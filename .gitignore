@@ -1,3 +1,9 @@
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
 # Node / 前端
 node_modules/
 dist/
@@ -5,10 +11,8 @@ dist/
 *.log
 *.tsbuildinfo
 
-# 系统 / 编辑器
-.agents/
-docs/
-.DS_Store
+# 编辑器
+.we-props/
 .idea/
 .vscode/
 *.swp
@@ -20,3 +24,11 @@ docs/
 *.mp4
 *.webm
 *.gif
+
+# agent
+.v2c/
+.video_agent/
+.agents/
+.v2c/
+docs/
+renderer/vendor/we-scene/README.md
