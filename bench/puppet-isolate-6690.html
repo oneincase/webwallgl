@@ -1,0 +1,104 @@
+<!doctype html>
+<!-- [TEMP-DEBUG] 3264246690 人物 puppet 最小复现页。
+     只创建 renderer + 只画 1拆分 一层（无效果链），复用生产 draw 路径。
+     对照：?fx=1 挂回原效果链；?rate=0 冻结动画。 -->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>puppet isolate 3264246690</title>
+<style>
+  body { margin: 0; background: #404040; }
+  canvas { width: 100vw; height: 100vh; display: block; }
+  #info { position: fixed; top: 8px; left: 8px; color: #0f0; font: 12px monospace; white-space: pre; }
+</style>
+</head>
+<body>
+<div id="info">loading…</div>
+<script>
+  window.addEventListener("error", (e) => { document.getElementById("info").textContent = "ERROR: " + e.message; });
+  window.addEventListener("unhandledrejection", (e) => { document.getElementById("info").textContent = "REJECTION: " + (e.reason && e.reason.message || e.reason); });
+</script>
+<script type="module">
+  const q = new URLSearchParams(location.search);
+  const FX = q.get("fx") === "1";
+  const RATE = Number(q.get("rate") ?? 1);
+  const ID = "3264246690";
+  const BASE = "http://127.0.0.1:1430/media/dev/" + ID;
+  const info = (s) => (document.getElementById("info").textContent = s);
+
+  const pkgMod = await import("/renderer/vendor/we-scene/pkg/container.js");
+  const texMod = await import("/renderer/vendor/we-scene/pkg/texture.js");
+  const scnMod = await import("/renderer/vendor/we-scene/scene/parse.js");
+  const mdlMod = await import("/renderer/vendor/we-scene/render/mdl.js");
+  const rndMod = await import("/renderer/vendor/we-scene/render/renderer.js");
+  const pkg = pkgMod.parsePkg(new Uint8Array(await (await fetch(BASE + "/scene.pkg")).arrayBuffer()));
+  const dec = new TextDecoder();
+
+  const sceneJson = JSON.parse(dec.decode(pkgMod.getEntry(pkg, "scene.json")));
+  const proj = JSON.parse(await (await fetch(BASE + "/project.json")).text());
+  const scene = scnMod.parseScene(sceneJson, proj);
+  const girl = scene.layers.find(l => l.name === "1拆分");
+  if (!girl) { info("找不到 1拆分"); throw new Error("no layer"); }
+
+  // 装配 puppet + 贴图（复用生产路径：PNG 载荷 → createImageBitmap，与 loadTex 同）
+  const modelJson = JSON.parse(dec.decode(pkgMod.getEntry(pkg, girl.image)));
+  girl.puppet = mdlMod.parseMDL(pkgMod.getEntry(pkg, modelJson.puppet));
+  const parsedTex = texMod.parseTex(pkgMod.getEntry(pkg, "materials/1拆分.tex"));
+  const m0 = texMod.decodeMip0(parsedTex);
+  if (!FX) girl.effects = [];
+
+  const c = document.createElement("canvas");
+  c.width = 1280; c.height = 800;
+  document.body.appendChild(c);
+  const renderer = rndMod.createRenderer(c, { fboCapFactor: 0 });
+  const mdlRenderer = mdlMod.createMDLRenderer(renderer.gl);
+  mdlRenderer.upload(girl.puppet);
+
+  const textures = new Map();
+  window.__csm = mdlMod.computeSkinMatrices;
+  window.__mdlR = mdlRenderer;
+  window.__girlPuppet = girl.puppet;
+  if (m0.png) {
+    const bmp = await createImageBitmap(new Blob([m0.png], { type: "image/png" }));
+    textures.set("1拆分", {
+      glTex: rndMod.makeTexture(renderer.gl, null, 0, 0, bmp),
+      width: bmp.width, height: bmp.height,
+    });
+    info("贴图: ImageBitmap " + bmp.width + "x" + bmp.height);
+  } else {
+    textures.set("1拆分", {
+      glTex: rndMod.makeTextureMip(renderer.gl, [m0], false),
+      width: m0.width, height: m0.height,
+    });
+    info("贴图: rgba " + m0.width + "x" + m0.height);
+  }
+  textures.set("util/white", {
+    glTex: rndMod.makeTexture(renderer.gl, new Uint8Array([255, 255, 255, 255]), 1, 1),
+    width: 1, height: 1,
+  });
+
+  const minimal = { general: scene.general, camera: scene.camera, layers: [girl] };
+  window.__scene = minimal;
+  window.__girl = girl;
+  // 生产路径同款注入：renderLayer 的 isPuppet 依赖它
+  renderer.setPuppetRenderer((layer, mvp, o) => {
+    try { (window.__pdN ||= [0])[0]++ } catch { /* ignore */ }
+    mdlRenderer.draw(mvp, girl.puppet, o, textures.get("1拆分"));
+  });
+  info("1拆分 v=" + girl.puppet.vertexCount + " bones=" + girl.puppet.bones.length +
+    " fx=" + (girl.effects || []).length + " rate=" + RATE);
+
+  let t = 0;
+  let last = performance.now();
+  const loop = (now) => {
+    const dt = (now - last) / 1000;
+    last = now;
+    t += dt;
+    for (const a of (girl.animationLayers || [])) a.rate = RATE;
+    renderer.render(minimal, textures, c.width, c.height, t, "cover").catch(e => info("render error: " + e.message));
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+</script>
+</body>
+</html>

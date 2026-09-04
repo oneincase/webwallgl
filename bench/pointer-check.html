@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>指针互动校验（真实渲染器 + GL 回读）</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font:13px/1.6 -apple-system,sans-serif; padding:16px; }
+  table { border-collapse:collapse; font-size:12px; margin-top:10px; }
+  th,td { border:1px solid #333; padding:4px 8px; text-align:right; }
+  th { background:#1c1c1c; text-align:left; } td:first-child { text-align:left; }
+  .ok { color:#5cd65c; } .bad { color:#ff6b6b; } .dim { color:#888; }
+  .box { margin:12px 0; padding:8px 10px; background:#1c1c1c; border-left:3px solid #555; }
+  code { color:#9cd; }
+</style>
+</head>
+<body>
+<h1 style="font-size:15px;margin:0 0 12px">指针互动校验（走真实渲染器 + readPixels）</h1>
+<p>两段判据，缺一不可：</p>
+<ol>
+<li><strong>uniform 闭环</strong>（下方「指针 uniform 闭环」）—— 自造一个把
+<code>g_PointerPosition</code> 直接输出成颜色的效果 pass，回读像素比对期望值。
+这一段**不依赖任何壁纸素材**，是「渲染器确实把指针值喂进了 shader」的直接证据。
+壁纸级判据受素材/贴图缺失影响，只有这一段能证伪接线本身。</li>
+<li><strong>壁纸级响应</strong>（下方表格）—— 对真实壁纸扫 12 个指针位置，取相对
+<code>(0.5,0.5)</code> 基准的最大通道差。**必须扫一圈而不是只比两点**：
+<code>xray</code> 的 <code>size</code> 决定开窗大小且语义是倒数
+（<code>v_PointerScale = 1/size</code>，1994794519 的 <code>size=0.05</code> →
+窗口只有约 1/20 屏），单点对比极易落在窗外读出 0。</li>
+</ol>
+<div class="box" id="probe">指针 uniform 闭环：运行中…</div>
+<div class="box" id="sum">壁纸级响应：加载中…</div>
+<div id="out"></div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as texMod from '/renderer/vendor/we-scene/pkg/texture.js'
+import * as scnMod from '/renderer/vendor/we-scene/scene/parse.js'
+import * as effMod from '/renderer/vendor/we-scene/scene/effects-parse.js'
+import * as rndMod from '/renderer/vendor/we-scene/render/renderer.js'
+import * as ptexMod from '/renderer/vendor/we-scene/render/particle-textures.js'
+import { WE_SHADER_HEADERS } from '/renderer/vendor/we-scene/headers.ts'
+
+const q = new URLSearchParams(location.search)
+const LIST = q.get('list')?.split(',').filter(Boolean)
+const dec = new TextDecoder()
+const readText = (b) => dec.decode(b).replace(/^\uFEFF/, '')
+const out = document.getElementById('out')
+const sum = document.getElementById('sum')
+const probeBox = document.getElementById('probe')
+
+// 静音频谱（audio.js 只导出模拟器，静音快照由调用方构造，同 main.ts 的 SILENT_AUDIO）
+const zeros = (n) => new Float32Array(n)
+const SILENT_AUDIO = {
+  left16: zeros(16), right16: zeros(16), left32: zeros(32), right32: zeros(32),
+  left64: zeros(64), right64: zeros(64), level: 0, silent: true,
+}
+
+// 假指针源：不依赖真实鼠标事件
+function makeFakePointer(u, v) {
+  const state = { u, v, screenX: u * 1920, screenY: v * 1080, wx: 0, wy: 0,
+    lastU: u, lastV: v, lastScreenX: 0, lastScreenY: 0, lastWx: 0, lastWy: 0,
+    leftDown: false, has: true, moveCount: 0, downCount: 0, upCount: 0,
+    lastEventTime: 0, screenW: 1920, screenH: 1080 }
+  return { state, beginFrame() {}, syncWorld(cam, px, py) {
+      state.wx = cam.offX + state.u * cam.viewW - (px || 0)
+      state.wy = cam.offY + state.v * cam.viewH - (py || 0)
+    }, normalizedDelta() { return 0 }, dispose() {} }
+}
+
+/**
+ * 第 1 段：指针 uniform 闭环。
+ * 自造一个 frag 把 g_PointerPosition 直接写进颜色，回读像素比对期望值。
+ * 通过即证明 renderer.js 的 setPointerProvider → bindSystemUniforms 链路正确，
+ * 且坐标空间是归一化 [0,1]（而非像素或 [-1,1]）。
+ */
+async function probePointerUniform() {
+  const cv = document.createElement('canvas'); cv.width = 8; cv.height = 8
+  const FRAG = '#version 300 es\nprecision highp float;\nuniform vec2 g_PointerPosition;\nout vec4 o;\nvoid main(){ o = vec4(g_PointerPosition, 0.0, 1.0); }'
+  const VERT = '#version 300 es\nprecision highp float;\nin vec3 a_Position;\nvoid main(){ gl_Position = vec4(a_Position, 1.0); }'
+  const r = rndMod.createRenderer(cv, {
+    shaderResolver: (f) => Promise.resolve(f.endsWith('.frag') ? FRAG : f.endsWith('.vert') ? VERT : null),
+    fboCapFactor: 0, parallax: false })
+  const gl = r.gl
+  const st = { u: 0.25, v: 0.75, lastU: 0.25, lastV: 0.75, screenX: 0, screenY: 0,
+    wx: 0, wy: 0, lastWx: 0, lastWy: 0, leftDown: false, has: true, moveCount: 0,
+    downCount: 0, upCount: 0, lastEventTime: 0, screenW: 100, screenH: 100 }
+  r.setPointerProvider(() => ({ state: st, beginFrame() {}, syncWorld() {} }))
+  const tm = new Map()
+  tm.set('util/white', { glTex: rndMod.makeTexture(gl, new Uint8Array([255,255,255,255]), 1, 1), width: 1, height: 1 })
+  const sc = scnMod.parseScene({ general: { orthogonalprojection: { width: 8, height: 8 }, clearcolor: '0 0 0', clearenabled: true },
+    objects: [{ id: 1, name: 'L', image: 'models/util/solidlayer.json', solid: '1 1 1',
+      origin: '4 4 0', size: '8 8', scale: '1 1 1', angles: '0 0 0', visible: true }] }, null)
+  sc.layers[0].effects = [{ visible: true, file: 'effects/probe', passes: [{}], fbos: [],
+    materialPasses: [{ shader: 'effects/probe', textures: [], combos: {}, constants: {}, blending: 'normal', binds: [] }] }]
+  const read = async () => {
+    await r.render(sc, tm, 8, 8, 0, 'stretch')
+    const p = new Uint8Array(8 * 8 * 4)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.readPixels(0, 0, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, p)
+    return [p[0], p[1]]
+  }
+  const a = await read()
+  st.u = 0.9; st.v = 0.1
+  const b = await read()
+  // 8bit 量化允许 ±2 误差
+  const near = (got, want) => Math.abs(got - want) <= 2
+  const okA = near(a[0], Math.round(0.25 * 255)) && near(a[1], Math.round(0.75 * 255))
+  const okB = near(b[0], Math.round(0.9 * 255)) && near(b[1], Math.round(0.1 * 255))
+  return { a, b, expectA: [64, 191], expectB: [230, 26], pass: okA && okB }
+}
+
+async function fetchLibrary() {
+  const r = await fetch('/api/library')
+  if (!r.ok) throw new Error('无法获取壁纸列表（HTTP ' + r.status + '）')
+  return r.json()
+}
+
+async function main() {
+  // ---- 第 1 段：uniform 闭环 ----
+  try {
+    const pr = await probePointerUniform()
+    window.__probeResult = pr
+    probeBox.innerHTML = `指针 uniform 闭环：`
+      + `指针(0.25,0.75) → 像素(${pr.a.join(',')})，期望(${pr.expectA.join(',')})；`
+      + `指针(0.90,0.10) → 像素(${pr.b.join(',')})，期望(${pr.expectB.join(',')})　`
+      + (pr.pass ? '<span class="ok">✓ g_PointerPosition 确实喂进 shader，空间为归一化 [0,1]</span>'
+                 : '<span class="bad">✗ 指针未生效（接线有 bug）</span>')
+  } catch (e) {
+    probeBox.innerHTML = `指针 uniform 闭环：<span class="bad">失败 ${String(e && e.message).slice(0,150)}</span>`
+    window.__probeResult = { error: String((e && e.message) || e) }
+  }
+
+  // ---- 第 2 段：壁纸级响应 ----
+  let ids
+  if (LIST) ids = LIST
+  else {
+    const lib = await fetchLibrary()
+    ids = (lib.items || []).filter((w) => w.type === 'scene' && w.hasScene).map((w) => w.itemId)
+    window.__titles = Object.fromEntries((lib.items || []).map((w) => [w.itemId, w.title]))
+  }
+  if (!ids || ids.length === 0) { sum.innerHTML = '壁纸级响应：未指定壁纸'; return }
+  {
+    const probe = document.createElement('canvas')
+    if (!probe.getContext('webgl2')) { sum.innerHTML = '需要 WebGL2'; return }
+  }
+
+  const POINTER_EFFECTS = /xray|cursorripple|iris_|chromatic_aberration|constellation|hue_shift|juguangdeng/
+  const rows = []
+  for (const id of ids) {
+    let r = await fetch(`/media/dev/${id}/scenes/scene.pkg`)
+    if (!r.ok) r = await fetch(`/media/dev/${id}/scene.pkg`)
+    if (!r.ok) continue
+    const pk = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+    const e = pkgMod.getEntry(pk, 'scene.json')
+    if (!e) continue
+    const scene = scnMod.parseScene(JSON.parse(readText(e)), null)
+    // 按**效果文件名**筛：此时 materialPasses 尚未解析（恒为空），不能用它判断
+    const hasPointerShader = scene.layers.some((L) =>
+      (L.effects || []).some((ef) => POINTER_EFFECTS.test(String(ef.file || ''))))
+    if (!hasPointerShader) continue
+
+    // 每个壁纸一份独立 canvas + renderer，且**不调 dispose()**：
+    // dispose 会 loseContext()，复用同一 canvas 时会让后续壁纸全部「着色器编译失败」。
+    const canvas = document.createElement('canvas')
+    canvas.width = 480; canvas.height = 270
+    const shaderResolver = (rel) => {
+      const file = rel.startsWith('shaders/') ? rel.slice(8) : rel
+      const e2 = pkgMod.getEntry(pk, rel.startsWith('shaders/') ? rel : 'shaders/' + rel)
+      return Promise.resolve(e2 ? readText(e2) : (WE_SHADER_HEADERS[file] ?? null))
+    }
+    let renderer
+    try {
+      renderer = rndMod.createRenderer(canvas, { shaderResolver, fboCapFactor: 0, parallax: false })
+    } catch (err) { rows.push({ id, error: String(err && err.message).slice(0, 80) }); continue }
+    const gl = renderer.gl
+    const textures = new Map()
+    textures.set('util/white', { glTex: rndMod.makeTexture(gl, new Uint8Array([255,255,255,255]), 1, 1), width: 1, height: 1 })
+    textures.set('util/noflow', { glTex: rndMod.makeTexture(gl, new Uint8Array([127,127,127,255]), 1, 1), width: 1, height: 1 })
+
+    async function loadTex(name) {
+      if (textures.has(name)) return textures.get(name)
+      const e2 = pkgMod.getEntry(pk, `materials/${name}.tex`)
+      if (!e2) {
+        // WE 内置资源（particle/halo_6 等）不在 pkg 里 —— 这正是 xray 的 sprite。
+        // 缺它会回退成纯白 1×1，指针决定的采样位置**处处取到同一个值**，
+        // 画面对指针零响应（实测 maxDiff 恰好为 0）。仓库自带等效素材，这里补上。
+        if (ptexMod.isBuiltinParticleTextureName(name)) {
+          const gen = ptexMod.buildBuiltinParticleTexture(name)
+          if (gen) {
+            // 与 main.ts 的 loadParticleTex 一致：生成结果是 mip 层对象，走 makeTextureMip
+            const entry = { glTex: rndMod.makeTextureMip(gl, [gen], false), width: gen.width, height: gen.height }
+            textures.set(name, entry)
+            return entry
+          }
+        }
+        return null
+      }
+      let pt, m
+      try { pt = texMod.parseTex(e2); m = texMod.decodeMip0(pt) } catch { return null }
+      if (!m || m.video !== undefined) return null
+      let entry = null
+      if (m.png !== undefined || (m.image !== undefined && m.fif === texMod.FIF.JPEG)) {
+        const blob = new Blob([m.png || m.image], { type: m.png ? 'image/png' : 'image/jpeg' })
+        const bmp = await createImageBitmap(blob)
+        entry = { glTex: rndMod.makeTexture(gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height }
+      } else if (m.image === undefined) {
+        entry = { glTex: rndMod.makeTextureMip(gl, [m], pt.format === 8), width: m.width, height: m.height }
+      }
+      if (entry) textures.set(name, entry)
+      return entry
+    }
+    for (const L of scene.layers) {
+      if (!L.image) continue
+      let mj; try { mj = JSON.parse(readText(pkgMod.getEntry(pk, L.image))) } catch { continue }
+      if (mj && mj.puppet) continue
+      let texName
+      try { texName = JSON.parse(readText(pkgMod.getEntry(pk, mj.material))).passes?.[0]?.textures?.[0] } catch {}
+      if (texName && await loadTex(texName)) L.textureName = texName
+      for (const ef of L.effects || []) {
+        effMod.resolveEffectChain(pk, ef, readText)
+        // 效果 pass 引用的贴图也要加载 —— xray 的 blend 靠 g_Texture1 的 alpha，
+        // 缺它 blend 恒 0、画面对指针完全不响应（这不是接线问题，见页首说明）
+        for (const p of ef.passes || []) for (const tn of p.textures || [])
+          if (typeof tn === 'string' && tn && !tn.startsWith('util/') && !tn.startsWith('_rt_')) await loadTex(tn)
+        for (const mp of ef.materialPasses || []) for (const tn of mp.textures || [])
+          if (typeof tn === 'string' && tn && !tn.startsWith('util/') && !tn.startsWith('_rt_')) await loadTex(tn)
+      }
+    }
+
+    const ptr = makeFakePointer(0.5, 0.5)
+    renderer.setPointerProvider(() => ptr)
+    renderer.setAudioProvider(() => SILENT_AUDIO)
+    scene.general = { ...scene.general, clearcolor: '0 0 0', clearenabled: true, cameraparallax: false }
+
+    const pxRead = async (u, v) => {
+      ptr.state.u = u; ptr.state.v = v
+      ptr.state.lastU = u; ptr.state.lastV = v
+      ptr.state.screenX = u * 1920; ptr.state.screenY = v * 1080
+      await renderer.render(scene, textures, canvas.width, canvas.height, 0, 'cover')
+      const p = new Uint8Array(canvas.width * canvas.height * 4)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, p)
+      return p
+    }
+    // 扫多个指针位置取最大差异：xray 的开窗可能很小（size=0.05 → 窗口约 1/20 屏），
+    // 单点对比容易漏掉，必须扫一圈。
+    const positions = [[0.5,0.5],[0.1,0.1],[0.5,0.05],[0.9,0.1],[0.95,0.5],[0.9,0.9],[0.5,0.95],[0.1,0.9],[0.05,0.5],[0.3,0.3],[0.7,0.7],[0.2,0.8],[0.8,0.2]]
+    let baseline = await pxRead(0.5, 0.5)
+    let maxDiff = 0, totalDiff = 0, totalPx = 0, alive = false
+    for (const [u, v] of positions) {
+      if (u === 0.5 && v === 0.5) continue
+      const p = await pxRead(u, v)
+      const w = canvas.width, h = canvas.height
+      let md = 0, td = 0, nz = 0
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4
+        if (baseline[i] + baseline[i+1] + baseline[i+2] <= 10 && p[i] + p[i+1] + p[i+2] <= 10) continue
+        nz++
+        const d = Math.abs(baseline[i] - p[i]) + Math.abs(baseline[i+1] - p[i+1]) + Math.abs(baseline[i+2] - p[i+2])
+        td += d
+        if (d > md) md = d
+      }
+      if (md > maxDiff) maxDiff = md
+      if (nz > totalPx) totalPx = nz
+      totalDiff += td
+      if (md > 24) alive = true
+    }
+    // 诊断：这个壁纸编译出来的 program 里有没有活跃的指针 uniform。
+    // 「有 uniform 但画面不变」通常是素材缺失（见页首），而非接线坏。
+    let ptrUni = 0
+    for (const [, entry] of renderer.progCache || []) {
+      if (!entry || !entry.uni) continue
+      for (const name of entry.uni.keys()) if (name.startsWith('g_Pointer')) ptrUni++
+    }
+    rows.push({ id, name: (window.__titles && window.__titles[id]) || id,
+      maxDiff, alive, px: totalPx,
+      programs: (renderer.progCache && renderer.progCache.size) || 0, ptrUni })
+  }
+
+  const alive = rows.filter((r) => r.alive)
+  const withUni = rows.filter((r) => r.ptrUni > 0)
+  sum.innerHTML = `壁纸级响应：<strong>${alive.length} / ${rows.length}</strong> 画面随指针变化；`
+    + `<strong>${withUni.length} / ${rows.length}</strong> 编译出了活跃的 g_Pointer* uniform`
+    + `<div class="dim">「有 uniform 但画面不变」多为本页未加载全部 mask/blend 贴图所致，`
+    + `接线正确性以上方 uniform 闭环为准。</div>`
+  const t = document.createElement('table')
+  t.innerHTML = '<tr><th>壁纸</th><th>program</th><th>指针 uniform</th><th>比较像素</th><th>最大通道差</th><th>判定</th></tr>'
+    + rows.map((r) => `<tr><td>${r.name} (${r.id})</td><td>${r.programs ?? '-'}</td>`
+      + `<td class="${r.ptrUni ? 'ok' : 'dim'}">${r.ptrUni ?? 0}</td>`
+      + `<td>${r.px ?? '-'}</td>`
+      + `<td class="${r.alive?'ok':'dim'}">${r.maxDiff ?? '-'}</td>`
+      + `<td class="${r.alive?'ok':'dim'}">${r.error ? '错误' : r.alive ? '✓ 有反应' : '— 无变化'}</td></tr>`).join('')
+  out.appendChild(t)
+  window.__result = { total: rows.length, alive: alive.length, withUni: withUni.length, rows }
+}
+main().catch((e) => {
+  sum.innerHTML = '<span class="bad">失败: ' + (e && e.message) + '</span>'
+  window.__result = { error: String((e && e.message) || e) }
+})
+</script>
+</body>
+</html>

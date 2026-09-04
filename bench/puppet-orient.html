@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>puppet 朝向校验（真实渲染器）</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font:13px/1.6 -apple-system,sans-serif; padding:16px; }
+  table { border-collapse:collapse; font-size:12px; margin-top:10px; }
+  th,td { border:1px solid #333; padding:4px 8px; text-align:right; }
+  th { background:#1c1c1c; text-align:left; } td:first-child { text-align:left; }
+  .ok { color:#5cd65c; } .bad { color:#ff6b6b; }
+  #sum { margin:12px 0; padding:8px 10px; background:#1c1c1c; border-left:3px solid #555; }
+</style>
+</head>
+<body>
+<h1 style="font-size:15px;margin:0 0 12px">puppet 朝向校验（走真实渲染器）</h1>
+<p>不重新实现变换链：直接用 <code>createRenderer</code> 把同一图层渲染两次 ——
+一次走 <strong>puppet 网格</strong>路径，一次清空 <code>layer.puppet</code> 走
+<strong>普通贴图 quad</strong>路径（既有的、已知正确的基准）。
+t=0 蒙皮为单位变换，两者应高度一致；若朝向反了，就会与「基准的垂直镜像」更像。
+加 <code>&amp;effects=0</code> 可单独验证无效果链的直接绘制路径。</p>
+<div id="sum">运行中…</div>
+<div id="out"></div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as texMod from '/renderer/vendor/we-scene/pkg/texture.js'
+import * as scnMod from '/renderer/vendor/we-scene/scene/parse.js'
+import * as effMod from '/renderer/vendor/we-scene/scene/effects-parse.js'
+import * as rndMod from '/renderer/vendor/we-scene/render/renderer.js'
+import * as mdlMod from '/renderer/vendor/we-scene/render/mdl.js'
+import { WE_SHADER_HEADERS } from '/renderer/vendor/we-scene/headers.ts'
+
+const q = new URLSearchParams(location.search)
+const SCENE = q.get('src') || '3791428510'
+const WITH_EFFECTS = q.get('effects') !== '0'
+const dec = new TextDecoder()
+const readText = (b) => dec.decode(b).replace(/^\uFEFF/, '')
+const out = document.getElementById('out'), sum = document.getElementById('sum')
+
+async function main() {
+  let r = await fetch(`/media/dev/${SCENE}/scenes/scene.pkg`)
+  if (!r.ok) r = await fetch(`/media/dev/${SCENE}/scene.pkg`)
+  const pk = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+
+  const cv = document.createElement('canvas')
+  cv.width = 480; cv.height = 270
+  const shaderResolver = (rel) => {
+    const inner = rel.startsWith('shaders/') ? rel : 'shaders/' + rel
+    const file = rel.startsWith('shaders/') ? rel.slice(8) : rel
+    const e = pkgMod.getEntry(pk, inner)
+    return Promise.resolve(e ? readText(e) : (WE_SHADER_HEADERS[file] ?? null))
+  }
+  const renderer = rndMod.createRenderer(cv, { shaderResolver, fboCapFactor: 0, parallax: false })
+  const gl = renderer.gl
+
+  const textures = new Map()
+  const px1 = (rgba) => ({ glTex: rndMod.makeTexture(gl, new Uint8Array(rgba), 1, 1), width:1, height:1 })
+  textures.set('util/white', px1([255,255,255,255]))
+  textures.set('util/noflow', px1([127,127,127,255]))
+
+  async function loadTex(name) {
+    if (textures.has(name)) return textures.get(name)
+    const e = pkgMod.getEntry(pk, `materials/${name}.tex`); if (!e) return null
+    let pt, m
+    try { pt = texMod.parseTex(e); m = texMod.decodeMip0(pt) } catch { return null }
+    if (m.video !== undefined) return null
+    let entry
+    if (m.png !== undefined || (m.image !== undefined && m.fif === texMod.FIF.JPEG)) {
+      const blob = new Blob([m.png||m.image], { type: m.png?'image/png':'image/jpeg' })
+      const bmp = await createImageBitmap(blob)
+      entry = { glTex: rndMod.makeTexture(gl,null,0,0,bmp), width:bmp.width, height:bmp.height }
+    } else if (m.image !== undefined) { return null }
+    else { entry = { glTex: rndMod.makeTextureMip(gl,[m],pt.format===8), width:m.width, height:m.height } }
+    textures.set(name, entry)
+    return entry
+  }
+
+  const freshScene = () => scnMod.parseScene(JSON.parse(readText(pkgMod.getEntry(pk,'scene.json'))), null)
+
+  // 找出所有 puppet 图层名
+  const puppetNames = []
+  for (const L of freshScene().layers) {
+    if (!L.image) continue
+    let mj; try { mj = JSON.parse(readText(pkgMod.getEntry(pk,L.image))) } catch { continue }
+    if (mj && mj.puppet) puppetNames.push(L.name)
+  }
+
+  // 渲染单个图层：mode='puppet' 走网格，mode='quad' 走贴图基准
+  const shot = async (target, mode) => {
+    const scene = freshScene()
+    scene.general = { ...scene.general, clearcolor: '0 0 0', clearenabled: true, cameraparallax: false }
+    scene.layers = scene.layers.filter((L) => L.name === target)
+    const L = scene.layers[0]; if (!L) return null
+    if (!WITH_EFFECTS) L.effects = []
+    let mj; try { mj = JSON.parse(readText(pkgMod.getEntry(pk, L.image))) } catch { return null }
+    let texName
+    try { texName = JSON.parse(readText(pkgMod.getEntry(pk, mj.material))).passes?.[0]?.textures?.[0] } catch {}
+    if (!texName || !(await loadTex(texName))) return null
+    L.textureName = texName
+    for (const e of L.effects || []) effMod.resolveEffectChain(pk, e, readText)
+    for (const e of L.effects || []) for (const p of e.passes || []) for (const tn of p.textures || [])
+      if (typeof tn === 'string' && tn && !tn.startsWith('util/') && !tn.startsWith('_rt_')) await loadTex(tn)
+
+    if (mode === 'puppet') {
+      const me = pkgMod.getEntry(pk, mj.puppet); if (!me) return null
+      L.puppet = mdlMod.parseMDL(new Uint8Array(me))
+      const mdlR = mdlMod.createMDLRenderer(gl)
+      mdlR.upload(L.puppet)
+      const tex = textures.get(texName)
+      renderer.setPuppetRenderer((layer, mvp, o) => {
+        mdlR.draw(mvp, layer.puppet, { time:o.time, animLayers:layer.animationLayers,
+          color:[layer.color[0]*layer.brightness, layer.color[1]*layer.brightness,
+                 layer.color[2]*layer.brightness, layer.alpha] }, tex)
+      })
+    } else {
+      L.puppet = null
+      renderer.setPuppetRenderer(null)
+    }
+    await renderer.render(scene, textures, cv.width, cv.height, 0, 'cover')
+    const p = new Uint8Array(cv.width*cv.height*4)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.readPixels(0,0,cv.width,cv.height,gl.RGBA,gl.UNSIGNED_BYTE,p)
+    return p
+  }
+
+  const rows = []
+  for (const target of puppetNames) {
+    const A = await shot(target, 'quad')
+    const B = await shot(target, 'puppet')
+    if (!A || !B) continue
+    const w=cv.width, h=cv.height
+    let n=0, same=0, mirror=0
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+      const i=(y*w+x)*4, j=((h-1-y)*w+x)*4
+      if (A[i]+A[i+1]+A[i+2] <= 16 && B[i]+B[i+1]+B[i+2] <= 16) continue
+      n++
+      if (Math.abs(A[i]-B[i])+Math.abs(A[i+1]-B[i+1])+Math.abs(A[i+2]-B[i+2]) <= 40) same++
+      if (Math.abs(A[j]-B[i])+Math.abs(A[j+1]-B[i+1])+Math.abs(A[j+2]-B[i+2]) <= 40) mirror++
+    }
+    rows.push({ name: target, px:n,
+      same:+(n?same/n*100:0).toFixed(1), mirror:+(n?mirror/n*100:0).toFixed(1) })
+  }
+
+  const bad = rows.filter(x => x.same < x.mirror)
+  sum.innerHTML = `效果链=${WITH_EFFECTS?'开':'关'}　`
+    + `<strong>${rows.length-bad.length} / ${rows.length}</strong> 个 puppet 图层朝向与贴图基准一致`
+    + (bad.length===0 ? ' <span class="ok">✓ 朝向正确</span>'
+                      : ` <span class="bad">✗ ${bad.length} 个上下颠倒</span>`)
+  const t = document.createElement('table')
+  t.innerHTML = '<tr><th>图层</th><th>比较像素</th><th>与基准一致%</th><th>与镜像一致%</th><th>判定</th></tr>'
+    + rows.map(x=>`<tr><td>${x.name}</td><td>${x.px}</td>`
+      + `<td class="${x.same>=x.mirror?'ok':'bad'}">${x.same}</td><td>${x.mirror}</td>`
+      + `<td class="${x.same>=x.mirror?'ok':'bad'}">${x.same>=x.mirror?'正':'倒'}</td></tr>`).join('')
+  out.appendChild(t)
+  window.__result = { total: rows.length, bad: bad.length, withEffects: WITH_EFFECTS, rows }
+}
+main().catch(e => { sum.innerHTML = '<span class="bad">失败: '+(e&&e.message)+'</span>'
+  window.__result = { error: String((e&&e.message)||e) } })
+</script>
+</body>
+</html>

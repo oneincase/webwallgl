@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "allowJs": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist/lib/types",
+    "skipLibCheck": true
+  },
+  "include": ["renderer/src/api/types.ts"]
+}

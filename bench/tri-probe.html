@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>三角形级染色探针</title>
+<style>
+  body{margin:0;background:#111;color:#ddd;font:12px/1.5 ui-monospace,monospace;padding:12px}
+  h1{font-size:14px;margin:0 0 8px}
+  .box{padding:6px 9px;background:#1c1c1c;border-left:3px solid #555;white-space:pre-wrap;max-width:1240px}
+  .row{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin:8px 0}
+  canvas{border:1px solid #444;background:#000}
+  select,input,button{background:#222;color:#ddd;border:1px solid #444;padding:2px 5px}
+  label{margin-right:10px}
+  .bad{color:#ff6b6b}.ok{color:#5cd65c}.warn{color:#ffcc66}
+</style>
+</head>
+<body>
+<h1>三角形级染色探针</h1>
+<div class="box">
+把 puppet 网格的**每个三角形**按所属 UV 区域染成不同颜色，用 WebGL 实际光栅化一遍。
+判据：如果某块区域在贴图里有内容、在这里也能看到对应色块 →
+三角形<b>确实被光栅化了</b>，问题在贴图采样/混合；如果那块是黑的 →
+三角形<b>没被画出来</b>（索引、裁剪、深度或 NaN）。
+<b>模式</b>：<code>region</code> 按 UV 分区上色；<code>tri</code> 每三角形随机色（看密度/缝隙）；
+<code>tex</code> 用真实贴图（对照）；<code>uv</code> 把 UV 直接输出成颜色（查 UV 是否错乱）。
+右侧「区域统计」给出每个 UV 区块的三角形数与实际覆盖像素数——<b>三角形数 &gt;0 但像素数 =0 就是被丢弃</b>。
+</div>
+<div class="row">
+  <label>壁纸 <select id="wp"></select></label>
+  <label>模型 <select id="mdl"></select></label>
+  <label>模式 <select id="mode">
+    <option value="region" selected>region</option>
+    <option value="tri">tri</option>
+    <option value="tex">tex</option>
+    <option value="uv">uv</option>
+  </select></label>
+  <label>时间 <input id="t" type="range" min="0" max="1" step="0.002" value="0.4" style="width:220px"></label>
+  <span id="tlab">t=—</span>
+  <label><input id="skinOff" type="checkbox"> 关蒙皮</label>
+</div>
+<div class="box" id="stats">加载中…</div>
+<div class="row">
+  <canvas id="cv" width="900" height="620"></canvas>
+  <div class="box" id="regions" style="max-width:430px;max-height:620px;overflow:auto">区域统计</div>
+</div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as texMod from '/renderer/vendor/we-scene/pkg/texture.js'
+import * as mdlMod from '/renderer/vendor/we-scene/render/mdl.js'
+
+const dec = new TextDecoder()
+const $ = (id) => document.getElementById(id)
+const cv = $('cv')
+const gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true })
+if (!gl) { $('stats').innerHTML = '<span class="bad">需要 WebGL2</span>' }
+
+// UV 分区：4x4 网格 + 命名，便于对照「中间人物头部」这类区域
+const GX = 8, GY = 8
+const regionOf = (u, v) => {
+  const gx = Math.max(0, Math.min(GX-1, Math.floor(u*GX)))
+  const gy = Math.max(0, Math.min(GY-1, Math.floor(v*GY)))
+  return gy*GX+gx
+}
+const regionColor = (r) => {
+  // 稳定的高对比配色
+  const h = (r*137.508)%360, s=0.75, l=0.55
+  const c=(1-Math.abs(2*l-1))*s, x=c*(1-Math.abs(((h/60)%2)-1)), m=l-c/2
+  let rgb
+  if(h<60)rgb=[c,x,0]; else if(h<120)rgb=[x,c,0]; else if(h<180)rgb=[0,c,x]
+  else if(h<240)rgb=[0,x,c]; else if(h<300)rgb=[x,0,c]; else rgb=[c,0,x]
+  return [rgb[0]+m, rgb[1]+m, rgb[2]+m]
+}
+
+const VS = `#version 300 es
+in vec3 a_pos; in vec2 a_uv; in vec4 a_bone; in vec4 a_weight; in vec3 a_col;
+uniform mat4 u_mvp; uniform mat4 u_skin[64]; uniform int u_boneCount; uniform int u_skinOff;
+out vec2 v_uv; out vec3 v_col;
+void main(){
+  vec4 p = vec4(a_pos, 1.0);
+  vec4 sk = vec4(0.0); float tot = 0.0;
+  if (u_boneCount > 0 && u_skinOff == 0) {
+    for (int i=0;i<4;i++){
+      float w = a_weight[i]; if (w <= 0.0) continue;
+      int bi = int(a_bone[i]); if (bi < 0 || bi >= u_boneCount) continue;
+      sk += (u_skin[bi] * p) * w; tot += w;
+    }
+  }
+  vec4 local = tot > 0.0 ? sk/tot : p;
+  gl_Position = u_mvp * vec4(local.xy, 0.0, 1.0);
+  v_uv = a_uv; v_col = a_col;
+}`
+const FS = `#version 300 es
+precision mediump float;
+in vec2 v_uv; in vec3 v_col;
+uniform sampler2D u_tex; uniform int u_mode;
+out vec4 o;
+void main(){
+  if (u_mode == 0) o = vec4(v_col, 1.0);                       // region
+  else if (u_mode == 1) o = vec4(v_col, 1.0);                  // tri（色由 CPU 给）
+  else if (u_mode == 2) o = texture(u_tex, v_uv);               // tex
+  else o = vec4(fract(v_uv.x), fract(v_uv.y), 0.0, 1.0);        // uv
+}`
+const sh = (t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o)
+  if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o}
+let prog=null
+function ensureProg(){
+  if (prog) return prog
+  prog=gl.createProgram()
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS))
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS))
+  gl.linkProgram(prog)
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog))
+  return prog
+}
+
+const cache = new Map()
+async function loadPkg(id){
+  if (cache.has(id)) return cache.get(id)
+  let r = await fetch(`/media/dev/${id}/scenes/scene.pkg`)
+  if (!r.ok) r = await fetch(`/media/dev/${id}/scene.pkg`)
+  if (!r.ok) throw new Error('scene.pkg HTTP '+r.status)
+  const pk = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+  cache.set(id, pk); return pk
+}
+function collectPuppets(pk){
+  const raw = JSON.parse(dec.decode(pkgMod.getEntry(pk,'scene.json')))
+  const out=[]
+  for (const o of raw.objects||[]){
+    if (typeof o.image!=='string') continue
+    const me=pkgMod.getEntry(pk,o.image); if(!me) continue
+    let mj; try{mj=JSON.parse(dec.decode(me))}catch{continue}
+    if (!mj.puppet) continue
+    const sz=String(o.size||'').trim().split(/\s+/).map(Number)
+    out.push({ id:o.id, name:o.name||'?', puppet:mj.puppet, material:mj.material,
+      size:[sz[0]||1024, sz[1]||1024],
+      animLayers:(o.animationlayers||o.animationLayers||[]).map(l=>({
+        animation:l.animation, visible:l.visible!==false, additive:!!l.additive,
+        blend:typeof l.blend==='number'?l.blend:1, rate:typeof l.rate==='number'?l.rate:1 })) })
+  }
+  return out
+}
+async function loadTex(pk, materialPath){
+  try{
+    const mm=pkgMod.getEntry(pk, materialPath); if(!mm) return null
+    const name=JSON.parse(dec.decode(mm)).passes?.[0]?.textures?.[0]
+    if(!name) return null
+    const te=pkgMod.getEntry(pk, `materials/${name}.tex`); if(!te) return null
+    const pt=texMod.parseTex(te), m0=texMod.decodeMip0(pt)
+    const t=gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D,t)
+    if(m0.png!==undefined||m0.image!==undefined){
+      const blob=new Blob([m0.png||m0.image],{type:m0.png?'image/png':'image/jpeg'})
+      const bmp=await createImageBitmap(blob)
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,bmp)
+    } else if (m0.rgba) {
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,m0.width,m0.height,0,gl.RGBA,gl.UNSIGNED_BYTE,m0.rgba)
+    } else return null
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE)
+    return { tex:t, w:m0.width, h:m0.height }
+  }catch{ return null }
+}
+
+let cur=null
+async function pick(){
+  const id=$('wp').value
+  const pk=await loadPkg(id)
+  const list=collectPuppets(pk)
+  const sel=$('mdl')
+  if (sel.dataset.wp!==id){
+    sel.innerHTML=''
+    list.forEach((e,i)=>{ const op=document.createElement('option')
+      op.value=String(i); op.textContent=`${e.name} (${e.puppet.split('/').pop()})`; sel.appendChild(op) })
+    sel.dataset.wp=id
+  }
+  const entry=list[Number(sel.value)||0]
+  if(!entry) throw new Error('该壁纸无 puppet')
+  const m=mdlMod.parseMDL(pkgMod.getEntry(pk, entry.puppet))
+  const tex=await loadTex(pk, entry.material)
+  // 逐三角形展开成独立顶点，才能给「每个三角形」上色
+  const triCount=m.indexCount/3
+  const pos=new Float32Array(triCount*9), uv=new Float32Array(triCount*6)
+  const bone=new Float32Array(triCount*12), wt=new Float32Array(triCount*12)
+  const col=new Float32Array(triCount*9)
+  const triRegion=new Int32Array(triCount)
+  for(let t=0;t<triCount;t++){
+    let cu=0, cvv=0
+    for(let k=0;k<3;k++){
+      const vi=m.indices[t*3+k]
+      pos[t*9+k*3]=m.positions[vi*3]; pos[t*9+k*3+1]=m.positions[vi*3+1]; pos[t*9+k*3+2]=m.positions[vi*3+2]
+      uv[t*6+k*2]=m.uvs[vi*2]; uv[t*6+k*2+1]=m.uvs[vi*2+1]
+      cu+=m.uvs[vi*2]/3; cvv+=m.uvs[vi*2+1]/3
+      for(let j=0;j<4;j++){ bone[t*12+k*4+j]=m.boneIdx[vi*4+j]; wt[t*12+k*4+j]=m.weights[vi*4+j] }
+    }
+    const r=regionOf(cu,cvv); triRegion[t]=r
+    const c=regionColor(r)
+    for(let k=0;k<3;k++){ col[t*9+k*3]=c[0]; col[t*9+k*3+1]=c[1]; col[t*9+k*3+2]=c[2] }
+  }
+  cur={ m, entry, tex, triCount, pos, uv, bone, wt, col, triRegion, pk }
+  // 上传
+  const mk=(data,loc,n)=>{ const b=gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW)
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,n,gl.FLOAT,false,0,0); return b }
+  ensureProg()
+  cur.vao=gl.createVertexArray()
+  gl.bindVertexArray(cur.vao)
+  mk(pos, gl.getAttribLocation(prog,'a_pos'), 3)
+  mk(uv, gl.getAttribLocation(prog,'a_uv'), 2)
+  mk(bone, gl.getAttribLocation(prog,'a_bone'), 4)
+  mk(wt, gl.getAttribLocation(prog,'a_weight'), 4)
+  mk(col, gl.getAttribLocation(prog,'a_col'), 3)
+  gl.bindVertexArray(null)
+  return cur
+}
+
+function draw(){
+  if(!cur) return
+  const { m, entry, tex, triCount, triRegion } = cur
+  const anims=m.animations||[]
+  const dur=anims.length?anims[0].duration:1
+  const time=Number($('t').value)*dur
+  $('tlab').textContent=`t=${time.toFixed(2)}s / ${dur.toFixed(1)}s`
+  const layers=entry.animLayers.length?entry.animLayers
+    :(anims.length?[{animation:anims[0].id,visible:true,additive:false,blend:1,rate:1}]:[])
+  const skin=mdlMod.computeSkinMatrices(m,time,layers,null)
+
+  // 视野：按「网格实际包围盒」而非 layer.size —— 探针要看全部几何
+  let mnx=Infinity,mxx=-Infinity,mny=Infinity,mxy=-Infinity
+  for(let i=0;i<m.vertexCount;i++){
+    const x=m.positions[i*3],y=m.positions[i*3+1]
+    if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y
+  }
+  const pad=(mxx-mnx)*0.06
+  const L=mnx-pad, R=mxx+pad, B=mny-pad, T=mxy+pad
+  // 正交（y 向上；网格是 y-up）
+  const mvp=new Float32Array([
+    2/(R-L),0,0,0,  0,2/(T-B),0,0,  0,0,1,0,
+    -(R+L)/(R-L), -(T+B)/(T-B), 0, 1 ])
+
+  gl.viewport(0,0,cv.width,cv.height)
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND)
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT)
+  gl.useProgram(prog)
+  gl.bindVertexArray(cur.vao)
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog,'u_mvp'),false,mvp)
+  const nb=Math.min(64, m.bones.length)
+  gl.uniform1i(gl.getUniformLocation(prog,'u_boneCount'), skin?nb:0)
+  gl.uniform1i(gl.getUniformLocation(prog,'u_skinOff'), $('skinOff').checked?1:0)
+  if(skin){
+    const buf=new Float32Array(64*16)
+    buf.set(skin.subarray(0, nb*16))
+    gl.uniformMatrix4fv(gl.getUniformLocation(prog,'u_skin'),false,buf)
+  }
+  const modeMap={region:0,tri:1,tex:2,uv:3}
+  gl.uniform1i(gl.getUniformLocation(prog,'u_mode'), modeMap[$('mode').value])
+  if(tex){ gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex.tex)
+    gl.uniform1i(gl.getUniformLocation(prog,'u_tex'),0) }
+  gl.drawArrays(gl.TRIANGLES, 0, triCount*3)
+  gl.bindVertexArray(null)
+
+  // 回读：统计每个 UV 区块「三角形数」vs「实际覆盖像素数」
+  const px=new Uint8Array(cv.width*cv.height*4)
+  gl.readPixels(0,0,cv.width,cv.height,gl.RGBA,gl.UNSIGNED_BYTE,px)
+  const triPerR=new Int32Array(GX*GY)
+  for(let t=0;t<triCount;t++) triPerR[triRegion[t]]++
+  // 用颜色反查区块（region 模式下颜色唯一）
+  const pixPerR=new Int32Array(GX*GY)
+  if($('mode').value==='region'){
+    const key=new Map()
+    for(let r=0;r<GX*GY;r++){
+      const c=regionColor(r)
+      key.set([Math.round(c[0]*255),Math.round(c[1]*255),Math.round(c[2]*255)].join(','), r)
+    }
+    for(let i=0;i<cv.width*cv.height;i++){
+      const k=`${px[i*4]},${px[i*4+1]},${px[i*4+2]}`
+      const r=key.get(k)
+      if(r!==undefined) pixPerR[r]++
+    }
+  }
+  let lit=0
+  for(let i=0;i<cv.width*cv.height;i++) if(px[i*4]||px[i*4+1]||px[i*4+2]) lit++
+  const cover=(lit/(cv.width*cv.height)*100).toFixed(1)
+  $('stats').innerHTML =
+    `${m.magic} · 顶点 ${m.vertexCount} · 三角形 ${triCount} · 骨 ${m.bones.length}`
+    + ` · 层尺寸 ${entry.size[0]}×${entry.size[1]} · 网格包围盒 x[${mnx.toFixed(0)},${mxx.toFixed(0)}] y[${mny.toFixed(0)},${mxy.toFixed(0)}]<br>`
+    + `画布非黑像素占比 <b>${cover}%</b>`
+    + (tex?` · 贴图 ${tex.w}×${tex.h}`:' · <span class="warn">无贴图</span>')
+  if($('mode').value==='region'){
+    const rows=[]
+    for(let r=0;r<GX*GY;r++){
+      if(triPerR[r]===0 && pixPerR[r]===0) continue
+      const gy=Math.floor(r/GX), gx=r%GX
+      const flag = triPerR[r]>0 && pixPerR[r]===0 ? ' <b class="bad">← 有三角形但 0 像素（被丢弃）</b>'
+                 : (triPerR[r]===0 ? ' <span class="warn">（无三角形）</span>' : '')
+      rows.push(`u[${(gx/GX).toFixed(2)}-${((gx+1)/GX).toFixed(2)}] v[${(gy/GY).toFixed(2)}-${((gy+1)/GY).toFixed(2)}]  三角 ${String(triPerR[r]).padStart(5)}  像素 ${String(pixPerR[r]).padStart(6)}${flag}`)
+    }
+    const dropped = rows.filter(x=>/被丢弃/.test(x)).length
+    $('regions').innerHTML = `<b>UV 区块：三角形数 vs 覆盖像素</b>\n`
+      + (dropped?`<b class="bad">${dropped} 个区块的三角形完全没画出来</b>\n`:`<b class="ok">所有有三角形的区块都画出了像素</b>\n`)
+      + rows.join('\n')
+  } else {
+    $('regions').textContent = '（切到 region 模式看区块统计）'
+  }
+}
+
+async function boot(){
+  const r=await fetch('/api/library')
+  const lib=r.ok?await r.json():{items:[]}
+  const sel=$('wp')
+  for(const w of (lib.items||[]).filter(x=>/scene/i.test(x.type||''))){
+    const op=document.createElement('option')
+    op.value=w.itemId; op.textContent=`${w.itemId} ${String(w.title||'').slice(0,26)}`
+    sel.appendChild(op)
+  }
+  const q=new URLSearchParams(location.search)
+  sel.value=q.get('id')||'3436945972'
+  const refresh=async()=>{ try{ await pick(); draw() }
+    catch(e){ $('stats').innerHTML=`<span class="bad">${String(e.message||e).slice(0,240)}</span>` } }
+  sel.onchange=async()=>{ $('mdl').dataset.wp=''; await refresh() }
+  $('mdl').onchange=refresh
+  for(const el of ['mode','t','skinOff']) $(el).oninput=draw
+  await refresh()
+}
+boot().catch(e=>{ $('stats').innerHTML=`<span class="bad">启动失败: ${String(e.stack||e).slice(0,300)}</span>` })
+</script>
+</body>
+</html>

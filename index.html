@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WebWallGL 测试台</title>
+    <meta name="theme-color" content="#0d111a" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/png" href="./icons/pwa-192.png" />
+    <link rel="apple-touch-icon" href="./icons/pwa-192.png" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+  </head>
+  <body>
+    <header id="titlebar">
+      <div class="traffic" aria-hidden="true">
+        <span class="dot close"></span>
+        <span class="dot min"></span>
+        <span class="dot max"></span>
+      </div>
+      <div class="titlebar-title"><span data-i18n="app.title">WebWallGL 测试台</span><span id="app-version"></span></div>
+      <button type="button" class="titlebar-icon" id="sponsor-btn" data-i18n-title="sponsor.title" title="赞赏作者">
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <path fill="currentColor" d="M8 14.2S1.6 10.4 1.6 5.9C1.6 3.6 3.4 2 5.4 2c1 0 2 .5 2.6 1.3C8.6 2.5 9.6 2 10.6 2c2 0 3.8 1.6 3.8 3.9 0 4.5-6.4 8.3-6.4 8.3z" />
+        </svg>
+      </button>
+      <label class="lang-box" data-i18n-title="lang.title">
+        <select id="lang" aria-label="Language">
+          <option value="zh">简体中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </header>
+
+    <div id="workbench">
+      <nav id="activitybar" aria-label="活动栏">
+        <button type="button" class="act" id="act-docs" title="使用说明" data-i18n-title="act.docs">
+          <svg viewBox="0 0 16 16" width="24" height="24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M8 1.5C6.9.7 5.5.3 4 .3 3 .3 2 .5 1.2.9L.5 1.3v12.4l.9-.4c.8-.4 1.7-.6 2.6-.6 1.5 0 2.9.5 4 1.3 1.1-.8 2.5-1.3 4-1.3.9 0 1.8.2 2.6.6l.9.4V1.3L14.8.9C14 .5 13 .3 12 .3c-1.5 0-2.9.4-4 1.2zM7.2 12.1C6.2 11.6 5.1 11.3 4 11.3c-.9 0-1.7.1-2.5.4V2.3c.7-.2 1.6-.4 2.5-.4 1.2 0 2.3.3 3.2.9v9.3zm8.3-.4c-.8-.3-1.6-.4-2.5-.4-1.1 0-2.2.3-3.2.8V2.8c.9-.6 2-.9 3.2-.9.9 0 1.8.2 2.5.4v9.4z"
+            />
+          </svg>
+        </button>
+        <button type="button" class="act active" id="act-explorer" title="资源管理器" data-i18n-title="act.explorer" aria-current="page">
+          <svg viewBox="0 0 16 16" width="24" height="24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M14 1H6.5l-.5.5V4H2.5L2 4.5v10l.5.5h9l.5-.5V13h2.5l.5-.5V1.5L14 1zm-3 12H3V5h3v.5l.5.5H11v7.5zm3-2.5H12V4.5L11.5 4H7V2h6v8.5z"
+            />
+          </svg>
+        </button>
+        
+        <div class="act-bottom">
+          <button type="button" class="act theme-btn" id="theme-toggle" title="主题：跟随系统" data-i18n-title="theme.auto">
+            <svg class="ic ic-auto" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true">
+              <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.2" />
+              <path fill="currentColor" d="M8 3.2a4.8 4.8 0 0 0 0 9.6V3.2z" />
+            </svg>
+            <svg class="ic ic-dark" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" hidden>
+              <path fill="currentColor" d="M9.8 1.2a6.8 6.8 0 1 0 4.9 11.5A7.6 7.6 0 0 1 9.8 1.2z" />
+            </svg>
+            <svg class="ic ic-light" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" hidden>
+              <circle cx="8" cy="8" r="3.2" fill="currentColor" />
+              <path fill="currentColor" d="M7.25.5h1.5v2.4h-1.5V.5zm0 12.6h1.5v2.4h-1.5v-2.4zM15.5 7.25v1.5h-2.4v-1.5h2.4zM2.9 8.75H.5v-1.5h2.4v1.5zm10.1-4.7l-1.06 1.06-1.06-1.06 1.06-1.06 1.06 1.06zM5.12 10.88L4.06 11.94 3 10.88l1.06-1.06 1.06 1.06zm0-5.76L4.06 5.18 3 4.12l1.06-1.06 1.06 1.06zm5.76 7.42l1.06 1.06-1.06 1.06-1.06-1.06 1.06-1.06z" />
+            </svg>
+          </button>
+</div>
+      </nav>
+
+      <aside id="sidebar">
+        <div class="sidebar-title" data-i18n="sidebar.title">资源管理器</div>
+        <div class="sidebar-section-head">
+          <span id="lib-count" data-i18n="sidebar.libCount">壁纸库</span>
+          <button type="button" id="open-pkg" data-i18n="file.open" data-i18n-title="file.openTitle" title="纯前端预览 Wallpaper Engine 的 scene.pkg（无需后端，文件不离开浏览器）">打开本地 .pkg</button>
+          <button type="button" id="pick-lib" data-i18n-title="sidebar.pickLib" title="选择壁纸库文件夹（也可继续用 WE_LIBRARY）" data-i18n="btn.pickLib">选择文件夹</button>
+        </div>
+        <p id="libpath" class="muted" title=""></p>
+        <input id="pkg-file" type="file" accept=".pkg" hidden />
+        <div class="sidebar-tools">
+          <input id="filter" type="search" placeholder="过滤标题 / itemId" data-i18n-ph="ph.filter" />
+          <div id="type-filter" class="seg" role="radiogroup" aria-label="壁纸类型">
+            <button type="button" class="seg-btn active" data-type="scene" role="radio" aria-checked="true">scene</button>
+            <button type="button" class="seg-btn" data-type="web" role="radio" aria-checked="false">web</button>
+            <button type="button" class="seg-btn" data-type="video" role="radio" aria-checked="false">video</button>
+          </div>
+        </div>
+        <ul id="list"></ul>
+      </aside>
+
+      <div id="main">
+        <div id="editor-chrome">
+          <div id="editor-tabs">
+            <div class="tab active" id="current" role="tab" aria-selected="true" data-i18n="tab.wallpaper">未选择壁纸</div>
+          </div>
+          <div id="toolbar">
+            <label data-i18n-title="toolbar.resolutionTip" title="舞台逻辑分辨率（iframe 视口）"><span data-i18n="toolbar.resolution">分辨率</span>
+              <select id="resolution">
+                <option value="fit" data-i18n="res.fit">自适应 16:9</option>
+                <option value="1280x720">1280 × 720 · HD</option>
+                <option value="1366x768">1366 × 768</option>
+                <option value="1440x900">1440 × 900</option>
+                <option value="1600x900">1600 × 900</option>
+                <option value="1680x1050">1680 × 1050</option>
+                <option value="1920x1080">1920 × 1080 · FHD</option>
+                <option value="1920x1200">1920 × 1200 · 16:10</option>
+                <option value="2560x1080">2560 × 1080 · 超宽</option>
+                <option value="2560x1440">2560 × 1440 · QHD</option>
+                <option value="2560x1600">2560 × 1600</option>
+                <option value="3440x1440">3440 × 1440 · 超宽</option>
+                <option value="3840x2160">3840 × 2160 · 4K</option>
+                <option value="1080x1920">1080 × 1920 · 竖屏</option>
+                <option value="1440x2560">1440 × 2560 · 竖屏</option>
+              </select>
+            </label>
+            <label>fit
+              <select id="fit">
+                <option value="cover">cover</option>
+                <option value="contain">contain</option>
+                <option value="stretch">stretch</option>
+              </select>
+            </label>
+            <label>dpr
+              <select id="dpr">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+              </select>
+            </label>
+            <label>fps
+              <select id="fps">
+                <option value="30">30</option>
+                <option value="60" selected>60</option>
+                <option value="120">120</option>
+              </select>
+            </label>
+            <label class="vol"><span data-i18n="toolbar.volume">音量</span>
+              <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
+            </label>
+            <button type="button" id="pause" data-i18n="toolbar.pause">暂停</button>
+            <button type="button" id="resume" data-i18n="toolbar.resume">恢复</button>
+            <button type="button" id="reload" data-i18n="toolbar.reload">重挂载</button>
+            <button type="button" id="release" data-i18n="toolbar.release">释放</button>
+            <button type="button" id="restore" data-i18n="toolbar.restore">恢复挂载</button>
+            <button type="button" id="open" data-i18n="toolbar.open">新窗口</button>
+            <button type="button" id="toggle-props" data-i18n="toolbar.props">壁纸配置</button>
+            <label class="fx"><span data-i18n="toolbar.filter">滤镜</span>
+              <select id="fx" data-i18n-title="toolbar.filterTip">
+                <option value="none" selected data-i18n="filter.none">无</option>
+                <option value="blur" data-i18n="filter.blur">高斯模糊</option>
+                <option value="grayscale" data-i18n="filter.grayscale">黑白</option>
+                <option value="sepia" data-i18n="filter.sepia">怀旧</option>
+                <option value="vivid" data-i18n="filter.vivid">鲜艳</option>
+                <option value="warm" data-i18n="filter.warm">暖色</option>
+                <option value="cool" data-i18n="filter.cool">冷色</option>
+                <option value="invert" data-i18n="filter.invert">反色</option>
+                <option value="brighten" data-i18n="filter.brighten">提亮</option>
+                <option value="darken" data-i18n="filter.darken">压暗</option>
+                <option value="contrast" data-i18n="filter.contrast">高对比</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div id="workspace">
+          <div id="stage-slot">
+            <div id="stage-frame">
+              <div id="stage-scale">
+                <div id="stage">
+                  <iframe id="frame" title="renderer"></iframe>
+                  <div id="empty" data-i18n="stage.empty">从左侧选择一个壁纸开始渲染</div>
+                </div>
+              </div>
+              <div id="stage-badge" hidden></div>
+            </div>
+          </div>
+          <aside id="props" hidden>
+            <div class="props-head">
+              <div class="props-head-main">
+                <strong data-i18n="props.title">壁纸配置</strong>
+                <span id="props-state"></span>
+              </div>
+              <div class="props-head-actions">
+                <button type="button" id="props-reset" data-i18n="props.reset">恢复默认</button>
+                <button type="button" id="props-close" data-i18n="props.collapse">收起</button>
+              </div>
+            </div>
+            <div class="props-row">
+              <input id="props-filter" type="search" placeholder="过滤属性名 / 文案" data-i18n-ph="ph.propsFilter" />
+              <label class="check"><input id="props-all" type="checkbox" /> <span data-i18n="props.showHidden">显示条件隐藏项</span></label>
+            </div>
+            <div id="props-body"></div>
+          </aside>
+          <section id="docs-view" hidden>
+            <div id="docs-body"></div>
+            <div id="sponsor-card">
+              <strong data-i18n="sponsor.title">赞赏作者</strong>
+              <p data-i18n="sponsor.text">如果这个渲染核心帮到了你的项目，欢迎请作者喝杯咖啡。扫描二维码即可赞赏，金额随意。</p>
+              <div class="sponsor-qr-container">
+                <!-- 国内收款码。海外收款码后续照 sponsor-qr-item 结构再加一项即可 -->
+                <figure class="sponsor-qr-item">
+                  <img class="sponsor-qr" src="./imgs/wechat.png" alt="微信支付赞赏码" />
+                  <figcaption data-i18n="sponsor.wechat">微信支付</figcaption>
+                </figure>
+                <figure class="sponsor-qr-item">
+                  <img class="sponsor-qr" src="./imgs/alipay.png" alt="支付宝赞赏码" />
+                  <figcaption data-i18n="sponsor.alipay">支付宝</figcaption>
+                </figure>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section id="logs">
+          <div class="logs-head">
+            <button type="button" id="toggle-logs" aria-expanded="true" data-i18n-title="logs.collapse" title="折叠输出">▾</button>
+            <span class="panel-tab active" data-i18n="logs.head">输出</span>
+            <strong data-i18n="logs.diag">渲染器诊断（/diag）</strong>
+            <span class="spacer"></span>
+            <button type="button" id="clear-logs" data-i18n="logs.clear">清空</button>
+          </div>
+          <pre id="logbody"></pre>
+        </section>
+      </div>
+    </div>
+
+    <footer id="statusbar">
+      <span id="status-lib" title=""></span>
+      <span class="status-sep"></span>
+      <span id="status-count"></span>
+      <span class="grow"></span>
+      <span id="status-item"></span>
+      <span id="status-res" data-i18n="status.adaptive">自适应 16:9</span>
+      <span id="status-dpr">DPR 1</span>
+      <span id="status-fps" data-i18n-title="status.capTitle" title="帧率上限（工具条 fps）">上限 60</span>
+      <span id="status-live-fps" class="idle" data-i18n-title="status.liveTitle" title="壁纸实测帧率（渲染循环最近 500ms）">— FPS</span>
+    </footer>
+
+    <script type="module" src="/bench/bench.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,59 @@
+<!doctype html>
+<!-- 内置粒子贴图目检页：渲染 buildBuiltinParticleTexture 的全部登记项 + 兜底采样。
+     用法：pnpm dev 后打开 /bench/particle-textures.html。
+     判读要点（对照 docs/CASEBOOK.md「粒子与特效」）：
+       1. 边缘必须收敛到黑（alpha 0），任何可见方形轮廓都是缺陷；
+       2. 渐变不得有同心色带（多项式衰减的症状，高斯剖面不应出现）；
+       3. 雾/烟的絮团应有大尺度结构，不得看出值噪声的格子。 -->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>内置粒子贴图目检</title>
+<style>
+  body { margin: 0; background: #0b0d10; color: #c9d1d9; font: 12px/1.5 ui-monospace, Menlo, monospace; }
+  h1 { font-size: 14px; padding: 12px 16px 0; }
+  p { padding: 0 16px; color: #8b949e; }
+  .grid { display: flex; flex-wrap: wrap; gap: 14px; padding: 16px; }
+  figure { margin: 0; text-align: center; }
+  canvas { background:
+    linear-gradient(45deg, #161b22 25%, transparent 25%, transparent 75%, #161b22 75%),
+    linear-gradient(45deg, #161b22 25%, #0d1117 25%, #0d1117 75%, #161b22 75%);
+    background-size: 16px 16px; border: 1px solid #30363d; border-radius: 4px; image-rendering: auto; }
+  figcaption { margin-top: 4px; color: #8b949e; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>内置粒子贴图（全程序化生成）</h1>
+<p>listBuiltinParticleTextureNames() 全部登记项 + 关键词兜底采样。生成尺寸 = 原生 ×2。缩略显示 128px。</p>
+<div class="grid" id="grid"></div>
+<script type="module">
+  const ptex = await import('/renderer/vendor/we-scene/render/particle-textures.js');
+  const names = [
+    ...ptex.listBuiltinParticleTextureNames(),
+    'x/unknown-name', 'x/fog', 'x/sparkle', 'x/fire', 'x/snow', 'x/sickle', 'x/流星',
+  ];
+  const grid = document.getElementById('grid');
+  for (const n of names) {
+    const t = ptex.buildBuiltinParticleTexture(n);
+    const c = document.createElement('canvas');
+    c.width = Math.round((t.width / t.height) * 128);
+    c.height = 128;
+    const ctx = c.getContext('2d');
+    const img = new ImageData(new Uint8ClampedArray(t.rgba), t.width, t.height);
+    // 手动双线性关闭：直接平滑缩放（drawImage 会做双线性，正好模拟 GPU 采样）
+    const tmp = document.createElement('canvas');
+    tmp.width = t.width;
+    tmp.height = t.height;
+    tmp.getContext('2d').putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(tmp, 0, 0, c.width, c.height);
+    const fig = document.createElement('figure');
+    fig.appendChild(c);
+    const cap = document.createElement('figcaption');
+    cap.textContent = n + '（' + t.width + '×' + t.height + '）';
+    fig.appendChild(cap);
+    grid.appendChild(fig);
+  }
+</script>
+</body>
+</html>

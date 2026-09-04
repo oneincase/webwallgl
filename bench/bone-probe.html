@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>逐骨可视化探针（骨架 + 绑定/动画对照）</title>
+<style>
+  body{margin:0;background:#111;color:#ddd;font:12px/1.5 ui-monospace,monospace;padding:12px}
+  h1{font-size:14px;margin:0 0 8px}
+  .row{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+  .box{padding:6px 9px;background:#1c1c1c;border-left:3px solid #555;white-space:pre-wrap;max-width:1180px}
+  canvas{border:1px solid #444;background:#000;image-rendering:auto}
+  label{margin-right:10px}
+  select,input{background:#222;color:#ddd;border:1px solid #444;padding:2px 4px}
+  .legend span{display:inline-block;margin-right:14px}
+  .k{display:inline-block;width:10px;height:10px;vertical-align:middle;margin-right:4px}
+  .bad{color:#ff6b6b}.ok{color:#5cd65c}.warn{color:#ffcc66}
+</style>
+</head>
+<body>
+<h1>逐骨可视化探针</h1>
+<div class="box">
+把 MDL 的骨架画出来做对照，用于定位「模型炸开 / 部位消失」的具体骨骼层级。
+<b>绿= 绑定姿势骨架</b>（invBindWorld 的来源，理论静止形态）；
+<b>红= 当前动画姿势骨架</b>；<b>黄线</b>= 同一根骨从绑定到动画的位移向量；
+<b>点</b>= 骨骼原点，<b>越亮=链越深</b>。灰点是蒙皮后的顶点云（抽样）。
+判据：若红骨架整体贴合绿骨架、只有末端轻微偏移 → 正常；若某一级突然大幅偏离
+并把整条子链带走 → 那一级的局部变换或绑定基准算错了。
+</div>
+<div class="row" style="margin:8px 0">
+  <label>壁纸 <select id="wp"></select></label>
+  <label>模型 <select id="mdl"></select></label>
+  <label>时间 <input id="t" type="range" min="0" max="1" step="0.002" value="0.4" style="width:280px"></label>
+  <span id="tlab">t=—</span>
+  <label><input id="showVerts" type="checkbox" checked> 顶点云</label>
+  <label><input id="showIdx" type="checkbox"> 骨号</label>
+</div>
+<div class="legend box" id="stats">加载中…</div>
+<div class="row">
+  <canvas id="cv" width="900" height="900"></canvas>
+  <div class="box" id="chain" style="max-width:420px;max-height:900px;overflow:auto">链路诊断</div>
+</div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as mdlMod from '/renderer/vendor/we-scene/render/mdl.js'
+
+const dec = new TextDecoder()
+const $ = (id) => document.getElementById(id)
+const cv = $('cv'), cx = cv.getContext('2d')
+
+// ---- 纯 JS 矩阵（只用于探针，不依赖渲染器内部实现）----
+const mul = (A, B) => { const O = new Float32Array(16)
+  for (let i=0;i<4;i++) for (let j=0;j<4;j++){ let s=0; for (let k=0;k<4;k++) s+=A[k*4+j]*B[i*4+k]; O[i*4+j]=s }
+  return O }
+const xf = (M, x, y) => [M[0]*x+M[4]*y+M[12], M[1]*x+M[5]*y+M[13]]
+
+let cache = new Map()
+async function loadPkg(id) {
+  if (cache.has(id)) return cache.get(id)
+  let r = await fetch(`/media/dev/${id}/scenes/scene.pkg`)
+  if (!r.ok) r = await fetch(`/media/dev/${id}/scene.pkg`)
+  if (!r.ok) throw new Error('scene.pkg HTTP ' + r.status)
+  const pk = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+  cache.set(id, pk)
+  return pk
+}
+
+// 用 scene.json 找出每个 puppet 模型对应的 animationlayers（与渲染路径一致）
+function collectPuppets(pk) {
+  const raw = JSON.parse(dec.decode(pkgMod.getEntry(pk, 'scene.json')))
+  const out = []
+  for (const o of raw.objects || []) {
+    if (typeof o.image !== 'string') continue
+    const me = pkgMod.getEntry(pk, o.image)
+    if (!me) continue
+    let mj; try { mj = JSON.parse(dec.decode(me)) } catch { continue }
+    if (!mj.puppet) continue
+    out.push({
+      id: o.id, name: o.name || '?', puppet: mj.puppet,
+      animLayers: (o.animationlayers || o.animationLayers || []).map((l) => ({
+        animation: l.animation, visible: l.visible !== false,
+        additive: !!l.additive,
+        blend: typeof l.blend === 'number' ? l.blend : 1,
+        rate: typeof l.rate === 'number' ? l.rate : 1,
+      })),
+    })
+  }
+  return out
+}
+
+// 绑定姿势世界矩阵：invBindWorld 的逆（探针只读，不改渲染器）
+function bindWorlds(m) {
+  const inv4 = (a) => { // 通用 4x4 逆
+    const o = new Float32Array(16)
+    const m00=a[0],m01=a[1],m02=a[2],m03=a[3],m10=a[4],m11=a[5],m12=a[6],m13=a[7]
+    const m20=a[8],m21=a[9],m22=a[10],m23=a[11],m30=a[12],m31=a[13],m32=a[14],m33=a[15]
+    const b00=m00*m11-m01*m10,b01=m00*m12-m02*m10,b02=m00*m13-m03*m10,b03=m01*m12-m02*m11
+    const b04=m01*m13-m03*m11,b05=m02*m13-m03*m12,b06=m20*m31-m21*m30,b07=m20*m32-m22*m30
+    const b08=m20*m33-m23*m30,b09=m21*m32-m22*m31,b10=m21*m33-m23*m31,b11=m22*m33-m23*m32
+    let d=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06
+    if (!d) return Float32Array.from([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1])
+    d = 1/d
+    o[0]=(m11*b11-m12*b10+m13*b09)*d; o[1]=(m02*b10-m01*b11-m03*b09)*d
+    o[2]=(m31*b05-m32*b04+m33*b03)*d; o[3]=(m22*b04-m21*b05-m23*b03)*d
+    o[4]=(m12*b08-m10*b11-m13*b07)*d; o[5]=(m00*b11-m02*b08+m03*b07)*d
+    o[6]=(m32*b02-m30*b05-m33*b01)*d; o[7]=(m20*b05-m22*b02+m23*b01)*d
+    o[8]=(m10*b10-m11*b08+m13*b06)*d; o[9]=(m01*b08-m00*b10-m03*b06)*d
+    o[10]=(m30*b04-m31*b02+m33*b00)*d; o[11]=(m21*b02-m20*b04-m23*b00)*d
+    o[12]=(m11*b07-m10*b09-m12*b06)*d; o[13]=(m00*b09-m01*b07+m02*b06)*d
+    o[14]=(m31*b01-m30*b03-m32*b00)*d; o[15]=(m20*b03-m21*b01+m22*b00)*d
+    return o
+  }
+  return m.invBindWorld.map(inv4)
+}
+
+let cur = null // { m, entry, bw }
+
+async function pickModel() {
+  const id = $('wp').value
+  const pk = await loadPkg(id)
+  const list = collectPuppets(pk)
+  const sel = $('mdl')
+  if (sel.dataset.wp !== id) {
+    sel.innerHTML = ''
+    for (let i = 0; i < list.length; i++) {
+      const op = document.createElement('option')
+      op.value = String(i)
+      op.textContent = `${list[i].name} (${list[i].puppet.split('/').pop()})`
+      sel.appendChild(op)
+    }
+    sel.dataset.wp = id
+  }
+  const entry = list[Number(sel.value) || 0]
+  if (!entry) throw new Error('该壁纸没有 puppet 模型')
+  const m = mdlMod.parseMDL(pkgMod.getEntry(pk, entry.puppet))
+  cur = { m, entry, bw: bindWorlds(m) }
+  return cur
+}
+
+function draw() {
+  if (!cur) return
+  const { m, entry, bw } = cur
+  const anims = m.animations || []
+  const dur = anims.length ? anims[0].duration : 1
+  const time = Number($('t').value) * dur
+  $('tlab').textContent = `t=${time.toFixed(2)}s / ${dur.toFixed(1)}s`
+
+  const layers = entry.animLayers.length ? entry.animLayers
+    : (anims.length ? [{ animation: anims[0].id, visible: true, additive: false, blend: 1, rate: 1 }] : [])
+  const skin = mdlMod.computeSkinMatrices(m, time, layers, null)
+
+  // 动画后的骨骼世界矩阵 = skin · bindWorld
+  const aw = []
+  for (let b = 0; b < m.bones.length; b++) {
+    aw.push(skin ? mul(skin.subarray(b*16, b*16+16), bw[b]) : Float32Array.from(bw[b]))
+  }
+
+  // 视野：绑定骨架 + 顶点范围
+  let mnx=Infinity,mxx=-Infinity,mny=Infinity,mxy=-Infinity
+  const bump = (x,y) => { if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y }
+  for (let b=0;b<m.bones.length;b++){ bump(bw[b][12],bw[b][13]); bump(aw[b][12],aw[b][13]) }
+  for (let i=0;i<m.vertexCount;i+=23) bump(m.positions[i*3], m.positions[i*3+1])
+  const pad = 60
+  const sx = (cv.width-pad*2)/Math.max(1,(mxx-mnx)), sy = (cv.height-pad*2)/Math.max(1,(mxy-mny))
+  const s = Math.min(sx, sy)
+  // y 向下翻转（模型 y-up → 画布 y-down）
+  const P = (x,y) => [pad + (x-mnx)*s, cv.height - pad - (y-mny)*s]
+
+  cx.clearRect(0,0,cv.width,cv.height)
+  cx.fillStyle = '#000'; cx.fillRect(0,0,cv.width,cv.height)
+
+  // 顶点云（蒙皮后）
+  if ($('showVerts').checked && skin) {
+    cx.fillStyle = 'rgba(160,160,160,0.5)'
+    for (let i=0;i<m.vertexCount;i+=11){
+      const px=m.positions[i*3], py=m.positions[i*3+1], pz=m.positions[i*3+2]
+      let ox=0, oy=0
+      for (let k=0;k<4;k++){
+        const w=m.weights[i*4+k]; if (w===0) continue
+        const b=m.boneIdx[i*4+k]|0
+        const M=skin.subarray(b*16,b*16+16)
+        ox+=w*(M[0]*px+M[4]*py+M[8]*pz+M[12]); oy+=w*(M[1]*px+M[5]*py+M[9]*pz+M[13])
+      }
+      const [X,Y]=P(ox,oy)
+      cx.fillRect(X,Y,1.4,1.4)
+    }
+  }
+
+  const depth = (b) => { let d=0,p=m.bones[b].parent; while(p>=0&&d<200){d++;p=m.bones[p].parent} return d }
+  const maxD = Math.max(1, ...m.bones.map((_,b)=>depth(b)))
+
+  // 绑定骨架（绿）
+  cx.lineWidth = 1.6
+  for (let b=0;b<m.bones.length;b++){
+    const p=m.bones[b].parent
+    if (p<0) continue
+    const [x1,y1]=P(bw[p][12],bw[p][13]), [x2,y2]=P(bw[b][12],bw[b][13])
+    cx.strokeStyle='rgba(70,210,110,0.55)'
+    cx.beginPath(); cx.moveTo(x1,y1); cx.lineTo(x2,y2); cx.stroke()
+  }
+  // 动画骨架（红）
+  for (let b=0;b<m.bones.length;b++){
+    const p=m.bones[b].parent
+    if (p<0) continue
+    const [x1,y1]=P(aw[p][12],aw[p][13]), [x2,y2]=P(aw[b][12],aw[b][13])
+    cx.strokeStyle='rgba(255,80,80,0.85)'
+    cx.beginPath(); cx.moveTo(x1,y1); cx.lineTo(x2,y2); cx.stroke()
+  }
+  // 位移向量（黄）+ 骨点
+  const rows=[]
+  for (let b=0;b<m.bones.length;b++){
+    const [bx,by]=P(bw[b][12],bw[b][13]), [ax,ay]=P(aw[b][12],aw[b][13])
+    const d=Math.hypot(aw[b][12]-bw[b][12], aw[b][13]-bw[b][13])
+    if (d>0.5){
+      cx.strokeStyle='rgba(255,215,0,0.75)'; cx.lineWidth=1
+      cx.beginPath(); cx.moveTo(bx,by); cx.lineTo(ax,ay); cx.stroke()
+    }
+    const dep=depth(b), lum=100+Math.round(155*dep/maxD)
+    cx.fillStyle=`rgb(${lum},${lum},255)`
+    cx.beginPath(); cx.arc(ax,ay,2.6,0,6.2832); cx.fill()
+    if ($('showIdx').checked){ cx.fillStyle='#8cf'; cx.font='9px monospace'; cx.fillText(String(b), ax+4, ay-3) }
+    rows.push({b,d,dep,parent:m.bones[b].parent})
+  }
+
+  // 统计 + 链路诊断：找「相对父骨的额外位移」最大的骨（跳变点）
+  let mx=0, mxb=-1
+  const jump=[]
+  for (const r of rows){
+    if (r.d>mx){mx=r.d;mxb=r.b}
+    const p=r.parent
+    if (p<0) continue
+    const dp=rows[p].d
+    jump.push({b:r.b, extra:r.d-dp, d:r.d, dep:r.dep})
+  }
+  jump.sort((a,b)=>b.extra-a.extra)
+  let mnxv=Infinity,mxxv=-Infinity,mnyv=Infinity,mxyv=-Infinity
+  for (let i=0;i<m.vertexCount;i++){const x=m.positions[i*3],y=m.positions[i*3+1]
+    if(x<mnxv)mnxv=x;if(x>mxxv)mxxv=x;if(y<mnyv)mnyv=y;if(y>mxyv)mxyv=y}
+  const size=Math.max(mxxv-mnxv,mxyv-mnyv)
+  const ratio = mx/size
+  $('stats').innerHTML =
+    `<span><i class="k" style="background:#46d26e"></i>绑定骨架</span>`
+    + `<span><i class="k" style="background:#ff5050"></i>动画骨架</span>`
+    + `<span><i class="k" style="background:#ffd700"></i>位移向量</span>`
+    + `<span><i class="k" style="background:#aaa"></i>蒙皮顶点</span><br>`
+    + `${m.magic} · 骨 ${m.bones.length} · 顶点 ${m.vertexCount} · 动画 ${anims.length} · 层 ${layers.length}`
+    + `（${layers.map(l=>`${l.additive?'add':'mix'} blend=${l.blend} rate=${l.rate}`).join(' | ')||'无'}）<br>`
+    + `模型尺度 ${size.toFixed(0)}px · 骨最大位移 ${mx.toFixed(1)}px (骨${mxb}) = `
+    + `<b class="${ratio>0.15?'bad':ratio>0.06?'warn':'ok'}">${(ratio*100).toFixed(1)}%</b> 尺度`
+  $('chain').innerHTML = '<b>相对父骨的额外位移 TOP12（跳变点=可疑层级）</b>\n'
+    + jump.slice(0,12).map(j=>`  骨${String(j.b).padStart(3)} 链深${String(j.dep).padStart(2)}  额外 ${j.extra>=0?'+':''}${j.extra.toFixed(1)}px   累计 ${j.d.toFixed(1)}px`).join('\n')
+}
+
+async function boot() {
+  const r = await fetch('/api/library')
+  const lib = r.ok ? await r.json() : { items: [] }
+  const scenes = (lib.items||[]).filter(w=>w.type==='scene'||w.type==='Scene')
+  const sel = $('wp')
+  // 只列出「含 .mdl」的壁纸需要逐个拉包，代价高；这里全列，选中才解析
+  for (const w of scenes){
+    const op=document.createElement('option')
+    op.value=w.itemId; op.textContent=`${w.itemId} ${String(w.title||'').slice(0,28)}`
+    sel.appendChild(op)
+  }
+  const q = new URLSearchParams(location.search)
+  sel.value = q.get('id') || '3436945972'
+  const refresh = async () => {
+    try { await pickModel(); draw() }
+    catch (e) { $('stats').innerHTML = `<span class="bad">${String(e.message||e).slice(0,200)}</span>` }
+  }
+  sel.onchange = async () => { $('mdl').dataset.wp=''; await refresh() }
+  $('mdl').onchange = refresh
+  for (const el of ['t','showVerts','showIdx']) $(el).oninput = draw
+  await refresh()
+}
+boot().catch(e=>{ $('stats').innerHTML = `<span class="bad">启动失败: ${String(e.stack||e).slice(0,300)}</span>` })
+</script>
+</body>
+</html>

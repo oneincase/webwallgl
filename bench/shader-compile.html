@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>效果 shader 真实编译校验</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font:13px/1.6 -apple-system,sans-serif; padding:16px; }
+  h1 { font-size:15px; margin:0 0 12px; }
+  p { max-width:900px; }
+  table { border-collapse:collapse; font-size:12px; margin-top:10px; width:100%; max-width:1200px; }
+  th,td { border:1px solid #333; padding:4px 8px; text-align:right; vertical-align:top; }
+  th { background:#1c1c1c; text-align:left; position:sticky; top:0; }
+  td:first-child, td:nth-child(2) { text-align:left; }
+  .ok { color:#5cd65c; } .bad { color:#ff6b6b; } .dim { color:#888; }
+  #sum { margin:12px 0; padding:8px 10px; background:#1c1c1c; border-left:3px solid #555; white-space:pre-wrap; }
+  pre { margin:2px 0; font-size:11px; color:#ffb4b4; white-space:pre-wrap; max-width:1100px; }
+  code { color:#9cd; }
+</style>
+</head>
+<body>
+<h1>效果 shader 真实编译校验</h1>
+<p>把全库每个效果 pass 的 shader 按<strong>真实 combos</strong> 走 <code>hlsl2glsl</code> 转译，
+再交给真正的 WebGL2 <code>compileShader</code> / <code>linkProgram</code>。
+这是唯一能证伪「转译产物看着没问题」的手段 —— <code>pnpm verify:shaders</code> 只做文本检查
+（未定义符号 / include 缺失 / 方言残留），编不过的 GLSL 它抓不到。</p>
+<p class="dim">失败的 pass 在实机上表现为：<code>renderLayer</code> 打一句 <code>console.warn</code>
+后跳过<strong>整个效果</strong>，画面照常出，只是水波/色调/模糊静默消失 —— 所以必须在这里量化。</p>
+<p>用法：<code>/bench/shader-compile.html</code> 跑全库；<code>?src=2134765860</code> 只跑一个壁纸；
+<code>?verbose=1</code> 打印每条失败的 GLSL 日志与出错行。</p>
+<div id="sum">运行中…</div>
+<div id="out"></div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import { hlsl2glsl } from '/renderer/vendor/we-scene/render/hlsl2glsl.js'
+import { WE_SHADER_HEADERS } from '/renderer/vendor/we-scene/headers.ts'
+
+const qs = new URLSearchParams(location.search)
+const ONLY = qs.get('src')
+const VERBOSE = qs.get('verbose') === '1'
+
+const utf8 = new TextDecoder()
+const readText = (b) => utf8.decode(b).replace(/^\uFEFF/, '')
+const out = document.getElementById('out')
+const sum = document.getElementById('sum')
+
+const canvas = document.createElement('canvas')
+canvas.width = canvas.height = 4
+const gl = canvas.getContext('webgl2')
+if (!gl) {
+  sum.innerHTML = '<span class="bad">WebGL2 不可用，无法做真实编译校验</span>'
+  throw new Error('no webgl2')
+}
+
+// 与 renderer.js 的 linkProgram 同构：分别编译 vert/frag 再链接。
+// 只关心「能否编译链接」，不需要真正绘制。
+function compileOne(type, src) {
+  const sh = gl.createShader(type)
+  gl.shaderSource(sh, src)
+  gl.compileShader(sh)
+  const ok = gl.getShaderParameter(sh, gl.COMPILE_STATUS)
+  const log = ok ? '' : (gl.getShaderInfoLog(sh) || '')
+  gl.deleteShader(sh)
+  return { ok, log }
+}
+function linkPair(vsSrc, fsSrc) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vsSrc); gl.compileShader(vs)
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fsSrc); gl.compileShader(fs)
+  const p = gl.createProgram()
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p)
+  const ok = gl.getProgramParameter(p, gl.LINK_STATUS)
+  const log = ok ? '' : (gl.getProgramInfoLog(p) || '')
+  gl.deleteShader(vs); gl.deleteShader(fs); gl.deleteProgram(p)
+  return { ok, log }
+}
+
+// GLSL 报错里带行号（如 "ERROR: 0:42: ..."），把对应源码行摘出来，
+// 否则一堆 "syntax error" 无法定位到底是哪条改写坏的。
+function annotate(log, src) {
+  const lines = src.split('\n')
+  return log.split('\n').filter(Boolean).slice(0, 6).map((l) => {
+    const m = /:(\d+):(\d+):/.exec(l) || /:\s*(\d+):(\d+)/.exec(l)
+    const ln = m ? Number(m[2]) : NaN
+    const srcLine = Number.isFinite(ln) && lines[ln - 1] !== undefined ? `\n        ${ln}| ${lines[ln - 1].trim()}` : ''
+    return l + srcLine
+  }).join('\n')
+}
+
+async function listItems() {
+  if (ONLY) return [ONLY]
+  const r = await fetch('/api/library')
+  if (!r.ok) throw new Error('/api/library 不可用（需 pnpm dev 起测试台）')
+  const j = await r.json()
+  const arr = Array.isArray(j) ? j : (j.items || j.list || [])
+  return arr.map((x) => (typeof x === 'string' ? x : (x.itemId || x.id || x.name))).filter(Boolean)
+}
+
+async function loadPkg(item) {
+  for (const p of [`/media/dev/${item}/scene.pkg`, `/media/dev/${item}/scenes/scene.pkg`, `/media/dev/${item}/gifscene.pkg`]) {
+    const r = await fetch(p)
+    if (r.ok) return pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+  }
+  return null
+}
+
+// 与 main.ts 的 shaderResolver 同语义：pkg 内嵌优先，缺失回落内置公共头
+function makeResolver(parsed) {
+  return (rel) => {
+    const inner = rel.startsWith('shaders/') ? rel : 'shaders/' + rel
+    const file = rel.startsWith('shaders/') ? rel.slice('shaders/'.length) : rel
+    const e = pkgMod.getEntry(parsed, inner)
+    if (e) return readText(e)
+    return WE_SHADER_HEADERS[file] ?? null
+  }
+}
+
+// 收集 effect → material → shader + 真实 combos（与 effects-parse.js 同路径）
+function collectJobs(parsed) {
+  const jobs = []
+  const raw = pkgMod.getEntry(parsed, 'scene.json') || pkgMod.getEntry(parsed, 'gifscene.json')
+  if (!raw) return jobs
+  let sj
+  try { sj = JSON.parse(readText(raw)) } catch { return jobs }
+  const seen = new Set()
+  const visit = (o) => {
+    if (!o || typeof o !== 'object') return
+    if (Array.isArray(o)) { for (const v of o) visit(v); return }
+    for (const eff of o.effects || []) {
+      if (!eff || typeof eff.file !== 'string') continue
+      const ee = pkgMod.getEntry(parsed, eff.file)
+      if (!ee) continue
+      let ej
+      try { ej = JSON.parse(readText(ee)) } catch { continue }
+      const scenePasses = eff.passes || []
+      ;(ej.passes || []).forEach((p, i) => {
+        if (!p.material) return
+        const me = pkgMod.getEntry(parsed, p.material)
+        if (!me) return
+        let mj
+        try { mj = JSON.parse(readText(me)) } catch { return }
+        const mp = (mj.passes && mj.passes[0]) || {}
+        if (!mp.shader) return
+        const combos = { ...(mp.combos || {}), ...((scenePasses[i] || {}).combos || {}) }
+        const key = mp.shader + '|' + JSON.stringify(combos)
+        if (seen.has(key)) return
+        seen.add(key)
+        jobs.push({ shader: mp.shader, combos, effect: eff.file })
+      })
+    }
+    for (const v of Object.values(o)) visit(v)
+  }
+  visit(sj.objects || [])
+  return jobs
+}
+
+async function main() {
+  const items = await listItems()
+  let nPrograms = 0, okPrograms = 0
+  let nStages = 0, okStages = 0
+  const failByShader = new Map()   // shader → { count, wallpapers:Set, log }
+  const badWallpapers = new Set()
+  const scanned = []
+
+  const rows = []
+  for (const item of items) {
+    let parsed
+    try { parsed = await loadPkg(item) } catch { parsed = null }
+    if (!parsed) continue
+    scanned.push(item)
+    const resolver = makeResolver(parsed)
+    const jobs = collectJobs(parsed)
+    let itemOk = 0, itemTotal = 0
+
+    for (const job of jobs) {
+      const vsRaw = resolver('shaders/' + job.shader + '.vert')
+      const fsRaw = resolver('shaders/' + job.shader + '.frag')
+      if (!vsRaw && !fsRaw) continue
+      let vs = null, fs = null, threw = ''
+      try {
+        // 互传配对 stage 源码（与 renderer.js 一致）：combo 默认值需两个 stage 合并看，
+        // 否则 KERNEL 只声明在 .vert 的效果会因 varying 数组长度不一致而链接失败。
+        if (vsRaw) vs = hlsl2glsl(vsRaw, 'vert', job.combos, resolver, fsRaw || '')
+        if (fsRaw) fs = hlsl2glsl(fsRaw, 'frag', job.combos, resolver, vsRaw || '')
+      } catch (e) { threw = '转译抛错: ' + e.message }
+
+      // 逐 stage 编译
+      const stageResults = []
+      if (!threw) {
+        if (vs) { const r = compileOne(gl.VERTEX_SHADER, vs); nStages++; if (r.ok) okStages++; stageResults.push(['vert', r, vs]) }
+        if (fs) { const r = compileOne(gl.FRAGMENT_SHADER, fs); nStages++; if (r.ok) okStages++; stageResults.push(['frag', r, fs]) }
+      }
+
+      // 程序级：两个 stage 都有才链接（renderer 就是这样用的）
+      itemTotal++; nPrograms++
+      let progOk = false, progLog = threw
+      if (!threw) {
+        if (vs && fs) {
+          const stagesOk = stageResults.every(([, r]) => r.ok)
+          if (stagesOk) { const r = linkPair(vs, fs); progOk = r.ok; progLog = r.ok ? '' : ('链接失败: ' + r.log) }
+          else progLog = stageResults.filter(([, r]) => !r.ok).map(([st, r, s]) => `${st}: ${annotate(r.log, s)}`).join('\n')
+        } else {
+          const only = stageResults[0]
+          progOk = only ? only[1].ok : false
+          if (!progOk && only) progLog = `${only[0]}: ${annotate(only[1].log, only[2])}`
+        }
+      }
+      if (progOk) { okPrograms++; itemOk++ } else {
+        badWallpapers.add(item)
+        const k = job.shader
+        if (!failByShader.has(k)) failByShader.set(k, { count: 0, wallpapers: new Set(), log: progLog })
+        const rec = failByShader.get(k)
+        rec.count++; rec.wallpapers.add(item)
+      }
+    }
+    if (itemTotal) rows.push({ item, itemOk, itemTotal })
+  }
+
+  const pct = (a, b) => (b === 0 ? '0.0' : ((a / b) * 100).toFixed(1))
+  sum.innerHTML =
+    `扫描壁纸 <b>${scanned.length}</b> 个\n` +
+    `program（效果 pass）编译+链接通过：<b class="${okPrograms === nPrograms ? 'ok' : 'bad'}">${okPrograms}/${nPrograms}</b> (${pct(okPrograms, nPrograms)}%)\n` +
+    `stage（单个 vert/frag）编译通过：<b>${okStages}/${nStages}</b> (${pct(okStages, nStages)}%)\n` +
+    `存在失败 pass 的壁纸：<b class="${badWallpapers.size === 0 ? 'ok' : 'bad'}">${badWallpapers.size}/${scanned.length}</b>`
+
+  let html = ''
+  if (failByShader.size) {
+    html += `<h3 class="bad">失败的 shader（${failByShader.size} 个）</h3><table><tr><th>shader</th><th>失败 pass</th><th>壁纸数</th><th>首条日志</th></tr>`
+    const sorted = [...failByShader.entries()].sort((a, b) => b[1].count - a[1].count)
+    for (const [name, rec] of sorted) {
+      const first = VERBOSE ? rec.log : rec.log.split('\n')[0]
+      html += `<tr><td><code>${name}</code></td><td>${rec.count}</td><td>${rec.wallpapers.size}</td><td><pre>${(first || '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</pre></td></tr>`
+    }
+    html += '</table>'
+  } else {
+    html += '<h3 class="ok">全部 shader 编译链接通过</h3>'
+  }
+
+  html += `<h3>逐壁纸</h3><table><tr><th>壁纸</th><th>通过/总数</th></tr>`
+  for (const r of rows.sort((a, b) => (a.itemOk / a.itemTotal) - (b.itemOk / b.itemTotal))) {
+    const good = r.itemOk === r.itemTotal
+    html += `<tr><td>${r.item}</td><td class="${good ? 'ok' : 'bad'}">${r.itemOk}/${r.itemTotal}</td></tr>`
+  }
+  html += '</table>'
+  out.innerHTML = html
+}
+
+main().catch((e) => { sum.innerHTML = `<span class="bad">出错: ${e.message}</span>`; console.error(e) })
+</script>
+</body>
+</html>

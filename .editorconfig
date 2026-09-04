@@ -1,0 +1,13 @@
+# 编辑器基础约定（刻意最小化：本仓库不引入 prettier/eslint，理由见 docs/ARCHITECTURE.md 第四节）
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

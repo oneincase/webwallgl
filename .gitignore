@@ -1,0 +1,20 @@
+# Node / 前端
+node_modules/
+dist/
+*.local
+*.log
+*.tsbuildinfo
+
+# 系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# 本机壁纸素材（受版权保护，永不入库）
+*.pkg
+*.tex
+*.mp4
+*.webm
+*.gif

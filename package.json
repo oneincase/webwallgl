@@ -1,0 +1,52 @@
+{
+  "name": "webwallgl",
+  "version": "1.0.0-beta1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.17.0",
+  "license": "MIT",
+  "author": "oneincase",
+  "email": "462534624@qq.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oneincase/webwallgl.git"
+  },
+  "homepage": "https://github.com/oneincase/webwallgl#readme",
+  "bugs": "https://github.com/oneincase/webwallgl/issues",
+  "description": "WebWallGL —— 浏览器端 WE 场景壁纸渲染库（npm / CDN）与独立测试台",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:pages": "tsc --noEmit && vite build --base=/webwallgl/",
+    "build:lib": "node scripts/gen-readme.mjs && vite build -c vite.lib.config.ts && tsc -p tsconfig.lib-types.json && node scripts/assemble-lib.mjs",
+    "gen:readme": "node scripts/gen-readme.mjs",
+    "gen:icons": "node scripts/gen-icons.mjs",
+    "publish:npm": "npm run build:lib && node scripts/publish-npm.mjs",
+    "export:github": "node scripts/export-github.mjs",
+    "typecheck": "tsc --noEmit",
+    "verify:particles": "node scripts/verify-particles.mjs",
+    "verify:text": "node scripts/verify-text.mjs",
+    "verify:shaders": "node scripts/verify-shaders.mjs",
+    "verify:pointer": "node scripts/verify-pointer.mjs",
+    "verify:audio": "node scripts/verify-audio.mjs",
+    "verify:camera": "node scripts/verify-camera.mjs",
+    "verify:sprites": "node scripts/verify-sprites.mjs",
+    "verify:groups": "node scripts/verify-groups.mjs",
+    "verify:props": "node scripts/verify-props.mjs",
+    "verify:animation": "node scripts/verify-animation.mjs",
+    "verify:attachments": "node scripts/verify-attachments.mjs",
+    "verify:media": "node scripts/verify-media.mjs",
+    "verify": "node scripts/verify-all.mjs",
+    "verify:all": "node scripts/verify-all.mjs --all",
+    "check": "npm run typecheck && node scripts/verify-arch.mjs && npm run verify",
+    "preview": "vite preview",
+    "publish:renderer": "node scripts/publish-renderer.mjs publish",
+    "publish:diff": "node scripts/publish-renderer.mjs diff"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.8.2",
+    "vite": "^6.4.3"
+  }
+}

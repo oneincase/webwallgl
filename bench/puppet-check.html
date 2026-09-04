@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>puppet 贴图一致性校验</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font:13px/1.6 -apple-system,sans-serif; padding:16px; }
+  h1 { font-size:15px; margin:0 0 12px; }
+  table { border-collapse:collapse; font-size:12px; margin-top:10px; }
+  th,td { border:1px solid #333; padding:4px 8px; text-align:right; }
+  th { background:#1c1c1c; text-align:left; }
+  td:first-child { text-align:left; }
+  .ok { color:#5cd65c; } .bad { color:#ff6b6b; }
+  canvas { display:block; margin:8px 0; border:1px solid #333; image-rendering:pixelated; }
+  #sum { margin:12px 0; padding:8px 10px; background:#1c1c1c; border-left:3px solid #555; }
+</style>
+</head>
+<body>
+<h1>puppet 贴图一致性校验</h1>
+<p>原理：MDLA 关键帧存的是<strong>绝对局部变换</strong>，frame 0 的平移与绑定矩阵完全相等，
+故 <code>t=0</code> 时蒙皮矩阵为单位矩阵。此时 puppet 网格渲染结果应当与「把同一张贴图当普通图层 quad 画」
+在网格覆盖区域内逐像素一致。若顶点偏移读错、UV 取反或 V 未翻转，一致率会显著下降。</p>
+<div id="sum">运行中…</div>
+<div id="out"></div>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as texMod from '/renderer/vendor/we-scene/pkg/texture.js'
+import * as scnMod from '/renderer/vendor/we-scene/scene/parse.js'
+import { parseMDL, createMDLRenderer, computeSkinMatrices } from '/renderer/vendor/we-scene/render/mdl.js'
+import { makeTexture, makeTextureMip } from '/renderer/vendor/we-scene/render/renderer.js'
+
+const SCENE = new URLSearchParams(location.search).get('src') || '3791428510'
+const BASE = `/media/dev/${SCENE}`
+const utf8 = new TextDecoder()
+const readText = (b) => utf8.decode(b).replace(/^\uFEFF/, '')
+
+const out = document.getElementById('out')
+const sum = document.getElementById('sum')
+
+function mul(a, b) {
+  const o = new Float32Array(16)
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3]
+  return o
+}
+const ident = () => new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1])
+const translate = (m,x,y,z) => mul(m, new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]))
+const scaleM = (m,x,y,z) => mul(m, new Float32Array([x,0,0,0,0,y,0,0,0,0,z,0,0,0,0,1]))
+function ortho(l,r,t,b,n,f){const o=ident();o[0]=2/(r-l);o[5]=2/(b-t);o[10]=-2/(f-n);o[12]=-(r+l)/(r-l);o[13]=-(b+t)/(b-t);o[14]=-(f+n)/(f-n);return o}
+
+// 简单的贴图 quad 程序（等价于 renderer.js 的 copy pass，供对照）
+const QUAD_VS = `#version 300 es
+in vec2 a_pos; in vec2 a_uv; uniform mat4 u_mvp; out vec2 v_uv;
+void main(){ gl_Position = u_mvp * vec4(a_pos,0.,1.); v_uv = a_uv; }`
+const QUAD_FS = `#version 300 es
+precision mediump float; in vec2 v_uv; uniform sampler2D u_tex; out vec4 o;
+void main(){ o = texture(u_tex, v_uv); }`
+
+async function main() {
+  let r = await fetch(`${BASE}/scenes/scene.pkg`)
+  if (!r.ok) r = await fetch(`${BASE}/scene.pkg`)
+  const parsed = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+  const scene = scnMod.parseScene(JSON.parse(readText(pkgMod.getEntry(parsed, 'scene.json'))), null)
+
+  const cv = document.createElement('canvas')
+  cv.width = 512; cv.height = 512
+  const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false, antialias: false })
+  const mdlR = createMDLRenderer(gl)
+
+  const compile = (t,s) => { const x=gl.createShader(t); gl.shaderSource(x,s); gl.compileShader(x);
+    if(!gl.getShaderParameter(x,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x }
+  const qp = gl.createProgram()
+  gl.attachShader(qp, compile(gl.VERTEX_SHADER, QUAD_VS))
+  gl.attachShader(qp, compile(gl.FRAGMENT_SHADER, QUAD_FS))
+  gl.bindAttribLocation(qp,0,'a_pos'); gl.bindAttribLocation(qp,1,'a_uv')
+  gl.linkProgram(qp)
+  const qvao = gl.createVertexArray()
+  gl.bindVertexArray(qvao)
+  const qb = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb)
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,16,0)
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,2,gl.FLOAT,false,16,8)
+  gl.bindVertexArray(null)
+
+  async function loadTex(name) {
+    const e = pkgMod.getEntry(parsed, `materials/${name}.tex`)
+    if (!e) return null
+    const pt = texMod.parseTex(e)
+    const m = texMod.decodeMip0(pt)
+    if (m.video !== undefined) return null
+    if (m.png !== undefined || (m.image !== undefined && m.fif === texMod.FIF.JPEG)) {
+      const blob = new Blob([m.png || m.image], { type: m.png ? 'image/png' : 'image/jpeg' })
+      const bmp = await createImageBitmap(blob)
+      return { glTex: makeTexture(gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height }
+    }
+    if (m.image !== undefined) return null
+    return { glTex: makeTextureMip(gl, [m], pt.format === 8), width: m.width, height: m.height }
+  }
+
+  const rows = []
+  for (const layer of scene.layers) {
+    if (!layer.image) continue
+    let model
+    try { model = JSON.parse(readText(pkgMod.getEntry(parsed, layer.image) || new Uint8Array())) } catch { continue }
+    if (!model || !model.puppet) continue
+    const me = pkgMod.getEntry(parsed, model.puppet)
+    if (!me) continue
+    const mdl = parseMDL(new Uint8Array(me))
+    // 贴图（材质 pass 槽 0）
+    let texName = null
+    try {
+      const mat = JSON.parse(readText(pkgMod.getEntry(parsed, model.material)))
+      texName = mat.passes?.[0]?.textures?.[0]
+    } catch { /* 无材质 */ }
+    if (!texName) continue
+    const tex = await loadTex(texName)
+    if (!tex) continue
+
+    const W = layer.size[0], H = layer.size[1]
+    // 两种画法都用同一套「层局部像素」正交投影，画满整个 canvas
+    const proj = ortho(-W/2, W/2, -H/2, H/2, -1e4, 1e4)
+
+    // A：普通 quad（贴图铺满层矩形，v 随屏幕向下增大）
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0,0,cv.width,cv.height)
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.useProgram(qp); gl.bindVertexArray(qvao); gl.disable(gl.BLEND)
+    gl.bindBuffer(gl.ARRAY_BUFFER, qb)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -W/2,-H/2, 0,0,  -W/2,H/2, 0,1,  W/2,-H/2, 1,0,
+       W/2,-H/2, 1,0,  -W/2,H/2, 0,1,  W/2,H/2, 1,1,
+    ]), gl.DYNAMIC_DRAW)
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex.glTex)
+    gl.uniform1i(gl.getUniformLocation(qp,'u_tex'), 0)
+    gl.uniformMatrix4fv(gl.getUniformLocation(qp,'u_mvp'), false, proj)
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    const quadPx = new Uint8Array(cv.width*cv.height*4)
+    gl.readPixels(0,0,cv.width,cv.height,gl.RGBA,gl.UNSIGNED_BYTE,quadPx)
+
+    // B：puppet 网格，t=0（蒙皮=单位）。网格 y-up，故投影需翻 y 以与 A 同向
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT)
+    mdlR.draw(scaleM(proj, 1, -1, 1), mdl, { time: 0, flipV: false, blending: 'normal',
+      animLayers: layer.animationLayers, color: [1,1,1,1] }, tex)
+    const meshPx = new Uint8Array(cv.width*cv.height*4)
+    gl.readPixels(0,0,cv.width,cv.height,gl.RGBA,gl.UNSIGNED_BYTE,meshPx)
+
+    // 只在网格实际画到的像素（非纯黑）上比较：贴图读错会立刻体现为大量色差
+    let n=0, agree=0, sumD=0
+    for (let i=0;i<cv.width*cv.height;i++) {
+      const mr=meshPx[i*4], mg=meshPx[i*4+1], mb=meshPx[i*4+2]
+      if (mr+mg+mb < 12) continue
+      const d = Math.abs(mr-quadPx[i*4])+Math.abs(mg-quadPx[i*4+1])+Math.abs(mb-quadPx[i*4+2])
+      n++; sumD+=d
+      if (d <= 24) agree++
+    }
+    const pct = n ? agree/n*100 : 0
+    rows.push({ name: layer.name, tex: texName, size:`${W}×${H}`, texSize:`${tex.width}×${tex.height}`,
+      verts: mdl.vertexCount, bones: mdl.bones.length, covered:n,
+      agree:+pct.toFixed(1), meanD:+(n?sumD/n:0).toFixed(1) })
+  }
+
+  const good = rows.filter(r=>r.agree>=90).length
+  sum.innerHTML = `<strong>${good} / ${rows.length}</strong> 个 puppet 网格在 t=0 与普通 quad 一致率 ≥90%`
+    + (good===rows.length ? ' <span class="ok">✓ 贴图映射正确</span>' : ' <span class="bad">✗ 存在贴图错位</span>')
+  const t = document.createElement('table')
+  t.innerHTML = '<tr><th>图层</th><th>贴图</th><th>层尺寸</th><th>贴图尺寸</th><th>顶点</th><th>骨骼</th><th>比较像素</th><th>一致率%</th><th>平均色差</th></tr>'
+    + rows.map(r=>`<tr><td>${r.name}</td><td>${r.tex}</td><td>${r.size}</td><td>${r.texSize}</td>`
+      + `<td>${r.verts}</td><td>${r.bones}</td><td>${r.covered}</td>`
+      + `<td class="${r.agree>=90?'ok':'bad'}">${r.agree}</td><td>${r.meanD}</td></tr>`).join('')
+  out.appendChild(t)
+  window.__result = { good, total: rows.length, rows }
+}
+main().catch(e => { sum.innerHTML = '<span class="bad">失败: '+e.message+'</span>'; window.__result={error:e.message} })
+</script>
+</body>
+</html>
