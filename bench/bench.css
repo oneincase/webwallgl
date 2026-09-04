@@ -790,14 +790,43 @@ select:hover {
 }
 
 .prop-group {
-  padding: 12px 10px 6px;
-  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+
+.prop-group-summary {
+  padding: 12px 10px 8px;
+  color: var(--fg);
   font-size: 12px;
   font-weight: 600;
   white-space: pre-line;
   word-break: keep-all;
   overflow-wrap: break-word;
-  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+
+.prop-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.prop-group-summary::before {
+  content: "▾";
+  color: var(--fg-dim);
+  font-size: 10px;
+  width: 12px;
+  flex: none;
+}
+
+.prop-group:not([open]) > .prop-group-summary::before {
+  content: "▸";
+}
+
+.prop-group-body {
+  padding-bottom: 4px;
 }
 
 .prop-text {

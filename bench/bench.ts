@@ -894,6 +894,8 @@ const sameValue = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringi
 const SAVE_DEBOUNCE_MS = 400;
 
 let propDefs: WebPropDef[] = [];
+/** 分组折叠状态（按属性名）；缺省展开，避免「分组无法设置」 */
+const propGroupOpen: Record<string, boolean> = {};
 let propDraft: Record<string, unknown> = {};
 let propItemId = "";
 let saveTimer: number | undefined;
@@ -907,6 +909,7 @@ async function loadProps(itemId: string) {
   propItemId = itemId;
   propDefs = [];
   propDraft = {};
+  for (const k of Object.keys(propGroupOpen)) delete propGroupOpen[k];
   propsBodyEl.textContent = "";
   propsState(t("props.reading"));
   try {
@@ -1017,36 +1020,75 @@ function renderProps() {
     propsBodyEl.appendChild(hint);
     return;
   }
-  let shown = 0;
+
+  // 按 WE 语义把 type=group 当可折叠分节：其后属性归属该组，直到下一个 group。
+  type Section = { group: WebPropDef | null; items: WebPropDef[] };
+  const sections: Section[] = [];
+  let cur: Section = { group: null, items: [] };
+  sections.push(cur);
   for (const p of propDefs) {
-    const visible = evalCondition(p.condition, vals);
-    if (!visible && !showHidden) continue;
-    if (kw && !`${p.name} ${p.text}`.toLowerCase().includes(kw)) continue;
-    if (p.ptype === "text" && !p.text && !(p.media && p.media.length)) continue;
-    shown++;
-    // group / text 是 WE 里的分节标题与静态说明，不是可编辑项
     if (p.ptype === "group") {
-      const g = document.createElement("div");
-      g.className = "prop-group";
-      g.textContent = p.text;
-      propsBodyEl.appendChild(g);
+      cur = { group: p, items: [] };
+      sections.push(cur);
       continue;
     }
+    cur.items.push(p);
+  }
+
+  let shown = 0;
+  const appendItem = (p: WebPropDef, parent: HTMLElement) => {
+    const visible = evalCondition(p.condition, vals);
+    if (!visible && !showHidden) return;
+    if (kw && !`${p.name} ${p.text}`.toLowerCase().includes(kw)) return;
+    if (p.ptype === "text" && !p.text && !(p.media && p.media.length)) return;
+    shown++;
     if (p.ptype === "text") {
-      const t = document.createElement("div");
-      t.className = "prop-text";
-      if (p.media && p.media.length) t.appendChild(renderMedia(p.media));
+      const te = document.createElement("div");
+      te.className = "prop-text";
+      if (p.media && p.media.length) te.appendChild(renderMedia(p.media));
       if (p.text) {
         const cap = document.createElement("div");
         cap.className = "prop-text-cap";
         cap.textContent = p.text;
-        t.appendChild(cap);
+        te.appendChild(cap);
       }
-      propsBodyEl.appendChild(t);
+      parent.appendChild(te);
+      return;
+    }
+    parent.appendChild(renderPropRow(p, visible));
+  };
+
+  for (const sec of sections) {
+    if (sec.group) {
+      const visible = evalCondition(sec.group.condition, vals);
+      if (!visible && !showHidden) continue;
+      if (kw && !`${sec.group.name} ${sec.group.text}`.toLowerCase().includes(kw)
+          && !sec.items.some((p) => `${p.name} ${p.text}`.toLowerCase().includes(kw))) {
+        continue;
+      }
+      shown++;
+      const details = document.createElement("details");
+      details.className = "prop-group";
+      details.open = propGroupOpen[sec.group.name] ?? true;
+      details.ontoggle = () => {
+        propGroupOpen[sec.group!.name] = details.open;
+      };
+      const summary = document.createElement("summary");
+      summary.className = "prop-group-summary";
+      summary.textContent = sec.group.text || sec.group.name;
+      summary.title = sec.group.name;
+      details.appendChild(summary);
+      const body = document.createElement("div");
+      body.className = "prop-group-body";
+      for (const p of sec.items) appendItem(p, body);
+      details.appendChild(body);
+      // 过滤后组内无可见项：仍显示组标题（作者分隔），避免整段消失像「坏了」
+      propsBodyEl.appendChild(details);
       continue;
     }
-    propsBodyEl.appendChild(renderPropRow(p, visible));
+    for (const p of sec.items) appendItem(p, propsBodyEl);
   }
+
   if (shown === 0) {
     const hint = document.createElement("div");
     hint.className = "prop-hint";
@@ -1058,6 +1100,7 @@ function renderProps() {
 function renderPropRow(p: WebPropDef, visible: boolean): HTMLElement {
   const row = document.createElement("div");
   row.className = "prop";
+  // 原始键名只放 title，主文案用 localization / 作者 text（避免面板上满屏 newproperty5）
   row.title = `${p.name} · ${p.ptype}`;
   if (!visible) row.classList.add("prop-cond"); // 条件隐藏但被强制显示：置灰提示
   const overridden = !sameValue(propDraft[p.name], p.default);
@@ -1069,11 +1112,8 @@ function renderPropRow(p: WebPropDef, visible: boolean): HTMLElement {
   textWrap.className = "prop-head-text";
   const nameEl = document.createElement("span");
   nameEl.className = "prop-name";
-  nameEl.textContent = p.text;
-  const keyEl = document.createElement("span");
-  keyEl.className = "prop-key";
-  keyEl.textContent = `${p.name} · ${p.ptype}`;
-  textWrap.append(nameEl, keyEl);
+  nameEl.textContent = p.text || p.name;
+  textWrap.appendChild(nameEl);
 
   if (p.ptype === "bool") {
     const cb = document.createElement("input");
@@ -1159,12 +1199,13 @@ function renderPropRow(p: WebPropDef, visible: boolean): HTMLElement {
       break;
     }
     case "file":
-    case "directory": {
+    case "directory":
+    case "scenetexture": {
       // 测试台没有原生文件选择框（主项目走 tauri dialog）：直接填相对壁纸根的路径
       const txt = document.createElement("input");
       txt.type = "text";
       txt.value = String(cur ?? "");
-      txt.placeholder = p.ptype === "file" ? t("props.filePh", { kind: p.fileType ?? "image" }) : t("props.dirPh");
+      txt.placeholder = p.ptype === "directory" ? t("props.dirPh") : t("props.filePh", { kind: p.fileType ?? "image" });
       txt.onchange = () => changeProp(p.name, txt.value);
       ctl.appendChild(txt);
       break;
