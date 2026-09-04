@@ -63,9 +63,31 @@ export function spriteTrailRotation(dx, dy) {
   return Math.atan2(dy, dx) - Math.PI / 2
 }
 
-/** 每个活粒子画几份实例：ropetrail 才按历史段数；spritetrail 永远 1。 */
+/** 每个活粒子画几份实例：ropetrail 才按历史点数；spritetrail 永远 1。 */
 export function particleInstanceSegs(trailCfg, trailSegments) {
   return trailCfg && trailCfg.kind === 'ropetrail' ? Math.max(1, trailSegments || 1) : 1
+}
+
+/**
+ * Rope Trail 历史采样点数。官方字段是 `segments`（全库 maxlength 从不出现在
+ * ropetrail 上）。缺省 8：旧实现误用 subdivision 默认 1 → max(2,1)=2，尾迹只有
+ * 两帧，length=0.5 的雨丝（3792881540 Gotas）缩成几个像素点。
+ */
+export function ropeTrailHistoryCount(cfg) {
+  if (!cfg || cfg.kind !== 'ropetrail') return 1
+  const segs = Math.round(Number(cfg.segments) || 0)
+  if (segs >= 2) return Math.min(32, segs)
+  return 8
+}
+
+/**
+ * Rope Trail 的 Length = 尾迹时长（秒）。文档：加长 Length 还要加 lifetime。
+ * 0.2/0.4/0.5 是预设常见值；若当空间长度则亚像素不可见。
+ */
+export function ropeTrailDuration(cfg) {
+  if (!cfg || cfg.kind !== 'ropetrail') return 0
+  const L = Number(cfg.length)
+  return Number.isFinite(L) && L > 0 ? L : 0.2
 }
 
 
@@ -102,6 +124,8 @@ class Particle {
     this.turbPhase = 0
     // ropetrail 才记历史折线；spritetrail 是单精灵转向+拉伸，不记历史
     this.trail = null
+    // 距下一次把当前位置推进历史环的剩余时间累加（见 trailSampleDt）
+    this.trailClock = 0
   }
 }
 
@@ -498,27 +522,37 @@ export class ParticleSystem {
     this.renderers = rlist.map((r) => {
       const kind = (r && r.name) || 'sprite'
       // spritetrail 省略 Length 不能当 0（理想长度恒 0 → 精灵消失）。库里 23 处没写。
+      // ropetrail 的 Length 是尾迹时长（秒），省略按预设常见 0.2。
       return {
         kind,
-        length: num(r && r.length, kind === 'spritetrail' ? 0.1 : 0),
+        length: num(r && r.length, kind === 'spritetrail' ? 0.1 : kind === 'ropetrail' ? 0.2 : 0),
         maxLength: num(r && r.maxlength, 0),
         minLength: num(r && r.minlength, 0),
         subdivision: num(r && r.subdivision, 1),
+        // Rope Trail 段数（官方 `segments`）；与 spritetrail 的 maxlength 无关
+        segments: num(r && r.segments, 0),
         orientation: (r && r.orientation) || null,
       }
     })
     if (omitted && !this.renderers.length) {
-      this.renderers = [{ kind: 'sprite', length: 0, maxLength: 0, minLength: 0, subdivision: 1, orientation: null }]
+      this.renderers = [{ kind: 'sprite', length: 0, maxLength: 0, minLength: 0, subdivision: 1, segments: 0, orientation: null }]
     }
     // Sprite Trail = 沿速度转向并按速度拉伸的**一条**精灵（length×speed，min/max 夹紧）。
-    // Rope Trail 才是历史折线；两者都叫 trail，但 maxlength 对 Sprite Trail 是长度上限，不是段数。
+    // Rope Trail 才是历史折线：Length=时长，segments=采样点数；maxlength 只属于 Sprite Trail。
     const tr = this.renderers.find((r) => r.kind === 'spritetrail' || r.kind === 'ropetrail')
     this.trailCfg = tr || null
     this.trailSegments = 1
+    this.trailDuration = 0
+    this.trailSampleDt = 0
     if (tr && tr.kind === 'ropetrail') {
-      const segs = Math.max(2, Math.min(16, Math.round(tr.maxLength || tr.subdivision || 6)))
+      const segs = ropeTrailHistoryCount(tr)
       this.trailSegments = segs
-      for (const p of this.pool) p.trail = new Float32Array(segs * 3)
+      this.trailDuration = ropeTrailDuration(tr)
+      this.trailSampleDt = this.trailDuration / Math.max(1, segs - 1)
+      for (const p of this.pool) {
+        p.trail = new Float32Array(segs * 3)
+        p.trailClock = 0
+      }
     }
   }
 
@@ -858,6 +892,7 @@ export class ParticleSystem {
         p.trail[i + 1] = p.y
         p.trail[i + 2] = p.z
       }
+      p.trailClock = 0
     }
   }
 
@@ -1038,14 +1073,27 @@ export class ParticleSystem {
       p.frame = Math.min(this.frameCount - 1, Math.floor(lt * this.frameCount))
     }
 
-    // 轨迹采样：把历史位置向后挪一格
+    // 轨迹采样：按 Rope Trail Length（秒）把当前位置推进历史环。
+    // 旧实现每帧挪一格 → 尾迹时长 ≈ segments/fps；segments 还被算成 2，
+    // length=0.5 的雨丝只剩两帧间距（3792881540）。
     if (p.trail) {
       const tr = p.trail
-      for (let i = tr.length - 3; i >= 3; i -= 3) {
-        tr[i] = tr[i - 3]
-        tr[i + 1] = tr[i - 2]
-        tr[i + 2] = tr[i - 1]
+      const step = this.trailSampleDt
+      if (step > 0) {
+        p.trailClock = (p.trailClock || 0) + dt
+        let shifts = 0
+        const cap = this.trailSegments || 8
+        while (p.trailClock >= step && shifts < cap) {
+          p.trailClock -= step
+          shifts++
+          for (let i = tr.length - 3; i >= 3; i -= 3) {
+            tr[i] = tr[i - 3]
+            tr[i + 1] = tr[i - 2]
+            tr[i + 2] = tr[i - 1]
+          }
+        }
       }
+      // 头节点始终贴当前点，避免采样间隙里尖端停住
       tr[0] = p.x
       tr[1] = p.y
       tr[2] = p.z
@@ -1208,6 +1256,11 @@ export class ParticleSystem {
         let ly = p.y
         let segAlpha = 1
         let segSize = 1
+        let rot = p.rot
+        let instStretchX = stretchX
+        let instStretchY = stretchY
+        let wx
+        let wy
         if (trail && p.trail) {
           lx = p.trail[s * 3]
           ly = p.trail[s * 3 + 1]
@@ -1215,12 +1268,44 @@ export class ParticleSystem {
           const t = segs > 1 ? s / (segs - 1) : 0
           segAlpha = 1 - t
           segSize = 1 - t * 0.55
+          // 沿相邻历史点拉成丝：否则 length 秒的轨迹仍是一串分离的圆点
+          let tdx = 0
+          let tdy = 0
+          if (s + 1 < segs) {
+            tdx = p.trail[s * 3] - p.trail[(s + 1) * 3]
+            tdy = p.trail[s * 3 + 1] - p.trail[(s + 1) * 3 + 1]
+          } else if (s > 0) {
+            tdx = p.trail[(s - 1) * 3] - p.trail[s * 3]
+            tdy = p.trail[(s - 1) * 3 + 1] - p.trail[s * 3 + 1]
+          } else {
+            tdx = p.vx
+            tdy = p.vy
+          }
+          const w0 = toWorld(lx, ly)
+          const w1 = toWorld(lx - tdx, ly - tdy)
+          const dx = w0[0] - w1[0]
+          const dy = w0[1] - w1[1]
+          const dist = Math.hypot(dx, dy)
+          const base = Math.max(1e-3, Math.abs(p.size) * sysScale * segSize)
+          if (dist > 1e-3) {
+            rot = spriteTrailRotation(dx, dy)
+            // 精灵中心放在段中点，沿向拉伸盖住相邻采样点间距
+            wx = (w0[0] + w1[0]) * 0.5
+            wy = (w0[1] + w1[1]) * 0.5
+            instStretchY = Math.max(stretchY, dist / base)
+          } else {
+            wx = w0[0]
+            wy = w0[1]
+          }
+        } else {
+          const w = toWorld(lx, ly)
+          wx = w[0]
+          wy = w[1]
         }
-        const w = toWorld(lx, ly)
-        let rot = p.rot
-        let instStretchX = stretchX
-        let instStretchY = stretchY
         if (spriteTrail) {
+          const w = toWorld(p.x, p.y)
+          wx = w[0]
+          wy = w[1]
           const w1 = toWorld(p.x + p.vx, p.y + p.vy)
           rot = spriteTrailRotation(w1[0] - w[0], w1[1] - w[1])
           const factor = spriteTrailLengthFactor(
@@ -1231,8 +1316,8 @@ export class ParticleSystem {
           )
           instStretchY = stretchY * factor
         }
-        data[k++] = w[0]
-        data[k++] = w[1]
+        data[k++] = wx
+        data[k++] = wy
         data[k++] = 0
         data[k++] = Math.abs(p.size) * sysScale * segSize
         data[k++] = rot

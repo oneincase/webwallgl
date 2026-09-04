@@ -29,6 +29,8 @@ const {
   spriteTrailLengthFactor,
   spriteTrailRotation,
   particleInstanceSegs,
+  ropeTrailHistoryCount,
+  ropeTrailDuration,
 } = await imp("renderer/vendor/we-scene/render/particles.js");
 const ptex = await imp("renderer/vendor/we-scene/render/particle-textures.js");
 const { createTarget, rasterizeSystem, analyzeTarget } = await imp(
@@ -1134,6 +1136,136 @@ function runSpriteTrail() {
   return { errors, sawSpriteTrail };
 }
 
+// ---------- Rope Trail：Length=时长，segments=历史点数（3792881540 Gotas）----------
+function runRopeTrail() {
+  const errors = [];
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (/tr\.maxLength \|\| tr\.subdivision \|\| 6/.test(src)) {
+    errors.push("ropetrail 仍用 maxlength/subdivision 当历史点数（会把 length=0.5 缩成 2 帧）");
+  }
+  if (!/ropeTrailHistoryCount|ropeTrailDuration/.test(src)) {
+    errors.push("未导出 ropeTrailHistoryCount / ropeTrailDuration");
+  }
+  if (!/trailSampleDt/.test(src)) {
+    errors.push("ropetrail 未按 Length 秒做时间采样（trailSampleDt）");
+  }
+
+  if (ropeTrailHistoryCount({ kind: "ropetrail", segments: 16 }) !== 16) {
+    errors.push("ropeTrailHistoryCount(segments=16) 应得 16");
+  }
+  if (ropeTrailHistoryCount({ kind: "ropetrail", length: 0.5 }) !== 8) {
+    errors.push("ropeTrailHistoryCount 缺省 segments 应得 8");
+  }
+  if (Math.abs(ropeTrailDuration({ kind: "ropetrail", length: 0.5 }) - 0.5) > 1e-9) {
+    errors.push("ropeTrailDuration(0.5) 应得 0.5 秒");
+  }
+
+  const gotas = new ParticleSystem(
+    null,
+    {
+      maxcount: 8,
+      renderer: [{ name: "ropetrail", length: 0.5 }],
+      emitter: [{ name: "sphererandom", rate: 0, distancemax: 0 }],
+      initializer: [{ name: "lifetimerandom", min: 2, max: 2 }],
+      operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+    },
+    null,
+    { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+  );
+  if (gotas.trailSegments !== 8) {
+    errors.push(`trail_2 缺省 segments 应得 8，实际 ${gotas.trailSegments}`);
+  }
+  if (Math.abs(gotas.trailDuration - 0.5) > 1e-9) {
+    errors.push(`trail_2 length 应得 0.5s，实际 ${gotas.trailDuration}`);
+  }
+  if (Math.abs(gotas.trailSampleDt - 0.5 / 7) > 1e-9) {
+    errors.push(`trailSampleDt 应得 0.5/7，实际 ${gotas.trailSampleDt}`);
+  }
+
+  // 匀速粒子：跑满 Length 后，头尾间距 ≈ speed × duration
+  const p = gotas.pool[0];
+  p.alive = true;
+  p.x = 0;
+  p.y = 0;
+  p.z = 0;
+  p.vx = 0;
+  p.vy = -200;
+  p.vz = 0;
+  p.life = 10;
+  p.age = 0;
+  p.baseSize = 4;
+  p.size = 4;
+  p.baseAlpha = 1;
+  p.alpha = 1;
+  p.baseR = p.baseG = p.baseB = 1;
+  p.r = p.g = p.b = 1;
+  if (p.trail) {
+    for (let i = 0; i < p.trail.length; i += 3) {
+      p.trail[i] = 0;
+      p.trail[i + 1] = 0;
+      p.trail[i + 2] = 0;
+    }
+    p.trailClock = 0;
+  }
+  for (let i = 0; i < 60; i++) {
+    p.y += p.vy * (1 / 60);
+    p.age += 1 / 60;
+    // 直接走 updateParticle 的轨迹分支：借用系统方法
+    gotas.updateParticle(p, 1 / 60);
+  }
+  const headY = p.trail[1];
+  const tailY = p.trail[(gotas.trailSegments - 1) * 3 + 1];
+  const span = Math.abs(headY - tailY);
+  // 0.5s × 200 ≈ 100；允许采样量化误差
+  if (!(span > 70 && span < 130)) {
+    errors.push(`ropetrail 0.5s×v=200 头尾间距应得≈100，实际 ${span.toFixed(1)}`);
+  }
+
+  const withSegs = new ParticleSystem(
+    null,
+    { maxcount: 1, renderer: [{ name: "ropetrail", length: 30, segments: 16 }] },
+    null,
+    { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+  );
+  if (withSegs.trailSegments !== 16) {
+    errors.push(`显式 segments=16 应得 16，实际 ${withSegs.trailSegments}`);
+  }
+
+  // 本机库：3792881540 Gotas = trail_2.json
+  const pkgPath = join(LIB, "3792881540", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = parsePkg(fs.readFileSync(pkgPath));
+      const raw = Buffer.from(getEntry(pkg, "particles/presets/trail_2.json")).toString("utf8");
+      const model = JSON.parse(raw);
+      const scene = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8"));
+      const gotasObj = (scene.objects || []).find((o) => o.name === "Gotas");
+      const layer = {
+        origin: String(gotasObj.origin).split(/\s+/).map(Number),
+        scale: String(gotasObj.scale).split(/\s+/).map(Number),
+        angles: String(gotasObj.angles || "0 0 0").split(/\s+/).map(Number),
+      };
+      const ps = new ParticleSystem(null, model, gotasObj.instanceoverride, layer);
+      if (ps.trailCfg?.kind !== "ropetrail") {
+        errors.push("3792881540 Gotas 应为 ropetrail");
+      }
+      if (ps.trailSegments !== 8) {
+        errors.push(`3792881540 Gotas trailSegments 应得 8，实际 ${ps.trailSegments}`);
+      }
+      if (Math.abs(ps.trailDuration - 0.5) > 1e-6) {
+        errors.push(`3792881540 Gotas trailDuration 应得 0.5，实际 ${ps.trailDuration}`);
+      }
+      if (ps.trailSegments <= 2) {
+        errors.push("3792881540 Gotas 历史点数仍 ≤2（雨丝会缩成点）");
+      }
+    } catch (e) {
+      errors.push(`3792881540 拆包失败: ${e.message}`);
+    }
+  }
+
+  return { errors };
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -1176,6 +1308,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【Sprite Trail】系统 ${r.sawSpriteTrail} → 问题 ${r.errors.length}`);
   r.errors.forEach((e) => console.log("  ! " + e));
   failed += r.errors.length;
+  const rr = runRopeTrail();
+  console.log(`\n【Rope Trail】问题 ${rr.errors.length}`);
+  rr.errors.forEach((e) => console.log("  ! " + e));
+  failed += rr.errors.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);
