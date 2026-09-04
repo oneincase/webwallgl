@@ -2089,6 +2089,12 @@ if (action === "all" || action === "script" || action === "hidevis") {
   errors.forEach((e) => console.log("  ! " + e));
   failed += errors.length;
 }
+if (action === "all" || action === "script" || action === "canvas") {
+  const errors = runEngineCanvasSize();
+  console.log(`\n【engine.canvasSize】向量形态 .x/.y（3790399458 左下角叠字） → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);
 process.exit(failed === 0 ? 0 : 1);
