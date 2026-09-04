@@ -627,6 +627,70 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
+// 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
+// 效果跳过 → 白三角直出（「窗口 Box」白块）。
+{
+  const clipSrc = [
+    "varying vec4 v_TexCoord;",
+    "uniform sampler2D g_Texture0;",
+    "uniform sampler2D g_Texture1;",
+    "uniform vec2 u_textureScale;",
+    "void main() {",
+    "  vec4 albedo = texSample2D(g_Texture0, v_TexCoord);",
+    "  vec2 uvTex = ((v_TexCoord * 2.0 - 1.0) / u_textureScale);",
+    "  vec4 clip = texSample2D(g_Texture1, v_TexCoord + uvTex);",
+    "  gl_FragColor = albedo;",
+    "}",
+  ].join("\n");
+  const clipVert = [
+    "attribute vec2 a_TexCoord;",
+    "varying vec4 v_TexCoord;",
+    "void main() { v_TexCoord.xy = a_TexCoord; gl_Position = vec4(0.); }",
+  ].join("\n");
+  const glsl = hlsl2glsl(clipSrc, "frag", {}, () => null, clipVert);
+  if (/texture\s*\(\s*g_Texture0\s*,\s*v_TexCoord\s*\)/.test(glsl)) {
+    wireErrors.push("texture(sampler, vec4 v_TexCoord) 必须截成 .xy");
+  }
+  if (!/texture\s*\(\s*g_Texture0\s*,\s*v_TexCoord\.xy\s*\)/.test(glsl)) {
+    wireErrors.push("texture 的 vec4 UV 应改写为 v_TexCoord.xy");
+  }
+  if (/vec2\s+uvTex\s*=\s*\(\(\s*v_TexCoord\s*\*/.test(glsl)) {
+    wireErrors.push("vec2 赋值里的裸 vec4 v_TexCoord 必须 .xy");
+  }
+  if (!/texture\s*\(\s*g_Texture1\s*,\s*\(\s*v_TexCoord\.xy\s*\+/.test(glsl)) {
+    wireErrors.push("texture(s, v_TexCoord + offset) 必须把左侧截成 .xy");
+  }
+  const hlslSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hlsl2glsl.js"), "utf8");
+  if (!/vec4\/vec3 当 UV 用/.test(hlslSrc)) {
+    wireErrors.push("hlsl2glsl.js 必须包含 vec4/vec3 UV 截断");
+  }
+  const clipPkg = join(LIB, "2902406982", "scene.pkg");
+  if (fs.existsSync(clipPkg)) {
+    let pkg;
+    try { pkg = parsePkg(fs.readFileSync(clipPkg)); } catch { pkg = null; }
+    const frag = pkg && getEntry(pkg, "shaders/workshop/2800594362/effects/clipping_mask.frag");
+    const vert = pkg && getEntry(pkg, "shaders/workshop/2800594362/effects/clipping_mask.vert");
+    if (!frag) {
+      wireErrors.push("2902406982 必须含 clipping_mask.frag");
+    } else {
+      const glsl2 = hlsl2glsl(
+        readText(frag),
+        "frag",
+        { BLENDMODE: 5, CLIPCOLOR: 0, INVERT: 0, PARALLAX: 0, ALIGNMENT: 0, MASK: 1 },
+        makeResolver(pkg),
+        vert ? readText(vert) : "",
+      );
+      if (/texture\s*\(\s*g_Texture0\s*,\s*v_TexCoord\s*\)/.test(glsl2)) {
+        wireErrors.push("2902406982 clipping_mask 的 texture UV 必须 .xy");
+      }
+      if (/vec2\s+uvTex\s*=\s*\(\(\s*v_TexCoord\s*\*/.test(glsl2)) {
+        wireErrors.push("2902406982 clipping_mask 的 uvTex 必须用 v_TexCoord.xy");
+      }
+    }
+  }
+}
+
 // [we-scene patch] 已声明 float 赋裸整数 + 标量→向量广播。
 // 3789816832 Sound：Simple_Audio_Bars.vert `i_DCorrectingFactor = 1`、sine_wave
 // `waveCoord = pow(...); ApplyBlending(..., opacity * waveCoord)` —— GLSL ES 无
@@ -706,6 +770,37 @@ const wireErrors = [];
           wireErrors.push("3789816832 sine_wave 的 opacity*waveCoord 必须是 *waveCoord.x");
         }
       }
+      // 2902406982 的 vec2 赋值 .xy 改写若扫到公共头 `vec3 r;`，会把 Bars 的
+      // `float r; vec2 delta = … + r` 改成 `r.xy` → 音谱回归消失。
+      const fGlsl = hlsl2glsl(readText(frag), "frag", {}, makeResolver(pkg), readText(vert));
+      if (/vec2\s+delta\s*=[^;]*\br\.xy\b/.test(fGlsl)) {
+        wireErrors.push("3789816832 Simple_Audio_Bars 不得把 float r 改成 r.xy（公共头 vec3 r 误伤）");
+      }
+      if (!/vec2\s+delta\s*=[^;]*\+\s*r\s*;/.test(fGlsl)) {
+        wireErrors.push("3789816832 Simple_Audio_Bars 的 delta 必须保留标量 r");
+      }
+    }
+  }
+  // 迷你语料：公共头风格的 vec3 r 不得污染其它函数里的 float r
+  {
+    const mini = hlsl2glsl(
+      [
+        "varying vec2 v_TexCoord;",
+        "vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) { vec3 r; r = A; return r; }",
+        "float roundedHollowBoxSDF(vec2 CurPosition, vec3 Size) {",
+        "  float r = min(Size.x, Size.y);",
+        "  vec2 delta = abs(CurPosition) - (Size.xy) + r;",
+        "  return length(max(delta, 0.0)) - r;",
+        "}",
+        "void main() { gl_FragColor = vec4(roundedHollowBoxSDF(v_TexCoord, vec3(1.0))); }",
+      ].join("\n"),
+      "frag",
+      {},
+      () => null,
+      "",
+    );
+    if (/\br\.xy\b/.test(mini)) {
+      wireErrors.push("vec2 赋值 .xy 改写不得误伤 float r（ApplyBlending 的 vec3 r）");
     }
   }
   // 3264246690 scroll.vert：`scroll = sign(scroll) * pow(vec2(...), …)` 以 sign( 开头

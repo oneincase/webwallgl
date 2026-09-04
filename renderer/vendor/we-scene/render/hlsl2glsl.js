@@ -783,6 +783,61 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       }
     }
 
+    // [we-scene patch] **vec4/vec3 当 UV 用**：WE/HLSL 的 `texSample2D(s, float4)`
+    // 隐式取 .xy；GLSL `texture` 只要 vec2。作者常把 `v_TexCoord` 声明成 vec4
+    //（vert 只写 `.xy` 或 `.xyxy`），两侧同为 vec4 时上面的「加宽」路径不触发，
+    // 整颗喂给采样 + 与 vec2 做算术 → 编不过 → 效果被跳过。
+    // 2902406982「窗口 Box」：clipping_mask 跳过后白三角 albedo 直出成白块
+    //（空 composelayer 回读已经对了，但遮罩效果本身没跑起来）。
+    // 全库同构：clipping_mask / chromatic_aberration 等约十余处。
+    //
+    // ⚠️ 局部 vec3/vec4 只用于 texture() 实参（中间 UV 变量）；**不能**拿去改
+    // `vec2 x = …` 赋值行——公共头 `ApplyBlending` 里有 `vec3 r;`，会把音条
+    // shader 的 `float r = …; vec2 delta = … + r` 改成 `r.xy`，ANGLE 报
+    // field selection on non-vector，Simple_Audio_Bars 整 pass 跳过（3789816832）。
+    {
+      const inVecN = new Map()
+      const declRe = /^\s*in\s+(?:highp|mediump|lowp\s+)?(vec[34])\s+([A-Za-z_]\w*)\s*;/gm
+      let dm
+      while ((dm = declRe.exec(code)) !== null) inVecN.set(dm[2], Number(dm[1].slice(3)))
+      const localVecN = new Map(inVecN)
+      const locRe = /\b(vec[34])\s+([A-Za-z_]\w*)\s*[=;]/g
+      while ((dm = locRe.exec(code)) !== null) {
+        if (!localVecN.has(dm[2])) localVecN.set(dm[2], Number(dm[1].slice(3)))
+      }
+      if (localVecN.size > 0) {
+        const swizzleUvArg = (arg) => {
+          const t = arg.trim()
+          if (!t) return arg
+          const bare = /^([A-Za-z_]\w*)$/.exec(t)
+          if (bare && localVecN.has(bare[1])) return bare[1] + '.xy'
+          // `v_TexCoord + offset`（左侧是 vecN、尚未 swizzle）
+          const bin = /^([A-Za-z_]\w*)(\s*[+\-].+)$/.exec(t)
+          if (bin && localVecN.has(bin[1])) return '(' + bin[1] + '.xy' + bin[2] + ')'
+          return arg
+        }
+        // textureLod 先于 texture，避免前缀误伤（rewriteCall 虽有词边界，顺序更稳）
+        for (const fn of ['textureLod', 'texture']) {
+          code = rewriteCall(code, fn, (inner) => {
+            const args = splitArgs(inner)
+            if (args.length >= 2) args[1] = swizzleUvArg(args[1])
+            return fn + '(' + args.join(', ') + ')'
+          })
+        }
+      }
+      // `vec2 uv = v_TexCoord * … - vec2`：只改 **in 插值量**（真 UV varying）。
+      if (inVecN.size > 0) {
+        code = code.split('\n').map((line) => {
+          if (!/\bvec2\s+[A-Za-z_]\w*\s*=/.test(line)) return line
+          let out = line
+          for (const name of inVecN.keys()) {
+            out = out.replace(new RegExp('\\b' + name + '\\b(?!\\s*[.\\w])', 'g'), name + '.xy')
+          }
+          return out
+        }).join('\n')
+      }
+    }
+
     // [we-scene patch] 片元阶段**写入 varying**：GLSL ES 3.0 的 `in` 是只读的，
     // 报 `'assign' : l-value required (can't modify an input "v_TexCoord")`；
     // 而 HLSL / GLSL 1.x 允许把插值量当可写局部量用，作者据此就地改 UV

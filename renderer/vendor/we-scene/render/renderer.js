@@ -404,7 +404,13 @@ export function createRenderer(canvas, opts = {}) {
       }
     }
     const key = shaderName + '|' + JSON.stringify(effectiveCombos)
-    if (progCache.has(key)) return progCache.get(key)
+    if (progCache.has(key)) {
+      const hit = progCache.get(key)
+      // null = 编译失败哨兵：避免每帧每层重试同一坏 shader（2902406982 的
+      // clipping_mask 编不过时曾把 FPS 打到个位数并刷爆 console）。
+      if (hit === null) throw new Error('shader=' + shaderName + ' 编译失败（已缓存）')
+      return hit
+    }
     // include 同步缓存：miss 时记录并补拉，重试转译
     for (let attempt = 0; attempt < 4; attempt++) {
       const missing = new Set()
@@ -423,6 +429,7 @@ export function createRenderer(canvas, opts = {}) {
         try {
           prog = linkProgram(gl, vertGlsl, fragGlsl)
         } catch (e) {
+          progCache.set(key, null)
           throw new Error('shader=' + shaderName + ' ' + (e && e.message))
         }
         const uni = new Map()
@@ -2251,7 +2258,11 @@ export function createRenderer(canvas, opts = {}) {
       try {
         progEntry = await getEffectProgram(mp.shader, combos, mergedTex)
       } catch (e) {
-        console.warn('[we-scene] 跳过效果（pass 编译失败）:', mp.shader, (e && e.message) || e)
+        const msg = (e && e.message) || String(e)
+        // 已缓存的失败每帧每层都会再进这里；只在首次编译失败时打日志，避免刷屏拖垮 FPS 观感。
+        if (!/已缓存/.test(msg)) {
+          console.warn('[we-scene] 跳过效果（pass 编译失败）:', mp.shader, msg)
+        }
         failedEffects.add(eff)
         continue
       }
