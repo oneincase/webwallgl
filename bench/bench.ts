@@ -669,6 +669,7 @@ function mount() {
   frameEl.classList.add("on");
   // 每次都换 src（含时间戳）强制重载，避免 WebGL 上下文复用掩盖泄漏问题
   frameEl.src = `${import.meta.env.BASE_URL}renderer/index.html?${q}&_t=${Date.now()}`;
+  setRunToggle(true); // 新渲染器页从运行态起步，切换按钮标签同步复位
   resetLiveFps();
   log(t("log.mount", { id: selected.itemId, q }));
 }
@@ -718,6 +719,7 @@ pkgFileEl.onchange = async () => {
     currentEl.title = file.name;
     frameEl.classList.add("on");
     emptyEl.style.display = "none";
+    setRunToggle(true); // loadSceneFile 在渲染器侧回到运行态
     log(t("log.filePreview", { name: file.name }));
   } catch (e) {
     log(t("err.filePreview", { msg: (e as Error).message }), true);
@@ -726,10 +728,24 @@ pkgFileEl.onchange = async () => {
 
 // ---------- 工具条 ----------
 
-$<HTMLButtonElement>("#pause").onclick = () => wp()?.pause();
-$<HTMLButtonElement>("#resume").onclick = () => wp()?.resume();
+// 暂停/恢复合成一个切换按钮：标签即状态（运行中显示「暂停」，已暂停显示「恢复」）。
+// 运行态只在本侧跟踪；重挂载/换壁纸后渲染器回到运行态，随 mount() 复位标签。
+const pauseBtn = $<HTMLButtonElement>("#pause");
+
+function setRunToggle(running: boolean) {
+  pauseBtn.dataset.i18n = running ? "toolbar.pause" : "toolbar.resume";
+  pauseBtn.textContent = t(pauseBtn.dataset.i18n);
+}
+
+pauseBtn.onclick = () => {
+  const w = wp();
+  if (!w) return;
+  const running = pauseBtn.dataset.i18n === "toolbar.pause";
+  if (running) w.pause();
+  else w.resume();
+  setRunToggle(!running);
+};
 $<HTMLButtonElement>("#release").onclick = () => wp()?.release();
-$<HTMLButtonElement>("#restore").onclick = () => wp()?.restore();
 $<HTMLButtonElement>("#reload").onclick = () => mount();
 $<HTMLButtonElement>("#open").onclick = () => {
   if (!selected) return;
