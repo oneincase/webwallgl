@@ -230,6 +230,7 @@ export function parseScene(sceneJson, project) {
       // anchor 是盒子相对 origin 的锚点（同 image alignment 枚举，外加 "none"）。
       // 本机 563 个文字层：none 237 / 缺省 301 / center 20 —— none 与缺省都按 center 处理
       // （WE 对象缺省对齐就是 center；显式 center 的挂件与时钟层行为一致）。
+      // 2780710296 实验过默认改 top：竖直阶梯对了，但会平移其它壁纸文字相对图元的位置，已回滚。
       textAnchor: typeof o.anchor === 'string' && o.anchor !== 'none' ? o.anchor : 'center',
       textMaxwidth: parseNum(o.maxwidth, 0),
       textMaxrows: parseNum(o.maxrows, 0),

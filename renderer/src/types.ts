@@ -20,6 +20,8 @@ export const SKIP_SCENE_EFFECTS = false;
 //   k = 盒高×scale/(行数×1.2×ps) 中位数 3.89、众数 4.0（9/17），其中 3122339805 的
 //   9 行 "text|text|…" 列（boxH 378, ps 9, scale 1）给出 3.89，与渲染实测吻合。
 //   交叉验证：2938612768 的作者滑条把时间/日期错开 85px，k=4 时两者恰好不叠（k=6 叠 1/3）。
+// 注意：2780710296 在 k=4 + center 锚下分秒仍糊进小时（见 CASEBOOK 待修条），
+// 全局改 k=1.5 / 顶边锚会伤其它已校准壁纸，禁止再全局动这两处。
 export const TEXT_EM_SCALE = 4;
 
 export type WallpaperFit = "cover" | "contain" | "stretch" | "fill" | "fit";

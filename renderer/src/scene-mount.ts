@@ -18,6 +18,7 @@ import {
   resolveUserProps,
   boundUserName,
 } from "../vendor/we-scene/scene/user-props.js";
+import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
 
 // WE 的 systemfont_* 内置字体 → 本机系统字体栈（WE 桌面端映射 Windows 系统字体，
 // macOS/Linux 上按近似度回退；都带 sans-serif 兜底，不命中也只是字形差异）。
@@ -1443,8 +1444,12 @@ cfg, source, pkgAbort.signal);
           try {
             const fe = pkg.getEntry(parsedPkg, fp);
             if (!fe) continue;
+            // Chrome OTS 拒载 cmap rangeShift 写错的 Tourner 等；先修再喂 FontFace。
+            const bytes = sanitizeFontForBrowser(
+              fe instanceof Uint8Array ? fe : new Uint8Array(fe as ArrayBuffer),
+            );
             const fam = "wefont_" + fp.split("/").pop()!.replace(/[^a-zA-Z0-9]/g, "_");
-            const url = URL.createObjectURL(new Blob([fe as BlobPart]));
+            const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
             const ff = new FontFace(fam, `url(${url})`);
             await ff.load();
             document.fonts.add(ff);

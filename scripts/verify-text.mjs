@@ -23,6 +23,8 @@ const wtext = await imp("renderer/vendor/we-scene/render/text.js");
 const engTimers = await imp("renderer/vendor/we-scene/render/engine-timers.js");
 const parseMod = await imp("renderer/vendor/we-scene/scene/parse.js");
 const userPropsMod = await imp("renderer/vendor/we-scene/scene/user-props.js");
+const fontSanMod = await imp("renderer/vendor/we-scene/render/font-sanitize.js");
+const pkgMod = await imp("renderer/vendor/we-scene/pkg/container.js");
 
 // ---------- scene.pkg 读取（container.js 的最小子集，避免拖入浏览器依赖） ----------
 
@@ -893,6 +895,70 @@ function runRibbonEffects() {
       errors.push("scene-mount.ts 未把媒体控制面注入沙箱");
     }
     if (!/scriptAnglesToRad\(/.test(mount)) errors.push("scene-mount.ts 对象脚本 angles 写回未走 scriptAnglesToRad");
+    if (!/sanitizeFontForBrowser/.test(mount)) {
+      errors.push("scene-mount.ts 未调用 sanitizeFontForBrowser（Tourner cmap 会被 OTS 拒载）");
+    }
+    const fontSan = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/font-sanitize.js"), "utf8");
+    if (!/rangeShift/.test(fontSan) || !/cmap/.test(fontSan)) {
+      errors.push("font-sanitize.js 必须修正 cmap format 4 的 rangeShift");
+    }
+    // 本机语料：2780710296 的 Tourner (588) 修前 rangeShift 错、修后应对。
+    const wp278 = join(LIB, "2780710296", "scene.pkg");
+    if (fs.existsSync(wp278)) {
+      const pkg = pkgMod.parsePkg(fs.readFileSync(wp278));
+      const raw = pkgMod.getEntry(pkg, "fonts/Tourner (588).TTF");
+      if (!raw) {
+        errors.push("2780710296 应含 fonts/Tourner (588).TTF");
+      } else {
+        const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+        const fixed = fontSanMod.sanitizeFontForBrowser(u8);
+        const dv = new DataView(fixed.buffer, fixed.byteOffset, fixed.byteLength);
+        const numTables = dv.getUint16(4);
+        let cmapOff = 0;
+        for (let i = 0; i < numTables; i++) {
+          const e = 12 + i * 16;
+          const tag = String.fromCharCode(fixed[e], fixed[e + 1], fixed[e + 2], fixed[e + 3]);
+          if (tag === "cmap") {
+            cmapOff = dv.getUint32(e + 8);
+            break;
+          }
+        }
+        const nEnc = dv.getUint16(cmapOff + 2);
+        let ok = false;
+        for (let i = 0; i < nEnc; i++) {
+          const soff = dv.getUint32(cmapOff + 4 + i * 8 + 4);
+          const abs = cmapOff + soff;
+          if (dv.getUint16(abs) !== 4) continue;
+          const segCountX2 = dv.getUint16(abs + 6);
+          const segCount = segCountX2 >> 1;
+          const expShift = segCountX2 - 2 * Math.pow(2, Math.floor(Math.log2(segCount)));
+          ok = dv.getUint16(abs + 12) === expShift;
+        }
+        if (!ok) errors.push("2780710296 Tourner (588) sanitize 后 cmap rangeShift 仍不对");
+        // 故意改坏：原件 rangeShift 必须是错的，否则本用例失去意义
+        const dv0 = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        let cmap0 = 0;
+        for (let i = 0; i < dv0.getUint16(4); i++) {
+          const e = 12 + i * 16;
+          const tag = String.fromCharCode(u8[e], u8[e + 1], u8[e + 2], u8[e + 3]);
+          if (tag === "cmap") {
+            cmap0 = dv0.getUint32(e + 8);
+            break;
+          }
+        }
+        let rawBad = false;
+        for (let i = 0; i < dv0.getUint16(cmap0 + 2); i++) {
+          const soff = dv0.getUint32(cmap0 + 4 + i * 8 + 4);
+          const abs = cmap0 + soff;
+          if (dv0.getUint16(abs) !== 4) continue;
+          const segCountX2 = dv0.getUint16(abs + 6);
+          const segCount = segCountX2 >> 1;
+          const expShift = segCountX2 - 2 * Math.pow(2, Math.floor(Math.log2(segCount)));
+          if (dv0.getUint16(abs + 12) !== expShift) rawBad = true;
+        }
+        if (!rawBad) errors.push("2780710296 Tourner (588) 原件 rangeShift 应变坏（用例失效）");
+      }
+    }
     const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
     if (!/shared:\s*scriptShared/.test(rsrc)) errors.push("renderer.js scriptedConstants 未把 shared 传进沙箱");
     if (!/inputView:\s*scriptInputView/.test(rsrc)) {
