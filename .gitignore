@@ -6,6 +6,8 @@ dist/
 *.tsbuildinfo
 
 # 系统 / 编辑器
+.agents/
+.docs/
 .DS_Store
 .idea/
 .vscode/
