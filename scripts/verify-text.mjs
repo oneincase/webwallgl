@@ -1945,6 +1945,92 @@ function runHideWindowVisibility() {
   return errors;
 }
 
+// ---------- engine.canvasSize 形态（3790399458 三个文字层塌到左下角） ----------
+//
+// WE 的 engine.canvasSize 是带 .x/.y 的向量；宿主一律传 {width,height}（ortho）。
+// 文字/对象脚本直接读 canvasSize.x/y 的语料（本地库 15 张）拿到 undefined
+// → NaN → 宿主写回 `NaN || 0` 把 origin 塌成世界原点（左下角叠字、被底边裁掉）。
+// 沙箱暴露的四键兼容对象必须同时保住：.x/.y 直接访问、new Vec3(canvasSize)
+// 的 x||width 路径、divide/multiply 对象路径的 v.x（修复前同样是 NaN）。
+
+function runEngineCanvasSize() {
+  const errors = [];
+
+  // ---- 1) 归一化：{width,height} → 四键；已带 .x/.y 原样透传 ----
+  {
+    const sb = wtext.evalObjectScript(
+      "export function update(v){ return { x: engine.canvasSize.x, y: engine.canvasSize.y, w: engine.canvasSize.width, h: engine.canvasSize.height }; }",
+      null,
+      { canvasSize: { width: 3840, height: 2160 } },
+    );
+    const r = sb.callUpdate({});
+    if (r.x !== 3840 || r.y !== 2160)
+      errors.push(
+        `engine.canvasSize.x/y 应等于 width/height（脚本直接读 .x/.y，3790399458），got ${JSON.stringify({ x: r.x, y: r.y })}`,
+      );
+    if (r.w !== 3840 || r.h !== 2160)
+      errors.push("engine.canvasSize.width/height 应继续可用（new Vec3(canvasSize) 的 x||width 路径依赖）");
+
+    const sb2 = wtext.evalObjectScript("export function update(v){ return engine.canvasSize.x; }", null, {
+      canvasSize: { x: 100, y: 60 },
+    });
+    if (sb2.callUpdate({}) !== 100) errors.push("已带 .x/.y 的 canvasSize 应原样透传，不得二次改写");
+  }
+
+  // ---- 2) Vec3 路径：构造器与 divide/multiply 的对象实参读 v.x ----
+  {
+    const sb = wtext.evalObjectScript(
+      "export function update(v){ return new Vec3(engine.canvasSize).divide(engine.canvasSize).toString(); }",
+      null,
+      { canvasSize: { width: 3840, height: 2160 } },
+    );
+    const s = sb.callUpdate();
+    if (s !== "1 1 0")
+      errors.push(`new Vec3(canvasSize).divide(canvasSize) 应为 "1 1 0"（修复前 v.x=undefined → NaN），got "${s}"`);
+  }
+
+  // ---- 3) 真实语料：3790399458 三个文字层 origin 脚本 ----
+  const dir = join(LIB, "3790399458");
+  const pkgPath = join(dir, "scene.pkg");
+  if (!fs.existsSync(pkgPath)) {
+    console.log("  （跳过 3790399458 语料：本机无此壁纸）");
+    return errors;
+  }
+  const scene = JSON.parse(readText(getEntry(parsePkg(fs.readFileSync(pkgPath)), "scene.json")));
+  // scene-mount 的逐帧 vec3 写回判据：update() 返回值必须有限——
+  // `NaN || 0` 会把 origin 静默兜底成 (0,0)（世界左下角），必须在这里红
+  const expect = { 61: [3033.6, 1209.6], 62: [3033.6, 1080], 63: [3033.6, 972] };
+  for (const id of [61, 62, 63]) {
+    const o = scene.objects.find((x) => x.id === id);
+    if (!o || !o.origin || typeof o.origin !== "object" || !o.origin.script) {
+      errors.push(`3790399458 对象 ${id} 应有 origin 脚本（posX/posY% 画布定位）`);
+      continue;
+    }
+    const sb = wtext.evalObjectScript(o.origin.script, o.origin.scriptproperties, {
+      canvasSize: { width: 3840, height: 2160 },
+      userProperties: {},
+    });
+    if (!sb || !sb.hasUpdate) {
+      errors.push(`3790399458 对象 ${id} origin 脚本应加载且带 update`);
+      continue;
+    }
+    const [ex, ey] = expect[id];
+    const ret = sb.callUpdate({ x: 0, y: 0, z: 0 });
+    const fx = Number(ret?.x);
+    const fy = Number(ret?.y);
+    if (!Number.isFinite(fx) || !Number.isFinite(fy)) {
+      errors.push(`3790399458 ${o.name} origin 算出非有限值 (${ret?.x}, ${ret?.y})——canvasSize 形态回归`);
+      continue;
+    }
+    if (Math.abs(fx - ex) > 0.5 || Math.abs(fy - ey) > 0.5) {
+      errors.push(
+        `3790399458 ${o.name} origin 应为 (${ex}, ${ey})（posX/posY% × 3840×2160），got (${fx.toFixed(1)}, ${fy.toFixed(1)})`,
+      );
+    }
+  }
+  return errors;
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";

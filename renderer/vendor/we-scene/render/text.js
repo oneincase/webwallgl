@@ -443,6 +443,23 @@ function scriptToFunctionBody(script) {
 }
 
 /**
+ * engine.canvasSize 统一成 WE 的向量形态（.x/.y）。
+ *
+ * WE 的 engine.canvasSize 是带 .x/.y 的向量；本仓宿主一律传 {width,height}
+ * （scene.json 的 orthogonalprojection）。直接成员访问 `canvasSize.x` 拿到
+ * undefined → 脚本算出 NaN → 宿主写回 `NaN || 0` 把字段塌成 0：
+ * 3790399458 三个文字层 origin 全部塌到世界原点（左下角叠字、被底边裁掉）。
+ * 本地库 167 张里 15 张含此访问形态。四键并存，.x/.y 直接访问、
+ * new Vec3(canvasSize) 的 x||width、divide/multiply 的 v.x 路径全部兼容
+ * ——divide/multiply 读 v.x，修复前同样是 NaN，此处一并修好。
+ */
+function engineCanvasSize(cs) {
+  const src = cs || { width: 1920, height: 1080 }
+  if (src.x !== undefined && src.y !== undefined) return src
+  return { x: src.width, y: src.height, width: src.width, height: src.height }
+}
+
+/**
  * 求值 WE 文字脚本，返回沙箱；脚本解析/执行失败返回 null（调用方回退静态文本）。
  * @param script text.script 源码
  * @param scriptprops scene.json 的 text.scriptproperties（值或 {user,value} 包装）
@@ -499,7 +516,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     registerAsset: () => {},
     frametime: 1 / 60,
     runtime: 0,
-    canvasSize: opts.canvasSize || { width: 1920, height: 1080 },
+    canvasSize: engineCanvasSize(opts.canvasSize),
     // [we-scene patch] engine.screenResolution（全库 10 处 / 2 壁纸）：
     // 屏幕**像素**尺寸，脚本用它把 input.cursorScreenPosition 归一化
     // （3791967416 除它得 [0,1]；3509243656 减半屏得 [-1,1]）。
@@ -1507,7 +1524,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     registerAsset: () => {},
     frametime: 1 / 60,
     runtime: 0,
-    canvasSize: opts.canvasSize || { width: 1920, height: 1080 },
+    canvasSize: engineCanvasSize(opts.canvasSize),
     screenResolution: opts.screenResolution || { x: 1920, y: 1080 },
     timeOfDay: typeof opts.timeOfDay === 'number' ? opts.timeOfDay : 0,
     userProperties: opts.userProperties || {},
