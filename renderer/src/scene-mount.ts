@@ -9,6 +9,7 @@ import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
+import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, noise, particles, ptex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
@@ -263,14 +264,32 @@ cfg, source, pkgAbort.signal);
       rt.renderer = renderer;
       if (disposed) return;
 
-      // ---- 模拟音频源（WE 音频可视化，见 vendor we-scene render/audio.js）----
-      // project.json 的 general.supportsaudioprocessing 是作者声明的「壁纸响应音频」
-      // 开关：false 时喂静音（WE 语义，实测 false 的壁纸也无任何音频引用）。
-      // 独立测试台没有系统音频，用确定性模拟频谱代替；换真实源只需替换 update。
+      // ---- 音频 / 媒体 / 窗口源 ----
+      // 默认确定性模拟（离线可复现）；cfg.liveSystem 时换麦克风 + 宿主 Now Playing。
       const supportsAudioProcessing =
         (project as { general?: { supportsaudioprocessing?: boolean } } | null)?.general
           ?.supportsaudioprocessing !== false;
       const simAudio = audioMod.createSimulatedAudio();
+      const simMedia = media.createSimulatedMedia();
+      const simWindow = system.createSimulatedWindowTitle();
+      // live 在 textures / mediaDriver 就绪后再 start（见下方），这里只占位
+      let live: LiveSystemHandle | null = null;
+      const liveHold: {
+        mediaDriver: { snapshot: any } | null;
+        lastSnap: { get: () => any; setHasThumbnail: (v: boolean) => void };
+      } = {
+        mediaDriver: null,
+        lastSnap: {
+          get: () => null,
+          setHasThumbnail: () => {},
+        },
+      };
+      const audioDriverRef: { current: { snapshot: any; pump: () => void } | null } = {
+        current: null,
+      };
+      // 先按模拟源装配；live 启动后改指向
+      let mediaDriver: any = simMedia;
+      let windowDriver: any = simWindow;
       const audioSim = { enabled: supportsAudioProcessing };
       // 静音（壁纸不支持音频 / __audioMute）必须显式喂全零：GL uniform 数组在
       // 不设置时会**保留上一帧的值**，返回 null 不会让波形落回零位。
@@ -281,30 +300,39 @@ cfg, source, pkgAbort.signal);
         left64: zero(64), right64: zero(64),
         level: 0, silent: true,
       };
-      renderer.setAudioProvider(() => (audioSim.enabled ? simAudio.snapshot : SILENT_AUDIO));
+      renderer.setAudioProvider(() => {
+        if (!audioSim.enabled) return SILENT_AUDIO;
+        return audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot;
+      });
       // 文字脚本 engine.registerAudioBuffers(n) 的共享视图（text.js 惰性创建，每帧重填）
       const audioViews = new Map<number, { left: Float32Array; right: Float32Array; average: Float32Array }>();
       // 调试出口：音频状态 / 强制静音（音频响应 A/B 对比验证用）
       (window as unknown as Record<string, unknown>).__audioStats = () => ({
         enabled: audioSim.enabled,
-        level: audioSim.enabled ? Math.round(simAudio.snapshot.level * 1000) / 1000 : 0,
-        silent: audioSim.enabled ? simAudio.snapshot.silent : true,
-        bass: audioSim.enabled ? Math.round(simAudio.snapshot.left64[2] * 1000) / 1000 : 0,
+        live: !!audioDriverRef.current,
+        level: audioSim.enabled
+          ? Math.round((audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot).level * 1000) / 1000
+          : 0,
+        silent: audioSim.enabled
+          ? (audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot).silent
+          : true,
+        bass: audioSim.enabled
+          ? Math.round((audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot).left64[2] * 1000) / 1000
+          : 0,
       });
       (window as unknown as Record<string, unknown>).__audioMute = (on: boolean) => {
         audioSim.enabled = !on;
         return audioSim.enabled;
       };
-      reportDiag(rt, cfg, `audio: simulated stream, supportsaudioprocessing=${supportsAudioProcessing}`);
+      reportDiag(
+        rt,
+        cfg,
+        `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+      );
 
-      // ---- 模拟媒体源（WE 媒体集成，见 vendor we-scene render/media.js）----
-      // WE 把「系统正在播放的音乐」通过 media*Changed 回调推给脚本。独立测试台
-      // 没有系统媒体会话，这里用确定性模拟播放列表代替；接真实源只需替换 update。
-      //
+      // ---- 媒体集成（模拟或实况）----
       // 回调是**事件**不是轮询：只在快照变化时派发。语料里 mediaThumbnailChanged
       // 常写 `anim.stop(); anim.play();`，每帧广播会让动画永远卡在第 0 帧。
-      const simMedia = media.createSimulatedMedia();
-      const simWindow = system.createSimulatedWindowTitle();
       const shortcuts = system.createShortcutHandler((name: string) => {
         reportDiag(rt, cfg, `openUserShortcut: ${name}`);
       });
@@ -312,6 +340,12 @@ cfg, source, pkgAbort.signal);
       // 挂了媒体回调的沙箱（广播表；媒体不做 hit-test，不必按图层索引）
       const mediaHooks: any[] = [];
       let lastMediaSnap: any = null;
+      liveHold.lastSnap = {
+        get: () => lastMediaSnap,
+        setHasThumbnail: (v: boolean) => {
+          if (lastMediaSnap) lastMediaSnap.hasThumbnail = v;
+        },
+      };
       // [we-scene patch] 登记必须**带补发**。媒体回调是事件而非轮询，沙箱只能从
       // 回调里知道当前播放态；而效果常量沙箱是惰性创建的（首帧渲染到该 pass 才建），
       // 等它登记进广播表时，首帧那批事件早已派发完、lastMediaSnap 也已追平，
@@ -320,13 +354,14 @@ cfg, source, pkgAbort.signal);
       // 各挂一份镜像淡入淡出脚本，占位层按「停止态」淡入到 1、实时层淡出到 0，
       // 于是画面永远停在 "Wallpaper Music" / "Name of artist"。
       // 用 diff(null, snapshot) 生成全量事件补给新沙箱，与首帧语义一致。
+      const mediaSnapshot = () => mediaDriver.snapshot;
       const registerMediaHook = (sb: any) => {
         if (!sb || !sb.hasMediaHook || mediaHooks.includes(sb)) return;
         mediaHooks.push(sb);
         // 建场阶段（首帧 update 之前）快照还是空的，补发只会送一轮「无媒体」；
         // 那批沙箱由首帧的 diff 正常覆盖，这里跳过。只有真正迟到的才需要补。
-        if (!simMedia.snapshot.hasMedia) return;
-        for (const { name, event } of media.diffMediaEvents(null, simMedia.snapshot)) {
+        if (!mediaSnapshot().hasMedia) return;
+        for (const { name, event } of media.diffMediaEvents(null, mediaSnapshot())) {
           try {
             sb.callMedia(name, event);
           } catch {
@@ -336,29 +371,30 @@ cfg, source, pkgAbort.signal);
       };
       (window as unknown as Record<string, unknown>).__mediaStats = () => ({
         enabled: mediaSim.enabled,
+        live: !!live,
         hooks: mediaHooks.length,
-        title: simMedia.snapshot.title,
-        artist: simMedia.snapshot.artist,
-        album: simMedia.snapshot.album,
-        state: simMedia.snapshot.state,
-        position: Math.round(simMedia.snapshot.position),
-        duration: simMedia.snapshot.duration,
-        hasThumbnail: simMedia.snapshot.hasThumbnail,
-        lyric: simMedia.snapshot.lyricLine,
-        primaryColor: simMedia.snapshot.primaryColor
-          ? [simMedia.snapshot.primaryColor.x, simMedia.snapshot.primaryColor.y, simMedia.snapshot.primaryColor.z]
+        title: mediaSnapshot().title,
+        artist: mediaSnapshot().artist,
+        album: mediaSnapshot().album,
+        state: mediaSnapshot().state,
+        position: Math.round(mediaSnapshot().position),
+        duration: mediaSnapshot().duration,
+        hasThumbnail: mediaSnapshot().hasThumbnail,
+        lyric: mediaSnapshot().lyricLine,
+        primaryColor: mediaSnapshot().primaryColor
+          ? [mediaSnapshot().primaryColor.x, mediaSnapshot().primaryColor.y, mediaSnapshot().primaryColor.z]
           : null,
       });
       // 手动覆写快照字段并立即广播（验证「换歌 → 文字/封面/唱针」链路用）
       (window as unknown as Record<string, unknown>).__mediaSet = (patch: Record<string, unknown>) => {
-        Object.assign(simMedia.snapshot, patch || {});
-        const evts = media.diffMediaEvents(lastMediaSnap, simMedia.snapshot);
+        Object.assign(mediaSnapshot(), patch || {});
+        const evts = media.diffMediaEvents(lastMediaSnap, mediaSnapshot());
         for (const { name, event } of evts) for (const sb of mediaHooks) sb.callMedia(name, event);
-        lastMediaSnap = media.cloneMediaSnapshot(simMedia.snapshot);
+        lastMediaSnap = media.cloneMediaSnapshot(mediaSnapshot());
         return (window as unknown as Record<string, () => unknown>).__mediaStats();
       };
       const dispatchMediaNow = () => {
-        const evts = media.diffMediaEvents(lastMediaSnap, simMedia.snapshot);
+        const evts = media.diffMediaEvents(lastMediaSnap, mediaSnapshot());
         for (const { name, event } of evts) {
           for (const sb of mediaHooks) {
             try {
@@ -368,42 +404,50 @@ cfg, source, pkgAbort.signal);
             }
           }
         }
-        lastMediaSnap = media.cloneMediaSnapshot(simMedia.snapshot);
+        lastMediaSnap = media.cloneMediaSnapshot(mediaSnapshot());
       };
       const mediaControl = {
-        snapshot: simMedia.snapshot,
+        get snapshot() {
+          return mediaSnapshot();
+        },
         skipNext: () => {
-          simMedia.skipNext();
+          mediaDriver.skipNext();
           dispatchMediaNow();
-          return simMedia.snapshot;
+          return mediaSnapshot();
         },
         skipPrevious: () => {
-          simMedia.skipPrevious();
+          mediaDriver.skipPrevious();
           dispatchMediaNow();
-          return simMedia.snapshot;
+          return mediaSnapshot();
         },
         play: () => {
-          simMedia.play();
+          mediaDriver.play();
           dispatchMediaNow();
-          return simMedia.snapshot;
+          return mediaSnapshot();
         },
         pause: () => {
-          simMedia.pause();
+          mediaDriver.pause();
           dispatchMediaNow();
-          return simMedia.snapshot;
+          return mediaSnapshot();
         },
         playPause: () => {
-          simMedia.playPause();
+          mediaDriver.playPause();
           dispatchMediaNow();
-          return simMedia.snapshot;
+          return mediaSnapshot();
         },
       };
       (window as unknown as Record<string, unknown>).__mediaControl = mediaControl;
       (window as unknown as Record<string, unknown>).__system = {
         media: mediaControl,
-        windowTitle: simWindow.snapshot,
+        windowTitle: windowDriver.snapshot,
         shortcuts: shortcuts.last,
+        live: null as null | (() => unknown),
       };
+      (window as unknown as Record<string, unknown>).__liveSystem = () => ({
+        audio: "off",
+        media: "offline",
+        window: "offline",
+      });
 
       // ---- 统一指针输入 ----
       // 一处监听、四方消费（shader uniform / 相机+对象视差 / 粒子 controlpoint /
@@ -530,6 +574,134 @@ cfg, source, pkgAbort.signal);
           textures.set("$mediaThumbnail", mkThumb(tracks[0]));
           textures.set("$mediaPreviousThumbnail", mkThumb(tracks[tracks.length - 1]));
         }
+      }
+
+      // ---- 系统实况：textures / mediaDriver 已就绪后再挂麦克风与 Now Playing ----
+      if (cfg.liveSystem) {
+        try {
+          const uploadLiveArtwork = async (info: {
+            url: string;
+            trackKey: string;
+            title: string;
+            artist: string;
+          }) => {
+            try {
+              const res = await fetch(info.url, { cache: "no-store" });
+              if (!res.ok) return;
+              const blob = await res.blob();
+              const bmp = await createImageBitmap(blob);
+              const raster = rasterizeArtwork(bmp, bmp.width, bmp.height, 512);
+              const palette = sampleArtworkPalette(bmp, bmp.width, bmp.height);
+              bmp.close?.();
+
+              const cur = textures.get("$mediaThumbnail");
+              if (cur) textures.set("$mediaPreviousThumbnail", cur);
+
+              const gl = renderer.gl as WebGL2RenderingContext;
+              const existing = textures.get("$mediaThumbnail");
+              if (existing?.glTex) {
+                gl.bindTexture(gl.TEXTURE_2D, existing.glTex);
+                gl.texImage2D(
+                  gl.TEXTURE_2D,
+                  0,
+                  gl.RGBA,
+                  raster.width,
+                  raster.height,
+                  0,
+                  gl.RGBA,
+                  gl.UNSIGNED_BYTE,
+                  raster.rgba,
+                );
+                existing.width = raster.width;
+                existing.height = raster.height;
+                existing.mips = [raster];
+              } else {
+                textures.set("$mediaThumbnail", {
+                  glTex: rnd.makeTextureMip(gl, [raster], false),
+                  width: raster.width,
+                  height: raster.height,
+                  rg88: false,
+                  mips: [raster],
+                  generated: true,
+                });
+              }
+
+              const snap = mediaDriver.snapshot;
+              if (palette) {
+                snap.primaryColor = media.mediaVec3(...palette.primary);
+                snap.secondaryColor = media.mediaVec3(...palette.secondary);
+                snap.tertiaryColor = media.mediaVec3(...palette.tertiary);
+                snap.textColor = media.mediaVec3(0.98, 0.98, 1);
+                snap.highContrastColor = media.mediaVec3(1, 1, 1);
+              }
+              snap.hasThumbnail = true;
+              liveHold.lastSnap.setHasThumbnail(false);
+              reportDiag(rt, cfg, `liveSystem: artwork ${info.title || info.trackKey}`);
+            } catch (e) {
+              reportDiag(
+                rt,
+                cfg,
+                `liveSystem: artwork 失败 (${e instanceof Error ? e.message : e})`,
+              );
+            }
+          };
+
+          live = await startLiveSystem({
+            origin: location.origin,
+            onArtwork: (info) => {
+              void uploadLiveArtwork(info);
+            },
+          });
+          mediaDriver = live.media;
+          windowDriver = live.windowTitle;
+          liveHold.mediaDriver = live.media;
+          if (live.status().audio === "mic") audioDriverRef.current = live.audio;
+          // 补发当前媒体快照给已登记沙箱
+          if (mediaDriver.snapshot.hasMedia) {
+            for (const { name, event } of media.diffMediaEvents(null, mediaDriver.snapshot)) {
+              for (const sb of mediaHooks) {
+                try {
+                  sb.callMedia(name, event);
+                } catch {
+                  /* ignore */
+                }
+              }
+            }
+            lastMediaSnap = media.cloneMediaSnapshot(mediaDriver.snapshot);
+          }
+          const st = live.status();
+          reportDiag(
+            rt,
+            cfg,
+            `liveSystem: audio=${st.audio} media=${st.media} window=${st.window}` +
+              (st.title ? ` title="${st.title}"` : "") +
+              (st.hasArtwork ? " artwork=1" : ""),
+          );
+          reportDiag(
+            rt,
+            cfg,
+            `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+          );
+          (window as unknown as Record<string, unknown>).__system = {
+            media: mediaControl,
+            windowTitle: windowDriver.snapshot,
+            shortcuts: shortcuts.last,
+            live: () => live!.status(),
+          };
+          (window as unknown as Record<string, unknown>).__liveSystem = () => live!.status();
+        } catch (e) {
+          reportDiag(rt, cfg, `liveSystem: 启动失败，回退模拟源 (${e instanceof Error ? e.message : e})`);
+          live = null;
+        }
+      }
+
+      {
+        const prevCleanup = particleCleanup;
+        particleCleanup = () => {
+          prevCleanup?.();
+          live?.dispose();
+          live = null;
+        };
       }
 
       const texInflight = new Map<string, Promise<any | null>>();
@@ -1516,7 +1688,7 @@ cfg, source, pkgAbort.signal);
                 // 与对象/效果开关/常量/general 统一走 engineTimers（P1-1）。
                 ...timerOpts,
                 mediaControl,
-                windowTitle: simWindow.snapshot,
+                windowTitle: windowDriver.snapshot,
                 openUserShortcut: shortcuts.openUserShortcut,
                 getLayerText: (name: string) => textLayerText.get(name),
                 onError: (e: unknown) => {
@@ -1804,7 +1976,7 @@ cfg, source, pkgAbort.signal);
             return clone;
           },
           mediaControl,
-          windowTitle: simWindow.snapshot,
+          windowTitle: windowDriver.snapshot,
           openUserShortcut: shortcuts.openUserShortcut,
           isScreensaver: false,
         };
@@ -2142,12 +2314,14 @@ cfg, source, pkgAbort.signal);
           // 脚本 input 视图就地重填（世界坐标是上一帧 render 里 syncWorld 算的，
           // 首帧为初值；与 audioViews 慢一帧的既有行为一致）
           inputView.update(pointerSrc.state);
-          // [we-scene patch] 模拟媒体源推进 + **变化时才派发**回调。
+          // [we-scene patch] 媒体源推进 + **变化时才派发**回调。
           // 放在对象脚本求值之前：媒体回调常改写 visible/文本/动画播放头，
           // 这些改动应当在本帧的字段求值与渲染里立即生效。
           if (mediaSim.enabled) {
-            simMedia.update(t);
-            const evts = media.diffMediaEvents(lastMediaSnap, simMedia.snapshot);
+            if (live?.media) live.media.pump();
+            else simMedia.update(t);
+            const snap = mediaSnapshot();
+            const evts = media.diffMediaEvents(lastMediaSnap, snap);
             if (evts.length) {
               for (const { name, event } of evts) {
                 for (const sb of mediaHooks) {
@@ -2155,10 +2329,11 @@ cfg, source, pkgAbort.signal);
                   sb.callMedia(name, event);
                 }
               }
-              lastMediaSnap = media.cloneMediaSnapshot(simMedia.snapshot);
+              lastMediaSnap = media.cloneMediaSnapshot(snap);
             }
           }
-          simWindow.update(t);
+          if (live?.windowTitle) live.windowTitle.pump();
+          else simWindow.update(t);
           // [we-scene patch] 关键帧动画推进并写回字段。必须在对象脚本**之前**：
           // 同一字段上两者可以并存（全库 44 处），语义是脚本控制播放头、
           // 动画产出值，脚本的 update 返回值优先级更高。
@@ -2242,8 +2417,12 @@ cfg, source, pkgAbort.signal);
           if (visibilityDirty) recomputeVisibility();
           // 模拟音频流按场景时间推进（确定性：同 t 同频谱），并重填文字脚本的频谱视图
           if (audioSim.enabled) {
-            simAudio.update(t);
-            audioMod.fillAudioBuffers(audioViews, simAudio.snapshot);
+            if (audioDriverRef.current) audioDriverRef.current.pump();
+            else simAudio.update(t);
+            audioMod.fillAudioBuffers(
+              audioViews,
+              audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot,
+            );
           }
           // [we-scene patch] 挂件跟随父 puppet 附着点。必须在对象脚本之后、绘制之前：
           // 从绑定姿势的 base origin 重写，加上当前姿势与绑定姿势的差。

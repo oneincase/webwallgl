@@ -137,6 +137,10 @@
             <label class="vol"><span data-i18n="toolbar.volume">音量</span>
               <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
             </label>
+            <label class="check" data-i18n-title="toolbar.liveTip" title="歌名走 Node/media-control；音频可视化走麦克风（测试台无系统声卡环回）">
+              <input id="live-system" type="checkbox" checked />
+              <span data-i18n="toolbar.live">系统实况</span>
+            </label>
             <button type="button" id="pause" data-i18n="toolbar.pause">暂停</button>
             <button type="button" id="resume" data-i18n="toolbar.resume">恢复</button>
             <button type="button" id="reload" data-i18n="toolbar.reload">重挂载</button>
@@ -167,7 +171,7 @@
             <div id="stage-frame">
               <div id="stage-scale">
                 <div id="stage">
-                  <iframe id="frame" title="renderer"></iframe>
+                  <iframe id="frame" title="renderer" allow="microphone"></iframe>
                   <div id="empty" data-i18n="stage.empty">从左侧选择一个壁纸开始渲染</div>
                 </div>
               </div>

@@ -43,6 +43,11 @@ export type WallpaperConfig = {
   filter?: string;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene/web 拉取资源） */
   mediaBase?: string;
+  /**
+   * 测试台「系统实况」：用麦克风频谱 + 宿主 Now Playing / 前台窗口替换模拟源。
+   * 默认 false（确定性模拟，离线可复现）。
+   */
+  liveSystem?: boolean;
 
   // ---- 库化改造引入的可选入口（docs/LIBRARY-PLAN.md 第 1 步）----
   // 公共 API 的 mount() 经这两个字段接管「画到哪」与「资源从哪来」。

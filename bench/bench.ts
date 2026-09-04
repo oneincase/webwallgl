@@ -89,6 +89,7 @@ const fitEl = $<HTMLSelectElement>("#fit");
 const dprEl = $<HTMLSelectElement>("#dpr");
 const fpsEl = $<HTMLSelectElement>("#fps");
 const volumeEl = $<HTMLInputElement>("#volume");
+const liveSystemEl = $<HTMLInputElement>("#live-system");
 const resolutionEl = $<HTMLSelectElement>("#resolution");
 const stageFrameEl = $<HTMLElement>("#stage-frame");
 const stageScaleEl = $<HTMLElement>("#stage-scale");
@@ -645,6 +646,7 @@ function buildQuery(it: LibraryItem): string {
   p.set("muted", String(Number(volumeEl.value) <= 0));
   p.set("loop", "true");
   p.set("mediaBase", MEDIA_BASE);
+  if (liveSystemEl.checked) p.set("liveSystem", "1");
   return p.toString();
 }
 
@@ -796,6 +798,14 @@ dprEl.onchange = () => {
   wp()?.setRenderDpr(Number(dprEl.value));
 };
 volumeEl.oninput = () => wp()?.setVolume(Number(volumeEl.value));
+liveSystemEl.onchange = () => {
+  if (selected) mount();
+  log(
+    liveSystemEl.checked
+      ? t("log.liveOn")
+      : t("log.liveOff"),
+  );
+};
 
 function layoutStage() {
   const val = resolutionEl.value;

@@ -306,6 +306,7 @@ const initialCfg: WallpaperConfig = {
   loop: params.get("loop") !== "false",
   filter: params.get("filter") ?? undefined,
   mediaBase: params.get("mediaBase") ?? undefined,
+  liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
 };
 rt.cfg = initialCfg;
 applyWallpaperFilter(rt);

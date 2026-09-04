@@ -19,6 +19,15 @@
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
  *   GET /api/props?item=                   壁纸自定义属性定义（含本地化文案与当前值）
  *   POST /api/props?item=                  保存属性覆盖值（body 为 name→wire 值）
+ *   GET /api/system/artwork                当前曲目封面（image/jpeg 等）
+ *   GET /api/system/media                  系统正在播放（Node 缓存；?fresh=1 强制刷新）
+ *   GET /api/system/window                 前台窗口标题
+ *   GET /api/system/stream                 媒体+窗口合并 SSE（读缓存 ~2Hz）
+ *   POST /api/system/media-control         切歌/播放/暂停 → 当前播放器
+ *   GET /audio-stream/{token}              对齐 WallpaperEM；测试台无 SCK 时 503
+ *
+ * 媒体元数据由 host/system-live.ts 在 Node 进程内采集（media-control 或 AppleScript），
+ * 不依赖浏览器 MediaSession。
  */
 import { createReadStream, promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
@@ -27,6 +36,17 @@ import { extname, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { Connect, Plugin, ViteDevServer } from "vite";
 import { describe, overrideProps, readOverrides, writeOverrides } from "./we-props";
+import {
+  controlNowPlaying,
+  getCachedArtwork,
+  getCachedMedia,
+  getCachedWindow,
+  getLiveBackend,
+  readFrontWindow,
+  readNowPlaying,
+  startLiveSystemService,
+  type MediaControl,
+} from "./system-live";
 
 /** 与原生侧一致的媒体访问 token；独立测试台无鉴权需求，固定值方便手拼 URL */
 export const DEV_TOKEN = "dev";
@@ -389,6 +409,19 @@ export function wallpaperHost(): Plugin {
     name: "we-scene-renderer:wallpaper-host",
     configureServer(server: ViteDevServer) {
       server.config.logger.info(`[host] 壁纸库目录：${lib}`);
+      void startLiveSystemService().then(({ backend }) => {
+        if (backend === "media-control") {
+          server.config.logger.info(
+            `[host] 系统媒体：media-control（系统级 Now Playing）`,
+          );
+        } else if (backend === "applescript") {
+          server.config.logger.info(
+            `[host] 系统媒体：AppleScript（Music/Spotify）；安装 brew install media-control 可覆盖浏览器等全部播放源`,
+          );
+        } else {
+          server.config.logger.info(`[host] 系统媒体：当前平台无采集后端`);
+        }
+      });
 
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -422,6 +455,120 @@ export function wallpaperHost(): Plugin {
           res.write(": connected\n\n");
           diagClients.add(res);
           req.on("close", () => diagClients.delete(res));
+          return;
+        }
+
+        // --- 系统实况：专辑封面（二进制；不进 SSE）---
+        if (path === "/api/system/artwork") {
+          await startLiveSystemService();
+          const art = getCachedArtwork();
+          if (!art) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "text/plain; charset=utf-8");
+            res.end("no artwork");
+            return;
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", art.mime);
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.end(art.data);
+          return;
+        }
+
+        // --- 系统实况：正在播放（读 Node 缓存；首次可强制刷新）---
+        if (path === "/api/system/media") {
+          const fresh = url.searchParams.get("fresh") === "1";
+          const media = fresh ? await readNowPlaying() : (await startLiveSystemService(), getCachedMedia());
+          sendJson(res, 200, { ...media, backend: getLiveBackend() });
+          return;
+        }
+
+        // --- 系统实况：前台窗口 ---
+        if (path === "/api/system/window") {
+          const fresh = url.searchParams.get("fresh") === "1";
+          const win = fresh ? await readFrontWindow() : (await startLiveSystemService(), getCachedWindow());
+          sendJson(res, 200, win);
+          return;
+        }
+
+        // --- 系统实况：媒体控制（壁纸 engine.media.*）---
+        if (path === "/api/system/media-control") {
+          if (req.method !== "POST") {
+            sendJson(res, 405, { error: "需要 POST" });
+            return;
+          }
+          let body: { action?: unknown } = {};
+          try {
+            body = JSON.parse((await readBody(req)) || "{}");
+          } catch {
+            sendJson(res, 400, { error: "body 需为 JSON" });
+            return;
+          }
+          const action = String(body.action || "") as MediaControl;
+          const allowed: MediaControl[] = [
+            "skipNext",
+            "skipPrevious",
+            "play",
+            "pause",
+            "playPause",
+          ];
+          if (!allowed.includes(action)) {
+            sendJson(res, 400, { error: `未知 action：${action}` });
+            return;
+          }
+          const media = await controlNowPlaying(action);
+          sendJson(res, 200, media);
+          return;
+        }
+
+        // --- 系统实况：媒体 + 窗口 SSE（读缓存，~2Hz；采集在后台单例）---
+        if (path === "/api/system/stream") {
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("Connection", "keep-alive");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.write(": connected\n\n");
+          await startLiveSystemService();
+          let closed = false;
+          req.on("close", () => {
+            closed = true;
+          });
+          const push = () => {
+            if (closed) return;
+            try {
+              const payload = {
+                media: getCachedMedia(),
+                window: getCachedWindow(),
+                backend: getLiveBackend(),
+              };
+              res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            } catch {
+              /* 单轮失败不掐连接 */
+            }
+          };
+          push();
+          const timer = setInterval(push, 500);
+          req.on("close", () => clearInterval(timer));
+          return;
+        }
+
+        // --- 对齐 WallpaperEM：系统音频 SSE（测试台无 ScreenCaptureKit → 503）---
+        if (path.startsWith("/audio-stream/")) {
+          const tok = path.slice("/audio-stream/".length).split("/")[0];
+          if (tok !== DEV_TOKEN) {
+            res.statusCode = 403;
+            res.setHeader("Content-Type", "text/plain; charset=utf-8");
+            res.end("forbidden");
+            return;
+          }
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.setHeader("Cache-Control", "no-store");
+          res.end(
+            "audio capture unavailable in test bench (no ScreenCaptureKit); use liveSystem mic",
+          );
           return;
         }
 
