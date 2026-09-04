@@ -29,7 +29,10 @@ function compile(gl, type, src) {
 }
 
 function parseVec3Local(s) {
-  const p = String(s).trim().split(/\s+/).map(Number)
+  // general.clearcolor 等可仍是 {user, value} 包装（resolveUserProps 就地改 .value、不拆壳）。
+  // String(object) → "[object Object]" → 全 0 → 橘色 schemecolor 底变黑（3792579196）。
+  if (s !== null && typeof s === 'object' && 'value' in s) s = s.value
+  const p = String(s ?? '').trim().split(/\s+/).map(Number)
   return [p[0] || 0, p[1] || 0, p[2] || 0]
 }
 
