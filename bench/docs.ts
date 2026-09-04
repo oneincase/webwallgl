@@ -9,6 +9,7 @@ export type DocBlock =
   | { k: "p"; v: Bi }
   | { k: "code"; v: Bi }
   | { k: "ul"; items: Bi[] }
+  | { k: "links"; items: { label: Bi; href: string }[] }
   | { k: "table"; head: Bi[]; rows: Bi[][]; codeCols?: number[] };
 
 export type DocSection = { id: string; title: Bi; blocks: DocBlock[] };
@@ -21,9 +22,16 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: "WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景壁纸渲染库：把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新。",
-          en: "WebWallGL is a browser-side renderer for Wallpaper Engine \"scene\" wallpapers: it faithfully replays workshop scene packages (scene.pkg) in WebGL, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates.",
+          zh: "WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web（后续版本支持）壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新。后续版本将加入本库独有效果支持，请敬请期待。",
+          en: "WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — \"scene\" today, with video and web support coming in later releases: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates. Upcoming versions will add effects exclusive to this library — stay tuned.",
         },
+      },
+      {
+        k: "links",
+        items: [
+          { label: { zh: "GitHub 开源仓库", en: "GitHub repository" }, href: "https://github.com/oneincase/webwallgl" },
+          { label: { zh: "在线版（GitHub Pages）", en: "Live demo (GitHub Pages)" }, href: "https://oneincase.github.io/webwallgl/" },
+        ],
       },
       {
         k: "ul",
@@ -313,6 +321,19 @@ export function renderDocs(body: HTMLElement, lang: Lang) {
           ul.appendChild(li);
         }
         body.appendChild(ul);
+      } else if (b.k === "links") {
+        const p = document.createElement("p");
+        p.className = "doc-links";
+        b.items.forEach((it, i) => {
+          if (i > 0) p.appendChild(document.createTextNode(" · "));
+          const a = document.createElement("a");
+          a.href = it.href;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          a.textContent = it.label[lang];
+          p.appendChild(a);
+        });
+        body.appendChild(p);
       } else {
         const table = document.createElement("table");
         table.className = "doc-table";

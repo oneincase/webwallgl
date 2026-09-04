@@ -134,6 +134,20 @@ input {
   overflow: hidden;
 }
 
+/* 显式钉列：使用说明页隐藏侧栏（display:none）后，auto 布局会把 #main 顶进
+   中间列，右侧留出大片死区；钉死后 #main 恒在 1fr 列，内容列才能真正居中 */
+#activitybar {
+  grid-column: 1;
+}
+
+#sidebar {
+  grid-column: 2;
+}
+
+#main {
+  grid-column: 3;
+}
+
 #activitybar {
   display: flex;
   flex-direction: column;
@@ -1083,6 +1097,7 @@ select:hover {
 
 #docs-body {
   max-width: 860px;
+  margin: 0 auto; /* 内容列在页面里水平居中 */
   padding: 28px 36px 48px;
   color: var(--fg);
   font-size: 13px;
@@ -1112,6 +1127,10 @@ select:hover {
 
 #docs-body li {
   margin: 4px 0;
+}
+
+#docs-body .doc-links a {
+  color: var(--link);
 }
 
 .doc-code {
@@ -1223,7 +1242,8 @@ html[data-theme="light"] {
 
 #sponsor-card {
   max-width: 860px;
-  margin: 36px 0 0;
+  /* 与 #docs-body 内容列同宽并水平居中（36px 内边距对齐正文） */
+  margin: 36px auto 0;
   padding: 18px 20px;
   border: 1px solid var(--border);
   border-radius: 6px;
