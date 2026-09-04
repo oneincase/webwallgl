@@ -104,6 +104,8 @@ export const DICT: Record<Lang, Record<string, string>> = {  zh: {
     "ok.reveal": "已打开文件夹：{id}",
     "log.libLoaded": "壁纸库载入：{n} 项（scene {s} / web {w} / video {v}）",
     "log.mount": "挂载 {id}：?{q}",
+    "log.liveOn": "已开启系统实况（麦克风频谱 + Music/Spotify + 前台窗口）",
+    "log.liveOff": "已关闭系统实况，恢复模拟源",
     "prompt.libDir": "壁纸库目录",
   },
   en: {
@@ -201,6 +203,8 @@ export const DICT: Record<Lang, Record<string, string>> = {  zh: {
     "ok.reveal": "Opened folder: {id}",
     "log.libLoaded": "Library loaded: {n} items (scene {s} / web {w} / video {v})",
     "log.mount": "Mount {id}: ?{q}",
+    "log.liveOn": "Live system on (mic spectrum + Music/Spotify + front window)",
+    "log.liveOff": "Live system off; back to simulated sources",
     "prompt.libDir": "Wallpaper library directory",
   },
 };
