@@ -31,7 +31,10 @@
 //                               类脚本退化为静态快照文本，属已知上限）
 //
 // 排版语义（563 个文字层实测）：文字画在 layer.size 尺寸的盒子内；
-//   padding 内缩；horizontalalign/verticalalign 盒内对齐；spacing 为字距/行距附加量；
+//   padding 内缩（装不下则当 0）；spacing 为字距/行距附加量；
+//   horizontalalign/verticalalign 相对**图层 origin** 贴齐（left = 文字左缘在
+//   origin.x，不是 CSS 式贴盒左缘；开发者确认过），层 quad 以 origin 为中心故
+//   实现上对准盒子中线；
 //   limitwidth + maxwidth 限宽换行，limitrows + maxrows 限行截断，limituseellipsis 加省略号；
 //   opaquebackground + backgroundcolor(+brightness) 盒底色；castshadow 投影。
 //   本机数据里 anchor 取值 none 237 / 缺省 301 / center 20，none 与缺省按 center 处理。

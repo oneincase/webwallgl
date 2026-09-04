@@ -72,16 +72,16 @@ function runLayout() {
     eq(l.lines[0].y, (100 - 31.25) / 2, "单行居中 y");
     if (l.lines.length !== 1) errors.push("单行应只有 1 行");
   }
-  // 2) 左对齐 + padding：x = padding
+  // 2) 左/顶对齐贴盒子中线（= 层 origin），不是贴盒边（WE 语义，见 text-layout 注释）
   {
     const l = wtext.layoutText("hi", { boxW: 200, boxH: 100, pointsize: 20, lineHeight: 25, padding: 12, halign: "left", valign: "top" }, measure);
-    eq(l.lines[0].x, 12, "左对齐+padding x");
-    eq(l.lines[0].y, 12, "顶对齐+padding y");
+    eq(l.lines[0].x, 100, "左对齐贴 origin（盒中线）x");
+    eq(l.lines[0].y, 50, "顶对齐贴 origin（盒中线）y");
   }
-  // 3) 右对齐：x = boxW - pad - width
+  // 3) 右对齐：行右缘贴盒中线
   {
     const l = wtext.layoutText("abcd", { boxW: 200, boxH: 100, pointsize: 20, lineHeight: 25, padding: 10, halign: "right" }, measure);
-    eq(l.lines[0].x, 200 - 10 - 40, "右对齐 x");
+    eq(l.lines[0].x, 100 - 40, "右对齐 x");
   }
   // 4) 限宽换行：40 字符 400px，盒内宽 150 → 每行 ≤15 字符，且空格处断行
   {
@@ -142,7 +142,7 @@ function runLayout() {
     const cell = wtext.layoutText("01", { boxW: 36, boxH: 42, pointsize: 9, lineHeight: 12, padding: 32, halign: "center", valign: "center" }, measure);
     eq(cell.lines[0].x, (36 - 20) / 2, "小盒默认 padding 夹 0 后居中 x");
     const hdr = wtext.layoutText("CITY", { boxW: 51, boxH: 23, pointsize: 9, lineHeight: 12, padding: 32, halign: "left", valign: "center" }, measure);
-    eq(hdr.lines[0].x, 0, "标题条默认 padding 夹 0 后左对齐 x=0");
+    eq(hdr.lines[0].x, 51 / 2, "标题条左对齐贴盒中线（origin）");
   }
   return errors;
 }

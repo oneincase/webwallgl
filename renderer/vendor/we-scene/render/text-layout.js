@@ -83,20 +83,27 @@ export function layoutText(content, opts, measure) {
     }
   }
 
-  // 盒内定位（y 向下，与场景一致）
+  // 盒内定位（y 向下，与 Canvas 一致）。
+  // WE 官方：horizontalalign/verticalalign 是相对**图层 origin** 的贴齐边，不是 CSS
+  // 那样在盒子里左/右排（开发者原话：「left-alignment aligns the text along the
+  // horizontal (X) position of the text element」）。我们的层 quad 以 origin 为中心，
+  // 故 left/right/top/bottom 应对准盒子中线（= origin），center 仍居中整段文字。
+  // 2974757317 歌名 ha=left：origin 在头像右侧，旧实现贴盒左缘 → 字叠进圆标。
   const widths = lines.map((t) => measure(t))
   const totalH = lines.length * lineHeight
   const halign = opts.halign || 'center'
   const valign = opts.valign || 'center'
+  const midX = boxW / 2
+  const midY = boxH / 2
   const y0 =
-    valign === 'top' ? pad
-      : valign === 'bottom' ? Math.max(pad, boxH - pad - totalH)
+    valign === 'top' ? midY
+      : valign === 'bottom' ? midY - totalH
         : (boxH - totalH) / 2
   const out = lines.map((text, i) => {
     const w = widths[i]
     const x =
-      halign === 'left' ? pad
-        : halign === 'right' ? Math.max(pad, boxW - pad - w)
+      halign === 'left' ? midX
+        : halign === 'right' ? midX - w
           : (boxW - w) / 2
     return { text, width: w, x, y: y0 + i * lineHeight }
   })
