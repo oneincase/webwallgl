@@ -608,6 +608,26 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   check(/BUILTIN_MATERIALS\s*\[\s*["']materials\/util\/solidlayer\.json["']\s*\]/.test(msrc),
     "实例 solid 缺材质时必须回退内置 solidlayer material（不能 continue 跳过效果链）");
 
+  // 实例的用户纹理绑定（instance.usertextures）：封面组件把槽 0 绑到 $mediaThumbnail，
+  // 缺绑定时 solid 白底直接画出白方块（3789462324 左下角）。绑定生效必须清 solid——
+  // 渲染端 `!layer.solid && textureName` 才取纹理，solid 恒赢；且异步默认槽回写不得覆盖。
+  check(/textureName\s*=\s*instBoundTex;[\s\S]{0,80}solid\s*=\s*false;/.test(msrc),
+    "scene-mount 必须把槽 0 的 instance.usertextures 绑到 layer.textureName 并清 solid（否则封面白块）");
+  check(/si === 0 && !instBoundTex/.test(msrc),
+    "实例绑定占用槽 0 时，材质默认槽的异步回写不得覆盖 textureName");
+  let utLayers = 0;
+  const utWp = new Set();
+  for (const { id, scene } of wallpapers) {
+    for (const o of scene.objects || []) {
+      const u0 = o.instance && o.instance.usertextures && o.instance.usertextures[0];
+      if (u0 && typeof u0.name === "string" && u0.name.startsWith("$")) {
+        utLayers++;
+        utWp.add(id);
+      }
+    }
+  }
+  console.log(`   实例用户纹理绑定：${utLayers} 层 / ${utWp.size} 张（$mediaThumbnail 封面类）`);
+
   let instLayers = 0, instVis = 0, instWp = new Set();
   for (const { id, pkg, scene } of wallpapers) {
     for (const o of scene.objects || []) {
@@ -649,6 +669,26 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/0\.7/.test(cc), `3444535389 clearcolor 应是 0.7 灰（背景丢了才露出来），实得 ${cc}`);
   } else {
     console.log("   skip 3444535389：库中没有这张壁纸");
+  }
+
+  // general.clearcolor 绑 schemecolor 时仍是 {user,value} 包装；parseVec3Local 必须解 .value，
+  // 否则 String(object)→NaN→清成黑，橘色底丢了（3792579196 / 3790389413）。
+  {
+    const { parseVec3Local } = await imp("renderer/vendor/we-scene/render/gl-util.js");
+    const orange = parseVec3Local({ user: "schemecolor", value: "0.85882 0.67843 0.41176" });
+    check(Math.abs(orange[0] - 0.85882) < 1e-4 && Math.abs(orange[1] - 0.67843) < 1e-4,
+      `parseVec3Local 必须解 {user,value} 包装，实得 ${orange}`);
+    check(parseVec3Local("0.1 0.2 0.3")[1] === 0.2, "parseVec3Local 字符串路径回归");
+    const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8");
+    check(/typeof s === ['"]object['"]/.test(src) && /\.value/.test(src),
+      "gl-util parseVec3Local 源码必须对 object 取 .value");
+    let wrappedCc = 0;
+    for (const { id, scene } of wallpapers) {
+      const cc = scene.general?.clearcolor;
+      if (cc && typeof cc === "object" && cc.user) wrappedCc++;
+    }
+    check(wrappedCc >= 1, `库中应有 clearcolor 用户属性包装样本，实得 ${wrappedCc}`);
+    console.log(`   clearcolor 包装 ${wrappedCc} 张；parseVec3Local 橘色=${orange.map((n) => n.toFixed(3))}`);
   }
 }
 

@@ -764,6 +764,27 @@ cfg, source, pkgAbort.signal);
           // 编辑器实例化的纯色层：模型带 solidlayer:true，image 不是 util/solidlayer。
           // 必须在找材质之前写回，缺材质时下面会 continue，但 solid 已经够渲染器喂 whiteTex。
           scn.applySolidFromModel(layer, model);
+          // [we-scene patch] 编辑器实例的用户纹理绑定（instance.usertextures）：
+          // 相册封面类组件的标准做法——实例 solid 模型槽 0 默认 fill 是 util/white，
+          // 真正内容通过 usertextures 绑 WE 保留纹理 $mediaThumbnail。缺绑定时
+          // solid 白底直接画出白方块（3789462324 左下角）。槽 0 绑到已就绪的
+          // 保留纹理时清 solid 并把 textureName 指过去：渲染端
+          // `!layer.solid && textureName` 才取纹理，solid 恒赢。绑不到（媒体源
+          // 没给封面）时保持 solid 兜底。type:"usershortcut"（spotify 快捷方式）
+          // 等非纹理绑定不处理。本地库 12 张 / 14 层，$mediaThumbnail 占 9。
+          const instUt = (layer as any).srcObject?.instance?.usertextures as
+            | Array<{ name?: string; type?: string } | null>
+            | undefined;
+          const instUtName =
+            instUt?.[0] && typeof instUt[0].name === "string" && instUt[0].name.startsWith("$")
+              ? instUt[0].name
+              : null;
+          // 只在保留纹理真实就绪时才占位；否则维持 solid/默认槽兜底
+          const instBoundTex = instUtName && textures.has(instUtName) ? instUtName : null;
+          if (instBoundTex) {
+            (layer as any).textureName = instBoundTex;
+            (layer as any).solid = false;
+          }
           // [we-scene patch] 图层 size 缺省时从模型尺寸回退：820654165 等场景的
           // 简单图片层不带 size 字段，parseScene 默认 [0, 0]，导致 layerModelMatrix
           // 算出 w=h=0 → quad 不可见。模型有 width/height 时用它补上。
@@ -829,7 +850,8 @@ cfg, source, pkgAbort.signal);
             texJobs.push(
               loadTex(tn).then((entry) => {
                 if (!entry) return;
-                if (si === 0) {
+                // 实例用户纹理占用槽 0 时不得回写模型默认贴图（异步 then 晚于上面的绑定）
+                if (si === 0 && !instBoundTex) {
                   layer.textureName = tn;
                   loadedTex++;
                   if (entry.videoCtl) (layer as any).videoCtl = entry.videoCtl;
