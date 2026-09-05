@@ -40,10 +40,13 @@ try {
   rmSync(join(root, "scripts", "_gen-readme"), { recursive: true, force: true });
 }
 
-// 赞赏收款码清单（与 index.html #sponsor-card 保持一致；key 取 bench/i18n.ts 文案）
+// 赞赏收款码清单（与 index.html #sponsor-card 保持一致；key 取 bench/i18n.ts 文案）。
+// README 必须用绝对 URL：npm 渲染 README 时不带仓库文件上下文，相对路径图片会裂；
+// raw.githubusercontent.com 在 GitHub 与 npm 上都能正常显示。
+const SPONSOR_REPO_RAW = "https://raw.githubusercontent.com/oneincase/webwallgl/main";
 const SPONSOR = [
-  { key: "sponsor.wechat", img: "public/imgs/wechat.png", alt: { zh: "微信支付赞赏码", en: "WeChat Pay QR code" } },
-  { key: "sponsor.alipay", img: "public/imgs/alipay.png", alt: { zh: "支付宝赞赏码", en: "Alipay QR code" } },
+  { key: "sponsor.wechat", img: `${SPONSOR_REPO_RAW}/public/imgs/wechat.png`, alt: { zh: "微信支付赞赏码", en: "WeChat Pay QR code" } },
+  { key: "sponsor.alipay", img: `${SPONSOR_REPO_RAW}/public/imgs/alipay.png`, alt: { zh: "支付宝赞赏码", en: "Alipay QR code" } },
 ];
 
 // 正文（非代码块）里的裸 HTML 标签（<script>、<input type=file> 等）会被
@@ -68,6 +71,9 @@ function renderMd(lang) {
         lines.push("```", b.v[lang], "```", "");
       } else if (b.k === "ul") {
         for (const it of b.items) lines.push(`- ${esc(it[lang])}`);
+        lines.push("");
+      } else if (b.k === "links") {
+        for (const it of b.items) lines.push(`- [${esc(it.label[lang])}](${it.href})`);
         lines.push("");
       } else {
         lines.push(`| ${b.head.map((h) => esc(h[lang])).join(" | ")} |`);

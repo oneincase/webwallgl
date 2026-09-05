@@ -4,7 +4,10 @@
 
 ## Introduction
 
-WebWallGL is a browser-side renderer for Wallpaper Engine "scene" wallpapers: it faithfully replays workshop scene packages (scene.pkg) in WebGL, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates.
+WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — "scene" today, with video and web support coming in later releases: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates. Upcoming versions will add effects exclusive to this library — stay tuned.
+
+- [GitHub repository](https://github.com/oneincase/webwallgl)
+- [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)
 
 - Zero runtime dependencies, single-file delivery (min ESM ~270KB / gzip ~90KB)
 - Installable via npm or a &lt;script> CDN tag; multiple isolated instances per page
@@ -33,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.0.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.0.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -170,4 +173,4 @@ If this rendering core helped your project, buying the author a coffee is always
 
 | WeChat Pay | Alipay |
 | --- | --- |
-| ![WeChat Pay QR code](public/imgs/wechat.png) | ![Alipay QR code](public/imgs/alipay.png) |
+| ![WeChat Pay QR code](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/wechat.png) | ![Alipay QR code](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/alipay.png) |

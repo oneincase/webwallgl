@@ -4,7 +4,10 @@
 
 ## 简介
 
-WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景壁纸渲染库：把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新。
+WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web（后续版本支持）壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新。后续版本将加入本库独有效果支持，请敬请期待。
+
+- [GitHub 开源仓库](https://github.com/oneincase/webwallgl)
+- [在线版（GitHub Pages）](https://oneincase.github.io/webwallgl/)
 
 - 零运行时依赖，单文件引入（min ESM 约 270KB / gzip 约 90KB）
 - 可 npm 安装，也可 &lt;script> CDN 引入；一页可开多个互不干扰的实例
@@ -33,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.0.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.0.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -170,4 +173,4 @@ b.pause(); // 不影响 a
 
 | 微信支付 | 支付宝 |
 | --- | --- |
-| ![微信支付赞赏码](public/imgs/wechat.png) | ![支付宝赞赏码](public/imgs/alipay.png) |
+| ![微信支付赞赏码](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/wechat.png) | ![支付宝赞赏码](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/alipay.png) |

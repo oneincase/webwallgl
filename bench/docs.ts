@@ -4,6 +4,10 @@
 
 import { t, type Lang } from "./i18n";
 
+// 读取 package.json 中的 version 字段（vite 与 esbuild 均原生支持 JSON 导入，
+// 浏览器构建与 gen-readme 的 Node 打包两条路都能走通，不能用 fs/path）
+import pkg from "../package.json";
+const version = pkg.version;
 export type Bi = { zh: string; en: string };
 export type DocBlock =
   | { k: "p"; v: Bi }
@@ -87,15 +91,15 @@ export const DOC: DocSection[] = [
       {
         k: "code",
         v: {
-          zh: "// 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）\nimport { mount, httpSource } from \"https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.min.mjs\";",
-          en: "// 2) ESM CDN via jsDelivr (without a bundler)\nimport { mount, httpSource } from \"https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.min.mjs\";",
+          zh: `// 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.min.mjs";`,
+          en: `// 2) ESM CDN via jsDelivr (without a bundler)\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.min.mjs";`,
         },
       },
       {
         k: "code",
         v: {
-          zh: "<!-- 3) UMD <script>：暴露全局 WebWallGL -->\n<script src=\"https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.global.min.js\"></script>\n<script>\n  const { mount, httpSource } = WebWallGL;\n</script>",
-          en: "<!-- 3) UMD <script>: exposes the global WebWallGL -->\n<script src=\"https://cdn.jsdelivr.net/npm/webwallgl@1.0.0-beta1/webwallgl.global.min.js\"></script>\n<script>\n  const { mount, httpSource } = WebWallGL;\n</script>",
+          zh: `<!-- 3) UMD <script>：暴露全局 WebWallGL -->\n<script src="https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.global.min.js"></script>\n<script>\n  const { mount, httpSource } = WebWallGL;\n</script>`,
+          en: `<!-- 3) UMD <script>: exposes the global WebWallGL -->\n<script src="https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.global.min.js"></script>\n<script>\n  const { mount, httpSource } = WebWallGL;\n</script>`,
         },
       },
     ],
