@@ -506,7 +506,8 @@ select,
 .sidebar-section-head button,
 .props-head-actions button,
 .logs-head button,
-.prop-revert {
+.prop-revert,
+.prop-pick {
   height: 24px;
   padding: 0 10px;
   border: 1px solid var(--widget-border);
@@ -521,6 +522,7 @@ select,
 .props-head-actions button:hover,
 .logs-head button:hover,
 .prop-revert:hover,
+.prop-pick:hover:not(:disabled),
 select:hover {
   background: var(--btn-hover);
 }
@@ -876,6 +878,47 @@ select:hover {
   max-width: 100%;
   height: auto;
   border-radius: 2px;
+}
+
+.prop-head .prop-media {
+  align-items: flex-start;
+  margin: 0 0 4px;
+}
+
+.prop-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  position: relative;
+}
+
+.prop-file-path {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prop-pick {
+  flex: none;
+}
+
+.prop-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+}
+
+.prop-pick:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .prop-hint {

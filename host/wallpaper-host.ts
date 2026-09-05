@@ -19,6 +19,8 @@
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
  *   GET /api/props?item=                   壁纸自定义属性定义（含本地化文案与当前值）
  *   POST /api/props?item=                  保存属性覆盖值（body 为 name→wire 值）
+ *   POST /api/props-file?item=&name=       上传 file/scenetexture 所选文件，拷入壁纸 we-props/
+ *   POST /api/props-dir                    系统选文件夹（directory 属性，存绝对路径）
  *   GET /api/system/artwork                当前曲目封面（image/jpeg 等）
  *   GET /api/system/media                  系统正在播放（Node 缓存；?fresh=1 强制刷新）
  *   GET /api/system/window                 前台窗口标题
@@ -67,12 +69,15 @@ export function libraryDir(): string {
 const execFileAsync = promisify(execFile);
 
 /** macOS 系统「选择文件夹」；取消或非 darwin 返回 null */
-async function pickFolderNative(defaultDir: string): Promise<string | null> {
+async function pickFolderNative(
+  defaultDir: string,
+  prompt = "选择壁纸库文件夹",
+): Promise<string | null> {
   if (process.platform !== "darwin") return null;
   const fallback = defaultDir || homedir();
   const script =
     `try\n` +
-    `  POSIX path of (choose folder with prompt "选择壁纸库文件夹" default location POSIX file ${JSON.stringify(fallback)})\n` +
+    `  POSIX path of (choose folder with prompt ${JSON.stringify(prompt)} default location POSIX file ${JSON.stringify(fallback)})\n` +
     `on error\n` +
     `  return ""\n` +
     `end try`;
@@ -342,15 +347,40 @@ async function mergeProjectOverrides(raw: Buffer, itemId: string): Promise<Buffe
 
 /** 读取请求体（属性保存用；测试台本地请求，限 4MB 足够） */
 async function readBody(req: Connect.IncomingMessage): Promise<string> {
+  const buf = await readRawBody(req, 4 * 1024 * 1024);
+  return buf.toString("utf8");
+}
+
+/** 读取原始请求体，超限抛错。file 属性上传用较大上限（视频）。 */
+async function readRawBody(req: Connect.IncomingMessage, max: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     const b = c as Buffer;
     size += b.length;
-    if (size > 4 * 1024 * 1024) throw new Error("请求体过大");
+    if (size > max) throw new Error("请求体过大");
     chunks.push(b);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+/** 上传文件名：只要 basename，去掉路径分隔与奇怪字符 */
+function safeUploadName(raw: string): string {
+  let s = raw;
+  try {
+    s = decodeURIComponent(raw);
+  } catch {
+    /* 非百分号编码则原样用 */
+  }
+  const base = s.replace(/\\/g, "/").split("/").pop() || "file";
+  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
+  return cleaned.slice(0, 80) || "file";
+}
+
+/** we-props/ 下的目标文件名：属性名前缀防冲突，超长名截断 */
+function destPropFileName(propName: string, original: string): string {
+  const prefix = propName.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40) || "prop";
+  return `${prefix}_${safeUploadName(original)}`;
 }
 
 function sendJson(res: any, status: number, body: unknown) {
@@ -721,6 +751,73 @@ export function wallpaperHost(): Plugin {
             return;
           }
           sendJson(res, 200, { itemId, props: await describe(lib, itemId) });
+          return;
+        }
+
+        // --- file/scenetexture：浏览器选中的文件拷入壁纸 we-props/，返回相对壁纸根的路径 ---
+        // 对齐主项目 library_set_item_prop_file（那边走 tauri dialog + 同目录拷贝）。
+        if (path === "/api/props-file") {
+          if (req.method !== "POST") {
+            sendJson(res, 405, { error: "需要 POST" });
+            return;
+          }
+          const itemId = url.searchParams.get("item") ?? "";
+          const propName = url.searchParams.get("name") ?? "";
+          if (!itemId || !propName) {
+            sendJson(res, 400, { error: "缺少 item 或 name" });
+            return;
+          }
+          const defs = await describe(lib, itemId);
+          const def = defs.find((d) => d.name === propName);
+          if (!def || (def.ptype !== "file" && def.ptype !== "scenetexture")) {
+            sendJson(res, 400, { error: "不是文件类型属性" });
+            return;
+          }
+          const itemBase = safeJoin(lib, itemId);
+          if (!itemBase) {
+            sendJson(res, 400, { error: "非法 item" });
+            return;
+          }
+          try {
+            const rawName =
+              typeof req.headers["x-filename"] === "string" ? req.headers["x-filename"] : "file";
+            const destName = destPropFileName(propName, rawName);
+            const destDir = join(itemBase, "we-props");
+            await fs.mkdir(destDir, { recursive: true });
+            const dest = safeJoin(destDir, destName);
+            if (!dest) {
+              sendJson(res, 400, { error: "非法文件名" });
+              return;
+            }
+            const buf = await readRawBody(req, 64 * 1024 * 1024);
+            if (buf.length === 0) {
+              sendJson(res, 400, { error: "空文件" });
+              return;
+            }
+            await fs.writeFile(dest, buf);
+            sendJson(res, 200, { value: `we-props/${destName}` });
+          } catch (e) {
+            sendJson(res, 400, { error: (e as Error).message });
+          }
+          return;
+        }
+
+        // --- directory：系统选文件夹，存绝对路径（与 WE / 主项目语义一致，不拷贝）---
+        if (path === "/api/props-dir") {
+          if (req.method !== "POST") {
+            sendJson(res, 405, { error: "需要 POST" });
+            return;
+          }
+          if (process.platform !== "darwin") {
+            sendJson(res, 200, { cancelled: true, unsupported: true });
+            return;
+          }
+          const picked = await pickFolderNative(homedir(), "选择目录");
+          if (!picked) {
+            sendJson(res, 200, { cancelled: true });
+            return;
+          }
+          sendJson(res, 200, { value: picked });
           return;
         }
 

@@ -43,7 +43,7 @@ type WebPropDef = {
   precision?: number;
   /** file 属性的期望文件类别（image/video/audio），决定选择器过滤器 */
   fileType?: string;
-  media?: { src: string; href?: string }[];
+  media?: { src: string; href?: string; width?: string; height?: string }[];
 };
 
 type RendererWindow = Window & {
@@ -994,13 +994,147 @@ function changeProp(name: string, value: unknown) {
   scheduleSave();
 }
 
+async function flushSave() {
+  if (!saveTimer) return;
+  window.clearTimeout(saveTimer);
+  saveTimer = undefined;
+  await saveProps();
+}
+
+function fileAccept(fileType?: string): string {
+  switch (fileType) {
+    case "video":
+      return "video/*,.mp4,.webm,.mov,.m4v";
+    case "audio":
+      return "audio/*,.mp3,.ogg,.wav,.flac,.m4a";
+    default:
+      return "image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp";
+  }
+}
+
+function renderFileCtl(p: WebPropDef): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "prop-file";
+  const cur = propDraft[p.name];
+  const path = String(cur ?? "");
+  const shown = document.createElement("span");
+  shown.className = "prop-file-path";
+  shown.textContent = path || t("props.fileUnset");
+  if (path) shown.title = path;
+  const pick = document.createElement("button");
+  pick.type = "button";
+  pick.className = "prop-pick";
+  const isDir = p.ptype === "directory";
+  pick.textContent = t(isDir ? "props.pickDir" : "props.pickFile");
+  if (isDir) {
+    pick.onclick = () => {
+      void pickPropDir(p.name, pick);
+    };
+  } else {
+    const file = document.createElement("input");
+    file.type = "file";
+    file.className = "prop-file-input";
+    file.accept = fileAccept(p.fileType);
+    file.onchange = () => {
+      const f = file.files?.[0];
+      file.value = "";
+      if (f) void uploadPropFile(p.name, f, pick);
+    };
+    pick.onclick = () => file.click();
+    wrap.appendChild(file);
+  }
+  wrap.append(shown, pick);
+  return wrap;
+}
+
+async function uploadPropFile(name: string, file: File, btn: HTMLButtonElement) {
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = t("props.fileUploading");
+  try {
+    await flushSave();
+    const res = await fetch(
+      `/api/props-file?item=${encodeURIComponent(propItemId)}&name=${encodeURIComponent(name)}`,
+      {
+        method: "POST",
+        headers: { "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      },
+    );
+    const data = (await res.json()) as { value?: string; error?: string };
+    if (!res.ok || data.error || !data.value) throw new Error(data.error || `HTTP ${res.status}`);
+    changeProp(name, data.value);
+  } catch (e) {
+    log(t("err.pickFile", { msg: (e as Error).message }), true);
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
+}
+
+async function pickPropDir(name: string, btn: HTMLButtonElement) {
+  btn.disabled = true;
+  try {
+    await flushSave();
+    const res = await fetch("/api/props-dir", { method: "POST" });
+    const data = (await res.json()) as {
+      value?: string;
+      cancelled?: boolean;
+      unsupported?: boolean;
+      error?: string;
+    };
+    if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+    if (data.cancelled) {
+      if (!data.unsupported) return;
+      const typed = window.prompt(t("props.dirPh"), String(propDraft[name] ?? ""));
+      if (!typed) return;
+      changeProp(name, typed.trim());
+      return;
+    }
+    if (data.value) changeProp(name, data.value);
+  } catch (e) {
+    log(t("err.pickDir", { msg: (e as Error).message }), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function mediaSrc(src: string): string {
   if (/^https?:\/\//i.test(src)) return src;
   if (!propItemId) return src;
   return `${MEDIA_BASE}/${encodeURIComponent(propItemId)}/${src.replace(/^\.\//, "")}`;
 }
 
-function renderMedia(media: { src: string; href?: string }[]): HTMLElement {
+function cssLen(v: string): string | undefined {
+  const s = v.trim().replace(/^['"]+|['"]+$/g, "");
+  if (!s) return undefined;
+  if (/%|px|em|rem|vh|vw$/i.test(s)) return s;
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? `${n}px` : undefined;
+}
+
+/** 作者 HTML 常写 height=30 当图标、width=2000 当横幅；横幅按比例缩，图标才钉高度。 */
+function applyMediaSize(
+  img: HTMLImageElement,
+  m: { width?: string; height?: string },
+) {
+  img.style.maxWidth = "100%";
+  const w = m.width ? cssLen(m.width) : undefined;
+  const h = m.height ? cssLen(m.height) : undefined;
+  const hPx = h && h.endsWith("px") ? Number.parseFloat(h) : NaN;
+  if (w && w.endsWith("%")) {
+    img.style.width = w;
+    img.style.height = "auto";
+    return;
+  }
+  if (Number.isFinite(hPx) && hPx >= 16 && hPx <= 96) {
+    img.style.height = h!;
+    img.style.width = "auto";
+    return;
+  }
+  img.style.height = "auto";
+}
+
+function renderMedia(media: { src: string; href?: string; width?: string; height?: string }[]): HTMLElement {
   const box = document.createElement("div");
   box.className = "prop-media";
   for (const m of media) {
@@ -1009,6 +1143,7 @@ function renderMedia(media: { src: string; href?: string }[]): HTMLElement {
     img.alt = "";
     img.referrerPolicy = "no-referrer";
     img.loading = "lazy";
+    applyMediaSize(img, m);
     if (m.href) {
       const a = document.createElement("a");
       a.href = m.href;
@@ -1021,6 +1156,22 @@ function renderMedia(media: { src: string; href?: string }[]): HTMLElement {
     }
   }
   return box;
+}
+
+/**
+ * 作者常把整段 <img> HTML 写进属性 key，WE 剥掉符号后变成 imgsrchttp… 这种「名字」。
+ * 有抽出的图时不要回退显示这段残渣。
+ */
+function looksLikeHtmlResidue(s: string): boolean {
+  if (s.length < 24 || /\s/.test(s)) return false;
+  return /^(imgsrc|ahref|hrbig|brahref)/i.test(s) || /viewer_4|photostore|qpiccn/i.test(s);
+}
+
+function propLabel(p: WebPropDef): string {
+  if (p.text && !looksLikeHtmlResidue(p.text)) return p.text;
+  if (p.media && p.media.length) return "";
+  if (looksLikeHtmlResidue(p.name)) return "";
+  return p.text || p.name;
 }
 
 function renderProps() {
@@ -1056,16 +1207,17 @@ function renderProps() {
     const visible = evalCondition(p.condition, vals);
     if (!visible && !showHidden) return;
     if (kw && !`${p.name} ${p.text}`.toLowerCase().includes(kw)) return;
-    if (p.ptype === "text" && !p.text && !(p.media && p.media.length)) return;
+    if (p.ptype === "text" && !propLabel(p) && !(p.media && p.media.length)) return;
     shown++;
     if (p.ptype === "text") {
       const te = document.createElement("div");
       te.className = "prop-text";
       if (p.media && p.media.length) te.appendChild(renderMedia(p.media));
-      if (p.text) {
+      const capText = propLabel(p);
+      if (capText) {
         const cap = document.createElement("div");
         cap.className = "prop-text-cap";
-        cap.textContent = p.text;
+        cap.textContent = capText;
         te.appendChild(cap);
       }
       parent.appendChild(te);
@@ -1091,7 +1243,8 @@ function renderProps() {
       };
       const summary = document.createElement("summary");
       summary.className = "prop-group-summary";
-      summary.textContent = sec.group.text || sec.group.name;
+      const gLabel = propLabel(sec.group);
+      summary.textContent = gLabel || sec.group.name;
       summary.title = sec.group.name;
       details.appendChild(summary);
       const body = document.createElement("div");
@@ -1126,10 +1279,14 @@ function renderPropRow(p: WebPropDef, visible: boolean): HTMLElement {
   head.className = "prop-head";
   const textWrap = document.createElement("div");
   textWrap.className = "prop-head-text";
-  const nameEl = document.createElement("span");
-  nameEl.className = "prop-name";
-  nameEl.textContent = p.text || p.name;
-  textWrap.appendChild(nameEl);
+  if (p.media && p.media.length) textWrap.appendChild(renderMedia(p.media));
+  const label = propLabel(p);
+  if (label) {
+    const nameEl = document.createElement("span");
+    nameEl.className = "prop-name";
+    nameEl.textContent = label;
+    textWrap.appendChild(nameEl);
+  }
 
   if (p.ptype === "bool") {
     const cb = document.createElement("input");
@@ -1217,13 +1374,7 @@ function renderPropRow(p: WebPropDef, visible: boolean): HTMLElement {
     case "file":
     case "directory":
     case "scenetexture": {
-      // 测试台没有原生文件选择框（主项目走 tauri dialog）：直接填相对壁纸根的路径
-      const txt = document.createElement("input");
-      txt.type = "text";
-      txt.value = String(cur ?? "");
-      txt.placeholder = p.ptype === "directory" ? t("props.dirPh") : t("props.filePh", { kind: p.fileType ?? "image" });
-      txt.onchange = () => changeProp(p.name, txt.value);
-      ctl.appendChild(txt);
+      ctl.appendChild(renderFileCtl(p));
       break;
     }
     default: {

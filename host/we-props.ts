@@ -344,7 +344,7 @@ function resolveText(project: Json, raw: string, fallback: string, keepBreaks = 
 }
 
 /** 属性面板用的图：src + 可选外链。不走 innerHTML，避免作者 HTML 注入。 */
-export type PropMedia = { src: string; href?: string };
+export type PropMedia = { src: string; href?: string; width?: string; height?: string };
 
 function attr(tag: string, name: string): string | undefined {
   const re = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i");
@@ -384,7 +384,14 @@ function extractMedia(html: string): PropMedia[] {
       href = undefined;
     } else {
       const src = attr(tag, "src");
-      if (src && isSafeImgSrc(src)) out.push(href ? { src, href } : { src });
+      if (src && isSafeImgSrc(src)) {
+        const item: PropMedia = href ? { src, href } : { src };
+        const w = attr(tag, "width")?.replace(/^['"]+|['"]+$/g, "");
+        const h = attr(tag, "height")?.replace(/^['"]+|['"]+$/g, "");
+        if (w) item.width = w;
+        if (h) item.height = h;
+        out.push(item);
+      }
     }
   }
   return out;

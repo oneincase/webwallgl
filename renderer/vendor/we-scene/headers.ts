@@ -283,10 +283,18 @@ mat3 squareToQuad(vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
     float d = p1.y - p0.y + g * p1.y;
     float e = p3.y - p0.y + h * p3.y;
     float f = p0.y;
-    // 行向量约定：[u v 1] * M
-    return mat3(a, d, g,
-                b, e, h,
-                c, f, 1.0);
+    // 调用点一律是 mul(vec3(uv,1), inverse(本函数结果))，hlsl2glsl 把它转写成
+    // transpose(xform) * vec3(uv,1)。要让屏幕点 s 得到 texCoord = S⁻¹·s（S 为
+    // Heckbert 正向矩阵 [[a,b,c],[d,e,f],[g,h,1]]，单位方→四边形），必须
+    // xform = inverse(本函数结果) 满足 transpose(xform)·s = S⁻¹·s，
+    // 即本函数返回 S 的**转置**：mat3 列主序构造为 (a,d,g)(b,e,h)(c,f,1) 的转置
+    // = (a,b,c)(d,e,f)(g,h,1)。排布差一个转置，perspective/水波等全部错位——
+    // 3174556087 的音谱柱被贴到窗户侧边竖排（应为贴下窗沿横排）实测确认。
+    // 2026-09-05 数值模拟：旧排布 transpose(S⁻¹)·corner 与正确 S⁻¹·corner 逐项不同，
+    // 可见区塌缩成一条斜带；新排布后中心 (0.5,0.5) → (0.478,0.511) ∈ [0,1]²。
+    return mat3(a, b, c,
+                d, e, f,
+                g, h, 1.0);
 }
 `,
   // WE common_blur.h（重建）。blurNa 的权重不是估算的 —— 壁纸 1444077782 里存着
