@@ -90,6 +90,15 @@ export function ropeTrailDuration(cfg) {
   return Number.isFinite(L) && L > 0 ? L : 0.2
 }
 
+/**
+ * rope 段端点的贴图 v。v=0 是纹理第 0 行（亮端，.tex 无翻行上传）：
+ * 新生粒子 v≈0 亮、老年端 v→1 淡出。GPU 写实例与 CPU 参考光栅共用，
+ * 改方向两边一起变，verify-particles 的「头亮于尾」判据才覆盖得到。
+ */
+export function ropeParticleV(p) {
+  return p.life > 0 ? p.age / p.life : 0
+}
+
 
 class Particle {
   constructor() {
@@ -126,6 +135,8 @@ class Particle {
     this.trail = null
     // 距下一次把当前位置推进历史环的剩余时间累加（见 trailSampleDt）
     this.trailClock = 0
+    // 发射序号：rope 渲染器按它把存活粒子连成一条绳（pool 槽位顺序 ≠ 发射顺序）
+    this.seq = 0
   }
 }
 
@@ -208,6 +219,10 @@ export class ParticleSystem {
     this._followParent = null
     this._followMode = null // 'particle' | 'origin'
     this._followOffset = [0, 0, 0]
+    // rope 渲染器：把存活粒子按发射序连成一条绳（1425503532 的 Pac-Man 光束）
+    this.ropeRenderer = null
+    this._seq = 0
+    this._ropeOrder = []
 
     this._ov = {}
     this._applyOverride()
@@ -554,6 +569,9 @@ export class ParticleSystem {
         p.trailClock = 0
       }
     }
+    // rope：粒子本身不是独立精灵，而是绳上的结——渲染时按发射序连成连续 ribbon。
+    // 掉进默认 sprite 分支会把光束拆成一根根竖条纹（1425503532 Pac-Man）。
+    this.ropeRenderer = this.renderers.find((r) => r.kind === 'rope') || null
   }
 
   setModel(model) {
@@ -717,6 +735,7 @@ export class ParticleSystem {
     p.rotVel = 0
     p.vx = p.vy = p.vz = 0
     p.frame = 0
+    p.seq = this._seq++
 
     // ---- 发射位置 ----
     const o = em.origin
@@ -1215,15 +1234,25 @@ export class ParticleSystem {
 
     const trail = this.trailCfg && this.trailCfg.kind === 'ropetrail' ? this.trailCfg : null
     const spriteTrail = this.trailCfg && this.trailCfg.kind === 'spritetrail' ? this.trailCfg : null
+    const rope = this.ropeRenderer
     const segs = particleInstanceSegs(this.trailCfg, this.trailSegments)
-    // 每实例 12 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(1) pad(1)
-    const STRIDE = 12
+    // 每实例 14 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(2) vrange(2)
+    const STRIDE = 14
     const pool = this.pool
+    // rope：先按发射序收集存活粒子（pool 槽位会循环复用，槽位序 ≠ 发射序）
+    let order = null
+    if (rope) {
+      order = this._ropeOrder
+      order.length = 0
+      for (let i = 0; i < pool.length; i++) if (pool[i].alive) order.push(pool[i])
+      order.sort((a, b) => a.seq - b.seq)
+    }
     let live = 0
-    for (let i = 0; i < pool.length; i++) if (pool[i].alive) live++
-    if (live === 0) return
+    if (order) live = order.length
+    else for (let i = 0; i < pool.length; i++) if (pool[i].alive) live++
+    if (live === 0 || (rope && live < 2)) return
 
-    const instCount = live * segs
+    const instCount = rope ? live - 1 : live * segs
     const need = instCount * STRIDE
     if (!this._data || this._data.length < need) this._data = new Float32Array(Math.max(need, 1024))
     const data = this._data
@@ -1248,7 +1277,43 @@ export class ParticleSystem {
       return [ox + px * cos - py * sin, projH - (oy + px * sin + py * cos)]
     }
 
-    for (let i = 0; i < pool.length; i++) {
+    if (rope) {
+      // rope：相邻发射序的两粒子连成一个拉伸段。贴图 u 横跨绳宽（横截面是
+      // 「两侧亮边线 + 柔光」），v 沿绳按粒子寿命推进（v=1 是纹理亮端 = 新生端，
+      // 随年龄淡到透明端）。逐段重复整张贴图会在粒子间距处出现周期性亮带。
+      for (let i = 0; i + 1 < live; i++) {
+        const a = order[i]
+        const b = order[i + 1]
+        const wa = toWorld(a.x, a.y)
+        const wb = toWorld(b.x, b.y)
+        const dx = wb[0] - wa[0]
+        const dy = wb[1] - wa[1]
+        const dist = Math.hypot(dx, dy)
+        const width = (Math.abs(a.size) + Math.abs(b.size)) * 0.5 * sysScale
+        if (!(width > 0)) continue
+        data[k++] = (wa[0] + wb[0]) * 0.5
+        data[k++] = (wa[1] + wb[1]) * 0.5
+        data[k++] = 0
+        data[k++] = width
+        // 局部 +y 轴旋到「旧粒子 → 新粒子」方向：(0,1) 旋转后 = (-sin, cos)
+        data[k++] = Math.atan2(-dx, dy)
+        data[k++] = (a.r + b.r) * 0.5 * bright
+        data[k++] = (a.g + b.g) * 0.5 * bright
+        data[k++] = (a.b + b.b) * 0.5 * bright
+        data[k++] = (a.alpha + b.alpha) * 0.5
+        // 实例布局 = a_stretchFrame(stretchX, stretchY, frame) + a_vrange(v0, v1)：
+        // stretchX=1（绳宽 = 粒子 size），stretchY 令 quad 长度正好盖住两粒子间距。
+        // ⚠ 槽位顺序曾写反成 (frame, stretchX, stretchY) → stretchX=0 → quad 零宽
+        // 全部退化（1425503532 光束整条消失）。
+        data[k++] = 1
+        data[k++] = dist / width
+        data[k++] = 0
+        // v=0 是贴图第 0 行（亮端，无翻行上传）：新生端 v≈0 亮，老年端 v→1 淡出
+        data[k++] = ropeParticleV(a)
+        data[k++] = ropeParticleV(b)
+      }
+    }
+    for (let i = 0; i < pool.length && !rope; i++) {
       const p = pool[i]
       if (!p.alive) continue
       for (let s = 0; s < segs; s++) {
@@ -1329,6 +1394,8 @@ export class ParticleSystem {
         data[k++] = instStretchX
         data[k++] = instStretchY
         data[k++] = p.frame
+        data[k++] = 0
+        data[k++] = 1
       }
     }
 

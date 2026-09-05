@@ -182,6 +182,9 @@ function build(sysDesc) {
     if (pixels.width !== gen.width || pixels.height !== gen.height) {
       pixels = { width: gen.width, height: gen.height, rgba: gen.rgba };
     }
+    // 内置帧表（rain1/rain2 的 1×4 图集）：与 scene-mount 的内置路径同源，
+    // randomframe 预设离线判据才能覆盖到「随机取帧」分支
+    if (!frames) frames = ptex.builtinParticleFrames(sysDesc.texName || "") ?? null;
   }
   ps.setTexture({
     glTex: null,
@@ -1266,6 +1269,197 @@ function runRopeTrail() {
   return { errors };
 }
 
+// ---------- Rope：粒子按发射序连成连续 ribbon（1425503532 Pac-Man 光束）----------
+function runRope() {
+  const errors = [];
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/ropeRenderer/.test(src)) {
+    errors.push("particles.js 未实现 rope 渲染器（ropeRenderer）——光束会掉进逐粒子 sprite 分支拆成竖条纹");
+  }
+
+  const pkgPath = join(LIB, "1425503532", "scene.pkg");
+  if (!fs.existsSync(pkgPath)) return { errors };
+  const pkg = parsePkg(fs.readFileSync(pkgPath));
+  const readText2 = (b) => new TextDecoder().decode(b);
+
+  const buildTrail = (childName) => {
+    const model = JSON.parse(readText2(getEntry(pkg, childName)));
+    const ps = new ParticleSystem(null, model, null, { origin: [474, 540, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+    const parsed = texMod.parseTex(getEntry(pkg, "materials/particle/ghosttrail.tex"));
+    const m0 = texMod.decodeMip0(parsed);
+    ps.setTexture({ glTex: null, width: m0.width, height: m0.height, pixels: { width: m0.width, height: m0.height, rgba: m0.rgba }, frames: null });
+    return ps;
+  };
+
+  const ps = buildTrail("particles/pacmantrail.json");
+  if (!ps.ropeRenderer) {
+    errors.push("1425503532 pacmantrail renderer=rope 未被识别（ropeRenderer 为空）");
+    return { errors };
+  }
+  for (let i = 0; i < 180; i++) ps.advance(1 / 60);
+  const live = ps.liveCount();
+  // rate 30/s × lifetime 4s，3 秒后应 ≈90 颗在飞
+  if (live < 60) {
+    errors.push(`1425503532 pacmantrail 3s 后存活 ${live}（预期 ≥60）`);
+  }
+
+  // CPU 参考光栅：光束应连续（无周期性竖条纹）、头亮于尾、宽 ≈ sizerandom 140
+  const W = 1920;
+  const H = 1080;
+  const target = createTarget(W, H, [0, 0, 0]);
+  rasterizeSystem(target, ps, { offX: 0, offY: 0, viewW: 1920, viewH: 1080, projH: 1080 });
+  const lum = (x, y) => {
+    const o = (y * W + x) * 3;
+    return target.rgb[o] * 0.299 + target.rgb[o + 1] * 0.587 + target.rgb[o + 2] * 0.114;
+  };
+  const colMax = [];
+  for (let x = 0; x < W; x++) {
+    let m = 0;
+    for (let y = 440; y < 640; y++) m = Math.max(m, lum(x, y));
+    colMax.push(m);
+  }
+  // 3 列窗口：消除 CPU 光栅在相邻段共享边上的单像素缝（GPU fill rules 无此缝）
+  const win = colMax.map((_, x) => Math.max(colMax[Math.max(0, x - 1)], colMax[x], colMax[Math.min(W - 1, x + 1)]));
+  const lit = [];
+  for (let x = 0; x < W; x++) if (win[x] > 0.05) lit.push(x);
+  if (lit.length < 1200) {
+    errors.push(`1425503532 光束长度不足：亮列 ${lit.length}（3s×500px/s 应 ≥1200）`);
+  } else {
+    const x0 = lit[0];
+    let sum = 0;
+    let n = 0;
+    let mx = 0;
+    for (let x = x0 + 200; x < Math.min(x0 + 1200, W - 1); x++) {
+      const d = Math.abs(win[x + 1] - win[x]);
+      if (win[x] > 0.05) {
+        sum += d;
+        n++;
+        mx = Math.max(mx, d);
+      }
+    }
+    const meanJump = sum / n;
+    if (meanJump > 0.002) {
+      errors.push(
+        `1425503532 光束沿绳亮度不连续（相邻列平均跳变 ${meanJump.toFixed(4)} > 0.002）——rope 被画成了一根根独立精灵`,
+      );
+    }
+    if (mx > 0.2) {
+      errors.push(`1425503532 光束存在突兀亮暗台阶（最大列跳变 ${mx.toFixed(3)}）`);
+    }
+    // 新生端亮、老年端淡出（贴图 v=0 亮端映射到 age≈0）
+    const head = win[x0 + 100];
+    const tail = win[Math.min(x0 + 1100, W - 1)];
+    if (!(head > tail * 1.1)) {
+      errors.push(`1425503532 光束淡出方向反了：新生端 ${head.toFixed(3)} 应亮于老年端 ${tail.toFixed(3)}`);
+    }
+    // 绳宽 ≈ sizerandom 140 × sysScale
+    const wx = Math.min(x0 + 600, W - 1);
+    let w0 = -1;
+    let w1 = -1;
+    for (let y = 300; y < 800; y++) {
+      if (lum(wx, y) > 0.04) {
+        if (w0 < 0) w0 = y;
+        w1 = y;
+      }
+    }
+    const width = w1 - w0 + 1;
+    if (!(width > 100 && width < 180)) {
+      errors.push(`1425503532 绳宽 ${width}（预期 ≈140±20）`);
+    }
+  }
+
+  // sprite 系统不得被误判成 rope
+  const glow = JSON.parse(readText2(getEntry(pkg, "particles/pacmanglow.json")));
+  const glowPs = new ParticleSystem(null, glow, null, { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+  if (glowPs.ropeRenderer) {
+    errors.push("pacmanglow（sprite 渲染器）被误识别为 rope");
+  }
+
+  // 同壁纸另外两条 trail（红/蓝幽灵）也应识别为 rope
+  for (const c of ["particles/ghost1trail.json", "particles/ghost2trail.json"]) {
+    const t = buildTrail(c);
+    if (!t.ropeRenderer) errors.push(`1425503532 ${c} 未识别为 rope`);
+  }
+
+  return { errors };
+}
+
+// ---------- 内置帧表：rain1/rain2 的 1×4 图集 + randomframe（1823900922）----------
+function runBuiltinFrames() {
+  const errors = [];
+  const frames = ptex.builtinParticleFrames("particle/nature/rain1");
+  if (!frames || frames.length !== 4) {
+    errors.push(`rain1 内置帧表应为 4 帧（randomframe 依赖），实际 ${frames ? frames.length : null}`);
+    return { errors };
+  }
+  for (let i = 0; i < 4; i++) {
+    const fr = frames[i];
+    if (Math.abs(fr.sv - 0.25) > 1e-9 || Math.abs(fr.ov - i / 4) > 1e-9 || fr.su !== 1) {
+      errors.push(`rain1 帧 ${i} 矩形应为 1×4 竖排等分，实际 ${JSON.stringify(fr)}`);
+    }
+  }
+  // 贴图应是 4 条互不相同的斜丝（帧间相位差）：randomframe 才有意义
+  const tex = ptex.buildBuiltinParticleTexture("particle/nature/rain1");
+  const { width, height, rgba } = tex;
+  const fh = height / 4;
+  const centers = [];
+  for (let f = 0; f < 4; f++) {
+    let bx = 0;
+    let bv = -1;
+    for (let x = 0; x < width; x++) {
+      const v = rgba[((f + 0.5) * fh | 0) * width * 4 + x * 4 + 3];
+      if (v > bv) {
+        bv = v;
+        bx = x;
+      }
+    }
+    centers.push(bx);
+  }
+  if (new Set(centers).size < 3) {
+    errors.push(`rain1 四帧亮心应错开（randomframe 取不同帧要有形态差），实际 x=${centers.join(",")}`);
+  }
+  // 斜丝方向：上半帧亮心在右、下半帧在左（与下落方向一致）
+  let topX = 0;
+  let botX = 0;
+  let tv = -1;
+  let bv2 = -1;
+  for (let x = 0; x < width; x++) {
+    const vt = rgba[2 * width * 4 + x * 4 + 3];
+    const vb = rgba[(fh * 4 - 3) * width * 4 + x * 4 + 3];
+    if (vt > tv) { tv = vt; topX = x; }
+    if (vb > bv2) { bv2 = vb; botX = x; }
+  }
+  if (topX <= botX) {
+    errors.push(`rain1 斜丝应顶右底左（官方 preview 雨向左下落），实际 top=${topX} bot=${botX}`);
+  }
+  // randomframe 系统：setTexture(帧表) 后 frameCount=4，spawn 随机取帧
+  const ps = new ParticleSystem(
+    null,
+    {
+      maxcount: 8,
+      animationmode: "randomframe",
+      emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+      initializer: [{ name: "lifetimerandom", min: 0.5, max: 0.5 }],
+      operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+    },
+    null,
+    { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+  );
+  ps.setTexture({ glTex: null, width, height, pixels: { width, height, rgba }, frames });
+  if (ps.frameCount !== 4) {
+    errors.push(`randomframe + 帧表 4 帧：frameCount 应为 4，实际 ${ps.frameCount}`);
+  }
+  for (let i = 0; i < 30; i++) ps.advance(1 / 60);
+  const bad = ps.pool.filter((p) => p.alive && (p.frame < 0 || p.frame > 3)).length;
+  if (bad > 0) {
+    errors.push(`randomframe 随机帧越界 ${bad} 颗`);
+  }
+  if (ps.liveCount() > 0 && ps.pool.filter((p) => p.alive).every((p) => p.frame === ps.pool.find((q) => q.alive).frame)) {
+    errors.push("randomframe 所有粒子同帧（帧随机化失效）");
+  }
+  return { errors };
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -1280,6 +1474,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【REFRACT 空白白图】问题 ${rb.errors.length}`);
   rb.errors.forEach((e) => console.log("  ! " + e));
   failed += rb.errors.length;
+  const bf = runBuiltinFrames();
+  console.log(`\n【内置帧表】问题 ${bf.errors.length}`);
+  bf.errors.forEach((e) => console.log("  ! " + e));
+  failed += bf.errors.length;
 }
 if (action === "all" || action === "sim") {
   const r = runSim();
@@ -1312,6 +1510,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【Rope Trail】问题 ${rr.errors.length}`);
   rr.errors.forEach((e) => console.log("  ! " + e));
   failed += rr.errors.length;
+  const rp = runRope();
+  console.log(`\n【Rope 连续光束】问题 ${rp.errors.length}`);
+  rp.errors.forEach((e) => console.log("  ! " + e));
+  failed += rp.errors.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);

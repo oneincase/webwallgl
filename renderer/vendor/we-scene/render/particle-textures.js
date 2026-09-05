@@ -193,6 +193,55 @@ function beam(w, h, coreWidth, fadeBoth, peak) {
   return { width: w, height: h, rgba }
 }
 
+// 雨丝（particle/nature/rain1、rain2）：贴图自带的斜细丝 + 1×4 帧图集。
+// WE 官方 rain1.tex 的丝不是竖直的——raindownpour 预设无任何旋转、不开风、
+// velocity x 仅 -45（0.6°），但官方 preview（1823900922 / 1444077782）里雨丝
+// 统一倾斜 ~10°（上端在右），只能来自贴图本身；且预设写了
+// `animationmode: randomframe`（每粒随机固定一帧）——单帧贴图写它毫无意义，
+// 说明官方贴图是多帧图集：丝长 = quad 高 ÷ 帧数（官方丝 200-500px，
+// 整高会画出 400-1000px 的超长丝，1823900922 图1 的另一处失衡）。
+// 旧实现用 beam() 的竖直 σ0.16 粗核心单帧 → 粗白竖长光柱。
+// beam() 本身别动：beam_*/light_shafts 的竖直粗丝是它们自己的正确形态。
+const RAIN_FRAMES = 4
+function rainStreak(w, h, tiltDeg, corePx, peak) {
+  const pk = peak === undefined ? 0.85 : peak
+  const rgba = new Uint8Array(w * h * 4)
+  const fh = h / RAIN_FRAMES
+  const rng = mulberry32(0x51ca1)
+  const tilt = Math.tan((tiltDeg * Math.PI) / 180)
+  const cx = w / 2
+  for (let f = 0; f < RAIN_FRAMES; f++) {
+    // 帧间微差（亮度/粗细/水平相位）：randomframe 抽到不同帧的雨丝形态不一
+    const peakF = pk * (0.8 + rng() * 0.35)
+    const coreF = corePx * (0.85 + rng() * 0.5)
+    const ph = (rng() - 0.5) * w * 0.12
+    for (let y = 0; y < fh; y++) {
+      const ty = y / (fh - 1)
+      // 帧内第 0 行（屏幕上端）在右侧，向下渐左——与下落方向一致
+      const lineX = cx + ph + ((fh - 1) * tilt) / 2 - (fh - 1) * tilt * ty
+      const vy = gauss(ty - 0.5, 0.27)
+      for (let x = 0; x < w; x++) {
+        const d = Math.abs(x + 0.5 - lineX)
+        const g = Math.exp(-(d * d) / (coreF * coreF))
+        const a = g * vy * peakF
+        if (a < 0.004) continue
+        writeWhite(rgba, ((f * fh + y) * w + x) * 4, a)
+      }
+    }
+  }
+  return { width: w, height: h, rgba }
+}
+
+/** 内置贴图的帧表（top-down，与 TEXS list 元素同构）。无帧表的名字返回 null。 */
+export function builtinParticleFrames(name) {
+  if (name === 'particle/nature/rain1' || name === 'particle/nature/rain2') {
+    const list = []
+    for (let i = 0; i < RAIN_FRAMES; i++) list.push({ ou: 0, ov: i / RAIN_FRAMES, su: 1, sv: 1 / RAIN_FRAMES })
+    return list
+  }
+  return null
+}
+
 // 环形波（particle/misc/wave）：高斯环 + 外侧衰减
 function ring(size, radius, thickness) {
   const rgba = new Uint8Array(size * size * 4)
@@ -957,8 +1006,8 @@ const BUILDERS = {
   // 水滴（原生 64×256 → 128×512）：竖长泪滴
   'particle/drop': () => teardrop(128, 512),
   // 雨丝（原生 64×256 → 128×512）：细长条，两端渐隐
-  'particle/nature/rain1': () => beam(128, 512, 0.16, true, 0.6),
-  'particle/nature/rain2': () => beam(128, 512, 0.24, true, 0.55),
+  'particle/nature/rain1': () => rainStreak(128, 512, 10, 1.0, 0.78),
+  'particle/nature/rain2': () => rainStreak(128, 512, 10, 1.6, 0.66),
   // 雨滴 sheet（原生 128×256 → 256×512，2×4 格）：每格一颗上圆下尖小水滴
   'particle/water/rain_drops_sheet': () => dropSheet(256, 512, 2, 4),
   // 雾（原生 256 → 512）：絮状 fBm，弱遮罩铺满；三张不同尺度/种子

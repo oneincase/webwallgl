@@ -7,7 +7,7 @@
 // 这两处都可以在 CPU 上按 shader 的公式逐字复算，得到与 GPU 一致的结论。
 //
 // 与 render/particles.js 的 _buildProgram 顶点/片元着色器严格对应，改 shader 时需同步改这里。
-import { rgbaIsBlankWhite, spriteTrailLengthFactor, spriteTrailRotation } from '../renderer/vendor/we-scene/render/particles.js'
+import { rgbaIsBlankWhite, spriteTrailLengthFactor, spriteTrailRotation, ropeParticleV } from '../renderer/vendor/we-scene/render/particles.js'
 
 // 采样贴图（双线性，clamp 到边缘；与 GL_LINEAR + CLAMP_TO_EDGE 一致）
 function sampleTex(tex, u, v) {
@@ -78,6 +78,116 @@ export function rasterizeSystem(target, ps, cam) {
   const sy = H / cam.viewH
   let drawn = 0
 
+  // 局部 → 世界（含图层 origin/scale/angles），y 翻转到投影空间（与 GPU 的 toWorld 一致）
+  const toWorld = (lx, ly) => {
+    const px = lx * ps.scaleX
+    const py = ly * ps.scaleY
+    return [ps.originX + px * cosL - py * sinL, cam.projH - (ps.originY + px * sinL + py * cosL)]
+  }
+
+  // 画一个实例 quad（与顶点着色器逐字对应）：
+  // quad 宽 = size*stX，长 = size*stY，rot 为投影空间弧度；uv.y = mix(v0, v1, corner.y+0.5)
+  const drawOne = (wx, wy, rot, size, stX, stY, cr2, cg2, cb2, ca, frameIdx, v0, v1) => {
+    const halfW = (size * stX) / 2
+    const halfH = (size * stY) / 2
+    const cr = Math.cos(rot)
+    const sr = Math.sin(rot)
+    // 旋转后的包围盒（保守放大，覆盖旋转后的四角）
+    const ext = Math.hypot(halfW, halfH)
+
+    // 屏幕范围
+    const cxs = (wx - cam.offX) * sx
+    const cys = (wy - cam.offY) * sy
+    const rx = ext * sx
+    const ry = ext * sy
+    const x0 = Math.max(0, Math.floor(cxs - rx))
+    const x1 = Math.min(W - 1, Math.ceil(cxs + rx))
+    const y0 = Math.max(0, Math.floor(cys - ry))
+    const y1 = Math.min(H - 1, Math.ceil(cys + ry))
+    if (x1 < x0 || y1 < y0) return
+    drawn++
+
+    for (let py = y0; py <= y1; py++) {
+      for (let px = x0; px <= x1; px++) {
+        // 屏幕像素 → 投影空间 → 精灵局部（逆旋转、去拉伸）
+        const dxw = px / sx + cam.offX - wx
+        const dyw = py / sy + cam.offY - wy
+        const ux = dxw * cr + dyw * sr
+        const uy = -dxw * sr + dyw * cr
+        // 归一化到 [-0.5, 0.5]（对应顶点着色器的 a_corner）
+        const cu = ux / (size * stX)
+        const cv = uy / (size * stY)
+        if (cu < -0.5 || cu > 0.5 || cv < -0.5 || cv > 0.5) continue
+        // corner → uv（与顶点着色器一致：不翻 v，投影空间 y 已翻）
+        let u = cu + 0.5
+        let v = v0 + (v1 - v0) * (cv + 0.5)
+        if (frames && frames.length) {
+          // 帧矩形以左上为原点（TEXS 是 top-down 像素坐标）
+          const fr = frames[Math.max(0, Math.min(frames.length - 1, frameIdx | 0))]
+          const cu2 = u * fr.su + fr.ou
+          const cv2 = (1 - v) * fr.sv + fr.ov
+          u = cu2
+          v = 1 - cv2
+        }
+        const t = sampleTex(tex, u, v)
+        // REFRACT + 空白白图：GPU 走折射；CPU 光栅没有帧缓冲可采，不能按不透明
+        // 白 quad 画，否则 2468489223 Splatter Small 会在离线结果里铺满白方块。
+        if (punchBlank) continue
+        const ta = (t[3] / 255) * ca
+        if (ta <= 0) continue
+        const o = (py * W + px) * 3
+        const srcR = (t[0] / 255) * cr2
+        const srcG = (t[1] / 255) * cg2
+        const srcB = (t[2] / 255) * cb2
+        if (additive) {
+          // gl.blendFunc(SRC_ALPHA, ONE)
+          rgb[o] += srcR * ta
+          rgb[o + 1] += srcG * ta
+          rgb[o + 2] += srcB * ta
+        } else {
+          // gl.blendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+          rgb[o] = srcR * ta + rgb[o] * (1 - ta)
+          rgb[o + 1] = srcG * ta + rgb[o + 1] * (1 - ta)
+          rgb[o + 2] = srcB * ta + rgb[o + 2] * (1 - ta)
+        }
+      }
+    }
+  }
+
+  if (ps.ropeRenderer) {
+    // rope：相邻发射序的两粒子连成一个拉伸段（u 横跨绳宽，v 沿绳按寿命推进）
+    const order = []
+    for (const p of ps.pool) if (p.alive) order.push(p)
+    order.sort((a, b) => a.seq - b.seq)
+    for (let i = 0; i + 1 < order.length; i++) {
+      const a = order[i]
+      const b = order[i + 1]
+      const wa = toWorld(a.x, a.y)
+      const wb = toWorld(b.x, b.y)
+      const dx = wb[0] - wa[0]
+      const dy = wb[1] - wa[1]
+      const dist = Math.hypot(dx, dy)
+      const width = (Math.abs(a.size) + Math.abs(b.size)) * 0.5 * sysScale
+      if (!(width > 0) || !(dist > 0)) continue
+      drawOne(
+        (wa[0] + wb[0]) * 0.5,
+        (wa[1] + wb[1]) * 0.5,
+        Math.atan2(-dx, dy),
+        width,
+        1,
+        dist / width,
+        ((a.r + b.r) / 2) * bright,
+        ((a.g + b.g) / 2) * bright,
+        ((a.b + b.b) / 2) * bright,
+        (a.alpha + b.alpha) / 2,
+        0,
+        ropeParticleV(a),
+        ropeParticleV(b),
+      )
+    }
+    return { drawn }
+  }
+
   for (const p of ps.pool) {
     if (!p.alive) continue
     // 局部 → 世界（含图层 origin/scale/angles），y 翻转到投影空间
@@ -106,75 +216,8 @@ export function rasterizeSystem(target, ps, cam) {
 
     const size = Math.abs(p.size) * sysScale
     if (!(size * pStretchX) || !(size * pStretchY)) continue
-    const halfW = (size * pStretchX) / 2
-    const halfH = (size * pStretchY) / 2
-    const cr = Math.cos(rot)
-    const sr = Math.sin(rot)
-    // 旋转后的包围盒（保守放大，覆盖旋转后的四角）
-    const ext = Math.hypot(halfW, halfH)
 
-    // 屏幕范围
-    const cxs = (wx - cam.offX) * sx
-    const cys = (wy - cam.offY) * sy
-    const rx = ext * sx
-    const ry = ext * sy
-    const x0 = Math.max(0, Math.floor(cxs - rx))
-    const x1 = Math.min(W - 1, Math.ceil(cxs + rx))
-    const y0 = Math.max(0, Math.floor(cys - ry))
-    const y1 = Math.min(H - 1, Math.ceil(cys + ry))
-    if (x1 < x0 || y1 < y0) continue
-    drawn++
-
-    const cr2 = p.r * bright
-    const cg2 = p.g * bright
-    const cb2 = p.b * bright
-    const ca = p.alpha
-
-    for (let py = y0; py <= y1; py++) {
-      for (let px = x0; px <= x1; px++) {
-        // 屏幕像素 → 投影空间 → 精灵局部（逆旋转、去拉伸）
-        const dxw = px / sx + cam.offX - wx
-        const dyw = py / sy + cam.offY - wy
-        const ux = dxw * cr + dyw * sr
-        const uy = -dxw * sr + dyw * cr
-        // 归一化到 [-0.5, 0.5]（对应顶点着色器的 a_corner）
-        const cu = ux / (size * pStretchX)
-        const cv = uy / (size * pStretchY)
-        if (cu < -0.5 || cu > 0.5 || cv < -0.5 || cv > 0.5) continue
-        // corner → uv（与顶点着色器一致：不翻 v，投影空间 y 已翻）
-        let u = cu + 0.5
-        let v = cv + 0.5
-        if (frames && frames.length) {
-          // 帧矩形以左上为原点（TEXS 是 top-down 像素坐标）
-          const fr = frames[Math.max(0, Math.min(frames.length - 1, p.frame | 0))]
-          const cu2 = u * fr.su + fr.ou
-          const cv2 = (1 - v) * fr.sv + fr.ov
-          u = cu2
-          v = 1 - cv2
-        }
-        const t = sampleTex(tex, u, v)
-        // REFRACT + 空白白图：GPU 走折射；CPU 光栅没有帧缓冲可采，不能按不透明
-        // 白 quad 画，否则 2464842912 Splatter Small 会在离线结果里铺满白方块。
-        if (punchBlank) continue
-        const ta = (t[3] / 255) * ca
-        if (ta <= 0) continue
-        const o = (py * W + px) * 3
-        const srcR = (t[0] / 255) * cr2
-        const srcG = (t[1] / 255) * cg2
-        const srcB = (t[2] / 255) * cb2
-        if (additive) {
-          // gl.blendFunc(SRC_ALPHA, ONE)
-          rgb[o] += srcR * ta
-          rgb[o + 1] += srcG * ta
-          rgb[o + 2] += srcB * ta
-        } else {
-          // gl.blendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
-          rgb[o] = srcR * ta + rgb[o] * (1 - ta)
-          rgb[o + 1] = srcG * ta + rgb[o + 1] * (1 - ta)
-          rgb[o + 2] = srcB * ta + rgb[o + 2] * (1 - ta)
-        }
-      }
-    }
+    drawOne(wx, wy, rot, size, pStretchX, pStretchY, p.r * bright, p.g * bright, p.b * bright, p.alpha, p.frame, 0, 1)
   }
   return { drawn }
 }

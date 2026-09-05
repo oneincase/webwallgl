@@ -378,6 +378,16 @@ export function applyAttachmentBindOrigins(layers) {
       c.origin[0] += d[0]
       c.origin[1] += d[1]
     }
+    // 挂件整棵子树的视差深度必须与附着目标（puppet 层）一致：挂件的一切屏幕
+    // 行为跟着骨骼走，视差深度也属于骨骼所在的层。parse 的视差继承只覆盖
+    // 「父是空组」，而挂件的父是 puppet（有 image）——继承不到组深度：
+    // 3232289987 精细模式下躯干继承组 -1.06，前发/右臂/发饰 parallax=null、
+    // 右眼球显式 "0 0"，视差一拉头走了五官钉在原地，像没绑在头上。
+    // （作者给挂件随手写 parallax 0 是常态，覆盖为骨骼深度才是 WE 语义。）
+    layer.parallaxDepth = parent.parallaxDepth ? parent.parallaxDepth.slice() : null
+    for (const c of desc) {
+      c.parallaxDepth = layer.parallaxDepth ? layer.parallaxDepth.slice() : null
+    }
     follows.push({
       layer,
       parent,

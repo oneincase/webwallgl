@@ -1131,6 +1131,9 @@ cfg, source, pkgAbort.signal);
           rg88: false,
           mips: [gen],
           generated: true,
+          // 内置贴图的帧表（rain1/rain2 的 1×4 图集）：randomframe 预设依赖它
+          // 随机取帧，缺了就整图采样画出超长丝（1823900922）。
+          frames: ptex.builtinParticleFrames(name) ?? undefined,
         };
         textures.set(name, entry);
         builtinTexCount++;

@@ -11,6 +11,7 @@ layout(location=1) in vec3 a_pos;         // 实例中心（投影空间世界�
 layout(location=2) in vec2 a_sizeRot;     // x=size(像素) y=rot(弧度)
 layout(location=3) in vec4 a_color;       // rgb + alpha
 layout(location=4) in vec3 a_stretchFrame; // xy=非等比拉伸 z=帧序号
+layout(location=5) in vec2 a_vrange;      // 段两端沿贴图 v 的取值（rope 连线用；普通精灵 0..1）
 uniform mat4 u_mvp;
 // 序列帧 uv 变换表（TEXS 帧矩形归一化后的 offset/scale），最多 128 帧
 // （matrix spritesheet 72 有 71 帧，旧上限 64 会丢末尾字符）
@@ -28,7 +29,8 @@ void main(){
   gl_Position = u_mvp * vec4(a_pos.xy + rotated, a_pos.z, 1.0);
   // quad 角 → 贴图 uv。世界 y 已翻转到投影空间（y 向下），故 quad 的 +y 角
   // 对应屏幕上方，应采样纹理顶行 v=1（与 renderer.js 的 layerQuadVerts 同约定）。
-  vec2 uv = a_corner + 0.5;
+  // a_vrange 让 rope 段两端各取自己的 v（沿绳连续渐变）；普通精灵是 (0,1) 恒等。
+  vec2 uv = vec2(a_corner.x + 0.5, mix(a_vrange.x, a_vrange.y, a_corner.y + 0.5));
   if (u_frameCount > 0) {
     // 帧矩形以左上为原点（TEXS 是 top-down 像素坐标），故先把 v 翻成 top-down
     int fi = int(a_stretchFrame.z);
@@ -105,9 +107,9 @@ void main(){
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0)
     gl.vertexAttribDivisor(0, 0)
-    // location 1..4：实例数据（stride 48 = 12 float）
+    // location 1..4：实例数据（stride 56 = 14 float，含 rope 的 a_vrange）
     gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
-    const S = 48
+    const S = 56
     gl.enableVertexAttribArray(1)
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, S, 0)
     gl.vertexAttribDivisor(1, 1)
@@ -120,6 +122,9 @@ void main(){
     gl.enableVertexAttribArray(4)
     gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, 36)
     gl.vertexAttribDivisor(4, 1)
+    gl.enableVertexAttribArray(5)
+    gl.vertexAttribPointer(5, 2, gl.FLOAT, false, S, 48)
+    gl.vertexAttribDivisor(5, 1)
     gl.bindVertexArray(null)
 
     return {
