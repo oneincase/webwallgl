@@ -66,7 +66,9 @@ function isDeclaration(text, idx) {
 function collectIntNames(code) {
   const names = new Set()
   let m
-  const declRe = /\b(?:const\s+)?int\s+([A-Za-z_]\w*)\s*[=;)]/g
+  // 尾随字符集里的 \u0003 是 for 循环头挖洞的起始标记：挖洞时刻意把循环变量名
+  // 留在洞外（`for (int i\u0003…`），就是为了让这里仍能把 i 认成 int。
+  const declRe = /\b(?:const\s+)?int\s+([A-Za-z_]\w*)\s*[=;)\u0003]/g
   while ((m = declRe.exec(code)) !== null) names.add(m[1])
   return names
 }
@@ -232,6 +234,26 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   code = code.replace(/\b\d+(?:\.\d+)?[eE][+-]?\d+\b/g, (m) => {
     sciHoles.push(m)
     return '\u0001' + '\u0002'.repeat(sciHoles.length) + '\u0001'
+  })
+
+  // [we-scene patch] **`for (int …)` 的循环头同样整体挖洞**，理由同上。
+  // 循环头里的数值本就该保持整型，但下面那些补 .0 的规则看不出上下文：
+  // common.h 有 `float atan2(float y, float x)`，其形参 y / x 被 floatNames 收进来，
+  // 于是「float 变量 ± 整数」那条把 `for (int y = -1; y <= 1; y++)` 的 -1 补成 -1.0，
+  // ANGLE 报 `cannot convert from 'const float' to 'mediump int'`，整个
+  // procedural_noise pass 被跳过（7 pass / 3 壁纸）。作者写的是标准整型循环。
+  //
+  // 挖洞而不去修 floatNames：那张表与 width 表一样被多处消费，收紧它的风险远大于
+  // 收益（width 表处记录过一次 569 个 pass 的回归）。
+  // 注意后面还有一条「循环边界 float→int」的补丁（`i < u_Iterations` → `int(...)`），
+  // 它在本循环**之后**执行，那时已回填，不受影响。
+  const forHoles = []
+  code = code.replace(/\bfor\s*\(\s*int\s+([A-Za-z_]\w*)([^)]*)\)/g, (m, name, rest) => {
+    // 把**循环变量名留在洞外**：后面的 collectIntNames 要靠 `for (int i` 把 i 认成
+    // int，10b-3 才会把 `i / sampleDrop` 改成 `float(i) / sampleDrop`（godrays_cast）。
+    // 整段挖掉会让它收不到循环变量，那条判据当场变红。
+    forHoles.push(rest + ')')
+    return `for (int ${name}\u0003${'\u0004'.repeat(forHoles.length)}\u0003`
   })
   //
   // [we-scene patch] **必须迭代到不动点**：这些都是单趟正则替换，而 HLSL 的
@@ -491,18 +513,13 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   //    误改的风险大于收益，交给真实编译校验兜住。
   {
     const width = new Map()
-    // [we-scene patch] **只收语句级声明，排除函数签名**。
-    // 原正则 `vecN <名字>` 会把公共头里的函数名与形参一起收进来：
-    // common_blending.h 有 24 个 `vec3 BlendXxx(vec3 base, vec3 blend)`，
-    // 于是 `BlendLinearDodge` / `base` / `blend` 三个名字都被当成 vec3 变量。
-    // 后果：blendgradient.frag 的 main() 里 `float blend = 1.0;` 被误判成 vec3，
-    // 下面 9b 把 `blend = smoothstep(…)` 包成 `blend = vec3(smoothstep(…))`，
-    // ANGLE 报 dimension mismatch —— 24 张壁纸的混合渐变 pass 全灭。
-    // 作者原式本来完全合法，这是转译器自己造的缺陷。
-    //
-    // 判据：声明必须以 `;`、`,`、`)` 之外的方式结束语句，且名字后不能紧跟 `(`
-    // （那是函数名），也不能处在形参列表里（前面最近的非空白字符是 `(` 或 `,`
-    // 且该行含 `)` 与 `{`）。用「名字后紧跟 = 或 ; 或 , 或行尾」正向判定更稳。
+    // ⚠️ 这个正则**故意保持宽松**（连函数名与形参一起收）。
+    // 试过收紧成「只认 `= ; [` 结尾的语句级声明」以避开 common_blending.h 里
+    // 24 个 `vec3 BlendXxx(vec3 base, vec3 blend)` 的形参污染 —— 结果这张表还被
+    // 下面的 swizzle 补齐消费，大量真正需要广播的向量落空，实测全库真实编译
+    // 1733 → 1164 pass（一次性回归 569 个）。
+    // 形参污染的真实危害（局部 `float blend` 被 9b 广播成 vec3）改在 9b 处
+    // 单独设闸门（同名 float 声明优先），见那里的注释。
     const wre = /\b(?:uniform|varying|attribute|in|out)?\s*\b(vec([234]))\s+([A-Za-z_]\w*)/g
     let wm
     while ((wm = wre.exec(code)) !== null) width.set(wm[3], Number(wm[2]))
@@ -514,6 +531,60 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         if (!lw || !rw || lw >= rw) return all
         return pre + lhs + ' = ' + rhs + '.' + SW[lw] + ';'
       })
+    }
+    // 9a-2) [we-scene patch] **声明式初始化的向量→标量截断**：
+    //    `float mask = texSample2D(g_Texture1, uv);`（sharpen_filter，2 张）、
+    //    `float pointer = g_PointerPosition.yx * u_pointerSpeed;`（chromatic_aberration，2 张）。
+    //    HLSL 隐式取 .x；GLSL ES 报 `cannot convert from '4-component vector of float' to 'float'`，
+    //    整个 pass 被跳过。上面第 9 段只处理「已声明变量之间的赋值」（a = b;），
+    //    不看声明式初始化，所以这类漏掉。
+    //
+    //    只在右值宽度**可确证**时截断，三种来源：
+    //      - texture / textureLod 调用（GLSL 规范返回 vec4）；
+    //      - 整段 RHS 是「向量标识符 op 标量」的乘除（宽度由该标识符决定）；
+    //      - 带 2~4 分量 swizzle 的标识符 op 标量。
+    //    推不出宽度就不动 —— 交给真实编译校验兜住，别猜。
+    {
+      // 本文件声明为 float 的名字：width 表宽松收集（连 common_blending.h 的
+      // 24 个 `vec3 BlendXxx(vec3 base, vec3 blend)` 形参也收），所以查 width
+      // 前必须先排掉同名 float 声明 —— 否则 `float blendAlpha = blend * g_Multiply;`
+      // 里两侧都是 float 的表达式会被当成向量截断成 `(...).x`，ANGLE 报
+      // `field selection requires structure, vector...`（2388299037 的 blend pass）。
+      // 与 9b 的闸门同源同理。
+      const floatDecl = new Set()
+      {
+        const fdre = /\b(?:uniform|varying|attribute|in|out|const)?\s*\bfloat\s+([A-Za-z_]\w*)/g
+        let fd
+        while ((fd = fdre.exec(code)) !== null) floatDecl.add(fd[1])
+      }
+      const vecW = (expr) => {
+        const e = expr.trim()
+        // texture(...) / textureLod(...) 整段
+        if (/^texture(?:Lod)?\s*\(/.test(e)) {
+          let depth = 0
+          for (let i = e.indexOf('('); i < e.length; i++) {
+            if (e[i] === '(') depth++
+            else if (e[i] === ')') { depth--; if (depth === 0) return i === e.length - 1 ? 4 : 0 }
+          }
+          return 0
+        }
+        // <标识符或 swizzle> <*|/> <不含向量特征的标量>
+        const m = /^([A-Za-z_]\w*)(?:\.([xyzwrgba]{2,4}))?\s*[*/]\s*([^*/]+)$/.exec(e)
+        if (!m) return 0
+        const rhsPart = m[3]
+        if (/\bvec[234]\s*\(|\.[xyzwrgba]{2,4}\b/.test(rhsPart)) return 0
+        if (m[2]) return m[2].length
+        if (floatDecl.has(m[1])) return 0
+        return width.get(m[1]) || 0
+      }
+      code = code.replace(
+        /(^|[;{}\n]\s*)float\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g,
+        (all, pre, name, rhs) => {
+          const w = vecW(rhs)
+          if (w < 2) return all
+          return `${pre}float ${name} = (${rhs.trim()}).x;`
+        },
+      )
     }
     // 9b) **标量 → 向量广播**：HLSL `vec2 a; a = pow(...);` 把 float 复制到每个分量，
     //    GLSL ES 报 dimension mismatch。3789816832 的 sine_wave 就是
@@ -1097,13 +1168,27 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         let body = code.slice(braceIdx + 1)
         const decls = []
         for (const name of written) {
+          // [we-scene patch] **作者已在 main 里声明同名局部量时不要造副本**。
+          // HLSL 允许局部量遮蔽 varying：chromatic_aberration.frag 顶部有
+          // `varying vec4 timer;`，main() 里又写 `vec4 timer = texSample2D(...)`。
+          // 无条件造副本会插入 `vec4 timer_rw = timer;`，而作者那句局部声明也被
+          // 整词替换成 `vec4 timer_rw = ...` —— 两个同名声明，ANGLE 报
+          // `'timer_rw' : redefinition`，整个色散 pass 被跳过
+          // （timer/rValue/gValue/bValue 四个名字同时中招，7 pass / 7 壁纸）。
+          // 作者既然自己声明了局部量，可写语义本来就成立，副本纯属多余。
+          const shadowed = new RegExp(
+            '(?:^|[;{}\\n])\\s*(?:highp|mediump|lowp\\s+)?(?:vec[234]|float|int|bool)\\s+' + name + '\\s*[=;]',
+          ).test(body)
+          if (shadowed) continue
           const tm = new RegExp('^\\s*in\\s+(?:highp|mediump|lowp\\s+)?(vec[234]|float)\\s+' + name + '\\s*;', 'm').exec(code)
           const ty = tm ? tm[1] : 'vec4'
           decls.push('    ' + ty + ' ' + name + '_rw = ' + name + ';')
           body = replaceWord(body, name, name + '_rw')
           // 初始化行自身被上面的整词替换改成了 `x_rw = x_rw`，这里单独写回
         }
-        body = '\n' + decls.map((d) => d.replace(/= (\w+)_rw;/, '= $1;')).join('\n') + '\n' + body
+        if (decls.length > 0) {
+          body = '\n' + decls.map((d) => d.replace(/= (\w+)_rw;/, '= $1;')).join('\n') + '\n' + body
+        }
         code = head + body
       }
     }
@@ -1112,6 +1197,18 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   // HLSL 属性/修饰符
   code = code.replace(/\[(?:unroll|loop|branch|flatten)\]\s*/g, '')
   code = code.replace(/\bstatic\s+/g, '')
+
+  // [we-scene patch] **回填 for 循环头**（在补 .0 的规则之前挖的洞，见 forHoles 处注释）。
+  // 回填点的取值范围很窄，两边都撞过墙：
+  //   - 放在内建函数实参补 .0（rewriteCall）**之前** → 那段仍会把循环头里的
+  //     `-1` 改成 `-1.0`，G 类修不掉；
+  //   - 放到函数最末（与 sciHoles 一起）→ 下面那条「整型循环边界 float→int」
+  //     看到的还是占位符，`i < u_Iterations` 不再被包 int()，反而弄坏 4 张壁纸，
+  //     离线判据当场爆 28 类问题。
+  // 所以必须夹在两者之间：内建段之后、循环边界规则之前。
+  if (forHoles.length > 0) {
+    code = code.replace(/\u0003(\u0004+)\u0003/g, (m, marks) => forHoles[marks.length - 1])
+  }
 
   // [we-scene patch] `for (int i = <float>; i < <float>; ...)` 的整型循环边界。
   // HLSL 允许 float→int 隐式收窄，GLSL ES 3.00 **不允许**，于是整个 pass 编译失败、
@@ -1165,9 +1262,8 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     }).join('\n')
   }
 
-  // [we-scene patch] 回填科学计数法字面量（上面在补 .0 之前整体挖了洞，
+  // [we-scene patch] 回填科学计数法字面量（在补 .0 之前整体挖了洞，
   // 见 sciHoles 处注释）。必须在所有改写之后、拼 prologue 之前。
-  // 一元记数：\u0002 的个数即序号（从 1 起）。
   if (sciHoles.length > 0) {
     code = code.replace(/\u0001(\u0002+)\u0001/g, (m, marks) => sciHoles[marks.length - 1])
   }

@@ -902,6 +902,134 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **写 varying 的副本机制不得撞上作者的同名局部量**。
+// HLSL 允许局部量遮蔽 varying：chromatic_aberration.frag 顶部 `varying vec4 timer;`，
+// main() 里又写 `vec4 timer = texSample2D(...)`。无条件造副本会插入
+// `vec4 timer_rw = timer;`，而作者那句也被整词替换成同名声明 → `redefinition`，
+// 整个色散 pass 被跳过（timer/rValue/gValue/bValue 四名同时中招，7 pass / 7 壁纸）。
+{
+  const shadowed = [
+    "varying vec4 timer;",
+    "uniform sampler2D g_Texture0;",
+    "varying vec2 v_TexCoord;",
+    "void main() {",
+    "  vec4 timer = texSample2D(g_Texture0, v_TexCoord);",
+    "  timer.x += 0.1;",
+    "  gl_FragColor = timer;",
+    "}",
+  ].join("\n");
+  const g1 = hlsl2glsl(shadowed, "frag", {}, () => null);
+  if ((g1.match(/\btimer_rw\s*=/g) || []).length > 1) {
+    wireErrors.push("作者已声明同名局部量时不得再造 _rw 副本（会 redefinition，整个 pass 被跳过）");
+  }
+  // 反向：真正需要副本的场景（写 varying 但无局部声明）必须照旧工作
+  const needsCopy = [
+    "varying vec2 v_TexCoord;",
+    "uniform sampler2D g_Texture0;",
+    "void main() {",
+    "  v_TexCoord.y += 0.1;",
+    "  gl_FragColor = texSample2D(g_Texture0, v_TexCoord);",
+    "}",
+  ].join("\n");
+  const g2 = hlsl2glsl(needsCopy, "frag", {}, () => null);
+  if (!/vec2 v_TexCoord_rw = v_TexCoord;/.test(g2)) {
+    wireErrors.push("写入 varying 但无同名局部量时仍须造 _rw 副本（GLSL ES 的 in 是只读的）");
+  }
+}
+
+// [we-scene patch] **声明式初始化的向量→标量截断**：
+// `float mask = texSample2D(...)`（sharpen_filter）/
+// `float pointer = g_PointerPosition.yx * u_speed`（chromatic_aberration）。
+// 第 9 段只处理「已声明变量之间的赋值」，不看声明式初始化。
+{
+  const t1 = hlsl2glsl(
+    "uniform sampler2D g_Texture1;\nvarying vec2 v_TexCoord;\nvoid main(){ float mask = texSample2D(g_Texture1, v_TexCoord); gl_FragColor=vec4(mask); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/float mask = \(texture\([^)]*\)\)\.x;/.test(t1)) {
+    wireErrors.push("float x = texture(...) 必须截断成 .x（GLSL ES 无 vec4→float 隐式转换）");
+  }
+  const t2 = hlsl2glsl(
+    "uniform vec2 g_PointerPosition;\nuniform float u_s;\nvoid main(){ float p = g_PointerPosition.yx * u_s; gl_FragColor=vec4(p); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/float p = \(g_PointerPosition\.yx \* u_s\)\.x;/.test(t2)) {
+    wireErrors.push("float x = <向量 op 标量> 必须截断成 .x");
+  }
+  // 不得误伤本来就是标量的右值：两侧都是 float / length / dot / vec.x
+  const safe = [
+    ["float*float", "uniform float a, b;\nvoid main(){ float v = a * b; gl_FragColor=vec4(v); }"],
+    ["length(vec)", "uniform vec3 c;\nvoid main(){ float v = length(c); gl_FragColor=vec4(v); }"],
+    ["dot(a,b)", "uniform vec3 a,b;\nvoid main(){ float v = dot(a, b); gl_FragColor=vec4(v); }"],
+    ["vec.x*float", "uniform vec3 c;\nuniform float k;\nvoid main(){ float v = c.x * k; gl_FragColor=vec4(v); }"],
+  ];
+  for (const [label, src] of safe) {
+    const g = hlsl2glsl(src, "frag", {}, () => null);
+    if (/float v = \(.*\)\.x;/.test(g)) {
+      wireErrors.push(`标量右值不得被截断（${label}）：会报 field selection requires vector`);
+    }
+  }
+  // common_blending.h 的形参污染同样要挡住（与 9b 闸门同源）：
+  // `float blendAlpha = blend * g_Multiply;` 两侧都是 float，blend 却在 width 表里。
+  const blendSrc = [
+    "vec3 BlendLinearDodge(vec3 base, vec3 blend) { return min(base + blend, vec3(1.0)); }",
+    "uniform float g_Multiply;",
+    "void main() {",
+    "  float blend = 0.5;",
+    "  float blendAlpha = blend * g_Multiply;",
+    "  gl_FragColor = vec4(blendAlpha);",
+    "}",
+  ].join("\n");
+  const bg = hlsl2glsl(blendSrc, "frag", {}, () => null);
+  if (/float blendAlpha = \(.*\)\.x;/.test(bg)) {
+    wireErrors.push("同名 float 声明优先于 width 表（否则 blend * g_Multiply 被误截断）");
+  }
+}
+
+// [we-scene patch] **`for (int …)` 循环头必须在补 .0 之前挖洞保护**。
+// common.h 有 `float atan2(float y, float x)`，其形参 y/x 被 floatNames 收进来，
+// 于是「float 变量 ± 整数」把 `for (int y = -1; ...)` 的 -1 补成 -1.0，
+// ANGLE 报 `cannot convert from 'const float' to 'mediump int'`（7 pass / 3 壁纸）。
+{
+  const loopSrc = [
+    "float atan2(float y, float x) { return atan(y, x); }",
+    "void main() {",
+    "  float s = 0.0;",
+    "  for (int y = -1; y <= 1; y++) { for (int x = -1; x <= 1; x++) { s += 1.0; } }",
+    "  gl_FragColor = vec4(s);",
+    "}",
+  ].join("\n");
+  const g = hlsl2glsl(loopSrc, "frag", {}, () => null);
+  if (/for \(int [xy] = -1\.0/.test(g)) {
+    wireErrors.push("for (int …) 循环头里的整数不得补 .0（float→int 转换失败，整个 pass 被跳过）");
+  }
+  // 回填点的取值范围很窄，两边都撞过墙 —— 这两条守住它：
+  // 1) 挖洞必须仍让 collectIntNames 认出循环变量（否则 godrays 的 float(i) 丢失）
+  const godrays = hlsl2glsl(
+    "void main(){ vec4 a=vec4(0.0); const int n=30; const float d = n - 1; for (int i=0;i<n;++i){ a += vec4(1.0) * (i / d); } gl_FragColor=a; }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/float\(i\) \/ d/.test(godrays)) {
+    wireErrors.push("for 头挖洞后 collectIntNames 仍须认出循环变量（否则 i / float 不被改写）");
+  }
+  // 2) 回填必须早于「整型循环边界 float→int」那条规则
+  const bound = hlsl2glsl(
+    "uniform float u_It;\nvoid main(){ float s=0.0; for (int i = 0; i < u_It; i++) s+=1.0; gl_FragColor=vec4(s); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/i < int\(u_It\)/.test(bound)) {
+    wireErrors.push("for 头回填必须早于循环边界 float→int 规则（否则 i < u_Iterations 不再包 int()）");
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。
