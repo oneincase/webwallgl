@@ -194,8 +194,15 @@ const sidebarEl = $<HTMLElement>("#sidebar");
 
 let activeView: "explorer" | "docs" = "explorer";
 
+const VIEW_KEY = "we-bench-view";
+
 function setView(view: "explorer" | "docs") {
   activeView = view;
+  try {
+    localStorage.setItem(VIEW_KEY, view);
+  } catch {
+    /* 隐私模式 */
+  }
   const docs = view === "docs";
   sidebarEl.hidden = docs;
   logsEl.hidden = docs; // 渲染器日志只在壁纸（舞台）页显示
@@ -227,8 +234,16 @@ tabCurrentEl.onclick = () => setView("explorer");
 for (const img of document.querySelectorAll<HTMLImageElement>(".sponsor-qr-item img")) {
   img.addEventListener("error", () => img.closest(".sponsor-qr-item")?.setAttribute("hidden", ""));
 }
-  // 首次进入默认落在「使用说明」
-  setView("docs");
+  // 恢复上次活动栏视图；首次进入默认落在「使用说明」
+  {
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem(VIEW_KEY);
+    } catch {
+      /* 隐私模式 */
+    }
+    setView(saved === "explorer" ? "explorer" : "docs");
+  }
 renderDocs(docsBodyEl, getLang());
 
 // ---------- 类型筛选（scene / web / video 三选一） ----------
