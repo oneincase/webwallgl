@@ -115,8 +115,12 @@ const rw = await importRewrite();
   check(/export function packWebAudioArray/.test(webTs), "web.ts 必须导出 packWebAudioArray");
   check(/Float32Array\(128\)/.test(webTs), "音频数组长度必须为 128");
   check(
-    /export const WEB_SIM_AUDIO_GAIN = 0\.2/.test(webTs),
-    "网页模拟音频必须降增益（1748506393 splat 积分白屏；场景 GAIN=3.2 过热）",
+    /export const WEB_SIM_AUDIO_GAIN = /.test(webTs) && /export const WEB_SIM_AUDIO_GAMMA = /.test(webTs),
+    "网页模拟音频必须有增益与对比扩展指数两个常量",
+  );
+  check(
+    /preL64/.test(webTs) && /preR64/.test(webTs),
+    "网页驱动必须读未钳位频谱 preL64/preR64（钳位后波峰因数已被压平，1520828134 猫爪阈值永不成立）",
   );
   check(
     /WEB_AUDIO_PUMP_HZ = 30/.test(webTs) && /Math\.min\(Math\.max\(1, fps\), WEB_AUDIO_PUMP_HZ\)/.test(webTs),
@@ -127,13 +131,98 @@ const rw = await importRewrite();
     "空 file 必须下发（1747779570 typeof object 才 setSingleVideo；file:/// 改由 shim 改写）",
   );
   {
-    // 1748506393：floor(bass * 5 * 10) splat/回调。场景满幅 bass≈0.5 → 25 颗/拍会白屏；
-    // 增益 0.2 后 ≈5 颗。故意把增益改回 1 会让本断言仍绿，所以另用公式锁上限。
-    const gain = 0.2;
-    const sensitivity = 5;
-    const bassHot = 0.5 * gain;
-    const splats = Math.floor(bassHot * sensitivity * 10);
-    check(splats > 0 && splats <= 8, `网页模拟音频在 sensitivity=5 时每拍 splat 应 ≤8，实得 ${splats}`);
+    // 用真实模拟音频语料复算两类作者判定（不再用手写常量——手写常量在增益改动后仍会绿）。
+    const { createSimulatedAudio } = await import(
+      new URL("../renderer/vendor/we-scene/render/audio.js", import.meta.url)
+    );
+
+    const sim = createSimulatedAudio();
+    const N = 1920; // 64s @30Hz，覆盖完整 32s 段结构（含静音段）两轮
+    const dt = 1 / 30;
+    const frames = [];
+    let preOk = true;
+    for (let k = 0; k < N; k++) {
+      const s = sim.update(k * dt);
+      if (!(s.preL64 instanceof Float32Array) || !(s.preR64 instanceof Float32Array)) preOk = false;
+      frames.push({
+        preL: Float32Array.from(s.preL64 ?? []),
+        preR: Float32Array.from(s.preR64 ?? []),
+        silent: s.silent,
+      });
+    }
+    check(preOk, "模拟音频快照必须含未钳位 preL64/preR64（网页 gamma 扩展的输入）");
+
+    // web.ts 是 TS，verifier 里无法直接 import；按源码取两个常量自行复算同一公式
+    const gain = Number(/WEB_SIM_AUDIO_GAIN = ([\d.]+)/.exec(webTs)?.[1]);
+    const gamma = Number(/WEB_SIM_AUDIO_GAMMA = ([\d.]+)/.exec(webTs)?.[1]);
+    check(
+      Number.isFinite(gain) && Number.isFinite(gamma) && gamma > 1,
+      `增益/gamma 必须可解析且 gamma>1（对比扩展），实得 gain=${gain} gamma=${gamma}`,
+    );
+    const shape = (v) => (v > 0 ? Math.min(1, Math.pow(v, gamma) * gain) : 0);
+
+    // (a) 1520828134 Bongo Cat：任一 band 0..62（双声道）> 0.5 才换成敲击贴图
+    let tapFrames = 0;
+    let onsets = 0;
+    let prevOn = false;
+    let silentTaps = 0;
+    let silentFrames = 0;
+    for (const f of frames) {
+      let peak = 0;
+      for (let i = 0; i < 63; i++) {
+        const a = shape(f.preL[i]);
+        const b = shape(f.preR[i]);
+        if (a > peak) peak = a;
+        if (b > peak) peak = b;
+      }
+      const on = peak > 0.5;
+      if (on) tapFrames++;
+      if (on && !prevOn) onsets++;
+      prevOn = on;
+      if (f.silent) {
+        silentFrames++;
+        if (on) silentTaps++;
+      }
+    }
+    const tapsPerSec = onsets / (N * dt);
+    check(
+      tapsPerSec >= 0.8,
+      `1520828134 猫爪每秒敲击应 ≥0.8 次（曲目 112BPM≈1.87 拍/秒），实得 ${tapsPerSec.toFixed(2)}`,
+    );
+    check(
+      silentFrames > 0 && silentTaps === 0,
+      `静音段不得敲击（实得 ${silentTaps}/${silentFrames} 帧）`,
+    );
+
+    // (b) 1748506393 流体：bass=mean(band0..8 双声道)，splats=floor(bass*sens*10)，默认 sens=5
+    const SENS = 5;
+    let splatSum = 0;
+    const per = [];
+    for (const f of frames) {
+      let s = 0;
+      for (let i = 0; i <= 8; i++) s += shape(f.preL[i]) + shape(f.preR[i]);
+      const sp = Math.floor((s / 16) * SENS * 10);
+      per.push(sp);
+      splatSum += sp;
+    }
+    const splatsPerSec = (splatSum / N) * 30;
+    // 旧的「钳位 × 0.2」实测约 179 颗/秒且不白屏，以此为上界基准（留 15% 余量）
+    check(
+      splatsPerSec <= 206,
+      `1748506393 流体 splat 速率应 ≤206 颗/秒（旧上线值约 179，超过会重回积分白屏），实得 ${splatsPerSec.toFixed(0)}`,
+    );
+    // 峰值不能长时间贴满：1s 窗口累计有界
+    let worst1s = 0;
+    let cur = 0;
+    for (let i = 0; i < per.length; i++) {
+      cur += per[i];
+      if (i >= 30) cur -= per[i - 30];
+      if (i >= 29 && cur > worst1s) worst1s = cur;
+    }
+    check(
+      worst1s <= 700,
+      `流体最坏 1s 窗口 splat 累计应 ≤700（满幅 60Hz 约 3200 会白屏），实得 ${worst1s}`,
+    );
   }
   check(
     /now - frameClock\.last > 200/.test(webTs.replace(/\s+/g, " ")),

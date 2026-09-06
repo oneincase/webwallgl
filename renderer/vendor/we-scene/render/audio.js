@@ -83,6 +83,9 @@ export function createSimulatedAudio(seed = 20260830) {
   const BANDS = 64
   const rawL = new Float32Array(BANDS) // 包络后的 64 band
   const rawR = new Float32Array(BANDS)
+  // 未钳位（pre-GAIN）频谱，供网页驱动做 gamma 对比扩展
+  const preL64 = new Float32Array(BANDS)
+  const preR64 = new Float32Array(BANDS)
   // 输出快照（降采样视图共享 base band 的数据）
   const left64 = new Float32Array(BANDS)
   const right64 = new Float32Array(BANDS)
@@ -92,6 +95,14 @@ export function createSimulatedAudio(seed = 20260830) {
   const right16 = new Float32Array(16)
   const snapshot = {
     left64, right64, left32, right32, left16, right16,
+    /**
+     * 未钳位（pre-GAIN、pre-clamp）的 64 band，含左右声道 pan。
+     * left64/right64 是 `min(1, v*GAIN)` 之后的值：底鼓段基底就已到 ~0.6、峰值贴 1，
+     * 波峰因数被压平——网页作者按「峰值过阈值」判定敲击时（1520828134 猫爪
+     * `audioArray[i] > 0.5`），事后再乘任何标量都无法把基底与峰值分开。
+     * 网页驱动改对本数组做 gamma 对比扩展，音条墙仍走已标定的 left64/right64。
+     */
+    preL64, preR64,
     /** vumeter：整体响度 0..1（粒子 audioprocessing / 文字脚本 average 用） */
     level: 0,
     /** 渲染器诊断：当前是否处于「静音段」 */
@@ -152,6 +163,7 @@ export function createSimulatedAudio(seed = 20260830) {
       if (fq >= 0.45) v += hatV * 0.5 * ((fq - 0.45) / 0.55)
       v += riser * 0.5
       v *= tilt
+      const vPre = v // 钳位前留一份（网页 gamma 扩展用；场景路径不变）
       v = Math.min(1, v * GAIN)
       // 立体声：低频居中，高频宽（左右去相关）
       const width = 0.06 + fq * 0.2
@@ -162,6 +174,9 @@ export function createSimulatedAudio(seed = 20260830) {
       const floorV = silent ? 0.012 : 0
       rawL[i] = Math.max(floorV, l)
       rawR[i] = Math.max(floorV, r)
+      // pre 系列走同一 pan/底噪，只是不乘 GAIN、不钳 1（保留波峰因数）
+      preL64[i] = Math.max(floorV, Math.max(0, vPre * (1 - pan)))
+      preR64[i] = Math.max(floorV, Math.max(0, vPre * (1 + pan)))
       if (i < 48) levelSum += (rawL[i] + rawR[i]) * 0.5
     }
     left64.set(rawL)

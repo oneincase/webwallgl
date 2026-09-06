@@ -90,9 +90,27 @@ function packWebAudioArrayInto(
  * 场景 `createSimulatedAudio` 的 GAIN=3.2 是给 shader 音条（均值要到 0.5–0.8）
  * 标定的。网页 `wallpaperRegisterAudioListener` 拿到的是作者自己再乘的 0..1 FFT：
  * 1748506393 默认 `SOUND_SENSITIVITY=5` 做 `floor(bass*5*10)` splat 计数，
- * 满幅 × ~60Hz 会把 HDR 染料+bloom 打成白屏。0.2 ≈ WE 桌面 FFT 常见量级。
+ * 满幅 × ~60Hz 会把 HDR 染料+bloom 打成白屏。
+ *
+ * 但**只降增益是错的**：`left64` 已经过 `min(1, v*3.2)`，底鼓段基底就被抬到 ~0.6、
+ * 峰值贴 1，波峰因数被压平；事后乘 0.2 得到的是 0.03–0.2 的一团平泥，
+ * 谁也过不了阈值。1520828134 猫爪判定 `audioArray[i] > 0.5` 因此永不成立
+ * （实测 0/960 帧敲击），猫看起来「不会动」。
+ *
+ * 正解是对**未钳位**的 `preL64/preR64` 做 gamma 对比扩展再乘增益：
+ * 真实音乐 FFT 是尖的（底鼓瞬时接近 1、间隙 ~0.05），gamma>1 把基底压深、
+ * 峰值留住，同时满足「峰值过阈值」（猫）与「低频均值要小」（流体积分型）两类作者。
  */
-export const WEB_SIM_AUDIO_GAIN = 0.2;
+export const WEB_SIM_AUDIO_GAIN = 1.8;
+
+/**
+ * 网页模拟音频的对比扩展指数（作用在未钳位频谱上，见 WEB_SIM_AUDIO_GAIN）。
+ *
+ * 1.8 时 band2 的基底/峰值对比由 5.4× 拉到 ~21×：流体低频均值 splat 速率
+ * 与旧的「钳位×0.2」持平（约 178 vs 179 颗/秒），而猫每秒约 1.6 次敲击
+ * （曲目 112 BPM ≈ 1.87 拍/秒），静音段 0 次。
+ */
+export const WEB_SIM_AUDIO_GAMMA = 1.8;
 
 /** WE 网页音频回调大约 30Hz；更快会让积分型可视化（splat/粒子）过热 */
 export const WEB_AUDIO_PUMP_HZ = 30;
@@ -103,20 +121,42 @@ type WebAudioDriver = {
   tick?(nowMs: number): void;
 };
 
+/**
+ * 未钳位频段 → 网页 listener 的 0..1 FFT：gamma 对比扩展 + 增益。
+ * 单独导出供 verify-web 用真实语料复算猫/流体两类判定。
+ */
+export function shapeWebAudioBand(pre: number): number {
+  const v = Number(pre) || 0;
+  if (v <= 0) return 0;
+  return Math.min(1, Math.pow(v, WEB_SIM_AUDIO_GAMMA) * WEB_SIM_AUDIO_GAIN);
+}
+
 function defaultAudioDriver(): WebAudioDriver {
   const sim = audioMod.createSimulatedAudio();
   const left = new Float32Array(64);
   const right = new Float32Array(64);
-  const gain = WEB_SIM_AUDIO_GAIN;
   return {
     tick(nowMs: number) {
       sim.update(nowMs / 1000);
     },
     snapshot() {
-      const s = sim.snapshot;
+      const s = sim.snapshot as unknown as {
+        left64: ArrayLike<number>;
+        right64: ArrayLike<number>;
+        preL64?: ArrayLike<number>;
+        preR64?: ArrayLike<number>;
+      };
+      // 优先未钳位频谱；老快照（无 pre 系列）退回钳位值乘固定小增益，行为同旧版
+      const preL = s.preL64;
+      const preR = s.preR64;
       for (let i = 0; i < 64; i++) {
-        left[i] = (Number(s.left64[i]) || 0) * gain;
-        right[i] = (Number(s.right64[i]) || 0) * gain;
+        if (preL && preR) {
+          left[i] = shapeWebAudioBand(preL[i]);
+          right[i] = shapeWebAudioBand(preR[i]);
+        } else {
+          left[i] = (Number(s.left64[i]) || 0) * 0.2;
+          right[i] = (Number(s.right64[i]) || 0) * 0.2;
+        }
       }
       return { left, right };
     },
