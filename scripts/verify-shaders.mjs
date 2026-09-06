@@ -1030,6 +1030,126 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **一维数组下标是 float 时包 int()**：
+// `float index = floor(v_TexCoord.x * 64.0); … arr[index]` —— HLSL 隐式取整，
+// GLSL ES 报 `'[]' : integer expression required`（7 pass / 4 壁纸）。
+{
+  const g = hlsl2glsl(
+    "uniform float arr[64];\nvarying vec2 v_TexCoord;\nvoid main(){ float index = floor(v_TexCoord.x * 64.0); float a = arr[index]; gl_FragColor=vec4(a); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/arr\[int\(index\)\]/.test(g)) {
+    wireErrors.push("float 变量作数组下标必须包 int()（GLSL ES 要求整型下标）");
+  }
+  // 不得误伤：整数字面量下标 / 循环变量 / 已写 int() / 二维展平
+  const safe = [
+    ["整数字面量", "uniform float arr[8];\nvoid main(){ float v = arr[2]; gl_FragColor=vec4(v); }", /arr\[2\]/],
+    ["循环变量", "uniform float arr[8];\nvoid main(){ float s=0.0; for(int i=0;i<8;i++) s += arr[i]; gl_FragColor=vec4(s); }", /arr\[i\]/],
+    ["已写 int()", "uniform float arr[8];\nuniform float u_k;\nvoid main(){ float v = arr[int(u_k)]; gl_FragColor=vec4(v); }", /arr\[int\(u_k\)\]/],
+  ];
+  for (const [label, src, want] of safe) {
+    const s = hlsl2glsl(src, "frag", {}, () => null);
+    if (!want.test(s)) wireErrors.push(`数组下标不得被重复包裹（${label}）`);
+  }
+  // 二维 packed 下标展平仍须工作（10d 的既有能力）
+  const two = hlsl2glsl(
+    "uniform float g_AudioSpectrum64Left[64];\nvoid main(){ float b=1.0; float v = g_AudioSpectrum64Left[b/4][b%4]; gl_FragColor=vec4(v); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/\* 4 \+ int\(/.test(two)) {
+    wireErrors.push("float[64] 的二维 packed 下标展平不得被一维规则截断");
+  }
+}
+
+// [we-scene patch] **宏展开产生的相邻符号**：`-SHADOWMASK_HORIZGAPWIDTH` 而
+// `#define SHADOWMASK_HORIZGAPWIDTH -1.3` → `--1.3`。HLSL 按数值折叠（= +1.3）；
+// GLSL 把 `--` 当自减，报 `l-value required (can't modify a const)`（6 pass / 4 壁纸）。
+{
+  const g = hlsl2glsl(
+    "#define W -1.3\nfloat G(float x, float o){ return x+o; }\nvoid main(){ float v = G(0.5, -W); gl_FragColor=vec4(v); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (/--1\.3/.test(g)) {
+    wireErrors.push("宏展开出的 `--<数字>` 必须折叠成 +（GLSL 会当自减运算符）");
+  }
+  if (!/G\(0\.5, \+1\.3\)/.test(g)) {
+    wireErrors.push(`--1.3 应折叠成 +1.3，实得 ${(g.match(/G\([^)]*\)/) || ["?"])[0]}`);
+  }
+  // 真自增/自减与「减负号变量」不得被碰
+  const keep = [
+    ["自减 i--", "void main(){ float s=0.0; for(int i=8;i>0;i--) s+=1.0; gl_FragColor=vec4(s); }", /i--/],
+    ["自增 i++", "void main(){ float s=0.0; for(int i=0;i<8;i++) s+=1.0; gl_FragColor=vec4(s); }", /i\+\+/],
+    ["a - -b", "uniform float a,b;\nvoid main(){ float v = a - -b; gl_FragColor=vec4(v); }", /a - -b/],
+  ];
+  for (const [label, src, want] of keep) {
+    const s = hlsl2glsl(src, "frag", {}, () => null);
+    if (!want.test(s)) wireErrors.push(`真自增/自减与变量取负不得被折叠（${label}）`);
+  }
+}
+
+// [we-scene patch] **窄向量声明接更宽右值需截断** + **float x = int(...)**。
+// `vec3 albedo = texSample2D(...)`（cutout_vignette / shimmer，4 pass / 4 壁纸）；
+// `float iterations = int(u_iterations)`（blur_gaussian，4 pass / 2 壁纸，
+// 作者想取整，所以外面包 float() 而不是删掉 int()——删掉会改变数值与循环边界）。
+{
+  const g1 = hlsl2glsl(
+    "uniform sampler2D g_Texture0;\nvarying vec4 v_TexCoord;\nvoid main(){ vec3 albedo = texSample2D(g_Texture0, v_TexCoord.xy); gl_FragColor=vec4(albedo,1.0); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/vec3 albedo = \(texture\([^;]*\)\)\.xyz;/.test(g1)) {
+    wireErrors.push("vec3 x = texture(...) 必须截成 .xyz（GLSL ES 无 vec4→vec3 隐式转换）");
+  }
+  const g2 = hlsl2glsl(
+    "uniform float u_it;\nvoid main(){ float iterations = int(u_it); gl_FragColor=vec4(iterations); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/float iterations = float\(int\(u_it\)\);/.test(g2)) {
+    wireErrors.push("float x = int(...) 必须包 float() 保留取整语义（不能删掉 int()）");
+  }
+  // vec4 = texture 本来合法，不得多包
+  const g3 = hlsl2glsl(
+    "uniform sampler2D g_T;\nvarying vec2 uv;\nvoid main(){ vec4 a = texSample2D(g_T, uv); gl_FragColor=a; }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (/vec4 a = \(texture/.test(g3)) {
+    wireErrors.push("vec4 = texture(...) 同宽，不得被截断包裹");
+  }
+}
+
+// [we-scene patch] **宏只对它自己的 #define 行之后生效**（C 预处理器语义）。
+// light_map.frag 的 `#else` 分支有 `#define emitters 1.0`，而它**上方**的
+// `vec3 lightMap = CAST3(0.0), emitters;` 是变量声明。全文替换会把声明也换成
+// `…, 1.0` → `'1.0' : syntax error`，整个 light_map pass 被跳过（5 pass / 5 壁纸）。
+{
+  const src = [
+    "vec3 lightMap = vec3(0.0), emitters;",
+    "#define emitters 1.0",
+    "void main() {",
+    "  lightMap = lightMap * emitters;",
+    "  gl_FragColor = vec4(lightMap, 1.0);",
+    "}",
+  ].join("\n");
+  const g = hlsl2glsl(src, "frag", {}, () => null);
+  if (!/vec3 lightMap = vec3\(0\.0\), emitters;/.test(g)) {
+    wireErrors.push("#define 之前的同名标识符不得被宏替换（C 预处理器语义：宏只向后生效）");
+  }
+  if (!/lightMap \* 1\.0/.test(g)) {
+    wireErrors.push("#define 之后的引用仍须正常展开（不能因位置检查而整体失效）");
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。

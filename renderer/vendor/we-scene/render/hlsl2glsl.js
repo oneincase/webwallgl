@@ -230,6 +230,19 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   // 补 .0 的规则改写（`\u00010\u0001` → `\u00010.0\u0001`），回填时索引对不上，
   // `1e-6` 直接变成 `0.0` —— 比原缺陷更糟（静默算错，不报编译错）。
   // 改用一元记数：序号 n 编码成 n 个 \u0002，中间无数字可改。
+  // [we-scene patch] **宏展开产生的相邻符号规范化**：`--1.3` / `+-0.5` / `-+2.0`。
+  // 作者写 `Grille(uv.y, -SHADOWMASK_HORIZGAPWIDTH)`，而
+  // `#define SHADOWMASK_HORIZGAPWIDTH -1.3` —— 展开后拼成 `--1.3`。
+  // HLSL 预处理器按数值折叠（= +1.3）；GLSL 把 `--` 解析成自减运算符，报
+  // `'--' : l-value required (can't modify a const)`，整个 shadow_map pass 被跳过
+  // （6 pass / 4 壁纸）。
+  //
+  // 只处理**符号紧跟数字字面量**的情形：`a--b` 这类真自减/自增不能碰
+  // （要求第二个符号后紧跟数字，且第一个符号前不是标识符或右括号）。
+  code = code.replace(/(^|[^\w)\]])([+-])([+-])(?=[\d.])/g, (all, pre, s1, s2) =>
+    pre + (s1 === s2 ? '+' : '-'),
+  )
+
   const sciHoles = []
   code = code.replace(/\b\d+(?:\.\d+)?[eE][+-]?\d+\b/g, (m) => {
     sciHoles.push(m)
@@ -585,6 +598,20 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
           return `${pre}float ${name} = (${rhs.trim()}).x;`
         },
       )
+      // [we-scene patch] 同理：**窄向量声明接了更宽的右值**。
+      // `vec3 albedo = texSample2D(g_Texture0, uv);`（cutout_vignette / shimmer，
+      // 4 pass / 4 壁纸）—— texture 返回 vec4，HLSL 隐式取前 3 个分量，
+      // GLSL ES 报 `cannot convert from '4-component vector' to '3-component vector'`。
+      const SWN = { 2: 'xy', 3: 'xyz' }
+      code = code.replace(
+        /(^|[;{}\n]\s*)vec([23])\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g,
+        (all, pre, dim, name, rhs) => {
+          const lw = Number(dim)
+          const rw = vecW(rhs)
+          if (rw <= lw) return all
+          return `${pre}vec${dim} ${name} = (${rhs.trim()}).${SWN[lw]};`
+        },
+      )
     }
     // 9b) **标量 → 向量广播**：HLSL `vec2 a; a = pow(...);` 把 float 复制到每个分量，
     //    GLSL ES 报 dimension mismatch。3789816832 的 sine_wave 就是
@@ -735,6 +762,18 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   code = code.replace(
     new RegExp(`\\bint\\s+([A-Za-z_]\\w*)\\s*=\\s*((?:${FLOAT_FNS})\\s*\\()`, 'g'),
     'float $1 = $2',
+  )
+
+  // 10b-1b) [we-scene patch] **`float x = int(...)`**：方向与 10b 相反。
+  //    blur_gaussian.frag 写 `float iterations = int(u_iterations);`（u_iterations 是
+  //    带 "int":true 标记的 float uniform，作者想取整）。GLSL ES 报
+  //    `cannot convert from 'int' to 'float'`，整个模糊 pass 被跳过（4 pass / 2 壁纸）。
+  //    作者的取整意图要保留，所以外面再包一层 float()，而不是把 int() 删掉 ——
+  //    删掉会改变数值（8.7 → 8.7 而非 8），后面 `for (int i = -iterations; …)` 的
+  //    边界跟着变。
+  code = code.replace(
+    /\bfloat\s+([A-Za-z_]\w*)\s*=\s*(int\s*\([^;]*\))\s*;/g,
+    'float $1 = float($2);',
   )
 
   // 10b-2) [we-scene patch] **float 声明 = 纯整型表达式**（不只是字面量）。
@@ -895,6 +934,26 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         let p = close1 + 1
         while (p < code.length && /[ \t]/.test(code[p])) p++
         if (code[p] !== '[') {
+          // [we-scene patch] **一维下标是 float 表达式时包 int()**。
+          // `float index = floor(v_TexCoord.x * 64.0); … arr[index]` —— HLSL 隐式
+          // 取整，GLSL ES 报 `'[]' : integer expression required`，整个 pass 被跳过
+          // （audio_buffer_accumulation / audio_caps_state，7 pass / 4 壁纸）。
+          // 判据：下标含小数点、或整段是本文件声明为 float 的单一标识符。
+          // 已经写成 int(...) / 纯整数字面量 / 循环变量的不动。
+          const e1 = code.slice(open1 + 1, close1)
+          const t = e1.trim()
+          const isFloatish =
+            /\d\.\d/.test(t) ||
+            /^[A-Za-z_]\w*$/.test(t) &&
+              new RegExp('\\bfloat\\s+' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(code)
+          const alreadyInt = /^\s*int\s*\(/.test(t) || /^-?\d+$/.test(t)
+          if (isFloatish && !alreadyInt) {
+            out += code.slice(last, fm.index)
+            out += fm[1] + '[int(' + t + ')]'
+            last = close1 + 1
+            re.lastIndex = last
+            continue
+          }
           re.lastIndex = close1 + 1
           continue
         }

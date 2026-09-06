@@ -106,12 +106,25 @@ function expandMacrosIn(text, depth) {
     const { defs, fns } = collectMacros(text)
     if (defs.size === 0 && fns.size === 0) break
     const lines = text.split('\n')
+    // [we-scene patch] **宏只对它自己的 #define 行之后生效**（C 预处理器语义）。
+    // 之前是全文替换，于是 light_map.frag 里 `#else` 分支的 `#define emitters 1.0`
+    // 把它**上方**第 28 行的变量声明 `vec3 lightMap = CAST3(0.0), emitters;`
+    // 也换成了 `…, 1.0`，ANGLE 报 `'1.0' : syntax error`，整个 light_map pass
+    // 被跳过（5 pass / 5 壁纸）。作者写法完全合法：声明在前、宏在后，
+    // 宏本意只是让后面那句 `* emitters` 变成 `* 1.0`。
+    const defLine = new Map()
+    for (let i = 0; i < lines.length; i++) {
+      const dm = /^[ \t]*#define[ \t]+([A-Za-z_][A-Za-z0-9_]*)/.exec(lines[i])
+      if (dm && !defLine.has(dm[1])) defLine.set(dm[1], i)
+    }
     let changed = false
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
       if (/^[ \t]*#/.test(line)) continue
       let l = line
       for (const [name, val] of defs) {
+        const dl = defLine.get(name)
+        if (dl !== undefined && i < dl) continue
         const re = new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b')
         if (re.test(l)) {
           l = replaceWord(l, name, val)
@@ -119,6 +132,8 @@ function expandMacrosIn(text, depth) {
         }
       }
       for (const [name, info] of fns) {
+        const dl = defLine.get(name)
+        if (dl !== undefined && i < dl) continue
         if (l.includes(name)) {
           l = expandFunctionMacro(l, name, info, depth)
           changed = true
