@@ -330,6 +330,30 @@
   };
 
   // —— PropertyListener（getter/setter；回调延后到微任务，见 afterAssign）——
+  // 官方在页面加载完成后才发全量属性/暂停状态；首屏脚本（body onLoad=init 等）常
+  // 假设属性到达时 DOM/场景已初始化（827982449：applyUserProperties→cl() 在 load 前
+  // 跑会撞上未创建的 scene/material）。未加载完成时等 window load + 一个宏任务
+  // （保证排在 onLoad 属性处理器之后），已加载完成则微任务即发。
+  function whenPageReady(fn) {
+    var ready = "complete";
+    try {
+      ready = w.document.readyState;
+    } catch (_) {
+      /* 忽略 */
+    }
+    if (ready === "complete") {
+      afterAssign(fn);
+      return;
+    }
+    try {
+      w.addEventListener("load", function () {
+        // setTimeout 保证排在 load 同步链（onLoad 处理器）之后
+        w.setTimeout(fn, 0);
+      }, { once: true });
+    } catch (_) {
+      afterAssign(fn);
+    }
+  }
   Object.defineProperty(w, "wallpaperPropertyListener", {
     configurable: true,
     enumerable: true,
@@ -345,7 +369,7 @@
       // 渲染体里重新赋值（新对象字面量），若每次都补 setPaused 会形成
       // 渲染 → 赋值 → 补发 setState → 再渲染 的微任务死循环（点下一曲整页卡死）。
       if (prev) return;
-      afterAssign(function () {
+      whenPageReady(function () {
         flushPending();
         callApplyGeneralProperties({ fps: fps });
         callSetPaused(paused);
@@ -527,12 +551,51 @@
 
   // —— 父页控制面 ——
   // 官方 setPaused 只在暂停状态实际变化时调用一次；重复调用去重。
+  // 暂停还要冻结页内媒体：官方是进程级冻结（无声、解码器可回收），作者的
+  // setPaused 常只管自己的逻辑。只记录「我们代为暂停」的元素，恢复时仅还原这部分，
+  // 不碰作者自己暂停的。
+  var weFrozenMedia = [];
+  function freezePageMedia() {
+    weFrozenMedia.length = 0;
+    try {
+      var nodes = w.document.querySelectorAll("audio,video");
+      for (var i = 0; i < nodes.length; i++) {
+        if (!nodes[i].paused) {
+          weFrozenMedia.push(nodes[i]);
+          try {
+            nodes[i].pause();
+          } catch (_) {
+            /* 忽略 */
+          }
+        }
+      }
+    } catch (_) {
+      /* 忽略 */
+    }
+  }
+  function thawPageMedia() {
+    for (var i = 0; i < weFrozenMedia.length; i++) {
+      try {
+        var p = weFrozenMedia[i].play();
+        if (p && p.catch) p.catch(function () {});
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
+    weFrozenMedia.length = 0;
+  }
   w.__weSetPaused = function (v) {
     var next = !!v;
     if (next === paused) return;
     paused = next;
-    callSetPaused(paused);
-    if (!paused) resumeTimers();
+    if (paused) {
+      callSetPaused(true);
+      freezePageMedia();
+    } else {
+      callSetPaused(false);
+      thawPageMedia();
+      resumeTimers();
+    }
   };
 
   w.__weSetFps = function (n) {

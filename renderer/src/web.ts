@@ -58,12 +58,25 @@ export function injectGpuThrottle(rt: Runtime, f: HTMLIFrameElement, _doc: Docum
   }
 }
 
-/** 左64+右64 → WE 网页 API 的 128 元数组 */
+/** 左64+右64 → WE 网页 API 的 128 元数组。
+ *  公共 API 版：每次新分配（调用方可能持有结果）。
+ *  音频泵（30Hz）走 packWebAudioArrayInto 复用模块级缓冲，避免每帧 GC 碎屑。 */
 export function packWebAudioArray(
   left: ArrayLike<number>,
   right: ArrayLike<number>,
 ): Float32Array {
   const out = new Float32Array(128);
+  packWebAudioArrayInto(out, left, right);
+  return out;
+}
+
+const pumpBuffer = new Float32Array(128);
+
+function packWebAudioArrayInto(
+  out: Float32Array,
+  left: ArrayLike<number>,
+  right: ArrayLike<number>,
+): Float32Array {
   const nL = Math.min(64, left.length);
   const nR = Math.min(64, right.length);
   for (let i = 0; i < nL; i++) out[i] = Number(left[i]) || 0;
@@ -340,7 +353,7 @@ function startAudioPump(
     try {
       driver.tick?.(now);
       const snap = driver.snapshot();
-      const arr = packWebAudioArray(snap.left, snap.right);
+      const arr = packWebAudioArrayInto(pumpBuffer, snap.left, snap.right);
       weShimCall(rt, (w) => w.__wePushAudio?.(arr));
       // 作者用 setTimeout 主循环时 shim 收不到 rAF we-frame（1748506393 FPS 为 `-`）
       if (frameClock && now - frameClock.last > 200) markFrame(rt, now);
@@ -427,12 +440,20 @@ function projectPropertiesToWire(project: unknown): Record<string, { value: unkn
   const out: Record<string, { value: unknown }> = {};
   for (const [name, def] of Object.entries(props)) {
     if (!def || typeof def !== "object" || typeof (def as { type?: unknown }).type !== "string") continue;
-    if (!("value" in def)) continue;
-    const raw = (def as { value: unknown }).value;
-    if (raw === null || raw === undefined) continue;
     // 空 file 也要下发：作者常用 `'object' == typeof p[name]` 才进 setSingleVideo
     // （1747779570 随即硬编码 files/wallpaper.webm）。`url("file:///"+value)` 变成
     // file:/// 由 shim 改写，不要在这里 continue 跳过。
+    // 无 value 键的 file/directory 同样按 "" 下发：官方全量属性表总是含 value
+    // （827982449 作者直接 `properties.customimage.value = ""`，缺对象即 TypeError）。
+    const raw = (def as { value?: unknown }).value;
+    const type = (def as { type: string }).type.toLowerCase();
+    if (raw === null || raw === undefined) {
+      if (type === "file" || type === "directory") {
+        out[name] = { value: "" };
+        continue;
+      }
+      if (!("value" in (def as object))) continue;
+    }
     out[name] = { value: raw };
   }
   return out;

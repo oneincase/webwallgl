@@ -43,13 +43,64 @@ export const SYSTEM_FONT_FAMILIES: Record<string, string> = {
   systemfont_simhei: "SimHei, 'Heiti SC', sans-serif",
 };
 
-// 字体族缓存：FontFace 以 family 名注册进 document.fonts，跨重挂复用避免同名重复注册
-export const fontFaceCache = new Map<string, string>(); // "itemId|fontPath" → CSS family
+// 字体族缓存：FontFace 以 family 名注册进 document.fonts，跨重挂复用避免同名重复注册。
+// refs = 正在使用的挂载数：clear 时逐键减一，归零才从 document.fonts 释放——
+// 带内嵌字体的壁纸各存几十 KB~几 MB，只增不清会在多壁纸轮播场景无界累积。
+export const fontFaceCache = new Map<string, { family: string; refs: number }>();
+
+/** djb2：family 名里嵌 key 哈希，防不同壁纸同文件名字体共族误删 */
+function fontKeyHash(key: string): string {
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) h = ((h << 5) + h + key.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+/** 逐键减引用；归零才从 document.fonts 删除该族的全部 FontFace 并清缓存键 */
+function releaseFontFaces(keys: string[]) {
+  for (const key of keys) {
+    const entry = fontFaceCache.get(key);
+    if (!entry) continue;
+    entry.refs--;
+    if (entry.refs > 0) continue;
+    fontFaceCache.delete(key);
+    try {
+      const dead: FontFace[] = [];
+      document.fonts.forEach((f) => {
+        if (f.family === entry.family) dead.push(f);
+      });
+      for (const f of dead) document.fonts.delete(f);
+    } catch {
+      /* document.fonts 不可用（老 WebView）就交给 GC */
+    }
+  }
+}
 
 /** 按缓存键缓存已解析的 scene.pkg。暂停恢复 / 改属性不再走网络与解析；
- *  真换壁纸最多留 2 份，避免多张百 MB 包常驻。
+ *  上限「≤2 份且总字节 ≤512MB」：解析后的包（条目字节+模型/动画）单份可达数百 MB，
+ *  只按份数上限会让两张巨包常驻 GB 级堆；超限从最旧淘汰（当前键除外）。
  *  键来自 Source.key（HTTP 源即 baseUrl，与旧的 mediaBase/itemId 等价）。 */
 const pkgCache = new Map<string, { parsed: any; at: number }>();
+const PKG_CACHE_MAX_BYTES = 512 * 1024 * 1024;
+let pkgCacheBytes = 0;
+
+function pkgCacheEvict(currentKey: string) {
+  while (pkgCache.size > 0 && (pkgCache.size > 2 || pkgCacheBytes > PKG_CACHE_MAX_BYTES)) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const [k, v] of pkgCache) {
+      if (k === currentKey) continue;
+      if (v.at < oldestAt) {
+        oldestAt = v.at;
+        oldestKey = k;
+      }
+    }
+    // 只剩当前键还超限：放着（正在用的那一份不能被自己挤掉）
+    if (!oldestKey) break;
+    const victim = pkgCache.get(oldestKey)!;
+    pkgCacheBytes -= victim.parsed.fileSize || 0;
+    pkgCache.delete(oldestKey);
+  }
+}
 
 async function loadParsedPkg(
   rt: Runtime,
@@ -78,18 +129,8 @@ async function loadParsedPkg(
   const parsed = pkg.parsePkg(bytes);
   if (!cacheKey) return parsed;
   pkgCache.set(cacheKey, { parsed, at: Date.now() });
-  if (pkgCache.size > 2) {
-    let oldestKey: string | null = null;
-    let oldestAt = Infinity;
-    for (const [k, v] of pkgCache) {
-      if (k === cacheKey) continue;
-      if (v.at < oldestAt) {
-        oldestAt = v.at;
-        oldestKey = k;
-      }
-    }
-    if (oldestKey) pkgCache.delete(oldestKey);
-  }
+  pkgCacheBytes += parsed.fileSize || 0;
+  pkgCacheEvict(cacheKey);
   return parsed;
 }
 
@@ -1620,8 +1661,9 @@ cfg, source, pkgAbort.signal);
         const win0 = fitWindow(normalizeFit(rt.cfg.fit), projW, projH, c.width, c.height);
         const quality = Math.min(3, Math.max(0.5, c.width / Math.max(1, win0.viewW)));
         // 用户属性：与对象脚本 / 效果常量共用 liveUserProps（见 parseScene 之后）
-        // 字体：pkg 内嵌 ttf/otf → FontFace（跨重挂缓存）；systemfont_* → 系统字体栈
+        // 字体：pkg 内嵌 ttf/otf → FontFace（refs 计数，clear 归零释放）；systemfont_* → 系统字体栈
         const fontFamilies = new Map<string, string>(); // fontPath → CSS family
+        const usedFontKeys: string[] = []; // 本次挂载引入的缓存键（cleanup 时 refs--）
         const fontPaths = new Set<string>();
         for (const l of scene.layers as any[]) if (l.isText && l.textFont) fontPaths.add(l.textFont);
         // 脚本可能在 applyUserProperties 里把 font 切到包内其它字体（3396722575 有 18 个）。
@@ -1630,9 +1672,12 @@ cfg, source, pkgAbort.signal);
           if (typeof e.name === "string" && /^fonts\/.+\.(ttf|otf|woff2?)$/i.test(e.name)) fontPaths.add(e.name);
         }
         for (const fp of fontPaths) {
-          const cached = fontFaceCache.get(`${cfg.src}|${fp}`);
+          const key = `${cfg.src}|${fp}`;
+          const cached = fontFaceCache.get(key);
           if (cached) {
-            fontFamilies.set(fp, cached);
+            cached.refs++;
+            usedFontKeys.push(key);
+            fontFamilies.set(fp, cached.family);
             continue;
           }
           const sys = SYSTEM_FONT_FAMILIES[fp.toLowerCase()];
@@ -1647,17 +1692,32 @@ cfg, source, pkgAbort.signal);
             const bytes = sanitizeFontForBrowser(
               fe instanceof Uint8Array ? fe : new Uint8Array(fe as ArrayBuffer),
             );
-            const fam = "wefont_" + fp.split("/").pop()!.replace(/[^a-zA-Z0-9]/g, "_");
+            // family 带 key 哈希：不同壁纸同文件名字体不共族，释放时按 family 删不误伤
+            const fam = "wefont_" + fontKeyHash(key) + "_" + fp.split("/").pop()!.replace(/[^a-zA-Z0-9]/g, "_");
             const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
             const ff = new FontFace(fam, `url(${url})`);
             await ff.load();
+            if (disposed) {
+              // 挂载中途被切走：不注册进 document.fonts，URL 也归当前实例后续 clear 处理
+              URL.revokeObjectURL(url);
+              break;
+            }
             document.fonts.add(ff);
             (rt.objectUrls ??= []).push(url);
             fontFamilies.set(fp, fam);
-            fontFaceCache.set(`${cfg.src}|${fp}`, fam);
+            fontFaceCache.set(key, { family: fam, refs: 1 });
+            usedFontKeys.push(key);
           } catch (e) {
             console.warn(`字体加载失败 ${fp}: ${(e as Error).message}`);
           }
+        }
+        if (usedFontKeys.length) {
+          // 链上字体释放：clear(rt) 时逐键 refs--，归零才从 document.fonts 删
+          const prevCleanup = rt.sceneCleanup;
+          rt.sceneCleanup = () => {
+            releaseFontFaces(usedFontKeys);
+            prevCleanup?.();
+          };
         }
         // 共享离屏画布：同一时刻只画/传一个挂件，尺寸按需调整
         textCanvas = document.createElement("canvas");

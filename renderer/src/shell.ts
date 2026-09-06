@@ -142,6 +142,15 @@ function setupFullscreen(rt: Runtime) {
 })();
 
 export function clear(rt: Runtime) {
+  // iframe 先导航走再移除：WKWebView 对带活动文档的 iframe 回收迟缓，
+  // 置空 src 促发文档立即拆毁（网页壁纸大堆内存随文档释放）
+  if (rt.iframe) {
+    try {
+      rt.iframe.contentWindow?.location.replace("about:blank");
+    } catch {
+      /* 跨源/已 detach 忽略 */
+    }
+  }
   // 全屏 wrap：一把清空。库形态无 wrap：只摘自己挂的 iframe，不碰调用方容器其它子节点。
   if (rt.wrap) {
     rt.wrap.innerHTML = "";

@@ -158,10 +158,15 @@ const rw = await importRewrite();
 
 // ---------- 3. shim 行为 ----------
 function runShim(extras) {
+  const loadHandlers = [];
   const win = {
     URL,
     location: { href: "http://localhost:1430/", protocol: "http:" },
     document: {
+      readyState: "complete",
+      addEventListener(_type, fn) {
+        loadHandlers.push(fn);
+      },
       documentElement: {
         setAttribute() {},
         getAttribute() {
@@ -207,11 +212,12 @@ function runShim(extras) {
   if (extras) Object.assign(win, extras);
   win.window = win;
   vm.runInNewContext(shimSrc, win);
-  return win;
+  return { win, loadHandlers };
 }
 
 {
-  const win = runShim();
+  let win;
+  ({ win } = runShim());
   check(
     typeof win.wallpaperRegisterAudioListener === "function",
     "shim 应暴露 wallpaperRegisterAudioListener",
@@ -236,6 +242,44 @@ function runShim(extras) {
     "PropertyListener 赋值后微任务应 flush 挂起属性",
   );
 
+  // 827982449：官方在页面加载完成后才发全量属性；页面未加载完成时补发须等 load
+  // （+一个宏任务，保证排在 onLoad 处理器之后），否则作者初始化代码会撞上未就绪 DOM。
+  {
+    const loadHandlers2 = [];
+    const { win: win3 } = runShim({
+      addEventListener(_type, fn) {
+        loadHandlers2.push(fn);
+      },
+      document: {
+        readyState: "loading",
+        addEventListener(_type, fn) {
+          loadHandlers2.push(fn);
+        },
+        documentElement: { setAttribute() {}, getAttribute() { return null; } },
+        querySelectorAll() {
+          return [];
+        },
+      },
+    });
+    const got = { props: null, paused: null };
+    win3.__weSeedProps({ snow: { value: 200 } });
+    win3.wallpaperPropertyListener = {
+      applyUserProperties(p) {
+        got.props = p;
+      },
+      setPaused(v) {
+        got.paused = v;
+      },
+    };
+    await Promise.resolve();
+    check(got.props === null && got.paused === null, "页面 loading 期间不得提前补发属性");
+    for (const fn of loadHandlers2.splice(0)) fn();
+    check(
+      got.props && got.props.snow && got.props.snow.value === 200 && got.paused === false,
+      "load 后（宏任务）应补发属性与暂停状态",
+    );
+  }
+
   let second = null;
   win.wallpaperPropertyListener = {
     applyUserProperties(p) {
@@ -251,7 +295,7 @@ function runShim(extras) {
   // setter 若每次都补发 setPaused/applyGeneralProperties，会形成
   // 渲染 → 赋值 → 微任务补发 setState → 再渲染 的死循环（实测 2 秒 6.6 万次渲染）。
   {
-    const win2 = runShim();
+    const { win: win2 } = runShim();
     let pausedCalls = 0;
     let generalCalls = 0;
     const makeListener = () => ({
@@ -281,7 +325,7 @@ function runShim(extras) {
 
   // ---------- 官方暂停/恢复：setPaused 仅状态变化时调用一次 + 暂停冻结定时器 ----------
   {
-    const win = runShim();
+    const { win } = runShim();
     const ran = [];
     let pausedCalls = 0;
     win.__weSetPaused(true);
@@ -311,6 +355,31 @@ function runShim(extras) {
       ran.length === 1 && ran[0] === "held-i",
       "恢复后挂起 interval 应启动、已取消的 timeout 不跑",
     );
+  }
+
+  // ---------- 暂停冻结页内媒体：只冻结我们在场的，恢复只还原这部分 ----------
+  {
+    const media = [
+      { paused: false, playCalls: 0, pauseCalls: 0, play() { this.playCalls++; this.paused = false; }, pause() { this.pauseCalls++; this.paused = true; } },
+      { paused: true, playCalls: 0, pauseCalls: 0, play() { this.playCalls++; this.paused = false; }, pause() { this.pauseCalls++; this.paused = true; } },
+    ];
+    const { win } = runShim({
+      document: {
+        readyState: "complete",
+        addEventListener() {},
+        documentElement: { setAttribute() {}, getAttribute() { return null; } },
+        querySelectorAll(sel) {
+          return sel === "audio,video" ? media : [];
+        },
+      },
+    });
+    win.__weSetPaused(true);
+    check(media[0].paused && media[0].pauseCalls === 1, "播放中的媒体应被代为暂停");
+    check(media[1].pauseCalls === 0, "作者已暂停的媒体不得重复操作");
+    win.__weSetPaused(false);
+    await Promise.resolve();
+    check(media[0].paused === false && media[0].playCalls === 1, "恢复时只还原我们代为暂停的媒体");
+    check(media[1].paused === true && media[1].playCalls === 0, "作者自己暂停的不得被唤醒");
   }
 
   let audioHits = 0;
@@ -367,7 +436,7 @@ function runShim(extras) {
         this.__rawMuted = v;
       },
     });
-    const win = runShim({
+    const { win } = runShim({
       HTMLMediaElement: FakeMedia,
       WeakRef,
       Audio: function (src) {
