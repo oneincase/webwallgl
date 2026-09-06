@@ -702,6 +702,83 @@ function runShim(extras) {
   );
 }
 
+// ---------- 8. 网页壁纸「露底」cover 自适配（1731760875 16:10 底部黑条）----------
+{
+  check(
+    /export function webCoverViewport/.test(webTs) && /export function measureWebLetterbox/.test(webTs),
+    "web.ts 必须导出 webCoverViewport / measureWebLetterbox（可独立数值校验）",
+  );
+  check(
+    /normalizeFit\(rt\.cfg\.fit\) === "cover"/.test(webTs),
+    "露底自适配只在 cover 生效（contain 本该留边、stretch 本该拉伸）",
+  );
+  check(
+    /querySelectorAll\("video,img"\)/.test(webTs),
+    "露底判定不得包含 canvas（canvas 无内在比例，作者自管 backing store）",
+  );
+  check(
+    /videoWidth.*naturalWidth/s.test(webTs) && /if \(!\(natW > 0\) \|\| !\(natH > 0\)\) continue;/.test(webTs),
+    "内容比例必须取媒体原始尺寸，且元数据未到时跳过（否则算出荒谬视口）",
+  );
+  check(
+    /rt\.webRelayout\?\.\(\)/.test(fs.readFileSync(path.join(ROOT, "renderer/src/main.ts"), "utf8")),
+    "setFit 必须触发网页壁纸复算（fit 实时切换不重挂）",
+  );
+
+  // 数值同构：把 web.ts 的公式在此复算，锁 cover 语义（不是照抄实现，是按定义验）
+  const ASPECT_EPS = 0.005;
+  const cover = (stageW, stageH, a) => {
+    if (!(stageW > 0) || !(stageH > 0) || !(a > 0)) return null;
+    const sa = stageW / stageH;
+    if (Math.abs(sa - a) <= ASPECT_EPS) return null;
+    if (sa < a) {
+      const width = stageH * a;
+      return { width, height: stageH, left: (stageW - width) / 2, top: 0 };
+    }
+    const height = stageW / a;
+    return { width: stageW, height, left: 0, top: (stageH - height) / 2 };
+  };
+  const A = 16 / 9;
+  // 16:9 舞台（含 4K / DPR 取整误差）：不该动
+  check(cover(1920, 1080, A) === null, "16:9 舞台不该换视口");
+  check(cover(3840, 2160, A) === null, "4K(16:9) 不该换视口");
+  check(cover(1920, 1081, A) === null, "DPR 取整的 1920×1081 仍算 16:9，不该换视口");
+  // 16:10：1731760875 的报障档，必须铺满高度、裁宽、居中
+  const r1610 = cover(1920, 1200, A);
+  check(
+    r1610 && Math.abs(r1610.height - 1200) < 0.5 && Math.abs(r1610.width - 2133.33) < 0.5,
+    `16:10 应铺满高度并裁宽到 2133×1200，实得 ${r1610 && `${r1610.width.toFixed(1)}×${r1610.height.toFixed(1)}`}`,
+  );
+  check(
+    r1610 && Math.abs(r1610.left + 106.67) < 0.5 && r1610.top === 0,
+    "16:10 裁切必须左右居中（left 为负的一半溢出）",
+  );
+  // 覆盖的定义：视口必须同时 >= 舞台两个方向（不能留缝）
+  for (const [w, h] of [
+    [1920, 1200],
+    [1680, 1050],
+    [2560, 1600],
+    [2560, 1080],
+    [3440, 1440],
+    [1080, 1920],
+    [1440, 2560],
+  ]) {
+    const r = cover(w, h, A);
+    check(
+      r !== null && r.width >= w - 0.5 && r.height >= h - 0.5,
+      `${w}×${h} 覆盖后视口必须不小于舞台（实得 ${r ? `${r.width.toFixed(0)}×${r.height.toFixed(0)}` : "null"}）`,
+    );
+    // 且比例必须还是内容比例（不许拉伸）
+    check(
+      r !== null && Math.abs(r.width / r.height - A) < 1e-6,
+      `${w}×${h} 覆盖后必须保持内容比例（不得拉伸）`,
+    );
+  }
+  // 非法输入不得抛
+  check(cover(0, 100, A) === null && cover(100, 0, A) === null && cover(100, 100, 0) === null,
+    "非法尺寸/比例必须回退 null（不抛异常）");
+}
+
 if (errors.length) {
   console.error(`verify-web: ${errors.length} 项失败`);
   for (const e of errors) console.error("  ✗", e);

@@ -222,6 +222,8 @@ window.__wp = {
   setFit(fit: string) {
     rt.cfg.fit = fit as WallpaperFit;
     resetCoverAlign(rt);
+    // 网页壁纸：cover 才做露底自适配，contain/stretch 回满视口（实时切换，不重挂）
+    rt.webRelayout?.();
     // DOM 回退路径（无 WebGL2）才需要改 object-fit；走场景引擎时 fit 由渲染循环
     // 每帧读 rt.cfg.fit 传给 fitWindow，无需重挂载即可实时切换
     const obj = rt.video ?? rt.img;

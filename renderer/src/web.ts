@@ -2,6 +2,7 @@
 import {
   clear,
   markFrame,
+  normalizeFit,
   reportDiag,
   type Runtime,
 } from "./shell";
@@ -197,6 +198,98 @@ function buildSeedScript(
   return parts.join("\n");
 }
 
+/**
+ * 挂上「露底才换视口」的自适配：iframe 默认 100%×100%，只有量到黑条才改成覆盖式视口。
+ *
+ * 复算时机：视口尺寸变化（resize/切分辨率）、fit 切换、媒体元数据到达（视频要先知道
+ * 原始比例）。作者脚本可能晚于 load 才插入 video，所以 load 后再补几拍。
+ */
+function installLetterboxFix(rt: Runtime, f: HTMLIFrameElement, container: HTMLElement) {
+  const BASE = "position:absolute;border:none;background:transparent;";
+  const applyFull = () => {
+    f.style.cssText = BASE + "inset:0;width:100%;height:100%;";
+  };
+  applyFull();
+
+  let lastKey = "";
+  const relayout = () => {
+    if (!f.isConnected) return;
+    let doc: Document | null = null;
+    try {
+      doc = f.contentDocument;
+    } catch {
+      return; // 跨源：交给作者页面自己，不动
+    }
+    if (!doc) return;
+
+    const stageW = container.clientWidth || window.innerWidth || 0;
+    const stageH = container.clientHeight || window.innerHeight || 0;
+    // 非 cover（contain/stretch）保持旧行为：contain 本就该留边，stretch 该拉伸
+    const cover = normalizeFit(rt.cfg.fit) === "cover";
+    // 量之前必须先回到满视口，否则量到的是上一次裁剪后的盒子（自反馈会锁死）
+    applyFull();
+    const box = cover && stageW > 0 && stageH > 0 ? measureWebLetterbox(doc) : null;
+    const vp = box ? webCoverViewport(stageW, stageH, box.contentAspect) : null;
+    const key = vp ? `${Math.round(vp.width)}x${Math.round(vp.height)}` : "full";
+    if (!vp) {
+      lastKey = "full";
+      return; // 已满视口
+    }
+    f.style.cssText =
+      BASE +
+      `left:${vp.left}px;top:${vp.top}px;width:${vp.width}px;height:${vp.height}px;`;
+    if (key !== lastKey) {
+      lastKey = key;
+      reportDiag(
+        rt,
+        rt.cfg,
+        `网页壁纸露底自适配：视口按内容比例改为 ${Math.round(vp.width)}×${Math.round(vp.height)}（cover 居中裁切）`,
+      );
+    }
+  };
+
+  const onResize = () => relayout();
+  window.addEventListener("resize", onResize);
+  let ro: ResizeObserver | undefined;
+  if (typeof ResizeObserver !== "undefined") {
+    ro = new ResizeObserver(() => relayout());
+    ro.observe(container);
+  }
+  // 视频/图片的原始比例要等元数据；作者也可能晚插入元素，load 后补几拍
+  const timers: number[] = [];
+  const onLoad = () => {
+    relayout();
+    for (const d of [120, 400, 1200]) timers.push(window.setTimeout(relayout, d));
+    try {
+      const doc = f.contentDocument;
+      if (doc) {
+        for (const el of doc.querySelectorAll("video,img")) {
+          el.addEventListener("loadedmetadata", relayout, { once: true });
+          el.addEventListener("load", relayout, { once: true });
+        }
+      }
+    } catch {
+      /* 跨源忽略 */
+    }
+  };
+  f.addEventListener("load", onLoad);
+  rt.webRelayout = relayout;
+
+  const prev = rt.sceneCleanup;
+  rt.sceneCleanup = () => {
+    window.removeEventListener("resize", onResize);
+    ro?.disconnect();
+    for (const t of timers) clearTimeout(t);
+    f.removeEventListener("load", onLoad);
+    if (rt.webRelayout === relayout) rt.webRelayout = undefined;
+    try {
+      prev?.();
+    } catch {
+      /* 忽略 */
+    }
+  };
+}
+
 function attachIframe(
   rt: Runtime,
   cfg: WallpaperConfig,
@@ -218,6 +311,7 @@ function attachIframe(
   if (opts.blobUrl) {
     (rt.objectUrls ??= []).push(opts.blobUrl);
   }
+  installLetterboxFix(rt, f, container);
 
   const onFrameMsg = (ev: MessageEvent) => {
     if (ev.source !== f.contentWindow) return;
@@ -280,8 +374,104 @@ function attachIframe(
   });
 }
 
-function vecToCss(v: { x?: number; y?: number; z?: number } | null | undefined): string {
-  if (!v) return "rgb(128,128,128)";
+/**
+ * 作者没做全屏适配的网页壁纸：按「覆盖式设计视口」铺满，避免露出 body 底色。
+ *
+ * WE 的网页壁纸就是一张按显示器尺寸铺开的网页，绝大多数作者会写 `object-fit:cover` /
+ * `height:100%` / `100vw`（本机 12 张含 video 的墙有 11 张这么写）。但也有作者只写
+ * `#video { width:100% }`（1731760875 Minecraft 红石钟，全库仅此 1 张）：高度 auto →
+ * 16:9 视频在 16:10 视口里只有 1920×1080，下面 120px 露出 `body` 黑底 = 用户看到的黑条。
+ *
+ * **不能直接给 video 补 `object-fit:cover`**：该墙的时钟数字是四个绝对定位 `<img>`，
+ * 用 `padding-left:79.9%` 这类**视口百分比**对准视频里的红石显示器。只放大 video 内容、
+ * 不动时钟坐标系，两者就会脱钩（16:10 下实测错位 64px，数字会飘出显示器）。
+ *
+ * 正解是把**整个页面视口**换成内容比例、让溢出的一边居中裁掉：视频与时钟同处一个坐标系，
+ * 相对位置分毫不动（错位 0px），也没有黑条。等价于场景侧 cover 的既有语义
+ * （见 CASEBOOK「32:9 场景多分辨率不适配」）。
+ *
+ * **只对「确实露底」的页面做**：那 48 张自己做了适配的墙必须原样 100%×100%——
+ * 给它们换视口再裁会把贴边的 UI（时钟/按钮）裁出屏幕，是实打实的回归。
+ * 判据不看 CSS 文本，而是**量真实盒子**（见 measureWebLetterbox）。
+ */
+
+/** 视口比例与内容比例差多少以内算「已经贴上」，不必再换视口（DPR 取整误差留余量） */
+const WEB_ASPECT_EPS = 0.005;
+
+/** 露底判定阈值：占视口 1% 以上的空隙才算黑条（躲开亚像素/取整缝） */
+const WEB_LETTERBOX_MIN_RATIO = 0.01;
+
+/** 合理的内容宽高比区间：超出即视为量错（元数据未到时盒子会塌成细条，别拿它当设计比例） */
+const WEB_ASPECT_MIN = 0.2;
+const WEB_ASPECT_MAX = 6;
+
+/**
+ * 覆盖式设计视口：把 `contentAspect` 的内容铺满 `stageW×stageH`，溢出的一边居中裁掉。
+ *
+ * 返回给 iframe 用的 CSS 尺寸与居中偏移；null = 无需特殊处理（直接 100%×100%）。
+ * 不用 transform 缩放：视口本身就取内容比例，1 CSS px 仍是 1 舞台 px，文字/视频不重采样。
+ */
+export function webCoverViewport(
+  stageW: number,
+  stageH: number,
+  contentAspect: number,
+): { width: number; height: number; left: number; top: number } | null {
+  if (!(stageW > 0) || !(stageH > 0) || !(contentAspect > 0)) return null;
+  const stageAspect = stageW / stageH;
+  if (Math.abs(stageAspect - contentAspect) <= WEB_ASPECT_EPS) return null;
+  if (stageAspect < contentAspect) {
+    // 舞台比内容更「高」（16:10 vs 16:9）→ 对齐高度，宽度溢出居中裁掉
+    const width = stageH * contentAspect;
+    return { width, height: stageH, left: (stageW - width) / 2, top: 0 };
+  }
+  // 舞台更「宽」（21:9/32:9）→ 对齐宽度，高度溢出居中裁掉
+  const height = stageW / contentAspect;
+  return { width: stageW, height, left: 0, top: (stageH - height) / 2 };
+}
+
+/**
+ * 量出页面是否「露底」：找铺满横向、竖向却留出空隙的全幅媒体。
+ *
+ * 只认**贴着视口原点、横向铺满**的 video/img（作者的全幅背景就是这形态），
+ * 且必须已知原始尺寸——比例取自媒体本身，不取渲染盒子。
+ * 竖向比视口矮出 1% 以上即判定露底。不匹配 CSS 文本：`width:100%` 有一万种写法，
+ * 量盒子才是真判据。
+ *
+ * 故意不含 `<canvas>`：canvas 没有内在比例（作者按视口 resize 自己的 backing store），
+ * 27 张含 canvas 的墙本来就自己管尺寸，替它们换视口只会裁掉贴边 UI。
+ */
+export function measureWebLetterbox(doc: Document): { contentAspect: number } | null {
+  const win = doc.defaultView;
+  if (!win) return null;
+  const vw = win.innerWidth;
+  const vh = win.innerHeight;
+  if (!(vw > 0) || !(vh > 0)) return null;
+
+  const cands = [...doc.querySelectorAll("video,img")] as Array<
+    HTMLVideoElement | HTMLImageElement
+  >;
+  for (const el of cands) {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    // 必须横向铺满且贴顶（全幅背景形态），否则是时钟/图标之类的局部元素
+    if (r.width < vw * 0.98) continue;
+    if (Math.abs(r.left) > vw * 0.02 || r.top > vh * 0.02) continue;
+    // 竖向留出的空隙够大才算黑条
+    if (vh - r.height < vh * WEB_LETTERBOX_MIN_RATIO) continue;
+    // 内容比例**只认媒体原始尺寸**：视频元数据未到时渲染盒子会是 300×150 之类的占位，
+    // 拿它当设计比例会算出 15360×1200 这种荒谬视口（先前实测到的一次误判）。
+    const natW = (el as HTMLVideoElement).videoWidth || (el as HTMLImageElement).naturalWidth || 0;
+    const natH =
+      (el as HTMLVideoElement).videoHeight || (el as HTMLImageElement).naturalHeight || 0;
+    if (!(natW > 0) || !(natH > 0)) continue; // 元数据还没到：这一拍不判，等 loadedmetadata 再来
+    const aspect = natW / natH;
+    if (!Number.isFinite(aspect) || aspect < WEB_ASPECT_MIN || aspect > WEB_ASPECT_MAX) continue;
+    return { contentAspect: aspect };
+  }
+  return null;
+}
+
+function vecToCss(v: { x?: number; y?: number; z?: number } | null | undefined): string {  if (!v) return "rgb(128,128,128)";
   const r = Math.round(Math.max(0, Math.min(1, Number(v.x) || 0)) * 255);
   const g = Math.round(Math.max(0, Math.min(1, Number(v.y) || 0)) * 255);
   const b = Math.round(Math.max(0, Math.min(1, Number(v.z) || 0)) * 255);

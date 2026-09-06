@@ -38,6 +38,11 @@ export type Runtime = {
   videoPairs?: VideoLoopPair[];
   img?: HTMLImageElement;
   iframe?: HTMLIFrameElement;
+  /**
+   * 网页壁纸的「露底自适配」复算钩子（web.ts 安装）。
+   * setFit 切换时要调它：cover 才换覆盖式视口，contain/stretch 回满视口。
+   */
+  webRelayout?: () => void;
   canvas?: HTMLCanvasElement;
   ctx?: CanvasRenderingContext2D;
   raf?: number;
