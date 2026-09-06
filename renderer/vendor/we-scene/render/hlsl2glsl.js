@@ -211,32 +211,93 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     return fn + '(vec' + dim + '(' + num + '), ' + expr + ')'
   })
 
-  // HLSL 隐式 int→float 转换：乘除两侧的整数字面量补 .0（WE 效果 shader 中此类仅出现在 float 上下文）
-  // 左侧字面量需排除标识符尾部数字（如 diffx1 * diffy2 不得改写成 diffx1.0）
-  code = code.replace(/(^|[^\w.])(\d+)\s*([*/])\s*([A-Za-z_][A-Za-z0-9_]*)/g, '$1$2.0 $3 $4')
-  code = code.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\s*([*/])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
-  // 字面量 × 字面量（如 3.14159 * 2）
-  code = code.replace(/(\d+\.\d+)\s*([*/])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
-  code = code.replace(/(^|[^\w.])(\d+)\s*([*/])\s*(\d+\.\d+)/g, '$1$2.0 $3 $4')
+  // HLSL 隐式 int→float 转换：整数字面量在浮点上下文里补 .0。
+  //
+  // [we-scene patch] **必须迭代到不动点**：这些都是单趟正则替换，而 HLSL 的
+  // 链式表达式要多趟才能收敛。`#define kernel 2` 展开出的 `2 + 2 + 2.0`
+  // （2999533824 等 7 张的 gaussian.frag）第一趟只改右边那个（它紧邻浮点字面量），
+  // 得到 `2 + 2.0 + 2.0` —— 最左的 2 右边仍是整数，规则不认，于是留下 int + float，
+  // ANGLE 报 `'+' : wrong operand types … 'int' and … 'float'`，整个 pass 被跳过。
+  // 单趟看着"能修"是因为手写测例往往只需一趟；真实语料经宏展开后是整数链。
+  //
+  // 迭代上限 8：语料里最长的链是 3 项（2 + 2 + 2.0），留足余量又不至于死循环。
+  for (let pass = 0; pass < 8; pass++) {
+    const before = code
 
-  // + / - 的隐式 int→float（GLSL 无此隐式转换，WE HLSL 有）：
-  // 仅当可证明浮点上下文时转换——左侧为浮点字面量（2.0 - 1）或 swizzle 表达式（x.xyz - 1），
-  // 以及左侧整数字面量、右侧为浮点字面量或 swizzle 表达式（1 + 2.0 / 1 + x.xyz）。
-  code = code.replace(/(\.\d+)\s*([+-])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
-  code = code.replace(/([A-Za-z_]\w*\.(?:xyzw|xyz|xy|zw|rgba|rgb|rg|x|y|z|w|r|g|b|a))\s*([+-])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
-  code = code.replace(/(^|[^\w.])(\d+)\s*([+-])\s*(\d+\.\d+)/g, '$1$2.0 $3 $4')
-  code = code.replace(/(^|[^\w.])(\d+)\s*([+-])\s*([A-Za-z_]\w*\.(?:xyzw|xyz|xy|zw|rgba|rgb|rg|x|y|z|w|r|g|b|a))/g, '$1$2.0 $3 $4')
-  // 整数字面量 ± 浮点类型变量（如 1 - g_Rough、1 + time）：
-  // 收集声明为 float/vec/mat 的 uniform 与局部变量名，仅对这些名字补 .0（int 变量不受影响）
-  {
-    const floatNames = new Set()
-    const declRe = /\b(?:uniform\s+)?(?:highp|mediump|lowp\s+)?(?:float|vec2|vec3|vec4|mat2|mat3|mat4)\s+([A-Za-z_][A-Za-z0-9_]*)/g
-    let dm
-    while ((dm = declRe.exec(code)) !== null) floatNames.add(dm[1])
-    if (floatNames.size > 0) {
-      const alt = Array.from(floatNames).sort((a, b) => b.length - a.length).join('|')
-      code = code.replace(new RegExp('(^|[^\\w.])(\\d+)\\s*([+-])\\s*(' + alt + ')(?![A-Za-z0-9_])', 'g'), '$1$2.0 $3 $4')
+    // 乘除两侧的整数字面量（WE 效果 shader 中此类仅出现在 float 上下文）
+    // 左侧字面量需排除标识符尾部数字（如 diffx1 * diffy2 不得改写成 diffx1.0）
+    code = code.replace(/(^|[^\w.])(\d+)\s*([*/])\s*([A-Za-z_][A-Za-z0-9_]*)/g, '$1$2.0 $3 $4')
+    code = code.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\s*([*/])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
+    // 字面量 × 字面量（如 3.14159 * 2）
+    code = code.replace(/(\d+\.\d+)\s*([*/])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
+    code = code.replace(/(^|[^\w.])(\d+)\s*([*/])\s*(\d+\.\d+)/g, '$1$2.0 $3 $4')
+
+    // + / - 的隐式 int→float（GLSL 无此隐式转换，WE HLSL 有）：
+    // 仅当可证明浮点上下文时转换——左侧为浮点字面量（2.0 - 1）或 swizzle 表达式（x.xyz - 1），
+    // 以及左侧整数字面量、右侧为浮点字面量或 swizzle 表达式（1 + 2.0 / 1 + x.xyz）。
+    code = code.replace(/(\.\d+)\s*([+-])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
+    code = code.replace(/([A-Za-z_]\w*\.(?:xyzw|xyz|xy|zw|rgba|rgb|rg|x|y|z|w|r|g|b|a))\s*([+-])\s*(\d+)(?![\d.])/g, '$1 $2 $3.0')
+    code = code.replace(/(^|[^\w.])(\d+)\s*([+-])\s*(\d+\.\d+)/g, '$1$2.0 $3 $4')
+    code = code.replace(/(^|[^\w.])(\d+)\s*([+-])\s*([A-Za-z_]\w*\.(?:xyzw|xyz|xy|zw|rgba|rgb|rg|x|y|z|w|r|g|b|a))/g, '$1$2.0 $3 $4')
+
+    // [we-scene patch] **整数字面量后紧跟括号表达式**：`1 / (1.0 - t)`（perspective.vert
+    // 的 q0/q1，3 张）、`(1 + (abs(u) + …) * 2.0)`（shadow.vert，3 张）。
+    // 上面每条规则的右操作数都要求是标识符/swizzle/字面量，`(` 一律漏掉。
+    //
+    // **只在同一子表达式里能看到浮点特征时才改**。不能无条件补 ——
+    // `int m = 3 * (k + 1);` 这类纯整数运算会被污染成 `3.0 * (k + 1)`，ANGLE 反过来报
+    // `cannot convert from 'float' to 'int'`（把一类失败换成另一类）。
+    //
+    // 判据的取值范围是「整数右侧起，到本层括号闭合或语句结束为止」而不是紧邻那一对
+    // 括号 —— shadow.vert 的 `(1 + (abs(u)+abs(u)) * 2.0)` 里，紧邻的
+    // `(abs(u)+abs(u))` 内部没有小数点，浮点特征在它**后面**的 `* 2.0`。
+    // 只看紧邻括号会漏掉这 3 张。
+    code = code.replace(
+      /(^|[^\w.])(\d+)\s*([*/+-])\s*(\()/g,
+      (all, pre, num, op, open, offset, whole) => {
+        // 从 open 位置起扫到本层闭合（深度回到 0）或语句结束，取这一段做浮点判定
+        let depth = 0
+        let end = offset + all.length - 1
+        for (; end < whole.length; end++) {
+          const ch = whole[end]
+          if (ch === '(') depth++
+          else if (ch === ')') { depth--; if (depth === 0) { end++; break } }
+          else if (depth === 0 && (ch === ';' || ch === ',' || ch === '\n')) break
+        }
+        // 闭合后再往前吃掉同层的后继运算（`) * 2.0` 里的 2.0）
+        for (; end < whole.length; end++) {
+          const ch = whole[end]
+          if (ch === ';' || ch === ',' || ch === '\n' || ch === ')') break
+        }
+        const seg = whole.slice(offset, end)
+        return /\d\.\d/.test(seg) ? `${pre}${num}.0 ${op} ${open}` : all
+      },
+    )
+    // 整数字面量 ± 浮点类型变量（如 1 - g_Rough、1 + time）：
+    // 收集声明为 float/vec/mat 的 uniform 与局部变量名，仅对这些名字补 .0（int 变量不受影响）
+    //
+    // [we-scene patch] 这块**必须在循环内**，与上面的括号扫描互相喂数据：
+    // perspective.vert 的 `1 / (1 - t)` 需要先由本块把 `1 - t` 改成 `1.0 - t`，
+    // 括号扫描下一轮才能看到小数点、把外层的 `1 /` 也补上。放在循环外时
+    // 第一轮括号扫描看不到浮点特征、第二轮循环又因 code 未变而提前 break，
+    // 于是 3 张 perspective 的 q0/q1 永远留着 int / float。
+    {
+      const floatNames = new Set()
+      const declRe = /\b(?:uniform\s+)?(?:highp|mediump|lowp\s+)?(?:float|vec2|vec3|vec4|mat2|mat3|mat4)\s+([A-Za-z_][A-Za-z0-9_]*)/g
+      let dm
+      while ((dm = declRe.exec(code)) !== null) floatNames.add(dm[1])
+      if (floatNames.size > 0) {
+        const alt = Array.from(floatNames).sort((a, b) => b.length - a.length).join('|')
+        // 变量在右：`1 - g_Rough`
+        code = code.replace(new RegExp('(^|[^\\w.])(\\d+)\\s*([+-])\\s*(' + alt + ')(?![A-Za-z0-9_])', 'g'), '$1$2.0 $3 $4')
+        // [we-scene patch] 变量在左：`(xScale - 1) * 0.5`（rounded_mask.vert，5 张）。
+        // xScale 是 `float xScale = max(1.0, …)`，减号右边那个裸 1 才是 int，
+        // 报 `'-' : … 'float' and … 'int'`。上面那条只覆盖变量在右的方向。
+        code = code.replace(new RegExp('\\b(' + alt + ')\\s*([+-])\\s*(\\d+)(?![\\d.])', 'g'), '$1 $2 $3.0')
+      }
     }
+
+    if (code === before) break
   }
 
   // GLSL 内置 float 函数的实参中不允许裸 int（无隐式转换）。
@@ -409,6 +470,18 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   //    误改的风险大于收益，交给真实编译校验兜住。
   {
     const width = new Map()
+    // [we-scene patch] **只收语句级声明，排除函数签名**。
+    // 原正则 `vecN <名字>` 会把公共头里的函数名与形参一起收进来：
+    // common_blending.h 有 24 个 `vec3 BlendXxx(vec3 base, vec3 blend)`，
+    // 于是 `BlendLinearDodge` / `base` / `blend` 三个名字都被当成 vec3 变量。
+    // 后果：blendgradient.frag 的 main() 里 `float blend = 1.0;` 被误判成 vec3，
+    // 下面 9b 把 `blend = smoothstep(…)` 包成 `blend = vec3(smoothstep(…))`，
+    // ANGLE 报 dimension mismatch —— 24 张壁纸的混合渐变 pass 全灭。
+    // 作者原式本来完全合法，这是转译器自己造的缺陷。
+    //
+    // 判据：声明必须以 `;`、`,`、`)` 之外的方式结束语句，且名字后不能紧跟 `(`
+    // （那是函数名），也不能处在形参列表里（前面最近的非空白字符是 `(` 或 `,`
+    // 且该行含 `)` 与 `{`）。用「名字后紧跟 = 或 ; 或 , 或行尾」正向判定更稳。
     const wre = /\b(?:uniform|varying|attribute|in|out)?\s*\b(vec([234]))\s+([A-Za-z_]\w*)/g
     let wm
     while ((wm = wre.exec(code)) !== null) width.set(wm[3], Number(wm[2]))
@@ -487,6 +560,17 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       code = code.replace(/(^|[;{}\n]\s*)([A-Za-z_]\w*)\s*=\s*([^;]+);/g, (all, pre, lhs, rhs) => {
         const lw = width.get(lhs)
         if (!lw) return all
+        // [we-scene patch] **同名 float 声明优先**：width 表用 `vecN <名字>` 全文扫，
+        // 会把函数签名里的形参一起收进来 —— common_blending.h 有 24 个
+        // `vec3 BlendXxx(vec3 base, vec3 blend)`，于是 base / blend 被登记成 vec3。
+        // 而 blendgradient.frag 的 main() 里是 `float blend = 1.0;`（局部标量），
+        // 被广播成 `blend = vec3(smoothstep(…))` 后 ANGLE 报 dimension mismatch，
+        // 24 张壁纸的混合渐变 pass 全灭 —— 作者原式本来完全合法，是转译器自己造的。
+        //
+        // 闸门只加在这里，**不动 width 表本身**：那张表还被上面的 swizzle 补齐消费，
+        // 把它的正则收紧成「只认 = ; [ 结尾的语句级声明」会让大量真正需要广播的
+        // 向量落空 —— 实测全库 1733 → 1164 pass（一次性回归 569 个）。
+        if (floatNames.has(lhs)) return all
         const r = rhs.trim()
         if (new RegExp('^vec' + lw + '\\s*\\(').test(r)) return all
         if (width.has(r)) return all

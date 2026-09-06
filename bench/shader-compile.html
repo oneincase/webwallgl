@@ -159,6 +159,7 @@ async function main() {
   let nPrograms = 0, okPrograms = 0
   let nStages = 0, okStages = 0
   const failByShader = new Map()   // shader → { count, wallpapers:Set, log }
+  const fails = []                 // 每个失败 pass 的完整记录（window.__shaderFails）
   const badWallpapers = new Set()
   const scanned = []
 
@@ -211,6 +212,10 @@ async function main() {
         if (!failByShader.has(k)) failByShader.set(k, { count: 0, wallpapers: new Set(), log: progLog })
         const rec = failByShader.get(k)
         rec.count++; rec.wallpapers.add(item)
+        // 结构化记录：批量修转译缺陷时要按「错误签名」聚类看全库分布，
+        // 上面那张表按 shader 名聚合、且只留首条日志 —— 同名不同包内容会被并成一行，
+        // 也看不到完整报错。这里留全量供探针脚本一次取走（window.__shaderFails）。
+        fails.push({ item, shader: job.shader, combos: job.combos, effect: job.effect, log: progLog })
       }
     }
     if (itemTotal) rows.push({ item, itemOk, itemTotal })
@@ -243,6 +248,15 @@ async function main() {
   }
   html += '</table>'
   out.innerHTML = html
+
+  window.__shaderFails = fails
+  window.__shaderSummary = {
+    scanned: scanned.length,
+    programs: { ok: okPrograms, total: nPrograms },
+    stages: { ok: okStages, total: nStages },
+    badWallpapers: badWallpapers.size,
+  }
+  window.__shaderDone = true
 }
 
 main().catch((e) => { sum.innerHTML = `<span class="bad">出错: ${e.message}</span>`; console.error(e) })

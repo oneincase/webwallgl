@@ -735,6 +735,112 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **整数字面量补 .0 必须迭代到不动点**。
+// 这些都是单趟正则，而 HLSL 链式表达式要多趟收敛：`#define kernel 2` 展开出的
+// `2 + 2 + 2.0`（gaussian.frag，7 张）第一趟只改紧邻浮点的那个，留下 `2 + 2.0 + 2.0`，
+// 最左的 2 右边仍是整数、规则不认 → int + float 编不过，整个 pass 被跳过。
+// 另外三个缺口：`1 / (1.0 - t)`（perspective.vert，3 张，字面量后紧跟括号）、
+// `(xScale - 1) * 0.5`（rounded_mask.vert，5 张，float 变量在左、裸整数在右）、
+// `(1 + (abs(u)+abs(u)) * 2.0)`（shadow.vert，3 张，浮点特征在紧邻括号之后）。
+{
+  const cases = [
+    // [标签, 源码, 期望出现, 不得出现]
+    [
+      "宏展开的整数链",
+      "#define kernel 2\nvoid main(){ vec4 a=vec4(1.0); a.rgb /= kernel + kernel + 2.0; gl_FragColor=a; }",
+      /a\.rgb \/= 2\.0 \+ 2\.0 \+ 2\.0/,
+      /a\.rgb \/= 2 \+/,
+    ],
+    [
+      "整数字面量后紧跟括号",
+      "void main(){ float t=0.5; float q0 = 1 / (1 - t); gl_FragColor=vec4(q0); }",
+      /q0 = 1\.0 \/ \(1\.0 - t\)/,
+      /q0 = 1 \//,
+    ],
+    [
+      "float 变量在左、裸整数在右",
+      "void main(){ float xScale = max(1.0, 2.0); float v = 0.0; v -= (xScale - 1) * 0.5; gl_FragColor=vec4(v); }",
+      /\(xScale - 1\.0\) \* 0\.5/,
+      /\(xScale - 1\) \*/,
+    ],
+    [
+      "浮点特征在紧邻括号之后",
+      "void main(){ float u=0.3; float a = (1 + (abs(u) + abs(u)) * 2.0) * max(1.0, abs(u)); gl_FragColor=vec4(a); }",
+      /\(1\.0 \+ \(abs\(u\)/,
+      /\(1 \+ \(abs/,
+    ],
+  ];
+  for (const [label, src, want, bad] of cases) {
+    const glsl = hlsl2glsl(src, "frag", {}, () => null);
+    if (bad.test(glsl)) wireErrors.push(`整浮混合未修（${label}）：GLSL ES 无 int/float 混合运算，整个 pass 被跳过`);
+    else if (!want.test(glsl)) wireErrors.push(`整浮混合改写形态不符预期（${label}）`);
+  }
+  // 不得误伤纯整数上下文：`int m = 3 * (k + 1)` 被补成 3.0 会反过来报
+  // cannot convert float to int（把一类失败换成另一类）。
+  const intCtx = hlsl2glsl(
+    "void main(){ int k=7; int m = 3 * (k + 1); gl_FragColor=vec4(float(m)); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (/3\.0 \* \(k \+ 1\)/.test(intCtx)) {
+    wireErrors.push("纯整数括号表达式不得补 .0（int m = 3 * (k + 1) 会变成 float→int 错误）");
+  }
+  // 源码守卫：这一段必须在循环里，且 floatNames 块也在循环内 ——
+  // perspective 的 `1 / (1 - t)` 需要先由 floatNames 块把 `1 - t` 改成 `1.0 - t`，
+  // 括号扫描下一轮才看得到小数点。floatNames 留在循环外时第二轮因 code 未变而 break。
+  const hs = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hlsl2glsl.js"), "utf8");
+  const loopStart = hs.indexOf("for (let pass = 0; pass < 8; pass++)");
+  const loopEnd = hs.indexOf("if (code === before) break");
+  if (loopStart < 0 || loopEnd < 0) {
+    wireErrors.push("hlsl2glsl.js 的整浮混合改写必须包在迭代到不动点的循环里");
+  } else {
+    const body = hs.slice(loopStart, loopEnd);
+    if (!/floatNames/.test(body)) {
+      wireErrors.push("floatNames 块必须在不动点循环内（否则 1 / (1 - t) 这类两趟依赖修不到）");
+    }
+  }
+}
+
+// [we-scene patch] **同名 float 声明优先于 width 表**（9b 标量广播的闸门）。
+// width 表用 `vecN <名字>` 全文扫，会把函数签名形参一起收进来：common_blending.h
+// 有 24 个 `vec3 BlendXxx(vec3 base, vec3 blend)`，于是 blend 被登记成 vec3。
+// blendgradient.frag 的 main() 里却是 `float blend = 1.0;`，广播成
+// `blend = vec3(smoothstep(…))` 后报 dimension mismatch —— 24 张壁纸的混合渐变全灭，
+// 而作者原式完全合法。
+{
+  const src = [
+    "vec3 BlendLinearDodge(vec3 base, vec3 blend) { return min(base + blend, vec3(1.0)); }",
+    "uniform float g_Multiply;",
+    "void main() {",
+    "  float gradient = 0.5;",
+    "  float blend = 1.0;",
+    "  blend = smoothstep(saturate(gradient - 0.1), saturate(gradient + 0.1), g_Multiply);",
+    "  gl_FragColor = vec4(blend);",
+    "}",
+  ].join("\n");
+  const glsl = hlsl2glsl(src, "frag", {}, () => null);
+  if (/blend = vec3\s*\(/.test(glsl)) {
+    wireErrors.push(
+      "局部 `float blend` 不得被 9b 广播成 vec3：width 表收了 common_blending.h 的函数形参，" +
+        "同名 float 声明必须优先（24 张壁纸的混合渐变 pass）",
+    );
+  }
+  // 反向：真正的 vecN 变量仍要能被标量广播（否则 sine_wave 一类会回归）
+  const vecSrc = [
+    "uniform float u_Amp;",
+    "void main() {",
+    "  vec2 waveCoord = vec2(0.0);",
+    "  waveCoord = pow(saturate(u_Amp), 2.0);",
+    "  gl_FragColor = vec4(waveCoord, 0.0, 1.0);",
+    "}",
+  ].join("\n");
+  const vecGlsl = hlsl2glsl(vecSrc, "frag", {}, () => null);
+  if (!/waveCoord = vec2\s*\(/.test(vecGlsl)) {
+    wireErrors.push("真正的 vecN 变量仍须被标量广播（闸门收得过紧会让 sine_wave 一类回归）");
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。
