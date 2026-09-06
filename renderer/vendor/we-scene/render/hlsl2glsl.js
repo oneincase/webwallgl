@@ -213,6 +213,23 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     return fn + '(vec' + dim + '(' + num + '), ' + expr + ')'
   })
 
+  // [we-scene patch] 同上，但**第二个实参是含运算的表达式**，且赋给窄 swizzle：
+  //   `v_Transforms.zw = max(1e-6, u_scale * g_Texture0Resolution.xy / 3.0);`
+  //   （procedural_noise / lens_distortion / frame_builder，5 pass / 4 壁纸）
+  // 上面那条要求第二参是纯 swizzle 标识符，含运算就漏掉。GLSL ES 的 max/min 要求
+  // 两参同宽，报 `'=' : dimension mismatch`，整个 pass 被跳过。
+  //
+  // 宽度从**赋值左侧的 swizzle** 读（`.zw` → 2）：这比推断右侧表达式宽度可靠得多。
+  // 第一参必须是标量（数字字面量，含科学计数法 1e-6），第二参必须含 swizzle 或
+  // vecN 构造（证明它是向量），否则不动。
+  code = code.replace(
+    /(\.([xyzwrgba]{2,4})\s*=\s*)(max|min)\(\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*,\s*([^;]+?)\s*\)\s*;/g,
+    (all, lead, sw, fn, scalar, vecExpr) => {
+      if (!/\.[xyzwrgba]{2,4}\b|\bvec[234]\s*\(/.test(vecExpr)) return all
+      return `${lead}${fn}(vec${sw.length}(${scalar}), ${vecExpr});`
+    },
+  )
+
   // HLSL 隐式 int→float 转换：整数字面量在浮点上下文里补 .0。
   //
   // [we-scene patch] **科学计数法字面量整体挖洞**，在补 .0 的全部规则之前。
@@ -1142,6 +1159,33 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
           }).join('\n')
         }
       }
+
+      // [we-scene patch] **反方向：片元声明更宽时收窄到顶点侧**。
+      // 上面只处理「顶点更宽 → 加宽片元」。constellation 是反过来：
+      // vert `varying vec2 v_TexCoord` / frag `varying vec4 v_TexCoord`
+      // （audio_buffer_accumulation 的 v_AccumulationRate 同理，vec2 vs vec3）。
+      // 链接期同样报 `Types of varying 'x' differ between VERTEX and FRAGMENT shaders`，
+      // 整个 pass 被跳过（6 壁纸）。
+      //
+      // 收窄是安全的：顶点侧只写了那么多分量，多出来的分量在 GLSL 里是未定义值，
+      // 片元读它本来就没有意义。实测这 6 张的片元引用全都已带 `.xy` 之类的窄
+      // swizzle（作者自己知道只有前几个分量有效），所以只改声明即可。
+      // 仍然保守起来：**片元里出现超出顶点宽度的 swizzle 时不动**（那说明作者
+      // 真的读了更宽的分量，收窄会让它编不过，留给真实编译校验暴露）。
+      code = code.replace(/^(\s*in\s+(?:highp|mediump|lowp\s+)?)(vec[234]|float)(\s+)([A-Za-z_]\w*)(\s*;)/gm,
+        (all, pre, ty, sp, name, tail) => {
+          const vt = vertTypes.get(name)
+          if (!vt || RANK[vt] >= RANK[ty]) return all
+          // 片元是否用到了超出顶点宽度的分量？
+          const CH = 'xyzw'
+          const RG = 'rgba'
+          const over = new RegExp(
+            '\\b' + name + '\\s*\\.\\s*[' + CH + RG + ']*[' +
+            CH.slice(RANK[vt]) + RG.slice(RANK[vt]) + ']',
+          )
+          if (over.test(code)) return all
+          return pre + vt + sp + name + tail
+        })
     }
 
     // [we-scene patch] **vec4/vec3 当 UV 用**：WE/HLSL 的 `texSample2D(s, float4)`

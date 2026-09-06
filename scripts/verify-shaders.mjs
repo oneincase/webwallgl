@@ -1150,6 +1150,66 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **varying 类型跨 stage 不一致的两个方向都要处理**。
+// 既有逻辑只做「顶点更宽 → 加宽片元」；constellation 是反过来（vert vec2 /
+// frag vec4），audio_buffer_accumulation 的 v_AccumulationRate 同理（vec2 / vec3）。
+// 链接期报 `Types of varying 'x' differ between VERTEX and FRAGMENT shaders`，
+// 整个 pass 被跳过（6 壁纸）。收窄安全：顶点没写的分量本来就是未定义值。
+{
+  const vert = "varying vec2 v_TexCoord;\nvoid main(){ v_TexCoord = vec2(0.0); gl_Position = vec4(0.0); }";
+  const frag = [
+    "varying vec4 v_TexCoord;",
+    "uniform sampler2D g_Texture0;",
+    "void main(){ gl_FragColor = texSample2D(g_Texture0, v_TexCoord.xy); }",
+  ].join("\n");
+  const g = hlsl2glsl(frag, "frag", {}, () => null, vert);
+  if (!/^in vec2 v_TexCoord;/m.test(g)) {
+    wireErrors.push("片元 varying 比顶点宽时必须收窄到顶点类型（否则链接期 varying types differ）");
+  }
+  // 片元真的读了超出顶点宽度的分量时不得收窄（作者语义如此，留给真实编译暴露）
+  const frag2 = [
+    "varying vec4 v_TexCoord;",
+    "void main(){ gl_FragColor = vec4(v_TexCoord.zw, 0.0, 1.0); }",
+  ].join("\n");
+  const g2 = hlsl2glsl(frag2, "frag", {}, () => null, vert);
+  if (/^in vec2 v_TexCoord;/m.test(g2)) {
+    wireErrors.push("片元读了超出顶点宽度的分量时不得收窄（会把编译错误变成静默算错）");
+  }
+  // 反方向（顶点更宽 → 加宽片元）必须照旧工作
+  const vertWide = "varying vec4 v_T;\nvoid main(){ v_T = vec4(0.0); gl_Position = vec4(0.0); }";
+  const fragNarrow = "varying vec2 v_T;\nvoid main(){ gl_FragColor = vec4(v_T, 0.0, 1.0); }";
+  const g3 = hlsl2glsl(fragNarrow, "frag", {}, () => null, vertWide);
+  if (!/^in vec4 v_T;/m.test(g3)) {
+    wireErrors.push("顶点 varying 更宽时仍须加宽片元声明（既有能力不得回归）");
+  }
+}
+
+// [we-scene patch] **max/min 标量广播：第二参含运算时也要补**。
+// `v_Transforms.zw = max(1e-6, u_scale * g_Texture0Resolution.xy / 3.0);`
+// （procedural_noise / lens_distortion / frame_builder，5 pass / 4 壁纸）。
+// 既有那条要求第二参是纯 swizzle 标识符，含运算就漏掉 → `dimension mismatch`。
+// 宽度从赋值左侧的 swizzle 读（.zw → 2），比推断右侧表达式宽度可靠。
+{
+  const g = hlsl2glsl(
+    "uniform float u_scale;\nuniform vec4 g_Texture0Resolution;\nvarying vec4 v_Transforms;\nvoid main(){ v_Transforms.zw = max(1e-6, u_scale * g_Texture0Resolution.xy / 3.0); gl_Position=vec4(0.0); }",
+    "vert",
+    {},
+    () => null,
+  );
+  if (!/max\(vec2\(1e-6\),/.test(g)) {
+    wireErrors.push("max/min 的标量首参必须按左侧 swizzle 宽度广播（含运算的第二参也要覆盖）");
+  }
+  // 同宽 / 标量赋值不得被包
+  const safe = [
+    ["同宽 vec2", "uniform vec2 a,b;\nvarying vec4 v;\nvoid main(){ v.zw = max(a, b); gl_Position=vec4(0.0); }", /max\(a, b\)/],
+    ["标量赋标量", "uniform float a;\nvarying vec4 v;\nvoid main(){ v.z = max(0.5, a); gl_Position=vec4(0.0); }", /max\(0\.5, a\)/],
+  ];
+  for (const [label, src, want] of safe) {
+    const s2 = hlsl2glsl(src, "vert", {}, () => null);
+    if (!want.test(s2)) wireErrors.push(`max/min 同宽或标量场景不得被广播包裹（${label}）`);
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。
