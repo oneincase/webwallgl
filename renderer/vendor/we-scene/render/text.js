@@ -672,6 +672,19 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       if (!fns.applyUserProperties) return
       try { fns.applyUserProperties(props || {}) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'applyUserProperties') }
     },
+    /** 直调 update 不做文本加工：层可见性脚本（visible.script）要拿原始返回值
+     *  ——布尔控可见，callUpdate 会把它吞成 null（防画到画面上的文字版语义）。 */
+    callUpdateRaw(value) {
+      if (!fns.update || sandbox.disabled) return undefined
+      try {
+        return fns.update(value)
+      } catch (e) {
+        sandbox.errCount++
+        if (opts.onError) opts.onError(e, 'update')
+        if (sandbox.errCount >= 3) sandbox.disabled = true
+        return undefined
+      }
+    },
     /** 求值当前文本：返回新文本；undefined/null 保留原值；连续出错 3 次熔断回退静态文本 */
     callUpdate(value) {
       if (!fns.update || sandbox.disabled) return null
@@ -1444,18 +1457,19 @@ function makeObjectLayerProxy(layer, opts) {
       }
     },
   })
-  // 向量字段：读回实时值、写回图层数组
+  // 向量字段：读回实时值、写回图层数组。
+  // getter 必须返回**新快照**而非共享 store：官方 thisLayer.origin 是值语义，
+  // 脚本常把引用长期持有（2315163178 Simple Visualizer：init 里
+  // `baseOrigin = thisLayer.origin`，bars[0] 就是 thisLayer，update 每帧
+  // `bar.origin = base+30` 会经 setter 写回模板层数组——getter 若回填同一 store，
+  // baseOrigin 下一帧跟着涨，64 根条每帧 +30 跑出屏幕）。全库语料 0 处
+  // `thisLayer.<vec>.<member> =` 成员直写，快照语义无回归面。
   for (const key of ['origin', 'scale', 'size', 'color']) {
     Object.defineProperty(proxy, key, {
       enumerable: true,
       get() {
-        if (layer && Array.isArray(layer[key])) {
-          const a = layer[key]
-          store[key].x = a[0] || 0
-          store[key].y = a[1] || 0
-          store[key].z = a[2] || 0
-        }
-        return store[key]
+        const a = layer && Array.isArray(layer[key]) ? layer[key] : null
+        return makeVec3(a || [0, 0, 0])
       },
       set(v) {
         const a = normVec(v)
