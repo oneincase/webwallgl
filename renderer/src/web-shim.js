@@ -460,6 +460,35 @@
     }
   }
 
+  /**
+   * 恢复暂停期间被挂起的 rAF 请求。
+   *
+   * **不补跑这些回调，主循环就永久断掉**（1278092907 Monstercat：`draw()` 在函数体
+   * 开头就 `requestAnimationFrame(draw)` 再画，暂停期间那次请求被登记成 hold，
+   * 恢复后没人跑它 → 整条链没有下一帧，画面永久定格，且没有任何报错）。
+   * 这是 rAF 自递归的通用形态，不是这一张的特例。
+   *
+   * 走 `w.requestAnimationFrame` 而不是 `origRaf`：此时已 unpaused，要让它重新经过
+   * 节流层（低 fps 时该走 setTimeout 路径），并照常发 we-frame 打点。
+   */
+  function resumeRafHolds() {
+    var holds = [];
+    for (var id in rafMap) {
+      if (!Object.prototype.hasOwnProperty.call(rafMap, id)) continue;
+      if (rafMap[id] && rafMap[id].kind === "hold") {
+        holds.push(rafMap[id].cb);
+        delete rafMap[id];
+      }
+    }
+    for (var i = 0; i < holds.length; i++) {
+      try {
+        w.requestAnimationFrame(holds[i]);
+      } catch (_) {
+        /* 单个回调重挂失败不影响其它 */
+      }
+    }
+  }
+
   // —— 媒体音量：对齐官方 CEF 语义（浏览器级主音量与作者页面内音量独立相乘）——
   // 作者常在播放前重设 a.volume = uiVolume（Bocchi），且音频多为 `new Audio()` 不进
   // DOM——querySelectorAll 找不到、直接覆盖 volume 又会被作者回写。因此 hook 原型：
@@ -585,6 +614,56 @@
     }
     weFrozenMedia.length = 0;
   }
+
+  /**
+   * 暂停还要冻结 **CSS 动画 / 过渡**（Web Animations 时间轴）。
+   *
+   * rAF 与定时器冻结管不到它们：CSS `animation` 由浏览器**合成器**独立驱动，
+   * 与 JS 主线程无关。1444432396 Glitch Clock 的整个视觉（背景移动、抖动、故障
+   * 闪烁）是 10 处 `animation: … infinite`，只有时钟文字走 `setInterval` ——
+   * 暂停后画面照旧动个不停，用户看到的就是「无法暂停」（实测暂停期间 6 个动画
+   * 全为 `playState:"running"`，`currentTime` 700ms 推进整 700ms）。
+   *
+   * 官方暂停语义是「fully freeze the process that renders the wallpaper」，
+   * 合成器动画自然也在冻结范围内。
+   *
+   * 与媒体冻结同一条纪律：**只记录我们代为暂停的**，恢复时仅还原这部分——
+   * 作者自己用 `animation-play-state: paused` 停下的（常见于 hover 才播的装饰）
+   * 不能被我们唤醒。`getAnimations()` 拿的是活动动画对象，`pause()`/`play()`
+   * 直接作用在时间轴上，比改 `style.animationPlayState` 干净（后者会污染作者的
+   * 内联样式，且被作者下一次样式写入覆盖）。
+   */
+  var weFrozenAnims = [];
+  function freezePageAnimations() {
+    weFrozenAnims.length = 0;
+    try {
+      if (typeof w.document.getAnimations !== "function") return;
+      var anims = w.document.getAnimations();
+      for (var i = 0; i < anims.length; i++) {
+        var a = anims[i];
+        if (a && a.playState === "running") {
+          weFrozenAnims.push(a);
+          try {
+            a.pause();
+          } catch (_) {
+            /* 个别动画不可暂停时跳过 */
+          }
+        }
+      }
+    } catch (_) {
+      /* 旧引擎无 getAnimations：退化为不冻结，不报错 */
+    }
+  }
+  function thawPageAnimations() {
+    for (var i = 0; i < weFrozenAnims.length; i++) {
+      try {
+        weFrozenAnims[i].play();
+      } catch (_) {
+        /* 已被作者移除的动画忽略 */
+      }
+    }
+    weFrozenAnims.length = 0;
+  }
   w.__weSetPaused = function (v) {
     var next = !!v;
     if (next === paused) return;
@@ -592,10 +671,14 @@
     if (paused) {
       callSetPaused(true);
       freezePageMedia();
+      freezePageAnimations();
     } else {
       callSetPaused(false);
       thawPageMedia();
+      thawPageAnimations();
       resumeTimers();
+      // rAF 挂起项必须补跑，否则自递归的主循环永久断链（1278092907）
+      resumeRafHolds();
     }
   };
 

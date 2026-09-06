@@ -481,6 +481,126 @@ function runShim(extras) {
     );
   }
 
+  // ---------- 暂停期间挂起的 rAF 必须在恢复时补跑（1278092907 暂停后无法恢复）----------
+  //
+  // 作者的主循环普遍是 rAF 自递归。1278092907 Monstercat 的 `draw()` 在**函数体开头**就
+  // `requestAnimationFrame(draw)` 再画：暂停期间那次请求被节流层登记成 hold，若恢复时
+  // 没人补跑，整条链就没有下一帧 —— 画面永久定格、无任何报错（实测正常 59 帧/500ms →
+  // 暂停 0 → 恢复后仍 0）。
+  {
+    const rafCalls = [];
+    const { win } = runShim({
+      requestAnimationFrame: (cb) => {
+        rafCalls.push(cb);
+        return 100 + rafCalls.length;
+      },
+      cancelAnimationFrame() {},
+    });
+    let ticks = 0;
+    // 模拟作者的自递归主循环
+    const draw = () => {
+      win.requestAnimationFrame(draw);
+      ticks++;
+    };
+    const pump = () => {
+      const list = rafCalls.splice(0);
+      for (const cb of list) cb(performance.now());
+    };
+    draw(); // 首次登记（未暂停：应进真 rAF）
+    check(rafCalls.length === 1, "未暂停时 rAF 应透传到底层");
+    pump();
+    check(ticks === 2, `泵一次应推进一帧，实得 ticks=${ticks}`);
+    // 把已排入底层的那次请求跑掉，让队列干净 —— 暂停前已排队的帧照常跑完是**正确**行为
+    // （浏览器同样如此），不清空会把它误当成「暂停后仍在出帧」。
+    pump();
+    check(rafCalls.length === 1, "自递归应持续登记下一帧");
+
+    win.__weSetPaused(true);
+    // 暂停后作者那次 rAF 请求（在上一帧回调里发出的）已在 rafCalls 里；把它跑掉，
+    // 它会再次请求下一帧，而这一次应被节流层挂起、不再透传。
+    pump();
+    const beforePauseTicks = ticks;
+    check(rafCalls.length === 0, "暂停期间的 rAF 请求不得透传到底层（应挂起）");
+    pump(); // 队列已空，不该再出帧
+    check(
+      ticks === beforePauseTicks,
+      `暂停期间不得继续出帧，实得 ticks 从 ${beforePauseTicks} 变为 ${ticks}`,
+    );
+
+    win.__weSetPaused(false);
+    check(
+      rafCalls.length === 1,
+      `恢复时必须补跑挂起的 rAF（否则自递归主循环永久断链，1278092907），实得 ${rafCalls.length} 个`,
+    );
+    pump();
+    check(ticks > beforePauseTicks, `恢复后主循环必须重新出帧，实得 ticks=${ticks}`);
+    // 链路要能持续，不是只跑一帧
+    pump();
+    pump();
+    check(ticks >= beforePauseTicks + 3, `恢复后主循环应持续自递归，实得 ticks=${ticks}`);
+  }
+
+  // ---------- 暂停必须冻结 CSS 动画（1444432396 Glitch Clock 无法暂停）----------
+  //
+  // CSS `animation` 由浏览器**合成器**驱动，与 JS 主线程无关 —— 冻结 rAF 与定时器
+  // 完全管不到它。1444432396 的整个视觉是 10 处 `animation: … infinite`（只有时钟文字
+  // 走 setInterval），暂停后画面照旧动，用户看到就是「无法暂停」。
+  // 纪律与媒体冻结一致：只还原我们代为暂停的，作者自己 paused 的不许唤醒。
+  {
+    const mk = (playState) => ({
+      playState,
+      pauseCalls: 0,
+      playCalls: 0,
+      pause() {
+        this.pauseCalls++;
+        this.playState = "paused";
+      },
+      play() {
+        this.playCalls++;
+        this.playState = "running";
+      },
+    });
+    const anims = [mk("running"), mk("paused"), mk("running")];
+    const { win } = runShim({
+      document: {
+        readyState: "complete",
+        addEventListener() {},
+        documentElement: { setAttribute() {}, getAttribute() { return null; } },
+        querySelectorAll() {
+          return [];
+        },
+        getAnimations() {
+          return anims;
+        },
+      },
+    });
+    win.__weSetPaused(true);
+    check(
+      anims[0].pauseCalls === 1 && anims[2].pauseCalls === 1,
+      "暂停必须冻结正在播放的 CSS 动画（合成器驱动，rAF 冻结管不到，1444432396）",
+    );
+    check(anims[1].pauseCalls === 0, "作者自己已暂停的动画不得重复操作");
+    win.__weSetPaused(false);
+    check(
+      anims[0].playCalls === 1 && anims[2].playCalls === 1,
+      "恢复时应还原我们代为暂停的 CSS 动画",
+    );
+    check(anims[1].playCalls === 0, "作者自己暂停的 CSS 动画不得被唤醒（hover 才播的装饰）");
+  }
+
+  // ---------- 无 getAnimations 的旧引擎不得抛错 ----------
+  {
+    const { win } = runShim();
+    let threw = false;
+    try {
+      win.__weSetPaused(true);
+      win.__weSetPaused(false);
+    } catch {
+      threw = true;
+    }
+    check(!threw, "环境无 document.getAnimations 时暂停/恢复不得抛错");
+  }
+
   // ---------- 暂停冻结页内媒体：只冻结我们在场的，恢复只还原这部分 ----------
   {
     const media = [
