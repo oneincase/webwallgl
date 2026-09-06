@@ -434,6 +434,166 @@ console.log('\n【3. 指针源状态机】')
   delete globalThis.window
 }
 
+// ------------------------------------- 3.5 外部指针注入（桌面 underlay 通道）
+// 桌面壁纸窗口位于桌面图标之下，Finder 的桌面窗口吃掉全部鼠标事件 —— 页面里
+// 一个 mousemove 都收不到。宿主轮询系统鼠标后经 __wp.pushPointer 推入。
+// 这条链路一旦坏掉，表现是「壁纸完全不响应鼠标」且**无任何报错**，所以判据必须硬。
+console.log('\n【3.5 外部指针注入（宿主推送通道）】')
+{
+  globalThis.window = { innerWidth: 1600, innerHeight: 900 }
+  const src = createPointerSource({ target: null })
+
+  // 归一化 → 四套空间自洽（u/v、screenX/Y、wx/wy、originY）
+  src.pushExternal({ u: 0.25, v: 0.75, buttons: 0 })
+  if (Math.abs(src.state.u - 0.25) > 1e-9 || Math.abs(src.state.v - 0.75) > 1e-9) {
+    fail(`外部注入 u/v 未落地：${src.state.u},${src.state.v}`)
+  } else ok('外部注入写入 u/v（g_PointerPosition 空间，Y 朝下）')
+  // screenX/Y 由 u/v 乘视口反算 —— input.cursorScreenPosition 要的是像素
+  if (src.state.screenX !== 400 || src.state.screenY !== 675) {
+    fail(`外部注入 screenX/Y 反算错误：${src.state.screenX},${src.state.screenY}（应 400,675）`)
+  } else ok('外部注入反算 screenX/Y（input.cursorScreenPosition 空间）')
+  src.syncWorld({ offX: 0, offY: 0, viewW: 1600, viewH: 900, projH: 900 })
+  if (Math.abs(src.state.wx - 400) > 1e-9 || Math.abs(src.state.wy - 675) > 1e-9) {
+    fail(`外部注入世界坐标错误：${src.state.wx},${src.state.wy}`)
+  } else if (Math.abs(src.state.originY - 225) > 1e-9) {
+    fail(`外部注入 originY 错误：${src.state.originY}（应 projH-wy=225）`)
+  } else ok('外部注入经 syncWorld 得到世界像素与 origin Y-up（hit-test / 脚本跟随一致）')
+
+  // 首次注入把 last 对齐 current：与 DOM 首事件同一约定，否则从屏幕中心
+  // (0.5,0.5) 拍出一道贯穿全屏的假波纹。
+  {
+    const s = createPointerSource({ target: null })
+    s.pushExternal({ u: 0, v: 0 })
+    if (s.normalizedDelta() > 1e-9) {
+      fail(`首次外部注入 delta=${s.normalizedDelta()}（last 未对齐，会从中心拍假波纹）`)
+    } else ok('首次外部注入 last 与 current 对齐（与 DOM 路径同一约定）')
+  }
+
+  // **最容易回归坏掉的一条**：推送频率（~90Hz）高于帧率，若 pushExternal 里
+  // 推进了 last，帧间位移恒接近 0 —— cursorripple 完全不起波且无报错
+  // （与 DOM 路径同一个坑，见 pointer.js 文件头）。
+  {
+    const s = createPointerSource({ target: null })
+    s.pushExternal({ u: 0.1, v: 0.5 })
+    s.beginFrame() // 帧 0 消费完毕
+    // 一帧之内宿主推了三次（模拟 90Hz 推送 / 60fps 渲染）
+    s.pushExternal({ u: 0.4, v: 0.5 })
+    s.pushExternal({ u: 0.7, v: 0.5 })
+    s.pushExternal({ u: 0.9, v: 0.5 })
+    if (Math.abs(s.state.lastU - 0.1) > 1e-9) {
+      fail(`外部注入改写了 last（lastU=${s.state.lastU}，应仍为 0.1）：` +
+        'last 必须只在 beginFrame 推进，否则涟漪力场恒为零')
+    } else ok('外部注入不改写 last（同帧多次推送后 last 仍是上帧值）')
+    const d = s.normalizedDelta()
+    if (!(d > 0.7)) fail(`同帧多次推送后帧间位移丢失（delta=${d}）`)
+    else ok(`同帧多次推送保留完整帧间位移（delta=${d.toFixed(3)}，涟漪才有冲量）`)
+  }
+
+  // 按键位掩码：只消费 bit0；高位（右/中键）不得污染 leftDown
+  src.pushExternal({ u: 0.25, v: 0.75, buttons: 1 })
+  if (!src.state.leftDown) fail('buttons bit0 未映射到 leftDown')
+  else ok('buttons bit0 → leftDown（input.cursorLeftDown）')
+  src.pushExternal({ u: 0.25, v: 0.75, buttons: 0 })
+  if (src.state.leftDown) fail('buttons 清零后 leftDown 未清')
+  src.pushExternal({ u: 0.25, v: 0.75, buttons: 6 }) // bit1|bit2 = 右+中
+  if (src.state.leftDown) {
+    fail('右/中键位污染了 leftDown（会让点击类脚本误触发）')
+  } else ok('高位按键不污染 leftDown（WE 语义只有左键）')
+
+  // down/up 计数按跳变累加：外部注入是**状态**而非事件，同状态重复推送
+  // 不该把计数刷爆（诊断面 __pointerStats 会失去意义）
+  {
+    const s = createPointerSource({ target: null })
+    s.pushExternal({ u: 0.5, v: 0.5, buttons: 1 })
+    s.pushExternal({ u: 0.5, v: 0.5, buttons: 1 })
+    s.pushExternal({ u: 0.5, v: 0.5, buttons: 1 })
+    if (s.state.downCount !== 1) {
+      fail(`重复推送按下态使 downCount=${s.state.downCount}（应按跳变计 1）`)
+    } else ok('按键计数按跳变累加（重复推送同一状态不刷爆计数）')
+  }
+
+  // pushExternalLeave 只清按键、**保留位置与 has**。清 has 会让 xray 开窗
+  // 跳到相机外（renderer.js XRAY_IDLE_SCREEN_UV）、视差弹回中心，画面明显抽一下。
+  src.pushExternal({ u: 0.3, v: 0.6, buttons: 1 })
+  src.pushExternalLeave()
+  if (src.state.leftDown) fail('pushExternalLeave 未清按键（点击态会永久卡住）')
+  else if (!src.state.has) {
+    fail('pushExternalLeave 清掉了 has：xray 会跳到相机外、视差弹回中心（画面抽一下）')
+  } else if (Math.abs(src.state.u - 0.3) > 1e-9 || Math.abs(src.state.v - 0.6) > 1e-9) {
+    fail('pushExternalLeave 改写了位置（应停在最后已知点）')
+  } else ok('pushExternalLeave 只清按键，保留位置与 has（不让 xray/视差抽帧）')
+
+  // 非有限值必须丢弃：宿主换算出 NaN 时若写进 state，NaN 会顺 uniform 传到
+  // shader 让整层画面消失，且 wx/wy 污染 hit-test —— 排查成本极高。
+  src.pushExternal({ u: 0.3, v: 0.6 })
+  src.pushExternal({ u: NaN, v: 0.6 })
+  src.pushExternal({ u: 0.3, v: undefined })
+  if (!Number.isFinite(src.state.u) || !Number.isFinite(src.state.v)) {
+    fail('非有限坐标写进了 state（NaN 会顺 uniform 传到 shader 让整层消失）')
+  } else if (Math.abs(src.state.u - 0.3) > 1e-9 || Math.abs(src.state.v - 0.6) > 1e-9) {
+    fail(`非有限坐标未被丢弃干净：${src.state.u},${src.state.v}`)
+  } else ok('非有限坐标被丢弃，保留上一个有效值（NaN 不进 uniform）')
+
+  // 外部注入与 DOM 监听并存：测试台用真鼠标、宿主用推送，两条路必须走
+  // 同一写入路径（applyMove/applyButtons），否则首帧对齐/计数语义会漂移。
+  {
+    const handlers = new Map()
+    const target = {
+      addEventListener: (n, fn) => handlers.set(n, fn),
+      removeEventListener: (n) => handlers.delete(n),
+    }
+    const s = createPointerSource({ target })
+    const emit = (n, ev) => { const h = handlers.get(n); if (h) h(ev) }
+    emit('mousemove', { clientX: 160, clientY: 90 })
+    s.pushExternal({ u: 0.5, v: 0.5 })
+    if (Math.abs(s.state.u - 0.5) > 1e-9) fail('外部注入未覆盖 DOM 事件（应谁后写谁赢）')
+    else ok('外部注入与 DOM 监听并存，后写者赢')
+    emit('mousemove', { clientX: 1440, clientY: 810 })
+    if (Math.abs(s.state.u - 0.9) > 1e-9) fail('DOM 事件未覆盖外部注入（应谁后写谁赢）')
+    else ok('DOM 事件同样可覆盖外部注入（测试台真鼠标路径不受影响）')
+    s.dispose()
+  }
+
+  // 源码守卫：两条路必须共用写入路径。各写一份必然漂移（首帧 last 对齐、
+  // 诊断计数、lastEventTime），而漂移不会报错，只会让某一条路行为诡异。
+  {
+    const text = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/pointer.js'), 'utf8')
+    const moveCalls = (text.match(/applyMove\(/g) || []).length
+    const btnCalls = (text.match(/applyButtons\(/g) || []).length
+    // 定义 1 次 + onMove 1 次 + pushExternal 1 次
+    if (moveCalls < 3) {
+      fail(`applyMove 出现 ${moveCalls} 次：DOM 与外部注入应共用同一位置写入路径`)
+    } else ok('位置写入路径唯一（DOM 与外部注入共用 applyMove）')
+    // 定义 1 + onDown + onUp + onLeaveWindow + pushExternal + pushExternalLeave
+    if (btnCalls < 6) {
+      fail(`applyButtons 出现 ${btnCalls} 次：DOM 与外部注入应共用同一按键写入路径`)
+    } else ok('按键写入路径唯一（DOM 与外部注入共用 applyButtons）')
+  }
+
+  // 接线守卫：装配层必须把注入出口挂到 rt.pointerCtl，适配层才能经 __wp 转发。
+  {
+    const mountSrc = fs.readFileSync(path.join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
+    if (!/rt\.pointerCtl\s*=/.test(mountSrc)) {
+      fail('scene-mount 未挂 rt.pointerCtl：__wp.pushPointer 会静默无效（壁纸永不响应鼠标）')
+    } else if (!mountSrc.includes('pushExternal')) {
+      fail('scene-mount 的 pointerCtl 未接到 pointerSrc.pushExternal')
+    } else ok('scene-mount 挂出 rt.pointerCtl（接到 pointerSrc.pushExternal）')
+
+    const mainSrc = fs.readFileSync(path.join(ROOT, 'renderer/src/main.ts'), 'utf8')
+    // 只在 window.__wp 赋值块内找实现 —— 顶上的 `declare global` 类型声明里也有
+    // 同名 `pushPointer(u: number, ...)`，全文匹配会让删掉实现后判据仍假绿。
+    const wpStart = mainSrc.indexOf('window.__wp = {')
+    const wpBlock = wpStart >= 0 ? mainSrc.slice(wpStart) : ''
+    if (!/\n  pushPointer\(/.test(wpBlock) || !/\n  pointerLeave\(/.test(wpBlock)) {
+      fail('main.ts 的 window.__wp 里缺 pushPointer/pointerLeave 实现（宿主推送无处可去）')
+    } else if (!/rt\.pointerCtl\?\.push\(/.test(wpBlock)) {
+      fail('__wp.pushPointer 未转发到 rt.pointerCtl（调用成功但指针不动）')
+    } else ok('main.ts 的 __wp.pushPointer 转发到 rt.pointerCtl（宿主契约面通）')
+  }
+
+  delete globalThis.window
+}
+
 // --------------------------------------- 4. 全库 cursor* 回调过沙箱
 console.log('\n【4. 全库 cursor* 回调沙箱求值】')
 {

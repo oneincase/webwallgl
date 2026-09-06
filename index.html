@@ -141,6 +141,10 @@
               <input id="live-system" type="checkbox" checked />
               <span data-i18n="toolbar.live">系统实况</span>
             </label>
+            <label class="check" data-i18n-title="toolbar.pointerPushTip" title="模拟桌面壁纸窗口：遮罩挡住原生鼠标事件，改用 __wp.pushPointer 推送坐标 —— 与宿主对接的是同一条通道">
+              <input id="pointer-push" type="checkbox" />
+              <span data-i18n="toolbar.pointerPush">指针注入</span>
+            </label>
             <button type="button" id="pause" data-i18n="toolbar.pause">暂停</button>
             <button type="button" id="reload" data-i18n="toolbar.reload">重挂载</button>
             <button type="button" id="release" data-i18n="toolbar.release">释放</button>
@@ -171,6 +175,10 @@
                 <div id="stage">
                   <iframe id="frame" title="renderer" allow="microphone"></iframe>
                   <div id="empty" data-i18n="stage.empty">从左侧选择一个壁纸开始渲染</div>
+                  <!-- 指针注入遮罩：开启时盖在 iframe 上吃掉原生鼠标事件，
+                       模拟桌面 underlay 层（页面收不到 mousemove），坐标改由
+                       __wp.pushPointer 推送。默认 hidden，不影响真鼠标路径。 -->
+                  <div id="pointer-veil" hidden></div>
                 </div>
               </div>
               <div id="stage-badge" hidden></div>

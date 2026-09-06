@@ -59,6 +59,9 @@ type RendererWindow = Window & {
     setFilter(filter: string): void;
     setSceneFps(fps: number): void;
     updateWebProps(props: Record<string, { value: unknown }>): void;
+    /** 外部指针注入（宿主推送通道，见 docs/INTEGRATION.md） */
+    pushPointer(u: number, v: number, buttons?: number): void;
+    pointerLeave(): void;
     loadSceneFile(file: File, project?: File): void;
   };
   /** 渲染器运行时观测面（见 renderer/src/main.ts 的 __wpStats） */
@@ -90,6 +93,8 @@ const dprEl = $<HTMLSelectElement>("#dpr");
 const fpsEl = $<HTMLSelectElement>("#fps");
 const volumeEl = $<HTMLInputElement>("#volume");
 const liveSystemEl = $<HTMLInputElement>("#live-system");
+const pointerPushEl = $<HTMLInputElement>("#pointer-push");
+const pointerVeilEl = $<HTMLElement>("#pointer-veil");
 const resolutionEl = $<HTMLSelectElement>("#resolution");
 const stageFrameEl = $<HTMLElement>("#stage-frame");
 const stageScaleEl = $<HTMLElement>("#stage-scale");
@@ -700,6 +705,12 @@ function wp() {
   return w.__wp;
 }
 
+/** 同上但不打日志：高频调用（指针注入每次 mousemove）用它，
+ *  否则渲染器未就绪时会把日志面板刷爆。 */
+function wpQuiet() {
+  return (frameEl.contentWindow as RendererWindow | null)?.__wp ?? null;
+}
+
 /** 确保渲染器页已在 iframe 里就绪（静态模式没有壁纸库选择流程，iframe 可能还空着），
  *  需要时先补载一次渲染器页；resolve 出 __wp 控制面。 */
 function ensureRenderer(): Promise<NonNullable<RendererWindow["__wp"]>> {
@@ -838,6 +849,84 @@ liveSystemEl.onchange = () => {
       : t("log.liveOff"),
   );
 };
+
+// ---- 指针注入（模拟桌面壁纸窗口的宿主推送通道）----
+//
+// 桌面壁纸窗口位于「桌面 underlay」层（桌面图标之下），Finder 的桌面窗口全屏
+// 盖在上面并吃掉全部鼠标事件 —— 壁纸页里一个 mousemove 都收不到。宿主的办法是
+// 自己轮询系统鼠标（CGEventGetLocation + CGEventSourceButtonState，零权限），
+// 换算成窗口归一化坐标后经 __wp.pushPointer 推进去。
+//
+// 这里用一层遮罩复现同样的处境：遮罩挡住 iframe，原生事件进不去，坐标只能靠
+// 推送。开启后能在本库内验证整条注入链路，不必等下游宿主实现 —— 也是下游对接
+// 时的参照实现（换算口径、按键掩码、离开语义都一致）。
+const POINTER_PUSH_KEY = "we-bench-pointer-push";
+
+/** 遮罩坐标 → 归一化 u/v。用遮罩自身的盒子而非舞台：固定分辨率模式下
+ *  #stage 带 CSS transform 缩放，遮罩与 iframe 同在缩放后的坐标系里，
+ *  getBoundingClientRect 已含缩放，比例天然与渲染器视口一致。 */
+function veilToNormalized(ev: MouseEvent): { u: number; v: number } {
+  const r = pointerVeilEl.getBoundingClientRect();
+  const u = r.width > 0 ? (ev.clientX - r.left) / r.width : 0.5;
+  const v = r.height > 0 ? (ev.clientY - r.top) / r.height : 0.5;
+  // 边界钳位：遮罩外沿的半像素舍入会算出 -0.0001 / 1.0001，
+  // 宿主侧也应保证 [0,1]（越界值会让 hit-test 落到画面外）。
+  return { u: Math.min(1, Math.max(0, u)), v: Math.min(1, Math.max(0, v)) };
+}
+
+// 按键位掩码：与契约一致，bit0 左键。MouseEvent.buttons 的 bit0 恰好也是左键，
+// 但 bit1/bit2 语义是右/中（DOM 里 2=右、4=中），与契约同构，直接透传。
+let veilButtons = 0;
+
+pointerVeilEl.addEventListener("mousemove", (ev) => {
+  const { u, v } = veilToNormalized(ev);
+  wpQuiet()?.pushPointer(u, v, veilButtons);
+});
+pointerVeilEl.addEventListener("mousedown", (ev) => {
+  veilButtons = ev.buttons;
+  const { u, v } = veilToNormalized(ev);
+  wpQuiet()?.pushPointer(u, v, veilButtons);
+});
+// mouseup 挂 window 而不是遮罩：在遮罩内按下、拖到遮罩外松手时，
+// 遮罩收不到 mouseup，按下态会永久卡住（DOM 路径当年踩过同一个坑）。
+window.addEventListener("mouseup", (ev) => {
+  if (pointerVeilEl.hidden) return;
+  veilButtons = ev.buttons;
+  const { u, v } = veilToNormalized(ev);
+  wpQuiet()?.pushPointer(u, v, veilButtons);
+});
+// 移出遮罩 = 鼠标去了别的显示器：清按键，位置保持最后已知点
+pointerVeilEl.addEventListener("mouseleave", () => {
+  veilButtons = 0;
+  wpQuiet()?.pointerLeave();
+});
+
+function applyPointerPush() {
+  const on = pointerPushEl.checked;
+  pointerVeilEl.hidden = !on;
+  if (!on) {
+    veilButtons = 0;
+    // 关掉注入时补一次 leave：否则最后那次按下态会留在场景里
+    wpQuiet()?.pointerLeave();
+  }
+}
+
+pointerPushEl.onchange = () => {
+  applyPointerPush();
+  try {
+    localStorage.setItem(POINTER_PUSH_KEY, pointerPushEl.checked ? "1" : "0");
+  } catch {
+    /* 隐私模式忽略 */
+  }
+  log(pointerPushEl.checked ? t("log.pointerPushOn") : t("log.pointerPushOff"));
+};
+
+try {
+  pointerPushEl.checked = localStorage.getItem(POINTER_PUSH_KEY) === "1";
+} catch {
+  /* 隐私模式忽略 */
+}
+applyPointerPush();
 
 function layoutStage() {
   const val = resolutionEl.value;

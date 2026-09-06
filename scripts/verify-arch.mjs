@@ -124,6 +124,11 @@ const REQUIRED_WP = [
   "setRenderDpr",
   "setSceneFps",
   "updateWebProps",
+  // 外部指针注入（桌面 underlay 层收不到鼠标事件，宿主轮询系统鼠标后推入）。
+  // 下游 WallpaperEM 按 docs/INTEGRATION.md 对接；改名或删除会静默断掉桌面交互，
+  // 且没有任何报错 —— 壁纸只是永远不响应鼠标，所以纳入契约面守卫。
+  "pushPointer",
+  "pointerLeave",
 ];
 for (const name of REQUIRED_WP) {
   check(defined.has(name), `契约面：window.__wp.${name} 在 main.ts 里缺失（见 docs/INTEGRATION.md）`);

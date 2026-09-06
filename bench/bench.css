@@ -633,6 +633,34 @@ select:hover {
   font-size: 13px;
 }
 
+/* 指针注入遮罩：盖在 iframe 上吃掉原生鼠标事件，模拟桌面 underlay 层
+   （壁纸窗口在桌面图标之下，页面收不到 mousemove）。开启后坐标只能经
+   __wp.pushPointer 进去 —— 与宿主对接的是同一条通道。
+   刻意留一点可见性（细虚线边框 + 角标），否则「开着注入」这件事看不出来，
+   排查时会误以为原生鼠标还在生效。 */
+#pointer-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  cursor: crosshair;
+  outline: 1px dashed rgba(120, 180, 255, 0.5);
+  outline-offset: -1px;
+}
+
+#pointer-veil::after {
+  content: "指针注入（原生事件已屏蔽）";
+  position: absolute;
+  left: 20px;
+  bottom: 20px;
+  padding: 2px 8px;
+  border: 1px solid rgba(120, 180, 255, 0.5);
+  border-radius: 2px;
+  background: rgba(24, 24, 24, 0.88);
+  color: #7ab4ff;
+  font: 11px/1.4 var(--mono);
+  pointer-events: none;
+}
+
 /* ---------- 自定义配置（右侧边栏，对标 WE 属性窗口） ---------- */
 
 #props {

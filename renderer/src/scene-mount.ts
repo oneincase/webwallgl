@@ -528,6 +528,13 @@ cfg, source, pkgAbort.signal);
           : {},
       );
       renderer.setPointerProvider(() => pointerSrc);
+      // 外部指针注入出口：桌面壁纸窗口在 underlay 层（桌面图标之下）收不到任何
+      // 鼠标事件，宿主轮询系统鼠标后经 __wp.pushPointer 推到这里。与上面的 DOM
+      // 监听并存（谁后写谁赢），测试台用真鼠标的路径不受影响。
+      rt.pointerCtl = {
+        push: (p) => pointerSrc.pushExternal(p),
+        leave: () => pointerSrc.pushExternalLeave(),
+      };
       {
         const prevCleanup = particleCleanup;
         particleCleanup = () => {

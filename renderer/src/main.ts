@@ -163,6 +163,20 @@ declare global {
       setFilter(filter: string): void;
       /** 热更新 WE 网页壁纸用户属性（wire 格式：{name: {value: ...}}） */
       updateWebProps(props: Record<string, { value: unknown }>): void;
+      /**
+       * 外部指针注入（宿主轮询系统鼠标后推入）。桌面壁纸窗口位于「桌面 underlay」
+       * 层（桌面图标之下），Finder 的桌面窗口吃掉全部鼠标事件，页面收不到 mousemove。
+       *
+       * @param u 归一化 X ∈ [0,1]，相对本窗口左边
+       * @param v 归一化 Y ∈ [0,1]，相对本窗口上边（**Y 朝下**，不要替 shader 翻）
+       * @param buttons 按键位掩码：bit0 左键。当前只消费 bit0
+       *
+       * 宿主侧的坐标换算、采样频率、点击边缘保持等要求见 docs/INTEGRATION.md。
+       * 仅对场景壁纸生效（网页壁纸的合成事件通道尚未实现）。
+       */
+      pushPointer(u: number, v: number, buttons?: number): void;
+      /** 外部指针离开本窗口（鼠标移到别的显示器）：清按键，位置保持最后已知点 */
+      pointerLeave(): void;
       /** 纯前端预览：本地 scene.pkg（File）直进 fileSource，无需任何后端；project.json 可选 */
       loadSceneFile(file: File, project?: File): void;
     };
@@ -276,6 +290,19 @@ window.__wp = {
     }
     weShimCall(rt, (w: any) => w.__weApplyProps?.(props));
   },
+  // 外部指针注入。桌面壁纸窗口在 underlay 层（桌面图标之下）收不到任何鼠标事件 ——
+  // Finder 的桌面窗口全屏盖在上面吃掉了它们，且 macOS 没有「向下透传」的窗口属性。
+  // 宿主轮询系统鼠标（CGEventGetLocation + CGEventSourceButtonState，零权限）后
+  // 换算成本窗口归一化坐标推进来。协议与宿主实现要求见 docs/INTEGRATION.md。
+  //
+  // 用扁平位置参数而非对象：宿主经 window.eval 字符串注入，~90Hz 调用下参数
+  // 越短 eval 解析越省。无场景壁纸（视频/网页/降级页）时静默忽略。
+  pushPointer(u: number, v: number, buttons?: number) {
+    rt.pointerCtl?.push({ u, v, buttons });
+  },
+  pointerLeave() {
+    rt.pointerCtl?.leave();
+  },
   // 纯前端预览：本地 scene.pkg 经同源 iframe 直传进来，包字节不落任何服务器。
   // 继承当前 fit/dpr/帧率/滤镜等观看偏好；无 project.json 时属性用场景快照值。
   loadSceneFile(file: File, project?: File) {
@@ -316,15 +343,9 @@ rt.cfg = initialCfg;
 applyWallpaperFilter(rt);
 mountWallpaper(rt, initialCfg);
 
-// 诊断：确认壁纸窗口是否收到鼠标事件（上报 /diag，仅首次，避免刷屏）
-let diagMouseOnce = false;
-const diagMouse = (ev: Event, label: string) => {
-  if (diagMouseOnce) return;
-  diagMouseOnce = true;
-  reportDiag(rt, initialCfg, `${label} 收到`);
-};
-window.addEventListener("mousemove", (e) => diagMouse(e, "mousemove"), { once: true, passive: true });
-window.addEventListener("mousedown", (e) => diagMouse(e, "mousedown"), { once: true, passive: true });
+// 这里曾有一个一次性 /diag 探针，上报「壁纸窗口是否收到 mousemove/mousedown」。
+// 结论已定且成了 __wp.pushPointer 存在的理由：underlay 层（桌面图标之下）永远
+// 收不到 —— Finder 的桌面窗口吃掉了全部鼠标事件。故移除探针，不再重复求证。
 
 // 页面卸载兜底：预览 iframe 关闭 / 壁纸窗口销毁时释放 WebGL 上下文与 blob URL。
 // （clear() 内部用 sceneCleanup 置 disposed + renderer.dispose，对已进入卸载流程的 iframe 安全。）

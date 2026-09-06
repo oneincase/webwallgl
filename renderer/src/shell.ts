@@ -62,6 +62,15 @@ export type Runtime = {
     resume(): void;
     applyUserProperties(props: Record<string, { value: unknown }>): void;
   };
+  /**
+   * 外部指针注入句柄（桌面壁纸窗口在桌面 underlay 层收不到鼠标事件，由宿主
+   * 轮询系统鼠标推入）。只有场景壁纸装配时设置；__wp.pushPointer 经它写入。
+   * 协议与宿主实现指南见 docs/INTEGRATION.md。
+   */
+  pointerCtl?: {
+    push(p: { u: number; v: number; buttons?: number }): void;
+    leave(): void;
+  };
   /** 当前场景的扁平化用户属性值表（mountScene 装配后写入；getProperties 用） */
   liveUserProps?: Record<string, unknown>;
   /** 场景基本信息（onSceneInfo 触发时写入；具体结构见 api/types.ts 的 SceneInfo） */
@@ -175,6 +184,7 @@ export function clear(rt: Runtime) {
   if (rt.sceneCleanup) rt.sceneCleanup();
   rt.sceneCleanup = undefined;
   rt.sceneCtl = undefined;
+  rt.pointerCtl = undefined;
   // 释放旧场景渲染器（loseContext → 归还 WebGL 上下文与全部纹理/FBO/program/buffer）
   if (rt.renderer) {
     rt.renderer.dispose?.();

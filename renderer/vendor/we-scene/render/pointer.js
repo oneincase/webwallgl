@@ -49,6 +49,18 @@
  * 若在消费前 last = current，帧间位移当场归零 —— 3299228616 的鼠标涟漪就是
  * 这样「效果在跑、力场恒为零」。正确顺序：消费（last=上帧, current=新）→
  * 再 beginFrame 把 last 推到 current，留给下一帧。
+ *
+ * ---- 外部注入（pushExternal / pushExternalLeave）----
+ *
+ * 桌面壁纸窗口位于「桌面 underlay」层（桌面图标之下），Finder 的桌面窗口全屏
+ * 盖在上面并吃掉全部鼠标事件 —— 页面里一个 mousemove 都收不到，且 macOS 没有
+ * 「向下透传」的窗口属性可用。唯一出路是宿主进程自己读系统鼠标状态
+ * （CGEventGetLocation + CGEventSourceButtonState，零权限），换算成本窗口的
+ * 归一化坐标后推进来。协议见 docs/INTEGRATION.md。
+ *
+ * 外部推送与 DOM 监听**并存**（谁后写谁赢）：测试台在普通浏览器里用真鼠标，
+ * 宿主里用推送，两条路走**同一个** applyMove/applyButtons 写入路径 ——
+ * 不能各写一份，否则首帧 last 对齐、诊断计数、lastEventTime 语义必然漂移。
  */
 
 /**
@@ -116,17 +128,11 @@ export function createPointerSource(opts = {}) {
   }
   readViewport()
 
-  function onMove(ev) {
-    readViewport()
-    // 目标是 Element（嵌入式 canvas 宿主）时，clientX/Y 是**页面**坐标，
-    // 必须减掉元素偏移；window 目标的 clientX/Y 本就是视口坐标，不用减。
-    let x = ev.clientX
-    let y = ev.clientY
-    if (target && typeof target.getBoundingClientRect === 'function') {
-      const r = target.getBoundingClientRect()
-      x -= r.left
-      y -= r.top
-    }
+  /**
+   * 位置写入的**唯一**路径：DOM mousemove 与外部注入都走这里。
+   * 传入的是相对视口/元素左上角的像素（Y 朝下）。
+   */
+  function applyMove(x, y) {
     const u = x / state.screenW
     const v = y / state.screenH
     // 首个事件把 last 对齐到 current：默认 last 停在屏幕中心 (0.5,0.5)，
@@ -145,21 +151,49 @@ export function createPointerSource(opts = {}) {
     state.moveCount++
     state.lastEventTime = Date.now()
   }
+
+  /**
+   * 按键写入的**唯一**路径。mask 是位掩码：bit0 左、bit1 右、bit2 中。
+   * 当前只消费 bit0（leftDown）—— WE 语义里只有 input.cursorLeftDown，
+   * 全库无一处读右键。掩码形式是为了宿主一次对接，将来接右键不必改协议。
+   * down/up 计数按**跳变**累加，与 DOM 的 mousedown/mouseup 次数语义一致
+   * （外部注入是状态而非事件，同一状态重复推送不该把计数刷爆）。
+   */
+  function applyButtons(mask) {
+    const left = (mask & 1) !== 0
+    if (left === state.leftDown) return
+    state.leftDown = left
+    if (left) state.downCount++
+    else state.upCount++
+    state.lastEventTime = Date.now()
+  }
+
+  function onMove(ev) {
+    readViewport()
+    // 目标是 Element（嵌入式 canvas 宿主）时，clientX/Y 是**页面**坐标，
+    // 必须减掉元素偏移；window 目标的 clientX/Y 本就是视口坐标，不用减。
+    let x = ev.clientX
+    let y = ev.clientY
+    if (target && typeof target.getBoundingClientRect === 'function') {
+      const r = target.getBoundingClientRect()
+      x -= r.left
+      y -= r.top
+    }
+    applyMove(x, y)
+  }
   // 只跟踪左键（button 0）。中/右键不属于 cursorLeftDown 语义。
   function onDown(ev) {
     if (ev.button !== undefined && ev.button !== 0) return
-    state.leftDown = true
-    state.downCount++
+    applyButtons(1)
   }
   function onUp(ev) {
     if (ev.button !== undefined && ev.button !== 0) return
-    state.leftDown = false
-    state.upCount++
+    applyButtons(0)
   }
   // 指针移出窗口后松手，mouseup 落在窗口外收不到 —— 不清掉会让 leftDown 永久卡住，
   // 点击类脚本（3791967416 的 hovered && cursorLeftDown）从此一直认为按键按着。
   function onLeaveWindow() {
-    state.leftDown = false
+    applyButtons(0)
   }
 
   let attached = false
@@ -177,6 +211,46 @@ export function createPointerSource(opts = {}) {
 
   return {
     state,
+
+    /**
+     * 外部注入指针状态（宿主轮询系统鼠标后推入）。协议见 docs/INTEGRATION.md。
+     *
+     * 接**归一化**坐标而不是像素：宿主知道自己那块屏的 points 尺寸，除法在它那边
+     * 做更准（混合 DPI 多显示器下无需任何 DPR 折算）；这里再乘回 screenW/H 得到
+     * input.cursorScreenPosition 要的像素。
+     *
+     * u/v 是 [0,1]、原点左上、**Y 朝下** —— 与 DOM 路径的 state.u/v 同一空间
+     * （见文件头坐标约定）。宿主不要替 shader 翻 Y。
+     *
+     * 不在这里推进 last：外部推送频率（~90Hz）高于帧率，若在推送里推进 last，
+     * `length(g_PointerPosition - g_PointerPositionLast)` 会恒接近 0，
+     * cursorripple 完全不起波且无报错（与 DOM 路径同一个坑，见文件头）。
+     *
+     * @param {{u:number, v:number, buttons?:number}} p 归一化位置 + 按键位掩码（bit0 左）
+     */
+    pushExternal(p) {
+      if (!p) return
+      readViewport()
+      const u = Number(p.u)
+      const v = Number(p.v)
+      // 非有限值直接丢弃：宿主换算出 NaN 时若写进去，wx/wy 会污染 hit-test，
+      // 且 NaN 会顺着 uniform 传到 shader 让整层画面消失（排查成本极高）。
+      if (Number.isFinite(u) && Number.isFinite(v)) {
+        applyMove(u * state.screenW, v * state.screenH)
+      }
+      applyButtons(Number(p.buttons) || 0)
+    },
+
+    /**
+     * 外部指针离开本窗口（鼠标移到了别的显示器）。
+     *
+     * **只清按键，保留位置与 has** —— 清 has 会让 xray 开窗突然跳到相机外
+     * （renderer.js 的 XRAY_IDLE_SCREEN_UV）、视差弹回中心，画面会明显抽一下。
+     * 语义与 DOM 的 onLeaveWindow 一致：位置停在最后已知点，只是不再按着键。
+     */
+    pushExternalLeave() {
+      applyButtons(0)
+    },
 
     /**
      * 每帧所有消费方读完 current/last **之后**调用一次：把 last 推到 current。
