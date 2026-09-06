@@ -172,7 +172,8 @@ declare global {
        * @param buttons 按键位掩码：bit0 左键。当前只消费 bit0
        *
        * 宿主侧的坐标换算、采样频率、点击边缘保持等要求见 docs/INTEGRATION.md。
-       * 仅对场景壁纸生效（网页壁纸的合成事件通道尚未实现）。
+       * 场景壁纸与网页壁纸都生效：场景侧写进统一指针状态对象，网页侧由 shim 合成
+       * DOM 事件（CSS `:hover` 是硬限制，合成事件点不亮它）。
        */
       pushPointer(u: number, v: number, buttons?: number): void;
       /** 外部指针离开本窗口（鼠标移到别的显示器）：清按键，位置保持最后已知点 */

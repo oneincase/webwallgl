@@ -62,6 +62,41 @@ async function importRewrite() {
 
 const rw = await importRewrite();
 
+/**
+ * 从 web.ts 里抽出一个**独立**的导出函数并编译执行。
+ *
+ * 不整体 bundle web.ts：它会拉进 vendor 引擎与 `?raw` 导入（esbuild 解析不了）。
+ * 抽源码片段的好处是断言跑的是**真实现**而不是 verifier 里复算的一份副本 ——
+ * 复算副本的坑刚踩过：实现改坏（换算漏减偏移）而 verifier 照绿。
+ */
+async function importIsolatedFn(srcText, fnName) {
+  const at = srcText.indexOf(`export function ${fnName}`);
+  if (at < 0) return null;
+  // 找函数结尾用「行首的 }」而不是括号配对：参数与返回值的类型字面量
+  // （`{ left: number; … }`、`{ x: number } | null`）里也有花括号，配对会切错位置。
+  // 本仓库顶层函数一律零缩进，行首 } 就是函数结尾。
+  const endAt = srcText.indexOf("\n}", at);
+  if (endAt < 0) return null;
+  const esbuild = await import("esbuild");
+  const out = await esbuild.transform(srcText.slice(at, endAt + 2), {
+    loader: "ts",
+    format: "esm",
+    target: "es2022",
+  });
+  const tmp = path.join(ROOT, "scripts", `.tmp-web-fn-${fnName}-${process.pid}.mjs`);
+  fs.writeFileSync(tmp, out.code);
+  try {
+    const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+    return mod[fnName] ?? null;
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* 忽略 */
+    }
+  }
+}
+
 // ---------- 1. rewriteHtml ----------
 {
   const shim = "window.__TEST_SHIM=1;";
@@ -650,6 +685,408 @@ function runShim(extras) {
     win.__weRewriteFileUrl("file:///files/wallpaper.webm") === "file:///files/wallpaper.webm",
     "file: 协议页应保留 file:///（真本地嵌入）",
   );
+}
+
+// ---------- 3c. 外部指针注入（桌面 underlay 通道的网页侧：合成 DOM 事件）----------
+//
+// 桌面壁纸窗口在 underlay 层收不到任何鼠标事件，宿主轮询系统鼠标后经
+// __wp.pushPointer 推入。场景侧写一个状态对象即可（verify-pointer 第 3.5 节），
+// 网页侧必须把推送**还原成合成 DOM 事件**——作者代码就是监听 DOM 的。
+//
+// 这一族缺陷全都是静默的：事件不发 / target 打错 / 边界链缺失，画面只是「不响应鼠标」，
+// 控制台一片安静。所以每条不变量都要有断言。
+{
+  // 最小 DOM：只实现派发链需要的部分（parentNode / dispatchEvent / 捕获-冒泡）。
+  // 不用 jsdom —— 全仓 verifier 都是零依赖离线跑。
+  class FakeNode {
+    constructor(name, parent) {
+      this.nodeName = name;
+      this.parentNode = parent || null;
+      this.children = [];
+      if (parent) parent.children.push(this);
+      this.log = [];
+    }
+    addEventListener(type, fn) {
+      (this.handlers ??= {})[type] ??= [];
+      this.handlers[type].push(fn);
+    }
+    dispatchEvent(ev) {
+      // 冒泡：目标 → 祖先链。不冒泡的事件只在 target 上跑（leave/enter）。
+      ev.target = this;
+      let n = this;
+      while (n) {
+        ev.currentTarget = n;
+        for (const fn of n.handlers?.[ev.type] ?? []) fn(ev);
+        if (!ev.bubbles) break;
+        n = n.parentNode;
+      }
+      return true;
+    }
+  }
+
+  class FakeMouseEvent {
+    constructor(type, init) {
+      this.type = type;
+      Object.assign(this, init || {});
+      this.bubbles = init?.bubbles !== false;
+    }
+  }
+  class FakePointerEvent extends FakeMouseEvent {}
+
+  /** 造一份「文档树 + shim」：documentElement > body > canvas / button */
+  function makePointerEnv(opts) {
+    const docEl = new FakeNode("HTML", null);
+    const body = new FakeNode("BODY", docEl);
+    const canvas = new FakeNode("CANVAS", body);
+    const button = new FakeNode("BUTTON", body);
+    // 命中表：调用方给 (x,y) → 元素；默认 body
+    const hit = opts?.hit ?? (() => body);
+    const doc = {
+      readyState: "complete",
+      addEventListener() {},
+      documentElement: docEl,
+      body,
+      querySelectorAll() {
+        return [];
+      },
+      elementFromPoint(x, y) {
+        return hit(x, y);
+      },
+    };
+    docEl.parentNode = doc; // 作者挂 document 的 leave 也要收到
+    const { win } = runShim({
+      document: doc,
+      MouseEvent: FakeMouseEvent,
+      PointerEvent: FakePointerEvent,
+      screenX: opts?.screenX ?? 0,
+      screenY: opts?.screenY ?? 0,
+    });
+    return { win, doc, docEl, body, canvas, button };
+  }
+
+  /** 把某节点上的一串事件类型录进数组（顺序即断言依据） */
+  function record(node, types, sink, label) {
+    for (const t of types) {
+      node.addEventListener(t, (ev) => {
+        sink.push({ node: label, type: t, x: ev.clientX, y: ev.clientY, ev });
+      });
+    }
+  }
+
+  check(/__wePushPointer/.test(shimSrc) && /__wePointerLeave/.test(shimSrc),
+    "web-shim 必须暴露 __wePushPointer / __wePointerLeave（网页壁纸的注入入口）");
+  check(/__wePushPointer/.test(webTs) && /__wePointerLeave/.test(webTs),
+    "web.ts 必须把 rt.pointerCtl 桥到 shim 的 __wePushPointer / __wePointerLeave");
+  check(/rt\.pointerCtl/.test(webTs),
+    "web.ts 必须设置 rt.pointerCtl（__wp.pushPointer 的落点，见 main.ts）");
+
+  // (1) 作者挂 document/window 的路径（语料 15 张）：靠冒泡收到 mousemove
+  {
+    const env = makePointerEnv();
+    const seen = [];
+    record(env.docEl, ["mousemove", "pointermove"], seen, "html");
+    env.win.__wePushPointer(120, 80, 0);
+    const mm = seen.filter((e) => e.type === "mousemove");
+    check(mm.length === 1, `挂 document 的 mousemove 应靠冒泡收到 1 次，实得 ${mm.length}`);
+    check(
+      mm[0] && mm[0].x === 120 && mm[0].y === 80,
+      `合成事件 clientX/Y 必须是父页换算后的像素，实得 ${mm[0] && `${mm[0].x},${mm[0].y}`}`,
+    );
+    check(
+      seen.some((e) => e.type === "pointermove"),
+      "createjs 一族只挂 pointermove（语料 7 张），必须一并合成",
+    );
+  }
+
+  // (2) 命中元素派发（1748506393 流体读 event.offsetX，挂在 canvas 上）：
+  //     target 必须是命中元素本身，不能一律打 document —— offsetX/offsetY 由浏览器
+  //     按 target 的 padding box 现算，target 错了偏移就错，且没有任何报错。
+  {
+    const env = makePointerEnv({ hit: (x) => (x > 100 ? null : null) });
+    // 让命中表返回 canvas
+    const envc = makePointerEnv();
+    const seen = [];
+    record(envc.canvas, ["mousemove"], seen, "canvas");
+    envc.doc.elementFromPoint = () => envc.canvas;
+    envc.win.__wePushPointer(50, 60, 0);
+    check(
+      seen.length === 1 && seen[0].ev.target === envc.canvas,
+      "合成事件的 target 必须是 elementFromPoint 命中的元素（offsetX 由它现算）",
+    );
+    void env;
+  }
+
+  // (3) 边界链：命中元素变化时补 out/leave + over/enter，且 leave/enter 不冒泡。
+  //     1748506393 靠 canvas 的 mouseenter 把 pointers[0].down 置 true（不进这个分支
+  //     鼠标怎么动都不出染料）；1081733658 animatedGrid 靠 body 的 mouseover/mouseleave
+  //     起停整个网格动画。
+  {
+    const env = makePointerEnv();
+    let target = env.body;
+    env.doc.elementFromPoint = () => target;
+    const seen = [];
+    record(env.canvas, ["mouseover", "mouseenter", "mouseout", "mouseleave"], seen, "canvas");
+    record(env.body, ["mouseover", "mouseenter", "mouseout", "mouseleave"], seen, "body");
+    env.win.__wePushPointer(10, 10, 0); // 进 body
+    check(
+      seen.some((e) => e.node === "body" && e.type === "mouseenter"),
+      "首次进入应给命中元素发 mouseenter（1748506393 的 down 标志靠它）",
+    );
+    seen.length = 0;
+    target = env.canvas;
+    env.win.__wePushPointer(11, 11, 0); // body → canvas（canvas 是 body 的子）
+    check(
+      seen.some((e) => e.node === "canvas" && e.type === "mouseenter"),
+      "移入子元素应发 canvas 的 mouseenter",
+    );
+    check(
+      !seen.some((e) => e.node === "body" && e.type === "mouseleave"),
+      "移入子元素时不得给父元素发 mouseleave（body 仍在指针下，animatedGrid 会误停）",
+    );
+    check(
+      seen.some((e) => e.node === "canvas" && e.type === "mouseover"),
+      "移入子元素应发 mouseover（会冒泡，17 张在用）",
+    );
+    seen.length = 0;
+    target = env.body;
+    env.win.__wePushPointer(12, 12, 0); // canvas → body
+    check(
+      seen.some((e) => e.node === "canvas" && e.type === "mouseleave") &&
+        seen.some((e) => e.node === "canvas" && e.type === "mouseout"),
+      "移出子元素应给它发 mouseout + mouseleave",
+    );
+    // enter/leave 的 bubbles 必须为 false，否则挂 document 的作者会被子元素的
+    // 每次进出反复触发（animatedGrid 的整网格起停会疯狂抖）
+    const le = seen.find((e) => e.type === "mouseleave");
+    check(le && le.ev.bubbles === false, "mouseleave/mouseenter 不得冒泡（W3C 语义）");
+  }
+
+  // (4) 按键掩码跳变 → down/up/click 边缘（29 张听 click，是最大消费方）。
+  //     轮询推送里没有「点击」这个事件，只有掩码跳变；边缘丢了整类交互就消失。
+  {
+    const env = makePointerEnv();
+    env.doc.elementFromPoint = () => env.button;
+    const seen = [];
+    record(env.button, ["mousedown", "mouseup", "click", "dblclick", "pointerdown", "pointerup"], seen, "btn");
+    env.win.__wePushPointer(5, 5, 0);
+    env.win.__wePushPointer(5, 5, 1); // 按下
+    check(
+      seen.filter((e) => e.type === "mousedown").length === 1 &&
+        seen.filter((e) => e.type === "pointerdown").length === 1,
+      "掩码 bit0 置位应发 mousedown + pointerdown 各一次",
+    );
+    check(!seen.some((e) => e.type === "click"), "只按下未松开时不得发 click");
+    // 同状态重复推送不得重复发（宿主 ~90Hz 推的是状态而非事件）
+    env.win.__wePushPointer(5, 5, 1);
+    env.win.__wePushPointer(5, 5, 1);
+    check(
+      seen.filter((e) => e.type === "mousedown").length === 1,
+      "重复推送同一按下态不得重复发 mousedown（推送是状态而非事件）",
+    );
+    env.win.__wePushPointer(5, 5, 0); // 松开
+    check(
+      seen.filter((e) => e.type === "mouseup").length === 1 &&
+        seen.filter((e) => e.type === "click").length === 1,
+      "掩码 bit0 清零应发 mouseup + click 各一次",
+    );
+    // 高位（右/中键）不得触发左键语义：桌面右键属于 Finder，不该被壁纸劫持
+    env.win.__wePushPointer(5, 5, 2);
+    env.win.__wePushPointer(5, 5, 4);
+    check(
+      seen.filter((e) => e.type === "mousedown").length === 1,
+      "掩码高位（右/中键）不得合成左键 mousedown",
+    );
+  }
+
+  // (5) 拖拽（down 与 up 落在不同元素）不得发 click —— 浏览器也不发
+  {
+    const env = makePointerEnv();
+    let target = env.button;
+    env.doc.elementFromPoint = () => target;
+    const seen = [];
+    record(env.docEl, ["click"], seen, "html");
+    env.win.__wePushPointer(5, 5, 1);
+    target = env.canvas;
+    env.win.__wePushPointer(90, 90, 1);
+    env.win.__wePushPointer(90, 90, 0);
+    check(seen.length === 0, "down/up 落在不同元素（拖拽）不得发 click");
+  }
+
+  // (6) dblclick：500ms 内同元素二次点击（语料 5 张听 dblclick）
+  {
+    const env = makePointerEnv();
+    env.doc.elementFromPoint = () => env.button;
+    const seen = [];
+    record(env.button, ["click", "dblclick"], seen, "btn");
+    for (let i = 0; i < 2; i++) {
+      env.win.__wePushPointer(5, 5, 1);
+      env.win.__wePushPointer(5, 5, 0);
+    }
+    check(
+      seen.filter((e) => e.type === "click").length === 2 &&
+        seen.filter((e) => e.type === "dblclick").length === 1,
+      "同元素连续两次点击应发 2 次 click + 1 次 dblclick",
+    );
+  }
+
+  // (7) 静止不重复派发：位置与按键都没变时什么都不发。
+  //     宿主 ~90Hz 推送，若静止也发 mousemove，作者的「有没有在动」判定
+  //     （1081733658 网格）会永远认为在动。
+  {
+    const env = makePointerEnv();
+    const seen = [];
+    record(env.docEl, ["mousemove"], seen, "html");
+    env.win.__wePushPointer(30, 40, 0);
+    env.win.__wePushPointer(30, 40, 0);
+    env.win.__wePushPointer(30, 40, 0);
+    check(seen.length === 1, `静止时不得重复派发 mousemove，实得 ${seen.length} 次`);
+  }
+
+  // (8) movementX/Y：首帧必须为 0（3 张读 movementX）。
+  //     首帧若按 (0,0) 算差会得到一个等于绝对坐标的巨大假位移。
+  {
+    const env = makePointerEnv();
+    const seen = [];
+    record(env.docEl, ["mousemove"], seen, "html");
+    env.win.__wePushPointer(300, 200, 0);
+    check(
+      seen[0] && seen[0].ev.movementX === 0 && seen[0].ev.movementY === 0,
+      `首次推送的 movementX/Y 必须为 0，实得 ${seen[0] && `${seen[0].ev.movementX},${seen[0].ev.movementY}`}`,
+    );
+    env.win.__wePushPointer(310, 190, 0);
+    check(
+      seen[1] && seen[1].ev.movementX === 10 && seen[1].ev.movementY === -10,
+      `第二次推送的 movementX/Y 应为帧间位移，实得 ${seen[1] && `${seen[1].ev.movementX},${seen[1].ev.movementY}`}`,
+    );
+  }
+
+  // (9) 非有限坐标必须丢弃：NaN 进 clientX 会让 elementFromPoint 返回 null、
+  //     作者的位移积分一次性污染成 NaN，且没有任何报错（与场景通道同一约定）。
+  {
+    const env = makePointerEnv();
+    const seen = [];
+    record(env.docEl, ["mousemove"], seen, "html");
+    env.win.__wePushPointer(NaN, 10, 0);
+    env.win.__wePushPointer(10, undefined, 0);
+    check(seen.length === 0, "非有限坐标必须丢弃（NaN 会静默污染作者状态）");
+    env.win.__wePushPointer(10, 10, 0);
+    check(seen.length === 1, "丢弃非法值后合法推送仍应正常派发");
+  }
+
+  // (10) 暂停期间丢弃：官方暂停语义是「冻结渲染进程」，此时派发事件会让作者的
+  //      动画状态在冻结中继续推进，恢复时画面跳一下。
+  {
+    const env = makePointerEnv();
+    const seen = [];
+    record(env.docEl, ["mousemove"], seen, "html");
+    env.win.__weSetPaused(true);
+    env.win.__wePushPointer(10, 10, 0);
+    env.win.__wePushPointer(20, 20, 1);
+    check(seen.length === 0, "暂停期间不得派发合成事件（官方暂停 = 冻结进程）");
+    env.win.__weSetPaused(false);
+    env.win.__wePushPointer(30, 30, 0);
+    check(seen.length === 1, "恢复后应继续派发");
+  }
+
+  // (11) pointerLeave 必须真的发 out/leave 链并补 up。
+  //      场景侧只清一个状态位就够，网页作者的 hover 态是自己记的 —— 不发 leave
+  //      就永久卡在「鼠标还在上面」（1081733658 网格一直跑、1748506393 的
+  //      pointers[0].down 一直 true 持续喷染料）。
+  {
+    const env = makePointerEnv();
+    env.doc.elementFromPoint = () => env.canvas;
+    const seen = [];
+    record(env.canvas, ["mouseleave", "mouseout", "mouseup"], seen, "canvas");
+    env.win.__wePushPointer(10, 10, 1); // 进来并按下
+    env.win.__wePointerLeave();
+    check(
+      seen.some((e) => e.type === "mouseup"),
+      "pointerLeave 时若仍按着键必须补 mouseup（否则拖拽逻辑永不结束）",
+    );
+    check(
+      seen.some((e) => e.type === "mouseleave") && seen.some((e) => e.type === "mouseout"),
+      "pointerLeave 必须发 mouseout + mouseleave（作者 hover 态否则永久卡住）",
+    );
+    // 再次进入时应重新发 enter（leave 已经把命中态清了）
+    const seen2 = [];
+    record(env.canvas, ["mouseenter"], seen2, "canvas");
+    env.win.__wePushPointer(11, 11, 0);
+    check(seen2.length === 1, "leave 之后再次进入应重新发 mouseenter");
+  }
+
+  // (12) 作者处理器抛错不得打断后续事件：一个坏 listener 若让整条链断掉，
+  //      leave 发不出去就会留下永久 hover / 按下态。
+  {
+    const env = makePointerEnv();
+    env.doc.elementFromPoint = () => env.canvas;
+    let after = 0;
+    env.canvas.addEventListener("mousemove", () => {
+      throw new Error("author bug");
+    });
+    env.docEl.addEventListener("mousemove", () => {
+      after++;
+    });
+    let threw = false;
+    try {
+      env.win.__wePushPointer(10, 10, 0);
+    } catch {
+      threw = true;
+    }
+    check(!threw, "作者处理器抛错不得冒出 __wePushPointer（会打断宿主推送循环）");
+    void after; // 冒泡在同一个 dispatchEvent 内，抛错后不强求继续
+  }
+
+  // (13) 坐标换算（父页侧）：cover 露底自适配下 iframe 比容器大且带负偏移，
+  //      归一化坐标是相对**窗口**的，必须减掉 iframe 相对容器的偏移。
+  //      按 webPointerToClient 的定义在此独立复算。
+  {
+    check(
+      /export function webPointerToClient/.test(webTs),
+      "web.ts 必须导出 webPointerToClient（坐标换算要能独立数值校验）",
+    );
+    // 跑**真实现**而不是复算副本：这一条最初写成 verifier 自己复算一遍公式，
+    // 结果把 web.ts 的偏移减法删掉后 verifier 照绿 —— 那样的断言等于没有。
+    const toClient = await importIsolatedFn(webTs, "webPointerToClient");
+    check(typeof toClient === "function", "webPointerToClient 必须能被独立抽出执行（无外部依赖）");
+    // 常规：iframe 与容器同盒
+    const stage = { left: 0, top: 0, width: 1920, height: 1080 };
+    const same = toClient(0.25, 0.75, stage, { left: 0, top: 0, width: 1920, height: 1080 }, { width: 1920, height: 1080 });
+    check(
+      same && Math.abs(same.x - 480) < 1e-6 && Math.abs(same.y - 810) < 1e-6,
+      `同盒时 u/v 应直接乘容器尺寸，实得 ${same && `${same.x},${same.y}`}`,
+    );
+    // 1731760875 的 16:10 档：1920×1200 容器里放 2133.33×1200 视口，left = -106.67
+    const stage1610 = { left: 0, top: 0, width: 1920, height: 1200 };
+    const frame1610 = { left: -106.666, top: 0, width: 2133.333, height: 1200 };
+    const cover = toClient(0.5, 0.5, stage1610, frame1610, { width: 2133.333, height: 1200 });
+    check(
+      cover && Math.abs(cover.x - 1066.666) < 0.01 && Math.abs(cover.y - 600) < 0.01,
+      `cover 换视口后窗口中心应落在 iframe 内容中心，实得 ${cover && `${cover.x.toFixed(1)},${cover.y.toFixed(1)}`}`,
+    );
+    // 若忘了减 iframe 偏移，窗口中心会算成 960（差 106.67px）—— 锁住这个差值
+    const wrong = 0.5 * stage1610.width;
+    check(
+      Math.abs(cover.x - wrong) > 100,
+      "换算必须减掉 iframe 相对容器的偏移（不减则 cover 下整体偏 ~107px）",
+    );
+    // 测试台固定分辨率模式：祖先 CSS transform 缩放，rect 含缩放、iframe 内部视口不含
+    const scaled = toClient(
+      0.5,
+      0.5,
+      { left: 0, top: 0, width: 960, height: 540 },
+      { left: 0, top: 0, width: 960, height: 540 },
+      { width: 1920, height: 1080 },
+    );
+    check(
+      scaled && Math.abs(scaled.x - 960) < 1e-6 && Math.abs(scaled.y - 540) < 1e-6,
+      `CSS 缩放下应还原到 iframe 内部视口像素，实得 ${scaled && `${scaled.x},${scaled.y}`}`,
+    );
+    check(
+      toClient(NaN, 0.5, stage, { left: 0, top: 0, width: 1, height: 1 }, { width: 1, height: 1 }) === null &&
+        toClient(0.5, 0.5, { left: 0, top: 0, width: 0, height: 0 }, { left: 0, top: 0, width: 1, height: 1 }, { width: 1, height: 1 }) === null,
+      "非法输入必须回退 null（不抛异常）",
+    );
+  }
 }
 
 // ---------- 4. 无 shim 对照 ----------

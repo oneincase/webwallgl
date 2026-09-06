@@ -290,6 +290,75 @@ function installLetterboxFix(rt: Runtime, f: HTMLIFrameElement, container: HTMLE
   };
 }
 
+/**
+ * 窗口归一化 u/v → iframe 内 client 像素。
+ *
+ * 单独导出成纯函数是为了能被 verify-web 按定义数值校验（与 webCoverViewport 同样路子）：
+ * 这条换算错了不会报错，只是鼠标位置整体偏，肉眼很难量。
+ *
+ * @param stage 容器（舞台）在视口里的盒子——归一化坐标的分母就是它
+ * @param frame iframe 在视口里的盒子；cover 露底自适配下它可能比 stage 大且带负偏移
+ * @param client iframe 的内部视口尺寸（clientWidth/Height，未受祖先 CSS 缩放影响）
+ */
+export function webPointerToClient(
+  u: number,
+  v: number,
+  stage: { left: number; top: number; width: number; height: number },
+  frame: { left: number; top: number; width: number; height: number },
+  client: { width: number; height: number },
+): { x: number; y: number } | null {
+  if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
+  if (!(stage.width > 0) || !(stage.height > 0)) return null;
+  // 祖先 CSS transform 缩放：getBoundingClientRect 含缩放，iframe 内部视口不含。
+  // 测试台的固定分辨率模式（#stage-scale）就是这个情形。
+  const sx = frame.width > 0 && client.width > 0 ? frame.width / client.width : 1;
+  const sy = frame.height > 0 && client.height > 0 ? frame.height / client.height : 1;
+  return {
+    x: (u * stage.width - (frame.left - stage.left)) / (sx || 1),
+    y: (v * stage.height - (frame.top - stage.top)) / (sy || 1),
+  };
+}
+
+/**
+ * 外部指针注入的父页侧桥接：窗口归一化 u/v → iframe 内 client 像素 → shim 合成事件。
+ *
+ * 为什么换算要在父页做：iframe 未必与容器同尺寸同原点 —— cover 露底自适配会把它
+ * 换成「内容比例的覆盖式视口」并居中偏移（见 installLetterboxFix，1731760875 的
+ * 16:10 情形是 1920×1200 容器里放 2133×1200 视口、left 为负）。归一化坐标是相对
+ * **窗口**的（宿主按 CGDisplayBounds 算，见 docs/INTEGRATION.md），必须先落到容器
+ * 像素，再减掉 iframe 相对容器的偏移，才是作者代码看到的 clientX/clientY。
+ * 让 shim 自己除一遍会得到「相对被裁切视口」的坐标，画面上肉眼可见地偏。
+ */
+function installWebPointerBridge(rt: Runtime, f: HTMLIFrameElement, container: HTMLElement) {
+  rt.pointerCtl = {
+    push(p) {
+      if (!f.isConnected) return;
+      const cRect = container.getBoundingClientRect();
+      const fRect = f.getBoundingClientRect();
+      const pt = webPointerToClient(
+        Number(p?.u),
+        Number(p?.v),
+        {
+          left: cRect.left,
+          top: cRect.top,
+          width: cRect.width || container.clientWidth || window.innerWidth || 0,
+          height: cRect.height || container.clientHeight || window.innerHeight || 0,
+        },
+        { left: fRect.left, top: fRect.top, width: fRect.width, height: fRect.height },
+        { width: f.clientWidth, height: f.clientHeight },
+      );
+      // 非有限值丢弃（与场景通道同一约定）：NaN 会让 elementFromPoint 返回 null，
+      // 作者的位移积分一次性污染成 NaN 且没有任何报错。
+      if (!pt) return;
+      weShimCall(rt, (w: any) => w.__wePushPointer?.(pt.x, pt.y, Number(p.buttons) || 0));
+    },
+    leave() {
+      weShimCall(rt, (w: any) => w.__wePointerLeave?.());
+    },
+  };
+  // 无需自挂 cleanup：clear() 统一清 rt.pointerCtl（与场景通道同一处）。
+}
+
 function attachIframe(
   rt: Runtime,
   cfg: WallpaperConfig,
@@ -312,6 +381,8 @@ function attachIframe(
     (rt.objectUrls ??= []).push(opts.blobUrl);
   }
   installLetterboxFix(rt, f, container);
+  // 外部指针注入：装了 shim 才有合成事件的接收端；裸 iframe 回退路径下推送静默无效。
+  if (opts.injected) installWebPointerBridge(rt, f, container);
 
   const onFrameMsg = (ev: MessageEvent) => {
     if (ev.source !== f.contentWindow) return;
