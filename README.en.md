@@ -4,7 +4,7 @@
 
 ## Introduction
 
-WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — "scene" today, with video and web support coming in later releases: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates. Upcoming versions will add effects exclusive to this library — stay tuned.
+WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned.
 
 - [GitHub repository](https://github.com/oneincase/webwallgl)
 - [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)
@@ -162,6 +162,8 @@ b.pause(); // does not affect a
 - Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error
 - stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected
 - Audio starts late: autoplay policy requires user interaction before sound; that's why volume defaults to 0
+- Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs)
+- Web wallpaper relative assets 404: resources rely on &lt;base href> pointing at the original directory; wallpapers that build URLs from location.href may break under blob loading
 
 ## Copyright & compliance
 

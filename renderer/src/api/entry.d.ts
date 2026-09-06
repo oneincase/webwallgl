@@ -22,12 +22,12 @@ export {
 } from "./types";
 
 export declare function mount(
-  canvas: HTMLCanvasElement,
+  el: HTMLElement,
   options: MountOptions,
 ): Promise<SceneInstance>;
 
 export declare function createScene(
-  canvas: HTMLCanvasElement,
+  el: HTMLElement,
   options?: Partial<Omit<MountOptions, "source">>,
 ): SceneInstance;
 

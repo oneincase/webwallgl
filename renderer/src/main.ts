@@ -27,7 +27,7 @@ import {
 } from "./shell";
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
-import { mountWeb, weShimCall } from "./web";
+import { weShimCall } from "./web";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 
 // ---- 滤镜（beta）----
@@ -55,10 +55,10 @@ function applyWallpaperFilter(rt: Runtime) {
 
 
 // ---- 壁纸页适配层职责（库化第 5 步：非核心能力移出核心装配）----
-// 以下三者不是「WE 场景渲染」能力，只属于这个全屏壁纸页：
+// 以下二者不是「WE 场景/网页渲染」能力，只属于这个全屏壁纸页：
 //   1. canvas 演示动画（渐变球 + 时钟）：无 query 时的占位壁纸；
-//   2. web 网页壁纸（sandbox iframe + rAF 节流）；
-//   3. /default-wallpaper 降级页：场景装配失败且调用方没给 onError 时兜底。
+//   2. /default-wallpaper 降级页：场景装配失败且调用方没给 onError 时兜底。
+// web 网页壁纸已升为一等能力（dispatch → mountWeb）。
 // 经 rt.onUnhandledType / rt.fallbackPage 两个钩子挂回装配层（dispatch）。
 
 /** 1. canvas 演示动画 */
@@ -140,10 +140,8 @@ const rt: Runtime = createRuntime({ fullscreen: true });
 rt.onUnhandledType = (cfg) => {
   if (cfg.type === "canvas") {
     mountCanvasDemo(rt);
-  } else if (cfg.type === "web" && cfg.src) {
-    mountWeb(rt, cfg);
   } else {
-    mountDefaultWallpaper(rt); // 无壁纸/未知配置 → 降级页
+    mountDefaultWallpaper(rt); // 无壁纸/未知配置 → 降级页（web 已由 dispatch 一等处理）
   }
 };
 rt.fallbackPage = () => mountDefaultWallpaper(rt);
@@ -171,7 +169,7 @@ declare global {
     /**
      * 运行时观测面（只读）。宿主 / 测试台轮询取真实帧率：
      * fps 是渲染循环最近 500ms 的实测值，running=false 表示已暂停或没在出帧。
-     * 网页壁纸（iframe 里自己的 rAF）不在本页渲染，读数为 0。
+     * 网页壁纸经 shim postMessage 打点，可读。
      */
     __wpStats?: {
       frame(): { fps: number; running: boolean };
@@ -267,11 +265,14 @@ window.__wp = {
     rt.cfg.filter = filter;
     applyWallpaperFilter(rt);
   },
-  // 热更新用户属性。网页壁纸走 shim；场景壁纸就地改属性表 / 效果常量 / 沙箱，
-  // 不整包重挂（pause/resume 同一条约束：禁止再拉 scene.pkg）。
+  // 热更新用户属性。网页/场景都走 sceneCtl（就地改，不重挂）；
+  // 无 ctl 时退回直接 weShimCall（裸 iframe 回退路径）。
   updateWebProps(props: Record<string, { value: unknown }>) {
+    if (rt.sceneCtl) {
+      rt.sceneCtl.applyUserProperties(props);
+      return;
+    }
     weShimCall(rt, (w: any) => w.__weApplyProps?.(props));
-    if (rt.cfg.type === "scene") rt.sceneCtl?.applyUserProperties(props);
   },
   // 纯前端预览：本地 scene.pkg 经同源 iframe 直传进来，包字节不落任何服务器。
   // 继承当前 fit/dpr/帧率/滤镜等观看偏好；无 project.json 时属性用场景快照值。
@@ -296,8 +297,9 @@ window.__wp = {
 // 初始配置优先取自 URL query（壁纸引擎窗口创建时注入，同步无竞态）。
 // 旧形态没有 source 字段 —— mediaBase/src 由 scene-mount 内部合成 httpSource。
 const params = new URLSearchParams(location.search);
+const rawType = (params.get("type") ?? "canvas").toLowerCase();
 const initialCfg: WallpaperConfig = {
-  type: (params.get("type") as WallpaperConfig["type"]) ?? "canvas",
+  type: (rawType as WallpaperConfig["type"]) || "canvas",
   src: params.get("src") ?? undefined,
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
   renderDpr: Number(params.get("renderDpr")) || 1,

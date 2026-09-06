@@ -54,10 +54,12 @@ export type WallpaperConfig = {
   // 旧的 mediaBase/src 路径保持原样，两条并存直到适配层落地（第 5 步）。
 
   /**
-   * 渲染目标画布。给了就画在它上面（库形态：调用方自己放 canvas，
+   * 渲染目标。给了就画在它上面（库形态：调用方自己放节点，
    * 可非全屏、可多实例）；不给则沿用旧行为——自建 canvas 铺满内部 wrap。
+   * 场景/视频需要 HTMLCanvasElement（或可在容器内自建）；网页壁纸可用任意
+   * HTMLElement（空 div 最佳；若传入 canvas 则挂到其父节点）。
    */
-  canvas?: HTMLCanvasElement;
+  canvas?: HTMLElement;
   /** 场景资源来源。给了走 source；不给回落到 mediaBase/src 拼 URL。 */
   source?: Source;
 };

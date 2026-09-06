@@ -86,10 +86,9 @@ export type Runtime = {
   /** cover 窥视的对齐动画 rAF 句柄 */
   peekRaf?: number;
   // ---- 非核心类型的能力钩子（库化第 5 步）----
-  // scene/video/gif/image 是核心渲染能力；canvas 演示动画、web 网页 iframe、
-  // 降级页是壁纸页（适配层）的职责，经这两个钩子注入。库实例不设置：
-  // 未知类型安全地不渲染，场景失败经 onError 交回调用方。
-  /** dispatch 遇到非核心类型（web/canvas/未知）时调用（仅壁纸页设置） */
+  // scene/video/gif/image/web 是核心能力；canvas 演示动画、降级页是壁纸页
+  // （适配层）的职责，经这两个钩子注入。库实例不设置：未知类型安全地不渲染。
+  /** dispatch 遇到非核心类型（canvas/未知）时调用（仅壁纸页设置） */
   onUnhandledType?: (cfg: WallpaperConfig) => void;
   /** 场景装配失败且调用方没给 onError 时的兜底（壁纸页挂降级页；库实例不需要） */
   fallbackPage?: () => void;
@@ -143,7 +142,16 @@ function setupFullscreen(rt: Runtime) {
 })();
 
 export function clear(rt: Runtime) {
-  if (rt.wrap) rt.wrap.innerHTML = "";
+  // 全屏 wrap：一把清空。库形态无 wrap：只摘自己挂的 iframe，不碰调用方容器其它子节点。
+  if (rt.wrap) {
+    rt.wrap.innerHTML = "";
+  } else if (rt.iframe?.isConnected) {
+    try {
+      rt.iframe.remove();
+    } catch {
+      /* 忽略 */
+    }
+  }
   if (rt.raf !== undefined) cancelAnimationFrame(rt.raf);
   rt.raf = undefined;
   // 停掉场景视频纹理循环对（取消 rAF 交换驱动 + 暂停解码）

@@ -629,7 +629,8 @@ filterEl.oninput = renderList;
 
 /** 把库条目翻译成渲染器 query，语义对齐原生侧 wallpaper/mod.rs */
 function buildQuery(it: LibraryItem): string {
-  const type = it.hasScene ? "scene" : it.type;
+  // project.json type 大小写混用（Web/Scene）；与 kindOf / dispatch 一样先小写
+  const type = it.hasScene ? "scene" : it.type.toLowerCase();
   const p = new URLSearchParams();
   p.set("type", type);
   if (type === "scene") {

@@ -37,9 +37,15 @@ rmSync(join(libDir, "types"), { recursive: true, force: true });
 
 // 可读版 → 压缩版（esbuild 保留既有模块格式，各配一份 sourcemap）。
 // min map 指向可读版文件，可读版自己的 map 再指向源码，DevTools 逐级解析。
+//
+// UMD 压缩版**不能传 format**：给 transform 指定 format:"iife" 会把 UMD 源码
+// 整个包进 esbuild 的 __commonJS 闭包，闭包内部存在局部 module/exports，
+// UMD 探测走 CommonJS 分支把 API 挂到内部 shim 上，globalThis.WebWallGL
+// 永远不会被赋值 —— <script> 引入后报「WebWallGL is not defined」且无任何报错。
+// 不传 format 时 esbuild 只做纯压缩，UMD 包装原样保留。
 const MINIFY = [
   { in: "webwallgl.mjs", out: "webwallgl.min.mjs", format: "esm" },
-  { in: "webwallgl.global.js", out: "webwallgl.global.min.js", format: "iife" },
+  { in: "webwallgl.global.js", out: "webwallgl.global.min.js", format: null },
 ];
 for (const { in: inFile, out: outFile, format } of MINIFY) {
   const source = readFileSync(join(libDir, inFile), "utf8");
@@ -47,7 +53,7 @@ for (const { in: inFile, out: outFile, format } of MINIFY) {
     minify: true,
     sourcemap: true,
     sourcefile: inFile,
-    format,
+    ...(format ? { format } : {}),
     loader: "js",
     legalComments: "none",
   });

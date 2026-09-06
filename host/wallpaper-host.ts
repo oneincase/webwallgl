@@ -7,7 +7,8 @@
  *
  * 复刻的端点：
  *   GET /media/{token}/{itemId}/{path...}  壁纸包资源（scene.pkg、project.json…）
- *   GET /web/{token}/{itemId}/{path...}    网页壁纸站点根（同一磁盘目录，语义同上）
+ *   GET /web/{token}/{itemId}/{path...}    网页壁纸站点根；.html 响应注入 WE shim
+ *                                          （同源原始 URL，避免 blob origin null 弄坏 Spine）
  *   GET /diag?msg=...                      渲染器诊断上报 → 打到 dev server 终端
  *   GET /default-wallpaper/index.html      降级默认壁纸（由 public/ 静态提供）
  *
@@ -38,6 +39,7 @@ import { extname, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { Connect, Plugin, ViteDevServer } from "vite";
 import { describe, overrideProps, readOverrides, writeOverrides } from "./we-props";
+import { injectWebShim, isHtmlPath } from "./we-web-html.mjs";
 import {
   controlNowPlaying,
   getCachedArtwork,
@@ -856,12 +858,17 @@ export function wallpaperHost(): Plugin {
           }
           // project.json 响应合并用户属性覆盖值，使渲染器读到当前生效配置
           const isProject = rel === "project.json";
-          await sendFile(
-            req,
-            res,
-            target,
-            isProject ? (raw) => mergeProjectOverrides(raw, itemId) : undefined,
-          );
+          // 网页壁纸 HTML：注入 WE shim（与原生 content_server 对齐）。
+          // 必须在同源 URL 上注入，不能靠渲染器 blob——Spine/WebGL 在 origin null 下贴图跨域失败。
+          const htmlInject =
+            (seg[0] === "web" || seg[0] === "media") && isHtmlPath(target)
+              ? async (raw: Buffer) =>
+                  Buffer.from(injectWebShim(raw.toString("utf8")), "utf8")
+              : undefined;
+          const transform = isProject
+            ? (raw: Buffer) => mergeProjectOverrides(raw, itemId)
+            : htmlInject;
+          await sendFile(req, res, target, transform);
           return;
         }
 

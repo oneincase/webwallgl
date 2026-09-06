@@ -61,6 +61,21 @@ export function httpSource(baseUrl: string, init?: RequestInit): Source {
         return null;
       }
     },
+    async webEntry(signal) {
+      let file = "index.html";
+      try {
+        const r = await fetch(`${base}/project.json`, { ...init, signal });
+        if (r.ok) {
+          const project = (await r.json()) as { file?: unknown } | null;
+          if (project && typeof project.file === "string" && project.file.trim()) {
+            file = project.file.trim().replace(/^\/+/, "");
+          }
+        }
+      } catch {
+        if (signal?.aborted) throw new Error("aborted");
+      }
+      return { url: `${base}/${file}` };
+    },
   };
 }
 

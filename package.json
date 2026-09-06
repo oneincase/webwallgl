@@ -36,6 +36,7 @@
     "verify:animation": "node scripts/verify-animation.mjs",
     "verify:attachments": "node scripts/verify-attachments.mjs",
     "verify:media": "node scripts/verify-media.mjs",
+    "verify:web": "node scripts/verify-web.mjs",
     "verify": "node scripts/verify-all.mjs",
     "verify:all": "node scripts/verify-all.mjs --all",
     "check": "npm run typecheck && node scripts/verify-arch.mjs && npm run verify",

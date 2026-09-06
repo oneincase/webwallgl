@@ -98,13 +98,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   // 库形态：调用方给了 canvas 就画在它上面（可非全屏、可多实例）；
   // 旧形态：自建 canvas 铺满内部 wrap 容器。backing store 按显示尺寸折算：
   // 嵌入式 canvas 用 CSS 尺寸（全屏 canvas 的 clientWidth == innerWidth，等价）。
-  const c = cfg.canvas ?? document.createElement("canvas");
+  const c =
+    (cfg.canvas instanceof HTMLCanvasElement ? cfg.canvas : null) ??
+    document.createElement("canvas");
   const dpr = effectiveDpr(rt, cfg);
   const vw = c.clientWidth || window.innerWidth || 1;
   const vh = c.clientHeight || window.innerHeight || 1;
   c.width = Math.max(1, Math.round(vw * dpr));
   c.height = Math.max(1, Math.round(vh * dpr));
-  if (!cfg.canvas) {
+  if (!(cfg.canvas instanceof HTMLCanvasElement)) {
     c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
     rt.wrap?.appendChild(c);
   }

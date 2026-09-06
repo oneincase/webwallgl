@@ -20,6 +20,7 @@ export type Source = {
   /**
    * 场景容器（scene.pkg）字节。实现方只管给字节，解析由库负责。
    * 抛错即视为该场景不可用，会走 onError。
+   * 网页壁纸（project.type=web）不会调用本方法。
    */
   scenePkg(signal?: AbortSignal): Promise<ArrayBuffer | Uint8Array>;
   /**
@@ -27,6 +28,11 @@ export type Source = {
    * 没有 project.json，此时场景字段一律用 scene.json 内的快照值。
    */
   project?(signal?: AbortSignal): Promise<unknown | null>;
+  /**
+   * 网页壁纸入口 URL（index.html 等）。`project.type` 为 web 时由 mount 调用；
+   * 省略则回退到 `{httpSource 基址}/{project.file || "index.html"}`。
+   */
+  webEntry?(signal?: AbortSignal): Promise<{ url: string } | null>;
   /**
    * 缓存键。相同键的 scene.pkg 命中库内缓存，避免重复解析上百 MB 的包
    * （暂停恢复、改属性都不该重新走一遍解析）。省略则不参与缓存。
@@ -159,7 +165,7 @@ export type FrameStats = {
 };
 
 export type SceneInstance = {
-  /** 挂载目标（构造时传入的那个 canvas） */
+  /** 挂载目标（构造时传入；场景路径可能是内部自建的 canvas） */
   readonly canvas: HTMLCanvasElement;
 
   pause(): void;
