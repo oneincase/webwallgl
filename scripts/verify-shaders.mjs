@@ -627,6 +627,114 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **int→float 隐式转换**（godrays_cast / shine_cast 体积光）。
+// WE 官方效果模板写 `const float sampleDrop = sampleCount - 1;`（int 表达式赋给
+// float）与 `i / sampleDrop`（int / float）。HLSL 两者都隐式转换，GLSL ES 全拒：
+//   ERROR: '=' : cannot convert from 'const mediump int' to 'const highp float'
+//   ERROR: '/' : wrong operand types - no operation '/' exists that takes ...
+// 整个 cast pass 被跳过 → 体积光/光晕整条效果消失（1315534440 首现）。
+// 全库 46 处 / 38 张壁纸，两类数量完全相同（同一模板语句的上下游）。
+{
+  const castSrc = [
+    "varying vec2 v_TexCoord;",
+    "uniform sampler2D g_Texture0;",
+    "uniform float g_Length;",
+    "void main() {",
+    "  vec2 texCoords = v_TexCoord;",
+    "  vec4 albedo = vec4(0.0);",
+    "  vec2 direction = vec2(0.5) - texCoords;",
+    "  float dist = length(direction);",
+    "  const int sampleCount = 30;",
+    "  const float sampleDrop = sampleCount - 1;",
+    "  direction = direction * dist / sampleDrop;",
+    "  for (int i = 0; i < sampleCount; ++i) {",
+    "    vec4 smp = texSample2D(g_Texture0, texCoords);",
+    "    albedo += smp * (i / sampleDrop);",
+    "  }",
+    "  gl_FragColor = albedo;",
+    "}",
+  ].join("\n");
+  const glsl = hlsl2glsl(castSrc, "frag", {}, () => null);
+  // 1) float 声明 = 纯整型表达式 → float(...) 包裹
+  if (/\bfloat\s+sampleDrop\s*=\s*sampleCount\s*-\s*1\s*;/.test(glsl)) {
+    wireErrors.push(
+      "float 声明的纯整型右值必须包 float()：`const float sampleDrop = sampleCount - 1;` " +
+        "在 GLSL ES 报 cannot convert from int to float，整个 godrays/shine cast pass 被跳过",
+    );
+  }
+  if (!/\bfloat\s+sampleDrop\s*=\s*float\(sampleCount\s*-\s*1\)/.test(glsl)) {
+    wireErrors.push("sampleDrop 应改写为 float(sampleCount - 1)");
+  }
+  // 2) int 循环变量与 float 混合运算 → float(i)
+  if (/\(\s*i\s*\/\s*sampleDrop\s*\)/.test(glsl)) {
+    wireErrors.push(
+      "int 与 float 的混合二元运算必须包 float()：`i / sampleDrop` 在 GLSL ES 报 " +
+        "wrong operand types（GLSL 无任何混合类型运算符重载）",
+    );
+  }
+  if (!/float\(i\)\s*\/\s*sampleDrop/.test(glsl)) {
+    wireErrors.push("循环变量 i 与 float 相除应改写为 float(i) / sampleDrop");
+  }
+  // 3) 不得误伤：右值含小数点的 float 声明本来合法，不该被包。
+  //    `n * 0.5` 含小数点、无函数调用 → 只触发小数点那道检查，可独立证伪。
+  //
+  //    注：函数调用（`float bar = max(barLeft, barRight);`，2134765860 的形态）
+  //    也不会被改写，但那是 `ids.every(intNames.has)` 的**天然结果** —— 函数名
+  //    本身也进 ids 且不在 intNames 里，判定必然失败。所以 10b-2 里那道显式的
+  //    函数调用检查是冗余的（保留是为了让意图直白、不依赖这层间接推理），
+  //    删掉它行为不变，因此不为它写断言 —— 那会是一条永远不会红的假绿。
+  const okSrc = [
+    "void main() {",
+    "  const int n = 4;",
+    "  float a = n * 0.5;",
+    "  gl_FragColor = vec4(a);",
+    "}",
+  ].join("\n");
+  const okGlsl = hlsl2glsl(okSrc, "frag", {}, () => null);
+  if (/float\s+a\s*=\s*float\(/.test(okGlsl)) {
+    wireErrors.push("右值已含小数点的 float 声明不得被包 float()（n * 0.5 已是 float 表达式）");
+  }
+  // 4) 顺序守卫：10b 把 `int x = step(...)` 改成 float 之后，x 不再是 int，
+  //    混合运算改写不得再给它套 float()（2134765860 Simple_Audio_Bars 的 bar）。
+  //    收集 int 名字若跑在 10b 之前就会多包一层，掩盖真实类型。
+  const barSrc = [
+    "uniform float u_BarOpacity;",
+    "void main() {",
+    "  float barHeight = 0.5;",
+    "  int bar = step(0.25, barHeight);",
+    "  float alpha = bar * u_BarOpacity;",
+    "  gl_FragColor = vec4(alpha);",
+    "}",
+  ].join("\n");
+  const barGlsl = hlsl2glsl(barSrc, "frag", {}, () => null);
+  if (!/\bfloat\s+bar\s*=\s*step\(/.test(barGlsl)) {
+    wireErrors.push("`int bar = step(...)` 应由 10b 改成 float 声明");
+  }
+  if (/float\(bar\)\s*\*\s*u_BarOpacity/.test(barGlsl)) {
+    wireErrors.push(
+      "已被 10b 转成 float 的变量不得再套 float()：说明 int 名字收集跑在 10b 之前（顺序错）",
+    );
+  }
+  // 5) 源码守卫：两段共用同一个 collectIntNames，且必须在 10b 之后
+  const hlslSrc2 = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hlsl2glsl.js"), "utf8");
+  if (!/function collectIntNames\s*\(/.test(hlslSrc2)) {
+    wireErrors.push("hlsl2glsl.js 必须有共用的 collectIntNames（两段各写一份会漂移成半修状态）");
+  }
+  // 两段都必须真的调用它 —— 只要有一段自己内联收集，就会出现「声明改对了、
+  // 运算没改」的半修状态：pass 依旧编译失败，但症状与完全没修一模一样。
+  if ((hlslSrc2.match(/collectIntNames\(code\)/g) || []).length < 2) {
+    wireErrors.push("10b-2 与 10b-3 都必须调用 collectIntNames（少一处即半修）");
+  }
+  const idx10b = hlslSrc2.indexOf("const FLOAT_FNS");
+  const idxB2 = hlslSrc2.indexOf("10b-2)");
+  const idxB3 = hlslSrc2.indexOf("10b-3)");
+  if (idx10b < 0 || idxB2 < 0 || idxB3 < 0) {
+    wireErrors.push("hlsl2glsl.js 缺少 10b-2 / 10b-3 段（int→float 隐式转换）");
+  } else if (!(idx10b < idxB2 && idxB2 < idxB3)) {
+    wireErrors.push("10b-2 / 10b-3 必须排在 10b（int x = step(...) → float）之后");
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。

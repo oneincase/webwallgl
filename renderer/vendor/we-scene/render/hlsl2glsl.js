@@ -52,6 +52,25 @@ function isDeclaration(text, idx) {
   return GLSL_TYPES.has(word)
 }
 
+/**
+ * [we-scene patch] 收集本文件里可确证为 int 的标识符名。
+ * 10b-2 / 10b-3 两段共用 —— 各写一份必然漂移（一处认得某种声明形态、另一处不认，
+ * 就会出现「声明改对了、运算没改」的半修状态，仍旧整 pass 编译失败）。
+ *
+ * 尾随 `[=;)]` 同时覆盖三种形态：`int n = 4;`、`int n;`、`for (int i = 0; …)`
+ * —— 循环变量走的是 `=` 那一支，不需要单独的 for 正则。
+ *
+ * 必须在 10b（`int x = step(...)` → `float x = ...`）**之后**调用，否则会把
+ * 已被改成 float 的变量当成 int（2134765860 的 bar 会被多包一层 float()）。
+ */
+function collectIntNames(code) {
+  const names = new Set()
+  let m
+  const declRe = /\b(?:const\s+)?int\s+([A-Za-z_]\w*)\s*[=;)]/g
+  while ((m = declRe.exec(code)) !== null) names.add(m[1])
+  return names
+}
+
 function rewriteCall(text, callName, fn) {
   let out = ''
   let i = 0
@@ -541,6 +560,87 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     new RegExp(`\\bint\\s+([A-Za-z_]\\w*)\\s*=\\s*((?:${FLOAT_FNS})\\s*\\()`, 'g'),
     'float $1 = $2',
   )
+
+  // 10b-2) [we-scene patch] **float 声明 = 纯整型表达式**（不只是字面量）。
+  //    10) 那条只覆盖右值是**裸整数字面量**的情况（`float x = 1;`）。WE 官方
+  //    godrays_cast / shine_cast 模板写的是**含 int 变量的表达式**：
+  //
+  //        const int sampleCount = 30;
+  //        const float sampleDrop = sampleCount - 1;   // int-int → int，GLSL ES 拒绝
+  //
+  //    ANGLE 报 `'=' : cannot convert from 'const mediump int' to 'const highp float'`，
+  //    整个 godrays_cast / shine_cast pass 被跳过 —— 画面上体积光/光晕整条效果消失
+  //    （1315534440 首现）。全库 46 处 / 38 张壁纸，语句形态只有一种，
+  //    来源是官方效果模板 + 5 个 workshop 派生副本
+  //    （shaders/effects/{godrays,shine}_cast.frag 与 workshop/{3424038533,
+  //    2920750574,2865559209,3689929683,3735484626}/effects/*.frag）。
+  //
+  //    **必须放在 10b 之后**：10b 会把 `int bar = step(...)` 改成 `float bar = ...`，
+  //    在它之前收集 int 名字会把这类已转 float 的变量当成 int，给后面 10b-3 的
+  //    混合运算改写喂进错误类型（2134765860 Simple_Audio_Bars 的 bar 就是此例，
+  //    会被多包一层 float(bar)：无害但掩盖真实类型）。
+  //
+  //    判定「纯整型表达式」的三个条件缺一不可，否则会误伤合法写法：
+  //      - 右值不含小数点：`float a = n * 0.5;` 已经是 float 表达式；
+  //      - 右值不含函数调用：`float bar = max(barLeft, barRight);` 返回 float，本来合法；
+  //      - 右值里出现的**每一个**标识符都是本文件已声明的 int。
+  //    三条同时满足才说明整条表达式的类型确实是 int。
+  {
+    const intNames = collectIntNames(code)
+    if (intNames.size > 0) {
+      code = code.replace(
+        /\b(const\s+)?float\s+([A-Za-z_]\w*)\s*=\s*([^;{}]+);/g,
+        (all, cst, name, rhs) => {
+          const body = rhs.trim()
+          if (/\./.test(body)) return all               // 已含小数点 → 已是 float 表达式
+          if (/[A-Za-z_]\w*\s*\(/.test(body)) return all // 函数调用 → 返回类型未知，不碰
+          const ids = body.match(/[A-Za-z_]\w*/g)
+          if (!ids || !ids.length) return all           // 纯字面量已由 10) 处理
+          if (!ids.every((x) => intNames.has(x))) return all
+          return `${cst || ''}float ${name} = float(${body});`
+        },
+      )
+    }
+  }
+
+  // 10b-3) [we-scene patch] **int 与 float 的混合二元运算**。
+  //    与上一条是同一批文件的配对症状：sampleDrop 修成 float 之后，循环体里
+  //
+  //        for (int i = 0; i < sampleCount; ++i)
+  //            albedo += smp * (i / sampleDrop);   // int / float，GLSL ES 无此运算
+  //
+  //    仍然报 `'/' : wrong operand types - no operation '/' exists that takes a
+  //    left-hand operand of type 'mediump int' and a right operand of type ...`。
+  //    HLSL 会把 i 提升成 float；GLSL ES **没有任何**混合类型的二元运算符重载。
+  //    全库 46 处 / 38 张壁纸，形态只有 `i / sampleDrop` 一种（与上一条完全重合，
+  //    印证两者是同一条模板语句的上下游）。
+  //
+  //    只改写两侧都能在本文件确证类型的标识符，不做通用类型推导（那需要完整 AST，
+  //    风险远大于收益）。同名既是 int 又是 float（不同 #if 分支重名）时两边都放弃。
+  {
+    const intNames = collectIntNames(code)
+    const floatNames = new Set()
+    let fm
+    const fDeclRe = /\b(?:const\s+|uniform\s+|varying\s+|in\s+|out\s+)*float\s+([A-Za-z_]\w*)/g
+    while ((fm = fDeclRe.exec(code)) !== null) floatNames.add(fm[1])
+    for (const n of [...intNames]) {
+      if (floatNames.has(n)) { intNames.delete(n); floatNames.delete(n) }
+    }
+    if (intNames.size > 0 && floatNames.size > 0) {
+      const iAlt = [...intNames].sort((a, b) => b.length - a.length).join('|')
+      const fAlt = [...floatNames].sort((a, b) => b.length - a.length).join('|')
+      // int OP float → float(int) OP float
+      code = code.replace(
+        new RegExp(`\\b(${iAlt})\\s*([*/+-])\\s*(${fAlt})\\b`, 'g'),
+        (all, a, op, b) => `float(${a}) ${op} ${b}`,
+      )
+      // float OP int → float OP float(int)（对称情形，语料里暂无但同样非法）
+      code = code.replace(
+        new RegExp(`\\b(${fAlt})\\s*([*/+-])\\s*(${iAlt})\\b`, 'g'),
+        (all, a, op, b) => `${a} ${op} float(${b})`,
+      )
+    }
+  }
 
   // 10c) [we-scene patch] **bool 参与算术**：`barLeft *= isLeftChannel;`
   //    HLSL 把 bool 当 0/1 隐式提升，GLSL ES 报
