@@ -156,6 +156,11 @@ const MIME: Record<string, string> = {
   ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  // pano2vr 等播放器用 XHR responseXML 解析配置——非 XML MIME 时 responseXML 恒为
+  // null（3406740580 黑屏：pano.xml 以 octet-stream 下发，贴图一张都不加载）
+  ".xml": "application/xml",
+  ".m4a": "audio/mp4",
+  ".m4v": "video/mp4",
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
@@ -278,9 +283,13 @@ async function sendFile(
 
   // scene.pkg 动辄上百 MB。按 size+mtime 给 ETag，重复挂载/刷新走 304，
   // 浏览器磁盘缓存也可命中，避免每次把整包再推一遍。
+  // 配置/文档类（xml/json/html）改 no-cache：体积小走 304 协商即可，长缓存会让
+  // MIME/内容修正被旧响应污染一天（3406740580 的 pano.xml 黑屏复活路径）。
+  const fileExt = extname(file).toLowerCase();
+  const isConfig = fileExt === ".xml" || fileExt === ".json" || fileExt === ".html" || fileExt === ".htm";
   const etag = `"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`;
   res.setHeader("ETag", etag);
-  res.setHeader("Cache-Control", "private, max-age=86400");
+  res.setHeader("Cache-Control", isConfig ? "no-cache" : "private, max-age=86400");
   if (req.headers["if-none-match"] === etag) {
     res.statusCode = 304;
     res.end();
