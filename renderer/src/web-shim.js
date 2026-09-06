@@ -834,8 +834,12 @@
       // 只能按外层窗口原点近似；16 张读 screenX，多用于算相对位移而非绝对定位。
       screenX: x + (Number(w.screenX) || 0),
       screenY: y + (Number(w.screenY) || 0),
-      // button：0 左 / 1 中 / 2 右（DOM 语义）。buttons 是位掩码，bit0 左。
-      button: o.button || 0,
+      // button：**移动/悬停类事件必须是 -1**，只有 down/up/click 才是 0（左）/1（中）/2（右）。
+      // 这条是 W3C 规定的「没有按键状态变化」哨兵值，不是可省的细节：GameMaker HTML5
+      // 导出的运行时（2517518192 FNAF）在 pointermove 分支里照抄 `_tq = e.button` 再
+      // `_mq |= (1 << _tq)`，而 _mq 只在 pointerup/out 才清零 —— 填 0 等于告诉游戏
+      // 「左键一直按着」，鼠标只是移过去就永久卡在按下态（且没有任何报错）。
+      button: o.button != null ? o.button : -1,
       buttons: o.buttons != null ? o.buttons : ptrButtons,
       movementX: o.movementX || 0,
       movementY: o.movementY || 0,
@@ -845,6 +849,14 @@
       metaKey: false,
     };
     if ("relatedTarget" in o) init.relatedTarget = o.relatedTarget || null;
+    // `button: -1` 无法经 MouseEvent 构造器表达：Chromium 把 -1 规范化成 0
+    // （实测 `new MouseEvent("x", {button:-1}).button === 0`，而 -2 能原样通过 ——
+    // 不是钳位，是对 -1 的特殊处理）。PointerEvent 构造器则保留 -1。
+    // 所以 mouse 类事件必须在构造后把 -1 盖回去，否则「移动=左键按下」的坑
+    // 只在 pointer 路径修好、mouse 路径依旧（2517518192 恰好走 pointer，
+    // 光看它会误以为已经修完）。
+    var needsButtonPatch = init.button < 0;
+    var ev = null;
     if (isPointer) {
       init.pointerId = 1;
       init.pointerType = "mouse";
@@ -853,17 +865,28 @@
       init.height = 1;
       init.pressure = init.buttons ? 0.5 : 0;
       try {
-        if (typeof w.PointerEvent === "function") return new w.PointerEvent(type, init);
+        if (typeof w.PointerEvent === "function") ev = new w.PointerEvent(type, init);
       } catch (_) {
         /* 退回 MouseEvent */
       }
     }
-    try {
-      if (typeof w.MouseEvent === "function") return new w.MouseEvent(type, init);
-    } catch (_) {
-      /* 忽略 */
+    if (!ev) {
+      try {
+        if (typeof w.MouseEvent === "function") ev = new w.MouseEvent(type, init);
+      } catch (_) {
+        /* 忽略 */
+      }
     }
-    return null;
+    if (ev && needsButtonPatch && ev.button !== init.button) {
+      try {
+        Object.defineProperty(ev, "button", { configurable: true, get: function () {
+          return init.button;
+        } });
+      } catch (_) {
+        /* 只读且不可重定义时保持构造值 */
+      }
+    }
+    return ev;
   }
 
   function ptrDispatch(node, type, x, y, opts) {

@@ -729,9 +729,20 @@ function runShim(extras) {
       this.type = type;
       Object.assign(this, init || {});
       this.bubbles = init?.bubbles !== false;
+      // **复现 Chromium 的真实行为**：MouseEvent 构造器把 button:-1 规范化成 0
+      // （实测 `new MouseEvent("x",{button:-1}).button === 0`，而 -2 原样通过）。
+      // 之前 stub 直接照抄 init，于是「移动事件 button 必须为 -1」在 verifier 里
+      // 绿着、真实浏览器里 mouse 路径却是 0 —— stub 比实现宽松就会漏掉真缺陷。
+      if (this.button === -1) this.button = 0;
     }
   }
-  class FakePointerEvent extends FakeMouseEvent {}
+  // PointerEvent 构造器保留 -1（与 Chromium 一致）
+  class FakePointerEvent extends FakeMouseEvent {
+    constructor(type, init) {
+      super(type, init);
+      if (init && init.button === -1) this.button = -1;
+    }
+  }
 
   /** 造一份「文档树 + shim」：documentElement > body > canvas / button */
   function makePointerEnv(opts) {
@@ -957,6 +968,48 @@ function runShim(extras) {
     check(
       seen[1] && seen[1].ev.movementX === 10 && seen[1].ev.movementY === -10,
       `第二次推送的 movementX/Y 应为帧间位移，实得 ${seen[1] && `${seen[1].ev.movementX},${seen[1].ev.movementY}`}`,
+    );
+  }
+
+  // (8b) `button` 的哨兵值：移动/悬停类事件必须是 -1，只有 down/up/click 才是 0。
+  //      2517518192（GameMaker HTML5 导出的 FNAF）在 pointermove 分支里照抄
+  //      `_tq = e.button` 再 `_mq |= (1 << _tq)`，且 _mq 只在 pointerup/out 才清零 ——
+  //      移动事件填 button:0 等于告诉游戏「左键一直按着」，鼠标只是移过去就永久卡在
+  //      按下态，画面表现是「点一下之后就再也点不动」，没有任何报错。
+  {
+    const env = makePointerEnv();
+    env.doc.elementFromPoint = () => env.canvas;
+    const seen = [];
+    record(
+      env.canvas,
+      ["pointermove", "mousemove", "pointerover", "mouseover", "pointerenter", "mouseenter",
+       "pointerout", "mouseout", "pointerleave", "mouseleave",
+       "pointerdown", "mousedown", "pointerup", "mouseup", "click"],
+      seen,
+      "canvas",
+    );
+    env.win.__wePushPointer(10, 10, 0); // 进入 + 移动
+    env.win.__wePushPointer(20, 20, 1); // 按下
+    env.win.__wePushPointer(20, 20, 0); // 松开 → click
+    env.win.__wePointerLeave(); // out/leave
+    const HOVER = new Set([
+      "pointermove", "mousemove", "pointerover", "mouseover", "pointerenter",
+      "mouseenter", "pointerout", "mouseout", "pointerleave", "mouseleave",
+    ]);
+    const PRESS = new Set(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
+    const badHover = seen.filter((e) => HOVER.has(e.type) && e.ev.button !== -1);
+    const badPress = seen.filter((e) => PRESS.has(e.type) && e.ev.button !== 0);
+    check(
+      seen.some((e) => HOVER.has(e.type)) && badHover.length === 0,
+      `移动/悬停类事件的 button 必须为 -1（W3C 哨兵值），违反：${badHover
+        .map((e) => `${e.type}=${e.ev.button}`)
+        .join(",")}`,
+    );
+    check(
+      seen.some((e) => PRESS.has(e.type)) && badPress.length === 0,
+      `down/up/click 的 button 必须为 0（左键），违反：${badPress
+        .map((e) => `${e.type}=${e.ev.button}`)
+        .join(",")}`,
     );
   }
 
