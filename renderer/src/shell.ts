@@ -291,7 +291,9 @@ export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string) {
     /* 回调抛错不打断渲染 */
   }
   try {
-    const origin = cfg.mediaBase ? new URL(cfg.mediaBase).origin : "";
+    // mediaBase 常是相对路径（/media/dev）——new URL 相对串无 base 会抛，诊断通道
+    // 从此静默断线（渲染端告警全部丢失）。必须挂 location.href 作 base。
+    const origin = cfg.mediaBase ? new URL(cfg.mediaBase, window.location.href).origin : "";
     if (origin) {
       const img = new Image();
       img.src = `${origin}/diag?msg=${encodeURIComponent(`scene ${cfg.src ?? "?"}: ${msg.slice(0, 500)}`)}`;

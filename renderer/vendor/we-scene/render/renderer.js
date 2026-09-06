@@ -442,9 +442,18 @@ export function createRenderer(canvas, opts = {}) {
           uni.set(base, { loc: gl.getUniformLocation(prog, info.name), type: GL_TYPES[info.type] || 'unknown', size: info.size })
         }
         const matMeta = { ...parseMaterialMeta(src.vert), ...parseMaterialMeta(src.frag) }
+        // [we-scene patch] 效果 vert 有两种顶点约定（全库并存）：
+        //   A. `mul(vec4(a_Position,1), g_ModelViewProjectionMatrix)` —— 像素空间
+        //      quad(0..w) + 转置像素正交 MVP（skew 等顶点位移 shader，3470764447）。
+        //   B. `gl_Position = vec4(a_Position, 1.0)` 直通不乘 MVP（D3D pretransformed
+        //      风格；motionblur_accumulation 等）—— 顶点必须是 NDC±1，像素 quad 会
+        //      整块裁掉、历史缓冲断链 → 白块（1444077782 回归）。
+        // 编译期扫 vert 源判定，渲染期按标志选 quad/MVP。
+        const ndcDirect = /gl_Position\s*=\s*vec4\s*\(\s*a_Position/.test(src.vert) &&
+          !/[aA]_Position[\s\S]{0,40}mul\s*\(/.test(src.vert)
         // sampler 槽的默认贴图名（scene.json 该槽为 null 时回退用）
         const samplerDefaults = new Map([...parseSamplerDefaults(src.vert), ...parseSamplerDefaults(src.frag)])
-        const entry = { prog, uni, matMeta, samplerDefaults, fragGlsl, vertGlsl }
+        const entry = { prog, uni, matMeta, samplerDefaults, fragGlsl, vertGlsl, ndcDirect }
         progCache.set(key, entry)
         return entry
       }
@@ -2289,7 +2298,21 @@ export function createRenderer(canvas, opts = {}) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, outFBO.fbo)
       gl.viewport(0, 0, outFBO.width, outFBO.height)
       gl.bindVertexArray(vao)
-      uploadQuad('pass', PASS_QUAD)
+      // [we-scene patch] 效果 pass 顶点空间按 shader 约定二选一（判定见 getEffectProgram）：
+      //   mul(MVP) 系 → 像素 quad(0..w) + 转置像素正交 MVP（WE 像素顶点语义，
+      //     skew 位移 87px=层宽 34% 合理；NDC 下 87 个 NDC 直接跑出裁剪体，
+      //     3470764447 Audio Bar 白块）。转置上传是 HLSL 行向量 `transpose(M)*v`
+      //     的约定（同 xray 逆矩阵先例），直接喂列主元会丢平移项。
+      //   NDC 直通系（gl_Position=vec4(a_Position,1)）→ NDC quad + 单位阵。
+      const usePixelQuad = !progEntry.ndcDirect
+      if (usePixelQuad) {
+        uploadQuad('passPx' + outFBO.width + 'x' + outFBO.height, layerQuad(outFBO.width, outFBO.height))
+      } else {
+        uploadQuad('pass', PASS_QUAD)
+      }
+      const passMVP = usePixelQuad
+        ? mat4Transpose(mat4Ortho(0, outFBO.width, 0, outFBO.height, -10000, 10000))
+        : IDENT_M4
       // 纹理绑定
       const texNames = mp.textures || []
       const maxTex = Math.max(texNames.length, 8)
@@ -2328,8 +2351,8 @@ export function createRenderer(canvas, opts = {}) {
         usedUnits.add(ti)
         resolutions.set(ti, [t.width, t.height, t.width, t.height])
       }
-      // 系统 uniform
-      bindSystemUniforms(uni, layer, time, cam.projW, cam.projH, IDENT_M4, layerOrtho, IDENT_M4, resolutions, layerOrtho, cam)
+      // 系统 uniform（mvp 随 quad 空间，见上方说明）
+      bindSystemUniforms(uni, layer, time, cam.projW, cam.projH, passMVP, layerOrtho, IDENT_M4, resolutions, layerOrtho, cam)
       // 常量（material 名 → uniform 映射）
       // [we-scene patch] 先跑常量脚本：带 {script} 的常量逐帧求值后才是当前值。
       // cacheKey 用 shader + pass 序号，保证同一 pass 的沙箱跨帧复用（脚本有内部状态）。

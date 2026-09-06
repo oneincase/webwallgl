@@ -153,12 +153,30 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   }
   rt.canvas = c;
   let disposed = false;
+  // [we-scene patch] 挂载期 console.warn → diag 桥：效果 pass 编译失败等渲染端
+  // 告警只走 console.warn（CDP 看不见、vite 日志也收不到），排错全靠盲猜。
+  // 桥接 [we-scene] 前缀到 reportDiag，卸载时还原。
+  const origWarn = console.warn.bind(console);
+  console.warn = (...args: unknown[]) => {
+    const s = args
+      .map((a) => (typeof a === "string" ? a : String((a as Error)?.message ?? a)))
+      .join(" ");
+    if (s.includes("[we-scene]")) {
+      try {
+        reportDiag(rt, cfg, s.slice(0, 300));
+      } catch {
+        /* 忽略 */
+      }
+    }
+    origWarn(...args);
+  };
   const pkgAbort = new AbortController();
   // 粒子系统注册的 mousemove 监听（控制点跟随鼠标）；卸载时必须摘掉，
   // 否则重挂场景会在 window 上累积监听器，旧回调还持有已释放的 GL 资源。
   let particleCleanup: (() => void) | undefined;
   rt.sceneCleanup = () => {
     disposed = true;
+    console.warn = origWarn;
     pkgAbort.abort();
     rt.sceneTextUpdate = undefined;
     if (particleCleanup) {
@@ -2273,6 +2291,8 @@ cfg, source, pkgAbort.signal);
       }
       // 调试出口：媒体广播表（排查「回调登记了没 / 派发到了没」）
       (window as unknown as Record<string, unknown>).__mediaHooks = mediaHooks;
+      // 调试出口：活层引用（白块/消失层归属定位——evaluate 直接改 visibleSelf 验证）
+      (window as unknown as Record<string, unknown>).__sceneLayers = scene.layers;
       // [we-scene patch] 调试出口：本帧解析出的跨层合成目标（`_rt_imageLayerComposite_*`）
       (window as unknown as Record<string, unknown>).__compositeStats = () =>
         (renderer as any).compositeStats?.() ?? null;
