@@ -117,6 +117,31 @@ function expandMacrosIn(text, depth) {
       const dm = /^[ \t]*#define[ \t]+([A-Za-z_][A-Za-z0-9_]*)/.exec(lines[i])
       if (dm && !defLine.has(dm[1])) defLine.set(dm[1], i)
     }
+    // [we-scene patch] **作者用同名变量声明遮蔽了宏时，只保护声明那一行**。
+    // 内置 common_blending.h 有 `#define LUMINANCE_FACTOR vec3(0.11, 0.59, 0.3)`，
+    // 而 tone_mapping.frag 自己写 `const vec3 LUMINANCE_FACTOR = vec3(0.2126, …);`。
+    // 不保护声明行 → 变成 `const vec3 vec3(0.11, …) = …`，ANGLE 报
+    // `'vec3' : syntax error`，整个 tone_mapping pass 被跳过（5 pass / 5 壁纸）。
+    //
+    // ⚠️ 试过「整份文件里这个宏完全失效」，更糟：公共头 greyscale/saturation 里
+    // 那些引用（在作者声明**之前**）会变成 `undeclared identifier`，
+    // GLSL 要求先声明后使用。所以只跳过声明行，其余引用照常展开宏值。
+    // 代价是作者第 256 行 `normalize(LUMINANCE_FACTOR)` 拿到的是公共头的 601 系数
+    // 而非他自己的 709 —— 数值有偏差但能编译出画面，好过整个色调映射效果消失。
+    const declLine = new Map()
+    {
+      const TYPES = '(?:float|int|bool|vec[234]|ivec[234]|bvec[234]|mat[234])'
+      for (const name of defs.keys()) {
+        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const re = new RegExp(
+          '^\\s*(?:const\\s+|uniform\\s+|varying\\s+|in\\s+|out\\s+|attribute\\s+)*' +
+            TYPES + '\\s+' + esc + '\\s*[=;]',
+        )
+        for (let i = 0; i < lines.length; i++) {
+          if (re.test(lines[i])) { declLine.set(name, i); break }
+        }
+      }
+    }
     let changed = false
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
@@ -125,6 +150,7 @@ function expandMacrosIn(text, depth) {
       for (const [name, val] of defs) {
         const dl = defLine.get(name)
         if (dl !== undefined && i < dl) continue
+        if (declLine.get(name) === i) continue
         const re = new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b')
         if (re.test(l)) {
           l = replaceWord(l, name, val)

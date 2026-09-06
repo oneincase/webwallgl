@@ -1210,6 +1210,30 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **宏名撞上作者的同名变量声明**：只保护声明那一行。
+// 内置 common_blending.h 有 `#define LUMINANCE_FACTOR vec3(0.11, 0.59, 0.3)`，
+// tone_mapping.frag 自己写 `const vec3 LUMINANCE_FACTOR = vec3(0.2126, …);`。
+// 不保护声明行 → `const vec3 vec3(0.11, …) = …` → `'vec3' : syntax error`，
+// 整个色调映射 pass 被跳过（5 pass / 5 壁纸）。
+// 也不能让宏整体失效：公共头里那些引用在作者声明**之前**，会变成
+// `undeclared identifier`（GLSL 要求先声明后使用）。
+{
+  const src = [
+    "#define LUMA vec3(0.11, 0.59, 0.3)",
+    "float greyscale(vec3 c) { return dot(LUMA, c); }",
+    "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);",
+    "void main() { gl_FragColor = vec4(greyscale(vec3(1.0))); }",
+  ].join("\n");
+  const g = hlsl2glsl(src, "frag", {}, () => null);
+  if (!/const vec3 LUMA = vec3\(0\.2126/.test(g)) {
+    wireErrors.push("宏名撞同名变量声明时，声明那一行不得被宏替换（会变成 vec3 vec3(...) 语法错误）");
+  }
+  // 声明之前的引用仍须展开成宏值，否则 undeclared identifier
+  if (!/dot\(vec3\(0\.11/.test(g)) {
+    wireErrors.push("作者声明之前的引用仍须展开宏值（宏整体失效会导致 undeclared identifier）");
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。
