@@ -647,6 +647,144 @@ const kf = (frame, value, front, back) => ({
   }
 }
 
+// ---------- 关键帧动画必须与骨骼动画同一时钟（3233141951 头发/头不同步、漏模）----------
+//
+// 骨骼动画（puppet）走渲染循环里的真实时钟 `t = (now - start - pauseAccum)/1000`；
+// 关键帧动画（objectAnimations）曾按 `advance(interval / 1000)` 累加**目标**帧间隔。
+// 渲染门是 `now - lastRender >= interval`，实际出帧周期总略大于 interval，
+// 每帧只加 interval 就是系统性欠计 —— 两条时间轴持续发散。
+//
+// 3233141951 的头是唯一 puppet 层（骨骼动画 63，30fps/900 帧），头发0202 / 头发负形 /
+// 发饰 / 补 都是 quad 靠 origin 关键帧位移（同样 30fps/900 帧，本该严格同步）。
+// 漂移的表现就是用户报的「头发和头部运动轨迹不统一，出现漏模」。
+{
+  console.log("\n[时钟同步] 关键帧动画 vs 骨骼动画");
+
+  // 1) 接线断言：渲染循环不得再用目标帧间隔喂 advance / frametime
+  const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(
+    !/\.advance\(interval \/ 1000\)/.test(mountSrc),
+    "关键帧动画不得按目标帧间隔累加（与骨骼的真实时钟发散，3233141951 漏模）",
+  );
+  check(
+    !/frametime = interval \/ 1000/.test(mountSrc),
+    "engine.frametime 不得用目标帧间隔（须与同一行的 runtime 同时基）",
+  );
+  check(
+    /const animDt = Math\.max\(0, t - lastAnimT\)/.test(mountSrc) &&
+      /\.advance\(animDt\)/.test(mountSrc),
+    "关键帧动画必须用真实经过时间 animDt 推进",
+  );
+  // animDt 是**帧间增量**，算完必须立刻推进 lastAnimT。漏掉这一句 dt 会变成
+  // 「从头到现在的累计时间」，播放头按 t 的平方增长 —— 动画瞬间飞出值域，
+  // 而上面几条正则断言全都照过（正则只看形状，不看语义）。
+  check(
+    /const animDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*lastAnimT = t;/.test(mountSrc),
+    "算出 animDt 后必须立即推进 lastAnimT（否则 dt 变成累计时间，播放头按 t² 增长）",
+  );
+  check(
+    (mountSrc.match(/frametime = animDt/g) || []).length === 3,
+    "三处 engine.frametime（效果开关 / general / 对象脚本）都应改用 animDt",
+  );
+
+  // 2) 数值判据：模拟渲染循环，两种推进方式各跑一遍，比对与真实时钟的偏差。
+  //    真实帧间隔取几档（含理想满帧）——重点是**即便满帧也会漂**，因为门限是 >=。
+  const pkgPath = join(LIB, "3233141951", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const raw = JSON.parse(new TextDecoder().decode(getEntry(pkg, "scene.json")));
+    const hair = (raw.objects || []).find((o) => o.name === "头发0202");
+    check(!!hair?.origin?.animation, "3233141951 头发0202 应有 origin 关键帧动画");
+    const head = (raw.objects || []).find((o) => o.name === "头");
+    check(
+      Array.isArray(head?.animationlayers) && head.animationlayers.length > 0,
+      "3233141951 头应有骨骼 animationlayers（对照时钟的另一侧）",
+    );
+
+    if (hair?.origin?.animation) {
+      /** 模拟渲染循环。mode=fixed 复现旧行为，real 是修复后的行为，
+       *  noAdvance 复现「算了 animDt 却忘记推进 lastAnimT」这个改错方式。 */
+      const simulate = (realFrameMs, seconds, mode, targetFps = 60) => {
+        const ctrl = createAnimation(hair.origin.animation);
+        const interval = 1000 / targetFps;
+        let now = 0;
+        let lastRender = -Infinity;
+        let lastAnimT = 0;
+        while (now < seconds * 1000) {
+          now += realFrameMs;
+          if (now - lastRender >= interval) {
+            lastRender = now;
+            const t = now / 1000;
+            if (mode === "fixed") ctrl.advance(interval / 1000);
+            else if (mode === "noAdvance") ctrl.advance(Math.max(0, t - lastAnimT));
+            else {
+              ctrl.advance(Math.max(0, t - lastAnimT));
+              lastAnimT = t;
+            }
+          }
+        }
+        return ctrl.getFrame();
+      };
+
+      for (const [label, ms] of [
+        ["理想满帧 60fps", 1000 / 60],
+        ["120Hz 显示器", 1000 / 120],
+        ["掉帧到 40fps", 25],
+      ]) {
+        const secs = 30;
+        const truth = secs * 30; // 骨骼按真实时钟走到的帧（动画 fps=30）
+        const fixed = simulate(ms, secs, "fixed");
+        const real = simulate(ms, secs, "real");
+        // 修复后必须紧跟真实时钟（容差 1 帧 ≈ 33ms）
+        check(
+          Math.abs(real - truth) <= 1,
+          `${label}：真实 dt 推进应跟住骨骼时钟（期望 ${truth} 帧，实得 ${real.toFixed(1)}）`,
+        );
+        // 且必须明显优于旧行为，否则这条断言等于没测
+        check(
+          Math.abs(fixed - truth) > Math.abs(real - truth) + 10,
+          `${label}：旧的固定累加应显著偏离（旧 ${fixed.toFixed(1)} / 新 ${real.toFixed(1)} / 真值 ${truth}）`,
+        );
+        console.log(
+          `   ${label}: 旧 ${fixed.toFixed(1)} 帧 / 新 ${real.toFixed(1)} 帧 / 真值 ${truth} 帧`,
+        );
+      }
+
+      // 「忘记推进 lastAnimT」是最容易写错的一步，且正则断言看不出来：
+      // dt 变成累计时间后播放头按 t² 增长，30s 会冲到真值的几十倍。
+      {
+        const truth = 30 * 30;
+        const broken = simulate(1000 / 60, 30, "noAdvance");
+        check(
+          broken > truth * 5,
+          `漏推进 lastAnimT 应让播放头爆炸式增长（真值 ${truth}，实得 ${broken.toFixed(1)}）—— ` +
+            `若这条不成立，说明模拟没能复现该错误，判据失去意义`,
+        );
+        console.log(`   （对照）漏推进 lastAnimT: ${broken.toFixed(0)} 帧 vs 真值 ${truth} 帧`);
+      }
+
+      // 3) 漂移换算成画面偏移：头发相对头顶错开几十像素就是肉眼可见的漏模
+      const ctrl = createAnimation(hair.origin.animation);
+      const base = hair.origin.value;
+      const at = (f) => {
+        ctrl.setFrame(f);
+        return ctrl.applyTo(base);
+      };
+      let worst = 0;
+      for (let f = 0; f < 900; f++) {
+        const a = at(f);
+        const b = at(f + 164); // 理想满帧下 30s 的实测漂移量
+        worst = Math.max(worst, Math.hypot(a[0] - b[0], a[1] - b[1]));
+      }
+      check(
+        worst > 20,
+        `漂移 164 帧应造成显著位移（>20px），实得 ${worst.toFixed(1)}px —— 若变小说明语料换了，判据需重新标定`,
+      );
+      console.log(`   漂移 164 帧 → 头发0202 最大偏移 ${worst.toFixed(1)}px（漏模量级）`);
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`verify-animation: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

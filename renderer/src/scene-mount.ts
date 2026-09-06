@@ -2384,6 +2384,12 @@ cfg, source, pkgAbort.signal);
       const playingVideos: Array<{ play: () => void }> = [];
       const playingAudios: HTMLAudioElement[] = [];
       let lastRender = -Infinity;
+      // 关键帧动画的上一帧时刻（真实时钟，秒）。**不能用固定的目标帧间隔累加**：
+      // 渲染门是 `now - lastRender >= interval`，实际出帧周期总略大于 interval，
+      // 每帧只加 interval 就是系统性欠计 —— 骨骼动画走真实时钟 t，两条时间轴会
+      // 持续发散（3233141951：理想满帧下 30s 就差 164 帧≈5.5s，头发相对头顶
+      // 最大错位 40px、发饰 79px，看起来就是「头发和头不同步、漏模」）。
+      let lastAnimT = 0;
       const renderLoop = (now: number) => {
         if (disposed || rt.paused) return;
         // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用。
@@ -2429,8 +2435,14 @@ cfg, source, pkgAbort.signal);
           // [we-scene patch] 关键帧动画推进并写回字段。必须在对象脚本**之前**：
           // 同一字段上两者可以并存（全库 44 处），语义是脚本控制播放头、
           // 动画产出值，脚本的 update 返回值优先级更高。
+          //
+          // dt 取**真实经过时间**（与骨骼动画的 t 同一时钟），不是目标帧间隔：
+          // 见 lastAnimT 的声明处。首帧 dt=0（lastAnimT 初值 0，t 也≈0）；
+          // 暂停期间 t 已扣掉 pauseAccum，恢复后不会补跑一大段。
+          const animDt = Math.max(0, t - lastAnimT);
+          lastAnimT = t;
           for (const run of animRuns) {
-            run.ctrl.advance(interval / 1000);
+            run.ctrl.advance(animDt);
             const field = run.field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (Array.isArray(out)) {
@@ -2442,7 +2454,7 @@ cfg, source, pkgAbort.signal);
             }
           }
           for (const run of generalAnimRuns) {
-            run.ctrl.advance(interval / 1000);
+            run.ctrl.advance(animDt);
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (typeof out === "number" && Number.isFinite(out)) run.write(out);
             else if (Array.isArray(out) && Number.isFinite(out[0])) run.write(out[0]);
@@ -2450,14 +2462,17 @@ cfg, source, pkgAbort.signal);
           // 效果开关脚本逐帧求值（只有明确返回布尔时才写回，同 visible 字段脚本）
           for (const run of effectVisibleRuns) {
             if (run.sandbox.disabled) continue;
-            run.sandbox.engine.frametime = interval / 1000;
+            // frametime 与 runtime 必须同一时基：runtime 是真实时钟 t，frametime
+            // 若用目标帧间隔就系统性欠计，作者的 `x += v * frametime` 积分会比骨骼
+            // 动画越走越慢（全库 57 张脚本用 frametime，3233141951 本张 9 处）。
+            run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
             const ret = run.sandbox.callUpdate(!!run.effect.visible);
             if (typeof ret === "boolean") run.effect.visible = ret;
           }
           for (const run of generalScriptRuns) {
             if (run.sandbox.disabled) continue;
-            run.sandbox.engine.frametime = interval / 1000;
+            run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
             const g = (scene as any).general || {};
             const cur = g[run.field] && typeof g[run.field] === "object" && "value" in g[run.field]
@@ -2471,7 +2486,7 @@ cfg, source, pkgAbort.signal);
           let visibilityDirty = false;
           for (const run of objectScriptRuns) {
             if (run.sandbox.disabled) continue;
-            run.sandbox.engine.frametime = interval / 1000;
+            run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
             run.sandbox.engine.screenResolution = screenRes;
             const cur = run.layer[run.field];
