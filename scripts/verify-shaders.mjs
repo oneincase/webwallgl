@@ -841,6 +841,67 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **内联比较表达式参与算术**：`depth *= (depth < 0.6) * 6.0;`
+// （gaussian.frag 的 PRECISE 分支，16 pass / 6 壁纸）。HLSL 把 bool 当 0/1 提升，
+// GLSL ES 报 `'*' : … 'bool' and … 'float'`，整个高斯模糊 pass 被跳过。
+// 既有的 10c 只认已声明的 bool 变量名，内联比较没有变量可收集。
+{
+  const hit = hlsl2glsl(
+    "void main(){ float depth=0.5; depth *= (depth < 0.6) * 6.0; gl_FragColor=vec4(depth); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/float\(depth < 0\.6\)/.test(hit)) {
+    wireErrors.push("内联比较参与算术必须包 float()：(depth < 0.6) * 6.0 在 GLSL ES 编不过");
+  }
+  // 不得误伤条件语句：if / 三元 / for / while 里的比较必须原样保留
+  const guards = [
+    ["if", "void main(){ float d=0.5; float o=0.0; if (d < 0.6) { o=1.0; } gl_FragColor=vec4(o); }", /if \(d < 0\.6\)/],
+    ["三元", "void main(){ float d=0.5; float o = (d < 0.6) ? 1.0 : 0.0; gl_FragColor=vec4(o); }", /\(d < 0\.6\) \?/],
+    ["while", "void main(){ float s=0.0; int i=0; while ((i < 3)) { s+=1.0; i++; } gl_FragColor=vec4(s); }", /while \(\(i < 3\)\)/],
+    ["逻辑与", "void main(){ float a=1.0,b=2.0; float o=0.0; if ((a < b && b < 3.0)) o=1.0; gl_FragColor=vec4(o); }", /a < b && b < 3\.0/],
+  ];
+  for (const [label, src, want] of guards) {
+    const g = hlsl2glsl(src, "frag", {}, () => null);
+    if (!want.test(g)) wireErrors.push(`条件语句里的比较不得被包 float()（${label}）`);
+  }
+}
+
+// [we-scene patch] **科学计数法字面量整体挖洞**（在补 .0 的全部规则之前）。
+// `1e-6` 指数部分的数字前面是 `-`，逃不过那些「整数字面量」正则的负向后顾，
+// 被改成 `1.0e-6.0` → ANGLE 报 `'.0' : syntax error`，整个 pass 被跳过
+// （procedural_noise / lens_distortion / frame_builder / oscilloscope，8 pass / 7 壁纸）。
+// 作者写的是防除零下限 max(1e-6, x)，本来完全合法。
+{
+  const one = hlsl2glsl(
+    "uniform float u_fps;\nvoid main(){ float v = max(1e-6, u_fps); gl_Position=vec4(v); }",
+    "vert",
+    {},
+    () => null,
+  );
+  if (/1\.0e-6\.0|e-6\.0/.test(one)) {
+    wireErrors.push("科学计数法字面量被补 .0（1e-6 → 1.0e-6.0），必须在补 .0 之前整体挖洞保护");
+  }
+  if (!/max\(1e-6,/.test(one)) {
+    wireErrors.push(`科学计数法字面量未原样保留：${(one.match(/max\([^)]*\)/) || ["?"])[0]}`);
+  }
+  // 多个字面量共存时回填索引不能错位 —— 占位符里若含十进制数字，序号本身会被
+  // 补 .0 规则改写（\u00010\u0001 → \u00010.0\u0001），回填后 1e-6 会变成 0.0：
+  // 静默算错，比原缺陷更糟（不报编译错）。故占位符用一元记数。
+  const multi = hlsl2glsl(
+    "uniform float a;\nvoid main(){ float x = max(1e-6, a) + max(2.5e-3, a) * 1e10; gl_Position=vec4(x); }",
+    "vert",
+    {},
+    () => null,
+  );
+  for (const lit of ["1e-6", "2.5e-3", "1e10"]) {
+    if (!multi.includes(lit)) {
+      wireErrors.push(`多个科学计数法共存时 ${lit} 回填错位（占位符不得含十进制数字）`);
+    }
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。

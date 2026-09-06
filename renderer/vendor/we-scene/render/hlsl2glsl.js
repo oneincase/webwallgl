@@ -213,6 +213,27 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
 
   // HLSL 隐式 int→float 转换：整数字面量在浮点上下文里补 .0。
   //
+  // [we-scene patch] **科学计数法字面量整体挖洞**，在补 .0 的全部规则之前。
+  // `1e-6` / `1.0e-6` 里指数部分的数字，前面是 `-`/`+`/`e`，全都逃不过下面那些
+  // 「整数字面量」正则的负向后顾（它们只排除字母数字和小数点）。于是
+  // `max(1e-6, u_fps)` 被改成 `max(1.0e-6.0, u_fps)`，ANGLE 报 `'.0' : syntax error`，
+  // 整个 pass 被跳过 —— procedural_noise / lens_distortion / frame_builder /
+  // audio_responsive_oscilloscope 等 8 pass / 7 壁纸，作者写的是防除零下限
+  // `max(1e-6, x)`，本来完全合法，是转译器自己造的缺陷。
+  //
+  // 之前试过只在内建函数实参处理里挖洞（rewriteCall 内），没用：真正改坏它的是
+  // 下面这个不动点循环里的多条规则组合，位置在那之前。挖洞必须放在最外层。
+  //
+  // 占位符**不能含十进制数字**：第一版用 `\u0001<序号>\u0001`，序号里的数字又被
+  // 补 .0 的规则改写（`\u00010\u0001` → `\u00010.0\u0001`），回填时索引对不上，
+  // `1e-6` 直接变成 `0.0` —— 比原缺陷更糟（静默算错，不报编译错）。
+  // 改用一元记数：序号 n 编码成 n 个 \u0002，中间无数字可改。
+  const sciHoles = []
+  code = code.replace(/\b\d+(?:\.\d+)?[eE][+-]?\d+\b/g, (m) => {
+    sciHoles.push(m)
+    return '\u0001' + '\u0002'.repeat(sciHoles.length) + '\u0001'
+  })
+  //
   // [we-scene patch] **必须迭代到不动点**：这些都是单趟正则替换，而 HLSL 的
   // 链式表达式要多趟才能收敛。`#define kernel 2` 展开出的 `2 + 2 + 2.0`
   // （2999533824 等 7 张的 gaussian.frag）第一趟只改右边那个（它紧邻浮点字面量），
@@ -750,6 +771,32 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     }
   }
 
+  // 10c-2) [we-scene patch] **内联比较表达式参与算术**：`depth *= (depth < 0.6) * 6.0;`
+  //    （gaussian.frag 的 PRECISE 分支，16 pass / 6 壁纸）。
+  //    HLSL 把 bool 当 0/1 隐式提升；GLSL ES 报
+  //    `'*' : … 'bool' and … 'float'` + `cannot convert from 'bool' to 'float'`，
+  //    整个高斯模糊 pass 被跳过（画面上景深模糊整条消失）。
+  //
+  //    10c 只认**已声明的 bool 变量名**，这里没有变量可收集 —— 比较表达式直接
+  //    写在括号里。所以单独一条：把 `(<表达式> <比较运算符> <表达式>)` 整体包成
+  //    float(...)，仅当该括号紧接着参与算术（后面跟 * / + - 或前面是复合赋值）时才动。
+  //
+  //    只匹配单层括号内的简单比较（无嵌套括号、无 && ||）：那是 WE 语料里的全部
+  //    形态。带逻辑运算符的条件（`(a < b && c > d)`）留给 if 语句用，包 float()
+  //    反而会破坏语义。
+  {
+    const CMP = /\(\s*([^()&|]+?)\s*(<=|>=|<|>|==|!=)\s*([^()&|]+?)\s*\)/g
+    // 参与算术的判定：括号后紧跟 * / + -，或括号前是复合赋值/算术运算符。
+    code = code.replace(
+      new RegExp(CMP.source + '\\s*([*/])', 'g'),
+      (all, lhs, op, rhs, mulOp) => `float(${lhs.trim()} ${op} ${rhs.trim()}) ${mulOp}`,
+    )
+    code = code.replace(
+      new RegExp('([-+*/]=\\s*)' + CMP.source, 'g'),
+      (all, assign, lhs, op, rhs) => `${assign}float(${lhs.trim()} ${op} ${rhs.trim()})`,
+    )
+  }
+
   // 10d) [we-scene patch] **float 一维数组的二维下标**。
   //    WE 引擎把 `g_AudioSpectrum64Left` 以 `float4[16]` 注入，作者声明成
   //    `uniform float arr[64]` 再用 `arr[i/4][i%4]` 取 packed 分量。HLSL 侧合法
@@ -1116,6 +1163,13 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       seen.add(name)
       return line
     }).join('\n')
+  }
+
+  // [we-scene patch] 回填科学计数法字面量（上面在补 .0 之前整体挖了洞，
+  // 见 sciHoles 处注释）。必须在所有改写之后、拼 prologue 之前。
+  // 一元记数：\u0002 的个数即序号（从 1 起）。
+  if (sciHoles.length > 0) {
+    code = code.replace(/\u0001(\u0002+)\u0001/g, (m, marks) => sciHoles[marks.length - 1])
   }
 
   // 输出：float 精度统一 highp（顶点默认即 highp；片元若用 mediump 会与顶点共享 uniform 精度不一致导致链接失败）
