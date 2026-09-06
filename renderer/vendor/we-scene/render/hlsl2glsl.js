@@ -589,6 +589,20 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       }
       const vecW = (expr) => {
         const e = expr.trim()
+        // [we-scene patch] 显式 vecN(...) 构造：宽度就写在名字里。
+        // `vec3 finalColor = vec4(rValue.r, gValue.g, bValue.b, 0.1);`
+        // （chromatic_aberration，5 壁纸）—— HLSL 隐式丢掉第 4 个分量。
+        {
+          const c = /^vec([234])\s*\(/.exec(e)
+          if (c) {
+            let depth = 0
+            for (let i = e.indexOf('('); i < e.length; i++) {
+              if (e[i] === '(') depth++
+              else if (e[i] === ')') { depth--; if (depth === 0) return i === e.length - 1 ? Number(c[1]) : 0 }
+            }
+            return 0
+          }
+        }
         // texture(...) / textureLod(...) 整段
         if (/^texture(?:Lod)?\s*\(/.test(e)) {
           let depth = 0

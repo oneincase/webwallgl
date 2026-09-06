@@ -1234,6 +1234,30 @@ const wireErrors = [];
   }
 }
 
+// [we-scene patch] **显式 vecN(...) 构造赋给更窄的向量声明**：
+// `vec3 finalColor = vec4(rValue.r, gValue.g, bValue.b, 0.1);`
+// （chromatic_aberration，5 壁纸）—— HLSL 隐式丢掉第 4 个分量，
+// GLSL ES 报 `'=' : dimension mismatch`，整个色散 pass 被跳过。
+{
+  const g = hlsl2glsl(
+    "uniform vec4 rV,gV,bV;\nvoid main(){ vec3 finalColor = vec4(rV.r, gV.g, bV.b, 0.1); gl_FragColor=vec4(finalColor,1.0); }",
+    "frag",
+    {},
+    () => null,
+  );
+  if (!/vec3 finalColor = \(vec4\([^;]*\)\)\.xyz;/.test(g)) {
+    wireErrors.push("vec3 x = vec4(...) 必须截成 .xyz（GLSL ES 无隐式丢分量）");
+  }
+  // 同宽构造不得被包
+  for (const [label, src, want] of [
+    ["vec3=vec3", "void main(){ vec3 a = vec3(0.5); gl_FragColor=vec4(a,1.0); }", /vec3 a = vec3\(0\.5\);/],
+    ["vec2=vec2", "void main(){ vec2 a = vec2(0.5, 0.3); gl_FragColor=vec4(a,0,1); }", /vec2 a = vec2\(0\.5, 0\.3\);/],
+  ]) {
+    const s2 = hlsl2glsl(src, "frag", {}, () => null);
+    if (!want.test(s2)) wireErrors.push(`同宽 vecN 构造不得被截断包裹（${label}）`);
+  }
+}
+
 // [we-scene patch] vec4 v_TexCoord 喂给 texture：GLSL 只要 vec2，必须 .xy。
 // 2902406982 clipping_mask 两侧都是 vec4 时「加宽」路径不触发，编不过 →
 // 效果跳过 → 白三角直出（「窗口 Box」白块）。
