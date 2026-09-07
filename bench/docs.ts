@@ -239,7 +239,7 @@ export const DOC: DocSection[] = [
           [{ zh: "setRenderDpr(dpr)", en: "setRenderDpr(dpr)" }, { zh: "改 DPR 需重建画布，内部自动重挂（pkg 缓存命中，不重新下载）", en: "Changing DPR rebuilds the canvas; remounts internally (pkg cache hit, no re-download)" }],
           [{ zh: "setProperties(props)", en: "setProperties(props)" }, { zh: "属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包", en: "Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch" }],
           [{ zh: "getProperties()", en: "getProperties()" }, { zh: "当前生效的扁平化属性值表", en: "The current flattened property value map" }],
-          [{ zh: "setAudio(src)", en: "setAudio(src)" }, { zh: "换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效", en: "Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only" }],
+          [{ zh: "setAudio(src)", en: "setAudio(src)" }, { zh: "换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。scene 与 web 都生效", en: "Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Works for scene and web" }],
           [{ zh: "setMedia(src)", en: "setMedia(src)" }, { zh: "换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空", en: "Swap the system media source (Now Playing); shared by scene and web, survives scene changes" }],
           [{ zh: "media", en: "media" }, { zh: "媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制", en: "Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control" }],
           [{ zh: "pushPointer(u, v, buttons?)", en: "pushPointer(u, v, buttons?)" }, { zh: "外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效", en: "Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web" }],
@@ -389,7 +389,7 @@ export const DOC: DocSection[] = [
           { zh: "音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生", en: "Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library" },
           { zh: "snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理", en: "Returning null (or throwing) from snapshot() means \"no data this frame\" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up" },
           { zh: "setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效", en: "setAudio survives scene changes: install it once and it applies to every scene loaded afterwards" },
-          { zh: "音频注入只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条通道", en: "Audio injection applies to scene wallpapers only; web wallpapers get audio through a separate iframe-shim channel" },
+          { zh: "音频注入对 scene 与 web 壁纸都生效：网页侧经 iframe shim 的音频泵收到同一份数据；两个泵都逐帧选源，所以 mount() 之后再 setAudio 同样有效", en: "Audio injection works for both scene and web wallpapers: the web side receives the same data through the iframe shim audio pump, and both pumps pick their source per frame so calling setAudio after mount() works too" },
         ],
       },
     ],
@@ -489,6 +489,7 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.1", en: "1.3.1" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流）", en: "Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream)" }],
           [{ zh: "1.3.0", en: "1.3.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver", en: "mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web" }],
           [{ zh: "1.2.0", en: "1.2.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈）", en: "Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports)" }],
           [{ zh: "1.1.0", en: "1.1.0" }, { zh: "2026-09-07", en: "2026-09-07" }, { zh: "外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全", en: "External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics" }],
@@ -496,6 +497,22 @@ export const DOC: DocSection[] = [
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
         ],
       },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.1 修一个下游实测发现的缺陷：**麦克风都接上了，网页壁纸的音谱还在放默认合成流**。",
+          en: "1.3.1 fixes a defect found downstream in real use: **the microphone was connected, yet web wallpapers kept showing the default synthetic stream**.",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "根因一：web 装配路径压根不读 rt.audioBridge（1.3.0 给媒体源接了这一环，音频这行漏了），注入的频谱到不了 iframe", en: "Root cause 1: the web assembly path never read rt.audioBridge (1.3.0 wired this up for the media source but missed the audio line), so injected spectra never reached the iframe" },
+          { zh: "根因二：音频与媒体两个泵都在**装配时**捕获 driver，而 setAudio()/setMedia() 通常在 mount() 之后才调用（宿主的麦克风 / SSE 通道那时才就绪）——定死 driver 等于后装的源永远不生效。两个泵均改为逐帧选源，撤源后也能落回默认", en: "Root cause 2: both the audio and media pumps captured their driver at assembly time, while setAudio()/setMedia() are typically called after mount() (that is when the host's microphone or SSE channel becomes ready) — a fixed driver means a later source never takes effect. Both pumps now pick their source per frame and fall back cleanly when the source is removed" },
+          { zh: "注入的频谱**不再套 gamma 对比扩展**：那道处理是给内置模拟源的未钳位频段用的，对宿主给的 0..1 真实频谱再乘一遍会把音条整体顶到满格", en: "Injected spectra are no longer put through the gamma contrast expansion: that step exists for the built-in simulation's unclamped bands, and applying it to a host's already-normalized 0..1 spectrum would peg every bar at full scale" },
+        ],
+      },
+
       {
         k: "p",
         v: {
@@ -528,7 +545,7 @@ export const DOC: DocSection[] = [
           { zh: "媒体路径改为支持调用方传入的 canvas，并按 CSS 尺寸而非窗口尺寸分配缓冲区（此前嵌入式画布会拿到整窗口大小的 backing store，且画布根本不会被插入 DOM）", en: "The media path now honors a caller-supplied canvas and sizes its backing store from CSS dimensions rather than the window (previously an embedded canvas got a full-window buffer and was never inserted into the DOM at all)" },
           { zh: "MountOptions.audio 真正接线（此前是声明了却零引用的死字段），并新增 SceneInstance.setAudio() 供挂载后切换——宿主的频谱通道常在 mount() 之后才就绪", en: "MountOptions.audio is actually wired now (it was a declared-but-unreferenced dead field), plus a new SceneInstance.setAudio() for swapping after mount — host spectrum channels usually become ready only after mount()" },
           { zh: "新增 SceneInstance.pushPointer() / pointerLeave()，与整页渲染器的 __wp 同名同签名，下游从整页迁到库时代码不用改", en: "New SceneInstance.pushPointer() / pointerLeave(), matching the full-page renderer's __wp in both name and signature so downstream code needs no changes when migrating to the library" },
-          { zh: "已知边界（写明而不假装支持）：音频注入只对 scene 生效，网页壁纸走 iframe shim 的另一条通道；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 仍未接线，类型注释已标注", en: "Known boundaries, stated rather than papered over: audio injection is scene-only (web wallpapers use a separate iframe-shim channel); media wallpapers have no pointer concept; MountOptions' pointer / media / features remain unwired and are now marked as such in the type comments" },
+          { zh: "已知边界（当时状态）：音频注入只对 scene 生效——网页壁纸走 iframe shim 的另一条通道，1.3.1 已补上；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 当时未接线（media 已在 1.3.0 接线）", en: "Known boundaries at the time: audio injection was scene-only — web wallpapers use a separate iframe-shim channel, wired up in 1.3.1; media wallpapers have no pointer concept; MountOptions' pointer / media / features were unwired (media landed in 1.3.0)" },
         ],
       },
       {

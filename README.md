@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -140,7 +140,7 @@ input.addEventListener("change", () => {
 | `setRenderDpr(dpr)` | 改 DPR 需重建画布，内部自动重挂（pkg 缓存命中，不重新下载） |
 | `setProperties(props)` | 属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包 |
 | `getProperties()` | 当前生效的扁平化属性值表 |
-| `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效 |
+| `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。scene 与 web 都生效 |
 | `setMedia(src)` | 换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空 |
 | `media` | 媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制 |
 | `pushPointer(u, v, buttons?)` | 外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
@@ -271,7 +271,7 @@ wp.setAudio(null);             // 撤源，回落内置模拟
 - 音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生
 - snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理
 - setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效
-- 音频注入只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条通道
+- 音频注入对 scene 与 web 壁纸都生效：网页侧经 iframe shim 的音频泵收到同一份数据；两个泵都逐帧选源，所以 mount() 之后再 setAudio 同样有效
 
 ## 事件与诊断
 
@@ -320,15 +320,22 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.0。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.1。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.1` | 2026-09-08 | 修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流） |
 | `1.3.0` | 2026-09-08 | mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver |
 | `1.2.0` | 2026-09-08 | video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈） |
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.1 修一个下游实测发现的缺陷：**麦克风都接上了，网页壁纸的音谱还在放默认合成流**。
+
+- 根因一：web 装配路径压根不读 rt.audioBridge（1.3.0 给媒体源接了这一环，音频这行漏了），注入的频谱到不了 iframe
+- 根因二：音频与媒体两个泵都在**装配时**捕获 driver，而 setAudio()/setMedia() 通常在 mount() 之后才调用（宿主的麦克风 / SSE 通道那时才就绪）——定死 driver 等于后装的源永远不生效。两个泵均改为逐帧选源，撤源后也能落回默认
+- 注入的频谱**不再套 gamma 对比扩展**：那道处理是给内置模拟源的未钳位频段用的，对宿主给的 0..1 真实频谱再乘一遍会把音条整体顶到满格
 
 1.3.0 是 1.2.0 的直接延续，继续按下游宿主的反馈补齐（四项）：
 
@@ -345,7 +352,7 @@ b.pause(); // 不影响 a
 - 媒体路径改为支持调用方传入的 canvas，并按 CSS 尺寸而非窗口尺寸分配缓冲区（此前嵌入式画布会拿到整窗口大小的 backing store，且画布根本不会被插入 DOM）
 - MountOptions.audio 真正接线（此前是声明了却零引用的死字段），并新增 SceneInstance.setAudio() 供挂载后切换——宿主的频谱通道常在 mount() 之后才就绪
 - 新增 SceneInstance.pushPointer() / pointerLeave()，与整页渲染器的 __wp 同名同签名，下游从整页迁到库时代码不用改
-- 已知边界（写明而不假装支持）：音频注入只对 scene 生效，网页壁纸走 iframe shim 的另一条通道；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 仍未接线，类型注释已标注
+- 已知边界（当时状态）：音频注入只对 scene 生效——网页壁纸走 iframe shim 的另一条通道，1.3.1 已补上；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 当时未接线（media 已在 1.3.0 接线）
 
 1.1.0 的内容（在 1.0.0 之后合入）：
 

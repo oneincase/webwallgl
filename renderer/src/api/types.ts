@@ -91,7 +91,8 @@ export type PointerSource = {
  * 会补零，多于 64 会截断。32/16 段降采样与 level/silent 由库自行派生，
  * 消费方（shader uniform、粒子、文字脚本）不区分数据来源。
  *
- * 只对 **scene** 壁纸生效：网页壁纸的音频走 iframe shim 的另一条泵。
+ * **scene 与 web 壁纸都生效**：网页壁纸经 iframe shim 的音频泵收到同一份数据
+ * （泵逐帧选源，所以 mount() 之后再 setAudio 也能生效）。
  */
 export type AudioSource = {
   /** 左右声道各 64 段频谱，值域 0..1 */
@@ -297,7 +298,7 @@ export type SceneInstance = {
    * （SSE / 原生桥 / WebAudio）常常在 mount() 之后才就绪。
    * **换场景不清空**：装一次对之后所有场景生效。
    *
-   * 只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条泵。
+   * scene 与 web 壁纸都生效（网页侧经 iframe shim 的音频泵拿到同一份数据）。
    */
   setAudio(src: AudioSource | null): void;
 

@@ -1389,6 +1389,92 @@ function runShim(extras) {
     "非法尺寸/比例必须回退 null（不抛异常）");
 }
 
+// ---------- 3f. 宿主注入的频谱 / 媒体源必须能到达网页壁纸 ----------
+//
+// 下游实测症状：「麦克风都接上了，网页壁纸的音谱还在放默认合成流」。
+// 根因是 web 装配路径压根不读 rt.audioBridge —— 1.3.0 给媒体接了这一环，
+// 音频这行漏了（web.ts 里 audioBridge 出现 0 次）。
+//
+// 第二个坑同样致命：泵在**装配时**捕获 driver，而 setAudio()/setMedia() 通常
+// 在 mount() 之后才调用（宿主的麦克风 / SSE 通道那时才就绪），定死 driver
+// 等于后装的源永远不生效。所以选源必须逐帧做。
+{
+  const webTs = fs.readFileSync(path.join(ROOT, "renderer/src/web.ts"), "utf8");
+
+  // --- 接线面 ---
+  check(/rt\.audioBridge/.test(webTs),
+    "web.ts 必须读 rt.audioBridge（否则宿主注入的频谱到不了网页壁纸，音谱永远是默认模拟流）");
+  check(/function bridgeAudioDriver/.test(webTs),
+    "web.ts 应有 bridgeAudioDriver 把注入源包成 web 侧 driver");
+
+  // --- 逐帧选源：两个泵都不能在装配期定死 driver ---
+  const bodyOf = (name) => {
+    const at = webTs.indexOf(`function ${name}`);
+    if (at < 0) return "";
+    const end = webTs.indexOf("\n}", at);
+    return end > at ? webTs.slice(at, end + 2) : "";
+  };
+  const audioPump = bodyOf("startAudioPump");
+  const mediaPump = bodyOf("startMediaPump");
+  check(audioPump.length > 0 && mediaPump.length > 0, "找不到 startAudioPump / startMediaPump 函数体");
+  check(/rt\.audioBridge \? bridged : driver/.test(audioPump) || /const pick[\s\S]{0,120}rt\.audioBridge/.test(audioPump),
+    "startAudioPump 必须逐帧选源（装配期定死 driver 会让 mount() 之后的 setAudio 永不生效）");
+  check(/rt\.mediaSource[\s\S]{0,60}\?\?\s*driver/.test(mediaPump) || /const pick[\s\S]{0,120}rt\.mediaSource/.test(mediaPump),
+    "startMediaPump 必须逐帧选源（同理，setMedia 常在 mount() 之后才调用）");
+  // 选了 cur 就要全程用 cur：曾经改了 update 却把 snapshot 落在旧 driver 上
+  check(!/pushMediaDiff\(rt, lastMedia, driver\.snapshot\)/.test(mediaPump),
+    "startMediaPump 取快照必须用逐帧选出的 driver，不能混用装配期的那个");
+
+  // --- 行为面：抽真函数执行 ---
+  const at = webTs.indexOf("function bridgeAudioDriver");
+  const end = webTs.indexOf("\n}", at) + 2;
+  const bridgeSrc = at >= 0 && end > at ? webTs.slice(at, end) : "";
+  // 注入源已是 0..1 真实频谱，**不得再套 shapeWebAudioBand 的 gamma 扩展**
+  // ——那是给内置模拟源的未钳位频段用的（把平缓合成波形拉出对比度），
+  // 对真实频谱再乘一遍会把音条整体顶到满格。源码面先挡一道，避免下面
+  // 隔离执行时因引用不到该函数而抛成难读的 ReferenceError。
+  check(bridgeSrc.length > 0, "找不到 bridgeAudioDriver 函数体");
+  check(!/shapeWebAudioBand/.test(bridgeSrc),
+    "bridgeAudioDriver 不得对注入频谱套 shapeWebAudioBand（宿主给的已是 0..1 真实频谱，再套 gamma 会顶满格）");
+  if (bridgeSrc && !/shapeWebAudioBand/.test(bridgeSrc)) {
+    const esbuild = await import("esbuild");
+    const out = await esbuild.transform(
+      "type Runtime=any; type WebAudioDriver=any;\n" + bridgeSrc + "\nexport {bridgeAudioDriver};",
+      { loader: "ts", format: "esm", target: "es2022" },
+    );
+    const tmp = path.join(ROOT, "scripts", `.tmp-web-bridge-${process.pid}.mjs`);
+    fs.writeFileSync(tmp, out.code);
+    try {
+      const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+      const rt = { audioBridge: null };
+      const d = mod.bridgeAudioDriver(rt);
+      const L = new Float32Array(64), R = new Float32Array(64);
+      for (let i = 0; i < 8; i++) { L[i] = 0.9; R[i] = 0.7; }
+      rt.audioBridge = () => ({ left: L, right: R });
+      const s1 = d.snapshot();
+      // **不得再套 shapeWebAudioBand 的 gamma 扩展**：那是给内置模拟源的未钳位
+      // 频段用的，宿主给的已是 0..1 真实频谱，再乘一遍会把音条整体顶到满格
+      check(Math.abs(s1.left[0] - 0.9) < 1e-6 && Math.abs(s1.right[0] - 0.7) < 1e-6,
+        `注入频谱必须原样透传（不套 gamma 扩展），实得 left[0]=${s1.left[0]} right[0]=${s1.right[0]}`);
+      check(s1.left[40] === 0, "未提供能量的高频段应为 0");
+      // 返回 null 时给全零而不是回落模拟源：宿主明确装了源就说明它要自己供数，
+      // 冒出一段合成波形只会让人误以为「注入生效了」
+      rt.audioBridge = () => null;
+      const s2 = d.snapshot();
+      check([...s2.left].every((v) => v === 0) && [...s2.right].every((v) => v === 0),
+        "bridge 返回 null 时应给全零，不得回落合成波形");
+      rt.audioBridge = () => ({ left: new Float32Array(64).fill(3), right: new Float32Array(64).fill(-1) });
+      const s3 = d.snapshot();
+      check(s3.left[0] === 1 && s3.right[0] === 0, `越界值必须钳到 0..1，实得 ${s3.left[0]}/${s3.right[0]}`);
+      rt.audioBridge = () => ({ left: new Float32Array(8).fill(1), right: new Float32Array(8).fill(1) });
+      const s4 = d.snapshot();
+      check(s4.left[0] === 1 && s4.left[10] === 0, "段数不足 64 时应补零，不得残留上一帧数据");
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* 忽略 */ }
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`verify-web: ${errors.length} 项失败`);
   for (const e of errors) console.error("  ✗", e);

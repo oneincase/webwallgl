@@ -164,6 +164,39 @@ function defaultAudioDriver(): WebAudioDriver {
   };
 }
 
+/**
+ * 宿主注入的频谱源（rt.audioBridge）包成 web 侧的 driver。
+ *
+ * **不套 shapeWebAudioBand 的 gamma 扩展**：那道处理是给内置模拟源的未钳位
+ * 频段用的（把平缓的合成波形拉出对比度），而宿主给的已经是 0..1 归一化的真实
+ * 频谱，再乘一遍 gamma+增益会把音条整体顶到满格。
+ *
+ * bridge 返回 null（未采集/无权限/本帧无数据）时返回全零而不是回落模拟源：
+ * 宿主明确装了源就说明它要自己供数，此时冒出一段合成波形只会让人以为"注入
+ * 生效了"。真要回落模拟源，调用方 setAudio(null) 撤源即可。
+ */
+function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
+  const left = new Float32Array(64);
+  const right = new Float32Array(64);
+  return {
+    snapshot() {
+      const src = rt.audioBridge?.();
+      const sl = src?.left;
+      const sr = src?.right;
+      const n = sl && sr ? Math.min(64, sl.length, sr.length) : 0;
+      for (let i = 0; i < n; i++) {
+        left[i] = Math.max(0, Math.min(1, Number(sl![i]) || 0));
+        right[i] = Math.max(0, Math.min(1, Number(sr![i]) || 0));
+      }
+      for (let i = n; i < 64; i++) {
+        left[i] = 0;
+        right[i] = 0;
+      }
+      return { left, right };
+    },
+  };
+}
+
 function resolveContainer(rt: Runtime, cfg: WallpaperConfig): HTMLElement | null {
   // 全屏适配层：画在 wrap 里
   if (rt.wrap) return rt.wrap;
@@ -641,6 +674,12 @@ function startAudioPump(
   frameClock?: { last: number },
 ) {
   if (!driver) return;
+  // [1.3.1] 注入源的选择必须**逐帧**做，不能在装配时定死：setAudio() 常在
+  // mount() 之后才调用（宿主的麦克风/SSE 通道那时才就绪），装配期捕获一个
+  // driver 就意味着后装的源永远不生效——症状正是「麦克风接上了，网页壁纸
+  // 的音谱还在放合成波形」。撤源（setAudio(null)）后同样要能落回原 driver。
+  const bridged = bridgeAudioDriver(rt);
+  const pick = (): WebAudioDriver => (rt.audioBridge ? bridged : driver);
   let raf = 0;
   let lastPush = 0;
   const tick = (now: number) => {
@@ -652,8 +691,9 @@ function startAudioPump(
     if (now - lastPush < interval * 0.85) return;
     lastPush = now;
     try {
-      driver.tick?.(now);
-      const snap = driver.snapshot();
+      const cur = pick();
+      cur.tick?.(now);
+      const snap = cur.snapshot();
       const arr = packWebAudioArrayInto(pumpBuffer, snap.left, snap.right);
       weShimCall(rt, (w) => w.__wePushAudio?.(arr));
       // 作者用 setTimeout 主循环时 shim 收不到 rAF we-frame（1748506393 FPS 为 `-`）
@@ -677,6 +717,9 @@ function startAudioPump(
 /** 模拟 / 外部 Now Playing → shim Media*Listener（仅变化时推送） */
 function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
   if (!driver) return;
+  // 与音频泵同理：setMedia() 常在 mount() 之后才调用，装配期定死 driver
+  // 会让后装的 Now Playing 源永远推不进 iframe。逐帧选当前生效的那个。
+  const pick = (): WebMediaDriver => (rt.mediaSource as WebMediaDriver | null) ?? driver;
   let raf = 0;
   let lastMedia: Record<string, unknown> | null = null;
   let lastTick = 0;
@@ -686,9 +729,10 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
     if (now - lastTick < 200) return; // 媒体进度按整秒 diff，200ms 足够
     lastTick = now;
     try {
+      const cur = pick();
       // update 在宿主注入源上是可选的（外部事件驱动的实现不需要按帧推进）
-      driver.update?.(now / 1000);
-      lastMedia = pushMediaDiff(rt, lastMedia, driver.snapshot);
+      cur.update?.(now / 1000);
+      lastMedia = pushMediaDiff(rt, lastMedia, cur.snapshot);
     } catch {
       /* 忽略单帧失败 */
     }
@@ -820,14 +864,14 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
     _webMedia?: WebMediaDriver | null;
   };
   const cfgExt = cfg as WebCfgExt;
+  // 注入源（rt.audioBridge）的优先判定在 startAudioPump 里**逐帧**做，
+  // 这里只决定「没有注入时用谁」：_webAudio=null 表示显式禁用音频。
   const audioDriver: WebAudioDriver | null =
     cfgExt._webAudio === null ? null : (cfgExt._webAudio ?? defaultAudioDriver());
+  // 注入源（rt.mediaSource）的优先判定同样在 startMediaPump 里逐帧做，
+  // 这里只决定「没有注入时用谁」：_webMedia=null 表示显式禁用系统媒体。
   const mediaDriver: WebMediaDriver | null =
-    cfgExt._webMedia === null
-      ? null
-      : // [1.3.0] 宿主经公共 API 注入的媒体源优先，与 scene 装配路径读同一个引用：
-        // 装一次，scene 与 web 两类壁纸看到同一份 Now Playing
-        (cfgExt._webMedia ?? (rt.mediaSource as WebMediaDriver | null) ?? defaultMediaDriver());
+    cfgExt._webMedia === null ? null : (cfgExt._webMedia ?? defaultMediaDriver());
 
   const finishBare = (why: string) => {
     reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`);

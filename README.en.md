@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -141,7 +141,7 @@ input.addEventListener("change", () => {
 | `setRenderDpr(dpr)` | Changing DPR rebuilds the canvas; remounts internally (pkg cache hit, no re-download) |
 | `setProperties(props)` | Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch |
 | `getProperties()` | The current flattened property value map |
-| `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only |
+| `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Works for scene and web |
 | `setMedia(src)` | Swap the system media source (Now Playing); shared by scene and web, survives scene changes |
 | `media` | Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control |
 | `pushPointer(u, v, buttons?)` | Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web |
@@ -272,7 +272,7 @@ wp.setAudio(null);             // remove the source, fall back to the built-in s
 - Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library
 - Returning null (or throwing) from snapshot() means "no data this frame" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up
 - setAudio survives scene changes: install it once and it applies to every scene loaded afterwards
-- Audio injection applies to scene wallpapers only; web wallpapers get audio through a separate iframe-shim channel
+- Audio injection works for both scene and web wallpapers: the web side receives the same data through the iframe shim audio pump, and both pumps pick their source per frame so calling setAudio after mount() works too
 
 ## Events & diagnostics
 
@@ -321,15 +321,22 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.0. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.1. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.1` | 2026-09-08 | Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream) |
 | `1.3.0` | 2026-09-08 | mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web |
 | `1.2.0` | 2026-09-08 | Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports) |
 | `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
+
+1.3.1 fixes a defect found downstream in real use: **the microphone was connected, yet web wallpapers kept showing the default synthetic stream**.
+
+- Root cause 1: the web assembly path never read rt.audioBridge (1.3.0 wired this up for the media source but missed the audio line), so injected spectra never reached the iframe
+- Root cause 2: both the audio and media pumps captured their driver at assembly time, while setAudio()/setMedia() are typically called after mount() (that is when the host's microphone or SSE channel becomes ready) — a fixed driver means a later source never takes effect. Both pumps now pick their source per frame and fall back cleanly when the source is removed
+- Injected spectra are no longer put through the gamma contrast expansion: that step exists for the built-in simulation's unclamped bands, and applying it to a host's already-normalized 0..1 spectrum would peg every bar at full scale
 
 1.3.0 continues directly from 1.2.0, closing four more items reported by the downstream host:
 
@@ -346,7 +353,7 @@ Current version: 1.3.0. This section records only user-visible changes (API, beh
 - The media path now honors a caller-supplied canvas and sizes its backing store from CSS dimensions rather than the window (previously an embedded canvas got a full-window buffer and was never inserted into the DOM at all)
 - MountOptions.audio is actually wired now (it was a declared-but-unreferenced dead field), plus a new SceneInstance.setAudio() for swapping after mount — host spectrum channels usually become ready only after mount()
 - New SceneInstance.pushPointer() / pointerLeave(), matching the full-page renderer's __wp in both name and signature so downstream code needs no changes when migrating to the library
-- Known boundaries, stated rather than papered over: audio injection is scene-only (web wallpapers use a separate iframe-shim channel); media wallpapers have no pointer concept; MountOptions' pointer / media / features remain unwired and are now marked as such in the type comments
+- Known boundaries at the time: audio injection was scene-only — web wallpapers use a separate iframe-shim channel, wired up in 1.3.1; media wallpapers have no pointer concept; MountOptions' pointer / media / features were unwired (media landed in 1.3.0)
 
 What went into 1.1.0 (merged after 1.0.0):
 
