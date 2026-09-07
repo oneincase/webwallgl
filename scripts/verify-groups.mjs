@@ -1335,7 +1335,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   let refSelf = 0;
   let srcWithModel = 0;
   let srcCompose = 0;
+  let srcComposeHidden = 0;
   const missDetail = [];
+  const hiddenDetail = [];
 
   let ids = [];
   try { ids = fs.readdirSync(LIB); } catch { ids = []; }
@@ -1371,8 +1373,19 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       const src = scene.objects.find((x) => x.id === to);
       if (!src) { refMissing++; missDetail.push(`${id}#${to}`); continue; }
       const img = typeof src.image === "string" ? src.image : "";
-      if (img.indexOf("models/util/composelayer") === 0) srcCompose++;
-      else if (img) srcWithModel++;
+      if (img.indexOf("models/util/composelayer") === 0) {
+        srcCompose++;
+        // 空 composelayer 源里**自己也是 visible:false** 的那一批：主循环的
+        // visible 闸门若不放行，这些引用永远取不到图（见下方接线断言）。
+        const v = src.visible;
+        const vis = v === undefined || v === true ||
+          (v !== null && typeof v === "object" && v.value === true);
+        const emptyEff = !(src.effects || []).some((e) => e.visible !== false);
+        if (!vis && emptyEff) {
+          srcComposeHidden++;
+          hiddenDetail.push(`${id}#${to}`);
+        }
+      } else if (img) srcWithModel++;
     }
   }
 
@@ -1401,6 +1414,19 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       "空 composelayer 源必须在主循环 z 序回读（captureEmptyComposeAtZOrder）");
     check(/if\s*\(\s*!hasVisibleEffects\s*\)[\s\S]{0,220}captureEmptyComposeAtZOrder/.test(rsrc),
       "主循环跳过无效果空容器时必须调用 captureEmptyComposeAtZOrder");
+    // **visible:false 的源也必须走得到回读钩子。** 这些层正是靠 visible:false 才不
+    // 出现在画面上的纯素材（renderCompositeSources 自己的注释：「源层几乎都是
+    // visible:false」）。主循环第一行的 `if (!layer.visible) continue` 抢在
+    // isContainer 分支之前把它们踢掉，`_rt_imageLayerComposite_<id>_a` 就永远进不了
+    // compositeFBOs，resolveTextureName 回退成引用方自己的 inputFBO，clipping_mask
+    //   albedo.rgb = ApplyBlending(mode, albedo.rgb, clip.rgb, mask * albedo.a * u_alpha)
+    // 白混白 = 一块矩形白板（2938612768 音条左侧白块）。
+    // destroyed 墓碑不能跟着一起放行：那是层已被 destroyLayer 拆掉。
+    check(/if\s*\(\s*layer\.destroyed\s*\)\s*continue/.test(rsrc),
+      "主循环必须单独保留 destroyed 墓碑的 continue（与 visible 合并会把已拆层一起放行）");
+    check(/if\s*\(\s*!layer\.visible\s*\)\s*\{[\s\S]{0,400}pendingEmptyCompose\.has\(layer\.id\)[\s\S]{0,200}captureEmptyComposeAtZOrder/.test(rsrc),
+      "主循环 visible 闸门必须放行「待回读的空 composelayer 源」" +
+      "（否则 visible:false 的遮罩源取不到，clipping_mask 白混白出白块）");
     const capStart = rsrc.indexOf("function captureEmptyComposeAtZOrder");
     let capCode = "";
     if (capStart >= 0) {
@@ -1432,6 +1458,14 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     if (srcCompose > 0) {
       console.log(
         `   空 composelayer 源 ${srcCompose} 个：预渲染跳过，主循环 z 序 drawBackdropToFBO 回读`,
+      );
+      // 这一批（源自身 visible:false）就是上面那条 visible 闸门断言保护的对象。
+      // 它若归零，说明库或扫描变了，接线断言就失去了真实覆盖 —— 要人来看一眼。
+      check(srcComposeHidden > 0,
+        "库里应存在 visible:false 的空 composelayer 合成源（归零则 visible 闸门放行的接线断言失去覆盖）");
+      console.log(
+        `   其中源自身 visible:false 的 ${srcComposeHidden} 个（必须靠 visible 闸门放行才取得到）：` +
+        `${hiddenDetail.slice(0, 8).join(", ")}`,
       );
     }
     const wp290 = wallpapers.find((w) => w.id === "2902406982");

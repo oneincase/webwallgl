@@ -1659,7 +1659,25 @@ export function createRenderer(canvas, opts = {}) {
       // destroyed：thisScene.destroyLayer 的墓碑。visible 字段脚本的
       // `return value` 可能在拆层的同一帧把 visible 写回 true
       // （3786330502 开场淡出），墓碑必须比写回更硬。
-      if (!layer.visible || layer.destroyed) continue
+      //
+      // [we-scene patch] 但**被引用的空 composelayer 源必须先回读再跳过**。
+      // 这些层就是靠 visible:false 才不出现在画面上的纯素材（renderCompositeSources
+      // 的注释也写了「源层几乎都是 visible:false」），可 z 序回读的钩子
+      // captureEmptyComposeAtZOrder 挂在下面 isContainer 分支里，被这一行提前
+      // continue 掉，于是 `_rt_imageLayerComposite_<id>_a` 永远进不了 compositeFBOs，
+      // resolveTextureName 回退成 inputFBO（引用方自己的链输入）。clipping_mask
+      //   albedo.rgb = ApplyBlending(mode, albedo.rgb, clip.rgb, mask * albedo.a * u_alpha)
+      // 于是拿白底胶囊自己当 clip，白混白 = 一块矩形白板盖在卡片外
+      // （2938612768 音条左侧白块）。全库 23 个空 composelayer 源里有 6 个是这种
+      // visible:false 形态（2938612768 / 2974757317 各 3 个），另 17 个恰好
+      // visible:true 才一直是对的。destroyed 墓碑不放行：那是层已经不存在了。
+      if (layer.destroyed) continue
+      if (!layer.visible) {
+        if (pendingEmptyCompose.has(layer.id)) {
+          captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height)
+        }
+        continue
+      }
       // [we-scene patch] 全屏后期：无可见效果的分隔层仍跳过（2134765860 一堆空
       // fullscreenlayer）。有 waterripple/pulse/godrays 的必须画，回读走
       // usePassthrough → drawBackdropToFBO。再整层 continue 就是静图（973101892）。
