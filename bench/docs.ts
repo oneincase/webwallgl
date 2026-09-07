@@ -369,6 +369,57 @@ export const DOC: DocSection[] = [
     ],
   },
   {
+    id: "changelog",
+    title: { zh: "版本更新说明", en: "Changelog" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: `当前版本 ${version}。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。`,
+          en: `Current version: ${version}. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.`,
+        },
+      },
+      {
+        k: "table",
+        codeCols: [0],
+        head: [
+          { zh: "版本", en: "Version" },
+          { zh: "日期", en: "Date" },
+          { zh: "说明", en: "Notes" },
+        ],
+        rows: [
+          [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
+          [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.0.0 之后（未发版，已在仓库主线）—— 下个版本会包含这些：",
+          en: "After 1.0.0 (unreleased, already on the repository's main branch) — these will ship in the next version:",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "新增外部指针注入通道 __wp.pushPointer / pointerLeave：桌面壁纸窗口收不到鼠标时（如 macOS 下 Finder 桌面窗口吃掉事件），由宿主轮询系统鼠标后推进来。场景与网页两类壁纸共用同一套协议，调用方不必判断类型", en: "New external pointer injection channel (__wp.pushPointer / pointerLeave): when the wallpaper window cannot receive the mouse (e.g. the Finder desktop window swallows events on macOS), the host polls the system cursor and pushes it in. Scene and web wallpapers share one protocol — callers need not branch on type" },
+          { zh: "网页壁纸接入同一条注入通道：shim 按命中元素合成 DOM 事件（over/out/enter/leave 链完整、click 靠按键边缘合成）。本机库 49 张网页壁纸里 mousemove 24 / click 29 / pointer* 16 张的交互从「完全无反应」变为可用。硬限制：CSS :hover 由浏览器 hit-test 驱动，合成事件点不亮", en: "Web wallpapers joined the same channel: the shim synthesizes DOM events against the hit element (full over/out/enter/leave chains, click derived from button edges). Of 49 local web wallpapers, interaction went from dead to working on 24 with mousemove, 29 with click and 16 with pointer events. Hard limit: CSS :hover is driven by browser hit-testing and cannot be lit by synthetic events" },
+          { zh: "效果 pass 编译失败清零（七批）：转译器修掉整浮混用、宏作用域、向量收窄、科学计数法等形态。全库效果 pass 编译通过率 1653/1873 (88.3%) → 1823/1873 (97.3%)，累计 +170。症状是「某个效果静默不出现」——编译失败只 warn 不报错，画面上表现为体积光/音谱/光晕整个缺失", en: "Effect-pass compile failures driven to near zero (seven rounds): the transpiler now handles int/float mixing, macro scoping, vector narrowing, scientific notation and more. Library-wide effect-pass compilation went from 1653/1873 (88.3%) to 1823/1873 (97.3%), +170 in total. The symptom was an effect silently missing — a failed compile only warns, so god rays / visualizers / glows simply vanished" },
+          { zh: "暂停语义补全：暂停必须同时冻结 rAF/定时器与 CSS 动画（合成器驱动的 CSS 动画不受 JS 冻结影响，1444432396 表现为「点了暂停画面照旧」）；恢复必须重挂 rAF 挂起项（rAF 自递归的壁纸暂停一次就永久断链，1278092907 表现为「恢复后永久定格」），且只还原我们代为暂停的部分", en: "Pause semantics completed: pausing must freeze rAF/timers and CSS animations together (compositor-driven CSS animations ignore JS freezing — 1444432396 kept animating after pause); resuming must re-arm held rAF callbacks (self-recursive rAF wallpapers break their chain permanently — 1278092907 froze forever after resume), restoring only what we paused" },
+          { zh: "还原度修复若干：关键帧动画改用真实时钟（此前按目标帧间隔累加，与骨骼两套时基必然发散，30 秒漂 5.5 秒，表现为头发与头不同步、头顶漏模）；对象脚本与关键帧动画的坐标空间改为 local 并每帧重算父子变换（此前把脚本返回的 local 值直接写进 world 槽，表现为元素无人操作就自行滑走、被边缘裁切）；clipping_mask 引用的隐藏遮罩层现在能正确回读身后画面（此前回退成引用方自身，表现为一块纯白板）", en: "Fidelity fixes: keyframe animations now run on the real clock (previously they accumulated the target frame interval, diverging from the bone clock by 5.5s over 30s — hair desynced from the head and the scalp showed through); object scripts and keyframe animations now work in local space with per-frame parent/child recomposition (previously local return values were written straight into world slots, so elements drifted away untouched and got clipped); hidden mask layers referenced by clipping_mask now correctly read back what is behind them (previously they fell back to the referencing layer itself, painting a solid white block)" },
+          { zh: "使用说明新增「挂载目标」与「用户属性」两节：网页壁纸必须传容器 div 而非 canvas，以及各类属性该传什么形态的值", en: "Two new documentation sections, \"Mount target\" and \"User properties\": web wallpapers require a container div rather than a canvas, and what value shape each property type expects" },
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "完整提交历史见 GitHub 仓库；每条修复在提交信息里都写明了症状、根因、影响面数字与验证方式。",
+          en: "The full commit history lives in the GitHub repository; every fix records its symptom, root cause, measured scope and verification method in the commit message.",
+        },
+      },
+    ],
+  },
+  {
     id: "compliance",
     title: { zh: "版权与合规", en: "Copyright & compliance" },
     blocks: [
