@@ -70,6 +70,31 @@ console.log("live fps:", wp.stats.fps);
 
 The canvas CSS size is the render size: the library aligns the backing store to clientWidth/clientHeight, and the aspect follows container resizes automatically — no manual resize handling.
 
+## Mount target: canvas or container div
+
+mount() takes any HTMLElement as its first argument, not just a canvas. Pass a canvas and it is used directly; pass a plain container (a div, say) and the library creates a full-bleed canvas inside it (tagged data-webwallgl, reused on remount; a position:static container is switched to relative).
+
+This is not a style choice — **web wallpapers require a container**. A web wallpaper does not use WebGL; the library appendChild()s a sandboxed iframe into the element you pass, and a canvas cannot have children, so passing one fails. If the same code path must handle both scene and web wallpapers (a general wallpaper player, say), always pass a div:
+
+```
+<!-- Works for both wallpaper types -->
+<div id="wp" style="position:relative;width:100%;height:400px"></div>
+
+// Scene wallpaper: the library builds a canvas inside the div
+// Web wallpaper:   the library mounts a sandboxed iframe inside the div
+const wp = await mount(document.querySelector("#wp"), {
+  source: httpSource("https://cdn.example.com/wallpapers/2517518192"),
+});
+
+// wp.canvas is always readable: the real canvas on the scene path,
+// the container you passed on the web path
+console.log(wp.canvas);
+```
+
+- You never branch on type yourself: mount() reads project.json first — type "web" takes the web path, everything else goes through scene assembly
+- The web entry URL resolves as Source.webEntry() → {httpSource base}/{project.file or index.html}; if neither yields a URL, mount throws
+- On the web path the WebGL-side options (fit / renderDpr / features) do not apply; pause/resume, setVolume and setProperties still work, relayed to author code through the shim
+
 ## Loading scenes: Source
 
 The library makes only two network requests (scene.pkg and optional project.json), so the resource abstraction is one interface with three built-in implementations:
@@ -122,6 +147,32 @@ input.addEventListener("change", () => {
 | `stats / info` | Measured FPS ({fps, running}, zeroes out instead of freezing) / scene info (logical size, layer count, has models/particles/text) |
 | `on(ev, fn)` | Subscribe to ready / error / diagnostic; returns an unsubscribe function |
 
+## User properties
+
+User properties are the settings a wallpaper author exposes in WE (colors, toggles, sliders, dropdowns), declared under general.properties in project.json. Keys are the author's property names (typically things like schemecolor or newproperty12); values must be scalars matching the property type:
+
+| Property type | What to pass | Example |
+| --- | --- | --- |
+| `color` | A "r g b" string: three 0..1 floats separated by spaces (not #RRGGBB, not 0..255) | `"0.5 0.2 0.8"` |
+| `bool` | A boolean | `true` |
+| `slider` | A number within the author's min/max | `100` |
+| `combo` | The option value; pass a number when options are integers (integer strings also work) | `1` |
+| `textinput / file / directory` | A string | `"https://…/clock.png"` |
+
+```
+// First see which properties this wallpaper has and their current values
+console.log(wp.getProperties());
+// → { schemecolor: "0 0 0", newproperty12: true, … }
+
+// Then set them by name (pass only what you change; the rest stays put)
+wp.setProperties({ schemecolor: "0.5 0.2 0.8", newproperty12: false });
+```
+
+- Property names differ per wallpaper; there is no cross-wallpaper naming convention — read getProperties() first instead of hardcoding guesses
+- Writing a name the current scene doesn't declare raises no error: the value still lands in the table (a later scene may use it) but changes nothing on screen — a typo shows up as "nothing happened", not as an exception
+- setProperties() patches in place — property table, effect constants and script sandboxes — with no re-fetch and no re-parse
+- Wallpapers without a project.json still run: the property table is empty and fields fall back to the scene.json snapshot values
+
 ## Events & diagnostics
 
 ```
@@ -154,6 +205,8 @@ b.pause(); // does not affect a
 - Parsed scene.pkg entries are cached by source.key (up to 2): pause/resume, property changes and setRenderDpr remounts never re-download
 - After release(), stats.running goes false and the FPS reading zeroes out — a stopped meter must not freeze on its last value
 - After destroy() the canvas is yours again; mount() a fresh instance any time
+- load() puts the instance back into the playing state (even if it was paused before); call pause() again after load() to stay paused
+- load() re-applies the properties given at mount time; values set later via setProperties() do not carry over — property names are per-scene anyway, so re-apply them after load() if you need them
 
 ## Troubleshooting
 

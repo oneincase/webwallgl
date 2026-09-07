@@ -70,6 +70,30 @@ console.log("实测帧率", wp.stats.fps);
 
 画布的 CSS 尺寸就是渲染尺寸：库把 backing store 对齐 clientWidth/clientHeight，容器改大小后画面宽高比自动跟随，不需要手动 resize。
 
+## 挂载目标：canvas 还是容器 div
+
+mount() 的第一个参数收任意 HTMLElement，不限于 canvas。传 canvas 就直接用它；传普通容器（div 等）则库在其内部自建一块铺满的 canvas（带 data-webwallgl 标记，重复挂载会复用同一块，容器若是 position:static 会被改成 relative）。
+
+选哪个不是风格问题——**网页类型壁纸必须传容器**。网页壁纸不走 WebGL，库会把 sandbox iframe 直接 appendChild 进你传的元素；canvas 不能有子元素，传 canvas 会挂不上。如果同一段代码要同时应付场景壁纸和网页壁纸（例如一个通用壁纸播放器），一律传 div 最稳妥：
+
+```
+<!-- 通用写法：两类壁纸都能挂 -->
+<div id="wp" style="position:relative;width:100%;height:400px"></div>
+
+// 场景壁纸：库在 div 内自建 canvas
+// 网页壁纸：库在 div 内挂 sandbox iframe
+const wp = await mount(document.querySelector("#wp"), {
+  source: httpSource("https://cdn.example.com/wallpapers/2517518192"),
+});
+
+// wp.canvas 始终可读：场景路径是那块真 canvas，网页路径是你传入的容器
+console.log(wp.canvas);
+```
+
+- 类型不用你判断：mount() 先取 project.json，type 为 "web" 走网页路径，其余一律走场景装配
+- 网页入口 URL 的解析顺序是 Source.webEntry() → {httpSource 基址}/{project.file 或 index.html}；两者都给不出就抛错
+- 网页路径下 fit / renderDpr / features 这些 WebGL 侧选项自然不适用；pause/resume、setVolume、setProperties 仍然有效（经 shim 转达给作者代码）
+
 ## 资源来源 Source
 
 库对网络只发两个请求（scene.pkg 与可选的 project.json），所以资源抽象只有一个接口、三个内置实现：
@@ -122,6 +146,32 @@ input.addEventListener("change", () => {
 | `stats / info` | 实测帧率（{fps, running}，停了会归零而不是冻住）/ 场景基本信息（逻辑分辨率、图层数、是否含模型/粒子/文字） |
 | `on(ev, fn)` | 订阅 ready / error / diagnostic，返回取消函数 |
 
+## 用户属性 properties
+
+用户属性就是 WE 里作者暴露给观众的那些设置项（颜色、开关、滑条、下拉），定义在 project.json 的 general.properties。键是属性名（作者自定的，常见形态是 schemecolor、newproperty12 这类），值必须按属性类型给对应的标量：
+
+| 属性类型 | 传什么 | 示例 |
+| --- | --- | --- |
+| `color` | 字符串 "r g b"，三个 0..1 浮点用空格分隔（不是 #RRGGBB，也不是 0..255） | `"0.5 0.2 0.8"` |
+| `bool` | 布尔 | `true` |
+| `slider` | 数字，落在作者定义的 min/max 内 | `100` |
+| `combo` | 选项值；选项为整数时给 number（整数字符串也认） | `1` |
+| `textinput / file / directory` | 字符串 | `"https://…/clock.png"` |
+
+```
+// 先看这张壁纸有哪些属性、当前值是什么
+console.log(wp.getProperties());
+// → { schemecolor: "0 0 0", newproperty12: true, … }
+
+// 再按名字改（只传要改的，其余保持不动）
+wp.setProperties({ schemecolor: "0.5 0.2 0.8", newproperty12: false });
+```
+
+- 属性名逐壁纸不同，没有跨壁纸通用的名字——先 getProperties() 读一遍再改，不要硬编码猜名字
+- 写一个当前场景没有的名字不会报错：值会照样进属性表（换场景后可能被用上），但对当前画面无任何影响——拼错名字的症状是「调了没反应」而不是异常
+- setProperties() 是就地热更新：改属性表、效果常量与脚本沙箱，不重新拉包也不重新解析
+- 没有 project.json 的壁纸也能跑：此时属性表为空，场景字段一律用 scene.json 里的快照值
+
 ## 事件与诊断
 
 ```
@@ -154,6 +204,8 @@ b.pause(); // 不影响 a
 - 解析后的 scene.pkg 按 source.key 缓存（最多 2 份）：暂停恢复、改属性、setRenderDpr 重挂都不重新下载
 - release() 后 stats.running 变 false、读数归零 —— 停住的读数不该冻在最后一个值上
 - destroy() 之后 canvas 归还给你，库不再碰它；可以再 mount() 一个新实例
+- load() 换场景会把实例恢复成播放态（即使换之前是暂停的），要保持暂停就在 load() 之后再 pause() 一次
+- load() 会重新套用挂载时传入的 properties，此前用 setProperties() 改的值不会延续到新场景——属性名本就是逐场景定义的，要沿用得自己在 load() 之后再设一次
 
 ## 故障排查
 

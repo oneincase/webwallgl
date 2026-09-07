@@ -126,6 +126,41 @@ export const DOC: DocSection[] = [
     ],
   },
   {
+    id: "mount-target",
+    title: { zh: "挂载目标：canvas 还是容器 div", en: "Mount target: canvas or container div" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "mount() 的第一个参数收任意 HTMLElement，不限于 canvas。传 canvas 就直接用它；传普通容器（div 等）则库在其内部自建一块铺满的 canvas（带 data-webwallgl 标记，重复挂载会复用同一块，容器若是 position:static 会被改成 relative）。",
+          en: "mount() takes any HTMLElement as its first argument, not just a canvas. Pass a canvas and it is used directly; pass a plain container (a div, say) and the library creates a full-bleed canvas inside it (tagged data-webwallgl, reused on remount; a position:static container is switched to relative).",
+        },
+      },
+      {
+        k: "p",
+        v: {
+          zh: "选哪个不是风格问题——**网页类型壁纸必须传容器**。网页壁纸不走 WebGL，库会把 sandbox iframe 直接 appendChild 进你传的元素；canvas 不能有子元素，传 canvas 会挂不上。如果同一段代码要同时应付场景壁纸和网页壁纸（例如一个通用壁纸播放器），一律传 div 最稳妥：",
+          en: "This is not a style choice — **web wallpapers require a container**. A web wallpaper does not use WebGL; the library appendChild()s a sandboxed iframe into the element you pass, and a canvas cannot have children, so passing one fails. If the same code path must handle both scene and web wallpapers (a general wallpaper player, say), always pass a div:",
+        },
+      },
+      {
+        k: "code",
+        v: {
+          zh: "<!-- 通用写法：两类壁纸都能挂 -->\n<div id=\"wp\" style=\"position:relative;width:100%;height:400px\"></div>\n\n// 场景壁纸：库在 div 内自建 canvas\n// 网页壁纸：库在 div 内挂 sandbox iframe\nconst wp = await mount(document.querySelector(\"#wp\"), {\n  source: httpSource(\"https://cdn.example.com/wallpapers/2517518192\"),\n});\n\n// wp.canvas 始终可读：场景路径是那块真 canvas，网页路径是你传入的容器\nconsole.log(wp.canvas);",
+          en: "<!-- Works for both wallpaper types -->\n<div id=\"wp\" style=\"position:relative;width:100%;height:400px\"></div>\n\n// Scene wallpaper: the library builds a canvas inside the div\n// Web wallpaper:   the library mounts a sandboxed iframe inside the div\nconst wp = await mount(document.querySelector(\"#wp\"), {\n  source: httpSource(\"https://cdn.example.com/wallpapers/2517518192\"),\n});\n\n// wp.canvas is always readable: the real canvas on the scene path,\n// the container you passed on the web path\nconsole.log(wp.canvas);",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "类型不用你判断：mount() 先取 project.json，type 为 \"web\" 走网页路径，其余一律走场景装配", en: "You never branch on type yourself: mount() reads project.json first — type \"web\" takes the web path, everything else goes through scene assembly" },
+          { zh: "网页入口 URL 的解析顺序是 Source.webEntry() → {httpSource 基址}/{project.file 或 index.html}；两者都给不出就抛错", en: "The web entry URL resolves as Source.webEntry() → {httpSource base}/{project.file or index.html}; if neither yields a URL, mount throws" },
+          { zh: "网页路径下 fit / renderDpr / features 这些 WebGL 侧选项自然不适用；pause/resume、setVolume、setProperties 仍然有效（经 shim 转达给作者代码）", en: "On the web path the WebGL-side options (fit / renderDpr / features) do not apply; pause/resume, setVolume and setProperties still work, relayed to author code through the shim" },
+        ],
+      },
+    ],
+  },
+  {
     id: "source",
     title: { zh: "资源来源 Source", en: "Loading scenes: Source" },
     blocks: [
@@ -214,6 +249,51 @@ export const DOC: DocSection[] = [
     ],
   },
   {
+    id: "properties",
+    title: { zh: "用户属性 properties", en: "User properties" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "用户属性就是 WE 里作者暴露给观众的那些设置项（颜色、开关、滑条、下拉），定义在 project.json 的 general.properties。键是属性名（作者自定的，常见形态是 schemecolor、newproperty12 这类），值必须按属性类型给对应的标量：",
+          en: "User properties are the settings a wallpaper author exposes in WE (colors, toggles, sliders, dropdowns), declared under general.properties in project.json. Keys are the author's property names (typically things like schemecolor or newproperty12); values must be scalars matching the property type:",
+        },
+      },
+      {
+        k: "table",
+        codeCols: [0, 2],
+        head: [
+          { zh: "属性类型", en: "Property type" },
+          { zh: "传什么", en: "What to pass" },
+          { zh: "示例", en: "Example" },
+        ],
+        rows: [
+          [{ zh: "color", en: "color" }, { zh: "字符串 \"r g b\"，三个 0..1 浮点用空格分隔（不是 #RRGGBB，也不是 0..255）", en: "A \"r g b\" string: three 0..1 floats separated by spaces (not #RRGGBB, not 0..255)" }, { zh: "\"0.5 0.2 0.8\"", en: "\"0.5 0.2 0.8\"" }],
+          [{ zh: "bool", en: "bool" }, { zh: "布尔", en: "A boolean" }, { zh: "true", en: "true" }],
+          [{ zh: "slider", en: "slider" }, { zh: "数字，落在作者定义的 min/max 内", en: "A number within the author's min/max" }, { zh: "100", en: "100" }],
+          [{ zh: "combo", en: "combo" }, { zh: "选项值；选项为整数时给 number（整数字符串也认）", en: "The option value; pass a number when options are integers (integer strings also work)" }, { zh: "1", en: "1" }],
+          [{ zh: "textinput / file / directory", en: "textinput / file / directory" }, { zh: "字符串", en: "A string" }, { zh: "\"https://…/clock.png\"", en: "\"https://…/clock.png\"" }],
+        ],
+      },
+      {
+        k: "code",
+        v: {
+          zh: "// 先看这张壁纸有哪些属性、当前值是什么\nconsole.log(wp.getProperties());\n// → { schemecolor: \"0 0 0\", newproperty12: true, … }\n\n// 再按名字改（只传要改的，其余保持不动）\nwp.setProperties({ schemecolor: \"0.5 0.2 0.8\", newproperty12: false });",
+          en: "// First see which properties this wallpaper has and their current values\nconsole.log(wp.getProperties());\n// → { schemecolor: \"0 0 0\", newproperty12: true, … }\n\n// Then set them by name (pass only what you change; the rest stays put)\nwp.setProperties({ schemecolor: \"0.5 0.2 0.8\", newproperty12: false });",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "属性名逐壁纸不同，没有跨壁纸通用的名字——先 getProperties() 读一遍再改，不要硬编码猜名字", en: "Property names differ per wallpaper; there is no cross-wallpaper naming convention — read getProperties() first instead of hardcoding guesses" },
+          { zh: "写一个当前场景没有的名字不会报错：值会照样进属性表（换场景后可能被用上），但对当前画面无任何影响——拼错名字的症状是「调了没反应」而不是异常", en: "Writing a name the current scene doesn't declare raises no error: the value still lands in the table (a later scene may use it) but changes nothing on screen — a typo shows up as \"nothing happened\", not as an exception" },
+          { zh: "setProperties() 是就地热更新：改属性表、效果常量与脚本沙箱，不重新拉包也不重新解析", en: "setProperties() patches in place — property table, effect constants and script sandboxes — with no re-fetch and no re-parse" },
+          { zh: "没有 project.json 的壁纸也能跑：此时属性表为空，场景字段一律用 scene.json 里的快照值", en: "Wallpapers without a project.json still run: the property table is empty and fields fall back to the scene.json snapshot values" },
+        ],
+      },
+    ],
+  },
+  {
     id: "events",
     title: { zh: "事件与诊断", en: "Events & diagnostics" },
     blocks: [
@@ -264,6 +344,8 @@ export const DOC: DocSection[] = [
           { zh: "解析后的 scene.pkg 按 source.key 缓存（最多 2 份）：暂停恢复、改属性、setRenderDpr 重挂都不重新下载", en: "Parsed scene.pkg entries are cached by source.key (up to 2): pause/resume, property changes and setRenderDpr remounts never re-download" },
           { zh: "release() 后 stats.running 变 false、读数归零 —— 停住的读数不该冻在最后一个值上", en: "After release(), stats.running goes false and the FPS reading zeroes out — a stopped meter must not freeze on its last value" },
           { zh: "destroy() 之后 canvas 归还给你，库不再碰它；可以再 mount() 一个新实例", en: "After destroy() the canvas is yours again; mount() a fresh instance any time" },
+          { zh: "load() 换场景会把实例恢复成播放态（即使换之前是暂停的），要保持暂停就在 load() 之后再 pause() 一次", en: "load() puts the instance back into the playing state (even if it was paused before); call pause() again after load() to stay paused" },
+          { zh: "load() 会重新套用挂载时传入的 properties，此前用 setProperties() 改的值不会延续到新场景——属性名本就是逐场景定义的，要沿用得自己在 load() 之后再设一次", en: "load() re-applies the properties given at mount time; values set later via setProperties() do not carry over — property names are per-scene anyway, so re-apply them after load() if you need them" },
         ],
       },
     ],
