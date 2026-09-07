@@ -73,6 +73,16 @@ export type Runtime = {
   };
   /** 当前场景的扁平化用户属性值表（mountScene 装配后写入；getProperties 用） */
   liveUserProps?: Record<string, unknown>;
+  /**
+   * 宿主注入的音频频谱源（`__wp.setAudioBridge` 设置）。
+   *
+   * 拉模式而非推模式：渲染循环每帧调一次，取当前 64 段左右声道频谱（值域 0..1）。
+   * 宿主每帧推 128 个浮点要走字符串拼接与 JS 解析，安卓 WebView 上 60fps 下开销
+   * 可观；让渲染器主动拉，宿主就能用同步原生桥直接返回。
+   *
+   * 返回 null 表示暂时无数据，此时回落到内置模拟源。
+   */
+  audioBridge?: (() => { left: ArrayLike<number>; right: ArrayLike<number> } | null) | null;
   /** 场景基本信息（onSceneInfo 触发时写入；具体结构见 api/types.ts 的 SceneInfo） */
   info?: unknown;
 

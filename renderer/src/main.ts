@@ -180,6 +180,27 @@ declare global {
       pointerLeave(): void;
       /** 纯前端预览：本地 scene.pkg（File）直进 fileSource，无需任何后端；project.json 可选 */
       loadSceneFile(file: File, project?: File): void;
+      /**
+       * 注册宿主音频频谱源（拉模式）。渲染循环每帧调一次 fn，取 64 段左右声道
+       * 频谱（值域 0..1）；返回 null 表示暂时无数据，该帧回落内置模拟源。
+       * 传 null 注销。
+       *
+       * 拉而不推：宿主每帧推 128 个浮点要走字符串拼接与 JS 解析，安卓 WebView
+       * 上 60fps 下开销可观。让渲染器主动拉，宿主可用同步原生桥直接返回。
+       */
+      setAudioBridge(
+        fn: (() => { left: ArrayLike<number>; right: ArrayLike<number> } | null) | null,
+      ): void;
+      /**
+       * 截取当前帧作缩略图，返回 dataURL；无画布时返回 null。
+       * 场景画布的 WebGL2 上下文是 preserveDrawingBuffer:true，可直接读，
+       * 无需 flush 技巧。
+       *
+       * @param maxWidth 最大宽度，超出时等比缩小。0 或省略表示原尺寸
+       */
+      capture(maxWidth?: number): string | null;
+      /** 回读当前生效的用户属性值表（扁平 `{name: value}`）。无场景时返回 null */
+      getProperties(): Record<string, unknown> | null;
     };
     /**
      * 运行时观测面（只读）。宿主 / 测试台轮询取真实帧率：
@@ -321,6 +342,39 @@ window.__wp = {
     rt.paused = false;
     applyWallpaperFilter(rt);
     mountWallpaper(rt, rt.cfg);
+  },
+  // 宿主音频频谱源。只存引用，实际每帧拉取在 scene-mount 的渲染循环里。
+  // 换壁纸不清空：宿主装一次就该对之后所有场景生效。
+  setAudioBridge(fn) {
+    rt.audioBridge = typeof fn === "function" ? fn : null;
+  },
+  // 截取当前帧。场景画布用 preserveDrawingBuffer:true 创建，直接 toDataURL 即可。
+  // 超过 maxWidth 时经离屏 canvas 等比缩小——安卓侧缩略图只要几百像素宽，
+  // 原尺寸 4K 截图的 dataURL 有几 MB，跨 JS 桥传回去很慢。
+  capture(maxWidth?: number) {
+    const src = rt.canvas ?? document.querySelector("canvas");
+    if (!src || !src.width || !src.height) return null;
+    try {
+      const limit = maxWidth && maxWidth > 0 ? maxWidth : 0;
+      if (!limit || src.width <= limit) return src.toDataURL("image/jpeg", 0.85);
+
+      const scale = limit / src.width;
+      const off = document.createElement("canvas");
+      off.width = limit;
+      off.height = Math.max(1, Math.round(src.height * scale));
+      const ctx = off.getContext("2d");
+      if (!ctx) return src.toDataURL("image/jpeg", 0.85);
+      ctx.drawImage(src, 0, 0, off.width, off.height);
+      return off.toDataURL("image/jpeg", 0.85);
+    } catch {
+      // 画布被跨源内容污染时 toDataURL 会抛 SecurityError
+      return null;
+    }
+  },
+  // 回读实时属性值表。与 updateWebProps 配对，让宿主的属性面板能闭环
+  // （改完读回确认，以及面板初始化时拿到场景快照值而非 project.json 默认值）。
+  getProperties() {
+    return rt.liveUserProps ? { ...rt.liveUserProps } : null;
   },
 };
 

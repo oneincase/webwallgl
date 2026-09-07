@@ -361,9 +361,81 @@ cfg, source, pkgAbort.signal);
         left64: zero(64), right64: zero(64),
         level: 0, silent: true,
       };
+      // 宿主注入的频谱源（rt.audioBridge）。宿主只给 64 段左右声道，
+      // 32/16 段降采样、level、silent、preL64/preR64 由这里派生，保证快照
+      // 与模拟源同构——消费方（shader uniform、粒子、文字脚本）不需要区分来源。
+      const hostAudio = (() => {
+        const snapshot = {
+          left64: zero(64), right64: zero(64),
+          left32: zero(32), right32: zero(32),
+          left16: zero(16), right16: zero(16),
+          // 未钳位频谱：网页驱动会对它做 gamma 对比扩展。宿主给的已是 0..1
+          // 归一化值，没有 pre-GAIN 概念，直接与 left64/right64 共用同一份数据
+          preL64: zero(64), preR64: zero(64),
+          level: 0,
+          silent: true,
+        };
+        const down = (dst: Float32Array, src: Float32Array) => {
+          const g = src.length / dst.length;
+          for (let i = 0; i < dst.length; i++) {
+            let s = 0;
+            const i0 = Math.floor(i * g);
+            const i1 = Math.max(i0 + 1, Math.floor((i + 1) * g));
+            for (let j = i0; j < i1; j++) s += src[j];
+            dst[i] = s / (i1 - i0);
+          }
+        };
+        return {
+          active: false,
+          snapshot,
+          /** 每帧从宿主拉一次。宿主返回 null（未采集/无权限）时置 active=false 回落模拟源 */
+          pump() {
+            const src = rt.audioBridge?.();
+            if (!src || !src.left || !src.right) {
+              this.active = false;
+              return;
+            }
+            const n = Math.min(64, src.left.length, src.right.length);
+            let sum = 0;
+            for (let i = 0; i < n; i++) {
+              const l = src.left[i] || 0;
+              const r = src.right[i] || 0;
+              snapshot.left64[i] = l;
+              snapshot.right64[i] = r;
+              snapshot.preL64[i] = l;
+              snapshot.preR64[i] = r;
+              // level 只统计前 48 段：最高的十几段是采样率上限附近的噪声，
+              // 计入会让整体响度被底噪抬起来，视觉上"永远在动"
+              if (i < 48) sum += l;
+            }
+            // 宿主给的段数不足 64 时补零，避免残留上一帧数据
+            for (let i = n; i < 64; i++) {
+              snapshot.left64[i] = 0;
+              snapshot.right64[i] = 0;
+              snapshot.preL64[i] = 0;
+              snapshot.preR64[i] = 0;
+            }
+            down(snapshot.left32, snapshot.left64);
+            down(snapshot.right32, snapshot.right64);
+            down(snapshot.left16, snapshot.left64);
+            down(snapshot.right16, snapshot.right64);
+            snapshot.level = Math.min(1, sum / 48);
+            snapshot.silent = snapshot.level < 0.02;
+            this.active = true;
+          },
+        };
+      })();
+      // 当前生效的音频快照。优先级：宿主注入 > 麦克风实况 > 内置模拟。
+      // 粒子 / 文字脚本 / shader uniform 都从这里取，保证同一帧看到同一份数据。
+      const activeAudioSnapshot = () =>
+        hostAudio.active
+          ? hostAudio.snapshot
+          : audioDriverRef.current
+            ? audioDriverRef.current.snapshot
+            : simAudio.snapshot;
       renderer.setAudioProvider(() => {
         if (!audioSim.enabled) return SILENT_AUDIO;
-        return audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot;
+        return activeAudioSnapshot();
       });
       // 文字脚本 engine.registerAudioBuffers(n) 的共享视图（text.js 惰性创建，每帧重填）
       const audioViews = new Map<number, { left: Float32Array; right: Float32Array; average: Float32Array }>();
@@ -1461,7 +1533,7 @@ cfg, source, pkgAbort.signal);
           if (particleDirty.length) {
             for (const ps of particleDirty) ps.syncLayerTransform();
           }
-          for (const ps of particleSystems) ps.advance(pdt, audioSim.enabled ? simAudio.snapshot : null);
+          for (const ps of particleSystems) ps.advance(pdt, audioSim.enabled ? activeAudioSnapshot() : null);
           // 首帧后上报一次实际存活粒子数
           if (particleDiagFrame < 2) {
             particleDiagFrame++;
@@ -2612,14 +2684,16 @@ cfg, source, pkgAbort.signal);
           // 只重算 transformDirty（变换绑了脚本/动画的层及其整棵子树，外加挂件子树），
           // 其余图层保持 parse 时的 world 一个字节都不碰。
           if (transformDirty.size) scn.recomposeWorld(scene.layers, transformDirty);
-          // 模拟音频流按场景时间推进（确定性：同 t 同频谱），并重填文字脚本的频谱视图
+          // 音频流推进并重填文字脚本的频谱视图。优先级：宿主注入 > 麦克风实况 >
+          // 内置模拟（确定性：同 t 同频谱）。hostAudio.pump 内部会在宿主无数据时
+          // 自行置 active=false，于是这一帧自动回落到后两者。
           if (audioSim.enabled) {
-            if (audioDriverRef.current) audioDriverRef.current.pump();
-            else simAudio.update(t);
-            audioMod.fillAudioBuffers(
-              audioViews,
-              audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot,
-            );
+            hostAudio.pump();
+            if (!hostAudio.active) {
+              if (audioDriverRef.current) audioDriverRef.current.pump();
+              else simAudio.update(t);
+            }
+            audioMod.fillAudioBuffers(audioViews, activeAudioSnapshot());
           }
           // [we-scene patch] 挂件跟随父 puppet 附着点。必须在对象脚本之后、绘制之前：
           // 从绑定姿势的 base origin 重写，加上当前姿势与绑定姿势的差。
