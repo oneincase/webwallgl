@@ -1266,6 +1266,72 @@ console.log('\n【6. 骨骼拖拽：真实脚本驱动真实 MDL】')
   if (ran === 0) fail('一个外观切换用例都没跑起来（壁纸缺失或脚本探测失效）')
   else if (toggled === ran) ok(`${toggled} 个外观切换端到端生效`)
 
+  // 「引擎层」脚本：无 export、只往 shared 上装 helper（3786330502 id=885 装
+  // createAnimation/updateAnimation）。它必须**留住沙箱**，否则宿主拿不到它的 engine、
+  // 逐帧回填漏掉它，而 helper 是这个沙箱里的闭包，读的就是那份冻结在 0 的时钟 ——
+  // `engine.runtime - stateChangeTime < delay` 恒成立，点击绿色箭头后 shared.ck 翻了
+  // 但图层一动不动。跑真脚本做端到端判据，不用正则看形状。
+  {
+    const pkgPath = path.join(LIB, '3786330502', 'scene.pkg')
+    if (!fs.existsSync(pkgPath)) {
+      ok('跳过 3786330502 引擎层时钟用例（本机无此壁纸）')
+    } else {
+      const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)))
+      const sj = JSON.parse(new TextDecoder().decode(getEntry(pkg, 'scene.json')))
+      const obj = (id) => (sj.objects || []).find((o) => o.id === id)
+      const shared = {}
+      const sandboxes = []
+      const mk = (o, f) => {
+        if (!o || !o[f]) return null
+        const sb = evalObjectScript(o[f].script, o[f].scriptproperties, {
+          shared, layer: {}, canvasSize: { x: 3840, y: 2160 }, onError: () => {},
+        })
+        if (sb) sandboxes.push(sb)
+        return sb
+      }
+      const sbEngine = mk(obj(885), 'visible')   // 引擎层：装 helper，无 export
+      const sbBtn = mk(obj(957), 'visible')      // 按键：cursorClick 翻 shared.ck
+      const sbGrp = mk(obj(1061), 'origin')      // 父组：update 里读 helper 驱动位移
+      if (!sbEngine) {
+        fail('3786330502 id=885 引擎层沙箱为 null —— 宿主拿不到它的 engine，' +
+          'shared 上的 helper 闭包会读到冻结在 0 的 runtime，动画闸门永不开启')
+      } else if (!sbBtn || !sbGrp) {
+        fail('3786330502 按键/父组脚本沙箱求值失败（用例过期）')
+      } else {
+        if (sbEngine.hasUpdate) {
+          fail('引擎层不该被判为有 update（会白占一个字段求值位）')
+        }
+        sbGrp.init({ x: 1711, y: 30, z: 0 })
+        let val = { x: 1711, y: 30, z: 0 }
+        let t = 0
+        // 宿主逐帧循环：**按沙箱回填时钟**，而不是只回填有 update 的那批
+        const frame = () => {
+          t += 1 / 60
+          for (const sb of sandboxes) { sb.engine.frametime = 1 / 60; sb.engine.runtime = t }
+          const r = sbGrp.callUpdate(val)
+          if (r && 'x' in r) val = { x: r.x, y: r.y, z: r.z }
+        }
+        for (let i = 0; i < 60; i++) frame()
+        const idle = val.x
+        sbBtn.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) })
+        for (let i = 0; i < 180; i++) frame()
+        const moved = val.x
+        if (Math.abs(idle - 1711) > 1) {
+          fail(`3786330502 静置 1s 后 origin.x 应停在 1711，实得 ${idle.toFixed(1)}`)
+        } else if (Number(shared.ck) !== 2) {
+          fail(`3786330502 点击后 shared.ck 应为 2，实得 ${shared.ck}`)
+        } else if (Math.abs(moved - 1000) > 5) {
+          fail(`3786330502 点击绿色箭头后父组应在 3s 内移到 x≈1000，实得 ${moved.toFixed(1)}` +
+            `（位移 ${Math.abs(moved - idle).toFixed(1)}px）—— 引擎层 engine.runtime 冻结在 0，` +
+            '动画 delay 闸门永不开启')
+        } else {
+          ok(`3786330502 点击绿色箭头 → shared.ck=2 → 父组 origin.x ${idle.toFixed(0)}→${moved.toFixed(0)}` +
+            `（位移 ${Math.abs(moved - idle).toFixed(0)}px）`)
+        }
+      }
+    }
+  }
+
   // 单元断言：getEffect 取不到时**必须返回句柄而不是 null**。
   // 语料里 9 处调用无一判空，返回 null 就是熔断。
   {

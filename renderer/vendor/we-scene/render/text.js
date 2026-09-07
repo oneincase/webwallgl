@@ -1650,7 +1650,18 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   // 只导出 `applyUserProperties(changed){ thisObject.color = shared.accentColor }`，
   // 属性驱动而非时间驱动）。此前被闸门整个丢弃，两个常量的脚本色全部丢失。
   const hasApplyHook = !!(fns && typeof fns.applyUserProperties === 'function')
-  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook)) return null
+  // 同理（第四种）：**「引擎层」脚本一个 export 都没有**，只在顶层往 `shared` 上装
+  // helper（3786330502 的 id=885 装 createAnimation/updateAnimation，供另外两层的
+  // update 调用）。丢掉它不会丢副作用——顶层代码在上面 factory() 里已经跑完了——丢掉的
+  // 是**它自己的 `engine`**：宿主只逐帧回填拿得到句柄的沙箱，这个 engine 的 runtime
+  // 就永远停在 0。而 helper 是在这个沙箱里定义的闭包，读的正是这份冻结时钟，于是
+  // `engine.runtime - stateChangeTime = 0 - 0 < delay` 恒成立，动画闸门永不开启，
+  // 表现为点击绿色箭头后 shared.ck 确实翻了但图层一动不动。
+  // 判据取「读时钟」而非「写 shared」：全库 5 个无 export 脚本里另外 4 个分别是整体
+  // 赋值 `shared = {...}`（打在形参上，本就是空操作）、纯文本属性说明、以及用了不存在
+  // 的 `scene.on` API，都不需要逐帧时钟，放它们进来只会白占一个每帧回填位。
+  const usesEngineClock = /\bengine\s*\.\s*(runtime|frametime)\b/.test(body)
+  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock)) return null
 
   const sandbox = {
     engine,

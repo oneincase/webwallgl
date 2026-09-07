@@ -2483,6 +2483,18 @@ cfg, source, pkgAbort.signal);
           }
           // 对象脚本逐帧求值（音频条 scale 随频谱伸缩等）；dt 封顶同粒子
           const screenRes = { x: c.clientWidth || window.innerWidth || 1, y: c.clientHeight || window.innerHeight || 1 };
+          // [we-scene patch] 时钟回填**不能只覆盖 objectScriptRuns**。那个队列按
+          // `hasUpdate` 筛过，把「引擎层」脚本（无 export，只往 shared 上装 helper）
+          // 挡在外面；而 helper 是在那个沙箱里定义的闭包，读的就是它自己的 engine。
+          // 只回填有 update 的沙箱 → 引擎层 runtime 恒为 0 → 依赖 `engine.runtime -
+          // stateChangeTime >= delay` 的动画闸门永不开启（3786330502 点绿色箭头
+          // shared.ck 翻了却一动不动）。改为按沙箱回填，字段求值仍走下面的队列。
+          for (const sb of propSandboxes) {
+            if (!sb || sb.disabled) continue;
+            sb.engine.frametime = animDt;
+            sb.engine.runtime = t;
+            sb.engine.screenResolution = screenRes;
+          }
           let visibilityDirty = false;
           for (const run of objectScriptRuns) {
             if (run.sandbox.disabled) continue;

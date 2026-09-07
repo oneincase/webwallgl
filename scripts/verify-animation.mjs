@@ -682,9 +682,12 @@ const kf = (frame, value, front, back) => ({
     /const animDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*lastAnimT = t;/.test(mountSrc),
     "算出 animDt 后必须立即推进 lastAnimT（否则 dt 变成累计时间，播放头按 t² 增长）",
   );
+  // 第四处是「按沙箱回填」：对象脚本队列按 hasUpdate 筛过，漏掉无 export 的引擎层
+  // 脚本（3786330502 id=885 往 shared 上装 helper）。那份 engine 不回填就冻结在 0，
+  // helper 闭包读的正是它，依赖 runtime 的动画闸门永不开启。四处必须同时基。
   check(
-    (mountSrc.match(/frametime = animDt/g) || []).length === 3,
-    "三处 engine.frametime（效果开关 / general / 对象脚本）都应改用 animDt",
+    (mountSrc.match(/frametime = animDt/g) || []).length === 4,
+    "四处 engine.frametime（效果开关 / general / 对象脚本 / 按沙箱回填）都应改用 animDt",
   );
 
   // 2) 数值判据：模拟渲染循环，两种推进方式各跑一遍，比对与真实时钟的偏差。
