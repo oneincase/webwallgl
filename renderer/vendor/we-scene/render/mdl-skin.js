@@ -388,6 +388,11 @@ export function applyAttachmentBindOrigins(layers) {
     for (const c of desc) {
       c.parallaxDepth = layer.parallaxDepth ? layer.parallaxDepth.slice() : null
     }
+    // [we-scene patch] 绑定姿势偏移要留在图层上。逐帧 recomposeWorld 会从
+    // `父 world + local` 重算这一层的 world，只把偏移加进 origin 的话，
+    // 祖先一动重算就把它抹掉，挂件（眼睛/头发/眼泪）会掉回未附着的位置。
+    // 只标在挂件层自己身上：子孙由 recompose 通过父链自然继承，标了会重复计入。
+    layer.attachBindDelta = [d[0], d[1]]
     follows.push({
       layer,
       parent,
@@ -403,6 +408,12 @@ export function applyAttachmentBindOrigins(layers) {
     f.baseY = f.layer.origin[1]
     f.subtree = [{ layer: f.layer, x: f.layer.origin[0], y: f.layer.origin[1] }]
     for (const c of f.desc) f.subtree.push({ layer: c, x: c.origin[0], y: c.origin[1] })
+    // [we-scene patch] 给整棵子树挂上「本帧绑定姿势基准」槽。
+    // 静态场景里它恒等于挂载期快照；祖先带脚本/动画变换时由 recomposeWorld
+    // 每帧重写（见 scene/parse.js）。followAttachments 只读不写，保证幂等。
+    for (const s of f.subtree) {
+      if (!s.layer.attachBase) s.layer.attachBase = [s.x, s.y]
+    }
   }
   return follows
 }
@@ -414,6 +425,15 @@ export function applyAttachmentBindOrigins(layers) {
  *
  * 嵌套挂件：先全体回到绑定快照，再把每条 follow 的增量加到它的整棵子孙。
  * 只写 f.layer 会让「主发 / 眼睛」停在绑定姿势、不随父骨摆。
+ *
+ * [we-scene patch] base 不能再用挂载期快照：祖先若带脚本/动画变换，
+ * recomposeWorld 每帧都会重算这些层的 world（挂件的绑定偏移由
+ * `attachBindDelta` 在重算里叠好）。此时把 origin 拍回挂载期的
+ * `f.baseX/baseY` 等于把祖先的位移整个撤销 —— 3786330502 的人物组一滑动，
+ * 7 个挂件（眼睛/眼泪×4/头发/眼眉）就会留在原地，人物一分为二。
+ * 改为**每帧调用前读一次当前 origin 当 base**（recompose 刚写好的值），
+ * 骨骼增量叠在它上面。没有 recompose 参与的场景里，当前 origin 恒等于
+ * 挂载期快照，行为与改动前逐位相同。
  */
 export function followAttachments(follows, time, getBoneOverrides) {
   if (!follows || follows.length === 0) return
@@ -437,14 +457,26 @@ export function followAttachments(follows, time, getBoneOverrides) {
     }
     deltas.push(parentMeshToWorldDelta(f.parent, cur[12] - f.bindX, cur[13] - f.bindY))
   }
+  // 本帧基准：优先用 recomposeWorld 刚写下的 `attachBase`（父子变换重算后的
+  // 绑定姿势世界位），否则退回挂载期快照 s.x/s.y（静态场景走这条，与改动前逐位相同）。
+  //
+  // **绝不能拿 `layer.origin` 当基准** —— 那是上一次 follow 的输出，连调两次就把
+  // 骨骼增量累加两遍（verify-attachments 的「调用两次必须得到同一 origin」正是锁这个）。
+  // attachBase 只由 recompose 写、follow 只读，因此本函数幂等。
+  const baseOf = (s) => {
+    const ab = s.layer.attachBase
+    if (ab) return ab
+    return [s.x, s.y]
+  }
   const seen = new Set()
   for (const f of follows) {
     const tree = f.subtree || [{ layer: f.layer, x: f.baseX, y: f.baseY }]
     for (const s of tree) {
       if (seen.has(s.layer)) continue
       seen.add(s.layer)
-      s.layer.origin[0] = s.x
-      s.layer.origin[1] = s.y
+      const b = baseOf(s)
+      s.layer.origin[0] = b[0]
+      s.layer.origin[1] = b[1]
     }
   }
   for (let i = 0; i < follows.length; i++) {

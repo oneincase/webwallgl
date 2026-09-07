@@ -1181,6 +1181,9 @@ cfg, source, pkgAbort.signal);
       // 内置资源。没有 WE 安装目录可回退，故用 particle-textures.js 按名字语义
       // 程序化生成近似素材，否则整个粒子系统无贴图可用、只能整体跳过。
       const particleSystems: any[] = [];
+      // [we-scene patch] 需要逐帧重读图层变换的粒子系统（脏子树内的）。
+      // 挂载末尾按 transformDirty 填充；静态场景恒为空，advance 前一次都不跑。
+      const particleDirty: any[] = [];
       // 按图层 id 索引粒子系统，用于逐层渲染（而非全部堆在最后）。
       // 子发射器（children）继承父图层的 layer.id，同一场景层的所有粒子系统在此分组。
       const particleSystemsByLayer = new Map<number, any[]>();
@@ -1452,6 +1455,12 @@ cfg, source, pkgAbort.signal);
             const py = originY != null ? originY : wy;
             for (const ps of particleSystems) ps.setPointer(wx, py);
           }
+          // [we-scene patch] 发射器变换只在构造时缓存过一次。父组带脚本/动画变换时
+          // recomposeWorld 每帧都会挪动图层，不重读就会「人物滑走、火焰留在原地」。
+          // 只同步脏子树里的粒子层（静态场景下集合为空，一次都不跑）。
+          if (particleDirty.length) {
+            for (const ps of particleDirty) ps.syncLayerTransform();
+          }
           for (const ps of particleSystems) ps.advance(pdt, audioSim.enabled ? simAudio.snapshot : null);
           // 首帧后上报一次实际存活粒子数
           if (particleDiagFrame < 2) {
@@ -1665,6 +1674,25 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt, cfg, `attachments: ${attachFollows.length} hanging layers`);
       }
 
+      // [we-scene patch] 逐帧需要重算父子变换的图层集合（见 scene/parse.js
+      // recomposeWorld / collectTransformDirty）。种子 = 变换字段绑了脚本或
+      // 关键帧动画的层 + 挂件层，然后连同整棵子树收进来（父动子必须跟）。
+      //
+      // 这是**风险闸门**：全库 187 张场景里 126 张不含任何脚本化变换，
+      // 集合为空 → 一帧都不重算 → 从机制上不可能回归。
+      const transformDirty: Set<unknown> = scn.collectTransformDirty(
+        scene.layers,
+        attachFollows.map((f: any) => f.layer),
+      );
+      if (transformDirty.size) {
+        reportDiag(rt, cfg, `transform graph: ${transformDirty.size} live layers`);
+        // 脏子树里的粒子层：发射器变换要跟着图层每帧重读（见 syncLayerTransform）。
+        for (const [lid, list] of particleSystemsByLayer) {
+          if (!transformDirty.has(lid)) continue;
+          for (const ps of list) particleDirty.push(ps);
+        }
+      }
+
       // ---- 文字对象 / 组件挂件（时钟、日期、星期等动态文本）----
       // 文字渲到离屏 2D canvas → GL 纹理 → 挂回图层本身（textureName），以**普通图层身份**
       // 进入渲染管线：z 序与图片层一致、可走效果链/混合/视差。旧 2D overlay 方案永远
@@ -1799,14 +1827,26 @@ cfg, source, pkgAbort.signal);
             textLayerText.set(layer.name || "", String(layer.text ?? ""));
             // anchor ≠ center 时一次性平移 origin，让盒子按锚点贴住原点（世界 y 轴朝上）。
             // 用的是原盒子尺寸 —— 下面立刻把 layer.size 扩成带溢出边距的画布尺寸。
+            //
+            // [we-scene patch] 偏移必须同时折进 localOrigin：world 逐帧由
+            // recomposeWorld 从 local 重新合成，只改 world 的话下一帧就被冲掉，
+            // 带脚本/动画变换的文字层锚点会当场失效。
             if (layer.textAnchor !== "center" && layer.size[0] > 0 && layer.size[1] > 0) {
               const hw = (layer.size[0] * (layer.scale[0] || 1)) / 2;
               const hh = (layer.size[1] * (layer.scale[1] || 1)) / 2;
               const a = layer.textAnchor;
-              if (a.includes("left")) layer.origin[0] += hw;
-              if (a.includes("right")) layer.origin[0] -= hw;
-              if (a.includes("top")) layer.origin[1] -= hh;
-              if (a.includes("bottom")) layer.origin[1] += hh;
+              let adx = 0;
+              let ady = 0;
+              if (a.includes("left")) adx += hw;
+              if (a.includes("right")) adx -= hw;
+              if (a.includes("top")) ady -= hh;
+              if (a.includes("bottom")) ady += hh;
+              layer.origin[0] += adx;
+              layer.origin[1] += ady;
+              if (layer.localOrigin) {
+                layer.localOrigin[0] += adx;
+                layer.localOrigin[1] += ady;
+              }
             }
             // 盒子（size）只是定位框，WE 不裁剪溢出文字（halign right 时整行向左长出）。
             // 画布/图层 quad 按盒子四周扩 M，内部盒子位置不变：文字溢出画进边距里。
@@ -1949,9 +1989,9 @@ cfg, source, pkgAbort.signal);
       // ---- WE 对象脚本（scale/origin/color/alpha/brightness/angles 绑定的脚本）----
       // 经典用法：音频条的 scale 脚本读 registerAudioBuffers 按频段改写 scale.y
       // （3078285611 底部 11 根音条即此）。逐帧求值，出错熔断回退字段静态快照。
-      const objectScriptRuns: Array<{ layer: any; field: string; kind: "vec3" | "scalar" | "bool"; sandbox: any }> = [];
+      const objectScriptRuns: Array<{ layer: any; field: string; slot: string; kind: "vec3" | "scalar" | "bool"; sandbox: any }> = [];
       // 关键帧动画：逐帧推进并把结果写回图层字段
-      const animRuns: Array<{ layer: any; field: string; ctrl: any }> = [];
+      const animRuns: Array<{ layer: any; field: string; slot: string; ctrl: any }> = [];
       const generalAnimRuns: Array<{ field: string; ctrl: any; write: (v: unknown) => void }> = [];
       const sceneNamedAnims: Record<string, any> = {};
       // 效果开关脚本（effects[i].visible.script）：逐帧决定该效果是否参与渲染
@@ -2088,6 +2128,22 @@ cfg, source, pkgAbort.signal);
             if (sb && sb.hasMediaHook) registerMediaHook(sb);
           },
         });
+        // [we-scene patch] 变换字段（origin/scale/angles）的脚本与关键帧动画一律在
+        // **父级相对（local）** 空间收发 —— 那是 WE 场景图的真实语义，也是作者写
+        // 目标值时用的空间（3786330502 气泡 `scriptProperties.A` = local y，
+        // 气泡1 的 −433 当世界 Y 讲不通）。world 三件套由 recomposeWorld 逐帧合成。
+        // 非变换字段（alpha / visible / brightness…）不存在父子空间问题，原样走 world。
+        const LOCAL_SLOT: Record<string, string> = {
+          origin: "localOrigin",
+          scale: "localScale",
+          angles: "localAngles",
+        };
+        const fieldSlot = (layer: any, field: string): string => {
+          const slot = LOCAL_SLOT[field];
+          // localOrigin 缺失只可能是 isPostProcess 之外的旧路径合成层（createLayer
+          // 克隆等），退回 world 槽，行为与改动前一致。
+          return slot && layer && Array.isArray(layer[slot]) ? slot : field;
+        };
         // [we-scene patch] 关键帧动画控制器：解析阶段建好挂到图层上，
         // 供脚本 thisObject.getAnimation() 取用、渲染循环逐帧推进。
         // 全库 126 处 / 25 张壁纸；没有它 `anim.play()` 是个 no-op（见 render/animation.js）。
@@ -2105,11 +2161,17 @@ cfg, source, pkgAbort.signal);
               // layer.origin / layer.angles 再喂给 applyTo，等于把动画曲线积分：
               // 3233141951「头发0202」angles 峰值只有 0.14rad，积 80 帧就转一整圈，
               // origin 峰值 −23px 也会一步步漂出画面，看起来像跟着飞剑飞走。
-              const live = (layer as any)[field];
+              //
+              // [we-scene patch] 变换字段的基准取 **local** 快照：曲线在 local 上
+              // 叠加，再由 recomposeWorld 合成 world。基准若取 world，父偏移会被
+              // 算两遍（全库 4 个非根变换动画全是 relative:true，取错即双计）。
+              const slot = fieldSlot(layer, field);
+              const live = (layer as any)[slot];
               ctrl.baseNumeric = Array.isArray(live) ? live.slice() : live;
+              ctrl.slot = slot;
               layer.animationList.push(ctrl);
               if (ctrl.name) layer.animations[ctrl.name] = ctrl;
-              animRuns.push({ layer, field, ctrl });
+              animRuns.push({ layer, field, slot, ctrl });
             } catch (e) {
               reportDiag(rt, cfg, `animation '${layer.name}.${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
             }
@@ -2188,7 +2250,12 @@ cfg, source, pkgAbort.signal);
                 // 此前 init() 无参调用，所有 `init(value){ initialValue = value.x }`
                 // 形态的脚本（3264246690 的月亮/时间/三条胶带音频缩放，全库音频
                 // 可视化模板的标准写法）都会在 init 里 TypeError 熔断。
-                const fieldVal = (layer as any)[field];
+                //
+                // [we-scene patch] 变换字段读 **local** 槽：作者的 init/update 都在
+                // 父级相对空间里算（见 fieldSlot 上方注释）。喂 world 会让脚本第一帧
+                // 就把图层拽到「local 目标当 world 用」的错位置上。
+                const initSlot = fieldSlot(layer, field);
+                const fieldVal = (layer as any)[initSlot];
                 // SceneScript 的 angles 是角度，图层数组是弧度。init(value) 必须同形，
                 // 否则 `initialValue = value.z` 拿到的是弧度，滑条（°）脚本会整圈乱转。
                 const initArg = field === "angles" && Array.isArray(fieldVal)
@@ -2216,6 +2283,8 @@ cfg, source, pkgAbort.signal);
                   objectScriptRuns.push({
                     layer,
                     field,
+                    // 变换字段逐帧也在 local 槽上收发（与 init 同一空间）。
+                    slot: initSlot,
                     kind: field === "visible"
                       ? "bool"
                       : field === "alpha" || field === "brightness"
@@ -2444,13 +2513,14 @@ cfg, source, pkgAbort.signal);
           for (const run of animRuns) {
             run.ctrl.advance(animDt);
             const field = run.field;
+            const slot = run.slot || field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (Array.isArray(out)) {
-              const cur = run.layer[field];
+              const cur = run.layer[slot];
               if (Array.isArray(cur)) for (let i = 0; i < out.length && i < cur.length; i++) cur[i] = out[i];
             } else if (Number.isFinite(out)) {
               if (field === "visible") run.layer[field] = !!out;
-              else run.layer[field] = out;
+              else run.layer[slot] = out;
             }
           }
           for (const run of generalAnimRuns) {
@@ -2523,17 +2593,25 @@ cfg, source, pkgAbort.signal);
               const n = Number(ret);
               if (Number.isFinite(n)) run.layer[run.field] = n;
             } else {
+              // 变换字段在 local 槽上收发（见 fieldSlot）；world 由 recomposeWorld 合成。
+              const slot = run.slot || run.field;
+              const lcur = run.layer[slot];
               const v = run.field === "angles"
-                ? wtext.radToScriptAngles(cur)
-                : { x: cur[0] || 0, y: cur[1] || 0, z: cur[2] || 0 };
+                ? wtext.radToScriptAngles(lcur)
+                : { x: lcur[0] || 0, y: lcur[1] || 0, z: lcur[2] || 0 };
               const ret = run.sandbox.callUpdate(v);
               const o = ret && typeof ret === "object" && "x" in (ret as object) ? ret : v;
-              run.layer[run.field] = run.field === "angles"
+              run.layer[slot] = run.field === "angles"
                 ? wtext.scriptAnglesToRad(o)
                 : [o.x || 0, o.y || 0, o.z || 0];
             }
           }
           if (visibilityDirty) recomputeVisibility();
+          // [we-scene patch] 父子变换重算：把 local 三件套合成回 world。
+          // 必须在动画/脚本写完 local **之后**、followAttachments 与绘制**之前**。
+          // 只重算 transformDirty（变换绑了脚本/动画的层及其整棵子树，外加挂件子树），
+          // 其余图层保持 parse 时的 world 一个字节都不碰。
+          if (transformDirty.size) scn.recomposeWorld(scene.layers, transformDirty);
           // 模拟音频流按场景时间推进（确定性：同 t 同频谱），并重填文字脚本的频谱视图
           if (audioSim.enabled) {
             if (audioDriverRef.current) audioDriverRef.current.pump();

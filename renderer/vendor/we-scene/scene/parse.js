@@ -66,6 +66,52 @@ export function parseNum(v, dflt) {
   return dflt
 }
 
+/**
+ * 「渲染惰性纯容器」判据：无 image / model / particle / text 且无 size。
+ * WE 只把这种「排版夹具」节点当分组用，**不把它的 scale 传给子层**
+ * （3791354118 / 3264246690 的无名组 id 373，详见 composeChildTransform 内注释）。
+ */
+export function isRenderInert(o) {
+  if (!o) return false
+  return !o.image && !o.model && !o.particle && o.text == null && !o.size
+}
+
+/**
+ * 父子变换合成：`(父 world, 子 local) → 子 world`。
+ *
+ * [we-scene patch] **这段数学是 parse 阶段的静态合并与运行时 recomposeWorld
+ * 的唯一实现**。两边各写一份必然发散（改了一处忘另一处，画面错位且无报错），
+ * 所以抽成纯函数由双方共用。改这里等于同时改两条路径，verify-transform
+ * 的「静态场景上 recompose 必须与 parse 逐位相等」就是锁这一点的。
+ *
+ * 约定：WE 2D 层只用 z 旋转，角度制；Y 轴向下（与 parse 的世界系一致）。
+ *
+ * @param {{origin:number[],scale:number[],angles:number[]}} parentWorld 父层世界变换
+ * @param {{origin:number[],scale:number[],angles:number[]}} childLocal 子层局部变换
+ * @param {boolean} parentScalePropagates 父 scale 是否传给子层（渲染惰性纯容器为 false）
+ */
+export function composeChildTransform(parentWorld, childLocal, parentScalePropagates) {
+  const pscale = parentScalePropagates ? parentWorld.scale : [1, 1, 1]
+  const ca = ((parentWorld.angles[2] || 0) * Math.PI) / 180
+  const cos = Math.cos(ca)
+  const sin = Math.sin(ca)
+  const ox = childLocal.origin[0] * pscale[0]
+  const oy = childLocal.origin[1] * pscale[1]
+  return {
+    origin: [
+      parentWorld.origin[0] + ox * cos - oy * sin,
+      parentWorld.origin[1] + ox * sin + oy * cos,
+      parentWorld.origin[2] + (childLocal.origin[2] || 0),
+    ],
+    scale: [
+      pscale[0] * childLocal.scale[0],
+      pscale[1] * childLocal.scale[1],
+      pscale[2] * childLocal.scale[2],
+    ],
+    angles: [childLocal.angles[0], childLocal.angles[1], (parentWorld.angles[2] || 0) + childLocal.angles[2]],
+  }
+}
+
 export function parseScene(sceneJson, project) {
   const properties = (project && project.general && project.general.properties) || {}
   const objects = sceneJson.objects || []
@@ -88,6 +134,16 @@ export function parseScene(sceneJson, project) {
     origin: parseVec3(o.origin || '0 0 0'),
     scale: parseVec3(o.scale || '1 1 1'),
     angles: parseVec3(o.angles || '0 0 0'),
+  }))
+  // [we-scene patch] 局部变换必须原样留一份。脚本 / 关键帧动画绑在 origin/scale/angles
+  // 上时，作者写的是**父级相对坐标**（3786330502 的 12 个气泡 scriptProperties.A
+  // 就是 local y，气泡1 的 −433 作为世界 Y 根本不成立）。合并后只剩 world，
+  // 逐帧把 world 喂进 update(value) 再把返回的 local 写回，图层会当场跳位；
+  // 父组自己动时子层也无从跟随。运行时由 recomposeWorld 拿这份 local 重新合成。
+  const localSnapshot = local.map((c) => ({
+    origin: c.origin.slice(),
+    scale: c.scale.slice(),
+    angles: c.angles.slice(),
   }))
   // 自底向上迭代合并（层级深时循环至收敛）
   for (let pass = 0; pass < 8; pass++) {
@@ -112,21 +168,11 @@ export function parseScene(sceneJson, project) {
       const prs = pr.scale
       const runtimeBound =
         prs !== null && typeof prs === 'object' && (typeof prs.script === 'string' || prs.user !== undefined)
-      const renderInert = !pr.image && !pr.model && !pr.particle && pr.text == null && !pr.size
-      const pscale = runtimeBound && renderInert ? [1, 1, 1] : pc.scale
-      // 父级已合并：应用父变换（旋转仅考虑 z；WE 2D 层只用 z 旋转）
-      const ca = (pc.angles[2] * Math.PI) / 180
-      const cos = Math.cos(ca)
-      const sin = Math.sin(ca)
-      const ox = c.origin[0] * pscale[0]
-      const oy = c.origin[1] * pscale[1]
-      c.origin[0] = pc.origin[0] + ox * cos - oy * sin
-      c.origin[1] = pc.origin[1] + ox * sin + oy * cos
-      c.origin[2] = pc.origin[2] + c.origin[2]
-      c.angles[2] = pc.angles[2] + c.angles[2]
-      c.scale[0] = pscale[0] * c.scale[0]
-      c.scale[1] = pscale[1] * c.scale[1]
-      c.scale[2] = pscale[2] * c.scale[2]
+      const propagateScale = !(runtimeBound && isRenderInert(pr))
+      const w = composeChildTransform(pc, c, propagateScale)
+      c.origin = w.origin
+      c.scale = w.scale
+      c.angles = w.angles
       c.parent = null // 标记已合并
       changed = true
     }
@@ -362,6 +408,22 @@ export function parseScene(sceneJson, project) {
       origin: layerOrigin,
       scale: world.scale,
       angles: world.angles,
+      // [we-scene patch] 父级相对变换（WE 场景图的真实语义）。origin/scale/angles
+      // 上的脚本与关键帧动画一律在这层空间收发，再由 recomposeWorld 合成回上面的
+      // world 三件套。渲染 / hittest / getTransformMatrix 仍只读 world，不受影响。
+      // isPostProcess 层的 world 被强制成整幅画布，local 对它无意义（recompose 跳过）。
+      localOrigin: localSnapshot[i].origin,
+      localScale: localSnapshot[i].scale,
+      localAngles: localSnapshot[i].angles,
+      // 「渲染惰性纯容器」：父 scale 是否传给子层由父级这个标志决定，
+      // 判据与 parse 合并阶段逐字相同（见 isRenderInert）。
+      renderInert: isRenderInert(o),
+      // 父 scale 绑了脚本/用户属性（运行时可变）。与 renderInert 一起决定传播闸门。
+      scaleRuntimeBound: !!(
+        o.scale !== null &&
+        typeof o.scale === 'object' &&
+        (typeof o.scale.script === 'string' || o.scale.user !== undefined)
+      ),
       size: layerSize,
       alignment: o.alignment || 'center',
       color: parseColor(o.color),
@@ -505,4 +567,137 @@ export function resolveMaterial(modelJson) {
     autosize: !!modelJson.autosize,
     cropoffset: modelJson.cropoffset ? parseVec2(modelJson.cropoffset) : null,
   }
+}
+
+/**
+ * [we-scene patch] 运行时父子变换重算（WE 场景图语义）。
+ *
+ * parse 阶段把父变换烘进子层得到 world，这在**静态**场景上是等价的；一旦
+ * origin/scale/angles 绑了脚本或关键帧动画就不成立了：
+ *   ① 作者写的目标是 local（3786330502 的 12 个气泡 `scriptProperties.A` 就是
+ *      local y，气泡1 的 −433 当 world Y 讲不通；全库 68 个 local≠world 的非根
+ *      脚本 origin 层里 30 个匹配 local、**0 个**匹配 world）；
+ *   ② 父组自己动时，子层的 world 早已拍平，动了也没人跟。3786330502 的
+ *      550/1061/1027 三个无贴图容器共 50 个后代的位移全被丢弃。
+ *
+ * 做法：脚本/动画在 local 三件套上收发，这里自顶向下把 local 合成回 world，
+ * 渲染 / hittest / getTransformMatrix 继续只读 world。
+ *
+ * **只重算 dirty 集合**（挂载期算出「变换绑了脚本/动画的层」及其整棵子树）。
+ * 其余图层保持 parse 时的 world，一个字节都不碰 —— 全库 187 张里 126 张不含
+ * 任何脚本化变换，从机制上不可能回归。dirty 为 null 时重算全部（供 verifier
+ * 做「静态场景上 recompose 必须与 parse 逐位相等」的一致性断言）。
+ *
+ * 挂件（attachment）：绑定姿势偏移由 mdl-skin 存成 `attachBindDelta` 留在图层上，
+ * 这里合成完 world 之后再加回去。否则重算会把它抹掉，人物一动五官就留在原地。
+ *
+ * @param {object[]} layers parseScene 产出的图层数组（就地改写 origin/scale/angles）
+ * @param {Set<any>|null} dirty 需要重算的 layer.id 集合；null = 全部
+ */
+export function recomposeWorld(layers, dirty) {
+  if (!layers || layers.length === 0) return
+  const byId = new Map()
+  for (const l of layers) {
+    if (l && l.id !== undefined && l.id !== null) byId.set(l.id, l)
+  }
+  // 自顶向下：父必须先于子算完。按父链深度排序即可（层级最深 3～4 层）。
+  const depthOf = (l) => {
+    let d = 0
+    let p = l.parentId
+    for (let guard = 0; p !== undefined && p !== null && guard < 64; guard++) {
+      const parent = byId.get(p)
+      if (!parent) break
+      d++
+      p = parent.parentId
+    }
+    return d
+  }
+  const targets = []
+  for (const l of layers) {
+    if (!l || !l.localOrigin) continue
+    // isPostProcess 的 world 被强制成整幅画布（见上方 isPost 分支），local 对它无意义。
+    if (l.isPostProcess) continue
+    if (dirty && !dirty.has(l.id)) continue
+    targets.push(l)
+  }
+  targets.sort((a, b) => depthOf(a) - depthOf(b))
+  for (const l of targets) {
+    const parent = l.parentId !== undefined && l.parentId !== null ? byId.get(l.parentId) : null
+    let w
+    if (!parent) {
+      w = { origin: l.localOrigin.slice(), scale: l.localScale.slice(), angles: l.localAngles.slice() }
+    } else {
+      // 传播闸门与 parse 合并阶段逐字相同：父是「渲染惰性纯容器」且其 scale
+      // 绑了脚本/用户属性时，scale 不传给子层。
+      const propagateScale = !(parent.scaleRuntimeBound && parent.renderInert)
+      w = composeChildTransform(
+        { origin: parent.origin, scale: parent.scale, angles: parent.angles },
+        { origin: l.localOrigin, scale: l.localScale, angles: l.localAngles },
+        propagateScale,
+      )
+    }
+    // 挂件绑定姿势偏移：world 合成之后再叠，逐帧的骨骼增量由 followAttachments 叠。
+    const d = l.attachBindDelta
+    if (d) {
+      w.origin[0] += d[0]
+      w.origin[1] += d[1]
+    }
+    l.origin[0] = w.origin[0]
+    l.origin[1] = w.origin[1]
+    l.origin[2] = w.origin[2]
+    l.scale[0] = w.scale[0]
+    l.scale[1] = w.scale[1]
+    l.scale[2] = w.scale[2]
+    l.angles[0] = w.angles[0]
+    l.angles[1] = w.angles[1]
+    l.angles[2] = w.angles[2]
+    // 挂件子树的**绑定姿势基准**：followAttachments 每帧从它重写再叠骨骼增量。
+    // 必须由本函数发布（follow 自己读 layer.origin 当基准会把上一帧的增量
+    // 累加进来，连调两次结果就不同了）。只有进入过 follow 子树的层才有这个标记。
+    if (l.attachBase) {
+      l.attachBase[0] = w.origin[0]
+      l.attachBase[1] = w.origin[1]
+    }
+  }
+}
+
+/**
+ * [we-scene patch] 算出需要逐帧重算的图层集合（dirty 子树）。
+ *
+ * 种子 = 变换字段（origin/scale/angles）上绑了脚本或关键帧动画的层，
+ * 外加调用方补充的种子（如 mdl 挂件层：骨骼一动整棵子树都要跟）。
+ * 然后沿 childIds 把整棵子树收进来 —— 父动子必须跟，这正是缺陷 B。
+ */
+export function collectTransformDirty(layers, extraSeeds) {
+  const dirty = new Set()
+  if (!layers || layers.length === 0) return dirty
+  const childrenOf = new Map()
+  for (const l of layers) {
+    if (!l || l.parentId === undefined || l.parentId === null) continue
+    const list = childrenOf.get(l.parentId)
+    if (list) list.push(l)
+    else childrenOf.set(l.parentId, [l])
+  }
+  const TRANSFORM_FIELDS = ['origin', 'scale', 'angles']
+  const seeds = []
+  for (const l of layers) {
+    if (!l || l.id === undefined || l.id === null) continue
+    const scripts = l.objectScripts || null
+    const anims = l.objectAnimations || null
+    const bound = TRANSFORM_FIELDS.some((f) => (scripts && scripts[f]) || (anims && anims[f]))
+    if (bound) seeds.push(l)
+  }
+  if (extraSeeds) {
+    for (const l of extraSeeds) if (l && l.id !== undefined && l.id !== null) seeds.push(l)
+  }
+  const stack = seeds.slice()
+  for (let guard = 0; stack.length > 0 && guard < 100000; guard++) {
+    const l = stack.pop()
+    if (!l || l.id === undefined || l.id === null) continue
+    if (dirty.has(l.id)) continue
+    dirty.add(l.id)
+    const kids = childrenOf.get(l.id)
+    if (kids) for (const c of kids) stack.push(c)
+  }
+  return dirty
 }

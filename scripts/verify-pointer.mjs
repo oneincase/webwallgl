@@ -44,7 +44,7 @@ const { createPointerSource } = await import(path.join(ROOT, 'renderer/vendor/we
 const { evalObjectScript, evalTextScript, createInputView, makeCursorEventVec } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/text.js'))
 const { hlsl2glsl } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/hlsl2glsl.js'))
 const { parseMDL, computeSkinMatrices } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/mdl.js'))
-const { parseScene } = await import(path.join(ROOT, 'renderer/vendor/we-scene/scene/parse.js'))
+const { parseScene, recomposeWorld, collectTransformDirty } = await import(path.join(ROOT, 'renderer/vendor/we-scene/scene/parse.js'))
 const { ParticleSystem } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/particles.js'))
 const { WE_SHADER_HEADERS } = await importTs('renderer/vendor/we-scene/headers.ts')
 
@@ -1266,67 +1266,130 @@ console.log('\n【6. 骨骼拖拽：真实脚本驱动真实 MDL】')
   if (ran === 0) fail('一个外观切换用例都没跑起来（壁纸缺失或脚本探测失效）')
   else if (toggled === ran) ok(`${toggled} 个外观切换端到端生效`)
 
-  // 「引擎层」脚本：无 export、只往 shared 上装 helper（3786330502 id=885 装
-  // createAnimation/updateAnimation）。它必须**留住沙箱**，否则宿主拿不到它的 engine、
-  // 逐帧回填漏掉它，而 helper 是这个沙箱里的闭包，读的就是那份冻结在 0 的时钟 ——
-  // `engine.runtime - stateChangeTime < delay` 恒成立，点击绿色箭头后 shared.ck 翻了
-  // 但图层一动不动。跑真脚本做端到端判据，不用正则看形状。
+  // 「引擎层」脚本 + 父子变换重算：无 export、只往 shared 上装 helper 的脚本
+  // （3786330502 id=885 装 createAnimation/updateAnimation）必须留住沙箱，否则
+  // 宿主拿不到它的 engine、逐帧回填漏掉它，而 helper 是这个沙箱里的闭包，
+  // 读的就是那份冻结在 0 的时钟 —— `engine.runtime - stateChangeTime < delay` 恒成立，
+  // 点击绿色箭头后 shared.ck 翻了但图层一动不动。
+  //
+  // [2026-09-07 补] 更隐蔽的一层：父组动了子层必须跟着动。
+  // 之前的断言用 `1711, 30, 0` 当 init / callUpdate 的种子 —— 那是 **local** 坐标，
+  // 而渲染器实际喂的是 parse 烘好的 **world** `[3631, 1110, 0]`，且父组 origin 的
+  // 变化无人读取（按键 957 的 world 早在 parse 阶段就拍平了）。等于断言了渲染器
+  // 从不产生的坐标空间 + 一个没有任何像素依赖的变量。
+  // 修法：跑真实 parseScene + 真实 recompose，量子层 world 是否跟随父组，
+  // 并拿兄弟层「带」的 y 做独立对照（枪滑过去时应与丝带同一高度）。
   {
     const pkgPath = path.join(LIB, '3786330502', 'scene.pkg')
-    if (!fs.existsSync(pkgPath)) {
-      ok('跳过 3786330502 引擎层时钟用例（本机无此壁纸）')
+    const projPath = path.join(LIB, '3786330502', 'project.json')
+    if (!fs.existsSync(pkgPath) || !fs.existsSync(projPath)) {
+      ok('跳过 3786330502 引擎层时钟 + 父子变换用例（本机无此壁纸）')
     } else {
       const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)))
       const sj = JSON.parse(new TextDecoder().decode(getEntry(pkg, 'scene.json')))
-      const obj = (id) => (sj.objects || []).find((o) => o.id === id)
+      const project = JSON.parse(fs.readFileSync(projPath, 'utf8'))
+      const scene = parseScene(sj, project)
       const shared = {}
       const sandboxes = []
-      const mk = (o, f) => {
-        if (!o || !o[f]) return null
-        const sb = evalObjectScript(o[f].script, o[f].scriptproperties, {
-          shared, layer: {}, canvasSize: { x: 3840, y: 2160 }, onError: () => {},
-        })
-        if (sb) sandboxes.push(sb)
-        return sb
+      const sbOwner = new Map()
+      const runs = []
+      const obj = (id) => scene.layers.find((l) => l.id === id)
+      const LOCAL_SLOT = { origin: 'localOrigin', scale: 'localScale', angles: 'localAngles' }
+      for (const layer of scene.layers) {
+        const os = layer.objectScripts
+        if (!os) continue
+        for (const [field, def] of Object.entries(os)) {
+          const sb = evalObjectScript(def.script, def.scriptproperties, {
+            shared, layer,
+            canvasSize: { x: 3840, y: 2160, width: 3840, height: 2160 },
+            userProperties: project.general?.properties || {},
+            onError: () => {},
+          })
+          if (!sb) continue
+          sandboxes.push(sb)
+          // 记下宿主侧的归属信息：翻 shared.ck 的是按键 957 的 visible 脚本，
+          // 它没有 update，从 runs 里找不到（runs 只收 hasUpdate 的）。
+          sbOwner.set(sb, { layerId: layer.id, field })
+          const slot = LOCAL_SLOT[field] && Array.isArray(layer[LOCAL_SLOT[field]])
+            ? LOCAL_SLOT[field] : field
+          const fv = layer[slot]
+          const initArg = Array.isArray(fv)
+            ? { x: fv[0] ?? 0, y: fv[1] ?? 0, z: fv[2] ?? 0 }
+            : fv
+          sb.init(initArg)
+          sb.applyUserProperties(project.general?.properties || {})
+          if (sb.hasUpdate) runs.push({ layer, field, slot, sb, kind: field === 'visible' ? 'bool' : 'vec3' })
+        }
       }
-      const sbEngine = mk(obj(885), 'visible')   // 引擎层：装 helper，无 export
-      const sbBtn = mk(obj(957), 'visible')      // 按键：cursorClick 翻 shared.ck
-      const sbGrp = mk(obj(1061), 'origin')      // 父组：update 里读 helper 驱动位移
+      const dirty = collectTransformDirty(scene.layers, [])
+      const sbEngine = sandboxes.find((s) => !s.hasUpdate && !s.hasCursorHook) // 引擎层：无 update
+      // 翻 shared.ck 的是按键 957 的 **visible** 脚本，它没有 update
+      // （只导出 cursorClick + applyUserProperties），不能从 runs 里找。
+      const btnHooks = sandboxes.filter((s) => s.hasCursorHook && sbOwner.get(s)?.layerId === 957)
+      const sbBtn = btnHooks.length ? btnHooks : null
       if (!sbEngine) {
         fail('3786330502 id=885 引擎层沙箱为 null —— 宿主拿不到它的 engine，' +
           'shared 上的 helper 闭包会读到冻结在 0 的 runtime，动画闸门永不开启')
-      } else if (!sbBtn || !sbGrp) {
-        fail('3786330502 按键/父组脚本沙箱求值失败（用例过期）')
+      } else if (sbEngine.hasUpdate) {
+        fail('引擎层不该被判为有 update（会白占一个字段求值位）')
+      } else if (!sbBtn) {
+        fail('3786330502 按键 cursorClick 钩子缺失（用例过期）')
       } else {
-        if (sbEngine.hasUpdate) {
-          fail('引擎层不该被判为有 update（会白占一个字段求值位）')
-        }
-        sbGrp.init({ x: 1711, y: 30, z: 0 })
-        let val = { x: 1711, y: 30, z: 0 }
         let t = 0
-        // 宿主逐帧循环：**按沙箱回填时钟**，而不是只回填有 update 的那批
         const frame = () => {
           t += 1 / 60
           for (const sb of sandboxes) { sb.engine.frametime = 1 / 60; sb.engine.runtime = t }
-          const r = sbGrp.callUpdate(val)
-          if (r && 'x' in r) val = { x: r.x, y: r.y, z: r.z }
+          for (const r of runs) {
+            if (r.sb.disabled) continue
+            if (r.kind === 'vec3') {
+              const cur = r.layer[r.slot]
+              const v = { x: cur[0] || 0, y: cur[1] || 0, z: cur[2] || 0 }
+              const ret = r.sb.callUpdate(v)
+              const o = ret && typeof ret === 'object' && 'x' in ret ? ret : v
+              r.layer[r.slot] = [o.x || 0, o.y || 0, o.z || 0]
+            }
+          }
+          recomposeWorld(scene.layers, dirty)
         }
         for (let i = 0; i < 60; i++) frame()
-        const idle = val.x
-        sbBtn.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) })
-        for (let i = 0; i < 180; i++) frame()
-        const moved = val.x
-        if (Math.abs(idle - 1711) > 1) {
-          fail(`3786330502 静置 1s 后 origin.x 应停在 1711，实得 ${idle.toFixed(1)}`)
+        const gunIdle = obj(2243).origin[0]
+        const groupIdle = obj(1061).origin[0]
+        const btnIdle = obj(957).origin[0]
+        const beltY = obj(896).origin[1]
+        const gunIdleY = obj(2243).origin[1]
+        sbBtn.forEach((s) => s.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) }))
+        for (let i = 0; i < 300; i++) frame()
+        const gunMoved = obj(2243).origin[0]
+        const groupMoved = obj(1061).origin[0]
+        const btnMoved = obj(957).origin[0]
+        const gunMovedY = obj(2243).origin[1]
+        // 判据 1：脚本在 local 空间，静置时枪不动（world 停在 parse 烘好的 5520）。
+        // 之前喂 world 值会让脚本第一帧就往 local 目标 3600 滑，静置即漂移 1920px。
+        if (Math.abs(gunIdle - 5520) > 1) {
+          fail(`3786330502 静置 1s 枪 world.x 应 ≈5520（parse 烘好的初始位），实得 ${gunIdle.toFixed(1)}` +
+            '—— 对象脚本喂了 world 值而非 local，图层第一帧就跳位')
+        // 判据 2：父组 1061 动了，子层按键 957 必须跟着动。
+        // 之前父组 origin 写了但子层 world 早在 parse 阶段拍平，按键钉死在 3631。
+        } else if (Math.abs(btnIdle - btnMoved) < 100) {
+          fail(`3786330502 点击后按键位移 ${Math.abs(btnMoved-btnIdle).toFixed(0)}px < 100` +
+            '—— 父组 1061 动了，但子层按键 world 没重算（父子变换未逐帧合成）')
+        // 判据 3：枪 ck=2 目标 1875（local）= world ≈ 3795，应与兄弟层「带」
+        // （local 1905.9 → world 3825.9）差不多同一高度（y 差 ≈3px）。
+        // 这是独立于脚本之外的构图判据 —— 丝带缠在枪上，y 必须接近。
+        } else if (Math.abs(gunMovedY - beltY) > 30) {
+          fail(`3786330502 点击后枪 y=${gunMovedY.toFixed(1)} vs 带 y=${beltY.toFixed(1)}` +
+            `（差 ${Math.abs(gunMovedY-beltY).toFixed(1)}px）—— 丝带本该缠在枪上，` +
+            '高度差过大说明坐标空间仍不对')
+        // 判据 4：位移量合理，且 shared.ck 确实翻了
         } else if (Number(shared.ck) !== 2) {
           fail(`3786330502 点击后 shared.ck 应为 2，实得 ${shared.ck}`)
-        } else if (Math.abs(moved - 1000) > 5) {
-          fail(`3786330502 点击绿色箭头后父组应在 3s 内移到 x≈1000，实得 ${moved.toFixed(1)}` +
-            `（位移 ${Math.abs(moved - idle).toFixed(1)}px）—— 引擎层 engine.runtime 冻结在 0，` +
-            '动画 delay 闸门永不开启')
+        } else if (Math.abs(groupMoved - 2920) > 30) {
+          // 父 887 在 (1920,1080) + 父组 1061 local target 1000 = 2920
+          fail(`3786330502 点击后父组 1061 world.x 应 ≈2920，实得 ${groupMoved.toFixed(1)}`)
         } else {
-          ok(`3786330502 点击绿色箭头 → shared.ck=2 → 父组 origin.x ${idle.toFixed(0)}→${moved.toFixed(0)}` +
-            `（位移 ${Math.abs(moved - idle).toFixed(0)}px）`)
+          ok(`3786330502 点击绿箭头：枪 ${gunIdle.toFixed(0)}→${gunMoved.toFixed(0)}` +
+            `，按键随父组 ${btnIdle.toFixed(0)}→${btnMoved.toFixed(0)}` +
+            `，枪 y 与丝带差 ${Math.abs(gunMovedY-beltY).toFixed(1)}px`)
         }
       }
     }

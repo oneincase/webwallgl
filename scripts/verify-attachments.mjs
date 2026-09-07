@@ -91,8 +91,9 @@ function neckOf(parent, attName) {
   check(/function followAttachments/.test(ssrc), "followAttachments 缺失");
   check(/collectDesc/.test(ssrc) && /c\.origin\[0\] \+= d\[0\]/.test(ssrc),
     "applyAttachmentBindOrigins 必须把附着点位移传给子孙（空组头发/黍头下的眼睛）");
-  check(/f\.subtree/.test(ssrc) && /s\.layer\.origin\[0\] = s\.x/.test(ssrc),
-    "followAttachments 必须从子孙绑定快照重写，不能只写 f.layer、也不能在当前值上累加");
+  check(/f\.subtree/.test(ssrc) && /s\.layer\.origin\[0\] = b\[0\]/.test(ssrc) && /attachBase/.test(ssrc),
+    "followAttachments 必须从子孙绑定快照重写（attachBase 优先、退回挂载期 s.x/s.y），" +
+    "不能只写 f.layer、也不能拿 layer.origin 当基准累加");
 
   const mount = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/applyAttachmentBindOrigins\s*\(/.test(mount),
@@ -278,6 +279,51 @@ function neckOf(parent, attName) {
     const want = parentMeshToWorldDelta(parent, -1.12158 + 89.88184, -220.94214 + -31.72168);
     check(hypot(d[0] - want[0], d[1] - want[1]) < 2,
       `主发相对头发附着点应等于 头发local+主发local，期望 (${want[0].toFixed(1)},${want[1].toFixed(1)}) 实测 (${d[0].toFixed(1)},${d[1].toFixed(1)})`);
+  }
+}
+
+// ---------- 3786330502：祖先带脚本变换时，挂件必须跟着整组走 ----------
+// 人物组 550「主题1」的 origin 绑了脚本（点绿箭头后整组滑 700px）。它下面
+// 隔一层挂着 7 个 attachment 层（眼睛 / 眼泪×4 / 头发 / 眼眉）。
+//
+// followAttachments 原先每帧把挂件 origin 拍回**挂载期**快照 f.baseX/baseY，
+// 等于把祖先的位移整个撤销 —— 人物滑走、五官留在原地，人一分为二。
+// 修法是 recomposeWorld 每帧重写 layer.attachBase（绑定姿势世界位），
+// follow 从它重写再叠骨骼增量。
+//
+// 这条判据必须是**数值**的：只查 attachBase 出现在源码里抓不到「发布了但没接上」。
+{
+  const wp = loadWallpaper(3786330502);
+  if (!wp) {
+    fail("壁纸库缺少 3786330502");
+  } else {
+    const { recomposeWorld, collectTransformDirty } = await imp("renderer/vendor/we-scene/scene/parse.js");
+    attachPuppets(wp.scene, wp.parsed);
+    const follows = applyAttachmentBindOrigins(wp.scene.layers);
+    const dirty = collectTransformDirty(wp.scene.layers, follows.map((f) => f.layer));
+    // 人物组 550 的整棵子树里，挂件层应当被收进脏集合
+    const eyes = wp.scene.layers.find((l) => l.id === 626 && l.attachment === "眼睛");
+    check(!!eyes, "3786330502 应有 attachment='眼睛' 的眼睛层 (id=626)");
+    if (eyes) {
+      check(dirty.has(eyes.id), "眼睛（挂件）应进入 transform 脏集合，否则祖先动了它不会重算");
+      followAttachments(follows, 0, () => null);
+      const eyeBefore = [eyes.origin[0], eyes.origin[1]];
+      // 人物组 550 滑 700px（作者脚本 ck=2 时 origin.x 1920→1220）
+      const g550 = wp.scene.layers.find((l) => l.id === 550);
+      check(!!g550 && !!g550.localOrigin, "550 主题1 应有 localOrigin");
+      g550.localOrigin[0] -= 700;
+      recomposeWorld(wp.scene.layers, dirty);
+      followAttachments(follows, 0, () => null);
+      const dEye = eyes.origin[0] - eyeBefore[0];
+      check(Math.abs(dEye + 700) < 1,
+        `人物组滑 -700px 后眼睛应同量位移，实测 ${dEye.toFixed(1)}px` +
+        "（followAttachments 把 origin 拍回了挂载期快照，撤销了祖先位移 → 人物一分为二）");
+      // 幂等：连调两次仍是同一位置
+      const twice = [eyes.origin[0], eyes.origin[1]];
+      followAttachments(follows, 0, () => null);
+      check(hypot(eyes.origin[0] - twice[0], eyes.origin[1] - twice[1]) < 1e-6,
+        "祖先移动后 followAttachments 仍须幂等（连调两次同一 origin）");
+    }
   }
 }
 

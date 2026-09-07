@@ -27,6 +27,7 @@ const STABLE = [
   "verify-shaders",
   "verify-animation",
   "verify-attachments",
+  "verify-transform",
   "verify-media",
   "verify-pointer",
   "verify-groups",

@@ -150,27 +150,7 @@ export class ParticleSystem {
     // 图层变换：粒子在局部空间模拟，渲染时用它落到世界空间。
     // WE 语义：图层 origin 是发射器世界位置，scale 缩放整个系统（尺寸与速度同步缩放），
     // angles.z 旋转发射方向。忽略它们会让所有粒子堆在世界原点。
-    const lo = layer && layer.origin ? layer.origin : [0, 0, 0]
-    const ls = layer && layer.scale ? layer.scale : [1, 1, 1]
-    const la = layer && layer.angles ? layer.angles : [0, 0, 0]
-    this.originX = lo[0] || 0
-    this.originY = lo[1] || 0
-    this.originZ = lo[2] || 0
-    this.scaleX = ls[0] === 0 ? 1 : ls[0]
-    this.scaleY = ls[1] === 0 ? 1 : ls[1]
-    this.angleZ = ((la[2] || 0) * Math.PI) / 180
-    // 精灵的非等比拉伸：WE 里图层 scale 直接作用于精灵 quad，x/y 不等时精灵被拉长。
-    // 全库 92 个带 scale 的粒子层有 36 个是非等比的（如 light_shafts_1 的 22.6/12.2、
-    // fog1 的 10/1、Splash 的 1/0.15），它们靠拉伸把圆形贴图变成光柱/雨丝/横向雾带。
-    // 若只取平均值做等比缩放，这些系统会变成巨大的圆斑糊住半个屏幕。
-    // 故：位置用 scaleX/scaleY 各自缩放，精灵尺寸取较小轴为基准、较大轴作为拉伸比。
-    const asx = Math.abs(this.scaleX)
-    const asy = Math.abs(this.scaleY)
-    this.sysScale = Math.min(asx, asy) || 1
-    // 精灵 quad 的宽高拉伸倍率（相对 sysScale）
-    this.spriteStretchX = asx / this.sysScale
-    this.spriteStretchY = asy / this.sysScale
-
+    this.syncLayerTransform()
     this.maxCount = Math.max(1, Math.min(20000, num(this.model.maxcount, 100)))
     // 发射累加器改为按发射器各存一份（见 _step），此字段仅保留以防外部引用
     this.simTime = 0
@@ -649,6 +629,38 @@ export class ParticleSystem {
 
   setVisible(v) {
     this.visible = v
+  }
+
+  /**
+   * [we-scene patch] 从图层重新读取变换（构造时也走这里）。
+   *
+   * 发射器变换原先只在构造时缓存一次、之后**从不刷新**。父组一旦带脚本/动画
+   * 变换（全库 17 个粒子层有脚本化祖先），图层被 recomposeWorld 挪走了，
+   * 粒子却仍从旧位置喷出来 —— 画面上是「人物滑走了、他的火焰留在原地」。
+   * 宿主在 recompose 之后对脏子树里的粒子层调用本方法。
+   */
+  syncLayerTransform() {
+    const layer = this.layer
+    const lo = layer && layer.origin ? layer.origin : [0, 0, 0]
+    const ls = layer && layer.scale ? layer.scale : [1, 1, 1]
+    const la = layer && layer.angles ? layer.angles : [0, 0, 0]
+    this.originX = lo[0] || 0
+    this.originY = lo[1] || 0
+    this.originZ = lo[2] || 0
+    this.scaleX = ls[0] === 0 ? 1 : ls[0]
+    this.scaleY = ls[1] === 0 ? 1 : ls[1]
+    this.angleZ = ((la[2] || 0) * Math.PI) / 180
+    // 精灵的非等比拉伸：WE 里图层 scale 直接作用于精灵 quad，x/y 不等时精灵被拉长。
+    // 全库 92 个带 scale 的粒子层有 36 个是非等比的（如 light_shafts_1 的 22.6/12.2、
+    // fog1 的 10/1、Splash 的 1/0.15），它们靠拉伸把圆形贴图变成光柱/雨丝/横向雾带。
+    // 若只取平均值做等比缩放，这些系统会变成巨大的圆斑糊住半个屏幕。
+    // 故：位置用 scaleX/scaleY 各自缩放，精灵尺寸取较小轴为基准、较大轴作为拉伸比。
+    const asx = Math.abs(this.scaleX)
+    const asy = Math.abs(this.scaleY)
+    this.sysScale = Math.min(asx, asy) || 1
+    // 精灵 quad 的宽高拉伸倍率（相对 sysScale）
+    this.spriteStretchX = asx / this.sysScale
+    this.spriteStretchY = asy / this.sysScale
   }
 
   // 宿主每帧提供鼠标位置（世界像素）；转到局部空间供控制点使用
