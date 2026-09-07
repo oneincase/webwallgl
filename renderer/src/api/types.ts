@@ -49,6 +49,13 @@ export type Source = {
    * （暂停恢复、改属性都不该重新走一遍解析）。省略则不参与缓存。
    */
   readonly key?: string;
+  /**
+   * 释放本来源占用的资源。实例 destroy() / 换源时调用一次。
+   *
+   * 目前只有 `mediaSource(File)` 需要：本地文件走 `URL.createObjectURL`，
+   * 不 revoke 就是每换一次壁纸泄漏一个几十 MB 的 blob。
+   */
+  dispose?(): void;
 };
 
 /**
@@ -91,20 +98,84 @@ export type AudioSource = {
   snapshot(): { left: Float32Array | number[]; right: Float32Array | number[] };
 };
 
+/** WE 播放态：0=停止 1=播放 2=暂停（与 MediaPlaybackEvent 枚举一致） */
+export type MediaPlaybackState = 0 | 1 | 2;
+
 /**
- * 系统媒体信息提供者（"正在播放"类壁纸用）。默认是内置模拟源。
- * 接真实数据时替换本接口即可，字段名与 WE 的 media* 回调一致。
+ * 媒体配色的三元组。**必须是带链式方法的实例，不能是普通数组或对象**：
+ * 真实语料里的脚本会写 `event.primaryColor.subtract(old).multiply(t).add(old)`，
+ * 给数组会 TypeError 熔断整个脚本（症状是「换歌后整层不见了」）。
+ * 用 `createMediaSource()` 构造快照可自动保证类型正确。
+ */
+export type MediaColor = {
+  x: number;
+  y: number;
+  z: number;
+  add(o: MediaColor): MediaColor;
+  subtract(o: MediaColor): MediaColor;
+  multiply(k: number | MediaColor): MediaColor;
+};
+
+/** 系统媒体快照。字段名与 WE 的 media* 回调载荷一致 */
+export type MediaSnapshot = {
+  /** 有没有正在播放的媒体会话；false 时其余字段无意义 */
+  hasMedia: boolean;
+  state: MediaPlaybackState;
+  title: string;
+  artist: string;
+  album: string;
+  albumArtist: string;
+  /** 播放进度与总时长，单位**秒**（不是 0..1 比例） */
+  position: number;
+  duration: number;
+  hasThumbnail: boolean;
+  /** 封面取色。见 MediaColor 的类型约束 */
+  primaryColor: MediaColor;
+  secondaryColor: MediaColor;
+  tertiaryColor: MediaColor;
+  textColor: MediaColor;
+  highContrastColor: MediaColor;
+  /** 播放列表内的曲目序号（换歌检测用） */
+  trackIndex: number;
+  /** 歌词行：[秒, 文本][]，按时间升序 */
+  lyrics: Array<[number, string]>;
+  /** 当前歌词行与其下标（由 position 定位，库不重算） */
+  lyricLine: string;
+  lyricIndex: number;
+};
+
+/**
+ * 系统媒体源（"正在播放"类壁纸用）。默认是内置模拟源。
+ *
+ * **scene 与 web 壁纸共用同一个实例**：宿主装一次，两类壁纸看到同一份 Now Playing。
+ * 库每帧调 `update(tSec)` 推进、读 `snapshot` 取值，并自动 diff 出 WE 的
+ * mediaStatusChanged / mediaPropertiesChanged / mediaPlaybackChanged /
+ * mediaThumbnailChanged 四个回调派发给壁纸脚本。
+ *
+ * 五个控制方法是**反向控制**：壁纸里的"上一曲/下一曲/播放暂停"按钮会调到这里，
+ * 由你转发给真实播放器。库只负责调用并在之后立刻重新派发一次事件。
+ *
+ * 自己实现全部字段很繁琐，用 `createMediaSource(partial)` 只给已知字段即可。
  */
 export type MediaSource = {
-  snapshot(): {
-    playing: boolean;
-    title?: string;
-    artist?: string;
-    album?: string;
-    /** 0..1 播放进度 */
-    position?: number;
-    durationSeconds?: number;
-  };
+  /** 每帧由渲染循环推进（tSec 为场景时间，秒）。无状态的实现可留空函数 */
+  update?(tSec: number): void;
+  readonly snapshot: MediaSnapshot;
+  skipNext?(): void;
+  skipPrevious?(): void;
+  play?(): void;
+  pause?(): void;
+  playPause?(): void;
+};
+
+/** 壁纸侧可用的媒体控制面（SceneInstance.media） */
+export type MediaControl = {
+  readonly snapshot: MediaSnapshot;
+  skipNext(): MediaSnapshot;
+  skipPrevious(): MediaSnapshot;
+  play(): MediaSnapshot;
+  pause(): MediaSnapshot;
+  playPause(): MediaSnapshot;
 };
 
 /** 渲染开关。调试用，默认全开；对应旧 types.ts 的 SKIP_* 常量取反 */
@@ -174,7 +245,10 @@ export type MountOptions = {
    * 挂载后可用 `SceneInstance.setAudio()` 再换（SSE 等异步数据源常在挂载后才就绪）。
    */
   audio?: AudioSource | null;
-  /** 系统媒体源。**当前未接线**（默认内置模拟） */
+  /**
+   * 系统媒体源（Now Playing）。默认内置模拟；null = 禁用。
+   * scene 与 web 壁纸共用同一个实例；挂载后可用 `setMedia()` 再换。
+   */
   media?: MediaSource | null;
 
   /** 渲染开关（调试用）。**当前未接线** */
@@ -226,6 +300,22 @@ export type SceneInstance = {
    * 只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条泵。
    */
   setAudio(src: AudioSource | null): void;
+
+  /**
+   * 换系统媒体源（Now Playing）。传 null 回落内置模拟源。
+   *
+   * 与 `setAudio` 同纪律：**换场景不清空**，装一次对之后所有场景生效。
+   * scene 与 web 壁纸吃同一个实例。
+   */
+  setMedia(src: MediaSource | null): void;
+
+  /**
+   * 媒体控制面：读当前快照，以及壁纸侧同款的播放控制。
+   *
+   * 调用控制方法会转发给当前 media 源并**立即重新派发一次事件**，
+   * 壁纸里的歌名/封面/进度会同帧更新，不必等下一轮 diff。
+   */
+  readonly media: MediaControl;
 
   /**
    * 外部指针注入：把宿主轮询到的鼠标位置推进壁纸。

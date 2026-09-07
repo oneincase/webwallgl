@@ -573,7 +573,7 @@ function thumbDataUrlFromSnap(snap: {
 }
 
 type WebMediaDriver = {
-  update(tSec: number): unknown;
+  update?(tSec: number): unknown;
   snapshot: Record<string, unknown>;
 };
 
@@ -686,7 +686,8 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
     if (now - lastTick < 200) return; // 媒体进度按整秒 diff，200ms 足够
     lastTick = now;
     try {
-      driver.update(now / 1000);
+      // update 在宿主注入源上是可选的（外部事件驱动的实现不需要按帧推进）
+      driver.update?.(now / 1000);
       lastMedia = pushMediaDiff(rt, lastMedia, driver.snapshot);
     } catch {
       /* 忽略单帧失败 */
@@ -822,7 +823,11 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   const audioDriver: WebAudioDriver | null =
     cfgExt._webAudio === null ? null : (cfgExt._webAudio ?? defaultAudioDriver());
   const mediaDriver: WebMediaDriver | null =
-    cfgExt._webMedia === null ? null : (cfgExt._webMedia ?? defaultMediaDriver());
+    cfgExt._webMedia === null
+      ? null
+      : // [1.3.0] 宿主经公共 API 注入的媒体源优先，与 scene 装配路径读同一个引用：
+        // 装一次，scene 与 web 两类壁纸看到同一份 Now Playing
+        (cfgExt._webMedia ?? (rt.mediaSource as WebMediaDriver | null) ?? defaultMediaDriver());
 
   const finishBare = (why: string) => {
     reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`);

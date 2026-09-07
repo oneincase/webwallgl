@@ -17,9 +17,13 @@ import {
 import { mountWallpaper } from "../dispatch";
 import type { WallpaperConfig } from "../types";
 import { weShimCall } from "../web";
+import { sniffMediaType } from "./source";
+import { mediaColor } from "./media-source";
 import type {
   AudioSource,
   Fit,
+  MediaControl,
+  MediaSource,
   MountOptions,
   PropertyValue,
   SceneEvents,
@@ -110,9 +114,11 @@ async function resolveMountConfig(
   const mediaType = mediaProjectType(project);
   if (mediaType) {
     let url: string | undefined;
+    let entryType: string | undefined;
     try {
       const entry = await o.source.mediaEntry?.();
       url = entry?.url;
+      entryType = entry?.type;
     } catch {
       url = undefined;
     }
@@ -130,7 +136,42 @@ async function resolveMountConfig(
       );
     }
     const canvas = ensureSceneCanvas(el);
-    return { ...base, type: mediaType as WallpaperConfig["type"], src: url, canvas, source: o.source };
+    // mediaEntry 显式给的 type 可纠正 project.json（作者把 gif 标成 image 之类）
+    const finalType = MEDIA_TYPES.has(String(entryType).toLowerCase())
+      ? String(entryType).toLowerCase()
+      : mediaType;
+    return { ...base, type: finalType as WallpaperConfig["type"], src: url, canvas, source: o.source };
+  }
+  // [1.3.0] project.type 缺失或不认识时，按资源 URL 的扩展名嗅探。
+  //
+  // 两道闸门，缺一不可：
+  //  · 只在 Source 提供了 mediaEntry 时才试——有 mediaEntry 就说明调用方本来
+  //    就想放一段媒体；对普通 httpSource（壁纸包目录）不嗅探，免得把没有
+  //    project.json 的场景壁纸误判成媒体。
+  //  · **project.type 已经明确声明过就绝不覆盖**（哪怕它声明的是 scene）。
+  //    作者说了算：某些场景壁纸的 project.file 确实指向 .mp4（那是场景里的
+  //    视频纹理素材，不是"这张壁纸是个视频"），嗅探覆盖它会整张壁纸走错路径。
+  const declaredType =
+    typeof (project as { type?: unknown } | null)?.type === "string"
+      ? String((project as { type: string }).type).trim()
+      : "";
+  if (!declaredType && typeof o.source.mediaEntry === "function") {
+    let url: string | undefined;
+    let entryType: string | undefined;
+    try {
+      const entry = await o.source.mediaEntry();
+      url = entry?.url;
+      entryType = entry?.type;
+    } catch {
+      url = undefined;
+    }
+    const sniffed =
+      (MEDIA_TYPES.has(String(entryType).toLowerCase()) ? String(entryType).toLowerCase() : null) ??
+      (url ? sniffMediaType(url) : null);
+    if (url && sniffed) {
+      const canvas = ensureSceneCanvas(el);
+      return { ...base, type: sniffed as WallpaperConfig["type"], src: url, canvas, source: o.source };
+    }
   }
   // 其余一律走场景装配
   const canvas = ensureSceneCanvas(el);
@@ -197,6 +238,9 @@ export function createScene(
     // rt.audioBridge —— 否则 load() 换场景会把 setAudio() 装好的宿主源
     // 冲回 undefined（挂载选项里本来就没有 audio 这一项）。
     if ("audio" in o) applyAudio(o.audio ?? null);
+    // 媒体源同理：只在选项里显式出现时才动 rt.mediaSource，否则 load() 换场景
+    // 会把 setMedia() 装好的宿主源冲掉
+    if ("media" in o) rt.mediaSource = o.media ?? null;
   };
 
   /** 把公共 AudioSource 接到运行时的拉模式桥；null = 回落内置模拟源 */
@@ -310,6 +354,36 @@ export function createScene(
       applyAudio(src);
     },
 
+    // 系统媒体源。与 setAudio 同纪律：只存引用、换场景不清空，
+    // scene 与 web 两条装配路径读同一个 rt.mediaSource。
+    setMedia(src: MediaSource | null) {
+      currentOptions = { ...currentOptions, media: src };
+      rt.mediaSource = src ?? null;
+    },
+
+    // 媒体控制面。装配后由 mountScene 写入 rt.mediaCtl；未装配（或媒体/网页
+    // 壁纸尚无控制面）时给一个惰性替身，读快照得空、控制方法静默无效 ——
+    // 让调用方能无条件 `wp.media.playPause()` 而不必先判空。
+    get media(): MediaControl {
+      const ctl = rt.mediaCtl as unknown as MediaControl | undefined;
+      if (ctl) return ctl;
+      const empty = {
+        hasMedia: false, state: 0, title: "", artist: "", album: "", albumArtist: "",
+        position: 0, duration: 0, hasThumbnail: false,
+        primaryColor: mediaColor(0, 0, 0), secondaryColor: mediaColor(0, 0, 0),
+        tertiaryColor: mediaColor(0, 0, 0), textColor: mediaColor(1, 1, 1),
+        highContrastColor: mediaColor(1, 1, 1),
+        trackIndex: 0, lyrics: [] as Array<[number, string]>, lyricLine: "", lyricIndex: -1,
+      } as MediaControl["snapshot"];
+      const noop = () => empty;
+      return {
+        get snapshot() {
+          return empty;
+        },
+        skipNext: noop, skipPrevious: noop, play: noop, pause: noop, playPause: noop,
+      };
+    },
+
     // 外部指针注入。pointerCtl 由 mountScene / mountWeb 各自装配时设置，
     // 媒体壁纸不设 —— 那时这里静默无效，与整页渲染器的 __wp.pushPointer 一致。
     pushPointer(u: number, v: number, buttons?: number) {
@@ -320,6 +394,16 @@ export function createScene(
     },
 
     async load(source: Source) {
+      // 换源前释放旧源（mediaSource(File) 的 objectURL）。同一个源重复 load
+      // 不释放：那会把还在用的 blob URL revoke 掉，视频立刻变黑。
+      const prev = currentOptions.source;
+      if (prev && prev !== source) {
+        try {
+          prev.dispose?.();
+        } catch {
+          /* 忽略 */
+        }
+      }
       currentOptions = { ...currentOptions, source };
       wireOptions(currentOptions);
       const cfg = await resolveMountConfig(boundEl, currentOptions);
@@ -353,6 +437,13 @@ export function createScene(
     },
     destroy() {
       destroyRuntime(rt);
+      // 释放来源占用的资源：mediaSource(File) 的 objectURL 不 revoke
+      // 就是每换一次壁纸泄漏一个几十 MB 的 blob
+      try {
+        currentOptions.source?.dispose?.();
+      } catch {
+        /* 释放失败不阻断销毁 */
+      }
       rt.onDiagnostic = undefined;
       rt.onError = undefined;
       rt.onFirstFrame = undefined;

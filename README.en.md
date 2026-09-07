@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -142,6 +142,8 @@ input.addEventListener("change", () => {
 | `setProperties(props)` | Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch |
 | `getProperties()` | The current flattened property value map |
 | `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only |
+| `setMedia(src)` | Swap the system media source (Now Playing); shared by scene and web, survives scene changes |
+| `media` | Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control |
 | `pushPointer(u, v, buttons?)` | Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web |
 | `pointerLeave()` | Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump) |
 | `load(source)` | Switch scenes reusing the same canvas and WebGL context; resolves after the first frame |
@@ -189,9 +191,62 @@ console.log(wp.info); // { width, height, layerCount, ... }
 ```
 
 - A video wallpaper's asset URL comes from Source.mediaEntry(); httpSource implements it (reads project.json's file field and joins {base}/{file})
-- A custom Source without mediaEntry falls back to {source.key}/{project.file}; if neither yields a URL, mount throws — media has no conventional filename like index.html, so guessing one would only 404
-- fileSource / bytesSource only carry scene.pkg bytes and cannot supply a video URL, so they do not support media wallpapers
+- For arbitrary video/images use mediaSource(): mediaSource(url) or mediaSource(file) — the type is inferred from the extension, no project.json needed
+- An explicit project.type always wins; sniffing only fills in when it is absent — some scene wallpapers point project.file at an .mp4 (a video texture inside the scene, not "this wallpaper is a video")
 - Media wallpapers need WebGL2; when it is unavailable the failure arrives via onError for you to handle — the library does not silently switch to DOM rendering
+- pause/resume, setVolume, setFps and setFit all work on media wallpapers too (setVolume drives the &lt;video> element's volume and muted directly)
+
+```
+import { mount, mediaSource } from "webwallgl";
+
+// Remote video: type inferred from the extension; a signed URL's ?query is stripped correctly
+await mount(box, { source: mediaSource("https://cdn/clip.mp4?token=…") });
+
+// Local import: a video/image from drag & drop or <input type=file>
+input.addEventListener("change", async () => {
+  const wp = await mount(box, { source: mediaSource(input.files[0]) });
+  // destroy() revokes the objectURL the library created internally
+});
+
+// Specify explicitly when the extension is unreliable
+mediaSource(streamUrl, { type: "video" });
+```
+
+## System media (Now Playing) & transport control
+
+"Now Playing" wallpapers read the title, artist, progress, cover palette and lyrics; some also have previous/next/play-pause buttons. All of it comes from a single MediaSource — **scene and web wallpapers share one instance**, so the host maintains a single driver and both wallpaper types see the same data.
+
+```
+import { mount, createMediaSource } from "webwallgl";
+
+// Supply only what you have; the library fills in palette, lyric line and trackIndex
+const media = createMediaSource(
+  { title: "Night Star", artist: "Phase Shift", playing: true,
+    position: 30, duration: 212,
+    lyrics: [[0, "first line"], [20, "second line"]] },
+  // Transport control: wallpaper buttons call these; forward them to the real player
+  { skipNext: () => player.next(),
+    playPause: () => player.toggle() },
+);
+
+const wp = await mount(box, { source, media });
+
+// Update when the system's Now Playing changes (the lyric line re-resolves from position)
+media.set({ title: "Next Track", position: 0 });
+
+// You can also install / swap / remove it after mounting
+wp.setMedia(media);
+wp.setMedia(null);        // fall back to the built-in simulation
+
+// The host can read the snapshot and issue transport commands too
+console.log(wp.media.snapshot.title);
+wp.media.playPause();
+```
+
+- The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you
+- All transport methods are optional: if you only provide metadata, wallpaper buttons are silently inert rather than throwing
+- setMedia survives scene changes: install once and it applies to every scene loaded afterwards
+- For video wallpapers the audio spectrum is captured from the &lt;video> automatically (visualizers react to the video's own audio); an explicit setAudio() injection takes precedence
 
 ## Injecting pointer & audio
 
@@ -266,14 +321,24 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.2.0. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.0. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.0` | 2026-09-08 | mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web |
 | `1.2.0` | 2026-09-08 | Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports) |
 | `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
+
+1.3.0 continues directly from 1.2.0, closing four more items reported by the downstream host:
+
+- New mediaSource(urlOrFile): any video or image can be a wallpaper, from a remote URL or a local File (drag & drop). The library revokes the objectURL on destroy()/source swap — without that, every wallpaper change would leak a multi-megabyte blob
+- Type sniffing: with no project.type the URL extension decides (correctly stripping a signed URL's ?query and #hash), falling back to scene only when unrecognized. An explicit project.type always wins and is never overridden
+- setVolume now works on media wallpapers (previously a complete no-op — volume only reached the scene audio graph). It writes both volume and muted, since changing volume on a muted &lt;video> does nothing; if unmuting is blocked by the autoplay policy that is reported via onDiagnostic rather than silently swallowed
+- MediaSource was widened to the driver's real contract (an 18-field snapshot plus five optional transport methods) and is now **one shared instance across scene and web** — previously each side created its own simulation with no way for the host to inject. The new createMediaSource() takes only the fields you have and fills in palette, lyric line and trackIndex, guaranteeing chainable color instances
+- New SceneInstance.setMedia() and a media control surface (snapshot plus previous/next/play-pause); transport commands forward straight to the host driver, and host-side data updates are visible to the engine in the same frame
+- Video wallpapers capture their spectrum from the &lt;video> itself so visualizers react to the video's own audio; an explicit setAudio() injection takes precedence
 
 1.2.0 closes three gaps where the runtime capability already worked but was never exposed through the library entry (reported by the downstream host wallpaperEM):
 

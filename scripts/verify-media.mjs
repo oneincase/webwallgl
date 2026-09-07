@@ -1024,6 +1024,176 @@ const { check, errors } = createChecker();
   );
 }
 
+// ---------- 9. 媒体来源、类型嗅探、媒体流 API（1.3.0 四项） ----------
+//
+// 这一节全部**抽真函数执行**，不用正则看形状：上一轮的教训是把
+// `mediaProjectType(project)` 短路成 null 之后，函数定义与 `type: mediaType`
+// 那行都还在源码里，正则断言照绿而缺陷已复现。
+{
+  const esbuild = await import("esbuild");
+  const tmpFiles = [];
+  const bundleTo = async (entry, name) => {
+    const out = await esbuild.build({
+      entryPoints: [join(ROOT, entry)],
+      bundle: true, write: false, format: "esm", platform: "neutral", target: "es2022",
+    });
+    const p = join(ROOT, "scripts", `.tmp-vm-${name}-${process.pid}.mjs`);
+    fs.writeFileSync(p, out.outputFiles[0].text);
+    tmpFiles.push(p);
+    return pathToFileURL(p).href;
+  };
+
+  try {
+    const srcUrl = await bundleTo("renderer/src/api/source.ts", "source");
+    const src = await import(srcUrl + `?t=${Date.now()}`);
+
+    // --- 9a. 扩展名嗅探真值表 ---
+    const sniff = src.sniffMediaType;
+    check(typeof sniff === "function", "source.ts 必须导出 sniffMediaType");
+    if (typeof sniff === "function") {
+      const T = [
+        ["a.mp4", "video"], ["a.MP4", "video"], ["x/y/b.webm", "video"],
+        ["clip.mov", "video"], ["c.gif", "gif"], ["d.png", "image"],
+        ["e.jpeg", "image"], ["f.avif", "image"], ["/abs/pic.WEBP", "image"],
+        // query / hash 必须先剥掉：签名 URL 在真实 CDN 上极常见，
+        // 对整串取后缀会拿到 "mp4?token=…" 这种永远匹配不上的东西
+        ["g.mp4?token=abc&Expires=1", "video"], ["h.png#frag", "image"],
+        ["i.mp4?a=1#b", "video"],
+        // 认不出的必须返回 null（宁可落回 scene，也不要嗅出一个必定黑屏的类型）
+        ["no-ext", null], ["j.mkv", null], ["k.txt", null], ["", null],
+      ];
+      for (const [input, want] of T) {
+        const got = sniff(input);
+        check(got === want, `sniffMediaType(${JSON.stringify(input)}) 应为 ${want}，实得 ${got}`);
+      }
+    }
+
+    // --- 9b. mediaSource 工厂 ---
+    const mediaSource = src.mediaSource;
+    check(typeof mediaSource === "function", "source.ts 必须导出 mediaSource");
+    if (typeof mediaSource === "function") {
+      const s1 = mediaSource("https://cdn/a.mp4");
+      const p1 = await s1.project();
+      check(p1 && p1.type === "video", `mediaSource(URL) 应嗅出 video，实得 ${JSON.stringify(p1)}`);
+      const e1 = await s1.mediaEntry();
+      check(e1 && e1.url === "https://cdn/a.mp4", "mediaSource.mediaEntry 应返回原 URL");
+      // scenePkg 必须抛明确错误，不能返回空字节假装成功：那样失败会推迟到
+      // pkg 解析阶段报成「魔数不对」，与真因（这压根不是场景壁纸）差太远
+      let threw = "";
+      try { await s1.scenePkg(); } catch (e) { threw = String(e && e.message); }
+      check(/scene\.pkg/.test(threw), `mediaSource.scenePkg 应抛明确错误，实得: ${threw || "未抛错"}`);
+      // 显式 type 跳过嗅探
+      const s2 = mediaSource("https://cdn/whatever", { type: "image" });
+      const p2 = await s2.project();
+      check(p2 && p2.type === "image", "mediaSource 的显式 type 应生效");
+      // 本地 File：objectURL 必须能被 dispose 回收，否则每换一次壁纸泄漏几十 MB
+      const revoked = [];
+      const created = [];
+      globalThis.URL = globalThis.URL || {};
+      const origCreate = globalThis.URL.createObjectURL;
+      const origRevoke = globalThis.URL.revokeObjectURL;
+      globalThis.URL.createObjectURL = (b) => { const u = "blob:fake/" + created.length; created.push(u); return u; };
+      globalThis.URL.revokeObjectURL = (u) => revoked.push(u);
+      try {
+        const fakeFile = { name: "movie.mp4", size: 1234, lastModified: 42, type: "video/mp4" };
+        const s3 = mediaSource(fakeFile);
+        const p3 = await s3.project();
+        check(p3 && p3.type === "video", `mediaSource(File) 应按 blob.type 判定 video，实得 ${JSON.stringify(p3)}`);
+        const e3 = await s3.mediaEntry();
+        check(created.length === 1 && e3.url === created[0], "mediaSource(File) 应走 createObjectURL");
+        s3.dispose();
+        check(revoked.length === 1 && revoked[0] === created[0],
+          `mediaSource(File).dispose() 必须 revoke objectURL（否则每换一次壁纸泄漏一个 blob），实得 revoked=${revoked.length}`);
+        check(typeof s3.key === "string" && /movie\.mp4/.test(s3.key), "mediaSource(File) 应有稳定 key");
+      } finally {
+        globalThis.URL.createObjectURL = origCreate;
+        globalThis.URL.revokeObjectURL = origRevoke;
+      }
+    }
+
+    // --- 9c. createMediaSource：补全 18 字段且颜色必须可链式调用 ---
+    const msUrl = await bundleTo("renderer/src/api/media-source.ts", "mediasrc");
+    const ms = await import(msUrl + `?t=${Date.now()}`);
+    check(typeof ms.createMediaSource === "function", "必须导出 createMediaSource");
+    if (typeof ms.createMediaSource === "function") {
+      const m = ms.createMediaSource(
+        { title: "夜航星", artist: "相位迁移", playing: true, position: 30, duration: 212,
+          lyrics: [[0, "第一行"], [20, "第二行"], [60, "第三行"]] },
+        { skipNext() { this.called = true; } },
+      );
+      const s = m.snapshot;
+      const need = ["hasMedia","state","title","artist","album","albumArtist","position","duration",
+        "hasThumbnail","primaryColor","secondaryColor","tertiaryColor","textColor",
+        "highContrastColor","trackIndex","lyrics","lyricLine","lyricIndex"];
+      const missing = need.filter((k) => !(k in s));
+      check(missing.length === 0, `createMediaSource 快照缺字段: ${missing.join(",")}`);
+      check(s.title === "夜航星" && s.state === 1, "createMediaSource 应保留传入字段");
+      // 歌词行按 position 定位（30s → 第二行）
+      check(s.lyricLine === "第二行" && s.lyricIndex === 1,
+        `歌词行应按 position 定位，实得 ${s.lyricLine}/${s.lyricIndex}`);
+      // **颜色必须能链式调用**：语料脚本写 c.subtract(o).multiply(t).add(o)，
+      // 给普通数组会 TypeError 熔断整个脚本（症状是「换歌后整层不见了」）
+      for (const key of ["primaryColor","secondaryColor","tertiaryColor","textColor","highContrastColor"]) {
+        const c = s[key];
+        check(c && typeof c.subtract === "function" && typeof c.multiply === "function"
+          && typeof c.add === "function", `${key} 必须是可链式调用的颜色实例（不能是数组/字面量）`);
+      }
+      const mixed = s.primaryColor.subtract(s.secondaryColor).multiply(0.5).add(s.secondaryColor);
+      check(mixed && Number.isFinite(mixed.x), "颜色链式运算应返回有限数值");
+      // set() 后快照重建
+      m.set({ title: "新歌", position: 65 });
+      check(m.snapshot.title === "新歌" && m.snapshot.lyricLine === "第三行",
+        "set() 后快照与歌词行应重算");
+    }
+  } finally {
+    for (const p of tmpFiles) { try { fs.unlinkSync(p); } catch { /* 忽略 */ } }
+  }
+
+  // --- 9d. 接线面（这几条查的是「有没有接」，行为由上面的真执行覆盖）---
+  const mountTs = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const typesTs = fs.readFileSync(join(ROOT, "renderer/src/api/types.ts"), "utf8");
+  const sceneTs = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const webTs = fs.readFileSync(join(ROOT, "renderer/src/web.ts"), "utf8");
+  const mediaTs = fs.readFileSync(join(ROOT, "renderer/src/media.ts"), "utf8");
+
+  // scene 与 web 必须读同一个 rt.mediaSource（"只维护一套 driver"）。
+  // 断言要求**赋值语句**而不是出现 rt.mediaSource 字样：注释里也会写这个名字，
+  // 只匹配名字的话把赋值改掉、注释留着就照绿（本轮故意改坏时已踩过一次）。
+  check(/mediaDriver[^\n]*=[^\n]*rt\.mediaSource/.test(sceneTs),
+    "scene-mount.ts 的 mediaDriver 必须以 rt.mediaSource 为优先来源（两侧共用同一 driver）");
+  check(/=[^\n]*rt\.mediaSource[^\n]*\?\?/.test(webTs) || /rt\.mediaSource as WebMediaDriver/.test(webTs),
+    "web.ts 必须读 rt.mediaSource（两侧共用同一 driver）");
+  check(/"media" in o/.test(mountTs),
+    'wireOptions 必须用 `"media" in o` 判定（无条件覆盖会让 load() 冲掉 setMedia 装的源）');
+  check(/setMedia\(src: MediaSource \| null\)/.test(typesTs), "SceneInstance 必须声明 setMedia");
+  check(/readonly media: MediaControl/.test(typesTs), "SceneInstance 必须声明 media 控制面");
+  // 推进的必须是当前 driver，不能写死 simMedia（注入源就收不到 update）
+  check(!/else simMedia\.update\(t\)/.test(sceneTs),
+    "scene 渲染循环不得写死推进 simMedia（注入的 driver 会收不到 update）");
+  check(/mediaDriver as any\)\?\.update/.test(sceneTs) || /mediaDriver\)\.update\(t\)/.test(sceneTs),
+    "scene 渲染循环必须推进当前生效的 mediaDriver");
+
+  // 媒体壁纸的音量控制
+  check(/rt\.sceneAudio\s*=/.test(mediaTs),
+    "media.ts 必须设 rt.sceneAudio（否则 setVolume 对视频壁纸完全无效）");
+  check(/\.muted\s*=/.test(mediaTs) && /\.volume\s*=/.test(mediaTs),
+    "media.ts 的音量控制必须同时写 volume 与 muted（<video muted> 下改 volume 无效）");
+
+  // <video> 频谱自动接管：**必须 connect(destination)**，否则视频直接静音
+  check(/createMediaElementSource/.test(mediaTs), "media.ts 应从 <video> 取频谱");
+  const specStart = mediaTs.indexOf("function attachVideoSpectrum");
+  const specBody = specStart >= 0 ? mediaTs.slice(specStart, mediaTs.indexOf("\n}", specStart)) : "";
+  check(specBody.length > 0, "找不到 attachVideoSpectrum 函数体");
+  check(/connect\(\s*ctx\.destination\s*\)/.test(specBody),
+    "频谱接管必须 connect(ctx.destination)：createMediaElementSource 会把音频从默认输出摘走，不接回去视频就彻底没声了");
+  check(/if \(rt\.audioBridge\) return/.test(specBody),
+    "宿主已 setAudio 注入时不得抢占（显式注入优先）");
+
+  // Source.dispose 要真的被调用
+  check(/source\?\.dispose\?\.\(\)/.test(mountTs) || /prev\.dispose\?\.\(\)/.test(mountTs),
+    "destroy()/load() 必须调用 Source.dispose（否则 mediaSource(File) 的 blob 泄漏）");
+}
+
 if (errors.length) {
   console.error(`verify-media: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

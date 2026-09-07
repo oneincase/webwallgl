@@ -240,6 +240,8 @@ export const DOC: DocSection[] = [
           [{ zh: "setProperties(props)", en: "setProperties(props)" }, { zh: "属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包", en: "Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch" }],
           [{ zh: "getProperties()", en: "getProperties()" }, { zh: "当前生效的扁平化属性值表", en: "The current flattened property value map" }],
           [{ zh: "setAudio(src)", en: "setAudio(src)" }, { zh: "换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效", en: "Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only" }],
+          [{ zh: "setMedia(src)", en: "setMedia(src)" }, { zh: "换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空", en: "Swap the system media source (Now Playing); shared by scene and web, survives scene changes" }],
+          [{ zh: "media", en: "media" }, { zh: "媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制", en: "Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control" }],
           [{ zh: "pushPointer(u, v, buttons?)", en: "pushPointer(u, v, buttons?)" }, { zh: "外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效", en: "Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web" }],
           [{ zh: "pointerLeave()", en: "pointerLeave()" }, { zh: "指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下）", en: "Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump)" }],
           [{ zh: "load(source)", en: "load(source)" }, { zh: "换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve", en: "Switch scenes reusing the same canvas and WebGL context; resolves after the first frame" }],
@@ -318,9 +320,46 @@ export const DOC: DocSection[] = [
         k: "ul",
         items: [
           { zh: "视频壁纸的资源地址由 Source.mediaEntry() 给出；httpSource 已实现（读 project.json 的 file 字段拼 {基址}/{file}）", en: "A video wallpaper's asset URL comes from Source.mediaEntry(); httpSource implements it (reads project.json's file field and joins {base}/{file})" },
-          { zh: "自定义 Source 若不实现 mediaEntry，会退回 {source.key}/{project.file}；两者都给不出就抛错——媒体没有 index.html 那样的惯例文件名，猜一个只会 404", en: "A custom Source without mediaEntry falls back to {source.key}/{project.file}; if neither yields a URL, mount throws — media has no conventional filename like index.html, so guessing one would only 404" },
-          { zh: "fileSource / bytesSource 只承载 scene.pkg 字节，拿不到视频地址，因此不支持媒体壁纸", en: "fileSource / bytesSource only carry scene.pkg bytes and cannot supply a video URL, so they do not support media wallpapers" },
+          { zh: "放任意视频/图片用 mediaSource()：mediaSource(url) 或 mediaSource(file)，按扩展名自动判类型，无需 project.json", en: "For arbitrary video/images use mediaSource(): mediaSource(url) or mediaSource(file) — the type is inferred from the extension, no project.json needed" },
+          { zh: "project.type 若已显式声明则永远优先，嗅探只在它缺失时兜底——有些场景壁纸的 project.file 指向 .mp4（那是场景内的视频纹理素材，不是「这张壁纸是个视频」）", en: "An explicit project.type always wins; sniffing only fills in when it is absent — some scene wallpapers point project.file at an .mp4 (a video texture inside the scene, not \"this wallpaper is a video\")" },
           { zh: "媒体壁纸需要 WebGL2；不可用时走 onError 交给调用方决定，库不自作主张换 DOM 渲染", en: "Media wallpapers need WebGL2; when it is unavailable the failure arrives via onError for you to handle — the library does not silently switch to DOM rendering" },
+          { zh: "pause/resume、setVolume、setFps、setFit 对媒体壁纸同样生效（setVolume 直接控制 <video> 的 volume 与 muted）", en: "pause/resume, setVolume, setFps and setFit all work on media wallpapers too (setVolume drives the <video> element's volume and muted directly)" },
+        ],
+      },
+      {
+        k: "code",
+        v: {
+          zh: "import { mount, mediaSource } from \"webwallgl\";\n\n// 远程视频：按扩展名判类型，签名 URL 的 ?query 会被正确剥掉\nawait mount(box, { source: mediaSource(\"https://cdn/clip.mp4?token=…\") });\n\n// 本地导入：拖拽或 <input type=file> 进来的视频/图片\ninput.addEventListener(\"change\", async () => {\n  const wp = await mount(box, { source: mediaSource(input.files[0]) });\n  // destroy() 时库会自动 revoke 内部创建的 objectURL\n});\n\n// 扩展名不可靠时显式指定\nmediaSource(streamUrl, { type: \"video\" });",
+          en: "import { mount, mediaSource } from \"webwallgl\";\n\n// Remote video: type inferred from the extension; a signed URL's ?query is stripped correctly\nawait mount(box, { source: mediaSource(\"https://cdn/clip.mp4?token=…\") });\n\n// Local import: a video/image from drag & drop or <input type=file>\ninput.addEventListener(\"change\", async () => {\n  const wp = await mount(box, { source: mediaSource(input.files[0]) });\n  // destroy() revokes the objectURL the library created internally\n});\n\n// Specify explicitly when the extension is unreliable\nmediaSource(streamUrl, { type: \"video\" });",
+        },
+      },
+    ],
+  },
+  {
+    id: "now-playing",
+    title: { zh: "系统媒体（Now Playing）与反向控制", en: "System media (Now Playing) & transport control" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "「正在播放」类壁纸要读歌名、歌手、进度、封面配色与歌词，部分还带上一曲/下一曲/播放暂停按钮。这些统一由一个 MediaSource 提供 —— **scene 与 web 壁纸共用同一个实例**，宿主只需维护一套 driver，两类壁纸看到同一份数据。",
+          en: "\"Now Playing\" wallpapers read the title, artist, progress, cover palette and lyrics; some also have previous/next/play-pause buttons. All of it comes from a single MediaSource — **scene and web wallpapers share one instance**, so the host maintains a single driver and both wallpaper types see the same data.",
+        },
+      },
+      {
+        k: "code",
+        v: {
+          zh: "import { mount, createMediaSource } from \"webwallgl\";\n\n// 只给你拿得到的字段，其余（配色、歌词行、trackIndex）由库补齐\nconst media = createMediaSource(\n  { title: \"夜航星\", artist: \"相位迁移\", playing: true,\n    position: 30, duration: 212,\n    lyrics: [[0, \"第一句\"], [20, \"第二句\"]] },\n  // 反向控制：壁纸里的按钮会调到这里，你转发给真实播放器\n  { skipNext: () => player.next(),\n    playPause: () => player.toggle() },\n);\n\nconst wp = await mount(box, { source, media });\n\n// 系统 Now Playing 变化时更新（歌词行会按 position 自动重算）\nmedia.set({ title: \"下一首\", position: 0 });\n\n// 也可以挂载后再装／换／撤\nwp.setMedia(media);\nwp.setMedia(null);        // 回落内置模拟源\n\n// 宿主侧也能读快照与发控制指令\nconsole.log(wp.media.snapshot.title);\nwp.media.playPause();",
+          en: "import { mount, createMediaSource } from \"webwallgl\";\n\n// Supply only what you have; the library fills in palette, lyric line and trackIndex\nconst media = createMediaSource(\n  { title: \"Night Star\", artist: \"Phase Shift\", playing: true,\n    position: 30, duration: 212,\n    lyrics: [[0, \"first line\"], [20, \"second line\"]] },\n  // Transport control: wallpaper buttons call these; forward them to the real player\n  { skipNext: () => player.next(),\n    playPause: () => player.toggle() },\n);\n\nconst wp = await mount(box, { source, media });\n\n// Update when the system's Now Playing changes (the lyric line re-resolves from position)\nmedia.set({ title: \"Next Track\", position: 0 });\n\n// You can also install / swap / remove it after mounting\nwp.setMedia(media);\nwp.setMedia(null);        // fall back to the built-in simulation\n\n// The host can read the snapshot and issue transport commands too\nconsole.log(wp.media.snapshot.title);\nwp.media.playPause();",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足", en: "The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you" },
+          { zh: "控制方法全是可选的：只提供元数据、不支持控制时，壁纸里的按钮点了静默无效，不会报错", en: "All transport methods are optional: if you only provide metadata, wallpaper buttons are silently inert rather than throwing" },
+          { zh: "setMedia 换场景不清空，装一次对之后所有场景生效", en: "setMedia survives scene changes: install once and it applies to every scene loaded afterwards" },
+          { zh: "视频壁纸的音频频谱会自动从 <video> 取（音条能跟着视频里的音乐动），宿主已用 setAudio 显式注入时则不接管", en: "For video wallpapers the audio spectrum is captured from the <video> automatically (visualizers react to the video's own audio); an explicit setAudio() injection takes precedence" },
         ],
       },
     ],
@@ -450,10 +489,29 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.0", en: "1.3.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver", en: "mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web" }],
           [{ zh: "1.2.0", en: "1.2.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈）", en: "Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports)" }],
           [{ zh: "1.1.0", en: "1.1.0" }, { zh: "2026-09-07", en: "2026-09-07" }, { zh: "外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全", en: "External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics" }],
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.0 是 1.2.0 的直接延续，继续按下游宿主的反馈补齐（四项）：",
+          en: "1.3.0 continues directly from 1.2.0, closing four more items reported by the downstream host:",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "新增 mediaSource(urlOrFile)：任意视频/图片可直接当壁纸，支持远程 URL 与本地 File（拖拽导入）。本地文件的 objectURL 由库在 destroy()/换源时自动 revoke——不 revoke 就是每换一次壁纸泄漏一个几十 MB 的 blob", en: "New mediaSource(urlOrFile): any video or image can be a wallpaper, from a remote URL or a local File (drag & drop). The library revokes the objectURL on destroy()/source swap — without that, every wallpaper change would leak a multi-megabyte blob" },
+          { zh: "类型嗅探：project.type 缺失时按 URL 扩展名判定（正确剥掉签名 URL 的 ?query 与 #hash），认不出才落回 scene。显式声明的 project.type 永远优先，不会被嗅探覆盖", en: "Type sniffing: with no project.type the URL extension decides (correctly stripping a signed URL's ?query and #hash), falling back to scene only when unrecognized. An explicit project.type always wins and is never overridden" },
+          { zh: "媒体壁纸现在支持 setVolume（此前完全无效：音量只打到 scene 的音频节点）。同时写 volume 与 muted——<video muted> 下只改 volume 一点用都没有；取消静音被自动播放策略拒绝时经 onDiagnostic 如实报出，不静默吞掉", en: "setVolume now works on media wallpapers (previously a complete no-op — volume only reached the scene audio graph). It writes both volume and muted, since changing volume on a muted <video> does nothing; if unmuting is blocked by the autoplay policy that is reported via onDiagnostic rather than silently swallowed" },
+          { zh: "MediaSource 扩成 driver 的真实契约（18 字段快照 + 5 个可选控制方法），并由 scene 与 web **共用同一个实例**——此前两侧各自 new 一份模拟源，宿主无从注入。新增 createMediaSource() 只需给已知字段，配色/歌词行/trackIndex 由库补齐并保证颜色是可链式调用的实例", en: "MediaSource was widened to the driver's real contract (an 18-field snapshot plus five optional transport methods) and is now **one shared instance across scene and web** — previously each side created its own simulation with no way for the host to inject. The new createMediaSource() takes only the fields you have and fills in palette, lyric line and trackIndex, guaranteeing chainable color instances" },
+          { zh: "新增 SceneInstance.setMedia() 与 media 控制面（读快照 + 上一曲/下一曲/播放暂停），反向控制直接转发给宿主 driver；宿主更新数据后引擎同帧可见", en: "New SceneInstance.setMedia() and a media control surface (snapshot plus previous/next/play-pause); transport commands forward straight to the host driver, and host-side data updates are visible to the engine in the same frame" },
+          { zh: "视频壁纸的频谱自动从 <video> 取，音条能跟着视频里的音乐动；宿主已用 setAudio 显式注入时不接管", en: "Video wallpapers capture their spectrum from the <video> itself so visualizers react to the video's own audio; an explicit setAudio() injection takes precedence" },
         ],
       },
       {

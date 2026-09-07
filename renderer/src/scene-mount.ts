@@ -356,8 +356,10 @@ cfg, source, pkgAbort.signal);
       const audioDriverRef: { current: { snapshot: any; pump: () => void } | null } = {
         current: null,
       };
-      // 先按模拟源装配；live 启动后改指向
-      let mediaDriver: any = simMedia;
+      // 先按模拟源装配；live 启动后改指向。
+      // [1.3.0] 宿主经公共 API 注入的媒体源优先（rt.mediaSource），它与 web
+      // 装配路径读同一个引用，两类壁纸看到同一份 Now Playing。
+      let mediaDriver: any = (rt.mediaSource as any) ?? simMedia;
       let windowDriver: any = simWindow;
       const audioSim = { enabled: supportsAudioProcessing };
       // 静音（壁纸不支持音频 / __audioMute）必须显式喂全零：GL uniform 数组在
@@ -547,36 +549,32 @@ cfg, source, pkgAbort.signal);
         }
         lastMediaSnap = media.cloneMediaSnapshot(mediaSnapshot());
       };
+      // 控制方法在注入源上是**可选**的（宿主可能只提供元数据、不支持反向控制）。
+      // 缺失时静默跳过再照常派发一次：壁纸按钮点了没反应好过整个脚本 TypeError 熔断。
+      const callDriver = (name: "skipNext" | "skipPrevious" | "play" | "pause" | "playPause") => {
+        const fn = (mediaDriver as any)?.[name];
+        if (typeof fn === "function") {
+          try {
+            fn.call(mediaDriver);
+          } catch (e) {
+            reportDiag(rt, cfg, `media ${name} 失败: ${(e as Error)?.message}`);
+          }
+        }
+        dispatchMediaNow();
+        return mediaSnapshot();
+      };
       const mediaControl = {
         get snapshot() {
           return mediaSnapshot();
         },
-        skipNext: () => {
-          mediaDriver.skipNext();
-          dispatchMediaNow();
-          return mediaSnapshot();
-        },
-        skipPrevious: () => {
-          mediaDriver.skipPrevious();
-          dispatchMediaNow();
-          return mediaSnapshot();
-        },
-        play: () => {
-          mediaDriver.play();
-          dispatchMediaNow();
-          return mediaSnapshot();
-        },
-        pause: () => {
-          mediaDriver.pause();
-          dispatchMediaNow();
-          return mediaSnapshot();
-        },
-        playPause: () => {
-          mediaDriver.playPause();
-          dispatchMediaNow();
-          return mediaSnapshot();
-        },
+        skipNext: () => callDriver("skipNext"),
+        skipPrevious: () => callDriver("skipPrevious"),
+        play: () => callDriver("play"),
+        pause: () => callDriver("pause"),
+        playPause: () => callDriver("playPause"),
       };
+      // 公共 API 的 instance.media 转发到这里
+      rt.mediaCtl = mediaControl as unknown as Runtime["mediaCtl"];
       (window as unknown as Record<string, unknown>).__mediaControl = mediaControl;
       (window as unknown as Record<string, unknown>).__system = {
         media: mediaControl,
@@ -2566,7 +2564,12 @@ cfg, source, pkgAbort.signal);
           // 这些改动应当在本帧的字段求值与渲染里立即生效。
           if (mediaSim.enabled) {
             if (live?.media) live.media.pump();
-            else simMedia.update(t);
+            // [1.3.0] 推进的必须是**当前生效的那个 driver**，不能写死 simMedia：
+            // 宿主注入源后 mediaDriver 已改指向，还推 simMedia 等于让注入源
+            // 永远收不到 update(t)（有内部时钟的实现就此冻住）。
+            else if (typeof (mediaDriver as any)?.update === "function") {
+              (mediaDriver as any).update(t);
+            }
             const snap = mediaSnapshot();
             const evts = media.diffMediaEvents(lastMediaSnap, snap);
             if (evts.length) {

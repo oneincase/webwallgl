@@ -83,6 +83,26 @@ export type Runtime = {
    * 返回 null 表示暂时无数据，此时回落到内置模拟源。
    */
   audioBridge?: (() => { left: ArrayLike<number>; right: ArrayLike<number> } | null) | null;
+  /**
+   * 宿主注入的系统媒体源（Now Playing）。由公共 API 的 `MountOptions.media` 或
+   * `setMedia()` 设置，结构见 api/types.ts 的 MediaSource。
+   *
+   * **scene 与 web 两条装配路径读同一个引用**：两侧默认各自 new 一份
+   * `createSimulatedMedia()`，但宿主装一次就该让两类壁纸看到同一份 Now Playing，
+   * 而不是各显示各的。为 null 时各自回落到自己的模拟源。
+   *
+   * 与 audioBridge 同纪律：换壁纸不清空（装一次对之后所有场景生效）。
+   */
+  mediaSource?: unknown | null;
+  /** 当前生效的媒体控制面（mountScene 装配后写入；实例的 media 属性转发到它） */
+  mediaCtl?: {
+    readonly snapshot: unknown;
+    skipNext(): unknown;
+    skipPrevious(): unknown;
+    play(): unknown;
+    pause(): unknown;
+    playPause(): unknown;
+  };
   /** 场景基本信息（onSceneInfo 触发时写入；具体结构见 api/types.ts 的 SceneInfo） */
   info?: unknown;
 

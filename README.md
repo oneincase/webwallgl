@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -141,6 +141,8 @@ input.addEventListener("change", () => {
 | `setProperties(props)` | 属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包 |
 | `getProperties()` | 当前生效的扁平化属性值表 |
 | `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效 |
+| `setMedia(src)` | 换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空 |
+| `media` | 媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制 |
 | `pushPointer(u, v, buttons?)` | 外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
 | `pointerLeave()` | 指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下） |
 | `load(source)` | 换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve |
@@ -188,9 +190,62 @@ console.log(wp.info); // { width, height, layerCount, ... }
 ```
 
 - 视频壁纸的资源地址由 Source.mediaEntry() 给出；httpSource 已实现（读 project.json 的 file 字段拼 {基址}/{file}）
-- 自定义 Source 若不实现 mediaEntry，会退回 {source.key}/{project.file}；两者都给不出就抛错——媒体没有 index.html 那样的惯例文件名，猜一个只会 404
-- fileSource / bytesSource 只承载 scene.pkg 字节，拿不到视频地址，因此不支持媒体壁纸
+- 放任意视频/图片用 mediaSource()：mediaSource(url) 或 mediaSource(file)，按扩展名自动判类型，无需 project.json
+- project.type 若已显式声明则永远优先，嗅探只在它缺失时兜底——有些场景壁纸的 project.file 指向 .mp4（那是场景内的视频纹理素材，不是「这张壁纸是个视频」）
 - 媒体壁纸需要 WebGL2；不可用时走 onError 交给调用方决定，库不自作主张换 DOM 渲染
+- pause/resume、setVolume、setFps、setFit 对媒体壁纸同样生效（setVolume 直接控制 &lt;video> 的 volume 与 muted）
+
+```
+import { mount, mediaSource } from "webwallgl";
+
+// 远程视频：按扩展名判类型，签名 URL 的 ?query 会被正确剥掉
+await mount(box, { source: mediaSource("https://cdn/clip.mp4?token=…") });
+
+// 本地导入：拖拽或 <input type=file> 进来的视频/图片
+input.addEventListener("change", async () => {
+  const wp = await mount(box, { source: mediaSource(input.files[0]) });
+  // destroy() 时库会自动 revoke 内部创建的 objectURL
+});
+
+// 扩展名不可靠时显式指定
+mediaSource(streamUrl, { type: "video" });
+```
+
+## 系统媒体（Now Playing）与反向控制
+
+「正在播放」类壁纸要读歌名、歌手、进度、封面配色与歌词，部分还带上一曲/下一曲/播放暂停按钮。这些统一由一个 MediaSource 提供 —— **scene 与 web 壁纸共用同一个实例**，宿主只需维护一套 driver，两类壁纸看到同一份数据。
+
+```
+import { mount, createMediaSource } from "webwallgl";
+
+// 只给你拿得到的字段，其余（配色、歌词行、trackIndex）由库补齐
+const media = createMediaSource(
+  { title: "夜航星", artist: "相位迁移", playing: true,
+    position: 30, duration: 212,
+    lyrics: [[0, "第一句"], [20, "第二句"]] },
+  // 反向控制：壁纸里的按钮会调到这里，你转发给真实播放器
+  { skipNext: () => player.next(),
+    playPause: () => player.toggle() },
+);
+
+const wp = await mount(box, { source, media });
+
+// 系统 Now Playing 变化时更新（歌词行会按 position 自动重算）
+media.set({ title: "下一首", position: 0 });
+
+// 也可以挂载后再装／换／撤
+wp.setMedia(media);
+wp.setMedia(null);        // 回落内置模拟源
+
+// 宿主侧也能读快照与发控制指令
+console.log(wp.media.snapshot.title);
+wp.media.playPause();
+```
+
+- 五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足
+- 控制方法全是可选的：只提供元数据、不支持控制时，壁纸里的按钮点了静默无效，不会报错
+- setMedia 换场景不清空，装一次对之后所有场景生效
+- 视频壁纸的音频频谱会自动从 &lt;video> 取（音条能跟着视频里的音乐动），宿主已用 setAudio 显式注入时则不接管
 
 ## 注入指针与音频
 
@@ -265,14 +320,24 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.2.0。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.0。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.0` | 2026-09-08 | mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver |
 | `1.2.0` | 2026-09-08 | video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈） |
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.0 是 1.2.0 的直接延续，继续按下游宿主的反馈补齐（四项）：
+
+- 新增 mediaSource(urlOrFile)：任意视频/图片可直接当壁纸，支持远程 URL 与本地 File（拖拽导入）。本地文件的 objectURL 由库在 destroy()/换源时自动 revoke——不 revoke 就是每换一次壁纸泄漏一个几十 MB 的 blob
+- 类型嗅探：project.type 缺失时按 URL 扩展名判定（正确剥掉签名 URL 的 ?query 与 #hash），认不出才落回 scene。显式声明的 project.type 永远优先，不会被嗅探覆盖
+- 媒体壁纸现在支持 setVolume（此前完全无效：音量只打到 scene 的音频节点）。同时写 volume 与 muted——&lt;video muted> 下只改 volume 一点用都没有；取消静音被自动播放策略拒绝时经 onDiagnostic 如实报出，不静默吞掉
+- MediaSource 扩成 driver 的真实契约（18 字段快照 + 5 个可选控制方法），并由 scene 与 web **共用同一个实例**——此前两侧各自 new 一份模拟源，宿主无从注入。新增 createMediaSource() 只需给已知字段，配色/歌词行/trackIndex 由库补齐并保证颜色是可链式调用的实例
+- 新增 SceneInstance.setMedia() 与 media 控制面（读快照 + 上一曲/下一曲/播放暂停），反向控制直接转发给宿主 driver；宿主更新数据后引擎同帧可见
+- 视频壁纸的频谱自动从 &lt;video> 取，音条能跟着视频里的音乐动；宿主已用 setAudio 显式注入时不接管
 
 1.2.0 补的是三个「运行时早就能跑、只是公共库入口没接出来」的缺口（由下游宿主 wallpaperEM 反馈）：
 

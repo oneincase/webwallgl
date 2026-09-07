@@ -108,6 +108,80 @@ export async function decodeGifFrames(
   return { width, height, frames };
 }
 
+/**
+ * 视频壁纸的频谱自动接管：从 <video> 自身的音轨取 64 段频谱写进 rt.audioBridge，
+ * 音频响应类效果（音条 / 律动）就能跟着视频里的音乐动，宿主零配置。
+ *
+ * 三条必须守住的纪律：
+ *
+ * 1. **必须 connect(ctx.destination)**。createMediaElementSource 会把该元素的
+ *    音频**从默认输出摘走**改路由到 WebAudio 图里；只接 analyser 不接回扬声器，
+ *    视频就彻底没声了（而画面照常播，极难联想到是这行代码）。
+ * 2. **宿主显式注入优先**。已经 setAudio() 过就不接管——那是调用方明确指定的源。
+ * 3. **AudioContext 可能 suspended**（自动播放策略要求先有用户交互）。此时不硬起，
+ *    静默回落模拟源，并挂一次性交互监听在用户点击后 resume。
+ */
+function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElement) {
+  if (rt.audioBridge) return; // 宿主已注入，不接管
+  const AC: typeof AudioContext | undefined =
+    (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!AC) return;
+  let ctx: AudioContext;
+  let analyser: AnalyserNode;
+  try {
+    ctx = new AC();
+    const srcNode = ctx.createMediaElementSource(v);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 256; // → 128 个频点，取前 64 段够用
+    analyser.smoothingTimeConstant = 0.75;
+    srcNode.connect(analyser);
+    // 关键：把音频接回扬声器，否则视频静音（见上方纪律 1）
+    analyser.connect(ctx.destination);
+  } catch (e) {
+    // 同一个 <video> 只能 createMediaElementSource 一次；重挂载时会抛，
+    // 属预期，静默回落即可
+    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`);
+    return;
+  }
+  const bins = new Uint8Array(analyser.frequencyBinCount);
+  const left = new Float32Array(64);
+  const right = new Float32Array(64);
+  rt.audioBridge = () => {
+    // suspended（未交互）时没有数据，返回 null 让引擎回落模拟源
+    if (ctx.state !== "running") return null;
+    analyser.getByteFrequencyData(bins);
+    const n = Math.min(64, bins.length);
+    for (let i = 0; i < n; i++) {
+      const x = bins[i] / 255;
+      left[i] = x;
+      right[i] = x; // AnalyserNode 给的是混合后的单路，左右同值
+    }
+    for (let i = n; i < 64; i++) {
+      left[i] = 0;
+      right[i] = 0;
+    }
+    return { left, right };
+  };
+  // 自动播放策略：用户首次交互后再 resume（一次性）
+  if (ctx.state === "suspended") {
+    const kick = () => {
+      void ctx.resume().catch(() => {});
+      window.removeEventListener("pointerdown", kick);
+      window.removeEventListener("keydown", kick);
+    };
+    window.addEventListener("pointerdown", kick, { once: true });
+    window.addEventListener("keydown", kick, { once: true });
+    rt.disposers?.push(() => {
+      window.removeEventListener("pointerdown", kick);
+      window.removeEventListener("keydown", kick);
+    });
+  }
+  rt.disposers?.push(() => {
+    rt.audioBridge = null;
+    void ctx.close().catch(() => {});
+  });
+}
+
 export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
   // 库化桥接：失败也必须让 mount() 的 Promise 落地。api/mount.ts 等的是
@@ -187,6 +261,26 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   let pauseImpl: (() => void) | undefined;
   let resumeImpl: (() => void) | undefined;
   let videoWasPlaying = false;
+  // [1.3.0] 音量控制：setVolume 打的是 rt.sceneAudio，此前只有 mountScene 设，
+  // 媒体壁纸调 setVolume 完全无效（视频照旧静音或照旧响）。这里直接操作 <video>。
+  // volume>0 时必须同时清 muted：<video muted> 下改 volume 一点用都没有。
+  rt.sceneAudio = {
+    setVolume(v: number) {
+      const vid = rt.video;
+      if (!vid) return;
+      const vol = Math.max(0, Math.min(1, Number(v) || 0));
+      vid.volume = vol;
+      vid.muted = vol <= 0;
+      // 从静音切到有声可能被自动播放策略拒绝（未发生用户交互时）。
+      // 如实经诊断报出，不要静默吞掉——否则表现为「设了音量但没声音」。
+      if (vol > 0 && vid.paused && !rt.paused) {
+        void vid.play().catch((e: unknown) => {
+          reportDiag(rt, cfg, `media 取消静音后自动播放被拒绝: ${(e as Error)?.message ?? e}`);
+        });
+      }
+    },
+    audios: [],
+  } as unknown as Runtime["sceneAudio"];
   rt.sceneCtl = {
     pause() {
       pauseImpl?.();
@@ -259,6 +353,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
           lastUploaded: -1,
         });
         if (!rt.paused) void v.play().catch(() => {});
+        attachVideoSpectrum(rt, cfg, v);
         reportDiag(rt, cfg, `media video ${mediaW}x${mediaH} → scene 渲染`);
       } else {
         // GIF 优先走 ImageDecoder 逐帧解码（见下），失败或非 GIF 才用 <img> 位图。
