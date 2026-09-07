@@ -1473,6 +1473,29 @@ function runShim(extras) {
       try { fs.unlinkSync(tmp); } catch { /* 忽略 */ }
     }
   }
+
+  // --- 系统实况麦克风也必须能喂到网页壁纸 ---
+  //
+  // 这是同一个症状的**第二条通道**：cfg.liveSystem（测试台「系统实况」勾选框）
+  // 此前只有 scene 装配路径消费，web.ts 里 liveSystem 零引用 —— 勾上之后
+  // 场景壁纸的音条跟着麦克风动、网页壁纸却始终是合成流。
+  // 它与 rt.audioBridge 是两条独立通道：前者库自己采麦克风，后者宿主推已采好的
+  // 频谱，两条都要能到网页壁纸。
+  // 断言要求**真实的条件判断**而不是出现 liveSystem 字样：注释里也写这个名字，
+  // 只匹配名字的话把 `if (cfg.liveSystem …)` 短路掉、注释留着就照绿（已踩过两次）
+  check(/if \(cfg\.liveSystem[^)]*\)/.test(webTs),
+    "web.ts 必须消费 cfg.liveSystem（否则测试台勾了「系统实况」网页壁纸仍是合成流）");
+  check(/function liveAudioDriver/.test(webTs), "web.ts 应有 liveAudioDriver 把麦克风包成 web driver");
+  check(/startLiveSystem/.test(webTs), "web.ts 必须调用 startLiveSystem 采麦克风");
+  // 麦克风采集是异步的（getUserMedia 要授权），不能阻塞泵启动：
+  // 必须先按默认源跑、授权通过后回填持有槽，由逐帧 pick 切过去
+  check(/liveHold/.test(webTs),
+    "liveSystem 必须走「延迟回填 + 逐帧 pick」（getUserMedia 是异步的，阻塞泵启动会让网页壁纸开局无声）");
+  check(/live\.dispose\(\)/.test(webTs),
+    "liveSystem 收尾必须 dispose（麦克风流不停，浏览器录音指示会一直亮）");
+  const liveBody = bodyOf("liveAudioDriver");
+  check(!/shapeWebAudioBand/.test(liveBody),
+    "liveAudioDriver 不得对麦克风频谱套 gamma 扩展（与注入源同理，它已是 0..1 真实频谱）");
 }
 
 if (errors.length) {

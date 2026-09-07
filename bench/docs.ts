@@ -489,12 +489,29 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.2", en: "1.3.2" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流", en: "Fix: the \"live system\" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream" }],
           [{ zh: "1.3.1", en: "1.3.1" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流）", en: "Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream)" }],
           [{ zh: "1.3.0", en: "1.3.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver", en: "mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web" }],
           [{ zh: "1.2.0", en: "1.2.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈）", en: "Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports)" }],
           [{ zh: "1.1.0", en: "1.1.0" }, { zh: "2026-09-07", en: "2026-09-07" }, { zh: "外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全", en: "External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics" }],
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.2 补上同一症状的**第二条通道**：1.3.1 修的是宿主注入（setAudio），而测试台「系统实况」勾选框走的是另一条路（cfg.liveSystem，库自己采麦克风），它此前只被 scene 装配路径消费——web.ts 里 liveSystem 零引用，所以勾上之后场景壁纸的音条跟着麦克风动、网页壁纸却始终是合成流。",
+          en: "1.3.2 closes the **second channel** of the same symptom: 1.3.1 fixed host injection (setAudio), while the bench's \"live system\" checkbox takes a different path (cfg.liveSystem, where the library captures the microphone itself). That path was only consumed by the scene assembly — web.ts referenced liveSystem zero times — so ticking the box made scene visualizers follow the mic while web wallpapers stayed on the synthetic stream.",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "网页壁纸现在也接系统实况麦克风，与 scene 用同一份采集（startLiveSystem）", en: "Web wallpapers now receive the live-system microphone through the same capture path as scene (startLiveSystem)" },
+          { zh: "麦克风采集是异步的（getUserMedia 要用户授权），不阻塞泵启动：先按默认源跑，授权通过后回填、由逐帧选源切过去", en: "Microphone capture is asynchronous (getUserMedia needs user consent) and does not block pump startup: the default source runs first, then the mic is filled in and the per-frame source pick switches over" },
+          { zh: "音频源优先级：宿主注入（setAudio）> 系统实况麦克风 > 内置模拟", en: "Audio source priority: host injection (setAudio) > live-system microphone > built-in simulation" },
+          { zh: "卸载时释放麦克风流（否则浏览器地址栏的录音指示会一直亮着）", en: "The microphone stream is released on teardown (otherwise the browser's recording indicator stays lit)" },
         ],
       },
       {

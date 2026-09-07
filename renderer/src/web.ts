@@ -7,6 +7,7 @@ import {
   type Runtime,
 } from "./shell";
 import type { WallpaperConfig } from "./types";
+import { startLiveSystem, type LiveSystemHandle } from "./live-system";
 import { audioMod, media as mediaMod } from "./vendor";
 import { entryDirUrl, hasBlockingCsp, rewriteHtml } from "./web-rewrite";
 import shimSource from "./web-shim.js?raw";
@@ -191,6 +192,35 @@ function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
       for (let i = n; i < 64; i++) {
         left[i] = 0;
         right[i] = 0;
+      }
+      return { left, right };
+    },
+  };
+}
+
+/**
+ * 「系统实况」麦克风包成 web 侧 driver。
+ *
+ * cfg.liveSystem 此前**只有 scene 装配路径消费**（web.ts 里 liveSystem 零引用），
+ * 所以测试台勾上「系统实况」后，场景壁纸的音条跟着麦克风动、网页壁纸却始终是
+ * 内置合成流。它与 rt.audioBridge 是两条独立通道：前者是库自己采麦克风，
+ * 后者是宿主把已采好的频谱推进来，两者都要能喂到网页壁纸。
+ *
+ * live 的 snapshot 是钳位后的 left64/right64（0..1），与宿主注入同属"真实频谱"，
+ * 因此同样**不套 shapeWebAudioBand 的 gamma 扩展**（那是给合成源拉对比度的）。
+ */
+function liveAudioDriver(handle: LiveSystemHandle): WebAudioDriver {
+  const left = new Float32Array(64);
+  const right = new Float32Array(64);
+  return {
+    tick() {
+      handle.audio.pump();
+    },
+    snapshot() {
+      const s = handle.audio.snapshot;
+      for (let i = 0; i < 64; i++) {
+        left[i] = Math.max(0, Math.min(1, Number(s.left64[i]) || 0));
+        right[i] = Math.max(0, Math.min(1, Number(s.right64[i]) || 0));
       }
       return { left, right };
     },
@@ -672,6 +702,8 @@ function startAudioPump(
   rt: Runtime,
   driver: WebAudioDriver | null,
   frameClock?: { last: number },
+  /** 系统实况麦克风的延迟持有：getUserMedia 是异步的，启动完成后回填 driver */
+  liveHold: { driver: WebAudioDriver | null } = { driver: null },
 ) {
   if (!driver) return;
   // [1.3.1] 注入源的选择必须**逐帧**做，不能在装配时定死：setAudio() 常在
@@ -679,7 +711,10 @@ function startAudioPump(
   // driver 就意味着后装的源永远不生效——症状正是「麦克风接上了，网页壁纸
   // 的音谱还在放合成波形」。撤源（setAudio(null)）后同样要能落回原 driver。
   const bridged = bridgeAudioDriver(rt);
-  const pick = (): WebAudioDriver => (rt.audioBridge ? bridged : driver);
+  // 优先级：宿主注入（rt.audioBridge）> 系统实况麦克风（cfg.liveSystem）> 默认模拟。
+  // 宿主显式推数据时不该被麦克风盖掉；两者都没有才用合成流。
+  const pick = (): WebAudioDriver =>
+    rt.audioBridge ? bridged : (liveHold.driver ?? driver);
   let raf = 0;
   let lastPush = 0;
   const tick = (now: number) => {
@@ -881,9 +916,40 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   };
 
   const frameClock = { last: 0 };
+  // 系统实况（cfg.liveSystem）：麦克风采集是异步的（getUserMedia 要用户授权），
+  // 不能阻塞泵启动 —— 泵先按默认源跑，授权通过后回填这个持有槽，
+  // pick() 逐帧读它，下一帧就切到真实麦克风。
+  const liveHold: { driver: WebAudioDriver | null } = { driver: null };
   const startPumps = () => {
-    startAudioPump(rt, audioDriver, frameClock);
+    startAudioPump(rt, audioDriver, frameClock, liveHold);
     startMediaPump(rt, mediaDriver);
+    if (cfg.liveSystem && audioDriver) {
+      void (async () => {
+        try {
+          const live = await startLiveSystem({ origin: location.origin });
+          const st = live.status();
+          if (st.audio === "mic") {
+            liveHold.driver = liveAudioDriver(live);
+            reportDiag(rt, cfg, "liveSystem: 网页壁纸音频改用麦克风");
+          } else {
+            reportDiag(rt, cfg, `liveSystem: 麦克风不可用（${st.audio}），网页壁纸沿用模拟源`);
+          }
+          const prev = rt.sceneCleanup;
+          rt.sceneCleanup = () => {
+            liveHold.driver = null;
+            // 必须释放：麦克风流不停，浏览器地址栏的录音指示会一直亮着
+            try {
+              live.dispose();
+            } catch {
+              /* 忽略 */
+            }
+            prev?.();
+          };
+        } catch (e) {
+          reportDiag(rt, cfg, `liveSystem: 启动失败，网页壁纸沿用模拟源 (${(e as Error)?.message ?? e})`);
+        }
+      })();
+    }
   };
 
   void (async () => {

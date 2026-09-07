@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -320,16 +320,24 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.1。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.2。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.2` | 2026-09-08 | 修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流 |
 | `1.3.1` | 2026-09-08 | 修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流） |
 | `1.3.0` | 2026-09-08 | mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver |
 | `1.2.0` | 2026-09-08 | video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈） |
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.2 补上同一症状的**第二条通道**：1.3.1 修的是宿主注入（setAudio），而测试台「系统实况」勾选框走的是另一条路（cfg.liveSystem，库自己采麦克风），它此前只被 scene 装配路径消费——web.ts 里 liveSystem 零引用，所以勾上之后场景壁纸的音条跟着麦克风动、网页壁纸却始终是合成流。
+
+- 网页壁纸现在也接系统实况麦克风，与 scene 用同一份采集（startLiveSystem）
+- 麦克风采集是异步的（getUserMedia 要用户授权），不阻塞泵启动：先按默认源跑，授权通过后回填、由逐帧选源切过去
+- 音频源优先级：宿主注入（setAudio）> 系统实况麦克风 > 内置模拟
+- 卸载时释放麦克风流（否则浏览器地址栏的录音指示会一直亮着）
 
 1.3.1 修一个下游实测发现的缺陷：**麦克风都接上了，网页壁纸的音谱还在放默认合成流**。
 
