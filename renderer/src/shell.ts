@@ -142,10 +142,14 @@ let fullscreenStylesApplied = false;
 function setupFullscreen(rt: Runtime) {
   if (!fullscreenStylesApplied) {
     fullscreenStylesApplied = true;
-    document.documentElement.style.cssText = "margin:0;height:100%;background:transparent;";
+    // 页面底色：桌面宿主要透明（壁纸窗口叠在桌面 underlay 层，透出下面的内容），
+    // 但嵌入式宿主（安卓 WebView）透明会露出 WebView 自己的浅色默认底 —— contain
+    // 留白处就成了刺眼的浅灰边。宿主用 ?opaque=1 声明"我要不透明背景"。
+    const bg = rt.cfg?.opaque ? "#000" : "transparent";
+    document.documentElement.style.cssText = `margin:0;height:100%;background:${bg};`;
     const root = document.body;
     root.style.cssText =
-      "margin:0;width:100vw;height:100vh;overflow:hidden;background:transparent;position:relative;";
+      `margin:0;width:100vw;height:100vh;overflow:hidden;background:${bg};position:relative;`;
   }
   const wrap = document.createElement("div");
   wrap.style.cssText = "position:fixed;inset:0;overflow:hidden;";

@@ -241,6 +241,14 @@ cfg, source, pkgAbort.signal);
       const sceneEntry = pkg.getEntry(parsedPkg, "scene.json");
       if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
       const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
+      // 宿主覆盖清屏色。场景作者按「铺满 PC 全屏」设 clearcolor，不少填的是浅灰；
+      // 手机竖屏用 contain 适配 16:9 场景时，上下留白会露出这块浅灰，像是渲染坏了。
+      // 宿主传 "0 0 0" 即可把留白压成中性黑。
+      if (cfg.clearColor) {
+        const g = ((scene as any).general ??= {});
+        g.clearcolor = cfg.clearColor;
+        g.clearenabled = true;
+      }
       {
         const zRaw = (scene as any).general?.zoom
         const zVal = zRaw && typeof zRaw === "object" ? Number(zRaw.value) : Number(zRaw)

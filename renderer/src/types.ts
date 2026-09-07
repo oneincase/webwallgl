@@ -48,6 +48,22 @@ export type WallpaperConfig = {
    * 默认 false（确定性模拟，离线可复现）。
    */
   liveSystem?: boolean;
+  /**
+   * 页面底色是否不透明。默认 false（透明）—— 桌面壁纸窗口叠在桌面 underlay 层，
+   * 需要透出下面的内容。嵌入式宿主（安卓 WebView）设 true 可避免露出 WebView
+   * 自己的浅色默认底。
+   */
+  opaque?: boolean;
+  /**
+   * 覆盖场景的清屏色（`"r g b"` 0..1 浮点三元组）。默认不覆盖，用场景自带的
+   * `general.clearcolor`。
+   *
+   * 为什么需要：clearcolor 是场景作者按「铺满 PC 全屏」设的，很多场景填的是
+   * 浅灰（如 0.7 0.7 0.7）。在 PC 上它完全被内容盖住，但手机竖屏用 contain
+   * 适配 16:9 场景时，上下留白就会露出这块浅灰，看起来像渲染坏了。
+   * 宿主传 `"0 0 0"` 可以把留白压成中性黑。
+   */
+  clearColor?: string;
 
   // ---- 库化改造引入的可选入口（docs/LIBRARY-PLAN.md 第 1 步）----
   // 公共 API 的 mount() 经这两个字段接管「画到哪」与「资源从哪来」。

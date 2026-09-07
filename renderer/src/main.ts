@@ -393,6 +393,8 @@ const initialCfg: WallpaperConfig = {
   filter: params.get("filter") ?? undefined,
   mediaBase: params.get("mediaBase") ?? undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
+  opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
+  clearColor: params.get("clearColor") ?? undefined,
 };
 rt.cfg = initialCfg;
 applyWallpaperFilter(rt);
