@@ -1229,6 +1229,32 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(!/cropDrawOffset/.test(rsrc323),
       "layerModelMatrix 不要再减 cropDrawOffset（肩饰会被错挪到头上）");
 
+    // I5c. cropoffset **不是位置补偿项**。上面那条正则只防"cropDrawOffset"这一个名字，
+    // 防不住有人换个写法重新发明加法（判据：正则只看形状、不看语义）。这里落数值判据。
+    //
+    // 假说「origin 里少加了裁切补偿」若成立，则 origin −(crop + size/2) 应当各层一致。
+    // 实测它从 朱鹤(−270, 792) 一路发散到 烟1(2201, 1017)，跨度 >2400px，假说不成立。
+    // 反证补强：`头` 层**没有** cropoffset，而它的贴图 w/h 恰好等于整画布 4096×2296 ——
+    // crop 只出现在"从大画布裁出来的小图"上，origin 已是作者摆好的最终世界坐标。
+    {
+      const deltas = [];
+      for (const L of scene323.layers) {
+        if (!L.image) continue;
+        const ent = getEntry(wp323.pkg, L.image);
+        if (!ent) continue;
+        const mj = JSON.parse(dec.decode(ent));
+        if (!mj.cropoffset) continue;
+        const c = String(mj.cropoffset).trim().split(/\s+/).map(Number);
+        deltas.push(L.origin[0] - (c[0] + L.size[0] / 2));
+      }
+      check(deltas.length >= 10,
+        `3233141951 应有 ≥10 个带 cropoffset 的层，实得 ${deltas.length}`);
+      const spreadX = Math.max(...deltas) - Math.min(...deltas);
+      check(spreadX > 1000,
+        `origin−(crop+size/2) 必须保持发散（实得跨度 ${spreadX.toFixed(0)}px）：` +
+        "这个值一旦收敛成常数，说明有人把 cropoffset 当位置补偿加进了 origin");
+    }
+
     console.log(`   3233141951 头 t=0 宽 ${head0.w.toFixed(0)}/${restW.toFixed(0)} 眼x=${eyeCx.toFixed(0)}；刀关 ${knifeOff.maxD.toFixed(1)}px 开 ${knifeOn.maxD.toFixed(1)}px`);
   } else {
     console.log("   skip I5：库中没有 3233141951");
