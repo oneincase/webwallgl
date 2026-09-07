@@ -110,18 +110,34 @@ export async function decodeGifFrames(
 
 export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
-  if (!cfg.src) {
+  // 库化桥接：失败也必须让 mount() 的 Promise 落地。api/mount.ts 等的是
+  // Promise.race([onFirstFrame, onError]) —— 两个钩子都不触发就是永久挂起，
+  // 调用方连超时都没法区分「还在加载」和「已经死了」。
+  const failHard = (why: string) => {
+    reportDiag(rt, cfg, `media ${cfg.type} 失败: ${why}`);
+    rt.onError?.(new Error(`媒体壁纸（${cfg.type}）${why}`));
     rt.fallbackPage?.();
+  };
+  if (!cfg.src) {
+    failHard("缺少资源 URL（cfg.src 为空）");
     return;
   }
   const isVideo = cfg.type === "video";
   const isGif = cfg.type === "gif";
 
-  const c = document.createElement("canvas");
+  // 库形态：调用方给了 canvas 就画在它上面（可非全屏、可多实例）；
+  // 旧形态（壁纸页）：自建 canvas 铺满内部 wrap 容器。与 mountScene 同构。
+  const embedded = cfg.canvas instanceof HTMLCanvasElement;
+  const c = embedded ? (cfg.canvas as HTMLCanvasElement) : document.createElement("canvas");
   const dpr = effectiveDpr(rt, cfg);
-  c.width = Math.max(1, Math.round(innerWidth * dpr));
-  c.height = Math.max(1, Math.round(innerHeight * dpr));
-  c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
+  // backing store 按显示尺寸折算：嵌入式用 CSS 尺寸（全屏 canvas 的
+  // clientWidth == innerWidth，两种形态等价）。直接用 innerWidth 会让
+  // 300×200 的嵌入画布拿到 1920×1080 的缓冲区。
+  const vw = c.clientWidth || window.innerWidth || 1;
+  const vh = c.clientHeight || window.innerHeight || 1;
+  c.width = Math.max(1, Math.round(vw * dpr));
+  c.height = Math.max(1, Math.round(vh * dpr));
+  if (!embedded) c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
   const gl2 = c.getContext("webgl2", {
     premultipliedAlpha: false,
     antialias: false,
@@ -129,14 +145,37 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
     preserveDrawingBuffer: true,
   });
   if (!gl2) {
-    // 无 WebGL2：回退 DOM 路径，媒体壁纸照常显示（只是拿不到场景引擎的能力）
-    reportDiag(rt, cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE，回退 DOM 渲染`);
+    // 无 WebGL2：壁纸页回退 DOM 路径（媒体照常显示，只是没有场景引擎能力）。
+    // 库形态没有 rt.wrap，DOM 回退的元素挂不上去也就永远看不见 —— 与其假装
+    // 成功，不如如实报错让调用方决定（提示 / 换壁纸 / 卸载实例）。
+    reportDiag(rt, cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE`);
+    if (embedded) {
+      rt.onError?.(new Error("WEBGL2_UNAVAILABLE"));
+      return;
+    }
     if (isVideo) mountVideoDom(rt, cfg);
     else mountGifDom(rt, cfg);
     return;
   }
-  rt.wrap?.appendChild(c);
+  if (!embedded) rt.wrap?.appendChild(c);
   rt.canvas = c;
+  // 库化桥接：媒体没有图层概念，报最小可用信息（与 web 路径同形）
+  if (rt.onSceneInfo) {
+    const hook = rt.onSceneInfo;
+    rt.onSceneInfo = undefined;
+    try {
+      hook({
+        width: vw,
+        height: vh,
+        layerCount: 0,
+        hasModels: false,
+        hasParticles: false,
+        hasText: false,
+      });
+    } catch {
+      /* 订阅者抛错不打断装配 */
+    }
+  }
   let disposed = false;
   rt.sceneCleanup = () => {
     disposed = true;
@@ -163,8 +202,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   const fail = (why: string) => {
     if (disposed) return;
     disposed = true;
-    reportDiag(rt, cfg, `media ${cfg.type} 失败: ${why}`);
-    rt.fallbackPage?.();
+    failHard(why);
   };
 
   void (async () => {
@@ -313,6 +351,17 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
         if (now - lastRender >= 1000 / fps) {
           lastRender = now;
           markFrame(rt, now);
+          // 库化桥接：首帧真正提交渲染 → resolve mount() 的 Promise（一次性）。
+          // 与 mountScene 同位置同写法：先摘钩子再调，避免订阅者里再触发一次。
+          if (rt.onFirstFrame) {
+            const first = rt.onFirstFrame;
+            rt.onFirstFrame = undefined;
+            try {
+              first();
+            } catch {
+              /* 订阅者抛错不打断渲染循环 */
+            }
+          }
           syncCanvasSize(rt, c, rt.cfg);
           refreshTex?.();
           const peek = rt.coverAlign;

@@ -19,6 +19,7 @@
  */
 import fs from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { LIB, ROOT, imp, createChecker } from "./lib/verify-kit.mjs";
 const {
@@ -804,6 +805,223 @@ const { check, errors } = createChecker();
       );
     }
   }
+}
+
+// ---------- 7. 媒体壁纸走公共库入口（video / gif / image） ----------
+//
+// 下游 wallpaperEM 报的缺口：库入口只产出 web/scene 两种 type，dispatch 里那条
+// video 分支从 api/mount.ts 永远走不到。但**只加分流会让 mount() 永久挂起** ——
+// api/mount.ts 等的是 Promise.race([onFirstFrame, onError])，而 media.ts 当时对
+// 这两个钩子的引用数都是 0：成功不 resolve、失败也不 reject，调用方连
+// 「还在加载」和「已经死了」都区分不了。所以这一节把四件事一起钉住。
+{
+  const mountTs = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const sourceTs = fs.readFileSync(join(ROOT, "renderer/src/api/source.ts"), "utf8");
+  const typesTs = fs.readFileSync(join(ROOT, "renderer/src/api/types.ts"), "utf8");
+  const mediaTs = fs.readFileSync(join(ROOT, "renderer/src/media.ts"), "utf8");
+  const dispatchTs = fs.readFileSync(join(ROOT, "renderer/src/dispatch.ts"), "utf8");
+
+  // --- 分流：库入口必须能产出 dispatch 认识的媒体 type ---
+  check(
+    /"video"/.test(dispatchTs) && /mountMedia/.test(dispatchTs),
+    "dispatch.ts 应把 video/gif/image 路由到 mountMedia",
+  );
+  // **执行真实的 resolveMountConfig**，不是拿正则看形状。
+  // 正则版本在故意改坏时不会红：把 `mediaProjectType(project)` 短路成 `null`
+  // 之后，函数定义与 `type: mediaType` 那一行都还在源码里，断言照样匹配得到。
+  // 这正是本仓库反复踩过的「断言只看形状不看语义」——所以这里抽真函数跑。
+  {
+    const esbuild = await import("esbuild");
+    // 抽 resolveMountConfig 及其依赖（mediaProjectType / isWebProject /
+    // ensureSceneCanvas / normalizeFitOption / MEDIA_TYPES），去掉 import 行后
+    // 单独编译执行：这样跑的是真实现，改坏必红。
+    const slice = mountTs.slice(
+      mountTs.indexOf("/** 归一化旧 fit 别名"),
+      mountTs.indexOf("/**\n * 同步创建实例"),
+    );
+    check(slice.length > 0, "抽不到 resolveMountConfig 及其依赖的源码片段");
+    const out = await esbuild.transform(
+      slice + "\nexport { resolveMountConfig, mediaProjectType };\n",
+      { loader: "ts", format: "esm", target: "es2022" },
+    );
+    const tmp = join(ROOT, "scripts", `.tmp-media-mount-${process.pid}.mjs`);
+    fs.writeFileSync(tmp, out.code);
+    let mod = null;
+    try {
+      mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+    } catch (e) {
+      check(false, `resolveMountConfig 片段无法执行: ${e && e.message}`);
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* 忽略 */
+      }
+    }
+    if (mod?.resolveMountConfig) {
+      // 极简 DOM 替身：只需要 ensureSceneCanvas 能走通
+      const mkCanvas = () => ({
+        __canvas: true,
+        style: {},
+        setAttribute() {},
+        clientWidth: 300,
+        clientHeight: 200,
+      });
+      const el = {
+        style: {},
+        appendChild() {},
+        querySelector: () => null,
+      };
+      globalThis.HTMLCanvasElement = class {};
+      globalThis.getComputedStyle = () => ({ position: "relative" });
+      globalThis.document = { createElement: () => mkCanvas() };
+
+      const srcOf = (project, extra) => ({
+        key: "https://cdn.example/wp/3122339805",
+        scenePkg: async () => new ArrayBuffer(0),
+        project: async () => project,
+        ...extra,
+      });
+
+      // ① project.type=video + mediaEntry → 必须产出 video 与该 URL
+      const vcfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "video", file: "scene.mp4" }, {
+          mediaEntry: async () => ({ url: "https://cdn.example/wp/x/scene.mp4" }),
+        }),
+      });
+      check(
+        vcfg.type === "video" && vcfg.src === "https://cdn.example/wp/x/scene.mp4",
+        `video 壁纸应产出 type=video 与 mediaEntry 的 URL，实得 type=${vcfg.type} src=${vcfg.src}`,
+      );
+
+      // ② 无 mediaEntry 时用 {key}/{project.file} 兜底
+      const gcfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "gif", file: "anim.gif" }),
+      });
+      check(
+        gcfg.type === "gif" && gcfg.src === "https://cdn.example/wp/3122339805/anim.gif",
+        `gif 应回退 {key}/{file}，实得 type=${gcfg.type} src=${gcfg.src}`,
+      );
+
+      // ③ 既无 mediaEntry 也无 file → 必须抛错，不能猜文件名发必然 404 的请求
+      let threw = "";
+      try {
+        await mod.resolveMountConfig(el, { source: srcOf({ type: "video" }) });
+      } catch (e) {
+        threw = String(e && e.message);
+      }
+      check(
+        /无法解析资源 URL/.test(threw),
+        `缺 mediaEntry 与 project.file 时应抛「无法解析资源 URL」，实得: ${threw || "未抛错"}`,
+      );
+
+      // ④ 不能误伤既有两条路径
+      const scfg = await mod.resolveMountConfig(el, { source: srcOf({ type: "scene" }) });
+      check(scfg.type === "scene", `scene 壁纸仍应产出 type=scene，实得 ${scfg.type}`);
+      const wcfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "web", file: "index.html" }, {
+          webEntry: async () => ({ url: "https://cdn.example/wp/index.html" }),
+        }),
+      });
+      check(wcfg.type === "web", `web 壁纸仍应产出 type=web，实得 ${wcfg.type}`);
+      // 无 project.json（大量真实壁纸如此）也不能被误判成媒体
+      const ncfg = await mod.resolveMountConfig(el, { source: srcOf(null) });
+      check(ncfg.type === "scene", `无 project.json 时应走 scene，实得 ${ncfg.type}`);
+    }
+  }
+
+  // --- 取址：Source 要有媒体入口，httpSource 要实现它 ---
+  check(/mediaEntry\?\(/.test(typesTs), "api/types.ts 的 Source 必须声明 mediaEntry");
+  check(/async mediaEntry\(/.test(sourceTs), "httpSource 必须实现 mediaEntry");
+  // 媒体没有 index.html 那样的惯例文件名：缺 file 必须返回 null 让 mount 如实报错，
+  // 不能猜一个名字发必然 404 的请求，再把那个 404 当成根因写进错误里
+  check(
+    /return file \? \{ url: `\$\{base\}\/\$\{file\}` \} : null/.test(sourceTs),
+    "httpSource.mediaEntry 缺 project.file 时必须返回 null（不得猜默认文件名）",
+  );
+
+  // --- 库化契约：四个钩子缺任一个，mount() 就落不了地 ---
+  check(
+    /rt\.onFirstFrame/.test(mediaTs),
+    "media.ts 必须触发 rt.onFirstFrame（否则媒体壁纸 mount() 永久挂起、onReady 永不触发）",
+  );
+  check(
+    /rt\.onError\?\.\(/.test(mediaTs),
+    "media.ts 失败路径必须触发 rt.onError（否则失败时 mount() 也不 reject）",
+  );
+  check(
+    /rt\.onSceneInfo/.test(mediaTs),
+    "media.ts 必须报告 rt.onSceneInfo（否则 instance.info 恒为 null）",
+  );
+  check(
+    /cfg\.canvas instanceof HTMLCanvasElement/.test(mediaTs),
+    "media.ts 必须支持调用方传入的 canvas（只 appendChild 到 rt.wrap 时库形态下画布永不入 DOM）",
+  );
+  // 嵌入式画布的 backing store 必须按 CSS 尺寸折算：裸 innerWidth 会让
+  // 300×200 的嵌入画布拿到 1920×1080 的缓冲区
+  const mmStart = mediaTs.indexOf("export function mountMedia");
+  const mmEnd = mediaTs.indexOf("function mountVideoDom");
+  const mountMediaBody = mmStart >= 0 && mmEnd > mmStart ? mediaTs.slice(mmStart, mmEnd) : "";
+  check(mountMediaBody.length > 0, "找不到 mountMedia 的函数体");
+  check(
+    !/Math\.round\(innerWidth \*/.test(mountMediaBody),
+    "mountMedia 不得用裸 innerWidth 定 backing store（嵌入式画布会拿到窗口尺寸）",
+  );
+  check(
+    /clientWidth \|\| window\.innerWidth/.test(mountMediaBody),
+    "mountMedia 必须优先用 canvas 的 CSS 尺寸（clientWidth || window.innerWidth）",
+  );
+}
+
+// ---------- 8. 音频与指针注入接到公共库 ----------
+//
+// 两者的运行时能力早就有、且在整页渲染器（window.__wp）里跑了很久，缺的只是
+// 公共库入口没接出来：MountOptions.audio 在 1.0.0 就公开了却零引用，
+// SceneInstance 上也没有任何指针注入方法。
+{
+  const mountTs = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const typesTs = fs.readFileSync(join(ROOT, "renderer/src/api/types.ts"), "utf8");
+  const sceneTs = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const mainTs = fs.readFileSync(join(ROOT, "renderer/src/main.ts"), "utf8");
+
+  // --- 音频 ---
+  check(
+    /rt\.audioBridge\s*=/.test(mountTs),
+    "api/mount.ts 必须把 MountOptions.audio 接到 rt.audioBridge（否则 audio 是死字段）",
+  );
+  check(
+    /setAudio\(src: AudioSource \| null\)/.test(typesTs),
+    "SceneInstance 必须声明 setAudio（宿主频谱通道常在 mount() 之后才就绪）",
+  );
+  check(/setAudio\(src: AudioSource \| null\)/.test(mountTs), "api/mount.ts 必须实现 setAudio");
+  // 只在选项里显式出现 audio 时才覆盖：否则 load() 换场景会把 setAudio()
+  // 装好的宿主源冲回 null（挂载选项里本来就没有 audio 这一项）
+  check(
+    /"audio" in o/.test(mountTs),
+    'wireOptions 必须用 `"audio" in o` 判定（无条件覆盖会让 load() 冲掉 setAudio 装的源）',
+  );
+  // 消费端仍在（留给日后改 scene-mount 的人）
+  check(/rt\.audioBridge\?\.\(\)/.test(sceneTs), "scene-mount.ts 必须每帧拉一次 rt.audioBridge");
+
+  // --- 指针 ---
+  check(
+    /pushPointer\(u: number, v: number, buttons\?: number\)/.test(typesTs),
+    "SceneInstance 必须声明 pushPointer（桌面壁纸在 underlay 层收不到鼠标，只能靠宿主推）",
+  );
+  check(/pointerLeave\(\): void/.test(typesTs), "SceneInstance 必须声明 pointerLeave");
+  check(
+    /rt\.pointerCtl\?\.push\(\{ u, v, buttons \}\)/.test(mountTs),
+    "api/mount.ts 的 pushPointer 必须映射到 rt.pointerCtl.push",
+  );
+  check(
+    /rt\.pointerCtl\?\.leave\(\)/.test(mountTs),
+    "api/mount.ts 的 pointerLeave 必须映射到 rt.pointerCtl.leave",
+  );
+  // 与 __wp 同签名是刻意的：下游从整页渲染器迁到库时代码不用改
+  check(
+    /pushPointer\(u: number, v: number, buttons\?: number\)/.test(mainTs),
+    "main.ts 的 __wp.pushPointer 签名应与 SceneInstance.pushPointer 保持一致",
+  );
 }
 
 if (errors.length) {

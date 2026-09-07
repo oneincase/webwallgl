@@ -76,6 +76,29 @@ export function httpSource(baseUrl: string, init?: RequestInit): Source {
       }
       return { url: `${base}/${file}` };
     },
+    /**
+     * 媒体壁纸（video/gif/image）的资源地址：`{base}/{project.file}`。
+     *
+     * 与 webEntry 的区别是**没有默认文件名可兜底**：网页壁纸缺 file 时
+     * index.html 是行业惯例，媒体壁纸的文件名（scene.mp4 / xxx.gif）完全由作者定，
+     * 猜一个只会 404。拿不到 file 就返回 null，让 mount 报「无法解析媒体 URL」，
+     * 而不是发一个必然失败的请求、再把那个 404 当成根因写进错误里。
+     */
+    async mediaEntry(signal) {
+      let file = "";
+      try {
+        const r = await fetch(`${base}/project.json`, { ...init, signal });
+        if (r.ok) {
+          const project = (await r.json()) as { file?: unknown } | null;
+          if (project && typeof project.file === "string" && project.file.trim()) {
+            file = project.file.trim().replace(/^\/+/, "");
+          }
+        }
+      } catch {
+        if (signal?.aborted) throw new Error("aborted");
+      }
+      return file ? { url: `${base}/${file}` } : null;
+    },
   };
 }
 

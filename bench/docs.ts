@@ -239,6 +239,9 @@ export const DOC: DocSection[] = [
           [{ zh: "setRenderDpr(dpr)", en: "setRenderDpr(dpr)" }, { zh: "改 DPR 需重建画布，内部自动重挂（pkg 缓存命中，不重新下载）", en: "Changing DPR rebuilds the canvas; remounts internally (pkg cache hit, no re-download)" }],
           [{ zh: "setProperties(props)", en: "setProperties(props)" }, { zh: "属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包", en: "Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch" }],
           [{ zh: "getProperties()", en: "getProperties()" }, { zh: "当前生效的扁平化属性值表", en: "The current flattened property value map" }],
+          [{ zh: "setAudio(src)", en: "setAudio(src)" }, { zh: "换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效", en: "Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only" }],
+          [{ zh: "pushPointer(u, v, buttons?)", en: "pushPointer(u, v, buttons?)" }, { zh: "外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效", en: "Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web" }],
+          [{ zh: "pointerLeave()", en: "pointerLeave()" }, { zh: "指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下）", en: "Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump)" }],
           [{ zh: "load(source)", en: "load(source)" }, { zh: "换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve", en: "Switch scenes reusing the same canvas and WebGL context; resolves after the first frame" }],
           [{ zh: "release() / restore()", en: "release() / restore()" }, { zh: "释放显存但保留配置（显示器睡眠）/ 用保留的配置重建", en: "Free GL resources keeping the config (display sleep) / rebuild from the kept config" }],
           [{ zh: "destroy()", en: "destroy()" }, { zh: "终态：释放资源、解绑监听，之后实例不可再用", en: "Terminal: frees resources, unbinds listeners; the instance is dead afterwards" }],
@@ -289,6 +292,65 @@ export const DOC: DocSection[] = [
           { zh: "写一个当前场景没有的名字不会报错：值会照样进属性表（换场景后可能被用上），但对当前画面无任何影响——拼错名字的症状是「调了没反应」而不是异常", en: "Writing a name the current scene doesn't declare raises no error: the value still lands in the table (a later scene may use it) but changes nothing on screen — a typo shows up as \"nothing happened\", not as an exception" },
           { zh: "setProperties() 是就地热更新：改属性表、效果常量与脚本沙箱，不重新拉包也不重新解析", en: "setProperties() patches in place — property table, effect constants and script sandboxes — with no re-fetch and no re-parse" },
           { zh: "没有 project.json 的壁纸也能跑：此时属性表为空，场景字段一律用 scene.json 里的快照值", en: "Wallpapers without a project.json still run: the property table is empty and fields fall back to the scene.json snapshot values" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "wallpaper-types",
+    title: { zh: "三类壁纸：scene / video / web", en: "Three wallpaper types: scene / video / web" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "类型不用你判断：mount() 先取 project.json，按其中的 type 分流 —— web 走 sandbox iframe，video / gif / image 走媒体路径，其余一律走场景装配。三类都用同一个 mount()、同一个 SceneInstance，pause/resume、setVolume、stats 等成员通用。",
+          en: "You never branch on type yourself: mount() reads project.json first and routes on its type — web goes to a sandboxed iframe, video / gif / image take the media path, everything else goes through scene assembly. All three share one mount() and one SceneInstance; pause/resume, setVolume, stats and friends work the same way.",
+        },
+      },
+      {
+        k: "code",
+        v: {
+          zh: "// 同一段代码挂任意类型（记得传容器 div，见上一节）\nconst wp = await mount(document.querySelector(\"#wp\"), {\n  source: httpSource(\"https://cdn.example.com/wallpapers/3789109327\"),\n});\nconsole.log(wp.info); // { width, height, layerCount, ... }",
+          en: "// One code path for any type (pass a container div — see the previous section)\nconst wp = await mount(document.querySelector(\"#wp\"), {\n  source: httpSource(\"https://cdn.example.com/wallpapers/3789109327\"),\n});\nconsole.log(wp.info); // { width, height, layerCount, ... }",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "视频壁纸的资源地址由 Source.mediaEntry() 给出；httpSource 已实现（读 project.json 的 file 字段拼 {基址}/{file}）", en: "A video wallpaper's asset URL comes from Source.mediaEntry(); httpSource implements it (reads project.json's file field and joins {base}/{file})" },
+          { zh: "自定义 Source 若不实现 mediaEntry，会退回 {source.key}/{project.file}；两者都给不出就抛错——媒体没有 index.html 那样的惯例文件名，猜一个只会 404", en: "A custom Source without mediaEntry falls back to {source.key}/{project.file}; if neither yields a URL, mount throws — media has no conventional filename like index.html, so guessing one would only 404" },
+          { zh: "fileSource / bytesSource 只承载 scene.pkg 字节，拿不到视频地址，因此不支持媒体壁纸", en: "fileSource / bytesSource only carry scene.pkg bytes and cannot supply a video URL, so they do not support media wallpapers" },
+          { zh: "媒体壁纸需要 WebGL2；不可用时走 onError 交给调用方决定，库不自作主张换 DOM 渲染", en: "Media wallpapers need WebGL2; when it is unavailable the failure arrives via onError for you to handle — the library does not silently switch to DOM rendering" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "inject",
+    title: { zh: "注入指针与音频", en: "Injecting pointer & audio" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "壁纸宿主常常拿不到浏览器天然的输入：桌面壁纸叠在桌面 underlay 层，鼠标事件被系统的桌面窗口吃掉；音频频谱也得由宿主自己采集。两条通道都由实例方法喂进来。",
+          en: "A wallpaper host often cannot rely on the browser's native input: desktop wallpapers sit in the desktop underlay layer where the system's desktop window swallows mouse events, and the audio spectrum has to be captured by the host itself. Both channels are fed through instance methods.",
+        },
+      },
+      {
+        k: "code",
+        v: {
+          zh: "// 指针：u/v 是 0..1 归一化坐标，buttons 同 MouseEvent.buttons\nwp.pushPointer(0.5, 0.5, 0);   // 悬停在正中\nwp.pushPointer(0.5, 0.5, 1);   // 按下左键\nwp.pointerLeave();             // 鼠标移出（只清按键，保留最后位置）\n\n// 音频：拉模式，渲染循环每帧调一次 snapshot()\nlet latest = { left: new Float32Array(64), right: new Float32Array(64) };\nwp.setAudio({ snapshot: () => latest });\n\n// 例：订阅宿主的频谱推送后更新 latest\nevtSource.onmessage = (e) => { latest = JSON.parse(e.data); };\n\nwp.setAudio(null);             // 撤源，回落内置模拟",
+          en: "// Pointer: u/v are normalized 0..1; buttons matches MouseEvent.buttons\nwp.pushPointer(0.5, 0.5, 0);   // hover at the center\nwp.pushPointer(0.5, 0.5, 1);   // press the left button\nwp.pointerLeave();             // pointer left (clears buttons, keeps last position)\n\n// Audio: pull model — the render loop calls snapshot() once per frame\nlet latest = { left: new Float32Array(64), right: new Float32Array(64) };\nwp.setAudio({ snapshot: () => latest });\n\n// e.g. update `latest` from the host's spectrum stream\nevtSource.onmessage = (e) => { latest = JSON.parse(e.data); };\n\nwp.setAudio(null);             // remove the source, fall back to the built-in sim",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "指针注入与 canvas 自身的 DOM 监听并存，谁后写谁赢；scene 与 web 壁纸都生效，媒体壁纸没有指针概念，调用静默无效", en: "Injected pointer state coexists with the canvas's own DOM listeners — last writer wins. It works for scene and web wallpapers; media wallpapers have no pointer concept, so the call is silently inert" },
+          { zh: "音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生", en: "Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library" },
+          { zh: "snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理", en: "Returning null (or throwing) from snapshot() means \"no data this frame\" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up" },
+          { zh: "setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效", en: "setAudio survives scene changes: install it once and it applies to every scene loaded afterwards" },
+          { zh: "音频注入只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条通道", en: "Audio injection applies to scene wallpapers only; web wallpapers get audio through a separate iframe-shim channel" },
         ],
       },
     ],
@@ -388,6 +450,8 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.2.0", en: "1.2.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈）", en: "Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports)" }],
+          [{ zh: "1.1.0", en: "1.1.0" }, { zh: "2026-09-07", en: "2026-09-07" }, { zh: "外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全", en: "External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics" }],
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
         ],
@@ -395,8 +459,25 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: "1.0.0 之后（未发版，已在仓库主线）—— 下个版本会包含这些：",
-          en: "After 1.0.0 (unreleased, already on the repository's main branch) — these will ship in the next version:",
+          zh: "1.2.0 补的是三个「运行时早就能跑、只是公共库入口没接出来」的缺口（由下游宿主 wallpaperEM 反馈）：",
+          en: "1.2.0 closes three gaps where the runtime capability already worked but was never exposed through the library entry (reported by the downstream host wallpaperEM):",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "video / gif / image 壁纸现在能经 mount() 挂载：新增 Source.mediaEntry() 取址，并补齐媒体路径的库化契约。此前媒体路径不触发 onFirstFrame / onError，即便接上分流，mount() 的 Promise 也会永久挂起——成功不 resolve、失败不 reject", en: "video / gif / image wallpapers can now be mounted via mount(): a new Source.mediaEntry() supplies the URL and the media path gained the library contract it lacked. Previously it fired neither onFirstFrame nor onError, so even with routing in place the mount() promise would hang forever — never resolving, never rejecting" },
+          { zh: "媒体路径改为支持调用方传入的 canvas，并按 CSS 尺寸而非窗口尺寸分配缓冲区（此前嵌入式画布会拿到整窗口大小的 backing store，且画布根本不会被插入 DOM）", en: "The media path now honors a caller-supplied canvas and sizes its backing store from CSS dimensions rather than the window (previously an embedded canvas got a full-window buffer and was never inserted into the DOM at all)" },
+          { zh: "MountOptions.audio 真正接线（此前是声明了却零引用的死字段），并新增 SceneInstance.setAudio() 供挂载后切换——宿主的频谱通道常在 mount() 之后才就绪", en: "MountOptions.audio is actually wired now (it was a declared-but-unreferenced dead field), plus a new SceneInstance.setAudio() for swapping after mount — host spectrum channels usually become ready only after mount()" },
+          { zh: "新增 SceneInstance.pushPointer() / pointerLeave()，与整页渲染器的 __wp 同名同签名，下游从整页迁到库时代码不用改", en: "New SceneInstance.pushPointer() / pointerLeave(), matching the full-page renderer's __wp in both name and signature so downstream code needs no changes when migrating to the library" },
+          { zh: "已知边界（写明而不假装支持）：音频注入只对 scene 生效，网页壁纸走 iframe shim 的另一条通道；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 仍未接线，类型注释已标注", en: "Known boundaries, stated rather than papered over: audio injection is scene-only (web wallpapers use a separate iframe-shim channel); media wallpapers have no pointer concept; MountOptions' pointer / media / features remain unwired and are now marked as such in the type comments" },
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.1.0 的内容（在 1.0.0 之后合入）：",
+          en: "What went into 1.1.0 (merged after 1.0.0):",
         },
       },
       {

@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.1.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.1.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -140,6 +140,9 @@ input.addEventListener("change", () => {
 | `setRenderDpr(dpr)` | 改 DPR 需重建画布，内部自动重挂（pkg 缓存命中，不重新下载） |
 | `setProperties(props)` | 属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包 |
 | `getProperties()` | 当前生效的扁平化属性值表 |
+| `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。只对 scene 生效 |
+| `pushPointer(u, v, buttons?)` | 外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
+| `pointerLeave()` | 指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下） |
 | `load(source)` | 换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve |
 | `release() / restore()` | 释放显存但保留配置（显示器睡眠）/ 用保留的配置重建 |
 | `destroy()` | 终态：释放资源、解绑监听，之后实例不可再用 |
@@ -171,6 +174,49 @@ wp.setProperties({ schemecolor: "0.5 0.2 0.8", newproperty12: false });
 - 写一个当前场景没有的名字不会报错：值会照样进属性表（换场景后可能被用上），但对当前画面无任何影响——拼错名字的症状是「调了没反应」而不是异常
 - setProperties() 是就地热更新：改属性表、效果常量与脚本沙箱，不重新拉包也不重新解析
 - 没有 project.json 的壁纸也能跑：此时属性表为空，场景字段一律用 scene.json 里的快照值
+
+## 三类壁纸：scene / video / web
+
+类型不用你判断：mount() 先取 project.json，按其中的 type 分流 —— web 走 sandbox iframe，video / gif / image 走媒体路径，其余一律走场景装配。三类都用同一个 mount()、同一个 SceneInstance，pause/resume、setVolume、stats 等成员通用。
+
+```
+// 同一段代码挂任意类型（记得传容器 div，见上一节）
+const wp = await mount(document.querySelector("#wp"), {
+  source: httpSource("https://cdn.example.com/wallpapers/3789109327"),
+});
+console.log(wp.info); // { width, height, layerCount, ... }
+```
+
+- 视频壁纸的资源地址由 Source.mediaEntry() 给出；httpSource 已实现（读 project.json 的 file 字段拼 {基址}/{file}）
+- 自定义 Source 若不实现 mediaEntry，会退回 {source.key}/{project.file}；两者都给不出就抛错——媒体没有 index.html 那样的惯例文件名，猜一个只会 404
+- fileSource / bytesSource 只承载 scene.pkg 字节，拿不到视频地址，因此不支持媒体壁纸
+- 媒体壁纸需要 WebGL2；不可用时走 onError 交给调用方决定，库不自作主张换 DOM 渲染
+
+## 注入指针与音频
+
+壁纸宿主常常拿不到浏览器天然的输入：桌面壁纸叠在桌面 underlay 层，鼠标事件被系统的桌面窗口吃掉；音频频谱也得由宿主自己采集。两条通道都由实例方法喂进来。
+
+```
+// 指针：u/v 是 0..1 归一化坐标，buttons 同 MouseEvent.buttons
+wp.pushPointer(0.5, 0.5, 0);   // 悬停在正中
+wp.pushPointer(0.5, 0.5, 1);   // 按下左键
+wp.pointerLeave();             // 鼠标移出（只清按键，保留最后位置）
+
+// 音频：拉模式，渲染循环每帧调一次 snapshot()
+let latest = { left: new Float32Array(64), right: new Float32Array(64) };
+wp.setAudio({ snapshot: () => latest });
+
+// 例：订阅宿主的频谱推送后更新 latest
+evtSource.onmessage = (e) => { latest = JSON.parse(e.data); };
+
+wp.setAudio(null);             // 撤源，回落内置模拟
+```
+
+- 指针注入与 canvas 自身的 DOM 监听并存，谁后写谁赢；scene 与 web 壁纸都生效，媒体壁纸没有指针概念，调用静默无效
+- 音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生
+- snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理
+- setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效
+- 音频注入只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条通道
 
 ## 事件与诊断
 
@@ -219,14 +265,24 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.1.0。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.2.0。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.2.0` | 2026-09-08 | video 壁纸可走库入口；音频与指针注入接到公共 API（下游三项反馈） |
+| `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
 
-1.0.0 之后（未发版，已在仓库主线）—— 下个版本会包含这些：
+1.2.0 补的是三个「运行时早就能跑、只是公共库入口没接出来」的缺口（由下游宿主 wallpaperEM 反馈）：
+
+- video / gif / image 壁纸现在能经 mount() 挂载：新增 Source.mediaEntry() 取址，并补齐媒体路径的库化契约。此前媒体路径不触发 onFirstFrame / onError，即便接上分流，mount() 的 Promise 也会永久挂起——成功不 resolve、失败不 reject
+- 媒体路径改为支持调用方传入的 canvas，并按 CSS 尺寸而非窗口尺寸分配缓冲区（此前嵌入式画布会拿到整窗口大小的 backing store，且画布根本不会被插入 DOM）
+- MountOptions.audio 真正接线（此前是声明了却零引用的死字段），并新增 SceneInstance.setAudio() 供挂载后切换——宿主的频谱通道常在 mount() 之后才就绪
+- 新增 SceneInstance.pushPointer() / pointerLeave()，与整页渲染器的 __wp 同名同签名，下游从整页迁到库时代码不用改
+- 已知边界（写明而不假装支持）：音频注入只对 scene 生效，网页壁纸走 iframe shim 的另一条通道；媒体壁纸没有指针概念；MountOptions 的 pointer / media / features 仍未接线，类型注释已标注
+
+1.1.0 的内容（在 1.0.0 之后合入）：
 
 - 新增外部指针注入通道 __wp.pushPointer / pointerLeave：桌面壁纸窗口收不到鼠标时（如 macOS 下 Finder 桌面窗口吃掉事件），由宿主轮询系统鼠标后推进来。场景与网页两类壁纸共用同一套协议，调用方不必判断类型
 - 网页壁纸接入同一条注入通道：shim 按命中元素合成 DOM 事件（over/out/enter/leave 链完整、click 靠按键边缘合成）。本机库 49 张网页壁纸里 mousemove 24 / click 29 / pointer* 16 张的交互从「完全无反应」变为可用。硬限制：CSS :hover 由浏览器 hit-test 驱动，合成事件点不亮

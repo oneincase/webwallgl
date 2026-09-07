@@ -34,6 +34,17 @@ export type Source = {
    */
   webEntry?(signal?: AbortSignal): Promise<{ url: string } | null>;
   /**
+   * 媒体壁纸（video / gif / image）的资源 URL。`project.type` 为这三者之一时
+   * 由 mount 调用；省略则回退到 `{httpSource 基址}/{project.file}`。
+   *
+   * 与 `webEntry` 分开而不是复用同一个方法：`webEntry` 的语义是「HTML 文档入口」
+   * （交给 iframe 加载并注入 shim），媒体是「一个可直接喂给 <video>/<img> 的资源」，
+   * 两者的消费方与失败模式都不同。`webEntry` 在 1.0.0 已公开，也不宜改语义。
+   *
+   * `type` 可选，用于纠正 project.json 里缺失或不准的类型；不给则以 project.type 为准。
+   */
+  mediaEntry?(signal?: AbortSignal): Promise<{ url: string; type?: string } | null>;
+  /**
    * 缓存键。相同键的 scene.pkg 命中库内缓存，避免重复解析上百 MB 的包
    * （暂停恢复、改属性都不该重新走一遍解析）。省略则不参与缓存。
    */
@@ -41,8 +52,14 @@ export type Source = {
 };
 
 /**
- * 指针状态提供者。默认实现监听传入 canvas 自身的 pointer 事件；
- * 传 null 则禁用指针交互（壁纸脚本读到的指针恒为静止居中）。
+ * 指针状态提供者（**当前未接线**）。
+ *
+ * 默认指针来自 canvas 自身的 pointer 事件，由 mountScene 按 `cfg.canvas` 建立，
+ * 与本接口无关。要从外部喂指针（桌面壁纸窗口在 underlay 层收不到鼠标）请用
+ * `SceneInstance.pushPointer(u, v, buttons)` —— 那是引擎实际消费的推模式通道。
+ *
+ * 本接口保留是为了不破坏 1.0.0 已公开的类型；注意 `rightDown` 即便接线也不会
+ * 生效：引擎的指针状态只消费按键位掩码的 bit0（左键），全库无壁纸读右键。
  */
 export type PointerSource = {
   /** 归一化坐标 0..1，相对 canvas 左上角；y 向下 */
@@ -58,6 +75,16 @@ export type PointerSource = {
  * 音频频谱提供者（音频响应壁纸用）。返回当前快照，不推进状态 ——
  * 推进由库的渲染循环按场景时间驱动，保证同一时刻取到同一份数据。
  * 默认是内置的确定性模拟源（无需麦克风权限，离线可复现）。
+ *
+ * **拉模式**：渲染循环每帧调一次 `snapshot()`。宿主每帧推 128 个浮点要走
+ * 跨语言桥的字符串拼接与 JS 解析，60fps 下开销可观；让渲染器主动拉，
+ * 宿主用同步原生桥直接返回即可。
+ *
+ * 契约：`left`/`right` 各 **64 段**、值域 **0..1**（已归一化）。段数不足 64
+ * 会补零，多于 64 会截断。32/16 段降采样与 level/silent 由库自行派生，
+ * 消费方（shader uniform、粒子、文字脚本）不区分数据来源。
+ *
+ * 只对 **scene** 壁纸生效：网页壁纸的音频走 iframe shim 的另一条泵。
  */
 export type AudioSource = {
   /** 左右声道各 64 段频谱，值域 0..1 */
@@ -140,14 +167,17 @@ export type MountOptions = {
   /** 用户属性覆盖值（键为 project.json 里的属性名） */
   properties?: Record<string, PropertyValue>;
 
-  /** 指针源。默认跟随 canvas 自身 pointer 事件；null = 禁用 */
+  /** 指针源。**当前未接线**，见 PointerSource 说明；外部喂指针请用 pushPointer() */
   pointer?: PointerSource | null;
-  /** 音频源。默认内置确定性模拟；null = 禁用（频谱恒为 0） */
+  /**
+   * 音频频谱源。默认内置确定性模拟；null = 禁用（频谱恒为 0）。
+   * 挂载后可用 `SceneInstance.setAudio()` 再换（SSE 等异步数据源常在挂载后才就绪）。
+   */
   audio?: AudioSource | null;
-  /** 系统媒体源。默认内置模拟；null = 禁用 */
+  /** 系统媒体源。**当前未接线**（默认内置模拟） */
   media?: MediaSource | null;
 
-  /** 渲染开关（调试用） */
+  /** 渲染开关（调试用）。**当前未接线** */
   features?: Partial<FeatureFlags>;
 
   /** 诊断回调。替代旧的 GET /diag 上报 */
@@ -185,6 +215,40 @@ export type SceneInstance = {
   setProperties(props: Record<string, PropertyValue>): void;
   /** 当前生效的属性值（扁平化后的 name → value） */
   getProperties(): Record<string, PropertyValue>;
+
+  /**
+   * 换音频频谱源。传 null 回落内置模拟源。
+   *
+   * 与挂载选项 `audio` 等价，但可在任何时刻调用 —— 宿主的频谱通道
+   * （SSE / 原生桥 / WebAudio）常常在 mount() 之后才就绪。
+   * **换场景不清空**：装一次对之后所有场景生效。
+   *
+   * 只对 scene 壁纸生效；网页壁纸的音频走 iframe shim 的另一条泵。
+   */
+  setAudio(src: AudioSource | null): void;
+
+  /**
+   * 外部指针注入：把宿主轮询到的鼠标位置推进壁纸。
+   *
+   * 用于窗口收不到鼠标事件的场景 —— 桌面壁纸叠在桌面 underlay 层，
+   * macOS 下 Finder 的桌面窗口会吃掉事件，且没有「向下透传」的窗口属性。
+   *
+   * @param u 归一化横坐标 0..1（相对画布左缘）
+   * @param v 归一化纵坐标 0..1（相对画布上缘，y 向下）
+   * @param buttons 按键位掩码，同 MouseEvent.buttons；只有 bit0（左键）被消费
+   *
+   * 与 canvas 自身的 DOM 指针监听并存，谁后写谁赢。scene 与 web 壁纸都生效，
+   * 媒体壁纸（video/gif/image）没有指针概念，调用静默无效。
+   */
+  pushPointer(u: number, v: number, buttons?: number): void;
+
+  /**
+   * 外部指针离开本窗口（鼠标移到了别的显示器）。
+   *
+   * **只清按键，保留最后位置** —— 清掉位置会让 xray 开窗跳到相机外、
+   * 视差弹回中心，画面明显抽一下。语义与 DOM 的 mouseleave 一致。
+   */
+  pointerLeave(): void;
 
   /** 换场景，复用同一 canvas 与 WebGL 上下文 */
   load(source: Source): Promise<void>;

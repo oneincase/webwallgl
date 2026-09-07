@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.1.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.1.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.2.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -141,6 +141,9 @@ input.addEventListener("change", () => {
 | `setRenderDpr(dpr)` | Changing DPR rebuilds the canvas; remounts internally (pkg cache hit, no re-download) |
 | `setProperties(props)` | Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch |
 | `getProperties()` | The current flattened property value map |
+| `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Scene wallpapers only |
+| `pushPointer(u, v, buttons?)` | Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web |
+| `pointerLeave()` | Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump) |
 | `load(source)` | Switch scenes reusing the same canvas and WebGL context; resolves after the first frame |
 | `release() / restore()` | Free GL resources keeping the config (display sleep) / rebuild from the kept config |
 | `destroy()` | Terminal: frees resources, unbinds listeners; the instance is dead afterwards |
@@ -172,6 +175,49 @@ wp.setProperties({ schemecolor: "0.5 0.2 0.8", newproperty12: false });
 - Writing a name the current scene doesn't declare raises no error: the value still lands in the table (a later scene may use it) but changes nothing on screen — a typo shows up as "nothing happened", not as an exception
 - setProperties() patches in place — property table, effect constants and script sandboxes — with no re-fetch and no re-parse
 - Wallpapers without a project.json still run: the property table is empty and fields fall back to the scene.json snapshot values
+
+## Three wallpaper types: scene / video / web
+
+You never branch on type yourself: mount() reads project.json first and routes on its type — web goes to a sandboxed iframe, video / gif / image take the media path, everything else goes through scene assembly. All three share one mount() and one SceneInstance; pause/resume, setVolume, stats and friends work the same way.
+
+```
+// One code path for any type (pass a container div — see the previous section)
+const wp = await mount(document.querySelector("#wp"), {
+  source: httpSource("https://cdn.example.com/wallpapers/3789109327"),
+});
+console.log(wp.info); // { width, height, layerCount, ... }
+```
+
+- A video wallpaper's asset URL comes from Source.mediaEntry(); httpSource implements it (reads project.json's file field and joins {base}/{file})
+- A custom Source without mediaEntry falls back to {source.key}/{project.file}; if neither yields a URL, mount throws — media has no conventional filename like index.html, so guessing one would only 404
+- fileSource / bytesSource only carry scene.pkg bytes and cannot supply a video URL, so they do not support media wallpapers
+- Media wallpapers need WebGL2; when it is unavailable the failure arrives via onError for you to handle — the library does not silently switch to DOM rendering
+
+## Injecting pointer & audio
+
+A wallpaper host often cannot rely on the browser's native input: desktop wallpapers sit in the desktop underlay layer where the system's desktop window swallows mouse events, and the audio spectrum has to be captured by the host itself. Both channels are fed through instance methods.
+
+```
+// Pointer: u/v are normalized 0..1; buttons matches MouseEvent.buttons
+wp.pushPointer(0.5, 0.5, 0);   // hover at the center
+wp.pushPointer(0.5, 0.5, 1);   // press the left button
+wp.pointerLeave();             // pointer left (clears buttons, keeps last position)
+
+// Audio: pull model — the render loop calls snapshot() once per frame
+let latest = { left: new Float32Array(64), right: new Float32Array(64) };
+wp.setAudio({ snapshot: () => latest });
+
+// e.g. update `latest` from the host's spectrum stream
+evtSource.onmessage = (e) => { latest = JSON.parse(e.data); };
+
+wp.setAudio(null);             // remove the source, fall back to the built-in sim
+```
+
+- Injected pointer state coexists with the canvas's own DOM listeners — last writer wins. It works for scene and web wallpapers; media wallpapers have no pointer concept, so the call is silently inert
+- Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library
+- Returning null (or throwing) from snapshot() means "no data this frame" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up
+- setAudio survives scene changes: install it once and it applies to every scene loaded afterwards
+- Audio injection applies to scene wallpapers only; web wallpapers get audio through a separate iframe-shim channel
 
 ## Events & diagnostics
 
@@ -220,14 +266,24 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.1.0. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.2.0. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.2.0` | 2026-09-08 | Video wallpapers work through the library entry; audio and pointer injection wired into the public API (three downstream reports) |
+| `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
 
-After 1.0.0 (unreleased, already on the repository's main branch) — these will ship in the next version:
+1.2.0 closes three gaps where the runtime capability already worked but was never exposed through the library entry (reported by the downstream host wallpaperEM):
+
+- video / gif / image wallpapers can now be mounted via mount(): a new Source.mediaEntry() supplies the URL and the media path gained the library contract it lacked. Previously it fired neither onFirstFrame nor onError, so even with routing in place the mount() promise would hang forever — never resolving, never rejecting
+- The media path now honors a caller-supplied canvas and sizes its backing store from CSS dimensions rather than the window (previously an embedded canvas got a full-window buffer and was never inserted into the DOM at all)
+- MountOptions.audio is actually wired now (it was a declared-but-unreferenced dead field), plus a new SceneInstance.setAudio() for swapping after mount — host spectrum channels usually become ready only after mount()
+- New SceneInstance.pushPointer() / pointerLeave(), matching the full-page renderer's __wp in both name and signature so downstream code needs no changes when migrating to the library
+- Known boundaries, stated rather than papered over: audio injection is scene-only (web wallpapers use a separate iframe-shim channel); media wallpapers have no pointer concept; MountOptions' pointer / media / features remain unwired and are now marked as such in the type comments
+
+What went into 1.1.0 (merged after 1.0.0):
 
 - New external pointer injection channel (__wp.pushPointer / pointerLeave): when the wallpaper window cannot receive the mouse (e.g. the Finder desktop window swallows events on macOS), the host polls the system cursor and pushes it in. Scene and web wallpapers share one protocol — callers need not branch on type
 - Web wallpapers joined the same channel: the shim synthesizes DOM events against the hit element (full over/out/enter/leave chains, click derived from button edges). Of 49 local web wallpapers, interaction went from dead to working on 24 with mousemove, 29 with click and 16 with pointer events. Hard limit: CSS :hover is driven by browser hit-testing and cannot be lit by synthetic events
