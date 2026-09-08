@@ -492,6 +492,13 @@ cfg, source, pkgAbort.signal);
       // 挂了媒体回调的沙箱（广播表；媒体不做 hit-test，不必按图层索引）
       const mediaHooks: any[] = [];
       let lastMediaSnap: any = null;
+      /**
+       * 已上传到 `$mediaThumbnail` 的封面来源串，用于按变化触发重传。
+       * 记「来源」而不是「是否传过」：同一首歌的封面常晚于元信息到达，
+       * 换歌后也要能再传一次。解码期间它同时充当取消令牌 —— 异步回来时
+       * 若已被后一首歌改写，就丢弃这次解码结果。
+       */
+      let mediaThumbnailLastSrc: string | undefined;
       liveHold.lastSnap = {
         get: () => lastMediaSnap,
         setHasThumbnail: (v: boolean) => {
@@ -732,6 +739,47 @@ cfg, source, pkgAbort.signal);
         }
       }
 
+      /**
+       * 把一张真实封面上传到 `$mediaThumbnail`（旧的顺位挪到 `$mediaPreviousThumbnail`）。
+       *
+       * 场景壁纸的封面**不走脚本回调**：作者是把这两个 WE 保留纹理名直接填进
+       * 层的 image / textures 槽（全库 35 + 29 处），所以 mediaThumbnailChanged
+       * 里带的 `e.thumbnail` 对场景侧没有意义 —— 必须把像素传成 GL 纹理。
+       *
+       * 复用既有纹理对象（bindTexture + texImage2D）而不是新建：引用方在装配期
+       * 已经把 glTex 句柄抓进各自的槽里，换成新对象它们仍指向旧纹理。
+       */
+      const uploadThumbnailBitmap = (bmp: ImageBitmap | HTMLImageElement, w: number, h: number) => {
+        const raster = rasterizeArtwork(bmp, w, h, 512);
+        const palette = sampleArtworkPalette(bmp, w, h);
+        const gl = renderer.gl as WebGL2RenderingContext;
+
+        const cur = textures.get("$mediaThumbnail");
+        if (cur) textures.set("$mediaPreviousThumbnail", cur);
+
+        const existing = textures.get("$mediaThumbnail");
+        if (existing?.glTex) {
+          gl.bindTexture(gl.TEXTURE_2D, existing.glTex);
+          gl.texImage2D(
+            gl.TEXTURE_2D, 0, gl.RGBA, raster.width, raster.height, 0,
+            gl.RGBA, gl.UNSIGNED_BYTE, raster.rgba,
+          );
+          existing.width = raster.width;
+          existing.height = raster.height;
+          existing.mips = [raster];
+        } else {
+          textures.set("$mediaThumbnail", {
+            glTex: rnd.makeTextureMip(gl, [raster], false),
+            width: raster.width,
+            height: raster.height,
+            rg88: false,
+            mips: [raster],
+            generated: true,
+          });
+        }
+        return palette;
+      };
+
       // ---- 系统实况：textures / mediaDriver 已就绪后再挂麦克风与 Now Playing ----
       if (cfg.liveSystem) {
         // 释放槽**同步登记**：getUserMedia 阻塞在系统授权弹窗上，时长不可控。
@@ -762,41 +810,8 @@ cfg, source, pkgAbort.signal);
               if (!res.ok) return;
               const blob = await res.blob();
               const bmp = await createImageBitmap(blob);
-              const raster = rasterizeArtwork(bmp, bmp.width, bmp.height, 512);
-              const palette = sampleArtworkPalette(bmp, bmp.width, bmp.height);
+              const palette = uploadThumbnailBitmap(bmp, bmp.width, bmp.height);
               bmp.close?.();
-
-              const cur = textures.get("$mediaThumbnail");
-              if (cur) textures.set("$mediaPreviousThumbnail", cur);
-
-              const gl = renderer.gl as WebGL2RenderingContext;
-              const existing = textures.get("$mediaThumbnail");
-              if (existing?.glTex) {
-                gl.bindTexture(gl.TEXTURE_2D, existing.glTex);
-                gl.texImage2D(
-                  gl.TEXTURE_2D,
-                  0,
-                  gl.RGBA,
-                  raster.width,
-                  raster.height,
-                  0,
-                  gl.RGBA,
-                  gl.UNSIGNED_BYTE,
-                  raster.rgba,
-                );
-                existing.width = raster.width;
-                existing.height = raster.height;
-                existing.mips = [raster];
-              } else {
-                textures.set("$mediaThumbnail", {
-                  glTex: rnd.makeTextureMip(gl, [raster], false),
-                  width: raster.width,
-                  height: raster.height,
-                  rg88: false,
-                  mips: [raster],
-                  generated: true,
-                });
-              }
 
               const snap = currentMediaDriver().snapshot;
               if (palette) {
@@ -2616,6 +2631,52 @@ cfg, source, pkgAbort.signal);
                 }
               }
               lastMediaSnap = media.cloneMediaSnapshot(snap);
+            }
+            // 场景壁纸的封面不走脚本回调，而是 $mediaThumbnail / $mediaPreviousThumbnail
+            // 两个 GL 纹理（作者把保留纹理名直接填进 image/textures 槽）。
+            // 每当 MediaSnapshot.thumbnail 变化，异步解码 + 上传纹理。
+            // 与 liveSystem 的 artwork 上传复用同一段像素上传逻辑。
+            if (
+              mediaThumbnailLastSrc !== snap.thumbnail &&
+              typeof snap.thumbnail === "string" &&
+              snap.thumbnail
+            ) {
+              const nextSrc = snap.thumbnail;
+              mediaThumbnailLastSrc = nextSrc;
+              void (async () => {
+                try {
+                  const blob = await fetch(nextSrc, { cache: "no-store" }).then((r) =>
+                    r.ok ? r.blob() : null,
+                  );
+                  if (!blob) return;
+                  const bmp = await createImageBitmap(blob);
+                  // 加载期间可能又切歌了：来源变了就丢弃这次结果
+                  if (mediaThumbnailLastSrc !== nextSrc) {
+                    bmp.close?.();
+                    return;
+                  }
+                  // 尺寸要在 close() 之前取：规范规定 close 后 width/height 归 0，
+                  // 放在后面读诊断日志会恒为「0×0」。
+                  const bw = bmp.width, bh = bmp.height;
+                  const palette = uploadThumbnailBitmap(bmp, bw, bh);
+                  bmp.close?.();
+                  if (palette) {
+                    const s = mediaSnapshot();
+                    s.primaryColor = media.mediaVec3(...palette.primary);
+                    s.secondaryColor = media.mediaVec3(...palette.secondary);
+                    s.tertiaryColor = media.mediaVec3(...palette.tertiary);
+                    s.textColor = media.mediaVec3(0.98, 0.98, 1);
+                    s.highContrastColor = media.mediaVec3(1, 1, 1);
+                  }
+                  reportDiag(rt, cfg, `media: $mediaThumbnail 已更新（${bw}×${bh}）`);
+                } catch (e) {
+                  reportDiag(
+                    rt,
+                    cfg,
+                    `media: 封面上传失败（${e instanceof Error ? e.message : e}）`,
+                  );
+                }
+              })();
             }
           }
           if (live?.windowTitle) live.windowTitle.pump();
