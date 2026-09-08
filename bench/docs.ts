@@ -489,6 +489,7 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.6", en: "1.3.6" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "新增 MediaSnapshot.thumbnail：宿主可把真实专辑封面透传给网页壁纸（此前只能给取色，封面固定是渐变占位图）", en: "New MediaSnapshot.thumbnail: the host can now pass the real album cover to web wallpapers (previously only colors were available, and the cover was always a gradient placeholder)" }],
           [{ zh: "1.3.5", en: "1.3.5" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "xray 效果：作者未在场景里配置 size 时，缺省从 shader 注释的 0.2 改为 1（恒等）", en: "xray effect: when the author doesn't configure size in the scene, the fallback is now 1 (identity) instead of the shader comment's 0.2" }],
           [{ zh: "1.3.4", en: "1.3.4" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理", en: "Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount" }],
           [{ zh: "1.3.3", en: "1.3.3" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等", en: "Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more" }],
@@ -500,6 +501,13 @@ export const DOC: DocSection[] = [
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
         ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.6 只有一项，补的是媒体快照里缺的封面通道。此前 MediaSnapshot 只有 hasThumbnail 和五个取色字段，没有图片本体：网页壁纸的 mediaThumbnailChanged 收到的 event.thumbnail 是库拿 primary/secondary 现画的 64×64 渐变块，语料里 `img.src = e.thumbnail` 那类写法能跑但显示的不是真封面。现在 MediaSnapshot 与 createMediaSource 都多一个可选的 thumbnail（data URL 或同源 URL），宿主填了就原样透传给壁纸，没填仍走渐变占位图；只给 thumbnail 不给 hasThumbnail 时后者自动为真。另外事件 diff 也把 thumbnail 纳入判定 —— 系统媒体接口普遍先给歌名再补封面，只看 hasThumbnail/trackIndex 会漏掉「同一首歌补上封面」这一次变化。场景（WebGL）壁纸不受影响：它们的脚本只读 hasThumbnail 与取色，不消费图片本体。",
+          en: "1.3.6 contains a single change: the missing cover channel in the media snapshot. MediaSnapshot previously carried only hasThumbnail plus the five color fields, with no image data — the event.thumbnail delivered to a web wallpaper's mediaThumbnailChanged was a 64×64 gradient the library painted from primary/secondary, so corpus code like `img.src = e.thumbnail` ran but never showed a real cover. MediaSnapshot and createMediaSource now both take an optional thumbnail (data URL or same-origin URL): when the host supplies it, it is passed through verbatim; when it doesn't, the gradient placeholder is still used. Supplying thumbnail without hasThumbnail implies the latter. The event diff also accounts for thumbnail now — system media interfaces typically deliver the track name first and the artwork a moment later, so watching only hasThumbnail/trackIndex would miss the \"same track, cover just arrived\" transition. Scene (WebGL) wallpapers are unaffected: their scripts read only hasThumbnail and the colors, never the image itself.",
+        },
       },
       {
         k: "p",

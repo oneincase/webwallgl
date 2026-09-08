@@ -134,6 +134,50 @@ for (const name of REQUIRED_WP) {
   check(defined.has(name), `契约面：window.__wp.${name} 在 main.ts 里缺失（见 docs/INTEGRATION.md）`);
 }
 
+// 发布类型的契约面：api/index.ts 是运行时导出清单，api/entry.d.ts 是手写的
+// 类型声明（build:lib 原样拷成 dist/lib/webwallgl.d.ts）。两边必须一一对应 ——
+// 只在 index.ts 里加导出会让消费方 `import { X } from "webwallgl"` 报 TS2305，
+// 而库自己的 typecheck 全绿（entry.d.ts 不参与主项目编译），所以必须机器比对。
+// 1.3.6 之前 createMediaSource / mediaColor / mediaSource / sniffMediaType
+// 四个运行时导出全都漏在 entry.d.ts 外，实测就是 TS2305。
+{
+  const indexTs = fs.readFileSync(path.join(ROOT, "renderer/src/api/index.ts"), "utf8");
+  const entryDts = fs.readFileSync(path.join(ROOT, "renderer/src/api/entry.d.ts"), "utf8");
+  // 值导出：`export { a, b } from "./x"`（跳过 `export type { ... }`）
+  const runtime = new Set();
+  const reExportRe = /export\s+\{([^}]*)\}\s+from/g;
+  let m;
+  while ((m = reExportRe.exec(indexTs))) {
+    const before = indexTs.slice(Math.max(0, m.index - 20), m.index + m[0].length);
+    if (/export\s+type\s*\{/.test(before)) continue;
+    for (const raw of m[1].split(",")) {
+      const name = raw.trim().split(/\s+as\s+/).pop()?.trim();
+      if (name && !name.startsWith("type ")) runtime.add(name);
+    }
+  }
+  check(runtime.size > 0, "契约面：无法从 api/index.ts 解析出运行时导出清单");
+  for (const name of runtime) {
+    check(
+      new RegExp(`export declare function ${name}\\b`).test(entryDts),
+      `契约面：api/index.ts 导出了 ${name}()，但 api/entry.d.ts 未声明 —— 消费方 import 会 TS2305`,
+    );
+  }
+  // 反向：entry.d.ts 声明了运行时并不导出的函数（改名后残留），同样是坏契约
+  const declaredRe = /export declare function (\w+)/g;
+  while ((m = declaredRe.exec(entryDts))) {
+    check(
+      runtime.has(m[1]),
+      `契约面：api/entry.d.ts 声明了 ${m[1]}()，但 api/index.ts 并未导出它`,
+    );
+  }
+  // 类型本体只能定义在 types.ts：tsconfig.lib-types.json 只编译那一个文件，
+  // entry.d.ts 从别处 import 类型会在发布包里解析失败
+  check(
+    /from "\.\/types"/.test(entryDts) && !/from "\.\/(?!types")/.test(entryDts),
+    "契约面：api/entry.d.ts 只能从 ./types 导入类型（别处的类型不进发布的 types.d.ts）",
+  );
+}
+
 // README 约定 GET scene.pkg 再回退 scenes/scene.pkg。WKWebView 对缺失路径抛
 // Failed to fetch，若源码仍先打 scenes/，本机 178 张根目录 pkg 会整场失败。
 // 2026-09-03 库化改造：这段逻辑从 scene-mount 搬到 api/source.ts 的 httpSource

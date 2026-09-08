@@ -130,6 +130,17 @@ export type MediaSnapshot = {
   position: number;
   duration: number;
   hasThumbnail: boolean;
+  /**
+   * 真实封面图（data URL 或同源 URL）。宿主能拿到系统封面时给这里，
+   * 网页壁纸的 `mediaThumbnailChanged(e)` 会直接收到它作为 `e.thumbnail`。
+   *
+   * 留空时库用 primary/secondary 生成一张渐变占位图 —— 保证语料里
+   * `img.src = e.thumbnail` 那类写法不会拿到空串，但显示的不是真专辑封面。
+   *
+   * 注意场景（WebGL）壁纸不消费图片本体，其脚本只读 `e.hasThumbnail` 与取色，
+   * 所以这个字段只对网页壁纸有效。
+   */
+  thumbnail?: string;
   /** 封面取色。见 MediaColor 的类型约束 */
   primaryColor: MediaColor;
   secondaryColor: MediaColor;
@@ -162,6 +173,59 @@ export type MediaSource = {
   /** 每帧由渲染循环推进（tSec 为场景时间，秒）。无状态的实现可留空函数 */
   update?(tSec: number): void;
   readonly snapshot: MediaSnapshot;
+  skipNext?(): void;
+  skipPrevious?(): void;
+  play?(): void;
+  pause?(): void;
+  playPause?(): void;
+};
+
+/**
+ * `createMediaSource(init, controls)` 的 init：宿主通常拿得到的那部分字段，
+ * 其余（配色、歌词行、trackIndex）由库补默认值。
+ *
+ * 类型本体放在这里而不是 api/media-source.ts，是因为只有本文件会被
+ * tsconfig.lib-types.json 编成发布的 types.d.ts —— 定义在别处的话
+ * 消费方 `import { createMediaSource } from "webwallgl"` 摸不到入参类型。
+ */
+export type MediaSourceInit = {
+  hasMedia?: boolean;
+  /** 0=停止 1=播放 2=暂停；也接受布尔 playing（true→1、false→2） */
+  state?: MediaPlaybackState;
+  playing?: boolean;
+  title?: string;
+  artist?: string;
+  album?: string;
+  albumArtist?: string;
+  /** 秒 */
+  position?: number;
+  duration?: number;
+  hasThumbnail?: boolean;
+  /**
+   * 真实封面图（data URL 或同源 URL）。给了就直接透给网页壁纸的
+   * `mediaThumbnailChanged(e).thumbnail`；不给则库生成渐变占位图。
+   * 传了非空值时 hasThumbnail 自动视为 true
+   */
+  thumbnail?: string;
+  primaryColor?: MediaColorInit;
+  secondaryColor?: MediaColorInit;
+  tertiaryColor?: MediaColorInit;
+  textColor?: MediaColorInit;
+  highContrastColor?: MediaColorInit;
+  trackIndex?: number;
+  /** [秒, 文本] 按时间升序；库按 position 定位当前行 */
+  lyrics?: Array<[number, string]>;
+};
+
+/** `mediaColor()` 与配色字段接受的形态 */
+export type MediaColorInit =
+  | number
+  | number[]
+  | { x: number; y: number; z: number }
+  | MediaColor;
+
+/** `createMediaSource(init, controls)` 的 controls：宿主转发给真实播放器 */
+export type MediaSourceControls = {
   skipNext?(): void;
   skipPrevious?(): void;
   play?(): void;

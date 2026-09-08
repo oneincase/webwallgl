@@ -316,11 +316,19 @@ export function diffMediaEvents(prev, snap) {
       },
     })
   }
-  if (first || prev.hasThumbnail !== snap.hasThumbnail || prev.trackIndex !== snap.trackIndex) {
+  // thumbnail 也要参与判定：真实封面常晚于元信息到达（系统媒体接口先给
+  // 歌名再补封面），只看 hasThumbnail/trackIndex 会漏掉「同一首歌补上封面」
+  if (
+    first ||
+    prev.hasThumbnail !== snap.hasThumbnail ||
+    prev.trackIndex !== snap.trackIndex ||
+    prev.thumbnail !== snap.thumbnail
+  ) {
     out.push({
       name: 'mediaThumbnailChanged',
       event: {
         hasThumbnail: snap.hasThumbnail,
+        thumbnail: snap.thumbnail,
         primaryColor: snap.primaryColor,
         secondaryColor: snap.secondaryColor,
         tertiaryColor: snap.tertiaryColor,
@@ -353,7 +361,7 @@ export function cloneMediaSnapshot(s) {
     hasMedia: s.hasMedia, state: s.state,
     title: s.title, artist: s.artist, album: s.album, albumArtist: s.albumArtist,
     position: s.position, duration: s.duration,
-    hasThumbnail: s.hasThumbnail, trackIndex: s.trackIndex,
+    hasThumbnail: s.hasThumbnail, thumbnail: s.thumbnail, trackIndex: s.trackIndex,
     lyricIndex: s.lyricIndex, lyricLine: s.lyricLine,
   }
 }

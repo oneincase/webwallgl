@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -320,10 +320,11 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.5。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.6。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.6` | 2026-09-08 | 新增 MediaSnapshot.thumbnail：宿主可把真实专辑封面透传给网页壁纸（此前只能给取色，封面固定是渐变占位图） |
 | `1.3.5` | 2026-09-08 | xray 效果：作者未在场景里配置 size 时，缺省从 shader 注释的 0.2 改为 1（恒等） |
 | `1.3.4` | 2026-09-08 | 补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理 |
 | `1.3.3` | 2026-09-08 | 全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等 |
@@ -334,6 +335,8 @@ b.pause(); // 不影响 a
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.6 只有一项，补的是媒体快照里缺的封面通道。此前 MediaSnapshot 只有 hasThumbnail 和五个取色字段，没有图片本体：网页壁纸的 mediaThumbnailChanged 收到的 event.thumbnail 是库拿 primary/secondary 现画的 64×64 渐变块，语料里 `img.src = e.thumbnail` 那类写法能跑但显示的不是真封面。现在 MediaSnapshot 与 createMediaSource 都多一个可选的 thumbnail（data URL 或同源 URL），宿主填了就原样透传给壁纸，没填仍走渐变占位图；只给 thumbnail 不给 hasThumbnail 时后者自动为真。另外事件 diff 也把 thumbnail 纳入判定 —— 系统媒体接口普遍先给歌名再补封面，只看 hasThumbnail/trackIndex 会漏掉「同一首歌补上封面」这一次变化。场景（WebGL）壁纸不受影响：它们的脚本只读 hasThumbnail 与取色，不消费图片本体。
 
 1.3.5 只有一项，改的是 xray 效果的缺省值。xray 的 size 决定效果范围（内部取倒数，size=1 是恒等）。作者若没在场景的 constantshadervalues 里写 size，此前会套用 shader 声明注释里的 "default":0.2 —— 但那是 WE 编辑器新建效果时滑条的初始位置，不是运行时缺省：编辑器一旦把效果加到层上就会把当时的滑条值写进场景文件，所以官方运行时永远读得到显式值。套 0.2 会让效果范围缩成五分之一，只剩光标旁一小块。现在缺省是 1。作用面收窄在这一个参数上，multiply 与贴图槽的注释缺省不变。
 

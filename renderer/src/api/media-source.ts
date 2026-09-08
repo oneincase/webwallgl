@@ -15,6 +15,9 @@ import type {
   MediaPlaybackState,
   MediaSnapshot,
   MediaSource,
+  MediaSourceInit,
+  MediaSourceControls,
+  MediaColorInit,
 } from "./types";
 
 /** 与引擎侧 MediaVec3 同构的颜色三元组（链式方法齐全，且都返回新实例） */
@@ -49,7 +52,7 @@ class Color implements MediaColor {
  * 已经是本类型时原样返回（避免重复包装）。
  */
 export function mediaColor(
-  r: number | number[] | { x: number; y: number; z: number } | MediaColor,
+  r: MediaColorInit,
   g?: number,
   b?: number,
 ): MediaColor {
@@ -62,37 +65,8 @@ export function mediaColor(
   return new Color(r as number, g ?? 0, b ?? 0);
 }
 
-/** 宿主通常拿得到的那部分字段；其余由本模块补默认值 */
-export type MediaSourceInit = {
-  hasMedia?: boolean;
-  /** 0=停止 1=播放 2=暂停；也接受布尔 playing（true→1、false→2） */
-  state?: MediaPlaybackState;
-  playing?: boolean;
-  title?: string;
-  artist?: string;
-  album?: string;
-  albumArtist?: string;
-  /** 秒 */
-  position?: number;
-  duration?: number;
-  hasThumbnail?: boolean;
-  primaryColor?: Parameters<typeof mediaColor>[0];
-  secondaryColor?: Parameters<typeof mediaColor>[0];
-  tertiaryColor?: Parameters<typeof mediaColor>[0];
-  textColor?: Parameters<typeof mediaColor>[0];
-  highContrastColor?: Parameters<typeof mediaColor>[0];
-  trackIndex?: number;
-  lyrics?: Array<[number, string]>;
-};
-
-/** 控制方法：宿主转发给真实播放器 */
-export type MediaSourceControls = {
-  skipNext?(): void;
-  skipPrevious?(): void;
-  play?(): void;
-  pause?(): void;
-  playPause?(): void;
-};
+/** 类型本体已搬到 ./types（发布的 types.d.ts 只由那一个文件生成），这里转发 */
+export type { MediaSourceInit, MediaSourceControls } from "./types";
 
 const DEF_PRIMARY: [number, number, number] = [0.35, 0.38, 0.45];
 const DEF_SECONDARY: [number, number, number] = [0.12, 0.13, 0.17];
@@ -121,6 +95,7 @@ function buildSnapshot(init: MediaSourceInit): MediaSnapshot {
   const { line, index } = locateLyric(lyrics, position);
   const state: MediaPlaybackState =
     init.state !== undefined ? init.state : init.playing === false ? 2 : init.playing ? 1 : 0;
+  const thumbnail = init.thumbnail ? String(init.thumbnail) : "";
   return {
     hasMedia: init.hasMedia ?? (init.title != null || init.artist != null || !!init.playing),
     state,
@@ -130,7 +105,9 @@ function buildSnapshot(init: MediaSourceInit): MediaSnapshot {
     albumArtist: String(init.albumArtist ?? init.artist ?? ""),
     position,
     duration: Number(init.duration) || 0,
-    hasThumbnail: init.hasThumbnail ?? false,
+    // 给了真封面就必然「有封面」，省得宿主两个字段都要记着填
+    hasThumbnail: init.hasThumbnail ?? !!thumbnail,
+    ...(thumbnail ? { thumbnail } : {}),
     primaryColor: mediaColor(init.primaryColor ?? DEF_PRIMARY),
     secondaryColor: mediaColor(init.secondaryColor ?? DEF_SECONDARY),
     tertiaryColor: mediaColor(init.tertiaryColor ?? DEF_TERTIARY),

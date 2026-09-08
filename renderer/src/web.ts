@@ -612,11 +612,19 @@ function vecToCss(v: { x?: number; y?: number; z?: number } | null | undefined):
   return `rgb(${r},${g},${b})`;
 }
 
-/** 给网页 MediaThumbnailListener 一张 data URL 封面（语料读 event.thumbnail） */
+/**
+ * 给网页 MediaThumbnailListener 一张封面 data URL（语料读 event.thumbnail）。
+ *
+ * 宿主给了真实封面（snapshot.thumbnail）就直接透传；否则拿 primary/secondary
+ * 画一张渐变占位图 —— 语料里 `img.src = e.thumbnail` 那类写法不能拿到空串。
+ */
 function thumbDataUrlFromSnap(snap: {
+  thumbnail?: unknown;
   primaryColor?: { x?: number; y?: number; z?: number };
   secondaryColor?: { x?: number; y?: number; z?: number };
 }): string {
+  const real = typeof snap.thumbnail === "string" ? snap.thumbnail.trim() : "";
+  if (real) return real;
   try {
     const c = document.createElement("canvas");
     c.width = c.height = 64;
@@ -668,6 +676,7 @@ function pushMediaDiff(
       );
     } else if (name === "mediaThumbnailChanged") {
       const thumb = thumbDataUrlFromSnap(snap as {
+        thumbnail?: unknown;
         primaryColor?: { x?: number; y?: number; z?: number };
         secondaryColor?: { x?: number; y?: number; z?: number };
       });

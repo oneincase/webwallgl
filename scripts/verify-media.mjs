@@ -289,6 +289,37 @@ const { check, errors } = createChecker();
     `只改播放态不应派发 mediaPropertiesChanged，实得 ${JSON.stringify(evState)}`,
   );
 
+  // 真实封面（宿主给的 snapshot.thumbnail）晚到也要派发：系统媒体接口普遍
+  // 先给歌名再补封面，若只看 hasThumbnail/trackIndex，同一首歌补上的封面会被吞掉
+  const withThumb = { ...snap, thumbnail: "data:image/jpeg;base64,AAAA" };
+  const evThumb = diffMediaEvents(snap, withThumb).map((e) => e.name);
+  check(
+    evThumb.includes("mediaThumbnailChanged"),
+    `thumbnail 变化应派发 mediaThumbnailChanged，实得 ${JSON.stringify(evThumb)}`,
+  );
+  // 同一首歌换图同样要派发
+  const otherThumb = { ...withThumb, thumbnail: "data:image/jpeg;base64,BBBB" };
+  check(
+    diffMediaEvents(withThumb, otherThumb).map((e) => e.name).includes("mediaThumbnailChanged"),
+    "换封面应派发 mediaThumbnailChanged",
+  );
+  // 事件里必须带 thumbnail 本体，否则 web 侧拿不到真图
+  const thEv = diffMediaEvents(snap, withThumb).find((e) => e.name === "mediaThumbnailChanged");
+  check(
+    thEv && thEv.event.thumbnail === withThumb.thumbnail,
+    `mediaThumbnailChanged 应透传 thumbnail，实得 ${thEv && thEv.event.thumbnail}`,
+  );
+  // clone 必须保留 thumbnail，否则下一帧 diff 会误判「又变了」而每帧重复派发
+  const clonedThumb = cloneMediaSnapshot(withThumb);
+  check(
+    clonedThumb.thumbnail === withThumb.thumbnail,
+    "cloneMediaSnapshot 应保留 thumbnail（否则每帧重复派发缩略图事件）",
+  );
+  check(
+    diffMediaEvents(clonedThumb, withThumb).length === 0,
+    "带 thumbnail 的快照 clone 后 diff 应为空",
+  );
+
   // 播放态事件必须带 state，且取值在枚举内
   const pb = diffMediaEvents(null, sim.snapshot).find((e) => e.name === "mediaPlaybackChanged");
   check(
@@ -1169,6 +1200,16 @@ const { check, errors } = createChecker();
     'wireOptions 必须用 `"media" in o` 判定（无条件覆盖会让 load() 冲掉 setMedia 装的源）');
   check(/setMedia\(src: MediaSource \| null\)/.test(typesTs), "SceneInstance 必须声明 setMedia");
   check(/readonly media: MediaControl/.test(typesTs), "SceneInstance 必须声明 media 控制面");
+
+  // 真实封面：宿主给了 snapshot.thumbnail 就必须透传给网页壁纸，
+  // 不能拿取色渐变块把它盖掉（那样壁纸永远显示不出真专辑图）
+  check(/thumbnail\?: string/.test(typesTs),
+    "MediaSnapshot 应声明可选 thumbnail（宿主传真实封面的通道）");
+  check(/snap\.thumbnail/.test(webTs),
+    "web.ts 的 thumbDataUrlFromSnap 必须优先用 snap.thumbnail（真实封面）");
+  // 回落路径不能删：语料里 `img.src = e.thumbnail` 拿到空串会显示破图
+  check(/createLinearGradient/.test(webTs),
+    "web.ts 仍需保留渐变占位图作回落（宿主没有真封面时）");
   // 推进的必须是当前 driver，不能写死 simMedia（注入源就收不到 update）
   check(!/else simMedia\.update\(t\)/.test(sceneTs),
     "scene 渲染循环不得写死推进 simMedia（注入的 driver 会收不到 update）");
