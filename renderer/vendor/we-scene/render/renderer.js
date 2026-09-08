@@ -217,6 +217,33 @@ export function rewriteXrayFragScale(fragGlsl) {
   return out.replace(from, 'unprojectedUVs *= ' + XRAY_FRAG_UV_SCALE + ' *')
 }
 
+/**
+ * xray 的 `size` 在作者没配时该取多少。
+ *
+ * shader 注释写的是 `"default":0.2`，但那是**编辑器新建效果时滑条的初始位置**，
+ * 不是运行时缺省：WE 编辑器一旦把效果加到层上，就会把当时的滑条值写进
+ * `constantshadervalues`，所以官方运行时永远读得到一个显式值，注释里的 0.2
+ * 从来没被当作 fallback 用过（本地库 17 个 xray pass 全都显式带 size）。
+ *
+ * 我们这边不一样：`bindConstants` 的兜底循环在缺键时会套用注释 default，
+ * 于是 csv 里没有 `size` 的 pass 拿到 0.2 —— 经 `xrayUvScale` 取倒数是 5，
+ * UV 被放大五倍，效果范围缩成光标旁一小块。缺省应当是**恒等**：1 时
+ * `1/1 = 1`，UV 不缩放，效果范围就等于作者给的 halo 贴图本身。
+ *
+ * 只对 `g_PointerScale` 生效：其余 uniform 的注释 default（`multiply` 的 1、
+ * 贴图槽的 `particle/halo_6`）与编辑器初值一致，动了会回归。
+ */
+export const XRAY_SIZE_FALLBACK = 1
+
+/**
+ * 缺键时该用哪个 default。返回 undefined 表示「不设这个 uniform」。
+ * 抽成纯函数供离线判据调用，不要在测试里再抄一份分支。
+ */
+export function constantFallback(uniformName, declaredDefault) {
+  if (uniformName === 'g_PointerScale') return XRAY_SIZE_FALLBACK
+  return declaredDefault
+}
+
 export function createRenderer(canvas, opts = {}) {
   const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, antialias: false, alpha: false, preserveDrawingBuffer: true })
   if (!gl) throw new Error('当前浏览器不支持 WebGL2')
@@ -736,10 +763,12 @@ export function createRenderer(canvas, opts = {}) {
       if (!entry) continue
       setConstant(uni, entry.uniform, value)
     }
-    // 未提供的常数用 shader 注释里的 default
+    // 未提供的常数用 shader 注释里的 default。
+    // xray 的 size 例外走 constantFallback（注释 0.2 是编辑器初值不是运行时缺省）。
     for (const [matKey, entry] of Object.entries(matMeta || {})) {
       if (!constants || !(matKey in constants)) {
-        if (entry.default !== undefined) setConstant(uni, entry.uniform, entry.default)
+        const dflt = constantFallback(entry.uniform, entry.default)
+        if (dflt !== undefined) setConstant(uni, entry.uniform, dflt)
       }
     }
   }

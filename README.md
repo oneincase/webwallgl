@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -320,10 +320,11 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.4。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.5。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.5` | 2026-09-08 | xray 效果：作者未在场景里配置 size 时，缺省从 shader 注释的 0.2 改为 1（恒等） |
 | `1.3.4` | 2026-09-08 | 补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理 |
 | `1.3.3` | 2026-09-08 | 全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等 |
 | `1.3.2` | 2026-09-08 | 修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流 |
@@ -333,6 +334,8 @@ b.pause(); // 不影响 a
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.5 只有一项，改的是 xray 效果的缺省值。xray 的 size 决定效果范围（内部取倒数，size=1 是恒等）。作者若没在场景的 constantshadervalues 里写 size，此前会套用 shader 声明注释里的 "default":0.2 —— 但那是 WE 编辑器新建效果时滑条的初始位置，不是运行时缺省：编辑器一旦把效果加到层上就会把当时的滑条值写进场景文件，所以官方运行时永远读得到显式值。套 0.2 会让效果范围缩成五分之一，只剩光标旁一小块。现在缺省是 1。作用面收窄在这一个参数上，multiply 与贴图槽的注释缺省不变。
 
 1.3.4 收掉 1.3.3 结尾列为「留待后续」的四项，都是能观测到的行为偏差，不是清理式重构：
 

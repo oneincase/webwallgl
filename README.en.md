@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.5/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -321,10 +321,11 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.4. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.5. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.5` | 2026-09-08 | xray effect: when the author doesn't configure size in the scene, the fallback is now 1 (identity) instead of the shader comment's 0.2 |
 | `1.3.4` | 2026-09-08 | Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount |
 | `1.3.3` | 2026-09-08 | Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more |
 | `1.3.2` | 2026-09-08 | Fix: the "live system" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream |
@@ -334,6 +335,8 @@ Current version: 1.3.4. This section records only user-visible changes (API, beh
 | `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
+
+1.3.5 contains a single change: the xray effect's fallback value. xray's size drives the effect radius (it is inverted internally, so size=1 is identity). When the author doesn't write size into the scene's constantshadervalues, the shader declaration comment's "default":0.2 used to be applied — but that is the slider's initial position when the WE editor creates the effect, not a runtime fallback: as soon as the editor attaches the effect to a layer it writes the current slider value into the scene file, so the official runtime always reads an explicit value. Applying 0.2 shrank the effect radius to a fifth, leaving only a small patch around the cursor. The fallback is now 1. The change is scoped to this one parameter; the comment defaults for multiply and the texture slots are unchanged.
 
 1.3.4 closes the four items 1.3.3 listed as deferred. All four are observable behaviour bugs, not cleanup refactors:
 

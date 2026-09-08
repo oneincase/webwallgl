@@ -858,7 +858,7 @@ console.log('\n【5. 指针 shader 转译产物】')
   // 判据：纯函数方向（size↑ → UV scale↓ → 范围↑）、rewrite 接线、
   // 旧版 *= g 同样取倒数（1586038665 调到 10 曾只剩小圆点）。
   {
-    const { xrayUvScale, rewriteXrayFragScale } = await import(
+    const { xrayUvScale, rewriteXrayFragScale, constantFallback, XRAY_SIZE_FALLBACK } = await import(
       path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js')
     ).catch(() => ({}))
     if (typeof xrayUvScale !== 'function') {
@@ -940,6 +940,44 @@ console.log('\n【5. 指针 shader 转译产物】')
       const r1 = cssR(1, 1280), r2 = cssR(2, 1280)
       if (!(r2 > r1)) fail(`size 2 的效果范围 (${r2.toFixed(1)}) 应大于 size 1 (${r1.toFixed(1)})`)
       else ok(`xray 效果范围与 dpr 无关（size 1→2：覆盖 ${r1.toFixed(0)}px → ${r2.toFixed(0)}px）`)
+    }
+
+    // [we-scene patch] 作者没在 constantshadervalues 里写 size 时的缺省。
+    //
+    // shader 注释是 `"default":0.2`，那是**编辑器新建效果时滑条的初值**，
+    // 不是运行时缺省：WE 编辑器把效果加到层上就会把当时的滑条值写进 csv，
+    // 官方运行时永远读得到显式值（本地库 17 个 xray pass 全都带 size）。
+    // 我们的 bindConstants 兜底循环却会把 0.2 当 fallback 套上去，
+    // 经 xrayUvScale 取倒数是 5 —— UV 放大五倍，效果范围缩成光标旁一小块。
+    // 缺省要的是恒等：1。
+    if (typeof constantFallback !== 'function') {
+      fail('renderer.js 未导出 constantFallback（xray size 缺省无离线入口）')
+    } else {
+      if (XRAY_SIZE_FALLBACK !== 1) {
+        fail(`XRAY_SIZE_FALLBACK 应为 1（恒等），得到 ${XRAY_SIZE_FALLBACK}`)
+      }
+      const fb = constantFallback('g_PointerScale', 0.2)
+      if (fb !== 1) {
+        fail(`作者未配置 size 时 g_PointerScale 缺省应为 1，得到 ${fb}` +
+          '（用注释里的 0.2 会让效果范围缩成 1/5）')
+      } else if (typeof xrayUvScale === 'function' && Math.abs(xrayUvScale(fb) - 1) > 1e-9) {
+        fail(`缺省 size 经 xrayUvScale 应得恒等 1，得到 ${xrayUvScale(fb)}`)
+      } else ok('xray size 未配置时缺省为 1（UV 恒等，效果范围 = halo 本身）')
+      // 只能改 g_PointerScale 这一个：其余 uniform 的注释 default 与编辑器初值
+      // 一致（multiply=1、贴图槽 particle/halo_6），跟着改会伤到别的效果。
+      if (constantFallback('g_Multiply', 1) !== 1) {
+        fail('constantFallback 不应改动 g_Multiply 的注释 default')
+      }
+      if (constantFallback('g_Texture2', 'particle/halo_6') !== 'particle/halo_6') {
+        fail('constantFallback 不应改动贴图槽的注释 default')
+      }
+      if (constantFallback('g_SomeOther', undefined) !== undefined) {
+        fail('无注释 default 的 uniform 不该被 constantFallback 凭空设值')
+      }
+      // 接线：兜底循环必须真的经过 constantFallback，不能只导出函数不用
+      if (!/const\s+dflt\s*=\s*constantFallback\(\s*entry\.uniform\s*,\s*entry\.default\s*\)/.test(rendererSrc)) {
+        fail('bindConstants 的兜底循环未经过 constantFallback（导出了函数但没接线）')
+      } else ok('bindConstants 缺省分支接到 constantFallback')
     }
   }
   // [we-scene patch] 初始加载：xray 开窗不能停在壁纸圆心。

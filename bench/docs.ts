@@ -489,6 +489,7 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.5", en: "1.3.5" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "xray 效果：作者未在场景里配置 size 时，缺省从 shader 注释的 0.2 改为 1（恒等）", en: "xray effect: when the author doesn't configure size in the scene, the fallback is now 1 (identity) instead of the shader comment's 0.2" }],
           [{ zh: "1.3.4", en: "1.3.4" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理", en: "Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount" }],
           [{ zh: "1.3.3", en: "1.3.3" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等", en: "Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more" }],
           [{ zh: "1.3.2", en: "1.3.2" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流", en: "Fix: the \"live system\" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream" }],
@@ -499,6 +500,13 @@ export const DOC: DocSection[] = [
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
         ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.5 只有一项，改的是 xray 效果的缺省值。xray 的 size 决定效果范围（内部取倒数，size=1 是恒等）。作者若没在场景的 constantshadervalues 里写 size，此前会套用 shader 声明注释里的 \"default\":0.2 —— 但那是 WE 编辑器新建效果时滑条的初始位置，不是运行时缺省：编辑器一旦把效果加到层上就会把当时的滑条值写进场景文件，所以官方运行时永远读得到显式值。套 0.2 会让效果范围缩成五分之一，只剩光标旁一小块。现在缺省是 1。作用面收窄在这一个参数上，multiply 与贴图槽的注释缺省不变。",
+          en: "1.3.5 contains a single change: the xray effect's fallback value. xray's size drives the effect radius (it is inverted internally, so size=1 is identity). When the author doesn't write size into the scene's constantshadervalues, the shader declaration comment's \"default\":0.2 used to be applied — but that is the slider's initial position when the WE editor creates the effect, not a runtime fallback: as soon as the editor attaches the effect to a layer it writes the current slider value into the scene file, so the official runtime always reads an explicit value. Applying 0.2 shrank the effect radius to a fifth, leaving only a small patch around the cursor. The fallback is now 1. The change is scoped to this one parameter; the comment defaults for multiply and the texture slots are unchanged.",
+        },
       },
       {
         k: "p",
