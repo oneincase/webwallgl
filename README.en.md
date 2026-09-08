@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -321,10 +321,11 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.2. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.3. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.3` | 2026-09-08 | Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more |
 | `1.3.2` | 2026-09-08 | Fix: the "live system" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream |
 | `1.3.1` | 2026-09-08 | Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream) |
 | `1.3.0` | 2026-09-08 | mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web |
@@ -332,6 +333,18 @@ Current version: 1.3.2. This section records only user-visible changes (API, beh
 | `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
+
+1.3.3 is a full audit covering unwired API, defects and memory leaks. Everything fixed here was confirmed by measurement:
+
+- **autoplay:false hung mount() forever** (scene and media wallpapers): pausing before assembly meant the render loop never ran a single frame, so the only first-frame trigger was unreachable and the promise neither resolved nor rejected. Measured: the same wallpaper resolved by default but was still pending after 500 live rAF frames with autoplay:false. It now assembles normally and pauses after the first frame is drawn
+- The first-frame callback now fires after render() completes (previously it ran before the render call, landing one frame early, so autoplay:false handed back a blank canvas)
+- **setMedia() was inert on scene wallpapers**: the scene captured its media driver once at assembly, while setMedia is typically called after mount(). It now re-picks on every read (the web path already did)
+- **Swapping wallpapers leaked an AudioContext**: the video spectrum takeover registered its release on the instance-level list, but swapping goes through clear() while only destroy() drained it. Browsers cap out at roughly 6 AudioContexts, after which audio reactivity silently dies. A per-wallpaper release list is now drained by clear()
+- **One throwing cleanup dropped the entire teardown**: clear() called the assembly-layer cleanup without try/catch, so a single exception skipped the WebGL context release, video element recycling and blob revocation that followed
+- **Swapping wallpapers during the mic permission prompt orphaned the stream**: getUserMedia blocks on the system dialog, and the release was registered after the await, so nothing on that path ever called it and the browser's recording indicator stayed lit. Both assembly paths now register the release slot synchronously
+- The instance.media control surface is reset by clear() (previously it still pointed at the destroyed scene's sandbox closures after release()/destroy())
+
+Still unwired by design (marked in the type comments): MountOptions' pointer and features. Use pushPointer() to feed pointer state from outside.
 
 1.3.2 closes the **second channel** of the same symptom: 1.3.1 fixed host injection (setAudio), while the bench's "live system" checkbox takes a different path (cfg.liveSystem, where the library captures the microphone itself). That path was only consumed by the scene assembly — web.ts referenced liveSystem zero times — so ticking the box made scene visualizers follow the mic while web wallpapers stayed on the synthetic stream.
 

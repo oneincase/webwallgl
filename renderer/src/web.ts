@@ -924,9 +924,36 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
     startAudioPump(rt, audioDriver, frameClock, liveHold);
     startMediaPump(rt, mediaDriver);
     if (cfg.liveSystem && audioDriver) {
+      // 释放槽**同步登记**，不能等 await 回来再挂：getUserMedia 会阻塞在系统
+      // 授权弹窗上，时长不可控。若这期间用户换了壁纸，clear() 早已跑过，
+      // 之后再挂的清理没人会调 —— 麦克风流不停、浏览器录音指示一直亮。
+      const liveSlot: { handle: { dispose(): void } | null; dead: boolean } = {
+        handle: null,
+        dead: false,
+      };
+      (rt.wallpaperDisposers ??= []).push(() => {
+        liveSlot.dead = true;
+        liveHold.driver = null;
+        try {
+          liveSlot.handle?.dispose();
+        } catch {
+          /* 忽略 */
+        }
+        liveSlot.handle = null;
+      });
       void (async () => {
         try {
           const live = await startLiveSystem({ origin: location.origin });
+          // 授权期间已被拆掉：立刻释放，不要挂上去
+          if (liveSlot.dead) {
+            try {
+              live.dispose();
+            } catch {
+              /* 忽略 */
+            }
+            return;
+          }
+          liveSlot.handle = live;
           const st = live.status();
           if (st.audio === "mic") {
             liveHold.driver = liveAudioDriver(live);
@@ -934,17 +961,6 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
           } else {
             reportDiag(rt, cfg, `liveSystem: 麦克风不可用（${st.audio}），网页壁纸沿用模拟源`);
           }
-          const prev = rt.sceneCleanup;
-          rt.sceneCleanup = () => {
-            liveHold.driver = null;
-            // 必须释放：麦克风流不停，浏览器地址栏的录音指示会一直亮着
-            try {
-              live.dispose();
-            } catch {
-              /* 忽略 */
-            }
-            prev?.();
-          };
         } catch (e) {
           reportDiag(rt, cfg, `liveSystem: 启动失败，网页壁纸沿用模拟源 (${(e as Error)?.message ?? e})`);
         }

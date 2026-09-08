@@ -146,7 +146,7 @@ function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElem
   const bins = new Uint8Array(analyser.frequencyBinCount);
   const left = new Float32Array(64);
   const right = new Float32Array(64);
-  rt.audioBridge = () => {
+  const bridge = () => {
     // suspended（未交互）时没有数据，返回 null 让引擎回落模拟源
     if (ctx.state !== "running") return null;
     analyser.getByteFrequencyData(bins);
@@ -162,6 +162,7 @@ function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElem
     }
     return { left, right };
   };
+  rt.audioBridge = bridge;
   // 自动播放策略：用户首次交互后再 resume（一次性）
   if (ctx.state === "suspended") {
     const kick = () => {
@@ -171,13 +172,15 @@ function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElem
     };
     window.addEventListener("pointerdown", kick, { once: true });
     window.addEventListener("keydown", kick, { once: true });
-    rt.disposers?.push(() => {
+    (rt.wallpaperDisposers ??= []).push(() => {
       window.removeEventListener("pointerdown", kick);
       window.removeEventListener("keydown", kick);
     });
   }
-  rt.disposers?.push(() => {
-    rt.audioBridge = null;
+  (rt.wallpaperDisposers ??= []).push(() => {
+    // 只在仍是"我装的那个"时才撤：宿主可能在本壁纸生命周期内调过
+    // setAudio() 换成自己的源，那时不该被这里清掉
+    if (rt.audioBridge === bridge) rt.audioBridge = null;
     void ctx.close().catch(() => {});
   });
 }
@@ -446,17 +449,6 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
         if (now - lastRender >= 1000 / fps) {
           lastRender = now;
           markFrame(rt, now);
-          // 库化桥接：首帧真正提交渲染 → resolve mount() 的 Promise（一次性）。
-          // 与 mountScene 同位置同写法：先摘钩子再调，避免订阅者里再触发一次。
-          if (rt.onFirstFrame) {
-            const first = rt.onFirstFrame;
-            rt.onFirstFrame = undefined;
-            try {
-              first();
-            } catch {
-              /* 订阅者抛错不打断渲染循环 */
-            }
-          }
           syncCanvasSize(rt, c, rt.cfg);
           refreshTex?.();
           const peek = rt.coverAlign;
@@ -472,6 +464,17 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
               peek.y,
             )
             .then(() => {
+              // 库化桥接：首帧**画完之后**才 resolve mount()（一次性）。
+              // 放在 render() 之前会早一帧落地，调用方拿到实例时画布还是空的；
+              // autoplay:false 紧接着 pause()，画面就永远停在一片 clearcolor。
+              // 也要排在 disposed/paused 早退之前，否则同样漏掉。
+              if (rt.onFirstFrame) {
+                const first = rt.onFirstFrame;
+                rt.onFirstFrame = undefined;
+                try {
+                  first();
+                } catch { /* 订阅者抛错不打断渲染循环 */ }
+              }
               if (disposed || rt.paused) return;
               rt.raf = requestAnimationFrame(renderLoop);
             })

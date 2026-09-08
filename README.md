@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.2/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -320,10 +320,11 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.2。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.3。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.3` | 2026-09-08 | 全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等 |
 | `1.3.2` | 2026-09-08 | 修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流 |
 | `1.3.1` | 2026-09-08 | 修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流） |
 | `1.3.0` | 2026-09-08 | mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver |
@@ -331,6 +332,18 @@ b.pause(); // 不影响 a
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.3 是一次覆盖「漏接 / 缺陷 / 内存泄漏」三类的全量审计，修掉的都是实测确认的问题：
+
+- **autoplay:false 会让 mount() 永久挂起**（scene 与媒体壁纸）：装配前就置 paused，渲染循环一帧都不跑，唯一触发首帧回调的地方永远到不了，Promise 既不 resolve 也不 reject。实测同一张壁纸默认能 resolve、autoplay:false 在 rAF 活跃 500 帧后仍 pending。改为照常装配、首帧画完再暂停
+- 首帧回调改到 render() **完成之后**触发（此前排在 render 调用之前，早一帧落地，autoplay:false 会拿到一张空画布）
+- **setMedia() 在场景壁纸上无效**：scene 把 media driver 在装配时一次性捕获，而 setMedia 通常在 mount() 之后才调用。改为每次读取重新选（web 侧本来就是这样）
+- **换壁纸会泄漏 AudioContext**：视频壁纸的频谱接管把释放登记在实例级列表里，而换壁纸走的是 clear()，只有 destroy() 才排空。浏览器约 6 个 AudioContext 就到顶，之后音频响应静默失效。新增壁纸级释放列表，clear() 逐张排空
+- **清理链一处抛异常会丢掉整个 teardown**：clear() 里调用装配层清理没有 try/catch，一旦抛出，后面的 WebGL 上下文释放、视频元素回收、blob revoke 全部跳过
+- **麦克风授权期间换壁纸会漏掉麦克风流**：getUserMedia 阻塞在系统弹窗上，此前的释放登记写在 await 之后，这条路径上没人会调它，浏览器录音指示一直亮着。两条装配路径都改为同步登记释放槽
+- instance.media 控制面在 clear() 时重置（此前 release()/destroy() 之后它仍指向已销毁场景的沙箱闭包）
+
+已知仍未接线（有意为之，类型注释已标注）：MountOptions 的 pointer 与 features。外部喂指针请用 pushPointer()。
 
 1.3.2 补上同一症状的**第二条通道**：1.3.1 修的是宿主注入（setAudio），而测试台「系统实况」勾选框走的是另一条路（cfg.liveSystem，库自己采麦克风），它此前只被 scene 装配路径消费——web.ts 里 liveSystem 零引用，所以勾上之后场景壁纸的音条跟着麦克风动、网页壁纸却始终是合成流。
 

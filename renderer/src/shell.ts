@@ -125,8 +125,15 @@ export type Runtime = {
   coverAlign: { x: number; y: number; tx: number; ty: number };
   /** 实例级帧率计（见 frameStats） */
   frameMeter: { stamps: number[]; last: number; fps: number };
-  /** 实例注册的 window/document 级监听，destroy 时成对摘除 */
+  /** 实例注册的 window/document 级监听，destroy 时成对摘除（**跨壁纸存活**） */
   disposers: Array<() => void>;
+  /**
+   * 单张壁纸的一次性释放：AudioContext、为该壁纸挂的 window 监听等。
+   * **每次 clear()（换壁纸/release/destroy）都排空** —— 与 `disposers` 的区别
+   * 是生命周期：那个是实例级（cover 窥视监听要活到 destroy），这个是壁纸级，
+   * 不逐张排就等于每换一次视频壁纸泄漏一个 AudioContext。
+   */
+  wallpaperDisposers?: Array<() => void>;
   /** cover 窥视的对齐动画 rAF 句柄 */
   peekRaf?: number;
   // ---- 非核心类型的能力钩子（库化第 5 步）----
@@ -215,10 +222,37 @@ export function clear(rt: Runtime) {
   // （视频壁纸本身已是单 video + 原生 loop，无需在此处理）
   for (const p of rt.videoPairs ?? []) p.destroy();
   rt.videoPairs = undefined;
-  if (rt.sceneCleanup) rt.sceneCleanup();
+  // 装配层自己登记的清理（链式，见各 mount* 的 `const prev = rt.sceneCleanup`）。
+  // **必须 try/catch**：链上任何一环抛出都会让下面的 renderer.dispose /
+  // 视频元素回收 / revokeObjectURL 全部跳过 —— 一次异常就漏一个 WebGL 上下文
+  // 加一批 blob，且没有任何报错线索。
+  if (rt.sceneCleanup) {
+    try {
+      rt.sceneCleanup();
+    } catch {
+      /* 单个清理失败不得中断整条 teardown */
+    }
+  }
   rt.sceneCleanup = undefined;
   rt.sceneCtl = undefined;
   rt.pointerCtl = undefined;
+  // 媒体控制面属于刚拆掉的那个场景：不清会让 instance.media 继续指向已销毁
+  // 的沙箱闭包（调用它等于往废墟里派发事件）
+  rt.mediaCtl = undefined;
+  // 本张壁纸登记的一次性释放（AudioContext、为它挂的 window 监听等）。
+  // **clear 就要排空，不能只在 destroyRuntime 里排** —— 换壁纸走的是 clear，
+  // 不排就等于每换一次视频壁纸泄漏一个 AudioContext（Chrome 上限约 6 个，
+  // 超了 new AudioContext() 直接抛，音频响应从此静默失效）。
+  // 注意与 rt.disposers 区分：那个是实例级（cover 窥视监听要活到 destroy）。
+  const ds = rt.wallpaperDisposers ?? [];
+  rt.wallpaperDisposers = [];
+  for (const d of ds) {
+    try {
+      d();
+    } catch {
+      /* 忽略 */
+    }
+  }
   // 释放旧场景渲染器（loseContext → 归还 WebGL 上下文与全部纹理/FBO/program/buffer）
   if (rt.renderer) {
     rt.renderer.dispose?.();
@@ -274,7 +308,18 @@ export function clear(rt: Runtime) {
  * 之后该 Runtime 不可再用。
  */
 export function destroyRuntime(rt: Runtime) {
-  clear(rt);
+  // clear 自身已全程 try/catch，但它可能因外部原因抛出；实例级监听的摘除
+  // 不能因此被跳过（那会把 window 监听永久留在宿主页上）
+  try {
+    clear(rt);
+  } catch {
+    /* 忽略 */
+  }
+  // cover 窥视的对齐动画：clear 只取消 rt.raf，peekRaf 是另一条
+  if (rt.peekRaf !== undefined) {
+    cancelAnimationFrame(rt.peekRaf);
+    rt.peekRaf = undefined;
+  }
   for (const off of rt.disposers.splice(0)) {
     try {
       off();

@@ -1156,11 +1156,13 @@ const { check, errors } = createChecker();
   const webTs = fs.readFileSync(join(ROOT, "renderer/src/web.ts"), "utf8");
   const mediaTs = fs.readFileSync(join(ROOT, "renderer/src/media.ts"), "utf8");
 
-  // scene 与 web 必须读同一个 rt.mediaSource（"只维护一套 driver"）。
-  // 断言要求**赋值语句**而不是出现 rt.mediaSource 字样：注释里也会写这个名字，
-  // 只匹配名字的话把赋值改掉、注释留着就照绿（本轮故意改坏时已踩过一次）。
-  check(/mediaDriver[^\n]*=[^\n]*rt\.mediaSource/.test(sceneTs),
-    "scene-mount.ts 的 mediaDriver 必须以 rt.mediaSource 为优先来源（两侧共用同一 driver）");
+  // scene 与 web 必须读同一个 rt.mediaSource（"只维护一套 driver"），
+  // 且必须**每次读取时重新选**——装配期定死会让 mount() 之后的 setMedia() 永不生效
+  // （web 侧一直是逐帧 pick，scene 侧 1.3.3 才补上）。
+  check(/const currentMediaDriver = \(\)[\s\S]{0,160}rt\.mediaSource/.test(sceneTs),
+    "scene-mount.ts 必须以「每次读取重新选」的方式取 rt.mediaSource（装配期定死会让 setMedia 在场景壁纸上无效）");
+  check(!/let mediaDriver[^\n]*=[^\n]*rt\.mediaSource/.test(sceneTs),
+    "scene-mount.ts 不得把 rt.mediaSource 一次性捕获进局部变量");
   check(/=[^\n]*rt\.mediaSource[^\n]*\?\?/.test(webTs) || /rt\.mediaSource as WebMediaDriver/.test(webTs),
     "web.ts 必须读 rt.mediaSource（两侧共用同一 driver）");
   check(/"media" in o/.test(mountTs),
@@ -1170,8 +1172,8 @@ const { check, errors } = createChecker();
   // 推进的必须是当前 driver，不能写死 simMedia（注入源就收不到 update）
   check(!/else simMedia\.update\(t\)/.test(sceneTs),
     "scene 渲染循环不得写死推进 simMedia（注入的 driver 会收不到 update）");
-  check(/mediaDriver as any\)\?\.update/.test(sceneTs) || /mediaDriver\)\.update\(t\)/.test(sceneTs),
-    "scene 渲染循环必须推进当前生效的 mediaDriver");
+  check(/currentMediaDriver\(\)[\s\S]{0,120}\.update\(t\)/.test(sceneTs),
+    "scene 渲染循环必须推进当前生效的 media driver（currentMediaDriver()）");
 
   // 媒体壁纸的音量控制
   check(/rt\.sceneAudio\s*=/.test(mediaTs),
@@ -1192,6 +1194,74 @@ const { check, errors } = createChecker();
   // Source.dispose 要真的被调用
   check(/source\?\.dispose\?\.\(\)/.test(mountTs) || /prev\.dispose\?\.\(\)/.test(mountTs),
     "destroy()/load() 必须调用 Source.dispose（否则 mediaSource(File) 的 blob 泄漏）");
+}
+
+// ---------- 10. 生命周期：挂载语义与资源释放（1.3.3 审计） ----------
+{
+  const mountTs = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const shellTs = fs.readFileSync(join(ROOT, "renderer/src/shell.ts"), "utf8");
+  const mediaTs = fs.readFileSync(join(ROOT, "renderer/src/media.ts"), "utf8");
+  const sceneTs = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const webTs = fs.readFileSync(join(ROOT, "renderer/src/web.ts"), "utf8");
+
+  // --- autoplay:false 不得在装配前置 paused ---
+  // scene/media 的 kickLoop 遇 rt.paused 直接返回，渲染循环一帧不跑，
+  // 唯一触发 onFirstFrame 的地方永远到不了 → mount() 既不 resolve 也不 reject，
+  // **永久挂起**。正解是照常装配、出完首帧再 pause。
+  check(!/rt\.paused = o\.autoplay === false/.test(mountTs),
+    "applyOptions 不得在 mountWallpaper 之前把 autoplay:false 置成 paused（scene/media 会一帧不跑，mount() 永久挂起）");
+  check(/if \(o\.autoplay === false\) instance\.pause\(\)/.test(mountTs),
+    "autoplay:false 必须在首帧之后再 pause（拿到的是「已就绪但静止在第一帧」）");
+  // onFirstFrame 必须在 render() **完成之后**触发：放在调用之前会早一帧落地，
+  // 调用方拿到实例时画布还是空的；autoplay:false 紧接着 pause()，画面就永远
+  // 停在一片 clearcolor（实测暂停时整幅读数是均匀的 178，没有任何内容）。
+  // 还必须排在 `if (disposed || rt.paused) return` 早退之前，否则同样漏掉。
+  for (const [name, src] of [["scene-mount.ts", sceneTs], ["media.ts", mediaTs]]) {
+    const render = src.indexOf(".render(");
+    const then = src.indexOf(".then(", render);
+    const ff = src.indexOf("rt.onFirstFrame) {");
+    const early = src.indexOf("if (disposed || rt.paused) return;", then);
+    check(render > 0 && then > render && ff > then,
+      `${name} 的 onFirstFrame 必须在 render().then 内触发（放在 render 之前会早一帧，autoplay:false 拿到空画布）`);
+    check(early > 0 && ff < early,
+      `${name} 的 onFirstFrame 必须排在 disposed/paused 早退之前（否则 autoplay:false 永远等不到）`);
+  }
+
+  // --- clear() 的三条纪律 ---
+  const clearStart = shellTs.indexOf("export function clear(");
+  const clearEnd = shellTs.indexOf("\n}", clearStart);
+  const clearBody = clearStart >= 0 ? shellTs.slice(clearStart, clearEnd) : "";
+  check(clearBody.length > 0, "找不到 clear() 函数体");
+  // ① 链式清理抛出不得中断整条 teardown（否则漏一个 WebGL 上下文 + 一批 blob）
+  check(/try \{\s*rt\.sceneCleanup\(\)/.test(clearBody),
+    "clear() 调用 rt.sceneCleanup 必须包 try/catch（一环抛出会跳过 renderer.dispose 与 revokeObjectURL）");
+  // ② 壁纸级释放必须在 clear 就排空，不能只在 destroyRuntime
+  //    （换壁纸走的是 clear；不排 = 每换一次视频壁纸泄漏一个 AudioContext）
+  //    断言要求**真的取出并置空**，不能只匹配名字：注释里也写这个词。
+  check(/=\s*rt\.wallpaperDisposers\s*\?\?\s*\[\]/.test(clearBody)
+    && /rt\.wallpaperDisposers = \[\]/.test(clearBody),
+    "clear() 必须真正排空 wallpaperDisposers（换壁纸走 clear，不排就累积 AudioContext）");
+  // ③ 媒体控制面属于刚拆掉的场景，不清会让 instance.media 指向已销毁的沙箱
+  check(/rt\.mediaCtl = undefined/.test(clearBody), "clear() 必须重置 rt.mediaCtl");
+  // 实例级监听（cover 窥视）必须活到 destroy，不能被 clear 一起排掉
+  check(!/rt\.disposers = \[\]/.test(clearBody),
+    "clear() 不得排空实例级 rt.disposers（cover 窥视监听要活到 destroy）");
+
+  // --- 异步授权期间被拆掉：麦克风必须仍被释放 ---
+  // getUserMedia 阻塞在系统弹窗上，时长不可控；释放槽必须**同步登记**，
+  // 等 await 回来再挂的清理，在"授权期间换了壁纸"这一路上没人会调
+  for (const [name, src] of [["scene-mount.ts", sceneTs], ["web.ts", webTs]]) {
+    check(/liveSlot/.test(src),
+      `${name} 的 liveSystem 释放必须同步登记（getUserMedia 期间换壁纸会漏掉麦克风流，录音指示常亮）`);
+    check(/liveSlot\.dead/.test(src),
+      `${name} 必须在 await 回来后检查 liveSlot.dead（已拆掉就立刻 dispose，不要接线）`);
+  }
+
+  // --- 视频频谱的 AudioContext 释放要幂等且不误伤宿主注入 ---
+  check(/if \(rt\.audioBridge === bridge\) rt\.audioBridge = null/.test(mediaTs),
+    "频谱释放只能撤「自己装的那个」bridge（宿主可能在此期间 setAudio 换了源）");
+  check(/wallpaperDisposers/.test(mediaTs),
+    "media.ts 的 AudioContext/监听必须登记到 wallpaperDisposers（挂 disposers 只有 destroy 才排）");
 }
 
 if (errors.length) {

@@ -479,7 +479,13 @@ export function createScene(
       boundEl = cfg.canvas;
     }
     rt.cfg = cfg;
-    rt.paused = o.autoplay === false;
+    // autoplay:false 不能在装配前就置 paused —— scene/media 的 kickLoop 会直接
+    // 掉头返回，渲染循环一帧都不跑，唯一触发 onFirstFrame 的地方永远到不了，
+    // 于是 mount() 的 Promise 既不 resolve 也不 reject，**永久挂起**
+    // （web 路径不受影响：它在 iframe load 时无条件触发首帧）。
+    // 正解是照常装配、出完首帧再暂停：调用方拿到的是"已就绪但静止在第一帧"，
+    // 这也正是 autoplay:false 的语义。
+    rt.paused = false;
     rt.info = undefined;
     resetCoverAlign(rt);
     if (o.properties && Object.keys(o.properties).length) {
@@ -493,6 +499,7 @@ export function createScene(
     } finally {
       failure.off();
     }
+    if (o.autoplay === false) instance.pause();
     if ((o.volume ?? 0) > 0) instance.setVolume(o.volume as number);
     // 网页种子属性已在 HTML 改写时灌入；再推一次覆盖热更路径
     if (o.properties && Object.keys(o.properties).length) instance.setProperties(o.properties);

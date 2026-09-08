@@ -357,9 +357,15 @@ cfg, source, pkgAbort.signal);
         current: null,
       };
       // 先按模拟源装配；live 启动后改指向。
-      // [1.3.0] 宿主经公共 API 注入的媒体源优先（rt.mediaSource），它与 web
-      // 装配路径读同一个引用，两类壁纸看到同一份 Now Playing。
-      let mediaDriver: any = (rt.mediaSource as any) ?? simMedia;
+      // [1.3.3] 宿主注入源（rt.mediaSource）**每次读取时重新选**，不能在装配时
+      // 定死：setMedia() 常在 mount() 之后才调用（宿主的 Now Playing 通道那时
+      // 才就绪），定死就意味着后装的源永远不生效——web 侧的泵已经是逐帧 pick，
+      // scene 这边漏了，症状是「setMedia 在场景壁纸上没反应」。
+      // liveSystem 的麦克风/系统媒体优先级更高（用户显式勾了「系统实况」），
+      // 由 liveMediaOverride 承载；两者都没有才回落模拟源。
+      let liveMediaOverride: any = null;
+      const currentMediaDriver = (): any =>
+        liveMediaOverride ?? (rt.mediaSource as any) ?? simMedia;
       let windowDriver: any = simWindow;
       const audioSim = { enabled: supportsAudioProcessing };
       // 静音（壁纸不支持音频 / __audioMute）必须显式喂全零：GL uniform 数组在
@@ -497,7 +503,7 @@ cfg, source, pkgAbort.signal);
       // 各挂一份镜像淡入淡出脚本，占位层按「停止态」淡入到 1、实时层淡出到 0，
       // 于是画面永远停在 "Wallpaper Music" / "Name of artist"。
       // 用 diff(null, snapshot) 生成全量事件补给新沙箱，与首帧语义一致。
-      const mediaSnapshot = () => mediaDriver.snapshot;
+      const mediaSnapshot = () => currentMediaDriver().snapshot;
       const registerMediaHook = (sb: any) => {
         if (!sb || !sb.hasMediaHook || mediaHooks.includes(sb)) return;
         mediaHooks.push(sb);
@@ -552,10 +558,11 @@ cfg, source, pkgAbort.signal);
       // 控制方法在注入源上是**可选**的（宿主可能只提供元数据、不支持反向控制）。
       // 缺失时静默跳过再照常派发一次：壁纸按钮点了没反应好过整个脚本 TypeError 熔断。
       const callDriver = (name: "skipNext" | "skipPrevious" | "play" | "pause" | "playPause") => {
-        const fn = (mediaDriver as any)?.[name];
+        const drv = currentMediaDriver();
+        const fn = drv?.[name];
         if (typeof fn === "function") {
           try {
-            fn.call(mediaDriver);
+            fn.call(drv);
           } catch (e) {
             reportDiag(rt, cfg, `media ${name} 失败: ${(e as Error)?.message}`);
           }
@@ -724,6 +731,22 @@ cfg, source, pkgAbort.signal);
 
       // ---- 系统实况：textures / mediaDriver 已就绪后再挂麦克风与 Now Playing ----
       if (cfg.liveSystem) {
+        // 释放槽**同步登记**：getUserMedia 阻塞在系统授权弹窗上，时长不可控。
+        // 若这期间换了壁纸，clear() 早已跑过，之后再挂的清理没人会调 ——
+        // 麦克风流不停、浏览器录音指示一直亮。先占位，await 回来再填句柄。
+        const liveSlot: { handle: { dispose(): void } | null; dead: boolean } = {
+          handle: null,
+          dead: false,
+        };
+        (rt.wallpaperDisposers ??= []).push(() => {
+          liveSlot.dead = true;
+          try {
+            liveSlot.handle?.dispose();
+          } catch {
+            /* 忽略 */
+          }
+          liveSlot.handle = null;
+        });
         try {
           const uploadLiveArtwork = async (info: {
             url: string;
@@ -772,7 +795,7 @@ cfg, source, pkgAbort.signal);
                 });
               }
 
-              const snap = mediaDriver.snapshot;
+              const snap = currentMediaDriver().snapshot;
               if (palette) {
                 snap.primaryColor = media.mediaVec3(...palette.primary);
                 snap.secondaryColor = media.mediaVec3(...palette.secondary);
@@ -798,43 +821,56 @@ cfg, source, pkgAbort.signal);
               void uploadLiveArtwork(info);
             },
           });
-          mediaDriver = live.media;
-          windowDriver = live.windowTitle;
-          liveHold.mediaDriver = live.media;
-          if (live.status().audio === "mic") audioDriverRef.current = live.audio;
-          // 补发当前媒体快照给已登记沙箱
-          if (mediaDriver.snapshot.hasMedia) {
-            for (const { name, event } of media.diffMediaEvents(null, mediaDriver.snapshot)) {
-              for (const sb of mediaHooks) {
-                try {
-                  sb.callMedia(name, event);
-                } catch {
-                  /* ignore */
+          // 授权期间已被拆掉：立刻释放、不接线，但**不能 return** ——
+          // 这里身处 mountScene 的整段 async 装配体内，return 会把后面的
+          // 渲染器启动与渲染循环一起跳过（画面永远不出）。
+          if (liveSlot.dead) {
+            try {
+              live.dispose();
+            } catch {
+              /* 忽略 */
+            }
+            live = null;
+          } else {
+            liveSlot.handle = live;
+            liveMediaOverride = live.media;
+            windowDriver = live.windowTitle;
+            liveHold.mediaDriver = live.media;
+            if (live.status().audio === "mic") audioDriverRef.current = live.audio;
+            // 补发当前媒体快照给已登记沙箱
+            if (currentMediaDriver().snapshot.hasMedia) {
+              for (const { name, event } of media.diffMediaEvents(null, currentMediaDriver().snapshot)) {
+                for (const sb of mediaHooks) {
+                  try {
+                    sb.callMedia(name, event);
+                  } catch {
+                    /* ignore */
+                  }
                 }
               }
+              lastMediaSnap = media.cloneMediaSnapshot(currentMediaDriver().snapshot);
             }
-            lastMediaSnap = media.cloneMediaSnapshot(mediaDriver.snapshot);
+            const st = live.status();
+            reportDiag(
+              rt,
+              cfg,
+              `liveSystem: audio=${st.audio} media=${st.media} window=${st.window}` +
+                (st.title ? ` title="${st.title}"` : "") +
+                (st.hasArtwork ? " artwork=1" : ""),
+            );
+            reportDiag(
+              rt,
+              cfg,
+              `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+            );
+            (window as unknown as Record<string, unknown>).__system = {
+              media: mediaControl,
+              windowTitle: windowDriver.snapshot,
+              shortcuts: shortcuts.last,
+              live: () => live!.status(),
+            };
+            (window as unknown as Record<string, unknown>).__liveSystem = () => live!.status();
           }
-          const st = live.status();
-          reportDiag(
-            rt,
-            cfg,
-            `liveSystem: audio=${st.audio} media=${st.media} window=${st.window}` +
-              (st.title ? ` title="${st.title}"` : "") +
-              (st.hasArtwork ? " artwork=1" : ""),
-          );
-          reportDiag(
-            rt,
-            cfg,
-            `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
-          );
-          (window as unknown as Record<string, unknown>).__system = {
-            media: mediaControl,
-            windowTitle: windowDriver.snapshot,
-            shortcuts: shortcuts.last,
-            live: () => live!.status(),
-          };
-          (window as unknown as Record<string, unknown>).__liveSystem = () => live!.status();
         } catch (e) {
           reportDiag(rt, cfg, `liveSystem: 启动失败，回退模拟源 (${e instanceof Error ? e.message : e})`);
           live = null;
@@ -842,6 +878,8 @@ cfg, source, pkgAbort.signal);
       }
 
       {
+        // 旧的兜底释放保留（particleCleanup 链）；主释放已改由
+        // rt.wallpaperDisposers 的 liveSlot 同步登记，两者都做 null 检查、幂等
         const prevCleanup = particleCleanup;
         particleCleanup = () => {
           prevCleanup?.();
@@ -2545,12 +2583,6 @@ cfg, source, pkgAbort.signal);
         if (now - lastRender >= interval) {
           lastRender = now;
           markFrame(rt, now);
-          // 库化桥接：首帧真正提交渲染 → resolve mount() 的 Promise（一次性）
-          if (rt.onFirstFrame) {
-            const first = rt.onFirstFrame;
-            rt.onFirstFrame = undefined;
-            first();
-          }
           syncCanvasSize(rt, c, rt.cfg);
           const t = (now - start - pauseAccum) / 1000;
           // 指针 last 在本帧 render 完成后再推进（见下方 then）。事件驱动下
@@ -2567,8 +2599,9 @@ cfg, source, pkgAbort.signal);
             // [1.3.0] 推进的必须是**当前生效的那个 driver**，不能写死 simMedia：
             // 宿主注入源后 mediaDriver 已改指向，还推 simMedia 等于让注入源
             // 永远收不到 update(t)（有内部时钟的实现就此冻住）。
-            else if (typeof (mediaDriver as any)?.update === "function") {
-              (mediaDriver as any).update(t);
+            else {
+              const drv = currentMediaDriver();
+              if (typeof drv?.update === "function") drv.update(t);
             }
             const snap = mediaSnapshot();
             const evts = media.diffMediaEvents(lastMediaSnap, snap);
@@ -2715,6 +2748,18 @@ cfg, source, pkgAbort.signal);
           void renderer
             .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y)
             .then(() => {
+              // 库化桥接：首帧**画完之后**才 resolve mount() 的 Promise（一次性）。
+              // 必须在 render().then 里，不能放在调用之前：那样 Promise 会早一帧
+              // 落地，调用方拿到实例时画布还是空的 —— autoplay:false 紧接着
+              // pause()，渲染循环就此停住，画面永远停在一片 clearcolor。
+              // 放这里也要在 disposed/paused 的早退**之前**，否则同样漏掉。
+              if (rt.onFirstFrame) {
+                const first = rt.onFirstFrame;
+                rt.onFirstFrame = undefined;
+                try {
+                  first();
+                } catch { /* 订阅者抛错不打断渲染 */ }
+              }
               if (disposed || rt.paused) return;
               // 指针回调派发放在 render 之后：世界坐标由渲染器在帧内
               // syncWorld(cam, …) 算好（含视差补偿），此时命中判定才与画面一致。

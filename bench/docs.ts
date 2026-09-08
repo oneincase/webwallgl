@@ -489,6 +489,7 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.3", en: "1.3.3" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等", en: "Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more" }],
           [{ zh: "1.3.2", en: "1.3.2" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流", en: "Fix: the \"live system\" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream" }],
           [{ zh: "1.3.1", en: "1.3.1" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流）", en: "Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream)" }],
           [{ zh: "1.3.0", en: "1.3.0" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "mediaSource() 任意视频/图片；类型嗅探；媒体壁纸支持音量；scene 与 web 共用一套 Now Playing driver", en: "mediaSource() for arbitrary video/images; type sniffing; volume for media wallpapers; one Now Playing driver shared by scene and web" }],
@@ -497,6 +498,32 @@ export const DOC: DocSection[] = [
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
         ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.3 是一次覆盖「漏接 / 缺陷 / 内存泄漏」三类的全量审计，修掉的都是实测确认的问题：",
+          en: "1.3.3 is a full audit covering unwired API, defects and memory leaks. Everything fixed here was confirmed by measurement:",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "**autoplay:false 会让 mount() 永久挂起**（scene 与媒体壁纸）：装配前就置 paused，渲染循环一帧都不跑，唯一触发首帧回调的地方永远到不了，Promise 既不 resolve 也不 reject。实测同一张壁纸默认能 resolve、autoplay:false 在 rAF 活跃 500 帧后仍 pending。改为照常装配、首帧画完再暂停", en: "**autoplay:false hung mount() forever** (scene and media wallpapers): pausing before assembly meant the render loop never ran a single frame, so the only first-frame trigger was unreachable and the promise neither resolved nor rejected. Measured: the same wallpaper resolved by default but was still pending after 500 live rAF frames with autoplay:false. It now assembles normally and pauses after the first frame is drawn" },
+          { zh: "首帧回调改到 render() **完成之后**触发（此前排在 render 调用之前，早一帧落地，autoplay:false 会拿到一张空画布）", en: "The first-frame callback now fires after render() completes (previously it ran before the render call, landing one frame early, so autoplay:false handed back a blank canvas)" },
+          { zh: "**setMedia() 在场景壁纸上无效**：scene 把 media driver 在装配时一次性捕获，而 setMedia 通常在 mount() 之后才调用。改为每次读取重新选（web 侧本来就是这样）", en: "**setMedia() was inert on scene wallpapers**: the scene captured its media driver once at assembly, while setMedia is typically called after mount(). It now re-picks on every read (the web path already did)" },
+          { zh: "**换壁纸会泄漏 AudioContext**：视频壁纸的频谱接管把释放登记在实例级列表里，而换壁纸走的是 clear()，只有 destroy() 才排空。浏览器约 6 个 AudioContext 就到顶，之后音频响应静默失效。新增壁纸级释放列表，clear() 逐张排空", en: "**Swapping wallpapers leaked an AudioContext**: the video spectrum takeover registered its release on the instance-level list, but swapping goes through clear() while only destroy() drained it. Browsers cap out at roughly 6 AudioContexts, after which audio reactivity silently dies. A per-wallpaper release list is now drained by clear()" },
+          { zh: "**清理链一处抛异常会丢掉整个 teardown**：clear() 里调用装配层清理没有 try/catch，一旦抛出，后面的 WebGL 上下文释放、视频元素回收、blob revoke 全部跳过", en: "**One throwing cleanup dropped the entire teardown**: clear() called the assembly-layer cleanup without try/catch, so a single exception skipped the WebGL context release, video element recycling and blob revocation that followed" },
+          { zh: "**麦克风授权期间换壁纸会漏掉麦克风流**：getUserMedia 阻塞在系统弹窗上，此前的释放登记写在 await 之后，这条路径上没人会调它，浏览器录音指示一直亮着。两条装配路径都改为同步登记释放槽", en: "**Swapping wallpapers during the mic permission prompt orphaned the stream**: getUserMedia blocks on the system dialog, and the release was registered after the await, so nothing on that path ever called it and the browser's recording indicator stayed lit. Both assembly paths now register the release slot synchronously" },
+          { zh: "instance.media 控制面在 clear() 时重置（此前 release()/destroy() 之后它仍指向已销毁场景的沙箱闭包）", en: "The instance.media control surface is reset by clear() (previously it still pointed at the destroyed scene's sandbox closures after release()/destroy())" },
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "已知仍未接线（有意为之，类型注释已标注）：MountOptions 的 pointer 与 features。外部喂指针请用 pushPointer()。",
+          en: "Still unwired by design (marked in the type comments): MountOptions' pointer and features. Use pushPointer() to feed pointer state from outside.",
+        },
       },
       {
         k: "p",
