@@ -1496,6 +1496,39 @@ function runShim(extras) {
   const liveBody = bodyOf("liveAudioDriver");
   check(!/shapeWebAudioBand/.test(liveBody),
     "liveAudioDriver 不得对麦克风频谱套 gamma 扩展（与注入源同理，它已是 0..1 真实频谱）");
+
+  // --- audio:null / media:null 必须是**真禁用**，不是回落模拟源 ---
+  // 类型注释写的是「null = 禁用（频谱恒为 0）」。此前"显式 null"与"从没设置过"
+  // 都塌成 audioBridge=null，web 侧于是取默认合成流 —— 等于该选项无效。
+  // 断言要求禁用判定真的参与 audioDriver/mediaDriver 的取值，
+  // 不能只匹配名字（注释与另一行也会出现同名标志）
+  check(/_webAudio === null \|\| rt\.audioDisabled/.test(webTs),
+    "web.ts 必须区分「显式禁用音频」与「没设置」（MountOptions.audio:null 应静音，不是退回合成流）");
+  check(/_webMedia === null \|\| rt\.mediaDisabled/.test(webTs),
+    "web.ts 必须区分「显式禁用系统媒体」与「没设置」");
+
+  // --- setFit 必须让网页壁纸真的重排 ---
+  // 网页的 fit 由 iframe 视口尺寸/偏移表达，不是相机参数；只改 cfg 画面不变。
+  const apiMountTs = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const setFitBody = (() => {
+    const at = apiMountTs.indexOf("setFit(fit: Fit)");
+    return at < 0 ? "" : apiMountTs.slice(at, apiMountTs.indexOf("\n    },", at));
+  })();
+  check(/rt\.webRelayout\?\.\(\)/.test(setFitBody),
+    "SceneInstance.setFit 必须触发 rt.webRelayout（否则对网页壁纸完全无反应）");
+
+  // --- 裸 iframe 回退下 stats 不得恒为 0 ---
+  // 两个泵都不启、shim 的 we-frame 打点也没有 → 帧率计没有任何输入，
+  // 画面明明在动而 stats.running 恒 false，调用方据此判活会误判成"挂了"。
+  const bareBody = (() => {
+    const at = webTs.indexOf("const finishBare");
+    return at < 0 ? "" : webTs.slice(at, webTs.indexOf("\n  };", at));
+  })();
+  check(bareBody.length > 0, "找不到 finishBare 函数体");
+  check(/markFrame\(rt, now\)/.test(bareBody),
+    "裸 iframe 回退必须自行打点帧率（否则 stats 恒 {fps:0,running:false}，调用方无法判活）");
+  check(/wallpaperDisposers/.test(bareBody),
+    "裸 iframe 的心跳 rAF 必须登记释放（否则拆了壁纸还在跑）");
 }
 
 if (errors.length) {

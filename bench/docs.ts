@@ -489,6 +489,7 @@ export const DOC: DocSection[] = [
           { zh: "说明", en: "Notes" },
         ],
         rows: [
+          [{ zh: "1.3.4", en: "1.3.4" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理", en: "Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount" }],
           [{ zh: "1.3.3", en: "1.3.3" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等", en: "Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more" }],
           [{ zh: "1.3.2", en: "1.3.2" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流", en: "Fix: the \"live system\" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream" }],
           [{ zh: "1.3.1", en: "1.3.1" }, { zh: "2026-09-08", en: "2026-09-08" }, { zh: "修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流）", en: "Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream)" }],
@@ -497,6 +498,22 @@ export const DOC: DocSection[] = [
           [{ zh: "1.1.0", en: "1.1.0" }, { zh: "2026-09-07", en: "2026-09-07" }, { zh: "外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全", en: "External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics" }],
           [{ zh: "1.0.0", en: "1.0.0" }, { zh: "2026-09-06", en: "2026-09-06" }, { zh: "首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套）", en: "First stable release: the public API is settled (mount / SceneInstance / Source)" }],
           [{ zh: "1.0.0-beta1", en: "1.0.0-beta1" }, { zh: "2026-09-04", en: "2026-09-04" }, { zh: "首个公开测试版", en: "First public preview" }],
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "1.3.4 收掉 1.3.3 结尾列为「留待后续」的四项，都是能观测到的行为偏差，不是清理式重构：",
+          en: "1.3.4 closes the four items 1.3.3 listed as deferred. All four are observable behaviour bugs, not cleanup refactors:",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "**setFit() 对网页壁纸不生效**：它只改了配置和 cover 对齐量，而网页壁纸的缩放是靠一次布局计算写进 iframe 的 transform 的，不重排就还是旧比例。现在 setFit 会触发重排（场景与媒体壁纸本来就每帧读配置，不受影响）", en: "**setFit() did nothing on web wallpapers**: it only updated the config and the cover alignment, while a web wallpaper's scaling lives in an iframe transform written by a layout pass. Without a re-layout the old ratio stayed. setFit now triggers one (scene and media wallpapers read the config every frame and were never affected)" },
+          { zh: "**注入 shim 失败退回裸 iframe 后帧率恒 0**：这条路径不启动任何 rAF，统计里没人推进帧计数，宿主看到的是「壁纸挂了」。回退分支补上心跳 rAF，帧率与实际刷新一致", en: "**The bare-iframe fallback reported 0 fps forever**: when shim injection fails that path starts no rAF at all, so nothing advanced the frame counter and hosts saw what looked like a dead wallpaper. The fallback now runs a heartbeat rAF and reports the real refresh rate" },
+          { zh: "**audio:null 在网页壁纸上不是静音，而是退回合成流**：判定只看「有没有设过注入源」，分不清「显式禁用」与「没设置」。现在两者分开，audio:null / media:null 在 scene 与 web 上都真的关掉（setAudio(src) 会重新打开）", en: "**audio:null fell back to the synthetic stream on web wallpapers instead of muting**: the check only asked whether an injected source existed, conflating \"explicitly disabled\" with \"never set\". The two are now distinct, and audio:null / media:null genuinely disable on both scene and web (setAudio(src) re-enables)" },
+          { zh: "**调试全局不随卸载清理**：__scene / __textures 等 19 个诊断入口在 clear() 后仍挂在 window 上，指着已销毁场景的对象图，既让上一张壁纸的纹理和层树无法回收，也会让宿主在控制台里读到过期状态。改为 clear() 时逐个删除", en: "**Debug globals outlived unmount**: 19 diagnostic hooks such as __scene and __textures stayed on window after clear(), pointing at the destroyed scene's object graph. That both pinned the previous wallpaper's textures and layer tree in memory and let hosts read stale state from the console. clear() now deletes each of them" },
         ],
       },
       {

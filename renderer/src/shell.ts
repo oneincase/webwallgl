@@ -94,6 +94,15 @@ export type Runtime = {
    * 与 audioBridge 同纪律：换壁纸不清空（装一次对之后所有场景生效）。
    */
   mediaSource?: unknown | null;
+  /**
+   * 显式禁用开关（`MountOptions.audio: null` / `media: null` 的语义）。
+   *
+   * 与「没设置」必须区分开：没设置要回落内置模拟源，显式 null 是**要静音/无媒体**
+   * （类型注释写的就是「null = 禁用（频谱恒为 0）」）。此前两者都塌成
+   * `audioBridge = null`，web 侧于是退回合成流，等于 `audio: null` 不生效。
+   */
+  audioDisabled?: boolean;
+  mediaDisabled?: boolean;
   /** 当前生效的媒体控制面（mountScene 装配后写入；实例的 media 属性转发到它） */
   mediaCtl?: {
     readonly snapshot: unknown;
@@ -300,6 +309,8 @@ export function clear(rt: Runtime) {
   rt.canvas = undefined;
   rt.ctx = undefined;
   rt.info = undefined;
+  // 调试出口持有整张场景图与全部贴图的 CPU 侧缓冲，拆场景时一并清掉
+  clearSceneDebugGlobals();
   resetFrameMeter(rt);
 }
 
@@ -481,6 +492,28 @@ function registerCoverPeek(rt: Runtime) {
     document.removeEventListener("pointerleave", leave);
   });
 }
+
+/**
+ * 场景装配挂在 window 上的调试出口。它们是排障刚需（`__scene` / `__textures`
+ * 是定位白块、缺层的主要手段），但**必须在拆场景时清掉**：`__textures` 持有
+ * 每张贴图的 CPU 侧 RGBA 缓冲（512×512 的封面栅格等），`__scene` 持有全部已解析
+ * 图层与模型。不清就等于每种壁纸类型各钉住一份上一次的完整场景图，
+ * 直到下次同类挂载才被覆盖。
+ */
+const SCENE_DEBUG_GLOBALS = [
+  "__scene", "__sceneLayers", "__textures", "__objScripts", "__textWidgets",
+  "__mediaHooks", "__mediaControl", "__mediaStats", "__mediaSet", "__system",
+  "__liveSystem", "__audioStats", "__audioMute", "__particleStats",
+  "__particleToggle", "__pointerStats", "__compositeStats", "__compositeEnable",
+] as const;
+
+function clearSceneDebugGlobals() {
+  const w = window as unknown as Record<string, unknown>;
+  for (const k of SCENE_DEBUG_GLOBALS) {
+    if (k in w) delete w[k];
+  }
+}
+
 
 /**
  * 把画布 backing store 对齐当前**显示尺寸**（canvas 的 CSS 尺寸；全屏 canvas

@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -321,10 +321,11 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.3. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.4. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.4` | 2026-09-08 | Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount |
 | `1.3.3` | 2026-09-08 | Full audit: fixed autoplay:false hanging mount(), setMedia being inert on the scene path, AudioContext leaking on wallpaper swap, and more |
 | `1.3.2` | 2026-09-08 | Fix: the "live system" microphone only fed scene wallpapers; web wallpaper visualizers still showed the synthetic stream |
 | `1.3.1` | 2026-09-08 | Fix: injected audio/media sources never reached web wallpapers (visualizers kept playing the default stream) |
@@ -333,6 +334,13 @@ Current version: 1.3.3. This section records only user-visible changes (API, beh
 | `1.1.0` | 2026-09-07 | External pointer injection channel, web wallpaper interaction, effect-pass compile fixes, complete pause semantics |
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
+
+1.3.4 closes the four items 1.3.3 listed as deferred. All four are observable behaviour bugs, not cleanup refactors:
+
+- **setFit() did nothing on web wallpapers**: it only updated the config and the cover alignment, while a web wallpaper's scaling lives in an iframe transform written by a layout pass. Without a re-layout the old ratio stayed. setFit now triggers one (scene and media wallpapers read the config every frame and were never affected)
+- **The bare-iframe fallback reported 0 fps forever**: when shim injection fails that path starts no rAF at all, so nothing advanced the frame counter and hosts saw what looked like a dead wallpaper. The fallback now runs a heartbeat rAF and reports the real refresh rate
+- **audio:null fell back to the synthetic stream on web wallpapers instead of muting**: the check only asked whether an injected source existed, conflating "explicitly disabled" with "never set". The two are now distinct, and audio:null / media:null genuinely disable on both scene and web (setAudio(src) re-enables)
+- **Debug globals outlived unmount**: 19 diagnostic hooks such as __scene and __textures stayed on window after clear(), pointing at the destroyed scene's object graph. That both pinned the previous wallpaper's textures and layer tree in memory and let hosts read stale state from the console. clear() now deletes each of them
 
 1.3.3 is a full audit covering unwired API, defects and memory leaks. Everything fixed here was confirmed by measurement:
 

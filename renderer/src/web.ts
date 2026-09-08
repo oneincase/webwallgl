@@ -900,19 +900,37 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   };
   const cfgExt = cfg as WebCfgExt;
   // 注入源（rt.audioBridge）的优先判定在 startAudioPump 里**逐帧**做，
-  // 这里只决定「没有注入时用谁」：_webAudio=null 表示显式禁用音频。
+  // 这里只决定「没有注入时用谁」：_webAudio=null 或 rt.audioDisabled
+  // （MountOptions.audio:null）表示显式禁用音频，此时连泵都不启。
   const audioDriver: WebAudioDriver | null =
-    cfgExt._webAudio === null ? null : (cfgExt._webAudio ?? defaultAudioDriver());
+    cfgExt._webAudio === null || rt.audioDisabled
+      ? null
+      : (cfgExt._webAudio ?? defaultAudioDriver());
   // 注入源（rt.mediaSource）的优先判定同样在 startMediaPump 里逐帧做，
-  // 这里只决定「没有注入时用谁」：_webMedia=null 表示显式禁用系统媒体。
+  // 这里只决定「没有注入时用谁」：_webMedia=null 或 rt.mediaDisabled 表示禁用。
   const mediaDriver: WebMediaDriver | null =
-    cfgExt._webMedia === null ? null : (cfgExt._webMedia ?? defaultMediaDriver());
+    cfgExt._webMedia === null || rt.mediaDisabled
+      ? null
+      : (cfgExt._webMedia ?? defaultMediaDriver());
 
   const finishBare = (why: string) => {
     reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`);
     attachIframe(rt, cfg, container, entry, { injected: false });
     startAudioPump(rt, null);
     startMediaPump(rt, null);
+    // 裸 iframe 下两个泵都不启、shim 的 we-frame 打点也没有，帧率计从此没有
+    // 任何输入 —— stats 会**恒为 {fps:0, running:false}**，即使画面明明在动，
+    // 调用方据此判活会误判成"挂了"。这里用自己的 rAF 打点：跨源文档拿不到
+    // 作者真实帧率，报的是"壁纸仍在运行"这一事实（按渲染节流上限计）。
+    let beat = 0;
+    const tick = (now: number) => {
+      if (!rt.iframe) return; // 已拆除
+      beat = requestAnimationFrame(tick);
+      if (rt.paused) return;
+      markFrame(rt, now);
+    };
+    beat = requestAnimationFrame(tick);
+    (rt.wallpaperDisposers ??= []).push(() => cancelAnimationFrame(beat));
   };
 
   const frameClock = { last: 0 };

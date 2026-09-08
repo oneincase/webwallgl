@@ -1262,6 +1262,21 @@ const { check, errors } = createChecker();
     "频谱释放只能撤「自己装的那个」bridge（宿主可能在此期间 setAudio 换了源）");
   check(/wallpaperDisposers/.test(mediaTs),
     "media.ts 的 AudioContext/监听必须登记到 wallpaperDisposers（挂 disposers 只有 destroy 才排）");
+
+  // --- 调试出口不得跨场景残留 ---
+  // __textures 持有每张贴图的 CPU 侧 RGBA 缓冲、__scene 持有全部已解析图层，
+  // 不清就等于每种壁纸类型各钉住一份上一次的完整场景图
+  check(/clearSceneDebugGlobals/.test(shellTs),
+    "shell.ts 应有 clearSceneDebugGlobals（__scene/__textures 等持有整张场景图，必须随拆场景清掉）");
+  const clearBody2 = (() => {
+    const at = shellTs.indexOf("export function clear(");
+    return at < 0 ? "" : shellTs.slice(at, shellTs.indexOf("\n}", at));
+  })();
+  check(/clearSceneDebugGlobals\(\)/.test(clearBody2),
+    "clear() 必须调用 clearSceneDebugGlobals");
+  for (const g of ["__scene", "__textures", "__sceneLayers"]) {
+    check(shellTs.includes(`"${g}"`), `调试出口清理表应包含 ${g}`);
+  }
 }
 
 if (errors.length) {

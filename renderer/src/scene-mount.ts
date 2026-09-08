@@ -367,7 +367,9 @@ cfg, source, pkgAbort.signal);
       const currentMediaDriver = (): any =>
         liveMediaOverride ?? (rt.mediaSource as any) ?? simMedia;
       let windowDriver: any = simWindow;
-      const audioSim = { enabled: supportsAudioProcessing };
+      // rt.audioDisabled = 调用方 MountOptions.audio:null 显式静音（频谱恒为 0），
+      // 与"没设置"区分开：后者要回落模拟源
+      const audioSim = { enabled: supportsAudioProcessing && !rt.audioDisabled };
       // 静音（壁纸不支持音频 / __audioMute）必须显式喂全零：GL uniform 数组在
       // 不设置时会**保留上一帧的值**，返回 null 不会让波形落回零位。
       const zero = (n: number) => new Float32Array(n);
@@ -485,7 +487,8 @@ cfg, source, pkgAbort.signal);
       const shortcuts = system.createShortcutHandler((name: string) => {
         reportDiag(rt, cfg, `openUserShortcut: ${name}`);
       });
-      const mediaSim = { enabled: true, override: null as Record<string, unknown> | null };
+      // rt.mediaDisabled = 调用方 MountOptions.media:null 显式禁用系统媒体
+      const mediaSim = { enabled: !rt.mediaDisabled, override: null as Record<string, unknown> | null };
       // 挂了媒体回调的沙箱（广播表；媒体不做 hit-test，不必按图层索引）
       const mediaHooks: any[] = [];
       let lastMediaSnap: any = null;

@@ -240,11 +240,19 @@ export function createScene(
     if ("audio" in o) applyAudio(o.audio ?? null);
     // 媒体源同理：只在选项里显式出现时才动 rt.mediaSource，否则 load() 换场景
     // 会把 setMedia() 装好的宿主源冲掉
-    if ("media" in o) rt.mediaSource = o.media ?? null;
+    if ("media" in o) {
+      rt.mediaSource = o.media ?? null;
+      // 显式传 null = 禁用（不是"回落模拟源"）；见 Runtime.mediaDisabled
+      rt.mediaDisabled = o.media === null;
+    }
   };
 
-  /** 把公共 AudioSource 接到运行时的拉模式桥；null = 回落内置模拟源 */
+  /**
+   * 把公共 AudioSource 接到运行时的拉模式桥。
+   * `null` 是**显式禁用**（频谱恒为 0），与"从没设置过"不同——后者才回落模拟源。
+   */
   const applyAudio = (src: AudioSource | null) => {
+    rt.audioDisabled = src === null;
     if (!src) {
       rt.audioBridge = null;
       return;
@@ -321,6 +329,10 @@ export function createScene(
     setFit(fit: Fit) {
       rt.cfg.fit = fit;
       resetCoverAlign(rt);
+      // 网页壁纸的 fit 由 iframe 的视口尺寸/偏移表达，不是相机参数：
+      // 只改 cfg 画面不会有任何变化，必须触发一次重排（整页渲染器一直是这么做的，
+      // 库入口漏了这一步，症状是 wp.setFit("contain") 对网页壁纸完全无反应）。
+      rt.webRelayout?.();
     },
     setFps(fps: number) {
       rt.cfg.sceneFps = fps;
@@ -352,13 +364,19 @@ export function createScene(
     setAudio(src: AudioSource | null) {
       currentOptions = { ...currentOptions, audio: src };
       applyAudio(src);
+      // 语义与 MountOptions.audio:null 不同：这里的 null 按文档是
+      // 「回落内置模拟源」，不是静音（禁用只在挂载选项里表达）
+      rt.audioDisabled = false;
     },
 
     // 系统媒体源。与 setAudio 同纪律：只存引用、换场景不清空，
     // scene 与 web 两条装配路径读同一个 rt.mediaSource。
+    // 注意语义与 MountOptions.media:null 不同：这里的 null 按文档是
+    // 「回落内置模拟源」，不是禁用（禁用只在挂载选项里表达）。
     setMedia(src: MediaSource | null) {
       currentOptions = { ...currentOptions, media: src };
       rt.mediaSource = src ?? null;
+      rt.mediaDisabled = false;
     },
 
     // 媒体控制面。装配后由 mountScene 写入 rt.mediaCtl；未装配（或媒体/网页

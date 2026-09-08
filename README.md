@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.3/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.4/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -320,10 +320,11 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.3。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.4。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.4` | 2026-09-08 | 补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理 |
 | `1.3.3` | 2026-09-08 | 全量审计：修 autoplay:false 挂死 mount()、scene 侧 setMedia 无效、换壁纸泄漏 AudioContext 等 |
 | `1.3.2` | 2026-09-08 | 修复：「系统实况」麦克风此前只喂 scene，网页壁纸音谱仍是合成流 |
 | `1.3.1` | 2026-09-08 | 修复：注入的频谱/媒体源到不了网页壁纸（音谱仍放默认流） |
@@ -332,6 +333,13 @@ b.pause(); // 不影响 a
 | `1.1.0` | 2026-09-07 | 外部指针注入通道、网页壁纸交互、效果 pass 编译清零、暂停语义补全 |
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
+
+1.3.4 收掉 1.3.3 结尾列为「留待后续」的四项，都是能观测到的行为偏差，不是清理式重构：
+
+- **setFit() 对网页壁纸不生效**：它只改了配置和 cover 对齐量，而网页壁纸的缩放是靠一次布局计算写进 iframe 的 transform 的，不重排就还是旧比例。现在 setFit 会触发重排（场景与媒体壁纸本来就每帧读配置，不受影响）
+- **注入 shim 失败退回裸 iframe 后帧率恒 0**：这条路径不启动任何 rAF，统计里没人推进帧计数，宿主看到的是「壁纸挂了」。回退分支补上心跳 rAF，帧率与实际刷新一致
+- **audio:null 在网页壁纸上不是静音，而是退回合成流**：判定只看「有没有设过注入源」，分不清「显式禁用」与「没设置」。现在两者分开，audio:null / media:null 在 scene 与 web 上都真的关掉（setAudio(src) 会重新打开）
+- **调试全局不随卸载清理**：__scene / __textures 等 19 个诊断入口在 clear() 后仍挂在 window 上，指着已销毁场景的对象图，既让上一张壁纸的纹理和层树无法回收，也会让宿主在控制台里读到过期状态。改为 clear() 时逐个删除
 
 1.3.3 是一次覆盖「漏接 / 缺陷 / 内存泄漏」三类的全量审计，修掉的都是实测确认的问题：
 
