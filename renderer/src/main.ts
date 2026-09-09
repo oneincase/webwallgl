@@ -170,14 +170,31 @@ declare global {
        * @param u 归一化 X ∈ [0,1]，相对本窗口左边
        * @param v 归一化 Y ∈ [0,1]，相对本窗口上边（**Y 朝下**，不要替 shader 翻）
        * @param buttons 按键位掩码：bit0 左键。当前只消费 bit0
+       * @param mods 修饰键掩码：bit0 ctrl / bit1 shift / bit2 alt / bit3 meta。
+       *   省略等于 0（老宿主不传无回归）。只有网页壁纸消费
        *
        * 宿主侧的坐标换算、采样频率、点击边缘保持等要求见 docs/INTEGRATION.md。
        * 场景壁纸与网页壁纸都生效：场景侧写进统一指针状态对象，网页侧由 shim 合成
        * DOM 事件（CSS `:hover` 是硬限制，合成事件点不亮它）。
        */
-      pushPointer(u: number, v: number, buttons?: number): void;
+      pushPointer(u: number, v: number, buttons?: number, mods?: number): void;
       /** 外部指针离开本窗口（鼠标移到别的显示器）：清按键，位置保持最后已知点 */
       pointerLeave(): void;
+      /**
+       * 外部滚轮注入（宿主捕获 scrollWheel / 触摸板手势后推入）。
+       *
+       * **只对网页壁纸生效**，场景壁纸静默无效——WE 脚本沙箱没有滚轮 API，
+       * 本机 194 张场景壁纸零消费（详见 docs/INTEGRATION.md 未覆盖表）。
+       *
+       * @param dx 横向滚动量，正 = 内容向右（与 DOM deltaX 同向）
+       * @param dy 纵向滚动量，正 = 内容向下（与 DOM deltaY 同向，
+       *   与 macOS NSEvent.scrollingDeltaY **反向**，取反由宿主负责）
+       * @param mode deltaMode：0 像素 / 1 行 / 2 页。触摸板与 Magic Mouse 恒为 0
+       * @param mods 修饰键掩码，bit0 ctrl。**触摸板双指捏合映射成 ctrl + 滚轮**
+       *   （浏览器就是这么把 magnify 手势喂给网页的，OrbitControls / pano2vr
+       *   都靠 event.ctrlKey 区分缩放与滚动）
+       */
+      pushWheel(dx: number, dy: number, mode?: number, mods?: number): void;
       /** 纯前端预览：本地 scene.pkg（File）直进 fileSource，无需任何后端；project.json 可选 */
       loadSceneFile(file: File, project?: File): void;
       /**
@@ -252,7 +269,13 @@ window.__wp = {
       rt.sceneCtl.resume();
       return;
     }
-    // DOM 回退视频：没有 rAF 循环，只恢复元素播放
+    // DOM 直显视频：没有 rAF 循环，只恢复元素播放。
+    // 有 A/B 无缝循环对时必须走 pair.resume()：它同时重启预热调度的 rAF，
+    // 只 play() 主元素会让恢复后的第一圈退回原生 loop（卡顿重现）。
+    if (rt.videoPairs?.length) {
+      for (const p of rt.videoPairs) p.resume();
+      return;
+    }
     if (rt.video) void rt.video.play().catch(() => {});
   },
   setFit(fit: string) {
@@ -260,18 +283,29 @@ window.__wp = {
     resetCoverAlign(rt);
     // 网页壁纸：cover 才做露底自适配，contain/stretch 回满视口（实时切换，不重挂）
     rt.webRelayout?.();
-    // DOM 回退路径（无 WebGL2）才需要改 object-fit；走场景引擎时 fit 由渲染循环
-    // 每帧读 rt.cfg.fit 传给 fitWindow，无需重挂载即可实时切换
-    const obj = rt.video ?? rt.img;
-    if (obj && obj.isConnected && rt.wrap && obj.parentElement === rt.wrap) {
-      const f = fitObjectFit(fit as WallpaperFit);
+    // DOM 直显路径（视频壁纸、无 WebGL2 的图片/GIF）才需要改 object-fit；
+    // 走场景引擎时 fit 由渲染循环每帧读 rt.cfg.fit 传给 fitWindow，无需重挂。
+    // 双元素循环时两个 <video> 都要改，否则交接后 fit 变回旧值。
+    const f = fitObjectFit(fit as WallpaperFit);
+    const applyFit = (obj: HTMLElement) => {
       obj.style.objectFit = f.objectFit;
       obj.style.background = f.background;
       obj.style.objectPosition = "50% 50%";
+    };
+    for (const p of rt.videoPairs ?? []) {
+      for (const el of [p.active, p.standby]) if (el.isConnected) applyFit(el);
     }
+    const obj = rt.video ?? rt.img;
+    // 不再要求 parentElement === rt.wrap：库形态下视频挂在调用方容器里，
+    // 那个判断恒 false，症状是 setFit 对库形态的视频壁纸完全无反应。
+    if (obj && obj.isConnected && !rt.videoPairs?.length) applyFit(obj);
   },
   setVolume(volume: number) {
-    if (rt.video) {
+    // 双元素循环对自己管音量与静音（备用侧恒静音防双声），不能绕过它直接
+    // 写 rt.video —— 那样交接后音量会跟着旧元素的状态走
+    if (rt.videoPairs?.length) {
+      for (const p of rt.videoPairs) p.setVolume(volume);
+    } else if (rt.video) {
       rt.video.volume = Math.max(0, Math.min(1, volume));
       rt.video.muted = volume <= 0;
     }
@@ -319,11 +353,19 @@ window.__wp = {
   //
   // 用扁平位置参数而非对象：宿主经 window.eval 字符串注入，~90Hz 调用下参数
   // 越短 eval 解析越省。无场景壁纸（视频/网页/降级页）时静默忽略。
-  pushPointer(u: number, v: number, buttons?: number) {
-    rt.pointerCtl?.push({ u, v, buttons });
+  pushPointer(u: number, v: number, buttons?: number, mods?: number) {
+    rt.pointerCtl?.push({ u, v, buttons, mods });
   },
   pointerLeave() {
     rt.pointerCtl?.leave();
+  },
+  // 外部滚轮注入（含 macOS 触摸板双指滚动与捏合）。位置沿用最后一次 pushPointer ——
+  // 宿主拿到滚轮事件时通常刚推过指针位置，再带一遍纯属冗余（eval 字符串更长）。
+  //
+  // wheel 是可选方法：只有网页壁纸装配时实现。场景壁纸不实现不是遗漏 ——
+  // WE 脚本沙箱没有滚轮 API，本机 194 张场景壁纸零消费。
+  pushWheel(dx: number, dy: number, mode?: number, mods?: number) {
+    rt.pointerCtl?.wheel?.({ dx, dy, mode, mods });
   },
   // 纯前端预览：本地 scene.pkg 经同源 iframe 直传进来，包字节不落任何服务器。
   // 继承当前 fit/dpr/帧率/滤镜等观看偏好；无 project.json 时属性用场景快照值。

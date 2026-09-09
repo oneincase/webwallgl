@@ -129,6 +129,9 @@ const REQUIRED_WP = [
   // 且没有任何报错 —— 壁纸只是永远不响应鼠标，所以纳入契约面守卫。
   "pushPointer",
   "pointerLeave",
+  // 滚轮注入（含 macOS 触摸板双指滚动与捏合）。同样是静默失效类契约：
+  // 宿主推了没人接，网页壁纸只是不响应滚轮。
+  "pushWheel",
 ];
 for (const name of REQUIRED_WP) {
   check(defined.has(name), `契约面：window.__wp.${name} 在 main.ts 里缺失（见 docs/INTEGRATION.md）`);
@@ -210,6 +213,143 @@ for (const name of REQUIRED_WP) {
   check(
     /^[ \t]*syncCanvasSize\s*\(\s*rt\s*,\s*c\s*,\s*rt\.cfg\s*\)/m.test(media),
     "media.ts 渲染循环必须每帧 syncCanvasSize（媒体壁纸与场景同一条 cover 路径）",
+  );
+}
+
+// 库形态重挂（setRenderDpr / restore）不得复用已 loseContext 的画布。
+//
+// clear() 里 renderer.dispose() 调的是 WEBGL_lose_context.loseContext()，
+// 按规范同一 canvas 之后 getContext("webgl2") 拿回的还是那个 lost 对象
+// （实测 sameObj=true / isContextLost()=true），只有换新 canvas 才能拿到
+// 可用上下文。整页渲染器 clear() 时 wrap.innerHTML="" 删掉画布所以不踩；
+// 库形态没有 wrap，画布被留下复用 —— 于是「切清晰度后壁纸黑屏且零报错」。
+{
+  const apiMount = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const sceneMount = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const media = fs.readFileSync(path.join(ROOT, "renderer/src/media.ts"), "utf8");
+  check(
+    /function ensureSceneCanvas\(el: HTMLElement, reuse = true\)/.test(apiMount),
+    "ensureSceneCanvas 必须带 reuse 形参（重挂时传 false 强制换画布）",
+  );
+  check(
+    /const remountCurrent\s*=/.test(apiMount),
+    "api/mount.ts 必须有 remountCurrent（setRenderDpr / restore 共用的重挂入口）",
+  );
+  // setRenderDpr / restore 直接 mountWallpaper(rt, rt.cfg) 就会带上死画布
+  for (const m of ["setRenderDpr", "restore"]) {
+    const body = (apiMount.match(new RegExp(`${m}\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n    \\}`)) || [""])[0];
+    check(
+      body.length > 0 && !/mountWallpaper\(\s*rt\s*,\s*rt\.cfg\s*\)/.test(body),
+      `api/mount.ts 的 ${m} 不得直接 mountWallpaper(rt, rt.cfg)（rt.cfg.canvas 的 GL 上下文已被 loseContext 弄死，须走 remountCurrent 换新画布）`,
+    );
+  }
+  // loseContext() 异步生效：clear() 之后同步查 isContextLost() 仍是 false，
+  // 靠它判断就会复用一块马上要死的画布（实测症状：场景重挂报
+  // shaderSource must be an instance of WebGLShader）。只能按
+  // 「建过 GL 上下文就换」这个确定性事实决策。
+  {
+    const body = (apiMount.match(/const remountCurrent = \(\) => \{[\s\S]*?\n  \};/) || [""])[0];
+    check(body.length > 0, "verify-arch 无法定位 remountCurrent 函数体（重构后请同步本检查）");
+    const code = body.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    check(
+      /ensureSceneCanvas\(\s*el\s*,\s*false\s*\)/.test(code),
+      "remountCurrent 必须 ensureSceneCanvas(el, false) 强制换画布 —— 复用建过 GL 上下文的画布会拿到 loseContext 后的死上下文",
+    );
+    check(
+      !/isContextLost\(\)/.test(code),
+      "remountCurrent 不得用 isContextLost() 决策：loseContext 异步生效，clear 后同步查恒为 false，会复用马上要死的画布",
+    );
+    const iClear = code.indexOf("clear(rt)");
+    const iEnsure = code.indexOf("ensureSceneCanvas");
+    check(
+      iClear >= 0 && iEnsure >= 0 && iClear < iEnsure,
+      "remountCurrent 必须先 clear(rt) 再换画布：clear 要读 rt.canvas 等旧引用做回收，换早了就漏回收",
+    );
+  }
+  // 两条 WebGL 装配路径都要打标记，否则 isCanvasContextLost 无从判断
+  for (const [name, src] of [["scene-mount.ts", sceneMount], ["media.ts", media]]) {
+    check(
+      /setAttribute\(\s*["']data-webwallgl-gl["']\s*,\s*["']1["']\s*\)/.test(src),
+      `${name} 创建 WebGL2 上下文后必须打 data-webwallgl-gl 标记（供重挂前检测上下文丢失）`,
+    );
+  }
+}
+
+// 视频壁纸走 DOM 直显，不进场景引擎（GL 纹理上传有尺寸上限，4K 源会被降采样
+// 后再放大 → 发糊），且必须用 A/B 双元素无缝循环（WebKit 原生 loop 在循环点
+// 重置解码管线，实测 3840×2160@60fps 素材最坏帧间隔 84ms；双元素降到 33ms，
+// 而进程 RSS 峰值只从 128MB 升到 130MB —— 备用元素平时不赋 src）。
+{
+  const media = fs.readFileSync(path.join(ROOT, "renderer/src/media.ts"), "utf8");
+  const apiMount = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  const rendererJs = fs.readFileSync(path.join(VENDOR, "render/renderer.js"), "utf8");
+
+  // mountMedia 必须在读取 canvas / 建 GL 上下文之前就把 video 分流走
+  const mm = (media.match(/export function mountMedia[\s\S]*?\n}/) || [""])[0];
+  check(mm.length > 0, "verify-arch 无法定位 mountMedia（重构后请同步本检查）");
+  const iVideoBranch = mm.indexOf("mountVideoDom(rt, cfg)");
+  const iGetCtx = mm.indexOf('getContext("webgl2"');
+  check(
+    iVideoBranch >= 0 && iGetCtx >= 0 && iVideoBranch < iGetCtx,
+    "mountMedia 必须在建 WebGL2 上下文**之前**把 video 分流到 mountVideoDom（否则白占一个 GL 上下文，且 4K 帧仍走纹理上传被降采样）",
+  );
+  check(
+    /createLoopingVideo\(/.test(media),
+    "mountVideoDom 必须用 createLoopingVideo 做 A/B 无缝循环（原生 loop 在循环点冻结 0.1~0.5s）",
+  );
+  // 库形态没有 rt.wrap，只 appendChild 到它等于元素永远看不见
+  check(
+    /function resolveVideoContainer/.test(media),
+    "mountVideoDom 必须经 resolveVideoContainer 定位挂载点（库形态没有 rt.wrap，直接 rt.wrap?.appendChild 是 no-op）",
+  );
+  // DOM 路径没有渲染循环：不显式上报首帧，库入口的 mount() 会永久挂起
+  check(
+    /const signalFirstFrame/.test(media) && /rt\.onFirstFrame = undefined/.test(media),
+    "mountVideoDom 必须显式触发 onFirstFrame（DOM 路径无渲染循环，不报首帧则 mount() 的 Promise 永久挂起）",
+  );
+  // frameStats 按 frameMeter.last 的新鲜度判活，不打点会一直报 fps=0/running=false
+  check(
+    /const pumpFrames/.test(media) && /markFrame\(rt, performance\.now\(\)\)/.test(media),
+    "mountVideoDom 必须持续 markFrame 打点（否则 instance.stats 恒报 running=false，宿主健康检查误判）",
+  );
+  // 实测 WKWebView 里 rvfc 存在却从不回调，判活不能依赖它
+  {
+    const pump = (media.match(/const pumpFrames = [\s\S]*?\n  \};/) || [""])[0];
+    const code = pump.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    check(
+      !/requestVideoFrameCallback/.test(code),
+      "pumpFrames 不得依赖 requestVideoFrameCallback：实测 WKWebView 里它存在却从不回调（视频正常播放时 1.5s 内 0 次），判活会永远失败",
+    );
+  }
+  // 四个实时控制 API 都得覆盖 videoPairs，否则对视频壁纸静默失效
+  for (const [m, why] of [
+    ["pause", "暂停"],
+    ["resume", "恢复（还要重启预热调度的 rAF，否则第一圈退回原生 loop）"],
+    ["setVolume", "音量（pair 自己管备用侧静音防双声）"],
+    ["setFit", "显示模式（双元素时两个 <video> 都要改，否则交接后 fit 变回旧值）"],
+  ]) {
+    const body = (apiMount.match(new RegExp(`${m}\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n    \\}`)) || [""])[0];
+    check(
+      body.length > 0 && /videoPairs/.test(body),
+      `api/mount.ts 的 ${m} 必须处理 rt.videoPairs（${why}）`,
+    );
+  }
+  // 视频不用 GL：重挂时不该去换画布
+  {
+    const rc = (apiMount.match(/const remountCurrent = \(\) => \{[\s\S]*?\n  \};/) || [""])[0];
+    check(
+      /"video"/.test(rc),
+      "remountCurrent 必须把 video 与 web 一并排除在换画布之外（DOM 直显不碰 GL 上下文）",
+    );
+  }
+  // 视频纹理上限不得写死成小于典型渲染目标的值
+  check(
+    !/const MAX_DIM = 2048/.test(rendererJs),
+    "renderer.js 不得用固定 MAX_DIM=2048 限制视频纹理（比 Retina 渲染目标还小，4K 源被降到 2048 再放大 → 发糊）",
+  );
+  check(
+    /VIDEO_TEX_HARD_CAP/.test(rendererJs) && /MAX_TEXTURE_SIZE/.test(rendererJs),
+    "renderer.js 视频纹理上限必须取 min(硬件 MAX_TEXTURE_SIZE, 渲染目标长边, VIDEO_TEX_HARD_CAP)",
   );
 }
 

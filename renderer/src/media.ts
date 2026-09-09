@@ -2,6 +2,7 @@
 // WebGL2 缺失时回退 DOM 路径。
 import { clear, effectiveDpr, fitObjectFit, markFrame, normalizeFit, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { createLoopingVideo } from "./video-loop";
+import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
 import { rnd, noise } from "./vendor";
 
@@ -98,7 +99,7 @@ export async function decodeGifFrames(
     width = image.displayWidth;
     height = image.displayHeight;
     frames.push({
-      bitmap: await createImageBitmap(image),
+      bitmap: await createImageBitmap(image, { premultiplyAlpha: "none" }),
       // duration 单位是微秒；缺失/为 0 的帧按 GIF 惯例给 100ms
       durationMs: image.duration ? image.duration / 1000 : 100,
     });
@@ -185,6 +186,89 @@ function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElem
   });
 }
 
+/**
+ * A/B 双元素的频谱接管：两个元素各建一条 analyser，桥只读**当前主元素**那条。
+ *
+ * 为什么不能像单元素那样只接一次：`createMediaElementSource(el)` 对同一个
+ * 元素在同一个 AudioContext 里只能调用一次（第二次抛 InvalidStateError），
+ * 而且一旦把某个元素接进 WebAudio 图，它的声音就只能从那条链路出去 ——
+ * 交接后如果桥还在读旧元素，频谱会停在旧元素被暂停的那一刻（恒定值），
+ * 视觉上就是"换圈后音频可视化卡住不动"。
+ *
+ * 返回一个 `swap(active)`：交接时调它切换取值来源。返回 undefined 表示
+ * 没接管（宿主已注入频谱源，或环境无 AudioContext）。
+ */
+function attachPairSpectrum(
+  rt: Runtime,
+  cfg: WallpaperConfig,
+  a: HTMLVideoElement,
+  b: HTMLVideoElement,
+): ((active: HTMLVideoElement) => void) | undefined {
+  if (rt.audioBridge) return undefined; // 宿主已注入，不接管
+  const AC: typeof AudioContext | undefined =
+    (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!AC) return undefined;
+  let ctx: AudioContext;
+  const nodes = new Map<HTMLVideoElement, AnalyserNode>();
+  try {
+    ctx = new AC();
+    for (const el of [a, b]) {
+      const srcNode = ctx.createMediaElementSource(el);
+      const an = ctx.createAnalyser();
+      an.fftSize = 256; // → 128 个频点，取前 64 段够用
+      an.smoothingTimeConstant = 0.75;
+      srcNode.connect(an);
+      // 必须接回扬声器，否则视频静音（元素一旦进 WebAudio 图就不再直出）
+      an.connect(ctx.destination);
+      nodes.set(el, an);
+    }
+  } catch (e) {
+    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`);
+    return undefined;
+  }
+  let cur = nodes.get(a)!;
+  const bins = new Uint8Array(cur.frequencyBinCount);
+  const left = new Float32Array(64);
+  const right = new Float32Array(64);
+  const bridge = () => {
+    if (ctx.state !== "running") return null;
+    cur.getByteFrequencyData(bins);
+    const n = Math.min(64, bins.length);
+    for (let i = 0; i < n; i++) {
+      const x = bins[i] / 255;
+      left[i] = x;
+      right[i] = x; // AnalyserNode 给的是混合后的单路，左右同值
+    }
+    for (let i = n; i < 64; i++) {
+      left[i] = 0;
+      right[i] = 0;
+    }
+    return { left, right };
+  };
+  rt.audioBridge = bridge;
+  if (ctx.state === "suspended") {
+    const kick = () => {
+      void ctx.resume().catch(() => {});
+      window.removeEventListener("pointerdown", kick);
+      window.removeEventListener("keydown", kick);
+    };
+    window.addEventListener("pointerdown", kick, { once: true });
+    window.addEventListener("keydown", kick, { once: true });
+    (rt.wallpaperDisposers ??= []).push(() => {
+      window.removeEventListener("pointerdown", kick);
+      window.removeEventListener("keydown", kick);
+    });
+  }
+  (rt.wallpaperDisposers ??= []).push(() => {
+    if (rt.audioBridge === bridge) rt.audioBridge = null;
+    void ctx.close().catch(() => {});
+  });
+  return (active: HTMLVideoElement) => {
+    const next = nodes.get(active);
+    if (next) cur = next;
+  };
+}
+
 export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
   // 库化桥接：失败也必须让 mount() 的 Promise 落地。api/mount.ts 等的是
@@ -201,6 +285,20 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   }
   const isVideo = cfg.type === "video";
   const isGif = cfg.type === "gif";
+
+  // 视频壁纸走 DOM 直显，不进场景引擎。
+  //
+  // 场景引擎那条路会把每帧上传成 WebGL 纹理，而渲染器的视频纹理分支有尺寸
+  // 上限（见 vendor renderer 的 videoTexLimit）—— 4K 源被降采样后再放大，
+  // 观感明显发糊。DOM 直显交给浏览器硬件解码合成，拿到的是原生分辨率，
+  // 还省掉一个 WebGL 上下文和每帧一次全画布 texImage2D。
+  //
+  // 代价是纯视频壁纸不再有效果链/粒子叠加能力 —— 它本来也用不到。
+  // 「场景内含视频纹理层」的壁纸走的是 scene-mount，不受这里影响。
+  if (isVideo) {
+    mountVideoDom(rt, cfg);
+    return;
+  }
 
   // 库形态：调用方给了 canvas 就画在它上面（可非全屏、可多实例）；
   // 旧形态（壁纸页）：自建 canvas 铺满内部 wrap 容器。与 mountScene 同构。
@@ -222,19 +320,22 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
     preserveDrawingBuffer: true,
   });
   if (!gl2) {
-    // 无 WebGL2：壁纸页回退 DOM 路径（媒体照常显示，只是没有场景引擎能力）。
+    // 无 WebGL2：壁纸页回退 DOM 路径（图片/GIF 照常显示，只是没有场景引擎能力）。
     // 库形态没有 rt.wrap，DOM 回退的元素挂不上去也就永远看不见 —— 与其假装
     // 成功，不如如实报错让调用方决定（提示 / 换壁纸 / 卸载实例）。
+    // 视频不会走到这里：它在上面已分流到 mountVideoDom（DOM 直显是默认路径）。
     reportDiag(rt, cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE`);
     if (embedded) {
       rt.onError?.(new Error("WEBGL2_UNAVAILABLE"));
       return;
     }
-    if (isVideo) mountVideoDom(rt, cfg);
-    else mountGifDom(rt, cfg);
+    mountGifDom(rt, cfg);
     return;
   }
   if (!embedded) rt.wrap?.appendChild(c);
+  // 标记已创建 WebGL 上下文，供 api/mount.ts 的 ensureSceneCanvas 在重挂前
+  // 检测上下文是否已被 clear() 的 loseContext 弄死（死了就换新画布）
+  c.setAttribute("data-webwallgl-gl", "1");
   rt.canvas = c;
   // 库化桥接：媒体没有图层概念，报最小可用信息（与 web 路径同形）
   if (rt.onSceneInfo) {
@@ -318,47 +419,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
       let mediaW = 0;
       let mediaH = 0;
 
-      if (isVideo) {
-        const v = document.createElement("video");
-        v.autoplay = true;
-        v.loop = cfg.loop !== false; // 默认循环；loop=false 则播完即停
-        v.muted = cfg.muted !== false;
-        v.playsInline = true;
-        // preload=metadata：只拉元数据，避免 WebKit 预下载整个视频文件进内存
-        v.preload = "metadata";
-        // 限制解码分辨率：按画布尺寸而非视频原始分辨率解码，4K 源在 1080p 窗口上
-        // 解码缓冲约降到 1/4（清晰度由采样阶段的缩放决定）
-        v.width = c.width;
-        v.height = c.height;
-        // 画面走 WebGL 纹理，元素自身不参与显示（但必须在文档内才会持续解码）
-        v.style.cssText =
-          "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none";
-        v.src = cfg.src!;
-        document.body.appendChild(v);
-        rt.video = v;
-        (rt.videoTextures ??= []).push(v);
-        await new Promise<void>((ok, err) => {
-          v.addEventListener("loadedmetadata", () => ok(), { once: true });
-          v.addEventListener("error", () => err(new Error(`video error ${v.error?.code ?? "?"}`)), {
-            once: true,
-          });
-        });
-        if (disposed) return;
-        mediaW = v.videoWidth || c.width;
-        mediaH = v.videoHeight || c.height;
-        // entry.video 交给渲染器的视频纹理分支：帧时间戳变化时自动上传
-        textures.set(TEX, {
-          video: v,
-          glTex: rnd.makeTexture(renderer.gl, new Uint8Array([0, 0, 0, 255]), 1, 1),
-          width: mediaW,
-          height: mediaH,
-          rg88: false,
-          lastUploaded: -1,
-        });
-        if (!rt.paused) void v.play().catch(() => {});
-        attachVideoSpectrum(rt, cfg, v);
-        reportDiag(rt, cfg, `media video ${mediaW}x${mediaH} → scene 渲染`);
-      } else {
+      {
         // GIF 优先走 ImageDecoder 逐帧解码（见下），失败或非 GIF 才用 <img> 位图。
         let decoded = false;
         if (isGif && typeof (window as any).ImageDecoder === "function") {
@@ -514,48 +575,309 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   })();
 }
 
-// ---------- 视频 / 图片：DOM 回退路径（无 WebGL2 时使用）----------
+// ---------- 视频：DOM 直显路径 ----------
 
+/**
+ * 视频壁纸挂到哪个容器。
+ *
+ * 与 web.ts 的 resolveContainer 同构：全屏适配层画在 wrap 里；库形态优先用
+ * 调用方给的空容器，给的是 canvas 就退到它父元素（canvas 不能有子节点）。
+ * 少了这一步，库形态下 `rt.wrap?.appendChild` 是 no-op —— 元素永远看不见。
+ */
+function resolveVideoContainer(rt: Runtime, cfg: WallpaperConfig): HTMLElement | null {
+  if (rt.wrap) return rt.wrap;
+  const el = cfg.canvas as HTMLElement | undefined;
+  if (!el) return null;
+  if (el instanceof HTMLCanvasElement) return el.parentElement;
+  return el;
+}
+
+/**
+ * 视频壁纸：`<video>` 直接显示，不经 WebGL 纹理。
+ *
+ * 这是视频类型的**默认路径**（不再只是无 WebGL2 时的回退）。相比走场景引擎：
+ *
+ *  · 清晰度：绕开渲染器视频纹理分支的尺寸上限，浏览器按自己的显示尺寸直接
+ *    硬件解码合成 —— 4K 源不再被降采样后再放大；
+ *  · 内存：省掉一整个 WebGL 上下文，以及每帧一次全画布 texImage2D 上传；
+ *  · 循环：用 A/B 双元素无缝循环（见 video-loop.ts）。实测 3840×2160@60fps
+ *    的 12s 素材，循环点最坏帧间隔从 84ms 降到 33ms，而进程 RSS 峰值只从
+ *    128MB 升到 130MB —— 备用元素平时不赋 src、只在结尾 0.5s 窗口预热保温，
+ *    所以并不是"双份解码器常驻"。
+ *
+ * 代价是没有场景引擎能力（效果链、粒子叠加）。纯视频壁纸本来也用不到那些；
+ * 真需要给视频加效果的是「场景内的视频纹理层」，那条路径不受本函数影响。
+ */
 export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
   if (!cfg.src) {
     rt.fallbackPage?.();
+    rt.onError?.(new Error("媒体壁纸（video）缺少资源 URL（cfg.src 为空）"));
+    return;
+  }
+  const container = resolveVideoContainer(rt, cfg);
+  if (!container) {
+    // 库形态传了裸 canvas 且它没有父节点：挂不上去就别假装成功
+    const why = "视频壁纸需要一个容器元素（传入的 canvas 没有父节点）";
+    reportDiag(rt, cfg, `media video 失败: ${why}`);
+    rt.onError?.(new Error(`媒体壁纸（video）${why}`));
     return;
   }
   const fit = fitObjectFit(cfg.fit);
   const css =
     "position:absolute;inset:0;width:100%;height:100%;" +
     `object-fit:${fit.objectFit};object-position:50% 50%;background:${fit.background};`;
-  let fellBack = false;
-  const onErr = () => {
-    if (fellBack) return;
-    fellBack = true;
-    console.warn("video error, fallback to default wallpaper");
+  // 库形态容器可能是 static 定位，绝对定位的 video 会逃到更外层的定位祖先
+  if (!rt.wrap && getComputedStyle(container).position === "static") {
+    container.style.position = "relative";
+  }
+
+  let failed = false;
+  const onErr = (code?: number) => {
+    if (failed) return;
+    failed = true;
+    const why = `解码/加载失败（code ${code ?? "?"}）`;
+    reportDiag(rt, cfg, `media video 失败: ${why}`);
+    rt.onError?.(new Error(`媒体壁纸（video）${why}`));
     rt.fallbackPage?.();
   };
 
-  // 单视频 + 原生 loop（放弃无缝循环双元素方案）。
-  // 内存减半（不再有备用 standby 解码器）；代价是循环点 0.1~0.5s 轻微冻结。
-  const v = document.createElement("video");
-  v.autoplay = true;
-  v.loop = cfg.loop !== false; // 默认循环；loop=false 则播完即停
-  v.muted = cfg.muted !== false;
-  v.playsInline = true;
-  // preload=metadata：只拉元数据，避免 WebKit 预下载整个视频文件进内存
-  v.preload = "metadata";
-  // 限制解码分辨率：按「窗口尺寸 × 有效 dpr」解码，而非视频原始分辨率。
-  // WebKit 对超出显示尺寸的 video 会分配等比缩小的解码缓冲（4K 源在 1080p 窗口上
-  // 解码缓冲约为 1/4），显著降低内存。不影响显示清晰度（object-fit 在 CSS 层面缩放）。
-  const dprV = Math.min(window.devicePixelRatio || 1, rt.cfg.renderDpr || 1);
-  v.width = Math.max(1, Math.round(innerWidth * dprV));
-  v.height = Math.max(1, Math.round(innerHeight * dprV));
-  v.style.cssText = css;
-  v.src = cfg.src;
-  v.addEventListener("error", onErr);
-  rt.wrap?.appendChild(v);
-  rt.video = v;
-  v.addEventListener("canplay", () => v.play().catch(() => {}), { once: true });
-  reportDiag(rt, cfg, "video mounted (single + native loop)");
+  // loop=false（播完即停）不需要双元素：直接单元素原生播放
+  const wantLoop = cfg.loop !== false;
+  const muted = cfg.muted !== false;
+
+  /**
+   * 首帧上报。库入口的 mount() 等的是 Promise.race([onFirstFrame, onError])，
+   * 两个钩子都不触发就是**永久挂起** —— 调用方连超时都分不清"还在加载"和
+   * "已经死了"。DOM 路径没有渲染循环，所以必须在这里显式触发一次。
+   */
+  const signalFirstFrame = () => {
+    markFrame(rt, performance.now());
+    const first = rt.onFirstFrame;
+    if (!first) return;
+    rt.onFirstFrame = undefined;
+    if (rt.onSceneInfo) {
+      const hook = rt.onSceneInfo;
+      rt.onSceneInfo = undefined;
+      try {
+        hook({
+          width: rt.video?.videoWidth || 0,
+          height: rt.video?.videoHeight || 0,
+          layerCount: 1,
+          hasModels: false,
+          hasParticles: false,
+          hasText: false,
+        });
+      } catch {
+        /* 订阅者抛错不打断装配 */
+      }
+    }
+    try {
+      first();
+    } catch {
+      /* 同上 */
+    }
+  };
+
+  /**
+   * 持续给帧率表打点。
+   *
+   * DOM 直显没有 rAF 渲染循环，而 `frameStats()` 是按 `frameMeter.last` 的
+   * 新鲜度判活的（>400ms 无打点即报 fps=0 / running=false）。不打点的话
+   * `instance.stats` 会一直说壁纸已停 —— 宿主据此做健康检查就会误判。
+   *
+   * 用 rAF 而**不用** requestVideoFrameCallback：后者理论上更合适（只在视频
+   * 真正呈现新帧时回调，能直接反映视频自身帧率），但实测在 WKWebView 里
+   * 这个方法**存在却从不回调** —— 视频正常播放（currentTime 在走）的同时
+   * 1.5 秒内 0 次回调，判活会永远失败。
+   *
+   * rAF 的频率是显示器刷新率，直接每次 rAF 都打点会把 30fps 的视频报成 60。
+   * 所以只在 `currentTime` 真的推进了一个视频帧间隔时才打点：帧间隔未知
+   * （拿不到 fps 元数据）时按"时间有推进"打点，读数退化为刷新率，但
+   * "是否还在跑"这个更重要的语义始终是准的。
+   */
+  const pumpFrames = (getEl: () => HTMLVideoElement | undefined) => {
+    let stopped = false;
+    let raf = 0;
+    let lastMediaTime = -1;
+    const mark = (el: HTMLVideoElement) => {
+      if (rt.paused) return;
+      // 暂停/缓冲卡住时如实反映为"未运行"，否则 rAF 会把卡死的视频报成满帧
+      if (el.paused || el.readyState < 2) return;
+      const t = el.currentTime;
+      // 时间没动 = 没有新的视频帧，不打点（避免把 30fps 报成刷新率）。
+      // 循环回绕时 t 变小，也算"有新帧"。rAF 与 rVFC 两条路径共享
+      // lastMediaTime 去重，同帧不会双记。
+      if (lastMediaTime >= 0 && t === lastMediaTime) return;
+      lastMediaTime = t;
+      markFrame(rt, performance.now());
+    };
+    // rVFC（浏览器可用）：按真实呈现帧打点，帧率读数 = 视频实际帧率，
+    // 不会被 rAF 刷新率污染（120Hz 屏上 30fps 视频不再报成 120）。
+    // WKWebView 里该方法存在却从不回调（实测），所以 rAF 兜底必须并存。
+    let vfcEl: HTMLVideoElement | undefined;
+    const vfcStep = () => {
+      if (stopped || !vfcEl) return;
+      mark(vfcEl);
+      vfcEl.requestVideoFrameCallback(vfcStep);
+    };
+    const step = () => {
+      if (stopped) return;
+      raf = requestAnimationFrame(step);
+      const el = getEl();
+      if (!el) return;
+      if (el !== vfcEl && typeof el.requestVideoFrameCallback === "function") {
+        vfcEl = el;
+        el.requestVideoFrameCallback(vfcStep);
+      }
+      mark(el);
+    };
+    raf = requestAnimationFrame(step);
+    (rt.wallpaperDisposers ??= []).push(() => {
+      stopped = true;
+      vfcEl = undefined;
+      if (raf) cancelAnimationFrame(raf);
+    });
+  };
+
+  if (!wantLoop) {
+    const v = document.createElement("video");
+    v.autoplay = true;
+    v.loop = false;
+    v.muted = muted;
+    v.playsInline = true;
+    v.preload = "metadata";
+    applyDecodeHint(v, rt, cfg);
+    v.style.cssText = css;
+    v.src = cfg.src;
+    v.addEventListener("error", () => onErr(v.error?.code));
+    container.appendChild(v);
+    rt.video = v;
+    (rt.videoTextures ??= []).push(v);
+    v.addEventListener("canplay", () => void v.play().catch(() => {}), { once: true });
+    v.addEventListener("loadeddata", signalFirstFrame, { once: true });
+    if (v.readyState >= 2) signalFirstFrame();
+    attachVideoSpectrum(rt, cfg, v);
+    pumpFrames(() => v);
+    reportDiag(rt, cfg, "media video → DOM 直显（单元素，不循环）");
+    return;
+  }
+
+  /** 无缝循环：A/B 双 <video> 元素（有声、或 WebCodecs 不可用/失败时的回退路径） */
+  const mountAbPair = () => {
+    // 无缝循环：A/B 双元素。两个元素都留在容器里，靠 z-index 决定谁可见 ——
+    // 交接时若改 display/visibility，被隐藏那一侧的解码器可能被 WebKit 回收，
+    // 保温就白做了。
+    // cfg.src 在 mountVideoDom 入口已判空（TS 对闭包内的属性收窄不生效，补 !）
+    const pair = createLoopingVideo(cfg.src!, {
+      muted,
+      renderDpr: cfg.renderDpr,
+      maxW: container.clientWidth || window.innerWidth,
+      maxH: container.clientHeight || window.innerHeight,
+      onRecover: (msg) => reportDiag(rt, cfg, `media video 自愈: ${msg}`),
+    });
+    for (const el of [pair.active, pair.standby]) {
+      el.style.cssText = css;
+      container.appendChild(el);
+      (rt.videoTextures ??= []).push(el);
+      el.addEventListener("error", () => onErr(el.error?.code));
+    }
+    const showActive = () => {
+      pair.active.style.zIndex = "1";
+      pair.standby.style.zIndex = "0";
+      rt.video = pair.active;
+    };
+    showActive();
+    pair.onSwap = () => {
+      showActive();
+      // 频谱要跟着换源：AudioContext 的 createMediaElementSource 对同一元素
+      // 只能调一次，所以两个元素各自接一次、按当前主元素取值（见 attachPairSpectrum）
+      swapSpectrum?.(pair.active);
+    };
+    pair.onFallback = () => reportDiag(rt, cfg, "media video: 无缝循环兜底（退回原生 loop）");
+    (rt.videoPairs ??= []).push(pair);
+
+    // 双元素的频谱：两个元素各建一条 analyser，读当前主元素那条
+    const swapSpectrum = attachPairSpectrum(rt, cfg, pair.active, pair.standby);
+
+    pair.active.addEventListener("loadeddata", signalFirstFrame, { once: true });
+    // metadata 已就绪（缓存命中）时 loadeddata 可能早于监听注册
+    if (pair.active.readyState >= 2) signalFirstFrame();
+    // 打点跟着主元素走：交接后读新主元素，否则每圈换手都会静默 400ms 被判定为已停
+    pumpFrames(() => pair.active);
+    if (!rt.paused) pair.resume();
+    reportDiag(rt, cfg, "media video → DOM 直显（A/B 无缝循环）");
+  };
+
+  // 优先 WebCodecs 逐帧调度（静音循环场景）：循环点帧级精确、没有元素级
+  // API 的整类不确定性（WKWebView 冷管线 ~1s / ended 丢失 / 静默暂停），
+  // 且帧率上限真正生效（<video> 的解码率由内容决定，HTML 无限帧 API）。
+  // 有声（需要音轨）、不循环、WebCodecs 不可用或初始化/解码失败时回退 A/B。
+  if (wantLoop && muted && supportsWebCodecsVideo()) {
+    let pathActive = true;
+    let player: ReturnType<typeof mountWebCodecsVideo> | null = null;
+    /** 销毁 WebCodecs 实例并回退 A/B 路径（rt 已 clear 时静默作废） */
+    const fallbackToAb = (why: string) => {
+      if (!pathActive) return;
+      pathActive = false;
+      player?.destroy();
+      player = null;
+      reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`);
+      mountAbPair();
+    };
+    player = mountWebCodecsVideo({
+      src: cfg.src,
+      container,
+      cssText: css,
+      fit: () => normalizeFit(rt.cfg.fit),
+      fps: () => rt.cfg.sceneFps || 60,
+      paused: () => !!rt.paused,
+      renderDpr: cfg.renderDpr,
+      onFirstFrame: signalFirstFrame,
+      onFrame: () => markFrame(rt, performance.now()),
+      onDiag: (m) => reportDiag(rt, cfg, `media video(webcodecs): ${m}`),
+      onFatal: (why) => fallbackToAb(`WebCodecs 路径失败（${why}）`),
+    });
+    // 暂停/恢复走 sceneCtl（与场景路径同一套钩子，mount.ts 统一调用）
+    rt.sceneCtl = {
+      pause: () => player?.pause(),
+      resume: () => player?.resume(),
+      applyUserProperties() {},
+    };
+    // 取消静音需要音轨（本路径整体忽略音轨）：回退 A/B 让声音回来。
+    // mount.ts 的 setVolume 先更新 rt.cfg.muted 再调这里，回退挂载读到 false
+    rt.sceneAudio = {
+      setVolume: (v) => {
+        if (v > 0) fallbackToAb("取消静音（需要音轨）");
+      },
+      audios: [],
+    };
+    (rt.wallpaperDisposers ??= []).push(() => {
+      pathActive = false;
+      player?.destroy();
+      player = null;
+    });
+    rt.canvas = player.canvas;
+    reportDiag(rt, cfg, "media video → WebCodecs 逐帧调度（静音循环）");
+    return;
+  }
+
+  mountAbPair();
+}
+
+/**
+ * 解码缓冲上限：按「显示尺寸 × 有效 dpr」而非视频原始分辨率。
+ *
+ * WebKit 对超出显示尺寸的 video 会分配等比缩小的解码缓冲（4K 源在 1080p 窗口上
+ * 约为 1/4），显著降低内存，且**不损失观感** —— 显示端最终只有那么多物理像素，
+ * 解码出 4K 再缩回去不会更清晰。真正会糊的是降到显示尺寸**以下**。
+ */
+function applyDecodeHint(v: HTMLVideoElement, rt: Runtime, cfg: WallpaperConfig) {
+  const dpr = Math.min(window.devicePixelRatio || 1, cfg.renderDpr ?? rt.cfg?.renderDpr ?? 1);
+  const w = (cfg.canvas as HTMLElement | undefined)?.clientWidth || window.innerWidth;
+  const h = (cfg.canvas as HTMLElement | undefined)?.clientHeight || window.innerHeight;
+  v.width = Math.max(1, Math.round(w * dpr));
+  v.height = Math.max(1, Math.round(h * dpr));
 }
 
 export function mountGifDom(rt: Runtime, cfg: WallpaperConfig) {

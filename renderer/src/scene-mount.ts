@@ -48,6 +48,15 @@ export const SYSTEM_FONT_FAMILIES: Record<string, string> = {
 // 带内嵌字体的壁纸各存几十 KB~几 MB，只增不清会在多壁纸轮播场景无界累积。
 export const fontFaceCache = new Map<string, { family: string; refs: number }>();
 
+/**
+ * [we-scene patch] WE 语义：visible 属性脚本返回 **number 时折叠成 bool**
+ *（≠ 0 = 可见）。真实现住在引擎 render/text.js（foldVisibleReturn），
+ * 离线 verifier 才能直接测它而不是复算一份。淡出计时器脚本把同一份
+ * `update(value) → mix(value, 0, …)` 同时挂在效果 visible 与 alpha 常量上
+ *（3233141951 中音条0上/下），淡出完成时返回精确 0 —— 作者意图是「淡完后隐藏」。
+ */
+const foldVisibleRet = wtext.foldVisibleReturn as (ret: unknown) => boolean | undefined;
+
 /** djb2：family 名里嵌 key 哈希，防不同壁纸同文件名字体共族误删 */
 function fontKeyHash(key: string): string {
   let h = 5381;
@@ -100,6 +109,23 @@ function pkgCacheEvict(currentKey: string) {
     pkgCacheBytes -= victim.parsed.fileSize || 0;
     pkgCache.delete(oldestKey);
   }
+}
+
+/**
+ * 显式淘汰指定 source.key 的 pkg 缓存（配合实例 destroy 的 releasePkgCache）。
+ *
+ * 缓存的存在意义是同壁纸的重挂不重新下载（暂停恢复/setRenderDpr/显示器
+ * 重载），但宿主**销毁**实例时语义是"这张壁纸我不再要了"——再留一份几百 MB
+ * 的解析包就违背直觉，Activity Monitor 里表现为"换了壁纸内存就是不降"。
+ * 宿主逐张显式释放，而不是收紧全局上限：多实例页面（同一 key 两个实例）
+ * 共享缓存仍然成立，只有明确声明放弃的那个 key 会被清。
+ */
+export function dropPkgCache(key: string | undefined) {
+  if (!key) return;
+  const hit = pkgCache.get(key);
+  if (!hit) return;
+  pkgCacheBytes -= hit.parsed.fileSize || 0;
+  pkgCache.delete(key);
 }
 
 async function loadParsedPkg(
@@ -237,6 +263,8 @@ cfg, source, pkgAbort.signal);
         preserveDrawingBuffer: true,
       });
       if (!gl2) throw new Error("WEBGL2_UNAVAILABLE");
+      // 标记已创建上下文，供 ensureSceneCanvas 复用前检测丢失状态
+      c.setAttribute("data-webwallgl-gl", "1");
 
       const sceneEntry = pkg.getEntry(parsedPkg, "scene.json");
       if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
@@ -457,6 +485,20 @@ cfg, source, pkgAbort.signal);
       });
       // 文字脚本 engine.registerAudioBuffers(n) 的共享视图（text.js 惰性创建，每帧重填）
       const audioViews = new Map<number, { left: Float32Array; right: Float32Array; average: Float32Array }>();
+      // [we-scene patch] 帧事件的图层级广播表：layer → 该层全部带 animationEvent
+      // 的沙箱（官方语义：该层任一动画出事件，这层所有带钩子的脚本都被叫到，
+      // 每个拿到的 value 是各自属性现值）。常量动画的事件经共享队列传入。
+      const animEventSinks = new Map<any, any[]>();
+      const constAnimEventQueue: Array<{ layer: any; events: Array<{ frame: number; name: string }> }> = [];
+      const registerAnimEventSink = (layer: any, sink: any) => {
+        if (!layer || !sink || !sink.sandbox) return;
+        let list = animEventSinks.get(layer);
+        if (!list) {
+          list = [];
+          animEventSinks.set(layer, list);
+        }
+        list.push(sink);
+      };
       // 调试出口：音频状态 / 强制静音（音频响应 A/B 对比验证用）
       (window as unknown as Record<string, unknown>).__audioStats = () => ({
         enabled: audioSim.enabled,
@@ -809,7 +851,7 @@ cfg, source, pkgAbort.signal);
               const res = await fetch(info.url, { cache: "no-store" });
               if (!res.ok) return;
               const blob = await res.blob();
-              const bmp = await createImageBitmap(blob);
+              const bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
               const palette = uploadThumbnailBitmap(bmp, bmp.width, bmp.height);
               bmp.close?.();
 
@@ -1045,7 +1087,12 @@ cfg, source, pkgAbort.signal);
           const blob = new Blob([(m.png || m.image) as BlobPart], {
             type: m.png ? "image/png" : "image/jpeg",
           });
-          const bmp = await createImageBitmap(blob);
+          // [we-scene patch] 必须显式 premultiplyAlpha:'none'：浏览器对 PNG 默认
+          // 做预乘（实现相关），上传的是预乘纹理，而渲染端混合用直通 alpha ——
+          // 半透明边缘的 rgb 被乘两次，所有 1~2px 细线（眼部轮廓/泪痕线/发丝）
+          // 变深色刻线，脸上叠出「细框眼镜」（3264246690 实测；同类还见
+          // 3148125112 / 3223543799）。
+          const bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
           entry = {
             glTex: rnd.makeTexture(renderer.gl, null, 0, 0, bmp),
             width: bmp.width,
@@ -1336,8 +1383,9 @@ cfg, source, pkgAbort.signal);
           rg88: false,
           mips: [gen],
           generated: true,
-          // 内置贴图的帧表（rain1/rain2 的 1×4 图集）：randomframe 预设依赖它
-          // 随机取帧，缺了就整图采样画出超长丝（1823900922）。
+          // 内置贴图的帧表（rain1/rain2 的 1×4、leaves* 的 3×3 图集，像素矩形）：
+          // randomframe 预设依赖它随机取帧，缺了就整图采样画出超长丝（1823900922）；
+          // 叶片缺了会被 sequencemultiplier:3 切成 9 个矩形块（1725510475）。
           frames: ptex.builtinParticleFrames(name) ?? undefined,
         };
         textures.set(name, entry);
@@ -1574,15 +1622,18 @@ cfg, source, pkgAbort.signal);
       if (disposed) return;
       // 粒子每帧推进 + 按图层渲染（在场景图层迭代的正确 z 序位置渲染）。
       // 不再「全部堆在最后」—— advance 在渲染器图层迭代前统一推进，render 按 layer.id 分发。
-      let lastPt = performance.now();
+      // [we-scene patch] 粒子 dt 必须与场景时钟 t 同源（帧循环每帧写入），
+      // 不能再用 performance.now() 差分：那是**第三条时钟** —— 掉帧时关键帧按 t
+      // 推进 200ms、粒子被 50ms 封顶只走 50ms；暂停期间 t 扣掉 pauseAccum、墙钟
+      // 照走 —— 两者都会让粒子与关键帧/骨骼动画永久漂移。3233141951 龙烟 alpha
+      // 曲线挂在场景 t 上，粒子发射若走墙钟就锁不住步（与已修的「两套时钟」同族）。
+      const particleClock = { dt: 1 / 60, t: 0 };
       let particleDiagFrame = 0;
       renderer.setParticleRenderer(
         // advanceFn：每帧推进所有粒子系统（在图层迭代前统一调用）
         () => {
-          const now = performance.now();
-          // dt 封顶 50ms：标签页切回或掉帧时的大 dt 会让粒子瞬移一大段
-          const pdt = Math.min(0.05, (now - lastPt) / 1000);
-          lastPt = now;
+          // dt 封顶 50ms 保留：标签页切回或掉帧时的大 dt 会让粒子瞬移一大段。
+          const pdt = Math.min(0.05, Math.max(0, particleClock.dt));
           // 世界指针位置：locktopointer 的控制点用它做吸引/排斥（controlpointattract）。
           if (pointerSrc.state.has) {
             const { wx, wy, originY } = pointerSrc.state;
@@ -1618,10 +1669,13 @@ cfg, source, pkgAbort.signal);
         cfg,
         `particles: ${particleSystems.length} systems, ${builtinTexCount} builtin tex generated`,
       );
-      // 调试出口：测试台/控制台可读粒子系统状态（存活数、世界包围盒、尺寸区间），
+      // 调试出口：测试台/控制台可读粒子系统状态（存活数、世界包围盒、尺寸区间、
+      // 图层名、override 动画的 opacityMul 曲线、场景时钟 t），
       // 用于确认粒子真的落在可见区域内、尺寸量级合理，而不是堆在原点或大到糊屏。
-      (window as unknown as Record<string, unknown>).__particleStats = () =>
-        particleSystems.map((ps) => {
+      // 单定义（闭包读活状态，不需要每帧重赋）。
+      (window as unknown as Record<string, unknown>).__particleStats = () => ({
+        t: particleClock.t,
+        systems: particleSystems.map((ps) => {
           let live = 0;
           let minX = Infinity;
           let maxX = -Infinity;
@@ -1642,6 +1696,8 @@ cfg, source, pkgAbort.signal);
             if (s > maxS) maxS = s;
           }
           return {
+            layer: ps.layer && ps.layer.name,
+            opacityMul: Math.round(ps.opacityMul * 10000) / 10000,
             live,
             max: ps.maxCount,
             blend: ps.blend,
@@ -1650,7 +1706,8 @@ cfg, source, pkgAbort.signal);
             bbox: live ? [Math.round(minX), Math.round(minY), Math.round(maxX), Math.round(maxY)] : null,
             size: live ? [Math.round(minS), Math.round(maxS)] : null,
           };
-        });
+        }),
+      });
       // 调试出口：整体开关粒子可见性，用于「开/关两帧对比」量化粒子对画面的实际贡献
       // （验证是否出现方块边界、是否把画面冲白、是否堆成一团）。
       // 传索引则只显示该系统，用于逐系统定位过曝来源。
@@ -1668,6 +1725,8 @@ cfg, source, pkgAbort.signal);
       // model json 有 puppet 字段 → 解析 MDL（网格 + 骨架 + MDLA 动画），挂到图层上。
       // 渲染由 renderer 的图层循环调用（按 z 序、可走效果链），不再作为叠加层单独绘制。
       const mdlItems: { mdl: any; tex: any; layer: any }[] = [];
+      // [we-scene patch] 骨骼动画帧事件的播放头跟踪（图层 → 动画层序号 → 上帧帧号）。
+      const puppetPrevFrames = new Map<any, Map<number, number>>();
       // [we-scene patch] 骨骼平移覆写表（图层 → Map<骨索引, 局部平移>）。
       // 脚本经 thisLayer.setBoneTransform 写入（见 text.js 的 makeBoneApi），
       // puppet draw 逐帧读取喂给 computeSkinMatrices。表按图层分开：
@@ -1834,6 +1893,9 @@ cfg, source, pkgAbort.signal);
       // 纯逻辑（脚本沙箱求值 / 盒内排版 / 绘制）在 vendor we-scene render/text.js，
       // 可被 scripts/verify-text.mjs 在 node 里对全库脚本离线校验。
         const textWidgets: any[] = [];
+        // 文字脚本的 init/applyUserProperties 延后队列（框架脚本装在 shared 上的
+        // helper 要等对象脚本顶层跑完才存在——时钟1 的 registerListener）。
+        const deferredTextInits: Array<{ sandbox: any; layer: any }> = [];
         const textLayerText = new Map<string, string>(); // 层名 → 当前文本（thisScene.getLayer 跨层读）
         const textShared: Record<string, unknown> = {}; // 同场景文字脚本共享状态（WE shared 全局）
       let textCanvas: HTMLCanvasElement | null = null;
@@ -1949,12 +2011,18 @@ cfg, source, pkgAbort.signal);
               });
               if (item.sandbox) {
                 propSandboxes.push(item.sandbox);
-                item.sandbox.init();
-                item.sandbox.applyUserProperties(liveUserProps);
+                // [we-scene patch] 文字脚本的 init/applyUserProperties **延后到对象脚本
+                // 装配完之后**：框架脚本（3163060610 基础脚本.visible，对象脚本）在顶层
+                // 往 shared 上装 eventDispatcher/CAniClass，文字脚本的 init 里
+                // `shared.eventDispatcher.registerListener(...)`（时钟1）——
+                // 先跑文字 init 时框架还没装，连环 TypeError。
+                deferredTextInits.push({ sandbox: item.sandbox, layer });
                 // [we-scene patch] 歌名/歌手文字层就靠媒体回调拿数据：
                 // `export function mediaPropertiesChanged(e){ mediaData = e.title }`
                 // 是全库 44 处文字脚本的标准形态。不登记就永远显示作者的占位文本。
                 if (item.sandbox.hasMediaHook) registerMediaHook(item.sandbox);
+                // [we-scene patch] 文字脚本的 animationEvent 同样进图层级广播表。
+                if (item.sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox: item.sandbox, kind: "text" });
               }
             }
             // 静态文本预置进跨层表（脚本层每帧更新自己的条目）
@@ -2036,10 +2104,13 @@ cfg, source, pkgAbort.signal);
             }
             textLayerText.set(layer.name || "", content);
             if (!layer.visible) continue;
-            // 脚本可改写 thisLayer.pointsize/text/font；内容、字号、字体都不变才跳过重绘
+            // 脚本可改写 thisLayer.pointsize/text/font；内容、字号、字体都不变才跳过重绘。
+            // [we-scene patch] maxwidth 关键帧动画改写的是 textMaxwidth（此前写
+            // layer.maxwidth 死槽且 key 不含它，写了也不重排，2902406982 宽度脉动）；
+            // limitwidth/maxrows/limitrows 一并入 key 防同类潜伏。
             const pts = Math.max(1, it.sandbox ? it.sandbox.thisLayer.pointsize : layer.textPointsize);
             const fontPath = (it.sandbox && it.sandbox.thisLayer.font) || layer.textFont || "";
-            const key = `${content}\u0000${pts}\u0000${fontPath}\u0000${layer.alpha}\u0000${layer.textCastshadow}`;
+            const key = `${content}\u0000${pts}\u0000${fontPath}\u0000${layer.alpha}\u0000${layer.textCastshadow}\u0000${layer.textMaxwidth || 0}\u0000${layer.limitwidth ? 1 : 0}\u0000${layer.maxrows || 0}\u0000${layer.limitrows ? 1 : 0}`;
             if (it.lastKey === key) continue;
             it.lastKey = key;
             try {
@@ -2123,13 +2194,16 @@ cfg, source, pkgAbort.signal);
       // ---- WE 对象脚本（scale/origin/color/alpha/brightness/angles 绑定的脚本）----
       // 经典用法：音频条的 scale 脚本读 registerAudioBuffers 按频段改写 scale.y
       // （3078285611 底部 11 根音条即此）。逐帧求值，出错熔断回退字段静态快照。
-      const objectScriptRuns: Array<{ layer: any; field: string; slot: string; kind: "vec3" | "scalar" | "bool"; sandbox: any }> = [];
+      const objectScriptRuns: Array<{ layer: any; field: string; slot: string; kind: "vec3" | "scalar" | "bool"; sandbox: any; last?: unknown }> = [];
       // 关键帧动画：逐帧推进并把结果写回图层字段
       const animRuns: Array<{ layer: any; field: string; slot: string; ctrl: any }> = [];
+      // 粒子 instanceoverride 的关键帧动画（与对象字段动画同一时钟/同一推进队列）：
+      // 写回目标是该层所有粒子系统的倍率，不是图层字段。
+      const overrideAnimRuns: Array<{ layer: any; key: string; ctrl: any }> = [];
       const generalAnimRuns: Array<{ field: string; ctrl: any; write: (v: unknown) => void }> = [];
       const sceneNamedAnims: Record<string, any> = {};
       // 效果开关脚本（effects[i].visible.script）：逐帧决定该效果是否参与渲染
-      const effectVisibleRuns: Array<{ effect: any; sandbox: any }> = [];
+      const effectVisibleRuns: Array<{ effect: any; sandbox: any; last?: unknown }> = [];
       const generalScriptRuns: Array<{ field: string; sandbox: any; write: (v: unknown) => void }> = [];
       // [we-scene patch] 挂了 cursor* 回调的沙箱（图层 → 沙箱列表）。
       // 这是 WE 场景互动的主入口：全库 267 处挂钩、跨 19 个壁纸，
@@ -2257,9 +2331,14 @@ cfg, source, pkgAbort.signal);
           // [we-scene patch] 效果常量的延时逻辑（全库 8 处）。renderer 侧
           // setConstantScriptRuntime 只提取白名单字段，timers 单独透传。
           timers: engineTimers,
+          // 常量动画的帧事件共享队列（render 内推进产生，帧循环 render 后派发）。
+          animEventQueue: constAnimEventQueue,
           ...sceneApi,
-          onSandbox: (sb: any) => {
+          onSandbox: (sb: any, info: any) => {
             if (sb && sb.hasMediaHook) registerMediaHook(sb);
+            // 常量脚本的 animationEvent 也进图层级广播表（3163060610 的事件
+            // 几乎全在常量上）。
+            if (sb && sb.hasAnimEventHook) registerAnimEventSink(info && info.layer, { sandbox: sb, kind: "const" });
           },
         });
         // [we-scene patch] 变换字段（origin/scale/angles）的脚本与关键帧动画一律在
@@ -2300,7 +2379,15 @@ cfg, source, pkgAbort.signal);
               // 叠加，再由 recomposeWorld 合成 world。基准若取 world，父偏移会被
               // 算两遍（全库 4 个非根变换动画全是 relative:true，取错即双计）。
               const slot = fieldSlot(layer, field);
-              const live = (layer as any)[slot];
+              // [we-scene patch] volume/maxwidth/zoom 的基准要从真实消费槽取：
+              // layer.volume/maxwidth/zoom 是零读者死槽（相对曲线叠加错基准会积分漂移）。
+              const live = field === "volume"
+                ? (layer as any).soundprops?.volume
+                : field === "maxwidth"
+                  ? (layer as any).textMaxwidth
+                  : field === "zoom"
+                    ? (scene as any).cameraTransforms?.zoom
+                    : (layer as any)[slot];
               ctrl.baseNumeric = Array.isArray(live) ? live.slice() : live;
               ctrl.slot = slot;
               layer.animationList.push(ctrl);
@@ -2310,7 +2397,38 @@ cfg, source, pkgAbort.signal);
               reportDiag(rt, cfg, `animation '${layer.name}.${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
             }
           }
+          // [we-scene patch] 时间轴联动组接线：同层字段间按 key 链接
+          //（children 不自播、播放头从属于 leader、play/rate 委托——全库 53 处
+          // 语料全在同层字段间）。悬空 parent（目标无动画/自指）与多级记诊断。
+          // animationsByField 同时供 thisObject.getAnimation() 按属性取（官方语义：
+          // 无参 = 当前属性自己的动画）。
+          if (layer.animationList.length) {
+            const siblings = new Map<string, any>();
+            for (const ctrl of layer.animationList) siblings.set(ctrl.field, ctrl);
+            anim.linkAnimations(siblings, (msg: string) => reportDiag(rt, cfg, `${layer.name}: ${msg}`));
+            layer.animationsByField = Object.fromEntries(siblings);
+          }
         }
+        // [we-scene patch] 粒子 instanceoverride 关键帧动画：3233141951 龙烟 alpha
+        //（single/900f：帧 0-599 = 1 → 608-830 = 0.01 → 873 回 1）此前被
+        // _applyOverride 当静态倍率读（opacityMul 恒 0.79），曲线整体丢失。
+        // 全库 4 处（3223543799×2 / 3238423642）。baseNumeric 取快照 value，
+        // 绝对曲线直取；relative 时按基准叠加（与对象字段动画同一约定）。
+        for (const layer of scene.layers as any[]) {
+          const defs = layer.particleOverrideAnimations as Record<string, { animation: any; value: unknown }> | null;
+          if (!defs) continue;
+          for (const [key, def] of Object.entries(defs)) {
+            try {
+              const ctrl = anim.createAnimation(def.animation);
+              ctrl.baseNumeric = typeof def.value === "number" ? def.value : Number(def.value) || 0;
+              overrideAnimRuns.push({ layer, key, ctrl });
+            } catch (e) {
+              reportDiag(rt, cfg, `override animation '${layer.name}.${key}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+            }
+          }
+        }
+        // 脚本 init 返回值改写 visible 的，挂载期一次性收集，层循环结束后统一重算。
+        let mountVisibilityDirty = false;
         for (const layer of scene.layers as any[]) {
           // [we-scene patch] 效果开关上的脚本（`effects[i].visible.script`）。
           // 全库 46 处、媒体回调的第二大挂载点，此前在 parse 阶段就被 parseBool
@@ -2338,11 +2456,25 @@ cfg, source, pkgAbort.signal);
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
-              // WE 语义：init(value) 收到字段的**当前值**（visible 字段 = 布尔）。
-              sandbox.init(effect.visible);
+              // WE 语义：init(value) 收到字段的**当前值**（visible 字段 = 布尔），
+              // 返回值成为新初值 —— 淡出脚本静音加载时 `return 0` 应把效果藏掉，
+              // 此前返回值被丢弃、效果恒显。number 按 WE 折叠（≠0 = 可见）。
+              const ivRet = sandbox.init(effect.visible);
+              const ivFold = foldVisibleRet(ivRet);
+              if (ivFold !== undefined) effect.visible = ivFold;
               sandbox.applyUserProperties(objUserProps);
               if (sandbox.hasMediaHook) registerMediaHook(sandbox);
-              if (sandbox.hasUpdate) effectVisibleRuns.push({ effect, sandbox });
+              // last = 逐帧反馈的未折叠上一值（淡出脚本的 mix 链依赖它，
+              // 只喂 bool 会丢掉小数进度，见帧循环 effectVisibleRuns）。
+              let animRun: any = null;
+              if (sandbox.hasUpdate) {
+                animRun = { effect, sandbox, last: ivRet };
+                effectVisibleRuns.push(animRun);
+              }
+              // [we-scene patch] animationEvent 进图层级广播表（官方事件消费口；
+              // 转发脚本常无 update，必须独立于 hasUpdate 登记——3163060610 的
+              // 调度框架就是这种形态）。
+              if (sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox, kind: "effectVisible", effect, run: animRun });
             } catch (e) {
               console.warn(`效果开关脚本 ${layer.name}#${ei} 求值失败: ${(e as Error).message}`);
             }
@@ -2363,6 +2495,10 @@ cfg, source, pkgAbort.signal);
                 inputView,
                 // thisLayer / thisScene.getLayer：拖拽类回调靠它们写回图层
                 layer,
+                // 官方语义：无参 getAnimation() = 当前属性自己的动画（联动组
+                // 接线后，对 child 字段的调用自然拿到 child→委托 leader）。
+                getAnimationForProperty: () =>
+                  ((layer as any).animationsByField && (layer as any).animationsByField[field]) || null,
                 ...sceneApi,
                 // 骨骼 API 的覆写表（按图层）
                 getBoneOverrides,
@@ -2397,7 +2533,29 @@ cfg, source, pkgAbort.signal);
                   : Array.isArray(fieldVal)
                     ? { x: fieldVal[0] ?? 0, y: fieldVal[1] ?? 0, z: fieldVal[2] ?? 0 }
                     : fieldVal;
-                sandbox.init(initArg);
+                // [we-scene patch] init 返回值 = 属性新初值（WE 官方语义），
+                // 此前全链路丢弃。按字段类型写回：visible 折叠成 bool 走 visibleSelf
+                //（要重算子孙可见性），标量写字段，向量写 local 槽（与 update 收发
+                // 同空间；angles 转回弧度）。只收合法形状，脏值不动槽位。
+                const ir = sandbox.init(initArg);
+                if (ir !== undefined && ir !== null) {
+                  if (field === "visible") {
+                    const fb = foldVisibleRet(ir);
+                    if (fb !== undefined && (layer as any).visibleSelf !== fb) {
+                      (layer as any).visibleSelf = fb;
+                      mountVisibilityDirty = true;
+                    }
+                  } else if (typeof ir === "number" && Number.isFinite(ir)) {
+                    if (field === "alpha" || field === "brightness") (layer as any)[field] = ir;
+                  } else if (typeof ir === "object" && (ir as any).x !== undefined) {
+                    const o = ir as any;
+                    if (Number.isFinite(Number(o.x)) && Number.isFinite(Number(o.y))) {
+                      (layer as any)[initSlot] = field === "angles"
+                        ? wtext.scriptAnglesToRad(o)
+                        : [Number(o.x) || 0, Number(o.y) || 0, Number(o.z) || 0];
+                    }
+                  }
+                }
                 // [we-scene patch] 对象脚本也要收一次全量用户属性。
                 // WE 挂载时 init() 之后必调 applyUserProperties(全量)，脚本靠它
                 // 拿状态初值；文字脚本这边一直调了，对象脚本这边漏了。
@@ -2425,6 +2583,19 @@ cfg, source, pkgAbort.signal);
                         ? "scalar"
                         : "vec3",
                     sandbox,
+                    // visible 字段的逐帧反馈种子（init 未折叠返回值，同
+                    // effectVisibleRuns；淡出计时器脚本挂在图层 visible 上时靠它）。
+                    last: field === "visible" ? ir : undefined,
+                  });
+                }
+                // [we-scene patch] animationEvent 进图层级广播表（独立于 hasUpdate：
+                // 无 update 的转发脚本同样是官方事件消费方）。
+                if (sandbox.hasAnimEventHook) {
+                  registerAnimEventSink(layer, {
+                    sandbox,
+                    kind: field === "visible" ? "bool" : field === "alpha" || field === "brightness" ? "scalar" : "vec3",
+                    field,
+                    slot: initSlot,
                   });
                 }
               }
@@ -2433,6 +2604,21 @@ cfg, source, pkgAbort.signal);
             }
           }
         }
+        // [we-scene patch] 文字脚本的 init/applyUserProperties 在这里统一补跑：
+        // 此时对象/效果/general 脚本的**顶层代码都已执行**，框架装在 shared 上的
+        // helper（eventDispatcher/CAniClass/CAniTaskListClass，3163060610 基础脚本）
+        // 已经就位，文字脚本 init 里的 registerListener 才拿得到（时钟1 此前连环
+        // TypeError「reading registerListener」）。
+        for (const d of deferredTextInits) {
+          // WE 语义：init(value) 收到字段当前值（文字字段 = 当前文本），
+          // 返回字符串成为初始文本。
+          const tir = d.sandbox.init(d.layer.text ?? "");
+          if (typeof tir === "string") d.layer.text = tir;
+          d.sandbox.applyUserProperties(liveUserProps);
+        }
+        // 挂载期 init 返回值改写过的 visibleSelf 统一重算一次（效果链/粒子分发
+        // 都在重算之后装配，避免先拿旧可见性建资源）。
+        if (mountVisibilityDirty) recomputeVisibility();
         // general.*.script（全库 3 处）：3151551777 zoom、2134765860 bloomstrength、
         // 3790527023 cameraparallax 场景切换。不是图层字段，漏加载等于这三张
         // 壁纸的火车震动 / 音频 bloom / 多场景轮换全部不跑。
@@ -2498,6 +2684,8 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt, cfg, `object scripts: ${objectScriptRuns.length}`);
         // 调试出口：读/改对象脚本的实时字段值（音条 scale 等）
         (window as unknown as Record<string, unknown>).__objScripts = objectScriptRuns;
+        // 调试出口：效果开关脚本队列（run.last = 未折叠的淡出进度，A/B 验证用）
+        (window as unknown as Record<string, unknown>).__effectScripts = effectVisibleRuns;
       }
       // 调试出口：媒体广播表（排查「回调登记了没 / 派发到了没」）
       (window as unknown as Record<string, unknown>).__mediaHooks = mediaHooks;
@@ -2602,7 +2790,11 @@ cfg, source, pkgAbort.signal);
           lastRender = now;
           markFrame(rt, now);
           syncCanvasSize(rt, c, rt.cfg);
-          const t = (now - start - pauseAccum) / 1000;
+          // [we-scene patch] t 不允许为负：首帧 rAF 时间戳可能早于挂载时刻的
+          // performance.now()（vsync 对齐），负的场景时间会让下游按相位取模的
+          // 消费者越界（模拟音频 patterns[i16<0] = undefined → NaN 毒化共享视图，
+          // 3233141951 反光层永久隐形）。负场景时间对一切下游都无意义。
+          const t = Math.max(0, (now - start - pauseAccum) / 1000);
           // 指针 last 在本帧 render 完成后再推进（见下方 then）。事件驱动下
           // rAF 之间的 mousemove 已经更新了 current；若在消费前 last=current，
           // cursorripple 的 v_PointDelta.x 恒为 0，涟漪完全不触发。
@@ -2649,7 +2841,7 @@ cfg, source, pkgAbort.signal);
                     r.ok ? r.blob() : null,
                   );
                   if (!blob) return;
-                  const bmp = await createImageBitmap(blob);
+                  const bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
                   // 加载期间可能又切歌了：来源变了就丢弃这次结果
                   if (mediaThumbnailLastSrc !== nextSrc) {
                     bmp.close?.();
@@ -2690,6 +2882,71 @@ cfg, source, pkgAbort.signal);
           // 暂停期间 t 已扣掉 pauseAccum，恢复后不会补跑一大段。
           const animDt = Math.max(0, t - lastAnimT);
           lastAnimT = t;
+          // 粒子推进与关键帧/骨骼同一条时间线（见 setParticleRenderer 上方注释）。
+          particleClock.dt = animDt;
+          particleClock.t = t;
+          let visibilityDirty = false;
+          // [we-scene patch] 帧事件派发（图层级广播，官方 AnimationEvent 语义）：
+          // 该层任一动画出事件，这层所有带 animationEvent 的沙箱都被叫到；
+          // 每个拿到的 value 是各自属性的当前值，返回值按 update 同构规则立即写回
+          //（undefined/非法形状 = 保持不变）。
+          const dispatchAnimEvents = (layer: any, evs: Array<{ frame: number; name: string }>) => {
+            const sinks = animEventSinks.get(layer);
+            if (!sinks || !sinks.length) return;
+            // 诊断计数：事件管线是否在跑（3163060610 调度器活性探针）
+            (window as unknown as Record<string, unknown>).__animEventsFired =
+              (((window as unknown as Record<string, unknown>).__animEventsFired as number) || 0) + evs.length;
+            // 诊断环形日志：最近 400 条派发事件（排查事件风暴/重复派发）
+            {
+              const w = window as unknown as Record<string, unknown>;
+              const log = (w.__animEventLog as Array<{ l: string; f: number; n: string }>) || (w.__animEventLog = []);
+              for (const ev of evs) {
+                log.push({ l: String(layer && (layer.name || layer.id)), f: ev.frame, n: ev.name });
+                if (log.length > 400) log.shift();
+              }
+            }
+            for (const ev of evs) {
+              for (const sink of sinks) {
+                const sb = sink.sandbox;
+                if (!sb || sb.disabled) continue;
+                if (sink.kind === "text") {
+                  const ret = sb.callAnimationEvent(ev, String(layer.text ?? ""));
+                  if (typeof ret === "string") layer.text = ret;
+                } else if (sink.kind === "effectVisible") {
+                  const cur = sink.run && sink.run.last !== undefined && sink.run.last !== null ? sink.run.last : !!sink.effect.visible;
+                  const ret = sb.callAnimationEvent(ev, cur);
+                  if (sink.run && (typeof ret === "boolean" || (typeof ret === "number" && Number.isFinite(ret)))) sink.run.last = ret;
+                  const folded = foldVisibleRet(ret);
+                  if (folded !== undefined) sink.effect.visible = folded;
+                } else if (sink.kind === "const") {
+                  const ret = sb.callAnimationEvent(ev, (sb as any).__lastConstValue);
+                  if (typeof ret === "number" && Number.isFinite(ret)) (sb as any).__lastConstValue = ret;
+                  else if (ret && typeof ret === "object" && Number.isFinite(Number((ret as any).x)) && Number.isFinite(Number((ret as any).y))) (sb as any).__lastConstValue = ret;
+                } else if (sink.kind === "bool") {
+                  const ret = sb.callAnimationEvent(ev, !!layer.visible);
+                  const folded = foldVisibleRet(ret);
+                  if (folded !== undefined && layer.visibleSelf !== folded) {
+                    layer.visibleSelf = folded;
+                    visibilityDirty = true;
+                  }
+                } else if (sink.kind === "scalar") {
+                  const ret = sb.callAnimationEvent(ev, Number(layer[sink.field]) || 0);
+                  const n = Number(ret);
+                  if (Number.isFinite(n)) layer[sink.field] = n;
+                } else {
+                  const lcur = layer[sink.slot];
+                  const v = sink.field === "angles"
+                    ? wtext.radToScriptAngles(lcur)
+                    : { x: (lcur && lcur[0]) || 0, y: (lcur && lcur[1]) || 0, z: (lcur && lcur[2]) || 0 };
+                  const ret = sb.callAnimationEvent(ev, v);
+                  const o = ret && typeof ret === "object" && "x" in (ret as object) ? (ret as any) : v;
+                  layer[sink.slot] = sink.field === "angles"
+                    ? wtext.scriptAnglesToRad(o)
+                    : [Number(o.x) || 0, Number(o.y) || 0, Number(o.z) || 0];
+                }
+              }
+            }
+          };
           for (const run of animRuns) {
             run.ctrl.advance(animDt);
             const field = run.field;
@@ -2699,10 +2956,56 @@ cfg, source, pkgAbort.signal);
               const cur = run.layer[slot];
               if (Array.isArray(cur)) for (let i = 0; i < out.length && i < cur.length; i++) cur[i] = out[i];
             } else if (Number.isFinite(out)) {
-              if (field === "visible") run.layer[field] = !!out;
-              else run.layer[slot] = out;
+              // [we-scene patch] visible 动画必须写 visibleSelf 并重算子孙——
+              // 直接写 layer.visible（有效可见性）会被任何一次 recomputeVisibility
+              // 冲掉，也不沿父链传播（与对象脚本 visible 路径同构）。
+              // 语料目前 0 处，属潜伏加固。
+              if (field === "visible") {
+                if (run.layer.visibleSelf !== !!out) {
+                  run.layer.visibleSelf = !!out;
+                  visibilityDirty = true;
+                }
+              } else if (field === "volume") {
+                // [we-scene patch] 音量动画：此前写 layer.volume 死槽——音频元素
+                // 只读 soundprops.volume。写回与属性热更同一范式（双写 + 实时
+                // setVolume，无节流要求）。2477602742 火车包络、3521337568 BGM 淡入。
+                run.layer.soundprops.volume = out;
+                run.layer.soundCtl?.setVolume?.(out);
+              } else if (field === "maxwidth") {
+                // [we-scene patch] 文字限宽动画：写排版真正读的 textMaxwidth
+                //（此前写 layer.maxwidth 死槽；重排触发已入 lastKey）。
+                run.layer.textMaxwidth = out;
+              } else if (field === "zoom") {
+                // [we-scene patch] 对象级 zoom 动画：layer.zoom 零读者，语义
+                // 消费方是 cameraTransforms.zoom（math.js 每帧读；3521337568
+                // 相机路径对象的开场 zoom 3→1）。与 general zoom 同一消费通道。
+                if (out > 0) (scene as any).cameraTransforms.zoom = out;
+              } else run.layer[slot] = out;
             }
           }
+          // [we-scene patch] 粒子 override 动画与对象字段动画同一时钟推进，
+          // 写回该层全部粒子系统的倍率（轻量 setter，不动 pool）。
+          // 必须在 render 之前：ps.advance/render 当帧就要读到新 opacityMul。
+          for (const run of overrideAnimRuns) {
+            run.ctrl.advance(animDt);
+            const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
+            if (typeof out !== "number" || !Number.isFinite(out)) continue;
+            const list = particleSystemsByLayer.get(run.layer.id);
+            if (!list) continue;
+            for (const ps of list) ps.setOverrideValue(run.key, out);
+          }
+          // [we-scene patch] 帧事件 drain（图层级广播）：对象字段动画与粒子
+          // override 动画在本帧推进时越过的事件，当帧派发。
+          for (const run of animRuns) {
+            const evs = run.ctrl.takeEvents();
+            if (evs.length) dispatchAnimEvents(run.layer, evs);
+          }
+          for (const run of overrideAnimRuns) {
+            const evs = run.ctrl.takeEvents();
+            if (evs.length) dispatchAnimEvents(run.layer, evs);
+          }
+          // general 动画没有图层语义（语料 0 处 events），drain 丢弃防积压。
+          for (const run of generalAnimRuns) run.ctrl.takeEvents();
           for (const run of generalAnimRuns) {
             run.ctrl.advance(animDt);
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
@@ -2717,8 +3020,17 @@ cfg, source, pkgAbort.signal);
             // 动画越走越慢（全库 57 张脚本用 frametime，3233141951 本张 9 处）。
             run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
-            const ret = run.sandbox.callUpdate(!!run.effect.visible);
-            if (typeof ret === "boolean") run.effect.visible = ret;
+            const ret = run.sandbox.callUpdate(
+              // [we-scene patch] 入参 = 上一帧**未折叠**的返回值（run.last，首轮
+              // 为 init 返回值），不再每帧重建 !!visible —— 淡出脚本的 mix 链靠
+              // 小数进度逐帧逼近 0，只喂 bool 会把进度永久卡在 1（3233141951
+              // 中音条淡出永不完成）。返回值 number 按 WE 折叠（≠0 = 可见）；
+              // undefined/NaN 保持不变（不下毒反馈环）。
+              run.last !== undefined && run.last !== null ? run.last : !!run.effect.visible,
+            );
+            if (typeof ret === "boolean" || (typeof ret === "number" && Number.isFinite(ret))) run.last = ret;
+            const folded = foldVisibleRet(ret);
+            if (folded !== undefined) run.effect.visible = folded;
           }
           for (const run of generalScriptRuns) {
             if (run.sandbox.disabled) continue;
@@ -2745,7 +3057,6 @@ cfg, source, pkgAbort.signal);
             sb.engine.runtime = t;
             sb.engine.screenResolution = screenRes;
           }
-          let visibilityDirty = false;
           for (const run of objectScriptRuns) {
             if (run.sandbox.disabled) continue;
             run.sandbox.engine.frametime = animDt;
@@ -2754,18 +3065,23 @@ cfg, source, pkgAbort.signal);
             const cur = run.layer[run.field];
             if (run.kind === "bool") {
               // visible：全库 180 个此类脚本的 value 快照都是 boolean。
-              // 只有脚本明确返回布尔时才写回 —— 纯 cursor 交互脚本（71 个，无 update）
-              // 的 callUpdate 返回 undefined，此时必须保留图层原可见性，
-              // 否则整层会被 undefined 判成隐藏而消失。
-              const ret = run.sandbox.callUpdate(!!cur);
-              if (typeof ret === "boolean") {
+              // 纯 cursor 交互脚本（71 个，无 update）的 callUpdate 返回 undefined，
+              // 此时必须保留图层原可见性，否则整层会被 undefined 判成隐藏而消失。
+              // [we-scene patch] number 按 WE 折叠（≠0 = 可见），未折叠值逐帧反馈
+              //（与 effectVisibleRuns 同构：淡出计时器脚本挂在图层 visible 上时
+              // 的 mix 链依赖小数进度）。
+              const cur2 = run.last !== undefined && run.last !== null ? run.last : !!cur;
+              const ret = run.sandbox.callUpdate(cur2);
+              if (typeof ret === "boolean" || (typeof ret === "number" && Number.isFinite(ret))) run.last = ret;
+              const folded = foldVisibleRet(ret);
+              if (folded !== undefined) {
                 if (run.field === "visible") {
-                  if (run.layer.visibleSelf !== ret) {
-                    run.layer.visibleSelf = ret;
+                  if (run.layer.visibleSelf !== folded) {
+                    run.layer.visibleSelf = folded;
                     visibilityDirty = true;
                   }
                 } else {
-                  run.layer[run.field] = ret;
+                  run.layer[run.field] = folded;
                 }
               }
             } else if (run.kind === "scalar") {
@@ -2808,6 +3124,40 @@ cfg, source, pkgAbort.signal);
           if (attachFollows.length) {
             mdl.followAttachments(attachFollows, t, getBoneOverrides);
           }
+          // [we-scene patch] 骨骼（puppet）动画帧事件：播放头 = t × rate × fps，
+          // 与时间轴事件同一套半开区间跨帧检测（animation.js crossedEvents），
+          // 同一套图层级广播（2477602742 flashStart → bell.play；
+          // 3396722575/3351179520/3405117965 的「错帧/插针」事件）。
+          // 首帧 prev=cur 不补发（与时间轴事件的装载语义一致）。
+          for (const item of mdlItems) {
+            const mdlObj = item.mdl;
+            const layer = item.layer;
+            const anims = mdlObj.animations;
+            if (!anims || !anims.length || !layer.animationLayers || !layer.visible) continue;
+            if (!anims.some((a: any) => a.events && a.events.length)) continue;
+            let prevMap = puppetPrevFrames.get(layer);
+            if (!prevMap) {
+              prevMap = new Map<number, number>();
+              puppetPrevFrames.set(layer, prevMap);
+            }
+            for (let li = 0; li < layer.animationLayers.length; li++) {
+              const al = layer.animationLayers[li];
+              if (!al || al.visible === false || al.visible === 0) continue;
+              const a = anims.find((x: any) => x.id === al.animation);
+              if (!a || !a.events || !a.events.length) continue;
+              const curFrame = t * (typeof al.rate === "number" ? al.rate : 1) * a.fps;
+              const prev = prevMap.has(li) ? (prevMap.get(li) as number) : curFrame;
+              const crossed = anim.crossedEvents(
+                a.events,
+                prev,
+                curFrame,
+                a.frameCount,
+                a.mode === "loop" ? "loop" : a.mode === "mirror" ? "mirror" : "single",
+              );
+              if (crossed.length) dispatchAnimEvents(layer, crossed);
+              prevMap.set(li, curFrame);
+            }
+          }
           const peek = rt.coverAlign;
           void renderer
             .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y)
@@ -2825,6 +3175,13 @@ cfg, source, pkgAbort.signal);
                 } catch { /* 订阅者抛错不打断渲染 */ }
               }
               if (disposed || rt.paused) return;
+              // [we-scene patch] 常量动画的帧事件在 render 内（bindConstants）推进
+              // 产生，render 后立刻做图层级广播（当帧派发；脚本对事件启动的动画
+              // 从下一帧开始生效，与官方「播完检测」的用法兼容）。
+              if (constAnimEventQueue.length) {
+                for (const item of constAnimEventQueue) dispatchAnimEvents(item.layer, item.events);
+                constAnimEventQueue.length = 0;
+              }
               // 指针回调派发放在 render 之后：世界坐标由渲染器在帧内
               // syncWorld(cam, …) 算好（含视差补偿），此时命中判定才与画面一致。
               try {
@@ -2975,7 +3332,8 @@ cfg, source, pkgAbort.signal);
           pauseAccum += performance.now() - pauseStarted;
           pauseStarted = 0;
         }
-        lastPt = performance.now();
+        // 粒子时钟已改场景 t 同源（particleClock），恢复帧 animDt 天然连续，
+        // 不再需要旧墙钟基准的重置。
         for (const ctl of playingVideos) {
           try {
             ctl.play();

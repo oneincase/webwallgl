@@ -391,11 +391,13 @@ export type SceneInstance = {
    * @param u 归一化横坐标 0..1（相对画布左缘）
    * @param v 归一化纵坐标 0..1（相对画布上缘，y 向下）
    * @param buttons 按键位掩码，同 MouseEvent.buttons；只有 bit0（左键）被消费
+   * @param mods 修饰键位掩码：bit0 ctrl / bit1 shift / bit2 alt / bit3 meta。
+   *   省略等于 0。只有 web 壁纸消费（合成事件的 ctrlKey 等字段）
    *
    * 与 canvas 自身的 DOM 指针监听并存，谁后写谁赢。scene 与 web 壁纸都生效，
    * 媒体壁纸（video/gif/image）没有指针概念，调用静默无效。
    */
-  pushPointer(u: number, v: number, buttons?: number): void;
+  pushPointer(u: number, v: number, buttons?: number, mods?: number): void;
 
   /**
    * 外部指针离开本窗口（鼠标移到了别的显示器）。
@@ -405,6 +407,25 @@ export type SceneInstance = {
    */
   pointerLeave(): void;
 
+  /**
+   * 外部滚轮注入：把宿主捕获的滚轮 / 触摸板手势推进壁纸。
+   *
+   * **只有 web 壁纸生效。** scene 壁纸静默无效不是遗漏：WE 的场景脚本沙箱
+   * 不暴露任何滚轮 API，实测 194 张场景壁纸零消费（场景包里的 `scroll`
+   * 全都是纹理滚动 shader 的 `g_ScrollSpeed`，与鼠标无关）。
+   *
+   * @param dx 横向滚动量，正 = 内容向右（与 WheelEvent.deltaX 同向同量级）
+   * @param dy 纵向滚动量，正 = 内容向下（与 WheelEvent.deltaY 同向；
+   *   macOS 原生 NSEvent.scrollingDeltaY 是**反向**的，宿主需取反）
+   * @param mode 同 WheelEvent.deltaMode：0 像素 / 1 行 / 2 页。触摸板恒为 0
+   * @param mods 修饰键位掩码，bit0 ctrl。**触摸板双指捏合应映射成 ctrl + 滚轮**
+   *   —— 浏览器就是这样把 macOS 的 magnify 手势喂给网页的，
+   *   OrbitControls / pano2vr 一族都靠 `event.ctrlKey` 区分缩放与滚动
+   *
+   * 位置沿用最后一次 `pushPointer()` 的坐标（滚轮事件本身不带位置）。
+   */
+  pushWheel(dx: number, dy: number, mode?: number, mods?: number): void;
+
   /** 换场景，复用同一 canvas 与 WebGL 上下文 */
   load(source: Source): Promise<void>;
 
@@ -412,8 +433,13 @@ export type SceneInstance = {
   release(): void;
   /** 用保留的配置重建 */
   restore(): void;
-  /** 彻底销毁：解绑事件监听、释放全部资源，之后不可再用 */
-  destroy(): void;
+  /**
+   * 彻底销毁：解绑事件监听、释放全部资源，之后不可再用。
+   * `releasePkgCache: true` 连带淘汰本实例 source 的 scene.pkg 解析缓存 ——
+   * 缓存默认跨实例保留（同壁纸重挂不重新下载），宿主"销毁即放弃"的语义
+   * （如桌面壁纸逐张切换）需要显式声明，否则旧包会压在缓存里不落内存。
+   */
+  destroy(opts?: { releasePkgCache?: boolean }): void;
 
   readonly stats: FrameStats;
   readonly info: SceneInfo | null;

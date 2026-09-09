@@ -43,7 +43,22 @@
 // 缝只占时间轴尾部 length − last.frame，开头到首关键帧仍钳在首值。
 // 全库 10 处，3233141951「火1」的 alpha/origin/scale 都开了；
 // 不做的话末帧（847，origin +64px）会钳到 length 再瞬间跳回 0。
-// 暂未实现：`options.parent` / `children` 联动组（15/12 处）、`options.events` 帧事件（2 处）。
+//
+// `options.parent` / `children`（时间轴联动组，全库 53 处 / 21 组 / 7 壁纸）：
+// 按**同作用域字段 key** 引用（对象字段=同层、常量=同 constantshadervalues 映射），
+// 与 options.name 无关（撞名实测存在）。leader 独占 startpaused/name/events
+//（21 vs 0）——**children 不自播**，播放头从属于 leader（组内 fps/length/mode
+// 实测全同，frame 恒等映射；relative/绝对/通道/wraploop 各自独立，3233141951
+// 火1 同组内 relative 3 通道 + 绝对 1 通道）。child 的 play/pause/stop/setFrame/
+// setRate/rate 赋值全部委托 leader（语料实证作者直接写 `ani.rate = ±x`）。
+// 悬空 parent（目标无动画，2 处）容忍退化为独立；无多级/无环（53/53）。
+//
+// `options.events`（帧事件，24 处全在 3163060610；骨骼动画事件表另 4 张）：
+// 官方语义 = 播放头**越过**某帧时触发同层脚本的 `animationEvent(event, value)`
+//（event = {name, frame}）。触发按语料魔数反推为半开区间：前进 `prev < f <= cur`、
+// 后退 `cur <= f < prev`；setFrame 不触发（脚本 seek 不算"passes"）；换向不补发；
+// single 钳到 length 时末帧事件触发（24/24 的 S 事件都钉在 frame==length）；
+// 装载时 frame-0 事件**不补发**（假设，语料两种解读都自洽）。
 
 /** 三次贝塞尔的一维分量 */
 function bez1(p0, p1, p2, p3, t) {
@@ -185,6 +200,82 @@ function coerceBase(base) {
 }
 
 /**
+ * [we-scene patch] 帧事件跨帧检测（只在 advance 里调；setFrame 不触发）。
+ * 半开区间：前进 prev < f <= cur、后退 cur <= f < prev（不含出发帧、含到达帧）。
+ * loop 按原始帧逐周期展开（第 k 周期事件 f 落在 k*len + f）；mirror 每周期两次
+ *（端点一次）。同刻多事件保 events 数组序（稳定排序）。语料 loop/mirror+events
+ * 为 0，这两种展开按模型实现并在头注释标注。
+ *
+ * 独立导出：时间轴控制器（collectCrossedEvents）与骨骼动画事件（scene-mount 的
+ * puppet 播放头跨帧）共用同一份数学 —— 两份实现必然发散。
+ */
+export function crossedEvents(events, prev, cur, length, mode) {
+  if (!events || !events.length || prev === cur) return []
+  const forward = cur > prev
+  const len = length > 0 ? length : 1
+  const hits = []
+  if (mode === 'single') {
+    for (const e of events) {
+      if (forward ? (e.frame > prev && e.frame <= cur) : (e.frame >= cur && e.frame < prev)) hits.push({ at: e.frame, e })
+    }
+  } else if (mode === 'loop') {
+    const kMin = Math.floor(Math.min(prev, cur) / len)
+    const kMax = Math.floor(Math.max(prev, cur) / len)
+    for (let k = kMin; k <= kMax; k++) {
+      for (const e of events) {
+        const at = k * len + e.frame
+        if (forward ? (at > prev && at <= cur) : (at >= cur && at < prev)) hits.push({ at, e })
+      }
+    }
+  } else {
+    // mirror：周期 2*len，升段 at1、降段 at2（f==0/len 时两点重合只算一次）
+    const period = len * 2
+    const kMin = Math.floor(Math.min(prev, cur) / period)
+    const kMax = Math.floor(Math.max(prev, cur) / period)
+    for (let k = kMin; k <= kMax; k++) {
+      for (const e of events) {
+        const at1 = k * period + e.frame
+        const at2 = k * period + 2 * len - e.frame
+        for (const at of at1 === at2 ? [at1] : [at1, at2]) {
+          if (forward ? (at > prev && at <= cur) : (at >= cur && at < prev)) hits.push({ at, e })
+        }
+      }
+    }
+  }
+  hits.sort((a, b) => (forward ? a.at - b.at : b.at - a.at))
+  return hits.map((h) => h.e)
+}
+
+/** 控制器的跨帧检测入口：把越过的事件推入实例队列（advance 内调用）。 */
+function collectCrossedEvents(anim, prev, cur) {
+  const crossed = crossedEvents(anim._events, prev, cur, anim.frameCount || 1, anim.mode)
+  for (const e of crossed) anim._eventQueue.push(e)
+}
+
+/**
+ * [we-scene patch] 时间轴联动组接线：按同作用域字段 key 把 child 挂到 leader 上
+ *（child.parent = leader）。siblings 为 Map<key, ctrl> 或 {key: ctrl}。
+ * 悬空 parent（目标无动画/自指）与多级 parent 不链接，经 onDiag 记一条。
+ */
+export function linkAnimations(siblings, onDiag) {
+  const map = siblings instanceof Map ? siblings : new Map(Object.entries(siblings || {}))
+  for (const [key, ctrl] of map) {
+    if (!ctrl || !ctrl.parentKey) continue
+    const leader = map.get(ctrl.parentKey)
+    if (!leader || leader === ctrl) {
+      if (onDiag) onDiag(`动画联动 parent 悬空（退化为独立）：${key} -> ${ctrl.parentKey}`)
+      continue
+    }
+    if (leader.parentKey) {
+      if (onDiag) onDiag(`动画联动多级 parent（不支持，退化为独立）：${key} -> ${ctrl.parentKey}`)
+      continue
+    }
+    ctrl.parent = leader
+  }
+  return map
+}
+
+/**
  * 创建一条动画的播放控制器。
  * @param def scene.json 的 `animation` 对象（含 c0..cN / options / relative）
  */
@@ -207,6 +298,17 @@ export function createAnimation(def) {
   // startpaused:true（39 处）初始不播，等脚本 play()；缺省自动播放
   const autoPlay = opts.startpaused !== true
   const endedCallbacks = []
+  // [we-scene patch] 联动组引用（按同作用域字段 key，linkAnimations 接线）与
+  // 帧事件表（保数组序；同帧多事件的预期派发顺序即数组序，语料 7 组全在 frame 0）
+  const parentKey = opts.parent && typeof opts.parent.key === 'string' ? opts.parent.key : null
+  const childKeys = Array.isArray(opts.children)
+    ? opts.children.map((c) => (c && typeof c.key === 'string' ? c.key : null)).filter(Boolean)
+    : []
+  const events = Array.isArray(opts.events)
+    ? opts.events
+        .filter((e) => e && Number.isFinite(Number(e.frame)) && typeof e.name === 'string')
+        .map((e) => ({ frame: Number(e.frame), name: e.name }))
+    : []
 
   const anim = {
     name,
@@ -214,53 +316,107 @@ export function createAnimation(def) {
     fps,
     relative,
     channelCount: channels.length,
+    parentKey,
+    childKeys,
+    /** linkAnimations 填写（child → leader）；leader/未链接恒 null */
+    parent: null,
     frame: 0,
-    rate: 1,
-    playing: autoPlay,
-    ended: false,
+    _playing: autoPlay,
+    _rate: 1,
+    _ended: false,
+    _events: events,
+    _eventQueue: [],
     get frameCount() { return length },
-    play() { anim.playing = true; anim.ended = false; return anim },
-    pause() { anim.playing = false; return anim },
-    stop() { anim.playing = false; anim.frame = 0; anim.ended = false; return anim },
+    // [we-scene patch] playing/rate/ended 是访问器：linked child 全部镜像/委托
+    // leader —— 语料里作者直接读写 `ani.rate`（不是 setRate），纯数据字段拦不住。
+    get playing() { return anim.parent ? anim.parent.playing : anim._playing },
+    set playing(v) { if (anim.parent) anim.parent.playing = !!v; else anim._playing = !!v },
+    get rate() { return anim.parent ? anim.parent.rate : anim._rate },
+    set rate(n) {
+      const v = Number(n)
+      if (!Number.isFinite(v)) return
+      if (anim.parent) anim.parent.rate = v
+      else anim._rate = v
+    },
+    get ended() { return anim.parent ? anim.parent.ended : anim._ended },
+    set ended(v) { if (anim.parent) anim.parent.ended = !!v; else anim._ended = !!v },
+    play() {
+      if (anim.parent) return anim.parent.play()
+      anim._playing = true
+      anim._ended = false
+      return anim
+    },
+    pause() {
+      if (anim.parent) return anim.parent.pause()
+      anim._playing = false
+      return anim
+    },
+    stop() {
+      if (anim.parent) return anim.parent.stop()
+      anim._playing = false
+      anim.frame = 0
+      anim._ended = false
+      return anim
+    },
     setFrame(f) {
+      if (anim.parent) return anim.parent.setFrame(f)
       const n = Number(f)
       if (Number.isFinite(n)) anim.frame = n
       return anim
     },
-    getFrame() { return anim.frame },
+    getFrame() { return anim.parent ? anim.parent.getFrame() : anim.frame },
     setRate(r) {
-      const n = Number(r)
-      if (Number.isFinite(n)) anim.rate = n
+      if (anim.parent) return anim.parent.setRate(r)
+      anim.rate = r
       return anim
     },
-    addEndedCallback(fn) { if (typeof fn === 'function') endedCallbacks.push(fn); return anim },
+    addEndedCallback(fn) {
+      if (anim.parent) return anim.parent.addEndedCallback(fn)
+      if (typeof fn === 'function') endedCallbacks.push(fn)
+      return anim
+    },
+    // [we-scene patch] 与中性面对齐：官方 IAnimation 有 isPlaying()，真控制器
+    // 此前只有 .playing 属性，脚本对真控制器调 isPlaying() 会 TypeError（潜伏不对称）。
+    isPlaying() { return anim.playing },
     setBlend() { return anim },
     setVisible() { return anim },
-    /** 推进播放头。dt 单位秒。 */
+    /** 推进播放头。dt 单位秒。linked child 的播放头由 leader 拥有，自己不推进。 */
     advance(dt) {
-      if (!anim.playing) return
-      anim.frame += (Number(dt) || 0) * fps * anim.rate
+      if (anim.parent) return
+      if (!anim._playing) return
+      const prev = anim.frame
+      anim.frame += (Number(dt) || 0) * fps * anim._rate
       if (mode === 'single') {
         if (anim.frame >= length) {
           anim.frame = length
-          anim.playing = false
-          if (!anim.ended) {
-            anim.ended = true
+          anim._playing = false
+          if (!anim._ended) {
+            anim._ended = true
             for (const cb of endedCallbacks) { try { cb() } catch (e) { /* 回调抛错不该拖垮渲染 */ } }
           }
         } else if (anim.frame < 0) {
           // 负 rate 倒放到头
           anim.frame = 0
-          anim.playing = false
+          anim._playing = false
         }
       }
+      collectCrossedEvents(anim, prev, anim.frame)
+    },
+    /** 取出并清空本帧越过的事件（宿主统一做图层级广播；setFrame 不产生事件） */
+    takeEvents() {
+      if (!anim._eventQueue.length) return []
+      const out = anim._eventQueue.slice()
+      anim._eventQueue.length = 0
+      return out
     },
     /**
      * 当前值。返回标量（1 通道）或数组（2/3 通道）。
      * relative 时调用方需自行叠加基准值 —— 见 applyTo。
+     * linked child 用 **leader 的播放头**采自己的通道（relative/基准/wraploop
+     * 各自独立 —— 3233141951 火1 同组内 relative 3ch + 绝对 1ch）。
      */
     value() {
-      const f = wrapFrame(anim.frame, length, mode)
+      const f = wrapFrame(anim.parent ? anim.parent.frame : anim.frame, length, mode)
       const wrap = wraploop ? { length } : undefined
       if (channels.length === 1) return sampleChannel(channels[0], f, wrap)
       const out = []
@@ -287,12 +443,14 @@ export function createAnimation(def) {
 export function createNeutralAnimation() {
   const a = {
     name: '', mode: 'single', fps: 30, relative: false, channelCount: 0,
+    parentKey: null, childKeys: [], parent: null,
     frame: 0, rate: 1, playing: false, ended: false,
     get frameCount() { return 0 },
     play() { return a }, pause() { return a }, stop() { return a },
     setFrame() { return a }, getFrame() { return 0 }, setRate() { return a },
-    addEndedCallback() { return a }, setBlend() { return a }, setVisible() { return a },
-    advance() {}, value() { return 0 }, applyTo(base) { return base },
+    addEndedCallback() { return a }, isPlaying() { return false },
+    setBlend() { return a }, setVisible() { return a },
+    advance() {}, takeEvents() { return [] }, value() { return 0 }, applyTo(base) { return base },
   }
   return a
 }

@@ -393,30 +393,59 @@ export function webPointerToClient(
  * 让 shim 自己除一遍会得到「相对被裁切视口」的坐标，画面上肉眼可见地偏。
  */
 function installWebPointerBridge(rt: Runtime, f: HTMLIFrameElement, container: HTMLElement) {
+  /** u/v → iframe 内 client 像素。指针与滚轮共用同一套几何。 */
+  const toClient = (u: unknown, v: unknown) => {
+    if (!f.isConnected) return null;
+    const cRect = container.getBoundingClientRect();
+    const fRect = f.getBoundingClientRect();
+    return webPointerToClient(
+      Number(u),
+      Number(v),
+      {
+        left: cRect.left,
+        top: cRect.top,
+        width: cRect.width || container.clientWidth || window.innerWidth || 0,
+        height: cRect.height || container.clientHeight || window.innerHeight || 0,
+      },
+      { left: fRect.left, top: fRect.top, width: fRect.width, height: fRect.height },
+      { width: f.clientWidth, height: f.clientHeight },
+    );
+  };
   rt.pointerCtl = {
     push(p) {
-      if (!f.isConnected) return;
-      const cRect = container.getBoundingClientRect();
-      const fRect = f.getBoundingClientRect();
-      const pt = webPointerToClient(
-        Number(p?.u),
-        Number(p?.v),
-        {
-          left: cRect.left,
-          top: cRect.top,
-          width: cRect.width || container.clientWidth || window.innerWidth || 0,
-          height: cRect.height || container.clientHeight || window.innerHeight || 0,
-        },
-        { left: fRect.left, top: fRect.top, width: fRect.width, height: fRect.height },
-        { width: f.clientWidth, height: f.clientHeight },
-      );
+      const pt = toClient(p?.u, p?.v);
       // 非有限值丢弃（与场景通道同一约定）：NaN 会让 elementFromPoint 返回 null，
       // 作者的位移积分一次性污染成 NaN 且没有任何报错。
       if (!pt) return;
-      weShimCall(rt, (w: any) => w.__wePushPointer?.(pt.x, pt.y, Number(p.buttons) || 0));
+      weShimCall(rt, (w: any) =>
+        w.__wePushPointer?.(pt.x, pt.y, Number(p.buttons) || 0, Number(p.mods) || 0),
+      );
     },
     leave() {
       weShimCall(rt, (w: any) => w.__wePointerLeave?.());
+    },
+    /**
+     * 滚轮注入。位置可选：宿主拿到滚轮事件时未必同时拿到坐标（macOS 的
+     * scrollWheel 自带 locationInWindow，但捏合手势的位置意义不大），
+     * 省略时 shim 用最后已知的指针位置。
+     *
+     * 滚动量本身**不做任何换算**：deltaX/deltaY 是与视口尺寸无关的量，
+     * 而 cover 露底自适配只影响坐标映射。曾想过按 sx/sy 缩放 delta，
+     * 但那会让固定分辨率模式下的滚动速度莫名变化。
+     */
+    wheel(ev) {
+      if (!f.isConnected) return;
+      const pt = ev.u !== undefined && ev.v !== undefined ? toClient(ev.u, ev.v) : null;
+      weShimCall(rt, (w: any) =>
+        w.__wePushWheel?.(
+          pt ? pt.x : NaN,
+          pt ? pt.y : NaN,
+          Number(ev.dx) || 0,
+          Number(ev.dy) || 0,
+          Number(ev.mode) || 0,
+          Number(ev.mods) || 0,
+        ),
+      );
     },
   };
   // 无需自挂 cleanup：clear() 统一清 rt.pointerCtl（与场景通道同一处）。

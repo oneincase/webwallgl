@@ -24,18 +24,12 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 
-import { LIB, ROOT, createChecker } from './lib/verify-kit.mjs'
+import { LIB, ROOT, createChecker, imp } from './lib/verify-kit.mjs'
 
-// headers.ts 是 TS 文件，用 verify-shaders 同款的极简转译（只有一个 export const）
-async function importTs(rel) {
-  const src = fs.readFileSync(path.join(ROOT, rel), 'utf8')
-  const js = src.replace(/:\s*Record<[^>]*>/g, '').replace(/\bexport\s+const\b/g, 'export const')
-  const tmp = path.join(os.tmpdir(), 'we_hdr_' + Date.now() + '.mjs')
-  fs.writeFileSync(tmp, js)
-  try { return await import('file://' + tmp) } finally { fs.unlinkSync(tmp) }
-}
+// headers.ts 由 Node 24 的类型擦除直接载入（verify-kit 的 imp）。
+// 不能再拷到 os.tmpdir() 转译：headers.ts 新增了相对 import（./render/renderer-glsl.js），
+// 拷到临时目录后该相对路径解析到 tmpdir 下而报 ERR_MODULE_NOT_FOUND。
 
 const { parsePkg, getEntry } = await import(path.join(ROOT, 'renderer/vendor/we-scene/pkg/container.js'))
 const mathMod = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/math.js'))
@@ -46,7 +40,7 @@ const { hlsl2glsl } = await import(path.join(ROOT, 'renderer/vendor/we-scene/ren
 const { parseMDL, computeSkinMatrices } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/mdl.js'))
 const { parseScene, recomposeWorld, collectTransformDirty } = await import(path.join(ROOT, 'renderer/vendor/we-scene/scene/parse.js'))
 const { ParticleSystem } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/particles.js'))
-const { WE_SHADER_HEADERS } = await importTs('renderer/vendor/we-scene/headers.ts')
+const { WE_SHADER_HEADERS } = await imp('renderer/vendor/we-scene/headers.ts')
 
 const { mat4Identity, mat4Translate, mat4RotateZ, mat4Scale, mat4TransformPoint, mat4Invert, fitWindow, parallaxDepthFactor } = mathMod
 
@@ -589,6 +583,23 @@ console.log('\n【3.5 外部指针注入（宿主推送通道）】')
     } else if (!/rt\.pointerCtl\?\.push\(/.test(wpBlock)) {
       fail('__wp.pushPointer 未转发到 rt.pointerCtl（调用成功但指针不动）')
     } else ok('main.ts 的 __wp.pushPointer 转发到 rt.pointerCtl（宿主契约面通）')
+
+    // 反向守卫：场景侧**不得**引入滚轮语义。
+    //
+    // WE 的场景脚本沙箱没有任何滚轮 API，本机 194 张场景壁纸零消费 ——
+    // 场景包里的 `scroll` 全是纹理滚动图层效果（shaders/effects/scroll.frag 的
+    // g_ScrollSpeed / scrolldirection，UV 平移动画），`zoom` 全是相机字段
+    // `"zoom": 1.0` 或 hover 缩放的属性面板文案，`wheel` 全是 COGWHEEL.json /
+    // frontwheel.json 模型资源名。滚轮只对网页壁纸有意义（web-shim 合成 DOM 事件）。
+    //
+    // 这条断言防的是「顺手补全」：给 pointer.js 加个 wheel 字段看着无害，实际是
+    // 凭空发明 WE 没有的语义，下游会以为场景壁纸也能响应滚轮。真要加，先改这条判据。
+    const ptrSrc = fs.readFileSync(
+      path.join(ROOT, 'renderer/vendor/we-scene/render/pointer.js'), 'utf8')
+    if (/wheel|deltaMode|deltaY/i.test(ptrSrc)) {
+      fail('pointer.js 出现滚轮字段：WE 场景沙箱无滚轮语义（194 张场景壁纸零消费），'
+        + '滚轮只走网页壁纸的 web-shim。若确要新增请先更新本判据与 docs/INTEGRATION.md')
+    } else ok('场景指针源不含滚轮语义（与 WE 一致；滚轮只对网页壁纸生效）')
   }
 
   delete globalThis.window

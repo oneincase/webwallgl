@@ -35,6 +35,194 @@ const COLOR_BLEND_GL = {
 // Screen/Multiply 的源色预处理档位，见 colorBlendPlan 的推导
 const BLEND_PREP = { screen: 1, multiply: 2 }
 
+// [we-scene patch] WE 的 32 个混合模式 GLSL 实现（编号同 common_blending.h）。
+//
+// **放在引擎 .js 层而不是 headers.ts**，因为两处都要用同一份：
+//   - 效果 shader 的 `#include "common_blending.h"`（headers.ts 供源）
+//   - 图层 colorBlendMode 的画布合成（本文件的 COMPOSITE_BLEND_FRAG）
+// headers.ts 是 TS，引擎 .js 不能 import 它（verify-arch 要求引擎模块 Node 直载），
+// 反过来 headers.ts import 本文件是允许的方向。复制成两份必然发散 —— 32 个模式
+// 的代数细节（哪些模式不套 opacity 二次加权）改一处漏一处，画面错了还查不出来。
+const WE_BLENDING_GLSL = `// WE common_blending.h（重建子集）
+vec3 weBlendOverlay(vec3 a, vec3 b) {
+    return vec3(
+        a.r < 0.5 ? 2.0 * a.r * b.r : 1.0 - 2.0 * (1.0 - a.r) * (1.0 - b.r),
+        a.g < 0.5 ? 2.0 * a.g * b.g : 1.0 - 2.0 * (1.0 - a.g) * (1.0 - b.g),
+        a.b < 0.5 ? 2.0 * a.b * b.b : 1.0 - 2.0 * (1.0 - a.b) * (1.0 - b.b));
+}
+vec3 weBlendSoftLight(vec3 a, vec3 b) {
+    return vec3(
+        b.r < 0.5 ? 2.0 * a.r * b.r + a.r * a.r * (1.0 - 2.0 * b.r) : sqrt(a.r) * (2.0 * b.r - 1.0) + 2.0 * a.r * (1.0 - b.r),
+        b.g < 0.5 ? 2.0 * a.g * b.g + a.g * a.g * (1.0 - 2.0 * b.g) : sqrt(a.g) * (2.0 * b.g - 1.0) + 2.0 * a.g * (1.0 - b.g),
+        b.b < 0.5 ? 2.0 * a.b * b.b + a.b * a.b * (1.0 - 2.0 * b.b) : sqrt(a.b) * (2.0 * b.b - 1.0) + 2.0 * a.b * (1.0 - b.b));
+}
+float weBlendVivid(float a, float b) {
+    if (b < 0.5) {
+        float bb = 2.0 * b;
+        return bb == 0.0 ? 0.0 : max(1.0 - (1.0 - a) / bb, 0.0);
+    }
+    float bb = 2.0 * (b - 0.5);
+    return bb == 1.0 ? 1.0 : min(a / (1.0 - bb), 1.0);
+}
+// Reflect 单独成函数：Glow = Reflect(B,A)。GLSL 禁止递归，不能在 ApplyBlending
+// 内部调 ApplyBlending(21, …)（整个函数会编译失败，效果被静默跳过）。
+vec3 weBlendReflect(vec3 A, vec3 B) {
+    return vec3(
+        A.r == 1.0 ? 1.0 : min(B.r * B.r / (1.0 - A.r), 1.0),
+        A.g == 1.0 ? 1.0 : min(B.g * B.g / (1.0 - A.g), 1.0),
+        A.b == 1.0 ? 1.0 : min(B.b * B.b / (1.0 - A.b), 1.0));
+}
+vec3 RGBToHSL(vec3 c) {
+    float fmin = min(c.r, min(c.g, c.b));
+    float fmax = max(c.r, max(c.g, c.b));
+    float delta = fmax - fmin;
+    vec3 h = vec3(0.0);
+    h.z = (fmax + fmin) / 2.0;
+    if (delta == 0.0) {
+        h.x = 0.0;
+        h.y = 0.0;
+    } else {
+        h.y = h.z < 0.5 ? delta / (fmax + fmin) : delta / (2.0 - fmax - fmin);
+        float deltaR = ((fmax - c.r) / 6.0 + delta / 2.0) / delta;
+        float deltaG = ((fmax - c.g) / 6.0 + delta / 2.0) / delta;
+        float deltaB = ((fmax - c.b) / 6.0 + delta / 2.0) / delta;
+        if (c.r == fmax) h.x = deltaB - deltaG;
+        else if (c.g == fmax) h.x = 1.0 / 3.0 + deltaR - deltaB;
+        else if (c.b == fmax) h.x = 2.0 / 3.0 + deltaG - deltaB;
+        if (h.x < 0.0) h.x += 1.0;
+        else if (h.x > 1.0) h.x -= 1.0;
+    }
+    return h;
+}
+float weHueToRgb(float f1, float f2, float hue) {
+    if (hue < 0.0) hue += 1.0;
+    else if (hue > 1.0) hue -= 1.0;
+    if (6.0 * hue < 1.0) return f1 + (f2 - f1) * 6.0 * hue;
+    if (2.0 * hue < 1.0) return f2;
+    if (3.0 * hue < 2.0) return f1 + (f2 - f1) * ((2.0 / 3.0 - hue) * 6.0);
+    return f1;
+}
+vec3 HSLToRGB(vec3 h) {
+    if (h.y == 0.0) return vec3(h.z);
+    float f2 = h.z < 0.5 ? h.z * (1.0 + h.y) : h.z + h.y - h.y * h.z;
+    float f1 = 2.0 * h.z - f2;
+    return vec3(
+        weHueToRgb(f1, f2, h.x + 1.0 / 3.0),
+        weHueToRgb(f1, f2, h.x),
+        weHueToRgb(f1, f2, h.x - 1.0 / 3.0));
+}
+// mode 编号同 WE common_blending.h（0=Normal … 32=LighterColor 的实现子集）
+vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
+    vec3 r;
+    if (mode == 1) { r = min(B, A); }                       // Darken
+    else if (mode == 2) { r = A * B; }                      // Multiply
+    else if (mode == 3) {                                   // ColorBurn
+        r = vec3(
+            B.r == 0.0 ? 0.0 : max(1.0 - (1.0 - A.r) / B.r, 0.0),
+            B.g == 0.0 ? 0.0 : max(1.0 - (1.0 - A.g) / B.g, 0.0),
+            B.b == 0.0 ? 0.0 : max(1.0 - (1.0 - A.b) / B.b, 0.0));
+    }
+    else if (mode == 4 || mode == 20) { r = max(A + B - 1.0, vec3(0.0)); } // Substract
+    else if (mode == 5) { r = min(A, B); }                  // LinearBurn
+    else if (mode == 6) { r = max(B, A); }                  // Lighten
+    else if (mode == 7) { r = 1.0 - (1.0 - A) * (1.0 - B); } // Screen
+    else if (mode == 8) {                                   // ColorDodge
+        r = vec3(
+            B.r == 1.0 ? 1.0 : min(A.r / (1.0 - B.r), 1.0),
+            B.g == 1.0 ? 1.0 : min(A.g / (1.0 - B.g), 1.0),
+            B.b == 1.0 ? 1.0 : min(A.b / (1.0 - B.b), 1.0));
+    }
+    else if (mode == 9) { r = min(A + B, vec3(1.0)); }      // Add
+    else if (mode == 10) { r = max(A, B); }                 // Lighter
+    else if (mode == 11) { r = weBlendOverlay(A, B); }      // Overlay
+    else if (mode == 12) { r = weBlendSoftLight(A, B); }    // SoftLight
+    else if (mode == 13) { r = weBlendOverlay(B, A); }      // HardLight
+    else if (mode == 14) {                                  // VividLight
+        r = vec3(weBlendVivid(A.r, B.r), weBlendVivid(A.g, B.g), weBlendVivid(A.b, B.b));
+    }
+    else if (mode == 15) {                                  // LinearLight
+        r = vec3(
+            B.r < 0.5 ? max(A.r + 2.0 * B.r - 1.0, 0.0) : min(A.r + 2.0 * (B.r - 0.5), 1.0),
+            B.g < 0.5 ? max(A.g + 2.0 * B.g - 1.0, 0.0) : min(A.g + 2.0 * (B.g - 0.5), 1.0),
+            B.b < 0.5 ? max(A.b + 2.0 * B.b - 1.0, 0.0) : min(A.b + 2.0 * (B.b - 0.5), 1.0));
+    }
+    else if (mode == 16) {                                  // PinLight
+        r = vec3(
+            B.r < 0.5 ? min(A.r, 2.0 * B.r) : max(A.r, 2.0 * (B.r - 0.5)),
+            B.g < 0.5 ? min(A.g, 2.0 * B.g) : max(A.g, 2.0 * (B.g - 0.5)),
+            B.b < 0.5 ? min(A.b, 2.0 * B.b) : max(A.b, 2.0 * (B.b - 0.5)));
+    }
+    else if (mode == 17) {                                  // HardMix
+        r = vec3(
+            weBlendVivid(A.r, B.r) < 0.5 ? 0.0 : 1.0,
+            weBlendVivid(A.g, B.g) < 0.5 ? 0.0 : 1.0,
+            weBlendVivid(A.b, B.b) < 0.5 ? 0.0 : 1.0);
+    }
+    else if (mode == 18) { r = abs(A - B); }                // Difference
+    else if (mode == 19) { r = A + B - 2.0 * A * B; }       // Exclusion
+    else if (mode == 21) { r = weBlendReflect(A, B); }      // Reflect
+    else if (mode == 22) { r = weBlendReflect(B, A); }      // Glow = Reflect(B,A)
+    else if (mode == 23) { r = min(A, B) - max(A, B) + 1.0; }  // Phoenix
+    else if (mode == 24) { r = (A + B) / 2.0; }             // Average
+    else if (mode == 25) { r = 1.0 - abs(1.0 - A - B); }    // Negation
+    else if (mode == 26) { r = HSLToRGB(vec3(RGBToHSL(B).x, RGBToHSL(A).y, RGBToHSL(A).z)); } // Hue
+    else if (mode == 27) { r = HSLToRGB(vec3(RGBToHSL(A).x, RGBToHSL(B).y, RGBToHSL(A).z)); } // Saturation
+    else if (mode == 28) { r = HSLToRGB(vec3(RGBToHSL(B).x, RGBToHSL(B).y, RGBToHSL(A).z)); } // Color
+    else if (mode == 29) { r = HSLToRGB(vec3(RGBToHSL(A).x, RGBToHSL(A).y, RGBToHSL(B).z)); } // Luminosity
+    else if (mode == 30) { r = mix(A, max(max(A.r, max(A.g, A.b)), 0.0) * B, opacity); } // Tint
+    else if (mode == 31) { r = A + B * opacity; }           // Add(带 opacity 权重)
+    else if (mode == 32) { r = mix(A, A + A * B, opacity); } // LinearDodge 变体
+    else { r = mix(A, B, opacity); }                        // Normal(含 0)
+    // CPU 参考（effects.js applyBlending）：5/10/30/31/32 直接返回不经 opacity 权重，
+    // 其余统一 mix(A, r, opacity) 回归原色。
+    //
+    // [we-scene patch] **mode 0 也必须排除**：它的分支已经是 mix(A, B, opacity)，
+    // 再套一层等于按 opacity² 加权。effects.js 的 default 分支是 switch 内直接
+    // return mix3(A, B, opacity)、不走 per() 的二次加权，这里漏排了 0。
+    // 症状极隐蔽：xray 的两张图是同一构图的不同版本（A≈B），平方后差异被压到
+    // 肉眼与 readPixels 都读不出（实测 6 个 xray 壁纸像素差恰好为 0，
+    // 而把最终输出换成中间量的探针显示 blend=187、sprite=187、mask.a=255 全都正常）。
+    // 注意本文件是 TS 模板字符串，注释里不能出现反引号。
+    if (mode != 0 && mode != 5 && mode != 10 && mode != 30 && mode != 31 && mode != 32) {
+        r = mix(A, r, opacity);
+    }
+    return r;
+}`
+
+// [we-scene patch] 图层 colorBlendMode 走 shader 侧混合：把背景当纹理读进来，
+// 用 ApplyBlending 算出结果再直接写（GL 混合关掉）。
+//
+// 为什么必须回读背景：固定管线的 blendFunc 只能表达 dst 因子为
+// ONE_MINUS_SRC_COLOR / SRC_COLOR / DST_COLOR 这种「原样的 src/dst」的线性组合，
+// 而 ColorBurn/Overlay/SoftLight/HSL 系全是 dst 的非线性函数，无论怎么配因子都算不出来。
+// 此前这 16 个模式一律回退 translucent —— 3287715210 的 7200x4800 渐变层
+// （colorBlendMode=3 ColorBurn、JPEG 无 alpha 故恒为不透明）就这样把人物整张盖住，
+// 用户看到的是「壁纸不显示人物」。
+//
+// u_Backdrop 是画布回读（captureBackdrop），u_BlendMode 是层的 colorBlendMode。
+// A = 背景（dst），B = 本层颜色（src），opacity = 层 alpha × 效果链 alpha，
+// 与 ApplyBlending(mode, A, B, opacity) 的参数序完全一致。
+const COMPOSITE_BLEND_FRAG = `#version 300 es
+precision mediump float;
+in vec2 v_UV;
+uniform sampler2D u_Tex;
+uniform sampler2D u_Backdrop;
+uniform int u_BlendMode;
+uniform vec2 u_CanvasSize;
+uniform float u_Opacity;
+out vec4 fragColor;
+${WE_BLENDING_GLSL}
+void main() {
+  vec4 src = texture(u_Tex, v_UV);
+  // 背景按**片元的屏幕位置**采样：gl_FragCoord 原点在左下，与 copyTexImage2D
+  // 得到的纹理坐标系一致，直接除画布尺寸即可（不要复用 v_UV —— 那是层 UV）。
+  vec3 dst = texture(u_Backdrop, gl_FragCoord.xy / u_CanvasSize).rgb;
+  vec3 r = ApplyBlending(u_BlendMode, dst, src.rgb, src.a * u_Opacity);
+  // GL 混合已关闭：这里写出的就是最终像素，alpha 恒 1（画布无 alpha 通道）。
+  fragColor = vec4(r, 1.0);
+}`
+
+
 
 // ---------- 内联着色器（拷贝 / 合成 / 背景直通）与 quad 顶点 ----------
 const COPY_VERT = `#version 300 es
@@ -157,4 +345,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }

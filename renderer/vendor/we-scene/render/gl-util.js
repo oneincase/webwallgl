@@ -41,11 +41,20 @@ export function makeTexture(gl, rgba, width, height, bitmap = null) {
   gl.bindTexture(gl.TEXTURE_2D, tex)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
   if (bitmap) {
+    // [we-scene patch] PNG/JPEG 解码出的大图（puppet 图集等）走这里。这类纹理在
+    // 画布上通常被大幅缩小（3264246690 人物贴图 3658×2000 → 屏上 ~840px ≈ 4.4×
+    // 缩小），LINEAR 无 mip 采样会让细线艺术（泪痕线/睫毛描边/发丝轮廓）以
+    // 满幅对比度显示并带反锯齿刻线；与 makeTextureMip 对齐：trilinear + 完整
+    // mip 链，缩小采样时细线按 WE 一样被淡化。
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap)
+    gl.generateMipmap(gl.TEXTURE_2D)
   } else {
+    // 小体积内部纹理（whiteTex 等）：保持 LINEAR，无 mip 也完整。
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba)
   }
   return tex

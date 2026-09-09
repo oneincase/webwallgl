@@ -9,12 +9,14 @@ import {
   clear,
   createRuntime,
   destroyRuntime,
+  fitObjectFit,
   frameStats,
   resetCoverAlign,
   resetFrameMeter,
   type Runtime,
 } from "../shell";
 import { mountWallpaper } from "../dispatch";
+import { dropPkgCache } from "../scene-mount";
 import type { WallpaperConfig } from "../types";
 import { weShimCall } from "../web";
 import { sniffMediaType } from "./source";
@@ -55,11 +57,35 @@ function mediaProjectType(project: unknown): string | null {
   return MEDIA_TYPES.has(lower) ? lower : null;
 }
 
-/** 场景路径需要真 canvas；若调用方给了空容器则在其内自建一块 */
-function ensureSceneCanvas(el: HTMLElement): HTMLCanvasElement {
+/**
+ * 场景路径需要真 canvas；若调用方给了空容器则在其内自建一块。
+ *
+ * `reuse=false`（重挂场景）时**一定换新画布**：`clear()` 里的
+ * `renderer.dispose()` 调 `WEBGL_lose_context.loseContext()`，丢失后同一
+ * canvas 再 `getContext("webgl2")` 拿回的是同一个 lost 对象，只有新画布
+ * 才能拿到可用上下文。
+ *
+ * 关键是**不能靠 `isContextLost()` 判断**：`loseContext()` 的生效是异步的
+ * （浏览器在后续任务里才真正丢弃上下文），`clear()` 之后同步查仍返回 false，
+ * 于是复用了一块马上就要死掉的画布 —— 实测症状是场景重挂报
+ * `createShader` 返回 null 派生的 `shaderSource must be an instance of
+ * WebGLShader`。所以只看「这块画布建过 GL 上下文吗」这个确定性事实：
+ * 建过就必须换，不去猜它此刻死没死。
+ *
+ * 整页渲染器不踩这个坑：它 `clear()` 时 `rt.wrap.innerHTML = ""` 把画布删了，
+ * 重挂自然新建。库形态没有 wrap，画布被留下复用 —— 于是「卸载后重挂」
+ * （setRenderDpr / restore）必然拿到死上下文，且这两个方法都不 arm 首帧守卫，
+ * 连报错都没有，宿主只看到一片黑。
+ */
+function ensureSceneCanvas(el: HTMLElement, reuse = true): HTMLCanvasElement {
   if (el instanceof HTMLCanvasElement) return el;
   const existing = el.querySelector(":scope > canvas[data-webwallgl]");
-  if (existing instanceof HTMLCanvasElement) return existing;
+  if (existing instanceof HTMLCanvasElement) {
+    // 没建过 GL 上下文的画布是干净的，任何时候都能复用（首次装配走这条）
+    if (reuse || existing.getAttribute("data-webwallgl-gl") !== "1") return existing;
+    // 建过上下文 + 正在重挂：无法复活，摘掉换新的（留着会挡住新画布）
+    existing.remove();
+  }
   const c = document.createElement("canvas");
   c.setAttribute("data-webwallgl", "1");
   c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;";
@@ -135,11 +161,14 @@ async function resolveMountConfig(
         `媒体壁纸（${mediaType}）：无法解析资源 URL（需要 Source.mediaEntry 或 project.file + httpSource）`,
       );
     }
-    const canvas = ensureSceneCanvas(el);
     // mediaEntry 显式给的 type 可纠正 project.json（作者把 gif 标成 image 之类）
     const finalType = MEDIA_TYPES.has(String(entryType).toLowerCase())
       ? String(entryType).toLowerCase()
       : mediaType;
+    // 视频走 DOM 直显：不建画布（白占一个 WebGL 上下文名额，且 instance.canvas
+    // 会指向一块永远空白的画布，误导调用方）。canvas 字段保留调用方给的容器
+    // 元素本身 —— mountVideoDom 要靠它定位挂载点。
+    const canvas = finalType === "video" ? el : ensureSceneCanvas(el);
     return { ...base, type: finalType as WallpaperConfig["type"], src: url, canvas, source: o.source };
   }
   // [1.3.0] project.type 缺失或不认识时，按资源 URL 的扩展名嗅探。
@@ -169,7 +198,8 @@ async function resolveMountConfig(
       (MEDIA_TYPES.has(String(entryType).toLowerCase()) ? String(entryType).toLowerCase() : null) ??
       (url ? sniffMediaType(url) : null);
     if (url && sniffed) {
-      const canvas = ensureSceneCanvas(el);
+      // 同上：嗅探出视频时也不建画布，canvas 保留容器元素供 mountVideoDom 定位
+      const canvas = sniffed === "video" ? el : ensureSceneCanvas(el);
       return { ...base, type: sniffed as WallpaperConfig["type"], src: url, canvas, source: o.source };
     }
   }
@@ -308,6 +338,48 @@ export function createScene(
     return { promise, off };
   };
 
+  /**
+   * 用当前配置原地重挂（setRenderDpr / restore 共用）。
+   *
+   * 必须换画布，不能沿用 `rt.cfg.canvas`：`clear()` 里 `renderer.dispose()` 调
+   * `WEBGL_lose_context.loseContext()`，那块画布的 GL 上下文就废了 ——
+   * 同一 canvas 再 `getContext("webgl2")` 拿回的还是那个 lost 对象。
+   * 而 `loseContext()` 是**异步生效**的，`clear()` 之后同步查 `isContextLost()`
+   * 仍是 false，所以只能按「建过上下文就换」这个确定性事实决策
+   * （`ensureSceneCanvas(el, false)`），不去猜它此刻死没死。
+   *
+   * 先 clear 再换画布：clear 要读 `rt.canvas` 等旧引用做回收，换早了就漏。
+   * 装配函数开头自己也会 clear 一次，幂等，多调只是空转。
+   *
+   * 只对**用 WebGL 的**路径需要。网页壁纸挂 iframe、视频壁纸挂 `<video>`
+   * DOM 直显，两者都不碰 GL 上下文，重挂时不该动画布（对视频尤其重要：
+   * 去换画布会把 `data-webwallgl-gl` 的干净画布白删一次，还可能把调用方
+   * 传的 canvas 误判成"上下文已死"而直接报错）。
+   * 调用方**直接传 canvas** 时换不掉（库不能替它换 DOM），如实报错。
+   */
+  const remountCurrent = () => {
+    const usesGL = rt.cfg.type !== "web" && rt.cfg.type !== "video";
+    if (usesGL) {
+      clear(rt);
+      if (el instanceof HTMLCanvasElement) {
+        emitError(
+          new Error(
+            "重挂失败：调用方直接传入了 canvas，其 WebGL 上下文已在卸载时归还且" +
+              "无法复活（loseContext 后同一 canvas 拿不回可用上下文），而库不能替" +
+              "调用方替换 DOM。请改传一个空容器让库自建画布，或重新调用 mount()。",
+          ),
+        );
+        return;
+      }
+      const fresh = ensureSceneCanvas(el, false);
+      if (fresh !== rt.cfg.canvas) {
+        rt.cfg = { ...rt.cfg, canvas: fresh };
+        boundEl = fresh;
+      }
+    }
+    mountWallpaper(rt, rt.cfg);
+  };
+
   const instance: SceneInstance = {
     get canvas() {
       return boundEl as HTMLCanvasElement;
@@ -316,11 +388,21 @@ export function createScene(
     pause() {
       rt.paused = true;
       rt.sceneCtl?.pause();
+      // 视频壁纸走 DOM 直显，没有 sceneCtl —— 不显式处理这四个方法对它就是空操作
+      for (const p of rt.videoPairs ?? []) p.pause();
+      if (!rt.videoPairs?.length) rt.video?.pause();
     },
     resume() {
       rt.paused = false;
       resetFrameMeter(rt);
       rt.sceneCtl?.resume();
+      // pair.resume() 同时重启预热调度的 rAF：只 play() 主元素会让恢复后的
+      // 第一圈退回原生 loop（循环卡顿重现）
+      if (rt.videoPairs?.length) {
+        for (const p of rt.videoPairs) p.resume();
+      } else if (rt.video) {
+        void rt.video.play().catch(() => {});
+      }
     },
     get paused() {
       return !!rt.paused;
@@ -333,6 +415,18 @@ export function createScene(
       // 只改 cfg 画面不会有任何变化，必须触发一次重排（整页渲染器一直是这么做的，
       // 库入口漏了这一步，症状是 wp.setFit("contain") 对网页壁纸完全无反应）。
       rt.webRelayout?.();
+      // DOM 直显的视频壁纸同理：fit 表达在 object-fit 上，不改样式画面不动。
+      // 双元素时两个都要改，否则交接后 fit 变回旧值。
+      const f = fitObjectFit(fit);
+      const applyFit = (el: HTMLElement) => {
+        el.style.objectFit = f.objectFit;
+        el.style.background = f.background;
+        el.style.objectPosition = "50% 50%";
+      };
+      for (const p of rt.videoPairs ?? []) {
+        for (const el of [p.active, p.standby]) if (el.isConnected) applyFit(el);
+      }
+      if (!rt.videoPairs?.length && rt.video?.isConnected) applyFit(rt.video);
     },
     setFps(fps: number) {
       rt.cfg.sceneFps = fps;
@@ -343,10 +437,17 @@ export function createScene(
       rt.cfg.muted = v <= 0;
       rt.sceneAudio?.setVolume(v);
       weShimCall(rt, (w) => w.__weSetVolume?.(v));
+      // 双元素循环对自己管音量与静音（备用侧恒静音防双声）
+      if (rt.videoPairs?.length) {
+        for (const p of rt.videoPairs) p.setVolume(v);
+      } else if (rt.video) {
+        rt.video.volume = v;
+        rt.video.muted = v <= 0;
+      }
     },
     setRenderDpr(dpr: number) {
       rt.cfg.renderDpr = dpr;
-      mountWallpaper(rt, rt.cfg);
+      remountCurrent();
     },
 
     setProperties(props: Record<string, PropertyValue>) {
@@ -404,11 +505,16 @@ export function createScene(
 
     // 外部指针注入。pointerCtl 由 mountScene / mountWeb 各自装配时设置，
     // 媒体壁纸不设 —— 那时这里静默无效，与整页渲染器的 __wp.pushPointer 一致。
-    pushPointer(u: number, v: number, buttons?: number) {
-      rt.pointerCtl?.push({ u, v, buttons });
+    pushPointer(u: number, v: number, buttons?: number, mods?: number) {
+      rt.pointerCtl?.push({ u, v, buttons, mods });
     },
     pointerLeave() {
       rt.pointerCtl?.leave();
+    },
+    // 滚轮注入。wheel 是可选方法，只有 mountWeb 实现 —— 场景壁纸没有滚轮语义
+    // （WE 沙箱无滚轮 API，194 张场景壁纸零消费），此处与媒体壁纸一样静默无效。
+    pushWheel(dx: number, dy: number, mode?: number, mods?: number) {
+      rt.pointerCtl?.wheel?.({ dx, dy, mode, mods });
     },
 
     async load(source: Source) {
@@ -451,10 +557,22 @@ export function createScene(
       clear(rt);
     },
     restore() {
-      mountWallpaper(rt, rt.cfg);
+      remountCurrent();
     },
-    destroy() {
+    /**
+     * 销毁实例并释放全部运行时资源（GL 上下文/视频/音频/监听/来源 blob）。
+     *
+     * `releasePkgCache: true` 时连带淘汰本实例 source.key 的 scene.pkg 解析缓存。
+     * 缓存默认跨实例保留（同壁纸重挂不重新下载），宿主切换壁纸后销毁旧实例时
+     * 旧包还会压在缓存里（上限 2 份/512MB），桌面壁纸宿主逐张换、不存在"回头
+     * 再挂旧壁纸"的模式，销毁即放弃才有可预期的内存曲线。
+     * 多实例共享同一 key 时，另一实例只是下次重挂多一次下载，不影响正确性。
+     */
+    destroy(opts?: { releasePkgCache?: boolean }) {
       destroyRuntime(rt);
+      if (opts?.releasePkgCache) {
+        dropPkgCache(rt.cfg.source?.key ?? currentOptions.source?.key);
+      }
       // 释放来源占用的资源：mediaSource(File) 的 objectURL 不 revoke
       // 就是每换一次壁纸泄漏一个几十 MB 的 blob
       try {

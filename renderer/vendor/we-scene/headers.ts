@@ -11,6 +11,8 @@
  *   `float lerp(...) { return mix(...); }` → `float mix(...) { return mix(...); }`（非法递归），
  * 整个 shader 编译失败后效果被静默跳过（表现：人物不眨眼、水波/摇曳全失效）。
  */
+import { WE_BLENDING_GLSL } from "./render/renderer-glsl.js";
+
 export const WE_SHADER_HEADERS: Record<string, string> = {
   'common.h': `// WE common.h（重建子集，供 we-scene 浏览器渲染）
 #define M_PI 3.14159265359
@@ -66,151 +68,11 @@ vec3 hsv2rgb(vec3 c) {
   // （README「HLSL→GLSL 转译」一节的已知待办）。逐字翻译自本仓库
   // render/effects.js 的 applyBlending CPU 参考实现（编号 = common_blending.h）。
   // 内部辅助函数一律加 weBlend 前缀：不得与 GLSL 内置撞名（如 reflect）。
-  'common_blending.h': `// WE common_blending.h（重建子集）
-vec3 weBlendOverlay(vec3 a, vec3 b) {
-    return vec3(
-        a.r < 0.5 ? 2.0 * a.r * b.r : 1.0 - 2.0 * (1.0 - a.r) * (1.0 - b.r),
-        a.g < 0.5 ? 2.0 * a.g * b.g : 1.0 - 2.0 * (1.0 - a.g) * (1.0 - b.g),
-        a.b < 0.5 ? 2.0 * a.b * b.b : 1.0 - 2.0 * (1.0 - a.b) * (1.0 - b.b));
-}
-vec3 weBlendSoftLight(vec3 a, vec3 b) {
-    return vec3(
-        b.r < 0.5 ? 2.0 * a.r * b.r + a.r * a.r * (1.0 - 2.0 * b.r) : sqrt(a.r) * (2.0 * b.r - 1.0) + 2.0 * a.r * (1.0 - b.r),
-        b.g < 0.5 ? 2.0 * a.g * b.g + a.g * a.g * (1.0 - 2.0 * b.g) : sqrt(a.g) * (2.0 * b.g - 1.0) + 2.0 * a.g * (1.0 - b.g),
-        b.b < 0.5 ? 2.0 * a.b * b.b + a.b * a.b * (1.0 - 2.0 * b.b) : sqrt(a.b) * (2.0 * b.b - 1.0) + 2.0 * a.b * (1.0 - b.b));
-}
-float weBlendVivid(float a, float b) {
-    if (b < 0.5) {
-        float bb = 2.0 * b;
-        return bb == 0.0 ? 0.0 : max(1.0 - (1.0 - a) / bb, 0.0);
-    }
-    float bb = 2.0 * (b - 0.5);
-    return bb == 1.0 ? 1.0 : min(a / (1.0 - bb), 1.0);
-}
-// Reflect 单独成函数：Glow = Reflect(B,A)。GLSL 禁止递归，不能在 ApplyBlending
-// 内部调 ApplyBlending(21, …)（整个函数会编译失败，效果被静默跳过）。
-vec3 weBlendReflect(vec3 A, vec3 B) {
-    return vec3(
-        A.r == 1.0 ? 1.0 : min(B.r * B.r / (1.0 - A.r), 1.0),
-        A.g == 1.0 ? 1.0 : min(B.g * B.g / (1.0 - A.g), 1.0),
-        A.b == 1.0 ? 1.0 : min(B.b * B.b / (1.0 - A.b), 1.0));
-}
-vec3 RGBToHSL(vec3 c) {
-    float fmin = min(c.r, min(c.g, c.b));
-    float fmax = max(c.r, max(c.g, c.b));
-    float delta = fmax - fmin;
-    vec3 h = vec3(0.0);
-    h.z = (fmax + fmin) / 2.0;
-    if (delta == 0.0) {
-        h.x = 0.0;
-        h.y = 0.0;
-    } else {
-        h.y = h.z < 0.5 ? delta / (fmax + fmin) : delta / (2.0 - fmax - fmin);
-        float deltaR = ((fmax - c.r) / 6.0 + delta / 2.0) / delta;
-        float deltaG = ((fmax - c.g) / 6.0 + delta / 2.0) / delta;
-        float deltaB = ((fmax - c.b) / 6.0 + delta / 2.0) / delta;
-        if (c.r == fmax) h.x = deltaB - deltaG;
-        else if (c.g == fmax) h.x = 1.0 / 3.0 + deltaR - deltaB;
-        else if (c.b == fmax) h.x = 2.0 / 3.0 + deltaG - deltaB;
-        if (h.x < 0.0) h.x += 1.0;
-        else if (h.x > 1.0) h.x -= 1.0;
-    }
-    return h;
-}
-float weHueToRgb(float f1, float f2, float hue) {
-    if (hue < 0.0) hue += 1.0;
-    else if (hue > 1.0) hue -= 1.0;
-    if (6.0 * hue < 1.0) return f1 + (f2 - f1) * 6.0 * hue;
-    if (2.0 * hue < 1.0) return f2;
-    if (3.0 * hue < 2.0) return f1 + (f2 - f1) * ((2.0 / 3.0 - hue) * 6.0);
-    return f1;
-}
-vec3 HSLToRGB(vec3 h) {
-    if (h.y == 0.0) return vec3(h.z);
-    float f2 = h.z < 0.5 ? h.z * (1.0 + h.y) : h.z + h.y - h.y * h.z;
-    float f1 = 2.0 * h.z - f2;
-    return vec3(
-        weHueToRgb(f1, f2, h.x + 1.0 / 3.0),
-        weHueToRgb(f1, f2, h.x),
-        weHueToRgb(f1, f2, h.x - 1.0 / 3.0));
-}
-// mode 编号同 WE common_blending.h（0=Normal … 32=LighterColor 的实现子集）
-vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
-    vec3 r;
-    if (mode == 1) { r = min(B, A); }                       // Darken
-    else if (mode == 2) { r = A * B; }                      // Multiply
-    else if (mode == 3) {                                   // ColorBurn
-        r = vec3(
-            B.r == 0.0 ? 0.0 : max(1.0 - (1.0 - A.r) / B.r, 0.0),
-            B.g == 0.0 ? 0.0 : max(1.0 - (1.0 - A.g) / B.g, 0.0),
-            B.b == 0.0 ? 0.0 : max(1.0 - (1.0 - A.b) / B.b, 0.0));
-    }
-    else if (mode == 4 || mode == 20) { r = max(A + B - 1.0, vec3(0.0)); } // Substract
-    else if (mode == 5) { r = min(A, B); }                  // LinearBurn
-    else if (mode == 6) { r = max(B, A); }                  // Lighten
-    else if (mode == 7) { r = 1.0 - (1.0 - A) * (1.0 - B); } // Screen
-    else if (mode == 8) {                                   // ColorDodge
-        r = vec3(
-            B.r == 1.0 ? 1.0 : min(A.r / (1.0 - B.r), 1.0),
-            B.g == 1.0 ? 1.0 : min(A.g / (1.0 - B.g), 1.0),
-            B.b == 1.0 ? 1.0 : min(A.b / (1.0 - B.b), 1.0));
-    }
-    else if (mode == 9) { r = min(A + B, vec3(1.0)); }      // Add
-    else if (mode == 10) { r = max(A, B); }                 // Lighter
-    else if (mode == 11) { r = weBlendOverlay(A, B); }      // Overlay
-    else if (mode == 12) { r = weBlendSoftLight(A, B); }    // SoftLight
-    else if (mode == 13) { r = weBlendOverlay(B, A); }      // HardLight
-    else if (mode == 14) {                                  // VividLight
-        r = vec3(weBlendVivid(A.r, B.r), weBlendVivid(A.g, B.g), weBlendVivid(A.b, B.b));
-    }
-    else if (mode == 15) {                                  // LinearLight
-        r = vec3(
-            B.r < 0.5 ? max(A.r + 2.0 * B.r - 1.0, 0.0) : min(A.r + 2.0 * (B.r - 0.5), 1.0),
-            B.g < 0.5 ? max(A.g + 2.0 * B.g - 1.0, 0.0) : min(A.g + 2.0 * (B.g - 0.5), 1.0),
-            B.b < 0.5 ? max(A.b + 2.0 * B.b - 1.0, 0.0) : min(A.b + 2.0 * (B.b - 0.5), 1.0));
-    }
-    else if (mode == 16) {                                  // PinLight
-        r = vec3(
-            B.r < 0.5 ? min(A.r, 2.0 * B.r) : max(A.r, 2.0 * (B.r - 0.5)),
-            B.g < 0.5 ? min(A.g, 2.0 * B.g) : max(A.g, 2.0 * (B.g - 0.5)),
-            B.b < 0.5 ? min(A.b, 2.0 * B.b) : max(A.b, 2.0 * (B.b - 0.5)));
-    }
-    else if (mode == 17) {                                  // HardMix
-        r = vec3(
-            weBlendVivid(A.r, B.r) < 0.5 ? 0.0 : 1.0,
-            weBlendVivid(A.g, B.g) < 0.5 ? 0.0 : 1.0,
-            weBlendVivid(A.b, B.b) < 0.5 ? 0.0 : 1.0);
-    }
-    else if (mode == 18) { r = abs(A - B); }                // Difference
-    else if (mode == 19) { r = A + B - 2.0 * A * B; }       // Exclusion
-    else if (mode == 21) { r = weBlendReflect(A, B); }      // Reflect
-    else if (mode == 22) { r = weBlendReflect(B, A); }      // Glow = Reflect(B,A)
-    else if (mode == 23) { r = min(A, B) - max(A, B) + 1.0; }  // Phoenix
-    else if (mode == 24) { r = (A + B) / 2.0; }             // Average
-    else if (mode == 25) { r = 1.0 - abs(1.0 - A - B); }    // Negation
-    else if (mode == 26) { r = HSLToRGB(vec3(RGBToHSL(B).x, RGBToHSL(A).y, RGBToHSL(A).z)); } // Hue
-    else if (mode == 27) { r = HSLToRGB(vec3(RGBToHSL(A).x, RGBToHSL(B).y, RGBToHSL(A).z)); } // Saturation
-    else if (mode == 28) { r = HSLToRGB(vec3(RGBToHSL(B).x, RGBToHSL(B).y, RGBToHSL(A).z)); } // Color
-    else if (mode == 29) { r = HSLToRGB(vec3(RGBToHSL(A).x, RGBToHSL(A).y, RGBToHSL(B).z)); } // Luminosity
-    else if (mode == 30) { r = mix(A, max(max(A.r, max(A.g, A.b)), 0.0) * B, opacity); } // Tint
-    else if (mode == 31) { r = A + B * opacity; }           // Add(带 opacity 权重)
-    else if (mode == 32) { r = mix(A, A + A * B, opacity); } // LinearDodge 变体
-    else { r = mix(A, B, opacity); }                        // Normal(含 0)
-    // CPU 参考（effects.js applyBlending）：5/10/30/31/32 直接返回不经 opacity 权重，
-    // 其余统一 mix(A, r, opacity) 回归原色。
-    //
-    // [we-scene patch] **mode 0 也必须排除**：它的分支已经是 mix(A, B, opacity)，
-    // 再套一层等于按 opacity² 加权。effects.js 的 default 分支是 switch 内直接
-    // return mix3(A, B, opacity)、不走 per() 的二次加权，这里漏排了 0。
-    // 症状极隐蔽：xray 的两张图是同一构图的不同版本（A≈B），平方后差异被压到
-    // 肉眼与 readPixels 都读不出（实测 6 个 xray 壁纸像素差恰好为 0，
-    // 而把最终输出换成中间量的探针显示 blend=187、sprite=187、mask.a=255 全都正常）。
-    // 注意本文件是 TS 模板字符串，注释里不能出现反引号。
-    if (mode != 0 && mode != 5 && mode != 10 && mode != 30 && mode != 31 && mode != 32) {
-        r = mix(A, r, opacity);
-    }
-    return r;
-}
+  // [we-scene patch] 32 个混合模式的 GLSL 从引擎层 render/renderer-glsl.js 取，
+  // 不在这里再抄一份：同一份实现同时供效果 shader 的 #include 与图层
+  // colorBlendMode 的画布合成（COMPOSITE_BLEND_FRAG）使用。两份必然发散 ——
+  // 「哪些模式不套 opacity 二次加权」这类代数细节改一处漏一处，画面错了还查不出来。
+  'common_blending.h': `${WE_BLENDING_GLSL}
 // greyscale 必须返回 **float** 而不是 vec3 —— 调用点几乎全是
 // \`noise = CAST3(greyscale(noise))\`（filmgrain/vhs），CAST3 只能作用于标量；
 // 若声明成 vec3 版本，这些点会变成非法的 vec3(vec3)。

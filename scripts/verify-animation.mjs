@@ -21,6 +21,9 @@ const { sampleChannel, wrapFrame, createAnimation, createNeutralAnimation } = aw
   "renderer/vendor/we-scene/render/animation.js",
 );
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
+const { evalObjectScript, foldVisibleReturn } = await imp("renderer/vendor/we-scene/render/text.js");
+const { linkAnimations, crossedEvents } = await imp("renderer/vendor/we-scene/render/animation.js");
+const { parseMDL } = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
 
 const { check, errors } = createChecker();
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -785,6 +788,659 @@ const kf = (frame, value, front, back) => ({
       );
       console.log(`   漂移 164 帧 → 头发0202 最大偏移 ${worst.toFixed(1)}px（漏模量级）`);
     }
+  }
+}
+
+// ---------- 3233141951 自带脚本 / 关键帧动画对齐 ----------
+// S1 常量脚本值反馈 / S2 visible 数值折叠 / S3 init 返回值消费 / S4 sp 活视图 /
+// A1 粒子 override 关键帧动画 / A2 粒子时钟统一 / A3 visible 动画槽。
+// 接线断言只认形状不认语义，每条都配「在模拟器里复现该错误」的数值断言。
+{
+  console.log("\n[3233141951] 自带脚本与关键帧动画对齐");
+  const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const rendererSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const textSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+  const particlesSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  const parseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+
+  // ---- A1 接线：parse 抽取 → scene-mount 控制器队列 → particles 轻量写回 ----
+  check(/particleOverrideAnimations/.test(parseSrc), "parse.js 必须抽取 instanceoverride 关键帧动画");
+  check(
+    /overrideAnimRuns/.test(mountSrc) && /setOverrideValue\(run\.key, out\)/.test(mountSrc),
+    "scene-mount 必须逐帧推进 overrideAnimRuns 并写回粒子倍率",
+  );
+  check(
+    /setOverrideValue\(key, v\)/.test(particlesSrc) && /key === 'alpha'\) this\.opacityMul = n/.test(particlesSrc),
+    "particles.js 必须有轻量 setOverrideValue（alpha → opacityMul，不动 pool）",
+  );
+  check(
+    /particleSystemsByLayer\.get\(run\.layer\.id\)/.test(mountSrc),
+    "override 动画写回必须按 layer.id 分发到该层全部粒子系统",
+  );
+
+  // ---- A2 接线：粒子时钟统一到场景 t ----
+  check(/particleClock\.dt = animDt/.test(mountSrc), "帧循环必须每帧把场景 dt 写入 particleClock");
+  check(
+    /const pdt = Math\.min\(0\.05, Math\.max\(0, particleClock\.dt\)\)/.test(mountSrc),
+    "粒子 advance 必须用场景时钟 dt（50ms 封顶保留）",
+  );
+  check(!/lastPt/.test(mountSrc), "粒子推进不得再用 performance.now() 墙钟差分（第三条时钟）");
+
+  // ---- S3 接线：init 返回值全链路消费 ----
+  check(
+    (textSrc.match(/return fns\.init\(/g) || []).length === 2,
+    "text.js 两个沙箱的 init 都必须透传脚本 init 的返回值",
+  );
+  check(
+    /const ir = sb\.init\(initArg\)/.test(rendererSrc) &&
+      /sb\.__lastConstValue = constShapeOk\(ir, scalar\) \? ir : initArg/.test(rendererSrc),
+    "常量脚本 init 返回值必须种子反馈链（删一句就退回快照起步）",
+  );
+  check(/const ir = sandbox\.init\(initArg\)/.test(mountSrc), "对象字段脚本 init 返回值必须消费");
+  check(/const ivRet = sandbox\.init\(effect\.visible\)/.test(mountSrc), "效果开关 init 返回值必须消费");
+  check(/const tir = d\.sandbox\.init\(d\.layer\.text/.test(mountSrc), "文字脚本 init 返回值必须消费（延后补跑点）");
+
+  // ---- S1 接线：常量脚本逐帧值反馈（写回必须在 update 之后）----
+  check(/const arg = sb\.__lastConstValue/.test(rendererSrc), "常量脚本 update 入参必须来自上一帧输出");
+  {
+    const callIdx = rendererSrc.indexOf("ret = sb.callUpdate(arg)");
+    const backIdx = rendererSrc.indexOf("sb.__lastConstValue = src");
+    check(callIdx > 0 && backIdx > callIdx, "反馈写回必须在 callUpdate 之后（写反顺序 = 喂旧值）");
+  }
+
+  // ---- S2/A3/S4 接线 ----
+  check(/export function foldVisibleReturn/.test(textSrc), "foldVisibleReturn 必须住在引擎 text.js");
+  check(
+    (mountSrc.match(/foldVisibleRet\(ret\)/g) || []).length >= 2,
+    "效果开关与对象 visible 两处写回都必须经 foldVisibleRet 折叠",
+  );
+  check(
+    /run\.layer\.visibleSelf = !!out/.test(mountSrc) && !/run\.layer\[field\] = !!out/.test(mountSrc),
+    "visible 关键帧动画必须写 visibleSelf 而非有效可见性（A3）",
+  );
+  check(
+    (textSrc.match(/defineLiveScriptProp\(spValues, k, v, opts\.userProperties\)/g) || []).length === 2,
+    "对象/文字两条 eval 路径的 scriptProperties 都必须走 defineLiveScriptProp 活代理",
+  );
+
+  // ---- S2 数值：foldVisibleReturn 真实现 ----
+  check(foldVisibleReturn(true) === true && foldVisibleReturn(false) === false, "bool 直通");
+  check(
+    foldVisibleReturn(1) === true && foldVisibleReturn(0.5) === true && foldVisibleReturn(0) === false,
+    "number 折叠：≠0 = 可见（淡出脚本精确 0 的归宿）",
+  );
+  check(
+    foldVisibleReturn(NaN) === undefined && foldVisibleReturn(undefined) === undefined && foldVisibleReturn("1") === undefined,
+    "NaN/undefined/字符串 → undefined（宿主保持不变，防脏值隐藏图层）",
+  );
+
+  // ---- S1/S3 数值：真实沙箱跑 3233141951 中音条淡出计时器脚本 ----
+  const pkgPath = join(LIB, "3233141951", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const raw = JSON.parse(new TextDecoder().decode(getEntry(pkg, "scene.json")));
+    const bar = (raw.objects || []).find((o) => o.name === "中音条0下");
+    const fadeScript = bar?.effects?.[0]?.visible?.script;
+    check(typeof fadeScript === "string" && fadeScript.includes("fadeOutDur"), "3233141951 中音条0下应有淡出计时器脚本");
+
+    if (fadeScript) {
+      // S3 数值：init 返回值随音频状态变化（此前全链路丢弃 → 静音加载也恒显）
+      {
+        const silentViews = new Map([
+          [16, { left: new Float32Array(16), right: new Float32Array(16), average: new Float32Array(16) }],
+        ]);
+        const sbSilent = evalObjectScript(fadeScript, null, { audioViews: silentViews });
+        check(sbSilent.init(1) === 0, `静音加载 init 必须返回 0（实得 ${sbSilent.init(1)}）`);
+        const musicAvg = new Float32Array(16).fill(0.5);
+        const musicViews = new Map([[16, { left: musicAvg, right: musicAvg, average: musicAvg }]]);
+        const sbMusic = evalObjectScript(fadeScript, null, { audioViews: musicViews });
+        check(sbMusic.init(1) === 1, `放歌加载 init 必须返回初值 1（实得 ${sbMusic.init(1)}）`);
+      }
+
+      // S1 数值：反馈链收敛 vs 快照重建不收敛。脚本的淡出闸门用 Date.now()，
+      // 仿真时钟接管它（测试后必须还原）。**单个会话连续跑**——每阶段重建沙箱
+      // 会让 init 锚到错误的音频状态。
+      const realNow = Date.now;
+      let fakeNow = 0;
+      Date.now = () => fakeNow;
+      try {
+        const avg = new Float32Array(16).fill(0.5);
+        const views = new Map([[16, { left: avg, right: avg, average: avg }]]);
+        const sb = evalObjectScript(fadeScript, null, { audioViews: views });
+        let last = sb.init(1);
+        check(last === 1, `放歌加载 init 应返回 1（实得 ${last}）`);
+        const step = (frames) => {
+          for (let i = 0; i < frames; i++) {
+            fakeNow += 1000 / 60;
+            sb.engine.frametime = 1 / 60;
+            const ret = sb.callUpdate(last);
+            if (typeof ret === "number" && Number.isFinite(ret)) last = ret;
+          }
+          return last;
+        };
+        // 阶段 1：放歌 60 帧 → 值保持 1
+        check(near(step(60), 1, 1e-6), `放歌时 alpha 应保持 1（实得 ${last}）`);
+        // 阶段 2：静音。timer=2s 内不动（119 帧 ≈ 1.98s），之后指数淡出收敛
+        avg.fill(0);
+        check(near(step(119), 1, 1e-6), `timer 2s 内 alpha 不应动（实得 ${last}）`);
+        check(step(150) < 0.01, `静音 2s+淡出后 alpha 应收敛到 <0.01（实得 ${last}）—— 快照重建恒 ≈0.967`);
+        // 对照：旧行为（每帧拿快照 1 重建入参）同样时长下**不得**收敛，
+        // 否则这条仿真没有区分度（修的就是它）。
+        {
+          avg.fill(0.5);
+          const sb2 = evalObjectScript(fadeScript, null, { audioViews: views });
+          let l2 = sb2.init(1);
+          check(l2 === 1, `（对照）放歌加载 init 应返回 1（实得 ${l2}）`);
+          avg.fill(0);
+          for (let i = 0; i < 269; i++) {
+            fakeNow += 1000 / 60;
+            sb2.engine.frametime = 1 / 60;
+            const ret = sb2.callUpdate(1); // 旧语义：arg 恒为快照 1，不反馈
+            if (typeof ret === "number" && Number.isFinite(ret)) l2 = ret;
+          }
+          check(l2 > 0.9, `（对照）快照重建应停在 ≈0.967 不收敛（实得 ${l2}）—— 若也变小说仿真失真`);
+          console.log(`   中音条淡出：反馈链静音后收敛（对照快照重建停在 ${l2.toFixed(3)}）`);
+        }
+        // 阶段 3：放歌恢复 → 淡入回 1
+        avg.fill(0.5);
+        check(step(150) > 0.95, `放歌恢复后应淡入回 >0.95（实得 ${last}）`);
+      } finally {
+        Date.now = realNow;
+      }
+
+      // ---- S4 数值：scriptProperties 活代理 ----
+      {
+        const liveProps = { newproperty30: true };
+        const spScript =
+          "export var scriptProperties = createScriptProperties()" +
+          ".addCheckbox({ name: 'pmztz', label: 'x', value: false })" +
+          ".addSlider({ name: 'weizhix', label: 'x', value: 0, min: 0, max: 10 })" +
+          ".finish();" +
+          "export function update(value) { return scriptProperties.pmztz ? 1 : 0; }";
+        const sp = evalObjectScript(
+          spScript,
+          { pmztz: { user: "newproperty30", value: true }, weizhix: 0 },
+          { userProperties: liveProps },
+        );
+        check(sp && sp.callUpdate(0) === 1, "活代理：初始应读到用户属性 true");
+        liveProps.newproperty30 = false; // 模拟 mergeUserPropertyValues 就地热更
+        check(sp.callUpdate(0) === 0, "活代理：热更后必须读到新值（此前恒快照）");
+        const dangling = evalObjectScript(
+          "export var scriptProperties = createScriptProperties().addCheckbox({name:'use24hFormat',label:'x',value:true}).finish();" +
+            "export function update(v){ return scriptProperties.use24hFormat ? 1 : 0; }",
+          { use24hFormat: { user: "_24", value: true } },
+          { userProperties: {} },
+        );
+        check(dangling.callUpdate(0) === 1, "悬空 user 引用（时钟 _24 类）必须退回场景快照");
+        const w = evalObjectScript(
+          "export var scriptProperties = createScriptProperties().addSlider({name:'weizhix',label:'x',value:0,min:0,max:10}).finish();" +
+            "export function update(v){ scriptProperties.weizhix += 1; return scriptProperties.weizhix; }",
+          { weizhix: 0 },
+          {},
+        );
+        check(w.callUpdate(0) === 1 && w.callUpdate(0) === 2, "非绑定滑条必须可写回并逐帧累加（拖拽脚本 weizhix 形态）");
+      }
+
+      // ---- A1 数值：龙烟 override.alpha 曲线 ----
+      const smoke = (raw.objects || []).find((o) => o.name === "龙烟");
+      const ovAnim = smoke?.instanceoverride?.alpha?.animation;
+      check(!!ovAnim?.options, "3233141951 龙烟应有 instanceoverride.alpha 关键帧");
+      if (ovAnim) {
+        const ctrl = createAnimation(ovAnim);
+        const base = smoke.instanceoverride.alpha.value; // 0.79 快照
+        const at = (f) => {
+          ctrl.setFrame(f);
+          return ctrl.applyTo(base);
+        };
+        check(near(at(0), 1, 0.05), `龙烟 f0 应≈1，实得 ${at(0)}`);
+        check(near(at(300), 1, 0.05), `龙烟 f300 应≈1，实得 ${at(300)}`);
+        check(near(at(608), 0.01, 0.05), `龙烟 f608 应≈0.01（烟雾消散），实得 ${at(608)}`);
+        check(near(at(830), 0.01, 0.05), `龙烟 f830 应≈0.01，实得 ${at(830)}`);
+        check(near(at(873), 1, 0.15), `龙烟 f873 应回≈1，实得 ${at(873)}`);
+        check(near(at(899), 1, 0.15), `single 模式尾段应钳在末值，实得 ${at(899)}`);
+        check(!near(at(0), 0.79 + 1, 0.01), "绝对曲线不得叠加快照基准");
+      }
+    }
+  }
+
+  // ---- A1 全库回归：4 处 override 动画逐帧跑，有限有界 ----
+  for (const id of ["3233141951", "3223543799", "3238423642"]) {
+    const p = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(p)) continue;
+    const raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(p))), "scene.json")));
+    let count = 0;
+    for (const o of raw.objects || []) {
+      for (const [k, v] of Object.entries(o.instanceoverride || {})) {
+        if (v && typeof v === "object" && v.animation && v.animation.options) {
+          count++;
+          const ctrl = createAnimation(v.animation);
+          for (let f = 0; f <= 1200; f += 7) {
+            ctrl.setFrame(f);
+            const out = ctrl.applyTo(typeof v.value === "number" ? v.value : 0);
+            const vals = Array.isArray(out) ? out : [out];
+            check(vals.every((x) => Number.isFinite(x)), `${id} ${o.name}.${k} f=${f} 必须有限`);
+          }
+        }
+      }
+    }
+    check(count > 0, `${id} 应有 override 关键帧动画语料（实得 ${count} 处）`);
+  }
+
+  // ---- S1 全库回归：常量脚本真实沙箱 × 反馈链 300 帧，输出必须有限 ----
+  {
+    let total = 0;
+    let evaluated = 0;
+    for (const id of fs.readdirSync(LIB)) {
+      const p = join(LIB, id, "scene.pkg");
+      if (!fs.existsSync(p)) continue;
+      let raw;
+      try {
+        raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(p))), "scene.json")));
+      } catch {
+        continue;
+      }
+      for (const o of raw.objects || []) {
+        for (const eff of o.effects || []) {
+          for (const pass of eff.passes || []) {
+            const csv = pass.constantshadervalues || {};
+            for (const [key, v] of Object.entries(csv)) {
+              if (!v || typeof v !== "object" || typeof v.script !== "string") continue;
+              total++;
+              const sb = evalObjectScript(v.script, v.scriptproperties || v.scriptProperties || null, {});
+              if (!sb || !sb.hasUpdate) continue;
+              evaluated++;
+              const isScalar = typeof v.value === "number";
+              let last = isScalar ? v.value : { x: 0, y: 0, z: 0 };
+              const ir = sb.init(last);
+              if (typeof ir === "number" && Number.isFinite(ir)) last = ir;
+              for (let f = 0; f < 300; f++) {
+                sb.engine.runtime = f / 60;
+                sb.engine.frametime = 1 / 60;
+                const ret = sb.callUpdate(last);
+                const out = ret !== undefined && ret !== null ? ret : last;
+                if (typeof out === "number") {
+                  check(Number.isFinite(out), `${id} ${o.name}.${key} 反馈链 f=${f} 输出必须有限（实得 ${out}）`);
+                  if (Number.isFinite(out)) last = out;
+                } else if (out && typeof out === "object") {
+                  check(
+                    Number.isFinite(Number(out.x)) && Number.isFinite(Number(out.y)),
+                    `${id} ${o.name}.${key} 反馈链 f=${f} 向量分量必须有限`,
+                  );
+                  last = out;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    check(total > 150, `全库常量脚本语料应 >150 处（实得 ${total}）`);
+    console.log(`   常量脚本反馈链回归：${evaluated}/${total} 个可求值脚本 × 300 帧，输出全部有限`);
+  }
+}
+
+// ---------- 时间轴联动组 / 帧事件 / 死槽动画 / 骨骼事件（缓修批，2026-09-09）----------
+{
+  console.log("\n[缓修] 联动组 / 帧事件 / 死槽 / 骨骼事件");
+  const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const rendererSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const textSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+  const mdlParseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl-parse.js"), "utf8");
+
+  // ---- 接线断言（每条都要能抓「删一句/写反」）----
+  check(/linkAnimations\(siblings/.test(mountSrc) && /animationsByField/.test(mountSrc),
+    "scene-mount 必须按层接联动组并建 animationsByField");
+  check(/constAnimLinkedCache/.test(rendererSrc) && !/setFrame\(time \*/.test(rendererSrc),
+    "animatedConstants 必须接联动组且改 advance 语义（不得再用场景时间钉播放头）");
+  check(/rec\.ctrl\.advance\(Math\.max\(0, dt\)\)/.test(rendererSrc), "常量动画必须用 advance(dt) 推进");
+  check(/getAnimationForProperty/.test(textSrc) && /getAnimationForProperty/.test(rendererSrc) && /getAnimationForProperty/.test(mountSrc),
+    "thisObject.getAnimation() 无参调用必须按属性取（text.js 分支 + 常量/对象两处注入）");
+  check((textSrc.match(/animationEvent: typeof animationEvent === "function" \? animationEvent : null/g) || []).length === 2,
+    "text.js 两个工厂表都必须收 animationEvent 导出");
+  check((textSrc.match(/hasAnimEventHook/g) || []).length >= 4, "text.js 必须有 hasAnimEventHook 闸门与沙箱标记");
+  check((textSrc.match(/callAnimationEvent/g) || []).length >= 2, "text.js 两个沙箱都要有 callAnimationEvent");
+  check(/registerAnimEventSink/.test(mountSrc) && /dispatchAnimEvents/.test(mountSrc),
+    "scene-mount 必须有图层级广播表与派发函数");
+  check(/constAnimEventQueue\.push\(\{ layer, events: evs \}\)/.test(rendererSrc),
+    "常量动画事件必须推入共享队列");
+  check(/run\.ctrl\.takeEvents\(\)/.test(mountSrc), "对象/override 动画必须逐帧 drain 事件队列");
+  check(/puppetPrevFrames/.test(mountSrc) && /anim\.crossedEvents\(/.test(mountSrc),
+    "scene-mount 必须跟踪骨骼播放头并用 crossedEvents 检测跨帧");
+  check(/findNextAnimHeader/.test(mdlParseSrc) && !/o \+= 35 \/\/ 动画条目末尾填充/.test(mdlParseSrc),
+    "mdl-parse 必须锚扫下一条动画头（固定 o+=35 会在有事件时错位丢动画）");
+
+  // 死槽接线
+  check(/run\.layer\.soundprops\.volume = out;\s*\n\s*run\.layer\.soundCtl\?\.setVolume\?\.\(out\);/.test(mountSrc),
+    "volume 动画必须双写 soundprops.volume + setVolume");
+  check(/run\.layer\.textMaxwidth = out/.test(mountSrc), "maxwidth 动画必须写 textMaxwidth");
+  check(/\$\{layer\.textMaxwidth \|\| 0\}/.test(mountSrc), "updateTexts 的 lastKey 必须含 textMaxwidth（否则写了不重排）");
+  check(/\(scene as any\)\.cameraTransforms\.zoom = out/.test(mountSrc), "对象级 zoom 动画必须写 cameraTransforms.zoom");
+  check(/field === "volume"\s*\?\s*\(layer as any\)\.soundprops\?\.volume/.test(mountSrc.replace(/\s+/g, " ")) ||
+    /soundprops\?\.volume/.test(mountSrc), "volume 动画基准必须取 soundprops.volume");
+
+  // ---- 联动组数值：合成组全行为 ----
+  {
+    const kf = (f, v) => ({ frame: f, value: v, front: { enabled: false, x: 1, y: 0 }, back: { enabled: false, x: 1, y: 0 }, lockangle: true, locklength: true });
+    const leader = createAnimation({ c0: [kf(0, 0), kf(10, 100)], options: { fps: 10, length: 10, mode: "single", startpaused: true, name: "L", children: [{ key: "angles" }] } });
+    const child = createAnimation({ c0: [kf(0, 0), kf(10, 50)], options: { fps: 10, length: 10, mode: "single", parent: { key: "origin" } } });
+    const diag = [];
+    linkAnimations(new Map([["origin", leader], ["angles", child]]), (m) => diag.push(m));
+    check(child.parent === leader, "child 必须链接到 leader");
+    child.advance(0.5);
+    check(child.frame === 0, `linked child 不得自播（实得 frame=${child.frame}）—— 此前 children 加载即自播`);
+    child.play();
+    check(leader.playing === true && child.playing === true, "child.play() 必须委托 leader 且 playing 镜像");
+    leader.advance(0.5);
+    check(near(child.value(), 25), `child 必须用 leader 播放头采样（期望 25，实得 ${child.value()}）`);
+    child.rate = -2;
+    check(leader.rate === -2, "child.rate 赋值必须委托 leader（语料实证作者直接写 ani.rate）");
+    child.stop();
+    check(leader.frame === 0 && leader.playing === false, "child.stop() 必须委托 leader");
+    // 悬空 parent 退化独立 + 诊断
+    const orphan = createAnimation({ c0: [kf(0, 1)], options: { fps: 10, length: 10, mode: "single", parent: { key: "ghost" } } });
+    const diag2 = [];
+    linkAnimations(new Map([["x", orphan]]), (m) => diag2.push(m));
+    check(orphan.parent === null && diag2.length === 1, "悬空 parent 必须退化为独立并记一条诊断");
+    orphan.advance(0.5);
+    check(orphan.frame === 5, "退化独立后必须照常自播");
+  }
+
+  // ---- 联动组真实语料 A/B：自治组联动前后视觉必须逐位一致 ----
+  {
+    const pkgPath = join(LIB, "3233141951", "scene.pkg");
+    if (fs.existsSync(pkgPath)) {
+      const raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkgPath))), "scene.json")));
+      const fire = (raw.objects || []).find((o) => o.name === "火1");
+      check(!!fire?.origin?.animation && !!fire?.scale?.animation && !!fire?.alpha?.animation, "3233141951 火1 应有 origin/scale/alpha 联动组");
+      if (fire?.origin?.animation) {
+        // A：各自独立推进（旧行为）；B：链接后 leader 推进（新行为）。自治组必须逐位一致。
+        const mk = () => ({
+          origin: createAnimation(fire.origin.animation),
+          scale: createAnimation(fire.scale.animation),
+          alpha: createAnimation(fire.alpha.animation),
+        });
+        const A = mk();
+        const B = mk();
+        linkAnimations(new Map([["origin", B.origin], ["scale", B.scale], ["alpha", B.alpha]]));
+        check(B.scale.parent === B.origin && B.alpha.parent === B.origin, "火1 scale/alpha 必须挂到 origin leader");
+        const bO = fire.origin.value, bS = fire.scale.value, bA = fire.alpha.value;
+        let worst = 0;
+        for (let f = 0; f < 60; f++) {
+          const dt = 1 / 60;
+          A.origin.advance(dt); A.scale.advance(dt); A.alpha.advance(dt);
+          B.origin.advance(dt); B.scale.advance(dt); B.alpha.advance(dt);
+          const ao = A.origin.applyTo(bO), bo = B.origin.applyTo(bO);
+          const as = A.scale.applyTo(bS), bs = B.scale.applyTo(bS);
+          const aa = A.alpha.applyTo(bA), ba = B.alpha.applyTo(bA);
+          worst = Math.max(worst,
+            Math.abs(ao[0] - bo[0]), Math.abs(ao[1] - bo[1]),
+            Math.abs(as[0] - bs[0]), Math.abs(as[1] - bs[1]),
+            Math.abs(aa - ba));
+        }
+        check(worst < 1e-9, `火1 自治组联动前后采样必须逐位一致（最大差 ${worst}）`);
+        // B 组 alpha 是绝对 1 通道、origin/scale 是 relative 3 通道——独立性证据
+        check(B.alpha.relative === false && B.origin.relative === true, "火1 同组内 relative/绝对必须各自独立");
+      }
+    }
+  }
+
+  // ---- 联动组真实语料：3444535389 的 child 在 play 前必须停帧 0 ----
+  {
+    const pkgPath = join(LIB, "3444535389", "scene.pkg");
+    if (fs.existsSync(pkgPath)) {
+      const raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkgPath))), "scene.json")));
+      const bc = (raw.objects || []).find((o) => o.name === "bc");
+      check(!!bc?.scale?.animation && !!bc?.alpha?.animation, "3444535389 bc 应有 scale(ckk)+alpha 联动组");
+      if (bc?.scale?.animation) {
+        const leader = createAnimation(bc.scale.animation);
+        const child = createAnimation(bc.alpha.animation);
+        linkAnimations(new Map([["scale", leader], ["alpha", child]]));
+        check(child.parent === leader, "3444535389 alpha 必须挂到 scale(ckk)");
+        check(leader.playing === false && child.playing === false, "SP leader 的组装载时必须全组停播");
+        // 旧行为：child 自动播完。新行为：advance 5 秒仍帧 0。
+        for (let i = 0; i < 300; i++) child.advance(1 / 60);
+        check(child.value() === 0 || near(child.value(), Number(bc.alpha.animation.c0[0].value), 1e-6),
+          `bc.alpha 在 leader.play() 前必须停帧 0（实得 ${child.value()}）—— 此前不点也自动播完`);
+        child.play();
+        for (let i = 0; i < 60; i++) leader.advance(1 / 60);
+        check(leader.getFrame() > 0 && child.getFrame() === leader.getFrame(),
+          `点击 play 后 leader 播放头必须推进且 child 镜像（leader=${leader.getFrame()} child=${child.getFrame()}）`);
+      }
+    }
+  }
+
+  // ---- 帧事件：crossedEvents 全语义 ----
+  {
+    const evs = [
+      { frame: 0, name: "H" },
+      { frame: 30, name: "M" },
+      { frame: 60, name: "S" },
+    ];
+    // 前进半开：prev=0 不含出发帧（H 不在起步触发），含到达帧
+    check(JSON.stringify(crossedEvents(evs, 0, 30, 60, "single").map((e) => e.name)) === '["M"]',
+      "前进 0→30 应只触发 M（H 是倒放回到头的到达信号，起步不触发）");
+    check(JSON.stringify(crossedEvents(evs, 30, 60, 60, "single").map((e) => e.name)) === '["S"]',
+      "前进 30→60 应触发 S（single 钳到 length 时末帧事件触发）");
+    // 后退：含到达帧（H 在回到 0 时触发）、不含出发帧（S 不触发）
+    check(JSON.stringify(crossedEvents(evs, 60, 0, 60, "single").map((e) => e.name)) === '["M","H"]',
+      "后退 60→0 应按序触发 M,H（S 是出发帧不触发）");
+    // 大 dt 一帧跨多事件，前进升序
+    check(JSON.stringify(crossedEvents(evs, 0, 60, 60, "single").map((e) => e.name)) === '["M","S"]',
+      "一帧跨多事件必须按帧序触发");
+    // loop 缝口：length 事件每周期一次（50→130 跨两个周期末 = 两次）
+    const loopEvs = [{ frame: 60, name: "E" }];
+    check(crossedEvents(loopEvs, 50, 130, 60, "loop").length === 2, "loop 跨缝 length 事件每周期一次（50→130 应得 2 次）");
+    check(crossedEvents(loopEvs, 50, 190, 60, "loop").length === 3, "loop 三周期三触发");
+    // 同帧多事件保数组序
+    const sameFrame = [{ frame: 0, name: "a" }, { frame: 0, name: "b" }];
+    check(JSON.stringify(crossedEvents(sameFrame, -0.5, 0.5, 60, "single").map((e) => e.name)) === '["a","b"]',
+      "同帧多事件必须保 events 数组序");
+  }
+
+  // ---- 帧事件真实语料：3163060610 mAvAni 全程事件序列（含作者的「倒放结束」语义）----
+  {
+    const pkgPath = join(LIB, "3163060610", "scene.pkg");
+    if (fs.existsSync(pkgPath)) {
+      const raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkgPath))), "scene.json")));
+      const av = raw.objects?.[33]?.effects?.[0]?.passes?.[0]?.constantshadervalues?.["Radius"];
+      check(!!av?.animation?.options?.events, "3163060610 objects[33] Radius 应有帧事件");
+      if (av?.animation?.options?.events) {
+        const ctrl = createAnimation(av.animation);
+        const seq = [];
+        for (let i = 0; i < 70; i++) {
+          ctrl.advance(1 / 60);
+          for (const e of ctrl.takeEvents()) seq.push(e.name);
+        }
+        check(JSON.stringify(seq) === '["mAvAni10","mAvAni20","mAvAni40","mAvAniS"]',
+          `mAvAni 正放事件序列（frame-0 事件装载不补发），实得 ${JSON.stringify(seq)}`);
+        // 倒放：从 60 回 0，H/mAvUpdate（frame-0）必须触发——作者拿它当「倒放结束」信号
+        ctrl.stop();
+        ctrl.setFrame(60);
+        check(ctrl.takeEvents().length === 0, "setFrame 不得触发事件（脚本 seek 不算 passes a frame）");
+        ctrl.rate = -1;
+        ctrl.play();
+        const back = [];
+        for (let i = 0; i < 70; i++) {
+          ctrl.advance(1 / 60);
+          for (const e of ctrl.takeEvents()) back.push(e.name);
+        }
+        check(JSON.stringify(back) === '["mAvAni40","mAvAni20","mAvAni10","mAvUpdate","mAvAniH"]',
+          `mAvAni 倒放事件序列（降序、frame-0 事件在回到 0 时触发、同帧保数组序），实得 ${JSON.stringify(back)}`);
+      }
+      // 全壁纸 24 处 events 表回放：全部有限、事件名唯一可解析、frame 在 [0,length]
+      let evCount = 0;
+      const walk = (n) => {
+        if (Array.isArray(n)) return n.forEach(walk);
+        if (!n || typeof n !== "object") return;
+        if (n.events && Array.isArray(n.events)) {
+          for (const e of n.events) {
+            evCount++;
+            check(Number.isInteger(e.frame) && typeof e.name === "string", "events 元素必须是 {frame:int, name:string}");
+            if (typeof n.length === "number") check(e.frame >= 0 && e.frame <= n.length, `事件帧 ${e.frame} 必须在 [0,${n.length}]`);
+          }
+        }
+        for (const v of Object.values(n)) walk(v);
+      };
+      walk(raw);
+      check(evCount === 75, `3163060610 应有 75 个事件元素（实得 ${evCount}）`);
+    }
+  }
+
+  // ---- 联动组全库回归：53 处语料（对象字段 12 组 + 常量映射 9 组）全链接、推进 120 帧有限 ----
+  {
+    let groups = 0;
+    let linked = 0;
+    const collectGroup = (defs, label) => {
+      // defs: [[key, animationDef]] — 同作用域（同层字段 / 同 constantshadervalues 映射）。
+      // 组判定看**原始 options**（children:[] 空组也是联动组声明，3163060610 封面 Radius）。
+      if (!defs.some(([, def]) => def.options && (def.options.parent || def.options.children))) return;
+      const sibs = new Map();
+      for (const [k, def] of defs) sibs.set(k, createAnimation(def));
+      groups++;
+      const diag = [];
+      linkAnimations(sibs, (m) => diag.push(m));
+      for (const [f, c] of sibs) {
+        if (c.parent) linked++;
+        for (let i = 0; i < 120; i++) c.advance(1 / 30);
+        const v = c.value();
+        const vals = Array.isArray(v) ? v : [v];
+        check(vals.every((x) => Number.isFinite(x)), `${label}.${f} 联动推进后取值必须有限`);
+      }
+    };
+    for (const id of fs.readdirSync(LIB)) {
+      const p = join(LIB, id, "scene.pkg");
+      if (!fs.existsSync(p)) continue;
+      let raw;
+      try {
+        raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(p))), "scene.json")));
+      } catch { continue; }
+      for (const o of raw.objects || []) {
+        // 对象字段组（同层作用域）
+        const fieldDefs = [];
+        for (const f of ["scale", "origin", "color", "alpha", "brightness", "angles", "visible", "volume", "maxwidth", "zoom"]) {
+          const v = o[f];
+          if (v && typeof v === "object" && v.animation && v.animation.options) fieldDefs.push([f, v.animation]);
+        }
+        if (fieldDefs.length) collectGroup(fieldDefs, `${id} ${o.name}`);
+        // 常量映射组（同对象/效果/pass 的 constantshadervalues 作用域）
+        for (const eff of o.effects || []) {
+          for (const pass of eff.passes || []) {
+            const csv = pass.constantshadervalues || {};
+            const constDefs = [];
+            for (const [k, v] of Object.entries(csv)) {
+              if (v && typeof v === "object" && v.animation && v.animation.options) constDefs.push([k, v.animation]);
+            }
+            if (constDefs.length) collectGroup(constDefs, `${id} ${o.name}.常量`);
+          }
+        }
+      }
+    }
+    check(groups === 21, `全库应有 21 个联动组作用域（对象字段 12 + 常量 9，实得 ${groups}）`);
+    console.log(`   联动组回归：${groups} 组 / ${linked} 个 child 链接 / 120 帧全部有限`);
+  }
+
+  // ---- 骨骼事件：mdl 事件表解析 + o+=35 错位修复 ----
+  {
+    const pkgPath = join(LIB, "2477602742", "scene.pkg");
+    if (fs.existsSync(pkgPath)) {
+      const ent = getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkgPath))), "models/FrontPole_puppet.mdl");
+      const mdl = parseMDL(new Uint8Array(ent.buffer, ent.byteOffset, ent.byteLength));
+      check(mdl.animations.length === 2,
+        `2477602742 FrontPole animCount=2 必须全解析（实得 ${mdl.animations.length}）—— 固定 o+=35 会把 "Animation 2" 错位丢掉`);
+      const a1 = mdl.animations[0];
+      check(a1 && a1.name === "Animation 1" && a1.events && a1.events.length === 2, "Animation 1 应有 2 个事件");
+      if (a1?.events?.length === 2) {
+        check(a1.events[0].frame === 0 && a1.events[0].name === "flashStart", "事件 1 必须是 flashStart@0");
+        check(a1.events[1].frame === 37 && a1.events[1].name === "flashStop", "事件 2 必须是 flashStop@37");
+      }
+      // 骨骼事件跨帧（loop 360 帧 @1fps）：第 37 秒应触发 flashStop
+      if (a1?.events?.length) {
+        const seq = crossedEvents(a1.events, 10, 40, a1.frameCount, "loop").map((e) => e.name);
+        check(JSON.stringify(seq) === '["flashStop"]', `骨骼事件跨帧检测（10→40 帧应只触发 flashStop），实得 ${JSON.stringify(seq)}`);
+        const loop2 = crossedEvents(a1.events, 350, 370, a1.frameCount, "loop").map((e) => e.name);
+        check(JSON.stringify(loop2) === '["flashStart"]', "骨骼 loop 跨缝应触发 flashStart@0（次周期）");
+      }
+    }
+    const pkg2 = join(LIB, "3396722575", "scene.pkg");
+    if (fs.existsSync(pkg2)) {
+      const ent = getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkg2))), "models/身体_puppet.mdl");
+      const mdl = parseMDL(new Uint8Array(ent.buffer, ent.byteOffset, ent.byteLength));
+      check(mdl.animations.length === 3,
+        `3396722575 身体_puppet animCount=3 必须全解析（实得 ${mdl.animations.length}）—— 固定 o+=35 把「耳坠」也错位丢掉了`);
+      const evs = mdl.animations.flatMap((a) => a.events || []);
+      check(evs.length === 1 && evs[0].frame === 30 && evs[0].name === "点头错帧", "3396722575 应有 30:点头错帧 事件");
+    }
+    // 无事件 mdl 回归：动画数不受影响
+    const pkg3 = join(LIB, "3233141951", "scene.pkg");
+    if (fs.existsSync(pkg3)) {
+      const ent = getEntry(parsePkg(new Uint8Array(fs.readFileSync(pkg3))), "models/龙_puppet.mdl");
+      const mdl = parseMDL(new Uint8Array(ent.buffer, ent.byteOffset, ent.byteLength));
+      check(mdl.animations.length >= 2, `3233141951 龙_puppet 至少 2 条动画（实得 ${mdl.animations.length}，锚扫不得影响无事件条目）`);
+      check(mdl.animations.every((a) => !a.events || a.events.length === 0), "无事件 mdl 不得误报事件");
+    }
+  }
+  // ---- 框架阻断性沙箱缺口（2026-09-09 补：isRunningInEditor 对偶 / 颜色 Vec3 / 文字 init 时序）----
+  {
+    console.log("   [沙箱缺口] isRunningInEditor / 颜色 Vec3 / 文字 init 时序");
+    const textSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+    const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const userPropsSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/user-props.js"), "utf8");
+    // 接线
+    check(/function dualFlag/.test(textSrc) && (textSrc.match(/dualFlag\(opts\.isRunningInEditor\)/g) || []).length >= 3,
+      "engine.isRunningInEditor 必须是对偶形态（dualFlag：可调用 + 可布尔读，三处注入点）");
+    check(/import \{ Vec3 \} from '\.\.\/render\/text\.js'/.test(userPropsSrc) && /colorVec3/.test(userPropsSrc),
+      "user-props 必须把 color 属性包成 Vec3（colorVec3）");
+    check(/deferredTextInits/.test(mountSrc) && /for \(const d of deferredTextInits\)/.test(mountSrc),
+      "文字脚本 init/applyUserProperties 必须延后到对象脚本装配之后");
+    // 数值 1：dualFlag 两种用法
+    const { evalObjectScript: eval2 } = await imp("renderer/vendor/we-scene/render/text.js");
+    const sbFlag = eval2(
+      "export function update(v){ if (engine.isRunningInEditor()) return 1; return 0; }",
+      null,
+      { isRunningInEditor: true },
+    );
+    check(sbFlag && sbFlag.callUpdate(0) === 1, "engine.isRunningInEditor() 必须可按方法调用（3163060610 基础脚本）");
+    const sbFlag2 = eval2(
+      "export function update(v){ return engine.isRunningInEditor ? 1 : 0; }",
+      null,
+      { isRunningInEditor: true },
+    );
+    check(sbFlag2 && sbFlag2.callUpdate(0) === 1, "engine.isRunningInEditor 必须可按布尔读");
+    const sbFlag3 = eval2(
+      "export function update(v){ return engine.isRunningInEditor() === false ? 1 : 0; }",
+      null,
+      { isRunningInEditor: false },
+    );
+    check(sbFlag3 && sbFlag3.callUpdate(0) === 1, "false 时 engine.isRunningInEditor() 必须返回 false");
+    // 注意：`!flag` / `flag ? :` 的真值判断在 WE（方法形态）下本就恒假/恒真，
+    // 对偶形态只覆盖「调用」与「==/数值」读法（valueOf），不覆盖 ! 运算符。
+    const sbFlag4 = eval2(
+      "export function update(v){ return engine.isRunningInEditor == false ? 1 : 0; }",
+      null,
+      { isRunningInEditor: false },
+    );
+    check(sbFlag4 && sbFlag4.callUpdate(0) === 1, "false 时 engine.isRunningInEditor == false 必须成立（valueOf 兜底）");
+    // 数值 2：颜色属性 Vec3（flatten + merge 两条路）
+    const { flattenUserProperties, mergeUserPropertyValues } = await imp("renderer/vendor/we-scene/scene/user-props.js");
+    const flat = flattenUserProperties({ m_bg_color: { type: "color", value: "1 0.5 0.2" } });
+    check(
+      flat.m_bg_color && typeof flat.m_bg_color.multiply === "function" && typeof flat.m_bg_color.subtract === "function",
+      "flattenUserProperties 的 color 必须带 multiply/subtract 方法（3163060610 背景.color 混色链）",
+    );
+    const merged = mergeUserPropertyValues(
+      { m_bg_color: { type: "color", value: "1 0.5 0.2" } },
+      { m_bg_color: 0 },
+      { m_bg_color: { value: "0.1 0.2 0.3" } },
+    );
+    check(typeof merged.m_bg_color.multiply === "function", "mergeUserPropertyValues 热更的 color 同样必须是 Vec3");
+    // 数值 3：WEColor.hsv2rgb 返回 Vec3（混色链另一环）
+    // 数值 3：WEColor.hsv2rgb 返回 Vec3（混色链另一环；hsv(0,1,1)=纯红 (1,0,0)）
+    const sbColor = eval2(
+      "export function update(v){ var c = WEColor.hsv2rgb({x:0,y:1,z:1}); return c.multiply(2).x; }",
+      null,
+      {},
+    );
+    check(sbColor && near(sbColor.callUpdate(0), 2), "WEColor.hsv2rgb 必须返回可链式 multiply 的 Vec3");
   }
 }
 

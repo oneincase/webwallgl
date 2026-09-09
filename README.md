@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -143,8 +143,9 @@ input.addEventListener("change", () => {
 | `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。scene 与 web 都生效 |
 | `setMedia(src)` | 换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空 |
 | `media` | 媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制 |
-| `pushPointer(u, v, buttons?)` | 外部指针注入（u/v 为 0..1 归一化）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
+| `pushPointer(u, v, buttons?, mods?)` | 外部指针注入（u/v 为 0..1 归一化；mods 为 ctrl/shift/alt/meta 掩码）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
 | `pointerLeave()` | 指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下） |
+| `pushWheel(dx, dy, mode?, mods?)` | 滚轮 / 触摸板注入（仅网页壁纸）。dy 正=内容向下；Mac 触摸板双指捏合映射成 mods 的 ctrl 位 |
 | `load(source)` | 换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve |
 | `release() / restore()` | 释放显存但保留配置（显示器睡眠）/ 用保留的配置重建 |
 | `destroy()` | 终态：释放资源、解绑监听，之后实例不可再用 |
@@ -249,13 +250,17 @@ wp.media.playPause();
 
 ## 注入指针与音频
 
-壁纸宿主常常拿不到浏览器天然的输入：桌面壁纸叠在桌面 underlay 层，鼠标事件被系统的桌面窗口吃掉；音频频谱也得由宿主自己采集。两条通道都由实例方法喂进来。
+壁纸宿主常常拿不到浏览器天然的输入：桌面壁纸叠在桌面 underlay 层，鼠标与滚轮事件被系统的桌面窗口吃掉；音频频谱也得由宿主自己采集。这几条通道都由实例方法喂进来。
 
 ```
 // 指针：u/v 是 0..1 归一化坐标，buttons 同 MouseEvent.buttons
 wp.pushPointer(0.5, 0.5, 0);   // 悬停在正中
 wp.pushPointer(0.5, 0.5, 1);   // 按下左键
 wp.pointerLeave();             // 鼠标移出（只清按键，保留最后位置）
+
+// 滚轮 / 触摸板（仅网页壁纸）：dy 与 DOM deltaY 同向；mode 0=像素 1=行 2=页
+wp.pushWheel(0, 100, 0, 0);    // 双指向下滚一格
+wp.pushWheel(0, -50, 0, 1);    // Mac 双指捏合 = ctrl 位（mods bit0）
 
 // 音频：拉模式，渲染循环每帧调一次 snapshot()
 let latest = { left: new Float32Array(64), right: new Float32Array(64) };
@@ -268,6 +273,8 @@ wp.setAudio(null);             // 撤源，回落内置模拟
 ```
 
 - 指针注入与 canvas 自身的 DOM 监听并存，谁后写谁赢；scene 与 web 壁纸都生效，媒体壁纸没有指针概念，调用静默无效
+- pushWheel 只对网页壁纸生效：场景壁纸没有滚轮 API（实测 194 张场景壁纸零消费）。网页侧会同时合成现代 wheel 与旧式 mousewheel——语料里唯一真正用滚轮的 360° 全景（3406740580）只听旧式，而 three.js OrbitControls 只听现代；不发 DOMMouseScroll，否则同一滚动会被处理两遍
+- Mac 触摸板：双指滚动直接喂像素级 delta（mode=0）；双指捏合按浏览器约定映射成 ctrl+滚轮（mods bit0），OrbitControls / pano2vr 都靠它区分缩放与滚动
 - 音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生
 - snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理
 - setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效
@@ -320,10 +327,19 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.6。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.15。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.15` | 2026-09-08 | 视频对新增自愈看门狗：元素可能进入"假播放"（paused=false 但解码停摆、时间不走，无任何事件可听）导致壁纸永久冻结——渲染循环里检测可见页面上 currentTime 连续 ~500ms 不前进即 pause→play 硬重启解码；页面被遮挡时的合法节流不会误判 |
+| `1.3.14` | 2026-09-08 | 循环交接第四版：硬切改快速淡出。爬行保证下层交接时已在运动，上层旧主元素（定格在末帧）以 64ms 线性淡出露出下层——元素级交接固有的 1~3 帧不精度（ended 分发、层交换合成）被融合窗口整体掩掉，不再依赖把每一环都压到零延迟 |
+| `1.3.13` | 2026-09-08 | 无缝循环交接第三版「爬行」：备用在主元素最后 0.12s 以 1/8 速率实际播放（媒体管线全程 playing 态，仅前进约 1 帧），ended 触发时拨回 1x 并同步换层——速率切换是纯时钟操作，消除前两版的唤醒延迟/定格与内容跳跃 |
+| `1.3.12` | 2026-09-08 | 无缝循环交接再调：去掉预播（双路 4K 解码瞬时争抢 + 交接处内容跳跃两个残留卡顿源），改为末帧定格——主元素 ended 后停在末帧，唤起备用并确认其真正前进再换层；定格发生在内容切点上，观感为正常剪辑切换 |
+| `1.3.11` | 2026-09-08 | 无缝循环交接改为「预播 + ended 精确交接」：备用在主元素最后几帧就开始在其下方实际播放，主元素 ended（精确到帧，非轮询）一触发即换层 —— 消除了旧方案里恢复播放的唤醒延迟与 rAF 检测滞后带来的最后 1~2 帧卡顿 |
+| `1.3.10` | 2026-09-08 | destroy() 新增 releasePkgCache 选项：销毁实例时连带淘汰该壁纸的 scene.pkg 解析缓存（此前切换壁纸后旧包仍留在缓存里，内存不降） |
+| `1.3.9` | 2026-09-08 | 新增 pushWheel 滚轮 / Mac 触摸板注入通道（仅网页壁纸）：合成 wheel + 旧式 mousewheel，双指捏合映射为 ctrl+滚轮；pushPointer 增加可选修饰键掩码 |
+| `1.3.8` | 2026-09-08 | 视频壁纸改走 DOM 直显：4K 不再被降采样到 2048（清晰度）＋ A/B 双元素无缝循环（循环点卡顿 84ms→33ms）；场景内视频纹理层的上限也跟随渲染目标 |
+| `1.3.7` | 2026-09-08 | 修复库入口 setRenderDpr / restore 重挂后画面全黑（复用了已 loseContext 的画布）；场景壁纸支持 $mediaThumbnail 真实封面纹理 |
 | `1.3.6` | 2026-09-08 | 新增 MediaSnapshot.thumbnail：宿主可把真实专辑封面透传给网页壁纸（此前只能给取色，封面固定是渐变占位图） |
 | `1.3.5` | 2026-09-08 | xray 效果：作者未在场景里配置 size 时，缺省从 shader 注释的 0.2 改为 1（恒等） |
 | `1.3.4` | 2026-09-08 | 补齐 1.3.3 遗留四项：setFit 对网页壁纸生效、audio:null 真静音、裸 iframe 回退不再帧数恒 0、调试全局随卸载清理 |
@@ -336,7 +352,15 @@ b.pause(); // 不影响 a
 | `1.0.0` | 2026-09-06 | 首个正式版：公共 API 定稿（mount / SceneInstance / Source 三件套） |
 | `1.0.0-beta1` | 2026-09-04 | 首个公开测试版 |
 
-1.3.6 只有一项，补的是媒体快照里缺的封面通道。此前 MediaSnapshot 只有 hasThumbnail 和五个取色字段，没有图片本体：网页壁纸的 mediaThumbnailChanged 收到的 event.thumbnail 是库拿 primary/secondary 现画的 64×64 渐变块，语料里 `img.src = e.thumbnail` 那类写法能跑但显示的不是真封面。现在 MediaSnapshot 与 createMediaSource 都多一个可选的 thumbnail（data URL 或同源 URL），宿主填了就原样透传给壁纸，没填仍走渐变占位图；只给 thumbnail 不给 hasThumbnail 时后者自动为真。另外事件 diff 也把 thumbnail 纳入判定 —— 系统媒体接口普遍先给歌名再补封面，只看 hasThumbnail/trackIndex 会漏掉「同一首歌补上封面」这一次变化。场景（WebGL）壁纸不受影响：它们的脚本只读 hasThumbnail 与取色，不消费图片本体。
+1.3.9 加的是滚轮注入通道。指针注入（pushPointer）一直只有位置与按键，没有滚轮 —— 桌面壁纸窗口收不到鼠标事件，自然也收不到滚轮。但这次扫了本机全部 256 张壁纸后发现范围比预想窄：194 张场景壁纸零滚轮消费（WE 的场景脚本沙箱根本没有滚轮 API，场景包里所有 scroll 字样都是纹理滚动图层效果 g_ScrollSpeed），只有网页壁纸用得上；而 52 张网页壁纸里真正消费滚轮的只有一张 360° 全景（3406740580，滚轮改视角 FOV），外加 three.js OrbitControls 默认开启的一张。麻烦的是这张全景只听旧式 mousewheel / DOMMouseScroll，不听现代 wheel，而 OrbitControls 又只听现代 wheel —— 只合成任意一种都会让另一类壁纸完全无反应，且没有任何报错。所以网页侧每次推送同时派发现代 wheel 与旧式 mousewheel（wheelDelta 与 deltaY 反号、detail 置 0）；刻意不发 DOMMouseScroll，因为三个旧式消费方每一个都把它和 mousewheel 绑到同一个处理函数上，三个都发等于同一次滚动处理两遍，FOV 一次跳两格，看起来只是「滚轮太灵敏」。Mac 触摸板的适配是重点：双指滚动直接是像素级 wheel（deltaMode=0），双指捏合则按浏览器约定翻译成 ctrl 位为真的 wheel（OrbitControls / pano2vr 都靠 event.ctrlKey 区分缩放与滚动），宿主从 NSEvent.magnify 映射时注意 scrollingDeltaY 要取反。滚轮位置沿用最后一次指针坐标。场景壁纸调用 pushWheel 静默无效，与视频等媒体壁纸同样处理。
+
+1.3.8 是一组视频壁纸的改动，起因是 4K 视频看起来发糊。原因不在任何清晰度设置，而是视频帧过去要先上传成 WebGL 纹理，那条路径有个写死的 2048 长边上限 —— 3840×2160 的源被降到 2048×1152（面积只剩 28%）再放大铺满屏幕，而 Retina 上渲染目标常见 3024 甚至 3840，等于把一张 2K 图放大给你看。现在视频类型直接用 `&lt;video>` 显示，不再经纹理：浏览器按显示尺寸硬件解码合成，拿到原生分辨率，还省掉一个 WebGL 上下文和每帧一次全画布上传。代价是纯视频壁纸没有效果链/粒子叠加能力，它本来也用不到；「场景内含视频纹理层」的壁纸不走这条路，但那条路径的上限也一并改成了 min(硬件 MAX_TEXTURE_SIZE, 渲染目标长边, 3840) —— 上传比渲染目标更大的纹理是纯浪费，多出的像素在采样阶段就被丢掉。
+
+同一版还接上了无缝循环。WebKit 的 `&lt;video loop>` 在循环点会重置解码管线，缓冲再充分也躲不掉 —— 实测 3840×2160@60fps 的 12 秒素材，循环点最坏帧间隔 84ms（约卡 5 帧）。库里本来就有 A/B 双元素方案（主元素临近结尾时备用起播一两帧后暂停保温，真到结尾的 2~5 帧内交接），只是没接到视频壁纸上，而当初 DOM 路径注释里写着「放弃双元素，内存减半」。这个说法经实测是错的：备用元素平时**不赋 src**，只在结尾前 0.5s 窗口才预热，12 秒视频里重叠占比不到 5%，进程 RSS 峰值从 128MB 到 130MB，而循环点最坏间隔降到 33ms。所以它默认开启，没有开关。备用未及时就绪时自动退回原生 loop，只是回到旧表现，不会中断或黑屏。附带修掉的：`pause`/`resume`/`setVolume`/`setFit` 过去只认场景实例，对 DOM 视频静默失效；DOM 路径不上报首帧会让 `mount()` 的 Promise 永久挂起；不持续打点会让 `instance.stats` 恒报「已停」。判活刻意用 rAF 而非 requestVideoFrameCallback —— 后者在 WKWebView 里存在却从不回调（视频正常播放时 1.5 秒 0 次）。
+
+1.3.7 两项，都在「卸载后重挂」这条路上。一是库入口的 setRenderDpr 与 restore 重挂后画面全黑：清理阶段 renderer.dispose() 走的是 WEBGL_lose_context.loseContext()，而按规范同一个 canvas 之后再 getContext("webgl2") 拿回的仍是那个已丢失的上下文对象（实测新旧引用相同、isContextLost() 为真），只有换一块新画布才能拿到可用上下文。整页渲染器不踩是因为它清理时把容器 innerHTML 清空、画布跟着删掉；库形态没有那层容器，画布被留下复用，于是宿主一改清晰度就黑屏，而且两个方法都不挂首帧守卫，连报错都没有。现在复用前先查上下文存活，死了就换新画布，调用方直接传 canvas（库不能替它换 DOM）时如实报错。二是场景壁纸的封面：它不像网页壁纸走脚本回调，作者是把 $mediaThumbnail / $mediaPreviousThumbnail 这两个 WE 保留纹理名直接填进层的 image / textures 槽，所以 1.3.6 加的 MediaSnapshot.thumbnail 对场景侧原本没有意义。现在快照里的封面变化会异步解码并上传成 GL 纹理（旧的顺位挪到 $mediaPreviousThumbnail），与「系统实况」原有的上传逻辑共用同一段像素代码。
+
+1.3.6 只有一项，补的是媒体快照里缺的封面通道。此前 MediaSnapshot 只有 hasThumbnail 和五个取色字段，没有图片本体：网页壁纸的 mediaThumbnailChanged 收到的 event.thumbnail 是库拿 primary/secondary 现画的 64×64 渐变块，语料里 `img.src = e.thumbnail` 那类写法能跑但显示的不是真封面。现在 MediaSnapshot 与 createMediaSource 都多一个可选的 thumbnail（data URL 或同源 URL），宿主填了就原样透传给壁纸，没填仍走渐变占位图；只给 thumbnail 不给 hasThumbnail 时后者自动为真。另外事件 diff 也把 thumbnail 纳入判定 —— 系统媒体接口普遍先给歌名再补封面，只看 hasThumbnail/trackIndex 会漏掉「同一首歌补上封面」这一次变化。场景（WebGL）壁纸在本版本里还用不上它：它们的脚本只读 hasThumbnail 与取色，图片本体要走保留纹理（见 1.3.7）。
 
 1.3.5 只有一项，改的是 xray 效果的缺省值。xray 的 size 决定效果范围（内部取倒数，size=1 是恒等）。作者若没在场景的 constantshadervalues 里写 size，此前会套用 shader 声明注释里的 "default":0.2 —— 但那是 WE 编辑器新建效果时滑条的初始位置，不是运行时缺省：编辑器一旦把效果加到层上就会把当时的滑条值写进场景文件，所以官方运行时永远读得到显式值。套 0.2 会让效果范围缩成五分之一，只剩光标旁一小块。现在缺省是 1。作用面收窄在这一个参数上，multiply 与贴图槽的注释缺省不变。
 

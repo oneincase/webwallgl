@@ -863,6 +863,17 @@ function runShim(extras) {
       if (init && init.button === -1) this.button = -1;
     }
   }
+  // WheelEvent：delta* 是构造器认识的字段，原样采纳（与真实浏览器一致）。
+  // button 同 MouseEvent 规范化 -1 → 0，所以实现必须自己盖回去。
+  class FakeWheelEvent extends FakeMouseEvent {
+    constructor(type, init) {
+      super(type, init);
+      this.deltaX = init?.deltaX ?? 0;
+      this.deltaY = init?.deltaY ?? 0;
+      this.deltaZ = init?.deltaZ ?? 0;
+      this.deltaMode = init?.deltaMode ?? 0;
+    }
+  }
 
   /** 造一份「文档树 + shim」：documentElement > body > canvas / button */
   function makePointerEnv(opts) {
@@ -889,8 +900,11 @@ function runShim(extras) {
       document: doc,
       MouseEvent: FakeMouseEvent,
       PointerEvent: FakePointerEvent,
+      WheelEvent: FakeWheelEvent,
       screenX: opts?.screenX ?? 0,
       screenY: opts?.screenY ?? 0,
+      innerWidth: opts?.innerWidth ?? 1920,
+      innerHeight: opts?.innerHeight ?? 1080,
     });
     return { win, doc, docEl, body, canvas, button };
   }
@@ -1258,6 +1272,409 @@ function runShim(extras) {
       toClient(NaN, 0.5, stage, { left: 0, top: 0, width: 1, height: 1 }, { width: 1, height: 1 }) === null &&
         toClient(0.5, 0.5, { left: 0, top: 0, width: 0, height: 0 }, { left: 0, top: 0, width: 1, height: 1 }, { width: 1, height: 1 }) === null,
       "非法输入必须回退 null（不抛异常）",
+    );
+  }
+}
+
+// ---------- 3d. 外部滚轮注入（含 macOS 触摸板双指滚动与捏合）----------
+//
+// 语料（本机 52 张 web 壁纸，逐文件数注册次数）决定了这一节的每条断言：
+//
+//   只听现代 wheel：1808443523 OrbitControls(1)、2905017768 react-lrc(4)、
+//                   3361256119 spine(1，死代码)、3747222633 r3f(1，仅事件表)
+//   只听旧式两路：  3406740580 pano2vr(mousewheel 1 + DOMMouseScroll 1) ← 唯一
+//                   作者设计内的滚轮交互（改全景 FOV）
+//                   2179153203 ge1doot(1+1)、2517518192 GameMaker(4+4)
+//
+// 两条硬结论：
+//   1. 必须同时发 `wheel` 与 `mousewheel` —— 只发任一路都有真实壁纸完全无反应；
+//   2. **不得**再发 `DOMMouseScroll` —— 三个旧式消费方每一处都同时注册了
+//      mousewheel 和 DOMMouseScroll 且共用同一个 handler，两个都发 = 同一次滚动
+//      处理两遍（pano2vr 的 FOV 一次跳两格）。真实浏览器也只发 wheel + mousewheel。
+{
+  class FakeNode {
+    constructor(name, parent) {
+      this.nodeName = name;
+      this.parentNode = parent || null;
+      if (parent) (parent.children ??= []).push(this);
+    }
+    addEventListener(type, fn) {
+      (this.handlers ??= {})[type] ??= [];
+      this.handlers[type].push(fn);
+    }
+    dispatchEvent(ev) {
+      ev.target = this;
+      let n = this;
+      while (n) {
+        ev.currentTarget = n;
+        for (const fn of n.handlers?.[ev.type] ?? []) fn(ev);
+        if (!ev.bubbles) break;
+        n = n.parentNode;
+      }
+      return true;
+    }
+  }
+  class FakeMouseEvent {
+    constructor(type, init) {
+      this.type = type;
+      Object.assign(this, init || {});
+      this.bubbles = init?.bubbles !== false;
+      this.cancelable = init?.cancelable !== false;
+      if (this.button === -1) this.button = 0; // 复现 Chromium 的规范化
+    }
+  }
+  class FakePointerEvent extends FakeMouseEvent {
+    constructor(type, init) {
+      super(type, init);
+      if (init && init.button === -1) this.button = -1;
+    }
+  }
+  class FakeWheelEvent extends FakeMouseEvent {
+    constructor(type, init) {
+      super(type, init);
+      this.deltaX = init?.deltaX ?? 0;
+      this.deltaY = init?.deltaY ?? 0;
+      this.deltaZ = init?.deltaZ ?? 0;
+      this.deltaMode = init?.deltaMode ?? 0;
+    }
+  }
+
+  function makeWheelEnv(opts) {
+    const docEl = new FakeNode("HTML", null);
+    const body = new FakeNode("BODY", docEl);
+    const canvas = new FakeNode("CANVAS", body);
+    const doc = {
+      readyState: "complete",
+      addEventListener() {},
+      documentElement: docEl,
+      body,
+      querySelectorAll() {
+        return [];
+      },
+      elementFromPoint: () => (opts?.hitBody ? body : canvas),
+    };
+    docEl.parentNode = doc;
+    const { win } = runShim({
+      document: doc,
+      MouseEvent: FakeMouseEvent,
+      PointerEvent: FakePointerEvent,
+      // noWheelEvent：复现「环境没有 WheelEvent 构造器」的退路
+      WheelEvent: opts?.noWheelEvent ? undefined : FakeWheelEvent,
+      screenX: 0,
+      screenY: 0,
+      innerWidth: opts?.innerWidth ?? 1600,
+      innerHeight: opts?.innerHeight ?? 900,
+    });
+    return { win, doc, docEl, body, canvas };
+  }
+
+  /** 录下节点上收到的全部滚轮族事件 */
+  function recordWheel(node) {
+    const seen = [];
+    for (const t of ["wheel", "mousewheel", "DOMMouseScroll"]) {
+      node.addEventListener(t, (ev) => seen.push({ type: t, ev }));
+    }
+    return seen;
+  }
+
+  check(/__wePushWheel/.test(shimSrc), "web-shim 必须暴露 __wePushWheel（滚轮注入入口）");
+  check(
+    /__wePushWheel/.test(webTs),
+    "web.ts 必须把 rt.pointerCtl.wheel 桥到 shim 的 __wePushWheel",
+  );
+  check(
+    /pushWheel/.test(fs.readFileSync(path.join(ROOT, "renderer/src/main.ts"), "utf8")),
+    "main.ts 必须提供 __wp.pushWheel（宿主侧契约面，见 docs/INTEGRATION.md）",
+  );
+
+  // (1) 两路齐发：wheel（OrbitControls 一族）+ mousewheel（pano2vr / ge1doot /
+  //     GameMaker）。少任何一路都有真实壁纸的滚轮完全没反应。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(100, 100, 0, 120, 0, 0);
+    check(
+      seen.some((e) => e.type === "wheel"),
+      "必须合成现代 wheel（1808443523 OrbitControls / 2905017768 react-lrc 只听它）",
+    );
+    check(
+      seen.some((e) => e.type === "mousewheel"),
+      "必须合成旧式 mousewheel（3406740580 pano2vr / 2179153203 / 2517518192 只听旧式，" +
+        "漏了这一路唯一真正设计了滚轮交互的壁纸完全无反应）",
+    );
+  }
+
+  // (2) **不得**发 DOMMouseScroll：三个旧式消费方都同时注册了它和 mousewheel
+  //     且共用同一 handler，两个都发就是同一次滚动被处理两遍。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(100, 100, 0, 120, 0, 0);
+    const dm = seen.filter((e) => e.type === "DOMMouseScroll");
+    check(
+      dm.length === 0,
+      "不得合成 DOMMouseScroll：pano2vr / ge1doot / GameMaker 都同时注册了它与 " +
+        "mousewheel（同一 handler），两个都发会让滚动量翻倍且看起来只是「太灵敏」",
+    );
+    // 每路各恰好一次（防止将来重构里重复派发）
+    check(
+      seen.filter((e) => e.type === "wheel").length === 1 &&
+        seen.filter((e) => e.type === "mousewheel").length === 1,
+      `wheel / mousewheel 各应恰好 1 次，实得 ${seen.map((e) => e.type).join(",")}`,
+    );
+  }
+
+  // (3) wheel 必须 cancelable：pano2vr 与 ge1doot 都在 handler 里 preventDefault()。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.cancelable === true,
+      "合成 wheel 必须 cancelable（作者调 preventDefault，不可取消会走异常分支）",
+    );
+  }
+
+  // (4) delta 透传，且 deltaMode 保真（作者按 mode 决定要不要乘行高）
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, -30, 120, 1, 0);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.deltaX === -30 && wv.ev.deltaY === 120,
+      `deltaX/deltaY 必须原样透传，实得 ${wv && `${wv.ev.deltaX},${wv.ev.deltaY}`}`,
+    );
+    check(wv && wv.ev.deltaMode === 1, `deltaMode 必须透传，实得 ${wv && wv.ev.deltaMode}`);
+  }
+
+  // (5) 旧式 wheelDelta 与 deltaY **反号**（Chromium：deltaY=+100 ↔ wheelDelta=-120）。
+  //     符号搞反会让所有旧式壁纸的滚轮方向整体反过来 —— pano2vr 里表现为
+  //     「滚下反而放大」，很容易被误当成作者的设定。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    const mw = seen.find((e) => e.type === "mousewheel");
+    check(
+      mw && mw.ev.wheelDelta < 0,
+      `deltaY 为正（内容向下）时 wheelDelta 必须为负，实得 ${mw && mw.ev.wheelDelta}`,
+    );
+    check(
+      mw && Math.abs(mw.ev.wheelDelta - -120) < 1e-6,
+      `一格标准滚动应折算成 wheelDelta=-120（Chromium 口径），实得 ${mw && mw.ev.wheelDelta}`,
+    );
+    check(
+      mw && mw.ev.wheelDeltaY === mw.ev.wheelDelta,
+      "wheelDeltaY 必须与 wheelDelta 同值（2905017768 一族读带 Y 后缀的）",
+    );
+    // pano2vr 的真实取值路径：`a.detail ? -1*a.detail : a.wheelDelta/40`。
+    // detail 必须为 0，否则它会抢在 wheelDelta 之前被采用，且量级完全不同。
+    check(
+      mw && (mw.ev.detail === 0 || mw.ev.detail === undefined),
+      `旧式事件的 detail 必须为 0（pano2vr 的三元判断会优先采用它），实得 ${mw && mw.ev.detail}`,
+    );
+  }
+
+  // (6) 触摸板双指捏合 = ctrlKey 的滚轮。这是浏览器把 macOS magnify 手势喂给
+  //     网页的标准约定，OrbitControls / pano2vr 都靠它区分缩放与滚动。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, -50, 0, 1); // mods bit0 = ctrl
+    const wv = seen.find((e) => e.type === "wheel");
+    check(wv && wv.ev.ctrlKey === true, "mods bit0 必须映射成 ctrlKey（触摸板捏合缩放的判据）");
+    const mw = seen.find((e) => e.type === "mousewheel");
+    check(mw && mw.ev.ctrlKey === true, "旧式 mousewheel 也要带 ctrlKey");
+    // 其余位不得误置
+    check(
+      wv && wv.ev.shiftKey === false && wv.ev.altKey === false && wv.ev.metaKey === false,
+      "只传 ctrl 位时 shift/alt/meta 必须为 false",
+    );
+  }
+
+  // (6b) 修饰键掩码的其余三位
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 10, 0, 2 | 4 | 8);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.shiftKey === true && wv.ev.altKey === true && wv.ev.metaKey === true &&
+        wv.ev.ctrlKey === false,
+      "mods bit1/2/3 必须分别映射 shift/alt/meta",
+    );
+  }
+
+  // (6c) 修饰键也要接到**指针**事件上（改动前 ctrlKey 等硬编码为 false）：
+  //      shift+拖拽一类交互否则无从表达。
+  {
+    const env = makeWheelEnv();
+    const seen = [];
+    env.canvas.addEventListener("mousemove", (ev) => seen.push(ev));
+    env.win.__wePushPointer(10, 10, 0, 2);
+    check(
+      seen.length === 1 && seen[0].shiftKey === true,
+      "__wePushPointer 的 mods 必须接到合成指针事件的 shiftKey（曾硬编码 false）",
+    );
+  }
+
+  // (7) 派发 target 必须是 elementFromPoint 命中元素：pano2vr 的 handler 开头就
+  //     `this.zc(a.target)` 校验命中是不是自己的容器，打错 target 直接被它否掉。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(
+      seen.length > 0 && seen.every((e) => e.ev.target === env.canvas),
+      "滚轮事件的 target 必须是命中元素（pano2vr 会按 target 校验容器）",
+    );
+  }
+
+  // (7b) 靠冒泡挂 document 的作者也要收到
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.docEl);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(
+      seen.some((e) => e.type === "wheel") && seen.some((e) => e.type === "mousewheel"),
+      "挂 document 的滚轮监听应靠冒泡收到（bubbles 必须为真）",
+    );
+  }
+
+  // (8) 位置：滚轮事件本身不带坐标，应沿用最后一次指针位置。
+  {
+    const env = makeWheelEnv();
+    env.win.__wePushPointer(640, 360, 0, 0);
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(NaN, NaN, 0, 100, 0, 0); // 不带位置
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.clientX === 640 && wv.ev.clientY === 360,
+      `未带位置时应沿用最后指针位置，实得 ${wv && `${wv.ev.clientX},${wv.ev.clientY}`}`,
+    );
+  }
+
+  // (8b) 从未收到过指针时取**视口中心**而不是 (0,0)：OrbitControls 一族按事件
+  //      坐标定缩放锚点，落在左上角会让画面一边缩放一边往角上跑。
+  {
+    const env = makeWheelEnv({ innerWidth: 1600, innerHeight: 900 });
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(NaN, NaN, 0, 100, 0, 0);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.clientX === 800 && wv.ev.clientY === 450,
+      `无指针历史时应取视口中心（800,450），实得 ${wv && `${wv.ev.clientX},${wv.ev.clientY}`}`,
+    );
+  }
+
+  // (8c) 带了位置就用它，并且要更新指针位置（后续 mousemove 的 movement 才连续）
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(123, 456, 0, 100, 0, 0);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(
+      wv && wv.ev.clientX === 123 && wv.ev.clientY === 456,
+      `带位置时必须用传入坐标，实得 ${wv && `${wv.ev.clientX},${wv.ev.clientY}`}`,
+    );
+  }
+
+  // (9) 非有限 delta 丢弃：NaN 会污染作者的缩放累加器，之后怎么滚都恢复不了。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, NaN, 100, 0, 0);
+    env.win.__wePushWheel(10, 10, 0, Infinity, 0, 0);
+    check(seen.length === 0, "非有限 delta 必须丢弃（NaN 会永久污染作者的缩放状态）");
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(seen.length === 2, "丢弃非法值后合法推送仍应正常派发（wheel + mousewheel）");
+  }
+
+  // (9b) 双向都是 0 不发：宿主在惯性滚动尾声会推一串 0，空事件会让作者的
+  //      「有没有在滚」判定一直为真。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 0, 0, 0);
+    check(seen.length === 0, "dx/dy 全为 0 时不得派发（惯性滚动尾声的空推送）");
+  }
+
+  // (10) 暂停期间丢弃（与指针通道同一语义：官方暂停 = 冻结渲染进程）
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__weSetPaused(true);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(seen.length === 0, "暂停期间不得派发滚轮事件");
+    env.win.__weSetPaused(false);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(seen.length === 2, "恢复后应继续派发");
+  }
+
+  // (11) button 必须是 -1 哨兵：滚轮不是按键状态变化。填 0 会让 GameMaker 一族
+  //      （2517518192 照抄 e.button 再 `_mq |= 1<<_tq`）误认为左键按着。
+  //      注意 FakeWheelEvent 复现了 Chromium 把 -1 规范化成 0 的行为，
+  //      所以实现必须自己用 defineProperty 盖回去。
+  {
+    const env = makeWheelEnv();
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    const bad = seen.filter((e) => e.ev.button !== -1);
+    check(
+      bad.length === 0,
+      `滚轮事件的 button 必须为 -1 哨兵，违反：${bad
+        .map((e) => `${e.type}=${e.ev.button}`)
+        .join(",")}`,
+    );
+  }
+
+  // (12) 环境没有 WheelEvent 构造器时退回 MouseEvent，delta 用 defineProperty 补上 ——
+  //      事件名照旧，作者的 addEventListener('wheel') 仍然收到。
+  {
+    const env = makeWheelEnv({ noWheelEvent: true });
+    const seen = recordWheel(env.canvas);
+    env.win.__wePushWheel(10, 10, 7, 100, 0, 0);
+    const wv = seen.find((e) => e.type === "wheel");
+    check(wv, "没有 WheelEvent 构造器时也必须发出 wheel（退回 MouseEvent）");
+    check(
+      wv && wv.ev.deltaY === 100 && wv.ev.deltaX === 7,
+      `MouseEvent 退路上 delta* 必须补齐，实得 ${wv && `${wv.ev.deltaX},${wv.ev.deltaY}`}`,
+    );
+  }
+
+  // (13) 作者 handler 抛错不得冒出（会打断宿主的推送循环）
+  {
+    const env = makeWheelEnv();
+    env.canvas.addEventListener("wheel", () => {
+      throw new Error("author bug");
+    });
+    let mwSeen = 0;
+    env.canvas.addEventListener("mousewheel", () => {
+      mwSeen++;
+    });
+    let threw = false;
+    try {
+      env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    } catch {
+      threw = true;
+    }
+    check(!threw, "作者 handler 抛错不得冒出 __wePushWheel");
+    check(mwSeen === 1, "wheel 的 handler 抛错后仍要继续发旧式 mousewheel");
+  }
+
+  // (14) 命中元素变化时先补边界链：作者可能靠 mouseenter 才开始接滚轮。
+  {
+    const env = makeWheelEnv();
+    const seen = [];
+    for (const t of ["mouseover", "mouseenter", "wheel"]) {
+      env.canvas.addEventListener(t, () => seen.push(t));
+    }
+    env.win.__wePushWheel(10, 10, 0, 100, 0, 0);
+    check(
+      seen.indexOf("mouseover") >= 0 && seen.indexOf("mouseover") < seen.indexOf("wheel"),
+      `命中元素首次进入时应先补 over/enter 再发 wheel，实得 ${seen.join(",")}`,
     );
   }
 }

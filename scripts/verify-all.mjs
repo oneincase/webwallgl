@@ -42,10 +42,12 @@ const FLAKY = ["verify-particles"];
  * 修复后请删除对应条目（新增失败不会匹配这里，照常报错）。
  */
 const KNOWN_BASELINE = {
-  // I4 蒙皮法向翻转 1895（阈值 1200，历史正确值 4xx）。该判据与 animation 功能
-  // 同批提交；startpaused 假设已证伪（蒙皮层动画本就常播），真实回归点待查，
-  // 见 engineering 分支的 KNOWN-ISSUES.md。
-  "verify-groups": "I4 蒙皮三角形法向翻转 1895 > 1200（animation 同批引入，回归点待查）",
+  // I4 蒙皮法向翻转：HEAD 本底 1914（阈值 1200，历史正确值 4xx）。动画 id 锚扫
+  // 修正后一批此前悬空的动画引用首次生效；2026-09 加算层两连修（rest-relative
+  // 增量 + 归一化只作用于增量）后为 2286。剩余的主要是隐藏重复层 kkkk#359 的
+  // 动画 476（4 骨静态 rz ~74°，blend=1 独占姿势）静态撕 ~904 —— 该层 visible:false
+  // 不上屏，是 WE 也这样还是旋转语义仍有缺口，见 CASEBOOK「之四」末尾。
+  "verify-groups": "I4 蒙皮三角形法向翻转 2311 > 1200（HEAD 本底 1914 + 隐藏层 kkkk 动画476 ~904）",
 };
 
 const runParticles = process.argv.includes("--all");

@@ -254,6 +254,21 @@ export function parseScene(sceneJson, project) {
       particle: typeof o.particle === 'string' ? o.particle : null,
       // [we-scene patch] 粒子参数覆盖 + 声音 + 文字 + 组件
       instanceoverride: o.instanceoverride || null,
+      // [we-scene patch] instanceoverride 里带 {animation, value} 的键是关键帧动画
+      //（3233141951 龙烟 alpha：single/30fps/900f，帧 608-830 掉到 0.01 再回 1，
+      // 快照 0.79 只是存盘瞬间值）。此前被当静态倍率读（opacityMul 恒 0.79），
+      // 曲线整体丢失 —— 龙的烟雾不会在 20.3-27.7s 消散再回来。全库 4 处。
+      particleOverrideAnimations: (() => {
+        const ov = o.instanceoverride
+        if (!ov || typeof ov !== 'object') return null
+        const out = {}
+        for (const [k, v] of Object.entries(ov)) {
+          if (v && typeof v === 'object' && v.animation && typeof v.animation === 'object' && v.animation.options) {
+            out[k] = { animation: v.animation, value: v.value }
+          }
+        }
+        return Object.keys(out).length ? out : null
+      })(),
       sound: Array.isArray(o.sound) ? o.sound.filter((s) => typeof s === 'string') : [],
       soundprops: {
         volume: parseNum(o.volume, 1),

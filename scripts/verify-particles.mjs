@@ -1384,7 +1384,7 @@ function runRope() {
   return { errors };
 }
 
-// ---------- 内置帧表：rain1/rain2 的 1×4 图集 + randomframe（1823900922）----------
+// ---------- 内置帧表：rain1/rain2 1×4、leaves* 3×3（1823900922 / 1725510475）----------
 function runBuiltinFrames() {
   const errors = [];
   const frames = ptex.builtinParticleFrames("particle/nature/rain1");
@@ -1392,10 +1392,13 @@ function runBuiltinFrames() {
     errors.push(`rain1 内置帧表应为 4 帧（randomframe 依赖），实际 ${frames ? frames.length : null}`);
     return { errors };
   }
+  // 帧表必须是 top-down 像素矩形（TEXS list 同构）：setTexture 会再除贴图尺寸归一化。
+  // 若返回的是归一化 {ou,ov,su,sv}，GL 路径会算出 NaN（CPU 光栅直接吃归一化格式，
+  // 离线全绿但实机雨丝采样全废）——曾真实坏过，这里两侧都锁。
   for (let i = 0; i < 4; i++) {
     const fr = frames[i];
-    if (Math.abs(fr.sv - 0.25) > 1e-9 || Math.abs(fr.ov - i / 4) > 1e-9 || fr.su !== 1) {
-      errors.push(`rain1 帧 ${i} 矩形应为 1×4 竖排等分，实际 ${JSON.stringify(fr)}`);
+    if (fr.x !== 0 || fr.y !== i * 128 || fr.width !== 128 || fr.height !== 128) {
+      errors.push(`rain1 帧 ${i} 应为 1×4 竖排等分像素矩形，实际 ${JSON.stringify(fr)}`);
     }
   }
   // 贴图应是 4 条互不相同的斜丝（帧间相位差）：randomframe 才有意义
@@ -1449,6 +1452,11 @@ function runBuiltinFrames() {
   if (ps.frameCount !== 4) {
     errors.push(`randomframe + 帧表 4 帧：frameCount 应为 4，实际 ${ps.frameCount}`);
   }
+  // GL 路径实际消费的是 setTexture 归一化后的 texFrames：必须全部有限
+  // （帧表格式错 → NaN → 着色器采样全废，但 frameCount 依旧正确，单测 frameCount 测不出来）
+  if (!ps.texFrames || ps.texFrames.some((f) => ![f.ou, f.ov, f.su, f.sv].every(Number.isFinite))) {
+    errors.push(`rain1 setTexture 后 texFrames 含非有限值：${JSON.stringify(ps.texFrames && ps.texFrames[0])}`);
+  }
   for (let i = 0; i < 30; i++) ps.advance(1 / 60);
   const bad = ps.pool.filter((p) => p.alive && (p.frame < 0 || p.frame > 3)).length;
   if (bad > 0) {
@@ -1456,6 +1464,68 @@ function runBuiltinFrames() {
   }
   if (ps.liveCount() > 0 && ps.pool.filter((p) => p.alive).every((p) => p.frame === ps.pool.find((q) => q.alive).frame)) {
     errors.push("randomframe 所有粒子同帧（帧随机化失效）");
+  }
+
+  // ---- 叶片 3×3 图集（1725510475）----
+  // 全库引用 leaves* 的粒子系统一律 sequencemultiplier:3：内置贴图必须是 3×3
+  // 九帧图集并登记像素矩形帧表；单张一片叶会被 N×N 切成 9 个矩形块（白/黄色块）。
+  {
+    const fam = {
+      "particle/nature/leaves1": (r, g, b) => r > 120 && r > g * 2.2 && g > b, // 红枫
+      "particle/nature/leaves3": (r, g, b) => r > 140 && g > 90 && g > b * 2.5, // 橙黄
+      "particle/nature/leaves7": (r, g, b) => g > r && g > b * 1.8, // 绿
+    };
+    for (const [name, colorOk] of Object.entries(fam)) {
+      const lf = ptex.builtinParticleFrames(name);
+      if (!lf || lf.length !== 9 || lf.some((f) => f.width == null || f.x == null)) {
+        errors.push(`${name} 应有 9 帧像素矩形帧表，实际 ${lf ? lf.length : null}`);
+        continue;
+      }
+      const t = ptex.buildBuiltinParticleTexture(name);
+      const cell = t.width / 3;
+      if (t.width !== t.height || cell !== 256 || lf[1].x !== cell || lf[3].y !== cell) {
+        errors.push(`${name} 图集应为 768×768（3×3 各 256），实际 ${t.width}×${t.height}`);
+        continue;
+      }
+      // 色系：不透明像素均值必须落进家族色（顶点色多为白→黄乘子，基色全靠贴图）
+      let n = 0, sr = 0, sg = 0, sb = 0;
+      for (let i = 0; i < t.rgba.length; i += 16) {
+        if (t.rgba[i + 3] > 128) { n++; sr += t.rgba[i]; sg += t.rgba[i + 1]; sb += t.rgba[i + 2]; }
+      }
+      const ar = sr / n, ag = sg / n, ab = sb / n;
+      if (!colorOk(ar, ag, ab)) {
+        errors.push(`${name} 色系不对（avg=${ar | 0},${ag | 0},${ab | 0}）：落叶会落成白/黄色块`);
+      }
+      // 每帧必须是叶形（不透明包围盒不得撑满整格 = 不是矩形块）且帧间有形差
+      const sig = [];
+      for (let f = 0; f < 9; f++) {
+        const fr = lf[f];
+        let minX = fr.width, maxX = 0, minY = fr.height, maxY = 0, cnt = 0;
+        for (let y = 0; y < fr.height; y += 4) {
+          for (let x = 0; x < fr.width; x += 4) {
+            const o = ((fr.y + y) * t.width + fr.x + x) * 4;
+            if (t.rgba[o + 3] > 128) {
+              cnt++;
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+        if (cnt < 100) { errors.push(`${name} 帧 ${f} 几乎全透明（cnt=${cnt}）`); continue; }
+        const fill = cnt / (((maxX - minX) / 4 + 1) * ((maxY - minY) / 4 + 1));
+        if (maxX - minX > fr.width * 0.94 && maxY - minY > fr.height * 0.94) {
+          errors.push(`${name} 帧 ${f} 不透明区撑满整格（矩形块，不是叶形）`);
+        } else if (fill > 0.9) {
+          errors.push(`${name} 帧 ${f} 包围盒填充率 ${fill.toFixed(2)}（实心矩形，不是叶形）`);
+        }
+        sig.push(`${maxX - minX}x${maxY - minY}@${minX},${minY}`);
+      }
+      if (new Set(sig).size < 5) {
+        errors.push(`${name} 九帧形态应错开（逐帧换叶形），实际 ${sig.length ? sig[0] : "空"} 雷同`);
+      }
+    }
   }
   return { errors };
 }

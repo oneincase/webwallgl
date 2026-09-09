@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.6/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -144,8 +144,9 @@ input.addEventListener("change", () => {
 | `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Works for scene and web |
 | `setMedia(src)` | Swap the system media source (Now Playing); shared by scene and web, survives scene changes |
 | `media` | Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control |
-| `pushPointer(u, v, buttons?)` | Inject pointer state (u/v normalized 0..1). For hosts whose window cannot receive the mouse; works for scene and web |
+| `pushPointer(u, v, buttons?, mods?)` | Inject pointer state (u/v normalized 0..1; mods is a ctrl/shift/alt/meta mask). For hosts whose window cannot receive the mouse; works for scene and web |
 | `pointerLeave()` | Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump) |
+| `pushWheel(dx, dy, mode?, mods?)` | Inject wheel / trackpad gestures (web wallpapers only). Positive dy scrolls content down; a macOS pinch maps to the ctrl bit in mods |
 | `load(source)` | Switch scenes reusing the same canvas and WebGL context; resolves after the first frame |
 | `release() / restore()` | Free GL resources keeping the config (display sleep) / rebuild from the kept config |
 | `destroy()` | Terminal: frees resources, unbinds listeners; the instance is dead afterwards |
@@ -250,13 +251,17 @@ wp.media.playPause();
 
 ## Injecting pointer & audio
 
-A wallpaper host often cannot rely on the browser's native input: desktop wallpapers sit in the desktop underlay layer where the system's desktop window swallows mouse events, and the audio spectrum has to be captured by the host itself. Both channels are fed through instance methods.
+A wallpaper host often cannot rely on the browser's native input: desktop wallpapers sit in the desktop underlay layer where the system's desktop window swallows mouse and wheel events, and the audio spectrum has to be captured by the host itself. These channels are fed through instance methods.
 
 ```
 // Pointer: u/v are normalized 0..1; buttons matches MouseEvent.buttons
 wp.pushPointer(0.5, 0.5, 0);   // hover at the center
 wp.pushPointer(0.5, 0.5, 1);   // press the left button
 wp.pointerLeave();             // pointer left (clears buttons, keeps last position)
+
+// Wheel / trackpad (web wallpapers only): dy matches DOM deltaY; mode 0=px 1=line 2=page
+wp.pushWheel(0, 100, 0, 0);    // two-finger scroll down one notch
+wp.pushWheel(0, -50, 0, 1);    // macOS pinch = ctrl bit (mods bit0)
 
 // Audio: pull model — the render loop calls snapshot() once per frame
 let latest = { left: new Float32Array(64), right: new Float32Array(64) };
@@ -269,6 +274,8 @@ wp.setAudio(null);             // remove the source, fall back to the built-in s
 ```
 
 - Injected pointer state coexists with the canvas's own DOM listeners — last writer wins. It works for scene and web wallpapers; media wallpapers have no pointer concept, so the call is silently inert
+- pushWheel only affects web wallpapers: scenes have no wheel API (zero consumers across 194 scene wallpapers tested). The web side synthesizes both the modern wheel and the legacy mousewheel — the only wallpaper that genuinely uses the wheel (a 360° panorama, 3406740580) listens solely to the legacy event, while three.js OrbitControls listens solely to the modern one. DOMMouseScroll is deliberately not dispatched, or the same scroll would be processed twice
+- macOS trackpad: feed two-finger scrolls as pixel deltas (mode=0); map a two-finger pinch to ctrl+wheel (mods bit0), exactly as browsers do — OrbitControls / pano2vr rely on that bit to tell zoom from scroll
 - Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library
 - Returning null (or throwing) from snapshot() means "no data this frame" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up
 - setAudio survives scene changes: install it once and it applies to every scene loaded afterwards
@@ -321,10 +328,19 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.6. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.15. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.15` | 2026-09-08 | The video pair gains a self-healing watchdog: elements can enter "phantom playback" (paused=false but the decoder stalls and time stops advancing, with no event to listen for), freezing the wallpaper permanently — the render loop now detects currentTime not advancing for ~500ms on a visible page and hard-restarts decode via pause→play; legitimate throttling while the page is occluded is not misjudged |
+| `1.3.14` | 2026-09-08 | Fourth pass at loop handover: the hard cut became a fast fade. Crawling keeps the layer beneath already moving while the old main (holding its last frame) fades out linearly over 64ms — the blend window masks the 1–3 frames of imprecision inherent to element-level handover (ended dispatch, layer-swap compositing) instead of requiring every stage to be zero-latency |
+| `1.3.13` | 2026-09-08 | Third pass at seamless-loop handover, "crawling": during the main video's final 0.12s the standby actually plays at 1/8 rate (its pipeline stays in the playing state while advancing only ~1 frame); on ended the rate flips back to 1x and layers swap in the same tick — a rate change is a pure clock operation, removing both the wakeup/freeze and the content jump of earlier versions |
+| `1.3.12` | 2026-09-08 | Loop handover refined again: pre-play removed (it caused a transient dual-4K-decode contention plus a content jump at the swap); the main video now holds its last frame on ended while the standby is started and confirmed to actually advance before layers swap — the hold lands on the content cut, reading as a normal edit |
+| `1.3.11` | 2026-09-08 | Seamless-loop handover reworked to "pre-play + exact ended swap": the standby actually starts playing underneath the main video a few frames before the end, and layers swap the instant ended fires (frame-exact, not polled) — eliminating the resume-wakeup latency and rAF detection lag behind the last 1–2 frame hitch |
+| `1.3.10` | 2026-09-08 | destroy() gains a releasePkgCache option: destroying an instance also evicts that wallpaper's parsed scene.pkg cache (previously the old package stayed cached after switching, so memory never dropped) |
+| `1.3.9` | 2026-09-08 | New pushWheel channel for wheel / macOS trackpad injection (web wallpapers only): synthesizes wheel plus the legacy mousewheel, and maps a two-finger pinch to ctrl+wheel; pushPointer gains an optional modifier mask |
+| `1.3.8` | 2026-09-08 | Video wallpapers now render as DOM video: 4K is no longer downsampled to 2048 (sharpness) and an A/B element pair gives seamless looping (loop-point hitch 84ms→33ms); the in-scene video texture cap now follows the render target too |
+| `1.3.7` | 2026-09-08 | Fix: the library entry's setRenderDpr / restore remount went fully black (it reused a canvas whose context had been lost); scene wallpapers now support the real cover texture via $mediaThumbnail |
 | `1.3.6` | 2026-09-08 | New MediaSnapshot.thumbnail: the host can now pass the real album cover to web wallpapers (previously only colors were available, and the cover was always a gradient placeholder) |
 | `1.3.5` | 2026-09-08 | xray effect: when the author doesn't configure size in the scene, the fallback is now 1 (identity) instead of the shader comment's 0.2 |
 | `1.3.4` | 2026-09-08 | Closes the four items deferred from 1.3.3: setFit now affects web wallpapers, audio:null truly mutes, the bare-iframe fallback no longer reports 0 fps, and debug globals are cleared on unmount |
@@ -337,7 +353,15 @@ Current version: 1.3.6. This section records only user-visible changes (API, beh
 | `1.0.0` | 2026-09-06 | First stable release: the public API is settled (mount / SceneInstance / Source) |
 | `1.0.0-beta1` | 2026-09-04 | First public preview |
 
-1.3.6 contains a single change: the missing cover channel in the media snapshot. MediaSnapshot previously carried only hasThumbnail plus the five color fields, with no image data — the event.thumbnail delivered to a web wallpaper's mediaThumbnailChanged was a 64×64 gradient the library painted from primary/secondary, so corpus code like `img.src = e.thumbnail` ran but never showed a real cover. MediaSnapshot and createMediaSource now both take an optional thumbnail (data URL or same-origin URL): when the host supplies it, it is passed through verbatim; when it doesn't, the gradient placeholder is still used. Supplying thumbnail without hasThumbnail implies the latter. The event diff also accounts for thumbnail now — system media interfaces typically deliver the track name first and the artwork a moment later, so watching only hasThumbnail/trackIndex would miss the "same track, cover just arrived" transition. Scene (WebGL) wallpapers are unaffected: their scripts read only hasThumbnail and the colors, never the image itself.
+1.3.9 adds a wheel-injection channel. Pointer injection (pushPointer) always carried only position and buttons, never the wheel — the desktop wallpaper window receives no mouse events, and so no wheel either. But scanning all 256 local wallpapers showed a narrower scope than expected: the 194 scene wallpapers have zero wheel consumers (the WE scene script sandbox has no wheel API at all; every scroll token in a scene package is the texture-scroll layer effect g_ScrollSpeed), so only web wallpapers matter. Of the 52 web wallpapers, exactly one genuinely consumes the wheel — a 360° panorama (3406740580, where the wheel changes the field of view) — plus one wallpaper where three.js OrbitControls has zoom enabled by default. The snag is that the panorama listens only to the legacy mousewheel / DOMMouseScroll, never the modern wheel, while OrbitControls listens only to the modern wheel — synthesizing either one alone leaves the other class completely inert, with no error. So the web side now dispatches both a modern wheel and a legacy mousewheel per push (wheelDelta has the opposite sign to deltaY and detail stays 0); DOMMouseScroll is deliberately not dispatched, because each of the three legacy consumers binds it and mousewheel to the very same handler, so firing all three would process one scroll twice — the FOV jumps two steps at a time and merely looks like an over-sensitive wheel. macOS trackpad support is the point: two-finger scroll is a plain pixel wheel (deltaMode=0), while a two-finger pinch is translated, exactly as browsers do, to a wheel whose ctrl bit is set (OrbitControls / pano2vr rely on event.ctrlKey to tell zoom from scroll); when mapping from NSEvent.magnify the host must negate scrollingDeltaY. Wheel position reuses the last pointer coordinates. Calling pushWheel for a scene wallpaper is silently inert, the same treatment as video and other media wallpapers.
+
+1.3.8 is a set of video-wallpaper changes, prompted by 4K video looking soft. The cause was not any sharpness setting: video frames used to be uploaded as WebGL textures, and that path had a hard-coded 2048 long-edge cap — a 3840×2160 source became 2048×1152 (28% of the area) and was then scaled back up to fill the screen, while a Retina render target is commonly 3024 or even 3840. In effect you were shown an upscaled 2K image. Video wallpapers now display through a plain `&lt;video>` element instead: the browser decodes and composites in hardware at display size, so you get native resolution, and a WebGL context plus a full-canvas upload per frame are saved. The trade-off is that pure video wallpapers lose effect-chain/particle overlay — which they never used anyway. Wallpapers with an in-scene video texture layer don't take this path, but that path's cap was also changed to min(hardware MAX_TEXTURE_SIZE, render-target long edge, 3840): uploading a texture larger than the render target is pure waste, as the extra pixels are discarded at sampling time.
+
+The same version also wires up seamless looping. WebKit's `&lt;video loop>` resets the decode pipeline at the loop point and no amount of buffering avoids it — measured on a 12-second 3840×2160@60fps clip, the worst frame gap at the loop point was 84ms (roughly five dropped frames). The library already had an A/B element scheme (as the main element nears the end, the standby starts, plays one or two frames and pauses to stay warm, then hands over within 2–5 frames of the true end); it just wasn't wired to video wallpapers, and the DOM path's comment claimed "dropped the pair, halves memory". Measurement shows that claim was wrong: the standby element has **no src** most of the time and only preheats in the final 0.5s window, so on a 12-second clip the overlap is under 5% — process RSS peak went from 128MB to 130MB while the worst loop-point gap dropped to 33ms. So it is on by default with no switch. If the standby isn't ready in time it falls back to native loop, which merely restores the old behaviour rather than interrupting or blanking. Also fixed along the way: `pause`/`resume`/`setVolume`/`setFit` previously only knew about scene instances and silently did nothing for DOM video; not reporting a first frame on the DOM path left `mount()`'s promise hanging forever; and without continuous frame marking `instance.stats` always reported "stopped". Liveness deliberately uses rAF rather than requestVideoFrameCallback — the latter exists but never fires in WKWebView (0 callbacks in 1.5s while the video plays normally).
+
+1.3.7 has two items, both on the unmount-then-remount path. First, the library entry's setRenderDpr and restore went fully black after remounting: teardown calls renderer.dispose(), which uses WEBGL_lose_context.loseContext(), and per spec a subsequent getContext("webgl2") on that same canvas returns the very same lost context object (verified: identical reference, isContextLost() true) — only a fresh canvas yields a usable context. The full-page renderer never hit this because its teardown clears the container's innerHTML and the canvas goes with it; the library form has no such container, so the canvas was kept and reused, and a host merely changing the resolution got a black screen with no error at all, since neither method arms a first-frame guard. Now the context's liveness is checked before reuse and a dead canvas is replaced; when the caller passed its own canvas (the library must not swap someone else's DOM) an explicit error is reported instead. Second, scene wallpaper covers: unlike web wallpapers these don't go through a script callback — authors put the reserved WE texture names $mediaThumbnail / $mediaPreviousThumbnail straight into a layer's image / textures slot, so the MediaSnapshot.thumbnail added in 1.3.6 meant nothing to the scene path. A cover change in the snapshot is now decoded asynchronously and uploaded as a GL texture (the previous one shifts to $mediaPreviousThumbnail), sharing the same pixel-upload code as the existing "live system" path.
+
+1.3.6 contains a single change: the missing cover channel in the media snapshot. MediaSnapshot previously carried only hasThumbnail plus the five color fields, with no image data — the event.thumbnail delivered to a web wallpaper's mediaThumbnailChanged was a 64×64 gradient the library painted from primary/secondary, so corpus code like `img.src = e.thumbnail` ran but never showed a real cover. MediaSnapshot and createMediaSource now both take an optional thumbnail (data URL or same-origin URL): when the host supplies it, it is passed through verbatim; when it doesn't, the gradient placeholder is still used. Supplying thumbnail without hasThumbnail implies the latter. The event diff also accounts for thumbnail now — system media interfaces typically deliver the track name first and the artwork a moment later, so watching only hasThumbnail/trackIndex would miss the "same track, cover just arrived" transition. Scene (WebGL) wallpapers can't use it in this version: their scripts read only hasThumbnail and the colors, and the image itself travels through a reserved texture (see 1.3.7).
 
 1.3.5 contains a single change: the xray effect's fallback value. xray's size drives the effect radius (it is inverted internally, so size=1 is identity). When the author doesn't write size into the scene's constantshadervalues, the shader declaration comment's "default":0.2 used to be applied — but that is the slider's initial position when the WE editor creates the effect, not a runtime fallback: as soon as the editor attaches the effect to a layer it writes the current slider value into the scene file, so the official runtime always reads an explicit value. Applying 0.2 shrank the effect radius to a fifth, leaving only a small patch around the cursor. The fallback is now 1. The change is scoped to this one parameter; the comment defaults for multiply and the texture slots are unchanged.
 

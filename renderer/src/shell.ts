@@ -68,8 +68,26 @@ export type Runtime = {
    * 协议与宿主实现指南见 docs/INTEGRATION.md。
    */
   pointerCtl?: {
-    push(p: { u: number; v: number; buttons?: number }): void;
+    push(p: { u: number; v: number; buttons?: number; mods?: number }): void;
     leave(): void;
+    /**
+     * 滚轮注入（含 macOS 触摸板双指滚动与捏合）。**只有网页壁纸实现**——
+     * 场景壁纸没有滚轮语义：WE 脚本沙箱不暴露滚轮 API，本机 194 张场景壁纸
+     * 零消费（所有 `scroll` 命中都是纹理滚动 shader 的 g_ScrollSpeed）。
+     * 场景侧不设此方法，`__wp.pushWheel` 对场景壁纸静默无效，与媒体壁纸同样处理。
+     *
+     * dx/dy 与 DOM 的 deltaX/deltaY 同向同量级；mode 对齐 deltaMode；
+     * mods 是修饰键掩码（bit0 ctrl —— 触摸板捏合就是 ctrl + 滚轮）。
+     * u/v 省略时由网页侧沿用最后已知的指针位置。
+     */
+    wheel?(ev: {
+      dx: number;
+      dy: number;
+      mode?: number;
+      mods?: number;
+      u?: number;
+      v?: number;
+    }): void;
   };
   /** 当前场景的扁平化用户属性值表（mountScene 装配后写入；getProperties 用） */
   liveUserProps?: Record<string, unknown>;

@@ -81,7 +81,7 @@ function defaultEngineTimer(fn, ms) {
  */
 function applyEngineHost(engine, opts) {
   engine.isScreensaver = !!opts.isScreensaver
-  if (typeof opts.isRunningInEditor === 'boolean') engine.isRunningInEditor = opts.isRunningInEditor
+  if (typeof opts.isRunningInEditor === 'boolean') engine.isRunningInEditor = dualFlag(opts.isRunningInEditor)
   if (!engine.setInterval) engine.setInterval = opts.setInterval || defaultEngineTimer
   if (!engine.setTimeout) engine.setTimeout = opts.setTimeout || defaultEngineTimer
   if (!engine.clearTimeout) engine.clearTimeout = opts.clearTimeout || (() => {})
@@ -315,7 +315,10 @@ const WECOLOR = {
     const t = v * (1 - (1 - f) * s)
     const tbl = [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]]
     const rgb = tbl[i % 6]
-    return { x: rgb[0], y: rgb[1], z: rgb[2] }
+    // [we-scene patch] 必须给 Vec3（带方法）而不是裸 {x,y,z}：WE 里 WEColor
+    // 的返回就是向量，作者的 `hsv2rgb(...).multiply(w)` / `.subtract(...)`
+    // 直接链式调用（3163060610 背景.color 的 mixColor 就是 multiply+add 链）。
+    return new Vec3(rgb[0], rgb[1], rgb[2])
   },
   rgb2hsv: (c) => {
     const o = c && typeof c === 'object' ? c : { x: 0, y: 0, z: 0 }
@@ -332,7 +335,7 @@ const WECOLOR = {
       else h = (4 + (r - g) / d) / 6
       if (h < 0) h += 1
     }
-    return { x: h, y: mx === 0 ? 0 : d / mx, z: mx }
+    return new Vec3(h, mx === 0 ? 0 : d / mx, mx)
   },
 }
 
@@ -437,9 +440,86 @@ function scriptToFunctionBody(script) {
     .replace(SANDBOX_PARAM_DECL_RE, '$1')
 }
 
+/**
+ * [we-scene patch] WE 语义：visible 属性脚本返回 **number 时折叠成 bool**
+ *（≠ 0 = 可见）。淡出计时器脚本把同一份 `update(value) → mix(value, 0, …)`
+ * 同时挂在效果 visible 与 alpha 常量上（3233141951 中音条0上/下），
+ * 淡出完成时返回精确 0 —— 作者意图明确是「淡完后隐藏」。
+ * undefined / NaN / 其它形状返回 undefined（宿主保持不变，防止脏值隐藏图层）。
+ */
+export function foldVisibleReturn(ret) {
+  if (typeof ret === 'boolean') return ret
+  if (typeof ret === 'number' && Number.isFinite(ret)) return ret !== 0
+  return undefined
+}
+
+/**
+ * [we-scene patch] registerAudioBuffers 的分辨率入参：正数取 1..64 钳位；
+ * 无效（undefined/NaN/0，如 3163060610 作者脚本的混淆残留
+ * `engine.AUDIO_RESOtime_switchingION_16` = undefined）按 WE 缺省给 64 ——
+ * 钳到 1 会让 `average[4]` 越界成 undefined，smoothValue 积分出 NaN，
+ * 整条音频响应链静默死（封面 strength 常量永远被拒收，停在快照 1）。
+ */
+function audioBufferSize(n) {
+  const raw = Math.floor(Number(n))
+  return Number.isFinite(raw) && raw >= 1 ? Math.min(64, raw) : 64
+}
+
 /** 从 text.scriptproperties 取属性值：容错 {user,value} 包装（离线校验路径未经 parseScene 解引用） */function propValue(v) {
   if (v !== null && typeof v === 'object' && 'value' in v) return v.value
   return v
+}
+
+/**
+ * [we-scene patch] WE 的 engine.isRunningInEditor：官方语料里既有按布尔读的，
+ * 也有按方法调的 —— 3163060610 的「基础脚本」写 `engine.isRunningInEditor()`，
+ * 它 TypeError 后 shared.CAniClass / CAniTaskListClass / eventDispatcher 全部
+ * 装不上，整张壁纸 155 个脚本连锁失败（调度框架从没活过）。
+ * 对偶形态：可当函数调，也可当布尔读（!flag / flag && x / flag === true 都成立）。
+ */
+function dualFlag(v) {
+  const b = !!v
+  return Object.assign(() => b, {
+    valueOf() {
+      return b
+    },
+    toString() {
+      return b ? 'true' : 'false'
+    },
+  })
+}
+
+/**
+ * [we-scene patch] WE 的 scriptProperties 是活代理，永远读用户属性现值：
+ * `{user: 属性名, value: 快照}` 包装定义成活属性（getter 读 userProps[v.user]，
+ * getter 读 userProps[v.user]，缺失或悬空（作者漏发属性，如 3233141951
+ * 时钟的 `_24`，WE 同样吃快照）退回场景快照；setter 存会话级覆写（脚本
+ * 会写回自己声明的滑条，如拖拽脚本 `scriptProperties.weizhix = …`）。
+ *
+ * 此前对象路径只在 eval 时解一次（热更失效）、文字路径根本不解（恒快照）：
+ * 拖拽边界开关 newproperty30 热更后脚本读到旧值。非绑定键仍是普通数据属性。
+ */
+function defineLiveScriptProp(spValues, key, v, userProps) {
+  if (v !== null && typeof v === 'object' && typeof v.user === 'string') {
+    const fallback = propValue(v)
+    let override
+    let hasOverride = false
+    Object.defineProperty(spValues, key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        if (hasOverride) return override
+        const live = userProps ? userProps[v.user] : undefined
+        return live !== undefined ? live : fallback
+      },
+      set(nv) {
+        override = nv
+        hasOverride = true
+      },
+    })
+  } else {
+    spValues[key] = propValue(v)
+  }
 }
 
 /**
@@ -479,7 +559,8 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 捕获的是参数绑定，此后对它的原地增补对脚本可见。
   const spValues = {}
   if (scriptprops && typeof scriptprops === 'object') {
-    for (const [k, v] of Object.entries(scriptprops)) spValues[k] = propValue(v)
+    // 文字路径此前只 unwrap .value（恒快照）：user 绑定键同样走活代理。
+    for (const [k, v] of Object.entries(scriptprops)) defineLiveScriptProp(spValues, k, v, opts.userProperties)
   }
   // builder 目标必须是函数：createScriptProperties() 是调用（apply 返回自身），
   // .addXxx(...) 走 get 陷阱。add* 只补声明默认值，scene 传入的值优先。
@@ -541,7 +622,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     setInterval: opts.setInterval || defaultEngineTimer,
     clearInterval: opts.clearInterval || (() => {}),
     openUserShortcut: opts.openUserShortcut || (() => {}),
-    isRunningInEditor: !!opts.isRunningInEditor,
+    isRunningInEditor: dualFlag(opts.isRunningInEditor),
     isScreensaver: !!opts.isScreensaver,
   }
   applyEngineHost(engine, opts)
@@ -551,7 +632,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 即最新频谱快照。宿主未提供音频时保持全 0（与 WE 无音乐播放时的表现一致）。
   const audioViews = opts.audioViews
   engine.registerAudioBuffers = (n) => {
-    const k = Math.max(1, Math.min(64, Math.floor(Number(n) || 0)))
+    const k = audioBufferSize(n)
     let v = audioViews ? audioViews.get(k) : undefined
     if (!v) {
       v = {
@@ -627,6 +708,8 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       // 歌名/歌手文字层就靠这一条：`export function mediaPropertiesChanged(e){ mediaData = e.title }`
       // 是全库 44 处文字脚本的标准形态。
       MEDIA_CALLBACKS.map((n) => `${n}: typeof ${n} === "function" ? ${n} : null,`).join('') +
+      // [we-scene patch] 官方 AnimationEvent 消费口（同对象路径，见那里的注释）。
+      'animationEvent: typeof animationEvent === "function" ? animationEvent : null,' +
       'dummy_: 0' +
       '};',
     )
@@ -649,7 +732,10 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 只导出 `applyUserProperties(changed){ thisObject.color = shared.accentColor }`，
   // 是属性驱动而非时间驱动。不把它计入判据会在闸门被整个丢弃。
   const hasApplyHook = !!(fns && typeof fns.applyUserProperties === 'function')
-  if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook)) return null
+  // [we-scene patch] 纯 animationEvent 转发脚本同样没有 update（动画事件是唯一
+  // 消费口的官方机制，闸门外丢弃 = 事件到了没人接）。
+  const hasAnimEventHook = !!(fns && typeof fns.animationEvent === 'function')
+  if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook && !hasAnimEventHook)) return null
 
   const sandbox = {
     engine,
@@ -662,11 +748,17 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     // [we-scene patch] 是否挂了媒体回调（宿主据此建广播表）
     hasMediaHook,
     hasApplyHook,
+    // [we-scene patch] 是否导出 animationEvent（宿主按图层级广播派发帧事件）
+    hasAnimEventHook,
     errCount: 0,
     disabled: false,
     init(value) {
-      if (!fns.init) return
-      try { fns.init(value) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'init') }
+      if (!fns.init) return undefined
+      // [we-scene patch] init(value) 的返回值是属性的**新初值**（WE 官方语义：
+      // 淡出脚本 `return oldState ? initValue : 0`、拖拽预设 `return value`）。
+      // 此前返回值被丢弃 —— 静音加载时 alpha 恒快照值、visible 恒 true。
+      try { return fns.init(value) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'init') }
+      return undefined
     },
     applyUserProperties(props) {
       if (!fns.applyUserProperties) return
@@ -741,6 +833,20 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       } catch (e) {
         sandbox.errCount++
         if (opts.onError) opts.onError(e, name)
+        if (sandbox.errCount >= 3) sandbox.disabled = true
+        return undefined
+      }
+    },
+    // [we-scene patch] 官方 AnimationEvent 消费口：value 是当前文本，返回
+    // 字符串成为新文本（undefined = 保持不变，宿主按 update 同构规则写回）。
+    callAnimationEvent(event, value) {
+      if (sandbox.disabled) return undefined
+      if (typeof fns.animationEvent !== 'function') return undefined
+      try {
+        return fns.animationEvent(event, value)
+      } catch (e) {
+        sandbox.errCount++
+        if (opts.onError) opts.onError(e, 'animationEvent')
         if (sandbox.errCount >= 3) sandbox.disabled = true
         return undefined
       }
@@ -1365,7 +1471,17 @@ function makeObjectLayerProxy(layer, opts) {
     getAnimation: (key) => {
       const map = layer && layer.animations
       const list = (layer && layer.animationList) || []
-      if (key === undefined || key === null || key === '') return list[0] || makeNeutralAnimation()
+      // [we-scene patch] 官方 IThisPropertyObject 语义：无参 = **当前属性自己的**
+      // 动画（宿主按挂载点经 opts.getAnimationForProperty 提供）。此前一律给
+      // animationList[0] —— 3163060610 的 21 个常量脚本拿到同层 origin 动画
+      //（frameCount 都对不上），CAniClass 包错对象，折叠/展开交互整体瘫痪。
+      if (key === undefined || key === null || key === '') {
+        if (typeof opts.getAnimationForProperty === 'function') {
+          const own = opts.getAnimationForProperty()
+          if (own) return own
+        }
+        return list[0] || makeNeutralAnimation()
+      }
       if (map && map[key]) return map[key]
       if (typeof key === 'number' && list[key]) return list[key]
       if (typeof key === 'string' && /^\d+$/.test(key) && list[Number(key)]) return list[Number(key)]
@@ -1503,18 +1619,12 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
 
   const spValues = {}
   if (scriptprops && typeof scriptprops === 'object') {
-    for (const [k, v] of Object.entries(scriptprops)) {
-      // [we-scene patch] scriptProperties 的 {user: 属性名, value: 快照} 包装必须解到
-      // **当前用户属性值**（WE 的 scriptProperties 是活属性代理，永远读现值）：
-      // 3078285611 的音频球位置脚本快照是 50/50，用户实际滑到了 1720/105——
-      // 按快照求值会把整组均衡器甩到画面左外。
-      if (v !== null && typeof v === 'object' && typeof v.user === 'string') {
-        const live = opts.userProperties ? opts.userProperties[v.user] : undefined
-        spValues[k] = live !== undefined ? live : propValue(v)
-      } else {
-        spValues[k] = propValue(v)
-      }
-    }
+    // [we-scene patch] scriptProperties 的 {user: 属性名, value: 快照} 包装定义成
+    // **活属性**（WE 的 scriptProperties 是活代理，永远读现值）：
+    // 3078285611 的音频球位置脚本快照是 50/50，用户实际滑到了 1720/105——
+    // 按快照求值会把整组均衡器甩到画面左外。此前只在 eval 时解一次，
+    // 热更后读到的还是旧值（3233141951 拖拽边界 newproperty30）。
+    for (const [k, v] of Object.entries(scriptprops)) defineLiveScriptProp(spValues, k, v, opts.userProperties)
   }
   const builder = new Proxy(() => builder, {
     apply() {
@@ -1550,13 +1660,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     setInterval: opts.setInterval || defaultEngineTimer,
     clearInterval: opts.clearInterval || (() => {}),
     openUserShortcut: opts.openUserShortcut || (() => {}),
-    isRunningInEditor: !!opts.isRunningInEditor,
+    isRunningInEditor: dualFlag(opts.isRunningInEditor),
     isScreensaver: !!opts.isScreensaver,
   }
   applyEngineHost(engine, opts)
   const audioViews = opts.audioViews
   engine.registerAudioBuffers = (n) => {
-    const k = Math.max(1, Math.min(64, Math.floor(Number(n) || 0)))
+    const k = audioBufferSize(n)
     let v = audioViews ? audioViews.get(k) : undefined
     if (!v) {
       v = {
@@ -1620,6 +1730,10 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       // mediaPropertiesChanged，这里是零）。全库 308 处声明里 264 处挂在对象字段与
       // 效果常量上，全部落在这个函数 —— 不收集就等于媒体集成整体不存在。
       MEDIA_CALLBACKS.map((n) => `${n}: typeof ${n} === "function" ? ${n} : null,`).join('') +
+      // [we-scene patch] 官方 AnimationEvent：播放头越过某帧时同层脚本的
+      // animationEvent(event, value) 回调（24 处帧事件全在 3163060610，
+      // 骨骼事件另 4 张；IAnimation 上没有任何注册 API，这是唯一消费口）。
+      'animationEvent: typeof animationEvent === "function" ? animationEvent : null,' +
       'dummy_: 0' +
       '};',
     )
@@ -1661,7 +1775,11 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   // 赋值 `shared = {...}`（打在形参上，本就是空操作）、纯文本属性说明、以及用了不存在
   // 的 `scene.on` API，都不需要逐帧时钟，放它们进来只会白占一个每帧回填位。
   const usesEngineClock = /\bengine\s*\.\s*(runtime|frametime)\b/.test(body)
-  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock)) return null
+  // 同理（第五种）：**纯 animationEvent 转发脚本也没有 update**（3163060610 的
+  // 调度框架：init 里包 CAniClass + 导出 animationEvent 转派给调度器）。
+  // 丢了这个脚本，事件到了也没人接，整张壁纸的折叠/展开状态机停摆。
+  const hasAnimEventHook = !!(fns && typeof fns.animationEvent === 'function')
+  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock && !hasAnimEventHook)) return null
 
   const sandbox = {
     engine,
@@ -1675,8 +1793,10 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     errCount: 0,
     disabled: false,
     init(value) {
-      if (!fns.init) return
-      try { fns.init(asScriptVec3(value)) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'init') }
+      if (!fns.init) return undefined
+      // [we-scene patch] 同对象沙箱：init 返回值是属性新初值，透传给宿主消费。
+      try { return fns.init(asScriptVec3(value)) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'init') }
+      return undefined
     },
     applyUserProperties(props) {
       if (!fns.applyUserProperties) return
@@ -1735,6 +1855,24 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       } catch (e) {
         sandbox.errCount++
         if (opts.onError) opts.onError(e, name)
+        if (sandbox.errCount >= 3) sandbox.disabled = true
+        return undefined
+      }
+    },
+    hasMediaHook,
+    // [we-scene patch] 官方 AnimationEvent 消费口（见工厂表注释）：
+    // 宿主按「图层级广播」派发——该层任一动画出事件，这层所有带 animationEvent
+    // 的沙箱都被叫到，value 是各自属性的当前值，返回值可覆盖属性值
+    //（undefined = 保持不变，与 update 的写回规则同构）。
+    hasAnimEventHook,
+    callAnimationEvent(event, value) {
+      if (sandbox.disabled) return undefined
+      if (typeof fns.animationEvent !== 'function') return undefined
+      try {
+        return fns.animationEvent(event, asScriptVec3(value))
+      } catch (e) {
+        sandbox.errCount++
+        if (opts.onError) opts.onError(e, 'animationEvent')
         if (sandbox.errCount >= 3) sandbox.disabled = true
         return undefined
       }
@@ -1849,4 +1987,4 @@ export function textLayerHasTintMask(layer) {
 // 排版只吃 measure 回调与 Canvas2D。拆开后 Node 侧可只加载排版做布局判据，
 // 未来 WE 脚本兼容性扩展（见 docs/SCRIPT-COMPAT.md）只改沙箱一半。
 import { layoutText, drawTextLayer, effectiveTextPadding } from './text-layout.js'
-export { layoutText, drawTextLayer, effectiveTextPadding }
+export { layoutText, drawTextLayer, effectiveTextPadding, Vec3 }

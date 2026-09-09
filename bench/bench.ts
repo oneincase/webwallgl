@@ -901,6 +901,34 @@ pointerVeilEl.addEventListener("mouseleave", () => {
   wpQuiet()?.pointerLeave();
 });
 
+// 滚轮 / 触摸板注入。遮罩会连原生 wheel 一起吃掉（否则双指滚动会滚动测试台页面
+// 而不是壁纸），这里必须 preventDefault —— 故 listener 用非 passive。
+//
+// 触摸板适配在浏览器里是天然成立的，不必自己识别手势：
+//   - 双指滚动直接就是 WheelEvent（hasPreciseScrollingDeltas，deltaMode=0，
+//     deltaY 是像素级小值）；
+//   - 双指捏合在 Chromium 里被翻译成 **ctrlKey=true 的 wheel**，与给宿主规定的
+//     「magnify → mods bit0」是同一条约定。所以这里把真实事件的 delta / ctrlKey
+//     原样透传，宿主侧照此实现即可（macOS NSEvent 注意 scrollingDeltaY 要取反）。
+//
+// 位置不带：__wp.pushWheel 沿用最后一次 pushPointer 的坐标，而 wheel 前必然有
+// mousemove 经过同一遮罩。宿主也是同一个道理（scrollWheel 前刚轮询过指针位置）。
+pointerVeilEl.addEventListener(
+  "wheel",
+  (ev) => {
+    ev.preventDefault();
+    const wp = wpQuiet();
+    if (!wp) return;
+    let mods = 0;
+    if (ev.ctrlKey) mods |= 1;
+    if (ev.shiftKey) mods |= 2;
+    if (ev.altKey) mods |= 4;
+    if (ev.metaKey) mods |= 8;
+    wp.pushWheel(ev.deltaX, ev.deltaY, ev.deltaMode, mods);
+  },
+  { passive: false },
+);
+
 function applyPointerPush() {
   const on = pointerPushEl.checked;
   pointerVeilEl.hidden = !on;

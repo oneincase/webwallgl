@@ -15,7 +15,8 @@
  *   __wePushMedia(event)  — {op, payload} 见下
  *   __wePushDirectoryFiles(prop, files) / __weRemoveDirectoryFiles(prop, files)
  *   __weRewriteFileUrl(s) — file:/// → 同源相对（HTTP 页）；空 file:/// → ""
- *   __wePushPointer(x, y, buttons) / __wePointerLeave() — 外部指针注入（见文末）
+ *   __wePushPointer(x, y, buttons, mods) / __wePointerLeave() — 外部指针注入（见文末）
+ *   __wePushWheel(x, y, dx, dy, mode, mods) — 外部滚轮注入（含触摸板捏合，见文末）
  */
 (function (w) {
   "use strict";
@@ -841,6 +842,17 @@
   var ptrDownTarget = null; // 按下时的命中元素（click 判定）
   var ptrLastClickTime = 0;
   var ptrLastClickTarget = null;
+  /**
+   * 修饰键掩码：bit0 ctrl / bit1 shift / bit2 alt / bit3 meta。
+   *
+   * 由 __wePushPointer 与 __wePushWheel 的末位参数共同维护（宿主知道当前键盘状态，
+   * 谁后推谁赢）。省略参数时归 0 —— 老宿主不传就等于改动前的全 false，无回归。
+   *
+   * 为什么必须有：触摸板双指捏合在浏览器里就是「ctrlKey 为真的 wheel」，
+   * OrbitControls / pano2vr 都靠 event.ctrlKey 把缩放和滚动分开。掩码写死 false
+   * 时捏合与普通滚动无从区分。
+   */
+  var ptrMods = 0;
   /** 双击判定窗口（ms）。与主流浏览器一致，语料里 5 张听 dblclick。 */
   var PTR_DBLCLICK_MS = 500;
 
@@ -926,10 +938,12 @@
       buttons: o.buttons != null ? o.buttons : ptrButtons,
       movementX: o.movementX || 0,
       movementY: o.movementY || 0,
-      ctrlKey: false,
-      shiftKey: false,
-      altKey: false,
-      metaKey: false,
+      // 修饰键由宿主推送的掩码驱动（见 ptrMods）。曾经硬编码 false，
+      // 于是触摸板捏合（= ctrlKey 的 wheel）无法与普通滚动区分。
+      ctrlKey: (ptrMods & 1) !== 0,
+      shiftKey: (ptrMods & 2) !== 0,
+      altKey: (ptrMods & 4) !== 0,
+      metaKey: (ptrMods & 8) !== 0,
     };
     if ("relatedTarget" in o) init.relatedTarget = o.relatedTarget || null;
     // `button: -1` 无法经 MouseEvent 构造器表达：Chromium 把 -1 规范化成 0
@@ -1039,6 +1053,8 @@
    * @param {number} y 同上，相对上边，Y 朝下
    * @param {number} [buttons] 按键位掩码，bit0 左键。与场景通道同一约定，
    *   当前只消费 bit0（右/中键位保留；桌面右键属于 Finder，不该被壁纸劫持）
+   * @param {number} [mods] 修饰键掩码：bit0 ctrl / bit1 shift / bit2 alt / bit3 meta。
+   *   省略等于 0（改动前的全 false 行为）
    *
    * 接**像素**而不是归一化坐标：网页壁纸的 iframe 在 cover 露底自适配下可能比舞台大
    * 并带居中偏移（见 web.ts installLetterboxFix），换算需要 iframe 的几何 —— 那是父页
@@ -1047,7 +1063,7 @@
    * 暂停期间丢弃：官方暂停语义是「冻结渲染进程」，此时派发事件会让作者的动画状态
    * 在冻结中继续推进，恢复时画面跳一下。
    */
-  w.__wePushPointer = function (x, y, buttons) {
+  w.__wePushPointer = function (x, y, buttons, mods) {
     if (paused) return;
     var nx = Number(x);
     var ny = Number(y);
@@ -1055,6 +1071,7 @@
     // 返回 null、后续 offsetX 全成 NaN，作者的位移积分会一次性污染成 NaN 且不报错。
     if (!isFinite(nx) || !isFinite(ny)) return;
     var mask = Number(buttons) || 0;
+    ptrMods = Number(mods) || 0;
     var moved = !ptrHas || nx !== ptrX || ny !== ptrY;
     var maskChanged = mask !== ptrButtons;
     // 位置与按键都没变就什么都不发：宿主按 ~90Hz 推送，静止时重复派发
@@ -1107,6 +1124,204 @@
     }
     ptrDownTarget = null;
   };
+
+  /**
+   * 外部滚轮注入（宿主捕获 scrollWheel / magnify 手势后推入）。
+   *
+   * @param {number} x 相对 iframe 视口左边的 **CSS 像素**（= clientX 空间）
+   * @param {number} y 同上，相对上边，Y 朝下
+   * @param {number} dx 横向滚动量，正 = 内容向右（与 DOM deltaX 同向）
+   * @param {number} dy 纵向滚动量，正 = 内容向下（与 DOM deltaY 同向，
+   *   与 macOS NSEvent.scrollingDeltaY **反向**，取反由宿主负责）
+   * @param {number} [mode] deltaMode：0 像素 / 1 行 / 2 页。触摸板与 Magic Mouse 恒为 0
+   * @param {number} [mods] 修饰键掩码，bit0 ctrl。**触摸板双指捏合 = ctrl + 滚轮**
+   *
+   * ---- 为什么必须补发旧式 `mousewheel`（语料决定，漏了命中率为 0）----
+   *
+   * 本机 52 张网页壁纸里真正消费滚轮的三处**全都不听现代 `wheel`**：
+   *   - 3406740580 pano2vr（唯一作者设计内的滚轮交互，滚轮改全景 FOV）：
+   *     `addEventListener("mousewheel")` + `("DOMMouseScroll")`，handler 取
+   *     `a.detail ? -1*a.detail : a.wheelDelta/40`；
+   *   - 2179153203 ge1doot：`onmousewheel` 里 `-event.wheelDelta * .25`；
+   *   - 2517518192 GameMaker 运行时：`canvas.onmousewheel` + DOMMouseScroll。
+   * 只听 `wheel` 的是 OrbitControls（1808443523）与 react-lrc（2905017768）。
+   * 所以两路都得发，只发任意一路都有真实壁纸完全无反应。
+   *
+   * ---- 为什么**不**发 `DOMMouseScroll`（否则滚动量翻倍）----
+   *
+   * 上面三处旧式消费方**每一处都同时注册了 `mousewheel` 和 `DOMMouseScroll`**，
+   * 而它们的 handler 是同一个函数。两个都发 = 同一次滚动被处理两遍，pano2vr 的
+   * FOV 一次跳两格，且看起来只是「滚轮太灵敏」，不像 bug。真实浏览器也从不同时发
+   * 这两个（Chromium 只发 wheel + mousewheel）。且全语料没有任何一张只听
+   * DOMMouseScroll —— 它没有独占消费方，发它纯是负收益。
+   *
+   * 暂停期间丢弃，与 __wePushPointer 一致。
+   */
+  w.__wePushWheel = function (x, y, dx, dy, mode, mods) {
+    if (paused) return;
+    // 先转数再判有限，**不要**写 `Number(dx) || 0`：那会把 NaN 静默变成 0，
+    // 于是「非有限值丢弃」这条约定形同虚设（NaN 的 dy 会被当成 0 放过去，
+    // 再与合法的 dx 一起派发出一个半污染的事件）。
+    var ndx = Number(dx);
+    var ndy = Number(dy);
+    // 非有限值丢弃（与指针通道同一约定）：NaN 的 deltaY 会污染作者的缩放累加器，
+    // 之后无论怎么滚都恢复不了，且没有任何报错。
+    if (!isFinite(ndx) || !isFinite(ndy)) return;
+    // 两个方向都是 0 就什么都不发：宿主在惯性滚动尾声会推一串 0，
+    // 空事件会让作者的「有没有在滚」判定一直为真。
+    if (ndx === 0 && ndy === 0) return;
+    var dmode = Number(mode) || 0;
+    ptrMods = Number(mods) || 0;
+
+    // 位置：滚轮事件本身不带位置，用最后已知的指针位置。没收到过指针时取视口中心
+    // 而不是 (0,0) —— OrbitControls 一族按事件坐标定缩放锚点，落在左上角会让画面
+    // 一边缩放一边往角上跑。
+    var px = ptrX;
+    var py = ptrY;
+    if (!ptrHas) {
+      px = ptrViewportW() / 2;
+      py = ptrViewportH() / 2;
+    }
+    var nx = Number(x);
+    var ny = Number(y);
+    if (isFinite(nx) && isFinite(ny)) {
+      px = nx;
+      py = ny;
+      ptrX = nx;
+      ptrY = ny;
+      ptrHas = true;
+    }
+
+    var target = ptrHitTest(px, py);
+    // 命中元素变了要先补边界链：作者可能靠 mouseenter 才开始接滚轮
+    // （与 __wePushPointer 同一理由），且 pano2vr 的 handler 开头就 `this.zc(a.target)`
+    // 校验命中是不是自己的容器。
+    if (target !== ptrTarget) {
+      ptrCrossBoundary(ptrTarget, target, px, py);
+      ptrTarget = target;
+    }
+
+    // (1) 现代 `wheel`。**必须 cancelable**：pano2vr 与 ge1doot 都在 handler 里调
+    // preventDefault()，不可取消时 Chromium 会在控制台刷 Unable to preventDefault
+    // 且作者的 `return false` 分支语义漂移。
+    ptrDispatchWheel(target, px, py, ndx, ndy, dmode);
+
+    // (2) 旧式 `mousewheel`（Chromium 的 legacy alias，与真实浏览器同款组合）。
+    // wheelDelta 与 deltaY **反号**：一格标准滚动在 Chromium 里是 deltaY=+100、
+    // wheelDelta=-120，故系数 1.2。pano2vr 的 `wheelDelta/40` 得 -3 → 缩小，
+    // 与真实浏览器里滚下缩小一致；符号搞反会让所有旧式壁纸的滚轮方向整体反过来。
+    var pxPerUnit = dmode === 1 ? WHEEL_LINE_PX : dmode === 2 ? ptrViewportH() || 800 : 1;
+    var legacyY = -ndy * pxPerUnit * 1.2;
+    var legacyX = -ndx * pxPerUnit * 1.2;
+    var ev = ptrMakeEvent("mousewheel", px, py, { button: -1 });
+    if (ev) {
+      ptrDefine(ev, "wheelDelta", legacyY);
+      ptrDefine(ev, "wheelDeltaY", legacyY);
+      ptrDefine(ev, "wheelDeltaX", legacyX);
+      // detail 恒为 0：旧式 Firefox 那套 `a.detail ? -1*a.detail : a.wheelDelta/40`
+      // 的三元判断里，detail 非 0 会抢在 wheelDelta 之前被采用（且量级完全不同）。
+      ptrDefine(ev, "detail", 0);
+      try {
+        target && target.dispatchEvent && target.dispatchEvent(ev);
+      } catch (_) {
+        /* 作者 handler 抛错不打断（与 ptrDispatch 同一理由） */
+      }
+    }
+  };
+
+  /** 一格「行」滚动折算的像素数，与 Chromium 的 kDefaultLineHeight 量级一致。 */
+  var WHEEL_LINE_PX = 40;
+
+  function ptrViewportW() {
+    try {
+      return Number(w.innerWidth) || Number(w.document.documentElement.clientWidth) || 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function ptrViewportH() {
+    try {
+      return Number(w.innerHeight) || Number(w.document.documentElement.clientHeight) || 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /** 在合成事件上补一个只读字段（构造器不认识的 legacy 字段只能这么给）。 */
+  function ptrDefine(ev, key, value) {
+    try {
+      Object.defineProperty(ev, key, {
+        configurable: true,
+        get: function () {
+          return value;
+        },
+      });
+    } catch (_) {
+      try {
+        ev[key] = value;
+      } catch (__) {
+        /* 只读且不可重定义时放弃该字段 */
+      }
+    }
+  }
+
+  /**
+   * 派发现代 `wheel`。优先真 `WheelEvent`（作者读 deltaMode / deltaZ 时才对）；
+   * 环境没有时退回 MouseEvent 再补字段 —— 事件名照旧，`addEventListener('wheel')`
+   * 仍然收到。
+   */
+  function ptrDispatchWheel(target, x, y, dx, dy, mode) {
+    if (!target || typeof target.dispatchEvent !== "function") return;
+    var init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: w,
+      detail: 0,
+      clientX: x,
+      clientY: y,
+      screenX: x + (Number(w.screenX) || 0),
+      screenY: y + (Number(w.screenY) || 0),
+      // 滚轮不是按键状态变化，button 取 -1 哨兵（与移动类事件同一理由，
+      // 填 0 会让 GameMaker 一族误认为左键按着）
+      button: -1,
+      buttons: ptrButtons,
+      ctrlKey: (ptrMods & 1) !== 0,
+      shiftKey: (ptrMods & 2) !== 0,
+      altKey: (ptrMods & 4) !== 0,
+      metaKey: (ptrMods & 8) !== 0,
+      deltaX: dx,
+      deltaY: dy,
+      deltaZ: 0,
+      deltaMode: mode,
+    };
+    var ev = null;
+    try {
+      if (typeof w.WheelEvent === "function") ev = new w.WheelEvent("wheel", init);
+    } catch (_) {
+      /* 退回 MouseEvent */
+    }
+    if (!ev) {
+      try {
+        if (typeof w.MouseEvent === "function") ev = new w.MouseEvent("wheel", init);
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
+    if (!ev) return;
+    // MouseEvent 退路上 delta* 不会被构造器采纳，必须补；WheelEvent 路径下
+    // 读到的值与 init 相同，条件不成立，补也不会发生。
+    if (ev.deltaX !== dx) ptrDefine(ev, "deltaX", dx);
+    if (ev.deltaY !== dy) ptrDefine(ev, "deltaY", dy);
+    if (ev.deltaMode !== mode) ptrDefine(ev, "deltaMode", mode);
+    if (ev.button !== -1) ptrDefine(ev, "button", -1);
+    try {
+      target.dispatchEvent(ev);
+    } catch (_) {
+      /* 作者 handler 抛错不打断后续旧式事件 */
+    }
+  }
 
   /**
    * 指针离开本窗口（鼠标去了别的显示器）。

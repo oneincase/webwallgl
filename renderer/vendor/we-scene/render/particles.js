@@ -223,6 +223,26 @@ export class ParticleSystem {
     this._applyOverride()
   }
 
+  /**
+   * [we-scene patch] 关键帧动画的逐帧写回：与 _applyOverride（快照应用，重建
+   * pool/编译参数）不同，这条只改对应倍率、不动任何重资源 —— 3233141951 龙烟
+   * alpha 的 900 帧曲线（帧 608-830 掉到 0.01）每帧都要写一次，走
+   * _applyOverride 会把 pool 每帧清空、粒子全灭。全库 4 处 override 动画
+   * 目前都是 alpha；热更 reapplyOverride 的快照值最多维持一帧即被动画覆盖。
+   */
+  setOverrideValue(key, v) {
+    const n = Number(v)
+    if (!Number.isFinite(n)) return
+    if (key === 'alpha') this.opacityMul = n
+    else if (key === 'count') this._ov.countMul = n
+    else if (key === 'size') this._ov.size = n
+    else if (key === 'rate') this._ov.rateMul = n
+    else if (key === 'speed') this._ov.speed = n
+    else if (key === 'lifetime') this.lifetimeMul = n
+    else if (key === 'brightness') this._ov.brightness = n
+    else this._ov[key] = n
+  }
+
   _applyOverride() {
     // 重新应用前清掉上次的倍率，避免旧键残留（热更去掉某个 override 字段时）
     this._ov = {}

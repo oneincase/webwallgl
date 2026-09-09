@@ -41,6 +41,9 @@ export function parseMDL(buf) {
   const LAYOUTS = ver >= 23
     ? [
         { lenOff: 32, stride: 80, uv: 72, bone: 40, weight: 56 },
+        // 新版 Puppet Warp 导出（3797270925）：顶点描述标记为 0x0181000e，
+        // 骨骼槽前多 4B，bone/weights/UV 整体后移；索引长度仍是顶点后的 u32。
+        { lenOff: 32, stride: 84, uv: 76, bone: 44, weight: 60, formatMarker: 0x0181000e },
         // [we-scene patch] 真 3D 网格（3509243656 恒星/天空盒）：MDLV0023 但顶点
         // 48B（pos@0 + nrm/tan + uv@40），没有骨骼权重。必须排在 80B puppet
         // 后面：puppet 的 80 能整除时优先走蒙皮布局。
@@ -57,7 +60,8 @@ export function parseMDL(buf) {
     const off = mat.next + cand.lenOff
     if (off + 4 > buf.byteLength) continue
     const n = dv.getUint32(off, true)
-    if (n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength) {
+    const markerOk = cand.formatMarker === undefined || dv.getUint32(mat.next + 28, true) === cand.formatMarker
+    if (markerOk && n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength) {
       L = cand
       vertexBytes = n
       vbOff = off
@@ -194,7 +198,12 @@ export function parseMDL(buf) {
       bindWorld[i] =
         p >= 0 && p < i ? mat4Mul(bindWorld[p], baseLocal[i]) : Float32Array.from(baseLocal[i])
     }
-    for (let i = 0; i < bones.length; i++) invBindWorld[i] = mat4Invert(bindWorld[i])
+    // invBindWorld 用 **f64** 保存：mat4Invert 的高斯消元本来就在 f64 里做，
+    // 存成 Float32Array 会给「World(anim)·invBind」的恒等乘积再添一份舍入源。
+    // f64 保存后，t=0 恒等性的剩余误差只来自 TRS 分解→重建的往返（~1 ulp/级，
+    // 沿骨链累积）与写出 _skin 的一次 f32 舍入 —— mat4Mul 内部是 f64 算术，
+    // 消费端（mdl-skin / bindWorldOf）对元素类型无感。
+    for (let i = 0; i < bones.length; i++) invBindWorld[i] = Float64Array.from(mat4Invert(bindWorld[i]))
 
     if (restLocal) {
       const restWorld = []
@@ -295,6 +304,78 @@ function parseSkeleton(buf, dv) {
 }
 
 // MDLA0006：魔数(8) + u8 + u32 endPos + u32 animCount，逐动画（末尾 35B 填充）
+//
+// [we-scene patch] 动画尾部可以是**帧事件表**（2477602742/3396722575/3351179520/
+// 3405117965 实测）：轨道数据之后是 `[u32 eventCount][u32 pad][JSON cstr\0 × N]`，
+// JSON 形态 `{"frame":0,"name":"flashStart"}`（$$hashKey 是编辑器残留，忽略）；
+// 记录间可有少量非 '{' 填充。有事件时**没有** 35B 尾部填充——固定 `o += 35` 会把
+// 下一条动画头整个错位丢掉（2477602742 animCount=2，"Animation 2" 曾因此消失）。
+// 做法：锚扫下一条动画头（id + unk=0 + 可打印 name/mode + 合法 fps/frameCount/
+// trackCount 五重校验），事件区即轨道尾到锚点之间；无事件时锚点就在 35B 填充之后，
+// 与旧行为逐位一致。
+
+/** 在 [from, limit) 内锚扫下一条动画头，找不到返回 -1。 */
+function findNextAnimHeader(dv, from, limit) {
+  const last = Math.min(dv.byteLength - 24, limit)
+  for (let p = from; p < last; p++) {
+    // [u32 id][u32 unk=0][name cstr 1..64][mode cstr 1..16][fps (0,240]][frameCount 1..100000][trackCount 1..1024]
+    if (dv.getUint32(p + 4, true) !== 0) continue
+    const nameR = readCStr(dv, p + 8)
+    if (!nameR.value || nameR.value.length > 64) continue
+    const modeR = readCStr(dv, nameR.next)
+    if (!modeR.value || modeR.value.length > 16) continue
+    const fps = dv.getFloat32(modeR.next, true)
+    if (!(fps > 0 && fps <= 240)) continue
+    const frameCount = dv.getUint32(modeR.next + 4, true)
+    if (frameCount <= 0 || frameCount > 100000) continue
+    const trackCount = dv.getUint32(modeR.next + 12, true)
+    if (trackCount <= 0 || trackCount > 1024) continue
+    return p
+  }
+  return -1
+}
+
+/** 解析轨道尾之后的事件 JSON（cstr，逐条 JSON.parse 验证 {frame,name} 形态）。 */
+function parseAnimEvents(dv, from, limit) {
+  const events = []
+  // 事件表必在轨道尾后 ~64B 内（三个语料样本：12~40B），窗口内没有 '{' 就是无事件。
+  // 关键：无事件时**位置必须留在轨道尾**——盲扫会把下一条动画头（甚至其后几千
+  // 字节）一起吃掉，3233141951 龙_puppet 的 Animation 2 就是这样丢的。
+  const firstEnd = Math.min(dv.byteLength, limit, from + 64)
+  let p = from
+  let hop = 0
+  while (p < firstEnd && dv.getUint8(p) !== 0x7b && hop++ < 64) p++
+  if (p >= firstEnd || dv.getUint8(p) !== 0x7b) return { events, next: from }
+  // 找到首个 '{' 后放宽窗口解析记录链
+  const scanEnd = Math.min(dv.byteLength, limit, from + 8192)
+  for (let guard = 0; guard < 64 && p < scanEnd && dv.getUint8(p) === 0x7b; guard++) {
+    const r = readCStr(dv, p)
+    let ev = null
+    try {
+      ev = JSON.parse(r.value)
+    } catch {
+      ev = null
+    }
+    if (!ev || typeof ev !== 'object' || !Number.isFinite(Number(ev.frame)) || typeof ev.name !== 'string') break
+    events.push({ frame: Number(ev.frame), name: ev.name })
+    p = r.next
+    // 记录间可有少量非 '{' 填充（2477602742 的 rec1/rec2 之间有 4 字节）——
+    // 只有窗口内真看到下一个 '{' 才继续，防止误吞下一条动画头。
+    let q = p
+    let pad = 0
+    while (q < scanEnd && dv.getUint8(q) !== 0x7b && pad < 8) {
+      q++
+      pad++
+    }
+    if (pad < 8 && q < scanEnd && dv.getUint8(q) === 0x7b) {
+      p = q
+      continue
+    }
+    break
+  }
+  return { events, next: p }
+}
+
 function parseAnimations(buf, dv, boneCount) {
   const a = findAscii(buf, 'MDLA')
   if (a < 0) return []
@@ -338,7 +419,9 @@ function parseAnimations(buf, dv, boneCount) {
       o += trackBytes
       tracks.push({ frameCount: n, keyframes: kf })
     }
-    o += 35 // 动画条目末尾填充
+    // [we-scene patch] 尾部事件表 + 锚扫下一条动画头（替代固定 o+=35，见文件头注释）
+    const limit = endPos > 0 && endPos <= dv.byteLength ? endPos : dv.byteLength
+    const ev = parseAnimEvents(dv, o, limit)
     if (tracks.length > 0 && frameCount > 0 && fps > 0) {
       anims.push({
         id,
@@ -348,9 +431,13 @@ function parseAnimations(buf, dv, boneCount) {
         frameCount,
         duration: frameCount / fps,
         tracks,
+        events: ev.events,
       })
     }
-    if (o >= endPos) break
+    // 下一条动画头：从事件末锚扫（无事件时事件末=轨道尾，锚点就在 35B 填充之后）
+    const next = findNextAnimHeader(dv, ev.next, limit)
+    if (next < 0) break
+    o = next
   }
   void boneCount
   return anims

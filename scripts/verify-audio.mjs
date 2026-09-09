@@ -90,6 +90,28 @@ const { check, errors } = createChecker();
   const s2 = createSimulatedAudio(2).update(11.2);
   check(Math.abs(mean(s2.left64) - mean(s2.left32)) < 1e-6, "64→32 降采样均值漂移");
   check(Math.abs(mean(s2.left64) - mean(s2.left16)) < 1e-6, "64→16 降采样均值漂移");
+
+  // [we-scene patch] 负时间必须全部有限：首帧 rAF 时间戳可以早于挂载时刻的
+  // performance.now()（vsync 对齐），t=(now-start)/1000 ≈ -0.005。
+  // `Math.floor(step) % 16` 得 -1 → patterns[i16<0] = undefined → 64 频段全 NaN
+  // 灌进共享音频视图；3233141951 反光层的缩放脚本把 NaN 积分进 smoothValue
+  // （作者脚本无自愈），整层永久塌成 scale=[0,0,1] 隐形。
+  {
+    const simNeg = createSimulatedAudio(3);
+    for (const t of [-2, -1.2, -0.5, -0.05, -0.02, -0.005, -0.001, -1 / 60000]) {
+      const s = simNeg.update(t);
+      for (const arr of [s.left64, s.right64, s.left32, s.right32, s.left16, s.right16, s.preL64, s.preR64]) {
+        for (const v of arr) check(Number.isFinite(v), `负时间 t=${t}: 频谱出现非有限值 ${v}`);
+      }
+      check(Number.isFinite(s.level), `负时间 t=${t}: level 非有限`);
+    }
+    // 接线断言：帧循环的场景时间必须钳非负（负 t 对一切下游无意义）
+    const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    check(
+      /const t = Math\.max\(0, \(now - start - pauseAccum\) \/ 1000\)/.test(mountSrc),
+      "帧循环的场景时间必须钳非负（首帧 rAF 时间戳可早于挂载时刻）",
+    );
+  }
 }
 
 // ---------- 2. audioResponse：与 pulse.vert CreateAudioResponse 逐公式对照 ----------

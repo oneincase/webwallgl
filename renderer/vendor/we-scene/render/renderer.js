@@ -13,9 +13,12 @@ import { hlsl2glsl } from './hlsl2glsl.js'
 //   renderer.js       本文件：createRenderer（GL 上下文、缓存、装配与三级绘制循环）
 // ALIGN / makeTexture / makeTextureMip 仍从本文件 re-export（verify-pointer、
 // main.ts 等既有 import 方不变）。
-import { COLOR_BLEND_GL, BLEND_PREP, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip } from './gl-util.js'
-import { createAnimation } from './animation.js'
+import { createAnimation, linkAnimations } from './animation.js'
+// applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
+// shader 侧混合的模式下做参考（effects.js 零 import，不构成环）。
+import { applyBlending } from './effects.js'
 
 /**
  * [we-scene patch] puppet 骨骼动画能把网格推出层矩形多远（视锥裁剪的额外余量，[x, y] 像素）。
@@ -110,11 +113,41 @@ export function colorBlendPlan(colorBlendMode) {
 }
 
 /**
+ * [we-scene patch] 这个 colorBlendMode 是否必须走 shader 侧混合（回读背景）。
+ *
+ * COLOR_BLEND_GL 只收录能用固定管线 blendFunc 表达的 5 个编号（2/6/7/9/31）。
+ * 其余非 0 编号此前一律回退 translucent —— 即「按不透明色盖上去」，对
+ * ColorBurn / Overlay / SoftLight / HSL 系这些 dst 的非线性函数完全不成立。
+ *
+ * 实测后果（3287715210「发光少女」，用户报「壁纸不显示人物」）：作者在人物层
+ * **之上**放了一张 7200x4800 的渐变图，colorBlendMode=3（ColorBurn）。该图是
+ * JPEG——没有 alpha 通道，解码后 alpha 恒 1——所以 translucent 回退把它当成
+ * 一张完全不透明的幕布，人物 100% 被盖住。作者预览图里人物清晰可见，渐变只是
+ * 一层染色。
+ *
+ * mode 0（Normal）与缺省不在此列：它们的语义本就是 translucent 的 mix，
+ * 固定管线精确表达，走回读只是白烧一次画布拷贝。
+ *
+ * 影响面（本地库 246 张全扫）：16 个编号 / 65 层 / 约 30 张壁纸此前静默走错。
+ * 单独导出而非内联，是为了让离线判据能直接调用做数值回归。
+ */
+export function needsShaderBlend(colorBlendMode) {
+  const m = Number(colorBlendMode)
+  if (!Number.isFinite(m) || m === 0) return false
+  return !COLOR_BLEND_GL[m]
+}
+
+/**
  * [we-scene patch] colorBlendPlan 的 CPU 参考实现：给定 dst/src/op 算出合成结果。
  * 与 GPU 路径**同源**（同一张 COLOR_BLEND_GL / BLEND_PREP 表 + 同样的因子），
  * 供 verify-groups 逐模式核对代数恒等式。改了 GPU 侧却没同步这里，测试会立刻炸。
  */
 export function applyColorBlendCPU(colorBlendMode, dst, src, op) {
+  // shader 侧混合的模式：CPU 参考就是 applyBlending 本体（effects.js 那份逐字实现），
+  // 不能套固定管线那套因子推导 —— 两条路径的代数完全不同。
+  if (needsShaderBlend(colorBlendMode)) {
+    return applyBlending(colorBlendMode, [dst, dst, dst], [src, src, src], op)[0]
+  }
   const { mode, prep } = colorBlendPlan(colorBlendMode)
   // shader 侧的 u_BlendPrep
   let s = src
@@ -255,6 +288,15 @@ export function createRenderer(canvas, opts = {}) {
     videoCanvas.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0'
   }
   let videoCanvasReported = false
+  // [we-scene patch] 上次上报的视频纹理上传尺寸（"WxH"）。上限随渲染目标变化，
+  // 变了就重报一次，便于确认清晰度设置是否真的生效。
+  let videoTexReportedSize = ''
+  // [we-scene patch] 视频纹理上传的尺寸兜底上限（见 renderLayer 的视频纹理分支）。
+  // HARD_CAP：即使硬件 MAX_TEXTURE_SIZE 和渲染目标都更大，也不超过这个值 ——
+  //   4K 逐帧 texImage2D 在部分驱动上会掉帧，3840 是"够用且还扛得住"的档。
+  // MIN_CAP：渲染目标尺寸在首帧前可能是 0/1，别据此把纹理压成一条线。
+  const VIDEO_TEX_HARD_CAP = 3840
+  const VIDEO_TEX_MIN_CAP = 1024
   // FBO 分辨率限幅系数：0 = 关闭（全质量）；>0 时效果链 FBO 上限 = 屏幕占比 × 系数
   let fboCapFactor = opts.fboCapFactor === undefined ? 0 : opts.fboCapFactor
   // [we-scene patch] 粒子每帧推进（由宿主注入，见 setParticleRenderer）
@@ -291,6 +333,12 @@ export function createRenderer(canvas, opts = {}) {
   let constScriptSink = null
   const constScriptCache = new Map()
   const constAnimCache = new Map()
+  // 联动组接线是一次性的（悬空 parent 的诊断不能每帧重报）
+  const constAnimLinkedCache = new Set()
+  // [we-scene patch] 常量动画的帧事件共享队列：常量动画在 render 内（bindConstants
+  // 里）推进，事件由此推入，宿主帧循环在 render 后统一做图层级广播
+  //（官方 AnimationEvent：同层全部脚本的 animationEvent(event, value)）。
+  let constAnimEventQueue = null
   const constScriptDiag = { total: 0, ok: 0, failed: 0 }
   function setConstantScriptRuntime(evalFn, opts) {
     evalObjectScriptFn = typeof evalFn === 'function' ? evalFn : null
@@ -300,8 +348,10 @@ export function createRenderer(canvas, opts = {}) {
     scriptInputView = (opts && opts.inputView) || null
     scriptTimers = (opts && opts.timers) || null
     constScriptSink = (opts && typeof opts.onSandbox === 'function') ? opts.onSandbox : null
+    constAnimEventQueue = (opts && Array.isArray(opts.animEventQueue)) ? opts.animEventQueue : null
     constScriptCache.clear()
     constAnimCache.clear()
+    constAnimLinkedCache.clear()
   }
   // [we-scene patch] 容器效果画布的首帧诊断开关
   let containerDiagDone = false
@@ -309,6 +359,9 @@ export function createRenderer(canvas, opts = {}) {
   const copyProg = linkProgram(gl, COPY_VERT, COPY_FRAG)
   const compProg = linkProgram(gl, COPY_VERT, COMPOSITE_FRAG)
   const backdropProg = linkProgram(gl, COPY_VERT, BACKDROP_FRAG)
+  // [we-scene patch] 固定管线表达不了的 colorBlendMode（ColorBurn/Overlay/HSL 系…）
+  // 走这条：回读背景当纹理，在 shader 里用 ApplyBlending 算完直接写。见 shaderBlendMode。
+  const compBlendProg = linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG)
 
   const vao = gl.createVertexArray()
   gl.bindVertexArray(vao)
@@ -792,6 +845,14 @@ export function createRenderer(canvas, opts = {}) {
   //
   // 复用 text.js 的 evalObjectScript（同族语义：update(value) 返回新值，
   // vec3 字段传可变 {x,y,z}），沙箱、熔断、scriptProperties 全部沿用。
+  // [we-scene patch] 常量脚本的反馈链只收与字段形状一致的值：标量键要有限数字、
+  // 向量键要带有限 x/y 的对象（Vec2 允许、z 可缺）。脏值保留上一态 ——
+  // 把 NaN 喂回下一帧会让输出永久 NaN。
+  function constShapeOk(val, isScalar) {
+    if (isScalar) return typeof val === 'number' && Number.isFinite(val)
+    return !!val && typeof val === 'object' && Number.isFinite(Number(val.x)) && Number.isFinite(Number(val.y))
+  }
+
   function scriptedConstants(constants, cacheKey, time, layer) {
     if (!constants) return constants
     let hasScript = false
@@ -828,6 +889,14 @@ export function createRenderer(canvas, opts = {}) {
             clearTimeout: scriptTimers ? scriptTimers.clearTimeout : undefined,
             setInterval: scriptTimers ? scriptTimers.setInterval : undefined,
             clearInterval: scriptTimers ? scriptTimers.clearInterval : undefined,
+            // [we-scene patch] 官方语义：无参 getAnimation() = **本常量自己的**
+            // 动画（constAnimCache 里那份）。此前 thisObject 是图层代理，拿到的是
+            // 同层对象字段动画或中性对象 —— 3163060610 的 21 个常量 leader 全部
+            // 够不到（CAniClass 包错对象，折叠/展开交互不可能工作）。
+            getAnimationForProperty: () => {
+              const rec = constAnimCache.get(cacheKey + '|anim|' + key)
+              return rec ? rec.ctrl : null
+            },
           })
         } catch { sb = null }
         if (sb) constScriptDiag.ok++
@@ -842,7 +911,10 @@ export function createRenderer(canvas, opts = {}) {
           const base0 = parseVecValue(rawVal)
           const scalar = typeof rawVal === 'number'
           const initArg = scalar ? base0[0] : { x: base0[0], y: base0[1], z: base0[2] }
-          if (sb.init) sb.init(initArg)
+          // [we-scene patch] init 返回值 = 常量新初值（WE 语义），同时是逐帧
+          // 反馈的起点：淡出脚本静音加载时 `return 0`，应从 0 开始而不是快照 1。
+          const ir = sb.init(initArg)
+          sb.__lastConstValue = constShapeOk(ir, scalar) ? ir : initArg
         }
         // [we-scene patch] WE 语义：applyUserProperties 在**加载时也要调一次**（初值
         // 应用），之后才在属性变化时再调。纯属性驱动的常量脚本（2847470774 的
@@ -852,9 +924,11 @@ export function createRenderer(canvas, opts = {}) {
         if (sb && typeof sb.applyUserProperties === 'function') {
           try { sb.applyUserProperties(userProps || {}) } catch { /* 初值应用失败不拖垮渲染 */ }
         }
-        // 带媒体钩子的新沙箱反向登记给宿主（惰性创建，宿主扫不到）
-        if (sb && sb.hasMediaHook && constScriptSink) {
-          try { constScriptSink(sb) } catch { /* 登记失败不该拖垮渲染 */ }
+        // 带媒体钩子或 animationEvent 钩子的新沙箱反向登记给宿主（惰性创建，宿主扫不到）。
+        // animationEvent 登记要带上图层与常量名：官方语义是**图层级广播**，
+        // 宿主要按图层找到这层全部带钩子的沙箱。
+        if (sb && (sb.hasMediaHook || sb.hasAnimEventHook) && constScriptSink) {
+          try { constScriptSink(sb, { layer, key }) } catch { /* 登记失败不该拖垮渲染 */ }
         }
       }
       // 没有 update 的沙箱不参与逐帧求值，但**不能在这里丢弃**——
@@ -880,13 +954,24 @@ export function createRenderer(canvas, opts = {}) {
           sb.engine.screenResolution = { x: ptr.screenW, y: ptr.screenH }
         }
       }
-      const base = parseVecValue(v.value !== undefined ? v.value : v)
       const isScalar = typeof (v.value !== undefined ? v.value : v) === 'number'
-      const arg = isScalar ? base[0] : { x: base[0], y: base[1], z: base[2] }
+      // [we-scene patch] WE 语义：update(value) 收到的是属性**当前值** = 脚本
+      // 上一帧的返回值（首轮是 init 返回值）。此前每帧都用 scene.json 快照重建
+      // 入参，`value = WEMath.mix(value, 0, engine.frametime / fadeOutDur)` 这类
+      // 递推每帧都被拉回快照 —— 淡出在数学上不可能完成（3233141951 中音条
+      // alpha 恒 ≈0.97）。对象入参保持同一身份（分量原地更新），init 里捕获
+      // 引用的写法（3264246690 音频缩放模板）不受影响。
+      if (!constShapeOk(sb.__lastConstValue, isScalar)) {
+        const base = parseVecValue(v.value !== undefined ? v.value : v)
+        sb.__lastConstValue = isScalar ? base[0] : { x: base[0], y: base[1], z: base[2] }
+      }
+      const arg = sb.__lastConstValue
       let ret
       try { ret = sb.callUpdate(arg) } catch { ret = undefined }
       // WE 语义：脚本可以「原地改写传入对象」或「返回新值」，两种都要支持。
       const src = ret !== undefined && ret !== null ? ret : arg
+      // 本帧输出回流为下帧输入（形状合法才收，防 NaN 入反馈环）。
+      if (constShapeOk(src, isScalar)) sb.__lastConstValue = src
       if (typeof src === 'number' && Number.isFinite(src)) out[key] = src
       else if (src && typeof src === 'object') {
         const x = Number(src.x), y = Number(src.y)
@@ -905,7 +990,7 @@ export function createRenderer(canvas, opts = {}) {
   // 带 animation 的常量永远停在 scene.json 快照。3233141951「剑音条01」opacity
   // 快照是 0、真正淡入在第 18 帧；不采样这条轨 ⇒ 武士刀音频条永远透明。
   // 全库 55 处效果常量动画（verify-animation 按 animation 键遍历已覆盖求值核）。
-  function animatedConstants(constants, cacheKey, time) {
+  function animatedConstants(constants, cacheKey, time, layer) {
     if (!constants) return constants
     let hasAnim = false
     for (const v of Object.values(constants)) {
@@ -913,6 +998,10 @@ export function createRenderer(canvas, opts = {}) {
     }
     if (!hasAnim) return constants
     const out = { ...constants }
+    // [we-scene patch] 先建齐本映射内全部控制器，再按 key 接一次联动组
+    //（children 不自播、播放头从属于 leader——3163060610 的折叠/展开全靠它，
+    // 此前 children 加载即自播完）。
+    const siblings = new Map()
     for (const [key, v] of Object.entries(constants)) {
       if (!v || typeof v !== 'object' || !v.animation || !v.animation.options) continue
       const sk = cacheKey + '|anim|' + key
@@ -921,12 +1010,35 @@ export function createRenderer(canvas, opts = {}) {
         const ctrl = createAnimation(v.animation)
         const raw = v.value !== undefined ? v.value : 0
         ctrl.baseNumeric = Array.isArray(raw) ? raw.slice() : raw
-        rec = { ctrl }
+        rec = { ctrl, prevTime: time }
         constAnimCache.set(sk, rec)
       }
-      // 用场景时间钉播放头：层被裁/晚出现时不会落后一整段 intro。
-      // startpaused 的控制器 playing=false，保持装配时的 frame 0。
-      if (rec.ctrl.playing) rec.ctrl.setFrame(time * rec.ctrl.fps * rec.ctrl.rate)
+      siblings.set(key, rec.ctrl)
+    }
+    if (!constAnimLinkedCache.has(cacheKey)) {
+      constAnimLinkedCache.add(cacheKey)
+      linkAnimations(siblings, (msg) => diag(`${cacheKey}: ${msg}`))
+    }
+    for (const [key, v] of Object.entries(constants)) {
+      if (!v || typeof v !== 'object' || !v.animation || !v.animation.options) continue
+      const sk = cacheKey + '|anim|' + key
+      const rec = constAnimCache.get(sk)
+      // [we-scene patch] advance 语义取代场景时间钉：autoplay（rate=1）时两者
+      // 等价，且层被裁/晚出现时 prevTime 追平照样补上一整段 intro；但脚本驱动
+      //（play/rate/setFrame——3163060610 的 CAniClass 全这么干）时钉时间会每帧
+      // 把播放头拉回场景时钟，脚本播放永远跑不起来。
+      // startpaused 停帧 0（playing=false 不推进），与钉时间行为一致。
+      const dt = time - rec.prevTime
+      rec.prevTime = time
+      if (rec.ctrl.playing) rec.ctrl.advance(Math.max(0, dt))
+      // [we-scene patch] 帧事件入共享队列，宿主帧循环 render 后图层级广播
+      //（事件在 render 内产生，当帧派发）。
+      if (constAnimEventQueue) {
+        const evs = rec.ctrl.takeEvents()
+        if (evs.length) constAnimEventQueue.push({ layer, events: evs })
+      } else {
+        rec.ctrl.takeEvents() // 无队列也要清，防积压
+      }
       out[key] = rec.ctrl.applyTo(rec.ctrl.baseNumeric)
     }
     return out
@@ -1011,6 +1123,14 @@ export function createRenderer(canvas, opts = {}) {
   const backdropUni = {
     mvp: gl.getUniformLocation(backdropProg, 'u_MVP'),
     tex: gl.getUniformLocation(backdropProg, 'u_Tex'),
+  }
+  const compBlendUni = {
+    mvp: gl.getUniformLocation(compBlendProg, 'u_MVP'),
+    tex: gl.getUniformLocation(compBlendProg, 'u_Tex'),
+    backdrop: gl.getUniformLocation(compBlendProg, 'u_Backdrop'),
+    blendMode: gl.getUniformLocation(compBlendProg, 'u_BlendMode'),
+    canvasSize: gl.getUniformLocation(compBlendProg, 'u_CanvasSize'),
+    opacity: gl.getUniformLocation(compBlendProg, 'u_Opacity'),
   }
   const IDENT_M4 = mat4Identity()
   const IDENT_M3 = mat3Identity()
@@ -1255,6 +1375,47 @@ export function createRenderer(canvas, opts = {}) {
       m = mat4Scale(m, base.w, base.h, 1)
     }
     const mvp = mat4Multiply(viewProj, m)
+    // [we-scene patch] 固定管线表达不了的 colorBlendMode 改走 shader 侧混合：
+    // 回读画布当 dst，用 ApplyBlending 算完直接写（见 needsShaderBlend 的归属证据）。
+    //
+    // 三个前置条件缺一不可：
+    //  - `!premultiplied`：容器画布（音频条 / audio_ring）有自己一套 alpha 约定，
+    //    见下方 [A]/[B] 分流，套 ApplyBlending 会把那两类都打错；
+    //  - `!groupTarget`：组渲染时目标是组 FBO，而回读拿到的是**画布**——
+    //    用画布当 dst 等于把组外的像素混进组内，位置和内容都不对。组自身合成到
+    //    画布那一趟仍会正常走到这里（那时 groupTarget 已复位）；
+    //  - `needsShaderBlend`：Normal 与 5 个固定管线模式继续走原路，不白烧一次拷贝。
+    const useShaderBlend =
+      !premultiplied && !groupTarget && needsShaderBlend(layer.colorBlendMode)
+    if (useShaderBlend) {
+      const backdrop = captureBackdrop(width, height)
+      gl.useProgram(compBlendProg)
+      // 结果由 shader 直接算出，GL 混合必须关掉（再叠一次等于混两遍）
+      gl.disable(gl.BLEND)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, width, height)
+      gl.bindVertexArray(vao)
+      uploadQuad('local', LOCAL_QUAD)
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, inputTex)
+      gl.uniform1i(compBlendUni.tex, 0)
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, backdrop)
+      gl.uniform1i(compBlendUni.backdrop, 1)
+      gl.uniform1i(compBlendUni.blendMode, Number(layer.colorBlendMode) | 0)
+      gl.uniform2f(compBlendUni.canvasSize, width, height)
+      // 层 alpha 是 WE 混合的 opacity。inputTex 是原始贴图（solid 层是 1×1 白），
+      // 不透传这里会把 alpha=0 的层按全不透明参与 ColorBurn/Overlay 等混合，
+      // 3793592591 的白色 Katı 层因此把整屏冲成纯白。
+      gl.uniform1f(compBlendUni.opacity, color4[3])
+      gl.uniformMatrix4fv(compBlendUni.mvp, false, mvp)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
+      // 纹理单元 1 用完解绑：后续 pass 按单元号取样，留着会串图
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, null)
+      gl.activeTexture(gl.TEXTURE0)
+      return
+    }
     const uni = prog === compProg ? compUni : copyUni
     gl.useProgram(prog)
     // [we-scene patch] 容器效果画布（空容器 + 音频可视化等）的合成方式。
@@ -1357,7 +1518,6 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // 直接绘制到画布。组渲染时改写进组 FBO（见 groupTarget）。
-  //
   // [we-scene patch] overrideTex：puppet 层跑完效果链后，网格要采样**效果链输出**
   // 而不是原始贴图（见 renderLayer 里「puppet 的效果链在贴图空间」那段注释）。
   function drawPuppetDirect(layer, cam, viewProj, width, height, time, overrideTex) {
@@ -1368,8 +1528,27 @@ export function createRenderer(canvas, opts = {}) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
       gl.viewport(0, 0, width, height)
     }
+    // [we-scene patch] 链尾 FBO 每帧重建 mip：效果链 FBO 本是 LINEAR 无 mip 的，
+    // 而 puppet 贴图在画布上通常被大幅缩小（3264246690 人物贴图 3658×2000 →
+    // 屏上 ~840px ≈ 4.4×），无 mip 采样会让细线艺术以满幅对比度显示并带
+    // 反锯齿刻线。MIN_FILTER 必须**每帧**在 generateMipmap 之前重设：结尾会把
+    // 池化 FBO 还原成 LINEAR（防其他层吃到过期 mip），如果只在首帧设一次
+    // trilinear，第 2 帧起就是「生成了 mip 但采样器不用」。
+    if (overrideTex) {
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, overrideTex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+      gl.generateMipmap(gl.TEXTURE_2D)
+    }
     const mvp = mat4Multiply(viewProj, puppetModelMatrix(layer, cam))
     puppetDrawFn(layer, mvp, { time, overrideTex: overrideTex || null })
+    // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
+    // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——
+    // 它们的 mip 是过期的，缩小采样会读出残影。画完立刻还原 LINEAR。
+    if (overrideTex) {
+      gl.bindTexture(gl.TEXTURE_2D, overrideTex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    }
     currentQuadKey = null // MDL 渲染器换过 VAO/buffer，失效 quad 缓存
   }
 
@@ -2035,10 +2214,23 @@ export function createRenderer(canvas, opts = {}) {
           // [we-scene patch] 用离屏 canvas 中转视频帧（video 直传 WebGL 在 WKWebView 可能失败）
           let vw = v.videoWidth || texObj.width
           let vh = v.videoHeight || texObj.height
-          // 纹理尺寸上限：超过则等比缩放（避免 texImage2D 失败 / 每帧 4K 上传开销大）
-          const MAX_DIM = 2048
-          const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE)
-          const limit = maxTex > 0 && maxTex < 4096 ? Math.min(MAX_DIM, maxTex) : MAX_DIM
+          // [we-scene patch] 纹理尺寸上限。三个约束取最小：
+          //   1) 硬件 MAX_TEXTURE_SIZE —— 超了 texImage2D 直接失败；
+          //   2) 当前渲染目标长边 —— 上传比渲染目标更大的纹理是纯浪费，多出的
+          //      像素在采样阶段就被丢掉，只白付每帧上传带宽；
+          //   3) VIDEO_TEX_HARD_CAP —— 兜底，防某些驱动报了巨大的 MAX_TEXTURE_SIZE
+          //      却在 4K 逐帧上传时掉帧。
+          //
+          // **不再**用固定 2048：那个值比典型渲染目标还小（Retina 上常见 3024
+          // 甚至 3840），4K 源被降到 2048 再放大，观感明显发糊 —— 实测日志
+          // `video tex ready 2048x1152 (src 3840x2160)` 就是这个损失。
+          const targetMax = Math.max(width || 0, height || 0)
+          const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0
+          let limit = VIDEO_TEX_HARD_CAP
+          if (maxTex > 0) limit = Math.min(limit, maxTex)
+          if (targetMax > 0) limit = Math.min(limit, targetMax)
+          // 渲染目标异常小（首帧前 width/height 可能是 0/1）时别把纹理压成一条线
+          limit = Math.max(limit, VIDEO_TEX_MIN_CAP)
           let scale = 1
           if (Math.max(vw, vh) > limit) scale = limit / Math.max(vw, vh)
           const uw = Math.max(1, Math.round(vw * scale))
@@ -2069,9 +2261,12 @@ export function createRenderer(canvas, opts = {}) {
           texObj.width = uw
           texObj.height = uh
           texObj.lastUploaded = v.currentTime
-          if (!videoCanvasReported) {
+          // [we-scene patch] 上传尺寸变化时重报（limit 现在跟随渲染目标，改清晰度/
+          // 改窗口都会变）。只报一次会让诊断停留在首帧那个值，排错时误导。
+          if (videoTexReportedSize !== uw + 'x' + uh) {
+            videoTexReportedSize = uw + 'x' + uh
             videoCanvasReported = true
-            diag('video tex ready ' + uw + 'x' + uh + ' (src ' + vw + 'x' + vh + ')')
+            diag('video tex ready ' + uw + 'x' + uh + ' (src ' + vw + 'x' + vh + ', limit ' + limit + ')')
           }
         } catch (e) {
           if (!videoCanvasReported) {
@@ -2414,6 +2609,7 @@ export function createRenderer(canvas, opts = {}) {
           ),
           (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi,
           time,
+          layer,
         ),
         progEntry.matMeta,
       )

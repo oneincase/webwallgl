@@ -40,11 +40,10 @@
  *      前者是效果画布（层内容应为空白），后者才是纯色层。混同后 17 个带 solid
  *      残留的 composelayer 拿到纯白底，2872267921「音频」糊出不透明白屏。
  *
- *   G. MDLV0013 顶点布局 + 视锥裁剪的动画位移余量
- *      0013 的顶点区长度字段偏移是 +4（不是 +8 / +32），缺少这一档时 14 个模型
- *      直接抛错、整层不渲染。视锥裁剪只看静态 origin，而 puppet 是被骨骼动画
- *      推着走的：「停在屏外、靠动画开进画面」的层会被每帧裁掉（2477602742 火车）。
- *      两个缺陷各自独立，修掉任何一个火车还是不动。
+ *   G. MDL 顶点布局 + 视锥裁剪的动画位移余量
+ *      MDLV0013 的 lenOff=4、stride=52；新版 MDLV0023 puppet 还有 stride=84
+ *      （3797270925）。视锥裁剪只看静态 origin，而 puppet 是被骨骼动画推着走的：
+ *      「停在屏外、靠动画开进画面」的层会被每帧裁掉（2477602742 火车）。
  *
  *   H. 图层混合：Screen/Multiply 丢掉 src 不透明度；效果 FBO 名不一定有 _rt_ 前缀
  *      colorBlendMode=7 的 Screen 层、mode=2 的 Multiply 层，原实现直接用
@@ -692,9 +691,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   }
 }
 
-// ---------- G. MDLV0013 顶点布局 + 动画位移不被视锥裁掉 ----------
+// ---------- G. MDL 顶点布局 + 动画位移不被视锥裁掉 ----------
 {
-  console.log("\n[G] MDLV0013 布局 / 动画位移与视锥裁剪");
+  console.log("\n[G] MDL 顶点布局 / 动画位移与视锥裁剪");
 
   // G1. 全库 MDL 逐个解析：版本分布、0013 自洽性、animBound 覆盖率
   const byVer = new Map();
@@ -788,7 +787,234 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     errors.push("壁纸库缺少样本 2477602742");
   }
 
-  // G3. 接线：isLayerOffscreen 必须真的用上 puppetAnimMargin（G2 直接调的是导出函数，
+  // G3. 3797270925：新版 MDLV0023 84B puppet 顶点（骨骼槽前多 4B，后续属性整体后移）。
+  // 旧解析只认 80B，整个人物网格加载失败；若把预留位误当骨骼/权重，蒙皮会撕开。
+  const acheron = wallpapers.find((w) => w.id === "3797270925");
+  if (acheron) {
+    const obj = (acheron.scene.objects || []).find((o) => o.name === "acheronbody");
+    check(!!obj, "3797270925 缺少 acheronbody puppet 图层");
+    if (obj) {
+      const model = readJson(acheron.pkg, obj.image);
+      let m = null;
+      try { m = parseMDL(getEntry(acheron.pkg, model.puppet)); }
+      catch (e) { errors.push(`3797270925 新版 84B MDL 解析失败（人物模型无法加载）：${e.message}`); }
+      if (m) {
+        check(m.magic === "MDLV0023" && m.vertexCount === 3269 && m.indexCount === 16377,
+          `3797270925 MDL 顶点/索引数应来自 84B 布局，实得 ${m.vertexCount}/${m.indexCount}`);
+        check(m.bones.length === 123 && m.animations.length === 26,
+          `3797270925 应解析 123 根骨/26 条动画，实得 ${m.bones.length}/${m.animations.length}`);
+        let badWeight = 0, badUV = 0, badBone = 0, badIndex = 0;
+        for (let v = 0; v < m.vertexCount; v++) {
+          let sum = 0;
+          for (let k = 0; k < 4; k++) {
+            const w = m.weights[v * 4 + k];
+            const b = m.boneIdx[v * 4 + k];
+            sum += w;
+            if (w !== 0 && (b < 0 || b >= m.bones.length)) badBone++;
+          }
+          if (Math.abs(sum - 1) > 1e-4) badWeight++;
+          if (m.uvs[v * 2] < -0.01 || m.uvs[v * 2] > 1.01 ||
+              m.uvs[v * 2 + 1] < -0.01 || m.uvs[v * 2 + 1] > 1.01) badUV++;
+        }
+        for (const idx of m.indices) if (idx >= m.vertexCount) badIndex++;
+        check(badWeight === 0 && badUV === 0 && badBone === 0 && badIndex === 0,
+          `3797270925 84B 顶点字段不自洽：权重=${badWeight} UV=${badUV} 骨号=${badBone} 索引=${badIndex}`);
+        const animIds = new Set(m.animations.map((a) => a.id));
+        const matched = (obj.animationlayers || []).filter((l) => animIds.has(l.animation)).length;
+        check(matched === 25, `3797270925 场景的 25 条 additive 动画层都应接到 MDLA，实接 ${matched}`);
+
+        const P = m.positions, BI = m.boneIdx, WT = m.weights, I = m.indices;
+        const skinnedAt = (t) => {
+          const sk = computeSkinMatrices(m, t, obj.animationlayers);
+          const out = new Float32Array(m.vertexCount * 2);
+          for (let v = 0; v < m.vertexCount; v++) {
+            const px = P[v * 3], py = P[v * 3 + 1];
+            for (let k = 0; k < 4; k++) {
+              const w = WT[v * 4 + k];
+              if (w <= 0) continue;
+              const mm = sk.subarray(BI[v * 4 + k] * 16, BI[v * 4 + k] * 16 + 16);
+              out[v * 2] += w * (mm[0] * px + mm[4] * py + mm[12]);
+              out[v * 2 + 1] += w * (mm[1] * px + mm[5] * py + mm[13]);
+            }
+          }
+          return out;
+        };
+        const statsAt = (q) => {
+          let flips = 0, maxD = 0;
+          for (let f = 0; f + 2 < I.length; f += 3) {
+            const a = I[f], b = I[f + 1], c = I[f + 2];
+            const baseCross = (P[b * 3] - P[a * 3]) * (P[c * 3 + 1] - P[a * 3 + 1])
+              - (P[c * 3] - P[a * 3]) * (P[b * 3 + 1] - P[a * 3 + 1]);
+            const nowCross = (q[b * 2] - q[a * 2]) * (q[c * 2 + 1] - q[a * 2 + 1])
+              - (q[c * 2] - q[a * 2]) * (q[b * 2 + 1] - q[a * 2 + 1]);
+            if (Math.abs(baseCross) > 10 && baseCross * nowCross < 0) flips++;
+          }
+          for (let v = 0; v < m.vertexCount; v++) {
+            maxD = Math.max(maxD, Math.hypot(q[v * 2] - P[v * 3], q[v * 2 + 1] - P[v * 3 + 1]));
+          }
+          return { flips, maxD };
+        };
+        const s0 = statsAt(skinnedAt(0));
+        // 恒等阈值 0.05px：加算层 t=0 增量精确为 0（mdl-skin rest-relative），
+        // 但蒙皮矩阵的 TRS 分解→composeTRS 重建每次带 ~1ulp 舍入，沿 acheron
+        // 123 级骨链 × 4000px 坐标累积实测 0.024px —— 这是合成精度地板，不是
+        // 动画漏进 t=0（真漏进来的话是 px 量级）。
+        check(s0.maxD < 0.05 && s0.flips === 0,
+          `3797270925 绑定姿势 t=0 应恒等，实得位移 ${s0.maxD.toFixed(2)}px / 翻转 ${s0.flips}`);
+        let worst = { flips: s0.flips, maxD: s0.maxD };
+        for (const t of [0.5, 1, 2, 5, 10, 20, 30]) {
+          const s = statsAt(skinnedAt(t));
+          worst = { flips: worst.flips + s.flips, maxD: Math.max(worst.maxD, s.maxD) };
+        }
+        check(worst.flips === 0 && worst.maxD < 100,
+          `3797270925 25 层 additive 动画下模型撕开：最大位移 ${worst.maxD.toFixed(1)}px / 翻转 ${worst.flips}`);
+        console.log(`   3797270925: 84B MDL 解析通过（${m.vertexCount} 顶点 / ${m.bones.length} 骨 / ${matched} 动画层），动画最大位移 ${worst.maxD.toFixed(1)}px`);
+      }
+    }
+  } else {
+    errors.push("壁纸库缺少样本 3797270925");
+  }
+
+  // G3b. additive 动画层的增量参考必须是**本轨道首关键帧**（clip 参考姿势），不是绑定姿势。
+  // 工坊把加算 clip 的非目标骨烘成录制姿势的绝对局部值（≠绑定）。按绑定取增量会给
+  // 全身叠恒定偏移：3148125112 人物2「眼睛」层曾把网格恒定推移 max 2337px（用户报
+  // 「上半身爆开」）。rest-relative 语义下常量轨道增量恒 0，动画轨道只贡献真实运动
+  //（该 clip 实测整周期 ≤31px）。直接调渲染器导出的 computeSkinMatrices（不在测试里
+  // 复算公式——把渲染器改坏了测不出来）。
+  {
+    const rin = wallpapers.find((w) => w.id === "3148125112");
+    if (rin) {
+      const obj = (rin.scene.objects || []).find((o) => o.name === "人物2");
+      const mjs = obj && readJson(rin.pkg, obj.image);
+      check(!!(obj && mjs && mjs.puppet), "3148125112 缺少 人物2 puppet 图层");
+      if (obj && mjs && mjs.puppet) {
+        let m;
+        try {
+          m = parseMDL(getEntry(rin.pkg, mjs.puppet));
+        } catch (e) {
+          m = null;
+          errors.push(`3148125112 人物2 MDL 解析失败：${e.message}`);
+        }
+        if (m) {
+          const all = (obj.animationlayers || []).filter((a) => a.visible !== false);
+          const bodyOnly = all.filter((a) => !a.additive);
+          check(all.some((a) => a.additive), "3148125112 人物2 应有 additive 动画层（本判据的前提）");
+          const P = m.positions, I = m.indices, BI = m.boneIdx, WT = m.weights;
+          const skinAt = (t, layers) => computeSkinMatrices(m, t, layers);
+          let worstD = 0;
+          for (const t of [0, 0.5, 1, 2, 4.6, 8, 20, 300]) {
+            const withAdd = skinAt(t, all);
+            const mdl2 = parseMDL(getEntry(rin.pkg, mjs.puppet)); // 独立解析，避开 _skin 缓存互踩
+            const noAdd = computeSkinMatrices(mdl2, t, bodyOnly);
+            for (let v = 0; v < m.vertexCount; v++) {
+              const at = (sk) => {
+                let x = 0, y = 0;
+                for (let k = 0; k < 4; k++) {
+                  const w = WT[v * 4 + k];
+                  if (w <= 0) continue;
+                  const mm = sk.subarray(BI[v * 4 + k] * 16, BI[v * 4 + k] * 16 + 16);
+                  x += w * (mm[0] * P[v * 3] + mm[4] * P[v * 3 + 1] + mm[12]);
+                  y += w * (mm[1] * P[v * 3] + mm[5] * P[v * 3 + 1] + mm[13]);
+                }
+                return [x, y];
+              };
+              const a = at(withAdd), b = at(noAdd);
+              worstD = Math.max(worstD, Math.hypot(a[0] - b[0], a[1] - b[1]));
+            }
+          }
+          check(worstD < 40,
+            `3148125112 人物2 additive 层贡献位移 ${worstD.toFixed(1)}px（应 <40px；按绑定姿势取增量时会到 ~2337px，上半身爆开）`);
+          console.log(`   3148125112: additive「眼睛」层贡献位移 max ${worstD.toFixed(1)}px（rest-relative 语义）`);
+        }
+      }
+    }
+  }
+
+  // G3c. additive 权重归一化只能作用于**加算增量之和**，不能把非加算层的替换姿势
+  // 拉向绑定姿势。kkkk(3223543799) 可见层 = 734(blend=1 替换) + 1320/357 两条
+  // additive（addW=2）：旧写法 `acc = base + (acc−base)/addW` 把 734 的装配姿势
+  // 拉回图集散开位的一半（骨31 局部T −32 → −1775），人物撕成碎块；rigid 平移
+  // 不产生法向翻转，I4 对此失明 —— 必须用「局部矩阵位移」判据。
+  {
+    const rin = wallpapers.find((w) => w.id === "3223543799");
+    // 注意：本张有两个同名 kkkk 层——隐藏重复层（动画 476，屏外）与可见层
+    // （动画 357）。必须用 parseScene 的**有效可见性**选层；raw objects 的
+    // visible 字段形态不一，find 会命中隐藏层（G3c 第一版就踩了）。
+    const L = rin ? parseScene(rin.scene).layers.find((l) => l.name === "kkkk" && l.visible === true) : null;
+    const mjs = L && L.image && readJson(rin.pkg, L.image);
+    check(!!(L && mjs && mjs.puppet), "3223543799 缺少可见 kkkk puppet 图层");
+    if (L && mjs && mjs.puppet) {
+      let m;
+      try {
+        m = parseMDL(getEntry(rin.pkg, mjs.puppet));
+      } catch (e) {
+        m = null;
+        errors.push(`3223543799 kkkk MDL 解析失败：${e.message}`);
+      }
+      if (m) {
+        const all = (L.animationLayers || []).filter((a) => a.visible !== false);
+        const no357 = all.filter((a) => a.animation !== 357);
+        check(all.length >= 3 && all.filter((a) => a.additive).length >= 2,
+          "3223543799 kkkk 应有 替换层+2条additive（本判据的前提：addW>1）");
+          let worstD = 0;
+          for (const t of [0, 2, 5, 10, 15, 20, 25, 30, 40]) {
+            const withAdd = computeSkinMatrices(m, t, all);
+            const mdl2 = parseMDL(getEntry(rin.pkg, mjs.puppet));
+            const base = computeSkinMatrices(mdl2, t, no357);
+            for (let i = 0; i < m.bones.length; i++) {
+              const d = Math.hypot(
+                m._local[i][12] - mdl2._local[i][12],
+                m._local[i][13] - mdl2._local[i][13],
+              );
+              void withAdd;
+              if (d > worstD) worstD = d;
+            }
+          }
+          check(worstD < 60,
+            `3223543799 kkkk additive 归一化把替换姿势拉向绑定：骨局部位移 max ${worstD.toFixed(1)}px（应 <60px；旧写法实测 1777px，人物撕碎）`);
+          console.log(`   3223543799: additive 归一化贡献（357 层实际增量）max ${worstD.toFixed(1)}px`);
+      }
+    }
+  }
+
+  // G3d. **全加算层栈的基准姿势**：一个 puppet 的动画层全是 additive（无替换层）
+  // 时，第一条加算 clip 的首帧 = 该骨的装配基准（可能 ≠ 绑定）。katanabody
+  // (3238423642) 10 条加算、骨 6/16/22 绑定平移 1479/2841/3075px 是图集散开位，
+  // clip 值 = 装配位 ± 小幅运动：不换基准人物缺头少臂。
+  {
+    const rin = wallpapers.find((w) => w.id === "3238423642");
+    const L = rin ? parseScene(rin.scene).layers.find((l) => l.name === "katanabody" && l.visible === true) : null;
+    const mjs = L && L.image && readJson(rin.pkg, L.image);
+    check(!!(L && mjs && mjs.puppet), "3238423642 缺少可见 katanabody puppet 图层");
+    if (L && mjs && mjs.puppet) {
+      let m;
+      try {
+        m = parseMDL(getEntry(rin.pkg, mjs.puppet));
+      } catch (e) {
+        m = null;
+        errors.push(`3238423642 katanabody MDL 解析失败：${e.message}`);
+      }
+      if (m) {
+        const all = (L.animationLayers || []).filter((a) => a.visible !== false);
+        check(all.length >= 3 && all.every((a) => a.additive),
+          "3238423642 katanabody 应为全 additive 层栈（本判据的前提）");
+        const carrier = [6, 16, 22]; // 绑定平移 1479/2841/3075px 的散件载体骨
+        let worst = 0;
+        for (const t of [0, 5, 10, 20]) {
+          computeSkinMatrices(m, t, all);
+          for (const b of carrier) {
+            const d = Math.hypot(m._local[b][12], m._local[b][13]);
+            if (d > worst) worst = d;
+          }
+        }
+        check(worst < 400,
+          `3238423642 katanabody 散件载体骨局部位移 max ${worst.toFixed(0)}px（应 <400px=装配位量级；掉回绑定则是 1479~3075px，头身分离）`);
+        console.log(`   3238423642: 全加算基准换位后载体骨局部T max ${worst.toFixed(0)}px（绑定值 1479~3075px）`);
+      }
+    }
+  }
+
+  // G4. 接线：isLayerOffscreen 必须真的用上 puppetAnimMargin（G2 直接调的是导出函数，
   // 这里补一刀确保它确实接进了裁剪判据，而不是只导出没人用）
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   const at = rsrc.indexOf("function isLayerOffscreen");
@@ -803,6 +1029,8 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     "MDLV0013 的 lenOff=4/stride=52 布局不能删（删掉后 14 个模型整层不渲染）");
   check(/stride:\s*48,\s*uv:\s*40/.test(msrc),
     "MDLV0023 真 3D 网格 stride=48/uv@40 不能删（3509243656 恒星/天空盒）");
+  check(/stride:\s*84,\s*uv:\s*76,\s*bone:\s*44,\s*weight:\s*60/.test(msrc),
+    "MDLV0023 新版 puppet stride=84/formatMarker=0x0181000e（uv@76/bone@44/weight@60）不能删（3797270925）");
   check(/function animDisplacementBound/.test(msrc), "animDisplacementBound 缺失");
 }
 
@@ -857,6 +1085,26 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   check(gap > 0.5, `旧行为与修复后的差异仅 ${gap.toFixed(3)}，用例鉴别力不足`);
   console.log(`   op=0 精确退化为背景；与「丢掉 op」的旧行为差异 ${gap.toFixed(3)}（云盖脸的量级）`);
 
+  // H1b. shader 侧混合（Overlay/Tint 等 needsShaderBlend 模式）也必须吃层 alpha。
+  //     3793592591 的 Katı 是一张铺满画面、colorBlendMode=11(Overlay)、alpha=0
+  //     的白色 solidlayer：inputTex 是 1×1 白图，src.a=1。若 compBlend 只拿 src.a，
+  //     就会按 op=1 把 Overlay(背景, 白)=白 写满全屏 —— 即整屏过曝。
+  const sakura = wallpapers.find((w) => w.id === "3793592591");
+  check(!!sakura, "壁纸库缺少样本 3793592591");
+  if (sakura) {
+    const solid = parseScene(sakura.scene).layers.find((l) => l.id === 471);
+    check(!!solid && solid.name === "Katı" && solid.colorBlendMode === 11 && solid.alpha === 0,
+      `3793592591 样本结构变化：Katı 应是 alpha=0 的 Overlay solidlayer，实得 ${JSON.stringify(solid)}`);
+    let psum = 0, pbright = 0, pn = 0;
+    for (const dst of [0, 0.05, 0.25, 0.7, 1]) {
+      const out = applyColorBlendCPU(11, dst, 1, 0);
+      psum += Math.abs(out - dst); pn++;
+      pbright = Math.max(pbright, out - dst);
+    }
+    check(psum < 1e-9 && pbright === 0,
+      `Overlay solidlayer 在层 alpha=0 时必须精确不存在，最大亮度增量 ${pbright.toFixed(6)}`);
+  }
+
   // H2. 接线：光有正确的 plan 不够，shader 与调用点都得真的用上
   // GLSL 常量已拆至 renderer-glsl.js（engineering/modularization），文本断言随常量走
   const rsrc2 = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer-glsl.js"), "utf8");
@@ -875,6 +1123,10 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   const cl = rsrcRenderer.slice(rsrcRenderer.indexOf("function compositeLayer"), rsrcRenderer.indexOf("function setFrameBasis"));
   check(/uniform1i\(\s*uni\.blendPrep\s*,\s*blendPrep\s*\)/.test(cl),
     "compositeLayer 必须把 blendPrep 写进 uniform，否则 shader 永远拿到 0");
+  check(/u_Opacity/.test(rsrc2) && /src\.a\s*\*\s*u_Opacity/.test(rsrc2),
+    "COMPOSITE_BLEND_FRAG 必须用 src.a * u_Opacity（否则 Overlay/ColorBurn 特殊混合丢掉层 alpha）");
+  check(/uniform1f\(\s*compBlendUni\.opacity\s*,\s*color4\[3\]\s*\)/.test(cl),
+    "compositeLayer 必须把层 alpha color4[3] 传给 shader 侧混合，否则 alpha=0 的白色 solidlayer 全屏过曝（3793592591）");
 
   // H3. 效果自定义 FBO 的名字**不一定带 _rt_ 前缀**（车尾灯纯白的根因）。
   //     _rt_ 只是 WE 内置全屏缓冲的命名约定；effect.json 的 fbos 由作者起名，

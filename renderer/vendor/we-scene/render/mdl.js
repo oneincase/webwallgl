@@ -6,7 +6,8 @@
 //     0x00  char[8]   "MDLV0023"
 //     0x15  cstr      材质路径（如 "materials/01腿-后.json"）
 //     +32   u32       顶点区字节数（= vertexCount × 80）★ 相对材质路径 null 之后
-//             顶点 80B：pos vec3 @0 / boneIdx u32×4 @40 / weights f32×4 @56 / uv vec2 @72
+//             常见顶点 80B：pos vec3 @0 / boneIdx u32×4 @40 / weights f32×4 @56 / uv vec2 @72
+//             新版 84B（formatMarker 0x0181000e）：boneIdx@44 / weights@60 / uv@76
 //     后接  u32       索引区字节数，随后 u16 索引
 //
 //   MDLS0004 骨架（魔数 + u8 + u32 nextOff + u32 boneCount，逐骨条目）

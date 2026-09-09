@@ -203,6 +203,8 @@ function beam(w, h, coreWidth, fadeBoth, peak) {
 // 旧实现用 beam() 的竖直 σ0.16 粗核心单帧 → 粗白竖长光柱。
 // beam() 本身别动：beam_*/light_shafts 的竖直粗丝是它们自己的正确形态。
 const RAIN_FRAMES = 4
+const RAIN_W = 128
+const RAIN_H = 512
 function rainStreak(w, h, tiltDeg, corePx, peak) {
   const pk = peak === undefined ? 0.85 : peak
   const rgba = new Uint8Array(w * h * 4)
@@ -232,11 +234,24 @@ function rainStreak(w, h, tiltDeg, corePx, peak) {
   return { width: w, height: h, rgba }
 }
 
-/** 内置贴图的帧表（top-down，与 TEXS list 元素同构）。无帧表的名字返回 null。 */
+/** 内置贴图的帧表（top-down **像素矩形** {x,y,width,height}，与 TEXS list 元素同构；
+ *  ParticleSystem.setTexture 会用贴图尺寸归一化成 uv。无帧表的名字返回 null。
+ *  ⚠ 曾经返回归一化 {ou,ov,su,sv}：setTexture 按像素矩形再除一次尺寸 → 全帧 NaN，
+ *  GL 端雨丝采样全废（CPU 光栅直接吃归一化格式所以离线全绿，两条路径格式不一致
+ *  让这条坏了很久没人发现）。 */
 export function builtinParticleFrames(name) {
   if (name === 'particle/nature/rain1' || name === 'particle/nature/rain2') {
     const list = []
-    for (let i = 0; i < RAIN_FRAMES; i++) list.push({ ou: 0, ov: i / RAIN_FRAMES, su: 1, sv: 1 / RAIN_FRAMES })
+    const fh = RAIN_H / RAIN_FRAMES
+    for (let i = 0; i < RAIN_FRAMES; i++) list.push({ x: 0, y: i * fh, width: RAIN_W, height: fh })
+    return list
+  }
+  // 叶片 3×3 图集（leaf() 与引用方 sequencemultiplier:3 对应）
+  if (/^particle\/nature\/leaves\d*$/.test(name)) {
+    const list = []
+    for (let r = 0; r < 3; r++)
+      for (let c = 0; c < 3; c++)
+        list.push({ x: c * LEAF_CELL, y: r * LEAF_CELL, width: LEAF_CELL, height: LEAF_CELL })
     return list
   }
   return null
@@ -347,35 +362,69 @@ function petals(size) {
   return conditionTexture({ width: size, height: size, rgba }, 0.11)
 }
 
-// 叶片：kind 0 卵形、1 偏宽、3 更圆、7 三裂（枫感）。中脉是沿主轴的细高斯脊。
-// 2/5/6/8 是本机库引用过、原先落到 kind 0 的变体。
+// 叶片 3×3 九帧图集。官方内置 leaves* 贴图就是图集：全库引用它的粒子系统
+// 一律 `sequencemultiplier: 3`、animationmode 空（按生命进度逐帧换叶形）。
+// 画成单张一片叶会被渲染端 N×N 切成 9 个矩形块，落叶糊成色块（1725510475）。
+// 色系按官方预设家族（作者侧 preview / 图层名反推，顶点色多为白→黄系乘子）：
+//   0/1/2 红枫（2999533824 纯白顶点色仍落红叶）
+//   3/5   橙黄（1725510475 白顶点色落橙叶、黄乘子落黄叶）
+//   6/7/8 绿（3455074362 图层直接命名 "Leaves (green)"）
+const LEAF_CELL = 256
+const LEAF_ATLAS = LEAF_CELL * 3
 function leaf(size, kind) {
   const specs = {
-    0: { rx: 0.36, ry: 0.92, wave: 0, folds: 0 },
-    1: { rx: 0.48, ry: 0.86, wave: 0.05, folds: 7 },
-    2: { rx: 0.4, ry: 0.88, wave: 0.08, folds: 5 },
-    3: { rx: 0.58, ry: 0.72, wave: 0, folds: 0 },
-    5: { rx: 0.44, ry: 0.8, wave: 0.12, folds: 9 },
-    6: { rx: 0.52, ry: 0.78, wave: 0.07, folds: 4 },
-    7: { rx: 0.5, ry: 0.9, wave: 0.16, folds: 3 },
-    8: { rx: 0.38, ry: 0.94, wave: 0.2, folds: 2 },
+    0: { rx: 0.36, ry: 0.92, wave: 0, folds: 0, rgb: [196, 66, 32] },
+    1: { rx: 0.48, ry: 0.86, wave: 0.05, folds: 7, rgb: [188, 58, 30] },
+    2: { rx: 0.4, ry: 0.88, wave: 0.08, folds: 5, rgb: [206, 82, 36] },
+    3: { rx: 0.58, ry: 0.72, wave: 0, folds: 0, rgb: [214, 148, 40] },
+    5: { rx: 0.44, ry: 0.8, wave: 0.12, folds: 9, rgb: [220, 158, 48] },
+    6: { rx: 0.52, ry: 0.78, wave: 0.07, folds: 4, rgb: [122, 150, 52] },
+    7: { rx: 0.5, ry: 0.9, wave: 0.16, folds: 3, rgb: [96, 138, 50] },
+    8: { rx: 0.38, ry: 0.94, wave: 0.2, folds: 2, rgb: [110, 148, 56] },
   }
   const s = specs[kind] || specs[0]
-  const rgba = new Uint8Array(size * size * 4)
-  const half = size / 2
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const px = (x + 0.5 - half) / half
-      const py = (y + 0.5 - half) / half
-      const th = Math.atan2(px, py)
-      const serr = s.wave ? 1 + s.wave * Math.sin(th * s.folds) : 1
-      const d = Math.hypot(px / (s.rx * serr), py / s.ry)
-      let a = d >= 1.12 ? 0 : gauss(d, 0.5)
-      if (a > 0) a = Math.min(1, a + gauss(px, 0.028) * gauss(py, 0.72) * 0.28)
-      writeWhite(rgba, (y * size + x) * 4, a)
+  const cell = Math.floor(size / 3)
+  const rgba = new Uint8Array(cell * 3 * cell * 3 * 4)
+  const half = cell / 2
+  const rng = mulberry32(0x1eaf + kind * 131)
+  for (let f = 0; f < 9; f++) {
+    const col = f % 3
+    const row = (f / 3) | 0
+    // 帧间差异：旋转 / 缩放 / 亮度微抖动，逐帧换叶形才成立
+    const rot = (f / 9) * Math.PI * 2 + (rng() - 0.5) * 0.7
+    const scaleJ = 0.9 + rng() * 0.16
+    const brightJ = 0.9 + rng() * 0.2
+    const hueJ = 1 + (rng() - 0.5) * 0.12
+    const ca = Math.cos(rot)
+    const sa = Math.sin(rot)
+    const mirror = f & 1 ? -1 : 1
+    for (let y = 0; y < cell; y++) {
+      for (let x = 0; x < cell; x++) {
+        const px = ((x + 0.5 - half) / half) * mirror
+        const py = (y + 0.5 - half) / half
+        const ux = (px * ca + py * sa) / scaleJ
+        const uy = (-px * sa + py * ca) / scaleJ
+        // 两端收尖（叶尖更窄）：椭圆 → 叶形轮廓
+        const taper = 1 - Math.pow(Math.min(1, Math.abs(uy)), 1.7) * 0.52
+        const th = Math.atan2(ux, uy)
+        const serr = s.wave ? 1 + s.wave * Math.sin(th * s.folds) : 1
+        const d = Math.hypot(ux / (s.rx * serr * taper), uy / s.ry)
+        // 锐利边 + 窄 AA 带（叶是近不透明实体，不是高斯软斑）
+        const a = d >= 1.08 ? 0 : Math.min(1, (1.08 - d) / 0.14)
+        if (a <= 0) continue
+        // 中脉提亮相邻像素，边缘与叶尖略暗，中心最饱满
+        const vein = gauss(ux, 0.028) * gauss(uy, 0.72)
+        const shade = (0.8 + 0.2 * Math.max(0, 1 - d)) * (1 + vein * 0.22) * brightJ
+        const o = (((row * cell + y) * cell * 3 + col * cell + x) * 4)
+        rgba[o] = Math.min(255, Math.round(s.rgb[0] * shade * hueJ))
+        rgba[o + 1] = Math.min(255, Math.round(s.rgb[1] * shade))
+        rgba[o + 2] = Math.min(255, Math.round(s.rgb[2] * shade * (2 - hueJ)))
+        rgba[o + 3] = Math.round(a * 255)
+      }
     }
   }
-  return conditionTexture({ width: size, height: size, rgba }, 0.11)
+  // targetAvg=0：叶是半透明混合的实体，不做 additive 系的能量归一
+  return conditionTexture({ width: cell * 3, height: cell * 3, rgba }, 0)
 }
 
 // 高度图 → 标准切线空间法线（OpenGL：R=nx G=ny B=nz，对齐 WE DecompressNormal 的 tex.xy）。
@@ -978,14 +1027,14 @@ const BUILDERS = {
 
   // 自然物
   'particle/nature/rosepetals': () => petals(256),
-  'particle/nature/leaves': () => leaf(256, 0),
-  'particle/nature/leaves1': () => leaf(256, 1),
-  'particle/nature/leaves2': () => leaf(256, 2),
-  'particle/nature/leaves3': () => leaf(256, 3),
-  'particle/nature/leaves5': () => leaf(256, 5),
-  'particle/nature/leaves6': () => leaf(256, 6),
-  'particle/nature/leaves7': () => leaf(256, 7),
-  'particle/nature/leaves8': () => leaf(256, 8),
+  'particle/nature/leaves': () => leaf(LEAF_ATLAS, 0),
+  'particle/nature/leaves1': () => leaf(LEAF_ATLAS, 1),
+  'particle/nature/leaves2': () => leaf(LEAF_ATLAS, 2),
+  'particle/nature/leaves3': () => leaf(LEAF_ATLAS, 3),
+  'particle/nature/leaves5': () => leaf(LEAF_ATLAS, 5),
+  'particle/nature/leaves6': () => leaf(LEAF_ATLAS, 6),
+  'particle/nature/leaves7': () => leaf(LEAF_ATLAS, 7),
+  'particle/nature/leaves8': () => leaf(LEAF_ATLAS, 8),
   'particle/nature/snow': () => snowflake(256),
 
   // --- B. 原 CC0 素材键的程序化替身（生成尺寸 = 原生 ×2） ---
@@ -1006,8 +1055,8 @@ const BUILDERS = {
   // 水滴（原生 64×256 → 128×512）：竖长泪滴
   'particle/drop': () => teardrop(128, 512),
   // 雨丝（原生 64×256 → 128×512）：细长条，两端渐隐
-  'particle/nature/rain1': () => rainStreak(128, 512, 10, 1.0, 0.78),
-  'particle/nature/rain2': () => rainStreak(128, 512, 10, 1.6, 0.66),
+  'particle/nature/rain1': () => rainStreak(RAIN_W, RAIN_H, 10, 1.0, 0.78),
+  'particle/nature/rain2': () => rainStreak(RAIN_W, RAIN_H, 10, 1.6, 0.66),
   // 雨滴 sheet（原生 128×256 → 256×512，2×4 格）：每格一颗上圆下尖小水滴
   'particle/water/rain_drops_sheet': () => dropSheet(256, 512, 2, 4),
   // 雾（原生 256 → 512）：絮状 fBm，弱遮罩铺满；三张不同尺度/种子
@@ -1055,14 +1104,14 @@ function fallbackFor(name) {
   }
   if (/rosepetal|petal|sakura|blossom/.test(n)) return () => petals(256)
   if (/leaf|leaves|foliage/.test(n)) {
-    if (/leaves8/.test(n)) return () => leaf(256, 8)
-    if (/leaves7/.test(n)) return () => leaf(256, 7)
-    if (/leaves6/.test(n)) return () => leaf(256, 6)
-    if (/leaves5/.test(n)) return () => leaf(256, 5)
-    if (/leaves3/.test(n)) return () => leaf(256, 3)
-    if (/leaves2/.test(n)) return () => leaf(256, 2)
-    if (/leaves1/.test(n)) return () => leaf(256, 1)
-    return () => leaf(256, 0)
+    if (/leaves8/.test(n)) return () => leaf(LEAF_ATLAS, 8)
+    if (/leaves7/.test(n)) return () => leaf(LEAF_ATLAS, 7)
+    if (/leaves6/.test(n)) return () => leaf(LEAF_ATLAS, 6)
+    if (/leaves5/.test(n)) return () => leaf(LEAF_ATLAS, 5)
+    if (/leaves3/.test(n)) return () => leaf(LEAF_ATLAS, 3)
+    if (/leaves2/.test(n)) return () => leaf(LEAF_ATLAS, 2)
+    if (/leaves1/.test(n)) return () => leaf(LEAF_ATLAS, 1)
+    return () => leaf(LEAF_ATLAS, 0)
   }
   if (/circle_wind|windcircle/.test(n)) return () => windCircle(256)
   if (/fog|cloud|mist|vapor/.test(n)) return () => fogNoise(512, 4, 5, 5, 0.4, 0.9, 150)

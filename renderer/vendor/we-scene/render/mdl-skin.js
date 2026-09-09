@@ -185,23 +185,52 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     acc.set(base)
     let touched = false
     let addW = 0
+    // 该骨是否已有非加算层给过基准姿势；首条加算 clip 是否已提供基准。
+    let seenNonAdd = false
+    let addBaseSet = false
+    // additive 增量单独累加（见循环内注释），最后统一叠加与归一。
+    const addDelta = mdl._addDelta || (mdl._addDelta = new Float32Array(9))
+    addDelta.fill(0)
     for (const L of layers) {
       const track = L.anim.tracks[i]
-      if (!track) continue
+      // 空轨道（0 关键帧）：sampleTrackTRS 会返回恒等 TRS(0,0,0,0,0,0,1,1,1)，
+      // 那不是任何参考姿势 —— 非 additive 会把骨混向原点、additive 会叠出
+      // (恒等−参考) 的垃圾增量。跳过 = 该骨保持此前的 acc（绑定/其它层）。
+      if (!track || !track.keyframes.length) continue
       sampleTrackTRS(track, L.anim, time * L.rate, smp)
       const w = L.blend
       if (L.additive) {
-        // 相对绑定姿势的增量按权重累加（平移/缩放线、欧拉角也线，跨 π 边界走最短弧）
+        // 增量参考 = **本轨道自己的首关键帧**（clip 的参考姿势），不是绑定姿势。
+        // 工坊导出的加算 clip 把非目标骨烘成作者录制姿势的**绝对局部值**，该值
+        // ≠ 绑定姿势（3148125112 人物2「眼睛」39 条轨相对绑定平移偏移最大
+        // 2101px，kkkk/katanabody 3130~3554px，全库 162 条加算层 47 条如此），
+        // 按绑定取增量 = 给全身叠一个恒定偏移，人物上半身整体飞出（爆开）。
+        // 相对首帧取增量后：常量轨道（人物2 46/85 条）增量恒 0，动画轨道只
+        // 贡献相对录制起点的真实运动（人物2 最大 29px）；t=0 时加算层精确
+        // 无贡献（3797270925 的「绑定姿势 t=0 应恒等」断言依赖这一点）。
+        // keyframes 扁平存储 n*9，首关键帧的第 k 分量恰是 keyframes[k]。
+        const rest = track.keyframes
+        // **全加算层栈的基准**：这条骨没有非加算层、加算增量还没基准时，第一条
+        // 加算 clip 的首帧就是基准姿势——把 acc 从绑定（= 图集散开位）换成装配位。
+        // katanabody(3238423642) 10 条加算、无替换层，骨 6/16/22 绑定平移
+        // 1479/2841/3075px 是图集散开位，所有 clip 的值 = 装配位 ± 小幅运动：
+        // 不换基准人物缺头少臂（头骨钉在图集位）；Lucy 那类 kf0==绑定的全加算
+        // 栈此步是无操作，行为与旧公式一致。
+        if (!seenNonAdd && !addBaseSet) {
+          for (let k = 0; k < 9; k++) acc[k] = rest[k]
+          addBaseSet = true
+        }
         for (let k = 0; k < 9; k++) {
-          let d = smp[k] - base[k]
+          let d = smp[k] - rest[k]
           if (k >= 3 && k <= 5) {
             if (d > Math.PI) d -= 2 * Math.PI
             else if (d < -Math.PI) d += 2 * Math.PI
           }
-          acc[k] += d * w
+          addDelta[k] += d * w
         }
         addW += w
       } else {
+        seenNonAdd = true
         for (let k = 0; k < 9; k++) acc[k] = acc[k] * (1 - w) + smp[k] * w
       }
       touched = true
@@ -209,8 +238,18 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     // additive 权重总和 >1 时按总权重归一：Lucy 那样 5 条 additive 层（blend 均为 1）
     // 若直接累加，同一根骨的增量会被叠 5 次，人物幅度被放大到形体明显走形。
     // WE 的 additive 混合是加权平均而非无界累加，故超过 1 时整体收缩回 1。
+    //
+    // [we-scene patch] 归一化只能作用于**加算增量之和**，绝不能动 acc 本体：
+    // acc 里还有非加算层的替换结果（blend=1 时 = 该层采样 = 装配姿势，与 base
+    // 无关）。旧写法 `acc = base + (acc − base)/addW` 会把替换姿势也往绑定姿势
+    // 拉回 1/addW —— kkkk(3223543799) 734 替换 + 1320/357 两条加算（addW=2）
+    // 时全部部件被拉回图集散开位的一半（骨31 局部T −32 → −1775 = 绑定/2），
+    // 人物整体撕成碎块；rigid 平移不产生法向翻转，I4 翻转指标对此完全失明。
     if (addW > 1) {
-      for (let k = 0; k < 9; k++) acc[k] = base[k] + (acc[k] - base[k]) / addW
+      for (let k = 0; k < 9; k++) addDelta[k] /= addW
+    }
+    if (addW > 0) {
+      for (let k = 0; k < 9; k++) acc[k] += addDelta[k]
     }
     // [we-scene patch] 脚本覆写：绝对写入平移分量（旋转/缩放不动 —— 全库 19 处
     // Transform 调用只用 translation()，rotation/scale 零调用）。

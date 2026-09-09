@@ -3,6 +3,22 @@
 // [we-scene patch] 从 parse.js 拆出的独立子库（纯函数、零依赖）。
 // 语义与坑的完整说明见各函数注释与 docs/CASEBOOK.md「属性解引用」：
 // 属性表优先、形状不匹配（撞车）退回快照。
+import { Vec3 } from '../render/text.js'
+
+/** [we-scene patch] color 属性的值 → Vec3：WE 的 engine.userProperties 里
+ *  颜色就是向量（带 multiply/subtract/add 方法），作者的混色链直接调用
+ * （3163060610 背景.color：`newBgColor.subtract(old)`、`base.multiply(1-w).add(new.multiply(w)`）。
+ *  给字符串/数组会在作者第一次链式调用时 TypeError 熔断。 */
+function colorVec3(v) {
+  if (v instanceof Vec3) return v
+  if (Array.isArray(v)) return new Vec3(Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0)
+  const parts = String(v ?? '')
+    .trim()
+    .split(/\s+/)
+    .map(Number)
+  return new Vec3(parts[0] || 0, parts[1] || 0, parts[2] || 0)
+}
+
 function propEntry(properties, name) {
   if (!properties || typeof name !== 'string') return null
   const p = properties[name]
@@ -169,7 +185,7 @@ function flattenUserProperties(properties) {
   if (!properties || typeof properties !== 'object') return out
   for (const [k, v] of Object.entries(properties)) {
     if (!v || typeof v !== 'object' || !('value' in v)) continue
-    out[k] = v.type === 'combo' ? coerceComboValue(v.value, v.options) : v.value
+    out[k] = v.type === 'combo' ? coerceComboValue(v.value, v.options) : v.type === 'color' ? colorVec3(v.value) : v.value
   }
   return out
 }
@@ -195,8 +211,11 @@ function mergeUserPropertyValues(properties, live, wire) {
       p.value = raw
       p.userOverridden = true
       const v = p.type === 'combo' ? coerceComboValue(p.value, p.options) : p.value
-      dst[k] = v
-      changed[k] = v
+      // [we-scene patch] color 属性热更同样要给 Vec3（与 flatten 同一语义），
+      // 否则脚本混色链在热更后第一次调用时熔断。
+      const wrapped = p.type === 'color' ? colorVec3(v) : v
+      dst[k] = wrapped
+      changed[k] = wrapped
     } else {
       dst[k] = raw
       changed[k] = raw

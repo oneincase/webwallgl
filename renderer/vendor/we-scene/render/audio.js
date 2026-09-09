@@ -124,7 +124,12 @@ export function createSimulatedAudio(seed = 20260830) {
   function update(t) {
     const beat = t / BEAT // 拍相位
     const step = beat * 4 // 16 分音符相位
-    const i16 = Math.floor(step) % 16
+    // [we-scene patch] i16 必须按数学取模包进 [0,15]：t 为负时（首帧 rAF 时间戳
+    // 可以早于挂载时刻的 performance.now()，t=(now-start)/1000 ≈ -0.005）
+    // `Math.floor(step) % 16` 得 -1 → patterns.kick[-1] = undefined → kickV=NaN →
+    // 全部 64 频段 NaN 灌进共享音频视图。3233141951 反光层的缩放脚本把 NaN 积分进
+    // smoothValue（作者脚本无自愈），整层永久塌成 scale=[0,0,1] 隐形。
+    const i16 = ((Math.floor(step) % 16) + 16) % 16
     const frac = step - Math.floor(step)
     // 打击乐瞬时包络：attack 快、decay 指数（约 0.22s 衰减到 1/e）
     const hitEnv = Math.exp(-frac * BEAT * 14)
