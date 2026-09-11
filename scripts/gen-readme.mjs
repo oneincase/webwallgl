@@ -13,9 +13,12 @@
 import esbuild from "esbuild";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
+// 必须用 fileURLToPath：`.pathname` 在 Windows 上会给出 "/D:/a/..." 这种带前导
+// 斜杠的路径，再经 path.join 变成 "\D:\a\..."，esbuild 会报
+// `Could not resolve "\\D:\...\bench\docs.ts"`（CI 的 Windows 构建就是这样挂的）。
+const root = fileURLToPath(new URL("..", import.meta.url));
 
 // bench/docs.ts 与 bench/i18n.ts 是带类型的浏览器模块（i18n 顶层碰 document，
 // 已加环境守卫），用 esbuild 打包成 Node 可导入的临时 mjs，读完即删。

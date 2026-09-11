@@ -12,9 +12,12 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
 
-const root = new URL("..", import.meta.url).pathname;
+// 同 gen-readme.mjs：`.pathname` 在 Windows 上是 "/D:/..."，join 后成 "\D:\..."，
+// 会让后续 existsSync / esbuild 全部找不到文件。必须 fileURLToPath。
+const root = fileURLToPath(new URL("..", import.meta.url));
 const libDir = join(root, "dist", "lib");
 
 for (const f of ["webwallgl.mjs", "webwallgl.global.js"]) {
