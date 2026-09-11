@@ -23,6 +23,7 @@ const wtext = await imp("renderer/vendor/we-scene/render/text.js");
 const engTimers = await imp("renderer/vendor/we-scene/render/engine-timers.js");
 const parseMod = await imp("renderer/vendor/we-scene/scene/parse.js");
 const userPropsMod = await imp("renderer/vendor/we-scene/scene/user-props.js");
+const pkgContainer = await imp("renderer/vendor/we-scene/pkg/container.js");
 const fontSanMod = await imp("renderer/vendor/we-scene/render/font-sanitize.js");
 const pkgMod = await imp("renderer/vendor/we-scene/pkg/container.js");
 
@@ -146,6 +147,46 @@ function runLayout() {
     const hdr = wtext.layoutText("CITY", { boxW: 51, boxH: 23, pointsize: 9, lineHeight: 12, padding: 32, halign: "left", valign: "center" }, measure);
     eq(hdr.lines[0].x, 51 / 2, "标题条左对齐贴盒中线（origin）");
   }
+  // 10) 占位小盒（2×2）+ limitwidth：换行只认 maxwidth，不得 min(innerW)。
+  //    3785267658 牛来的歌名/歌手层就是 2×2 占位盒 + maxwidth=450 —— 钳到 innerW=2
+  //    会每字一行再被 maxrows=1 收成单独「…」，整层空白（实机画布像素 0 证实）。
+  {
+    const l = wtext.layoutText("相位迁移", { boxW: 2, boxH: 2, pointsize: 32, lineHeight: 50, limitwidth: true, maxwidth: 450, maxrows: 1, limitrows: true, limituseellipsis: true, halign: "left", valign: "center" }, measure);
+    if (l.lines.length !== 1) errors.push(`占位小盒限宽应单行，实得 ${l.lines.length} 行`);
+    if (l.lines[0].text !== "相位迁移") errors.push(`占位小盒内容应完整，实得 ${JSON.stringify(l.lines[0].text)}`);
+    if (l.truncated) errors.push("占位小盒不应被截断（40px 内容远低于 maxwidth 450）");
+    if (l.lines[0].text === "…") errors.push("限宽不得把内容收成单独省略号（旧 innerW 钳位回归）");
+    // 11) 对称扩边：墨水右溢必须换算成边距（画布随内容长，盒中心=origin 不动）
+    const m = wtext.textCanvasMarginGrow(l, 2, 2, 8);
+    const need = 1 + 4 * CHAR_W - 2; // x=1 + 宽 40 − 盒宽 2
+    if (m < need) errors.push(`扩边应覆盖墨水右溢 ${need}，实得 ${m}`);
+    // 不溢出的常规盒：扩边退化为基础边距
+    const l2 = wtext.layoutText("hi", { boxW: 200, boxH: 100, pointsize: 20, lineHeight: 25, halign: "center", valign: "center" }, measure);
+    eq(wtext.textCanvasMarginGrow(l2, 200, 100, 32), 32, "不溢出时扩边 = 基础边距");
+    if (typeof wtext.inkOverflow !== "function") errors.push("text.js 未导出 inkOverflow");
+
+    // 12) shouldGrowMediaPlaceholder 两条件（缺一不扩）——曾因只看「盒子小」
+    //     误伤三体 3509243656 的普通脚本 2×2 层（字忽大忽小/消失）。
+    if (typeof wtext.shouldGrowMediaPlaceholder !== "function") {
+      errors.push("text.js 未导出 shouldGrowMediaPlaceholder");
+    } else {
+      const grow = wtext.shouldGrowMediaPlaceholder;
+      // 媒体钩子 + 2×2：允许扩（真正改不改 size 由 textCanvasMarginGrow 定）
+      if (!grow(2, 2, true)) errors.push("媒体 2×2 歌名层应允许扩边");
+      // 同 2×2 但非媒体层（三体 time/State）：不允许
+      if (grow(2, 2, false)) errors.push("非媒体 2×2 脚本层不应扩边");
+      // 正常大盒即使是媒体层：不允许（2938612768 标题几何不动）
+      if (grow(200, 100, true)) errors.push("正常大盒媒体层不应扩边");
+    }
+    // textCanvasMarginGrow 在墨水装得下时退回基础边距（短词 Paused/Playing
+    // 保持原布局），装不下才扩——这是「允许扩边」后真正改 size 的闸。
+    {
+      const lShort = wtext.layoutText("Playing", { boxW: 2, boxH: 2, pointsize: 12, lineHeight: 16, maxwidth: 500, halign: "left", valign: "center" }, (s) => s.length * 12 * 0.55);
+      eq(wtext.textCanvasMarginGrow(lShort, 2, 2, 72), 72, "短词在基础边距内时 grow 退回基础边距");
+      const grown = wtext.textCanvasMarginGrow(lShort, 2, 2, 4);
+      if (grown <= 4) errors.push("短词超出小边距时 grow 必须 > 基础边距");
+    }
+  }
   return errors;
 }
 
@@ -235,8 +276,11 @@ function runScripts() {
       layerTextStore.set(o.name || "", String(layer.text ?? ""));
       try {
         const r = sandbox.callUpdate(String(layer.text ?? ""));
-        if (r === null) {
-          // undefined 返回且未写 thisLayer.text → 保留原文本，合法
+        if (r === null && !sandbox.hasUpdate) {
+          // 纯回调脚本（无 update）的 store = 静态文本起步，是显示与回调读写
+          // 的共同载体；首帧（回调未发）就被清空才算异常。
+          // update 脚本不查这条：新语义下其 value 链以空串起步（WE 打字机前提，
+          // 见下方「打字机模板」用例），起步即空是设计行为而非「内容被写没」。
           if (sandbox.thisLayer.text !== String(layer.text ?? "") && sandbox.thisLayer.text === "") {
             updateFails.push({ item, name: o.name });
           }
@@ -290,6 +334,81 @@ function runScripts() {
     );
     const r = sb.callUpdate("");
     if (r !== "a;b") errors.push(`声明默认值回落不符: ${r}`);
+  }
+  // ---- 打字机模板：value 链从空串起步（WE 语义，3786330502 实机曾卡死在
+  //      「Wallpaper Music夜」；3395777145 官方预览图是干净完整歌名）----
+  // 用麻匪的真实脚本（scene.pkg objects[99]）驱动完整打字流程：首帧 value 必须
+  // 是空串，媒体事件到达后逐帧打出歌名，最终文本**不含静态占位前缀**。
+  {
+    const twId = "3786330502";
+    const twPkg = join(LIB, twId, "scene.pkg");
+    if (!fs.existsSync(twPkg)) {
+      console.log("  （跳过打字机语料：本机无 3786330502）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(twPkg));
+      const sj = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8").replace(/^﻿/, ""));
+      const obj = (sj.objects || []).find((o) => o && o.name === "歌曲名称");
+      const script = obj?.text?.script;
+      const staticText = String(obj?.text?.value ?? "");
+      if (!script || !script.includes("addLastChar")) {
+        errors.push("打字机语料结构变了（未找到 addLastChar 脚本），用例需更新");
+      } else {
+        const sb = wtext.evalTextScript(script, obj.text.scriptproperties || {}, {
+          text: staticText,
+          canvasSize: { width: 1920, height: 1080 },
+          userProperties: {},
+        });
+        if (!sb || !sb.hasUpdate) {
+          errors.push("打字机脚本沙箱构建失败");
+        } else {
+          // 断言 1：首帧 value 必须是空串（不是静态占位 "Wallpaper Music"）。
+          // 旧实现把静态文本喂进 value 链，脚本「不删字直接打」→「Wallpaper Music夜」卡死
+          const r0 = sb.callUpdate("");
+          if (r0 !== "") errors.push(`打字机首帧 value 应为空串（静态文本只是显示占位），实得 ${JSON.stringify(r0)}`);
+          // 断言 2：媒体事件 + 逐帧驱动 → 干净歌名
+          sb.callMedia("mediaPropertiesChanged", { title: "夜航星", artist: "相位迁移", album: "", albumArtist: "" });
+          let out = "";
+          for (let i = 0; i < 600; i++) {
+            sb.engine.frametime = 1 / 60;
+            sb.engine.runtime = i / 60;
+            const r = sb.callUpdate(out);
+            if (typeof r === "string") out = r;
+          }
+          if (out !== "夜航星") {
+            errors.push(`打字机最终应为干净歌名「夜航星」，实得 ${JSON.stringify(out)}（含占位前缀 = 旧卡死回归）`);
+          }
+        }
+      }
+    }
+  }
+  // ---- `value=...;return value` 时钟式脚本不得被误判成写回式 ----
+  // 3379996991 的 Clock/Date：update 只写形参（value=新值）再 return value，
+  // 从不读入参。写回式判据若只数 value 出现，会被函数签名/属性键/注释/return
+  // 骗到而清空 store，时钟日期不显示。这类必须 updateIsWriteback=false。
+  {
+    const cases = [
+      `export function update(value){ value = "14:30"; return value; }`,
+      `export function update(value){ var h=14,m=5; value=h+":"+m; return value; }`,
+      // 含 {value:false} 属性键与 //value 注释，形参仍只写不读
+      `export function update(value){
+        var o = { value: false };
+        // value == true 时怎样
+        value = "03:55PM";
+        return value;
+      }`,
+    ];
+    for (const src of cases) {
+      const sb = wtext.evalTextScript(src, {}, { text: "STATIC" });
+      if (sb?.updateIsWriteback !== false) errors.push(`时钟式 value=;return 脚本不得判为写回式: ${src.slice(0, 40)}`);
+      const r = sb.callUpdate("STATIC");
+      if (!r || r === "STATIC") errors.push(`时钟式脚本应返回计算值而非静态文本，实得 ${JSON.stringify(r)}`);
+    }
+    // 反向：真打字机（表达式里读 value）必须仍是写回式
+    const tw = wtext.evalTextScript(
+      "let n='';\nexport function update(value){ if(n.length<3) value=value+'x'; return value; }",
+      {}, { text: "STATIC" },
+    );
+    if (tw?.updateIsWriteback !== true) errors.push("表达式读 value 的打字机脚本应判为写回式");
   }
   // ---- scene 值优先于声明默认值 ----
   {
@@ -421,10 +540,158 @@ function runScripts() {
     }
   }
 
+  // ---- sandbox Vec3 数学面：lengthSqr + subtract 不可变（1712475860 Dino Run 互动熔断）----
+  // 脚本 3s 时生成首枚金币，`marioOrigin.subtract(origin).lengthSqr()` 缺方法 →
+  // 三连错熔断 → 跟随/点击跳/金币互动全死。判据覆盖两类向量（makeVec3 与 class Vec3）。
+  {
+    const sb = wtext.evalObjectScript(
+      "let a, b;\n" +
+        "export function init(value) {\n" +
+        "  a = thisLayer.origin;\n" +
+        "  b = a.subtract(new Vec3(1, 0, 0));\n" +
+        "}\n" +
+        "export function update(value) { return [a.x, b.lengthSqr(), new Vec3(1, 2, 2).lengthSqr()]; }\n",
+      {},
+      { layer: { name: "vec", origin: [5, 2, 0] } },
+    );
+    if (!sb) errors.push("vec 语义样例沙箱构建失败");
+    else {
+      sb.init(true);
+      const r = sb.callUpdate({});
+      const ax = Array.isArray(r) ? Number(r[0]) : NaN;
+      const ls = Array.isArray(r) ? Number(r[1]) : NaN;
+      const cls = Array.isArray(r) ? Number(r[2]) : NaN;
+      if (ax !== 5) errors.push(`subtract 变异左值：a.x 应恒 5，实得 ${ax}`);
+      if (Math.abs(ls - 20) > 1e-9) errors.push(`makeVec3.lengthSqr：期望 (4)²+(2)²=20，实得 ${ls}`);
+      if (Math.abs(cls - 9) > 1e-9) errors.push(`class Vec3.lengthSqr：期望 1+4+4=9，实得 ${cls}`);
+    }
+    const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+    if (!/lengthSqr\(\) \{/.test(src)) errors.push("makeVec3/Vec3 缺 lengthSqr（1712475860 互动熔断根因）");
+    if (!/subtract\(o\) \{ const b = normVec\(o\); return makeVec3/.test(src)) {
+      errors.push("makeVec3.subtract 必须返回新向量（变异实现会污染 marioOrigin）");
+    }
+  }
+
+  // ---- 真实语料：1712475860 Dino Run 互动脚本整段驱动 ----
+  // 不重建完整场景，靠 makeThisScene 的哑代理兜底：驱动 init + 5s+ 的 update
+  // （金币生成/漂移/收集判定全路径）+ cursorDown 跳跃，断言零出错、零熔断。
+  {
+    const pkgPath = join(
+      process.env.HOME || "",
+      "Library/Application Support/io.github.oneincase.wallpaperem/wallpapers/1712475860/scene.pkg",
+    );
+    if (!fs.existsSync(pkgPath)) {
+      console.log("  （跳过 1712475860 语料：本机无此壁纸）");
+    } else {
+      const pkgBytes = new Uint8Array(fs.readFileSync(pkgPath));
+      const sceneJson = JSON.parse(
+        new TextDecoder().decode(pkgContainer.getEntry(pkgContainer.parsePkg(pkgBytes), "scene.json")),
+      );
+      const marioObj = (sceneJson.objects || []).find(
+        (o) => o.name === "mario_walk_1" && o.visible && typeof o.visible === "object" && o.visible.script,
+      );
+      if (!marioObj) errors.push("语料缺 mario_walk_1.visible.script");
+      else {
+        const createdLayers = [];
+        const createArgs = [];
+        const marioLayer = { name: "mario_walk_1", origin: [107, 22.9, 0], size: [24, 24], visible: true };
+        const sb = wtext.evalObjectScript(marioObj.visible.script, {}, {
+          layer: marioLayer,
+          inputView: { cursorWorldPosition: { x: 300, y: 0, z: 0 } },
+          userProperties: { dino: "vita", level: "mountains", follow_cursor: true },
+          createSceneLayer: (cfg) => {
+            createArgs.push(cfg);
+            // 与真实 createSceneLayer 同形态：**无名**克隆层（id 递增）——
+            // destroyLayer 若只按名字查找必然落空（1712475860 金币不消失的根因）。
+            const l = { id: 1000 + createdLayers.length, origin: [0, 0, 0], size: [24, 24], visible: true };
+            createdLayers.push(l);
+            return l;
+          },
+          getSceneLayer: (n) => ({ name: n, origin: [0, 0, 0], size: [24, 24], visible: false }),
+          enumerateSceneLayers: () => [{ name: "postprocess" }, ...createdLayers],
+        });
+        if (!sb) errors.push("mario 脚本沙箱构建失败");
+        else {
+          sb.init(true);
+          sb.applyUserProperties({ dino: "vita", level: "mountains", follow_cursor: true });
+          // 驱动到首枚金币生成（coinTimer 3s → ~180 帧），再跑 300 帧过收集判定
+          let frames = 0;
+          while (createdLayers.length === 0 && frames < 600) {
+            sb.engine.frametime = 1 / 60;
+            sb.callUpdate(true);
+            frames++;
+          }
+          // 金币 x=360 以 50/s 左移，出屏（x<-10）约需 7.4s = ~444 帧；
+          // 跑 700 帧保证至少一枚完整飞出，覆盖销毁判定。
+          for (let i = 0; i < 700; i++) {
+            sb.engine.frametime = 1 / 60;
+            sb.callUpdate(true);
+          }
+          if (sb.errCount > 0) errors.push(`mario 脚本 ${sb.errCount} 次出错（lengthSqr 缺口复现）`);
+          if (sb.disabled) errors.push("mario 脚本被熔断（互动全停的根因复现）");
+          if (createdLayers.length === 0) errors.push("mario 脚本未生成金币（createLayer 链路异常）");
+          // 金币飞出左屏（x < -10）应被 destroyLayer 销毁——克隆层无名，
+          // 只按名字查找必然落空（1712475860 金币「吃了不消失」的根因复现）。
+          if (!createdLayers.some((l) => l.destroyed)) {
+            errors.push(`出屏金币未被销毁（${createdLayers.length} 层存活），destroyLayer 身份解析失效`);
+          }
+          // registerAsset 的返回值必须能流进 createLayer 成为路径字符串：
+          // 返回 undefined（旧 no-op）时 createLayer(undefined) 造出无贴图空层，金币不显示。
+          const strArgs = createArgs.filter((a) => typeof a === "string");
+          if (createArgs.length > 0 && strArgs.length !== createArgs.length) {
+            errors.push(`registerAsset 返回值未进入 createLayer（收到非路径参数：${createArgs.map((a) => typeof a).join(",")}）`);
+          }
+          if (!createArgs.some((a) => /models\/coin_0\.json$/.test(String(a)))) {
+            errors.push(`createLayer 未收到金币模型路径：${createArgs.map(String).slice(0, 3).join(", ")}`);
+          }
+          // 跟随光标：mario.x 应向 300 方向移动
+          if (!(marioLayer.origin[0] > 107.5)) {
+            errors.push(`跟随光标未生效：mario.x=${Number(marioLayer.origin[0]).toFixed(2)}（初值 107）`);
+          }
+          // 点击跳：cursorDown → jumpVelocity>0 → y 上升
+          sb.callCursor("cursorDown", {});
+          let jumped = false;
+          for (let i = 0; i < 20; i++) {
+            sb.engine.frametime = 1 / 60;
+            sb.callUpdate(true);
+            if (Number(marioLayer.origin[1]) > 23.5) { jumped = true; break; }
+          }
+          if (!jumped) errors.push("cursorDown 后 mario.y 未上升（点击跳失效）");
+        }
+      }
+    }
+  }
+
+  // ---- registerAsset / createLayer 资产实例化接线（1712475860 金币不显示）----
+  {
+    const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+    if (!/registerAsset: \(p\) => p,/.test(src)) {
+      errors.push("registerAsset 必须返回路径（返回值喂给 createLayer；返回 undefined 造无贴图空层）");
+    }
+    const mount = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    // canvas.width/height 重设会清空整个 2D 上下文状态（font/transform/textBaseline
+    // 回默认 10px sans-serif）。measure 阶段设的 ctx.font 在「画布尺寸变化那帧」丢失，
+    // drawTextLayer 若透传 ctx.font 会把大字按 10px 画、缩放后只剩几个像素
+    // （2468489223 白色时钟整层不可见，纹理仅 43 不透明像素）。
+    // 契约：drawTextLayer 的 font 必须用显式保存的 fontCss，不能读 ctx.font。
+    if (!/font:\s*fontCss/.test(mount)) {
+      errors.push("drawTextLayer 的 font 必须用显式 fontCss（canvas 尺寸重设会把 ctx.font 重置成 10px，透传 ctx.font 会让大字时钟不可见）");
+    }
+    if (!/assetToMount = \{ path: imagePath, kind: "model" \}/.test(mount)) {
+      errors.push("createSceneLayer 缺少 models/ 资产实例化分支（无模板层时金币造不出来）");
+    }
+    if (!/assetToMount = \{ path: imagePath, kind: "particle" \}/.test(mount)) {
+      errors.push("createSceneLayer 缺少 particles/ 资产实例化分支（coinget 特效造不出来）");
+    }
+    if (!/clone\.runtimeCreated = true;/.test(mount)) {
+      errors.push("克隆层缺 runtimeCreated 标记（粒子系统无法识别运行期层，特效钉在 (0,0)）");
+    }
+    if (!/ps\.layer && ps\.layer\.runtimeCreated\) ps\.syncLayerTransform\(\)/.test(mount)) {
+      errors.push("粒子推进缺 runtimeCreated 系统的逐帧变换重读（特效会钉在构造点 0,0）");
+    }
+  }
+
   // ---- Vec2 + 效果常量读指针（3791967416 聚光灯 delayedPointer）----
-  // juguangdeng 基于 xray，位置却不走 g_PointerPosition，而是常量脚本
-  // `return new Vec2(cursorScreenPosition / screenResolution)` 再 lerp。
-  // 沙箱没有 Vec2 → ReferenceError 熔断；常量沙箱不传 inputView → 灯钉在 (0,0)。
   {
     const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
     if (!/const Vec2 = Vec3/.test(src) || !/'Vec2'/.test(src)) {

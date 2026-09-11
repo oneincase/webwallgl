@@ -463,11 +463,31 @@ export function parseScene(sceneJson, project) {
         visibleScript: e.visible && typeof e.visible === 'object' && typeof e.visible.script === 'string' && e.visible.script
           ? { script: e.visible.script, scriptproperties: e.visible.scriptproperties || null, value: !!e.visible.value }
           : null,
-        passes: (e.passes || []).map((p) => ({
-          combos: p.combos || {},
-          constantshadervalues: p.constantshadervalues || {},
-          textures: p.textures || [],
-        })),
+        passes: (e.passes || []).map((p) => {
+          // [we-scene patch] pass 级 usertextures 合并（全库 122 处 / 33 张，清一色
+          // $mediaThumbnail / $mediaPreviousThumbnail）：作者把封面绑在效果贴图槽时，
+          // scene.json 的 textures 槽留的是默认占位图（workshop/.../500x500），真正的
+          // 绑定在 usertextures[i].name。不合并封面永远停在占位灰块（3785267658 的
+          // Vinyl Cover / Albuim Art、3786330502 的播放器封面）。
+          const base = p.textures || [];
+          const ut = p.usertextures;
+          let textures = base;
+          if (Array.isArray(ut)) {
+            for (let i = 0; i < ut.length; i++) {
+              const u = ut[i];
+              const name = u && typeof u === 'object' && typeof u.name === 'string' ? u.name
+                : typeof u === 'string' ? u : null;
+              if (!name) continue;
+              if (textures === base) textures = base.slice();
+              textures[i] = name;
+            }
+          }
+          return {
+            combos: p.combos || {},
+            constantshadervalues: p.constantshadervalues || {},
+            textures,
+          };
+        }),
       })),
     }
   })

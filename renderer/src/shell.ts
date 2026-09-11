@@ -6,6 +6,7 @@
 // 壁纸页（main.ts）创建全屏运行时；公共 API（api/mount.ts）每个实例创建自己的。
 //
 // 依赖方向：shell ← web / media / scene-mount / dispatch / api / main（单向，无环）。
+import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math.js";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 import type { VideoLoopPair } from "./video-loop";
 
@@ -36,6 +37,14 @@ export type Runtime = {
   video?: HTMLVideoElement;
   /** 场景内视频纹理循环对（每纹理一个） */
   videoPairs?: VideoLoopPair[];
+  /**
+   * 视频壁纸「重新静音时应切回 WebCodecs 静音循环」标记。
+   * 取消静音会把 WebCodecs 路径回退成 A/B <video>（要音轨）；当音量回到 0 时
+   * mount.ts 的 setVolume 据此重挂回 WebCodecs 路径（循环点帧级精确、帧率上限
+   * 真正生效）。A/B 挂载时按 supportsWebCodecsVideo() 置位；WebCodecs 解码失败
+   * 的回退会清零（别再尝试切回）。clear() 复位。
+   */
+  webcodecsPreferred?: boolean;
   img?: HTMLImageElement;
   iframe?: HTMLIFrameElement;
   /**
@@ -150,6 +159,11 @@ export type Runtime = {
   wrap?: HTMLDivElement;
   /** cover 裁切预览的对齐状态（竖屏顶/底热区滑动） */
   coverAlign: { x: number; y: number; tx: number; ty: number };
+  /**
+   * cover 窥视的逐轴门控基准（场景挂载时由 scene-mount 写入：可见内容包围盒 +
+   * 投影画布）。缺省（媒体/网页壁纸、未挂场景）视为两轴都溢出 = 既有行为。
+   */
+  coverPeek?: { contentW: number; contentH: number; projW: number; projH: number };
   /** 实例级帧率计（见 frameStats） */
   frameMeter: { stamps: number[]; last: number; fps: number };
   /** 实例注册的 window/document 级监听，destroy 时成对摘除（**跨壁纸存活**） */
@@ -249,6 +263,7 @@ export function clear(rt: Runtime) {
   // （视频壁纸本身已是单 video + 原生 loop，无需在此处理）
   for (const p of rt.videoPairs ?? []) p.destroy();
   rt.videoPairs = undefined;
+  rt.webcodecsPreferred = undefined;
   // 装配层自己登记的清理（链式，见各 mount* 的 `const prev = rt.sceneCleanup`）。
   // **必须 try/catch**：链上任何一环抛出都会让下面的 renderer.dispose /
   // 视频元素回收 / revokeObjectURL 全部跳过 —— 一次异常就漏一个 WebGL 上下文
@@ -440,6 +455,17 @@ export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string) {
 const COVER_EDGE_PX = 96;
 const COVER_LERP = 0.14;
 
+// 逐轴窥视门控：内容包围盒没溢出 cover 视窗的轴不允许滑动（target 与当前值都钉回
+// 居中，避免残留 target 在热区离开后继续拖动）。没有场景基准（媒体/网页壁纸）时
+// 两轴都放行 = 既有行为。
+function peekAxes(rt: Runtime): { x: boolean; y: boolean } {
+  const cp = rt.coverPeek;
+  if (!cp) return { x: true, y: true };
+  const view = coverViewSize(cp.projW, cp.projH, window.innerWidth, window.innerHeight);
+  if (!view) return { x: true, y: true };
+  return coverPeekOverflow(cp.contentW, cp.contentH, view.viewW, view.viewH);
+}
+
 export function resetCoverAlign(rt: Runtime) {
   rt.coverAlign.x = rt.coverAlign.y = rt.coverAlign.tx = rt.coverAlign.ty = 0.5;
   applyCoverAlignToDom(rt);
@@ -463,6 +489,12 @@ export function advanceCoverAlign(rt: Runtime): { x: number; y: number } {
     applyCoverAlignToDom(rt);
     return rt.coverAlign;
   }
+  // 无溢出的轴钉回居中：热区残留下来的 target 不许继续拖动视窗
+  const axes = peekAxes(rt);
+  if (!axes.x) rt.coverAlign.tx = 0.5;
+  if (!axes.y) rt.coverAlign.ty = 0.5;
+  if (!axes.x) rt.coverAlign.x = 0.5;
+  if (!axes.y) rt.coverAlign.y = 0.5;
   rt.coverAlign.x += (rt.coverAlign.tx - rt.coverAlign.x) * COVER_LERP;
   rt.coverAlign.y += (rt.coverAlign.ty - rt.coverAlign.y) * COVER_LERP;
   if (Math.abs(rt.coverAlign.x - rt.coverAlign.tx) < 0.001) rt.coverAlign.x = rt.coverAlign.tx;
@@ -493,8 +525,11 @@ function onCoverPointer(rt: Runtime, clientX: number, clientY: number, inside: b
   const h = Math.max(1, window.innerHeight);
   const edgeX = Math.min(0.22, Math.max(0.1, COVER_EDGE_PX / w));
   const edgeY = Math.min(0.22, Math.max(0.1, COVER_EDGE_PX / h));
-  rt.coverAlign.tx = axisTarget(clientX / w, edgeX);
-  rt.coverAlign.ty = axisTarget(clientY / h, edgeY);
+  // 逐轴门控：内容在该轴没被裁掉（1920911984 的旋转横条纵向只有 610）就不滑动，
+  // 否则热区会把视窗滑出内容区（整屏空白）。
+  const axes = peekAxes(rt);
+  rt.coverAlign.tx = axes.x ? axisTarget(clientX / w, edgeX) : 0.5;
+  rt.coverAlign.ty = axes.y ? axisTarget(clientY / h, edgeY) : 0.5;
   ensurePeekTick(rt);
 }
 

@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -101,6 +101,7 @@ The library makes only two network requests (scene.pkg and optional project.json
 
 | Factory | Use case |
 | --- | --- |
+| `1.3.16` | 2026-09-11 | Media-component fixes and branding: (1) album covers on 33 wallpapers rendered as black placeholders because the $mediaThumbnail / $mediaPreviousThumbnail binding in an effect pass usertextures slot was dropped by parsing; the binding is now merged so covers show. (2) media title/artist layers were blank because width-limited wrapping was squeezed by the 2x2 placeholder box; the text canvas now grows only for placeholder-sized boxes, and typewriter scripts no longer stick at the placeholder text. (3) simulated audio is now true stereo. (4) the simulated media source is rebranded: title WebWallGL, artist oneincase, cover is the library logo. (5) fix lost font after the shared text canvas is resized: assigning textCanvas.width/height resets the 2D context and wipes the font back to the default 10px, so large clocks/dates were nearly invisible (2468489223, 3379996991); drawing now uses an explicit font string. (6) fix clock/date scripts misclassified as writeback and having their text cleared (3379996991). |
 | `httpSource(baseUrl, init?)` | HTTP base URL; falls back through the three real layouts: scene.pkg → scenes/scene.pkg → gifscene.pkg |
 | `fileSource(file, project?)` | A local .pkg from &lt;input type=file> or drag & drop |
 | `bytesSource(pkg, project?, key?)` | Bytes already in hand (bundled, IndexedDB cache, custom transport) |
@@ -328,7 +329,7 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.15. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.16. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |

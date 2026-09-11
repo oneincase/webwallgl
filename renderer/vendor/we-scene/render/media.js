@@ -31,6 +31,8 @@
 // 21 张壁纸也没有一处用到。放在这里是为了给宿主/自制壁纸提供统一数据源，
 // 通过 mediaLyricsChanged 派发，不与 WE 的四类语义混淆。
 
+import { MEDIA_LOGO_DATA_URL } from './media-logo.js'
+
 export const MEDIA_PLAYBACK = { STOPPED: 0, PLAYING: 1, PAUSED: 2 }
 
 /** 与 text.js 的 Vec3 保持同一套链式 API（脚本会做 subtract/multiply/add） */
@@ -58,49 +60,64 @@ class MediaVec3 {
 
 export function mediaVec3(x, y, z) { return new MediaVec3(x, y, z) }
 
-// 模拟播放列表。时长取真实歌曲量级（3~4 分钟），配色各不相同以便肉眼确认
-// 「换歌 → 封面主色跟着变」这条链路确实通了。
+// [we-scene patch] 模拟播放列表 = 库自己的品牌曲：曲名一律 WebWallGL、歌手一律
+// oneincase、封面一律本库 logo（media-logo.js 的 data URL），专辑名区分四首
+// （Scene / Web / Video / Live，正好对应库支持的壁纸类型，切歌时肉眼仍能确认
+// 轮换链路是通的）。配色取 logo 的橙日 / 深蓝夜空 / 钢蓝山脉，四首一致 ——
+// 与场景侧从封面位图重采样得到的调色板保持同色。
+// 此前是四首虚构乐队歌（夜航星/Amber Lantern/苔痕/Neon Ashes）+ 程序化渐变封面，
+// 用户明确要求换成库品牌；时长仍取真实歌曲量级（3~4 分钟）。
+const LOGO_COLORS = {
+  primary: [0.96, 0.65, 0.14],   // 橙日
+  secondary: [0.08, 0.11, 0.18], // 深蓝夜空
+  tertiary: [0.66, 0.74, 0.88],  // 钢蓝山脉
+  text: [0.96, 0.97, 1.0],
+}
 const PLAYLIST = [
   {
-    title: '夜航星', artist: '相位迁移', album: '深空回声', albumArtist: '相位迁移',
+    title: 'WebWallGL', artist: 'oneincase', album: 'Scene', albumArtist: 'oneincase',
     duration: 212,
-    colors: { primary: [0.24, 0.42, 0.86], secondary: [0.12, 0.18, 0.42], tertiary: [0.62, 0.74, 0.98], text: [0.95, 0.97, 1.0] },
+    colors: LOGO_COLORS,
+    thumbnail: MEDIA_LOGO_DATA_URL,
     lyrics: [
-      [0, '在无光的航道上'], [12, '我们只带走彼此的名字'], [26, '引擎低鸣像一句旧诺言'],
-      [41, '把黑暗折成两半'], [58, '夜航星啊'], [72, '别在中途熄灭'],
-      [95, '（间奏）'], [126, '如果坐标终将失效'], [140, '就让轨迹自己说话'],
-      [158, '我们不返航'], [176, '也不遗憾'], [198, '……'],
+      [0, '场景一层层亮起'], [12, '骨骼与粒子各就各位'], [26, '脚本在沙箱里苏醒'],
+      [41, '把每一帧交给时间'], [58, 'WebWallGL'], [72, '场景正在呼吸'],
+      [95, '（间奏）'], [126, '图层排成星轨'], [140, '效果链一寸寸点亮'],
+      [158, '我们不渲染黑暗'], [176, '只渲染光'], [198, '……'],
     ],
   },
   {
-    title: 'Amber Lantern', artist: 'Hollow Coast', album: 'Tidewater', albumArtist: 'Hollow Coast',
+    title: 'WebWallGL', artist: 'oneincase', album: 'Web', albumArtist: 'oneincase',
     duration: 187,
-    colors: { primary: [0.93, 0.62, 0.24], secondary: [0.44, 0.24, 0.10], tertiary: [0.99, 0.82, 0.56], text: [1.0, 0.98, 0.93] },
+    colors: LOGO_COLORS,
+    thumbnail: MEDIA_LOGO_DATA_URL,
     lyrics: [
-      [0, 'Salt on the window frame'], [14, 'a lantern swinging slow'], [30, 'you said the tide forgets'],
-      [46, 'but the harbour never does'], [63, 'Amber lantern, burn a little longer'],
-      [88, '(instrumental)'], [118, 'Every rope remembers the knot'], [134, 'every shore remembers the leaving'],
-      [152, 'burn a little longer'], [170, 'for me'],
+      [0, 'iframe 里有一座城'], [14, 'shim 为它点亮路灯'], [30, '指针翻过山脊'],
+      [46, '事件按时到达'], [63, 'WebWallGL，网页正在播放'],
+      [88, '(instrumental)'], [118, '每一帧都是同源'], [134, '每一次点击都有回声'],
+      [152, '网页正在播放'], [170, '不停歇'],
     ],
   },
   {
-    title: '苔痕', artist: '林间电台', album: '半山雨', albumArtist: '林间电台',
+    title: 'WebWallGL', artist: 'oneincase', album: 'Video', albumArtist: 'oneincase',
     duration: 241,
-    colors: { primary: [0.30, 0.68, 0.44], secondary: [0.10, 0.28, 0.20], tertiary: [0.72, 0.92, 0.78], text: [0.96, 1.0, 0.97] },
+    colors: LOGO_COLORS,
+    thumbnail: MEDIA_LOGO_DATA_URL,
     lyrics: [
-      [0, '雨停在第三级台阶'], [16, '苔痕爬满了旧门牌'], [33, '你说慢一点也没关系'],
-      [52, '山不会走'], [70, '而我们有的是时间'], [92, '（间奏）'],
-      [130, '把伞收起来吧'], [148, '让潮气记住这一刻'], [172, '慢一点'], [200, '真的没关系'], [226, '……'],
+      [0, '解码器推开第一帧'], [16, '循环点没有缝隙'], [33, '帧率贴着心跳走'],
+      [52, '画面不旧'], [70, '时间一直新'], [92, '（间奏）'],
+      [130, '把像素交给硬件'], [148, '把流畅留给眼睛'], [172, '一圈一圈'], [200, '都是第一圈'], [226, '……'],
     ],
   },
   {
-    title: 'Neon Ashes', artist: 'VELVET//NULL', album: 'Afterimage', albumArtist: 'VELVET//NULL',
+    title: 'WebWallGL', artist: 'oneincase', album: 'Live', albumArtist: 'oneincase',
     duration: 168,
-    colors: { primary: [0.86, 0.22, 0.58], secondary: [0.30, 0.06, 0.22], tertiary: [0.99, 0.64, 0.86], text: [1.0, 0.94, 0.98] },
+    colors: LOGO_COLORS,
+    thumbnail: MEDIA_LOGO_DATA_URL,
     lyrics: [
-      [0, 'city bleeds into the lens'], [11, 'we were only afterimage'], [24, 'neon ashes on your coat'],
-      [38, 'nothing here stays lit'], [55, 'burn out with me'], [76, '(drop)'],
-      [104, 'nothing here stays lit'], [122, 'burn out with me'], [146, '…'],
+      [0, '麦克风听见房间'], [11, '频谱开出六十四个窗口'], [24, '正在播放的歌'],
+      [38, '有名字也有封面'], [55, 'WebWallGL 实况'], [76, '(drop)'],
+      [104, '系统在说它在听'], [122, '壁纸在跟着唱'], [146, '…'],
     ],
   },
 ]
@@ -125,6 +142,9 @@ export function createSimulatedMedia(seed = 20260901) {
     title: '', artist: '', album: '', albumArtist: '',
     position: 0, duration: 0,
     hasThumbnail: false,
+    /** 当前曲封面（data URL）。网页壁纸的 mediaThumbnailChanged 直接透传；
+     * 场景壁纸由宿主解码上传成 $mediaThumbnail 纹理（1.3.7 通道） */
+    thumbnail: '',
     // 颜色恒为 Vec3 实例（见文件头的类型约定）
     primaryColor: new MediaVec3(0, 0, 0),
     secondaryColor: new MediaVec3(0, 0, 0),
@@ -183,6 +203,8 @@ export function createSimulatedMedia(seed = 20260901) {
     else snapshot.state = MEDIA_PLAYBACK.PLAYING
 
     snapshot.hasThumbnail = !inGap
+    // 曲间空隙没有封面（与 hasThumbnail 同步）；有曲时给当前曲封面（本库 logo）
+    snapshot.thumbnail = inGap ? '' : (tr.thumbnail || '')
     const c = tr.colors
     snapshot.primaryColor = new MediaVec3(c.primary[0], c.primary[1], c.primary[2])
     snapshot.secondaryColor = new MediaVec3(c.secondary[0], c.secondary[1], c.secondary[2])

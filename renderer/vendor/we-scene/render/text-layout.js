@@ -30,14 +30,16 @@ export function effectiveTextPadding(boxW, boxH, padding) {
 export function layoutText(content, opts, measure) {
   const boxW = Math.max(1, opts.boxW)
   const boxH = Math.max(1, opts.boxH)
-  const pad = effectiveTextPadding(boxW, boxH, opts.padding || 0)
   const spacing = opts.spacing || [0, 0]
   const lineHeight = Math.max(1, opts.lineHeight || (opts.pointsize || 24) * 1.25 + spacing[1])
-  const innerW = Math.max(1, boxW - pad * 2)
   // WE 只有 limitwidth（+maxwidth）开启才换行；关闭时整行溢出盒子继续画
   // （宿主画布已预留溢出边距）。实测反例：2134765860 时钟 302 盒 + padding 82 不开
   // limitwidth，按内宽换行会把 "20:47:41" 竖着摞成三行。
-  const wrapW = opts.limitwidth && opts.maxwidth > 0 ? Math.min(opts.maxwidth, innerW) : Infinity
+  // [we-scene patch] 换行宽度只认 maxwidth，不能再 min(innerW)：媒体文字层的盒子是
+  // 占位尺寸（歌名/歌手层常是 2×2，WE 运行时按内容重排），钳到 innerW=2 会让每个
+  // 字都换行，再被 maxrows=1+ellipsis 收成单独一个「…」（3785267658 牛来的歌名/
+  // 歌手因此整层空白）。作者设 maxwidth 就是要的换行约束，与盒子占位宽无关。
+  const wrapW = opts.limitwidth && opts.maxwidth > 0 ? opts.maxwidth : Infinity
 
   // 限宽换行：优先在空白断；CJK 无空格则硬断。逐字 measure 对挂件级文本量足够。
   function wrapOne(text) {
@@ -108,6 +110,56 @@ export function layoutText(content, opts, measure) {
     return { text, width: w, x, y: y0 + i * lineHeight }
   })
   return { lines: out, lineHeight, totalH, truncated, boxW, boxH }
+}
+
+/**
+ * 墨水量界 → 画布边距（scene-mount updateTexts 用，纯函数、可离线校验）。
+ * 返回 [marginLeft, marginTop, marginRight, marginBottom]：盒外四个方向各需要
+ * 多少额外边距才能完整装下排版结果（不含字形超出行盒的少量抗锯齿墨晕，
+ * 那部分由基础边距 cover）。
+ */
+export function inkOverflow(layout, boxW, boxH) {
+  let inkL = Infinity, inkR = -Infinity, inkT = Infinity, inkB = -Infinity
+  for (const ln of layout.lines || []) {
+    inkL = Math.min(inkL, ln.x)
+    inkR = Math.max(inkR, ln.x + ln.width)
+    inkT = Math.min(inkT, ln.y)
+    inkB = Math.max(inkB, ln.y + (layout.lineHeight || 0))
+  }
+  if (!layout.lines || !layout.lines.length) return [0, 0, 0, 0]
+  return [
+    Math.max(0, -inkL),
+    Math.max(0, -inkT),
+    Math.max(0, inkR - boxW),
+    Math.max(0, inkB - boxH),
+  ]
+}
+
+/**
+ * 对称扩边后的统一边距：盒中心 = 画布中心 = 层 origin 不动（墨水在屏幕上的
+ * 位置不随扩边移动），只长透明边距。媒体文字层的盒子是占位尺寸（歌名/歌手
+ * 层常是 2×2，WE 运行时按内容重排），不扩边长标题会被画布边缘截没
+ * （3785267658 整层空白）。
+ */
+export function textCanvasMarginGrow(layout, boxW, boxH, baseMargin) {
+  const [l, t, r, b] = inkOverflow(layout, boxW, boxH)
+  return Math.max(baseMargin, l, t, r, b)
+}
+
+/**
+ * 媒体组件的歌名/歌手文字层是否需要按内容对称扩边（scene-mount updateTexts 用，
+ * 纯函数、可离线校验）。两个条件缺一不可——曾因只看「盒子小」误伤一批普通层：
+ *   - boxW/H ≤ 4：媒体组件文字层的盒子是 WE 占位尺寸（2×2，WE 运行时按内容重排）；
+ *     正常大盒自有几何，扩边改 quad 会把好字挪出可见区（2938612768 标题被裁）。
+ *   - hasMediaHook：沙箱挂了 media* 回调。三体 3509243656 的 time/State/Tx 等
+ *     2×2 是脚本驱动的普通文本，内容动态，扩边会让 size 每帧跟着内容跳变。
+ *
+ * 返回 true 不代表一定会改 size：调用方仍要用 textCanvasMarginGrow 算边距——
+ * 墨水在「盒 + 基础边距」内装得下时它会退回基础边距，layer.size 与原来一致
+ * （短词 Paused/Playing 因此保持作者原布局，不依赖这里做字宽预判）。
+ */
+export function shouldGrowMediaPlaceholder(boxW, boxH, hasMediaHook) {
+  return boxW <= 4 && boxH <= 4 && !!hasMediaHook
 }
 
 /**

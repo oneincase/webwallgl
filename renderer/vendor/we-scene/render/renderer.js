@@ -13,7 +13,7 @@ import { hlsl2glsl } from './hlsl2glsl.js'
 //   renderer.js       本文件：createRenderer（GL 上下文、缓存、装配与三级绘制循环）
 // ALIGN / makeTexture / makeTextureMip 仍从本文件 re-export（verify-pointer、
 // main.ts 等既有 import 方不变）。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
@@ -113,6 +113,22 @@ export function colorBlendPlan(colorBlendMode) {
 }
 
 /**
+ * 层最终合成到画布时用哪个混合模式。
+ *
+ * 优先 scene.json 对象自带的 colorBlendMode（非 0）；对象没写（默认 0）时回退到
+ * **基色材质的 blending 字段**：材质声明 additive 的发光层（黑底光斑贴图，
+ * 2734266359 的两个 spot overlay）必须加法合成，否则全不透明黑底按 translucent
+ * 糊成一整块黑方块。全库「additive 材质 + 对象无 colorBlendMode」只有 3 层
+ * （2734266359 ×2、3789604238 ×1），其余 additive 材质的对象都带 colorBlendMode，
+ * 所以这个回退不会改变既有壁纸的行为。纯函数，verify-groups 直接跑。
+ */
+export function layerCompositeBlendMode(colorBlendMode, materialBlending) {
+  const m = Number(colorBlendMode)
+  if (Number.isFinite(m) && m !== 0) return m
+  return materialBlending === 'additive' ? 9 : (Number.isFinite(m) ? m : 0)
+}
+
+/**
  * [we-scene patch] 这个 colorBlendMode 是否必须走 shader 侧混合（回读背景）。
  *
  * COLOR_BLEND_GL 只收录能用固定管线 blendFunc 表达的 5 个编号（2/6/7/9/31）。
@@ -186,6 +202,62 @@ export function effectFboSize(fboDef, baseW, baseH) {
     }
   }
   return [w, h]
+}
+
+/**
+ * 内置 Bloom 后期（general.bloom）的参数解析。纯函数，离线判据直接跑这个。
+ *
+ * 「HDR 切换无效果」的根因是 general.bloom 没有任何消费者（壁纸把 hdr 属性绑在
+ * `general.bloom` 上做 SDR/HDR 后期切换）。参数到 WE 内置 Bloom（localeffects
+ * 2822917890）uniform 的映射，按字段名与材质注释逐一对号：
+ *   bloomhdrscatter → u_radius（材质 label 就叫 "Scatter"）；bloomhdriterations →
+ *   u_iterations；bloomhdrstrength / bloomstrength → u_strength；bloomhdrthreshold /
+ *   bloomthreshold → u_threshold；bloomhdrfeather → u_damp（"Damp brightness"，
+ *   亮部阈值软边；命名对应是推断，语料值 0~0.3 落在合理区间）；bloomtint → u_tint。
+ *
+ * `general.hdr === true`（场景以 HDR 模式保存的旗标，全库 4 张 hdr 绑定壁纸都是
+ * true）用 bloomhdr* 家族；否则用经典 strength/threshold/tint，未指定的迭代/散射/
+ * 软边取材质默认 8 / 3 / 0.5。strength ≤ 0.001 时 WE 原 shader 全部分支直通
+ * （light_map/blur 输出 0、apply 直通场景），等价于无 bloom —— 调用方据此跳过。
+ *
+ * **亮度判定口径（metric）**：
+ * 经典家族（metric=0）= WE 引擎 `downsample_quarter_bloom` 原样——
+ * `albedo × saturate(max(r,g,b) − threshold)` 软拐点（只留超阈能量，亮场景
+ * 不会全屏通过）→ 饱和度 ×2 → ×strength 一次（2026-09-11 起，取代误用的
+ * 「pow2.2 + 三通道求和硬判定 + blur 双程 strength²」，3791670523 等整屏冲白）。
+ * HDR 家族（metric=1）= 既有 raw sRGB 亮度 + 软窗口校准（2646504847 过曝修复，
+ * threshold 以 1.0=白点标定）；其真身是 fp16 金字塔 + combine_hdr，尚未重写。
+ */
+export function bloomPostParams(general) {
+  const g = general || {}
+  const boolOf = (v, dflt) => {
+    const raw = v !== null && typeof v === 'object' ? v.value : v
+    if (raw === true || raw === 1) return true
+    if (raw === false || raw === 0) return false
+    return dflt
+  }
+  const numOf = (v, dflt) => {
+    const raw = v !== null && typeof v === 'object' ? v.value : v
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : dflt
+  }
+  if (!boolOf(g.bloom, false)) return null
+  const hdrMode = boolOf(g.hdr, false)
+  const strength = hdrMode ? numOf(g.bloomhdrstrength, 1.5) : numOf(g.bloomstrength, 1.5)
+  const tint = parseVec3Local(g.bloomtint || '1 1 1')
+  return {
+    enabled: true,
+    hdr: hdrMode,
+    strength,
+    threshold: hdrMode ? numOf(g.bloomhdrthreshold, 0.1) : numOf(g.bloomthreshold, 0.65),
+    iterations: Math.max(1, Math.round(hdrMode ? numOf(g.bloomhdriterations, 8) : 8)),
+    radius: Math.max(0, hdrMode ? numOf(g.bloomhdrscatter, 3) : 3),
+    damp: hdrMode ? numOf(g.bloomhdrfeather, 0.5) : 0.5,
+    alpha: 1,
+    tint,
+    // 亮度判定口径：HDR 家族 = raw sRGB 亮度 + 软窗口（shader u_Metric=1），
+    // 经典家族 = 引擎 downsample_quarter_bloom 软拐点（u_Metric=0）。见上方注释。
+    metric: hdrMode ? 1 : 0,
+  }
 }
 
 /**
@@ -355,10 +427,21 @@ export function createRenderer(canvas, opts = {}) {
   }
   // [we-scene patch] 容器效果画布的首帧诊断开关
   let containerDiagDone = false
+  // [we-scene patch] 内置 Bloom 门控的一次性诊断（HDR 开关无效果时的定位入口）
+  let bloomDiagDone = false
+  // 稳态采样点（挂载后第 1/120/600 帧 → reportDiag，HDR 无效果/过曝定位入口；
+  // 可用 opts.bloomDebugFrames = 0 关闭）
+  let bloomFrameCount = 0
+  let bloomDebugFrames = typeof opts.bloomDebugFrames === 'number' ? opts.bloomDebugFrames : 3
 
   const copyProg = linkProgram(gl, COPY_VERT, COPY_FRAG)
   const compProg = linkProgram(gl, COPY_VERT, COMPOSITE_FRAG)
   const backdropProg = linkProgram(gl, COPY_VERT, BACKDROP_FRAG)
+  // [we-scene patch] 内置 Bloom 后期（general.bloom；HDR 开关绑在这里）。
+  // 三段 program 见 renderer-glsl.js 的 BLOOM_* 注释，语义 = WE localeffects/Bloom。
+  const bloomLightProg = linkProgram(gl, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG)
+  const bloomBlurProg = linkProgram(gl, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG)
+  const bloomApplyProg = linkProgram(gl, COPY_VERT, BLOOM_APPLY_FRAG)
   // [we-scene patch] 固定管线表达不了的 colorBlendMode（ColorBurn/Overlay/HSL 系…）
   // 走这条：回读背景当纹理，在 shader 里用 ApplyBlending 算完直接写。见 shaderBlendMode。
   const compBlendProg = linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG)
@@ -1132,6 +1215,32 @@ export function createRenderer(canvas, opts = {}) {
     canvasSize: gl.getUniformLocation(compBlendProg, 'u_CanvasSize'),
     opacity: gl.getUniformLocation(compBlendProg, 'u_Opacity'),
   }
+  const bloomLightUni = {
+    tex: gl.getUniformLocation(bloomLightProg, 'u_Tex'),
+    texel: gl.getUniformLocation(bloomLightProg, 'u_Texel'),
+    damp: gl.getUniformLocation(bloomLightProg, 'u_Damp'),
+    alpha: gl.getUniformLocation(bloomLightProg, 'u_Alpha'),
+    strength: gl.getUniformLocation(bloomLightProg, 'u_Strength'),
+    threshold: gl.getUniformLocation(bloomLightProg, 'u_Threshold'),
+    metric: gl.getUniformLocation(bloomLightProg, 'u_Metric'),
+  }
+  const bloomBlurUni = {
+    tex: gl.getUniformLocation(bloomBlurProg, 'u_Tex'),
+    texel: gl.getUniformLocation(bloomBlurProg, 'u_Texel'),
+    res: gl.getUniformLocation(bloomBlurProg, 'u_Res'),
+    radius: gl.getUniformLocation(bloomBlurProg, 'u_Radius'),
+    dir: gl.getUniformLocation(bloomBlurProg, 'u_Dir'),
+    alpha: gl.getUniformLocation(bloomBlurProg, 'u_Alpha'),
+    strength: gl.getUniformLocation(bloomBlurProg, 'u_Strength'),
+    iterations: gl.getUniformLocation(bloomBlurProg, 'u_Iterations'),
+  }
+  const bloomApplyUni = {
+    mvp: gl.getUniformLocation(bloomApplyProg, 'u_MVP'),
+    tex: gl.getUniformLocation(bloomApplyProg, 'u_Tex'),
+    alpha: gl.getUniformLocation(bloomApplyProg, 'u_Alpha'),
+    strength: gl.getUniformLocation(bloomApplyProg, 'u_Strength'),
+    tint: gl.getUniformLocation(bloomApplyProg, 'u_Tint'),
+  }
   const IDENT_M4 = mat4Identity()
   const IDENT_M3 = mat3Identity()
   function setBlend(mode) {
@@ -1449,7 +1558,9 @@ export function createRenderer(canvas, opts = {}) {
         gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
       }
     } else {
-      setColorBlend(layer.colorBlendMode)
+      // 对象无 colorBlendMode 时回退基色材质的 blending（additive 发光层的黑底
+      // 必须加法合成，2734266359 spot overlay 黑方块）。见 layerCompositeBlendMode。
+      setColorBlend(layerCompositeBlendMode(layer.colorBlendMode, layer.materialBlending))
     }
     // Screen/Multiply 必须在 shader 里先按 src.a 处理一遍，见 BLEND_PREP 注释。
     // 这条路径是所有「效果链层」和「直接层」的最终合成出口，统一在这里设置。
@@ -1611,6 +1722,83 @@ export function createRenderer(canvas, opts = {}) {
     // copyTexImage2D 一次完成「分配 + 拷贝」，画布尺寸变化自动跟随
     gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, width, height, 0)
     return backdropTex
+  }
+
+  // [we-scene patch] 内置 Bloom 后期（general.bloom）。「部分壁纸提供 HDR 属性、
+  // 切换后无任何效果」的根因：hdr 属性绑在 general.bloom 上（2902406982 /
+  // 3287715210 / 3299228616 / 3764725758），而内置 Bloom 此前没有任何消费者。
+  //
+  // WE 的运行时实现 = localeffects "Bloom"（2822917890）整屏后期：
+  // light_map → 1/4 分辨率亮部图 → 双向高斯 → Add 合成回场景。effect.json 的
+  // 两个 _rt_buffer 都是 scale:4，这里用 getFBO 同尺寸缓存。
+  //
+  // 场景纹理用 captureBackdrop 的画布回读（copyTexImage2D，RGB8）：不动主循环
+  // 的绘制路径，零风险拿到「本帧最终画面」。light_map 4 抽头只偏移 ±1 全分辨率
+  // 纹素，降采样带锯齿是 WE 原样（它的 first pass 也直接吃全分辨率 previous）。
+  function applyBloomPost(p, width, height) {
+    const sceneTex = captureBackdrop(width, height)
+    const bw = Math.max(1, Math.round(width / 4))
+    const bh = Math.max(1, Math.round(height / 4))
+    const bufA = getFBO(bw, bh, 'bloomA')
+    const bufB = getFBO(bw, bh, 'bloomB')
+    gl.bindVertexArray(vao)
+    uploadQuad('pass', PASS_QUAD)
+    gl.activeTexture(gl.TEXTURE0)
+    // 1) light_map：全分辨率场景 → 1/4 亮部图
+    gl.useProgram(bloomLightProg)
+    gl.disable(gl.BLEND)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bufA.fbo)
+    gl.viewport(0, 0, bw, bh)
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex)
+    gl.uniform1i(bloomLightUni.tex, 0)
+    gl.uniform2f(bloomLightUni.texel, 1 / width, 1 / height)
+    gl.uniform1f(bloomLightUni.damp, p.damp)
+    gl.uniform1f(bloomLightUni.alpha, p.alpha)
+    gl.uniform1f(bloomLightUni.strength, p.strength)
+    gl.uniform1f(bloomLightUni.threshold, p.threshold)
+    gl.uniform1i(bloomLightUni.metric, p.metric)
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    // 2) 高斯横/纵各一趟（±iterations 抽头，exp(-|n|*0.1) 权重，Scatter 缩放步长）
+    gl.useProgram(bloomBlurProg)
+    const blurPass = (src, dst, dirX, dirY) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo)
+      gl.viewport(0, 0, dst.width, dst.height)
+      gl.bindTexture(gl.TEXTURE_2D, src.tex)
+      gl.uniform1i(bloomBlurUni.tex, 0)
+      gl.uniform2f(bloomBlurUni.texel, 1 / src.width, 1 / src.height)
+      gl.uniform2f(bloomBlurUni.res, src.width, src.height)
+      gl.uniform1f(bloomBlurUni.radius, p.radius)
+      gl.uniform2f(bloomBlurUni.dir, dirX, dirY)
+      gl.uniform1f(bloomBlurUni.alpha, p.alpha)
+      gl.uniform1f(bloomBlurUni.strength, p.strength)
+      gl.uniform1f(bloomBlurUni.iterations, p.iterations)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
+    }
+    blurPass(bufA, bufB, 1, 0)
+    blurPass(bufB, bufA, 0, 1)
+    // 3) apply：Add（ApplyBlending 31）加回画布。ONE/ONE 只加 rgb，alpha +0。
+    gl.useProgram(bloomApplyProg)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, width, height)
+    gl.enable(gl.BLEND)
+    gl.blendFunc(gl.ONE, gl.ONE)
+    gl.bindTexture(gl.TEXTURE_2D, bufA.tex)
+    gl.uniform1i(bloomApplyUni.tex, 0)
+    gl.uniformMatrix4fv(bloomApplyUni.mvp, false, IDENT_M4)
+    gl.uniform1f(bloomApplyUni.alpha, p.alpha)
+    gl.uniform1f(bloomApplyUni.strength, p.strength)
+    gl.uniform3f(bloomApplyUni.tint, p.tint[0], p.tint[1], p.tint[2])
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    // 恢复默认混合（后续帧的第一趟 draw 各自会设，这里保守复原）
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    bloomFrameCount++
+    if (bloomFrameCount === 1 || bloomFrameCount === 120 || bloomFrameCount === 600) {
+      const px = new Uint8Array(4)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bufA.fbo)
+      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      diag(`bloom frame ${bloomFrameCount}: center=[${[...px].join(",")}] glErr=${gl.getError()} threshold=${p.threshold} strength=${p.strength} metric=${p.metric}`)
+    }
   }
 
   // 把画布内容按层矩形的屏幕投影画进层 FBO（passthrough 层的效果链输入）。
@@ -1963,6 +2151,21 @@ export function createRenderer(canvas, opts = {}) {
         gl.uniformMatrix4fv(copyUni.mvp, false, IDENT_M4)
         gl.drawArrays(gl.TRIANGLES, 0, 6)
       }
+    }
+    // [we-scene patch] 内置 Bloom 后期（general.bloom）。必须最后跑：它吃的是
+    // 「本帧最终画面」（含 camerafade 幕布），与 WE 的整屏后期位置一致。
+    // strength ≤ 0.001 时 WE 原 shader 三段全部直通/零输出，等价无 bloom。
+    const bloom = bloomPostParams(general)
+    if (!bloomDiagDone) {
+      bloomDiagDone = true
+      diag(
+        bloom
+          ? `bloom post: on strength=${bloom.strength} threshold=${bloom.threshold} iter=${bloom.iterations} radius=${bloom.radius} damp=${bloom.damp} hdr=${bloom.hdr}`
+          : 'bloom post: off',
+      )
+    }
+    if (bloom && bloom.strength > 0.001) {
+      applyBloomPost(bloom, width, height)
     }
     gl.bindVertexArray(null)
     pruneUnusedFbos()

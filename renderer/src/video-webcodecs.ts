@@ -89,7 +89,11 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
   window.addEventListener("resize", sizeCanvas);
 
   const queue: VideoSample[] = [];
-  let iter: AsyncGenerator<VideoSample, void, unknown> | null = null;
+  let input: Input | null = null;
+  let sink: VideoSampleSink | null = null;
+  // 直接持有 mediabunny 的内层迭代器（不经生成器包装）：销毁时必须能
+  // 确定性地调 return() 终止解码泵，见 destroy()
+  let innerIter: AsyncGenerator<VideoSample, void, unknown> | null = null;
   let lapStart = 0;
   let lapDur = 0;
   let queueTarget = QUEUE_MIN;
@@ -190,16 +194,10 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
     }
   };
 
-  /** 无限圈样本生成器：一圈迭代自然结束即开新圈（seek 回起点由 sink 处理） */
-  async function* lapSamples(sink: VideoSampleSink, start: number) {
-    while (!disposed) {
-      yield* sink.samples(start);
-    }
-  }
-
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  /** 解码泵：保持前瞻队列有水位。背压靠 queueTarget，暂停时限流不空转 */
+  /** 解码泵：保持前瞻队列有水位。背压靠 queueTarget，暂停时限流不空转。
+      一圈迭代自然结束即开新一圈（循环点 seek 回起点由 sink 处理）。 */
   const pump = async () => {
     try {
       while (!disposed) {
@@ -207,8 +205,17 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
           await sleep(20);
         }
         if (disposed) return;
-        const r = await iter!.next();
-        if (r.done || disposed) return;
+        if (!innerIter) innerIter = sink!.samples(lapStart);
+        const r = await innerIter.next();
+        if (disposed) {
+          // 销毁途中到达的样本同样要 close（VideoFrame 是 GPU 资源）
+          r.value?.close();
+          return;
+        }
+        if (r.done) {
+          innerIter = null;
+          continue;
+        }
         queue.push(r.value);
       }
     } catch (e) {
@@ -218,7 +225,7 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
 
   void (async () => {
     try {
-      const input = new Input({ source: new UrlSource(opts.src), formats: ALL_FORMATS });
+      input = new Input({ source: new UrlSource(opts.src), formats: ALL_FORMATS });
       const track = await input.getPrimaryVideoTrack();
       if (!track) throw new Error("无视频轨");
       if (!(await track.canDecode())) throw new Error(`编码不可解（${track.codec}）`);
@@ -228,8 +235,15 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
       // 精确的「末帧结束 - 首帧开始」，取大者兜底，时钟模数偏差亚帧级
       lapDur = Math.max(dur - lapStart, dur > 0 ? dur : 0);
       if (!isFinite(lapDur) || lapDur <= 0) throw new Error("时长异常");
-      if (disposed) return;
-      iter = lapSamples(new VideoSampleSink(track), lapStart);
+      if (disposed) {
+        try {
+          input.dispose();
+        } catch {
+          /* 忽略 */
+        }
+        return;
+      }
+      sink = new VideoSampleSink(track);
       const vw = await track.getDisplayWidth();
       const vh = await track.getDisplayHeight();
       opts.onDiag?.(`${track.codec} ${vw}x${vh} ${lapDur.toFixed(2)}s → WebCodecs 逐帧调度`);
@@ -265,8 +279,19 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
           /* 忽略 */
         }
       }
-      // return() 触发生成器 finally，sink 内部解码器随之释放
-      void iter?.return(undefined).catch(() => {});
+      // 直接调内层迭代器的 return() 终止解码泵。不能依赖「生成器 return()
+      // 透传」：若解码泵正挂在一个永不 settle 的 next() 上（壁纸窗口被遮挡
+      // 时 WKWebView 节流 VideoDecoder 回调 —— 切壁纸恰恰常发生在用户打开
+      // 主界面、壁纸被完全遮挡的时刻），透传的 return 会永远排在那个 next
+      // 后面，解码器/样本队列/输入全部泄漏。内层迭代器的 return 会置
+      // terminated 并唤醒解码泵退出（mediabunny 在 finally 里 close 解码器）。
+      if (innerIter) void innerIter.return(undefined).catch(() => {});
+      // 双保险：dispose 输入，仍挂起的读取/迭代以 InputDisposedError 收场
+      try {
+        input?.dispose();
+      } catch {
+        /* 忽略 */
+      }
       canvas.remove();
     },
   };

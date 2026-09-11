@@ -444,6 +444,14 @@ export function createScene(
         rt.video.volume = v;
         rt.video.muted = v <= 0;
       }
+      // 取消静音曾把视频从 WebCodecs 静音循环切到 A/B <video>（要音轨）；
+      // 音量回到 0 时对称地切回去 —— WebCodecs 路径循环点帧级精确、
+      // 帧率上限真正生效，不该一直停在 A/B 上。
+      // 重挂走 mountVideoDom → clear → WebCodecs 分支，代价是视频从头播放；
+      // 解码失败过的源已被 media.ts 清零标记，不会反复尝试
+      if (v <= 0 && rt.webcodecsPreferred && rt.cfg.type === "video") {
+        remountCurrent();
+      }
     },
     setRenderDpr(dpr: number) {
       rt.cfg.renderDpr = dpr;

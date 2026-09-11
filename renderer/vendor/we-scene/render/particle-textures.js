@@ -968,6 +968,38 @@ function hashName(n) {
   return h
 }
 
+// 官方十字星光斑（particle/light/flare_1）：紧凑亮核 + 四条细锐芒。
+// 官方形态按 1948961570（SouredAppleClouds）官方 preview 实测标定：
+//   - 芒是**恒定像素宽度的细线**（横向窄高斯），不是角向扇形——扇形的光束
+//     离芯越远越宽，官方芒全程 ~2-3px 细线；
+//   - 径向是**指数缓降**（exp(-d/0.30)），芒尾拖到贴图边缘仍有 ~4% 微光
+//     （官方 preview 里细线一路延伸到画面边缘），高斯包络会在半路截断；
+//   - 核小且亮，外加一圈贴芯小光晕。
+// 旧实现 spikyStar(4, 0.62, 14) 的芒是 ~25° 宽、len 0.62 的宽扇形：magic
+// sparkle 一类预设带 rotationrandom，粒子转到 ~45° 时宽扇形糊成整屏对角
+// 粗光束（全库 5 张引用 flare_1，同病）。
+function flareCross(size) {
+  const rgba = new Uint8Array(size * size * 4)
+  const half = size / 2
+  const feather = Math.max(2, Math.round(size * 0.03))
+  const rayW = 1.6 / size // 芒的横向 σ（归一化半径）：512 → σ≈0.8px，FWHM≈2px
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const px = (x + 0.5 - half) / half
+      const py = (y + 0.5 - half) / half
+      const d = Math.hypot(px, py)
+      // 核：紧凑亮芯 + 贴芯小光晕
+      let a = gauss(d, 0.05) + 0.3 * gauss(d, 0.15)
+      // 四芒：横向细高斯 × 径向指数缓降
+      a += 0.9 * gauss(py, rayW) * Math.exp(-Math.abs(px) / 0.3)
+      a += 0.9 * gauss(px, rayW) * Math.exp(-Math.abs(py) / 0.3)
+      a *= edgeFade(x, y, size, feather)
+      writeWhite(rgba, (y * size + x) * 4, a)
+    }
+  }
+  return { width: size, height: size, rgba }
+}
+
 // 变形光斑（particle/light/flare_2）：水平宽条 + 小芯，区别于 flare_1 的四尖十字
 function flareAnamorphic(size) {
   const rgba = new Uint8Array(size * size * 4)
@@ -1048,9 +1080,9 @@ const BUILDERS = {
   'particle/sharp_halo': () => glowN(256, [{ r: 0.035, w: 1 }, { r: 0.09, w: 0.45 }, { r: 0.22, w: 0.08 }]),
   // 色差小圆点（原生 64 → 128）：亮芯小点
   'particle/chromaticdot': () => chromaticDot(128),
-  // 四芒 flare（原生 256 → 512）：解析十字星芒
+  // 四芒 flare（原生 256 → 512）：flare_1 是官方十字细芒（见 flareCross 注释）
   'particle/light/flare_0': () => spikyStar(256, 6, 0.58, 10, 0.08),
-  'particle/light/flare_1': () => spikyStar(512, 4, 0.62, 14, 0.07),
+  'particle/light/flare_1': () => flareCross(512),
   'particle/light/flare_2': () => flareAnamorphic(256),
   // 水滴（原生 64×256 → 128×512）：竖长泪滴
   'particle/drop': () => teardrop(128, 512),

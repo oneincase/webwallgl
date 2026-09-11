@@ -71,7 +71,7 @@ const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container
 const { parseMDL, computeSkinMatrices } = await imp("renderer/vendor/we-scene/render/mdl.js");
 const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
 // 视锥裁剪的 puppet 动画余量 / 图层混合：H、G 区块直接调这两份实现做回归（不在测试里另写一遍）
-const { puppetAnimMargin, applyColorBlendCPU, layerWantsPreserveBackdrop, collectGroupDescendantIds } = await imp("renderer/vendor/we-scene/render/renderer.js");
+const { puppetAnimMargin, applyColorBlendCPU, layerWantsPreserveBackdrop, collectGroupDescendantIds, layerCompositeBlendMode } = await imp("renderer/vendor/we-scene/render/renderer.js");
 
 const { check, errors } = createChecker();
 const readJson = (pkg, name) => {
@@ -1127,6 +1127,32 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     "COMPOSITE_BLEND_FRAG 必须用 src.a * u_Opacity（否则 Overlay/ColorBurn 特殊混合丢掉层 alpha）");
   check(/uniform1f\(\s*compBlendUni\.opacity\s*,\s*color4\[3\]\s*\)/.test(cl),
     "compositeLayer 必须把层 alpha color4[3] 传给 shader 侧混合，否则 alpha=0 的白色 solidlayer 全屏过曝（3793592591）");
+
+  // H2b. additive 材质 + 对象无 colorBlendMode → 基色材质混合回退（2734266359 射灯黑方块）。
+  // 黑底光斑贴图（alpha 100% 不透明）按 translucent 合成 = 整块黑方块；WE 里基色材质的
+  // blending 字段（additive）就是这类层的合成模式。全库该组合仅 3 层（2734266359 ×2、
+  // 3789604238 ×1），其余 additive 材质的对象都带 colorBlendMode，回退不改变既有行为。
+  {
+    const lcbm = layerCompositeBlendMode;
+    check(typeof lcbm === "function", "renderer.js 应导出 layerCompositeBlendMode");
+    const T = [
+      [0, 'additive', 9, '对象无 colorBlendMode + additive 材质 → 加法'],
+      [undefined, 'additive', 9, '字段缺失同样按 additive 材质走'],
+      [9, 'additive', 9, '对象已有 colorBlendMode=9 → 材质不再改'],
+      [0, 'translucent', 0, 'translucent 材质 + 无 colorBlendMode → 默认 translucent（不变）'],
+      [0, null, 0, '材质无 blending 字段 → 默认 translucent（不变）'],
+      [2, 'additive', 2, '对象 colorBlendMode=2（Multiply）时对象优先'],
+    ];
+    for (const [cbm, mb, want, desc] of T) {
+      const got = lcbm(cbm, mb);
+      check(got === want, `layerCompositeBlendMode(${cbm}, ${mb}) ${desc}：期望 ${want}，实得 ${got}`);
+    }
+    check(/layerCompositeBlendMode\(layer\.colorBlendMode, layer\.materialBlending\)/.test(cl),
+      "compositeLayer 必须经 layerCompositeBlendMode 选择混合（additive 材质回退才生效）");
+    const mount = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    check(/layer as any\)\.materialBlending = typeof pass\?\.blending/.test(mount),
+      "scene-mount 挂载时必须把基色材质 blending 写到 layer.materialBlending");
+  }
 
   // H3. 效果自定义 FBO 的名字**不一定带 _rt_ 前缀**（车尾灯纯白的根因）。
   //     _rt_ 只是 WE 内置全屏缓冲的命名约定；effect.json 的 fbos 由作者起名，

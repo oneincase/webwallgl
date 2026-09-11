@@ -11,7 +11,7 @@ import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SK
 import type { WallpaperConfig } from "./types";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
-import { fitWindow } from "../vendor/we-scene/render/math.js";
+import { fitWindow, coverContentBounds } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, noise, particles, ptex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
 import {
   flattenUserProperties,
@@ -20,6 +20,7 @@ import {
   boundUserName,
 } from "../vendor/we-scene/scene/user-props.js";
 import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
+import { decodeTexImageBitmap } from "./tex-decode";
 
 // WE 的 systemfont_* 内置字体 → 本机系统字体栈（WE 桌面端映射 Windows 系统字体，
 // macOS/Linux 上按近似度回退；都带 sans-serif 兜底，不命中也只是字形差异）。
@@ -797,7 +798,11 @@ cfg, source, pkgAbort.signal);
         const gl = renderer.gl as WebGL2RenderingContext;
 
         const cur = textures.get("$mediaThumbnail");
-        if (cur) textures.set("$mediaPreviousThumbnail", cur);
+        // 占位封面（挂载时 renderThumbnail 程序化生成，generated 标记）不是「上一张
+        // 封面」：第一张真实封面上传时把它顺位给 previous，Previous album cover 效果
+        // 会在交叉淡入里闪出一帧程序化圆环。占位则当前/上一张都直接上真实封面。
+        const curIsPlaceholder = !!cur?.generated;
+        if (cur && !curIsPlaceholder) textures.set("$mediaPreviousThumbnail", cur);
 
         const existing = textures.get("$mediaThumbnail");
         if (existing?.glTex) {
@@ -809,6 +814,7 @@ cfg, source, pkgAbort.signal);
           existing.width = raster.width;
           existing.height = raster.height;
           existing.mips = [raster];
+          existing.generated = false;
         } else {
           textures.set("$mediaThumbnail", {
             glTex: rnd.makeTextureMip(gl, [raster], false),
@@ -816,8 +822,22 @@ cfg, source, pkgAbort.signal);
             height: raster.height,
             rg88: false,
             mips: [raster],
-            generated: true,
+            generated: false,
           });
+        }
+        if (curIsPlaceholder) {
+          const prev = textures.get("$mediaPreviousThumbnail");
+          if (prev?.glTex) {
+            gl.bindTexture(gl.TEXTURE_2D, prev.glTex);
+            gl.texImage2D(
+              gl.TEXTURE_2D, 0, gl.RGBA, raster.width, raster.height, 0,
+              gl.RGBA, gl.UNSIGNED_BYTE, raster.rgba,
+            );
+            prev.width = raster.width;
+            prev.height = raster.height;
+            prev.mips = [raster];
+            prev.generated = false;
+          }
         }
         return palette;
       };
@@ -1092,7 +1112,17 @@ cfg, source, pkgAbort.signal);
           // 半透明边缘的 rgb 被乘两次，所有 1~2px 细线（眼部轮廓/泪痕线/发丝）
           // 变深色刻线，脸上叠出「细框眼镜」（3264246690 实测；同类还见
           // 3148125112 / 3223543799）。
-          const bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
+          //
+          // [we-scene patch] 且必须对齐 WE 的 FreeImage 语义「不执行 EXIF 方向」：
+          // 浏览器解码默认按 EXIF 转正，orientation=8 的 1080×5760 长图会变成
+          // 5760×1080，与层 size / 90° 旋转错轴，整屏撕成条带（1920911984）。
+          // 详见 tex-decode.ts 头注。
+          const bmp = await decodeTexImageBitmap(
+            blob,
+            m.png ? null : (m.image as Uint8Array),
+            m.width,
+            m.height,
+          );
           entry = {
             glTex: rnd.makeTexture(renderer.gl, null, 0, 0, bmp),
             width: bmp.width,
@@ -1246,6 +1276,9 @@ cfg, source, pkgAbort.signal);
           }).passes?.[0];
           const texSlots = pass?.textures || [];
           const texName = texSlots[0];
+          // 基色材质 blending 字段（additive/translucent/normal）：对象无 colorBlendMode
+          // 时合成层按它走（2734266359 spot overlay 黑底光斑必须加法，否则黑方块）。
+          (layer as any).materialBlending = typeof pass?.blending === "string" ? pass.blending : null;
           // [we-scene patch] 序列帧图层：material 的 combos 里 spritesheet=1 表示这张
           // 贴图是 sprite sheet，图层的 size 是**单帧尺寸**，渲染时只该采样当前那一格
           // （帧表来自 .tex 的 TEXS 段，见 loadTex 里 entry.frames）。
@@ -1645,6 +1678,13 @@ cfg, source, pkgAbort.signal);
           // 只同步脏子树里的粒子层（静态场景下集合为空，一次都不跑）。
           if (particleDirty.length) {
             for (const ps of particleDirty) ps.syncLayerTransform();
+          }
+          // 运行期 createLayer 的粒子层：脚本能随时改 origin（1712475860 的
+          // coinget 特效由脚本 `coinFx.origin = origin` 定位到收集点），但克隆层
+          // 不在 mount 期 transformDirty 里 —— 不每帧重读就会钉在构造点 (0,0)。
+          // 这类系统只有个位数，直接全量同步一次即可。
+          for (const ps of particleSystems) {
+            if (ps.layer && ps.layer.runtimeCreated) ps.syncLayerTransform();
           }
           for (const ps of particleSystems) ps.advance(pdt, audioSim.enabled ? activeAudioSnapshot() : null);
           // 首帧后上报一次实际存活粒子数
@@ -2119,26 +2159,11 @@ cfg, source, pkgAbort.signal);
               const em = TEXT_EM_SCALE * pts;
               const bw = it.boxW;
               const bh = it.boxH;
-              const M = it.margin;
               const sx = Math.abs(layer.scale[0] || 1);
               const sy = Math.abs(layer.scale[1] || 1);
-              let cw = Math.max(1, Math.round(layer.size[0] * sx * it.quality));
-              let ch = Math.max(1, Math.round(layer.size[1] * sy * it.quality));
-              const shrink = Math.min(1, MAX_TEX / Math.max(cw, ch));
-              cw = Math.max(1, Math.round(cw * shrink));
-              ch = Math.max(1, Math.round(ch * shrink));
-              if (textCanvas.width !== cw || textCanvas.height !== ch) {
-                textCanvas.width = cw;
-                textCanvas.height = ch;
-              } else {
-                ctx.setTransform(1, 0, 0, 1, 0, 0);
-                ctx.clearRect(0, 0, cw, ch);
-              }
-              // 「场景单位 → 画布像素」折进 transform，再平移到内部盒子左上角
-              const k = Math.min(cw / layer.size[0], ch / layer.size[1]);
-              ctx.setTransform(k, 0, 0, k, 0, 0);
-              ctx.translate(M, M);
               const fam = fontPath ? (fontFamilies.get(fontPath) || "sans-serif") : "sans-serif";
+              // 先排版（measure 只依赖 ctx.font，与 transform 无关），再按墨水量界定画布。
+              ctx.setTransform(1, 0, 0, 1, 0, 0);
               ctx.font = `${em}px "${fam}", sans-serif`;
               const met = ctx.measureText("");
               const fontH = (met.fontBoundingBoxAscent || 0) + (met.fontBoundingBoxDescent || 0);
@@ -2158,8 +2183,54 @@ cfg, source, pkgAbort.signal);
                 halign: layer.textHAlign,
                 valign: layer.textVAlign,
               }, (s: string) => ctx.measureText(s).width);
+              // [we-scene patch] 媒体组件的歌名/歌手层盒子是 WE 占位尺寸（2×2，
+              // WE 运行时按内容重排），墨水远超盒子，旧实现把字截在画布边缘
+              // （3785267658 整层空白）。这类层按溢出墨水**对称**扩边：盒中心恒等于
+              // 画布中心 = 层 origin，墨水位置不随扩边移动。
+              //
+              // 判据必须同时满足，缺一不可（2026-09-11 收窄，曾因只看盒子小误伤）：
+              //  ① 占位小盒（boxW/H ≤ 4）——正常大盒自有几何，扩边会改 quad 把
+              //     好字挪出可见区（2938612768 标题被黑卡裁）；
+              //  ② 沙箱挂了媒体回调（hasMediaHook）——三体 3509243656 的
+              //     time/State/Tx 等 2×2 是脚本驱动的普通文本，内容动态，扩边会让
+              //     layer.size 每帧跟着内容跳变、字忽大忽小甚至消失；
+              //  ③ 墨水在**当前画布**（盒 + 既有 margin）里确实装不下——短词
+              //     （Paused/Playing）不溢出就不扩，保持作者原布局。
+              const M = it.margin;
+              if (wtext.shouldGrowMediaPlaceholder(bw, bh, !!it.sandbox?.hasMediaHook)) {
+                // 媒体 2×2 占位层：对称扩到刚好装下当前墨水。墨水在基础边距内
+                // 装得下时 textCanvasMarginGrow 退回基础边距，size 与原来一致
+                //（短词 Paused/Playing 保持作者布局）；layer.size 只在这类层改写。
+                const grow = wtext.textCanvasMarginGrow(layout, bw, bh, M);
+                layer.size[0] = bw + grow * 2;
+                layer.size[1] = bh + grow * 2;
+              }
+              // 非扩边层**不碰** layer.size（挂载时已按 box+margin 设好；脚本/动画
+              // 可能也在改它，每帧无条件覆写会与那些写入互相打架）。
+              let cw = Math.max(1, Math.round(layer.size[0] * sx * it.quality));
+              let ch = Math.max(1, Math.round(layer.size[1] * sy * it.quality));
+              const shrink = Math.min(1, MAX_TEX / Math.max(cw, ch));
+              cw = Math.max(1, Math.round(cw * shrink));
+              ch = Math.max(1, Math.round(ch * shrink));
+              if (textCanvas.width !== cw || textCanvas.height !== ch) {
+                textCanvas.width = cw;
+                textCanvas.height = ch;
+              } else {
+                ctx.clearRect(0, 0, cw, ch);
+              }
+              // [we-scene patch] 改 canvas.width/height 会**重置整个 2D 上下文状态**
+              // （font/transform/textBaseline 全回默认 10px sans-serif）。上面 measure
+              // 阶段设的 ctx.font 在尺寸变化那帧就此丢失，若再把 ctx.font 透传给
+              // drawTextLayer，320px 的大字会按 10px 画、缩放后只剩几个像素
+              // （2468489223 白色时钟整层不可见，纹理仅 43 不透明像素）。
+              // 尺寸变化后必须用显式保存的 fontCss 重新设置，不能读 ctx.font。
+              const fontCss = `${em}px "${fam}", sans-serif`;
+              // 「场景单位 → 画布像素」折进 transform，再平移到内部盒子左上角
+              const k = Math.min(cw / layer.size[0], ch / layer.size[1]);
+              ctx.setTransform(k, 0, 0, k, 0, 0);
+              ctx.translate(M, M);
               wtext.drawTextLayer(ctx, layout, {
-                font: ctx.font,
+                font: fontCss,
                 color: layer.textColor,
                 alpha: layer.alpha,
                 brightness: layer.brightness,
@@ -2263,6 +2334,7 @@ cfg, source, pkgAbort.signal);
             // 克隆同 image 的已装配层（含 textureName / layerMaterial 效果），
             // 否则会得到无贴图空层 —— 3789604238 Simple Visualizer 的 63 根克隆条。
             let src: any = layerCfg && typeof layerCfg === "object" ? layerCfg : null;
+            let assetToMount: { path: string; kind: "model" | "particle" } | null = null;
             if (typeof layerCfg === "string") {
               const imagePath = layerCfg;
               src =
@@ -2274,12 +2346,42 @@ cfg, source, pkgAbort.signal);
                 ) ||
                 null;
               if (!src) {
-                reportDiag(
-                  rt,
-                  cfg,
-                  `createLayer('${imagePath}') 找不到已加载的同模型层`,
-                );
-                return null;
+                // 没有模板层可克隆 → 从包内资产实例化（engine.registerAsset +
+                // createLayer 的常规路径；1712475860 Dino Run 的金币/收集特效）。
+                if (/^models\//.test(imagePath) && pkg.getEntry(parsedPkg, imagePath)) {
+                  assetToMount = { path: imagePath, kind: "model" };
+                  src = {
+                    image: imagePath,
+                    origin: [0, 0, 0],
+                    scale: [1, 1, 1],
+                    angles: [0, 0, 0],
+                    size: [0, 0],
+                    color: [1, 1, 1],
+                    visible: true,
+                    alpha: 1,
+                    brightness: 1,
+                  };
+                } else if (/^particles\//.test(imagePath) && pkg.getEntry(parsedPkg, imagePath)) {
+                  assetToMount = { path: imagePath, kind: "particle" };
+                  src = {
+                    particle: imagePath,
+                    origin: [0, 0, 0],
+                    scale: [1, 1, 1],
+                    angles: [0, 0, 0],
+                    size: [0, 0],
+                    color: [1, 1, 1],
+                    visible: true,
+                    alpha: 1,
+                    brightness: 1,
+                  };
+                } else {
+                  reportDiag(
+                    rt,
+                    cfg,
+                    `createLayer('${imagePath}') 找不到已加载的同模型层`,
+                  );
+                  return null;
+                }
               }
             }
             if (!src) src = {};
@@ -2311,6 +2413,49 @@ cfg, source, pkgAbort.signal);
               }));
             }
             scene.layers.push(clone);
+            // 运行期创建的层（金币/收集特效等）：不在 mount 期的 transformDirty 里，
+            // 但脚本能随时改 origin。给粒子系统留标记，推进时按帧重读发射器变换，
+            // 否则特效钉在构造点的 (0,0)（1712475860 的收集特效跑到左下角）。
+            clone.runtimeCreated = true;
+            // 资产实例化的异步收尾：模型层解析 material → 载贴图 → autosize；
+            // 粒子层起运行时粒子系统（登记到 clone.id，z 序由 renderByLayer 分发）。
+            if (assetToMount && assetToMount.kind === "model") {
+              const imagePath = assetToMount.path;
+              try {
+                const model = JSON.parse(readText(pkg.getEntry(parsedPkg, imagePath)!));
+                const mat = scn.resolveMaterial(model);
+                const matEntry = mat && pkg.getEntry(parsedPkg, mat.materialPath);
+                const material = matEntry ? JSON.parse(readText(matEntry)) : null;
+                const pass = material?.passes?.[0];
+                if (pass?.combos) {
+                  for (const k of Object.keys(pass.combos)) {
+                    if (k.toLowerCase() === "spritesheet" && Number(pass.combos[k]) === 1) {
+                      clone.spriteSheet = true;
+                      break;
+                    }
+                }
+                }
+                const tn = pass?.textures?.[0];
+                if (typeof tn === "string" && tn && !tn.startsWith("util/") && !tn.startsWith("_rt_")) {
+                  void loadTex(tn).then((entry) => {
+                    if (!entry) return;
+                    clone.textureName = tn;
+                    // autosize：序列帧按帧尺寸（WE autosize 语义），否则按贴图尺寸
+                    if (clone.size[0] === 0 || clone.size[1] === 0) {
+                      const fl = entry.frames && Array.isArray(entry.frames) ? entry.frames[0] : null;
+                      clone.size = [(fl && fl.width) || entry.width, (fl && fl.height) || entry.height];
+                    }
+                  });
+                }
+              } catch (e) {
+                reportDiag(rt, cfg, `createLayer('${imagePath}') 资产实例化失败: ${String((e as Error).message || e).slice(0, 120)}`);
+              }
+            } else if (assetToMount && assetToMount.kind === "particle") {
+              const ppath = assetToMount.path;
+              void buildParticleSystem(ppath, clone, null, 0).then((ps) => {
+                if (!ps) reportDiag(rt, cfg, `createLayer('${ppath}') 粒子系统装配失败`);
+              });
+            }
             return clone;
           },
           mediaControl,
@@ -3216,6 +3361,11 @@ cfg, source, pkgAbort.signal);
         const properties = (scene as any).properties || {};
         const changed = mergeUserPropertyValues(properties, liveUserProps, wire) as Record<string, unknown>;
         if (!Object.keys(changed).length) return;
+        // general 字段同样可能绑用户属性：clearcolor 绑 schemecolor（3792579196）、
+        // HDR 开关绑 bloom（2902406982 / 3299228616 / 3764725758 等一整族）。
+        // 此前只逐层 resolve，general 绑定的 .value 永远停在挂载快照 —— 开关
+        // 切了、画面不变。resolveUserProps 就地改 .value，渲染端每帧解包读取。
+        resolveUserProps((scene as any).general || {}, properties, 0);
         for (const layer of scene.layers as any[]) {
           const src = layer.srcObject;
           if (!src) continue;
@@ -3362,6 +3512,22 @@ cfg, source, pkgAbort.signal);
           cfg,
           `fit ${fit}: view ${Math.round(win.viewW)}x${Math.round(win.viewH)} scene ${projW}x${projH} canvas ${c.width}x${c.height}`,
         );
+        // cover 窥视的逐轴门控基准：**可见内容的世界包围盒**（旋转矩形取 AABB 并集）。
+        // 画布溢出 ≠ 内容溢出——1920911984 这类「竖版画布 + 旋转 90° 横条」壁纸，
+        // 画布纵向溢出 5000+ 而内容纵向只有 610（≈视窗 607），按画布算会把视窗
+        // 滑出条外（整屏空白）。纯函数 coverContentBounds 见 math.js（离线判据直接跑）。
+        {
+          const b = coverContentBounds(scene.layers as any[]);
+          if (Number.isFinite(b.minX) && Number.isFinite(b.minY)) {
+            rt.coverPeek = {
+              contentW: b.maxX - b.minX,
+              contentH: b.maxY - b.minY,
+              projW,
+              projH,
+            };
+            reportDiag(rt, cfg, `cover peek gate: content ${Math.round(b.maxX - b.minX)}x${Math.round(b.maxY - b.minY)}`);
+          }
+        }
       }
       reportDiag(rt, cfg, `renderer started: ${scene.layers.length} layers`);
     } catch (e) {

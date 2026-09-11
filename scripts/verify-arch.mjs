@@ -312,13 +312,16 @@ for (const name of REQUIRED_WP) {
     /const pumpFrames/.test(media) && /markFrame\(rt, performance\.now\(\)\)/.test(media),
     "mountVideoDom 必须持续 markFrame 打点（否则 instance.stats 恒报 running=false，宿主健康检查误判）",
   );
-  // 实测 WKWebView 里 rvfc 存在却从不回调，判活不能依赖它
+  // 实测 WKWebView 里 rvfc 存在却从不回调，判活不能**只**依赖它。
+  // rVFC 作为按真实呈现帧打点的增强路径可以存在，但 rAF 兜底必须并存：
+  // WKWebView（rVFC 0 回调）就靠 rAF 维持判活。
   {
     const pump = (media.match(/const pumpFrames = [\s\S]*?\n  \};/) || [""])[0];
     const code = pump.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const hasRafFallback = /requestAnimationFrame\(step\)/.test(code) && /mark\(el\)/.test(code);
     check(
-      !/requestVideoFrameCallback/.test(code),
-      "pumpFrames 不得依赖 requestVideoFrameCallback：实测 WKWebView 里它存在却从不回调（视频正常播放时 1.5s 内 0 次），判活会永远失败",
+      hasRafFallback,
+      "pumpFrames 必须有 rAF 兜底打点（实测 WKWebView 里 requestVideoFrameCallback 存在却从不回调，单靠它判活会永远失败）",
     );
   }
   // 四个实时控制 API 都得覆盖 videoPairs，否则对视频壁纸静默失效

@@ -158,30 +158,54 @@ export function createSimulatedAudio(seed = 20260830) {
       // 和弦基底按频段加权：低频弱（让给底鼓）、中高频强 —— 低频的起伏由节拍驱动。
       // 基底均值目标 ~0.5：WE 真实音乐下频段均值 0.5-0.8，音频条/示波器的幅度才
       // 达到作者预期（实测 3078285611 音条 scale=band 值，过小则只是贴地小圆点）。
-      let v = midGate * (0.5 + 0.3 * vnoise(beat * 0.5 + phases[i] * 0.05, i % 8)) // 和弦/旋律基底
-      v *= 0.35 + 0.65 * fq
-      if (fq < 0.2) v += kickV * (1 - fq / 0.2)
+      //
+      // [we-scene patch] 真立体声：左右声道的**内容**去相关，不是同一波形乘
+      // (1±pan) 的伪立体声（旧实现左右条完全同相，只是高度差 ±6~26%，双声道
+      // 可视化看起来是镜像单声道）。做法照真实混音：
+      //   底鼓/上升扫频居中（两声道一致，保住节拍锚点与 level 标定）；
+      //   军鼓偏左、踩镲偏右；和弦基底左右各走一条独立游走（不同种子与相位）。
+      // 左右均值能量保持一致，GAIN=3.2 标定的场景音条不受影响。
+      const baseL = midGate * (0.5 + 0.3 * vnoise(beat * 0.5 + phases[i] * 0.05, i % 8))
+      const baseR = midGate * (0.5 + 0.3 * vnoise(beat * 0.53 + phases[i] * 0.05 + 31.7, (i % 8) + 16))
+      let vL = baseL * (0.35 + 0.65 * fq)
+      let vR = baseR * (0.35 + 0.65 * fq)
+      if (fq < 0.2) {
+        const k = kickV * (1 - fq / 0.2)
+        vL += k
+        vR += k
+      }
       if (fq >= 0.12 && fq < 0.62) {
         const w = 1 - Math.abs(fq - 0.34) / 0.28
-        if (w > 0) v += snareV * 0.55 * w
+        if (w > 0) {
+          vL += snareV * 0.55 * w
+          vR += snareV * 0.35 * w
+        }
       }
-      if (fq >= 0.45) v += hatV * 0.5 * ((fq - 0.45) / 0.55)
-      v += riser * 0.5
-      v *= tilt
-      const vPre = v // 钳位前留一份（网页 gamma 扩展用；场景路径不变）
-      v = Math.min(1, v * GAIN)
-      // 立体声：低频居中，高频宽（左右去相关）
+      if (fq >= 0.45) {
+        const w = (fq - 0.45) / 0.55
+        vR += hatV * 0.5 * w
+        vL += hatV * 0.3 * w
+      }
+      vL += riser * 0.5
+      vR += riser * 0.5
+      vL *= tilt
+      vR *= tilt
+      const vPreL = vL // 钳位前留一份（网页 gamma 扩展用；场景路径不变）
+      const vPreR = vR
+      vL = Math.min(1, vL * GAIN)
+      vR = Math.min(1, vR * GAIN)
+      // 立体声摆位：低频居中，高频宽（在已去相关的内容上再叠一个慢速整体摆位）
       const width = 0.06 + fq * 0.2
       const pan = vnoise(beat * 0.13 + i * 0.35, 11) * width
-      let l = Math.min(1, Math.max(0, v * (1 - pan)))
-      let r = Math.min(1, Math.max(0, v * (1 + pan)))
+      let l = Math.min(1, Math.max(0, vL * (1 - pan)))
+      let r = Math.min(1, Math.max(0, vR * (1 + pan)))
       // 静音段不完全为零（底噪 -60dB 级），更接近真实频谱仪的观感
       const floorV = silent ? 0.012 : 0
       rawL[i] = Math.max(floorV, l)
       rawR[i] = Math.max(floorV, r)
       // pre 系列走同一 pan/底噪，只是不乘 GAIN、不钳 1（保留波峰因数）
-      preL64[i] = Math.max(floorV, Math.max(0, vPre * (1 - pan)))
-      preR64[i] = Math.max(floorV, Math.max(0, vPre * (1 + pan)))
+      preL64[i] = Math.max(floorV, Math.max(0, vPreL * (1 - pan)))
+      preR64[i] = Math.max(floorV, Math.max(0, vPreR * (1 + pan)))
       if (i < 48) levelSum += (rawL[i] + rawR[i]) * 0.5
     }
     left64.set(rawL)

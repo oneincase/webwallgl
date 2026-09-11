@@ -222,6 +222,147 @@ void main() {
   fragColor = vec4(r, 1.0);
 }`
 
+// ---------- 内置 Bloom 后期（general.bloom；WE 引擎 util/bloom 管线转写） ----------
+//
+// WE 场景设置「Bloom」在引擎里的真身是这条 util 材质链（linux-wallpaperengine
+// 复刻同源：`downsample_quarter_bloom`(_rt_FullFrameBuffer→1/4) →
+// `downsample_eighth_blur_v`(1/4→1/8) → `blur_h_bloom`(1/8→_rt_Bloom) →
+// `combine`(scene+bloom)；原版 shader 全文见 assets/shaders/，逐行转写如下）：
+//   亮部提取：4 抽头平均（无 gamma）→ `albedo *= saturate(max(r,g,b) - threshold)`
+//   （软拐点，只保留超出 threshold 的能量）→ 饱和度 ×2（-gray + albedo*2）
+//   → ×strength×tint **只乘一次**；模糊是能量守恒高斯，**不乘 strength**。
+//
+// ⚠ 2026-09-11 前误把 localeffects/Bloom(2822917890) 的 light_map 当真身：
+// 「pow(2.2) + r+g+b 求和硬判定」让亮场景 90%+ 像素全值通过，叠加 blur 双程
+// strength（strength²）→ 3791670523 / 3793592591 / 820654165 整屏冲白。
+// HDR 家族（hdr=true + bloomhdr*）的真身是 fp16 金字塔 + combine_hdr，本次不动，
+// metric=1 分支保持既有软窗口校准（对 4 张 HDR 壁纸实测对齐，见 CASEBOOK）。
+
+const BLOOM_LIGHTMAP_VERT = `#version 300 es
+in vec3 a_Position;
+in vec2 a_TexCoord;
+uniform vec2 u_Texel; // 1/场景纹理尺寸
+uniform float u_Damp; // Feather（材质原字段 "Damp brightness"，默认 0.5）
+out vec2 v_TexCoord[4];
+out float v_Damp;
+void main() {
+  v_Damp = 1.0 + u_Damp * 0.1;
+  gl_Position = vec4(a_Position, 1.0);
+  vec2 offsets = u_Texel;
+  v_TexCoord[0] = a_TexCoord - offsets;
+  v_TexCoord[1] = a_TexCoord + vec2(offsets.x, -offsets.y);
+  v_TexCoord[2] = a_TexCoord + vec2(-offsets.x, offsets.y);
+  v_TexCoord[3] = a_TexCoord + offsets;
+}`
+
+const BLOOM_LIGHTMAP_FRAG = `#version 300 es
+precision mediump float;
+in vec2 v_TexCoord[4];
+in float v_Damp;
+uniform sampler2D u_Tex;
+uniform float u_Alpha;
+uniform float u_Strength;
+uniform float u_Threshold;
+// 0 = 经典家族（WE 引擎 downsample_quarter_bloom 逐行转写）
+// 1 = HDR 家族（bloomhdr*）的 SDR 等效判定，见 renderer.js bloomPostParams 注释
+uniform int u_Metric;
+out vec4 fragColor;
+void main() {
+  vec3 lightMap = vec3(0.0);
+  if (u_Strength > 0.001 && u_Alpha > 0.001) {
+    if (u_Metric == 0) {
+      // 引擎原文：4 抽头平均 → saturate(max 通道 - threshold) 软拐点
+      // → 饱和度 ×2（-grayscale*sat + albedo*(1+sat)，sat=1）→ ×strength（一次）。
+      // saturate 在 GLSL 不存在，clamp(x,0,1) 等价。
+      vec3 albedo = texture(u_Tex, v_TexCoord[0]).rgb +
+                    texture(u_Tex, v_TexCoord[1]).rgb +
+                    texture(u_Tex, v_TexCoord[2]).rgb +
+                    texture(u_Tex, v_TexCoord[3]).rgb;
+      albedo *= 0.25;
+      float scale = max(max(albedo.x, albedo.y), albedo.z);
+      albedo *= clamp(scale - u_Threshold, 0.0, 1.0);
+      float grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
+      albedo = -grayscale + albedo * 2.0;
+      lightMap = max(vec3(0.0), albedo * u_Strength);
+    } else {
+      // HDR 家族既有校准（2646504847）：raw sRGB 亮度 + 软窗口。
+      // strength 在此乘两次，补偿 blur 不再乘（与旧行为逐位一致）。
+      float weight = 0.0;
+      vec3 samplec;
+      for (int i = 0; i < 4; ++i) {
+        samplec = texture(u_Tex, v_TexCoord[i]).rgb;
+        float w = smoothstep(u_Threshold - 0.2, u_Threshold + 0.4, dot(samplec, vec3(0.2126, 0.7152, 0.0722)));
+        lightMap += samplec * w;
+        weight += w;
+      }
+      lightMap = lightMap * max(0.001, mix(weight, 1.0, v_Damp)) / 4.0 * u_Strength * u_Strength;
+    }
+  }
+  fragColor = vec4(lightMap, 1.0);
+}`
+
+const BLOOM_BLUR_VERT = `#version 300 es
+in vec3 a_Position;
+in vec2 a_TexCoord;
+uniform vec2 u_Texel; // 1/源纹理尺寸
+uniform vec2 u_Res;   // 源纹理尺寸
+uniform float u_Radius; // Scatter
+out vec2 v_TexCoord;
+out vec2 v_SizeMultiplier;
+void main() {
+  vec2 ratio = u_Res * u_Texel;
+  v_SizeMultiplier = u_Texel * vec2(1.0, ratio.x / ratio.y) * u_Radius;
+  gl_Position = vec4(a_Position, 1.0);
+  v_TexCoord = a_TexCoord;
+}`
+
+const BLOOM_BLUR_FRAG = `#version 300 es
+precision mediump float;
+in vec2 v_TexCoord;
+in vec2 v_SizeMultiplier;
+uniform sampler2D u_Tex;
+uniform float u_Alpha;
+uniform float u_Strength;
+uniform float u_Iterations;
+uniform vec2 u_Dir; // (1,0)=横向 / (0,1)=纵向
+out vec4 fragColor;
+void main() {
+  vec4 albedo = vec4(0.0);
+  if (u_Strength > 0.001 && u_Alpha > 0.001) {
+    float divisor = 0.0, weight, n;
+    float iterations = u_Iterations;
+    for (int i = -15; i <= 15; i++) {
+      if (abs(float(i)) > iterations) continue;
+      n = float(i);
+      vec2 offset = u_Dir * (n * v_SizeMultiplier);
+      weight = exp(-abs(n) * 0.1);
+      divisor += weight;
+      albedo += texture(u_Tex, v_TexCoord + offset) * weight;
+    }
+    // 模糊只做能量守恒归一：strength 已在亮部提取段乘过（引擎原版
+    // downsample_eighth_blur_v / blur_h_bloom 同样不乘 strength）。
+    // 2026-09-11 前这里横/纵两趟各乘一次 → strength² 叠满全屏。
+    albedo = albedo / divisor;
+  }
+  fragColor = albedo;
+}`
+
+const BLOOM_APPLY_FRAG = `#version 300 es
+precision mediump float;
+in vec2 v_UV;
+uniform sampler2D u_Tex; // 模糊后的 bloom
+uniform float u_Alpha;
+uniform float u_Strength;
+uniform vec3 u_Tint;
+out vec4 fragColor;
+void main() {
+  vec3 bloom = texture(u_Tex, v_UV).rgb * u_Tint * u_Alpha;
+  if (u_Strength <= 0.001) bloom = vec3(0.0);
+  // Add（ApplyBlending 31）：rgb = base + bloom；GL 侧 blendFunc(ONE, ONE)，
+  // dst 就是画布里的 base。alpha +0 = 保持场景 alpha（画布本就无 alpha 通道）。
+  fragColor = vec4(bloom, 0.0);
+}`
+
 
 
 // ---------- 内联着色器（拷贝 / 合成 / 背景直通）与 quad 顶点 ----------
@@ -345,4 +486,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }

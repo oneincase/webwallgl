@@ -199,6 +199,65 @@ export function matchDesignAspect(width, height, projW, projH, relTol) {
   return null
 }
 
+/**
+ * cover 窥视（顶/底热区滑动）的逐轴门控。
+ *
+ * 适配只该发生在「内容在那个轴上真的被裁掉」时。1920911984 这类壁纸：投影画布
+ * 是竖的（1080×5760），内容却是一根旋转 90° 的横条（世界包围盒 3254×610）——
+ * 按画布算 cover 纵向溢出 5000+，热区滑动会把视窗滑出条外（整屏空白）；
+ * 按内容包围盒算纵向根本没溢出（610 ≈ 视窗 607）。所以这里吃**内容包围盒**
+ * 与 cover 视窗尺寸，返回每个轴是否允许滑动。容差 2%：吃得下 DPR 取整与
+ * 旋转包围盒的 ±1px 量化，1920911984 的 610/607.5（+0.4%）判为不溢出。
+ * 纯函数，verify-cover-peek 直接跑。
+ */
+export function coverPeekOverflow(contentW, contentH, viewW, viewH, relTol) {
+  const tol = relTol > 0 ? relTol : 0.02
+  const overflow = (content, view) =>
+    Number.isFinite(content) && Number.isFinite(view) && view > 0 ? content > view * (1 + tol) : true
+  return {
+    x: overflow(contentW, viewW),
+    y: overflow(contentH, viewH),
+  }
+}
+
+/** cover 视窗的世界尺寸（fit=cover，与 fitWindow 主路径同一公式，给窥视门控用） */
+export function coverViewSize(projW, projH, width, height) {
+  if (!(projW > 0) || !(projH > 0) || !(width > 0) || !(height > 0)) return null
+  const scale = Math.max(width / projW, height / projH)
+  return { viewW: width / scale, viewH: height / scale }
+}
+
+/**
+ * 可见图层的世界包围盒（旋转矩形取 AABB 并集），cover 窥视门控的内容基准。
+ * layers 是 parse 产出的层（visible 已折叠父链；origin/scale/angles 为 world 值）。
+ * 只统计「会画出来」的层：visible:false / destroyed / 零尺寸跳过。
+ * 返回 {minX,minY,maxX,maxY}；没有任何可见层时各分量为 Infinity/-Infinity。
+ */
+export function coverContentBounds(layers) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const l of layers || []) {
+    if (!l || l.visible === false || l.destroyed) continue
+    const w = Math.abs((l.size?.[0] ?? 0) * (l.scale?.[0] ?? 1))
+    const h = Math.abs((l.size?.[1] ?? 0) * (l.scale?.[1] ?? 1))
+    if (!(w > 0) && !(h > 0)) continue
+    const az = Number(l.angles?.[2] ?? 0) || 0
+    const cos = Math.abs(Math.cos(az))
+    const sin = Math.abs(Math.sin(az))
+    const ew = w * cos + h * sin
+    const eh = w * sin + h * cos
+    const cx = Number(l.origin?.[0] ?? 0) || 0
+    const cy = Number(l.origin?.[1] ?? 0) || 0
+    minX = Math.min(minX, cx - ew / 2)
+    maxX = Math.max(maxX, cx + ew / 2)
+    minY = Math.min(minY, cy - eh / 2)
+    maxY = Math.max(maxY, cy + eh / 2)
+  }
+  return { minX, minY, maxX, maxY }
+}
+
 // 场景默认相机（WE 2D 约定：世界坐标 = 像素，y 向下）
 // 注意：2D 正交场景渲染时忽略 scene.json 的 eye/center/up（那是编辑器最后保存的相机状态，运行时不用），使用固定相机
 // 根据显示模式计算「可见窗口」：把场景设计尺寸（projW×projH）映射到屏幕（width×height）时，

@@ -75,6 +75,37 @@ const { check, errors } = createChecker();
   check(silentMax < 0.05, `静音段响度过高 max=${silentMax}`);
   check(beatBass > offBass * 1.5, `节拍结构不成立 beat=${beatBass.toFixed(3)} off=${offBass.toFixed(3)}`);
 
+  // 真立体声：左右声道**内容**去相关（底鼓居中、军鼓偏左、踩镲偏右、和弦左右
+  // 独立游走），不是同一波形乘 (1±pan) 的伪立体声 —— 旧实现左右条完全同相，
+  // 双声道可视化看着是镜像单声道（用户实测要求改）。同时左右能量必须保持平衡
+  // （GAIN=3.2 按双声道总和标定的场景音条不能歪）。
+  {
+    const simS = createSimulatedAudio(7);
+    let sumAbsDiff = 0;
+    let sumL = 0;
+    let sumR = 0;
+    let n = 0;
+    for (let f = 0; f < 1200; f++) {
+      const s = simS.update(1 + f / 60); // 跳过开头，取稳定播放段
+      for (let i = 0; i < 64; i++) {
+        sumAbsDiff += Math.abs(s.left64[i] - s.right64[i]);
+        sumL += s.left64[i];
+        sumR += s.right64[i];
+        n++;
+      }
+    }
+    const meanDiff = sumAbsDiff / n;
+    check(meanDiff > 0.05, `立体声去相关不足：L/R 平均绝对差 ${meanDiff.toFixed(4)}（伪立体声 ≈0.02，应 >0.05）`);
+    check(meanDiff < 0.45, `立体声分离过度：L/R 平均绝对差 ${meanDiff.toFixed(4)}（应 <0.45，否则左右完全不像一首歌）`);
+    const ratio = sumL / Math.max(1e-9, sumR);
+    check(ratio > 0.85 && ratio < 1.15, `左右能量失衡：L/R=${ratio.toFixed(3)}（应 0.85~1.15）`);
+    // pre 系列同样要立体声（网页 gamma 扩展驱动的是 preL64/preR64）
+    const s2 = createSimulatedAudio(7).update(5.5);
+    let preDiff = 0;
+    for (let i = 0; i < 64; i++) preDiff += Math.abs(s2.preL64[i] - s2.preR64[i]);
+    check(preDiff / 64 > 0.01, `preL64/preR64 去相关不足：${(preDiff / 64).toFixed(4)}`);
+  }
+
   // 确定性：同 t 重复调用结果一致（暂停/回卷安全）
   const a = createSimulatedAudio(1).update(7.77);
   const b = createSimulatedAudio(1).update(7.77);

@@ -158,6 +158,9 @@ class Vec3 {
     )
   }
   length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z) }
+  // [we-scene patch] WE Vec3 的平方长度（1712475860 金币距离判定在用；
+  // makeVec3 同款缺口的另一处补齐）。
+  lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z }
   normalize() {
     const l = this.length()
     return l === 0 ? new Vec3(0, 0, 0) : new Vec3(this.x / l, this.y / l, this.z / l)
@@ -583,6 +586,13 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   })
 
   const thisLayer = {
+    // [we-scene patch] update 的 value 链从**空串**起步（脚本有 update 时才如此，
+    // 见下方 fns 解析后的回填）：场景静态文本只是脚本产出前的占位显示，不进
+    // value 链。打字机模板（全库 3 张 / 7 处脚本，3786330502 / 3395777145 /
+    // 3789617659）隐含「index===0 时 value 必为空」的前提做「不删字直接打」，
+    // 给它静态占位文本会打出「Wallpaper Music夜」并永久卡死 —— 3395777145 的
+    // 官方预览图里是干干净净的完整歌名，证明 WE 的 value 链就是空串起步。
+    // init(value) 仍由宿主传静态文本（scene-mount deferredTextInits），不受影响。
     text: opts.text !== undefined && opts.text !== null ? String(opts.text) : '',
     font: opts.font || '',
     pointsize: opts.pointsize || 24,
@@ -594,7 +604,10 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     origin: makeVec3(opts.origin || [0, 0, 0]),
   }
   const engine = {
-    registerAsset: () => {},
+    // [we-scene patch] registerAsset 必须把路径**原样返回**：脚本拿到的返回值
+    // 会直接喂给 thisScene.createLayer（1712475860 的金币 coinget）。
+    // 旧 no-op 返回 undefined → createLayer(undefined) 造出无贴图空层，金币永远不显示。
+    registerAsset: (p) => p,
     frametime: 1 / 60,
     runtime: 0,
     canvasSize: engineCanvasSize(opts.canvasSize),
@@ -736,6 +749,41 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 消费口的官方机制，闸门外丢弃 = 事件到了没人接）。
   const hasAnimEventHook = !!(fns && typeof fns.animationEvent === 'function')
   if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook && !hasAnimEventHook)) return null
+  // [we-scene patch] update 的首帧 value 语义按脚本形态区分：
+  //  - 写回式（打字机模板）：update 把入参 value 当作**累积中的当前文本读入**
+  //    （addLastChar(value) / handleBlinker(value) / queuedWord===value），返回值
+  //    依赖入参；隐含「index===0 时 value 必为空」的前提，store 必须从空串起步，
+  //    否则打出「静态占位+新歌名」永久卡死（3786330502）。
+  //  - 返回式（时钟/日期 `value=hours+':'+minutes; return value`、麻匪
+  //    `return mediaData`）：返回值不读入参，store 保留静态文本由返回值覆盖。
+  //
+  // 判据是词法分析「形参有没有被**读**」，不是有没有被赋值（两类都会 value=）。
+  // 必须先剥注释/字符串/属性键，否则时钟脚本里的 `{value:false}`、`//value==`
+  // 会误判（3379996991 的 Clock/Date 曾因此被清空不显示）。
+  const updateIsWriteback = (() => {
+    if (!fns.update) return false
+    const src = Function.prototype.toString.call(fns.update)
+    // 只分析函数体（首个 { 到末尾 }），形参声明在签名里、不算「读」
+    const bodyStart = src.indexOf('{')
+    if (bodyStart < 0) return false
+    const params = /\(([^)]*)\)/.exec(src.slice(0, bodyStart))?.[1] || ''
+    const paramNames = params.split(',').map((p) => p.trim().split(/[=\s]/)[0]).filter(Boolean)
+    if (!paramNames.length) return false
+    let code = src.slice(bodyStart + 1, src.lastIndexOf('}'))
+    // 词法清洗：去注释/字符串/模板串 → 再去对象属性键（标识符后跟 :，三元的 : 前是表达式不匹配）
+    code = code
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/[^\n]*/g, ' ')
+      .replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g, '""')
+      .replace(/([A-Za-z_$][\w$]*)\s*:/g, (m, id) => (paramNames.includes(id) ? ' :' : m))
+    // 去掉赋值左值与 `return 形参`（只回传刚赋的值，不算读）
+    for (const p of paramNames) {
+      code = code.replace(new RegExp(`\\b${p}\\s*(\\+\\+|--|=(?!=)|\\+=|-=|\\*=|\\/=)`, 'g'), ' ')
+      code = code.replace(new RegExp(`return\\s+${p}\\s*;?`, 'g'), ' ')
+    }
+    return paramNames.some((p) => new RegExp(`\\b${p}\\b`).test(code))
+  })()
+  if (fns.update && updateIsWriteback) thisLayer.text = ''
 
   const sandbox = {
     engine,
@@ -779,11 +827,12 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     },
     /** 求值当前文本：返回新文本；undefined/null 保留原值；连续出错 3 次熔断回退静态文本 */
     callUpdate(value) {
+      void value // 保留签名兼容调用方；value 链只走沙箱 store（见 thisLayer 声明处注释）
       if (!fns.update || sandbox.disabled) return null
       const before = thisLayer.text
       let ret
       try {
-        ret = fns.update(before !== '' ? before : (value !== undefined ? value : ''))
+        ret = fns.update(before)
       } catch (e) {
         sandbox.errCount++
         if (opts.onError) opts.onError(e, 'update')
@@ -851,6 +900,9 @@ export function evalTextScript(script, scriptprops, opts = {}) {
         return undefined
       }
     },
+    // [we-scene patch] 脚本是写回式 update（无 return，打字机模板）：value 链从
+    // 空串起步，沙箱创建时 store 已清空。
+    updateIsWriteback,
   }
   return sandbox
 }
@@ -1226,7 +1278,18 @@ function resolveDestroyTarget(arg, opts) {
     if (opts && opts.layer && opts.layer.name === name) return opts.layer
     return null
   }
-  if (typeof arg === 'object') return lookup(arg.name)
+  if (typeof arg === 'object') {
+    // [we-scene patch] 先按 id 做身份解析：运行期 createLayer 出来的克隆层
+    // **没有名字**（1712475860 的金币），只按名字 lookup 必然落空 ——
+    // destroyLayer(coin) 静默无效，金币被「收集」后照样在天上飞，
+    // 还会每帧重复触发收集特效（一张壁纸上 20 个特效系统）。
+    const id = Number(arg.id)
+    if (id > 0 && opts && typeof opts.enumerateSceneLayers === 'function') {
+      const list = opts.enumerateSceneLayers()
+      for (const l of list) if (l && l.id === id) return l
+    }
+    return lookup(arg.name)
+  }
   return lookup(String(arg))
 }
 
@@ -1645,7 +1708,10 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   })
 
   const engine = {
-    registerAsset: () => {},
+    // [we-scene patch] registerAsset 必须把路径**原样返回**：脚本拿到的返回值
+    // 会直接喂给 thisScene.createLayer（1712475860 的金币 coinget）。
+    // 旧 no-op 返回 undefined → createLayer(undefined) 造出无贴图空层，金币永远不显示。
+    registerAsset: (p) => p,
     frametime: 1 / 60,
     runtime: 0,
     canvasSize: engineCanvasSize(opts.canvasSize),
@@ -1890,7 +1956,11 @@ function makeVec3(v) {
     get y() { return base.y }, set y(n) { base.y = Number(n) || 0 },
     get z() { return base.z }, set z(n) { base.z = Number(n) || 0 },
     add(o) { const b = normVec(o); base.x += b[0]; base.y += b[1]; base.z += b[2]; return api },
-    subtract(o) { const b = normVec(o); base.x -= b[0]; base.y -= b[1]; base.z -= b[2]; return api },
+    // [we-scene patch] subtract 必须返回**新向量**（WE 语义：纯运算不变异左值）。
+    // 旧实现就地变异 base：1712475860 Dino Run 每帧
+    // `marioOrigin.subtract(origin).lengthSqr()` —— base 被逐帧减 origin.x，
+    // 角色坐标被污染得越来越远；加 lengthSqr 后才会暴露这个漂移。
+    subtract(o) { const b = normVec(o); return makeVec3([base.x - b[0], base.y - b[1], base.z - b[2]]) },
     multiply(k) {
       if (k && typeof k === 'object') {
         const b = normVec(k)
@@ -1905,6 +1975,10 @@ function makeVec3(v) {
     // 旧 api 没有 copy，update 被 try/catch 吃掉 → 64 根条 origin/scale 永不更新。
     copy() { return new Vec3(base.x, base.y, base.z) },
     length() { return Math.sqrt(base.x * base.x + base.y * base.y + base.z * base.z) },
+    // [we-scene patch] WE Vec3 有 lengthSqr（平方长度，省一次 sqrt）：
+    // 缺它 → `a.subtract(b).lengthSqr()` 直接 TypeError → 连错 3 次熔断，
+    // 1712475860 Dino Run 的金币距离判定让整张互动死掉。
+    lengthSqr() { return base.x * base.x + base.y * base.y + base.z * base.z },
     toArray() { return [base.x, base.y, base.z] },
   }
   return api
@@ -1986,5 +2060,5 @@ export function textLayerHasTintMask(layer) {
 // [we-scene patch] 脚本沙箱与排版是两类依赖：沙箱吃 engine/属性/媒体视图，
 // 排版只吃 measure 回调与 Canvas2D。拆开后 Node 侧可只加载排版做布局判据，
 // 未来 WE 脚本兼容性扩展（见 docs/SCRIPT-COMPAT.md）只改沙箱一半。
-import { layoutText, drawTextLayer, effectiveTextPadding } from './text-layout.js'
-export { layoutText, drawTextLayer, effectiveTextPadding, Vec3 }
+import { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder } from './text-layout.js'
+export { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder, Vec3 }

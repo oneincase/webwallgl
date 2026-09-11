@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.15/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -100,6 +100,7 @@ console.log(wp.canvas);
 
 | 工厂 | 用途 |
 | --- | --- |
+| `1.3.16` | 2026-09-11 | 媒体组件修复与品牌化：①33 张壁纸的专辑封面此前显示黑色占位——作者把 $mediaThumbnail/$mediaPreviousThumbnail 绑在效果 pass 的 usertextures 槽，解析只取了默认占位纹理；现按绑定合并，封面正常显示（3785267658/3786330502 等）。②媒体歌名/歌手整层空白：限宽换行曾被 2×2 占位盒的内宽压成每字一行再收成省略号；文字画布改为只对占位小盒按内容对称扩边，打字机式脚本的标题不再卡在占位文本。③模拟音频改成真立体声（底鼓居中、军鼓/踩镲分左右、和弦左右独立）。④模拟媒体源换成库品牌：曲名 WebWallGL、歌手 oneincase、封面用库 logo。⑤修复共享文字画布尺寸重设后字体丢失：改 textCanvas.width/height 会重置 2D 上下文，measure 阶段设的字号被清成默认 10px，导致大字号时钟/日期按 10px 绘制、整层几乎不可见（2468489223、3379996991）；现绘制用显式字体串。⑥修复时钟/日期脚本被误判为写回式而清空文本（3379996991）。 |
 | `httpSource(baseUrl, init?)` | HTTP 基址；自动按 scene.pkg → scenes/scene.pkg → gifscene.pkg 三种真实布局回退 |
 | `fileSource(file, project?)` | &lt;input type=file> 或拖拽进来的 .pkg 本地文件 |
 | `bytesSource(pkg, project?, key?)` | 已经拿到字节（bundle 内嵌、IndexedDB 缓存、自定义通道） |
@@ -327,7 +328,7 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.15。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.16。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |

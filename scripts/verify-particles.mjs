@@ -507,6 +507,23 @@ function runTextures() {
     if (ck(n) === haloCk) errors.push(`${n}: 形状仍等于 halo（登记表未补全）`);
   }
 
+  // flare_1 必须是官方十字细芒（1948961570 官方 preview 标定）：
+  // 角向扇形宽光束（旧 spikyStar 25°）在粒子随机旋转后糊成整屏对角粗光束。
+  // 三条判据分别钉死：中半径亮度（径向衰减够快）、角向宽度（芒够细）、
+  // 贴图边缘仍有微光（指数长尾，高斯包络会在半路截断）。
+  {
+    const t = ptex.buildBuiltinParticleTexture("particle/light/flare_1");
+    const { width: w, rgba } = t;
+    const c = w / 2;
+    const A = (x, y) => rgba[(Math.round(y) * w + Math.round(x)) * 4 + 3];
+    const mid = A(c + 128, c); // r=128 轴上
+    const off = A(c + 100 * Math.cos(Math.PI / 20), c + 100 * Math.sin(Math.PI / 20)); // r=100 偏 9°
+    const tail = A(c + 240, c); // r=240 轴上（贴图边缘 256 以内）
+    if (mid >= 90) errors.push(`flare_1: r=128 亮度 ${mid} 过高 → 芒太宽/太长（应 <90，旧扇形 165）`);
+    if (off >= 10) errors.push(`flare_1: r=100 偏 9° 亮度 ${off} 过高 → 芒太宽（应 <10，旧扇形 36）`);
+    if (tail < 2) errors.push(`flare_1: r=240 亮度 ${tail} 为 0 → 芒尾被截断（官方细线拖到贴图边缘）`);
+  }
+
   // 官方 Refract 法线不得再是平坦 (0.5,0.5,1)
   const normalSlope = (t) => {
     const { width: w, height: h, rgba } = t;

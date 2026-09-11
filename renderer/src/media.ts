@@ -796,6 +796,10 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
     };
     pair.onFallback = () => reportDiag(rt, cfg, "media video: 无缝循环兜底（退回原生 loop）");
     (rt.videoPairs ??= []).push(pair);
+    // A/B 路径 = 有声/回退形态；重新静音时允许切回 WebCodecs 静音循环
+    // （mount.ts setVolume 在音量归 0 时读这个标记重挂）。WebCodecs 解码失败
+    // 的回退会在 fallbackToAb 里把它再清零 —— 失败过的源不要反复尝试
+    rt.webcodecsPreferred = supportsWebCodecsVideo();
 
     // 双元素的频谱：两个元素各建一条 analyser，读当前主元素那条
     const swapSpectrum = attachPairSpectrum(rt, cfg, pair.active, pair.standby);
@@ -816,14 +820,17 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
   if (wantLoop && muted && supportsWebCodecsVideo()) {
     let pathActive = true;
     let player: ReturnType<typeof mountWebCodecsVideo> | null = null;
-    /** 销毁 WebCodecs 实例并回退 A/B 路径（rt 已 clear 时静默作废） */
-    const fallbackToAb = (why: string) => {
+    /** 销毁 WebCodecs 实例并回退 A/B 路径（rt 已 clear 时静默作废）。
+     *  allowReturn=false（解码/初始化失败）时禁止再切回 WebCodecs，
+     *  否则音量每次归 0 都会重挂一次再失败，画面反复闪 */
+    const fallbackToAb = (why: string, allowReturn = true) => {
       if (!pathActive) return;
       pathActive = false;
       player?.destroy();
       player = null;
       reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`);
       mountAbPair();
+      if (!allowReturn) rt.webcodecsPreferred = false;
     };
     player = mountWebCodecsVideo({
       src: cfg.src,
@@ -836,7 +843,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       onFirstFrame: signalFirstFrame,
       onFrame: () => markFrame(rt, performance.now()),
       onDiag: (m) => reportDiag(rt, cfg, `media video(webcodecs): ${m}`),
-      onFatal: (why) => fallbackToAb(`WebCodecs 路径失败（${why}）`),
+      onFatal: (why) => fallbackToAb(`WebCodecs 路径失败（${why}）`, false),
     });
     // 暂停/恢复走 sceneCtl（与场景路径同一套钩子，mount.ts 统一调用）
     rt.sceneCtl = {

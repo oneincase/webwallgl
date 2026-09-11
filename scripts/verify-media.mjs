@@ -31,7 +31,7 @@ const {
   mediaVec3,
 } = await imp("renderer/vendor/we-scene/render/media.js");
 const { createSimulatedWindowTitle, createSimulatedSystem } = await imp("renderer/vendor/we-scene/render/system.js");
-const { evalTextScript, evalObjectScript, makeCursorEventVec } = await imp("renderer/vendor/we-scene/render/text.js");
+const { evalTextScript, evalObjectScript, makeCursorEventVec, Vec3: ScriptVec3 } = await imp("renderer/vendor/we-scene/render/text.js");
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
 const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
 
@@ -45,6 +45,10 @@ const { check, errors } = createChecker();
 
   const states = new Set();
   const titles = new Set();
+  const albums = new Set();
+  const trackIdx = new Set();
+  let thumbOk = 0;
+  let thumbChecked = 0;
   let lastTrack = -1;
   let posResets = 0;
   let badPos = 0;
@@ -55,9 +59,16 @@ const { check, errors } = createChecker();
     const s = sim.snapshot;
     states.add(s.state);
     if (s.title) titles.add(s.title);
+    if (s.album) albums.add(s.album);
+    if (s.trackIndex >= 0) trackIdx.add(s.trackIndex);
     if (s.trackIndex !== lastTrack) {
       posResets++;
       lastTrack = s.trackIndex;
+    }
+    // 封面通道：有曲（非曲间空隙）时必须带 data URL 封面（本库 logo）
+    if (s.hasThumbnail) {
+      thumbChecked++;
+      if (typeof s.thumbnail === "string" && s.thumbnail.startsWith("data:image/")) thumbOk++;
     }
     if (!(s.position >= 0 && s.position <= s.duration + 1e-6)) badPos++;
     // 歌词行必须与时间戳一致：找最后一个 ts <= position 的行
@@ -78,7 +89,13 @@ const { check, errors } = createChecker();
   );
   check(states.has(MEDIA_PLAYBACK.PAUSED), "一个周期内应出现 PAUSED 状态（暂停分支未被覆盖）");
   check(states.has(MEDIA_PLAYBACK.STOPPED), "一个周期内应出现 STOPPED 状态（曲间空隙）");
-  check(titles.size >= 4, `一个周期内应轮换完整播放列表，实得 ${titles.size} 首`);
+  // 品牌曲播放列表：曲名一律 WebWallGL、歌手一律 oneincase（用户要求的库品牌），
+  // 轮换靠专辑名（Scene/Web/Video/Live）与 trackIndex 区分
+  check(titles.size === 1 && titles.has("WebWallGL"), `曲名应一律为 WebWallGL，实得 ${[...titles].join(",")}`);
+  check(albums.size >= 4, `一个周期内应轮换完整播放列表（专辑区分），实得 ${albums.size} 张`);
+  check(trackIdx.size >= 4, `一个周期内应轮换完整播放列表（trackIndex），实得 ${trackIdx.size} 首`);
+  check(thumbChecked > 0 && thumbOk === thumbChecked,
+    `有曲时封面必须一律是 data URL（本库 logo），${thumbChecked - thumbOk}/${thumbChecked} 处不是`);
   check(badPos === 0, `进度应始终落在 [0, duration]，越界 ${badPos} 次`);
   check(lyricMismatch === 0, `歌词行与时间戳不符 ${lyricMismatch} 次`);
 
@@ -130,20 +147,22 @@ const { check, errors } = createChecker();
 {
   const sim = createSimulatedMedia();
   sim.update(10);
-  const first = sim.snapshot.title;
+  const first = sim.snapshot.album;
   const firstIdx = sim.snapshot.trackIndex;
   sim.skipNext();
-  check(sim.snapshot.trackIndex !== firstIdx, `skipNext 应换曲，仍停在 ${firstIdx} ${sim.snapshot.title}`);
-  check(sim.snapshot.title !== first, `skipNext 后歌名应变，仍是 ${first}`);
+  check(sim.snapshot.trackIndex !== firstIdx, `skipNext 应换曲，仍停在 ${firstIdx} ${sim.snapshot.album}`);
+  check(sim.snapshot.album !== first, `skipNext 后专辑应变（品牌曲同名不同专辑），仍是 ${first}`);
+  check(sim.snapshot.title === "WebWallGL" && sim.snapshot.artist === "oneincase",
+    `品牌曲名/歌手应为 WebWallGL / oneincase，实得 ${sim.snapshot.title} / ${sim.snapshot.artist}`);
   check(sim.snapshot.position < 1, `skipNext 应落到下一首开头，position=${sim.snapshot.position}`);
-  const mid = sim.snapshot.title;
+  const mid = sim.snapshot.album;
   sim.skipPrevious();
-  check(sim.snapshot.title === first, `skipPrevious 应回到上一首，实得 ${sim.snapshot.title} 期望 ${first}`);
+  check(sim.snapshot.album === first, `skipPrevious 应回到上一首，实得 ${sim.snapshot.album} 期望 ${first}`);
   sim.pause();
   check(sim.snapshot.state === MEDIA_PLAYBACK.PAUSED, `pause 后 state 应为 PAUSED，实得 ${sim.snapshot.state}`);
   const pos = sim.snapshot.position;
   sim.update(10 + 30);
-  check(sim.snapshot.title === first, "暂停后时间推进不应换歌");
+  check(sim.snapshot.album === first, "暂停后时间推进不应换歌");
   check(Math.abs(sim.snapshot.position - pos) < 1e-9, "暂停后进度应冻结");
   sim.play();
   check(sim.snapshot.state !== MEDIA_PLAYBACK.PAUSED, "play 后不应再保持用户暂停");
@@ -536,8 +555,12 @@ const { check, errors } = createChecker();
           // WE 挂载顺序：init(字段当前值) → applyUserProperties → 逐帧 update。
           // 3791163858 悬停缩放在 applyUserProperties 里 `initScale.multiply(hoScale)`，
           // 不先 init 就会把「沙箱缺 Vec3 方法」和「verifier 没走完生命周期」混在一起。
+          // init/update 的值必须是真 Vec3 实例（不是 {x,y,z} 字面量）：颜色脚本
+          // 在 init 里直接 `value.multiply(...)`（3163060610 背景色），字面量没有
+          // 链式方法会三振熔断 —— 真实宿主给 color 字段的就是 Vec3。
+          const initVec = new ScriptVec3(1, 1, 1);
           try {
-            sb.init({ x: 1, y: 1, z: 1 });
+            sb.init(initVec);
             sb.applyUserProperties({});
           } catch {
             /* init 抛错由 errCount 记录，下面 disabled 检查会抓到熔断 */
@@ -546,7 +569,7 @@ const { check, errors } = createChecker();
           const readOut = () => {
             if (!sb.hasUpdate) return null;
             try {
-              const r = sb.callUpdate({ x: 1, y: 1, z: 1 });
+              const r = sb.callUpdate(new ScriptVec3(1, 1, 1));
               if (r === null || r === undefined) return null;
               if (typeof r === "number") return String(r.toFixed(4));
               if (typeof r === "object")
@@ -597,6 +620,58 @@ const { check, errors } = createChecker();
     );
   } else {
     console.log("  真实语料：未找到壁纸库，跳过回归");
+  }
+}
+
+// ---------- 5b. pass 级 usertextures 合并（封面绑定的唯一通道） ----------
+// scene.json 效果 pass 的 textures 槽留默认占位图，$mediaThumbnail /
+// $mediaPreviousThumbnail 的真绑定在 usertextures[i].name（全库 122 处 / 33 张，
+// 清一色保留名）。parse 不合并 → 封面永远停在作者打包时的占位灰块
+// （3785267658 Vinyl Cover、3786330502 播放器封面实机证实）。
+{
+  let totalBound = 0;
+  let mergedOk = 0;
+  let niulaiCover = null;
+  let ids5b = [];
+  try { ids5b = fs.readdirSync(LIB); } catch { ids5b = []; }
+  for (const id of ids5b) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let sj;
+    try {
+      const pkg = parsePkg(fs.readFileSync(pkgPath));
+      sj = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8").replace(/^﻿/, ""));
+    } catch { continue; }
+    // 先按结构数 scene.json 原文里 **pass 级**（效果 passes 槽下）usertextures 的
+    // 保留名绑定——instance 级是另一条已支持的路径，不在此处统计。
+    for (const o of sj.objects || []) {
+      for (const e of o.effects || []) {
+        for (const p of e.passes || []) {
+          for (const u of p.usertextures || []) {
+            if (u && typeof u.name === "string" && u.name.startsWith("$media")) totalBound++;
+          }
+        }
+      }
+    }
+    // 再过 parseScene：合并后的 pass.textures 必须带上保留名
+    const scene = parseScene(sj, null);
+    for (const layer of scene.layers) {
+      for (const e of layer.effects || []) {
+        for (const p of e.passes || []) {
+          const texArr = p.textures || [];
+          if (texArr.some((t) => typeof t === "string" && t.startsWith("$media"))) mergedOk++;
+          if (id === "3785267658" && texArr.includes("$mediaThumbnail")) niulaiCover = layer.name;
+        }
+      }
+    }
+  }
+  if (totalBound > 0) {
+    check(mergedOk >= totalBound,
+      `pass 级 usertextures 合并不完整：scene.json 绑定 ${totalBound} 处，parse 后仅 ${mergedOk} 个 pass 带保留名`);
+    check(niulaiCover !== null, "3785267658 牛来的封面效果应在 parse 后绑定 $mediaThumbnail");
+    console.log(`  pass 级 usertextures：${totalBound} 处绑定全部合并（牛来封面层 = ${niulaiCover}）`);
+  } else {
+    console.log("  （跳过 usertextures 语料：库内无绑定）");
   }
 }
 
@@ -1035,13 +1110,14 @@ const { check, errors } = createChecker();
   check(/rt\.audioBridge\?\.\(\)/.test(sceneTs), "scene-mount.ts 必须每帧拉一次 rt.audioBridge");
 
   // --- 指针 ---
+  // 1.3.9 起签名带滚轮修饰键 mods（可选第四位），断言要兼容超集签名
   check(
-    /pushPointer\(u: number, v: number, buttons\?: number\)/.test(typesTs),
+    /pushPointer\(u: number, v: number, buttons\?: number(, mods\?: number)?\)/.test(typesTs),
     "SceneInstance 必须声明 pushPointer（桌面壁纸在 underlay 层收不到鼠标，只能靠宿主推）",
   );
   check(/pointerLeave\(\): void/.test(typesTs), "SceneInstance 必须声明 pointerLeave");
   check(
-    /rt\.pointerCtl\?\.push\(\{ u, v, buttons \}\)/.test(mountTs),
+    /rt\.pointerCtl\?\.push\(\{ u, v, buttons(, mods)? \}\)/.test(mountTs),
     "api/mount.ts 的 pushPointer 必须映射到 rt.pointerCtl.push",
   );
   check(
@@ -1050,7 +1126,7 @@ const { check, errors } = createChecker();
   );
   // 与 __wp 同签名是刻意的：下游从整页渲染器迁到库时代码不用改
   check(
-    /pushPointer\(u: number, v: number, buttons\?: number\)/.test(mainTs),
+    /pushPointer\(u: number, v: number, buttons\?: number(, mods\?: number)?\)/.test(mainTs),
     "main.ts 的 __wp.pushPointer 签名应与 SceneInstance.pushPointer 保持一致",
   );
 }
@@ -1258,10 +1334,13 @@ const { check, errors } = createChecker();
   // 停在一片 clearcolor（实测暂停时整幅读数是均匀的 178，没有任何内容）。
   // 还必须排在 `if (disposed || rt.paused) return` 早退之前，否则同样漏掉。
   for (const [name, src] of [["scene-mount.ts", sceneTs], ["media.ts", mediaTs]]) {
-    const render = src.indexOf(".render(");
-    const then = src.indexOf(".then(", render);
     const ff = src.indexOf("rt.onFirstFrame) {");
-    const early = src.indexOf("if (disposed || rt.paused) return;", then);
+    // 从 ff 反查：包含它的那个 .then( 与其前置 .render( —— 不能正向 indexOf，
+    // 装配区新增的异步 .then(（loadTex 等）会把「第一个 .then」抢走，让 early
+    // 误命中渲染循环起始的那句早退（1.3.7 挂过一次）。
+    const then = src.lastIndexOf(".then(", ff);
+    const render = src.lastIndexOf(".render(", then);
+    const early = src.indexOf("if (disposed || rt.paused) return;", ff);
     check(render > 0 && then > render && ff > then,
       `${name} 的 onFirstFrame 必须在 render().then 内触发（放在 render 之前会早一帧，autoplay:false 拿到空画布）`);
     check(early > 0 && ff < early,
