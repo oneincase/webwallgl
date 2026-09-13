@@ -217,5 +217,56 @@ console.log("\n[4] 内置 util 贴图：util/clouds_256 必须可平铺且非平
   check(/opts && opts\.wrap === 'repeat' \? gl\.REPEAT/.test(glSrc), "makeTexture 应支持 wrap:'repeat'");
 }
 
+console.log("\n[5] 精灵硬边封印：软形状贴图外圈 alpha 必须严格 0（2241938645 / 2250845956）");
+{
+  // 「能看出透明的方块」：烟/雾/火/光斑/气泡这类按精灵画的软形状贴图，边缘只要还留
+  // 1~130/255 的 alpha，放大成几百~几千像素的 quad 后每个方块的直边就肉眼可见。
+  const ptex = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js")).href
+  );
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js"), "utf8");
+  check(/RIM_SEALED/.test(src) && /function sealRim/.test(src), "生成器应有 RIM_SEALED + sealRim 封边");
+  const border = (t) => {
+    const W = t.width, H = t.height, rgba = t.rgba;
+    const A = (x, y) => rgba[(y * W + x) * 4 + 3];
+    let b = 0;
+    for (let x = 0; x < W; x++) b = Math.max(b, A(x, 0), A(x, H - 1));
+    for (let y = 0; y < H; y++) b = Math.max(b, A(0, y), A(W - 1, y));
+    return b;
+  };
+  // 精灵类抽样（烟/雾/火/光柱/气泡/星芒/泪滴/风环）
+  const sprites = [
+    "particle/smoke/smoke2", "particle/smoke/smoke1", "particle/fog/fog1",
+    "particle/fire/fire1", "particle/light/light_shafts_6", "particle/light/flare_2",
+    "particle/bubbles/bubble1", "particle/misc/star_0", "particle/drop",
+    "particle/shape/circle_wind", "particle/beam/beam_2_fade",
+  ];
+  let bad = 0;
+  for (const n of sprites) {
+    const t = ptex.buildBuiltinParticleTexture(n);
+    const b = border(t);
+    if (b > 2) { bad++; check(false, `${n} 外圈 alpha=${b}（应 0，放大后露方块边）`); }
+  }
+  check(bad === 0, `精灵类抽样 ${sprites.length} 张全部外圈 alpha ≤2`);
+  // 法线豁免：alpha 是 REFRACT 蒙版
+  const nrm = ptex.buildBuiltinParticleTexture("particle/drop_normal");
+  check(nrm.rgba[3] > 0, "particle/drop_normal 必须豁免封边（法线 alpha 是折射蒙版）");
+  // 烟/雾紧凑窗：半径 0.75 外零 alpha，且不是稀到看不见
+  for (const n of ["particle/smoke/smoke2", "particle/fog/fog1"]) {
+    const t = ptex.buildBuiltinParticleTexture(n);
+    const W = t.width, rgba = t.rgba;
+    let outer = 0, mean = 0;
+    for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+      const a = rgba[(y * W + x) * 4 + 3];
+      mean += a;
+      const d = Math.hypot(x + 0.5 - W / 2, y + 0.5 - W / 2) / (W / 2);
+      if (d > 0.75 && a > outer) outer = a;
+    }
+    mean /= W * W;
+    check(outer === 0, `${n} 半径 0.75 外 alpha 必须为 0（方块裙边）`);
+    check(mean > 0.3 && mean < 12, `${n} 平均 alpha=${mean.toFixed(2)} 应在 0.3~12（过稀/过浓）`);
+  }
+}
+
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

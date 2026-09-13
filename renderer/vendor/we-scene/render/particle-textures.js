@@ -670,9 +670,19 @@ function fogNoise(size, freq, oct, seed, density, maskExp, peakTarget) {
     for (let x = 0; x < inner; x++) {
       const n = (noise[y * inner + x] - lo) / span
       const d = Math.hypot((x + 0.5 - half) / half, (y + 0.5 - half) / half)
-      const mask = Math.pow(Math.max(0, 1 - d), mExp)
+      // [we-scene patch 2026-09-14] 紧凑径向窗：旧实现只用 `pow(1-d, mExp)`
+      // （mExp 0.9~1.7，近似线性），低 alpha 的「裙边」一直铺到 quad 边缘 ——
+      // 半透明混合下几十个精灵叠加，每个 quad 的**直边**肉眼可见
+      // （2241938645 车尾气 / 2250845956 人呼气「能看出透明的方块」）。
+      // 这两个预设的精灵极大（sizerandom 500~700 / 1000~2200，叠图层 scale 后
+      // 可覆盖整屏），方块的边被同步放大，所以窗必须收到「外圈 alpha 严格为 0」：
+      // 高斯窗（C∞，无环带）+ 低 alpha 截断，blob 占中心 ~70% 直径。
+      const window = Math.exp(-((d / 0.45) ** 2))
+      const mask = Math.pow(Math.max(0, 1 - d), mExp) * window
       let a = Math.max(0, (n - (1 - density)) / (density || 1))
       a = smooth01(Math.min(1, a)) * mask
+      // 低 alpha 截断：裙边残留的 1~5/255 也会随叠加显形，直接归零
+      a = a <= 0.02 ? 0 : (a - 0.02) / 0.98
       writeWhite(rgba, (y * inner + x) * 4, a)
     }
   }
@@ -1092,13 +1102,13 @@ const BUILDERS = {
   // 雨滴 sheet（原生 128×256 → 256×512，2×4 格）：每格一颗上圆下尖小水滴
   'particle/water/rain_drops_sheet': () => dropSheet(256, 512, 2, 4),
   // 雾（原生 256 → 512）：絮状 fBm，弱遮罩铺满；三张不同尺度/种子
-  'particle/fog/fog1': () => fogNoise(512, 4, 5, 1, 0.4, 0.9, 150),
-  'particle/fog/fog2': () => fogNoise(512, 3, 5, 2, 0.45, 0.8, 140),
-  'particle/fog/fog3': () => fogNoise(512, 6, 4, 3, 0.36, 1, 150),
+  'particle/fog/fog1': () => fogNoise(512, 4, 5, 1, 0.4, 0.9, 210),
+  'particle/fog/fog2': () => fogNoise(512, 3, 5, 2, 0.45, 0.8, 200),
+  'particle/fog/fog3': () => fogNoise(512, 6, 4, 3, 0.36, 1, 210),
   // 烟（原生 256 → 512）：同源 fBm 但遮罩更收（团絮感），smoke2light 降密度与峰值
-  'particle/smoke/smoke1': () => fogNoise(512, 3, 5, 7, 0.55, 1.5, 130),
-  'particle/smoke/smoke2': () => fogNoise(512, 2, 5, 11, 0.6, 1.7, 120),
-  'particle/smoke/smoke2light': () => fogNoise(512, 2, 5, 13, 0.4, 1.7, 110),
+  'particle/smoke/smoke1': () => fogNoise(512, 3, 5, 7, 0.55, 1.5, 185),
+  'particle/smoke/smoke2': () => fogNoise(512, 2, 5, 11, 0.6, 1.7, 170),
+  'particle/smoke/smoke2light': () => fogNoise(512, 2, 5, 13, 0.4, 1.7, 155),
   // 环形波（原生 256 → 512）
   'particle/misc/wave': () => ring(512, 0.72, 0.085),
   'particle/misc/star_0': () => spikyStar(256, 5, 0.62, 8, 0.1),
@@ -1146,8 +1156,8 @@ function fallbackFor(name) {
     return () => leaf(LEAF_ATLAS, 0)
   }
   if (/circle_wind|windcircle/.test(n)) return () => windCircle(256)
-  if (/fog|cloud|mist|vapor/.test(n)) return () => fogNoise(512, 4, 5, 5, 0.4, 0.9, 150)
-  if (/smoke/.test(n)) return () => fogNoise(512, 3, 5, 8, 0.55, 1.5, 130)
+  if (/fog|cloud|mist|vapor/.test(n)) return () => fogNoise(512, 4, 5, 5, 0.4, 0.9, 210)
+  if (/smoke/.test(n)) return () => fogNoise(512, 3, 5, 8, 0.55, 1.5, 185)
   if (/beam|shaft|ray|godray/.test(n)) return () => beam(128, 512, 0.3, true)
   if (/flare/.test(n)) return () => flareAnamorphic(256)
   if (/bubble/.test(n)) return () => bubble(256, 1)
@@ -1209,8 +1219,56 @@ export function buildBuiltinParticleTexture(name) {
   }
   // 生成器异常时的最后防线：纯算术光晕（不依赖 canvas）
   if (!out) out = glow2(256, { r: 0.12, w: 1 }, { r: 0.3, w: 0.15 })
+  // 精灵硬边封印（见下方 RIM_SEALED 注释）：软形状精灵的边缘 alpha 必须严格 0
+  for (const rule of RIM_SEALED) {
+    if (rule.re.test(name)) {
+      sealRim(out, rule.band)
+      break
+    }
+  }
   cache.set(name, out)
   return out
+}
+
+// ---------- 精灵硬边封印（2026-09-14）----------
+//
+// 「烟/雾/火/光斑/气泡/光柱」这类**按精灵画**的软形状贴图，只要边缘 alpha 不是
+// 严格 0，放成几百~几千像素的 quad 后就能看见方形的边（2241938645 车尾气、
+// 2250845956 人呼气「能看出透明的方块」；同族还有 flares / star / bubble / beam）。
+// 官方素材的轮廓是一条平滑衰减到 0 的软边；本仓库部分生成器沿到边缘仍有
+// 12~130/255 的 alpha，conditionTexture 的 4% 线性羽化盖不住。
+// 这里在**出贴图时**统一加一道更宽的 S 形窗，比逐生成器改更安全、也便于离线审计。
+//
+// 只对「精灵类」名单生效：图集（rain1/rain2、leaves*、lightning*、
+// rain_drops_sheet）与法线贴图（*normal*、drop_normal 等）**必须原样** ——
+// 图集的格子边是帧边界不是精灵边；法线的 alpha 是折射蒙版，改它会让 REFRACT
+// 雨滴的形状/边缘变形。
+const RIM_SEALED = [
+  { re: /^particle\/(light|beam|fire)\//, band: 0.18 },
+  { re: /^particle\/bubbles\/(?!.*normal)/, band: 0.18 },
+  { re: /^particle\/(misc|shape)\//, band: 0.18 },
+  { re: /^particle\/(star|sickle)/, band: 0.18 },
+  { re: /^particle\/drop$/, band: 0.08 },
+  { re: /^@(star|sparkle|trail)$/, band: 0.18 },
+]
+
+/** 把 alpha 乘上一道宽 S 形边窗：内部 1、边界 0，C1 连续无硬台阶 */
+function sealRim(tex, bandFrac) {
+  if (!tex || !tex.rgba) return tex
+  const W = tex.width
+  const H = tex.height
+  const band = Math.max(2, Math.round(Math.min(W, H) * bandFrac))
+  const rgba = tex.rgba
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dEdge = Math.min(x, y, W - 1 - x, H - 1 - y)
+      if (dEdge >= band) continue
+      const k = smooth01(dEdge / band)
+      const o = (y * W + x) * 4 + 3
+      rgba[o] = Math.round(rgba[o] * k)
+    }
+  }
+  return tex
 }
 
 // 该名字是否是「WE 内置」粒子贴图（用于区分工坊贴图缺失 vs 内置缺失，仅诊断用）

@@ -1547,6 +1547,85 @@ function runBuiltinFrames() {
   return { errors };
 }
 
+// ---------- 精灵硬边：软形状贴图边缘 alpha 必须严格 0（2241938645 车尾气 / 2250845956 人呼气）----------
+// 「能看出透明的方块」：烟/雾/火/光斑/气泡这类按精灵画的软形状贴图，只要边缘还留
+// 1~130/255 的 alpha，放大成几百~几千像素的 quad 后每个方块的直边就肉眼可见
+// （几十个叠加成一片带直边的灰幕）。生成器统一加宽 S 形边窗封印；图集与法线豁免。
+function runSoftRim() {
+  const errors = [];
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js"), "utf8");
+  if (!/RIM_SEALED/.test(src) || !/function sealRim/.test(src)) {
+    errors.push("particle-textures 缺 RIM_SEALED/sealRim（软形状精灵贴图未封边 → 方块边回归）");
+  }
+  const names = ptex.listBuiltinParticleTextureNames();
+  let sealed = 0;
+  for (const name of names) {
+    let t;
+    try { t = ptex.buildBuiltinParticleTexture(name); } catch { continue; }
+    const W = t.width, H = t.height, rgba = t.rgba;
+    const A = (x, y) => rgba[(y * W + x) * 4 + 3];
+    let border = 0;
+    for (let x = 0; x < W; x++) border = Math.max(border, A(x, 0), A(x, H - 1));
+    for (let y = 0; y < H; y++) border = Math.max(border, A(0, y), A(W - 1, y));
+    const isAtlasOrNormal = /normal|leaves|lightning|rain1|rain2|rain_drops|rosetepal/.test(name);
+    if (isAtlasOrNormal) continue;
+    if (border > 2) errors.push(`${name} 外圈 alpha=${border}（应严格 0，否则放大后露方块边）`);
+    else sealed++;
+  }
+  if (sealed < 30) errors.push(`封边的精灵类内置贴图只有 ${sealed} 张（预期 ≥30；名单被改窄了？）`);
+  // 法线必须豁免：alpha 是 REFRACT 蒙版，封边会让雨滴变形
+  const nrm = ptex.buildBuiltinParticleTexture("particle/drop_normal");
+  if (nrm && nrm.rgba[3] === 0) {
+    errors.push("particle/drop_normal 边缘被误封（法线 alpha 是折射蒙版，必须豁免）");
+  }
+
+  // 烟/雾：紧凑径向窗 —— 中心外 75% 半径必须完全透明，且整体 ink 集中在核内
+  for (const [name, peakMin] of [["particle/smoke/smoke2", 150], ["particle/fog/fog1", 180], ["particle/smoke/smoke1", 160]]) {
+    const t = ptex.buildBuiltinParticleTexture(name);
+    const W = t.width, rgba = t.rgba;
+    let outer = 0, mean = 0, above8 = 0;
+    for (let y = 0; y < W; y++) {
+      for (let x = 0; x < W; x++) {
+        const a = rgba[(y * W + x) * 4 + 3];
+        mean += a;
+        if (a > 8) above8++;
+        const d = Math.hypot(x + 0.5 - W / 2, y + 0.5 - W / 2) / (W / 2);
+        if (d > 0.75 && a > outer) outer = a;
+      }
+    }
+    const n = W * W;
+    mean /= n;
+    if (outer > 0) errors.push(`${name} 半径 0.75 外仍有 alpha=${outer}（方块裙边回归）`);
+    if (above8 / n > 0.5) errors.push(`${name} 有效区占 ${(100 * above8 / n).toFixed(0)}%（>50%，低 alpha 铺满方块）`);
+    if (mean < 0.3) errors.push(`${name} 平均 alpha=${mean.toFixed(2)}（过稀，烟雾看不见）`);
+  }
+
+  // 行为判据（真实语料）：排气烟雾的精灵覆盖面积必须明显小于整块 quad
+  // —— 修前 touched 21.7%（整片灰幕），修后 10.2%
+  const pkgPath = join(LIB, "2241938645", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(fs.readFileSync(pkgPath));
+    const readText2 = (b) => new TextDecoder().decode(b);
+    const model = JSON.parse(readText2(getEntry(pkg, "particles/presets/smoke1.json")));
+    const mat = JSON.parse(readText2(getEntry(pkg, model.material)));
+    const gen = ptex.buildBuiltinParticleTexture(mat.passes[0].textures[0]);
+    const ps = new ParticleSystem(null, model, null, { origin: [960, 540, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+    ps.setTexture({ glTex: null, width: gen.width, height: gen.height, pixels: { width: gen.width, height: gen.height, rgba: gen.rgba }, frames: null });
+    ps.setMaterial(mat);
+    for (let i = 0; i < 240; i++) ps.advance(1 / 60);
+    const cam = { offX: 0, offY: 0, viewW: 1920, viewH: 1080, projH: 1080 };
+    const target = createTarget(1280, 720, [0, 0, 0]);
+    rasterizeSystem(target, ps, cam);
+    const a = analyzeTarget(target, [0, 0, 0]);
+    if (a.touchedPct > 16) {
+      errors.push(
+        `2241938645 排气烟雾覆盖 ${a.touchedPct}%（>16%）—— 精灵裙边铺满方块（修前 21.7 / 修后 10.2）`,
+      );
+    }
+  }
+  return { errors };
+}
+
 // ---------- Overbright：材质 constantshadervalues 必须乘进精灵 RGB（3151551777 Bokeh）----------
 // halo_2_1.json 写了 ui_editor_properties_overbright:0.25，此前整键被丢弃 →
 // 等效 1.0，additive 大光斑亮 4 倍糊住画面。缺省必须是 1（没写常量的材质不变）。
@@ -1712,6 +1791,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【Overbright】问题 ${ob.errors.length}`);
   ob.errors.forEach((e) => console.log("  ! " + e));
   failed += ob.errors.length;
+  const sr = runSoftRim();
+  console.log(`\n【精灵硬边封印】问题 ${sr.errors.length}`);
+  sr.errors.forEach((e) => console.log("  ! " + e));
+  failed += sr.errors.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);
