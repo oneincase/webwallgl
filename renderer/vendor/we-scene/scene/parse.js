@@ -472,6 +472,12 @@ export function parseScene(sceneJson, project) {
           const base = p.textures || [];
           const ut = p.usertextures;
           let textures = base;
+          // [we-scene patch 2388299037] 被保留名覆盖掉的**原槽贴图**另存一份：
+          // 封面显示优先级 = 外部真实封面 > 模拟/测试封面 > 壁纸内置封面。
+          // 前两级都不可用（媒体被禁用 / 没有测试源）时，回落到作者内置的这张
+          // （本壁纸是 workshop/2978738836/500x500 灰色占位）。只存不删，渲染端
+          // 在保留名解析不到内容时才用它。
+          let textureFallbacks = null;
           if (Array.isArray(ut)) {
             for (let i = 0; i < ut.length; i++) {
               const u = ut[i];
@@ -479,6 +485,10 @@ export function parseScene(sceneJson, project) {
                 : typeof u === 'string' ? u : null;
               if (!name) continue;
               if (textures === base) textures = base.slice();
+              if (base[i] !== undefined && base[i] !== null && base[i] !== name) {
+                if (!textureFallbacks) textureFallbacks = []
+                textureFallbacks[i] = base[i]
+              }
               textures[i] = name;
             }
           }
@@ -486,6 +496,7 @@ export function parseScene(sceneJson, project) {
             combos: p.combos || {},
             constantshadervalues: p.constantshadervalues || {},
             textures,
+            textureFallbacks,
           };
         }),
       })),

@@ -1519,6 +1519,59 @@ const { check, errors } = createChecker();
   }
 }
 
+// ---------- 6c. 封面/元数据优先级：外部真实 > 模拟测试 > 壁纸内置（2388299037） ----------
+{
+  const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  // ① mip 链：真实封面上传只写 level 0 而 mipmap 不重建时，缩小的封面 quad 会
+  // 三线性采到挂载期占位封面的旧 mip —— 真实封面已上传、画面却一直是占位图
+  // （「歌曲封面不显示」的真身，实机手工 generateMipmap 后立刻显形）。
+  const mipCount = (smSrc.match(/gl\.generateMipmap\(gl\.TEXTURE_2D\)/g) || []).length;
+  check(
+    mipCount >= 2,
+    `封面上传必须重建 mip 链（当前/上一张各一次），实得 ${mipCount} 处 generateMipmap`,
+  );
+  const uploadIdx = smSrc.indexOf("const uploadThumbnailBitmap");
+  const firstTexImage = smSrc.indexOf("gl.texImage2D(", uploadIdx);
+  const firstMip = smSrc.indexOf("gl.generateMipmap(gl.TEXTURE_2D)", uploadIdx);
+  check(
+    uploadIdx >= 0 && firstMip > firstTexImage && firstMip - firstTexImage < 900,
+    "generateMipmap 必须紧跟封面 texImage2D（间距 <900 字符）",
+  );
+  // ② 媒体源门槛：外部源没在播（hasMedia=false）时不占用驱动位 → 按优先级回落测试源
+  check(/const hasLiveMedia = \(drv: any\)/.test(smSrc), "外部媒体源应按 hasMedia 门控");
+  check(
+    /hasLiveMedia\(liveMediaOverride\) \? liveMediaOverride/.test(smSrc),
+    "currentMediaDriver 必须对 liveMediaOverride 做 hasMedia 门控",
+  );
+  check(
+    /hasLiveMedia\(rt\.mediaSource\) \? \(rt\.mediaSource as any\)/.test(smSrc),
+    "currentMediaDriver 必须对 rt.mediaSource 做 hasMedia 门控",
+  );
+  // ③ 测试封面只在媒体启用时注册：禁用媒体 → 保留名无内容 → 回落内置封面
+  check(
+    /tracks\.length && mediaSim\.enabled/.test(smSrc),
+    "模拟测试封面只能在 mediaSim.enabled 时注册（否则内置封面不可达）",
+  );
+  // ④ 内置封面回落：parse 记录被覆盖的原槽贴图 → 预载 → 渲染端在保留名无内容时使用
+  const parseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  check(/textureFallbacks/.test(parseSrc), "parse 必须记录被保留名覆盖的原槽贴图");
+  check(
+    /textureFallbacks\[i\] = base\[i\]/.test(parseSrc),
+    "parse 的 textureFallbacks 应存原槽名",
+  );
+  check(
+    /p\.textureFallbacks \|\| \[\]/.test(smSrc),
+    "效果贴图预载必须包含 textureFallbacks（否则回落名查不到纹理）",
+  );
+  const rSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  check(
+    /ov\.textureFallbacks/.test(rSrc) && /textures\.get\(nm\)\) continue/.test(rSrc),
+    "渲染端必须在保留名解析不到内容时回落到内置封面",
+  );
+  // 保留名判定不能误伤：只有 $ 开头的系统保留名走回落
+  check(/nm\.charCodeAt\(0\) !== 36/.test(rSrc), "回落只对 $ 保留名生效");
+}
+
 if (errors.length) {
   console.error(`verify-media: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

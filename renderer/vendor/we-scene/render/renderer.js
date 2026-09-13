@@ -2692,6 +2692,20 @@ export function createRenderer(canvas, opts = {}) {
         if (ovT[i] !== undefined && ovT[i] !== null) mergedTex[i] = ovT[i]
         else mergedTex[i] = mpT[i] !== undefined ? mpT[i] : null
       }
+      // [we-scene patch 2388299037] 封面显示优先级：外部真实封面 > 模拟/测试封面 >
+      // 壁纸内置封面。保留名（$mediaThumbnail / $mediaPreviousThumbnail）在当前
+      // 纹素表里**没有条目**时（媒体被禁用、没有测试源），回落到作者写在原槽里的
+      // 内置封面（parse 的 textureFallbacks）。有占位/测试封面（generated）时不回落
+      // —— 那是优先级里的第二级。
+      if (ov && Array.isArray(ov.textureFallbacks)) {
+        for (let i = 0; i < mergedTex.length; i++) {
+          const nm = mergedTex[i]
+          if (typeof nm !== 'string' || nm.charCodeAt(0) !== 36 /* $ */) continue
+          if (textures && textures.get(nm)) continue
+          const fb = ov.textureFallbacks[i]
+          if (fb) mergedTex[i] = fb
+        }
+      }
       // [we-scene patch] pass 编译失败（缺失公共头/不支持的组合）时跳过**整个效果**，
       // 而不是只跳过这一个 pass。多 pass 效果的后续 pass 依赖前置 pass 写入的中间
       // target FBO（如 cursorripple 的 _rt_EightBuffer2）；只跳过失败的那个会让 combine

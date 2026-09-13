@@ -397,8 +397,14 @@ cfg, source, pkgAbort.signal);
       // WE 官方语义是「自带音频不产生媒体事件」，这里是本仓库的刻意扩展。
       const wallpaperAudio = media.createWallpaperAudioMedia(media.MEDIA_PLAYBACK, media.mediaVec3);
       let liveMediaOverride: any = null;
+      // [we-scene patch 2388299037] 封面/元数据优先级：外部真实媒体 > 壁纸自带音频 >
+      // 模拟测试源。外部源**没在播**（hasMedia=false，例如系统实况开着但播放器停着）
+      // 时不占用驱动位 —— 否则面板会显示一场空，而按优先级应回落到测试源/内置封面。
+      const hasLiveMedia = (drv: any) => !!(drv && drv.snapshot && drv.snapshot.hasMedia);
       const currentMediaDriver = (): any =>
-        liveMediaOverride ?? (rt.mediaSource as any) ?? (wallpaperAudio.hasCurrent() ? wallpaperAudio : null) ?? simMedia;
+        hasLiveMedia(liveMediaOverride) ? liveMediaOverride
+        : hasLiveMedia(rt.mediaSource) ? (rt.mediaSource as any)
+        : (wallpaperAudio.hasCurrent() ? wallpaperAudio : null) ?? simMedia;
       let windowDriver: any = simWindow;
       // rt.audioDisabled = 调用方 MountOptions.audio:null 显式静音（频谱恒为 0），
       // 与"没设置"区分开：后者要回落模拟源
@@ -809,7 +815,10 @@ cfg, source, pkgAbort.signal);
           };
         };
         const tracks = simMedia.tracks || [];
-        if (tracks.length) {
+        // [we-scene patch 2388299037] 封面优先级：外部真实封面 > 模拟/测试封面 >
+        // 壁纸内置封面。媒体被整条禁用时不注册模拟测试封面，保留名解析不到内容 →
+        // 渲染端回落到作者内置封面（parse 的 textureFallbacks）。
+        if (tracks.length && mediaSim.enabled) {
           textures.set("$mediaThumbnail", mkThumb(tracks[0]));
           textures.set("$mediaPreviousThumbnail", mkThumb(tracks[tracks.length - 1]));
         }
@@ -844,6 +853,14 @@ cfg, source, pkgAbort.signal);
             gl.TEXTURE_2D, 0, gl.RGBA, raster.width, raster.height, 0,
             gl.RGBA, gl.UNSIGNED_BYTE, raster.rgba,
           );
+          // [we-scene patch 2388299037] **必须重建 mip 链**：纹理是 makeTextureMip
+          // 建的（MIN_FILTER=LINEAR_MIPMAP_LINEAR），挂载时的 mip 链来自程序化
+          // 占位封面。只写 level 0 而 mipmap 不更新时，缩小的封面 quad（层 100×100
+          // 放大 3.46 后 346px 采样 512 纹理）按 LOD≈0.56 在 level0/1 之间三线性
+          // 插值，采到的仍是**旧占位环**——真实封面早就上传了，画面上却一直显示
+          // 占位图（「歌曲封面不显示」的真身；实测在页面里手工 generateMipmap
+          // 后同一张纹理立刻显形）。
+          gl.generateMipmap(gl.TEXTURE_2D);
           existing.width = raster.width;
           existing.height = raster.height;
           existing.mips = [raster];
@@ -866,6 +883,8 @@ cfg, source, pkgAbort.signal);
               gl.TEXTURE_2D, 0, gl.RGBA, raster.width, raster.height, 0,
               gl.RGBA, gl.UNSIGNED_BYTE, raster.rgba,
             );
+            // 同上：不重建 mip 会采到旧占位封面（Previous album cover 淡入时闪环）
+            gl.generateMipmap(gl.TEXTURE_2D);
             prev.width = raster.width;
             prev.height = raster.height;
             prev.mips = [raster];
@@ -1357,6 +1376,19 @@ cfg, source, pkgAbort.signal);
           for (const e of layer.effects || []) {
             for (const p of e.passes || []) {
               for (const tn of p.textures || []) {
+                if (
+                  typeof tn === "string" &&
+                  tn !== "" &&
+                  !tn.startsWith("util/") &&
+                  !tn.startsWith("_rt_")
+                ) {
+                  texJobs.push(loadTex(tn));
+                }
+              }
+              // [we-scene patch 2388299037] 被保留名（$mediaThumbnail…）覆盖掉的原槽
+              // 贴图也要预载：那是封面优先级第三级「壁纸内置封面」。合并后原名不在
+              // textures 里，渲染端回落到它时查不到就只剩白纹理。
+              for (const tn of p.textureFallbacks || []) {
                 if (
                   typeof tn === "string" &&
                   tn !== "" &&
