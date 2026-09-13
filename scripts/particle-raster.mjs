@@ -60,7 +60,9 @@ export function rasterizeSystem(target, ps, cam) {
   const stretchY = ps.spriteStretchY * (ps.texAspectY || 1)
   const cosL = Math.cos(ps.angleZ)
   const sinL = Math.sin(ps.angleZ)
-  const bright = ps._ov.brightness || 1
+  // 与 particles.js 的 fillInstanceData 同构：材质 overbright（3151551777 Bokeh
+  // 0.25）与 instanceoverride.brightness 相乘，改一边必改另一边
+  const bright = (ps._ov.brightness || 1) * (ps.overbright ?? 1)
   // 序列帧：优先真实 TEXS 帧矩形，否则按 sequencemultiplier 退回 N×N 方格
   let frames = ps.texFrames
   if (!frames && ps.sequenceMul > 1) {

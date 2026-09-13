@@ -387,3 +387,151 @@ export function cloneMediaSnapshot(s) {
     lyricIndex: s.lyricIndex, lyricLine: s.lyricLine,
   }
 }
+
+// ---------------------------------------------------------------------------
+// [we-scene patch] 壁纸自带音频 → 媒体面板数据源
+//
+// WE 官方语义里媒体集成只反映**系统播放器**，壁纸自己播的音频不产生任何媒体
+// 事件 —— 但语料里音乐壁纸（3151551777 等）的 MEDIA 面板显隐全部挂在
+// `mediaPlaybackChanged(state!==STOPPED)` 上、歌名来自 mediaPropertiesChanged：
+// 壁纸放着自己的歌、面板却永久隐藏或停在模拟源的品牌占位曲。
+//
+// 本驱动把**脚本显式播放的声音层**（thisScene.getLayer(x).play() → soundCtl.play）
+// 接进媒体快照：正在播的曲目即「正在播放」的媒体。装配期自动开播的环境音
+// （火车声、雨声，宿主 startsilent=false 分支）**不** markPlayed —— 那不是用户
+// 在听的「曲目」，抢媒体面板没有意义。文件标签（Vorbis/ID3）实测常为空
+// （3151551777 全部 17 首注释 n=0），标题回退到层名剥扩展名与曲号前缀。
+// ---------------------------------------------------------------------------
+
+/** 层名 → 曲目名：剥扩展名与 "1.16 " / "01. " / "2-01 " 这类曲号前缀 */
+export function songTitleFromLayerName(name) {
+  let s = String(name || '')
+  s = s.replace(/\.(ogg|oga|mp3|wav|flac|m4a)$/i, '')
+  // 曲号形态必须是「数字.数字」或「数字+分隔符」，否则 "7 clouds" 这种歌名
+  // 开头的数字会被误剥（分隔符后无第二段数字的 "7 clouds" 不剥）
+  s = s.replace(/^\s*\d{1,3}\s*[.\-_]\s*\d{0,3}\s*[.\-_\)]?\s+/, '')
+  s = s.replace(/^\s*\d{1,3}\s*[.\-_\)]\s+/, '')
+  return s.trim()
+}
+
+/**
+ * 壁纸音频媒体源。register/markPlayed 由宿主的声音图层装配接线；
+ * snapshot 字段与 createSimulatedMedia 同构（diffMediaEvents 直接可用）。
+ * @param {object} MEDIA_PLAYBACK { STOPPED, PLAYING, PAUSED }
+ * @param {Function} MediaVec3 颜色构造器（与 mediaVec3 同一实现）
+ */
+export function createWallpaperAudioMedia(MEDIA_PLAYBACK, MediaVec3) {
+  /** @type {Array<{au:HTMLAudioElement, title:string, key:string}>} */
+  const tracks = []
+  const byAu = new Map()
+  let current = null
+  let changeSeq = 0
+
+  const NEUTRAL_COLORS = {
+    primaryColor: new MediaVec3(0.18, 0.22, 0.3),
+    secondaryColor: new MediaVec3(0.08, 0.1, 0.16),
+    tertiaryColor: new MediaVec3(0.6, 0.66, 0.76),
+    textColor: new MediaVec3(0.96, 0.97, 1),
+    highContrastColor: new MediaVec3(1, 1, 1),
+  }
+
+  function register(au, layerName) {
+    if (!au || byAu.has(au)) return
+    const title = songTitleFromLayerName(layerName)
+    const t = { au, title, key: `wa:${tracks.length}:${title}` }
+    tracks.push(t)
+    byAu.set(au, t)
+    return t
+  }
+
+  /** 脚本显式 play() 时调用：这首曲子成为「正在播放」 */
+  function markPlayed(au) {
+    const t = byAu.get(au)
+    if (!t || current === t) return
+    current = t
+    changeSeq++
+  }
+
+  /** 脚本显式 stop() 时调用：停止的曲子不再是「正在播放」（面板按 STOPPED 收起） */
+  function markStopped(au) {
+    if (current && current.au === au) {
+      current = null
+      changeSeq++
+    }
+  }
+
+  function trackIndex() {
+    return current ? tracks.indexOf(current) : -1
+  }
+
+  function playing() {
+    if (!current) return false
+    const au = current.au
+    // ended 也算停止（playbackmode=single 的一次性曲目放完后面板该收了）
+    return !au.paused && !au.ended
+  }
+
+  const snapshot = {
+    get hasMedia() { return current != null },
+    get state() {
+      if (!current) return MEDIA_PLAYBACK.STOPPED
+      const au = current.au
+      if (!au.paused && !au.ended) return MEDIA_PLAYBACK.PLAYING
+      // 暂停与停止：WE 只有三态。ended → STOPPED（面板收起），paused → PAUSED
+      return au.ended ? MEDIA_PLAYBACK.STOPPED : MEDIA_PLAYBACK.PAUSED
+    },
+    get title() { return current ? current.title : '' },
+    get artist() { return '' },
+    get album() { return '' },
+    get albumArtist() { return '' },
+    get position() { return current ? Number(current.au.currentTime) || 0 : 0 },
+    get duration() { const d = current ? Number(current.au.duration) : 0; return Number.isFinite(d) ? d : 0 },
+    get hasThumbnail() { return false },
+    get thumbnail() { return '' },
+    get trackIndex() { return trackIndex() },
+    get lyrics() { return [] },
+    get lyricIndex() { return -1 },
+    get lyricLine() { return '' },
+    primaryColor: NEUTRAL_COLORS.primaryColor,
+    secondaryColor: NEUTRAL_COLORS.secondaryColor,
+    tertiaryColor: NEUTRAL_COLORS.tertiaryColor,
+    textColor: NEUTRAL_COLORS.textColor,
+    highContrastColor: NEUTRAL_COLORS.highContrastColor,
+  }
+
+  function playTrack(i) {
+    const n = ((i % tracks.length) + tracks.length) % tracks.length
+    const t = tracks[n]
+    if (!t) return
+    for (const { au } of tracks) {
+      if (au !== t.au) {
+        au.pause()
+        try { au.currentTime = 0 } catch { /* ignore */ }
+      }
+    }
+    Promise.resolve(t.au.play()).catch(() => {})
+    markPlayed(t.au)
+  }
+
+  return {
+    snapshot,
+    register,
+    markPlayed,
+    markStopped,
+    /** 有脚本播放过的曲目时才作为当前媒体 driver（否则回落 simMedia） */
+    hasCurrent: () => current != null,
+    /** 诊断/测试 */
+    _changeSeq: () => changeSeq,
+    skipNext() { if (tracks.length) playTrack(trackIndex() + 1) },
+    skipPrevious() { if (tracks.length) playTrack(trackIndex() - 1) },
+    play() {
+      if (current) Promise.resolve(current.au.play()).catch(() => {})
+    },
+    pause() { if (current) current.au.pause() },
+    playPause() {
+      if (!current) return
+      if (current.au.paused) this.play()
+      else this.pause()
+    },
+  }
+}

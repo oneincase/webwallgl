@@ -590,6 +590,13 @@ export class ParticleSystem {
     const rawAmt = cv && cv.ui_editor_properties_refract_amount
     const amt = Number(rawAmt)
     this.refractAmount = Number.isFinite(amt) ? Math.min(0.35, Math.max(0, amt)) : 0.04
+    // 官方 Overbright（ui_editor_properties_overbright）：乘在精灵 RGB 上的亮度
+    // 系数，编辑器滑条缺省 1。此前整个键被静默丢弃 → 等效恒 1.0，3151551777 的
+    // Bokeh 光斑材质写了 0.25，渲染出来亮 4 倍，additive 大光斑糊住整个画面。
+    // 注意 Number(null)=0：键缺失时必须显式落缺省 1，不能走 Number()。
+    const rawOb = cv ? cv.ui_editor_properties_overbright : undefined
+    const ob = Number(rawOb)
+    this.overbright = rawOb == null || !Number.isFinite(ob) ? 1 : Math.max(0, ob)
   }
 
   setNormalTexture(tex) {
@@ -1290,7 +1297,7 @@ export class ParticleSystem {
     const data = this._data
     let k = 0
 
-    const bright = this._ov.brightness || 1
+    const bright = (this._ov.brightness || 1) * (this.overbright ?? 1)
     const sysScale = this.sysScale
     // 精灵形状 = 贴图宽高比 × 图层非等比 scale
     const stretchX = this.spriteStretchX * (this.texAspectX || 1)

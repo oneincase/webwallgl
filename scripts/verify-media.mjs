@@ -913,6 +913,126 @@ const { check, errors } = createChecker();
   }
 }
 
+// ---------- 6b. 壁纸自带音频 → 媒体面板（3151551777） ----------
+// 音乐壁纸的 MEDIA 面板显隐挂 mediaPlaybackChanged、歌名挂 mediaPropertiesChanged，
+// 但 WE 官方语义自带音频不产生媒体事件 → 面板永久隐藏或停在品牌占位曲。
+// createWallpaperAudioMedia 把「脚本显式 play() 的声音层」接成媒体快照。
+{
+  const {
+    songTitleFromLayerName,
+    createWallpaperAudioMedia,
+  } = await imp("renderer/vendor/we-scene/render/media.js");
+
+  // 层名 → 曲目名
+  check(
+    songTitleFromLayerName("1.16 Color Your Night.ogg") === "Color Your Night",
+    `曲号前缀应剥掉，实际 ${songTitleFromLayerName("1.16 Color Your Night.ogg")}`,
+  );
+  check(
+    songTitleFromLayerName("01. Disconnected.ogg") === "Disconnected",
+    `两位曲号前缀应剥掉，实际 ${songTitleFromLayerName("01. Disconnected.ogg")}`,
+  );
+  check(
+    songTitleFromLayerName("2.26 Memories of You -Reload-.ogg") === "Memories of You -Reload-",
+    `实际 ${songTitleFromLayerName("2.26 Memories of You -Reload-.ogg")}`,
+  );
+  check(
+    songTitleFromLayerName("Brand New Days -Reload-.ogg") === "Brand New Days -Reload-",
+    `无曲号层名应原样保留，实际 ${songTitleFromLayerName("Brand New Days -Reload-.ogg")}`,
+  );
+  check(
+    songTitleFromLayerName("7 clouds.ogg") === "7 clouds",
+    `非曲号形态（数字后无分隔/无第二段）不能剥，实际 ${songTitleFromLayerName("7 clouds.ogg")}`,
+  );
+
+  const mkAu = () => ({
+    paused: true,
+    ended: false,
+    currentTime: 42.5,
+    duration: 213,
+    play() {
+      this.paused = false;
+    },
+    pause() {
+      this.paused = true;
+    },
+  });
+  const wa = createWallpaperAudioMedia(MEDIA_PLAYBACK, mediaVec3);
+
+  // 未播放：不是当前媒体，回落 simMedia 由宿主 hasCurrent 判定
+  const au1 = mkAu();
+  const au2 = mkAu();
+  wa.register(au1, "1.16 Color Your Night.ogg");
+  wa.register(au2, "zapsplat_vehicles_train_metro.mp3");
+  check(wa.snapshot.hasMedia === false, "未 markPlayed 前不能宣称 hasMedia");
+  check(wa.snapshot.state === MEDIA_PLAYBACK.STOPPED, "未播放时 state 应为 STOPPED");
+  check(wa.hasCurrent() === false, "hasCurrent 应为 false（宿主据此回落 simMedia）");
+
+  // 脚本 play() → markPlayed：成为「正在播放」
+  au1.play();
+  wa.markPlayed(au1);
+  check(wa.hasCurrent() === true, "markPlayed 后 hasCurrent 应为 true");
+  check(wa.snapshot.hasMedia === true, "播放中 hasMedia 应为 true");
+  check(wa.snapshot.title === "Color Your Night", `标题应取层名剥曲号，实际 ${wa.snapshot.title}`);
+  check(wa.snapshot.state === MEDIA_PLAYBACK.PLAYING, "播放中 state 应为 PLAYING");
+  check(Math.abs(wa.snapshot.position - 42.5) < 1e-9, "position 应读 au.currentTime");
+  check(wa.snapshot.duration === 213, "duration 应读 au.duration");
+  check(
+    typeof wa.snapshot.primaryColor.subtract === "function" &&
+      typeof wa.snapshot.primaryColor.multiply === "function",
+    "颜色字段必须是带链式方法的 Vec3 实例（语料脚本会 subtract/multiply/add）",
+  );
+  check(wa.snapshot.thumbnail === "" && wa.snapshot.hasThumbnail === false, "无内嵌封面时 hasThumbnail 应为 false");
+
+  // 首次 diff 派发全量事件：mediaPropertiesChanged.title 是面板歌名的唯一来源
+  const firstEvts = diffMediaEvents(null, wa.snapshot);
+  const propEvt = firstEvts.find((e) => e.name === "mediaPropertiesChanged");
+  check(!!propEvt && propEvt.event.title === "Color Your Night", `首次 diff 应带歌名，实际 ${JSON.stringify(propEvt?.event)}`);
+  const playEvt = firstEvts.find((e) => e.name === "mediaPlaybackChanged");
+  check(!!playEvt && playEvt.event.state === MEDIA_PLAYBACK.PLAYING, "首次 diff 应带 PLAYING（面板显隐脚本靠它点亮）");
+
+  // pause → PAUSED（保持 current，面板不收）
+  au1.pause();
+  check(wa.snapshot.state === MEDIA_PLAYBACK.PAUSED, "au.paused 应映射 PAUSED");
+  // stop → 清空 current → STOPPED + hasMedia false（面板收起）
+  wa.markStopped(au1);
+  check(wa.snapshot.state === MEDIA_PLAYBACK.STOPPED && wa.snapshot.hasMedia === false, "markStopped 后应回 STOPPED");
+
+  // skipNext 按登记顺序循环，停前一首播下一首
+  au1.play();
+  wa.markPlayed(au1);
+  wa.skipNext();
+  check(au1.paused === true, "skipNext 应停掉上一首");
+  check(au2.paused === false, "skipNext 应播下一首");
+  check(wa.snapshot.title === "zapsplat_vehicles_train_metro", `skipNext 后标题应切到下一首，实际 ${wa.snapshot.title}`);
+
+  // 放完（playbackmode=single）→ STOPPED
+  au2.ended = true;
+  au2.paused = true;
+  check(wa.snapshot.state === MEDIA_PLAYBACK.STOPPED, "ended 应映射 STOPPED（一次性曲目放完面板该收）");
+
+  // duration NaN（元数据未到）必须落 0，不能 NaN 毒化 diff/进度条
+  const au3 = mkAu();
+  au3.duration = NaN;
+  wa.register(au3, "x.ogg");
+  wa.markPlayed(au3);
+  check(wa.snapshot.duration === 0, `duration NaN 应落 0，实际 ${wa.snapshot.duration}`);
+
+  // 接线：soundCtl.play/stop 必须带 markPlayed/markStopped；自动开播路径不得带；
+  // currentMediaDriver 的回落链必须包含壁纸音频
+  const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(
+    (smSrc.match(/wallpaperAudio\.markPlayed\(au\)/g) || []).length === 1,
+    "soundCtl.play 应恰好调用一次 markPlayed（自动开播路径不得调用）",
+  );
+  check((smSrc.match(/wallpaperAudio\.markStopped\(au\)/g) || []).length === 1, "soundCtl.stop 应调用 markStopped");
+  check(/wallpaperAudio\.register\(au, layer\.name/.test(smSrc), "声音图层装配应登记进壁纸音频媒体源");
+  check(
+    /wallpaperAudio\.hasCurrent\(\) \? wallpaperAudio : null\) \?\? simMedia/.test(smSrc),
+    "currentMediaDriver 回落链应为 liveMediaOverride ?? mediaSource ?? 壁纸音频 ?? simMedia",
+  );
+}
+
 // ---------- 7. 媒体壁纸走公共库入口（video / gif / image） ----------
 //
 // 下游 wallpaperEM 报的缺口：库入口只产出 web/scene 两种 type，dispatch 里那条

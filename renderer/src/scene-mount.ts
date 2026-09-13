@@ -392,9 +392,13 @@ cfg, source, pkgAbort.signal);
       // scene 这边漏了，症状是「setMedia 在场景壁纸上没反应」。
       // liveSystem 的麦克风/系统媒体优先级更高（用户显式勾了「系统实况」），
       // 由 liveMediaOverride 承载；两者都没有才回落模拟源。
+      // [1.3.17] 壁纸自带音频（脚本显式 play() 的声音层）排在注入源之后、模拟源
+      // 之前：音乐壁纸放着自己的歌，MEDIA 面板却只能显示品牌占位曲（3151551777）。
+      // WE 官方语义是「自带音频不产生媒体事件」，这里是本仓库的刻意扩展。
+      const wallpaperAudio = media.createWallpaperAudioMedia(media.MEDIA_PLAYBACK, media.mediaVec3);
       let liveMediaOverride: any = null;
       const currentMediaDriver = (): any =>
-        liveMediaOverride ?? (rt.mediaSource as any) ?? simMedia;
+        liveMediaOverride ?? (rt.mediaSource as any) ?? (wallpaperAudio.hasCurrent() ? wallpaperAudio : null) ?? simMedia;
       let windowDriver: any = simWindow;
       // rt.audioDisabled = 调用方 MountOptions.audio:null 显式静音（频谱恒为 0），
       // 与"没设置"区分开：后者要回落模拟源
@@ -589,7 +593,12 @@ cfg, source, pkgAbort.signal);
       });
       // 手动覆写快照字段并立即广播（验证「换歌 → 文字/封面/唱针」链路用）
       (window as unknown as Record<string, unknown>).__mediaSet = (patch: Record<string, unknown>) => {
-        Object.assign(mediaSnapshot(), patch || {});
+        // 壁纸音频驱动（1.3.17）的快照是 getter 视图，直接 assign 会 TypeError
+        try {
+          Object.assign(mediaSnapshot(), patch || {});
+        } catch {
+          reportDiag(rt, cfg, "__mediaSet: 当前媒体快照为只读视图（壁纸音频驱动），覆写跳过");
+        }
         const evts = media.diffMediaEvents(lastMediaSnap, mediaSnapshot());
         for (const { name, event } of evts) for (const sb of mediaHooks) sb.callMedia(name, event);
         lastMediaSnap = media.cloneMediaSnapshot(mediaSnapshot());
@@ -1615,6 +1624,9 @@ cfg, source, pkgAbort.signal);
                   }
                 }
                 void au.play().catch(() => {});
+                // 脚本显式播放的曲目 = 「正在播放」的媒体（面板歌名/显隐的数据源）。
+                // 装配期自动开播的环境音不走这里，不会抢媒体面板。
+                wallpaperAudio.markPlayed(au);
               },
               pause() {
                 au.pause();
@@ -1626,6 +1638,7 @@ cfg, source, pkgAbort.signal);
                 } catch {
                   /* 忽略 */
                 }
+                wallpaperAudio.markStopped(au);
               },
               isPlaying: () => !au.paused && !au.ended,
               getVolume: () => au.volume,
@@ -1633,6 +1646,8 @@ cfg, source, pkgAbort.signal);
                 au.volume = Math.max(0, Math.min(1, v));
               },
             };
+            // 登记进壁纸音频媒体源（跳歌/上一曲在这份有序表上循环）
+            wallpaperAudio.register(au, layer.name || "");
             if (!layer.soundprops?.startsilent && !rt.paused) {
               void au.play().catch(() => {});
             }
@@ -2196,14 +2211,37 @@ cfg, source, pkgAbort.signal);
               //     layer.size 每帧跟着内容跳变、字忽大忽小甚至消失；
               //  ③ 墨水在**当前画布**（盒 + 既有 margin）里确实装不下——短词
               //     （Paused/Playing）不溢出就不扩，保持作者原布局。
-              const M = it.margin;
-              if (wtext.shouldGrowMediaPlaceholder(bw, bh, !!it.sandbox?.hasMediaHook)) {
-                // 媒体 2×2 占位层：对称扩到刚好装下当前墨水。墨水在基础边距内
-                // 装得下时 textCanvasMarginGrow 退回基础边距，size 与原来一致
-                //（短词 Paused/Playing 保持作者布局）；layer.size 只在这类层改写。
+              let M: number = it.margin;
+              // [we-scene patch 3151551777] 媒体大盒的右对齐长标题：WE 不裁剪溢出
+              // 文字（halign right 整行向左长出），但我们的画布只扩到「盒 + 基础
+              // 边距」，溢出超出边距的部分被纹理边缘截掉（"Color Your Night" 只剩
+              // "Your Night"）。挂媒体回调、且墨水在当前画布里装不下的层，按墨水
+              // 对称扩边（盒中心 = 画布中心 = origin 不动，墨水位置不变）：
+              //   - 只增不减：换短歌名后保持大画布，size 不随内容来回跳；
+              //   - 跳过 tint 蒙版层（蒙版按原盒 UV 对齐，扩边会错位）；
+              //   - 锚点须为 none/center（方向锚点的 origin 在挂载期按原盒平移过，
+              //     扩边会把盒子挪走——2938612768 的教训）。
+              const anchorSafe = !layer.textAnchor || layer.textAnchor === "center" || layer.textAnchor === "none";
+              if (
+                !!it.sandbox?.hasMediaHook &&
+                !wtext.textLayerHasTintMask(layer) &&
+                anchorSafe
+              ) {
                 const grow = wtext.textCanvasMarginGrow(layout, bw, bh, M);
-                layer.size[0] = bw + grow * 2;
-                layer.size[1] = bh + grow * 2;
+                if (wtext.shouldGrowMediaPlaceholder(bw, bh, true)) {
+                  // 2×2 占位层：跟随内容双向扩/缩（旧行为；短词 Paused/Playing
+                  // 时 grow 退回基础边距，size 与挂载一致）
+                  layer.size[0] = bw + grow * 2;
+                  layer.size[1] = bh + grow * 2;
+                } else if (grow > M) {
+                  layer.size[0] = bw + grow * 2;
+                  layer.size[1] = bh + grow * 2;
+                }
+                if (grow !== M) {
+                  // 内部盒在新画布里的位置 = 新边距（盒中心 = 画布中心）
+                  it.margin = grow;
+                  M = grow;
+                }
               }
               // 非扩边层**不碰** layer.size（挂载时已按 box+margin 设好；脚本/动画
               // 可能也在改它，每帧无条件覆写会与那些写入互相打架）。

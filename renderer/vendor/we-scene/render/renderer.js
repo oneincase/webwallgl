@@ -1073,6 +1073,29 @@ export function createRenderer(canvas, opts = {}) {
   // 带 animation 的常量永远停在 scene.json 快照。3233141951「剑音条01」opacity
   // 快照是 0、真正淡入在第 18 帧；不采样这条轨 ⇒ 武士刀音频条永远透明。
   // 全库 55 处效果常量动画（verify-animation 按 animation 键遍历已覆盖求值核）。
+  //
+  // [we-scene patch] rec 预建必须先于 scriptedConstants：媒体淡入模板
+  // （3151551777 Media Opacity）的常量沙箱在 scriptedConstants 里创建并**同步
+  // 补发** mediaThumbnailChanged → getAnimation().play()。若此时 rec 还没建
+  //（旧序：animatedConstants 在外层后跑），getAnimationForProperty 落空拿到
+  // 中性哑对象，play() 静默丢失，startpaused 的淡入永远停在 alpha 0 ——
+  // 歌名/歌手/专辑整行不显示，且无任何报错。
+  function ensureConstAnimRecs(constants, cacheKey, time) {
+    if (!constants) return
+    for (const [key, v] of Object.entries(constants)) {
+      if (!v || typeof v !== 'object' || !v.animation || !v.animation.options) continue
+      const sk = cacheKey + '|anim|' + key
+      let rec = constAnimCache.get(sk)
+      if (!rec) {
+        const ctrl = createAnimation(v.animation)
+        const raw = v.value !== undefined ? v.value : 0
+        ctrl.baseNumeric = Array.isArray(raw) ? raw.slice() : raw
+        rec = { ctrl, prevTime: time }
+        constAnimCache.set(sk, rec)
+      }
+    }
+  }
+
   function animatedConstants(constants, cacheKey, time, layer) {
     if (!constants) return constants
     let hasAnim = false
@@ -1083,7 +1106,7 @@ export function createRenderer(canvas, opts = {}) {
     const out = { ...constants }
     // [we-scene patch] 先建齐本映射内全部控制器，再按 key 接一次联动组
     //（children 不自播、播放头从属于 leader——3163060610 的折叠/展开全靠它，
-    // 此前 children 加载即自播完）。
+    // 此前 children 加载即自播完）。rec 可能已被 ensureConstAnimRecs 预建。
     const siblings = new Map()
     for (const [key, v] of Object.entries(constants)) {
       if (!v || typeof v !== 'object' || !v.animation || !v.animation.options) continue
@@ -2801,16 +2824,21 @@ export function createRenderer(canvas, opts = {}) {
       // 常量（material 名 → uniform 映射）
       // [we-scene patch] 先跑常量脚本：带 {script} 的常量逐帧求值后才是当前值。
       // cacheKey 用 shader + pass 序号，保证同一 pass 的沙箱跨帧复用（脚本有内部状态）。
+      // [we-scene patch] 常量动画的控制器必须**先于** scriptedConstants 预建：
+      // 沙箱创建即同步补发媒体事件，getAnimation() 要能拿到本常量的控制器。
+      const constCacheKey = (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi
+      const constMerged = { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) }
+      ensureConstAnimRecs(constMerged, constCacheKey, time)
       bindConstants(
         uni,
         animatedConstants(
           scriptedConstants(
-            { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) },
-            (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi,
+            constMerged,
+            constCacheKey,
             time,
             layer,
           ),
-          (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi,
+          constCacheKey,
           time,
           layer,
         ),

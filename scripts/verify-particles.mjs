@@ -1547,6 +1547,113 @@ function runBuiltinFrames() {
   return { errors };
 }
 
+// ---------- Overbright：材质 constantshadervalues 必须乘进精灵 RGB（3151551777 Bokeh）----------
+// halo_2_1.json 写了 ui_editor_properties_overbright:0.25，此前整键被丢弃 →
+// 等效 1.0，additive 大光斑亮 4 倍糊住画面。缺省必须是 1（没写常量的材质不变）。
+function runOverbright() {
+  const errors = [];
+  const mkPS = () =>
+    new ParticleSystem(
+      null,
+      {
+        maxcount: 1,
+        emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+        initializer: [{ name: "lifetimerandom", min: 0.5, max: 0.5 }],
+        operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+      },
+      null,
+      { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+
+  const obPS = mkPS();
+  obPS.setMaterial({
+    passes: [{ blending: "additive", constantshadervalues: { ui_editor_properties_overbright: 0.25 } }],
+  });
+  if (obPS.overbright !== 0.25) {
+    errors.push(`setMaterial 应解析 overbright=0.25，实际 ${obPS.overbright}`);
+  }
+  const barePS = mkPS();
+  barePS.setMaterial({ passes: [{ blending: "additive" }] });
+  if (barePS.overbright !== 1) {
+    errors.push(`材质未写 overbright 应缺省 1，实际 ${barePS.overbright}`);
+  }
+  const nullMatPS = mkPS();
+  nullMatPS.setMaterial(null);
+  if ((nullMatPS.overbright ?? 1) !== 1) {
+    errors.push(`无材质应缺省 1，实际 ${nullMatPS.overbright}`);
+  }
+  // 负值/非数值钳到缺省，不能 NaN 毒化实例颜色
+  const badPS = mkPS();
+  badPS.setMaterial({ passes: [{ constantshadervalues: { ui_editor_properties_overbright: "abc" } }] });
+  if (badPS.overbright !== 1) {
+    errors.push(`overbright 非数值应缺省 1，实际 ${badPS.overbright}`);
+  }
+
+  // 真实语料端到端：3151551777 的 Bokeh 系统在 overbright 前后的亮度比 = 0.25
+  const pkgPath = join(LIB, "3151551777", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(fs.readFileSync(pkgPath));
+    const decode = (name) => {
+      const m0 = texMod.decodeMip0(texMod.parseTex(getEntry(pkg, name)));
+      return { glTex: null, width: m0.width, height: m0.height, pixels: { width: m0.width, height: m0.height, rgba: m0.rgba }, frames: null };
+    };
+    const buildBokeh = (mat) => {
+      const model = JSON.parse(new TextDecoder().decode(getEntry(pkg, "particles/workshop/2820123291/bokeh_Hex.json")));
+      const ps = new ParticleSystem(null, model, null, { origin: [960, 540, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+      ps.setTexture(decode("materials/workshop/2820123291/particle/Boke_hex_tex.tex"));
+      ps.setMaterial(mat);
+      return ps;
+    };
+    const halo = JSON.parse(new TextDecoder().decode(getEntry(pkg, "materials/workshop/2820123291/particle/halo_2_1.json")));
+    const stripped = JSON.parse(JSON.stringify(halo));
+    delete stripped.passes[0].constantshadervalues.ui_editor_properties_overbright;
+    // 同一份粒子状态各装配一次实例数据（先 0.25 再剥常量），抵消随机颜色/位置的采样噪声。
+    // 直接走 particles.js 的真实实例装配路径 render()：_buildProgram 置空跳过 GL，
+    // 装配完成后 prog.uniTex 抛错被吞 —— 实例 _data 已经填好（14 float/实例，RGB 在 5..7）。
+    const meanInstRGB = (ps, mat) => {
+      ps.setMaterial(mat);
+      ps._buildProgram = () => {}; // 跳过 GL 程序构建：render() 填完 _data 后才会在 gl.useProgram 抛错
+      try {
+        ps.render(null, 1920, 1080, 1920, 1080);
+      } catch {
+        /* 预期：填完 _data 后 GL 装配抛错 */
+      }
+      const d = ps._data;
+      if (!d || !d.length) return -1;
+      let sum = 0;
+      let n = 0;
+      for (let o = 5; o + 2 < d.length; o += 14) {
+        sum += d[o] + d[o + 1] + d[o + 2];
+        n += 3;
+      }
+      return n ? sum / n : -1;
+    };
+    const ps = buildBokeh(halo);
+    ps.setVisible(true);
+    for (let i = 0; i < 240; i++) ps.advance(1 / 60);
+    if (ps.liveCount() > 0) {
+      const r1 = meanInstRGB(ps, halo);
+      const r2 = meanInstRGB(ps, stripped);
+      if (r1 >= 0 && r2 > 0) {
+        const ratio = r1 / r2;
+        if (Math.abs(ratio - 0.25) > 0.01) {
+          errors.push(
+            `3151551777 Bokeh overbright 0.25：实例 RGB 比应 ≈0.25，实际 ${ratio.toFixed(3)}（${r1.toFixed(4)} vs ${r2.toFixed(4)}）——材质 constantshadervalues 没乘进装配`,
+          );
+        }
+      } else {
+        errors.push("3151551777 Bokeh render() 未产出实例数据，overbright 断言无效");
+      }
+    }
+    // CPU 参考光栅必须与 GPU 实例装配同构：particle-raster 也要吃 overbright
+    const rasterSrc = fs.readFileSync(join(ROOT, "scripts/particle-raster.mjs"), "utf8");
+    if (!/ps\.overbright/.test(rasterSrc)) {
+      errors.push("particle-raster.mjs 未乘 overbright —— 与 particles.js 实例装配不同构（改一边必改另一边）");
+    }
+  }
+  return { errors };
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -1601,6 +1708,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【Rope 连续光束】问题 ${rp.errors.length}`);
   rp.errors.forEach((e) => console.log("  ! " + e));
   failed += rp.errors.length;
+  const ob = runOverbright();
+  console.log(`\n【Overbright】问题 ${ob.errors.length}`);
+  ob.errors.forEach((e) => console.log("  ! " + e));
+  failed += ob.errors.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);
