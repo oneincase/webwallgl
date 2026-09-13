@@ -1614,6 +1614,10 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   let srcWithModel = 0;
   let srcCompose = 0;
   let srcComposeHidden = 0;
+  // copybackground 源（内容 = 身后画面 + 效果链）：预渲染阶段画布只有 clearcolor，
+  // 必须走主循环 z 序捕获（2464842912 的 Beam 流光盘带）
+  let srcCopyBg = 0;
+  const copyBgDetail = [];
   const missDetail = [];
   const hiddenDetail = [];
 
@@ -1664,6 +1668,10 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
           hiddenDetail.push(`${id}#${to}`);
         }
       } else if (img) srcWithModel++;
+      if (src.copybackground) {
+        srcCopyBg++;
+        copyBgDetail.push(`${id}#${to}`);
+      }
     }
   }
 
@@ -1686,8 +1694,13 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     // 预渲染循环仍必须跳过空 composelayer（那时画布只有 clearcolor）。
     // 但跳过时要登记 pendingEmptyCompose，主循环 z 序再 drawBackdropToFBO。
     // 只留 `if (isEmptyCompose) continue` 会回退 inputFBO → 2902406982 白三角。
-    check(/if\s*\(\s*isEmptyCompose\s*\)[\s\S]{0,160}pendingEmptyCompose\.set[\s\S]{0,80}continue/.test(cCode),
+    check(/if\s*\(\s*isEmptyCompose[^)]*\)[\s\S]{0,160}pendingEmptyCompose\.set[\s\S]{0,80}continue/.test(cCode),
       "renderCompositeSources 跳过空 composelayer 时必须登记 pendingEmptyCompose（不能只 continue）");
+    // copybackground 源同理（内容 = 身后画面）：预渲染拿不到背景，必须 z 序捕获
+    check(/needsZOrderBackdrop\s*=\s*!!src\.copybackground/.test(cCode),
+      "renderCompositeSources 必须识别 copybackground 源（预渲染只能得到空图）");
+    check(/if\s*\(\s*isEmptyCompose\s*\|\|\s*needsZOrderBackdrop\s*\)/.test(cCode),
+      "copybackground 源必须与空 composelayer 一样走 pendingEmptyCompose（z 序捕获）");
     check(/function captureEmptyComposeAtZOrder/.test(rsrc),
       "空 composelayer 源必须在主循环 z 序回读（captureEmptyComposeAtZOrder）");
     check(/if\s*\(\s*!hasVisibleEffects\s*\)[\s\S]{0,220}captureEmptyComposeAtZOrder/.test(rsrc),
@@ -1729,10 +1742,22 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/bindFramebuffer[\s\S]{0,80}null/.test(capCode) &&
       /viewport\(\s*0\s*,\s*0\s*,\s*width\s*,\s*height\s*\)/.test(capCode),
       "回读后必须恢复画布 FBO/viewport，否则后续层画进合成 FBO 尺寸的角落");
+    // 带可见效果的 copybackground 源（Beam：scroll/transform）要在回读的内容上
+    // **跑效果链**，否则只有静止的背景副本、没有「流动」
+    check(/hasVisibleEffects[\s\S]{0,400}renderLayer\(/.test(capCode),
+      "z 序捕获必须对带可见效果链的源跑 renderLayer（否则流光盘带是静止副本）");
+    check(/await captureEmptyComposeAtZOrder\([^)]*time\)/.test(rsrc),
+      "z 序捕获必须 await 且把场景时间传进去（g_Time=0 时 scroll 不流动）");
+    check(/zOrderComposePersist/.test(rsrc) &&
+      /for \(const \[n, fbo\] of zOrderComposePersist\) compositeFBOs\.set\(n, fbo\)/.test(rsrc),
+      "copybackground 源的成品要留一帧给排在它前面的引用方（预渲染阶段补位）");
     console.log(
       `   跨层合成：${refTotal} 处引用 / ${refWallpapers} 张壁纸` +
-      `（源层带模型 ${srcWithModel}，空 composelayer ${srcCompose}，自引用 ${refSelf}）`,
+      `（源层带模型 ${srcWithModel}，空 composelayer ${srcCompose}，自引用 ${refSelf}，` +
+      `copybackground 源 ${srcCopyBg}${srcCopyBg ? "：" + copyBgDetail.slice(0, 4).join(", ") : ""}）`,
     );
+    check(srcCopyBg > 0,
+      "库里应存在 copybackground 合成源（2464842912 Beam 流光盘带；为 0 说明扫描漏了）");
     if (srcCompose > 0) {
       console.log(
         `   空 composelayer 源 ${srcCompose} 个：预渲染跳过，主循环 z 序 drawBackdropToFBO 回读`,

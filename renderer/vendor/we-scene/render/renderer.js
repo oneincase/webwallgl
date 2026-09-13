@@ -1639,6 +1639,12 @@ export function createRenderer(canvas, opts = {}) {
   // 空 composelayer 合成源：预渲染阶段无法回读（后面的层还没画），先记下名字，
   // 主循环按图层顺序捕获。oid → Set<完整纹理名>
   const pendingEmptyCompose = new Map()
+  // [we-scene patch 2026-09-14] **copybackground 源**（图层自身内容 = 身后画面，
+  // 再套效果链，如 2464842912 的 Beam：copybackground + scroll = 流光盘带）也必须
+  // 按 z 序回读：预渲染跑在主循环之前，画布只有 clearcolor，复制出来是一张空图。
+  // 这些层的「上一帧成品」在这里留一份：预渲染阶段（renderCompositeSources）把
+  // 引用它们的合成源（107 遮罩层）先填上——**差一帧**，对流光盘带这类自走动画无感。
+  const zOrderComposePersist = new Map()
   // [we-scene patch] A/B 开关（调试用）：关掉后 `_rt_imageLayerComposite_*` 退回
   // 改动前的行为（一律返回当前层自己的 inputFBO），用来判定某处画面异常
   // 是本次改动引入的回归、还是改动前就存在。
@@ -1884,7 +1890,7 @@ export function createRenderer(canvas, opts = {}) {
   //
   // 必须在主循环里、画完排在它前面的层之后、continue 跳过空容器自身之前调用。
   // drawBackdropToFBO 会改 FBO / viewport / program，回来一定要绑回画布。
-  function captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height) {
+  async function captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time) {
     if (!compositeEnabled || groupTarget) return
     const names = pendingEmptyCompose.get(layer.id)
     if (!names || names.size === 0) return
@@ -1892,9 +1898,30 @@ export function createRenderer(canvas, opts = {}) {
     const sh = Math.max(1, Math.round(Math.abs(layer.size[1] * (layer.scale[1] || 1))))
     if (sw <= 1 && sh <= 1) return
     const fbo = getFBO(sw, sh, 'lc:' + layer.id)
-    drawBackdropToFBO(layer, fbo, sw, sh, cam, viewProj, width, height)
+    // [we-scene patch 2026-09-14] 带可见效果链的 copybackground 源（Beam：copybackground
+    // + scroll/transform）：光把身后画面抠进 FBO 不够，还要在**这块内容上跑效果链**。
+    // 走 renderLayer + groupTarget —— 与主循环里「可见的 passthrough 层」完全同一条
+    // 路径（drawBackdropToFBO 回读当前画布 → 效果链 → 合成进 groupTarget）。
+    const hasVisibleEffects = (layer.effects || []).some((e) => e.visible)
+    if (hasVisibleEffects) {
+      const savedTarget = groupTarget
+      groupTarget = { fbo, w: sw, h: sh }
+      try {
+        renderLayer(layer, textures, cam, viewProj, width, height, time)
+      } catch (e) {
+        diag(`z 序合成源 ${layer.id} 效果链失败: ${e && e.message}`)
+      } finally {
+        groupTarget = savedTarget
+      }
+    } else {
+      drawBackdropToFBO(layer, fbo, sw, sh, cam, viewProj, width, height)
+    }
     for (const n of names) compositeFBOs.set(n, fbo)
     pendingEmptyCompose.delete(layer.id)
+    // 留一帧成品给下一帧的预渲染阶段（引用方可能在它之前绘制）
+    if (layer.copybackground) {
+      for (const n of names) zOrderComposePersist.set(n, fbo)
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, width, height)
   }
@@ -2093,7 +2120,7 @@ export function createRenderer(canvas, opts = {}) {
       if (layer.destroyed) continue
       if (!layer.visible) {
         if (pendingEmptyCompose.has(layer.id)) {
-          captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height)
+          await captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time)
         }
         continue
       }
@@ -2111,7 +2138,7 @@ export function createRenderer(canvas, opts = {}) {
         const hasVisibleEffects = (layer.effects || []).some((e) => e.visible)
         if (!hasVisibleEffects) {
           // 空 composelayer 被当成合成源时：在这一刻回读身后画面，再跳过自身绘制。
-          captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height)
+          await captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time)
           continue
         }
         if (layer.hasChildren) {
@@ -2221,6 +2248,10 @@ export function createRenderer(canvas, opts = {}) {
   async function renderCompositeSources(scene, textures, cam, width, height, time) {
     compositeFBOs.clear()
     pendingEmptyCompose.clear()
+    // [we-scene patch 2026-09-14] 先把**上一帧**按 z 序捕获的 copybackground 源
+    // 填回来：引用它们的层（2464842912 的 107 遮罩层）可能排在它们之前绘制，
+    // 预渲染阶段拿不到当帧成品 —— 差一帧，对流光盘带这类自走动画无感。
+    for (const [n, fbo] of zOrderComposePersist) compositeFBOs.set(n, fbo)
     // 扫描所有 pass 的贴图槽与 bind，收集被引用的对象 id
     const wanted = new Map() // objectId(number) → Set<完整纹理名>
     // 自引用（引用方 id === 被引用 id）的层：见下方循环里的说明，不预渲染
@@ -2251,6 +2282,14 @@ export function createRenderer(canvas, opts = {}) {
         }
       }
     }
+    // 清理上一帧遗留、这一帧已没人引用的 z 序成品
+    for (const n of [...zOrderComposePersist.keys()]) {
+      let used = false
+      for (const set of wanted.values()) {
+        if (set.has(n)) { used = true; break }
+      }
+      if (!used) zOrderComposePersist.delete(n)
+    }
     if (wanted.size === 0) return
     for (const [oid, names] of wanted) {
       const src = (scene.layers || []).find((l) => l.id === oid)
@@ -2275,7 +2314,16 @@ export function createRenderer(canvas, opts = {}) {
       const isEmptyCompose = src.isContainer && !src.hasChildren &&
         srcImage.indexOf('models/util/composelayer') === 0 &&
         !(src.effects || []).some((e) => e.visible)
-      if (isEmptyCompose) {
+      // [we-scene patch 2026-09-14] **copybackground 源同样不能在预渲染里做**：
+      // 它的内容 = 身后已渲染画面（再套 scroll/transform 等效果链），而本函数跑在
+      // 主循环之前、画布只有 clearcolor —— 预渲染出来是一张空图。
+      // 2464842912 的 Beam（copybackground + scroll，实心 32×32 ×19.97）就是这样：
+      // 它是「流光盘带」的本体，被 107 遮罩层的 blend 引用、再被主图层 ColorDodge
+      // 叠到车身上。预渲染拿到空图 → 流光整段消失（只剩静态剪影）。
+      // 正解同空 composelayer：登记进 pendingEmptyCompose，主循环走到该层 z 序时
+      // 连效果链一起做（captureEmptyComposeAtZOrder 里走 renderLayer）。
+      const needsZOrderBackdrop = !!src.copybackground
+      if (isEmptyCompose || needsZOrderBackdrop) {
         pendingEmptyCompose.set(oid, names)
         continue
       }
