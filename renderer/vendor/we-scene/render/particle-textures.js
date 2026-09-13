@@ -1217,3 +1217,98 @@ export function buildBuiltinParticleTexture(name) {
 export function isBuiltinParticleTextureName(name) {
   return typeof name === 'string' && name.indexOf('particle/') === 0
 }
+
+// ---------- 场景「内置 util 贴图」（效果链用，非粒子）----------
+//
+// 效果 pass 的 textures 槽引用的 WE 公共 util 贴图**不在 scene.pkg 里**（与粒子
+// 内置贴图同源，属 WE 安装目录的公共资源）。全库实测引用：
+//   util/clouds_256 ×36 处 / 20 张壁纸（云效果的密度图）
+//   util/black      ×8  （黑色遮罩/回退）
+// 缺 clouds_256 时云效果拿到白板贴图：cloud0×cloud1 恒为 1，smoothstep 后整片蒙版
+// 区被涂成均匀色（Hue 混合下还会把色相拉到红），且白板无图案可漂移 —— 天空是一层
+// **静止伪影**（959417181「下雨 shader 动态效果」缺失的真身之一）。
+// 生成尺寸/形态对齐官方 clouds_256：256×256、可平铺、软絮状（对比度偏中，留出
+// 阈值 0.15 + 羽化下方的净空）。可平铺是硬要求：云 shader 的 uv 随 g_Time 无界增长，
+// 采样必须能环绕（见 scene-mount 的 REPEAT 注册），否则漂一会儿整片天空都会被
+// CLAMP 拉成边缘一行。
+
+/** 周期值噪声：格点按 grid 取模 → size % grid === 0 时左右/上下无缝拼接 */
+function periodicValueNoise(size, grid, seed) {
+  const rng = mulberry32(seed)
+  const g = new Float32Array(grid * grid)
+  for (let i = 0; i < g.length; i++) g[i] = rng()
+  const out = new Float32Array(size * size)
+  const cell = size / grid
+  for (let y = 0; y < size; y++) {
+    const fy = y / cell
+    const iy = Math.floor(fy)
+    const ty = fy - iy
+    const sy = ty * ty * (3 - 2 * ty)
+    const y0 = (iy % grid) * grid
+    const y1 = ((iy + 1) % grid) * grid
+    for (let x = 0; x < size; x++) {
+      const fx = x / cell
+      const ix = Math.floor(fx)
+      const tx = fx - ix
+      const sx = tx * tx * (3 - 2 * tx)
+      const x0 = ix % grid
+      const x1 = (ix + 1) % grid
+      const a = g[y0 + x0]
+      const b = g[y0 + x1]
+      const c = g[y1 + x0]
+      const d = g[y1 + x1]
+      const top = a + (b - a) * sx
+      const bot = c + (d - c) * sx
+      out[y * size + x] = top + (bot - top) * sy
+    }
+  }
+  return out
+}
+
+/** 云密度图：多倍频周期噪声 → 阈值软拐点 → 灰阶（shader 只采 .r） */
+function cloudDensityTexture(size = 256) {
+  const octaves = [
+    [4, 0.5, 0x9e3779b1],
+    [8, 0.25, 0x85ebca6b],
+    [16, 0.125, 0xc2b2ae35],
+    [32, 0.0625, 0x27d4eb2f],
+    [64, 0.03125, 0x165667b1],
+  ]
+  const acc = new Float32Array(size * size)
+  let wsum = 0
+  for (const [grid, amp, seed] of octaves) {
+    const n = periodicValueNoise(size, grid, seed)
+    for (let i = 0; i < acc.length; i++) acc[i] += n[i] * amp
+    wsum += amp
+  }
+  const rgba = new Uint8Array(size * size * 4)
+  for (let i = 0; i < acc.length; i++) {
+    let v = acc[i] / wsum
+    // 偏置：官方云图大部分区域落在阈值 0.15 之下（晴空），絮团才亮
+    v = Math.min(1, Math.max(0, (v - 0.30) / 0.52))
+    v = v * v * (3 - 2 * v)
+    const c = Math.round(v * 255)
+    const o = i * 4
+    rgba[o] = c
+    rgba[o + 1] = c
+    rgba[o + 2] = c
+    rgba[o + 3] = 255
+  }
+  return { width: size, height: size, rgba }
+}
+
+/**
+ * 内置 util 贴图生成（scene-mount 注册内置纹理表时调用）。
+ * 返回 null 表示不是内置 util 名（调用方继续走 pkg / 其它来源）。
+ */
+export function buildBuiltinUtilTexture(name) {
+  if (name === 'util/clouds_256') {
+    if (!cache.has(name)) cache.set(name, cloudDensityTexture(256))
+    return cache.get(name)
+  }
+  if (name === 'util/black') {
+    if (!cache.has(name)) cache.set(name, { width: 1, height: 1, rgba: new Uint8Array([0, 0, 0, 255]) })
+    return cache.get(name)
+  }
+  return null
+}

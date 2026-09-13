@@ -767,6 +767,30 @@ cfg, source, pkgAbort.signal);
         rg88: false,
         mips: null,
       });
+      // [we-scene patch 959417181] 效果链引用的 WE 公共 util 贴图（不在 pkg 里）。
+      // util/clouds_256（云密度图，全库 20 张 / 36 处）缺了会让云效果拿到白板贴图：
+      // 天空是一层静止伪影，且白板无图案可漂移 —— 「下雨 shader 动态效果」的
+      // 真身之一。云 shader 的 uv 随 g_Time 无界增长，必须 REPEAT 环绕（贴图本身
+      // 是可平铺的周期噪声，见 particle-textures.buildBuiltinUtilTexture）。
+      // util/black 同属公共 util 贴图（×8 处，黑色遮罩回退）。
+      for (const utilName of ["util/clouds_256", "util/black"]) {
+        const t = ptex.buildBuiltinUtilTexture ? ptex.buildBuiltinUtilTexture(utilName) : null;
+        if (!t) continue;
+        textures.set(utilName, {
+          glTex: rnd.makeTexture(
+            renderer.gl,
+            t.rgba,
+            t.width,
+            t.height,
+            null,
+            utilName === "util/clouds_256" ? { wrap: "repeat" } : null,
+          ),
+          width: t.width,
+          height: t.height,
+          rg88: false,
+          mips: null,
+        });
+      }
 
       // [we-scene patch] WE 的两个保留纹理名：当前封面 / 上一张封面。
       // 全库 35 + 29 处引用（作者直接把它们填进 image 或 textures 槽）。

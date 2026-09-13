@@ -142,5 +142,80 @@ console.log("\n[3] 接线：scene-mount 的 .tex 分支必须走 decodeTexImageB
   check(bare === 2, `scene-mount 剩余裸 createImageBitmap 应为 2（媒体封面路径），实得 ${bare}`);
 }
 
+console.log("\n[4] 内置 util 贴图：util/clouds_256 必须可平铺且非平坦（959417181）");
+{
+  // 效果链引用的 WE 公共 util 贴图不在 pkg 里，缺 clouds_256 时云效果拿到白板
+  // 贴图：天空是一层静止伪影（全库 20 张 / 36 处引用）。
+  const ptex = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js")).href
+  );
+  const clouds = ptex.buildBuiltinUtilTexture("util/clouds_256");
+  check(!!clouds && clouds.width === 256 && clouds.height === 256, "util/clouds_256 应为 256×256");
+  if (clouds) {
+    const W = clouds.width;
+    const rgba = clouds.rgba;
+    let sum = 0;
+    let sum2 = 0;
+    let above = 0;
+    for (let i = 0; i < W * W; i++) {
+      const v = rgba[i * 4] / 255;
+      sum += v;
+      sum2 += v * v;
+      if (v > 0.15) above++; // 云 shader 的 smoothstep 阈值下界
+    }
+    const n = W * W;
+    const mean = sum / n;
+    const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+    check(std > 0.08, `云密度图不能是平坦色（std=${std.toFixed(3)}，白板回归）`);
+    const coverage = above / n;
+    check(
+      coverage > 0.1 && coverage < 0.9,
+      `阈值 0.15 以上的覆盖率应在 10%~90%（实得 ${(coverage * 100).toFixed(1)}%——全 0=看不见、全 1=整片蒙版）`,
+    );
+    // 可平铺性：环绕接缝的列差不应远大于内部相邻列差（云 uv 随 g_Time 无界增长，
+    // 不平铺会在接缝处出现硬线；CLAMP 环绕则整片被拉成边缘一行）
+    const colDiff = (a, b) => {
+      let s = 0;
+      for (let y = 0; y < W; y++) s += Math.abs(rgba[(y * W + a) * 4] - rgba[(y * W + b) * 4]);
+      return s / W;
+    };
+    let interior = 0;
+    let cnt = 0;
+    for (let x = 0; x < W - 1; x += 7) {
+      interior += colDiff(x, x + 1);
+      cnt++;
+    }
+    const meanInterior = interior / cnt;
+    const seam = colDiff(W - 1, 0);
+    check(
+      seam < Math.max(2, meanInterior * 1.6),
+      `环绕接缝应不比内部列差更陡（接缝 ${seam.toFixed(2)} vs 内部均值 ${meanInterior.toFixed(2)}）`,
+    );
+    // 反证：平坦白板必须被上面两条判据抓住（断言不是恒真）
+    const flat = new Uint8Array(W * W * 4).fill(255);
+    let fsum = 0;
+    let fsum2 = 0;
+    for (let i = 0; i < W * W; i++) {
+      const v = flat[i * 4] / 255;
+      fsum += v;
+      fsum2 += v * v;
+    }
+    const fstd = Math.sqrt(Math.max(0, fsum2 / n - (fsum / n) ** 2));
+    check(fstd < 0.08, "自检：平坦贴图必须被 std 判据判为失败");
+  }
+  const black = ptex.buildBuiltinUtilTexture("util/black");
+  check(!!black && black.rgba[0] === 0 && black.rgba[3] === 255, "util/black 应为不透明纯黑");
+  check(ptex.buildBuiltinUtilTexture("util/white") === null, "非内置 util 名应返回 null（不吞掉 pkg/其它来源）");
+
+  const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/buildBuiltinUtilTexture/.test(src), "scene-mount 应注册内置 util 贴图");
+  check(
+    /util\/clouds_256"[\s\S]{0,200}wrap: "repeat"/.test(src),
+    "util/clouds_256 必须以 REPEAT 环绕注册（CLAMP 下云漂一会儿整片被拉成边缘行）",
+  );
+  const glSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8");
+  check(/opts && opts\.wrap === 'repeat' \? gl\.REPEAT/.test(glSrc), "makeTexture 应支持 wrap:'repeat'");
+}
+
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

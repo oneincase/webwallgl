@@ -36,11 +36,15 @@ function parseVec3Local(s) {
   return [p[0] || 0, p[1] || 0, p[2] || 0]
 }
 
-export function makeTexture(gl, rgba, width, height, bitmap = null) {
+export function makeTexture(gl, rgba, width, height, bitmap = null, opts = null) {
   const tex = gl.createTexture()
   gl.bindTexture(gl.TEXTURE_2D, tex)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  // [we-scene patch] 环绕模式：默认 CLAMP（精灵/单帧贴图 uv 恒在 0..1）。
+  // 云效果（util/clouds_256）的 uv 随 g_Time 无界增长，必须 REPEAT —— CLAMP 下
+  // 漂一会儿整片天空会被拉成边缘那一行（959417181）。
+  const wrap = opts && opts.wrap === 'repeat' ? gl.REPEAT : gl.CLAMP_TO_EDGE
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap)
   if (bitmap) {
     // [we-scene patch] PNG/JPEG 解码出的大图（puppet 图集等）走这里。这类纹理在
     // 画布上通常被大幅缩小（3264246690 人物贴图 3658×2000 → 屏上 ~840px ≈ 4.4×
