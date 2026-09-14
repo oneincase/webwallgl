@@ -25,6 +25,82 @@ const {
   composeChildTransform,
   isRenderInert,
 } = await import(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"));
+const { evalObjectScript } = await import(path.join(ROOT, "renderer/vendor/we-scene/render/text.js"));
+
+// ---- 6. 跨层 origin 写入必须落 local 槽（2983846453 昼夜开关）----
+// 开关脚本挂在「早」层的 visible 字段上：cursorClick 翻 shared.hover，真正的
+// 位移在**每帧 update 的副作用**里——`thisScene.getLayer('yuan1').origin = new Vec3(…)`
+// 用 WEMath.mix 把圆片从 1773 lerp 到 2068。旧的 makeObjectLayerProxy origin
+// setter 只写 world origin；而圆片层的 origin 字段绑了脚本（哪怕整段被注释），
+// collectTransformDirty 把它们收进脏集合，同一帧稍后的 recomposeWorld 用没变的
+// localOrigin 覆盖 world —— 滑动每帧被冲掉，点了开关不右滑。
+{
+  const id = "2983846453";
+  const dir = path.join(LIB, id);
+  const pkgPath = fs.existsSync(path.join(dir, "scene.pkg")) ? path.join(dir, "scene.pkg") : null;
+  if (!pkgPath) {
+    console.log(`  (跳过 ${id}：库中无此壁纸)`);
+  } else {
+    const pkg = parsePkg(fs.readFileSync(pkgPath));
+    const sj = JSON.parse(dec.decode(getEntry(pkg, "scene.json")));
+    const proj = JSON.parse(fs.readFileSync(path.join(dir, "project.json"), "utf8"));
+    const live = {};
+    for (const [k, v] of Object.entries(proj.general?.properties || {})) live[k] = v.value;
+    const vec3 = (v) => {
+      if (typeof v === "string") { const a = v.trim().split(/\s+/).map(Number); return [a[0] || 0, a[1] || 0, a[2] || 0]; }
+      return [0, 0, 0];
+    };
+    // 构造与 parse 同构的图层（world + local 三件套），圆片层都标记 origin 绑脚本
+    // （模拟真实的 collectTransformDirty 种子）。
+    const layers = [];
+    const byName = new Map();
+    for (const so of sj.objects) {
+      const o = typeof so.origin === "string" ? vec3(so.origin) : [0, 0, 0];
+      const L = {
+        id: so.id, name: so.name,
+        origin: o.slice(), localOrigin: o.slice(), localScale: [1, 1, 1], localAngles: [0, 0, 0],
+        scale: typeof so.scale === "string" ? vec3(so.scale) : [1, 1, 1], angles: [0, 0, 0],
+        size: typeof so.size === "string" ? vec3(so.size) : [100, 100, 0],
+        visible: true, visibleSelf: true, alpha: 1, color: [1, 1, 1],
+        childIds: [], parentId: so.parent ?? null, isPostProcess: false,
+        objectScripts: { origin: { script: "// commented origin script" } },
+      };
+      layers.push(L); byName.set(so.name, L);
+    }
+    const knob = sj.objects.find((o) => o.id === 32);
+    const code = String(knob.visible.script).replace(/^'/, "");
+    const scriptedDirty = new Set();
+    const sb = evalObjectScript(code, knob.visible.scriptproperties, {
+      layer: byName.get("早"),
+      getSceneLayer: (n) => byName.get(n) || null,
+      getSceneLayerById: (idv) => layers.find((l) => l.id === idv) || null,
+      markTransformDirty: (l) => scriptedDirty.add(l.id),
+      userProperties: live, shared: {},
+      canvasSize: { width: 3840, height: 2160 }, screenResolution: { x: 3840, y: 2160 },
+      workshopId: Number(id),
+    });
+    sb.init(true);
+    sb.callCursor("cursorClick", { worldPosition: { x: 1773, y: 1072, z: 0 } });
+    for (let i = 0; i < 400; i++) sb.callUpdate(true);
+    const y1 = byName.get("yuan1");
+    // 1) update 副作用必须写 local 槽
+    if (Math.abs(y1.localOrigin[0] - 2068) > 1) {
+      fail(`2983846453 开关圆片 localOrigin.x=${y1.localOrigin[0].toFixed(1)} 应收敛到 2068（跨层 origin 写入未走 local 槽）`);
+    } else {
+      console.log("  ✓ 2983846453：开关脚本把圆片 localOrigin lerp 到 2068");
+    }
+    // 2) 用真实 collectTransformDirty + recomposeWorld 模拟一帧后，world 必须跟随 local，
+    //    不能被旧 local 冲回 1773（旧 bug：setter 只写 world，recompose 立刻覆盖）。
+    y1.origin[0] = 1773; // 模拟「只写 world」被冲前的状态不应出现：重算后应由 local 决定
+    const dirty = collectTransformDirty(layers, []);
+    recomposeWorld(layers, dirty);
+    if (Math.abs(y1.origin[0] - 2068) > 1) {
+      fail(`2983846453 recompose 后圆片 world.x=${y1.origin[0].toFixed(1)}，应=local 的 2068（被旧 localOrigin 冲回）`);
+    } else {
+      console.log("  ✓ 2983846453：recomposeWorld 后 world 跟随 local（滑动不被冲掉）");
+    }
+  }
+}
 
 // ---- 1. composeChildTransform 纯函数单元：旋转 + 缩放 + 平移全到位
 {

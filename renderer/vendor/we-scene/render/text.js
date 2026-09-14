@@ -1643,18 +1643,53 @@ function makeObjectLayerProxy(layer, opts) {
   // `bar.origin = base+30` 会经 setter 写回模板层数组——getter 若回填同一 store，
   // baseOrigin 下一帧跟着涨，64 根条每帧 +30 跑出屏幕）。全库语料 0 处
   // `thisLayer.<vec>.<member> =` 成员直写，快照语义无回归面。
+  //
+  // [we-scene patch] origin/scale 经 thisLayer / thisScene.getLayer() 写回时必须落
+  // **local 槽**（localOrigin/localScale），与对象脚本 update 返回值的写回空间一致
+  //（见 scene-mount 的 LOCAL_SLOT）：作者坐标是父级相对空间，world 三件套每帧由
+  // recomposeWorld 从 local 合成。
+  // 2983846453 昼夜开关：visible 字段脚本在 update 里用
+  // `thisScene.getLayer('yuan1').origin = new Vec3(…)` 移动开关圆片（副作用不在
+  // click 里，在每帧 update 里 lerp）。旧 setter 只写 world origin，而这些圆片层
+  // 的 origin 字段绑了脚本（哪怕整段被注释）→ collectTransformDirty 把它们收进
+  // 脏集合 → 同一帧稍后的 recomposeWorld 用没变的 localOrigin 覆盖 world，滑动
+  // 每帧被冲掉（手动只调 update 不 recompose 时能移到 2061，真实帧循环里恒在
+  // 1773）。写 local 后：顶层层 local===world 立即同步，子层标脏由 recompose 合成。
+  // size/color 没有父子空间问题，仍写 world（size 且故意不回写，避免 FBO 抖动）。
+  const LOCAL_VEC_SLOT = { origin: 'localOrigin', scale: 'localScale' }
   for (const key of ['origin', 'scale', 'size', 'color']) {
     Object.defineProperty(proxy, key, {
       enumerable: true,
       get() {
-        const a = layer && Array.isArray(layer[key]) ? layer[key] : null
-        return makeVec3(a || [0, 0, 0])
+        // 变换字段读 local 槽（作者坐标空间，刚写入即可读回）；缺 local 的合成层
+        // 退回 world；scale 缺省 1、origin 缺省 0。
+        const localSlot = LOCAL_VEC_SLOT[key]
+        const fallback = key === 'scale' ? [1, 1, 1] : [0, 0, 0]
+        const a = layer && localSlot && Array.isArray(layer[localSlot])
+          ? layer[localSlot]
+          : (layer && Array.isArray(layer[key]) ? layer[key] : null)
+        return makeVec3(a || fallback)
       },
       set(v) {
         const a = normVec(v)
         store[key].x = a[0]; store[key].y = a[1]; store[key].z = a[2]
-        // size 是渲染几何的输入，脚本改它会让效果链 FBO 尺寸抖动，不回写
-        if (layer && Array.isArray(layer[key]) && key !== 'size') {
+        const localSlot = LOCAL_VEC_SLOT[key]
+        if (!layer) return
+        if (localSlot) {
+          if (Array.isArray(layer[localSlot])) {
+            layer[localSlot][0] = a[0]; layer[localSlot][1] = a[1]; layer[localSlot][2] = a[2]
+          }
+          // 顶层层层 local===world，立即同步 world，本帧渲染 / hit-test / 脚本紧接
+          // 读回都拿到新值；子层 world 含父变换，不能直接填 local，标记为脏让宿主
+          // 在本帧 recompose 阶段从父链合成（sceneApi.markTransformDirty）。
+          const isTopLevel = layer.parentId === undefined || layer.parentId === null
+          if (isTopLevel && Array.isArray(layer[key])) {
+            layer[key][0] = a[0]; layer[key][1] = a[1]; layer[key][2] = a[2]
+          } else if (!isTopLevel && typeof opts.markTransformDirty === 'function') {
+            opts.markTransformDirty(layer)
+          }
+        } else if (Array.isArray(layer[key]) && key !== 'size') {
+          // size 是渲染几何的输入，脚本改它会让效果链 FBO 尺寸抖动，不回写
           layer[key][0] = a[0]; layer[key][1] = a[1]; layer[key][2] = a[2]
         }
       },

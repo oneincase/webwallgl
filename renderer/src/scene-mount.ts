@@ -2360,6 +2360,11 @@ cfg, source, pkgAbort.signal);
       // 经典用法：音频条的 scale 脚本读 registerAudioBuffers 按频段改写 scale.y
       // （3078285611 底部 11 根音条即此）。逐帧求值，出错熔断回退字段静态快照。
       const objectScriptRuns: Array<{ layer: any; field: string; slot: string; kind: "vec3" | "scalar" | "bool"; sandbox: any; last?: unknown }> = [];
+      // [we-scene patch] 跨层脚本（thisScene.getLayer(x).origin/scale = …）写了某个
+      // **子层** local 变换槽后，目标层要进本帧 recompose 集合（顶层 local===world
+      // 已即时同步，只有子层需从父链合成）。沙箱经 sceneApi.markTransformDirty 登记，
+      // 每帧 recompose 前并入 transformDirty 后清空。
+      const scriptedTransformDirty = new Set<unknown>();
       // 关键帧动画：逐帧推进并把结果写回图层字段
       const animRuns: Array<{ layer: any; field: string; slot: string; ctrl: any }> = [];
       // 粒子 instanceoverride 的关键帧动画（与对象字段动画同一时钟/同一推进队列）：
@@ -2405,6 +2410,11 @@ cfg, source, pkgAbort.signal);
           1 + Math.max(0, ...(scene.layers as any[]).map((l: any) => Number(l.id) || 0));
         const sceneApi = {
           recomputeVisibility,
+          markTransformDirty: (layer: any) => {
+            if (layer && layer.id !== undefined && layer.id !== null) {
+              scriptedTransformDirty.add(layer.id);
+            }
+          },
           getSceneLayer: (name: string) =>
             (scene.layers as any[]).find((l) => l.name === name && !l.destroyed) || null,
           getSceneLayerById: (id: unknown) =>
@@ -3344,6 +3354,11 @@ cfg, source, pkgAbort.signal);
           if (visibilityDirty) recomputeVisibility();
           // [we-scene patch] 父子变换重算：把 local 三件套合成回 world。
           // 必须在动画/脚本写完 local **之后**、followAttachments 与绘制**之前**。
+          // 跨层脚本经 markTransformDirty 登记的子层并入脏集合（见 scriptedTransformDirty）。
+          if (scriptedTransformDirty.size) {
+            for (const id of scriptedTransformDirty) transformDirty.add(id);
+            scriptedTransformDirty.clear();
+          }
           // 只重算 transformDirty（变换绑了脚本/动画的层及其整棵子树，外加挂件子树），
           // 其余图层保持 parse 时的 world 一个字节都不碰。
           if (transformDirty.size) scn.recomposeWorld(scene.layers, transformDirty);
