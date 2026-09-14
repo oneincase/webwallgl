@@ -10,6 +10,7 @@ import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
+import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, noise, particles, ptex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
@@ -57,6 +58,102 @@ export const fontFaceCache = new Map<string, { family: string; refs: number }>()
  *（3233141951 中音条0上/下），淡出完成时返回精确 0 —— 作者意图是「淡完后隐藏」。
  */
 const foldVisibleRet = wtext.foldVisibleReturn as (ret: unknown) => boolean | undefined;
+
+/**
+ * [we-scene patch] 对象散字段脚本（P2-1）的真实读写槽：
+ * scene.json 字段名与渲染层字段名不总是一致——直接写 layer.maxwidth 没有任何
+ * 消费者（文字排版读 textMaxwidth，与关键帧动画 volume/maxwidth/zoom 同族）。
+ * volume 还要同步到 HTMLAudio（声音层）；pointsize/maxwidth 是文字布局输入，
+ * 下帧 drawText 自动重读；intensity/exponent 是灯光参数（本仓无灯光对象），
+ * 值存层上无害（作者滑条/脚本仍可读写）。
+ */
+function scalarFieldSlot(layer: any, field: string): { get: () => number; set: (n: number) => void } {
+  if (field === "maxwidth") {
+    return {
+      get: () => Number(layer.textMaxwidth) || 0,
+      set: (n) => { layer.textMaxwidth = n; layer.lastKey = null; },
+    };
+  }
+  if (field === "pointsize") {
+    return { get: () => Number(layer.textPointsize) || 0, set: (n) => { layer.textPointsize = n; layer.lastKey = null; } };
+  }
+  if (field === "volume") {
+    return {
+      get: () => {
+        if (layer.soundprops) return Number(layer.soundprops.volume) ?? 1;
+        return Number(layer.volume) || 1;
+      },
+      set: (n) => {
+        const v = Math.max(0, Math.min(1, n));
+        if (layer.soundprops) layer.soundprops.volume = v;
+        layer.volume = v;
+        if (layer.soundCtl?.setVolume) layer.soundCtl.setVolume(v);
+      },
+    };
+  }
+  // alpha/brightness/intensity/exponent 等直接读写层字段
+  return {
+    get: () => Number(layer[field]) || 0,
+    set: (n) => { layer[field] = n; },
+  };
+}
+
+// [we-scene patch] BGM 频谱并入增益：getByteFrequencyData 的峰值普遍偏低
+// （音乐平均能量远低于底鼓瞬态），与模拟源 GAIN=3.2 的观感对齐，音条才会
+// 明显摆动；逐段 min(1) 防爆。实测多数 BGM 峰值 0.2~0.5，×2 后 0.4~1。
+const BGM_SPECTRUM_GAIN = 2.0;
+
+/**
+ * [we-scene patch] 构造本场景全部脚本共享的 localStorage（P1-2）。
+ *
+ * WE 语义：同壁纸所有脚本（五个 eval 点）一份、跨会话保留；LOCATION_GLOBAL
+ * 跨壁纸共享。库在浏览器里默认把数据落到 window.localStorage，按 source.key
+ * 加前缀隔离（不同壁纸互不串），无 window（Node verifier / SSR）时返回 null，
+ * makeSandboxStorage 自己退化为进程内 Map。
+ *
+ * key 可能含 URL 保留字符（"https://x/123"），用 encodeURIComponent 转义后再
+ * 拼前缀，避免一个壁纸的 key 成为另一个壁纸前缀的前缀（a/1 与 a/10）。
+ */
+function createSceneStorage(cfg: WallpaperConfig, sourceKey: string | undefined) {
+  if (cfg.storageProvider) {
+    return wtext.makeSandboxStorage(cfg.storageProvider.screen, cfg.storageProvider.global);
+  }
+  let dom: Storage | null = null;
+  try {
+    dom = typeof window !== "undefined" && window.localStorage ? window.localStorage : null;
+  } catch {
+    // 某些浏览器在隐私模式/文件协议下访问 localStorage 直接抛错
+    dom = null;
+  }
+  if (!dom) return wtext.makeSandboxStorage();
+  const ns = "wst:" + (sourceKey ? encodeURIComponent(sourceKey) : "nokey") + ":";
+  const gns = "wst:global:";
+  const makeDom = (prefix: string) => ({
+    get: (k: string) => {
+      const v = dom!.getItem(prefix + k);
+      return v === null ? null : v;
+    },
+    set: (k: string, v: string) => dom!.setItem(prefix + k, v),
+    remove: (k: string) => dom!.removeItem(prefix + k),
+    clear: () => {
+      const dead: string[] = [];
+      for (let i = 0; i < dom!.length; i++) {
+        const k = dom!.key(i);
+        if (k && k.startsWith(prefix)) dead.push(k);
+      }
+      for (const k of dead) dom!.removeItem(k);
+    },
+    keys: () => {
+      const out: string[] = [];
+      for (let i = 0; i < dom!.length; i++) {
+        const k = dom!.key(i);
+        if (k && k.startsWith(prefix)) out.push(k.slice(prefix.length));
+      }
+      return out;
+    },
+  });
+  return wtext.makeSandboxStorage(makeDom(ns), makeDom(gns));
+}
 
 /** djb2：family 名里嵌 key 哈希，防不同壁纸同文件名字体共族误删 */
 function fontKeyHash(key: string): string {
@@ -314,6 +411,14 @@ cfg, source, pkgAbort.signal);
         hook(info);
       }
       const propSandboxes: any[] = [];
+      // [we-scene patch] SceneScript localStorage（P1-2）：WE 语义是**按壁纸
+      // 共享 + 跨会话持久**。五个 eval 点必须拿到同一份 storage 实例（脚本 A
+      // 写、脚本 B 读）。后端优先级：
+      //   1) cfg.storageProvider（测试台文件后端 / 自定义宿主）；
+      //   2) window.localStorage + 按 source.key 命名空间（库形态默认，跨重挂保留）；
+      //   3) 都没有时 makeSandboxStorage 内部退化为进程内 Map。
+      // LOCATION_GLOBAL 走不带壁纸命名空间的全局后端（跨壁纸共享）。
+      const sceneStorage = createSceneStorage(cfg, source.key);
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
@@ -490,9 +595,12 @@ cfg, source, pkgAbort.signal);
           : audioDriverRef.current
             ? audioDriverRef.current.snapshot
             : simAudio.snapshot;
+      // 本帧最终频谱（当前源 + BGM 合并），setAudioProvider 与 fillAudioBuffers
+      // 都读这一份；无 BGM 时等于 activeAudioSnapshot()。
+      let frameAudioSnapshot: any = null;
       renderer.setAudioProvider(() => {
         if (!audioSim.enabled) return SILENT_AUDIO;
-        return activeAudioSnapshot();
+        return frameAudioSnapshot || activeAudioSnapshot();
       });
       // 文字脚本 engine.registerAudioBuffers(n) 的共享视图（text.js 惰性创建，每帧重填）
       const audioViews = new Map<number, { left: Float32Array; right: Float32Array; average: Float32Array }>();
@@ -544,6 +652,45 @@ cfg, source, pkgAbort.signal);
       const mediaSim = { enabled: !rt.mediaDisabled, override: null as Record<string, unknown> | null };
       // 挂了媒体回调的沙箱（广播表；媒体不做 hit-test，不必按图层索引）
       const mediaHooks: any[] = [];
+      // [we-scene patch] 挂了 resizeScreen 的沙箱（画布尺寸变化时统一派发，
+      // 含首帧）。文字/对象/效果开关/general 沙箱在装配期就能扫到；效果常量沙箱
+      // 是惰性创建的，经 setConstantScriptRuntime 的 onSandbox 回调补登记。
+      const resizeHooks = new Set<any>();
+      // 0 保证首帧一定派发一次（懒创建的常量沙箱在登记时会立即补一次，见下）
+      let lastResizeW = 0;
+      let lastResizeH = 0;
+      let lastResizeDispatch: { w: number; h: number } | null = null;
+      // engine.timeOfDay 当前值（秒级缓存，随真实时钟走，见帧循环）
+      let timeOfDayValue = (() => {
+        const d = new Date();
+        return (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
+      })();
+      let lastTodSec = -1;
+      const registerResizeHook = (sb: any) => {
+        if (!sb || !sb.hasResizeHook || typeof sb.callResize !== "function") return;
+        if (resizeHooks.has(sb)) return;
+        resizeHooks.add(sb);
+        // 懒创建的常量沙箱可能晚于首帧才登记：立即补发当前尺寸，与
+        // init 内手写 resizeScreen(engine.screenResolution) 的意图一致，
+        // 否则它要等到用户真的拖一次窗口才第一次收到正确尺寸。
+        if (lastResizeDispatch) {
+          try {
+            sb.callResize(lastResizeDispatch.w, lastResizeDispatch.h);
+          } catch {
+            /* callResize 内部有三振熔断 */
+          }
+        }
+      };
+      const dispatchResize = (w: number, h: number) => {
+        for (const sb of resizeHooks) {
+          if (!sb || sb.disabled) continue;
+          try {
+            sb.callResize(w, h);
+          } catch {
+            /* callResize 内部已有三振熔断，这里只防一个坏脚本打断其余派发 */
+          }
+        }
+      };
       let lastMediaSnap: any = null;
       /**
        * 已上传到 `$mediaThumbnail` 的封面来源串，用于按变化触发重传。
@@ -1342,9 +1489,23 @@ cfg, source, pkgAbort.signal);
           // 后三个壁纸的 12 层（含全部开关按钮）。
           if (pass?.combos) {
             for (const k of Object.keys(pass.combos)) {
-              if (k.toLowerCase() === "spritesheet" && Number(pass.combos[k]) === 1) {
+              const kl = k.toLowerCase();
+              if (kl === "spritesheet" && Number(pass.combos[k]) === 1) {
                 (layer as any).spriteSheet = true;
-                break;
+              }
+              // [we-scene patch] genericimage*/genericpuppet 系列材质的 LIGHTING
+              // combo（官方 shader：#if LIGHTING 时
+              //   ambient = max(0.001, g_LightAmbientColor) * albedo
+              //   color = CombineLighting(directLight, ambient)）。
+              // 全库仅 4 个 pass 开启（2872267921/2890473419/3351179520/
+              // 3509243656），且 NORMALMAP 全为 0 —— 2D 正交层法线恒 +Z、场景无
+              // 灯光对象时 PBR 直射项为 0，CombineLighting 退化为
+              // color = albedo * g_LightAmbientColor。这里把场景 ambientcolor 乘进
+              // 基色；不开 LIGHTING 的材质（99.9%）一律不碰，零回归面。
+              // generic.frag（带法线网格）另用 skylight 按 N.y 混合，本仓不跑那条
+              // 完整 PBR，故不处理 skylight（无 NORMALMAP 材质时两源同色，无差别）。
+              if (kl === "lighting" && Number(pass.combos[k]) === 1) {
+                (layer as any).lightingEnabled = true;
               }
             }
           }
@@ -1648,6 +1809,11 @@ cfg, source, pkgAbort.signal);
       // ---- 声音图层（sound 对象）----
       // 从 scene.pkg 提取声音文件 → Blob → audio 播放；受 cfg.muted 控制
       const soundAudios: HTMLAudioElement[] = [];
+      // [we-scene patch] BGM 频谱桥（35 张「声音层 + 音频反应」壁纸）：声音元素
+      // 接共享 AnalyserNode，每帧把 BGM 频域并入音频快照，让自带音乐也能驱动
+      // g_AudioSpectrum* / registerAudioBuffers（见 bgm-analyser.ts）。
+      const bgm = createBgmAnalyser();
+      const bgmCleanup = () => bgm.dispose();
       for (const layer of scene.layers) {
         if (!layer.sound || !layer.sound.length) continue;
         try {
@@ -1667,6 +1833,8 @@ cfg, source, pkgAbort.signal);
             au.loop = layer.soundprops?.playbackmode === "loop";
             au.volume = Math.max(0, Math.min(1, layer.soundprops?.volume ?? 1));
             au.muted = cfg.muted !== false;
+            // 接入 BGM 频谱分析（createMediaElementSource 每元素仅一次，幂等）
+            bgm.attach(au);
             // startsilent：等脚本 thisLayer.play() 再响。2887099508 的 10 层语音/备选
             // BGM 都是 true，一律 play 会在加载瞬间把问候、翻页、五首 BGM 叠在一起。
             // 全库 59 层 / 11 张壁纸。playbackmode=single 的一次性语音也走这条。
@@ -1679,6 +1847,7 @@ cfg, source, pkgAbort.signal);
                     /* 忽略 */
                   }
                 }
+                bgm.resume();
                 void au.play().catch(() => {});
                 // 脚本显式播放的曲目 = 「正在播放」的媒体（面板歌名/显隐的数据源）。
                 // 装配期自动开播的环境音不走这里，不会抢媒体面板。
@@ -1705,6 +1874,7 @@ cfg, source, pkgAbort.signal);
             // 登记进壁纸音频媒体源（跳歌/上一曲在这份有序表上循环）
             wallpaperAudio.register(au, layer.name || "");
             if (!layer.soundprops?.startsilent && !rt.paused) {
+              bgm.resume();
               void au.play().catch(() => {});
             }
             // 循环播放时循环
@@ -1722,7 +1892,7 @@ cfg, source, pkgAbort.signal);
           au.muted = vol <= 0;
         }
       };
-      rt.sceneAudio = { setVolume: setSceneVolume, audios: soundAudios };
+      rt.sceneAudio = { setVolume: setSceneVolume, audios: soundAudios, dispose: bgmCleanup };
       if (disposed) return;
       // 粒子每帧推进 + 按图层渲染（在场景图层迭代的正确 z 序位置渲染）。
       // 不再「全部堆在最后」—— advance 在渲染器图层迭代前统一推进，render 按 layer.id 分发。
@@ -1899,8 +2069,14 @@ cfg, source, pkgAbort.signal);
             const matEntry = pkg.getEntry(parsedPkg, mdlObj.materialPath);
             if (matEntry) {
               const material = JSON.parse(readText(matEntry));
-              const tex = material?.passes?.[0]?.textures?.[0];
+              const pass0 = material?.passes?.[0];
+              const tex = pass0?.textures?.[0];
               if (typeof tex === "string" && tex) texName = tex;
+              // [we-scene patch] 真 3D 网格材质的 LIGHTING combo（3509243656
+              // 球体/天空盒用 generic4 + LIGHTING=1）：标给 puppet 绘制回调，
+              // u_color 乘场景环境光（见 renderer drawPuppetDirect）。
+              const L = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
+              if (Number(L) === 1) (layer as any).lightingEnabled = true;
             }
           }
           if (texName) {
@@ -1948,9 +2124,11 @@ cfg, source, pkgAbort.signal);
                 // 无效果链时为 null，网格照常采样原始贴图。
                 overrideTex: o.overrideTex || null,
                 color: [
-                  layer.color[0] * layer.brightness,
-                  layer.color[1] * layer.brightness,
-                  layer.color[2] * layer.brightness,
+                  // [we-scene patch] 真 3D 网格 LIGHTING 材质乘场景环境光
+                  //（o.ambient，未开光照时是 [1,1,1]）。
+                  layer.color[0] * layer.brightness * (o.ambient?.[0] ?? 1),
+                  layer.color[1] * layer.brightness * (o.ambient?.[1] ?? 1),
+                  layer.color[2] * layer.brightness * (o.ambient?.[2] ?? 1),
                   layer.alpha,
                 ],
               },
@@ -2105,8 +2283,10 @@ cfg, source, pkgAbort.signal);
                 scale: layer.scale,
                 visible: layer.visible,
                 canvasSize: { width: projW, height: projH },
+                timeOfDay: timeOfDayValue,
                 userProperties: liveUserProps,
                 shared: textShared,
+                storage: sceneStorage,
                 audioViews,
                 inputView,
                 // [we-scene patch] 文字脚本此前没有真定时器（no-op stub），
@@ -2132,6 +2312,7 @@ cfg, source, pkgAbort.signal);
                 // `export function mediaPropertiesChanged(e){ mediaData = e.title }`
                 // 是全库 44 处文字脚本的标准形态。不登记就永远显示作者的占位文本。
                 if (item.sandbox.hasMediaHook) registerMediaHook(item.sandbox);
+                registerResizeHook(item.sandbox);
                 // [we-scene patch] 文字脚本的 animationEvent 同样进图层级广播表。
                 if (item.sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox: item.sandbox, kind: "text" });
               }
@@ -2205,6 +2386,7 @@ cfg, source, pkgAbort.signal);
             let content = String(layer.text ?? "");
             if (it.sandbox && it.sandbox.hasUpdate) {
               it.sandbox.engine.runtime = t;
+              it.sandbox.engine.timeOfDay = timeOfDayValue;
               const r = it.sandbox.callUpdate(content);
               if (r !== null && r !== undefined) content = String(r);
               else if (it.sandbox.thisLayer.text) content = String(it.sandbox.thisLayer.text);
@@ -2370,6 +2552,13 @@ cfg, source, pkgAbort.signal);
       // 粒子 instanceoverride 的关键帧动画（与对象字段动画同一时钟/同一推进队列）：
       // 写回目标是该层所有粒子系统的倍率，不是图层字段。
       const overrideAnimRuns: Array<{ layer: any; key: string; ctrl: any }> = [];
+      // [we-scene patch] instanceoverride 的 {script}：每帧 callUpdate →
+      // setOverrideValue（rate/count/size/alpha 轻量写口、colorn 颜色）。
+      // 与 overrideAnimRuns 同一处逐帧写，粒子 advance/render 当帧读到。
+      const overrideScriptRuns: Array<{ layer: any; key: string; sandbox: any }> = [];
+      // [we-scene patch] animationlayers[].visible 脚本（puppet clip 层开关，
+      // 24 段/8 张）：init 停错位层、帧事件 play；visible 返回值折叠后控制该层。
+      const animLayerScriptRuns: Array<{ layer: any; index: number; sandbox: any }> = [];
       const generalAnimRuns: Array<{ field: string; ctrl: any; write: (v: unknown) => void }> = [];
       const sceneNamedAnims: Record<string, any> = {};
       // 效果开关脚本（effects[i].visible.script）：逐帧决定该效果是否参与渲染
@@ -2576,6 +2765,7 @@ cfg, source, pkgAbort.signal);
           userProperties: objUserProps,
           audioViews,
           shared: textShared,
+          storage: sceneStorage,
           inputView,
           // [we-scene patch] 效果常量的延时逻辑（全库 8 处）。renderer 侧
           // setConstantScriptRuntime 只提取白名单字段，timers 单独透传。
@@ -2585,6 +2775,7 @@ cfg, source, pkgAbort.signal);
           ...sceneApi,
           onSandbox: (sb: any, info: any) => {
             if (sb && sb.hasMediaHook) registerMediaHook(sb);
+            registerResizeHook(sb);
             // 常量脚本的 animationEvent 也进图层级广播表（3163060610 的事件
             // 几乎全在常量上）。
             if (sb && sb.hasAnimEventHook) registerAnimEventSink(info && info.layer, { sandbox: sb, kind: "const" });
@@ -2676,6 +2867,86 @@ cfg, source, pkgAbort.signal);
             }
           }
         }
+        // [we-scene patch] animationlayers[].visible 脚本循环体见下方；声明提到
+      // 装配块顶部，使 renderLoop 闭包可见（与 overrideScriptRuns 同作用域）。
+      for (const layer of scene.layers as any[]) {
+        const als = Array.isArray(layer.animationLayers) ? layer.animationLayers : [];
+        als.forEach((al: any, index: number) => {
+          const vs = al.visibleScript as { script: string; scriptproperties: unknown; value: unknown } | null;
+          if (!vs) return;
+          try {
+            const sandbox = wtext.evalObjectScript(vs.script, vs.scriptproperties, {
+              canvasSize: { width: objProjW, height: objProjH },
+              timeOfDay: timeOfDayValue,
+              userProperties: objUserProps,
+              audioViews,
+              inputView,
+              layer,
+              ...timerOpts,
+              ...sceneApi,
+              shared: textShared,
+              storage: sceneStorage,
+              onError: (e: unknown) =>
+                reportDiag(rt, cfg, `animationlayer visible script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+            });
+            if (!sandbox) return;
+            propSandboxes.push(sandbox);
+            // init(value) 收到该层当前 visible（bool），返回值折叠后写回；
+            // init 内对 getAnimationLayer(name).stop() 的调用此刻已生效。
+            const ir = sandbox.init(al.visible !== false);
+            const f = foldVisibleRet(ir);
+            if (f !== undefined) al.visible = f;
+            sandbox.applyUserProperties(objUserProps);
+            if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+            registerResizeHook(sandbox);
+            animLayerScriptRuns.push({ layer, index, sandbox });
+            // 帧事件转发给该脚本（它据此 play 错位层）
+            if (sandbox.hasAnimEventHook) {
+              registerAnimEventSink(layer, { sandbox, kind: "animLayer", animLayerIndex: index });
+            }
+          } catch (e) {
+            reportDiag(rt, cfg, `animationlayer script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+          }
+        });
+      }
+      // [we-scene patch] instanceoverride 脚本（音频响应粒子参数，104 段/29 张）。
+        // 每帧求值后写该层全部粒子系统：rate/count/size/alpha 走轻量 setter，
+        // colorn 由 setOverrideValue 识别归一化三色；init(value) 的 value 是字段
+        // 当前快照值（WE 语义）。
+        for (const layer of scene.layers as any[]) {
+          const defs = layer.particleOverrideScripts as
+            | Record<string, { script: string; scriptproperties: unknown; value: unknown }>
+            | null;
+          if (!defs) continue;
+          for (const [key, def] of Object.entries(defs)) {
+            try {
+              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+                canvasSize: { width: objProjW, height: objProjH },
+                timeOfDay: timeOfDayValue,
+                userProperties: objUserProps,
+                audioViews,
+                inputView,
+                layer,
+                ...timerOpts,
+                ...sceneApi,
+                shared: textShared,
+                storage: sceneStorage,
+                onError: (e: unknown) =>
+                  reportDiag(rt, cfg, `override script '${layer.name}.${key}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+              });
+              if (!sandbox) continue;
+              propSandboxes.push(sandbox);
+              // init(value) 收到该 override 键的快照值（倍率/数量/颜色）。
+              sandbox.init(def.value);
+              sandbox.applyUserProperties(objUserProps);
+              if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+              registerResizeHook(sandbox);
+              if (sandbox.hasUpdate) overrideScriptRuns.push({ layer, key, sandbox });
+            } catch (e) {
+              reportDiag(rt, cfg, `override script '${layer.name}.${key}' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+            }
+          }
+        }
         // 脚本 init 返回值改写 visible 的，挂载期一次性收集，层循环结束后统一重算。
         let mountVisibilityDirty = false;
         for (const layer of scene.layers as any[]) {
@@ -2690,6 +2961,7 @@ cfg, source, pkgAbort.signal);
             try {
               const sandbox = wtext.evalObjectScript(vs.script, vs.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
+                timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
                 audioViews,
                 inputView,
@@ -2700,6 +2972,7 @@ cfg, source, pkgAbort.signal);
                 targetEffect: effect,
                 ...sceneApi,
                 shared: textShared,
+                storage: sceneStorage,
                 onError: (e: unknown) =>
                   reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
               });
@@ -2713,6 +2986,7 @@ cfg, source, pkgAbort.signal);
               if (ivFold !== undefined) effect.visible = ivFold;
               sandbox.applyUserProperties(objUserProps);
               if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+              registerResizeHook(sandbox);
               // last = 逐帧反馈的未折叠上一值（淡出脚本的 mix 链依赖它，
               // 只喂 bool 会丢掉小数进度，见帧循环 effectVisibleRuns）。
               let animRun: any = null;
@@ -2735,10 +3009,8 @@ cfg, source, pkgAbort.signal);
               const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 screenResolution: { x: c.clientWidth || window.innerWidth || 1, y: c.clientHeight || window.innerHeight || 1 },
-                timeOfDay: (() => {
-                  const d = new Date();
-                  return (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
-                })(),
+                // 初值同 timeOfDayValue；帧循环每秒回填，昼夜脚本不再冻结。
+                timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
                 audioViews,
                 inputView,
@@ -2752,6 +3024,7 @@ cfg, source, pkgAbort.signal);
                 // 骨骼 API 的覆写表（按图层）
                 getBoneOverrides,
                 shared: textShared,
+                storage: sceneStorage,
                 // [we-scene patch] WE 的 engine.setTimeout 返回**取消函数**句柄：
                 // 语料写 `lastHideEvent = engine.setTimeout(...)` 之后
                 // `lastHideEvent()` 直接调用它来取消（3790189808 的延时隐藏封面）。
@@ -2795,7 +3068,10 @@ cfg, source, pkgAbort.signal);
                       mountVisibilityDirty = true;
                     }
                   } else if (typeof ir === "number" && Number.isFinite(ir)) {
-                    if (field === "alpha" || field === "brightness") (layer as any)[field] = ir;
+                    if (["alpha", "brightness", "maxwidth", "pointsize", "volume", "intensity", "exponent"].includes(field)) {
+                      // 散字段经真实槽位写回（maxwidth/pointsize/volume 名字与消费槽不同）
+                      scalarFieldSlot(layer, field).set(ir);
+                    }
                   } else if (typeof ir === "object" && (ir as any).x !== undefined) {
                     const o = ir as any;
                     if (Number.isFinite(Number(o.x)) && Number.isFinite(Number(o.y))) {
@@ -2818,6 +3094,7 @@ cfg, source, pkgAbort.signal);
                 // 纯媒体回调脚本没有 update（`mediaThumbnailChanged(e){thisObject.visible=e.hasThumbnail}`
                 // 是最常见形态），放进 if 里会一个都收不到。同 addCursorHook 的位置。
                 if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+                registerResizeHook(sandbox);
                 // 只有真的导出了 update 的脚本才进逐帧字段求值队列。
                 // 纯 cursor 交互脚本（拖拽类）没有 update，进队列只会每帧白跑一次。
                 if (sandbox.hasUpdate) {
@@ -2828,7 +3105,7 @@ cfg, source, pkgAbort.signal);
                     slot: initSlot,
                     kind: field === "visible"
                       ? "bool"
-                      : field === "alpha" || field === "brightness"
+                      : ["alpha", "brightness", "maxwidth", "pointsize", "volume", "intensity", "exponent"].includes(field)
                         ? "scalar"
                         : "vec3",
                     sandbox,
@@ -2880,12 +3157,14 @@ cfg, source, pkgAbort.signal);
             try {
               const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
+                timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
                 audioViews,
                 inputView,
                 ...timerOpts,
                 ...sceneApi,
                 shared: textShared,
+                storage: sceneStorage,
                 onError: (e: unknown) =>
                   reportDiag(rt, cfg, `general script '${field}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
               });
@@ -2894,6 +3173,7 @@ cfg, source, pkgAbort.signal);
               sandbox.init(def.value);
               sandbox.applyUserProperties(objUserProps);
               if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+              registerResizeHook(sandbox);
               const write = (v: unknown) => writeGeneralField(field, v);
               if (sandbox.hasUpdate) generalScriptRuns.push({ field, sandbox, write });
             } catch (e) {
@@ -3039,6 +3319,20 @@ cfg, source, pkgAbort.signal);
           lastRender = now;
           markFrame(rt, now);
           syncCanvasSize(rt, c, rt.cfg);
+          // [we-scene patch] resizeScreen 派发（官方生命周期事件）：画布 CSS 尺寸
+          // 变化（含首帧：resize 模板在 init 里手动调
+          // resizeScreen(engine.screenResolution)，首帧不补发它拿到的是沙箱
+          // 默认值 1920×1080）时，对全部挂了 resizeScreen 的沙箱广播一次。
+          // 用 CSS 像素（与每帧回填的 engine.screenResolution 同口径），不用
+          // backing store：脚本拿它和 1920/1080 比，DPR 不应进入比较。
+          const cssW = c.clientWidth || window.innerWidth || 1;
+          const cssH = c.clientHeight || window.innerHeight || 1;
+          if (cssW !== lastResizeW || cssH !== lastResizeH) {
+            lastResizeW = cssW;
+            lastResizeH = cssH;
+            lastResizeDispatch = { w: cssW, h: cssH };
+            dispatchResize(cssW, cssH);
+          }
           // [we-scene patch] t 不允许为负：首帧 rAF 时间戳可能早于挂载时刻的
           // performance.now()（vsync 对齐），负的场景时间会让下游按相位取模的
           // 消费者越界（模拟音频 patterns[i16<0] = undefined → NaN 毒化共享视图，
@@ -3243,6 +3537,42 @@ cfg, source, pkgAbort.signal);
             if (!list) continue;
             for (const ps of list) ps.setOverrideValue(run.key, out);
           }
+          // [we-scene patch] instanceoverride 脚本逐帧求值（音频响应粒子）。
+          // 返回标量写倍率；返回向量（colorn "r g b"）需透传，setOverrideValue
+          // 的颜色分支接受数组——对象沙箱返回 Vec3-like（{x,y,z}）时转数组。
+          // [we-scene patch] animationlayers[].visible 脚本逐帧求值（puppet
+          // 蒙皮前，computeSkinMatrices 当帧就要读到）。返回值折叠成 bool。
+          for (const run of animLayerScriptRuns) {
+            if (run.sandbox.disabled) continue;
+            run.sandbox.engine.frametime = animDt;
+            run.sandbox.engine.runtime = t;
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
+            const al = run.layer.animationLayers?.[run.index];
+            if (!al) continue;
+            const out = run.sandbox.callUpdate(al.visible !== false);
+            const f = foldVisibleRet(out);
+            if (f !== undefined) al.visible = f;
+          }
+          for (const run of overrideScriptRuns) {
+            if (run.sandbox.disabled) continue;
+            run.sandbox.engine.frametime = animDt;
+            run.sandbox.engine.runtime = t;
+            run.sandbox.engine.screenResolution = { x: c.clientWidth || window.innerWidth || 1, y: c.clientHeight || window.innerHeight || 1 };
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
+            const out = run.sandbox.callUpdate(undefined);
+            const list = particleSystemsByLayer.get(run.layer.id);
+            if (!list) continue;
+            let val: unknown = out;
+            // colorn 脚本可能返回 {x,y,z} / "r g b" / 数字倍率
+            if (out && typeof out === "object") {
+              const o = out as any;
+              if (o.x !== undefined || o.y !== undefined) val = [Number(o.x) || 0, Number(o.y) || 0, Number(o.z) || 0];
+            }
+            for (const ps of list) {
+              if (run.key === "colorn" && Array.isArray(val)) ps.setColorOverride(val);
+              else ps.setOverrideValue(run.key, val as number);
+            }
+          }
           // [we-scene patch] 帧事件 drain（图层级广播）：对象字段动画与粒子
           // override 动画在本帧推进时越过的事件，当帧派发。
           for (const run of animRuns) {
@@ -3262,6 +3592,19 @@ cfg, source, pkgAbort.signal);
             else if (Array.isArray(out) && Number.isFinite(out[0])) run.write(out[0]);
           }
           // 效果开关脚本逐帧求值（只有明确返回布尔时才写回，同 visible 字段脚本）
+          // [we-scene patch] engine.timeOfDay 逐秒回填（一天中的时刻 [0,1)）。
+          // 此前只在沙箱构造时算一次（3151551777 火车震动、2134765860 夜灯…
+          // 全库 27 处 / 4 张），壁纸挂几小时也不入夜。每秒算一次即可：最小
+          // 粒度到秒，且昼夜混合脚本都按小时门判断（smoothStep(6.5, 7.5, …)）。
+          // 常量沙箱在 renderer 的 scriptedConstants 里逐帧回填（同一公式）。
+          // 必须放在下面所有字段求值循环之前：effect 开关 / general / 对象脚本
+          // 都会读它。
+          const todSec = Math.floor(now / 1000);
+          if (todSec !== lastTodSec) {
+            lastTodSec = todSec;
+            const d = new Date();
+            timeOfDayValue = (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
+          }
           for (const run of effectVisibleRuns) {
             if (run.sandbox.disabled) continue;
             // frametime 与 runtime 必须同一时基：runtime 是真实时钟 t，frametime
@@ -3269,6 +3612,7 @@ cfg, source, pkgAbort.signal);
             // 动画越走越慢（全库 57 张脚本用 frametime，3233141951 本张 9 处）。
             run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
             const ret = run.sandbox.callUpdate(
               // [we-scene patch] 入参 = 上一帧**未折叠**的返回值（run.last，首轮
               // 为 init 返回值），不再每帧重建 !!visible —— 淡出脚本的 mix 链靠
@@ -3285,6 +3629,7 @@ cfg, source, pkgAbort.signal);
             if (run.sandbox.disabled) continue;
             run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
             const g = (scene as any).general || {};
             const cur = g[run.field] && typeof g[run.field] === "object" && "value" in g[run.field]
               ? g[run.field].value
@@ -3305,12 +3650,14 @@ cfg, source, pkgAbort.signal);
             sb.engine.frametime = animDt;
             sb.engine.runtime = t;
             sb.engine.screenResolution = screenRes;
+            sb.engine.timeOfDay = timeOfDayValue;
           }
           for (const run of objectScriptRuns) {
             if (run.sandbox.disabled) continue;
             run.sandbox.engine.frametime = animDt;
             run.sandbox.engine.runtime = t;
             run.sandbox.engine.screenResolution = screenRes;
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
             const cur = run.layer[run.field];
             if (run.kind === "bool") {
               // visible：全库 180 个此类脚本的 value 快照都是 boolean。
@@ -3334,9 +3681,13 @@ cfg, source, pkgAbort.signal);
                 }
               }
             } else if (run.kind === "scalar") {
-              const ret = run.sandbox.callUpdate(Number(cur) || 0);
+              // 散字段写回真实消费槽（P2-1）：maxwidth/pointsize 是文字布局
+              // 字段（layer.textMaxwidth/textPointsize，直接写 layer.maxwidth 是
+              // 零读者），volume 是声音层音量（soundprops + HTMLAudio）。
+              const curSlot = scalarFieldSlot(run.layer, run.field);
+              const ret = run.sandbox.callUpdate(Number(curSlot.get()) || 0);
               const n = Number(ret);
-              if (Number.isFinite(n)) run.layer[run.field] = n;
+              if (Number.isFinite(n)) curSlot.set(n);
             } else {
               // 变换字段在 local 槽上收发（见 fieldSlot）；world 由 recomposeWorld 合成。
               const slot = run.slot || run.field;
@@ -3368,10 +3719,34 @@ cfg, source, pkgAbort.signal);
           if (audioSim.enabled) {
             hostAudio.pump();
             if (!hostAudio.active) {
-              if (audioDriverRef.current) audioDriverRef.current.pump();
-              else simAudio.update(t);
-            }
-            audioMod.fillAudioBuffers(audioViews, activeAudioSnapshot());
+            if (audioDriverRef.current) audioDriverRef.current.pump();
+            else simAudio.update(t);
+          }
+          // [we-scene patch] BGM 并入音频快照（必须在 fillAudioBuffers 前）：
+          // 自带声音层在播放时，它的频谱与当前源（模拟/注入/麦克风）逐频段取 max，
+          // 使「BGM + 音频反应」壁纸的音条能响应自身音乐。取一份临时快照合并，
+          // 不改驱动源/模拟器内部数组。
+          const bgmBands = bgm.readBands();
+          const baseSnap = activeAudioSnapshot();
+          if (bgmBands) {
+            // 在副本上合并，绝不就地改模拟器/注入源的内部数组（那会逐帧累积污染）。
+            const merged: any = {
+              left64: baseSnap.left64.slice(),
+              right64: baseSnap.right64.slice(),
+              left32: baseSnap.left32.slice(),
+              right32: baseSnap.right32.slice(),
+              left16: baseSnap.left16.slice(),
+              right16: baseSnap.right16.slice(),
+              level: baseSnap.level,
+              silent: false,
+            };
+            mergeBgmBands(merged, bgmBands, BGM_SPECTRUM_GAIN);
+            frameAudioSnapshot = merged;
+            audioMod.fillAudioBuffers(audioViews, merged);
+          } else {
+            frameAudioSnapshot = baseSnap;
+            audioMod.fillAudioBuffers(audioViews, baseSnap);
+          }
           }
           // [we-scene patch] 挂件跟随父 puppet 附着点。必须在对象脚本之后、绘制之前：
           // 从绑定姿势的 base origin 重写，加上当前姿势与绑定姿势的差。

@@ -34,6 +34,7 @@ const { createSimulatedWindowTitle, createSimulatedSystem } = await imp("rendere
 const { evalTextScript, evalObjectScript, makeCursorEventVec, Vec3: ScriptVec3 } = await imp("renderer/vendor/we-scene/render/text.js");
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
 const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
+const { flattenUserProperties } = await imp("renderer/vendor/we-scene/scene/user-props.js");
 
 const { check, errors } = createChecker();
 
@@ -510,7 +511,58 @@ const { check, errors } = createChecker();
     } catch {
       continue;
     }
+    // engine.userProperties 在真实宿主里永远是**全量属性表**（无 project.json 才
+    // 是 {}）。3163060610 的 init 直接读 engine.userProperties.m_auto_pick_color，
+    // 给空表会抛 TypeError、连错两次 errCount=2，媒体回调再来一次就三振熔断 ——
+    // 生产路径 scene-mount 恒传 flattenUserProperties(project.general.properties)，
+    // verifier 必须喂同一份，否则测的是生产里不存在的环境。
+    let liveUserProps = {};
+    try {
+      const project = JSON.parse(fs.readFileSync(join(LIB, id, "project.json"), "utf8"));
+      liveUserProps = flattenUserProperties((project && project.general && project.general.properties) || {});
+    } catch {
+      liveUserProps = {};
+    }
     let hit = false;
+    // 框架预跑（priming）：CAniClass / EventDispatcher 一类壁纸（3163060610）
+    // 由「引擎层」脚本在顶层把 helper 挂到共享 `shared`（eventDispatcher /
+    // aniScheduler / CAniClass…），业务脚本在 init / applyUserProperties 里读
+    // shared.eventDispatcher.registerListener。生产环境同场景**所有**沙箱共用
+    // 一个 textShared 且按场景对象顺序全部先实例化（顶层副作用先跑），业务脚本
+    // 后跑；离线只实例化媒体脚本时 helper 尚不存在 → registerListener of
+    // undefined，连错后三振熔断，是 harness 顺序缺口而非沙箱缺陷。
+    // 这里按场景顺序把全部脚本实例化一遍（顶层副作用即可，不驱动任何回调），
+    // 与生产装配同构。同一份源码只跑一次（seen 去重，与生产共享 factory 缓存同理）。
+    const wallShared = {};
+    const primeSeen = new Set();
+    const primeOpts = { shared: wallShared, userProperties: liveUserProps };
+    const primeWalk = (node) => {
+      if (Array.isArray(node)) {
+        for (const x of node) primeWalk(x);
+        return;
+      }
+      if (!node || typeof node !== "object") return;
+      for (const [k, v] of Object.entries(node)) {
+        if (k === "script" && typeof v === "string") {
+          if (primeSeen.has(v)) continue;
+          primeSeen.add(v);
+          const props = node.scriptproperties || node.scriptProperties || null;
+          try {
+            if (node.text !== undefined && typeof node.text === "object") {
+              evalTextScript(v, props, primeOpts);
+            } else {
+              evalObjectScript(v, props, primeOpts);
+            }
+          } catch {
+            // 无 export 的引擎层脚本 evalObjectScript 返回 null（正常）；
+            // 顶层 SyntaxError 等由后续真实统计路径计数，priming 不判失败。
+          }
+          continue;
+        }
+        primeWalk(v);
+      }
+    };
+    primeWalk(scene.objects || []);
     // 通用遍历：媒体回调挂在对象字段、效果常量、effect.visible、文字层等多处，
     // 按固定路径找会漏掉大半。
     const seen = new Set();
@@ -541,7 +593,10 @@ const { check, errors } = createChecker();
           scripts++;
           let sb = null;
           try {
-            sb = evalObjectScript(v, node.scriptproperties || node.scriptProperties || null, {});
+            sb = evalObjectScript(v, node.scriptproperties || node.scriptProperties || null, {
+              shared: wallShared,
+              userProperties: liveUserProps,
+            });
           } catch {
             sb = null;
           }
@@ -561,7 +616,7 @@ const { check, errors } = createChecker();
           const initVec = new ScriptVec3(1, 1, 1);
           try {
             sb.init(initVec);
-            sb.applyUserProperties({});
+            sb.applyUserProperties(liveUserProps);
           } catch {
             /* init 抛错由 errCount 记录，下面 disabled 检查会抓到熔断 */
           }

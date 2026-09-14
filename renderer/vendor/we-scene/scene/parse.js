@@ -269,6 +269,24 @@ export function parseScene(sceneJson, project) {
         }
         return Object.keys(out).length ? out : null
       })(),
+      // [we-scene patch] instanceoverride 里带 {script} 的键由脚本每帧驱动
+      //（音频响应粒子：rate 56 段 / colorn 18 / count 16 / size 8 / alpha 5，
+      // 2026-09 全库 104 段 / 29 张）。典型形态 update() 读 registerAudioBuffers
+      // 后 `return initialValue * (smooth*delta + min)`，宿主逐帧把返回值喂给
+      // ParticleSystem.setOverrideValue（rate/count/size/alpha 是轻量写口，
+      // 不重建 pool；colorn 见该写口的颜色处理）。controlpoint1 之类非倍率键
+      // 落到 setOverrideValue 的兜底分支（_ov[key]），先原样保留。
+      particleOverrideScripts: (() => {
+        const ov = o.instanceoverride
+        if (!ov || typeof ov !== 'object') return null
+        const out = {}
+        for (const [k, v] of Object.entries(ov)) {
+          if (v && typeof v === 'object' && typeof v.script === 'string' && v.script) {
+            out[k] = { script: v.script, scriptproperties: v.scriptproperties || null, value: v.value }
+          }
+        }
+        return Object.keys(out).length ? out : null
+      })(),
       sound: Array.isArray(o.sound) ? o.sound.filter((s) => typeof s === 'string') : [],
       soundprops: {
         volume: parseNum(o.volume, 1),
@@ -330,7 +348,13 @@ export function parseScene(sceneJson, project) {
       // 71 个纯 cursor 交互（无 update，靠回调改写别的图层）。
       objectScripts: (() => {
         const out = {}
-        for (const f of ['scale', 'origin', 'color', 'alpha', 'brightness', 'angles', 'visible']) {
+        // [we-scene patch] 白名单扩到散字段（P2-1，2026-09 共 25 段/12 张）：
+        // maxwidth/pointsize 是文字布局、volume 是声音层音量、intensity/exponent
+        // 是灯光参数（本仓无灯光对象，值存层上无害）。写回槽见 scene-mount 的
+        // fieldWriteSlot（maxwidth→textMaxwidth、pointsize→textPointsize、
+        // volume→soundprops.volume）。
+        for (const f of ['scale', 'origin', 'color', 'alpha', 'brightness', 'angles', 'visible',
+          'maxwidth', 'pointsize', 'volume', 'intensity', 'exponent']) {
           const v = o[f]
           if (v && typeof v === 'object' && typeof v.script === 'string' && v.script) {
             out[f] = { script: v.script, scriptproperties: v.scriptproperties || null, value: v.value }
@@ -358,10 +382,24 @@ export function parseScene(sceneJson, project) {
         .filter((a) => a && typeof a.animation === 'number')
         .map((a) => ({
           animation: a.animation,
+          // [we-scene patch] 层名：脚本经 thisLayer.getAnimationLayer(name)
+          // 控制特定 clip（3396722575 的「错帧」机制：init 停掉错位层，收到
+          // 帧事件后 play）。visible 是 {script} 时 parseBool 吃默认 true，
+          // 脚本装配后逐帧决定（见 scene-mount animLayerScriptRuns）。
+          name: typeof a.name === 'string' ? a.name : '',
+          visibleScript: a.visible && typeof a.visible === 'object' && typeof a.visible.script === 'string' && a.visible.script
+            ? { script: a.visible.script, scriptproperties: a.visible.scriptproperties || null, value: a.visible.value }
+            : null,
           visible: parseBool(a.visible, true),
           additive: parseBool(a.additive, false),
           blend: parseNum(a.blend, 1),
           rate: parseNum(a.rate, 1),
+          // 运行态：play()/stop() 控制（脚本），默认播放；不参与序列化。
+          playing: true,
+          paused: false,
+          play() { this.playing = true; this.paused = false },
+          pause() { this.paused = true },
+          stop() { this.playing = false; this.paused = false },
         })),
       // WE 的 solid 层：无 image/particle，或 image 指向内置 models/util/*（纯色层，无纹理）
       //
@@ -430,6 +468,11 @@ export function parseScene(sceneJson, project) {
       localOrigin: localSnapshot[i].origin,
       localScale: localSnapshot[i].scale,
       localAngles: localSnapshot[i].angles,
+      // [we-scene patch] 原始 local origin 快照（脚本 thisLayer.originalOrigin，
+      // 7 处拖拽「恢复初始位置」：resetPosition 把拖走的 origin 复位）。
+      // 必须是独立数组，不能与 localOrigin 同引用（否则拖拽写 localOrigin
+      // 会连带改掉「初始值」，复位永远回到当前点）。
+      originalOrigin: localSnapshot[i].origin.slice(),
       // 「渲染惰性纯容器」：父 scale 是否传给子层由父级这个标志决定，
       // 判据与 parse 合并阶段逐字相同（见 isRenderInert）。
       renderInert: isRenderInert(o),

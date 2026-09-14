@@ -224,6 +224,18 @@ export class ParticleSystem {
   }
 
   /**
+   * [we-scene patch] 逐帧写归一化颜色（instanceoverride.colorn 的 {script}，
+   * 音频驱动粒子变色）。_ov.color 只在 spawn 时作为新粒子基色（见 _compile 的
+   * color 初始化器），逐帧更新只影响之后出生的粒子——这正是 WE 语义（节拍变色
+   * 时新粒子换新色、已存在粒子保持出生色）。与 _applyOverride 不同，不重建
+   * pool（每帧重建会把全部存活粒子清空）。
+   */
+  setColorOverride(rgb) {
+    const a = Array.isArray(rgb) ? rgb : [rgb?.x || 0, rgb?.y || 0, rgb?.z || 0]
+    this._ov.color = [Number(a[0]) || 0, Number(a[1]) || 0, Number(a[2]) || 0]
+  }
+
+  /**
    * [we-scene patch] 关键帧动画的逐帧写回：与 _applyOverride（快照应用，重建
    * pool/编译参数）不同，这条只改对应倍率、不动任何重资源 —— 3233141951 龙烟
    * alpha 的 900 帧曲线（帧 608-830 掉到 0.01）每帧都要写一次，走

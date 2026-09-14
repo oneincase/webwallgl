@@ -528,6 +528,70 @@ const ids = fs.existsSync(LIB)
   }
 }
 
+// ---------- 11. 场景环境光：材质 LIGHTING combo → 图层基色乘 ambientcolor ----------
+//
+// 官方 genericimage2/3/4（genericparticle 另有 DOUBLESIDEDLIGHTING）在
+// `#if LIGHTING` 时 ambient = max(0.001, g_LightAmbientColor)*albedo，无直射
+// 灯（本仓不跑 PBR、语料 NORMALMAP 全 0）时结果 = albedo × ambientcolor。
+// 2026-09 全库扫描：仅 4 个 pass 开 LIGHTING（2872267921/2890473419/
+// 3351179520/3509243656），其余 4400+ pass 不受影响，这条断言同时守住
+// 「不要给未开光照的材质全局压暗」的回归红线。
+{
+  const renderer = await imp("renderer/vendor/we-scene/render/renderer.js");
+  const near3 = (a, b, eps = 1e-6) => a.every((x, i) => Math.abs(x - b[i]) <= eps);
+
+  // 纯函数数值语义
+  if (!near3(renderer.layerColorAmbient(false, [0.3, 0.3, 0.3]), [1, 1, 1]))
+    fail("未开 LIGHTING 时乘子必须是 [1,1,1]（不能全局压暗 99.9% 材质）");
+  if (!near3(renderer.layerColorAmbient(true, [0.3, 0.3, 0.3]), [0.3, 0.3, 0.3]))
+    fail("开 LIGHTING 时应逐分量返回 ambientcolor");
+  if (!near3(renderer.layerColorAmbient(true, [0, 0, 0]), [0.001, 0.001, 0.001]))
+    fail("纯黑 ambient 必须有 0.001 下限（官方 max(0.001, g_LightAmbientColor)）");
+
+  // 语料面貌：恰好这 4 张有 LIGHTING=1 的 genericimage* pass（数量变了要人看一眼）
+  const litWalls = new Set();
+  let litPasses = 0;
+  for (const id of ids) {
+    let d;
+    try {
+      const pkg = parsePkg(new Uint8Array(fs.readFileSync(join(LIB, id, "scene.pkg"))));
+      for (const e of pkg.entries) {
+        if (!e.name.endsWith(".json")) continue;
+        let j;
+        try { j = JSON.parse(dec.decode(getEntry(pkg, e.name))); } catch { continue; }
+        for (const p of j.passes || []) {
+          if (p.combos && /genericimage|generic\d|^generic$/.test(String(p.shader || "")) &&
+              Number(p.combos.LIGHTING) === 1) {
+            litPasses++;
+            litWalls.add(id);
+          }
+        }
+      }
+    } catch { /* 个别包读取失败不影响 */ }
+  }
+  if (litPasses !== 4) fail(`LIGHTING=1 的 genericimage pass 应是 4（台账），实得 ${litPasses}`);
+  const expectWalls = ["2872267921", "2890473419", "3351179520", "3509243656"];
+  for (const w of expectWalls) {
+    if (!litWalls.has(w)) fail(`LIGHTING 壁纸 ${w} 未扫到（材质路径/combo 解析回退？）`);
+  }
+  ok(`环境光：${litPasses} 个 LIGHTING pass / ${litWalls.size} 张（${[...litWalls].join(",")}）；乘子语义锁定`);
+
+  // 接线断言：scene-mount 标 lightingEnabled，renderer color4 用它
+  const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  if (!/lightingEnabled\s*=\s*true/.test(msrc))
+    fail("scene-mount 未把材质 LIGHTING combo 标到 layer.lightingEnabled");
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  if (!/layerColorAmbient\(layer\.lightingEnabled, sceneAmbient\)/.test(rsrc))
+    fail("renderer color4 未按 lightingEnabled 乘场景 ambient");
+  if (!/sceneAmbient\s*=\s*parseVec3Local\(general\.ambientcolor/.test(rsrc))
+    fail("renderer 未在每帧从 general.ambientcolor 读场景环境光");
+  if (!/ambient:\s*layerColorAmbient\(layer\.lightingEnabled, sceneAmbient\)/.test(rsrc))
+    fail("renderer 未把环境光乘子传给真 3D 网格 puppetDrawFn（3509243656 球体/天空盒）");
+  // 真 3D MDL 材质路径（parseMDL.materialPath）也要标 lightingEnabled
+  if (!/pass0\?\.combos\?\.LIGHTING/.test(msrc))
+    fail("scene-mount 未在静态 MDL 材质解析 LIGHTING combo");
+}
+
 for (const n of notes) console.log("  ✓ " + n);
 if (errors.length) {
   console.log("");

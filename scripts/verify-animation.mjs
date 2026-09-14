@@ -548,6 +548,11 @@ const kf = (frame, value, front, back) => ({
             hi.push(b);
             scale.push(mag);
           }
+          // 空通道（`c2: []`，3163060610 小云1 的 z）：createAnimation 会把它
+          // 收进 channels（[] 仍是数组），sampleChannel 对零关键帧恒返回 0。
+          // 这里 lo/hi 保持 ±Infinity 是度量盲区，不能再拿它算越界 —— 否则 0
+          // 被判 Infinity 倍越界（121 个假阳性）。空通道改走「必须恒 0」断言。
+          const emptyChannel = chans.map((c) => c.length === 0);
 
           const len = Number(opts.length) > 0 ? Number(opts.length) : 60;
           for (let f = -5; f <= len + 5; f += Math.max(0.5, len / 120)) {
@@ -557,6 +562,18 @@ const kf = (frame, value, front, back) => ({
             for (let i = 0; i < arr.length; i++) {
               if (!Number.isFinite(arr[i])) {
                 badValue++;
+                continue;
+              }
+              if (emptyChannel[i]) {
+                // 空通道恒为 0（sampleChannel 的零关键帧分支），任何非零
+                // 都是运行时把空通道错误插值成了别的值。
+                if (arr[i] !== 0) {
+                  outOfRange++;
+                  if (Math.abs(arr[i]) > worstOver) {
+                    worstOver = Math.abs(arr[i]);
+                    worstWhere = `${id}/${field} 空通道${i} 应为 0，实得 ${arr[i].toFixed(3)}`;
+                  }
+                }
                 continue;
               }
               const over = Math.max(arr[i] - hi[i], lo[i] - arr[i]) / scale[i];
@@ -688,9 +705,11 @@ const kf = (frame, value, front, back) => ({
   // 第四处是「按沙箱回填」：对象脚本队列按 hasUpdate 筛过，漏掉无 export 的引擎层
   // 脚本（3786330502 id=885 往 shared 上装 helper）。那份 engine 不回填就冻结在 0，
   // helper 闭包读的正是它，依赖 runtime 的动画闸门永不开启。四处必须同时基。
+  // [2026-09 P2-1] 新增粒子 instanceoverride 脚本、animationlayers.visible
+  // 脚本两个逐帧队列，各补一处 frametime=animDt，共 6 处。
   check(
-    (mountSrc.match(/frametime = animDt/g) || []).length === 4,
-    "四处 engine.frametime（效果开关 / general / 对象脚本 / 按沙箱回填）都应改用 animDt",
+    (mountSrc.match(/frametime = animDt/g) || []).length === 6,
+    "六处 engine.frametime（效果开关 / general / 对象脚本 / 按沙箱回填 / 粒子 override 脚本 / animLayer 脚本）都应用 animDt",
   );
 
   // 2) 数值判据：模拟渲染循环，两种推进方式各跑一遍，比对与真实时钟的偏差。
@@ -1335,7 +1354,9 @@ const kf = (frame, value, front, back) => ({
         }
       }
     }
-    check(groups === 21, `全库应有 21 个联动组作用域（对象字段 12 + 常量 9，实得 ${groups}）`);
+    // 数据面貌断言（语料 247 张 / 2026-09 实测：对象字段 13 + 常量 11 = 24；
+    // 旧值 21 = 12+9 是 178 张语料时的数字，3163060610 时钟主题贡献了多组）。
+    check(groups === 24, `全库应有 24 个联动组作用域（对象字段 13 + 常量 11，实得 ${groups}）`);
     console.log(`   联动组回归：${groups} 组 / ${linked} 个 child 链接 / 120 帧全部有限`);
   }
 

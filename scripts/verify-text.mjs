@@ -1146,8 +1146,14 @@ function runRibbonEffects() {
       errors.push("scene-mount.ts 仍按层长边扩文字边距");
     }
     if (!/shared:\s*textShared/.test(mount)) errors.push("scene-mount.ts 未把 textShared 注入 setConstantScriptRuntime");
-    if (!/inputView/.test(mount.slice(mount.indexOf("setConstantScriptRuntime"), mount.indexOf("setConstantScriptRuntime") + 500))) {
-      errors.push("scene-mount.ts 未把 inputView 注入 setConstantScriptRuntime（聚光灯 delayedPointer 读不到光标）");
+    // 定位真正的调用点（`setConstantScriptRuntime?.(`），不能用 indexOf 锚
+    // 字符串：前面的注释/注册代码也含这个名字，slice 窗口会落在无关代码上。
+    {
+      const callAt = mount.indexOf("setConstantScriptRuntime?.(");
+      const win = callAt >= 0 ? mount.slice(callAt, callAt + 1200) : "";
+      if (!/inputView/.test(win)) {
+        errors.push("scene-mount.ts 未把 inputView 注入 setConstantScriptRuntime（聚光灯 delayedPointer 读不到光标）");
+      }
     }
     if (!/flattenUserProperties\(/.test(mount)) {
       errors.push("scene-mount.ts 未用 flattenUserProperties 构建 userProperties");
@@ -1977,8 +1983,9 @@ function runEngineTimers() {
     const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
     if (!msrc.includes("wtimers.createEngineTimers(")) errors.push("scene-mount 未创建 engineTimers（P1-1 接线被拆）");
     const spreadCount = (msrc.match(/\.\.\.timerOpts/g) || []).length;
-    if (spreadCount !== 4)
-      errors.push(`scene-mount 四个直连 eval 点（文字/效果开关/对象字段/general）应各有一处 ...timerOpts，实得 ${spreadCount}`);
+    // 4 个直连 eval 点 + 粒子 override 脚本 + animLayer 脚本（P2-1 新增）= 6
+    if (spreadCount !== 6)
+      errors.push(`四个直连 eval 点 + 两个粒子脚本队列应各有一处 ...timerOpts，实得 ${spreadCount}`);
     if (!/timers:\s*engineTimers/.test(msrc))
       errors.push("setConstantScriptRuntime 未传 timers: engineTimers（效果常量定时器缺口，renderer 只提取白名单字段）");
     if (!/engineTimers\.dispose\(\)/.test(msrc)) errors.push("场景卸载未 engineTimers.dispose()（未触发回调会写穿死层）");
@@ -2298,6 +2305,556 @@ function runEngineCanvasSize() {
   return errors;
 }
 
+// ---------- resizeScreen 生命周期 + engine.timeOfDay 逐秒回填 ----------
+//
+// resizeScreen 是官方第 8 个生命周期事件：`resizeScreen(size: Vec2)`，画布尺寸
+// 变化时派发（3396722575 / 3405117965：横屏按 size.x/1920、竖屏按 size.y/1080
+// 缩放常量）。此前沙箱不收集这个钩子，纯 resize 脚本（无 update/任何别的
+// 导出）被闸门整个丢弃。
+//
+// timeOfDay 是一天中的时刻 [0,1)：2134765860 夜灯 / 2406282996 / 3151551777
+// 的昼夜脚本读它，此前只在沙箱构造时算一次后冻结，壁纸挂几小时也不入夜。
+function runResizeScreen() {
+  const errors = [];
+  const eq = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+
+  // ---- 1) 纯 resizeScreen 脚本必须被两个工厂保留（闸门第五族）----
+  {
+    const pure = `
+var layout = [];
+export function resizeScreen(size) {
+  layout = [size.x, size.y, size.width, size.height];
+}
+export function getLayout() { return layout; }`;
+    const objSb = wtext.evalObjectScript(pure, null, {});
+    if (!objSb) errors.push("对象沙箱：纯 resizeScreen 脚本被闸门丢弃（应有第六族保留）");
+    if (objSb && !objSb.hasResizeHook) errors.push("对象沙箱：hasResizeHook 应为 true");
+    if (objSb && typeof objSb.callResize !== "function")
+      errors.push("对象沙箱：callResize 应是函数");
+    const textSb = wtext.evalTextScript(pure, null, {});
+    if (!textSb) errors.push("文字沙箱：纯 resizeScreen 脚本被闸门丢弃");
+    if (textSb && !textSb.hasResizeHook) errors.push("文字沙箱：hasResizeHook 应为 true");
+  }
+
+  // ---- 2) 官方签名是单个 Vec2；调用后 engine.screenResolution 同步刷新 ----
+  {
+    const sb = wtext.evalObjectScript(
+      `var seen = null;
+export function update() { return seen ? seen[0] + '/' + seen[1] : 'none'; }
+export function resizeScreen(size) { seen = [size.x, size.y]; }`,
+      null,
+      { screenResolution: { x: 1920, y: 1080 } },
+    );
+    // 防御：两个参数的错误调用形态不得生效（实现里必须按 Vec2 传）
+    sb.callResize(2560, 1440);
+    if (sb.callUpdate() !== "2560/1440")
+      errors.push("resizeScreen：size.x/size.y 未按单个 Vec2 收到（2560/1440）");
+    if (!eq(sb.engine.screenResolution.x, 2560) || !eq(sb.engine.screenResolution.y, 1440))
+      errors.push("resizeScreen：engine.screenResolution 未同步到新尺寸");
+  }
+
+  // ---- 3) canvasSize 不随 resize 变化（它是场景正交设计尺寸，不是屏幕）----
+  {
+    const sb = wtext.evalObjectScript(
+      `var c = null;
+export function update(){ return c ? c[0] + '/' + c[1] : 'none'; }
+export function resizeScreen(size) { c = [engine.canvasSize.x, engine.canvasSize.y]; }`,
+      null,
+      { canvasSize: { width: 4096, height: 2296 }, screenResolution: { x: 1920, y: 1080 } },
+    );
+    sb.callResize(1280, 720);
+    if (sb.callUpdate() !== "4096/2296")
+      errors.push("resizeScreen 改动了 engine.canvasSize（设计尺寸必须保持 4096×2296）");
+  }
+
+  // ---- 4) 三振熔断：resize 抛错 3 次后 disabled ----
+  {
+    // 带 update：避免依赖「纯 resize 脚本被闸门保留」（那个性质由第 1 组测），
+    // 这里只测熔断本身。
+    const sb = wtext.evalObjectScript(
+      `export function update(){ return 1; }
+export function resizeScreen() { throw new Error('boom'); }`,
+      null,
+      {},
+    );
+    if (!sb) {
+      errors.push("resizeScreen：熔断用例沙箱创建失败");
+    } else {
+      sb.callResize(10, 10); sb.callResize(10, 10);
+      if (sb.disabled) errors.push("resizeScreen：两次错误就熔断（应三振）");
+      sb.callResize(10, 10);
+      if (!sb.disabled) errors.push("resizeScreen：三次错误后未熔断");
+    }
+  }
+
+  // ---- 5) 真实语料：3396722575 / 3405117965 的 resize 模板必须按分辨率缩放 ----
+  //
+  // 模板（两份语料源码逐字相同）：
+  //   init(value){ originalValue = value; resizeScreen(engine.screenResolution); }
+  //   resizeScreen(size){ thisObject.scale = originalValue.multiply(
+  //       size.x > size.y ? size.x/1920 : size.y/1080); }
+  for (const id of ["3396722575", "3405117965"]) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let scene;
+    try {
+      const pkg = pkgContainer.parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+      scene = JSON.parse(new TextDecoder().decode(pkgContainer.getEntry(pkg, "scene.json")));
+    } catch {
+      continue;
+    }
+    // 找到那段 resize 模板（constantshadervalues.scale.script）
+    let src = null;
+    (function walk(n) {
+      if (Array.isArray(n)) return n.forEach(walk);
+      if (!n || typeof n !== "object") return;
+      for (const [k, v] of Object.entries(n)) {
+        if (k === "script" && typeof v === "string" && /export function resizeScreen/.test(v) && /originalValue/.test(v)) {
+          if (!src) src = v;
+        } else walk(v);
+      }
+    })(scene);
+    if (!src) {
+      errors.push(`${id}：resizeScreen 模板脚本未找到（结构变了？）`);
+      continue;
+    }
+    // 模板的 originalValue.multiply(k) 是**原地变异**（Vec3.multiply 语义），
+    // 横屏 / 竖屏两档各自用新沙箱 + 新 orig 测，不能连调。
+    const make = (w, h) => {
+      const l = { scale: [1, 1, 1], localScale: [1, 1, 1], origin: [0, 0, 0] };
+      const sb = wtext.evalObjectScript(src, null, { layer: l, screenResolution: { x: w, y: h } });
+      return { sb, l };
+    };
+    // 横屏：init 内手动 resize(3840×2160)，orig=1 → ×(3840/1920)=2.0
+    {
+      const { sb, l } = make(3840, 2160);
+      if (!sb) {
+        errors.push(`${id}：resize 模板沙箱创建失败`);
+        continue;
+      }
+      sb.init(new wtext.Vec3(1, 1, 1));
+      if (!eq(l.localScale[0], 2.0) || !eq(l.localScale[1], 2.0))
+        errors.push(`${id}：init 内手动 resize(3840×2160) 后 scale 应 =2.0，实得 ${l.localScale[0]}`);
+    }
+    // 横屏挂着、窗口转成竖屏：init 按 1920×1080（×1），宿主派发 resize(1080,1920)
+    // 后走 size.y/1080。orig 在 init 后仍是 1（×1 不变异），派发一次正好 ×k。
+    {
+      const { sb, l } = make(1920, 1080);
+      sb.init(new wtext.Vec3(1, 1, 1));
+      sb.callResize(1080, 1920);
+      const k = 1920 / 1080;
+      if (!eq(l.localScale[0], k, 1e-4) || !eq(l.localScale[1], k, 1e-4))
+        errors.push(`${id}：竖屏 resize 后 scale 应 =${k.toFixed(4)}，实得 ${l.localScale[0]},${l.localScale[1]}`);
+    }
+  }
+
+  // ---- 6) timeOfDay：沙箱能收到构造值，逐帧回填走 engine.timeOfDay 赋值 ----
+  {
+    const sb = wtext.evalObjectScript(
+      `export function update(){ return engine.timeOfDay; }`,
+      null,
+      { timeOfDay: 0.25 },
+    );
+    if (!eq(sb.callUpdate(), 0.25)) errors.push("engine.timeOfDay 构造值未透传（应 0.25）");
+    sb.engine.timeOfDay = 0.75;
+    if (!eq(sb.callUpdate(), 0.75)) errors.push("engine.timeOfDay 回填不生效（模拟宿主每秒写入）");
+  }
+
+  // ---- 7) 接线断言：五个 eval 点 + 常量沙箱必须接到 resize / timeOfDay ----
+  {
+    const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    if (!/const resizeHooks = new Set/.test(msrc))
+      errors.push("scene-mount 缺少 resizeHooks 注册表");
+    const regCalls = (msrc.match(/registerResizeHook\(/g) || []).length;
+    // 五个 eval 点各一处调用：文字 / 常量 onSandbox / 效果开关 / 对象字段 / general。
+    // 定义形如 `const registerResizeHook = (sb)`（= 号隔开）不被本正则命中。
+    // 5 个 eval 点 + 粒子 override 脚本 + animLayer 脚本 = 7 处
+    if (regCalls !== 7)
+      errors.push(`五个 eval 点 + 两个粒子脚本队列都应登记 resize 沙箱，实得 ${regCalls} 处调用`);
+    if (!/cssW !== lastResizeW[\s\S]{0,300}dispatchResize\(cssW, cssH\)/.test(msrc))
+      errors.push("resize 必须按 CSS 尺寸变化派发（含首帧 lastResizeW=0 哨兵）");
+    if (!/sb\.engine\.timeOfDay = timeOfDayValue/.test(msrc))
+      errors.push("scene-mount 未逐秒回填 engine.timeOfDay");
+    if (!/let timeOfDayValue/.test(msrc))
+      errors.push("scene-mount 缺少 timeOfDayValue 秒级缓存");
+    const todOpts = (msrc.match(/timeOfDay: timeOfDayValue/g) || []).length;
+    // 对象字段 + 效果开关 + general + 文字 四个直连 eval 点
+    if (todOpts < 4) errors.push(`四个直连 eval 点都应传 timeOfDay 初值，实得 ${todOpts}`);
+    const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/sb\.engine\.timeOfDay = daytimeFraction\(\)/.test(rsrc))
+      errors.push("renderer.js 常量沙箱未逐帧回填 timeOfDay（daytimeFraction）");
+    if (!/sb\.hasResizeHook\) && constScriptSink/.test(rsrc))
+      errors.push("renderer.js onSandbox 未把 hasResizeHook 的惰性常量沙箱反向登记给宿主");
+  }
+
+  return errors;
+}
+
+// ---------- SceneScript localStorage：按壁纸共享 + 跨会话持久（P1-2） ----------
+//
+// WE 的 localStorage 不是浏览器 DOM storage：同一张壁纸的全部脚本（五个 eval
+// 点）共享一份、跨重挂/重启保留，另有 LOCATION_GLOBAL 跨壁纸位置。此前是
+// **每脚本一个进程内 Map**，脚本间互不可见、重挂即丢（3238423642 点击计数、
+// 3292361861、3786330502 等 39 处 / 11 张）。
+function runStorage() {
+  const errors = [];
+  const storageMod = wtext; // makeSandboxStorage 已 re-export
+
+  // 内存 KV，模拟宿主文件后端（host 的 .we-state/<id>.json 是文件版同契约）
+  const memProvider = (m = new Map()) => ({
+    get: (k) => (m.has(k) ? m.get(k) : null),
+    set: (k, v) => m.set(k, String(v)),
+    remove: (k) => m.delete(k),
+    clear: () => m.clear(),
+    keys: () => [...m.keys()],
+  });
+
+  // ---- 1) 基础 API + 别名 + 字符串化 ----
+  {
+    const s = storageMod.makeSandboxStorage();
+    s.setItem("k", 5);
+    if (s.getItem("k") !== "5") errors.push("localStorage：setItem 必须字符串化");
+    if (s.length !== 1 || s.key(0) !== "k") errors.push("localStorage：length/key 不对");
+    s.set("a", "x"); // 非标准别名
+    if (s.get("a") !== "x") errors.push("localStorage：set/get 别名缺失");
+    s.remove("a");
+    if (s.getItem("a") !== null) errors.push("localStorage：remove 别名无效");
+    s.removeItem("k");
+    if (s.length !== 0) errors.push("localStorage：removeItem 后应为空");
+  }
+
+  // ---- 2) 两个 storage 实例共享同一 screen provider → 跨脚本可见 ----
+  {
+    const p = memProvider();
+    const a = storageMod.makeSandboxStorage(p);
+    const b = storageMod.makeSandboxStorage(p);
+    a.setItem("shared", "yes");
+    if (b.getItem("shared") !== "yes")
+      errors.push("localStorage：同壁纸脚本必须共享一份（provider 注入未生效）");
+  }
+
+  // ---- 3) WE 文档名 delete + LOCATION_GLOBAL ----
+  {
+    const sm = new Map(); const gm = new Map();
+    const s = storageMod.makeSandboxStorage(memProvider(sm), memProvider(gm));
+    if (s.LOCATION_SCREEN !== 0 || s.LOCATION_GLOBAL !== 1)
+      errors.push("localStorage：LOCATION_SCREEN/GLOBAL 常量应为 0/1");
+    s.setItem("g", "v", 1);
+    if (gm.get("g") !== "v" || sm.has("g"))
+      errors.push("localStorage：LOCATION_GLOBAL 必须落到全局后端而非 screen");
+    if (s.getItem("g", 1) !== "v") errors.push("localStorage：getItem 带 LOCATION_GLOBAL 读取失败");
+    s.delete("g", 1);
+    if (gm.has("g")) errors.push("localStorage：delete(name, LOCATION_GLOBAL) 无效");
+    s.setItem("s", "v", 0); s.clear(1);
+    if (!sm.has("s")) errors.push("localStorage：clear(GLOBAL) 不得清掉 SCREEN 数据");
+    s.clear(0);
+    if (sm.size !== 0) errors.push("localStorage：clear(SCREEN) 未清空");
+  }
+
+  // ---- 4) 默认参数 = LOCATION_SCREEN ----
+  {
+    const sm = new Map(); const gm = new Map();
+    const s = storageMod.makeSandboxStorage(memProvider(sm), memProvider(gm));
+    s.setItem("d", "1");
+    if (!sm.has("d") || gm.size !== 0) errors.push("localStorage：缺省位置必须是 SCREEN");
+  }
+
+  // ---- 5) 无 provider 时退化内存 Map（离线 verifier 环境），不抛 ----
+  {
+    let s;
+    try { s = storageMod.makeSandboxStorage(null, null); }
+    catch (e) { errors.push("localStorage：无 provider 时应退化内存 Map 而非抛错: " + e.message); }
+    if (s) { s.setItem("x", "1"); if (s.getItem("x") !== "1") errors.push("localStorage：内存退化读写失败"); }
+  }
+
+  // ---- 6) 沙箱真能从脚本里读写：文字 + 对象两工厂，且共享 ----
+  {
+    const p = memProvider();
+    const st = storageMod.makeSandboxStorage(p);
+    const obj = wtext.evalObjectScript(
+      `let n = parseInt(localStorage.getItem('clicks') || '0', 10);
+export function cursorClick(){ n++; localStorage.setItem('clicks', String(n)); }
+export function update(){ return n; }`,
+      null, { storage: st });
+    const reader = wtext.evalTextScript(
+      `export function update(){ return 'r:' + (localStorage.getItem('clicks') || '0'); }`,
+      null, { storage: st });
+    obj.callCursor("cursorClick", { worldPosition: { x: 0, y: 0, z: 0 } });
+    if (reader.callUpdate("") !== "r:1")
+      errors.push("localStorage：对象脚本写入后文字脚本读不到（工厂未共享 opts.storage）");
+  }
+
+  // ---- 7) 接线断言：五个 eval 点 + renderer 常量点都传同一份 storage ----
+  {
+    const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    if (!/const sceneStorage = createSceneStorage/.test(msrc))
+      errors.push("scene-mount 未创建按壁纸共享的 sceneStorage");
+    const inj = (msrc.match(/storage: sceneStorage/g) || []).length;
+    // 5 个 eval 点 + 粒子 instanceoverride 脚本 + animationlayers.visible
+    // 脚本（2026-09 P2-1 新增两个逐帧队列，同样共享壁纸存储）= 7 处。
+    if (inj !== 7) errors.push(`五个 eval 点 + 两个粒子脚本队列都应注入 storage: sceneStorage，实得 ${inj}`);
+    if (!/cfg\.storageProvider/.test(msrc))
+      errors.push("scene-mount 未支持 cfg.storageProvider（宿主文件后端入口）");
+    const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/storage: scriptStorage \|\| undefined/.test(rsrc))
+      errors.push("renderer.js 常量沙箱未透传 storage");
+    // 引擎模块零 DOM：storage.js 不得 import 任何宿主模块
+    const ssrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/storage.js"), "utf8");
+    if (/^\s*import\s/m.test(ssrc))
+      errors.push("storage.js 必须零 import（纯逻辑，Node 可载、verify-arch 契约）");
+  }
+
+  // ---- 8) 全库语料：含 localStorage 的脚本在共享 storage 下冒烟不炸 ----
+  {
+    let scanned = 0; const walls = new Set(); const bad = [];
+    for (const item of fs.readdirSync(LIB)) {
+      const dir = join(LIB, item);
+      if (!fs.statSync(dir).isDirectory()) continue;
+      let pkgPath = join(dir, "scenes/scene.pkg");
+      if (!fs.existsSync(pkgPath)) pkgPath = join(dir, "scene.pkg");
+      if (!fs.existsSync(pkgPath)) continue;
+      let pkg;
+      try { pkg = parsePkg(fs.readFileSync(pkgPath)); } catch { continue; }
+      const sj = getEntry(pkg, "scene.json");
+      if (!sj) continue;
+      let scene;
+      try { scene = JSON.parse(readText(sj).replace(/^﻿/, "")); } catch { continue; }
+      // 同壁纸共享一份 storage（模拟 scene-mount）
+      const st = storageMod.makeSandboxStorage();
+      const visit = (node, isText) => {
+        if (node === null || typeof node !== "object") return;
+        if (Array.isArray(node)) { node.forEach((x) => visit(x, isText)); return; }
+        if (typeof node.script === "string" && /\blocalStorage\b/.test(node.script)) {
+          scanned++; walls.add(item);
+          try {
+            const sb = isText
+              ? wtext.evalTextScript(node.script, node.scriptproperties || null, { storage: st })
+              : wtext.evalObjectScript(node.script, node.scriptproperties || null, { storage: st });
+            if (sb) {
+              sb.init(undefined);
+              sb.applyUserProperties({});
+              for (let i = 0; i < 5; i++) sb.callUpdate(isText ? "" : undefined);
+            }
+          } catch (e) {
+            bad.push(`${item}: ${String((e && e.message) || e).slice(0, 80)}`);
+          }
+        }
+        for (const [k, v] of Object.entries(node)) {
+          if (k === "script") continue;
+          visit(v, k === "text" || isText);
+        }
+      };
+      visit(scene, false);
+    }
+    // 语料下限（PLAN 台账：39 处 / 11 张）。库变小会提醒人看一眼。
+    if (scanned < 30) errors.push(`localStorage 语料扫描仅 ${scanned} 段（台账 ≈39，解析/收集可能回退）`);
+    if (walls.size < 10) errors.push(`localStorage 壁纸数仅 ${walls.size}（台账 ≈11）`);
+    if (bad.length) errors.push(`localStorage 语料冒烟失败 ${bad.length} 段：${bad.slice(0, 3).join(" | ")}`);
+  }
+
+  return errors;
+}
+
+// ---------- P2-1 未装配挂点：粒子 override 脚本 / animLayer 脚本 / 散字段 ----------
+async function runP21Scripts() {
+  const errors = [];
+  const parseScene = parseMod.parseScene;
+
+  // ---- 1) instanceoverride 脚本被 parse 提取 ----
+  {
+    const scene = {
+      objects: [{
+        particle: "particles/p.json",
+        instanceoverride: {
+          rate: { value: 1, script: "export function update(){ return 1; }" },
+          colorn: { value: "1 1 1", script: "export function update(){ return {x:1,y:0,z:0}; }" },
+          alpha: { value: 1, animation: { options: { fps: 30, length: 10 }, c0: [] } }, // 动画，不应进 scripts
+        },
+      }],
+    };
+    const ps = parseScene(scene, null);
+    const ov = ps.layers[0].particleOverrideScripts;
+    if (!ov || !ov.rate || !ov.colorn) errors.push("particleOverrideScripts 未提取 rate/colorn 脚本");
+    if (ov && ov.alpha) errors.push("particleOverrideScripts 误收了 {animation} 键（应只进 particleOverrideAnimations）");
+    if (!ps.layers[0].particleOverrideAnimations?.alpha) errors.push("alpha 关键帧应仍进 particleOverrideAnimations");
+  }
+
+  // ---- 2) rate 脚本驱动粒子倍率（离线：沙箱返回值 → setOverrideValue）----
+  {
+    const mk = () => ({
+      maxcount: 100,
+      emitter: [{ name: "sphererandom", rate: 10, distancemin: 1, distancemax: 2 }],
+      initializer: [{ name: "lifetimerandom", min: 5, max: 5 }],
+      operator: [], renderer: [{ name: "billboard" }],
+    });
+    const { ParticleSystem } = await importParticle();
+    const ps = new ParticleSystem(null, mk(), { rate: 1 }, {});
+    // 模拟 scene-mount：update 返回 0（静音门）→ setOverrideValue('rate', 0)
+    ps.setOverrideValue("rate", 0);
+    let fired = 0;
+    const stub = { spawn: () => { fired++; } };
+    // 直接断言倍率写口（rateMul）而非内部 spawn，避免依赖实现细节
+    if (ps._ov.rateMul !== 0) errors.push("setOverrideValue('rate',0) 未把 rateMul 置 0");
+    void stub;
+  }
+
+  // ---- 3) colorn 归一化颜色写口（新粒子不读旧色）----
+  {
+    const mk = () => ({
+      maxcount: 10,
+      emitter: [{ name: "sphererandom", rate: 0, distancemin: 1, distancemax: 2 }],
+      initializer: [{ name: "lifetimerandom", min: 1, max: 1 }, { name: "sizerandom", min: 4, max: 4 }],
+      operator: [], renderer: [{ name: "billboard" }],
+    });
+    const { ParticleSystem } = await importParticle();
+    const ps = new ParticleSystem(null, mk(), null, {});
+    ps.setColorOverride([0.2, 0.4, 0.8]);
+    if (!ps._ov.color || Math.abs(ps._ov.color[0] - 0.2) > 1e-6 || Math.abs(ps._ov.color[2] - 0.8) > 1e-6)
+      errors.push("setColorOverride 未写入归一化 _ov.color");
+    // 不重建 pool（逐帧安全）
+    const poolLen = ps.pool.length;
+    ps.setColorOverride([1, 0, 0]);
+    if (ps.pool.length !== poolLen) errors.push("setColorOverride 不应重建 pool");
+  }
+
+  // ---- 4) animationlayers 保留 name + visibleScript，play/stop 控制 ----
+  {
+    const scene = { objects: [{
+      image: "models/x.json",
+      animationlayers: [
+        { animation: 1, name: "身体", visible: true },
+        { animation: 2, name: "头部转动", visible: { value: true, script: "export function init(){ thisLayer.getAnimationLayer('头部转动').stop(); } export function animationEvent(){}" } },
+      ],
+    }] };
+    const ps2 = parseScene(scene, null);
+    const als = ps2.layers[0].animationLayers;
+    if (als[1].name !== "头部转动") errors.push("animationLayers 未保留 name");
+    if (!als[1].visibleScript?.script) errors.push("animationLayers.visible 脚本未提取");
+    if (typeof als[0].play !== "function" || typeof als[0].stop !== "function")
+      errors.push("animationLayer 缺 play/stop 运行态");
+    als[1].stop();
+    if (als[1].playing !== false) errors.push("stop() 未把 playing 置 false");
+    als[1].play();
+    if (als[1].playing !== true) errors.push("play() 未恢复 playing");
+  }
+
+  // ---- 5) getAnimationLayer(name) 返回真层控制器并能 stop（沙箱）----
+  {
+    const layer = {
+      id: 1, name: "p", origin: [0, 0, 0], scale: [1, 1, 1],
+      animationLayers: [
+        { animation: 1, name: "身体", visible: true, playing: true, play() { this.playing = true; }, stop() { this.playing = false; } },
+        { animation: 2, name: "头", visible: true, playing: true, play() { this.playing = true; }, stop() { this.playing = false; } },
+      ],
+    };
+    const sb = wtext.evalObjectScript(
+      "export function init(){ thisLayer.getAnimationLayer('头').stop(); }\nexport function animationEvent(){}",
+      null, { layer });
+    if (!sb) errors.push("getAnimationLayer 测试沙箱创建失败");
+    else {
+      sb.init();
+      if (layer.animationLayers[1].playing !== false) errors.push("getAnimationLayer('头').stop() 未作用到具名层");
+      if (layer.animationLayers[0].playing !== true) errors.push("stop 误伤了其它动画层");
+    }
+  }
+
+  // ---- 6) 散字段白名单 + 真实槽位（maxwidth/pointsize/volume）----
+  {
+    const scene = { objects: [
+      { image: "a.tex", maxwidth: { value: 100, script: "export function update(){ return 200; }" } },
+      { text: "hi", pointsize: { value: 12, script: "export function update(){ return 24; }" } },
+    ] };
+    const ps3 = parseScene(scene, null);
+    if (!ps3.layers[0].objectScripts?.maxwidth) errors.push("maxwidth 脚本未进 objectScripts 白名单");
+    if (!ps3.layers[1].objectScripts?.pointsize) errors.push("pointsize 脚本未进 objectScripts 白名单");
+  }
+
+  // ---- 7) originalOrigin 快照独立 + 代理读取 ----
+  {
+    const layer = { id: 1, name: "l", origin: [5, 5, 0], localOrigin: [5, 5, 0], originalOrigin: [5, 5, 0], scale: [1, 1, 1] };
+    layer.localOrigin[0] = 50; // 拖拽改了 local
+    const sb = wtext.evalObjectScript("export function update(){ return thisLayer.originalOrigin.x; }", null, { layer });
+    if (sb.callUpdate() !== 5) errors.push("originalOrigin 应返回初始 5（不随 localOrigin 拖拽变化）");
+  }
+
+  // ---- 8) getMaterial 不返回 null 且可写（Dino Run applyUserProperties 不熔断）----
+  {
+    const layer = { id: 1, name: "m", origin: [0, 0, 0], scale: [1, 1, 1], effects: [] };
+    const sb = wtext.evalObjectScript(
+      "export function applyUserProperties(p){ thisObject.getMaterial(0).raythreshold = 0.52; }", null, { layer });
+    let threw = false;
+    try { sb.applyUserProperties({ level: "mountains" }); } catch { threw = true; }
+    if (threw) errors.push("getMaterial(0) 返回 null/不可写导致 applyUserProperties 熔断");
+    if (layer.__dummyMaterialBags?.[0]?.raythreshold !== 0.52) errors.push("getMaterial 写入未落袋");
+  }
+
+  // ---- 9) 接线源码断言 ----
+  {
+    const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    if (!/particleOverrideScripts/.test(msrc)) errors.push("scene-mount 未消费 particleOverrideScripts");
+    if (!/overrideScriptRuns/.test(msrc)) errors.push("scene-mount 缺粒子 override 脚本逐帧队列");
+    if (!/animLayerScriptRuns/.test(msrc)) errors.push("scene-mount 缺 animationLayer 可见性脚本队列");
+    if (!/setColorOverride/.test(msrc)) errors.push("colorn 脚本未走 setColorOverride");
+    if (!/scalarFieldSlot/.test(msrc)) errors.push("散字段未走 scalarFieldSlot 真实槽位");
+    const skinSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js"), "utf8");
+    if (!/l\.playing === false/.test(skinSrc)) errors.push("mdl-skin 未尊重动画层 stop() 运行态");
+    const parseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+    if (!/originalOrigin: localSnapshot\[i\]\.origin\.slice\(\)/.test(parseSrc))
+      errors.push("parse 未保留独立的 originalOrigin 快照");
+    // BGM 频谱桥
+    if (!/createBgmAnalyser|mergeBgmBands/.test(msrc)) errors.push("scene-mount 未接 BGM 频谱桥");
+  }
+
+  // ---- 10) 全库冒烟：粒子 override 脚本 / animLayer 脚本可加载不炸 ----
+  {
+    let ovScripts = 0, alScripts = 0;
+    const ovWalls = new Set(), alWalls = new Set();
+    for (const item of fs.readdirSync(LIB)) {
+      const dir = join(LIB, item);
+      if (!fs.statSync(dir).isDirectory()) continue;
+      let pkgPath = join(dir, "scenes/scene.pkg");
+      if (!fs.existsSync(pkgPath)) pkgPath = join(dir, "scene.pkg");
+      if (!fs.existsSync(pkgPath)) continue;
+      let parsed;
+      try {
+        const pkg = parsePkg(fs.readFileSync(pkgPath));
+        const sj = getEntry(pkg, "scene.json");
+        if (!sj) continue;
+        parsed = parseMod.parseScene(JSON.parse(new TextDecoder().decode(sj)), null);
+      } catch { continue; }
+      for (const l of parsed.layers) {
+        for (const k of Object.keys(l.particleOverrideScripts || {})) {
+          const def = l.particleOverrideScripts[k];
+          try {
+            const sb = wtext.evalObjectScript(def.script, def.scriptproperties, {});
+            if (sb?.hasUpdate) { sb.init(def.value); sb.callUpdate(undefined); ovScripts++; ovWalls.add(item); }
+          } catch (e) { errors.push(`${item} override ${k} 冒烟失败: ${String(e.message).slice(0, 60)}`); }
+        }
+        (l.animationLayers || []).forEach((al) => {
+          if (!al.visibleScript) return;
+          try {
+            const sb = wtext.evalObjectScript(al.visibleScript.script, al.visibleScript.scriptproperties, { layer: l });
+            if (sb) { sb.init(true); alScripts++; alWalls.add(item); }
+          } catch (e) { errors.push(`${item} animLayer.visible 冒烟失败: ${String(e.message).slice(0, 60)}`); }
+        });
+      }
+    }
+    // 语料下限（2026-09 实测：override 104 段 / animLayer 24 段；库收缩会提醒）
+    if (ovWalls.size < 20) errors.push(`粒子 override 脚本壁纸仅 ${ovWalls.size}（台账 ≈29）`);
+    if (alWalls.size < 6) errors.push(`animLayer 脚本壁纸仅 ${alWalls.size}（台账 8）`);
+    console.log(`    [P2-1 冒烟] override 脚本 ${ovScripts} 段/${ovWalls.size} 张，animLayer 脚本 ${alScripts} 段/${alWalls.size} 张`);
+  }
+
+  return errors;
+}
+
+// 懒加载粒子类（Node ESM），供上面的 runner 用
+let _particleMod = null;
+async function importParticle() {
+  if (!_particleMod) _particleMod = await imp("renderer/vendor/we-scene/render/particles.js");
+  return _particleMod;
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -2359,6 +2916,24 @@ if (action === "all" || action === "script" || action === "hidevis") {
 if (action === "all" || action === "script" || action === "canvas") {
   const errors = runEngineCanvasSize();
   console.log(`\n【engine.canvasSize】向量形态 .x/.y（3790399458 左下角叠字） → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
+if (action === "all" || action === "script" || action === "resize") {
+  const errors = runResizeScreen();
+  console.log(`\n【resizeScreen / timeOfDay】3396722575/3405117965 缩放 + 昼夜时钟回填 → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
+if (action === "all" || action === "script" || action === "storage") {
+  const errors = runStorage();
+  console.log(`\n【localStorage】按壁纸共享 + LOCATION_GLOBAL + 五 eval 点（P1-2） → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
+if (action === "all" || action === "script" || action === "p21") {
+  const errors = await runP21Scripts();
+  console.log(`\n【P2-1 未装配挂点】粒子 override/animLayer/散字段/originalOrigin/getMaterial/BGM → 问题 ${errors.length}`);
   errors.forEach((e) => console.log("  ! " + e));
   failed += errors.length;
 }

@@ -56,7 +56,7 @@ export type Runtime = {
   ctx?: CanvasRenderingContext2D;
   raf?: number;
   sceneCleanup?: () => void;
-  sceneAudio?: { setVolume: (vol: number) => void; audios: HTMLAudioElement[] };
+  sceneAudio?: { setVolume: (vol: number) => void; audios: HTMLAudioElement[]; dispose?: () => void };
   /** 当前场景渲染器（含 dispose 释放 WebGL 上下文） */
   renderer?: { dispose?: () => void };
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
@@ -322,6 +322,12 @@ export function clear(rt: Runtime) {
       au.pause();
       au.removeAttribute("src");
       au.load();
+    }
+    // 关闭 BGM 频谱桥的共享 AudioContext（见 bgm-analyser.ts）
+    try {
+      rt.sceneAudio.dispose?.();
+    } catch {
+      /* ignore */
     }
     rt.sceneAudio = undefined;
   }

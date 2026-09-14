@@ -228,6 +228,25 @@ export function effectFboSize(fboDef, baseW, baseH) {
  * HDR 家族（metric=1）= 既有 raw sRGB 亮度 + 软窗口校准（2646504847 过曝修复，
  * threshold 以 1.0=白点标定）；其真身是 fp16 金字塔 + combine_hdr，尚未重写。
  */
+/**
+ * [we-scene patch] 图层基色的环境光乘子。
+ *
+ * 官方 genericimage2/3/4 与 genericparticle 在 `#if LIGHTING` 下：
+ *   ambient = max(0.001, g_LightAmbientColor) * color
+ *   color   = CombineLighting(directLight, ambient)
+ * 本仓不跑完整 PBR、场景也没有灯光对象（语料 NORMALMAP 全 0、lightconfig 仅 3 个
+ * 场景且本仓不解析），直射项恒为 0 → CombineLighting 退化为 albedo × ambient。
+ * - lightingEnabled=false（99.9% 的层，combo 没开 LIGHTING）：返回 [1,1,1]，不碰。
+ * - true：逐分量 max(0.001, ambient)（官方下限，防纯黑场景吞掉整个发光材质）。
+ *
+ * 纯函数供离线 verifier 直接跑（不创建 WebGL 上下文）。
+ */
+export function layerColorAmbient(lightingEnabled, ambient) {
+  if (!lightingEnabled) return [1, 1, 1]
+  const a = ambient || [0, 0, 0]
+  return [Math.max(0.001, Number(a[0]) || 0), Math.max(0.001, Number(a[1]) || 0), Math.max(0.001, Number(a[2]) || 0)]
+}
+
 export function bloomPostParams(general) {
   const g = general || {}
   const boolOf = (v, dflt) => {
@@ -399,6 +418,8 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] engine.setTimeout/setInterval（SCENESCRIPT-PLAN P1-1）：效果常量
   // 是定时器的挂点之一（全库 8 处），由宿主注入统一的一份 createEngineTimers 实例。
   let scriptTimers = null
+  // [we-scene patch] 按壁纸共享的 localStorage（宿主注入，见 setConstantScriptRuntime）
+  let scriptStorage = null
   // [we-scene patch] 效果常量沙箱是**惰性创建**的（首次渲染到该 pass 才建），
   // 宿主没法一次性扫出来，所以留一个回调：新建带媒体钩子的沙箱时反向登记给宿主。
   // 效果常量是媒体回调的最大挂载点（全库 101/308），不接这个口子它们一处都收不到。
@@ -419,6 +440,9 @@ export function createRenderer(canvas, opts = {}) {
     scriptShared = (opts && opts.shared) || null
     scriptInputView = (opts && opts.inputView) || null
     scriptTimers = (opts && opts.timers) || null
+    // [we-scene patch] SceneScript localStorage（P1-2）：常量沙箱与其余四个
+    // eval 点共用同一份按壁纸共享的 storage；宿主注入，渲染层只透传。
+    scriptStorage = (opts && opts.storage) || null
     constScriptSink = (opts && typeof opts.onSandbox === 'function') ? opts.onSandbox : null
     constAnimEventQueue = (opts && Array.isArray(opts.animEventQueue)) ? opts.animEventQueue : null
     constScriptCache.clear()
@@ -936,6 +960,15 @@ export function createRenderer(canvas, opts = {}) {
     return !!val && typeof val === 'object' && Number.isFinite(Number(val.x)) && Number.isFinite(Number(val.y))
   }
 
+  // [we-scene patch] 当前帧场景环境光颜色（g_LightAmbientColor），renderScene
+  // 每帧更新；LIGHTING combo 开启的图层基色乘它（见 renderLayer color4）。
+  let sceneAmbient = [1, 1, 1]
+  // [we-scene patch] 当前渲染尺寸：scriptedConstants 里沙箱创建时要给
+  // engine.screenResolution 一个真实默认值（resize 模板的 init 立即读它：
+  // `init(value){ originalValue = value; resizeScreen(engine.screenResolution) }`，
+  // 3396722575 / 3405117965）。每帧 renderScene 更新，比沙箱默认 1920×1080 准。
+  let renderWidth = 1920
+  let renderHeight = 1080
   function scriptedConstants(constants, cacheKey, time, layer) {
     if (!constants) return constants
     let hasScript = false
@@ -954,6 +987,10 @@ export function createRenderer(canvas, opts = {}) {
         try {
           sb = evalObjectScriptFn(v.script, v.scriptproperties || v.scriptProperties || null, {
             userProperties: userProps || {},
+            // init 里立刻读 engine.screenResolution 的 resize 模板（3396722575）
+            // 需要创建时就是当前画布尺寸；timeOfDay 同理（昼夜脚本 init 就读）。
+            screenResolution: { x: renderWidth, y: renderHeight },
+            timeOfDay: daytimeFraction(),
             audioViews: scriptAudioViews || undefined,
             // [we-scene patch] 必须传 layer：媒体回调里 `thisObject.visible = e.hasThumbnail`
             // 与 `thisObject.getAnimation().play()` 都要写回真图层。此前没传，
@@ -972,6 +1009,8 @@ export function createRenderer(canvas, opts = {}) {
             clearTimeout: scriptTimers ? scriptTimers.clearTimeout : undefined,
             setInterval: scriptTimers ? scriptTimers.setInterval : undefined,
             clearInterval: scriptTimers ? scriptTimers.clearInterval : undefined,
+            // 五 eval 点共享同一份 localStorage（P1-2）
+            storage: scriptStorage || undefined,
             // [we-scene patch] 官方语义：无参 getAnimation() = **本常量自己的**
             // 动画（constAnimCache 里那份）。此前 thisObject 是图层代理，拿到的是
             // 同层对象字段动画或中性对象 —— 3163060610 的 21 个常量 leader 全部
@@ -1007,10 +1046,11 @@ export function createRenderer(canvas, opts = {}) {
         if (sb && typeof sb.applyUserProperties === 'function') {
           try { sb.applyUserProperties(userProps || {}) } catch { /* 初值应用失败不拖垮渲染 */ }
         }
-        // 带媒体钩子或 animationEvent 钩子的新沙箱反向登记给宿主（惰性创建，宿主扫不到）。
-        // animationEvent 登记要带上图层与常量名：官方语义是**图层级广播**，
-        // 宿主要按图层找到这层全部带钩子的沙箱。
-        if (sb && (sb.hasMediaHook || sb.hasAnimEventHook) && constScriptSink) {
+        // 带媒体钩子、animationEvent 或 resizeScreen 钩子的新沙箱反向登记给宿主
+        //（惰性创建，宿主扫不到）。animationEvent 登记要带上图层与常量名：官方
+        // 语义是**图层级广播**，宿主要按图层找到这层全部带钩子的沙箱；
+        // resizeScreen 由宿主在画布尺寸变化（含首帧）时统一派发。
+        if (sb && (sb.hasMediaHook || sb.hasAnimEventHook || sb.hasResizeHook) && constScriptSink) {
           try { constScriptSink(sb, { layer, key }) } catch { /* 登记失败不该拖垮渲染 */ }
         }
       }
@@ -1681,7 +1721,14 @@ export function createRenderer(canvas, opts = {}) {
       gl.generateMipmap(gl.TEXTURE_2D)
     }
     const mvp = mat4Multiply(viewProj, puppetModelMatrix(layer, cam))
-    puppetDrawFn(layer, mvp, { time, overrideTex: overrideTex || null })
+    // [we-scene patch] 真 3D 静态网格（generic4 + LIGHTING，仅 3509243656 的
+    // 球体/天空盒）同样受场景环境光：u_color 乘 max(0.001, ambientcolor)。
+    // 2D puppet（人物）材质是 puppettexturechannels、不开 LIGHTING，乘子为 1。
+    puppetDrawFn(layer, mvp, {
+      time,
+      overrideTex: overrideTex || null,
+      ambient: layerColorAmbient(layer.lightingEnabled, sceneAmbient),
+    })
     // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
     // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——
     // 它们的 mip 是过期的，缩小采样会读出残影。画完立刻还原 LINEAR。
@@ -1928,9 +1975,15 @@ export function createRenderer(canvas, opts = {}) {
 
 
   async function renderScene(scene, textures, width, height, time, fit, alignX, alignY) {
+    renderWidth = width
+    renderHeight = height
     fboStamp++
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
+    // [we-scene patch] 场景环境光（g_LightAmbientColor）：材质 combos.LIGHTING=1
+    // 的 genericimage* 层，官方 shader 做 color = albedo * max(0.001, ambient)
+    // （无灯光直射项时）。每帧缓存供 renderLayer 的 color4 使用。
+    sceneAmbient = parseVec3Local(general.ambientcolor || '1 1 1')
     if (general.clearenabled !== false) {
       const cc = parseVec3Local(general.clearcolor || '0 0 0')
       gl.clearColor(cc[0], cc[1], cc[2], 1)
@@ -2597,7 +2650,16 @@ export function createRenderer(canvas, opts = {}) {
     }
     const w = Math.max(1, Math.round(contentW))
     const h = Math.max(1, Math.round(contentH))
-    const color4 = [layer.color[0] * layer.brightness, layer.color[1] * layer.brightness, layer.color[2] * layer.brightness, layer.alpha]
+    // [we-scene patch] 材质 LIGHTING combo 开启时乘场景环境光（官方
+    // genericimage*：ambient = max(0.001, g_LightAmbientColor)，无直射灯时
+    // 结果 = albedo × ambient）。max(0.001) 防纯黑环境吞掉整个发光层。
+    const amb = layerColorAmbient(layer.lightingEnabled, sceneAmbient)
+    const color4 = [
+      layer.color[0] * layer.brightness * amb[0],
+      layer.color[1] * layer.brightness * amb[1],
+      layer.color[2] * layer.brightness * amb[2],
+      layer.alpha,
+    ]
     const effects = (layer.effects || []).filter((e) => e.visible)
 
     // 效果降采样（性能档位）：fboCapFactor > 0 时效果链 FBO 上限 = 屏幕占比 × 系数（0=全质量）。

@@ -555,7 +555,10 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 形如 `"use strict";export var ...`），故按「前导符 + export + 声明关键字」全局匹配，
   // 前导符保留。import 按完整语法剥（import 'x' / import * as X from 'x'）。
   const body = scriptToFunctionBody(script)
-  if (body === script && script.indexOf('update') < 0) return null
+  // 快速短路：scriptToFunctionBody 未剥掉任何 export（body===script）时，只有
+  // 含 update 的才可能是有效脚本——但 resizeScreen 纯钩子脚本（无 update，
+  // 3396722575 自适应缩放模板）也要放行，否则下面的第五闸门族永远收不到它。
+  if (body === script && script.indexOf('update') < 0 && script.indexOf('resizeScreen') < 0) return null
 
   // scriptProperties：scene 值优先，createScriptProperties 的 add* 只补缺省。
   // 声明链在模块体执行时立刻跑完并 finish()，返回的就是这个对象 —— update() 闭包
@@ -699,7 +702,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
       'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
       'Vec3', 'Vec2', 'input',
-      'MediaPlaybackEvent',
+      'MediaPlaybackEvent', 'localStorage',
       '"use strict";\n' + body +
       '\n;return {' +
       'update: typeof update === "function" ? update : null,' +
@@ -723,6 +726,8 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       MEDIA_CALLBACKS.map((n) => `${n}: typeof ${n} === "function" ? ${n} : null,`).join('') +
       // [we-scene patch] 官方 AnimationEvent 消费口（同对象路径，见那里的注释）。
       'animationEvent: typeof animationEvent === "function" ? animationEvent : null,' +
+      // [we-scene patch] resizeScreen(size)（同对象路径；3396722575 自适应缩放）。
+      'resizeScreen: typeof resizeScreen === "function" ? resizeScreen : null,' +
       'dummy_: 0' +
       '};',
     )
@@ -735,6 +740,10 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       undefined, undefined, undefined, undefined,
       Vec3, Vec2, input,
       MEDIA_PLAYBACK_EVENT,
+      // [we-scene patch] 文字沙箱也拿按壁纸共享的 localStorage（P1-2）：
+      // 此前形参表里没有 localStorage，脚本读它得到的是消毒全局上的 undefined，
+      // 「记住状态」类文字脚本（时钟制式记忆）ReferenceError 熔断。
+      opts.storage || makeSandboxStorage(),
     )
   } catch (e) {
     if (opts.onError) opts.onError(e, 'parse')
@@ -748,7 +757,11 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // [we-scene patch] 纯 animationEvent 转发脚本同样没有 update（动画事件是唯一
   // 消费口的官方机制，闸门外丢弃 = 事件到了没人接）。
   const hasAnimEventHook = !!(fns && typeof fns.animationEvent === 'function')
-  if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook && !hasAnimEventHook)) return null
+  // [we-scene patch] 第五闸门族：resizeScreen（画布尺寸变化；3396722575 /
+  // 3405117965 的 LED 矩阵按画布重排）。首帧也派发一次，因此纯 resize 脚本
+  // 没有任何逐帧消费者，不进 update 队列，只在尺寸变化时由宿主调 callResize。
+  const hasResizeHook = !!(fns && typeof fns.resizeScreen === 'function')
+  if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook && !hasAnimEventHook && !hasResizeHook)) return null
   // [we-scene patch] update 的首帧 value 语义按脚本形态区分：
   //  - 写回式（打字机模板）：update 把入参 value 当作**累积中的当前文本读入**
   //    （addLastChar(value) / handleBlinker(value) / queuedWord===value），返回值
@@ -798,6 +811,8 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     hasApplyHook,
     // [we-scene patch] 是否导出 animationEvent（宿主按图层级广播派发帧事件）
     hasAnimEventHook,
+    // [we-scene patch] 是否导出 resizeScreen（画布尺寸变化时宿主派发）
+    hasResizeHook,
     errCount: 0,
     disabled: false,
     init(value) {
@@ -896,6 +911,36 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       } catch (e) {
         sandbox.errCount++
         if (opts.onError) opts.onError(e, 'animationEvent')
+        if (sandbox.errCount >= 3) sandbox.disabled = true
+        return undefined
+      }
+    },
+    /**
+     * [we-scene patch] 派发 resizeScreen（官方第 8 个生命周期事件）。
+     * 官方签名是**单个 Vec2**：`resizeScreen(size)`，脚本读 `size.x/size.y`
+     * （3396722575 / 3405117965：`if (size.x > size.y) scale = orig *
+     * size.x / 1920`），不是两个数。宿主在画布 backing store 尺寸变化（含
+     * 首帧——init 里会手动调一次 resizeScreen(engine.screenResolution)，没有
+     * 首帧派发它拿到的是构造默认值）时调用，参数为屏幕像素尺寸。
+     * 只刷新 engine.screenResolution：engine.canvasSize 是场景正交**设计**
+     * 尺寸（orthogonalprojection），不随窗口变化，resize 模板读的也是
+     * screenResolution。
+     * 与 callCursor 同构：三振熔断 + onError。返回字符串时按文字写回处理。
+     */
+    callResize(width, height) {
+      if (sandbox.disabled) return undefined
+      if (typeof fns.resizeScreen !== 'function') return undefined
+      const w = Number(width) || 0
+      const h = Number(height) || 0
+      engine.screenResolution = { x: w, y: h }
+      const size = { x: w, y: h, width: w, height: h }
+      try {
+        const ret = fns.resizeScreen(size)
+        if (typeof ret === 'string') thisLayer.text = ret
+        return ret
+      } catch (e) {
+        sandbox.errCount++
+        if (opts.onError) opts.onError(e, 'resizeScreen')
         if (sandbox.errCount >= 3) sandbox.disabled = true
         return undefined
       }
@@ -1055,28 +1100,11 @@ function makeVideoTextureHandle(layer) {
   return api
 }
 
-/**
- * [we-scene patch] 沙箱 localStorage：语料里 2 个脚本用它存交互状态
- * （点击计数等）。给一份**进程内 Map**而不是真 localStorage —— 壁纸脚本不该
- * 污染宿主存储，且离线校验里 localStorage 本就不存在。
- */
-function makeSandboxStorage() {
-  const m = new Map()
-  const get = (k) => (m.has(String(k)) ? m.get(String(k)) : null)
-  const set = (k, v) => { m.set(String(k), String(v)) }
-  return {
-    getItem: get,
-    setItem: set,
-    // 语料里有脚本按 `localStorage.set/get` 调用（非标准写法），一并提供别名
-    get: get,
-    set: set,
-    removeItem: (k) => { m.delete(String(k)) },
-    remove: (k) => { m.delete(String(k)) },
-    clear: () => { m.clear() },
-    key: (i) => Array.from(m.keys())[i] ?? null,
-    get length() { return m.size },
-  }
-}
+// [we-scene patch] localStorage 实现拆到独立的纯逻辑模块 storage.js：
+// 按壁纸共享 + 跨会话持久（provider 注入）+ LOCATION_SCREEN/GLOBAL 两级位置。
+// 无 provider 时退化为进程内 Map（离线 verifier）。re-export 供装配层使用。
+import { makeSandboxStorage, LOCATION_SCREEN, LOCATION_GLOBAL } from './storage.js'
+export { makeSandboxStorage, LOCATION_SCREEN, LOCATION_GLOBAL }
 
 /**
  * [we-scene patch] 骨骼 API 桥接（thisLayer.getBoneCount / getBoneTransform /
@@ -1426,6 +1454,14 @@ function makeObjectLayerProxy(layer, opts) {
   const proxy = {
     get name() { return (layer && layer.name) || '' },
     get id() { return (layer && layer.id) || 0 },
+    // [we-scene patch] ITransform.originalOrigin：图层未被脚本/动画改动前的
+    // 初始 origin（local 空间）。7 处拖拽脚本 resetPosition 用它复位
+    // （`thisLayer.origin = thisLayer.originalOrigin`）。返回 Vec3 快照，
+    // 缺省退回当前 localOrigin（无快照的动态建层场景）。
+    get originalOrigin() {
+      const a = (layer && (layer.originalOrigin || layer.localOrigin)) || [0, 0, 0]
+      return makeVec3(a)
+    },
     // [we-scene patch] 效果开关脚本（`effects[i].visible.script`）里的
     // `thisObject.visible` 指的是**那个效果**，不是整个图层。宿主通过
     // opts.targetEffect 指明重定向目标；不给则照旧写图层。
@@ -1551,14 +1587,41 @@ function makeObjectLayerProxy(layer, opts) {
       return makeNeutralAnimation()
     },
     getAnimationLayer: (key) => {
+      // [we-scene patch] IAnimationLayer（puppet 的 MDL clip 层，区别于属性动画
+      // IAnimation）：按层名/索引取，返回该层自己的播放控制器。3396722575 的
+      // 「错帧」机制 `thisLayer.getAnimationLayer('头部转动').stop()`、帧事件后
+      // play() 全靠它。旧实现只查属性动画表，名字查不到 → 中性对象，stop/play 空转。
+      const al = (layer && layer.animationLayers) || []
+      let target = null
+      if (typeof key === "number") target = al[key] || null
+      else if (typeof key === "string" && /^\d+$/.test(key)) target = al[Number(key)] || null
+      else if (typeof key === "string") target = al.find((x) => x && x.name === key) || null
+      if (target) {
+        return {
+          play: () => target.play?.(),
+          pause: () => target.pause?.(),
+          stop: () => target.stop?.(),
+          isPlaying: () => target.playing !== false && !target.paused,
+          get visible() { return target.visible !== false },
+          set visible(v) { target.visible = !!v },
+          get rate() { return target.rate ?? 1 },
+          set rate(v) { target.rate = Number(v) || 1 },
+          get name() { return target.name || "" },
+        }
+      }
+      // 回落到属性动画控制器（旧调用方：数字索引的字段动画）
       const map = layer && layer.animations
       const list = (layer && layer.animationList) || []
       if (map && map[key]) return map[key]
-      if (typeof key === 'number' && list[key]) return list[key]
-      if (typeof key === 'string' && /^\d+$/.test(key) && list[Number(key)]) return list[Number(key)]
+      if (typeof key === "number" && list[key]) return list[key]
+      if (typeof key === "string" && /^\d+$/.test(key) && list[Number(key)]) return list[Number(key)]
       return makeNeutralAnimation()
     },
-    getAnimationLayerCount: () => ((layer && layer.animationList) || []).length,
+    getAnimationLayerCount: () => {
+      // 优先 puppet 动画层数（脚本多数字索引针对它）；无则回落属性动画列表。
+      const al = (layer && layer.animationLayers) || []
+      return al.length || ((layer && layer.animationList) || []).length
+    },
     getTextureAnimation: () => makeTextureAnimation(layer),
     // [we-scene patch] ISoundLayer / IVideoTexture 播放控制。
     //
@@ -1622,6 +1685,33 @@ function makeObjectLayerProxy(layer, opts) {
       }
       const name = String(key)
       return makeEffectHandle(list.find((e) => e && e.name === name) || null)
+    },
+    // [we-scene patch] IMaterial getMaterial(index)（1712475860 Dino Run：
+    // applyUserProperties 按关卡改 godrays pass 的 raythreshold/rayintensity）。
+    // 返回该层第 index 个效果 pass 的可写常量袋：写入落到
+    // materialPasses[index].constantshadervalues，bindConstants 当帧读到。
+    // 取不到（无效果/越界）仍给一个可读写的临时袋（脚本不判空，赋 null 会
+    // TypeError 熔断整个 applyUserProperties），值至少能回读。
+    getMaterial(index) {
+      const eff = layer && Array.isArray(layer.effects) ? layer.effects : null
+      let bag = null
+      if (eff) {
+        const flat = []
+        for (const e of eff) for (const mp of (e.materialPasses || [])) flat.push(mp)
+        const mp = flat[Number(index)]
+        if (mp) {
+          mp.constantshadervalues = mp.constantshadervalues || {}
+          bag = mp.constantshadervalues
+        }
+      }
+      if (!bag) bag = (layer && layer.__dummyMaterialBags?.[Number(index)]) || null
+      if (!bag) {
+        bag = {}
+        if (layer) {
+          (layer.__dummyMaterialBags ||= {})[Number(index)] = bag
+        }
+      }
+      return bag
     },
   }
   Object.defineProperty(proxy, 'angles', {
@@ -1835,6 +1925,9 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       // animationEvent(event, value) 回调（24 处帧事件全在 3163060610，
       // 骨骼事件另 4 张；IAnimation 上没有任何注册 API，这是唯一消费口）。
       'animationEvent: typeof animationEvent === "function" ? animationEvent : null,' +
+      // [we-scene patch] resizeScreen(size: Vec2)：画布尺寸变化（含首帧）回调，
+      // 3396722575 / 3405117965 的自适应缩放模板唯一的钩子。
+      'resizeScreen: typeof resizeScreen === "function" ? resizeScreen : null,' +
       'dummy_: 0' +
       '};',
     )
@@ -1845,7 +1938,11 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined,
-      Vec3, Vec2, input, thisLayer, thisScene, thisLayer, makeSandboxStorage(),
+      Vec3, Vec2, input, thisLayer, thisScene, thisLayer,
+      // [we-scene patch] 按壁纸共享的同一份存储（opts.storage，P1-2）：
+      // 五 eval 点注入同一实例，脚本间互相可见；未注入时 makeSandboxStorage
+      // 内部退化为进程内 Map（离线 verifier 路径）。
+      opts.storage || makeSandboxStorage(),
       MEDIA_PLAYBACK_EVENT,
     )
   } catch (e) {
@@ -1880,7 +1977,15 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   // 调度框架：init 里包 CAniClass + 导出 animationEvent 转派给调度器）。
   // 丢了这个脚本，事件到了也没人接，整张壁纸的折叠/展开状态机停摆。
   const hasAnimEventHook = !!(fns && typeof fns.animationEvent === 'function')
-  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock && !hasAnimEventHook)) return null
+  // 同理（第六种）：**纯 resizeScreen 脚本**（3396722575 / 3405117965 的 LED
+  // 矩阵只在画布尺寸变化时重排列距，没有 update / 任何别的钩子）。不放进闸门
+  // 就被 evalObjectScript 丢弃，宿主派 resize 时无人接收。
+  const hasResizeHook = !!(fns && typeof fns.resizeScreen === 'function')
+  // 同理（第七种）：**纯 init 脚本**（3521337568 Lucy 的多个 animationlayers
+  // 只导出 init，里面 `shared.offsetedStartAni(...)` 装启动副作用）。WE 装载时
+  // init 必执行，闸门丢弃则初始进度/回调全部丢失。
+  const hasInitHook = !!(fns && typeof fns.init === 'function')
+  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock && !hasAnimEventHook && !hasResizeHook && !hasInitHook)) return null
 
   const sandbox = {
     engine,
@@ -1974,6 +2079,30 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       } catch (e) {
         sandbox.errCount++
         if (opts.onError) opts.onError(e, 'animationEvent')
+        if (sandbox.errCount >= 3) sandbox.disabled = true
+        return undefined
+      }
+    },
+    // [we-scene patch] 是否导出 resizeScreen（画布尺寸变化时宿主派发，含首帧）。
+    hasResizeHook,
+    /**
+     * 派发 resizeScreen(size)，官方签名是单个 Vec2（脚本读 size.x/size.y）。
+     * 参数为屏幕像素尺寸；只同步 engine.screenResolution —— engine.canvasSize
+     * 是场景正交**设计**尺寸，不随窗口变化（resize 模板读的也是 screenResolution）。
+     * 返回脚本原值（可能改写 thisLayer / thisObject）。
+     */
+    callResize(width, height) {
+      if (sandbox.disabled) return undefined
+      if (typeof fns.resizeScreen !== 'function') return undefined
+      const w = Number(width) || 0
+      const h = Number(height) || 0
+      engine.screenResolution = { x: w, y: h }
+      const size = { x: w, y: h, width: w, height: h }
+      try {
+        return fns.resizeScreen(size)
+      } catch (e) {
+        sandbox.errCount++
+        if (opts.onError) opts.onError(e, 'resizeScreen')
         if (sandbox.errCount >= 3) sandbox.disabled = true
         return undefined
       }

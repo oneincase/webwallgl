@@ -159,6 +159,9 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   if (hadExplicitLayers) {
     for (const l of animLayers) {
       if (l.visible === false || l.visible === 0) continue
+      // [we-scene patch] 脚本 play()/stop() 运行态：stop 后该层不参与蒙皮
+      //（3396722575 错帧机制：init 停掉错位层、帧事件到达再 play）。
+      if (l.playing === false) continue
       const a = mdl.animations.find((x) => x.id === l.animation)
       if (a) layers.push({ anim: a, additive: !!l.additive, blend: typeof l.blend === 'number' ? l.blend : 1, rate: typeof l.rate === 'number' ? l.rate : 1 })
     }

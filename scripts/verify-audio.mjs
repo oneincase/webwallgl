@@ -395,6 +395,59 @@ export function update(value) {
   }
 }
 
+// ---------- 7. BGM 频谱桥（mergeBgmBands）：35 张「声音层+音频反应」壁纸 ----------
+{
+  // TS 模块经 esbuild bundle 后在 Node 直行（与 verify-textures 同模式）
+  const { build } = await import("esbuild");
+  const { pathToFileURL } = await import("node:url");
+  const out = await build({
+    entryPoints: [join(ROOT, "renderer/src/bgm-analyser.ts")],
+    bundle: true, write: false, format: "esm", platform: "neutral", target: "es2022",
+  });
+  const tmp = join(ROOT, "scripts", `.tmp-bgm-${process.pid}.mjs`);
+  fs.writeFileSync(tmp, out.outputFiles[0].text);
+  let bgm;
+  try {
+    bgm = await import(pathToFileURL(tmp).href);
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+  const arr = (n, v) => new Float32Array(n).fill(v);
+  const close = (a, b) => Math.abs(a - b) < 1e-5;
+  const snap = () => ({
+    left64: arr(64, 0.2), right64: arr(64, 0.2),
+    left32: arr(32, 0.2), right32: arr(32, 0.2),
+    left16: arr(16, 0.2), right16: arr(16, 0.2),
+  });
+  // BGM 0.8 取 max → 0.8（不与基底相加，避免双倍）
+  {
+    const s = snap();
+    bgm.mergeBgmBands(s, arr(64, 0.8), 1);
+    check(close(s.left64[0], 0.8) && close(s.right64[10], 0.8), "BGM 0.8 应逐频段取 max 到 0.8");
+  }
+  // BGM 0.1 低于基底 0.2 → 保持 0.2
+  {
+    const s = snap();
+    bgm.mergeBgmBands(s, arr(64, 0.1), 1);
+    check(close(s.left64[0], 0.2), "BGM 低于基底时应保留基底（max 语义）");
+  }
+  // 增益 + 钳位 1
+  {
+    const s = snap();
+    bgm.mergeBgmBands(s, arr(64, 0.9), 2);
+    check(close(s.left64[0], 1), "BGM ×gain 后应钳位到 1");
+  }
+  // 32/16 派生数组同步降采样（max）
+  {
+    const s = snap();
+    const band = arr(64, 0);
+    band[5] = 0.7;
+    bgm.mergeBgmBands(s, band, 1);
+    check(s.left32.some((v) => close(v, 0.7)), "BGM 32 段降采样应取组内 max（某段含 0.7）");
+    check(s.left16.some((v) => close(v, 0.7)), "BGM 16 段应同步");
+  }
+}
+
 if (errors.length) {
   console.error(`verify-audio: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

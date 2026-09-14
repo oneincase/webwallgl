@@ -78,4 +78,25 @@ export type WallpaperConfig = {
   canvas?: HTMLElement;
   /** 场景资源来源。给了走 source；不给回落到 mediaBase/src 拼 URL。 */
   source?: Source;
+
+  /**
+   * SceneScript `localStorage` 的持久后端（WE 语义：按壁纸共享、跨会话保留）。
+   * 契约：{get,set,remove,clear,keys}，全部同步；screen 是默认位置（每壁纸一份），
+   * global 是跨壁纸共享位置（LOCATION_GLOBAL）。
+   * 不给时库默认用 window.localStorage + 按 source.key 命名空间；无 DOM（Node
+   * verifier）时退化为进程内 Map（重挂即丢）。
+   */
+  storageProvider?: {
+    screen?: StorageProviderLike;
+    global?: StorageProviderLike;
+  };
+};
+
+/** 同步 KV 后端（SceneScript localStorage 持久化用）。 */
+export type StorageProviderLike = {
+  get: (key: string) => string | null;
+  set: (key: string, value: string) => void;
+  remove: (key: string) => void;
+  clear: () => void;
+  keys: () => string[];
 };
