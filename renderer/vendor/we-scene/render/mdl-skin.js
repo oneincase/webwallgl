@@ -163,6 +163,14 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
       if (a) layers.push({ anim: a, additive: !!l.additive, blend: typeof l.blend === 'number' ? l.blend : 1, rate: typeof l.rate === 'number' ? l.rate : 1 })
     }
   }
+  // [we-scene patch] 标记「零动画且无覆写」：draw 仍按 identitySkin 走（绑定姿势蒙皮
+  // 恒等于单位变换），但**不能再提前 return** —— 早退会让 _world 停在未填充的零矩阵，
+  // attachmentWorld 读到附着点 (0,0)，followAttachments 算出 delta = 0 − 绑定偏移，
+  // 把挂在这种「无动画中间 puppet」上的挂件整组反向拽飞。3463520581 的亚丝娜头发链
+  // （ASUNA PUPPET→HAIR BACK BIG→main hair back c2→c2 部件）中间两层正是无动画
+  // puppet，整束后发被拉到头顶右上方形成第二个头/身体。仍要跑完下面的骨骼循环，
+  // 把 _local/_world 填成绑定姿势，供 attachmentWorld / followAttachments 使用。
+  let identityEarlyOut = false
   if (layers.length === 0 && !hadExplicitLayers) {
     const a = mdl.animations[0]
     // [we-scene patch] 无动画但有脚本覆写时**不能早退**：全库 3 个骨骼拖拽壁纸
@@ -170,7 +178,7 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     // 早退会让 draw() 走 identitySkin，覆写永远不生效。
     // 此时 layers 保持为空，下面每根骨 touched=false → 取绑定姿势，再叠覆写。
     if (!a) {
-      if (!hasOverride) return null
+      identityEarlyOut = !hasOverride
     } else {
       layers.push({ anim: a, additive: false, blend: 1, rate: 1 })
     }
@@ -291,7 +299,9 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     mat4Mul(mdl._world[i], mdl.invBindWorld[i], mdl._tmp)
     mdl._skin.set(mdl._tmp, i * 16)
   }
-  return mdl._skin
+  // 见 identityEarlyOut 注释：无动画无覆写时 draw 走 identitySkin（与此处算出的
+  // 绑定姿势蒙皮逐位等价），返回 null 保持旧契约；_world 已是绑定姿势。
+  return identityEarlyOut ? null : mdl._skin
 }
 
 /**

@@ -282,25 +282,117 @@ function parseAttachments(buf, dv, boneCount) {
   return out
 }
 
-// MDLS0004：魔数(8) + u8 + u32 nextOff + u32 boneCount，逐骨可变长条目
+// MDLS0004：魔数(8) + u8 + u32 nextOff + u32 boneCount，逐骨**可变长**条目。
+//
+// 实测三种记录布局：
+//  A. 常规（全库绝大多数，龙/Lucy/lainpw…），每条 78B：
+//       [u8 00 占位名][u32 id][i32 parent][u32 len=64][64B 矩阵][name cstr 常在矩阵后]
+//     无名骨 name 为单个 00。旧实现按此固定步进（id@1 parent@5 matrix@13、name@77）。
+//  B. 名字前置且变长（3463520581，骨名 legs/skirt）：
+//       [name cstr][u32 id][i32 parent][u32 len=64][64B 矩阵]
+//     无名时 name 是单个 00（记录 77B），带名时把后续记录整体推后。固定 77B 步进在
+//     第一个命名骨后永久失步：parent 读成 0x3F800000=16256、矩阵退化成 1e-43 垃圾 /
+//     89° 假旋转 / z=2.1e18。
+//  C. 名字前置 + 矩阵后变长 JSON 元数据（3479521040，骨名「主」「右眼」，JSON 形如
+//     [{"a":null,...,"tm":100,"tp":".. .. .."}]）：
+//       [name cstr][u32 id][i32 parent][u32 len=64][64B 矩阵][JSON cstr]
+//     记录长 199~205B 不等；固定步进在第 4 条（命名骨「主」）失步，旧解析 parent
+//     =−16777216、矩阵读成全零——绑定姿势串了，消失动画推进后残留错乱模型。
+//
+// 策略：**先按 A 固定布局整体解析并校验**（parent 全合法 + 每矩阵两列单位长度 +
+// 平移有限），通过就逐位采用（旧模型零回归）；任一骨非法才判定为 B/C 变长布局，
+// 顺序重解析：记录起点是 name cstr（UTF-8，可空），其后 12B 头在 ~80B 窗口内用
+// 「id 有界 + parent 合法 + len 恰 64 + 矩阵正交有限」严格合取定位（矩阵内部偶然的
+// 0x3F800000 不可能误命中）；矩阵尾若紧跟 '{'（布局 C）则跳过 JSON cstr 再到下一
+// 条，否则（布局 B）矩阵尾即下一记录起点。重扫必须拿全所有骨且全合法才采用，
+// 否则回退固定解析，绝不返回残缺骨架。
 function parseSkeleton(buf, dv) {
   const s = findAscii(buf, 'MDLS')
   if (s < 0) return []
   const boneCount = dv.getUint32(s + 13, true)
   if (boneCount <= 0 || boneCount > 1024) return []
+
+  const orthMatrix = (m) =>
+    Number.isFinite(m[12]) && Number.isFinite(m[13]) && Number.isFinite(m[14]) &&
+    Math.abs(Math.hypot(m[0], m[1]) - 1) < 0.05 &&
+    Math.abs(Math.hypot(m[4], m[5]) - 1) < 0.05
+
+  // ---- 布局 A：固定 id@1 parent@5 matrix@13（64B），name cstr@77 ----
+  const parseFixed = () => {
+    const bones = []
+    let j = s + 17
+    let ok = true
+    for (let b = 0; b < boneCount; b++) {
+      if (j + 77 > dv.byteLength) return { bones, ok: false }
+      const id = dv.getUint32(j + 1, true)
+      const parent = dv.getInt32(j + 5, true)
+      const matrix = new Float32Array(16)
+      for (let k = 0; k < 16; k++) matrix[k] = dv.getFloat32(j + 13 + k * 4, true)
+      const meta = readCStr(dv, j + 77)
+      if (!(parent === -1 || (parent >= 0 && parent < boneCount)) || !orthMatrix(matrix)) ok = false
+      bones.push({ id, name: '', parent: parent >= 0 && parent < boneCount ? parent : -1, matrix })
+      j = meta.next
+    }
+    return { bones, ok }
+  }
+
+  const fixed = parseFixed()
+  if (fixed.ok) return fixed.bones
+
+  // ---- 布局 B/C：name cstr + 12B 头 + 64B 矩阵 (+ JSON cstr)，顺序重解析 ----
+  const findHeader = (j) => {
+    // name 通常 ≤48B，头在其后；留 80B 窗口并保证不越过文件
+    const limit = Math.min(j + 80, dv.byteLength - 76)
+    for (let hp = j; hp <= limit; hp++) {
+      const id = dv.getUint32(hp, true)
+      const parent = dv.getInt32(hp + 4, true)
+      const mlen = dv.getUint32(hp + 8, true)
+      if (id >= 100000) continue
+      if (!(parent === -1 || (parent >= 0 && parent < boneCount))) continue
+      if (mlen !== 64) continue
+      const m = new Float32Array(16)
+      for (let k = 0; k < 16; k++) m[k] = dv.getFloat32(hp + 12 + k * 4, true)
+      if (!orthMatrix(m)) continue
+      // hp 必须确实落在「某个 cstr 之后」：hp 前一字节是 00（name 终止符）。
+      // 这排除了在矩阵/JSON 二进制内部误命中的合法头（那里前一字节通常非 0）。
+      if (hp <= j || buf[hp - 1] !== 0) continue
+      return { id, parent, matrix: m, head: hp, nameStart: j }
+    }
+    return null
+  }
+
   const bones = []
   let j = s + 17
+  let ok = true
   for (let b = 0; b < boneCount; b++) {
-    if (j + 77 > dv.byteLength) return bones
-    const id = dv.getUint32(j + 1, true)
-    const parent = dv.getInt32(j + 5, true)
-    const matrix = new Float32Array(16)
-    for (let k = 0; k < 16; k++) matrix[k] = dv.getFloat32(j + 13 + k * 4, true)
-    const meta = readCStr(dv, j + 13 + 64)
-    bones.push({ id, parent: parent >= 0 && parent < boneCount ? parent : -1, matrix })
-    j = meta.next
+    const rec = findHeader(j)
+    if (!rec) { ok = false; break }
+    // name cstr 在 [nameStart, head)（不含 head 前的终止 00）。它可能还含一个
+    // 前导 00：布局 B 的无名骨记录是 `00|头|矩阵`，矩阵尾的 00 同时是下一条命名
+    // 骨 name 的起点，于是命名骨段呈现 `00 legs 00|头`；布局 C 命名骨则是
+    // `主 00|头` 无前导 00。统一剥掉两端所有 00 再按 UTF-8 解码（骨名可为中文）。
+    let name = ''
+    let a = rec.nameStart
+    let z = rec.head - 1
+    while (a < z && buf[a] === 0) a++
+    while (z > a && buf[z - 1] === 0) z--
+    if (z > a) {
+      const txt = new TextDecoder('utf-8', { fatal: false }).decode(buf.subarray(a, z))
+      if (/^[\x20-\x7e\u3000-\u9fff\uff00-\uffefA-Za-z0-9 _.-]*$/.test(txt)) name = txt
+    }
+    bones.push({ id: rec.id, name, parent: rec.parent, matrix: rec.matrix })
+    const matrixEnd = rec.head + 12 + 64
+    // 布局 C：矩阵尾紧跟变长 JSON 元数据 cstr，跳过它再到下一条；
+    // 布局 B：矩阵尾即下一记录的 name cstr 起点。
+    j = matrixEnd < dv.byteLength && buf[matrixEnd] === 0x7b /* '{' */
+      ? readCStr(dv, matrixEnd).next
+      : matrixEnd
   }
-  return bones
+
+  const rescanned = ok && bones.length === boneCount &&
+    bones.every((x) => x.parent === -1 || (x.parent >= 0 && x.parent < boneCount)) &&
+    bones.every((x) => orthMatrix(x.matrix))
+  return rescanned ? bones : fixed.bones
 }
 
 // MDLA0006：魔数(8) + u8 + u32 endPos + u32 animCount，逐动画（末尾 35B 填充）

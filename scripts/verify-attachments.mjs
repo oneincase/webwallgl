@@ -327,6 +327,153 @@ function neckOf(parent, attName) {
   }
 }
 
+// ---------- 3463520581：MDLS 变长骨名把固定步进解析带错位 ----------
+// 亚丝娜 asuna body bottom（7 骨）含命名骨 "legs"/"skirt"。旧 parseSkeleton 假定
+// 「id@1 parent@5 matrix@13、名字在矩阵后」固定 77B 步进，在第一个命名骨处永久
+// 错位：parent 读到 0x3F800000(=16256)，矩阵退化成 1e-43 垃圾 / 89° 假旋转 /
+// z=2.1e18。无动画中间 puppet（70/134/16）当前姿势因此 ≠ 绑定姿势，
+// followAttachments 算出 delta=0−bind 把挂件整组反向拽飞，亚丝娜后发/头身分离、
+// 头顶浮出第二个身体。
+{
+  const wp = loadWallpaper(3463520581);
+  if (!wp) {
+    fail("壁纸库缺少 3463520581");
+  } else {
+    attachPuppets(wp.scene, wp.parsed);
+    const byImage = (img) => wp.scene.layers.find((l) => l.image === img);
+
+    // 1) 命名骨必须解析出来，且 parent 全合法
+    const bottom = byImage("models/asuna body bottom.json");
+    check(!!bottom && !!bottom.puppet, "3463520581 应有 asuna body bottom puppet");
+    if (bottom) {
+      const names = bottom.puppet.bones.map((b) => b.name || "");
+      check(names.includes("legs") && names.includes("skirt"),
+        `asuna body bottom 应解析出命名骨 legs/skirt，实得 ${JSON.stringify(names)}`);
+      const badParent = bottom.puppet.bones.findIndex(
+        (b) => !(b.parent === -1 || (b.parent >= 0 && b.parent < bottom.puppet.bones.length)),
+      );
+      check(badParent < 0, `asuna body bottom 存在越界 parent（旧解析错位），骨 ${badParent}`);
+      // bone2 是 "Attachment bottom" 锚点骨；旧解析它是 z=2.1e18 + 89° 假旋转
+      const m2 = bottom.puppet.bones[2].matrix;
+      check(Math.abs(m2[14]) < 1e3 &&
+            Math.abs(Math.hypot(m2[0], m2[1]) - 1) < 0.05,
+        "asuna body bottom bone2 应是合法正交矩阵（旧解析为非规格化垃圾 + 89° 假旋转）");
+    }
+
+    // 2) 无动画 puppet：当前姿势必须等于绑定姿势（computeSkinMatrices 不得早退留零矩阵）
+    for (const [img, att] of [
+      ["models/hair back big chunk.json", "hair back"],
+      ["models/main hair back c2.json", "hair back 2"],
+      ["models/asuna body bottom.json", "Attachment bottom"],
+    ]) {
+      const l = byImage(img);
+      if (!l || !l.puppet) { fail(`缺少 puppet ${img}`); continue; }
+      computeSkinMatrices(l.puppet, 0, undefined, null);
+      const bm = attachmentBind(l.puppet, att);
+      const cm = attachmentWorld(l.puppet, att);
+      check(!!bm && !!cm && hypot(bm[12] - cm[12], bm[13] - cm[13]) < 0.5,
+        `${img} 无动画 puppet 附着点「${att}」当前姿势必须=绑定姿势，` +
+        `bind(${bm ? bm[12].toFixed(1) : "-"},${bm ? bm[13].toFixed(1) : "-"}) ` +
+        `cur(${cm ? cm[12].toFixed(1) : "-"},${cm ? cm[13].toFixed(1) : "-"})` +
+        "（旧实现早退 → cur=(0,0) → 挂件被反向拽飞）");
+    }
+
+    // 3) 端到端：无动画中间 puppet 的自身 follow 增量必须为 0（cur≡bind）。
+    //    main hair back c2(134) 自身无动画，旧实现 computeSkinMatrices 早退使
+    //    cur=(0,0)，给它和整棵子树叠加 (−bindX,−bindY)=(+32,−248) → 整束后发飞到
+    //    头顶上方形成第二个头/身体。注意它最终原点仍会因**祖先**根 puppet 的
+    //    Animation 1 漂移 ~15px，那是合法骨骼运动，故这里只断言它自己的 follow
+    //    记录增量，不把祖先动画误算进来。
+    const follows = applyAttachmentBindOrigins(wp.scene.layers);
+    followAttachments(follows, 0, () => null);
+    const c2 = byImage("models/main hair back c2.json");
+    check(!!c2 && !!c2.attachBase, "main hair back c2 应有 attachBase 快照");
+    if (c2) {
+      const self = follows.find((f) => f.layer === c2);
+      check(!!self, "main hair back c2 应在 attachFollows 中");
+      if (self) {
+        computeSkinMatrices(self.parent.puppet, 0, self.parent.animationLayers, null);
+        const cm = attachmentWorld(self.parent.puppet, self.name);
+        const dx = cm[12] - self.bindX;
+        const dy = cm[13] - self.bindY;
+        check(hypot(dx, dy) < 0.5,
+          `main hair back c2（无动画）自身 follow 增量必须为 0，实测 (${dx.toFixed(2)},${dy.toFixed(2)})；` +
+          "旧实现 cur=(0,0) 给出 (+32,−248)，整束后发飞到头顶形成第二个身体");
+      }
+    }
+  }
+}
+
+// ---------- 3479521040：布局 C（骨名前置 + 矩阵后变长 JSON 元数据）----------
+// 「日向の幽霊」人物是 55 骨 puppet，记录形如 `[name cstr][id][parent][len=64]
+// [64B 矩阵][JSON cstr 元数据]`，记录长 199~205B 不等；第 4 根骨带名「主」。
+// 旧固定步进在「主」处失步（parent=−16777216、矩阵全零），绑定姿势串了 ——
+// 消失/姿态动画的循环段一结束就露出错误绑定姿势，画面残留错乱残肢。
+// 重扫若不跳过矩阵后的变长 JSON，会在 JSON 内部误命中假头，同样错位。
+{
+  const wp = loadWallpaper(3479521040);
+  if (!wp) {
+    fail("壁纸库缺少 3479521040");
+  } else {
+    attachPuppets(wp.scene, wp.parsed);
+    const person = wp.scene.layers.find((l) => l.image === "models/人物.json");
+    check(!!person && !!person.puppet, "3479521040 应有 人物 puppet（55 骨）");
+    if (person && person.puppet) {
+      const p = person.puppet;
+      check(p.bones.length === 55, `人物应有 55 骨，实得 ${p.bones.length}`);
+      // 命名骨（含中文「主」/「右眼」）应被解析
+      const names = p.bones.map((b) => b.name || "");
+      check(names.includes("主"), `应解析出命名骨「主」，实得 ${JSON.stringify(names.filter(Boolean).slice(0, 6))}`);
+      // 所有 parent 合法、矩阵正交有限（旧解析从「主」起全坏）
+      const badParent = p.bones.findIndex((b) => !(b.parent === -1 || (b.parent >= 0 && b.parent < 55)));
+      check(badParent < 0, `存在越界 parent（旧解析 −16777216），骨 ${badParent}`);
+      const badMatrix = p.bones.findIndex((b) => {
+        const m = b.matrix;
+        return !Number.isFinite(m[12]) || !Number.isFinite(m[13]) ||
+          Math.abs(Math.hypot(m[0], m[1]) - 1) > 0.05 ||
+          Math.abs(Math.hypot(m[4], m[5]) - 1) > 0.05;
+      });
+      check(badMatrix < 0, `存在非正交/非有限矩阵（旧解析全零），骨 ${badMatrix}`);
+      // 整个动画周期（动画1 替换 + 动画2 加算，rate 0.9）网格顶点包围盒必须
+      // 始终有限、尺寸稳定 —— 修复前错误绑定姿势会在动画段间露出错乱残肢。
+      const layers = [
+        { animation: 267, visible: true, additive: false, blend: 1, rate: 0.9 },
+        { animation: 777, visible: true, additive: true, blend: 1, rate: 1 },
+      ];
+      const bboxAt = (t) => {
+        const sk = computeSkinMatrices(p, t, layers, null);
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, bad = 0;
+        for (let i = 0; i < p.vertexCount; i++) {
+          const px = p.positions[i * 3], py = p.positions[i * 3 + 1];
+          let sx = 0, sy = 0, tot = 0;
+          for (let k = 0; k < 4; k++) {
+            const bi = p.boneIdx[i * 4 + k], w = p.weights[i * 4 + k];
+            if (w <= 0 || bi < 0 || bi >= p.bones.length) continue;
+            const o = bi * 16;
+            sx += (sk[o] * px + sk[o + 4] * py + sk[o + 12]) * w;
+            sy += (sk[o + 1] * px + sk[o + 5] * py + sk[o + 13]) * w;
+            tot += w;
+          }
+          if (tot > 0) { sx /= tot; sy /= tot; } else { sx = px; sy = py; }
+          if (!Number.isFinite(sx) || !Number.isFinite(sy)) { bad++; continue; }
+          if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
+          if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
+        }
+        return { w: maxX - minX, h: maxY - minY, bad };
+      };
+      const samples = [0, 2, 5, 9, 12, 19].map(bboxAt);
+      const anyBad = samples.some((s) => s.bad > 0);
+      check(!anyBad, "动画周期内不应有非有限蒙皮顶点（错乱残肢）");
+      const baseW = samples[0].w, baseH = samples[0].h;
+      const stable = samples.every((s) => s.w > baseW * 0.5 && s.w < baseW * 1.6 &&
+        s.h > baseH * 0.5 && s.h < baseH * 1.6);
+      check(stable,
+        `动画周期网格包围盒应稳定（消失动画是微摆/淡变，非爆开），实得 ` +
+        samples.map((s) => `${s.w | 0}×${s.h | 0}`).join(" / "));
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`\nverify-attachments：${errors.length} 项失败`);
   process.exit(1);
