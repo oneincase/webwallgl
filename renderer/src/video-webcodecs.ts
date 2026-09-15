@@ -79,7 +79,11 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
   let isPaused = false;
 
   const sizeCanvas = () => {
-    const dpr = Math.min(window.devicePixelRatio || 1, opts.renderDpr || 1);
+    const cap = opts.renderDpr || 0;
+    const dpr = Math.min(
+      window.devicePixelRatio || 1,
+      cap <= 0 ? (window.devicePixelRatio || 1) : cap,
+    );
     const w = Math.max(1, Math.round((opts.container.clientWidth || window.innerWidth) * dpr));
     const h = Math.max(1, Math.round((opts.container.clientHeight || window.innerHeight) * dpr));
     if (canvas.width !== w) canvas.width = w;

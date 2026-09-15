@@ -73,7 +73,12 @@ export function createLoopingVideo(src: string, opts: VideoLoopOpts): VideoLoopP
     // 限制解码分辨率：按「显示尺寸 × 有效 dpr」解码，而非视频原始分辨率。
     // WebKit 对超出显示尺寸的 video 会分配等比缩小的解码缓冲（4K 源在 1080p 窗口上
     // 解码缓冲约为 1/4），显著降低内存。不影响显示清晰度（object-fit 在 CSS 层面缩放）。
-    const dpr = Math.min(window.devicePixelRatio || 1, opts.renderDpr || 1);
+    // renderDpr=0（默认/自动）→ 跟随设备 DPR；显式值作为解码上限（不超过设备）。
+    const cap = opts.renderDpr || 0;
+    const dpr = Math.min(
+      window.devicePixelRatio || 1,
+      cap <= 0 ? (window.devicePixelRatio || 1) : cap,
+    );
     const maxW = Math.max(1, Math.round((opts.maxW || innerWidth) * dpr));
     const maxH = Math.max(1, Math.round((opts.maxH || innerHeight) * dpr));
     v.width = maxW;

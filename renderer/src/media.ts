@@ -880,7 +880,14 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
  * 解码出 4K 再缩回去不会更清晰。真正会糊的是降到显示尺寸**以下**。
  */
 function applyDecodeHint(v: HTMLVideoElement, rt: Runtime, cfg: WallpaperConfig) {
-  const dpr = Math.min(window.devicePixelRatio || 1, cfg.renderDpr ?? rt.cfg?.renderDpr ?? 1);
+  // 视频解码缓冲不超过设备 DPR：宿主 backing 若真为 1，超采样解码只费内存、
+  // CSS 放大不会更清晰（与 WebGL 场景画布的超采样语义不同，那里走 effectiveDpr）。
+  // renderDpr=0（默认/自动）→ 跟随设备 DPR；显式值作为上限。
+  const cap = cfg.renderDpr ?? rt.cfg?.renderDpr ?? 0;
+  const dpr = Math.min(
+    window.devicePixelRatio || 1,
+    !cap || cap <= 0 ? (window.devicePixelRatio || 1) : cap,
+  );
   const w = (cfg.canvas as HTMLElement | undefined)?.clientWidth || window.innerWidth;
   const h = (cfg.canvas as HTMLElement | undefined)?.clientHeight || window.innerHeight;
   v.width = Math.max(1, Math.round(w * dpr));

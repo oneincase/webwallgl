@@ -100,7 +100,8 @@ async function resolveMountConfig(
 ): Promise<WallpaperConfig> {
   const base = {
     fit: normalizeFitOption(o.fit),
-    renderDpr: o.renderDpr ?? 1,
+    // 0 = 自动跟随设备 DPR（Retina 原生清晰，默认）；显式正数 = 目标 DPR
+    renderDpr: o.renderDpr ?? 0,
     sceneFps: o.fps ?? 60,
     muted: (o.volume ?? 0) <= 0,
     loop: true,

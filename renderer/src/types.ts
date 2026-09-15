@@ -30,7 +30,8 @@ export type WallpaperConfig = {
   type: "canvas" | "video" | "gif" | "web" | "scene" | "image";
   src?: string;
   fit?: WallpaperFit;
-  /** 渲染分辨率上限（有效 devicePixelRatio 封顶），越低越省内存；默认 1 */
+  /** 渲染分辨率 DPR：0（默认）=自动跟随设备 DPR（Retina 原生清晰）；正数=目标
+   *  DPR，可高于设备上报值（宿主 WKWebView 误报 1 时仍能超采样）；调低省显存。 */
   renderDpr?: number;
   /** 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低；默认 60 */
   sceneFps?: number;

@@ -23,6 +23,7 @@ import {
   resetCoverAlign,
   resetFrameMeter,
   createRuntime,
+  effectiveDpr,
   type Runtime,
 } from "./shell";
 import { mountWallpaper } from "./dispatch";
@@ -65,7 +66,7 @@ function applyWallpaperFilter(rt: Runtime) {
 function mountCanvasDemo(rt: Runtime) {
   clear(rt);
   const c = document.createElement("canvas");
-  const dpr = Math.min(window.devicePixelRatio || 1, rt.cfg.renderDpr ?? 1);
+  const dpr = effectiveDpr(rt);
   c.width = Math.max(1, Math.round(innerWidth * dpr));
   c.height = Math.max(1, Math.round(innerHeight * dpr));
   c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
@@ -428,7 +429,8 @@ const initialCfg: WallpaperConfig = {
   type: (rawType as WallpaperConfig["type"]) || "canvas",
   src: params.get("src") ?? undefined,
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
-  renderDpr: Number(params.get("renderDpr")) || 1,
+  // query 缺省 0 = 自动跟随设备 DPR（Retina 原生清晰）；显式数字是目标 DPR
+  renderDpr: Number(params.get("renderDpr")) || 0,
   sceneFps: Number(params.get("sceneFps")) || 60,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",

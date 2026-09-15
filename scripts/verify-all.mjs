@@ -35,6 +35,7 @@ const STABLE = [
   "verify-pointer",
   "verify-groups",
   "verify-web",
+  "verify-resolution",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */

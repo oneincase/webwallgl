@@ -286,8 +286,11 @@ export type MountOptions = {
   /** 适配模式。默认 "cover" */
   fit?: Fit;
   /**
-   * 渲染分辨率上限（有效 devicePixelRatio 封顶），越低越省显存。默认 1。
-   * 实际使用 min(devicePixelRatio, renderDpr)。
+   * 渲染分辨率 DPR，决定 backing store = CSS 像素 × DPR。
+   * - 0 或不传（默认）：自动跟随设备 devicePixelRatio，Retina/HiDPI 屏原生清晰；
+   * - 正数：目标 DPR，**允许高于设备上报值**（某些壁纸宿主 WKWebView 把
+   *   devicePixelRatio 报成 1，传 2 仍按 2 超采样到物理分辨率）；
+   * 物理最长边封顶 4096 防爆显存，超出等比回收。调低（如 1）可省显存。
    */
   renderDpr?: number;
   /** 帧率上限。默认 60。渲染循环跳过比目标更快的帧，降低 GPU 占用 */

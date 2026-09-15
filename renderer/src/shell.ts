@@ -10,10 +10,33 @@ import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math
 import type { WallpaperConfig, WallpaperFit } from "./types";
 import type { VideoLoopPair } from "./video-loop";
 
-// 有效渲染 DPR = min(设备 DPR, renderDpr 上限)，用于压缩画布/纹理内存（Retina 上默认降到 1/4）。
+/**
+ * 有效渲染 DPR（backing store = CSS 像素 × 此值）。
+ *
+ * renderDpr 语义（2026-09 修订，修 3.5K/Retina 屏「高清也不到原生」）：
+ *   - 0 / undefined / null：**自动**，跟随设备 devicePixelRatio（Retina 即 2）；
+ *   - 正数：目标 DPR，**允许高于设备上报值**——某些壁纸宿主（非 Retina 后端的
+ *     WKWebView）window.devicePixelRatio 恒报 1，旧实现 min(1, n) 把高清模式
+ *     永远钉在逻辑像素；现在按目标值超采样，仍能到原生清晰度；
+ *   - 物理最长边封顶 MAX_BACKING_EDGE，避免在 5K/多显示器上 backing 过大爆显存
+ *     （超采样超出部分等比回收）。
+ * 默认从 1（省显存但 HiDPI 糊）改为 0（自动=原生）。
+ */
+const MAX_BACKING_EDGE = 4096;
+
 export function effectiveDpr(rt: Runtime, cfg?: WallpaperConfig): number {
-  const cap = cfg?.renderDpr ?? rt.cfg?.renderDpr ?? 1;
-  return Math.min(window.devicePixelRatio || 1, cap);
+  const device = window.devicePixelRatio || 1;
+  const raw = cfg?.renderDpr ?? rt.cfg?.renderDpr;
+  let target: number;
+  if (raw === undefined || raw === null || raw === 0 || Number.isNaN(Number(raw))) {
+    target = device; // 自动跟随
+  } else {
+    target = Math.max(0.25, Number(raw));
+  }
+  // 物理最长边保护：按 CSS 最长边算出目标 backing，超 4096 就等比收。
+  const cssLongEdge = Math.max(window.innerWidth || 0, window.innerHeight || 0, 1);
+  const byCap = MAX_BACKING_EDGE / cssLongEdge;
+  return Math.max(0.25, Math.min(target, byCap));
 }
 
 // 规范化显示模式：兼容旧会话里的 fill（=拉伸）与 fit（=适应）。
