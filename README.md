@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.16/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -328,10 +328,16 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.16。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.22。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.22` | 2026-09-15 | 场景脚本生命周期、粒子脚本挂点与自带音乐响应补齐，还原度提升：①`resizeScreen(size)` 生命周期事件——窗口/分辨率（含首帧、竖屏）变化时按 **CSS 像素**派发，`engine.screenResolution` 同步更新，横竖屏自适应缩放类壁纸（3396722575/3405117965/3002120692）不再只按 1920×1080 布局。②`engine.timeOfDay` 此前只在挂载时取一次，昼夜/夜灯壁纸（2134765860/3151551777 等 6 张）挂再久也不入夜；现随真实时间秒级刷新。③SceneScript `localStorage` 对齐 WE 语义：同壁纸全部脚本共享、跨会话保留，支持 `LOCATION_SCREEN`/`LOCATION_GLOBAL` 两级与 WE 的 `delete` 名；库默认用浏览器 localStorage 按壁纸隔离，宿主也可经新增的 `cfg.storageProvider` 注入自定义持久后端。④粒子 `instanceoverride` 脚本（29 张）接通：发射率/数量/大小/透明度/颜色可被音频等逐帧驱动。⑤`animationlayers` 的可见性脚本与 `thisLayer.getAnimationLayer(name)` 接通（8 张，puppet「错帧」机制），并补 `originalOrigin`（拖拽复位）、`getMaterial(index)`（改材质常量不再熔断）。⑥**壁纸自带 BGM 现在会驱动音频可视化**——此前自带音乐在响但音条/粒子只跟模拟或麦克风（35 张）。⑦开了 LIGHTING 的材质按 `general.ambientcolor` 受环境光（少数工坊壁纸）。 |
+| `1.3.21` | 2026-09-14 | 修复点开关后状态切换了但部件不滑动（2983846453）：脚本经 `thisScene.getLayer(x).origin=` 写的是 world 槽，而该字段绑了脚本时每帧又被 local 基准覆盖，位移被逐帧冲掉；现统一在 local 空间收发。同提交含 3463520581 变长骨骼名解析的后续修正 |
+| `1.3.20` | 2026-09-14 | 修复车尾气、人呼气等软粒子能看出透明方块（2241938645/2250845956）：内置烟/雾贴图低透明度裙边被大尺寸精灵放大成带直边的灰幕；现高斯径向封边，影响约 110 张壁纸 |
+| `1.3.19` | 2026-09-13 | 修复真实歌曲封面在播却仍显示占位环/空白（2388299037）：封面纹理用了三线性 mip 采样，上传真实封面只写 level 0、不重建 mip，缩小显示时读到的仍是旧占位；现上传后重建 mip。封面/元数据确立「外部真实 > 模拟测试 > 壁纸内置」优先级 |
+| `1.3.18` | 2026-09-13 | 修复下雨等场景的天空云层完全静止、像蒙了一层白纱（959417181 等 20 张）：云密度效果引用了 WE 安装目录自带的公共贴图 `util/clouds_256`，包内没有，退回 1×1 白板导致云图恒等、无图案可漂移；现程序化生成可平铺周期噪声云图（uv 随时间无界增长，用重复环绕），另补 `util/black` |
+| `1.3.17` | 2026-09-13 | ①光斑粒子过亮糊住画面（3151551777）：材质常量 `ui_editor_properties_overbright`（0.17~10，全库 68 张/159 材质）此前被整体丢弃按 1.0 处理，亮核饱和外溢；现正确乘到实例亮度。②正在播放的歌曲元数据不显示：壁纸自带声音（.ogg）按 WE 语义不产生系统媒体事件，面板只能显示品牌占位；现把脚本显式 `play()` 的声音层接成媒体快照（环境音不抢面板），并修正常量动画「先于」常量脚本沙箱创建导致 `getAnimation().play()` 落空的竞态，以及右对齐长标题被文字画布截断 |
 | `1.3.15` | 2026-09-08 | 视频对新增自愈看门狗：元素可能进入"假播放"（paused=false 但解码停摆、时间不走，无任何事件可听）导致壁纸永久冻结——渲染循环里检测可见页面上 currentTime 连续 ~500ms 不前进即 pause→play 硬重启解码；页面被遮挡时的合法节流不会误判 |
 | `1.3.14` | 2026-09-08 | 循环交接第四版：硬切改快速淡出。爬行保证下层交接时已在运动，上层旧主元素（定格在末帧）以 64ms 线性淡出露出下层——元素级交接固有的 1~3 帧不精度（ended 分发、层交换合成）被融合窗口整体掩掉，不再依赖把每一环都压到零延迟 |
 | `1.3.13` | 2026-09-08 | 无缝循环交接第三版「爬行」：备用在主元素最后 0.12s 以 1/8 速率实际播放（媒体管线全程 playing 态，仅前进约 1 帧），ended 触发时拨回 1x 并同步换层——速率切换是纯时钟操作，消除前两版的唤醒延迟/定格与内容跳跃 |
