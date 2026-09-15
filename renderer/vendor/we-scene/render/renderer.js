@@ -1,4 +1,4 @@
-import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, parallaxDepthFactor, layerWorldOrigin } from './math.js'
+import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, parallaxDepthFactor, layerWorldOrigin } from './math.js'
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 通用 pass 管线渲染器（移植 linux-wallpaperengine 架构）：
 // 每层 copy pass → 效果链（WE shader 转译执行，FBO 乒乓）→ 合成到画布。
@@ -13,7 +13,7 @@ import { hlsl2glsl } from './hlsl2glsl.js'
 //   renderer.js       本文件：createRenderer（GL 上下文、缓存、装配与三级绘制循环）
 // ALIGN / makeTexture / makeTextureMip 仍从本文件 re-export（verify-pointer、
 // main.ts 等既有 import 方不变）。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
@@ -37,6 +37,26 @@ export function puppetAnimMargin(layer) {
   if (!b) return [0, 0]
   // 两轴量级差很大（火车 x=18046 / y=4425），必须分轴，共用一个余量会过度放宽
   return [b.x * Math.abs(layer.scale[0]), b.y * Math.abs(layer.scale[1])]
+}
+
+/**
+ * [we-scene patch] 容器效果链输出的 alpha 是否携带形状信息（合成方式判据）。
+ * 抽成纯函数供 renderer 与 verifier 单源共用（复合层合成 3395777145 白屏根因）：
+ *  - 任一 pass 写 `float alpha = <非 scene.a>`（Simple_Audio_Bars 的 bar*opacity）→ 有信息；
+ *  - 任一 pass 调用 `BlendTransparency(`（oscilloscope/procedural_noise/clipping_mask/
+ *    frame_builder 家族，全库 7 个 shader；与 scene.a 加法族 36 个零交集）→ 有信息：
+ *    alpha 按波形/形状逐像素成形，且其 rgb 经 `mix(bg, albedo.rgb, albedo.a)` 自带背景，
+ *    按 SRC_ALPHA 合成 (bg+wave)*a + dst*(1-a) = dst + wave*a；误判成「无信息 → 加法」
+ *    （ONE, 1-a）会把背景在画布上叠两遍 → 整屏泛白。
+ */
+export function chainAlphaMeaningful(fragSources) {
+  for (const src of fragSources || []) {
+    if (typeof src !== 'string') continue
+    const m = src.match(/\bfloat\s+alpha\s*=\s*([^;]+);/)
+    if (m && !/^\s*scene\s*\.\s*a\s*$/.test(m[1])) return true
+    if (src.includes('BlendTransparency(')) return true
+  }
+  return false
 }
 
 /**
@@ -390,6 +410,118 @@ export function createRenderer(canvas, opts = {}) {
   const VIDEO_TEX_MIN_CAP = 1024
   // FBO 分辨率限幅系数：0 = 关闭（全质量）；>0 时效果链 FBO 上限 = 屏幕占比 × 系数
   let fboCapFactor = opts.fboCapFactor === undefined ? 0 : opts.fboCapFactor
+  // [we-scene patch] 性能设置（对标 WE 客户端：抗锯齿 / 后处理开关）。
+  // aaMode：'off'（默认=现状）| 'fxaa'（帧末 FXAA pass）| 'msaa2' | 'msaa4'
+  // （多重采样 FBO + blit resolve）。单选不叠加：MSAA 与 FXAA 是互斥路径。
+  let aaMode = 'off'
+  // effectsEnabled=false：图层效果链直通（renderLayer 落入既有的「无效果直接
+  // 合成」路径）、整屏后期层（isPostProcess）整层跳过、内置 Bloom 关闭。
+  let effectsEnabled = true
+  // [we-scene patch] MSAA 离屏目标。架构上全帧都画「最终目标」（默认帧缓冲），
+  // MSAA 开启时把它换成多重采样 renderbuffer FBO，帧末 blit resolve 回画布。
+  // 结构：{ fbo, rbo, width, height, samples }；null = 未建/关闭。
+  let msaaTarget = null
+  let msaaDiagDone = false
+  function msaaSampleCount() {
+    if (aaMode === 'msaa2') return 2
+    if (aaMode === 'msaa4') return 4
+    return 0
+  }
+  // 当前帧的「最终绘制目标」：MSAA 开 = 多重采样 FBO，关 = 默认帧缓冲（null）。
+  // 帧内所有「画到画布」的位置一律走 bindFinal()，不能写死 null —— 否则 MSAA
+  // 开启时那部分绘制会绕过多重采样直接上屏（resolve 后又盖掉，表现为闪烁/丢失）。
+  function bindFinal() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaaTarget ? msaaTarget.fbo : null)
+  }
+  // 粒子系统（particles.js）绘制自己绑帧缓冲，经返回对象的 getFrameTarget 取同一目标。
+  function ensureMsaaTarget(width, height) {
+    const want = msaaSampleCount()
+    if (!want || !(width > 0) || !(height > 0)) {
+      if (msaaTarget) { destroyMsaaTarget() }
+      return
+    }
+    if (msaaTarget && msaaTarget.width === width && msaaTarget.height === height && msaaTarget.samples === want) return
+    destroyMsaaTarget()
+    // 钳位到驱动实际支持的采样数；完全不支持时回退 off（diag 一次性上报）。
+    // 取数组最大值而不是 [0]：返回顺序依赖驱动，不能假设降序。
+    let samples = want
+    try {
+      const supported = gl.getInternalformatParameter(gl.RENDERBUFFER, gl.RGBA8, gl.SAMPLES)
+      let max = 0
+      if (supported && supported.length) for (const s of supported) if (s > max) max = s
+      if (!(max >= want)) samples = 0
+    } catch (e) { samples = 0 }
+    if (!samples) {
+      if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: 驱动不支持 ${want}x 多重采样，回退 off`) }
+      aaMode = 'off'
+      return
+    }
+    const fbo = gl.createFramebuffer()
+    const rbo = gl.createRenderbuffer()
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rbo)
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, width, height)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rbo)
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (!ok) {
+      gl.deleteFramebuffer(fbo)
+      gl.deleteRenderbuffer(rbo)
+      if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: FBO 不完整（${want}x ${width}x${height}），回退 off`) }
+      aaMode = 'off'
+      return
+    }
+    msaaTarget = { fbo, rbo, width, height, samples }
+    if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: on ${samples}x ${width}x${height}`) }
+  }
+  function destroyMsaaTarget() {
+    if (!msaaTarget) return
+    gl.deleteFramebuffer(msaaTarget.fbo)
+    gl.deleteRenderbuffer(msaaTarget.rbo)
+    msaaTarget = null
+  }
+  // MSAA → 默认帧缓冲 resolve（多重采样缓冲不能被采样，只能 blit 解析）。
+  //
+  // **不能直接 blit 到默认帧缓冲**：WebKit（WKWebView/ANGLE Metal）对
+  // 「多重采样 RGBA8 → 默认 FB」的 blit 一律报 INVALID_OPERATION 静默失败
+  // （alpha:true/false 都试过），表现是画面冻结在切换 MSAA 前的最后一帧
+  // （preserveDrawingBuffer 留着旧帧，rAF 照跑、fps 照计，极具迷惑性）。
+  // 合法路径：blit 到同格式 RGBA8 纹理 FBO（实测 err=0），再把该纹理全屏
+  // 合成回画布 —— 多一趟直通 copy，代价可忽略。
+  let msaaResolveDiagDone = false
+  function resolveMsaa(width, height) {
+    if (!msaaTarget) return
+    const dst = getFBO(width, height, 'msaaResolve')
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaaTarget.fbo)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fbo)
+    gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null)
+    gl.useProgram(copyProg)
+    gl.disable(gl.BLEND)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, width, height)
+    gl.bindVertexArray(vao)
+    uploadQuad('pass', PASS_QUAD)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, dst.tex)
+    gl.uniform1i(copyUni.tex, 0)
+    gl.uniform4f(copyUni.color, 1, 1, 1, 1)
+    // 直通合成：复位帧基与 Screen/Multiply 预处理，防上一层残留
+    setFrameBasis(copyUni, null)
+    if (copyUni.blendPrep !== null && copyUni.blendPrep !== undefined) {
+      gl.uniform1i(copyUni.blendPrep, 0)
+    }
+    gl.uniformMatrix4fv(copyUni.mvp, false, IDENT_M4)
+    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    // 一次性错误探针：别的驱动若也有 resolve 怪癖，diag 里要能看见
+    if (!msaaResolveDiagDone) {
+      msaaResolveDiagDone = true
+      const err = gl.getError()
+      if (err !== gl.NO_ERROR) diag(`msaa resolve: glErr=${err}`)
+    }
+  }
   // [we-scene patch] 粒子每帧推进（由宿主注入，见 setParticleRenderer）
   let particleAdvanceFn = null
   // [we-scene patch] 粒子按图层渲染回调：fn(layerId, cam, viewProj, w, h)
@@ -469,6 +601,8 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 固定管线表达不了的 colorBlendMode（ColorBurn/Overlay/HSL 系…）
   // 走这条：回读背景当纹理，在 shader 里用 ApplyBlending 算完直接写。见 shaderBlendMode。
   const compBlendProg = linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG)
+  // [we-scene patch] FXAA 抗锯齿（aaMode='fxaa' 时帧末执行，见 renderScene 末尾）
+  const fxaaProg = linkProgram(gl, COPY_VERT, FXAA_FRAG)
 
   const vao = gl.createVertexArray()
   gl.bindVertexArray(vao)
@@ -678,6 +812,15 @@ export function createRenderer(canvas, opts = {}) {
   // 层视差缩放（每帧由 renderScene 更新）
   let layerParallaxScaleX = 0
   let layerParallaxScaleY = 0
+  // [we-scene patch] perspective 图层相机眼点（渲染世界坐标，每帧 renderScene 更新；
+  // 无透视层时为 null）。hit-test 拿它做射线-平面求交。
+  let perspEye = null
+  // _rt_FullFrameBuffer 懒捕获缓存（见 resolveTextureName 注释）：ffbStamp 每帧
+  // renderScene 帧首递增，sceneCanvasW/H 是当前画布尺寸（captureBackdrop 的入参）。
+  let ffbStamp = 0
+  let ffbEntry = null
+  let sceneCanvasW = 0
+  let sceneCanvasH = 0
   // [we-scene patch] g_Frametime 用的帧间隔（秒）。每帧 renderScene 开头由场景时间
   // 差分得出，首帧退化为 1/60（不能给 0：cursorripple 的 timeAmt = dt/0.02 会归零）。
   let lastFrametime = 1 / 60
@@ -762,12 +905,19 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 「层局部像素、原点在层中心」的正交投影，供指针反投影用。
   // 见 g_ModelViewProjectionMatrixInverse 的绑定注释：只有反投影到这个空间，
   // xray 的开窗中心才落在指针处。按尺寸缓存，避免每帧每 pass 新建矩阵。
-  function bindSystemUniforms(uni, layer, time, projW, projH, mvp, modelM, viewProjM, resolutions, passProj, cam) {
+  function bindSystemUniforms(uni, layer, time, projW, projH, mvp, modelM, viewProjM, resolutions, passProj, cam, effectScreenMVP) {
     setVal(uni, 'g_Time', (l) => gl.uniform1f(l, time))
     setVal(uni, 'g_Daytime', (l) => gl.uniform1f(l, daytimeFraction()))
     setVal(uni, 'g_ModelViewProjectionMatrix', (l) => gl.uniformMatrix4fv(l, false, mvp))
     setVal(uni, 'g_ModelMatrix', (l) => gl.uniformMatrix4fv(l, false, modelM))
     setVal(uni, 'g_ViewProjectionMatrix', (l) => gl.uniformMatrix4fv(l, false, viewProjM))
+    // [we-scene patch] g_EffectModelViewProjectionMatrix：pass 顶点 → **画布** NDC
+    // （g_ModelViewProjectionMatrix 是 →效果 FBO）。oscilloscope 的 v_ViewCoord 靠它
+    // 采样 _rt_FullFrameBuffer 对齐屏幕；此前从未绑定（零矩阵）→ xy/z=NaN。
+    // 由调用点按 quad 空间（像素/NDC）算好转置后的矩阵传入（HLSL 行向量约定）。
+    if (effectScreenMVP) {
+      setVal(uni, 'g_EffectModelViewProjectionMatrix', (l) => gl.uniformMatrix4fv(l, false, effectScreenMVP))
+    }
     // [we-scene patch] g_ModelViewProjectionMatrixInverse 曾硬编码为单位矩阵。
     // 这挡死了 xray（6 个壁纸）：它的 .vert 用**这个**矩阵（而非 Effect 版）
     // 把指针反投影成 sprite 的采样中心。两个必须同时满足的条件：
@@ -1192,6 +1342,35 @@ export function createRenderer(canvas, opts = {}) {
 
   function resolveTextureName(name, inputFBO, effectFBOs, textures) {
     if (name === null || name === undefined || name === '') return null
+    // [we-scene patch] `_rt_FullFrameBuffer`（backgroundTexture 隐藏槽，全库 45 张 /
+    // oscilloscope、godrays/shine_combine、clipping_mask、frame_builder）= 本层绘制
+    // **之前**的画布内容。此前落到 `_rt_` 分支返回 null → 白纹理兜底：oscilloscope 的
+    // `mix(bg, albedo.rgb, albedo.a)` 在空容器（albedo.a≈0）上退化成整屏纯白
+    // （3395777145 白屏根因）；albedo.a=1 的层 bg 被短路掉才一直没暴露。
+    // 槽位常走 shader 声明的默认（samplerDefaults），预扫描不到，必须在这里懒捕获。
+    // 语义与 passthrough 的画布回读一致；每帧渲染最多捕获一次（ffbStamp 由
+    // renderScene 帧首递增），与 bloom 的 captureBackdrop 同级开销。
+    if (name === '_rt_FullFrameBuffer') {
+      if (!ffbEntry || ffbEntry.stamp !== ffbStamp) {
+        // captureBackdrop 会把 FRAMEBUFFER 绑回默认画布、把 backdropTex 绑到
+        // **当前活动纹理单元**且不恢复。本函数在 pass 的纹理绑定循环里被调：
+        // 循环按 ti 依次 activeTexture(ti) + bindTexture，capture 会把先前几槽
+        // 已绑好的贴图（combine 的 'previous' = 层输入）**覆盖成 backdropTex** ——
+        // combine 采到的 albedo 变成灰画布，整屏只剩 clearcolor（2921280230 灰屏）；
+        // 不恢复帧缓冲绑定还会把本次 pass 画进画布。两处状态都必须保存/恢复。
+        const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+        const prevTex = gl.getParameter(gl.TEXTURE_BINDING_2D)
+        ffbEntry = {
+          glTex: captureBackdrop(sceneCanvasW || 1, sceneCanvasH || 1),
+          width: sceneCanvasW || 1,
+          height: sceneCanvasH || 1,
+          stamp: ffbStamp,
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo)
+        gl.bindTexture(gl.TEXTURE_2D, prevTex)
+      }
+      return ffbEntry
+    }
     if (name.startsWith('_rt_')) {
       // [we-scene patch] `_rt_imageLayerComposite_<objectId>_a` 指的是**另一个对象**
       // 跑完自己效果链后的合成结果（WE 的「图层作为纹理」：作者把一层设成
@@ -1304,6 +1483,11 @@ export function createRenderer(canvas, opts = {}) {
     strength: gl.getUniformLocation(bloomApplyProg, 'u_Strength'),
     tint: gl.getUniformLocation(bloomApplyProg, 'u_Tint'),
   }
+  const fxaaUni = {
+    mvp: gl.getUniformLocation(fxaaProg, 'u_MVP'),
+    tex: gl.getUniformLocation(fxaaProg, 'u_Tex'),
+    texel: gl.getUniformLocation(fxaaProg, 'u_Texel'),
+  }
   const IDENT_M4 = mat4Identity()
   const IDENT_M3 = mat3Identity()
   function setBlend(mode) {
@@ -1364,6 +1548,9 @@ export function createRenderer(canvas, opts = {}) {
   function isLayerOffscreen(layer, cam) {
     // 透视场景的世界单位不是像素，2D AABB 裁剪会把几乎所有层判到窗外。
     if (cam && cam.perspective) return false
+    // perspective 图层：X/Y 旋转 + 透视投影后 2D AABB 不再成立（旋转可以把屏外
+    // 边缘转进画面），停用裁剪。
+    if (layer.perspective) return false
     const sw = layer.size[0] * layer.scale[0]
     const sh = layer.size[1] * layer.scale[1]
     // 尺寸未知（0）的层不裁：文字/声音/纯效果层的 size 常为 0，但仍可能有内容
@@ -1509,6 +1696,19 @@ export function createRenderer(canvas, opts = {}) {
     }
     // 旋转：参考实现 y-up 空间 rotate(-angle)，等效 y-down 屏幕 rotate(-angle)（正角度=屏幕逆时针）
     m = mat4RotateZ(m, -layer.angles[2])
+    // [we-scene patch] perspective 图层（脚本 thisLayer.perspective=true）再叠
+    // X/Y 轴 3D 旋转，顺序与 WE 重实现（open-wallpaper-engine SceneNode）一致：
+    // M = T·Rz·Ry·Rx。该层由主循环改用 buildLayerPerspectiveVP 的透视 VP 绘制，
+    // 旋转在 z=0 正交对齐的相机下产生透视形变；脚本写 angles 的单位是**角度**，
+    // 沙箱代理（makeScriptAngleVec）已转成弧度。
+    // 符号（渲染世界 y 向下）经投影数值验证，判据 = 卡片朝向指针：
+    //   指针右下 → 脚本 rotation=(+11°,+9°,…) → 右/下边缘必须放大。
+    //   X 保持 +（下边放大=朝下 ✓），**Y 要取负**（+θ 会让左边放大=朝左 ✗）。
+    //   Z 沿用 2D 既有的 -angles[2]（y 翻转约定，全库标定）。
+    if (layer.perspective) {
+      if (layer.angles[1]) m = mat4RotateY(m, -layer.angles[1])
+      if (layer.angles[0]) m = mat4RotateX(m, layer.angles[0])
+    }
     }
     // [we-scene patch] WE alignment：origin 锚在图层 quad 的对应边/角（bottom=底边中点、
     // topleft=左上角…）。这是音频条「底部对齐、随频谱向上伸缩」的基准
@@ -1564,7 +1764,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.useProgram(compBlendProg)
       // 结果由 shader 直接算出，GL 混合必须关掉（再叠一次等于混两遍）
       gl.disable(gl.BLEND)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      bindFinal()
       gl.viewport(0, 0, width, height)
       gl.bindVertexArray(vao)
       uploadQuad('local', LOCAL_QUAD)
@@ -1635,7 +1835,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, groupTarget.fbo.fbo)
       gl.viewport(0, 0, groupTarget.w, groupTarget.h)
     } else {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      bindFinal()
       gl.viewport(0, 0, width, height)
     }
     gl.bindVertexArray(vao)
@@ -1705,7 +1905,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, groupTarget.fbo.fbo)
       gl.viewport(0, 0, groupTarget.w, groupTarget.h)
     } else {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      bindFinal()
       gl.viewport(0, 0, width, height)
     }
     // [we-scene patch] 链尾 FBO 每帧重建 mip：效果链 FBO 本是 LINEAR 无 mip 的，
@@ -1785,6 +1985,19 @@ export function createRenderer(canvas, opts = {}) {
   // 症状是 passthrough 层的背景变成纯黑方块而不是真实画面。
   let backdropTex = null
   function captureBackdrop(width, height) {
+    // [we-scene patch] MSAA 分支：copyTexImage2D 不能读多重采样缓冲
+    // （INVALID_OPERATION），先把当前内容 blit resolve 到一块普通 FBO 再返回其纹理。
+    // 语义与下方画布回读完全一致（调用方只关心「当前已绘制内容」这张纹理）。
+    // RGBA8 即可：blit 不涉copyTexImage2D 的「目标分量必须在源里存在」限制。
+    if (msaaTarget) {
+      const fbo = getFBO(width, height, 'msaaBackdrop')
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaaTarget.fbo)
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fbo.fbo)
+      gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null)
+      return fbo.tex
+    }
     if (backdropTex === null) {
       backdropTex = gl.createTexture()
       gl.bindTexture(gl.TEXTURE_2D, backdropTex)
@@ -1969,7 +2182,7 @@ export function createRenderer(canvas, opts = {}) {
     if (layer.copybackground) {
       for (const n of names) zOrderComposePersist.set(n, fbo)
     }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    bindFinal()
     gl.viewport(0, 0, width, height)
   }
 
@@ -1978,6 +2191,11 @@ export function createRenderer(canvas, opts = {}) {
     renderWidth = width
     renderHeight = height
     fboStamp++
+    // [we-scene patch] MSAA：尺寸/档位变化时重建多重采样目标，并把「最终绘制
+    // 目标」切到它（aaMode=off 时 bindFinal 就是默认帧缓冲，零行为差）。
+    // 必须在 clear 之前绑定 —— 否则清的是画布而画的是 MSAA 缓冲。
+    ensureMsaaTarget(width, height)
+    bindFinal()
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
     // [we-scene patch] 场景环境光（g_LightAmbientColor）：材质 combos.LIGHTING=1
@@ -2002,6 +2220,9 @@ export function createRenderer(canvas, opts = {}) {
     lastFrameTimeStamp = time
     const cam = buildCamera(scene, width, height, fit, alignX, alignY)
     let viewProj = mat4Multiply(cam.projection, cam.view)
+    ffbStamp++
+    sceneCanvasW = width
+    sceneCanvasH = height
 
     // ---- 场景级视差（cameraparallax）+ 对象级视差基准 ----
     const parRaw = general.cameraparallax
@@ -2088,6 +2309,7 @@ export function createRenderer(canvas, opts = {}) {
     // 与视差不同，抖动是**相机自身**位移（整个画面一起晃），所以右乘到 viewProj
     // 才是在世界空间平移 —— 写成左乘会落到投影后的 NDC 空间（全宽仅 2.0），
     // 几十像素的偏移被当成十几个屏幕宽，画面直接跑飞。
+    let shakeM = null
     if (!cam.perspective && opts.shake !== false) {
       const sh = cameraShakeOffset(general, time)
       if (sh) {
@@ -2095,8 +2317,27 @@ export function createRenderer(canvas, opts = {}) {
         const px = sh.x * cam.viewW * 0.02
         const py = sh.y * cam.viewH * 0.02
         if (px !== 0 || py !== 0) {
-          viewProj = mat4Multiply(viewProj, mat4Translate(mat4Identity(), px, py, 0))
+          shakeM = mat4Translate(mat4Identity(), px, py, 0)
+          viewProj = mat4Multiply(viewProj, shakeM)
         }
+      }
+    }
+
+    // [we-scene patch] perspective 图层的独立视图投影（2890473419 3D 卡片倾斜）。
+    // 旗标由脚本 init 写入（thisLayer.perspective=true），挂载后任意帧出现都要
+    // 即时生效，所以每帧探测。z=0 平面与正交逐像素重合（buildLayerPerspectiveVP），
+    // 未旋转的层与普通层无缝对齐。相机抖动同样右乘，两个相机一起晃。
+    let viewProjPersp = null
+    perspEye = null
+    if (!cam.perspective) {
+      for (const l of scene.layers) {
+        if (!l.perspective || l.destroyed) continue
+        const lp = buildLayerPerspectiveVP(cam, general)
+        if (lp) {
+          viewProjPersp = shakeM ? mat4Multiply(lp.viewProj, shakeM) : lp.viewProj
+          perspEye = lp.eye
+        }
+        break
       }
     }
 
@@ -2171,9 +2412,11 @@ export function createRenderer(canvas, opts = {}) {
       // visible:false 形态（2938612768 / 2974757317 各 3 个），另 17 个恰好
       // visible:true 才一直是对的。destroyed 墓碑不放行：那是层已经不存在了。
       if (layer.destroyed) continue
+      // perspective 图层换透视 VP（z=0 与正交逐像素重合，见 buildLayerPerspectiveVP）。
+      const layerVP = layer.perspective && viewProjPersp ? viewProjPersp : viewProj
       if (!layer.visible) {
         if (pendingEmptyCompose.has(layer.id)) {
-          await captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time)
+          await captureEmptyComposeAtZOrder(layer, cam, layerVP, width, height, time)
         }
         continue
       }
@@ -2181,6 +2424,9 @@ export function createRenderer(canvas, opts = {}) {
       // fullscreenlayer）。有 waterripple/pulse/godrays 的必须画，回读走
       // usePassthrough → drawBackdropToFBO。再整层 continue 就是静图（973101892）。
       if (layer.isPostProcess && !(layer.effects || []).some((e) => e.visible)) continue
+      // [we-scene patch] 后处理关档：整屏后期层整层跳过。这类层的内容全部由
+      // 效果链生成（基础贴图常为空/白底），效果直通后裸画 quad 就是白块。
+      if (!effectsEnabled && layer.isPostProcess) continue
       // 组渲染目标的子层：由所属容器在自己的位置统一画（见下方 renderContainerGroup）
       if (groupChildIds.has(layer.id)) continue
       if (layer.isContainer) {
@@ -2191,13 +2437,13 @@ export function createRenderer(canvas, opts = {}) {
         const hasVisibleEffects = (layer.effects || []).some((e) => e.visible)
         if (!hasVisibleEffects) {
           // 空 composelayer 被当成合成源时：在这一刻回读身后画面，再跳过自身绘制。
-          await captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time)
+          await captureEmptyComposeAtZOrder(layer, cam, layerVP, width, height, time)
           continue
         }
         if (layer.hasChildren) {
           // 带子层：走组渲染目标（子层 → 组 FBO → 效果链 → 合成）
           if ((layer.childIds || []).length > 0) {
-            await renderContainerGroup(layer, scene, textures, cam, viewProj, width, height, time)
+            await renderContainerGroup(layer, scene, textures, cam, layerVP, width, height, time)
           }
           continue
         }
@@ -2207,7 +2453,7 @@ export function createRenderer(canvas, opts = {}) {
         // 不再「全部堆在最后」，而是**在图层迭代的正确位置**渲染，确保粒子与场景层正确穿插。
         // 例如雨景的底层雨滴（layer.id=12）渲染在人物层（layer.id~30）之前，人物不被雨幕遮挡。
         if (particleRenderByLayer) {
-          try { await particleRenderByLayer(layer.id, cam, viewProj, width, height) }
+          try { await particleRenderByLayer(layer.id, cam, layerVP, width, height) }
           catch (e) { diag('particle render error: ' + (e && e.message)) }
         }
         continue
@@ -2217,7 +2463,7 @@ export function createRenderer(canvas, opts = {}) {
       // 而屏幕只有 3840 宽），这些层的效果链 FBO 会按整层尺寸分配 —— 跳过屏外层
       // 既省显存与逐 pass 开销，也不会改变画面（屏外内容本就被裁掉）。
       if (isLayerOffscreen(layer, cam)) continue
-      await renderLayer(layer, textures, cam, viewProj, width, height, time)
+      await renderLayer(layer, textures, cam, layerVP, width, height, time)
     }
     // [we-scene patch] camerafade：WE 的开场淡入（全库 127/128 个场景都开着）。
     // scene.json 只有 `camerafade: true` 这个开关，**没有时长参数** —— WE 用固定
@@ -2237,7 +2483,7 @@ export function createRenderer(canvas, opts = {}) {
         gl.useProgram(copyProg)
         gl.enable(gl.BLEND)
         gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+        bindFinal()
         gl.viewport(0, 0, width, height)
         gl.bindVertexArray(vao)
         uploadQuad('pass', PASS_QUAD)
@@ -2255,10 +2501,15 @@ export function createRenderer(canvas, opts = {}) {
         gl.drawArrays(gl.TRIANGLES, 0, 6)
       }
     }
+    // [we-scene patch] MSAA resolve：图层+camerafade 都画进了多重采样缓冲，
+    // 这里解析回默认帧缓冲。之后的 bloom / FXAA 走的都是单采样画布路径，
+    // 与 aaMode=off 完全一致（captureBackdrop 的 copyTexImage2D 也要求如此）。
+    resolveMsaa(width, height)
     // [we-scene patch] 内置 Bloom 后期（general.bloom）。必须最后跑：它吃的是
     // 「本帧最终画面」（含 camerafade 幕布），与 WE 的整屏后期位置一致。
     // strength ≤ 0.001 时 WE 原 shader 三段全部直通/零输出，等价无 bloom。
-    const bloom = bloomPostParams(general)
+    // 后处理关档（effectsEnabled=false）时整个跳过 —— Bloom 也是后处理。
+    const bloom = effectsEnabled ? bloomPostParams(general) : null
     if (!bloomDiagDone) {
       bloomDiagDone = true
       diag(
@@ -2269,6 +2520,23 @@ export function createRenderer(canvas, opts = {}) {
     }
     if (bloom && bloom.strength > 0.001) {
       applyBloomPost(bloom, width, height)
+    }
+    // [we-scene patch] FXAA 抗锯齿：帧末最后一趟，吃「最终画面」（含 bloom）。
+    // captureBackdrop 拷出画布纹理 → 全屏 FXAA pass 覆盖写回（禁混合）。
+    if (aaMode === 'fxaa') {
+      const sceneTex = captureBackdrop(width, height)
+      gl.useProgram(fxaaProg)
+      gl.disable(gl.BLEND)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, width, height)
+      gl.bindVertexArray(vao)
+      uploadQuad('pass', PASS_QUAD)
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, sceneTex)
+      gl.uniform1i(fxaaUni.tex, 0)
+      gl.uniform2f(fxaaUni.texel, 1 / width, 1 / height)
+      gl.uniformMatrix4fv(fxaaUni.mvp, false, IDENT_M4)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
     }
     gl.bindVertexArray(null)
     pruneUnusedFbos()
@@ -2424,7 +2692,7 @@ export function createRenderer(canvas, opts = {}) {
         src.visible = savedVisible
       }
     }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    bindFinal()
     gl.viewport(0, 0, width, height)
   }
 
@@ -2660,7 +2928,9 @@ export function createRenderer(canvas, opts = {}) {
       layer.color[2] * layer.brightness * amb[2],
       layer.alpha,
     ]
-    const effects = (layer.effects || []).filter((e) => e.visible)
+    // [we-scene patch] 后处理关档：效果列表置空，落入下方既有的「无效果直接
+    // 合成」路径（基础层照常绘制，效果链整体直通）。
+    const effects = effectsEnabled ? (layer.effects || []).filter((e) => e.visible) : []
 
     // 效果降采样（性能档位）：fboCapFactor > 0 时效果链 FBO 上限 = 屏幕占比 × 系数（0=全质量）。
     // 注意 copy pass 会把**整张贴图**铺满 fboW×fboH，所以任何缩小 FBO 的做法都是降质，
@@ -2851,7 +3121,7 @@ export function createRenderer(canvas, opts = {}) {
           // 画布再经层 FBO 倒置，就是 1444077782 左侧那块硬边白三角。
           // 其余效果 pass 一律 TRIANGLES 6，copy 必须同构。
           gl.drawArrays(gl.TRIANGLES, 0, 6)
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+          bindFinal()
         }
         continue
       }
@@ -2944,7 +3214,21 @@ export function createRenderer(canvas, opts = {}) {
         resolutions.set(ti, [t.width, t.height, t.width, t.height])
       }
       // 系统 uniform（mvp 随 quad 空间，见上方说明）
-      bindSystemUniforms(uni, layer, time, cam.projW, cam.projH, passMVP, layerOrtho, IDENT_M4, resolutions, layerOrtho, cam)
+      // g_EffectModelViewProjectionMatrix：pass 顶点 → 画布 NDC。链末端 compositeLayer
+      // 把 FBO 内容按层矩形贴回画布（model*scale(w,h)，FBO 全域=层矩形全域），
+      // 所以 pass 像素先归一到层局部 [-0.5,0.5]，再经同一模型矩阵到世界、经 viewProj
+      // 到画布 NDC。NDC 直通 quad 的局部归一是 scale(0.5)。puppet contentRect 的
+      // 映射不走这层矩形基准，此处不覆盖（语料暂无 backgroundTexture×puppet）。
+      let effectScreenMVP = null
+      if (uni.get('g_EffectModelViewProjectionMatrix')) {
+        const base = layerModelMatrix(layer, cam)
+        let em = mat4Scale(base.m, base.w, base.h, 1)
+        em = usePixelQuad
+          ? mat4Multiply(em, mat4Scale(mat4Translate(mat4Identity(), -0.5, -0.5, 0), 1 / outFBO.width, 1 / outFBO.height, 1))
+          : mat4Multiply(em, mat4Scale(mat4Identity(), 0.5, 0.5, 1))
+        effectScreenMVP = mat4Transpose(mat4Multiply(viewProj, em))
+      }
+      bindSystemUniforms(uni, layer, time, cam.projW, cam.projH, passMVP, layerOrtho, IDENT_M4, resolutions, layerOrtho, cam, effectScreenMVP)
       // 常量（material 名 → uniform 映射）
       // [we-scene patch] 先跑常量脚本：带 {script} 的常量逐帧求值后才是当前值。
       // cacheKey 用 shader + pass 序号，保证同一 pass 的沙箱跨帧复用（脚本有内部状态）。
@@ -2995,14 +3279,9 @@ export function createRenderer(canvas, opts = {}) {
       // 只看末尾就取不到任何 alpha 信息 → 误判成「无信息 → 加法」→ 音频条又被
       // 刷成整块白（实测两块白色矩形）。语义上只要链上**有一个** pass 把形状写进
       // alpha，最终 FBO 的 alpha 就携带形状，就该按 alpha 合成。
-      let meaningful = false
-      for (const src of chainFragGlsl) {
-        if (typeof src !== 'string') continue
-        const m = src.match(/\bfloat\s+alpha\s*=\s*([^;]+);/)
-        if (m && !/^\s*scene\s*\.\s*a\s*$/.test(m[1])) { meaningful = true; break }
-      }
-      layer.containerAlphaMeaningful = meaningful
-      diag(`container "${layer.name || '?'}" alpha ${meaningful ? '携带形状 → SRC_ALPHA' : '无信息 → 加法'}`)
+      // 判据实现与 verifier 单源共享（chainAlphaMeaningful 的注释即两族语义）。
+      layer.containerAlphaMeaningful = chainAlphaMeaningful(chainFragGlsl)
+      diag(`container "${layer.name || '?'}" alpha ${layer.containerAlphaMeaningful ? '携带形状 → SRC_ALPHA' : '无信息 → 加法'}`)
     }
     // [we-scene patch] puppet 收尾：效果链输出的是**贴图空间**的成品（丝袜已经合成
     // 在腿上、蒙版已按层矩形生效），现在才让网格采样它做形变。走的仍是无效果那条
@@ -3037,6 +3316,25 @@ export function createRenderer(canvas, opts = {}) {
     // 运行时切换效果降采样系数（性能档位：0=全质量，1=效果链 ≤ 屏幕尺寸）
     setFboCapFactor: function (v) {
       fboCapFactor = v
+    },
+    // [we-scene patch] 抗锯齿模式热切换：'off' | 'fxaa' | 'msaa2' | 'msaa4'。
+    // 非法值按 off 处理；MSAA 目标在下一帧 renderScene 开头按新档位重建。
+    setAntiAliasing: function (mode) {
+      aaMode = (mode === 'fxaa' || mode === 'msaa2' || mode === 'msaa4') ? mode : 'off'
+    },
+    // [we-scene patch] 后处理总开关热切换（false = 效果链直通 + 跳整屏后期层 + 关 Bloom）
+    setEffectsEnabled: function (on) {
+      effectsEnabled = !!on
+    },
+    // [we-scene patch] 当前帧的「最终绘制目标」FBO（MSAA 开 = 多重采样 FBO，
+    // 关 = null 即默认帧缓冲）。粒子系统自己绑帧缓冲，经这个出口拿同一目标。
+    getFrameTarget: function () {
+      return msaaTarget ? msaaTarget.fbo : null
+    },
+    // [we-scene patch] 「当前已绘制内容」纹理捕获（REFRACT 粒子注入用）。
+    // 内部带 MSAA blit 分支；MSAA 关时 = 原 copyTexImage2D 画布回读。
+    captureSceneTexture: function (w, h) {
+      return captureBackdrop(w, h)
     },
     // [we-scene patch] 注入粒子推进+按层渲染回调：
     //   advanceFn() — 每帧推进所有粒子系统（由宿主管理 dt 和 audio）
@@ -3098,6 +3396,10 @@ export function createRenderer(canvas, opts = {}) {
     // 位置」换回图层世界坐标（视差场景下画面相对 cam 窗口整体平移了这么多）。
     getParallaxOffset: function () {
       return { x: layerParallaxScaleX, y: layerParallaxScaleY }
+    },
+    // perspective 图层相机眼点（渲染世界坐标），无透视层返回 null。hit-test 用。
+    getPerspectiveEye: function () {
+      return perspEye
     },
     // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
     dispose: function () {

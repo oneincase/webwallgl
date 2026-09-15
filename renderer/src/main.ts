@@ -28,6 +28,7 @@ import {
 } from "./shell";
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
+import { normalizeQuality, qualityFromQuery, type QualityOptions, type ResolvedQuality } from "./quality";
 import { weShimCall } from "./web";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 
@@ -160,6 +161,10 @@ declare global {
       restore(): void;
       setRenderDpr(dpr: number): void;
       setSceneFps(fps: number): void;
+      /** 性能设置热更（抗锯齿/粒子/后处理档位，部分更新、不重挂载） */
+      setQuality(patch: QualityOptions): void;
+      /** 当前生效的质量设置（三项齐全） */
+      getQuality(): ResolvedQuality;
       /** 切换滤镜（beta）：传白名单 id（WALLPAPER_FILTERS），未知 id 按无滤镜处理 */
       setFilter(filter: string): void;
       /** 热更新 WE 网页壁纸用户属性（wire 格式：{name: {value: ...}}） */
@@ -333,6 +338,15 @@ window.__wp = {
     rt.cfg.sceneFps = fps;
     weShimCall(rt, (w: any) => w.__weSetFps?.(fps));
   },
+  // 性能设置热更（抗锯齿/粒子/后处理档位）：就地生效不重挂载；写回 cfg 让
+  // setRenderDpr 这类重挂路径之后仍保持。只传要改的键（部分更新）。
+  setQuality(patch: QualityOptions) {
+    rt.cfg.quality = { ...normalizeQuality(rt.cfg.quality), ...(patch ?? {}) };
+    rt.sceneCtl?.setQuality?.(patch ?? {});
+  },
+  getQuality() {
+    return normalizeQuality(rt.cfg.quality);
+  },
   // 切换滤镜（beta）：查白名单后应用到 wrap，CSS 合成层处理，无需重挂载
   setFilter(filter: string) {
     rt.cfg.filter = filter;
@@ -439,6 +453,8 @@ const initialCfg: WallpaperConfig = {
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
   opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
   clearColor: params.get("clearColor") ?? undefined,
+  // 性能设置（aa/pq/pp）：测试台工具条与宿主的抗锯齿/粒子/后处理档位
+  quality: qualityFromQuery((k) => params.get(k)),
 };
 rt.cfg = initialCfg;
 applyWallpaperFilter(rt);

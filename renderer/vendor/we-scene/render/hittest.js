@@ -29,6 +29,15 @@ import { parallaxDepthFactor } from './math.js'
  * 做法：把**世界点逆变换回局部空间**（而不是把 quad 正变换到世界再做多边形判定）——
  * 逆变换后只需比较 |lx| ≤ 0.5 && |ly| ≤ 0.5，既简单又天然支持旋转与非等比缩放。
  *
+ * ---- perspective 图层（2026-09-15 补）----
+ *
+ * layer.perspective 的层由 buildLayerPerspectiveVP 的透视相机绘制，模型矩阵多叠
+ * 了 X/Y 旋转（M = T·Rz·Ry·Rx，与 layerModelMatrix 同序）。这类层的命中不能再用
+ * 「世界点逆变换」（点在 z=0、层已旋出 z=0 平面），改做**射线-平面求交**：
+ * 指针在 z=0 上的世界点 (wx,wy,0) 与透视眼点 eye 连成射线，与图层旋转后的平面
+ * 求交，交点再经 Rᵀ 逆旋回局部。z=0 平面上两个相机逐像素重合，所以非透视层
+ * 不受影响仍走原路径。
+ *
  * ---- 可见性必须沿父链 ----
  *
  * parse.js 已经把「沿父链求得的有效可见性」算进 layer.visible，这里直接用。
@@ -49,7 +58,7 @@ import { parallaxDepthFactor } from './math.js'
  * @param {Record<string, number[]>} alignTable ALIGN 表（由渲染器传入，保持单一真源）
  * @returns {{lx:number, ly:number, w:number, h:number}|null}
  */
-export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable) {
+export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, perspEye) {
   const size = layer.size || [0, 0]
   const scale = layer.scale || [1, 1, 1]
   const w = size[0] * scale[0]
@@ -76,6 +85,11 @@ export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignT
     const fy = parallaxDepthFactor(d[1])
     cx += fx * parOffX
     cy += fy * parOffY
+  }
+
+  // perspective 图层：射线-平面求交（见文件头「perspective 图层」节）。
+  if (layer.perspective && perspEye) {
+    return perspLayerLocal(layer, wx, wy, cx, cy, w, h, alignTable, perspEye)
   }
 
   // 先平移到以锚点为原点
@@ -111,6 +125,51 @@ export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignT
   return { lx: px / w, ly: py / h, w, h }
 }
 
+// 列主序 3×3，与 math.js 的 mat4Rotate* 同排布、同符号。
+function rotZ3(a) { const c = Math.cos(a), s = Math.sin(a); return [c, s, 0, -s, c, 0, 0, 0, 1] }
+function rotY3(a) { const c = Math.cos(a), s = Math.sin(a); return [c, 0, -s, 0, 1, 0, s, 0, c] }
+function rotX3(a) { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, s, 0, -s, c] }
+function mul3(a, b) {
+  const o = new Array(9)
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++) {
+    o[c * 3 + r] = a[r] * b[c * 3] + a[3 + r] * b[c * 3 + 1] + a[6 + r] * b[c * 3 + 2]
+  }
+  return o
+}
+
+/**
+ * perspective 图层的命中：透视眼点 eye 与指针 z=0 世界点连成射线，
+ * 与图层旋转平面（锚点 C、法线 R·(0,0,1)）求交，交点逆旋回局部。
+ * 旋转 R = Rz(-z)·Ry(-y)·Rx(x)，与 layerModelMatrix 的透视分支**逐字同序同号**
+ * （Y 取负见 renderer.js 透视分支注释）；锚点 C 的视差偏移已在调用点并入 cx/cy。
+ */
+function perspLayerLocal(layer, wx, wy, cx, cy, w, h, alignTable, eye) {
+  const cz = (layer.origin || [0, 0, 0])[2] || 0
+  const angles = layer.angles || [0, 0, 0]
+  let r = rotZ3(-(angles[2] || 0))
+  r = mul3(r, rotY3(-(angles[1] || 0)))
+  r = mul3(r, rotX3(angles[0] || 0))
+  // 平面法线 = R 的第三列
+  const nx = r[6], ny = r[7], nz = r[8]
+  const dx = wx - eye[0], dy = wy - eye[1], dz = -eye[2]
+  const denom = nx * dx + ny * dy + nz * dz
+  if (Math.abs(denom) < 1e-9) return null
+  const ex = cx - eye[0], ey = cy - eye[1], ez = cz - eye[2]
+  const t = (nx * ex + ny * ey + nz * ez) / denom
+  const px = eye[0] + dx * t - cx
+  const py = eye[1] + dy * t - cy
+  const pz = eye[2] + dz * t - cz
+  // v = Rᵀ·p（R 正交，逆=转置；列主序下即各列与 p 的点积）
+  let lx = r[0] * px + r[1] * py + r[2] * pz
+  let ly = r[3] * px + r[4] * py + r[5] * pz
+  const a = (alignTable && alignTable[layer.alignment]) || [0.5, 0.5]
+  if (a[0] !== 0.5 || a[1] !== 0.5) {
+    lx -= (0.5 - a[0]) * w
+    ly -= (0.5 - a[1]) * h
+  }
+  return { lx: lx / w, ly: ly / h, w, h }
+}
+
 /**
  * 命中测试：返回最上层（z 序最后）命中的可见图层。
  *
@@ -122,6 +181,8 @@ export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignT
  * @param {number} [opts.parOffX] 对象视差位移 x
  * @param {number} [opts.parOffY] 对象视差位移 y
  * @param {Record<string, number[]>} [opts.alignTable] ALIGN 表
+ * @param {number[]} [opts.perspEye] perspective 图层相机眼点（renderer.getPerspectiveEye()），
+ *   场景无透视层时为 null/缺省
  * @param {(layer:object)=>boolean} [opts.filter] 额外过滤（例如只考虑挂了 cursor 回调的层）
  * @returns {object|null} 命中的图层，或 null
  */
@@ -137,7 +198,7 @@ export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
     // 可见性已由 parse.js 沿父链求得（见文件头说明），隐藏层不参与命中
     if (!layer || !layer.visible || layer.destroyed) continue
     if (filter && !filter(layer)) continue
-    const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable)
+    const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye)
     if (!loc) continue
     if (Math.abs(loc.lx) <= 0.5 && Math.abs(loc.ly) <= 0.5) return layer
   }

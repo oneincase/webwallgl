@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.23/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.23/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -101,7 +101,6 @@ The library makes only two network requests (scene.pkg and optional project.json
 
 | Factory | Use case |
 | --- | --- |
-| `1.3.16` | 2026-09-11 | Media-component fixes and branding: (1) album covers on 33 wallpapers rendered as black placeholders because the $mediaThumbnail / $mediaPreviousThumbnail binding in an effect pass usertextures slot was dropped by parsing; the binding is now merged so covers show. (2) media title/artist layers were blank because width-limited wrapping was squeezed by the 2x2 placeholder box; the text canvas now grows only for placeholder-sized boxes, and typewriter scripts no longer stick at the placeholder text. (3) simulated audio is now true stereo. (4) the simulated media source is rebranded: title WebWallGL, artist oneincase, cover is the library logo. (5) fix lost font after the shared text canvas is resized: assigning textCanvas.width/height resets the 2D context and wipes the font back to the default 10px, so large clocks/dates were nearly invisible (2468489223, 3379996991); drawing now uses an explicit font string. (6) fix clock/date scripts misclassified as writeback and having their text cleared (3379996991). |
 | `httpSource(baseUrl, init?)` | HTTP base URL; falls back through the three real layouts: scene.pkg → scenes/scene.pkg → gifscene.pkg |
 | `fileSource(file, project?)` | A local .pkg from &lt;input type=file> or drag & drop |
 | `bytesSource(pkg, project?, key?)` | Bytes already in hand (bundled, IndexedDB cache, custom transport) |
@@ -131,6 +130,7 @@ input.addEventListener("change", () => {
 | `properties` | `{}` | Initial user property overrides (keys are property names) |
 | `pointer / audio / media` | `built-in` | Pointer follows the canvas; audio/media are deterministic sims; pass null to disable |
 | `features` | `all on` | Debug switches: models / text / particles / effects / components |
+| `quality` | `all defaults` | Render quality tiers (like the WE client's performance options): antiAliasing "off" (default)/"fxaa"/"msaa2"/"msaa4", particles "high" (default)/"medium"/"low"/"off" (low/medium scale both the count cap and emission rate), postProcessing "high" (default)/"medium"/"low"/"off" (low/medium cap effect-chain FBO resolution; off bypasses effect chains, fullscreen post layers and Bloom). Supersampling lives in renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | Callback surface; can also subscribe later via instance.on() |
 
 ## The SceneInstance API
@@ -140,6 +140,7 @@ input.addEventListener("change", () => {
 | `pause() / resume() / paused` | Pause/resume. Never remounts the package: video/audio resume from where they were |
 | `setFit(fit) / setFps(n) / setVolume(v)` | Live updates, no remount (the render loop reads them per frame) |
 | `setRenderDpr(dpr)` | Changing DPR rebuilds the canvas; remounts internally (pkg cache hit, no re-download) |
+| `setQuality(patch) / getQuality()` | Live quality-tier patch (partial update), applied in place with no remount; survives scene/load() changes |
 | `setProperties(props)` | Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch |
 | `getProperties()` | The current flattened property value map |
 | `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Works for scene and web |
@@ -329,10 +330,11 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.3.22. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
+Current version: 1.3.23. This section records only user-visible changes (API, behavior, compatibility, fidelity), each backed by a commit in the repository; pure internal refactors and verifier scripts are omitted.
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| `1.3.23` | 2026-09-15 | New render quality settings (mirroring the WE client's performance options): MountOptions.quality plus SceneInstance.setQuality()/getQuality(), all applied live without remount — antiAliasing (off default / fxaa final-frame post pass / msaa2 / msaa4 multisampling), particles (high default / medium / low scaling both the count cap and emission rate / off = no simulate, no render), postProcessing (high default / medium / low capping effect-chain FBO resolution / off bypassing effect chains, fullscreen post layers and Bloom). Fixed MSAA being completely broken on WebKit (WKWebView/ANGLE Metal): the blit from the multisampled buffer to the default framebuffer was silently rejected with INVALID_OPERATION (freezing the picture on the last pre-switch frame); resolve now blits to a same-format texture FBO and composites it back with a fullscreen copy. |
 | `1.3.22` | 2026-09-15 | SceneScript lifecycle, particle script hooks and built-in-music response wired up, raising fidelity: (1) the resizeScreen(size) lifecycle event is dispatched in CSS pixels when the window/resolution changes (including the first frame and portrait orientation) and engine.screenResolution updates with it, so adaptive-scale wallpapers (3396722575/3405117965/3002120692) are no longer locked to a 1920×1080 layout. (2) engine.timeOfDay previously sampled once at mount, so day/night and night-light wallpapers (6 incl. 2134765860/3151551777) never transitioned no matter how long they ran; it now refreshes per second with real time. (3) SceneScript localStorage now matches WE semantics: shared by all scripts of one wallpaper, persisted across sessions, with LOCATION_SCREEN/LOCATION_GLOBAL and the WE delete name; by default the library uses browser localStorage namespaced per wallpaper, and hosts can inject a custom persistent backend via the new cfg.storageProvider. (4) Particle instanceoverride scripts (29 wallpapers) are connected: rate/count/size/alpha/color can be driven per frame (e.g. by audio). (5) animationlayers visibility scripts and thisLayer.getAnimationLayer(name) are connected (8 wallpapers, puppet "frame-offset" mechanism), plus originalOrigin (drag reset) and getMaterial(index) (editing material constants no longer crashes the script). (6) built-in BGM now drives audio visualization — previously the wallpaper's own music played but bars/particles only reacted to the simulated or microphone source (35 wallpapers). (7) materials with LIGHTING enabled receive ambient light from general.ambientcolor. (8) fixed "HD still not native on Retina/HiDPI screens": renderDpr default changed from 1 to 0 (auto-follow device DPR), and the target DPR may now exceed the reported devicePixelRatio (some host WKWebViews always report 1; the old min(deviceDpr, renderDpr) pinned HD mode to logical pixels, rendering only a quarter of the physical area on 3.5K/Retina). Physical long edge is capped at 4096 to bound VRAM; video decode buffers still cap at device DPR (supersampling there gives no gain). |
 | `1.3.21` | 2026-09-14 | Fixed a toggle whose state changed but whose knob didn't slide (2983846453): scripts writing via thisScene.getLayer(x).origin= hit the world slot while the bound field was overwritten every frame from the local basis, cancelling the movement; reads and writes now consistently use local space. Also includes the follow-up fix for variable-length bone-name MDLS parsing from 3463520581 |
 | `1.3.20` | 2026-09-14 | Fixed visible transparent squares on soft particles such as car exhaust and human breath (2241938645/2250845956): the low-alpha fringe of built-in smoke/fog textures was magnified by large sprites into straight-edged gray veils; now sealed with a gaussian radial falloff, affecting ~110 wallpapers |

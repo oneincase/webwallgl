@@ -489,6 +489,11 @@ export function parseScene(sceneJson, project) {
       brightness: parseNum(o.brightness, 1),
       copybackground: !!o.copybackground,
       colorBlendMode: o.colorBlendMode || 0,
+      // 静态 perspective 旗标（全库 22 层 / 16 张，多为时钟/人物；3794216052 的
+      // Audio/帧率显示带非零静态 X/Y 角 = 作者要固定 3D 倾斜）。脚本侧
+      // thisLayer.perspective=true 是另一条写入路径（对象层代理 setter）。
+      // 零角度的层在 z=0 上与正交逐像素重合，透传不改变它们的画面。
+      perspective: o.perspective === true ? true : undefined,
       // 视差深度（vec2：x/y 方向分量；近景正值位移大、远景负值反向）
       parallaxDepth: o.parallaxDepth !== undefined ? parseVec2(o.parallaxDepth) : null,
       effects: (o.effects || []).map((e) => ({

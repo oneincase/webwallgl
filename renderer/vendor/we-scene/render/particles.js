@@ -20,6 +20,37 @@
 import { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
 import { buildParticleProgram } from './particle-shaders.js'
 
+// [we-scene patch] 粒子质量倍率（性能设置面板「粒子」档）：同时缩 maxcount 上限
+// 与发射率，语义与 instanceoverride 的 count 倍率一致（见 _applyOverride 注释）。
+// 装配层（scene-mount）在档位切换时调 setter 并触发各系统 _applyOverride 重建池。
+// 「关」档不经过这里：装配层直接跳过推进与渲染（零 CPU 模拟）。
+let particleQualityScale = 1
+export function setParticleQualityScale(s) {
+  const n = Number(s)
+  particleQualityScale = Number.isFinite(n) && n >= 0 ? n : 1
+}
+export function getParticleQualityScale() {
+  return particleQualityScale
+}
+
+// [we-scene patch] 绘制目标/场景捕获注入（MSAA 支持）。粒子 render() 历史上
+// 不绑帧缓冲，靠「上一个合成调用残留的绑定」画到画布 —— MSAA 开启后最终目标
+// 变成多重采样 FBO，必须显式绑定；REFRACT 的 copyTexImage2D 也不能读多重采样
+// 缓冲，改由 renderer 的 captureBackdrop（内部带 MSAA blit 分支）代抓。
+// 两个 provider 都由装配层注入；未注入时（离线 verifier 等）保持原行为。
+let particleFrameTargetProvider = null
+export function setParticleFrameTargetProvider(fn) {
+  particleFrameTargetProvider = typeof fn === 'function' ? fn : null
+}
+let particleSceneCaptureFn = null
+export function setParticleSceneCapture(fn) {
+  particleSceneCaptureFn = typeof fn === 'function' ? fn : null
+}
+function bindParticleFrameTarget(gl) {
+  const t = particleFrameTargetProvider ? particleFrameTargetProvider() : null
+  gl.bindFramebuffer(gl.FRAMEBUFFER, t || null)
+}
+
 /** genericparticle 的 REFRACT combo：槽 0 常常是空白白图，形状在法线槽。 */
 export function particlePassRefract(mat) {
   const c = mat && mat.passes && mat.passes[0] && mat.passes[0].combos
@@ -151,7 +182,8 @@ export class ParticleSystem {
     // WE 语义：图层 origin 是发射器世界位置，scale 缩放整个系统（尺寸与速度同步缩放），
     // angles.z 旋转发射方向。忽略它们会让所有粒子堆在世界原点。
     this.syncLayerTransform()
-    this.maxCount = Math.max(1, Math.min(20000, num(this.model.maxcount, 100)))
+    // 质量倍率与 _applyOverride 里同一处数学保持一致（构造路径无 override 时的初始池）
+    this.maxCount = Math.max(1, Math.min(20000, num(this.model.maxcount, 100) * particleQualityScale))
     // 发射累加器改为按发射器各存一份（见 _step），此字段仅保留以防外部引用
     this.simTime = 0
     this.paused = false
@@ -260,7 +292,9 @@ export class ParticleSystem {
     this._ov = {}
     this.opacityMul = 1
     this.lifetimeMul = 1
-    this.maxCount = Math.max(1, Math.min(20000, num(this.model.maxcount, 100)))
+    // 粒子质量倍率（性能档位）：折进 maxcount 与 countMul 两处，与 count override
+    // 同数学 —— 上限与发射率同比例缩，稳态密度才真的降（见下方 count 分支注释）。
+    this.maxCount = Math.max(1, Math.min(20000, num(this.model.maxcount, 100) * particleQualityScale))
     const ov = this.override || {}
     for (const k of Object.keys(ov)) {
       if (k === 'id') continue
@@ -276,7 +310,7 @@ export class ParticleSystem {
         // 表现为「画面正中一块过密的长方形雨」）；同时缩发射率则降到 13%。
         const base = num(this.model.maxcount, 100)
         const mul = Number(val)
-        const m = Number.isFinite(mul) ? mul : 1
+        const m = (Number.isFinite(mul) ? mul : 1) * particleQualityScale
         this.maxCount = Math.max(1, Math.min(20000, Math.round(base * m)))
         this._ov.countMul = m
       } else if (k === 'alpha') {
@@ -1451,6 +1485,10 @@ export class ParticleSystem {
     }
 
     const prog = this._prog
+    // [we-scene patch] 显式绑定「最终绘制目标」（MSAA 时是多重采样 FBO，否则
+    // 是默认帧缓冲）。历史上不绑、靠残留状态画到画布；MSAA 下残留目标可能是
+    // 上一帧某个效果链 FBO，必须钉死。
+    bindParticleFrameTarget(gl)
     gl.useProgram(prog.prog)
     gl.bindVertexArray(this._vao)
     gl.bindBuffer(gl.ARRAY_BUFFER, this._vbuf)
@@ -1474,21 +1512,30 @@ export class ParticleSystem {
       if (sampleScene) {
         const dw = gl.drawingBufferWidth || width
         const dh = gl.drawingBufferHeight || height
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
         // 必须在 TEXTURE2 上绑 scene 拷贝：copyTexImage2D 写的是当前 unit，
         // 若仍停在 TEXTURE1 会把法线贴图覆盖掉。
         gl.activeTexture(gl.TEXTURE2)
-        if (!this._sceneTex) {
-          this._sceneTex = gl.createTexture()
-          gl.bindTexture(gl.TEXTURE_2D, this._sceneTex)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        if (particleSceneCaptureFn) {
+          // [we-scene patch] MSAA 安全路径：由 renderer 代抓「当前已绘制内容」
+          // （多重采样缓冲不能 copyTexImage2D，captureBackdrop 内部走 blit）。
+          // 抓取会动帧缓冲绑定，拿回纹理后必须重新绑回绘制目标。
+          const tex = particleSceneCaptureFn(dw, dh)
+          gl.bindTexture(gl.TEXTURE_2D, tex || this.texture.glTex)
+          bindParticleFrameTarget(gl)
         } else {
-          gl.bindTexture(gl.TEXTURE_2D, this._sceneTex)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+          if (!this._sceneTex) {
+            this._sceneTex = gl.createTexture()
+            gl.bindTexture(gl.TEXTURE_2D, this._sceneTex)
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+          } else {
+            gl.bindTexture(gl.TEXTURE_2D, this._sceneTex)
+          }
+          gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, dw, dh, 0)
         }
-        gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, dw, dh, 0)
         if (prog.uniScene) gl.uniform1i(prog.uniScene, 2)
         if (prog.uniResolution) gl.uniform2f(prog.uniResolution, dw, dh)
         if (prog.uniRefractScale) gl.uniform1f(prog.uniRefractScale, this.refractAmount || 0.04)

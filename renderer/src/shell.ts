@@ -8,6 +8,7 @@
 // 依赖方向：shell ← web / media / scene-mount / dispatch / api / main（单向，无环）。
 import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math.js";
 import type { WallpaperConfig, WallpaperFit } from "./types";
+import type { QualityOptions } from "./quality";
 import type { VideoLoopPair } from "./video-loop";
 
 /**
@@ -93,6 +94,8 @@ export type Runtime = {
     pause(): void;
     resume(): void;
     applyUserProperties(props: Record<string, { value: unknown }>): void;
+    /** 性能设置热更（抗锯齿/粒子/后处理档位，就地生效不重挂载） */
+    setQuality?(q: QualityOptions): void;
   };
   /**
    * 外部指针注入句柄（桌面壁纸窗口在桌面 underlay 层收不到鼠标事件，由宿主

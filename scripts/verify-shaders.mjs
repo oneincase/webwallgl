@@ -604,6 +604,71 @@ const wireErrors = [];
       wireErrors.push("hlsl2glsl.js 必须包含 float 数组二维下标展平");
     }
   }
+  // ---------- 容器 alpha 语义判定（chainAlphaMeaningful 真实现 + 真语料） ----------
+  // 3395777145 白屏根因之二：oscilloscope 家族的 alpha 由 BlendTransparency 按波形
+  // 成形且 rgb 自带背景（_rt_FullFrameBuffer 混入），被误判「无信息 → 加法」时背景
+  // 在画布上叠两遍 → 整屏泛白。判据必须跑真实现（renderer.js 导出的纯函数）
+  // 与真 shader 语料：oscilloscope/Simple_Audio_Bars → true，audio_ring → false。
+  {
+    const { chainAlphaMeaningful } = await imp("renderer/vendor/we-scene/render/renderer.js");
+    // 1) oscilloscope（3395777145 的 2799421411）
+    const oscPkgPath = join(LIB, "3395777145", "scene.pkg");
+    if (!fs.existsSync(oscPkgPath)) {
+      console.log("  （跳过 3395777145 语料：本机无此壁纸）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(oscPkgPath));
+      const frag = getEntry(pkg, "shaders/workshop/2799421411/effects/audio_responsive_oscilloscope.frag");
+      const glsl = hlsl2glsl(readText(frag), "frag", {}, makeResolver(pkg), "");
+      if (chainAlphaMeaningful([glsl]) !== true) {
+        wireErrors.push("oscilloscope 的 BlendTransparency 形状 alpha 必须判「携带形状」（3395777145 白屏）");
+      }
+    }
+    // 2) audio_ring（加法族，2134765860 的 2504730727）：仍必须判「无信息 → 加法」
+    const ringPkgPath = join(LIB, "2134765860", "scene.pkg");
+    if (fs.existsSync(ringPkgPath)) {
+      const pkg = parsePkg(fs.readFileSync(ringPkgPath));
+      const frag = getEntry(pkg, "shaders/workshop/2504730727/effects/audio_ring.frag");
+      const glsl = hlsl2glsl(readText(frag), "frag", {}, makeResolver(pkg), "");
+      if (chainAlphaMeaningful([glsl]) !== false) {
+        wireErrors.push("audio_ring 的 alpha=scene.a 必须仍判「无信息 → 加法」（加法族回归面）");
+      }
+    }
+    // 3) Simple_Audio_Bars（2134765860 同包 2084198056）：float alpha=bar 族 → true
+    if (fs.existsSync(ringPkgPath)) {
+      const pkg = parsePkg(fs.readFileSync(ringPkgPath));
+      const frag = pkg.entries.find((e) => e.name.endsWith("Simple_Audio_Bars.frag"));
+      if (frag) {
+        const glsl = hlsl2glsl(readText(getEntry(pkg, frag.name)), "frag", {}, makeResolver(pkg), "");
+        if (chainAlphaMeaningful([glsl]) !== true) {
+          wireErrors.push("Simple_Audio_Bars 的 float alpha=bar 必须判「携带形状」");
+        }
+      }
+    }
+    // 4) 接线：renderer.js 的合成判定必须走共享纯函数
+    const rndSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/containerAlphaMeaningful = chainAlphaMeaningful\(chainFragGlsl\)/.test(rndSrc)) {
+      wireErrors.push("renderer.js 容器 alpha 判定必须调用 chainAlphaMeaningful(chainFragGlsl)");
+    }
+    // 5) _rt_FullFrameBuffer 懒捕获（3395777145 白屏根因之一：背景纹理落空成白纹理）
+    if (!/name === '_rt_FullFrameBuffer'/.test(rndSrc) || !/ffbEntry[\s\S]{0,200}captureBackdrop/.test(rndSrc)) {
+      wireErrors.push("resolveTextureName 必须对 _rt_FullFrameBuffer 懒捕获画布（背景纹理不能落白纹理）");
+    }
+    // 5b) 懒捕获在 pass 纹理绑定循环里被调，必须保存/恢复 GL 状态——
+    // captureBackdrop 会把帧缓冲绑回默认画布、把 backdropTex 绑到当前活动纹理单元：
+    // 不恢复则本次 pass 画进画布、且先前几槽已绑的贴图（combine 的 'previous'=层输入）
+    // 被覆盖成 backdropTex（2921280230 整屏 clearcolor 灰）。
+    if (!/TEXTURE_BINDING_2D\)[\s\S]{0,400}gl\.bindTexture\(gl\.TEXTURE_2D, prevTex\)/.test(rndSrc)) {
+      wireErrors.push("_rt_FullFrameBuffer 懒捕获必须保存/恢复纹理单元绑定（防覆盖 'previous' 槽）");
+    }
+    if (!/FRAMEBUFFER_BINDING\)[\s\S]{0,400}gl\.bindFramebuffer\(gl\.FRAMEBUFFER, prevFbo\)/.test(rndSrc)) {
+      wireErrors.push("_rt_FullFrameBuffer 懒捕获必须保存/恢复帧缓冲绑定（防 pass 画进画布）");
+    }
+    // 6) g_EffectModelViewProjectionMatrix 必须按 quad 空间计算并绑定
+    if (!/g_EffectModelViewProjectionMatrix/.test(rndSrc) || !/effectScreenMVP/.test(rndSrc)) {
+      wireErrors.push("g_EffectModelViewProjectionMatrix 未接线（v_ViewCoord 会是零矩阵/NaN）");
+    }
+  }
+
   const ringPkg = join(LIB, "3784370784", "scene.pkg");
   if (fs.existsSync(ringPkg)) {
     let pkg;

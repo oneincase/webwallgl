@@ -361,6 +361,42 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
   return { view, projection, eye: eyeV, projW, projH, offX: win.offX, offY: win.offY, viewW: win.viewW, viewH: win.viewH, perspective: false }
 }
 
+// [we-scene patch] 2D 场景里「perspective 图层」（脚本 thisLayer.perspective=true，
+// 全库 4 张 / 16 层：2890473419 整张 3D 卡片、2983846453 云/时钟、3118949804
+// 音谱、3206627081 时钟）的透视视图投影。
+//
+// 语义照 open-wallpaper-engine（WE 重实现）SceneObjectParsers.cpp 的
+// global_perspective 相机：相机架在可见窗口中心正前方，z=0 平面上的投影与
+// 正交**逐像素重合**（未旋转的透视层与正交层无缝对齐），旋转层才产生 3D 透视形变。
+//   distance = (H/2) / tan(fovY/2)
+//   fovY = general.perspectiveoverridefov > 0 ? 它 : 2·atan((H/2)/1000)（距离 1000 反推）
+// H/W 取 buildCamera 的 fit 窗口（offX/offY/viewW/viewH），cover 裁切与 zoom 因此
+// 自动继承 —— 与 C++ 直接吃正交设计尺寸等价（它运行期正交窗随窗口变化）。
+// 世界 y 向下，相机 up=(0,-1,0)。near 取 1（透视层 z 可达 +500，距相机仅百余像素）。
+export function buildLayerPerspectiveVP(cam, general) {
+  if (!cam || cam.perspective) return null
+  if (!(cam.viewW > 0) || !(cam.viewH > 0)) return null
+  const override = numField(general && general.perspectiveoverridefov, 0)
+  let fovY, dist
+  if (override > 0) {
+    fovY = override
+    dist = cam.viewH / 2 / Math.tan(((fovY * Math.PI) / 180) / 2)
+  } else {
+    dist = 1000
+    fovY = (2 * Math.atan(cam.viewH / 2 / dist) * 180) / Math.PI
+  }
+  const cx = cam.offX + cam.viewW / 2
+  const cy = cam.offY + cam.viewH / 2
+  const eye = [cx, cy, dist]
+  // 视图矩阵：相机轴与世界轴平行，但 y 要翻（渲染世界 y 向下，相机空间 y 向上）。
+  // mat4LookAt 是旋转群构造，y 翻与 x 不翻不可兼得（会镜像 x）——直接写：
+  //   camera = (xw - cx, -(yw - cy), zw - dist)
+  // z=0 的点在相机前方（zc=-dist<0）✓；世界 +x → NDC 右 ✓；世界 +y(下) → NDC 下 ✓。
+  const view = new Float32Array([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, -cx, cy, -dist, 1])
+  const projection = mat4Perspective(fovY, cam.viewW / cam.viewH, 1, dist + 20000)
+  return { viewProj: mat4Multiply(projection, view), eye, fovY, dist }
+}
+
 function clamp01(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return 0.5

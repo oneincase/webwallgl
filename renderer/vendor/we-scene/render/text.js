@@ -117,8 +117,12 @@ class Vec3 {
   constructor(x, y, z) {
     if (x !== null && typeof x === 'object') {
       this.x = x.x !== undefined ? x.x : x.width || 0
-      this.y = y !== undefined ? y : x.y !== undefined ? x.y : x.height || 0
-      this.z = z !== undefined ? z : x.z || 0
+      // [we-scene patch] 首参是向量时**第二参是 z**（WE 的 `new Vec3(vec, z)` 形态）。
+      // 2890473419 透视模板 `new Vec3(engine.canvasSize.divide(r), 1)` 要的是
+      // (v.x, v.y, 1)；旧实现把 1 当 y → 除数成 (11467, 1, 1)，归一化 y 不生效，
+      // 卡片上下方向倾斜角被放大 4800 倍（x 也按错误的 response 挡位算）。
+      this.y = x.y !== undefined ? x.y : x.height || 0
+      this.z = (y !== undefined ? y : z !== undefined ? z : x.z) || 0
     } else if (y === undefined && z === undefined) {
       // 单标量广播：`new Vec3(0.2)` → (0.2, 0.2, 0.2)。
       // 3790527023 按钮缩放模板写 `currentScale = new Vec3(ORIGINAL_SCALE)`，
@@ -535,11 +539,23 @@ function defineLiveScriptProp(spValues, key, v, userProps) {
  * 本地库 167 张里 15 张含此访问形态。四键并存，.x/.y 直接访问、
  * new Vec3(canvasSize) 的 x||width、divide/multiply 的 v.x 路径全部兼容
  * ——divide/multiply 读 v.x，修复前同样是 NaN，此处一并修好。
+ *
+ * 2026-09-15 补：光有四键还不够——WE 的 canvasSize 本身就是向量，作者会把
+ * **方法调用在它自己身上**：2890473419 透视模板 `engine.canvasSize.divide(response)`
+ * （10 个图层共用），普通对象没有 .divide → 每帧 TypeError → errCount=3 熔断，
+ * 整组 3D 倾斜动画全灭。改成返回真正的 Vec3，再补 width/height 别名键。
  */
 function engineCanvasSize(cs) {
   const src = cs || { width: 1920, height: 1080 }
-  if (src.x !== undefined && src.y !== undefined) return src
-  return { x: src.width, y: src.height, width: src.width, height: src.height }
+  if (typeof src.divide === 'function' && src.x !== undefined) return src
+  const v = new Vec3(
+    src.x !== undefined ? src.x : src.width || 0,
+    src.y !== undefined ? src.y : src.height || 0,
+    0,
+  )
+  v.width = v.x
+  v.height = v.y
+  return v
 }
 
 /**
@@ -1447,7 +1463,7 @@ function makeObjectLayerProxy(layer, opts) {
     scale: vec(layer ? layer.scale : [1, 1, 1]),
     // SceneScript 的 angles 是**角度**；图层数组是弧度（scene.json / layerModelMatrix）。
     // 分量赋值 `layer.angles.z = -5` 必须当场写回，不能只改本地 store。
-    angles: makeScriptAngleVec(layer),
+    angles: makeScriptAngleVec(layer, opts),
     size: vec(layer ? layer.size : [0, 0, 0]),
     color: vec(layer ? layer.color : [1, 1, 1]),
   }
@@ -1489,6 +1505,12 @@ function makeObjectLayerProxy(layer, opts) {
     },
     get alpha() { return layer && typeof layer.alpha === 'number' ? layer.alpha : 1 },
     set alpha(v) { if (layer) layer.alpha = Number(v) || 0 },
+    // [we-scene patch] 透视层开关（2890473419 等 4 张 / 16 层，WE 编辑器 Perspective
+    // 模板 init 里 `thisLayer.perspective = true`）。以前代理没有这栏，赋值只落在
+    // 代理对象的 expando 上，渲染器永远看不到 → 3D 卡片倾斜静默退化成 2D。
+    // createLayer({perspective:true}) 的阴影克隆层则经 createSceneLayer 展开早已带旗标。
+    get perspective() { return !!(layer && layer.perspective) },
+    set perspective(v) { if (layer) layer.perspective = !!v },
     get brightness() { return layer && typeof layer.brightness === 'number' ? layer.brightness : 1 },
     set brightness(v) { if (layer) layer.brightness = Number(v) || 0 },
     get text() { return layer && layer.text !== undefined ? String(layer.text) : '' },
@@ -1720,9 +1742,19 @@ function makeObjectLayerProxy(layer, opts) {
     set(v) {
       if (layer && Array.isArray(layer.angles)) {
         const r = scriptAnglesToRad(v)
-        layer.angles[0] = r[0]
-        layer.angles[1] = r[1]
-        layer.angles[2] = r[2]
+        // 与分量写入同一条 localAngles 通道（makeScriptAngleVec 注释）：
+        // 只写 world 会被同帧 recomposeWorld 冲掉（2890473419 透视模板）。
+        if (Array.isArray(layer.localAngles)) {
+          layer.localAngles[0] = r[0]; layer.localAngles[1] = r[1]; layer.localAngles[2] = r[2]
+        }
+        const isTopLevel = layer.parentId === undefined || layer.parentId === null
+        if (isTopLevel) {
+          layer.angles[0] = r[0]
+          layer.angles[1] = r[1]
+          layer.angles[2] = r[2]
+        } else if (opts && typeof opts.markTransformDirty === 'function') {
+          opts.markTransformDirty(layer)
+        }
       }
     },
   })
@@ -2125,6 +2157,14 @@ function makeVec3(v) {
     // `marioOrigin.subtract(origin).lengthSqr()` —— base 被逐帧减 origin.x，
     // 角色坐标被污染得越来越远；加 lengthSqr 后才会暴露这个漂移。
     subtract(o) { const b = normVec(o); return makeVec3([base.x - b[0], base.y - b[1], base.z - b[2]]) },
+    // [we-scene patch] divide 同 subtract 返回新向量（WE 纯运算语义）。
+    // 2890473419 透视模板 `delta = delta.divide(new Vec3(engine.canvasSize.divide(r), 1))`
+    // —— 缺它是三振熔断链的第二环（canvasSize.divide 修好后的下一个 TypeError）。
+    divide(o) {
+      const b = normVec(o)
+      const safe = (a, d) => (d === 0 ? 0 : a / d)
+      return makeVec3([safe(base.x, b[0]), safe(base.y, b[1]), safe(base.z, b[2])])
+    },
     multiply(k) {
       if (k && typeof k === 'object') {
         const b = normVec(k)
@@ -2170,8 +2210,23 @@ export function scriptAnglesToRad(v) {
   return [a[0] * ANGLE_RAD, a[1] * ANGLE_RAD, a[2] * ANGLE_RAD]
 }
 
-function makeScriptAngleVec(layer) {
+function makeScriptAngleVec(layer, opts) {
   const idx = { x: 0, y: 1, z: 2 }
+  // [we-scene patch] 写 angles 必须落 **localAngles**（与 origin/scale 的
+  // LOCAL_VEC_SLOT 同族，2983846453）：目标层的 origin/scale 字段绑了脚本时，
+  // recomposeWorld 每帧从 local 三件套重算 world，只写 world angles 会在同帧
+  // 被冲掉 —— 2890473419 透视模板 `thisLayer.angles = rotation`（副作用写回）
+  // 因此恒为 0，3D 卡片倾斜看着「脚本在跑但画面不动」。
+  const writeBack = (i, rad) => {
+    if (!layer || !Array.isArray(layer.angles)) return
+    if (Array.isArray(layer.localAngles)) layer.localAngles[i] = rad
+    const isTopLevel = layer.parentId === undefined || layer.parentId === null
+    if (isTopLevel) {
+      layer.angles[i] = rad
+    } else if (opts && typeof opts.markTransformDirty === 'function') {
+      opts.markTransformDirty(layer)
+    }
+  }
   const api = {
     add(o) { const a = normVec(o); api.x += a[0]; api.y += a[1]; api.z += a[2]; return api },
     subtract(o) { const a = normVec(o); api.x -= a[0]; api.y -= a[1]; api.z -= a[2]; return api },
@@ -2182,12 +2237,15 @@ function makeScriptAngleVec(layer) {
     Object.defineProperty(api, k, {
       enumerable: true,
       get() {
-        if (!layer || !Array.isArray(layer.angles)) return 0
-        return (layer.angles[idx[k]] || 0) * ANGLE_DEG
+        // 读回优先 local 槽（与 origin/scale getter 一致：作者坐标空间，刚写入即可读回）
+        const a = layer && Array.isArray(layer.localAngles)
+          ? layer.localAngles
+          : (layer && Array.isArray(layer.angles) ? layer.angles : null)
+        if (!a) return 0
+        return (a[idx[k]] || 0) * ANGLE_DEG
       },
       set(v) {
-        if (!layer || !Array.isArray(layer.angles)) return
-        layer.angles[idx[k]] = (Number(v) || 0) * ANGLE_RAD
+        writeBack(idx[k], (Number(v) || 0) * ANGLE_RAD)
       },
     })
   }

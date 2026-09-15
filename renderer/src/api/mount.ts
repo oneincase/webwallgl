@@ -18,6 +18,8 @@ import {
 import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
 import type { WallpaperConfig } from "../types";
+import { normalizeQuality } from "../quality";
+import type { QualityOptions, ResolvedQuality } from "./types";
 import { weShimCall } from "../web";
 import { sniffMediaType } from "./source";
 import { mediaColor } from "./media-source";
@@ -107,6 +109,10 @@ async function resolveMountConfig(
     loop: true,
     canvas: el,
     source: o.source,
+    // 质量设置（抗锯齿/粒子/后处理档位）。原样透传：规范化在消费方做
+    // （scene-mount applyQuality / getQuality），这里不引依赖 —— 本函数会被
+    // verify-media 抽出来脱离 import 单独执行。
+    quality: o.quality,
   };
   let project: unknown = null;
   try {
@@ -457,6 +463,18 @@ export function createScene(
     setRenderDpr(dpr: number) {
       rt.cfg.renderDpr = dpr;
       remountCurrent();
+    },
+
+    // 质量设置热更：就地生效不重挂载（与 setRenderDpr 不同）。与 setAudio 同纪律
+    // 合并进 currentOptions —— load() 换场景、restore() 重挂之后仍保持。
+    setQuality(patch: QualityOptions) {
+      const merged = { ...normalizeQuality(currentOptions.quality ?? rt.cfg.quality), ...(patch ?? {}) };
+      currentOptions = { ...currentOptions, quality: merged };
+      rt.cfg.quality = merged;
+      rt.sceneCtl?.setQuality?.(patch ?? {});
+    },
+    getQuality(): ResolvedQuality {
+      return normalizeQuality(currentOptions.quality ?? rt.cfg.quality);
     },
 
     setProperties(props: Record<string, PropertyValue>) {

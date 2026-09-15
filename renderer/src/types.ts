@@ -1,6 +1,7 @@
 // 壁纸类型、URL 协议字段与手动测试开关（从 main.ts 拆出）
 
 import type { Source } from "./api/types";
+import type { QualityOptions } from "./quality";
 
 // 场景壁纸渲染开关（手动测试用）
 export const SKIP_3D_MODELS = false; // puppet 骨骼网格（人物模型）
@@ -35,6 +36,9 @@ export type WallpaperConfig = {
   renderDpr?: number;
   /** 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低；默认 60 */
   sceneFps?: number;
+  /** 渲染质量设置（抗锯齿/粒子/后处理档位，见 quality.ts）。缺省 = 全默认
+   *  （AA off、粒子 high、后处理 high），与引入前的行为一致。 */
+  quality?: QualityOptions;
   muted?: boolean;
   loop?: boolean;
   /**

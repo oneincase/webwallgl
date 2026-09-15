@@ -415,7 +415,14 @@ export async function describe(wallpapersDir: string, itemId: string): Promise<W
   const project = loadProject(join(wallpapersDir, itemId));
   if (!project) return [];
   const overrides = await readOverrides(itemId);
-  return rawProps(project).map(([name, def]) => {
+  return rawProps(project)
+    // `editable: false` = 作者在 WE 编辑器里明确标记「用户不可编辑」——这类属性是
+    // 壁纸自己读写的工作变量（真实语料：背景色相旋转/音量/字号），WE 的属性面板
+    // 不显示。仅严格布尔 false 隐藏；缺省 / true / "true" 都显示。
+    // 与 condition 隐藏同理：只影响本 UI 列表，effectiveProps 照常下发（壁纸代码
+    // 要读这些值，过滤会让壁纸读不到而异常）。
+    .filter(([, def]) => def.editable !== false)
+    .map(([name, def]) => {
     const ptype = String(def.type ?? "other");
     const dflt = wireValue(ptype, def);
     const value = name in overrides ? overrides[name] : dflt;

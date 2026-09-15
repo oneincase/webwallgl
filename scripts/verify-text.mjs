@@ -2263,6 +2263,71 @@ function runEngineCanvasSize() {
       errors.push(`new Vec3(canvasSize).divide(canvasSize) 应为 "1 1 0"（修复前 v.x=undefined → NaN），got "${s}"`);
   }
 
+  // ---- 2b) canvasSize 自身就是向量：方法调在它身上（2890473419 透视模板熔断根因） ----
+  // WE 编辑器 Perspective 模板 `engine.canvasSize.divide(response)` —— 普通四键对象
+  // 没有 .divide → 每帧 TypeError → errCount=3 熔断，10 个倾斜脚本全灭。
+  {
+    const sb = wtext.evalObjectScript(
+      "export function update(v){ const d = engine.canvasSize.divide(2); return d.x + ',' + d.y + ',' + engine.canvasSize.width + ',' + engine.canvasSize.height; }",
+      null,
+      { canvasSize: { width: 3840, height: 2160 } },
+    );
+    const r = sb.callUpdate();
+    if (r !== "1920,1080,3840,2160")
+      errors.push(`engine.canvasSize.divide(2) 应为 (1920,1080) 且 width/height 别名仍在，got "${r}"（透视模板 canvasSize.divide 调用形态）`);
+    if (sb.errCount !== 0) errors.push("canvasSize.divide 调用不得产生脚本错误");
+  }
+
+  // ---- 2c) 真实语料：2890473419 透视模板 origin 脚本（id=124 人物卡片）----
+  // 端到端：init 写 thisLayer.perspective=true（代理 setter 必须落到图层），
+  // update 读 input.cursorWorldPosition（默认 0,0）+ canvasSize.divide 不得抛错，
+  // 且写回 thisLayer.angles 的 3D 旋转（度数→弧度由 makeScriptAngleVec 转换）。
+  {
+    const dir2 = join(LIB, "2890473419");
+    const pkgPath2 = join(dir2, "scene.pkg");
+    if (!fs.existsSync(pkgPath2)) {
+      console.log("  （跳过 2890473419 语料：本机无此壁纸）");
+    } else {
+      const scene2 = JSON.parse(readText(getEntry(parsePkg(fs.readFileSync(pkgPath2)), "scene.json")));
+      const obj124 = scene2.objects.find((x) => x.id === 124);
+      if (!obj124 || !obj124.origin || typeof obj124.origin !== "object" || !obj124.origin.script) {
+        errors.push("2890473419 对象 124 应有 origin 脚本（Perspective 模板）");
+      } else {
+        const fakeLayer = {
+          id: 124, name: "101272156_p0",
+          origin: [1720, 716.35864, 0], scale: [1, 1, 1], angles: [0, 0, 0], size: [800, 1000],
+        };
+        const sb3 = wtext.evalObjectScript(obj124.origin.script, obj124.origin.scriptproperties, {
+          canvasSize: { width: 3440, height: 1440 },
+          userProperties: {},
+          layer: fakeLayer,
+        });
+        if (!sb3 || !sb3.hasUpdate) {
+          errors.push("2890473419 透视脚本应加载且带 update");
+        } else {
+          sb3.init([1720, 716.35864, 0]);
+          if (fakeLayer.perspective !== true)
+            errors.push("init 后 layer.perspective 必须为 true（代理 setter 丢失则渲染器永远看不到透视旗标）");
+          let ret;
+          for (let i = 0; i < 3; i++) ret = sb3.callUpdate([1720, 716.35864, 0]);
+          if (sb3.errCount !== 0 || sb3.disabled)
+            errors.push(`透视脚本 update 不得抛错（修复前 canvasSize.divide is not a function 三振熔断），errCount=${sb3.errCount} disabled=${sb3.disabled}`);
+          if (!ret || typeof ret !== "object")
+            errors.push("透视脚本 update 应返回字段值（return value），got " + ret);
+          // 指针在 (0,0)：delta = origin/（canvasSize/response）→ rotation.y = -delta.x*50°。
+          // response 读 scene 保存的 scriptproperties（124 存的是 0.5，不是脚本默认 0.3）。
+          const respRaw = (obj124.origin.scriptproperties || {}).response;
+          const respNum = typeof respRaw === "object" && respRaw ? Number(respRaw.value) : Number(respRaw);
+          const response = Number.isFinite(respNum) && respNum > 0 ? respNum : 0.3;
+          const expY = (-(1720 / (3440 / response)) * 50 * Math.PI) / 180;
+          const gotY = fakeLayer.angles[1];
+          if (!(Math.abs(gotY - expY) < 1e-3))
+            errors.push(`透视脚本应写回 angles.y≈${expY.toFixed(4)} rad（3D 倾斜），got ${gotY}`);
+        }
+      }
+    }
+  }
+
   // ---- 3) 真实语料：3790399458 三个文字层 origin 脚本 ----
   const dir = join(LIB, "3790399458");
   const pkgPath = join(dir, "scene.pkg");

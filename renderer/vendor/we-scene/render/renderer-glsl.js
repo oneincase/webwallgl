@@ -439,6 +439,55 @@ void main() {
   fragColor = vec4(texture(u_Tex, v_UV).rgb, 1.0);
 }`
 
+// [we-scene patch] FXAA 抗锯齿（性能设置面板的 aa=fxaa 档）。
+// 经典 reduced 版（9 抽头，Lottes FXAA 3.11 的精简形态）：luma 边缘方向估计 →
+// 沿边缘方向模糊。选它而不是 12 抽头 quality 全量版的理由：壁纸内容绝大部分是
+// 半透明纹理 quad（不是硬几何边），reduced 版的边缘搜索已足够，且帧末只多一趟
+// 全屏 pass，代价恒定、无状态。MSAA 档走多重采样 FBO（renderer.js），不经这里。
+//
+// 输入是 captureBackdrop 的画布回读纹理（RGB8，无 alpha），输出直接覆盖画布，
+// 所以 alpha 恒 1（画布上下文 alpha:false，写出 alpha 无意义）。
+// 用 highp：4K 超采样下 UV 偏移量小，mediump（部分驱动 16bit）会在边缘方向
+// 估计上出可见带状误差。
+const FXAA_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_UV;
+uniform sampler2D u_Tex;
+uniform vec2 u_Texel; // 1/width, 1/height
+out vec4 fragColor;
+void main() {
+  const float SPAN_MAX = 8.0;
+  const float REDUCE_MUL = 1.0 / 8.0;
+  const float REDUCE_MIN = 1.0 / 128.0;
+  const vec3 LUMA = vec3(0.299, 0.587, 0.114);
+  vec3 rgbNW = texture(u_Tex, v_UV + vec2(-1.0, -1.0) * u_Texel).rgb;
+  vec3 rgbNE = texture(u_Tex, v_UV + vec2( 1.0, -1.0) * u_Texel).rgb;
+  vec3 rgbSW = texture(u_Tex, v_UV + vec2(-1.0,  1.0) * u_Texel).rgb;
+  vec3 rgbSE = texture(u_Tex, v_UV + vec2( 1.0,  1.0) * u_Texel).rgb;
+  vec3 rgbM  = texture(u_Tex, v_UV).rgb;
+  float lumaNW = dot(rgbNW, LUMA);
+  float lumaNE = dot(rgbNE, LUMA);
+  float lumaSW = dot(rgbSW, LUMA);
+  float lumaSE = dot(rgbSE, LUMA);
+  float lumaM  = dot(rgbM,  LUMA);
+  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+  vec2 dir = vec2(
+    -((lumaNW + lumaNE) - (lumaSW + lumaSE)),
+     ((lumaNW + lumaSW) - (lumaNE + lumaSE)));
+  float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * REDUCE_MUL), REDUCE_MIN);
+  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+  dir = min(vec2(SPAN_MAX), max(vec2(-SPAN_MAX), dir * rcpDirMin)) * u_Texel;
+  vec3 rgbA = 0.5 * (
+    texture(u_Tex, v_UV + dir * (1.0 / 3.0 - 0.5)).rgb +
+    texture(u_Tex, v_UV + dir * (2.0 / 3.0 - 0.5)).rgb);
+  vec3 rgbB = rgbA * 0.5 + 0.25 * (
+    texture(u_Tex, v_UV + dir * -0.5).rgb +
+    texture(u_Tex, v_UV + dir *  0.5).rgb);
+  float lumaB = dot(rgbB, LUMA);
+  fragColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, 1.0);
+}`
+
 // quad 顶点（每顶点 5 float：x,y,z,u,v）
 // WE 同款空间：层 FBO 内容倒置（FBO 顶=纹理底行），pass quad 顶 v=1（顶采顶直通），合成时再正过来。
 function layerQuadVerts(w, h) {
@@ -486,4 +535,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }

@@ -102,6 +102,56 @@ const { evalObjectScript } = await import(path.join(ROOT, "renderer/vendor/we-sc
   }
 }
 
+// ---- 6b. 脚本副作用写 angles 必须落 localAngles（2890473419 透视模板）----
+// 与第 6 节同族、字段换成 angles：透视模板的 update 用 `thisLayer.angles = rotation`
+// 写 3D 倾斜角（副作用，不是返回值），而该层 origin 字段绑了脚本在脏集里，
+// recomposeWorld 每帧从 localAngles 重算 world angles —— 旧 setter 只写 world，
+// 同帧被 localAngles=0 冲回，卡片恒平（「脚本在跑但画面不动」）。
+{
+  const id = "2890473419";
+  const pkgPath = path.join(LIB, id, "scene.pkg");
+  if (!fs.existsSync(pkgPath)) {
+    console.log(`  (跳过 ${id}：库中无此壁纸)`);
+  } else {
+    const pkg = parsePkg(fs.readFileSync(pkgPath));
+    const sj = JSON.parse(dec.decode(getEntry(pkg, "scene.json")));
+    const o124 = sj.objects.find((o) => o.id === 124);
+    const L = {
+      id: 124, name: "101272156_p0",
+      origin: [1720, 716.35864, 0], localOrigin: [1720, 716.35864, 0],
+      localScale: [1, 1, 1], localAngles: [0, 0, 0],
+      scale: [1, 1, 1], angles: [0, 0, 0],
+      size: [800, 1000, 0], visible: true, visibleSelf: true, alpha: 1, color: [1, 1, 1],
+      childIds: [], parentId: null, isPostProcess: false,
+      objectScripts: { origin: { script: o124.origin.script } },
+    };
+    const layers = [L];
+    const sb = evalObjectScript(o124.origin.script, o124.origin.scriptproperties, {
+      layer: L,
+      markTransformDirty: () => {},
+      userProperties: {}, shared: {},
+      canvasSize: { width: 3440, height: 1440 },
+    });
+    sb.init({ x: 1720, y: 716.35864, z: 0 });
+    for (let i = 0; i < 3; i++) sb.callUpdate({ x: 1720, y: 716.35864, z: 0 });
+    // 1) 副作用必须写进 localAngles（透视角非零；response=0.5 时 angles.y=-12.5°）
+    if (!(Math.abs(L.localAngles[1]) > 0.1)) {
+      fail(`2890473419 透视脚本副作用应写 localAngles（y≈-0.218rad），got [${L.localAngles.map((a) => a.toFixed(3))}]（只写 world 时这里恒 0）`);
+    } else {
+      console.log(`  ✓ 2890473419：透视脚本 angles 副作用落 localAngles = [${L.localAngles.map((a) => a.toFixed(3))}]`);
+    }
+    // 2) 模拟真实帧：脏集 recompose 后 world angles 必须跟随 local，不得被冲回 0
+    L.angles = [0, 0, 0]; // 旧 bug 的被冲状态：recompose 应由 local 决定
+    const dirty = collectTransformDirty(layers, []);
+    recomposeWorld(layers, dirty);
+    if (!(Math.abs(L.angles[1] - L.localAngles[1]) < 1e-9) || !(Math.abs(L.angles[1]) > 0.1)) {
+      fail(`2890473419 recompose 后 world angles 应跟随 localAngles（倾斜不被冲掉），got [${L.angles.map((a) => a.toFixed(3))}]`);
+    } else {
+      console.log("  ✓ 2890473419：recomposeWorld 后 world angles 跟随 local（倾斜不被冲掉）");
+    }
+  }
+}
+
 // ---- 1. composeChildTransform 纯函数单元：旋转 + 缩放 + 平移全到位
 {
   const parent = { origin: [100, 200, 0], scale: [2, 3, 1], angles: [0, 0, 90] }

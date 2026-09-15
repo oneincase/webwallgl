@@ -1,6 +1,6 @@
 {
   "name": "webwallgl",
-  "version": "1.3.22",
+  "version": "1.3.23",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.17.0",
@@ -41,6 +41,7 @@
     "verify:cover-peek": "node scripts/verify-cover-peek.mjs",
     "verify:web": "node scripts/verify-web.mjs",
     "verify:resolution": "node scripts/verify-resolution.mjs",
+    "verify:quality": "node scripts/verify-quality.mjs",
     "verify": "node scripts/verify-all.mjs",
     "verify:all": "node scripts/verify-all.mjs --all",
     "check": "npm run typecheck && node scripts/verify-arch.mjs && npm run verify",

@@ -260,7 +260,7 @@ if (fs.existsSync(LIB)) {
   check(/cameraShakeOffset\s*\(/.test(src), "renderer.js 未调用 cameraShakeOffset（抖动未接线）");
   // 抖动必须右乘 viewProj（左乘会落到 NDC 空间，画面跑飞）
   check(
-    /viewProj\s*=\s*mat4Multiply\(viewProj,\s*mat4Translate\(mat4Identity\(\),\s*px,\s*py,\s*0\)\)/.test(src),
+    /viewProj\s*=\s*mat4Multiply\(viewProj,\s*(mat4Translate\(mat4Identity\(\),\s*px,\s*py,\s*0\)|shakeM)\)/.test(src),
     "抖动必须写成 mat4Multiply(viewProj, translate)（右乘=世界空间）",
   );
   // 抖动不得用随机数（会抽帧）
@@ -271,6 +271,125 @@ if (fs.existsSync(LIB)) {
     /if\s*\(cam\s*&&\s*cam\.perspective\)\s*return false/.test(src),
     "isLayerOffscreen 对透视场景必须停用像素 AABB 裁剪");
   check(/layerWorldOrigin/.test(src), "renderer.js 未调用 layerWorldOrigin（天空盒未锁到相机）");
+}
+
+// ---------- 5. perspective 图层（2890473419 3D 卡片倾斜）----------
+// 2D 场景里脚本 thisLayer.perspective=true 的层换独立透视 VP（WE 编辑器
+// Perspective 模板，全库 4 张 / 16 层）。语义照 open-wallpaper-engine 的
+// global_perspective 相机：相机架在可见窗口中心正前方，z=0 与正交逐像素重合；
+// distance = H/(2·tan(fovY/2))，fovY 取 perspectiveoverridefov（>0），缺省 dist=1000 反推。
+{
+  const { buildLayerPerspectiveVP } = await imp("renderer/vendor/we-scene/render/math.js");
+  const { mat4Multiply, mat4TransformPoint } = await imp("renderer/vendor/we-scene/render/math.js");
+
+  const scene = {
+    general: {
+      orthogonalprojection: { width: 3440, height: 1440 },
+      fov: 50, perspectiveoverridefov: 95, zoom: 1,
+    },
+    camera: null,
+  };
+  const cam = buildCamera(scene, 2560, 1440, "cover", 0.5, 0.5);
+  const lp = buildLayerPerspectiveVP(cam, scene.general);
+
+  // 5a) 基本几何：相机在窗口中心正前方，距离 = (H/2)/tan(fovY/2)
+  const distExp = cam.viewH / 2 / Math.tan(((95 * Math.PI) / 180) / 2);
+  check(lp && Math.abs(lp.dist - distExp) < 1e-6, `透视层相机距离应为 (H/2)/tan(fovY/2)=${distExp.toFixed(3)}，got ${lp && lp.dist}`);
+  check(lp && Math.abs(lp.eye[0] - (cam.offX + cam.viewW / 2)) < 1e-9 && Math.abs(lp.eye[1] - (cam.offY + cam.viewH / 2)) < 1e-9,
+    "透视层相机必须架在可见窗口中心（否则 z=0 对不齐正交）");
+  check(lp && lp.eye[2] > 0, "透视层相机必须在 z>0（屏幕外朝里看）");
+
+  // 5b) z=0 平面上与正交**逐像素重合**（未旋转的透视层与普通层无缝对齐）
+  {
+    const orthoVP = mat4Multiply(cam.projection, cam.view);
+    let maxErr = 0;
+    const pts = [
+      [cam.offX, cam.offY], [cam.offX + cam.viewW, cam.offY],
+      [cam.offX, cam.offY + cam.viewH], [cam.offX + cam.viewW, cam.offY + cam.viewH],
+      [1720, 720], [853, 1282],
+    ];
+    for (const [x, y] of pts) {
+      const a = mat4TransformPoint(orthoVP, x, y, 0);
+      const b = mat4TransformPoint(lp.viewProj, x, y, 0);
+      maxErr = Math.max(maxErr, Math.hypot(a[0] - b[0], a[1] - b[1]));
+    }
+    check(maxErr < 1e-5, `z=0 平面透视 VP 与正交 VP 必须逐像素重合（maxErr=${maxErr.toExponential(2)}；x 镜像/未对齐会到 2.0 量级）`);
+  }
+
+  // 5c) 深度：z 越大（越朝相机）放大越多（3D 近大远小）
+  {
+    const cx = cam.offX + cam.viewW / 2, cy = cam.offY + cam.viewH / 2;
+    const a = mat4TransformPoint(lp.viewProj, cx + 100, cy, 0);
+    const b = mat4TransformPoint(lp.viewProj, cx + 100, cy, 500);
+    check(b[0] > a[0] && b[0] / a[0] > 1.5, `z=500 的点应明显放大（近大远小），放大率=${(b[0] / a[0]).toFixed(2)}`);
+    // 世界方向：+x 必须投到 NDC +x（修过的镜像坑：lookAt up 向量会镜像 x）
+    check(a[0] > 0, `世界 +x 必须投到 NDC +x（lookAt 镜像会让它翻负），got ${a[0]}`);
+  }
+
+  // 5d) 无 override 时 distance=1000、fov 反推
+  {
+    const lp2 = buildLayerPerspectiveVP(cam, { ...scene.general, perspectiveoverridefov: 0 });
+    check(lp2 && lp2.dist === 1000, `无 perspectiveoverridefov 时距离应为 1000，got ${lp2 && lp2.dist}`);
+    const fovExp = (2 * Math.atan(cam.viewH / 2 / 1000) * 180) / Math.PI;
+    check(lp2 && Math.abs(lp2.fovY - fovExp) < 1e-6, `无 override 时 fovY 应由 distance=1000 反推=${fovExp.toFixed(3)}，got ${lp2 && lp2.fovY}`);
+  }
+
+  // 5e) hit-test 射线-平面求交（render/hittest.js 真实现）：
+  // 旋转层的边中点，经「眼点→边上点」射线在 z=0 的落点喂回 worldToLayerLocal，
+  // 必须还原出 lx=-0.5。旋转/顺序错一个，lx 就偏。
+  {
+    const { worldToLayerLocal } = await imp("renderer/vendor/we-scene/render/hittest.js");
+    const ALIGN = { center: [0.5, 0.5] };
+    const ry = (30 * Math.PI) / 180;
+    const layer = {
+      origin: [1720, 716.4, 0], size: [800, 1000], scale: [1, 1, 1],
+      angles: [0, ry, 0], alignment: "center", perspective: true,
+    };
+    const eye = lp.eye;
+    const projH = 1440;
+    // 层局部 (-0.5w, 0, 0) 经实现侧 R = Rz(-z)·Ry(-y)·Rx(x) 旋到世界
+    // （T·R，无 z 旋/无视差/居中锚）：Ry(-30°) 作用于 (-400,0,0) → (c·x, 0, s·x)
+    const c = Math.cos(ry), s = Math.sin(ry);
+    const localEdge = [-400, 0, 0];
+    const wx0 = 1720 + c * localEdge[0];
+    const wy0 = projH - 716.4;
+    const wz0 = s * localEdge[0];
+    // 眼点→边点 的射线与 z=0 交点 = 该点在屏幕上对应的指针世界坐标
+    const t = eye[2] / (eye[2] - wz0);
+    const px = eye[0] + (wx0 - eye[0]) * t;
+    const py = eye[1] + (wy0 - eye[1]) * t;
+    const hit = worldToLayerLocal(layer, px, py, projH, 0, 0, ALIGN, eye);
+    check(hit && Math.abs(hit.lx + 0.5) < 1e-3 && Math.abs(hit.ly) < 1e-3,
+      `旋转 30° 的透视层左边中点命中应还原 lx=-0.5,ly=0，got ${hit && `lx=${hit.lx.toFixed(3)},ly=${hit.ly.toFixed(3)}`}`);
+    // 锚点正对的指针必须命中中心（任意旋转角都成立）
+    const hitC = worldToLayerLocal(layer, 1720, wy0, projH, 0, 0, ALIGN, eye);
+    check(hitC && Math.abs(hitC.lx) < 1e-6 && Math.abs(hitC.ly) < 1e-6,
+      `透视层锚点正对的指针应命中中心，got ${hitC && `lx=${hitC.lx.toFixed(4)},ly=${hitC.ly.toFixed(4)}`}`);
+    // 未开 perspective 的层走原 2D 路径（回归面不受新分支影响）
+    const flat = worldToLayerLocal({ ...layer, perspective: false, angles: [0, 0, 0] }, 1720 - 400, wy0, projH, 0, 0, ALIGN, eye);
+    check(flat && Math.abs(flat.lx + 0.5) < 1e-9, "非透视层的 2D 命中路径必须保持原样");
+  }
+
+  // 5f) 接线断言（renderer.js / hittest.js / text.js / scene-mount.ts）
+  {
+    const src2 = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    check(/buildLayerPerspectiveVP/.test(src2), "renderer.js 未引用 buildLayerPerspectiveVP（透视 VP 未接线）");
+    check(/layer\.perspective\s*&&\s*viewProjPersp/.test(src2), "renderer.js 主循环必须按层选透视 VP（layerVP）");
+    // 旋转顺序必须与 WE 重实现一致：Rz 之后接 Ry 再接 Rx（M = T·Rz·Ry·Rx）。
+    // 锚到 angles[1]/angles[0] 的具体语句，别搜 "if (layer.perspective)"
+    // （isLayerOffscreen 里也有同样的前缀，会切错位置）。
+    check(/if \(layer\.angles\[1\]\) m = mat4RotateY\(m, -layer\.angles\[1\]\)[\s\S]{0,120}if \(layer\.angles\[0\]\) m = mat4RotateX\(m, layer\.angles\[0\]\)/.test(src2),
+      "layerModelMatrix 透视分支必须是 Rz → Ry(-y) → Rx(+x)（顺序/符号错=倾斜轴向错：+y 会让卡片背向指针左右反转）");
+    check(/if \(layer\.perspective\) return false/.test(src2), "isLayerOffscreen 必须跳过 perspective 层");
+    const hit = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hittest.js"), "utf8");
+    check(/perspLayerLocal/.test(hit) && /layer\.perspective && perspEye/.test(hit),
+      "hittest.js 必须接 perspective 射线-平面求交分支");
+    const txt = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
+    check(/set perspective\(v\) \{ if \(layer\) layer\.perspective = !!v \}/.test(txt),
+      "对象层代理必须有 perspective setter（脚本 thisLayer.perspective=true 才能落到图层）");
+    const mnt = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    check(/getPerspectiveEye/.test(mnt), "scene-mount.ts 必须把 perspEye 传给 hitTestLayers");
+  }
 }
 
 if (errors.length) {

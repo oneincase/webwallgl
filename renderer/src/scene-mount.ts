@@ -9,6 +9,7 @@ import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
+import { normalizeQuality, particleQualityScale, postFboCapFactor, type ResolvedQuality } from "./quality";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
@@ -317,6 +318,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   let applyLiveImpl: ((wire: Record<string, { value: unknown }>) => void) | undefined;
   let pauseImpl: (() => void) | undefined;
   let resumeImpl: (() => void) | undefined;
+  // 性能设置（抗锯齿/粒子/后处理）热更入口。cfg.quality 是真源：impl 未就绪
+  // （渲染器还没建出来）时只写 cfg，装配到建渲染器那步会按 cfg.quality 应用。
+  let setQualityImpl: ((q: ResolvedQuality) => void) | undefined;
   rt.sceneCtl = {
     pause() {
       pauseImpl?.();
@@ -327,6 +331,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
     applyUserProperties(props) {
       if (applyLiveImpl) applyLiveImpl(props);
       else pendingWire = { ...(pendingWire || {}), ...props };
+    },
+    setQuality(q) {
+      rt.cfg.quality = { ...normalizeQuality(rt.cfg.quality), ...(q ?? {}) };
+      setQualityImpl?.(normalizeQuality(rt.cfg.quality));
     },
   };
 
@@ -466,6 +474,20 @@ cfg, source, pkgAbort.signal);
       // 立即登记渲染器：即使后续异步加载中途被 clear(rt)，也能正确释放该 WebGL 上下文
       rt.renderer = renderer;
       if (disposed) return;
+      // [we-scene patch] 粒子的 MSAA 接线：绘制目标与 REFRACT 场景捕获都走
+      // renderer 的当前状态（aaMode=off 时分别退回默认帧缓冲 / copyTexImage2D，
+      // 行为与注入前逐字一致）。模块级注入与 ptex.setParticleTextureProvider 同先例；
+      // 卸载时在 particleCleanup 复位，防止悬垂引用上一个渲染器。
+      particles.setParticleFrameTargetProvider(() => renderer.getFrameTarget?.() ?? null);
+      particles.setParticleSceneCapture((w: number, h: number) => renderer.captureSceneTexture?.(w, h) ?? null);
+      {
+        const prevCleanup = particleCleanup;
+        particleCleanup = () => {
+          prevCleanup?.();
+          particles.setParticleFrameTargetProvider(null);
+          particles.setParticleSceneCapture(null);
+        };
+      }
 
       // ---- 音频 / 媒体 / 窗口源 ----
       // 默认确定性模拟（离线可复现）；cfg.liveSystem 时换麦克风 + 宿主 Now Playing。
@@ -1903,9 +1925,13 @@ cfg, source, pkgAbort.signal);
       // 曲线挂在场景 t 上，粒子发射若走墙钟就锁不住步（与已修的「两套时钟」同族）。
       const particleClock = { dt: 1 / 60, t: 0 };
       let particleDiagFrame = 0;
+      // [we-scene patch] 粒子「关」档（性能设置）：跳过推进与渲染，系统对象保留
+      // （重新开档时不用重建，_applyOverride 池重建即可恢复）。零 CPU 模拟开销。
+      let particleQualityOff = false;
       renderer.setParticleRenderer(
         // advanceFn：每帧推进所有粒子系统（在图层迭代前统一调用）
         () => {
+          if (particleQualityOff) return;
           // dt 封顶 50ms 保留：标签页切回或掉帧时的大 dt 会让粒子瞬移一大段。
           const pdt = Math.min(0.05, Math.max(0, particleClock.dt));
           // 世界指针位置：locktopointer 的控制点用它做吸引/排斥（controlpointattract）。
@@ -1940,12 +1966,27 @@ cfg, source, pkgAbort.signal);
         // renderByLayerFn：按图层 id 渲染该层对应的粒子系统。
         // cam.projW/projH 必须透传：particles.render 用 projH 做世界 y 向下 → 投影空间的翻转。
         (layerId: number, cam: any, viewProj: any, w: number, h: number) => {
+          if (particleQualityOff) return;
           if (layerId === undefined) return;
           const list = particleSystemsByLayer.get(layerId);
           if (!list) return;
           for (const ps of list) ps.render(viewProj, w, h, cam.projW, cam.projH);
         },
       );
+      // [we-scene patch] 性能设置应用（挂载初值 + setQuality 热更共用）。
+      // 全部就地生效不重挂载：AA/后处理是渲染器门控，粒子倍率是池重建（粒子重生，
+      // 与 WE 改档位时的表现一致）。
+      const applyQuality = (q: ResolvedQuality) => {
+        renderer.setAntiAliasing?.(q.antiAliasing);
+        renderer.setEffectsEnabled?.(q.postProcessing !== "off");
+        renderer.setFboCapFactor?.(postFboCapFactor(q.postProcessing));
+        particleQualityOff = q.particles === "off";
+        particles.setParticleQualityScale?.(particleQualityScale(q.particles));
+        for (const ps of particleSystems) ps._applyOverride?.();
+        reportDiag(rt, cfg, `quality: aa=${q.antiAliasing} particles=${q.particles} post=${q.postProcessing}`);
+      };
+      setQualityImpl = applyQuality;
+      applyQuality(normalizeQuality(cfg.quality));
       reportDiag(rt,
         cfg,
         `particles: ${particleSystems.length} systems, ${builtinTexCount} builtin tex generated`,
@@ -3271,6 +3312,8 @@ cfg, source, pkgAbort.signal);
           parOffX: par.x,
           parOffY: par.y,
           alignTable: rnd.ALIGN,
+          // perspective 图层走射线-平面求交（无透视层时为 null，命中逻辑不变）
+          perspEye: renderer.getPerspectiveEye ? renderer.getPerspectiveEye() : null,
           // 只在挂了回调的图层里找命中 —— 否则上方任何一个全屏背景层都会把
           // 指针「挡住」，下方真正的交互层永远收不到 enter。
           filter: (l: any) => cursorHooks.has(l),

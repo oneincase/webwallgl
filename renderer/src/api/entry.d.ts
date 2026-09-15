@@ -37,6 +37,11 @@ import type {
   MediaSourceInit,
   MediaSourceControls,
   DiagnosticLevel,
+  AntiAliasingMode,
+  ParticleQuality,
+  PostQuality,
+  QualityOptions,
+  ResolvedQuality,
 } from "./types";
 
 export type {
@@ -60,6 +65,11 @@ export type {
   MediaSourceInit,
   MediaSourceControls,
   DiagnosticLevel,
+  AntiAliasingMode,
+  ParticleQuality,
+  PostQuality,
+  QualityOptions,
+  ResolvedQuality,
 };
 
 export declare function mount(

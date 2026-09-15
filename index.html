@@ -135,6 +135,30 @@
                 <option value="120">120</option>
               </select>
             </label>
+            <label data-i18n-title="toolbar.aaTip" title="抗锯齿：FXAA=帧末后处理（平滑所有边缘）；MSAA=多重采样（只平滑几何边缘）"><span data-i18n="toolbar.aa">抗锯齿</span>
+              <select id="aa">
+                <option value="off" selected data-i18n="quality.off">关</option>
+                <option value="fxaa">FXAA</option>
+                <option value="msaa2">MSAA 2x</option>
+                <option value="msaa4">MSAA 4x</option>
+              </select>
+            </label>
+            <label data-i18n-title="toolbar.pqTip" title="粒子质量：低/中档按倍率同时缩数量上限与发射率；关=不渲染不推进"><span data-i18n="toolbar.pq">粒子</span>
+              <select id="pq">
+                <option value="high" selected data-i18n="quality.high">高</option>
+                <option value="medium" data-i18n="quality.medium">中</option>
+                <option value="low" data-i18n="quality.low">低</option>
+                <option value="off" data-i18n="quality.off">关</option>
+              </select>
+            </label>
+            <label data-i18n-title="toolbar.ppTip" title="后处理：低/中档压效果链 FBO 分辨率；关=效果链直通+跳整屏后期层+关 Bloom"><span data-i18n="toolbar.pp">后处理</span>
+              <select id="pp">
+                <option value="high" selected data-i18n="quality.high">高</option>
+                <option value="medium" data-i18n="quality.medium">中</option>
+                <option value="low" data-i18n="quality.low">低</option>
+                <option value="off" data-i18n="quality.off">关</option>
+              </select>
+            </label>
             <label class="vol"><span data-i18n="toolbar.volume">音量</span>
               <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
             </label>

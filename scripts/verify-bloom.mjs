@@ -117,7 +117,9 @@ console.log('\n[2] shader 保真（renderer-glsl.js 与 localeffects/Bloom 28229
 console.log('\n[3] 接线：renderScene 尾部挂后期 + 缓冲 1/4 分辨率 + Add 合成 + general 热更')
 {
   const rd = fs.readFileSync(join(ROOT, 'renderer/vendor/we-scene/render/renderer.js'), 'utf8')
-  check(/const bloom = bloomPostParams\(general\)/.test(rd), 'renderScene 读取 bloom 门控')
+  // 2026-09-15 质量设置：bloom 改经后处理总开关门控（off 档 = null），
+  // 「每帧从 general 读参数」的语义不变（effectsEnabled 默认 true）。
+  check(/const bloom = effectsEnabled \? bloomPostParams\(general\) : null/.test(rd), 'renderScene 读取 bloom 门控（经后处理总开关）')
   check(/applyBloomPost\(bloom, width, height\)/.test(rd), '门控通过时调用 applyBloomPost')
   check(/bloom post: on strength=/.test(rd), '一次性诊断输出 bloom 参数（HDR 无效果时的定位入口）')
   check(/Math\.round\(width \/ 4\)/.test(rd), 'bloom 缓冲 1/4 分辨率（effect.json scale:4）')

@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.3.23/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.22/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.3.23/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -100,7 +100,6 @@ console.log(wp.canvas);
 
 | 工厂 | 用途 |
 | --- | --- |
-| `1.3.16` | 2026-09-11 | 媒体组件修复与品牌化：①33 张壁纸的专辑封面此前显示黑色占位——作者把 $mediaThumbnail/$mediaPreviousThumbnail 绑在效果 pass 的 usertextures 槽，解析只取了默认占位纹理；现按绑定合并，封面正常显示（3785267658/3786330502 等）。②媒体歌名/歌手整层空白：限宽换行曾被 2×2 占位盒的内宽压成每字一行再收成省略号；文字画布改为只对占位小盒按内容对称扩边，打字机式脚本的标题不再卡在占位文本。③模拟音频改成真立体声（底鼓居中、军鼓/踩镲分左右、和弦左右独立）。④模拟媒体源换成库品牌：曲名 WebWallGL、歌手 oneincase、封面用库 logo。⑤修复共享文字画布尺寸重设后字体丢失：改 textCanvas.width/height 会重置 2D 上下文，measure 阶段设的字号被清成默认 10px，导致大字号时钟/日期按 10px 绘制、整层几乎不可见（2468489223、3379996991）；现绘制用显式字体串。⑥修复时钟/日期脚本被误判为写回式而清空文本（3379996991）。 |
 | `httpSource(baseUrl, init?)` | HTTP 基址；自动按 scene.pkg → scenes/scene.pkg → gifscene.pkg 三种真实布局回退 |
 | `fileSource(file, project?)` | &lt;input type=file> 或拖拽进来的 .pkg 本地文件 |
 | `bytesSource(pkg, project?, key?)` | 已经拿到字节（bundle 内嵌、IndexedDB 缓存、自定义通道） |
@@ -130,6 +129,7 @@ input.addEventListener("change", () => {
 | `properties` | `{}` | 初始用户属性覆盖值（键为属性名） |
 | `pointer / audio / media` | `内置` | 指针跟随 canvas、音频/系统媒体为确定性模拟；传 null 禁用 |
 | `features` | `全开` | 调试开关：models / text / particles / effects / components |
+| `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
 
 ## 实例 API SceneInstance
@@ -139,6 +139,7 @@ input.addEventListener("change", () => {
 | `pause() / resume() / paused` | 暂停恢复。禁止整包重挂：恢复时视频/音频从暂停点继续 |
 | `setFit(fit) / setFps(n) / setVolume(v)` | 热更新，无需重挂载（渲染循环每帧读取） |
 | `setRenderDpr(dpr)` | 改 DPR 需重建画布，内部自动重挂（pkg 缓存命中，不重新下载） |
+| `setQuality(patch) / getQuality()` | 质量档位热更（部分更新），就地生效不重挂载；换场景/load() 后保持 |
 | `setProperties(props)` | 属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包 |
 | `getProperties()` | 当前生效的扁平化属性值表 |
 | `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。scene 与 web 都生效 |
@@ -328,10 +329,11 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 1.3.22。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
+当前版本 1.3.23。本节只记对使用者可见的变化（API、行为、兼容性、还原度），逐条对应仓库里的提交；纯内部重构与判据脚本不列。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| `1.3.23` | 2026-09-15 | 新增渲染质量设置（对标 WE 客户端性能选项）：MountOptions.quality 与 SceneInstance.setQuality()/getQuality()，三项档位全部就地热调不重挂载——antiAliasing（off 默认 / fxaa 帧末后处理 / msaa2 / msaa4 多重采样）、particles（high 默认 / medium / low 按倍率同缩数量上限与发射率 / off 不渲染不推进）、postProcessing（high 默认 / medium / low 压效果链 FBO 分辨率 / off 效果链直通+跳整屏后期层+关 Bloom）。修复 MSAA 在 WebKit（WKWebView/ANGLE Metal）完全失效：「多重采样 → 默认帧缓冲」的 blit 被一律 INVALID_OPERATION 静默拒绝（画面冻结在切换前最后一帧），resolve 改为 blit 到同格式纹理 FBO 再全屏合成回画布。 |
 | `1.3.22` | 2026-09-15 | 场景脚本生命周期、粒子脚本挂点与自带音乐响应补齐，还原度提升：①resizeScreen(size) 生命周期事件——窗口/分辨率（含首帧、竖屏）变化时按 CSS 像素派发，engine.screenResolution 同步更新，横竖屏自适应缩放类壁纸（3396722575/3405117965/3002120692）不再只按 1920×1080 布局。②engine.timeOfDay 此前只在挂载时取一次，昼夜/夜灯壁纸（2134765860/3151551777 等 6 张）挂再久也不入夜；现随真实时间秒级刷新。③SceneScript localStorage 对齐 WE 语义：同壁纸全部脚本共享、跨会话保留，支持 LOCATION_SCREEN/LOCATION_GLOBAL 两级与 WE 的 delete 名；库默认用浏览器 localStorage 按壁纸隔离，宿主也可经新增的 cfg.storageProvider 注入自定义持久后端。④粒子 instanceoverride 脚本（29 张）接通：发射率/数量/大小/透明度/颜色可被音频等逐帧驱动。⑤animationlayers 的可见性脚本与 thisLayer.getAnimationLayer(name) 接通（8 张，puppet「错帧」机制），并补 originalOrigin（拖拽复位）、getMaterial(index)（改材质常量不再熔断）。⑥壁纸自带 BGM 现在会驱动音频可视化——此前自带音乐在响但音条/粒子只跟模拟或麦克风（35 张）。⑦开了 LIGHTING 的材质按 general.ambientcolor 受环境光（少数工坊壁纸）。⑧修复 Retina/HiDPI 屏「高清也不到原生分辨率」：renderDpr 默认从 1 改为 0（自动跟随设备 DPR），并允许目标 DPR 高于宿主上报的 devicePixelRatio（部分壁纸宿主 WKWebView 恒报 1，旧 min(设备DPR, renderDpr) 会把高清模式钉死在逻辑像素，3.5K/Retina 屏只渲染物理面积的 1/4）；物理最长边封顶 4096 防爆显存，视频解码缓冲则仍以设备 DPR 为上限（超采样无收益）。 |
 | `1.3.21` | 2026-09-14 | 修复点开关后状态切换了但部件不滑动（2983846453）：脚本经 thisScene.getLayer(x).origin= 写的是 world 槽，而该字段绑了脚本时每帧又被 local 基准覆盖，位移被逐帧冲掉；现统一在 local 空间收发。同提交含 3463520581 变长骨骼名解析的后续修正 |
 | `1.3.20` | 2026-09-14 | 修复车尾气、人呼气等软粒子能看出透明方块（2241938645/2250845956）：内置烟/雾贴图低透明度裙边被大尺寸精灵放大成带直边的灰幕；现高斯径向封边，影响约 110 张壁纸 |

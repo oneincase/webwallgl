@@ -257,6 +257,37 @@ export type FeatureFlags = {
   components: boolean;
 };
 
+// ---- 渲染质量设置（对标 WE 客户端的壁纸性能选项）----
+// 运行时的映射表与 normalize 在 renderer/src/quality.ts；这里只放公共类型
+// （本文件是生成 d.ts 的唯一真源，必须保持零 import）。
+
+/** 抗锯齿模式。off=关闭（默认）；fxaa=帧末后处理抗锯齿（平滑所有边缘，含纹理
+ *  alpha 边）；msaa2/msaa4=多重采样（只平滑几何边缘，与 WE 的 MSAA 语义一致）。
+ *  单选不叠加。 */
+export type AntiAliasingMode = "off" | "fxaa" | "msaa2" | "msaa4";
+
+/** 粒子质量档。off=不渲染不推进；low/medium 按倍率同时缩 maxcount 上限与
+ *  发射率；high=原始配置（默认）。 */
+export type ParticleQuality = "off" | "low" | "medium" | "high";
+
+/** 后处理质量档。off=图层效果链直通 + 跳过整屏后期层 + 关内置 Bloom；
+ *  low/medium/high=效果链开启，仅效果链 FBO 分辨率预算不同。 */
+export type PostQuality = "off" | "low" | "medium" | "high";
+
+/** 质量设置（缺省键按默认值补全：AA off / 粒子 high / 后处理 high） */
+export type QualityOptions = {
+  antiAliasing?: AntiAliasingMode;
+  particles?: ParticleQuality;
+  postProcessing?: PostQuality;
+};
+
+/** 三项齐全的规范化结果（getQuality / normalizeQuality 的输出） */
+export type ResolvedQuality = {
+  antiAliasing: AntiAliasingMode;
+  particles: ParticleQuality;
+  postProcessing: PostQuality;
+};
+
 /** 场景装配完成后的基本信息 */
 export type SceneInfo = {
   /** 场景逻辑分辨率（scene.json 的 general.orthogonalprojection） */
@@ -322,6 +353,13 @@ export type MountOptions = {
   /** 渲染开关（调试用）。**当前未接线** */
   features?: Partial<FeatureFlags>;
 
+  /**
+   * 渲染质量设置（抗锯齿/粒子/后处理档位，见 quality.ts）。
+   * 缺省 = 全默认（AA off、粒子 high、后处理 high），与引入前的行为一致。
+   * 挂载后可用 `SceneInstance.setQuality()` 热调。
+   */
+  quality?: QualityOptions;
+
   /** 诊断回调。替代旧的 GET /diag 上报 */
   onDiagnostic?: SceneEvents["diagnostic"];
   /** 装配或渲染失败。库不自带降级页，由调用方决定怎么兜 */
@@ -349,6 +387,15 @@ export type SceneInstance = {
   setVolume(volume: number): void;
   /** 改 DPR 需重建画布尺寸，内部自动重挂当前场景 */
   setRenderDpr(dpr: number): void;
+
+  /**
+   * 渲染质量设置热更（对标 WE 客户端的性能选项：抗锯齿/粒子/后处理档位）。
+   * 部分更新：只传要改的键。**就地生效，不重挂载**（与 setRenderDpr 不同）。
+   * 换场景/load() 之后保持（与 setAudio 同纪律，合并进挂载选项）。
+   */
+  setQuality(patch: QualityOptions): void;
+  /** 当前生效的质量设置（三项齐全，缺省键已按默认值补全） */
+  getQuality(): ResolvedQuality;
 
   /**
    * 用户属性热更新。就地改属性表 / 效果常量 / 脚本沙箱，

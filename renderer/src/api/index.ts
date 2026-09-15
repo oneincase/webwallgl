@@ -21,4 +21,9 @@ export type {
   MediaControl,
   MediaPlaybackState,
   DiagnosticLevel,
+  AntiAliasingMode,
+  ParticleQuality,
+  PostQuality,
+  QualityOptions,
+  ResolvedQuality,
 } from "./types";
