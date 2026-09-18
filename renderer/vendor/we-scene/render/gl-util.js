@@ -64,11 +64,14 @@ export function makeTexture(gl, rgba, width, height, bitmap = null, opts = null)
   return tex
 }
 
-export function makeTextureMip(gl, levels, rg88 = false) {
+export function makeTextureMip(gl, levels, rg88 = false, opts = null) {
   const tex = gl.createTexture()
   gl.bindTexture(gl.TEXTURE_2D, tex)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  // [we-scene patch] 环绕模式与 makeTexture 对齐：系统内置 util 贴图（噪声/云场）
+  // 被效果链用无界 uv 采样，必须 REPEAT（system-textures.js 注册端统一传 repeat）
+  const wrap = opts && opts.wrap === 'repeat' ? gl.REPEAT : gl.CLAMP_TO_EDGE
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
   // 只上传基础级，其余 mip 用 generateMipmap 生成完整链：

@@ -14,7 +14,7 @@ import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSyste
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, noise, particles, ptex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -923,48 +923,37 @@ cfg, source, pkgAbort.signal);
       };
 
       const textures = new Map<string, any>();
-      textures.set("util/white", {
-        glTex: rnd.makeTexture(renderer.gl, new Uint8Array([255, 255, 255, 255]), 1, 1),
-        width: 1,
-        height: 1,
-        rg88: false,
-      });
-      textures.set("util/noflow", {
-        glTex: rnd.makeTexture(renderer.gl, new Uint8Array([127, 127, 127, 255]), 1, 1),
-        width: 1,
-        height: 1,
-        rg88: false,
-      });
-      textures.set("util/noise", {
-        glTex: rnd.makeTexture(renderer.gl, noise.generateNoiseTexture(), 256, 256),
-        width: 256,
-        height: 256,
-        rg88: false,
-        mips: null,
-      });
-      // [we-scene patch 959417181] 效果链引用的 WE 公共 util 贴图（不在 pkg 里）。
-      // util/clouds_256（云密度图，全库 20 张 / 36 处）缺了会让云效果拿到白板贴图：
-      // 天空是一层静止伪影，且白板无图案可漂移 —— 「下雨 shader 动态效果」的
-      // 真身之一。云 shader 的 uv 随 g_Time 无界增长，必须 REPEAT 环绕（贴图本身
-      // 是可平铺的周期噪声，见 particle-textures.buildBuiltinUtilTexture）。
-      // util/black 同属公共 util 贴图（×8 处，黑色遮罩回退）。
-      for (const utilName of ["util/clouds_256", "util/black"]) {
-        const t = ptex.buildBuiltinUtilTexture ? ptex.buildBuiltinUtilTexture(utilName) : null;
+      // [we-scene patch] WE 系统内置贴图（materials/util/*，效果链/材质/sampler
+      // 默认槽引用、不在壁纸 pkg 里）。此前只硬编码 5 个名字且多为 1×1 占位，
+      // 与官方差距大：flatnormal（法线参考）缺失 → 法线类效果落白板、法线被
+      // 解释成 (1,1,1)；noflow 的 B 通道误写 127（官方 0=无流动）；noise 是
+      // 8px 平滑值噪声（官方逐像素白噪声）；perlin_256/uniform_256/fur 缺失。
+      // 现由 system-textures.js 按官方实测统计程序化复刻（尺寸/通道布局/均值
+      // 方差/零值占比/平铺性，逐字节不入库，见该模块头注与 docs/COMPLIANCE.md）。
+      // 全部 REPEAT 环绕（官方 clampuvs:false，uv 随 g_Time 无界增长）；
+      // nomip 名单（flatnormal/fur/noflow/noise）LINEAR 无 mip 链，与官方一致。
+      for (const sysName of sysTex.SYSTEM_UTIL_TEXTURES) {
+        const t = sysTex.buildSystemUtilTexture(sysName);
         if (!t) continue;
-        textures.set(utilName, {
-          glTex: rnd.makeTexture(
-            renderer.gl,
-            t.rgba,
-            t.width,
-            t.height,
-            null,
-            utilName === "util/clouds_256" ? { wrap: "repeat" } : null,
-          ),
-          width: t.width,
-          height: t.height,
-          rg88: false,
-          mips: null,
-        });
+        const opts = { wrap: "repeat" };
+        textures.set(
+          sysName,
+          sysTex.isNomipSystemTexture(sysName)
+            ? {
+                glTex: rnd.makeTexture(renderer.gl, t.rgba, t.width, t.height, null, opts),
+                width: t.width,
+                height: t.height,
+                rg88: false,
+                mips: null,
+              }
+            : {
+                glTex: rnd.makeTextureMip(renderer.gl, [t], false, opts),
+                width: t.width,
+                height: t.height,
+                rg88: false,
+                mips: [t],
+              },
+        );
       }
 
       // [we-scene patch] WE 的两个保留纹理名：当前封面 / 上一张封面。

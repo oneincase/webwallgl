@@ -142,14 +142,156 @@ console.log("\n[3] 接线：scene-mount 的 .tex 分支必须走 decodeTexImageB
   check(bare === 2, `scene-mount 剩余裸 createImageBitmap 应为 2（媒体封面路径），实得 ${bare}`);
 }
 
-console.log("\n[4] 内置 util 贴图：util/clouds_256 必须可平铺且非平坦（959417181）");
+console.log("\n[4] 系统内置 util 贴图（materials/util/* 程序化复刻，官方统计锚点见 system-textures.js 头注）");
 {
-  // 效果链引用的 WE 公共 util 贴图不在 pkg 里，缺 clouds_256 时云效果拿到白板
-  // 贴图：天空是一层静止伪影（全库 20 张 / 36 处引用）。
-  const ptex = await import(
-    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js")).href
+  // 效果链引用的 WE 公共 util 贴图不在 pkg 里。此前只硬编码 5 个名字且多为
+  // 1×1 占位：flatnormal（法线参考）缺失 → 法线类效果落白板、法线被解释成
+  // (1,1,1)；noflow 的 B 通道误写 127（官方 0=无流动）；noise 是 8px 平滑值
+  // 噪声（官方逐像素白噪声）；perlin_256/uniform_256/fur 缺失落白板。
+  const sys = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/system-textures.js")).href
   );
-  const clouds = ptex.buildBuiltinUtilTexture("util/clouds_256");
+  const NAMES = [
+    "util/white", "util/black", "util/noflow", "util/flatnormal", "util/noise",
+    "util/perlin_256", "util/uniform_256", "util/fur", "util/clouds_256",
+  ];
+  check(
+    JSON.stringify(sys.SYSTEM_UTIL_TEXTURES) === JSON.stringify(NAMES),
+    "SYSTEM_UTIL_TEXTURES 名单与官方 materials/util 集合一致",
+  );
+  for (const n of NAMES) {
+    check(!!sys.buildSystemUtilTexture(n), `${n} 必须有产出（缺失时效果槽落白板）`);
+  }
+  check(sys.buildSystemUtilTexture("util/不存在") === null, "名单外名字返回 null（不吞掉 pkg/其它来源）");
+
+  // 常量贴图逐字节断言（官方解码形态实测值）
+  const px = (t, x, y) => {
+    const o = (y * t.width + x) * 4;
+    return [t.rgba[o], t.rgba[o + 1], t.rgba[o + 2], t.rgba[o + 3]];
+  };
+  const isSolid = (t, v) => {
+    for (let i = 0; i < t.width * t.height; i++) {
+      if (t.rgba[i * 4] !== v[0] || t.rgba[i * 4 + 1] !== v[1] || t.rgba[i * 4 + 2] !== v[2] || t.rgba[i * 4 + 3] !== v[3]) return false;
+    }
+    return true;
+  };
+  const white = sys.buildSystemUtilTexture("util/white");
+  check(white.width === 32 && white.height === 32 && isSolid(white, [255, 255, 255, 255]), "util/white = 32×32 纯白");
+  const black = sys.buildSystemUtilTexture("util/black");
+  check(black.width === 32 && black.height === 32 && isSolid(black, [0, 0, 0, 255]), "util/black = 32×32 纯黑");
+  const noflow = sys.buildSystemUtilTexture("util/noflow");
+  // B=0 是本次修复的关键（曾误写 127 = 半强度流动）
+  check(noflow.width === 32 && isSolid(noflow, [127, 127, 0, 255]), "util/noflow = 32×32 (127,127,0,255)：零向量 + B=0 无流动");
+  const flat = sys.buildSystemUtilTexture("util/flatnormal");
+  // 法线参考（官方 DXT5N 解码形态）：x 存 alpha=127、y 存 green=127 → shader
+  // 按 (a,g) 重建得 (0,0,+1) 平面法线
+  check(flat.width === 16 && flat.height === 16 && isSolid(flat, [255, 127, 0, 127]), "util/flatnormal = 16×16 (255,127,0,127)（DXT5N 解码形态，法线参考）");
+  check(px(flat, 0, 0)[3] === 127 && px(flat, 0, 0)[1] === 127, "flatnormal (a,g)=(127,127)：重建法线 = +Z");
+  check(sys.isNomipSystemTexture("util/noise") && sys.isNomipSystemTexture("util/fur") && sys.isNomipSystemTexture("util/noflow") && sys.isNomipSystemTexture("util/flatnormal"), "nomip 名单 = noise/fur/noflow/flatnormal（官方 nomip:true）");
+  check(!sys.isNomipSystemTexture("util/clouds_256") && !sys.isNomipSystemTexture("util/perlin_256"), "clouds/perlin 官方带 mip 链");
+
+  // 统计判据（官方实测锚点，允许 ±容差）
+  const chanStats = (t, c) => {
+    let s = 0, s2 = 0, z = 0;
+    const n = t.width * t.height;
+    for (let i = 0; i < n; i++) {
+      const v = t.rgba[i * 4 + c];
+      s += v;
+      s2 += v * v;
+      if (v === 0) z++;
+    }
+    const m = s / n;
+    return { mean: m, sd: Math.sqrt(Math.max(0, s2 / n - m * m)), zero: z / n, n };
+  };
+  const seamRatio = (t) => {
+    const W = t.width, H = t.height, rgba = t.rgba;
+    const colDiff = (a, b) => {
+      let s = 0;
+      for (let y = 0; y < H; y++) s += Math.abs(rgba[(y * W + a) * 4] - rgba[(y * W + b) * 4]);
+      return s / H;
+    };
+    let interior = 0, cnt = 0;
+    for (let x = 0; x < W - 1; x += 7) {
+      interior += colDiff(x, x + 1);
+      cnt++;
+    }
+    return { seam: colDiff(W - 1, 0), interior: interior / cnt };
+  };
+
+  // noise：四通道独立白噪声（官方 mean≈127.5 sd≈73.8；此前是 8px 平滑值噪声）
+  const noiseT = sys.buildSystemUtilTexture("util/noise");
+  check(noiseT.width === 256 && noiseT.height === 256, "util/noise = 256×256");
+  {
+    let ok = true;
+    for (let c = 0; c < 4; c++) {
+      const st = chanStats(noiseT, c);
+      if (Math.abs(st.mean - 127.5) > 12 || Math.abs(st.sd - 73.6) > 8) ok = false;
+      // 白噪声无零值聚集（uniform_256 才有一半零）
+      if (st.zero > 0.02) ok = false;
+    }
+    check(ok, "util/noise 四通道均为均匀白噪声（mean≈127.5 sd≈73.8，无零值聚集）");
+    // 通道间独立：同像素 R 与 G 的相关系数应接近 0
+    let sxy = 0, sx = 0, sy = 0;
+    const n = noiseT.width * noiseT.height;
+    for (let i = 0; i < n; i++) {
+      const x = noiseT.rgba[i * 4], y = noiseT.rgba[i * 4 + 1];
+      sxy += x * y; sx += x; sy += y;
+    }
+    const cov = sxy / n - (sx / n) * (sy / n);
+    check(Math.abs(cov) < 90, `util/noise R/G 通道独立（协方差 ${cov.toFixed(1)} 应 ≈0，±90 即 |ρ|<0.017）`);
+  }
+
+  // perlin_256：四个平滑可平铺场，通道 (mean,sd) 有序（官方 94.8/108.4/145.2/112.0）
+  const perlin = sys.buildSystemUtilTexture("util/perlin_256");
+  check(perlin.width === 256, "util/perlin_256 = 256×256");
+  {
+    const means = [];
+    let ok = true;
+    for (let c = 0; c < 4; c++) {
+      const st = chanStats(perlin, c);
+      means.push(st.mean);
+      const target = [94.8, 108.4, 145.2, 112.0][c];
+      const targetSd = [21.5, 26.2, 23.6, 32.0][c];
+      if (Math.abs(st.mean - target) > 15 || Math.abs(st.sd - targetSd) > 8) ok = false;
+      if (st.zero > 0.01) ok = false;
+    }
+    check(ok, "util/perlin_256 四通道 (mean,sd) 对齐官方实测（±15/±8）");
+    check(means[2] > means[1] && means[1] > means[0], `util/perlin_256 通道均值有序 ch0<ch1<ch2（${means.map((m) => m.toFixed(0)).join("<")}）`);
+    // 平滑：相邻像素差远小于白噪声（官方 smoothness≈0.8，白噪声≈85）
+    let d = 0;
+    for (let y = 0; y < 256; y++) for (let x = 0; x < 255; x++) d += Math.abs(perlin.rgba[(y * 256 + x) * 4] - perlin.rgba[(y * 256 + x + 1) * 4]);
+    const smooth = d / (255 * 256);
+    check(smooth < 4, `util/perlin_256 是平滑场（相邻差 ${smooth.toFixed(2)} < 4，白噪声≈85）`);
+    const sr = seamRatio(perlin);
+    check(sr.seam < Math.max(2, sr.interior * 1.6), `util/perlin_256 可平铺（接缝 ${sr.seam.toFixed(2)} vs 内部 ${sr.interior.toFixed(2)}）`);
+  }
+
+  // uniform_256：恰 ~50% 零 + 其余均匀（官方 zero=49.8%、非零均值 128.7）
+  const uni = sys.buildSystemUtilTexture("util/uniform_256");
+  {
+    let ok = true;
+    for (let c = 0; c < 4; c++) {
+      const st = chanStats(uni, c);
+      if (Math.abs(st.zero - 0.5) > 0.03) ok = false;
+      const nzMean = st.mean / Math.max(1e-9, 1 - st.zero);
+      if (Math.abs(nzMean - 128) > 15) ok = false;
+    }
+    check(ok, "util/uniform_256 每通道 50% 零值 + 非零均匀 [0,255]");
+  }
+
+  // fur：~41% 零 + 非零偏亮（官方 zero=41.3%、非零均值≈155）
+  const fur = sys.buildSystemUtilTexture("util/fur");
+  check(fur.width === 128 && fur.height === 128, "util/fur = 128×128");
+  {
+    const st = chanStats(fur, 0);
+    check(Math.abs(st.zero - 0.413) < 0.05, `util/fur 零值占比 ≈41%（实得 ${(st.zero * 100).toFixed(1)}%）`);
+    const nzMean = st.mean / (1 - st.zero);
+    check(nzMean > 130 && nzMean < 185, `util/fur 非零均值偏亮 ≈155（实得 ${nzMean.toFixed(0)}）`);
+    check(fur.rgba[3] === 255 && chanStats(fur, 3).sd === 0, "util/fur alpha 恒 255（R8 解码为灰度）");
+  }
+
+  // clouds_256：灰度 FBM（官方 mean=126 sd=52.7 钟形薄尾），可平铺非平坦
+  const clouds = sys.buildSystemUtilTexture("util/clouds_256");
   check(!!clouds && clouds.width === 256 && clouds.height === 256, "util/clouds_256 应为 256×256");
   if (clouds) {
     const W = clouds.width;
@@ -157,64 +299,58 @@ console.log("\n[4] 内置 util 贴图：util/clouds_256 必须可平铺且非平
     let sum = 0;
     let sum2 = 0;
     let above = 0;
+    let mono = true;
     for (let i = 0; i < W * W; i++) {
       const v = rgba[i * 4] / 255;
       sum += v;
       sum2 += v * v;
       if (v > 0.15) above++; // 云 shader 的 smoothstep 阈值下界
+      if (rgba[i * 4] !== rgba[i * 4 + 1] || rgba[i * 4 + 1] !== rgba[i * 4 + 2]) mono = false;
     }
     const n = W * W;
     const mean = sum / n;
     const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+    check(mono, "util/clouds_256 是灰度图（官方 r=g=b，彩色会让云蒙版偏色）");
     check(std > 0.08, `云密度图不能是平坦色（std=${std.toFixed(3)}，白板回归）`);
+    check(Math.abs(mean * 255 - 126) < 20 && Math.abs(std * 255 - 52.7) < 15, `util/clouds_256 分布对齐官方（mean=126 sd=52.7，实得 ${(mean * 255).toFixed(0)}/${(std * 255).toFixed(0)}）`);
     const coverage = above / n;
+    // 官方 clouds_256 实测覆盖率 ≈98.1%（此前程序化版本误把大部分压到阈值下，
+    // 旧判据 10%~90% 正是按那个错误分布校的）。这里只防退化：全 0=看不见、
+    // 全 1=白板。
     check(
-      coverage > 0.1 && coverage < 0.9,
-      `阈值 0.15 以上的覆盖率应在 10%~90%（实得 ${(coverage * 100).toFixed(1)}%——全 0=看不见、全 1=整片蒙版）`,
+      coverage > 0.6 && coverage < 0.995,
+      `阈值 0.15 以上的覆盖率应落在官方量级 ~98%（实得 ${(coverage * 100).toFixed(1)}%）`,
     );
     // 可平铺性：环绕接缝的列差不应远大于内部相邻列差（云 uv 随 g_Time 无界增长，
     // 不平铺会在接缝处出现硬线；CLAMP 环绕则整片被拉成边缘一行）
-    const colDiff = (a, b) => {
-      let s = 0;
-      for (let y = 0; y < W; y++) s += Math.abs(rgba[(y * W + a) * 4] - rgba[(y * W + b) * 4]);
-      return s / W;
-    };
-    let interior = 0;
-    let cnt = 0;
-    for (let x = 0; x < W - 1; x += 7) {
-      interior += colDiff(x, x + 1);
-      cnt++;
-    }
-    const meanInterior = interior / cnt;
-    const seam = colDiff(W - 1, 0);
+    const sr = seamRatio(clouds);
     check(
-      seam < Math.max(2, meanInterior * 1.6),
-      `环绕接缝应不比内部列差更陡（接缝 ${seam.toFixed(2)} vs 内部均值 ${meanInterior.toFixed(2)}）`,
+      sr.seam < Math.max(2, sr.interior * 1.6),
+      `环绕接缝应不比内部列差更陡（接缝 ${sr.seam.toFixed(2)} vs 内部均值 ${sr.interior.toFixed(2)}）`,
     );
     // 反证：平坦白板必须被上面两条判据抓住（断言不是恒真）
-    const flat = new Uint8Array(W * W * 4).fill(255);
+    const flatT = new Uint8Array(W * W * 4).fill(255);
     let fsum = 0;
     let fsum2 = 0;
     for (let i = 0; i < W * W; i++) {
-      const v = flat[i * 4] / 255;
+      const v = flatT[i * 4] / 255;
       fsum += v;
       fsum2 += v * v;
     }
     const fstd = Math.sqrt(Math.max(0, fsum2 / n - (fsum / n) ** 2));
     check(fstd < 0.08, "自检：平坦贴图必须被 std 判据判为失败");
   }
-  const black = ptex.buildBuiltinUtilTexture("util/black");
-  check(!!black && black.rgba[0] === 0 && black.rgba[3] === 255, "util/black 应为不透明纯黑");
-  check(ptex.buildBuiltinUtilTexture("util/white") === null, "非内置 util 名应返回 null（不吞掉 pkg/其它来源）");
 
+  // 接线：scene-mount 遍历系统贴图名单注册、全部 REPEAT 环绕
   const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
-  check(/buildBuiltinUtilTexture/.test(src), "scene-mount 应注册内置 util 贴图");
+  check(/SYSTEM_UTIL_TEXTURES/.test(src) && /buildSystemUtilTexture/.test(src), "scene-mount 应遍历注册系统内置 util 贴图");
   check(
-    /util\/clouds_256"[\s\S]{0,200}wrap: "repeat"/.test(src),
-    "util/clouds_256 必须以 REPEAT 环绕注册（CLAMP 下云漂一会儿整片被拉成边缘行）",
+    /const opts = \{ wrap: "repeat" \}/.test(src),
+    "系统 util 贴图必须以 REPEAT 环绕注册（CLAMP 下 uv 漂移被拉成边缘行）",
   );
   const glSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8");
   check(/opts && opts\.wrap === 'repeat' \? gl\.REPEAT/.test(glSrc), "makeTexture 应支持 wrap:'repeat'");
+  check(/export function makeTextureMip\(gl, levels, rg88 = false, opts = null\)/.test(glSrc), "makeTextureMip 应支持 wrap:'repeat'（带 mip 的系统贴图同样被无界 uv 采样）");
 }
 
 console.log("\n[5] 精灵硬边封印：软形状贴图外圈 alpha 必须严格 0（2241938645 / 2250845956）");

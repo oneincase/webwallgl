@@ -11,6 +11,7 @@ import * as rndMod from "../vendor/we-scene/render/renderer.js";
 import * as noiseMod from "../vendor/we-scene/render/noise.js";
 import * as particlesMod from "../vendor/we-scene/render/particles.js";
 import * as particleTexMod from "../vendor/we-scene/render/particle-textures.js";
+import * as sysTexMod from "../vendor/we-scene/render/system-textures.js";
 import * as mdlMod from "../vendor/we-scene/render/mdl.js";
 import * as textMod from "../vendor/we-scene/render/text.js";
 import * as timersMod from "../vendor/we-scene/render/engine-timers.js";
@@ -31,6 +32,7 @@ const rnd = asAny(rndMod);
 const noise = asAny(noiseMod);
 const particles = asAny(particlesMod);
 const ptex = asAny(particleTexMod);
+const sysTex = asAny(sysTexMod);
 const mdl = asAny(mdlMod);
 const wtext = asAny(textMod);
 const wtimers = asAny(timersMod);
@@ -41,5 +43,5 @@ const pointerLib = asAny(pointerMod);
 const hitTest = asAny(hitTestMod);
 
 export {
-  pkg, tex, scn, eff, rnd, noise, particles, ptex, mdl, wtext, wtimers, media, system, pointerLib, hitTest, anim, audioMod,
+  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, pointerLib, hitTest, anim, audioMod,
 };
