@@ -153,6 +153,8 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/renderer\.setAntiAliasing\?\.\(q\.antiAliasing\)/.test(mountSrc), "scene-mount 应用抗锯齿档");
   check(/renderer\.setEffectsEnabled\?\.\(q\.postProcessing !== "off"\)/.test(mountSrc), "scene-mount 应用后处理开关");
   check(/setParticleQualityScale\?\.\(particleQualityScale\(q\.particles\)\)/.test(mountSrc), "scene-mount 应用粒子倍率");
+  check(/setParticleDensityTier\?\.\(q\.particles === "off" \? "high" : q\.particles\)/.test(mountSrc), "scene-mount 应用粒子密度档（超大 count 倍率封顶）");
+  check(/particles\.js/.test("particles.js") && /MAX_POOL_BY_QUALITY/.test(particlesSrc), "particles 有按质量档的池容量上限");
   check(/particleQualityOff = q\.particles === "off"/.test(mountSrc), "粒子 off 档走推进/渲染跳过");
   check(/setQualityImpl = applyQuality/.test(mountSrc), "sceneCtl.setQuality 热更已接线");
   check(/applyQuality\(normalizeQuality\(cfg\.quality\)\)/.test(mountSrc), "挂载时按 cfg.quality 应用初值");
@@ -174,14 +176,15 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
 // 不缩发射率会让稳态密度不变）、Bloom 必须被后处理总开关门控。断言写完后已
 // 各验证一次：变异体能被抓住（FAILED 行出现）、原源码全绿。
 {
-  // 3a) 把 _applyOverride 的 count 分支改回「不乘质量倍率」
+  // 3a) 把 count 分支的发射率倍率改回「不乘质量倍率」。新结构里质量倍率折进
+  //     effective * particleQualityScale（3509806978 密度封顶后 count 分支重写）。
   const mutated = particlesSrc.replace(
-    "const m = (Number.isFinite(mul) ? mul : 1) * particleQualityScale",
-    "const m = Number.isFinite(mul) ? mul : 1",
+    "this._ov.countMul = effective * particleQualityScale",
+    "this._ov.countMul = effective",
   );
   const catches = mutated !== particlesSrc &&
-    /const m = \(Number\.isFinite\(mul\) \? mul : 1\) \* particleQualityScale/.test(particlesSrc) &&
-    !/const m = \(Number\.isFinite\(mul\) \? mul : 1\) \* particleQualityScale/.test(mutated);
+    /this\._ov\.countMul = effective \* particleQualityScale/.test(particlesSrc) &&
+    !/this\._ov\.countMul = effective \* particleQualityScale/.test(mutated);
   check(catches, "变异红测：粒子 count 分支的质量倍率丢失会被断言抓住");
   // 3b) 把 Bloom 门控改回「不受后处理总开关控制」
   const mutated2 = rendererSrc.replace(

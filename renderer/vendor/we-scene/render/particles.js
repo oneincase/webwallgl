@@ -33,6 +33,34 @@ export function getParticleQualityScale() {
   return particleQualityScale
 }
 
+// [we-scene patch 3509806978] CPU 模拟的粒子密度上限（按质量档分级）。
+//
+// 背景：instanceoverride.count 是 WE 的「粒子数量倍率」。参考实现（linux-wallpaper
+// engine 的 CParticle：rate = emitter.rate × override.rate，与 count 无关；
+// Mirage：emit_speed = emitSpeed × 音频响应）里 **count 只放大池容量，从不乘进
+// 发射率**——因为 count=5000 这类值若乘进 rate 会瞬间灌满整池（25/s × 5000 =
+// 125000/s）。
+//
+// 本仓为支持 count<1 的「调稀」语义（Rain_secondary count=0.13 需要降密度），让
+// rate 乘了 countMul——这在 count<1 时正确，但 count>1 的线性放大是密度/性能错误：
+// 全库 83 个 count override 真实最大值只有 5（雨/火花），唯一离群是 3509806978
+// 细节雪的 count=5000，把 360 池灌到 20000、每帧 CPU 算 fbm 湍流，稳态 2fps。
+//
+// 故对 count>1 的**发射率放大**按质量档封顶（count<1 的线性缩放原样保留）；
+// 池容量另设硬上限（MAX_POOL_BY_QUALITY），只作用于「作者显式写了 count override」
+// 的系统——无 override 的系统保留 20000 上限（Candles_1 maxcount=25000/rate=15000
+// 是作者有意的高密度，不替它做决定）。
+const MAX_POOL_BY_QUALITY = { low: 3000, medium: 6000, high: 12000 }
+// rate 的 count 放大封顶（>1 时）。5 = 全库真实最大倍率（雨），雪异常值压到同档
+const COUNT_RATE_MUL_CAP = { low: 3, medium: 5, high: 8 }
+let particleDensityTier = 'high'
+export function setParticleDensityTier(tier) {
+  particleDensityTier = MAX_POOL_BY_QUALITY[tier] ? tier : 'high'
+}
+export function getParticleDensityTier() {
+  return particleDensityTier
+}
+
 // [we-scene patch] 绘制目标/场景捕获注入（MSAA 支持）。粒子 render() 历史上
 // 不绑帧缓冲，靠「上一个合成调用残留的绑定」画到画布 —— MSAA 开启后最终目标
 // 变成多重采样 FBO，必须显式绑定；REFRACT 的 copyTexImage2D 也不能读多重采样
@@ -301,18 +329,32 @@ export class ParticleSystem {
       const raw = ov[k]
       const val = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw
       if (k === 'count') {
-        // count 是**粒子数量倍率**：既缩上限，也按同比例缩发射率。
-        // 只缩 maxcount 是错的 —— 稳态存活数 ≈ rate × lifetime，不动 rate 的话
-        // 调小 count 只会让粒子更快被回收、密度几乎不变，与编辑器里"数量"滑块的语义相反。
-        // 全库 91 个带 count override 的层实测：只缩上限有 46% 的层稳态超出 maxcount
-        // 被硬截断（2370927443 的 Rain_secondary 需要 4500 颗却只有 1300 的上限，
-        // 于是 1300 颗全挤在 6%×20% 的小窗格里，密度是主雨的 900 倍 ——
-        // 表现为「画面正中一块过密的长方形雨」）；同时缩发射率则降到 13%。
+        // count 是 WE 的「粒子数量倍率」。两件事要分开：
+        //
+        // 1) 池容量（maxCount）：按 base × count × 质量倍率放大，但带 CPU 硬上限。
+        //    全库真实 count ∈ [0.05, 5]（83 处 override），3509806978 的 5000 是
+        //    唯一离群值。有 count override 的系统按密度档封顶池容量。
+        //
+        // 2) 发射率倍率（_ov.countMul）：稳态存活 ≈ rate × lifetime，不缩 rate 的话
+        //    调小 count 密度不变（见下方 Rain_secondary 实测）。但参考实现
+        //    （lwe / Mirage）里 count 从不乘 rate——因为 count>1 线性放大 rate 会把
+        //    25/s 的雪炸成 125000/s。故：
+        //      • count ≤ 1：rate 线性缩放（调稀语义，Rain_secondary=0.13 需要它）；
+        //      • count > 1：rate 放大按密度档封顶（雨 count=5 落在 high 档 8 内，
+        //        观感零回归；雪 count=5000 压到 8 → 稳态 ~2800 而非填满 20000）。
         const base = num(this.model.maxcount, 100)
         const mul = Number(val)
-        const m = (Number.isFinite(mul) ? mul : 1) * particleQualityScale
-        this.maxCount = Math.max(1, Math.min(20000, Math.round(base * m)))
-        this._ov.countMul = m
+        const countMul = Number.isFinite(mul) ? mul : 1
+        const poolCap = MAX_POOL_BY_QUALITY[particleDensityTier]
+        this.maxCount = Math.max(
+          1,
+          Math.min(poolCap, Math.round(base * countMul * particleQualityScale)),
+        )
+        const rateCap = COUNT_RATE_MUL_CAP[particleDensityTier]
+        const effective = countMul <= 1 ? countMul : Math.min(countMul, rateCap)
+        this._ov.countMul = effective * particleQualityScale
+        // 保留未封顶的原始倍率供诊断
+        this._ov.countRaw = countMul
       } else if (k === 'alpha') {
         this.opacityMul = Number(val)
         if (!Number.isFinite(this.opacityMul)) this.opacityMul = 1
@@ -1225,7 +1267,25 @@ export class ParticleSystem {
       this._warmed = true
       if (this.startTime > 0) {
         const step = 1 / 30
-        const steps = Math.min(900, Math.round(this.startTime / step))
+        const wantSteps = Math.min(900, Math.round(this.startTime / step))
+        // [we-scene patch 3509806978] 预热步数必须按池规模设预算，不能对
+        // maxCount=20000 的系统也跑满 450 步。starttime=15 的「细节雪」被
+        // instanceoverride.count=5000 放大到 360×5000（截断 20000）后，450 步
+        // 每步都线性扫全池（fill 的存活计数 + spawn 环形查找 + update 全量），
+        // 单次 advance 实测 56.6s，4 个雪系统串行把首帧推到 145s，整个测试台卡死。
+        //
+        // 实测雪系统只需 ~25 步（0.8s 模拟）就到稳态满池（lifetime 8~20s +
+        // rate=25×countMul），多跑的步数纯属重复扫池。预算口径 = 步数×池规模，
+        // 上限取 2.4e5「粒子步」：
+        //   - 常规系统（池 ≤ 800）：wantSteps 不变，预热完整（观感零回归）；
+        //   - 巨型池（20000）：压到 12 步（≈0.4s 模拟），单系统预热亚秒级；
+        //   - 中间规模线性插值。
+        // 巨型池通常伴生巨大的 countMul（雪被 instanceoverride.count=5000 放大），
+        // 其发射率同样被放大，12 步内生成量已足以铺满；少跑的只是「确认稳态」的
+        // 冗余扫池。正确性不受影响——最终粒子分布由 spawn/update 决定。
+        const PARTICLE_STEP_BUDGET = 240_000
+        const stepsByBudget = Math.max(1, Math.floor(PARTICLE_STEP_BUDGET / Math.max(1, this.maxCount)))
+        const steps = Math.min(wantSteps, stepsByBudget)
         for (let i = 0; i < steps; i++) this._step(step)
       }
     }

@@ -1971,6 +1971,9 @@ cfg, source, pkgAbort.signal);
         renderer.setFboCapFactor?.(postFboCapFactor(q.postProcessing));
         particleQualityOff = q.particles === "off";
         particles.setParticleQualityScale?.(particleQualityScale(q.particles));
+        // 粒子密度档：控制超大 count 倍率系统的池容量与发射率封顶（3509806978
+        // count=5000 的雪）。off 不经过这里（上面已门控推进与渲染）。
+        particles.setParticleDensityTier?.(q.particles === "off" ? "high" : q.particles);
         for (const ps of particleSystems) ps._applyOverride?.();
         reportDiag(rt, cfg, `quality: aa=${q.antiAliasing} particles=${q.particles} post=${q.postProcessing}`);
       };

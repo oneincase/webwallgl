@@ -31,6 +31,7 @@ const {
   particleInstanceSegs,
   ropeTrailHistoryCount,
   ropeTrailDuration,
+  setParticleDensityTier,
 } = await imp("renderer/vendor/we-scene/render/particles.js");
 const ptex = await imp("renderer/vendor/we-scene/render/particle-textures.js");
 const { createTarget, rasterizeSystem, analyzeTarget } = await imp(
@@ -1551,6 +1552,95 @@ function runBuiltinFrames() {
 // 「能看出透明的方块」：烟/雾/火/光斑/气泡这类按精灵画的软形状贴图，只要边缘还留
 // 1~130/255 的 alpha，放大成几百~几千像素的 quad 后每个方块的直边就肉眼可见
 // （几十个叠加成一片带直边的灰幕）。生成器统一加宽 S 形边窗封印；图集与法线豁免。
+function runPrewarmBudget() {
+  const errors = [];
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/PARTICLE_STEP_BUDGET/.test(src)) {
+    errors.push("预热缺按池规模的步数预算（3509806978 回归：count=5000 的雪系统跑满 450 步 × 扫 20000 池 = 首帧 145s 卡死）");
+  }
+  if (!/MAX_POOL_BY_QUALITY/.test(src) || !/COUNT_RATE_MUL_CAP/.test(src)) {
+    errors.push("缺超大 count 倍率的密度封顶（3509806978：count=5000 把雪灌到 20000 池、稳态 2fps）");
+  }
+
+  // 高发射率雪系统（对齐 3509806978 obj374：preset maxcount=360/starttime=15/rate=25，
+  // instanceoverride.count=5000）。密度修复后 high 档池上限 12000、rate 的 count 放大
+  // 封顶 8（count<1 的线性缩放保留，>1 封顶，见 COUNT_RATE_MUL_CAP）。
+  const snowModel = {
+    maxcount: 360,
+    starttime: 15,
+    emitter: [{ name: "sphererandom", rate: 25, origin: "0 0 0", directions: "1 0.03 1", distancemin: 10, distancemax: 1000, sign: "0 0 1" }],
+    initializer: [
+      { name: "lifetimerandom", min: 8, max: 20 },
+      { name: "sizerandom", min: 2, max: 30 },
+      { name: "velocityrandom", min: "10 -50 0", max: "37 -90 0" },
+    ],
+    operator: [{ name: "movement" }],
+  };
+  const layer = { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0], visible: true };
+
+  // ---- 密度封顶（3509806978：count=5000 不再灌满 20000 池）----
+  setParticleDensityTier("high");
+  const ps = new ParticleSystem(null, snowModel, { count: 5000, size: 0.37 }, layer);
+  if (ps.maxCount > 12000) errors.push(`count=5000 high 档池容量应 ≤12000，实得 ${ps.maxCount}`);
+  if (ps._ov.countMul !== 8) errors.push(`count=5000 的 rate 放大应封顶 8（参考实现 count 不乘 rate），实得 ${ps._ov.countMul}`);
+  // 预热必须快速（修复前 56.6s）
+  const t0 = Date.now();
+  ps.advance(0, { level: 0 });
+  const warmMs = Date.now() - t0;
+  if (warmMs > 2000) errors.push(`巨型池雪系统预热耗时 ${warmMs}ms > 2000ms（会卡死测试台，修复前 56600ms）`);
+  // 预热后有雪（不能为快把雪弄没）
+  let live = 0;
+  for (const p of ps.pool) if (p.alive) live++;
+  if (live < 100) errors.push(`预热后雪存活 ${live} 过少（开场无雪）`);
+  // 稳态密度：rate=25×8 × life≈14 理论 ~2800，不应灌满上万（修复前 20000/2fps）
+  for (let i = 0; i < 300; i++) ps.advance(1 / 60, { level: 0 });
+  let steady = 0;
+  for (const p of ps.pool) if (p.alive) steady++;
+  if (steady > 5000) errors.push(`count=5000 雪稳态 ${steady} > 5000（密度封顶失效，仍会拖垮 CPU）`);
+
+  // ---- 分档 ----
+  setParticleDensityTier("low");
+  const low = new ParticleSystem(null, snowModel, { count: 5000 }, layer);
+  if (low.maxCount > 3000) errors.push(`low 档池容量应 ≤3000，实得 ${low.maxCount}`);
+  if (low._ov.countMul !== 3) errors.push(`low 档 rate count 放大应封顶 3，实得 ${low._ov.countMul}`);
+  setParticleDensityTier("high");
+
+  // ---- count<1 的调稀语义必须保留（Rain_secondary=0.13，2370927443）----
+  const thin = new ParticleSystem(
+    null,
+    { ...snowModel, maxcount: 10000, starttime: 0 },
+    { count: 0.13 },
+    layer,
+  );
+  if (thin._ov.countMul !== 0.13) errors.push(`count<1 应线性缩放 rate（0.13），实得 ${thin._ov.countMul}`);
+  if (thin.maxCount !== 1300) errors.push(`count=0.13 池容量应=1300，实得 ${thin.maxCount}`);
+
+  // ---- count=5 雨（全库真实最大倍率）不应被密度封顶误伤 ----
+  const rain = new ParticleSystem(null, { ...snowModel, maxcount: 100000, starttime: 0 }, { count: 5 }, layer);
+  if (rain._ov.countMul !== 5) errors.push(`count=5 在 high 档（cap=8）内应原样保留 rate 倍率 5，实得 ${rain._ov.countMul}`);
+
+  // 常规小池系统：预热步数不被预算压缩（观感零回归）。starttime=3 → wantSteps=90，
+  // 池 360 时预算允许 240000/360=666 步，wantSteps=90 原样保留。
+  const small = new ParticleSystem(
+    null,
+    {
+      ...snowModel,
+      maxcount: 360,
+      starttime: 3,
+      emitter: [{ ...snowModel.emitter[0], rate: 100 }],
+    },
+    null,
+    layer,
+  );
+  small.advance(0, { level: 0 });
+  let smallLive = 0;
+  for (const p of small.pool) if (p.alive) smallLive++;
+  if (smallLive < 280) errors.push(`小池系统完整预热应近满池（${smallLive}/360），预算误伤了常规系统`);
+
+  console.log(`    异常雪 count=5000 high 档 maxCount=${ps.maxCount} rateMul=${ps._ov.countMul} 预热 ${warmMs}ms；稳态 ${steady}；小池(360)存活 ${smallLive}`);
+  return errors;
+}
+
 function runSoftRim() {
   const errors = [];
   const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js"), "utf8");
@@ -1795,6 +1885,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【精灵硬边封印】问题 ${sr.errors.length}`);
   sr.errors.forEach((e) => console.log("  ! " + e));
   failed += sr.errors.length;
+  const pw = runPrewarmBudget();
+  console.log(`\n【预热步数预算（3509806978 卡死回归）】问题 ${pw.length}`);
+  pw.forEach((e) => console.log("  ! " + e));
+  failed += pw.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);
