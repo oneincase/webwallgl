@@ -528,25 +528,29 @@ const ids = fs.existsSync(LIB)
   }
 }
 
-// ---------- 11. 场景环境光：材质 LIGHTING combo → 图层基色乘 ambientcolor ----------
+// ---------- 11. 场景环境光：材质 LIGHTING combo → 图层基色乘有效环境光 ----------
 //
 // 官方 genericimage2/3/4（genericparticle 另有 DOUBLESIDEDLIGHTING）在
-// `#if LIGHTING` 时 ambient = max(0.001, g_LightAmbientColor)*albedo，无直射
-// 灯（本仓不跑 PBR、语料 NORMALMAP 全 0）时结果 = albedo × ambientcolor。
-// 2026-09 全库扫描：仅 4 个 pass 开 LIGHTING（2872267921/2890473419/
-// 3351179520/3509243656），其余 4400+ pass 不受影响，这条断言同时守住
-// 「不要给未开光照的材质全局压暗」的回归红线。
+// `#if LIGHTING` 时 ambient = g_LightAmbientColor*albedo，无直射灯（本仓不跑
+// PBR）时结果 = albedo × g_LightAmbientColor。
+// **g_LightAmbientColor = min(1, ambientcolor×π)**（2026-09-18 实测标定，
+// 3737267090「整体太黑」：raw 0.3 直乘压暗 70%；详见 CASEBOOK「环境光 π 标定」）。
+// 语料锁：LIGHTING=1 的 genericimage* pass（2026-09-18 本机库 8 pass / 4 张：
+// 2894296965×4 / 3737267090×2 / 3047405322×1 / 3509243656×1），数量变了要人看一眼；
+// 这条断言同时守住「不要给未开光照的材质全局压暗」的回归红线。
 {
   const renderer = await imp("renderer/vendor/we-scene/render/renderer.js");
   const near3 = (a, b, eps = 1e-6) => a.every((x, i) => Math.abs(x - b[i]) <= eps);
 
-  // 纯函数数值语义
+  // 纯函数数值语义：min(1, max(0.001, a)×π)
   if (!near3(renderer.layerColorAmbient(false, [0.3, 0.3, 0.3]), [1, 1, 1]))
     fail("未开 LIGHTING 时乘子必须是 [1,1,1]（不能全局压暗 99.9% 材质）");
-  if (!near3(renderer.layerColorAmbient(true, [0.3, 0.3, 0.3]), [0.3, 0.3, 0.3]))
-    fail("开 LIGHTING 时应逐分量返回 ambientcolor");
-  if (!near3(renderer.layerColorAmbient(true, [0, 0, 0]), [0.001, 0.001, 0.001]))
-    fail("纯黑 ambient 必须有 0.001 下限（官方 max(0.001, g_LightAmbientColor)）");
+  if (!near3(renderer.layerColorAmbient(true, [0.3, 0.3, 0.3]), [0.3 * Math.PI, 0.3 * Math.PI, 0.3 * Math.PI]))
+    fail("开 LIGHTING 时应逐分量返回 ambientcolor×π（3737267090：raw 0.3 直乘 = 整体太黑）");
+  if (!near3(renderer.layerColorAmbient(true, [0, 0, 0]), [0.001 * Math.PI, 0.001 * Math.PI, 0.001 * Math.PI]))
+    fail("纯黑 ambient 必须有 0.001 下限（官方 max(0.001, g_LightAmbientColor)）再乘 π");
+  if (!near3(renderer.layerColorAmbient(true, [1, 1, 1]), [1, 1, 1]))
+    fail("纯白 ambient 必须封顶 1（2894296965 官方 preview/反照率中位 ≈1.03，不是 π≈3.1）");
 
   // 语料面貌：恰好这 4 张有 LIGHTING=1 的 genericimage* pass（数量变了要人看一眼）
   const litWalls = new Set();
@@ -569,8 +573,8 @@ const ids = fs.existsSync(LIB)
       }
     } catch { /* 个别包读取失败不影响 */ }
   }
-  if (litPasses !== 4) fail(`LIGHTING=1 的 genericimage pass 应是 4（台账），实得 ${litPasses}`);
-  const expectWalls = ["2872267921", "2890473419", "3351179520", "3509243656"];
+  if (litPasses !== 8) fail(`LIGHTING=1 的 genericimage pass 应是 8（2026-09-18 台账），实得 ${litPasses}`);
+  const expectWalls = ["2894296965", "3047405322", "3509243656", "3737267090"];
   for (const w of expectWalls) {
     if (!litWalls.has(w)) fail(`LIGHTING 壁纸 ${w} 未扫到（材质路径/combo 解析回退？）`);
   }

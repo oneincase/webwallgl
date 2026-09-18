@@ -254,17 +254,30 @@ export function effectFboSize(fboDef, baseW, baseH) {
  * 官方 genericimage2/3/4 与 genericparticle 在 `#if LIGHTING` 下：
  *   ambient = max(0.001, g_LightAmbientColor) * color
  *   color   = CombineLighting(directLight, ambient)
- * 本仓不跑完整 PBR、场景也没有灯光对象（语料 NORMALMAP 全 0、lightconfig 仅 3 个
- * 场景且本仓不解析），直射项恒为 0 → CombineLighting 退化为 albedo × ambient。
+ * 本仓不跑完整 PBR，直射项按 0 处理 → CombineLighting 退化为 albedo × ambient。
+ * **g_LightAmbientColor ≠ 原始 ambientcolor**：引擎按辐照度口径喂入
+ * ambientcolor×π（3737267090 实测：ambient=0.3 灰默认 + 无灯光时，官方
+ * preview/反照率整帧比值 ≈0.94~1.03；3047405322 同为 0.87——raw 0.3 直乘会
+ * 整体压暗 70%，3737267090「整体太黑」即此；ambient=1.0 的 2894296965 比值
+ * 中位 ≈1.03 → 封顶 1；三体 ambient=0 → 0.001 地板仍近黑）。
  * - lightingEnabled=false（99.9% 的层，combo 没开 LIGHTING）：返回 [1,1,1]，不碰。
- * - true：逐分量 max(0.001, ambient)（官方下限，防纯黑场景吞掉整个发光材质）。
+ * - true：逐分量 min(1, max(0.001, a)×π)（0.3 灰默认 ≙ 0.94 近原亮度，
+ *   白色封顶 1，纯黑保官方 0.001 下限×π）。
+ *
+ * 场景灯光对象（lpoint/lspot，3737267090 有一盏 intensity 1.79 的点光）本仓
+ * 不解析；按官方 LightingV1 公式其全帧平均贡献仅 ~2%（falloff^exponent 衰减
+ * 极快），并入 ambient 误差可忽略。
  *
  * 纯函数供离线 verifier 直接跑（不创建 WebGL 上下文）。
  */
 export function layerColorAmbient(lightingEnabled, ambient) {
   if (!lightingEnabled) return [1, 1, 1]
   const a = ambient || [0, 0, 0]
-  return [Math.max(0.001, Number(a[0]) || 0), Math.max(0.001, Number(a[1]) || 0), Math.max(0.001, Number(a[2]) || 0)]
+  return [
+    Math.min(1, Math.max(0.001, Number(a[0]) || 0) * Math.PI),
+    Math.min(1, Math.max(0.001, Number(a[1]) || 0) * Math.PI),
+    Math.min(1, Math.max(0.001, Number(a[2]) || 0) * Math.PI),
+  ]
 }
 
 export function bloomPostParams(general) {
@@ -2199,8 +2212,10 @@ export function createRenderer(canvas, opts = {}) {
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
     // [we-scene patch] 场景环境光（g_LightAmbientColor）：材质 combos.LIGHTING=1
-    // 的 genericimage* 层，官方 shader 做 color = albedo * max(0.001, ambient)
-    // （无灯光直射项时）。每帧缓存供 renderLayer 的 color4 使用。
+    // 的 genericimage* 层，官方 shader 做 color = albedo * g_LightAmbientColor
+    // （无灯光直射项时）；g_LightAmbientColor = ambientcolor×π 封顶 1（口径见
+    // layerColorAmbient 注释，3737267090 实测标定）。每帧缓存供 renderLayer
+    // 的 color4 使用。
     sceneAmbient = parseVec3Local(general.ambientcolor || '1 1 1')
     if (general.clearenabled !== false) {
       const cc = parseVec3Local(general.clearcolor || '0 0 0')
@@ -2919,8 +2934,8 @@ export function createRenderer(canvas, opts = {}) {
     const w = Math.max(1, Math.round(contentW))
     const h = Math.max(1, Math.round(contentH))
     // [we-scene patch] 材质 LIGHTING combo 开启时乘场景环境光（官方
-    // genericimage*：ambient = max(0.001, g_LightAmbientColor)，无直射灯时
-    // 结果 = albedo × ambient）。max(0.001) 防纯黑环境吞掉整个发光层。
+    // genericimage*：ambient = g_LightAmbientColor * albedo，无直射灯时结果
+    // = albedo × min(1, ambientcolor×π)；口径与实测依据见 layerColorAmbient）。
     const amb = layerColorAmbient(layer.lightingEnabled, sceneAmbient)
     const color4 = [
       layer.color[0] * layer.brightness * amb[0],
