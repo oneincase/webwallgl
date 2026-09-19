@@ -1955,6 +1955,17 @@ cfg, source, pkgAbort.signal);
               cOrigin[1] || 0,
               cOrigin[2] || 0,
             ]);
+          } else if (childPs && (ch.type === "eventdeath" || ch.type === "eventspawn")) {
+            // 事件子发射器：**不自播**，只由父粒子的死亡/生成事件在父粒子当时的位置
+            // 触发爆发（WE 的 SpawnType::EVENT_DEATH / EVENT_SPAWN）。此前这类子级
+            // 被当成独立系统装配，于是只在首帧于图层 origin 白爆一次 ——
+            // 2131872317 的烟花火箭升空后不会炸（8500 颗的爆开、flare、冲击波全无）。
+            // cOrigin 是本系统相对父系统的站位（children.origin，父局部坐标）。
+            childPs.attachEventParent(ps, ch.type, [
+              cOrigin[0] || 0,
+              cOrigin[1] || 0,
+              cOrigin[2] || 0,
+            ]);
           }
         }
         return ps;

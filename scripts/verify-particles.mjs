@@ -258,6 +258,11 @@ function runSim() {
       );
 
       if (nan) errors.push(`${scene.id} ${d.path}: ${nan} 个粒子出现 NaN/Inf`);
+      // 存活计数不变量：_aliveCount 是「池满即返回」的依据（爆发 8500 颗时不做
+      // O(池容量) 的环形扫描），与逐槽扫描必须恒等 —— 多一处 alive 赋值没同步就静默错。
+      if (ps._aliveCount !== live) {
+        errors.push(`${scene.id} ${d.path}: _aliveCount=${ps._aliveCount} ≠ 实际存活 ${live}`);
+      }
       // 20 秒内理应至少生成 1 颗（rate*20 >= 1 才要求；低速流星不在此列）
       if (peak === 0 && rate * 20 >= 1)
         errors.push(`${scene.id} ${d.path}: 发射率 ${rate}/s 但 20s 内 0 颗粒子`);
@@ -1862,6 +1867,380 @@ function runOverbright() {
   return { errors };
 }
 
+// ---------- 校验：事件子发射器（eventspawn / eventdeath） ----------
+//
+// WE 语义（OWE ParticleRuntime::SpawnChild / Mirage SceneCompiler 的 SpawnType）：
+// `children.type` 为 eventspawn / eventdeath 的子级**不是**独立系统，而是由父粒子的
+// 生成 / 死亡事件在**父粒子当时的位置**临时创建的实例。此前本仓按独立系统装配
+// （renderer/vendor/we-scene/README.md 旧文），子级只在装配首帧于图层 origin 爆发
+// 一次：2131872317 三层烟花共 7 个 eventdeath 子级，8500 颗的爆开、闪光 flare 与
+// 冲击波 distort 全都不见 —— 火箭升空后什么都不炸。
+//
+// 判据两条语义，都不依赖随机数落在哪个区间：
+//   1. 父粒子事件之前，子级一颗都不许有（旧行为的首帧白爆立刻违反）；
+//   2. 事件发生当帧，子级在**父粒子事件点**爆发（世界空间质心贴事件点、且远离图层 origin）。
+// 位置一律换算到世界空间再比：子级可以有自己的 children.scale（雨溅水滴是 0.2），
+// 两个系统的**局部**坐标之间差一个缩放，直接比局部坐标会把正确的实现判成错的。
+function runEventChildren() {
+  const errors = [];
+  let checked = 0;
+  const DT = 1 / 60;
+  const layerOf = (o) => ({
+    origin: parseVec(o.origin),
+    scale: parseVec(o.scale, [1, 1, 1]),
+    angles: parseVec(o.angles),
+  });
+  const mk = (pkg, path, override, layer) => {
+    const model = JSON.parse(readText(getEntry(pkg, path)));
+    const ps = new ParticleSystem(null, model, override || null, layer);
+    ps.setVisible(true);
+    return { ps, model };
+  };
+  // 与 scene-mount 的 buildParticleSystem **同构**的装配（children 变换 + 接线）。
+  // 两边不同构的话这条判据就测不到真实路径。
+  const rig = (pkg, obj) => {
+    const layer = layerOf(obj);
+    const parent = mk(pkg, obj.particle, obj.instanceoverride, layer);
+    const kids = [];
+    for (const ch of parent.model.children || []) {
+      if (!ch || typeof ch.name !== "string" || !getEntry(pkg, ch.name)) continue;
+      const cO = parseVec(ch.origin);
+      const cS = parseVec(ch.scale, [1, 1, 1]);
+      const cA = parseVec(ch.angles);
+      const w = parent.ps.localToWorld(cO[0], cO[1]);
+      const childLayer = {
+        origin: [w[0], w[1], cO[2]],
+        scale: [layer.scale[0] * cS[0], layer.scale[1] * cS[1], layer.scale[2] * cS[2]],
+        angles: [layer.angles[0] + cA[0], layer.angles[1] + cA[1], layer.angles[2] + cA[2]],
+      };
+      const child = mk(pkg, ch.name, ch.instanceoverride || obj.instanceoverride, childLayer);
+      if (ch.type === "eventdeath" || ch.type === "eventspawn") {
+        child.ps.attachEventParent(parent.ps, ch.type, cO);
+      } else if (ch.type === "eventfollow") {
+        child.ps.attachFollow(parent.ps, "particle", cO);
+      } else if (!ch.type || ch.type === "static") {
+        child.ps.attachFollow(parent.ps, "origin", cO);
+      }
+      kids.push({ type: ch.type, path: ch.name, ...child });
+    }
+    return { parent, kids, layer };
+  };
+  // 质心**在世界空间**给出（各系统局部坐标之间可能差一个 children.scale）
+  const stats = (ps) => {
+    let live = 0;
+    let sx = 0;
+    let sy = 0;
+    for (const p of ps.pool) {
+      if (!p.alive) continue;
+      live++;
+      const w = ps.localToWorld(p.x, p.y);
+      sx += w[0];
+      sy += w[1];
+    }
+    return { live, wx: live ? sx / live : 0, wy: live ? sy / live : 0 };
+  };
+  const aliveSet = (ps) => {
+    const s = new Set();
+    for (const p of ps.pool) if (p.alive) s.add(p);
+    return s;
+  };
+  // 存活计数不变量：_aliveCount 是「池满即返回」的依据（爆发 8500 颗时不做
+  // O(池容量) 的环形扫描），与逐槽扫描必须恒等 —— 多一处 alive 赋值没同步就静默错。
+  const checkAlive = (id, ps, tag) => {
+    if (ps._aliveCount !== ps.liveCount()) {
+      errors.push(
+        `${id} ${tag}: _aliveCount=${ps._aliveCount} ≠ liveCount=${ps.liveCount()}（存活计数漏同步）`,
+      );
+    }
+  };
+
+  // —— 单元：合成模型，确定性 ——
+  {
+    const L = { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] };
+    const parentModel = {
+      maxcount: 8,
+      emitter: [{ name: "sphererandom", rate: 4, distancemax: 0 }],
+      initializer: [
+        { name: "lifetimerandom", min: 1, max: 1 },
+        { name: "sizerandom", min: 10, max: 10 },
+        // 父粒子匀速漂移：事件点因此**远离**图层 origin，才能区分
+        // 「在父粒子死亡点爆发」与「在图层 origin 爆发」
+        { name: "velocityrandom", min: "600 -600 0", max: "600 -600 0" },
+      ],
+    };
+    const childModel = {
+      maxcount: 50,
+      emitter: [{ name: "sphererandom", instantaneous: 10, rate: 0 }],
+      initializer: [
+        { name: "lifetimerandom", min: 5, max: 5 },
+        { name: "sizerandom", min: 5, max: 5 },
+        { name: "velocityrandom", min: "-100 -100 0", max: "100 100 0" },
+      ],
+    };
+    // 独立系统：instantaneous 仍须首帧自播（全库 22 个独立系统靠它，别一起延迟了）
+    const solo = new ParticleSystem(null, childModel, null, L);
+    solo.advance(DT);
+    if (solo.liveCount() !== 10) {
+      errors.push(`非事件系统的 instantaneous=10 首帧应 10 颗，实际 ${solo.liveCount()}（自播被误延迟）`);
+    }
+    const parent = new ParticleSystem(null, parentModel, null, L);
+    const kid = new ParticleSystem(null, childModel, null, L);
+    kid.attachEventParent(parent, "eventdeath", [0, 0, 0]);
+    let prev = new Set();
+    let deathWorld = null;
+    let early = 0;
+    let burst = null;
+    for (let f = 0; f < 240; f++) {
+      parent.advance(DT);
+      const cur = aliveSet(parent);
+      if (!deathWorld) {
+        for (const p of prev) {
+          if (!cur.has(p)) {
+            const w = parent.localToWorld(p.x, p.y);
+            deathWorld = w;
+            break;
+          }
+        }
+      }
+      prev = cur;
+      kid.advance(DT);
+      if (!deathWorld && kid.liveCount() > 0) early = kid.liveCount();
+      if (deathWorld && !burst) burst = stats(kid);
+    }
+    checkAlive("单元", parent, "父系统");
+    checkAlive("单元", kid, "事件子级");
+    if (early > 0) errors.push(`事件子级在父粒子死亡前就有 ${early} 颗（装配即自播回归）`);
+    if (!deathWorld) {
+      errors.push("单元：父系统 4s 内没有粒子死亡，判据无法成立");
+    } else if (!burst || burst.live !== 10) {
+      errors.push(`父粒子死亡当帧应在死亡点爆发 10 颗，实际 ${burst ? burst.live : 0} 颗`);
+    } else {
+      const d = Math.hypot(burst.wx - deathWorld[0], burst.wy - deathWorld[1]);
+      if (d > 25) {
+        errors.push(
+          `事件爆发质心 (${burst.wx.toFixed(0)},${burst.wy.toFixed(0)}) 离父粒子死亡点 ` +
+            `(${deathWorld[0].toFixed(0)},${deathWorld[1].toFixed(0)}) 达 ${d.toFixed(0)}px（应贴事件点）`,
+        );
+      }
+      if (Math.hypot(deathWorld[0], deathWorld[1]) < 300) {
+        errors.push("单元：父粒子死亡点离 origin 太近，判据无区分度（检查 velocityrandom）");
+      }
+    }
+  }
+
+  // —— 真实语料 2131872317（Night Market）：三个烟花层的 eventdeath 子级 ——
+  {
+    const pkgPath = join(LIB, "2131872317", "scene.pkg");
+    if (!fs.existsSync(pkgPath)) {
+      console.log("  （跳过 2131872317 语料：本机无此壁纸）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(pkgPath));
+      const scene = JSON.parse(readText(getEntry(pkg, "scene.json")));
+      // 期望爆发量 = min(instantaneous, 池容量)。池容量吃 count 倍率与质量档。
+      const expect = {
+        "fireworks1hit.json": 8500,
+        "fireworks1flare.json": 1,
+        "fireworkshitdistort.json": 1,
+      };
+      const expect2 = {
+        "fireworks2hit.json": 150,
+        "fireworks2stars.json": 50,
+        "fireworks2flare.json": 1,
+      };
+      for (const [idx, table] of [[5, expect], [6, expect], [7, expect2]]) {
+        const obj = scene.objects[idx];
+        const { parent, kids } = rig(pkg, obj);
+        const tagged = kids.filter((k) => k.type === "eventdeath");
+        checked += tagged.length;
+        if (!tagged.length) {
+          errors.push(`2131872317 #${idx} ${obj.name}: 没有 eventdeath 子级，语料变了`);
+          continue;
+        }
+        const burst = tagged.map((k) => ({ k, name: k.path.split("/").pop(), seen: null }));
+        let prev = new Set();
+        let deathWorld = null;
+        let deathFrame = -1;
+        let early = 0;
+        for (let f = 0; f < 60 * 12; f++) {
+          parent.ps.advance(DT, { level: 1 });
+          const cur = aliveSet(parent.ps);
+          if (!deathWorld) {
+            for (const p of prev) {
+              if (!cur.has(p)) {
+                deathWorld = parent.ps.localToWorld(p.x, p.y);
+                deathFrame = f;
+                break;
+              }
+            }
+          }
+          prev = cur;
+          for (const b of burst) {
+            b.k.ps.advance(DT, { level: 1 });
+            if (!deathWorld && b.k.ps.liveCount() > 0) early += b.k.ps.liveCount();
+            if (deathFrame >= 0 && f >= deathFrame && !b.seen) b.seen = stats(b.k.ps);
+          }
+        }
+        if (early > 0) {
+          errors.push(`2131872317 #${idx} ${obj.name}: 父粒子死亡前子级已有 ${early} 颗（首帧白爆回归）`);
+        }
+        if (!deathWorld) {
+          errors.push(`2131872317 #${idx} ${obj.name}: 12s 内父粒子未死亡（火箭不升空？判据失效）`);
+          continue;
+        }
+        for (const b of burst) {
+          const want = table[b.name];
+          if (want === undefined) continue;
+          const cap = Math.min(want, b.k.ps.maxCount);
+          if (!b.seen || b.seen.live !== cap) {
+            errors.push(
+              `2131872317 #${idx} ${obj.name} → ${b.name}: 死亡当帧应爆发 ${cap} 颗（instantaneous ${want}），实际 ${b.seen ? b.seen.live : 0}`,
+            );
+            continue;
+          }
+          const d = Math.hypot(b.seen.wx - deathWorld[0], b.seen.wy - deathWorld[1]);
+          if (d > 400) {
+            errors.push(
+              `2131872317 #${idx} ${obj.name} → ${b.name}: 爆发质心离死亡点 ${d.toFixed(0)}px（应 <400，粒子初速只跑 1 帧）`,
+            );
+          }
+          const fromOrigin = Math.hypot(b.seen.wx - parent.ps.originX, b.seen.wy - parent.ps.originY);
+          if (fromOrigin < 300) {
+            errors.push(
+              `2131872317 #${idx} ${obj.name} → ${b.name}: 爆发质心离图层 origin 仅 ${fromOrigin.toFixed(0)}px —— 像旧行为（在图层 origin 爆发）`,
+            );
+          }
+        }
+        checkAlive(`2131872317 #${idx}`, parent.ps, "父系统");
+        for (const b of burst) checkAlive(`2131872317 #${idx}`, b.k.ps, b.name);
+      }
+    }
+  }
+
+  // —— 真实语料 2370927443：eventspawn 的 rate 型子级要跟着父粒子走 ——
+  {
+    const pkgPath = join(LIB, "2370927443", "scene.pkg");
+    if (!fs.existsSync(pkgPath)) {
+      console.log("  （跳过 2370927443 语料：本机无此壁纸）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(pkgPath));
+      const scene = JSON.parse(readText(getEntry(pkg, "scene.json")));
+      const obj = scene.objects[40]; // Splash：rate=100 溅起水花 + eventspawn 的 rate 型水滴子级
+      const { parent, kids } = rig(pkg, obj);
+      const kid = kids.find((k) => k.type === "eventspawn" && k.ps.emitters.some((e) => e.rate > 0));
+      checked += kids.length;
+      if (!kid) {
+        errors.push("2370927443 #40 Splash: 没有 rate 型的 eventspawn 子级，语料变了");
+      } else {
+        let farFromOrigin = 0;
+        let nearParent = 0;
+        let liveKid = 0;
+        for (let f = 0; f < 60 * 6; f++) {
+          parent.ps.advance(DT, { level: 0.9 });
+          kid.ps.advance(DT, { level: 0.9 });
+          if (f < 60 * 2 || f % 3) continue;
+          const parents = [];
+          for (const q of parent.ps.pool) {
+            if (q.alive) parents.push(parent.ps.localToWorld(q.x, q.y));
+          }
+          for (const p of kid.ps.pool) {
+            if (!p.alive) continue;
+            liveKid++;
+            const w = kid.ps.localToWorld(p.x, p.y);
+            if (Math.hypot(w[0] - parent.ps.originX, w[1] - parent.ps.originY) > 150) farFromOrigin++;
+            let best = Infinity;
+            for (const q of parents) best = Math.min(best, Math.hypot(w[0] - q[0], w[1] - q[1]));
+            if (best < 100) nearParent++;
+          }
+        }
+        checkAlive("2370927443", parent.ps, "父系统");
+        checkAlive("2370927443", kid.ps, "eventspawn 子级");
+        if (liveKid < 200) {
+          errors.push(`2370927443 Splash: 采样到的子级粒子只有 ${liveKid} 颗，判据样本不足`);
+        } else {
+          // 旧行为：子级恒在图层 origin 发射 → 远离 origin 的比例≈0、贴近父粒子的比例≈0
+          if (farFromOrigin / liveKid < 0.5) {
+            errors.push(
+              `2370927443 Splash eventspawn 子级仅 ${((farFromOrigin / liveKid) * 100).toFixed(0)}% 的粒子离图层 origin >150px —— 没跟着父粒子走`,
+            );
+          }
+          if (nearParent / liveKid < 0.6) {
+            errors.push(
+              `2370927443 Splash eventspawn 子级仅 ${((nearParent / liveKid) * 100).toFixed(0)}% 的粒子贴近存活父粒子（应 ≥60）`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // —— 全库扫描：所有 eventdeath 子级都不得在父粒子死亡前发射 ——
+  {
+    for (const dir of fs.readdirSync(LIB).sort()) {
+      const pkgPath = join(LIB, dir, "scene.pkg");
+      if (!fs.existsSync(pkgPath)) continue;
+      let pkg;
+      try {
+        pkg = parsePkg(fs.readFileSync(pkgPath));
+      } catch {
+        continue;
+      }
+      const sceneEntry = getEntry(pkg, "scene.json");
+      if (!sceneEntry) continue;
+      let scene;
+      try {
+        scene = JSON.parse(readText(sceneEntry));
+      } catch {
+        continue;
+      }
+      for (const obj of scene.objects || []) {
+        if (typeof obj.particle !== "string" || !getEntry(pkg, obj.particle)) continue;
+        let built;
+        try {
+          built = rig(pkg, obj);
+        } catch {
+          continue;
+        }
+        const tagged = built.kids.filter((k) => k.type === "eventdeath");
+        if (!tagged.length) continue;
+        checked += tagged.length;
+        let prev = new Set();
+        let firstDeathFrame = -1;
+        let bad = null;
+        for (let f = 0; f < 60 * 5 && !bad; f++) {
+          built.parent.ps.advance(DT, { level: 0.9 });
+          const cur = aliveSet(built.parent.ps);
+          if (firstDeathFrame < 0) {
+            for (const p of prev) {
+              if (!cur.has(p)) {
+                firstDeathFrame = f;
+                break;
+              }
+            }
+          }
+          prev = cur;
+          for (const k of tagged) k.ps.advance(DT, { level: 0.9 });
+          if (firstDeathFrame >= 0) continue; // 已有父粒子死亡：之后允许爆发
+          for (const k of tagged) {
+            if (k.ps.liveCount() > 0) {
+              bad = k;
+              break;
+            }
+          }
+        }
+        if (bad) {
+          errors.push(
+            `${dir} ${obj.name || obj.particle} → ${bad.path.split("/").pop()}: 父粒子尚未死亡就发射（装配即自播）`,
+          );
+        }
+        checkAlive(dir, built.parent.ps, `${obj.name || obj.particle} 父系统`);
+        for (const k of tagged) checkAlive(dir, k.ps, k.path.split("/").pop());
+      }
+    }
+  }
+
+  return { errors, checked };
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -1886,6 +2265,12 @@ if (action === "all" || action === "sim") {
   console.log(`\n【模拟】跑完 ${r.checked} 个粒子系统 → 问题 ${r.errors.length}`);
   r.errors.forEach((e) => console.log("  ! " + e));
   failed += r.errors.length;
+}
+if (action === "all" || action === "sim" || action === "events") {
+  const ec = runEventChildren();
+  console.log(`\n【事件子级 eventspawn/eventdeath】装配 ${ec.checked} 个子级 → 问题 ${ec.errors.length}`);
+  ec.errors.forEach((e) => console.log("  ! " + e));
+  failed += ec.errors.length;
 }
 if (action === "all" || action === "raster") {
   const r = runRaster(action === "raster");

@@ -62,6 +62,15 @@ export function getParticleDensityTier() {
   return particleDensityTier
 }
 
+// 「维持池满」型发射器（rate 与 instantaneous 都缺省）的补充上限。这类发射器
+// 的总量由 maxcount 决定，而 maxcount 常是作者的预算上限而非期望值（见 _step）。
+const PARTICLE_FILL_CAP = 2048
+// 同时挂在一个系统上的事件绑定发射器上限（eventspawn 的 rate/fill 型）。
+// 官方每个父粒子一个子系统实例，这里共用一个池，故设个上限防病态数据爆炸。
+const EVENT_BOUND_CAP = 256
+// 未消费的爆发点上限（事件子级不可见时不推进，队列会一直攒）
+const EVENT_BURST_QUEUE_CAP = 64
+
 // [we-scene patch] 绘制目标/场景捕获注入（MSAA 支持）。粒子 render() 历史上
 // 不绑帧缓冲，靠「上一个合成调用残留的绑定」画到画布 —— MSAA 开启后最终目标
 // 变成多重采样 FBO，必须显式绑定；REFRACT 的 copyTexImage2D 也不能读多重采样
@@ -260,6 +269,19 @@ export class ParticleSystem {
     this._followParent = null
     this._followMode = null // 'particle' | 'origin'
     this._followOffset = [0, 0, 0]
+    // 事件子发射器（children.type = eventspawn / eventdeath）：本系统的**发射**
+    // 完全由父粒子的事件驱动，不再「装配即自播」（见 attachEventParent）。
+    this._eventParent = null
+    this._eventType = null // 'eventspawn' | 'eventdeath'
+    this._eventOffset = null // children.origin：本系统在父局部空间的站位
+    this._eventChildren = [] // 反向引用：本系统自己的事件子级
+    this._burstQueue = [] // 待爆发点（本系统局部空间），父事件当帧入队、次帧消费
+    this._bound = [] // eventspawn 的 rate / 「维持池满」发射器：随父粒子存续
+    // 存活计数（O(1) 判池满）：spawn 在池满时环形扫描一次是 O(池容量)，
+    // 8500 颗的烟花爆发在池满后每次要扫 12000 槽 × 8500 次 = 100M 次运算，
+    // 会在爆发帧卡住主线程。死亡点只此一处（updateParticle）、出生点只此一处。
+    this._aliveCount = 0
+    this._poolGen = 0 // 池重建代数：绑定项靠它识别「父粒子已随重置作废」
     // rope 渲染器：把存活粒子按发射序连成一条绳（1425503532 的 Pac-Man 光束）
     this.ropeRenderer = null
     this._seq = 0
@@ -384,6 +406,10 @@ export class ParticleSystem {
     }
     this.pool = []
     for (let i = 0; i < this.maxCount; i++) this.pool.push(new Particle())
+    // 池已换成全新的（全死）粒子：存活计数归零，代数 +1 让仍在别处的
+    // 绑定项（eventspawn 挂到本系统粒子上的发射器）识别出父粒子已作废。
+    this._aliveCount = 0
+    this._poolGen = (this._poolGen || 0) + 1
   }
 
   // 把 model 的 JSON 描述编译成扁平参数，避免每帧字符串比较
@@ -805,14 +831,8 @@ export class ParticleSystem {
 
   // 宿主每帧提供鼠标位置（世界像素）；转到局部空间供控制点使用
   setPointer(worldX, worldY) {
-    const dx = worldX - this.originX
-    const dy = worldY - this.originY
-    const c = Math.cos(-this.angleZ)
-    const s = Math.sin(-this.angleZ)
-    this.pointer = {
-      x: (dx * c - dy * s) / (this.scaleX || 1),
-      y: (dx * s + dy * c) / (this.scaleY || 1),
-    }
+    const l = this.worldToLocal(worldX, worldY)
+    this.pointer = { x: l[0], y: l[1] }
   }
 
   // 子级挂到父系统：eventfollow 跟父粒子走，static 跟父系统 origin 走。
@@ -832,6 +852,38 @@ export class ParticleSystem {
     return null
   }
 
+  /**
+   * [we-scene patch] 挂成某个粒子系统的**事件子发射器**。
+   *
+   * WE 语义（ObjectParser 的 `children.type`，见 OWE ParticleRuntime / Mirage
+   * SceneCompiler 的 SpawnType）：子级不是「装配即自播的独立系统」，而是由父粒子的
+   * 事件临时创建的实例 —— `eventspawn` 在父粒子**生成**时、`eventdeath` 在父粒子
+   * **死亡**时各建一个，位置取父粒子当时的世界坐标（SpawnChild → FollowWorldPosition）。
+   * 本仓此前按独立系统处理（README 旧文），于是子级只在装配首帧于**图层 origin**
+   * 爆发一次、此后再不出现：2131872317 三层烟花共 7 个 eventdeath 子级，8500 颗的
+   * 爆开、闪光 flare 与冲击波 distort 全都不见了（升空的火箭死了却什么都不炸）。
+   *
+   * offset = `children.origin`（父系统局部坐标）：本系统与父同图层变换、外加这个站位。
+   */
+  attachEventParent(parent, type, offset) {
+    if (!parent || (type !== 'eventdeath' && type !== 'eventspawn')) return
+    const o = offset || [0, 0, 0]
+    this._eventParent = parent
+    this._eventType = type
+    this._eventOffset = [o[0] || 0, o[1] || 0, o[2] || 0]
+    if (!parent._eventChildren.includes(this)) parent._eventChildren.push(this)
+    this._syncEventOrigin()
+  }
+
+  // 事件子级的坐标系跟着父图层走（父层被脚本/动画挪走时子级不能留在原地）
+  _syncEventOrigin() {
+    const parent = this._eventParent
+    if (!parent || !this._eventOffset) return
+    const w = parent.localToWorld(this._eventOffset[0], this._eventOffset[1])
+    this.originX = w[0]
+    this.originY = w[1]
+  }
+
   // 粒子局部坐标 → 世界像素（y 向下，与 originX/originY 同一空间；投影翻转在 render）
   localToWorld(lx, ly) {
     const px = lx * this.scaleX
@@ -839,6 +891,61 @@ export class ParticleSystem {
     const c = Math.cos(this.angleZ)
     const s = Math.sin(this.angleZ)
     return [this.originX + px * c - py * s, this.originY + px * s + py * c]
+  }
+
+  // localToWorld 的逆（与 setPointer 同一段数学）：世界像素 → 本系统局部坐标
+  worldToLocal(wx, wy) {
+    const dx = wx - this.originX
+    const dy = wy - this.originY
+    const c = Math.cos(-this.angleZ)
+    const s = Math.sin(-this.angleZ)
+    return [(dx * c - dy * s) / (this.scaleX || 1), (dx * s + dy * c) / (this.scaleY || 1)]
+  }
+
+  /**
+   * 父粒子事件回调（kind: 'spawn' | 'death'）。
+   * 位置一律「父局部 → 世界 → 本系统局部」走两端变换，而不是直接抄父坐标：
+   * 子级可能带自己的 children.origin / scale / angles。
+   */
+  onParentEvent(kind, parent, particle, wx, wy, wz) {
+    // 事件到达时先对齐坐标系：父层可能刚被脚本/关键帧挪过（本系统上一帧的同步已过期）
+    this._syncEventOrigin()
+    const l = this.worldToLocal(wx, wy)
+    const q = this._burstQueue
+    if (q.length >= EVENT_BURST_QUEUE_CAP) q.shift()
+    q.push([l[0], l[1], wz])
+    if (kind !== 'spawn') return
+    // rate / 「维持池满」型发射器：官方每个父粒子一个实例，实例随父粒子存续 ——
+    // 发射位置每帧取父粒子当前位置（雨滴溅起的水花跟着雨滴走）。
+    for (const em of this.emitters) {
+      // 已用 instantaneous 爆发过的发射器不再挂绑定：官方是「实例 + 各自发射器」，
+      // 两者可以并存，但全库 43 个事件子级里没有这种写法（有 rate 的都是纯 rate 型）
+      if (em.instantaneous > 0) continue
+      if (!(em.rate > 0) && !em.fill) continue
+      if (this._bound.length >= EVENT_BOUND_CAP) break
+      this._bound.push({
+        em,
+        parent,
+        particle,
+        seq: particle.seq,
+        poolGen: parent._poolGen,
+        pos: [l[0], l[1], wz],
+        accum: 0,
+        parts: [], // fill 型的配额追踪（只存本实例发出的粒子）
+        cap: em.fill ? Math.min(this.maxCount, PARTICLE_FILL_CAP) : 0,
+      })
+    }
+  }
+
+  // 通知本系统的事件子级（父粒子出生/死亡）。无子级时是一次数组长度判断。
+  _notifyChildren(kind, p) {
+    const kids = this._eventChildren
+    if (!kids.length) return
+    const w = this.localToWorld(p.x, p.y)
+    for (const c of kids) {
+      if (kind === 'death' ? c._eventType !== 'eventdeath' : c._eventType !== 'eventspawn') continue
+      c.onParentEvent(kind, this, p, w[0], w[1], p.z)
+    }
   }
 
   _syncFollow() {
@@ -864,7 +971,16 @@ export class ParticleSystem {
 
   // ---------- 生成 ----------
 
-  spawn(em) {
+  /**
+   * @param em 发射器
+   * @param at 可选的发射基点（本系统局部坐标）：事件子级在父粒子的事件点爆发时用，
+   *           叠加在 emitter.origin 之外（与 official 的实例位置 = 父粒子世界坐标一致）。
+   * @returns 生成的粒子，池满时 null
+   */
+  spawn(em, at) {
+    // 池满直接返回：环形扫描一次是 O(池容量)，爆发 8500 颗而池只有 12000 槽时，
+    // 后面的每一颗都要白扫一遍全池（见 _aliveCount 注释）。
+    if (this._aliveCount >= this.pool.length) return null
     // 线性扫描找空位在 maxcount 大时是热点；用游标做环形查找
     const pool = this.pool
     const n = pool.length
@@ -878,7 +994,7 @@ export class ParticleSystem {
         break
       }
     }
-    if (!p) return
+    if (!p) return null
 
     p.alive = true
     p.age = 0
@@ -968,6 +1084,14 @@ export class ParticleSystem {
         p.vy += ma.speedMin[1] + (ma.speedMax[1] - ma.speedMin[1]) * k
         p.vz += ma.speedMin[2] + (ma.speedMax[2] - ma.speedMin[2]) * k
       }
+    }
+
+    // 事件子级的爆发基点（父粒子的事件位置）叠加在发射器位置之上。
+    // 放在 mapAround 之后：那一支是**覆写** p.x/y/z，不是叠加。
+    if (at) {
+      p.x += at[0]
+      p.y += at[1]
+      p.z += at[2]
     }
 
     // ---- 初始化器 ----
@@ -1065,6 +1189,11 @@ export class ParticleSystem {
       }
       p.trailClock = 0
     }
+
+    this._aliveCount++
+    // eventspawn 子级：父粒子**生成**即触发（位置 = 父粒子出生点，见 onParentEvent）
+    if (this._eventChildren.length) this._notifyChildren('spawn', p)
+    return p
   }
 
   // ---------- 每粒子更新 ----------
@@ -1072,7 +1201,10 @@ export class ParticleSystem {
   updateParticle(p, dt) {
     p.age += dt
     if (p.age >= p.life) {
+      // eventdeath 子级：在父粒子**死亡点**爆发（位置要趁 p 还没被回收时取）
+      if (this._eventChildren.length) this._notifyChildren('death', p)
       p.alive = false
+      this._aliveCount--
       return
     }
     const lt = p.age / p.life // 生命进度 0..1
@@ -1322,7 +1454,12 @@ export class ParticleSystem {
     // 音频快照：level = 整体响度 0..1（render/audio.js 的模拟频谱；离线/无音频时为 0）
     const level = audio && Number.isFinite(audio.level) ? Math.max(0, Math.min(1, audio.level)) : 0
     this._audioLevel = level
-    for (const em of this.emitters) {
+    // 事件子级（eventspawn / eventdeath）的发射完全由父粒子事件驱动，走不了下面的
+    // 自动分支 —— 自动分支会让它在装配首帧于图层 origin 白爆一次
+    //（2131872317 的三个烟花的 8500 颗爆开此前就是「开局闪一下、之后再无」）。
+    if (this._eventParent) {
+      this._stepEventChild(dt)
+    } else for (const em of this.emitters) {
       // instantaneous：一次性爆发 N 个（烟花/冲击波）
       if (em.instantaneous > 0 && !em._burst) {
         em._burst = true
@@ -1335,10 +1472,8 @@ export class ParticleSystem {
       // 照搬会画出近两万颗尘埃（占该场景粒子总量的 82%），既拖慢渲染又让画面糊成一片。
       // 故按同预设的常见量级封顶，更接近真实观感。
       if (em.fill) {
-        const FILL_CAP = 2048
-        const cap = Math.min(this.maxCount, FILL_CAP)
-        let live = 0
-        for (let i = 0; i < this.pool.length; i++) if (this.pool[i].alive) live++
+        const cap = Math.min(this.maxCount, PARTICLE_FILL_CAP)
+        const live = this._aliveCount
         // 单帧补充量也设上限，避免首帧一次性生成造成明显卡顿
         let refill = Math.min(cap - live, 512)
         while (refill-- > 0) this.spawn(em)
@@ -1370,10 +1505,8 @@ export class ParticleSystem {
             for (let i = 0; i < n; i++) this.spawn(em)
           }
         } else {
-          const FILL_CAP = 2048
-          const target = Math.round(Math.min(this.maxCount, FILL_CAP) * k)
-          let live = 0
-          for (let i = 0; i < this.pool.length; i++) if (this.pool[i].alive) live++
+          const target = Math.round(Math.min(this.maxCount, PARTICLE_FILL_CAP) * k)
+          const live = this._aliveCount
           let refill = Math.min(target - live, 256)
           while (refill-- > 0) this.spawn(em)
         }
@@ -1402,6 +1535,80 @@ export class ParticleSystem {
     for (let i = 0; i < pool.length; i++) {
       if (pool[i].alive) this.updateParticle(pool[i], dt)
     }
+  }
+
+  /**
+   * 事件子级的发射：只做两件事 —— 消费父粒子事件排下的爆发点，推进挂在父粒子上
+   * 的 rate / 「维持池满」发射器。两者的位置都是**父粒子的当前位置**。
+   */
+  _stepEventChild(dt) {
+    // 本系统坐标系跟着父图层走（父层被脚本/动画挪走时子级不能留在原地）
+    this._syncEventOrigin()
+    const q = this._burstQueue
+    if (q.length) {
+      this._burstQueue = []
+      for (const at of q) this._burstAt(at)
+    }
+    if (!this._bound.length) return
+    const keep = []
+    for (const b of this._bound) {
+      const p = b.particle
+      // 父粒子已死、槽位被复用（seq 变了），或父系统重建过池（代数变了）→ 释放
+      if (!p.alive || p.seq !== b.seq || b.parent._poolGen !== b.poolGen) continue
+      const w = b.parent.localToWorld(p.x, p.y)
+      const l = this.worldToLocal(w[0], w[1])
+      b.pos[0] = l[0]
+      b.pos[1] = l[1]
+      b.pos[2] = p.z
+      this._emitBound(b, dt)
+      keep.push(b)
+    }
+    this._bound = keep
+  }
+
+  // 在指定基点（本系统局部坐标）爆发：该发射器的 instantaneous 颗全放出去
+  _burstAt(at) {
+    for (const em of this.emitters) {
+      if (!(em.instantaneous > 0)) continue
+      const n = Math.min(em.instantaneous, this.maxCount)
+      for (let i = 0; i < n; i++) if (!this.spawn(em, at)) break
+    }
+  }
+
+  _emitBound(b, dt) {
+    const em = b.em
+    if (b.cap > 0) {
+      // 「维持池满」型（无 rate / instantaneous）：官方每个父粒子一个实例、各自一份池，
+      // 故配额按**本实例**算，父粒子一死就释放（Shooting Star 的 Flare 就是这样
+      // 挂在流星头上的一团光晕）。
+      let live = 0
+      const keep = []
+      for (const e of b.parts) {
+        if (e.p.alive && e.p.seq === e.seq) {
+          live++
+          keep.push(e)
+        }
+      }
+      b.parts = keep
+      let want = Math.min(b.cap - live, 32)
+      while (want-- > 0) {
+        const p = this.spawn(em, b.pos)
+        if (!p) break
+        b.parts.push({ p, seq: p.seq })
+      }
+      return
+    }
+    const mul =
+      (this._ov.rateMul !== undefined ? this._ov.rateMul : 1) *
+      (this._ov.countMul !== undefined ? this._ov.countMul : 1)
+    const rate = em.rate * mul
+    if (!(rate > 0)) return
+    b.accum = (b.accum || 0) + rate * dt
+    let n = Math.floor(b.accum)
+    if (n <= 0) return
+    b.accum -= n
+    if (n > this.maxCount) n = this.maxCount
+    for (let i = 0; i < n; i++) if (!this.spawn(em, b.pos)) break
   }
 
   // ---------- 渲染 ----------
