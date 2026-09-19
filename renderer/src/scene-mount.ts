@@ -3531,6 +3531,10 @@ cfg, source, pkgAbort.signal);
       // 持续发散（3233141951：理想满帧下 30s 就差 164 帧≈5.5s，头发相对头顶
       // 最大错位 40px、发饰 79px，看起来就是「头发和头不同步、漏模」）。
       let lastAnimT = 0;
+      // [we-scene patch 3448845950] 单帧 dt 上限（秒）。见 animDt 处注释：
+      // 作者的 `mix(cur, target, speed * frametime)` 在 dt 过大时会越过目标来回荡。
+      // 0.05 = 20fps，与粒子时钟的 50ms 封顶同口径。
+      const MAX_SCRIPT_FRAME_DT = 0.05;
       const renderLoop = (now: number) => {
         if (disposed || rt.paused) return;
         // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用。
@@ -3644,7 +3648,21 @@ cfg, source, pkgAbort.signal);
           // dt 取**真实经过时间**（与骨骼动画的 t 同一时钟），不是目标帧间隔：
           // 见 lastAnimT 的声明处。首帧 dt=0（lastAnimT 初值 0，t 也≈0）；
           // 暂停期间 t 已扣掉 pauseAccum，恢复后不会补跑一大段。
-          const animDt = Math.max(0, t - lastAnimT);
+          //
+          // [we-scene patch 3448845950] 但**单帧 dt 要封顶**：作者的动画脚本普遍写成
+          // 「指数趋近」`value = WEMath.mix(value, target, speed * engine.frametime)`
+          //（3448845950 的面板 A/B 位移就是 speed=5 的一族）。这个式子要求
+          // `speed * frametime < 1`：一次卡顿（首帧预热、大贴图解码、切标签页回来）
+          // 把 frametime 顶到 0.37s（≈2.7fps）时系数变成 1.85 → 每帧**越过**目标
+          // 85% 再荡回来，整块 UI 甩飞后又拉回（实测根层位移 −868/−378 →
+          // 4995/1989 → 才收敛），观感就是「动画乱飞、点了也切不过去」。
+          // 粒子的 dt 早有 50ms 封顶（见 particleClock 注释），脚本这条同因同治。
+          // 参考实现同样对帧间隔做平滑：Mirage 的 FrameTimer 用队列**平均**
+          // frametime（FrameClock.cpp），不把单帧尖峰原样喂给脚本。
+          // 口径 20fps（0.05s）：全库 speed 滑条上限 10 时系数 0.5，仍在收敛区内；
+          // 正常帧（≥20fps）dt 原样透传，观感零差异。
+          const rawDt = Math.max(0, t - lastAnimT);
+          const animDt = Math.min(rawDt, MAX_SCRIPT_FRAME_DT);
           lastAnimT = t;
           // 粒子推进与关键帧/骨骼同一条时间线（见 setParticleRenderer 上方注释）。
           particleClock.dt = animDt;

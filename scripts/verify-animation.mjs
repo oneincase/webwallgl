@@ -690,16 +690,19 @@ const kf = (frame, value, front, back) => ({
     !/frametime = interval \/ 1000/.test(mountSrc),
     "engine.frametime 不得用目标帧间隔（须与同一行的 runtime 同时基）",
   );
+  // [we-scene patch 3448845950] animDt 仍取真实经过时间，但**要封顶**（见下方
+  // 「单帧 dt 封顶」一节）：`mix(cur, target, speed*frametime)` 在卡顿帧会过冲。
   check(
-    /const animDt = Math\.max\(0, t - lastAnimT\)/.test(mountSrc) &&
+    /const rawDt = Math\.max\(0, t - lastAnimT\)/.test(mountSrc) &&
+      /const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\)/.test(mountSrc) &&
       /\.advance\(animDt\)/.test(mountSrc),
-    "关键帧动画必须用真实经过时间 animDt 推进",
+    "关键帧动画必须用真实经过时间 animDt（封顶后）推进",
   );
   // animDt 是**帧间增量**，算完必须立刻推进 lastAnimT。漏掉这一句 dt 会变成
   // 「从头到现在的累计时间」，播放头按 t 的平方增长 —— 动画瞬间飞出值域，
   // 而上面几条正则断言全都照过（正则只看形状，不看语义）。
   check(
-    /const animDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*lastAnimT = t;/.test(mountSrc),
+    /const rawDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\);\s*\n\s*lastAnimT = t;/.test(mountSrc),
     "算出 animDt 后必须立即推进 lastAnimT（否则 dt 变成累计时间，播放头按 t² 增长）",
   );
   // 第四处是「按沙箱回填」：对象脚本队列按 hasUpdate 筛过，漏掉无 export 的引擎层
@@ -1464,6 +1467,54 @@ const kf = (frame, value, front, back) => ({
     );
     check(sbColor && near(sbColor.callUpdate(0), 2), "WEColor.hsv2rgb 必须返回可链式 multiply 的 Vec3");
   }
+}
+
+// ---------------------------------------------------------------------------
+// [we-scene patch 3448845950] 单帧 dt 必须封顶：作者的动画脚本普遍写成指数趋近
+// `value = WEMath.mix(value, target, speed * engine.frametime)`（3448845950 的面板
+// A/B 位移一族，speed=5）。系数 `speed * frametime` 一旦 >1，每帧都会**越过**目标
+// 再荡回来；一次卡顿把 frametime 顶到 0.37s（≈2.7fps）时系数 1.85，实测根层位移
+// −868/−378 → 4995/1989 → 才收敛（观感：动画甩飞、点击也切不过去）。
+// 判据分两层：① scene-mount 真的把 dt 钳在 0.05s（源码接线）；
+// ② 用**模拟器复现**该错误：同一段趋近在未钳 dt 下必须冲出目标、钳后必须单调收敛。
+{
+  const fsMod = await import("node:fs");
+  const src = fsMod.readFileSync(ROOT + "/renderer/src/scene-mount.ts", "utf8");
+  check(/MAX_SCRIPT_FRAME_DT\s*=\s*0\.05/.test(src),
+    "scene-mount 缺少 MAX_SCRIPT_FRAME_DT = 0.05（单帧 dt 未封顶，卡顿后动画会越过目标来回荡）");
+  check(/const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\)/.test(src),
+    "animDt 未按 MAX_SCRIPT_FRAME_DT 封顶（author 的 mix(cur, target, speed*frametime) 会过冲）");
+  check(/const rawDt = Math\.max\(0, t - lastAnimT\)[\s\S]{0,80}lastAnimT = t/.test(src),
+    "场景时钟仍必须按真实时间推进（lastAnimT = t），封顶只作用于喂给脚本/animation 的 dt");
+  // ② 模拟器：index 型趋近 v += (target - v) * k
+  const approach = (dt, steps, speed = 5, from = 2495, target = 2174) => {
+    let v = from;
+    const series = [];
+    for (let i = 0; i < steps; i++) {
+      v += (target - v) * Math.min(speed * dt, 4); // 与 WEMath.mix 同式（系数不钳，模拟现状）
+      series.push(v);
+    }
+    return series;
+  };
+  const clampDt = 0.05;
+  const OVER_TARGET = 2174;                       // 展开位（与 approach 的 target 同值）
+  const unclamped = approach(0.37, 40);           // 卡顿帧：未封顶
+  const clamped = approach(clampDt, 40);          // 封顶后
+  const overshoot = Math.max(...unclamped.map((v) => OVER_TARGET - v));   // 冲过目标多少（>0 = 冲过头）
+  const clampedOver = Math.max(...clamped.map((v) => OVER_TARGET - v));
+  check(overshoot > 100, `模拟器未复现过冲（overshoot=${overshoot.toFixed(1)}px）—— 判据失去意义`);
+  check(clampedOver < 5,
+    `钳到 ${clampDt}s 后仍过冲 ${clampedOver.toFixed(1)}px（speed=5 时系数 ${(5 * clampDt).toFixed(2)} 应 <1）`);
+  // 单调逼近：钳后每一步到目标的距离都不得增大（越过目标再回升 = 过冲）
+  let monotone = true;
+  let prevDist = Math.abs(clamped[0] - OVER_TARGET);
+  for (let i = 1; i < clamped.length; i++) {
+    const d = Math.abs(clamped[i] - OVER_TARGET);
+    if (d > prevDist + 1e-9) monotone = false;
+    prevDist = d;
+  }
+  check(monotone, "钳后趋近应逐步逼近目标（不得越过目标后回升）");
+  console.log(`   单帧 dt 封顶：卡顿 ${0.37}s 未钳时过冲 ${overshoot.toFixed(0)}px → 钳 0.05s 后 ${clampedOver.toFixed(1)}px`);
 }
 
 if (errors.length) {
