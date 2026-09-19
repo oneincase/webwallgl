@@ -112,6 +112,25 @@ function bindTRS(mdl, i, out9) {
   return out9
 }
 
+/**
+ * [we-scene patch] **MDLS 尾部的静态装配姿势**（`mdl.staticPoseTRS`，见 mdl-parse 的
+ * parseStaticPose）。只有无 MDLA 的模型有；本函数是它在蒙皮侧的入口。
+ *
+ * 为什么必须有它：这类模型的顶点烘焙在图集布局上（「顶点位置 == uv×图集尺寸」残差
+ * 恒 0），作者把零件分散画在贴图里、靠骨骼拼装。装配姿势不写在动画轨道里（它们没有
+ * 轨道），只写在 MDLS 尾部这张表里。不解析 → 蒙皮恒等 → 画出来是**散开的图集**：
+ * 3186328539 单车两轮脱离车架轴位、3226487183 抬头身体下半身整片落到画布外。
+ *
+ * 是否可用由调用方判定（**必须**同时满足「无动画轨道」与「有该表」）：
+ * 有 MDLA 的 77 个模型靠动画轨道给姿势，套这张表会把它们改坏。
+ */
+function staticPoseTRS(mdl, i, out9) {
+  const s = mdl.staticPoseTRS && mdl.staticPoseTRS[i]
+  if (!s) return bindTRS(mdl, i, out9)
+  out9.set(s)
+  return out9
+}
+
 
 // 计算 time 处的蒙皮矩阵数组（World(anim) · invBindWorld），写入 mdl._skinCache
 //
@@ -173,6 +192,17 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   // （ASUNA PUPPET→HAIR BACK BIG→main hair back c2→c2 部件）中间两层正是无动画
   // puppet，整束后发被拉到头顶右上方形成第二个头/身体。仍要跑完下面的骨骼循环，
   // 把 _local/_world 填成绑定姿势，供 attachmentWorld / followAttachments 使用。
+  // [we-scene patch] **无动画模型用 MDLS 尾部的静态装配姿势**（见 staticPoseTRS 头注）。
+  // 判据必须三条同时成立：① 这个模型一条动画轨道都没有（mdl.animations 空）；
+  // ② 场景也没给它 animationlayers；③ 解析到了那张表。有动画的 77 个模型照旧走
+  // 动画（frame0 == MDLS 链），一行都不受影响。
+  // 3186328539 单车：套上它两个轮心才落到车架轴位（Δy 359→4、轮距 991→1289）；
+  // 3226487183 抬头身体背景：骨0 平移 −1023.6 → −460.0（下半身从画布外收回）。
+  // 判据只看**这个模型自己有没有动画轨道**：没有轨道时场景里的 animationlayers 一定
+  // 解析不到任何 clip（layers 为空），静态姿势就是唯一的姿势来源。
+  const useStaticPose = !(mdl.animations && mdl.animations.length) &&
+    !!(mdl.staticPoseTRS && mdl.staticPoseTRS.length === count)
+
   let identityEarlyOut = false
   if (layers.length === 0 && !hadExplicitLayers) {
     const a = mdl.animations[0]
@@ -181,7 +211,9 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     // 早退会让 draw() 走 identitySkin，覆写永远不生效。
     // 此时 layers 保持为空，下面每根骨 touched=false → 取绑定姿势，再叠覆写。
     if (!a) {
-      identityEarlyOut = !hasOverride
+      // 有静态装配姿势时**不能**早退：蒙皮矩阵 = 静态姿势世界链 · invBindWorld ≠ 单位，
+      // 早退会让 draw 用 identitySkin 把散件原样画出来（就是本函数要修的病）。
+      identityEarlyOut = !hasOverride && !useStaticPose
     } else {
       layers.push({ anim: a, additive: false, blend: 1, rate: 1 })
     }
@@ -192,7 +224,8 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   const smp = mdl._trsSmp || (mdl._trsSmp = new Float32Array(9))
 
   for (let i = 0; i < count; i++) {
-    bindTRS(mdl, i, base)
+    if (useStaticPose) staticPoseTRS(mdl, i, base)
+    else bindTRS(mdl, i, base)
     acc.set(base)
     let touched = false
     let addW = 0

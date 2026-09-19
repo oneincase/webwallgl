@@ -503,6 +503,168 @@ function neckOf(parent, attName) {
   }
 }
 
+// ---------- 无 MDLA 模型的「静态装配姿势」（3186328539 单车两轮脱离车架） ----------
+//
+// 现象：3186328539 的两个自行车车轮不在车架的轴位上（整辆车是拆散的）；3226487183
+// 的抬头身体下半身落到画布外。
+// 根因：这三个模型**没有任何 MDLA 动画轨道**（全库 80 个 puppet 里只有 3 个），而顶点
+// 烘焙在**图集布局**上（`positions == uv×贴图尺寸` 残差恒 0）——作者把零件分散画在贴图
+// 里、靠骨骼拼装，装配姿势**只写在 MDLS 尾部那张表里**（不解析就蒙皮恒等 = 画出散件）。
+//
+// 判据分三层（缺一层就是假绿）：
+//   ① 语料结构：3 个无 MDLA 模型都要解析出 staticPoseTRS；解析位置与各段字节数自洽；
+//   ② **几何（承重判据）**：真实现 computeSkinMatrices 出来的两个轮心必须同高
+//      （Δy < 30px）且轮距落在 1200~1400px；把 staticPoseTRS 置空复现修复前，
+//      Δy 必须 >> 300px。改坏任何一环即红。
+//   ③ 反向：**带动画的模型一行都不能受影响** —— 同族模型（有 MDLA）在 t=0 的蒙皮
+//      必须仍是恒等（零件停在图集位），否则 77 个动画模型会被这张表改坏。
+{
+  const { composeTRS, mat4Mul } = await imp("renderer/vendor/we-scene/render/mdl-math.js");
+  const { parseTex } = await imp("renderer/vendor/we-scene/pkg/texture.js");
+  const srcParse = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl-parse.js"), "utf8");
+  const srcSkin = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js"), "utf8");
+  check(/function parseStaticPose/.test(srcParse), "mdl-parse 必须有 parseStaticPose（MDLS 尾部静态姿势表）");
+  check(/staticPoseTRS/.test(srcParse), "parseMDL 必须把静态姿势以 TRS 暴露给蒙皮");
+  check(/function staticPoseTRS/.test(srcSkin) && /useStaticPose/.test(srcSkin),
+    "mdl-skin 必须把静态姿势接进 computeSkinMatrices");
+  // 反向接线：只有在模型**自己没有动画轨道**时才准用它
+  check(/const useStaticPose = !\(mdl\.animations && mdl\.animations\.length\)/.test(srcSkin),
+    "静态姿势只能在 mdl.animations 为空时生效（否则 77 个动画模型会被改坏）");
+  check(/identityEarlyOut = !hasOverride && !useStaticPose/.test(srcSkin),
+    "套了静态姿势就不能走 identitySkin 早退（否则装配白算）");
+
+  const wp = loadWallpaper(3186328539);
+  if (!wp) {
+    console.log("   skip 3186328539：库中没有该壁纸");
+  } else {
+    attachPuppets(wp.scene, wp.parsed);
+    const bike = wp.scene.layers.find((l) => l.puppet && (l.image || "").indexOf("77773") >= 0);
+    check(!!bike, "3186328539 应加载到 77773 单车 puppet");
+    if (bike) {
+      const mdl = bike.puppet;
+      check(!!mdl.staticPoseTRS && mdl.staticPoseTRS.length === mdl.bones.length,
+        `单车应解析出 ${mdl.bones.length} 根骨的静态姿势`);
+      check(mdl.animations.length === 0, "单车模型不应有 MDLA 动画轨道（语料前提）");
+      // 贴图尺寸（图集空间 = uv×尺寸）
+      let W = 0, H = 0;
+      try {
+        const mj = JSON.parse(dec.decode(getEntry(wp.parsed, "models/77773.json")));
+        const mat = JSON.parse(dec.decode(getEntry(wp.parsed, mj.material)));
+        const t = parseTex(getEntry(wp.parsed, "materials/" + mat.passes[0].textures[0] + ".tex"));
+        W = t.width; H = t.height;
+      } catch { /* 落到下面覆盖度断言 */ }
+      check(W > 0 && H > 0, "单车贴图尺寸应可读（图集空间换算要用它）");
+      // 顶点是否烘焙在图集布局上（本模型的性质，先验一次）
+      let lockMax = 0;
+      for (let v = 0; v < mdl.vertexCount; v++) {
+        lockMax = Math.max(lockMax, Math.hypot(
+          mdl.positions[v * 3] - (mdl.uvs[v * 2] * W - W / 2),
+          mdl.positions[v * 3 + 1] - (H / 2 - mdl.uvs[v * 2 + 1] * H)));
+      }
+      check(lockMax < 1, `单车顶点应烘焙在图集布局上（残差 ${lockMax.toFixed(1)}px，>1px 说明空间假设变了）`);
+      // 骨 → 轮：按 uv 的主连通簇取「轮」顶点（1 号骨含少量非轮碎点）
+      const CELL = 40;
+      const groups = new Map();
+      for (let v = 0; v < mdl.vertexCount; v++) {
+        const b = mdl.boneIdx[v * 4];
+        if (!groups.has(b)) groups.set(b, []);
+        groups.get(b).push(v);
+      }
+      const wheelVerts = (b) => {
+        const cells = new Map();
+        for (const v of groups.get(b) || []) {
+          const k = Math.floor((mdl.uvs[v * 2] * W) / CELL) + "," + Math.floor((mdl.uvs[v * 2 + 1] * H) / CELL);
+          if (!cells.has(k)) cells.set(k, []);
+          cells.get(k).push(v);
+        }
+        const seen = new Set();
+        let best = [];
+        for (const k of cells.keys()) {
+          if (seen.has(k)) continue;
+          const st = [k]; seen.add(k); const acc = [];
+          while (st.length) {
+            const cur = st.pop(); acc.push(...cells.get(cur));
+            const [cx, cy] = cur.split(",").map(Number);
+            for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+              const nk = (cx + dx) + "," + (cy + dy);
+              if (cells.has(nk) && !seen.has(nk)) { seen.add(nk); st.push(nk); }
+            }
+          }
+          if (acc.length > best.length) best = acc;
+        }
+        return best;
+      };
+      // 蒙皮后的「图集像素」包围盒中心（轮是环，取包围盒中心稳健）
+      const wheelCenter = (skin, b) => {
+        const verts = wheelVerts(b);
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const v of verts) {
+          const x = mdl.positions[v * 3], y = mdl.positions[v * 3 + 1];
+          let X = x, Y = y;
+          if (skin) {
+            const M = skin[b * 16] !== undefined ? skin.subarray(b * 16, b * 16 + 16) : skin[b];
+            X = M[0] * x + M[4] * y + M[12];
+            Y = M[1] * x + M[5] * y + M[13];
+          }
+          const px = X + W / 2, py = H / 2 - Y;
+          x0 = Math.min(x0, px); x1 = Math.max(x1, px);
+          y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+        }
+        return { c: [(x0 + x1) / 2, (y0 + y1) / 2], n: verts.length, size: [x1 - x0, y1 - y0] };
+      };
+      const skinWith = computeSkinMatrices(mdl, 0, [], null);
+      const a2 = wheelCenter(skinWith, 1), b2 = wheelCenter(skinWith, 3);
+      check(a2.n > 800 && b2.n > 800, `两个轮的顶点数应足够（${a2.n} / ${b2.n}）`);
+      const dy = Math.abs(a2.c[1] - b2.c[1]);
+      const base = Math.hypot(a2.c[0] - b2.c[0], a2.c[1] - b2.c[1]);
+      check(dy < 30, `套静态姿势后两轮必须同高：Δy ${dy.toFixed(1)}px（>30 说明没拼到车架轴位）`);
+      check(base > 1200 && base < 1400, `轮距应落在 1200~1400px（实得 ${base.toFixed(0)}px）`);
+      // 轮径保持（纯平移 → 环的直径不变，850×1000px 量级）
+      check(a2.size[0] > 600 && a2.size[0] < 950 && b2.size[0] > 600 && b2.size[0] < 950,
+        `套姿势后轮径应保持（${a2.size[0].toFixed(0)} / ${b2.size[0].toFixed(0)}px）`);
+      console.log(`   3186328539 单车静态姿势：轮A(${a2.c[0].toFixed(0)},${a2.c[1].toFixed(0)}) 轮B(${b2.c[0].toFixed(0)},${b2.c[1].toFixed(0)}) Δy ${dy.toFixed(1)} 轮距 ${base.toFixed(0)}`);
+      // 承重对照：把静态姿势表摘掉（复现修复前）必须散开
+      const saved = mdl.staticPoseTRS;
+      mdl.staticPoseTRS = null;
+      mdl._skin = null;
+      const skinOff = computeSkinMatrices(mdl, 0, [], null);
+      mdl.staticPoseTRS = saved;
+      mdl._skin = null;
+      const a1 = wheelCenter(skinOff, 1), b1 = wheelCenter(skinOff, 3);
+      const dyOff = Math.abs(a1.c[1] - b1.c[1]);
+      check(dyOff > 300, `摘掉静态姿势必须复现「两轮错位」：Δy ${dyOff.toFixed(1)}px（>300 才算判据承重）`);
+      console.log(`   对照（无静态姿势）：Δy ${dyOff.toFixed(1)}px`);
+    }
+    // 反向：同族**有动画**的模型在 t=0 必须是恒等（零件留在图集位）
+    const animated = wp.scene.layers.find((l) => l.puppet && (l.puppet.animations || []).length > 0) ||
+      (() => {
+        const w2 = loadWallpaper(3226487183);
+        if (!w2) return null;
+        attachPuppets(w2.scene, w2.parsed);
+        return w2.scene.layers.find((l) => l.puppet && (l.puppet.animations || []).length > 0) || null;
+      })();
+    if (animated) {
+      const m2 = animated.puppet;
+      // 差分判据：有没有静态姿势表，蒙皮结果必须**逐位相同**（有动画的模型不读它）。
+      // 不能断言「t=0 恒等」：frame0 ≠ 绑定姿势的那 20 个模型本就不回原网格。
+      const skA = Float32Array.from(computeSkinMatrices(m2, 0, [], null) || []);
+      const keep = m2.staticPoseTRS;
+      m2.staticPoseTRS = null;
+      m2._skin = null;
+      const skB = Float32Array.from(computeSkinMatrices(m2, 0, [], null) || []);
+      m2.staticPoseTRS = keep;
+      m2._skin = null;
+      let maxD = Math.abs(skA.length - skB.length);
+      for (let i = 0; i < Math.min(skA.length, skB.length); i++) maxD = Math.max(maxD, Math.abs(skA[i] - skB[i]));
+      check(maxD < 1e-6,
+        `有动画的 puppet 不得读静态姿势表（${animated.name} 差分 ${maxD.toExponential(1)}）`);
+      console.log(`   反向：有动画模型（${animated.name}）静态姿势差分 ${maxD.toExponential(1)}`);
+    } else {
+      console.log("   （跳过带动画模型的反向断言：库内找不到）");
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`\nverify-attachments：${errors.length} 项失败`);
   process.exit(1);

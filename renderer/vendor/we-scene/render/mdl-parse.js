@@ -108,7 +108,11 @@ export function parseMDL(buf) {
     for (let i = 0; i < indexCount; i++) indices[i] = dv.getUint16(idxStart + i * 2, true)
   }
 
-  const bones = parseSkeleton(buf, dv)
+  const skel = parseSkeleton(buf, dv)
+  const bones = skel.bones
+  // 无 MDLA 的模型（全库 80 个 puppet 里 3 个：3186328539 单车、3226487183 左侧手 /
+  // 抬头身体背景）拿 MDLS 尾部这张表当**装配姿势**，见 parseStaticPose 头注。
+  const staticPose = parseStaticPose(dv, skel, bones.length)
   const animations = parseAnimations(buf, dv, bones.length)
   // MDLE0002（可选）：贴图空间的静止姿势。
   //   顶点按 MDLS 姿势烘焙，而 UV 对应的是 MDLE 姿势 —— 实测 lainpw 用
@@ -232,6 +236,19 @@ export function parseMDL(buf) {
     if (y > maxY) maxY = y
   }
 
+  // 静态姿势的 TRS 九分量：与 bindTRS 同口径（平移/rz/缩放），供 computeSkinMatrices
+  // 在「无动画」时当基准姿势用。无该表的模型为 null（行为完全不变）。
+  let staticTRS = null
+  let staticPermutation = null
+  if (staticPose && staticPose.local.length === bones.length) {
+    staticTRS = staticPose.local.map((m) => Float32Array.from([
+      m[12], m[13], m[14],
+      0, 0, Math.atan2(m[1], m[0]),
+      Math.hypot(m[0], m[1]) || 1, Math.hypot(m[4], m[5]) || 1, m[10] || 1,
+    ]))
+    if (!staticPose.permutationIdentity) staticPermutation = staticPose.permutation
+  }
+
   return {
     magic,
     materialPath: mat.value,
@@ -244,6 +261,11 @@ export function parseMDL(buf) {
     indexType: useU32 ? 'u32' : 'u16',
     indices,
     bones,
+    // MDLS 尾部的静态装配姿势（无 MDLA 的模型才有）：TRS 九分量 + 原始局部矩阵
+    staticPoseTRS: staticTRS,
+    staticPoseLocal: staticPose ? staticPose.local : null,
+    staticPosePermutation: staticPermutation,
+    staticPoseAt: staticPose ? staticPose.at : -1,
     animations,
     // 动画平移极值（见 animDisplacementBound）：供渲染器放宽视锥裁剪余量
     animBound: animDisplacementBound(animations, bones),
@@ -308,9 +330,9 @@ function parseAttachments(buf, dv, boneCount) {
 // 否则回退固定解析，绝不返回残缺骨架。
 function parseSkeleton(buf, dv) {
   const s = findAscii(buf, 'MDLS')
-  if (s < 0) return []
+  if (s < 0) return { bones: [], sectionStart: -1, recordsEnd: -1, nextOff: -1, permutation: null }
   const boneCount = dv.getUint32(s + 13, true)
-  if (boneCount <= 0 || boneCount > 1024) return []
+  if (boneCount <= 0 || boneCount > 1024) return { bones: [], sectionStart: s, recordsEnd: -1, nextOff: -1, permutation: null }
 
   const orthMatrix = (m) =>
     Number.isFinite(m[12]) && Number.isFinite(m[13]) && Number.isFinite(m[14]) &&
@@ -323,7 +345,7 @@ function parseSkeleton(buf, dv) {
     let j = s + 17
     let ok = true
     for (let b = 0; b < boneCount; b++) {
-      if (j + 77 > dv.byteLength) return { bones, ok: false }
+      if (j + 77 > dv.byteLength) return { bones, ok: false, end: -1 }
       const id = dv.getUint32(j + 1, true)
       const parent = dv.getInt32(j + 5, true)
       const matrix = new Float32Array(16)
@@ -333,11 +355,20 @@ function parseSkeleton(buf, dv) {
       bones.push({ id, name: '', parent: parent >= 0 && parent < boneCount ? parent : -1, matrix })
       j = meta.next
     }
-    return { bones, ok }
+    return { bones, ok, end: j }
   }
 
+  const section = (bones, recordsEnd) => ({
+    bones,
+    sectionStart: s,
+    recordsEnd,
+    nextOff: dv.getUint32(s + 9, true),
+    permutation: null,
+  })
+
   const fixed = parseFixed()
-  if (fixed.ok) return fixed.bones
+  if (fixed.ok) return section(fixed.bones, fixed.end)
+
 
   // ---- 布局 B/C：name cstr + 12B 头 + 64B 矩阵 (+ JSON cstr)，顺序重解析 ----
   const findHeader = (j) => {
@@ -392,7 +423,77 @@ function parseSkeleton(buf, dv) {
   const rescanned = ok && bones.length === boneCount &&
     bones.every((x) => x.parent === -1 || (x.parent >= 0 && x.parent < boneCount)) &&
     bones.every((x) => orthMatrix(x.matrix))
-  return rescanned ? bones : fixed.bones
+  return rescanned ? section(bones, j) : section(fixed.bones, fixed.end)
+}
+
+// MDLS 尾部的**静态姿势表**（只对无 MDLA 的模型有意义）
+//
+// [we-scene patch] 现象：3186328539 的单车模型两个车轮不在车架的轴位上（整辆车
+// 是"拆散"的），3226487183 的抬头身体下半身整片落到画布外。
+//
+// 为什么错：这三个模型**没有任何 MDLA 动画轨道**（全库 80 个 puppet 里只有 3 个，
+// 其余 77 个的蒙皮姿势由动画轨道给，frame0 == MDLS 链）。而 Mesh 顶点是**烘焙在
+// 图集布局上**的（实测「顶点位置 == uv×图集尺寸」残差恒为 0），也就是作者把零件
+// 分散画在贴图里、靠骨骼把它们**拼装**起来。装配姿势不存在动画里，只存在
+// MDLS 骨架节尾部这张表里；不解析它 → 蒙皮恒等 → 画出来就是散开的图集。
+//
+// 尾部结构（本机 3 个无 MDLA 模型 + 另外 5 个 MDLS0002 模型逐一实测一致，
+// 且各段字节数与表头自洽：3 + 64N + 9 + 76N + (1+4N) == 尾部字节数）：
+//   [3B 头]                       （实测 00 00 01）
+//   [N × 64B 矩阵]                ← 本函数要的**静态姿势**（局部矩阵，可含旋转/缩放）
+//   [9B]                          （填充/版本）
+//   [N × 76B 记录]                （12B 头 + 64B 矩阵；带 z 与旋转，本仓不消费）
+//   [u8 flag=1][N × u32 排列表]   （顶点/骨骼的排列顺序；单车为恒等 0,1,2,3）
+// 逐字节校验：3186328539 尾部 589 = 3+256+9+304+17 ✓、3226487183 默认身体背景
+// 1165 = 3+512+9+608+33 ✓、抬头面具/左侧手 445 = 3+192+9+228+13 ✓。
+//
+// 判据不是"读到了字节"而是"读出来能拼装"：按 World(静态姿势) · invBindWorld 蒙皮后，
+// 单车的两个轮心落到 (1280,869)/(2569,873)（同一水平线、轮距 1289 = 1.63× 轮径、
+// 都在车架包围盒内）；不套这张表则两轮中心 (832,1111)/(1756,1470) Δy=359 且都在
+// 车架外。见 verify-attachments 的「静态姿势」节。
+function parseStaticPose(dv, skel, boneCount) {
+  if (!skel || boneCount <= 0) return null
+  if (!(skel.recordsEnd > 0 && skel.nextOff > skel.recordsEnd)) return null
+  const permBytes = 1 + 4 * boneCount
+  const group2Bytes = 76 * boneCount
+  const poseBytes = 64 * boneCount
+  // 先按结构算：尾部 = [3B][64N][9B][76N][1+4N]
+  const candidates = []
+  const byLayout = skel.nextOff - permBytes - group2Bytes - 9 - poseBytes
+  if (byLayout >= skel.recordsEnd) candidates.push(byLayout)
+  // 再退化扫描：记录结束后的前 32 字节里找「N 个连续合法 64B 矩阵」
+  for (let off = skel.recordsEnd; off < Math.min(skel.recordsEnd + 32, skel.nextOff - poseBytes); off++) {
+    if (!candidates.includes(off)) candidates.push(off)
+  }
+  const okMatrix = (m) => {
+    if (!(Number.isFinite(m[12]) && Number.isFinite(m[13]))) return false
+    if (Math.abs(m[15] - 1) > 1e-3) return false
+    if (Math.abs(m[3]) > 1e-3 || Math.abs(m[7]) > 1e-3 || Math.abs(m[11]) > 1e-3) return false
+    const len = (a, b, c) => Math.hypot(m[a], m[b], m[c])
+    return Math.abs(len(0, 1, 2) - 1) < 0.05 && Math.abs(len(4, 5, 6) - 1) < 0.05 &&
+      Math.abs(len(8, 9, 10) - 1) < 0.05
+  }
+  for (const start of candidates) {
+    if (start < 0 || start + poseBytes > skel.nextOff) continue
+    const mats = []
+    let ok = true
+    for (let i = 0; i < boneCount; i++) {
+      const m = new Float32Array(16)
+      for (let k = 0; k < 16; k++) m[k] = dv.getFloat32(start + i * 64 + k * 4, true)
+      if (!okMatrix(m)) { ok = false; break }
+      mats.push(m)
+    }
+    if (!ok) continue
+    // 排列表（尾部最后 1+4N 字节）
+    const perm = []
+    const permAt = skel.nextOff - permBytes
+    if (permAt >= start + poseBytes) {
+      for (let i = 0; i < boneCount; i++) perm.push(dv.getUint32(permAt + 1 + i * 4, true))
+    }
+    const permIdentity = perm.length === boneCount && perm.every((v, i) => v === i)
+    return { local: mats, permutation: perm.length === boneCount ? perm : null, permutationIdentity: permIdentity, at: start }
+  }
+  return null
 }
 
 // MDLA0006：魔数(8) + u8 + u32 endPos + u32 animCount，逐动画（末尾 35B 填充）
