@@ -1175,6 +1175,87 @@ function runRibbonEffects() {
     if (!/rangeShift/.test(fontSan) || !/cmap/.test(fontSan)) {
       errors.push("font-sanitize.js 必须修正 cmap format 4 的 rangeShift");
     }
+    // hhea/vhea 的 version 归一：OTS 只认 1.0=0x00010000 / 1.1=0x00011000，
+    // 写成 0x00010001（FreeType 只校验 version>>16==1，所以桌面 WE 照常渲染）时
+    // FontFace 抛 "A network error occurred"，文字整体回落系统字体。
+    if (!/\bvhea\b/.test(fontSan) || !/\bhhea\b/.test(fontSan)) {
+      errors.push("font-sanitize.js 必须同时归一 hhea/vhea 的 version（OTS 拒载 0x00010001）");
+    }
+    if (!/0x00010000/.test(fontSan) || !/0x00011000/.test(fontSan)) {
+      errors.push("font-sanitize.js 必须同时认合法的 0x00010000 与 0x00011000（不能见 vhea 就改）");
+    }
+    // 本机语料：3448845950 的 Aa后浪行楷 / Aa攒劲小楷 写的是 0x00010001，
+    // 且它们的 cmap 本身是对的 —— 修完 cmap 才能 return 的实现会在这里漏修
+    // （旧实现的 `if (!changed) return src` 就是这种形态）。
+    const wp344 = join(LIB, "3448845950", "scene.pkg");
+    if (fs.existsSync(wp344)) {
+      const readFont = (name) => {
+        const pkg = pkgMod.parsePkg(fs.readFileSync(wp344));
+        const raw = pkgMod.getEntry(pkg, name);
+        return raw ? (raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : null;
+      };
+      const tableInfo = (u8, tag) => {
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        const n = dv.getUint16(4);
+        for (let i = 0; i < n; i++) {
+          const e = 12 + i * 16;
+          const t = String.fromCharCode(u8[e], u8[e + 1], u8[e + 2], u8[e + 3]);
+          if (t !== tag) continue;
+          const off = dv.getUint32(e + 8);
+          const len = dv.getUint32(e + 12);
+          let sum = 0;
+          for (let p = off; p < off + len; p += 4) {
+            const b0 = u8[p] || 0, b1 = p + 1 < off + len ? u8[p + 1] : 0;
+            const b2 = p + 2 < off + len ? u8[p + 2] : 0, b3 = p + 3 < off + len ? u8[p + 3] : 0;
+            sum = (sum + ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)) >>> 0;
+          }
+          return { entry: e, off, len, version: dv.getUint32(off), stored: dv.getUint32(e + 4), computed: sum };
+        }
+        return null;
+      };
+      for (const name of ["fonts/Aa后浪行楷.ttf", "fonts/Aa攒劲小楷.ttf"]) {
+        const u8 = readFont(name);
+        if (!u8) {
+          errors.push(`3448845950 应含 ${name}`);
+          continue;
+        }
+        const rawVhea = tableInfo(u8, "vhea");
+        if (!rawVhea || rawVhea.version !== 0x00010001) {
+          errors.push(`3448845950 ${name} 原件 vhea 应为 0x00010001（用例前提失效）`);
+          continue;
+        }
+        const fixed = fontSanMod.sanitizeFontForBrowser(u8);
+        if (fixed === u8) {
+          errors.push(`3448845950 ${name} 未被修补（字体并未「找不到」，是 OTS 拒载 0x00010001）`);
+          continue;
+        }
+        const fv = tableInfo(fixed, "vhea");
+        if (fv.version !== 0x00010000) {
+          errors.push(`3448845950 ${name} sanitize 后 vhea version=0x${fv.version.toString(16)}（应为 0x00010000）`);
+        }
+        if (fv.stored !== fv.computed) {
+          errors.push(`3448845950 ${name} vhea 目录 checksum 未按表内容重算`);
+        }
+        const cv0 = tableInfo(u8, "cmap");
+        const cv1 = tableInfo(fixed, "cmap");
+        if (cv0 && cv1 && (cv0.stored !== cv1.stored || cv0.version !== cv1.version)) {
+          errors.push(`3448845950 ${name} cmap 本来是对的，不得被动过`);
+        }
+      }
+      // 反例：千图笔锋手写体的 vhea 是**合法**的 0x00011000，必须原样返回
+      // （不许「见 vhea 就归一」，那会篡改作者写的 1.1）
+      const okFont = readFont("fonts/千图笔锋手写体.ttf");
+      if (okFont) {
+        const vh = tableInfo(okFont, "vhea");
+        if (vh && vh.version === 0x00011000) {
+          if (fontSanMod.sanitizeFontForBrowser(okFont) !== okFont) {
+            errors.push("合法 vhea 0x00011000 的字体必须原样返回（不得被归一）");
+          }
+        }
+      }
+    } else {
+      console.log("  （跳过 3448845950 字体语料：本机无此壁纸）");
+    }
     // 本机语料：2780710296 的 Tourner (588) 修前 rangeShift 错、修后应对。
     const wp278 = join(LIB, "2780710296", "scene.pkg");
     if (fs.existsSync(wp278)) {

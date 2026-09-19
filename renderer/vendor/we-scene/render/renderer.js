@@ -241,6 +241,38 @@ export function effectFboSize(fboDef, baseW, baseH) {
 }
 
 /**
+ * [we-scene patch 3448845950] 跨层合成源 FBO 的尺寸钳制。
+ *
+ * 素材层（`visible:false` 的隐藏层，被 `_rt_imageLayerComposite_<id>_a` 引用）
+ * 的 FBO 按「层尺寸 × 层缩放」开。**文本素材层**的尺寸是 autosize 长出来的：
+ * 3448845950 的「圆盘文字」（环形文字遮罩）报 13136×736，而 MAX_TEXTURE_SIZE
+ * 只有 8192 的机器上 texImage2D 直接 INVALID_VALUE —— 附件尺寸为 0 的 FBO，
+ * 之后每次 clear/draw 都是 GL_INVALID_FRAMEBUFFER_OPERATION（每帧刷屏），
+ * `_rt_imageLayerComposite_102_a` 整张作废，引用它的那一层拿不到遮罩。
+ *
+ * 钳法：等比缩到长边 ≤ maxTex，并把同一个 k 交给调用方折进源层的 scale
+ * （quad 恰好铺满缩小后的 FBO，UV 关系不变）。
+ *
+ * 单独导出给 verify-groups 做数值回归：改坏了钳制比例，离线就能红。
+ *
+ * @param {number} swRaw 源层像素宽（size[0] × |scale[0]|）
+ * @param {number} shRaw 源层像素高
+ * @param {number} maxTex GL_MAX_TEXTURE_SIZE
+ * @returns {{width:number, height:number, k:number}} 钳后尺寸与缩放系数（k ≤ 1）
+ */
+export function clampCompositeFboSize(swRaw, shRaw, maxTex) {
+  const sw = Math.max(1, Math.round(Math.abs(swRaw) || 1))
+  const sh = Math.max(1, Math.round(Math.abs(shRaw) || 1))
+  const limit = Math.max(1, Math.floor(Number(maxTex) || 1))
+  const k = Math.min(1, limit / sw, limit / sh)
+  return {
+    width: Math.max(1, Math.round(sw * k)),
+    height: Math.max(1, Math.round(sh * k)),
+    k,
+  }
+}
+
+/**
  * 内置 Bloom 后期（general.bloom）的参数解析。纯函数，离线判据直接跑这个。
  *
  * 「HDR 切换无效果」的根因是 general.bloom 没有任何消费者（壁纸把 hdr 属性绑在
@@ -1928,6 +1960,8 @@ export function createRenderer(canvas, opts = {}) {
   // 自己效果链后的 FBO。带模型的源每帧开头由 renderCompositeSources 填充；
   // 空 composelayer 源在主循环走到该层 z 序时由 captureEmptyComposeAtZOrder 回读画布填入。
   const compositeFBOs = new Map()
+  // [we-scene patch 3448845950] GL_MAX_TEXTURE_SIZE 缓存（0 = 未取）
+  let maxTextureSize = 0
   // 空 composelayer 合成源：预渲染阶段无法回读（后面的层还没画），先记下名字，
   // 主循环按图层顺序捕获。oid → Set<完整纹理名>
   const pendingEmptyCompose = new Map()
@@ -2697,14 +2731,36 @@ export function createRenderer(canvas, opts = {}) {
       // 叠到车身上。预渲染拿到空图 → 流光整段消失（只剩静态剪影）。
       // 正解同空 composelayer：登记进 pendingEmptyCompose，主循环走到该层 z 序时
       // 连效果链一起做（captureEmptyComposeAtZOrder 里走 renderLayer）。
-      const needsZOrderBackdrop = !!src.copybackground
+      //
+      // [we-scene patch 2748169441] **但这只对「自己没有内容」的 copybackground 层成立**。
+      // scene.json 里 `copybackground` 是编辑器的一个开关，作者给**有贴图的整幅画面层**
+      // 也会写 true（2748169441 的 7 个时段美术层：`models/下午16-18.json` +
+      // `materials/…` 贴图 + copybackground:true + solid:true）。
+      // 这类层的**可见路径**画的是自己的贴图（`texObj = !layer.solid && layer.textureName`
+      // 命中，主循环里 copybackground 根本不参与内容选择）；只有合成源这条路按
+      // 「内容 = 身后画面」处理，于是 366 的六个 blend 全部把**同一张身后画面**
+      // 混进来 —— `_rt_imageLayerComposite_{24,28,32,36,40,339,351}_a` 六张内容完全
+      // 相同（同一时刻逐点采样一致），时段美术永远切不过去：白天也显示 1-4 点那张
+      // 夜景（它自带一块大白斑），夜间灯/pulse 也永远盖不上。
+      // 判据与可见路径同源：**层有真贴图（!solid && textureName）时按自己的内容预渲染**。
+      // 无贴图的实心/空容器（Beam 那种 32×32 solid）仍走 z 序回读，行为不变。
+      const hasOwnContent = !src.solid && !!src.textureName
+      const needsZOrderBackdrop = !!src.copybackground && !hasOwnContent
       if (isEmptyCompose || needsZOrderBackdrop) {
         pendingEmptyCompose.set(oid, names)
         continue
       }
-      const sw = Math.max(1, Math.round(Math.abs(src.size[0] * (src.scale[0] || 1))))
-      const sh = Math.max(1, Math.round(Math.abs(src.size[1] * (src.scale[1] || 1))))
-      if (sw <= 1 && sh <= 1) continue
+      const swRaw = Math.max(1, Math.round(Math.abs(src.size[0] * (src.scale[0] || 1))))
+      const shRaw = Math.max(1, Math.round(Math.abs(src.size[1] * (src.scale[1] || 1))))
+      if (swRaw <= 1 && shRaw <= 1) continue
+      // [we-scene patch 3448845950] 源层尺寸必须**钳到 GPU 的 MAX_TEXTURE_SIZE**
+      // （见 clampCompositeFboSize 的注释：文本素材层会长到 13136px）。
+      // 纹理尺寸上限一帧取一次（老 GPU 上 8192，够用且省 getParameter 开销）。
+      if (maxTextureSize <= 0) maxTextureSize = Math.max(1, gl.getParameter(gl.MAX_TEXTURE_SIZE) || 8192)
+      const clamped = clampCompositeFboSize(swRaw, shRaw, maxTextureSize)
+      const sw = clamped.width
+      const sh = clamped.height
+      const k = clamped.k
       const fbo = getFBO(sw, sh, 'lc:' + oid)
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo)
       gl.viewport(0, 0, sw, sh)
@@ -2728,9 +2784,10 @@ export function createRenderer(canvas, opts = {}) {
       const savedAngles = src.angles
       const savedVisible = src.visible
       groupTarget = { fbo, w: sw, h: sh }
-      // 源层摆到视口正中、去掉自身缩放与旋转（尺寸已折进 FBO 与视口）
+      // 源层摆到视口正中、去掉自身缩放与旋转（尺寸已折进 FBO 与视口）；
+      // 钳过尺寸时再把 k 折进 scale，quad 恰好铺满缩小的 FBO。
       src.origin = [sw / 2, srcCam.projH - sh / 2, savedOrigin[2]]
-      src.scale = [Math.sign(savedScale[0]) || 1, Math.sign(savedScale[1]) || 1, savedScale[2]]
+      src.scale = [(Math.sign(savedScale[0]) || 1) * k, (Math.sign(savedScale[1]) || 1) * k, savedScale[2]]
       src.angles = [0, 0, 0]
       src.visible = true
       try {

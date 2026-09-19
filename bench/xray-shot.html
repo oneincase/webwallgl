@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>xray shot</title>
+<style>
+  html,body { margin:0; padding:0; background:#000; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script type="module">
+import * as pkgMod from '/renderer/vendor/we-scene/pkg/container.js'
+import * as texMod from '/renderer/vendor/we-scene/pkg/texture.js'
+import * as scnMod from '/renderer/vendor/we-scene/scene/parse.js'
+import * as effMod from '/renderer/vendor/we-scene/scene/effects-parse.js'
+import * as rndMod from '/renderer/vendor/we-scene/render/renderer.js'
+import * as ptexMod from '/renderer/vendor/we-scene/render/particle-textures.js'
+import { WE_SHADER_HEADERS } from '/renderer/vendor/we-scene/headers.ts'
+
+const q = new URLSearchParams(location.search)
+const ID = q.get('id') || '2212279721'
+const U = parseFloat(q.get('u') ?? '0.5')
+const V = parseFloat(q.get('v') ?? '0.5')
+const SIZE = q.get('size') // optional override of xray size
+const XRAYOFF = q.get('xrayoff') === '1'
+const W = 960, H = 540
+
+const cv = document.getElementById('cv')
+cv.width = W; cv.height = H
+const dec = new TextDecoder()
+const readText = (b) => dec.decode(b).replace(/^﻿/, '')
+
+const SILENT = (() => { const z = (n) => new Float32Array(n); return {
+  left16: z(16), right16: z(16), left32: z(32), right32: z(32),
+  left64: z(64), right64: z(64), level: 0, silent: true } })()
+
+function main() {
+  const ready = (info) => { document.title = 'READY ' + JSON.stringify(info); window.__ready = info }
+  const fail = (e) => { document.title = 'FAIL ' + String(e && e.message); window.__fail = String(e && e.stack || e) }
+  ;(async () => {
+    let r = await fetch(`/media/dev/${ID}/scenes/scene.pkg`)
+    if (!r.ok) r = await fetch(`/media/dev/${ID}/scene.pkg`)
+    if (!r.ok) throw new Error('pkg ' + r.status)
+    const pk = pkgMod.parsePkg(new Uint8Array(await r.arrayBuffer()))
+    const scene = scnMod.parseScene(JSON.parse(readText(pkgMod.getEntry(pk, 'scene.json'))), null)
+    scene.general = { ...scene.general, clearcolor: '1 0 1', clearenabled: true, cameraparallax: false }
+
+    const diag = { texOk: [], texFail: [], msgs: [] }
+    const renderer = rndMod.createRenderer(cv, {
+      diag: (m) => diag.msgs.push(String(m).slice(0, 200)),
+      shaderResolver: (rel) => {
+        const pre = rel.startsWith('shaders/') ? rel : 'shaders/' + rel
+        const e = pkgMod.getEntry(pk, pre) || pkgMod.getEntry(pk, rel)
+        const file = rel.replace(/^shaders\//, '')
+        return Promise.resolve(e ? readText(e) : (WE_SHADER_HEADERS[file] ?? null))
+      },
+      fboCapFactor: 0, parallax: false,
+    })
+    window.__r = renderer; window.__diag = diag; window.__gl = renderer.gl
+    const gl = renderer.gl
+    const textures = new Map()
+    textures.set('util/white', { glTex: rndMod.makeTexture(gl, new Uint8Array([255,255,255,255]), 1, 1), width: 1, height: 1 })
+    textures.set('util/noflow', { glTex: rndMod.makeTexture(gl, new Uint8Array([127,127,127,255]), 1, 1), width: 1, height: 1 })
+    async function loadTex(name) {
+      if (textures.has(name)) return textures.get(name)
+      const e = pkgMod.getEntry(pk, `materials/${name}.tex`)
+      if (!e) {
+        if (ptexMod.isBuiltinParticleTextureName(name)) {
+          const gen = ptexMod.buildBuiltinParticleTexture(name)
+          if (gen) {
+            const entry = { glTex: rndMod.makeTextureMip(gl, [gen], false), width: gen.width, height: gen.height }
+            textures.set(name, entry); return entry
+          }
+        }
+        return null
+      }
+      const pt = texMod.parseTex(e)
+      const m = texMod.decodeMip0(pt)
+      if (!m || m.video !== undefined) return null
+      let entry = null
+      if (m.png !== undefined || (m.image !== undefined && m.fif === texMod.FIF.JPEG)) {
+        const blob = new Blob([m.png || m.image], { type: m.png ? 'image/png' : 'image/jpeg' })
+        const bmp = await createImageBitmap(blob)
+        entry = { glTex: rndMod.makeTexture(gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height }
+      } else if (m.image === undefined) {
+        entry = { glTex: rndMod.makeTextureMip(gl, [m], pt.format === 8), width: m.width, height: m.height }
+      }
+      if (entry) { textures.set(name, entry); diag.texOk.push(name + '@' + entry.width + 'x' + entry.height) }
+      else diag.texFail.push(name)
+      return entry
+    }
+    for (const L of scene.layers) {
+      if (!L.image) continue
+      let mj; try { mj = JSON.parse(readText(pkgMod.getEntry(pk, L.image))) } catch { continue }
+      if (mj && mj.puppet) continue
+      let texName
+      try { texName = JSON.parse(readText(pkgMod.getEntry(pk, mj.material))).passes?.[0]?.textures?.[0] } catch {}
+      if (texName && await loadTex(texName)) L.textureName = texName
+      for (const ef of L.effects || []) {
+        effMod.resolveEffectChain(pk, ef, readText)
+        for (const p of ef.passes || []) for (const tn of p.textures || [])
+          if (typeof tn === 'string' && tn && !tn.startsWith('_rt_')) await loadTex(tn)
+        for (const mp of ef.materialPasses || []) for (const tn of mp.textures || [])
+          if (typeof tn === 'string' && tn && !tn.startsWith('_rt_')) await loadTex(tn)
+        if (XRAYOFF) ef.visible = false
+      }
+    }
+    // 可选：直接改 size 常量（materialPasses[].constants.size）
+    if (SIZE !== null) {
+      for (const L of scene.layers) for (const ef of L.effects || []) {
+        for (const mp of ef.materialPasses || []) {
+          if (mp.constants && 'size' in mp.constants) mp.constants.size = { value: parseFloat(SIZE) }
+        }
+      }
+    }
+
+    const state = { u: U, v: V, screenX: U * 1920, screenY: V * 1080, wx: 0, wy: 0,
+      lastU: U, lastV: V, lastScreenX: 0, lastScreenY: 0, lastWx: 0, lastWy: 0,
+      leftDown: false, has: true, moveCount: 0, downCount: 0, upCount: 0,
+      lastEventTime: 0, screenW: 1920, screenH: 1080 }
+    const ptr = { state, beginFrame() {}, syncWorld(cam) {
+      state.wx = cam.offX + state.u * cam.viewW
+      state.wy = cam.offY + state.v * cam.viewH
+    }, normalizedDelta() { return 0 }, dispose() {} }
+    window.__scene = scene; window.__textures = textures
+    renderer.setPointerProvider(() => ptr)
+    renderer.setAudioProvider(() => SILENT)
+
+    await renderer.render(scene, textures, W, H, 0, 'cover')
+    await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)))
+    await renderer.render(scene, textures, W, H, 0, 'cover')
+    ready({ id: ID, u: U, v: V, size: SIZE, xrayoff: XRAYOFF })
+  })().catch(fail)
+}
+main()
+</script>
+</body>
+</html>

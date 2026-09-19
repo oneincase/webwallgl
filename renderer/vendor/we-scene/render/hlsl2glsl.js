@@ -235,6 +235,41 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   // 反过来 HLSL_SM30 必须保持未定义（恒假）：blur_combine.frag 用它守一个
   // 仅 D3D9 需要的半像素偏移，在 GLSL 下加上会让模糊整体偏移半个纹素。
   const effective = { GLSL: 1, ...defaults, ...(combos || {}) }
+  // [we-scene patch 3448845950] **作者自定义函数与 GLSL 内建函数同名** → 改名。
+  // GLSL ES 3.0 禁止重定义内建函数（`'mod' : Name of a built-in function cannot be
+  // redeclared as function`），整个 pass 被跳过：3022742727 的 halftone.frag 里
+  // 作者自己写了 `float mod(float x, float y){...}` 对齐 HLSL 的取余语义，
+  // 于是 halftone 这条效果在 3448845950 上整条不见。
+  //
+  // 必须在 `preprocess` **之前**做：只有作者自己的源码里出现定义时才改名，
+  // 公共头（common.h / common_blending.h）里的 min/max/… 定义不能被误伤
+  //（实测把规则放在 preprocess 之后会把头里的 `min(B, A)` 一起改成 we_fn_min）。
+  // 该文件里所有 `<name>(` 都指作者这份实现（自写 mod 与内建的 float 取余同族），
+  // 定义与调用一起换名，语义不变。
+  {
+    const builtinShadow = [
+      'mod', 'mix', 'clamp', 'min', 'max', 'step', 'smoothstep', 'fract', 'abs', 'floor',
+      'ceil', 'sign', 'pow', 'exp', 'exp2', 'log', 'log2', 'sqrt', 'inversesqrt',
+      'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh',
+      'dot', 'cross', 'normalize', 'length', 'distance', 'reflect', 'refract',
+      'round', 'trunc', 'modf', 'degrees', 'radians',
+    ]
+    // 定义形态必须**同时**满足三条，否则等于见名就改（实测把
+    // `return clamp(...)` / `return length(...)` 当成定义，于是 clamp/mix/length
+    // 的**调用**被改成 we_fn_*，本来好好的 4 个 pass 反而编不过）：
+    //   ① 上一字符是语句边界（行首 / `;` / `}`），不能是 `return`；
+    //   ② 返回类型是**真类型名**，不能是任意标识符；
+    //   ③ 名字后面紧跟 `(`。
+    const typeRe = '(?:void|float|int|uint|bool|half|double|vec[234]|ivec[234]|bvec[234]|mat[234]|mat[234]x[234])'
+    for (const fn of builtinShadow) {
+      const defRe = new RegExp('(^|[;}\\n])[ \\t]*(?:(?:static|const|inline)[ \\t]+)*' + typeRe + '[ \\t]+' + fn + '[ \\t]*\\(', 'm')
+      if (!defRe.test(src)) continue
+      const renamed = 'we_fn_' + fn
+      if (new RegExp('\\b' + renamed + '\\b').test(src)) continue
+      src = src.replace(new RegExp('\\b' + fn + '\\b(?=\\s*\\()', 'g'), renamed)
+    }
+  }
+
   let code = preprocess(src, effective, includeResolver, 0)  // 展开本文件保留的宏（#define 行仍在，GLSL 预处理器会展开；但函数宏在 GLSL ES 也支持，
   // 为稳妥起见用 JS 预展开，然后移除 #define 行）
 
@@ -1491,6 +1526,165 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       return line
     }).join('\n')
   }
+
+  // [we-scene patch 3448845950] 四条与「作者手写 GLSL 风格代码」有关的规则。
+  //
+  // ① `int(expr)` 强制转换参与**浮点**运算/比较：HLSL 会把 int 隐式提升为 float
+  //    （`(int(barFreq1) + 0.5) / audioResolution` 是 3082978660 的
+  //    Simple_Audio_Bars 取外部音频缓冲的写法），GLSL ES 3.0 报
+  //    `'+' : wrong operand types … 'int' and … 'float'`，整条效果被跳过。
+  //    修法与 HLSL 语义**逐字等价**：把 cast 包成 `float(int(x))`（先截断再提升）。
+  //    反向的 `0.0 == int(1)`（2800594362 clipping_mask.vert 的
+  //    `ALIGNMENT == int(1)`，宏替换成 0 后又补了 .0）同一条规则覆盖。
+  //    注意**不能**反过来把浮点侧包成 int —— `1.5 == int(1)` 在 HLSL 里是
+  //    `1.5 == 1.0`（假），包成 `int(1.5) == 1` 就变真了（静默算错）。
+  //
+  // ② 浮点 `%` / `%=`：GLSL ES 的 `%` 只对整数成立。dot_matrix_mobile_fix 的
+  //    `fragLV %= 2;`（fragLV 是 float）改写成 `fragLV = mod(fragLV, 2.0);`。
+  //
+  // ③ `const` 声明的右值引用了 uniform/varying（ascii_art_converter 的
+  //    `const vec2 fontRatio = vec2(g_Texture1Resolution.z/…)`）：GLSL ES 要求
+  //    const 初始化式是常量表达式，报 `assigning non-constant to 'const …'`。
+  //    去掉 const 保留变量语义（HLSL 的 static const 本来就是只读变量）。
+  //
+  // ④（见 preprocess 之前的「作者函数与内建同名」改名）
+  {
+    const collectFloatNames = () => {
+      const names = new Set()
+      const re = /\b(?:uniform\s+)?(?:highp\s+|mediump\s+|lowp\s+)?(?:float|vec2|vec3|vec4|mat2|mat3|mat4)\s+([A-Za-z_][A-Za-z0-9_]*)/g
+      let m
+      while ((m = re.exec(code)) !== null) names.add(m[1])
+      return names
+    }
+    const isFloatish = (tok, floatNames) => {
+      if (!tok) return false
+      if (/\d*\.\d|\d\./.test(tok)) return true // 浮点字面量
+      if (/^float\s*\(/.test(tok)) return true
+      const id = /^[A-Za-z_]\w*/.exec(tok)
+      return !!(id && floatNames.has(id[0]))
+    }
+    // ① 扫描 `int(` cast，看紧邻的运算符与对侧操作数
+    const wrapIntCasts = (src, floatNames) => {
+      let out = ''
+      let i = 0
+      while (i < src.length) {
+        const m = /\bint\s*\(/.exec(src.slice(i))
+        if (!m) { out += src.slice(i); break }
+        const at = i + m.index
+        out += src.slice(i, at)
+        // 配平括号，取整段 cast
+        let depth = 0
+        let j = at + m[0].length - 1
+        for (; j < src.length; j++) {
+          if (src[j] === '(') depth++
+          else if (src[j] === ')') { depth--; if (depth === 0) { j++; break } }
+        }
+        const cast = src.slice(at, j)
+        // 前一个非空 token（运算符）与更前的操作数；后一个运算符与操作数
+        const before = src.slice(0, at)
+        const after = src.slice(j)
+        // 已经被 float(...) / int(...) 包过的不再重复包（for 循环边界规则会产出
+        // `int(x)`，本规则若不设防就会再包成 `float(int(x))` ——
+        // chromatic_aberration 的 `for (int a = float(int(...)); ...)` 就是这么坏的）
+        if (/\b(?:float|int|uint)\s*\(\s*$/.test(before)) { out += cast; i = j; continue }
+        // for 头里的 `int(x)` 是「整型循环边界」规则专门产出的（那里就需要 int），
+        // 再包一层 float 会让 `for (int a = float(int(x)); …)` 编不过
+        // （chromatic_aberration.vert 实测）。判据：最近一个未闭合的 `for (` 之内。
+        //
+        // [we-scene patch 3448845950] 这里**必须**用 `\bfor\s*\(` 找关键字，不能用
+        // `lastIndexOf('for')`：`uniform` 里就含子串 "for"（uni-for-m），于是任何
+        // 出现在第一条 uniform 声明之后的 `int(` 都被误判成 for 头里的 cast、
+        // 一律跳过包装 —— 本规则等于从第二个 uniform 起彻底失效。
+        // 现场：clipping_mask.vert 的 `ALIGNMENT == int(1)` 之前正好有
+        // `uniform sampler2D`，`0.0 == int(1.0)` 照旧编不过；
+        // Simple_Audio_Bars.frag 的 `(int(barFreq1) + 0.5)` 同理（两者在
+        // 3448845950 上整条效果被跳过）。离线夹具因为 uniform 少/顺序不同没复现，
+        // 是**真实整包 shader** 才暴露出来的。
+        {
+          const forRe = /\bfor\s*\(/g
+          let forAt = -1
+          let fm
+          while ((fm = forRe.exec(before)) !== null) forAt = fm.index
+          if (forAt >= 0) {
+            const seg = before.slice(forAt)
+            let d = 0
+            let open = false
+            for (const ch of seg) {
+              if (ch === '(') { d++; open = true }
+              else if (ch === ')') { d--; if (d <= 0) { open = false } }
+            }
+            if (open && d > 0) { out += cast; i = j; continue }
+          }
+        }
+        const mBefore = /(?:([^\s;,(]+)\s*)?([+\-*/%<>=!]=?|[<>])\s*$/.exec(before)
+        const mAfter = /^\s*([+\-*/%<>=!]=?|[<>])\s*([^\s;,)]+)?/.exec(after)
+        const lhs = mBefore && mBefore[1] ? mBefore[1] : null
+        const rhs = mAfter && mAfter[2] ? mAfter[2] : null
+        // 只认**二元算术/比较**：形如 `<操作数> <op> int(x)` 或 `int(x) <op> <操作数>`
+        const binary = !!(mBefore && mBefore[2]) || !!(mAfter && mAfter[1])
+        const peer = (lhs && isFloatish(lhs, floatNames) ? lhs : null) || (rhs && isFloatish(rhs, floatNames) ? rhs : null)
+        if (binary && peer) out += 'float(' + cast + ')'
+        else out += cast
+        i = j
+      }
+      return out
+    }
+    const fixFloatMod = (src, floatNames) => {
+      // ② `x %= y;`
+      src = src.replace(/\b([A-Za-z_]\w*)\s*%=\s*([^;]+);/g, (all, name, rhs) => {
+        if (!floatNames.has(name)) return all
+        const r = /^\s*(\d+)\s*$/.exec(rhs)
+        return `${name} = mod(${name}, ${r ? r[1] + '.0' : rhs.trim()});`
+      })
+      // ② `x % y`（左侧已知浮点变量）
+      const alt = Array.from(floatNames).sort((a, b) => b.length - a.length).join('|')
+      if (alt) {
+        src = src.replace(new RegExp('\\b(' + alt + ')\\s*%\\s*([^=;]+)', 'g'), (all, name, rhs) => {
+          if (/^\s*[A-Za-z_]/.test(rhs) && !floatNames.has(rhs.trim())) return all
+          return `${name} % ${rhs}`
+        })
+      }
+      return src
+    }
+    // ③ 去掉「右值引用了非常量」的 const。
+    //
+    // **只在函数体内（花括号深度 > 0）动手**。全局作用域是另一套规则：GLSL ES 3.0
+    // 要求全局变量初始化式必须是常量表达式，`const float fMultiplier = 32.0 / resolution;`
+    // （resolution 也是 const）本来是**合法**的常量表达式；把 const 拿掉就变成
+    // 「非 const 全局变量 + 非常量初始化式」，报
+    // `'=' : global variable initializers must be constant expressions`
+    // —— 2799421411 的 audio_responsive_oscilloscope（3078285611）全局那 4 行
+    // 就因此从「能编过」变成编不过（全库扫描 before/after 对比抓到的唯一回归）。
+    const dropNonConstConst = (src) => src.replace(
+      /\bconst\s+((?:highp|mediump|lowp)\s+)?(float|int|bool|vec2|vec3|vec4|mat2|mat3|mat4)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g,
+      (all, prec, type, name, expr, offset) => {
+        let depth = 0
+        for (let i = 0; i < offset; i++) {
+          const c = src[i]
+          if (c === '{') depth++
+          else if (c === '}') depth--
+        }
+        if (depth <= 0) return all
+        // 右值里去掉类型构造名之后还剩标识符 = 引用了非常量
+        const stripped = expr.replace(/\b(vec2|vec3|vec4|mat2|mat3|mat4|float|int|bool|true|false)\b/g, ' ')
+        if (!/[A-Za-z_]/.test(stripped)) return all
+        return `${type} ${name} = ${expr};`
+      },
+    )
+    // ⑤ 括号里的比较/逻辑式直接赋给浮点变量：GLSL ES 的 bool → float 也是显式转换。
+    //    ascii_art_converter 的 `float mask = ((c.r + c.g + c.b) / 3. > 0.5);` 报
+    //    `'=' : cannot convert from 'bool' to 'highp float'`（本轮修完 ③ 的 const
+    //    问题后暴露出来的下一处，同一个 pass）。
+    code = code.replace(
+      /\b((?:highp|mediump|lowp)\s+)?(float|vec2|vec3|vec4)(\s+[A-Za-z_]\w*\s*=\s*)(\((?:[^()]|\([^()]*\))*\s*(?:[<>]=?|==|!=)\s*(?:[^()]|\([^()]*\))*\))\s*;/g,
+      (all, prec, type, mid, expr) => `${prec || ''}${type}${mid}${type}(${expr});`,
+    )
+    const floatNames = collectFloatNames()
+    code = wrapIntCasts(code, floatNames)
+    code = fixFloatMod(code, floatNames)
+    code = dropNonConstConst(code)
+  }
+
 
   // [we-scene patch] 回填科学计数法字面量（在补 .0 之前整体挖了洞，
   // 见 sciHoles 处注释）。必须在所有改写之后、拼 prologue 之前。

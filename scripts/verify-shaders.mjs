@@ -1727,6 +1727,163 @@ const wireErrors = [];
     }
   }
 }
+// ---------- 作者手写 GLSL 风格代码的五条规则（3448845950 效果链整条消失） ----------
+//
+// 3448845950 有 5 个效果 pass 在浏览器里**全部编译失败**、renderLayer 逐条 warn 后跳过，
+// 而离线扫描当时报「32/32 全过」—— 因为离线夹具的 uniform 顺序与真实整包不同，
+// 掩盖了其中一条规则的判据 bug（见下 ② 的 `uniform` 陷阱）。
+// 教训：这一节必须同时钉「真实整包语料」和「会掩盖 bug 的最小夹具」，
+// 并且每条规则都要有反例（改宽了会把本来能编过的 shader 写坏）。
+{
+  const noRes = () => null;
+
+  // ① `int(expr)` 参与浮点运算/比较 → 包成 float(int(x))（HLSL 的隐式 int→float）
+  //    陷阱：判据里找 `for` 关键字时若用 lastIndexOf('for')，`uniform` 里就含 "for"
+  //    （uni-for-m）——任何出现在第一条 uniform 之后的 cast 都会被误判成 for 头里的
+  //    cast 而跳过。所以夹具**必须**把 uniform 放在 cast 前面。
+  const castFix = hlsl2glsl(
+    [
+      "uniform sampler2D g_Texture1;",
+      "uniform float audioResolution;",
+      "float barFreq1;",
+      "void main(){",
+      "  vec4 d = texSample2D(g_Texture1, vec2((int(barFreq1) + 0.5) / audioResolution, 0.5));",
+      "  float b = 0.0 == int(1) ? 1.0 : 0.0;",
+      "  gl_FragColor = d + vec4(b);",
+      "}",
+    ].join("\n"),
+    "frag",
+    {},
+    noRes,
+  );
+  if (!/float\(int\(barFreq1\)\)/.test(castFix)) {
+    wireErrors.push("`(int(x) + 0.5)` 未包 float()（uniform 含 'for' 子串的判据 bug 回归：找 for 必须用 \\bfor\\s*\\(）");
+  }
+  if (!/==\s*float\(int\(1\)\)/.test(castFix)) {
+    wireErrors.push("`0.0 == int(1)` 未包 float()（clipping_mask 的 ALIGNMENT == int(1)）");
+  }
+  // 反例：整型变量与 int 字面量比较不得被包（包了语义不变但会掩盖规则过宽）
+  const castNeg = hlsl2glsl(
+    "uniform float a;\nvoid main(){ int i = 3; float c = (i == int(1)) ? 2.0 : a; gl_Position = vec4(c); }",
+    "vert",
+    {},
+    noRes,
+  );
+  if (/float\(int\(1\)\)/.test(castNeg)) {
+    wireErrors.push("整型对整型比较（i == int(1)）不得被包 float()（规则过宽）");
+  }
+
+  // ② 浮点 `%=` → mod()（dot_matrix_mobile_fix 的 `fragLV %= 2;`）
+  const modFix = hlsl2glsl(
+    "uniform float a;\nfloat fragLV;\nvoid main(){ fragLV = a; fragLV %= 2; gl_Position = vec4(fragLV); }",
+    "vert",
+    {},
+    noRes,
+  );
+  if (/%/.test(modFix.replace(/\/\/.*/g, ""))) {
+    wireErrors.push("浮点 %= 未改写成 mod()（GLSL ES 的 % 只对整数成立）");
+  }
+
+  // ③ 局部 const 引用非常量 → 去 const；**全局 const 必须保留**
+  //    （全局那条是 2799421411 audio_responsive_oscilloscope 的回归：去掉 const 后
+  //     全局变量初始化式不再是常量表达式，本来能编过的 pass 反而编不过）
+  const constFix = hlsl2glsl(
+    [
+      "uniform vec4 g_Texture1Resolution;",
+      "uniform float u_fontGridSize;",
+      "const float resolution = float(32);",
+      "const float fMultiplier = 32.0 / resolution;",
+      "void main(){",
+      "  const vec2 fontRatio = vec2(g_Texture1Resolution.z/u_fontGridSize);",
+      "  gl_FragColor = vec4(fontRatio, resolution, fMultiplier);",
+      "}",
+    ].join("\n"),
+    "frag",
+    {},
+    noRes,
+  );
+  if (/const\s+vec2\s+fontRatio/.test(constFix)) {
+    wireErrors.push("函数体内 `const vec2 x = vec2(uniform…)` 未去 const（ascii_art_converter 整条效果被跳过）");
+  }
+  if (!/const\s+float\s+fMultiplier/.test(constFix)) {
+    wireErrors.push("全局 const 初始化式是常量表达式时不得去 const（2799421411 全局变量初始化式报错的回归）");
+  }
+
+  // ④ 比较式直接赋给浮点变量 → 包 float()（ascii_art_converter 的 `float mask = (... > 0.5);`）
+  const boolFix = hlsl2glsl(
+    "uniform vec4 c;\nvoid main(){ float mask = ((c.r + c.g + c.b) / 3. > 0.5); gl_FragColor = vec4(mask); }",
+    "frag",
+    {},
+    noRes,
+  );
+  if (!/float mask = float\(\(/.test(boolFix)) {
+    wireErrors.push("bool 表达式赋给 float 未包 float()（GLSL ES 不做隐式 bool→float）");
+  }
+
+  // ⑤ 作者自定义函数与 GLSL 内建同名 → 定义与调用一起改名（halftone 的 `float mod(…)`）
+  const shadow = hlsl2glsl(
+    [
+      "uniform float a;",
+      "float mod(float x, float y){ return x - y * floor(x / y); }",
+      "void main(){ gl_FragColor = vec4(mod(a, 2.0), clamp(a, 0.0, 1.0), length(vec2(a)), 1.0); }",
+    ].join("\n"),
+    "frag",
+    {},
+    noRes,
+  );
+  if (!/float we_fn_mod\s*\(/.test(shadow)) {
+    wireErrors.push("作者自定义 mod() 未改名（GLSL ES 禁止重定义内建函数，halftone 整条效果被跳过）");
+  }
+  if (/\bmod\s*\(a, 2\.0\)/.test(shadow)) {
+    wireErrors.push("改名的同时必须改掉本文件内的调用点，否则调用的是内建 float mod(float,float)");
+  }
+  // 反例：只有调用、没有定义的文件不得改名（曾经把 return clamp(…) 当成定义，
+  // 改坏 4 个 pass）
+  const shadowNeg = hlsl2glsl(
+    "uniform float a;\nvoid main(){ gl_FragColor = vec4(mod(a, 2.0), clamp(a, 0.0, 1.0), length(vec2(a)), 1.0); }",
+    "frag",
+    {},
+    noRes,
+  );
+  if (/we_fn_/.test(shadowNeg)) {
+    wireErrors.push("无定义只有调用时不得改名内建函数（return clamp(…) 曾被当成定义）");
+  }
+
+  // ⑥ 真实整包语料（3448845950 的两个 pass；combos 必须让出错行真的参与编译，
+  //    否则 #if 把整段剪掉、测试变成空转 —— 这也是第一版离线检查漏掉 bug 的原因）
+  const wp = join(LIB, "3448845950", "scene.pkg");
+  if (!fs.existsSync(wp)) {
+    console.log("  （跳过 3448845950 语料：本机无此壁纸）");
+  } else {
+    const pkg = parsePkg(fs.readFileSync(wp));
+    const cmVert = getEntry(pkg, "shaders/workshop/2800594362/effects/clipping_mask.vert");
+    const cmFrag = getEntry(pkg, "shaders/workshop/2800594362/effects/clipping_mask.frag");
+    if (!cmVert) {
+      wireErrors.push("3448845950 包内应含 clipping_mask.vert");
+    } else {
+      // TEX=1 才能进 `#if TEX` 里那行 ratio/mix
+      const g = hlsl2glsl(readText(cmVert), "vert", { ALIGNMENT: 0, TEX: 1 }, makeResolver(pkg), cmFrag ? readText(cmFrag) : "");
+      if (!/float\(int\(1\.0\)\)/.test(g)) {
+        wireErrors.push("3448845950 clipping_mask.vert：ALIGNMENT == int(1) 未产出 float(int(1.0))");
+      }
+      if (/==\s*int\(1\.0\)/.test(g)) {
+        wireErrors.push("3448845950 clipping_mask.vert 仍残留 `== int(1.0)`（'const float' vs 'const int' 编不过）");
+      }
+    }
+    const sabFrag = getEntry(pkg, "shaders/workshop/3082978660/effects/Simple_Audio_Bars.frag");
+    const sabVert = getEntry(pkg, "shaders/workshop/3082978660/effects/Simple_Audio_Bars.vert");
+    if (!sabFrag) {
+      wireErrors.push("3448845950 包内应含 Simple_Audio_Bars.frag");
+    } else {
+      // SOURCE=0 + HasExternalAudioBuffer=1 才会走 `int(barFreq1) + 0.5` 那行
+      const g = hlsl2glsl(readText(sabFrag), "frag", { SOURCE: 0, HasExternalAudioBuffer: 1 }, makeResolver(pkg), sabVert ? readText(sabVert) : "");
+      if (!/float\(int\(barFreq1\)\)/.test(g)) {
+        wireErrors.push("3448845950 Simple_Audio_Bars.frag：外部音频缓冲的 int(barFreq1) 未包 float()");
+      }
+    }
+  }
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

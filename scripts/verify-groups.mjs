@@ -1793,8 +1793,16 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/if\s*\(\s*isEmptyCompose[^)]*\)[\s\S]{0,160}pendingEmptyCompose\.set[\s\S]{0,80}continue/.test(cCode),
       "renderCompositeSources 跳过空 composelayer 时必须登记 pendingEmptyCompose（不能只 continue）");
     // copybackground 源同理（内容 = 身后画面）：预渲染拿不到背景，必须 z 序捕获
-    check(/needsZOrderBackdrop\s*=\s*!!src\.copybackground/.test(cCode),
-      "renderCompositeSources 必须识别 copybackground 源（预渲染只能得到空图）");
+    //
+    // [we-scene patch 2748169441] 但**只对「自己没有内容」的 copybackground 层**成立。
+    // 编辑器给带贴图的整幅画面层也会写 copybackground:true（2748169441 的 7 个时段
+    // 美术层），这类层的可见路径画的是自己的贴图；合成源若一律按「身后画面」处理，
+    // 366 的六个 blend 混进来的就是同一张身后画面 → 时段美术永远切不过去
+    // （六张 `_rt_imageLayerComposite_*` 内容逐点相同），白天显示夜景、pulse 白斑不消失。
+    check(/hasOwnContent\s*=\s*!src\.solid\s*&&\s*!!src\.textureName/.test(cCode),
+      "renderCompositeSources 必须先判「层自己有内容」（!solid && textureName，与可见路径同源）");
+    check(/needsZOrderBackdrop\s*=\s*!!src\.copybackground\s*&&\s*!hasOwnContent/.test(cCode),
+      "copybackground 只有在层没有自己的贴图时才是「内容 = 身后画面」（有贴图的整幅画面层必须走预渲染）");
     check(/if\s*\(\s*isEmptyCompose\s*\|\|\s*needsZOrderBackdrop\s*\)/.test(cCode),
       "copybackground 源必须与空 composelayer 一样走 pendingEmptyCompose（z 序捕获）");
     check(/function captureEmptyComposeAtZOrder/.test(rsrc),
@@ -1866,6 +1874,38 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
         `   其中源自身 visible:false 的 ${srcComposeHidden} 个（必须靠 visible 闸门放行才取得到）：` +
         `${hiddenDetail.slice(0, 8).join(", ")}`,
       );
+    }
+    // [we-scene patch 3448845950] 合成源 FBO 尺寸必须钳到 GL_MAX_TEXTURE_SIZE。
+    // 文本素材层的 autosize 会长到 13136px（3448845950 的「圆盘文字」环形遮罩），
+    // 超过 8192 的机器上 texImage2D 直接 INVALID_VALUE → 附件尺寸为 0 的 FBO，
+    // 此后每次 clear/draw 都是 GL_INVALID_FRAMEBUFFER_OPERATION，那张合成整张作废
+    //（引用它的层拿不到遮罩/白块），控制台每帧刷错。
+    check(/export function clampCompositeFboSize/.test(rsrc),
+      "renderer.js 未导出 clampCompositeFboSize（合成源 FBO 尺寸不钳，超限机型整张作废）");
+    check(/clampCompositeFboSize\(swRaw,\s*shRaw,\s*maxTextureSize\)/.test(cCode),
+      "renderCompositeSources 未用 clampCompositeFboSize 钳源层 FBO 尺寸");
+    check(/MAX_TEXTURE_SIZE/.test(cCode) && /maxTextureSize/.test(rsrc),
+      "钳制必须取真实的 GL_MAX_TEXTURE_SIZE（写死 8192 会在 16384 机型上白降分辨率）");
+    check(/src\.scale = \[\(Math\.sign\(savedScale\[0\]\) \|\| 1\) \* k/.test(cCode),
+      "钳掉尺寸后必须把 k 折进源层 scale（否则 quad 溢出 FBO，内容被裁而不是被缩小）");
+    {
+      const mod = await imp("renderer/vendor/we-scene/render/renderer.js");
+      const fn = mod.clampCompositeFboSize;
+      if (typeof fn !== "function") {
+        check(false, "clampCompositeFboSize 不是函数（离线判据无法跑）");
+      } else {
+        const a = fn(13136, 736, 8192);      // 3448845950 圆盘文字实测尺寸
+        check(a.width === 8192 && a.height === 459 && Math.abs(a.k - 8192 / 13136) < 1e-6,
+          `13136×736 钳到 8192 长边应为 8192×459（k=${(8192 / 13136).toFixed(4)}），实得 ${a.width}×${a.height} k=${a.k}`);
+        const b = fn(2000, 2000, 8192);
+        check(b.width === 2000 && b.height === 2000 && b.k === 1,
+          `未超限不该缩（2000×2000 → ${b.width}×${b.height} k=${b.k}）`);
+        const c2 = fn(16384, 9000, 16384);
+        check(c2.width === 16384 && c2.height === 9000,
+          `长边恰好等于上限时不该缩（→ ${c2.width}×${c2.height}）`);
+        const d2 = fn(0, 0, 8192);
+        check(d2.width === 1 && d2.height === 1, `零尺寸要落到 1×1（实得 ${d2.width}×${d2.height}）`);
+      }
     }
     const wp290 = wallpapers.find((w) => w.id === "2902406982");
     if (wp290) {
