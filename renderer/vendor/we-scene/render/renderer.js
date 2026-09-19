@@ -1980,6 +1980,11 @@ export function createRenderer(canvas, opts = {}) {
       time,
       overrideTex: overrideTex || null,
       ambient: layerColorAmbient(layer.lightingEnabled, sceneAmbient),
+      // [we-scene patch] 顶点 z 只有透视场景该参与投影：2D puppet 的网格 z 是建模残留
+      // （3737267090 人物 z∈[111,435]），放过去会按深度被别的层挡住；而透视场景里的
+      // 真 3D 网格（三体的天空盒/恒星/地球）必须保留 z，否则球体被压平在相机平面上
+      // 退化成一条边（天空盒只剩一条细缝、整屏近黑）。
+      keepZ: !!(cam && cam.perspective),
     })
     // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
     // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——

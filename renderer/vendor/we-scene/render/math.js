@@ -130,9 +130,21 @@ function numField(v, dflt) {
 
 // 有 fov、没有 orthogonalprojection = 真 3D 透视场景。
 // 全库目前只有 3509243656。2D 场景即使写了 fov（编辑器残留）也带正交投影，必须走正交。
+//
+// 「没有」= 键缺失 / null / **空对象**。scene.json 里透视场景写的是
+// `"orthogonalprojection": null`，装配期另有代码会拿到 general 就顺手补字段
+// （GIF 模板的 auto ortho），一旦补出一个 `{}`，这里 `g.orthogonalprojection`
+// 就是真值 → 三体被当 2D 像素正交画到画布角落（全黑）。空对象必须按「无投影」算。
 export function isPerspectiveScene(scene) {
   const g = scene && scene.general
-  if (!g || g.orthogonalprojection) return false
+  if (!g) return false
+  const o = g.orthogonalprojection
+  if (o && typeof o === 'object') {
+    // 只要写过任何一个键（width/height/auto…）就当作者声明了正交投影；空对象按「没声明」算
+    if (Object.keys(o).length > 0) return false
+  } else if (o) {
+    return false
+  }
   return numField(g.fov, 0) > 0
 }
 

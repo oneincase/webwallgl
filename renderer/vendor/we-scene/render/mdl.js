@@ -63,7 +63,14 @@ function boneBudget(gl) {
 }
 
 // 顶点着色器在 GPU 上做蒙皮。网格坐标为「图层局部像素、y 轴朝上」，
-// u_mvp 由宿主构造（含 y 方向、图层旋转缩放、场景投影），故这里直传 xy 即可。
+// u_mvp 由宿主构造（含 y 方向、图层旋转缩放、场景投影）。
+//
+// u_keepZ：顶点 z 是否参与投影。**默认 0 = 压平到 z=0**，这是 2D puppet 的正确行为
+// —— 那类网格坐标是图层局部像素，z 只是建模残留（本机库 3737267090 的
+// 人物网格 z∈[111,435]，是「贴图平面」之外的建模偏移，放过去会让它按深度被
+// 其它层挡住）。透视场景（3509243656 三体）里的真 3D 网格必须保留 z，否则
+// 球体被压成过相机的一张薄片：天空盒（半径 8 的球心就在相机上）只剩一条边、
+// 星空铺不满，星芒球变成边缘朝上的小点 —— 整个画面近乎全黑。
 // UV 恒等直传：朝向差异一律由 u_mvp 的几何翻转表达，翻 UV 会把贴图镜像到未翻转的网格上。
 const mdlVertSrc = (maxBones) => `#version 300 es
 in vec3 a_pos;
@@ -73,6 +80,7 @@ in vec4 a_weight;
 uniform mat4 u_mvp;
 uniform mat4 u_skin[${maxBones}];
 uniform int u_boneCount;
+uniform float u_keepZ;
 out vec2 v_uv;
 void main() {
   vec4 p = vec4(a_pos, 1.0);
@@ -89,7 +97,7 @@ void main() {
     }
   }
   vec4 local = total > 0.0 ? skinned / total : p;
-  gl_Position = u_mvp * vec4(local.xy, 0.0, 1.0);
+  gl_Position = u_mvp * vec4(local.xy, local.z * u_keepZ, 1.0);
   v_uv = a_uv;
 }`
 
@@ -152,6 +160,7 @@ export function createMDLRenderer(gl) {
     skin: gl.getUniformLocation(prog, 'u_skin'),
     boneCount: gl.getUniformLocation(prog, 'u_boneCount'),
     color: gl.getUniformLocation(prog, 'u_color'),
+    keepZ: gl.getUniformLocation(prog, 'u_keepZ'),
   }
   const identitySkin = new Float32Array(MAX_BONES * 16)
   for (let i = 0; i < MAX_BONES; i++) identitySkin.set(IDENTITY, i * 16)
@@ -206,9 +215,10 @@ export function createMDLRenderer(gl) {
     upload(mdl) {
       ensureMesh(mdl)
     },
-    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex }
+    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex, keepZ }
     // overrideTex：puppet 层跑过效果链时采样源是链尾 FBO 的纹理，而不是原始贴图
     // （效果在贴图空间合成，见 renderer.js 中部那段长注释）。传裸 WebGLTexture。
+    // keepZ：顶点 z 是否参与投影（透视场景的真 3D 网格 = true，2D puppet = 缺省 false）。
     draw(mvp, mdl, opts, texture) {
       const m = ensureMesh(mdl)
       gl.useProgram(prog)
@@ -218,6 +228,7 @@ export function createMDLRenderer(gl) {
       gl.bindTexture(gl.TEXTURE_2D, src)
       gl.uniform1i(uni.tex, 0)
       gl.uniformMatrix4fv(uni.mvp, false, mvp)
+      gl.uniform1f(uni.keepZ, opts.keepZ ? 1 : 0)
       const col = opts.color || [1, 1, 1, 1]
       gl.uniform4f(uni.color, col[0], col[1], col[2], col[3])
       const skin = computeSkinMatrices(mdl, opts.time || 0, opts.animLayers, opts.boneOverrides)

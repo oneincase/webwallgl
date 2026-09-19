@@ -148,6 +148,87 @@ const num = (v, d) => {
   const ortho = buildCamera(twoD, 1920, 1080, "cover");
   check(ortho.perspective === false, "2D 场景 cam.perspective 必须为 false");
   check(Math.abs(ortho.viewW - 1920) < 1e-6, `2D cover 视口不得被透视分支改掉，viewW=${ortho.viewW}`);
+
+  // 2c-2. 「没有正交投影」必须含**空对象**这一种。
+  // 三体 scene.json 写的是 `"orthogonalprojection": null`，装配期只要有人
+  // `general.orthogonalprojection ??= {}`（GIF 模板 auto ortho 那段的旧写法），
+  // 空对象就是真值 → 三体退回像素正交 → 世界单位 ≈1 的星星被当 1 像素画到角落，
+  // 整屏全黑（实测 mean 0.00 / max 17）。空对象必须按「无投影」处理。
+  check(
+    isPerspectiveScene({ general: { fov: 50, orthogonalprojection: {} }, camera: {} }),
+    "orthogonalprojection 是空对象时必须仍判定为透视（装配期补空对象不准改判）",
+  );
+  check(
+    isPerspectiveScene({ general: { fov: 50, orthogonalprojection: undefined }, camera: {} }),
+    "orthogonalprojection 缺失时必须判定为透视",
+  );
+  // 反例：真写过键的正交投影（含 GIF 模板的 auto 标记）必须仍是 2D
+  check(
+    !isPerspectiveScene({ general: { fov: 50, orthogonalprojection: { auto: true } }, camera: {} }),
+    "带 auto 标记的正交投影（GIF 导入模板）必须走正交，不能被 fov 抢走",
+  );
+  check(
+    !isPerspectiveScene({ general: { fov: 50, orthogonalprojection: { width: 0, height: 0, auto: true } }, camera: {} }),
+    "auto 模板即使宽高没算出来也必须留在正交路径",
+  );
+  // 真实语料：scene.json 原文就是 null，装配期不得把它变成对象
+  {
+    const sceneJsonPath = join(LIB, "3509243656", "scene.pkg");
+    if (fs.existsSync(sceneJsonPath)) {
+      const buf = fs.readFileSync(sceneJsonPath);
+      const pkg = parsePkg(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+      const g = JSON.parse(dec.decode(getEntry(pkg, "scene.json"))).general;
+      check(g.orthogonalprojection === null, `三体 scene.json 的 orthogonalprojection 应为 null，实得 ${JSON.stringify(g.orthogonalprojection)}`);
+      const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+      check(
+        !/general\.orthogonalprojection\s*=(?!=)/.test(mountSrc) && !/\?\?\s*\(\s*general\.orthogonalprojection\s*=/.test(mountSrc),
+        "装配期不得往 general.orthogonalprojection 写值（写空对象会让透视场景退回正交 = 全黑）",
+      );
+      check(
+        /const ortho = \(general\.orthogonalprojection \?\? null\)/.test(mountSrc),
+        "auto ortho 那段必须只读不建：`const ortho = (general.orthogonalprojection ?? null)`",
+      );
+    }
+  }
+}
+
+// ---------- 2c-3. 真 3D 网格的顶点 z 必须保留（否则球体被压平在相机平面上）----------
+// 顶点着色器曾是 `u_mvp * vec4(local.xy, 0.0, 1.0)`：z 恒 0 是 2D puppet 的正确行为
+// （网格坐标是图层局部像素，z 只是建模残留），但透视场景里的真 3D 网格会被压成
+// 过相机的一张薄片 —— 天空盒（球心就在相机上）只剩一条边、星空铺不满、星芒球变成
+// 小点，整屏近黑（实测 mean 0.44 / 无天空盒）。修法：加 u_keepZ，透视才传 1。
+{
+  const mdlSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8");
+  const rndSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/uniform float u_keepZ;/.test(mdlSrc), "mdl 顶点着色器必须有 u_keepZ");
+  check(
+    /gl_Position = u_mvp \* vec4\(local\.xy, local\.z \* u_keepZ, 1\.0\)/.test(mdlSrc),
+    "mdl 顶点着色器必须写成 local.z * u_keepZ（直接写 local.z 会把 2D puppet 的建模 z 放进深度）",
+  );
+  check(/gl\.uniform1f\(uni\.keepZ, opts\.keepZ \? 1 : 0\)/.test(mdlSrc), "mdl.draw 必须按 opts.keepZ 设置 u_keepZ（缺省 = 压平）");
+  check(/keepZ: gl\.getUniformLocation\(prog, 'u_keepZ'\)/.test(mdlSrc), "u_keepZ 的 uniform 位置必须缓存");
+  check(
+    /keepZ: !!\(cam && cam\.perspective\)/.test(rndSrc),
+    "renderer 给 puppet 回调的 keepZ 必须由 cam.perspective 决定（透视场景才保留 z）",
+  );
+  check(/keepZ: !!o\.keepZ/.test(mountSrc), "宿主必须把 o.keepZ 透传给 mdlRenderer.draw");
+
+  // 语料事实：2D 场景里确实存在 z 很深的 puppet 网格，所以「一律保留 z」是错的
+  const deepZ = [];
+  if (fs.existsSync(join(LIB, "3737267090", "scene.pkg"))) {
+    const { parseMDL } = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+    const buf = fs.readFileSync(join(LIB, "3737267090", "scene.pkg"));
+    const pkg = parsePkg(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    const e = getEntry(pkg, "models/556_puppet.mdl");
+    if (e) {
+      const m = parseMDL(e);
+      let zmax = 0;
+      for (let i = 2; i < m.positions.length; i += 3) zmax = Math.max(zmax, Math.abs(m.positions[i]));
+      deepZ.push({ id: "3737267090", zmax });
+    }
+  }
+  check(deepZ.length > 0 && deepZ[0].zmax > 10, `2D 人物网格必须仍有深 z（否则 keepZ 的闸门没有意义）实得 ${JSON.stringify(deepZ)}`);
 }
 
 // ---------- 2d. 3509243656 真 3D mdl（直接挂 model，不经 puppet json）----------

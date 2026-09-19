@@ -1746,18 +1746,22 @@ cfg, source, pkgAbort.signal);
       // 保持既有画布回退，避免投影原点错位。
       {
         const general = (scene as any).general ?? ((scene as any).general = {});
-        const ortho = general.orthogonalprojection ?? (general.orthogonalprojection = {});
-        const explicit = Number(ortho.width) > 0 && Number(ortho.height) > 0;
+        // 不要在这里新建 orthogonalprojection：3D 透视场景（3509243656 写的是
+        // `"orthogonalprojection": null`）本来就该没有这个键，补一个空对象会被
+        // render/math.js 的 isPerspectiveScene 当成「作者声明了正交投影」→ 整个
+        // 场景退回像素正交，星星被当成 1 像素画到画布角落 = 全黑。
+        const ortho = (general.orthogonalprojection ?? null) as any;
+        const explicit = Number(ortho?.width) > 0 && Number(ortho?.height) > 0;
         // [临时诊断]
-        {
+        if (ortho) {
           const b0 = coverContentBounds(scene.layers as any[]);
           reportDiag(
             rt,
             cfg,
-            `auto ortho probe: auto=${(ortho as any).auto} explicit=${explicit} bounds=${Math.round(b0.minX)},${Math.round(b0.minY)}..${Math.round(b0.maxX)},${Math.round(b0.maxY)} sizes=${(scene.layers as any[]).map((l) => `${l.size?.[0]}x${l.size?.[1]}`).join("|")}`,
+            `auto ortho probe: auto=${ortho.auto} explicit=${explicit} bounds=${Math.round(b0.minX)},${Math.round(b0.minY)}..${Math.round(b0.maxX)},${Math.round(b0.maxY)} sizes=${(scene.layers as any[]).map((l) => `${l.size?.[0]}x${l.size?.[1]}`).join("|")}`,
           );
         }
-        if (ortho.auto === true && !explicit) {
+        if (ortho && ortho.auto === true && !explicit) {
           const b = coverContentBounds(scene.layers as any[]);
           const w = b.maxX - b.minX;
           const h = b.maxY - b.minY;
@@ -2331,6 +2335,9 @@ cfg, source, pkgAbort.signal);
                 // [we-scene patch] 效果链输出（贴图空间的合成结果）。
                 // 无效果链时为 null，网格照常采样原始贴图。
                 overrideTex: o.overrideTex || null,
+                // [we-scene patch] 顶点 z 是否参与投影：透视场景的真 3D 网格要保留
+                // （renderer 按 cam.perspective 给），2D puppet 压平到 z=0。
+                keepZ: !!o.keepZ,
                 color: [
                   // [we-scene patch] 真 3D 网格 LIGHTING 材质乘场景环境光
                   //（o.ambient，未开光照时是 [1,1,1]）。
