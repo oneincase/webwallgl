@@ -21,6 +21,7 @@ import * as systemMod from "../vendor/we-scene/render/system.js";
 import * as animMod from "../vendor/we-scene/render/animation.js";
 import * as pointerMod from "../vendor/we-scene/render/pointer.js";
 import * as hitTestMod from "../vendor/we-scene/render/hittest.js";
+import * as cursorDispatchMod from "../vendor/we-scene/render/cursor-dispatch.js";
 
 const asAny = (m: unknown) => m as unknown as Record<string, any>;
 
@@ -41,7 +42,8 @@ const system = asAny(systemMod);
 const anim = asAny(animMod);
 const pointerLib = asAny(pointerMod);
 const hitTest = asAny(hitTestMod);
+const cursorDispatch = asAny(cursorDispatchMod);
 
 export {
-  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, pointerLib, hitTest, anim, audioMod,
+  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, pointerLib, hitTest, cursorDispatch, anim, audioMod,
 };

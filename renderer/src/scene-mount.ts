@@ -14,7 +14,7 @@ import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSyste
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -3457,9 +3457,14 @@ cfg, source, pkgAbort.signal);
       if (cursorLayers.length) {
         reportDiag(rt, cfg, `cursor hooks: ${cursorLayers.length} layers`);
       }
-      let hoveredLayer: any = null;
-      let pressedLayer: any = null;
-      let lastLeftDown = false;
+      // 命中集（z 序自上而下）。**同一帧可以有多个图层同时命中**：WE 的 cursor
+      // 回调按图层各自判定、不做上层遮挡（open-wallpaper-engine TickAll 逐 script
+      // HitTestNode、Mirage ResolveCursorNode + ancestors_visible 都是这个语义）。
+      // 3801397319 的右上角是两个同位同尺寸的交互区（切换人物形态 + 作者水印），
+      // 只派发给最上层那一个会让「切换人物」永远收不到点击。
+      // 派发规则本身是纯函数 cursor-dispatch.js 的 planCursorDispatch——
+      // verify-pointer 直接跑那份真实现，不在测试里再抄一遍派发顺序。
+      let cursorState: any = { hovered: [], pressed: [], lastLeftDown: false };
       // event 只需 worldPosition：全库 51 处引用它，无一处读 button/screenPosition/delta。
       // 但它**必须是 Vec3 而非对象字面量** —— 脚本会存下来再做向量运算
       // （2998757800 的 cursorDown 存 dragStart，update 里 dragStart.add(...)），
@@ -3482,36 +3487,25 @@ cfg, source, pkgAbort.signal);
         if (!p.has) return;
         const par = renderer.getParallaxOffset ? renderer.getParallaxOffset() : null;
         const projH = (scene as any).general?.orthogonalprojection?.height || c.height;
-        const hit = hitTest.hitTestLayers(scene.layers, p.wx, p.wy, projH, {
+        const hits = hitTest.hitTestLayersAll(scene.layers, p.wx, p.wy, projH, {
           parallaxCtx: par,
           alignTable: rnd.ALIGN,
           // perspective 图层走射线-平面求交（无透视层时为 null，命中逻辑不变）
           perspEye: renderer.getPerspectiveEye ? renderer.getPerspectiveEye() : null,
-          // 只在挂了回调的图层里找命中 —— 否则上方任何一个全屏背景层都会把
-          // 指针「挡住」，下方真正的交互层永远收不到 enter。
+          // 只在挂了回调的图层里找命中 —— 多命中语义下没有「挡住」，但无关图层
+          // 不该白跑几何。
           filter: (l: any) => cursorHooks.has(l),
         });
+        const plan = cursorDispatch.planCursorDispatch(cursorState, hits, p.leftDown);
+        cursorState = plan.next;
         const ev = makeCursorEvent();
-        // enter / leave：命中层变化时成对派发
-        if (hit !== hoveredLayer) {
-          if (hoveredLayer) fire(hoveredLayer, "cursorLeave", ev);
-          hoveredLayer = hit;
-          if (hit) fire(hit, "cursorEnter", ev);
-        }
-        // move：命中层内每帧派发（拖拽脚本需要连续位置）
-        if (hit) fire(hit, "cursorMove", ev);
-        // down / up / click
-        if (p.leftDown && !lastLeftDown) {
-          pressedLayer = hit;
-          if (hit) fire(hit, "cursorDown", ev);
-        } else if (!p.leftDown && lastLeftDown) {
-          if (pressedLayer) fire(pressedLayer, "cursorUp", ev);
-          // click 只在「按下与松开落在同一层」时派发 ——
-          // 否则从层内按下、拖到层外松手也会误触发一次点击。
-          if (pressedLayer && pressedLayer === hit) fire(hit, "cursorClick", ev);
-          pressedLayer = null;
-        }
-        lastLeftDown = p.leftDown;
+        // 派发顺序与 planCursorDispatch 的返回顺序一致：leave → enter → move → down → up → click
+        for (const l of plan.leave) fire(l, "cursorLeave", ev);
+        for (const l of plan.enter) fire(l, "cursorEnter", ev);
+        for (const l of plan.move) fire(l, "cursorMove", ev);
+        for (const l of plan.down) fire(l, "cursorDown", ev);
+        for (const l of plan.up) fire(l, "cursorUp", ev);
+        for (const l of plan.click) fire(l, "cursorClick", ev);
       };
 
       const start = performance.now();

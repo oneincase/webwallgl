@@ -21,6 +21,8 @@
  *      这些「改动前从未绑定」的 uniform 确实出现在声明里（防回归）。
  *   8. 粒子 controlpoint flags bit0 锁鼠标 + eventfollow 子级跟随父粒子
  *      （1425503532 Pac-Man：无脚本、无 locktopointer 字段）。
+ *   9. 光标多命中派发：同位/同尺寸的交互区**都**收事件（WE 按图层各自判定命中，
+ *      没有上层遮挡）——3801397319 右上角「切换人物 + 作者水印」两区重叠。
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -33,7 +35,9 @@ import { LIB, ROOT, createChecker, imp } from './lib/verify-kit.mjs'
 
 const { parsePkg, getEntry } = await import(path.join(ROOT, 'renderer/vendor/we-scene/pkg/container.js'))
 const mathMod = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/math.js'))
-const { worldToLayerLocal, hitTestLayers } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/hittest.js'))
+const { worldToLayerLocal, hitTestLayers, hitTestLayersAll } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/hittest.js'))
+const { createAnimation } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/animation.js'))
+const { planCursorDispatch } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/cursor-dispatch.js'))
 const { createPointerSource } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/pointer.js'))
 const { evalObjectScript, evalTextScript, createInputView, makeCursorEventVec } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/text.js'))
 const { hlsl2glsl } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/hlsl2glsl.js'))
@@ -1820,6 +1824,243 @@ console.log('\n【cursorripple 力场 FBO fit】')
       if (ew !== 512 || eh !== 288) fail(`语料 fit:512 算出 ${ew}×${eh}，应为 512×288`)
       else ok('3299228616 语料 fit:512 → 512×288')
     }
+  }
+}
+
+
+// -------------------------------------- 9. 光标多命中派发（同位交互区都收事件）
+//
+// WE 的 cursor* 回调是**按图层各自判定命中**派发的，没有「上层遮挡下层」：
+//   - open-wallpaper-engine `Script.cpp` 的 `TickAll()`：遍历**每个** field script，
+//     自己 `HitTestNode(node, cursor)`（世界 AABB 包含判定），命中的都收事件；
+//   - Mirage `ScriptRuntime.cpp`：遍历每个 script 的节点，`ResolveCursorNode` +
+//     `ancestors_visible` 各自判定，`over_node` 的全部派发。
+// 本仓此前用「取最上层一个命中层」派发。3801397319 的右上角正是两个**同位同尺寸**
+// 的交互区：切换人物形态（纯色-右上角 → 25917-18_ahq12 的 alpha 动画 789）与作者
+// 水印（纯色-右上角-水印 → 水印 的 7899）。只派给最上层那一个时人物的 cursorClick
+// 永远不触发 —— 用户看到的就是「点右上角只闪水印，人物不换」。
+//
+// 判据分两层：① 命中集必须同时含两个区（旧行为只有水印区）；② 用**真实混淆脚本 +
+// 真实场景层**各自派发一次 cursorClick，两个动画控制器都必须真的被 play()，
+// 且按钮脚本 engine.setTimeout(…,1500) 之后人物的 alpha 停在 1（形态切过去了）。
+console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
+{
+  const projH = 2160
+  const mkLayer = (name, visible = true) => ({
+    name, origin: [500, 500, 0], size: [200, 200], scale: [1, 1, 1],
+    angles: [0, 0, 0], alignment: 'center', visible, destroyed: false, parallaxDepth: null,
+  })
+  const lower = mkLayer('lower')
+  const upper = mkLayer('upper')
+  const hidden = mkLayer('hidden', false)
+  const px = 500
+  const py = projH - 500
+  const all = hitTestLayersAll([lower, hidden, upper], px, py, projH, { alignTable: ALIGN_TABLE })
+  const names = all.map((l) => l.name)
+  if (names.join(',') !== 'upper,lower') {
+    fail(`同位两层都应命中且按 z 序自上而下（期望 upper,lower，实得 ${names.join(',') || '空'}）`)
+  } else ok('同位两层都命中并按 z 序自上而下；隐藏层不参与')
+  const one = hitTestLayers([lower, hidden, upper], px, py, projH, { alignTable: ALIGN_TABLE })
+  if (!one || one.name !== 'upper') fail(`单点查询仍应返回最上层 upper，实得 ${one && one.name}`)
+  else ok('单点查询仍是 z 序最上层（与 All 同一实现）')
+
+  // 派发状态机：直接跑 scene-mount 消费的**真实现**（cursor-dispatch.js），
+  // 不在测试里再抄一遍顺序 —— 抄出来的第三份实现会跟着一起写错。
+  {
+    const A = mkLayer('A'), B = mkLayer('B'), C = mkLayer('C')
+    let st = { hovered: [], pressed: [], lastLeftDown: false }
+    const step = (hits, down) => { const p = planCursorDispatch(st, hits, down); st = p.next; return p }
+    const p1 = step([A, B], false) // 悬停到同位两区
+    const p2 = step([A, B], true) // 按下
+    const p3 = step([A, B], false) // 松开：两层都要 click
+    const p4 = step([], false) // 移开：两层都要 leave
+    if (p1.enter.length !== 2 || p2.down.length !== 2) {
+      fail(`同位两区应都收 enter/down（实得 enter=${p1.enter.length} down=${p2.down.length}）`)
+    } else if (p3.click.length !== 2 || p3.up.length !== 2) {
+      fail(`同位两区松开应都收 click/up（实得 click=${p3.click.length} up=${p3.up.length}）——` +
+        '只发最上层那一个就是「切换人物点不动」')
+    } else if (p4.leave.length !== 2) {
+      fail(`移开时两区都应收 leave（实得 ${p4.leave.length}）`)
+    } else ok('派发状态机：同位两区的 enter/move/down/up/click/leave 逐层成对（真实现）')
+    // 拖拽：在 A+B 上按下、只在 A 上松手 → up 两层都收、click 只给 A
+    let st2 = { hovered: [], pressed: [], lastLeftDown: false }
+    planCursorDispatch(st2, [A, B], false)
+    const d1 = planCursorDispatch({ hovered: [A, B], pressed: [], lastLeftDown: false }, [A, B], true)
+    const d2 = planCursorDispatch(d1.next, [A], false)
+    if (d2.up.length !== 2 || d2.click.length !== 1 || d2.click[0] !== A) {
+      fail(`拖到层外松手：up 应给按下集两层、click 只给仍在层内的 A（实得 up=${d2.up.length} click=${d2.click.length}）`)
+    } else ok('拖到层外松手：up 发给按下集全部，click 只给仍命中的层')
+    // 空命中集不该产生任何事件（且不能因为 undefined 崩）
+    const e0 = planCursorDispatch(st2, [], false)
+    if (e0.click.length || e0.down.length || e0.up.length || e0.enter.length) {
+      fail('空命中集不该产生 down/up/click/enter')
+    } else ok('空命中集零事件')
+  }
+
+  const pkgPath = path.join(LIB, '3801397319', 'scene.pkg')
+  if (!fs.existsSync(pkgPath)) {
+    ok('跳过 3801397319 语料（本机无此壁纸）')
+  } else {
+    const pkg = parsePkg(fs.readFileSync(pkgPath))
+    const sj = JSON.parse(new TextDecoder().decode(getEntry(pkg, 'scene.json')))
+    const projPath = path.join(LIB, '3801397319', 'project.json')
+    const pj = fs.existsSync(projPath) ? JSON.parse(fs.readFileSync(projPath, 'utf8')) : null
+    const scene = parseScene(sj, pj)
+    const userProps = {}
+    for (const [k, v] of Object.entries((pj && pj.general && pj.general.properties) || {})) {
+      if (v && typeof v === 'object' && 'value' in v) userProps[k] = v.value
+    }
+    // 与 scene-mount 同构：把 objectAnimations 建成按名字索引的控制器
+    for (const layer of scene.layers) {
+      const defs = layer.objectAnimations
+      if (!defs) continue
+      layer.animations = layer.animations || {}
+      layer.animationList = layer.animationList || []
+      for (const [field, def] of Object.entries(defs)) {
+        const ctrl = createAnimation(def.animation)
+        ctrl.field = field
+        ctrl.baseNumeric = Array.isArray(layer[field]) ? layer[field].slice() : layer[field]
+        if (ctrl.name) layer.animations[ctrl.name] = ctrl
+        layer.animationList.push(ctrl)
+      }
+    }
+    const byName = new Map(scene.layers.map((l) => [l.name, l]))
+    // 挂了 cursor 回调的层（scene-mount 的 cursorHooks：有 cursor* 导出的字段脚本）
+    const hookNames = []
+    const cursorDef = new Map()
+    for (const o of sj.objects || []) {
+      for (const f of ['visible', 'origin', 'scale', 'angles', 'alpha', 'color', 'brightness']) {
+        const v = o[f]
+        if (v && typeof v === 'object' && typeof v.script === 'string' && /export\s+function\s+cursor/.test(v.script)) {
+          hookNames.push(o.name)
+          cursorDef.set(o.name, { script: v.script, props: v.scriptproperties || null, field: f })
+          break
+        }
+      }
+    }
+    const hookLayers = hookNames.map((n) => byName.get(n)).filter(Boolean)
+    const zone = byName.get('纯色-右上角')
+    const mark = byName.get('纯色-右上角-水印')
+    if (!zone || !mark || hookLayers.length < 3) {
+      fail('3801397319 语料过期：右上角两个交互区或 cursor 钩子层缺失')
+    } else {
+      // 点击点 = 右上角区域中心（世界 y 向下，origin.y 是 WE 的 y-up）
+      const cxp = zone.origin[0]
+      const cyp = (scene.general?.orthogonalprojection?.height || 2160) - zone.origin[1]
+      const opt = { alignTable: ALIGN_TABLE, filter: (l) => hookLayers.includes(l) }
+      const hits = hitTestLayersAll(scene.layers, cxp, cyp, 2160, opt)
+      const hitNames = hits.map((l) => l.name)
+      const single = hitTestLayers(scene.layers, cxp, cyp, 2160, opt)
+      if (!hitNames.includes('纯色-右上角') || !hitNames.includes('纯色-右上角-水印')) {
+        fail(`3801397319 右上角应同时命中两个交互区，实得 [${hitNames.join(', ')}]`)
+      } else if (single && single.name !== '纯色-右上角-水印') {
+        fail(`4001397319 单点查询应命中最上层的水印区（实得 ${single.name}）—— 语料变了`)
+      } else {
+        ok(`3801397319 右上角命中 ${hitNames.length} 个交互区（${hitNames.join(' + ')}）；` +
+          `单点查询只到最上层的水印区 —— 只派发一个就永远点不到「切换人物」`)
+      }
+      // 端到端：逐层派发真实脚本，两个动画都必须真的 play()，人物的 alpha 停在 1
+      const clicked = []
+      const timers = []
+      for (const name of ['纯色-右上角', '纯色-右上角-水印']) {
+        const def = cursorDef.get(name)
+        const sb = evalObjectScript(def.script, def.props, {
+          layer: byName.get(name),
+          userProperties: userProps,
+          getSceneLayer: (n) => byName.get(String(n)) || null,
+          setTimeout: (fn, ms) => { timers.push({ name, fn, ms }); return () => {} },
+          clearTimeout: () => {},
+          onError: () => {},
+        })
+        if (!sb) { fail(`3801397319 ${name}: cursor 脚本沙箱求值返回 null`); continue }
+        sb.init()
+        sb.applyUserProperties(userProps)
+        sb.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) })
+        if (sb.errCount > 0) fail(`3801397319 ${name}: cursorClick 抛错（errCount=${sb.errCount}）`)
+        clicked.push(name)
+      }
+      const form2 = byName.get('25917-18_ahq12')
+      const a789 = form2 && form2.animations && form2.animations['789']
+      const mark2 = byName.get('水印')
+      const a7899 = mark2 && mark2.animations && mark2.animations['7899']
+      if (!a789 || !a7899) {
+        fail('3801397319 语料的命名动画 789 / 7899 没建成控制器（用例过期）')
+      } else if (clicked.length < 2) {
+        fail(`3801397319 只派发了 ${clicked.length} 个交互区`)
+      } else if (!a789.playing) {
+        fail('3801397319 人物形态动画 789 没被 play() —— 切换人物的 cursorClick 没收到事件')
+      } else if (!a7899.playing) {
+        fail('3801397319 水印动画 7899 没被 play()')
+      } else if (timers.length < 2 || timers.some((t) => Number(t.ms) !== 1500)) {
+        fail(`3801397319 两个按钮都应 engine.setTimeout(…, 1500)，实得 ${JSON.stringify(timers.map((t) => t.ms))}`)
+      } else {
+        // 1.5s × 30fps = 45 帧：人物 alpha 从 0 升到 1（形态 2 停在显示），
+        // 水印 alpha 升到 0.5；随后 engine.setTimeout 的 pause() 把播放头钉住。
+        for (let i = 0; i < 45; i++) {
+          a789.advance(1 / 30)
+          a7899.advance(1 / 30)
+        }
+        for (const t of timers) t.fn()
+        const alpha1 = a789.applyTo(a789.baseNumeric)
+        const alphaMark = a7899.applyTo(a7899.baseNumeric)
+        const frame789 = a789.frame
+        if (!(Math.abs(frame789 - 45) < 1.5)) {
+          fail(`3801397319 人物动画 1.5s 后播放头应 ≈45 帧，实得 ${frame789.toFixed(1)}`)
+        } else if (Math.abs(alpha1 - 1) > 0.05) {
+          fail(`3801397319 点击后人物形态 2 的 alpha 应停在 1（换人成功），实得 ${Number(alpha1).toFixed(3)}`)
+        } else if (Math.abs(alphaMark - 0.5) > 0.05) {
+          fail(`3801397319 点击后水印 alpha 应停在 0.5，实得 ${Number(alphaMark).toFixed(3)}`)
+        } else if (a789.playing) {
+          fail('3801397319 engine.setTimeout 的 pause() 没生效（播放头会继续跑到 0，人物切过去又退回）')
+        } else {
+          // 再点一次：从 45 帧接着淡出到 0 → 回到形态 1
+          timers.length = 0
+          for (const name of ['纯色-右上角', '纯色-右上角-水印']) {
+            const def = cursorDef.get(name)
+            const sb = evalObjectScript(def.script, def.props, {
+              layer: byName.get(name),
+              userProperties: userProps,
+              getSceneLayer: (n) => byName.get(String(n)) || null,
+              setTimeout: (fn, ms) => { timers.push({ name, fn, ms }); return () => {} },
+              clearTimeout: () => {},
+              onError: () => {},
+            })
+            sb.init()
+            sb.applyUserProperties(userProps)
+            sb.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) })
+          }
+          for (let i = 0; i < 46; i++) {
+            a789.advance(1 / 30)
+            a7899.advance(1 / 30)
+          }
+          for (const t of timers) t.fn()
+          const alpha2 = a789.applyTo(a789.baseNumeric)
+          if (Math.abs(alpha2) > 0.05) {
+            fail(`3801397319 第二次点击后人物形态 2 的 alpha 应回到 0，实得 ${Number(alpha2).toFixed(3)}`)
+          } else {
+            ok(`3801397319 右上角一次点击切到形态 2（789 播到 45 帧停，alpha ${Number(alpha1).toFixed(2)}），` +
+              `再点一次切回（alpha ${Number(alpha2).toFixed(2)}）；水印同时闪（alpha ${Number(alphaMark).toFixed(2)}）`)
+          }
+        }
+      }
+    }
+  }
+}
+
+
+// 接线：scene-mount 必须用多命中命中集 + 纯状态机派发（形状断言只是补充，
+// 语义由上面跑真实现的状态机断言保证 —— 缺了它「取了 All 却只派发第一个」照样绿）
+{
+  const src = fs.readFileSync(path.join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
+  const okAll = /hitTest\.hitTestLayersAll\(/.test(src)
+  const okPlan = /planCursorDispatch\(cursorState,\s*hits,\s*p\.leftDown\)/.test(src)
+  const okFire = /for \(const l of plan\.click\) fire\(l, "cursorClick", ev\)/.test(src)
+  if (!okAll || !okPlan || !okFire) {
+    fail(`scene-mount 派发接线不完整（All=${okAll} plan=${okPlan} click=${okFire}）`)
+  } else if (/const hit = hitTest\.hitTestLayers\(/.test(src)) {
+    fail('scene-mount 仍在用单点命中 hitTestLayers 派发（最上层会吞掉下层交互区）')
+  } else {
+    ok('scene-mount 走 hitTestLayersAll + planCursorDispatch，逐层派发 click（多命中接线完整）')
   }
 }
 

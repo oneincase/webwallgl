@@ -168,7 +168,17 @@ function perspLayerLocal(layer, wx, wy, cx, cy, w, h, alignTable, eye) {
 }
 
 /**
- * 命中测试：返回最上层（z 序最后）命中的可见图层。
+ * 命中测试（**全部命中**）：返回所有命中的可见图层，按 z 序**从上到下**排列。
+ *
+ * 为什么需要「全部命中」：WE 的 cursor 回调是**按图层各自判定命中**派发的，
+ * 不存在「上层把下层挡住」这回事 —— 两个参考实现都如此：
+ *   - open-wallpaper-engine `Script.cpp` 的 `TickAll()`：遍历**每个** field script，
+ *     自己 `HitTestNode(node, cursor)`（世界 AABB 包含判定），命中的都收事件；
+ *   - Mirage `ScriptRuntime.cpp`：遍历**每个** script 的节点，`ResolveCursorNode`
+ *     + `ancestors_visible` 各自判定，`over_node` 的全部派发。
+ * 3801397319 的右上角正是两个**同位同尺寸**的交互区（切换人物形态 #104 + 作者水印
+ * #118，两个 quad 的 origin/size/scale 完全相同）：只派发给最上层那一个，
+ * 「切换人物」的 cursorClick 永远不触发（点了只闪水印）。
  *
  * @param {Array} layers scene.layers（顺序即绘制顺序，后者在上）
  * @param {number} wx 世界 x
@@ -181,16 +191,17 @@ function perspLayerLocal(layer, wx, wy, cx, cy, w, h, alignTable, eye) {
  * @param {number[]} [opts.perspEye] perspective 图层相机眼点（renderer.getPerspectiveEye()），
  *   场景无透视层时为 null/缺省
  * @param {(layer:object)=>boolean} [opts.filter] 额外过滤（例如只考虑挂了 cursor 回调的层）
- * @returns {object|null} 命中的图层，或 null
+ * @returns {object[]} 命中的图层（z 序自上而下），无命中为 []
  */
-export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
-  if (!layers || layers.length === 0) return null
+export function hitTestLayersAll(layers, wx, wy, projH, opts = {}) {
+  if (!layers || layers.length === 0) return []
   const parOffX = opts.parOffX || 0
   const parOffY = opts.parOffY || 0
   const parallaxCtx = opts.parallaxCtx
   const alignTable = opts.alignTable
   const filter = opts.filter
-  // 从上往下找：layers 顺序即绘制顺序，后画的在上面
+  const out = []
+  // 从上往下扫：layers 顺序即绘制顺序，后画的在上面
   for (let i = layers.length - 1; i >= 0; i--) {
     const layer = layers[i]
     // 可见性已由 parse.js 沿父链求得（见文件头说明），隐藏层不参与命中
@@ -198,7 +209,18 @@ export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
     if (filter && !filter(layer)) continue
     const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye, parallaxCtx)
     if (!loc) continue
-    if (Math.abs(loc.lx) <= 0.5 && Math.abs(loc.ly) <= 0.5) return layer
+    if (Math.abs(loc.lx) <= 0.5 && Math.abs(loc.ly) <= 0.5) out.push(layer)
   }
-  return null
+  return out
+}
+
+/**
+ * 命中测试（单点查询）：返回最上层（z 序最后）命中的可见图层。
+ * 与 hitTestLayersAll 同一实现，取第一个。派发一律用 All（见其注释）。
+ *
+ * @returns {object|null} 命中的图层，或 null
+ */
+export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
+  const all = hitTestLayersAll(layers, wx, wy, projH, opts)
+  return all.length ? all[0] : null
 }
