@@ -840,6 +840,45 @@ function runMatrixSheetUv() {
   return { checked, errors };
 }
 
+// ---------- 3226487183 Matrix 字号：等比图层 scale 不乘精灵；100 = 50px 帧的 100% ----------
+function runMatrixGlyphSize() {
+  const errors = [];
+  const psrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/uniform \? 1 : \(Math\.min\(asx, asy\)/.test(psrc)) {
+    errors.push("等比图层 scale 不得乘进 sysScale（否则 matrix 字随 1.476 放到 148px 叠成没缝）");
+  }
+  if (!/v \* 0\.01 \* framePx/.test(psrc)) {
+    errors.push("TEXS 小帧 + sizerandom≈100 须按帧长边百分比（50px），不能当 100 像素");
+  }
+  const layer = { origin: [0, 0, 0], scale: [1.47631, 1.47631, 1.47631], angles: [0, 0, 0] };
+  const ps = new ParticleSystem(null, { maxcount: 1, sequencemultiplier: 2 }, null, layer);
+  ps.setTexture({
+    glTex: null,
+    width: 512,
+    height: 512,
+    frames: [{ x: 0, y: 0, width: 50, height: 50 }],
+  });
+  if (Math.abs(ps.sysScale - 1) > 1e-6) {
+    errors.push(`等比 scale 1.476 的 sysScale 应为 1，实际 ${ps.sysScale}`);
+  }
+  if (Math.abs((ps.frameLongPx || 0) - 50) > 1e-6) {
+    errors.push(`TEXS 50×50 的 frameLongPx 应为 50，实际 ${ps.frameLongPx}`);
+  }
+  // 与 fillInstances 的 sizePx 同构：100 → 50px，再 × sysScale=1
+  let v = 100;
+  const framePx = ps.frameLongPx || 0;
+  if (framePx > 0 && framePx <= 64 && v >= 80 && v <= 120) v = v * 0.01 * framePx;
+  const glyph = v * ps.sysScale;
+  if (Math.abs(glyph - 50) > 0.5) {
+    errors.push(`matrix 字号应为 50px（帧 100%），实际 ${glyph}（旧：100×1.476=148 与列距 74 重叠）`);
+  }
+  const worldStep = 50 * Math.abs(layer.scale[0]);
+  if (!(glyph + 1 < worldStep)) {
+    errors.push(`字号 ${glyph} 应小于列内间距 ${worldStep.toFixed(1)}，否则上下没有缝`);
+  }
+  return { errors };
+}
+
 // ---------- REFRACT 空白白图（2464842912 Raindrops Splatter Small）----------
 // 槽 0 是整张不透明白 PNG，形状在法线槽。按普通精灵画 = 满屏白方块。
 
@@ -1863,6 +1902,10 @@ if (action === "all" || action === "nested" || action === "sim") {
   console.log(`\n【图集 UV】TEXS ${uv.checked} 张 → 问题 ${uv.errors.length}`);
   uv.errors.forEach((e) => console.log("  ! " + e));
   failed += uv.errors.length;
+  const glyph = runMatrixGlyphSize();
+  console.log(`\n【Matrix 字号】问题 ${glyph.errors.length}`);
+  glyph.errors.forEach((e) => console.log("  ! " + e));
+  failed += glyph.errors.length;
 }
 if (action === "all" || action === "sim" || action === "trail") {
   const r = runSpriteTrail();

@@ -1,4 +1,4 @@
-import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, parallaxDepthFactor, layerWorldOrigin } from './math.js'
+import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, layerParallaxOffset, resolveParallaxFormula, parallaxDepthFactor, layerWorldOrigin } from './math.js'
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 通用 pass 管线渲染器（移植 linux-wallpaperengine 架构）：
 // 每层 copy pass → 效果链（WE shader 转译执行，FBO 乒乓）→ 合成到画布。
@@ -78,6 +78,22 @@ export function layerWantsPreserveBackdrop(layer) {
     }
   }
   return false
+}
+
+/**
+ * [we-scene patch] 空 composelayer（无子层）挂效果时，层内容 = 身后已渲染画面。
+ *
+ * WE 编辑器「可调整组合层」默认不写 `config.passthrough`（全库 36 处：
+ * CRT / vignette / 模糊 / 滤镜），但语义就是一块局部后期画布，着色器采
+ * `g_Texture0` framebuffer。fullscreenlayer 已走 `isPostProcess`；有子层的
+ * 走 groupTex。空画布 +「alpha 无信息 → 加法」会把效果链输出的黑底不透明
+ * 盖住背景 —— 3798926489 GlitchGirl 人物还在、彩色故障底没了，诊断正好是
+ * `container "Adjustable Composition Layer" alpha 无信息 → 加法`。
+ * 已显式 passthrough 的 98 处路径不变。
+ */
+export function layerWantsComposeBackdrop(layer) {
+  // 无子层的 composelayer：效果链输入必须是身后画面，不能是空画布。
+  return !!(layer && layer.isContainer && !layer.hasChildren)
 }
 
 /**
@@ -818,13 +834,25 @@ export function createRenderer(canvas, opts = {}) {
     const p = typeof pointerProvider === 'function' ? pointerProvider() : pointerProvider
     return p && p.state ? p.state : p
   }
-  // 视差平滑状态。x/y 是归一化到 [-1,1] 的指针（视差要的是「相对屏幕中心的偏移」，
-  // 故由指针源的 [0,1] 现算，不再单独维护一份事件状态）。
-  const parallaxState = { x: 0, y: 0, sx: 0, sy: 0 }
+  // 视差公式路径：legacy（默认全库）/ mirage（白名单壁纸，见 math.js）。
+  const parallaxFormula = resolveParallaxFormula(opts)
+  // 平滑状态：legacy 用 [-1,1]（与旧 amount×viewW 合成一致）；mirage 用 [0,1]
+  //（Mirage 对 m_parallaxMousePos 做 delay 平滑，mouse 世界向量由公式现算）。
+  const parallaxState = parallaxFormula === 'mirage'
+    ? { x: 0.5, y: 0.5, sx: 0.5, sy: 0.5 }
+    : { x: 0, y: 0, sx: 0, sy: 0 }
+  // [we-scene patch] 视差上下文（每帧 renderScene 更新；layerModelMatrix /
+  // hittest / 粒子宿主共用 layerParallaxOffset）：
+  //   mode='mirage' → mx/my/cx/cy/amount/staticScale
+  //   mode='legacy' → lx/ly（已封顶+取负的 parOff）
+  const parallaxCtx = {
+    mode: parallaxFormula,
+    mx: 0, my: 0, amount: 0, cx: 0, cy: 0, staticScale: 1,
+    lx: 0, ly: 0,
+    active: false,
+  }
   let lastParallaxTime = 0
-  // 层视差缩放（每帧由 renderScene 更新）
-  let layerParallaxScaleX = 0
-  let layerParallaxScaleY = 0
+
   // [we-scene patch] perspective 图层相机眼点（渲染世界坐标，每帧 renderScene 更新；
   // 无透视层时为 null）。hit-test 拿它做射线-平面求交。
   let perspEye = null
@@ -1043,8 +1071,11 @@ export function createRenderer(canvas, opts = {}) {
     setVal(uni, 'g_PointerState', (l) => gl.uniform4f(l, pu, pv, p && p.leftDown ? 1 : 0, 0))
     // g_ParallaxPosition：3088030303/shadow.vert 用 `g_PointerPosition -
     // g_ParallaxPosition` 求「指针相对平滑视差位置的偏移」，故喂**平滑后**的指针。
-    // parallaxState.sx/sy 是 [-1,1] 空间的平滑值，换回 [0,1] 与 g_PointerPosition 同空间。
-    setVal(uni, 'g_ParallaxPosition', (l) => gl.uniform2f(l, parallaxState.sx * 0.5 + 0.5, parallaxState.sy * 0.5 + 0.5))
+    // g_ParallaxPosition 要 [0,1]：mirage 状态本身就是；legacy 从 [-1,1] 换回。
+    setVal(uni, 'g_ParallaxPosition', (l) => {
+      if (parallaxCtx.mode === 'mirage') gl.uniform2f(l, parallaxState.sx, parallaxState.sy)
+      else gl.uniform2f(l, parallaxState.sx * 0.5 + 0.5, parallaxState.sy * 0.5 + 0.5)
+    })
     // g_Frametime：cursorripple_apply_force.frag 的 `timeAmt = g_Frametime / 0.02`
     // 是冲量的时间归一因子。不绑定则恒为 0 → 注入零力，水波**完全不动**且无报错。
     setVal(uni, 'g_Frametime', (l) => gl.uniform1f(l, lastFrametime))
@@ -1583,12 +1614,20 @@ export function createRenderer(canvas, opts = {}) {
     }
     const cx = layer.origin[0]
     const cy = cam.projH - layer.origin[1]
-    // 视差与相机抖动会让层在几十像素内浮动；留一档余量避免边缘层被误裁。
-    // 对象级视差最大位移 = |d|/2 × layerParallaxScale（见 parallaxDepthFactor）。
+    // 视差与相机抖动会让层浮动；留余量避免边缘层被误裁。
     let margin = 64
-    if (layer.parallaxDepth) {
-      margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[0]) * layerParallaxScaleX)
-      margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[1]) * layerParallaxScaleY)
+    if (layer.parallaxDepth && parallaxCtx.active) {
+      if (parallaxCtx.mode === 'mirage') {
+        // Mirage 上界 = (|origin−center| + |mouse|) × |d| × amount
+        margin += Math.abs((layer.origin[0] - parallaxCtx.cx) * layer.parallaxDepth[0] * parallaxCtx.amount)
+        margin += Math.abs((layer.origin[1] - parallaxCtx.cy) * layer.parallaxDepth[1] * parallaxCtx.amount)
+        margin += Math.abs(layer.parallaxDepth[0] * parallaxCtx.mx * parallaxCtx.amount)
+        margin += Math.abs(layer.parallaxDepth[1] * parallaxCtx.my * parallaxCtx.amount)
+      } else {
+        // Legacy 上界 = |d|/2 × |parOff|（parOff 已 60px 封顶）
+        margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[0]) * parallaxCtx.lx)
+        margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[1]) * parallaxCtx.ly)
+      }
     }
     // [we-scene patch] puppet 的骨骼动画会把网格推离 origin，而这里判的是**静态** origin，
     // 于是「停在屏外、靠动画开进来」的层会被每帧裁掉，动画永远播不出来。
@@ -1697,15 +1736,12 @@ export function createRenderer(canvas, opts = {}) {
       m = mat4RotateZ(m, -layer.angles[2])
     } else {
     m = mat4Translate(m, layer.origin[0], cam.projH - layer.origin[1], layer.origin[2])
-    // 对象级视差（parallaxDepth）：相机不动，各层按自身深度**正向**平移。
-    // 放在旋转之前 = 沿世界轴平移（视差是相机效果，不应被图层自身旋转带偏）。
-    // 深度响应线性：offset = parOff × d/2（parallaxDepthFactor）。
-    // |d|=1 → 0.5×parOff（与旧饱和函数在 1 处同值）；depth=0 → 不动；
-    // 大 depth 按作者写的数字比例走，不再饱和。
-    if (layer.parallaxDepth && (layerParallaxScaleX !== 0 || layerParallaxScaleY !== 0)) {
-      const fx = parallaxDepthFactor(layer.parallaxDepth[0])
-      const fy = parallaxDepthFactor(layer.parallaxDepth[1])
-      m = mat4Translate(m, fx * layerParallaxScaleX, fy * layerParallaxScaleY, 0)
+    // 对象级视差（parallaxDepth）：相机不动，各层按自身深度平移。
+    // 放在旋转之前 = 沿世界轴平移。公式路径见 math.js layerParallaxOffset
+    // （legacy = d/2×parOff+60px 封顶；mirage = Mirage 原样含静态项）。
+    if (layer.parallaxDepth && parallaxCtx.active) {
+      const off = layerParallaxOffset(layer, parallaxCtx)
+      if (off[0] !== 0 || off[1] !== 0) m = mat4Translate(m, off[0], off[1], 0)
     }
     // 旋转：参考实现 y-up 空间 rotate(-angle)，等效 y-down 屏幕 rotate(-angle)（正角度=屏幕逆时针）
     m = mat4RotateZ(m, -layer.angles[2])
@@ -2242,14 +2278,16 @@ export function createRenderer(canvas, opts = {}) {
     // ---- 场景级视差（cameraparallax）+ 对象级视差基准 ----
     const parRaw = general.cameraparallax
     const parEnabled = parRaw === true || (parRaw !== null && typeof parRaw === 'object' && parRaw.value === true)
-    layerParallaxScaleX = 0
-    layerParallaxScaleY = 0
     const ptr = readPointer()
-    // 指针归一化 [0,1] → 视差要的 [-1,1]（相对屏幕中心的偏移）。
-    // 没有指针源或还没收到事件时停在中心（0,0），即无视差偏移。
+    // 指针：mirage 存 [0,1]；legacy 存 [-1,1]（与旧 amount×viewW 合成一致）。
     if (ptr) {
-      parallaxState.x = ptr.u * 2 - 1
-      parallaxState.y = ptr.v * 2 - 1
+      if (parallaxCtx.mode === 'mirage') {
+        parallaxState.x = ptr.u
+        parallaxState.y = ptr.v
+      } else {
+        parallaxState.x = ptr.u * 2 - 1
+        parallaxState.y = ptr.v * 2 - 1
+      }
     }
     // 视差只在 cameraparallax 开启时生效。
     // 我曾自作主张给所有场景加了一个 0.02 的「默认对象视差基准」，理由是
@@ -2277,47 +2315,40 @@ export function createRenderer(canvas, opts = {}) {
       const parAlpha = parDt > 0 ? 1 - Math.exp(-parDt / Math.max(0.05, delay)) : 1
       parallaxState.sx += (parallaxState.x - parallaxState.sx) * parAlpha
       parallaxState.sy += (parallaxState.y - parallaxState.sy) * parAlpha
-      const strength = amount * influence
-      // [we-scene patch] 视差是**纯分层效果，相机不动**。
-      //
-      // 原实现让相机整体平移 parOff，再让每层反向补偿 -f(d)×parOff，净位移
-      // 成了 (1-f(d))×parOff —— 这把深度关系**弄反了**：parallaxDepth=0 拿到的是
-      // **最大**位移，depth 越大反而越不动。全库实测这正是「主窗口随鼠标乱飘移」：
-      //   2974757317  全部 53 个对象 parallaxDepth=0 → 整个场景刚性平移 480px
-      //   2887099508  82 个对象里 68 个为 0         → 绝大多数层满额飘
-      //   2902406982  140 个对象里 96 个为 0        → 同上
-      // 而作者的实际用法（3148125112：15 层留 0、其余分级到 -0.1~-0.8）说明
-      // **depth=0 就是「钉住不动」**，作者只给想浮动的层设非零深度。
-      //
-      // 正确语义：相机固定，第 i 层平移 +f(d)×parOff，f(d)=d/2。
-      // depth=0 → 完全不动；depth=1 → 0.5×parOff（与旧 d/(1+|d|) 在 1 处同值）；
-      // depth=25 → 12.5×parOff。负值（远景）反向跟随。
-      // 旧饱和函数 d/(1+|d|) 让 pd=25 的文字和 pd≈1.75 的鸟几乎一样远，
-      // 作者写 25 就白写了（2802243144）。不要再给文字层乘固定倍数。
-      const PARALLAX_MAX_PX = 60
-      const rawOffX = parallaxState.sx * strength * cam.viewW
-      const rawOffY = parallaxState.sy * strength * cam.viewH
-      // 按 x/y 里更大的超出比例统一缩放，避免单轴截断改变位移方向。
-      //
-      // [we-scene patch] 封顶**无条件生效**，不再只针对编辑器默认值。
-      // amount 的绝对像素当量无从考证：全库 1906 个 shader 里**没有一个**引用
-      // g_ParallaxPosition，官方文档只有落地页，无法反推 amount→px 的比例。
-      // 已知的只有分布：编辑器默认 amount=0.5/infl=0.5（乘积 0.25，9 个壁纸原样
-      // 保留），作者真正调过的落在 0.005~0.05，另有 3 个显式调高到 0.35~0.63。
-      // 按 product×viewSize 直算，默认值在 1920 宽上就是 480px，调高的那批到
-      // 672~1210px。既然基准本身不可信，就统一压到「几十像素轻微浮动」的观感，
-      // 并在 README 记录这是**未经证实的近似**。
-      const over = Math.max(Math.abs(rawOffX), Math.abs(rawOffY)) / PARALLAX_MAX_PX
-      const damp = over > 1 ? 1 / over : 1
-      // 对象级视差基准：各层按 +(d/2)×parOff 平移（见 layerModelMatrix / parallaxDepthFactor）。
-      // 相机自身不平移 —— viewProj 保持原样。
-      //
-      // XY 都取负：视差是「朝指针方向看」——近景与鼠标反向漂。正号会让层
-      // 跟着指针走，观感反了。Y 额外对应 origin Y-up 翻转
-      // （worldY = projH - (origin.y + fy * sy)）。不要改 f(d) 本身，
-      // 也不要翻 g_ParallaxPosition（shader 要的是和指针一样的 Y-down [0,1]）。
-      layerParallaxScaleX = -(rawOffX * damp)
-      layerParallaxScaleY = -(rawOffY * damp)
+
+      if (parallaxCtx.mode === 'mirage') {
+        // Mirage（SceneUniformBinder.cpp:260-292）：mouse 直接乘 ortho×influence；
+        // 层位移含 (origin−center) 静态项；depth 直接乘；无封顶。
+        // 仅白名单壁纸（3233141951 等）启用——全库默认走下方 legacy。
+        parallaxCtx.mx = (0.5 - parallaxState.sx) * cam.projW * influence
+        parallaxCtx.my = (parallaxState.sy - 0.5) * cam.projH * influence
+        parallaxCtx.amount = amount
+        parallaxCtx.cx = cam.projW / 2
+        parallaxCtx.cy = cam.projH / 2
+        parallaxCtx.lx = 0
+        parallaxCtx.ly = 0
+      } else {
+        // Legacy（全库默认）：相机固定，第 i 层平移 +(d/2)×parOff。
+        // depth=0 → 完全不动（2974757317 全 depth=0 回归基准）；
+        // 60px 封顶：amount→px 比例无从考证，统一压到「几十像素轻微浮动」。
+        // XY 都取负：「朝指针方向看」——近景与鼠标反向漂。
+        const strength = amount * influence
+        const PARALLAX_MAX_PX = 60
+        const rawOffX = parallaxState.sx * strength * cam.viewW
+        const rawOffY = parallaxState.sy * strength * cam.viewH
+        const over = Math.max(Math.abs(rawOffX), Math.abs(rawOffY)) / PARALLAX_MAX_PX
+        const damp = over > 1 ? 1 / over : 1
+        parallaxCtx.lx = -(rawOffX * damp)
+        parallaxCtx.ly = -(rawOffY * damp)
+        parallaxCtx.mx = 0
+        parallaxCtx.my = 0
+        parallaxCtx.amount = 0
+      }
+      parallaxCtx.active = true
+    } else {
+      parallaxCtx.active = false
+      parallaxCtx.lx = 0
+      parallaxCtx.ly = 0
     }
 
     // [we-scene patch] camerashake：相机整体抖动（全库 5 个场景开启）。
@@ -2898,7 +2929,7 @@ export function createRenderer(canvas, opts = {}) {
     //
     // Transparency=Preserve（combo 0）没有旗标时也走这条：shader 写 alpha=scene.a，
     // 空画布下音条不可见。见 layerWantsPreserveBackdrop。
-    const usePassthrough = (!!layer.passthrough || !!layer.isPostProcess || layerWantsPreserveBackdrop(layer)) && !layer.groupTex && !texObj && !isPuppet
+    const usePassthrough = (!!layer.passthrough || !!layer.isPostProcess || layerWantsPreserveBackdrop(layer) || layerWantsComposeBackdrop(layer)) && !layer.groupTex && !texObj && !isPuppet
     // puppet 层的层内容尺寸由 size 决定（网格坐标即层局部像素），而非贴图尺寸。
     // 空内容层（容器效果画布/纯效果层，无 textureName）同理：效果链 FBO 必须
     // 按图层 size 分配，否则会退化成 1×1，波形/音频条/光效被压缩成一个像素。
@@ -3092,10 +3123,23 @@ export function createRenderer(canvas, opts = {}) {
       // 纹素表里**没有条目**时（媒体被禁用、没有测试源），回落到作者写在原槽里的
       // 内置封面（parse 的 textureFallbacks）。有占位/测试封面（generated）时不回落
       // —— 那是优先级里的第二级。
+      //
+      // [we-scene patch] **不限于 `$` 保留名**：`usertextures` 同样可以把槽绑到
+      // **场景用户属性**上（`{name:"custombackground"}`，属性类型 file/scenetexture）。
+      // parse 已经把槽名换成属性名、原槽贴图存进 textureFallbacks。属性没被用户
+      // 改过（值为 ""）时纹素表里既没有属性名、也没有别的回落点 —— 这个槽就落
+      // `resolveTextureName` 的 whiteTex 兜底。而 whiteTex 在 blend 这类效果里
+      // 是**实打实的白色输入**：`BLENDMODE 0` = Normal，`albedo.rgb = blendColor.rgb`
+      // 直接把整屏刷白（2067939514 的「Solid」是 1920×1080 全屏背景层，一白就是整屏）。
+      // 全库 22 张有 pass 级 usertextures，其中 10 张绑的是属性名而非 `$` 保留名。
+      //
+      // 判据是「**纹素表里查不到这个名字**」而不是「名字以 $ 开头」：封面那三级
+      // 优先级靠 `textures.get('$mediaThumbnail')` 是否存在来判定，属性纹理将来若
+      // 由宿主按属性名注册进纹素表（用户选了自定义图）也走同一条短路。
       if (ov && Array.isArray(ov.textureFallbacks)) {
         for (let i = 0; i < mergedTex.length; i++) {
           const nm = mergedTex[i]
-          if (typeof nm !== 'string' || nm.charCodeAt(0) !== 36 /* $ */) continue
+          if (typeof nm !== 'string' || nm === '') continue
           if (textures && textures.get(nm)) continue
           const fb = ov.textureFallbacks[i]
           if (fb) mergedTex[i] = fb
@@ -3196,8 +3240,10 @@ export function createRenderer(canvas, opts = {}) {
       const resolutions = new Map()
       const usedUnits = new Set()
       for (let ti = 0; ti < maxTex; ti++) {
-        let name = ti < texNames.length ? texNames[ti] : null
-        if (ov && ov.textures && ov.textures[ti] !== undefined && ov.textures[ti] !== null) name = ov.textures[ti]
+        // 本槽的名字 = 上面合并好的 mergedTex（含 `$` 保留名 / 用户属性名的原槽回落）。
+        // 这里曾经按 mp.textures / ov.textures 重新推一遍，与 mergedTex 是同一段逻辑的
+        // 两份实现 —— 回落只写进 mergedTex 时，真正绑纹理的这一路就永远拿不到它。
+        let name = mergedTex[ti] !== undefined ? mergedTex[ti] : null
         // bind 覆盖：定义在**每个 pass** 上（effect.json 的 passes[i].bind），
         // 由 effects-parse 存进 mp.binds。此前误读效果级的 eff.binds（恒为 undefined），
         // 使 cursorripple 这类多 pass 效果的 bind 全部失效：combine pass 的槽 1
@@ -3407,10 +3453,10 @@ export function createRenderer(canvas, opts = {}) {
     // 相机/对象视差，并在帧内回调其 syncWorld(cam, parOffX, parOffY) 把世界坐标
     // 算回去供脚本/粒子/hit-test 使用。宿主负责挂载与 dispose。
     setPointerProvider: setPointerProvider,
-    // [we-scene patch] 当前帧的对象视差世界位移。hit-test 需要它把「肉眼看到的
-    // 位置」换回图层世界坐标（视差场景下画面相对 cam 窗口整体平移了这么多）。
+    // [we-scene patch] 视差上下文。每层位移由 layerParallaxOffset(layer, ctx)
+    // 按 mode 分发（legacy / mirage）；hit-test 与粒子宿主共用。
     getParallaxOffset: function () {
-      return { x: layerParallaxScaleX, y: layerParallaxScaleY }
+      return parallaxCtx
     },
     // perspective 图层相机眼点（渲染世界坐标），无透视层返回 null。hit-test 用。
     getPerspectiveEye: function () {

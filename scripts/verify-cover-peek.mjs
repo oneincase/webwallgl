@@ -99,7 +99,7 @@ console.log('\n[3] 接线：scene-mount 写基准、shell 按轴门控')
   const mount = fs.readFileSync(join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
   check(/rt\.coverPeek = \{/.test(mount), 'scene-mount 挂载时应写 rt.coverPeek（内容包围盒基准）')
   check(/coverContentBounds\(scene\.layers/.test(mount), 'scene-mount 应用 coverContentBounds(scene.layers) 计算基准')
-  check(/import \{ fitWindow, coverContentBounds \} from "\.\.\/vendor\/we-scene\/render\/math\.js";/.test(mount), 'scene-mount 从 math.js 引入 coverContentBounds')
+  check(/import \{[^}]*coverContentBounds[^}]*\} from "\.\.\/vendor\/we-scene\/render\/math\.js";/.test(mount), 'scene-mount 从 math.js 引入 coverContentBounds')
 
   const mathSrc = fs.readFileSync(join(ROOT, 'renderer/vendor/we-scene/render/math.js'), 'utf8')
   check(/l\.angles\?\.\[2\]/.test(mathSrc), '包围盒必须吃图层 z 旋转（旋转横条的 AABB 换轴）')

@@ -167,13 +167,18 @@ export function parseTex(buf) {
           const vY = f32(buf, off + 28)
           // 轴对齐时 (width,height) 就是 (|uDir|, |vDir|)；旋转帧则交换，
           // 故一律取两个基向量的长度，并保留原始基供渲染端做仿射采样。
+          // [we-scene patch] 某些布局（GIF 导入模板 843532366）的 uDir/vDir 槽位
+          // 存的是 **u32 尺寸**，整数位模式读成 f32 = 1e-43 量级的次正规数 ——
+          // hypot 得到极小正数会骗过下面的 || frameW 回退，这里低于 1e-30 视为无效。
+          const uLen = Math.hypot(uX, uY)
+          const vLen = Math.hypot(vX, vY)
           list.push({
             imageId: f32(buf, off) | 0,
             duration: f32(buf, off + 4),
             x: ox,
             y: oy,
-            width: Math.hypot(uX, uY) || frameW,
-            height: Math.hypot(vX, vY) || frameH,
+            width: (uLen > 1e-30 ? uLen : 0) || frameW,
+            height: (vLen > 1e-30 ? vLen : 0) || frameH,
             // 仿射基（像素单位）。rotated=true 时 u 不再沿 +x，渲染端必须走
             // 「origin + s·uDir + t·vDir」而不能退化成矩形。
             uDir: [uX, uY],

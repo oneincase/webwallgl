@@ -416,11 +416,74 @@ function cross(a, b) {
   return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-// 对象视差深度系数。线性 d/2：
+// 对象视差深度系数。线性 d/2（**仅 legacy 路径**）：
 //   |d|=1 时与旧饱和函数 d/(1+|d|) 同为 0.5，depth=0 仍钉住；
 //   大 depth 按作者写的比例走（2802243144 文字 pd=25 vs 鸟 pd≈1.75 ≈ 14 倍），
 //   不再被饱和压成几乎同一位移。不要给文字层另乘固定倍数。
 export function parallaxDepthFactor(d) {
   const n = Number(d)
   return Number.isFinite(n) ? n * 0.5 : 0
+}
+
+// ---- 视差双路径（2026-09-19 用户拍板）----
+//
+// Mirage 公式（SceneUniformBinder.cpp:260-292）在 3233141951 上对齐人物/挂饰/
+// 粒子，但静态项 (origin−center)×depth×amount 对全库其它壁纸过大
+// （pd 大 / origin 离中心远 → 上千像素），会把已校准的「几十像素浮动」观感打烂。
+// 因此：
+//   · legacy（默认，全库）= 旧近似：offset = (d/2) × parOff，parOff 经 60px 封顶；
+//   · mirage（白名单壁纸）= Mirage 原样，含节点静态项、无 d/2、无封顶。
+// renderer / hittest / 粒子宿主一律走 layerParallaxOffset，改一边必改三边。
+
+/** 走 Mirage 公式的壁纸 ID（其余默认 legacy）。opts.parallaxFormula 可强制覆盖。 */
+export const MIRAGE_PARALLAX_WALLPAPERS = Object.freeze(['3233141951'])
+
+/**
+ * 解析视差公式路径。
+ * @param {{ parallaxFormula?: string, workshopId?: string|number }|null|undefined} opts
+ * @returns {'legacy'|'mirage'}
+ */
+export function resolveParallaxFormula(opts) {
+  const explicit = opts && opts.parallaxFormula
+  if (explicit === 'mirage' || explicit === 'legacy') return explicit
+  const id = opts && opts.workshopId != null ? String(opts.workshopId) : ''
+  if (id && MIRAGE_PARALLAX_WALLPAPERS.includes(id)) return 'mirage'
+  return 'legacy'
+}
+
+/**
+ * Legacy 路径：offset = (d/2) × (ctx.lx, ctx.ly)。
+ * ctx.lx/ly 已是帧级封顶+取负后的 parOff（见 renderer renderScene）。
+ */
+export function legacyParallaxOffset(layer, ctx) {
+  if (!ctx || !ctx.active || !layer.parallaxDepth) return [0, 0]
+  const lx = ctx.lx || 0
+  const ly = ctx.ly || 0
+  if (lx === 0 && ly === 0) return [0, 0]
+  const fx = parallaxDepthFactor(layer.parallaxDepth[0])
+  const fy = parallaxDepthFactor(layer.parallaxDepth[1])
+  return [fx * lx, fy * ly]
+}
+
+/**
+ * Mirage 路径（SceneUniformBinder.cpp:260-292）：
+ *   mouse  = ((0.5 - px) * orthoW, (py - 0.5) * orthoH) * mouseinfluence
+ *   offset = ((origin - camPos) * staticScale + mouse) * depth * amount
+ * camPos = (orthoW/2, orthoH/2)；depth 直接乘；无封顶。
+ */
+export function mirageParallaxOffset(layer, ctx) {
+  if (!ctx || !ctx.active || !layer.parallaxDepth) return [0, 0]
+  const dx = Number(layer.parallaxDepth[0])
+  const dy = Number(layer.parallaxDepth[1])
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return [0, 0]
+  const origin = layer.origin || [0, 0, 0]
+  const ox = ((origin[0] - ctx.cx) * (ctx.staticScale ?? 1) + ctx.mx) * dx * ctx.amount
+  const oy = ((origin[1] - ctx.cy) * (ctx.staticScale ?? 1) + ctx.my) * dy * ctx.amount
+  return [ox, oy]
+}
+
+/** 单一真源分发：按 ctx.mode 选 legacy / mirage。 */
+export function layerParallaxOffset(layer, ctx) {
+  if (!ctx || !ctx.active) return [0, 0]
+  return ctx.mode === 'mirage' ? mirageParallaxOffset(layer, ctx) : legacyParallaxOffset(layer, ctx)
 }

@@ -474,6 +474,35 @@ function neckOf(parent, attName) {
   }
 }
 
+// ---------- 3226487183：无动画图集身体的附着点不能当世界偏移 ----------
+// 抬头身体背景 MDLV0019、无 MDLA，绑定姿势 = 贴图散开。Attachment 在图集
+// (289,-656)，×scale2 把已装配的「抬头拆分」从 parse (1941,1234) 拽到
+// (2519,-77)，jiaose=3 人物错乱。有动画的「默认身体背景」仍必须加偏移。
+{
+  const wp = loadWallpaper(3226487183);
+  if (!wp) {
+    console.log("   skip 3226487183：库中没有该壁纸");
+  } else {
+    attachPuppets(wp.scene, wp.parsed);
+    const face = findLayer(wp.scene, "抬头拆分", "Attachment");
+    const defFace = findLayer(wp.scene, "中间默认主体", "默认身体背景点");
+    check(!!face && !!face.puppet, "3226487183 应有抬头拆分 puppet");
+    check(!!defFace && !!defFace.puppet, "3226487183 应有中间默认主体 puppet");
+    if (face && defFace) {
+      const parseFace = [face.origin[0], face.origin[1]];
+      const parseDef = [defFace.origin[0], defFace.origin[1]];
+      applyAttachmentBindOrigins(wp.scene.layers);
+      const dLook = hypot(face.origin[0] - parseFace[0], face.origin[1] - parseFace[1]);
+      const dDef = hypot(defFace.origin[0] - parseDef[0], defFace.origin[1] - parseDef[1]);
+      check(dLook < 8,
+        `3226487183 抬头拆分不应叠图集附着点，位移 ${dLook.toFixed(0)}px（旧实现 ~1400px → 脸飞出画面）`);
+      check(dDef > 200,
+        `3226487183 中间默认主体仍应叠默认身体的装配附着点，位移 ${dDef.toFixed(0)}px（误跳过则脸停在胸口）`);
+      console.log(`   3226487183: 抬头脸位移 ${dLook.toFixed(1)}px / 默认脸位移 ${dDef.toFixed(1)}px`);
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`\nverify-attachments：${errors.length} 项失败`);
   process.exit(1);

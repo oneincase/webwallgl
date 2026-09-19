@@ -236,6 +236,13 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
           if (k >= 3 && k <= 5) {
             if (d > Math.PI) d -= 2 * Math.PI
             else if (d < -Math.PI) d += 2 * Math.PI
+          } else if (k >= 6) {
+            // 加算缩放：rest≈0 时 (sampled−0) 会把替换层已是 1 的眼睛再加一次 → 2× 拉长
+            //（3226487183「眨眼」骨 37/40/41 kf0 sy=0，眨眼瞬间 sy→1）。
+            // 采样值爆炸（同 clip 骨 56 sx=-7）是录制穿越 0 的符号翻转，不能当增量。
+            // 跳过这两类，合法的闭眼缩放（rest=1、sampled→0.03，骨 43）仍生效。
+            if (!(Math.abs(rest[k]) > 1e-3)) continue
+            if (Math.abs(smp[k]) > 3 && Math.abs(rest[k]) < 1.5) continue
           }
           addDelta[k] += d * w
         }
@@ -364,6 +371,30 @@ export function attachmentBind(mdl, name) {
   return null
 }
 
+/**
+ * 网格 UV 是否与层矩形坐标 1:1（MDLV0019 puppet-warp：顶点画在贴图图集布局上）。
+ * 无动画时绑定姿势 = 图集散开，MDAT 附着点也是图集坐标，不能当世界偏移。
+ */
+function puppetUvMatchesLayout(mdl, size) {
+  if (!mdl || !mdl.uvs || !mdl.positions || !size) return false
+  const W = size[0]
+  const H = size[1]
+  if (!(W > 0 && H > 0) || mdl.vertexCount < 3) return false
+  const n = Math.min(mdl.vertexCount, 48)
+  const step = Math.max(1, (mdl.vertexCount / n) | 0)
+  let err = 0
+  let count = 0
+  for (let i = 0; i < mdl.vertexCount; i += step) {
+    const x = mdl.positions[i * 3]
+    const y = mdl.positions[i * 3 + 1]
+    const eu = Math.abs(mdl.uvs[i * 2] - (x + W / 2) / W)
+    const ev = Math.abs(mdl.uvs[i * 2 + 1] - (H / 2 - y) / H)
+    err += Math.max(eu, ev)
+    count++
+  }
+  return count > 0 && err / count < 1e-3
+}
+
 /** 父层网格空间偏移 → 场景 origin 空间（Y-up）。旋转约定与 parse.js 父子合并逐字相同。 */
 export function parentMeshToWorldDelta(parent, dx, dy) {
   const ang = parent && parent.angles ? parent.angles[2] || 0 : 0
@@ -421,7 +452,12 @@ export function applyAttachmentBindOrigins(layers) {
     if (!bindM) continue
     const bx = bindM[12]
     const by = bindM[13]
-    const d = parentMeshToWorldDelta(parent, bx, by)
+    // 无动画的图集布局 puppet：绑定附着点是贴图散开位（3226487183 抬头身体
+    // Attachment 在 (289,-656)），加上去会把已装配的脸拽到画外。有动画时
+    // follow 会用「当前−绑定」把挂件收到装配姿势，必须保留这份偏移。
+    const atlasBind = !(parent.puppet.animations && parent.puppet.animations.length) &&
+      puppetUvMatchesLayout(parent.puppet, parent.size)
+    const d = atlasBind ? [0, 0] : parentMeshToWorldDelta(parent, bx, by)
     const desc = []
     collectDesc(layer, desc)
     layer.origin[0] += d[0]

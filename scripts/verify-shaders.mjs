@@ -287,6 +287,59 @@ const HLSL_LEFTOVERS = [
 
 // ---------- 主流程 ----------
 
+/**
+ * 找出「复合赋值右侧顶层是布尔表达式」的语句：`x += a < b;` / `x *= a && b;`。
+ *
+ * HLSL 把 bool 隐式提升成 0/1，GLSL ES 报
+ * `'assign' : cannot convert from 'bool' to 'highp float'`；renderLayer 对编译失败
+ * 只 console.warn 后跳过**整个效果** —— 症状是「效果静默消失、画面没有任何报错」。
+ * Simple_Audio_Bars 靠这两行裁掉圆形可视化的多余半边，2067939514（ICUE）的
+ * 12 个 Bar 层曾整片空掉（页面上完全看不到音频条）。
+ *
+ * 判定与转译器**互不共享代码**：它检查的是「产物必须是合法 GLSL」，而不是把转译
+ * 公式再算一遍（后者等于没有断言）。已由真实 WebGL 编译交叉验证：
+ * /bench/shader-compile.html 上 2067939514 由 13/16 → 16/16，全库 1168/1193 → 1171/1193。
+ */
+function boolTailSites(glsl) {
+  const topLevelBool = (expr) => {
+    let d = 0;
+    for (let i = 0; i < expr.length; i++) {
+      const c = expr[i];
+      if (c === "(" || c === "[") { d++; continue; }
+      if (c === ")" || c === "]") { d--; continue; }
+      if (d !== 0) continue;
+      if (c === "?" || c === "#") return false; // 顶层三元：类型来自两个分支
+      if ((c === "&" || c === "|") && expr[i + 1] === c) return true;
+      if (c === "<" || c === ">") {
+        if (expr[i + 1] === c) { i++; continue; } // << / >> 是位移，不是比较
+        return true;
+      }
+      if (c === "=" && expr[i + 1] === "=") return true;
+      if (c === "!" && expr[i + 1] === "=") return true;
+    }
+    return false;
+  };
+  const stmts = [];
+  let start = 0;
+  let depth = 0;
+  for (let i = 0; i < glsl.length; i++) {
+    const c = glsl[i];
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth--;
+    else if (c === ";" && depth === 0) { stmts.push(glsl.slice(start, i)); start = i + 1; }
+  }
+  stmts.push(glsl.slice(start));
+  const sites = [];
+  for (const st of stmts) {
+    if (/[{}]/.test(st)) continue;
+    const m = /^\s*([A-Za-z_]\w*(?:\.\s*[A-Za-z_]\w*)*)\s*([-+*/]=)([\s\S]+)$/.exec(st);
+    if (!m) continue;
+    const rhs = m[3].trim();
+    if (topLevelBool(rhs)) sites.push(`${m[1]} ${m[2]} ${rhs.slice(0, 70)}`);
+  }
+  return sites;
+}
+
 function collectShaderJobs(pkg) {
   // effect → material → shader（+ 每 pass 的 combos），与 effects-parse.js 同路径
   const jobs = [];
@@ -386,6 +439,8 @@ const undefAgg = new Map(); // symbol -> { files:Set, wallpapers:Set }
 const macroAgg = new Map();
 const leftoverAgg = new Map();
 const structAgg = [];
+// 复合赋值右侧的布尔表达式（转译产物里的非法 GLSL）：key = 语句形态，value = 出现处
+const boolTailAgg = new Map();
 const includeMissing = new Map();
 const failedWallpapers = new Set();
 const scannedWallpapers = new Set();
@@ -482,6 +537,13 @@ for (const item of items) {
         structAgg.push(`${item} ${label}: ${iss}`);
       }
 
+      // 语法合法性：复合赋值右侧不得是布尔表达式（bool→float 隐式转换，GLSL ES 非法）
+      for (const site of boolTailSites(code)) {
+        clean = false;
+        if (!boolTailAgg.has(site)) boolTailAgg.set(site, new Set());
+        boolTailAgg.get(site).add(`${item} ${label}`);
+      }
+
       if (clean) okShaders++;
       else failedWallpapers.add(item);
     }
@@ -522,6 +584,12 @@ if (structAgg.length) {
   console.log(`\n[结构性问题] ${structAgg.length} 处`);
   for (const s of structAgg.slice(0, 20)) console.log("    " + s);
   if (structAgg.length > 20) console.log(`    …另有 ${structAgg.length - 20} 处`);
+}
+if (boolTailAgg.size) {
+  console.log(`\n[布尔尾随赋值] ${boolTailAgg.size} 种形态（GLSL ES 非法，整条效果会被跳过）`);
+  for (const [site, where] of [...boolTailAgg.entries()].slice(0, 20)) {
+    console.log(`    ${where.size} 处${site}`);
+  }
 }
 
 const wireErrors = [];
@@ -930,6 +998,124 @@ const wireErrors = [];
   for (const [label, src, want] of guards) {
     const g = hlsl2glsl(src, "frag", {}, () => null);
     if (!want.test(g)) wireErrors.push(`条件语句里的比较不得被包 float()（${label}）`);
+  }
+}
+
+// ---------- audioValue varying 钳制（3737267090 条动画缺失） ----------
+// 示波器把频谱塞进 varying vec4 audioValue[N]；Android 路径 RES=32 → N=28，
+// 加上 v_TexCoord/Persp/View 共 31 槽，桌面 ANGLE MAX_VARYING_VECTORS=30 链接失败
+// →「跳过效果」→ 属性「条」开着画面上没有波形。转译器必须把 N 与 bufferRes 钳到 ≤24。
+{
+  const hlslSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hlsl2glsl.js"), "utf8");
+  if (!/AUDIO_VARYING_CAP\s*=\s*24/.test(hlslSrc) || !/audioValue/.test(hlslSrc)) {
+    wireErrors.push("hlsl2glsl 必须钳制 audioValue varying 数组（AUDIO_VARYING_CAP=24）");
+  }
+  const oscPkgPath = join(LIB, "3737267090", "scene.pkg");
+  if (!fs.existsSync(oscPkgPath)) {
+    console.log("  （跳过 3737267090 语料：本机无此壁纸）");
+  } else {
+    const pkg = parsePkg(fs.readFileSync(oscPkgPath));
+    const vert = getEntry(pkg, "shaders/workshop/2799421411/effects/audio_responsive_oscilloscope.vert");
+    const frag = getEntry(pkg, "shaders/workshop/2799421411/effects/audio_responsive_oscilloscope.frag");
+    const resolver = makeResolver(pkg);
+    const combos = { GLOW: 1, SUPPRESS: 1 }; // 本墙默认 RESOLUTION=32
+    const vGlsl = hlsl2glsl(readText(vert), "vert", combos, resolver, readText(frag));
+    const fGlsl = hlsl2glsl(readText(frag), "frag", combos, resolver, readText(vert));
+    const sizes = [...`${vGlsl}\n${fGlsl}`.matchAll(/audioValue\s*\[\s*(\d+)\s*\]/g)].map((m) => Number(m[1]));
+    if (!sizes.length) {
+      wireErrors.push("3737267090 oscilloscope 转译后应保留 audioValue 数组");
+    }
+    for (const n of sizes) {
+      if (!(n <= 24)) {
+        wireErrors.push(`audioValue[${n}] 必须 ≤24（否则 ANGLE 装不下 varying，条动画被跳过）`);
+      }
+    }
+    if (/audioValue\s*\[\s*(?:28|60|32)\s*\]/.test(vGlsl + fGlsl)) {
+      wireErrors.push("audioValue 不得残留未钳制的 28/32/60（改坏钳制即红）");
+    }
+    // RES=64 作者写 60，同样必须钳住
+    const v64 = hlsl2glsl(readText(vert), "vert", { RESOLUTION: 64 }, resolver, readText(frag));
+    const n64 = [...v64.matchAll(/audioValue\s*\[\s*(\d+)\s*\]/g)].map((m) => Number(m[1]));
+    if (n64.some((n) => n > 24)) {
+      wireErrors.push(`RESOLUTION=64 的 audioValue 必须 ≤24，实得 [${n64}]`);
+    }
+    console.log(`  oscilloscope varying 钳制：默认 ${sizes.join("/")}，RES64 ${n64.join("/") || "—"}`);
+  }
+}
+
+// ---------- 复合赋值右侧的布尔表达式（2067939514 音频条整条效果被跳过） ----------
+// 三条互补规则里的第三条：10c 认「已声明的 bool 变量名」、10c-2 认「括号里的比较」，
+// 本条认「比较/逻辑直接写在复合赋值右侧、没有括号」。转译器不补这条时产物是非法
+// GLSL，renderLayer 只 warn 后跳过**整个效果**。
+{
+  // ① 真实语料：2067939514 的 Simple_Audio_Bars（SHAPE=4）两处都必须被包 float()
+  const barsPkg = join(LIB, "2067939514", "scene.pkg");
+  if (!fs.existsSync(barsPkg)) {
+    console.log("  （跳过 2067939514 语料：本机无此壁纸）");
+  } else {
+    const pkg = parsePkg(fs.readFileSync(barsPkg));
+    const sj = JSON.parse(readText(getEntry(pkg, "scene.json")));
+    const combosList = [];
+    for (const o of sj.objects || []) {
+      for (const e of o.effects || []) {
+        if (!String(e.file || "").includes("Simple_Audio_Bars")) continue;
+        for (const p of e.passes || []) combosList.push(p.combos || {});
+      }
+    }
+    if (!combosList.length) {
+      wireErrors.push("2067939514 应挂 Simple_Audio_Bars 效果（语料前提）");
+    }
+    const frag = getEntry(pkg, "shaders/workshop/2084198056/effects/Simple_Audio_Bars.frag");
+    if (!frag) {
+      wireErrors.push("2067939514 包内应含 Simple_Audio_Bars.frag");
+    } else {
+      const resolver = makeResolver(pkg);
+      let minWrapped = Infinity;
+      for (const cb of combosList) {
+        const out = hlsl2glsl(readText(frag), "frag", cb, resolver);
+        const wrapped = (out.match(/[-+*/]= float\(/g) || []).length;
+        minWrapped = Math.min(minWrapped, wrapped);
+        for (const site of boolTailSites(out)) {
+          wireErrors.push(`2067939514 ${JSON.stringify(cb)} 残留布尔尾随赋值：${site}`);
+        }
+      }
+      if (!(minWrapped >= 2)) {
+        wireErrors.push(`2067939514 Simple_Audio_Bars 每组 combos 至少 2 处需包 float()，实得 ${minWrapped}`);
+      }
+    }
+  }
+  // ② 反例：bool 目标、以及右侧带顶层三元的写法不得被改写
+  //（3577990983/3573886911 frame_builder 的 notchEnabled / notch 就是这两种形态，
+  //  包成 float() 反而会把本来能编过的 shader 写坏）
+  const neg = hlsl2glsl(
+    [
+      "uniform float u_Notch3;",
+      "uniform vec2 v_TexCoord;",
+      "uniform vec2 quadrant;",
+      "void main() {",
+      "  bool notchEnabled = false;",
+      "  float notch = 1.0;",
+      "  notchEnabled = v_TexCoord.x > 0.0 && v_TexCoord.y > 0.0 ? u_Notch3 : notchEnabled;",
+      "  notch = v_TexCoord.x == quadrant.x && v_TexCoord.y == quadrant.y ? notch : -1e5;",
+      "  gl_FragColor = vec4(notch, notchEnabled ? 1.0 : 0.0, 0.0, 1.0);",
+      "}",
+    ].join("\n"),
+    "frag",
+    {},
+    () => null,
+  );
+  if (/notchEnabled = float\(/.test(neg)) {
+    wireErrors.push("bool 目标的赋值不得被包 float()（frame_builder 的 notchEnabled）");
+  }
+  if (/notch = float\(/.test(neg)) {
+    wireErrors.push("右侧带顶层三元的赋值不得被包 float()（类型来自分支，不是条件）");
+  }
+  if (!/notchEnabled = v_TexCoord\.x > 0\.0/.test(neg)) {
+    wireErrors.push("反例语句必须原样保留（改坏了说明规则过宽）");
+  }
+  // ③ 全库：转译产物里不得残留该形态（boolTailAgg 在主循环里收集）
+  if (boolTailAgg.size) {
+    wireErrors.push(`全库仍有 ${boolTailAgg.size} 种布尔尾随赋值形态（GLSL 编不过，整条效果被跳过）`);
   }
 }
 
@@ -1546,7 +1732,7 @@ if (wireErrors.length) {
   for (const e of wireErrors) console.log("    " + e);
 }
 
-const bad = includeMissing.size + undefAgg.size + macroAgg.size + leftoverAgg.size + structAgg.length + wireErrors.length;
+const bad = includeMissing.size + undefAgg.size + macroAgg.size + leftoverAgg.size + structAgg.length + boolTailAgg.size + wireErrors.length;
 if (listUndefined) process.exit(0);
 if (bad === 0) {
   console.log("\n全部通过");

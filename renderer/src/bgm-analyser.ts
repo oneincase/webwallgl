@@ -50,6 +50,10 @@ export function createBgmAnalyser(): BgmAnalyser {
       analyser = ctx.createAnalyser();
       analyser.fftSize = FFT;
       analyser.smoothingTimeConstant = 0.8;
+      // 动态余量：默认 maxDecibels=-30 会把响度大的母带低频钉在 255（应用层
+      // 增益只能 ≤1，见 scene-mount BGM_SPECTRUM_GAIN），抬到 -25 让强段保留
+      // 一点起伏。
+      analyser.maxDecibels = -25;
       freq = new Uint8Array(analyser.frequencyBinCount);
       return true;
     } catch {

@@ -73,6 +73,84 @@ function collectIntNames(code) {
   return names
 }
 
+/**
+ * [we-scene patch] 表达式在**顶层**（括号深度 0）是不是布尔类型。
+ *
+ * 判据：顶层的比较（`< <= > >= == !=`）或逻辑（`&& ||`）运算符 —— 它们的优先级
+ * 低于算术，只要出现在顶层，整个表达式就是 bool。反例（都要返回 false）：
+ *   - 顶层 `?:`：三元表达式的类型来自**两个分支**，条件是不是 bool 无关；
+ *   - `<<` / `>>`：位移是算术，不是比较；
+ *   - 运算符写在括号里（`(a < b) * 6.0`）：那是已有的 10c-2 管的事，整体类型是数值。
+ */
+function topLevelBoolExpr(expr) {
+  let depth = 0
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i]
+    if (c === '(' || c === '[') { depth++; continue }
+    if (c === ')' || c === ']') { depth--; continue }
+    if (depth !== 0) continue
+    if (c === '?' || c === '#') return false
+    if ((c === '&' || c === '|') && expr[i + 1] === c) return true
+    if (c === '<' || c === '>') {
+      // `<<` / `>>` 是位移；`<=` / `>=` 是比较
+      if (expr[i + 1] === c) { i++; continue }
+      return true
+    }
+    if (c === '=' && expr[i + 1] === '=') return true
+    if (c === '!' && expr[i + 1] === '=') return true
+  }
+  return false
+}
+
+/**
+ * [we-scene patch] **复合赋值右侧整体是布尔表达式**：`x += a < b;` / `x *= a && b;`
+ *
+ * HLSL 把 bool 隐式提升成 0/1，GLSL ES 报
+ * `'assign' : cannot convert from 'bool' to 'highp float'`；renderLayer 对编译失败
+ * 只 console.warn 后跳过**整个效果** —— 症状是「效果静默消失、无报错」。
+ * Simple_Audio_Bars（workshop/2084198056）就靠这两行裁掉圆形/扇形可视化的多余
+ * 半边，SHAPE=4 时整条音频条 pass 不出现（2067939514 的 16 个 Bar 层全空）。
+ *
+ * 与同族两条规则的分工（三条互补，都不动对方的地盘）：
+ *   - 10c   只认**已声明的 bool 变量名**：`x *= isLeftChannel;`
+ *   - 10c-2 只认**括号里的比较**参与算术：`x *= (a < b) * 6.0;`
+ *   - 本条补第三种形态：比较/逻辑直接写在赋值右侧、**没有括号**。
+ *
+ * 只处理复合赋值（`+= -= *= /=`）：bool 没有复合赋值，目标必然是数值，
+ * `float(布尔表达式)` 在 GLSL ES 3.0 是合法的标量转换。`=` 一律不动 ——
+ * 目标可能是 bool，3573886911/frame_builder 的
+ * `notchEnabled = a > 0.0 && b > 0.0 ? u_Notch3 : notchEnabled;` 就是 bool 目标
+ * （且带顶层三元），包成 float 反而把能编的写成编不过的。
+ */
+function rewriteBoolTailAssignments(code, boolNames) {
+  const rewriteStmt = (stmt) => {
+    // `{`/`}` 在语句里 = for/if 头或块，形态复杂，不碰
+    if (/[{}]/.test(stmt)) return stmt
+    const m = /^(\s*)([A-Za-z_]\w*(?:\.\s*[A-Za-z_]\w*)*)\s*([-+*/]=)([\s\S]+)$/.exec(stmt)
+    if (!m) return stmt
+    const [, indent, lvalue, op, rhsRaw] = m
+    const rhs = rhsRaw.trim()
+    if (!rhs) return stmt
+    // 防御：目标是本文件声明过的 bool（正常不该出现，出现了说明形态超出本规则）
+    if (boolNames.has(lvalue.split('.')[0])) return stmt
+    if (!topLevelBoolExpr(rhs)) return stmt
+    return indent + lvalue + ' ' + op + ' float(' + rhs + ')'
+  }
+  let out = ''
+  let start = 0
+  let depth = 0
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i]
+    if (c === '(' || c === '[') depth++
+    else if (c === ')' || c === ']') depth--
+    else if (c === ';' && depth === 0) {
+      out += rewriteStmt(code.slice(start, i)) + ';'
+      start = i + 1
+    }
+  }
+  return out + rewriteStmt(code.slice(start))
+}
+
 function rewriteCall(text, callName, fn) {
   let out = ''
   let i = 0
@@ -159,6 +237,27 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   const effective = { GLSL: 1, ...defaults, ...(combos || {}) }
   let code = preprocess(src, effective, includeResolver, 0)  // 展开本文件保留的宏（#define 行仍在，GLSL 预处理器会展开；但函数宏在 GLSL ES 也支持，
   // 为稳妥起见用 JS 预展开，然后移除 #define 行）
+
+  // [we-scene patch] **钳制 audioValue varying 数组长度**。
+  // audio_responsive_oscilloscope 把频谱打进 `varying vec4 audioValue[N]`，再加
+  // v_TexCoord / v_PerspCoord / v_ViewCoord（约 3 槽）。作者 Android 路径 RES=32
+  // 用 N=28（按 MAX_VARYING_VECTORS=32 留 4 槽）；桌面 ANGLE 常报 30，28+3=31
+  // → 链接失败 `Could not pack varying v_TexCoord`，整条「条」效果被跳过
+  // （3737267090）。RES=64 的 N=60 在 WebGL 上更不可能装下。
+  // 频谱跨全屏 quad 恒定、不需要插值，砍到 24 只少高频采样点，条仍会动。
+  // 必须在 expandMacrosIn 之前改 `#define bufferRes`，循环边界才会跟着变。
+  {
+    const AUDIO_VARYING_CAP = 24
+    code = code.replace(
+      /(#define\s+bufferRes\s+)(\d+)/g,
+      (_, a, n) => a + Math.min(Number(n), AUDIO_VARYING_CAP),
+    )
+    code = code.replace(
+      /(\b(?:varying|out|in)\s+vec4\s+audioValue\s*\[\s*)(\d+)(\s*\])/g,
+      (_, a, n, b) => a + Math.min(Number(n), AUDIO_VARYING_CAP) + b,
+    )
+  }
+
   code = expandMacrosIn(code, 20)
   code = code.replace(/^[ \t]*#define[^\n]*\n?/gm, '')
 
@@ -936,6 +1035,20 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       new RegExp('([-+*/]=\\s*)' + CMP.source, 'g'),
       (all, assign, lhs, op, rhs) => `${assign}float(${lhs.trim()} ${op} ${rhs.trim()})`,
     )
+  }
+
+  // 10c-3) [we-scene patch] **无括号的比较/逻辑写在复合赋值右侧**：
+  //    `shapeCoord.x += endAngle - startAngle < 0.0;`
+  //    `bar *= shapeCoord.x > 0.0 && shapeCoord.x * sign(a) < 1.0;`
+  //    10c 要有已声明的 bool 变量名、10c-2 要有括号，这两种形态两条都不认，
+  //    于是 `'assign' : cannot convert from 'bool' to 'highp float'`，
+  //    Simple_Audio_Bars（SHAPE=4，2067939514 的 16 个 Bar 层）整条效果被跳过。
+  //    「目标是 bool 就别包」的守卫在 helper 里（frame_builder 的 notchEnabled）。
+  {
+    const boolNames = new Set()
+    // 同时收 `bool x = …;`、`bool x;`、`bool x = a && b;`
+    for (const bm of code.matchAll(/\bbool\s+([A-Za-z_]\w*)\s*(?=[=;,)\[])/g)) boolNames.add(bm[1])
+    code = rewriteBoolTailAssignments(code, boolNames)
   }
 
   // 10d) [we-scene patch] **float 一维数组的二维下标**。

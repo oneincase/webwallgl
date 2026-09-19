@@ -13,7 +13,7 @@ import { normalizeQuality, particleQualityScale, postFboCapFactor, type Resolved
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
-import { fitWindow, coverContentBounds } from "../vendor/we-scene/render/math.js";
+import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, audioMod } from "./vendor";
 import {
   flattenUserProperties,
@@ -99,10 +99,12 @@ function scalarFieldSlot(layer: any, field: string): { get: () => number; set: (
   };
 }
 
-// [we-scene patch] BGM 频谱并入增益：getByteFrequencyData 的峰值普遍偏低
-// （音乐平均能量远低于底鼓瞬态），与模拟源 GAIN=3.2 的观感对齐，音条才会
-// 明显摆动；逐段 min(1) 防爆。实测多数 BGM 峰值 0.2~0.5，×2 后 0.4~1。
-const BGM_SPECTRUM_GAIN = 2.0;
+// [we-scene patch] BGM 频谱并入增益。getByteFrequencyData 是 dB 映射线标
+// （(dB+100)/70），压缩母带播放时绝大多数频段 ≥0.5（≈-65dB 以上，噪声底都
+// 在这之上）——旧增益 ×2 后 `min(1)` 把几乎全部频段钳到 1，音量一开音频响应
+// 就是一条满幅直线（静音回落模拟源才正常，用户实测）。增益必须 ≤1 保住动态：
+// 低频段偶尔贴 1 属正常可视化行为，中高频随音乐起伏。
+const BGM_SPECTRUM_GAIN = 1.0;
 
 /**
  * [we-scene patch] 构造本场景全部脚本共享的 localStorage（P1-2）。
@@ -372,7 +374,14 @@ cfg, source, pkgAbort.signal);
       // 标记已创建上下文，供 ensureSceneCanvas 复用前检测丢失状态
       c.setAttribute("data-webwallgl-gl", "1");
 
-      const sceneEntry = pkg.getEntry(parsedPkg, "scene.json");
+      // 场景描述条目：常规工程是 scene.json；WE 的 GIF 场景模板工程编译产物
+      // 叫 gifscene.json（project.json 的 file 指向 gifscene.json，见 843532366），
+      // 少数放进 scenes/ 子目录。getEntry 是精确匹配，逐个候选回退。
+      const sceneEntry =
+        pkg.getEntry(parsedPkg, "scene.json") ??
+        pkg.getEntry(parsedPkg, "gifscene.json") ??
+        pkg.getEntry(parsedPkg, "scenes/scene.json") ??
+        pkg.getEntry(parsedPkg, "scenes/gifscene.json");
       if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
       const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
       // 宿主覆盖清屏色。场景作者按「铺满 PC 全屏」设 clearcolor，不少填的是浅灰；
@@ -470,6 +479,9 @@ cfg, source, pkgAbort.signal);
         // 最后放大回屏幕，就在网格交界处（如 3113287126 头发与手臂交汇）看到发虚透明。
         // 代价：该场景效果链 FBO 由 3.5MB 升到约 100MB。
         fboCapFactor: 0,
+        // 视差公式：默认 legacy（全库）；3233141951 等白名单走 mirage（见 math.js）。
+        workshopId: cfg.src,
+        parallaxFormula: (cfg as { parallaxFormula?: string }).parallaxFormula,
       });
       // 立即登记渲染器：即使后续异步加载中途被 clear(rt)，也能正确释放该 WebGL 上下文
       rt.renderer = renderer;
@@ -1211,6 +1223,74 @@ cfg, source, pkgAbort.signal);
           return null;
         }
         const parsedTex = tex.parseTex(texEntry);
+        // [we-scene patch] 多图 .tex（GIF 导入模板 843532366 等）：WE 把动图逐帧
+        // 编译成多个 image（每张 POT 画布 2048x1024，内容在左上
+        // textureWidth x textureHeight）。WE 桌面端轮播这些 image 实现动画。
+        // 这里裁出每帧内容区，先同步传首帧，再按固定节奏 texSubImage2D **原地**
+        // 换像素 —— 消费方装配期抓的是 glTex 句柄，动画不能换对象。
+        // 时长：TEXS 帧表与 image 数对不上（模板实测 64 项 vs 6 图），取 100ms/帧。
+        if (!parsedTex.isVideo && parsedTex.images && parsedTex.images.length > 1) {
+          const contentW = parsedTex.textureWidth || parsedTex.width;
+          const contentH = parsedTex.textureHeight || parsedTex.height;
+          if (contentW > 0 && contentH > 0 && contentW * contentH <= 4096 * 4096) {
+            const gl = renderer.gl as WebGL2RenderingContext;
+            const frameData: Uint8Array[] = [];
+            try {
+              for (const img of parsedTex.images) {
+                const m0 = img[0];
+                if (!m0 || m0.data === undefined || m0.compression !== 0) throw new Error("skip");
+                const rowBytes = m0.width * 4;
+                const cropped = new Uint8Array(contentW * contentH * 4);
+                for (let y = 0; y < contentH; y++) {
+                  cropped.set(
+                    m0.data.subarray(y * rowBytes, y * rowBytes + contentW * 4),
+                    y * contentW * 4,
+                  );
+                }
+                frameData.push(cropped);
+              }
+            } catch {
+              frameData.length = 0; // 任一帧不合预期 → 走常规单帧路径
+            }
+            if (frameData.length > 1) {
+              const glTex = rnd.makeTexture(gl, frameData[0], contentW, contentH, null);
+              let idx = 0;
+              const timer = window.setInterval(() => {
+                if (disposed || rt.paused) return;
+                idx = (idx + 1) % frameData.length;
+                gl.bindTexture(gl.TEXTURE_2D, glTex);
+                gl.texSubImage2D(
+                  gl.TEXTURE_2D,
+                  0,
+                  0,
+                  0,
+                  contentW,
+                  contentH,
+                  gl.RGBA,
+                  gl.UNSIGNED_BYTE,
+                  frameData[idx],
+                );
+              }, 100);
+              (rt.wallpaperDisposers ??= []).push(() => window.clearInterval(timer));
+              const entry: any = {
+                glTex,
+                width: contentW,
+                height: contentH,
+                rg88: false,
+                generated: true,
+              };
+              entry.declaredWidth = parsedTex.textureWidth;
+              entry.declaredHeight = parsedTex.textureHeight;
+              textures.set(name, entry);
+              reportDiag(
+                rt,
+                cfg,
+                `tex '${name}': animated multi-image, ${frameData.length} frames @ ${contentW}x${contentH}`,
+              );
+              return entry;
+            }
+          }
+        }
         const m = tex.decodeMip0(parsedTex);
         const rg88 = parsedTex.format === 8;
         let entry: any = null;
@@ -1359,6 +1439,11 @@ cfg, source, pkgAbort.signal);
         // 归一化分母必须是图集真实像素尺寸。1444077782 的 .tex 头部声明 316x214
         // （那是单帧尺寸），mip0 实为 2048x1024 —— 用错分母整表错位。
         // 粒子端历史上只吃数组，故保留 list 别名兼容（见 particles.js）。
+        // [we-scene patch] .tex 头部声明的单帧尺寸。entry.width/height 是上传
+        // 图集尺寸（可能被 POT 填充放大到 2048x1024），WE autosize 模型要的是
+        // 头部声明的单帧尺寸（316x214 这类）—— 见图层装配的 autosize 回退。
+        entry.declaredWidth = parsedTex.textureWidth;
+        entry.declaredHeight = parsedTex.textureHeight;
         if (parsedTex.frames?.list?.length) {
           const fl = parsedTex.frames.list as unknown[];
           // 分母跟实际上传尺寸走，不跟 parseTex 的 mip0 声明走：有 TEXS 时
@@ -1368,6 +1453,12 @@ cfg, source, pkgAbort.signal);
           entry.frames = fl;
         }
         textures.set(name, entry);
+        // [临时诊断] 定位 843532366 黑屏：贴图装载的运行时状态
+        reportDiag(
+          rt,
+          cfg,
+          `tex '${name}': ${entry.width}x${entry.height} declared=${entry.declaredWidth}x${entry.declaredHeight} frames=${Array.isArray(entry.frames) ? entry.frames.length : "none"} video=${!!entry.videoCtl}`,
+        );
         return entry;
       };
       const loadTex = (name: string): Promise<any | null> => {
@@ -1457,6 +1548,9 @@ cfg, source, pkgAbort.signal);
           }
           const mat = scn.resolveMaterial(model);
           if (!mat) continue;
+          // cropoffset 不得加进 origin（CASEBOOK 2341 / verify-groups I5c）：
+          // origin 已是最终世界坐标；2477602742 的 Mountain crop.y=−358 等会把
+          // 地面层整块拽开露出 clearcolor 灰带。3233141951 装饰层对齐走 mirage 视差。
           let material: unknown;
           if (eff.BUILTIN_MATERIALS[mat.materialPath]) {
             material = eff.BUILTIN_MATERIALS[mat.materialPath];
@@ -1533,6 +1627,37 @@ cfg, source, pkgAbort.signal);
                   layer.textureName = tn;
                   loadedTex++;
                   if (entry.videoCtl) (layer as any).videoCtl = entry.videoCtl;
+                  // [we-scene patch] WE autosize 模型（GIF 导入模板 843532366 等）：
+                  // 模型/图层都不带尺寸，层尺寸 = 贴图**单帧**尺寸 —— 雪碧图取帧表
+                  // 首帧，普通 .tex 取头部声明尺寸。缺它时 layer.size=[0,0] →
+                  // quad 不可见 → 整屏黑（createLayer 动态建层路径已有同款回退）。
+                  reportDiag(
+                    rt,
+                    cfg,
+                    `autosize gate: model.autosize=${(model as any)?.autosize} size=${layer.size?.[0]}x${layer.size?.[1]}`,
+                  );
+                  if (
+                    (model as any)?.autosize &&
+                    layer.size &&
+                    (layer.size[0] === 0 || layer.size[1] === 0)
+                  ) {
+                    // 帧表是仿射 UV 基（uDirX/vDirY 可为负：旋转/镜像打包的帧），
+                    // 尺寸取绝对值；非法时回退 .tex 头部声明尺寸
+                    const f0 =
+                      Array.isArray(entry.frames) && entry.frames.length ? entry.frames[0] : null;
+                    const fw = Math.abs(Number(f0?.width ?? 0));
+                    const fh = Math.abs(Number(f0?.height ?? 0));
+                    const w = fw > 0 ? fw : Number(entry.declaredWidth || 0);
+                    const h = fh > 0 ? fh : Number(entry.declaredHeight || 0);
+                    if (w > 0 && h > 0) {
+                      layer.size = [w, h];
+                      // [临时诊断]
+                      reportDiag(rt, cfg, `autosize applied: layer.size=${w}x${h}`);
+                    } else {
+                      // [临时诊断]
+                      reportDiag(rt, cfg, `autosize skipped: fw=${fw} fh=${fh} declared=${entry.declaredWidth}x${entry.declaredHeight}`);
+                    }
+                  }
                 }
               }),
             );
@@ -1612,6 +1737,42 @@ cfg, source, pkgAbort.signal);
         }
       }
       await Promise.all(texJobs);
+
+      // [we-scene patch] orthogonalprojection auto（GIF 导入模板等不带
+      // width/height 的工程）：WE 桌面端按**内容边界**取景。贴图装载完成、
+      // autosize 把图层尺寸补齐之后，量出实际内容框写回 ortho 宽高 —— 不做这步
+      // scene 尺寸回落画布大小，480x300 的图层会缩在角落。只处理内容锚定在
+      // 原点 (minX≈0, minY≈0) 的情形（WE 模板坐标即如此）；内容悬在别处的工程
+      // 保持既有画布回退，避免投影原点错位。
+      {
+        const general = (scene as any).general ?? ((scene as any).general = {});
+        const ortho = general.orthogonalprojection ?? (general.orthogonalprojection = {});
+        const explicit = Number(ortho.width) > 0 && Number(ortho.height) > 0;
+        // [临时诊断]
+        {
+          const b0 = coverContentBounds(scene.layers as any[]);
+          reportDiag(
+            rt,
+            cfg,
+            `auto ortho probe: auto=${(ortho as any).auto} explicit=${explicit} bounds=${Math.round(b0.minX)},${Math.round(b0.minY)}..${Math.round(b0.maxX)},${Math.round(b0.maxY)} sizes=${(scene.layers as any[]).map((l) => `${l.size?.[0]}x${l.size?.[1]}`).join("|")}`,
+          );
+        }
+        if (ortho.auto === true && !explicit) {
+          const b = coverContentBounds(scene.layers as any[]);
+          const w = b.maxX - b.minX;
+          const h = b.maxY - b.minY;
+          const anchored = Math.abs(b.minX) < 0.5 && Math.abs(b.minY) < 0.5;
+          if (anchored && Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+            ortho.width = w;
+            ortho.height = h;
+            reportDiag(
+              rt,
+              cfg,
+              `auto ortho: content ${Math.round(w)}x${Math.round(h)}（orthogonalprojection.auto）`,
+            );
+          }
+        }
+      }
 
       // 可见层上的视频纹理才自动起播（WE 默认）。隐藏层（2887099508 安全模式
       // 盖屏视频）等脚本 getVideoTexture().play()；一加载就 play 会被双元素
@@ -1941,6 +2102,20 @@ cfg, source, pkgAbort.signal);
           // 这类系统只有个位数，直接全量同步一次即可。
           for (const ps of particleSystems) {
             if (ps.layer && ps.layer.runtimeCreated) ps.syncLayerTransform();
+          }
+          // [we-scene patch] 对象视差：粒子层不走 layerModelMatrix（渲染回调
+          // 直传 cam/viewProj），宿主每帧按共享 layerParallaxOffset 注入偏移。
+          // ctx 由 renderer 帧循环更新（getParallaxOffset）；legacy/mirage 同构。
+          {
+            const pctx = renderer.getParallaxOffset ? (renderer.getParallaxOffset() as any) : null;
+            for (const ps of particleSystems) {
+              if (!pctx || !pctx.active || !ps.layer || !ps.layer.parallaxDepth) {
+                ps.setParallaxOffset(0, 0);
+              } else {
+                const off = layerParallaxOffset(ps.layer, pctx);
+                ps.setParallaxOffset(off[0], off[1]);
+              }
+            }
           }
           for (const ps of particleSystems) ps.advance(pdt, audioSim.enabled ? activeAudioSnapshot() : null);
           // 首帧后上报一次实际存活粒子数
@@ -3298,11 +3473,10 @@ cfg, source, pkgAbort.signal);
         if (cursorLayers.length === 0) return;
         const p = pointerSrc.state;
         if (!p.has) return;
-        const par = renderer.getParallaxOffset ? renderer.getParallaxOffset() : { x: 0, y: 0 };
+        const par = renderer.getParallaxOffset ? renderer.getParallaxOffset() : null;
         const projH = (scene as any).general?.orthogonalprojection?.height || c.height;
         const hit = hitTest.hitTestLayers(scene.layers, p.wx, p.wy, projH, {
-          parOffX: par.x,
-          parOffY: par.y,
+          parallaxCtx: par,
           alignTable: rnd.ALIGN,
           // perspective 图层走射线-平面求交（无透视层时为 null，命中逻辑不变）
           perspEye: renderer.getPerspectiveEye ? renderer.getPerspectiveEye() : null,

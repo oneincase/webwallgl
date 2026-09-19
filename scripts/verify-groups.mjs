@@ -35,6 +35,8 @@
  *   E. config.passthrough：层的效果链输入应是**背后已渲染的画面**
  *      给空画布会让工坊音频可视化的 rgb 完全不含 bar 形状。
  *      3789131791「Green」糊出一块 1920×1080 青色矩形。
+ *      E2：空 composelayer 未写该旗标仍应回读（WE「可调整组合层」默认不写；
+ *      3798926489 CRT/vignette 空画布把彩色背景盖成黑底噪点）。
  *
  *   F. composelayer 被当成 solidlayer
  *      前者是效果画布（层内容应为空白），后者才是纯色层。混同后 17 个带 solid
@@ -71,7 +73,7 @@ const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container
 const { parseMDL, computeSkinMatrices } = await imp("renderer/vendor/we-scene/render/mdl.js");
 const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
 // 视锥裁剪的 puppet 动画余量 / 图层混合：H、G 区块直接调这两份实现做回归（不在测试里另写一遍）
-const { puppetAnimMargin, applyColorBlendCPU, layerWantsPreserveBackdrop, collectGroupDescendantIds, layerCompositeBlendMode } = await imp("renderer/vendor/we-scene/render/renderer.js");
+const { puppetAnimMargin, applyColorBlendCPU, layerWantsPreserveBackdrop, layerWantsComposeBackdrop, collectGroupDescendantIds, layerCompositeBlendMode } = await imp("renderer/vendor/we-scene/render/renderer.js");
 
 const { check, errors } = createChecker();
 const readJson = (pkg, name) => {
@@ -492,6 +494,51 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   // passthrough 层不能再走空容器那套 alpha 猜测 / 预乘合成
   check(/!layer\.groupTex\s*&&\s*!usePassthrough/.test(rsrc),
     "passthrough 层必须绕开空容器的 alpha 判定与预乘合成");
+
+  // E2. 空 composelayer 未写 config.passthrough 仍应回读身后画面。
+  // WE 编辑器「可调整组合层」默认不打旗标（全库 36 处）；空画布 +
+  // 「alpha 无信息 → 加法」会把 CRT/vignette 的黑底盖住真正的背景
+  // （3798926489 GlitchGirl）。fullscreenlayer 已走 isPostProcess，
+  // 有子层的走 groupTex，这条只收无子层容器。
+  check(/function layerWantsComposeBackdrop/.test(rsrc),
+    "必须导出 layerWantsComposeBackdrop（空 composelayer 回读身后画面）");
+  check(/layerWantsPreserveBackdrop\s*\(\s*layer\s*\)\s*\|\|\s*layerWantsComposeBackdrop\s*\(\s*layer\s*\)/.test(rsrc),
+    "usePassthrough 必须并上 layerWantsComposeBackdrop（可调整组合层没打 passthrough 旗标）");
+  let nEmptyNoFlag = 0;
+  const emptyNoFlagIds = new Set();
+  for (const { id, scene } of wallpapers) {
+    const kids = new Set();
+    for (const o of scene.objects || []) {
+      if (o.parent !== undefined && o.parent !== null) kids.add(o.parent);
+    }
+    for (const o of scene.objects || []) {
+      const img = typeof o.image === "string" ? o.image : "";
+      if (img.indexOf("models/util/composelayer") !== 0) continue;
+      if (kids.has(o.id)) continue;
+      const eff = (o.effects || []).filter((e) => e.visible !== false);
+      if (eff.length === 0) continue;
+      if (o.config && o.config.passthrough === true) continue;
+      nEmptyNoFlag++;
+      emptyNoFlagIds.add(id);
+    }
+  }
+  console.log(`【E2. 空组合层无 passthrough 旗标】${nEmptyNoFlag} 处 / ${emptyNoFlagIds.size} 个壁纸（应走 compose backdrop）`);
+  check(nEmptyNoFlag >= 20, `空组合层无旗标样本异常偏低: ${nEmptyNoFlag}（预期 ≥20）`);
+  check(emptyNoFlagIds.has("3798926489"), "3798926489 应在「空组合层无旗标」集合里");
+  const wpGlitch = wallpapers.find((w) => w.id === "3798926489");
+  if (wpGlitch) {
+    const parsed = parseScene(wpGlitch.scene, {});
+    const compose = parsed.layers.filter((l) => l.isContainer && !l.hasChildren
+      && (l.effects || []).some((e) => e.visible !== false));
+    check(compose.length >= 2, `3798926489 应有 ≥2 个空组合层+效果，实得 ${compose.length}`);
+    for (const L of compose) {
+      check(!L.passthrough, `${L.name}#${L.id} 作者没写 config.passthrough，不应靠旗标`);
+      check(layerWantsComposeBackdrop(L),
+        `${L.name}#${L.id} 应走 compose backdrop（空画布会盖住故障背景）`);
+    }
+  } else {
+    check(false, "库里应有 3798926489（GlitchGirl 空组合层回读样本）");
+  }
 }
 
 // ---------- F. composelayer 不是 solidlayer ----------
@@ -1014,6 +1061,50 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     }
   }
 
+  // G3e. 3226487183 眨眼加算层：rest≈0 / 采样爆炸的缩放不能叠进替换姿势，
+  // 否则眼皮 2×、碎发 -7× 把贴图拉成一条。合法闭眼（骨 43 rest=1→0.03）仍要在。
+  {
+    const wp = wallpapers.find((w) => w.id === "3226487183");
+    if (wp) {
+      const parsed = parseScene(wp.scene);
+      const L = parsed.layers.find((l) => l.name === "中间默认主体");
+      const mj = L && L.image && readJson(wp.pkg, L.image);
+      check(!!(L && mj && mj.puppet), "3226487183 缺少中间默认主体 puppet");
+      if (L && mj && mj.puppet) {
+        let m;
+        try { m = parseMDL(getEntry(wp.pkg, mj.puppet)); }
+        catch (e) { m = null; errors.push(`3226487183 中间默认主体 MDL 失败：${e.message}`); }
+        if (m) {
+          const layers = L.animationLayers || [];
+          check(layers.some((a) => a.additive) && layers.some((a) => !a.additive),
+            "3226487183 中间默认主体应有替换层+眨眼加算层");
+          const localScale = (bi) => {
+            const loc = m._local[bi];
+            return [Math.hypot(loc[0], loc[1]), Math.hypot(loc[4], loc[5])];
+          };
+          let worst = 1;
+          let lidMin = 1;
+          for (const t of [0, 1.5, 1.8, 2, 2.2]) {
+            computeSkinMatrices(m, t, layers);
+            for (const bi of [37, 40, 41, 56, 61]) {
+              const s = localScale(bi);
+              worst = Math.max(worst, s[0], s[1]);
+            }
+            const lid = localScale(43);
+            lidMin = Math.min(lidMin, lid[0], lid[1]);
+          }
+          check(worst < 2.2,
+            `3226487183 眨眼加算把缩放拉到 ${worst.toFixed(2)}（rest=0 叠成 2× 或 sx=-7 拉长贴图；应 <2.2）`);
+          check(lidMin < 0.2,
+            `3226487183 眨眼骨 43 闭眼缩放应收到 <0.2，实得 ${lidMin.toFixed(2)}（误跳过了合法加算缩放）`);
+          console.log(`   3226487183: 眨眼加算缩放 max ${worst.toFixed(2)} / 骨43闭眼 ${lidMin.toFixed(2)}`);
+        }
+      }
+    } else {
+      console.log("   skip G3e：库中没有 3226487183");
+    }
+  }
+
   // G4. 接线：isLayerOffscreen 必须真的用上 puppetAnimMargin（G2 直接调的是导出函数，
   // 这里补一刀确保它确实接进了裁剪判据，而不是只导出没人用）
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
@@ -1531,6 +1622,11 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       check(spreadX > 1000,
         `origin−(crop+size/2) 必须保持发散（实得跨度 ${spreadX.toFixed(0)}px）：` +
         "这个值一旦收敛成常数，说明有人把 cropoffset 当位置补偿加进了 origin");
+      // 接线禁令：scene-mount 不得把 cropoffset 加进 origin（2477602742 地面层
+      // crop.y=−358 会撕出 clearcolor 灰带）。I5c 数值判据只覆盖 3233141951 语料。
+      const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+      check(!/origin\[\s*[01]\s*\]\s*\+=\s*.*cropoffset/.test(mountSrc),
+        "scene-mount 不得 origin += cropoffset（2477602742 回归；CASEBOOK 2341）");
     }
 
     console.log(`   3233141951 头 t=0 宽 ${head0.w.toFixed(0)}/${restW.toFixed(0)} 眼x=${eyeCx.toFixed(0)}；刀关 ${knifeOff.maxD.toFixed(1)}px 开 ${knifeOn.maxD.toFixed(1)}px`);

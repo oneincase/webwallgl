@@ -247,6 +247,63 @@ export function update(value) {
   void full;
 }
 
+// ---------- 4b. 发射器音频参数：mode/频段/bounds/exponent（3669623379 光束）----------
+// 缺陷：emitter 的 audioprocessingmode/frequencystart/end 此前被解析但门控只用整体
+// level（audioGate(bounds, level)），省略的 bounds 默认成 (0,1)，频段与 exponent 全丢。
+// 3669623379 的 light_shafts_0 指定 mode=3、freq 1..15（剔除底鼓 band0）、省略 bounds
+// 与 exponent，官方 ObjectParser.cpp 默认 bounds=(0.8,1.0)、exponent=2。旧实现里光束
+// 被底鼓电平推着常发（实机 live 恒 4/40、~0.3/s），真实音乐（中高频驱动）反而错。
+{
+  const snap = (b) => ({
+    level: 1,
+    left16: new Float32Array(16).map((_, i) => (b(i) ? 0.95 : 0)),
+    right16: new Float32Array(16).map((_, i) => (b(i) ? 0.95 : 0)),
+  });
+  const run = (emitter, audio, frames = 600) => {
+    const model = {
+      maxcount: 200,
+      emitter: [emitter],
+      initializer: [{ name: "lifetimerandom", min: 10, max: 10 }],
+      operator: [],
+      renderer: [{ name: "billboard" }],
+    };
+    const ps = new ParticleSystem(null, model, null, {});
+    for (let i = 0; i < frames; i++) ps.advance(1 / 60, audio);
+    return ps.pool.reduce((s, p) => s + (p.alive ? 1 : 0), 0);
+  };
+  const liveCount = (x) => x;
+
+  // 3669 光束配置（来自真实 light_shafts_0.json）
+  const beamEmitter = {
+    name: "sphererandom", rate: 40,
+    audioprocessingmode: 3, audioprocessingfrequencystart: 1, audioprocessingfrequencyend: 15,
+    distancemin: 0, distancemax: 0,
+  };
+  const probe = new ParticleSystem(null, {
+    maxcount: 1, emitter: [beamEmitter], initializer: [], operator: [], renderer: [{ name: "billboard" }],
+  }, null, {});
+  const ce = probe.emitters[0];
+  check(ce.audioMode === 3, `光束 mode 应为 3，实得 ${ce.audioMode}`);
+  check(ce.audioFreqStart === 1 && ce.audioFreqEnd === 15, `光束频段应为 1..15，实得 ${ce.audioFreqStart}..${ce.audioFreqEnd}`);
+  check(ce.audioBounds[0] === 0.8 && ce.audioBounds[1] === 1.0,
+    `省略 bounds 的 emitter 默认应为 (0.8,1)（官方 ObjectParser），实得 (${ce.audioBounds})`);
+  check(ce.audioExponent === 2, `省略 exponent 的 emitter 默认应为 2（官方 ObjectParser），实得 ${ce.audioExponent}`);
+
+  // 频段选择：只在 band0（底鼓）满幅、band1..15 全静时，门控必须为 0（旧实现会因 level 高而常发）
+  check(liveCount(run(beamEmitter, snap((i) => i === 0))) === 0, "光束 freq=1..15：只有底鼓 band0 时不应发射");
+  // band1..15 满幅时应大量发射
+  check(liveCount(run(beamEmitter, snap((i) => i >= 1 && i <= 15))) > 100, "光束 band1..15 满幅时应大量发射");
+  // 静音不发
+  check(liveCount(run(beamEmitter, snap(() => false))) === 0, "光束全静时不应发射");
+
+  // 作者显式窄频带（2857410102 starfield：freq 15..15）必须只看那一个 band
+  const narrow = { name: "sphererandom", rate: 100, audioprocessingmode: 3,
+    audioprocessingfrequencystart: 15, audioprocessingfrequencyend: 15,
+    audioprocessingbounds: "0.01 0.01", audioprocessingexponent: 1 };
+  check(run(narrow, snap((i) => i === 0)) === 0, "窄频带 freq=15：band0 满幅不应发射");
+  check(run(narrow, snap((i) => i === 15)) > 100, "窄频带 freq=15：band15 满幅应发射");
+}
+
 // ---------- 5. 真实壁纸 shader 转译冒烟 ----------
 // headers.ts 是 TS 文件，模板串里没有反引号/插值，用正则安全提取两份公共头。
 {
@@ -445,6 +502,25 @@ export function update(value) {
     bgm.mergeBgmBands(s, band, 1);
     check(s.left32.some((v) => close(v, 0.7)), "BGM 32 段降采样应取组内 max（某段含 0.7）");
     check(s.left16.some((v) => close(v, 0.7)), "BGM 16 段应同步");
+  }
+  // 应用层增益必须 ≤1：getByteFrequencyData 是 dB 线标，压缩母带播放时多数
+  // 频段 ≥0.5，×2 一类增益会让 min(1) 把全频段钳到 1 —— 音量一开音频响应成
+  // 满幅直线，静音回落模拟源才正常（用户实测 35 张 BGM 壁纸）。
+  {
+    const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const m = /const BGM_SPECTRUM_GAIN = ([\d.]+)/.exec(src);
+    check(!!m, "scene-mount 应有 BGM_SPECTRUM_GAIN 常量");
+    const g = m ? Number(m[1]) : 0;
+    check(g > 0 && g <= 1, `BGM_SPECTRUM_GAIN 应在 (0,1]，实得 ${g}（>1 会全频段钳满成直线）`);
+  }
+  // 典型音乐（全频段 0.55~0.90）经合并后必须保留起伏，不得整条钳到 1
+  {
+    const s = snap();
+    const music = new Float32Array(64);
+    for (let i = 0; i < 64; i++) music[i] = 0.55 + (i % 8) * 0.05;
+    bgm.mergeBgmBands(s, music, 1);
+    const ones = [...s.left64].filter((v) => v >= 0.999).length;
+    check(ones < 64, `典型音乐不应全频段钳满（${ones}/64 段=1）`);
   }
 }
 

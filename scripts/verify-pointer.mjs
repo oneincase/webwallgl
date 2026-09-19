@@ -110,44 +110,56 @@ console.log('\n【1. OBB hit-test】')
   if (worst > 1e-4) fail(`往返误差过大：${worst.toExponential(2)}`)
   else ok(`7 组几何用例往返一致（最大误差 ${worst.toExponential(2)}）`)
 
-  // ---- 视差符号：hittest 与 renderer 必须同号 ----
+  // ---- 视差：renderer / hittest / 粒子共用 layerParallaxOffset（双路径）----
   //
-  // 上面的往返用例**锁不住这个**：forward() 是这份测试自己抄的一份实现，
-  // 它和 hittest 一起写错符号时往返照样自洽。01ba726 把 layerModelMatrix 的对象视差
-  // 从 −f 改成 +f（相机固定、层正向平移），hittest 漏改，测试也跟着漏改，
-  // 于是三处一致地错着，全绿了半年 —— 带 parallaxDepth 的层画面在一边、命中区在另一边，
-  // 偏移量是渲染位移的两倍。小控件直接点不中（3148125112 的丝袜按钮屏上仅 16.7px）。
-  //
-  // 所以判据只能是**读两份真实源码比符号**，不能再自己抄第三份。
+  // 2026-09-19 用户拍板：Mirage 公式只对白名单壁纸（3233141951）启用；
+  // 全库默认 legacy（d/2 × parOff + 60px 封顶）。判据读真实源码：
+  //   1) 三处都必须调用 layerParallaxOffset（单一真源分发）；
+  //   2) resolveParallaxFormula 默认 legacy，白名单含 3233141951；
+  //   3) mirage 分支 mouse.x = (0.5−sx)、含静态项、无 d/2；
+  //   4) legacy 分支保留 PARALLAX_MAX_PX=60 与 parallaxDepthFactor(d/2)。
   {
     const rdSrc = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js'), 'utf8')
     const htSrc = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/hittest.js'), 'utf8')
-    // renderer：mat4Translate(m, ±fx * layerParallaxScaleX, ...)
-    const rd = /mat4Translate\(\s*m\s*,\s*(-?)fx\s*\*\s*layerParallaxScaleX/.exec(rdSrc)
-    // hittest：cx += ±fx * parOffX
-    const ht = /cx\s*\+=\s*(-?)fx\s*\*\s*parOffX/.exec(htSrc)
-    if (!rd) fail('renderer.js 里找不到对象视差平移（layerModelMatrix 结构变了，本断言需同步）')
-    else if (!ht) fail('hittest.js 里找不到对象视差偏移（worldToLayerLocal 结构变了，本断言需同步）')
-    else if (rd[1] !== ht[1]) {
-      fail(`对象视差符号不一致：renderer 用 ${rd[1] || '+'}f，hittest 用 ${ht[1] || '+'}f` +
-        ' —— 带 parallaxDepth 的层命中区会偏到画面另一侧')
-    } else {
-      ok(`对象视差符号两处一致（均为 ${rd[1] || '+'}f × parOff）`)
-    }
+    const mathSrc = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/math.js'), 'utf8')
+    const mountSrc = fs.readFileSync(path.join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
 
-    // XY 基准都取负（朝指针方向看，近景与鼠标反向漂）。不要改成翻 f(d)——
-    // 那会让 depth=0 再次变成动得最厉害的层。
-    const xAssign = /layerParallaxScaleX\s*=\s*-\s*\(?\s*rawOffX\s*\*\s*damp/.exec(rdSrc)
-    const yAssign = /layerParallaxScaleY\s*=\s*-\s*\(?\s*rawOffY\s*\*\s*damp/.exec(rdSrc)
-    if (!xAssign) {
-      fail('renderer.js 里 layerParallaxScaleX 必须赋值为 -(rawOffX * damp)' +
-        '（否则视差左右跟鼠标同向）')
-    } else if (!yAssign) {
-      fail('renderer.js 里 layerParallaxScaleY 必须赋值为 -(rawOffY * damp)' +
-        '（否则视差上下跟鼠标同向）')
-    } else {
-      ok('对象视差 XY 基准均取负（近景与鼠标反向）')
-    }
+    if (!/layerParallaxOffset\(layer,\s*parallaxCtx\)/.test(rdSrc))
+      fail('renderer.js layerModelMatrix 必须调用 layerParallaxOffset(layer, parallaxCtx)')
+    else if (!/layerParallaxOffset\(layer,\s*parallaxCtx\)/.test(htSrc))
+      fail('hittest.js worldToLayerLocal 必须调用 layerParallaxOffset(layer, parallaxCtx)')
+    else if (!/layerParallaxOffset\(ps\.layer,\s*pctx\)/.test(mountSrc))
+      fail('scene-mount.ts 粒子视差必须调用 layerParallaxOffset（与渲染同构）')
+    else if (!/export function layerParallaxOffset/.test(mathSrc))
+      fail('math.js 缺少 layerParallaxOffset 分发')
+    else ok('对象视差：renderer / hittest / 粒子 / math 四处共用 layerParallaxOffset')
+
+    if (!/export function resolveParallaxFormula/.test(mathSrc))
+      fail('math.js 缺少 resolveParallaxFormula')
+    else if (!/return 'legacy'/.test(mathSrc))
+      fail('resolveParallaxFormula 默认必须是 legacy（全库）')
+    else if (!/3233141951/.test(mathSrc) || !/MIRAGE_PARALLAX_WALLPAPERS/.test(mathSrc))
+      fail('MIRAGE_PARALLAX_WALLPAPERS 必须包含 3233141951')
+    else if (!/workshopId:\s*cfg\.src/.test(mountSrc))
+      fail('scene-mount 必须把 cfg.src 传给 createRenderer 作 workshopId（白名单选路）')
+    else ok('视差双路径：默认 legacy，3233141951 → mirage')
+
+    // mirage 分支：mouse.x 反向、含静态项
+    const mx = /parallaxCtx\.mx\s*=\s*\(0\.5\s*-\s*parallaxState\.sx\)/.exec(rdSrc)
+    const my = /parallaxCtx\.my\s*=\s*\(parallaxState\.sy\s*-\s*0\.5\)/.exec(rdSrc)
+    if (!mx) fail('renderer.js mirage 分支 mouse.x 必须是 (0.5 − sx)')
+    else if (!my) fail('renderer.js mirage 分支 mouse.y 必须是 (sy − 0.5)')
+    else ok('mirage mouse 世界向量 XY 符号与 Mirage 一致')
+
+    if (!/origin\[0\]\s*-\s*ctx\.cx/.test(mathSrc))
+      fail('math.js mirageParallaxOffset 缺少节点静态项 (origin − camPos)')
+    if (!/export function legacyParallaxOffset/.test(mathSrc))
+      fail('math.js 缺少 legacyParallaxOffset')
+    if (!/PARALLAX_MAX_PX\s*=\s*60/.test(rdSrc))
+      fail('renderer.js legacy 分支必须保留 PARALLAX_MAX_PX=60 封顶')
+    if (!/parallaxDepthFactor/.test(mathSrc) || !/n\s*\*\s*0\.5/.test(mathSrc))
+      fail('math.js parallaxDepthFactor 必须是 d/2（legacy 路径）')
+    else ok('legacy 路径保留 d/2 + 60px 封顶；mirage 路径含静态项')
   }
 
   // ---- alignment 绝对语义：origin 必须真的落在对应的边/角上 ----

@@ -1,4 +1,4 @@
-import { parallaxDepthFactor } from './math.js'
+import { layerParallaxOffset } from './math.js'
 
 /**
  * [we-scene patch] 图层级 hit-test（OBB / 有向包围盒）。
@@ -58,7 +58,7 @@ import { parallaxDepthFactor } from './math.js'
  * @param {Record<string, number[]>} alignTable ALIGN 表（由渲染器传入，保持单一真源）
  * @returns {{lx:number, ly:number, w:number, h:number}|null}
  */
-export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, perspEye) {
+export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, perspEye, parallaxCtx) {
   const size = layer.size || [0, 0]
   const scale = layer.scale || [1, 1, 1]
   const w = size[0] * scale[0]
@@ -72,19 +72,16 @@ export function worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignT
 
   // 2) 对象视差（沿世界轴，旋转之前）
   //
-  // [we-scene patch] 符号必须是 **+f**，与 layerModelMatrix 逐字一致。
-  // 01ba726 把渲染侧从「相机平移 + 层反向补偿」改成「相机固定、层正向平移」，
-  // 符号由 −f 变成 +f，这里漏改了 —— 于是带 parallaxDepth 的层，画面在一边、
-  // 命中区在另一边，偏移量是渲染位移的两倍。
-  //
-  // 大层看不出来（偏几十像素仍落在层内），小按钮直接点不中：3148125112 的
-  // 丝袜切换按钮 pd=(−0.6,−0.4)、屏上只有 16.7px，指针指着它却永远收不到 click。
-  if (layer.parallaxDepth && (parOffX !== 0 || parOffY !== 0)) {
+  // [we-scene patch] 与 layerModelMatrix 共用 layerParallaxOffset（legacy / mirage
+  // 双路径）。ctx 缺席时回退旧 parOffX×(d/2)（离线校验兼容路径）。
+  if (layer.parallaxDepth && parallaxCtx) {
+    const off = layerParallaxOffset(layer, parallaxCtx)
+    cx += off[0]
+    cy += off[1]
+  } else if (layer.parallaxDepth && (parOffX !== 0 || parOffY !== 0)) {
     const d = layer.parallaxDepth
-    const fx = parallaxDepthFactor(d[0])
-    const fy = parallaxDepthFactor(d[1])
-    cx += fx * parOffX
-    cy += fy * parOffY
+    cx += d[0] * 0.5 * parOffX
+    cy += d[1] * 0.5 * parOffY
   }
 
   // perspective 图层：射线-平面求交（见文件头「perspective 图层」节）。
@@ -190,6 +187,7 @@ export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
   if (!layers || layers.length === 0) return null
   const parOffX = opts.parOffX || 0
   const parOffY = opts.parOffY || 0
+  const parallaxCtx = opts.parallaxCtx
   const alignTable = opts.alignTable
   const filter = opts.filter
   // 从上往下找：layers 顺序即绘制顺序，后画的在上面
@@ -198,7 +196,7 @@ export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
     // 可见性已由 parse.js 沿父链求得（见文件头说明），隐藏层不参与命中
     if (!layer || !layer.visible || layer.destroyed) continue
     if (filter && !filter(layer)) continue
-    const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye)
+    const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye, parallaxCtx)
     if (!loc) continue
     if (Math.abs(loc.lx) <= 0.5 && Math.abs(loc.ly) <= 0.5) return layer
   }

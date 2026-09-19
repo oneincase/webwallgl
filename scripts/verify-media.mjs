@@ -1623,8 +1623,58 @@ const { check, errors } = createChecker();
     /ov\.textureFallbacks/.test(rSrc) && /textures\.get\(nm\)\) continue/.test(rSrc),
     "渲染端必须在保留名解析不到内容时回落到内置封面",
   );
-  // 保留名判定不能误伤：只有 $ 开头的系统保留名走回落
-  check(/nm\.charCodeAt\(0\) !== 36/.test(rSrc), "回落只对 $ 保留名生效");
+  // 回落判定的是「纹素表里查不到这个名字」，**不是**「名字以 $ 开头」：
+  // `usertextures` 同样能把槽绑到场景属性上（`{name:"custombackground"}`，
+  // 属性类型 file/scenetexture），原槽贴图也在 textureFallbacks 里。
+  // 只认 `$` 时属性槽落 resolveTextureName 的 whiteTex 兜底，而 blend 效果
+  // 的 BLENDMODE 0 = Normal 会把它当**白色输入**整屏刷白（2067939514）。
+  check(
+    !/nm\.charCodeAt\(0\) !== 36/.test(rSrc),
+    "回落不能只认 $ 保留名：usertextures 也可以绑场景属性（2067939514 custombackground）",
+  );
+  // 真正绑纹理的那一路必须直接用 mergedTex（回落就写在 mergedTex 上）。
+  // 曾经的形状是「mergedTex 里回落、绑定循环按 mp/ov.textures 再推一遍」——
+  // 回落对绑定完全无效（$ 保留名的第三级封面同样落不到画面上）。
+  check(
+    /let name = mergedTex\[ti\] !== undefined/.test(rSrc),
+    "纹理绑定必须用 mergedTex 取槽名（回落只写进 mergedTex 时绑定这一路拿不到）",
+  );
+  // 真实语料：2067939514 的 blend 槽绑 custombackground，原槽是 pkg 内那张背景图
+  {
+    const id = "2067939514";
+    const p = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(p)) {
+      console.log("  （跳过 2067939514 语料：本机无此壁纸）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(p));
+      const sj = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8"));
+      const solid = (sj.objects || []).find((o) => o.name === "Solid" && (o.effects || []).length);
+      const pass = solid && solid.effects[0].passes[0];
+      check(
+        !!pass && (pass.usertextures || []).some((u) => {
+          const name = u && typeof u === "object" ? u.name : u;
+          return name === "custombackground";
+        }),
+        "2067939514 的背景层必须把槽绑到 custombackground 属性（语料前提）",
+      );
+      check(
+        !!pass && pass.textures[1] === "882671 (1)",
+        "2067939514 原槽必须是包内那张自定义背景贴图（回落目标）",
+      );
+      const scene = parseScene(sj, null);
+      const layer = scene.layers.find((l) => l.name === "Solid" && l.effects && l.effects.length);
+      const parsedPass = layer && layer.effects[0].passes[0];
+      check(
+        parsedPass && parsedPass.textures[1] === "custombackground" &&
+          parsedPass.textureFallbacks && parsedPass.textureFallbacks[1] === "882671 (1)",
+        "parse 必须把属性名放进 textures、原槽贴图放进 textureFallbacks",
+      );
+      check(
+        !!getEntry(pkg, "materials/882671 (1).tex"),
+        "回落目标必须在包内真实存在（贴图名含空格与括号，别按路径解析）",
+      );
+    }
+  }
 }
 
 if (errors.length) {

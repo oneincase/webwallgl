@@ -19,6 +19,7 @@
 //   particles.js         本文件：Particle / ParticleSystem（配置编译 + 模拟 + 绘制）
 import { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
 import { buildParticleProgram } from './particle-shaders.js'
+import { audioResponse } from './audio.js'
 
 // [we-scene patch] 粒子质量倍率（性能设置面板「粒子」档）：同时缩 maxcount 上限
 // 与发射率，语义与 instanceoverride 的 count 倍率一致（见 _applyOverride 注释）。
@@ -405,8 +406,20 @@ export class ParticleSystem {
       // 若按「维持池满」处理，会把音频响应的星星填满并叠成一片过曝
       // （2419444134 的 reactive Stars 实测 15% 像素过曝）。故静音时按不发射处理。
       audioDriven: e.audioprocessingmode !== undefined,
-      // audioprocessingbounds：发射量随响度平滑门控的区间（实测 "0.8 1" 等）
-      audioBounds: parseVec(e.audioprocessingbounds, [0, 1]),
+      // audioprocessingbounds：发射量随响度平滑门控的区间。
+      // 默认 (0.8,1.0) 对齐官方 ObjectParser.cpp 的 emitter 默认（不是操作器的
+      // (0,1)）：省略 bounds 的音频发射器（3669623379 光束 light_shafts_0、
+      // 3299228616 Star_*）只在强拍发射，用 (0,1) 会退化成几乎常发。
+      audioBounds: parseVec(e.audioprocessingbounds, [0.8, 1.0]),
+      // 与 shader 的 CreateAudioResponse 同源（mode: 0 关/1 左/2 右/3 双，
+      // 频段平均 → smoothstep(bounds) → pow(exponent)）。官方 emitter 默认
+      // exponent=2、freqStart=0、freqEnd=1。作者显式给的 frequencystart/end
+      // 必须生效——3669623379 光束指定 1..15（剔除底鼓 band0），此前一律用
+      // 整体 level，频段配置被静默丢弃。
+      audioMode: num(e.audioprocessingmode, 0),
+      audioExponent: num(e.audioprocessingexponent, 2),
+      audioFreqStart: num(e.audioprocessingfrequencystart, 0),
+      audioFreqEnd: num(e.audioprocessingfrequencyend, 1),
       fill: e.rate === undefined && e.instantaneous === undefined && e.audioprocessingmode === undefined,
       instantaneous: num(e.instantaneous, 0),
       speedMin: num(e.speedmin, 0),
@@ -739,6 +752,8 @@ export class ParticleSystem {
     const longSide = Math.max(aw, ah) || 1
     this.texAspectX = aw / longSide
     this.texAspectY = ah / longSide
+    // TEXS 单帧长边。sizerandom=100 对 50×50 字符帧是「100% 帧尺寸」，不是 100px。
+    this.frameLongPx = this.texFrames ? longSide : 0
     this._frameData = undefined // 帧表变化时重建 uniform 缓存
   }
 
@@ -765,17 +780,27 @@ export class ParticleSystem {
     this.scaleX = ls[0] === 0 ? 1 : ls[0]
     this.scaleY = ls[1] === 0 ? 1 : ls[1]
     this.angleZ = ((la[2] || 0) * Math.PI) / 180
-    // 精灵的非等比拉伸：WE 里图层 scale 直接作用于精灵 quad，x/y 不等时精灵被拉长。
-    // 全库 92 个带 scale 的粒子层有 36 个是非等比的（如 light_shafts_1 的 22.6/12.2、
-    // fog1 的 10/1、Splash 的 1/0.15），它们靠拉伸把圆形贴图变成光柱/雨丝/横向雾带。
-    // 若只取平均值做等比缩放，这些系统会变成巨大的圆斑糊住半个屏幕。
-    // 故：位置用 scaleX/scaleY 各自缩放，精灵尺寸取较小轴为基准、较大轴作为拉伸比。
+    // 非等比拉伸：图层 scale x/y 不等时精灵被拉长（light_shafts 22.6/12.2、
+    // fog1 10/1）。位置始终按 scaleX/scaleY 走。
+    // 等比缩放只拉开列距/速度，不乘进精灵尺寸：3226487183 代码雨 scale 1.476
+    // 若连 size 一起乘，50px 字变成 148px，列内间距 74px，上下叠成没有缝。
     const asx = Math.abs(this.scaleX)
     const asy = Math.abs(this.scaleY)
-    this.sysScale = Math.min(asx, asy) || 1
-    // 精灵 quad 的宽高拉伸倍率（相对 sysScale）
-    this.spriteStretchX = asx / this.sysScale
-    this.spriteStretchY = asy / this.sysScale
+    const uniform = Math.abs(asx - asy) <= 1e-3 * Math.max(asx, asy, 1)
+    this.sysScale = uniform ? 1 : (Math.min(asx, asy) || 1)
+    this.spriteStretchX = uniform ? 1 : asx / this.sysScale
+    this.spriteStretchY = uniform ? 1 : asy / this.sysScale
+  }
+
+  /**
+   * [we-scene patch] Mirage 对象视差的渲染偏移（cameraparallax 场景级 × parallaxDepth）。
+   * 粒子层不走 layerModelMatrix（渲染回调直传 cam/viewProj），视差偏移由宿主每帧
+   * 按共享公式（math.js mirageParallaxOffset）算好后注入，render 输出时整体平移——
+   * 只动绘制位置，已发射粒子的模拟坐标不变（视差是相机效果，不改粒子运动）。
+   */
+  setParallaxOffset(x, y) {
+    this.parallaxX = Number(x) || 0
+    this.parallaxY = Number(y) || 0
   }
 
   // 宿主每帧提供鼠标位置（世界像素）；转到局部空间供控制点使用
@@ -1322,7 +1347,18 @@ export class ParticleSystem {
       // 音频驱动发射器（audioprocessingmode）：发射量随响度门控（smoothstep(bounds)）。
       // 有 rate 的按 rate×k 发射；无 rate 的按「池目标量 ∝ k」维持（WE 音频常驻场）。
       if (em.audioDriven) {
-        const k = audioGate(em.audioBounds, level)
+        // 优先走与 shader CreateAudioResponse 同源的频段响应（mode/频段/bounds/
+        // exponent）；快照没带频段数组（离线合成 audio 只给 level）时退回整体响度门控。
+        let k
+        if (audio && (audio.left16 || audio.right16)) {
+          k = audioResponse(
+            { left: audio.left16, right: audio.right16 },
+            em.audioMode, em.audioFreqStart, em.audioFreqEnd,
+            em.audioBounds, em.audioExponent, 1,
+          )
+        } else {
+          k = audioGate(em.audioBounds, level)
+        }
         if (em.rate > 0) {
           const rate = em.rate * k * (this._ov.rateMul !== undefined ? this._ov.rateMul : 1) * (this._ov.countMul !== undefined ? this._ov.countMul : 1)
           if (!(rate > 0)) continue
@@ -1405,13 +1441,21 @@ export class ParticleSystem {
 
     const bright = (this._ov.brightness || 1) * (this.overbright ?? 1)
     const sysScale = this.sysScale
+    const framePx = this.frameLongPx || 0
+    // TEXS 小帧 + sizerandom≈100：100 是帧长边的百分比（matrix 50×50 → 50px），
+    // 按像素会长边会把字画成两倍并与列内间距重叠。
+    const sizePx = (s) => {
+      let v = Math.abs(s)
+      if (framePx > 0 && framePx <= 64 && v >= 80 && v <= 120) v = v * 0.01 * framePx
+      return v * sysScale
+    }
     // 精灵形状 = 贴图宽高比 × 图层非等比 scale
     const stretchX = this.spriteStretchX * (this.texAspectX || 1)
     const stretchY = this.spriteStretchY * (this.texAspectY || 1)
     const cos = Math.cos(this.angleZ)
     const sin = Math.sin(this.angleZ)
-    const ox = this.originX
-    const oy = this.originY
+    const ox = this.originX + (this.parallaxX || 0)
+    const oy = this.originY + (this.parallaxY || 0)
     const sx = this.scaleX
     const sy = this.scaleY
 
@@ -1434,7 +1478,7 @@ export class ParticleSystem {
         const dx = wb[0] - wa[0]
         const dy = wb[1] - wa[1]
         const dist = Math.hypot(dx, dy)
-        const width = (Math.abs(a.size) + Math.abs(b.size)) * 0.5 * sysScale
+        const width = (sizePx(a.size) + sizePx(b.size)) * 0.5
         if (!(width > 0)) continue
         data[k++] = (wa[0] + wb[0]) * 0.5
         data[k++] = (wa[1] + wb[1]) * 0.5
@@ -1496,7 +1540,7 @@ export class ParticleSystem {
           const dx = w0[0] - w1[0]
           const dy = w0[1] - w1[1]
           const dist = Math.hypot(dx, dy)
-          const base = Math.max(1e-3, Math.abs(p.size) * sysScale * segSize)
+          const base = Math.max(1e-3, sizePx(p.size) * segSize)
           if (dist > 1e-3) {
             rot = spriteTrailRotation(dx, dy)
             // 精灵中心放在段中点，沿向拉伸盖住相邻采样点间距
@@ -1529,7 +1573,7 @@ export class ParticleSystem {
         data[k++] = wx
         data[k++] = wy
         data[k++] = 0
-        data[k++] = Math.abs(p.size) * sysScale * segSize
+        data[k++] = sizePx(p.size) * segSize
         data[k++] = rot
         data[k++] = p.r * bright
         data[k++] = p.g * bright
