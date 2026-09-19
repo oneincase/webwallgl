@@ -488,7 +488,18 @@ export function applyAttachmentBindOrigins(layers) {
     // 无动画的图集布局 puppet：绑定附着点是贴图散开位（3226487183 抬头身体
     // Attachment 在 (289,-656)），加上去会把已装配的脸拽到画外。有动画时
     // follow 会用「当前−绑定」把挂件收到装配姿势，必须保留这份偏移。
+    // [we-scene patch 3186328539] **还必须有「没有静态装配姿势」这一条**。
+    // 这个 0 位移是与「follow 的增量也恒为 0」配对使用的（旧实现里无动画 puppet
+    // 蒙皮恒等 = 渲染的就是图集散开位，两者同时成立才自洽）。无 MDLA 的模型现在
+    // 渲染的是 MDLS 尾部的静态装配姿势（姿态变了、且与绑定姿势差一个装配位移），
+    // 于是 follow 的增量不再为 0 —— 此时再把它压成 0，就只剩这半边的错：
+    // 3226487183 jiaose=3 的「抬头拆分」净位移从应有的 (4.8,−218)px 变成
+    // (−569,1126)px（脸被推离身体 1262px，用户实机报「只有脸部不正确」）。
+    // 有静态姿势的模型与**有动画的模型同款处理**（同一具身体模型、同一个姿势：
+    // 静态姿势 == 动画 frame0，实测两者附着点都在 (2.4,−108.8)），
+    // 净位移自然同为 (4.8,−218)px —— 那条路是 CASEBOOK 实机确认「脸在头上」的。
     const atlasBind = !(parent.puppet.animations && parent.puppet.animations.length) &&
+      !parent.puppet.staticPoseTRS &&
       puppetUvMatchesLayout(parent.puppet, parent.size)
     const d = atlasBind ? [0, 0] : parentMeshToWorldDelta(parent, bx, by)
     const desc = []

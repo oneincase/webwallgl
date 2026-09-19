@@ -474,10 +474,16 @@ function neckOf(parent, attName) {
   }
 }
 
-// ---------- 3226487183：无动画图集身体的附着点不能当世界偏移 ----------
-// 抬头身体背景 MDLV0019、无 MDLA，绑定姿势 = 贴图散开。Attachment 在图集
-// (289,-656)，×scale2 把已装配的「抬头拆分」从 parse (1941,1234) 拽到
-// (2519,-77)，jiaose=3 人物错乱。有动画的「默认身体背景」仍必须加偏移。
+// ---------- 3226487183：同一具身体的两套脸，附着净位移必须同量级 ----------
+// 「抬头身体背景」（jiaose=3）与「默认身体背景」（jiaose=1）是**同一个模型的两个实例**，
+// 附着点同名（绑定姿势都在图集 (287,-672)、装配/静态姿势都在 (2.4,-108.8)）——静态姿势
+// 实测等于动画 frame0。所以两侧脸的附着处理必须同款：净位移都只有两三百像素的校正，
+// 而不是「一半叠一半不叠」。
+//
+// 历史：无动画 + UV≈布局 时曾把绑定位移整段压成 0（当时无动画 puppet 蒙皮恒等，渲染的
+// 就是图集散开位，压 0 与 follow 增量恒 0 配对自洽）。现在无 MDLA 的模型渲染的是 MDLS
+// 尾部的静态装配姿势，follow 增量不再为 0 —— 再把绑定位移压 0 就只剩半边，净位移从
+// (7,-185) 变成 (-569,1126)（脸被推离身体 1262px，用户实机报「只有脸部不正确」）。
 {
   const wp = loadWallpaper(3226487183);
   if (!wp) {
@@ -491,14 +497,19 @@ function neckOf(parent, attName) {
     if (face && defFace) {
       const parseFace = [face.origin[0], face.origin[1]];
       const parseDef = [defFace.origin[0], defFace.origin[1]];
-      applyAttachmentBindOrigins(wp.scene.layers);
+      const follows = applyAttachmentBindOrigins(wp.scene.layers);
+      // 走完整链路（挂载期绑定偏移 + 逐帧 follow）才是「净位移」
+      followAttachments(follows, 0, null);
       const dLook = hypot(face.origin[0] - parseFace[0], face.origin[1] - parseFace[1]);
       const dDef = hypot(defFace.origin[0] - parseDef[0], defFace.origin[1] - parseDef[1]);
-      check(dLook < 8,
-        `3226487183 抬头拆分不应叠图集附着点，位移 ${dLook.toFixed(0)}px（旧实现 ~1400px → 脸飞出画面）`);
-      check(dDef > 200,
-        `3226487183 中间默认主体仍应叠默认身体的装配附着点，位移 ${dDef.toFixed(0)}px（误跳过则脸停在胸口）`);
-      console.log(`   3226487183: 抬头脸位移 ${dLook.toFixed(1)}px / 默认脸位移 ${dDef.toFixed(1)}px`);
+      check(dLook > 50 && dLook < 300,
+        `3226487183 抬头拆分净位移应在 50~300px，实得 ${dLook.toFixed(0)}px` +
+        `（~0 = 静态姿势下又把绑定位移压成 0；~1262 = 只压了一半 → 脸离开身体）`);
+      check(dDef > 150 && dDef < 300,
+        `3226487183 中间默认主体净位移应在 150~300px，实得 ${dDef.toFixed(0)}px（误跳过则脸停在胸口）`);
+      check(Math.abs(dLook - dDef) < 100,
+        `3226487183 同身体两套脸的净位移必须同量级：抬头 ${dLook.toFixed(0)}px vs 默认 ${dDef.toFixed(0)}px`);
+      console.log(`   3226487183: 抬头脸净位移 ${dLook.toFixed(1)}px / 默认脸净位移 ${dDef.toFixed(1)}px`);
     }
   }
 }
