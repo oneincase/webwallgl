@@ -116,8 +116,14 @@ console.log('\n【1. OBB hit-test】')
   // 全库默认 legacy（d/2 × parOff + 60px 封顶）。判据读真实源码：
   //   1) 三处都必须调用 layerParallaxOffset（单一真源分发）；
   //   2) resolveParallaxFormula 默认 legacy，白名单含 3233141951；
-  //   3) mirage 分支 mouse.x = (0.5−sx)、含静态项、无 d/2；
+  //   3) mirage 分支 mouse.x = (0.5−sx)、**不含 (origin−camPos) 静态项**、无 d/2；
   //   4) legacy 分支保留 PARALLAX_MAX_PX=60 与 parallaxDepthFactor(d/2)。
+  //
+  //   静态项在第三轮按用户反馈移除、第四轮当「Mirage 原样」加回，2026-09-19 用户
+  //   实机复核**逐项报错且数值全部对上静态项预测**（刀 −309px=13.5%高、烟1 −277px、
+  //   面具01 −469px、挂饰1 −665px 偏上；发饰 +64px 偏下；头/身体 −37/−33px≈1.5%
+  //   所以"脸正常"；朱鹤/下音条 depth 0/null → 0 所以"阴影音条正常"）。故再次移除，
+  //   并加**数值判据**（下面 mirage 段）而不只是源码正则。
   {
     const rdSrc = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js'), 'utf8')
     const htSrc = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/hittest.js'), 'utf8')
@@ -151,15 +157,53 @@ console.log('\n【1. OBB hit-test】')
     else if (!my) fail('renderer.js mirage 分支 mouse.y 必须是 (sy − 0.5)')
     else ok('mirage mouse 世界向量 XY 符号与 Mirage 一致')
 
-    if (!/origin\[0\]\s*-\s*ctx\.cx/.test(mathSrc))
-      fail('math.js mirageParallaxOffset 缺少节点静态项 (origin − camPos)')
+    // 只看**函数体**（注释里会解释历史沿革，提到 staticScale/camPos 是正常的）
+    const mirageBody = (/export function mirageParallaxOffset[\s\S]*?\n\}/.exec(mathSrc) || [''])[0]
+    if (!mirageBody) fail('math.js 缺少 mirageParallaxOffset')
+    else if (/ctx\.c[xy]|staticScale/.test(mirageBody))
+      fail('math.js mirageParallaxOffset 不得再含节点静态项 (origin − camPos)：3233141951 用户实机逐项复核证明它把刀/烟/面具/挂饰推高 10~29%、发饰压低')
+    else ok('mirage 公式体不含静态项（只有 mouse × depth × amount）')
     if (!/export function legacyParallaxOffset/.test(mathSrc))
       fail('math.js 缺少 legacyParallaxOffset')
     if (!/PARALLAX_MAX_PX\s*=\s*60/.test(rdSrc))
       fail('renderer.js legacy 分支必须保留 PARALLAX_MAX_PX=60 封顶')
     if (!/parallaxDepthFactor/.test(mathSrc) || !/n\s*\*\s*0\.5/.test(mathSrc))
       fail('math.js parallaxDepthFactor 必须是 d/2（legacy 路径）')
-    else ok('legacy 路径保留 d/2 + 60px 封顶；mirage 路径含静态项')
+    else ok('legacy 路径保留 d/2 + 60px 封顶；mirage 路径不含静态项')
+
+    // ---- mirage 数值判据：指针居中时 offset 必须恒 0 ----
+    // 用真实语料的 (origin, depth) 组合跑**真实现** mirageParallaxOffset：
+    // 静态项一旦回加，刀/面具01/挂饰1/烟1 会立刻出现 −309/−469/−665/−277px，
+    // 头/身体约 −37/−33px，发饰 +64px —— 全部与用户实机报的一一对应。
+    {
+      const { mirageParallaxOffset } = mathMod
+      const ctx = { mode: 'mirage', active: true, mx: 0, my: 0, cx: 2048, cy: 1148, amount: 0.5, staticScale: 1 }
+      // 3233141951 的真实层参数（origin.y / parallaxDepth 取自 scene.pkg）
+      const corpus = [
+        ['刀#278', 954.9, [2.8, 3.2], -309],
+        ['烟1#105', 532.5, [0.9, 0.9], -277],
+        ['面具01#216', 478.2, [1.4, 1.4], -469],
+        ['挂饰1#314', 197.6, [1.4, 1.4], -665],
+        ['发饰#119', 1240.1, [1.4, 1.4], 64],
+        ['头#26', 1091.1, [1.3, 1.3], -37],
+      ]
+      let bad = 0
+      for (const [name, oy, pd] of corpus) {
+        const off = mirageParallaxOffset({ origin: [2048, oy, 0], parallaxDepth: pd }, ctx)
+        if (Math.abs(off[0]) > 1e-9 || Math.abs(off[1]) > 1e-9) {
+          bad++
+          fail(`mirage 指针居中时 ${name} offset 必须为 0，实得 (${off[0].toFixed(1)}, ${off[1].toFixed(1)})`)
+        }
+      }
+      if (!bad) {
+        ok(`mirage 指针居中：${corpus.length} 个真实层 offset 全 0（静态项未回加）`)
+        // 反向：鼠标推到边角时必须有位移，否则等于把视差关掉
+        const moved = mirageParallaxOffset({ origin: [2048, 954.9, 0], parallaxDepth: [2.8, 3.2] },
+          { ...ctx, mx: -0.5 * 4096 * 0.07, my: -0.5 * 2296 * 0.07 })
+        if (Math.abs(moved[1]) < 50) fail(`mirage mouse 项失效（刀 在指针到边时位移仅 ${moved[1].toFixed(1)}px）`)
+        else ok(`mirage mouse 项仍生效（刀 指针到边位移 ${moved[1].toFixed(0)}px）`)
+      }
+    }
   }
 
   // ---- alignment 绝对语义：origin 必须真的落在对应的边/角上 ----

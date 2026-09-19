@@ -466,19 +466,44 @@ export function legacyParallaxOffset(layer, ctx) {
 }
 
 /**
- * Mirage 路径（SceneUniformBinder.cpp:260-292）：
+ * Mirage 路径：`offset = mouse × depth × amount`（**不含节点静态项**）。
  *   mouse  = ((0.5 - px) * orthoW, (py - 0.5) * orthoH) * mouseinfluence
- *   offset = ((origin - camPos) * staticScale + mouse) * depth * amount
- * camPos = (orthoW/2, orthoH/2)；depth 直接乘；无封顶。
+ * 无 d/2、无 60px 封顶 —— 与 legacy 的两个差别就在这里。
+ *
+ * [we-scene patch 2026-09-19 用户实机复核] **去掉 (origin − camPos) 静态项。**
+ *
+ * Mirage 原式是 `((origin − camPos) * staticScale + mouse) * depth * amount`
+ * （SceneUniformBinder.cpp:260-292，camPos = 正交主相机节点 = 场景中心）。第四轮
+ * 「双路径」按「Mirage 原样」把静态项加回白名单路径，随后用户实机复核**逐项报错，
+ * 且每一项都对得上静态项的预测值**（指针居中 → mx=my=0，故偏移全部来自静态项）：
+ *
+ *   | 层 | depth.y | origin.y | 静态项预测 | 用户原话 |
+ *   | --- | --- | --- | --- | --- |
+ *   | 刀#278 | 3.20 | 954.9 | −309px（−13.5% 高） | 偏上 ~10% |
+ *   | 烟1#105 | 0.90 | 532.5 | −277px（−12.1%） | 偏上 ~10% |
+ *   | 烟2#111 | 0.90 | 588.6 | −252px（−11.0%） | 同上 |
+ *   | 面具01#216 | 1.40 | 478.2 | −469px（−20.4%） | 偏上 |
+ *   | 挂饰1#314 | 1.40 | 197.6 | −665px（−29.0%） | 偏上 |
+ *   | 发饰#119 | 1.40 | 1240.1 | **+64px（+2.8%，向下）** | 偏下 ~5% |
+ *   | 头#26 / 身体#21 | 1.3 / 1.6 | ~1100 | −37 / −33px（≈1.5%） | 脸正常 |
+ *   | 朱鹤#403 / 下音条01#392 | null / 0 | — | 0 | 阴影、音条正常 |
+ *
+ * 同一个公式里「偏上 10~29%」与「发饰偏下」的**符号差异**只有 (origin.y − camPos.y)
+ * 能解释（origin 在场景中心下方 → 上移，在上方 → 下移），而头/身体恰好贴近中心
+ * 所以只有 ~1.5%（看不出来）。这与第三轮「移除静态项 → 全层对齐官方设计构图」是
+ * 同一结论、同一批层；第四轮把它当「Mirage 原样」加回来是错的。
+ *
+ * 保留的 Mirage 语义：mouse 的 XY 符号与量纲（(0.5−px)·orthoW / (py−0.5)·orthoH，
+ * 乘 mouseinfluence）、depth 直接乘、无 d/2、无封顶 —— 指针居中时 offset 恒 0，
+ * 各层回到作者设计构图位。
  */
 export function mirageParallaxOffset(layer, ctx) {
   if (!ctx || !ctx.active || !layer.parallaxDepth) return [0, 0]
   const dx = Number(layer.parallaxDepth[0])
   const dy = Number(layer.parallaxDepth[1])
   if (!Number.isFinite(dx) || !Number.isFinite(dy)) return [0, 0]
-  const origin = layer.origin || [0, 0, 0]
-  const ox = ((origin[0] - ctx.cx) * (ctx.staticScale ?? 1) + ctx.mx) * dx * ctx.amount
-  const oy = ((origin[1] - ctx.cy) * (ctx.staticScale ?? 1) + ctx.my) * dy * ctx.amount
+  const ox = ctx.mx * dx * ctx.amount
+  const oy = ctx.my * dy * ctx.amount
   return [ox, oy]
 }
 

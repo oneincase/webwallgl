@@ -843,11 +843,12 @@ export function createRenderer(canvas, opts = {}) {
     : { x: 0, y: 0, sx: 0, sy: 0 }
   // [we-scene patch] 视差上下文（每帧 renderScene 更新；layerModelMatrix /
   // hittest / 粒子宿主共用 layerParallaxOffset）：
-  //   mode='mirage' → mx/my/cx/cy/amount/staticScale
+  //   mode='mirage' → mx/my/amount（cx/cy 只作诊断，**不再进公式**：静态项已按
+  //                   用户实机复核移除，见 math.js mirageParallaxOffset 的层表）
   //   mode='legacy' → lx/ly（已封顶+取负的 parOff）
   const parallaxCtx = {
     mode: parallaxFormula,
-    mx: 0, my: 0, amount: 0, cx: 0, cy: 0, staticScale: 1,
+    mx: 0, my: 0, amount: 0, cx: 0, cy: 0,
     lx: 0, ly: 0,
     active: false,
   }
@@ -1618,9 +1619,8 @@ export function createRenderer(canvas, opts = {}) {
     let margin = 64
     if (layer.parallaxDepth && parallaxCtx.active) {
       if (parallaxCtx.mode === 'mirage') {
-        // Mirage 上界 = (|origin−center| + |mouse|) × |d| × amount
-        margin += Math.abs((layer.origin[0] - parallaxCtx.cx) * layer.parallaxDepth[0] * parallaxCtx.amount)
-        margin += Math.abs((layer.origin[1] - parallaxCtx.cy) * layer.parallaxDepth[1] * parallaxCtx.amount)
+        // Mirage 上界 = |mouse| × |d| × amount（静态项已移除，见 math.js；
+        // 多算静态项会让裁剪盒过宽，等于关掉边缘裁剪）
         margin += Math.abs(layer.parallaxDepth[0] * parallaxCtx.mx * parallaxCtx.amount)
         margin += Math.abs(layer.parallaxDepth[1] * parallaxCtx.my * parallaxCtx.amount)
       } else {
