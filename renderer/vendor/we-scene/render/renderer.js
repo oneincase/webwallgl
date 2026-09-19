@@ -1617,13 +1617,16 @@ export function createRenderer(canvas, opts = {}) {
     const cy = cam.projH - layer.origin[1]
     // 视差与相机抖动会让层浮动；留余量避免边缘层被误裁。
     let margin = 64
-    if (layer.parallaxDepth && parallaxCtx.active) {
-      if (parallaxCtx.mode === 'mirage') {
-        // Mirage 上界 = |mouse| × |d| × amount（静态项已移除，见 math.js；
-        // 多算静态项会让裁剪盒过宽，等于关掉边缘裁剪）
-        margin += Math.abs(layer.parallaxDepth[0] * parallaxCtx.mx * parallaxCtx.amount)
-        margin += Math.abs(layer.parallaxDepth[1] * parallaxCtx.my * parallaxCtx.amount)
-      } else {
+    if (layer.parallaxDepthOwn || layer.parallaxDepth || layer.parallaxDepthProp) {
+      if (parallaxCtx.active && parallaxCtx.mode === 'mirage') {
+        // 引擎原式上界 = |anchor − center + mouse| × |d| × amount（静态项也计入，
+        // 见 math.js mirageParallaxOffset）
+        const depth = layer.parallaxDepthProp || layer.parallaxDepth || [0, 0]
+        const anchor = layer.parallaxAnchor || [cx, cam.projH - cy]
+        const ox = Math.abs(anchor[0] - parallaxCtx.cx + parallaxCtx.mx) * Math.abs(depth[0]) * parallaxCtx.amount
+        const oy = Math.abs(anchor[1] - parallaxCtx.cy + parallaxCtx.my) * Math.abs(depth[1]) * parallaxCtx.amount
+        margin += ox + oy
+      } else if (parallaxCtx.active && layer.parallaxDepth) {
         // Legacy 上界 = |d|/2 × |parOff|（parOff 已 60px 封顶）
         margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[0]) * parallaxCtx.lx)
         margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[1]) * parallaxCtx.ly)

@@ -496,6 +496,14 @@ export function parseScene(sceneJson, project) {
       perspective: o.perspective === true ? true : undefined,
       // 视差深度（vec2：x/y 方向分量；近景正值位移大、远景负值反向）
       parallaxDepth: o.parallaxDepth !== undefined ? parseVec2(o.parallaxDepth) : null,
+      // [we-scene patch] 视差是**组级**属性：WE/引擎把「本节点 + 它下面的整棵子树」
+      // 当成一个整体平移，锚点是**本节点自己的世界位置**，深度也是**本节点自己声明的
+      // 值**（子层自己写 parallaxDepth 不参与，除非父链上有节点写了
+      // `disablepropagation: true` 截断）。Mirage 原式见 math.js mirageParallaxOffset。
+      // 这两个字段就是给那条路径用的：parallaxDepthOwn = 本层**自己写的**深度，
+      // disablePropagation = 是否把视差拦在自己这一层、不向子层传播。
+      parallaxDepthOwn: o.parallaxDepth !== undefined ? parseVec2(o.parallaxDepth) : null,
+      disablePropagation: o.disablepropagation === true,
       effects: (o.effects || []).map((e) => ({
         file: e.file || '',
         // [we-scene patch] 效果名要留着：对象脚本按名字取效果开关外观
@@ -595,6 +603,34 @@ export function parseScene(sceneJson, project) {
         changed = true
       }
       if (!changed) break
+    }
+  }
+
+  // [we-scene patch] 视差锚点（mirage 路径专用，2026-09-19 用 Mirage 自渲染帧定案）。
+  //
+  // WE 的视差是「节点级」的：从本层沿父链向上走，凡是没写 `disablepropagation: true`
+  // 的祖先都会被**整体接管**——偏移用**最上层那个祖先的世界位置**算，深度也用
+  // **那个祖先自己声明的**深度（子层自己写的被忽略）。语义就是「组视差带着整棵子树
+  // 刚性平移」，所以同一组里的挂饰/面具必须挪一样多。
+  //
+  // 3233141951 上一版没做这件事：它给每个子层用**自己的** origin 算静态项，于是
+  // 面具01/挂饰1/挂饰2（父层是空组 576，视差 1.4）各自被挪了不同距离 —— 与 Mirage
+  // 自渲染帧逐像素比对时该区域平均 |Δ亮度| 42.2（错）vs 25.6（按本规则）。
+  // 锚点只存世界坐标两个数（不存对象引用，避免层对象出现环、JSON 化爆掉），
+  // 上层节点自己动时由 recomposeWorld 刷新。
+  {
+    const byId = new Map()
+    for (const L of layers) if (L.id !== undefined) byId.set(L.id, L)
+    for (const L of layers) {
+      let node = L
+      for (let p = L.parentId != null ? byId.get(L.parentId) : null; p; p = p.parentId != null ? byId.get(p.parentId) : null) {
+        if (p.disablePropagation === true) break
+        node = p
+      }
+      L.parallaxNodeId = node === L ? null : node.id
+      L.parallaxAnchor = [node.origin ? node.origin[0] : 0, node.origin ? node.origin[1] : 0]
+      const d = node.parallaxDepthOwn
+      L.parallaxDepthProp = d ? d.slice() : [0, 0]
     }
   }
 
@@ -751,6 +787,19 @@ export function recomposeWorld(layers, dirty) {
     if (l.attachBase) {
       l.attachBase[0] = w.origin[0]
       l.attachBase[1] = w.origin[1]
+    }
+  }
+  // [we-scene patch] 视差锚点跟着动：视差节点的世界 origin 变了（组自己绑了脚本/
+  // 关键帧动画），它后代层缓存的 parallaxAnchor 要刷新，否则偏移还按旧锚点算。
+  if (byId.size) {
+    for (const l of layers) {
+      if (l.parallaxNodeId == null) continue
+      if (dirty && !dirty.has(l.parallaxNodeId)) continue
+      const n = byId.get(l.parallaxNodeId)
+      if (n && l.parallaxAnchor) {
+        l.parallaxAnchor[0] = n.origin[0]
+        l.parallaxAnchor[1] = n.origin[1]
+      }
     }
   }
 }
