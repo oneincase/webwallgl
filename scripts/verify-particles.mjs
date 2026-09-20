@@ -853,8 +853,14 @@ function runMatrixGlyphSize() {
   if (!/uniform \? 1 : \(Math\.min\(asx, asy\)/.test(psrc)) {
     errors.push("等比图层 scale 不得乘进 sysScale（否则 matrix 字随 1.476 放到 148px 叠成没缝）");
   }
-  if (!/v \* 0\.01 \* framePx/.test(psrc)) {
-    errors.push("TEXS 小帧 + sizerandom≈100 须按帧长边百分比（50px），不能当 100 像素");
+  // [we-scene patch] 官方 quad 公式：宽 = size × texAspectX = size × 0.5
+  // （assets/shaders/common_particles.h::ComputeParticlePosition）。旧实现把 size 当长边，
+  // 需要一条「80~120 → 帧长边百分比」的补偿 hack 才得到同样的 50px；现在公式本身给出。
+  if (!/this\.texAspectX = 0\.5/.test(psrc)) {
+    errors.push("quad 宽必须是 size × 0.5（官方 ComputeParticlePosition），texAspectX 应为 0.5");
+  }
+  if (/v \* 0\.01 \* framePx/.test(psrc)) {
+    errors.push("尺寸换算里不得再有「帧长边百分比」补偿 hack（官方公式已给出等价结果）");
   }
   const layer = { origin: [0, 0, 0], scale: [1.47631, 1.47631, 1.47631], angles: [0, 0, 0] };
   const ps = new ParticleSystem(null, { maxcount: 1, sequencemultiplier: 2 }, null, layer);
@@ -870,11 +876,8 @@ function runMatrixGlyphSize() {
   if (Math.abs((ps.frameLongPx || 0) - 50) > 1e-6) {
     errors.push(`TEXS 50×50 的 frameLongPx 应为 50，实际 ${ps.frameLongPx}`);
   }
-  // 与 fillInstances 的 sizePx 同构：100 → 50px，再 × sysScale=1
-  let v = 100;
-  const framePx = ps.frameLongPx || 0;
-  if (framePx > 0 && framePx <= 64 && v >= 80 && v <= 120) v = v * 0.01 * framePx;
-  const glyph = v * ps.sysScale;
+  // 与 fillInstances 同构：quad 宽 = size × texAspectX × sysScale = 100 × 0.5 × 1 = 50px
+  const glyph = 100 * (ps.texAspectX || 1) * ps.sysScale;
   if (Math.abs(glyph - 50) > 0.5) {
     errors.push(`matrix 字号应为 50px（帧 100%），实际 ${glyph}（旧：100×1.476=148 与列距 74 重叠）`);
   }
@@ -1171,8 +1174,9 @@ function runSpriteTrail() {
         if (!ps.texFrames || ps.texFrames.length !== 2) {
           errors.push(`2468489223 ${d.path}: pezanimado 应为 TEXS 两帧，实际 ${ps.texFrames?.length}`);
         }
-        if (Math.abs((ps.texAspectX || 0) - 50 / 70) > 0.02) {
-          errors.push(`2468489223 ${d.path}: 单帧宽高比应为 50/70，实际 ${ps.texAspectX}/${ps.texAspectY}`);
+        // 官方：quad 宽 = size×0.5、高 = size×0.5×(帧高/帧宽) → 50×70 帧应得 0.5 / 0.7
+        if (Math.abs((ps.texAspectX || 0) - 0.5) > 1e-6 || Math.abs((ps.texAspectY || 0) - 0.5 * (70 / 50)) > 1e-6) {
+          errors.push(`2468489223 ${d.path}: 单帧 quad 比例应为 0.5/0.7（宽=size/2、高=size/2×h/w），实际 ${ps.texAspectX}/${ps.texAspectY}`);
         }
         if (Math.abs(ps.ops.alphaFade?.fadeIn - 0.1) > 1e-9 || Math.abs(ps.ops.alphaFade?.fadeOut - 0.9) > 1e-9) {
           errors.push(

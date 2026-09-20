@@ -738,11 +738,15 @@ export class ParticleSystem {
       this.texFrames = null
       this.frameCount = this.sequenceMul * this.sequenceMul
     }
-    // 精灵 quad 的宽高比取自**贴图（单帧）本身**：WE 的粒子精灵是带纹理比例的四边形。
-    // size 控制的是精灵的**长边**，短边按贴图比例压缩：
-    // 全库 72 个非方形贴图的粒子层实测，按"size=长边"只有 4% 的精灵超出屏幕 1.5 倍，
-    // 按"size=短边"则有 18%（光轴会算出 36545px、雨滴 6400px 这种荒谬尺寸）。
-    // 这样光轴/雨丝才是细长条：高度由 size 决定、宽度被压到 1/4。
+    // [we-scene patch] 精灵 quad 的尺寸/宽高比**按官方公式**
+    // （assets/shaders/common_particles.h::ComputeParticlePosition）：
+    //     quad 宽 = size × 0.5
+    //     quad 高 = size × 0.5 × (帧高 / 帧宽)
+    // 即 `size` 是「两倍精灵宽度」，高度只由**帧**的高宽比拉伸（SPRITESHEET 时用
+    // 帧的高宽比，否则用贴图的高宽比）。旧实现把 size 当**长边**（宽 = size×w/long、
+    // 高 = size×h/long）：方形贴图会大 2 倍、竖长贴图反而小 2 倍 —— 与 Mirage 出帧
+    // 逐帧对照时「我们的粒子又大又糊」（halo/雾/光斑尤其明显）就是这个。
+    // size 本体一个字都不改（sim 与 WE 的 sizerandom 同语义），只改 quad 映射。
     let aw = 1
     let ah = 1
     if (this.texFrames && list) {
@@ -753,10 +757,10 @@ export class ParticleSystem {
       ah = tex.height
     }
     const longSide = Math.max(aw, ah) || 1
-    this.texAspectX = aw / longSide
-    this.texAspectY = ah / longSide
-    // TEXS 单帧长边。sizerandom=100 对 50×50 字符帧是「100% 帧尺寸」，不是 100px。
-    this.frameLongPx = this.texFrames ? longSide : 0
+    this.texAspectX = 0.5
+    this.texAspectY = 0.5 * ((ah || 1) / (aw || 1))
+    // 保留：TEXS / 贴图单帧的长边（诊断与旧判据读它；不再参与尺寸换算）
+    this.frameLongPx = longSide
     this._frameData = undefined // 帧表变化时重建 uniform 缓存
   }
 
@@ -1076,7 +1080,9 @@ export class ParticleSystem {
     const sizeMul = this._ov.size || 1
 
     p.life = I.life ? Math.max(0.001, randExp(I.life.min, I.life.max, I.life.exp) * this.lifetimeMul) : 1
-    p.baseSize = I.size ? randExp(I.size.min, I.size.max, I.size.exp) * sizeMul : sizeMul
+    // 无 sizerandom 时官方默认 size=20（Domain/Scene/World.cppm 的 Particle::size），
+    // 旧实现落 1 → 这些系统（441 个模型里的 3 个）精灵小 20 倍。
+    p.baseSize = I.size ? randExp(I.size.min, I.size.max, I.size.exp) * sizeMul : 20 * sizeMul
     p.size = p.baseSize
 
     if (I.color) {
@@ -1620,14 +1626,10 @@ export class ParticleSystem {
 
     const bright = (this._ov.brightness || 1) * (this.overbright ?? 1)
     const sysScale = this.sysScale
-    const framePx = this.frameLongPx || 0
-    // TEXS 小帧 + sizerandom≈100：100 是帧长边的百分比（matrix 50×50 → 50px），
-    // 按像素会长边会把字画成两倍并与列内间距重叠。
-    const sizePx = (s) => {
-      let v = Math.abs(s)
-      if (framePx > 0 && framePx <= 64 && v >= 80 && v <= 120) v = v * 0.01 * framePx
-      return v * sysScale
-    }
+    // [we-scene patch] 官方公式下 size=100 对 50×50 帧自然得到 50px 宽（100×0.5），
+    // 旧实现需要一条「80~120 → 帧长边百分比」的补偿 hack 才等价，已在 quad 映射里
+    // 一次性解决（见 setTexture 的 texAspect）。此处只保留图层缩放。
+    const sizePx = (s) => Math.abs(s) * sysScale
     // 精灵形状 = 贴图宽高比 × 图层非等比 scale
     const stretchX = this.spriteStretchX * (this.texAspectX || 1)
     const stretchY = this.spriteStretchY * (this.texAspectY || 1)
