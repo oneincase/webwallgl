@@ -509,7 +509,13 @@ function runTextures() {
     // halo_6 = xray 开窗蒙版、bubble3 = 原版「黑底小气泡群」（形状在 RGB、additive）：
     // 两者的**原版素材本身**平均 alpha 就高（halo_6 0.464、bubble3 1.0），
     // 「精灵平均 alpha ≤0.35」这条是给程序化软光斑标定的，对它们不适用。
-    const isEffectMask = /^particle\/halo_6$/.test(n) || /^particle\/bubbles\/bubble3$/.test(n);
+    // [we-scene patch 2026-09-20] smoke2/smoke2light 同理：按官方素材实测重建后整帧均值
+    // 0.458（烟就是**浓团絮**，45.8% 是实测原版值），照判等于判官方不合格。它们的覆盖率/
+    // 均值/径向剖面与「每帧四边 alpha ≤2」已按实测值锁在 verify-textures 的【烟图集】。
+    const isEffectMask =
+      /^particle\/halo_6$/.test(n) ||
+      /^particle\/bubbles\/bubble3$/.test(n) ||
+      /^particle\/smoke\/smoke2(light)?$/.test(n);
     if (!isNormal && !isEffectMask && edge / 255 > 0.06)
       errors.push(`${n}: 边缘 alpha=${(edge / 255).toFixed(3)} 未收敛 → 会露出方块边`);
     if (!isNormal && !isEffectMask && avgA > 0.35)
@@ -1687,7 +1693,9 @@ function runRefractTangents() {
     [/v_refract = vec4\(rightXY, upXY\) \* u_refractScale/, "顶点着色器必须按旋转基算切线"],
     [/v_refract\.x \* nxy\.x \+ v_refract\.z \* nxy\.y/, "frag 必须用切线点乘法线"],
     [/nMask \* v_color\.a/, "偏移必须乘 normal.a 蒙版 × 粒子 alpha"],
-    [/rgb = t\.rgb \* v_color\.rgb \* scene/, "官方是 color.rgb *= scene（albedo 相乘）"],
+    // [we-scene patch 2026-09-20] 反照率变量已改名为 albedoRgb/albedoA（R8 直传要在着色器里
+    // 补 WE 语义 `vec4(1,1,1,r)`，形状不再恒等于 t.a）—— 语义未变，只是取值来源分了两条。
+    [/rgb = albedoRgb \* v_color\.rgb \* scene/, "官方是 color.rgb *= scene（albedo 相乘）"],
   ]) {
     if (!re.test(shSrc)) errors.push(`接线缺失：${msg}`);
   }
@@ -1779,8 +1787,11 @@ function runRefractBlank() {
   // 官方语义（common_particles.h + genericparticle.frag）：空白白图**照常**输出
   // （alpha = albedo.a × 顶点 alpha），靠 `color.rgb *= scene(uv+offset)` 天然隐形 ——
   // 法线平坦处 offset=0、采回的就是原画面。判据钉三件事：
-  //   ① 认 DXT5nm(AG) 与 RG 两条法线布局；② 画面是**乘**进 albedo（不是替换）；
+  //   ① 认 WE 打包(AG) 与 RG 两条法线布局；② 画面是**乘**进 albedo（不是替换）；
   //   ③ 不得再有「拿法线偏离顶替 alpha」的旧 hack（没采到画面时它会画出白 quad）。
+  // [we-scene patch 2026-09-20] 通道取值的变量名随 R8 直传拆开（见 shader 注释）：
+  // 反照率走 `albedoRgb`/`albedoA`（u_albedoR8=1 时 rgb 恒白、形状取 .r），法线布局走
+  // `u_normalPacked`。判据比对的是这两条取值路径本身，不再要求字面上的 `t.rgb`/`t.a`。
   if (!/u_scene/.test(shader) || !/ntex\.ag/.test(shader) || !/ntex\.rg/.test(shader)) {
     errors.push("粒子 shader 未实现 REFRACT（需同时认 WE 打包 AG 与官方 RG 两条法线布局）");
   }
@@ -1794,11 +1805,11 @@ function runRefractBlank() {
   if (/ntex\.r > 0\.85 && ntex\.b < 0\.15/.test(shader)) {
     errors.push("不得再用「R>0.85 即 DXT5nm」的逐像素启发式（官方剪影法线会被判反）");
   }
-  if (!/rgb = t\.rgb \* v_color\.rgb \* scene/.test(shader)) {
+  if (!/rgb = albedoRgb \* v_color\.rgb \* scene/.test(shader)) {
     errors.push("REFRACT 必须按官方把画面乘进 albedo（rgb = albedo × 顶点色 × scene），否则空白白图会画成白块");
   }
-  if (!/float alpha = t\.a \* v_color\.a/.test(shader)) {
-    errors.push("REFRACT 的 alpha 必须是官方的 t.a × v_Color.a");
+  if (!/float alpha = albedoA \* v_color\.a/.test(shader)) {
+    errors.push("REFRACT 的 alpha 必须是官方的 albedo.a × v_Color.a");
   }
   if (/mix\(t\.a, drop, blank\)/.test(shader)) {
     errors.push("不得再用「法线偏离顶替 alpha」的旧 hack（官方就是 albedo.a × 顶点 alpha）");
@@ -2846,8 +2857,12 @@ function runSoftRim() {
     errors.push("particle/drop_normal 边缘被误封（法线 alpha 是折射蒙版，必须豁免）");
   }
 
-  // 烟/雾：紧凑径向窗 —— 中心外 75% 半径必须完全透明，且整体 ink 集中在核内
-  for (const [name, peakMin] of [["particle/smoke/smoke2", 150], ["particle/fog/fog1", 180], ["particle/smoke/smoke1", 160]]) {
+  // 烟/雾：紧凑径向窗 —— 中心外 75% 半径必须完全透明，且整体 ink 集中在核内。
+  // [we-scene patch 2026-09-20] 只剩 smoke1 仍是单帧 `fogNoise`；smoke2/smoke2light 与
+  // fog1..fog3 已按官方素材实测重建为**多帧图集**，形态就是「团絮铺满整帧」
+  // （官方 fog1 整帧均值 5.0%、smoke2 45.8%，半径 0.75 外本来就有内容），防方块边改由
+  // **每帧四边 alpha→0** 保证 —— 紧凑窗判据对它们不成立（照判等于判官方不合格）。
+  for (const [name, peakMin] of [["particle/smoke/smoke1", 160]]) {
     const t = ptex.buildBuiltinParticleTexture(name);
     const W = t.width, rgba = t.rgba;
     let outer = 0, mean = 0, above8 = 0;
@@ -2865,6 +2880,42 @@ function runSoftRim() {
     if (outer > 0) errors.push(`${name} 半径 0.75 外仍有 alpha=${outer}（方块裙边回归）`);
     if (above8 / n > 0.5) errors.push(`${name} 有效区占 ${(100 * above8 / n).toFixed(0)}%（>50%，低 alpha 铺满方块）`);
     if (mean < 0.3) errors.push(`${name} 平均 alpha=${mean.toFixed(2)}（过稀，烟雾看不见）`);
+  }
+
+  // 图集族（smoke2/smoke2light/fog1）：紧凑窗换成**图集口径**的同款不变式 ——
+  // 帧表齐全（引用方 sequencemultiplier 为 null = 引擎默认 SEQUENCE，没有帧表就完全静止）
+  // 且每帧四边 alpha→0（这是图集唯一能防「放大后露 quad 直边」的手段：原版团絮铺满整帧）。
+  // 能量/覆盖率/径向剖面/精确循环按官方实测值锁在 verify-textures，这里不重复。
+  for (const name of ["particle/smoke/smoke2", "particle/smoke/smoke2light", "particle/fog/fog1"]) {
+    const t = ptex.buildBuiltinParticleTexture(name);
+    const frames = Array.isArray(t.frames) && t.frames.length ? t.frames : ptex.builtinParticleFrames(name);
+    if (!Array.isArray(frames) || frames.length < 2) {
+      errors.push(`${name} 已按官方重建为图集，必须带多帧帧表（实得 ${frames && frames.length}；没帧表=粒子静止）`);
+      continue;
+    }
+    let border = 0;
+    for (const f of frames) {
+      const FW = f.width, FH = f.height;
+      for (let i = 0; i < FW; i++) {
+        border = Math.max(
+          border,
+          t.rgba[(f.y * t.width + f.x + i) * 4 + 3],
+          t.rgba[((f.y + FH - 1) * t.width + f.x + i) * 4 + 3],
+        );
+      }
+      for (let i = 0; i < FH; i++) {
+        border = Math.max(
+          border,
+          t.rgba[((f.y + i) * t.width + f.x) * 4 + 3],
+          t.rgba[((f.y + i) * t.width + f.x + FW - 1) * 4 + 3],
+        );
+      }
+    }
+    let sum = 0;
+    for (let i = 0; i < t.width * t.height; i++) sum += t.rgba[i * 4 + 3];
+    const mean = sum / (t.width * t.height);
+    if (border > 2) errors.push(`${name} 图集每帧四边 alpha=${border}（应 ≤2，否则放大后露方块边）`);
+    if (mean < 1) errors.push(`${name} 图集整体过空（均值 ${mean.toFixed(2)}/255）→ 粒子看不见`);
   }
 
   // 行为判据（真实语料）：排气烟雾的精灵覆盖面积必须明显小于整块 quad
