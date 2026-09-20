@@ -237,6 +237,78 @@ function beam(w, h, coreWidth, fadeBoth, peak) {
   return { width: w, height: h, rgba }
 }
 
+/**
+ * 原版 `particle/bubbles/bubble3` —— **照本机原版素材实测重建**。
+ *
+ * 原版：1024×1024 图集、**TEXS 64 帧**（每帧 128×128，8×8）、format 0、
+ * **alpha 恒 255（形状在 RGB）**。帧 0 实测：非黑(>24) 仅 **2.9%**、亮(>100) 0.4%、
+ * 均值 2.4/255、峰值 253、**连通域 45 个**（最大 85px，宽度中位 **2px**）——
+ * 即「黑底 + 一大片**细小的青色气泡/亮点**」，配合材质的 `blending: additive`
+ * （黑色=不贡献）在画面上就是一层细密的小气泡。
+ *
+ * 旧实现是 `bubbleSheet(256, 3)`：2×2 四帧、**白色实心肥皂泡**，还带 alpha 形状 ——
+ * 与「64 帧黑底小气泡群」完全两回事（1837470104「Ocean bubbles」两种素材下不一样）。
+ */
+function bubbleClusterSheet(size, frames, perFrame, seed) {
+  const cell = Math.round(size / Math.sqrt(frames))
+  const cols = Math.round(size / cell)
+  const rgba = new Uint8Array(size * size * 4)
+  // alpha 恒 255（原版如此：形状在 RGB，配合 additive —— 黑色不贡献、亮点才可见）
+  for (let i = 0; i < size * size; i++) rgba[i * 4 + 3] = 255
+  const rng = mulberry32(seed >>> 0)
+  // 每个小气泡一个生命周期：跨帧淡入-涨大-淡出，形成"咕嘟"循环
+  const specks = []
+  for (let i = 0; i < perFrame; i++) {
+    const ang = rng() * Math.PI * 2
+    const rad = Math.pow(rng(), 1.15) * 0.38 * cell
+    specks.push({
+      x: cell / 2 + Math.cos(ang) * rad,
+      y: cell / 2 + Math.sin(ang) * rad,
+      r: 0.5 + rng() * 1.35,
+      phase: rng(),
+      drift: (rng() - 0.5) * 0.06,
+      tint: [0.55 + rng() * 0.45, 0.75 + rng() * 0.25, 0.85 + rng() * 0.15],
+      // 亮度重尾：多数暗、少数很亮（原版峰值 253 而均值只有 2.4）
+      bright: rng() < 0.18 ? 0.75 + rng() * 0.6 : 0.22 + rng() * 0.35,
+    })
+  }
+  for (let f = 0; f < frames; f++) {
+    const ox = (f % cols) * cell
+    const oy = ((f / cols) | 0) * cell
+    const t = f / frames
+    for (const sp of specks) {
+      // 生命周期：每个气泡在自己的相位附近出现一次
+      const life = (t - sp.phase + 1) % 1
+      const grow = Math.min(1, life * 6)
+      const fade = life > 0.75 ? Math.max(0, 1 - (life - 0.75) / 0.25) : 1
+      const a = grow * fade * sp.bright
+      if (a <= 0.02) continue
+      const r = sp.r * (0.6 + 0.8 * Math.min(1, life * 3))
+      const cx = sp.x + sp.drift * cell * life * 3
+      const cy = sp.y - life * cell * 0.12
+      // 画一圈细环（气泡轮廓）+ 极淡的内芯
+      for (let y = Math.floor(cy - r - 1); y <= Math.ceil(cy + r + 1); y++) {
+        for (let x = Math.floor(cx - r - 1); x <= Math.ceil(cx + r + 1); x++) {
+          if (x < 0 || y < 0 || x >= cell || y >= cell) continue
+          const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy)
+          const ring = Math.exp(-Math.pow((d - r) / 0.7, 2))
+          const core = Math.exp(-Math.pow(d / (r * 0.9), 2)) * 0.22
+          const v = Math.min(1, (ring + core) * a)
+          if (v <= 0.01) continue
+          const o = ((oy + y) * size + ox + x) * 4
+          // additive 混合：RGB 即亮度，alpha 恒 255（与原版一致）
+          const add = (c) => Math.min(255, rgba[o + c] + Math.round(v * sp.tint[c] * 255 * 0.42))
+          rgba[o] = add(0)
+          rgba[o + 1] = add(1)
+          rgba[o + 2] = add(2)
+          rgba[o + 3] = 255
+        }
+      }
+    }
+  }
+  return { width: size, height: size, rgba }
+}
+
 // 雨丝图集（particle/nature/rain1、rain2）—— **照本机原版素材实测重建**。
 //
 // 原版 rain1.tex：1024×1024 / TEXS 4 帧（每帧 512×512，2×2 排布），R8（形状在 R）。
@@ -313,6 +385,15 @@ export function builtinParticleFrames(name) {
         width: RAIN_FRAME,
         height: RAIN_FRAME,
       })
+    }
+    return list
+  }
+  // bubble3：原版是 **TEXS 64 帧**（8×8/128²）——程序化图集必须把帧表一起给出来，
+  // 否则渲染端只能按引用方的 sequencemultiplier(2) 猜成 2×2，把 16 帧当一帧采样。
+  if (name === 'particle/bubbles/bubble3') {
+    const list = []
+    for (let i = 0; i < 64; i++) {
+      list.push({ x: (i % 8) * 128, y: ((i / 8) | 0) * 128, width: 128, height: 128 })
     }
     return list
   }
@@ -1250,7 +1331,9 @@ const BUILDERS = {
   // 气泡（原生 128 → 256）：三档环厚 / 高光
   'particle/bubbles/bubble1': () => bubbleSheet(256, 1),
   'particle/bubbles/bubble2': () => bubbleSheet(256, 2),
-  'particle/bubbles/bubble3': () => bubbleSheet(256, 3),
+  // 原版 bubble3 = 1024²/64 帧/黑底小气泡群（见 bubbleClusterSheet 注释）；
+  // 旧实现 bubbleSheet(256,3) 是白色实心肥皂泡，与它完全不是一回事（1837470104）。
+  'particle/bubbles/bubble3': () => bubbleClusterSheet(1024, 64, 58, 0xb3b31e),
   // 碎屑（原生 64 → 128）：固定种子高斯散点
   'particle/debris/debris1': () => debrisScatter(128),
   // 闪电（原生 128 → 256）：三种折线，种子不同
@@ -1377,7 +1460,10 @@ export function buildBuiltinParticleTexture(name) {
 // 雨滴的形状/边缘变形。
 const RIM_SEALED = [
   { re: /^particle\/(light|beam|fire)\//, band: 0.18 },
-  { re: /^particle\/bubbles\/(?!.*normal)/, band: 0.18 },
+  // bubble3 **排除**：它是原版那种「黑底 + 小气泡群」——形状在 **RGB**、alpha 恒 255、
+  // 走 additive（黑=不贡献）。封边只压 alpha，对它毫无作用，却会把图集外圈 0.18 带宽
+  // （1024² 上 ~184px，整个 frame 0）的 RGB 一起留着、alpha 归零 → 首帧整帧消失。
+  { re: /^particle\/bubbles\/(?!.*normal)(?!bubble3)/, band: 0.18 },
   { re: /^particle\/(misc|shape)\//, band: 0.18 },
   { re: /^particle\/(star|sickle)/, band: 0.18 },
   { re: /^particle\/drop$/, band: 0.08 },

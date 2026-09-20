@@ -394,6 +394,7 @@ function runRaster(verbose) {
     let drawn = 0;
     let worstLayerOver = 0;
     let worstLayerName = "";
+    let worstLayerTex = "";
     for (const d of scene.systems) {
       let ps;
       try {
@@ -411,6 +412,7 @@ function runRaster(verbose) {
       if (sa.overExposedPct > worstLayerOver) {
         worstLayerOver = sa.overExposedPct;
         worstLayerName = d.name || d.path;
+        worstLayerTex = d.texName || '';
       }
     }
     const a = analyzeTarget(target, BASE);
@@ -426,7 +428,8 @@ function runRaster(verbose) {
     // 这一层就是大片亮盘 —— 实测 Mirage 出帧 >240 灰阶占 5.96%，我们只有 0.14%，
     // 即**引擎比我们还亮**，不属于"参数/贴图有问题的真缺陷"。这条判据是给程序化精灵
     // 标定的，故对原版形态的贴图豁免（仍受"全场景累加 >35%"约束）。
-    const engineDiskLayer = /halo_6/.test(String(worstLayerName));
+    // 判据看**贴图名**（层的名字可能是 new_particle_system，与纹理无关）
+    const engineDiskLayer = /halo_6|bubbles\/bubble3/.test(String(worstLayerTex));
     if (worstLayerOver > 8 && !engineDiskLayer)
       errors.push(`${scene.id}: 单层 additive 过曝 ${worstLayerOver.toFixed(1)}%（${worstLayerName}）`);
     // 同一豁免：含原版 halo_6 亮盘的场景（2938612768）累加 35.3% 只是擦线，
@@ -503,7 +506,10 @@ function runTextures() {
     // 不是 additive 粒子精灵 —— 原版素材本身就平均 alpha 0.464（实心盘），
     // 按「精灵平均 alpha ≤0.35」判它等于判原版不合格。形状判据在【xray 开窗形状】。
     const isNormal = /normal/.test(n);
-    const isEffectMask = /^particle\/halo_6$/.test(n);
+    // halo_6 = xray 开窗蒙版、bubble3 = 原版「黑底小气泡群」（形状在 RGB、additive）：
+    // 两者的**原版素材本身**平均 alpha 就高（halo_6 0.464、bubble3 1.0），
+    // 「精灵平均 alpha ≤0.35」这条是给程序化软光斑标定的，对它们不适用。
+    const isEffectMask = /^particle\/halo_6$/.test(n) || /^particle\/bubbles\/bubble3$/.test(n);
     if (!isNormal && !isEffectMask && edge / 255 > 0.06)
       errors.push(`${n}: 边缘 alpha=${(edge / 255).toFixed(3)} 未收敛 → 会露出方块边`);
     if (!isNormal && !isEffectMask && avgA > 0.35)
@@ -1092,6 +1098,104 @@ function runXrayWindow() {
   }
   if (!/'particle\/halo': \(\) =>\s*\n?\s*radialProfile\(256, \[234, 225, 201, 164, 119, 75, 41, 19, 8, 3, 1\]/.test(src)) {
     errors.push("particle/halo 必须按原版实测剖面 radialProfile(256, [234,225,201,…]) 生成");
+  }
+  return { errors };
+}
+
+// ---------- 气泡图集 bubble3：必须是原版那种「黑底 + 成片小气泡」 ----------
+// 原版 particle/bubbles/bubble3：1024²、TEXS **64 帧**（每帧 128²、8×8）、alpha 恒 255
+// （形状在 RGB，配合材质的 additive：黑色不贡献）。帧 0 实测：非黑(>24) 2.9%、亮(>100) 0.4%、
+// 均值 2.4/255、峰值 253、连通域 45、宽度中位 2px。
+// 旧实现 bubbleSheet(256,3) 是 2×2 四帧「白色实心肥皂泡」，跟它完全不是一回事
+// （1837470104 Ocean bubbles 两种素材下明显不同）。
+function runBubbleSheet3() {
+  const errors = [];
+  const t = ptex.buildBuiltinParticleTexture("particle/bubbles/bubble3");
+  if (!t) {
+    errors.push("particle/bubbles/bubble3 无生成器");
+    return { errors };
+  }
+  if (t.width !== 1024) errors.push(`bubble3 图集应为 1024²（原版），实际 ${t.width}`);
+  const cell = 128;
+  const V = (x, y) => {
+    const o = (y * t.width + x) * 4;
+    return Math.max(t.rgba[o], t.rgba[o + 1], t.rgba[o + 2]);
+  };
+  let bright = 0;
+  let thin = 0;
+  let sum = 0;
+  let n = 0;
+  let peak = 0;
+  let alphaBad = 0;
+  for (let y = 0; y < cell; y++) {
+    for (let x = 0; x < cell; x++) {
+      const v = V(x, y);
+      n++;
+      sum += v;
+      if (v > 24) bright++;
+      if (v > 100) thin++;
+      if (v > peak) peak = v;
+      if (t.rgba[(y * t.width + x) * 4 + 3] !== 255) alphaBad++;
+    }
+  }
+  const pct = (bright / n) * 100;
+  if (!(pct > 1.2 && pct < 6.5)) {
+    errors.push(`bubble3 帧 0 非黑像素应在 1.2~6.5%（原版 2.9%），实际 ${pct.toFixed(1)}%`);
+  }
+  if (sum / n > 6) errors.push(`bubble3 帧 0 平均亮度应 ≤6（原版 2.4），实际 ${(sum / n).toFixed(1)}`);
+  if (peak < 90) errors.push(`bubble3 必须有亮的芯（原版峰值 253），实际 ${peak}`);
+  if (alphaBad > 0) errors.push(`bubble3 的 alpha 应恒 255（原版如此，形状在 RGB），实际 ${alphaBad} 个像素不是`);
+  // 连通域：必须是很多细小的点（原版 45 个、宽度中位 2px），不是一个实心大泡
+  const seen = new Uint8Array(t.width * cell);
+  const comps = [];
+  const dd = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+  for (let y = 0; y < cell; y++) {
+    for (let x = 0; x < cell; x++) {
+      const i = y * t.width + x;
+      if (seen[i] || V(x, y) <= 24) continue;
+      const st = [i];
+      seen[i] = 1;
+      let cnt = 0;
+      let minX = 1e9;
+      let maxX = 0;
+      while (st.length) {
+        const q = st.pop();
+        const qx = q % t.width;
+        const qy = (q / t.width) | 0;
+        cnt++;
+        if (qx < minX) minX = qx;
+        if (qx > maxX) maxX = qx;
+        for (const [dx, dy] of dd) {
+          const nx = qx + dx;
+          const ny = qy + dy;
+          if (nx < 0 || nx >= cell || ny < 0 || ny >= cell) continue;
+          const r = ny * t.width + nx;
+          if (!seen[r] && V(nx, ny) > 24) {
+            seen[r] = 1;
+            st.push(r);
+          }
+        }
+      }
+      comps.push({ cnt, w: maxX - minX + 1 });
+    }
+  }
+  const ws = comps.map((c) => c.w).sort((a, b) => a - b);
+  const medW = ws.length ? ws[ws.length >> 1] : 0;
+  if (!(comps.length >= 25 && medW > 0 && medW <= 10)) {
+    errors.push(`bubble3 应是成片细小的点（原版 45 个、宽度中位 2px），实际 ${comps.length} 个、宽度中位 ${medW}`);
+  }
+  // 帧表：程序化图集必须自带 8×8/128² 的 64 帧表，否则渲染端按 sequencemultiplier(2)
+  // 猜成 2×2，把 16 帧当一帧采样（首轮实测：给了图集却没给帧表 → 反而更不像）
+  const frames = ptex.builtinParticleFrames("particle/bubbles/bubble3");
+  if (!frames || frames.length !== 64) {
+    errors.push(`bubble3 内置帧表应为 64 帧（原版 TEXS 64），实际 ${frames ? frames.length : null}`);
+  } else if (frames[0].width !== 128 || frames[1].x !== 128 || frames[8].y !== 128) {
+    errors.push(`bubble3 帧表应为 8×8/128² 像素矩形，实际 ${JSON.stringify(frames[0])} / ${JSON.stringify(frames[8])}`);
+  }
+  // 接线
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js"), "utf8");
+  if (!/'particle\/bubbles\/bubble3': \(\) => bubbleClusterSheet\(1024, 64,/.test(src)) {
+    errors.push("particle/bubbles/bubble3 必须挂 bubbleClusterSheet(1024, 64, …)（原版 64 帧黑底小气泡）");
   }
   return { errors };
 }
@@ -2631,7 +2735,9 @@ function runSoftRim() {
     let border = 0;
     for (let x = 0; x < W; x++) border = Math.max(border, A(x, 0), A(x, H - 1));
     for (let y = 0; y < H; y++) border = Math.max(border, A(0, y), A(W - 1, y));
-    const isAtlasOrNormal = /normal|leaves|lightning|rain1|rain2|rain_drops|rosetepal/.test(name);
+    // bubble3 也排除：原版就是「黑底小气泡群」——**形状在 RGB、alpha 恒 255**，走 additive
+    // （封 alpha 边对它没用，反而会把图集外圈整帧压没），与原版一致才是对的。
+    const isAtlasOrNormal = /normal|leaves|lightning|rain1|rain2|rain_drops|rosetepal|bubbles\/bubble3/.test(name);
     if (isAtlasOrNormal) continue;
     if (border > 2) errors.push(`${name} 外圈 alpha=${border}（应严格 0，否则放大后露方块边）`);
     else sealed++;
@@ -3192,6 +3298,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【REFRACT 空白白图】问题 ${rb.errors.length}`);
   rb.errors.forEach((e) => console.log("  ! " + e));
   failed += rb.errors.length;
+  const b3 = runBubbleSheet3();
+  console.log(`\n【气泡图集 bubble3】问题 ${b3.errors.length}`);
+  b3.errors.forEach((e) => console.log("  ! " + e));
+  failed += b3.errors.length;
   const xw = runXrayWindow();
   console.log(`\n【xray 开窗形状】问题 ${xw.errors.length}`);
   xw.errors.forEach((e) => console.log("  ! " + e));
