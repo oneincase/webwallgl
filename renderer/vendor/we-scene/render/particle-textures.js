@@ -186,45 +186,64 @@ function beam(w, h, coreWidth, fadeBoth, peak) {
   return { width: w, height: h, rgba }
 }
 
-// 雨丝（particle/nature/rain1、rain2）：贴图自带的斜细丝 + 1×4 帧图集。
-// WE 官方 rain1.tex 的丝不是竖直的——raindownpour 预设无任何旋转、不开风、
-// velocity x 仅 -45（0.6°），但官方 preview（1823900922 / 1444077782）里雨丝
-// 统一倾斜 ~10°（上端在右），只能来自贴图本身；且预设写了
-// `animationmode: randomframe`（每粒随机固定一帧）——单帧贴图写它毫无意义，
-// 说明官方贴图是多帧图集：丝长 = quad 高 ÷ 帧数（官方丝 200-500px，
-// 整高会画出 400-1000px 的超长丝，1823900922 图1 的另一处失衡）。
-// 旧实现用 beam() 的竖直 σ0.16 粗核心单帧 → 粗白竖长光柱。
-// beam() 本身别动：beam_*/light_shafts 的竖直粗丝是它们自己的正确形态。
+// 雨丝图集（particle/nature/rain1、rain2）—— **照本机原版素材实测重建**。
+//
+// 原版 rain1.tex：1024×1024 / TEXS 4 帧（每帧 512×512，2×2 排布），R8（形状在 R）。
+// 对解码后的第 0 帧做连通域实测（阈值 >12/255）：
+//   · 89 段/帧，段长 p10 14 / p50 49 / p90 219 / max 304 px（**短丝为主，不是贯穿整帧**）；
+//   · 段宽 p50 2 / p90 5 px（细，抗锯齿后 2~5px）；
+//   · 峰值亮度 p50 24 / max 95（满量程 255，整体很暗）；
+//   · 整帧平均倾角 **-1.1°**（几乎垂直，略向左下）。
+//
+// 旧实现是「一帧一根 10° 斜丝」（当年照 preview 目测拍的：丝长 = quad 高、单粒一根）。
+// 后果：`raindownpour` 预设 sizerandom 800~1600 → quad 400~800px，一颗雨滴就画出一根
+// 400~800px 的**倾斜长丝**，而原版一颗雨滴画的是「十几根短细近垂直的丝」——
+// 1444077782 用户实测：「倾斜的雨粒子少而大」。preview 的 10° 观感来自整片短丝的叠加，
+// 不是单根丝的倾角。
 const RAIN_FRAMES = 4
-const RAIN_W = 128
-const RAIN_H = 512
-function rainStreak(w, h, tiltDeg, corePx, peak) {
-  const pk = peak === undefined ? 0.85 : peak
-  const rgba = new Uint8Array(w * h * 4)
-  const fh = h / RAIN_FRAMES
-  const rng = mulberry32(0x51ca1)
-  const tilt = Math.tan((tiltDeg * Math.PI) / 180)
-  const cx = w / 2
+const RAIN_FRAME = 512 // 单帧边长（官方 512）
+const RAIN_ATLAS = RAIN_FRAME * 2 // 2×2 图集
+function rainSheet(opts) {
+  const cfg = opts || {}
+  const segments = cfg.segments || 89
+  const peakMax = cfg.peakMax || 0.37
+  const peakPow = cfg.peakPow || 1.6
+  const lean = cfg.lean === undefined ? -0.019 : cfg.lean // tan(-1.1°)
+  const rgba = new Uint8Array(RAIN_ATLAS * RAIN_ATLAS * 4)
   for (let f = 0; f < RAIN_FRAMES; f++) {
-    // 帧间微差（亮度/粗细/水平相位）：randomframe 抽到不同帧的雨丝形态不一
-    const peakF = pk * (0.8 + rng() * 0.35)
-    const coreF = corePx * (0.85 + rng() * 0.5)
-    const ph = (rng() - 0.5) * w * 0.12
-    for (let y = 0; y < fh; y++) {
-      const ty = y / (fh - 1)
-      // 帧内第 0 行（屏幕上端）在右侧，向下渐左——与下落方向一致
-      const lineX = cx + ph + ((fh - 1) * tilt) / 2 - (fh - 1) * tilt * ty
-      const vy = gauss(ty - 0.5, 0.27)
-      for (let x = 0; x < w; x++) {
-        const d = Math.abs(x + 0.5 - lineX)
-        const g = Math.exp(-(d * d) / (coreF * coreF))
-        const a = g * vy * peakF
-        if (a < 0.004) continue
-        writeWhite(rgba, ((f * fh + y) * w + x) * 4, a)
+    const rng = mulberry32((0x9e3779b9 ^ (f * 0x85ebca6b)) >>> 0)
+    const ox = (f % 2) * RAIN_FRAME
+    const oy = ((f / 2) | 0) * RAIN_FRAME
+    // 原版图集的**每一帧四边 2px 内都是 0**（实测），所以丝必须留在帧内留边，
+    // 否则 2×2 图集的外圈会带 alpha（quad 边界露硬边）。
+    const MARGIN = 3
+    const write = (x, y, a) => {
+      if (x < MARGIN || y < MARGIN || x >= RAIN_FRAME - MARGIN || y >= RAIN_FRAME - MARGIN) return
+      const o = ((oy + y) * RAIN_ATLAS + ox + x) * 4
+      const v = Math.round(Math.min(1, Math.max(0, a)) * 255)
+      if (v * 255 > rgba[o + 3] * 255) writeWhite(rgba, o, v / 255) // 叠丝取最大值，不做加法
+    }
+    for (let i = 0; i < segments; i++) {
+      const x0 = rng() * RAIN_FRAME
+      const y0 = rng() * RAIN_FRAME
+      // 段长：中位 ~49、p90 ~219、max ~304 → 重尾分布
+      const len = 16 + 430 * Math.pow(rng(), 2.2)
+      const peak = 0.04 + (peakMax - 0.04) * Math.pow(rng(), peakPow)
+      const sigma = 0.5 + rng() * 0.35
+      for (let t = 0; t < len; t++) {
+        const y = Math.round(y0 + t)
+        const cx = x0 + lean * t
+        const fade = Math.min(1, Math.min(t, len - 1 - t) / 5)
+        if (fade <= 0) continue
+        for (let x = Math.floor(cx - 3); x <= Math.ceil(cx + 3); x++) {
+          const d = x + 0.5 - cx
+          const a = Math.exp(-(d * d) / (sigma * sigma)) * peak * fade
+          if (a > 0.004) write(x, y, a)
+        }
       }
     }
   }
-  return { width: w, height: h, rgba }
+  return { width: RAIN_ATLAS, height: RAIN_ATLAS, rgba }
 }
 
 /** 内置贴图的帧表（top-down **像素矩形** {x,y,width,height}，与 TEXS list 元素同构；
@@ -234,9 +253,16 @@ function rainStreak(w, h, tiltDeg, corePx, peak) {
  *  让这条坏了很久没人发现）。 */
 export function builtinParticleFrames(name) {
   if (name === 'particle/nature/rain1' || name === 'particle/nature/rain2') {
+    // 与官方 rain1.tex 同构：1024×1024、TEXS 4 帧、每帧 512×512、2×2
     const list = []
-    const fh = RAIN_H / RAIN_FRAMES
-    for (let i = 0; i < RAIN_FRAMES; i++) list.push({ x: 0, y: i * fh, width: RAIN_W, height: fh })
+    for (let i = 0; i < RAIN_FRAMES; i++) {
+      list.push({
+        x: (i % 2) * RAIN_FRAME,
+        y: ((i / 2) | 0) * RAIN_FRAME,
+        width: RAIN_FRAME,
+        height: RAIN_FRAME,
+      })
+    }
     return list
   }
   // 叶片 3×3 图集（leaf() 与引用方 sequencemultiplier:3 对应）
@@ -1149,8 +1175,9 @@ const BUILDERS = {
   // 水滴（原生 64×256 → 128×512）：竖长泪滴
   'particle/drop': () => teardrop(128, 512),
   // 雨丝（原生 64×256 → 128×512）：细长条，两端渐隐
-  'particle/nature/rain1': () => rainStreak(RAIN_W, RAIN_H, 10, 1.0, 0.78),
-  'particle/nature/rain2': () => rainStreak(RAIN_W, RAIN_H, 10, 1.6, 0.66),
+  'particle/nature/rain1': () => rainSheet({ segments: 120, peakMax: 0.42, peakPow: 2.4 }),
+  // rain2 本机原版素材缺失（WE 安装目录里没有），按同族关系取「更密更亮」的一档
+  'particle/nature/rain2': () => rainSheet({ segments: 120, peakMax: 0.55, peakPow: 2.2 }),
   // 雨滴 sheet（原生 128×256 → 256×512，2×4 格）：每格一颗上圆下尖小水滴
   'particle/water/rain_drops_sheet': () => dropSheet(256, 512, 2, 4),
   // 雾（原生 256 → 512）：絮状 fBm，弱遮罩铺满；三张不同尺度/种子

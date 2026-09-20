@@ -2219,10 +2219,13 @@ function runBuiltinFrames() {
   // 帧表必须是 top-down 像素矩形（TEXS list 同构）：setTexture 会再除贴图尺寸归一化。
   // 若返回的是归一化 {ou,ov,su,sv}，GL 路径会算出 NaN（CPU 光栅直接吃归一化格式，
   // 离线全绿但实机雨丝采样全废）——曾真实坏过，这里两侧都锁。
+  // 与官方 rain1.tex 同构：1024×1024 图集、4 帧、每帧 512×512、2×2 排布
   for (let i = 0; i < 4; i++) {
     const fr = frames[i];
-    if (fr.x !== 0 || fr.y !== i * 128 || fr.width !== 128 || fr.height !== 128) {
-      errors.push(`rain1 帧 ${i} 应为 1×4 竖排等分像素矩形，实际 ${JSON.stringify(fr)}`);
+    const ex = (i % 2) * 512;
+    const ey = ((i / 2) | 0) * 512;
+    if (fr.x !== ex || fr.y !== ey || fr.width !== 512 || fr.height !== 512) {
+      errors.push(`rain1 帧 ${i} 应为 2×2 图集的 512×512 像素矩形（${ex},${ey}），实际 ${JSON.stringify(fr)}`);
     }
   }
   // 贴图应是 4 条互不相同的斜丝（帧间相位差）：randomframe 才有意义
@@ -2245,19 +2248,83 @@ function runBuiltinFrames() {
   if (new Set(centers).size < 3) {
     errors.push(`rain1 四帧亮心应错开（randomframe 取不同帧要有形态差），实际 x=${centers.join(",")}`);
   }
-  // 斜丝方向：上半帧亮心在右、下半帧在左（与下落方向一致）
-  let topX = 0;
-  let botX = 0;
-  let tv = -1;
-  let bv2 = -1;
-  for (let x = 0; x < width; x++) {
-    const vt = rgba[2 * width * 4 + x * 4 + 3];
-    const vb = rgba[(fh * 4 - 3) * width * 4 + x * 4 + 3];
-    if (vt > tv) { tv = vt; topX = x; }
-    if (vb > bv2) { bv2 = vb; botX = x; }
-  }
-  if (topX <= botX) {
-    errors.push(`rain1 斜丝应顶右底左（官方 preview 雨向左下落），实际 top=${topX} bot=${botX}`);
+  // 形态必须照原版素材（1024²/4×512²）：**一片短细近垂直的丝**，不是「一帧一根长斜丝」。
+  // 原版实测（帧 0，alpha>12 连通域）：89 段；段长 p10 14 / p50 49 / p90 219 / max 304 px；
+  // 段宽 p50 2 / p90 5 px；每行 ~16 条；整帧平均倾角 -1.1°；每帧四边 2px 内为 0。
+  {
+    const F = 512;
+    let runs = 0;
+    let rows = 0;
+    for (let y = 6; y < F; y += 16) {
+      let inRun = false;
+      rows++;
+      for (let x = 0; x < F; x++) {
+        const a = rgba[(y * width + x) * 4 + 3];
+        if (a > 18) {
+          if (!inRun) runs++;
+          inRun = true;
+        } else inRun = false;
+      }
+    }
+    const perRow = runs / rows;
+    if (!(perRow >= 6)) {
+      errors.push(`rain1 每行雨丝应 ≥6 条（原版实测 16.3），实际 ${perRow.toFixed(1)} —— 单粒只画一根长丝就是这里漏掉的`);
+    }
+    const A = (x, y) => rgba[(y * width + x) * 4 + 3];
+    let best = -1;
+    let bx = 0;
+    for (let sx = -30; sx <= 30; sx++) {
+      let acc = 0;
+      for (let y = 0; y + 200 < F; y += 8) {
+        for (let x = 0; x < F; x += 2) {
+          const x2 = x + sx;
+          if (x2 < 0 || x2 >= F) continue;
+          acc += A(x, y) * A(x2, y + 200);
+        }
+      }
+      if (acc > best) { best = acc; bx = sx; }
+    }
+    const tiltDeg = (Math.atan2(bx, 200) * 180) / Math.PI;
+    if (Math.abs(tiltDeg) > 4) {
+      errors.push(`rain1 雨丝应近垂直（原版实测 -1.1°），实测 ${tiltDeg.toFixed(1)}°（旧实现是 10° 单根斜丝）`);
+    }
+    const seen = new Uint8Array(width * F);
+    const hs = [];
+    const dd = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+    for (let i = 0; i < F * F; i++) {
+      const xx = i % width;
+      if (seen[i] || xx >= F || rgba[i * 4 + 3] <= 18) continue;
+      const st = [i];
+      seen[i] = 1;
+      let n = 0;
+      let minY = F;
+      let maxY = 0;
+      while (st.length) {
+        const q = st.pop();
+        const qx = q % width;
+        const qy = (q / width) | 0;
+        n++;
+        if (qy < minY) minY = qy;
+        if (qy > maxY) maxY = qy;
+        for (const [dx, dy] of dd) {
+          const nx = qx + dx;
+          const ny = qy + dy;
+          if (nx < 0 || nx >= F || ny < 0 || ny >= F) continue;
+          const r = ny * width + nx;
+          if (!seen[r] && rgba[r * 4 + 3] > 18) { seen[r] = 1; st.push(r); }
+        }
+      }
+      if (n >= 4) hs.push(maxY - minY + 1);
+    }
+    hs.sort((a, b) => a - b);
+    const medH = hs.length ? hs[hs.length >> 1] : 0;
+    if (!(hs.length >= 40 && medH > 0 && medH < 160)) {
+      errors.push(`rain1 应有大量短丝（原版 89 段、中位长 49/512），实际 ${hs.length} 段、中位长 ${medH}`);
+    }
+    let edge = 0;
+    for (let x = 0; x < width; x++) edge = Math.max(edge, rgba[x * 4 + 3], rgba[((height - 1) * width + x) * 4 + 3]);
+    for (let y = 0; y < height; y++) edge = Math.max(edge, rgba[(y * width) * 4 + 3], rgba[(y * width + width - 1) * 4 + 3]);
+    if (edge > 12) errors.push(`rain1 图集外圈必须干净（原版为 0），实际最大 alpha ${edge}`);
   }
   // randomframe 系统：setTexture(帧表) 后 frameCount=4，spawn 随机取帧
   const ps = new ParticleSystem(
