@@ -11,7 +11,7 @@ layout(location=2) in vec2 a_sizeRot;     // x=size(像素) y=rot(弧度)
 layout(location=3) in vec4 a_color;       // rgb + alpha
 layout(location=4) in vec3 a_stretchFrame; // xy=非等比拉伸 z=帧序号
 layout(location=5) in vec2 a_vrange;      // 段两端沿贴图 v 的取值（rope 连线用；普通精灵 0..1）
-layout(location=6) in vec2 a_frameBlend;  // x=下一帧序号 y=帧间混合权重（官方 SPRITESHEETBLEND）
+layout(location=6) in vec4 a_frameBlend;  // xy=下一帧序号/帧间混合权重 zw=rotation.x/rotation.y
 uniform mat4 u_mvp;
 // 官方 g_RefractAmount（common_particles.h 的 uniform 声明：默认 0.05、range [-1,1]）
 uniform float u_refractScale;
@@ -26,11 +26,23 @@ out float v_frameMix;  // 帧间混合权重（0 = 不混合，硬切）
 out vec4 v_color;
 void main(){
   float size = a_sizeRot.x;
-  float rot = a_sizeRot.y;
-  float c = cos(rot), s = sin(rot);
+  float rz = a_sizeRot.y;
+  float rx = a_frameBlend.z;
+  float ry = a_frameBlend.w;
+  // 官方 ComputeParticleTangents：right/up = 旋转基（Rz·Rx·Ry）的两个轴。正交投影下
+  // 精灵的屏幕形状 = 这两个轴在屏幕平面的投影（x/y 侧倾 ⇒ 对应轴按 cos 压缩）。
+  // z 的符号沿用既有标定（652 个纯 z 模型的朝向逐位不能变）：right=(cos rz, sin rz)、
+  // up=(-sin rz, cos rz)；x/y 的交叉项按官方 Rz·Rx·Ry 的顺序展开。
+  float cz = cos(rz), sz = sin(rz);
+  float cx = cos(rx), sx = sin(rx);
+  float cy = cos(ry), sy = sin(ry);
+  // R = Rz * Rx * Ry（列向量约定，与官方 mul(mul(Rz,Rx),Ry) 同序）
+  vec2 rightXY = vec2(cz * cy - sz * sx * sy, sz * cy + cz * sx * sy);
+  vec2 upXY    = vec2(-sz * cx, cz * cx);
   // 先按 size 与非等比拉伸展开，再旋转（顺序反了会把拉伸方向也转走）
   vec2 corner = a_corner * size * a_stretchFrame.xy;
-  vec2 rotated = vec2(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
+  vec2 rotated = vec2(corner.x * rightXY.x + corner.y * upXY.x,
+                      corner.x * rightXY.y + corner.y * upXY.y);
   gl_Position = u_mvp * vec4(a_pos.xy + rotated, a_pos.z, 1.0);
   // quad 角 → 贴图 uv。世界 y 已翻转到投影空间（y 向下），故 quad 的 +y 角
   // 对应屏幕上方，应采样纹理顶行 v=1（与 renderer.js 的 layerQuadVerts 同约定）。
@@ -39,7 +51,7 @@ void main(){
   // 官方 ComputeScreenRefractionTangents：把精灵的 x/y 轴（归一化旋转基）投影到屏幕右/上
   // 方向后乘 g_RefractAmount。2D 正交场景里视图右=(1,0)、视图上=(0,1)（屏幕 y 向下），
   // 于是切线就是旋转后的两个轴本身 —— 精灵一转，折射偏移方向跟着转（旧实现恒按屏幕轴）。
-  v_refract = vec4(c, s, -s, c) * u_refractScale;
+  v_refract = vec4(rightXY, upXY) * u_refractScale;
   v_uv2 = uv;
   v_frameMix = 0.0;
   if (u_frameCount > 0) {
@@ -144,9 +156,9 @@ void main(){
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0)
     gl.vertexAttribDivisor(0, 0)
-    // location 1..6：实例数据（stride 64 = 16 float，含 rope 的 a_vrange 与帧间混合）
+    // location 1..6：实例数据（stride 72 = 18 float，含 rope 的 a_vrange、帧间混合、三轴旋转）
     gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
-    const S = 64
+    const S = 72
     gl.enableVertexAttribArray(1)
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, S, 0)
     gl.vertexAttribDivisor(1, 1)
@@ -163,7 +175,7 @@ void main(){
     gl.vertexAttribPointer(5, 2, gl.FLOAT, false, S, 48)
     gl.vertexAttribDivisor(5, 1)
     gl.enableVertexAttribArray(6)
-    gl.vertexAttribPointer(6, 2, gl.FLOAT, false, S, 56)
+    gl.vertexAttribPointer(6, 4, gl.FLOAT, false, S, 56)
     gl.vertexAttribDivisor(6, 1)
     gl.bindVertexArray(null)
 

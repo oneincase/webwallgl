@@ -47,6 +47,27 @@ export function createTarget(width, height, fill) {
 }
 
 // 渲染一个粒子系统到目标缓冲。
+/**
+ * 官方 `ComputeParticleTangents` 的旋转基（与 `particle-shaders.js` 的顶点着色器逐字同构）：
+ *   R = Rz · Rx · Ry；right/up 是它的两个轴；正交投影下屏幕形状取它们的 x/y 分量。
+ * z 的符号沿用既有标定（652 个纯 z 模型的朝向逐位不能变）：right=(cos rz, sin rz)、
+ * up=(-sin rz, cos rz)。导出给 verify-particles 用同一份数学（改一边必改另一边）。
+ */
+export function particleBasis(rx2, ry2, rz2) {
+  const cz = Math.cos(rz2)
+  const sz = Math.sin(rz2)
+  const cx = Math.cos(rx2)
+  const sx = Math.sin(rx2)
+  const cy = Math.cos(ry2)
+  const sy = Math.sin(ry2)
+  return {
+    rx: cz * cy - sz * sx * sy,
+    ry: sz * cy + cz * sx * sy,
+    ux: -sz * cx,
+    uy: cz * cx,
+  }
+}
+
 // cam: { offX, offY, viewW, viewH, projH } —— 与 math.js 的 buildCamera 输出一致。
 // 顶点变换逐字对应 particles.js 的顶点着色器。
 export function rasterizeSystem(target, ps, cam, opts) {
@@ -103,13 +124,16 @@ export function rasterizeSystem(target, ps, cam, opts) {
 
   // 画一个实例 quad（与顶点着色器逐字对应）：
   // quad 宽 = size*stX，长 = size*stY，rot 为投影空间弧度；uv.y = mix(v0, v1, corner.y+0.5)
-  const drawOne = (wx, wy, rot, size, stX, stY, cr2, cg2, cb2, ca, frameIdx, v0, v1, frameB, frameMix) => {
+  const drawOne = (wx, wy, rot, size, stX, stY, cr2, cg2, cb2, ca, frameIdx, v0, v1, frameB, frameMix, rotX, rotY) => {
+    const basis = particleBasis(rotX || 0, rotY || 0, rot)
     const halfW = (size * stX) / 2
     const halfH = (size * stY) / 2
-    const cr = Math.cos(rot)
-    const sr = Math.sin(rot)
-    // 旋转后的包围盒（保守放大，覆盖旋转后的四角）
-    const ext = Math.hypot(halfW, halfH)
+    // 包围盒：基向量（含拉伸）→ 屏幕
+    const bx = basis.rx * size * stX
+    const by = basis.ry * size * stX
+    const ex = basis.ux * size * stY
+    const ey = basis.uy * size * stY
+    const ext = (Math.abs(bx) + Math.abs(ex) + Math.abs(by) + Math.abs(ey)) / 2
 
     // 屏幕范围
     const cxs = (wx - cam.offX) * sx
@@ -125,14 +149,12 @@ export function rasterizeSystem(target, ps, cam, opts) {
 
     for (let py = y0; py <= y1; py++) {
       for (let px = x0; px <= x1; px++) {
-        // 屏幕像素 → 投影空间 → 精灵局部（逆旋转、去拉伸）
+        // 屏幕像素 → 投影空间 → 精灵局部：解 [right*stX | up*stY] * (cu,cv) = (dx,dy)
         const dxw = px / sx + cam.offX - wx
         const dyw = py / sy + cam.offY - wy
-        const ux = dxw * cr + dyw * sr
-        const uy = -dxw * sr + dyw * cr
-        // 归一化到 [-0.5, 0.5]（对应顶点着色器的 a_corner）
-        const cu = ux / (size * stX)
-        const cv = uy / (size * stY)
+        const det = basis.rx * basis.uy - basis.ux * basis.ry
+        const cu = det === 0 ? 1 : (dxw * basis.uy - dyw * basis.ux) / (det * size * stX)
+        const cv = det === 0 ? 1 : (basis.rx * dyw - basis.ry * dxw) / (det * size * stY)
         if (cu < -0.5 || cu > 0.5 || cv < -0.5 || cv > 0.5) continue
         // corner → uv（与顶点着色器一致：不翻 v，投影空间 y 已翻）
         let u = cu + 0.5
@@ -285,7 +307,7 @@ export function rasterizeSystem(target, ps, cam, opts) {
     const size = Math.abs(p.size) * sysScale
     if (!(size * pStretchX) || !(size * pStretchY)) continue
 
-    drawOne(wx, wy, rot, size, pStretchX, pStretchY, p.r * bright, p.g * bright, p.b * bright, p.alpha, p.frame, 0, 1, p.frameB, p.frameMix)
+    drawOne(wx, wy, rot, size, pStretchX, pStretchY, p.r * bright, p.g * bright, p.b * bright, p.alpha, p.frame, 0, 1, p.frameB, p.frameMix, p.rotX, p.rotY)
   }
   return { drawn }
 }

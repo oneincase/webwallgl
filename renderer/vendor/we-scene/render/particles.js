@@ -1,6 +1,6 @@
 // [we-scene patch] 粒子：CPU 模拟 + 实例化 quad（非 gl.POINTS：PointSize 上限、
 // 需旋转、尺寸须随场景缩放）。局部空间模拟 → 图层变换到世界像素（y 向下）。
-import { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
+import { TAU, rand, randExp, parseVec, parseRandomVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
 import { buildParticleProgram } from './particle-shaders.js'
 import { audioResponse } from './audio.js'
 
@@ -166,6 +166,10 @@ class Particle {
     this.baseSize = 1
     this.rot = 0
     this.rotVel = 0
+    this.rotX = 0
+    this.rotY = 0
+    this.rotVelX = 0
+    this.rotVelY = 0
     this.r = this.g = this.b = 1
     this.baseR = this.baseG = this.baseB = 1
     this.alpha = 1
@@ -462,20 +466,40 @@ export class ParticleSystem {
           this.init.size = { min: num(z.min, 1), max: num(z.max, 1), exp: num(z.exponent, 1) }
           break
         case 'colorrandom':
-          // WE 的 colorrandom 是 0–255；min/max 不保证有序（实测大量 min>max）
-          this.init.color = { min: parseVec(z.min, [255, 255, 255]), max: parseVec(z.max, [255, 255, 255]) }
+          // WE 的 colorrandom 是 0–255；min/max 不保证有序（实测大量 min>max）。
+          // 缺省是 (0,0,0)..(255,255,255)（官方 VecRandom 默认全 0，由调用方补满）
+          this.init.color = {
+            min: parseRandomVec(z.min) || [0, 0, 0],
+            max: parseRandomVec(z.max) || [255, 255, 255],
+          }
           break
         case 'alpharandom':
           this.init.alpha = { min: num(z.min, 1), max: num(z.max, 1) }
           break
         case 'velocityrandom':
-          this.init.velocity = { min: parseVec(z.min), max: parseVec(z.max) }
+          // 官方默认 min[0]=min[1]=-32、max[0]=max[1]=32（z 恒 0），再按 VecRandom 语义读
+          this.init.velocity = {
+            min: parseRandomVec(z.min) || [-32, -32, 0],
+            max: parseRandomVec(z.max) || [32, 32, 0],
+          }
           break
         case 'rotationrandom':
-          this.init.rotation = { min: parseVec(z.min), max: parseVec(z.max, [0, 0, 0]), exp: num(z.exponent, 1) }
+          // 官方：先 `r.max[2] = TAU` 再读 —— 标量 min/max 会把 z **归零**（只留 x），
+          // 只有 max 缺键才保留「绕 z 随机一圈」。1199910952 的光轴写的正是标量
+          // （min -0.4 / max -0.3）＝绕 x 侧倾 ±0.35，不是三轴一起转。
+          this.init.rotation = {
+            min: parseRandomVec(z.min) || [0, 0, 0],
+            max: parseRandomVec(z.max) || [0, 0, TAU],
+            exp: num(z.exponent, 1),
+          }
           break
         case 'angularvelocityrandom':
-          this.init.angularVelocity = { min: parseVec(z.min), max: parseVec(z.max), exp: num(z.exponent, 1) }
+          // 官方：先 `r.min[2] = -5; r.max[2] = 5` 再读
+          this.init.angularVelocity = {
+            min: parseRandomVec(z.min) || [0, 0, -5],
+            max: parseRandomVec(z.max) || [0, 0, 5],
+            exp: num(z.exponent, 1),
+          }
           break
         case 'mapsequencearoundcontrolpoint':
           // Position around control point：在控制点周围 N 个点上轮流投放。
@@ -990,6 +1014,10 @@ export class ParticleSystem {
     p.seed = Math.random()
     p.rot = 0
     p.rotVel = 0
+    p.rotX = 0
+    p.rotY = 0
+    p.rotVelX = 0
+    p.rotVelY = 0
     p.vx = p.vy = p.vz = 0
     p.frame = 0
     p.seq = this._seq++
@@ -1134,13 +1162,24 @@ export class ParticleSystem {
       p.vy += nv[1] * sp
       p.vz += nv[2] * sp
     }
+    // [we-scene patch] rotation / angularvelocity 都是 **vec3**：官方 ComputeParticleTangents
+    // 用 rotation.xyz 建旋转基（Rz·Rx·Ry），x/y 分量是「精灵朝屏幕里侧倾」——正交投影下
+    // 表现为对应轴按 cos 压缩。全库 51/703 个粒子模型写了 x/y（lightshafts 的三轴
+    // rotationrandom、leaves5…），旧实现只取 [2] 让这些精灵的侧倾完全没体现。
     if (I.rotation) {
-      // 只用 z 分量（2D 精灵绕视线轴旋转）
-      p.rot = rand(I.rotation.min[2], I.rotation.max[2])
+      p.rotX = randExp(I.rotation.min[0], I.rotation.max[0], I.rotation.exp)
+      p.rotY = randExp(I.rotation.min[1], I.rotation.max[1], I.rotation.exp)
+      p.rot = randExp(I.rotation.min[2], I.rotation.max[2], I.rotation.exp)
     }
     if (I.angularVelocity) {
-      p.rotVel = rand(I.angularVelocity.min[2], I.angularVelocity.max[2])
+      p.rotVelX = randExp(I.angularVelocity.min[0], I.angularVelocity.max[0], I.angularVelocity.exp)
+      p.rotVelY = randExp(I.angularVelocity.min[1], I.angularVelocity.max[1], I.angularVelocity.exp)
+      p.rotVel = randExp(I.angularVelocity.min[2], I.angularVelocity.max[2], I.angularVelocity.exp)
     }
+    // 官方 override：`p.angularVelocity *= modifiers.Speed()`（三轴同乘）
+    p.rotVelX *= speedMul
+    p.rotVelY *= speedMul
+    p.rotVel *= speedMul
 
     // 振荡相位/频率在生成时固化一次（每帧重取会导致抖动）
     const O = this.ops
@@ -1216,8 +1255,14 @@ export class ParticleSystem {
       }
     }
     if (O.angularMovement) {
-      p.rotVel += (O.angularMovement.force[2] || 0) * dt
-      if (O.angularMovement.drag > 0) p.rotVel *= Math.exp(-O.angularMovement.drag * dt)
+      // 官方 angularmovement：`acc = DragForce(GetAngular(p), drag) + force`（DragForce = -v*drag）
+      // 再 `AngularAccelerate(acc, dt)`（= angularVelocity += acc*dt）。三轴同式；
+      // 旧实现只做 z，且用 exp(-drag*dt) 近似（Euler 与指数衰减在小 dt 下差别极小）。
+      const f = O.angularMovement.force
+      const drag = O.angularMovement.drag || 0
+      p.rotVelX += (-p.rotVelX * drag + (f[0] || 0)) * dt
+      p.rotVelY += (-p.rotVelY * drag + (f[1] || 0)) * dt
+      p.rotVel += (-p.rotVel * drag + (f[2] || 0)) * dt
     }
 
     // 湍流：噪声场加速度（雪花飘、烟雾扰动）
@@ -1292,6 +1337,8 @@ export class ParticleSystem {
     p.bx += p.vx * dt
     p.by += p.vy * dt
     p.bz += p.vz * dt
+    p.rotX += p.rotVelX * dt
+    p.rotY += p.rotVelY * dt
     p.rot += p.rotVel * dt
 
     // 振荡位移叠加在基准位置上（不回写基准，否则与运动互相累加发散）
@@ -1620,8 +1667,9 @@ export class ParticleSystem {
     const spriteTrail = this.trailCfg && this.trailCfg.kind === 'spritetrail' ? this.trailCfg : null
     const rope = this.ropeRenderer
     const segs = particleInstanceSegs(this.trailCfg, this.trailSegments)
-    // 每实例 16 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(2) vrange(2) frameB+mix(2)
-    const STRIDE = 16
+    // 每实例 18 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(2) vrange(2)
+    //                   frameB+mix(2) rotX+rotY(2)
+    const STRIDE = 18
     const pool = this.pool
     // rope：先按发射序收集存活粒子（pool 槽位会循环复用，槽位序 ≠ 发射序）
     let order = null
@@ -1702,6 +1750,8 @@ export class ParticleSystem {
         // 帧间混合槽位：rope 段不做帧混合（官方 ropetrail 走 THICKFORMAT 路径）
         data[k++] = 0
         data[k++] = 0
+        data[k++] = 0 // rotX
+        data[k++] = 0 // rotY
       }
     }
     for (let i = 0; i < pool.length && !rope; i++) {
@@ -1790,6 +1840,9 @@ export class ParticleSystem {
         // 帧间混合：下一帧序号 + 权重（官方 SPRITESHEETBLEND）
         data[k++] = p.frameB === undefined ? p.frame : p.frameB
         data[k++] = p.frameMix || 0
+        // 官方 ComputeParticleTangents 的 x/y 旋转（spritetrail 由速度定姿态，恒 0）
+        data[k++] = p.rotX || 0
+        data[k++] = p.rotY || 0
       }
     }
 

@@ -35,7 +35,7 @@ const {
   setParticleDensityTier,
 } = await imp("renderer/vendor/we-scene/render/particles.js");
 const ptex = await imp("renderer/vendor/we-scene/render/particle-textures.js");
-const { createTarget, rasterizeSystem, analyzeTarget } = await imp(
+const { createTarget, rasterizeSystem, analyzeTarget, particleBasis } = await imp(
   "scripts/particle-raster.mjs",
 );
 const texMod = await imp("renderer/vendor/we-scene/pkg/texture.js");
@@ -982,6 +982,274 @@ function runMatrixGlyphSize() {
   return { errors };
 }
 
+// ---------- 粒子 3D 旋转：官方 ComputeParticleTangents（rotation.xyz） ----------
+// 官方 vert 用 rotation.xyz 建基：`mRotation = mul(mul(Rz,Rx),Ry)`，right/up 取它的两个轴；
+// 正交投影下精灵屏幕形状 = 这两个轴的 x/y 投影（x/y 侧倾 ⇒ 对应轴按 cos 压缩）。
+// 旧实现只用 rotation.z —— 全库 51/703 个模型写了 x/y（lightshafts 三轴 rotationrandom、
+// leaves5…），这些精灵的侧倾完全没体现。
+function runParticleRotation3D() {
+  const errors = [];
+  // ① 纯 z 零回归：基必须逐位等于旧实现（right=(cos,sin)、up=(-sin,cos)）
+  for (const rz of [0, 0.3, 1.1, -2.2, Math.PI]) {
+    const b = particleBasis(0, 0, rz);
+    if (
+      Math.abs(b.rx - Math.cos(rz)) > 1e-9 ||
+      Math.abs(b.ry - Math.sin(rz)) > 1e-9 ||
+      Math.abs(b.ux + Math.sin(rz)) > 1e-9 ||
+      Math.abs(b.uy - Math.cos(rz)) > 1e-9
+    ) {
+      errors.push(`纯 z=${rz.toFixed(2)} 的基必须与旧实现逐位一致，实得 ${JSON.stringify(b)}`);
+      break;
+    }
+  }
+  // ② Rx(90°) 侧看成零高；Ry(60°) 横向压到 cos60=0.5
+  const edge = particleBasis(Math.PI / 2, 0, 0);
+  if (Math.hypot(edge.ux, edge.uy) > 1e-6) {
+    errors.push(`Rx(90°) 的 up 轴长度应为 0（侧看成一条线），实得 ${Math.hypot(edge.ux, edge.uy).toFixed(6)}`);
+  }
+  const tilt = particleBasis(0, Math.PI / 3, 0);
+  if (Math.abs(Math.hypot(tilt.rx, tilt.ry) - 0.5) > 1e-6) {
+    errors.push(`Ry(60°) 的 right 轴长度应为 0.5，实得 ${Math.hypot(tilt.rx, tilt.ry).toFixed(4)}`);
+  }
+  if (Math.abs(Math.hypot(tilt.ux, tilt.uy) - 1) > 1e-6) {
+    errors.push("Ry 不应改变 up 轴长度（官方 Ry 只转 x/z）");
+  }
+
+  // ③ 模拟：rotationrandom / angularvelocityrandom 的三轴都要落地
+  const mkPS = (model) =>
+    new ParticleSystem(
+      null,
+      Object.assign(
+        {
+          maxcount: 2,
+          emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+          initializer: [{ name: "lifetimerandom", min: 5, max: 5 }],
+        },
+        model,
+      ),
+      null,
+      { origin: [640, 360, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+  const psRot = mkPS({
+    initializer: [
+      { name: "lifetimerandom", min: 5, max: 5 },
+      // min=max 固化取值，才能分辨「初始化没落地」与「积分推进过了」
+      { name: "rotationrandom", min: "0.4 0.7 0.2", max: "0.4 0.7 0.2" },
+      { name: "angularvelocityrandom", min: "0.5 1.5 0.25", max: "0.5 1.5 0.25" },
+    ],
+  });
+  psRot.advance(1 / 60);
+  const pr = (psRot.pool || []).find((q) => q.alive);
+  if (!pr) {
+    errors.push("3D 旋转夹具没有粒子");
+  } else {
+    const dt = 1 / 60;
+    const near = (a, b) => Math.abs(a - b) < 1e-6 + 4 * Math.abs(b) * dt;
+    if (!near(pr.rotX, 0.4) || !near(pr.rotY, 0.7) || !near(pr.rot, 0.2)) {
+      errors.push(`rotationrandom 的三轴都要落地（期望 0.4/0.7/0.2 附近），实得 ${pr.rotX}/${pr.rotY}/${pr.rot}`);
+    }
+    if (!near(pr.rotVelX, 0.5) || !near(pr.rotVelY, 1.5) || !near(pr.rotVel, 0.25)) {
+      errors.push(`angularvelocityrandom 的三轴都要落地（期望 0.5/1.5/0.25），实得 ${pr.rotVelX}/${pr.rotVelY}/${pr.rotVel}`);
+    }
+    const x0 = pr.rotX;
+    const y0 = pr.rotY;
+    const z0 = pr.rot;
+    for (let i = 0; i < 30; i++) psRot.advance(1 / 60);
+    if (!(pr.rotX > x0 && pr.rotY > y0 && pr.rot > z0)) {
+      errors.push(
+        `三轴旋转必须一起积分（x ${x0.toFixed(3)}→${pr.rotX.toFixed(3)}、y ${y0.toFixed(3)}→${pr.rotY.toFixed(3)}、z ${z0.toFixed(3)}→${pr.rot.toFixed(3)}）`,
+      );
+    }
+  }
+  // angularmovement 的 x/y 力与 drag（官方 acc = -v*drag + force，三轴同式）
+  const psAM = mkPS({
+    initializer: [{ name: "lifetimerandom", min: 5, max: 5 }],
+    operator: [{ name: "angularmovement", force: "0.6 1.2 0.3", drag: 0 }],
+  });
+  psAM.advance(1 / 60);
+  const pa = (psAM.pool || []).find((q) => q.alive);
+  if (!pa) {
+    errors.push("angularmovement 夹具没有粒子");
+  } else if (!(Math.abs(pa.rotVelX - 0.6 / 60) < 1e-6 && Math.abs(pa.rotVelY - 1.2 / 60) < 1e-6)) {
+    errors.push(`angularmovement 的 x/y 力必须落地，实得 ${pa.rotVelX}/${pa.rotVelY}`);
+  }
+  // ④ 光栅：Rx(90°) 侧看时几乎不落像素；Ry(60°) 的覆盖面积约为正面的 1/2
+  const mkRaster = () => {
+    const ps = new ParticleSystem(
+      null,
+      {
+        maxcount: 1,
+        emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+        initializer: [
+          { name: "lifetimerandom", min: 5, max: 5 },
+          { name: "sizerandom", min: 160, max: 160 },
+        ],
+        operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+      },
+      null,
+      { origin: [64, 64, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+    ps.setTexture({
+      glTex: null,
+      width: 4,
+      height: 4,
+      pixels: { width: 4, height: 4, rgba: new Uint8Array(4 * 4 * 4).fill(255) },
+    });
+    for (let i = 0; i < 3; i++) ps.advance(1 / 60);
+    return ps;
+  };
+  const cam = fitCover(128, 128, 128, 128);
+  const covered = (rx, ry, rz) => {
+    const ps = mkRaster();
+    const p = (ps.pool || []).find((q) => q.alive);
+    if (!p) return -1;
+    p.rotX = rx;
+    p.rotY = ry;
+    p.rot = rz;
+    const target = createTarget(128, 128, [0, 0, 0]);
+    rasterizeSystem(target, ps, cam);
+    let n = 0;
+    for (let i = 0; i < 128 * 128; i++) if (target.rgb[i * 3] > 0.02) n++;
+    return n;
+  };
+  const flat = covered(0, 0, 0);
+  const edgeOn = covered(Math.PI / 2, 0, 0);
+  const yTilt = covered(0, Math.PI / 3, 0);
+  if (flat <= 0) {
+    errors.push("正面精灵应覆盖像素（夹具失效）");
+  } else {
+    if (edgeOn > flat * 0.1) {
+      errors.push(`Rx(90°) 侧看应几乎不覆盖像素，实得 ${edgeOn}/${flat}`);
+    }
+    const ratio = yTilt / flat;
+    if (!(ratio > 0.3 && ratio < 0.75)) {
+      errors.push(`Ry(60°) 覆盖面积应约为正面的 0.5（cos60），实得 ${ratio.toFixed(2)}`);
+    }
+  }
+  // ④b VecRandom 的官方读法：标量只填第一个分量（其余**归零**），数组/字符串必须恰好 3 段
+  const scalarRot = mkPS({
+    initializer: [
+      { name: "lifetimerandom", min: 5, max: 5 },
+      { name: "rotationrandom", min: -0.4, max: -0.3 },
+    ],
+  });
+  scalarRot.advance(1 / 60);
+  const psv = (scalarRot.pool || []).find((q) => q.alive);
+  if (!psv) {
+    errors.push("VecRandom 标量夹具没有粒子");
+  } else {
+    if (!(psv.rotX >= -0.4 && psv.rotX <= -0.3)) {
+      errors.push(`rotationrandom 标量的 x 应取 [-0.4,-0.3]，实得 ${psv.rotX}`);
+    }
+    if (psv.rotY !== 0 || psv.rot !== 0) {
+      errors.push(`标量 min/max 必须把 y/z 归零（官方 ReadJsonValue 只填第一个分量），实得 y=${psv.rotY} z=${psv.rot}`);
+    }
+  }
+  const noMaxRot = mkPS({
+    initializer: [
+      { name: "lifetimerandom", min: 5, max: 5 },
+      { name: "rotationrandom", min: -0.4, max: -0.4 },
+    ],
+  });
+  // max 缺键时官方保留 `r.max[2] = TAU`：只写 min 的模型必须仍在 z 上随机
+  const onlyMin = new ParticleSystem(
+    null,
+    {
+      maxcount: 1,
+      emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+      initializer: [{ name: "lifetimerandom", min: 5, max: 5 }, { name: "rotationrandom", min: 0.5 }],
+    },
+    null,
+    { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+  );
+  let sawZSpread = false;
+  for (let run = 0; run < 12 && !sawZSpread; run++) {
+    const one = new ParticleSystem(
+      null,
+      {
+        maxcount: 1,
+        emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+        initializer: [{ name: "lifetimerandom", min: 5, max: 5 }, { name: "rotationrandom", min: 0.5 }],
+      },
+      null,
+      { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+    one.advance(1 / 60);
+    const p0 = (one.pool || []).find((q) => q.alive);
+    if (p0 && p0.rot > 0.2) sawZSpread = true;
+  }
+  if (!sawZSpread) {
+    errors.push("rotationrandom 省略 max 时必须保留 z 的 TAU 默认（否则作者没写 max 的模型全都不转）");
+  }
+  void noMaxRot;
+  void onlyMin;
+
+  // ⑤ 接线：shader/raster 同构 + 实例流带 rotX/rotY + 真实语料确有 x/y 旋转
+  const shSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
+  for (const [re, msg] of [
+    [/float cz = cos\(rz\), sz = sin\(rz\)/, "z 的符号必须沿用既有标定"],
+    [/vec2 rightXY = vec2\(cz \* cy - sz \* sx \* sy, sz \* cy \+ cz \* sx \* sy\)/, "right 必须按官方 Rz·Rx·Ry 展开"],
+    [/vec2 upXY\s+= vec2\(-sz \* cx, cz \* cx\)/, "up 必须按官方 Rz·Rx 展开"],
+    [/const S = 72/, "实例 stride 必须 72（rotX/rotY 进 a_frameBlend.zw）"],
+  ]) {
+    if (!re.test(shSrc)) errors.push(`接线缺失：${msg}`);
+  }
+  const vidSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/data\[k\+\+\] = p\.rotX \|\| 0/.test(vidSrc)) {
+    errors.push("实例流必须写 rotX/rotY（否则 shader 的 zw 恒 0）");
+  }
+  const rasterSrc = fs.readFileSync(join(ROOT, "scripts/particle-raster.mjs"), "utf8");
+  if (!/export function particleBasis/.test(rasterSrc)) {
+    errors.push("CPU 参考光栅必须导出 particleBasis（改一边必改另一边）");
+  }
+  // 真实语料：本库确有 x/y 旋转的模型
+  let models = 0;
+  let withXY = 0;
+  const hasXY = (item) => {
+    if (!item) return false;
+    const nums = (v) =>
+      String(v == null ? "" : v)
+        .trim()
+        .split(/\s+/)
+        .map(Number);
+    const M = nums(item.max);
+    const N = nums(item.min);
+    return (
+      Math.abs(M[0] || 0) > 1e-6 || Math.abs(M[1] || 0) > 1e-6 || Math.abs(N[0] || 0) > 1e-6 || Math.abs(N[1] || 0) > 1e-6
+    );
+  };
+  for (const id of fs.readdirSync(LIB)) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let pkg;
+    try {
+      pkg = parsePkg(fs.readFileSync(pkgPath));
+    } catch {
+      continue;
+    }
+    for (const e of pkg.entries) {
+      if (!/^particles\/.*\.json$/i.test(e.name)) continue;
+      let j;
+      try {
+        j = JSON.parse(new TextDecoder().decode(getEntry(pkg, e.name)));
+      } catch {
+        continue;
+      }
+      models++;
+      const hit = [...(j.initializer || []), ...(j.operator || [])].some(
+        (x) => x && /rotation|angular/i.test(x.name || "") && hasXY(x),
+      );
+      if (hit) withXY++;
+    }
+  }
+  if (!(withXY > 0)) {
+    errors.push("本库应有多轴旋转的粒子模型（语料失效？）");
+  } else {
+    console.log(`  · 粒子模型 ${models} 个，其中带 x/y 旋转 ${withXY} 个`);
+  }
+  return { errors };
+}
+
 // ---------- REFRACT 切线：官方 ComputeScreenRefractionTangents 的三项语义 ----------
 // 官方（common_particles.h + genericparticle.frag）：
 //   v_ScreenTangents = (精灵 x 轴, 精灵 y 轴) 在视图右/上方向的投影 × g_RefractAmount
@@ -1111,7 +1379,7 @@ function runRefractTangents() {
   // ⑥ 接线：切线必须在顶点着色器里由旋转基给出，且 CPU 光栅同构
   const shSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
   for (const [re, msg] of [
-    [/v_refract = vec4\(c, s, -s, c\) \* u_refractScale/, "顶点着色器必须按旋转基算切线"],
+    [/v_refract = vec4\(rightXY, upXY\) \* u_refractScale/, "顶点着色器必须按旋转基算切线"],
     [/v_refract\.x \* nxy\.x \+ v_refract\.z \* nxy\.y/, "frag 必须用切线点乘法线"],
     [/nMask \* v_color\.a/, "偏移必须乘 normal.a 蒙版 × 粒子 alpha"],
     [/rgb = t\.rgb \* v_color\.rgb \* scene/, "官方是 color.rgb *= scene（albedo 相乘）"],
@@ -1814,9 +2082,9 @@ function runFrameBlend() {
   // ④ 接线：着色器与 CPU 光栅都要有第二帧与混合权重
   const shSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
   for (const [re, msg] of [
-    [/layout\(location=6\) in vec2 a_frameBlend/, "实例流要有第二帧 + 混合权重"],
+    [/layout\(location=6\) in vec4 a_frameBlend/, "实例流要有第二帧 + 混合权重（+ 三轴旋转）"],
     [/t = mix\(t, texture\(u_tex, v_uv2\), v_frameMix\)/, "frag 必须 mix 两帧"],
-    [/const S = 64/, "实例 stride 必须跟着扩到 64"],
+    [/const S = 72/, "实例 stride 必须跟着扩到 72（16 → 18 float：加了 rotX/rotY）"],
   ]) {
     if (!re.test(shSrc)) errors.push(`接线缺失：${msg}`);
   }
@@ -2729,6 +2997,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【REFRACT 空白白图】问题 ${rb.errors.length}`);
   rb.errors.forEach((e) => console.log("  ! " + e));
   failed += rb.errors.length;
+  const r3 = runParticleRotation3D();
+  console.log(`\n【粒子 3D 旋转】问题 ${r3.errors.length}`);
+  r3.errors.forEach((e) => console.log("  ! " + e));
+  failed += r3.errors.length;
   const rt = runRefractTangents();
   console.log(`\n【REFRACT 切线】问题 ${rt.errors.length}`);
   rt.errors.forEach((e) => console.log("  ! " + e));

@@ -27,6 +27,32 @@ function parseVec(s, dflt) {
   return [p[0] || 0, p[1] || 0, p[2] || 0]
 }
 
+/**
+ * 官方的 **VecRandom 字段**（min/max/exponent）解析语义 —— 与通用 `parseVec` 不同：
+ * `sr::GetJsonValue(j, "max", std::array<float,3>&)`（Kernel/Json.cpp）：
+ *   · JSON 标量 → **只填第一个分量，其余归零**（`item = first ? ConvertNumber(input) : Value{}`）；
+ *   · JSON 数组 → 必须恰好 3 个，长度不符抛 WrongArraySize（= 读失败，保留调用方默认值）；
+ *   · 字符串 → `ConvertArray` 同样要求恰好 3 段，否则抛；
+ *   · null/缺键 → 读失败，保留调用方默认值。
+ * parseVec 对标量做的是广播 `[s,s,s]`，用在 rotationrandom 上会把作者的
+ * `rotationrandom: min -0.4, max -0.3`（本意是**绕 x 侧倾**）变成三轴一起转 ——
+ * 1199910952 的光轴就是被这个画错的。返回 null = 读失败，调用方落自己的默认值。
+ */
+function parseRandomVec(s) {
+  if (s === undefined || s === null) return null
+  if (Array.isArray(s)) {
+    if (s.length !== 3) return null
+    const v = s.map(Number)
+    return v.every(Number.isFinite) ? v : null
+  }
+  if (typeof s === 'object') return parseRandomVec(s.value)
+  if (typeof s === 'number') return Number.isFinite(s) ? [s, 0, 0] : null
+  const parts = String(s).trim().split(/\s+/)
+  if (parts.length !== 3) return null
+  const v = parts.map(Number)
+  return v.every(Number.isFinite) ? v : null
+}
+
 // emitter 的 distancemin/max 既可能是标量（sphererandom 的半径）
 // 也可能是向量（boxrandom 的半边长），统一成向量处理。
 function parseDist(s) {
@@ -96,4 +122,4 @@ function noiseVec3(x, y, z, oct) {
 }
 
 
-export { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 }
+export { TAU, rand, randExp, parseVec, parseRandomVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 }
