@@ -1454,6 +1454,228 @@ function runRope() {
 // 官方素材（R8/RG88 取样语义 + TEXS 帧表）的判据在 verify-textures（稳定集）里，
 // 本文件只保留粒子系统本身的模拟/光栅回归。
 
+// ---------- 序列帧**帧间交叉淡入**（官方 SPRITESHEETBLEND） ----------
+// 官方：animationmode==SEQUENCE 且模型 flags 的 spritenoframeblending(bit1=2) 未置位时
+// 打开 SPRITESHEETBLEND（SceneCompiler.cpp:4535），frag 里
+// `mix(tex(curFrame), tex(nextFrame), frac(lifetime*numFrames))`。硬切会让动画跳帧。
+function runFrameBlend() {
+  const errors = [];
+  // 2 帧图集：左半纯红（帧 0）、右半纯蓝（帧 1），每帧 2×2。
+  // mkTexN(n)：n 帧方格图集（供真实语料用，n=64 时 8×8）。
+  const mkTex = () => {
+    const w = 4;
+    const h = 2;
+    const rgba = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const o = (y * w + x) * 4;
+        const left = x < 2;
+        rgba[o] = left ? 255 : 0;
+        rgba[o + 1] = 0;
+        rgba[o + 2] = left ? 0 : 255;
+        rgba[o + 3] = 255;
+      }
+    }
+    return {
+      glTex: null,
+      width: w,
+      height: h,
+      pixels: { width: w, height: h, rgba },
+      frames: [{ x: 0, y: 0, width: 2, height: 2 }, { x: 2, y: 0, width: 2, height: 2 }],
+    };
+  };
+  const mkTexN = (n) => {
+    const side = Math.max(1, Math.round(Math.sqrt(n)));
+    const cell = 2;
+    const w = side * cell;
+    const frames = [];
+    const rgba = new Uint8Array(w * w * 4);
+    for (let i = 0; i < n; i++) {
+      const c = i % side;
+      const r = (i / side) | 0;
+      frames.push({ x: c * cell, y: r * cell, width: cell, height: cell });
+      for (let y = r * cell; y < r * cell + cell; y++) {
+        for (let x = c * cell; x < c * cell + cell; x++) {
+          const o = (y * w + x) * 4;
+          rgba[o] = 200;
+          rgba[o + 1] = 200;
+          rgba[o + 2] = 200;
+          rgba[o + 3] = 255;
+        }
+      }
+    }
+    return { glTex: null, width: w, height: w, pixels: { width: w, height: w, rgba }, frames };
+  };
+  const mkPS = (flags, life) =>
+    new ParticleSystem(
+      null,
+      {
+        maxcount: 1,
+        animationmode: "sequence",
+        flags,
+        emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+        initializer: [
+          { name: "lifetimerandom", min: life, max: life },
+          { name: "sizerandom", min: 200, max: 200 },
+        ],
+        operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+      },
+      null,
+      { origin: [640, 360, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+
+  const alive = (sys) => (sys.pool || []).find((q) => q.alive) || null;
+
+  // ① 默认（flags 未置位）→ 混合开启；8 帧 = 0.133s → ff = 0.266
+  const ps = mkPS(0, 1);
+  ps.setTexture(mkTex());
+  for (let i = 0; i < 8; i++) ps.advance(1 / 60);
+  const p = alive(ps);
+  if (!p) {
+    errors.push("帧间混合样本没有粒子");
+  } else {
+    if (p.frame !== 0 || p.frameB !== 1) {
+      errors.push(`2 帧序列在 lt=0.133 应停在第 0 帧、下一帧 1，实际 ${p.frame}/${p.frameB}`);
+    }
+    if (!(p.frameMix > 0.05 && p.frameMix < 0.95)) {
+      errors.push(`帧间混合权重应在 (0,1)，实际 ${p.frameMix}（硬切 = 0）`);
+    }
+  }
+  // ② flags bit1（spritenoframeblending）→ 必须硬切
+  const psNo = mkPS(2, 1);
+  psNo.setTexture(mkTex());
+  for (let i = 0; i < 8; i++) psNo.advance(1 / 60);
+  if ((alive(psNo)?.frameMix || 0) !== 0) {
+    errors.push(`flags=2(spritenoframeblending) 必须硬切，实际 mix=${alive(psNo)?.frameMix}`);
+  }
+  // ③ CPU 参考光栅必须真的把两帧混起来（红→蓝 各半）
+  const psR = mkPS(0, 1);
+  psR.setTexture(mkTex());
+  for (let i = 0; i < 8; i++) psR.advance(1 / 60);
+  const pR = alive(psR);
+  if (pR) {
+    pR.alpha = 1;
+    pR.r = 1;
+    pR.g = 1;
+    pR.b = 1;
+  }
+  psR.blend = "translucent";
+  const cam = fitCover(1280, 720, W, H);
+  const target = createTarget(W, H, [0, 0, 0]);
+  rasterizeSystem(target, psR, cam);
+  // 中心像素：mix≈0.5 时红蓝各半（不能是纯红或纯蓝）
+  const cx = Math.round(640);
+  const cy = Math.round(360);
+  const o = (cy * W + cx) * 3;
+  const [rr, gg, bb] = [target.rgb[o], target.rgb[o + 1], target.rgb[o + 2]];
+  // target.rgb 是 0..1 归一化（见 createTarget）：mix≈0.27 → 红 0.73 / 蓝 0.27
+  if (!(rr > 0.15 && bb > 0.15 && rr < 0.9 && bb < 0.9 && Math.abs(rr + bb - 1) < 0.05)) {
+    errors.push(
+      `帧间混合光栅中心像素应为红蓝混合，实际 rgb(${rr},${gg},${bb})（mix=${pR ? (pR.frameMix || 0).toFixed(2) : "无粒子"}）`,
+    );
+  }
+  // ④ 接线：着色器与 CPU 光栅都要有第二帧与混合权重
+  const shSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
+  for (const [re, msg] of [
+    [/layout\(location=6\) in vec2 a_frameBlend/, "实例流要有第二帧 + 混合权重"],
+    [/t = mix\(t, texture\(u_tex, v_uv2\), v_frameMix\)/, "frag 必须 mix 两帧"],
+    [/const S = 64/, "实例 stride 必须跟着扩到 64"],
+  ]) {
+    if (!re.test(shSrc)) errors.push(`接线缺失：${msg}`);
+  }
+  const rasterSrc = fs.readFileSync(join(ROOT, "scripts/particle-raster.mjs"), "utf8");
+  if (!/p\.frameB, p\.frameMix/.test(rasterSrc)) {
+    errors.push("CPU 参考光栅必须同步帧间混合（改一边必改另一边）");
+  }
+  // ④b 平滑性：同一颗粒子、同一贴图，混合开/关的**逐帧像素差序列**必须可分辨 ——
+  //   混合 = 每帧都在小步变化（无跳变）；硬切 = 长时间不动 + 偶尔一次大跳。
+  //   这是帧间混合唯一可靠的判据（跨引擎 A/B 会被粒子随机性淹没）。
+  {
+    const mkLong = (flags) =>
+      new ParticleSystem(
+        null,
+        {
+          maxcount: 1,
+          animationmode: "sequence",
+          flags,
+          emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+          initializer: [
+            { name: "lifetimerandom", min: 1.5, max: 1.5 },
+            { name: "sizerandom", min: 300, max: 300 },
+          ],
+          operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+        },
+        null,
+        { origin: [32, 32, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+      );
+    const series = (flags) => {
+      const sys = mkLong(flags);
+      sys.setTexture(mkTex());
+      const cam = fitCover(64, 64, 64, 64);
+      const deltas = [];
+      let prev = null;
+      // 1.5s 命 → 帧 0→1 的切换落在第 45 帧（混合时整段 45 帧连续过渡）
+      for (let i = 0; i < 80; i++) {
+        sys.advance(1 / 60);
+        const tg = createTarget(64, 64, [0, 0, 0]);
+        rasterizeSystem(tg, sys, cam);
+        const cur = tg.rgb[((32 * 64) + 32) * 3 + 2]; // 中心像素的蓝分量（帧 1 = 蓝）
+        if (prev !== null) deltas.push(Math.abs(cur - prev));
+        prev = cur;
+      }
+      return deltas;
+    };
+    const on = series(0);
+    const off = series(2);
+    const maxOn = Math.max(...on);
+    const maxOff = Math.max(...off);
+    const steepOn = on.filter((d) => d > 0.05).length;
+    const steepOff = off.filter((d) => d > 0.05).length;
+    // 硬切：一次帧切换 = 一记大跳（淡入/淡出带来的小幅变化不算）
+    if (!(maxOff > 0.2 && steepOff <= 8)) {
+      errors.push(`硬切样本应「几乎不动 + 偶尔大跳」，实际 maxΔ=${maxOff.toFixed(3)} 陡变帧=${steepOff}`);
+    }
+    if (!(maxOn < maxOff * 0.5)) {
+      errors.push(`帧间混合应把跳变抹平：maxΔ(混合)=${maxOn.toFixed(3)} 应 < 硬切 ${maxOff.toFixed(3)} 的一半`);
+    }
+  }
+
+  // ⑤ 真实语料：2131872317 的 fog1（animationmode 缺省 = SEQUENCE、flags 未置位）
+  // 在官方语义下必须开帧间混合（浏览器实测 frameMixMax=0.906）。
+  const corpus = join(LIB, "2131872317", "scene.pkg");
+  if (!fs.existsSync(corpus)) {
+    console.log("  （跳过 2131872317 fog1 语料：本机无此壁纸）");
+  } else {
+    const pkg = parsePkg(fs.readFileSync(corpus));
+    const fog = getEntry(pkg, "particles/presets/fog1.json");
+    if (!fog) {
+      errors.push("2131872317 缺少 particles/presets/fog1.json（语料失效）");
+    } else {
+      const model = JSON.parse(new TextDecoder().decode(fog));
+      if ((model.animationmode || "") === "randomframe") {
+        errors.push("fog1 语料的 animationmode 变了（预期缺省 = SEQUENCE）");
+      }
+      const psC = new ParticleSystem(null, model, null, {
+        origin: [640, 360, 0],
+        scale: [1, 1, 1],
+        angles: [0, 0, 0],
+      });
+      psC.setTexture(mkTexN(64));
+      for (let i = 0; i < 40; i++) psC.advance(1 / 60);
+      const blended = (psC.pool || []).some((q) => q.alive && (q.frameMix || 0) > 0.01);
+      if (!blended) errors.push("2131872317 fog1（SEQUENCE）必须开帧间混合，实际全部硬切");
+    }
+  }
+  const simSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/this\.frameBlend = \(num\(model\.flags, 0\) & 2\) === 0/.test(simSrc)) {
+    errors.push("frameBlend 必须按官方 flags bit1 判定（默认开启）");
+  }
+  if (!/p\.frameB = Math\.min\(this\.frameCount - 1, a \+ 1\)/.test(simSrc)) {
+    errors.push("下一帧必须是 min(n-1, cur+1)（官方 ComputeSpriteFrame）");
+  }
+  return { errors };
+}
+
 // ---------- 内置帧表：rain1/rain2 1×4、leaves* 3×3（1823900922 / 1725510475）----------
 function runBuiltinFrames() {
   const errors = [];
@@ -2267,6 +2489,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【内置帧表】问题 ${bf.errors.length}`);
   bf.errors.forEach((e) => console.log("  ! " + e));
   failed += bf.errors.length;
+  const fb = runFrameBlend();
+  console.log(`\n【帧间交叉淡入】问题 ${fb.errors.length}`);
+  fb.errors.forEach((e) => console.log("  ! " + e));
+  failed += fb.errors.length;
 }
 if (action === "all" || action === "sim") {
   const r = runSim();

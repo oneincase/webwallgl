@@ -89,7 +89,7 @@ export function rasterizeSystem(target, ps, cam) {
 
   // 画一个实例 quad（与顶点着色器逐字对应）：
   // quad 宽 = size*stX，长 = size*stY，rot 为投影空间弧度；uv.y = mix(v0, v1, corner.y+0.5)
-  const drawOne = (wx, wy, rot, size, stX, stY, cr2, cg2, cb2, ca, frameIdx, v0, v1) => {
+  const drawOne = (wx, wy, rot, size, stX, stY, cr2, cg2, cb2, ca, frameIdx, v0, v1, frameB, frameMix) => {
     const halfW = (size * stX) / 2
     const halfH = (size * stY) / 2
     const cr = Math.cos(rot)
@@ -123,15 +123,31 @@ export function rasterizeSystem(target, ps, cam) {
         // corner → uv（与顶点着色器一致：不翻 v，投影空间 y 已翻）
         let u = cu + 0.5
         let v = v0 + (v1 - v0) * (cv + 0.5)
+        // 帧间交叉淡入（官方 SPRITESHEETBLEND）：同一 quad 采当前帧与下一帧后 mix。
+        // 与 particle-shaders.js 的 frag 逐字对应，改一边必改另一边。
+        let t
         if (frames && frames.length) {
           // 帧矩形以左上为原点（TEXS 是 top-down 像素坐标）
-          const fr = frames[Math.max(0, Math.min(frames.length - 1, frameIdx | 0))]
-          const cu2 = u * fr.su + fr.ou
-          const cv2 = (1 - v) * fr.sv + fr.ov
-          u = cu2
-          v = 1 - cv2
+          const pick = (fi, uu, vv) => {
+            const fr = frames[Math.max(0, Math.min(frames.length - 1, fi | 0))]
+            return [uu * fr.su + fr.ou, 1 - ((1 - vv) * fr.sv + fr.ov)]
+          }
+          const [ua, va] = pick(frameIdx, u, v)
+          t = sampleTex(tex, ua, va)
+          const mixW = frameMix || 0
+          if (mixW > 0) {
+            const [ub, vb] = pick(frameB === undefined ? frameIdx : frameB, u, v)
+            const t2 = sampleTex(tex, ub, vb)
+            t = [
+              t[0] + (t2[0] - t[0]) * mixW,
+              t[1] + (t2[1] - t[1]) * mixW,
+              t[2] + (t2[2] - t[2]) * mixW,
+              t[3] + (t2[3] - t[3]) * mixW,
+            ]
+          }
+        } else {
+          t = sampleTex(tex, u, v)
         }
-        const t = sampleTex(tex, u, v)
         // REFRACT + 空白白图：GPU 走折射；CPU 光栅没有帧缓冲可采，不能按不透明
         // 白 quad 画，否则 2468489223 Splatter Small 会在离线结果里铺满白方块。
         if (punchBlank) continue
@@ -219,7 +235,7 @@ export function rasterizeSystem(target, ps, cam) {
     const size = Math.abs(p.size) * sysScale
     if (!(size * pStretchX) || !(size * pStretchY)) continue
 
-    drawOne(wx, wy, rot, size, pStretchX, pStretchY, p.r * bright, p.g * bright, p.b * bright, p.alpha, p.frame, 0, 1)
+    drawOne(wx, wy, rot, size, pStretchX, pStretchY, p.r * bright, p.g * bright, p.b * bright, p.alpha, p.frame, 0, 1, p.frameB, p.frameMix)
   }
   return { drawn }
 }

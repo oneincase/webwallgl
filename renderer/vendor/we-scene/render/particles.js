@@ -221,6 +221,11 @@ export class ParticleSystem {
     this._vao = null
     this._data = null
     this._sceneTex = null
+    // [we-scene patch] 序列帧**帧间交叉淡入**：官方在 animationmode==SEQUENCE 且
+    // 模型 flags 的 `spritenoframeblending`(bit1=2) 未置位时开启 SPRITESHEETBLEND
+    // （SceneCompiler.cpp:4535），frag 里 `mix(frame, nextFrame, frac(lifetime*numFrames))`。
+    // 硬切会让快速动画的精灵「跳帧」发顿；全库粒子模型绝大多数没写 flags → 默认开。
+    this.frameBlend = (num(model.flags, 0) & 2) === 0
     // 序列帧（sprite sheet）。优先用贴图 TEXS 段里的**真实帧矩形**；
     // 只有在贴图没有 TEXS 时才退回按 sequencemultiplier 猜 N×N 方格
     // （猜测对横排/竖排的 sheet 是错的，会采样到跨帧的错位图块）。
@@ -1158,6 +1163,8 @@ export class ParticleSystem {
     if (this.frameCount > 1) {
       p.frame = this.animationMode === 'randomframe' ? Math.floor(Math.random() * this.frameCount) : 0
     }
+    p.frameB = p.frame
+    p.frameMix = 0
 
     p.bx = p.x
     p.by = p.y
@@ -1352,9 +1359,16 @@ export class ParticleSystem {
     }
     p.alpha = Math.max(0, a)
 
-    // 序列帧推进（非 randomframe 时按生命进度走完一轮）
+    // 序列帧推进（非 randomframe 时按生命进度走完一轮）。
+    // [we-scene patch] 同时给出**下一帧与混合权重**（官方 ComputeSpriteFrame：
+    // currentFrame = floor(lifetime*numFrames)、nextFrame = min(n-1, cur+1)、
+    // frameBlend = frac(lifetime*numFrames)），帧间连续过渡而不是硬切。
     if (this.frameCount > 1 && this.animationMode !== 'randomframe') {
-      p.frame = Math.min(this.frameCount - 1, Math.floor(lt * this.frameCount))
+      const ff = lt * this.frameCount
+      const a = Math.min(this.frameCount - 1, Math.floor(ff))
+      p.frame = a
+      p.frameB = Math.min(this.frameCount - 1, a + 1)
+      p.frameMix = this.frameBlend ? Math.min(1, Math.max(0, ff - a)) : 0
     }
 
     // 轨迹采样：按 Rope Trail Length（秒）把当前位置推进历史环。
@@ -1602,8 +1616,8 @@ export class ParticleSystem {
     const spriteTrail = this.trailCfg && this.trailCfg.kind === 'spritetrail' ? this.trailCfg : null
     const rope = this.ropeRenderer
     const segs = particleInstanceSegs(this.trailCfg, this.trailSegments)
-    // 每实例 14 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(2) vrange(2)
-    const STRIDE = 14
+    // 每实例 16 float：pos(3) size(1) rot(1) color(4) frame(1) aspect(2) vrange(2) frameB+mix(2)
+    const STRIDE = 16
     const pool = this.pool
     // rope：先按发射序收集存活粒子（pool 槽位会循环复用，槽位序 ≠ 发射序）
     let order = null
@@ -1681,6 +1695,9 @@ export class ParticleSystem {
         // v=0 是贴图第 0 行（亮端，无翻行上传）：新生端 v≈0 亮，老年端 v→1 淡出
         data[k++] = ropeParticleV(a)
         data[k++] = ropeParticleV(b)
+        // 帧间混合槽位：rope 段不做帧混合（官方 ropetrail 走 THICKFORMAT 路径）
+        data[k++] = 0
+        data[k++] = 0
       }
     }
     for (let i = 0; i < pool.length && !rope; i++) {
@@ -1766,6 +1783,9 @@ export class ParticleSystem {
         data[k++] = p.frame
         data[k++] = 0
         data[k++] = 1
+        // 帧间混合：下一帧序号 + 权重（官方 SPRITESHEETBLEND）
+        data[k++] = p.frameB === undefined ? p.frame : p.frameB
+        data[k++] = p.frameMix || 0
       }
     }
 

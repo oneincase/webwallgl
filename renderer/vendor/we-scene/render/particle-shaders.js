@@ -11,12 +11,15 @@ layout(location=2) in vec2 a_sizeRot;     // x=size(像素) y=rot(弧度)
 layout(location=3) in vec4 a_color;       // rgb + alpha
 layout(location=4) in vec3 a_stretchFrame; // xy=非等比拉伸 z=帧序号
 layout(location=5) in vec2 a_vrange;      // 段两端沿贴图 v 的取值（rope 连线用；普通精灵 0..1）
+layout(location=6) in vec2 a_frameBlend;  // x=下一帧序号 y=帧间混合权重（官方 SPRITESHEETBLEND）
 uniform mat4 u_mvp;
 // 序列帧 uv 变换表（TEXS 帧矩形归一化后的 offset/scale），最多 128 帧
 // （matrix spritesheet 72 有 71 帧，旧上限 64 会丢末尾字符）
 uniform int u_frameCount;
 uniform vec4 u_frames[128];               // xy=offset zw=scale
 out vec2 v_uv;
+out vec2 v_uv2;        // 下一帧的 uv（同一 quad 位置、换帧矩形）
+out float v_frameMix;  // 帧间混合权重（0 = 不混合，硬切）
 out vec4 v_color;
 void main(){
   float size = a_sizeRot.x;
@@ -30,13 +33,24 @@ void main(){
   // 对应屏幕上方，应采样纹理顶行 v=1（与 renderer.js 的 layerQuadVerts 同约定）。
   // a_vrange 让 rope 段两端各取自己的 v（沿绳连续渐变）；普通精灵是 (0,1) 恒等。
   vec2 uv = vec2(a_corner.x + 0.5, mix(a_vrange.x, a_vrange.y, a_corner.y + 0.5));
+  v_uv2 = uv;
+  v_frameMix = 0.0;
   if (u_frameCount > 0) {
     // 帧矩形以左上为原点（TEXS 是 top-down 像素坐标），故先把 v 翻成 top-down
+    vec2 uv2 = uv;
     int fi = int(a_stretchFrame.z);
     fi = clamp(fi, 0, u_frameCount - 1);
     vec4 fr = u_frames[fi];
     vec2 cell = vec2(uv.x, 1.0 - uv.y) * fr.zw + fr.xy;
     uv = vec2(cell.x, 1.0 - cell.y);
+    // 官方 ComputeSpriteFrame：nextFrame = min(n-1, cur+1)、frameBlend = frac(lifetime*n)；
+    // frag 用 mix(当前帧, 下一帧, blend) 做交叉淡入（硬切会跳帧）。
+    int fj = clamp(int(a_frameBlend.x), 0, u_frameCount - 1);
+    vec4 fr2 = u_frames[fj];
+    vec2 cell2 = vec2(uv2.x, 1.0 - uv2.y) * fr2.zw + fr2.xy;
+    uv2 = vec2(cell2.x, 1.0 - cell2.y);
+    v_uv2 = uv2;
+    v_frameMix = clamp(a_frameBlend.y, 0.0, 1.0);
   }
   v_uv = uv;
   v_color = a_color;
@@ -51,10 +65,15 @@ uniform int u_sampleScene;
 uniform vec2 u_resolution;
 uniform float u_refractScale;
 in vec2 v_uv;
+in vec2 v_uv2;
+in float v_frameMix;
 in vec4 v_color;
 out vec4 fragColor;
 void main(){
   vec4 t = texture(u_tex, v_uv);
+  // 帧间交叉淡入（官方 SPRITESHEETBLEND：mix(frame, nextFrame, frac(lifetime*n))）。
+  // 法线槽仍只采当前帧 —— 官方 frag 也是只对 albedo 做 mix。
+  if (v_frameMix > 0.0) t = mix(t, texture(u_tex, v_uv2), v_frameMix);
   vec4 col = vec4(t.rgb * v_color.rgb, t.a * v_color.a);
   if (u_refract == 1) {
     // genericparticle REFRACT：槽 0 经常是空白白图（Rain2 的
@@ -106,9 +125,9 @@ void main(){
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0)
     gl.vertexAttribDivisor(0, 0)
-    // location 1..4：实例数据（stride 56 = 14 float，含 rope 的 a_vrange）
+    // location 1..6：实例数据（stride 64 = 16 float，含 rope 的 a_vrange 与帧间混合）
     gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
-    const S = 56
+    const S = 64
     gl.enableVertexAttribArray(1)
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, S, 0)
     gl.vertexAttribDivisor(1, 1)
@@ -124,6 +143,9 @@ void main(){
     gl.enableVertexAttribArray(5)
     gl.vertexAttribPointer(5, 2, gl.FLOAT, false, S, 48)
     gl.vertexAttribDivisor(5, 1)
+    gl.enableVertexAttribArray(6)
+    gl.vertexAttribPointer(6, 2, gl.FLOAT, false, S, 56)
+    gl.vertexAttribDivisor(6, 1)
     gl.bindVertexArray(null)
 
     return {

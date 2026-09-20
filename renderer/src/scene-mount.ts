@@ -2224,9 +2224,12 @@ cfg, source, pkgAbort.signal);
           let maxY = -Infinity;
           let minS = Infinity;
           let maxS = -Infinity;
+          // 序列帧诊断：最大帧间混合权重（官方 SPRITESHEETBLEND 是否真的在混）
+          let frameMixMax = 0;
           for (const p of ps.pool) {
             if (!p.alive) continue;
             live++;
+            if ((p.frameMix || 0) > frameMixMax) frameMixMax = p.frameMix;
             const px = ps.originX + p.x * ps.scaleX;
             const py = ps.originY + p.y * ps.scaleY;
             if (px < minX) minX = px;
@@ -2246,6 +2249,8 @@ cfg, source, pkgAbort.signal);
             origin: [Math.round(ps.originX), Math.round(ps.originY)],
             bbox: live ? [Math.round(minX), Math.round(minY), Math.round(maxX), Math.round(maxY)] : null,
             size: live ? [Math.round(minS), Math.round(maxS)] : null,
+            frameCount: ps.frameCount,
+            frameMixMax: Math.round(frameMixMax * 1000) / 1000,
           };
         }),
       });
