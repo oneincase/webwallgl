@@ -68,6 +68,55 @@ export function libraryDir(): string {
   );
 }
 
+/**
+ * 本机引擎内置素材目录（贴图 / 法线）。
+ *
+ * 这些是 Wallpaper Engine 安装目录自带的公共素材（`assets/materials/**`），
+ * **受版权保护、永不入库**：仓库只留程序化复刻（system-textures.js /
+ * particle-textures.js），谁本机想按原版观感测试就自己拷一份到
+ * `local-assets/mirage/materials/**`（.gitignore 已忽略整个 `local-assets/`），
+ * 或用 `WE_LOCAL_ASSETS=/abs/path` 指向别处（例如 Mirage 的 assets 目录）。
+ * 目录不存在 = 端点返回 `{ok:false}`，渲染器整条路径跳过，行为与今天一致。
+ */
+export function localAssetProviders(): Array<{ id: string; dir: string }> {
+  const out: Array<{ id: string; dir: string }> = [];
+  const env = process.env.WE_LOCAL_ASSETS;
+  if (env) out.push({ id: "env", dir: resolve(env) });
+  out.push({ id: "mirage", dir: join(resolve("."), "local-assets", "mirage") });
+  return out;
+}
+
+/** 素材名清单缓存：dir → { names, at }（扫 586 个文件不值得每次挂载都做） */
+const localAssetIndexCache = new Map<string, { names: string[]; at: number }>();
+
+/** 扫描 materials 目录下全部 `.tex` → 引擎名（相对 materials 的路径去掉扩展名） */
+async function listLocalAssetNames(dir: string): Promise<string[]> {
+  const hit = localAssetIndexCache.get(dir);
+  if (hit && Date.now() - hit.at < 60_000) return hit.names;
+  const base = join(dir, "materials");
+  const names: string[] = [];
+  const walk = async (d: string, prefix: string): Promise<void> => {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = (await fs.readdir(d, { withFileTypes: true })) as never;
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        await walk(join(d, e.name), rel);
+      } else if (e.isFile() && e.name.endsWith(".tex")) {
+        names.push(rel.slice(0, -4));
+      }
+    }
+  };
+  await walk(base, "");
+  names.sort();
+  localAssetIndexCache.set(dir, { names, at: Date.now() });
+  return names;
+}
+
 const execFileAsync = promisify(execFile);
 
 /** macOS 系统「选择文件夹」；取消或非 darwin 返回 null */
@@ -829,6 +878,62 @@ export function wallpaperHost(): Plugin {
             return;
           }
           sendJson(res, 200, { value: picked });
+          return;
+        }
+
+        // --- 本机引擎内置素材（贴图 / 法线）：/api/local-assets/... ---
+        // WE 的内置贴图（materials/util/*、materials/particle/**）不在壁纸 pkg 里，
+        // 只有官方安装目录才有。本地想按原版观感测试时把它们拷到 `local-assets/<id>/`
+        // （.gitignore 忽略、永不入库，见 docs/COMPLIANCE.md），这个端点只把它喂给渲染器；
+        // 目录不存在时返回 `{ok:false}`，渲染器整条路径静默跳过、回落到程序化复刻
+        // （system-textures.js / particle-textures.js）。
+        if (path === "/api/local-assets" || path.startsWith("/api/local-assets/")) {
+          const providers = localAssetProviders();
+          if (path === "/api/local-assets") {
+            const roots: Array<{ id: string; dir: string }> = [];
+            for (const p of providers) {
+              try {
+                const st = await fs.stat(join(p.dir, "materials"));
+                if (!st.isDirectory()) continue;
+              } catch {
+                continue;
+              }
+              roots.push({ id: p.id, dir: p.dir });
+            }
+            sendJson(res, 200, { ok: roots.length > 0, roots });
+            return;
+          }
+          const segs = path
+            .replace(/^\/api\/local-assets\//, "")
+            .split("/")
+            .filter(Boolean)
+            .map(decodeURIComponent);
+          const id = segs.shift() ?? "";
+          const provider = providers.find((p) => p.id === id);
+          if (!provider) {
+            sendJson(res, 404, { error: `未知素材源：${id}` });
+            return;
+          }
+          const rel = segs.join("/");
+          // 引擎素材名清单：把 materials/**/*.tex 的相对路径去掉扩展名当「引擎名」
+          // （`materials/util/noise.tex` → `util/noise`，与 shader/材质引用同名）。
+          // 扫盘结果按目录 mtime 缓存 60s，避免每次挂载都重扫 586 个文件。
+          if (rel === "materials/index.json") {
+            sendJson(res, 200, { names: await listLocalAssetNames(provider.dir) });
+            return;
+          }
+          const file = rel ? safeJoin(provider.dir, rel) : null;
+          if (!file) {
+            sendJson(res, 400, { error: "路径非法" });
+            return;
+          }
+          const st = await statFile(file);
+          if (!st || !st.isFile()) {
+            sendJson(res, 404, { error: `素材不存在：${rel}` });
+            return;
+          }
+          // sendFile 自带 MIME / ETag / Range，并等到流结束才返回（见其注释）
+          await sendFile(req, res, file);
           return;
         }
 

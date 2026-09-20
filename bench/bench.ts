@@ -98,6 +98,7 @@ const pqEl = $<HTMLSelectElement>("#pq");
 const ppEl = $<HTMLSelectElement>("#pp");
 const volumeEl = $<HTMLInputElement>("#volume");
 const liveSystemEl = $<HTMLInputElement>("#live-system");
+const localAssetsEl = $<HTMLInputElement>("#local-assets");
 const pointerPushEl = $<HTMLInputElement>("#pointer-push");
 const pointerVeilEl = $<HTMLElement>("#pointer-veil");
 const resolutionEl = $<HTMLSelectElement>("#resolution");
@@ -677,6 +678,8 @@ function buildQuery(it: LibraryItem): string {
   p.set("loop", "true");
   p.set("mediaBase", MEDIA_BASE);
   if (liveSystemEl.checked) p.set("liveSystem", "1");
+  // 本机引擎内置素材（贴图/法线）开关：渲染器页 local-assets.ts 按同名键解析
+  if (!localAssetsEl.checked) p.set("localAssets", "0");
   return p.toString();
 }
 
@@ -881,6 +884,11 @@ ppEl.onchange = () => {
   wp()?.setQuality({ postProcessing: ppEl.value });
 };
 volumeEl.oninput = () => wp()?.setVolume(Number(volumeEl.value));
+localAssetsEl.onchange = () => {
+  // 素材开关在挂载期生效（挂载前装载 / provider 注入），所以要重挂一次
+  if (selected) mount();
+  log(localAssetsEl.checked ? t("log.localAssetsOn") : t("log.localAssetsOff"));
+};
 liveSystemEl.onchange = () => {
   if (selected) mount();
   log(

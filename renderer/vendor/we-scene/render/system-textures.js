@@ -242,11 +242,33 @@ function buildClouds() {
 }
 
 /**
+ * 宿主素材覆盖：fn(name) → { width, height, rgba } | null。
+ *
+ * 本机装了 WE / Mirage 的原版素材时（`local-assets/mirage/materials/util/*.tex`，
+ * 见 host/wallpaper-host.ts 的 /api/local-assets 与 docs/COMPLIANCE.md），由宿主
+ * 解码后从这里注入，`buildSystemUtilTexture` 优先返回它 —— 观感与官方逐像素一致。
+ * 返回 null 则继续走本模块的程序化复刻，所以**不装素材时行为一个字节不变**。
+ * 与 particle-textures.js 的 setParticleTextureProvider 同一先例。
+ */
+let overrideProvider = null
+export function setSystemTextureProvider(provider) {
+  overrideProvider = typeof provider === 'function' ? provider : null
+}
+
+/**
  * 系统内置 util 贴图生成。任何情况下不为 null（名单内名字必有产出），
  * 名单外返回 null（调用方继续走 pkg / 其它来源）。
  * 返回 { width, height, rgba }；mip 行为由 isNomipSystemTexture 描述。
  */
 export function buildSystemUtilTexture(name) {
+  if (overrideProvider) {
+    try {
+      const t = overrideProvider(name)
+      if (t && t.rgba) return t
+    } catch {
+      /* 覆盖失败不阻断：继续走下面的程序化复刻 */
+    }
+  }
   if (cache.has(name)) return cache.get(name)
   let t = null
   switch (name) {

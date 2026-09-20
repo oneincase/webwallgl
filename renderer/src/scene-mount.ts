@@ -8,6 +8,7 @@ import type { WallpaperConfig } from "./types";
 import { normalizeQuality, particleQualityScale, postFboCapFactor, type ResolvedQuality } from "./quality";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
+import { installLocalAssets, ensureLocalAsset } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
@@ -933,6 +934,28 @@ cfg, source, pkgAbort.signal);
       };
 
       const textures = new Map<string, any>();
+      // [we-scene patch] 本机引擎内置素材（WE 安装目录的 materials/**）：贴图 + 法线。
+      // 装了（`local-assets/mirage/` 或 WE_LOCAL_ASSETS）就用原版像素，没装就返回
+      // null → 下面照旧走 system-textures.js / particle-textures.js 的程序化复刻。
+      // 必须在注册 util 贴图**之前** await：provider 一旦装上，注册循环直接拿官方像素。
+      {
+        // 防呆：本地素材只是测试通路，任何意外都不许拖垮挂载（内部已各自 try/catch）
+        let st: Awaited<ReturnType<typeof installLocalAssets>> = null;
+        try {
+          st = await installLocalAssets();
+        } catch (e) {
+          reportDiag(rt, cfg, `local assets 装载失败（忽略）：${(e as Error)?.message}`);
+        }
+        if (st) {
+          reportDiag(
+            rt,
+            cfg,
+            `local assets: ${st.loaded}/${st.requested} tex（util ${st.util} / particle ${st.particle}）` +
+              ` ${(st.bytes / 1e6).toFixed(1)}MB ${st.ms}ms source=${st.source} mode=${st.mode}` +
+              (st.failed ? ` failed=${st.failed}` : ""),
+          );
+        }
+      }
       // [we-scene patch] WE 系统内置贴图（materials/util/*，效果链/材质/sampler
       // 默认槽引用、不在壁纸 pkg 里）。此前只硬编码 5 个名字且多为 1×1 占位，
       // 与官方差距大：flatnormal（法线参考）缺失 → 法线类效果落白板、法线被
@@ -1203,6 +1226,10 @@ cfg, source, pkgAbort.signal);
           // 仓库自带等效素材（render/particle-textures.js），这里按名回退。
           // 注意：这条回退过去只在 loadParticleTex 里有，效果 pass 的贴图预载走的是
           // 本函数，所以粒子能拿到内置素材、效果不能。
+          // [we-scene patch] 本机装了 WE 原版素材时先按需拉这一张（粒子图集很大，
+          // 不做全量预载）：落进 provider 缓存后，下面的 buildBuiltinParticleTexture
+          // 就命中官方像素。没装素材时它立刻返回 false，照旧走程序化复刻。
+          await ensureLocalAsset(name);
           if (ptex.isBuiltinParticleTextureName(name)) {
             const gen = ptex.buildBuiltinParticleTexture(name);
             if (gen) {
