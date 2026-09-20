@@ -36,6 +36,28 @@ function typeFromMime(mime: string): "video" | "gif" | "image" | null {
  *
  * 认不出返回 null（交给调用方决定是否再 HEAD 一次或落回 scene）。
  */
+/**
+ * 从 Source.key（通常是壁纸目录 URL / 本地路径）抽出工坊 ID。
+ *
+ * WallpaperEM 等宿主走 `mount({ source })` 时不会再填 cfg.src；视差白名单
+ * （MIRAGE_PARALLAX_WALLPAPERS）却靠 workshopId=cfg.src 选路。若这里抽不出 ID，
+ * 3233141951 等白名单墙会默默退回 legacy 视差，本库测试台（URL ?src=ID）正常、
+ * 下游开发模式却「修好了却不一致」。
+ *
+ * 只认末段纯数字（Steam 工坊 ID）；fileSource / bytesSource 无数字 key 时返回
+ * undefined，视差保持默认 legacy。
+ */
+export function workshopIdFromSourceKey(key?: string | null): string | undefined {
+  if (typeof key !== "string" || !key) return undefined;
+  const seg =
+    key
+      .replace(/[?#].*$/, "")
+      .replace(/\/+$/, "")
+      .split(/[/\\]/)
+      .pop() ?? "";
+  return /^\d+$/.test(seg) ? seg : undefined;
+}
+
 export function sniffMediaType(url: string): "video" | "gif" | "image" | null {
   if (typeof url !== "string" || !url) return null;
   let path = url;

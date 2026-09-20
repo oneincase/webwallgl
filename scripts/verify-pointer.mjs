@@ -156,9 +156,31 @@ console.log('\n【1. OBB hit-test】')
       fail('resolveParallaxFormula 默认必须是 legacy（全库）')
     else if (!/3233141951/.test(mathSrc) || !/MIRAGE_PARALLAX_WALLPAPERS/.test(mathSrc))
       fail('MIRAGE_PARALLAX_WALLPAPERS 必须包含 3233141951')
-    else if (!/workshopId:\s*cfg\.src/.test(mountSrc))
-      fail('scene-mount 必须把 cfg.src 传给 createRenderer 作 workshopId（白名单选路）')
+    else if (!/workshopId:\s*cfg\.src\s*\?\?\s*workshopIdFromSourceKey/.test(mountSrc))
+      fail('scene-mount 必须把 cfg.src ?? workshopIdFromSourceKey(source.key) 传给 createRenderer（Source API 无 src 时也能命中白名单）')
     else ok('视差双路径：默认 legacy，3233141951 → mirage')
+
+    // Source API 路径：WallpaperEM 只传 source.key=…/3233141951，不填 cfg.src。
+    // 抽不出 ID → 白名单永远 miss → 本库测试台正常、下游开发模式视差错位。
+    {
+      const { workshopIdFromSourceKey } = await imp('renderer/src/api/source.ts')
+      const samples = [
+        ['http://127.0.0.1:7411/3233141951', '3233141951'],
+        ['https://cdn.example.com/wallpapers/3233141951/', '3233141951'],
+        ['file:///Users/x/Library/.../3233141951', '3233141951'],
+        ['bytes:deadbeef', undefined],
+        ['', undefined],
+      ]
+      let bad = 0
+      for (const [key, expect] of samples) {
+        const got = workshopIdFromSourceKey(key)
+        if (got !== expect) {
+          bad++
+          fail(`workshopIdFromSourceKey(${JSON.stringify(key)}) 期望 ${expect}，实得 ${got}`)
+        }
+      }
+      if (!bad) ok(`workshopIdFromSourceKey：${samples.length} 组（含 WallpaperEM Source.key 形态）`)
+    }
 
     // mirage 分支：mouse 向量符号 + 节点静态项 + y 取负
     const mx = /parallaxCtx\.mx\s*=\s*\(0\.5\s*-\s*parallaxState\.sx\)/.exec(rdSrc)

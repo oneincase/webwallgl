@@ -101,6 +101,11 @@ export declare function sniffMediaType(
   url: string,
 ): "video" | "gif" | "image" | null;
 
+/** 从 Source.key 末段抽出工坊 ID（视差白名单 / 脚本 __workshopId 回填用） */
+export declare function workshopIdFromSourceKey(
+  key?: string | null,
+): string | undefined;
+
 export declare function createMediaSource(
   init?: MediaSourceInit,
   controls?: MediaSourceControls,

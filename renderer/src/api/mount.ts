@@ -21,7 +21,7 @@ import type { WallpaperConfig } from "../types";
 import { normalizeQuality } from "../quality";
 import type { QualityOptions, ResolvedQuality } from "./types";
 import { weShimCall } from "../web";
-import { sniffMediaType } from "./source";
+import { sniffMediaType, workshopIdFromSourceKey } from "./source";
 import { mediaColor } from "./media-source";
 import type {
   AudioSource,
@@ -210,9 +210,18 @@ async function resolveMountConfig(
       return { ...base, type: sniffed as WallpaperConfig["type"], src: url, canvas, source: o.source };
     }
   }
-  // 其余一律走场景装配
+  // 其余一律走场景装配。
+  // src 填工坊 ID（从 source.key 末段抽出）：scene-mount 用它作 workshopId
+  // 喂视差白名单；缺了会让 3233141951 等墙在 Source API 路径下退回 legacy。
   const canvas = ensureSceneCanvas(el);
-  return { ...base, type: "scene", canvas, source: o.source };
+  const workshopId = workshopIdFromSourceKey(o.source.key);
+  return {
+    ...base,
+    type: "scene",
+    canvas,
+    source: o.source,
+    ...(workshopId ? { src: workshopId } : {}),
+  };
 }
 
 /**

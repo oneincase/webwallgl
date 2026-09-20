@@ -690,20 +690,21 @@ const kf = (frame, value, front, back) => ({
     !/frametime = interval \/ 1000/.test(mountSrc),
     "engine.frametime 不得用目标帧间隔（须与同一行的 runtime 同时基）",
   );
-  // [we-scene patch 3448845950] animDt 仍取真实经过时间，但**要封顶**（见下方
-  // 「单帧 dt 封顶」一节）：`mix(cur, target, speed*frametime)` 在卡顿帧会过冲。
+  // [we-scene patch 3448845950 + 2026-09-20] 脚本 frametime 封顶，关键帧 advance 不封顶：
+  // 骨骼吃绝对时间 t；关键帧若也封顶，卡顿后 lastAnimT=t 会把丢掉的时间永久吃掉
+  // （3233141951 头发落后于头 → 漏模）。
   check(
-    /const rawDt = Math\.max\(0, t - lastAnimT\)/.test(mountSrc) &&
-      /const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\)/.test(mountSrc) &&
-      /\.advance\(animDt\)/.test(mountSrc),
-    "关键帧动画必须用真实经过时间 animDt（封顶后）推进",
+    /const clockDt = rawDt/.test(mountSrc) &&
+      /\.advance\(clockDt\)/.test(mountSrc) &&
+      /const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\)/.test(mountSrc),
+    "关键帧 advance 必须用未封顶 clockDt；脚本 frametime 才用封顶后的 animDt",
   );
-  // animDt 是**帧间增量**，算完必须立刻推进 lastAnimT。漏掉这一句 dt 会变成
+  // clockDt/animDt 都是**帧间增量**，算完必须立刻推进 lastAnimT。漏掉这一句 dt 会变成
   // 「从头到现在的累计时间」，播放头按 t 的平方增长 —— 动画瞬间飞出值域，
   // 而上面几条正则断言全都照过（正则只看形状，不看语义）。
   check(
-    /const rawDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\);\s*\n\s*lastAnimT = t;/.test(mountSrc),
-    "算出 animDt 后必须立即推进 lastAnimT（否则 dt 变成累计时间，播放头按 t² 增长）",
+    /const rawDt = Math\.max\(0, t - lastAnimT\);\s*\n\s*lastAnimT = t;\s*\n\s*const clockDt = rawDt;\s*\n\s*const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\);/.test(mountSrc),
+    "算出 rawDt 后必须立即推进 lastAnimT（否则 dt 变成累计时间，播放头按 t² 增长）",
   );
   // 第四处是「按沙箱回填」：对象脚本队列按 hasUpdate 筛过，漏掉无 export 的引擎层
   // 脚本（3786330502 id=885 往 shared 上装 helper）。那份 engine 不回填就冻结在 0，
@@ -778,6 +779,62 @@ const kf = (frame, value, front, back) => ({
         );
       }
 
+      // 「关键帧也封顶 + lastAnimT=t」是 3448845950 引入的回归：每次卡顿丢掉
+      // (rawDt−0.05) 秒，骨骼仍走绝对 t → 头发永久落后。模拟器必须复现并证明
+      // 当前实现不受影响。
+      {
+        const secs = 30;
+        const truth = secs * 30;
+        const CAP = 0.05;
+        const simulateCappedAdvance = () => {
+          const ctrl = createAnimation(hair.origin.animation);
+          let now = 0;
+          let lastAnimT = 0;
+          // 穿插卡顿：多数帧 16ms，每秒一次 200ms 尖峰（≈ 30 次 × 0.15s 丢失）
+          let i = 0;
+          while (now < secs * 1000) {
+            const step = i % 60 === 0 ? 200 : 1000 / 60;
+            i++;
+            now += step;
+            const t = now / 1000;
+            const raw = Math.max(0, t - lastAnimT);
+            lastAnimT = t;
+            ctrl.advance(Math.min(raw, CAP)); // 错误写法
+          }
+          return ctrl.getFrame();
+        };
+        const simulateClockAdvance = () => {
+          const ctrl = createAnimation(hair.origin.animation);
+          let now = 0;
+          let lastAnimT = 0;
+          let i = 0;
+          while (now < secs * 1000) {
+            const step = i % 60 === 0 ? 200 : 1000 / 60;
+            i++;
+            now += step;
+            const t = now / 1000;
+            const raw = Math.max(0, t - lastAnimT);
+            lastAnimT = t;
+            ctrl.advance(raw); // 正确写法（与骨骼同源）
+          }
+          return ctrl.getFrame();
+        };
+        const bad = simulateCappedAdvance();
+        const good = simulateClockAdvance();
+        check(
+          Math.abs(good - truth) <= 1,
+          `卡顿交错下未封顶 advance 应跟住骨骼（期望 ${truth}，实得 ${good.toFixed(1)}）`,
+        );
+        check(
+          Math.abs(bad - truth) > 50,
+          `卡顿交错下「关键帧也封顶」应显著落后（坏 ${bad.toFixed(1)} / 真值 ${truth}）—— ` +
+            `若这条不成立，说明模拟没能复现该回归，判据失去意义`,
+        );
+        console.log(
+          `   卡顿交错: 封顶 advance ${bad.toFixed(1)} 帧 / 未封顶 ${good.toFixed(1)} 帧 / 真值 ${truth} 帧`,
+        );
+      }
+
       // 「忘记推进 lastAnimT」是最容易写错的一步，且正则断言看不出来：
       // dt 变成累计时间后播放头按 t² 增长，30s 会冲到真值的几十倍。
       {
@@ -841,7 +898,7 @@ const kf = (frame, value, front, back) => ({
   );
 
   // ---- A2 接线：粒子时钟统一到场景 t ----
-  check(/particleClock\.dt = animDt/.test(mountSrc), "帧循环必须每帧把场景 dt 写入 particleClock");
+  check(/particleClock\.dt = clockDt/.test(mountSrc), "帧循环必须每帧把场景 clockDt 写入 particleClock（与关键帧同源、未封顶）");
   check(
     /const pdt = Math\.min\(0\.05, Math\.max\(0, particleClock\.dt\)\)/.test(mountSrc),
     "粒子 advance 必须用场景时钟 dt（50ms 封顶保留）",
@@ -1484,8 +1541,12 @@ const kf = (frame, value, front, back) => ({
     "scene-mount 缺少 MAX_SCRIPT_FRAME_DT = 0.05（单帧 dt 未封顶，卡顿后动画会越过目标来回荡）");
   check(/const animDt = Math\.min\(rawDt, MAX_SCRIPT_FRAME_DT\)/.test(src),
     "animDt 未按 MAX_SCRIPT_FRAME_DT 封顶（author 的 mix(cur, target, speed*frametime) 会过冲）");
-  check(/const rawDt = Math\.max\(0, t - lastAnimT\)[\s\S]{0,80}lastAnimT = t/.test(src),
-    "场景时钟仍必须按真实时间推进（lastAnimT = t），封顶只作用于喂给脚本/animation 的 dt");
+  check(/frametime = animDt/.test(src),
+    "脚本 frametime 必须用封顶后的 animDt");
+  check(/\.advance\(clockDt\)/.test(src) && /const clockDt = rawDt/.test(src),
+    "关键帧 advance 必须用未封顶 clockDt（封顶会让头发落后于骨骼绝对时间 t）");
+  check(/const rawDt = Math\.max\(0, t - lastAnimT\)[\s\S]{0,120}lastAnimT = t/.test(src),
+    "场景时钟仍必须按真实时间推进（lastAnimT = t）");
   // ② 模拟器：index 型趋近 v += (target - v) * k
   const approach = (dt, steps, speed = 5, from = 2495, target = 2174) => {
     let v = from;

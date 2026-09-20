@@ -4,7 +4,7 @@
 // [we-scene patch] 本次只做**文件级**搬移（行为零改动）；函数内部再按阶段拆分
 // 属于下一轮（需先给装配各阶段补离线判据，见 docs/ARCHITECTURE.md 路线图）。
 import { clear, effectiveDpr, markFrame, normalizeFit, readText, reportDiag, syncCanvasSize, type Runtime } from "./shell";
-import { httpSource } from "./api/source";
+import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
@@ -480,7 +480,9 @@ cfg, source, pkgAbort.signal);
         // 代价：该场景效果链 FBO 由 3.5MB 升到约 100MB。
         fboCapFactor: 0,
         // 视差公式：默认 legacy（全库）；3233141951 等白名单走 mirage（见 math.js）。
-        workshopId: cfg.src,
+        // cfg.src：测试台 URL ?src=ID；Source API 路径由 mount.ts 从 source.key 回填。
+        // 再兜底直接抽 key —— 宿主自建 Source 漏填 src 时也不至于退回 legacy。
+        workshopId: cfg.src ?? workshopIdFromSourceKey(cfg.source?.key),
         parallaxFormula: (cfg as { parallaxFormula?: string }).parallaxFormula,
       });
       // 立即登记渲染器：即使后续异步加载中途被 clear(rt)，也能正确释放该 WebGL 上下文
@@ -3649,23 +3651,24 @@ cfg, source, pkgAbort.signal);
           // 见 lastAnimT 的声明处。首帧 dt=0（lastAnimT 初值 0，t 也≈0）；
           // 暂停期间 t 已扣掉 pauseAccum，恢复后不会补跑一大段。
           //
-          // [we-scene patch 3448845950] 但**单帧 dt 要封顶**：作者的动画脚本普遍写成
-          // 「指数趋近」`value = WEMath.mix(value, target, speed * engine.frametime)`
-          //（3448845950 的面板 A/B 位移就是 speed=5 的一族）。这个式子要求
-          // `speed * frametime < 1`：一次卡顿（首帧预热、大贴图解码、切标签页回来）
-          // 把 frametime 顶到 0.37s（≈2.7fps）时系数变成 1.85 → 每帧**越过**目标
-          // 85% 再荡回来，整块 UI 甩飞后又拉回（实测根层位移 −868/−378 →
-          // 4995/1989 → 才收敛），观感就是「动画乱飞、点了也切不过去」。
-          // 粒子的 dt 早有 50ms 封顶（见 particleClock 注释），脚本这条同因同治。
-          // 参考实现同样对帧间隔做平滑：Mirage 的 FrameTimer 用队列**平均**
-          // frametime（FrameClock.cpp），不把单帧尖峰原样喂给脚本。
-          // 口径 20fps（0.05s）：全库 speed 滑条上限 10 时系数 0.5，仍在收敛区内；
-          // 正常帧（≥20fps）dt 原样透传，观感零差异。
+          // 两条时间线必须拆开（2026-09-20，3233141951 头发/头漏模回归）：
+          //   · clockDt = 未封顶真实 dt → 关键帧 advance（头发0202 / 发饰 / 火1…）
+          //     骨骼蒙皮吃的是绝对时间 t，关键帧若也封顶就会在每次卡顿后
+          //     **永久落后**（lastAnimT 已跳到 t，丢掉的那截再也补不回来）。
+          //   · animDt = 封顶后的 dt → 只喂 engine.frametime（脚本）。
+          //     作者的「指数趋近」`mix(cur, target, speed * frametime)`
+          //     （3448845950 面板 A/B，speed=5）要求 speed*frametime < 1：
+          //     卡顿把 frametime 顶到 0.37s 时系数 1.85 → 越过目标来回荡。
+          // 口径 20fps（0.05s）：全库 speed 滑条上限 10 时系数 0.5，仍在收敛区；
+          // 正常帧（≥20fps）两条 dt 相等，观感零差异。
           const rawDt = Math.max(0, t - lastAnimT);
-          const animDt = Math.min(rawDt, MAX_SCRIPT_FRAME_DT);
           lastAnimT = t;
+          const clockDt = rawDt;
+          const animDt = Math.min(rawDt, MAX_SCRIPT_FRAME_DT);
           // 粒子推进与关键帧/骨骼同一条时间线（见 setParticleRenderer 上方注释）。
-          particleClock.dt = animDt;
+          // 粒子内部还有一层 50ms 封顶（物理稳定）；这里喂未封顶，避免与
+          // 场景 t 再叠一层系统性欠计。
+          particleClock.dt = clockDt;
           particleClock.t = t;
           let visibilityDirty = false;
           // [we-scene patch] 帧事件派发（图层级广播，官方 AnimationEvent 语义）：
@@ -3730,7 +3733,7 @@ cfg, source, pkgAbort.signal);
             }
           };
           for (const run of animRuns) {
-            run.ctrl.advance(animDt);
+            run.ctrl.advance(clockDt);
             const field = run.field;
             const slot = run.slot || field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
@@ -3769,7 +3772,7 @@ cfg, source, pkgAbort.signal);
           // 写回该层全部粒子系统的倍率（轻量 setter，不动 pool）。
           // 必须在 render 之前：ps.advance/render 当帧就要读到新 opacityMul。
           for (const run of overrideAnimRuns) {
-            run.ctrl.advance(animDt);
+            run.ctrl.advance(clockDt);
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (typeof out !== "number" || !Number.isFinite(out)) continue;
             const list = particleSystemsByLayer.get(run.layer.id);
@@ -3825,7 +3828,7 @@ cfg, source, pkgAbort.signal);
           // general 动画没有图层语义（语料 0 处 events），drain 丢弃防积压。
           for (const run of generalAnimRuns) run.ctrl.takeEvents();
           for (const run of generalAnimRuns) {
-            run.ctrl.advance(animDt);
+            run.ctrl.advance(clockDt);
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (typeof out === "number" && Number.isFinite(out)) run.write(out);
             else if (Array.isArray(out) && Number.isFinite(out[0])) run.write(out[0]);
