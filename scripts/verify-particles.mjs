@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import { join } from "node:path";
 import zlib from "node:zlib";
+import { pathToFileURL } from "node:url";
 
 import { LIB, ROOT, imp } from "./lib/verify-kit.mjs";
 const {
@@ -1445,6 +1446,9 @@ function runRope() {
 
   return { errors };
 }
+
+// 官方素材（R8/RG88 取样语义 + TEXS 帧表）的判据在 verify-textures（稳定集）里，
+// 本文件只保留粒子系统本身的模拟/光栅回归。
 
 // ---------- 内置帧表：rain1/rain2 1×4、leaves* 3×3（1823900922 / 1725510475）----------
 function runBuiltinFrames() {

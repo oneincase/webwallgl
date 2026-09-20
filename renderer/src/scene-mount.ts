@@ -1826,12 +1826,28 @@ cfg, source, pkgAbort.signal);
       const particleSystemsByLayer = new Map<number, any[]>();
       let builtinTexCount = 0;
 
-      // 取粒子贴图：先查 pkg，缺失则程序化生成（生成结果并入 textures 缓存复用）
-      const loadParticleTex = async (name: string): Promise<any | null> => {
-        const inPkg = await loadTex(name);
+      // 取粒子贴图：先查 pkg，缺失则走内置素材（本机原版 / 程序化复刻）
+      // [we-scene patch] 两条必须按官方语义处理，缺一条本机接入原版素材就会「更难看」：
+      //   ① 纹理格式：stock 粒子图集大量是 R8/RG88（rain1 / fog1 / rain_drops_sheet /
+      //      light_shafts_0），WE 按 ConvertTexture0Format 取样（形状进 alpha），
+      //      我们直接 .a 会得到实心方块 / 取错通道；
+      //   ② TEXS 序列帧表：rain_drops_sheet 16 帧、fog1 64 帧、rain1 4 帧，不传就退化成
+      //      「整张图集当一帧」，画面上是一坨糊（3801012392 实测）。
+      const loadParticleTex = async (name: string, purpose: "albedo" | "normal" = "albedo"): Promise<any | null> => {
+        // 只在 pkg 真的有这张贴图时走 pkg 路径。不能无条件 `await loadTex(name)`：
+        // loadTexInner 自己也会把内置粒子贴图**程序化建出来**并返回，于是下面的
+        // 格式转换 / 真实帧表永远轮不到（本机接入原版素材时正是这个坑）。
+        const inPkg = pkg.getEntry(parsedPkg, `materials/${name}.tex`) ? await loadTex(name) : null;
         if (inPkg) return inPkg;
-        const gen = ptex.buildBuiltinParticleTexture(name);
+        // 本机装了 WE 原版素材（local-assets/，见 local-assets.ts）时按需拉这一张：
+        // 粒子图集很大（164 张解完 ~180MB），不做全量预载。没装素材时它立刻返回 false。
+        await ensureLocalAsset(name);
+        let gen = ptex.buildBuiltinParticleTexture(name);
         if (!gen) return null;
+        gen =
+          purpose === "normal"
+            ? ptex.convertParticleNormalFormat(gen, gen.format)
+            : ptex.convertParticleTexFormat(gen, gen.format);
         const entry = {
           glTex: rnd.makeTextureMip(renderer.gl, [gen], false),
           width: gen.width,
@@ -1839,10 +1855,10 @@ cfg, source, pkgAbort.signal);
           rg88: false,
           mips: [gen],
           generated: true,
-          // 内置贴图的帧表（rain1/rain2 的 1×4、leaves* 的 3×3 图集，像素矩形）：
-          // randomframe 预设依赖它随机取帧，缺了就整图采样画出超长丝（1823900922）；
-          // 叶片缺了会被 sequencemultiplier:3 切成 9 个矩形块（1725510475）。
-          frames: ptex.builtinParticleFrames(name) ?? undefined,
+          // 帧表优先级：原版素材 .tex 的 TEXS（官方布局）> 程序化图集的内置猜测表
+          // （rain1/rain2 的 1×4、leaves* 的 3×3；randomframe 依赖它随机取帧，
+          // 缺了会画出超长丝 1823900922；叶片缺了会被切成 9 块 1725510475）。
+          frames: gen.frames && gen.frames.length ? gen.frames : ptex.builtinParticleFrames(name) ?? undefined,
         };
         textures.set(name, entry);
         builtinTexCount++;
@@ -1911,7 +1927,7 @@ cfg, source, pkgAbort.signal);
         // （drop → drop_normal）；空白 albedo 没有法线就会画成白方块。
         const nrmName = texName1 || (ps.refract ? ptex.particleNormalNameForAlbedo(texName || "particle/halo") : null);
         if (nrmName) {
-          const nrm = asParticleNormal(await loadParticleTex(nrmName));
+          const nrm = asParticleNormal(await loadParticleTex(nrmName, "normal"));
           if (nrm) ps.setNormalTexture({ glTex: nrm.glTex, width: nrm.width, height: nrm.height });
         }
         ps.setVisible(!!layer.visible);

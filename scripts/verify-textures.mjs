@@ -404,5 +404,192 @@ console.log("\n[5] 精灵硬边封印：软形状贴图外圈 alpha 必须严格
   }
 }
 
+// ---------- .tex 容器变体：`flags & 0x40` 的 LUT 导出器（头部 + 每条 mip 各多一个 u32） ----------
+// WE 自带颜色分级 LUT（materials/lut/*.tex，28/28）用另一种前缀：TEXI 头之后多一个
+// = 像素数的 u32，且**每条 mip 记录前也多一个 u32**。按标准布局读会把 TEXB magic
+// 读成像素数据（「未知 TEXB 容器」整张作废）、或在 mip 上把 lz4 标志读成 32、载荷
+// 长度读成 0（空图）。本机接入原版素材时 28 张 LUT 全灭就是这个。
+// 判据：同一份像素分别按两种布局打包，parseTex 必须给出相同的 width/height/格式/载荷。
+async function containerVariant() {
+  const { parseTex } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const build = (variant) => {
+    const chunks = [];
+    const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); chunks.push(b); };
+    const stamp = (str) => chunks.push(Buffer.from(str.padEnd(9, "\0"), "latin1"));
+    stamp("TEXV0005");
+    stamp("TEXI0001");
+    u32(0);                       // format ARGB8888
+    u32(variant ? 66 : 0);        // flags（0x42 = LUT 导出器）
+    u32(32); u32(32);             // width/height（POT）
+    if (variant) u32(1024);       // 变体：多一个 = 像素数 的 u32
+    u32(32); u32(32);             // mapWidth/mapHeight
+    u32(0);                       // reserved_a
+    stamp("TEXB0004");
+    u32(1);                       // imageCount
+    u32(13);                      // freeImageFormat = PNG
+    u32(0);                       // hasMipExtension = 0 → V3 布局
+    u32(1);                       // mipCount
+    u32(32); u32(32);             // mip 宽高
+    if (variant) u32(32);         // 变体：mip 记录前多一个 u32
+    u32(0); u32(0);               // lz4 标志 / 解压尺寸
+    u32(png.length);              // src_size
+    chunks.push(png);
+    return new Uint8Array(Buffer.concat(chunks));
+  };
+  const safeParse = (buf) => {
+    try {
+      return parseTex(buf);
+    } catch (e) {
+      return { width: -1, height: -1, textureWidth: -1, textureHeight: -1, images: [[{ data: new Uint8Array(0) }]], error: String(e && e.message) };
+    }
+  };
+  const normal = safeParse(build(false));
+  const lut = safeParse(build(true));
+  check(normal.width === 32 && normal.height === 32, `标准布局 .tex 解析 32×32（实得 ${normal.width}×${normal.height}）`);
+  check(
+    lut.width === 32 && lut.height === 32,
+    `LUT 变体 .tex 解析 32×32（实得 ${lut.width}×${lut.height}${lut.error ? "，抛错：" + lut.error : ""}）`,
+  );
+  check(lut.textureWidth === 32 && lut.textureHeight === 32, "LUT 变体保留 TEXI 声明的单帧尺寸");
+  const n0 = normal.images[0] && normal.images[0][0];
+  const l0 = lut.images[0] && lut.images[0][0];
+  check(!!n0 && !!l0 && n0.data.length === png.length, "标准布局载荷长度 = 容器声明（不能为空）");
+  check(!!l0 && l0.data.length === png.length, `LUT 变体载荷长度 = 容器声明（实得 ${l0 ? l0.data.length : -1}，0 = 变体布局没认出来）`);
+  check(
+    !!l0 && Buffer.from(l0.data).equals(png),
+    "LUT 变体载荷逐字节等于嵌入的 PNG",
+  );
+  // 反例：把 flags 的 0x40 去掉但保留多出来的 u32 —— 必须**不**按变体解析（不能见谁都偏移）
+  const noFlag = build(true);
+  noFlag[22] = 0;
+  const wrong = safeParse(noFlag);
+  check(
+    wrong.images[0][0].data.length === 0,
+    "无 0x40 标记时不得套用变体布局（载荷应为空 —— 说明判据挂在 flags 上）",
+  );
+  // 真实语料（本机装了原版素材时）：28 个 LUT 全部解析出 PNG 载荷
+  const LUT_DIR = process.env.WE_LOCAL_ASSETS
+    ? join(process.env.WE_LOCAL_ASSETS, "materials", "lut")
+    : join(process.env.HOME || "", "Documents", "workspace", "MirageWallpaper", "assets", "materials", "lut");
+  if (!fs.existsSync(LUT_DIR)) {
+    console.log("  （跳过本机 LUT 语料：没有 " + LUT_DIR + "）");
+  } else {
+    let ok = 0;
+    let bad = 0;
+    for (const f of fs.readdirSync(LUT_DIR)) {
+      if (!f.endsWith(".tex")) continue;
+      try {
+        const t = parseTex(new Uint8Array(fs.readFileSync(join(LUT_DIR, f))));
+        const m = t.images[0] && t.images[0][0];
+        if (m && m.data.length > 64 && m.data[0] === 0x89 && m.data[1] === 0x50) ok++;
+        else bad++;
+      } catch (e) {
+        bad++;
+      }
+    }
+    check(bad === 0 && ok >= 28, `本机 LUT 语料 ${ok} 张解析出 PNG 载荷、失败 ${bad}`);
+  }
+}
+
+await containerVariant();
+
+// ---------- 官方素材的纹理格式语义 + TEXS 帧表接线（本机接入原版素材时暴露） ----------
+// WE `common_fragment.h::ConvertTexture0Format`（GLSL 分支）：R8 → vec4(1,1,1,r)、
+// RG88 → vec4(r,r,r,g)。粒子 shader 用 `.a` 当形状，而我们解码出来的 R8 是 (r,r,r,255)
+// （实心方块）、RG88 是 (G,G,G,R)（取错通道）。stock 粒子图集大量是这两种格式：
+// rain1 / fog1 / splash_1(R8)、rain_drops_sheet / light_shafts_0(RG88)。
+// 同时 stock 图集带 TEXS 帧表（rain_drops_sheet 16、fog1/splash_1 64、ripple_single 14），
+// 粒子取贴图必须优先用真帧表，否则退化成「整张图集当一帧」= 一坨糊（3801012392 实测）。
+async function stockTexFormats() {
+  const ptex = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js")).href);
+  const px = (w, h, fn) => {
+    const rgba = new Uint8Array(w * h * 4);
+    for (let i = 0; i < w * h; i++) fn(rgba, i * 4);
+    return { width: w, height: h, rgba };
+  };
+  const r8 = ptex.convertParticleTexFormat(px(2, 2, (o, i) => { o[i] = 200; o[i + 1] = 200; o[i + 2] = 200; o[i + 3] = 255 }), 9);
+  check(
+    r8.rgba[0] === 255 && r8.rgba[1] === 255 && r8.rgba[2] === 255 && r8.rgba[3] === 200,
+    `R8 取样语义应为 (255,255,255,200)（形状进 alpha），实得 ${[...r8.rgba.slice(0, 4)]}`,
+  );
+  const rg = ptex.convertParticleTexFormat(px(2, 2, (o, i) => { o[i] = 30; o[i + 1] = 220; o[i + 2] = 0; o[i + 3] = 255 }), 8);
+  check(
+    rg.rgba[0] === 30 && rg.rgba[1] === 30 && rg.rgba[2] === 30 && rg.rgba[3] === 220,
+    `RG88 取样语义应为 (30,30,30,220)（rgb=R、alpha=G），实得 ${[...rg.rgba.slice(0, 4)]}`,
+  );
+  const plain = px(2, 2, (o, i) => { o[i] = 10; o[i + 1] = 20; o[i + 2] = 30; o[i + 3] = 40 });
+  check(ptex.convertParticleTexFormat(plain, 0) === plain, "ARGB8888 不得被转换（原样返回同一对象）");
+  const nrm = ptex.convertParticleNormalFormat(px(2, 2, (o, i) => { o[i] = 30; o[i + 1] = 220; o[i + 2] = 7; o[i + 3] = 9 }), 8);
+  check(
+    nrm.rgba[0] === 220 && nrm.rgba[1] === 30 && nrm.rgba[2] === 0 && nrm.rgba[3] === 255,
+    `RG88 法线应换成 (G,R,0,255)（WE: normal.xy = normal.gr*2-1），实得 ${[...nrm.rgba.slice(0, 4)]}`,
+  );
+  check(ptex.convertParticleNormalFormat(plain, 0) === plain, "非 RG88 法线不得被转换");
+
+  // 接线：粒子取贴图路径（scene-mount）必须按用途转换格式、优先真帧表、按需拉本机素材、
+  // 且只在 pkg 真有该贴图时才走 pkg 分支（否则 loadTexInner 会把内置贴图提前程序化建出，
+  // 转换与真帧表永远轮不到 —— 这正是接入原版素材后仍然「效果太差」的第二个坑）。
+  const sm = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const wiring = [
+    [/ptex\.convertParticleTexFormat\(gen, gen\.format\)/, "反照率必须过 convertParticleTexFormat"],
+    [/ptex\.convertParticleNormalFormat\(gen, gen\.format\)/, "法线槽必须过 convertParticleNormalFormat"],
+    [/frames: gen\.frames && gen\.frames\.length \? gen\.frames : ptex\.builtinParticleFrames\(name\)/, "帧表必须「原版 TEXS 优先、内置猜测兜底」"],
+    [/await ensureLocalAsset\(name\)/, "本机素材必须按需拉取（provider 否则拿不到像素）"],
+    [/loadParticleTex\(nrmName, "normal"\)/, "法线槽调用必须带 purpose=normal"],
+    [/pkg\.getEntry\(parsedPkg, `materials\/\$\{name\}\.tex`\) \? await loadTex\(name\) : null/, "必须只在 pkg 命中时走 pkg 分支"],
+  ];
+  for (const [re, msg] of wiring) check(re.test(sm), `接线：${msg}`);
+  // 本机素材装载端也要带上格式与帧表（否则上面两条无从谈起）
+  const la = fs.readFileSync(join(ROOT, "renderer/src/local-assets.ts"), "utf8");
+  check(/px\.format = parsed\.format/.test(la), "local-assets 必须把 .tex 格式带给消费方");
+  check(/atlasWidth = px\.width/.test(la), "local-assets 必须把 TEXS 帧表连图集尺寸一起带上");
+
+  // 真实语料（本机装了原版素材时）：转换后的 alpha 必须真的携带形状
+  const MAT = process.env.WE_LOCAL_ASSETS
+    ? join(process.env.WE_LOCAL_ASSETS, "materials")
+    : join(process.env.HOME || "", "Documents", "workspace", "MirageWallpaper", "assets", "materials");
+  if (!fs.existsSync(MAT)) {
+    console.log(`  （跳过本机原版素材语料：没有 ${MAT}）`);
+    return;
+  }
+  const tex = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+  const cases = [
+    ["particle/nature/rain1", 9],
+    ["particle/fog/fog1", 9],
+    ["particle/water/rain_drops_sheet", 8],
+    ["particle/light/light_shafts_0", 8],
+  ];
+  let seen = 0;
+  for (const [name, fmt] of cases) {
+    const f = join(MAT, `${name}.tex`);
+    if (!fs.existsSync(f)) continue;
+    seen++;
+    const parsed = tex.parseTex(new Uint8Array(fs.readFileSync(f)));
+    const m0 = tex.decodeMips(parsed)[0];
+    const conv = ptex.convertParticleTexFormat({ width: m0.width, height: m0.height, rgba: m0.rgba }, parsed.format);
+    let mean = 0;
+    let m2 = 0;
+    let amax = 0;
+    const n = conv.width * conv.height;
+    for (let i = 0; i < n; i++) {
+      const a = conv.rgba[i * 4 + 3];
+      mean += a;
+      m2 += a * a;
+      if (a > amax) amax = a;
+    }
+    mean /= n;
+    const sd = Math.sqrt(Math.max(0, m2 / n - mean * mean));
+    check(parsed.format === fmt, `${name} 语料格式应为 ${fmt}，实得 ${parsed.format}`);
+    check(amax > 32 && sd > 4, `${name} 转换后 alpha 必须携带形状（max=${amax} sd=${sd.toFixed(1)}）`);
+    if (parsed.frames?.list?.length) {
+      console.log(`  · ${name} 带 TEXS ${parsed.frames.list.length} 帧（${parsed.frames.list[0].width}×${parsed.frames.list[0].height}）`);
+    }
+  }
+  check(seen > 0, `本机原版素材语料命中 ${seen} 张`);
+}
+
+await stockTexFormats();
+
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

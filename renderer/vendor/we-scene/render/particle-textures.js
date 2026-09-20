@@ -502,6 +502,67 @@ function windCircle(size) {
   return { width: size, height: size, rgba }
 }
 
+/**
+ * [we-scene patch] 官方素材的**纹理格式取样语义**（WE `common_fragment.h::ConvertTexture0Format`
+ * 的 GLSL 分支）：粒子槽拿到的贴图常常不是 RGBA8，而是单/双通道掩码 ——
+ *   R8 / R16F      → `vec4(1, 1, 1, r)`   形状在 **R**，rgb 补白；
+ *   RG88 / RG1616F → `vec4(r, r, r, g)`   形状在 **G**，rgb 用 R。
+ * 我们的解码器把 R8 展开成 (r,r,r,**255**)、RG88 展开成 (G,G,G,R)，直接喂粒子 shader
+ * （用 `t.a` 当形状）就得到**实心方块**或**取错通道**的精灵。本机接入 WE 原版素材后
+ * 这个差距立刻显形：`particle/nature/rain1`(R8)、`particle/fog/fog1`(R8)、
+ * `particle/water/rain_drops_sheet`(RG88)、`particle/light/light_shafts_0`(RG88)
+ * 全是这种格式。这里把它们**烘成 WE 取样后的 RGBA**，粒子路径按普通 RGBA 上传即可。
+ * 只给粒子路径用：效果链槽位另有 rg88（GL_RG 上传 + flowChannels/maskChannel）的约定。
+ */
+export function convertParticleTexFormat(pixel, format) {
+  if (!pixel || !pixel.rgba) return pixel
+  const f = Number(format)
+  if (f !== 8 && f !== 9 && f !== 10 && f !== 11) return pixel
+  const n = pixel.width * pixel.height
+  const out = new Uint8Array(n * 4)
+  const src = pixel.rgba
+  if (f === 9 || f === 11) {
+    // R8 / R16F：rgb = 白，alpha = R
+    for (let i = 0; i < n; i++) {
+      out[i * 4] = 255
+      out[i * 4 + 1] = 255
+      out[i * 4 + 2] = 255
+      out[i * 4 + 3] = src[i * 4]
+    }
+  } else {
+    // RG88 / RG1616F：rgb = R，alpha = G
+    for (let i = 0; i < n; i++) {
+      const r = src[i * 4]
+      const g = src[i * 4 + 1]
+      out[i * 4] = r
+      out[i * 4 + 1] = r
+      out[i * 4 + 2] = r
+      out[i * 4 + 3] = g
+    }
+  }
+  return { width: pixel.width, height: pixel.height, rgba: out, format: f, frames: pixel.frames }
+}
+
+/**
+ * 法线槽的 RG88 语义：WE `DecompressNormalWithMask` 对 RG88 走 `normal.xy = normal.gr * 2 - 1`
+ * —— **x 在 G、y 在 R**。我们的粒子 shader 读 `.rg` 当 xy，所以这里换回 (G, R, 0)。
+ */
+export function convertParticleNormalFormat(pixel, format) {
+  if (!pixel || !pixel.rgba) return pixel
+  const f = Number(format)
+  if (f !== 8 && f !== 10) return pixel
+  const n = pixel.width * pixel.height
+  const out = new Uint8Array(n * 4)
+  const src = pixel.rgba
+  for (let i = 0; i < n; i++) {
+    out[i * 4] = src[i * 4 + 1] // x ← G
+    out[i * 4 + 1] = src[i * 4] // y ← R
+    out[i * 4 + 2] = 0
+    out[i * 4 + 3] = 255
+  }
+  return { width: pixel.width, height: pixel.height, rgba: out, format: f, frames: pixel.frames }
+}
+
 function rgbaLooksLikeAlbedo(rgba) {
   if (!rgba || rgba.length < 16) return false
   const n = rgba.length / 4

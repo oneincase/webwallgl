@@ -5,6 +5,14 @@
 //   texture.js     本文件：.tex 容器解析（parseTex）+ 公共出口（re-export）
 import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodePixels, lz4Decompress, u32, i32, f32 } from './tex-codecs.js'
 
+/** FreeImage 容器的魔数（用于「变体布局」的载荷自校验，见 mip 记录那段注释） */
+const FREE_IMAGE_MAGIC = {
+  [FIF.PNG]: [0x89, 0x50, 0x4e, 0x47],
+  [FIF.JPEG]: [0xff, 0xd8, 0xff],
+  [FIF.GIF]: [0x47, 0x49, 0x46],
+  [FIF.WEBP]: [0x52, 0x49, 0x46, 0x46],
+}
+
 export function parseTex(buf) {
   let p = 0
   const magic1 = asciiTex(buf, p, 9)
@@ -22,11 +30,26 @@ export function parseTex(buf) {
   p += 4
   const textureHeight = u32(buf, p)
   p += 4
-  const width = u32(buf, p)
-  p += 4
-  const height = u32(buf, p)
-  p += 4
-  p += 4 // ignored（实测 0xFF000000，编辑器用途）
+  // [we-scene patch] TEXI 头之后到 TEXB 容器之间是「width / height / ignored」三个 u32，
+  // 但**存在多一个 u32 的变体**：`flags & 0x40` 的导出器（实测 WE 自带颜色分级 LUT，
+  // 28/28 个 `materials/lut/*.tex`）会在 width 之前多写一个 = 像素数的 u32
+  // （32×32 的 LUT 写 1024）。按固定偏移读会把 TEXB magic 读成图像数据、抛
+  // 「未知 TEXB 容器」，整张贴图作废（本地素材接入时 28 张 LUT 全灭）。
+  // 两种布局的差别正好是 4 字节，且 TEXB magic 是 ASCII 唯一串，所以这里**扫 magic
+  // 定位容器**，再按「容器前 12/8/4 字节 = width/height/ignored」反推：
+  // 正常文件落在 46、变体落在 50，未来再出新前缀也不至于整张作废。
+  // 全库 2011 张 .tex 均为 46（0 个 flags&0x40），改后逐字节结果不变（见 verify-textures）。
+  let containerOffset = 46
+  for (let off = 34; off <= 64; off++) {
+    const m = asciiTex(buf, off, 9)
+    if (m === 'TEXB0001\0' || m === 'TEXB0002\0' || m === 'TEXB0003\0' || m === 'TEXB0004\0') {
+      containerOffset = off
+      break
+    }
+  }
+  const width = u32(buf, containerOffset - 12)
+  const height = u32(buf, containerOffset - 8)
+  p = containerOffset
 
   const containerMagic = asciiTex(buf, p, 9)
   p += 9
@@ -85,6 +108,31 @@ export function parseTex(buf) {
       p += 4
       const mh = u32(buf, p)
       p += 4
+      // [we-scene patch] `flags & 0x40` 的导出器（WE 自带颜色分级 LUT，28/28 个
+      // `materials/lut/*.tex`）**在每条 mip 记录前也多写一个 u32**（头部同样多一个，
+      // 见上面的容器定位）。按标准布局读会把 `lz4_compressed` 读成 32、`src_size`
+      // 读成 0 → 载荷长度为 0，整张 LUT 变成空图。判据不能只看位置：正常布局与
+      // 变体布局都是 4 字节错位，所以这里**用载荷本身验证**（容器魔数 / 尺寸吻合 /
+      // 不越界），只有变体通过、正常不通过才采用变体。全库 2011 张 .tex 无 0x40 标记，
+      // 走不到这段（verify-textures 有真实语料 + 反例锁定）。
+      let mipExtra = 0
+      if (flags & 0x40 && containerVersion >= 2 && !isVideo) {
+        const cmpA = u32(buf, p)
+        const sizeA = i32(buf, p + 8)
+        const cmpB = u32(buf, p + 4)
+        const sizeB = i32(buf, p + 12)
+        const startsAt = (off) => {
+          if (!(sizeB >= 0)) return false
+          if (off + sizeB > buf.length) return false
+          const fm = FREE_IMAGE_MAGIC[freeImageFormat]
+          if (fm) return fm.every((v, k) => buf[off + k] === v)
+          return true
+        }
+        const okA = cmpA <= 1 && sizeA >= 0 && p + 12 + sizeA <= buf.length
+        const okB = cmpB <= 1 && startsAt(p + 16)
+        if (!okA && okB) mipExtra = 4
+      }
+      p += mipExtra
       let compression = 0
       let uncompressedSize = 0
       if (containerVersion >= 2) {

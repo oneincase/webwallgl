@@ -42,7 +42,16 @@ export type LocalAssetStats = {
   particle: number;
 };
 
-type Pixel = { width: number; height: number; rgba: Uint8Array };
+type TexFrame = { x: number; y: number; width: number; height: number; [k: string]: unknown };
+type Pixel = {
+  width: number;
+  height: number;
+  rgba: Uint8Array;
+  /** .tex 的像素格式号（0=ARGB8888 / 8=RG88 / 9=R8 …）：粒子路径要按 WE 的取样语义转换 */
+  format?: number;
+  /** .tex 的 TEXS 序列帧表（像素矩形）；图集尺寸挂在数组的 atlasWidth/atlasHeight 上 */
+  frames?: TexFrame[];
+};
 
 /** 已解码像素缓存：跨挂载复用（切壁纸 / 改画质不重新下载解码）。 */
 const pixels = new Map<string, Pixel>();
@@ -101,7 +110,19 @@ async function fetchTex(url: string): Promise<Pixel | null> {
   const mips = tex.decodeMips(parsed) as any[];
   if (!mips.length) return null;
   // mip0 即可：消费方（util 注册 / 粒子贴图）本来就用单级 + generateMipmap
-  return await mipToRgba(mips[0]);
+  const px = await mipToRgba(mips[0]);
+  if (!px) return null;
+  px.format = parsed.format;
+  // TEXS 序列帧表：官方粒子图集（rain_drops_sheet 16 帧、fog1 64 帧、rain1 4 帧）
+  // 全靠它切图。不传的话粒子只能按 sequencemultiplier 猜 N×N 方格 —— 一颗粒子
+  // 会把整张图集当一帧采样，画面变成一坨糊（实测 3801012392）。
+  const list = parsed.frames?.list as TexFrame[] | undefined;
+  if (list && list.length) {
+    (list as unknown as Record<string, unknown>).atlasWidth = px.width;
+    (list as unknown as Record<string, unknown>).atlasHeight = px.height;
+    px.frames = list;
+  }
+  return px;
 }
 
 /** 并发上限跑一批任务（本地磁盘 + 位图解码，8 路足够且不堵 UI） */
