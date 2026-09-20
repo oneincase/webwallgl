@@ -199,6 +199,100 @@ function build(sysDesc) {
   return ps;
 }
 
+// ---------- 组合成（combo）与混合面：官方支持面 vs 本库实际用量 ----------
+// 官方 genericparticle.frag 的 combo 声明：
+//   LIGHTING default 0、FOG default 1（但真正生效要 FOG_DIST/FOG_HEIGHT 子 combo，
+//   由**场景** general 的雾参数驱动）、REFRACT default 0、CUTOUT default 0；
+//   SPRITESHEET/THICKFORMAT 由贴图是否序列帧决定（见帧表与内置素材两章）。
+// 混合走 common_blending.h::ApplyBlending(BLENDMODE,…)。本块把「本库到底用到哪些」
+// 固化成判据：一旦新壁纸打开未实现的 combo / 混合模式，这里立刻红，而不是默默画错。
+function runComboCoverage() {
+  const errors = [];
+  const blends = new Map();
+  const combos = new Map();
+  const fogScenes = [];
+  let models = 0;
+  let scenes = 0;
+  for (const id of fs.readdirSync(LIB)) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let pkg;
+    try {
+      pkg = parsePkg(fs.readFileSync(pkgPath));
+    } catch {
+      continue;
+    }
+    scenes++;
+    try {
+      const sc = JSON.parse(new TextDecoder().decode(getEntry(pkg, "scene.json")));
+      const g = sc.general || {};
+      if (Object.keys(g).some((k) => /fog/i.test(k))) fogScenes.push(id);
+    } catch {
+      /* 坏包跳过 */
+    }
+    const mats = new Set();
+    for (const e of pkg.entries) {
+      if (!/\.json$/i.test(e.name) || !/particles\//.test(e.name)) continue;
+      models++;
+      try {
+        const j = JSON.parse(new TextDecoder().decode(getEntry(pkg, e.name)));
+        if (j.material) mats.add(j.material);
+      } catch {
+        /* 坏模型跳过 */
+      }
+    }
+    for (const m of mats) {
+      const e = getEntry(pkg, m);
+      if (!e) continue;
+      let j;
+      try {
+        j = JSON.parse(new TextDecoder().decode(e));
+      } catch {
+        continue;
+      }
+      for (const pass of j.passes || []) {
+        if (!/^generic/.test(pass.shader || "")) continue;
+        const b = pass.blending || "(none)";
+        blends.set(b, (blends.get(b) || 0) + 1);
+        for (const [k, v] of Object.entries(pass.combos || {})) {
+          const key = `${k}=${v}`;
+          combos.set(key, (combos.get(key) || 0) + 1);
+        }
+      }
+    }
+  }
+  // 我们实现了的混合模式（particles.js 的 blendFunc 两支）
+  const SUPPORTED_BLENDS = new Set(["additive", "translucent", "(none)"]);
+  const unsupported = [...blends.keys()].filter((b) => !SUPPORTED_BLENDS.has(b));
+  if (unsupported.length) {
+    errors.push(
+      `有未实现的粒子混合模式：${unsupported.map((b) => `${b}(${blends.get(b)})`).join(", ")} —— 需要在 particles.js 补 blendFunc`,
+    );
+  }
+  // 未实现的 combo：CUTOUT/LIGHTING 为 1 时我们完全没做
+  for (const [k, v] of combos) {
+    if (/^(CUTOUT|LIGHTING)=1$/.test(k)) {
+      errors.push(`本库有粒子材质打开未实现的 combo ${k}（${v} 处）—— 需要实现后再放行`);
+    }
+  }
+  // 雾：只有场景带雾参数时 FOG_DIST/FOG_HEIGHT 才会被打开
+  if (fogScenes.length) {
+    errors.push(`本库有 ${fogScenes.length} 个场景带雾参数（${fogScenes.slice(0, 3).join(",")}）—— 粒子雾尚未实现`);
+  }
+  console.log(
+    `  · 粒子模型 ${models} 个 / 场景 ${scenes} 个：混合 ${[...blends].map(([k, v]) => k + "=" + v).join(" ")}；combo ${[...combos].map(([k, v]) => k + "(" + v + ")").join(" ") || "（无显式）"}；带雾场景 ${fogScenes.length}`,
+  );
+  // 接线：两支 blendFunc 必须与官方语义一致（additive = SRC_ALPHA/ONE）
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (!/if \(this\.blend === 'additive'\) gl\.blendFunc\(gl\.SRC_ALPHA, gl\.ONE\)/.test(src)) {
+    errors.push("additive 必须走 gl.blendFunc(SRC_ALPHA, ONE)");
+  }
+  if (!/gl\.blendFunc\(gl\.SRC_ALPHA, gl\.ONE_MINUS_SRC_ALPHA\)/.test(src)) {
+    errors.push("translucent 必须走 gl.blendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)");
+  }
+  return { errors };
+}
+
 // ---------- 校验一：全库模拟 ----------
 // 跑 20 秒（长于多数 lifetime），确认生成/回收进入稳态且数值不发散。
 
@@ -2618,6 +2712,13 @@ function runEventChildren() {
 
 const action = process.argv[2] ?? "all";
 let failed = 0;
+
+if (action === "all" || action === "combos") {
+  const cb = runComboCoverage();
+  console.log(`\n【combo 与混合面】问题 ${cb.errors.length}`);
+  cb.errors.forEach((e) => console.log("  ! " + e));
+  failed += cb.errors.length;
+}
 
 if (action === "all" || action === "tex") {
   const r = runTextures();
