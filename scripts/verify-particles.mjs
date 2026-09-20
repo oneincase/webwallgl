@@ -1102,6 +1102,93 @@ function runXrayWindow() {
   return { errors };
 }
 
+// ---------- 光照条 light_shafts_*：按原版实测剖面重建（不许又细又亮） ----------
+// 原版 7 张都是 RG88、R==G==强度（实测 100% 相等）、无 TEXS 帧；additive 下有效贡献
+// = rgb × alpha = R·G/255（平方衰减）。实测（尺寸 / 有效亮度均值 / 有效峰值）：
+//   _0 256×512 11.8 204 | _1 256×512 1.7 146 | _2 256×256 11.9 255 | _3 128×512 4.8 255
+//   _4 256×256 6.7 148  | _5 256×256 2.2 199 | _6 128×512 6.7 148
+// 旧实现 beam(128,512,0.2…)：一律 128×512、横截面 gauss(tx,0.2)³ 极窄、纵向中段最亮、
+// 白 RGB×alpha 峰值 0.55 —— 用户报 2282120494「光照条太亮和粗了」。
+function runLightShafts() {
+  const errors = [];
+  // width = 原版「最亮行上 ≥15% 峰值像素」占宽比例（实测），±0.15 容差
+  const REF = [
+    { i: 0, w: 256, h: 512, mean: 11.8, peak: 204, width: 0.5 },
+    { i: 1, w: 256, h: 512, mean: 1.7, peak: 146, width: 0.24 },
+    { i: 2, w: 256, h: 256, mean: 11.9, peak: 255, width: 0.23 },
+    { i: 3, w: 128, h: 512, mean: 4.8, peak: 255, width: 0.32 },
+    { i: 4, w: 256, h: 256, mean: 6.7, peak: 148, width: 0.6 },
+    { i: 5, w: 256, h: 256, mean: 2.2, peak: 199, width: 0.26 },
+    { i: 6, w: 128, h: 512, mean: 6.7, peak: 148, width: 0.6 },
+  ];
+  for (const ref of REF) {
+    const t = ptex.buildBuiltinParticleTexture(`particle/light/light_shafts_${ref.i}`);
+    if (!t) {
+      errors.push(`light_shafts_${ref.i} 无生成器`);
+      continue;
+    }
+    if (t.width !== ref.w || t.height !== ref.h) {
+      errors.push(`light_shafts_${ref.i} 尺寸应为 ${ref.w}×${ref.h}（原版），实际 ${t.width}×${t.height}`);
+      continue;
+    }
+    // 有效贡献 = rgb × alpha = (R/255)·(A/255)·255
+    let sum = 0;
+    let peak = 0;
+    const W = t.width;
+    const H = t.height;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const o = (y * W + x) * 4;
+        const v = (t.rgba[o] / 255) * (t.rgba[o + 3] / 255) * 255;
+        sum += v;
+        if (v > peak) peak = v;
+      }
+    }
+    const mean = sum / (W * H);
+    if (Math.abs(mean - ref.mean) / ref.mean > 0.2) {
+      errors.push(`light_shafts_${ref.i} 平均有效亮度应 ≈${ref.mean}（原版实测，±20%），实际 ${mean.toFixed(1)}`);
+    }
+    if (peak > ref.peak * 1.1) {
+      errors.push(`light_shafts_${ref.i} 有效峰值不得比原版更亮（原版 ${ref.peak}），实际 ${peak.toFixed(0)}`);
+    }
+    // 形状：横截面必须是"宽而暗"的条，不是中间一根细亮线。
+    // 用**最亮的那一行**做截面（有几种光条的纵向剖面中间反而是暗的，取 H/2 会误判）。
+    let yBest = 0;
+    let bestSum = -1;
+    for (let y = 0; y < H; y++) {
+      let s2 = 0;
+      for (let x = 0; x < W; x++) s2 += t.rgba[(y * W + x) * 4];
+      if (s2 > bestSum) { bestSum = s2; yBest = y; }
+    }
+    // 形状：用 min(R, A) 当"强度"—— 我们的替身 R=A=强度，旧 beam 是白 RGB + alpha 形状，
+    // 只看 R 会把旧 beam 判成"满宽"。
+    const shape = (x, y) => {
+      const o = (y * W + x) * 4;
+      return Math.min(t.rgba[o], t.rgba[o + 3]) / 255;
+    };
+    const rowMax = Math.max(...Array.from({ length: W }, (_, x) => shape(x, yBest)));
+    let wideN = 0;
+    for (let x = 0; x < W; x++) if (shape(x, yBest) >= rowMax * 0.15) wideN++;
+    const widthFrac = rowMax > 0 ? wideN / W : 0;
+    // 「9×17 网格 + 对比度指数 p + 增益 k」三个约束（均值/峰值/宽度）在 2 个参数下不能全等，
+    // 故宽度只做**单侧**判据：不得比原版明显更窄（那正是旧 beam 的病：_6 只有 16% 而原版 60%），
+    // 也不得离谱地宽。均值与峰值是双侧硬判据（"太亮"就是这两条）。
+    if (rowMax > 0 && (widthFrac < ref.width - 0.1 || widthFrac > ref.width + 0.3)) {
+      errors.push(
+        `light_shafts_${ref.i} 横截面宽度应 ≈${(ref.width * 100).toFixed(0)}%（原版实测），实际 ${(widthFrac * 100).toFixed(0)}% —— 又细又亮就是旧 beam 的病`,
+      );
+    }
+  }
+  // 接线：7 张都必须挂 shaftSheet，不得回 beam
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-textures.js"), "utf8");
+  for (let i = 0; i < 7; i++) {
+    if (!new RegExp(`'particle/light/light_shafts_${i}': \\(\\) => shaftSheet\\(${i}\\)`).test(src)) {
+      errors.push(`light_shafts_${i} 必须挂 shaftSheet(${i})（按原版实测剖面）`);
+    }
+  }
+  return { errors };
+}
+
 // ---------- 气泡图集 bubble3：必须是原版那种「黑底 + 成片小气泡」 ----------
 // 原版 particle/bubbles/bubble3：1024²、TEXS **64 帧**（每帧 128²、8×8）、alpha 恒 255
 // （形状在 RGB，配合材质的 additive：黑色不贡献）。帧 0 实测：非黑(>24) 2.9%、亮(>100) 0.4%、
@@ -3298,6 +3385,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【REFRACT 空白白图】问题 ${rb.errors.length}`);
   rb.errors.forEach((e) => console.log("  ! " + e));
   failed += rb.errors.length;
+  const ls = runLightShafts();
+  console.log(`\n【光照条 light_shafts】问题 ${ls.errors.length}`);
+  ls.errors.forEach((e) => console.log("  ! " + e));
+  failed += ls.errors.length;
   const b3 = runBubbleSheet3();
   console.log(`\n【气泡图集 bubble3】问题 ${b3.errors.length}`);
   b3.errors.forEach((e) => console.log("  ! " + e));
