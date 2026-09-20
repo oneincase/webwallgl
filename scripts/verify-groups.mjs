@@ -2031,6 +2031,61 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   }
 }
 
+// ---------- M. 退化尺寸的跨层合成源（3448845950 音频缓冲区 → 音频条）----------
+// 源层 `size 64×0 / scale 0`：FBO 按 size×scale 钳成 64×1，而 compositeLayer 用
+// size*scale 画 quad（高度 0）→ 一个像素都写不进合成 FBO，引用方永远采到全 0
+// 纹理（音频条恒停在最小高度）。判据跑**真实现** compositeSourceQuadSize。
+{
+  const { compositeSourceQuadSize, clampCompositeFboSize } = await imp("renderer/vendor/we-scene/render/renderer.js");
+  const q = compositeSourceQuadSize([64, 0], [0, 0, 0], 64, 1, 1);
+  check(
+    Array.isArray(q) && q[0] === 64 && q[1] === 1,
+    `退化源层（64×0 / scale 0）的 quad 必须撑满 64×1 的 FBO，实得 ${JSON.stringify(q)}`,
+  );
+  // 反例 1：非退化源层一个字节都不许动
+  check(
+    compositeSourceQuadSize([560, 560], [1, 1, 1], 560, 560, 1) === null,
+    "非退化源层不得覆盖 quad 尺寸",
+  );
+  // 反例 2：只退化一个轴也要撑满（另一轴保留 FBO 尺寸）
+  const q2 = compositeSourceQuadSize([128, 0], [1, 1, 1], 128, 32, 1);
+  check(Array.isArray(q2) && q2[0] === 128 && q2[1] === 32, `单轴退化也要铺满 FBO，实得 ${JSON.stringify(q2)}`);
+  // 钳过尺寸时 k 要折回去，quad 尺寸 ×k 必须回到 FBO 尺寸
+  const q3 = compositeSourceQuadSize([64, 0], [0, 0, 0], 8192, 459, 0.6236);
+  check(
+    Array.isArray(q3) && Math.abs(q3[0] * 0.6236 - 8192) < 1 && Math.abs(q3[1] * 0.6236 - 459) < 1,
+    `quad 尺寸 ×k 必须等于 FBO 尺寸，实得 ${JSON.stringify(q3)}`,
+  );
+  const c = clampCompositeFboSize(64, 1, 8192);
+  check(c.width === 64 && c.height === 1, `clampCompositeFboSize(64,1) 应为 64×1，实得 ${c.width}×${c.height}`);
+  // 接线：调用点必须用这个纯函数，且渲染后还原 size
+  const rsrcM = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  check(
+    /compositeSourceQuadSize\(src\.size, savedScale, sw, sh, k\)/.test(rsrcM),
+    "renderCompositeSources 必须用 compositeSourceQuadSize 计算 quad 覆盖",
+  );
+  check(/src\.size = savedSize/.test(rsrcM), "源层 size 覆盖后必须还原");
+  // 真实语料：引用链 + 源层确实是退化生成器
+  const wpM = wallpapers.find((w) => w.id === "3448845950");
+  if (!wpM) {
+    console.log("   skip M：库中没有 3448845950");
+  } else {
+    const objs = wpM.scene.objects || [];
+    const bars = objs.find((o) => o.id === 322);
+    const buf = objs.find((o) => o.id === 1475);
+    let refs = 0;
+    for (const e of (bars && bars.effects) || []) {
+      for (const p of e.passes || []) for (const t of p.textures || []) if (t === "_rt_imageLayerComposite_1475_a") refs++;
+    }
+    check(refs >= 1, `3448845950 音频条应引用 _rt_imageLayerComposite_1475_a，实得 ${refs}`);
+    const size = String((buf && buf.size) || "0 0").trim().split(/\s+/).map(Number);
+    const scale = String((buf && buf.scale) || "1 1 1").trim().split(/\s+/).map(Number);
+    check(size[0] === 64 && size[1] === 0, `音频缓冲区层应是 64×0，实得 ${JSON.stringify(size)}`);
+    check(scale[0] === 0 && scale[1] === 0, `音频缓冲区层 scale 应为 0，实得 ${JSON.stringify(scale)}`);
+    console.log(`   M. 3448845950 音频缓冲区源层 ${size.join("×")} scale ${scale[0]} → quad 覆盖 ${JSON.stringify(q)}`);
+  }
+}
+
 if (errors.length) {
   console.error(`\n发现 ${errors.length} 个问题：`);
   for (const e of errors) console.error("  ✗ " + e);

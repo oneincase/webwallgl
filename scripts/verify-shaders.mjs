@@ -673,22 +673,25 @@ const wireErrors = [];
     }
   }
   // ---------- 容器 alpha 语义判定（chainAlphaMeaningful 真实现 + 真语料） ----------
-  // 3395777145 白屏根因之二：oscilloscope 家族的 alpha 由 BlendTransparency 按波形
-  // 成形且 rgb 自带背景（_rt_FullFrameBuffer 混入），被误判「无信息 → 加法」时背景
-  // 在画布上叠两遍 → 整屏泛白。判据必须跑真实现（renderer.js 导出的纯函数）
-  // 与真 shader 语料：oscilloscope/Simple_Audio_Bars → true，audio_ring → false。
+  // WRITEALPHA=1：alpha 由波形成形且 rgb 自带背景，误判加法 → 整屏泛白（3395777145）。
+  // WRITEALPHA=0（默认）：alpha 仍 = scene.a，形状只在 rgb，必须判「无信息」；
+  // 否则空画布/组 FBO 下波形消失，再叠主画布 passthrough 整块带不透明底（3078285611）。
   {
     const { chainAlphaMeaningful } = await imp("renderer/vendor/we-scene/render/renderer.js");
-    // 1) oscilloscope（3395777145 的 2799421411）
-    const oscPkgPath = join(LIB, "3395777145", "scene.pkg");
+    // 1) oscilloscope WRITEALPHA 分流（3078285611 语料；同 shader 2799421411）
+    const oscPkgPath = join(LIB, "3078285611", "scene.pkg");
     if (!fs.existsSync(oscPkgPath)) {
-      console.log("  （跳过 3395777145 语料：本机无此壁纸）");
+      console.log("  （跳过 3078285611 语料：本机无此壁纸）");
     } else {
       const pkg = parsePkg(fs.readFileSync(oscPkgPath));
       const frag = getEntry(pkg, "shaders/workshop/2799421411/effects/audio_responsive_oscilloscope.frag");
-      const glsl = hlsl2glsl(readText(frag), "frag", {}, makeResolver(pkg), "");
-      if (chainAlphaMeaningful([glsl]) !== true) {
-        wireErrors.push("oscilloscope 的 BlendTransparency 形状 alpha 必须判「携带形状」（3395777145 白屏）");
+      const glsl0 = hlsl2glsl(readText(frag), "frag", { RESOLUTION: 64 }, makeResolver(pkg), "");
+      if (chainAlphaMeaningful([glsl0]) !== false) {
+        wireErrors.push("oscilloscope WRITEALPHA=0 必须判「无信息 → 加法」（3078285611 示波器不透明底）");
+      }
+      const glsl1 = hlsl2glsl(readText(frag), "frag", { RESOLUTION: 64, WRITEALPHA: 1 }, makeResolver(pkg), "");
+      if (chainAlphaMeaningful([glsl1]) !== true) {
+        wireErrors.push("oscilloscope WRITEALPHA=1 必须判「携带形状 → SRC_ALPHA」（3395777145 白屏）");
       }
     }
     // 2) audio_ring（加法族，2134765860 的 2504730727）：仍必须判「无信息 → 加法」
@@ -716,6 +719,18 @@ const wireErrors = [];
     const rndSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
     if (!/containerAlphaMeaningful = chainAlphaMeaningful\(chainFragGlsl\)/.test(rndSrc)) {
       wireErrors.push("renderer.js 容器 alpha 判定必须调用 chainAlphaMeaningful(chainFragGlsl)");
+    }
+    // 4b) 组内回读不得吃主画布；嵌套空 composelayer 不得走主画布 passthrough
+    if (!/if\s*\(\s*groupTarget\s*\)\s*\{[\s\S]*?groupTarget\.fbo\.tex/.test(rndSrc)) {
+      wireErrors.push("captureBackdrop 在 groupTarget 下必须返回组 FBO 纹理（3078285611 嵌套 composelayer）");
+    }
+    if (!/!groupTarget/.test(rndSrc) || !/usePassthrough =[\s\S]{0,400}!groupTarget/.test(rndSrc)) {
+      wireErrors.push("组渲染目标内 usePassthrough 必须为 false（3078285611 嵌套示波器不透明底）");
+    }
+    // 4c) oscilloscope 未显式 combo 时抬 WRITEALPHA/TRANSPARENCY（3078285611）
+    if (!/audio_responsive_oscilloscope[\s\S]{0,400}WRITEALPHA\s*=\s*1/.test(rndSrc) ||
+        !/audio_responsive_oscilloscope[\s\S]{0,500}TRANSPARENCY\s*=\s*1/.test(rndSrc)) {
+      wireErrors.push("audio_responsive_oscilloscope 未显式 combo 时必须抬 WRITEALPHA=1 与 TRANSPARENCY=1（3078285611 示波器透明）");
     }
     // 5) _rt_FullFrameBuffer 懒捕获（3395777145 白屏根因之一：背景纹理落空成白纹理）
     if (!/name === '_rt_FullFrameBuffer'/.test(rndSrc) || !/ffbEntry[\s\S]{0,200}captureBackdrop/.test(rndSrc)) {

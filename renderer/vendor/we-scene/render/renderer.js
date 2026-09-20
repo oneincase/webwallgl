@@ -32,18 +32,27 @@ export function puppetAnimMargin(layer) {
  * [we-scene patch] 容器效果链输出的 alpha 是否携带形状信息（合成方式判据）。
  * 抽成纯函数供 renderer 与 verifier 单源共用（复合层合成 3395777145 白屏根因）：
  *  - 任一 pass 写 `float alpha = <非 scene.a>`（Simple_Audio_Bars 的 bar*opacity）→ 有信息；
- *  - 任一 pass 调用 `BlendTransparency(`（oscilloscope/procedural_noise/clipping_mask/
- *    frame_builder 家族，全库 7 个 shader；与 scene.a 加法族 36 个零交集）→ 有信息：
- *    alpha 按波形/形状逐像素成形，且其 rgb 经 `mix(bg, albedo.rgb, albedo.a)` 自带背景，
- *    按 SRC_ALPHA 合成 (bg+wave)*a + dst*(1-a) = dst + wave*a；误判成「无信息 → 加法」
- *    （ONE, 1-a）会把背景在画布上叠两遍 → 整屏泛白。
+ *  - 任一 pass 调用 `BlendTransparency(` **且** WRITEALPHA 把波形写进 alpha
+ *    （`ApplyBlending(..., opacity * wave.a)` / `vec4(u_color, u_brightness * smoothed)`）
+ *    → 有信息：alpha 按波形成形，rgb 常自带背景，按 SRC_ALPHA 合成；误判成「无信息 →
+ *    加法」会把背景叠两遍 → 整屏泛白（3395777145）。
+ *  - WRITEALPHA=0（默认）时 wave.a 恒 1 且不参与 rgb 权重，`BlendTransparency(Normal)`
+ *    仍等于 scene.a —— 形状只在 rgb。此时必须判「无信息 → 加法」，否则空画布 / 组
+ *    FBO 下 a=0 会让波形消失；再叠主画布 passthrough（RGB8→a=1）则整块变成不透明底
+ *    （3078285611 歌手名下「音频识别跳动」）。
  */
 export function chainAlphaMeaningful(fragSources) {
   for (const src of fragSources || []) {
     if (typeof src !== 'string') continue
     const m = src.match(/\bfloat\s+alpha\s*=\s*([^;]+);/)
     if (m && !/^\s*scene\s*\.\s*a\s*$/.test(m[1])) return true
-    if (src.includes('BlendTransparency(')) return true
+    if (src.includes('BlendTransparency(')) {
+      // WRITEALPHA=1：波形进 alpha（混合权重乘 wave.a，或 wave = vec4(color, smoothed)）
+      if (/ApplyBlending\s*\([^;]*wave\.a/.test(src)) return true
+      if (/vec4\s*\(\s*u_color\s*,\s*u_brightness\s*\*\s*smoothed\s*\)/.test(src)) return true
+      // WRITEALPHA=0：仅有 BlendTransparency 调用不足以说明 alpha 携带形状
+      continue
+    }
   }
   return false
 }
@@ -436,6 +445,30 @@ export const XRAY_SIZE_FALLBACK = 1
 export function constantFallback(uniformName, declaredDefault) {
   if (uniformName === 'g_PointerScale') return XRAY_SIZE_FALLBACK
   return declaredDefault
+}
+
+/**
+ * [we-scene patch 3448845950] 跨层合成源层的 quad 尺寸覆盖。
+ *
+ * `_rt_imageLayerComposite_<id>_a` 的 FBO 按「源层内容矩形 size×scale」钳制而来，
+ * 但真正画进这块 FBO 的 `compositeLayer` 用的是
+ * `mat4Scale(size[0]*scale[0], size[1]*scale[1])` —— 某个轴上 <1px 时 quad 退化，
+ * **一个像素都写不进去**，引用方永远采到全 0 纹理（本墙音频条恒停在最小高度）。
+ * 源层在这条路径上只是「生成器」（几何无意义）时把 quad 撑到 FBO 全域
+ * （size = FBO 尺寸 / k，故 quad 尺寸 size*k == FBO）。
+ *
+ * 抽成纯函数：离线判据直接跑它 + 真实语料（3448845950 的 64×0 音频缓冲区层），
+ * 不在这里再抄一份分支。
+ *
+ * @returns {number[]|null} 需要覆盖的 [w, h]；非退化源层返回 null（一个字节都不动）。
+ */
+export function compositeSourceQuadSize(srcSize, srcScale, sw, sh, k) {
+  const sx = (srcScale && srcScale[0]) || 1
+  const sy = (srcScale && srcScale[1]) || 1
+  const degenerate = Math.abs((srcSize && srcSize[0]) * sx) < 1 || Math.abs((srcSize && srcSize[1]) * sy) < 1
+  if (!degenerate) return null
+  const kk = k || 1
+  return [sw / kk, sh / kk]
 }
 
 export function createRenderer(canvas, opts = {}) {
@@ -2022,6 +2055,14 @@ export function createRenderer(canvas, opts = {}) {
   // 症状是 passthrough 层的背景变成纯黑方块而不是真实画面。
   let backdropTex = null
   function captureBackdrop(width, height) {
+    // [we-scene patch] 组渲染目标内回读必须吃组 FBO，不能回退到主画布。
+    // 嵌套空 composelayer（3078285611「音频识别跳动」挂在「音乐父级」下）若从
+    // 主画布 copyTexImage2D（RGB8 → 采样 a≡1），会把角色衣服等身后像素烘成
+    // 不透明底，示波器整块带背景；组 FBO 是 RGBA 且 clear(0,0,0,0)，空区 a=0
+    // 才能与 WRITEALPHA=0 的加法合成拼出透明波形。
+    if (groupTarget) {
+      return groupTarget.fbo.tex
+    }
     // [we-scene patch] MSAA 分支：copyTexImage2D 不能读多重采样缓冲
     // （INVALID_OPERATION），先把当前内容 blit resolve 到一块普通 FBO 再返回其纹理。
     // 语义与下方画布回读完全一致（调用方只关心「当前已绘制内容」这张纹理）。
@@ -2715,7 +2756,19 @@ export function createRenderer(canvas, opts = {}) {
       const savedScale = src.scale
       const savedAngles = src.angles
       const savedVisible = src.visible
+      const savedSize = src.size
       groupTarget = { fbo, w: sw, h: sh }
+      // [we-scene patch 3448845950] **退化尺寸的源层要先把 quad 撑满 FBO。**
+      // 层自身内容矩形（size×scale）在某个轴上 <1px 时，compositeLayer 会按
+      // `mat4Scale(w, h)` 画一个零高度的 quad —— 什么都写不进合成 FBO，引用方
+      // 永远采到全 0 纹理。现场：本墙「音频缓冲区 - 积累」(id 1475) 是
+      // `size 64×0 / scale 0` 的**生成器**层（WE 里它只用来跑
+      // audio_buffer_accumulation，几何没有意义），音频条那一层用 SOURCE=0 +
+      // `_rt_imageLayerComposite_1475_a` 读它的频谱缓冲，结果读到全 0 ⇒ 14 根
+      // 音条恒停在最小高度（用户报「音频组件不动」；把 combo 改成 SOURCE=1 走
+      // 内置频谱立刻会动，这就是判据）。判据函数见 compositeSourceQuadSize。
+      const quadOverride = compositeSourceQuadSize(src.size, savedScale, sw, sh, k)
+      if (quadOverride) src.size = quadOverride
       // 源层摆到视口正中、去掉自身缩放与旋转（尺寸已折进 FBO 与视口）；
       // 钳过尺寸时再把 k 折进 scale，quad 恰好铺满缩小的 FBO。
       src.origin = [sw / 2, srcCam.projH - sh / 2, savedOrigin[2]]
@@ -2733,6 +2786,7 @@ export function createRenderer(canvas, opts = {}) {
         src.scale = savedScale
         src.angles = savedAngles
         src.visible = savedVisible
+        src.size = savedSize
       }
     }
     bindFinal()
@@ -2920,7 +2974,11 @@ export function createRenderer(canvas, opts = {}) {
     // WE 的 passthrough 只影响空画布那一档。groupTex 走组渲染目标另一条路。
     // Transparency=Preserve（combo 0）没有旗标时也走这条：shader 写 alpha=scene.a，
     // 空画布下音条不可见。见 layerWantsPreserveBackdrop。
-    const usePassthrough = (!!layer.passthrough || !!layer.isPostProcess || layerWantsPreserveBackdrop(layer) || layerWantsComposeBackdrop(layer)) && !layer.groupTex && !texObj && !isPuppet
+    // [we-scene patch] 组渲染目标内禁止走主画布式 passthrough：嵌套空 composelayer
+    // （3078285611「音频识别跳动」）若回读主画布会把身后像素烘成不透明底；组内应
+    // 从透明画布起步，靠容器 alpha 加法合成把 WRITEALPHA=0 的波形叠上去。
+    // （组内若仍需身后内容，captureBackdrop 在 groupTarget 下会改读组 FBO。）
+    const usePassthrough = (!!layer.passthrough || !!layer.isPostProcess || layerWantsPreserveBackdrop(layer) || layerWantsComposeBackdrop(layer)) && !layer.groupTex && !texObj && !isPuppet && !groupTarget
     // puppet 层的层内容尺寸由 size 决定（网格坐标即层局部像素），而非贴图尺寸。
     // 空内容层（容器效果画布/纯效果层，无 textureName）同理：效果链 FBO 必须
     // 按图层 size 分配，否则会退化成 1×1，波形/音频条/光效被压缩成一个像素。
@@ -3099,6 +3157,18 @@ export function createRenderer(canvas, opts = {}) {
       const { eff, mp, ov } = flatPasses[fi]
       if (failedEffects.has(eff)) continue
       const combos = { ...(mp.combos || {}), ...((ov && ov.combos) || {}) }
+      // [we-scene patch] audio_responsive_oscilloscope：作者未写 WRITEALPHA/TRANSPARENCY
+      // 时 shader 默认是 0/0（Normal + 不写 alpha）—— alpha 恒等于 scene.a。
+      // 叠在主画布 passthrough（RGB8→a=1）上像一块不透明底；嵌进透明组 FBO
+      // （3078285611「音频识别跳动」挂在「音乐父级」下）则 a≡0，波形 rgb 进得去
+      // 但父级 SRC_ALPHA 合成后整段消失。抬到 WRITEALPHA=1 + TRANSPARENCY=Replace
+      // 让波形进 alpha，透明区真正透出。作者显式写了的 combo 不覆盖。
+      if (/audio_responsive_oscilloscope/i.test(mp.shader || '')) {
+        const oc = (ov && ov.combos) || {}
+        const mc = mp.combos || {}
+        if (oc.WRITEALPHA === undefined && mc.WRITEALPHA === undefined) combos.WRITEALPHA = 1
+        if (oc.TRANSPARENCY === undefined && mc.TRANSPARENCY === undefined) combos.TRANSPARENCY = 1
+      }
       // 本 pass 提供的纹理（material + scene override 合并，用于纹理关联 combo）
       const mpT = mp.textures || []
       const ovT = (ov && ov.textures) || []

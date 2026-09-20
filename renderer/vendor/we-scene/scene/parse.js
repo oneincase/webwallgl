@@ -152,20 +152,19 @@ export function parseScene(sceneJson, project) {
       if (pIdx < 0) continue
       const pc = local[pIdx]
       if (pc.parent !== undefined && pc.parent !== null) continue // 父级还未合并完成，下一轮
-      // [we-scene patch] 「渲染惰性纯容器」的 scale 不参与父子合并。
-      // 3791354118 / 3264246690 的无名组（id 373）：无 image、无 size、solid:true，
-      // scale 绑用户属性 newproperty6（快照 1.43）。乘进子层后人物总缩放 0.7848，
-      // 头顶越出设计上沿；WE 实机缩略图里人物总缩放就是子层自身的 0.54881
-      // （头顶距设计顶 ≈4%）。即 WE 对这种「只当排版夹具」的节点不把 scale
-      // 传给子层。带 image/size 的真图层（3789007480 Clock 0.2、3396722575
-      // 耳坠 0.5、3791967416 交互按钮 0.32 等）照旧传播；静态字面量（3151551777
-      // Snow storm -1 镜像、3113287126 Albuim Art 48.4）也不受影响。
-      const pr = objects[pIdx]
-      const prs = pr.scale
-      const runtimeBound =
-        prs !== null && typeof prs === 'object' && (typeof prs.script === 'string' || prs.user !== undefined)
-      const propagateScale = !(runtimeBound && isRenderInert(pr))
-      const w = composeChildTransform(pc, c, propagateScale)
+      // [we-scene patch 2026-09-20] **父 scale 一律传播**（WE 场景图语义）。
+      // 这里曾经有一条「渲染惰性纯容器（无 image/model/particle/text 且无 size）
+      // 且 scale 运行时绑定时不传 scale 给子层」的守卫，依据是 3791354118 /
+      // 3264246690 的工坊缩略图。该结论已被引擎原版渲染器推翻：
+      //   `Mirage SceneWallpaper --resolution 1280x720` 出帧实测，3264246690 的
+      //   人物剪影（阈值 r,g,b<50）宽 756px、暗像素 107953；关掉该守卫后本渲染器
+      //   同为 756px（比值 1.45 ≈ 组 scale 1.43）——WE **确实**把无名组的 1.43
+      //   乘进子层（0.54881×1.43=0.7848）。缩略图当时应是按 newproperty6=1.0 出图。
+      // 同一守卫也让 3448845950 的媒体卡片少了 0.6（作者把整卡片的位移/尺寸都
+      // 挂在无名组 189 上），卡片因此偏右 13% 且放大 1.67 倍（用户报「组件没居中」）。
+      // 判据：verify-props【父 scale 一律传播】用真实整包（3264246690 / 3448845950）
+      // 断言子层 world = 自身 local × 父 scale；recompose==parse 锁两条路径同构。
+      const w = composeChildTransform(pc, c, true)
       c.origin = w.origin
       c.scale = w.scale
       c.angles = w.angles
@@ -747,9 +746,9 @@ export function recomposeWorld(layers, dirty) {
     if (!parent) {
       w = { origin: l.localOrigin.slice(), scale: l.localScale.slice(), angles: l.localAngles.slice() }
     } else {
-      // 传播闸门与 parse 合并阶段逐字相同：父是「渲染惰性纯容器」且其 scale
-      // 绑了脚本/用户属性时，scale 不传给子层。
-      const propagateScale = !(parent.scaleRuntimeBound && parent.renderInert)
+      // 传播闸门与 parse 合并阶段逐字相同（父 scale 一律传播，见合并阶段的注释：
+      // 2026-09-20 用 Mirage 出帧推翻了旧的「渲染惰性纯容器不传 scale」守卫）。
+      const propagateScale = true
       w = composeChildTransform(
         { origin: parent.origin, scale: parent.scale, angles: parent.angles },
         { origin: l.localOrigin, scale: l.localScale, angles: l.localAngles },
