@@ -13,10 +13,13 @@ layout(location=4) in vec3 a_stretchFrame; // xy=非等比拉伸 z=帧序号
 layout(location=5) in vec2 a_vrange;      // 段两端沿贴图 v 的取值（rope 连线用；普通精灵 0..1）
 layout(location=6) in vec2 a_frameBlend;  // x=下一帧序号 y=帧间混合权重（官方 SPRITESHEETBLEND）
 uniform mat4 u_mvp;
+// 官方 g_RefractAmount（common_particles.h 的 uniform 声明：默认 0.05、range [-1,1]）
+uniform float u_refractScale;
 // 序列帧 uv 变换表（TEXS 帧矩形归一化后的 offset/scale），最多 128 帧
 // （matrix spritesheet 72 有 71 帧，旧上限 64 会丢末尾字符）
 uniform int u_frameCount;
 uniform vec4 u_frames[128];               // xy=offset zw=scale
+out vec4 v_refract;    // 官方 v_ScreenTangents：xy=精灵 x 轴、zw=精灵 y 轴（已乘 Refract Amount）
 out vec2 v_uv;
 out vec2 v_uv2;        // 下一帧的 uv（同一 quad 位置、换帧矩形）
 out float v_frameMix;  // 帧间混合权重（0 = 不混合，硬切）
@@ -33,6 +36,10 @@ void main(){
   // 对应屏幕上方，应采样纹理顶行 v=1（与 renderer.js 的 layerQuadVerts 同约定）。
   // a_vrange 让 rope 段两端各取自己的 v（沿绳连续渐变）；普通精灵是 (0,1) 恒等。
   vec2 uv = vec2(a_corner.x + 0.5, mix(a_vrange.x, a_vrange.y, a_corner.y + 0.5));
+  // 官方 ComputeScreenRefractionTangents：把精灵的 x/y 轴（归一化旋转基）投影到屏幕右/上
+  // 方向后乘 g_RefractAmount。2D 正交场景里视图右=(1,0)、视图上=(0,1)（屏幕 y 向下），
+  // 于是切线就是旋转后的两个轴本身 —— 精灵一转，折射偏移方向跟着转（旧实现恒按屏幕轴）。
+  v_refract = vec4(c, s, -s, c) * u_refractScale;
   v_uv2 = uv;
   v_frameMix = 0.0;
   if (u_frameCount > 0) {
@@ -63,7 +70,7 @@ uniform sampler2D u_scene;
 uniform int u_refract;
 uniform int u_sampleScene;
 uniform vec2 u_resolution;
-uniform float u_refractScale;
+in vec4 v_refract;
 in vec2 v_uv;
 in vec2 v_uv2;
 in float v_frameMix;
@@ -83,7 +90,11 @@ void main(){
     vec4 ntex = texture(u_normal, v_uv);
     // 工坊 DXT5nm：R=255 B=0，XY 在 AG（2464842912 Rain2）。
     // 官方 DecompressNormal（common_fragment.h）与程序化法线：XY 在 RG。
-    vec2 nxy = (ntex.r > 0.85 && ntex.b < 0.15) ? (ntex.ag * 2.0 - 1.0) : (ntex.rg * 2.0 - 1.0);
+    // 官方 DecompressNormalWithMask 的蒙版是 normal.a：先做 normal.xw = normal.wx 交换，
+    // 于是蒙版取的是**原始 R 通道**（DXT5nm 的 R=255 → 蒙版 1；RG88 路径不交换、蒙版=alpha）。
+    bool dxt5nm = ntex.r > 0.85 && ntex.b < 0.15;
+    vec2 nxy = dxt5nm ? (ntex.ag * 2.0 - 1.0) : (ntex.rg * 2.0 - 1.0);
+    float nMask = min(dxt5nm ? ntex.r : ntex.a, 1.0);
     // 平坦处 AG≈128，量化噪声会让 length*2.2 仍有 ~0.04，整块 quad 剩淡方块。
     float drop = smoothstep(0.06, 0.28, length(nxy));
     float blank = step(0.95, min(min(t.r, t.g), min(t.b, t.a)));
@@ -91,8 +102,16 @@ void main(){
     vec3 rgb = t.rgb * v_color.rgb;
     if (u_sampleScene == 1) {
       vec2 screenUV = gl_FragCoord.xy / max(u_resolution, vec2(1.0));
-      vec3 scene = texture(u_scene, clamp(screenUV + nxy * u_refractScale, 0.0, 1.0)).rgb;
-      rgb = scene * v_color.rgb;
+      // 官方 frag：offset = v_ScreenTangents.xy*normal.x + v_ScreenTangents.zw*normal.y，
+      // 再乘 normal.a（蒙版）× v_Color.a（粒子 alpha）。y 的符号在官方里为适配 GLSL 取负；
+      // 我们的切线本来就在屏幕 y 向下空间，故不翻。
+      vec2 offset = vec2(
+        v_refract.x * nxy.x + v_refract.z * nxy.y,
+        v_refract.y * nxy.x + v_refract.w * nxy.y
+      ) * (nMask * v_color.a);
+      vec3 scene = texture(u_scene, clamp(screenUV + offset, 0.0, 1.0)).rgb;
+      // 官方是「color.rgb *= scene」（albedo × 顶点色 × 画面），不是用画面替换 albedo
+      rgb = t.rgb * v_color.rgb * scene;
     }
     col = vec4(rgb, alpha);
     if (col.a < 0.004) discard;

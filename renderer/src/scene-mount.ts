@@ -2251,6 +2251,9 @@ cfg, source, pkgAbort.signal);
             size: live ? [Math.round(minS), Math.round(maxS)] : null,
             frameCount: ps.frameCount,
             frameMixMax: Math.round(frameMixMax * 1000) / 1000,
+            // 折射诊断：官方 g_RefractAmount（缺省 0.05、range[-1,1]）与是否真的走 REFRACT
+            refract: !!ps.refract,
+            refractAmount: Math.round((Number.isFinite(ps.refractAmount) ? ps.refractAmount : 0.05) * 1000) / 1000,
           };
         }),
       });

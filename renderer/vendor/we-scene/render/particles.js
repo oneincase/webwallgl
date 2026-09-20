@@ -213,7 +213,7 @@ export class ParticleSystem {
     this.material = null
     this.blend = 'translucent'
     this.refract = false
-    this.refractAmount = 0.04
+    this.refractAmount = 0.05
     this.opacityMul = 1
     this.lifetimeMul = 1
     this.visible = true
@@ -696,12 +696,13 @@ export class ParticleSystem {
     const pass = mat && mat.passes && mat.passes[0]
     this.blend = (pass && pass.blending) || 'translucent'
     this.refract = particlePassRefract(mat)
-    // 官方 Refract Amount（ui_editor_properties_refract_amount）：雨滴常见 0.05，
-    // 水花可到 2。缺省 0.04 对齐未填常量的工坊材质。上限避免一次采样跨整屏。
+    // 官方 Refract Amount（ui_editor_properties_refract_amount）：common_particles.h 的
+    // uniform 声明是 `default 0.05, range [-1,1]` —— 缺省 0.05、允许负值（反向扰动）。
+    // 旧实现缺省 0.04 且把上限钳到 0.35（会悄悄改掉作者写的 2 之类的大值）。
     const cv = pass && pass.constantshadervalues
     const rawAmt = cv && cv.ui_editor_properties_refract_amount
     const amt = Number(rawAmt)
-    this.refractAmount = Number.isFinite(amt) ? Math.min(0.35, Math.max(0, amt)) : 0.04
+    this.refractAmount = Number.isFinite(amt) ? Math.min(1, Math.max(-1, amt)) : 0.05
     // 官方 Overbright（ui_editor_properties_overbright）：乘在精灵 RGB 上的亮度
     // 系数，编辑器滑条缺省 1。此前整个键被静默丢弃 → 等效恒 1.0，3151551777 的
     // Bokeh 光斑材质写了 0.25，渲染出来亮 4 倍，additive 大光斑糊住整个画面。
@@ -1812,10 +1813,15 @@ export class ParticleSystem {
       gl.activeTexture(gl.TEXTURE1)
       gl.bindTexture(gl.TEXTURE_2D, this.normalTex.glTex)
       if (prog.uniNormal) gl.uniform1i(prog.uniNormal, 1)
-      // 半透明折射才去采画面：additive 再叠一层场景色会把背景加倍冲白。
+      // [we-scene patch] 官方 frag 在 `#if REFRACT` 下**无条件**采画面
+      // （`color.rgb *= texSample2D(g_Texture3, refracted)`），与混合模式无关。
+      // 旧实现把 additive 排除在外（当时用的是「用画面替换 albedo」的写法，会冲白）；
+      // 现在按官方改成 albedo × 顶点色 × 画面 的**相乘**，且空白 albedo 的 alpha 由法线
+      // 偏离给出，additive 也能安全采样 —— 直接证据：2464842912 车尾那块被冲白的
+      // 加色水花（Splash，Refract Amount=1）在 Mirage 里是暗的场景色。
       // 画布是 alpha:false，copyTexImage2D 必须 RGB8，RGBA8 会 INVALID_OPERATION
       // 并留下全零纹理（见 renderer.js captureBackdrop）。
-      const sampleScene = this.blend !== 'additive'
+      const sampleScene = true
       if (prog.uniSampleScene) gl.uniform1i(prog.uniSampleScene, sampleScene ? 1 : 0)
       if (sampleScene) {
         const dw = gl.drawingBufferWidth || width
@@ -1846,7 +1852,7 @@ export class ParticleSystem {
         }
         if (prog.uniScene) gl.uniform1i(prog.uniScene, 2)
         if (prog.uniResolution) gl.uniform2f(prog.uniResolution, dw, dh)
-        if (prog.uniRefractScale) gl.uniform1f(prog.uniRefractScale, this.refractAmount || 0.04)
+        if (prog.uniRefractScale) gl.uniform1f(prog.uniRefractScale, Number.isFinite(this.refractAmount) ? this.refractAmount : 0.05)
       } else {
         gl.activeTexture(gl.TEXTURE2)
         gl.bindTexture(gl.TEXTURE_2D, this.texture.glTex)

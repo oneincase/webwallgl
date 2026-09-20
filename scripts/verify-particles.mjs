@@ -888,6 +888,149 @@ function runMatrixGlyphSize() {
   return { errors };
 }
 
+// ---------- REFRACT 切线：官方 ComputeScreenRefractionTangents 的三项语义 ----------
+// 官方（common_particles.h + genericparticle.frag）：
+//   v_ScreenTangents = (精灵 x 轴, 精灵 y 轴) 在视图右/上方向的投影 × g_RefractAmount
+//   offset = tangents.xy*normal.x + tangents.zw*normal.y
+//   offset *= normal.a（DXT5nm 取交换前的原始 R）× v_Color.a
+//   color.rgb *= scene(uv + offset)
+// 旧实现恒按屏幕轴偏移（`nxy * scale`），精灵一转方向就不跟着转，也不乘蒙版/alpha。
+// 这里给 CPU 参考光栅喂一张「x 编码在 R、y 编码在 G」的假画面，逐项验：
+// ① 未旋转：只沿 R 通道偏移；② 旋转 90°：偏移随之转到 G 通道；
+// ③ 蒙版 0 / ④ 粒子 alpha 0：完全不偏移；⑤ 缺省量 0.05、钳 [-1,1]。
+function runRefractTangents() {
+  const errors = [];
+  const W2 = 64;
+  const scene = { width: W2, height: W2, rgb: new Float32Array(W2 * W2 * 3) };
+  for (let y = 0; y < W2; y++) {
+    for (let x = 0; x < W2; x++) {
+      const o = (y * W2 + x) * 3;
+      scene.rgb[o] = x / (W2 - 1); // R = 横向梯度
+      scene.rgb[o + 1] = y / (W2 - 1); // G = 纵向梯度
+      scene.rgb[o + 2] = 0;
+    }
+  }
+  // 法线：RG 路径（r=191 < 0.85*255 不能触发 DXT5nm 判定），nx=+0.5、ny=0
+  const mkNormal = (alpha) => {
+    const rgba = new Uint8Array(4 * 4 * 4);
+    for (let i = 0; i < 16; i++) {
+      rgba[i * 4] = 191; // nx = 191/255*2-1 ≈ 0.498
+      rgba[i * 4 + 1] = 128; // ny = 0
+      rgba[i * 4 + 2] = 128; // B 高 → 不判 DXT5nm
+      rgba[i * 4 + 3] = alpha; // 蒙版（RG 路径取 alpha）
+    }
+    return { width: 4, height: 4, pixels: { width: 4, height: 4, rgba } };
+  };
+  const white = () => ({
+    glTex: null,
+    width: 4,
+    height: 4,
+    pixels: { width: 4, height: 4, rgba: new Uint8Array(4 * 4 * 4).fill(255) },
+  });
+  const mkPS = (rot, alpha) => {
+    const ps = new ParticleSystem(
+      null,
+      {
+        maxcount: 1,
+        emitter: [{ name: "sphererandom", rate: 60, distancemax: 0 }],
+        initializer: [
+          { name: "lifetimerandom", min: 5, max: 5 },
+          { name: "sizerandom", min: 300, max: 300 },
+        ],
+        operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+      },
+      null,
+      { origin: [32, 32, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+    ps.refract = true;
+    ps.refractAmount = 0.5;
+    ps.blend = "translucent";
+    ps.setTexture(white());
+    for (let i = 0; i < 3; i++) ps.advance(1 / 60);
+    const p = (ps.pool || []).find((q) => q.alive);
+    if (!p) return null;
+    p.rot = rot;
+    p.alpha = alpha;
+    p.vx = 0;
+    p.vy = 0;
+    return ps;
+  };
+  const cam = fitCover(64, 64, W2, W2);
+  const draw = (ps) => {
+    const target = createTarget(W2, W2, [0, 0, 0]);
+    rasterizeSystem(target, ps, cam, { scene });
+    return target;
+  };
+  // 粒子中心的屏幕像素（origin 32,32 → 正好中心）
+  const cxy = [(W2 / 2) | 0, (W2 / 2) | 0];
+  const at = (target, ch) => target.rgb[(cxy[1] * W2 + cxy[0]) * 3 + ch];
+
+  const psA = mkPS(0, 1);
+  if (!psA) {
+    errors.push("REFRACT 切线夹具没有粒子");
+    return { errors };
+  }
+  psA.setNormalTexture(mkNormal(255));
+  const a = draw(psA);
+  const baseR = cxy[0] / (W2 - 1);
+  const baseG = cxy[1] / (W2 - 1);
+  // nx≈0.5、amount=0.5、alpha=1、蒙版=1 → offX≈0.25；offY=0
+  if (!(at(a, 0) > baseR + 0.15 && Math.abs(at(a, 1) - baseG) < 0.06)) {
+    errors.push(
+      `未旋转精灵应只沿 +x 偏移：R=${at(a, 0).toFixed(3)}（应≈${(baseR + 0.25).toFixed(3)}）G=${at(a, 1).toFixed(3)}（应≈${baseG.toFixed(3)}）`,
+    );
+  }
+  // ② 旋转 90°：偏移转到 +y（G 通道）
+  const psB = mkPS(Math.PI / 2, 1);
+  psB.setNormalTexture(mkNormal(255));
+  const b = draw(psB);
+  if (!(at(b, 1) > baseG + 0.15 && Math.abs(at(b, 0) - baseR) < 0.06)) {
+    errors.push(
+      `旋转 90° 后偏移必须转到 +y：G=${at(b, 1).toFixed(3)}（应≈${(baseG + 0.25).toFixed(3)}）R=${at(b, 0).toFixed(3)}（应≈${baseR.toFixed(3)}）`,
+    );
+  }
+  // ③ 蒙版 = 0 → 不偏移
+  const psC = mkPS(0, 1);
+  psC.setNormalTexture(mkNormal(0));
+  const c = draw(psC);
+  if (!(Math.abs(at(c, 0) - baseR) < 0.05 && Math.abs(at(c, 1) - baseG) < 0.05)) {
+    errors.push(`normal.a 蒙版 0 时必须不偏移（实得 R=${at(c, 0).toFixed(3)} G=${at(c, 1).toFixed(3)}）`);
+  }
+  // ④ 粒子 alpha = 0 → 不偏移
+  const psD = mkPS(0, 0);
+  psD.setNormalTexture(mkNormal(255));
+  const d = draw(psD);
+  if (!(Math.abs(at(d, 0) - baseR) < 0.05)) {
+    errors.push(`v_Color.a = 0 时必须不偏移（实得 R=${at(d, 0).toFixed(3)}）`);
+  }
+  // ⑤ 缺省量与钳制（官方 uniform：default 0.05 / range [-1,1]）
+  const bare = new ParticleSystem(null, { maxcount: 1 }, null, { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+  bare.setMaterial({ passes: [{ blending: "translucent" }] });
+  if (bare.refractAmount !== 0.05) errors.push(`Refract Amount 缺省应为 0.05，实际 ${bare.refractAmount}`);
+  const big = new ParticleSystem(null, { maxcount: 1 }, null, { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+  big.setMaterial({ passes: [{ constantshadervalues: { ui_editor_properties_refract_amount: 2 } }] });
+  if (big.refractAmount !== 1) errors.push(`Refract Amount=2 应钳到 1（官方 range[-1,1]），实际 ${big.refractAmount}`);
+  const neg = new ParticleSystem(null, { maxcount: 1 }, null, { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+  neg.setMaterial({ passes: [{ constantshadervalues: { ui_editor_properties_refract_amount: -0.3 } }] });
+  if (neg.refractAmount !== -0.3) errors.push(`Refract Amount=-0.3 应保留（负值=反向扰动），实际 ${neg.refractAmount}`);
+
+  // ⑥ 接线：切线必须在顶点着色器里由旋转基给出，且 CPU 光栅同构
+  const shSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
+  for (const [re, msg] of [
+    [/v_refract = vec4\(c, s, -s, c\) \* u_refractScale/, "顶点着色器必须按旋转基算切线"],
+    [/v_refract\.x \* nxy\.x \+ v_refract\.z \* nxy\.y/, "frag 必须用切线点乘法线"],
+    [/nMask \* v_color\.a/, "偏移必须乘 normal.a 蒙版 × 粒子 alpha"],
+    [/rgb = t\.rgb \* v_color\.rgb \* scene/, "官方是 color.rgb *= scene（albedo 相乘）"],
+  ]) {
+    if (!re.test(shSrc)) errors.push(`接线缺失：${msg}`);
+  }
+  const rasterSrc = fs.readFileSync(join(ROOT, "scripts/particle-raster.mjs"), "utf8");
+  if (!/offX = \(co \* nx \+ -si \* ny\) \* refractAmount \* nMask \* ca/.test(rasterSrc)) {
+    errors.push("CPU 参考光栅必须镜像折射切线（改一边必改另一边）");
+  }
+  return { errors };
+}
+
 // ---------- REFRACT 空白白图（2464842912 Raindrops Splatter Small）----------
 // 槽 0 是整张不透明白 PNG，形状在法线槽。按普通精灵画 = 满屏白方块。
 
@@ -2485,6 +2628,10 @@ if (action === "all" || action === "tex") {
   console.log(`\n【REFRACT 空白白图】问题 ${rb.errors.length}`);
   rb.errors.forEach((e) => console.log("  ! " + e));
   failed += rb.errors.length;
+  const rt = runRefractTangents();
+  console.log(`\n【REFRACT 切线】问题 ${rt.errors.length}`);
+  rt.errors.forEach((e) => console.log("  ! " + e));
+  failed += rt.errors.length;
   const bf = runBuiltinFrames();
   console.log(`\n【内置帧表】问题 ${bf.errors.length}`);
   bf.errors.forEach((e) => console.log("  ! " + e));

@@ -49,10 +49,24 @@ export function createTarget(width, height, fill) {
 // 渲染一个粒子系统到目标缓冲。
 // cam: { offX, offY, viewW, viewH, projH } —— 与 math.js 的 buildCamera 输出一致。
 // 顶点变换逐字对应 particles.js 的顶点着色器。
-export function rasterizeSystem(target, ps, cam) {
+export function rasterizeSystem(target, ps, cam, opts) {
   const { width: W, height: H, rgb } = target
   const tex = ps.texture && ps.texture.pixels ? ps.texture.pixels : null
   if (!tex) return { drawn: 0, skipped: 'no texture pixels' }
+  // REFRACT：官方是「用已绘制画面做 UV 偏移后乘进 albedo」。CPU 侧要有一张假画面
+  // （opts.scene = {width,height,rgb}）才判得出切线方向/蒙版/alpha 三项语义。
+  const scene = opts && opts.scene ? opts.scene : null
+  const nrmPix = ps.normalTex && ps.normalTex.pixels ? ps.normalTex.pixels : null
+  const refractOn = !!(scene && nrmPix && ps.refract)
+  const refractAmount = Number.isFinite(ps.refractAmount) ? ps.refractAmount : 0.05
+  const sampleScene = (u, v) => {
+    const sw = scene.width
+    const sh = scene.height
+    const x = Math.min(sw - 1, Math.max(0, Math.round(u * sw - 0.5)))
+    const y = Math.min(sh - 1, Math.max(0, Math.round(v * sh - 0.5)))
+    const o = (y * sw + x) * 3
+    return [scene.rgb[o], scene.rgb[o + 1], scene.rgb[o + 2]]
+  }
 
   const sysScale = ps.sysScale
   // 与 particles.js 的顶点着色器一致：精灵形状 = 贴图宽高比 × 图层非等比 scale
@@ -148,9 +162,45 @@ export function rasterizeSystem(target, ps, cam) {
         } else {
           t = sampleTex(tex, u, v)
         }
-        // REFRACT + 空白白图：GPU 走折射；CPU 光栅没有帧缓冲可采，不能按不透明
+        // REFRACT + 空白白图：GPU 走折射；CPU 光栅没有假画面可采时不能按不透明
         // 白 quad 画，否则 2468489223 Splatter Small 会在离线结果里铺满白方块。
-        if (punchBlank) continue
+        if (punchBlank && !refractOn) continue
+        if (refractOn) {
+          // 官方 frag（逐字对应 particle-shaders.js）：
+          //   offset = v_ScreenTangents.xy*normal.x + v_ScreenTangents.zw*normal.y
+          //   offset *= normal.a（DXT5nm 取原始 R）× v_Color.a
+          //   color.rgb *= scene(u_uv + offset)
+          // 切线与顶点着色器同构：精灵旋转后的 x/y 轴 × Refract Amount。
+          const n = sampleTex(nrmPix, u, v)
+          const dxt = n[0] > 0.85 * 255 && n[2] < 0.15 * 255
+          const nx = dxt ? (n[3] / 255) * 2 - 1 : (n[0] / 255) * 2 - 1
+          const ny = dxt ? (n[1] / 255) * 2 - 1 : (n[1] / 255) * 2 - 1
+          const nMask = Math.min(dxt ? n[0] / 255 : n[3] / 255, 1)
+          const co = Math.cos(rot)
+          const si = Math.sin(rot)
+          const offX = (co * nx + -si * ny) * refractAmount * nMask * ca
+          const offY = (si * nx + co * ny) * refractAmount * nMask * ca
+          const su = px / (W - 1)
+          const sv = py / (H - 1)
+          const sc = sampleScene(
+            Math.min(1, Math.max(0, su + offX)),
+            Math.min(1, Math.max(0, sv + offY)),
+          )
+          const rr = (t[0] / 255) * cr2 * sc[0]
+          const gg = (t[1] / 255) * cg2 * sc[1]
+          const bb2 = (t[2] / 255) * cb2 * sc[2]
+          const o2 = (py * W + px) * 3
+          if (additive) {
+            rgb[o2] += rr
+            rgb[o2 + 1] += gg
+            rgb[o2 + 2] += bb2
+          } else {
+            rgb[o2] = rr
+            rgb[o2 + 1] = gg
+            rgb[o2 + 2] = bb2
+          }
+          continue
+        }
         const ta = (t[3] / 255) * ca
         if (ta <= 0) continue
         const o = (py * W + px) * 3
