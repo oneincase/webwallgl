@@ -2,8 +2,9 @@
  * verify-camera.mjs —— 相机级动画的离线校验
  *
  * 覆盖三个 WE 相机特性（本仓库新实现，见 render/math.js / renderer.js）：
- *   1. camerafade  开场淡入。scene.json 只有 `camerafade: true` 开关，**无时长参数**
- *      （WE 用固定内置时长），本仓库取 1.0s 且可由 opts.fadeDuration 覆盖。
+ *   1. camerafade  开场幕布。scene.json 只有 `camerafade` 开关、**无时长参数**。
+ *      官方语义是「相机切换路径时的淡入」**不是挂载开场淡入** —— 幕布默认不播，
+ *      仅宿主显式 fade:true 才接线（时长取 1.0s，可由 opts.fadeDuration 覆盖）。
  *   2. camerashake 相机抖动。三个参数齐全（amplitude / roughness / speed），
  *      无需猜测；但「amp → 像素」的比例（±2% 视宽）是观感近似、无数据出处。
  *   3. 透视相机。有 fov、无 orthogonalprojection 才走 lookAt + perspective
@@ -317,7 +318,8 @@ if (fs.existsSync(LIB)) {
   console.log(`扫描 ${total} 个场景：camerafade 开启 ${fadeOn}，缺字段 ${fadeMissing}，camerashake 开启 ${shakeOn}，透视 ${perspIds.length}（${perspIds.join(",") || "无"}）`);
   check(perspIds.includes("3509243656"), `库内应有 3509243656 透视场景，实得 [${perspIds.join(", ")}]`);
   check(perspIds.length <= 3, `透视场景异常增多：${perspIds.length}（判定正交投影的条件可能被写反）`);
-  // camerafade 是绝大多数场景的默认行为；若骤降说明 parse 或数据读取出了问题
+  // camerafade 字段本身绝大多数场景为 true（WE 编辑器默认值）；若骤降说明 parse
+  // 或数据读取出了问题。字段分布与是否播放无关 —— 幕布默认不播（见第 4 组守卫）。
   check(fadeOn > total * 0.8, `camerafade 开启数异常偏低：${fadeOn}/${total}（预期 >80%）`);
   // 缺字段的场景**不该**淡入（默认关），这是 renderer.js 里 boolProp(...,false) 的依据
   check(fadeMissing <= 2, `camerafade 缺字段的场景数异常：${fadeMissing}（预期 ≤2）`);
@@ -338,6 +340,13 @@ if (fs.existsSync(LIB)) {
   check(/camerafade/.test(src), "renderer.js 未引用 camerafade");
   check(/camerashake/.test(src), "renderer.js 未引用 camerashake");
   check(/fadeEnabled\s*\(/.test(src), "renderer.js 未调用 fadeEnabled（淡入未接线）");
+  // 幕布必须**默认不播**：官方语义 camerafade = 相机切换路径时的淡入，不是挂载
+  // 开场淡入 —— 旧闸门（opts.fade !== false && 场景 true 就放行）曾让 127/128 个
+  // 壁纸加载完成后先黑 1s，观感 = 加载变慢。必须保持「宿主显式 fade:true 才接线」。
+  check(
+    /fadeEnabled = \(general\) => opts\.fade === true && boolProp\(general\.camerafade, false\)/.test(src),
+    "camerafade 幕布必须默认不播（opts.fade === true 显式接线），不得退回「场景写了 true 就淡入」",
+  );
   check(/cameraShakeOffset\s*\(/.test(src), "renderer.js 未调用 cameraShakeOffset（抖动未接线）");
   // 抖动必须右乘 viewProj（左乘会落到 NDC 空间，画面跑飞）
   check(

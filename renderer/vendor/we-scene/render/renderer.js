@@ -932,8 +932,14 @@ export function createRenderer(canvas, opts = {}) {
     const raw = v !== null && typeof v === 'object' ? v.value : v
     return typeof raw === 'number' && Number.isFinite(raw) ? raw : dflt
   }
-  // camerafade 默认**关**：只有 127/128 个场景显式写了 true，缺字段的那个不该淡入。
-  const fadeEnabled = (general) => opts.fade !== false && boolProp(general.camerafade, false)
+  // camerafade 幕布**默认不播**：官方文档（docs.wallpaperengine.io，SceneScript
+  // IScene）对 camerafade 的定义是 "Whether the camera will show the fade effect
+  // when changing paths" —— 相机**切换路径时**的淡入，不是挂载时的开场淡入。旧实现
+  // 按字段名把它当开场淡入，全库 127/128 个 camerafade:true 的场景加载完成后还要先
+  // 黑 fadeDuration 秒（幕布时间基准是首帧起算的 time），观感就是「壁纸加载变慢」。
+  // 现在只有宿主显式 fade:true 才接线；场景显式写 false 的仍不放（缺省按关处理），
+  // 默认无开场动画的壁纸不再叠加全局开场动画。
+  const fadeEnabled = (general) => opts.fade === true && boolProp(general.camerafade, false)
   // [we-scene patch] camerashake：相机持续抖动（全库 5 个场景开启）。
   // 三个参数齐全（amplitude / roughness / speed），无需猜测：
   //   2800248288 amp=0.35 rough=0   speed=1
@@ -2534,13 +2540,13 @@ export function createRenderer(canvas, opts = {}) {
       if (isLayerOffscreen(layer, cam)) continue
       await renderLayer(layer, textures, cam, layerVP, width, height, time)
     }
-    // [we-scene patch] camerafade：WE 的开场淡入（全库 127/128 个场景都开着）。
-    // scene.json 只有 `camerafade: true` 这个开关，**没有时长参数** —— WE 用固定
-    // 内置时长。这里取 1.0s（可用 opts.fadeDuration 覆盖），并在 README 注明这个
-    // 数值是观感近似、无数据出处。
-    // 实现为「最后叠一层由不透明渐变到全透明的 clearcolor 幕布」，而不是改每层的
-    // alpha：后者要穿透效果链、且会把「层自身 alpha 参与的混合」算错；幕布只影响
-    // 最终像素，与 WE 的整屏淡入观感一致。
+    // [we-scene patch] camerafade 幕布：实现为「最后叠一层由不透明渐变到全透明的
+    // clearcolor 幕布」，而不是改每层的 alpha：后者要穿透效果链、且会把「层自身
+    // alpha 参与的混合」算错；幕布只影响最终像素，整屏淡入观感一致。
+    // **默认不播**：官方文档对 camerafade 的定义是「相机切换路径时的淡入」，不是
+    // 挂载开场淡入 —— 曾按开场淡入误读，127/128 个壁纸加载完成后还要先黑 1 秒，
+    // 观感等于加载变慢。现在只有宿主显式 fade:true 才进入这里；时长 1.0s 仍是
+    // 观感近似、无数据出处（可用 opts.fadeDuration 覆盖）。
     // 时间基准用 time（main.ts 传的是 (now-start)/1000，自挂载起算），首帧即 0。
     if (fadeEnabled(general) && time < fadeDuration) {
       const k = Math.max(0, Math.min(1, time / fadeDuration))
