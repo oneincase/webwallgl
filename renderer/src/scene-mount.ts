@@ -2843,8 +2843,21 @@ cfg, source, pkgAbort.signal);
             }
           }
           if (texName) {
-            await loadTex(texName);
-            layer.textureName = texName;
+            // [we-scene patch] 单张贴图解析/解码失败**不许拖垮整张壁纸**：下面那个
+            // `!texObj` 分支本来就会「跳过该图层 + 报诊断」，但异常会从 loadTex 直接
+            // 冒到挂载外层，变成「整张墙加载失败」（764162681 的 TEXV0004 就是这样：
+            // 五张贴图全抛「不是 .tex 文件」→ scene render failed → 画面全空）。
+            // 失败时不写 layer.textureName，交给下面的跳过分支。
+            try {
+              await loadTex(texName);
+              layer.textureName = texName;
+            } catch (e) {
+              reportDiag(
+                rt,
+                cfg,
+                `model '${layer.name}' 的贴图 '${texName}' 加载失败，跳过该层：${(e as Error)?.message}`,
+              );
+            }
           }
           const texObj = texName ? textures.get(texName) : null;
           if (!texObj) {

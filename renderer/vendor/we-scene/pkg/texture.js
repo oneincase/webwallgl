@@ -17,6 +17,7 @@ export function parseTex(buf) {
   let p = 0
   const magic1 = asciiTex(buf, p, 9)
   p += 9
+  if (magic1 === 'TEXV0004\0') return parseTexV4(buf)
   if (magic1 !== 'TEXV0005\0') throw new Error('不是 .tex 文件: ' + magic1)
   const magic2 = asciiTex(buf, p, 9)
   p += 9
@@ -282,6 +283,66 @@ export function parseTex(buf) {
 }
 
 // mip0 → { width, height, rgba } 或 { width, height, png } / { ..., image, fif } / { ..., video }
+/**
+ * [we-scene patch 2026-09-20] **旧容器 TEXV0004**（764162681 Jake 的五张贴图）。
+ *
+ * 与 TEXV0005 的差别（本机 5 张全部实测，2048²/512² 两组尺寸各自吻合）：
+ *   · 魔数之后**没有 `TEXI0001` 子魔数**（TEXV0005 才有），条目也没有 `TEXB` 容器魔数；
+ *   · 头之后直接是「imageCount + 单条 mip 记录」，mip 记录形如 TEXB0001：
+ *     `{ u32 mipW, u32 mipH, u32 size, 原始像素 }` —— **没有 LZ4 的
+ *     `compression / uncompressedSize` 两个 u32**（实测 payload 恰好 = W×H×1 字节：
+ *     2048² 的 4194304、512² 的 262144，与「头 49 字节 + 原始载荷」逐字节吻合）。
+ * 我们的解析器原来只认 `TEXV0005\0`，遇到这五张直接抛「不是 .tex 文件」→ 图层拿不到
+ * textureName → 整张壁纸加载失败（用户报「直接无法加载」）。全库扫描：3491 张 TEXV0005、
+ * **5 张 TEXV0004（全部在这一张壁纸里）**，所以这是一条只影响旧作品的窄路径。
+ *
+ * 头部字段布局（偏移相对文件头）：
+ *   0  9B  "TEXV0004\0"
+ *   9  u32 format（本例 4 = DXT5）
+ *   13 u32 flags
+ *   17 u32 textureWidth / 21 textureHeight / 25 width / 29 height
+ *   33 u32 imageCount（本例 1）
+ *   37 u32 mip0 width / 41 mip0 height / 45 u32 mip0 size
+ *   49     mip0 原始像素
+ * 判据：verify-textures【TEXV0004 旧容器】—— 合成文件按此布局打包必须解析出
+ * 与 TEXV0005 路径相同的字段与像素；真实语料（本机这五张）必须解析出 2048²/512²。
+ */
+function parseTexV4(buf) {
+  let p = 9
+  const format = u32(buf, p); p += 4
+  const flags = u32(buf, p); p += 4
+  const textureWidth = u32(buf, p); p += 4
+  const textureHeight = u32(buf, p); p += 4
+  const width = u32(buf, p); p += 4
+  const height = u32(buf, p); p += 4
+  const imageCount = u32(buf, p); p += 4
+  const images = []
+  for (let i = 0; i < imageCount; i++) {
+    if (p + 12 > buf.length) throw new Error('TEXV0004 mip 记录越界 @' + i)
+    const mw = u32(buf, p); p += 4
+    const mh = u32(buf, p); p += 4
+    const size = u32(buf, p); p += 4
+    if (p + size > buf.length) throw new Error('TEXV0004 载荷越界 @' + i)
+    images.push([{ width: mw, height: mh, compression: 0, data: buf.subarray(p, p + size) }])
+    p += size
+  }
+  return {
+    format,
+    formatName: TEXTURE_FORMATS[format] || String(format),
+    flags,
+    textureWidth,
+    textureHeight,
+    width,
+    height,
+    freeImageFormat: FIF.UNKNOWN,
+    containerMagic: 'TEXV0004',
+    containerVersion: 0,
+    isVideo: false,
+    images,
+    frames: null,
+  }
+}
+
 function asciiTex(buf, start, len) {
   let s = ''
   for (let i = start; i < start + len; i++) s += String.fromCharCode(buf[i])

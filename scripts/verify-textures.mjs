@@ -747,6 +747,71 @@ async function containerVariant() {
 
 await containerVariant();
 
+// ---------- TEXV0004 旧容器（764162681 Jake 的五张贴图：整张壁纸加载失败的真因） ----------
+// TEXV0004 与 TEXV0005 的差别（本机 5 张实测）：
+//   · 魔数后**没有 `TEXI0001` 子魔数**，条目也没有 `TEXB` 容器魔数；
+//   · 头之后直接是「imageCount + 单条 mip 记录」，mip 记录 = `{w, h, size, 原始像素}`
+//     （没有 LZ4 的 compression/uncompressedSize 两个 u32 —— 实测 payload 恰好 = W×H×1）。
+// 旧解析器只认 TEXV0005 → 五张全抛「不是 .tex 文件」→ 挂载中断 → 整张墙不加载。
+async function texV4() {
+  const { parseTex } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+  // 合成：4×4 DXT5（format=4）单 mip，载荷 16 字节
+  const build = () => {
+    const chunks = []
+    const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); chunks.push(b) }
+    chunks.push(Buffer.from("TEXV0004\0", "latin1"))
+    u32(4) // format = DXT5
+    u32(2) // flags
+    u32(8); u32(8) // textureWidth/Height
+    u32(4); u32(4) // width/height
+    u32(1) // imageCount
+    u32(4); u32(4) // mip0 w/h
+    const data = Buffer.alloc(16, 0x7f)
+    u32(16) // mip0 size
+    chunks.push(data)
+    return Buffer.concat(chunks)
+  }
+  let t = null;
+  let parseErr = "";
+  try { t = parseTex(new Uint8Array(build())); } catch (e) { parseErr = e.message; }
+  check(!!t, `TEXV0004 必须能解析（实得异常：${parseErr}）`);
+  check(!!t && t.format === 4 && t.width === 4 && t.height === 4 && t.textureWidth === 8, `TEXV0004 头部字段应解析为 4/4×4（texture 8）：实得 fmt=${t && t.format} ${t && t.width}×${t && t.height} tex=${t && t.textureWidth}`);
+  check(!!t && t.images.length === 1 && t.images[0].length === 1 && t.images[0][0].data.length === 16, "TEXV0004 必须解析出 1 图 1 mip 16 字节载荷");
+  check(!!t && t.images[0][0].compression === 0 && t.frames === null, "TEXV0004 的 mip 必须按未压缩处理（无 LZ4 头）");
+  // 反例：载荷越界必须抛错，而不是静默截断
+  const bad = build()
+  bad.writeUInt32LE(9999, 45)
+  let threw = false
+  try { parseTex(new Uint8Array(bad)) } catch { threw = true }
+  check(threw, "TEXV0004 载荷越界必须抛错");
+  // 真实语料（本机装了这张壁纸时）：五张必须解析出 DXT5 与 2048²/512²
+  const pkgPath = join(process.env.HOME || "", "Library/Application Support/io.github.oneincase.wallpaperem/wallpapers/764162681/scene.pkg");
+  let found = 0;
+  if (fs.existsSync(pkgPath)) {
+    const { parsePkg, getEntry } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/container.js")).href);
+    const { decodeMips } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    for (const e of pkg.entries) {
+      if (!e.name.endsWith(".tex")) continue;
+      let ok = false;
+      let info = "";
+      try {
+        const parsed = parseTex(new Uint8Array(getEntry(pkg, e.name)));
+        const m0 = decodeMips(parsed)[0];
+        ok = parsed.format === 4 && (parsed.width === 2048 || parsed.width === 512) && !!m0.rgba && m0.width === parsed.width;
+        info = `fmt=${parsed.format} ${parsed.width}² rgba=${!!m0.rgba}`;
+      } catch (e) {
+        info = "异常 " + e.message;
+      }
+      if (!ok) check(false, `764162681 ${e.name} 应解析为 DXT5 2048²/512² 并解出像素（实得 ${info}）`);
+      found++;
+    }
+  }
+  console.log(`  · TEXV0004 真实语料命中 ${found} 张（本机 764162681）`);
+}
+
+await texV4();
+
 // ---------- 官方素材的纹理格式语义 + TEXS 帧表接线（本机接入原版素材时暴露） ----------
 // WE `common_fragment.h::ConvertTexture0Format`（GLSL 分支）：R8 → vec4(1,1,1,r)、
 // RG88 → vec4(r,r,r,g)。粒子 shader 用 `.a` 当形状，而我们解码出来的 R8 是 (r,r,r,255)
