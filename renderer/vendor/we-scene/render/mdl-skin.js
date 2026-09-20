@@ -486,8 +486,18 @@ export function applyAttachmentBindOrigins(layers) {
     // 有静态姿势的模型与**有动画的模型同款处理**（同一具身体模型、同一个姿势：
     // 静态姿势 == 动画 frame0，实测两者附着点都在 (2.4,−108.8)），
     // 净位移自然同为 (4.8,−218)px —— 那条路是 CASEBOOK 实机确认「脸在头上」的。
+    // [we-scene patch 3463520581] **图集散开位必须按模型格式（MDLV0019 puppet-warp）
+    // 判定，不能拿「UV≈网格布局」当代理。** 整图 sprite 的 MDLV0023 模型同样满足那个
+    // UV 启发式（顶点与 UV 本来就是 1:1 的整块矩形），于是被误判成图集模型：
+    // 3463520581 的 HAIR BACK (BIG) / main hair back c2 都是 MDLV0023、0 动画、无静态
+    // 姿势、uvErr≈2e-8 → atlasBind 成立 → **26 个挂件层（c3 + c2 部件）的附着点位移
+    // 全被压成 0**，整片后发停在装配前的位置、缩在身体后面，Mirage 里那片宽发帘整个
+    // 消失（用户报「头发错位」）。全库 132 行附着点实测：这条判定只影响本壁纸 26 行，
+    // 另有 1 行 bind=[0,0]（压不压等价）；MDLV0019 的 4 个父模型（全在 3226487183）
+    // 本来就被「有动画 / 有静态姿势」两条排除，一行未动。
     const atlasBind = !(parent.puppet.animations && parent.puppet.animations.length) &&
       !parent.puppet.staticPoseTRS &&
+      parent.puppet.magic === 'MDLV0019' &&
       puppetUvMatchesLayout(parent.puppet, parent.size)
     const d = atlasBind ? [0, 0] : parentMeshToWorldDelta(parent, bx, by)
     const desc = []

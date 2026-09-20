@@ -401,6 +401,37 @@ function neckOf(parent, attName) {
           "旧实现 cur=(0,0) 给出 (+32,−248)，整束后发飞到头顶形成第二个身体");
       }
     }
+
+    // 4) 图集散开位 hack（atlasBind）不得命中 MDLV0023 的**整图 sprite**。
+    //    HAIR BACK (BIG) / main hair back c2 都是 MDLV0023、0 动画、无静态姿势，且
+    //    顶点↔UV 是 1:1 的整块矩形（uvErr≈2e-8）—— 「UV≈网格布局」这条代理启发式
+    //    因此把它们误判成 puppet-warp，26 个挂件层（c3 + c2 部件）的附着点位移被压成
+    //    0，整片后发停在装配前的位置、缩在身体后面：Mirage 里那片宽发帘整片消失，
+    //    用户实机报「女人物头发错位」。真正的判据是模型格式（MDLV0019 puppet-warp）。
+    //    判据：这批层的 attachBindDelta 必须等于附着点算出的位移，且量级 > 100px。
+    for (const [img, att] of [
+      ["models/c2 part 1.json", "hair back 2"],
+      ["models/c2 part 4.json", "hair back 2"],
+      ["models/hair back c3.json", "hair back"],
+    ]) {
+      const l = byImage(img);
+      if (!l) { fail(`缺少挂件层 ${img}`); continue; }
+      const p = wp.scene.layers.find((x) => x.id === l.parentId);
+      if (!p || !p.puppet) { fail(`${img} 的父层不是 puppet`); continue; }
+      check(p.puppet.magic === "MDLV0023",
+        `${img} 的父 puppet 应是 MDLV0023（整图 sprite，不是 puppet-warp），实得 ${p.puppet.magic}`);
+      const bm = attachmentBind(p.puppet, att);
+      if (!bm) { fail(`${p.image} 缺附着点「${att}」`); continue; }
+      const exp = parentMeshToWorldDelta(p, bm[12], bm[13]);
+      check(hypot(exp[0], exp[1]) > 100,
+        `${img} 的附着点位移应 > 100px（否则判据无信息量），实得 ${hypot(exp[0], exp[1]).toFixed(1)}px`);
+      const got = l.attachBindDelta;
+      check(Array.isArray(got) && hypot(got[0] - exp[0], got[1] - exp[1]) < 1,
+        `${img} 挂件位移必须等于附着点位移 (${exp[0].toFixed(1)},${exp[1].toFixed(1)})，` +
+        `实得 ${Array.isArray(got) ? `(${got[0].toFixed(1)},${got[1].toFixed(1)})` : String(got)}` +
+        " —— atlasBind 把 MDLV0023 整图 sprite 误当 puppet-warp，位移被压成 0，" +
+        "整片后发停在装配前的位置（宽发帘消失）");
+    }
   }
 }
 
