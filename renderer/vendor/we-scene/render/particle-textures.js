@@ -144,6 +144,57 @@ function glow2(size, core, halo) {
 }
 
 /**
+ * 按**实测径向剖面**重建一张纯白径向贴图（alpha = 剖面值，RGB 恒 255）。
+ * `samples` = r = 0, 0.1, … 处的 alpha（0~1）；样本之间线性插值，r>1 取 0。
+ * 这是本仓复刻内置贴图的标准做法：**先量原版 `.tex`，再按数还原**（见 SKILL）。
+ */
+function radialProfile(size, samples) {
+  const rgba = new Uint8Array(size * size * 4)
+  const half = size / 2
+  const n = samples.length - 1
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = Math.hypot(x + 0.5 - half, y + 0.5 - half) / half
+      let a = 0
+      if (d < 1) {
+        const t = d * n
+        const i = Math.min(n - 1, Math.floor(t))
+        a = samples[i] + (samples[i + 1] - samples[i]) * (t - i)
+      }
+      writeWhite(rgba, (y * size + x) * 4, a)
+    }
+  }
+  return { width: size, height: size, rgba }
+}
+
+/**
+ * xray 的**开窗形状**（原版素材 `particle/halo_6`）。
+ *
+ * 原版实测（128²、format 0、RGB 恒 255、形状全在 alpha；径向 r = d/(size/2)）：
+ *   a(r) = 255 255 255 255 255 255 248 193 83 18 1  @ r = 0.0…1.0（步长 0.1）
+ * 即**一片实心盘**（r ≤ 0.6 满亮）+ 一圈平滑软边（0.6→1.0 收到 0），
+ * 拟合为 `255 · (1 - smoothstep(0.6, 1.0, r))^1.6`（0.7→193✓ 0.8→82✓ 0.9→12≈18）。
+ *
+ * 旧实现是 `glow2`（高斯核 + 光晕）：a = 255/181/68/28/16/9/5/2/1… —— 中心一个小亮点。
+ * xray 的 frag 是 `blend *= sample.r * sample.a`，于是程序化素材下**整个开窗变成中心小亮斑**，
+ * 而原版素材是一整片均匀透亮的圆窗 —— 14 个 xray 壁纸（1368497013 / 1586038665 / …）
+ * 在两种素材下完全两个样子。
+ */
+function haloWindow(size) {
+  const rgba = new Uint8Array(size * size * 4)
+  const half = size / 2
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = Math.hypot(x + 0.5 - half, y + 0.5 - half) / half
+      const t = Math.min(1, Math.max(0, (d - 0.6) / 0.4))
+      const sm = t * t * (3 - 2 * t)
+      writeWhite(rgba, (y * size + x) * 4, Math.pow(1 - sm, 1.6))
+    }
+  }
+  return { width: size, height: size, rgba }
+}
+
+/**
  * 解析尖星（@sparkle / @star / flare / 星类兜底）。
  * 尖峰 = 角向高斯（cos(points·θ) 的幂把 θ 空间切成 points 个瓣）× 径向高斯，
  * 全程 C∞，彻底取代旧多边形顶点法的锯齿。coreR 为中心亮斑宽度，len 为瓣长。
@@ -1114,12 +1165,11 @@ function flareAnamorphic(size) {
 // 生成尺寸 = 原生尺寸 × 2（原生尺寸取自 git 历史的素材表；上限 512）。
 const BUILDERS = {
   // --- A. 定向覆盖 ---
-  // [we-scene patch] halo_6 必须程序化，**不能用素材表那张**。
-  // 它在全库只被 2 个壁纸引用，且两个都是 xray 的「开窗精灵」（g_Texture2），
-  // 不是普通粒子 —— frag 用 `blend *= sample.r * sample.a` 把它当**窗口的形状**，
-  // 所以中心必须最亮、往外单调衰减，否则窗口正中心反而是暗的。
-  // glow2 双叶都中心对称且单调递减，满足「中心最亮」；core 0.14 保证峰值贴满 1.0。
-  'particle/halo_6': () => glow2(256, { r: 0.14, w: 1 }, { r: 0.4, w: 0.17 }),
+  // [we-scene patch] halo_6 = xray 的「开窗精灵」（g_Texture2），全库只被 xray 壁纸引用。
+  // frag 用 `blend *= sample.r * sample.a` 把它当**窗口的形状**，所以必须按原版素材的
+  // 实心盘+软边剖面（见 haloWindow 注释），不能用软光斑 —— 否则程序化素材下整个窗口
+  // 塌成中心一个小亮点。
+  'particle/halo_6': () => haloWindow(128),
 
   // 法线贴图：官方 Refract / Lighting 开了才出现（Particle Component - General）。
   // 形状从配对反照率的 alpha 做高度图；DecompressNormal 吃 tex.xy，故写成标准 RGB 法线。
@@ -1159,7 +1209,13 @@ const BUILDERS = {
 
   // --- B. 原 CC0 素材键的程序化替身（生成尺寸 = 原生 ×2） ---
   // halo 家族（原生 128 → 256）：双叶高斯，由紧到松；halo_3/halo_5 加实心芯
-  'particle/halo': () => glow2(256, { r: 0.12, w: 1 }, { r: 0.3, w: 0.15 }),
+  // [we-scene patch] particle/halo 是 1 个 xray 壁纸（2131872317? 见 SKILL）的 g_Texture2 默认，
+  // 也是全库最常用的粒子精灵之一。原版 halo.tex（64²、RGB 恒 255）实测径向剖面
+  //   a = 234 225 201 164 119 75 41 19 8 3 1 @ r=0.0…1.0
+  // ≈ 234·exp(-(r/0.47)²)（很宽的软晕，σ≈0.47）。旧实现 glow2(0.12/0.3) 的 σ≈0.15 窄 3 倍，
+  // 程序化素材下光斑小一圈 —— xray 窗口同样塌成小点。
+  'particle/halo': () =>
+    radialProfile(256, [234, 225, 201, 164, 119, 75, 41, 19, 8, 3, 1].map((v) => v / 255)),
   'particle/halo_1': () => glow2(256, { r: 0.1, w: 1 }, { r: 0.3, w: 0.13 }),
   'particle/halo_2': () => glow2(256, { r: 0.2, w: 0.9 }, { r: 0.44, w: 0.2 }),
   'particle/halo_3': () => glowN(256, [{ r: 0.045, w: 1 }, { r: 0.13, w: 0.85 }, { r: 0.36, w: 0.15 }]),
