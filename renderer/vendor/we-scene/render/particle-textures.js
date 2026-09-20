@@ -590,6 +590,44 @@ export function builtinParticleFrames(name) {
     }
     return list
   }
+  // splash_1 / ripple_single / fog2 / fog3 / rain_drops_sheet：四张「中心点 + 环」图集与
+  // 水滴图集都是原版的 TEXS 布局（splash_1 8×8/64、ripple_single 7×2/14、fog2/fog3 8×8/64、
+  // rain_drops_sheet 4×4/16）。引用方 `sequencemultiplier` 是 null（引擎默认 1.0）或
+  // `randomframe`，不给帧表就只剩静止的一帧。
+  {
+    const spec = RING_SHEETS[name]
+    if (spec) return sheetFrames(spec.cols, spec.fw, spec.fh, spec.frames)
+    if (name === 'particle/water/rain_drops_sheet') return sheetFrames(4, 64, 64, 16)
+  }
+  // fog1：原版 TEXS 64 帧 128²（8×8 图集 1024²）。引用方 `sequencemultiplier` 是 null，
+  // 引擎默认 1.0（SceneCompiler 的 ParticleAnimationMode 只认 "randomframe" 为 RANDOMONE，
+  // 其余一律 SEQUENCE）→ 每颗粒子在自己的生命周期里放完 64 帧。不给帧表就是**完全静止**。
+  if (name === 'particle/fog/fog1') {
+    const list = []
+    for (let i = 0; i < FOG_ATLAS_FRAMES; i++) {
+      list.push({
+        x: (i % 8) * FOG_FRAME,
+        y: ((i / 8) | 0) * FOG_FRAME,
+        width: FOG_FRAME,
+        height: FOG_FRAME,
+      })
+    }
+    return list
+  }
+  // 烟（particle/smoke/*）：官方 smoke1/smoke2/smoke2light 都是**图集**（见 smokePuffAtlas 注释）。不给帧表时渲染端按
+  // 引用方的 `sequencemultiplier: 2` 猜 2×2 → 每颗精灵只采到四分之一的团絮（碎条）。
+  if (name === 'particle/smoke/smoke2' || name === 'particle/smoke/smoke2light') {
+    const list = []
+    for (let i = 0; i < SMOKE_ATLAS_FRAMES; i++) {
+      list.push({
+        x: (i % 8) * SMOKE_FRAME,
+        y: ((i / 8) | 0) * SMOKE_FRAME,
+        width: SMOKE_FRAME,
+        height: SMOKE_FRAME,
+      })
+    }
+    return list
+  }
   // 叶片 3×3 图集（leaf() 与引用方 sequencemultiplier:3 对应）
   if (/^particle\/nature\/leaves\d*$/.test(name)) {
     const list = []
@@ -858,11 +896,19 @@ function windCircle(size) {
  * 的 GLSL 分支）：粒子槽拿到的贴图常常不是 RGBA8，而是单/双通道掩码 ——
  *   R8 / R16F      → `vec4(1, 1, 1, r)`   形状在 **R**，rgb 补白；
  *   RG88 / RG1616F → `vec4(r, r, r, g)`   形状在 **G**，rgb 用 R。
- * 我们的解码器把 R8 展开成 (r,r,r,**255**)、RG88 展开成 (G,G,G,R)，直接喂粒子 shader
- * （用 `t.a` 当形状）就得到**实心方块**或**取错通道**的精灵。本机接入 WE 原版素材后
- * 这个差距立刻显形：`particle/nature/rain1`(R8)、`particle/fog/fog1`(R8)、
- * `particle/water/rain_drops_sheet`(RG88)、`particle/light/light_shafts_0`(RG88)
- * 全是这种格式。这里把它们**烘成 WE 取样后的 RGBA**，粒子路径按普通 RGBA 上传即可。
+ *
+ * 抽样语义必须对着**解码器实际给出的通道**换算，否则会静默取错通道：
+ * 我们的 `tex-codecs.js::fromRG88` 按 RePKG/ImageSharp 的约定解码（灰度 = 第二字节 G、
+ * alpha = 第一字节 R），即解码后 `rgba = (fileG, fileG, fileG, fileR)`。而 WE 是把
+ * GL_RG 采到的 `_sample.rg`（= fileR、fileG）写成 `vec4(_sample.r, …, _sample.g)`
+ * —— 也就是说 **WE 的 rgb 来自解码器的 alpha 通道、WE 的 alpha 来自解码器的 rgb 通道**。
+ * 旧实现写的是 `rgb = src[0]`、`alpha = src[1]`（两路都取到 fileG = 形状），
+ * 于是 RGB 变成「形状灰度」而不是官方那条近乎常量的白 —— 半透明混合下
+ * `rgb × alpha` 从 shape¹ 掉成 shape²，外圈软晕整体暗掉（smoke2 的 R 通道实测 234.8/255
+ * 近常量，不是形状；`particle/light/light_shafts_*` 的 R 通道是 255 常量）。
+ * 判据 verify-textures【官方素材纹理格式语义】用**真解码数组**（(G,G,G,R) 布局）锁这条。
+ *
+ * 这里把它们**烘成 WE 取样后的 RGBA**，粒子路径按普通 RGBA 上传即可。
  * 只给粒子路径用：效果链槽位另有 rg88（GL_RG 上传 + flowChannels/maskChannel）的约定。
  */
 export function convertParticleTexFormat(pixel, format) {
@@ -873,7 +919,7 @@ export function convertParticleTexFormat(pixel, format) {
   const out = new Uint8Array(n * 4)
   const src = pixel.rgba
   if (f === 9 || f === 11) {
-    // R8 / R16F：rgb = 白，alpha = R
+    // R8 / R16F：rgb = 白，alpha = fileR（解码器把 fileR 铺进 rgb 三通道，alpha 恒 255）
     for (let i = 0; i < n; i++) {
       out[i * 4] = 255
       out[i * 4 + 1] = 255
@@ -881,14 +927,14 @@ export function convertParticleTexFormat(pixel, format) {
       out[i * 4 + 3] = src[i * 4]
     }
   } else {
-    // RG88 / RG1616F：rgb = R，alpha = G
+    // RG88 / RG1616F：rgb = fileR（解码器的 alpha 通道），alpha = fileG（解码器的 rgb 通道）
     for (let i = 0; i < n; i++) {
-      const r = src[i * 4]
-      const g = src[i * 4 + 1]
-      out[i * 4] = r
-      out[i * 4 + 1] = r
-      out[i * 4 + 2] = r
-      out[i * 4 + 3] = g
+      const fileR = src[i * 4 + 3]
+      const fileG = src[i * 4]
+      out[i * 4] = fileR
+      out[i * 4 + 1] = fileR
+      out[i * 4 + 2] = fileR
+      out[i * 4 + 3] = fileG
     }
   }
   return { width: pixel.width, height: pixel.height, rgba: out, format: f, frames: pixel.frames }
@@ -914,7 +960,7 @@ export function convertParticleNormalFormat(pixel, format) {
   return { width: pixel.width, height: pixel.height, rgba: out, format: f, frames: pixel.frames }
 }
 
-function rgbaLooksLikeAlbedo(rgba) {
+export function rgbaLooksLikeAlbedo(rgba) {
   if (!rgba || rgba.length < 16) return false
   const n = rgba.length / 4
   const step = Math.max(1, (n / 48) | 0)
@@ -928,6 +974,31 @@ function rgbaLooksLikeAlbedo(rgba) {
 }
 
 /** 槽 1 若拿到的是反照率（白 RGB、形状在 A），转成法线。DXT5nm / 标准法线原样返回。 */
+/**
+ * [we-scene patch] 法线贴图是不是 **WE 原生打包布局**。
+ *
+ * 官方 `common_fragment.h::DecompressNormalWithMask` 对非 RG88 的法线一律做
+ * `normal.xw = normal.wx`（x ← 原 A 通道），蒙版取 `normal.a`（= 原 R 通道）：
+ *   · DXT5nm（TEX1FORMAT=4）：x 在 A、y 在 G、**蒙版在 R**（0.965 的缩放差异 2% 量级）；
+ *   · RGBA8888（=0，如 `particle/water/rain_drops_sheet_normal`）：同上，x 在 A、蒙版在 R。
+ * 我们自己的生成器（`heightToNormal`）与 RG88 转换结果都是 **(x,y,z,255)** —— x 在 R、alpha 恒 255。
+ * 两者的区别在 alpha：官方打包法线的 A 是 x 分量（约 128，**明显不等于 255**），
+ * 我们的 A 恒 255。按这一点在**贴图层**判一次（比逐像素启发式稳），结果随贴图带给着色器。
+ */
+export function isPackedNormalTexture(pixel) {
+  if (!pixel || !pixel.rgba || !pixel.rgba.length) return false
+  const n = pixel.rgba.length / 4
+  const step = Math.max(1, (n / 96) | 0)
+  let seen = 0
+  let varying = 0
+  for (let i = 0; i < n; i += step) {
+    const a = pixel.rgba[i * 4 + 3]
+    seen++
+    if (a < 250) varying++
+  }
+  return seen > 0 && varying / seen > 0.2
+}
+
 export function prepareParticleNormalTexture(tex) {
   if (!tex || !tex.rgba) return tex
   return rgbaLooksLikeAlbedo(tex.rgba) ? heightToNormal(tex, 2.8) : tex
@@ -1020,7 +1091,66 @@ function makeFbm(freq, oct, seed) {
   }
 }
 
-function bilinearResize(tex, w2, h2) {
+// 3D 值噪声 fBm：x/y/z 三轴都按格点取模 → 贴图在 uv 上无缝、在时间轴上**精确循环**
+// （w=1 时每个倍频程的 z 恰好走完整数格）。雾这类「快速翻滚」的图集需要真正的形变，
+// 2D 噪声的平移/混合做不到「lag32 相关性 0.32 但接缝与相邻帧同量级」。
+// 每倍频程的 z 相位错开（oz）：否则各倍频程会在 w=0.5 同时回到格点 → 帧 0 与帧 32 全等。
+// ampFall 控制倍频程衰减：0.55 是常规 fBm（大尺度主导），0.8 更接近原版雾的细丝感。
+function makeFbm3(freq, oct, seed, zCells, ampFall) {
+  const fall = ampFall === undefined ? 0.55 : ampFall
+  const rnd = mulberry32(seed * 7919 + 17)
+  const lats = []
+  let f = freq
+  let zf = zCells
+  for (let o = 0; o < oct; o++) {
+    const n = f * f * zf
+    const g = new Float32Array(n)
+    for (let i = 0; i < n; i++) g[i] = rnd()
+    lats.push({ f, zf, g, ox: o * 7.31, oy: o * 3.17, oz: o * 0.379 + 0.123 })
+    f *= 2
+    zf *= 2
+  }
+  const at = (l, ix, iy, iz) => {
+    const xa = ((ix % l.f) + l.f) % l.f
+    const ya = ((iy % l.f) + l.f) % l.f
+    const za = ((iz % l.zf) + l.zf) % l.zf
+    return l.g[(za * l.f + ya) * l.f + xa]
+  }
+  const layer = (l, u, v, z) => {
+    const fx = (u + l.ox) * l.f
+    const fy = (v + l.oy) * l.f
+    const fz = z + l.oz
+    const x0 = Math.floor(fx)
+    const y0 = Math.floor(fy)
+    const z0 = Math.floor(fz)
+    const dx = fx - x0
+    const dy = fy - y0
+    const dz = fz - z0
+    const tx = smooth5(dx)
+    const ty = smooth5(dy)
+    const tz = smooth5(dz)
+    const c00 = lerp(at(l, x0, y0, z0), at(l, x0 + 1, y0, z0), tx)
+    const c10 = lerp(at(l, x0, y0 + 1, z0), at(l, x0 + 1, y0 + 1, z0), tx)
+    const c01 = lerp(at(l, x0, y0, z0 + 1), at(l, x0 + 1, y0, z0 + 1), tx)
+    const c11 = lerp(at(l, x0, y0 + 1, z0 + 1), at(l, x0 + 1, y0 + 1, z0 + 1), tx)
+    return lerp(lerp(c00, c10, ty), lerp(c01, c11, ty), tz)
+  }
+  return function fbm3(u, v, w, octLimit) {
+    const n = octLimit == null ? lats.length : Math.min(octLimit, lats.length)
+    let amp = 1
+    let sum = 0
+    let norm = 0
+    for (let i = 0; i < n; i++) {
+      // 每个倍频程的 z 采样周期 = 自身的 zf → w=1 时整体平移整数格，值精确回到 w=0
+      sum += layer(lats[i], u, v, w * lats[i].zf) * amp
+      norm += amp
+      amp *= fall
+    }
+    return sum / norm
+  }
+}
+
+export function bilinearResize(tex, w2, h2) {
   const { width: w, height: h, rgba } = tex
   if (w === w2 && h === h2) return tex
   const out = new Uint8Array(w2 * h2 * 4)
@@ -1435,6 +1565,561 @@ function flareAnamorphic(size) {
 }
 
 
+// ---------- 雾（particle/fog/*）：官方「湍流环」8×8 / 64 帧图集的程序化复刻 ----------
+//
+// [we-scene patch 2026-09-20] 1195626192 的底部雾气（`Fog 1`，图层 scale 10×1×1，additive）
+// 用 `particle/fog/fog1`；`convertParticleTexFormat` 之前把 RG88 取错通道只是顺带，
+// **主因和 smoke2 同型**：原版 fog1 是 R8、1024²、TEXS **64 帧 128²**，我们却是
+// 「单帧 512² 紧凑高斯窗」且 `builtinParticleFrames` 返回 null —— 引用方没写
+// `sequencemultiplier`（JSON 里是 null，引擎默认 1.0）→ 渲染端 frameCount=1，雾**完全静止**。
+//
+// 原版 fog1（R8；WE 取样 `vec4(1,1,1,r)` → rgb 恒白、形状进 alpha）实测统计：
+//   · 形态是「中间一个黑洞 + 一圈湍流细丝」而不是中心实心团：
+//     帧中心 r<0.15 均值 0.40×全帧、方向剖面在 d=0.3~0.5 才到峰值（0.21 水平 / 0.15 垂直 / 0.33 对角）；
+//   · 覆盖率 a>0.8/0.5/0.2/0.03 = 0.3 / 1.1 / 7.1 / 31.7%、全帧均值 5.0%（很淡的霾）；
+//   · 质心径向剖面（d=0…1）= 0.02 0.05 0.09 0.12 0.14 0.12 0.09 0.07 0.03 0.01 0.00；
+//   · 环带自相关 dx=2/4/8（128² 像素）= 0.80 / 0.61 / 0.30 → 细丝尺度 ≈ 0.06 帧宽；
+//   · 时间：同一 lag 在多个基准帧上平均 corr = 0.98(lag1) 0.84(4) 0.68(8) 0.46(16) 0.32(32)
+//     且左右对称（lag56 回 0.71、lag63 回 0.98）、相邻帧 Δ≈1.8/255 → **快速翻滚但精确循环**；
+//   · 四边框带 alpha 均值 0.25/255（团絮不压边）。
+// 旧实现（`fogNoise(512, 4, 5, 1, 0.4, 0.9, 210)`）是中心实心单团、均值 0.5% —— 形状、浓度、
+// 动画三样都不对。这里用 3D 值噪声（时间轴精确循环）+ 实测径向包络 + 阈值映射重建。
+const FOG_ATLAS_SIZE = 1024 // 8×8 × 128²，与官方 fog1 同布局
+const FOG_ATLAS_FRAMES = 64
+const FOG_FRAME = 128
+/** 官方 fog1 的质心径向剖面（11 档）→ 归一到峰值当包络（黑洞 + 湍流环） */
+const FOG1_RADIAL = [0.02, 0.05, 0.09, 0.12, 0.14, 0.12, 0.09, 0.07, 0.03, 0.01, 0]
+
+/** 官方 fog1 的同构生成器：3D 值噪声 + 实测径向包络 + 阈值映射 → 8×8/64 帧图集。
+ * 默认参数是按官方统计反解并锁定的（改一个就换一种雾；verify-textures 有断言）。
+ * rgb 恒白、形状进 alpha —— 与 `convertParticleTexFormat` 的 R8 分支同语义。 */
+function fogAtlas(opts) {
+  const o = opts || {}
+  const gen = o.gen === undefined ? FOG_FRAME >> 1 : o.gen
+  const frames = o.frames === undefined ? FOG_ATLAS_FRAMES : o.frames
+  const seed = o.seed === undefined ? 21 : o.seed
+  const freq = o.freq === undefined ? 9 : o.freq
+  const oct = o.oct === undefined ? 4 : o.oct
+  const ampFall = o.ampFall === undefined ? 0.8 : o.ampFall
+  const zCells = o.zCells === undefined ? 2 : o.zCells
+  const warp = o.warp === undefined ? 0.25 : o.warp
+  const thr = o.thr === undefined ? 0.62 : o.thr
+  const soft = o.soft === undefined ? 0.2 : o.soft
+  const gain = o.gain === undefined ? 0.85 : o.gain
+  const gamma = o.gamma === undefined ? 1.1 : o.gamma
+  const margin = o.margin === undefined ? 0.151 : o.margin
+  const envScale = o.envScale === undefined ? 0.925 : o.envScale
+  const radial = o.radial || FOG1_RADIAL
+  const fbm = makeFbm3(freq, oct, seed, zCells, ampFall)
+  const fbmW = makeFbm3(Math.max(2, Math.round(freq / 2)), 2, seed + 401, zCells, 0.55)
+  const peak = Math.max(...radial)
+  const env = radial.map((v) => v / peak)
+  const half = gen / 2
+  const size = o.size === undefined ? FOG_ATLAS_SIZE : o.size
+  const up = Math.max(1, Math.round(FOG_FRAME / gen))
+  const meta = { width: size, height: size, rgba: new Uint8Array(size * size * 4), frames: [] }
+  for (let i = 0; i < frames; i++) {
+    const t = i / frames
+    const fI = (i / 8) | 0
+    const cI = i % 8
+    const px0 = cI * FOG_FRAME
+    const py0 = fI * FOG_FRAME
+    for (let y = 0; y < gen; y++) {
+      for (let x = 0; x < gen; x++) {
+        const u = (x + 0.5) / gen
+        const v = (y + 0.5) / gen
+        const qx = fbmW(u, v, t) - 0.5
+        const qy = fbmW(u + 0.37, v + 0.11, t) - 0.5
+        const n = fbm(u + qx * warp, v + qy * warp, t)
+        const d = Math.hypot((x + 0.5 - half) / half, (y + 0.5 - half) / half)
+        // 径向包络：11 档线性插值（黑心 + 环）
+        const k = Math.min(10, Math.max(0, d * 10))
+        const ki = Math.min(9, Math.floor(k))
+        const e = (env[ki] + (env[ki + 1] - env[ki]) * (k - ki)) * envScale
+        const s = Math.min(1, Math.max(0, (n - (thr - soft)) / (2 * soft)))
+        let a = Math.min(1, Math.max(0, gain * e * s))
+        if (gamma !== 1) a = Math.pow(a, gamma)
+        const de = Math.min(x, y, gen - 1 - x, gen - 1 - y) / gen
+        if (de < margin) a *= smooth01(de / margin)
+        const av = Math.round(255 * a)
+        for (let sy = 0; sy < up; sy++) {
+          for (let sx = 0; sx < up; sx++) {
+            const off = ((py0 + y * up + sy) * size + px0 + x * up + sx) * 4
+            // R8 语义：rgb 恒白、形状进 alpha（与 convertParticleTexFormat 的 R8 分支一致）
+            meta.rgba[off] = 255
+            meta.rgba[off + 1] = 255
+            meta.rgba[off + 2] = 255
+            meta.rgba[off + 3] = av
+          }
+        }
+      }
+    }
+    meta.frames.push({ x: px0, y: py0, width: FOG_FRAME, height: FOG_FRAME })
+  }
+  return meta
+}
+
+// ---------- 水面 / 雾的「中心点 + 环」图集：splash_1 / ripple_single / fog2 / fog3 ----------
+//
+// [we-scene patch 2026-09-20] 这一族原版都是「逐帧推进的径向结构」：水花 = 中心点炸开成
+// 一圈碎片、涟漪 = 中心点扩散成细环（14 帧里跑两轮）、fog2 = 带小暗心的团（呼吸式胀缩）、
+// fog3 = 膨胀后消散的烟柱（首尾都接近 0，所以循环闭合）。四张全被 3801012392 引用
+// （splash_1 / ripple_single）或 fog2/fog3 各自 1~3 张壁纸引用。
+//
+// **这些原版全是图集**（splash_1 BC3 1024²/64 帧 128²；ripple_single RG88 224×64/14 帧 32²；
+// fog2/fog3 RG88 1024²/64 帧 128²），而我们的程序化版本既没有帧表（引用方
+// `sequencemultiplier` 一律 null → 引擎默认 1.0 → 本该按帧播完，我们 frameCount=1 全静止），
+// 形态也是随便回落到通用光晕/紧凑窗 fBm。
+//
+// 做法：把每帧的**质心径向剖面**用两个高斯拟合（本机原版实测反解）：
+//     p(d) = C·exp(-(d/0.12)²) + A·exp(-((d−R)/W)²)
+// 表就是每帧的 [A, R, W, C]（下面四张表由拟合工具从原版 .tex 反解，残差见注释）。
+// 逐像素再乘一层**均值保持**的 3D 噪声调制（`mod = 1 + k·(n^q/E[n^q] − 1)`，E[mod]=1）：
+// k 控制絮感、q 控制峰化（q>1 把 alpha 挤到噪声峰上 = 碎片化，水花要的就是这个）。
+// rgb 按各资产的实测通道关系写（fog2 的 fileR≈0.33+0.25a 是暗灰烟，fog3≈0.12+1.27a，
+// 水花/涟漪的 fileR 恒 1.0 → 白）。
+// fog/fog2：64 帧拟合残差 RMSE 均值 0.0402 / 最大 0.0613
+const FOG2_RINGS = [
+  [0.625,0.30,0.24,0.476], [0.618,0.30,0.24,0.484], [0.615,0.30,0.24,0.492], [0.613,0.30,0.24,0.501],
+  [0.617,0.30,0.24,0.540], [0.626,0.30,0.24,0.564], [0.640,0.30,0.24,0.557], [0.669,0.32,0.22,0.641],
+  [0.681,0.32,0.22,0.611], [0.699,0.32,0.22,0.590], [0.719,0.32,0.22,0.568], [0.735,0.32,0.22,0.548],
+  [0.747,0.32,0.22,0.540], [0.743,0.30,0.24,0.388], [0.731,0.30,0.26,0.272], [0.740,0.30,0.26,0.226],
+  [0.737,0.28,0.28,0.118], [0.730,0.28,0.30,0.013], [0.734,0.28,0.30,0.026], [0.735,0.26,0.32,0.000],
+  [0.735,0.26,0.32,0.008], [0.726,0.26,0.32,0.045], [0.707,0.24,0.34,0.036], [0.689,0.24,0.34,0.064],
+  [0.685,0.24,0.34,0.035], [0.688,0.24,0.34,0.000], [0.687,0.24,0.34,0.000], [0.684,0.26,0.32,0.009],
+  [0.703,0.26,0.30,0.000], [0.700,0.26,0.30,0.000], [0.706,0.28,0.28,0.000], [0.707,0.28,0.28,0.000],
+  [0.692,0.30,0.28,0.000], [0.686,0.30,0.28,0.000], [0.680,0.30,0.28,0.000], [0.674,0.30,0.28,0.000],
+  [0.669,0.30,0.28,0.000], [0.664,0.30,0.28,0.000], [0.661,0.30,0.28,0.000], [0.649,0.30,0.30,0.000],
+  [0.641,0.30,0.32,0.000], [0.673,0.28,0.30,0.000], [0.662,0.28,0.32,0.000], [0.684,0.26,0.32,0.000],
+  [0.694,0.26,0.32,0.000], [0.705,0.24,0.34,0.000], [0.717,0.24,0.34,0.008], [0.735,0.24,0.34,0.021],
+  [0.754,0.22,0.36,0.025], [0.743,0.24,0.36,0.135], [0.748,0.26,0.34,0.293], [0.745,0.26,0.36,0.328],
+  [0.733,0.28,0.34,0.445], [0.721,0.28,0.34,0.464], [0.705,0.28,0.34,0.475], [0.680,0.26,0.38,0.407],
+  [0.684,0.24,0.38,0.356], [0.681,0.22,0.40,0.266], [0.703,0.18,0.42,0.118], [0.725,0.14,0.44,0.000],
+  [0.711,0.16,0.40,0.000], [0.693,0.18,0.36,0.000], [0.677,0.20,0.32,0.000], [0.679,0.22,0.28,0.000],
+]
+
+// fog/fog3：64 帧拟合残差 RMSE 均值 0.0036 / 最大 0.01
+const FOG3_RINGS = [
+  [0.014,0.10,0.10,0.004], [0.018,0.14,0.08,0.013], [0.039,0.16,0.08,0.020], [0.055,0.16,0.06,0.029],
+  [0.060,0.18,0.08,0.038], [0.073,0.18,0.10,0.034], [0.076,0.18,0.12,0.035], [0.084,0.18,0.12,0.045],
+  [0.087,0.18,0.14,0.049], [0.096,0.18,0.14,0.043], [0.101,0.20,0.14,0.064], [0.113,0.22,0.12,0.090],
+  [0.118,0.22,0.12,0.098], [0.119,0.22,0.14,0.091], [0.124,0.22,0.14,0.102], [0.122,0.22,0.16,0.108],
+  [0.126,0.22,0.16,0.129], [0.129,0.22,0.16,0.153], [0.127,0.22,0.18,0.159], [0.126,0.24,0.18,0.178],
+  [0.128,0.24,0.18,0.183], [0.123,0.26,0.18,0.209], [0.118,0.26,0.20,0.207], [0.115,0.26,0.22,0.204],
+  [0.109,0.24,0.26,0.188], [0.109,0.22,0.30,0.161], [0.116,0.16,0.36,0.104], [0.124,0.10,0.42,0.074],
+  [0.148,0.00,0.48,0.023], [0.153,0.00,0.48,0.005], [0.147,0.02,0.48,0.002], [0.135,0.12,0.40,0.000],
+  [0.136,0.14,0.38,0.000], [0.139,0.14,0.36,0.000], [0.141,0.12,0.38,0.001], [0.147,0.12,0.36,0.000],
+  [0.144,0.16,0.32,0.000], [0.146,0.16,0.32,0.000], [0.135,0.22,0.26,0.072], [0.136,0.26,0.22,0.092],
+  [0.144,0.28,0.20,0.053], [0.139,0.28,0.22,0.012], [0.136,0.30,0.22,0.036], [0.134,0.30,0.22,0.036],
+  [0.128,0.30,0.22,0.027], [0.113,0.32,0.22,0.026], [0.097,0.32,0.22,0.015], [0.077,0.32,0.24,0.004],
+  [0.062,0.32,0.24,0.000], [0.049,0.32,0.24,0.001], [0.038,0.34,0.24,0.003], [0.028,0.34,0.26,0.000],
+  [0.021,0.34,0.26,0.002], [0.016,0.34,0.26,0.001], [0.011,0.34,0.26,0.001], [0.007,0.34,0.30,0.000],
+  [0.007,0.26,0.14,0.004], [0.016,0.00,0.06,0.011], [0.008,0.00,0.06,0.007], [0.002,0.28,0.12,0.001],
+  [0.001,0.28,0.10,0.000], [0.001,0.26,0.08,0.000], [0.000,0.26,0.10,0.000], [0.000,0.26,0.08,0.000],
+]
+
+// water/splash_1：64 帧拟合残差 RMSE 均值 0.0203 / 最大 0.044
+const SPLASH1_RINGS = [
+  [0.489,0.12,0.06,0.991], [0.661,0.08,0.10,0.651], [0.714,0.08,0.12,0.544], [0.583,0.14,0.08,0.978],
+  [0.568,0.14,0.10,0.918], [0.607,0.14,0.10,0.876], [0.616,0.16,0.10,0.898], [0.649,0.16,0.10,0.849],
+  [0.663,0.16,0.10,0.799], [0.641,0.16,0.12,0.658], [0.657,0.16,0.12,0.572], [0.686,0.14,0.14,0.321],
+  [0.664,0.14,0.16,0.217], [0.679,0.14,0.16,0.120], [0.695,0.14,0.16,0.051], [0.660,0.14,0.18,0.000],
+  [0.651,0.14,0.18,0.000], [0.592,0.16,0.18,0.036], [0.591,0.16,0.18,0.000], [0.542,0.18,0.18,0.019],
+  [0.529,0.18,0.18,0.016], [0.528,0.18,0.18,0.000], [0.513,0.18,0.18,0.000], [0.480,0.20,0.18,0.005],
+  [0.451,0.20,0.20,0.000], [0.452,0.20,0.18,0.000], [0.445,0.20,0.18,0.000], [0.407,0.22,0.20,0.000],
+  [0.394,0.22,0.20,0.000], [0.371,0.22,0.22,0.000], [0.345,0.24,0.22,0.000], [0.339,0.24,0.22,0.000],
+  [0.330,0.24,0.22,0.000], [0.314,0.26,0.22,0.000], [0.305,0.26,0.22,0.000], [0.290,0.26,0.24,0.000],
+  [0.291,0.26,0.22,0.000], [0.269,0.28,0.24,0.000], [0.261,0.28,0.24,0.000], [0.249,0.28,0.26,0.000],
+  [0.243,0.28,0.26,0.000], [0.235,0.30,0.26,0.000], [0.220,0.30,0.28,0.000], [0.232,0.30,0.24,0.000],
+  [0.207,0.32,0.28,0.000], [0.209,0.32,0.26,0.000], [0.196,0.32,0.28,0.000], [0.190,0.34,0.28,0.000],
+  [0.187,0.34,0.28,0.000], [0.176,0.34,0.30,0.000], [0.174,0.34,0.30,0.000], [0.174,0.36,0.28,0.000],
+  [0.164,0.36,0.30,0.000], [0.160,0.36,0.30,0.000], [0.155,0.38,0.30,0.000], [0.152,0.38,0.30,0.000],
+  [0.144,0.38,0.32,0.000], [0.141,0.38,0.32,0.000], [0.139,0.40,0.32,0.000], [0.136,0.40,0.32,0.000],
+  [0.131,0.40,0.34,0.000], [0.127,0.42,0.34,0.000], [0.125,0.42,0.34,0.000], [0.122,0.42,0.34,0.000],
+]
+
+// water/ripple_single：14 帧拟合残差 RMSE 均值 0.0295 / 最大 0.0891
+const RIPPLE_SINGLE_RINGS = [
+  [0.399,0.12,0.10,0.755], [0.782,0.16,0.10,0.878], [0.912,0.24,0.14,0.852], [0.704,0.24,0.24,0.457],
+  [0.706,0.38,0.22,0.173], [0.586,0.50,0.16,0.000], [0.444,0.60,0.12,0.136], [0.622,0.16,0.12,0.759],
+  [0.887,0.22,0.16,0.626], [0.807,0.36,0.10,0.000], [0.571,0.48,0.08,0.000], [0.451,0.56,0.06,0.000],
+  [0.141,0.64,0.08,0.000], [0.058,0.72,0.06,0.000],
+]
+
+
+/** 每帧 [A(环幅), R(环半径), W(环宽), C(中心点幅)] + 帧尺寸/排布 → 8×8 或 7×2 图集。
+ * 输出 rgb 由 `rgbOf(a)` 给（默认白），alpha 为形状。 */
+export function ringSheetAtlas(spec) {
+  const {
+    fw, fh, cols, frames, noise = 1, q = 1, gate = 0, gamma = 1, power = 1,
+    seed = 31, freq = 5, oct = 3, zCells = 2, ampFall = 0.6, margin = 0.05,
+    rgbOf, rows: rowsOf, gen: genOpt,
+  } = spec
+  const rowsN = Math.max(1, Math.ceil(frames / cols))
+  const size = { w: cols * fw, h: rowsN * fh }
+  const rgba = new Uint8Array(size.w * size.h * 4)
+  const fbm = makeFbm3(freq, oct, seed, zCells, ampFall)
+  const colorAt = rgbOf || (() => 255)
+  const meta = { width: size.w, height: size.h, rgba, frames: [] }
+  // 生成分辨率：128² 帧在 64² 上生成再整数倍放大（1M 像素 × 3D 噪声是首载卡顿主因）
+  const g = genOpt === undefined ? (fw > 64 ? fw >> 1 : fw) : genOpt
+  const gh = fh > 64 ? fh >> 1 : fh
+  const upX = Math.max(1, Math.round(fw / g))
+  const upY = Math.max(1, Math.round(fh / gh))
+  const n = new Float32Array(g * gh)
+  for (let i = 0; i < frames; i++) {
+    const [A, R, W, C] = rowsOf[i]
+    const t = i / frames
+    // 第一遍：算本帧的噪声场与 E[n^q]（保持均值的调制，不改变每帧平均浓度）
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < g; x++) {
+        const v = Math.max(0, fbm((x + 0.5) / g, (y + 0.5) / gh, t))
+        n[y * g + x] = v
+      }
+    }
+    const px0 = (i % cols) * fw
+    const py0 = ((i / cols) | 0) * fh
+    // 形状函数 f(目标剖面 × 调制)：power 压峰、gamma 提/压中间调 —— 都会改变每档半径的平均值，
+    // 所以最后按**半径档**把平均值拉回实测剖面（档内对比度保留）。这就是「分布对 + 剖面也对」
+    // 的关键：只按「全局均值保持」的调制会让低 alpha 铺太开（fog2 的 a>0.03 会到 48% 而原版 27%）。
+    const BINS = 11
+    const tgt = new Float64Array(BINS)
+    const got = new Float64Array(BINS)
+    const cntB = new Float64Array(BINS)
+    const shaped = new Float32Array(g * gh)
+    const binOf = (d) => Math.min(BINS - 1, Math.round(Math.min(1.2, d) * 10))
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < g; x++) {
+        const idx = y * g + x
+        const d = Math.hypot((x + 0.5 - g / 2) / (g / 2), (y + 0.5 - gh / 2) / (gh / 2))
+        const p = C * Math.exp(-((d / 0.12) ** 2)) + A * Math.exp(-(((d - R) / W) ** 2))
+        // 稀疏遮罩：n 低于门限的像素归零（团絮的洞），其余按幂次提亮；绝对尺度无关紧要
+        // —— 后面按半径档把平均值拉回实测剖面。门限**跟着目标浓度走**（浓度高的地方几乎全覆盖，
+        // 浓雾的芯不会被「覆盖率 × 亮度」的钳位削平；稀薄的外圈才是稀疏的絮）。
+        const gateEff = gate * (1 - Math.min(1, p))
+        const m = Math.pow(Math.max(0, (n[idx] - gateEff) / (1 - gateEff)), q)
+        const mod = 1 - noise + noise * m * 2.2
+        let v = p * mod
+        if (power !== 1) v = Math.pow(Math.max(0, v), power)
+        if (gamma !== 1) v = Math.pow(Math.min(1, Math.max(0, v)), gamma)
+        v = Math.min(1, Math.max(0, v))
+        shaped[idx] = v
+        const k = binOf(d)
+        tgt[k] += Math.min(1, p)
+        got[k] += v
+        cntB[k]++
+      }
+    }
+    for (let k = 0; k < BINS; k++) {
+      if (cntB[k] > 0) { tgt[k] /= cntB[k]; got[k] /= cntB[k] }
+    }
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < g; x++) {
+        const idx = y * g + x
+        const d = Math.hypot((x + 0.5 - g / 2) / (g / 2), (y + 0.5 - gh / 2) / (gh / 2))
+        const k = binOf(d)
+        const kk = Math.abs(1.2 - d * 10) < 0.001 ? BINS - 1 : k
+        const want = tgt[kk] || tgt[BINS - 1]
+        const have = got[kk] || got[BINS - 1]
+        let a = have > 1e-6 ? shaped[idx] * (want / have) : shaped[idx]
+        const de = Math.min(x, y, g - 1 - x, gh - 1 - y) / g
+        if (de < margin) a *= smooth01(de / margin)
+        a = Math.min(1, Math.max(0, a))
+        const c = colorAt(a)
+        const av = Math.round(255 * a)
+        for (let sy = 0; sy < upY; sy++) {
+          for (let sx = 0; sx < upX; sx++) {
+            const off = ((py0 + y * upY + sy) * size.w + px0 + x * upX + sx) * 4
+            rgba[off] = c
+            rgba[off + 1] = c
+            rgba[off + 2] = c
+            rgba[off + 3] = av
+          }
+        }
+      }
+    }
+    meta.frames.push({ x: px0, y: py0, width: fw, height: fh })
+  }
+  return meta
+}
+
+/** 各资产的生成配置（帧尺寸/排布 + 噪声调制强度 + 颜色通道关系）。
+ * `rgbOf` 来自原版 fileR 通道按形状分桶的实测关系（见各注释里的均值/斜率）。 */
+export const RING_SHEETS = {
+  // 涟漪：RG88 224×64 = 7×2 / 14 帧 32²，fileR 恒 1.0（白）
+  'particle/water/ripple_single': {
+    fw: 32, fh: 32, cols: 7, frames: 14, rows: RIPPLE_SINGLE_RINGS,
+    noise: 0.35, q: 0.5, gate: 0.5, power: 1, gamma: 1, seed: 31, freq: 4, oct: 3, zCells: 4, ampFall: 0.6,
+  },
+  // 水花：BC3 1024² = 8×8 / 64 帧 128²，rgb 恒 1.0（白）；碎片化靠 q>1 + 幂次收紧
+  'particle/water/splash_1': {
+    fw: 128, fh: 128, cols: 8, frames: 64, rows: SPLASH1_RINGS,
+    noise: 1, q: 0.3, gate: 0.7, power: 1, gamma: 1, seed: 53, freq: 10, oct: 4, zCells: 6, ampFall: 0.78,
+    gen: 128,
+  },
+  // fog2：RG88，fileR ≈ 0.325 + 0.246a（暗灰烟）
+  'particle/fog/fog2': {
+    fw: 128, fh: 128, cols: 8, frames: 64, rows: FOG2_RINGS,
+    noise: 1, q: 0.8, gate: 0.7, power: 1, gamma: 1, seed: 61, freq: 5, oct: 4, zCells: 6, ampFall: 0.6,
+    rgbOf: (a) => Math.round(255 * Math.min(1, 0.325 + 0.246 * a)),
+  },
+  // fog3：RG88，fileR ≈ 0.116 + 1.274a（越浓越亮，实测分桶 0.196→0.833）
+  'particle/fog/fog3': {
+    fw: 128, fh: 128, cols: 8, frames: 64, rows: FOG3_RINGS,
+    noise: 1, q: 1.2, gate: 0.5, power: 1, gamma: 1, seed: 71, freq: 5, oct: 4, zCells: 12, ampFall: 0.6,
+    rgbOf: (a) => Math.round(255 * Math.min(1, 0.116 + 1.274 * a)),
+  },
+}
+
+/** 图集帧矩形表（top-down 像素矩形，与 TEXS 元素同构） */
+function sheetFrames(cols, fw, fh, count) {
+  const list = []
+  for (let i = 0; i < count; i++) list.push({ x: (i % cols) * fw, y: ((i / cols) | 0) * fh, width: fw, height: fh })
+  return list
+}
+
+// rain_drops_sheet：官方 RG88 256²、**4×4 / 16 帧 64²**，每帧一颗**硬边**（alpha 二值 0/1）
+// 多边形水滴，面积比 4.3%~23.3%（等效半径 0.23~0.55 半格），fileR≈1.0（白）。
+// 旧实现 dropSheet(256,512,2,4) 是 2×4 八格 + 无帧表 → 引用方 `randomframe` 只能取到
+// 同一颗、还被按 128² 格采样。这里逐格建多边形并按实测覆盖率归一面积。
+function dropBlobSheet(seed) {
+  const CELL = 64
+  const COLS = 4
+  const FRAMES = 16
+  const COVER = [23.27, 11.11, 14.31, 18.68, 6.93, 15.33, 8.42, 10.38, 17.43, 4.30, 16.92, 13.45, 16.58, 8.28, 22.31, 13.33]
+  const rnd = mulberry32((seed === undefined ? 47 : seed) * 7919 + 13)
+  const size = COLS * CELL
+  const rgba = new Uint8Array(size * size * 4)
+  const meta = { width: size, height: size, rgba, frames: [] }
+  for (let i = 0; i < FRAMES; i++) {
+    const verts = 5 + ((rnd() * 3) | 0)
+    const rot = rnd() * Math.PI * 2
+    const jitter = []
+    for (let k = 0; k < verts; k++) jitter.push(0.78 + 0.44 * rnd())
+    // 归一：先按单位半径建多边形，量面积 → 反解出命中目标覆盖率的半径
+    const area = (scale) => {
+      let hit = 0
+      const pts = jitter.map((j, k) => {
+        const a = rot + (k / verts) * Math.PI * 2
+        return [Math.cos(a) * j * scale, Math.sin(a) * j * scale]
+      })
+      const inside = (px, py) => {
+        let c = false
+        for (let a = 0, b = pts.length - 1; a < pts.length; b = a++) {
+          const [ax, ay] = pts[a]
+          const [bx, by] = pts[b]
+          if ((ay > py) !== (by > py) && px < ((bx - ax) * (py - ay)) / (by - ay) + ax) c = !c
+        }
+        return c
+      }
+      for (let y = 0; y < CELL; y++) {
+        for (let x = 0; x < CELL; x++) {
+          if (inside(((x + 0.5 - CELL / 2) / (CELL / 2)), ((y + 0.5 - CELL / 2) / (CELL / 2)))) hit++
+        }
+      }
+      return hit / (CELL * CELL)
+    }
+    let lo = 0.05
+    let hi = 1.2
+    for (let it = 0; it < 22; it++) {
+      const mid = (lo + hi) / 2
+      if (area(mid) < COVER[i] / 100) lo = mid
+      else hi = mid
+    }
+    const scale = (lo + hi) / 2
+    const px0 = (i % COLS) * CELL
+    const py0 = ((i / COLS) | 0) * CELL
+    const pts = jitter.map((j, k) => {
+      const a = rot + (k / verts) * Math.PI * 2
+      return [Math.cos(a) * j * scale, Math.sin(a) * j * scale]
+    })
+    for (let y = 0; y < CELL; y++) {
+      for (let x = 0; x < CELL; x++) {
+        const ux = (x + 0.5 - CELL / 2) / (CELL / 2)
+        const uy = (y + 0.5 - CELL / 2) / (CELL / 2)
+        let c = false
+        for (let a = 0, b = pts.length - 1; a < pts.length; b = a++) {
+          const [ax, ay] = pts[a]
+          const [bx, by] = pts[b]
+          if ((ay > uy) !== (by > uy) && ux < ((bx - ax) * (uy - ay)) / (by - ay) + ax) c = !c
+        }
+        const off = ((py0 + y) * size + px0 + x) * 4
+        rgba[off] = 255
+        rgba[off + 1] = 255
+        rgba[off + 2] = 255
+        rgba[off + 3] = c ? 255 : 0
+      }
+    }
+    meta.frames.push({ x: px0, y: py0, width: CELL, height: CELL })
+  }
+  return meta
+}
+
+// ---------- 烟（particle/smoke/*）：官方「圆瓣团絮」8×8 / 64 帧图集的程序化复刻 ----------
+//
+// [we-scene patch 2026-09-20] 旧实现把 smoke2 当「单帧 512² fBm + 紧凑高斯窗」出图：
+// 粒子端拿不到帧表，只能按引用方的 `sequencemultiplier: 2` 猜 2×2 方格 —— 每颗精灵
+// 采到的是那团噪声的**四分之一**（画面里是碎条/楔形），且形状只占 quad 中心 ~30%，
+// 整体 alpha 只剩官方的 ~1/100。2031502939 实测：官方 smoke 系统对画面贡献 0.90/255，
+// 程序化 0.008/255 —— 用户报「烟雾粒子和原版素材效果差距很大」就是这个。
+//
+// 原版 smoke2.tex 的实测统计（本机 assets，RG88、1024²、TEXS 64 帧 128²）：
+//   · 形状在**文件 G 通道**（WE 取样 `_sample.rrrg` → 进 alpha），文件 R ≈ 0.87~0.97 近常量；
+//   · 形状均值 45.8%；a>0.8 / >0.5 / >0.2 / >0.03 覆盖率 = 34.4 / 47.9 / 59.3 / 67.5%；
+//   · 质心径向剖面（d=0…1，11 档）= 0.96 0.96 0.96 0.95 0.93 0.89 0.78 0.59 0.39 0.22 0.07；
+//   · 外圈自相关（dx = 0.0625 / 0.125 帧宽）= 0.67 / 0.39 → 瓣的尺度 ≈ 0.1 帧宽；
+//   · 时间自相关 lag8/16/32 = 0.950 / 0.902 / 0.862、相邻帧 |Δ| = 2.9/255 → **缓慢形变**；
+//   · 四边框带 alpha 均值 0.9/255 → 团絮不压边（quad 直边不可见）。
+//
+// 形态学：原版是「十几个~几十个圆斑叠成的一团 + 一圈软晕」，不是 fBm 等值线
+// （等值线的边界是折线，看起来是锯齿块而不是圆瓣）。这里用「圆斑密度场 + 全局色调映射」。
+// 所有运动量（摆位 move / 半径呼吸 pulse / 自转 spin / 细节平移）都以帧数为周期 → 精确循环。
+const SMOKE_ATLAS_SIZE = 1024 // 8×8 × 128²，与官方 smoke2 同布局
+const SMOKE_ATLAS_FRAMES = 64
+const SMOKE_FRAME = 128
+
+/** 圆斑密度场：返回 frames × gen² 的 Float32Array（gen = 去程分辨率，图集帧尺寸的一半） */
+function smokeDensityField(opts) {
+  const {
+    gen = SMOKE_FRAME >> 1, frames = SMOKE_ATLAS_FRAMES, seed = 11,
+    puffs = 81, spread = 0.73, sMin = 0.044, sMax = 0.15, ampMin = 0.4, ampMax = 1,
+    coreAmp = 0.64, coreS = 0.225, lobeBias = 1.7,
+    hazes = 8, hazeAmp = 0.162, hazeSMin = 0.175, hazeSMax = 0.31, hazeSpread = 0.33,
+    move = 0.06, pulse = 0.41, spin = 0,
+  } = opts
+  const rnd = mulberry32(seed * 7919 + 101)
+  const half = gen / 2
+  const ps = []
+  for (let i = 0; i < puffs + hazes; i++) {
+    const haze = i >= puffs
+    // sqrt 分布（面积均匀）；lobeBias 把更多圆斑推到外圈当「瓣」
+    const rr = (haze ? hazeSpread : spread) * Math.pow(rnd(), 1 / (2 * (haze ? 1 : lobeBias)))
+    const th = rnd() * Math.PI * 2
+    const s = haze
+      ? hazeSMin + (hazeSMax - hazeSMin) * rnd()
+      : sMin + (sMax - sMin) * rnd()
+    const amp = haze
+      ? hazeAmp * (0.6 + 0.8 * rnd())
+      : ampMin + (ampMax - ampMin) * rnd()
+    ps.push({
+      cx: rr * Math.cos(th), cy: rr * Math.sin(th), s, amp,
+      ph: rnd() * Math.PI * 2,
+      r1: 1 + ((rnd() * 2) | 0), r2: 1 + ((rnd() * 3) | 0), w: rnd() * Math.PI * 2,
+    })
+  }
+  const out = new Float32Array(frames * gen * gen)
+  const TAU = Math.PI * 2
+  const spinTurns = Math.round(spin) // 非整数圈会在末帧留缝（帧 63 → 帧 0 跳变）
+  for (let i = 0; i < frames; i++) {
+    const t = i / frames
+    const ang = TAU * t
+    const ca = Math.cos(spinTurns * ang)
+    const sa = Math.sin(spinTurns * ang)
+    const base = i * gen * gen
+    for (const p of ps) {
+      const cx = half + (p.cx * ca - p.cy * sa + move * Math.cos(p.r1 * ang + p.ph)) * half
+      const cy = half + (p.cx * sa + p.cy * ca + move * Math.sin(p.r1 * ang + p.ph)) * half
+      const S = p.s * (1 + pulse * 0.5 * Math.sin(p.r2 * ang + p.w)) * half
+      const A = p.amp * (1 + pulse * 0.4 * Math.sin(p.r2 * ang + p.w + 1.7))
+      const cut = 2.4 * S
+      const x0 = Math.max(0, Math.floor(cx - cut))
+      const x1 = Math.min(gen - 1, Math.ceil(cx + cut))
+      const y0 = Math.max(0, Math.floor(cy - cut))
+      const y1 = Math.min(gen - 1, Math.ceil(cy + cut))
+      const inv = 1 / (S * S)
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const dx = x + 0.5 - cx
+          const dy = y + 0.5 - cy
+          const t2 = (dx * dx + dy * dy) * inv
+          if (t2 > 5.76) continue
+          out[base + y * gen + x] += A * Math.exp(-t2)
+        }
+      }
+    }
+    // 中心大团（让核心实心）+ 缓慢平移的细絮（细节层）
+    for (let y = 0; y < gen; y++) {
+      for (let x = 0; x < gen; x++) {
+        const dx = (x + 0.5 - half) / half
+        const dy = (y + 0.5 - half) / half
+        const d = Math.hypot(dx, dy)
+        out[base + y * gen + x] += coreAmp * Math.exp(-((d / coreS) ** 2))
+      }
+    }
+  }
+  return { out, gen, frames }
+}
+
+/**
+ * 官方 smoke2 / smoke2light 的图集（形状同源，只有「文件 R 通道」的颜色映射不同）。
+ * @param color 'smoke2' 近常量白烟；'light' 更暗更透（颜色随形状二次衰减）
+ * @param over 仅供离线标定 / 判据调参用（默认值就是锁定值）
+ */
+export function smokePuffAtlas(color, over) {
+  const o = over || {}
+  const gen = o.gen === undefined ? SMOKE_FRAME >> 1 : o.gen
+  const frames = SMOKE_ATLAS_FRAMES
+  // 细节层幅度/频率、色调映射指数与增益：按官方统计（覆盖率 34/48/59/68%、均值 45.8%、
+  // 径向剖面 0.96…0.07）反解后固定 —— 改这几个数会直接改变烟的浓淡，verify-particles 有断言
+  const detail = o.detail === undefined ? 0.048 : o.detail
+  const detailFreq = 5
+  const detailOct = 3
+  const detailDrift = 0.05
+  const detailSeed = 77
+  const gamma = o.gamma === undefined ? 0.838 : o.gamma
+  const gain = o.gain === undefined ? 1.238 : o.gain
+  const margin = o.margin === undefined ? 0.038 : o.margin
+  const seed = 11
+  const field = smokeDensityField({ gen, frames, seed, ...o })
+  const up = Math.max(1, Math.round(SMOKE_FRAME / gen)) // gen < 帧尺寸时按整数倍放大写进图集
+  const flow = makeFbm(detailFreq, detailOct, detailSeed)
+  const size = SMOKE_ATLAS_SIZE
+  const atlas = new Uint8Array(size * size * 4)
+  const meta = { width: size, height: size, rgba: atlas, frames: [] }
+  const TAU = Math.PI * 2
+  const D = field.out
+  for (let i = 0; i < frames; i++) {
+    const t = i / frames
+    const ox = detailDrift * Math.cos(TAU * t)
+    const oy = detailDrift * Math.sin(TAU * t)
+    const f = Math.min(7, (i / 8) | 0)
+    const c = i % 8
+    const px0 = c * SMOKE_FRAME
+    const py0 = f * SMOKE_FRAME
+    const base = i * gen * gen
+    for (let y = 0; y < gen; y++) {
+      for (let x = 0; x < gen; x++) {
+        const u = (x + 0.5) / gen
+        const v = (y + 0.5) / gen
+        const dens =
+          D[base + y * gen + x] + detail * (flow(u + ox, v + oy) - 0.5) * 2
+        let a = dens <= 0 ? 0 : Math.pow(Math.min(1, gain * dens), gamma)
+        // 贴边归零：官方四边框带 alpha 均值 0.9/255，quad 直边因此不可见（同款约束）
+        const de = Math.min(x, y, gen - 1 - x, gen - 1 - y) / gen
+        if (de < margin) a *= smooth01(de / margin)
+        // 帧内按 up 倍放大写进图集（gen = 64 → 帧 128；生成分辨率减半是首载成本的主要来源）
+        const lum =
+          color === 'light'
+            ? Math.min(1, 0.8 * Math.pow(a, 1.25))
+            : 0.865 + 0.108 * a
+        const rgb = Math.round(255 * lum)
+        const av = Math.round(255 * a)
+        for (let sy = 0; sy < up; sy++) {
+          for (let sx = 0; sx < up; sx++) {
+            const off = ((py0 + y * up + sy) * size + px0 + x * up + sx) * 4
+            atlas[off] = rgb
+            atlas[off + 1] = rgb
+            atlas[off + 2] = rgb
+            atlas[off + 3] = av
+          }
+        }
+      }
+    }
+    meta.frames.push({ x: px0, y: py0, width: SMOKE_FRAME, height: SMOKE_FRAME })
+  }
+  return meta
+}
+
 // 键为 WE 材质里的纹理名（去掉 materials/ 前缀与 .tex 后缀）。
 // 生成尺寸 = 原生尺寸 × 2（原生尺寸取自 git 历史的素材表；上限 512）。
 const BUILDERS = {
@@ -1452,7 +2137,10 @@ const BUILDERS = {
   'particle/drop_normal': () => heightToNormal(teardrop(128, 512), 3.4),
   'particle/normal_ring_smooth': () => heightToNormal(ring(256, 0.55, 0.12), 3.1),
   'particle/normal_pinch_rotate': () => heightToNormal(pinchHeight(256), 2.8),
-  'particle/water/rain_drops_sheet_normal': () => heightToNormal(dropSheet(256, 512, 2, 4), 3.6),
+  // [we-scene patch] 与反照率同源同布局：反照率已改成 dropBlobSheet（256²/4×4/16 帧硬边水滴），
+  // 法线也必须从**同一张图**出，否则 16 帧各自采样到旧 2×4 图集的随机位置 —— 折射的「透镜」
+  // 与水滴形状对不上（3801012392「雨和原版素材有细微差别」的一半根因）。
+  'particle/water/rain_drops_sheet_normal': () => heightToNormal(dropBlobSheet(), 3.6),
   'particle/bubbles/bubble1normal': () => heightToNormal(bubbleSheet(256, 1), 3.2),
   'particle/bubbles/bubble2_normal': () => heightToNormal(bubbleSheet(256, 2), 3.2),
   'particle/sharp_halo_normal': () => heightToNormal(glowN(256, [{ r: 0.035, w: 1 }, { r: 0.09, w: 0.45 }, { r: 0.22, w: 0.08 }]), 3.4),
@@ -1512,16 +2200,26 @@ const BUILDERS = {
   'particle/nature/rain1': () => rainSheet({ segments: 120, peakMax: 0.42, peakPow: 2.4 }),
   // rain2 本机原版素材缺失（WE 安装目录里没有），按同族关系取「更密更亮」的一档
   'particle/nature/rain2': () => rainSheet({ segments: 120, peakMax: 0.55, peakPow: 2.2 }),
-  // 雨滴 sheet（原生 128×256 → 256×512，2×4 格）：每格一颗上圆下尖小水滴
-  'particle/water/rain_drops_sheet': () => dropSheet(256, 512, 2, 4),
-  // 雾（原生 256 → 512）：絮状 fBm，弱遮罩铺满；三张不同尺度/种子
-  'particle/fog/fog1': () => fogNoise(512, 4, 5, 1, 0.4, 0.9, 210),
-  'particle/fog/fog2': () => fogNoise(512, 3, 5, 2, 0.45, 0.8, 200),
-  'particle/fog/fog3': () => fogNoise(512, 6, 4, 3, 0.36, 1, 210),
-  // 烟（原生 256 → 512）：同源 fBm 但遮罩更收（团絮感），smoke2light 降密度与峰值
+  // 雨滴 sheet：官方是 RG88 256²、**4×4 / 16 帧 64²** 的硬边多边形水滴（见 dropBlobSheet）。
+  // 旧实现是 2×4 八格 256×512 的软水滴 + 无帧表 → 引用方 randomframe 只能取到同一颗，
+  // 画面是「几千个一模一样的小白圆点」（3801012392）。
+  'particle/water/rain_drops_sheet': () => dropBlobSheet(),
+  // 水花 / 涟漪：同样是图集，见 RING_SHEETS
+  'particle/water/splash_1': () => ringSheetAtlas(RING_SHEETS['particle/water/splash_1']),
+  'particle/water/ripple_single': () => ringSheetAtlas(RING_SHEETS['particle/water/ripple_single']),
+  // 雾：官方 fog1..fog3 都是 1024²/TEXS 64 帧 128² 图集（见 fogAtlas 注释）。
+  // fog1 被 34 张壁纸引用，本次按实测统计重建（黑洞 + 湍流环、均值 5.0%、快速翻滚且精确循环）；
+  'particle/fog/fog1': () => fogAtlas(),
+  // fog2/fog3 与 splash_1 / ripple_single 同属「逐帧径向结构」一族：改用实测 [A,R,W,C] 表
+  'particle/fog/fog2': () => ringSheetAtlas(RING_SHEETS['particle/fog/fog2']),
+  'particle/fog/fog3': () => ringSheetAtlas(RING_SHEETS['particle/fog/fog3']),
+  // 烟：官方 smoke1/smoke2/smoke2light 都是**图集**（见 smokePuffAtlas 注释）。
+  // smoke2 被 12 张壁纸引用、smoke2light 2 张（2031502939 / 2857410102 …）—— 两者形状同源，
+  // 只有颜色映射不同。smoke1/smoke3/smoke4 本机库零引用（原版是「极淡的细丝」另一族），
+  // 暂不动，回退到 fogNoise 的老样子。
+  'particle/smoke/smoke2': () => smokePuffAtlas('smoke2'),
+  'particle/smoke/smoke2light': () => smokePuffAtlas('light'),
   'particle/smoke/smoke1': () => fogNoise(512, 3, 5, 7, 0.55, 1.5, 185),
-  'particle/smoke/smoke2': () => fogNoise(512, 2, 5, 11, 0.6, 1.7, 170),
-  'particle/smoke/smoke2light': () => fogNoise(512, 2, 5, 13, 0.4, 1.7, 155),
   // 环形波（原生 256 → 512）
   'particle/misc/wave': () => ring(512, 0.72, 0.085),
   'particle/misc/star_0': () => spikyStar(256, 5, 0.62, 8, 0.1),

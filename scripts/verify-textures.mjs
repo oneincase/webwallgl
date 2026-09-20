@@ -387,20 +387,273 @@ console.log("\n[5] 精灵硬边封印：软形状贴图外圈 alpha 必须严格
   // 法线豁免：alpha 是 REFRACT 蒙版
   const nrm = ptex.buildBuiltinParticleTexture("particle/drop_normal");
   check(nrm.rgba[3] > 0, "particle/drop_normal 必须豁免封边（法线 alpha 是折射蒙版）");
-  // 烟/雾紧凑窗：半径 0.75 外零 alpha，且不是稀到看不见
-  for (const n of ["particle/smoke/smoke2", "particle/fog/fog1"]) {
-    const t = ptex.buildBuiltinParticleTexture(n);
-    const W = t.width, rgba = t.rgba;
-    let outer = 0, mean = 0;
-    for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
-      const a = rgba[(y * W + x) * 4 + 3];
-      mean += a;
-      const d = Math.hypot(x + 0.5 - W / 2, y + 0.5 - W / 2) / (W / 2);
-      if (d > 0.75 && a > outer) outer = a;
+  // 雾图集：官方 fog1 是「黑洞 + 湍流环」的 8×8/64 帧图集（见 fogAtlas 注释）。
+  // 它**不是**紧凑窗单帧贴图：环在 d≈0.4 才到峰值，靠**每帧四边 alpha→0** 防方块边。
+  {
+    const OFFICIAL_RADIAL = [0.02, 0.05, 0.09, 0.12, 0.14, 0.12, 0.09, 0.07, 0.03, 0.01, 0];
+    const t = ptex.buildBuiltinParticleTexture("particle/fog/fog1");
+    const frames = t.frames && t.frames.length ? t.frames : ptex.builtinParticleFrames("particle/fog/fog1");
+    check(Array.isArray(frames) && frames.length === 64, `fog1 必须自带 64 帧帧表（实得 ${frames && frames.length}）`);
+    const fallback = ptex.builtinParticleFrames("particle/fog/fog1");
+    check(
+      Array.isArray(fallback) && fallback.length === 64 && fallback[9].x === 128 && fallback[9].y === 128,
+      `builtinParticleFrames 必须给出 fog1 的 8×8/64 帧兜底表（实得 ${fallback && fallback.length}）`,
+    );
+    check(t.width === 1024 && frames[0].width === 128, `fog1 图集应为 1024²/128² 帧（实得 ${t.width}/${frames[0].width}）`);
+    const FW = frames[0].width;
+    const A = (fi, x, y) => t.rgba[((frames[fi].y + y) * t.width + frames[fi].x + x) * 4 + 3] / 255;
+    let frameBorder = 0;
+    for (const f of frames) {
+      for (let i = 0; i < FW; i++) {
+        const pts = [[f.x + i, f.y], [f.x + i, f.y + FW - 1], [f.x, f.y + i], [f.x + FW - 1, f.y + i]];
+        for (const [x, y] of pts) frameBorder = Math.max(frameBorder, t.rgba[(y * t.width + x) * 4 + 3]);
+      }
     }
-    mean /= W * W;
-    check(outer === 0, `${n} 半径 0.75 外 alpha 必须为 0（方块裙边）`);
-    check(mean > 0.3 && mean < 12, `${n} 平均 alpha=${mean.toFixed(2)} 应在 0.3~12（过稀/过浓）`);
+    check(frameBorder <= 2, `fog1 每帧四边 alpha 必须 ≤2（防 quad 直边，实得 ${frameBorder}）`);
+    const frac = { a80: 0, a50: 0, a20: 0, a08: 0 };
+    let sum = 0, n = 0;
+    for (let f = 0; f < frames.length; f++) {
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+        const a = A(f, x, y); sum += a; n++;
+        if (a > 0.8) frac.a80++;
+        if (a > 0.5) frac.a50++;
+        if (a > 0.2) frac.a20++;
+        if (a > 0.03) frac.a08++;
+      }
+    }
+    const pct = (k) => (100 * frac[k]) / n;
+    check(pct("a20") > 4 && pct("a20") < 10, `fog1 a>0.2 覆盖率应≈7.1%（实得 ${pct("a20").toFixed(2)}）`);
+    check(pct("a08") > 24 && pct("a08") < 42, `fog1 a>0.03 覆盖率应≈31.7%（实得 ${pct("a08").toFixed(2)}）`);
+    check(Math.abs(sum / n - 0.05) < 0.015, `fog1 平均 alpha 应≈5.0%（实得 ${((100 * sum) / n).toFixed(2)}%）`);
+    const bins = new Array(11).fill(0), cnt = new Array(11).fill(0);
+    for (let f = 0; f < frames.length; f++) {
+      let cx = 0, cy = 0, cw = 0;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) if (A(f, x, y) > 0.03) { cx += x; cy += y; cw++; }
+      cx /= cw; cy /= cw;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+        const d = Math.hypot((x - cx) / (FW / 2), (y - cy) / (FW / 2));
+        const k = Math.min(10, Math.round(d * 10));
+        bins[k] += A(f, x, y); cnt[k]++;
+      }
+    }
+    const radial = bins.map((v, i) => v / cnt[i]);
+    const worst = Math.max(...radial.map((v, i) => Math.abs(v - OFFICIAL_RADIAL[i])));
+    check(worst < 0.04, `fog1 径向剖面须贴合官方（最大偏差 ${worst.toFixed(3)}）`);
+    // 黑心 + 环：中心必须明显低于环带峰值
+    check(radial[0] < radial[4] * 0.6, `fog1 必须是「黑心 + 环」（中心 ${radial[0].toFixed(3)} vs d=0.4 ${radial[4].toFixed(3)}）`);
+    // 时间：快速翻滚且**精确循环**（末帧→首帧与相邻帧同量级）
+    const madj = (a, b) => {
+      let s = 0;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) s += Math.abs(A(a, x, y) - A(b, x, y));
+      return (255 * s) / (FW * FW);
+    };
+    const dAdj = madj(0, 1), dSeam = madj(frames.length - 1, 0);
+    check(dAdj > 0.3 && dAdj < 6, `fog1 相邻帧 |Δ| 应≈1.8/255（实得 ${dAdj.toFixed(1)}）`);
+    check(dSeam < dAdj * 2.5, `fog1 末帧→首帧必须与相邻帧同量级（接缝 ${dSeam.toFixed(1)} vs 相邻 ${dAdj.toFixed(1)}）`);
+    // 同一个 lag 在多基准帧上的平均相关必须单调下降（0.98/0.84/0.68/0.46/0.32）
+    const corr = (b1, b2) => {
+      let m = 0, s1 = 0, s2 = 0, s11 = 0, s22 = 0, s12 = 0;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+        const u = A(b1, x, y), v = A(b2, x, y);
+        s1 += u; s2 += v; s11 += u * u; s22 += v * v; s12 += u * v; m++;
+      }
+      const m1 = s1 / m, m2 = s2 / m;
+      return (s12 / m - m1 * m2) / (Math.sqrt(s11 / m - m1 * m1) * Math.sqrt(s22 / m - m2 * m2));
+    };
+    const lagAvg = (l) => {
+      let cs = 0, k = 0;
+      for (let i = 0; i + l < frames.length; i += 8) { cs += corr(i, i + l); k++; }
+      return cs / k;
+    };
+    check(lagAvg(8) > 0.4 && lagAvg(8) < 0.85, `fog1 lag8 相关应≈0.68（实得 ${lagAvg(8).toFixed(3)}）`);
+    check(lagAvg(32) < lagAvg(8) - 0.1, `fog1 必须真的在翻滚（lag32 ${lagAvg(32).toFixed(3)} 应明显低于 lag8 ${lagAvg(8).toFixed(3)}）`);
+    check(t.rgba[0] === 255 && t.rgba[1] === 255 && t.rgba[2] === 255, "fog1 是 R8 语义：RGB 必须恒白（形状在 alpha）");
+  }
+
+  // ---------- 法线：WE 打包布局判定 + 与反照率同布局 ----------
+  // 官方 DecompressNormalWithMask 对非 RG88 法线做 `normal.xw = normal.wx`：x ← 原 A、蒙版 ← 原 R。
+  // 官方素材实测（本机原版，2026-09-20）：rain_drops_sheet_normal(RGBA8888) R=35/255 是水滴剪影、
+  // G=190、A=190；splash_1_normal(DXT5nm) R=11.8 是水花剪影、G=128、A=128 —— 都是「A 不是 255」。
+  // 我们自己的生成器与 RG88 转换结果是 (x,y,z,255)：A 恒 255。据此在贴图层判一次。
+  {
+    const px = (w, h, fn) => {
+      const rgba = new Uint8Array(w * h * 4)
+      for (let i = 0; i < w * h; i++) fn(rgba, i * 4)
+      return { width: w, height: h, rgba }
+    };
+    const packed = px(8, 8, (o, i) => { o[i] = 40; o[i + 1] = 190; o[i + 2] = 0; o[i + 3] = 190 });
+    check(ptex.isPackedNormalTexture(packed) === true, "A 非常量的法线必须判为 WE 打包布局（x 在 A、蒙版在 R）");
+    const ours = px(8, 8, (o, i) => { o[i] = 128; o[i + 1] = 127; o[i + 2] = 250; o[i + 3] = 255 });
+    check(ptex.isPackedNormalTexture(ours) === false, "我们生成的 (x,y,z,255) 法线不得判成 WE 打包");
+    check(ptex.isPackedNormalTexture(null) === false, "空贴图必须安全返回 false");
+    // 反照率与法线必须**同布局**：错位时一颗粒子会拿别的帧的法线去折射（3801012392）
+    const albedo = ptex.buildBuiltinParticleTexture("particle/water/rain_drops_sheet");
+    const nrm = ptex.buildBuiltinParticleTexture("particle/water/rain_drops_sheet_normal");
+    check(
+      nrm.width === albedo.width && nrm.height === albedo.height,
+      `rain_drops_sheet_normal 必须与反照率同画布（反照率 ${albedo.width}×${albedo.height}，法线 ${nrm.width}×${nrm.height}）`,
+    );
+    check(ptex.isPackedNormalTexture(nrm) === false, "程序化 rain_drops_sheet_normal 是我们自己的 (x,y,z,255) 布局");
+    const sp = ptex.buildBuiltinParticleTexture("particle/water/splash_1_normal");
+    const spl = ptex.buildBuiltinParticleTexture("particle/water/splash_1");
+    check(sp.width === spl.width && sp.height === spl.height, `splash_1_normal 必须与反照率同画布（法线 ${sp.width}×${sp.height}）`);
+  }
+
+  // ---------- 「中心点 + 环」图集与水滴图集：splash_1 / ripple_single / fog2 / fog3 / rain_drops_sheet ----------
+  // 五张都是原版图集（帧尺寸/排布见下），程序化复刻按**每帧实测径向剖面** [A,R,W,C] 重建
+  // （拟合残差见 particle-textures.js 各表注释），再乘均值保持的稀疏遮罩、最后按半径档把
+  // 平均值拉回实测剖面。判据锁的是「帧表 + 布局 + 形态统计」，不是像素相等。
+  {
+    const CASES = [
+      // name, 画布, 每帧, 帧数, [a80,a50,a20,a08] 容差, 均值, 均值容差
+      ["particle/water/rain_drops_sheet", 256, 64, 16, "binary", true],
+      ["particle/water/ripple_single", 224, 32, 14, "ring", true],
+      ["particle/water/splash_1", 1024, 128, 64, "ring", false],
+      ["particle/fog/fog2", 1024, 128, 64, "ring", true],
+      ["particle/fog/fog3", 1024, 128, 64, "ring", true],
+    ];
+    for (const [name, canvas, cell, count, kind, loops] of CASES) {
+      const t = ptex.buildBuiltinParticleTexture(name);
+      const frames = t.frames && t.frames.length ? t.frames : ptex.builtinParticleFrames(name);
+      check(Array.isArray(frames) && frames.length === count, `${name} 必须有 ${count} 帧帧表（实得 ${frames && frames.length}）`);
+      const canvasH = name === "particle/water/ripple_single" ? 64 : canvas;
+      check(t.width === canvas && t.height === canvasH, `${name} 图集应为 ${canvas}×${canvasH}（实得 ${t.width}×${t.height}）`);
+      check(frames[0].width === cell && frames[0].height === cell, `${name} 每帧应为 ${cell}²（实得 ${frames[0].width}²）`);
+      const fb = ptex.builtinParticleFrames(name);
+      check(Array.isArray(fb) && fb.length === count, `builtinParticleFrames 必须给出 ${name} 的兜底帧表`);
+      const FW = cell;
+      const A = (fi, x, y) => t.rgba[((frames[fi].y + y) * t.width + frames[fi].x + x) * 4 + 3] / 255;
+      // 每帧四边不得有实心内容（原版这几张的边框带都接近 0）
+      let bMax = 0;
+      for (const f of frames) {
+        for (let i = 0; i < FW; i++) {
+          const pts = [[f.x + i, f.y], [f.x + i, f.y + FW - 1], [f.x, f.y + i], [f.x + FW - 1, f.y + i]];
+          for (const [x, y] of pts) bMax = Math.max(bMax, t.rgba[(y * t.width + x) * 4 + 3]);
+        }
+      }
+      check(bMax <= 8, `${name} 每帧四边 alpha 必须接近 0（实得 ${bMax}）`);
+      const frac = { a80: 0, a50: 0, a20: 0, a08: 0 };
+      let sum = 0, n = 0;
+      for (let f = 0; f < frames.length; f++) {
+        for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+          const a = A(f, x, y); sum += a; n++;
+          if (a > 0.8) frac.a80++;
+          if (a > 0.5) frac.a50++;
+          if (a > 0.2) frac.a20++;
+          if (a > 0.03) frac.a08++;
+        }
+      }
+      const pct = (k) => (100 * frac[k]) / n;
+      const mean = (100 * sum) / n;
+      if (kind === "binary") {
+        // 水滴是**二值** alpha（原版 13.81% 的像素正好是 1，其余 0）
+        check(Math.abs(pct("a80") - 13.81) < 2 && Math.abs(pct("a08") - 13.81) < 2, `${name} 覆盖率应≈13.81%（实得 ${pct("a08").toFixed(2)}）`);
+        check(Math.abs(pct("a80") - pct("a08")) < 0.6, `${name} alpha 必须是二值（a>0.8 ${pct("a80").toFixed(2)} vs a>0.03 ${pct("a08").toFixed(2)}）`);
+        check(Math.abs(mean - 13.81) < 2, `${name} 均值应≈13.81%（实得 ${mean.toFixed(2)}）`);
+      } else {
+        const OFF = {
+          "particle/water/ripple_single": [1.42, 6.8, 12.51, 18.22, 7.23],
+          "particle/water/splash_1": [3.22, 4.5, 5.98, 7.31, 4.63],
+          "particle/fog/fog2": [10.09, 18.02, 23.33, 27.69, 16.85],
+          "particle/fog/fog3": [0, 0, 1.58, 10.91, 1.37],
+        }[name];
+        check(Math.abs(pct("a20") - OFF[2]) < Math.max(2.5, OFF[2] * 0.35), `${name} a>0.2 覆盖率应≈${OFF[2]}%（实得 ${pct("a20").toFixed(2)}）`);
+        check(Math.abs(pct("a08") - OFF[3]) < Math.max(3.5, OFF[3] * 0.35), `${name} a>0.03 覆盖率应≈${OFF[3]}%（实得 ${pct("a08").toFixed(2)}）`);
+        check(Math.abs(mean - OFF[4]) / OFF[4] < 0.15, `${name} 均值应≈${OFF[4]}%（实得 ${mean.toFixed(2)}）`);
+      }
+      // 逐帧推进必须真的存在（这些原版都是 SEQUENCE）：相邻帧差不得为 0
+      const madj = (a, b) => {
+        let d = 0;
+        for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) d += Math.abs(A(a, x, y) - A(b, x, y));
+        return (255 * d) / (FW * FW);
+      };
+      check(madj(0, 1) > 0.02, `${name} 相邻帧必须有变化（实得 ${madj(0, 1).toFixed(3)}，静止=没帧表）`);
+      if (kind !== "binary") {
+        if (loops) check(madj(frames.length - 1, 0) < Math.max(3, madj(0, 1) * 2.5), `${name} 末帧→首帧不得比相邻帧剧烈（接缝 ${madj(frames.length - 1, 0).toFixed(2)} vs 相邻 ${madj(0, 1).toFixed(2)}）`);
+        // splash_1 原版就是**不循环**的（接缝 16.26 vs 相邻 0.80）：每颗水花从中心炸开一次
+        else check(madj(frames.length - 1, 0) > 3, `${name} 原版是不循环的水花：末帧→首帧必须剧烈（实得 ${madj(frames.length - 1, 0).toFixed(2)}）`);
+      }
+    }
+  }
+
+  // ---------- 烟图集：官方 smoke2 的统计不变量（2031502939「烟雾和原版素材差距很大」） ----------
+  // 烟**不是**紧凑窗单帧贴图：官方是 1024² / 8×8 / 64 帧 128² 的「圆瓣团絮」图集，
+  // 团絮铺满整帧（r>0.75 仍有内容），靠**每帧四边 alpha→0** 保证 quad 直边不可见。
+  // 判据锁官方实测统计（不是像素相等）：覆盖率 a>0.8/0.5/0.2/0.03 = 34.4/47.9/59.3/67.5%、
+  // 均值 45.8/255、质心径向剖面 0.96 0.96 0.96 0.95 0.93 0.89 0.78 0.59 0.39 0.22 0.07、
+  // 相邻帧 |Δ|=2.9/255、帧 63→帧 0 接缝与相邻帧同量级（精确循环）、RGB 近常量白烟。
+  {
+    const OFFICIAL_RADIAL = [0.96, 0.96, 0.96, 0.95, 0.93, 0.89, 0.78, 0.59, 0.39, 0.22, 0.07];
+    const t = ptex.buildBuiltinParticleTexture("particle/smoke/smoke2");
+    const frames = t.frames && t.frames.length ? t.frames : ptex.builtinParticleFrames("particle/smoke/smoke2");
+    check(Array.isArray(frames) && frames.length === 64, `smoke2 必须自带 64 帧帧表（实得 ${frames && frames.length}）`);
+    // 兜底路径也要有：贴图对象不带帧表时（别的调用方直接问名字）必须仍给 8×8/64 帧
+    const fallback = ptex.builtinParticleFrames("particle/smoke/smoke2");
+    check(
+      Array.isArray(fallback) && fallback.length === 64 && fallback[0].width === 128 && fallback[9].x === 128 && fallback[9].y === 128,
+      `builtinParticleFrames 必须给出 smoke2 的 8×8/64 帧兜底表（实得 ${fallback && fallback.length}）`,
+    );
+    check(t.width === 1024 && t.height === 1024, `smoke2 图集应为 1024²（实得 ${t.width}×${t.height}）`);
+    const FW = frames[0].width;
+    check(FW === 128 && frames[0].height === 128, `smoke2 每帧应为 128²（实得 ${FW}×${frames[0].height}）`);
+    const A = (fi, x, y) => t.rgba[((frames[fi].y + y) * t.width + frames[fi].x + x) * 4 + 3] / 255;
+    // 每帧四边 alpha 必须 ≤2（r>0.75 外**允许**有内容：官方就是这样，靠帧边归零防方块边）
+    let frameBorder = 0;
+    for (const f of frames) {
+      for (let i = 0; i < FW; i++) {
+        const pts = [[f.x + i, f.y], [f.x + i, f.y + FW - 1], [f.x, f.y + i], [f.x + FW - 1, f.y + i]];
+        for (const [x, y] of pts) frameBorder = Math.max(frameBorder, t.rgba[(y * t.width + x) * 4 + 3]);
+      }
+    }
+    check(frameBorder <= 2, `smoke2 每帧四边 alpha 必须 ≤2（防 quad 直边，实得 ${frameBorder}）`);
+    const frac = { a80: 0, a50: 0, a20: 0, a08: 0 };
+    let sum = 0, n = 0;
+    for (let f = 0; f < frames.length; f++) {
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+        const a = A(f, x, y); sum += a; n++;
+        if (a > 0.8) frac.a80++;
+        if (a > 0.5) frac.a50++;
+        if (a > 0.2) frac.a20++;
+        if (a > 0.03) frac.a08++;
+      }
+    }
+    const pct = (k) => (100 * frac[k]) / n;
+    check(Math.abs(pct("a80") - 34.4) < 6, `smoke2 a>0.8 覆盖率应≈34.4%（实得 ${pct("a80").toFixed(1)}）`);
+    check(Math.abs(pct("a50") - 47.9) < 6, `smoke2 a>0.5 覆盖率应≈47.9%（实得 ${pct("a50").toFixed(1)}）`);
+    check(Math.abs(pct("a20") - 59.3) < 8, `smoke2 a>0.2 覆盖率应≈59.3%（实得 ${pct("a20").toFixed(1)}）`);
+    check(Math.abs(pct("a08") - 67.5) < 8, `smoke2 a>0.03 覆盖率应≈67.5%（实得 ${pct("a08").toFixed(1)}）`);
+    check(Math.abs(sum / n - 0.458) < 0.06, `smoke2 平均 alpha 应≈45.8%（实得 ${((100 * sum) / n).toFixed(1)}%）`);
+    const bins = new Array(11).fill(0), cnt = new Array(11).fill(0);
+    for (let f = 0; f < frames.length; f++) {
+      let cx = 0, cy = 0, cw = 0;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) if (A(f, x, y) > 0.03) { cx += x; cy += y; cw++; }
+      cx /= cw; cy /= cw;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) {
+        const d = Math.hypot((x - cx) / (FW / 2), (y - cy) / (FW / 2));
+        const k = Math.min(10, Math.round(d * 10));
+        bins[k] += A(f, x, y); cnt[k]++;
+      }
+    }
+    const radial = bins.map((v, i) => v / cnt[i]);
+    const worst = Math.max(...radial.map((v, i) => Math.abs(v - OFFICIAL_RADIAL[i])));
+    check(worst < 0.25, `smoke2 径向剖面须贴合官方（最大偏差 ${worst.toFixed(2)}）`);
+    check(radial[0] > 0.8 && radial[10] < 0.2, `smoke2 须「中心实心 + 外圈软晕」（中心 ${radial[0].toFixed(2)} / 边 ${radial[10].toFixed(2)}）`);
+    const madj = (a, b) => {
+      let s = 0;
+      for (let y = 0; y < FW; y++) for (let x = 0; x < FW; x++) s += Math.abs(A(a, x, y) - A(b, x, y));
+      return (255 * s) / (FW * FW);
+    };
+    const dAdj = madj(0, 1), dSeam = madj(frames.length - 1, 0);
+    check(dAdj > 0.5 && dAdj < 8, `smoke2 相邻帧 |Δ| 应≈2.9/255（实得 ${dAdj.toFixed(1)}）`);
+    check(dSeam < dAdj * 2.5, `smoke2 末帧→首帧必须与相邻帧同量级（接缝 ${dSeam.toFixed(1)} vs 相邻 ${dAdj.toFixed(1)}）`);
+    let cMin = 255, cMax = 0, cSum = 0, cN = 0;
+    for (let i = 0; i < t.width * t.height; i++) { const v = t.rgba[i * 4]; if (v < cMin) cMin = v; if (v > cMax) cMax = v; cSum += v; cN++; }
+    check(cMin > 180 && cSum / cN > 0.85 * 255, `smoke2 RGB 应近常量白烟（min ${cMin} 均值 ${(cSum / cN).toFixed(1)}）`);
+    const lt = ptex.buildBuiltinParticleTexture("particle/smoke/smoke2light");
+    let ls = 0;
+    for (let i = 0; i < lt.width * lt.height; i++) ls += lt.rgba[i * 4];
+    const lMean = ls / (lt.width * lt.height) / 255;
+    check(lMean > 0.2 && lMean < 0.5, `smoke2light RGB 均值应≈0.34（实得 ${lMean.toFixed(3)}）`);
   }
 }
 
@@ -513,10 +766,19 @@ async function stockTexFormats() {
     r8.rgba[0] === 255 && r8.rgba[1] === 255 && r8.rgba[2] === 255 && r8.rgba[3] === 200,
     `R8 取样语义应为 (255,255,255,200)（形状进 alpha），实得 ${[...r8.rgba.slice(0, 4)]}`,
   );
-  const rg = ptex.convertParticleTexFormat(px(2, 2, (o, i) => { o[i] = 30; o[i + 1] = 220; o[i + 2] = 0; o[i + 3] = 255 }), 8);
+  // 但输入必须是**解码器真正给出的通道布局**：tex-codecs 的 fromRG88 按 RePKG/ImageSharp
+  // 解码成 (fileG,fileG,fileG,fileR)（灰度在第 2 字节、alpha 在第 1 字节），而 WE 的
+  // `vec4(_sample.r,…, _sample.g)` 取的是 GL_RG 的 (fileR,fileG) —— 即 WE 的 rgb 来自
+  // 解码器的 **alpha**、WE 的 alpha 来自解码器的 **rgb**。上一版把两路都写成 src[0..1]
+  // （同一个 fileG），RGB 因此变成形状灰度：官方 smoke2 的 R 通道实测 234.8/255 近常量，
+  // 拿形状当 rgb 会让 `rgb×alpha` 从 shape¹ 掉成 shape²，外圈软晕整体暗掉。
+  const rgReal = ptex.convertParticleTexFormat(
+    px(2, 2, (o, i) => { o[i] = 220; o[i + 1] = 220; o[i + 2] = 220; o[i + 3] = 30 }), // 解码后布局：fileG 铺 rgb、fileR 在 alpha
+    8,
+  );
   check(
-    rg.rgba[0] === 30 && rg.rgba[1] === 30 && rg.rgba[2] === 30 && rg.rgba[3] === 220,
-    `RG88 取样语义应为 (30,30,30,220)（rgb=R、alpha=G），实得 ${[...rg.rgba.slice(0, 4)]}`,
+    rgReal.rgba[0] === 30 && rgReal.rgba[1] === 30 && rgReal.rgba[2] === 30 && rgReal.rgba[3] === 220,
+    `RG88 必须把解码器的 alpha 当 rgb、rgb 当 alpha（WE 的 _sample.rrrg），实得 ${[...rgReal.rgba.slice(0, 4)]}`,
   );
   const plain = px(2, 2, (o, i) => { o[i] = 10; o[i + 1] = 20; o[i + 2] = 30; o[i + 3] = 40 });
   check(ptex.convertParticleTexFormat(plain, 0) === plain, "ARGB8888 不得被转换（原样返回同一对象）");
@@ -559,6 +821,7 @@ async function stockTexFormats() {
     ["particle/fog/fog1", 9],
     ["particle/water/rain_drops_sheet", 8],
     ["particle/light/light_shafts_0", 8],
+    ["particle/smoke/smoke2", 8],
   ];
   let seen = 0;
   for (const [name, fmt] of cases) {
@@ -580,8 +843,20 @@ async function stockTexFormats() {
     }
     mean /= n;
     const sd = Math.sqrt(Math.max(0, m2 / n - mean * mean));
+    // RGB 必须比 alpha「平」：官方 RG88 的字节 0（= 解码器的 alpha 通道）是亮度/近常量，
+    // 字节 1（= 解码器的 rgb 通道）才是形状。取错通道时两者会反过来（rgb 抖、alpha 平）。
+    let cMean = 0;
+    let cM2 = 0;
+    for (let i = 0; i < n; i++) {
+      const c = conv.rgba[i * 4];
+      cMean += c;
+      cM2 += c * c;
+    }
+    cMean /= n;
+    const cSd = Math.sqrt(Math.max(0, cM2 / n - cMean * cMean));
     check(parsed.format === fmt, `${name} 语料格式应为 ${fmt}，实得 ${parsed.format}`);
     check(amax > 32 && sd > 4, `${name} 转换后 alpha 必须携带形状（max=${amax} sd=${sd.toFixed(1)}）`);
+    check(cSd < sd, `${name} 转换后 rgb 必须比 alpha 平（形状在 alpha：rgb sd=${cSd.toFixed(1)} alpha sd=${sd.toFixed(1)}）`);
     if (parsed.frames?.list?.length) {
       console.log(`  · ${name} 带 TEXS ${parsed.frames.list.length} 帧（${parsed.frames.list[0].width}×${parsed.frames.list[0].height}）`);
     }
