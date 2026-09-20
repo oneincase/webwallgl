@@ -17,12 +17,28 @@ export type BgmAnalyser = {
   /** 把声音元素接入分析（幂等：同一元素只接一次） */
   attach(audio: HTMLAudioElement): void;
   /**
+   * 元素是否已成功路由进 WebAudio 图（其出声由主增益控制）。
+   * 已路由的元素：WebKit 上 muted/volume 不作用于实际输出（见 setVolume 注释），
+   * Chromium 上则会与主增益**双重缩放** —— 调用方据此决定元素侧还写不写音量
+   * （路由 → 元素固定 1.0，全靠增益；未路由 → 常规写元素属性）。
+   */
+  routes(audio: HTMLAudioElement): boolean;
+  /**
    * 读出当前 BGM 的 64 段包络（0..1）。返回 null 表示上下文不可用/无元素。
    * 只统计**正在播放且未静音**的元素。
    */
   readBands(): Float32Array | null;
   /** 在 ctx suspended 时尝试恢复（声音 play() 时调用） */
   resume(): void;
+  /**
+   * 主输出增益（0..1）。WKWebView 上经 createMediaElementSource 路由的元素，
+   * 其 muted/volume 属性**不再作用于实际输出**（WebKit 与 Chromium 的行为分歧）：
+   * 场景 BGM 一旦接入本分析器，宿主 setVolume(0) 写 au.muted/volume 全部失效，
+   * 表现为「音量为 0 仍播内置音乐」。增益节点挂在出声通路上（source → gain →
+   * destination；频谱分析在 gain 之前分路，静音不影响可视化读数），是唯一对
+   * 三端都可靠的音量/静音开关。
+   */
+  setVolume(v: number): void;
   dispose(): void;
 };
 
@@ -32,8 +48,11 @@ const BANDS = 64;
 export function createBgmAnalyser(): BgmAnalyser {
   let ctx: AudioContext | null = null;
   let analyser: AnalyserNode | null = null;
+  let masterGain: GainNode | null = null;
+  let masterVolume = 1;
   let freq: Uint8Array<ArrayBuffer> | null = null;
   const attached = new WeakSet<HTMLAudioElement>();
+  const routed = new WeakSet<HTMLAudioElement>();
   const elements: HTMLAudioElement[] = [];
 
   const ensureCtx = (): boolean => {
@@ -51,11 +70,15 @@ export function createBgmAnalyser(): BgmAnalyser {
       // 增益只能 ≤1，见 scene-mount BGM_SPECTRUM_GAIN），抬到 -25 让强段保留
       // 一点起伏。
       analyser.maxDecibels = -25;
+      masterGain = ctx.createGain();
+      masterGain.gain.value = masterVolume;
+      masterGain.connect(ctx.destination);
       freq = new Uint8Array(analyser.frequencyBinCount);
       return true;
     } catch {
       ctx = null;
       analyser = null;
+      masterGain = null;
       return false;
     }
   };
@@ -66,15 +89,23 @@ export function createBgmAnalyser(): BgmAnalyser {
     try {
       const node = ctx.createMediaElementSource(audio);
       node.connect(analyser);
-      // 必须再接回路：createMediaElementSource 会接管元素输出，不连 destination
-      // 声音就没了。
-      node.connect(ctx.destination);
+      // 出声通路必须经过主增益再进 destination：直连会让 WKWebView 忽略元素的
+      // muted/volume（见 setVolume 注释），静音失效。
+      if (masterGain) node.connect(masterGain);
       attached.add(audio);
+      routed.add(audio);
       elements.push(audio);
     } catch {
       // 元素已被别处接过 source（理论上 WeakSet 已挡）等：放弃分析，声音照常。
       attached.add(audio);
     }
+  };
+
+  const routes = (audio: HTMLAudioElement) => routed.has(audio);
+
+  const setVolume = (v: number) => {
+    masterVolume = Math.max(0, Math.min(1, Number(v) || 0));
+    if (masterGain) masterGain.gain.value = masterVolume;
   };
 
   const resume = () => {
@@ -109,15 +140,16 @@ export function createBgmAnalyser(): BgmAnalyser {
     try {
       void ctx?.close();
     } catch {
-      
+
     }
     ctx = null;
     analyser = null;
+    masterGain = null;
     freq = null;
     elements.length = 0;
   };
 
-  return { attach, readBands, resume, dispose };
+  return { attach, routes, readBands, resume, setVolume, dispose };
 }
 
 /**

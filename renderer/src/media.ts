@@ -1,5 +1,5 @@
 // 媒体壁纸：合成单图层 scene 走 we-scene；无 WebGL2 时回退 DOM。
-import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, reapplyVolume, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
@@ -271,6 +271,9 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   // 「场景内含视频纹理层」的壁纸走的是 scene-mount，不受这里影响。
   if (isVideo) {
     mountVideoDom(rt, cfg);
+    // 视频元素同步创建完毕：立即重放宿主音量。内部重挂（setRenderDpr 等）
+    // 重建的 <video>/循环对只带 cfg.muted 近似，中间音量在这里补齐。
+    reapplyVolume(rt);
     return;
   }
 

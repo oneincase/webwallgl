@@ -502,6 +502,7 @@
     liveMedia.push(new w.WeakRef(el));
   }
   function applyMediaVolume(el) {
+    if (!mediaVolDesc || !mediaMutedDesc) return;
     if (el.__weBaseVol != null) {
       mediaVolDesc.set.call(el, el.__weBaseVol * hostVolume);
     } else {
@@ -579,6 +580,33 @@
     }
   }
   installMediaVolumeHooks();
+
+  // —— 新建媒体元素的音量收敛 ——
+  // 属性 hook 只拦得到「作者用 JS 赋 .volume/.muted」与新 Audio() 构造；
+  // createElement + innerHTML 插入、且从未赋过值的 <audio>/<video>（autoplay
+  // 直接开走）既没登记也没刷新，主音量为 0 时照样出声——表现为「恢复播放/挂
+  // 后台一段时间后冒一小段音乐」。对插入 DOM 的媒体元素立即按当前主音量落
+  // 一次真实属性；不进 DOM的元素观察不到（罕见，接受）。
+  try {
+    var mediaObserver = new w.MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i++) {
+        var added = records[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          var n = added[j];
+          if (!n || n.nodeType !== 1) continue;
+          if (n.tagName === "AUDIO" || n.tagName === "VIDEO") {
+            applyMediaVolume(n);
+          } else if (n.querySelectorAll) {
+            var inner = n.querySelectorAll("audio,video");
+            for (var k = 0; k < inner.length; k++) applyMediaVolume(inner[k]);
+          }
+        }
+      }
+    });
+    mediaObserver.observe(w.document, { childList: true, subtree: true });
+  } catch (_) {
+    /* 旧引擎无 MutationObserver：退化为仅属性 hook，行为同旧版 */
+  }
 
   // —— 父页控制面 ——
   // 官方 setPaused 只在暂停状态实际变化时调用一次；重复调用去重。

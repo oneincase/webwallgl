@@ -1,6 +1,7 @@
 // 网页壁纸：sandbox iframe + 加载前注入 WE shim + 音频/属性泵 + sceneCtl 对齐
 import {
   clear,
+  effectiveUserVolume,
   markFrame,
   normalizeFit,
   reportDiag,
@@ -510,7 +511,9 @@ function attachIframe(
       for (const [k, v] of Object.entries(rt.liveUserProps ?? {})) wire[k] = { value: v };
       w.__weApplyProps?.(wire);
       w.__weSetFps?.(rt.cfg.sceneFps ?? 60);
-      w.__weSetVolume?.(rt.cfg.muted === false ? 1 : 0);
+      // 重放宿主的精确音量（重挂后 iframe 的 shim 是全新的，hostVolume 从 1
+      // 起步；种子脚本已尽量早，这里兜 load 晚于种子执行的窗口）
+      w.__weSetVolume?.(effectiveUserVolume(rt));
       if (rt.paused) w.__weSetPaused?.(true);
     });
     // 首帧钩子：网页没有 GL 提交，load 即视为就绪
@@ -1066,7 +1069,9 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       }
       const rewritten = rewriteHtml(html, shimSource, {
         baseHref: entryDirUrl(entry),
-        seedScript: buildSeedScript(wire, cfg.sceneFps, cfg.muted === false ? 1 : 0),
+        // 种子用精确音量（宿主 setVolume 过的值）：cfg.muted 的 0/1 近似会让
+        // 重挂后的网页壁纸在 load 完成前以全音量出声（shim 初始 hostVolume=1）
+        seedScript: buildSeedScript(wire, cfg.sceneFps, effectiveUserVolume(rt, cfg)),
       });
       const blob = new Blob([rewritten], { type: "text/html;charset=utf-8" });
       const blobUrl = URL.createObjectURL(blob);

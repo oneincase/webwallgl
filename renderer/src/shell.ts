@@ -67,6 +67,14 @@ export type Runtime = {
   raf?: number;
   sceneCleanup?: () => void;
   sceneAudio?: { setVolume: (vol: number) => void; audios: HTMLAudioElement[]; dispose?: () => void };
+  /**
+   * 宿主经 setVolume 下发过的**精确**音量（0..1）。库内部的重挂（setRenderDpr /
+   * restore / 质量回退等）会重建媒体元素，元素只按 cfg.muted 近似成 0/1 ——
+   * 0.3 这类中间值会丢、静音态也可能被换文档冲掉。这里记住精确值，重挂完成后
+   * 由 reapplyVolume 原样重放（三端媒体路径：sceneAudio / videoPairs / video /
+   * web shim）。undefined = 宿主从未设置，各路径按 cfg.muted 近似（旧行为）。
+   */
+  userVolume?: number;
   /** 当前场景渲染器（含 dispose 释放 WebGL 上下文） */
   renderer?: { dispose?: () => void };
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
@@ -197,6 +205,59 @@ export type Runtime = {
   /** 场景装配失败且调用方没给 onError 时的兜底（壁纸页挂降级页；库实例不需要） */
   fallbackPage?: () => void;
 };
+
+/**
+ * 当前应生效的宿主音量：setVolume 下发过的精确值优先；从未设置过则按
+ * cfg.muted 近似成 0/1（挂载选项 volume>0 时 applyOptions 已转成 setVolume，
+ * 所以这里只需兜旧调用方）。
+ */
+export function effectiveUserVolume(rt: Runtime, cfg?: WallpaperConfig): number {
+  const v = rt.userVolume;
+  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.min(1, v));
+  return (cfg ?? rt.cfg)?.muted === false ? 1 : 0;
+}
+
+/**
+ * 把宿主音量重放到**当前这代**媒体元素上（scene 声音层 / 视频循环对 / 单视频 /
+ * 网页 shim）。库内部重挂完成后各装配点调用：新元素只带 cfg.muted 的 0/1
+ * 近似，中间音量会丢；WKWebView 上场景 BGM 走 WebAudio 路由后元素 muted 根本
+ * 不生效，必须靠 sceneAudio（→ bgm 增益）重新落一次。
+ *
+ * 只在宿主显式 setVolume 过才重放：从未设置时保持作者侧元素状态（图层各自的
+ * soundprops.volume），不压平。直接操作元素而不走 instance.setVolume：那条路
+ * 对 WebCodecs 视频在 v<=0 时会再触发一次整段重挂（remountCurrent），重放点
+ * 自己就在挂载流程里，递归重挂不可接受。
+ */
+export function reapplyVolume(rt: Runtime) {
+  const v = rt.userVolume;
+  if (typeof v !== "number" || !Number.isFinite(v)) return;
+  const vol = Math.max(0, Math.min(1, v));
+  try {
+    rt.sceneAudio?.setVolume(vol);
+  } catch {
+    /* 个别装配阶段可能拒绝，静默 */
+  }
+  if (rt.videoPairs?.length) {
+    for (const p of rt.videoPairs) {
+      try {
+        p.setVolume(vol);
+      } catch {
+        /* 忽略 */
+      }
+    }
+  } else if (rt.video) {
+    rt.video.volume = vol;
+    rt.video.muted = vol <= 0;
+  }
+  if (rt.iframe) {
+    try {
+      (rt.iframe.contentWindow as unknown as { __weSetVolume?: (v: number) => void })
+        .__weSetVolume?.(vol);
+    } catch {
+      /* 跨源/已卸载忽略 */
+    }
+  }
+}
 
 /**
  * 创建一个独立渲染运行时。

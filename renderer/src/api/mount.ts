@@ -419,6 +419,9 @@ export function createScene(
     },
     setVolume(volume: number) {
       const v = Math.max(0, Math.min(1, volume));
+      // 记住精确值：库内部重挂（setRenderDpr/restore 等）重建媒体元素后由
+      // reapplyVolume 原样重放，否则只剩 cfg.muted 的 0/1 近似（中间音量丢失）
+      rt.userVolume = v;
       rt.cfg.muted = v <= 0;
       rt.sceneAudio?.setVolume(v);
       weShimCall(rt, (w) => w.__weSetVolume?.(v));

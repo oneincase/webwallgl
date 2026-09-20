@@ -1,5 +1,5 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
-import { clear, effectiveDpr, FrameGate, markFrame, normalizeFit, readText, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, type Runtime } from "./shell";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
@@ -2532,6 +2532,10 @@ cfg, source, pkgAbort.signal);
       // 接共享 AnalyserNode，每帧把 BGM 频域并入音频快照，让自带音乐也能驱动
       // g_AudioSpectrum* / registerAudioBuffers（见 bgm-analyser.ts）。
       const bgm = createBgmAnalyser();
+      // 出声通路的主增益按当前生效音量起步：宿主已 setVolume(0) 后的内部重挂
+      // （setRenderDpr/restore），新元素只带 cfg.muted 近似 —— 不初始化增益，
+      // WKWebView 上 BGM 会以全音量漏出来（元素 muted 路由后不生效）。
+      bgm.setVolume(effectiveUserVolume(rt, cfg));
       const bgmCleanup = () => bgm.dispose();
       for (const layer of scene.layers) {
         if (!layer.sound || !layer.sound.length) continue;
@@ -2604,14 +2608,31 @@ cfg, source, pkgAbort.signal);
           console.warn(`声音图层 ${layer.name} 加载失败: ${(e as Error).message}`);
         }
       }
-      // 提供 setVolume 控制（含 muted 切换）
+      // 提供 setVolume 控制（含 muted 切换）。
+      // 已路由进 WebAudio 的元素由主增益统一控制实际出声：WebKit 上元素的
+      // muted/volume 对路由后的输出不生效（静音会漏），Chromium 上则会与增益
+      // 双重缩放 —— 路由元素固定满音量、只留 muted 给频谱门控；未路由元素
+      // 按旧行为直接写属性。
       const setSceneVolume = (vol: number) => {
+        const v = Math.max(0, Math.min(1, vol));
         for (const au of soundAudios) {
-          au.volume = Math.max(0, Math.min(1, vol));
-          au.muted = vol <= 0;
+          if (bgm.routes(au)) {
+            au.volume = 1;
+            au.muted = v <= 0;
+          } else {
+            au.volume = v;
+            au.muted = v <= 0;
+          }
         }
+        bgm.setVolume(v);
       };
       rt.sceneAudio = { setVolume: setSceneVolume, audios: soundAudios, dispose: bgmCleanup };
+      // 每次挂载/重挂装配完声音层就重放宿主音量：新元素只带 cfg.muted 的 0/1
+      // 近似（setRenderDpr/restore 等内部重挂会丢中间值），且 WKWebView 上元素
+      // muted 对 WebAudio 路由不生效，必须经这里（→ bgm 增益）重落一次。
+      // 放在 rt.sceneAudio 赋值之后而非首帧回调：onFirstFrame 是一次性钩子，
+      // 内部重挂不会再触发。
+      reapplyVolume(rt);
       if (disposed) return;
       // 粒子每帧推进 + 按图层渲染（在场景图层迭代的正确 z 序位置渲染）。
       // 不再「全部堆在最后」—— advance 在渲染器图层迭代前统一推进，render 按 layer.id 分发。
