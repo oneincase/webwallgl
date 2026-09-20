@@ -1,5 +1,5 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
-import { clear, effectiveDpr, markFrame, normalizeFit, readText, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, FrameGate, markFrame, normalizeFit, readText, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
@@ -3564,12 +3564,16 @@ cfg, source, pkgAbort.signal);
       let pauseStarted = 0;
       const playingVideos: Array<{ play: () => void }> = [];
       const playingAudios: HTMLAudioElement[] = [];
-      let lastRender = -Infinity;
+      // 帧率上限门：相位累加调度（见 shell.ts FrameGate）。旧的
+      // `now - lastRender >= interval` 死重闸门会因浮点量化/vsync 抖动误丢整帧，
+      // 60Hz 屏设 60 也周期性掉到 30/58fps；高刷屏 cap60 长期均值甚至只有 ~48fps。
+      const frameGate = new FrameGate(rt.cfg.sceneFps || 60);
+      let gateFps = rt.cfg.sceneFps || 60;
       // 关键帧动画的上一帧时刻（真实时钟，秒）。**不能用固定的目标帧间隔累加**：
-      // 渲染门是 `now - lastRender >= interval`，实际出帧周期总略大于 interval，
-      // 每帧只加 interval 就是系统性欠计 —— 骨骼动画走真实时钟 t，两条时间轴会
-      // 持续发散（3233141951：理想满帧下 30s 就差 164 帧≈5.5s，头发相对头顶
-      // 最大错位 40px、发饰 79px，看起来就是「头发和头不同步、漏模」）。
+      // 实际出帧周期总略大于 interval，每帧只加 interval 就是系统性欠计 ——
+      // 骨骼动画走真实时钟 t，两条时间轴会持续发散（3233141951：理想满帧下
+      // 30s 就差 164 帧≈5.5s，头发相对头顶最大错位 40px、发饰 79px，看起来就是
+      // 「头发和头不同步、漏模」）。
       let lastAnimT = 0;
       // [we-scene patch 3448845950] 单帧 dt 上限（秒）。见 animDt 处注释：
       // 作者的 `mix(cur, target, speed * frametime)` 在 dt 过大时会越过目标来回荡。
@@ -3577,11 +3581,14 @@ cfg, source, pkgAbort.signal);
       const MAX_SCRIPT_FRAME_DT = 0.05;
       const renderLoop = (now: number) => {
         if (disposed || rt.paused) return;
-        // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用。
+        // 帧率上限：相位累加调度，比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
+        // 热改 fps（工具条滑条）只改 rt.cfg.sceneFps，这里同步进调度器、保留节拍相位。
         const fps = rt.cfg.sceneFps || 60;
-        const interval = 1000 / fps;
-        if (now - lastRender >= interval) {
-          lastRender = now;
+        if (fps !== gateFps) {
+          gateFps = fps;
+          frameGate.setFps(fps);
+        }
+        if (frameGate.shouldRender(now)) {
           markFrame(rt, now);
           syncCanvasSize(rt, c, rt.cfg);
           // [we-scene patch] resizeScreen 派发（官方生命周期事件）：画布 CSS 尺寸
@@ -4256,6 +4263,8 @@ cfg, source, pkgAbort.signal);
         playingVideos.length = 0;
         for (const au of playingAudios) void au.play().catch(() => {});
         playingAudios.length = 0;
+        // 恢复后首帧立即出，不被暂停期间冻结的节拍相位挡住
+        frameGate.reset();
         kickLoop();
       };
       applyLiveImpl = applyLiveProps;

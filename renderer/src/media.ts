@@ -1,5 +1,5 @@
 // 媒体壁纸：合成单图层 scene 走 we-scene；无 WebGL2 时回退 DOM。
-import { clear, effectiveDpr, fitObjectFit, markFrame, normalizeFit, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
@@ -476,13 +476,19 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
       const start = performance.now();
       let pauseAccum = 0;
       let pauseStarted = 0;
-      let lastRender = -Infinity;
+      // 帧率上限门：相位累加调度（见 shell.ts FrameGate），替代会误丢整帧的死重闸门
+      const frameGate = new FrameGate(rt.cfg.sceneFps || 60);
+      let gateFps = rt.cfg.sceneFps || 60;
       const renderLoop = (now: number) => {
         if (disposed || rt.paused) return;
-        // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用
+        // 帧率上限：比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
+        // 热改 fps 同步进调度器（保留节拍相位，平滑收敛）。
         const fps = rt.cfg.sceneFps || 60;
-        if (now - lastRender >= 1000 / fps) {
-          lastRender = now;
+        if (fps !== gateFps) {
+          gateFps = fps;
+          frameGate.setFps(fps);
+        }
+        if (frameGate.shouldRender(now)) {
           markFrame(rt, now);
           syncCanvasSize(rt, c, rt.cfg);
           refreshTex?.();
@@ -540,6 +546,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
         }
         if (videoWasPlaying) void rt.video?.play().catch(() => {});
         videoWasPlaying = false;
+        frameGate.reset();
         kickLoop();
       };
       kickLoop();

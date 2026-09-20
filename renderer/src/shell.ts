@@ -432,6 +432,70 @@ export function frameStats(rt: Runtime): { fps: number; running: boolean } {
   return { fps: rt.frameMeter.fps, running: true };
 }
 
+/**
+ * 帧率上限调度器（相位累加 / accumulation 模式）。
+ *
+ * 旧实现是「死重闸门」：
+ *   if (now - lastRender >= 1000 / fps) { lastRender = now; render(); }
+ * 在 60fps 上限下有两个系统性缺陷，导致实测跑不满 60：
+ *  1. 浮点量化 + vsync 抖动：60Hz 屏 rAF 间隔偶尔 16.664ms < 闸门 16.6667ms，
+ *     该帧被误丢，要再等一个 vsync（33.3ms）才放行 —— 实测周期性掉到
+ *     58~30fps，且帧距在 16.6 / 33.3ms 间抖（画面一顿一顿）。
+ *  2. 高刷屏（120/144Hz）闸门与刷新节拍不对齐：144Hz、cap 60 时每 2.4 个
+ *     vsync 才该放一帧，取整后约每 2~3 个 vsync 放一帧，长期均值只有 ~48fps。
+ *
+ * 做法：维护一条理想节拍栅格 nextAt（每放行一帧 += interval）。每个 rAF 只问
+ * 「是否已越过下一节拍」，越过即放行。栅格不随实际出帧时刻漂移，所以长期平均
+ * 帧率恒等于上限，且放行的 vsync 在栅格上均匀分布（120Hz cap60 严格隔帧，
+ * 144Hz cap60 按 2,3,2,3… 分布，均值精确 60）。节拍严重落后（切后台回来 /
+ * 掉帧）时重锚到当前时刻，不一次性补历史帧。
+ */
+export class FrameGate {
+  /** 亚毫秒容差：吸收浮点量化与 vsync 抖动，避免「差零点零几毫秒」误丢帧 */
+  private static EPS_MS = 0.5;
+  private interval = 0;
+  private nextAt = 0;
+  private armed = false;
+
+  constructor(fps: number) {
+    this.interval = FrameGate.intervalFor(fps);
+  }
+
+  private static intervalFor(fps: number): number {
+    const n = Number(fps);
+    // 0 / 非法：不限帧（interval 0 → 每个 rAF 都放行）
+    return n > 0 && isFinite(n) ? 1000 / n : 0;
+  }
+
+  /** 运行中热改上限（工具条 fps 滑条）；保留节拍相位平滑收敛。 */
+  setFps(fps: number) {
+    this.interval = FrameGate.intervalFor(fps);
+  }
+
+  /** 本个 rAF（传入其 DOMHighResTimeStamp）是否应当提交一帧。 */
+  shouldRender(now: number): boolean {
+    const interval = this.interval;
+    if (interval <= 0) return true; // 不限帧
+    if (!this.armed) {
+      this.armed = true;
+      this.nextAt = now; // 首个 rAF 立即放行，并以此为相位原点铺节拍
+      return true;
+    }
+    if (now + FrameGate.EPS_MS < this.nextAt) return false;
+    this.nextAt += interval;
+    // 落后超过一整帧（卡顿 / 切后台返回）：重锚到当前时刻之后，不追补历史帧，
+    // 否则会连环放行造成一次瞬时冲刺。
+    if (this.nextAt < now - interval) this.nextAt = now + interval;
+    return true;
+  }
+
+  /** 暂停后恢复时调用：清空相位，恢复后首帧立即出、再重新铺节拍。 */
+  reset() {
+    this.armed = false;
+    this.nextAt = 0;
+  }
+}
+
 
 /** 渲染器诊断上报。先交给库化桥接的 onDiagnostic（公共 API 的回调面），
  *  再走旧的 /diag img 通道（宿主日志；经内容服务器，用 <img> 免 CORS） */
