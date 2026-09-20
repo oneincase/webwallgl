@@ -1,5 +1,4 @@
 // 用户属性解引用（{user: 属性名, value: 存场景时的快照} → 现值）
-//
 // [we-scene patch] 从 parse.js 拆出的独立子库（纯函数、零依赖）。
 // 语义与坑的完整说明见各函数注释与 docs/CASEBOOK.md「属性解引用」：
 // 属性表优先、形状不匹配（撞车）退回快照。
@@ -42,12 +41,10 @@ function valuesEqual(a, b) {
 }
 
 // [we-scene patch] 快照只是「上次存场景时的值」，不是运行时该用的值。
-//
 // 上面那条「默认沿用快照」的规则把 2854083091 的 X-Ray 开窗做小了 5 倍：
 // 它的 size 绑在 xraysize 上，快照 0.2、属性表默认 1，而 shader 里
 // v_PointerScale = 1/g_PointerScale —— 0.2 直接把 halo 缩成 1/5。
 // 用户看到的就是「开窗默认值有点小」。
-//
 // 判据不是猜的。origin/scale/angles 带 script 时，字段自身的 `value` 是 WE
 // **跑完脚本后烘焙下来的结果**，脚本形如 `value.x = scriptProperties.x`，
 // 于是这个烘焙值直接暴露了 WE 当时把 {user,value} 解成了哪一侧。全库统计：
@@ -56,18 +53,15 @@ function valuesEqual(a, b) {
 // 场景之后又调了属性」，烘焙值本就是旧的，区分不了两种假说。反过来 38 处
 // baked==prop≠snap 无法用「读快照」解释：若 WE 读快照，烘焙值必然等于快照。
 // 所以 WE 运行时读的是属性表。
-//
 // 本仓另外两条路径其实早就这么做了：engine.userProperties（main.ts）和
 // scriptProperties（text.js:919）都无条件读属性表当前值 —— 只有这里还在等
 // userOverridden 标记，三者语义不一致。
-//
 // 仍然不能无条件替换：全库 381 处快照≠属性里有 44 处是**字段名与属性名撞车**
 // （3078285611 把 visible 绑到一个 color 属性、3521337568 把 x 绑到 bool、
 // 3292361861 把 parallaxDepth(vec2) 绑到 bool…）。替进去会得到类型错乱的值。
 // 所以按「形状」把关：数值↔数值（标量与向量按分量广播，WE 自己也这么用，
 // 如 scale 绑单个 slider）放行，bool/文本必须严格同形，其余一律退回快照。
 // 经此过滤，337 处生效、44 处撞车的保持原样。
-//
 // userOverridden 仍然优先：宿主明示用户改过时，连撞车检查一起跳过。
 
 /** 值的「形状」，用于判断属性表的值能否安全替换快照 */

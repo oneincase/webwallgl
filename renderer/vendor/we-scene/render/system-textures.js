@@ -1,5 +1,4 @@
 // WE 系统内置贴图（materials/util/*）的程序化复刻供给入口。
-//
 // 背景：工坊壁纸的效果链 / 材质 / sampler 默认值会引用 WE 安装目录的公共 util
 // 贴图（`materials/util/<名>.tex`），它们不在壁纸 pkg 里。linux-wallpaperengine
 // 通过 `--assets-dir` 指向本机 WE 安装来解析；本渲染器没有 WE 安装目录可回退，
@@ -11,7 +10,6 @@
 //   - util/noise 用的是 8px 平滑值噪声，官方是**逐像素白噪声**（4 通道独立均匀
 //     分布），颗粒感完全不同；
 //   - util/perlin_256 / util/uniform_256 / util/fur 缺失 → 引用它们的槽落白板。
-//
 // 合规（docs/COMPLIANCE.md 红线「解包产物不入库」）：本模块**零内嵌官方字节**，
 // 只复刻接口契约与像素统计。下列实测锚点均为统计量（尺寸 / 通道布局 / 均值方差 /
 // 零值占比 / 平铺性 / mip 行为），不含任何内容本身：
@@ -32,13 +30,11 @@
 //              即「法线参考」；alpha/green 被直接采样的效果也拿到与官方逐位一致的值
 //   noflow     32×32 恒 RGBA(127,127,0,255)：(127,127) = 零向量、B=0 = 无流动
 //   white/black 32×32 纯色（官方各带 4/5 级 mip，纯色下 generateMipmap 等价）
-//
 // 所有名字一律 REPEAT 环绕（官方 tex-json `clampuvs:false` / 缺省同值）：效果链
 // 的 uv 随 g_Time 无界增长，CLAMP 会把采样拉成边缘一行（959417181 教训）。
 // nomip 名单（flatnormal/fur/noflow/noise）走 LINEAR 无 mip 链，与官方一致；
 // 带 mip 名字走 mip0 + generateMipmap（纯噪声/平滑场的 box 下采样与官方导出
 // mip 在期望上一致）。
-//
 // 生成器全部确定性（固定种子）——本仓库以像素 diff 对账渲染回归，随机种子
 // 不可漂移。
 
@@ -74,7 +70,6 @@ function mulberry32(seed) {
   }
 }
 
-// ---------- 可平铺多倍频值噪声 ----------
 
 /** 周期值噪声单倍频：格点按 grid 取模，size % grid === 0 时无缝平铺。salt 区分通道/用途 */
 function periodicValueNoise(size, grid, seed, salt) {
@@ -164,7 +159,6 @@ function solid(size, r, g, b, a) {
   return rgba
 }
 
-// ---------- 各贴图生成（模块级缓存，生成一次） ----------
 
 const cache = new Map()
 

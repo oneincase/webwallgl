@@ -1,11 +1,9 @@
 // HLSL → GLSL 转译 · C 预处理器（#include / #define / 函数宏 / #if 求值）
-//
 // [we-scene patch] 从 hlsl2glsl.js 拆出（切口 = 「预处理器 vs 方言语法转换」两类职责，
 // 见 docs/ARCHITECTURE.md）。WE 的 effect shader 大量使用 #if 组合变体与函数宏，
 // GLSL ES 的预处理器不支持函数宏，必须在转译前展开干净。
 // 与方言段的内部协作：stripComments / expandMacrosIn / replaceWord 由 hlsl2glsl.js
 // 主函数直接复用，故一并导出。
-// ---------- 预处理 ----------
 
 // 收集宏定义（对象宏 + 函数宏）
 function collectMacros(src) {
@@ -122,7 +120,6 @@ function expandMacrosIn(text, depth) {
     // 而 tone_mapping.frag 自己写 `const vec3 LUMINANCE_FACTOR = vec3(0.2126, …);`。
     // 不保护声明行 → 变成 `const vec3 vec3(0.11, …) = …`，ANGLE 报
     // `'vec3' : syntax error`，整个 tone_mapping pass 被跳过（5 pass / 5 壁纸）。
-    //
     // ⚠️ 试过「整份文件里这个宏完全失效」，更糟：公共头 greyscale/saturation 里
     // 那些引用（在作者声明**之前**）会变成 `undeclared identifier`，
     // GLSL 要求先声明后使用。所以只跳过声明行，其余引用照常展开宏值。
@@ -268,7 +265,6 @@ function evalIfExpr(expr, combos, defs) {
 
 // 行级预处理：展开 #include、按 combo 裁剪 #if 块
 // [we-scene patch] 去注释。转译器此前完全不处理注释，导致两类静默故障：
-//
 //  1. `collectMacros` 用逐行正则收 `#define`，会把**注释掉的**宏也收进来。
 //     procedural_noise.frag 里有两组被 /* */ 包起来的备选哈希常量：
 //       /*#define HASHSCALE1 0.1031
@@ -278,7 +274,6 @@ function evalIfExpr(expr, combos, defs) {
 //     （实测圆括号净 +3、花括号净 -1），整个 shader 编译失败；
 //  2. `rewriteCall` / `splitArgs` 是纯字符串扫描，不认注释。注释里出现的
 //     `(`、`)`、`,`、以及 saturate/lerp 等被改写的名字，都会干扰取参与替换。
-//
 // 保留换行以免行号错位（诊断日志按行号定位）。字符串字面量在 GLSL 里不存在，
 // 无需考虑「注释符出现在字符串内」的情形。
 // 注意：`// {"material":...,"default":...}` 这类 uniform 元数据注释是被

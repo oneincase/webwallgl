@@ -1,5 +1,4 @@
 // WebCodecs 视频壁纸：mediabunny demux → VideoDecoder → canvas 逐帧调度。
-//
 // 为什么存在（与 <video> A/B 无缝循环并存的分工）：
 // 元素级 API 在 WKWebView 里有整类不确定性 —— 冷管线 play() 到出帧可达 ~1s、
 // ended 事件可能丢失、系统节能会静默 pause 元素（均已在 video-loop.ts 打满
@@ -243,7 +242,7 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
         try {
           input.dispose();
         } catch {
-          /* 忽略 */
+          
         }
         return;
       }

@@ -1,28 +1,11 @@
-// 媒体类壁纸（从 main.ts 拆出）：视频 / 图片 / GIF 合成单图层场景走 we-scene 渲染，
-// WebGL2 缺失时回退 DOM 路径。
+// 媒体壁纸：合成单图层 scene 走 we-scene；无 WebGL2 时回退 DOM。
 import { clear, effectiveDpr, fitObjectFit, markFrame, normalizeFit, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
 import { rnd, noise } from "./vendor";
 
-// ---------- 视频 / 图片 / GIF：走场景引擎渲染 ----------
-//
-// 视频与图片类型壁纸不再各自维护一条 DOM 渲染路径（<video object-fit> / <img object-fit>），
-// 而是合成一个「单图层场景」交给 we-scene 渲染。这样 fit / renderDpr / sceneFps / 效果链
-// 只有一份实现，媒体类壁纸自动获得与场景壁纸一致的行为；后续要给媒体加效果
-// （模糊、色调、粒子叠加）也只是往这个合成场景里加层，不必再碰 DOM 分支。
-//
-// 三种媒体的纹理供给方式不同，但都不需要给 vendor 打新补丁：
-//   video —— 渲染器本身就有视频纹理分支（帧时间戳变化时上传当前帧）；
-//   gif   —— 每帧由本文件把 <img> 重新上传（GIF 动画由浏览器内部推进，
-//            texImage2D 取到的即当前帧）；
-//   image —— 一次性上传位图。
-//
-// WebGL2 不可用时回退原来的 DOM 路径（mountVideoDom / mountGifDom），
-// 保证无 WebGL 环境里媒体壁纸仍可显示。
-
-/** 合成单图层场景：投影尺寸取媒体自身像素，fit 交给 buildCamera/fitWindow（语义同 object-fit） */
+/** 合成单图层场景（fit 语义同 object-fit） */
 export function buildMediaScene(width: number, height: number, textureName: string) {
   return {
     camera: null,
@@ -65,15 +48,8 @@ export function buildMediaScene(width: number, height: number, textureName: stri
 }
 
 /**
- * 用 ImageDecoder 把 GIF 解成一组 ImageBitmap（各帧带自己的时长）。
- *
- * 为什么不能直接把 `<img src=*.gif>` 当纹理源逐帧上传：GIF 的动画只推进**用于合成显示**
- * 的那份帧，`drawImage` / `texImage2D` 取到的始终是首帧。实测三种摆放（脱离文档、
- * 屏幕外、可见 64×64）在 1.5s 内取到的像素**完全无变化**，90 帧的 GIF 渲染成静止画。
- * ImageDecoder 是显式的逐帧解码接口，能拿到真实帧与 `duration`。
- *
- * 代价：整段动画的位图常驻内存（256×256×90 帧 ≈ 23MB）。GIF 壁纸通常是小尺寸预览级
- * 素材，可接受；解码失败或无 ImageDecoder 时回退静态首帧（画面不动但不黑屏）。
+ * ImageDecoder 解 GIF 帧（`<img>`/`texImage2D` 只会拿到首帧）。
+ * 全帧位图常驻内存；失败则回退静态首帧。
  */
 export async function decodeGifFrames(
   src: string,
@@ -287,12 +263,10 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   const isGif = cfg.type === "gif";
 
   // 视频壁纸走 DOM 直显，不进场景引擎。
-  //
   // 场景引擎那条路会把每帧上传成 WebGL 纹理，而渲染器的视频纹理分支有尺寸
   // 上限（见 vendor renderer 的 videoTexLimit）—— 4K 源被降采样后再放大，
   // 观感明显发糊。DOM 直显交给浏览器硬件解码合成，拿到的是原生分辨率，
   // 还省掉一个 WebGL 上下文和每帧一次全画布 texImage2D。
-  //
   // 代价是纯视频壁纸不再有效果链/粒子叠加能力 —— 它本来也用不到。
   // 「场景内含视频纹理层」的壁纸走的是 scene-mount，不受这里影响。
   if (isVideo) {
@@ -575,15 +549,8 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   })();
 }
 
-// ---------- 视频：DOM 直显路径 ----------
 
-/**
- * 视频壁纸挂到哪个容器。
- *
- * 与 web.ts 的 resolveContainer 同构：全屏适配层画在 wrap 里；库形态优先用
- * 调用方给的空容器，给的是 canvas 就退到它父元素（canvas 不能有子节点）。
- * 少了这一步，库形态下 `rt.wrap?.appendChild` 是 no-op —— 元素永远看不见。
- */
+/** 与 web.resolveContainer 同构：库形态下 canvas 不能挂子节点。 */
 function resolveVideoContainer(rt: Runtime, cfg: WallpaperConfig): HTMLElement | null {
   if (rt.wrap) return rt.wrap;
   const el = cfg.canvas as HTMLElement | undefined;
@@ -593,20 +560,8 @@ function resolveVideoContainer(rt: Runtime, cfg: WallpaperConfig): HTMLElement |
 }
 
 /**
- * 视频壁纸：`<video>` 直接显示，不经 WebGL 纹理。
- *
- * 这是视频类型的**默认路径**（不再只是无 WebGL2 时的回退）。相比走场景引擎：
- *
- *  · 清晰度：绕开渲染器视频纹理分支的尺寸上限，浏览器按自己的显示尺寸直接
- *    硬件解码合成 —— 4K 源不再被降采样后再放大；
- *  · 内存：省掉一整个 WebGL 上下文，以及每帧一次全画布 texImage2D 上传；
- *  · 循环：用 A/B 双元素无缝循环（见 video-loop.ts）。实测 3840×2160@60fps
- *    的 12s 素材，循环点最坏帧间隔从 84ms 降到 33ms，而进程 RSS 峰值只从
- *    128MB 升到 130MB —— 备用元素平时不赋 src、只在结尾 0.5s 窗口预热保温，
- *    所以并不是"双份解码器常驻"。
- *
- * 代价是没有场景引擎能力（效果链、粒子叠加）。纯视频壁纸本来也用不到那些；
- * 真需要给视频加效果的是「场景内的视频纹理层」，那条路径不受本函数影响。
+ * 视频默认走 DOM `<video>`（非 WebGL）：原生清晰度、省上下文、A/B 无缝循环
+ * （见 video-loop.ts）。场景内视频纹理层仍走引擎路径。
  */
 export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);

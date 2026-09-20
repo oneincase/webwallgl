@@ -481,7 +481,7 @@ export async function startLiveSystem(opts?: {
       try {
         es?.close();
       } catch {
-        /* ignore */
+        
       }
       es = null;
       if (mic) {

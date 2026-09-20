@@ -1,12 +1,10 @@
 // .tex 内嵌图片（freeImage JPEG/PNG）的解码辅助。
-//
 // [we-scene patch] WE 桌面端用 FreeImage 解 .tex 内嵌 JPEG，**不执行 EXIF 方向**，
 // 场景里层的 size / angles 都是作者按「存储像素」设计的。浏览器的
 // `createImageBitmap` 默认 `imageOrientation: "from-image"`，会把带 EXIF 方向的
 // JPEG 预先转正 —— 1920911984（orientation=8 的 1080×5760 长图）被转成
 // 5760×1080，与层 size 1080×5760 和 90° 层旋转彻底错轴，整屏撕成横向条带
 // （实测画布行/列梯度比 ~20:1；剥掉 EXIF 后同一比特流 0.90）。
-//
 // 修法：请求 `imageOrientation: "none"`；引擎不支持该选项（或未按声明尺寸返回、
 // 宽高互换）时，按 EXIF 方向手工反转回存储像素。只处理 90° 族（6/8，互换尺寸可
 // 检测）：180°/镜像不换尺寸、无法与「未应用 EXIF」区分，且 FreeImage 本就不转，

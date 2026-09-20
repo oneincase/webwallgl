@@ -7,7 +7,6 @@ export const M_2PI = 6.28318530718
 
 const WHITE = { width: 1, height: 1, rgba: new Uint8Array([255, 255, 255, 255]), rg88: false }
 
-// ---------- 采样 ----------
 
 // 双线性采样（与 WE 纹理线性过滤一致；高频纹理如噪声必须双线性）
 export function sampleTex(tex, u, v) {
@@ -63,7 +62,6 @@ export function maskChannel(tex, f) {
   return tex.rg88 ? f[3] / 255 : f[0] / 255
 }
 
-// ---------- 位移类效果（采样坐标） ----------
 
 export function rotate2(v, a) {
   const c = Math.cos(a)
@@ -182,7 +180,6 @@ export function applyShakeMasks(items, u0, v0, su, sv, tex, textures, time, t) {
   return t
 }
 
-// ---------- waterflow（waterflow.frag:16-45，全量字面翻译） ----------
 
 export function applyFlowMix(items, u0, v0, su, sv, tex, textures, time, t) {
   for (const it of items) {
@@ -229,7 +226,6 @@ export function smoothstep(e0, e1, x) {
   return k * k * (3 - 2 * k)
 }
 
-// ---------- 颜色类效果（按 effect 列表顺序作用） ----------
 
 // WE 混合模式（common_blending.h），逐字实现
 export function applyBlending(mode, A, B, opacity) {

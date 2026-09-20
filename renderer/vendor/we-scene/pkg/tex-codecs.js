@@ -1,5 +1,4 @@
 // 像素格式编解码 + 解码入口 + 二进制小原语（从 texture.js 拆出）
-//
 // [we-scene patch] 容器解析（texture.js 的 parseTex）与像素解码是两类依赖：
 // 本文件是纯数据→纯数据的编解码库（含 LZ4 解压），Node 直载。
 // TEXTURE_FORMATS / FIF 是格式元数据表、u32/i32/f32 是两侧共用的小原语，
@@ -24,7 +23,6 @@ export const TEXTURE_FORMATS = {
 export const FIF = { UNKNOWN: -1, JPEG: 2, PNG: 13, GIF: 25, WEBP: 35, MP4: 35 }
 
 
-// ---------- 解码（mip0 / mip 链 / 像素格式 → RGBA） ----------
 export function decodeMip0(tex) {
   const image = tex.images[0]
   if (!image || image.length === 0) throw new Error('无图像数据')

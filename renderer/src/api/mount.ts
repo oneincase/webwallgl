@@ -1,9 +1,4 @@
-// 公共 API 入口：mount() / createScene()（docs/LIBRARY-PLAN.md §3）
-//
-// 每个 SceneInstance 持有独立的 Runtime（shell.createRuntime）：cfg、帧率计、
-// 渲染器、属性表互不可见 —— 一页多实例成立。装配经 dispatch.mountWallpaper，
-// 与壁纸页 window.__wp 走同一条路。
-// 按 project.type 分流三类：web / video·gif·image（媒体）/ 其余走 scene。
+// 公共 API：mount() / createScene()（每实例独立 Runtime；按 project.type 分流）
 
 import {
   clear,
@@ -11,13 +6,14 @@ import {
   destroyRuntime,
   fitObjectFit,
   frameStats,
+  normalizeFit,
   resetCoverAlign,
   resetFrameMeter,
   type Runtime,
 } from "../shell";
 import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
-import type { WallpaperConfig } from "../types";
+import type { WallpaperConfig, WallpaperFit } from "../types";
 import { normalizeQuality } from "../quality";
 import type { QualityOptions, ResolvedQuality } from "./types";
 import { weShimCall } from "../web";
@@ -36,22 +32,13 @@ import type {
   Source,
 } from "./types";
 
-/** 归一化旧 fit 别名（fill/fit 是 WE 旧会话遗留，见 shell.normalizeFit） */
-function normalizeFitOption(fit: string | undefined): Fit {
-  if (fit === "fit") return "contain";
-  if (fit === "fill") return "cover";
-  return fit === "contain" || fit === "stretch" ? fit : "cover";
-}
-
 function isWebProject(project: unknown): boolean {
   const t = (project as { type?: unknown } | null)?.type;
   return typeof t === "string" && t.toLowerCase() === "web";
 }
 
-/** 媒体壁纸的三种 type（dispatch.ts 把它们统一路由到 mountMedia） */
 const MEDIA_TYPES = new Set(["video", "gif", "image"]);
 
-/** project.type ∈ {video,gif,image} → 媒体壁纸；返回小写后的 type，否则 null */
 function mediaProjectType(project: unknown): string | null {
   const t = (project as { type?: unknown } | null)?.type;
   if (typeof t !== "string") return null;
@@ -60,32 +47,14 @@ function mediaProjectType(project: unknown): string | null {
 }
 
 /**
- * 场景路径需要真 canvas；若调用方给了空容器则在其内自建一块。
- *
- * `reuse=false`（重挂场景）时**一定换新画布**：`clear()` 里的
- * `renderer.dispose()` 调 `WEBGL_lose_context.loseContext()`，丢失后同一
- * canvas 再 `getContext("webgl2")` 拿回的是同一个 lost 对象，只有新画布
- * 才能拿到可用上下文。
- *
- * 关键是**不能靠 `isContextLost()` 判断**：`loseContext()` 的生效是异步的
- * （浏览器在后续任务里才真正丢弃上下文），`clear()` 之后同步查仍返回 false，
- * 于是复用了一块马上就要死掉的画布 —— 实测症状是场景重挂报
- * `createShader` 返回 null 派生的 `shaderSource must be an instance of
- * WebGLShader`。所以只看「这块画布建过 GL 上下文吗」这个确定性事实：
- * 建过就必须换，不去猜它此刻死没死。
- *
- * 整页渲染器不踩这个坑：它 `clear()` 时 `rt.wrap.innerHTML = ""` 把画布删了，
- * 重挂自然新建。库形态没有 wrap，画布被留下复用 —— 于是「卸载后重挂」
- * （setRenderDpr / restore）必然拿到死上下文，且这两个方法都不 arm 首帧守卫，
- * 连报错都没有，宿主只看到一片黑。
+ * 场景需要真 canvas。`reuse=false` 时必换新画布：`loseContext()` 异步生效，
+ * `isContextLost()` 不可信；建过 GL 的旧画布重挂会拿到死上下文（黑屏）。
  */
 function ensureSceneCanvas(el: HTMLElement, reuse = true): HTMLCanvasElement {
   if (el instanceof HTMLCanvasElement) return el;
   const existing = el.querySelector(":scope > canvas[data-webwallgl]");
   if (existing instanceof HTMLCanvasElement) {
-    // 没建过 GL 上下文的画布是干净的，任何时候都能复用（首次装配走这条）
     if (reuse || existing.getAttribute("data-webwallgl-gl") !== "1") return existing;
-    // 建过上下文 + 正在重挂：无法复活，摘掉换新的（留着会挡住新画布）
     existing.remove();
   }
   const c = document.createElement("canvas");
@@ -101,7 +70,8 @@ async function resolveMountConfig(
   o: MountOptions,
 ): Promise<WallpaperConfig> {
   const base = {
-    fit: normalizeFitOption(o.fit),
+    fit: normalizeFit(o.fit as WallpaperFit | undefined),
+
     // 0 = 自动跟随设备 DPR（Retina 原生清晰，默认）；显式正数 = 目标 DPR
     renderDpr: o.renderDpr ?? 0,
     sceneFps: o.fps ?? 60,
@@ -179,7 +149,6 @@ async function resolveMountConfig(
     return { ...base, type: finalType as WallpaperConfig["type"], src: url, canvas, source: o.source };
   }
   // [1.3.0] project.type 缺失或不认识时，按资源 URL 的扩展名嗅探。
-  //
   // 两道闸门，缺一不可：
   //  · 只在 Source 提供了 mediaEntry 时才试——有 mediaEntry 就说明调用方本来
   //    就想放一段媒体；对普通 httpSource（壁纸包目录）不嗅探，免得把没有
@@ -259,7 +228,7 @@ export function createScene(
       try {
         o.onDiagnostic?.(msg, level);
       } catch {
-        /* 忽略 */
+        
       }
       for (const fn of events.diagnostic) {
         try {

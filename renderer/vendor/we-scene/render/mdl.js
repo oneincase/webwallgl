@@ -1,7 +1,5 @@
 // [we-scene patch] MDL（Puppet Warp 骨骼网格）解析与渲染
-//
 // 格式（逆向自本机壁纸库 23 个 MDLV0023 模型，全部校验通过）：
-//
 //   MDLV0023 头
 //     0x00  char[8]   "MDLV0023"
 //     0x15  cstr      材质路径（如 "materials/01腿-后.json"）
@@ -9,11 +7,9 @@
 //             常见顶点 80B：pos vec3 @0 / boneIdx u32×4 @40 / weights f32×4 @56 / uv vec2 @72
 //             新版 84B（formatMarker 0x0181000e）：boneIdx@44 / weights@60 / uv@76
 //     后接  u32       索引区字节数，随后 u16 索引
-//
 //   MDLS0004 骨架（魔数 + u8 + u32 nextOff + u32 boneCount，逐骨条目）
 //     每骨：u8 flag / u32 id / i32 parent / u32 matSize(=64) / f32[16] 绑定矩阵 / cstr JSON
 //     绑定矩阵为**列主序**（平移在 [12],[13],[14]），与 WebGL 一致。
-//
 //   MDLA0006 动画（魔数 + u8 + u32 endPos + u32 animCount，逐动画条目）
 //     每动画：u32 id / u32 unk / cstr 名称 / cstr 模式("loop") / f32 fps
 //             u32 frameCount / u32 unk / u32 trackCount
@@ -22,11 +18,9 @@
 //             动画条目末尾固定 35B 填充（据此 endPos 与实际游标精确吻合）
 //     关键帧存**绝对局部变换**：frame 0 的平移与绑定矩阵平移完全相等
 //     ⇒ 蒙皮矩阵 = World(anim) · World(bind)⁻¹，frame 0 为单位变换。
-//
 // 网格坐标 = 图层局部像素、**Y 轴朝上**；UV 与之精确对应：
 //     u = (x + W/2) / W ,  v = (H/2 - y) / H   （W/H = 图层 size，实测误差 0）
 // 因此渲染时把 y 取反即回到 y-down 的场景世界空间（与 renderer.js 的层空间一致）。
-//
 // 历史 bug（导致「人物不动 + 贴图错乱」）：
 //   1) 顶点区偏移硬编码 0x47，实际为「材质路径长度 + 32」，材质路径长短不同即错位
 //      → 顶点/UV 全部读到错误字节 = 贴图错乱；
@@ -44,12 +38,10 @@ import { parseMDL } from './mdl-parse.js'
 import { computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments } from './mdl-skin.js'
 import { IDENTITY } from './mdl-math.js'
 
-// ---------- 渲染 ----------
 
 // 蒙皮上限。此前设为 24 并注明「实测最多 16 骨」，实际本机库里 WLOP DOME GIRL 有 64 骨、
 // Lucy 有 61 骨：超限骨骼在顶点着色器里被 `bi >= u_boneCount` 跳过，权重丢失，
 // 顶点落到错误位置 —— 表现为人物五官/头发/躯体撕裂错位。
-//
 // WebGL2 只保证 MAX_VERTEX_UNIFORM_VECTORS ≥ 256 个 vec4（mat4 占 4 个 → 64 骨），
 // 但实测本机 ANGLE/Metal 上报 1024。故不写死上限：createMDLRenderer 按 GPU 实际
 // 上报值算出可用骨数（留 32 个 vec4 给 u_mvp 等），链接失败时逐级减半回退。
@@ -64,7 +56,6 @@ function boneBudget(gl) {
 
 // 顶点着色器在 GPU 上做蒙皮。网格坐标为「图层局部像素、y 轴朝上」，
 // u_mvp 由宿主构造（含 y 方向、图层旋转缩放、场景投影）。
-//
 // u_keepZ：顶点 z 是否参与投影。**默认 0 = 压平到 z=0**，这是 2D puppet 的正确行为
 // —— 那类网格坐标是图层局部像素，z 只是建模残留（本机库 3737267090 的
 // 人物网格 z∈[111,435]，是「贴图平面」之外的建模偏移，放过去会让它按深度被

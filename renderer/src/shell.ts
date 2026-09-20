@@ -1,27 +1,12 @@
-// 页面外壳与共享运行时（库化改造：docs/LIBRARY-PLAN.md 第 2 步）
-//
-// 曾经的模块级单例 `state` 已改为 **Runtime 实例**：createRuntime() 每调用一次
-// 产出一个独立运行时（cfg/画布/渲染器/帧率计/cover 对齐……互不可见），
-// 这是「一页多实例」的硬前提。跨模块函数一律以 rt 为首参。
-// 壁纸页（main.ts）创建全屏运行时；公共 API（api/mount.ts）每个实例创建自己的。
-//
-// 依赖方向：shell ← web / media / scene-mount / dispatch / api / main（单向，无环）。
+// 共享 Runtime：每实例独立（cfg/画布/渲染器互不可见），作 web/media/scene-mount 首参。
 import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math.js";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 import type { QualityOptions } from "./quality";
 import type { VideoLoopPair } from "./video-loop";
 
 /**
- * 有效渲染 DPR（backing store = CSS 像素 × 此值）。
- *
- * renderDpr 语义（2026-09 修订，修 3.5K/Retina 屏「高清也不到原生」）：
- *   - 0 / undefined / null：**自动**，跟随设备 devicePixelRatio（Retina 即 2）；
- *   - 正数：目标 DPR，**允许高于设备上报值**——某些壁纸宿主（非 Retina 后端的
- *     WKWebView）window.devicePixelRatio 恒报 1，旧实现 min(1, n) 把高清模式
- *     永远钉在逻辑像素；现在按目标值超采样，仍能到原生清晰度；
- *   - 物理最长边封顶 MAX_BACKING_EDGE，避免在 5K/多显示器上 backing 过大爆显存
- *     （超采样超出部分等比回收）。
- * 默认从 1（省显存但 HiDPI 糊）改为 0（自动=原生）。
+ * 有效渲染 DPR。0=跟 devicePixelRatio；正数=目标（可高于设备上报，WKWebView 恒报 1 时仍能超采样）；
+ * 最长边封顶 MAX_BACKING_EDGE。
  */
 const MAX_BACKING_EDGE = 4096;
 
@@ -280,7 +265,7 @@ export function clear(rt: Runtime) {
     try {
       rt.iframe.remove();
     } catch {
-      /* 忽略 */
+      
     }
   }
   if (rt.raf !== undefined) cancelAnimationFrame(rt.raf);
@@ -410,12 +395,9 @@ export function destroyRuntime(rt: Runtime) {
 const utf8 = new TextDecoder();
 export const readText = (bytes: Uint8Array) => utf8.decode(bytes).replace(/^\uFEFF/, "");
 
-// ---------- 实时帧率计 ----------
-//
 // 测试台状态栏 / 公共 API stats 要显示「壁纸真实在跑多少帧」。这个数不能由
 // sceneFps 推算：它是上限，重场景（大量粒子/后期链）实际会掉到上限以下，
 // 掉帧恰恰是要看的。所以由渲染循环每画完一帧打点，按滑动窗口算。
-//
 // 只统计**真正提交渲染**的帧：被帧率上限跳过的 rAF 不打点，否则读数永远是
 // 显示器刷新率。窗口取 500ms，够稳又能在掉帧时及时反映。
 
@@ -450,7 +432,6 @@ export function frameStats(rt: Runtime): { fps: number; running: boolean } {
   return { fps: rt.frameMeter.fps, running: true };
 }
 
-// ---------- Scene（we-scene WebGL） ----------
 
 /** 渲染器诊断上报。先交给库化桥接的 onDiagnostic（公共 API 的回调面），
  *  再走旧的 /diag img 通道（宿主日志；经内容服务器，用 <img> 免 CORS） */
@@ -473,13 +454,10 @@ export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string) {
   }
 }
 
-// ---------- cover 裁切预览（竖屏顶/底热区）----------
-//
 // cover 居中裁切：竖屏壁纸在 16:9 窗口上上下被切掉。鼠标靠近屏幕顶/底时把
 // 可见窗口滑向对应端（align 0=顶/左，1=底/右），裁切模式下也能扫完整张图。
 // 横屏壁纸在瘦窗口上同理走左右。离开热区或离开窗口回到居中。
 // 不拦截点击，不影响壁纸脚本指针。无溢出时 (proj-view)*align=0，平移是空操作。
-//
 // 库化改造：监听与状态归实例（rt.coverAlign / rt.disposers）。只有全屏运行时
 // 注册 window 级监听 —— 公共 API 实例画在页面局部，不该截获整页指针。
 // 第 3 步会给公共实例接 canvas 级指针源。

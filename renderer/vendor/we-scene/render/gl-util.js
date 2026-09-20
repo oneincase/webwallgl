@@ -1,5 +1,4 @@
 // GL 公共小工具（从 renderer.js 拆出）：程序链接、shader 编译、纹理上传。
-//
 // [we-scene patch] 此前 renderer.js / mdl.js / particles.js 各有一份 compile/link
 // 隐性重复（见 docs/ARCHITECTURE.md「重复代码」）；本模块是收敛的第一步——
 // renderer.js 侧改用这里，mdl/particles 侧待后续轮次切换。

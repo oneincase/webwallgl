@@ -1,18 +1,14 @@
 // [we-scene patch] WE 音频可视化的模拟音频源
-//
 // WE 引擎把系统音频做成三组频谱喂给渲染端（见 shaders/effects/pulse.vert 与
 // workshop 音频效果的实测语料）：
-//
 //   uniform float g_AudioSpectrum16Left[16];  / g_AudioSpectrum16Right[16];
 //   uniform float g_AudioSpectrum32Left[32];  / g_AudioSpectrum32Right[32];
 //   uniform float g_AudioSpectrum64Left[64];  / g_AudioSpectrum64Right[64];
-//
 // 取值约 0..1（pulse.vert 的 CreateAudioResponse 直接 smoothstep(bounds, 值)）。
 // 文字脚本侧对应 engine.registerAudioBuffers(n) → { left, right, average } 数组。
 // 独立测试台没有系统音频（/audio-stream SSE 未复刻），本模块**按时间确定性合成**
 // 一段仿音乐的频谱流：底鼓/军鼓节奏、中频和弦、高频踩镲、段间静音。
 // 纯时间驱动（无累积状态、无随机数漂移），node 离线校验与浏览器逐帧驱动走同一路径。
-//
 // project.json 的 general.supportsaudioprocessing === false 时宿主应喂静音
 // （WE 语义：作者声明壁纸不响应音频；实测本机库 3 个 false 壁纸也无任何音频引用）。
 
@@ -158,7 +154,6 @@ export function createSimulatedAudio(seed = 20260830) {
       // 和弦基底按频段加权：低频弱（让给底鼓）、中高频强 —— 低频的起伏由节拍驱动。
       // 基底均值目标 ~0.5：WE 真实音乐下频段均值 0.5-0.8，音频条/示波器的幅度才
       // 达到作者预期（实测 3078285611 音条 scale=band 值，过小则只是贴地小圆点）。
-      //
       // [we-scene patch] 真立体声：左右声道的**内容**去相关，不是同一波形乘
       // (1±pan) 的伪立体声（旧实现左右条完全同相，只是高度差 ±6~26%，双声道
       // 可视化看起来是镜像单声道）。做法照真实混音：

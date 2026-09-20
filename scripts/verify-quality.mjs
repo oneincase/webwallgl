@@ -90,11 +90,6 @@ const q = await loadQuality();
   const bad = q.qualityFromQuery((k) => (k === "aa" ? "msaa9" : null));
   check(bad.antiAliasing === "off", "query 非法档位回退默认");
 }
-// MSAA 档位数表
-{
-  check(q.MSAA_SAMPLES.msaa2 === 2 && q.MSAA_SAMPLES.msaa4 === 4, "MSAA 档位 → 2/4 采样");
-}
-
 // ---------- 2) 接线断言 ----------
 
 const rendererSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
@@ -124,6 +119,7 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
     check(!/gl\.bindFramebuffer\(gl\.DRAW_FRAMEBUFFER, null\)\s*\n\s*gl\.blitFramebuffer/.test(fn), "resolve 不得直接 blit 到默认帧缓冲（WebKit INVALID_OPERATION 静默冻结）");
     check(/bindTexture\(gl\.TEXTURE_2D, dst\.tex\)/.test(fn) && /gl\.drawArrays\(gl\.TRIANGLES, 0, 6\)/.test(fn), "resolve 末段把 resolve 纹理全屏合成回画布");
   }
+  check(/if \(aaMode === 'msaa2'\) return 2/.test(rendererSrc) && /if \(aaMode === 'msaa4'\) return 4/.test(rendererSrc), "MSAA 档位 → 2/4 采样（renderer 内联）");
   check(/aaMode === 'fxaa'/.test(rendererSrc), "FXAA pass 只在 fxaa 档执行");
   check(/const bloom = effectsEnabled \? bloomPostParams/.test(rendererSrc), "Bloom 受后处理总开关门控");
   check(/effectsEnabled \? \(layer\.effects \|\| \[\]\)\.filter/.test(rendererSrc), "后处理关档效果列表置空（直通既有无效果路径）");

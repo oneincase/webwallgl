@@ -1,11 +1,9 @@
 // 修 Chrome OTS 拒载的残缺 TTF。
-//
 // 缺陷 A：cmap format 4 的 binary-search 三元组写错。
 // 症状：FontFace.load() → `OTS parsing error: cmap: unexpected range shift (5 != 6)`，
 // 字体回落系统黑体，字宽/字高与作者设计的 Tourner 等完全不同，时钟分秒叠进小时
 // （2780710296「最大视差」下的文字布局错乱其实是字体没装上）。
 // 全库约 200 个内嵌 ttf 里目前 5 个踩中，全是 Tourner 变体：rangeShift 少算 1。
-//
 // 缺陷 B：hhea/vhea 的 version 写成 0x00010001。
 // 症状：`OTS parsing error: vhea: Unsupported table version: 0x10001` →
 // FontFace 抛 "A network error occurred" → 回落系统字体（3448845950 的
@@ -14,7 +12,6 @@
 // `version >> 16 == 1`（所以桌面 WE 照常渲染），OTS 严格比对 → 必须先改对再喂。
 // 同族里 千图笔锋手写体 写的就是合法的 0x00011000，可见 0x00010001 是作者工具链
 // 的笔误而非新版本。这两个字体自身的 hhea 都是 0x00010000，所以按 1.0 归一。
-//
 // 桌面 WE 不跑 OTS，照样能开；改完表内容必须重算该表 checksum（目录项）。
 
 /**

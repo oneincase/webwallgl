@@ -1,5 +1,4 @@
 // 粒子系统纯工具（从 particles.js 拆出）：值/分布解析、音频门控、3D value-noise
-//
 // [we-scene patch] 这些与 GL / 实例状态完全无关，单独成模块便于离线复用
 // （scripts/particle-raster.mjs 的 CPU 参考光栅器读同一套语义）。
 const TAU = Math.PI * 2
@@ -52,7 +51,6 @@ function audioGate(bounds, level) {
   return k * k * (3 - 2 * k)
 }
 
-// ---------- 噪声（turbulence / turbulentvelocityrandom / remapvalue） ----------
 
 function hash3(x, y, z) {
   const n = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
@@ -97,6 +95,5 @@ function noiseVec3(x, y, z, oct) {
   ]
 }
 
-// ---------- 粒子 ----------
 
 export { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 }

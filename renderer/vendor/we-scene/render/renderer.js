@@ -1,18 +1,7 @@
 import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, layerParallaxOffset, resolveParallaxFormula, parallaxDepthFactor, layerWorldOrigin } from './math.js'
 import { hlsl2glsl } from './hlsl2glsl.js'
-// WebGL2 通用 pass 管线渲染器（移植 linux-wallpaperengine 架构）：
-// 每层 copy pass → 效果链（WE shader 转译执行，FBO 乒乓）→ 合成到画布。
-// copy/合成用自写 shader；效果 pass 用转译 WE shader（MVP=单位矩阵，mul 转置无影响）。
-// 空间：层 FBO 内容正立（v-down 显示空间），与 WE 帧缓冲空间（v-up+倒置画面）数学等价（docs/WE_RENDER_CONVENTIONS.md §1）。
-
-// [we-scene patch] 导出：hit-test（render/hittest.js）必须用**同一份** alignment 表
-// 复算图层几何，否则命中区与画面错开一个锚点偏移。
-// [we-scene patch] 模块结构（本仓库拆分，见 docs/ARCHITECTURE.md）：
-//   renderer-glsl.js  ALIGN/混合映射/内联 GLSL/quad 顶点/GL_TYPES（纯数据）
-//   gl-util.js        linkProgram/compile/makeTexture/makeTextureMip（GL 小工具）
-//   renderer.js       本文件：createRenderer（GL 上下文、缓存、装配与三级绘制循环）
-// ALIGN / makeTexture / makeTextureMip 仍从本文件 re-export（verify-pointer、
-// main.ts 等既有 import 方不变）。
+// WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
+// ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
 import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
@@ -543,7 +532,6 @@ export function createRenderer(canvas, opts = {}) {
     msaaTarget = null
   }
   // MSAA → 默认帧缓冲 resolve（多重采样缓冲不能被采样，只能 blit 解析）。
-  //
   // **不能直接 blit 到默认帧缓冲**：WebKit（WKWebView/ANGLE Metal）对
   // 「多重采样 RGBA8 → 默认 FB」的 blit 一律报 INVALID_OPERATION 静默失败
   // （alpha:true/false 都试过），表现是画面冻结在切换 MSAA 前的最后一帧
@@ -736,7 +724,6 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] sampler 槽的默认贴图：`uniform sampler2D g_Texture2; //
   // {"material":"sprite","default":"particle/halo_6"}` —— scene.json 里该槽为 null 时
   // 应回退到这个声明值，而不是白纹理。
-  //
   // 为什么单独解析：parseMaterialMeta 按 **material 名**建索引（供 bindConstants 用），
   // 而纹理是按 **sampler 序号**绑定的，两者对不上，于是纹理槽的 default 一直无人消费。
   // 实测影响 4 个 xray 壁纸（textures[2]=null）：sprite 落白纹理后开窗形状完全消失、
@@ -946,7 +933,6 @@ export function createRenderer(canvas, opts = {}) {
     return (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400
   }
 
-  // ---------- uniform 设置 ----------
   function setVal(uni, name, setter) {
     const u = uni.get(name)
     if (u && u.loc !== null) setter(u.loc, u.type, u.size)
@@ -995,7 +981,6 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] g_ModelViewProjectionMatrixInverse 曾硬编码为单位矩阵。
     // 这挡死了 xray（6 个壁纸）：它的 .vert 用**这个**矩阵（而非 Effect 版）
     // 把指针反投影成 sprite 的采样中心。两个必须同时满足的条件：
-    //
     // 1. **传「转置后的逆」，不能直接传逆。** WE 的 shader 是 HLSL 行向量语义
     //    （`mul(向量, 矩阵)`），hlsl2glsl 统一改写成 `transpose(M) * 向量`，
     //    于是 shader 里算的是 transpose(我们传进去的矩阵)。直接传逆矩阵时那个
@@ -1003,27 +988,21 @@ export function createRenderer(canvas, opts = {}) {
     //    反投影出的齐次 w 从 1 变成 **-613**，而 frag 紧接着做
     //    `v_PointerUV.xy / v_PointerUV.z`（z 存的就是 .xyw 的 w），
     //    偏移被大 w 压成近零 → 开窗死死钉在画面中心不动。
-    //
     // 2. **反投影的目标空间随 shader 版本变化，必须分两支。**
     //    xray.vert 在全库有**两个版本**，差别就在这个矩阵之后的归一化步骤：
-    //
     //      新版（5/6 个壁纸，用 g_EffectTextureProjectionMatrixInverse）：
     //        v_PointerUV.xyz = mul(vec4(pointer*2-1, 0, 1), Minv).xyw;
     //        v_PointerUV.xy *= 0.5;                     ← 乘 0.5
-    //
     //      旧版（仅 1994794519，用 g_ModelViewProjectionMatrixInverse）：
     //        v_PointerUV.xyz = mul(vec4(pointer*2-1, 0, 1), Minv).xyw;
     //        v_PointerUV.xy *= 1.0 / g_Texture0Resolution.xy;   ← 除以贴图像素分辨率
-    //
     //    frag 两版一致，都要求 P = v_PointerUV.xy / z 落在 **[-0.5, 0.5]**：
     //      d  = saturate(texSource - P)      texSource 是当前像素 UV ∈[0,1]
     //      uv = (d - 0.5) * v_PointerScale * … + 0.5
     //    halo 中心在 uv=0.5，故需 d=0.5，即 texSource = P + 0.5。
-    //
     //    于是：新版 `pointer*2-1 ∈[-1,1]` 乘 0.5 恰好得 [-0.5,0.5] → **传单位矩阵**；
     //    旧版还要再除以 texRes，故矩阵得先把量放大 texRes/2 抵消回来
     //    → **传 transpose(scale(texW/2, texH/2))**。
-    //
     //    两处曾都错传 `ortho(-W/2, W/2, …)` 的逆（W/H 取相机 projW/projH），
     //    那是**像素**空间：算出的 P 达 ±512/±256，紧随其后的
     //    `saturate(texSource - P)` 把整屏一律夹成 0 或 1，于是除正中心
@@ -1052,12 +1031,10 @@ export function createRenderer(canvas, opts = {}) {
     setVal(uni, 'g_TextureReductionScale', (l) => gl.uniform1f(l, 1))
     // [we-scene patch] 指针 uniform（WE 保留名）。改动前这几个全是硬编码 0 /
     // 完全未绑定，导致全库 28 个壁纸的指针效果一律「编过了但毫无反应」。
-    //
     // g_PointerPosition 的空间是**归一化 [0,1]、Y 朝下**（原始屏幕空间）：
     // 依据是 cursorripple_apply_force.vert / iris_follow_cursor.vert 等都显式写
     // `pointer.y = 1.0 - pointer.y; // Flip pointer screen space Y to match
     // texture space Y` —— shader 自己负责翻 Y，我们**不要**替它翻。
-    //
     // g_PointerPositionLast 取「上一帧」而非「上一个事件」，见 render/pointer.js
     // 的 beginFrame 说明（否则 length(cur-last) 恒 ≈0，水波不起波）。
     const p = readPointer()
@@ -1069,17 +1046,14 @@ export function createRenderer(canvas, opts = {}) {
     let plu = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.lastU : 0.5)
     let plv = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.lastV : 0.5)
     // [we-scene patch] g_PointerPosition 要换算到**当前层的 UV 空间**，不能直接喂屏幕归一化值。
-    //
     // xray.frag 拿 `d = texSource - P` 求开窗中心，texSource 是当前像素的**层 UV**
     // ∈[0,1]。所以 P 也必须是层 UV。层铺满屏幕（层宽高比 == 画布宽高比）时两者恰好
     // 相等，此前一直没暴露；一旦层与画布宽高比不同，fit=cover 会把层的一部分裁到
     // 屏幕外，屏幕 v 与层 v 就差一个「裁掉的边距 + 缩放」。
-    //
     // 2854083091 层 4000×2667（3:2），画布 1280×720（16:9）：层铺屏后是 1280×853，
     // 上下各裁 67px。于是开窗中心在纵向按 (853/720) 倍率发散并偏移 —— 指针在画面
     // 顶端时开窗偏上 56px、底端时偏下 56px，正中间才恰好对上。用户描述的
     //「开窗没有以鼠标为中心跟随」就是这个：横向准、纵向越往边缘越偏。
-    //
     // cam.offX/offY/viewW/viewH 就是「屏幕窗口在场景坐标里的范围」（fitWindow 的产物），
     // 用它把屏幕归一化 → 场景像素 → 层 UV。层与画布同宽高比时该式退化为恒等，
     // 所以对其余壁纸零影响。
@@ -1176,7 +1150,6 @@ export function createRenderer(canvas, opts = {}) {
   // `update(value){ return WEColor.hsv2rgb({x: engine.runtime * speed, …}) }`
   // 逐帧改写颜色。不跑脚本 ⇒ 颜色永远是初值 ⇒ 表现为**整块固定色**，
   // 而作者要的是随时间/音频动态变化的色彩。
-  //
   // 复用 text.js 的 evalObjectScript（同族语义：update(value) 返回新值，
   // vec3 字段传可变 {x,y,z}），沙箱、熔断、scriptProperties 全部沿用。
   // [we-scene patch] 常量脚本的反馈链只收与字段形状一致的值：标量键要有限数字、
@@ -1286,7 +1259,6 @@ export function createRenderer(canvas, opts = {}) {
       if (!sb || sb.disabled || !sb.hasUpdate) continue
       // engine.runtime 必须逐帧推进：颜色循环脚本整个动画都由它驱动，
       // 停在 0 等于永远输出同一个色（与「不跑脚本」的症状完全一样）。
-      //
       // [we-scene patch] engine.timeOfDay 同样必须每帧刷新，而且**漏了它会直接毁画面**：
       // 2134765860 的「夜灯」用 blend 效果把 `day lo` 叠在背景上，叠加强度 g_Multiply
       // 挂了个昼夜脚本 —— smoothStep 组合出「7 点前与 18 点后为 1，白天为 0」的门。
@@ -1340,7 +1312,6 @@ export function createRenderer(canvas, opts = {}) {
   // 带 animation 的常量永远停在 scene.json 快照。3233141951「剑音条01」opacity
   // 快照是 0、真正淡入在第 18 帧；不采样这条轨 ⇒ 武士刀音频条永远透明。
   // 全库 55 处效果常量动画（verify-animation 按 animation 键遍历已覆盖求值核）。
-  //
   // [we-scene patch] rec 预建必须先于 scriptedConstants：媒体淡入模板
   // （3151551777 Media Opacity）的常量沙箱在 scriptedConstants 里创建并**同步
   // 补发** mediaThumbnailChanged → getAnimation().play()。若此时 rec 还没建
@@ -1453,11 +1424,9 @@ export function createRenderer(canvas, opts = {}) {
       // 跑完自己效果链后的合成结果（WE 的「图层作为纹理」：作者把一层设成
       // visible:false 当纯素材，另一层引用它，常用于遮罩和封面）。带层号时必须
       // 查预渲染表，不能返回 inputFBO —— 那是**当前层自己**的效果链输入。
-      //
       // 此前不看层号一律返回 inputFBO。2938612768 的背景层引用的是隐藏的
       // 「默认音频封面azb」，取到自己（空容器 = 全透明）后整屏只剩灰底，
       // 原版那张模糊铺屏的专辑封面完全不见。全库 92 处引用 / 22 个壁纸。
-      //
       // 不带层号的裸 `_rt_imageLayerComposite` 仍指当前层，保持原样。
       if (name.startsWith('_rt_imageLayerComposite')) {
         if (!compositeEnabled) return inputFBO
@@ -1474,18 +1443,15 @@ export function createRenderer(canvas, opts = {}) {
     // 这些名字在 `target`/`source`/`bind` 三处都是直接查 effectFBOs 的，唯独这里
     // 因为前缀判断落到了 `textures.get(name)` —— 贴图表里当然没有，于是返回 null，
     // 调用方兜底成**白纹理**。
-    //
     // 后果是多 pass 效果的链路从中间断掉：bloom 的 apply pass 槽 0 本该取模糊结果、
     // 槽 2 取原图，两个都变成纯白 ⇒ `ApplyBlending(31, white, white*tint, mask)`
     // 恒为白 ⇒ 尾灯/高光位置糊成纯白方块（3789462324 车尾灯，掩码形状就是白块轮廓）。
     // 全库 3 种效果 / 8 个壁纸：bloom(3)、bokeh_blur(2)、crt_screen(3)。
-    //
     // 放在贴图表查找**之前**：FBO 名是效果私有的，同名贴图不该抢占。
     if (effectFBOs.has(name)) return effectFBOs.get(name)
     return textures.get(name) || null
   }
 
-  // ---------- 绘制辅助 ----------
   // 静态 quad 单例 + 变更才上传：避免每帧每 pass 新建 Float32Array 与 bufferData
   const PASS_QUAD = passQuadVerts()
   const LOCAL_QUAD = localQuadVerts()
@@ -1583,7 +1549,6 @@ export function createRenderer(canvas, opts = {}) {
   // blend mode 编号）→ 合成到画布时的 GL 混合模式。
   // 只映射能用固定管线表达的几种；其余（Overlay/SoftLight 等需要读回目标色）
   // 退回 translucent，与此前行为一致。
-  //
   // 这一步不做的后果：像 3299228616 的 ripple1440p 水面层，贴图是一张几乎全黑、
   // 靠 Add 混合只贡献亮部高光的图（colorBlendMode=9），若按 translucent 合成，
   // 黑色像素会被当成不透明色直接糊住背景，看起来就是"一层黑色蒙版盖住了壁纸"。
@@ -1618,7 +1583,6 @@ export function createRenderer(canvas, opts = {}) {
     gl.drawArrays(gl.TRIANGLES, 0, 6)
   }
 
-  // ---------- 视锥裁剪 ----------
   // 图层的世界空间 AABB 与可见窗口是否完全不相交。
   // 世界坐标同 layerModelMatrix：y 已翻成 cam.projH - origin.y，可见窗口是
   // [offX, offX+viewW] × [offY, offY+viewH]（见 buildCamera 的 fitWindow）。
@@ -1681,15 +1645,12 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // [we-scene patch] 序列帧动画：算出当前该采样 sprite sheet 的哪一格。
-  //
   // WE 的做法是给图层 material 打 `combos: { spritesheet: 1 }`（大小写两种写法
   // 全库都有），贴图本身在 TEXS 段带一张帧表（每帧一组仿射 UV 基 + duration）。
   // 图层的 size 是**单帧尺寸**（如 3250755486 的猫是 220x220），而贴图是
   // 1320x1540 的整张 sheet。
-  //
   // 不实现的后果：整张 sheet 被铺满 quad —— 那只猫显示成 6x7 的贴图网格。
   // 全库 52 个图层 / 7 个壁纸用它（其中 37 层由脚本钉帧，15 层自动播放）。
-  //
   // 帧的选择有两条来源，脚本优先：
   //   1) `thisLayer.getTextureAnimation().setFrame(n)` —— 37 层这么用，语义是
   //      **把这一格钉住**（3299228616 的 AM/PM 按当前小时选 0/1；3292361861 的
@@ -1698,7 +1659,6 @@ export function createRenderer(canvas, opts = {}) {
   //   2) 无脚本时按时间自动播：各帧 duration 累加取模。时间基准用场景时间
   //      （自挂载起算），故限帧/暂停时播放进度与画面一致，不会因丢帧跳格。
   //      duration ≤ 0 的帧按 1/30s 兜底（避免除零卡死在第 0 帧）。
-  //
   // 返回 [originU, originV, uU, uV, vU, vV]（都已归一化到图集尺寸），
   // 供 COPY_FRAG 做 `origin + u·uDir + v·vDir` 仿射采样 —— 矩形表达不了
   // Raiden Friends 末 3 帧的 90° 旋转打包。
@@ -1753,7 +1713,6 @@ export function createRenderer(canvas, opts = {}) {
     return [f.x / texW, f.y / texH, uX / texW, uY / texH, vX / texW, vY / texH]
   }
 
-  // ---------- 合成（层 → 画布） ----------
   // 图层局部变换（不含投影）：把 [-0.5,0.5] 的 local quad 映射到世界空间
   function layerModelMatrix(layer, cam) {
     const w = layer.size[0] * layer.scale[0]
@@ -1797,13 +1756,11 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] WE alignment：origin 锚在图层 quad 的对应边/角（bottom=底边中点、
     // topleft=左上角…）。这是音频条「底部对齐、随频谱向上伸缩」的基准
     // （全库 112 处 / 18 壁纸）。
-    //
     // 锚点偏移的单位是**像素**（w/h），不是局部 quad。矩阵列主序、右乘施加，
     // 后面那句 mat4Scale(w,h) 只作用于它**右侧**的顶点，不会把这里的平移量放大。
     // 早先写成 (ax-0.5, 0.5-ay) 相当于只偏了「不到 1 个像素」，非 center 层
     // 等于仍然绕中心对齐 —— 3148125112 的「柱子/柱子布料」（bottom，应上移
     // 526px）整根柱子沉到画面外，只剩顶端露在人物左脚下方，看着像被裁掉。
-    //
     // x 分量还得取反：origin 要落在锚点上，quad 就得往**反方向**长。
     // left(ax=0) 期望 x∈[0,w]，需要 +w/2，即 (0.5-ax)*w；写成 (ax-0.5)*w 会
     // 朝反方向偏一整个层宽（3148125112「指针」topright 横向差 1634px）。
@@ -1833,7 +1790,6 @@ export function createRenderer(canvas, opts = {}) {
     const mvp = mat4Multiply(viewProj, m)
     // [we-scene patch] 固定管线表达不了的 colorBlendMode 改走 shader 侧混合：
     // 回读画布当 dst，用 ApplyBlending 算完直接写（见 needsShaderBlend 的归属证据）。
-    //
     // 三个前置条件缺一不可：
     //  - `!premultiplied`：容器画布（音频条 / audio_ring）有自己一套 alpha 约定，
     //    见下方 [A]/[B] 分流，套 ApplyBlending 会把那两类都打错；
@@ -1876,7 +1832,6 @@ export function createRenderer(canvas, opts = {}) {
     gl.useProgram(prog)
     // [we-scene patch] 容器效果画布（空容器 + 音频可视化等）的合成方式。
     // 两类容器效果的输出约定**正好相反**，必须分流，一刀切必然牺牲一类：
-    //
     //  [A] 形状在 alpha（Simple_Audio_Bars，TRANSPARENCY=REPLACE 为声明默认 1）：
     //        finalColor = ApplyBlending(0, mix(u_BarColor, scene.rgb, scene.a),
     //                                   u_BarColor, bar*opacity)
@@ -1886,12 +1841,10 @@ export function createRenderer(canvas, opts = {}) {
     //      这类必须按直通 alpha 做 over：否则 bar=0 处的白 rgb 会铺满整个 quad。
     //      实测症状：2134765860 "Visualizer 32"（340x250 @1313,537）整块纯白矩形，
     //      把该层 size 改成 80x60 白块同步缩小（归属确认）。
-    //
     //  [B] 发光在 rgb、alpha 恒为基底（audio_ring，BLENDMODE=31 Add）：
     //        finalColor = A + B*opacity;  alpha = scene.a  ⇒ 空容器下恒为 0
     //      这类必须让 rgb 直接叠加：按 alpha 合成会因 alpha=0 整个消失
     //      （实测音箱上的蓝色光环不见了）。
-    //
     // 判据取自着色器**实际写出的 alpha 是否携带信息**：由 renderLayer 在跑完
     // 效果链后置位（见 containerAlphaMeaningful）。无法判定时按 [B] 处理 ——
     // 少遮挡比整层消失更接近 WE 观感。
@@ -2031,7 +1984,6 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // [we-scene patch] puppet 的效果链跑在**贴图空间**，不再有「把网格渲进层 FBO」这一步。
-  //
   // 旧实现：先蒙皮渲进 FBO A（几何空间），再把效果盖在形变后的画面上。
   // 这对 3148125112 的丝袜切换是错的 —— 实测 `materials/腿2.tex`（白丝）的不透明
   // 像素有 **100.0%** 落在 `materials/腿1.tex`（光腿）的不透明像素内，两张图在
@@ -2039,11 +1991,9 @@ export function createRenderer(canvas, opts = {}) {
   // 1286×1148 = 层尺寸的一半，同样按层矩形归一化。也就是说这些资源全部作于
   // 静止姿势的贴图坐标系，必须先在贴图上合成、再由网格整体形变。
   // 旧顺序把平整的丝袜贴到已经抬腿的画面上，只能糊出一条错位白带。
-  //
   // 网格 UV 与静止姿势位置严格对应（u=(x+W/2)/W、v=(H/2-y)/H，见 mdl.js 头注），
   // 所以「贴图空间」就是「层矩形空间」：效果链按普通图片层那套跑完，
   // 把输出当作新贴图交给网格采样即可（见 drawPuppetDirect 的 overrideTex）。
-  //
   // 附带收益：contentRect（层矩形 ∪ 网格包围盒）随之失效并被删除。它原本是为了
   // 让 FBO 装下超出层矩形的网格，但那是几何空间的问题；贴图空间里效果链的画布
   // 天然就是层矩形，与蒙版基准一致，不需要再扩。
@@ -2051,7 +2001,6 @@ export function createRenderer(canvas, opts = {}) {
 
   // [we-scene patch] `config.passthrough`：层的效果链输入 = 它**背后已渲染的画面**，
   // 而不是一块空白画布。全库 120 处、全部是容器，其中 119 个是「空容器 + 效果」。
-  //
   // 为什么必须实现：工坊音频可视化普遍写成
   //   finalColor = ApplyBlending(MODE, lerp(barColor, scene.rgb, scene.a), barColor, bar*op)
   // 空画布下 scene=(0,0,0,0)，那个 lerp 原样返回 barColor，两个混合参数相同
@@ -2060,14 +2009,11 @@ export function createRenderer(canvas, opts = {}) {
   // （alpha = scene.a = 0）连 alpha 都没有 —— 整块 quad 成了恒定纯色。
   // 3789131791「Green」就是这样糊出一块 1920×1080 青色矩形。给它真实背景后
   // scene.a=1，bar=0 处输出精确等于原背景（离线复算：[0.10,0.12,0.25] 原样返回）。
-  //
   // 做法：把画布当前内容按**层矩形的屏幕投影**采样进层 FBO。层的世界变换可能带
   // 旋转与负缩放（库内 86/119 有 z 旋转、93/119 有负缩放），所以不能用轴对齐
   // 矩形回读；这里逐顶点把层局部 quad 的四角变换到屏幕、算出各自的画布 UV，
   // 由 GPU 做透视正确的插值 —— 旋转/镜像自动成立。
-  //
   // 画布内容先拷进一张纹理（WebGL 不能一边采样默认帧缓冲一边写它）。
-  //
   // **内部格式必须是 RGB8，不能是 RGBA8。** 画布上下文是 `alpha: false`
   // （见 main.ts 的 getContext），默认帧缓冲根本没有 alpha 通道，
   // 而 copyTexImage2D 要求目标格式的每个分量在源里都存在 —— 拿 RGBA8 去拷
@@ -2107,11 +2053,9 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 内置 Bloom 后期（general.bloom）。「部分壁纸提供 HDR 属性、
   // 切换后无任何效果」的根因：hdr 属性绑在 general.bloom 上（2902406982 /
   // 3287715210 / 3299228616 / 3764725758），而内置 Bloom 此前没有任何消费者。
-  //
   // WE 的运行时实现 = localeffects "Bloom"（2822917890）整屏后期：
   // light_map → 1/4 分辨率亮部图 → 双向高斯 → Add 合成回场景。effect.json 的
   // 两个 _rt_buffer 都是 scale:4，这里用 getFBO 同尺寸缓存。
-  //
   // 场景纹理用 captureBackdrop 的画布回读（copyTexImage2D，RGB8）：不动主循环
   // 的绘制路径，零风险拿到「本帧最终画面」。light_map 4 抽头只偏移 ±1 全分辨率
   // 纹素，降采样带锯齿是 WE 原样（它的 first pass 也直接吃全分辨率 previous）。
@@ -2233,12 +2177,10 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 空 composelayer 作 `_rt_imageLayerComposite` 源：在**该层自己的 z 序**
   // 把画布当前内容按层矩形抠进独占 FBO。这才是 WE 的 composelayer 语义
   // （捕获身后已渲染画面），不是「跑一遍空层效果链」。
-  //
   // 不能放在 renderCompositeSources 里：那趟在主循环之前，画布只有 clearcolor，
   // 预渲染只能给一张全透明图。clipping_mask 吃到透明 clip（rgb=0）会把白底三角
   // 混成不透明色块；回退 inputFBO 则 clip≈albedo≈白，BLENDMODE 5（Darken）
   // 仍是白三角。2902406982 中间那组几何组件就是这样糊成实心白块的。
-  //
   // 必须在主循环里、画完排在它前面的层之后、continue 跳过空容器自身之前调用。
   // drawBackdropToFBO 会改 FBO / viewport / program，回来一定要绑回画布。
   async function captureEmptyComposeAtZOrder(layer, cam, viewProj, width, height, time) {
@@ -2431,7 +2373,6 @@ export function createRenderer(canvas, opts = {}) {
 
     // [we-scene patch] 把归一化指针换算成世界像素并写回指针源。
     // 必须在这里做（而非宿主侧）：cam 每帧由 buildCamera 构造，只在帧内可得。
-    //
     // 补偿恒为 0：视差改成纯分层效果后**相机不再平移**，画面整体没有位移，
     // 减去 layerParallaxScale 反而会让指针与画面错开一个视差量。
     if (pointerProvider) {
@@ -2487,7 +2428,6 @@ export function createRenderer(canvas, opts = {}) {
       // destroyed：thisScene.destroyLayer 的墓碑。visible 字段脚本的
       // `return value` 可能在拆层的同一帧把 visible 写回 true
       // （3786330502 开场淡出），墓碑必须比写回更硬。
-      //
       // [we-scene patch] 但**被引用的空 composelayer 源必须先回读再跳过**。
       // 这些层就是靠 visible:false 才不出现在画面上的纯素材（renderCompositeSources
       // 的注释也写了「源层几乎都是 visible:false」），可 z 序回读的钩子
@@ -2557,7 +2497,6 @@ export function createRenderer(canvas, opts = {}) {
     // scene.json 只有 `camerafade: true` 这个开关，**没有时长参数** —— WE 用固定
     // 内置时长。这里取 1.0s（可用 opts.fadeDuration 覆盖），并在 README 注明这个
     // 数值是观感近似、无数据出处。
-    //
     // 实现为「最后叠一层由不透明渐变到全透明的 clearcolor 幕布」，而不是改每层的
     // alpha：后者要穿透效果链、且会把「层自身 alpha 参与的混合」算错；幕布只影响
     // 最终像素，与 WE 的整屏淡入观感一致。
@@ -2632,26 +2571,20 @@ export function createRenderer(canvas, opts = {}) {
 
   // [we-scene patch] 跨层合成源：把被 `_rt_imageLayerComposite_<id>_a` 引用的对象
   // 预渲染到**各自独占**的 FBO，供引用方在自己的效果链里采样。
-  //
   // WE 的「图层作为纹理」：作者把一层设成 visible:false 当纯素材（封面、遮罩），
   // 另一层引用它跑完效果链后的合成结果。全库 92 处引用 / 22 个壁纸。
-  //
   // 三个必须绕开的坑（README「已知未实现」记过两次失败尝试）：
-  //
   // 1. **不能共用乒乓 fboA/fboB。** 那两个按尺寸缓存、被所有图层共享，源层跑完
   //    效果链后结果还留在乒乓上，引用方进来第一件事就是 clear 它 —— 之前
   //    「让素材层照常渲染再登记 FBO」就是这么整屏全白的。这里给每个源层
   //    `getFBO(w, h, 'lc:'+id)` 独占一块：fboCache 按 `tag|WxH` 缓存，
   //    tag 唯一就不会被任何人抢走。窗口改尺寸后本帧没用到的旧尺寸会回收。
   //    前缀 `lc:` 避开效果自定义 FBO 的名字空间。
-  //
   // 2. **必须绕开 visible 与 offscreen 两道门。** 源层几乎都是 visible:false
   //    （主循环第一行就 continue），且常被摆在取景外（2938612768 的三张默认封面
   //    origin 是 -418,-573）。所以这里不走主循环，直接调 renderLayer。
-  //
   // 3. **必须先于引用方跑完。** 渲染顺序就是 scene.layers 数组顺序，源层完全可能
   //    排在引用方后面，所以这趟预渲染放在主循环之前。
-  //
   // 用「以源层矩形为视口」的局部相机（同 renderContainerGroup 的 groupCam），
   // 并把 origin 挪到视口中心 —— 源层的世界坐标就此完全不参与，屏外也无所谓。
   async function renderCompositeSources(scene, textures, cam, width, height, time) {
@@ -2731,7 +2664,6 @@ export function createRenderer(canvas, opts = {}) {
       // 叠到车身上。预渲染拿到空图 → 流光整段消失（只剩静态剪影）。
       // 正解同空 composelayer：登记进 pendingEmptyCompose，主循环走到该层 z 序时
       // 连效果链一起做（captureEmptyComposeAtZOrder 里走 renderLayer）。
-      //
       // [we-scene patch 2748169441] **但这只对「自己没有内容」的 copybackground 层成立**。
       // scene.json 里 `copybackground` 是编辑器的一个开关，作者给**有贴图的整幅画面层**
       // 也会写 true（2748169441 的 7 个时段美术层：`models/下午16-18.json` +
@@ -2808,21 +2740,17 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // [we-scene patch] 组渲染目标：带子层的容器，其效果作用在**子层合成图**上。
-  //
   // WE 语义：composelayer 是一块画布，子层画在画布上，容器的效果对整块画布生效。
   // 此前渲染器把这类容器整个跳过（子层已合并成世界坐标各画各的），于是容器上挂的
   // 效果一处都不生效 —— 3264246690 的三条 DANGER 胶带挂的是 scroll（speedx 0.1），
   // 表现就是胶带纹理完全静止。全库 15 个这类容器 / 9 个壁纸。
-  //
   // 必须收**孙层**。childIds 只有直接孩子：3787937755 的 1361 挂 depthparallax，
   // 直接孩子只有身子 68，眼睛 1115 / 手 72 是 68 的孩子。只画直接子层时脸跟着
   // 视差走、眼睛钉在世界坐标上，看起来就像「眼睛单独随视差移动」。
-  //
   // 做法：用一台「以容器为视口」的临时相机把子孙画进组 FBO，再把该 FBO 当成容器的
   // 层内容纹理走既有效果链。容器 quad 的世界变换仍由 layerModelMatrix 给出，
   // 所以组 FBO 的 0..1 uv 必须正好对应容器矩形 —— groupCam 的 projW/projH 取容器
   // 尺寸、并把容器中心平移到视口中心。
-  //
   // **关键**：parse 阶段已把父级的 origin/scale/angles 合并进子层（见 parse.js 的
   // 父子层级合并），子层现在拿的是世界变换。而容器合成时会再套一次自己的变换，
   // 直接画子层等于把容器的 scale/rotate 施加两遍（实测胶带粗了一倍、倾角翻倍）。
@@ -2926,7 +2854,6 @@ export function createRenderer(canvas, opts = {}) {
           //      像素在采样阶段就被丢掉，只白付每帧上传带宽；
           //   3) VIDEO_TEX_HARD_CAP —— 兜底，防某些驱动报了巨大的 MAX_TEXTURE_SIZE
           //      却在 4K 逐帧上传时掉帧。
-          //
           // **不再**用固定 2048：那个值比典型渲染目标还小（Retina 上常见 3024
           // 甚至 3840），4K 源被降到 2048 再放大，观感明显发糊 —— 实测日志
           // `video tex ready 2048x1152 (src 3840x2160)` 就是这个损失。
@@ -2962,7 +2889,7 @@ export function createRenderer(canvas, opts = {}) {
               const id = vctx2.getImageData(0, 0, videoCanvas.width, videoCanvas.height)
               gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, videoCanvas.width, videoCanvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(id.data.buffer))
               while (gl.getError() !== gl.NO_ERROR) {}
-            } catch (e) { /* ignore */ }
+            } catch (e) {  }
           }
           texObj.width = uw
           texObj.height = uh
@@ -2991,19 +2918,16 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] passthrough：层内容 = 背后已渲染的画面（见 drawBackdropToFBO）。
     // 只对「没有自己内容」的层生效 —— 有贴图或组图时那才是层内容，
     // WE 的 passthrough 只影响空画布那一档。groupTex 走组渲染目标另一条路。
-    //
     // Transparency=Preserve（combo 0）没有旗标时也走这条：shader 写 alpha=scene.a，
     // 空画布下音条不可见。见 layerWantsPreserveBackdrop。
     const usePassthrough = (!!layer.passthrough || !!layer.isPostProcess || layerWantsPreserveBackdrop(layer) || layerWantsComposeBackdrop(layer)) && !layer.groupTex && !texObj && !isPuppet
     // puppet 层的层内容尺寸由 size 决定（网格坐标即层局部像素），而非贴图尺寸。
     // 空内容层（容器效果画布/纯效果层，无 textureName）同理：效果链 FBO 必须
     // 按图层 size 分配，否则会退化成 1×1，波形/音频条/光效被压缩成一个像素。
-    //
     // [we-scene patch] 序列帧层的「层内容」是**单帧**，不是整张 sprite sheet。
     // 用整张 sheet 的尺寸分配 FBO 会把一格拉伸铺满 —— 3299228616 的 AM/PM
     // 贴图是 22×40（上 AM 下 PM），按 40 高分配再把 22×20 的一格拉满，
     // 效果链输出的字符纵向拉伸一倍。故这里取帧尺寸。
-    //
     // [we-scene patch] puppet 层的「层内容」= 它的**平面贴图**（未形变），
     // 效果链在贴图空间跑完后才交给网格采样（见 drawPuppetToFBO 位置的长注释）。
     // 贴图尺寸恒等于 layer.size（库内 5/5 实测一致），与蒙版的层矩形基准天然对齐。
@@ -3188,7 +3112,6 @@ export function createRenderer(canvas, opts = {}) {
       // 纹素表里**没有条目**时（媒体被禁用、没有测试源），回落到作者写在原槽里的
       // 内置封面（parse 的 textureFallbacks）。有占位/测试封面（generated）时不回落
       // —— 那是优先级里的第二级。
-      //
       // [we-scene patch] **不限于 `$` 保留名**：`usertextures` 同样可以把槽绑到
       // **场景用户属性**上（`{name:"custombackground"}`，属性类型 file/scenetexture）。
       // parse 已经把槽名换成属性名、原槽贴图存进 textureFallbacks。属性没被用户
@@ -3197,7 +3120,6 @@ export function createRenderer(canvas, opts = {}) {
       // 是**实打实的白色输入**：`BLENDMODE 0` = Normal，`albedo.rgb = blendColor.rgb`
       // 直接把整屏刷白（2067939514 的「Solid」是 1920×1080 全屏背景层，一白就是整屏）。
       // 全库 22 张有 pass 级 usertextures，其中 10 张绑的是属性名而非 `$` 保留名。
-      //
       // 判据是「**纹素表里查不到这个名字**」而不是「名字以 $ 开头」：封面那三级
       // 优先级靠 `textures.get('$mediaThumbnail')` 是否存在来判定，属性纹理将来若
       // 由宿主按属性名注册进纹素表（用户选了自定义图）也走同一条短路。
@@ -3417,7 +3339,6 @@ export function createRenderer(canvas, opts = {}) {
       return
     }
     // 合成。容器效果画布按上面的判定选择混合方式（见 compositeLayer 注释）
-    //
     // [we-scene patch] passthrough 层绕开 [A]/[B] 那套判定：它的 FBO 里是
     // 「背景 + 效果」的**不透明**结果，按普通 over 直接盖回原位即可
     // （效果没改动的像素恰好等于原背景，视觉上零遮挡）。走 premultiplied 的

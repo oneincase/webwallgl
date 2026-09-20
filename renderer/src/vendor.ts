@@ -1,8 +1,4 @@
-// vendor 模块统一出口：we-scene 引擎 13 个模块的 import + asAny 转型
-//
-// [we-scene patch] 此前 14 个 import + 13 个 asAny 转型全部堆在 main.ts 顶部；
-// main.ts 拆分后（types/shell/video-loop/web/media/scene-mount/main 七模块），
-// 只有 scene-mount 与 media 需要引擎，从这里按需 import，避免每个模块重复转型。
+// we-scene 引擎统一出口（asAny 转型一次，scene-mount / media 按需引用）
 import * as pkgMod from "../vendor/we-scene/pkg/container.js";
 import * as texMod from "../vendor/we-scene/pkg/texture.js";
 import * as sceneMod from "../vendor/we-scene/scene/parse.js";

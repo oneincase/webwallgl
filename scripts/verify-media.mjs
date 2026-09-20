@@ -1114,15 +1114,43 @@ const { check, errors } = createChecker();
   {
     const esbuild = await import("esbuild");
     // 抽 resolveMountConfig 及其依赖（mediaProjectType / isWebProject /
-    // ensureSceneCanvas / normalizeFitOption / MEDIA_TYPES），去掉 import 行后
+    // ensureSceneCanvas / normalizeFit / MEDIA_TYPES），去掉 import 行后
     // 单独编译执行：这样跑的是真实现，改坏必红。
-    const slice = mountTs.slice(
-      mountTs.indexOf("/** 归一化旧 fit 别名"),
-      mountTs.indexOf("/**\n * 同步创建实例"),
-    );
+    const sliceStart = mountTs.indexOf("function isWebProject");
+    const sliceEnd = mountTs.indexOf("/**\n * 同步创建实例");
+    const slice = mountTs.slice(sliceStart, sliceEnd);
     check(slice.length > 0, "抽不到 resolveMountConfig 及其依赖的源码片段");
+    // normalizeFit / workshopIdFromSourceKey / sniffMediaType 来自其它模块；抽离时内联同语义
+    const shims = `
+function normalizeFit(fit) {
+  if (fit === "fit") return "contain";
+  if (fit === "fill") return "cover";
+  return fit === "contain" || fit === "stretch" ? fit : "cover";
+}
+function workshopIdFromSourceKey(key) {
+  if (typeof key !== "string" || !key) return undefined;
+  const seg = key.replace(/[?#].*$/, "").replace(/\\/+$/, "").split(/[/\\\\]/).pop() ?? "";
+  return /^\\d+$/.test(seg) ? seg : undefined;
+}
+function sniffMediaType(url) {
+  if (typeof url !== "string" || !url) return null;
+  let path = url;
+  const hash = path.indexOf("#");
+  if (hash >= 0) path = path.slice(0, hash);
+  const q = path.indexOf("?");
+  if (q >= 0) path = path.slice(0, q);
+  const seg = path.split("/").pop() || "";
+  const dot = seg.lastIndexOf(".");
+  if (dot < 0) return null;
+  const ext = seg.slice(dot + 1).toLowerCase();
+  if (ext === "gif") return "gif";
+  if (/^(mp4|webm|mov|m4v|mkv)$/.test(ext)) return "video";
+  if (/^(png|jpe?g|webp|bmp|svg)$/.test(ext)) return "image";
+  return null;
+}
+`;
     const out = await esbuild.transform(
-      slice + "\nexport { resolveMountConfig, mediaProjectType };\n",
+      shims + slice + "\nexport { resolveMountConfig, mediaProjectType };\n",
       { loader: "ts", format: "esm", target: "es2022" },
     );
     const tmp = join(ROOT, "scripts", `.tmp-media-mount-${process.pid}.mjs`);

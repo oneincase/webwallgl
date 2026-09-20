@@ -1,15 +1,11 @@
 // 场景对象模型：scene.json + project.json → 归一化图层列表
-//
 // [we-scene patch] 用户属性解引用（resolveUserValue）
-//
 // scene.json 里受壁纸自定义属性控制的字段形如 `{"user": "bgcolor", "value": "0.1 0.2 0.3"}`：
 // `user` 是 project.json `general.properties` 里的属性名，`value` 是场景保存时的快照。
 // 也可以是 `{"user":{"name":"game","condition":"3"},"value":true}`：字段值 = (属性 == condition)。
-//
 // 快照与 project.json 默认值并非总是相等 —— 本机 78 个场景的 3117 处引用里有 381 处不等
 // （作者改过属性默认值却没重存场景，或字段名与属性名撞车，如某场景的 visible 绑到一个
 // color 属性上）。
-//
 // 规则：优先属性表（这是 WE 的运行时语义，判据见 resolveUserValue 上方的烘焙值统计），
 // 但类型撞车（形状不符）时退回场景快照，避免把 color 塞进 visible 这种错乱。
 // [we-scene patch] 用户属性解引用已拆至 ./user-props.js（本仓库拆分，见 docs/ARCHITECTURE.md）
@@ -338,7 +334,6 @@ export function parseScene(sceneJson, project) {
       // [we-scene patch] 对象脚本：scale/origin/color/alpha/brightness/angles/visible 字段可绑
       // WE 脚本（音频条 scale 读 registerAudioBuffers 逐帧改写是经典用法，本场景 31 处）。
       // 解析保留脚本原文与静态快照，宿主逐帧求值后写回图层字段（见 main.ts）。
-      //
       // **visible 必须在列**：全库 180 个 visible 脚本（跨 40 个壁纸）承载了绝大多数
       // 指针交互 —— 266 个 cursor* 回调里有 115 个（43%）挂在这个字段上，包括全部
       // 3 个骨骼拖拽壁纸（2998757800 / 3790261114 / 3790389413）。
@@ -402,7 +397,6 @@ export function parseScene(sceneJson, project) {
           stop() { this.playing = false; this.paused = false },
         })),
       // WE 的 solid 层：无 image/particle，或 image 指向内置 models/util/*（纯色层，无纹理）
-      //
       // [we-scene patch] **composelayer 必须排除在外。** 它不是纯色层而是一块
       // 「效果画布」—— 层内容本该是**空白（全 0）**，让效果链自己往上画。
       // 而 solid 在渲染器里意味着「层内容 = whiteTex」（不透明纯白）。
@@ -411,7 +405,6 @@ export function parseScene(sceneJson, project) {
       //   2872267921「音频」的 test_shader 写 ApplyBlending(31, albedo.rgb, color, 1.0)
       //   = albedo + color，albedo 是纯白 ⇒ 输出恒为 1，整块 2000×2000 quad 全白，
       //   且 alpha 直通 albedo.a = 1 ⇒ 不透明地盖住整个画面。
-      //
       // [we-scene patch] **solidlayer 不看 `solid` 旗标。** 编辑器给 image=
       // `models/util/solidlayer.json` 时经常不写 `solid: true`（全库约 300 层 /
       // 仅约 40 层带旗标）。渲染器无贴图且 solid=false 会喂 transparentTex，
@@ -443,7 +436,6 @@ export function parseScene(sceneJson, project) {
       // [we-scene patch] `config.passthrough` —— WE 声明「本层的效果链输入 = 它**背后
       // 已渲染的画面**」，而不是一块空白画布。全库 120 处，**全部**是容器，
       // 其中 119 个是「空容器 + 效果」。
-      //
       // 不实现时空容器基底是 scene=(0,0,0,0)，而工坊音频可视化普遍写
       //   finalColor = ApplyBlending(MODE, lerp(barColor, scene.rgb, scene.a), barColor, bar*op)
       // scene.a=0 让那个 lerp 原样返回 barColor，两个混合参数相同 ⇒ **rgb 与 bar 无关**，
@@ -607,12 +599,10 @@ export function parseScene(sceneJson, project) {
   }
 
   // [we-scene patch] 视差锚点（mirage 路径专用，2026-09-19 用 Mirage 自渲染帧定案）。
-  //
   // WE 的视差是「节点级」的：从本层沿父链向上走，凡是没写 `disablepropagation: true`
   // 的祖先都会被**整体接管**——偏移用**最上层那个祖先的世界位置**算，深度也用
   // **那个祖先自己声明的**深度（子层自己写的被忽略）。语义就是「组视差带着整棵子树
   // 刚性平移」，所以同一组里的挂饰/面具必须挪一样多。
-  //
   // 3233141951 上一版没做这件事：它给每个子层用**自己的** origin 算静态项，于是
   // 面具01/挂饰1/挂饰2（父层是空组 576，视差 1.4）各自被挪了不同距离 —— 与 Mirage
   // 自渲染帧逐像素比对时该区域平均 |Δ亮度| 42.2（错）vs 25.6（按本规则）。

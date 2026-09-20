@@ -1,6 +1,5 @@
 // 渲染器的 GL 数据常量（从 renderer.js 拆出）：对齐表、混合模式映射、内联 GLSL、
 // quad 顶点布局、GL 枚举 → 名称表。
-//
 // [we-scene patch] 全部是**纯数据/纯函数**，零闭包依赖；ALIGN 必须与 hittest.js
 // 的几何约定保持单一真源（verify-pointer 读此表做命中回归）。
 export const ALIGN = {
@@ -21,7 +20,6 @@ export const ALIGN = {
 // blend mode 编号）→ 合成到画布时的 GL 混合模式。
 // 只映射能用固定管线表达的几种；其余（Overlay/SoftLight 等需要读回目标色）
 // 退回 translucent，与此前行为一致。
-//
 // 这一步不做的后果：像 3299228616 的 ripple1440p 水面层，贴图是一张几乎全黑、
 // 靠 Add 混合只贡献亮部高光的图（colorBlendMode=9），若按 translucent 合成，
 // 黑色像素会被当成不透明色直接糊住背景，看起来就是"一层黑色蒙版盖住了壁纸"。
@@ -36,7 +34,6 @@ const COLOR_BLEND_GL = {
 const BLEND_PREP = { screen: 1, multiply: 2 }
 
 // [we-scene patch] WE 的 32 个混合模式 GLSL 实现（编号同 common_blending.h）。
-//
 // **放在引擎 .js 层而不是 headers.ts**，因为两处都要用同一份：
 //   - 效果 shader 的 `#include "common_blending.h"`（headers.ts 供源）
 //   - 图层 colorBlendMode 的画布合成（本文件的 COMPOSITE_BLEND_FRAG）
@@ -175,7 +172,6 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
     else { r = mix(A, B, opacity); }                        // Normal(含 0)
     // CPU 参考（effects.js applyBlending）：5/10/30/31/32 直接返回不经 opacity 权重，
     // 其余统一 mix(A, r, opacity) 回归原色。
-    //
     // [we-scene patch] **mode 0 也必须排除**：它的分支已经是 mix(A, B, opacity)，
     // 再套一层等于按 opacity² 加权。effects.js 的 default 分支是 switch 内直接
     // return mix3(A, B, opacity)、不走 per() 的二次加权，这里漏排了 0。
@@ -191,14 +187,12 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
 
 // [we-scene patch] 图层 colorBlendMode 走 shader 侧混合：把背景当纹理读进来，
 // 用 ApplyBlending 算出结果再直接写（GL 混合关掉）。
-//
 // 为什么必须回读背景：固定管线的 blendFunc 只能表达 dst 因子为
 // ONE_MINUS_SRC_COLOR / SRC_COLOR / DST_COLOR 这种「原样的 src/dst」的线性组合，
 // 而 ColorBurn/Overlay/SoftLight/HSL 系全是 dst 的非线性函数，无论怎么配因子都算不出来。
 // 此前这 16 个模式一律回退 translucent —— 3287715210 的 7200x4800 渐变层
 // （colorBlendMode=3 ColorBurn、JPEG 无 alpha 故恒为不透明）就这样把人物整张盖住，
 // 用户看到的是「壁纸不显示人物」。
-//
 // u_Backdrop 是画布回读（captureBackdrop），u_BlendMode 是层的 colorBlendMode。
 // A = 背景（dst），B = 本层颜色（src），opacity = 层 alpha × 效果链 alpha，
 // 与 ApplyBlending(mode, A, B, opacity) 的参数序完全一致。
@@ -222,8 +216,6 @@ void main() {
   fragColor = vec4(r, 1.0);
 }`
 
-// ---------- 内置 Bloom 后期（general.bloom；WE 引擎 util/bloom 管线转写） ----------
-//
 // WE 场景设置「Bloom」在引擎里的真身是这条 util 材质链（linux-wallpaperengine
 // 复刻同源：`downsample_quarter_bloom`(_rt_FullFrameBuffer→1/4) →
 // `downsample_eighth_blur_v`(1/4→1/8) → `blur_h_bloom`(1/8→_rt_Bloom) →
@@ -231,7 +223,6 @@ void main() {
 //   亮部提取：4 抽头平均（无 gamma）→ `albedo *= saturate(max(r,g,b) - threshold)`
 //   （软拐点，只保留超出 threshold 的能量）→ 饱和度 ×2（-gray + albedo*2）
 //   → ×strength×tint **只乘一次**；模糊是能量守恒高斯，**不乘 strength**。
-//
 // ⚠ 2026-09-11 前误把 localeffects/Bloom(2822917890) 的 light_map 当真身：
 // 「pow(2.2) + r+g+b 求和硬判定」让亮场景 90%+ 像素全值通过，叠加 blur 双程
 // strength（strength²）→ 3791670523 / 3793592591 / 820654165 整屏冲白。
@@ -364,8 +355,6 @@ void main() {
 }`
 
 
-
-// ---------- 内联着色器（拷贝 / 合成 / 背景直通）与 quad 顶点 ----------
 const COPY_VERT = `#version 300 es
 in vec3 a_Position;
 in vec2 a_TexCoord;
@@ -381,11 +370,9 @@ void main() {
 // 序列帧图层（material 的 combos 里 spritesheet=1，注意大小写两种写法都有）把整张
 // sprite sheet 当贴图，但每帧只该采样其中一格。
 // 默认 origin=(0,0)、uDir=(1,0)、vDir=(0,1) 即整图直通，不影响普通图层。
-//
 // 为什么是仿射基而不是「子矩形 xy/zw」：TEXS 帧表本身存的就是一组基向量，
 // 2623473016/Raiden Friends 末 3 帧是**旋转 90° 打包**的（uDir=(0,-600)、
 // vDir=(338,0)），用矩形无法表达 —— 会取到错帧或糊成一片。
-//
 // 不做这一步的后果：整张 sheet 被铺满整个 quad —— 3250755486 的猫在碎玻璃后
 // 显示成 6x7 的贴图网格而不是逐帧动画。
 // [we-scene patch] u_BlendPrep：Screen/Multiply 合成前的**源色预处理**（见 BLEND_PREP）。
@@ -444,7 +431,6 @@ void main() {
 // 沿边缘方向模糊。选它而不是 12 抽头 quality 全量版的理由：壁纸内容绝大部分是
 // 半透明纹理 quad（不是硬几何边），reduced 版的边缘搜索已足够，且帧末只多一趟
 // 全屏 pass，代价恒定、无状态。MSAA 档走多重采样 FBO（renderer.js），不经这里。
-//
 // 输入是 captureBackdrop 的画布回读纹理（RGB8，无 alpha），输出直接覆盖画布，
 // 所以 alpha 恒 1（画布上下文 alpha:false，写出 alpha 无意义）。
 // 用 highp：4K 超采样下 UV 偏移量小，mediump（部分驱动 16bit）会在边缘方向

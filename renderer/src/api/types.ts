@@ -1,5 +1,4 @@
 // we-scene 公共 API 类型定义（唯一真源，`dist/we-scene.d.ts` 由此生成）
-//
 // 设计基线见 docs/LIBRARY-PLAN.md §3。三条约束反复体现在下面的取舍里：
 //   1. 一个 mount() + 一个 SceneInstance，没有模块级全局状态；
 //   2. 运行边界是**调用方传入的 canvas**，库不碰 document.body、不假设全屏；

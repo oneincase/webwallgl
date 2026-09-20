@@ -1,22 +1,5 @@
-// [we-scene patch] 粒子系统：CPU 模拟 + WebGL 实例化 quad 渲染。
-//
-// 坐标约定：粒子在**图层局部空间**模拟（发射器 origin 即局部原点），渲染时经
-// 图层变换（origin / scale / angles.z）落到世界空间；世界坐标 = 像素，y 向下。
-//
-// 为什么用实例化 quad 而不是 gl.POINTS：
-//   1. gl_PointSize 有实现相关的硬上限（多数 GL 实现 64–255），而全库实测
-//      sizerandom.max 达 2200（光轴 light_shafts / beam 类），点精灵会被硬截断；
-//   2. 点精灵无法旋转，但 54/149 个系统用 rotationrandom、15 个用
-//      angularvelocityrandom，不支持旋转会让花瓣/叶片/碎屑看起来是僵死的圆点；
-//   3. 点精灵尺寸是屏幕像素，无法随场景缩放/视差正确变化。
-//
-// 覆盖的 WE 组件（按全库 149 个真实粒子系统的使用频次排序，见 emitter/initializer/
-// operator 的实现分支）。未覆盖者静默忽略，不影响其余部分。
-
-// [we-scene patch] 模块结构（本仓库拆分，见 docs/ARCHITECTURE.md）：
-//   particle-util.js     纯工具：值/分布解析、音频门控、3D value-noise
-//   particle-shaders.js  实例精灵 shader 源 + 程序/VAO 装配（buildParticleProgram）
-//   particles.js         本文件：Particle / ParticleSystem（配置编译 + 模拟 + 绘制）
+// [we-scene patch] 粒子：CPU 模拟 + 实例化 quad（非 gl.POINTS：PointSize 上限、
+// 需旋转、尺寸须随场景缩放）。局部空间模拟 → 图层变换到世界像素（y 向下）。
 import { TAU, rand, randExp, parseVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
 import { buildParticleProgram } from './particle-shaders.js'
 import { audioResponse } from './audio.js'
@@ -35,18 +18,15 @@ export function getParticleQualityScale() {
 }
 
 // [we-scene patch 3509806978] CPU 模拟的粒子密度上限（按质量档分级）。
-//
 // 背景：instanceoverride.count 是 WE 的「粒子数量倍率」。参考实现（linux-wallpaper
 // engine 的 CParticle：rate = emitter.rate × override.rate，与 count 无关；
 // Mirage：emit_speed = emitSpeed × 音频响应）里 **count 只放大池容量，从不乘进
 // 发射率**——因为 count=5000 这类值若乘进 rate 会瞬间灌满整池（25/s × 5000 =
 // 125000/s）。
-//
 // 本仓为支持 count<1 的「调稀」语义（Rain_secondary count=0.13 需要降密度），让
 // rate 乘了 countMul——这在 count<1 时正确，但 count>1 的线性放大是密度/性能错误：
 // 全库 83 个 count override 真实最大值只有 5（雨/火花），唯一离群是 3509806978
 // 细节雪的 count=5000，把 360 池灌到 20000、每帧 CPU 算 fbm 湍流，稳态 2fps。
-//
 // 故对 count>1 的**发射率放大**按质量档封顶（count<1 的线性缩放原样保留）；
 // 池容量另设硬上限（MAX_POOL_BY_QUALITY），只作用于「作者显式写了 count override」
 // 的系统——无 override 的系统保留 20000 上限（Candles_1 maxcount=25000/rate=15000
@@ -353,11 +333,9 @@ export class ParticleSystem {
       const val = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw
       if (k === 'count') {
         // count 是 WE 的「粒子数量倍率」。两件事要分开：
-        //
         // 1) 池容量（maxCount）：按 base × count × 质量倍率放大，但带 CPU 硬上限。
         //    全库真实 count ∈ [0.05, 5]（83 处 override），3509806978 的 5000 是
         //    唯一离群值。有 count override 的系统按密度档封顶池容量。
-        //
         // 2) 发射率倍率（_ov.countMul）：稳态存活 ≈ rate × lifetime，不缩 rate 的话
         //    调小 count 密度不变（见下方 Rain_secondary 实测）。但参考实现
         //    （lwe / Mirage）里 count 从不乘 rate——因为 count>1 线性放大 rate 会把
@@ -426,7 +404,6 @@ export class ParticleSystem {
       // rate 与 instantaneous 都缺省 = 「维持池满」的常驻场（尘埃/灰烬/星空）。
       // 全库有 21 个这样的发射器（dust_motes_0 / ember_small / Shooting_Star_01）。
       // 若按 rate=0 处理，这些系统一颗粒子都不会出现（dust motes 整层消失）。
-      //
       // 但带 audioprocessingmode 的发射器例外：它的发射量由系统音频驱动，
       // 静音时 WE 的发射量趋近 0（_step 里按 audio.level 门控；无音频输入时恒 0）。
       // 若按「维持池满」处理，会把音频响应的星星填满并叠成一片过曝
@@ -969,7 +946,6 @@ export class ParticleSystem {
     }
   }
 
-  // ---------- 生成 ----------
 
   /**
    * @param em 发射器
@@ -1196,7 +1172,6 @@ export class ParticleSystem {
     return p
   }
 
-  // ---------- 每粒子更新 ----------
 
   updateParticle(p, dt) {
     p.age += dt
@@ -1414,7 +1389,6 @@ export class ParticleSystem {
     return cp.offset
   }
 
-  // ---------- 帧推进 ----------
 
   advance(dt, audio) {
     if (this.paused || !this.visible) return
@@ -1430,7 +1404,6 @@ export class ParticleSystem {
         // instanceoverride.count=5000 放大到 360×5000（截断 20000）后，450 步
         // 每步都线性扫全池（fill 的存活计数 + spawn 环形查找 + update 全量），
         // 单次 advance 实测 56.6s，4 个雪系统串行把首帧推到 145s，整个测试台卡死。
-        //
         // 实测雪系统只需 ~25 步（0.8s 模拟）就到稳态满池（lifetime 8~20s +
         // rate=25×countMul），多跑的步数纯属重复扫池。预算口径 = 步数×池规模，
         // 上限取 2.4e5「粒子步」：
@@ -1611,7 +1584,6 @@ export class ParticleSystem {
     for (let i = 0; i < n; i++) if (!this.spawn(em, b.pos)) break
   }
 
-  // ---------- 渲染 ----------
 
   // viewProj：场景投影矩阵；projH 用于 y 翻转（世界 y 向下 → 投影空间）
   render(viewProj, width, height, projW, projH) {

@@ -1,8 +1,6 @@
 // [we-scene patch] WE 文字对象（时钟 / 日期 / 歌曲标题等挂件）渲染
-//
 // WE 的「组件」在 scene.json 里几乎都以文字对象实现：本机 84 个场景 0 个 component
 // 对象、563 个文字对象（335 个带脚本）。动态文本 = 文字层 + text.script（ES module）：
-//
 //   'use strict';
 //   export var scriptProperties = createScriptProperties()
 //       .addCheckbox({ name: 'use24hFormat', value: true })
@@ -11,7 +9,6 @@
 //   export function update(value) {
 //       return hours + scriptProperties.delimiter + minutes;
 //   }
-//
 // 全库 335 个脚本用到的宿主符号（逆向统计）：
 //   scriptProperties.<name>     脚本属性（scene.json text.scriptproperties 的值，
 //                               缺省回落到 createScriptProperties 声明的默认值）
@@ -29,7 +26,6 @@
 //   applyUserProperties(props)  用户属性变更（挂载时以全量属性调用一次）
 //   mediaPropertiesChanged(evt) 媒体播放事件 —— 宿主无媒体源，不调用（歌曲标题
 //                               类脚本退化为静态快照文本，属已知上限）
-//
 // 排版语义（563 个文字层实测）：文字画在 layer.size 尺寸的盒子内；
 //   padding 内缩（装不下则当 0）；spacing 为字距/行距附加量；
 //   horizontalalign/verticalalign 相对**图层 origin** 贴齐（left = 文字左缘在
@@ -785,7 +781,6 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   //    否则打出「静态占位+新歌名」永久卡死（3786330502）。
   //  - 返回式（时钟/日期 `value=hours+':'+minutes; return value`、麻匪
   //    `return mediaData`）：返回值不读入参，store 保留静态文本由返回值覆盖。
-  //
   // 判据是词法分析「形参有没有被**读**」，不是有没有被赋值（两类都会 value=）。
   // 必须先剥注释/字符串/属性键，否则时钟脚本里的 `{value:false}`、`//value==`
   // 会误判（3379996991 的 Clock/Date 曾因此被清空不显示）。
@@ -1581,11 +1576,9 @@ function makeObjectLayerProxy(layer, opts) {
       return out
     },
     // [we-scene patch] 关键帧动画：改为返回**真实控制器**。
-    //
     // 此前一律返回 makeNeutralAnimation() —— 纯 no-op，`play()` 什么也不做。
     // 于是 2938612768 的封面淡入（mediaThumbnailChanged 里 `anim.stop(); anim.play()`）
     // 表现为「封面瞬切、没有过渡」。全库 126 处动画 / 25 张壁纸。
-    //
     // 控制器由宿主在解析阶段建好挂到 layer.animations（名字 → 控制器）与
     // layer.animationList（声明顺序）。取不到时仍回退中性对象：语料不判空，
     // 拿 null 会 TypeError 熔断。
@@ -1646,7 +1639,6 @@ function makeObjectLayerProxy(layer, opts) {
     },
     getTextureAnimation: () => makeTextureAnimation(layer),
     // [we-scene patch] ISoundLayer / IVideoTexture 播放控制。
-    //
     // 此前 play/pause/stop 是空 stub、getVideoTexture 恒 null：
     //   - 3292361861 `init` 里 `thisLayer.getVideoTexture().stop()` —— 拿 null
     //     立刻 TypeError，整段交互（含点耳朵播语音）三振熔断；
@@ -1765,7 +1757,6 @@ function makeObjectLayerProxy(layer, opts) {
   // `bar.origin = base+30` 会经 setter 写回模板层数组——getter 若回填同一 store，
   // baseOrigin 下一帧跟着涨，64 根条每帧 +30 跑出屏幕）。全库语料 0 处
   // `thisLayer.<vec>.<member> =` 成员直写，快照语义无回归面。
-  //
   // [we-scene patch] origin/scale 经 thisLayer / thisScene.getLayer() 写回时必须落
   // **local 槽**（localOrigin/localScale），与对象脚本 update 返回值的写回空间一致
   //（见 scene-mount 的 LOCAL_SLOT）：作者坐标是父级相对空间，world 三件套每帧由
@@ -2278,7 +2269,6 @@ export function textLayerHasTintMask(layer) {
   }
   return false
 }
-// ---------- 纯排版与绘制（实现在 ./text-layout.js，此处保留公共出口） ----------
 // [we-scene patch] 脚本沙箱与排版是两类依赖：沙箱吃 engine/属性/媒体视图，
 // 排版只吃 measure 回调与 Canvas2D。拆开后 Node 侧可只加载排版做布局判据，
 // 未来 WE 脚本兼容性扩展（见 docs/SCRIPT-COMPAT.md）只改沙箱一半。

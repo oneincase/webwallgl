@@ -78,7 +78,6 @@ vec3 hsv2rgb(vec3 c) {
 // 若声明成 vec3 版本，这些点会变成非法的 vec3(vec3)。
 // 唯一的 \`albedo.rgb = greyscale(albedo.rgb)\`（color_grading）在 HLSL 里靠标量
 // 自动广播成立，转译到 GLSL 后由赋值端的 vec3 = float 广播承接。
-//
 // 权重是 **vec3(0.11, 0.59, 0.3)**，即 Rec.601 (0.30,0.59,0.11) 的**逆序**——
 // WE 第一方 shader 里的历史遗留（BGR 时代）。依据是 4 个第一方文件把它内联写死：
 // localcontrast_combine.frag（正是 blur_combine 的免头文件版，#if GREYSCALE 下
@@ -109,16 +108,13 @@ vec3 ContrastSaturationBrightness(vec3 color, float brt, float sat, float con) {
 `,
   // WE common_perspective.h（重建）。缺失时 waterwaves（全库 344 处引用 / 44 壁纸）、
   // waterripple、perspective、reflection 等整体被跳过 —— 是影响面最大的一个头。
-  //
   // squareToQuad 把**单位正方形映射到四边形**，全库 98 个文件只有一种调用形式：
   //   mat3 xform = inverse(squareToQuad(g_Point0, g_Point1, g_Point2, g_Point3));
   //   v_TexCoord = mul(vec3(a_TexCoord.xy, 1.0), xform);
   // 片元侧再做透视除法 \`v_TexCoord.xy / v_TexCoord.z\`，并用 \`step(0.0, v_TexCoord.z)\`
   // 当有效性掩码 —— 所以正面样本的 z 必须为**正**，末行不能带负号缩放。
-  //
   // 四个点的默认值是 g_Point0..3 = (0,0) (1,0) (1,1) (0,1)，即单位正方形，
   // 此时必须退化为单位矩阵（否则所有没调透视的图层都会被莫名扭曲）。
-  //
   // 采用标准的「单位正方形 → 任意四边形」投影解法（Heckbert）：
   //   dx1 = p1-p2, dy1 = p3-p2, dx2 = p0-p1+p2-p3（对边不平行时的偏差量）
   //   若 dx2 为 0 则是仿射情形，g=h=0。
@@ -162,19 +158,16 @@ mat3 squareToQuad(vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
   // WE common_blur.h（重建）。blurNa 的权重不是估算的 —— 壁纸 1444077782 里存着
   // **加公共头之前的旧版** blur_precise_gaussian.frag，把 13/7/3 抽样的系数
   // 逐项内联写死，这里逐字照抄（已核对原文）。
-  //
   // 两个关键约定：
   //  1. **隐式采样 g_Texture0**，不传 sampler —— 调用形式恒为 blurNa(uv, step)，
   //     而包含本头的文件都声明了 uniform sampler2D g_Texture0；
   //  2. step 由**顶点着色器**算好：VERTICAL 时 (0, g_Scale.y / g_Texture0Resolution.w)，
   //     否则 (g_Scale.x / g_Texture0Resolution.z, 0) —— 即已经除过分辨率的单texel步长，
   //     未使用的轴为 0。所以这里直接按 ±1..±6 倍 step 取样即可。
-  //
   // 注意 precise 版的 3 抽样权重是 0.27901/0.44198/0.27901（真高斯，和为 1），
   // 与 blur_gaussian.frag 的 0.25/0.5/0.25 **不同**，不要统一。
   // g_Texture0Resolution 四个分量都是像素尺寸：.xy 是补齐后的纹理尺寸（POT），
   // .zw 是图像实际尺寸；都是被除数，不是倒数。
-  //
   // **本头必须自己声明 g_Texture0**：`#include "common_blur.h"` 在文件第 4 行，
   // 而 `uniform sampler2D g_Texture0` 在第 8 行 —— GLSL 要求先声明后使用，
   // 若头里只引用不声明，实测报 `'g_Texture0' : undeclared identifier`。
@@ -234,7 +227,6 @@ vec4 blurRadial3a(vec2 uv, vec2 center, float scale) {
   // COMPOSITEMONO 全库从未被覆盖，恒为 0。
   // ApplyCompositeOffset 在 normal 下必须是恒等 —— 否则所有未改 COMPOSITE 的
   // blur 效果都会整体偏移。
-  //
   // 两条**必须自洽**的约束（踩过）：
   //  1. **不能调用 ApplyBlending** —— blur_combine.frag 只 include 本头，
   //     不 include common_blending.h。真实 WE 的 common_composite.h 必须自给自足，

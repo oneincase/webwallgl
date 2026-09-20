@@ -1,8 +1,4 @@
-// 场景壁纸装配（从 main.ts 拆出）：mountScene 一千两百行的拉取→解析→资源装配→
-// 渲染循环→指针/脚本/音频/文字/粒子/媒体全链路都在这一个函数闭包里。
-//
-// [we-scene patch] 本次只做**文件级**搬移（行为零改动）；函数内部再按阶段拆分
-// 属于下一轮（需先给装配各阶段补离线判据，见 docs/ARCHITECTURE.md 路线图）。
+// 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
 import { clear, effectiveDpr, markFrame, normalizeFit, readText, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
@@ -292,7 +288,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       try {
         reportDiag(rt, cfg, s.slice(0, 300));
       } catch {
-        /* 忽略 */
+        
       }
     }
     origWarn(...args);
@@ -1404,7 +1400,6 @@ cfg, source, pkgAbort.signal);
           // 半透明边缘的 rgb 被乘两次，所有 1~2px 细线（眼部轮廓/泪痕线/发丝）
           // 变深色刻线，脸上叠出「细框眼镜」（3264246690 实测；同类还见
           // 3148125112 / 3223543799）。
-          //
           // [we-scene patch] 且必须对齐 WE 的 FreeImage 语义「不执行 EXIF 方向」：
           // 浏览器解码默认按 EXIF 转正，orientation=8 的 1080×5760 长图会变成
           // 5760×1080，与层 size / 90° 旋转错轴，整屏撕成条带（1920911984）。
@@ -1436,7 +1431,6 @@ cfg, source, pkgAbort.signal);
         if (!entry) return null;
         // 序列帧表（.tex 的 TEXS 段）：粒子与序列帧图层据此切 sprite sheet。
         // 没有它就只能按 sequencemultiplier 猜 N×N 方格，对横排/竖排 sheet 会采错图块。
-        //
         // 挂**整个 frames 对象**（含 atlasWidth/Height）而不只是 list：帧矩形的
         // 归一化分母必须是图集真实像素尺寸。1444077782 的 .tex 头部声明 316x214
         // （那是单帧尺寸），mip0 实为 2048x1024 —— 用错分母整表错位。
@@ -1590,7 +1584,6 @@ cfg, source, pkgAbort.signal);
           // （帧表来自 .tex 的 TEXS 段，见 loadTex 里 entry.frames）。
           // 不置这个标志的话整张 sheet 会铺满 quad —— 3250755486 的猫在碎玻璃后
           // 显示成 6x7 贴图网格而非逐帧动画。全库 52 层 / 7 壁纸。
-          //
           // combo 键名**大小写两种写法都存在**：3250755486/3299228616 用 `SPRITESHEET`，
           // 3292361861/3790527023/1444077782 用小写 `spritesheet`。只认大写会漏掉
           // 后三个壁纸的 12 层（含全部开关按钮）。
@@ -1793,7 +1786,6 @@ cfg, source, pkgAbort.signal);
 
       // ---- 粒子系统（particle 图层）----
       // 加载粒子模型 json + 材质 + 贴图，构造 ParticleSystem，注入 renderer。
-      //
       // 贴图有两个来源：pkg 内嵌（工坊自制素材）与 WE 内置资源。后者（particle/halo、
       // particle/fog/fog1 …）不在 pkg 里 —— 全库 33 张被引用的粒子贴图有 24 张属于
       // 内置资源。没有 WE 安装目录可回退，故用 particle-textures.js 按名字语义
@@ -2387,7 +2379,6 @@ cfg, source, pkgAbort.signal);
       // [we-scene patch] 逐帧需要重算父子变换的图层集合（见 scene/parse.js
       // recomposeWorld / collectTransformDirty）。种子 = 变换字段绑了脚本或
       // 关键帧动画的层 + 挂件层，然后连同整棵子树收进来（父动子必须跟）。
-      //
       // 这是**风险闸门**：全库 187 张场景里 126 张不含任何脚本化变换，
       // 集合为空 → 一帧都不重算 → 从机制上不可能回归。
       const transformDirty: Set<unknown> = scn.collectTransformDirty(
@@ -2549,7 +2540,6 @@ cfg, source, pkgAbort.signal);
             textLayerText.set(layer.name || "", String(layer.text ?? ""));
             // anchor ≠ center 时一次性平移 origin，让盒子按锚点贴住原点（世界 y 轴朝上）。
             // 用的是原盒子尺寸 —— 下面立刻把 layer.size 扩成带溢出边距的画布尺寸。
-            //
             // [we-scene patch] 偏移必须同时折进 localOrigin：world 逐帧由
             // recomposeWorld 从 local 重新合成，只改 world 的话下一帧就被冲掉，
             // 带脚本/动画变换的文字层锚点会当场失效。
@@ -2668,7 +2658,6 @@ cfg, source, pkgAbort.signal);
               // WE 运行时按内容重排），墨水远超盒子，旧实现把字截在画布边缘
               // （3785267658 整层空白）。这类层按溢出墨水**对称**扩边：盒中心恒等于
               // 画布中心 = 层 origin，墨水位置不随扩边移动。
-              //
               // 判据必须同时满足，缺一不可（2026-09-11 收窄，曾因只看盒子小误伤）：
               //  ① 占位小盒（boxW/H ≤ 4）——正常大盒自有几何，扩边会改 quad 把
               //     好字挪出可见区（2938612768 标题被黑卡裁）；
@@ -3042,7 +3031,6 @@ cfg, source, pkgAbort.signal);
               // layer.origin / layer.angles 再喂给 applyTo，等于把动画曲线积分：
               // 3233141951「头发0202」angles 峰值只有 0.14rad，积 80 帧就转一整圈，
               // origin 峰值 −23px 也会一步步漂出画面，看起来像跟着飞剑飞走。
-              //
               // [we-scene patch] 变换字段的基准取 **local** 快照：曲线在 local 上
               // 叠加，再由 recomposeWorld 合成 world。基准若取 world，父偏移会被
               // 算两遍（全库 4 个非根变换动画全是 relative:true，取错即双计）。
@@ -3270,7 +3258,6 @@ cfg, source, pkgAbort.signal);
                 // 此前 init() 无参调用，所有 `init(value){ initialValue = value.x }`
                 // 形态的脚本（3264246690 的月亮/时间/三条胶带音频缩放，全库音频
                 // 可视化模板的标准写法）都会在 init 里 TypeError 熔断。
-                //
                 // [we-scene patch] 变换字段读 **local** 槽：作者的 init/update 都在
                 // 父级相对空间里算（见 fieldSlot 上方注释）。喂 world 会让脚本第一帧
                 // 就把图层拽到「local 目标当 world 用」的错位置上。
@@ -3646,11 +3633,9 @@ cfg, source, pkgAbort.signal);
           // [we-scene patch] 关键帧动画推进并写回字段。必须在对象脚本**之前**：
           // 同一字段上两者可以并存（全库 44 处），语义是脚本控制播放头、
           // 动画产出值，脚本的 update 返回值优先级更高。
-          //
           // dt 取**真实经过时间**（与骨骼动画的 t 同一时钟），不是目标帧间隔：
           // 见 lastAnimT 的声明处。首帧 dt=0（lastAnimT 初值 0，t 也≈0）；
           // 暂停期间 t 已扣掉 pauseAccum，恢复后不会补跑一大段。
-          //
           // 两条时间线必须拆开（2026-09-20，3233141951 头发/头漏模回归）：
           //   · clockDt = 未封顶真实 dt → 关键帧 advance（头发0202 / 发饰 / 火1…）
           //     骨骼蒙皮吃的是绝对时间 t，关键帧若也封顶就会在每次卡顿后

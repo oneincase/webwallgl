@@ -1,11 +1,9 @@
 // 媒体源构造辅助：把「宿主知道的那几个字段」补全成引擎要的完整快照。
-//
 // 为什么需要它：MediaSnapshot 有 18 个字段，且五个颜色**必须是带链式方法的
 // 实例**——真实语料里的脚本会写
 //   color = event.primaryColor.subtract(old).multiply(t).add(old)
 // 给普通数组或 {x,y,z} 字面量会 TypeError 熔断整个脚本，症状是「换歌后整层
 // 不见了」，且不报错、不熔断计数，极难排查（verify-media 为此专门有一节断言）。
-//
 // 宿主接系统 Now Playing 时通常只拿得到 title/artist/album/position/duration
 // 与一张封面，剩下的（配色、歌词、trackIndex）要么没有、要么要自己算。
 // 这里统一补默认值并保证类型正确，宿主只给已知字段即可。

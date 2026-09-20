@@ -1,13 +1,10 @@
 // MDL 蒙皮求值（从 mdl.js 拆出）：关键帧采样、TRS 合成、逐骨世界矩阵、蒙皮矩阵
-//
 // 纯数学、DOM/GPU-free；GPU 侧在 mdl.js（createMDLRenderer）。
 // computeSkinMatrices 是 verify-groups I4 区块的直接被测对象。
 import { mat4Mul, mat4Invert, composeTRS } from './mdl-math.js'
-// ---------- 姿势求解 ----------
 
 // 在 time（秒）处求 anim 某轨的 TRS 分量，写入 out9 = [tx,ty,tz, rx,ry,rz, sx,sy,sz]。
 // 拆出 TRS（不直接出矩阵）是为了让多条动画层能按 WE 语义在 TRS 空间叠加/加权。
-//
 // [we-scene patch] 槽位语义修正：k[3..5] 是**欧拉角**、k[6..8] 是**三轴缩放**。
 // 原实现读成 [qx,qy,qz,qw, sx,sy]，从索引 3 起整体错位一格，后果有三层：
 //   ① 真正的 rz(k[5]) 被当成 qz，再经四元数公式换算成 2·atan2(z,w) —— 角度被放大约 2 倍；
@@ -83,10 +80,8 @@ function sampleTrack(track, anim, time, out) {
 }
 
 // 骨骼绑定姿势的 TRS 基准。
-//
 // [we-scene patch] **必须与 invBindWorld 同源**（`mdl.bindTRS`，由 parseMDL 的
 // baseLocal 一并产出），不能在这里另用别的姿势重算一套。
-//
 // 旧实现取「平移 = 绑定矩阵第 4 列、旋转 = 0、缩放 = 1」，而 invBindWorld 取主动画
 // frame0，两套参考系并存。它们在 59/73 个模型上恰好相等，掩盖了问题；不相等的
 // 20 个（3148125112 人物2 差 2101px、腿1 差 1230px、3113287126 差 872px、
@@ -94,7 +89,6 @@ function sampleTrack(track, anim, time, out) {
 // （acc = base·(1-w) + smp·w）把 base 整个替换掉，**t=0 仍然恒等** ——
 // 静止画面正常，一动起来 additive 增量与 blend<1 的插值就落在错误参考系里，
 // 父子骨被推向相反方向。
-//
 // 旧实现还把旋转固定为 0、缩放固定为 1，对绑定姿势自带旋转的骨直接错：
 // 腿1 骨 3 的绑定角是 −2.608 rad，骨 13 是 −2.940 rad。
 function bindTRS(mdl, i, out9) {
@@ -133,7 +127,6 @@ function staticPoseTRS(mdl, i, out9) {
 
 
 // 计算 time 处的蒙皮矩阵数组（World(anim) · invBindWorld），写入 mdl._skinCache
-//
 // [we-scene patch] boneOverrides：脚本层的骨骼平移覆写（`Map<boneIndex, [x,y,z]>`，
 // **骨骼局部空间**，由宿主从世界像素换算而来，见 render/text.js 的 makeBoneApi）。
 // WE 的 thisLayer.setBoneTransform() 语义按全库 4 处调用点实测为**绝对覆盖**而非累加
@@ -161,13 +154,11 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   // 用 kopf/arm/body 三条动画分别驱动头(骨8)、手臂(骨4,5,6)、身体(骨1) 的模型，
   // 只播 kopf 会让其余骨骼被这条动画的轨道按绑定姿势覆写 —— 表现就是五官、头发、
   // 躯体各自错位僵死。
-  //
   // 叠加规则（TRS 空间）：
   //   base 取绑定姿势（frame0 实测等于绑定矩阵），
   //   每层贡献 = (该层采样 - base) × blend，additive 层累加，
   //   非 additive 层按 blend 覆盖式混合（mix(base, sample, blend)）。
   //   rate 逐层生效（各层动画速度不同，如 lainpw 的 0.4 / 0.5 / 0.5）。
-  //
   // [we-scene patch] 列表非空但全部 visible:false → **绑定姿势**，不要退回
   // animations[0]。官方 IAnimationLayer.visible = 这一层当前是否被应用；
   // 3233141951 刀的 newproperty38「武士刀动画 开/关」关掉后若仍播 clip，开关无效。
@@ -289,7 +280,6 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     // additive 权重总和 >1 时按总权重归一：Lucy 那样 5 条 additive 层（blend 均为 1）
     // 若直接累加，同一根骨的增量会被叠 5 次，人物幅度被放大到形体明显走形。
     // WE 的 additive 混合是加权平均而非无界累加，故超过 1 时整体收缩回 1。
-    //
     // [we-scene patch] 归一化只能作用于**加算增量之和**，绝不能动 acc 本体：
     // acc 里还有非加算层的替换结果（blend=1 时 = 该层采样 = 装配姿势，与 base
     // 无关）。旧写法 `acc = base + (acc − base)/addW` 会把替换姿势也往绑定姿势
@@ -328,12 +318,10 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   }
   for (let i = 0; i < count; i++) {
     // 蒙皮矩阵 = World(anim) · World(绑定姿势)⁻¹，静止时为单位变换。
-    //
     // 不要再乘 MDLE 校正（restCorrection）。MDLE 存的是**贴图空间的静止姿势**：
     // 作者把眼睛/头发/手臂等部件在贴图里分散摆放，MDLE 描述的正是「网格姿态 →
     // 贴图里那些分散位置」的搬运。渲染要的恰好相反 —— 顶点保持网格姿态（人物
     // 完整），UV 直接去贴图对应区域取样即可，不需要任何搬运。
-    //
     // 实测 3787341007（lainpw）：乘上 restCorrection 会把眼睛（骨14/15）推到左边
     // 426px/360px、头发（骨12）推到右边 345px、头部（骨9/11）上移，躯干（骨0）不动
     // —— 正是「双眼在人物左边很远处独立存在、头发在右上方、头与脖子断开」的现象。
@@ -591,7 +579,6 @@ export function followAttachments(follows, time, getBoneOverrides) {
   }
   // 本帧基准：优先用 recomposeWorld 刚写下的 `attachBase`（父子变换重算后的
   // 绑定姿势世界位），否则退回挂载期快照 s.x/s.y（静态场景走这条，与改动前逐位相同）。
-  //
   // **绝不能拿 `layer.origin` 当基准** —— 那是上一次 follow 的输出，连调两次就把
   // 骨骼增量累加两遍（verify-attachments 的「调用两次必须得到同一 origin」正是锁这个）。
   // attachBase 只由 recompose 写、follow 只读，因此本函数幂等。

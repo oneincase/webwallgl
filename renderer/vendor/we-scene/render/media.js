@@ -1,24 +1,19 @@
 // [we-scene patch] WE 媒体集成（Media Integration）的模拟数据源
-//
 // WE 引擎把「系统当前正在播放的音乐」推给壁纸脚本，靠五个回调（不是轮询）：
-//
 //   mediaPropertiesChanged(e)  e.title / e.artist / e.albumArtist / e.album
 //   mediaThumbnailChanged(e)   e.hasThumbnail / e.primaryColor / e.secondaryColor
 //                              e.tertiaryColor / e.textColor / e.highContrastColor
 //   mediaPlaybackChanged(e)    e.state（对应 MediaPlaybackEvent 枚举）
 //   mediaTimelineChanged(e)    e.position / e.duration
 //   mediaStatusChanged(e)      有无媒体源（全库零使用，留占位）
-//
 // 全库 21 张壁纸 / 308 处回调声明依赖它，此前一次都没被调用过 —— 音乐类壁纸
 // 的歌名、歌手、封面、唱针动作、进度条因此全部停在作者存盘时的占位快照
 // （2938612768 就一直显示 "Wallpaper Music" / "Name of artist"）。
-//
 // 本模块严格照抄 render/audio.js 已验证的范式：
 //   - **纯时间函数**：update(t) 同 t 同结果，不累积状态，暂停/回卷都安全，
 //     node 离线校验与浏览器逐帧驱动走同一条路径；
 //   - vendor 侧只做数据，宿主侧组装并派发（见 main.ts）；
 //   - 接真实系统媒体源时只需替换 update，快照结构不变。
-//
 // 两个必须遵守的类型约定（踩过同款坑）：
 //   1. **颜色字段必须是 Vec3 实例**，不能是数组或 {x,y,z} 字面量。语料脚本会写
 //      `newColor.subtract(oldColor).multiply(t).add(oldColor)` 做封面主色渐变，
@@ -26,7 +21,6 @@
 //      原因存在的：worldPosition 给字面量导致 3 个骨骼拖拽壁纸全部失效）。
 //   2. **state 用 MediaPlaybackEvent 的整数**（STOPPED=0 / PLAYING=1 / PAUSED=2）。
 //      全库 236 处读 `event.state` 并与枚举比较。
-//
 // 歌词（lyrics）是**本仓库的自定义扩展**，WE 官方媒体 API 没有这一类，全库
 // 21 张壁纸也没有一处用到。放在这里是为了给宿主/自制壁纸提供统一数据源，
 // 通过 mediaLyricsChanged 派发，不与 WE 的四类语义混淆。
@@ -388,20 +382,16 @@ export function cloneMediaSnapshot(s) {
   }
 }
 
-// ---------------------------------------------------------------------------
 // [we-scene patch] 壁纸自带音频 → 媒体面板数据源
-//
 // WE 官方语义里媒体集成只反映**系统播放器**，壁纸自己播的音频不产生任何媒体
 // 事件 —— 但语料里音乐壁纸（3151551777 等）的 MEDIA 面板显隐全部挂在
 // `mediaPlaybackChanged(state!==STOPPED)` 上、歌名来自 mediaPropertiesChanged：
 // 壁纸放着自己的歌、面板却永久隐藏或停在模拟源的品牌占位曲。
-//
 // 本驱动把**脚本显式播放的声音层**（thisScene.getLayer(x).play() → soundCtl.play）
 // 接进媒体快照：正在播的曲目即「正在播放」的媒体。装配期自动开播的环境音
 // （火车声、雨声，宿主 startsilent=false 分支）**不** markPlayed —— 那不是用户
 // 在听的「曲目」，抢媒体面板没有意义。文件标签（Vorbis/ID3）实测常为空
 // （3151551777 全部 17 首注释 n=0），标题回退到层名剥扩展名与曲号前缀。
-// ---------------------------------------------------------------------------
 
 /** 层名 → 曲目名：剥扩展名与 "1.16 " / "01. " / "2-01 " 这类曲号前缀 */
 export function songTitleFromLayerName(name) {
@@ -506,7 +496,7 @@ export function createWallpaperAudioMedia(MEDIA_PLAYBACK, MediaVec3) {
     for (const { au } of tracks) {
       if (au !== t.au) {
         au.pause()
-        try { au.currentTime = 0 } catch { /* ignore */ }
+        try { au.currentTime = 0 } catch {  }
       }
     }
     Promise.resolve(t.au.play()).catch(() => {})

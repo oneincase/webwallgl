@@ -1,15 +1,12 @@
 // [we-scene patch] 壁纸自带 BGM（声音层 HTMLAudio）→ 频谱桥。
-//
 // 官方 WE 的音频可视化采的是「整条音频输出」：壁纸自带的声音层一旦在播放，
 // 它的频谱就和系统音频一起喂给 g_AudioSpectrum* / engine.registerAudioBuffers。
 // 本仓的声音层用 HTMLAudio 直放，没经过任何分析节点 —— 35 张「BGM + 音频反应
 // 内容」的壁纸里，作者若把音条设计成响应自带音乐，就只会被模拟/麦克风源驱动。
-//
 // 做法：一个共享 AudioContext，每个声音元素 createMediaElementSource 后分两路
 // （analyser 采集 + destination 继续出声），每帧把各元素的频域数据按频段取最大
 // 合成成 64 段（左右声道 Web Audio 的单 AnalyserNode 不分离，BGM 多为立体声但
 // 音条不强调声道差，同值喂左右；外部注入/麦克风仍是真立体声）。
-//
 // 约束：
 //  - createMediaElementSource 每元素**只能一次**：在声音层装配时挂，销毁不重连；
 //  - blob URL 同源，无 CORS 污染，频谱可读；
@@ -112,7 +109,7 @@ export function createBgmAnalyser(): BgmAnalyser {
     try {
       void ctx?.close();
     } catch {
-      /* ignore */
+      
     }
     ctx = null;
     analyser = null;

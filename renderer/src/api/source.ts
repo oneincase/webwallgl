@@ -1,5 +1,4 @@
 // Source 实现：把「场景资源从哪来」与渲染解耦（见 docs/LIBRARY-PLAN.md §4）
-//
 // 库对外只发两个请求（scene.pkg / project.json）—— shader 从 pkg 内部取，
 // 视频/音频/字体都是 pkg 内嵌字节转 Blob URL。所以这里不做通用虚拟文件系统。
 

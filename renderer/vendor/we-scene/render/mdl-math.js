@@ -1,11 +1,9 @@
 // MDL 共享底座：列主序 4x4 工具 + 二进制读取原语（从 mdl.js 拆出）
-//
 // [we-scene patch] 解析（mdl-parse.js）、蒙皮（mdl-skin.js）、渲染（mdl.js）
 // 三段都要用这批纯函数，单独成模块以消除曾经的 mat4Mul/mat4Invert 双实现
 // （与 render/math.js 的重复见 docs/ARCHITECTURE.md「未来拆分路线」）。
 const IDENTITY = Object.freeze([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 
-// ---------- 列主序 4x4 工具（与 WebGL uniformMatrix4fv 的内存布局一致） ----------
 
 function mat4Mul(a, b, out) {
   const o = out || new Float32Array(16)
@@ -55,7 +53,6 @@ function mat4Invert(m) {
 // MDLA 关键帧的 9 个 float 是 **[tx,ty,tz, rx,ry,rz, sx,sy,sz]**（欧拉角 + 三轴缩放），
 // 不是「四元数 + 二维缩放」。此前按 [T, qx,qy,qz,qw, sx,sy] 读，索引 3 之后**整体错位一格**：
 // 真正的 rz 被当成 qz、sx 被当成 qw、sy/sz 被当成 sx/sy —— 详见 sampleTrackTRS 的判据。
-//
 // 旋转按 Rz·Ry·Rx 合成，列 0/1/2 分别乘 sx/sy/sz（列主序，o[col*4+row]）。
 // 2D 场景里 rx/ry 实测恒为 0（全库 99.9% / 100% 的关键帧），此时退化为纯绕 z 旋转，
 // 但仍按完整欧拉角实现，免得 3233141951（朱鹤 rx 最大 1.605）这类模型再踩坑。
@@ -86,7 +83,6 @@ function composeTRS(tx, ty, tz, rx, ry, rz, scx, scy, scz, out) {
   return o
 }
 
-// ---------- 解析 ----------
 
 function readCStr(dv, off) {
   const bytes = []

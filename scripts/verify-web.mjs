@@ -1704,7 +1704,7 @@ function runShim(extras) {
     !/cfg\.type === "web" && cfg\.src/.test(main),
     "main.ts 适配层不应再单独分流 web（已由 dispatch 处理）",
   );
-  check(/mountWebWithOptions|type === "web"|isSameOriginUrl/.test(webTs), "web.ts 必须实现 mountWeb");
+  check(/export function mountWeb\b|type === "web"|isSameOriginUrl/.test(webTs), "web.ts 必须实现 mountWeb");
   check(/import shimSource from "\.\/web-shim\.js\?raw"/.test(webTs), "web.ts 必须以 ?raw 嵌入 shim");
   check(/isSameOriginUrl/.test(webTs) && /origin null|同源/.test(webTs), "web.ts 同源入口不得走 blob（Spine/WebGL）");
   check(

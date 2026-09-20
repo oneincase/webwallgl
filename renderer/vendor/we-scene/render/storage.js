@@ -1,5 +1,4 @@
 // WE SceneScript 的 localStorage 语义（ILocalStorage）。
-//
 // 官方文档（docs.wallpaperengine.io）：
 //   - **按壁纸共享**：同一张壁纸的全部脚本（文字/对象字段/效果开关/常量/general，
 //     五 eval 点）看到同一份存储；不是每个脚本一份。
@@ -9,7 +8,6 @@
 //   - API 是 getItem/setItem/removeItem/clear/key/length；WE 文档方法名是
 //     `delete`（不是 removeItem），语料里 `localStorage.set/get/remove` 非标准
 //     别名也都出现过，一并提供。
-//
 // 引擎侧零 DOM、零 IO：所有读写经注入的 provider（{get,set,remove,clear,keys}）。
 // provider 缺失时退化为进程内 Map（离线 verifier / 未接持久化的宿主用）。
 // 纯逻辑模块，Node 可直载（ARCHITECTURE §三不变量）。

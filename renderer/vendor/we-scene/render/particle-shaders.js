@@ -1,5 +1,4 @@
 // 粒子渲染 GPU 装配（从 particles.js 拆出）：实例精灵 shader 源 + 程序/VAO 构建
-//
 // [we-scene patch] _buildProgram 的方法体只吃 gl 参数、不读实例状态，
 // 抽成自由函数后 Simulation 与 GPU 装配解耦（ParticleSystem.render 里的
 // this._prog 消费方不变）。

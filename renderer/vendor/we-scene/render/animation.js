@@ -1,13 +1,10 @@
 // WE 场景关键帧动画（scene.json 的 `animation` 字段）
-//
 // [we-scene patch] 这套东西此前**完全没实现**：`parse.js` 只读字段的 `.value`
 // （那份存场景时的静态快照），`animation` 兄弟键被静默丢弃；脚本侧
 // `thisObject.getAnimation()` 返回的是 text.js 的 `makeNeutralAnimation()` ——
 // 一个纯 no-op 链式对象，`play()` / `stop()` 什么也不做。
 // 全库 **126 处动画 / 25 张壁纸 / 743 个关键帧**。
-//
 // 数据结构（实测，不是猜的）：
-//
 //   "alpha": {
 //     "value": 1,                       ← 静态快照，relative 时作为基准
 //     "animation": {
@@ -17,12 +14,9 @@
 //       "options": { "fps": 30, "length": 60, "mode": "single", "startpaused": true, "name": "淡入" }
 //     }
 //   }
-//
 // 关键帧恒为 6 个字段（743/743，无例外）：
 //   { frame, value, front:{enabled,x,y}, back:{enabled,x,y}, lockangle, locklength }
-//
 // 实测数据决定的取舍：
-//
 // - **贝塞尔插值不能省。** 743 个关键帧里 303 个（40.8%）带真实切线手柄，
 //   126 处动画里 41 处（32.5%）含非线性帧。x 有 84 种取值、y 有 155 种非零值
 //   （典型是 1/3 帧间距的手柄）。只做线性会让 3195212886 / 3233141951 的
@@ -38,12 +32,10 @@
 //   `previewvalue` 都是编辑器 UI 状态**，求值时一律忽略。
 // - 关键帧数据已保证**单调递增、无重复、frame 全整数**（实测 0 处乱序 0 处重复），
 //   所以不排序、不去重，直接二分。
-//
 // `wraploop:true`（官方 Wrap loop frames）：loop 时从末关键帧平滑接到首关键帧，
 // 缝只占时间轴尾部 length − last.frame，开头到首关键帧仍钳在首值。
 // 全库 10 处，3233141951「火1」的 alpha/origin/scale 都开了；
 // 不做的话末帧（847，origin +64px）会钳到 length 再瞬间跳回 0。
-//
 // `options.parent` / `children`（时间轴联动组，全库 53 处 / 21 组 / 7 壁纸）：
 // 按**同作用域字段 key** 引用（对象字段=同层、常量=同 constantshadervalues 映射），
 // 与 options.name 无关（撞名实测存在）。leader 独占 startpaused/name/events
@@ -52,7 +44,6 @@
 // 火1 同组内 relative 3 通道 + 绝对 1 通道）。child 的 play/pause/stop/setFrame/
 // setRate/rate 赋值全部委托 leader（语料实证作者直接写 `ani.rate = ±x`）。
 // 悬空 parent（目标无动画，2 处）容忍退化为独立；无多级/无环（53/53）。
-//
 // `options.events`（帧事件，24 处全在 3163060610；骨骼动画事件表另 4 张）：
 // 官方语义 = 播放头**越过**某帧时触发同层脚本的 `animationEvent(event, value)`
 //（event = {name, frame}）。触发按语料魔数反推为半开区间：前进 `prev < f <= cur`、
@@ -140,9 +131,7 @@ export function sampleChannel(keys, frame, wrap) {
   //     P1 = ( f0 + front.x * span/3 ,  v0 + front.y )
   //     P2 = ( f1 - |back.x| * span/3 ,  v1 + back.y )
   // 即 **x 是「段长的比例」（再按三次贝塞尔惯例除以 3），y 是「值的绝对增量」**。
-  //
   // 三条实测判据：
-  //
   // 1. **x 的符号是结构性的**：front.x 全库 463 个全为正、back.x 454 个全为负，
   //    无一例外。这说明两个 x 各自「背离自己的端点」指向段内，是方向而非斜率分母。
   // 2. **x 的取值域紧贴 1**：front.x ∈ [0.511, 1.117]（中位数 1），|back.x| 同形。
@@ -152,7 +141,6 @@ export function sampleChannel(keys, frame, wrap) {
   //    **0 处**；而早先「切线斜率 = y/x」的读法有 117 段越界，最坏处把
   //    3233141951 的 opacity 从 [0, 0.78] 拉到 20.5（放大 25 倍），alpha 段
   //    甚至跑出负值 −9.88 —— 那会让「淡入」变成整层爆闪后消失。
-  //
   // `enabled:false`（约 11% 的侧）表示该侧不做缓动，控制点落在弦上（该侧线性）。
   // 注意 x=1,y=0 **不是**线性而是**水平切线**（标准缓入缓出）：lockangle/locklength
   // 恒 true，编辑器新建关键帧默认就是这种平滑切线，占全库 456/535 段。

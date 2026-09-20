@@ -41,7 +41,7 @@ export function injectGpuThrottle(rt: Runtime, f: HTMLIFrameElement, _doc: Docum
           try {
             cb(now);
           } catch {
-            /* 忽略 */
+            
           }
         });
       }, interval);
@@ -1076,35 +1076,4 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       finishBare(e instanceof Error ? e.message : String(e));
     }
   })();
-}
-
-/** 库入口：带可选 Audio / Media / 属性的网页挂载 */
-export function mountWebWithOptions(
-  rt: Runtime,
-  cfg: WallpaperConfig,
-  opts?: {
-    audio?: { snapshot(): { left: ArrayLike<number>; right: ArrayLike<number> } } | null;
-    media?: WebMediaDriver | null;
-    properties?: Record<string, unknown>;
-  },
-) {
-  if (opts?.properties) {
-    rt.liveUserProps = { ...opts.properties };
-  }
-  const cfg2 = cfg as WallpaperConfig & {
-    _webAudio?: WebAudioDriver | null;
-    _webMedia?: WebMediaDriver | null;
-  };
-  if (opts && "audio" in opts) {
-    if (opts.audio == null) cfg2._webAudio = null;
-    else {
-      cfg2._webAudio = {
-        snapshot: () => opts.audio!.snapshot(),
-      };
-    }
-  }
-  if (opts && "media" in opts) {
-    cfg2._webMedia = opts.media ?? null;
-  }
-  mountWeb(rt, cfg2);
 }

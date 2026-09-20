@@ -1,5 +1,4 @@
 // 文字排版与光栅化（从 text.js 拆出，切口 = 脚本沙箱 vs 纯排版）
-//
 // [we-scene patch] 这一半**没有任何沙箱/引擎依赖**：
 //   - layoutText 是纯函数，measure(text) → 宽度由宿主注入，Node 可直接校验
 //     （scripts/verify-text.mjs 不加载沙箱一半也能跑排版判据）；
