@@ -97,8 +97,9 @@ void main(){
   if (u_refract == 1) {
     // genericparticle REFRACT：槽 0 经常是空白白图（Rain2 的
     // "particles 256x1280 blank"、firework 的 util/white），水珠形状在法线里。
-    // 按普通精灵画会把整块 quad 涂成白方块。这里用法线 AG（DXT5nm 打包）
-    // 扭曲已绘制的画面，空白 albedo 改用法线偏离当 alpha。
+    // 官方做法：albedo **照常**参与（空白白图 = alpha 1 的白 quad），画面色是
+    // 「color.rgb *= scene(uv+offset)」**乘进去**的 —— 法线平坦处 offset=0，采到的就是
+    // 原画面，天然「隐形」；只有法线偏离处才出现扭曲，所以空白 albedo 不会画成白块。
     vec4 ntex = texture(u_normal, v_uv);
     // 工坊 DXT5nm：R=255 B=0，XY 在 AG（2464842912 Rain2）。
     // 官方 DecompressNormal（common_fragment.h）与程序化法线：XY 在 RG。
@@ -107,10 +108,9 @@ void main(){
     bool dxt5nm = ntex.r > 0.85 && ntex.b < 0.15;
     vec2 nxy = dxt5nm ? (ntex.ag * 2.0 - 1.0) : (ntex.rg * 2.0 - 1.0);
     float nMask = min(dxt5nm ? ntex.r : ntex.a, 1.0);
-    // 平坦处 AG≈128，量化噪声会让 length*2.2 仍有 ~0.04，整块 quad 剩淡方块。
-    float drop = smoothstep(0.06, 0.28, length(nxy));
-    float blank = step(0.95, min(min(t.r, t.g), min(t.b, t.a)));
-    float alpha = mix(t.a, drop, blank) * v_color.a;
+    // 官方 alpha 就是 albedo.a × 顶点 alpha（不再拿法线偏离顶替 —— 那是为了绕开
+    // 「没采到画面时会把白 quad 画出来」的旧实现，现在 rgb 恒为 albedo×顶点色×画面）。
+    float alpha = t.a * v_color.a;
     vec3 rgb = t.rgb * v_color.rgb;
     if (u_sampleScene == 1) {
       vec2 screenUV = gl_FragCoord.xy / max(u_resolution, vec2(1.0));

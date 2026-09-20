@@ -940,12 +940,18 @@ function runMatrixSheetUv() {
   return { checked, errors };
 }
 
-// ---------- 3226487183 Matrix 字号：等比图层 scale 不乘精灵；100 = 50px 帧的 100% ----------
+// ---------- 3226487183 Matrix 字号：图层 scale **一律**乘进精灵（官方 model matrix）----------
+// 官方把粒子位置与 quad 都过图层 model matrix —— 等比缩放的图层，精灵尺寸同样按比例放大。
+// 旧实现只对非等比图层乘 min(|sx|,|sy|)、等比恒 1（当年为「代码雨 50px 字 ×1.476 = 74px
+// 与列距 74px 叠住」加的保险）；但那正是作者在 WE 里看到的样子，用户本轮要求对齐官方。
 function runMatrixGlyphSize() {
   const errors = [];
   const psrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
-  if (!/uniform \? 1 : \(Math\.min\(asx, asy\)/.test(psrc)) {
-    errors.push("等比图层 scale 不得乘进 sysScale（否则 matrix 字随 1.476 放到 148px 叠成没缝）");
+  if (!/this\.sysScale = Math\.min\(asx, asy\) \|\| 1/.test(psrc)) {
+    errors.push("图层 scale 必须一律乘进 sysScale（官方 model matrix；等比也不能跳过）");
+  }
+  if (/uniform \? 1 :/.test(psrc)) {
+    errors.push("不得再按「等比/非等比」分支跳过缩放");
   }
   // [we-scene patch] 官方 quad 公式：宽 = size × texAspectX = size × 0.5
   // （assets/shaders/common_particles.h::ComputeParticlePosition）。旧实现把 size 当长边，
@@ -964,20 +970,27 @@ function runMatrixGlyphSize() {
     height: 512,
     frames: [{ x: 0, y: 0, width: 50, height: 50 }],
   });
-  if (Math.abs(ps.sysScale - 1) > 1e-6) {
-    errors.push(`等比 scale 1.476 的 sysScale 应为 1，实际 ${ps.sysScale}`);
+  if (Math.abs(ps.sysScale - 1.47631) > 1e-4) {
+    errors.push(`等比 scale 1.47631 的 sysScale 必须等于它（官方 model matrix），实际 ${ps.sysScale}`);
+  }
+  if (Math.abs(ps.spriteStretchX - 1) > 1e-6 || Math.abs(ps.spriteStretchY - 1) > 1e-6) {
+    errors.push("等比图层不得有额外非等比拉伸");
   }
   if (Math.abs((ps.frameLongPx || 0) - 50) > 1e-6) {
     errors.push(`TEXS 50×50 的 frameLongPx 应为 50，实际 ${ps.frameLongPx}`);
   }
-  // 与 fillInstances 同构：quad 宽 = size × texAspectX × sysScale = 100 × 0.5 × 1 = 50px
+  // 与 fillInstances 同构：quad 宽 = size × texAspectX × sysScale = 100 × 0.5 × 1.47631 ≈ 73.8px
   const glyph = 100 * (ps.texAspectX || 1) * ps.sysScale;
-  if (Math.abs(glyph - 50) > 0.5) {
-    errors.push(`matrix 字号应为 50px（帧 100%），实际 ${glyph}（旧：100×1.476=148 与列距 74 重叠）`);
-  }
   const worldStep = 50 * Math.abs(layer.scale[0]);
-  if (!(glyph + 1 < worldStep)) {
-    errors.push(`字号 ${glyph} 应小于列内间距 ${worldStep.toFixed(1)}，否则上下没有缝`);
+  if (Math.abs(glyph - worldStep) > 0.5) {
+    errors.push(`matrix 字号应 = 帧尺寸 × 图层 scale（${worldStep.toFixed(1)}px），实际 ${glyph.toFixed(1)}`);
+  }
+  // 非等比：等比部分进 sysScale、差值进 stretch，两者相乘仍等于各轴 scale
+  const layer2 = { origin: [0, 0, 0], scale: [22.6, 12.2, 1], angles: [0, 0, 0] };
+  const ps2 = new ParticleSystem(null, { maxcount: 1 }, null, layer2);
+  if (Math.abs(ps2.sysScale - 12.2) > 1e-6) errors.push(`非等比图层 sysScale 应取 min=12.2，实际 ${ps2.sysScale}`);
+  if (Math.abs(ps2.spriteStretchX * ps2.sysScale - 22.6) > 1e-4) {
+    errors.push("非等比图层 stretchX × sysScale 必须还原 22.6");
   }
   return { errors };
 }
@@ -1471,8 +1484,22 @@ function runRefractBlank() {
   if (rgbaIsBlankWhite(ghost)) errors.push("rgbaIsBlankWhite 把带透明的图当成空白白图");
 
   const shader = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
-  if (!/u_scene/.test(shader) || !/ntex\.ag/.test(shader) || !/ntex\.rg/.test(shader) || !/smoothstep/.test(shader)) {
-    errors.push("粒子 shader 未实现 REFRACT（空白白图会画成满屏白方块；需同时认 DXT5nm AG 与官方 RG）");
+  // 官方语义（common_particles.h + genericparticle.frag）：空白白图**照常**输出
+  // （alpha = albedo.a × 顶点 alpha），靠 `color.rgb *= scene(uv+offset)` 天然隐形 ——
+  // 法线平坦处 offset=0、采回的就是原画面。判据钉三件事：
+  //   ① 认 DXT5nm(AG) 与 RG 两条法线布局；② 画面是**乘**进 albedo（不是替换）；
+  //   ③ 不得再有「拿法线偏离顶替 alpha」的旧 hack（没采到画面时它会画出白 quad）。
+  if (!/u_scene/.test(shader) || !/ntex\.ag/.test(shader) || !/ntex\.rg/.test(shader)) {
+    errors.push("粒子 shader 未实现 REFRACT（需同时认 DXT5nm AG 与官方 RG 两条法线布局）");
+  }
+  if (!/rgb = t\.rgb \* v_color\.rgb \* scene/.test(shader)) {
+    errors.push("REFRACT 必须按官方把画面乘进 albedo（rgb = albedo × 顶点色 × scene），否则空白白图会画成白块");
+  }
+  if (!/float alpha = t\.a \* v_color\.a/.test(shader)) {
+    errors.push("REFRACT 的 alpha 必须是官方的 t.a × v_Color.a");
+  }
+  if (/mix\(t\.a, drop, blank\)/.test(shader)) {
+    errors.push("不得再用「法线偏离顶替 alpha」的旧 hack（官方就是 albedo.a × 顶点 alpha）");
   }
   const pj = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
   if (!/copyTexImage2D/.test(pj) || !/RGB8/.test(pj)) {

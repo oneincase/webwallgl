@@ -820,16 +820,16 @@ export class ParticleSystem {
     this.scaleX = ls[0] === 0 ? 1 : ls[0]
     this.scaleY = ls[1] === 0 ? 1 : ls[1]
     this.angleZ = ((la[2] || 0) * Math.PI) / 180
-    // 非等比拉伸：图层 scale x/y 不等时精灵被拉长（light_shafts 22.6/12.2、
-    // fog1 10/1）。位置始终按 scaleX/scaleY 走。
-    // 等比缩放只拉开列距/速度，不乘进精灵尺寸：3226487183 代码雨 scale 1.476
-    // 若连 size 一起乘，50px 字变成 148px，列内间距 74px，上下叠成没有缝。
+    // [we-scene patch] 图层 scale **一律**乘进精灵尺寸（官方：粒子位置与 quad 都过
+    // 图层 model matrix，等比也一样）。旧实现只对非等比图层乘 min(|sx|,|sy|)、等比图层
+    // 恒 1（当时为 3226487183 代码雨「50px 字 × 1.476 = 74px 与列距 74px 叠住」加的
+    // 保险）—— 但那正是 WE 的行为：作者按放大后的结果排的版，我们必须跟上。
+    // 非等比时仍拆成「等比部分进 sysScale、差值进 spriteStretch」，与 model matrix 等价。
     const asx = Math.abs(this.scaleX)
     const asy = Math.abs(this.scaleY)
-    const uniform = Math.abs(asx - asy) <= 1e-3 * Math.max(asx, asy, 1)
-    this.sysScale = uniform ? 1 : (Math.min(asx, asy) || 1)
-    this.spriteStretchX = uniform ? 1 : asx / this.sysScale
-    this.spriteStretchY = uniform ? 1 : asy / this.sysScale
+    this.sysScale = Math.min(asx, asy) || 1
+    this.spriteStretchX = asx / this.sysScale
+    this.spriteStretchY = asy / this.sysScale
   }
 
   /**
