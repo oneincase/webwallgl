@@ -24,6 +24,7 @@
     "publish:npm": "npm run build:lib && node scripts/publish-npm.mjs",
     "export:github": "node scripts/export-github.mjs",
     "typecheck": "tsc --noEmit",
+    "headless": "node scripts/headless-gpu.mjs",
     "verify:particles": "node scripts/verify-particles.mjs",
     "verify:text": "node scripts/verify-text.mjs",
     "verify:shaders": "node scripts/verify-shaders.mjs",
