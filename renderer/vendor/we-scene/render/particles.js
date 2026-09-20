@@ -94,14 +94,17 @@ export function rgbaIsBlankWhite(rgba) {
 }
 
 /**
- * Sprite Trail 的沿向倍率（官方：Length × speed = 理想长度，再夹 Min/Max Length）。
- * min/max 缺省 0 表示不设下限 / 上限。三项皆为 1 时恒为 1：只转向、不变形。
+ * Sprite Trail 的沿向倍率 —— 官方 `ComputeParticleTrailTangents`：
+ *     up = v̂ × clamp(|v| × g_RenderVar0.x[Length], g_RenderVar0.z, g_RenderVar0.y[MaxLength])
+ * 而 `g_RenderVar0.z` 是 **segment UV 时间偏移（恒 0）**，不是 minlength：
+ * Mirage 的 `ParticleRender` 结构里只有 length / maxlength / subdivision / segments，
+ * **没有 minlength 字段**（作者写进 JSON 的 `minlength` 官方直接忽略）。
+ * 旧实现把它当下限夹紧 → 3801012392 两条雨丝速度低时会比官方长。
+ * 故这里只夹 [0, maxLength]；Max Length 缺省 0 = 不设上限（保持既有约定）。
  */
 export function spriteTrailLengthFactor(speed, length, minLength, maxLength) {
   let f = Math.abs(Number(speed) || 0) * (Number(length) || 0)
-  const mn = Number(minLength) || 0
   const mx = Number(maxLength) || 0
-  if (mn > 0) f = Math.max(mn, f)
   if (mx > 0) f = Math.min(mx, f)
   return f
 }
