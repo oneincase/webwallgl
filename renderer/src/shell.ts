@@ -25,6 +25,7 @@ export function effectiveDpr(rt: Runtime, cfg?: WallpaperConfig): number {
   return Math.max(0.25, Math.min(target, byCap));
 }
 
+// [we-scene patch 2026-09-20] 资源分辨率倍率（清晰度 → 贴图尺寸）实现见 resource-scale.ts
 // 规范化显示模式：兼容旧会话里的 fill（=拉伸）与 fit（=适应）。
 // 旧 fill 是"忽略宽高比铺满"（会被拉伸变形），默认迁移到 cover 修复，不再默认拉伸。
 export function normalizeFit(fit?: WallpaperFit): "cover" | "contain" | "stretch" {
@@ -657,3 +658,5 @@ export function syncCanvasSize(rt: Runtime, canvas: HTMLCanvasElement, cfg?: Wal
   canvas.height = h;
   return true;
 }
+
+export { RESOURCE_REF_DPR, resourceScaleFor, resourceScaleForNormal } from "./resource-scale";

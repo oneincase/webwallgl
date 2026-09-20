@@ -1782,7 +1782,17 @@ function runRefractBlank() {
   //   ① 认 DXT5nm(AG) 与 RG 两条法线布局；② 画面是**乘**进 albedo（不是替换）；
   //   ③ 不得再有「拿法线偏离顶替 alpha」的旧 hack（没采到画面时它会画出白 quad）。
   if (!/u_scene/.test(shader) || !/ntex\.ag/.test(shader) || !/ntex\.rg/.test(shader)) {
-    errors.push("粒子 shader 未实现 REFRACT（需同时认 DXT5nm AG 与官方 RG 两条法线布局）");
+    errors.push("粒子 shader 未实现 REFRACT（需同时认 WE 打包 AG 与官方 RG 两条法线布局）");
+  }
+  // [we-scene patch 2026-09-20] 法线布局必须由**贴图层判定后经 uniform 传入**，
+  // 不能再用「R 很亮就是 DXT5nm」的逐像素启发式：官方 rain_drops_sheet_normal /
+  // splash_1_normal 的 R 是**剪影**（35/255、11.8/255），启发式会把 x 取成剪影、
+  // 蒙版取成常量 A —— 折射方向与作用范围都错（3801012392「和原版素材下有细微差别」）。
+  if (!/uniform int u_normalPacked/.test(shader) || !/u_normalPacked == 1 \? \(ntex\.ag/.test(shader)) {
+    errors.push("REFRACT 法线布局必须按 u_normalPacked 分派（WE 打包 x 在 A/蒙版在 R vs 我们的 x 在 R）");
+  }
+  if (/ntex\.r > 0\.85 && ntex\.b < 0\.15/.test(shader)) {
+    errors.push("不得再用「R>0.85 即 DXT5nm」的逐像素启发式（官方剪影法线会被判反）");
   }
   if (!/rgb = t\.rgb \* v_color\.rgb \* scene/.test(shader)) {
     errors.push("REFRACT 必须按官方把画面乘进 albedo（rgb = albedo × 顶点色 × scene），否则空白白图会画成白块");

@@ -218,6 +218,7 @@ export class ParticleSystem {
     this.blend = 'translucent'
     this.refract = false
     this.refractAmount = 0.05
+    this.normalPacked = false
     this.opacityMul = 1
     this.lifetimeMul = 1
     this.visible = true
@@ -738,6 +739,9 @@ export class ParticleSystem {
 
   setNormalTexture(tex) {
     this.normalTex = tex || null
+    // [we-scene patch] 法线通道布局（官方打包 vs 我们的生成器）：由贴图层判定后带过来，
+    // 透传给着色器的 u_normalPacked（见 particle-shaders.js 的 DecompressNormalWithMask 注释）。
+    this.normalPacked = !!(tex && tex.packed)
   }
 
   // 注入贴图 {glTex, width, height, frames?}
@@ -746,6 +750,8 @@ export class ParticleSystem {
   // 只认 `.length` 时整对象会被当成「无帧表」，退回 sequencemultiplier 的 N×N
   // 方格，72 帧字符图集会变成 2×2 大块 —— Matrix 雨看起来字都挤成一团。
   setTexture(tex) {
+    // [we-scene patch 2026-09-20] R8 单通道反照率（GL_R8 上传）要在着色器里补映射
+    this.albedoR8 = !!(tex && tex.albedoR8)
     this.texture = tex
     this._ready = !!tex
     const raw = tex && tex.frames
@@ -1862,10 +1868,12 @@ export class ParticleSystem {
     gl.uniformMatrix4fv(prog.uniMvp, false, viewProj)
     const useRefract = this.refract && this.normalTex && this.normalTex.glTex
     if (prog.uniRefract) gl.uniform1i(prog.uniRefract, useRefract ? 1 : 0)
+    if (prog.uniAlbedoR8) gl.uniform1i(prog.uniAlbedoR8, this.albedoR8 ? 1 : 0)
     if (useRefract) {
       gl.activeTexture(gl.TEXTURE1)
       gl.bindTexture(gl.TEXTURE_2D, this.normalTex.glTex)
       if (prog.uniNormal) gl.uniform1i(prog.uniNormal, 1)
+      if (prog.uniNormalPacked) gl.uniform1i(prog.uniNormalPacked, this.normalPacked ? 1 : 0)
       // [we-scene patch] 官方 frag 在 `#if REFRACT` 下**无条件**采画面
       // （`color.rgb *= texSample2D(g_Texture3, refracted)`），与混合模式无关。
       // 旧实现把 additive 排除在外（当时用的是「用画面替换 albedo」的写法，会冲白）；

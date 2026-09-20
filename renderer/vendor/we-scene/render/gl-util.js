@@ -102,3 +102,80 @@ export function makeTextureMip(gl, levels, rg88 = false, opts = null) {
 }
 
 export { linkProgram, compile, parseVec3Local }
+
+/**
+ * [we-scene patch 2026-09-20] **压缩纹理上传**（DXT1/DXT3/DXT5/BC7/ETC1/ETC2）。
+ *
+ * 背景：`.tex` 里这些格式存的就是压缩块（DXT5/BC 1 B/px、DXT1 0.5 B/px），
+ * 我们过去一律解成 RGBA 再上传 —— 4~8 倍的显存浪费（全库 DXT 系 5170MB → 1160MB）。
+ * 这里把**文件自带的块**逐级直接上传：
+ *   · 零质量损失（GPU 解出来的就是文件里的块）；
+ *   · WebGL2 **不允许**对压缩纹理 generateMipmap，正好用文件里的 mip 链；
+ *   · 只上传 N 级时必须把 `TEXTURE_MAX_LEVEL` 收到 N-1，否则纹理不完整（采样恒黑）。
+ * 扩展不可用 / 有 POT 填充没裁干净 / 只要一级时，调用方回退到 RGBA 路径。
+ */
+export function makeCompressedTextureMip(gl, levels, internalFormat, opts = null) {
+  const tex = gl.createTexture()
+  gl.bindTexture(gl.TEXTURE_2D, tex)
+  const wrap = opts && opts.wrap === 'repeat' ? gl.REPEAT : gl.CLAMP_TO_EDGE
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  for (let i = 0; i < levels.length; i++) {
+    const lv = levels[i]
+    gl.compressedTexImage2D(gl.TEXTURE_2D, i, internalFormat, lv.width, lv.height, 0, lv.data)
+  }
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, Math.max(0, levels.length - 1))
+  return tex
+}
+
+/** 压缩格式 → { internalFormat, blockBytes }；扩展不可用时返回 null。 */
+export function compressedFormatFor(gl, format) {
+  const f = Number(format)
+  if (f === 7) {
+    const e = gl.getExtension('WEBGL_compressed_texture_s3tc')
+    return e ? { internalFormat: e.COMPRESSED_RGB_S3TC_DXT1_EXT, blockBytes: 8 } : null
+  }
+  if (f === 6) {
+    const e = gl.getExtension('WEBGL_compressed_texture_s3tc')
+    return e ? { internalFormat: e.COMPRESSED_RGBA_S3TC_DXT3_EXT, blockBytes: 16 } : null
+  }
+  if (f === 4) {
+    const e = gl.getExtension('WEBGL_compressed_texture_s3tc')
+    return e ? { internalFormat: e.COMPRESSED_RGBA_S3TC_DXT5_EXT, blockBytes: 16 } : null
+  }
+  if (f === 12) {
+    const e = gl.getExtension('WEBGL_compressed_texture_bptc')
+    return e ? { internalFormat: e.COMPRESSED_RGBA_BPTC_UNORM_EXT, blockBytes: 16 } : null
+  }
+  // ETC1/ETC2 在 WebGL2 里是核心格式（无需扩展）
+  if (f === 5) return { internalFormat: gl.COMPRESSED_RGBA8_ETC2_EAC, blockBytes: 16 }
+  if (f === 3) return { internalFormat: gl.COMPRESSED_RGB8_ETC2, blockBytes: 8 }
+  return null
+}
+
+/**
+ * [we-scene patch 2026-09-20] **R8 单通道上传**（格式 9）。
+ *
+ * WE 的 R8 语义是 `vec4(1,1,1,r)`（形状在 R、rgb 补白）。过去我们把它烘成
+ * RGBA（白 rgb + alpha=形状）再上传 = **4 倍显存**（全库 R8 2883MB → 721MB）。
+ * 这里按 GL_R8/GL_RED 上传（1 B/px + generateMipmap），由消费端着色器做
+ * `rgb = 1, alpha = .r` 的映射（粒子 shader 的 `u_albedoR8`）。
+ */
+export function makeR8TextureMip(gl, levels, opts = null) {
+  const tex = gl.createTexture()
+  gl.bindTexture(gl.TEXTURE_2D, tex)
+  const wrap = opts && opts.wrap === 'repeat' ? gl.REPEAT : gl.CLAMP_TO_EDGE
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  const lv = levels[0]
+  const prev = gl.getParameter(gl.UNPACK_ALIGNMENT)
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, lv.width, lv.height, 0, gl.RED, gl.UNSIGNED_BYTE, lv.data)
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, prev)
+  gl.generateMipmap(gl.TEXTURE_2D)
+  return tex
+}

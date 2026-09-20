@@ -96,37 +96,96 @@ export async function decodeTexImageBitmap(
   bytes: Uint8Array | null,
   wantW: number,
   wantH: number,
+  // [we-scene patch 2026-09-20] 资源倍率：<1 时**解码期**就降到目标尺寸
+  // （createImageBitmap 的 resize 选项），省掉的正是这类大图最贵的全尺寸解码峰值。
+  // 不支持的引擎会抛错 → 退回全尺寸解码（下游照旧按倍率走 canvas 重绘路径）。
+  scale = 1,
 ): Promise<ImageBitmap> {
+  const k = Number.isFinite(scale) && scale > 0 ? Math.min(1, scale) : 1;
+  const outW = wantW > 0 ? Math.max(1, Math.round(wantW * k)) : 1;
+  const outH = wantH > 0 ? Math.max(1, Math.round(wantH * k)) : 1;
+  const resize = k < 0.999 && wantW > 0 && wantH > 0
+    ? { resizeWidth: outW, resizeHeight: outH, resizeQuality: "high" as const }
+    : null;
   let bmp: ImageBitmap;
   try {
-    bmp = await createImageBitmap(blob, { imageOrientation: "none", premultiplyAlpha: "none" });
+    bmp = await createImageBitmap(blob, { imageOrientation: "none", premultiplyAlpha: "none", ...(resize || {}) });
   } catch {
-    // 个别引擎不认 imageOrientation 选项：退回默认解码，交给下面的尺寸检测回滚。
-    bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
+    try {
+      // 个别引擎不认 imageOrientation 选项：退回默认解码，交给下面的尺寸检测回滚。
+      bmp = await createImageBitmap(blob, { premultiplyAlpha: "none", ...(resize || {}) });
+    } catch {
+      bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
+    }
   }
+  // 旋转判定用**缩放后**的目标尺寸比（宽高关系不随缩放改变，判定逻辑不变）
   const plan = texOrientationPlan(
     bytes ? jpegExifOrientation(bytes) : 1,
     bmp.width,
     bmp.height,
-    wantW,
-    wantH,
+    outW,
+    outH,
   );
   if (plan === "keep") return bmp;
   const cv = document.createElement("canvas");
-  cv.width = wantW;
-  cv.height = wantH;
+  cv.width = outW;
+  cv.height = outH;
   const ctx = cv.getContext("2d");
   if (!ctx) return bmp;
   // 顺时针：translate(wantW,0)+rotate(+90°)；逆时针：translate(0,wantH)+rotate(-90°)。
   if (plan === "rot-cw") {
-    ctx.translate(wantW, 0);
+    ctx.translate(outW, 0);
     ctx.rotate(Math.PI / 2);
   } else {
-    ctx.translate(0, wantH);
+    ctx.translate(0, outH);
     ctx.rotate(-Math.PI / 2);
   }
   ctx.drawImage(bmp, 0, 0);
   const fixed = await createImageBitmap(cv);
   bmp.close?.();
   return fixed;
+}
+
+/**
+ * [we-scene patch 2026-09-20] CPU 侧 RGBA 双线性重采样（资源倍率用）。
+ *
+ * 与 `particle-textures.js::bilinearResize` 的区别：那个只保留 **alpha**（粒子遮罩用，
+ * 出图是白 RGB + 形状 alpha）；场景贴图是彩色图像，必须四个通道一起重采样，
+ * 否则整张贴图会变成白图。
+ */
+export function resampleRgba(
+  src: { width: number; height: number; rgba: Uint8Array },
+  w2: number,
+  h2: number,
+): { width: number; height: number; rgba: Uint8Array } {
+  const { width: w, height: h, rgba } = src;
+  const W = Math.max(1, Math.round(w2));
+  const H = Math.max(1, Math.round(h2));
+  if (W === w && H === h) return src;
+  const out = new Uint8Array(W * H * 4);
+  const sx = w / W;
+  const sy = h / H;
+  for (let y = 0; y < H; y++) {
+    const fy = Math.min(h - 1, Math.max(0, (y + 0.5) * sy - 0.5));
+    const y0 = Math.floor(fy);
+    const y1 = Math.min(h - 1, y0 + 1);
+    const ty = fy - y0;
+    for (let x = 0; x < W; x++) {
+      const fx = Math.min(w - 1, Math.max(0, (x + 0.5) * sx - 0.5));
+      const x0 = Math.floor(fx);
+      const x1 = Math.min(w - 1, x0 + 1);
+      const tx = fx - x0;
+      const o00 = (y0 * w + x0) * 4;
+      const o10 = (y0 * w + x1) * 4;
+      const o01 = (y1 * w + x0) * 4;
+      const o11 = (y1 * w + x1) * 4;
+      const o = (y * W + x) * 4;
+      for (let c = 0; c < 4; c++) {
+        const a = rgba[o00 + c] * (1 - tx) + rgba[o10 + c] * tx;
+        const b = rgba[o01 + c] * (1 - tx) + rgba[o11 + c] * tx;
+        out[o + c] = Math.round(a * (1 - ty) + b * ty);
+      }
+    }
+  }
+  return { width: W, height: H, rgba: out };
 }

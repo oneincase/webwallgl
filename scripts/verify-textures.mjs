@@ -130,7 +130,7 @@ console.log("\n[3] 接线：scene-mount 的 .tex 分支必须走 decodeTexImageB
     ".tex JPEG/PNG 分支应调用 decodeTexImageBitmap",
   );
   check(
-    /import \{ decodeTexImageBitmap \} from "\.\/tex-decode"/.test(src),
+    /import \{ decodeTexImageBitmap(, resampleRgba)? \} from "\.\/tex-decode"/.test(src),
     "scene-mount 应从 ./tex-decode 导入",
   );
   const decode = fs.readFileSync(join(ROOT, "renderer/src/tex-decode.ts"), "utf8");

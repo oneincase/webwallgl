@@ -81,6 +81,11 @@ uniform sampler2D u_normal;
 uniform sampler2D u_scene;
 uniform int u_refract;
 uniform int u_sampleScene;
+// [we-scene patch 2026-09-20] 反照率是 **R8 单通道**（WE 语义 vec4(1,1,1,r)）：
+// 上传时按 GL_R8 存（省 4 倍显存），这里补上「rgb 白、形状取 .r」的映射。
+uniform int u_albedoR8;
+// 法线通道布局：1 = 官方打包（x 在 A、蒙版在 R），0 = 我们自己的生成器/RG88 转换（x 在 R、A 恒 255）
+uniform int u_normalPacked;
 uniform vec2 u_resolution;
 in vec4 v_refract;
 in vec2 v_uv;
@@ -93,7 +98,10 @@ void main(){
   // 帧间交叉淡入（官方 SPRITESHEETBLEND：mix(frame, nextFrame, frac(lifetime*n))）。
   // 法线槽仍只采当前帧 —— 官方 frag 也是只对 albedo 做 mix。
   if (v_frameMix > 0.0) t = mix(t, texture(u_tex, v_uv2), v_frameMix);
-  vec4 col = vec4(t.rgb * v_color.rgb, t.a * v_color.a);
+  // R8 上传（GL_R8）采样得到 (r,0,0,1)：按 WE 语义恢复成「rgb 白 + 形状在 alpha」
+  vec3 albedoRgb = u_albedoR8 == 1 ? vec3(1.0) : t.rgb;
+  float albedoA = u_albedoR8 == 1 ? t.r : t.a;
+  vec4 col = vec4(albedoRgb * v_color.rgb, albedoA * v_color.a);
   if (u_refract == 1) {
     // genericparticle REFRACT：槽 0 经常是空白白图（Rain2 的
     // "particles 256x1280 blank"、firework 的 util/white），水珠形状在法线里。
@@ -101,17 +109,22 @@ void main(){
     // 「color.rgb *= scene(uv+offset)」**乘进去**的 —— 法线平坦处 offset=0，采到的就是
     // 原画面，天然「隐形」；只有法线偏离处才出现扭曲，所以空白 albedo 不会画成白块。
     vec4 ntex = texture(u_normal, v_uv);
-    // 工坊 DXT5nm：R=255 B=0，XY 在 AG（2464842912 Rain2）。
-    // 官方 DecompressNormal（common_fragment.h）与程序化法线：XY 在 RG。
-    // 官方 DecompressNormalWithMask 的蒙版是 normal.a：先做 normal.xw = normal.wx 交换，
-    // 于是蒙版取的是**原始 R 通道**（DXT5nm 的 R=255 → 蒙版 1；RG88 路径不交换、蒙版=alpha）。
-    bool dxt5nm = ntex.r > 0.85 && ntex.b < 0.15;
-    vec2 nxy = dxt5nm ? (ntex.ag * 2.0 - 1.0) : (ntex.rg * 2.0 - 1.0);
-    float nMask = min(dxt5nm ? ntex.r : ntex.a, 1.0);
+    // 官方 DecompressNormalWithMask（common_fragment.h）对**非 RG88** 的法线一律
+    // normal.xw = normal.wx：x ← 原 A 通道、y ← G，蒙版 = normal.a（= 原 R 通道）。
+    // 也就是官方打包法线是「x 在 A、形状/蒙版在 R」（DXT5nm 与 RGBA8888 都是这条，
+    // 只是压缩族多一个 0.965 的缩放，2% 量级）：实测
+    //   particle/water/rain_drops_sheet_normal（RGBA8888）R=35/255（水滴剪影）、G=190、A=190；
+    //   particle/water/splash_1_normal（DXT5nm）R=11.8（水花剪影）、G=128、A=128。
+    // 我们自己的生成器（heightToNormal）与 RG88 转换结果是 (x,y,z,255)：x 在 R、蒙版恒 1。
+    // 旧实现按「R 很亮」的启发式猜 DXT5nm —— 上面两张的 R 是**剪影**（很暗），猜反了：
+    // x 取成剪影（0/1 二值）而蒙版取成常量 A，折射方向与作用范围都错（3801012392 的
+    // 「和原版素材下有细微差别」）。现在布局由贴图层判定后经 uniform 传进来。
+    vec2 nxy = u_normalPacked == 1 ? (ntex.ag * 2.0 - 1.0) : (ntex.rg * 2.0 - 1.0);
+    float nMask = min(u_normalPacked == 1 ? ntex.r : ntex.a, 1.0);
     // 官方 alpha 就是 albedo.a × 顶点 alpha（不再拿法线偏离顶替 —— 那是为了绕开
     // 「没采到画面时会把白 quad 画出来」的旧实现，现在 rgb 恒为 albedo×顶点色×画面）。
-    float alpha = t.a * v_color.a;
-    vec3 rgb = t.rgb * v_color.rgb;
+    float alpha = albedoA * v_color.a;
+    vec3 rgb = albedoRgb * v_color.rgb;
     if (u_sampleScene == 1) {
       vec2 screenUV = gl_FragCoord.xy / max(u_resolution, vec2(1.0));
       // 官方 frag：offset = v_ScreenTangents.xy*normal.x + v_ScreenTangents.zw*normal.y，
@@ -123,7 +136,7 @@ void main(){
       ) * (nMask * v_color.a);
       vec3 scene = texture(u_scene, clamp(screenUV + offset, 0.0, 1.0)).rgb;
       // 官方是「color.rgb *= scene」（albedo × 顶点色 × 画面），不是用画面替换 albedo
-      rgb = t.rgb * v_color.rgb * scene;
+      rgb = albedoRgb * v_color.rgb * scene;
     }
     col = vec4(rgb, alpha);
     if (col.a < 0.004) discard;
@@ -187,6 +200,8 @@ void main(){
         uniScene: gl.getUniformLocation(prog, 'u_scene'),
         uniRefract: gl.getUniformLocation(prog, 'u_refract'),
         uniSampleScene: gl.getUniformLocation(prog, 'u_sampleScene'),
+        uniNormalPacked: gl.getUniformLocation(prog, 'u_normalPacked'),
+        uniAlbedoR8: gl.getUniformLocation(prog, 'u_albedoR8'),
         uniResolution: gl.getUniformLocation(prog, 'u_resolution'),
         uniRefractScale: gl.getUniformLocation(prog, 'u_refractScale'),
         uniMvp: gl.getUniformLocation(prog, 'u_mvp'),

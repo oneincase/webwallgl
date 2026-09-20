@@ -46,6 +46,41 @@ export function decodeMip0(tex) {
 }
 
 // 解码全部 mip 级别 → [{ width, height, rgba }]（PNG/JPEG 等 freeImage 格式只有一级）
+/**
+ * [we-scene patch 2026-09-20] 解出**指定 mip 级**（当独立纹理用）。
+ *
+ * 用途：清晰度变化时按资源倍率 R 取「够用的最小一级」——TEXB 里本来就存着 mip 链
+ * （本机 3496 张贴图里 1730 张有多级），直接拿低级当 level 0 上传即可，
+ * **零重采样、零画质损失**（低级就是引擎自己降的）。
+ * 语义与 decodeMip0 一致（内嵌 PNG/JPEG/视频照原样透出，带 level 标记）；
+ * 裁剪规则只在 level 0 生效：POT 对齐填充只出现在 level 0 的量级上，
+ * 且帧表路径本来就不裁（见 decodeMip0 的长注释）。
+ */
+export function decodeMipLevel(tex, level) {
+  const image = tex.images[0];
+  if (!image || image.length === 0) throw new Error('无图像数据');
+  const k = Math.max(0, Math.min(image.length - 1, Math.floor(level) || 0));
+  const m = image[k];
+  if (tex.isVideo) return { width: m.width, height: m.height, video: m.data, level: k };
+  if (tex.freeImageFormat === FIF.PNG) return { width: m.width, height: m.height, png: m.data, level: k };
+  if (tex.freeImageFormat !== FIF.UNKNOWN) {
+    return { width: m.width, height: m.height, image: m.data, fif: tex.freeImageFormat, level: k };
+  }
+  const rgba = decodePixels(tex.format, m.data, m.width, m.height);
+  // 裁剪到**内容尺寸**：`.tex` 的 mip0 常带 POT 对齐填充（1039919954：mip0 2048×2048、
+  // 内容 1920×1080 在左上角）。每一级的 mip 画布同样是填充过的（1024×1024、512×512…），
+  // 所以要按 2^k 折算内容尺寸再裁。**漏裁的症状**：四边形按整个填充画布采样，图像缩到
+  // 左上角、右侧/下方露出 clearcolor，看起来「缩小变形」（用户 2026-09-20 报的就是这个）。
+  if (!tex.frames?.list?.length) {
+    const sw = Math.min(m.width, Math.max(1, Math.round((tex.width || m.width) / 2 ** k)));
+    const sh = Math.min(m.height, Math.max(1, Math.round((tex.height || m.height) / 2 ** k)));
+    if (m.width !== sw || m.height !== sh) {
+      return { width: sw, height: sh, rgba: cropRgba(rgba, m.width, m.height, sw, sh), level: k };
+    }
+  }
+  return { width: m.width, height: m.height, rgba, level: k };
+}
+
 export function decodeMips(tex) {
   const image = tex.images[0]
   if (!image || image.length === 0) throw new Error('无图像数据')
@@ -292,6 +327,27 @@ function dxt5Alphas(block) {
 }
 
 // ---- LZ4 块格式解压（对应 LZ4_decompress_safe） ----
+
+/**
+ * [we-scene patch 2026-09-20] 压缩纹理的**块级裁剪**（POT 填充 → 内容尺寸）。
+ *
+ * `.tex` 的 mip 画布常带 POT 对齐填充（1039919954：mip0 2048²、内容 1920×1080 在左上角）。
+ * RGBA 路径可以逐像素裁，压缩路径只能按 **4×4 块**裁：目标宽高向上取整到块边界即可
+ * （内容不是 4 的倍数时最多多带 1 块，约 0.2% 拉伸，肉眼不可见）。
+ * 不裁的后果与 RGBA 路径漏裁一样：四边形按整个填充画布采样 → 图像缩到左上角。
+ */
+export function cropBlocks(data, srcW, dstW, dstH, blockBytes) {
+  const sbw = Math.ceil(srcW / 4)
+  const dbw = Math.ceil(dstW / 4)
+  const rows = Math.ceil(dstH / 4)
+  if (sbw === dbw) return data.subarray(0, dbw * rows * blockBytes)
+  const out = new Uint8Array(dbw * rows * blockBytes)
+  for (let r = 0; r < rows; r++) {
+    const from = r * sbw * blockBytes
+    out.set(data.subarray(from, from + dbw * blockBytes), r * dbw * blockBytes)
+  }
+  return out
+}
 
 export function lz4Decompress(src, outSize) {
   const out = new Uint8Array(outSize)

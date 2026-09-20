@@ -3,7 +3,7 @@
 // [we-scene patch] 模块结构（本仓库拆分，见 docs/ARCHITECTURE.md）：
 //   tex-codecs.js  格式表 + mip 解码 + 像素编解码 + LZ4 + u32/i32/f32 原语
 //   texture.js     本文件：.tex 容器解析（parseTex）+ 公共出口（re-export）
-import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodePixels, lz4Decompress, u32, i32, f32 } from './tex-codecs.js'
+import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, u32, i32, f32 } from './tex-codecs.js'
 
 /** FreeImage 容器的魔数（用于「变体布局」的载荷自校验，见 mip 记录那段注释） */
 const FREE_IMAGE_MAGIC = {
@@ -288,4 +288,4 @@ function asciiTex(buf, start, len) {
   return s
 }
 
-export { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodePixels, lz4Decompress }
+export { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress }

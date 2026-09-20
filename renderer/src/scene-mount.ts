@@ -1,5 +1,6 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
-import { clear, effectiveDpr, FrameGate, markFrame, normalizeFit, readText, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, FrameGate, markFrame, normalizeFit, readText, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, type Runtime } from "./shell";
+import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
@@ -19,7 +20,7 @@ import {
   boundUserName,
 } from "../vendor/we-scene/scene/user-props.js";
 import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
-import { decodeTexImageBitmap } from "./tex-decode";
+import { decodeTexImageBitmap, resampleRgba } from "./tex-decode";
 
 // WE 的 systemfont_* 内置字体 → 本机系统字体栈（WE 桌面端映射 Windows 系统字体，
 // macOS/Linux 上按近似度回退；都带 sans-serif 兜底，不命中也只是字形差异）。
@@ -933,7 +934,221 @@ cfg, source, pkgAbort.signal);
         };
       };
 
+      // [S4] 足迹安全系数：视差/相机抖动/轻微放大动画的余量（1.15 = 15%）
+      const FOOTPRINT_SAFETY = 1.15;
+      // [S4] **图层足迹表**：贴图只需要 ≥ 它在屏幕上占的**设备像素**。
+      // 预扫描一遍「有四边形几何的图层」（image/model 的图集层，排除 puppet/网格、
+      // 粒子、文本、声音），按材质贴图槽算出每个贴图名的最大足迹（设备像素，含安全系数）。
+      // 之后贴图装载时用 min(档位上限, 足迹) 作为目标尺寸 —— 这是数量级收益的来源：
+      // 一张 3658×2000 的图在 840 CSS px 的层里，标准档过去要 2926、现在只要 ~966。
+      const texFootprint = new Map<string, number>();
+      {
+        const general = (scene as any).general ?? null;
+        const ortho = (general?.orthogonalprojection ?? null) as { width?: number; height?: number; auto?: boolean } | null;
+        const viewW = Number(ortho?.width) || 0;
+        const viewH = Number(ortho?.height) || 0;
+        const explicitOrtho = viewW > 0 && viewH > 0 && ortho?.auto !== true;
+        const dpr = effectiveDpr(rt, cfg) || 1;
+        const canvasDeviceW = (c.clientWidth || window.innerWidth || 1280) * dpr;
+        const canvasDeviceH = (c.clientHeight || window.innerHeight || 720) * dpr;
+        if (explicitOrtho) {
+          const ctx = { canvasDeviceW, canvasDeviceH, viewW, viewH, safety: FOOTPRINT_SAFETY };
+          for (const layer of scene.layers as any[]) {
+            if (!layer || layer.destroyed || !layer.visible) continue;
+            const img = layer.image || layer.model;
+            if (!img) continue; // 粒子/文本/声音层没有四边形贴图密度语义
+            let model: any = null;
+            try {
+              if (eff.BUILTIN_MODELS[img]) model = eff.BUILTIN_MODELS[img];
+              else {
+                const me = pkg.getEntry(parsedPkg, img);
+                // [S4 保守] 网格/骨骼模型（puppet）的屏幕范围由骨骼动画决定，layer.size 不是上界
+                if (me) model = JSON.parse(readText(me));
+              }
+            } catch {
+              model = null;
+            }
+            if (!model || (model as any).meshes || (model as any).puppet) continue;
+            const matPath = model.material;
+            if (!matPath) continue;
+            const matEntry = pkg.getEntry(parsedPkg, matPath);
+            if (!matEntry) continue;
+            let names: string[] = [];
+            try {
+              const mat = JSON.parse(readText(matEntry));
+              names = (mat?.passes || []).flatMap((p: any) => (Array.isArray(p?.textures) ? p.textures : []));
+            } catch {
+              names = [];
+            }
+            // 图层世界尺寸：优先 scene.json 的 size；缺省时按模型声明的 width/height
+            // （image 模型的 autosize 语义，与装配期一致 —— Jake 这类层 scene.json 里没有 size）
+            const szRaw = (layer.size || [0, 0]) as [number, number];
+            const sz: [number, number] =
+              Math.abs(Number(szRaw[0])) > 0 && Math.abs(Number(szRaw[1])) > 0
+                ? [Number(szRaw[0]), Number(szRaw[1])]
+                : [Number((model as any).width || 0), Number((model as any).height || 0)];
+            if (!(Math.abs(sz[0]) > 0) || !(Math.abs(sz[1]) > 0)) continue;
+            const sc = (layer.scale || [1, 1, 1]) as [number, number, number];
+            // 尺寸/缩放动画会让足迹变大：有动画的层放宽安全系数（宁可少省，不可变糊）
+            const animated = !!(layer.sizeAnimation || layer.scaleAnimation || layer.animationlayers?.length);
+            const need = layerFootprintPx(
+              sz,
+              [Number(sc[0] ?? 1), Number(sc[1] ?? 1)],
+              Number((layer.angles || [0, 0, 0])[2] || 0),
+              { ...ctx, safety: FOOTPRINT_SAFETY * (animated ? 1.4 : 1) },
+            );
+            if (!(need > 0)) continue;
+            for (const nm of names) {
+              if (typeof nm !== "string" || !nm || nm.startsWith("util/") || nm.startsWith("_rt_")) continue;
+              const prev = texFootprint.get(nm) || 0;
+              if (need > prev) texFootprint.set(nm, need);
+            }
+          }
+          reportDiag(
+            rt,
+            cfg,
+            `[S4] 图层足迹表 ${texFootprint.size} 个贴图（视口 ${viewW}x${viewH} 世界 → 画布 ${Math.round(canvasDeviceW)}x${Math.round(canvasDeviceH)} 设备像素，safety=${FOOTPRINT_SAFETY}）`,
+          );
+        } else {
+          reportDiag(rt, cfg, "[S4] 正交投影非显式（auto/透视）：跳过图层足迹模型，回退到全局档位");
+        }
+      }
       const textures = new Map<string, any>();
+      // [we-scene patch 2026-09-20] 资源分辨率倍率（清晰度 → 贴图缩放）与内存台账。
+      // 只有「贴在设备像素上的足迹」需要那么多像素；多出来的部分纯属常驻内存。
+      const resOff = resourcesOff();
+      let currentTexName = "";
+      // 当前贴图是否「一律不缩」（帧表图集 / 本来就小）：跳过必须**绝对** ——
+      // 只把档位倍率设成 1 不够，S4 的图层足迹仍会把它压下去（1444077782 的序列帧图集
+      // 就是这么被缩掉、下方贴图出白块的）。
+      let currentTexNoScale = false;
+      const resScaleBase = resourceScaleFor(rt, cfg);
+      const resScaleNormal = resourceScaleForNormal(rt, cfg);
+      const MIN_RES_EDGE = 32;
+      const mem = {
+        texCount: 0,
+        cpuDecoded: 0, // 解出来的 RGBA 总量（仅被释放判定覆盖到的那些）
+        cpuReleased: 0, // 上传后释放掉的 CPU 副本
+        gpuUploaded: 0, // 上传纹理估计值（含 mip 链 ×4/3）
+        compressed: 0, // 其中以压缩块直传的字节（DXT/BC/ETC）
+        r8Native: 0, // 其中以 R8 单通道直传的字节
+        framesScaled: [] as string[],
+        scaled: [] as Array<{ name: string; how: string; from: string; to: string }>,
+        textures: [] as Array<{ name: string; size: string; scale: number; level: number; native?: number; need?: number; target?: number }>,
+        pkgBytes: 0,
+      };
+      // `?texr8=0` 关掉 R8 单通道直传（A/B 对照用）
+      const texR8On = (() => {
+        if (typeof location === "undefined") return true;
+        const q = new URLSearchParams(location.search).get("texr8");
+        return !(q === "0" || q === "off" || q === "native");
+      })();
+      // `?texcompress=0` 关掉压缩直传（A/B 对照用）
+      const texCompressOn = (() => {
+        if (typeof location === "undefined") return true;
+        const q = new URLSearchParams(location.search).get("texcompress");
+        return !(q === "0" || q === "off" || q === "native");
+      })();
+      /** 当前屏幕最长边（**设备像素**）：画布 CSS 长边 × 有效 DPR。 */
+      const screenLongEdge = (): number => {
+        const dpr = effectiveDpr(rt, cfg) || 1;
+        const w = (c.clientWidth || window.innerWidth || 1280) * dpr;
+        const h = (c.clientHeight || window.innerHeight || 720) * dpr;
+        return Math.max(w, h);
+      };
+      // 纯函数（倍率/目标边/mip 级/帧矩形缩放/字节估计/不透明判定）集中在 resource-scale.ts
+      const normalizedResScale = (name: string): number => texResScale(name, resScaleBase, resScaleNormal);
+      /** 贴图的**原生内容最长边**（帧表贴图用 mip0；否则用可能小于填充画布的 tex.width/height）。 */
+      const texNativeLong = (parsedTex: any): number => {
+        const im0 = parsedTex?.images?.[0]?.[0];
+        const hasFrames = !!parsedTex?.frames?.list?.length;
+        // 无帧表时「原生尺寸」取**内容尺寸**（tex.width/height，可能小于被 POT 填充的 mip0）：
+        // 1039919954 内容 1920×1080、mip0 却是 2048×2048，按 mip0 算会把目标边放大 6%。
+        return hasFrames
+          ? Math.max(Number(im0?.width || 0), Number(im0?.height || 0))
+          : Math.max(Number(parsedTex?.width || 0), Number(parsedTex?.height || 0), 0) ||
+              Math.max(Number(im0?.width || 0), Number(im0?.height || 0));
+      };
+      /**
+       * [S4] 目标最长边 = min(档位上限, 图层足迹)。
+       * `?resources=native` 时严格 no-op（返回原生，供 A/B 对照）。
+       */
+      const texTargetLong = (R: number, parsedTex: any): number => {
+        const native = texNativeLong(parsedTex);
+        if (resOff || currentTexNoScale) return native;
+        const cap = targetLong(native, R);
+        const need = texFootprint.get(currentTexName) || 0;
+        return footprintTarget(cap, native, need);
+      };
+      const pickMipLevel = (parsedTex: any, target: number, R: number): number => {
+        // `?resources=native` 必须是严格的 no-op（A/B 对照用）。高清档 R=1 不再是 no-op：
+        // 它的 policy 上限是原生，但**图层足迹**仍可以把尺寸压下来（S4 的主要收益）。
+        if (resOff || currentTexNoScale) return 0
+        const image = parsedTex?.images?.[0];
+        if (!image) return 0;
+        const im0 = image[0];
+        const hasFrames = !!parsedTex?.frames?.list?.length;
+        // 每级的「内容最长边」：被 POT 填充的 .tex（1039919954：mip0 2048×2048、内容 1920×1080）
+        // 必须按内容算，否则 target=1920 会把「2048 > 1920」当成需要降级 → 白白掉到 mip1。
+        const contentLong = hasFrames
+          ? Math.max(Number(im0?.width || 0), Number(im0?.height || 0))
+          : Math.max(Number(parsedTex?.width || 0), Number(parsedTex?.height || 0), 0) ||
+            Math.max(Number(im0?.width || 0), Number(im0?.height || 0));
+        const sizes = image.map((m: any, i: number) =>
+          hasFrames ? Math.max(Number(m.width || 0), Number(m.height || 0)) : Math.max(1, Math.round(contentLong / 2 ** i)),
+        );
+        // [we-scene patch 2026-09-20] 屏幕底线：mip 是 2× 一跳，若降级后的尺寸**小于屏幕
+        // 最长边**，就是把清晰度让给了内存（1039919954 的 1920×1080 图在 1280 画布上降到
+        // 960×540 = 放大 1.33× 才能铺满，观感变糊）。所以挑选时以「屏幕最长边（设备像素）」
+        // 为底线：优先在 [屏幕边, policy 上限] 区间里取最省的一级；区间为空就取最接近
+        // 屏幕边的那一级（宁可省不动，也不明显糊）。S4 的逐层足迹模型会把这条底线替换成
+        // 真正的图层足迹。
+        // 下限优先用**该贴图的图层足迹**（S4）；没有足迹信息（粒子/效果/util/未知几何）时
+        // 退回全局「屏幕最长边」，至少不会小于屏幕。
+        const fp = texFootprint.get(currentTexName) || 0;
+        const needFloor = fp > 0 ? Math.round(fp) : Math.max(64, Math.round(screenLongEdge()));
+        return pickMipLevelPure(sizes, target, needFloor);
+      };
+      /** 单级贴图的兜底：走 JS 精确重采样（形状/蒙版/带 alpha 的贴图用）。 */
+      const shrinkDecoded = (m: any, target: number): any => {
+        const long = Math.max(Number(m.width || 0), Number(m.height || 0));
+        // 1.1 而不是 1.25：标准档 R=0.8 的目标正好是原生的 1/1.25，用 1.25 会让这一档
+        // 「单级贴图完全不缩」（只有 mip 链能缩），把标准档的收益让掉一半。
+        if (!target || long <= target * 1.1) return m;
+        const k = target / long;
+        return resampleRgba(m, Math.max(1, Math.round(m.width * k)), Math.max(1, Math.round(m.height * k)));
+      };
+      /**
+       * 不透明单级贴图的高效降采样：交给浏览器的原生缩放器（canvas → createImageBitmap），
+       * 大图比 JS 循环快一个数量级（6144×4096 实测 JS 201ms，浏览器原生几毫秒）。
+       * **只对不透明图用**：canvas 内部是预乘、上传时再解预乘，低 alpha 区会有 1 LSB 级
+       * 舍入（本仓库踩过「细线变深色刻线」的坑），所以带 alpha 的贴图仍走 JS 精确路径。
+       */
+      const scaleViaBitmap = async (m: { width: number; height: number; rgba: Uint8Array }, w: number, h: number) => {
+        const cv = document.createElement("canvas");
+        cv.width = m.width;
+        cv.height = m.height;
+        const ctx = cv.getContext("2d", { alpha: true, willReadFrequently: false });
+        if (!ctx) return null;
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(m.rgba.buffer, m.rgba.byteOffset, m.rgba.length), m.width, m.height), 0, 0);
+        const cv2 = document.createElement("canvas");
+        cv2.width = w;
+        cv2.height = h;
+        const ctx2 = cv2.getContext("2d", { alpha: true });
+        if (!ctx2) return null;
+        ctx2.imageSmoothingEnabled = true;
+        ctx2.imageSmoothingQuality = "high";
+        ctx2.drawImage(cv, 0, 0, w, h);
+        try {
+          return await createImageBitmap(cv2, { premultiplyAlpha: "none" });
+        } catch {
+          return null;
+        }
+      };
+      // pkg 字节进台账（解析后的整份容器常驻，是记忆体里最大的一块之一）
+      mem.pkgBytes = Number((parsedPkg as { fileSize?: number })?.fileSize || 0);
+
+
       // [we-scene patch] 本机引擎内置素材（WE 安装目录的 materials/**）：贴图 + 法线。
       // 装了（`local-assets/mirage/` 或 WE_LOCAL_ASSETS）就用原版像素，没装就返回
       // null → 下面照旧走 system-textures.js / particle-textures.js 的程序化复刻。
@@ -1213,6 +1428,8 @@ cfg, source, pkgAbort.signal);
 
       const texInflight = new Map<string, Promise<any | null>>();
       const loadTexInner = async (name: string): Promise<any | null> => {
+        currentTexName = name;
+        currentTexNoScale = false;
         if (textures.has(name)) return textures.get(name);
         const texEntry = pkg.getEntry(parsedPkg, `materials/${name}.tex`);
         if (!texEntry) {
@@ -1431,12 +1648,29 @@ cfg, source, pkgAbort.signal);
           // 浏览器解码默认按 EXIF 转正，orientation=8 的 1080×5760 长图会变成
           // 5760×1080，与层 size / 90° 旋转错轴，整屏撕成条带（1920911984）。
           // 详见 tex-decode.ts 头注。
+          // [we-scene patch 2026-09-20] 解码期直接降到**目标尺寸**（省掉最贵的全尺寸解码峰值）：
+          // 目标 = min(档位上限, 图层足迹)，见 texTargetLong（S4）。R=1 的档位也照样按足迹降。
+          const pngNative = Math.max(Number(m.width || 0), Number(m.height || 0)) || 1;
+          const pngSkip =
+            !!parsedTex?.frames?.list?.length || isSmallTexture(Number(m.width || 0), Number(m.height || 0));
+          currentTexNoScale = pngSkip;
+          const pngTarget = pngSkip ? pngNative : texTargetLong(normalizedResScale(name), parsedTex) || pngNative;
+          const pngScale = Math.min(1, pngTarget / pngNative);
           const bmp = await decodeTexImageBitmap(
             blob,
             m.png ? null : (m.image as Uint8Array),
             m.width,
             m.height,
+            pngScale,
           );
+          if (pngScale < 0.999) {
+            mem.scaled.push({
+              name,
+              how: "decode-resize",
+              from: `${m.width}x${m.height}`,
+              to: `${bmp.width}x${bmp.height}`,
+            });
+          }
           entry = {
             glTex: rnd.makeTexture(renderer.gl, null, 0, 0, bmp),
             width: bmp.width,
@@ -1446,14 +1680,166 @@ cfg, source, pkgAbort.signal);
         } else if (m.image !== undefined) {
           return null;
         } else {
-          const m0 = tex.decodeMip0(parsedTex) as { width: number; height: number; rgba: Uint8Array };
-          entry = {
-            glTex: rnd.makeTextureMip(renderer.gl, [m0], rg88),
-            width: m0.width,
-            height: m0.height,
-            rg88,
-            mips: [m0],
-          };
+          // [we-scene patch 2026-09-20] 资源倍率：贴图只需要 ≥ 它在设备像素上的足迹。
+          // ① 有真 mip 链（本库 1730/3496 张）→ 取「够用的最小一级」当 level 0 上传，
+          //    **零重采样**；② 该级仍明显大于目标 / 单级图 → bilinearResize 到目标。
+          // 白名单（LUT 数据栅格、util 小图、法线另档、帧图集单列）见 texResScaleFor()。
+          // [we-scene patch 2026-09-20] 白名单：**带帧表（TEXS）的图集**与**本来就小**的贴图
+          // 一律不缩。帧矩形同时是布局输入（字体条/序列帧/按钮/时钟），缩放会让字形与列距
+          // 变小、动画错位（用户报「过小而动画错误，资源值越小越明显」）；小图本来就只有
+          // 几百 KB，省不下内存却最容易踩这类坑。
+          const rawPix = parsedTex?.images?.[0]?.[0];
+          const rawSkip =
+            !!parsedTex?.frames?.list?.length ||
+            isSmallTexture(Number(rawPix?.width || 0), Number(rawPix?.height || 0));
+          currentTexNoScale = rawSkip;
+          const R = rawSkip ? 1 : normalizedResScale(name);
+          const target = texTargetLong(R, parsedTex);
+          const baseLevel = pickMipLevel(parsedTex, target, R);
+          // [we-scene patch 2026-09-20] **压缩纹理直传**：DXT1/3/5、BC7、ETC1/2 在 `.tex`
+          // 里就是压缩块（DXT5/BC 1B/px、DXT1 0.5B/px），过去一律解成 RGBA 上传 = 4~8 倍显存。
+          // 条件：扩展可用（ETC1/2 是 WebGL2 核心）、非 LUT、未被 resOff/native 关掉。
+          // 块级裁剪后尺寸必须与内容一致（POT 填充按 4×4 块裁）。单级压缩贴图也能用
+          // （`TEXTURE_MAX_LEVEL=0` 纹理仍然完整），但会失去 mip 缩小平滑 —— 由
+          // `?texcompress=0` 可整体回退对照。
+          {
+            const cInfo = texCompressOn ? rnd.compressedFormatFor(renderer.gl, parsedTex?.format) : null;
+            const cMips = parsedTex?.images?.[0];
+            if (cInfo && cMips && cMips.length && !(Number(parsedTex?.flags) & 0x40) && !rawSkip) {
+              const cLevels: Array<{ width: number; height: number; data: Uint8Array }> = [];
+              let cOk = true;
+              for (let k = baseLevel; k < cMips.length; k++) {
+                const m = cMips[k];
+                const isFrames = !!parsedTex?.frames?.list?.length;
+                const cw = isFrames ? m.width : Math.max(1, Math.round(Number(parsedTex?.width || m.width) / 2 ** k));
+                const ch = isFrames ? m.height : Math.max(1, Math.round(Number(parsedTex?.height || m.height) / 2 ** k));
+                const bw = Math.ceil(cw / 4) * 4;
+                const bh = Math.ceil(ch / 4) * 4;
+                // 目标尺寸必须是完整块网格，且不超过该级画布
+                if (bw > m.width || bh > m.height) { cOk = false; break }
+                const data = bw === m.width ? m.data : tex.cropBlocks(m.data, m.width, bw, bh, cInfo.blockBytes);
+                cLevels.push({ width: bw, height: bh, data });
+              }
+              if (cOk && cLevels.length) {
+                const gl = renderer.gl;
+                const lv0 = cLevels[0];
+                entry = {
+                  glTex: rnd.makeCompressedTextureMip(gl, cLevels, cInfo.internalFormat),
+                  width: lv0.width,
+                  height: lv0.height,
+                  rg88: false,
+                  compressed: true,
+                  cpuMips: null,
+                  looksAlbedo: false,
+                  // DXT/BC/ETC 家族在 WE 里是 `normal.xw = normal.wx`（x 在 A、蒙版在 R）
+                  packedNormal: true,
+                  mipLevel: baseLevel,
+                };
+                mem.compressed += lv0.width * lv0.height * (parsedTex.format === 7 ? 0.5 : 1);
+                mem.scaled.push({ name, how: `compressed-${parsedTex.format}${baseLevel ? `+mip${baseLevel}` : ""}`, from: `${rawPix?.width}x${rawPix?.height}`, to: `${lv0.width}x${lv0.height}` });
+              }
+            }
+          }
+          // 压缩路径命中就不再解 RGBA（也不再覆盖 entry）
+          const m0 = (entry
+            ? null
+            : tex.decodeMipLevel(parsedTex, baseLevel)) as { width: number; height: number; rgba?: Uint8Array; png?: unknown; image?: unknown; video?: unknown; level?: number } | null;
+          // R8 直传（1 B/px）：格式 9、非 LUT、非跳过项、开关未关（内嵌 PNG/JPEG/视频除外）
+          const r8Native =
+            !entry &&
+            texR8On &&
+            Number(parsedTex?.format) === 9 &&
+            !rawSkip &&
+            !(Number(parsedTex?.flags) & 0x40) &&
+            m0 != null &&
+            m0.png === undefined && m0.image === undefined && m0.video === undefined;
+          if (!entry && m0 && (m0.png !== undefined || m0.image !== undefined || m0.video !== undefined)) {
+            // 选中的级是内嵌 PNG/JPEG/视频：退回 mip0 路径（上面 png/video 分支只处理 level0，
+            // 「多级 + 内嵌」的罕见组合保守起见不缩放）
+            const m00 = tex.decodeMip0(parsedTex) as { width: number; height: number; rgba: Uint8Array };
+            entry = {
+              glTex: rnd.makeTextureMip(renderer.gl, [m00], rg88),
+              width: m00.width,
+              height: m00.height,
+              rg88,
+              cpuMips: [m00],
+            };
+            mem.cpuDecoded += m00.rgba.byteLength;
+          } else if (!entry && r8Native && m0) {
+            // [we-scene patch 2026-09-20] **R8 直传**（1 B/px + generateMipmap）：
+            // 从解码像素取 R 通道（解码器把 fileR 铺进 rgb、alpha 恒 255），
+            // 由消费端着色器做 WE 语义映射（粒子 shader 的 u_albedoR8）。
+            const a0 = m0 as { width: number; height: number; rgba: Uint8Array };
+            const n = a0.width * a0.height;
+            const r8 = new Uint8Array(n);
+            for (let i = 0; i < n; i++) r8[i] = a0.rgba[i * 4];
+            entry = {
+              glTex: rnd.makeR8TextureMip(renderer.gl, [{ width: a0.width, height: a0.height, data: r8 }]),
+              width: a0.width,
+              height: a0.height,
+              rg88: false,
+              r8: true,
+              albedoR8: true,
+              cpuMips: null,
+              looksAlbedo: false,
+              packedNormal: false,
+              mipLevel: baseLevel,
+            };
+            mem.r8Native += n;
+            mem.scaled.push({ name, how: `r8${baseLevel ? `+mip${baseLevel}` : ""}`, from: `${rawPix?.width}x${rawPix?.height}`, to: `${a0.width}x${a0.height}` });
+          } else if (!entry) {
+            const m0r = m0 as { width: number; height: number; rgba: Uint8Array };
+            const long0 = Math.max(m0r.width, m0r.height);
+            const mips = parsedTex.images?.[0]?.length || 1;
+            const tw = Math.max(1, Math.round((m0r.width * target) / long0));
+            const th = Math.max(1, Math.round((m0r.height * target) / long0));
+            let shrunk: { width: number; height: number; rgba: Uint8Array } = m0r;
+            let bmp: ImageBitmap | null = null;
+            let how = baseLevel > 0 ? `mip${baseLevel}` : "";
+            if (baseLevel === 0 && mips === 1 && target > 0 && long0 > target) {
+              // 单级贴图：没有 mip 可用，只能重采样。形状/蒙版格式（RG88/R8）与带 alpha 的
+              // 贴图走 JS 精确重采样（保通道语义、无预乘舍入）；不透明彩图走浏览器原生缩放。
+              if (rg88 || looksOpaquePure(m0r.rgba)) {
+                const viaBitmap = !rg88 ? await scaleViaBitmap(m0r, tw, th) : null;
+                if (viaBitmap) {
+                  bmp = viaBitmap;
+                  shrunk = { width: viaBitmap.width, height: viaBitmap.height, rgba: m0r.rgba };
+                  how = "resample-native";
+                } else if (m0r.width * m0r.height <= 16e6 || rg88) {
+                  shrunk = shrinkDecoded(m0r, target);
+                  how = "resample";
+                } else {
+                  how = "skip-big-alpha";
+                }
+              } else if (m0r.width * m0r.height <= 16e6) {
+                shrunk = shrinkDecoded(m0r, target);
+                how = "resample";
+              } else {
+                how = "skip-big-alpha";
+              }
+            }
+            // CPU 副本：只有「看起来是反照率」的贴图必须留着（材质把反照率填进法线槽时
+            // asParticleNormal 要就地转 bump 图）；其余上传完即释放（4K 一张就是 67MB）。
+            const albedoLike = ptex.rgbaLooksLikeAlbedo(m0r.rgba);
+            entry = {
+              glTex: bmp
+                ? rnd.makeTexture(renderer.gl, null, 0, 0, bmp)
+                : rnd.makeTextureMip(renderer.gl, [shrunk], rg88),
+              width: shrunk.width,
+              height: shrunk.height,
+              rg88: bmp ? false : rg88,
+              cpuMips: albedoLike ? [shrunk] : null,
+              looksAlbedo: albedoLike,
+              // 打包判定必须在**原始解码像素**上做（native 缩放后的 bitmap 拿不到像素）
+              packedNormal: ptex.isPackedNormalTexture(m0r),
+              mipLevel: baseLevel,
+            };
+            mem.cpuDecoded += m0r.rgba.byteLength;
+            if (!albedoLike) mem.cpuReleased += m0r.rgba.byteLength;
+            if (how) {
+              mem.scaled.push({ name, how, from: `${parsedTex.images[0][0].width}x${parsedTex.images[0][0].height}`, to: `${shrunk.width}x${shrunk.height}` });
+            }
+          }
         }
         if (!entry) return null;
         // 序列帧表（.tex 的 TEXS 段）：粒子与序列帧图层据此切 sprite sheet。
@@ -1473,14 +1859,75 @@ cfg, source, pkgAbort.signal);
           // decodeMip0 不再裁 POT 填充，entry.width 就是采样用的图集大小。
           (fl as unknown as Record<string, unknown>).atlasWidth = entry.width;
           (fl as unknown as Record<string, unknown>).atlasHeight = entry.height;
+          // [we-scene patch 2026-09-20] 降采样后帧矩形必须**同倍率缩放**：uv 是
+          // 「原像素 / 原图集宽」，缩放后必须仍是同一个归一化矩形，否则粒子采到邻帧。
+          // 但**几何**（autosize 用的单帧尺寸）不能跟着缩 —— 那是图层世界尺寸的来源，
+          // 缩了整层会变小。原值另存 entry.geomFrame 供 autosize 使用。
+          const fr0 = fl[0] as { width?: number; height?: number } | undefined;
+          entry.geomFrame = {
+            width: Math.abs(Number(fr0?.width ?? entry.declaredWidth ?? 0)),
+            height: Math.abs(Number(fr0?.height ?? entry.declaredHeight ?? 0)),
+          };
+          // 原生图集宽 = mip0 的宽（帧坐标写在 mip0 像素空间，见 decodeMip0 注释）
+          const nativeW =
+            Number((fl as unknown as Record<string, unknown>).nativeAtlasWidth) ||
+            Number(parsedTex.images?.[0]?.[0]?.width || 0) ||
+            entry.width;
+          (fl as unknown as Record<string, unknown>).nativeAtlasWidth = nativeW;
+          const k = nativeW > 0 ? entry.width / nativeW : 1;
+          if (k < 0.999) {
+            scaleFrames(fl as unknown as Array<{ x: number; y: number; width: number; height: number }>, k);
+            mem.framesScaled.push(`${name} x${k.toFixed(3)}`);
+          }
           entry.frames = fl;
         }
+        // [we-scene patch 2026-09-20] CPU 侧像素用完就放：只有「看起来是反照率」的贴图
+        // 还需要留着做「反照率被填进法线槽」的兜底转换（asParticleNormal），其余一律释放。
+        // 判据在地板附近采样 48 点，成本可忽略；释放的是整张贴图的 W×H×4（4K 就是 64MB×N）。
+        {
+          // 原始像素路径已在上面判过并释放；这里只兜 PNG/多图/回退路径（没有 CPU 像素可放）
+          if (entry.looksAlbedo === undefined && entry.glTex) {
+            const cpu = entry.cpuMips && entry.cpuMips[0];
+            entry.looksAlbedo = cpu?.rgba ? ptex.rgbaLooksLikeAlbedo(cpu.rgba) : false;
+            if (entry.packedNormal === undefined) entry.packedNormal = cpu?.rgba ? ptex.isPackedNormalTexture(cpu) : false;
+            if (!entry.looksAlbedo && entry.cpuMips) {
+              mem.cpuReleased += cpu?.rgba ? cpu.rgba.byteLength : 0;
+              entry.cpuMips = null;
+            }
+          }
+        }
+        entry.resourceScale = normalizedResScale(name);
+        mem.texCount++;
+        // 上传字节：压缩块按块大小、R8 按 1 B/px，其余 RGBA/RG88 走原口径（都含 mip 链 ×4/3）
+        {
+          const fmt = Number(parsedTex?.format);
+          const perPx = entry.compressed
+            ? fmt === 7 || fmt === 3
+              ? 0.5
+              : 1
+            : entry.r8
+              ? 1
+              : entry.rg88
+                ? 2
+                : 4;
+          mem.gpuUploaded += Math.round(entry.width * entry.height * perPx * (4 / 3));
+        }
+        // [S4 对账表] 每张贴图：原生内容边 / 图层足迹（设备像素）/ 实际目标 / 落到的 mip 级
+        mem.textures.push({
+          name,
+          size: `${entry.width}x${entry.height}`,
+          scale: entry.resourceScale,
+          level: entry.mipLevel ?? 0,
+          native: texNativeLong(parsedTex),
+          need: Math.round(texFootprint.get(name) || 0),
+          target: texTargetLong(entry.resourceScale, parsedTex),
+        });
         textures.set(name, entry);
         // [临时诊断] 定位 843532366 黑屏：贴图装载的运行时状态
         reportDiag(
           rt,
           cfg,
-          `tex '${name}': ${entry.width}x${entry.height} declared=${entry.declaredWidth}x${entry.declaredHeight} frames=${Array.isArray(entry.frames) ? entry.frames.length : "none"} video=${!!entry.videoCtl}`,
+          `tex '${name}': ${entry.width}x${entry.height} declared=${entry.declaredWidth}x${entry.declaredHeight} R=${entry.resourceScale} lvl=${entry.mipLevel ?? 0} frames=${Array.isArray(entry.frames) ? entry.frames.length : "none"} video=${!!entry.videoCtl}`,
         );
         return entry;
       };
@@ -1522,6 +1969,23 @@ cfg, source, pkgAbort.signal);
         }
       };
 
+      // [we-scene patch 2026-09-20] 资源分辨率台账（S0）：清晰度变化时贴图实际缩了多少、
+      // 释放了多少 CPU 副本，都能直接读出来。`?resources=native` 可 A/B。
+      (window as unknown as Record<string, unknown>).__memStats = () => ({
+        resourceScale: resScaleBase,
+        resourceScaleNormal: resScaleNormal,
+        texCount: mem.texCount,
+        cpuDecodedMB: +(mem.cpuDecoded / 1e6).toFixed(1),
+        cpuReleasedMB: +(mem.cpuReleased / 1e6).toFixed(1),
+        gpuUploadedMB: +(mem.gpuUploaded / 1e6).toFixed(1),
+        compressedMB: +(mem.compressed / 1e6).toFixed(1),
+        r8NativeMB: +(mem.r8Native / 1e6).toFixed(1),
+        pkgBytes: mem.pkgBytes || 0,
+        framesScaled: mem.framesScaled.slice(0, 20),
+        scaledCount: mem.scaled.length,
+        scaled: mem.scaled.slice(0, 40),
+        textures: mem.textures.slice(0, 60),
+      });
       let loadedTex = 0;
       const texJobs: Promise<unknown>[] = [];
       for (let li = 0; li < scene.layers.length; li++) {
@@ -1669,8 +2133,13 @@ cfg, source, pkgAbort.signal);
                       Array.isArray(entry.frames) && entry.frames.length ? entry.frames[0] : null;
                     const fw = Math.abs(Number(f0?.width ?? 0));
                     const fh = Math.abs(Number(f0?.height ?? 0));
-                    const w = fw > 0 ? fw : Number(entry.declaredWidth || 0);
-                    const h = fh > 0 ? fh : Number(entry.declaredHeight || 0);
+                    // [we-scene patch 2026-09-20] 几何取**原始**单帧尺寸（geomFrame）：
+                    // 资源倍率只改上传的像素密度，不改图层世界尺寸。降采样后 entry.frames
+                    // 的矩形已按倍率缩小（采样要按上传尺寸归一化），直接拿来当尺寸会让整层变小。
+                    const gw = Math.abs(Number(entry.geomFrame?.width || 0));
+                    const gh = Math.abs(Number(entry.geomFrame?.height || 0));
+                    const w = gw > 0 ? gw : fw > 0 ? fw : Number(entry.declaredWidth || 0);
+                    const h = gh > 0 ? gh : fh > 0 ? fh : Number(entry.declaredHeight || 0);
                     if (w > 0 && h > 0) {
                       layer.size = [w, h];
                       // [临时诊断]
@@ -1803,6 +2272,17 @@ cfg, source, pkgAbort.signal);
       // 可见层上的视频纹理才自动起播（WE 默认）。隐藏层（2887099508 安全模式
       // 盖屏视频）等脚本 getVideoTexture().play()；一加载就 play 会被双元素
       // 预热/切壁纸 pause 打断，日志刷 AbortError。
+      // [we-scene patch 2026-09-20] 资源分辨率汇总（S0 台账）：一眼看到这次挂载缩了多少、省了多少
+      reportDiag(
+        rt,
+        cfg,
+        `resources R=${resScaleBase}${resScaleNormal !== resScaleBase ? ` (normal R=${resScaleNormal})` : ""}` +
+          ` tex=${mem.texCount} gpu≈${(mem.gpuUploaded / 1e6).toFixed(1)}MB` +
+          ` cpuDecoded=${(mem.cpuDecoded / 1e6).toFixed(1)}MB released=${(mem.cpuReleased / 1e6).toFixed(1)}MB` +
+          ` scaled=${mem.scaled.length}` +
+          (mem.scaled.length ? ` 例: ${mem.scaled.slice(0, 3).map((x) => `${x.name}(${x.how} ${x.from}→${x.to})`).join(" ")}` : "") +
+          (mem.framesScaled.length ? ` 帧图集缩放: ${mem.framesScaled.slice(0, 3).join(" ")}` : ""),
+      );
       for (const [texName, texEntry] of textures) {
         if (!texEntry?.videoCtl) continue;
         const usedVisible = (scene.layers as any[]).some(
@@ -1868,7 +2348,10 @@ cfg, source, pkgAbort.signal);
       // 白 RGB 不能当 DXT5nm/标准法线用，要按 alpha 转 bump。
       const asParticleNormal = (entry: any) => {
         if (!entry) return null;
-        const pix = entry.mips && entry.mips[0];
+        // [we-scene patch 2026-09-20] CPU 副本只在「看起来是反照率」时才保留
+        // （见 loadTexInner 的释放逻辑）；这里按标记判，不依赖像素常驻。
+        if (entry.looksAlbedo === false) return entry;
+        const pix = (entry.cpuMips && entry.cpuMips[0]) || (entry.mips && entry.mips[0]);
         if (pix?.rgba && typeof ptex.prepareParticleNormalTexture === "function") {
           const n = ptex.prepareParticleNormalTexture(pix);
           if (n && n !== pix) {
@@ -1928,7 +2411,19 @@ cfg, source, pkgAbort.signal);
         const nrmName = texName1 || (ps.refract ? ptex.particleNormalNameForAlbedo(texName || "particle/halo") : null);
         if (nrmName) {
           const nrm = asParticleNormal(await loadParticleTex(nrmName, "normal"));
-          if (nrm) ps.setNormalTexture({ glTex: nrm.glTex, width: nrm.width, height: nrm.height });
+          if (nrm) {
+            // [we-scene patch] 法线的通道布局要随贴图带给着色器：官方原生法线是
+            // 「x 在 A、蒙版在 R」的打包布局，我们自己的生成器/RG88 转换结果是
+            // 「x 在 R、alpha 恒 255」（见 isPackedNormalTexture 注释）。
+            // 打包布局在 loadTexInner 里就判好了（那里才有像素，之后 CPU 副本会被释放）
+            (nrm as { packed?: boolean }).packed = nrm.packedNormal === true;
+            ps.setNormalTexture({
+              glTex: nrm.glTex,
+              width: nrm.width,
+              height: nrm.height,
+              packed: !!(nrm as { packed?: boolean }).packed,
+            });
+          }
         }
         ps.setVisible(!!layer.visible);
         particleSystems.push(ps);
@@ -3003,8 +3498,14 @@ cfg, source, pkgAbort.signal);
                     clone.textureName = tn;
                     // autosize：序列帧按帧尺寸（WE autosize 语义），否则按贴图尺寸
                     if (clone.size[0] === 0 || clone.size[1] === 0) {
+                      // [we-scene patch 2026-09-20] 几何取**原始**尺寸（geomFrame/declared），
+                      // 不能用被资源倍率缩过的 entry.frames / entry.width，否则动态建层变小
+                      const gf = entry.geomFrame;
                       const fl = entry.frames && Array.isArray(entry.frames) ? entry.frames[0] : null;
-                      clone.size = [(fl && fl.width) || entry.width, (fl && fl.height) || entry.height];
+                      clone.size = [
+                        (gf && gf.width) || (fl && fl.width) || entry.declaredWidth || entry.width,
+                        (gf && gf.height) || (fl && fl.height) || entry.declaredHeight || entry.height,
+                      ];
                     }
                   });
                 }

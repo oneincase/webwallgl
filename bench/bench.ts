@@ -98,6 +98,8 @@ const pqEl = $<HTMLSelectElement>("#pq");
 const ppEl = $<HTMLSelectElement>("#pp");
 const volumeEl = $<HTMLInputElement>("#volume");
 const liveSystemEl = $<HTMLInputElement>("#live-system");
+const resEl = $<HTMLSelectElement>("#res");
+const resnEl = $<HTMLSelectElement>("#resn");
 const localAssetsEl = $<HTMLInputElement>("#local-assets");
 const pointerPushEl = $<HTMLInputElement>("#pointer-push");
 const pointerVeilEl = $<HTMLElement>("#pointer-veil");
@@ -668,6 +670,9 @@ function buildQuery(it: LibraryItem): string {
   }
   p.set("fit", fitEl.value);
   p.set("renderDpr", dprEl.value);
+  // 资源分辨率倍率覆盖（贴图缩放）：空=跟随清晰度档，见 renderer/src/resource-scale.ts
+  if (resEl.value) p.set("resources", resEl.value);
+  if (resnEl.value) p.set("resourcesNormal", resnEl.value);
   p.set("sceneFps", fpsEl.value);
   // 性能设置三档（抗锯齿/粒子/后处理）：渲染器页 main.ts 按同名键解析
   p.set("aa", aaEl.value);
@@ -792,8 +797,26 @@ $<HTMLButtonElement>("#open").onclick = () => {
 };
 
 // fit / fps / 音量走 __wp 热更新（不重挂载），dpr 需重建画布由 __wp 内部重挂
+/**
+ * 由清晰度档推出贴图资源倍率，用于状态栏显示（与 renderer/src/resource-scale.ts 的
+ * 档位映射保持一致：高清 ≥1.5 → 1、标准 ≈1 → 0.8、省电 → 0.6、auto 按屏幕密度自适应）。
+ * `资源` 下拉有覆盖值时优先显示覆盖值。
+ */
+function resourceScaleLabel(): string {
+  if (resEl.value === "native") return "R 1（native）";
+  if (resEl.value) return `R ${resEl.value}（覆盖）`;
+  const n = Number(dprEl.value);
+  if (!dprEl.value || n === 0 || Number.isNaN(n)) {
+    const d = Math.max(0.6, Math.min(1, (window.devicePixelRatio || 1) / 2));
+    return `R ${d.toFixed(2)}（auto）`;
+  }
+  if (n >= 1.5) return "R 1（高清）";
+  if (n >= 0.9) return "R 0.8（标准）";
+  return "R 0.6（省电）";
+}
+
 function syncStatusChrome() {
-  statusDprEl.textContent = `DPR ${dprEl.value}`;
+  statusDprEl.textContent = `DPR ${dprEl.value} · ${resourceScaleLabel()}${resnEl.value ? ` · 法线 ${resnEl.value}` : ""}`;
   statusFpsEl.textContent = t("status.cap", { n: fpsEl.value });
 }
 
@@ -851,6 +874,15 @@ fpsEl.onchange = () => {
 dprEl.onchange = () => {
   syncStatusChrome();
   wp()?.setRenderDpr(Number(dprEl.value));
+};
+// 资源倍率在**挂载期**解码/上传，改完必须重挂（dpr 走 __wp 内部重挂，这里显式 mount）
+resEl.onchange = () => {
+  syncStatusChrome();
+  mount();
+};
+resnEl.onchange = () => {
+  syncStatusChrome();
+  mount();
 };
 // ---------- 性能设置（抗锯齿 / 粒子 / 后处理）----------
 // 对标 WE 客户端的壁纸性能选项：全局一套、localStorage 记住、所有壁纸共用。

@@ -118,14 +118,33 @@
                 <option value="stretch">stretch</option>
               </select>
             </label>
-            <label>dpr
+            <label data-i18n-title="toolbar.dprTip" title="渲染分辨率倍率（相对 CSS 像素）。清晰度档位同时决定**贴图资源倍率**：高清 1 / 标准 0.8 / 省电 0.6，auto 按屏幕密度自适应。改档会重建画布并重挂"><span data-i18n="toolbar.dpr">清晰度</span>
               <select id="dpr">
                 <option value="0" selected>auto</option>
-                <option value="1">1</option>
-                <option value="2">2</option>
-                <option value="3">3</option>
-                <option value="4">4</option>
-                <option value="5">5</option>
+                <option value="0.5">0.5 · eco</option>
+                <option value="0.8">0.8 · eco</option>
+                <option value="1">1 · std</option>
+                <option value="1.5">1.5 · std/hd 边界</option>
+                <option value="2">2 · hd</option>
+                <option value="3">3 · 超采样</option>
+                <option value="4">4 · 超采样</option>
+              </select>
+            </label>
+            <label data-i18n-title="toolbar.resTip" title="贴图资源倍率覆盖（默认跟随清晰度档）：native=不缩，用于和缩放后的画面做逐像素 A/B"><span data-i18n="toolbar.res">资源</span>
+              <select id="res">
+                <option value="" selected>auto（跟随清晰度）</option>
+                <option value="native">native（不缩，A/B 用）</option>
+                <option value="0.8">0.8</option>
+                <option value="0.6">0.6</option>
+                <option value="0.5">0.5</option>
+              </select>
+            </label>
+            <label data-i18n-title="toolbar.resnTip" title="只改法线/蒙版的资源倍率（折射与光照对模糊敏感）：默认 1，用来拍法线下限的效果对比"><span data-i18n="toolbar.resn">法线</span>
+              <select id="resn">
+                <option value="" selected>默认（1）</option>
+                <option value="0.75">0.75</option>
+                <option value="0.5">0.5</option>
+                <option value="0.35">0.35</option>
               </select>
             </label>
             <label>fps
@@ -270,7 +289,7 @@
       <span class="grow"></span>
       <span id="status-item"></span>
       <span id="status-res" data-i18n="status.adaptive">自适应 16:9</span>
-      <span id="status-dpr">DPR auto</span>
+      <span id="status-dpr">DPR auto · R auto</span>
       <span id="status-fps" data-i18n-title="status.capTitle" title="帧率上限（工具条 fps）">上限 60</span>
       <span id="status-live-fps" class="idle" data-i18n-title="status.liveTitle" title="壁纸实测帧率（渲染循环最近 500ms）">— FPS</span>
     </footer>
