@@ -135,7 +135,13 @@ export function compressedFormatFor(gl, format) {
   const f = Number(format)
   if (f === 7) {
     const e = gl.getExtension('WEBGL_compressed_texture_s3tc')
-    return e ? { internalFormat: e.COMPRESSED_RGB_S3TC_DXT1_EXT, blockBytes: 8 } : null
+    // [we-scene patch 2026-09-21] DXT1 必须用 **RGBA** 变体：WE 的 DXT1 带 1-bit alpha
+    // （块内 c0<=c1 的第 4 色 = 透明黑，CPU 解码器 decodeDxtCommon 同样解出 alpha=0）。
+    // RGB 变体强制 alpha=1，透明区变成**不透明黑块**——2468489223 的 2fish（几乎全屏）
+    // / pezmediano2trio（右侧竖条）整片黑，用户报「黑色阴影」。两种变体块数据完全
+    // 相同：不透明 DXT1 在 RGBA 变体下 alpha 恒 1，零副作用（离线对照实测透明块处
+    // RGB 变体 [0,0,0,255] / RGBA 变体 alpha=0）。
+    return e ? { internalFormat: e.COMPRESSED_RGBA_S3TC_DXT1_EXT, blockBytes: 8 } : null
   }
   if (f === 6) {
     const e = gl.getExtension('WEBGL_compressed_texture_s3tc')
