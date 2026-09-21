@@ -334,7 +334,94 @@ function env(dpr, w, h) {
   check(/else if \(!entry && r8Native && m0\)/.test(smSrc) && /else if \(!entry\)/.test(smSrc), "直传命中后不得再被 RGBA 分支覆盖");
   const codecSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/pkg/tex-codecs.js"), "utf8");
   check(/export function cropBlocks/.test(codecSrc), "压缩路径要有块级裁剪（POT 填充只能按 4×4 块裁）");
+  // [2026-09-21] 压缩直传的**双轴画布对齐**：`.tex` 的 mip 画布常被对齐填充
+  // （3463520581 sky：内容 1920×1080、画布 1920×1088）。旧条件只看宽度
+  // （`bw === m.width ? m.data : crop`），宽度恰等时把整块画布数据原样传给
+  // compressedTexImage2D，GL 按裁后尺寸期望 → INVALID_VALUE → 纹理不完整 → 采样恒黑
+  // （用户报「整张壁纸基本全黑」；全库 31 张走压缩直传的壁纸 22 张命中）。
+  check(
+    /bw === m\.width && bh === m\.height\s*\?\s*m\.data/.test(smSrc),
+    "压缩直传原样上传必须**宽高两轴**都等于画布（只看宽度会把填充块行一起传 → GL 拒收 → 恒黑）",
+  );
+  check(
+    /data\.length !== Math\.ceil\(bw \/ 4\) \* Math\.ceil\(bh \/ 4\) \* cInfo\.blockBytes/.test(smSrc),
+    "压缩级上传前必须按 GL 期望长度对账，对不上回退 RGBA（宁可走老路不出黑块）",
+  );
+  // [2026-09-21] 压缩链的**尺寸金字塔**：WebGL2 的 mipmap 完整性要求第 i 级尺寸恰好
+  // = 第 i-1 级 floor÷2，偏差任意一级（如 round+ceil4 造出的 480×272 vs 应为 480×270）
+  // 整张纹理不完整 → 采样恒黑且**无任何 GL 报错**（离线 comptest 实测：同一份块，
+  // 旧链 mean=0.0 / floor 链 mean=146.6）。判据锁「level0 块对齐 + 逐级 floor÷2 +
+  // 文件画布盖不住就截断」三条接线。
+  check(
+    /const cW0 = Math\.min\(cMips\[baseLevel\]\.width, Math\.ceil\(cW0raw \/ 4\) \* 4\)/.test(smSrc) &&
+      /const cH0 = Math\.min\(cMips\[baseLevel\]\.height, Math\.ceil\(cH0raw \/ 4\) \* 4\)/.test(smSrc),
+    "压缩链 level0 = 内容尺寸块对齐（且不超过文件画布）",
+  );
+  check(
+    /Math\.floor\(cW0 \/ 2 \*\* i\)/.test(smSrc) && /Math\.floor\(cH0 \/ 2 \*\* i\)/.test(smSrc),
+    "压缩链每级必须严格 floor÷2（round/ceil4 会造出 272≠270 的断裂金字塔 → 不完整 → 恒黑）",
+  );
+  check(
+    /if \(bw > m\.width \|\| bh > m\.height\) break;/.test(smSrc),
+    "文件画布盖不住某级时必须**截断链**（MAX_LEVEL 收到末级仍完整），而不是放弃压缩或硬传",
+  );
+  check(
+    !/Math\.round\(Number\(parsedTex\?\.width[\s\S]{0,120}2 \*\* k\)[\s\S]{0,80}Math\.ceil\(cw \/ 4\) \* 4/.test(smSrc.slice(smSrc.indexOf("cLevels") - 200, smSrc.indexOf("makeCompressedTextureMip"))),
+    "不得再按 round+ceil4 推每级尺寸（断裂金字塔 = 黑块回归）",
+  );
+  {
+    const { cropBlocks } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/tex-codecs.js")).href);
+    // sky.tex 实形：DXT5 画布 1920×1088（480×272 块），内容裁到 1920×1080
+    const canvas = new Uint8Array(Math.ceil(1920 / 4) * Math.ceil(1088 / 4) * 16);
+    const cut = cropBlocks(canvas, 1920, 1920, 1080, 16);
+    check(
+      cut.length === Math.ceil(1920 / 4) * Math.ceil(1080 / 4) * 16,
+      `cropBlocks(1920×1088 → 1920×1080) 必须 = GL 期望的 2073600B，实得 ${cut.length}`,
+    );
+    check(
+      canvas.length === 2088960 && canvas.length !== cut.length,
+      "旧「只看宽度」路径的原样长度 2088960 ≠ GL 期望（这就是 3463520581 全黑的根因形状）",
+    );
+    // sky 的真实金字塔（floor 规则）：1080 → 540 → 270 → 135 —— 135 非 4 对齐也要照传
+    // （WebGL2 允许非零级非块对齐，数据按 ceil 块数给）。旧 round+ceil4 在第 2/3 级
+    // 造出 272/136，与 floor÷2 规则冲突 → 不完整。
+    const pyr = [];
+    const w0 = 1920, h0 = 1080;
+    for (let i = 0; i < 4; i++) pyr.push([Math.max(1, Math.floor(w0 / 2 ** i)), Math.max(1, Math.floor(h0 / 2 ** i))]);
+    check(
+      JSON.stringify(pyr) === JSON.stringify([[1920, 1080], [960, 540], [480, 270], [240, 135]]),
+      `sky 的 floor 金字塔应为 1920×1080 → 960×540 → 480×270 → 240×135，实得 ${JSON.stringify(pyr)}`,
+    );
+    const cut3 = cropBlocks(new Uint8Array(Math.ceil(272 / 4) * Math.ceil(136 / 4) * 16), 272, 240, 135, 16);
+    check(
+      cut3.length === Math.ceil(240 / 4) * Math.ceil(135 / 4) * 16,
+      `第 3 级裁剪 272×136 画布 → 240×135 内容：数据必须 = 60×34 块 = 32640B，实得 ${cut3.length}`,
+    );
+    // sbw ≠ dbw 的重排行布局（宽高都填充的画布）也必须逐行搬运保块序。
+    // out 第 r 行第 b 块必须来自**源**第 r*sbw + b 块（源行距 512 块、目标 480 块），
+    // 末字节 = 源块 (rows-1)*sbw + dbw-1 的末字节。
+    const canvas2 = new Uint8Array(Math.ceil(2048 / 4) * Math.ceil(2048 / 4) * 16);
+    for (let i = 0; i < canvas2.length; i++) canvas2[i] = ((i / 16) | 0) & 0xff; // 源块序号当填充值
+    const cut2 = cropBlocks(canvas2, 2048, 1920, 1080, 16);
+    const rows2 = Math.ceil(1080 / 4);
+    const lastSrcBlock = (rows2 - 1) * Math.ceil(2048 / 4) + (Math.ceil(1920 / 4) - 1);
+    check(
+      cut2.length === rows2 * Math.ceil(1920 / 4) * 16 && cut2[0] === 0 && cut2[cut2.length - 1] === (lastSrcBlock & 0xff),
+      "cropBlocks 跨行重排必须按源行距取块（sbw≠dbw 时逐行搬运，块内字节不动）",
+    );
+  }
   check(/TEXTURE_MAX_LEVEL/.test(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8")), "只传 N 级压缩纹理必须收 TEXTURE_MAX_LEVEL（否则纹理不完整）");
+  // [2026-09-21] DXT1 必须映射 **RGBA** 变体：WE 的 DXT1 带 1-bit alpha（c0<=c1 第 4 色
+  // = 透明黑，CPU 解码器 decodeDxtCommon 解出 alpha=0）。RGB 变体强制 alpha=1，
+  // 透明区变成不透明黑块（2468489223 的 2fish/pezmediano2trio 整片黑，用户报「黑色阴影」；
+  // 离线 GL 对照：同一份透明块 RGB 变体采出 [0,0,0,255]、RGBA 变体 alpha=0）。
+  {
+    const glUtilSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8");
+    check(
+      /COMPRESSED_RGBA_S3TC_DXT1_EXT/.test(glUtilSrc) && !/COMPRESSED_RGB_S3TC_DXT1_EXT/.test(glUtilSrc),
+      "DXT1 必须映射 RGBA_S3TC_DXT1 变体（RGB 变体丢 1-bit alpha → 透明区不透明黑块）",
+    );
+  }
   const pshSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particle-shaders.js"), "utf8");
   check(/u_albedoR8 == 1 \? t\.r : t\.a/.test(pshSrc), "粒子 shader 必须为 R8 直传补 WE 语义映射（rgb 白、形状取 .r）");
   check(/texFootprint\.set\(nm, need\)/.test(smSrc), "scene-mount 预扫描建立图层足迹表");

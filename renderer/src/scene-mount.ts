@@ -1708,16 +1708,36 @@ cfg, source, pkgAbort.signal);
             if (cInfo && cMips && cMips.length && !(Number(parsedTex?.flags) & 0x40) && !rawSkip) {
               const cLevels: Array<{ width: number; height: number; data: Uint8Array }> = [];
               let cOk = true;
-              for (let k = baseLevel; k < cMips.length; k++) {
-                const m = cMips[k];
-                const isFrames = !!parsedTex?.frames?.list?.length;
-                const cw = isFrames ? m.width : Math.max(1, Math.round(Number(parsedTex?.width || m.width) / 2 ** k));
-                const ch = isFrames ? m.height : Math.max(1, Math.round(Number(parsedTex?.height || m.height) / 2 ** k));
-                const bw = Math.ceil(cw / 4) * 4;
-                const bh = Math.ceil(ch / 4) * 4;
-                // 目标尺寸必须是完整块网格，且不超过该级画布
-                if (bw > m.width || bh > m.height) { cOk = false; break }
-                const data = bw === m.width ? m.data : tex.cropBlocks(m.data, m.width, bw, bh, cInfo.blockBytes);
+              // [we-scene patch 2026-09-21] 压缩 mip 链的尺寸必须是**严格 floor÷2 金字塔**：
+              // WebGL2 的 mipmap 完整性要求第 i 级尺寸恰好 = 第 i-1 级的 floor(w/2)×floor(h/2)，
+              // 偏差**任意一级**（哪怕 1px）整张纹理不完整 → 采样恒黑且**无任何 GL 报错**。
+              // 旧实现按 `round(content/2^k)` 再 ceil 到 4 的倍数（1080→540→270→272→136…），
+              // 内容尺寸非 4 幂的贴图（1920×1080、人物图集…）全数中招 —— 3463520581 的
+              // sky/人物整片黑块、云（POT 尺寸）正常，就是这条（全库 31 张压缩直传壁纸
+              // 基本全踩）。离线判据：comptest 链A mean=0.0 / 链B mean=146.6（同一份块）。
+              // level0 取内容尺寸块对齐；其后每级 floor÷2，数据从文件画布裁（内容在左上角，
+              // 与 decodeMipLevel 的裁剪口径一致）；文件 mip 用完就截断（MAX_LEVEL 收到
+              // 已传的末级，纹理仍完整）。单级贴图无链可言，天然完整。
+              const cW0raw = Math.max(1, Math.floor(Number(parsedTex?.width || cMips[0].width) / 2 ** baseLevel));
+              const cH0raw = Math.max(1, Math.floor(Number(parsedTex?.height || cMips[0].height) / 2 ** baseLevel));
+              const cW0 = Math.min(cMips[baseLevel].width, Math.ceil(cW0raw / 4) * 4);
+              const cH0 = Math.min(cMips[baseLevel].height, Math.ceil(cH0raw / 4) * 4);
+              for (let i = 0; i < cMips.length - baseLevel; i++) {
+                const m = cMips[baseLevel + i];
+                const bw = Math.max(1, Math.floor(cW0 / 2 ** i));
+                const bh = Math.max(1, Math.floor(cH0 / 2 ** i));
+                if (bw > m.width || bh > m.height) break; // 文件画布盖不住该级 → 截断链（仍完整）
+                // [we-scene patch 2026-09-21] **宽、高两轴都对齐画布**才能原样上传：
+                // 内容尺寸恰好等于画布时不裁；否则按 4×4 块裁（cropBlocks 对 sbw===dbw
+                // 的行主序布局截掉尾部多余块行）。数据长度对账，对不上回退 RGBA。
+                const data =
+                  bw === m.width && bh === m.height
+                    ? m.data
+                    : tex.cropBlocks(m.data, m.width, bw, bh, cInfo.blockBytes);
+                if (data.length !== Math.ceil(bw / 4) * Math.ceil(bh / 4) * cInfo.blockBytes) {
+                  cOk = false;
+                  break;
+                }
                 cLevels.push({ width: bw, height: bh, data });
               }
               if (cOk && cLevels.length) {
