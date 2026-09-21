@@ -401,6 +401,9 @@ export class ParticleSystem {
     // 绑定项（eventspawn 挂到本系统粒子上的发射器）识别出父粒子已作废。
     this._aliveCount = 0
     this._poolGen = (this._poolGen || 0) + 1
+    // 新粒子的 trail 是 null，必须补分配，否则 rope 尾迹整条消失
+    // （见 allocTrails 的注释：挂载期的 applyQuality 就会走到这里）。
+    this.allocTrails()
   }
 
   // 把 model 的 JSON 描述编译成扁平参数，避免每帧字符串比较
@@ -701,14 +704,36 @@ export class ParticleSystem {
       this.trailSegments = segs
       this.trailDuration = ropeTrailDuration(tr)
       this.trailSampleDt = this.trailDuration / Math.max(1, segs - 1)
-      for (const p of this.pool) {
-        p.trail = new Float32Array(segs * 3)
-        p.trailClock = 0
-      }
     }
+    this.allocTrails()
     // rope：粒子本身不是独立精灵，而是绳上的结——渲染时按发射序连成连续 ribbon。
     // 掉进默认 sprite 分支会把光束拆成一根根竖条纹（1425503532 Pac-Man）。
     this.ropeRenderer = this.renderers.find((r) => r.kind === 'rope') || null
+  }
+
+  /**
+   * [we-scene patch 2026-09-21] 给池里每个粒子分配 rope 历史环。
+   *
+   * **pool 每次重建都必须重跑**：`_applyOverride()` 会 `this.pool = []` 再 new 一批
+   * 全新粒子，新粒子的 `trail` 是 `null`，而 render 的尾迹分支有
+   * `if (trail && p.trail)` 这道守卫 —— 漏分配就等于**该系统的 rope 尾迹整条消失**，
+   * 渲染退化成「每个粒子一个孤立小精灵」。
+   *
+   * 现场：`scene-mount` 挂载时 `applyQuality()` 会对**所有**粒子系统调
+   * `_applyOverride()`（性能档位要重算池容量），于是全库 36 个 `ropetrail` 系统
+   * （23 张壁纸）的尾迹从挂载起就是死的。2464842912 两个车轮的 Magic Vortex
+   * （`ropetrail`，作者把颜色改成品红、`size ×2`）本该是绕轮顺时针流动的光带，
+   * 实际渲染成一圈孤立碎点 —— 用户报「车轮上应该是顺时针循环的灯光流动，
+   * 不是现在这种错误的粒子旋转」。
+   */
+  allocTrails() {
+    const tr = this.trailCfg
+    if (!tr || tr.kind !== 'ropetrail') return
+    const segs = Math.max(1, this.trailSegments || 1)
+    for (const p of this.pool) {
+      if (!p.trail || p.trail.length !== segs * 3) p.trail = new Float32Array(segs * 3)
+      p.trailClock = 0
+    }
   }
 
   setModel(model) {
@@ -1776,9 +1801,15 @@ export class ParticleSystem {
         if (trail && p.trail) {
           lx = p.trail[s * 3]
           ly = p.trail[s * 3 + 1]
-          // 尾部越远越淡越细
+          // [we-scene patch 2026-09-21] 尾部**只收细，不再额外乘 alpha**。
+          // 官方 Rope Trail 渲染器的可调项只有 Length / Segments / Subdivision /
+          // UV scale / UV scrolling（见 docs/we-docs/particles-renderer.md），
+          // **没有「沿绳的 alpha 渐隐」这一项** —— 官方靠贴图自身的 v 渐变与粒子的
+          // alphafade 表达淡出（真实 WE 页面里 Rope Trail 的设置项也印证了这点）。
+          // 旧实现自加的 `segAlpha = 1 - t` 会与贴图 v 渐隐**叠乘**，把整条尾迹
+          // 压暗近一半：2464842912 两个车轮的 Magic Vortex（作者把颜色改成品红、
+          // size ×2、alpha 1.5）因此几乎看不见，用户报「车轮上没有灯光流动」。
           const t = segs > 1 ? s / (segs - 1) : 0
-          segAlpha = 1 - t
           segSize = 1 - t * 0.55
           // 沿相邻历史点拉成丝：否则 length 秒的轨迹仍是一串分离的圆点
           let tdx = 0

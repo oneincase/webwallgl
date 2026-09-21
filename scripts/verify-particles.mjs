@@ -2064,6 +2064,16 @@ function runRopeTrail() {
   if (!/trailSampleDt/.test(src)) {
     errors.push("ropetrail 未按 Length 秒做时间采样（trailSampleDt）");
   }
+  // 官方 Rope Trail 渲染器的可调项只有 Length / Segments / Subdivision / UV scale /
+  // UV scrolling（见 docs/we-docs/particles-renderer.md），**没有「沿绳的 alpha 渐隐」**：
+  // 淡出应由贴图自身的 v 渐变与粒子的 alphafade 表达。旧实现自加的 `segAlpha = 1 - t`
+  // 会与贴图 v 渐隐叠乘、把整条尾迹压暗近一半（2464842912 车轮的 Magic Vortex 因此几乎看不见）。
+  if (/segAlpha\s*=\s*1\s*-\s*t/.test(src.replace(/\/\/[^\n]*/g, ""))) {
+    errors.push("ropetrail 又给每段乘了自加的 alpha 渐隐（官方无此设置，见 docs/we-docs/particles-renderer.md）");
+  }
+  if (!fs.existsSync(join(ROOT, "docs/we-docs/particles-renderer.md"))) {
+    errors.push("缺少官方文档镜像 docs/we-docs/particles-renderer.md（判据的出处）");
+  }
 
   if (ropeTrailHistoryCount({ kind: "ropetrail", segments: 16 }) !== 16) {
     errors.push("ropeTrailHistoryCount(segments=16) 应得 16");
@@ -2175,6 +2185,91 @@ function runRopeTrail() {
       }
     } catch (e) {
       errors.push(`3792881540 拆包失败: ${e.message}`);
+    }
+  }
+
+  // ---- pool 重建后 rope 历史环必须重新分配（2464842912 车轮 Magic Vortex）----
+  // `_applyOverride()` 会把整个 pool 换成新粒子（trail=null），而 scene-mount 挂载时
+  // 的 `applyQuality()` 对**所有**粒子系统调它 —— 漏补分配 = 全库 36 个 ropetrail
+  // 系统的尾迹从挂载起就是死的，render 的 `if (trail && p.trail)` 恒假，
+  // 每个粒子退化成一个孤立小精灵（车轮的「顺时针灯光流动」变成一圈碎点）。
+  if (!/allocTrails/.test(src)) {
+    errors.push("particles.js 未实现 allocTrails（pool 重建后 rope 历史环不会补分配）");
+  }
+  {
+    const ps2 = new ParticleSystem(
+      null,
+      {
+        maxcount: 32,
+        renderer: [{ name: "ropetrail", length: 0.4 }],
+        emitter: [{ name: "boxrandom", rate: 200, distancemax: 64 }],
+        initializer: [{ name: "lifetimerandom", min: 1, max: 1 }],
+        // 必须给持续的加速度：这里的发射器是 boxrandom（不写初速），没有 gravity
+        // 粒子就原地不动、历史环全是同一个点 —— 判据会假红。
+        operator: [{ name: "movement", gravity: "0 -200 0", drag: 0 }],
+      },
+      { size: 2, alpha: 1.5, colorn: "0.5 0 0.5" },
+      { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] },
+    );
+    for (let i = 0; i < 120; i++) ps2.advance(1 / 60, { level: 0 });
+    const before = ps2.pool.filter((q) => q.alive).length;
+    // 模拟挂载期的性能档位重算：重建 pool
+    ps2._applyOverride();
+    const nullTrails = ps2.pool.filter((q) => !q.trail).length;
+    if (nullTrails > 0) {
+      errors.push(`_applyOverride 重建 pool 后仍有 ${nullTrails}/${ps2.pool.length} 个粒子没有 trail 环`);
+    }
+    for (let i = 0; i < 150; i++) ps2.advance(1 / 60, { level: 0 });
+    const alive2 = ps2.pool.filter((q) => q.alive && q.trail);
+    let spread = 0;
+    for (const q of alive2) {
+      const s = Math.hypot(q.trail[0] - q.trail[q.trail.length - 3], q.trail[1] - q.trail[q.trail.length - 2]);
+      if (s > spread) spread = s;
+    }
+    if (!(alive2.length > 0)) {
+      errors.push(`pool 重建后 ropetrail 存活 ${alive2.length}（重建前 ${before}）`);
+    } else if (!(spread > 5)) {
+      errors.push(`pool 重建后 rope 尾迹跨度只有 ${spread.toFixed(1)}px（历史环没在累积）`);
+    } else {
+      console.log(`   pool 重建后 ropetrail：存活 ${alive2.length}，最大尾迹跨度 ${spread.toFixed(1)}px`);
+    }
+  }
+
+  // 真实语料：2464842912 两个车轮的 Magic Vortex（magic_vortex_1 + 品红 override）
+  {
+    const pkgPath = join(LIB, "2464842912", "scene.pkg");
+    if (!fs.existsSync(pkgPath)) {
+      console.log("   skip：库中没有 2464842912");
+    } else {
+      try {
+        const pkg = parsePkg(fs.readFileSync(pkgPath));
+        const model = JSON.parse(Buffer.from(getEntry(pkg, "particles/presets/magic_vortex_1.json")).toString("utf8"));
+        const scene = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8"));
+        const mv = (scene.objects || []).filter((o) => typeof o.particle === "string" && /magic_vortex/.test(o.particle));
+        if (mv.length !== 2) errors.push(`2464842912 应有 2 个 Magic Vortex 图层，实得 ${mv.length}`);
+        for (const o of mv) {
+          const layer = {
+            origin: String(o.origin).split(/\s+/).map(Number),
+            scale: String(o.scale).split(/\s+/).map(Number),
+            angles: String(o.angles || "0 0 0").split(/\s+/).map(Number),
+          };
+          const ps3 = new ParticleSystem(null, model, o.instanceoverride, layer);
+          if (ps3.trailCfg?.kind !== "ropetrail") errors.push(`2464842912 #${o.id} 应为 ropetrail`);
+          ps3._applyOverride(); // 挂载期 quality 重算
+          for (let i = 0; i < 240; i++) ps3.advance(1 / 60, { level: 0 });
+          const alive3 = ps3.pool.filter((q) => q.alive && q.trail);
+          let mx = 0;
+          for (const q of alive3) {
+            const s = Math.hypot(q.trail[0] - q.trail[q.trail.length - 3], q.trail[1] - q.trail[q.trail.length - 2]);
+            if (s > mx) mx = s;
+          }
+          if (!(alive3.length > 5)) errors.push(`2464842912 #${o.id} Magic Vortex 存活 ${alive3.length}`);
+          if (!(mx > 40)) errors.push(`2464842912 #${o.id} Magic Vortex 尾迹跨度仅 ${mx.toFixed(1)}px（应绕轮成带）`);
+          console.log(`   2464842912 #${o.id} Magic Vortex：存活 ${alive3.length}，尾迹跨度 ${mx.toFixed(1)}px`);
+        }
+      } catch (e) {
+        errors.push(`2464842912 Magic Vortex 判据失败: ${e.message}`);
+      }
     }
   }
 
