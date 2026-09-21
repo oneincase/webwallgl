@@ -26,7 +26,7 @@
  *   `?localAssets=0|off` 关闭；`all` 全量；`1|on` 或 dev 缺省 = util 急切 + particle 按需。
  *   只有 dev（`import.meta.env.DEV`）或显式参数才发请求，生产构建不会产生任何请求。
  */
-import { tex, ptex, sysTex } from "./vendor";
+import { tex, ptex, sysTex, gtex } from "./vendor";
 
 /** 一次装载的结果（给 diag / `window.__localAssets` 看） */
 export type LocalAssetStats = {
@@ -199,6 +199,9 @@ export async function installLocalAssets(): Promise<LocalAssetStats | null> {
     // 3) provider 必须先装：util 注册循环、粒子取贴图都会立刻问它
     sysTex.setSystemTextureProvider((name: string) => pixels.get(name) ?? null);
     ptex.setParticleTextureProvider((name: string) => pixels.get(name) ?? null);
+    // gradient/gradient_*（shimmer 等效果的 gradient map 默认值）同构覆盖：
+    // 本机拷了原版 materials/gradient/*.tex 时命中官方像素，否则程序化复刻兜底。
+    gtex.setGradientTextureProvider((name: string) => pixels.get(name) ?? null);
 
     // 4) 急切装载：util（默认）或全量（mode=all）
     const utilNames = [...source.names].filter((n) => n.startsWith("util/"));

@@ -1462,6 +1462,26 @@ cfg, source, pkgAbort.signal);
               return genEntry;
             }
           }
+          // [we-scene patch] 内置渐变（gradient/gradient_*）：shimmer 的 gradient map、
+          // lightshafts / procedural_noise 等效果槽的 sampler default。缺它落 whiteTex
+          // → shimmer 的混合权重 `mask * shimmerColor` 恒 1，「从左向右扫过的亮暗带」
+          // 退化成整层恒定染色（3737267090；全库 3 个渐变名 / 13 张壁纸受影响）。
+          // 上面 ensureLocalAsset 命中官方像素时已进 textures；这里只兜程序化复刻。
+          if (!textures.has(name) && gtex.isBuiltinGradientTextureName(name)) {
+            const gen = gtex.buildBuiltinGradientTexture(name);
+            if (gen) {
+              const genEntry = {
+                glTex: rnd.makeTextureMip(renderer.gl, [gen], false, { wrap: "repeat" }),
+                width: gen.width,
+                height: gen.height,
+                rg88: false,
+                mips: [gen],
+                generated: true,
+              };
+              textures.set(name, genEntry);
+              return genEntry;
+            }
+          }
           return null;
         }
         const parsedTex = tex.parseTex(texEntry);

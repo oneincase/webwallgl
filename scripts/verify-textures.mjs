@@ -931,5 +931,125 @@ async function stockTexFormats() {
 
 await stockTexFormats();
 
+// ---------- 内置渐变（gradient/gradient_*）：程序化复刻 + 三处接线 ----------
+// shimmer / lightshafts / procedural_noise 的 gradient map 槽走 sampler default
+// （`gradient/gradient_ferro_fluid` 等），不在壁纸 pkg 里。缺它落 whiteTex →
+// shimmer 的混合权重 `mask * shimmerColor` 恒 1，「从左向右扫过的亮暗带」退化成
+// 整层恒定染色（3737267090 用户报缺失动画；全库 3 个渐变名 / 13 张壁纸受影响，
+// 2026-09-21 sampler default 全库扫描）。修复 = gradient-textures.js 锚点表复刻
+// + scene-mount 的 loadTexInner 兜底 + local-assets provider 官方像素覆盖。
+async function builtinGradients() {
+  const gtex = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/gradient-textures.js")).href
+  );
+  // 登记表：本库在用的 3 个名字必须齐（ferro_fluid=shimmer、iridescent=lightshafts、
+  // fire=procedural_noise），形近名字不得误命中。
+  const names = gtex.listBuiltinGradientTextureNames();
+  for (const must of ["gradient/gradient_ferro_fluid", "gradient/gradient_fire", "gradient/gradient_iridescent"]) {
+    check(names.includes(must), `内置渐变登记表必须含 ${must}`);
+  }
+  check(
+    !gtex.isBuiltinGradientTextureName("gradient/gradient_nope") &&
+      !gtex.isBuiltinGradientTextureName("util/white") &&
+      !gtex.isBuiltinGradientTextureName(null),
+    "isBuiltinGradientTextureName 必须拒绝未登记名 / 非渐变名 / null",
+  );
+  // 径向坡（blend_gradient[_reverse]）：blur 的径向模糊蒙版（3047405322）与媒体
+  // 组件渐变掩码（2134765860/2370927443）用。落白 = 蒙版 .r 恒 1 → 整屏全模糊。
+  check(
+    gtex.isBuiltinGradientTextureName("gradient/blend_gradient") &&
+      gtex.isBuiltinGradientTextureName("gradient/blend_gradient_reverse"),
+    "登记表必须含径向坡 blend_gradient / blend_gradient_reverse",
+  );
+  const rad = gtex.buildBuiltinGradientTexture("gradient/blend_gradient");
+  check(rad && rad.width === 256 && rad.height === 256, `blend_gradient 尺寸应为 256²，实得 ${rad && `${rad.width}×${rad.height}`}`);
+  const radPx = (x, y) => rad.rgba[(y * 256 + x) * 4];
+  check(
+    radPx(128, 128) <= 2 && radPx(255, 255) >= 250 && radPx(255, 0) >= 250,
+    `blend_gradient 必须中心黑(≤2) 角白(≥250)，实得 中心=${radPx(128, 128)} 角=${radPx(255, 255)}`,
+  );
+  const radR = gtex.buildBuiltinGradientTexture("gradient/blend_gradient_reverse");
+  const revPx = (x, y) => radR.rgba[(y * 256 + x) * 4];
+  check(
+    revPx(128, 128) >= 253 && revPx(255, 255) <= 5,
+    `blend_gradient_reverse 必须为反相（中心 ≥253 / 角 ≤5），实得 中心=${revPx(128, 128)} 角=${revPx(255, 255)}`,
+  );
+  check(
+    revPx(128, 64) === 255 - radPx(128, 64),
+    `reverse 必须逐点反相（官方实测偏差 0），实得 ${revPx(128, 64)} vs ${255 - radPx(128, 64)}`,
+  );
+  // 径向对称抽检（官方实测对称；坐标须对 127.5 中心等距）
+  check(
+    radPx(128, 16) === radPx(16, 128) && radPx(128, 240) === radPx(240, 128),
+    "blend_gradient 必须径向对称",
+  );
+  // 输出契约：64×2、两行相同（官方原图即此形态）；重复构建返回同一缓存对象。
+  const g = gtex.buildBuiltinGradientTexture("gradient/gradient_ferro_fluid");
+  check(g && g.width === 64 && g.height === 2, `ferro_fluid 尺寸应为 64×2，实得 ${g && `${g.width}×${g.height}`}`);
+  check(gtex.buildBuiltinGradientTexture("gradient/gradient_ferro_fluid") === g, "同名字必须命中缓存（确定性）");
+  let rowsEqual = true;
+  for (let x = 0; x < 64; x++) {
+    for (let c = 0; c < 4; c++) {
+      if (g.rgba[x * 4 + c] !== g.rgba[(64 + x) * 4 + c]) rowsEqual = false;
+    }
+  }
+  check(rowsEqual, "渐变两行必须逐位相同（1D 色带）");
+  check(gtex.buildBuiltinGradientTexture("gradient/gradient_nope") === null, "未登记名必须返回 null（调用方继续走其它来源）");
+  // 形状不变量（判据锁形态，不锁字节）：ferro_fluid = 近黑底 + 一条窄银带
+  // （官方峰值在 x≈41-42，x∈[35,48]），全行均值必须低 —— 亮带丢了或铺满全行都红。
+  const cols = [];
+  for (let x = 0; x < 64; x++) {
+    cols.push((g.rgba[x * 4] + g.rgba[x * 4 + 1] + g.rgba[x * 4 + 2]) / 3);
+  }
+  const mean = cols.reduce((a, b) => a + b, 0) / 64;
+  let peak = 0;
+  for (let x = 0; x < 64; x++) if (cols[x] > cols[peak]) peak = x;
+  check(mean < 40, `ferro_fluid 全行均值必须 <40（近黑底），实得 ${mean.toFixed(1)}`);
+  check(peak >= 35 && peak <= 48, `ferro_fluid 亮带峰值列必须在 [35,48]，实得 x=${peak}`);
+  // fire：暗红起步（g 低）、尾部偏黄（g 高）—— g 单调上升被破坏即红。
+  const fire = gtex.buildBuiltinGradientTexture("gradient/gradient_fire");
+  const gMean = (x0, x1) => {
+    let s = 0;
+    for (let x = x0; x < x1; x++) s += fire.rgba[x * 4 + 1];
+    return s / (x1 - x0);
+  };
+  check(gMean(0, 8) < 20 && gMean(56, 64) > 150, `fire 的 G 通道必须「暗红→黄」上升（首 8 列均值 ${gMean(0, 8).toFixed(0)}、末 8 列均值 ${gMean(56, 64).toFixed(0)}）`);
+  // 锚点表自检：x 单调且首尾钉住 0/63 —— 表被改乱（乱序/越界）时插值会静默出错。
+  const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gradient-textures.js"), "utf8");
+  const entries = [...src.matchAll(/^  ([a-z0-9_]+): \{ r8: (?:true|false), stops: (\[\[.*?\]\]) \},?$/gm)];
+  check(entries.length >= 14, `渐变锚点表必须 ≥14 条，实得 ${entries.length}`);
+  for (const [, variant, stopsSrc] of entries) {
+    const xs = [...stopsSrc.matchAll(/\[(\d+),/g)].map((m) => Number(m[1]));
+    const monotonic = xs.length >= 2 && xs.every((v, i) => i === 0 || v > xs[i - 1]);
+    check(monotonic && xs[0] === 0 && xs[xs.length - 1] === 63, `渐变 ${variant} 锚点 x 必须严格递增且钉住 0/63`);
+  }
+  // 径向锚点表：半径严格递增、钉住 0/181（表被改乱时径向插值静默出错）
+  const radialEntries = [...src.matchAll(/^  (blend_gradient(?:_reverse)?): \{ invert: (?:true|false), stops: (\[\[.*?\]\]) \},?$/gm)];
+  check(radialEntries.length === 2, `径向锚点表必须 2 条，实得 ${radialEntries.length}`);
+  for (const [, variant, stopsSrc] of radialEntries) {
+    const xs = [...stopsSrc.matchAll(/\[(\d+),/g)].map((m) => Number(m[1]));
+    const monotonic = xs.length >= 8 && xs.every((v, i) => i === 0 || v > xs[i - 1]);
+    check(monotonic && xs[0] === 0 && xs[xs.length - 1] === 181, `径向 ${variant} 锚点半径必须严格递增且钉住 0/181`);
+  }
+  // 接线两处：loadTexInner 的 pkg 缺项分支（ensureLocalAsset 之后）、vendor 出口、
+  // local-assets provider。少一处：官方像素或程序化兜底整条断链、静默落白。
+  const sm = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const smWiring = [
+    [/gtex\.isBuiltinGradientTextureName\(name\)/, "loadTexInner 必须在 pkg 缺项时问内置渐变登记表"],
+    [/gtex\.buildBuiltinGradientTexture\(name\)/, "命中登记表必须调 buildBuiltinGradientTexture 生成兜底像素"],
+  ];
+  for (const [re, msg] of smWiring) check(re.test(sm), `接线：${msg}`);
+  check(
+    /isBuiltinGradientTextureName[\s\S]{0,400}buildBuiltinGradientTexture[\s\S]{0,700}return null;/.test(sm),
+    "渐变兜底必须位于 loadTexInner 缺项分支的 return null 之前",
+  );
+  const vendor = fs.readFileSync(join(ROOT, "renderer/src/vendor.ts"), "utf8");
+  check(/gradient-textures\.js/.test(vendor), "vendor 出口必须引 gradient-textures.js");
+  const la = fs.readFileSync(join(ROOT, "renderer/src/local-assets.ts"), "utf8");
+  check(/gtex\.setGradientTextureProvider/.test(la), "local-assets 必须给渐变装 provider（本机官方像素覆盖）");
+}
+
+await builtinGradients();
+
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);
