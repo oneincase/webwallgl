@@ -471,6 +471,36 @@ export function compositeSourceQuadSize(srcSize, srcScale, sw, sh, k) {
   return [sw / kk, sh / kk]
 }
 
+/**
+ * [we-scene patch 2026-09-21] 跨层合成源层预渲染时的 size / scale 摆放。
+ *
+ * 不变量：**quad 的世界尺寸必须等于合成 FBO 尺寸**（FBO 就是按 `size × scale`
+ * 钳制出来的），否则源层内容会缩到 FBO 正中、四周留透明，引用方采到一张
+ * 只有中央一小块有内容的图。
+ *
+ * 旧实现把 `scale` 写成 `sign(scale) * k`（丢掉模长），只有 scale=1 的源层恰好
+ * 等价；`scale ≠ 1` 的源层全部缩水（2464842912 的 Beam 32×32×19.97 → 只剩
+ * 32×32 的一小块，车身上的「流光」因此既不动也没内容）。
+ *
+ * 退化源层（某轴 <1px）由 `compositeSourceQuadSize` 把 quad 撑满 FBO，此时
+ * `scale` 取单位模长 × k —— 不能乘原 scale，那个轴是 0，乘出来还是退化。
+ *
+ * @returns {{size: number[], scale: number[]}} 预渲染期要写进源层的 size / scale。
+ */
+export function compositeSourcePlacement(srcSize, srcScale, sw, sh, k) {
+  const size = Array.isArray(srcSize) && srcSize.length >= 2 ? srcSize : [1, 1]
+  const scale = Array.isArray(srcScale) && srcScale.length >= 2 ? srcScale : [1, 1, 1]
+  const kk = k || 1
+  const quad = compositeSourceQuadSize(size, scale, sw, sh, kk)
+  if (quad) {
+    return {
+      size: quad,
+      scale: [(Math.sign(scale[0]) || 1) * kk, (Math.sign(scale[1]) || 1) * kk, scale[2]],
+    }
+  }
+  return { size, scale: [scale[0] * kk, scale[1] * kk, scale[2]] }
+}
+
 export function createRenderer(canvas, opts = {}) {
   const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, antialias: false, alpha: false, preserveDrawingBuffer: true })
   if (!gl) throw new Error('当前浏览器不支持 WebGL2')
@@ -2680,7 +2710,65 @@ export function createRenderer(canvas, opts = {}) {
       if (!used) zOrderComposePersist.delete(n)
     }
     if (wanted.size === 0) return
-    for (const [oid, names] of wanted) {
+    // [we-scene patch 2026-09-21] **合成源必须按依赖顺序预渲染：被引用者先做。**
+    //
+    // `wanted` 是按**图层顺序**插入的，而图层的 z 序与依赖方向常常相反：引用方
+    // 通常排在前面（本墙 13 → 107 → 94）。按插入顺序走，预渲染 107 时
+    // `compositeFBOs` 里还没有 `_rt_imageLayerComposite_94_a`，`resolveTextureName`
+    // 返回 null → blend pass 的 `g_Texture1` 落到 sampler 声明里的 `default`
+    // （`materials/effects/blend.json` 用的是 `util/white`）→ `A × 白 = A`，
+    // 上游那层的 multiply 等于没乘。
+    //
+    // 现场（2464842912）：107 的 multiply 本该乘上 Beam 的近黑合成图、把遮罩项压成 0，
+    // 于是下游 ColorDodge 应当是**惰性**的（作者工坊图：轮拱 34.2 / 车身 68.9，
+    // 与原画 32.2 / 60.1 齐平）。顺序反了以后 `composite107 = 遮罩原文` →
+    // ColorDodge 把整片剪影打到过曝：实测轮拱 **140.7**（11 帧 140.6~141.1，稳定）
+    // / 车身 115.6，即 4.4× / 1.9×。
+    // 判据：合成源的预渲染顺序必须是其引用关系的拓扑序。
+    const depOrder = (() => {
+      const ids = [...wanted.keys()]
+      const deps = new Map()
+      for (const oid of ids) {
+        const l = (scene.layers || []).find((x) => x.id === oid)
+        const set = new Set()
+        if (l) {
+          const scan = (v) => {
+            if (typeof v === 'string') {
+              const m = /^_rt_imageLayerComposite_(\d+)_[a-z]$/.exec(v)
+              if (m) {
+                const d = Number(m[1])
+                if (d !== oid && wanted.has(d)) set.add(d)
+              }
+            } else if (Array.isArray(v)) {
+              v.forEach(scan)
+            }
+          }
+          for (const eff of l.effects || []) {
+            if (!eff.visible) continue
+            for (const p of eff.passes || []) for (const t of p.textures || []) scan(t)
+            for (const mp of eff.materialPasses || []) {
+              for (const b of mp.binds || []) scan(b && b.name)
+              for (const t of mp.textures || []) scan(t)
+            }
+          }
+        }
+        deps.set(oid, set)
+      }
+      const out = []
+      const state = new Map()
+      const visit = (oid) => {
+        const st = state.get(oid) || 0
+        if (st !== 0) return // 1 = 正在访问（环）：自引用已单独筛掉，这里直接跳过
+        state.set(oid, 1)
+        for (const d of deps.get(oid) || []) visit(d)
+        state.set(oid, 2)
+        out.push(oid)
+      }
+      for (const oid of ids) visit(oid)
+      return out
+    })()
+    for (const oid of depOrder) {
+      const names = wanted.get(oid)
       const src = (scene.layers || []).find((l) => l.id === oid)
       if (!src || src.particle || src.isPostProcess) continue
       // [we-scene patch] **自引用**（层在自己的效果链里引用自己的合成结果）不预渲染。
@@ -2773,12 +2861,23 @@ export function createRenderer(canvas, opts = {}) {
       // `_rt_imageLayerComposite_1475_a` 读它的频谱缓冲，结果读到全 0 ⇒ 14 根
       // 音条恒停在最小高度（用户报「音频组件不动」；把 combo 改成 SOURCE=1 走
       // 内置频谱立刻会动，这就是判据）。判据函数见 compositeSourceQuadSize。
-      const quadOverride = compositeSourceQuadSize(src.size, savedScale, sw, sh, k)
-      if (quadOverride) src.size = quadOverride
-      // 源层摆到视口正中、去掉自身缩放与旋转（尺寸已折进 FBO 与视口）；
-      // 钳过尺寸时再把 k 折进 scale，quad 恰好铺满缩小的 FBO。
+      // 源层摆到视口正中、去掉自身旋转。
+      // [we-scene patch 2026-09-21] **size / scale 一起算**（见 compositeSourcePlacement）：
+      // compositeLayer 的 quad 世界尺寸 = `size × scale`，而这块 FBO 恰好按
+      // `size × scale` 开 —— 只有把原 scale 乘回钳制系数 k，quad 才正好铺满 FBO。
+      // 旧实现写 `sign(scale) * k`（丢掉模长，等效 scale=1），于是 **scale≠1 的源层
+      // 内容被画成 FBO 正中的一小块**、四周全透明：
+      //   2464842912「Beam」32×32 × scale 19.97 → 合成图里只剩 32×32 的小块，
+      //   下游 107（1920×1080 × scale 2）也被缩到画面中央 1/4；
+      //   车身上那层 ColorDodge 的「流光」既没有内容可走动（Beam 的竖直光带被缩成
+      //   32px），又只剩一块静止的遮罩亮斑 —— 用户报「车身没有从车头到车尾的循环
+      //   灯光流动」。
+      // 退化源层仍走单位模长 × k（savedScale 那一轴是 0，乘原值会把 3448845950 的
+      // 音频条修回去）。判据：quad 世界尺寸 == FBO 尺寸（scale=1 的源层逐位不变）。
+      const placed = compositeSourcePlacement(src.size, savedScale, sw, sh, k)
       src.origin = [sw / 2, srcCam.projH - sh / 2, savedOrigin[2]]
-      src.scale = [(Math.sign(savedScale[0]) || 1) * k, (Math.sign(savedScale[1]) || 1) * k, savedScale[2]]
+      src.size = placed.size
+      src.scale = placed.scale
       src.angles = [0, 0, 0]
       src.visible = true
       try {

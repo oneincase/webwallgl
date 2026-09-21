@@ -1886,8 +1886,8 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       "renderCompositeSources 未用 clampCompositeFboSize 钳源层 FBO 尺寸");
     check(/MAX_TEXTURE_SIZE/.test(cCode) && /maxTextureSize/.test(rsrc),
       "钳制必须取真实的 GL_MAX_TEXTURE_SIZE（写死 8192 会在 16384 机型上白降分辨率）");
-    check(/src\.scale = \[\(Math\.sign\(savedScale\[0\]\) \|\| 1\) \* k/.test(cCode),
-      "钳掉尺寸后必须把 k 折进源层 scale（否则 quad 溢出 FBO，内容被裁而不是被缩小）");
+    check(/compositeSourcePlacement\(src\.size, savedScale, sw, sh, k\)/.test(cCode),
+      "钳掉尺寸后必须把 k 折进源层 scale（否则 quad 与 FBO 不匹配：溢出被裁，或缩成中心一小块）");
     {
       const mod = await imp("renderer/vendor/we-scene/render/renderer.js");
       const fn = mod.clampCompositeFboSize;
@@ -2058,13 +2058,49 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   );
   const c = clampCompositeFboSize(64, 1, 8192);
   check(c.width === 64 && c.height === 1, `clampCompositeFboSize(64,1) 应为 64×1，实得 ${c.width}×${c.height}`);
-  // 接线：调用点必须用这个纯函数，且渲染后还原 size
+  // 接线：调用点必须用这对纯函数，且渲染后还原 size
   const rsrcM = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   check(
-    /compositeSourceQuadSize\(src\.size, savedScale, sw, sh, k\)/.test(rsrcM),
-    "renderCompositeSources 必须用 compositeSourceQuadSize 计算 quad 覆盖",
+    /compositeSourcePlacement\(src\.size, savedScale, sw, sh, k\)/.test(rsrcM),
+    "renderCompositeSources 必须用 compositeSourcePlacement 计算 size/scale 摆放",
   );
   check(/src\.size = savedSize/.test(rsrcM), "源层 size 覆盖后必须还原");
+  // [2026-09-21] 不变量：预渲染期 quad 的**世界尺寸**必须等于合成 FBO 尺寸。
+  // 旧实现把 scale 写成 sign(scale)*k（丢掉模长），scale≠1 的源层内容被画成
+  // FBO 正中的一小块 —— 2464842912 的流光（Beam 32×32×19.97 + 遮罩 1920×1080×2）
+  // 就是这么整段缩水成静止亮斑的。
+  {
+    const { compositeSourcePlacement } = await imp("renderer/vendor/we-scene/render/renderer.js");
+    // scale=1 的源层逐位不变（quad == FBO）
+    const p1 = compositeSourcePlacement([560, 560], [1, 1, 1], 560, 560, 1);
+    check(
+      p1.size[0] === 560 && p1.size[1] === 560 && p1.scale[0] === 1,
+      `scale=1 的源层摆放不得变化，实得 ${JSON.stringify(p1)}`,
+    );
+    // scale≠1：quad = size×scale×k == FBO
+    const p2 = compositeSourcePlacement([1920, 1080], [2, 2, 1], 3840, 2160, 1);
+    check(
+      Math.abs(p2.size[0] * p2.scale[0] - 3840) < 1 && Math.abs(p2.size[1] * p2.scale[1] - 2160) < 1,
+      `scale=2 的源层 quad 必须铺满 3840×2160 的 FBO，实得 ${JSON.stringify(p2)}`,
+    );
+    const p3 = compositeSourcePlacement([32, 32], [19.96554, 19.96554, 1], 639, 639, 1);
+    check(
+      Math.abs(p3.size[0] * p3.scale[0] - 639) < 2 && Math.abs(p3.scale[0]) > 19,
+      `scale=19.97 的源层必须保留模长（旧实现丢掉后只剩 1），实得 ${JSON.stringify(p3)}`,
+    );
+    // 钳制：quad × k 仍等于钳后的 FBO（用自洽的 (swRaw, k) 组合：3840×2160 @ k=0.5 → 1920×1080）
+    const p4 = compositeSourcePlacement([1920, 1080], [2, 2, 1], 1920, 1080, 0.5);
+    check(
+      Math.abs(p4.size[0] * p4.scale[0] - 1920) < 2 && Math.abs(p4.size[1] * p4.scale[1] - 1080) < 2,
+      `钳过尺寸后 quad×k 仍须等于 FBO，实得 ${JSON.stringify(p4)}`,
+    );
+    // 退化源层走单位模长 × k（不能乘 0）
+    const p5 = compositeSourcePlacement([64, 0], [0, 0, 0], 64, 1, 1);
+    check(
+      p5.size[0] * p5.scale[0] === 64 && p5.size[1] * p5.scale[1] === 1,
+      `退化源层仍须撑满 FBO，实得 ${JSON.stringify(p5)}`,
+    );
+  }
   // 真实语料：引用链 + 源层确实是退化生成器
   const wpM = wallpapers.find((w) => w.id === "3448845950");
   if (!wpM) {
@@ -2083,6 +2119,130 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(size[0] === 64 && size[1] === 0, `音频缓冲区层应是 64×0，实得 ${JSON.stringify(size)}`);
     check(scale[0] === 0 && scale[1] === 0, `音频缓冲区层 scale 应为 0，实得 ${JSON.stringify(scale)}`);
     console.log(`   M. 3448845950 音频缓冲区源层 ${size.join("×")} scale ${scale[0]} → quad 覆盖 ${JSON.stringify(q)}`);
+  }
+
+  // ---------- N. 真实语料：每个合成源的 quad 世界尺寸 == 合成 FBO 尺寸 ----------
+  // 全库扫 `_rt_imageLayerComposite_<id>_a` 引用，对每个源层跑 compositeSourcePlacement
+  // 与 clampCompositeFboSize，断言 `size × scale × k == FBO`。旧实现对 scale≠1 的源层
+  // 断言失败（quad 缩到 FBO 的 1/scale）。
+  {
+    const { compositeSourcePlacement, clampCompositeFboSize } = await imp("renderer/vendor/we-scene/render/renderer.js");
+    let srcCount = 0;
+    let bad = [];
+    let scaled = 0;
+    let walls = 0;
+    for (const w of wallpapers) {
+      const objs = w.scene.objects || [];
+      const byId = new Map(objs.map((o) => [o.id, o]));
+      const refs = new Set();
+      const scan = (v) => {
+        if (typeof v === "string") {
+          const m = v.match(/_rt_imageLayerComposite_(\d+)_/);
+          if (m) refs.add(Number(m[1]));
+        } else if (Array.isArray(v)) v.forEach(scan);
+        else if (v && typeof v === "object") Object.values(v).forEach(scan);
+      };
+      objs.forEach(scan);
+      let hit = false;
+      for (const rid of refs) {
+        const o = byId.get(rid);
+        if (!o || typeof o.particle === "string") continue;
+        const size = String(o.size || "0 0").trim().split(/\s+/).map(Number);
+        const scale = String(o.scale || "1 1 1").trim().split(/\s+/).map(Number);
+        if (!size[0] || !size[1]) continue;
+        const c = clampCompositeFboSize(Math.abs(size[0] * (scale[0] || 1)), Math.abs(size[1] * (scale[1] || 1)), 8192);
+        const p = compositeSourcePlacement(size, scale, c.width, c.height, c.k);
+        srcCount++;
+        hit = true;
+        const qw = Math.abs(p.size[0] * p.scale[0]);
+        const qh = Math.abs(p.size[1] * p.scale[1]);
+        if (Math.abs(qw - c.width) > 1.5 || Math.abs(qh - c.height) > 1.5) {
+          bad.push(`${w.id}#${rid} size ${size[0]}×${size[1]} scale ${scale[0]}×${scale[1]} → quad ${qw.toFixed(1)}×${qh.toFixed(1)} ≠ FBO ${c.width}×${c.height}`);
+        }
+        if (Math.abs((scale[0] || 1) - 1) > 1e-6 || Math.abs((scale[1] || 1) - 1) > 1e-6) scaled++;
+      }
+      if (hit) walls++;
+    }
+    check(srcCount >= 100, `合成源语料应 >=100 个，实得 ${srcCount}`);
+    check(scaled >= 30, `其中 scale≠1 的源层应 >=30 个（旧实现全错），实得 ${scaled}`);
+    check(
+      bad.length === 0,
+      `合成源 quad 世界尺寸必须等于 FBO 尺寸，${bad.length} 个不符：${bad.slice(0, 3).join(" | ")}`,
+    );
+    console.log(`   N. ${walls} 张壁纸 / ${srcCount} 个合成源（scale≠1 的 ${scaled} 个）quad 世界尺寸 == FBO 尺寸`);
+  }
+
+  // ---------- O. 合成源预渲染必须按依赖拓扑序（被引用者先做）----------
+  // `wanted` 按图层 z 序插入，而依赖方向常常相反（2464842912：13→107→94，
+  // 于是 107 先于 94 被预渲染）。顺序反了时 `compositeFBOs` 里还没有被引用者，
+  // `resolveTextureName` 回退到 sampler 的 `default`（blend 是 `util/white`）→
+  // 上游 multiply 变成「× 白 = 原样」，下游 ColorDodge 把遮罩整片打到过曝
+  // （实测轮拱 140.7 vs 作者 34.2；排序后 31.4）。
+  {
+    const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    check(/const depOrder = \(\(\) => \{/.test(rsrc), "renderCompositeSources 未按依赖拓扑排序合成源");
+    check(/for \(const oid of depOrder\)/.test(rsrc), "合成源预渲染循环未使用 depOrder");
+    const refRe = /^_rt_imageLayerComposite_(\d+)_[a-z]$/;
+    let wallsWithViolation = 0;
+    let violations = 0;
+    const sample = [];
+    for (const w of wallpapers) {
+      const objs = w.scene.objects || [];
+      const order = [];
+      const deps = new Map();
+      for (const o of objs) {
+        if (o.id === undefined) continue;
+        const refs = new Set();
+        const scan = (v) => {
+          if (typeof v === "string") {
+            const m = refRe.exec(v);
+            if (m) refs.add(Number(m[1]));
+          } else if (Array.isArray(v)) v.forEach(scan);
+        };
+        for (const e of o.effects || []) {
+          if (!e.visible) continue;
+          for (const p of e.passes || []) for (const t of p.textures || []) scan(t);
+          for (const mp of e.materialPasses || []) {
+            for (const b of mp.binds || []) scan(b && b.name);
+            for (const t of mp.textures || []) scan(t);
+          }
+        }
+        // 与渲染器同源：被引用者按「引用它的那一层」的 z 序插入
+        for (const r of refs) {
+          if (r === o.id) continue;
+          if (!order.includes(r)) order.push(r);
+        }
+        if (!deps.has(o.id)) deps.set(o.id, new Set([...refs].filter((r) => r !== o.id)));
+      }
+      const pos = new Map(order.map((id, i) => [id, i]));
+      let local = 0;
+      for (const id of order) {
+        for (const d of deps.get(id) || []) {
+          if (!pos.has(d)) continue;
+          if (pos.get(id) < pos.get(d)) {
+            local++;
+            if (!sample.some((s) => s.id === w.id)) sample.push({ id: w.id, ref: id, dep: d });
+          }
+        }
+      }
+      if (local) {
+        wallsWithViolation++;
+        violations += local;
+      }
+    }
+    check(
+      violations > 0,
+      `语料里应存在「引用方排在前面」的合成源（否则这条判据没有意义），实得 ${violations}`,
+    );
+    const hit = sample.find((s) => s.id === "2464842912");
+    check(
+      !!hit && hit.ref === 107 && hit.dep === 94,
+      `2464842912 应是 107 引用 94 且 107 排在前面，实得 ${JSON.stringify(hit)}`,
+    );
+    console.log(
+      `   O. 合成源依赖序：${wallsWithViolation} 张壁纸存在「引用方在前」（共 ${violations} 处），` +
+        `如 ${sample.slice(0, 2).map((s) => `${s.id}#${s.ref}<-${s.dep}`).join("、")}`,
+    );
   }
 }
 
