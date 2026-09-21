@@ -9,10 +9,10 @@ import type { WallpaperConfig } from "./types";
 import { normalizeQuality, particleQualityScale, postFboCapFactor, type ResolvedQuality } from "./quality";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
-import { installLocalAssets, ensureLocalAsset } from "./local-assets";
+import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -3064,11 +3064,17 @@ cfg, source, pkgAbort.signal);
           }
           try {
             const fe = pkg.getEntry(parsedPkg, fp);
-            if (!fe) continue;
+            // pkg 没内嵌时找本机 WE 原版素材树（local-assets/fonts/**，见
+            // local-assets.ts 的消费面说明）：引用官方字体（NotoSans 等）的文字层
+            // 不再回落系统黑体；没装素材 fetchLocalAssetFile 返回 null → 照旧兜底。
+            const raw = fe
+              ? fe instanceof Uint8Array
+                ? fe
+                : new Uint8Array(fe as ArrayBuffer)
+              : await fetchLocalAssetFile(fp);
+            if (!raw) continue;
             // Chrome OTS 拒载 cmap rangeShift 写错的 Tourner 等；先修再喂 FontFace。
-            const bytes = sanitizeFontForBrowser(
-              fe instanceof Uint8Array ? fe : new Uint8Array(fe as ArrayBuffer),
-            );
+            const bytes = sanitizeFontForBrowser(raw);
             // family 带 key 哈希：不同壁纸同文件名字体不共族，释放时按 family 删不误伤
             const fam = "wefont_" + fontKeyHash(key) + "_" + fp.split("/").pop()!.replace(/[^a-zA-Z0-9]/g, "_");
             const url = URL.createObjectURL(new Blob([bytes as BlobPart]));

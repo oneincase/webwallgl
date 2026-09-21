@@ -69,19 +69,26 @@ export function libraryDir(): string {
 }
 
 /**
- * 本机引擎内置素材目录（贴图 / 法线）。
+ * 本机引擎内置素材目录（贴图 / 法线 / 渐变 / LUT …）。
  *
- * 这些是 Wallpaper Engine 安装目录自带的公共素材（`assets/materials/**`），
+ * 这些是 Wallpaper Engine 安装目录自带的公共素材（官方 `assets/` 树），
  * **受版权保护、永不入库**：仓库只留程序化复刻（system-textures.js /
- * particle-textures.js），谁本机想按原版观感测试就自己拷一份到
- * `local-assets/mirage/materials/**`（.gitignore 已忽略整个 `local-assets/`），
+ * particle-textures.js / gradient-textures.js），谁本机想按原版观感测试，
+ * 就把官方 assets 树拷到本仓库 `local-assets/`（顶层平铺 `local-assets/materials/**`，
+ * .gitignore 已忽略整个 `local-assets/`），或旧布局 `local-assets/mirage/materials/**`，
  * 或用 `WE_LOCAL_ASSETS=/abs/path` 指向别处（例如 Mirage 的 assets 目录）。
- * 目录不存在 = 端点返回 `{ok:false}`，渲染器整条路径跳过，行为与今天一致。
+ *
+ * 探测要求 `<dir>/materials` 存在：渲染端只按名字消费贴图（`util/*` 急切 +
+ * `particle/**` / `gradient/*` 等按需，见 renderer/src/local-assets.ts），
+ * 只拷了 `effects/`、`fonts/` 等非贴图目录不算数。一个源都不满足 = 端点返回
+ * `{ok:false}`，渲染器整条路径跳过、照旧走程序化复刻，行为与无素材完全一致。
+ * 优先级（渲染端取探测通过的第一个）：env 显式指定 > 顶层平铺 > mirage 旧布局。
  */
 export function localAssetProviders(): Array<{ id: string; dir: string }> {
   const out: Array<{ id: string; dir: string }> = [];
   const env = process.env.WE_LOCAL_ASSETS;
   if (env) out.push({ id: "env", dir: resolve(env) });
+  out.push({ id: "local", dir: join(resolve("."), "local-assets") });
   out.push({ id: "mirage", dir: join(resolve("."), "local-assets", "mirage") });
   return out;
 }

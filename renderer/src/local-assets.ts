@@ -1,18 +1,35 @@
 /**
- * 本机引擎内置素材（WE 安装目录的 `materials/**`：贴图 + 法线）接入。
+ * 本机引擎内置素材（WE 安装目录 `assets/` 树）接入。
  *
  * ## 为什么存在
  * 工坊壁纸的效果链 / 材质 / 粒子系统会按名字引用 WE 安装目录自带的公共贴图
  * （`util/white`、`util/flatnormal`、`particle/halo`、`particle/drop_normal` …），
  * 这些**不在壁纸 pkg 里**。仓库里没有官方字节（受版权保护，见 docs/COMPLIANCE.md），
- * 只用 system-textures.js / particle-textures.js 的程序化复刻顶上 —— 观感近似但
- * 逐像素对不上（法线参考、噪声颗粒、粒子精灵形状差异最明显）。
+ * 只用 system-textures.js / particle-textures.js / gradient-textures.js 的程序化
+ * 复刻顶上 —— 观感近似但逐像素对不上（法线参考、噪声颗粒、粒子精灵形状差异最明显）。
  *
- * 本模块是**本地测试用的可选通路**：谁本机有原版素材（拷到 `local-assets/mirage/`，
- * 或 `WE_LOCAL_ASSETS=/abs/path`），dev server 的 `/api/local-assets` 把它们喂过来，
- * 这里解码成 `{width,height,rgba}` 并经宿主 provider 注入引擎 → 渲染与官方对齐。
- * 没有素材时 `/api/local-assets` 返回 `{ok:false}`，本模块返回 null、引擎走程序化
- * 复刻，**行为与今天完全一致**。
+ * 本模块是**本地测试用的可选通路**：谁本机有原版素材（拷到 `local-assets/`，
+ * 顶层平铺 = 官方 assets 树；旧布局 `local-assets/mirage/` 也认；或
+ * `WE_LOCAL_ASSETS=/abs/path` 指向别处），dev server 的 `/api/local-assets`
+ * 把它们喂过来，这里解码成 `{width,height,rgba}` 并经宿主 provider 注入引擎
+ * → 渲染与官方对齐。没有素材时 `/api/local-assets` 返回 `{ok:false}`，本模块
+ * 返回 null、引擎走程序化复刻，**行为与无素材时完全一致**。
+ *
+ * ## 消费面（官方 assets 树逐目录的取舍）
+ *   - `materials/**`（.tex 贴图）：**唯一按名进运行时的目录** ——
+ *     `util/*` 急切（效果链槽位默认值）、`particle/**` 按需（精灵图集很大）、
+ *     `gradient/*` / `lut/*` / `pattern/*` / `cookie/*` 按需（loadTexInner 的
+ *     pkg-miss 路径先问 ensureLocalAsset，命中官方像素；miss 则程序化复刻兜底）；
+ *   - `fonts/**`：仅当壁纸文字层引用的字体 pkg 里没内嵌时作后备
+ *     （fetchLocalAssetFile，scene-mount 字体装配调用），官方树里是
+ *     NotoSans / RobotoMono / TwemojiMozilla 等可再分发字体；
+ *   - `shaders/` 与 `materials/` 下的材质 JSON、`effects/`：**不进运行时** ——
+ *     官方 shader 头带 saturate/lerp 定义，会被 hlsl2glsl 按名改写出语法错误
+ *     （headers.ts 的重建子集就是为绕开这个），官方材质 / 效果 JSON 又与渲染器的
+ *     原生效果实现（waterripple / pulse / blend …）语义重叠，混喂只会打架；
+ *     这些目录留作「效果链重实现的对照参考」；
+ *   - `presets/`、`scenes/`、`models/editor`、`scripts/`：编辑器侧资源，
+ *     播放路径不引用。
  *
  * ## 装载策略（内存是有代价的：一张 512² RGBA 就是 1MB，全量 164 张粒子图解码后 ~180MB）
  *   - `util/**`（9 张，含 flatnormal 法线参考）：挂载时**急切**装载 —— 它们是
@@ -264,6 +281,32 @@ export async function ensureLocalAsset(name: string): Promise<boolean> {
     (globalThis as Record<string, unknown>).__localAssets = st;
   }
   return true;
+}
+
+/** 原始文件字节缓存（fonts 等非贴图后备），按素材根相对路径存。 */
+const files = new Map<string, Uint8Array>();
+
+/**
+ * 取素材树里的原始文件字节（非贴图路径：scene-mount 的字体装配拉 `fonts/*.ttf`）。
+ * 素材没装 / 路径不存在 → null，调用方继续走自己的兜底（系统字体）。
+ */
+export async function fetchLocalAssetFile(rel: string): Promise<Uint8Array | null> {
+  if (!source || !rel || rel.includes("..")) return null;
+  const hit = files.get(rel);
+  if (hit) return hit;
+  try {
+    const url = `${BASE}/${encodeURIComponent(source.id)}/${rel
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+    const res = await fetch(url, { cache: "force-cache" });
+    if (!res.ok) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    files.set(rel, buf);
+    return buf;
+  } catch {
+    return null;
+  }
 }
 
 /** 调试 / 测试用：已装载的引擎素材名单 */
