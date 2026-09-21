@@ -40,7 +40,7 @@ export const DOC: DocSection[] = [
       {
         k: "ul",
         items: [
-          { zh: "零运行时依赖，单文件引入（min ESM 约 270KB / gzip 约 90KB）", en: "Zero runtime dependencies, single-file delivery (min ESM ~270KB / gzip ~90KB)" },
+          { zh: "零运行时依赖，单文件引入（min ESM 约 930KB / gzip 约 295KB）", en: "Zero runtime dependencies, single-file delivery (min ESM ~930KB / gzip ~295KB)" },
           { zh: "可 npm 安装，也可 <script> CDN 引入；一页可开多个互不干扰的实例", en: "Installable via npm or a <script> CDN tag; multiple isolated instances per page" },
           { zh: "本测试台本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API", en: "This bench is the library's first consumer — everything you see here is public API" },
         ],
@@ -210,7 +210,7 @@ export const DOC: DocSection[] = [
         rows: [
           [{ zh: "source（必填）", en: "source (required)" }, { zh: "—", en: "—" }, { zh: "见上节 Source", en: "See Source above" }],
           [{ zh: "fit", en: "fit" }, { zh: "\"cover\"", en: "\"cover\"" }, { zh: "cover 等比裁切铺满 / contain 等比留边 / stretch 拉伸", en: "cover crops to fill / contain letterboxes / stretch distorts" }],
-          [{ zh: "renderDpr", en: "renderDpr" }, { zh: "0（自动）", en: "0 (auto)" }, { zh: "渲染 DPR：0=跟随设备 devicePixelRatio（Retina/HiDPI 原生清晰）；正数=目标 DPR，可高于设备上报值（宿主 WKWebView 误报 1 时仍能超采样到物理分辨率）。物理最长边封顶 4096，调低省显存", en: "Render DPR: 0 = follow devicePixelRatio (native-sharp on Retina/HiDPI); a positive number = target DPR and may exceed the reported device value (supersamples to physical resolution even when a host WKWebView misreports 1). Physical long edge capped at 4096; lower it to save VRAM" }],
+          [{ zh: "renderDpr", en: "renderDpr" }, { zh: "0（自动）", en: "0 (auto)" }, { zh: "渲染 DPR：0=跟随设备 devicePixelRatio（Retina/HiDPI 原生清晰）；正数=目标 DPR，可高于设备上报值（宿主 WKWebView 误报 1 时仍能超采样到物理分辨率）。物理最长边封顶 4096，调低省显存。该档位同时决定贴图资源倍率（档位越低，贴图按图层足迹选得越小，见下节「显存与清晰度」）", en: "Render DPR: 0 = follow devicePixelRatio (native-sharp on Retina/HiDPI); a positive number = target DPR and may exceed the reported device value (supersamples to physical resolution even when a host WKWebView misreports 1). Physical long edge capped at 4096; lower it to save VRAM. The tier also drives the texture resource scale — at lower tiers textures resolve to smaller sizes per layer footprint (see \"VRAM & clarity\" below)" }],
           [{ zh: "fps", en: "fps" }, { zh: "60", en: "60" }, { zh: "帧率上限；被上限跳过的帧不计入 stats.fps，掉帧一眼可见", en: "FPS cap; skipped frames don't count into stats.fps, so drops are visible" }],
           [{ zh: "volume", en: "volume" }, { zh: "0", en: "0" }, { zh: "0..1。默认静音起步（浏览器自动播放策略）；就绪后再设非零音量", en: "0..1. Starts muted (autoplay policy); set a non-zero volume after ready" }],
           [{ zh: "autoplay", en: "autoplay" }, { zh: "true", en: "true" }, { zh: "false 时挂载后保持暂停", en: "When false, stays paused after mount" }],
@@ -219,6 +219,23 @@ export const DOC: DocSection[] = [
           [{ zh: "features", en: "features" }, { zh: "全开", en: "all on" }, { zh: "调试开关：models / text / particles / effects / components", en: "Debug switches: models / text / particles / effects / components" }],
           [{ zh: "quality", en: "quality" }, { zh: "全默认", en: "all defaults" }, { zh: "渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: \"off\"（默认）/\"fxaa\"/\"msaa2\"/\"msaa4\"、particles: \"high\"（默认）/\"medium\"/\"low\"/\"off\"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: \"high\"（默认）/\"medium\"/\"low\"/\"off\"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr", en: "Render quality tiers (like the WE client's performance options): antiAliasing \"off\" (default)/\"fxaa\"/\"msaa2\"/\"msaa4\", particles \"high\" (default)/\"medium\"/\"low\"/\"off\" (low/medium scale both the count cap and emission rate), postProcessing \"high\" (default)/\"medium\"/\"low\"/\"off\" (low/medium cap effect-chain FBO resolution; off bypasses effect chains, fullscreen post layers and Bloom). Supersampling lives in renderDpr" }],
           [{ zh: "onReady / onError / onDiagnostic", en: "onReady / onError / onDiagnostic" }, { zh: "—", en: "—" }, { zh: "回调面；也可之后用 instance.on() 订阅", en: "Callback surface; can also subscribe later via instance.on()" }],
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "显存与清晰度：显存的大头是纹理与画布/效果链缓冲，两者都随挂载选项自动伸缩，不需要手动管理——",
+          en: "VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and both scale automatically with the mount options — no manual management required:",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "贴图按「清晰度 × 图层在屏幕上的实际足迹」自动选分辨率：只要贴图分辨率 ≥ 图层的设备像素足迹，画面与全分辨率素材逐像素一致——省掉的只是过采样。有 mip 链的图直接截链（零重采样），单级大图才重采样", en: "Textures auto-pick their resolution from \"clarity × the layer's on-screen footprint\": as long as texture resolution ≥ the layer's device-pixel footprint, output is pixel-identical to full-resolution assets — only oversampling is removed. Mip-chained textures just truncate the chain (zero resampling); single-image giants get resampled" },
+          { zh: "压缩纹理（DXT1/3/5、BC7、ETC2）按文件自带的 mip 链直传给 GPU，不解成 RGBA；单通道 R8 走 GL_R8 直传。浏览器不支持对应扩展时自动回退解码路径，观感不变", en: "Compressed textures (DXT1/3/5, BC7, ETC2) upload their embedded mip chains straight to the GPU instead of decoding to RGBA; single-channel R8 uploads as GL_R8. Unsupported browsers fall back to the decode path with identical visuals" },
+          { zh: "上传完成后立即释放 CPU 侧解码副本（多帧动画 .tex 除外），最坏单墙可省数百 MB", en: "CPU-side decoded copies are freed right after upload (except multi-frame animated .tex) — up to hundreds of MB on the worst wallpapers" },
+          { zh: "白名单不缩：LUT 数据栅格、多帧动画、视频纹理保持原样；法线/蒙版可降但有独立下限。挂载后 window.__memStats() 给出 pkg/解码/上传的分项台账", en: "Whitelisted assets never shrink: LUT data grids, multi-frame animations and video textures stay native; normal/mask maps have their own floor. window.__memStats() after mount reports per-bucket usage (package/decoded/uploaded)" },
+          { zh: "低内存设备的推荐组合：清晰度 0.8 + 质量 low（粒子/后处理 low、抗锯齿关）。4K 屏上画布与效果链 FBO 才是大头（随 DPR 平方增长，MSAA4 再 ×4），纹理反而是其次", en: "Recommended combo for low-memory devices: clarity 0.8 + quality low (particles/post low, anti-aliasing off). On 4K screens the canvas and effect-chain FBOs dominate — they grow with DPR squared and MSAA4 multiplies by 4 — textures come second" },
         ],
       },
     ],
@@ -359,7 +376,7 @@ export const DOC: DocSection[] = [
       {
         k: "ul",
         items: [
-          { zh: "五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足", en: "The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you" },
+          { zh: "五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足；要手工构造时用导出的 mediaColor(r, g, b)，它接受 0..1 分量、{x,y,z} 或数组，返回带完整链式方法的对象", en: "The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you; to build one by hand use the exported mediaColor(r, g, b), which accepts 0..1 components, {x,y,z} or arrays and returns an object with the full chain API" },
           { zh: "控制方法全是可选的：只提供元数据、不支持控制时，壁纸里的按钮点了静默无效，不会报错", en: "All transport methods are optional: if you only provide metadata, wallpaper buttons are silently inert rather than throwing" },
           { zh: "setMedia 换场景不清空，装一次对之后所有场景生效", en: "setMedia survives scene changes: install once and it applies to every scene loaded afterwards" },
           { zh: "视频壁纸的音频频谱会自动从 <video> 取（音条能跟着视频里的音乐动），宿主已用 setAudio 显式注入时则不接管", en: "For video wallpapers the audio spectrum is captured from the <video> automatically (visualizers react to the video's own audio); an explicit setAudio() injection takes precedence" },

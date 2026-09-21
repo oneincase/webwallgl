@@ -9,7 +9,7 @@ WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、
 - [GitHub 开源仓库](https://github.com/oneincase/webwallgl)
 - [在线版（GitHub Pages）](https://oneincase.github.io/webwallgl/)
 
-- 零运行时依赖，单文件引入（min ESM 约 270KB / gzip 约 90KB）
+- 零运行时依赖，单文件引入（min ESM 约 930KB / gzip 约 295KB）
 - 可 npm 安装，也可 &lt;script> CDN 引入；一页可开多个互不干扰的实例
 - 本测试台本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API
 
@@ -122,7 +122,7 @@ input.addEventListener("change", () => {
 | --- | --- | --- |
 | `source（必填）` | `—` | 见上节 Source |
 | `fit` | `"cover"` | cover 等比裁切铺满 / contain 等比留边 / stretch 拉伸 |
-| `renderDpr` | `0（自动）` | 渲染 DPR：0=跟随设备 devicePixelRatio（Retina/HiDPI 原生清晰）；正数=目标 DPR，可高于设备上报值（宿主 WKWebView 误报 1 时仍能超采样到物理分辨率）。物理最长边封顶 4096，调低省显存 |
+| `renderDpr` | `0（自动）` | 渲染 DPR：0=跟随设备 devicePixelRatio（Retina/HiDPI 原生清晰）；正数=目标 DPR，可高于设备上报值（宿主 WKWebView 误报 1 时仍能超采样到物理分辨率）。物理最长边封顶 4096，调低省显存。该档位同时决定贴图资源倍率（档位越低，贴图按图层足迹选得越小，见下节「显存与清晰度」） |
 | `fps` | `60` | 帧率上限；被上限跳过的帧不计入 stats.fps，掉帧一眼可见 |
 | `volume` | `0` | 0..1。默认静音起步（浏览器自动播放策略）；就绪后再设非零音量 |
 | `autoplay` | `true` | false 时挂载后保持暂停 |
@@ -131,6 +131,14 @@ input.addEventListener("change", () => {
 | `features` | `全开` | 调试开关：models / text / particles / effects / components |
 | `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
+
+显存与清晰度：显存的大头是纹理与画布/效果链缓冲，两者都随挂载选项自动伸缩，不需要手动管理——
+
+- 贴图按「清晰度 × 图层在屏幕上的实际足迹」自动选分辨率：只要贴图分辨率 ≥ 图层的设备像素足迹，画面与全分辨率素材逐像素一致——省掉的只是过采样。有 mip 链的图直接截链（零重采样），单级大图才重采样
+- 压缩纹理（DXT1/3/5、BC7、ETC2）按文件自带的 mip 链直传给 GPU，不解成 RGBA；单通道 R8 走 GL_R8 直传。浏览器不支持对应扩展时自动回退解码路径，观感不变
+- 上传完成后立即释放 CPU 侧解码副本（多帧动画 .tex 除外），最坏单墙可省数百 MB
+- 白名单不缩：LUT 数据栅格、多帧动画、视频纹理保持原样；法线/蒙版可降但有独立下限。挂载后 window.__memStats() 给出 pkg/解码/上传的分项台账
+- 低内存设备的推荐组合：清晰度 0.8 + 质量 low（粒子/后处理 low、抗锯齿关）。4K 屏上画布与效果链 FBO 才是大头（随 DPR 平方增长，MSAA4 再 ×4），纹理反而是其次
 
 ## 实例 API SceneInstance
 
@@ -245,7 +253,7 @@ console.log(wp.media.snapshot.title);
 wp.media.playPause();
 ```
 
-- 五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足
+- 五个配色字段必须是可链式调用的颜色对象（脚本会写 c.subtract(o).multiply(t).add(o)，给普通数组会 TypeError 熔断整个脚本）——用 createMediaSource 构造即自动满足；要手工构造时用导出的 mediaColor(r, g, b)，它接受 0..1 分量、{x,y,z} 或数组，返回带完整链式方法的对象
 - 控制方法全是可选的：只提供元数据、不支持控制时，壁纸里的按钮点了静默无效，不会报错
 - setMedia 换场景不清空，装一次对之后所有场景生效
 - 视频壁纸的音频频谱会自动从 &lt;video> 取（音条能跟着视频里的音乐动），宿主已用 setAudio 显式注入时则不接管

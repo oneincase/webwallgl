@@ -9,7 +9,7 @@ WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, 
 - [GitHub repository](https://github.com/oneincase/webwallgl)
 - [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)
 
-- Zero runtime dependencies, single-file delivery (min ESM ~270KB / gzip ~90KB)
+- Zero runtime dependencies, single-file delivery (min ESM ~930KB / gzip ~295KB)
 - Installable via npm or a &lt;script> CDN tag; multiple isolated instances per page
 - This bench is the library's first consumer — everything you see here is public API
 
@@ -123,7 +123,7 @@ input.addEventListener("change", () => {
 | --- | --- | --- |
 | `source (required)` | `—` | See Source above |
 | `fit` | `"cover"` | cover crops to fill / contain letterboxes / stretch distorts |
-| `renderDpr` | `0 (auto)` | Render DPR: 0 = follow devicePixelRatio (native-sharp on Retina/HiDPI); a positive number = target DPR and may exceed the reported device value (supersamples to physical resolution even when a host WKWebView misreports 1). Physical long edge capped at 4096; lower it to save VRAM |
+| `renderDpr` | `0 (auto)` | Render DPR: 0 = follow devicePixelRatio (native-sharp on Retina/HiDPI); a positive number = target DPR and may exceed the reported device value (supersamples to physical resolution even when a host WKWebView misreports 1). Physical long edge capped at 4096; lower it to save VRAM. The tier also drives the texture resource scale — at lower tiers textures resolve to smaller sizes per layer footprint (see "VRAM & clarity" below) |
 | `fps` | `60` | FPS cap; skipped frames don't count into stats.fps, so drops are visible |
 | `volume` | `0` | 0..1. Starts muted (autoplay policy); set a non-zero volume after ready |
 | `autoplay` | `true` | When false, stays paused after mount |
@@ -132,6 +132,14 @@ input.addEventListener("change", () => {
 | `features` | `all on` | Debug switches: models / text / particles / effects / components |
 | `quality` | `all defaults` | Render quality tiers (like the WE client's performance options): antiAliasing "off" (default)/"fxaa"/"msaa2"/"msaa4", particles "high" (default)/"medium"/"low"/"off" (low/medium scale both the count cap and emission rate), postProcessing "high" (default)/"medium"/"low"/"off" (low/medium cap effect-chain FBO resolution; off bypasses effect chains, fullscreen post layers and Bloom). Supersampling lives in renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | Callback surface; can also subscribe later via instance.on() |
+
+VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and both scale automatically with the mount options — no manual management required:
+
+- Textures auto-pick their resolution from "clarity × the layer's on-screen footprint": as long as texture resolution ≥ the layer's device-pixel footprint, output is pixel-identical to full-resolution assets — only oversampling is removed. Mip-chained textures just truncate the chain (zero resampling); single-image giants get resampled
+- Compressed textures (DXT1/3/5, BC7, ETC2) upload their embedded mip chains straight to the GPU instead of decoding to RGBA; single-channel R8 uploads as GL_R8. Unsupported browsers fall back to the decode path with identical visuals
+- CPU-side decoded copies are freed right after upload (except multi-frame animated .tex) — up to hundreds of MB on the worst wallpapers
+- Whitelisted assets never shrink: LUT data grids, multi-frame animations and video textures stay native; normal/mask maps have their own floor. window.__memStats() after mount reports per-bucket usage (package/decoded/uploaded)
+- Recommended combo for low-memory devices: clarity 0.8 + quality low (particles/post low, anti-aliasing off). On 4K screens the canvas and effect-chain FBOs dominate — they grow with DPR squared and MSAA4 multiplies by 4 — textures come second
 
 ## The SceneInstance API
 
@@ -246,7 +254,7 @@ console.log(wp.media.snapshot.title);
 wp.media.playPause();
 ```
 
-- The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you
+- The five palette fields must be chainable color objects (scripts write c.subtract(o).multiply(t).add(o); a plain array throws a TypeError that kills the whole script) — createMediaSource guarantees this for you; to build one by hand use the exported mediaColor(r, g, b), which accepts 0..1 components, {x,y,z} or arrays and returns an object with the full chain API
 - All transport methods are optional: if you only provide metadata, wallpaper buttons are silently inert rather than throwing
 - setMedia survives scene changes: install once and it applies to every scene loaded afterwards
 - For video wallpapers the audio spectrum is captured from the &lt;video> automatically (visualizers react to the video's own audio); an explicit setAudio() injection takes precedence
