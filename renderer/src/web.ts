@@ -567,16 +567,17 @@ function attachIframe(
       /* 跨源忽略 */
     }
     // load 后再 flush 一次（listener 在作者脚本里赋值；WE 挂载必调全量 applyUserProperties）
-    weShimCall(rt, (w) => {
-      const wire: Record<string, { value: unknown }> = {};
-      for (const [k, v] of Object.entries(rt.liveUserProps ?? {})) wire[k] = { value: v };
-      w.__weApplyProps?.(wire);
-      w.__weSetFps?.(rt.cfg.sceneFps ?? 60);
-      // 重放宿主的精确音量（重挂后 iframe 的 shim 是全新的，hostVolume 从 1
-      // 起步；种子脚本已尽量早，这里兜 load 晚于种子执行的窗口）
-      w.__weSetVolume?.(effectiveUserVolume(rt));
-      if (rt.paused) w.__weSetPaused?.(true);
-    });
+    // 走 weShimSend：严格沙箱（跨源）下 contentWindow 不可达，直接调用会静默失效
+    // —— 属性/帧率/音量全部送不到 shim，依赖用户属性的壁纸会退化成默认值（实测：
+    // Chroma Drencher 拿不到 color* 就画成全黑，用户看到「网页壁纸黑屏」）。
+    const wire: Record<string, { value: unknown }> = {};
+    for (const [k, v] of Object.entries(rt.liveUserProps ?? {})) wire[k] = { value: v };
+    weShimSend(rt, "applyProps", { props: wire });
+    weShimSend(rt, "setFps", { n: rt.cfg.sceneFps ?? 60 });
+    // 重放宿主的精确音量（重挂后 iframe 的 shim 是全新的，hostVolume 从 1
+    // 起步；种子脚本已尽量早，这里兜 load 晚于种子执行的窗口）
+    weShimSend(rt, "setVolume", { v: effectiveUserVolume(rt) });
+    if (rt.paused) weShimSend(rt, "setPaused", { v: true });
     // 首帧钩子：网页没有 GL 提交，load 即视为就绪
     try {
       rt.onFirstFrame?.();
@@ -1101,10 +1102,17 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
         "load",
         () => {
           let hasShim = false;
-          weShimCall(rt, (w) => {
-            hasShim = typeof w.__weSetPaused === "function";
-          });
-          if (!hasShim) {
+          let reachable = true;
+          try {
+            const w = f.contentWindow as any;
+            if (!w) reachable = false;
+            else hasShim = typeof w.__weSetPaused === "function";
+          } catch {
+            // 跨源 / 严格沙箱：读不到 contentWindow 属预期（控制经 postMessage
+            // 通道），不能当作「host 未注入 shim」报警 —— 否则正常配置被误报成故障。
+            reachable = false;
+          }
+          if (reachable && !hasShim) {
             reportDiag(
               rt,
               cfg,
