@@ -22,6 +22,58 @@ export function weShimCall(rt: Runtime, call: (win: any) => void) {
   }
 }
 
+/**
+ * 网页壁纸控制下发：同源直访优先（WallpaperEM 路径，行为零变化），跨源 /
+ * 严格沙箱下自动退回 postMessage。
+ *
+ * 为什么需要两条通道：常规宿主与壁纸 iframe 同源，直接读 `contentWindow.__weXxx`
+ * 调用最省；但把第三方 HTML 嵌进**共享宿主 origin** 的页面时（例如宿主插件把
+ * 工坊网页壁纸挂进主界面），iframe 的 sandbox 必须收紧到 `allow-scripts`
+ *（不能给 allow-same-origin，否则作者脚本能冒用宿主身份调用宿主 API）——
+ * 此时 `contentWindow` 不可达，控制改走 shim 内的 message 通道
+ *（`{__we:1, op, ...}`，见 web-shim.js 末尾；两种通道落到同一批实现上）。
+ */
+export function weShimSend(rt: Runtime, op: string, payload?: Record<string, unknown>) {
+  const f = rt.iframe as HTMLIFrameElement | null;
+  if (!f) return;
+  try {
+    const w = f.contentWindow as any;
+    // 同源且 shim 已就绪 → 直接调用（保持既有语义与零延迟）
+    if (w && typeof w.__weSetPaused === "function") {
+      switch (op) {
+        case "setPaused": w.__weSetPaused?.(!!payload?.v); return;
+        case "setVolume": w.__weSetVolume?.(Number(payload?.v) || 0); return;
+        case "setFps": w.__weSetFps?.(Number(payload?.n) || 0); return;
+        case "applyProps": w.__weApplyProps?.(payload?.props); return;
+        case "pointer":
+          w.__wePushPointer?.(
+            Number(payload?.x), Number(payload?.y),
+            Number(payload?.b) || 0, Number(payload?.m) || 0,
+          );
+          return;
+        case "pointerLeave": w.__wePointerLeave?.(); return;
+        case "wheel":
+          // x/y 故意不带 `|| 0`：NaN 表示"无位置"（shim 用最后已知点），
+          // 与指针桥的 `pt ? pt.x : NaN` 约定一致。
+          w.__wePushWheel?.(
+            Number(payload?.x), Number(payload?.y),
+            Number(payload?.dx) || 0, Number(payload?.dy) || 0,
+            Number(payload?.mode) || 0, Number(payload?.mods) || 0,
+          );
+          return;
+        default: return;
+      }
+    }
+  } catch {
+    /* 跨源：contentWindow 访问被拒 → 落到下面的 postMessage */
+  }
+  try {
+    f.contentWindow?.postMessage({ __we: 1, op, ...(payload ?? {}) }, "*");
+  } catch {
+    /* ignore */
+  }
+}
+
 /** 向网页壁纸 iframe 注入 GPU 降级（shim 已接管则跳过） */
 export function injectGpuThrottle(rt: Runtime, f: HTMLIFrameElement, _doc: Document) {
   const win = f.contentWindow;
@@ -418,12 +470,10 @@ function installWebPointerBridge(rt: Runtime, f: HTMLIFrameElement, container: H
       // 非有限值丢弃（与场景通道同一约定）：NaN 会让 elementFromPoint 返回 null，
       // 作者的位移积分一次性污染成 NaN 且没有任何报错。
       if (!pt) return;
-      weShimCall(rt, (w: any) =>
-        w.__wePushPointer?.(pt.x, pt.y, Number(p.buttons) || 0, Number(p.mods) || 0),
-      );
+      weShimSend(rt, "pointer", { x: pt.x, y: pt.y, b: Number(p.buttons) || 0, m: Number(p.mods) || 0 });
     },
     leave() {
-      weShimCall(rt, (w: any) => w.__wePointerLeave?.());
+      weShimSend(rt, "pointerLeave");
     },
     /**
      * 滚轮注入。位置可选：宿主拿到滚轮事件时未必同时拿到坐标（macOS 的
@@ -437,16 +487,14 @@ function installWebPointerBridge(rt: Runtime, f: HTMLIFrameElement, container: H
     wheel(ev) {
       if (!f.isConnected) return;
       const pt = ev.u !== undefined && ev.v !== undefined ? toClient(ev.u, ev.v) : null;
-      weShimCall(rt, (w: any) =>
-        w.__wePushWheel?.(
-          pt ? pt.x : NaN,
-          pt ? pt.y : NaN,
-          Number(ev.dx) || 0,
-          Number(ev.dy) || 0,
-          Number(ev.mode) || 0,
-          Number(ev.mods) || 0,
-        ),
-      );
+      weShimSend(rt, "wheel", {
+        x: pt ? pt.x : NaN,
+        y: pt ? pt.y : NaN,
+        dx: Number(ev.dx) || 0,
+        dy: Number(ev.dy) || 0,
+        mode: Number(ev.mode) || 0,
+        mods: Number(ev.mods) || 0,
+      });
     },
   };
   // 无需自挂 cleanup：clear() 统一清 rt.pointerCtl（与场景通道同一处）。
@@ -457,10 +505,23 @@ function attachIframe(
   cfg: WallpaperConfig,
   container: HTMLElement,
   src: string,
-  opts: { blobUrl?: string; injected: boolean; frameClock?: { last: number } },
+  opts: {
+    blobUrl?: string;
+    injected: boolean;
+    frameClock?: { last: number };
+    /** 严格沙箱：只给 allow-scripts（去掉 allow-same-origin）。宿主与壁纸共享
+     *  origin 时（插件把工坊 HTML 挂进主界面）必须开启 —— 否则第三方脚本可冒用
+     *  宿主身份；代价是 iframe 内 origin 变 opaque，作者脚本的 fetch/XHR 需要
+     *  宿主返回 CORS 头（img/script/css 不受影响），控制经 weShimSend 的
+     *  postMessage 通道下发。默认 false = WallpaperEM 既有行为。 */
+    strictSandbox?: boolean;
+  },
 ) {
   const f = document.createElement("iframe");
-  f.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  f.setAttribute(
+    "sandbox",
+    opts.strictSandbox ? "allow-scripts" : "allow-scripts allow-same-origin",
+  );
   f.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;border:none;background:transparent;";
   // 库形态画在非全屏容器时，容器需定位上下文
@@ -829,11 +890,11 @@ function installWebCtl(rt: Runtime) {
   rt.sceneCtl = {
     pause() {
       rt.paused = true;
-      weShimCall(rt, (w) => w.__weSetPaused?.(true));
+      weShimSend(rt, "setPaused", { v: true });
     },
     resume() {
       rt.paused = false;
-      weShimCall(rt, (w) => w.__weSetPaused?.(false));
+      weShimSend(rt, "setPaused", { v: false });
     },
     applyUserProperties(props) {
       const flat: Record<string, unknown> = { ...(rt.liveUserProps ?? {}) };
@@ -842,7 +903,7 @@ function installWebCtl(rt: Runtime) {
         flat[k] = val;
       }
       rt.liveUserProps = flat;
-      weShimCall(rt, (w) => w.__weApplyProps?.(props));
+      weShimSend(rt, "applyProps", { props });
     },
   };
 }
@@ -956,7 +1017,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
 
   const finishBare = (why: string) => {
     reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`);
-    attachIframe(rt, cfg, container, entry, { injected: false });
+    attachIframe(rt, cfg, container, entry, { injected: false, strictSandbox: cfg.webSandbox === "strict" });
     startAudioPump(rt, null);
     startMediaPump(rt, null);
     // 裸 iframe 下两个泵都不启、shim 的 we-frame 打点也没有，帧率计从此没有
@@ -1033,7 +1094,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
     rt.liveUserProps = Object.fromEntries(Object.entries(wire).map(([k, w]) => [k, w.value]));
 
     if (isSameOriginUrl(entry)) {
-      attachIframe(rt, cfg, container, entry, { injected: true, frameClock });
+      attachIframe(rt, cfg, container, entry, { injected: true, frameClock, strictSandbox: cfg.webSandbox === "strict" });
       startPumps();
       const f = rt.iframe;
       f?.addEventListener(
@@ -1075,7 +1136,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       });
       const blob = new Blob([rewritten], { type: "text/html;charset=utf-8" });
       const blobUrl = URL.createObjectURL(blob);
-      attachIframe(rt, cfg, container, blobUrl, { blobUrl, injected: true, frameClock });
+      attachIframe(rt, cfg, container, blobUrl, { blobUrl, injected: true, frameClock, strictSandbox: cfg.webSandbox === "strict" });
       startPumps();
     } catch (e) {
       finishBare(e instanceof Error ? e.message : String(e));

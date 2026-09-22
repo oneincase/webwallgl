@@ -29,7 +29,7 @@ import {
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
 import { normalizeQuality, qualityFromQuery, type QualityOptions, type ResolvedQuality } from "./quality";
-import { weShimCall } from "./web";
+import { weShimCall, weShimSend } from "./web";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 
 // ---- 滤镜（beta）----
@@ -249,7 +249,7 @@ window.__wp = {
   },
   pause() {
     rt.paused = true;
-    weShimCall(rt, (w: any) => w.__weSetPaused?.(true));
+    weShimSend(rt, "setPaused", { v: true });
     if (rt.sceneCtl) {
       rt.sceneCtl.pause();
       return;
@@ -266,7 +266,7 @@ window.__wp = {
     // 丢掉暂停前的打点：短暂停（<窗口长度）残留的旧时间戳会把恢复后的
     // 首个读数算得偏低，看起来像刚恢复就掉帧。
     resetFrameMeter(rt);
-    weShimCall(rt, (w: any) => w.__weSetPaused?.(false));
+    weShimSend(rt, "setPaused", { v: false });
     if (rt.cfg.type === "canvas") {
       startCanvasDemoLoop(rt);
       return;
@@ -318,7 +318,7 @@ window.__wp = {
     if (rt.sceneAudio) {
       rt.sceneAudio.setVolume(volume);
     }
-    weShimCall(rt, (w: any) => w.__weSetVolume?.(Math.max(0, Math.min(1, volume))));
+    weShimSend(rt, "setVolume", { v: Math.max(0, Math.min(1, volume)) });
   },
   // 释放壁纸渲染资源（画布/WebGL/视频/iframe），归还内存；保留 rt.cfg 供 restore() 重建
   release() {
@@ -336,7 +336,7 @@ window.__wp = {
   // 调整场景帧率：渲染循环每帧读取 rt.cfg.sceneFps，无需重挂载即可实时生效
   setSceneFps(fps: number) {
     rt.cfg.sceneFps = fps;
-    weShimCall(rt, (w: any) => w.__weSetFps?.(fps));
+    weShimSend(rt, "setFps", { n: fps });
   },
   // 性能设置热更（抗锯齿/粒子/后处理档位）：就地生效不重挂载；写回 cfg 让
   // setRenderDpr 这类重挂路径之后仍保持。只传要改的键（部分更新）。
@@ -359,7 +359,7 @@ window.__wp = {
       rt.sceneCtl.applyUserProperties(props);
       return;
     }
-    weShimCall(rt, (w: any) => w.__weApplyProps?.(props));
+    weShimSend(rt, "applyProps", { props });
   },
   // 外部指针注入。桌面壁纸窗口在 underlay 层（桌面图标之下）收不到任何鼠标事件 ——
   // Finder 的桌面窗口全屏盖在上面吃掉了它们，且 macOS 没有「向下透传」的窗口属性。
@@ -452,6 +452,9 @@ const initialCfg: WallpaperConfig = {
   mediaBase: params.get("mediaBase") ?? undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
   opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
+  // 严格沙箱（网页壁纸）：宿主与壁纸共享 origin 时置 "strict"，
+  // iframe 只给 allow-scripts（详见 types.ts 的 webSandbox 注释）。
+  webSandbox: params.get("webSandbox") === "strict" ? "strict" : undefined,
   clearColor: params.get("clearColor") ?? undefined,
   // 性能设置（aa/pq/pp）：测试台工具条与宿主的抗锯齿/粒子/后处理档位
   quality: qualityFromQuery((k) => params.get(k)),

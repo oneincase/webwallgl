@@ -1434,5 +1434,58 @@
   }
 
   installRafThrottle();
+
+  // ── 宿主控制通道（postMessage）──────────────────────────────────────────
+  // 常规宿主与本 iframe 同源，直接读 contentWindow.__weXxx 调用（上面那批全局）。
+  // 但宿主把工坊 HTML 嵌进**共享自身 origin** 的页面时必须收紧 sandbox（只给
+  // allow-scripts，防作者脚本冒用宿主身份）—— 那时父页跨源读不到本 window，
+  // 控制改经 postMessage 落到同一批实现上：op 名与 web.ts 的 weShimSend 一一对应，
+  // 语义与直访完全一致。载荷用 structured clone，NaN（滚轮"无位置"）原样保留。
+  try {
+    w.addEventListener("message", function (ev) {
+      var d = ev && ev.data;
+      if (!d || typeof d !== "object" || d.__we !== 1) return;
+      try {
+        switch (d.op) {
+          case "setPaused":
+            w.__weSetPaused(!!d.v);
+            break;
+          case "setVolume":
+            w.__weSetVolume(Number(d.v) || 0);
+            break;
+          case "setFps":
+            w.__weSetFps(Number(d.n) || 0);
+            break;
+          case "applyProps":
+            if (w.__weApplyProps) w.__weApplyProps(d.props);
+            break;
+          case "pointer":
+            if (w.__wePushPointer) {
+              w.__wePushPointer(Number(d.x), Number(d.y), Number(d.b) || 0, Number(d.m) || 0);
+            }
+            break;
+          case "pointerLeave":
+            if (w.__wePointerLeave) w.__wePointerLeave();
+            break;
+          case "wheel":
+            if (w.__wePushWheel) {
+              w.__wePushWheel(
+                Number(d.x),
+                Number(d.y),
+                Number(d.dx) || 0,
+                Number(d.dy) || 0,
+                Number(d.mode) || 0,
+                Number(d.mods) || 0,
+              );
+            }
+            break;
+        }
+      } catch (_) {
+        /* 作者脚本异常不该打断控制通道 */
+      }
+    });
+  } catch (_) {
+    /* 无 addEventListener 的环境忽略 */
+  }
 })(window);
 
