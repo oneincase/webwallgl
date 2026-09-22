@@ -113,6 +113,22 @@ async function importIsolatedFn(srcText, fnName) {
   const again = rw.rewriteHtml(out, shim, { baseHref: "https://cdn.example/wp/" });
   check(again === out, "已注入 HTML 应幂等（原样返回）");
 
+  // 宿主自带 shim（dsh-wallpaper-engine 的 /scene-files 注 `data-we-shim="host"`）：
+  // 判重必须按属性存在性，否则同一文档两套 shim → 两道 rAF 节流叠加（实测 15fps
+  // 上限变成 7.5fps）。同时 <base> 不能因此漏掉：跨源入口经 blob 挂载，相对路径
+  // 全靠它。
+  const hostInjected = rw.rewriteHtml(
+    `<!doctype html><html><head><script data-we-shim="host">/*host shim*/</script></head><body>x</body></html>`,
+    shim,
+    { baseHref: "https://cdn.example/wp/", seedScript: "__weSeedProps({color0:{value:'1 0 0'}})" },
+  );
+  check((hostInjected.match(/data-we-shim/g) || []).length === 1,
+    "宿主已注入 shim 时不得再注一遍（双 shim 会叠加 rAF 节流）");
+  check(/<base href="https:\/\/cdn\.example\/wp\/">/i.test(hostInjected),
+    "宿主已注入时仍要补 <base>（blob 挂载靠它解析相对路径）");
+  check(hostInjected.indexOf("__weSeedProps") === -1,
+    "宿主已注入时不再注入 seed（宿主的种子随文档到达）");
+
   const withBase = rw.rewriteHtml(
     `<html><head><base href="/old/"><script>a()</script></head></html>`,
     shim,

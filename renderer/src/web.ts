@@ -616,6 +616,7 @@ function attachIframe(
     const t = typeof data.t === "number" ? data.t : performance.now();
     if (opts.frameClock) opts.frameClock.last = t;
     markFrame(rt, t);
+    markWebFrame(rt, t);
   };
   window.addEventListener("message", onFrameMsg);
   const prevCleanup = rt.sceneCleanup;
@@ -971,6 +972,25 @@ function installWebCtl(rt: Runtime) {
       weShimSend(rt, "applyProps", { props });
     },
   };
+}
+
+/**
+ * 壁纸**自身**的出帧率：只吃 shim 上报的 `we-frame`。
+ *
+ * 渲染页自己那圈 beat rAF 也会 markFrame（那是「渲染页还活着」的心跳信号），两者
+ * 混在一起时读数永远等于显示刷新率，判断不了壁纸有没有掉帧 —— 排查「限了 30 还是
+ * 卡」正需要这个数，所以另立一个 1s 滑窗（跨源/沙箱下渲染页读不到壁纸内部，这是
+ * 唯一能反映壁纸真实帧率的信号）。`getState().webFps` 暴露给宿主。
+ */
+function markWebFrame(rt: Runtime, now: number) {
+  const holder = rt as unknown as { webFrameMeter?: { stamps: number[]; fps: number } };
+  const m = (holder.webFrameMeter ??= { stamps: [], fps: 0 });
+  const s = m.stamps;
+  s.push(now);
+  const cut = now - 1000;
+  while (s.length && s[0] < cut) s.shift();
+  const span = s.length >= 2 ? s[s.length - 1] - s[0] : 0;
+  m.fps = span > 0 ? ((s.length - 1) * 1000) / span : 0;
 }
 
 function isSameOriginUrl(url: string): boolean {

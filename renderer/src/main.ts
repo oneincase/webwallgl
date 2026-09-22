@@ -456,11 +456,15 @@ window.__wp = {
   },
   getState() {
     const st = (rt as unknown as { webState?: { loaded: boolean; error: string | null } }).webState;
+    const wm = (rt as unknown as { webFrameMeter?: { fps: number } }).webFrameMeter;
     return {
       type: rt.cfg?.type ?? null,
       iframeLoaded: st ? st.loaded : null,
       webError: st ? st.error : null,
       paused: rt.paused === true,
+      // 壁纸自身出帧率（只统计 shim 上报的 we-frame）：钳到整数便于宿主直接上报，
+      // 0 表示壁纸不靠 rAF 驱动（纯 CSS 动画 / 视频）或当前没在出帧。
+      webFps: wm ? Math.round(wm.fps) : null,
     };
   },
 };

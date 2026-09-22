@@ -20,6 +20,12 @@
  */
 (function (w) {
   "use strict";
+  // 幂等：同一文档只装一套。宿主（如 dsh-wallpaper-engine 的 /scene-files）会把 shim
+  // 直接注进 HTML，渲染页跨源改写时若判重失手再注一次，就会有两套 rAF 节流 / 指针桥 /
+  // 音频泵叠加 —— 实测帧率上限被限两次（15fps → 7.5fps），观感「卡得不行」。
+  // 宿主侧判重 + 这里守卫 = 双保险。
+  if (w.__weShimInstalled) return;
+  w.__weShimInstalled = true;
   try {
     if (w.document && w.document.documentElement) {
       w.document.documentElement.setAttribute("data-we-shim", "1");
@@ -1396,23 +1402,41 @@
         rafMap[idNative] = { kind: "native", id: idNative };
         return idNative;
       }
+      // 跳帧节流：每帧都挂原生 rAF（与显示器 vsync 同相位），只把第 n 帧交给作者
+      // 回调。旧实现是 `setTimeout(1000/fps)` 之后再 rAF —— 定时器回调落在刷新的
+      // 任意相位上，30fps 上限会产出 17/33/50ms 的抖动间隔，观感就是「限了 30 反而
+      // 更卡」。n 按实测的原生 rAF 间隔自适应（60Hz→2，120Hz→4，90Hz→3）。
       var id = ++rafCounter;
-      var to = w.setTimeout(function () {
+      var slot = 0;
+      var lastNow = 0;
+      var nativeMs = 0;
+      var step = function (now) {
+        if (lastNow > 0) {
+          var dt = now - lastNow;
+          if (dt > 1 && dt < 40) nativeMs = nativeMs > 0 ? nativeMs * 0.8 + dt * 0.2 : dt;
+        }
+        lastNow = now;
+        slot++;
+        // 目标间隔 / 实测间隔向上取整 = 落在 fps 上限**以下**的均匀帧；留 0.05 容差，
+        // 否则 16.4ms 这类测量噪声会把 30fps 算成 20fps。
+        var n = nativeMs > 0 ? Math.max(1, Math.ceil(1000 / fps / nativeMs - 0.05)) : 2;
+        if (slot % n !== 0) {
+          rafMap[id] = { kind: "native", id: origRaf(step) };
+          return;
+        }
         delete rafMap[id];
-        origRaf(function (now) {
-          try {
-            cb(now);
-          } catch (_) {
-            /* 忽略 */
-          }
-          try {
-            w.parent.postMessage({ op: "we-frame", t: now }, "*");
-          } catch (_) {
-            /* 忽略 */
-          }
-        });
-      }, limit);
-      rafMap[id] = { kind: "timeout", to: to };
+        try {
+          cb(now);
+        } catch (_) {
+          /* 忽略 */
+        }
+        try {
+          w.parent.postMessage({ op: "we-frame", t: now }, "*");
+        } catch (_) {
+          /* 忽略 */
+        }
+      };
+      rafMap[id] = { kind: "native", id: origRaf(step) };
       return id;
     };
     throttled.__weThrottled = true;

@@ -3,7 +3,13 @@
  * 纯字符串操作，Node 可测（verify-web）。
  */
 
-const SHIM_MARK = 'data-we-shim="1"';
+/**
+ * shim 已在 HTML 里的判据：按属性**存在性**判断，不看值。
+ * 早期这里写死 `data-we-shim="1"`（本文件自己的注入值），宿主自己注入时用的是
+ * `data-we-shim="host"` —— 匹配不上就会再注一遍，同一文档两套 shim，rAF 节流、
+ * 指针桥、音频泵全部叠加（实测 15fps 上限被限两次 → 7.5fps，用户观感「卡得不行」）。
+ */
+const SHIM_MARK_RE = /\bdata-we-shim(?:-src)?\b/i;
 const SHIM_ATTR = "data-we-shim-src";
 
 /** 从入口 URL 推出目录（含末尾 /），供 <base href> */
@@ -51,7 +57,11 @@ function escapeScriptClose(js: string): string {
 
 /**
  * 把 shim 源码与可选 <base> / 种子脚本插入 HTML。
- * 已注入（含 data-we-shim）则原样返回。
+ *
+ * **已经注入过 shim 时不重复注入**（宿主可能自带 shim，见 SHIM_MARK_RE），
+ * 但 **`<base>` 仍然照补**：跨源入口是经 blob URL 挂载的，blob 没有目录概念，
+ * 相对路径全靠这个 <base> 解析（早期版本在这里"原样返回"，一旦宿主自己注入过，
+ * 相对子资源就会全部 404）。
  *
  * `seedScript`：紧跟 shim 的 classic script 正文（如 `__weSeedProps(...)`），
  * 在作者脚本之前执行，解决「父页 load 后再灌属性已晚」的时序。
@@ -62,19 +72,21 @@ export function rewriteHtml(
   opts: { baseHref?: string; seedScript?: string },
 ): string {
   if (!html) html = "";
-  if (html.includes(SHIM_MARK) || html.includes(SHIM_ATTR)) return html;
+  const injected = SHIM_MARK_RE.test(html);
 
   const base =
     opts.baseHref && !/<base\b/i.test(html)
       ? `<base href="${opts.baseHref.replace(/"/g, "&quot;")}">`
       : "";
-  const script =
-    `<script ${SHIM_ATTR}="1">\n${escapeScriptClose(shimSource)}\n</script>`;
+  const script = injected
+    ? ""
+    : `<script ${SHIM_ATTR}="1">\n${escapeScriptClose(shimSource)}\n</script>`;
   const seed =
-    opts.seedScript && opts.seedScript.trim()
-      ? `<script>\n${escapeScriptClose(opts.seedScript)}\n</script>`
-      : "";
+    injected || !opts.seedScript || !opts.seedScript.trim()
+      ? ""
+      : `<script>\n${escapeScriptClose(opts.seedScript)}\n</script>`;
   const inject = `${base}${script}${seed}`;
+  if (!inject) return html;
 
   // 优先插进 <head> 最前（任何作者 script 之前）
   const headOpen = /<head(\s[^>]*)?>/i.exec(html);
