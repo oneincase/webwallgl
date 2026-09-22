@@ -80,7 +80,11 @@ export function isRenderInert(o) {
  * 所以抽成纯函数由双方共用。改这里等于同时改两条路径，verify-transform
  * 的「静态场景上 recompose 必须与 parse 逐位相等」就是锁这一点的。
  *
- * 约定：WE 2D 层只用 z 旋转，角度制；Y 轴向下（与 parse 的世界系一致）。
+ * 约定：WE 2D 层只用 z 旋转，**弧度**；Y 轴向下（与 parse 的世界系一致）。
+ * scene.json 的 angles 官方就是弧度（Node.cpp："Static scene.json `angles`
+ * are already radians"；库内实测值全是 π/2、π 这类弧度，没有 90/180 度值），
+ * 脚本/动画写回经沙箱桥 scriptAnglesToRad 也落弧度 —— 此处曾 ×PI/180，
+ * 等于把斜父组（如 3281559867 的 180°=3.1416）转成 3.14°，子层偏移几乎不转。
  *
  * @param {{origin:number[],scale:number[],angles:number[]}} parentWorld 父层世界变换
  * @param {{origin:number[],scale:number[],angles:number[]}} childLocal 子层局部变换
@@ -88,7 +92,7 @@ export function isRenderInert(o) {
  */
 export function composeChildTransform(parentWorld, childLocal, parentScalePropagates) {
   const pscale = parentScalePropagates ? parentWorld.scale : [1, 1, 1]
-  const ca = ((parentWorld.angles[2] || 0) * Math.PI) / 180
+  const ca = parentWorld.angles[2] || 0
   const cos = Math.cos(ca)
   const sin = Math.sin(ca)
   const ox = childLocal.origin[0] * pscale[0]

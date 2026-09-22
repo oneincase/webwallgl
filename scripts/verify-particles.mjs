@@ -333,22 +333,22 @@ function runSim() {
       for (const p of ps.pool) {
         if (!p.alive) continue;
         live++;
-        const wx = ps.originX + p.x * ps.scaleX;
-        const wy = ps.originY + p.y * ps.scaleY;
+        // worldspace 粒子坐标已是世界坐标，不再加图层 origin/scale
+        const wx = ps.worldSpace ? p.x : ps.originX + p.x * ps.scaleX;
+        const wy = ps.worldSpace ? p.y : ps.originY + p.y * ps.scaleY;
         if (![wx, wy, p.size, p.alpha, p.rot].every(Number.isFinite)) nan++;
         if (wx < minX) minX = wx;
         if (wx > maxX) maxX = wx;
         if (wy < minY) minY = wy;
         if (wy > maxY) maxY = wy;
       }
-      // 有效发射率需含 rate 与 count 两个倍率（与 _step 的算法一致），
-      // 否则会把「用户属性把数量关到最小」误判成缺陷（如 magic_pulse 的 explosionrate）。
-      // audioDriven 发射器（audioprocessingmode）的发射量随音频响度门控，无音频输入时
-      // 恒 0（与 WE 静音行为一致）——它的响度路径由 scripts/verify-audio.mjs 覆盖。
-      const rateMul = ps._ov.rateMul !== undefined ? ps._ov.rateMul : 1;
+      // 有效发射率（仿真秒内）= emitter.rate × count 倍率。
+      // instanceoverride.rate 是仿真时间缩放，只改变 20 墙钟秒内推进的仿真时长，
+      // 故下面「20s 内该有粒子」的判定按「仿真秒」口径：实际仿真时长 = 20·timeScale。
       const countMul = ps._ov.countMul !== undefined ? ps._ov.countMul : 1;
+      const timeScale = ps.timeScale === undefined ? 1 : Math.max(0, ps.timeScale);
       const rate = ps.emitters.reduce(
-        (s, e) => s + (e.fill ? Infinity : e.rate * rateMul * countMul * (e.audioDriven ? 0 : 1)),
+        (s, e) => s + (e.fill ? Infinity : e.rate * countMul * (e.audioDriven ? 0 : 1)),
         0,
       );
 
@@ -358,8 +358,9 @@ function runSim() {
       if (ps._aliveCount !== live) {
         errors.push(`${scene.id} ${d.path}: _aliveCount=${ps._aliveCount} ≠ 实际存活 ${live}`);
       }
-      // 20 秒内理应至少生成 1 颗（rate*20 >= 1 才要求；低速流星不在此列）
-      if (peak === 0 && rate * 20 >= 1)
+      // 20 墙钟秒内理应至少生成 1 颗：实际仿真时长 = 20·timeScale，故按
+      // rate·20·timeScale >= 1 要求（低速流星 / 仿真大幅放慢时不苛求）。
+      if (peak === 0 && rate * 20 * timeScale >= 1)
         errors.push(`${scene.id} ${d.path}: 发射率 ${rate}/s 但 20s 内 0 颗粒子`);
       if (
         live > 0 &&
@@ -374,6 +375,84 @@ function runSim() {
     }
   }
   return { checked, errors };
+}
+
+// ---------- 校验一·补：sphererandom 发射方向的维度（2464842912 螺旋回归）----------
+// directions 第 3 轴为 0（2D 场景）时，发射方向必须是严格单位圆盘：出生半径恒等于
+// distancemax。旧实现按 3D 球面采方向，投影到 2D 后半径 = r·√(1−u²) 随机缩短，
+// magic vortex 粒子从 r=256 缩到 r≈70，尾迹螺旋填满轮盘内部（Mirage 是贴轮胎外缘
+// 的干净亮环）。
+function runSphereEmitterDim() {
+  const errors = [];
+  const makeModel = (directions, dmin, dmax) => ({
+    maxcount: 400,
+    emitter: [{ name: "sphererandom", rate: 400, directions,
+      distancemin: dmin, distancemax: dmax, speedmin: 0, speedmax: 0 }],
+    renderer: [{ name: "ropetrail", length: 0.2, segments: 8 }],
+  });
+  const layer = { id: 1, name: "t", origin: [0,0,0], scale: [1,1,1], visible: true };
+
+  // 2D（dir z=0）：所有活粒子出生/当前半径恒为 256（容差数值积分少量漂移 ≤12%）
+  {
+    const ps = new ParticleSystem(null, makeModel("1 1 0", 256, 256), null, layer);
+    ps.setTexture({ glTex: null, width: 8, height: 8, pixels: ptex.buildBuiltinParticleTexture("particle/beam") });
+    ps.setVisible(true);
+    for (let i = 0; i < 600; i++) ps.advance(1 / 30);
+    const live = ps.pool.filter(p => p.alive);
+    let bad = 0; let worst = 256;
+    for (const p of live) {
+      const r = Math.hypot(p.x, p.y);
+      if (r < 220) bad++;
+      if (r < worst) worst = r;
+    }
+    if (bad > 0)
+      errors.push(`2D dir(1,1,0)：${bad}/${live.length} 颗粒子半径 <220（最小 ${Math.round(worst)}），方向未按 2D 单位圆盘采`);
+  }
+
+  // 3D（dir z=1）：允许投影半径缩短（回归保护，避免误改成强制 2D）
+  // —— 只确认不抛错、仍有粒子
+  {
+    const ps = new ParticleSystem(null, makeModel("1 1 1", 256, 256), null, layer);
+    ps.setTexture({ glTex: null, width: 8, height: 8, pixels: ptex.buildBuiltinParticleTexture("particle/beam") });
+    ps.setVisible(true);
+    for (let i = 0; i < 300; i++) ps.advance(1 / 30);
+    const live = ps.pool.filter(p => p.alive).length;
+    if (live === 0) errors.push("3D dir(1,1,1)：稳态 0 颗粒子");
+  }
+  return errors;
+}
+
+// ---------- 校验一·补：程序化 beam_1 = 黑底亮线（2464842912 additive 光环）----------
+// 真实 materials/Beam.tex 是 32×32：黑底、x=15 列 RGB=255（x=14/16 为 50 软边）、
+// alpha 恒 255、纵向无衰减。additive 下黑=不贡献，只显细线。
+// 旧 beam() 替身是「白 RGB + alpha 形状」，在 additive(SRC_ALPHA,ONE) 下成白块。
+function runBeamLineShape() {
+  const errors = [];
+  const t = ptex.buildBuiltinParticleTexture("particle/beam/beam_1");
+  if (t.width !== 32 || t.height !== 32)
+    errors.push(`尺寸应为 32×32，实得 ${t.width}×${t.height}`);
+  const { width: w, height: h, rgba } = t;
+  // 每一行：x=15 必须亮(255)、x=14/16 软边(50)、其余黑；alpha 全 255
+  for (const y of [0, (h / 2) | 0, h - 1]) {
+    const px = (x) => {
+      const o = (y * w + x) * 4;
+      return [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]];
+    };
+    const center = px(15);
+    if (center[0] !== 255 || center[1] !== 255 || center[2] !== 255 || center[3] !== 255)
+      errors.push(`y${y} x15 应为 (255,255,255,255)，实得 (${center})`);
+    for (const x of [14, 16]) {
+      const c = px(x);
+      if (c[0] !== 50 || c[3] !== 255)
+        errors.push(`y${y} x${x} 应为 (50,..,255)，实得 (${c})`);
+    }
+    for (const x of [0, 31]) {
+      const c = px(x);
+      if (c[0] !== 0 || c[3] !== 255)
+        errors.push(`y${y} x${x} 应为 (0,..,255)，实得 (${c})`);
+    }
+  }
+  return errors;
 }
 
 // ---------- 校验二：CPU 参考光栅器 ----------
@@ -1015,6 +1094,40 @@ function runMatrixGlyphSize() {
   if (Math.abs(ps2.sysScale - 12.2) > 1e-6) errors.push(`非等比图层 sysScale 应取 min=12.2，实际 ${ps2.sysScale}`);
   if (Math.abs(ps2.spriteStretchX * ps2.sysScale - 22.6) > 1e-4) {
     errors.push("非等比图层 stretchX × sysScale 必须还原 22.6");
+  }
+  return { errors };
+}
+
+// ---------- 1039919954 烟带倾角：layer.angles 是**弧度**，不得再 ×PI/180 ----------
+// 官方 Node.cpp："Static scene.json `angles` are already radians"（脚本 API 才用度，
+// 在沙箱桥 scriptAnglesToRad 转换；renderer.js 的 mat4RotateZ 也直用该值）。
+// 旧实现把 0.346rad 当 0.346°，两条烟粒子带的图层旋转被抹成水平 ——
+// 用户报「缺一个倾斜角度，应与双刀角度重合」（下带 19.8°、上带 12.0°）。
+// 库内 216 包 1223 个非零 angles 值全是弧度（π、π/2、120°=2.094…），没有 90/180 度值。
+function runLayerAngleRadians() {
+  const errors = [];
+  const psrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+  if (/la\[2\][^;\n]*Math\.PI\)\s*\/\s*180/.test(psrc)) {
+    errors.push("syncLayerTransform 不得把 layer.angles 当度数 ×PI/180（scene.json 原生弧度）");
+  }
+  if (!/this\.angleZ = la\[2\] \|\| 0/.test(psrc)) {
+    errors.push("angleZ 必须直读 layer.angles[2]（弧度），否则图层旋转被抹平");
+  }
+  // 真实包数值：1039919954 下带（id 18）origin(1038.478,115.140) scale(1.432,0.082) angles z=0.346rad≈19.8°
+  const layer = {
+    origin: [1038.478, 115.14, 0],
+    scale: [1.432, 0.082, 1],
+    angles: [0, 0, 0.346],
+  };
+  const ps = new ParticleSystem(null, { maxcount: 1 }, null, layer);
+  if (Math.abs(ps.angleZ - 0.346) > 1e-9) {
+    errors.push(`angleZ 应=0.346rad（19.8° 双刀倾角），实际 ${ps.angleZ}（按度解读≈0.006rad 会躺平）`);
+  }
+  // localToWorld 的 x 轴必须真的被转 0.346：atan2(dy,dx)≈0.346，且 y 分量为正（屏幕上右端上扬）
+  const [wx, wy] = ps.localToWorld(1, 0);
+  const tilt = Math.atan2(wy - 115.14, wx - 1038.478);
+  if (Math.abs(tilt - 0.346) > 1e-6) {
+    errors.push(`发射带 x 轴倾角应=0.346rad，实际 ${tilt.toFixed(6)}rad（${((tilt * 180) / Math.PI).toFixed(2)}°）`);
   }
   return { errors };
 }
@@ -2391,6 +2504,204 @@ function runRope() {
   return { errors };
 }
 
+// ---------- worldspace（Particle flags bit0）/ oscillateposition / attract ----------
+// 语义全部对自 Mirage SceneRenderer（SceneCompiler flags、ParticleCompiler
+// FrequencyValue/ControlPointForce）。1425503532 Pac-Man 的 rope 光束靠这套
+// 组合把父粒子的历史轨迹冻结在世界里。
+function runWorldspaceAndOps() {
+  const errors = [];
+  const L = { origin: [100, 500, 0], scale: [1, 1, 1], angles: [0, 0, 0] };
+  const mk = (model, layer) => new ParticleSystem(null, model, null, layer || L);
+
+  // ① flags bit0 → worldSpace：spawn 时一次性变换到世界坐标，之后原点挪走
+  //    不再带走老粒子（rope 光束的冻结轨迹）；局部系统则整体随原点平移。
+  for (const flags of [1, 0]) {
+    const ps = mk({
+      maxcount: 32,
+      flags,
+      emitter: [{ name: "boxrandom", rate: 60, distancemax: "0 0 0", origin: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 2, max: 2 },
+        { name: "sizerandom", min: 40, max: 40 },
+        { name: "velocityrandom", min: "300 0 0", max: "300 0 0" },
+      ],
+      operator: [{ name: "movement", gravity: "0 0 0", drag: 0 }],
+    });
+    for (let i = 0; i < 30; i++) ps.advance(1 / 60); // 0.5s 老粒子
+    const old = ps.pool.find((p) => p.alive && p.age > 0.4);
+    if (flags === 1 && ps.worldSpace !== true) {
+      errors.push("flags bit0 必须解析为 worldSpace（Particle::FlagEnum::wordspace）");
+    }
+    if (!old) {
+      errors.push(`worldspace(flags=${flags}): 没生成老粒子`);
+      continue;
+    }
+    // 统一按实现的空间语义算「渲染世界位置」：实现回退成局部空间时，
+    // 原点跳变会被 localToWorld 带进来，shift 立刻飙到 ~500，判据变红
+    const rendered = (q) => (ps.worldSpace ? [q.x, q.y] : ps.localToWorld(q.x, q.y));
+    const before = rendered(old);
+    ps.originX = 600; // 模拟 eventfollow 原点跳到父粒子新位置
+    for (let i = 0; i < 10; i++) ps.advance(1 / 60);
+    const after = rendered(old);
+    const shift = Math.hypot(after[0] - before[0], after[1] - before[1]);
+    if (flags === 1) {
+      // worldspace：只允许自己 10 帧 ×300px/s ≈ 50px 的前进，不允许随原点跳
+      if (shift > 60) errors.push(`worldspace 粒子不应被原点平移带走（跳了 ${shift.toFixed(0)}px）`);
+    } else if (shift < 400) {
+      errors.push(`局部粒子必须随原点平移（只移动 ${shift.toFixed(0)}px，预期 ≈500）`);
+    }
+    // 原点跳走之后新生的粒子要在新原点附近
+    if (flags === 1) {
+      const young = ps.pool
+        .filter((p) => p.alive && p.age < 10 / 60 + 0.05)
+        .sort((a, b) => a.age - b.age)[0];
+      if (!young || Math.abs(young.x - 600) > 60) {
+        errors.push(`worldspace 新粒子应在新原点发射（x=${young ? young.x.toFixed(0) : "无"}，预期 ≈600）`);
+      }
+    }
+  }
+
+  // ② oscillateposition：年龄时基、频率即角频率（不乘 TAU）、各轴独立相位、
+  //    位移 = scale*(cos(w*age+phi) - cos(phi))（出生时为 0）
+  {
+    const ps = mk({
+      maxcount: 256,
+      flags: 1,
+      emitter: [{ name: "boxrandom", rate: 200, distancemax: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 3, max: 3 },
+        { name: "sizerandom", min: 20, max: 20 },
+      ],
+      operator: [
+        { name: "movement", drag: 0 },
+        {
+          name: "oscillateposition",
+          frequencymin: 2, frequencymax: 2,
+          scalemin: 30, scalemax: 30,
+          phasemin: 0, phasemax: 0,
+          mask: "0 1 0",
+        },
+      ],
+    });
+    for (let i = 0; i < 90; i++) ps.advance(1 / 60); // 1.5s
+    const snap = ps.pool
+      .filter((p) => p.alive)
+      .map((p) => ({ p, age: p.age, off: p.y - p.by, x: p.x - p.bx }));
+    ps.advance(1 / 60);
+    const live = ps.pool.filter((p) => p.alive);
+    let badBound = 0;
+    let badX = 0;
+    let sawSwing = 0;
+    let birthJitter = 0;
+    let badPredict = 0;
+    let predictN = 0;
+    for (const p of live) {
+      const off = p.y - p.by;
+      // off = 30(cos(2age+phi)-cos(phi)) = -60 sin(age) sin(phi+age)
+      const denom = 60 * Math.sin(p.age);
+      if (Math.abs(denom) > 1e-3 && Math.abs(off) > Math.abs(denom) + 0.5) badBound++;
+      if (Math.abs(p.x - p.bx) > 0.01) badX++;
+      if (p.age > 0.4 && p.age < 0.8 && Math.abs(off) > 10) sawSwing++;
+      if (p.age < 0.03 && Math.abs(off) > 1) birthJitter++;
+      // 跨帧预测：由当前 (age,off) 反解 sin(phi+age)，预测 1/60 后的 off。
+      // 频率不是角频率（多乘 TAU）或时基用全局 simTime 都会让预测失败。
+      if (Math.abs(Math.sin(p.age)) > 0.5) {
+        const s0 = snap.find((z) => z.p === p);
+        if (s0) {
+          const k = s0.off / (-60 * Math.sin(s0.age));
+          if (Math.abs(k) <= 1.0001) {
+            predictN++;
+            const c = Math.sqrt(Math.max(0, 1 - k * k));
+            const dt = p.age - s0.age;
+            // sin(phi+age') = k*cos(dt) ± c*sin(dt)，取与实际最吻合的符号
+            const cand = [
+              -60 * Math.sin(p.age) * (k * Math.cos(dt) + c * Math.sin(dt)),
+              -60 * Math.sin(p.age) * (k * Math.cos(dt) - c * Math.sin(dt)),
+            ];
+            if (Math.min(Math.abs(cand[0] - off), Math.abs(cand[1] - off)) > 1.5) badPredict++;
+          }
+        }
+      }
+    }
+    if (badBound) errors.push(`oscillateposition ${badBound} 颗粒子超出 cos 恒等式包络（频率乘了 TAU 或时基错）`);
+    if (badX) errors.push(`mask=[0,1,0] 时 x 轴不该振荡（${badX} 颗偏移）`);
+    if (birthJitter) errors.push(`oscillateposition 出生瞬间位移必须为 0（${birthJitter} 颗非零）`);
+    if (sawSwing < 10) errors.push("oscillateposition 0.4-0.8s 区间应有可见 y 摆动（角频率 2）");
+    if (predictN < 20) errors.push(`oscillateposition 跨帧预测样本不足（${predictN}）`);
+    else if (badPredict > 2) errors.push(`oscillateposition ${badPredict}/${predictN} 颗粒子不满足角频率/年龄时基的跨帧恒等式`);
+    // 旧实现（simTime 时基、w=freq*TAU、sin/cos 共享相位）在本判据下：
+    // age 0.1 处最大位移 60|sin(0.628)|=35.6 > 包络 60|sin(0.1)|=6，且跨帧预测失败。
+  }
+
+  // ③ controlpointattract：门限内恒力（无距离衰减），门限外为 0，scale<0 排斥
+  for (const [ox, expectVx, tag] of [
+    [25, -100, "门限内"],
+    [49, -100, "门限边缘不衰减"],
+    [75, 0, "门限外无力"],
+  ]) {
+    const ps = mk({
+      maxcount: 4,
+      flags: 0,
+      emitter: [{ name: "boxrandom", rate: 0, instantaneous: 1, distancemax: "0 0 0", origin: `${ox} 0 0` }],
+      controlpoint: [{ id: 0, flags: 0, offset: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 10, max: 10 },
+        { name: "sizerandom", min: 10, max: 10 },
+      ],
+      operator: [{ name: "controlpointattract", controlpoint: 0, scale: 100, threshold: 50, origin: "0 0 0" }],
+    });
+    ps.advance(1 / 60);
+    const p = ps.pool.find((q) => q.alive);
+    if (!p) {
+      errors.push(`controlpointattract ${tag}: 粒子未生成`);
+      continue;
+    }
+    const target = expectVx / 60;
+    if (Math.abs(p.vx - target) > 0.05) {
+      errors.push(`controlpointattract ${tag}: vx=${p.vx.toFixed(3)}（预期 ${target.toFixed(3)}）——旧的线性衰减实现会在 25/49 处给出 0.83/0.03`);
+    }
+  }
+
+  // ④ rope 渲染器无 alpha 算子时不套自造淡入淡出（官方 alpha 恒定，沿绳淡出
+  //    交给 ghosttrail.tex 的 v 渐变）；普通 sprite 仍保留温和包络
+  {
+    const ropePs = mk({
+      maxcount: 64,
+      flags: 1,
+      emitter: [{ name: "boxrandom", rate: 200, distancemax: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 0.2, max: 0.2 },
+        { name: "sizerandom", min: 40, max: 40 },
+      ],
+      operator: [{ name: "movement", drag: 0 }],
+      renderer: [{ name: "rope" }],
+    });
+    for (let i = 0; i < 120; i++) ropePs.advance(1 / 60);
+    const oldRope = ropePs.pool.filter((p) => p.alive && p.age / p.life > 0.9);
+    if (oldRope.length && oldRope.some((p) => Math.abs(p.alpha - 1) > 1e-6)) {
+      errors.push("rope 粒子无 alpha 算子时 alpha 必须恒为 1（淡出由贴图 v 渐变负责）");
+    }
+    const sprPs = mk({
+      maxcount: 64,
+      flags: 0,
+      emitter: [{ name: "boxrandom", rate: 200, distancemax: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 0.2, max: 0.2 },
+        { name: "sizerandom", min: 40, max: 40 },
+      ],
+      operator: [{ name: "movement", drag: 0 }],
+      renderer: [{ name: "sprite" }],
+    });
+    for (let i = 0; i < 120; i++) sprPs.advance(1 / 60);
+    const oldSpr = sprPs.pool.filter((p) => p.alive && p.age / p.life > 0.95);
+    if (oldSpr.length && !oldSpr.some((p) => p.alpha < 0.99)) {
+      errors.push("普通 sprite 的默认淡入淡出包络被误删");
+    }
+  }
+
+  return { errors };
+}
+
 // 官方素材（R8/RG88 取样语义 + TEXS 帧表）的判据在 verify-textures（稳定集）里，
 // 本文件只保留粒子系统本身的模拟/光栅回归。
 
@@ -3204,7 +3515,8 @@ function runEventChildren() {
     }
     return { parent, kids, layer };
   };
-  // 质心**在世界空间**给出（各系统局部坐标之间可能差一个 children.scale）
+  // 质心**在世界空间**给出（各系统局部坐标之间可能差一个 children.scale）。
+  // worldspace 系统的粒子坐标 spawn 时已变换到世界，不能再过 localToWorld。
   const stats = (ps) => {
     let live = 0;
     let sx = 0;
@@ -3212,9 +3524,14 @@ function runEventChildren() {
     for (const p of ps.pool) {
       if (!p.alive) continue;
       live++;
-      const w = ps.localToWorld(p.x, p.y);
-      sx += w[0];
-      sy += w[1];
+      if (ps.worldSpace) {
+        sx += p.x;
+        sy += p.y;
+      } else {
+        const w = ps.localToWorld(p.x, p.y);
+        sx += w[0];
+        sy += w[1];
+      }
     }
     return { live, wx: live ? sx / live : 0, wy: live ? sy / live : 0 };
   };
@@ -3424,7 +3741,8 @@ function runEventChildren() {
           for (const p of kid.ps.pool) {
             if (!p.alive) continue;
             liveKid++;
-            const w = kid.ps.localToWorld(p.x, p.y);
+            // worldspace 子级粒子坐标已是世界坐标（Rain_Splash flags=1）
+            const w = kid.ps.worldSpace ? [p.x, p.y] : kid.ps.localToWorld(p.x, p.y);
             if (Math.hypot(w[0] - parent.ps.originX, w[1] - parent.ps.originY) > 150) farFromOrigin++;
             let best = Infinity;
             for (const q of parents) best = Math.min(best, Math.hypot(w[0] - q[0], w[1] - q[1]));
@@ -3601,6 +3919,10 @@ if (action === "all" || action === "nested" || action === "sim") {
   console.log(`\n【Matrix 字号】问题 ${glyph.errors.length}`);
   glyph.errors.forEach((e) => console.log("  ! " + e));
   failed += glyph.errors.length;
+  const ang = runLayerAngleRadians();
+  console.log(`\n【图层角度单位（1039919954 烟带倾角）】问题 ${ang.errors.length}`);
+  ang.errors.forEach((e) => console.log("  ! " + e));
+  failed += ang.errors.length;
 }
 if (action === "all" || action === "sim" || action === "trail") {
   const r = runSpriteTrail();
@@ -3615,6 +3937,10 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【Rope 连续光束】问题 ${rp.errors.length}`);
   rp.errors.forEach((e) => console.log("  ! " + e));
   failed += rp.errors.length;
+  const wo = runWorldspaceAndOps();
+  console.log(`\n【worldspace / 振荡 / 恒力吸引】问题 ${wo.errors.length}`);
+  wo.errors.forEach((e) => console.log("  ! " + e));
+  failed += wo.errors.length;
   const ob = runOverbright();
   console.log(`\n【Overbright】问题 ${ob.errors.length}`);
   ob.errors.forEach((e) => console.log("  ! " + e));
@@ -3627,6 +3953,20 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【预热步数预算（3509806978 卡死回归）】问题 ${pw.length}`);
   pw.forEach((e) => console.log("  ! " + e));
   failed += pw.length;
+}
+
+{
+  const sed = runSphereEmitterDim();
+  console.log(`\n【sphererandom 方向维度（2464842912 螺旋回归）】问题 ${sed.length}`);
+  sed.forEach((e) => console.log("  ! " + e));
+  failed += sed.length;
+}
+
+{
+  const bl = runBeamLineShape();
+  console.log(`\n【程序化 beam_1 黑底亮线（additive 光环回归）】问题 ${bl.length}`);
+  bl.forEach((e) => console.log("  ! " + e));
+  failed += bl.length;
 }
 
 console.log(failed === 0 ? "\n✓ 全部通过" : `\n✗ 共 ${failed} 处问题`);

@@ -421,7 +421,8 @@ export function parentMeshToWorldDelta(parent, dx, dy) {
   const ang = parent && parent.angles ? parent.angles[2] || 0 : 0
   const sx = parent && parent.scale ? parent.scale[0] : 1
   const sy = parent && parent.scale ? parent.scale[1] : 1
-  const ca = (ang * Math.PI) / 180
+  // layer.angles 已是弧度（scene.json 原生单位，见 parse.js composeChildTransform 注释）
+  const ca = ang
   const cos = Math.cos(ca)
   const sin = Math.sin(ca)
   const ox = dx * sx

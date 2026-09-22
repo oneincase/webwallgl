@@ -38,6 +38,14 @@ vec2 rotateVec2(vec2 v, float a) {
     float s = sin(a);
     return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
 }
+// [we-scene patch 3351179520] HLSL 允许把 vec4 隐式截断成 float2 传参，GLSL 不允许 ——
+// multistage_wave.vert（GLOBAL_ROTATION=1 时 v_DirectionN 是 vec4）写
+// \`v_DirectionN.zw = rotateVec2(v_DirectionN, g_DirectionOffset)\`，没有这个重载
+// 整条 pass 编译失败、效果被静默跳过（飘带/头发的多层波动全消失）。
+// 语义 = 取 xy 分量旋转，与 WE 原生截断一致。
+vec2 rotateVec2(vec4 v, float a) {
+    return rotateVec2(v.xy, a);
+}
 float rand(vec2 n) { return fract(sin(dot(n, vec2(12.9898, 78.233))) * 43758.5453); }
 float rand(vec2 n, float m) { return 0.5 + 0.5 * rand(n * m); }
 float smoothstep01(float x) { return smoothstep(0.0, 1.0, x); }

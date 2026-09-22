@@ -4,7 +4,7 @@
 
 ## 简介
 
-WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。
+让 Wallpaper Engine 实现再次伟大！！！恭喜你发现宝藏，这是全网复刻程度最高，功能最强，更新最快的 Wallpaper Engine 自研核心库，纯 TypeScript/JS 实现。webwallgl 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。下游如果进行了库的引用，麻烦给个 star，非常感谢！
 
 - [GitHub 开源仓库](https://github.com/oneincase/webwallgl)
 - [在线版（GitHub Pages）](https://oneincase.github.io/webwallgl/)

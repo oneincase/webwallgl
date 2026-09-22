@@ -89,12 +89,19 @@ export function rasterizeSystem(target, ps, cam, opts) {
     return [scene.rgb[o], scene.rgb[o + 1], scene.rgb[o + 2]]
   }
 
-  const sysScale = ps.sysScale
+  // worldspace 粒子 spawn 时已含图层 origin/scale/angle，光栅端只做投影翻转
+  //（与 particles.js render() 同一组分流）
+  const ws = !!ps.worldSpace
+  const sysScale = ws ? 1 : ps.sysScale
   // 与 particles.js 的顶点着色器一致：精灵形状 = 贴图宽高比 × 图层非等比 scale
-  const stretchX = ps.spriteStretchX * (ps.texAspectX || 1)
-  const stretchY = ps.spriteStretchY * (ps.texAspectY || 1)
-  const cosL = Math.cos(ps.angleZ)
-  const sinL = Math.sin(ps.angleZ)
+  const stretchX = (ws ? 1 : ps.spriteStretchX) * (ps.texAspectX || 1)
+  const stretchY = (ws ? 1 : ps.spriteStretchY) * (ps.texAspectY || 1)
+  const cosL = ws ? 1 : Math.cos(ps.angleZ)
+  const sinL = ws ? 0 : Math.sin(ps.angleZ)
+  const originX = ws ? (ps.parallaxX || 0) : ps.originX + (ps.parallaxX || 0)
+  const originY = ws ? (ps.parallaxY || 0) : ps.originY + (ps.parallaxY || 0)
+  const scaleX = ws ? 1 : ps.scaleX
+  const scaleY = ws ? 1 : ps.scaleY
   // 与 particles.js 的 fillInstanceData 同构：材质 overbright（3151551777 Bokeh
   // 0.25）与 instanceoverride.brightness 相乘，改一边必改另一边
   const bright = (ps._ov.brightness || 1) * (ps.overbright ?? 1)
@@ -117,9 +124,9 @@ export function rasterizeSystem(target, ps, cam, opts) {
 
   // 局部 → 世界（含图层 origin/scale/angles），y 翻转到投影空间（与 GPU 的 toWorld 一致）
   const toWorld = (lx, ly) => {
-    const px = lx * ps.scaleX
-    const py = ly * ps.scaleY
-    return [ps.originX + px * cosL - py * sinL, cam.projH - (ps.originY + px * sinL + py * cosL)]
+    const px = lx * scaleX
+    const py = ly * scaleY
+    return [originX + px * cosL - py * sinL, cam.projH - (originY + px * sinL + py * cosL)]
   }
 
   // 画一个实例 quad（与顶点着色器逐字对应）：
@@ -281,10 +288,10 @@ export function rasterizeSystem(target, ps, cam, opts) {
   for (const p of ps.pool) {
     if (!p.alive) continue
     // 局部 → 世界（含图层 origin/scale/angles），y 翻转到投影空间
-    const lx = p.x * ps.scaleX
-    const ly = p.y * ps.scaleY
-    const wx = ps.originX + lx * cosL - ly * sinL
-    const wy = cam.projH - (ps.originY + lx * sinL + ly * cosL)
+    const lx = p.x * scaleX
+    const ly = p.y * scaleY
+    const wx = originX + lx * cosL - ly * sinL
+    const wy = cam.projH - (originY + lx * sinL + ly * cosL)
 
     let pStretchX = stretchX
     let pStretchY = stretchY
@@ -297,10 +304,10 @@ export function rasterizeSystem(target, ps, cam, opts) {
         spriteTrail.maxLength,
       )
       pStretchY = stretchY * factor
-      const lx1 = (p.x + p.vx) * ps.scaleX
-      const ly1 = (p.y + p.vy) * ps.scaleY
-      const wx1 = ps.originX + lx1 * cosL - ly1 * sinL
-      const wy1 = cam.projH - (ps.originY + lx1 * sinL + ly1 * cosL)
+      const lx1 = (p.x + p.vx) * scaleX
+      const ly1 = (p.y + p.vy) * scaleY
+      const wx1 = originX + lx1 * cosL - ly1 * sinL
+      const wy1 = cam.projH - (originY + lx1 * sinL + ly1 * cosL)
       rot = spriteTrailRotation(wx1 - wx, wy1 - wy)
     }
 

@@ -671,6 +671,30 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         if (!lw || !rw || lw >= rw) return all
         return pre + lhs + ' = ' + rhs + '.' + SW[lw] + ';'
       })
+      // 9-3) [we-scene patch 3351179520] **复合赋值的向量截断**：
+      //    `vec2 strength; strength *= 500.0 / g_Texture0Resolution;`
+      //    HLSL 按左值宽度截断右值（vec2 *= vec4 合法），GLSL ES 报
+      //    `'=' : cannot convert from 'vec4' to 'vec2'`，整条 pass 报废。
+      //    只在右值宽度**可确证**时处理：右值 = 单一向量标识符，或
+      //    「标量/向量 标识符 与该标识符之间恰好一次二元乘除加减」——
+      //    宽度由该标识符决定；推不出就不动，交给真实编译校验。
+      code = code.replace(/(^|[;{}\n]\s*)([A-Za-z_]\w*)\s*(\*=|\/=|\+=|-=)\s*([^;\n]+);/g, (all, pre, lhs, op, rhs) => {
+        const lw = width.get(lhs)
+        if (!lw) return all
+        const m = /^\s*(-?\s*(?:\d+(?:\.\d+)?f?|([A-Za-z_]\w*))\s*(?:[*/+\-]\s*(-?\s*(?:\d+(?:\.\d+)?f?|[A-Za-z_]\w*))\s*)?)$/.exec(rhs)
+        if (!m) return all
+        // 右值里可确证宽度的那个标识符（优先第二个操作数，缺省取第一个）
+        const idents = [m[2], m[3]].filter(Boolean)
+        let srcId = null
+        let rw = 0
+        for (const id of idents) {
+          const w = width.get(id)
+          if (w) { srcId = id; rw = w; break }
+        }
+        if (!srcId || rw <= lw) return all
+        const sw = SW[lw]
+        return pre + lhs + ' ' + op + ' ' + rhs.replace(srcId, srcId + '.' + sw) + ';'
+      })
     }
     // 9a-2) [we-scene patch] **声明式初始化的向量→标量截断**：
     //    `float mask = texSample2D(g_Texture1, uv);`（sharpen_filter，2 张）、
@@ -1254,15 +1278,26 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     // 反过来收窄顶点侧会丢掉它确实写入的分量。
     if (typeof siblingSrc === 'string' && siblingSrc) {
       const vertTypes = new Map()
+      const vertConflicts = new Set()
       const vre = /^\s*(?:varying|out)\s+(?:highp|mediump|lowp\s+)?(vec[234]|float)\s+([A-Za-z_]\w*)\s*;/gm
       let vm
-      while ((vm = vre.exec(siblingSrc)) !== null) vertTypes.set(vm[2], vm[1])
+      // [we-scene patch 3351179520] 扫描的是**未预处理的兄弟原文**：写在
+      // `#if X / vec4 / #else / vec2 / #endif` 两个分支里的同名 varying 会被
+      // 先后各记一次，后写的（往往是死分支）覆盖前面的 —— 于是把「按顶点侧
+      // 加宽/收窄片元」建立在死分支的声明上（multistage_wave 的
+      // v_Direction1 被 #else 的 vec2 收窄，calWaveData(vec4) 调用随之报废）。
+      // 同名多变体 = 预处理分支没定案，两边都别动，留给真实编译校验。
+      while ((vm = vre.exec(siblingSrc)) !== null) {
+        const prev = vertTypes.get(vm[2])
+        if (prev !== undefined && prev !== vm[1]) vertConflicts.add(vm[2])
+        vertTypes.set(vm[2], vm[1])
+      }
       const RANK = { float: 1, vec2: 2, vec3: 3, vec4: 4 }
       const widened = new Map()
       code = code.replace(/^(\s*in\s+(?:highp|mediump|lowp\s+)?)(vec[234]|float)(\s+)([A-Za-z_]\w*)(\s*;)/gm,
         (all, pre, ty, sp, name, tail) => {
           const vt = vertTypes.get(name)
-          if (!vt || RANK[vt] <= RANK[ty]) return all
+          if (!vt || vertConflicts.has(name) || RANK[vt] <= RANK[ty]) return all
           widened.set(name, RANK[ty]) // 记住片元原本当它是几维用的
           return pre + vt + sp + name + tail
         })
@@ -1296,7 +1331,7 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       code = code.replace(/^(\s*in\s+(?:highp|mediump|lowp\s+)?)(vec[234]|float)(\s+)([A-Za-z_]\w*)(\s*;)/gm,
         (all, pre, ty, sp, name, tail) => {
           const vt = vertTypes.get(name)
-          if (!vt || RANK[vt] >= RANK[ty]) return all
+          if (!vt || vertConflicts.has(name) || RANK[vt] >= RANK[ty]) return all
           // 片元是否用到了超出顶点宽度的分量？
           const CH = 'xyzw'
           const RG = 'rgba'

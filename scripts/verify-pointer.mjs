@@ -1673,7 +1673,10 @@ console.log('\n【8. 粒子锁鼠标 / eventfollow】')
   const home = parent.leaderParticle()
   const homeDist = home ? Math.hypot(home.x, home.y) : Infinity
   if (homeDist >= fleeDist) fail(`拉回原点：5s 后 dist=${homeDist.toFixed(2)} 未小于推开时的 ${fleeDist.toFixed(2)}`)
-  else if (homeDist > 10) fail(`拉回原点：5s 后仍距原点 ${homeDist.toFixed(2)}px`)
+  // 官方 controlpointattract 是**门限内恒力**（无距离衰减），原点附近是 bang-bang
+  // 极限环：恒力 64 + drag 1 下稳态抖振半宽约 24px（Pac-Man 的抖动即来源于此）。
+  // 旧阈值 10px 只在「线性衰减」实现下成立；恒力语义下瞬时距离落在 ±30 即已归位。
+  else if (homeDist > 30) fail(`拉回原点：5s 后仍距原点 ${homeDist.toFixed(2)}px（恒力 bang-bang 抖振阈值 30）`)
   else ok(`拉回原点：5s 回到 ${homeDist.toFixed(2)}px`)
 
   const child = new ParticleSystem(

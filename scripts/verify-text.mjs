@@ -2837,11 +2837,12 @@ async function runP21Scripts() {
     const ps = new ParticleSystem(null, mk(), { rate: 1 }, {});
     // 模拟 scene-mount：update 返回 0（静音门）→ setOverrideValue('rate', 0)
     ps.setOverrideValue("rate", 0);
-    let fired = 0;
-    const stub = { spawn: () => { fired++; } };
-    // 直接断言倍率写口（rateMul）而非内部 spawn，避免依赖实现细节
-    if (ps._ov.rateMul !== 0) errors.push("setOverrideValue('rate',0) 未把 rateMul 置 0");
-    void stub;
+    // rate 在 WE 语义里是仿真时间缩放（timeScale）：设 0 即仿真停滞（静音门）。
+    if (ps.timeScale !== 0) errors.push("setOverrideValue('rate',0) 未把 timeScale 置 0");
+    const before = ps.pool.filter((p) => p.alive).length;
+    for (let i = 0; i < 30; i++) ps.advance(1 / 30);
+    const after = ps.pool.filter((p) => p.alive).length;
+    if (after !== before) errors.push(`timeScale=0 仍在 spawn（${before} → ${after}）`);
   }
 
   // ---- 3) colorn 归一化颜色写口（新粒子不读旧色）----

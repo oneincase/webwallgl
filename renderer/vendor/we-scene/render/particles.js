@@ -178,13 +178,16 @@ class Particle {
     this.frame = 0
     // 每粒子固化的随机相位：振荡类算子的 min/max 必须在**生成时**取一次，
     // 若每帧重取，随机相位会让粒子每帧跳到不同位置（表现为剧烈抖动）。
-    this.oscPhase = 0
-    this.oscFreq = 0
-    this.oscAmp = 0
+    // oscillateposition：三轴各自独立固化（官方每个激活轴一次 Random）
+    this.oscPFreq = [0, 0, 0]
+    this.oscPAmp = [0, 0, 0]
+    this.oscPPhase = [0, 0, 0]
     this.oscAPhase = 0
     this.oscAFreq = 0
+    this.oscAAmp = [0, 0]
     this.oscSPhase = 0
     this.oscSFreq = 0
+    this.oscSAmp = [0, 0]
     this.turbSpeed = 0
     this.turbPhase = 0
     // ropetrail 才记历史折线；spritetrail 是单精灵转向+拉伸，不记历史
@@ -234,6 +237,12 @@ export class ParticleSystem {
     // （SceneCompiler.cpp:4535），frag 里 `mix(frame, nextFrame, frac(lifetime*numFrames))`。
     // 硬切会让快速动画的精灵「跳帧」发顿；全库粒子模型绝大多数没写 flags → 默认开。
     this.frameBlend = (num(model.flags, 0) & 2) === 0
+    // 官方 Particle::FlagEnum bit0（wordspace）：粒子在**生成时**一次性变换到世界
+    // 坐标，之后模拟与渲染都不再跟随图层原点（Mirage SceneCompiler / ParticleSystem：
+    // IsNew 时 world_from_spawn_space 变换位置与速度，几何 base=0）。
+    // 1425503532 Pac-Man 的 rope 光束靠它把父粒子的波动冻结成世界里的波形；
+    // 缺这一位时整条光束随当前原点刚体平移，波形被抹掉。
+    this.worldSpace = (num(model.flags, 0) & 1) !== 0
     // 序列帧（sprite sheet）。优先用贴图 TEXS 段里的**真实帧矩形**；
     // 只有在贴图没有 TEXS 时才退回按 sequencemultiplier 猜 N×N 方格
     // （猜测对横排/竖排的 sheet 是错的，会采样到跨帧的错位图块）。
@@ -281,6 +290,7 @@ export class ParticleSystem {
     this._ropeOrder = []
 
     this._ov = {}
+    this.timeScale = 1
     this._applyOverride()
 
     // starttime：WE 用它预热模拟，让首帧就有铺满的粒子（雪/雾不会从空屏渐入）
@@ -324,7 +334,7 @@ export class ParticleSystem {
     if (key === 'alpha') this.opacityMul = n
     else if (key === 'count') this._ov.countMul = n
     else if (key === 'size') this._ov.size = n
-    else if (key === 'rate') this._ov.rateMul = n
+    else if (key === 'rate') this.timeScale = n
     else if (key === 'speed') this._ov.speed = n
     else if (key === 'lifetime') this.lifetimeMul = n
     else if (key === 'brightness') this._ov.brightness = n
@@ -380,11 +390,12 @@ export class ParticleSystem {
       } else if (k === 'size') {
         this._ov.size = Number(val) || 1
       } else if (k === 'rate') {
-        // rate 是**倍率**而非绝对值（实测 32 处 override 全在 0.19–4.84 区间，
-        // 且与 emitter.rate 一起出现：如 rate=250 的 emitter 配 override 0.32 → 80/s）。
-        // 当成绝对值会把 250/s 的发射器压成 0.32/s，粒子几乎不出现。
-        this._ov.rateMul = Number(val)
-        if (!Number.isFinite(this._ov.rateMul)) this._ov.rateMul = 1
+        // rate 是**仿真时间缩放（播放速率）**，不是 emitter 发射率倍率（对齐 Mirage
+        // ParticleSubSystem::Advance：simulation_time = frame_time·rate）。
+        // rate=0.4 → 仿真放慢到 40%：发射率与算子都变慢，但粒子在墙钟时间活得更久，
+        // 稳态存活更多、ribbon 更密。当 emitter rateMul 直接缩放发射率会少 1/0.4 倍粒子。
+        this.timeScale = Number(val)
+        if (!Number.isFinite(this.timeScale)) this.timeScale = 1
       } else if (k === 'speed') {
         this._ov.speed = Number(val) || 1
       } else if (k === 'lifetime') {
@@ -603,36 +614,34 @@ export class ParticleSystem {
           })
           break
         case 'oscillatealpha':
-          this.ops.oscAlpha = {
-            freqMin: num(o.frequencymin, num(o.frequencymax, 1)),
-            freqMax: num(o.frequencymax, 1),
-            scaleMin: num(o.scalemin, 0),
-            scaleMax: num(o.scalemax, 1),
-            phaseMax: num(o.phasemax, TAU),
-          }
-          break
         case 'oscillatesize':
-          this.ops.oscSize = {
-            freqMin: num(o.frequencymin, num(o.frequencymax, 1)),
-            freqMax: num(o.frequencymax, num(o.frequencymin, 1)),
-            scaleMin: num(o.scalemin, 1),
-            scaleMax: num(o.scalemax, 1),
-            phaseMax: num(o.phasemax, TAU),
-          }
-          break
-        case 'oscillateposition':
-          this.ops.oscPos = {
-            freqMin: num(o.frequencymin, num(o.frequencymax, 0.5)),
-            freqMax: num(o.frequencymax, 0.5),
-            scaleMin: num(o.scalemin, 0),
-            scaleMax: num(o.scalemax, 1),
+        case 'oscillateposition': {
+          // 官方 FrequencyValue（Mirage ParticleCompiler）：频率字段直接是
+          // 角频率 w（GetMove/GetScale 里 w=freq，不再乘 TAU）；时间基是粒子年龄；
+          // 相位每个激活轴独立 Random(phasemin, phasemax+TAU)。
+          // frequencymax 显式为 0 时回退 frequencymin。
+          const opName = o.name
+          const isPos = opName === 'oscillateposition'
+          const fMin = num(o.frequencymin, 0)
+          let fMax = o.frequencymax === undefined ? (isPos ? 5 : 10) : num(o.frequencymax)
+          if (fMax === 0) fMax = fMin
+          const cfg = {
+            freqMin: fMin,
+            freqMax: fMax,
+            scaleMin: num(o.scalemin, opName === 'oscillatesize' ? 0.8 : 0),
+            scaleMax: num(o.scalemax, opName === 'oscillatesize' ? 1.2 : 1),
             phaseMin: num(o.phasemin, 0),
             phaseMax: num(o.phasemax, TAU),
-            mask: o.mask !== undefined ? parseVec(o.mask, [1, 1, 0]) : [1, 1, 0],
           }
+          if (opName === 'oscillatealpha') this.ops.oscAlpha = cfg
+          else if (opName === 'oscillatesize') this.ops.oscSize = cfg
+          else this.ops.oscPos = { ...cfg, mask: o.mask !== undefined ? parseVec(o.mask, [1, 1, 0]) : [1, 1, 0] }
           break
+        }
         case 'controlpointattract':
-          // scale<0 = 排斥（实测 -10000 很常见，是"鼠标推开粒子"效果）
+          // 官方（Mirage ParticleCompiler）：threshold 是**作用门限**（距离 <
+          // threshold 才受力），门内加速度恒为 normalize(cp - pos) * scale，
+          // **没有**随距离的衰减；scale<0 = 排斥。
           this.ops.attract.push({
             cp: num(o.controlpoint, 0),
             origin: parseVec(o.origin),
@@ -677,14 +686,15 @@ export class ParticleSystem {
     this.renderers = rlist.map((r) => {
       const kind = (r && r.name) || 'sprite'
       // spritetrail 省略 Length 不能当 0（理想长度恒 0 → 精灵消失）。库里 23 处没写。
-      // ropetrail 的 Length 是尾迹时长（秒），省略按预设常见 0.2。
+      // ropetrail 的 length 是尾迹长度因子；maxlength 缺省 10（官方 ParticleLayerSpec
+      // 默认，不是 0——否则 min(|v|·length, 0) 恒 0、quad 退化）。
       return {
         kind,
         length: num(r && r.length, kind === 'spritetrail' ? 0.1 : kind === 'ropetrail' ? 0.2 : 0),
-        maxLength: num(r && r.maxlength, 0),
+        maxLength: num(r && r.maxlength, kind === 'ropetrail' ? 10 : 0),
         minLength: num(r && r.minlength, 0),
         subdivision: num(r && r.subdivision, 1),
-        // Rope Trail 段数（官方 `segments`）；与 spritetrail 的 maxlength 无关
+        // Rope Trail 段数（官方 `segments`）
         segments: num(r && r.segments, 0),
         orientation: (r && r.orientation) || null,
       }
@@ -850,7 +860,11 @@ export class ParticleSystem {
     this.originZ = lo[2] || 0
     this.scaleX = ls[0] === 0 ? 1 : ls[0]
     this.scaleY = ls[1] === 0 ? 1 : ls[1]
-    this.angleZ = ((la[2] || 0) * Math.PI) / 180
+    // [we-scene patch] scene.json 的 angles 本来就是**弧度**（官方 Node.cpp：
+    // "Static scene.json `angles` are already radians"，脚本 API 才用度、在沙箱桥
+    // scriptAnglesToRad 转换；renderer.js 的 mat4RotateZ 也直用该值）。这里曾
+    // ×PI/180 把 0.346rad 当 0.346°，1039919954 的两条烟带因此躺平（缺双刀倾角）。
+    this.angleZ = la[2] || 0
     // [we-scene patch] 图层 scale **一律**乘进精灵尺寸（官方：粒子位置与 quad 都过
     // 图层 model matrix，等比也一样）。旧实现只对非等比图层乘 min(|sx|,|sy|)、等比图层
     // 恒 1（当时为 3226487183 代码雨「50px 字 × 1.476 = 74px 与列距 74px 叠住」加的
@@ -1068,20 +1082,39 @@ export class ParticleSystem {
       const dir = em.directions
       const rmin = em.distanceMin ? em.distanceMin[0] : 0
       const rmax = em.distanceMax ? em.distanceMax[0] : 0
-      // 球面均匀采样
-      const u = Math.random() * 2 - 1
-      const th = Math.random() * TAU
-      const sq = Math.sqrt(Math.max(0, 1 - u * u))
-      let nx = sq * Math.cos(th)
-      let ny = sq * Math.sin(th)
-      let nz = u
+      // 均匀单位方向：**按 directions 激活的轴数取对应维度**（对齐 Mirage
+      // ParticleEmitter：dir[2]=0 的 2D 场景里 z 强制 0、(nx,ny) 是严格单位
+      // 圆盘——否则 3D 球面方向投影到 2D 后半径 = r·√(1−u²) 随机缩短，
+      // 2464842912 的 magic vortex 粒子会从 r=256 缩到 r≈70、螺旋填满轮盘内部）
+      // 激活轴数（对齐 Mirage ActiveAxisCount）：决定方向维度与半径分布
+      const useZ = Math.abs(dir[2]) > 1e-6
+      const useX = Math.abs(dir[0]) > 1e-6
+      const useY = Math.abs(dir[1]) > 1e-6
+      const dims = Math.max(1, (useX?1:0) + (useY?1:0) + (useZ?1:0))
+      let nx, ny, nz
+      if (useZ) {
+        const u = Math.random() * 2 - 1
+        const th = Math.random() * TAU
+        const sq = Math.sqrt(Math.max(0, 1 - u * u))
+        nx = sq * Math.cos(th)
+        ny = sq * Math.sin(th)
+        nz = u
+      } else {
+        const th = Math.random() * TAU
+        nx = Math.cos(th)
+        ny = Math.sin(th)
+        nz = 0
+      }
       if (em.sign) {
         // sign 非 0 的轴强制取正（半球发射）
         if (em.sign[0]) nx = Math.abs(nx) * Math.sign(em.sign[0])
         if (em.sign[1]) ny = Math.abs(ny) * Math.sign(em.sign[1])
         if (em.sign[2]) nz = Math.abs(nz) * Math.sign(em.sign[2])
       }
-      const r = rand(rmin, rmax)
+      // 半径：按维度均匀（Mirage RandomRadius：d 维内取 lerp(rmin^d,rmax^d) 再开 d 次方，
+      // 2D=面积均匀、3D=体积均匀）
+      const lo = Math.max(0, rmin), hi = Math.max(lo, rmax)
+      const r = lo === hi ? lo : Math.pow(lo**dims + Math.random()*(hi**dims - lo**dims), 1/dims)
       p.x = o[0] + nx * r * dir[0]
       p.y = o[1] + ny * r * dir[1]
       p.z = o[2] + nz * r * dir[2]
@@ -1212,20 +1245,27 @@ export class ParticleSystem {
     p.rotVelY *= speedMul
     p.rotVel *= speedMul
 
-    // 振荡相位/频率在生成时固化一次（每帧重取会导致抖动）
+    // 振荡参数在生成时固化一次（每帧重取会导致抖动）。官方每个激活轴/槽位各做
+    // 一次独立 Random（频率、幅度、相位三轴互不相关），相位区间是
+    // [phasemin, phasemax + TAU]（Mirage FrequencyValue::GenFrequency）。
     const O = this.ops
     if (O.oscPos) {
-      p.oscFreq = rand(O.oscPos.freqMin, O.oscPos.freqMax)
-      p.oscAmp = rand(O.oscPos.scaleMin, O.oscPos.scaleMax)
-      p.oscPhase = rand(O.oscPos.phaseMin, O.oscPos.phaseMax) + p.seed * TAU
+      for (let d = 0; d < 3; d++) {
+        if (!O.oscPos.mask[d]) continue
+        p.oscPFreq[d] = rand(O.oscPos.freqMin, O.oscPos.freqMax)
+        p.oscPAmp[d] = rand(O.oscPos.scaleMin, O.oscPos.scaleMax)
+        p.oscPPhase[d] = rand(O.oscPos.phaseMin, O.oscPos.phaseMax + TAU)
+      }
     }
     if (O.oscAlpha) {
       p.oscAFreq = rand(O.oscAlpha.freqMin, O.oscAlpha.freqMax)
-      p.oscAPhase = Math.random() * (O.oscAlpha.phaseMax || TAU)
+      p.oscAAmp = [O.oscAlpha.scaleMin, O.oscAlpha.scaleMax]
+      p.oscAPhase = rand(O.oscAlpha.phaseMin, O.oscAlpha.phaseMax + TAU)
     }
     if (O.oscSize) {
       p.oscSFreq = rand(O.oscSize.freqMin, O.oscSize.freqMax)
-      p.oscSPhase = Math.random() * (O.oscSize.phaseMax || TAU)
+      p.oscSAmp = [O.oscSize.scaleMin, O.oscSize.scaleMax]
+      p.oscSPhase = rand(O.oscSize.phaseMin, O.oscSize.phaseMax + TAU)
     }
     if (O.turbulence.length) {
       const t0 = O.turbulence[0]
@@ -1239,6 +1279,27 @@ export class ParticleSystem {
     }
     p.frameB = p.frame
     p.frameMix = 0
+
+    // 世界空间系统（flags bit0）：在**生成时**一次性把位置/速度/朝向变换到世界
+    // 坐标（官方 IsNew 分支 world_from_spawn_space），之后模拟与渲染都不再跟随
+    // 图层原点。eventfollow 子级此时 origin 已 _syncFollow 到父粒子当前世界位置，
+    // 所以每颗粒子出生在父粒子当时所在处 —— 旧粒子留在旧位置，rope 才能把
+    // 父粒子的波动历史连成冻结在世界里的波形（1425503532 Pac-Man 光束）。
+    if (this.worldSpace) {
+      const c = Math.cos(this.angleZ)
+      const s = Math.sin(this.angleZ)
+      const lx = p.x * this.scaleX
+      const ly = p.y * this.scaleY
+      p.x = this.originX + lx * c - ly * s
+      p.y = this.originY + lx * s + ly * c
+      const vx = p.vx * this.scaleX
+      const vy = p.vy * this.scaleY
+      p.vx = vx * c - vy * s
+      p.vy = vx * s + vy * c
+      p.vz = p.vz * (this.scaleZ || 1)
+      // 注意：精灵自转不加图层角——worldspace 几何整体跳过模型矩阵
+      // （官方只在 spawn 时旋位置/速度），加了会让非零 angles 的图层精灵偏转。
+    }
 
     p.bx = p.x
     p.by = p.y
@@ -1254,7 +1315,7 @@ export class ParticleSystem {
     }
 
     this._aliveCount++
-    // eventspawn 子级：父粒子**生成**即触发（位置 = 父粒子出生点，见 onParentEvent）
+    // eventspawn 子级：父粒子**生成**即触发（位置 = 父粒子出生点，见 onParentViewEvent）
     if (this._eventChildren.length) this._notifyChildren('spawn', p)
     return p
   }
@@ -1310,18 +1371,32 @@ export class ParticleSystem {
       p.vz += nv[2] * p.turbSpeed * t.mask[2] * dt
     }
 
-    // 控制点吸引/排斥（scale<0 = 排斥；threshold 是作用半径）
+    // 控制点吸引/排斥（scale<0 = 排斥）。官方公式（Mirage ParticleCompiler
+    // controlpointattract）：距离 < threshold 时加速度恒为 scale（沿归一化方向），
+    // 门限只是开关，力不随距离衰减；threshold<=0 = 全距离生效。
     for (const a of O.attract) {
-      const cp = this._cpPos(a.cp)
+      let cp = this._cpPos(a.cp)
       if (!cp) continue
+      if (this.worldSpace) {
+        // 世界空间系统里粒子坐标已是世界坐标，控制点偏移（局部）也要变换到世界
+        const w = this.localToWorld(cp[0] + (a.origin[0] || 0), cp[1] + (a.origin[1] || 0))
+        cp = [w[0], w[1], cp[2]]
+        const dx = cp[0] - p.x
+        const dy = cp[1] - p.y
+        const dist = Math.hypot(dx, dy)
+        if (dist < 1e-3) continue
+        if (a.threshold > 0 && dist >= a.threshold) continue
+        const f = (a.scale * dt) / dist
+        p.vx += dx * f
+        p.vy += dy * f
+        continue
+      }
       const dx = cp[0] + a.origin[0] - p.x
       const dy = cp[1] + a.origin[1] - p.y
       const dist = Math.hypot(dx, dy)
       if (dist < 1e-3) continue
-      if (a.threshold > 0 && dist > a.threshold) continue
-      // 力随距离衰减（1 - d/threshold），threshold 内平滑过渡到 0
-      const falloff = a.threshold > 0 ? 1 - dist / a.threshold : 1
-      const f = (a.scale * falloff * dt) / Math.max(1, dist)
+      if (a.threshold > 0 && dist >= a.threshold) continue
+      const f = (a.scale * dt) / dist
       p.vx += dx * f
       p.vy += dy * f
     }
@@ -1338,9 +1413,10 @@ export class ParticleSystem {
       // 音频门控（_step 每帧存 _audioLevel）：响度低时涡流停转
       const vK = v.audioMode ? audioGate(v.audioBounds, this._audioLevel || 0) : 1
       const speed = v.speedInner + (v.speedOuter - v.speedInner) * k
-      // 切向（绕 z 轴）
-      p.vx += (-dy / dist) * speed * dt * vK
-      p.vy += (dx / dist) * speed * dt * vK
+      // 切向（绕 z 轴）：方向 = -axis×radial（对齐官方/Mirage/open-wallpaper-engine；
+      // axis=(0,0,1) 时为 (dy,-dx)）
+      p.vx += (dy / dist) * speed * dt * vK
+      p.vy += (-dx / dist) * speed * dt * vK
     }
 
     // remapvalue：噪声重映射到速度/速率
@@ -1372,16 +1448,26 @@ export class ParticleSystem {
     p.rotY += p.rotVelY * dt
     p.rot += p.rotVel * dt
 
-    // 振荡位移叠加在基准位置上（不回写基准，否则与运动互相累加发散）
+    // 振荡位移叠加在基准位置上（不回写基准，否则与运动互相累加发散）。
+    // 官方 oscillateposition（Mirage ParticleCompiler）：时间基是粒子年龄；
+    // 频率字段直接是角频率 w（GetMove: del=-scale*w*sin(w*age+phase)*dt），
+    // 积分得 offset = scale*(cos(w*age+phase) - cos(phase))，age=0 时为 0；
+    // 三轴各自独立的频率/幅度/相位，mask[d]<0.01 的轴跳过。
     p.x = p.bx
     p.y = p.by
     p.z = p.bz
     if (O.oscPos) {
-      const ph = this.simTime * p.oscFreq * TAU + p.oscPhase
       const m = O.oscPos.mask
-      p.x += Math.sin(ph) * p.oscAmp * m[0]
-      p.y += Math.cos(ph) * p.oscAmp * m[1]
-      p.z += Math.sin(ph * 0.7) * p.oscAmp * m[2]
+      const age0 = p.age
+      for (let d = 0; d < 3; d++) {
+        if (!(m[d] >= 0.01)) continue
+        const w = p.oscPFreq[d]
+        const ph = w * age0 + p.oscPPhase[d]
+        const off = p.oscPAmp[d] * (Math.cos(ph) - Math.cos(p.oscPPhase[d]))
+        if (d === 0) p.x += off
+        else if (d === 1) p.y += off
+        else p.z += off
+      }
     }
 
     // --- 尺寸 ---
@@ -1393,11 +1479,9 @@ export class ParticleSystem {
       size *= sc.startValue + (sc.endValue - sc.startValue) * k
     }
     if (O.oscSize) {
-      const ph = this.simTime * p.oscSFreq * TAU + p.oscSPhase
-      const os = O.oscSize
-      const mid = (os.scaleMin + os.scaleMax) / 2
-      const amp = (os.scaleMax - os.scaleMin) / 2
-      size *= mid + Math.sin(ph) * amp
+      // 官方 GetScale：(cos(w*age+phase)+1)/2 在 scaleMin..scaleMax 间插值
+      const ph = p.oscSFreq * p.age + p.oscSPhase
+      size *= p.oscSAmp[0] + ((Math.cos(ph) + 1) * 0.5) * (p.oscSAmp[1] - p.oscSAmp[0])
     }
     p.size = size
 
@@ -1421,8 +1505,11 @@ export class ParticleSystem {
       const fo = O.alphaFade.fadeOut
       if (fi > 0 && lt < fi) a *= lt / fi
       if (fo < 1 && lt > fo) a *= Math.max(0, (1 - lt) / (1 - fo))
-    } else if (!O.alphaChange) {
-      // 无任何 alpha 算子时给一条温和的默认包络，避免粒子突然出现/消失
+    } else if (!O.alphaChange && !this.ropeRenderer) {
+      // 无任何 alpha 算子时给一条温和的默认包络，避免粒子突然出现/消失。
+      // rope 渲染器不走这条（官方 alpha 恒为初始值）：绳的新旧端淡入淡出完全由
+      // 贴图 v 渐变表达（v=0 亮端对新生点、v=1 透明端对最老点），自加包络会把
+      // 本该最亮的新生端（1425503532 Pac-Man 光束头）压暗，并让老端叠乘两次。
       if (lt < 0.1) a *= lt / 0.1
       else if (lt > 0.85) a *= (1 - lt) / 0.15
     }
@@ -1433,11 +1520,9 @@ export class ParticleSystem {
       a *= ac.startValue + (ac.endValue - ac.startValue) * k
     }
     if (O.oscAlpha) {
-      const ph = this.simTime * p.oscAFreq * TAU + p.oscAPhase
-      const oa = O.oscAlpha
-      const mid = (oa.scaleMin + oa.scaleMax) / 2
-      const amp = (oa.scaleMax - oa.scaleMin) / 2
-      a *= mid + Math.sin(ph) * amp
+      // 官方 GetScale：(cos(w*age+phase)+1)/2 在 scaleMin..scaleMax 间插值
+      const ph = p.oscAFreq * p.age + p.oscAPhase
+      a *= p.oscAAmp[0] + ((Math.cos(ph) + 1) * 0.5) * (p.oscAAmp[1] - p.oscAAmp[0])
     }
     p.alpha = Math.max(0, a)
 
@@ -1494,6 +1579,9 @@ export class ParticleSystem {
 
   advance(dt, audio) {
     if (this.paused || !this.visible) return
+    // instanceoverride.rate：仿真时间缩放（播放速率）。所有 spawn/算子/寿命都按仿真 dt 推进，
+    // 故 rate<1 时发射变慢、粒子墙钟寿命按 1/rate 拉长，稳态存活更多（对齐 Mirage）。
+    dt = dt * (this.timeScale === undefined ? 1 : Math.max(0, this.timeScale))
     this._syncFollow()
     // starttime 预热：首帧一次性快进，让场景一打开就有稳定的粒子分布
     if (!this._warmed) {
@@ -1570,7 +1658,7 @@ export class ParticleSystem {
           k = audioGate(em.audioBounds, level)
         }
         if (em.rate > 0) {
-          const rate = em.rate * k * (this._ov.rateMul !== undefined ? this._ov.rateMul : 1) * (this._ov.countMul !== undefined ? this._ov.countMul : 1)
+          const rate = em.rate * k * (this._ov.countMul !== undefined ? this._ov.countMul : 1)
           if (!(rate > 0)) continue
           em._accum = (em._accum || 0) + rate * dt
           let n = Math.floor(em._accum)
@@ -1587,10 +1675,9 @@ export class ParticleSystem {
         }
         continue
       }
-      // 发射率同时受 rate 与 count 两个倍率影响（见 _applyOverride 里 count 的说明）
+      // 发射率受 count 倍率影响；rate（instanceoverride）是仿真时间缩放，已作用于 dt
       const rate =
         em.rate *
-        (this._ov.rateMul !== undefined ? this._ov.rateMul : 1) *
         (this._ov.countMul !== undefined ? this._ov.countMul : 1)
       if (!(rate > 0)) continue
       // 累加器必须**按发射器各存一份**：低速发射器（如光轴 rate=0.3/s）每帧只累加
@@ -1673,9 +1760,7 @@ export class ParticleSystem {
       }
       return
     }
-    const mul =
-      (this._ov.rateMul !== undefined ? this._ov.rateMul : 1) *
-      (this._ov.countMul !== undefined ? this._ov.countMul : 1)
+    const mul = (this._ov.countMul !== undefined ? this._ov.countMul : 1)
     const rate = em.rate * mul
     if (!(rate > 0)) return
     b.accum = (b.accum || 0) + rate * dt
@@ -1715,27 +1800,31 @@ export class ParticleSystem {
     else for (let i = 0; i < pool.length; i++) if (pool[i].alive) live++
     if (live === 0 || (rope && live < 2)) return
 
-    const instCount = rope ? live - 1 : live * segs
+    // ropetrail/spritetrail/sprite：每颗粒子 1 个 quad；rope：相邻粒子连线 (live-1)
+    const instCount = rope ? live - 1 : live
     const need = instCount * STRIDE
     if (!this._data || this._data.length < need) this._data = new Float32Array(Math.max(need, 1024))
     const data = this._data
     let k = 0
 
     const bright = (this._ov.brightness || 1) * (this.overbright ?? 1)
-    const sysScale = this.sysScale
+    // 世界空间系统的位置/速度在 spawn 时已含图层 origin/scale/angle，渲染端只做
+    // 投影翻转（视差偏移仍整体生效）；尺寸也不再乘图层 scale（官方几何 size=p.size*0.5）。
+    const ws = this.worldSpace
+    const sysScale = ws ? 1 : this.sysScale
     // [we-scene patch] 官方公式下 size=100 对 50×50 帧自然得到 50px 宽（100×0.5），
     // 旧实现需要一条「80~120 → 帧长边百分比」的补偿 hack 才等价，已在 quad 映射里
     // 一次性解决（见 setTexture 的 texAspect）。此处只保留图层缩放。
     const sizePx = (s) => Math.abs(s) * sysScale
-    // 精灵形状 = 贴图宽高比 × 图层非等比 scale
-    const stretchX = this.spriteStretchX * (this.texAspectX || 1)
-    const stretchY = this.spriteStretchY * (this.texAspectY || 1)
-    const cos = Math.cos(this.angleZ)
-    const sin = Math.sin(this.angleZ)
-    const ox = this.originX + (this.parallaxX || 0)
-    const oy = this.originY + (this.parallaxY || 0)
-    const sx = this.scaleX
-    const sy = this.scaleY
+    // 精灵形状 = 贴图宽高比 × 图层非等比 scale（worldspace 不含图层 scale）
+    const stretchX = (ws ? 1 : this.spriteStretchX) * (this.texAspectX || 1)
+    const stretchY = (ws ? 1 : this.spriteStretchY) * (this.texAspectY || 1)
+    const cos = ws ? 1 : Math.cos(this.angleZ)
+    const sin = ws ? 0 : Math.sin(this.angleZ)
+    const ox = ws ? (this.parallaxX || 0) : this.originX + (this.parallaxX || 0)
+    const oy = ws ? (this.parallaxY || 0) : this.originY + (this.parallaxY || 0)
+    const sx = ws ? 1 : this.scaleX
+    const sy = ws ? 1 : this.scaleY
 
     // 局部 → 世界（含图层 origin/scale/angles），再 y 翻转到投影空间
     const toWorld = (lx, ly) => {
@@ -1785,101 +1874,54 @@ export class ParticleSystem {
         data[k++] = 0 // rotY
       }
     }
+    // ropetrail 与 spritetrail 同构：每颗粒子输出**一个沿当前速度方向**的 quad
+    // （官方 genericparticle 的 TRAILRENDERER → ComputeParticleTrailTangents 用
+    // velocity 算 right/up；不是沿历史折线的多个 quad）。长度因子：
+    //   ropetrail  factor = min(|v|·length, maxLength)（无 minLength）
+    //   spritetrail 同款（带 minLength 夹紧）
+    // 写一个 quad 实例（18 float）。width=横向像素，along=纵向拉伸倍数，
+    // vrange=段两端沿贴图 v 的取值
+    const emitQuad = (cx, cy, rot, width, along, v0, v1, p, frame) => {
+      data[k++] = cx; data[k++] = cy; data[k++] = 0
+      data[k++] = width
+      data[k++] = rot
+      data[k++] = p.r * bright
+      data[k++] = p.g * bright
+      data[k++] = p.b * bright
+      data[k++] = p.alpha
+      data[k++] = stretchX
+      data[k++] = along
+      data[k++] = frame
+      data[k++] = v0
+      data[k++] = v1
+      // 下一帧序号 + 帧间混合权重（官方 SPRITESHEETBLEND）
+      data[k++] = p.frameB === undefined ? p.frame : p.frameB
+      data[k++] = p.frameMix || 0
+      // 三轴旋转（rotX/rotY）必须透传，shader 据此建旋转基
+      data[k++] = p.rotX || 0
+      data[k++] = p.rotY || 0
+    }
+
     for (let i = 0; i < pool.length && !rope; i++) {
       const p = pool[i]
       if (!p.alive) continue
-      for (let s = 0; s < segs; s++) {
-        let lx = p.x
-        let ly = p.y
-        let segAlpha = 1
-        let segSize = 1
-        let rot = p.rot
-        let instStretchX = stretchX
-        let instStretchY = stretchY
-        let wx
-        let wy
-        if (trail && p.trail) {
-          lx = p.trail[s * 3]
-          ly = p.trail[s * 3 + 1]
-          // [we-scene patch 2026-09-21] 尾部**只收细，不再额外乘 alpha**。
-          // 官方 Rope Trail 渲染器的可调项只有 Length / Segments / Subdivision /
-          // UV scale / UV scrolling（见 docs/we-docs/particles-renderer.md），
-          // **没有「沿绳的 alpha 渐隐」这一项** —— 官方靠贴图自身的 v 渐变与粒子的
-          // alphafade 表达淡出（真实 WE 页面里 Rope Trail 的设置项也印证了这点）。
-          // 旧实现自加的 `segAlpha = 1 - t` 会与贴图 v 渐隐**叠乘**，把整条尾迹
-          // 压暗近一半：2464842912 两个车轮的 Magic Vortex（作者把颜色改成品红、
-          // size ×2、alpha 1.5）因此几乎看不见，用户报「车轮上没有灯光流动」。
-          const t = segs > 1 ? s / (segs - 1) : 0
-          segSize = 1 - t * 0.55
-          // 沿相邻历史点拉成丝：否则 length 秒的轨迹仍是一串分离的圆点
-          let tdx = 0
-          let tdy = 0
-          if (s + 1 < segs) {
-            tdx = p.trail[s * 3] - p.trail[(s + 1) * 3]
-            tdy = p.trail[s * 3 + 1] - p.trail[(s + 1) * 3 + 1]
-          } else if (s > 0) {
-            tdx = p.trail[(s - 1) * 3] - p.trail[s * 3]
-            tdy = p.trail[(s - 1) * 3 + 1] - p.trail[s * 3 + 1]
-          } else {
-            tdx = p.vx
-            tdy = p.vy
-          }
-          const w0 = toWorld(lx, ly)
-          const w1 = toWorld(lx - tdx, ly - tdy)
-          const dx = w0[0] - w1[0]
-          const dy = w0[1] - w1[1]
-          const dist = Math.hypot(dx, dy)
-          const base = Math.max(1e-3, sizePx(p.size) * segSize)
-          if (dist > 1e-3) {
-            rot = spriteTrailRotation(dx, dy)
-            // 精灵中心放在段中点，沿向拉伸盖住相邻采样点间距
-            wx = (w0[0] + w1[0]) * 0.5
-            wy = (w0[1] + w1[1]) * 0.5
-            instStretchY = Math.max(stretchY, dist / base)
-          } else {
-            wx = w0[0]
-            wy = w0[1]
-          }
-        } else {
-          const w = toWorld(lx, ly)
-          wx = w[0]
-          wy = w[1]
-        }
-        if (spriteTrail) {
-          const w = toWorld(p.x, p.y)
-          wx = w[0]
-          wy = w[1]
-          const w1 = toWorld(p.x + p.vx, p.y + p.vy)
-          rot = spriteTrailRotation(w1[0] - w[0], w1[1] - w[1])
-          const factor = spriteTrailLengthFactor(
-            Math.hypot(p.vx, p.vy),
-            spriteTrail.length,
-            spriteTrail.minLength,
-            spriteTrail.maxLength,
-          )
-          instStretchY = stretchY * factor
-        }
-        data[k++] = wx
-        data[k++] = wy
-        data[k++] = 0
-        data[k++] = sizePx(p.size) * segSize
-        data[k++] = rot
-        data[k++] = p.r * bright
-        data[k++] = p.g * bright
-        data[k++] = p.b * bright
-        data[k++] = p.alpha * segAlpha
-        // 非等比拉伸（光柱/雨丝/雾带靠它成形），在精灵局部空间应用于旋转前
-        data[k++] = instStretchX
-        data[k++] = instStretchY
-        data[k++] = p.frame
-        data[k++] = 0
-        data[k++] = 1
-        // 帧间混合：下一帧序号 + 权重（官方 SPRITESHEETBLEND）
-        data[k++] = p.frameB === undefined ? p.frame : p.frameB
-        data[k++] = p.frameMix || 0
-        // 官方 ComputeParticleTangents 的 x/y 旋转（spritetrail 由速度定姿态，恒 0）
-        data[k++] = p.rotX || 0
-        data[k++] = p.rotY || 0
+
+      // ropetrail 与 spritetrail 同构：每颗粒子一个沿当前速度的 quad。
+      // 长度因子 = clamp(|v|·length, ..., maxLength)（官方 ComputeParticleTrailTangents）；
+      // 不是沿 trail 历史折线展开多段。
+      if (trail || spriteTrail) {
+        const cfg = trail || spriteTrail
+        const c = toWorld(p.x, p.y)
+        const c2 = toWorld(p.x + p.vx, p.y + p.vy)
+        const dvx = c2[0] - c[0], dvy = c2[1] - c[1]
+        const w = sizePx(p.size)
+        const rot = spriteTrailRotation(dvx, dvy)
+        const factor = spriteTrailLengthFactor(
+          Math.hypot(p.vx, p.vy), cfg.length, cfg.minLength, cfg.maxLength)
+        emitQuad(c[0], c[1], rot, w, factor, 0, 1, p, p.frame)
+      } else {
+        const c = toWorld(p.x, p.y)
+        emitQuad(c[0], c[1], p.rot, sizePx(p.size), stretchY, 0, 1, p, p.frame)
       }
     }
 

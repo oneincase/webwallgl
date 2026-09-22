@@ -27,6 +27,7 @@ dist/
 
 # 本机引擎内置素材（WE 安装目录的 materials/**：贴图 + 法线；本地测试用，见 docs/COMPLIANCE.md）
 local-assets/
+article-promo.md
 
 # agent
 .v2c/

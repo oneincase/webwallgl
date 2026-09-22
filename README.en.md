@@ -4,7 +4,7 @@
 
 ## Introduction
 
-WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned.
+Make Wallpaper Engine great again!!! Congratulations — you've found a treasure. This is the most faithful, most feature-complete, and fastest-updated self-built Wallpaper Engine core on the web, implemented in pure TypeScript/JS. WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned. If your project uses this library, please give it a star — many thanks!
 
 - [GitHub repository](https://github.com/oneincase/webwallgl)
 - [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)

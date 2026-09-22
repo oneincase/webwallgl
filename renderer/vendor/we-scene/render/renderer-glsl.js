@@ -183,6 +183,14 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
         r = mix(A, r, opacity);
     }
     return r;
+}
+// [we-scene patch 3351179520] combo 替换会把 int 型 combo 值写成浮点字面量
+// （BLENDMODE → 0.0），GLSL ES 没有 float→int 隐式转换，circular_text 等
+// workshop shader 按 \`ApplyBlending(0.0, …)\` 调用会「no matching overloaded
+// function found」整条 pass 报废。加一个 float 重载转回 int：已有调用点
+// （int 字面量/uniform）仍精确命中原重载，不受影响。
+vec3 ApplyBlending(float mode, vec3 A, vec3 B, float opacity) {
+    return ApplyBlending(int(mode + 0.5), A, B, opacity);
 }`
 
 // [we-scene patch] 图层 colorBlendMode 走 shader 侧混合：把背景当纹理读进来，

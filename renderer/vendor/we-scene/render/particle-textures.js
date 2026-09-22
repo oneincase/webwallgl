@@ -238,6 +238,34 @@ function beam(w, h, coreWidth, fadeBoth, peak) {
 }
 
 /**
+ * `particle/beam/beam_1` 在 **additive** 材质下的真实形态（照 2464842912 内
+ * `materials/Beam.tex` 实测重建）：32×32、**黑底**、中心一条纵向贯穿的细线
+ * （中线 RGB=255、两侧 1px RGB=50）、**alpha 恒 255、无纵向渐隐**。
+ *
+ * additive 下黑色不贡献、只有亮线可见 → 贴在轮缘就是一条细光环。
+ * 旧 beam() 是「白 RGB + alpha 形状」（128×512 长条），在 additive(SRC_ALPHA,ONE)
+ * 下会按白色矩形整片加亮成白块，与素材完全不符。
+ */
+function beamLine(size) {
+  const s = size || 32
+  const rgba = new Uint8Array(s * s * 4)
+  // 真实 Beam.tex（32 宽，中心在 15.5）亮线落在 x=15
+  const mid = s === 32 ? 15 : (s / 2) | 0
+  for (let y = 0; y < s; y++) {
+    for (let x = 0; x < s; x++) {
+      const o = (y * s + x) * 4
+      // 中心线 255；左右各 1px 软边 50；其余黑
+      let v = 0
+      if (x === mid) v = 255
+      else if (x === mid - 1 || x === mid + 1) v = 50
+      rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v
+      rgba[o + 3] = 255
+    }
+  }
+  return { width: s, height: s, rgba }
+}
+
+/**
  * 原版 `particle/bubbles/bubble3` —— **照本机原版素材实测重建**。
  *
  * 原版：1024×1024 图集、**TEXS 64 帧**（每帧 128×128，8×8）、format 0、
@@ -2148,7 +2176,7 @@ const BUILDERS = {
   // 光束 / 光轴：纵向长条渐变。解析式梯度本就是这类贴图的真实形态
   // （WE 原素材也是纯梯度），程序化反而更干净。原生尺寸 64×256 → 生成 128×512。
   'particle/beam/beam_0': () => beam(128, 512, 0.46, true),
-  'particle/beam/beam_1': () => beam(128, 512, 0.34, true),
+  'particle/beam/beam_1': () => beamLine(32),
   'particle/beam/beam_2': () => beam(128, 512, 0.22, true),
   'particle/beam/beam_2_fade': () => beam(128, 512, 0.24, false),
   // [we-scene patch] light_shafts_* 全部按原版实测剖面重建（尺寸/横截面/纵截面逐个对齐，
@@ -2354,7 +2382,9 @@ export function buildBuiltinParticleTexture(name) {
 // 图集的格子边是帧边界不是精灵边；法线的 alpha 是折射蒙版，改它会让 REFRACT
 // 雨滴的形状/边缘变形。
 const RIM_SEALED = [
-  { re: /^particle\/(light|beam|fire)\//, band: 0.18 },
+  // beam_1 排除：它（照 2464842912 实测）是 additive 黑底亮线——形状在 **RGB**、
+  // alpha 恒 25、黑=不贡献，本就无方块边；封边反而把纵向贯穿亮线的两端 alpha 压0。
+  { re: /^particle\/(light|beam|fire)\/(?!beam_1)/, band: 0.18 },
   // bubble3 **排除**：它是原版那种「黑底 + 小气泡群」——形状在 **RGB**、alpha 恒 255、
   // 走 additive（黑=不贡献）。封边只压 alpha，对它毫无作用，却会把图集外圈 0.18 带宽
   // （1024² 上 ~184px，整个 frame 0）的 RGB 一起留着、alpha 归零 → 首帧整帧消失。

@@ -26,8 +26,8 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: "WebWallGL 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。",
-          en: "WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned.",
+          zh: "让 Wallpaper Engine 实现再次伟大！！！恭喜你发现宝藏，这是全网复刻程度最高，功能最强，更新最快的 Wallpaper Engine 自研核心库，纯 TypeScript/JS 实现。webwallgl 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。下游如果进行了库的引用，麻烦给个 star，非常感谢！",
+          en: "Make Wallpaper Engine great again!!! Congratulations — you've found a treasure. This is the most faithful, most feature-complete, and fastest-updated self-built Wallpaper Engine core on the web, implemented in pure TypeScript/JS. WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned. If your project uses this library, please give it a star — many thanks!",
         },
       },
       {

@@ -3103,8 +3103,16 @@ export function createRenderer(canvas, opts = {}) {
       contentW = layer.size[0]
       contentH = layer.size[1]
     } else {
-      contentW = texObj.width
-      contentH = texObj.height
+      // [we-scene patch 3351179520] 效果链 FBO 不能跟着**被绑定贴图**的像素尺寸走：
+      // 媒体封面层（1.3.16+ 把 $mediaThumbnail 真实封面绑成基础贴图）的封面图常常
+      // 只有 150×150，链 FBO 随之缩成 150²、圆裁/透视全在邮票里跑，合成时再拉伸回
+      // 层矩形 ⇒ 封面内容放大 4 倍以上（用户报「专辑封面异常大、还是方形的」）。
+      // WE 语义是链 FBO = 层矩形的世界像素：层有声明 size 就用 size×scale
+      // （与 layerModelMatrix 的 base.w/h 同源，合成 1:1 不缩放），没声明才回落贴图。
+      const dw = Math.round(Math.abs((layer.size && layer.size[0]) || 0) * Math.abs((layer.scale && layer.scale[0]) || 1))
+      const dh = Math.round(Math.abs((layer.size && layer.size[1]) || 0) * Math.abs((layer.scale && layer.scale[1]) || 1))
+      contentW = dw > 0 ? dw : texObj.width
+      contentH = dh > 0 ? dh : texObj.height
     }
     if (!isPuppet && texObj && layer.spriteSheet) {
       const fl = texObj.frames

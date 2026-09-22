@@ -154,7 +154,10 @@ const { evalObjectScript } = await import(path.join(ROOT, "renderer/vendor/we-sc
 
 // ---- 1. composeChildTransform 纯函数单元：旋转 + 缩放 + 平移全到位
 {
-  const parent = { origin: [100, 200, 0], scale: [2, 3, 1], angles: [0, 0, 90] }
+  // layer.angles 是**弧度**（scene.json 原生单位，官方 Node.cpp 明注；脚本 API
+  // 才用度、在沙箱桥转换）。90° 旋转的 JSON 值是 π/2 —— 曾按度解读，
+  // 3281559867 的 180°(3.1416) 父组把子层偏移只转了 3.14°。
+  const parent = { origin: [100, 200, 0], scale: [2, 3, 1], angles: [0, 0, Math.PI / 2] }
   const child = { origin: [10, 0, 5], scale: [2, 2, 1], angles: [0, 0, 0] }
   const w = composeChildTransform(parent, child, true)
   // 90° 旋转：[10,0] 先乘父 scale (2,3) → (20, 0)，再 90° 旋转 → (0, 20)，加父 origin (100, 200)
@@ -163,12 +166,12 @@ const { evalObjectScript } = await import(path.join(ROOT, "renderer/vendor/we-sc
   if (Math.abs(w.origin[2] - 5) > 1e-9) fail(`compose z=${w.origin[2]} 应=5`)
   if (Math.abs(w.scale[0] - 4) > 1e-9) fail(`compose scale.x=${w.scale[0]} 应=4`)
   if (Math.abs(w.scale[1] - 6) > 1e-9) fail(`compose scale.y=${w.scale[1]} 应=6`)
-  if (Math.abs(w.angles[2] - 90) > 1e-9) fail(`compose angles.z=${w.angles[2]} 应=90`)
+  if (Math.abs(w.angles[2] - Math.PI / 2) > 1e-9) fail(`compose angles.z=${w.angles[2]} 应=π/2`)
   // 渲染惰性纯容器：scale 不传播
   const w2 = composeChildTransform(parent, child, false)
   if (Math.abs(w2.scale[0] - 2) > 1e-9) fail(`惰性容器 scale.x=${w2.scale[0]} 应=2（不继承父 scale）`)
   if (Math.abs(w2.origin[0] - 100) > 1e-9) fail(`惰性容器 origin 仍应受父平移/旋转`)
-  if (errors.length === 0) console.log("  ✓ composeChildTransform 纯函数：旋转/缩放/z 继承/惰性容器全对")
+  if (errors.length === 0) console.log("  ✓ composeChildTransform 纯函数：旋转/缩放/z 继承/惰性容器全对（弧度）")
 }
 
 // ---- 2. 库级一致性：静态场景上 recompose(全部) == parse 的 world
