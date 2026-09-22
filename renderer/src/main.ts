@@ -29,7 +29,7 @@ import {
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
 import { normalizeQuality, qualityFromQuery, type QualityOptions, type ResolvedQuality } from "./quality";
-import { weShimCall, weShimSend } from "./web";
+import { weShimCall, weShimSend, webSetMedia } from "./web";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 
 // ---- 滤镜（beta）----
@@ -224,6 +224,24 @@ declare global {
       capture(maxWidth?: number): string | null;
       /** 回读当前生效的用户属性值表（扁平 `{name: value}`）。无场景时返回 null */
       getProperties(): Record<string, unknown> | null;
+      /**
+       * 运行时状态快照（宿主心跳用）：网页壁纸很多没有 rAF 帧打点
+       * （setTimeout 主循环 / 纯静态页），`__wpStats.frame()` 的 fps 恒为 0 ——
+       * 此时「iframe 已 load」才是可靠的「壁纸已就绪」信号。
+       * 非网页类型返回 iframeLoaded: null。
+       */
+      getState(): {
+        type: string | null;
+        iframeLoaded: boolean | null;
+        webError: string | null;
+        paused: boolean;
+      };
+      /**
+       * 媒体集成（Now Playing）：宿主推系统正在播放的信息（普通 wire 对象；
+       * 封面走 `thumbnail` —— data URL 或同源 URL）。传 null 停止。
+       * 字段见 MediaSourceInit；未知字段忽略。
+       */
+      setMedia(init: Record<string, unknown> | null): void;
     };
     /**
      * 运行时观测面（只读）。宿主 / 测试台轮询取真实帧率：
@@ -432,6 +450,18 @@ window.__wp = {
   // （改完读回确认，以及面板初始化时拿到场景快照值而非 project.json 默认值）。
   getProperties() {
     return rt.liveUserProps ? { ...rt.liveUserProps } : null;
+  },
+  setMedia(init: Record<string, unknown> | null) {
+    webSetMedia(rt, init);
+  },
+  getState() {
+    const st = (rt as unknown as { webState?: { loaded: boolean; error: string | null } }).webState;
+    return {
+      type: rt.cfg?.type ?? null,
+      iframeLoaded: st ? st.loaded : null,
+      webError: st ? st.error : null,
+      paused: rt.paused === true,
+    };
   },
 };
 

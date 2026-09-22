@@ -1467,6 +1467,18 @@
           case "pointerLeave":
             if (w.__wePointerLeave) w.__wePointerLeave();
             break;
+          case "audio":
+            // 宿主下发的量化音频快照（0-255 整数，~20fps）：还原成 0..1 浮点后
+            // 喂给既有的 __wePushAudio（与同源直调路径落到同一实现）。
+            if (w.__wePushAudio && d.a) {
+              var arr = new Array(d.a.length);
+              for (var ai = 0; ai < d.a.length; ai++) arr[ai] = (Number(d.a[ai]) || 0) / 255;
+              w.__wePushAudio(arr);
+            }
+            break;
+          case "media":
+            if (w.__wePushMedia && d.ev) w.__wePushMedia(d.ev);
+            break;
           case "wheel":
             if (w.__wePushWheel) {
               w.__wePushWheel(

@@ -11,6 +11,7 @@ import type { WallpaperConfig } from "./types";
 import { startLiveSystem, type LiveSystemHandle } from "./live-system";
 import { audioMod, media as mediaMod } from "./vendor";
 import { entryDirUrl, hasBlockingCsp, rewriteHtml } from "./web-rewrite";
+import { createMediaSource } from "./api/media-source";
 import shimSource from "./web-shim.js?raw";
 
 export function weShimCall(rt: Runtime, call: (win: any) => void) {
@@ -71,6 +72,65 @@ export function weShimSend(rt: Runtime, op: string, payload?: Record<string, unk
     f.contentWindow?.postMessage({ __we: 1, op, ...(payload ?? {}) }, "*");
   } catch {
     /* ignore */
+  }
+}
+
+/** 向 shim 直接投递一条 postMessage（跨源控制的公共出口）。 */
+function postToShim(rt: Runtime, op: string, payload: Record<string, unknown>) {
+  try {
+    (rt.iframe as HTMLIFrameElement | null)?.contentWindow?.postMessage({ __we: 1, op, ...payload }, "*");
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 音频快照推送。同源直调 `__wePushAudio`（WallpaperEM 路径，零开销）；严格沙箱
+ * （跨源）下改走 postMessage —— 但每帧序列化 128 个浮点太贵，故降频到 ~20fps
+ * 并量化成 0-255 整数（观感无差，载荷缩到整数且更小）。壁纸音频条对 20fps 的
+ * 包络更新无感，60fps 下省下的是每帧一次 structured clone。
+ */
+let webAudioLastPost = 0;
+function pushWebAudio(rt: Runtime, arr: Float32Array | number[]) {
+  if ((rt as any).webBridge !== "post") {
+    weShimCall(rt, (w) => w.__wePushAudio?.(arr));
+    return;
+  }
+  const now = performance.now();
+  if (now - webAudioLastPost < 50) return;
+  webAudioLastPost = now;
+  const a = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    const v = Number((arr as any)[i]) || 0;
+    a[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
+  }
+  postToShim(rt, "audio", { a });
+}
+
+/** 媒体事件推送（仅变化时调用，载荷小，跨源直接 postMessage）。 */
+function pushWebMedia(rt: Runtime, ev: Record<string, unknown>) {
+  if ((rt as any).webBridge === "post") postToShim(rt, "media", { ev });
+  else weShimCall(rt, (w) => w.__wePushMedia?.(ev));
+}
+
+/**
+ * 媒体集成（Now Playing）：宿主经 `__wp.setMedia(wire)` 推进来**普通 wire 对象**
+ * （跨 iframe 只能结构化克隆，带方法的 MediaColor 实例传不过来），所以在渲染页这
+ * 一侧构造 `createMediaSource` → diff 出事件 → 经 pushWebMedia 推给网页壁纸的
+ * shim（严格沙箱下自动走 postMessage）。
+ */
+export function webSetMedia(rt: Runtime, init: Record<string, unknown> | null) {
+  try {
+    const src = createMediaSource((init ?? {}) as Parameters<typeof createMediaSource>[0]);
+    const snap = src.snapshot as unknown as Record<string, unknown>;
+    const prev = (rt as unknown as { webMediaSnap?: Record<string, unknown> }).webMediaSnap
+      ?? ({} as Record<string, unknown>);
+    (rt as unknown as { webMediaSnap?: Record<string, unknown> }).webMediaSnap = snap;
+    // 与上一快照 diff → status/properties/playback/timeline/thumbnail 逐项推送
+    //（内部即 pushWebMedia；跨源自动走 postMessage）。
+    pushMediaDiff(rt, prev, snap);
+  } catch {
+    /* wire 不合法：静默（壁纸退到自己静态态） */
   }
 }
 
@@ -522,6 +582,16 @@ function attachIframe(
     "sandbox",
     opts.strictSandbox ? "allow-scripts" : "allow-scripts allow-same-origin",
   );
+  // 跨源桥判定 + 就绪状态记录：宿主心跳读它（__wp.getState）。网页壁纸很多没有
+  // rAF 帧打点（setTimeout 主循环/纯静态），「iframe 已 load」才是可靠的就绪信号。
+  (rt as any).webBridge = opts.strictSandbox ? "post" : "direct";
+  (rt as any).webState = { loaded: false, error: null };
+  f.addEventListener("load", () => {
+    (rt as any).webState = { loaded: true, error: null };
+  });
+  f.addEventListener("error", () => {
+    (rt as any).webState = { loaded: false, error: "iframe load error" };
+  });
   f.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;border:none;background:transparent;";
   // 库形态画在非全屏容器时，容器需定位上下文
@@ -757,45 +827,39 @@ function pushMediaDiff(
   }>;
   for (const { name, event } of events) {
     if (name === "mediaStatusChanged") {
-      weShimCall(rt, (w) => w.__wePushMedia?.({ op: "status", enabled: !!(event as { enabled?: boolean }).enabled }));
+      pushWebMedia(rt, { op: "status", enabled: !!(event as { enabled?: boolean }).enabled });
     } else if (name === "mediaPropertiesChanged") {
-      weShimCall(rt, (w) =>
-        w.__wePushMedia?.({
-          op: "properties",
-          title: event.title ?? "",
-          artist: event.artist ?? "",
-          album: event.album ?? "",
-          albumArtist: event.albumArtist ?? "",
-        }),
-      );
+      pushWebMedia(rt, {
+        op: "properties",
+        title: event.title ?? "",
+        artist: event.artist ?? "",
+        album: event.album ?? "",
+        albumArtist: event.albumArtist ?? "",
+      });
     } else if (name === "mediaThumbnailChanged") {
       const thumb = thumbDataUrlFromSnap(snap as {
         thumbnail?: unknown;
         primaryColor?: { x?: number; y?: number; z?: number };
         secondaryColor?: { x?: number; y?: number; z?: number };
       });
-      weShimCall(rt, (w) =>
-        w.__wePushMedia?.({
-          op: "thumbnail",
-          thumbnail: thumb,
-          hasThumbnail: !!(event as { hasThumbnail?: boolean }).hasThumbnail || !!thumb,
-          primaryColor: vecToCss(event.primaryColor as { x?: number; y?: number; z?: number }),
-          secondaryColor: vecToCss(event.secondaryColor as { x?: number; y?: number; z?: number }),
-          tertiaryColor: vecToCss(event.tertiaryColor as { x?: number; y?: number; z?: number }),
-          textColor: vecToCss(event.textColor as { x?: number; y?: number; z?: number }),
-          highContrastColor: vecToCss(event.highContrastColor as { x?: number; y?: number; z?: number }),
-        }),
-      );
+      pushWebMedia(rt, {
+        op: "thumbnail",
+        thumbnail: thumb,
+        hasThumbnail: !!(event as { hasThumbnail?: boolean }).hasThumbnail || !!thumb,
+        primaryColor: vecToCss(event.primaryColor as { x?: number; y?: number; z?: number }),
+        secondaryColor: vecToCss(event.secondaryColor as { x?: number; y?: number; z?: number }),
+        tertiaryColor: vecToCss(event.tertiaryColor as { x?: number; y?: number; z?: number }),
+        textColor: vecToCss(event.textColor as { x?: number; y?: number; z?: number }),
+        highContrastColor: vecToCss(event.highContrastColor as { x?: number; y?: number; z?: number }),
+      });
     } else if (name === "mediaPlaybackChanged") {
-      weShimCall(rt, (w) => w.__wePushMedia?.({ op: "playback", state: Number(event.state) || 0 }));
+      pushWebMedia(rt, { op: "playback", state: Number(event.state) || 0 });
     } else if (name === "mediaTimelineChanged") {
-      weShimCall(rt, (w) =>
-        w.__wePushMedia?.({
-          op: "timeline",
-          position: Number(event.position) || 0,
-          duration: Number(event.duration) || 0,
-        }),
-      );
+      pushWebMedia(rt, {
+        op: "timeline",
+        position: Number(event.position) || 0,
+        duration: Number(event.duration) || 0,
+      });
     }
   }
   return mediaMod.cloneMediaSnapshot(snap) as Record<string, unknown>;
@@ -833,7 +897,7 @@ function startAudioPump(
       cur.tick?.(now);
       const snap = cur.snapshot();
       const arr = packWebAudioArrayInto(pumpBuffer, snap.left, snap.right);
-      weShimCall(rt, (w) => w.__wePushAudio?.(arr));
+      pushWebAudio(rt, arr);
       // 作者用 setTimeout 主循环时 shim 收不到 rAF we-frame（1748506393 FPS 为 `-`）
       if (frameClock && now - frameClock.last > 200) markFrame(rt, now);
     } catch {
