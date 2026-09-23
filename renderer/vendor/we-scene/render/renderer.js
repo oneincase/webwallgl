@@ -2,7 +2,7 @@ import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4Ro
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
@@ -541,6 +541,12 @@ export function compositeSourcePlacement(srcSize, srcScale, sw, sh, k) {
 export function createRenderer(canvas, opts = {}) {
   const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, antialias: false, alpha: false, preserveDrawingBuffer: true })
   if (!gl) throw new Error('当前浏览器不支持 WebGL2')
+  // [we-scene patch] 浮点颜色附件（HDR RGBA16F 场景目标、流体 r16f/rg16f）。
+  // 桌面 ANGLE 一般默认可渲染到半浮点，显式请求 color_buffer_float 兜底；
+  // 移动端只支持 half_float 扩展时由浏览器自行决定，缺失则 HDR 回退风险在 ensureHdrTarget。
+  gl.getExtension('EXT_color_buffer_float')
+  gl.getExtension('EXT_color_buffer_half_float')
+  gl.getExtension('OES_texture_float_linear')
   const shaderResolver = opts.shaderResolver || (async () => null)
   const diag = opts.diag || (() => {})
   // [we-scene patch] 视频帧中转离屏 canvas（video→GL 直传在部分 WebView 受限，用 drawImage 中转更稳）
@@ -572,6 +578,12 @@ export function createRenderer(canvas, opts = {}) {
   // 结构：{ fbo, rbo, width, height, samples }；null = 未建/关闭。
   let msaaTarget = null
   let msaaDiagDone = false
+  // [we-scene patch] HDR 场景目标（general.hdr=true）。场景/粒子/效果先画进
+  // RGBA16F（加法叠加可 >1.0），bloom 在其上跑，帧末 tonemap 回 SDR 画布。
+  // 帧作用域：每帧 renderScene 开头按 hdr 旗标激活，SDR 场景恒为 null（零路径差）。
+  let hdrSceneFbo = null
+  let hdrActive = false
+  let hdrDiagDone = false
   function msaaSampleCount() {
     if (aaMode === 'msaa2') return 2
     if (aaMode === 'msaa4') return 4
@@ -581,7 +593,29 @@ export function createRenderer(canvas, opts = {}) {
   // 帧内所有「画到画布」的位置一律走 bindFinal()，不能写死 null —— 否则 MSAA
   // 开启时那部分绘制会绕过多重采样直接上屏（resolve 后又盖掉，表现为闪烁/丢失）。
   function bindFinal() {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, msaaTarget ? msaaTarget.fbo : null)
+    // HDR：场景画进 fp16 目标；MSAA 开 = 多重采样 FBO；否则默认画布。
+    gl.bindFramebuffer(gl.FRAMEBUFFER, hdrActive ? hdrSceneFbo.fbo : (msaaTarget ? msaaTarget.fbo : null))
+  }
+  // 取得/复用 HDR 场景 FBO（RGBA16F，CLAMP 边缘、LINEAR）。
+  function ensureHdrTarget(width, height) {
+    if (hdrSceneFbo && hdrSceneFbo.width === width && hdrSceneFbo.height === height) return hdrSceneFbo
+    if (hdrSceneFbo) {
+      gl.deleteFramebuffer(hdrSceneFbo.fbo)
+      gl.deleteTexture(hdrSceneFbo.tex)
+    }
+    const fbo = gl.createFramebuffer()
+    const tex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, width, height, 0, gl.RGBA, gl.HALF_FLOAT, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    hdrSceneFbo = { fbo, tex, width, height }
+    return hdrSceneFbo
   }
   // 粒子系统（particles.js）绘制自己绑帧缓冲，经返回对象的 getFrameTarget 取同一目标。
   function ensureMsaaTarget(width, height) {
@@ -752,6 +786,8 @@ export function createRenderer(canvas, opts = {}) {
   const compBlendProg = linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG)
   // [we-scene patch] FXAA 抗锯齿（aaMode='fxaa' 时帧末执行，见 renderScene 末尾）
   const fxaaProg = linkProgram(gl, COPY_VERT, FXAA_FRAG)
+  // [we-scene patch] HDR 色调映射（general.hdr=true 时把 fp16 场景目标映射回 SDR 画布）
+  const tonemapProg = linkProgram(gl, COPY_VERT, TONEMAP_FRAG)
 
   const vao = gl.createVertexArray()
   gl.bindVertexArray(vao)
@@ -774,6 +810,7 @@ export function createRenderer(canvas, opts = {}) {
   const FBO_FORMATS = {
     rgba8888: { ifmt: gl.RGBA8, fmt: gl.RGBA, type: gl.UNSIGNED_BYTE },
     rgba_backbuffer: { ifmt: gl.RGBA8, fmt: gl.RGBA, type: gl.UNSIGNED_BYTE },
+    rgba161616f: { ifmt: gl.RGBA16F, fmt: gl.RGBA, type: gl.HALF_FLOAT },
     r16f: { ifmt: gl.R16F, fmt: gl.RED, type: gl.HALF_FLOAT },
     rg1616f: { ifmt: gl.RG16F, fmt: gl.RG, type: gl.HALF_FLOAT },
   }
@@ -1660,6 +1697,10 @@ export function createRenderer(canvas, opts = {}) {
     tex: gl.getUniformLocation(fxaaProg, 'u_Tex'),
     texel: gl.getUniformLocation(fxaaProg, 'u_Texel'),
   }
+  const tonemapUni = {
+    mvp: gl.getUniformLocation(tonemapProg, 'u_MVP'),
+    tex: gl.getUniformLocation(tonemapProg, 'u_Tex'),
+  }
   const IDENT_M4 = mat4Identity()
   const IDENT_M3 = mat3Identity()
   function setBlend(mode) {
@@ -2159,6 +2200,12 @@ export function createRenderer(canvas, opts = {}) {
     if (groupTarget) {
       return groupTarget.fbo.tex
     }
+    // [we-scene patch] HDR：直接返回 fp16 场景纹理（copyTexImage2D 只吃
+    // 画布、且会把 >1 的高光截断到 8bit）。passthrough/REFRACT/效果链回读
+    // 在 HDR 下都取这张未色调映射的场。
+    if (hdrActive && hdrSceneFbo) {
+      return hdrSceneFbo.tex
+    }
     // [we-scene patch] MSAA 分支：copyTexImage2D 不能读多重采样缓冲
     // （INVALID_OPERATION），先把当前内容 blit resolve 到一块普通 FBO 再返回其纹理。
     // 语义与下方画布回读完全一致（调用方只关心「当前已绘制内容」这张纹理）。
@@ -2200,8 +2247,11 @@ export function createRenderer(canvas, opts = {}) {
     const sceneTex = captureBackdrop(width, height)
     const bw = Math.max(1, Math.round(width / 4))
     const bh = Math.max(1, Math.round(height / 4))
-    const bufA = getFBO(bw, bh, 'bloomA')
-    const bufB = getFBO(bw, bh, 'bloomB')
+    // HDR：亮部/模糊缓冲也用 fp16（>1 的能量不被 8bit 截断），bloom 在
+    // 色调映射前累加；SDR 仍 RGBA8，行为不变。
+    const bufFmt = hdrActive ? 'rgba161616f' : undefined
+    const bufA = getFBO(bw, bh, 'bloomA', bufFmt)
+    const bufB = getFBO(bw, bh, 'bloomB', bufFmt)
     gl.bindVertexArray(vao)
     uploadQuad('pass', PASS_QUAD)
     gl.activeTexture(gl.TEXTURE0)
@@ -2237,9 +2287,10 @@ export function createRenderer(canvas, opts = {}) {
     }
     blurPass(bufA, bufB, 1, 0)
     blurPass(bufB, bufA, 0, 1)
-    // 3) apply：Add（ApplyBlending 31）加回画布。ONE/ONE 只加 rgb，alpha +0。
+    // 3) apply：Add（ApplyBlending 31）加回场景。ONE/ONE 只加 rgb，alpha +0。
+    // HDR：加进 fp16 场景目标（>1 不截断），帧末再 tonemap；SDR 加回画布。
     gl.useProgram(bloomApplyProg)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, hdrActive && hdrSceneFbo ? hdrSceneFbo.fbo : null)
     gl.viewport(0, 0, width, height)
     gl.enable(gl.BLEND)
     gl.blendFunc(gl.ONE, gl.ONE)
@@ -2254,11 +2305,11 @@ export function createRenderer(canvas, opts = {}) {
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
     bloomFrameCount++
     if (bloomFrameCount === 1 || bloomFrameCount === 120 || bloomFrameCount === 600) {
-      const px = new Uint8Array(4)
+      const px = hdrActive ? new Float32Array(4) : new Uint8Array(4)
       gl.bindFramebuffer(gl.FRAMEBUFFER, bufA.fbo)
-      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-      diag(`bloom frame ${bloomFrameCount}: center=[${[...px].join(",")}] glErr=${gl.getError()} threshold=${p.threshold} strength=${p.strength} metric=${p.metric}`)
+      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, hdrActive ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, px)
+      bindFinal()
+      diag(`bloom frame ${bloomFrameCount}: center=[${[...px].map((x) => +x.toFixed(3))}] glErr=${gl.getError()} threshold=${p.threshold} strength=${p.strength} metric=${p.metric} hdr=${hdrActive}`)
     }
   }
 
@@ -2361,13 +2412,23 @@ export function createRenderer(canvas, opts = {}) {
     renderWidth = width
     renderHeight = height
     fboStamp++
+    // [we-scene patch] HDR：general.hdr=true 时场景画进 fp16 目标（SDR 路径
+    // hdrActive 恒 false，下面所有 bindFinal/captureBackdrop/粒子目标零行为差）。
+    // HDR 与 MSAA 不叠加（fp16 多重采样兼容性差，HDR 壁纸一般不开 MSAA）。
+    hdrActive = !!(scene.general && (scene.general.hdr === true || (scene.general.hdr && scene.general.hdr.value === true)))
+    if (hdrActive) {
+      ensureHdrTarget(width, height)
+      msaaTarget = null
+    }
     // [we-scene patch] MSAA：尺寸/档位变化时重建多重采样目标，并把「最终绘制
     // 目标」切到它（aaMode=off 时 bindFinal 就是默认帧缓冲，零行为差）。
     // 必须在 clear 之前绑定 —— 否则清的是画布而画的是 MSAA 缓冲。
-    ensureMsaaTarget(width, height)
+    if (!hdrActive) ensureMsaaTarget(width, height)
     bindFinal()
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
+    // HDR 目标首帧不清零会残留上一场景；clearColor 作用于当前绑定的 HDR FBO。
+    if (!hdrDiagDone) { hdrDiagDone = true; if (hdrActive) diag(`hdr scene target: RGBA16F ${width}x${height}`) }
     // [we-scene patch] 场景环境光（g_LightAmbientColor）：材质 combos.LIGHTING=1
     // 的 genericimage* 层，官方 shader 做 color = albedo * g_LightAmbientColor
     // （无灯光直射项时）；g_LightAmbientColor = ambientcolor×π 封顶 1（口径见
@@ -2668,7 +2729,8 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] MSAA resolve：图层+camerafade 都画进了多重采样缓冲，
     // 这里解析回默认帧缓冲。之后的 bloom / FXAA 走的都是单采样画布路径，
     // 与 aaMode=off 完全一致（captureBackdrop 的 copyTexImage2D 也要求如此）。
-    resolveMsaa(width, height)
+    // HDR 没有 MSAA 目标（场景在 fp16 FBO），跳过；最后由 tonemap 落到画布。
+    if (!hdrActive) resolveMsaa(width, height)
     // [we-scene patch] 内置 Bloom 后期（general.bloom）。必须最后跑：它吃的是
     // 「本帧最终画面」（含 camerafade 幕布），与 WE 的整屏后期位置一致。
     // strength ≤ 0.001 时 WE 原 shader 三段全部直通/零输出，等价无 bloom。
@@ -2685,10 +2747,43 @@ export function createRenderer(canvas, opts = {}) {
     if (bloom && bloom.strength > 0.001) {
       applyBloomPost(bloom, width, height)
     }
+    // [we-scene patch] HDR combine/tonemap：把 fp16 场景（含 bloom 的 >1 高光）
+    // 映射回 SDR 默认画布。禁混合、全屏覆盖写；[0,1] 恒等，仅高光 rolloff。
+    // 必须在 bloom 之后、FXAA 之前（FXAA 吃已色调映射的 SDR 画面）。
+    if (hdrActive && hdrSceneFbo) {
+      gl.useProgram(tonemapProg)
+      gl.disable(gl.BLEND)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, width, height)
+      gl.bindVertexArray(vao)
+      uploadQuad('pass', PASS_QUAD)
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, hdrSceneFbo.tex)
+      gl.uniform1i(tonemapUni.tex, 0)
+      if (tonemapUni.mvp) gl.uniformMatrix4fv(tonemapUni.mvp, false, IDENT_M4)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
+    }
     // [we-scene patch] FXAA 抗锯齿：帧末最后一趟，吃「最终画面」（含 bloom）。
-    // captureBackdrop 拷出画布纹理 → 全屏 FXAA pass 覆盖写回（禁混合）。
+    // HDR 时画面已 tonemap 到默认画布，这里从画布直接回读（不能用 captureBackdrop，
+    // 那在 HDR 下返回未映射的 fp16 场）。
     if (aaMode === 'fxaa') {
-      const sceneTex = captureBackdrop(width, height)
+      let sceneTex
+      if (hdrActive) {
+        if (backdropTex === null) {
+          backdropTex = gl.createTexture()
+          gl.bindTexture(gl.TEXTURE_2D, backdropTex)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+        gl.bindTexture(gl.TEXTURE_2D, backdropTex)
+        gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, width, height, 0)
+        sceneTex = backdropTex
+      } else {
+        sceneTex = captureBackdrop(width, height)
+      }
       gl.useProgram(fxaaProg)
       gl.disable(gl.BLEND)
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
@@ -3657,6 +3752,7 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] 当前帧的「最终绘制目标」FBO（MSAA 开 = 多重采样 FBO，
     // 关 = null 即默认帧缓冲）。粒子系统自己绑帧缓冲，经这个出口拿同一目标。
     getFrameTarget: function () {
+      if (hdrActive && hdrSceneFbo) return hdrSceneFbo.fbo
       return msaaTarget ? msaaTarget.fbo : null
     },
     // [we-scene patch] 「当前已绘制内容」纹理捕获（REFRACT 粒子注入用）。

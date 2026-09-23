@@ -363,6 +363,26 @@ void main() {
 }`
 
 
+// [we-scene patch] HDR combine/tonemap（general.hdr=true）：把 fp16 场景目标
+// （加法效果/粒子可 >1.0）映射回 SDR 画布。[0,1] 区间**恒等**——HDR 壁纸的
+// 基础反照率与 SDR 像素一致，只有超过白点的能量做色相保持的高光 rolloff
+// （max 通道映射到 1，其余按比例），避免直接硬裁切丢色/冲白。alpha 直通。
+const TONEMAP_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_UV;
+uniform sampler2D u_Tex;
+out vec4 fragColor;
+void main() {
+  vec4 src = texture(u_Tex, v_UV);
+  vec3 c = src.rgb;
+  float m = max(c.r, max(c.g, c.b));
+  if (m > 1.0) {
+    c /= 1.0 + (m - 1.0);
+  }
+  fragColor = vec4(c, src.a);
+}`
+
+
 const COPY_VERT = `#version 300 es
 in vec3 a_Position;
 in vec2 a_TexCoord;
@@ -529,4 +549,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }

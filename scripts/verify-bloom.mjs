@@ -123,9 +123,16 @@ console.log('\n[3] 接线：renderScene 尾部挂后期 + 缓冲 1/4 分辨率 +
   check(/applyBloomPost\(bloom, width, height\)/.test(rd), '门控通过时调用 applyBloomPost')
   check(/bloom post: on strength=/.test(rd), '一次性诊断输出 bloom 参数（HDR 无效果时的定位入口）')
   check(/Math\.round\(width \/ 4\)/.test(rd), 'bloom 缓冲 1/4 分辨率（effect.json scale:4）')
-  check(/'bloomA'\)/.test(rd) && /'bloomB'\)/.test(rd), 'bloomA/bloomB 独立 FBO（getFBO 按尺寸+tag 缓存）')
+  check(/'bloomA'[,\)]/.test(rd) && /'bloomB'[,\)]/.test(rd), 'bloomA/bloomB 独立 FBO（getFBO 按尺寸+tag 缓存；HDR 时第 4 参传 fp16 格式）')
   check(/gl\.blendFunc\(gl\.ONE, gl\.ONE\)/.test(rd), 'apply = Add（ONE/ONE 只加 rgb，alpha +0）')
   check(/const sceneTex = captureBackdrop\(width, height\)/.test(rd), '场景纹理复用 captureBackdrop 画布回读（不动主循环）')
+
+  // HDR 路径（general.hdr=true）：fp16 场景目标 + bloom 累加 + tonemap 回 SDR，
+  // SDR 场景 hdrActive 恒 false（零路径差）。
+  check(/hdrActive\s*=/.test(rd), 'HDR：每帧按 general.hdr 旗标激活（SDR 恒 false）')
+  check(/gl\.RGBA16F/.test(rd) && /ensureHdrTarget/.test(rd), 'HDR：场景画进 RGBA16F 目标')
+  check(/hdrActive\s*&&\s*hdrSceneFbo\s*\?\s*hdrSceneFbo\.fbo/.test(rd), 'HDR：bloom apply 累加进 fp16 而非画布')
+  check(/tonemapProg/.test(rd) && /m\s*>\s*1\.0/.test(fs.readFileSync(join(ROOT, 'renderer/vendor/we-scene/render/renderer-glsl.js'), 'utf8')), 'HDR：帧末 tonemap，[0,1] 恒等、>1 高光 rolloff')
 
   const mount = fs.readFileSync(join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
   check(
