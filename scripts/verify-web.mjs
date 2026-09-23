@@ -1858,6 +1858,26 @@ function runShim(extras) {
   check(!/pushMediaDiff\(rt, lastMedia, driver\.snapshot\)/.test(mediaPump),
     "startMediaPump 取快照必须用逐帧选出的 driver，不能混用装配期的那个");
 
+  // --- 宿主 wire 必须是**唯一**的媒体源：存档到 rt.mediaSource + 与泵共用 diff 记录 ---
+  // 实测回归（dsh-wallpaper-engine 的浏览器 e2e 抓到）：webSetMedia 原来把快照存在
+  // 自己私有的字段上、直接推 diff，而媒体泵另有自己一份记录在推内置模拟源 —— 属性 /
+  // 封面 / 播放态宿主的值能赢（模拟源那几项相对自己的上一帧没变，不推），但**进度 /
+  // 时长被模拟源覆盖**：宿主推 position=5 duration=100，壁纸实际收到 3.1,212 → 6.1,212
+  // （212 是模拟源首曲的时长）。根因是 wire 这条路径没遵守 shell.ts 里写明的约定
+  //（scene 与 web 两条装配路径读同一个 rt.mediaSource）。
+  const setMediaBody = bodyOf("webSetMedia");
+  check(setMediaBody.length > 0, "找不到 webSetMedia 函数体");
+  check(/rt\.mediaSource\s*=/.test(setMediaBody),
+    "webSetMedia 必须把宿主源存档到 rt.mediaSource（不存档 = 泵继续推模拟源，时间轴打架）");
+  check(/webMediaState\(rt\)/.test(setMediaBody),
+    "webSetMedia 必须与媒体泵共用同一份 diff 记录（各自记一份 = 同一路媒体推两套时间轴）");
+  check(/webMediaState\(rt\)/.test(mediaPump) && !/let lastMedia/.test(mediaPump),
+    "startMediaPump 必须用共享的 diff 记录，不得再留私有的 lastMedia");
+  check(!/webMediaSnap/.test(webTs),
+    "不得再留 webSetMedia 私有的快照字段（它与泵的记录会互相打架）");
+  check(/hasMedia/.test(setMediaBody) && /mediaDisabled = false/.test(setMediaBody),
+    "webSetMedia 必须按 hasMedia 决定存档还是落回模拟源，并清掉显式禁用标记");
+
   // --- 行为面：抽真函数执行 ---
   const at = webTs.indexOf("function bridgeAudioDriver");
   const end = webTs.indexOf("\n}", at) + 2;

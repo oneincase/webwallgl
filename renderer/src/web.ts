@@ -114,21 +114,46 @@ function pushWebMedia(rt: Runtime, ev: Record<string, unknown>) {
 }
 
 /**
+ * 宿主 wire 的 diff 记录。
+ *
+ * **泵与 setMedia 必须共用这一份**：两边各自记一份的话，同一路媒体会被 diff 两次，
+ * 壁纸收到两套互相打架的时间轴 —— 实测症状是宿主推 `position=5 duration=100`，
+ * 壁纸收到的却是 `3.1,212` / `6.2,212`（212 是内置模拟源首曲的时长）：属性/封面/
+ * 播放态宿主的值能赢（模拟源那几项相对自己的上一帧没变，不推），但进度每秒都在变，
+ * 模拟源就一直在推。共用一份后「谁在供数」是唯一的，泵也不能再推自己那份。
+ */
+type WebMediaState = { last: Record<string, unknown> | null };
+
+function webMediaState(rt: Runtime): WebMediaState {
+  const holder = rt as unknown as { webMediaState?: WebMediaState };
+  return (holder.webMediaState ??= { last: null });
+}
+
+/**
  * 媒体集成（Now Playing）：宿主经 `__wp.setMedia(wire)` 推进来**普通 wire 对象**
  * （跨 iframe 只能结构化克隆，带方法的 MediaColor 实例传不过来），所以在渲染页这
  * 一侧构造 `createMediaSource` → diff 出事件 → 经 pushWebMedia 推给网页壁纸的
  * shim（严格沙箱下自动走 postMessage）。
+ *
+ * **同时把源存档到 `rt.mediaSource`** —— 这是 shell.ts 里写明的约定（scene 与 web
+ * 两条装配路径读同一个引用）。存档之后 startMediaPump 的逐帧 pick() 拿到的是宿主
+ * 源，内置模拟源自动让位：模拟源只在「宿主没说有媒体」时出场（与库文档的
+ * `setMedia(null)` = 回落模拟源一致，预览里壁纸仍有在放歌的观感）。
+ * 此前只写一份自己的快照、不存档，于是模拟源继续按 200ms 推 timeline。
  */
 export function webSetMedia(rt: Runtime, init: Record<string, unknown> | null) {
   try {
     const src = createMediaSource((init ?? {}) as Parameters<typeof createMediaSource>[0]);
     const snap = src.snapshot as unknown as Record<string, unknown>;
-    const prev = (rt as unknown as { webMediaSnap?: Record<string, unknown> }).webMediaSnap
-      ?? ({} as Record<string, unknown>);
-    (rt as unknown as { webMediaSnap?: Record<string, unknown> }).webMediaSnap = snap;
-    // 与上一快照 diff → status/properties/playback/timeline/thumbnail 逐项推送
-    //（内部即 pushWebMedia；跨源自动走 postMessage）。
-    pushMediaDiff(rt, prev, snap);
+    // hasMedia=false（宿主明确「现在没有媒体」）时存 null，落回模拟源；
+    // 有媒体则存档，泵随即以宿主为准。
+    rt.mediaSource = (snap.hasMedia as boolean)
+      ? (src as unknown as NonNullable<Runtime["mediaSource"]>)
+      : null;
+    rt.mediaDisabled = false;
+    // 立即推一次（泵 200ms 才跑一拍），与泵共用同一份 diff 记录。
+    const st = webMediaState(rt);
+    st.last = pushMediaDiff(rt, st.last, snap);
   } catch {
     /* wire 不合法：静默（壁纸退到自己静态态） */
   }
@@ -923,8 +948,12 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
   // 与音频泵同理：setMedia() 常在 mount() 之后才调用，装配期定死 driver
   // 会让后装的 Now Playing 源永远推不进 iframe。逐帧选当前生效的那个。
   const pick = (): WebMediaDriver => (rt.mediaSource as WebMediaDriver | null) ?? driver;
+  // diff 记录与 webSetMedia 共用一份（见 WebMediaState 的说明）；泵每次装配时
+  // 清空一次：换壁纸是新 iframe、shim 里没有上一帧，必须从「null → 当前快照」
+  // 重新全量推一遍，否则新壁纸拿不到初始的媒体状态。
+  const state = webMediaState(rt);
+  state.last = null;
   let raf = 0;
-  let lastMedia: Record<string, unknown> | null = null;
   let lastTick = 0;
   const tick = (now: number) => {
     raf = requestAnimationFrame(tick);
@@ -935,7 +964,7 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
       const cur = pick();
       // update 在宿主注入源上是可选的（外部事件驱动的实现不需要按帧推进）
       cur.update?.(now / 1000);
-      lastMedia = pushMediaDiff(rt, lastMedia, cur.snapshot);
+      state.last = pushMediaDiff(rt, state.last, cur.snapshot);
     } catch {
       /* 忽略单帧失败 */
     }
