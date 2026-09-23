@@ -121,12 +121,30 @@ function pushWebMedia(rt: Runtime, ev: Record<string, unknown>) {
  * 壁纸收到的却是 `3.1,212` / `6.2,212`（212 是内置模拟源首曲的时长）：属性/封面/
  * 播放态宿主的值能赢（模拟源那几项相对自己的上一帧没变，不推），但进度每秒都在变，
  * 模拟源就一直在推。共用一份后「谁在供数」是唯一的，泵也不能再推自己那份。
+ *
+ * `host` 记的是「上一帧是谁供的」：换源时必须把记录清空 —— 新源并不知道壁纸先前
+ * 听过什么，若沿用旧记录，「两边恰好相同」的字段就不会再推。实测踩到过：演示源
+ * 先推了 `state=1`，宿主随后推的也是 `state=1`，于是**播放态事件永远没发出去**
+ *（壁纸的 mediaPlayback 监听器一次都没触发，`mstate=null`）。
  */
-type WebMediaState = { last: Record<string, unknown> | null };
+type WebMediaState = { last: Record<string, unknown> | null; host: boolean };
 
 function webMediaState(rt: Runtime): WebMediaState {
   const holder = rt as unknown as { webMediaState?: WebMediaState };
-  return (holder.webMediaState ??= { last: null });
+  return (holder.webMediaState ??= { last: null, host: false });
+}
+
+/**
+ * 推一次媒体 diff。`isHost` = 这一帧是不是宿主 wire 供的（false = 内置模拟源）。
+ * 换源先清空记录 → 新源的第一帧是全量推送。
+ */
+function pushMediaDiffFrom(rt: Runtime, isHost: boolean, snap: Record<string, unknown>): void {
+  const st = webMediaState(rt);
+  if (st.host !== isHost) {
+    st.host = isHost;
+    st.last = null;
+  }
+  st.last = pushMediaDiff(rt, st.last, snap);
 }
 
 /**
@@ -151,9 +169,8 @@ export function webSetMedia(rt: Runtime, init: Record<string, unknown> | null) {
       ? (src as unknown as NonNullable<Runtime["mediaSource"]>)
       : null;
     rt.mediaDisabled = false;
-    // 立即推一次（泵 200ms 才跑一拍），与泵共用同一份 diff 记录。
-    const st = webMediaState(rt);
-    st.last = pushMediaDiff(rt, st.last, snap);
+    // 立即推一次（泵 200ms 才跑一拍），与泵共用同一份 diff 记录（换源会全量推）。
+    pushMediaDiffFrom(rt, true, snap);
   } catch {
     /* wire 不合法：静默（壁纸退到自己静态态） */
   }
@@ -950,7 +967,8 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
   const pick = (): WebMediaDriver => (rt.mediaSource as WebMediaDriver | null) ?? driver;
   // diff 记录与 webSetMedia 共用一份（见 WebMediaState 的说明）；泵每次装配时
   // 清空一次：换壁纸是新 iframe、shim 里没有上一帧，必须从「null → 当前快照」
-  // 重新全量推一遍，否则新壁纸拿不到初始的媒体状态。
+  // 重新全量推一遍，否则新壁纸拿不到初始的媒体状态。换源（模拟 ↔ 宿主）由
+  // pushMediaDiffFrom 自己识别并再清一次。
   const state = webMediaState(rt);
   state.last = null;
   let raf = 0;
@@ -964,7 +982,7 @@ function startMediaPump(rt: Runtime, driver: WebMediaDriver | null) {
       const cur = pick();
       // update 在宿主注入源上是可选的（外部事件驱动的实现不需要按帧推进）
       cur.update?.(now / 1000);
-      state.last = pushMediaDiff(rt, state.last, cur.snapshot);
+      pushMediaDiffFrom(rt, cur !== driver, cur.snapshot);
     } catch {
       /* 忽略单帧失败 */
     }

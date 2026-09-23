@@ -1869,12 +1869,17 @@ function runShim(extras) {
   check(setMediaBody.length > 0, "找不到 webSetMedia 函数体");
   check(/rt\.mediaSource\s*=/.test(setMediaBody),
     "webSetMedia 必须把宿主源存档到 rt.mediaSource（不存档 = 泵继续推模拟源，时间轴打架）");
-  check(/webMediaState\(rt\)/.test(setMediaBody),
-    "webSetMedia 必须与媒体泵共用同一份 diff 记录（各自记一份 = 同一路媒体推两套时间轴）");
-  check(/webMediaState\(rt\)/.test(mediaPump) && !/let lastMedia/.test(mediaPump),
-    "startMediaPump 必须用共享的 diff 记录，不得再留私有的 lastMedia");
+  check(/pushMediaDiffFrom\(rt, true, snap\)/.test(setMediaBody),
+    "webSetMedia 必须经 pushMediaDiffFrom 推送（换源识别只有一处）");
+  check(/webMediaState\(rt\)/.test(mediaPump) && /pushMediaDiffFrom\(rt, cur !== driver/.test(mediaPump)
+    && !/let lastMedia/.test(mediaPump),
+    "startMediaPump 必须共用 diff 记录并经 pushMediaDiffFrom 推送，不得再留私有的 lastMedia");
   check(!/webMediaSnap/.test(webTs),
     "不得再留 webSetMedia 私有的快照字段（它与泵的记录会互相打架）");
+  // 换源清记录：模拟源与宿主源的「两边相同」字段（最容易撞的是 state=1）不重推的
+  // 话，壁纸的 Media*Listener 就整场收不到那一路事件 —— 实测 mstate=null。
+  check(/st\.host !== isHost/.test(webTs) && /st\.last = null/.test(webTs),
+    "换源（模拟 ↔ 宿主）必须清空 diff 记录 → 新源第一帧全量推送");
   check(/hasMedia/.test(setMediaBody) && /mediaDisabled = false/.test(setMediaBody),
     "webSetMedia 必须按 hasMedia 决定存档还是落回模拟源，并清掉显式禁用标记");
 
