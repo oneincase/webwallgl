@@ -1899,6 +1899,62 @@ const wireErrors = [];
   }
 }
 
+// ---------- constantshadervalues 键的大小写不敏感匹配（issue#3） ----------
+// WE 编辑器保存的键是首字母大写（官方 shake 预览 scene.json：{"Strength":0.3,...}），
+// shader 注释 material 名是小写 "strength"。精确匹配落空 ⇒ 作者设置被静默丢弃、
+// 回落注释 default（strength=0.1 / speed=1 / bounds="0 1" 全窗）⇒ 作者用 bounds
+// 窗口与低速调好的轻微晃动被放大成全窗快速晃动 —— issue #3「晃动效果阈值/幅度
+// 参数映射不当，出现剧烈晃动」的直接成因。官方预览场景就是「大写键在 WE 能生效」
+// 的活证：编辑器是键的唯一写入方，WE 运行时必然大小写不敏感。
+{
+  const cErr = [];
+  const rendererPath = join(ROOT, "renderer/vendor/we-scene/render/renderer.js");
+  const { indexMatMetaLower, lookupMatMeta } = await import(rendererPath);
+
+  // 单元：精确命中优先；大小写变体命中；ui_editor_properties_ 前缀归一；
+  // 真缺失返回 undefined；null 安全
+  {
+    const meta = { strength: { uniform: "g_Amp" }, speed: { uniform: "g_Speed" } };
+    const idx = indexMatMetaLower(meta);
+    if (lookupMatMeta(meta, idx, "strength") !== meta.strength) cErr.push("精确键未命中 strength");
+    if (lookupMatMeta(meta, idx, "Strength") !== meta.strength) cErr.push("大写变体未命中：Strength→strength");
+    if (lookupMatMeta(meta, idx, "SPEED") !== meta.speed) cErr.push("大写变体未命中：SPEED→speed");
+    if (lookupMatMeta(meta, idx, "ui_editor_properties_strength") !== meta.strength) {
+      cErr.push("前缀键未命中：ui_editor_properties_strength→strength（本机库 23 处）");
+    }
+    if (lookupMatMeta(meta, idx, "ui_editor_properties_SPEED") !== meta.speed) {
+      cErr.push("前缀键 + 大写变体未命中：ui_editor_properties_SPEED→speed");
+    }
+    if (lookupMatMeta(meta, idx, "power") !== undefined) cErr.push("真缺失键不应命中 power");
+    if (lookupMatMeta(meta, idx, "ui_editor_properties_power") !== undefined) cErr.push("前缀归一后真缺失键不应命中 power");
+    if (lookupMatMeta(null, null, "strength") !== undefined) cErr.push("null matMeta 必须安全返回 undefined");
+    if (indexMatMetaLower(null).size !== 0) cErr.push("indexMatMetaLower(null) 必须返回空索引");
+  }
+  // 语料事实（本仓库自带官方效果预览 = 编辑器原生输出）：键确实是大写
+  {
+    const previewScene = join(ROOT, "local-assets/effects/shake/preview/scene.json");
+    const sceneText = fs.readFileSync(previewScene, "utf8");
+    if (!/"Strength"\s*:/.test(sceneText)) {
+      cErr.push("官方 shake 预览应含大写键 Strength（证据文件被改动，此判据失效）");
+    }
+  }
+  // 源码守卫：bindConstants 必须走小写索引 + 小写「已提供」集合（两条缺一条，
+  // 大写键的值要么查不到、要么设完又被 default 二次覆盖）
+  {
+    const src = fs.readFileSync(rendererPath, "utf8");
+    if (!/function bindConstants\(uni, constants, matMeta\) \{\s*\n\s*const lowerIndex = indexMatMetaLower\(matMeta\)/.test(src)) {
+      cErr.push("bindConstants 必须先建小写索引（indexMatMetaLower）");
+    }
+    if (!/const entry = lookupMatMeta\(matMeta, lowerIndex, matKey\)/.test(src)) {
+      cErr.push("bindConstants 的条目查找必须走 lookupMatMeta（大小写不敏感）");
+    }
+    if (!/providedLower\.has\(matKey\.toLowerCase\(\)\)/.test(src)) {
+      cErr.push("default 兜底必须按小写集合判断「已提供」（否则大写键的值会被 default 二次覆盖）");
+    }
+  }
+  wireErrors.push(...cErr);
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

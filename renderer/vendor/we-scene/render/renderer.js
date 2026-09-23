@@ -448,6 +448,43 @@ export function constantFallback(uniformName, declaredDefault) {
 }
 
 /**
+ * [we-scene patch issue#3] constantshadervalues 键 → matMeta 条目必须**大小写不敏感**。
+ *
+ * WE 编辑器保存的 scene.json 用首字母大写的属性名，而效果 shader 注释里的
+ * material 名是小写 —— WE 官方 shake 预览场景就是活证：
+ *   scene.json:  {"constantshadervalues": {"Strength":0.3, "Speed":1, "Power":0.78}}
+ *   shake.frag:  uniform float g_Amp; // {"material":"strength", ...}
+ * 编辑器是键的唯一写入方，WE 运行时能让这些大写键生效，说明匹配必然不区分
+ * 大小写。精确匹配落空时作者设置会被静默丢弃、回落注释 default —— 对 shake
+ * 就是 strength=0.1、speed=1、bounds="0 1"（全窗）：作者用 bounds 窗口和低速
+ * 调好的轻微缓慢晃动被放大成全窗快速晃动，即 issue #3「晃动效果阈值/幅度参数
+ * 映射不当，出现剧烈晃动」的直接成因（本机库的实证形态见下一函数注释）。
+ *
+ * 两个函数拆开：index 每帧建一次传给 bindConstants 循环复用（每帧每 pass 都要查）。
+ * 键冲突（同 shader 声明两个只差大小写的 material 名）取后一个 —— 无此语料，防御即可。
+ */
+export function indexMatMetaLower(matMeta) {
+  const m = new Map()
+  for (const k of Object.keys(matMeta || {})) m.set(k.toLowerCase(), k)
+  return m
+}
+
+/** 先精确后小写；再退「ui_editor_properties_ 前缀名 → 短名」（本机库 23 处
+ * strength / 17 speed / 11 friction / 10 bounds 用这种键 —— 粒子侧的
+ * `ui_editor_properties_overbright` 是同一写入方的同款行为，overbright 当年
+ * 也是靠显式识别这个前缀才接上的）。能精确命中就不走归一化（零开销路径）。 */
+export function lookupMatMeta(matMeta, lowerIndex, matKey) {
+  if (!matMeta) return undefined
+  if (matMeta[matKey]) return matMeta[matKey]
+  let k = lowerIndex && lowerIndex.get(String(matKey).toLowerCase())
+  if (k === undefined) {
+    const short = String(matKey).replace(/^ui_editor_properties_/, '')
+    if (short !== matKey) k = lowerIndex && lowerIndex.get(short.toLowerCase())
+  }
+  return k !== undefined ? matMeta[k] : undefined
+}
+
+/**
  * [we-scene patch 3448845950] 跨层合成源层的 quad 尺寸覆盖。
  *
  * `_rt_imageLayerComposite_<id>_a` 的 FBO 按「源层内容矩形 size×scale」钳制而来，
@@ -977,7 +1014,12 @@ export function createRenderer(canvas, opts = {}) {
   //   3790769971 amp=0.2  rough=0   speed=0.9
   // 用两条不同频率的正弦叠加取代真随机：抖动必须**逐帧连续**，用 Math.random()
   // 会得到每帧跳变的抽帧感；roughness 控制高频分量的权重（0=纯低频平滑摆动）。
-  // 幅度按可见画面的百分比换算（amp=1 → ±2% 视宽），这个比例是观感近似、无数据出处。
+  // [we-scene patch 2026-09-23 issue#3] 幅度与频率收敛：WE 的 camerashake 实现
+  // 未公开（linux-wallpaperengine 只解析不实现），此前的「amp=1 → ±2% 视宽」
+  // 是观感近似、无数据出处 —— 实测 amp=0.5 时整屏 ±38px@4K、~2.5Hz，属剧烈晃动。
+  // 现按 issue #3 的验收口径（轻微、缓慢）标定：amp=1 → ±0.5% 视宽
+  // （amp=0.5 → ±9.6px@4K），高频分量频率减半（rough=1 主频 ≤~1.5Hz）。
+  // 两个数字同样是标定值而非 WE 逆向值；rough=1 仍明显快于 rough=0，语义不变。
   function cameraShakeOffset(general, time) {
     if (!boolProp(general.camerashake, false)) return null
     const amp = numProp2(general.camerashakeamplitude, 0)
@@ -987,8 +1029,8 @@ export function createRenderer(canvas, opts = {}) {
     const t = time * speed
     const lowX = Math.sin(t * 2.1) * Math.cos(t * 0.7)
     const lowY = Math.cos(t * 1.7) * Math.sin(t * 0.9)
-    const hiX = Math.sin(t * 11.3) * Math.cos(t * 7.1)
-    const hiY = Math.cos(t * 9.7) * Math.sin(t * 13.1)
+    const hiX = Math.sin(t * 5.65) * Math.cos(t * 3.55)
+    const hiY = Math.cos(t * 4.2) * Math.sin(t * 5.0)
     return {
       x: (lowX * (1 - rough) + hiX * rough) * amp,
       y: (lowY * (1 - rough) + hiY * rough) * amp,
@@ -1187,19 +1229,24 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // constantshadervalues 的键是 material 名 → 经 matMeta 映射到 uniform 名并设值；缺省用注释 default
+  // [we-scene patch issue#3] 键匹配大小写不敏感（编辑器写 "Strength"、注释是
+  // "strength"；见 lookupMatMeta 注释）。
   function bindConstants(uni, constants, matMeta) {
+    const lowerIndex = indexMatMetaLower(matMeta)
     for (const [matKey, value] of Object.entries(constants || {})) {
-      const entry = matMeta && matMeta[matKey]
+      const entry = lookupMatMeta(matMeta, lowerIndex, matKey)
       if (!entry) continue
       setConstant(uni, entry.uniform, value)
     }
     // 未提供的常数用 shader 注释里的 default。
     // xray 的 size 例外走 constantFallback（注释 0.2 是编辑器初值不是运行时缺省）。
+    // 「已提供」的判断同样大小写不敏感 —— 否则同一名义键会先按大写设一次值、
+    // 再在这里被 default 二次覆盖，作者设置等于没设。
+    const providedLower = new Set(Object.keys(constants || {}).map((k) => k.toLowerCase()))
     for (const [matKey, entry] of Object.entries(matMeta || {})) {
-      if (!constants || !(matKey in constants)) {
-        const dflt = constantFallback(entry.uniform, entry.default)
-        if (dflt !== undefined) setConstant(uni, entry.uniform, dflt)
-      }
+      if (providedLower.has(matKey.toLowerCase())) continue
+      const dflt = constantFallback(entry.uniform, entry.default)
+      if (dflt !== undefined) setConstant(uni, entry.uniform, dflt)
     }
   }
 
@@ -2420,9 +2467,9 @@ export function createRenderer(canvas, opts = {}) {
     if (!cam.perspective && opts.shake !== false) {
       const sh = cameraShakeOffset(general, time)
       if (sh) {
-        // amp=1 → ±2% 视宽；这个比例是观感近似（见 cameraShakeOffset 注释）
-        const px = sh.x * cam.viewW * 0.02
-        const py = sh.y * cam.viewH * 0.02
+        // amp=1 → ±0.5% 视宽（issue#3 标定收敛，见 cameraShakeOffset 注释）
+        const px = sh.x * cam.viewW * 0.005
+        const py = sh.y * cam.viewH * 0.005
         if (px !== 0 || py !== 0) {
           shakeM = mat4Translate(mat4Identity(), px, py, 0)
           viewProj = mat4Multiply(viewProj, shakeM)

@@ -62,8 +62,10 @@ const num = (v, d) => {
     const t = time * speed;
     const lowX = Math.sin(t * 2.1) * Math.cos(t * 0.7);
     const lowY = Math.cos(t * 1.7) * Math.sin(t * 0.9);
-    const hiX = Math.sin(t * 11.3) * Math.cos(t * 7.1);
-    const hiY = Math.cos(t * 9.7) * Math.sin(t * 13.1);
+    // issue#3：高频分量频率减半（原 11.3/7.1、9.7/13.1 整屏 ~2.5Hz 属剧烈晃动）。
+    // 和频约束 ≤9.2（乘积项主频 =(f1+f2)/2π ≤1.46Hz）
+    const hiX = Math.sin(t * 5.65) * Math.cos(t * 3.55);
+    const hiY = Math.cos(t * 4.2) * Math.sin(t * 5.0);
     return {
       x: (lowX * (1 - rough) + hiX * rough) * amp,
       y: (lowY * (1 - rough) + hiY * rough) * amp,
@@ -89,6 +91,40 @@ const num = (v, d) => {
   // amp=0 必须完全静止（renderer.js 里提前 return null）
   const z = shake(0, 0, 1, 3.7);
   check(z.x === 0 && z.y === 0, "amp=0 时抖动必须恒为 0");
+
+  // ---------- 2a-2. issue#3 标定收敛：整屏抖动必须落在「轻微缓慢」区间 ----------
+  // 旧标定 amp=1 → ±2% 视宽在 amp=0.5 时整屏 ±38px@4K、~2.5Hz，实测 62% 像素
+  // 逐帧变化（CASEBOOK 实机数据），观感是剧烈晃动。收敛后 amp=1 → ±0.5% 视宽。
+  {
+    const screenPx = (amp, viewW, viewH) => {
+      const s = shake(amp, 1, 0.81, 0); // rough=1 = 幅度上限路径
+      return Math.max(Math.abs(s.x) * viewW * 0.005, Math.abs(s.y) * viewH * 0.005);
+    };
+    // 语料最猛的一组（3789602510）在 4K 下不得超过 12px、1080p 不得超过 6px
+    const p4k = screenPx(0.5, 3840, 2160);
+    const p1080 = screenPx(0.5, 1920, 1080);
+    check(p4k <= 12, `camerashake 4K 幅度超标：amp=0.5 → ±${p4k.toFixed(2)}px（应 ≤12，即轻微可感）`);
+    check(p1080 <= 6, `camerashake 1080p 幅度超标：amp=0.5 → ±${p1080.toFixed(2)}px（应 ≤6）`);
+    // 高频路径必须真的慢下来：rough=1 speed≤1 时主频率不超过 ~1.5Hz
+    // （过零率估计：10s 采样、60fps，两轴各 ≤15 个方向翻转）
+    for (const [axis, key] of [["x", "x"], ["y", "y"]]) {
+      let prev = null, zc = 0;
+      for (let i = 0; i <= 600; i++) {
+        const v = shake(1, 1, 1, i / 60)[key];
+        if (prev !== null && Math.sign(v) !== Math.sign(prev)) zc++;
+        prev = v;
+      }
+      // 主频 ≈ 过零数 / 2 / 10s；hiX=5.65±3.55 → ≤ (5.65+3.55)/2π ≈ 1.46Hz → 10s ≤ 29 次翻转
+      check(zc <= 30, `rough=1 高频分量过快：${axis} 轴 10s 过零 ${zc} 次（>30 即 ≥1.5Hz，不满足「缓慢」）`);
+    }
+    // 源码守卫：应用点的比例必须是 0.005，且 camerashake 区间内不得残留 0.02 旧标定
+    const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    const appBlock = src.slice(src.indexOf("camerashake：相机整体抖动"));
+    check(/cam\.viewW \* 0\.005/.test(appBlock), "抖动幅度必须是 ±0.5% 视宽（cam.viewW * 0.005）");
+    check(!/cam\.viewW \* 0\.02/.test(appBlock), "不得退回 ±2% 视宽旧标定（整屏 ±38px@4K = 剧烈晃动）");
+    const fnSrc = src.slice(src.indexOf("function cameraShakeOffset"), src.indexOf("function cameraShakeOffset") + 900);
+    check(/Math\.sin\(t \* 5\.65\)/.test(fnSrc), "高频 x 分量频率应为 5.65（issue#3 减半后）");
+  }
 }
 
 // ---------- 2b. 脚本 zoom 叠在 fit 窗口上（3151551777 火车震动 1.01）----------
