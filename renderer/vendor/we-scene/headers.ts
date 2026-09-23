@@ -273,17 +273,89 @@ vec4 ApplyComposite(vec4 backdrop, vec4 source) {
   // 标注这类贴图并重建 z。返回值的 .z 在现有 3 个调用点里从未被使用
   // （只用 normal.xy 做 UV 位移），故真正吃重的只有 *2-1 这步。
   // FORMAT_R8 / FORMAT_RG88 取 pkg/texture.js 的 .tex 格式枚举：RG88=8、R8=9。
-  // WE common_pbr_2.h：**最小重建，仅保证 fluid combine 在 LIGHTING=0 下编译**。
-  // combine shader 无条件 include 本头，但灯光函数（PerformLighting_V1 /
-  // CombineLighting / ComputePBRLight* / PerformShadowMapping）的调用全部位于
-  // `#if LIGHTING` 段 —— LIGHTING=0 时本头一个符号都不被引用，给空体即可。
-  // 完整 PBR（GGX/Smith/Fresnel、点光/平行光、实时阴影、阴影图集）属缺口 #5，
-  // 届时在本头补真实实现；LIGHTING=1 的当前行为是 combine 编译失败、效果被跳过，
-  // 与"无 PBR"一致，不会错画。
-  'common_pbr_2.h': `// WE common_pbr_2.h（重建占位：LIGHTING=0 编译用；完整 PBR 见缺口 #5）
-// 官方头首行即 include common.h —— combine 未直接包含 common.h，靠本头带入
-// rgb2hsv/hsv2rgb；漏掉会在调用点报 no matching overload（combine 编译失败）。
+  // WE common_pbr_2.h（重建子集）：提供 PBR 基元与 CombineLighting，并把
+  // PerformLighting_V1 的**直射项置 0** —— 本仓不解析场景灯光对象
+  // （点光/聚光/平行光/阴影图集，官方 LightingV1 全帧平均贡献实测 ~2%，
+  // 见 renderer.js layerColorAmbient 注释），故 LIGHTING=1 走 ambient-only，
+  // 与 genericimage* 既有的 ambient 近似一致。这样 fluidsimulation combine
+  // 的 LIGHTING=1 分支（法线扰动染色）可编译运行；fur/foliage/chroma 等同头
+  // shader 也能过编译（真实直射光照留待引入灯光管线时补 PerformLighting_V1）。
+  'common_pbr_2.h': `// WE common_pbr_2.h（重建：PBR 基元 + ambient-only 灯光）
 #include "common.h"
+#ifndef M_PI
+#define M_PI 3.14159265359
+#endif
+
+vec3 FresnelSchlick(float lightTheta, vec3 baseReflectance) {
+  return baseReflectance + (vec3(1.0) - baseReflectance) * pow(max(1.0 - lightTheta, 0.001), 5.0);
+}
+
+float Distribution_GGX(vec3 N, vec3 H, float roughness) {
+  float r = roughness * roughness;
+  float r2 = r * r;
+  float NH = max(dot(N, H), 0.0);
+  float denom = (NH * NH * (r2 - 1.0) + 1.0);
+  return r2 / (M_PI * denom * denom);
+}
+
+float Schlick_GGX(float NV, float roughness) {
+  float k = (roughness + 1.0);
+  k = (k * k) / 8.0;
+  return NV / (NV * (1.0 - k) + k);
+}
+
+float GeoSmith(vec3 N, vec3 V, vec3 L, float roughness) {
+  return Schlick_GGX(max(dot(N, V), 0.001), roughness) * Schlick_GGX(max(dot(N, L), 0.001), roughness);
+}
+
+// 无 GRADIENT_SAMPLER / RIMLIGHTING / 阴影宏时的标准直接光 BRDF 项。
+// shadowFactor 由调用方给（本仓恒 1，无阴影）。
+vec3 ComputePBRLightShadow(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
+  float radius, float exponent, vec3 specularTint, vec3 baseReflectance,
+  float roughness, float metallic, float shadowFactor) {
+  float dist = length(L);
+  L = L / max(dist, 1e-4);
+  vec3 H = normalize(V + L);
+  float falloff = clamp(1.0 - dist / max(radius, 1e-4), 0.0, 1.0);
+  float fltMin = 6.103515625e-5;
+  vec3 radiance = lightColor * mix(0.0, pow(falloff + fltMin, exponent), step(fltMin, falloff));
+  float NDF = shadowFactor * Distribution_GGX(N, H, roughness);
+  float G = GeoSmith(N, V, L, roughness);
+  vec3 F = FresnelSchlick(max(dot(H, V), 0.0), baseReflectance);
+  vec3 numerator = NDF * G * F;
+  vec3 diffuse = (1.0 - metallic) * (vec3(1.0) - F);
+  float NL = max(dot(N, L) * shadowFactor, 0.0);
+  float denominator = 4.0 * max(dot(N, V), 0.0) * NL;
+  vec3 specular = numerator / max(denominator, 0.001);
+  return (diffuse * albedo / M_PI + specular * specularTint) * radiance * NL;
+}
+
+vec3 ComputePBRLightShadowInfinite(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
+  vec3 specularTint, vec3 baseReflectance, float roughness, float metallic, float shadowFactor) {
+  vec3 H = normalize(V + L);
+  float NDF = shadowFactor * Distribution_GGX(N, H, roughness);
+  float G = GeoSmith(N, V, L, roughness);
+  vec3 F = FresnelSchlick(max(dot(H, V), 0.0), baseReflectance);
+  vec3 numerator = NDF * G * F;
+  float NL = max(dot(N, L) * shadowFactor, 0.0);
+  float denominator = 4.0 * max(dot(N, V), 0.0) * NL;
+  vec3 specular = numerator / max(denominator, 0.001);
+  vec3 diffuse = (1.0 - metallic) * (vec3(1.0) - F);
+  return (diffuse * albedo / M_PI + specular * specularTint) * lightColor * NL;
+}
+
+// 场景灯光驱动的总直射：本仓无灯光对象，恒为 0（见头注释）。
+vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewVector,
+  vec3 specularTint, vec3 f0, float roughness, float metallic) {
+  return vec3(0.0);
+}
+
+vec3 CombineLighting(vec3 light, vec3 ambient) {
+  return ambient + light;
+}
+vec3 CombineLighting(vec3 light, vec3 baseAmbient, vec3 ambient) {
+  return max(baseAmbient, ambient + light);
+}
 `,
   'common_fragment.h': `// WE common_fragment.h（重建）
 #define FORMAT_RG88 8

@@ -1131,6 +1131,17 @@ export function createRenderer(canvas, opts = {}) {
     setVal(uni, 'g_Daytime', (l) => gl.uniform1f(l, daytimeFraction()))
     setVal(uni, 'g_ModelViewProjectionMatrix', (l) => gl.uniformMatrix4fv(l, false, mvp))
     setVal(uni, 'g_ModelMatrix', (l) => gl.uniformMatrix4fv(l, false, modelM))
+    // [we-scene patch] g_EffectModelMatrix：PBR 头的 v_WorldPos 用它算世界坐标
+    // （fluidsimulation combine LIGHTING=1 的 vert）。此前只有 g_EffectModelViewProjectionMatrix。
+    setVal(uni, 'g_EffectModelMatrix', (l) => gl.uniformMatrix4fv(l, false, modelM))
+    // [we-scene patch] g_LightAmbientColor：genericimage*/PBR shader 的
+    // `ambient = g_LightAmbientColor * albedo`。genericimage* 层在 JS 侧已乘
+    // ambient（color4），但效果 pass（fluid combine LIGHTING=1）直接读此 uniform，
+    // 未绑会取 (0,0,0) 使 ambient 段全黑。喂当前帧场景环境光（ambientcolor×π 封顶）。
+    setVal(uni, 'g_LightAmbientColor', (l) => {
+      const amb = layerColorAmbient(true, sceneAmbient)
+      gl.uniform3f(l, amb[0], amb[1], amb[2])
+    })
     setVal(uni, 'g_ViewProjectionMatrix', (l) => gl.uniformMatrix4fv(l, false, viewProjM))
     // [we-scene patch] g_EffectModelViewProjectionMatrix：pass 顶点 → **画布** NDC
     // （g_ModelViewProjectionMatrix 是 →效果 FBO）。oscilloscope 的 v_ViewCoord 靠它
@@ -3282,7 +3293,11 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] 材质 LIGHTING combo 开启时乘场景环境光（官方
     // genericimage*：ambient = g_LightAmbientColor * albedo，无直射灯时结果
     // = albedo × min(1, ambientcolor×π)；口径与实测依据见 layerColorAmbient）。
-    const amb = layerColorAmbient(layer.lightingEnabled, sceneAmbient)
+    // g_LightAmbientColor uniform 现已在 bindSystemUniforms 绑定（shader 自己
+    // 乘 ambient），故 LIGHTING 层的 color4 给恒等、由 shader 单次应用，避免
+    // 0.3 灰被 color4 与 shader 各乘一次（0.94²≈0.88 偏暗）；非 LIGHTING 层
+    // shader 不读该 uniform（#if LIGHTING=0），ambient 仍在 color4 侧应用。
+    const amb = layer.lightingEnabled ? [1, 1, 1] : layerColorAmbient(layer.lightingEnabled, sceneAmbient)
     const color4 = [
       layer.color[0] * layer.brightness * amb[0],
       layer.color[1] * layer.brightness * amb[1],
