@@ -68,6 +68,8 @@ type Pixel = {
   format?: number;
   /** .tex 的 TEXS 序列帧表（像素矩形）；图集尺寸挂在数组的 atlasWidth/atlasHeight 上 */
   frames?: TexFrame[];
+  /** .tex flags bit1（TEXI clamp uvs）：效果链纹理绑定据此选 CLAMP/REPEAT */
+  clampUvs?: boolean;
 };
 
 /** 已解码像素缓存：跨挂载复用（切壁纸 / 改画质不重新下载解码）。 */
@@ -130,6 +132,10 @@ async function fetchTex(url: string): Promise<Pixel | null> {
   const px = await mipToRgba(mips[0]);
   if (!px) return null;
   px.format = parsed.format;
+  // .tex flags bit1 = TEXI「clamp uvs」：与 .tex-json clampuvs 布尔一致
+  // （229 张官方素材零反例）。效果链纹理绑定据此选 CLAMP/REPEAT，如
+  // particle/halo_6 必须 CLAMP，否则 xray 开窗无限平铺（2212279721）。
+  px.clampUvs = (Number(parsed.flags) & 2) !== 0;
   // TEXS 序列帧表：官方粒子图集（rain_drops_sheet 16 帧、fog1 64 帧、rain1 4 帧）
   // 全靠它切图。不传的话粒子只能按 sequencemultiplier 猜 N×N 方格 —— 一颗粒子
   // 会把整张图集当一帧采样，画面变成一坨糊（实测 3801012392）。

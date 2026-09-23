@@ -2419,6 +2419,23 @@ export function isBuiltinParticleTextureName(name) {
   return typeof name === 'string' && name.indexOf('particle/') === 0
 }
 
+/**
+ * 程序化兜底的内置粒子贴图按官方 .tex-json 语义必须 CLAMP（clampuvs:true）的名字。
+ *
+ * 效果 pass 绑定槽 1+ 时渲染器默认按 WE 缺省 REPEAT（waterripple 法线槽需要），
+ * 但被效果当「开窗形状」采样的精灵不能回绕：xray.frag 先 saturate(unprojectedUVs)
+ * 再以指针为中心缩放，开窗之外的像素 uv 落在 [0,1] 外，REPEAT 会让形状无限平铺
+ * （2212279721：整屏无数个相同开窗）。官方 particle/halo_6 的 tex-json 是
+ * clampuvs:true。只登记**会被效果 shader 采样**的名字；纯粒子精灵走粒子绘制、
+ * 不经过效果纹理绑定循环，无需登记。
+ */
+const BUILTIN_CLAMP_UVS = new Set(['particle/halo_6'])
+
+/** 该内置名字的程序化贴图是否强制 CLAMP（效果链纹理绑定用）。 */
+export function isBuiltinClampUvsName(name) {
+  return BUILTIN_CLAMP_UVS.has(name)
+}
+
 // 效果 pass 的 textures 槽引用的 WE 公共 util 贴图**不在 scene.pkg 里**（与粒子
 // 内置贴图同源，属 WE 安装目录的公共资源）。全库实测引用：
 //   util/clouds_256 ×36 处 / 20 张壁纸（云效果的密度图）

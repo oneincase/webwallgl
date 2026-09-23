@@ -3488,22 +3488,28 @@ export function createRenderer(canvas, opts = {}) {
         const t = entry.fbo ? entry : { tex: entry.glTex || whiteTex, width: entry.width || 1, height: entry.height || 1 }
         gl.activeTexture(gl.TEXTURE0 + ti)
         gl.bindTexture(gl.TEXTURE_2D, t.tex)
-        // [we-scene patch] 效果链输入槽（ti>=1）按 WE 语义强制 REPEAT。
+        // [we-scene patch] 效果链输入槽（ti>=1）的环绕按**贴图自身**的 wrap 设置：
         // 官方效果 shader 普遍用「随 g_Time 无界增长的 uv」采样槽 1+ —— waterripple
         // 的法线槽是典型：rippleCoords.xy = uv + g_Time*g_AnimationSpeed²，
         // .zw = uv*1.333 - g_Time*g_AnimationSpeed²。包装端（gl-util 的 makeTexture*/
-        // makeR8TextureMip）默认 CLAMP_TO_EDGE，而 pkg 贴图创建时从不传 wrap:'repeat'
-        // （只有 materials/util/* 系统贴图与内置渐变传了），于是坐标一旦离开 [0,1] 就被
-        // 钉在边缘纹素：n1/n2 退化成常量 → normal 恒定 → texCoord 只得一个固定偏移，
-        // 涟漪先变形、约 1/g_AnimationSpeed² 秒（本壁纸 animationspeed=0.15 → 44s）后
-        // 完全消失，实测 60s 起水面帧间差恒为 0（3295448069）。
+        // makeR8TextureMip）默认 CLAMP_TO_EDGE，于是坐标离开 [0,1] 就被钉在边缘纹素：
+        // n1/n2 退化成常量 → normal 恒定 → 涟漪先变形、约 1/g_AnimationSpeed² 秒后
+        // 完全消失（3295448069）。而 WE 的官方缺省是 REPEAT（tex-json clampuvs 缺省
+        // false），故无标记的槽 1+ 一律 REPEAT。
+        // 但**不是所有槽都能回绕**：xray 的 sprite 槽（particle/halo_6，tex-json
+        // clampuvs:true）在 frag 里先 `saturate(unprojectedUVs)` 再以指针为中心缩放，
+        // 开窗之外的像素 uv 落在 [0,1] 区间外并逐格重复 —— 强制 REPEAT 会让 halo
+        // 形状无限平铺，整屏出现无数个相同开窗（2212279721）。clampUvs 标记由
+        // scene-mount 从 .tex flags bit1（TEXI flag，229 张官方素材与 tex-json
+        // clampuvs 逐一吻合，零反例）带入；程序化贴图按官方语义各自标注。
         // 槽 0 是层内容、passInput/effectFBOs 是渲染目标，保持 CLAMP —— 那正是下方
         // waterwaves 注释要的语义（uv 位移后采样到 quad 之外要贴边而不是回绕）。
-        if (ti >= 1 && !entry.fbo && entry.glTex && entry.samplerWrapRepeat !== true) {
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT)
+        if (ti >= 1 && !entry.fbo && entry.glTex && entry.samplerWrapSet !== true) {
+          const mode = entry.clampUvs === true ? gl.CLAMP_TO_EDGE : gl.REPEAT
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, mode)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, mode)
           // 贴图对象（entry）在多个 pass / 多帧之间共享，设一次即可，避免每帧的冗余调用。
-          entry.samplerWrapRepeat = true
+          entry.samplerWrapSet = true
         }
         usedUnits.add(ti)
         resolutions.set(ti, [t.width, t.height, t.width, t.height])

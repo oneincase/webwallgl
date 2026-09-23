@@ -1193,6 +1193,8 @@ cfg, source, pkgAbort.signal);
                 height: t.height,
                 rg88: false,
                 mips: null,
+                // 官方素材 Pixel 带 .tex flags 的 clamp 标记；程序化复刻恒 REPEAT。
+                clampUvs: t.clampUvs === true,
               }
             : {
                 glTex: rnd.makeTextureMip(renderer.gl, [t], false, opts),
@@ -1200,6 +1202,7 @@ cfg, source, pkgAbort.signal);
                 height: t.height,
                 rg88: false,
                 mips: [t],
+                clampUvs: t.clampUvs === true,
               },
         );
       }
@@ -1457,6 +1460,10 @@ cfg, source, pkgAbort.signal);
                 rg88: false,
                 mips: [gen],
                 generated: true,
+                // 官方 clampuvs:true 的精灵（如 particle/halo_6）：效果链槽 1+
+                // 采样时必须 CLAMP，否则开窗形状无限平铺（2212279721）。
+                // 官方素材 Pixel 自带 flags 标记时优先，程序化兜底按名字表判定。
+                clampUvs: gen.clampUvs === true || ptex.isBuiltinClampUvsName(name),
               };
               textures.set(name, genEntry);
               return genEntry;
@@ -1882,6 +1889,12 @@ cfg, source, pkgAbort.signal);
           }
         }
         if (!entry) return null;
+        // [we-scene patch] .tex flags bit1 = TEXI「clamp uvs」标记（官方导出器写入，
+        // 229 张带 .tex-json sidecar 的素材里与 clampuvs 布尔逐一吻合、零反例）：
+        // 效果链槽 1+ 绑定纹理时据此选 CLAMP/REPEAT。没有它时渲染器按 WE 缺省
+        // REPEAT（waterripple 法线槽需要），但 xray 的 sprite（particle/halo_6，
+        // 该位=1）必须 CLAMP，否则开窗形状无限平铺（2212279721）。
+        entry.clampUvs = (Number(parsedTex.flags) & 2) !== 0;
         // 序列帧表（.tex 的 TEXS 段）：粒子与序列帧图层据此切 sprite sheet。
         // 没有它就只能按 sequencemultiplier 猜 N×N 方格，对横排/竖排 sheet 会采错图块。
         // 挂**整个 frames 对象**（含 atlasWidth/Height）而不只是 list：帧矩形的
@@ -2375,6 +2388,10 @@ cfg, source, pkgAbort.signal);
           rg88: false,
           mips: [gen],
           generated: true,
+          // 官方 clampuvs:true 的精灵（如 particle/halo_6）：效果链槽 1+
+          // 采样时必须 CLAMP，否则开窗形状无限平铺（2212279721）。
+          // 官方素材 Pixel 自带 flags 标记时优先，程序化兜底按名字表判定。
+          clampUvs: gen.clampUvs === true || ptex.isBuiltinClampUvsName(name),
           // 帧表优先级：原版素材 .tex 的 TEXS（官方布局）> 程序化图集的内置猜测表
           // （rain1/rain2 的 1×4、leaves* 的 3×3；randomframe 依赖它随机取帧，
           // 缺了会画出超长丝 1823900922；叶片缺了会被切成 9 块 1725510475）。
