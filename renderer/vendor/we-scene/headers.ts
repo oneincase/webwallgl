@@ -57,13 +57,16 @@ float atan2(float y, float x) { return atan(y, x); }
 // HSV ↔ RGB。色相范围是 0..1 而不是 0..360 —— 依据 gradient_color.frag 的
 // \`hsv.x = frac(hsv.x + g_Time * u_Speed)\`（按 1 环绕）与 test_shader.frag 的
 // \`hsv2rgb(vec3(x * 0.23 + g_Time * 0.12, 1.0, 1.0))\`（喂入无界小数）。
-vec3 rgb2hsv(vec3 c) {
-    vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
-    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
-    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
-    float d = q.x - min(q.w, q.y);
-    float e = 1.0e-10;
-    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+vec3 rgb2hsv(vec3 RGB) {
+    // 逐字对齐官方 common.h：三元组选 g/b 序，常数布局不能用 step+mix 替代
+    // （旧重建版的 swizzle 对橙红区段返回错误色相，combine 把火色调成白色）。
+    vec4 P = (RGB.g < RGB.b) ? vec4(RGB.bg, -1.0, 2.0/3.0) : vec4(RGB.gb, 0.0, -1.0/3.0);
+    vec4 Q = (RGB.r < P.x) ? vec4(P.xyw, RGB.r) : vec4(RGB.r, P.yzx);
+    float C = Q.x - min(Q.w, Q.y);
+    float H = abs((Q.w - Q.y) / (6.0 * C + 1e-10) + Q.z);
+    vec3 HCV = vec3(H, C, Q.x);
+    float S = HCV.y / (HCV.z + 1e-10);
+    return vec3(HCV.x, S, HCV.z);
 }
 vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
@@ -270,6 +273,18 @@ vec4 ApplyComposite(vec4 backdrop, vec4 source) {
   // 标注这类贴图并重建 z。返回值的 .z 在现有 3 个调用点里从未被使用
   // （只用 normal.xy 做 UV 位移），故真正吃重的只有 *2-1 这步。
   // FORMAT_R8 / FORMAT_RG88 取 pkg/texture.js 的 .tex 格式枚举：RG88=8、R8=9。
+  // WE common_pbr_2.h：**最小重建，仅保证 fluid combine 在 LIGHTING=0 下编译**。
+  // combine shader 无条件 include 本头，但灯光函数（PerformLighting_V1 /
+  // CombineLighting / ComputePBRLight* / PerformShadowMapping）的调用全部位于
+  // `#if LIGHTING` 段 —— LIGHTING=0 时本头一个符号都不被引用，给空体即可。
+  // 完整 PBR（GGX/Smith/Fresnel、点光/平行光、实时阴影、阴影图集）属缺口 #5，
+  // 届时在本头补真实实现；LIGHTING=1 的当前行为是 combine 编译失败、效果被跳过，
+  // 与"无 PBR"一致，不会错画。
+  'common_pbr_2.h': `// WE common_pbr_2.h（重建占位：LIGHTING=0 编译用；完整 PBR 见缺口 #5）
+// 官方头首行即 include common.h —— combine 未直接包含 common.h，靠本头带入
+// rgb2hsv/hsv2rgb；漏掉会在调用点报 no matching overload（combine 编译失败）。
+#include "common.h"
+`,
   'common_fragment.h': `// WE common_fragment.h（重建）
 #define FORMAT_RG88 8
 #define FORMAT_R8 9

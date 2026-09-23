@@ -283,6 +283,11 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
 
   code = expandMacrosIn(code, 20)
   code = code.replace(/^[ \t]*#define[^\n]*\n?/gm, '')
+  // [we-scene patch] `#require <capability>` 是 WE 的能力门控声明（如 combine 的
+  // #require LightingV1）：它只声明该 pass 可选用到的引擎能力，真正的灯光代码
+  // 已在 `#if LIGHTING` 段里。GLSL 不认识这个指令，留着会让整个 program 编译失败、
+  // 效果被静默跳过（染料不显示）。直接去掉该行；能力缺失时可选段由 combo 决定。
+  code = code.replace(/^[ \t]*#require[^\n]*\n?/gm, '')
 
   // 代码中作为标识符使用的 combo（如 ApplyBlending(BLENDMODE, ...)）替换为数值；未定义 combo 用声明 default，无声明 = 0
   // 从 [COMBO] 注释提取全部 combo 名（含未提供的）。

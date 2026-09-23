@@ -766,8 +766,21 @@ export function createRenderer(canvas, opts = {}) {
   // FBO 缓存（tag 区分用途：乒乓 A/B 必须是两个独立实例；同一 tag+尺寸复用）
   const fboCache = new Map()
   let fboStamp = 1
-  function getFBO(w, h, tag) {
-    const key = (tag || '') + '|' + w + 'x' + h
+  /**
+   * FBO 颜色附件格式表（fluidsimulation 的 GPU 速度/压力场需要半浮点）。
+   * 键 = effect.json `fbos[].format`。RGBA8888 / rgba_backbuffer 走经典 RGBA8
+   * （backbuffer 是命名约定，附件本身就是 RGBA）。
+   */
+  const FBO_FORMATS = {
+    rgba8888: { ifmt: gl.RGBA8, fmt: gl.RGBA, type: gl.UNSIGNED_BYTE },
+    rgba_backbuffer: { ifmt: gl.RGBA8, fmt: gl.RGBA, type: gl.UNSIGNED_BYTE },
+    r16f: { ifmt: gl.R16F, fmt: gl.RED, type: gl.HALF_FLOAT },
+    rg1616f: { ifmt: gl.RG16F, fmt: gl.RG, type: gl.HALF_FLOAT },
+  }
+  function getFBO(w, h, tag, formatName) {
+    const fkey = formatName && FBO_FORMATS[formatName] ? formatName : 'rgba8888'
+    const fm = FBO_FORMATS[fkey]
+    const key = (tag || '') + '|' + w + 'x' + h + '|' + fkey
     if (fboCache.has(key)) {
       const hit = fboCache.get(key)
       hit.stamp = fboStamp
@@ -776,7 +789,7 @@ export function createRenderer(canvas, opts = {}) {
     const fbo = gl.createFramebuffer()
     const tex = gl.createTexture()
     gl.bindTexture(gl.TEXTURE_2D, tex)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    gl.texImage2D(gl.TEXTURE_2D, 0, fm.ifmt, w, h, 0, fm.fmt, fm.type, null)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
@@ -788,7 +801,7 @@ export function createRenderer(canvas, opts = {}) {
     gl.clearColor(0, 0, 0, 0)
     gl.clear(gl.COLOR_BUFFER_BIT)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    const entry = { fbo, tex, width: w, height: h, stamp: fboStamp }
+    const entry = { fbo, tex, width: w, height: h, stamp: fboStamp, format: fkey }
     fboCache.set(key, entry)
     return entry
   }
@@ -3304,7 +3317,8 @@ export function createRenderer(canvas, opts = {}) {
           // unique: 每层一份历史缓冲。1444077782 挂了两个 fullscreen motionblur，
           // 同名 `_rt_FullCompoBuffer1` 若走全局缓存会串历史，第二趟读到半块白。
           const tag = f.unique ? layer.id + ':' + f.name : f.name
-          effectFBOs.set(f.name, getFBO(ew, eh, tag))
+          // FBO 像素格式（fluidsimulation 需要浮点速度/压力场；缺省 rgba8888）。
+          effectFBOs.set(f.name, getFBO(ew, eh, tag, f.format))
         }
       }
       const passes = eff.materialPasses || []
@@ -3372,6 +3386,20 @@ export function createRenderer(canvas, opts = {}) {
       // unique FBO 当作下一帧的历史。不实现的后果不是少个效果，而是**画面冲白**：
       // accumulation pass 采样的历史缓冲永远是初始清零值，
       // `mix(pastAlbedo, albedo, rate)` 每帧把自己的输出又当输入，正反馈到饱和。
+      // [we-scene patch] swap 命令（fluidsimulation 末尾乒乓）：交换 source/target
+      // 两个 FBO 名指向的缓冲，不拷像素。下一帧的 curl 从「本帧 advection 产出」
+      // 的场起步 —— effect.json 在 Velocity/Dye 链末尾各放一次 swap。
+      // 只换 Map 的指向：unique 缓冲本身跨帧保留（在 fboCache 里），名字 A 此后
+      // 指向原 B 的缓冲，所有按名解析的 bind 自动读到正确场。
+      if (mp.swapCommand) {
+        const a = mp.source ? effectFBOs.get(mp.source) : null
+        const b = mp.target ? effectFBOs.get(mp.target) : null
+        if (a && b && mp.source !== mp.target) {
+          effectFBOs.set(mp.source, b)
+          effectFBOs.set(mp.target, a)
+        }
+        continue
+      }
       if (mp.copyCommand) {
         const srcEntry = mp.source ? effectFBOs.get(mp.source) : null
         const dstEntry = mp.target ? effectFBOs.get(mp.target) : null

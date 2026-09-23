@@ -43,7 +43,7 @@
  *   `?localAssets=0|off` 关闭；`all` 全量；`1|on` 或 dev 缺省 = util 急切 + particle 按需。
  *   只有 dev（`import.meta.env.DEV`）或显式参数才发请求，生产构建不会产生任何请求。
  */
-import { tex, ptex, sysTex, gtex } from "./vendor";
+import { tex, ptex, sysTex, gtex, patTex } from "./vendor";
 
 /** 一次装载的结果（给 diag / `window.__localAssets` 看） */
 export type LocalAssetStats = {
@@ -225,6 +225,10 @@ export async function installLocalAssets(): Promise<LocalAssetStats | null> {
     // gradient/gradient_*（shimmer 等效果的 gradient map 默认值）同构覆盖：
     // 本机拷了原版 materials/gradient/*.tex 时命中官方像素，否则程序化复刻兜底。
     gtex.setGradientTextureProvider((name: string) => pixels.get(name) ?? null);
+    // pattern/voronoi[_local]（watercaustics 的槽 2/5 默认值）同构覆盖：本机拷了
+    // 原版 materials/pattern/*.tex 时命中官方像素（含 flags→clampUvs=REPEAT），
+    // 否则 pattern-textures.js 的程序化复刻兜底。
+    patTex.setPatternTextureProvider((name: string) => pixels.get(name) ?? null);
 
     // 4) 急切装载：util（默认）或全量（mode=all）
     const utilNames = [...source.names].filter((n) => n.startsWith("util/"));

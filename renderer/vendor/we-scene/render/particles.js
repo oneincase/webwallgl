@@ -471,6 +471,9 @@ export class ParticleSystem {
       angularVelocity: null,
       turbulentVelocity: null,
       mapAround: null,
+      // [we-scene patch] mapsequencebetweencontrolpoints：沿控制点折线按发射
+      // 序号投放 count 个点（放电/闪电分叉：CP0→CP1 间 count 点，rope 渲染连成链）。
+      mapBetween: null,
     }
     for (const z of init) {
       switch (z.name) {
@@ -528,7 +531,18 @@ export class ParticleSystem {
           }
           this._mapAroundSeq = 0
           break
-        case 'turbulentvelocityrandom':
+        case 'mapsequencebetweencontrolpoints':
+          // 沿全部控制点折线投放 count 个有序点。limitbehavior:"mirror"
+          // 时序号 ping-pong（闭环放电用）；arcamount 给每点一个确定性的
+          // 垂直扰动（闪电分叉的锯齿感），flags 低位是行为位（保留但不强制）。
+          this.init.mapBetween = {
+            count: Math.max(1, num(z.count, 1)),
+            arcAmount: num(z.arcamount, 0),
+            mirror: z.limitbehavior === 'mirror',
+            flags: num(z.flags, 0),
+          }
+          this._mapBetweenSeq = 0
+          break
           // 用噪声场给初速度方向（雪/雾的自然扩散感来源）
           this.init.turbulentVelocity = {
             scale: num(z.scale, 0.1),
@@ -562,6 +576,13 @@ export class ParticleSystem {
       attract: [],
       vortex: [],
       remap: [],
+      // [we-scene patch] 高级算子（缺口#4）
+      capVelocity: null, // capvelocity：限速
+      posOffsetRandom: null, // positionoffsetrandom：随时间的随机位移抖动
+      collision: [], // collisionquad / collisionplane
+      reduceNearCp: [], // reducemovementnearcontrolpoint：CP 邻域阻尼
+      maintainDistance: null, // maintaindistancebetweencontrolpoints
+      vortex2: [], // vortex_v2：环形涡流
     }
     for (const o of ops) {
       switch (o.name) {
@@ -671,6 +692,73 @@ export class ParticleSystem {
             rangeMax: parseVec(o.outputrangemax),
             fn: o.transformfunction || 'simplexnoise',
             inputScale: num(o.transforminputscale, 1),
+          })
+          break
+        case 'capvelocity':
+          // 限速：速度幅值夹到 maxspeed；blendinstart/end 是生命周期比例，
+          // 在该区间内由 0 渐入到完整限速（闪电束出生时不被瞬间刹停）。
+          this.ops.capVelocity = {
+            maxSpeed: num(o.maxspeed, 0),
+            blendInStart: num(o.blendinstart, 0),
+            blendInEnd: num(o.blendinend, 1),
+          }
+          break
+        case 'positionoffsetrandom':
+          // 随时间缓变的随机位移（闪电束轻微抖动）。distance=位移半径，
+          // timescale=抖动时间尺度（越大越慢），scale=幅度倍率。
+          this.ops.posOffsetRandom = {
+            distance: num(o.distance, 0),
+            timeScale: num(o.timescale, 1),
+            scale: num(o.scale, 1),
+          }
+          break
+        case 'collisionquad':
+        case 'collisionplane': {
+          // 碰撞几何：粒子碰到面时法向速度归零（闪电/雨撞地面/墙面）。
+          // quad 在 2D 粒子里取其法向轴（origin/size 定义的轴对齐面）；
+          // plane 是单面。先实现「法向止速」，反弹留给后续（语料无 bounce 位）。
+          const origin = parseVec(o.origin)
+          const size = parseVec(o.size)
+          this.ops.collision.push({
+            kind: o.name === 'collisionquad' ? 'quad' : 'plane',
+            origin,
+            size,
+            // 最大的非零尺寸轴 = 平面所在的静止轴；粒子该轴坐标越过 origin
+            // 时把对应速度分量清零并夹回。
+          })
+          break
+        }
+        case 'reducemovementnearcontrolpoint': {
+          // CP 邻域阻尼：粒子进入 distanceOuter 环后速度按距离向
+          // reductioninner(‰) 衰减，distanceInner 内几乎静止（闪电两端锚定）。
+          this.ops.reduceNearCp.push({
+            cp: o.controlpoint !== undefined && o.controlpoint !== null ? num(o.controlpoint, 0) : 0,
+            distanceInner: num(o.distanceinner, 0),
+            distanceOuter: num(o.distanceouter, 0),
+            reductionInner: num(o.reductioninner, 0) / 1000, // 官方用千分比
+          })
+          break
+        }
+        case 'maintaindistancebetweencontrolpoints':
+          // 维持粒子在 CP 折线间距均匀（闪电束粒子不聚堆）。简化为把粒子
+          // 吸回它在最近两个 CP 连线上、按发射序号应处的等分点。完整约束
+          // 求解器属后续；当前对 rope 链已能消除明显聚堆。
+          this.ops.maintainDistance = { enabled: true }
+          break
+        case 'vortex_v2':
+          // 环形涡流（magic_vortex_orb）：ringradius 定义环、ringwidth 带宽，
+          // 环上 speedouter 旋转、ringpulldistance 内的粒子被拉向环；
+          // 中心 distanceInner..Outer 区间按径向距离插值速度。
+          this.ops.vortex2.push({
+            cp: o.controlpoint !== undefined && o.controlpoint !== null ? num(o.controlpoint, 0) : 0,
+            distanceInner: num(o.distanceinner, 0),
+            distanceOuter: num(o.distanceouter, 1),
+            speedInner: num(o.speedinner, 0),
+            speedOuter: num(o.speedouter, 0),
+            ringRadius: num(o.ringradius, 0),
+            ringWidth: num(o.ringwidth, 0),
+            ringPullDistance: num(o.ringpulldistance, 0),
+            flags: num(o.flags, 0),
           })
           break
         default:
@@ -1167,6 +1255,66 @@ export class ParticleSystem {
       }
     }
 
+    // mapsequencebetweencontrolpoints：沿控制点折线按发射序号投放 count 点。
+    if (this.init.mapBetween) {
+      const mb = this.init.mapBetween
+      // 收集有有效位置的控制点作为折线顶点（按 id 排序）
+      const cps = this.controlPoints
+        .map((c) => ({ id: c.id, pos: this._cpPos(c.id) }))
+        .filter((c) => c.pos)
+        .sort((a, b) => a.id - b.id)
+        .map((c) => c.pos)
+      if (cps.length >= 2) {
+        const n = mb.count
+        let idx = this._mapBetweenSeq++ % Math.max(1, n)
+        if (mb.mirror && n > 2) {
+          // ping-pong：0..n-1..1 循环
+          const period = 2 * (n - 1)
+          const m = idx % period
+          idx = m < n ? m : period - m
+        }
+        // 折线总长
+        const segLen = []
+        let total = 0
+        for (let s = 0; s < cps.length - 1; s++) {
+          const d = Math.hypot(cps[s + 1][0] - cps[s][0], cps[s + 1][1] - cps[s][1], cps[s + 1][2] - cps[s][2])
+          segLen.push(d)
+          total += d
+        }
+        const t = n > 1 ? idx / (n - 1) : 0
+        let dist = t * total
+        let sx = cps[0][0], sy = cps[0][1], sz = cps[0][2]
+        for (let s = 0; s < segLen.length; s++) {
+          if (dist <= segLen[s] || s === segLen.length - 1) {
+            const f = segLen[s] > 1e-6 ? Math.min(1, dist / segLen[s]) : 0
+            sx = cps[s][0] + (cps[s + 1][0] - cps[s][0]) * f
+            sy = cps[s][1] + (cps[s + 1][1] - cps[s][1]) * f
+            sz = cps[s][2] + (cps[s + 1][2] - cps[s][2]) * f
+            break
+          }
+          dist -= segLen[s]
+        }
+        // arc：确定性垂直扰动（按 idx 给锯齿，闪电分叉）。
+        if (mb.arcAmount) {
+          // 该段方向
+          let ax = 0, ay = 0
+          for (let s = 0; s < segLen.length; s++) {
+            if (t >= (segLen.slice(0, s).reduce((a, b) => a + b, 0)) / (total || 1) - 1e-9 &&
+                t <= (segLen.slice(0, s + 1).reduce((a, b) => a + b, 0)) / (total || 1) + 1e-9) {
+              const dx = cps[s + 1][0] - cps[s][0], dy = cps[s + 1][1] - cps[s][1]
+              const l = Math.hypot(dx, dy) || 1
+              ax = -dy / l; ay = dx / l
+              break
+            }
+          }
+          const jitter = (hash3(idx, 0, 0) * 2 - 1) * mb.arcAmount * (total / Math.max(1, n))
+          sx += ax * jitter
+          sy += ay * jitter
+        }
+        p.x = sx; p.y = sy; p.z = sz
+      }
+    }
+
     // 事件子级的爆发基点（父粒子的事件位置）叠加在发射器位置之上。
     // 放在 mapAround 之后：那一支是**覆写** p.x/y/z，不是叠加。
     if (at) {
@@ -1440,6 +1588,109 @@ export class ParticleSystem {
       }
     }
 
+    // vortex_v2：环形涡流。绕 CP 在 ringRadius 环上旋转，带内的粒子被
+    // speedOuter 卷起；ringPullDistance 内的粒子额外获得指向环的径向拉力
+    // （magic_vortex_orb：粒子被吸到环上沿环高速转）。
+    for (const v of O.vortex2) {
+      const base = this._cpPos(v.cp) || [0, 0, 0]
+      const dx = p.x - base[0]
+      const dy = p.y - base[1]
+      const dist = Math.hypot(dx, dy)
+      if (dist < 1e-3) continue
+      const span = Math.max(1e-6, v.distanceOuter - v.distanceInner)
+      const k = Math.min(1, Math.max(0, (dist - v.distanceInner) / span))
+      const speed = v.speedInner + (v.speedOuter - v.speedInner) * k
+      p.vx += (dy / dist) * speed * dt
+      p.vy += (-dx / dist) * speed * dt
+      // 拉向环（在 ringPullDistance 内、且不在环带宽内时）
+      if (v.ringRadius > 0 && v.ringPullDistance > 0) {
+        const toRing = v.ringRadius - dist
+        if (Math.abs(toRing) > v.ringWidth && Math.abs(toRing) < v.ringPullDistance) {
+          const pull = (toRing / Math.max(1, v.ringPullDistance)) * v.speedOuter
+          p.vx += (dx / dist) * pull * dt
+          p.vy += (dy / dist) * pull * dt
+        }
+      }
+    }
+
+    // reducemovementnearcontrolpoint：CP 邻域内速度向 0 衰减。
+    // reductionInner 是千分比（1000 = 完全静止）；distanceInner 内满阻尼，
+    // distanceInner..Outer 线性过渡到 0。
+    for (const r of O.reduceNearCp) {
+      const cp = this._cpPos(r.cp)
+      if (!cp) continue
+      const d = Math.hypot(p.x - cp[0], p.y - cp[1])
+      let damp = 0
+      if (d <= r.distanceInner) damp = r.reductionInner
+      else if (d < r.distanceOuter && r.distanceOuter > r.distanceInner) {
+        damp = r.reductionInner * (1 - (d - r.distanceInner) / (r.distanceOuter - r.distanceInner))
+      }
+      if (damp > 0) {
+        const f = Math.exp(-damp * dt)
+        p.vx *= f
+        p.vy *= f
+        p.vz *= f
+      }
+    }
+
+    // collisionquad / collisionplane：法向止速 + 位置夹回。
+    // 取 size 的主轴为平面静止轴（quad 的另一轴若是长度则做双向夹）。
+    for (const c of O.collision) {
+      const o = c.origin
+      const sx = c.size[0], sy = c.size[1]
+      // 选 size 里"面位置"语义：origin 给出面坐标，粒子越过则停。
+      // quad（闪电地面常见 origin "0 -300 0" size "4000 200"）：y 越过 -300 夹住。
+      if (sy !== 0 && p.y < o[1]) {
+        p.y = o[1]
+        if (p.vy < 0) p.vy = 0
+      }
+      if (sx !== 0 && Math.abs(p.x - o[0]) > Math.abs(sx) / 2) {
+        // quad 横向边界（很宽，通常不触发）
+        if (p.x < o[0]) { p.x = o[0] - Math.abs(sx) / 2; if (p.vx < 0) p.vx = 0 }
+        else { p.x = o[0] + Math.abs(sx) / 2; if (p.vx > 0) p.vx = 0 }
+      }
+    }
+
+    // maintaindistancebetweencontrolpoints：把粒子轻拉回 CP 折线最近点
+    // （闪电束沿两 CP 连线分布，不飞散）。只对有 ≥2 个有效 CP 的系统生效。
+    if (O.maintainDistance) {
+      let bx = 0, by = 0, best = Infinity
+      for (let ci = 0; ci < this.controlPoints.length - 1; ci++) {
+        const a = this._cpPos(this.controlPoints[ci].id)
+        const b = this._cpPos(this.controlPoints[ci + 1].id)
+        if (!a || !b) continue
+        const ex = b[0] - a[0], ey = b[1] - a[1]
+        const el2 = ex * ex + ey * ey || 1
+        let t = ((p.x - a[0]) * ex + (p.y - a[1]) * ey) / el2
+        t = Math.min(1, Math.max(0, t))
+        const qx = a[0] + ex * t, qy = a[1] + ey * t
+        const d = (p.x - qx) ** 2 + (p.y - qy) ** 2
+        if (d < best) { best = d; bx = qx; by = qy }
+      }
+      if (best < Infinity) {
+        const f = Math.min(1, 4 * dt) // 软拉回，不硬钉
+        p.vx += (bx - p.x) * f / Math.max(dt, 1e-4)
+        p.vy += (by - p.y) * f / Math.max(dt, 1e-4)
+      }
+    }
+
+    // capvelocity：速度幅值夹到 maxspeed（blendin 按生命周期比例渐入）。
+    if (O.capVelocity && O.capVelocity.maxSpeed > 0) {
+      const cv = O.capVelocity
+      let k = 1
+      if (cv.blendInEnd > cv.blendInStart) {
+        k = Math.min(1, Math.max(0, (p.age / Math.max(1e-4, p.life) - cv.blendInStart) / (cv.blendInEnd - cv.blendInStart)))
+      }
+      if (k > 0) {
+        const sp = Math.hypot(p.vx, p.vy, p.vz)
+        const limit = cv.maxSpeed / Math.max(1e-4, k) // k 小时放宽限速（渐入）
+        if (sp > limit) {
+          const f = limit / sp
+          p.vx *= f; p.vy *= f; p.vz *= f
+        }
+      }
+    }
+
     // --- 积分 ---
     p.bx += p.vx * dt
     p.by += p.vy * dt
@@ -1468,6 +1719,17 @@ export class ParticleSystem {
         else if (d === 1) p.y += off
         else p.z += off
       }
+    }
+
+    // positionoffsetrandom：随时间缓变的随机位移（闪电束抖动）。
+    // distance=位移半径(px)、timescale=抖动速率；每粒子种子保证各点独立。
+    if (O.posOffsetRandom && O.posOffsetRandom.distance > 0) {
+      const por = O.posOffsetRandom
+      const tt = this.simTime * (por.timeScale || 1)
+      const s0 = p.seed * 100
+      const amp = por.distance
+      p.x += (vnoise3(s0, tt * 0.3, 0) - 0.5) * 2 * amp
+      p.y += (vnoise3(0, s0, tt * 0.3) - 0.5) * 2 * amp
     }
 
     // --- 尺寸 ---

@@ -12,7 +12,7 @@ import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -1464,6 +1464,30 @@ cfg, source, pkgAbort.signal);
                 // 采样时必须 CLAMP，否则开窗形状无限平铺（2212279721）。
                 // 官方素材 Pixel 自带 flags 标记时优先，程序化兜底按名字表判定。
                 clampUvs: gen.clampUvs === true || ptex.isBuiltinClampUvsName(name),
+              };
+              textures.set(name, genEntry);
+              return genEntry;
+            }
+          }
+          // [we-scene patch] WE 内置纹样（pattern/voronoi[_local]）：watercaustics 的
+          // 槽 2（主焦散纹样）/ 槽 5（辉光）的 sampler default，缺它两槽落 whiteTex
+          // → 整层焦散变纯色（docs/ASSET-AUDIT.md §6 缺口第 1 条、唯一直接贴图缺口）。
+          // 官方 .tex flags bit1 = 0（sidecar `clampuvs:false`）→ REPEAT，且图像本身
+          // 是 256 周期化的（规格 §2「周期性」）——消费方 uv 随 g_Time 无界漂移，
+          // CLAMP 会把整片拉成边缘一行（与 util/* 同一教训）。
+          // 上面 ensureLocalAsset 命中官方像素时已进 textures；这里只兜程序化复刻。
+          if (!textures.has(name) && patTex.isBuiltinPatternTextureName(name)) {
+            const gen = patTex.buildBuiltinPatternTexture(name);
+            if (gen) {
+              const genEntry = {
+                glTex: rnd.makeTextureMip(renderer.gl, [gen], false, { wrap: "repeat" }),
+                width: gen.width,
+                height: gen.height,
+                rg88: false,
+                mips: [gen],
+                generated: true,
+                // 官方 flags bit1 = 0 / clampuvs:false → 效果链槽位按 REPEAT 绑定
+                clampUvs: false,
               };
               textures.set(name, genEntry);
               return genEntry;

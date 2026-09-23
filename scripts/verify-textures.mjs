@@ -1051,5 +1051,406 @@ async function builtinGradients() {
 
 await builtinGradients();
 
+// ---------- WE 内置纹样（pattern/voronoi[_local]）：程序化复刻 + 三处接线 ----------
+// 官方 `materials/pattern/` 下两张 256² 灰度 Voronoi 图（**不在壁纸 pkg 里**），全库唯一
+// 消费方是 watercaustics：`shaders/effects/caustics.frag` 槽 2 默认 `pattern/voronoi_local`
+// （主焦散纹样，.r 采 3 次做色散）、槽 5 默认 `pattern/voronoi`（辉光）。缺它两槽落
+// whiteTex → 整层焦散退化成纯色（docs/ASSET-AUDIT.md §2 pattern 行 + §6 缺口第 1 条）。
+// 复刻规格：docs/replication/pattern-voronoi.spec.md（判据锁「统计锚点 + 周期性 +
+// 两图共享几何」，不锁官方像素；合规要求种子按锚点**重新随机**，不照抄官方坐标）。
+async function builtinPatterns() {
+  const pat = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/pattern-textures.js")).href
+  );
+  const SIZE = 256;
+  const N = SIZE * SIZE;
+  const EXPECTED = ["pattern/voronoi", "pattern/voronoi_local"];
+
+  // ---- 登记表 / 产出契约 ----
+  check(
+    JSON.stringify(pat.listBuiltinPatternTextureNames()) === JSON.stringify(EXPECTED),
+    "内置纹样登记表 = pattern/voronoi + pattern/voronoi_local（官方 materials/pattern 的全部内容）",
+  );
+  check(
+    !pat.isBuiltinPatternTextureName("pattern/nope") &&
+      !pat.isBuiltinPatternTextureName("gradient/gradient_fire") &&
+      !pat.isBuiltinPatternTextureName("util/white") &&
+      !pat.isBuiltinPatternTextureName(null) &&
+      !pat.isBuiltinPatternTextureName(undefined),
+    "isBuiltinPatternTextureName 必须拒绝未登记名 / 别族名 / null",
+  );
+  const vor = pat.buildBuiltinPatternTexture("pattern/voronoi");
+  const loc = pat.buildBuiltinPatternTexture("pattern/voronoi_local");
+  check(!!vor && !!loc, "两张纹样都必须有产出（缺失时 watercaustics 槽 2/5 落白板）");
+  check(pat.buildBuiltinPatternTexture("pattern/nope") === null, "未登记名必须返回 null（不吞掉 pkg/其它来源）");
+  check(pat.buildBuiltinPatternTexture("pattern/voronoi") === vor, "同名字必须命中缓存（确定性，像素 diff 才可对账）");
+
+  const grayOf = (t) => {
+    const g = new Uint8Array(N);
+    for (let i = 0; i < N; i++) g[i] = t.rgba[i * 4];
+    return g;
+  };
+  const gv = grayOf(vor);
+  const gl = grayOf(loc);
+  check(vor.width === SIZE && vor.height === SIZE && loc.width === SIZE && loc.height === SIZE, "两张纹样都必须是 256×256（官方容器实测）");
+  {
+    let mono = true;
+    let alpha = true;
+    for (let i = 0; i < N; i++) {
+      const o = i * 4;
+      if (vor.rgba[o] !== vor.rgba[o + 1] || vor.rgba[o + 1] !== vor.rgba[o + 2]) mono = false;
+      if (vor.rgba[o + 3] !== 255) alpha = false;
+      const o2 = i * 4;
+      if (loc.rgba[o2] !== loc.rgba[o2 + 1] || loc.rgba[o2 + 1] !== loc.rgba[o2 + 2] || loc.rgba[o2 + 3] !== 255) mono = false;
+    }
+    check(mono && alpha, "两张纹样都必须是纯灰度（R=G=B）+ alpha 全 255（官方实测）");
+  }
+  // 黄金哈希：生成器常量（种子/公式）一改就红 —— 有意改动时同步更新这两个常量。
+  const fnv1a = (u8) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < u8.length; i++) {
+      h ^= u8[i];
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  };
+  check(fnv1a(gv) === 0x82c5d047, `pattern/voronoi 灰度黄金哈希（实得 0x${fnv1a(gv).toString(16)}，期望 0x82c5d047）`);
+  // local 哈希：连续 Lc 模型（2026-09-24 替换离散 L，修 gradMax 132→45）。
+  check(fnv1a(gl) === 0x4cef797e, `pattern/voronoi_local 灰度黄金哈希（实得 0x${fnv1a(gl).toString(16)}，期望 0x4cef797e）`);
+
+  // ---- 周期性（规格 §2 的定性特征，验收必查）----
+  // 官方两图是**周期化**的 Voronoi 场：把 32 个种子按 256 周期平铺后，环绕 F1 逐像素
+  // 解释整张图（官方 corr 0.9994 / 边缘带零违例）；同一组种子算非环绕 F1 只有 0.8679。
+  // 复刻必须同语义 —— 否则 REPEAT 平铺会出现接缝（消费方 uv 随 g_Time 无界漂移）。
+  const seeds = pat.patternSeeds();
+  check(
+    Array.isArray(seeds) && seeds.length === 32 && seeds.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)),
+    "必须是 32 个有限坐标的种子（官方实测 32 点 Voronoi）",
+  );
+  const corrOf = (a, b) => {
+    let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (let i = 0; i < N; i++) {
+      const x = a[i], y = b[i];
+      sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
+    }
+    const ma = sa / N, mb = sb / N;
+    return (sab / N - ma * mb) / (Math.sqrt(saa / N - ma * ma) * Math.sqrt(sbb / N - mb * mb));
+  };
+  const f1Map = (toroidal) => {
+    const out = new Float32Array(N);
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        let best = Infinity;
+        for (const [sx, sy] of seeds) {
+          let dx = x - sx;
+          let dy = y - sy;
+          if (toroidal) {
+            dx -= SIZE * Math.round(dx / SIZE);
+            dy -= SIZE * Math.round(dy / SIZE);
+          }
+          const d = dx * dx + dy * dy;
+          if (d < best) best = d;
+        }
+        out[y * SIZE + x] = Math.sqrt(best);
+      }
+    }
+    return out;
+  };
+  const f1t = f1Map(true);
+  const f1n = f1Map(false);
+  const modelT = new Float32Array(N);
+  const modelN = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    modelT[i] = Math.round(3.0 * f1t[i]);
+    modelN[i] = Math.round(3.0 * f1n[i]);
+  }
+  // 独立重算（本文件自己的环绕实现）必须逐像素命中：既锁公式 v = round(3·F1)，也锁环绕语义。
+  let mismatch = 0;
+  for (let i = 0; i < N; i++) if (gv[i] !== modelT[i]) mismatch++;
+  check(mismatch === 0, `voronoi 必须等于 round(3.0 × 环绕 F1)（独立重算，实得 ${mismatch} 个像素不符）`);
+  check(
+    corrOf(gv, modelT) - corrOf(gv, modelN) > 0.05,
+    `环绕语义必须显著优于非环绕（corr ${corrOf(gv, modelT).toFixed(4)} vs ${corrOf(gv, modelN).toFixed(4)}）`,
+  );
+  {
+    // 边缘带（四周 ±8px）按环绕模型零违例；非环绕模型必须在这里露馅（反例非空 = 判据不恒真）
+    const viol = (model) => {
+      let bad = 0;
+      for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+          if (x >= 8 && x < SIZE - 8 && y >= 8 && y < SIZE - 8) continue;
+          if (Math.abs(gv[y * SIZE + x] - model[y * SIZE + x]) > 5) bad++;
+        }
+      }
+      return bad;
+    };
+    check(viol(modelT) === 0, `边缘带按环绕模型必须零违例（实得 ${viol(modelT)}）`);
+    check(viol(modelN) > 50, `反证：非环绕模型必须在边缘带露馅（实得 ${viol(modelN)} 个违例，判据不得恒真）`);
+  }
+
+  const statsOf = (g) => {
+    let s = 0, s2 = 0, max = 0;
+    for (const v of g) { s += v; s2 += v * v; if (v > max) max = v; }
+    const m = s / N;
+    return { mean: m, sd: Math.sqrt(s2 / N - m * m), max };
+  };
+  const covAbove = (g, t) => { let c = 0; for (const v of g) if (v > t) c++; return (100 * c) / N; };
+  const covBelow = (g, t) => { let c = 0; for (const v of g) if (v <= t) c++; return (100 * c) / N; };
+
+  // ---- pattern/voronoi 锚点（规格 §2.1/§5.3）----
+  const sv = statsOf(gv);
+  check(sv.max >= 140 && sv.max <= 200, `voronoi 最大值应对齐官方 161（实得 ${sv.max}）`);
+  check(Math.abs(sv.mean - 61.84) < 5, `voronoi 均值应对齐官方 61.84（实得 ${sv.mean.toFixed(2)}）`);
+  check(Math.abs(sv.sd - 29.45) < 5, `voronoi 标准差应对齐官方 29.45（实得 ${sv.sd.toFixed(2)}）`);
+  {
+    // 径向剖面（全图像素按环绕 F1 分桶 1.5px 求均值）必须线性、斜率 3.0 灰阶/px
+    const nb = 26;
+    const sum = new Float64Array(nb), cnt = new Float64Array(nb);
+    for (let i = 0; i < N; i++) {
+      const k = Math.floor(f1t[i] / 1.5);
+      if (k < nb) { sum[k] += gv[i]; cnt[k]++; }
+    }
+    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    for (let k = 0; k < nb; k++) {
+      if (cnt[k] < 50) continue;
+      const r = k * 1.5, m = sum[k] / cnt[k];
+      n++; sx += r; sy += m; sxx += r * r; sxy += r * m; syy += m * m;
+    }
+    const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    const r2 = ((n * sxy - sx * sy) ** 2) / ((n * sxx - sx * sx) * (n * syy - sy * sy));
+    check(slope > 2.8 && slope < 3.2, `voronoi 径向剖面斜率应为 3.0 灰阶/px（实得 ${slope.toFixed(3)}）`);
+    check(r2 > 0.995, `voronoi 径向剖面必须严格线性（R²=${r2.toFixed(5)}）`);
+  }
+  {
+    let gmax = 0;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE - 1; x++) {
+        const d = Math.abs(gv[y * SIZE + x] - gv[y * SIZE + x + 1]);
+        if (d > gmax) gmax = d;
+      }
+    }
+    check(gmax <= 6, `voronoi 是极平滑距离场（水平梯度 max 应 ≈3，实得 ${gmax}）`);
+  }
+
+  // ---- pattern/voronoi_local 锚点（规格 §2.2/§5.4）----
+  const sl = statsOf(gl);
+  // 连续 Lc 平滑后最亮结点零星到 ~249（离散模型 255；仅个别像素、视觉不可分辨）。
+  // 用 ≥245 而非精确 255：若连续化导致整体压暗，max 会明显跌出，仍能被抓住。
+  check(sl.max >= 245, `local 最亮结点应≈255（实得 ${sl.max}）`);
+  check(Math.abs(sl.mean - 35.52) < 4, `local 均值应对齐官方 35.52（实得 ${sl.mean.toFixed(2)}）`);
+  check(Math.abs(sl.sd - 52.49) < 6, `local 标准差应对齐官方 52.49（实得 ${sl.sd.toFixed(2)}）`);
+  const dark = covBelow(gl, 9);
+  check(Math.abs(dark - 56.5) < 4, `local 胞内深黑（≤9）应≈56.5%（实得 ${dark.toFixed(1)}%）`);
+  const c64 = covAbove(gl, 64), c128 = covAbove(gl, 128), c200 = covAbove(gl, 200);
+  check(Math.abs(c64 - 24.1) < 3, `local >64 覆盖率应≈24.1%（实得 ${c64.toFixed(1)}%）`);
+  check(Math.abs(c128 - 9.1) < 2, `local >128 覆盖率应≈9.1%（实得 ${c128.toFixed(1)}%）`);
+  check(Math.abs(c200 - 0.62) < 0.25, `local >200 覆盖率应≈0.62%（实得 ${c200.toFixed(2)}%）`);
+  {
+    // 脊线宽度（水平 run >128 中位 4px、p90 10px）
+    const runs = [];
+    for (let y = 0; y < SIZE; y++) {
+      let run = 0;
+      for (let x = 0; x < SIZE; x++) {
+        if (gl[y * SIZE + x] > 128) run++;
+        else { if (run) runs.push(run); run = 0; }
+      }
+      if (run) runs.push(run);
+    }
+    runs.sort((a, b) => a - b);
+    const q = (p) => runs[Math.min(runs.length - 1, Math.floor(p * runs.length))];
+    check(q(0.5) >= 2 && q(0.5) <= 7, `local 脊线 run>128 中位应≈4px（实得 ${q(0.5)}）`);
+    check(q(0.9) >= 5 && q(0.9) <= 16, `local 脊线 run>128 p90 应≈10px（实得 ${q(0.9)}）`);
+  }
+  // 热点（>200）必须聚成小簇、且全部落在三胞结点上（官方 405 像素 / 37 簇 / 最大 34px²）
+  {
+    const mask = new Uint8Array(N);
+    let hot = 0;
+    for (let i = 0; i < N; i++) if (gl[i] > 200) { mask[i] = 1; hot++; }
+    const seen = new Uint8Array(N);
+    const sizes = [];
+    for (let i = 0; i < N; i++) {
+      if (!mask[i] || seen[i]) continue;
+      const st = [i];
+      seen[i] = 1;
+      let n = 0;
+      while (st.length) {
+        const k = st.pop();
+        n++;
+        const x = k % SIZE, y = (k - x) / SIZE;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const xx = ((x + dx) % SIZE + SIZE) % SIZE;
+          const yy = ((y + dy) % SIZE + SIZE) % SIZE;
+          const kk = yy * SIZE + xx;
+          if (mask[kk] && !seen[kk]) { seen[kk] = 1; st.push(kk); }
+        }
+      }
+      sizes.push(n);
+    }
+    check(hot >= 200 && hot <= 700, `local >200 热点像素数应≈405（实得 ${hot}）`);
+    check(sizes.length >= 20 && sizes.length <= 120, `local 热点必须是小簇（官方 37 簇，实得 ${sizes.length}）`);
+    check(Math.max(...sizes) <= 60, `local 最大热点簇应≈34px²（实得 ${Math.max(...sizes)}）`);
+  }
+  {
+    // local 水平梯度守卫（修 gradMax 回归）：离散 L 会在第二近种子切换点产生硬跳变
+    // （实测得 gradMax 132，官方仅 43），脊线被打成硬边。连续 Lc 后 gradMax≈45。
+    let gmax = 0;
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE - 1; x++) {
+      const d = Math.abs(gl[y * SIZE + x] - gl[y * SIZE + x + 1]);
+      if (d > gmax) gmax = d;
+    }
+    check(gmax <= 55, `local 水平梯度 max 应≈官方 43（连续 Lc；实得 ${gmax}）`);
+  }
+
+  // ---- 两图共享几何（规格 §2.3 四条证据，全部环绕度量）----
+  {
+    const bright = [];
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) if (gl[y * SIZE + x] > 128) bright.push([x, y]);
+    // ① 种子（voronoi 的 v≈0 黑点）到最近亮脊的距离 ≈ 胞心到边界的量级
+    let dmin = Infinity, dmax = 0;
+    const ds = [];
+    for (const [sx, sy] of seeds) {
+      let best = Infinity;
+      for (const [bx, by] of bright) {
+        let dx = sx - bx, dy = sy - by;
+        dx -= SIZE * Math.round(dx / SIZE);
+        dy -= SIZE * Math.round(dy / SIZE);
+        const d = dx * dx + dy * dy;
+        if (d < best) best = d;
+      }
+      ds.push(Math.sqrt(best));
+    }
+    ds.sort((a, b) => a - b);
+    dmin = ds[0];
+    dmax = ds[ds.length - 1];
+    check(dmin >= 8 && dmax <= 40, `种子到最近亮脊的距离应≈胞心到边界（官方 12.0..26.9px，实得 ${dmin.toFixed(1)}..${dmax.toFixed(1)}）`);
+    // ② voronoi ≈ blur(local)（两趟盒式、半径 16；官方 corr 0.7053）
+    const blur = new Float32Array(N);
+    {
+      const tmp = new Float32Array(N);
+      for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        let s = 0, c = 0;
+        for (let d = -16; d <= 16; d++) { const xx = x + d; if (xx < 0 || xx >= SIZE) continue; s += gl[y * SIZE + xx]; c++; }
+        tmp[y * SIZE + x] = s / c;
+      }
+      for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        let s = 0, c = 0;
+        for (let d = -16; d <= 16; d++) { const yy = y + d; if (yy < 0 || yy >= SIZE) continue; s += tmp[yy * SIZE + x]; c++; }
+        blur[y * SIZE + x] = s / c;
+      }
+    }
+    const corrBlur = corrOf(Float32Array.from(gv), blur);
+    check(corrBlur > 0.4, `两图必须共享几何：corr(voronoi, blur16(local)) 应≈0.7（实得 ${corrBlur.toFixed(4)}）`);
+    // ③ 亮/暗像素按环绕 F2−F1 干净分离（官方：>128 的 d2 ≤ 6.48 中位 1.45；<10 的 d2 中位 14.65）
+    const f2t = new Float32Array(N);
+    const f3t = new Float32Array(N);
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+      let a = Infinity, b = Infinity, c = Infinity;
+      for (const [sx, sy] of seeds) {
+        let dx = x - sx, dy = y - sy;
+        dx -= SIZE * Math.round(dx / SIZE);
+        dy -= SIZE * Math.round(dy / SIZE);
+        const d = dx * dx + dy * dy;
+        if (d < a) { c = b; b = a; a = d; }
+        else if (d < b) { c = b; b = d; }
+        else if (d < c) c = d;
+      }
+      f2t[y * SIZE + x] = Math.sqrt(b) - Math.sqrt(a);
+      f3t[y * SIZE + x] = Math.sqrt(c) - Math.sqrt(a);
+    }
+    let bmax = 0, bin = 0;
+    let dmed = [];
+    let hotMax = 0;
+    for (let i = 0; i < N; i++) {
+      if (gl[i] > 128) { if (f2t[i] > bmax) bmax = f2t[i]; bin++; }
+      if (gl[i] < 10) dmed.push(f2t[i]);
+      if (gl[i] > 200) { if (f3t[i] > hotMax) hotMax = f3t[i]; }
+    }
+    check(bin > 2000 && bmax <= 12, `>128 亮脊必须紧贴胞边界（官方 d2 max 6.48，实得 ${bmax.toFixed(2)}）`);
+    dmed.sort((a, b) => a - b);
+    check(dmed[Math.floor(dmed.length / 2)] >= 10, `<10 胞内黑应远离边界（官方 d2 中位 14.65，实得 ${dmed[Math.floor(dmed.length / 2)].toFixed(2)}）`);
+    // ④ 全部 >200 热点落在三胞结点（官方 F3−F1 max 4.81 < 10）
+    check(hotMax < 10, `>200 热点必须全部落在三胞结点（官方 F3−F1 max 4.81，实得 ${hotMax.toFixed(2)}）`);
+  }
+
+  // ---- mip 行为（官方 7 级链；本地策略 = mip0 + generateMipmap 的盒式降采样）----
+  {
+    const chain = (g) => {
+      const out = [];
+      let cur = Float32Array.from(g);
+      let size = SIZE;
+      out.push({ mean: cur.reduce((a, b) => a + b, 0) / cur.length, max: Math.max(...cur) });
+      while (size > 4) {
+        const h = size / 2;
+        const next = new Float32Array(h * h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < h; x++) {
+          next[y * h + x] = (cur[2 * y * size + 2 * x] + cur[2 * y * size + 2 * x + 1] + cur[(2 * y + 1) * size + 2 * x] + cur[(2 * y + 1) * size + 2 * x + 1]) / 4;
+        }
+        cur = next;
+        size = h;
+        out.push({ mean: cur.reduce((a, b) => a + b, 0) / cur.length, max: Math.max(...cur) });
+      }
+      return out;
+    };
+    const cv = chain(gv), cl = chain(gl);
+    check(cv.length === 7 && cl.length === 7, `两条 mip 链都应是 7 级（256→4，官方实测；实得 ${cv.length}/${cl.length}）`);
+    const drift = Math.max(...cv.map((m) => Math.abs(m.mean - cv[0].mean)), ...cl.map((m) => Math.abs(m.mean - cl[0].mean)));
+    check(drift < 3, `盒式降采样的 mip 链均值必须稳定（官方 61.8→59.8 / 35.5→33.7 同量级，实得最大漂移 ${drift.toFixed(2)}）`);
+    check(cl[6].max > 20 && cl[6].max < 120 && cv[6].max < cv[0].max, `最粗一级 mip 不得退化（local 4×4 级 max 应≈42、voronoi≈97，实得 ${cl[6].max.toFixed(0)}/${cv[6].max.toFixed(0)}）`);
+  }
+
+  // ---- 合规：种子按锚点重新随机，不照抄官方坐标 ----
+  // 官方 32 个种子坐标的实测表留在规格 §2.3（docs/replication/pattern-voronoi.spec.md），
+  // 复刻不得逐坐标搬运 —— 这里直接读规格里的表做最小间距断言。
+  {
+    const specPath = join(ROOT, "docs/replication/pattern-voronoi.spec.md");
+    if (!fs.existsSync(specPath)) {
+      console.log("  （跳过官方种子间距检查：没有 " + specPath + "）");
+    } else {
+      const table = [...fs.readFileSync(specPath, "utf8").matchAll(/\((\d+),(\d+),\d+\)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+      check(table.length === 32, `规格 §2.3 的官方种子表应能解出 32 个坐标（实得 ${table.length}）`);
+      let minDist = Infinity;
+      for (const [mx, my] of seeds) {
+        for (const [ox, oy] of table) {
+          let dx = Math.abs(mx - ox), dy = Math.abs(my - oy);
+          if (dx > SIZE / 2) dx = SIZE - dx;
+          if (dy > SIZE / 2) dy = SIZE - dy;
+          const d = Math.hypot(dx, dy);
+          if (d < minDist) minDist = d;
+        }
+      }
+      check(minDist >= 3, `复刻种子必须重新随机（与官方种子表最小间距 ≥3px，实得 ${minDist.toFixed(2)}px）`);
+    }
+  }
+
+  // ---- 接线三处：loadTexInner 兜底（pkg 缺项分支的 return null 之前）、vendor 出口、
+  //      local-assets provider。少一处：官方像素或程序化兜底整条断链、静默落白。----
+  const sm = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/patTex\.isBuiltinPatternTextureName\(name\)/.test(sm), "接线：loadTexInner 必须在 pkg 缺项时问内置纹样登记表");
+  check(/patTex\.buildBuiltinPatternTexture\(name\)/.test(sm), "接线：命中登记表必须调 buildBuiltinPatternTexture 生成兜底像素");
+  check(
+    (() => {
+      // 「缺项分支」= ensureLocalAsset 起、到该分支第一个 return null 止的那段兜底链
+      // （ptex → patTex → gtex）。按结构切片而不是量字符宽度：块变长不该误报。
+      const start = sm.indexOf("await ensureLocalAsset(name)");
+      const end = sm.indexOf("return null;", start);
+      if (start < 0 || end < 0) return false;
+      const chain = sm.slice(start, end);
+      return /patTex\.isBuiltinPatternTextureName\(name\)/.test(chain) && /patTex\.buildBuiltinPatternTexture\(name\)/.test(chain);
+    })(),
+    "纹样兜底必须位于 loadTexInner 缺项分支的 return null 之前（与 ptex/gtex 同一条兜底链）",
+  );
+  check(
+    /buildBuiltinPatternTexture[\s\S]{0,600}wrap: "repeat"/.test(sm),
+    "纹样注册必须 REPEAT 环绕（官方 flags bit1=0 / clampuvs:false；CLAMP 下 uv 漂移被拉成边缘行）",
+  );
+  check(/clampUvs: false/.test(sm), "纹样 entry 必须带 clampUvs:false（效果链槽位据此选 REPEAT）");
+  const vendor = fs.readFileSync(join(ROOT, "renderer/src/vendor.ts"), "utf8");
+  check(/pattern-textures\.js/.test(vendor) && /patTex/.test(vendor), "vendor 出口必须引 pattern-textures.js 并导出 patTex");
+  const la = fs.readFileSync(join(ROOT, "renderer/src/local-assets.ts"), "utf8");
+  check(/patTex\.setPatternTextureProvider/.test(la), "local-assets 必须给纹样装 provider（本机官方像素覆盖）");
+}
+
+await builtinPatterns();
+
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

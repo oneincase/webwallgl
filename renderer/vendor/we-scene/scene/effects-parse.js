@@ -2,29 +2,63 @@ import { getEntry } from '../pkg/container.js'
 // 解析效果的 material 链：effects/<name>/effect.json → materials/effects/*.json 的 passes
 // 产出 layer.effects[i] 的 { materialPasses, fbos, binds }，供通用 pass 管线使用。
 
+/**
+ * [we-scene patch] WE 自带 effect/material json 允许**尾逗号**（其引擎 JSON 解析器
+ * 容忍，如 fluidsimulation/effect.json 的 dependencies 末尾 `…, ]`），JSON.parse
+ * 严格模式会抛错，使 resolveEffectChain 在 catch 处静默退出 —— 表现为整个特效
+ * materialPasses/fbos 全空、效果消失且无报错。
+ * 仅在严格解析失败时尝试「去尾逗号」，合法文件原样解析，避免改动正常内容；
+ * 正则只匹配紧贴 }/] 的逗号，WE 数据里不会出现在字符串值中。
+ */
+function parseEffectJson(text) {
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1'))
+  }
+}
+
 // pkg: parsePkg 结果；effect: scene.json 的效果条目（file/passes/visible）
 export function resolveEffectChain(pkg, effect, readText) {
   const entry = getEntry(pkg, effect.file)
   if (entry === null) return
   let ej
   try {
-    ej = JSON.parse(readText(entry))
+    ej = parseEffectJson(readText(entry))
   } catch (e) {
     return
   }
   effect.fbos = ej.fbos || []
   effect.materialPasses = (ej.passes || []).map((p) => {
     if (!p.material) {
-      // 无 material 的 copy 命令 pass：`{"command":"copy","target":X,"source":Y}`。
+      // 无 material 的命令 pass：copy（source→target 整块拷）或 swap（交换两个 FBO）。
+      // [we-scene patch] copy 命令 pass：`{"command":"copy","target":X,"source":Y}`。
       // [we-scene patch] 必须带上 source —— 此前只存 target，渲染器又完全没实现 copy，
       // 于是 motionblur 这类**帧累积**效果拿不到「上一帧」：
       // accumulation pass 读的 _rt_FullCompoBuffer1 永远没被写过，
       // `mix(pastAlbedo, albedo, rate)` 自我反馈直到饱和 ——
       // 表现为画面竖向拉丝并冲成全白（1444077782 实测 74% 像素过曝、只剩 14% 彩色）。
       // copy 画完后还必须 TRIANGLES 6：PASS_QUAD 是三角形列表，STRIP 4 会只拷半块对角。
+      // [we-scene patch] swap（fluidsimulation 末尾乒乓）：`{"command":"swap",
+      // "source":A,"target":B}` 语义是交换两个 FBO 名指向的缓冲，不拷像素。
+      if (p.command === 'swap') {
+        return {
+          shader: null,
+          copyCommand: false,
+          swapCommand: true,
+          target: p.target || null,
+          source: p.source || null,
+          binds: p.bind || [],
+          blending: 'normal',
+          textures: [],
+          combos: {},
+          constants: {},
+        }
+      }
       return {
         shader: null,
         copyCommand: true,
+        swapCommand: false,
         target: p.target || null,
         source: p.source || null,
         binds: p.bind || [],
@@ -38,7 +72,7 @@ export function resolveEffectChain(pkg, effect, readText) {
     if (me === null) {
       return { shader: null, copyCommand: false, target: p.target || null, binds: p.bind || [], blending: 'normal', textures: [], combos: {}, constants: {} }
     }
-    const mj = JSON.parse(readText(me))
+    const mj = parseEffectJson(readText(me))
     const mp = (mj.passes && mj.passes[0]) || {}
     return {
       shader: mp.shader || null,
