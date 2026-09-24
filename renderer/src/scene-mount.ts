@@ -2711,10 +2711,15 @@ cfg, source, pkgAbort.signal);
           };
           // 图层 instanceoverride（如 colorn 绑用户颜色）下传到没有自己 override 的子级，
           // 否则 Pac-Man / 幽灵的颜色滑块只作用在空 renderer 的隐形父系统上。
+          // 事件子级（eventdeath/eventspawn）例外：它们由父粒子死亡/生成事件临时实例化，
+          // 图层 override 是作者绑给父粒子系统的（3436945972 火箭的 colorn 橙色），
+          // 下传给 REFRACT 冲击波会把整块白 quad 的折射画面染成同色方块 ——
+          // 官方 frag 对 v_Color 与折射结果做乘法，事件子级的 v_Color 应取自己的配置。
+          const eventChild = ch.type === "eventdeath" || ch.type === "eventspawn";
           const childPs = await buildParticleSystem(
             ch.name,
             childLayer,
-            ch.instanceoverride || override,
+            eventChild ? ch.instanceoverride || null : ch.instanceoverride || override,
             depth + 1,
           );
           if (childPs && followMode) {
