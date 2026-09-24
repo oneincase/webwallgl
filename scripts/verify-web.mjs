@@ -135,7 +135,6 @@ async function importIsolatedFn(srcText, fnName) {
     { baseHref: "https://cdn.example/wp/" },
   );
   check((withBase.match(/<base\b/gi) || []).length === 1, "已有 <base> 时不得再插一个");
-
   const bare = rw.rewriteHtml(`<script>author()</script>`, shim, {
     baseHref: "https://x/a/",
     seedScript: "window.__SEED=1;",
@@ -317,7 +316,13 @@ async function importIsolatedFn(srcText, fnName) {
 }
 
 // ---------- 3. shim 行为 ----------
-function runShim(extras) {
+/**
+ * @param extras 预注入的全局（HTMLMediaElement/Audio 等须在 shim 安装前就位）
+ * @param opts.opaqueStorage 模拟严格沙箱（sandbox="allow-scripts"）的**不透明源**：
+ *   localStorage / sessionStorage / document.cookie 的**读取本身**抛 SecurityError
+ *   （Chromium 实测，不是返回不可用对象）—— 这正是宿主用 webSandbox=strict 时的环境。
+ */
+function runShim(extras, opts) {
   const loadHandlers = [];
   const win = {
     URL,
@@ -371,8 +376,79 @@ function runShim(extras) {
   // 预注入（HTMLMediaElement/Audio 等须在 shim 安装前就位——hook 在安装时立即执行）
   if (extras) Object.assign(win, extras);
   win.window = win;
-  vm.runInNewContext(shimSrc, win);
-  return { win, loadHandlers };
+  const ctx = vm.createContext(win);
+  if (opts && opts.opaqueStorage) {
+    // 必须在**上下文内部**定义这些访问器：从外层 Object.defineProperty 装在 sandbox 上的
+    // 访问器，在 vm 里读出来是 `undefined`（既不抛也不给值，实测），测试会假绿。
+    vm.runInContext(`
+      (function () {
+        function boom(what) {
+          function fail() {
+            throw new Error("SecurityError: sandboxed and lacks the 'allow-same-origin' flag: " + what);
+          }
+          return { configurable: true, get: fail, set: fail };
+        }
+        Object.defineProperty(globalThis, "localStorage", boom("localStorage"));
+        Object.defineProperty(globalThis, "sessionStorage", boom("sessionStorage"));
+        // document.cookie 在真实引擎里挂在 **Document.prototype** 上（不是 document 自有属性），
+        // 假环境必须同构：否则 shim 定义到原型上的兜底访问不到，测试同样假绿。
+        function Document() {}
+        Object.defineProperty(Document.prototype, "cookie", boom("cookie"));
+        globalThis.Document = Document;
+        Object.setPrototypeOf(document, Document.prototype);
+      })();
+    `, ctx);
+  }
+  vm.runInContext(shimSrc, ctx);
+  return { win, loadHandlers, ctx, evalIn: (code) => vm.runInContext(code, ctx) };
+}
+
+{
+  // 不透明源兜底：这三样读取即抛时必须在作者脚本前换掉。语料（本机 15 张 web 壁纸）
+  // localStorage 6 张、document.cookie 2 张，且都写在作者的第一行逻辑里 ——
+  // 2905017768 Bocchi 把它放进 React 的 useState 初始化，首屏就崩成白屏、
+  // 作者一帧不跑（宿主读到 web fps 恒 -1）。
+  const { evalIn } = runShim({}, { opaqueStorage: true });
+  const r = JSON.parse(evalIn(`(function () {
+    var out = {};
+    function t(name, fn) { try { out[name] = String(fn()); } catch (e) { out[name] = "THROW:" + (e && e.name); } }
+    t("readType", function () { return typeof window.localStorage; });
+    t("sameInstance", function () { return window.localStorage === window.localStorage; });
+    t("ssDistinct", function () { return window.sessionStorage !== window.localStorage; });
+    t("roundTrip", function () { window.localStorage.setItem("k", "v"); return window.localStorage.getItem("k"); });
+    t("missingNull", function () { return String(window.localStorage.getItem("nope")); });
+    t("length", function () { return String(window.localStorage.length); });
+    t("keys", function () { return Object.keys(window.localStorage).join(","); });
+    t("propStyle", function () { window.localStorage.foo = 1; return window.localStorage.getItem("foo"); });
+    t("removeItem", function () { window.localStorage.removeItem("k"); return String(window.localStorage.length); });
+    t("clear", function () { window.localStorage.clear(); return String(window.localStorage.length); });
+    t("cookieWrite", function () { document.cookie = "ggvar_x=1"; return document.cookie; });
+    t("cookieDelete", function () { document.cookie = "ggvar_x=1; expires=Thu, 01 Jan 1970 00:00:00 GMT"; return document.cookie; });
+    return JSON.stringify(out);
+  })()`));
+  check(r.readType === "object", "不透明源：localStorage 被兜底（读取不再抛）", r.readType);
+  check(r.sameInstance === "true", "不透明源：localStorage 是同一实例（getter 不许每次新建）");
+  check(r.ssDistinct === "true", "不透明源：sessionStorage 与 localStorage 各自独立");
+  check(r.roundTrip === "v", "不透明源：写入可读回");
+  check(r.missingNull === "null", "不透明源：未写入的键返回 null（不是 undefined）");
+  check(r.length === "1", "不透明源：length 只数已存键", r.length);
+  check(r.keys === "k", "不透明源：Object.keys 只列存储键，不列方法", r.keys);
+  check(r.propStyle === "1", "不透明源：属性式写入与 getItem 是同一份数据", r.propStyle);
+  check(r.removeItem === "1", "不透明源：removeItem 生效", r.removeItem);
+  check(r.clear === "0", "不透明源：clear 生效", r.clear);
+  check(r.cookieWrite === "ggvar_x=1", "不透明源：cookie 写后可读回（pano2vr 一族要 read-back）", r.cookieWrite);
+  check(r.cookieDelete === "", "不透明源：过期时间在过去 = 删除", r.cookieDelete);
+}
+
+{
+  // 同源页（WallpaperEM 的注入路径）必须**保留原生存储**，不能被兜底接管：
+  // 原生 localStorage 是持久的，兜底是内存的 —— 平白丢掉持久化就是回归。
+  const real = { getItem: () => "real", setItem() {}, length: 0 };
+  const { evalIn } = runShim({ localStorage: real });
+  const got = evalIn(`(function () {
+    try { return String(window.localStorage.getItem("x")); } catch (e) { return "THROW:" + (e && e.name); }
+  })()`);
+  check(got === "real", "同源页不接管 localStorage（原生持久化保留）", got);
 }
 
 {

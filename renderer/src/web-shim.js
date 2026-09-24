@@ -34,6 +34,198 @@
     
   }
 
+  /**
+   * 不透明源下的存储 / Cookie 兜底。
+   *
+   * 严格沙箱（`sandbox="allow-scripts"`）里文档是不透明源，下面这些属性**读取即抛**
+   * SecurityError —— 不是「返回一个不可用的对象」，而是属性访问本身抛（Chromium
+   * 实测，2026-09-25）：
+   *   window.localStorage / window.sessionStorage / document.cookie（读写都抛）
+   *   window.caches / navigator.serviceWorker（**故意不兜底**：假装成功比抛错更危险，
+   *   等缓存命中的应用会永远挂住；且全语料 0 命中）
+   *   window.indexedDB 不抛（返回对象），无需处理。
+   *
+   * 语料（本机 15 张 web 壁纸）：localStorage 6 张、document.cookie 2 张，且都写在
+   * **作者代码的第一行逻辑里** —— 2905017768 Bocchi 把读取放进 React 的 useState
+   * 初始化，首屏渲染就抛 → #root 空 → 整屏白，宿主侧看到的是作者一帧都没跑
+   * （web fps 恒 -1）。1396475780 AudiOrbits、3110581014 / 3406740580 两张 pano2vr
+   * 全景同型。官方 CEF 里壁纸跑在真实源上、两类 API 都可用，所以工坊不会做防御。
+   *
+   * 可替换性（实测，决定这条修法成立）：两者在 Chromium 里都是**可配置**属性 ——
+   * localStorage / sessionStorage 是 window 上的自有访问器，cookie 在
+   * Document.prototype 上，defineProperty 均成功。
+   *
+   * 语义边界：不透明源拿不到真存储，这里退化为**文档内内存存储**（同一次会话内读写
+   * 一致，换壁纸 / 刷新即失）。目标是「别崩」，不是持久化对等；要真持久化得把写入经
+   * 父页 postMessage 转给宿主落盘（未做）。
+   */
+  function storageGetterThrows() {
+    try {
+      void w.localStorage;
+      return false;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function makeMemoryStorage() {
+    var data = Object.create(null);
+    var api = {};
+    function has(k) {
+      return Object.prototype.hasOwnProperty.call(data, k);
+    }
+    function def(name, fn) {
+      // 方法必须**不可枚举**：真实 Storage 上 Object.keys / for…in 只列存储的键
+      Object.defineProperty(api, name, {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: fn,
+      });
+    }
+    def("getItem", function (k) {
+      var s = String(k);
+      return has(s) ? data[s] : null;
+    });
+    def("setItem", function (k, v) {
+      data[String(k)] = String(v);
+    });
+    def("removeItem", function (k) {
+      delete data[String(k)];
+    });
+    def("clear", function () {
+      data = Object.create(null);
+    });
+    def("key", function (i) {
+      var keys = Object.keys(data);
+      var n = Number(i) || 0;
+      return n >= 0 && n < keys.length ? keys[n] : null;
+    });
+    Object.defineProperty(api, "length", {
+      configurable: true,
+      enumerable: false,
+      get: function () {
+        return Object.keys(data).length;
+      },
+    });
+    // 属性式读写（`localStorage.foo = 1` / `localStorage["foo"]` / delete / for…in）
+    // 映射到同一份数据：不映射就会分裂成两份状态（属性写的值 getItem 读不到，且没有
+    // 任何报错，比抛错更难查）。方法名优先于同名数据键 —— 真实 Storage 的顺序相反
+    // （命名属性是自有属性、会盖住原型方法），这里不模仿那个角落语义。
+    if (typeof w.Proxy !== "function") return api;
+    return new w.Proxy(api, {
+      get: function (t, p) {
+        if (typeof p !== "string") return t[p];
+        if (p in t) return t[p];
+        return has(p) ? data[p] : undefined;
+      },
+      set: function (t, p, v) {
+        if (typeof p !== "string" || p in t) {
+          t[p] = v;
+          return true;
+        }
+        data[p] = String(v);
+        return true;
+      },
+      has: function (t, p) {
+        return (typeof p === "string" && has(p)) || p in t;
+      },
+      deleteProperty: function (t, p) {
+        if (typeof p === "string" && has(p)) {
+          delete data[p];
+          return true;
+        }
+        delete t[p];
+        return true;
+      },
+      // 只报存储的键：真实 Storage 上 Object.keys 拿不到方法名
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, p) {
+        if (typeof p === "string" && has(p)) {
+          return { configurable: true, enumerable: true, writable: true, value: data[p] };
+        }
+        return Object.getOwnPropertyDescriptor(t, p);
+      },
+    });
+  }
+
+  function installOpaqueOriginFallbacks() {
+    try {
+      if (storageGetterThrows()) {
+        // getter 必须返回**同一个实例**：new 一个每次访问（真实 Storage 是同一对象），
+        // 否则 setItem 写完下一次读取就换了个空对象，比不兜底还怪。
+        var ls = null;
+        Object.defineProperty(w, "localStorage", {
+          configurable: true,
+          get: function () {
+            if (!ls) ls = makeMemoryStorage();
+            return ls;
+          },
+        });
+        var ss = null;
+        Object.defineProperty(w, "sessionStorage", {
+          configurable: true,
+          get: function () {
+            if (!ss) ss = makeMemoryStorage();
+            return ss;
+          },
+        });
+      }
+    } catch (_) {
+      /* 将来引擎把属性改成不可配置时保持原样：作者脚本照样抛，但至少不是我们抛的 */
+    }
+    // Cookie：pano2vr 一族（3110581014 / 3406740580）直接读 document.cookie.length
+    try {
+      void w.document.cookie;
+    } catch (_) {
+      try {
+        installMemoryCookie();
+      } catch (__) {
+        /* 忽略 */
+      }
+    }
+  }
+
+  /** 内存 cookie jar：同会话内可读回自己写的键，跨会话不保留（见上）。 */
+  function installMemoryCookie() {
+    var jar = Object.create(null);
+    Object.defineProperty(w.Document.prototype, "cookie", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        var parts = [];
+        for (var k in jar) {
+          if (Object.prototype.hasOwnProperty.call(jar, k)) parts.push(k + "=" + jar[k]);
+        }
+        return parts.join("; ");
+      },
+      set: function (v) {
+        var s = String(v);
+        var pair = s.split(";")[0];
+        var eq = pair.indexOf("=");
+        if (eq <= 0) return;
+        var name = pair.slice(0, eq).trim();
+        if (!name) return;
+        // 删除语义：max-age=0 或 expires 在过去（作者清 cookie 的两种写法）
+        var expires = /expires=([^;]+)/i.exec(s);
+        var dead = /max-age=0/i.test(s);
+        if (expires) {
+          var at = Date.parse(expires[1]);
+          if (!isNaN(at) && at <= Date.now()) dead = true;
+        }
+        if (dead) {
+          delete jar[name];
+          return;
+        }
+        jar[name] = pair.slice(eq + 1).trim();
+      },
+    });
+  }
+
+  installOpaqueOriginFallbacks();
+
   var audioListener = null;
   var propertyListener = null;
   var paused = false;
