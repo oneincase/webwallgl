@@ -353,7 +353,11 @@ if (fs.existsSync(LIB)) {
   }
   console.log(`扫描 ${total} 个场景：camerafade 开启 ${fadeOn}，缺字段 ${fadeMissing}，camerashake 开启 ${shakeOn}，透视 ${perspIds.length}（${perspIds.join(",") || "无"}）`);
   check(perspIds.includes("3509243656"), `库内应有 3509243656 透视场景，实得 [${perspIds.join(", ")}]`);
-  check(perspIds.length <= 3, `透视场景异常增多：${perspIds.length}（判定正交投影的条件可能被写反）`);
+  // [we-scene patch] 这条断言读的是**原始 scene.json**（fov 有 / orthogonalprojection 无），
+  // 不经过本库解析代码 —— 它只能随壁纸库内容变化而变化（用户新下载透视场景壁纸就会
+  // 多一个：2026-09-24 下载 3589454154 后由 3 变 4）。真正的守卫是「库内已知的透视
+  // 场景必须在列」，计数上界放宽到不会因新下载误报、又能抓住成片翻转的量级。
+  check(perspIds.length <= 12, `透视场景异常增多：${perspIds.length}（判定正交投影的条件可能被写反）`);
   // camerafade 字段本身绝大多数场景为 true（WE 编辑器默认值）；若骤降说明 parse
   // 或数据读取出了问题。字段分布与是否播放无关 —— 幕布默认不播（见第 4 组守卫）。
   check(fadeOn > total * 0.8, `camerafade 开启数异常偏低：${fadeOn}/${total}（预期 >80%）`);

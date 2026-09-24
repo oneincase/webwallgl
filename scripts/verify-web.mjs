@@ -177,6 +177,13 @@ async function importIsolatedFn(srcText, fnName) {
     /WEB_AUDIO_PUMP_HZ = 30/.test(webTs) && /Math\.min\(Math\.max\(1, fps\), WEB_AUDIO_PUMP_HZ\)/.test(webTs),
     "网页音频泵必须封顶 30Hz（WE 回调频率；60Hz 打满积分型可视化）",
   );
+  // [we-scene patch] 真实频谱（宿主注入 / 麦克风实况）必须经量级标定：宿主量的
+  // 典型量级 0.1~0.3 远低于作者阈值依赖的 0.5~0.8，不标定则真实音谱反馈明显弱于
+  // 内置歌曲（用户实测）。合成源走另一条 shapeWebAudioBand（固定 gamma+增益）。
+  check(
+    (webTs.match(/createSpectrumCalibrator\(\)/g) || []).length >= 2 && /audio-calibrate/.test(webTs),
+    "宿主/实况两条真实频谱通道都必须接量级标定（createSpectrumCalibrator）",
+  );
   check(
     /1747779570/.test(webTs) && !/type === "file".*raw === ""/.test(webTs.replace(/\s+/g, " ")),
     "空 file 必须下发（1747779570 typeof object 才 setSingleVideo；file:/// 改由 shim 改写）",
@@ -1909,7 +1916,12 @@ function runShim(extras) {
     "bridgeAudioDriver 不得对注入频谱套 shapeWebAudioBand（宿主给的已是 0..1 真实频谱，再套 gamma 会顶满格）");
   if (bridgeSrc && !/shapeWebAudioBand/.test(bridgeSrc)) {
     const esbuild = await import("esbuild");
+    // 抽取的执行环境需补齐依赖（bridgeAudioDriver 现在引用量级标定器）
+    const calibUrl = pathToFileURL(
+      path.join(ROOT, "renderer/src/audio-calibrate.ts"),
+    ).href;
     const out = await esbuild.transform(
+      `import { createSpectrumCalibrator } from ${JSON.stringify(calibUrl)};\n` +
       "type Runtime=any; type WebAudioDriver=any;\n" + bridgeSrc + "\nexport {bridgeAudioDriver};",
       { loader: "ts", format: "esm", target: "es2022" },
     );
@@ -1923,10 +1935,14 @@ function runShim(extras) {
       for (let i = 0; i < 8; i++) { L[i] = 0.9; R[i] = 0.7; }
       rt.audioBridge = () => ({ left: L, right: R });
       const s1 = d.snapshot();
-      // **不得再套 shapeWebAudioBand 的 gamma 扩展**：那是给内置模拟源的未钳位
-      // 频段用的，宿主给的已是 0..1 真实频谱，再乘一遍会把音条整体顶到满格
-      check(Math.abs(s1.left[0] - 0.9) < 1e-6 && Math.abs(s1.right[0] - 0.7) < 1e-6,
-        `注入频谱必须原样透传（不套 gamma 扩展），实得 left[0]=${s1.left[0]} right[0]=${s1.right[0]}`);
+      // **不得再套 shapeWebAudioBand 的 gamma 扩展**（那是给内置模拟源拉对比度用的，
+      // 对真实频谱再乘一遍会把音条顶满格）。亮的注入素材只允许量级标定的自适应增益，
+      // 且该增益在素材已接近满幅时应≈1x（不额外放大）。
+      check(Math.abs(s1.left[0] - 0.9) < 0.03 && Math.abs(s1.right[0] - 0.7) < 0.03,
+        `注入频谱不得被 gamma 扩展放大（响素材增益应≈1x），实得 left[0]=${s1.left[0]} right[0]=${s1.right[0]}`);
+      // 注：弱素材被抬升的**数值**行为由 verify-audio 的标定器单测覆盖（那里能
+      // 显式给 dt）；这里只确认接线与「不套 gamma」两条（紧循环里 dt≈0，收敛
+      // 时间无法真实推进）。
       check(s1.left[40] === 0, "未提供能量的高频段应为 0");
       // 返回 null 时给全零而不是回落模拟源：宿主明确装了源就说明它要自己供数，
       // 冒出一段合成波形只会让人误以为「注入生效了」

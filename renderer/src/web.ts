@@ -7,6 +7,7 @@ import {
   reportDiag,
   type Runtime,
 } from "./shell";
+import { createSpectrumCalibrator } from "./audio-calibrate";
 import type { WallpaperConfig } from "./types";
 import { startLiveSystem, type LiveSystemHandle } from "./live-system";
 import { audioMod, media as mediaMod } from "./vendor";
@@ -334,15 +335,24 @@ function defaultAudioDriver(): WebAudioDriver {
 function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
   const left = new Float32Array(64);
   const right = new Float32Array(64);
+  // [we-scene patch] 同场景路径：宿主频谱量级（约 0.1~0.3）远低于作者阈值依赖的
+  // 量级（强段均值 0.5~0.8，见 audio-calibrate.ts 头注），自适应增益把滚动峰值
+  // 抬到目标量级，使网页壁纸的音条/阈值判定与内置歌曲同级别。
+  const calib = createSpectrumCalibrator();
+  let lastMs = 0;
   return {
     snapshot() {
       const src = rt.audioBridge?.();
       const sl = src?.left;
       const sr = src?.right;
       const n = sl && sr ? Math.min(64, sl.length, sr.length) : 0;
+      const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const dtSec = lastMs > 0 ? (nowMs - lastMs) / 1000 : 1 / 60;
+      lastMs = nowMs;
+      const gain = n > 0 ? calib.gainFor(sl!, sr!, n, dtSec) : (calib.reset(), 1);
       for (let i = 0; i < n; i++) {
-        left[i] = Math.max(0, Math.min(1, Number(sl![i]) || 0));
-        right[i] = Math.max(0, Math.min(1, Number(sr![i]) || 0));
+        left[i] = Math.max(0, Math.min(1, (Number(sl![i]) || 0) * gain));
+        right[i] = Math.max(0, Math.min(1, (Number(sr![i]) || 0) * gain));
       }
       for (let i = n; i < 64; i++) {
         left[i] = 0;
@@ -367,15 +377,22 @@ function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
 function liveAudioDriver(handle: LiveSystemHandle): WebAudioDriver {
   const left = new Float32Array(64);
   const right = new Float32Array(64);
+  // 麦克风实况同属「真实频谱」，与宿主注入用同一条量级标定（见 bridgeAudioDriver）。
+  const calib = createSpectrumCalibrator();
+  let lastMs = 0;
   return {
     tick() {
       handle.audio.pump();
     },
     snapshot() {
       const s = handle.audio.snapshot;
+      const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const dtSec = lastMs > 0 ? (nowMs - lastMs) / 1000 : 1 / 60;
+      lastMs = nowMs;
+      const gain = calib.gainFor(s.left64, s.right64, 64, dtSec);
       for (let i = 0; i < 64; i++) {
-        left[i] = Math.max(0, Math.min(1, Number(s.left64[i]) || 0));
-        right[i] = Math.max(0, Math.min(1, Number(s.right64[i]) || 0));
+        left[i] = Math.max(0, Math.min(1, (Number(s.left64[i]) || 0) * gain));
+        right[i] = Math.max(0, Math.min(1, (Number(s.right64[i]) || 0) * gain));
       }
       return { left, right };
     },

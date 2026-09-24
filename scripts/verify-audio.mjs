@@ -89,6 +89,74 @@ const { check, errors } = createChecker();
     );
   }
 
+// ---------- 1b. 真实音频量级标定（audio-calibrate.ts）----------
+// 宿主真实频谱典型量级 0.1~0.3，而作者按「强段均值 0.5~0.8」设计阈值；标定器
+// 用滚动峰值把真实音频抬到该量级（用户实测：不标定时真实音谱反馈明显弱于内置）。
+{
+  const { createSpectrumCalibrator } = await import(
+    new URL("../renderer/src/audio-calibrate.ts", import.meta.url)
+  ).catch(() => ({ createSpectrumCalibrator: null }))
+  if (!createSpectrumCalibrator) {
+    // TS 源码在 Node 下不可直接 import 时跳过（浏览器侧由 typecheck 保障）
+    console.log("  [skip] audio-calibrate.ts 需 TS 运行时，跳过（浏览器侧生效）")
+  } else {
+    const mk = (peak) => {
+      const l = new Float32Array(64)
+      const r = new Float32Array(64)
+      for (let i = 0; i < 64; i++) { l[i] = peak * (1 - i / 128); r[i] = peak * (1 - i / 128) * 0.98 }
+      return { l, r }
+    }
+    // (a) 弱素材（峰 0.15）应被抬到作者量级
+    {
+      const c = createSpectrumCalibrator()
+      let peak = 0
+      for (let f = 0; f < 90; f++) { // 1.5s @60fps
+        const { l, r } = mk(0.15)
+        const g = c.gainFor(l, r, 64, 1 / 60)
+        for (let i = 0; i < 64; i++) peak = Math.max(peak, Math.min(1, l[i] * g))
+      }
+      check(peak > 0.5 && peak <= 1, `弱素材（峰 0.15）标定后峰值应落入作者量级 0.5~1（实得 ${peak.toFixed(3)}）`)
+    }
+    // (b) 响亮素材（峰 0.95）不得被额外放大到削波
+    {
+      const c = createSpectrumCalibrator()
+      let peak = 0
+      for (let f = 0; f < 90; f++) {
+        const { l, r } = mk(0.95)
+        const g = c.gainFor(l, r, 64, 1 / 60)
+        for (let i = 0; i < 64; i++) peak = Math.max(peak, Math.min(1, l[i] * g))
+      }
+      check(peak <= 1.0001 && c.currentGain() <= 1.05, `响亮素材不应被放大（增益 ${c.currentGain().toFixed(2)}，峰 ${peak.toFixed(3)}）`)
+    }
+    // (c) 静音不放大：全零输入下输出仍为零
+    {
+      const c = createSpectrumCalibrator()
+      const z = new Float32Array(64)
+      let maxOut = 0
+      for (let f = 0; f < 120; f++) {
+        const g = c.gainFor(z, z, 64, 1 / 60)
+        for (let i = 0; i < 64; i++) maxOut = Math.max(maxOut, z[i] * g)
+      }
+      check(maxOut === 0, `静音输入必须输出零（实得 ${maxOut}）`)
+    }
+    // (d) 确定性：同一串输入两次运行得到同一串增益
+    {
+      const run = () => {
+        const c = createSpectrumCalibrator()
+        const out = []
+        for (let f = 0; f < 60; f++) {
+          const { l, r } = mk(f < 30 ? 0.2 : 0.6)
+          out.push(c.gainFor(l, r, 64, 1 / 60))
+        }
+        return out
+      }
+      const a = run()
+      const b = run()
+      check(a.every((v, i) => v === b[i]), "标定器必须确定性（同输入同增益）")
+    }
+  }
+}
+
 // ---------- 2. audioResponse：与 pulse.vert CreateAudioResponse 逐公式对照 ----------
 {
   const bands = { left: new Float32Array(16), right: new Float32Array(16) };

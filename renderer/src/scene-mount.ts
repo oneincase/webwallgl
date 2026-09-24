@@ -9,6 +9,7 @@ import type { WallpaperConfig } from "./types";
 import { normalizeQuality, particleQualityScale, postFboCapFactor, type ResolvedQuality } from "./quality";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
+import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
@@ -560,6 +561,8 @@ cfg, source, pkgAbort.signal);
       // 宿主注入的频谱源（rt.audioBridge）。宿主只给 64 段左右声道，
       // 32/16 段降采样、level、silent、preL64/preR64 由这里派生，保证快照
       // 与模拟源同构——消费方（shader uniform、粒子、文字脚本）不需要区分来源。
+      // 宿主通道当前增益（诊断 __audioStats().host.gain 读它）
+      const calibGainRef = { current: 1 };
       const hostAudio = (() => {
         const snapshot = {
           left64: zero(64), right64: zero(64),
@@ -581,6 +584,14 @@ cfg, source, pkgAbort.signal);
             dst[i] = s / (i1 - i0);
           }
         };
+        // [we-scene patch] 真实音频的量级标定：宿主频谱的典型量级（约 0.1~0.3）远低于
+        // 作者阈值所依赖的量级（强段均值 0.5~0.8，见 audio-calibrate.ts 头注），
+        // 原样透传导致「真实音谱反馈明显弱于内置歌曲」。自适应增益把滚动峰值抬到
+        // 目标量级；silent/level 仍按**标定后**的实际画面电平判定，静音段保持静音。
+        const calib = createSpectrumCalibrator();
+        // 标定器需要帧间隔：pump 每帧调用一次，用墙钟差分（首帧/异常值由
+        // 标定器内部钳到 [1/240, 0.25]）。
+        let lastPumpMs = 0;
         return {
           active: false,
           snapshot,
@@ -589,13 +600,19 @@ cfg, source, pkgAbort.signal);
             const src = rt.audioBridge?.();
             if (!src || !src.left || !src.right) {
               this.active = false;
+              calib.reset();
               return;
             }
             const n = Math.min(64, src.left.length, src.right.length);
+            const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+            const dtSec = lastPumpMs > 0 ? (nowMs - lastPumpMs) / 1000 : 1 / 60;
+            lastPumpMs = nowMs;
+            const gain = calib.gainFor(src.left, src.right, n, dtSec);
+            calibGainRef.current = gain;
             let sum = 0;
             for (let i = 0; i < n; i++) {
-              const l = src.left[i] || 0;
-              const r = src.right[i] || 0;
+              const l = Math.min(1, (src.left[i] || 0) * gain);
+              const r = Math.min(1, (src.right[i] || 0) * gain);
               snapshot.left64[i] = l;
               snapshot.right64[i] = r;
               snapshot.preL64[i] = l;
@@ -656,6 +673,18 @@ cfg, source, pkgAbort.signal);
       (window as unknown as Record<string, unknown>).__audioStats = () => ({
         enabled: audioSim.enabled,
         live: !!audioDriverRef.current,
+        // [we-scene patch] 宿主注入通道的可观测性：active=本帧拉到数据、
+        // level/bass=**标定后**（真正喂给着色器/脚本的）量级，用于排查
+        // 「真实音谱反馈偏弱」（见 audio-calibrate.ts）。
+        host: hostAudio.active
+          ? {
+              active: true,
+              level: Math.round(hostAudio.snapshot.level * 1000) / 1000,
+              silent: hostAudio.snapshot.silent,
+              bass: Math.round(hostAudio.snapshot.left64[2] * 1000) / 1000,
+              gain: Math.round(calibGainRef.current * 100) / 100,
+            }
+          : { active: false },
         level: audioSim.enabled
           ? Math.round((audioDriverRef.current ? audioDriverRef.current.snapshot : simAudio.snapshot).level * 1000) / 1000
           : 0,
