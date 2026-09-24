@@ -177,7 +177,7 @@ async function importIsolatedFn(srcText, fnName) {
     /WEB_AUDIO_PUMP_HZ = 30/.test(webTs) && /Math\.min\(Math\.max\(1, fps\), WEB_AUDIO_PUMP_HZ\)/.test(webTs),
     "网页音频泵必须封顶 30Hz（WE 回调频率；60Hz 打满积分型可视化）",
   );
-  // [we-scene patch] 真实频谱（宿主注入 / 麦克风实况）必须经量级标定：宿主量的
+  // [we-scene patch] 真实频谱（宿主注入 / 系统实况）必须经量级标定：宿主量的
   // 典型量级 0.1~0.3 远低于作者阈值依赖的 0.5~0.8，不标定则真实音谱反馈明显弱于
   // 内置歌曲（用户实测）。合成源走另一条 shapeWebAudioBand（固定 gamma+增益）。
   check(
@@ -1844,12 +1844,12 @@ function runShim(extras) {
 
 // ---------- 3f. 宿主注入的频谱 / 媒体源必须能到达网页壁纸 ----------
 //
-// 下游实测症状：「麦克风都接上了，网页壁纸的音谱还在放默认合成流」。
+// 下游实测症状：「实况都接上了，网页壁纸的音谱还在放默认合成流」。
 // 根因是 web 装配路径压根不读 rt.audioBridge —— 1.3.0 给媒体接了这一环，
 // 音频这行漏了（web.ts 里 audioBridge 出现 0 次）。
 //
 // 第二个坑同样致命：泵在**装配时**捕获 driver，而 setAudio()/setMedia() 通常
-// 在 mount() 之后才调用（宿主的麦克风 / SSE 通道那时才就绪），定死 driver
+// 在 mount() 之后才调用（宿主的频谱 / SSE 通道那时才就绪），定死 driver
 // 等于后装的源永远不生效。所以选源必须逐帧做。
 {
   const webTs = fs.readFileSync(path.join(ROOT, "renderer/src/web.ts"), "utf8");
@@ -1961,28 +1961,28 @@ function runShim(extras) {
     }
   }
 
-  // --- 系统实况麦克风也必须能喂到网页壁纸 ---
+  // --- 系统实况（media-bridge 系统频谱）也必须能喂到网页壁纸 ---
   //
   // 这是同一个症状的**第二条通道**：cfg.liveSystem（测试台「系统实况」勾选框）
   // 此前只有 scene 装配路径消费，web.ts 里 liveSystem 零引用 —— 勾上之后
-  // 场景壁纸的音条跟着麦克风动、网页壁纸却始终是合成流。
-  // 它与 rt.audioBridge 是两条独立通道：前者库自己采麦克风，后者宿主推已采好的
-  // 频谱，两条都要能到网页壁纸。
+  // 场景壁纸的音条跟着系统输出动、网页壁纸却始终是合成流。
+  // 它与 rt.audioBridge 是两条独立通道：前者库自己订阅宿主的频谱 SSE，
+  // 后者宿主把已采好的频谱推进来，两条都要能到网页壁纸。
   // 断言要求**真实的条件判断**而不是出现 liveSystem 字样：注释里也写这个名字，
   // 只匹配名字的话把 `if (cfg.liveSystem …)` 短路掉、注释留着就照绿（已踩过两次）
   check(/if \(cfg\.liveSystem[^)]*\)/.test(webTs),
     "web.ts 必须消费 cfg.liveSystem（否则测试台勾了「系统实况」网页壁纸仍是合成流）");
-  check(/function liveAudioDriver/.test(webTs), "web.ts 应有 liveAudioDriver 把麦克风包成 web driver");
-  check(/startLiveSystem/.test(webTs), "web.ts 必须调用 startLiveSystem 采麦克风");
-  // 麦克风采集是异步的（getUserMedia 要授权），不能阻塞泵启动：
-  // 必须先按默认源跑、授权通过后回填持有槽，由逐帧 pick 切过去
+  check(/function liveAudioDriver/.test(webTs), "web.ts 应有 liveAudioDriver 把系统实况频谱包成 web driver");
+  check(/startLiveSystem/.test(webTs), "web.ts 必须调用 startLiveSystem 接系统实况源");
+  // startLiveSystem 是异步的（首轮轮询 + SSE 建立），不能阻塞泵启动：
+  // 必须先按默认源跑、就绪后回填持有槽，由逐帧 pick 切过去
   check(/liveHold/.test(webTs),
-    "liveSystem 必须走「延迟回填 + 逐帧 pick」（getUserMedia 是异步的，阻塞泵启动会让网页壁纸开局无声）");
+    "liveSystem 必须走「延迟回填 + 逐帧 pick」（startLiveSystem 是异步的，阻塞泵启动会让网页壁纸开局无声）");
   check(/live\.dispose\(\)/.test(webTs),
-    "liveSystem 收尾必须 dispose（麦克风流不停，浏览器录音指示会一直亮）");
+    "liveSystem 收尾必须 dispose（SSE 连接与快照不释放会跨壁纸累积）");
   const liveBody = bodyOf("liveAudioDriver");
   check(!/shapeWebAudioBand/.test(liveBody),
-    "liveAudioDriver 不得对麦克风频谱套 gamma 扩展（与注入源同理，它已是 0..1 真实频谱）");
+    "liveAudioDriver 不得对系统频谱套 gamma 扩展（与注入源同理，它已是 0..1 真实频谱）");
 
   // --- audio:null / media:null 必须是**真禁用**，不是回落模拟源 ---
   // 类型注释写的是「null = 禁用（频谱恒为 0）」。此前"显式 null"与"从没设置过"

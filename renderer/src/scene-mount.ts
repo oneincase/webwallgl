@@ -503,7 +503,7 @@ cfg, source, pkgAbort.signal);
       }
 
       // ---- 音频 / 媒体 / 窗口源 ----
-      // 默认确定性模拟（离线可复现）；cfg.liveSystem 时换麦克风 + 宿主 Now Playing。
+      // 默认确定性模拟（离线可复现）；cfg.liveSystem 时换系统输出频谱 + 宿主 Now Playing。
       const supportsAudioProcessing =
         (project as { general?: { supportsaudioprocessing?: boolean } } | null)?.general
           ?.supportsaudioprocessing !== false;
@@ -530,7 +530,7 @@ cfg, source, pkgAbort.signal);
       // 定死：setMedia() 常在 mount() 之后才调用（宿主的 Now Playing 通道那时
       // 才就绪），定死就意味着后装的源永远不生效——web 侧的泵已经是逐帧 pick，
       // scene 这边漏了，症状是「setMedia 在场景壁纸上没反应」。
-      // liveSystem 的麦克风/系统媒体优先级更高（用户显式勾了「系统实况」），
+      // liveSystem 的系统音频/系统媒体优先级更高（用户显式勾了「系统实况」），
       // 由 liveMediaOverride 承载；两者都没有才回落模拟源。
       // [1.3.17] 壁纸自带音频（脚本显式 play() 的声音层）排在注入源之后、模拟源
       // 之前：音乐壁纸放着自己的歌，MEDIA 面板却只能显示品牌占位曲（3151551777）。
@@ -638,7 +638,7 @@ cfg, source, pkgAbort.signal);
           },
         };
       })();
-      // 当前生效的音频快照。优先级：宿主注入 > 麦克风实况 > 内置模拟。
+      // 当前生效的音频快照。优先级：宿主注入 > 系统实况（media-bridge）> 内置模拟。
       // 粒子 / 文字脚本 / shader uniform 都从这里取，保证同一帧看到同一份数据。
       const activeAudioSnapshot = () =>
         hostAudio.active
@@ -702,7 +702,7 @@ cfg, source, pkgAbort.signal);
       reportDiag(
         rt,
         cfg,
-        `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+        `audio: ${audioDriverRef.current ? "live system" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
       );
 
       // ---- 媒体集成（模拟或实况）----
@@ -1332,11 +1332,11 @@ cfg, source, pkgAbort.signal);
         return palette;
       };
 
-      // ---- 系统实况：textures / mediaDriver 已就绪后再挂麦克风与 Now Playing ----
+      // ---- 系统实况：textures / mediaDriver 已就绪后再挂系统频谱与 Now Playing ----
       if (cfg.liveSystem) {
-        // 释放槽**同步登记**：getUserMedia 阻塞在系统授权弹窗上，时长不可控。
-        // 若这期间换了壁纸，clear() 早已跑过，之后再挂的清理没人会调 ——
-        // 麦克风流不停、浏览器录音指示一直亮。先占位，await 回来再填句柄。
+        // 释放槽**同步登记**：startLiveSystem 是异步的（首轮轮询 + SSE 建立，
+        // 时长不可控）。若这期间换了壁纸，clear() 早已跑过，之后再挂的清理
+        // 没人会调。先占位，await 回来再填句柄。
         const liveSlot: { handle: { dispose(): void } | null; dead: boolean } = {
           handle: null,
           dead: false,
@@ -1406,7 +1406,7 @@ cfg, source, pkgAbort.signal);
             liveMediaOverride = live.media;
             windowDriver = live.windowTitle;
             liveHold.mediaDriver = live.media;
-            if (live.status().audio === "mic") audioDriverRef.current = live.audio;
+            if (live.status().audio === "live") audioDriverRef.current = live.audio;
             // 补发当前媒体快照给已登记沙箱
             if (currentMediaDriver().snapshot.hasMedia) {
               for (const { name, event } of media.diffMediaEvents(null, currentMediaDriver().snapshot)) {
@@ -1431,7 +1431,7 @@ cfg, source, pkgAbort.signal);
             reportDiag(
               rt,
               cfg,
-              `audio: ${audioDriverRef.current ? "live mic" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+              `audio: ${audioDriverRef.current ? "live system" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
             );
             (window as unknown as Record<string, unknown>).__system = {
               media: mediaControl,
@@ -4825,7 +4825,7 @@ cfg, source, pkgAbort.signal);
           // 只重算 transformDirty（变换绑了脚本/动画的层及其整棵子树，外加挂件子树），
           // 其余图层保持 parse 时的 world 一个字节都不碰。
           if (transformDirty.size) scn.recomposeWorld(scene.layers, transformDirty);
-          // 音频流推进并重填文字脚本的频谱视图。优先级：宿主注入 > 麦克风实况 >
+          // 音频流推进并重填文字脚本的频谱视图。优先级：宿主注入 > 系统实况 >
           // 内置模拟（确定性：同 t 同频谱）。hostAudio.pump 内部会在宿主无数据时
           // 自行置 active=false，于是这一帧自动回落到后两者。
           if (audioSim.enabled) {
@@ -4835,7 +4835,7 @@ cfg, source, pkgAbort.signal);
             else simAudio.update(t);
           }
           // [we-scene patch] BGM 并入音频快照（必须在 fillAudioBuffers 前）：
-          // 自带声音层在播放时，它的频谱与当前源（模拟/注入/麦克风）逐频段取 max，
+          // 自带声音层在播放时，它的频谱与当前源（模拟/注入/系统实况）逐频段取 max，
           // 使「BGM + 音频反应」壁纸的音条能响应自身音乐。取一份临时快照合并，
           // 不改驱动源/模拟器内部数组。
           const bgmBands = bgm.readBands();

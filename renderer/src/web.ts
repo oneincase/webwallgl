@@ -364,12 +364,12 @@ function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
 }
 
 /**
- * 「系统实况」麦克风包成 web 侧 driver。
+ * 「系统实况」包成 web 侧 driver。
  *
  * cfg.liveSystem 此前**只有 scene 装配路径消费**（web.ts 里 liveSystem 零引用），
- * 所以测试台勾上「系统实况」后，场景壁纸的音条跟着麦克风动、网页壁纸却始终是
- * 内置合成流。它与 rt.audioBridge 是两条独立通道：前者是库自己采麦克风，
- * 后者是宿主把已采好的频谱推进来，两者都要能喂到网页壁纸。
+ * 所以测试台勾上「系统实况」后，场景壁纸的音条跟着真实系统音频动、网页壁纸却始终是
+ * 内置合成流。它与 rt.audioBridge 是两条独立通道：前者是库自己订阅宿主
+ * media-bridge 的频谱，后者是宿主把已采好的频谱推进来，两者都要能喂到网页壁纸。
  *
  * live 的 snapshot 是钳位后的 left64/right64（0..1），与宿主注入同属"真实频谱"，
  * 因此同样**不套 shapeWebAudioBand 的 gamma 扩展**（那是给合成源拉对比度的）。
@@ -377,7 +377,7 @@ function bridgeAudioDriver(rt: Runtime): WebAudioDriver {
 function liveAudioDriver(handle: LiveSystemHandle): WebAudioDriver {
   const left = new Float32Array(64);
   const right = new Float32Array(64);
-  // 麦克风实况同属「真实频谱」，与宿主注入用同一条量级标定（见 bridgeAudioDriver）。
+  // 系统实况同属「真实频谱」，与宿主注入用同一条量级标定（见 bridgeAudioDriver）。
   const calib = createSpectrumCalibrator();
   let lastMs = 0;
   return {
@@ -929,17 +929,17 @@ function startAudioPump(
   rt: Runtime,
   driver: WebAudioDriver | null,
   frameClock?: { last: number },
-  /** 系统实况麦克风的延迟持有：getUserMedia 是异步的，启动完成后回填 driver */
+  /** 系统实况的延迟持有：startLiveSystem 是异步的（首轮轮询 + SSE），就绪后回填 driver */
   liveHold: { driver: WebAudioDriver | null } = { driver: null },
 ) {
   if (!driver) return;
   // [1.3.1] 注入源的选择必须**逐帧**做，不能在装配时定死：setAudio() 常在
-  // mount() 之后才调用（宿主的麦克风/SSE 通道那时才就绪），装配期捕获一个
-  // driver 就意味着后装的源永远不生效——症状正是「麦克风接上了，网页壁纸
+  // mount() 之后才调用（宿主的频谱/SSE 通道那时才就绪），装配期捕获一个
+  // driver 就意味着后装的源永远不生效——症状正是「实况接上了，网页壁纸
   // 的音谱还在放合成波形」。撤源（setAudio(null)）后同样要能落回原 driver。
   const bridged = bridgeAudioDriver(rt);
-  // 优先级：宿主注入（rt.audioBridge）> 系统实况麦克风（cfg.liveSystem）> 默认模拟。
-  // 宿主显式推数据时不该被麦克风盖掉；两者都没有才用合成流。
+  // 优先级：宿主注入（rt.audioBridge）> 系统实况（cfg.liveSystem）> 默认模拟。
+  // 宿主显式推数据时不该被实况盖掉；两者都没有才用合成流。
   const pick = (): WebAudioDriver =>
     rt.audioBridge ? bridged : (liveHold.driver ?? driver);
   let raf = 0;
@@ -1185,17 +1185,16 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   };
 
   const frameClock = { last: 0 };
-  // 系统实况（cfg.liveSystem）：麦克风采集是异步的（getUserMedia 要用户授权），
-  // 不能阻塞泵启动 —— 泵先按默认源跑，授权通过后回填这个持有槽，
-  // pick() 逐帧读它，下一帧就切到真实麦克风。
+  // 系统实况（cfg.liveSystem）：startLiveSystem 是异步的（首轮轮询 + SSE 建立），
+  // 不能阻塞泵启动 —— 泵先按默认源跑，就绪后回填这个持有槽，
+  // pick() 逐帧读它，下一帧就切到真实系统音频。
   const liveHold: { driver: WebAudioDriver | null } = { driver: null };
   const startPumps = () => {
     startAudioPump(rt, audioDriver, frameClock, liveHold);
     startMediaPump(rt, mediaDriver);
     if (cfg.liveSystem && audioDriver) {
-      // 释放槽**同步登记**，不能等 await 回来再挂：getUserMedia 会阻塞在系统
-      // 授权弹窗上，时长不可控。若这期间用户换了壁纸，clear() 早已跑过，
-      // 之后再挂的清理没人会调 —— 麦克风流不停、浏览器录音指示一直亮。
+      // 释放槽**同步登记**，不能等 await 回来再挂：startLiveSystem 的时长不可控，
+      // 若这期间用户换了壁纸，clear() 早已跑过，之后再挂的清理没人会调。
       const liveSlot: { handle: { dispose(): void } | null; dead: boolean } = {
         handle: null,
         dead: false,
@@ -1213,7 +1212,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       void (async () => {
         try {
           const live = await startLiveSystem({ origin: location.origin });
-          // 授权期间已被拆掉：立刻释放，不要挂上去
+          // 启动期间已被拆掉：立刻释放，不要挂上去
           if (liveSlot.dead) {
             try {
               live.dispose();
@@ -1224,11 +1223,11 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
           }
           liveSlot.handle = live;
           const st = live.status();
-          if (st.audio === "mic") {
+          if (st.audio === "live") {
             liveHold.driver = liveAudioDriver(live);
-            reportDiag(rt, cfg, "liveSystem: 网页壁纸音频改用麦克风");
+            reportDiag(rt, cfg, "liveSystem: 网页壁纸音频改用系统实况频谱");
           } else {
-            reportDiag(rt, cfg, `liveSystem: 麦克风不可用（${st.audio}），网页壁纸沿用模拟源`);
+            reportDiag(rt, cfg, `liveSystem: 系统音频不可用（${st.audio}），网页壁纸沿用模拟源`);
           }
         } catch (e) {
           reportDiag(rt, cfg, `liveSystem: 启动失败，网页壁纸沿用模拟源 (${(e as Error)?.message ?? e})`);

@@ -1,7 +1,8 @@
 /**
  * 测试台「系统实况」浏览器侧：
- *   - 音频：麦克风 → AnalyserNode → WE 16/32/64 band 快照（无 ScreenCaptureKit）
- *   - 媒体 / 窗口：订阅宿主 /api/system/stream SSE（Music/Spotify + 前台窗口）
+ *   - 音频：宿主 media-bridge 的**系统输出**频谱（64 段 0-255 对数刻度）经
+ *     /api/system/stream SSE 下发（`{audio:{bands,…}}` 帧）；浏览器不再采麦克风
+ *   - 媒体 / 窗口：轮询 + 订阅宿主 /api/system/stream SSE（media-bridge Now Playing + 前台窗口）
  *
  * 接进 scene-mount 后替换 createSimulated*；失败时调用方应回退模拟源。
  */
@@ -20,6 +21,8 @@ export type LiveAudioSnapshot = {
 
 const BANDS = 64;
 const MEDIA_PLAYBACK = { STOPPED: 0, PLAYING: 1, PAUSED: 2 } as const;
+/** 频谱帧多久没来就视为采集断流（清零，别冻住最后一帧） */
+const AUDIO_STALE_MS = 1_500;
 
 function zeroBands(): LiveAudioSnapshot {
   return {
@@ -43,35 +46,6 @@ function downsample(dst: Float32Array, src64: Float32Array) {
     for (let j = i0; j < i1; j++) s += src64[j];
     dst[i] = s / (i1 - i0);
   }
-}
-
-/** 字节频谱 → 对数分箱 64 band（近似 WE / WallpaperEM we_shim） */
-function fillFromByteFreq(out: LiveAudioSnapshot, bytes: Uint8Array, sampleRate: number) {
-  const n = bytes.length;
-  const nyquist = sampleRate * 0.5;
-  const fMin = 20;
-  const fMax = Math.min(20_000, nyquist);
-  let levelSum = 0;
-  for (let b = 0; b < BANDS; b++) {
-    const t0 = b / BANDS;
-    const t1 = (b + 1) / BANDS;
-    const loHz = fMin * Math.pow(fMax / fMin, t0);
-    const hiHz = fMin * Math.pow(fMax / fMin, t1);
-    const i0 = Math.max(0, Math.floor((loHz / nyquist) * n));
-    const i1 = Math.min(n, Math.max(i0 + 1, Math.ceil((hiHz / nyquist) * n)));
-    let s = 0;
-    for (let i = i0; i < i1; i++) s += bytes[i] / 255;
-    const v = Math.min(1, (s / (i1 - i0)) * 1.35);
-    out.left64[b] = v;
-    out.right64[b] = v;
-    if (b < 48) levelSum += v;
-  }
-  downsample(out.left32, out.left64);
-  downsample(out.right32, out.right64);
-  downsample(out.left16, out.left64);
-  downsample(out.right16, out.right64);
-  out.level = Math.min(1, levelSum / (48 * 1.2));
-  out.silent = out.level < 0.02;
 }
 
 function hashHue(s: string): number {
@@ -211,7 +185,7 @@ function emptyMediaSnapshot(): {
 }
 
 export type LiveSystemStatus = {
-  audio: "mic" | "denied" | "unavailable" | "off";
+  audio: "live" | "denied" | "unavailable" | "off";
   media: "live" | "empty" | "offline";
   window: "live" | "empty" | "offline";
   title?: string;
@@ -244,37 +218,9 @@ export type LiveSystemHandle = {
   dispose: () => void;
 };
 
-async function openMicAnalyser(): Promise<{
-  ctx: AudioContext;
-  stream: MediaStream;
-  analyser: AnalyserNode;
-  buf: Uint8Array;
-} | null> {
-  if (!navigator.mediaDevices?.getUserMedia) return null;
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-      video: false,
-    });
-    const ctx = new AudioContext();
-    const src = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyser.smoothingTimeConstant = 0.8;
-    src.connect(analyser);
-    if (ctx.state === "suspended") await ctx.resume().catch(() => {});
-    return { ctx, stream, analyser, buf: new Uint8Array(analyser.frequencyBinCount) };
-  } catch {
-    return null;
-  }
-}
-
 /**
- * 启动实况源。媒体以 HTTP 轮询为主（SSE 为辅）；封面经 /api/system/artwork。
+ * 启动实况源。媒体以 HTTP 轮询为主（SSE 为辅）；频谱帧走同一条 SSE；
+ * 封面经 /api/system/artwork。
  */
 export async function startLiveSystem(opts?: {
   origin?: string;
@@ -293,10 +239,7 @@ export async function startLiveSystem(opts?: {
   let hasArtwork = false;
   let lastArtworkKey = "";
 
-  const mic = await openMicAnalyser();
-  if (mic) audioMode = "mic";
-  else if (!navigator.mediaDevices?.getUserMedia) audioMode = "unavailable";
-  else audioMode = "denied";
+  let lastAudioFrameMs = 0;
 
   let es: EventSource | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -312,6 +255,34 @@ export async function startLiveSystem(opts?: {
       title,
       artist,
     });
+  };
+
+  /** media-bridge 频谱帧：64 段 0-255 对数刻度，单声道复制到左右 */
+  const applyAudioFrame = (frame: Record<string, unknown> | null | undefined) => {
+    const bands = frame && Array.isArray(frame.bands) ? frame.bands : null;
+    if (!bands || bands.length !== BANDS) return;
+    let levelSum = 0;
+    for (let b = 0; b < BANDS; b++) {
+      const v = Math.max(0, Math.min(1, (Number(bands[b]) || 0) / 255));
+      audioSnap.left64[b] = v;
+      audioSnap.right64[b] = v;
+      if (b < 48) levelSum += v;
+    }
+    downsample(audioSnap.left32, audioSnap.left64);
+    downsample(audioSnap.right32, audioSnap.right64);
+    downsample(audioSnap.left16, audioSnap.left64);
+    downsample(audioSnap.right16, audioSnap.right64);
+    audioSnap.level = Math.min(1, levelSum / 48);
+    audioSnap.silent = audioSnap.level < 0.02;
+    lastAudioFrameMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+  };
+
+  /** 采集端状态由宿主随媒体载荷下发（denied/unavailable 时频谱恒静默） */
+  const applyAudioStatus = (state: unknown) => {
+    const s = String(state ?? "");
+    if (s === "live" || s === "denied" || s === "unavailable" || s === "idle" || s === "off") {
+      audioMode = s === "idle" ? "unavailable" : s;
+    }
   };
 
   const applyMediaPayload = (m: Record<string, unknown> | null | undefined) => {
@@ -375,8 +346,10 @@ export async function startLiveSystem(opts?: {
       if (mr.ok) {
         const j = (await mr.json()) as Record<string, unknown>;
         applyMediaPayload(j);
+        applyAudioStatus(j.audioState);
       } else {
         mediaMode = "offline";
+        audioMode = "off";
       }
       if (wr.ok) {
         applyWindowPayload((await wr.json()) as Record<string, unknown>);
@@ -399,9 +372,13 @@ export async function startLiveSystem(opts?: {
           const data = JSON.parse(ev.data) as {
             media?: Record<string, unknown>;
             window?: Record<string, unknown>;
+            audio?: Record<string, unknown>;
+            audioState?: unknown;
           };
-          applyMediaPayload(data.media);
-          applyWindowPayload(data.window);
+          if (data.audio) applyAudioFrame(data.audio);
+          if (data.audioState !== undefined) applyAudioStatus(data.audioState);
+          if (data.media) applyMediaPayload(data.media);
+          if (data.window) applyWindowPayload(data.window);
         } catch {
           /* 单帧坏 JSON 忽略 */
         }
@@ -436,13 +413,20 @@ export async function startLiveSystem(opts?: {
     audio: {
       snapshot: audioSnap,
       pump: () => {
-        if (!mic || disposed) {
+        // 快照由 SSE 帧写入；这里只负责断流检测：帧停了就归零，
+        // 别把最后一帧频谱冻在画面上
+        if (disposed || !lastAudioFrameMs) return;
+        const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (nowMs - lastAudioFrameMs > AUDIO_STALE_MS) {
+          audioSnap.left64.fill(0);
+          audioSnap.right64.fill(0);
+          audioSnap.left32.fill(0);
+          audioSnap.right32.fill(0);
+          audioSnap.left16.fill(0);
+          audioSnap.right16.fill(0);
           audioSnap.level = 0;
           audioSnap.silent = true;
-          return;
         }
-        mic.analyser.getByteFrequencyData(mic.buf);
-        fillFromByteFreq(audioSnap, mic.buf, mic.ctx.sampleRate || 48000);
       },
     },
     media: {
@@ -484,14 +468,6 @@ export async function startLiveSystem(opts?: {
         
       }
       es = null;
-      if (mic) {
-        try {
-          mic.stream.getTracks().forEach((t) => t.stop());
-          void mic.ctx.close();
-        } catch {
-          /* ignore */
-        }
-      }
     },
   };
 }

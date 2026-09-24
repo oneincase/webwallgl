@@ -1,17 +1,25 @@
 /**
- * 测试台「系统实况」——Node 后端读真实 Now Playing / 前台窗口。
+ * 测试台「系统实况」——经 media-bridge（Node 子进程 + JSON 行协议）读真实系统媒体与系统输出频谱。
  *
- * 数据源优先级（macOS）：
- *   1. `media-control` CLI（brew install media-control）
- *      → 走 MediaRemote 适配层，覆盖 Music / Spotify / 浏览器 / 任意播放器
- *   2. AppleScript：Music.app、Spotify（无需额外依赖）
+ * media-bridge（仓库同级 ../media-bridge，Rust 单二进制，跨平台）负责：
+ *   - Now Playing：MediaRemote / GSMTC / MPRIS，覆盖 Music / Spotify / 浏览器 / 任意播放器
+ *     （事件：track / playback / artwork，只报变化）
+ *   - 系统音频：回环采集**系统输出**（不是麦克风，无需浏览器录音授权），
+ *     64 段 0-255 对数频谱（事件：spectrum，按订阅间隔推送）
+ *   - 反向控制：play / pause / next / previous …（能力位 + 回执）
  *
- * 本模块维护一份内存缓存，由后台轮询 / stream 更新；HTTP/SSE 只读缓存，
- * 避免每个 SSE 客户端每 500ms 各打一轮 osascript。
+ * 二进制解析顺序：MEDIA_BRIDGE_BIN 环境变量 → 仓库同级 ../media-bridge/target/release/
+ * → PATH 上的 media-bridge。都找不到时 backend="none"，HTTP 端点照常应答（空快照），
+ * 前端回落模拟源。
  *
- * 音频频谱仍在浏览器侧（麦克风），见 renderer/src/live-system.ts。
+ * 前台窗口 media-bridge 不管，仍走 AppleScript 轮询（System Events）。
+ *
+ * 本模块维护一份内存缓存，由子进程事件更新；HTTP/SSE 只读缓存。
+ * 频谱帧经 onAudioFrame 回调交给 wallpaper-host 的 SSE 下发，浏览器侧不再采集。
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -30,7 +38,7 @@ export type LiveMediaSnap = {
   /** 当前曲目是否有缓存封面（经 /api/system/artwork 取） */
   hasArtwork: boolean;
   /** 数据从哪来，便于诊断 */
-  source: "media-control" | "applescript" | "none";
+  source: "media-bridge" | "none";
 };
 
 export type LiveWindowSnap = {
@@ -40,6 +48,18 @@ export type LiveWindowSnap = {
 };
 
 export type MediaControl = "skipNext" | "skipPrevious" | "play" | "pause" | "playPause";
+
+/** media-bridge spectrum 事件帧：64 段 0-255 对数刻度 */
+export type AudioFrame = {
+  bands: number[];
+  peak: number;
+  rms: number;
+  sampleRate: number;
+  tsMs: number;
+};
+
+/** 音频采集侧状态（给前端状态条 / 诊断用） */
+export type AudioStatus = "live" | "denied" | "unavailable" | "idle" | "off";
 
 const EMPTY_MEDIA: LiveMediaSnap = {
   hasMedia: false,
@@ -64,391 +84,24 @@ export type CachedArtwork = {
 
 /** 当前曲目封面（不进 SSE JSON） */
 let serviceArtwork: CachedArtwork | null = null;
+/** 已读过的封面文件，避免 track/artwork 事件重复读盘 */
+let artworkReadPath = "";
 
 const EMPTY_WINDOW: LiveWindowSnap = { app: "", title: "", url: "" };
 
-const OSA_TIMEOUT_MS = 4_000;
-const MEDIA_POLL_MS = 1_000;
 const WINDOW_POLL_MS = 1_500;
+const BRIDGE_CALL_TIMEOUT_MS = 4_000;
+const BRIDGE_RESPAWN_DELAY_MS = 2_000;
+const BRIDGE_MAX_RESPAWNS = 8;
+/** 频谱订阅间隔：20Hz 对可视化足够，SSE 本地转发无压力 */
+const SPECTRUM_INTERVAL_MS = 50;
 
-function num(v: unknown, fallback = 0): number {
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function str(v: unknown): string {
-  return v == null ? "" : String(v);
-}
-
-async function osascript(source: string): Promise<string | null> {
-  if (process.platform !== "darwin") return null;
-  try {
-    const { stdout } = await execFileAsync("osascript", ["-e", source], {
-      timeout: OSA_TIMEOUT_MS,
-      encoding: "utf8",
-      maxBuffer: 256 * 1024,
-    });
-    return stdout.trim();
-  } catch {
-    return null;
-  }
-}
-
-function parsePipe(raw: string | null): string[] {
-  if (!raw || raw === "none") return [];
-  return raw.split("|||");
-}
-
-// ---------- media-control（系统级 Now Playing）----------
-
-let mediaControlPath: string | null | undefined;
-
-/** 解析 PATH 上的 media-control；结果缓存。设 WE_MEDIA_CONTROL=0 可强制禁用。 */
-async function resolveMediaControl(): Promise<string | null> {
-  if (process.env.WE_MEDIA_CONTROL === "0") return null;
-  if (mediaControlPath !== undefined) return mediaControlPath;
-  if (process.platform !== "darwin") {
-    mediaControlPath = null;
-    return null;
-  }
-  const override = process.env.WE_MEDIA_CONTROL?.trim();
-  if (override && override !== "1") {
-    mediaControlPath = override;
-    return mediaControlPath;
-  }
-  try {
-    const { stdout } = await execFileAsync("which", ["media-control"], {
-      timeout: 2_000,
-      encoding: "utf8",
-    });
-    const p = stdout.trim();
-    mediaControlPath = p || null;
-  } catch {
-    mediaControlPath = null;
-  }
-  return mediaControlPath;
-}
-
-/**
- * 把 media-control JSON 归一成 LiveMediaSnap。
- * stream 事件形如 `{ type:"data", diff:bool, payload:{...} }`；get 则是扁平对象。
- * `diff:true` 时 payload 是增量，必须与现有缓存合并，不能整表替换。
- */
-function fromMediaControlJson(raw: unknown, prev?: LiveMediaSnap): LiveMediaSnap {
-  if (raw == null || typeof raw !== "object") {
-    return { ...EMPTY_MEDIA, source: "media-control" };
-  }
-  const o = raw as Record<string, unknown>;
-
-  // stream 包装
-  let info: Record<string, unknown>;
-  let isDiff = false;
-  if (o.type === "data" && o.payload !== undefined) {
-    isDiff = o.diff === true;
-    if (o.payload == null) {
-      return { ...EMPTY_MEDIA, source: "media-control" };
-    }
-    if (typeof o.payload !== "object") {
-      return prev ? { ...prev } : { ...EMPTY_MEDIA, source: "media-control" };
-    }
-    info = o.payload as Record<string, unknown>;
-    // 启动时常见：先推一条空 payload，再推完整曲目。空包且非 diff → 忽略，保留 prev/get 结果。
-    if (!isDiff && Object.keys(info).length === 0) {
-      return prev ?? { ...EMPTY_MEDIA, source: "media-control" };
-    }
-  } else if (o.payload && typeof o.payload === "object") {
-    info = o.payload as Record<string, unknown>;
-  } else {
-    info = o;
-  }
-
-  // 先存封面再删，避免 SSE 被 base64 撑爆
-  const artRaw = info.artworkData;
-  const artMime = str(info.artworkMimeType) || "image/jpeg";
-  delete info.artworkData;
-
-  const base = isDiff && prev?.hasMedia ? { ...prev } : { ...EMPTY_MEDIA, source: "media-control" as const };
-
-  const title = str(info.title ?? info.Title ?? info.name ?? (isDiff ? base.title : ""));
-  const artist = str(info.artist ?? info.Artist ?? info.trackArtist ?? (isDiff ? base.artist : ""));
-  const album = str(info.album ?? info.Album ?? info.albumName ?? (isDiff ? base.album : ""));
-  const albumArtist = str(
-    info.albumArtist ?? info.AlbumArtist ?? artist ?? (isDiff ? base.albumArtist : ""),
-  );
-
-  let duration = info.duration != null || info.Duration != null || info.durationSeconds != null
-    ? num(info.duration ?? info.Duration ?? info.durationSeconds)
-    : base.duration;
-  let position =
-    info.elapsedTime != null || info.elapsed != null || info.position != null || info.Progress != null
-      ? num(info.elapsedTime ?? info.elapsed ?? info.position ?? info.Progress)
-      : base.position;
-  if (duration > 10_000) duration /= duration > 1_000_000 ? 1_000_000 : 1_000;
-  if (position > 10_000) position /= position > 1_000_000 ? 1_000_000 : 1_000;
-
-  const hasPlayingFlag = "playing" in info || "Playing" in info;
-  const playing =
-    info.playing === true ||
-    info.Playing === true ||
-    Number(info.playbackRate ?? info.PlaybackRate) > 0;
-  const pausedExplicit =
-    info.playing === false ||
-    info.Playing === false ||
-    (hasPlayingFlag && !playing && Number(info.playbackRate ?? info.PlaybackRate) === 0);
-
-  const bundle = str(
-    info.bundleIdentifier ??
-      info.bundleId ??
-      info.appBundleIdentifier ??
-      info.clientBundleIdentifier ??
-      (isDiff ? "" : ""),
-  );
-  const appName = str(
-    info.appName ??
-      info.application ??
-      info.displayName ??
-      (bundleAppName(bundle) || (isDiff ? base.app : "")),
-  );
-
-  if (!title && !artist && !album && !isDiff) {
-    // 明确无曲目（例如 get 返回 null 字段）
-    if (hasPlayingFlag && !playing) return { ...EMPTY_MEDIA, source: "media-control" };
-    if (!hasPlayingFlag && Object.keys(info).length === 0) {
-      return prev ?? { ...EMPTY_MEDIA, source: "media-control" };
-    }
-  }
-
-  let state: 0 | 1 | 2 = base.state;
-  if (playing) state = 1;
-  else if (pausedExplicit) state = 2;
-  else if (title || artist) state = state || 2;
-
-  if (!title && !artist && !album && state === 0) {
-    return { ...EMPTY_MEDIA, source: "media-control" };
-  }
-
-  const trackKey = `${title || base.title}|${artist || base.artist}|${album || base.album}`;
-  if (typeof artRaw === "string" && artRaw.length > 64) {
-    try {
-      const data = Buffer.from(artRaw, "base64");
-      if (data.length > 64) {
-        serviceArtwork = { mime: artMime, data, key: trackKey };
-      }
-    } catch {
-      /* 坏 base64 忽略 */
-    }
-  }
-
-  const hasArtwork = !!(serviceArtwork && serviceArtwork.key === trackKey);
-
-  return {
-    hasMedia: true,
-    state: state === 0 ? 2 : state,
-    title: title || base.title,
-    artist: artist || base.artist,
-    album: album || base.album,
-    albumArtist: albumArtist || base.albumArtist,
-    position,
-    duration,
-    app: appName || base.app || bundle || "Now Playing",
-    hasArtwork,
-    source: "media-control",
-  };
-}
-
-function bundleAppName(bundle: string): string {
-  if (!bundle) return "";
-  if (bundle.includes("spotify")) return "Spotify";
-  if (bundle.includes("Music") || bundle.endsWith(".Music")) return "Music";
-  if (bundle.includes("chrome")) return "Google Chrome";
-  if (bundle.includes("safari") || bundle.includes("Safari")) return "Safari";
-  if (bundle.includes("firefox")) return "Firefox";
-  if (bundle.includes("tv")) return "TV";
-  const last = bundle.split(".").pop() || bundle;
-  return last.charAt(0).toUpperCase() + last.slice(1);
-}
-
-async function mediaControlGet(bin: string): Promise<LiveMediaSnap> {
-  try {
-    const { stdout } = await execFileAsync(bin, ["get", "--now"], {
-      timeout: 5_000,
-      encoding: "utf8",
-      maxBuffer: 32 * 1024 * 1024,
-    });
-    const text = stdout.trim();
-    if (!text || text === "null") return { ...EMPTY_MEDIA, source: "media-control" };
-    return fromMediaControlJson(JSON.parse(text), service.media);
-  } catch {
-    // 旧版无 --now
-    try {
-      const { stdout } = await execFileAsync(bin, ["get"], {
-        timeout: 5_000,
-        encoding: "utf8",
-        maxBuffer: 32 * 1024 * 1024,
-      });
-      const text = stdout.trim();
-      if (!text || text === "null") return { ...EMPTY_MEDIA, source: "media-control" };
-      return fromMediaControlJson(JSON.parse(text), service.media);
-    } catch {
-      return { ...EMPTY_MEDIA, source: "media-control" };
-    }
-  }
-}
-
-async function mediaControlSend(bin: string, action: MediaControl): Promise<void> {
-  // media-control 0.7 命令名：next-track / previous-track / toggle-play-pause
-  const args =
-    action === "skipNext"
-      ? ["next-track"]
-      : action === "skipPrevious"
-        ? ["previous-track"]
-        : action === "play"
-          ? ["play"]
-          : action === "pause"
-            ? ["pause"]
-            : ["toggle-play-pause"];
-  try {
-    await execFileAsync(bin, args, { timeout: 3_000, encoding: "utf8" });
-  } catch {
-    /* ignore */
-  }
-}
-
-// ---------- AppleScript 回退（Music / Spotify）----------
-
-async function readMusic(): Promise<LiveMediaSnap | null> {
-  const raw = await osascript(`
-tell application "System Events"
-  if not (exists process "Music") then return "none"
-end tell
-tell application "Music"
-  set st to player state as string
-  if st is "stopped" then return "none"
-  try
-    set t to name of current track
-    set a to artist of current track
-    set al to album of current track
-    set pos to player position
-    set dur to duration of current track
-  on error
-    return "none"
-  end try
-  return st & "|||" & t & "|||" & a & "|||" & al & "|||" & pos & "|||" & dur
-end tell
-`);
-  const p = parsePipe(raw);
-  if (p.length < 6) return null;
-  const state: 0 | 1 | 2 = p[0] === "playing" ? 1 : p[0] === "paused" ? 2 : 0;
-  if (state === 0) return null;
-  return {
-    hasMedia: true,
-    state,
-    title: p[1] || "",
-    artist: p[2] || "",
-    album: p[3] || "",
-    albumArtist: p[2] || "",
-    position: num(p[4]),
-    duration: num(p[5]),
-    app: "Music",
-    hasArtwork: false,
-    source: "applescript",
-  };
-}
-
-async function readSpotify(): Promise<LiveMediaSnap | null> {
-  const raw = await osascript(`
-tell application "System Events"
-  if not (exists process "Spotify") then return "none"
-end tell
-tell application "Spotify"
-  set st to player state as string
-  if st is "stopped" then return "none"
-  try
-    set t to name of current track
-    set a to artist of current track
-    set al to album of current track
-    set pos to player position
-    set dur to duration of current track
-  on error
-    return "none"
-  end try
-  return st & "|||" & t & "|||" & a & "|||" & al & "|||" & pos & "|||" & dur
-end tell
-`);
-  const p = parsePipe(raw);
-  if (p.length < 6) return null;
-  const state: 0 | 1 | 2 = p[0] === "playing" ? 1 : p[0] === "paused" ? 2 : 0;
-  if (state === 0) return null;
-  let duration = num(p[5]);
-  let position = num(p[4]);
-  if (duration > 10_000) {
-    duration /= 1000;
-    if (position > 10_000) position /= 1000;
-  }
-  return {
-    hasMedia: true,
-    state,
-    title: p[1] || "",
-    artist: p[2] || "",
-    album: p[3] || "",
-    albumArtist: p[2] || "",
-    position,
-    duration,
-    app: "Spotify",
-    hasArtwork: false,
-    source: "applescript",
-  };
-}
-
-async function readViaAppleScript(): Promise<LiveMediaSnap> {
-  const [music, spotify] = await Promise.all([readMusic(), readSpotify()]);
-  const playing = [music, spotify].find((m) => m && m.state === 1);
-  if (playing) return playing;
-  const paused = [music, spotify].find((m) => m && m.state === 2);
-  if (paused) return paused;
-  return { ...EMPTY_MEDIA, source: "applescript" };
-}
-
-async function controlViaAppleScript(action: MediaControl, app: string): Promise<void> {
-  if (app !== "Music" && app !== "Spotify") return;
-  const cmd =
-    action === "skipNext"
-      ? "next track"
-      : action === "skipPrevious"
-        ? "previous track"
-        : action === "play"
-          ? "play"
-          : action === "pause"
-            ? "pause"
-            : "playpause";
-  await osascript(`tell application ${JSON.stringify(app)} to ${cmd}`);
-}
-
-// ---------- 前台窗口 ----------
-
-async function readFrontWindowOnce(): Promise<LiveWindowSnap> {
-  const raw = await osascript(`
-tell application "System Events"
-  set p to first application process whose frontmost is true
-  set appName to name of p
-  set winTitle to ""
-  try
-    set winTitle to name of front window of p
-  end try
-  return appName & "|||" & winTitle
-end tell
-`);
-  const p = parsePipe(raw);
-  if (p.length < 1) return { ...EMPTY_WINDOW };
-  return { app: p[0] || "", title: p[1] || "", url: "" };
-}
-
-// ---------- 后台服务（单例缓存）----------
+// ---------- media-bridge 子进程（stdio JSON 行）----------
 
 type LiveService = {
   media: LiveMediaSnap;
   window: LiveWindowSnap;
-  backend: "media-control" | "applescript" | "none";
+  backend: "media-bridge" | "none";
   started: boolean;
 };
 
@@ -459,27 +112,360 @@ const service: LiveService = {
   started: false,
 };
 
-let mediaTimer: ReturnType<typeof setInterval> | null = null;
-let windowTimer: ReturnType<typeof setInterval> | null = null;
-let streamProc: ChildProcess | null = null;
-let streamBuf = "";
+let bridgeBin: string | null = null;
+let bridgeBinResolved = false;
+let bridgeProc: ChildProcess | null = null;
+let bridgeBuf = "";
+let bridgeSeq = 0;
+let bridgeRespawns = 0;
+let bridgeShuttingDown = false;
+const pending = new Map<
+  number,
+  { resolve: (msg: Record<string, unknown>) => void; timer: ReturnType<typeof setTimeout> }
+>();
 
-function applyMedia(next: LiveMediaSnap) {
-  service.media = next;
-  if (next.source !== "none") service.backend = next.source;
+/** 最新频谱帧 + 采集侧状态 */
+let latestAudio: AudioFrame | null = null;
+let lastAudioAtMs = 0;
+let audioStatus: AudioStatus = "idle";
+
+const audioFrameListeners = new Set<(frame: AudioFrame) => void>();
+
+/** 频谱帧到达时回调（wallpaper-host 用它向 SSE 客户端扇出） */
+export function onAudioFrame(cb: (frame: AudioFrame) => void): () => void {
+  audioFrameListeners.add(cb);
+  return () => audioFrameListeners.delete(cb);
 }
 
-function applyMediaControlRaw(raw: unknown) {
-  applyMedia(fromMediaControlJson(raw, service.media));
+export function getAudioStatus(): AudioStatus {
+  if (service.backend !== "media-bridge") return "off";
+  if (audioStatus === "live" && Date.now() - lastAudioAtMs > 1_500) return "unavailable";
+  return audioStatus;
 }
 
-async function pollAppleScriptMedia() {
-  try {
-    applyMedia(await readViaAppleScript());
-  } catch {
-    /* 单轮失败保留旧缓存 */
+export function getLatestAudioFrame(): AudioFrame | null {
+  return latestAudio;
+}
+
+function recordAudioFrame(frame: AudioFrame) {
+  latestAudio = frame;
+  lastAudioAtMs = Date.now();
+  if (audioStatus !== "live") audioStatus = "live";
+  for (const cb of audioFrameListeners) {
+    try {
+      cb(frame);
+    } catch {
+      /* 单个订阅者抛错不影响其他 */
+    }
   }
 }
+
+function recordAudioSourceState(state: string) {
+  if (state === "running") {
+    // 真正"活"要看帧有没有来；这里只把 denied/unavailable 摘掉
+    if (audioStatus === "denied" || audioStatus === "unavailable") audioStatus = "idle";
+  } else if (state === "denied") {
+    audioStatus = "denied";
+  } else if (state === "unavailable" || state === "error") {
+    audioStatus = "unavailable";
+  }
+}
+
+/** 解析 media-bridge 二进制：env 覆盖 → 仓库同级构建产物 → PATH。结果（含失败）缓存。 */
+async function resolveBridgeBin(): Promise<string | null> {
+  if (bridgeBinResolved) return bridgeBin;
+  bridgeBinResolved = true;
+  const override = process.env.MEDIA_BRIDGE_BIN?.trim();
+  const candidates: string[] = [];
+  if (override) candidates.push(override);
+  // vite dev server 的 cwd 是仓库根；同级 checkout 是本机的常规布局
+  candidates.push(resolve(process.cwd(), "../media-bridge/target/release/media-bridge"));
+  candidates.push(resolve(process.cwd(), "media-bridge/target/release/media-bridge"));
+  for (const p of candidates) {
+    try {
+      await access(p);
+      bridgeBin = p;
+      return bridgeBin;
+    } catch {
+      /* 下一个候选 */
+    }
+  }
+  if (process.platform !== "win32") {
+    try {
+      const { stdout } = await execFileAsync("which", ["media-bridge"], {
+        timeout: 2_000,
+        encoding: "utf8",
+      });
+      const p = stdout.trim();
+      if (p) {
+        bridgeBin = p;
+        return bridgeBin;
+      }
+    } catch {
+      /* PATH 上没有 */
+    }
+  }
+  return null;
+}
+
+/** 调一次方法，resolve 出 result；`ok:false` / 超时 / 进程不在 → reject */
+function callBridge(
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = BRIDGE_CALL_TIMEOUT_MS,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    if (!bridgeProc || !bridgeProc.stdin) {
+      reject(new Error("media-bridge 未运行"));
+      return;
+    }
+    const id = ++bridgeSeq;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`media-bridge ${method} 超时`));
+    }, timeoutMs);
+    const settle = (msg: Record<string, unknown>) => {
+      if (msg.ok === true) {
+        resolve((msg.result ?? {}) as Record<string, unknown>);
+      } else {
+        const err = (msg.error ?? {}) as Record<string, unknown>;
+        reject(new Error(String(err.message ?? err.code ?? `${method} 失败`)));
+      }
+    };
+    pending.set(id, { resolve: settle, timer });
+    try {
+      bridgeProc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+    } catch (e) {
+      clearTimeout(timer);
+      pending.delete(id);
+      reject(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
+function applyNow(now: unknown) {
+  if (now == null || typeof now !== "object") return;
+  const o = now as Record<string, unknown>;
+  const playback = (o.playback ?? {}) as Record<string, unknown>;
+  const track = (o.track ?? null) as Record<string, unknown> | null;
+  const stateStr = String(playback.state ?? "stopped");
+
+  if (o.hasMedia !== true || !track || stateStr === "stopped") {
+    service.media = { ...EMPTY_MEDIA };
+    return;
+  }
+
+  const source = (track.source ?? {}) as Record<string, unknown>;
+  const artwork = (track.artwork ?? null) as Record<string, unknown> | null;
+  // control 等回执里的 now 可能省略 artwork；曲目没换就不回退封面标志
+  const prev = service.media;
+  const sameTrack =
+    prev.hasMedia &&
+    prev.title === String(track.title ?? "") &&
+    prev.artist === String(track.artist ?? "") &&
+    prev.album === String(track.album ?? "");
+  const hasArtwork = !!(artwork && artwork.path) || (sameTrack && prev.hasArtwork);
+
+  const snap: LiveMediaSnap = {
+    hasMedia: true,
+    state: stateStr === "playing" ? 1 : 2,
+    title: String(track.title ?? ""),
+    artist: String(track.artist ?? ""),
+    album: String(track.album ?? ""),
+    albumArtist: String(track.albumArtist ?? ""),
+    position: Number(playback.positionMs ?? 0) / 1000,
+    duration: Number(track.durationMs ?? playback.durationMs ?? 0) / 1000,
+    app: String(source.appName ?? ""),
+    hasArtwork,
+    source: "media-bridge",
+  };
+  service.media = snap;
+  service.backend = "media-bridge";
+
+  // 封面落盘在 media-bridge 缓存目录，直接读文件进内存（HTTP 端点只读缓存）
+  if (artwork && typeof artwork.path === "string") {
+    void refreshArtwork(String(artwork.path), String(artwork.mime ?? "image/jpeg"));
+  }
+}
+
+async function refreshArtwork(path: string, mime: string) {
+  if (path === artworkReadPath && serviceArtwork) return;
+  try {
+    const data = await readFile(path);
+    artworkReadPath = path;
+    serviceArtwork = {
+      mime,
+      data,
+      key: `${service.media.title}|${service.media.artist}|${service.media.album}`,
+    };
+  } catch {
+    /* 封面文件暂时读不到（竞态/权限）就等下一个事件 */
+  }
+}
+
+function handleBridgeEvent(msg: Record<string, unknown>) {
+  const event = String(msg.event ?? "");
+  if (event === "track" || event === "playback") {
+    applyNow(msg.now);
+  } else if (event === "artwork") {
+    const art = (msg.artwork ?? null) as Record<string, unknown> | null;
+    if (art && typeof art.path === "string") {
+      void refreshArtwork(String(art.path), String(art.mime ?? "image/jpeg"));
+    }
+  } else if (event === "spectrum") {
+    const frame = (msg.frame ?? null) as Record<string, unknown> | null;
+    if (frame && Array.isArray(frame.bands) && frame.bands.length === 64) {
+      recordAudioFrame({
+        bands: frame.bands.map((b) => Math.max(0, Math.min(255, Number(b) || 0))),
+        peak: Number(frame.peak ?? 0),
+        rms: Number(frame.rms ?? 0),
+        sampleRate: Number(frame.sampleRate ?? 16000),
+        tsMs: Number(frame.tsMs ?? Date.now()),
+      });
+    }
+  } else if (event === "status") {
+    const status = (msg.status ?? null) as Record<string, unknown> | null;
+    const sources = Array.isArray(status?.sources) ? status!.sources : [];
+    for (const s of sources as Record<string, unknown>[]) {
+      if (String(s.name ?? "") === "audio") recordAudioSourceState(String(s.state ?? ""));
+    }
+  } else if (event === "error") {
+    // 数据源出错（如 macOS 音频录制未授权）：按来源标记，别反复触发采集
+    if (String(msg.source ?? "") === "audio") {
+      recordAudioSourceState(String(msg.code ?? "unavailable") === "denied" ? "denied" : "unavailable");
+    }
+  }
+}
+
+function handleBridgeLine(line: string) {
+  if (!line) return;
+  let msg: Record<string, unknown>;
+  try {
+    msg = JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    /* 坏行忽略 */
+    return;
+  }
+  if (msg.event !== undefined) {
+    handleBridgeEvent(msg);
+    return;
+  }
+  if (msg.id === null || msg.id === undefined) return;
+  const entry = pending.get(Number(msg.id));
+  if (!entry) return;
+  clearTimeout(entry.timer);
+  pending.delete(Number(msg.id));
+  entry.resolve(msg);
+}
+
+function stopBridge() {
+  bridgeShuttingDown = true;
+  if (bridgeProc) {
+    try {
+      bridgeProc.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+    bridgeProc = null;
+  }
+  for (const [, entry] of pending) clearTimeout(entry.timer);
+  pending.clear();
+}
+
+function spawnBridge(bin: string) {
+  let child: ChildProcess;
+  try {
+    child = spawn(bin, ["serve"], { stdio: ["pipe", "pipe", "pipe"] });
+  } catch {
+    service.backend = "none";
+    return;
+  }
+  bridgeProc = child;
+  bridgeBuf = "";
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    bridgeBuf += chunk;
+    let idx: number;
+    while ((idx = bridgeBuf.indexOf("\n")) >= 0) {
+      const line = bridgeBuf.slice(0, idx).trim();
+      bridgeBuf = bridgeBuf.slice(idx + 1);
+      handleBridgeLine(line);
+    }
+  });
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", () => {
+    /* media-bridge 的日志走 stderr；测试台不转发 */
+  });
+  child.on("error", () => {
+    if (bridgeProc === child) bridgeProc = null;
+  });
+  child.on("exit", () => {
+    if (bridgeProc !== child) return;
+    bridgeProc = null;
+    service.backend = "none";
+    audioStatus = "off";
+    latestAudio = null;
+    // dev server 常驻，media-bridge 意外退出（崩溃/被杀）时拉起，别让实况静默死掉
+    if (!bridgeShuttingDown && service.started && bridgeRespawns < BRIDGE_MAX_RESPAWNS) {
+      bridgeRespawns++;
+      setTimeout(() => {
+        if (service.started && !bridgeProc) void startLiveSystemService();
+      }, BRIDGE_RESPAWN_DELAY_MS).unref?.();
+    }
+  });
+}
+
+async function initBridgeSession(bin: string) {
+  await callBridge("hello", {}, 6_000);
+  bridgeRespawns = 0;
+  service.backend = "media-bridge";
+  // 订阅要显式带上 spectrum（缺省 = 除频谱外全部）
+  await callBridge("subscribe", {
+    events: ["track", "playback", "artwork", "lyrics", "status", "error", "spectrum"],
+    intervalMs: SPECTRUM_INTERVAL_MS,
+  });
+  // 立刻有值：先取快照，再点一次 spectrum（首次调用触发音频 tap 创建）
+  applyNow(await callBridge("now"));
+  try {
+    const frame = await callBridge("spectrum", {}, 6_000);
+    if (Array.isArray(frame.bands)) recordAudioFrame(frame as unknown as AudioFrame);
+  } catch {
+    /* 音频侧不可用（未授权/无设备）不阻塞媒体实况 */
+  }
+}
+
+// ---------- 前台窗口（media-bridge 不管，AppleScript 轮询）----------
+
+async function readFrontWindowOnce(): Promise<LiveWindowSnap> {
+  if (process.platform !== "darwin") return { ...EMPTY_WINDOW };
+  let raw = "";
+  try {
+    const { stdout } = await execFileAsync(
+      "osascript",
+      [
+        "-e",
+        `tell application "System Events"
+  set p to first application process whose frontmost is true
+  set appName to name of p
+  set winTitle to ""
+  try
+    set winTitle to name of front window of p
+  end try
+  return appName & "|||" & winTitle
+end tell`,
+      ],
+      { timeout: 4_000, encoding: "utf8", maxBuffer: 256 * 1024 },
+    );
+    raw = stdout.trim();
+  } catch {
+    return { ...EMPTY_WINDOW };
+  }
+  const p = raw === "none" ? [] : raw.split("|||");
+  if (p.length < 1) return { ...EMPTY_WINDOW };
+  return { app: p[0] || "", title: p[1] || "", url: "" };
+}
+
+let windowTimer: ReturnType<typeof setInterval> | null = null;
 
 async function pollWindow() {
   try {
@@ -489,64 +475,7 @@ async function pollWindow() {
   }
 }
 
-function startMediaControlStream(bin: string) {
-  stopStream();
-  try {
-    // --no-diff：每次全量，避免增量吞掉 title；--debounce 降噪
-    const child = spawn(bin, ["stream", "--no-diff", "--debounce=250"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    streamProc = child;
-    streamBuf = "";
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      streamBuf += chunk;
-      let idx: number;
-      while ((idx = streamBuf.indexOf("\n")) >= 0) {
-        const line = streamBuf.slice(0, idx).trim();
-        streamBuf = streamBuf.slice(idx + 1);
-        if (!line) continue;
-        if (line === "null") {
-          serviceArtwork = null;
-          applyMedia({ ...EMPTY_MEDIA, source: "media-control" });
-          continue;
-        }
-        try {
-          applyMediaControlRaw(JSON.parse(line));
-        } catch {
-          /* 坏行忽略 */
-        }
-      }
-    });
-    child.on("exit", () => {
-      streamProc = null;
-      if (service.started && service.backend === "media-control" && !mediaTimer) {
-        mediaTimer = setInterval(() => {
-          void mediaControlGet(bin).then(applyMedia);
-        }, MEDIA_POLL_MS);
-        mediaTimer.unref?.();
-        void mediaControlGet(bin).then(applyMedia);
-      }
-    });
-  } catch {
-    mediaTimer = setInterval(() => {
-      void mediaControlGet(bin).then(applyMedia);
-    }, MEDIA_POLL_MS);
-    mediaTimer.unref?.();
-    void mediaControlGet(bin).then(applyMedia);
-  }
-}
-
-function stopStream() {
-  if (streamProc) {
-    try {
-      streamProc.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
-    streamProc = null;
-  }
-}
+// ---------- 对外 API（wallpaper-host 端点只读这些）----------
 
 /**
  * 启动后台采集（幂等）。Vite 插件 configureServer 时调一次即可。
@@ -554,28 +483,28 @@ function stopStream() {
 export async function startLiveSystemService(): Promise<{ backend: LiveService["backend"] }> {
   if (service.started) return { backend: service.backend };
   service.started = true;
+  bridgeShuttingDown = false;
 
-  if (process.platform !== "darwin") {
+  const bin = await resolveBridgeBin();
+  if (!bin) {
     service.backend = "none";
     return { backend: "none" };
   }
 
-  const bin = await resolveMediaControl();
-  if (bin) {
-    service.backend = "media-control";
-    // 先 get 一次立刻有值，再 stream 差分
-    applyMedia(await mediaControlGet(bin));
-    startMediaControlStream(bin);
-  } else {
-    service.backend = "applescript";
-    await pollAppleScriptMedia();
-    mediaTimer = setInterval(() => void pollAppleScriptMedia(), MEDIA_POLL_MS);
-    mediaTimer.unref?.();
+  try {
+    spawnBridge(bin);
+    await initBridgeSession(bin);
+  } catch {
+    // 起不来（二进制坏/协议对不上）：不反复重启，实况退化为空快照
+    stopBridge();
+    service.backend = "none";
   }
 
-  await pollWindow();
-  windowTimer = setInterval(() => void pollWindow(), WINDOW_POLL_MS);
-  windowTimer.unref?.();
+  if (process.platform === "darwin") {
+    await pollWindow();
+    windowTimer ??= setInterval(() => void pollWindow(), WINDOW_POLL_MS);
+    windowTimer.unref?.();
+  }
 
   return { backend: service.backend };
 }
@@ -600,16 +529,15 @@ export function getLiveBackend(): LiveService["backend"] {
   return service.backend;
 }
 
-/** 兼容旧调用：确保服务已起，再返回最新媒体（必要时等一轮采集） */
+/** 兼容旧调用：确保服务已起，再取一次最新快照 */
 export async function readNowPlaying(): Promise<LiveMediaSnap> {
   await startLiveSystemService();
-  // AppleScript 路径下缓存可能刚启动仍空，补一次
-  if (service.backend === "applescript" && !service.media.hasMedia) {
-    await pollAppleScriptMedia();
-  }
-  if (service.backend === "media-control" && !service.media.hasMedia) {
-    const bin = await resolveMediaControl();
-    if (bin) applyMedia(await mediaControlGet(bin));
+  if (service.backend === "media-bridge") {
+    try {
+      applyNow(await callBridge("now"));
+    } catch {
+      /* 读缓存 */
+    }
   }
   return service.media;
 }
@@ -620,19 +548,26 @@ export async function readFrontWindow(): Promise<LiveWindowSnap> {
   return service.window;
 }
 
-/** 控制当前系统正在播放；成功后刷新缓存 */
+const CONTROL_ACTIONS: Record<MediaControl, string> = {
+  skipNext: "next",
+  skipPrevious: "previous",
+  play: "play",
+  pause: "pause",
+  playPause: "play-pause",
+};
+
+/** 控制当前系统正在播放；media-bridge 回执里带控制后的完整快照 */
 export async function controlNowPlaying(action: MediaControl): Promise<LiveMediaSnap> {
   await startLiveSystemService();
-  const bin = await resolveMediaControl();
-  if (bin && service.backend === "media-control") {
-    await mediaControlSend(bin, action);
-    await new Promise((r) => setTimeout(r, 150));
-    applyMedia(await mediaControlGet(bin));
-    return service.media;
+  if (service.backend !== "media-bridge") return service.media;
+  try {
+    const result = await callBridge("control", { action: CONTROL_ACTIONS[action] });
+    // applied=false（播放器不支持）也带 now，照常刷新缓存
+    applyNow(result.now);
+  } catch {
+    /* 控制失败保留旧缓存 */
   }
-  const app = service.media.app;
-  await controlViaAppleScript(action, app);
-  await new Promise((r) => setTimeout(r, 150));
-  await pollAppleScriptMedia();
   return service.media;
 }
+
+process.on("exit", () => stopBridge());

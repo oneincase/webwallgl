@@ -49,8 +49,8 @@ export type WallpaperConfig = {
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene/web 拉取资源） */
   mediaBase?: string;
   /**
-   * 测试台「系统实况」：用麦克风频谱 + 宿主 Now Playing / 前台窗口替换模拟源。
-   * 默认 false（确定性模拟，离线可复现）。
+   * 测试台「系统实况」：用宿主 media-bridge 的系统输出频谱 + Now Playing /
+   * 前台窗口替换模拟源。默认 false（确定性模拟，离线可复现）。
    */
   liveSystem?: boolean;
   /**

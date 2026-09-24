@@ -1570,12 +1570,12 @@ function sniffMediaType(url) {
   check(!/rt\.disposers = \[\]/.test(clearBody),
     "clear() 不得排空实例级 rt.disposers（cover 窥视监听要活到 destroy）");
 
-  // --- 异步授权期间被拆掉：麦克风必须仍被释放 ---
-  // getUserMedia 阻塞在系统弹窗上，时长不可控；释放槽必须**同步登记**，
-  // 等 await 回来再挂的清理，在"授权期间换了壁纸"这一路上没人会调
+  // --- 异步启动期间被拆掉：实况句柄必须仍被释放 ---
+  // startLiveSystem 是异步的（首轮轮询 + SSE 建立），时长不可控；释放槽必须
+  // **同步登记**，等 await 回来再挂的清理，在"启动期间换了壁纸"这一路上没人会调
   for (const [name, src] of [["scene-mount.ts", sceneTs], ["web.ts", webTs]]) {
     check(/liveSlot/.test(src),
-      `${name} 的 liveSystem 释放必须同步登记（getUserMedia 期间换壁纸会漏掉麦克风流，录音指示常亮）`);
+      `${name} 的 liveSystem 释放必须同步登记（启动期间换壁纸会漏掉 dispose，句柄跨壁纸泄漏）`);
     check(/liveSlot\.dead/.test(src),
       `${name} 必须在 await 回来后检查 liveSlot.dead（已拆掉就立刻 dispose，不要接线）`);
   }

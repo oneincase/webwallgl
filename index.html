@@ -181,7 +181,7 @@
             <label class="vol"><span data-i18n="toolbar.volume">音量</span>
               <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
             </label>
-            <label class="check" data-i18n-title="toolbar.liveTip" title="歌名走 Node/media-control；音频可视化走麦克风（测试台无系统声卡环回）">
+            <label class="check" data-i18n-title="toolbar.liveTip" title="歌名/进度与音频条走 media-bridge（Node 子进程，系统输出回环采集，不采麦克风）；前台窗口走 AppleScript">
               <input id="live-system" type="checkbox" checked />
               <span data-i18n="toolbar.live">系统实况</span>
             </label>

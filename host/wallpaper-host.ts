@@ -25,12 +25,12 @@
  *   GET /api/system/artwork                当前曲目封面（image/jpeg 等）
  *   GET /api/system/media                  系统正在播放（Node 缓存；?fresh=1 强制刷新）
  *   GET /api/system/window                 前台窗口标题
- *   GET /api/system/stream                 媒体+窗口合并 SSE（读缓存 ~2Hz）
+ *   GET /api/system/stream                 媒体+窗口+频谱 SSE（媒体 ~2Hz，频谱随 media-bridge 帧率）
  *   POST /api/system/media-control         切歌/播放/暂停 → 当前播放器
  *   GET /audio-stream/{token}              对齐 WallpaperEM；测试台无 SCK 时 503
  *
- * 媒体元数据由 host/system-live.ts 在 Node 进程内采集（media-control 或 AppleScript），
- * 不依赖浏览器 MediaSession。
+ * 媒体元数据与系统音频由 host/system-live.ts 经 media-bridge 子进程在 Node 侧采集
+ * （Now Playing + 系统输出频谱，浏览器不再采麦克风），不依赖浏览器 MediaSession。
  */
 import { createReadStream, promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
@@ -42,10 +42,12 @@ import { describe, overrideProps, readOverrides, writeOverrides } from "./we-pro
 import { injectWebShim, isHtmlPath } from "./we-web-html.mjs";
 import {
   controlNowPlaying,
+  getAudioStatus,
   getCachedArtwork,
   getCachedMedia,
   getCachedWindow,
   getLiveBackend,
+  onAudioFrame,
   readFrontWindow,
   readNowPlaying,
   startLiveSystemService,
@@ -502,21 +504,32 @@ export function wallpaperHost(): Plugin {
   let lib = libraryDir();
   /** 已连接的测试台 SSE 客户端（用于把 /diag 上报回显到页面日志区） */
   const diagClients = new Set<any>();
+  // /api/system/stream 的订阅者：media/window 定时推，频谱帧随到随推
+  const streamClients = new Set<any>();
+  onAudioFrame((frame) => {
+    if (!streamClients.size) return;
+    const line = `data: ${JSON.stringify({ audio: frame })}\n\n`;
+    for (const c of streamClients) {
+      try {
+        c.write(line);
+      } catch {
+        streamClients.delete(c);
+      }
+    }
+  });
   return {
     name: "we-scene-renderer:wallpaper-host",
     configureServer(server: ViteDevServer) {
       server.config.logger.info(`[host] 壁纸库目录：${lib}`);
       void startLiveSystemService().then(({ backend }) => {
-        if (backend === "media-control") {
+        if (backend === "media-bridge") {
           server.config.logger.info(
-            `[host] 系统媒体：media-control（系统级 Now Playing）`,
-          );
-        } else if (backend === "applescript") {
-          server.config.logger.info(
-            `[host] 系统媒体：AppleScript（Music/Spotify）；安装 brew install media-control 可覆盖浏览器等全部播放源`,
+            `[host] 系统实况：media-bridge（系统级 Now Playing + 系统输出频谱）`,
           );
         } else {
-          server.config.logger.info(`[host] 系统媒体：当前平台无采集后端`);
+          server.config.logger.info(
+            `[host] 系统实况：未找到 media-bridge（构建 ../media-bridge 或设 MEDIA_BRIDGE_BIN）；端点返回空快照`,
+          );
         }
       });
 
@@ -577,7 +590,11 @@ export function wallpaperHost(): Plugin {
         if (path === "/api/system/media") {
           const fresh = url.searchParams.get("fresh") === "1";
           const media = fresh ? await readNowPlaying() : (await startLiveSystemService(), getCachedMedia());
-          sendJson(res, 200, { ...media, backend: getLiveBackend() });
+          sendJson(res, 200, {
+            ...media,
+            backend: getLiveBackend(),
+            audioState: getAudioStatus(),
+          });
           return;
         }
 
@@ -619,7 +636,7 @@ export function wallpaperHost(): Plugin {
           return;
         }
 
-        // --- 系统实况：媒体 + 窗口 SSE（读缓存，~2Hz；采集在后台单例）---
+        // --- 系统实况：媒体 + 窗口 SSE（媒体/窗口 ~2Hz；频谱随 media-bridge 帧率）---
         if (path === "/api/system/stream") {
           res.statusCode = 200;
           res.setHeader("Content-Type", "text/event-stream");
@@ -628,17 +645,14 @@ export function wallpaperHost(): Plugin {
           res.setHeader("Access-Control-Allow-Origin", "*");
           res.write(": connected\n\n");
           await startLiveSystemService();
-          let closed = false;
-          req.on("close", () => {
-            closed = true;
-          });
+          streamClients.add(res);
           const push = () => {
-            if (closed) return;
             try {
               const payload = {
                 media: getCachedMedia(),
                 window: getCachedWindow(),
                 backend: getLiveBackend(),
+                audioState: getAudioStatus(),
               };
               res.write(`data: ${JSON.stringify(payload)}\n\n`);
             } catch {
@@ -647,11 +661,14 @@ export function wallpaperHost(): Plugin {
           };
           push();
           const timer = setInterval(push, 500);
-          req.on("close", () => clearInterval(timer));
+          req.on("close", () => {
+            clearInterval(timer);
+            streamClients.delete(res);
+          });
           return;
         }
 
-        // --- 对齐 WallpaperEM：系统音频 SSE（测试台无 ScreenCaptureKit → 503）---
+        // --- 对齐 WallpaperEM：系统音频 SSE（测试台无 SCK；真实频谱走 /api/system/stream）---
         if (path.startsWith("/audio-stream/")) {
           const tok = path.slice("/audio-stream/".length).split("/")[0];
           if (tok !== DEV_TOKEN) {
@@ -664,7 +681,7 @@ export function wallpaperHost(): Plugin {
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
           res.setHeader("Cache-Control", "no-store");
           res.end(
-            "audio capture unavailable in test bench (no ScreenCaptureKit); use liveSystem mic",
+            "audio capture unavailable in test bench (no ScreenCaptureKit); liveSystem uses media-bridge via /api/system/stream",
           );
           return;
         }
