@@ -135,6 +135,49 @@ async function importIsolatedFn(srcText, fnName) {
     { baseHref: "https://cdn.example/wp/" },
   );
   check((withBase.match(/<base\b/gi) || []).length === 1, "已有 <base> 时不得再插一个");
+
+  // 作者自带的 <base> 分两类（实测，2026-09-25）：
+  //   · 绝对 URL → 保留（作者可能真把资源放在 CDN，覆盖它反而会打断）；
+  //   · 相对值（`./` / `/` / `../`）→ **必须就地改写**：跨源入口是 blob 挂载的，blob
+  //     文档没有目录概念，`.` 会解析到 blob 自己 ⇒ 相对子资源一个请求都发不出 ⇒
+  //     整页白屏（合成夹具 A/B：同一份 HTML 去掉 base 时 app.js 正常执行并回传信标，
+  //     加回 `<base href="./">` 后脚本完全不加载；媒体源对同一路径实测 200）。
+  //     SPA/Angular 构建常自带 `<base href="./">`（CRA 不带），所以这不是角落情况。
+  const relBase = rw.rewriteHtml(
+    `<!doctype html><html><head><base href="./"><script src="./static/app.js"></script></head></html>`,
+    shim,
+    { baseHref: "https://cdn.example/wp/" },
+  );
+  check((relBase.match(/<base\b/gi) || []).length === 1, "相对 base 就地改写，不得再加第二个");
+  check(/<base href="https:\/\/cdn\.example\/wp\/">/i.test(relBase), "相对 base 必须换成入口目录");
+  check(relBase.indexOf('href="./"') === -1, "改写后不得残留相对的 ./ base");
+
+  const absBase = rw.rewriteHtml(
+    `<!doctype html><html><head><base href="https://assets.example/cdn/"><script src="a.js"></script></head></html>`,
+    shim,
+    { baseHref: "https://cdn.example/wp/" },
+  );
+  check(/<base href="https:\/\/assets\.example\/cdn\/">/i.test(absBase), "作者的绝对 base 应保留不动");
+  check(absBase.indexOf("cdn.example/wp") === -1, "绝对 base 有效时不得再塞自己的 base");
+
+  const rootBase = rw.rewriteHtml(
+    `<!doctype html><html><head><base href="/"></head></html>`,
+    shim,
+    { baseHref: "https://cdn.example/wp/" },
+  );
+  check(/<base href="https:\/\/cdn\.example\/wp\/">/i.test(rootBase), "根相对 base（/）同样要改写");
+
+  const targetOnly = rw.rewriteHtml(
+    `<!doctype html><html><head><base target="_blank"></head></html>`,
+    shim,
+    { baseHref: "https://cdn.example/wp/" },
+  );
+  check(
+    /<base target="_blank">/i.test(targetOnly) &&
+      /<base href="https:\/\/cdn\.example\/wp\/">/i.test(targetOnly),
+    "只带 target 的 base 不设基准 URL：保留它并另插自己的 base",
+  );
+
   const bare = rw.rewriteHtml(`<script>author()</script>`, shim, {
     baseHref: "https://x/a/",
     seedScript: "window.__SEED=1;",
