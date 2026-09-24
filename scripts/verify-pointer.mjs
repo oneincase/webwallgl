@@ -665,7 +665,7 @@ console.log('\n【3.5 外部指针注入（宿主推送通道）】')
   }
 
   // pushExternalLeave 只清按键、**保留位置与 has**。清 has 会让 xray 开窗
-  // 跳到相机外（renderer.js XRAY_IDLE_SCREEN_UV）、视差弹回中心，画面明显抽一下。
+  // 跳到层外（renderer.js XRAY_IDLE_LAYER_UV）、视差弹回中心，画面明显抽一下。
   src.pushExternal({ u: 0.3, v: 0.6, buttons: 1 })
   src.pushExternalLeave()
   if (src.state.leftDown) fail('pushExternalLeave 未清按键（点击态会永久卡住）')
@@ -1027,7 +1027,7 @@ console.log('\n【5. 指针 shader 转译产物】')
   // 判据：纯函数方向（size↑ → UV scale↓ → 范围↑）、rewrite 接线、
   // 旧版 *= g 同样取倒数（1586038665 调到 10 曾只剩小圆点）。
   {
-    const { xrayUvScale, rewriteXrayFragScale, constantFallback, XRAY_SIZE_FALLBACK } = await import(
+    const { xrayUvScale, rewriteXrayFragScale } = await import(
       path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js')
     ).catch(() => ({}))
     if (typeof xrayUvScale !== 'function') {
@@ -1062,17 +1062,21 @@ console.log('\n【5. 指针 shader 转译产物】')
       } else if (!/1\.0\s*\/\s*max\(\s*g_PointerScale/.test(out)) {
         fail('rewriteXrayFragScale 未在 frag 对 g_PointerScale 取倒数')
       } else ok('xray.frag 在片元内对 g_PointerScale 取倒数（size↑ → 效果范围↑）')
-      // 旧版 1586038665：frag 直接乘 g。上一则断言「不要改」已推翻——
-      // 作者滑条叫 xray size、1–10，size=1 恒等看不出，调到 10 只剩小圆点。
+      // 旧版（frag 直接乘 g，1586038665 / 1368497013）**必须保持官方原样**：
+      // 它的 `g_PointerScale` 是 exponent 语义（material ui_editor_particle_element_exponent,
+      // 官方 range [0.01,20]、缺省 5，作者滑条 1–10 默认 2 → 0.25 层 UV 开窗）。
+      // 曾经把旧版也改成 1/g 来"让 size 调大范围变大"，代价是默认 2 变成 0.5 的 UV 放大：
+      // 开窗半径 1.0 层 UV ≥ 整层，实测 d′ 全屏落在 [0.259,0.741]（halo 亮盘内）= 开窗
+      // 面积 100%，整屏洗白 + saturate 直线缝。调到 10 只剩小圆点是旧版滑条的官方行为。
       const old = 'unprojectedUVs *= g_PointerScale * vec2(1.0, v_PointerUV.w);'
       const oldOut = rewriteXrayFragScale(old)
-      if (/unprojectedUVs\s*\*=\s*g_PointerScale\s*\*/.test(oldOut)) {
-        fail('旧版 xray.frag 仍乘 g_PointerScale（size=10 只剩小圆点）')
-      } else if (!/1\.0\s*\/\s*max\(\s*g_PointerScale/.test(oldOut)) {
-        fail('旧版 xray.frag 未对 g_PointerScale 取倒数')
-      } else ok('旧版 xray.frag（*= g_PointerScale）同样取倒数（size=10 范围变大）')
+      if (!/unprojectedUVs\s*\*=\s*g_PointerScale\s*\*/.test(oldOut)) {
+        fail('旧版 xray.frag 被改写了（官方 *= g 的 exponent 语义必须原样保留）')
+      } else if (oldOut !== old) {
+        fail('旧版 xray.frag 输出与输入不一致（旧版不应有任何改写）')
+      } else ok('旧版 xray.frag（*= g_PointerScale）保持官方 exponent 语义')
       if (rewriteXrayFragScale(oldOut) !== oldOut) {
-        fail('rewriteXrayFragScale 对已改写的旧版不幂等（会叠倒）')
+        fail('rewriteXrayFragScale 对旧版不幂等')
       }
       if (rewriteXrayFragScale(out) !== out) {
         fail('rewriteXrayFragScale 对已改写的新版不幂等（会叠倒）')
@@ -1089,11 +1093,9 @@ console.log('\n【5. 指针 shader 转译产物】')
             fail('1586038665 转译后找不到 *= g_PointerScale（旧版探测失效）')
           } else {
             const rewritten = rewriteXrayFragScale(oldGlsl)
-            if (/unprojectedUVs\s*\*=\s*g_PointerScale\s*\*/.test(rewritten)) {
-              fail('1586038665 旧版 xray.frag 仍乘 g（size=10 只剩小圆点）')
-            } else if (!/1\.0\s*\/\s*max\(\s*g_PointerScale/.test(rewritten)) {
-              fail('1586038665 旧版 xray.frag 未取倒数')
-            } else ok('1586038665 实机 shader 已改写为 1/g（调到 10 范围变大）')
+            if (rewritten !== oldGlsl) {
+              fail('1586038665 实机 shader 被改写（官方 exponent 语义必须原样保留）')
+            } else ok('1586038665 实机 shader 原样保留 *= g（默认 2 → 0.25 层 UV 开窗）')
           }
         } catch (e) {
           fail('1586038665 旧版 xray.frag 改写检查失败：' + ((e && e.message) || e))
@@ -1104,6 +1106,8 @@ console.log('\n【5. 指针 shader 转译产物】')
       fail('getEffectProgram 未调用 rewriteXrayFragScale（导出了函数但没接线，size 变大范围会缩）')
     } else ok('getEffectProgram 编译前改写 xray.frag 的 UV scale')
     // 效果覆盖半径 = 层 UV 分数 × 层 CSS 宽，与画布 bitmap（dpr）无关。
+    // xrayUvScale 只描述**新版 varying 形态**（s = 1/size，size 越大覆盖越大）；
+    // 旧版是官方 exponent（s = g，调大覆盖变小），方向相反是有意的，别往这函数上套。
     if (typeof xrayUvScale === 'function') {
       const cssR = (g, layerCssW) => (0.5 / xrayUvScale(g)) * layerCssW
       const r1 = cssR(1, 1280), r2 = cssR(2, 1280)
@@ -1113,102 +1117,100 @@ console.log('\n【5. 指针 shader 转译产物】')
 
     // [we-scene patch] 作者没在 constantshadervalues 里写 size 时的缺省。
     //
-    // shader 注释是 `"default":0.2`，那是**编辑器新建效果时滑条的初值**，
-    // 不是运行时缺省：WE 编辑器把效果加到层上就会把当时的滑条值写进 csv，
-    // 官方运行时永远读得到显式值（本地库 17 个 xray pass 全都带 size）。
-    // 我们的 bindConstants 兜底循环却会把 0.2 当 fallback 套上去，
-    // 经 xrayUvScale 取倒数是 5 —— UV 放大五倍，效果范围缩成光标旁一小块。
-    // 缺省要的是恒等：1。
-    if (typeof constantFallback !== 'function') {
-      fail('renderer.js 未导出 constantFallback（xray size 缺省无离线入口）')
-    } else {
-      if (XRAY_SIZE_FALLBACK !== 1) {
-        fail(`XRAY_SIZE_FALLBACK 应为 1（恒等），得到 ${XRAY_SIZE_FALLBACK}`)
+    // 就是 shader 注释里的声明 default，**不要**再给 g_PointerScale 开特例：
+    // 旧版声明 5（exponent）、新版声明 0.2（size，经 vert 的 1/g 也是 5），官方
+    // 对没写值的 material 用的就是声明 default。曾经按「1 = 恒等」塞过
+    // XRAY_SIZE_FALLBACK=1 —— 那是给改写后的 1/g 语义配的锚，换成官方 ×g 后 1
+    // 等于把开窗放到最大（1368497013 的 csv 里本来就没有 size，是活的受害者）。
+    {
+      if (/\b(?:XRAY_SIZE_FALLBACK|constantFallback)\b/.test(rendererSrc)
+        || /===\s*'g_PointerScale'/.test(rendererSrc)) {
+        fail('renderer.js 仍给 g_PointerScale 开缺省特例（应用声明 default）')
+      } else if (!/if\s*\(\s*entry\.default\s*!==\s*undefined\s*\)\s*setConstant\(/.test(rendererSrc)) {
+        fail('bindConstants 缺省分支未直接使用 entry.default')
+      } else ok('bindConstants 缺省统一用声明 default（无 g_PointerScale 特例）')
+      // 声明 default 必须让两种形态落到同一个小开窗：旧版 s=5；新版 s=1/0.2=5。
+      const oldPkg = path.join(LIB, '1368497013', 'scene.pkg')
+      if (fs.existsSync(oldPkg)) {
+        try {
+          const pk = parsePkg(fs.readFileSync(oldPkg))
+          const frag = dec(getEntry(pk, 'shaders/effects/xray.frag'))
+          const dflt = /uniform\s+float\s+g_PointerScale\s*;\s*\/\/[^\n]*"default"\s*:\s*([0-9.]+)/.exec(frag)
+          if (!dflt) fail('1368497013 的 g_PointerScale 声明缺少 default')
+          else if (Math.abs(parseFloat(dflt[1]) - 5) > 1e-9) {
+            fail(`1368497013 声明 default 应为 5（exponent），得到 ${dflt[1]}`)
+          } else ok('旧版缺省 = 声明 default 5（开窗半径 0.5/5 = 0.1 层 UV，不是整层）')
+        } catch (e) {
+          fail('1368497013 缺省检查失败：' + ((e && e.message) || e))
+        }
       }
-      const fb = constantFallback('g_PointerScale', 0.2)
-      if (fb !== 1) {
-        fail(`作者未配置 size 时 g_PointerScale 缺省应为 1，得到 ${fb}` +
-          '（用注释里的 0.2 会让效果范围缩成 1/5）')
-      } else if (typeof xrayUvScale === 'function' && Math.abs(xrayUvScale(fb) - 1) > 1e-9) {
-        fail(`缺省 size 经 xrayUvScale 应得恒等 1，得到 ${xrayUvScale(fb)}`)
-      } else ok('xray size 未配置时缺省为 1（UV 恒等，效果范围 = halo 本身）')
-      // 只能改 g_PointerScale 这一个：其余 uniform 的注释 default 与编辑器初值
-      // 一致（multiply=1、贴图槽 particle/halo_6），跟着改会伤到别的效果。
-      if (constantFallback('g_Multiply', 1) !== 1) {
-        fail('constantFallback 不应改动 g_Multiply 的注释 default')
+      const newPkg = path.join(LIB, '1943018087', 'scene.pkg')
+      if (fs.existsSync(newPkg)) {
+        try {
+          const pk = parsePkg(fs.readFileSync(newPkg))
+          const vert = dec(getEntry(pk, 'shaders/effects/xray.vert'))
+          const dflt = /uniform\s+float\s+g_PointerScale\s*;\s*\/\/[^\n]*"default"\s*:\s*([0-9.]+)/.exec(vert)
+          if (!dflt) fail('新版 xray.vert 的 g_PointerScale 声明缺少 default')
+          else if (Math.abs(1 / parseFloat(dflt[1]) - 5) > 1e-9) {
+            fail(`新版声明 default ${dflt[1]} 经 1/g 应等于 5，得到 ${1 / parseFloat(dflt[1])}`)
+          } else ok('新版缺省 = 1/声明 default（与旧版同一个 s=5，两形态缺省一致）')
+        } catch (e) {
+          fail('新版缺省检查失败：' + ((e && e.message) || e))
+        }
       }
-      if (constantFallback('g_Texture2', 'particle/halo_6') !== 'particle/halo_6') {
-        fail('constantFallback 不应改动贴图槽的注释 default')
-      }
-      if (constantFallback('g_SomeOther', undefined) !== undefined) {
-        fail('无注释 default 的 uniform 不该被 constantFallback 凭空设值')
-      }
-      // 接线：兜底循环必须真的经过 constantFallback，不能只导出函数不用
-      if (!/const\s+dflt\s*=\s*constantFallback\(\s*entry\.uniform\s*,\s*entry\.default\s*\)/.test(rendererSrc)) {
-        fail('bindConstants 的兜底循环未经过 constantFallback（导出了函数但没接线）')
-      } else ok('bindConstants 缺省分支接到 constantFallback')
     }
   }
   // [we-scene patch] 初始加载：xray 开窗不能停在壁纸圆心。
   //
   // 全局指针初值仍是 (0.5,0.5)（视差/iris/涟漪要相对中心为零）。只对声明了
-  // g_PointerScale 的 xray 把屏幕 UV 换成 XRAY_IDLE_SCREEN_UV（-1，一整屏在
-  // 相机左上外），再走同一套 toLayerU/V。size>1 时 saturate(texSource-P) 会把
-  // 屏外开窗的边沿染成整屏亮斑，所以 bindConstants 之后还要把 g_PointerScale
-  // 打到 0（frag mix → 999）。
+  // g_PointerScale 的 xray 把开窗中心停到**层 UV** XRAY_IDLE_LAYER_UV（-1）：
+  // 屏内每个像素的 d = texSource - P 都 ≥ 1，saturate 夹平后 d′ 落在 halo 盘外
+  // （半径 ≥ 0.5·s ≥ 0.5），任何官方 size 语义（旧 s=g、新 s=1/size，都 ≥ 1）
+  // 都不显形。**不要**再像 1/g 时代那样把 g_PointerScale 打到 0：官方 ×g 下
+  // g=0 是 uv 系数塌成 0、d′ 全屏落盘心 = 整屏全亮，正好反了。
   {
-    const { xrayShouldParkPointer, XRAY_IDLE_SCREEN_UV, xrayUvScale } = await import(
+    const { xrayShouldParkPointer, XRAY_IDLE_LAYER_UV } = await import(
       path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js')
     ).catch(() => ({}))
     if (typeof xrayShouldParkPointer !== 'function') {
       fail('renderer.js 未导出 xrayShouldParkPointer（初始加载圆心开窗无离线入口）')
     } else {
       if (!xrayShouldParkPointer(false, true)) {
-        fail('未收到鼠标时应把 xray 停到相机外（否则开窗在壁纸圆心）')
+        fail('未收到鼠标时应把 xray 停到层外（否则开窗在壁纸圆心）')
       } else if (xrayShouldParkPointer(true, true)) {
         fail('收到鼠标后不应再停 xray（否则开窗不跟随）')
       } else if (xrayShouldParkPointer(false, false)) {
         fail('非 xray（无 g_PointerScale）不应改指针初值（iris 会看向屏外）')
-      } else ok('xray 仅在未收到鼠标时停到相机外（iris/ripple 仍用中心）')
+      } else ok('xray 仅在未收到鼠标时停到层外（iris/ripple 仍用中心）')
     }
-    if (XRAY_IDLE_SCREEN_UV !== -1) {
-      fail(`XRAY_IDLE_SCREEN_UV 应为 -1（一整屏在相机外），得到 ${XRAY_IDLE_SCREEN_UV}`)
+    if (XRAY_IDLE_LAYER_UV !== -1) {
+      fail(`XRAY_IDLE_LAYER_UV 应为 -1（层 UV 一整层在层外），得到 ${XRAY_IDLE_LAYER_UV}`)
     } else {
-      // 2854083091：层 4000×2667、画布 1280×720 cover。idle 层 UV 必须在可见相机外。
-      const projW = 4000, projH = 2667, canW = 1280, canH = 720
-      const s = Math.max(canW / projW, canH / projH)
-      const viewW = projW, viewH = canH / s
-      const offX = 0, offY = (projH - viewH) / 2
-      const lw = projW, lh = projH, lx = 0, ly = 0
-      const toLayerU = (u) => (offX + u * viewW - lx) / lw
-      const toLayerV = (v) => (offY + v * viewH - ly) / lh
-      const idleU = toLayerU(XRAY_IDLE_SCREEN_UV)
-      const idleV = toLayerV(XRAY_IDLE_SCREEN_UV)
-      const visU0 = toLayerU(0), visU1 = toLayerU(1)
-      const visV0 = toLayerV(0), visV1 = toLayerV(1)
-      const inU = idleU >= Math.min(visU0, visU1) && idleU <= Math.max(visU0, visU1)
-      const inV = idleV >= Math.min(visV0, visV1) && idleV <= Math.max(visV0, visV1)
-      if (inU && inV) {
-        fail(`xray idle 层 UV (${idleU.toFixed(3)},${idleV.toFixed(3)}) 仍在相机可见区`)
-      } else ok('xray 未收到鼠标时开窗中心在相机可见区外')
+      // 停车点的数学保证：d = saturate(texSource - P)，P=-1 时屏内 d 至少一轴夹到
+      // 边界，d′ = 0.5 + 0.5·s（y 轴再乘 |w|=h/w ≥ 1）。x 方向半径 0.5·s ≥ 0.5
+      // 对任何 s ≥ 1 都成立 —— 与层尺寸/宽高比无关，不需要再做屏幕→层换算。
+      // （旧实现的屏幕 UV 停车在「层比屏幕高」时纵向只走 0.4 层 UV，d 够不到 1，
+      //   屏外开窗会探回屏内；1586038665 层 2471×3467 / 画布 1280×720 就是这种。）
+      let bad = null
+      for (const s of [1, 2, 5, 10, 20]) {
+        for (const aspect of [1, 1280 / 720, 3467 / 2471]) {
+          const dx = 0.5 * s
+          const dy = 0.5 * s * aspect
+          const r = Math.hypot(dx, dy)
+          if (!(r >= 0.5)) bad = { s, aspect, r }
+        }
+      }
+      if (bad) {
+        fail(`停车自由度不足：s=${bad.s} aspect=${bad.aspect} 落点半径 ${bad.r} 仍在 halo 盘内`)
+      } else ok('idle 停车 d′ 对任何 size（s≥1）都落在 halo 盘外（与层尺寸无关）')
     }
-    if (typeof xrayUvScale === 'function') {
-      const satEdgeUv = (scale) => 0.5 + 0.5 * scale
-      if (!(satEdgeUv(xrayUvScale(10)) > 0.5)) {
-        fail('size=10 屏外 saturate 判据失效（无法证明 idle 必须把 scale 打到 0）')
-      } else ok('size>1 屏外 saturate 仍采 halo 亮区，idle 必须把 g_PointerScale 打到 0')
-    }
-    const parkIdx = rendererSrc.indexOf('parkXrayUntilPointer(uni)')
-    const bindIdx = rendererSrc.lastIndexOf('bindConstants(', parkIdx === -1 ? undefined : parkIdx)
-    if (parkIdx < 0) {
-      fail('未调用 parkXrayUntilPointer（idle xray 的用户 size 会盖掉 scale=0）')
-    } else if (bindIdx < 0 || parkIdx < bindIdx) {
-      fail('parkXrayUntilPointer 未在 bindConstants 之后（用户 xraysize 会盖掉 idle 的 0）')
-    } else ok('idle xray 在 bindConstants 之后把 g_PointerScale 打到 0')
-    if (!/parkXray\s*\?\s*XRAY_IDLE_SCREEN_UV/.test(rendererSrc)
-      && !/parkXray \? XRAY_IDLE_SCREEN_UV/.test(rendererSrc)) {
-      fail('bindSystemUniforms 未把 idle xray 的屏幕 UV 换成 XRAY_IDLE_SCREEN_UV')
-    } else ok('bindSystemUniforms 把 idle xray 屏幕 UV 停在相机外')
+    if (/parkXrayUntilPointer\s*\(/.test(rendererSrc)
+      || /setVal\(\s*uni\s*,\s*'g_PointerScale'\s*,\s*\(l\)\s*=>\s*gl\.uniform1f\(l,\s*0\)/.test(rendererSrc)) {
+      fail('idle 仍在把 g_PointerScale 打到 0（官方 ×g 下 g=0 = uv 系数塌成 0 = 整屏全亮）')
+    } else ok('idle 不再改 g_PointerScale（只靠层外停车点）')
+    if (!/if\s*\(\s*parkXray\s*\)\s*\{\s*pu\s*=\s*XRAY_IDLE_LAYER_UV/.test(rendererSrc)) {
+      fail('bindSystemUniforms 未在换算之后把 idle xray 停在 XRAY_IDLE_LAYER_UV（层 UV）')
+    } else ok('bindSystemUniforms 把 idle xray 停在层 UV -1（换算之后覆盖）')
     // 全局指针初值必须仍是中心，不能为了 xray 把视差/iris 拽到屏外
     const pointerSrcText = fs.readFileSync(path.join(ROOT, 'renderer/vendor/we-scene/render/pointer.js'), 'utf8')
     if (!/\bu:\s*0\.5/.test(pointerSrcText) || !/\bv:\s*0\.5/.test(pointerSrcText)) {

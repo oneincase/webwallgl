@@ -245,7 +245,7 @@ export function createPointerSource(opts = {}) {
      * 外部指针离开本窗口（鼠标移到了别的显示器）。
      *
      * **只清按键，保留位置与 has** —— 清 has 会让 xray 开窗突然跳到相机外
-     * （renderer.js 的 XRAY_IDLE_SCREEN_UV）、视差弹回中心，画面会明显抽一下。
+     * （renderer.js 的 XRAY_IDLE_LAYER_UV）、视差弹回中心，画面会明显抽一下。
      * 语义与 DOM 的 onLeaveWindow 一致：位置停在最后已知点，只是不再按着键。
      */
     pushExternalLeave() {

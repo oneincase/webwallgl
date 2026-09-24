@@ -503,16 +503,17 @@ export function bloomPostParams(general) {
 }
 
 /**
- * xray.frag 把 sprite UV 按 `v_PointerScale` 从中心拉开：
- *   uv = (d - 0.5) * scale * … + 0.5
+ * xray.frag 把 sprite UV 按 scale 从中心拉开：uv = (d - 0.5) * scale * … + 0.5
  *
  * 两套不能混的「大小」：
  *   - **开窗**（采 halo 贴图的窗口）：scale 越大，UV 拉得越开，采到更多黑边。
- *     size 滑条要的不是这个。
- *   - **效果范围**（halo 亮区盖住的层 UV 半径）：∝ 1/scale。size 变大要的是这个。
+ *   - **效果范围**（halo 亮区盖住的层 UV 半径）：∝ 1/scale。
  *
- * 新版 vert 写 `v_PointerScale = mix(999, 1/g_PointerScale, …)`，size 变大则
- * 范围变大。size=1 时 1/g 是恒等。frag 若乘到 g 而不是 1/g，调大 size 范围会缩。
+ * 这个函数只服务**新版 varying 形态**：官方 vert 写
+ * `v_PointerScale = mix(999, 1/g_PointerScale, step(0.001, g))`，size ∈ [0,1]，
+ * frag 乘 v_PointerScale ⇒ scale = 1/size，size 越大范围越大，size=1 是恒等。
+ * 旧版形态的 scale 就是 g 本身（官方 exponent 语义，范围 ∝ 1/g），**不要**
+ * 拿这个函数去套旧版 —— 方向相反是作者绑定的语义，见 rewriteXrayFragScale。
  *
  * 离线断言用这个纯函数，不要在测试里再抄一份 mix/step。
  */
@@ -523,11 +524,16 @@ export function xrayUvScale(gPointerScale) {
 }
 
 /**
- * 未收到鼠标时 xray 开窗用的屏幕归一化坐标：一整屏在相机左上外。
+ * 未收到鼠标时 xray 开窗用的**层 UV**坐标：一整屏在层外。
  * 不要改成 (0.5,0.5)（壁纸圆心一个洞），也不要改全局指针初值（视差/iris
  * 要相对中心为零）。只在本文件 bind 时对 xray 替换。
+ *
+ * 必须是层 UV（不是屏幕归一化）：层比屏幕高时，「一屏」在层 UV 里不足 1
+ * （1586038665 层 2471×3467、画布 1280×720，纵向一屏只有 0.4 层 UV），
+ * 屏外开窗会从远处探回屏内。停到 -1 后屏内 d 恒 ≥1、被 saturate 夹平，
+ * 开窗与 size 无关地落在 halo 盘外。见 docs/CASEBOOK.md「1586038665 初始加载图层断层 + x-ray 范围异常大」。
  */
-export const XRAY_IDLE_SCREEN_UV = -1
+export const XRAY_IDLE_LAYER_UV = -1
 
 /**
  * 还没收到指针事件时，xray 开窗不能停在屏幕中心。只判定 xray（程序里有
@@ -541,54 +547,35 @@ const XRAY_FRAG_UV_SCALE =
   'mix(999.0, 1.0 / max(g_PointerScale, 0.001), step(0.001, g_PointerScale))'
 
 /**
- * 新版（`*= v_PointerScale`）和旧版 1586038665（`*= g_PointerScale`）都改成
- * 在片元里对 `g_PointerScale` 取倒数。size=1 时 1/g 是恒等；size=10 若不倒，
- * UV 拉开会把亮区缩成光标旁一个小圆点。不要在 JS setConstant 里再倒一次
- * （新版 vert 已有 1/g，会双倒：size=1 仍对、调大范围又缩回去）。
+ * 只改写**新版**（`*= v_PointerScale`）的取倒数，旧版 `*= g_PointerScale` 保持官方原样。
+ *
+ * 新版 vert 自己写 `v_PointerScale = mix(999, 1/g, step(0.001, g))`，frag 里把
+ * varying 换成等价表达式是为了让「size 调大 → 范围变大」在片元内自洽（size=1 是恒等）。
+ * 不要在 JS setConstant 里再倒一次（会双倒：size=1 仍对、调大范围又缩回去）。
+ *
+ * 旧版不能跟着倒。旧版的 `g_PointerScale` 是 **exponent** 语义（material
+ * `ui_editor_particle_element_exponent`，官方注释 range [0.01, 20]，缺省 5），
+ * 官方就是 `*= g`：范围 ∝ 1/g。1586038665 的作者滑条（1–10，默认 2）正是按这套
+ * 调的——默认 2 对应 0.25 层 UV 的开窗。改成 `*= 1/g` 后默认值变成 0.5 的 UV 放大，
+ * 开窗半径 1.0 层 UV ≥ 整层：实测 d′ 全屏只落在 [0.259, 0.741]（halo 亮盘内），
+ * 开窗面积 100%，配合 saturate 边界变成整屏洗白 + 直线断层。
+ * 「调到 10 只剩小圆点」是旧版滑条的**官方行为**（作者把 size 绑在 exponent 上），
+ * 不是 bug —— 详见 docs/CASEBOOK.md「1586038665 初始加载图层断层 + x-ray 范围异常大」。
  */
 export function rewriteXrayFragScale(fragGlsl) {
   if (typeof fragGlsl !== 'string') return fragGlsl
   if (/unprojectedUVs\s*\*=\s*mix\(999\.0,\s*1\.0\s*\/\s*max\(\s*g_PointerScale/.test(fragGlsl)) {
     return fragGlsl
   }
-  const usesVarying = /unprojectedUVs\s*\*=\s*v_PointerScale\s*\*/.test(fragGlsl)
-  const usesUniform = /unprojectedUVs\s*\*=\s*g_PointerScale\s*\*/.test(fragGlsl)
-  if (!usesVarying && !usesUniform) return fragGlsl
+  if (!/unprojectedUVs\s*\*=\s*v_PointerScale\s*\*/.test(fragGlsl)) return fragGlsl
   let out = fragGlsl
   if (!/uniform\s+float\s+g_PointerScale\b/.test(out)) {
     out = out.replace(/void\s+main\s*\(/, 'uniform float g_PointerScale;\nvoid main(')
   }
-  const from = usesVarying
-    ? /unprojectedUVs\s*\*=\s*v_PointerScale\s*\*/
-    : /unprojectedUVs\s*\*=\s*g_PointerScale\s*\*/
-  return out.replace(from, 'unprojectedUVs *= ' + XRAY_FRAG_UV_SCALE + ' *')
-}
-
-/**
- * xray 的 `size` 在作者没配时该取多少。
- *
- * shader 注释写的是 `"default":0.2`，但那是**编辑器新建效果时滑条的初始位置**，
- * 不是运行时缺省：WE 编辑器一旦把效果加到层上，就会把当时的滑条值写进
- * `constantshadervalues`，所以官方运行时永远读得到一个显式值，注释里的 0.2
- * 从来没被当作 fallback 用过（本地库 17 个 xray pass 全都显式带 size）。
- *
- * 我们这边不一样：`bindConstants` 的兜底循环在缺键时会套用注释 default，
- * 于是 csv 里没有 `size` 的 pass 拿到 0.2 —— 经 `xrayUvScale` 取倒数是 5，
- * UV 被放大五倍，效果范围缩成光标旁一小块。缺省应当是**恒等**：1 时
- * `1/1 = 1`，UV 不缩放，效果范围就等于作者给的 halo 贴图本身。
- *
- * 只对 `g_PointerScale` 生效：其余 uniform 的注释 default（`multiply` 的 1、
- * 贴图槽的 `particle/halo_6`）与编辑器初值一致，动了会回归。
- */
-export const XRAY_SIZE_FALLBACK = 1
-
-/**
- * 缺键时该用哪个 default。返回 undefined 表示「不设这个 uniform」。
- * 抽成纯函数供离线判据调用，不要在测试里再抄一份分支。
- */
-export function constantFallback(uniformName, declaredDefault) {
-  if (uniformName === 'g_PointerScale') return XRAY_SIZE_FALLBACK
-  return declaredDefault
+  return out.replace(
+    /unprojectedUVs\s*\*=\s*v_PointerScale\s*\*/,
+    'unprojectedUVs *= ' + XRAY_FRAG_UV_SCALE + ' *',
+  )
 }
 
 /**
@@ -1358,12 +1345,13 @@ export function createRenderer(canvas, opts = {}) {
     // 的 beginFrame 说明（否则 length(cur-last) 恒 ≈0，水波不起波）。
     const p = readPointer()
     const parkXray = xrayShouldParkPointer(!!(p && p.has), !!uni.get('g_PointerScale'))
-    // 初始加载：xray 开窗若用默认 (0.5,0.5)，会在壁纸圆心挖一个洞。停到屏幕
-    // 归一化 (-1,-1) 再换算到层 UV，即一整屏在相机左上外。iris/ripple 不走这支。
-    let pu = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.u : 0.5)
-    let pv = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.v : 0.5)
-    let plu = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.lastU : 0.5)
-    let plv = parkXray ? XRAY_IDLE_SCREEN_UV : (p ? p.lastV : 0.5)
+    // 初始加载：xray 开窗若用默认 (0.5,0.5)，会在壁纸圆心挖一个洞。
+    // 先按普通路径取屏幕归一化值并换算（下面整段换算是给真实指针用的），
+    // 停车的最终坐标在换算之后统一盖成 XRAY_IDLE_LAYER_UV。iris/ripple 不走这支。
+    let pu = p ? p.u : 0.5
+    let pv = p ? p.v : 0.5
+    let plu = p ? p.lastU : 0.5
+    let plv = p ? p.lastV : 0.5
     // [we-scene patch] g_PointerPosition 要换算到**当前层的 UV 空间**，不能直接喂屏幕归一化值。
     // xray.frag 拿 `d = texSource - P` 求开窗中心，texSource 是当前像素的**层 UV**
     // ∈[0,1]。所以 P 也必须是层 UV。层铺满屏幕（层宽高比 == 画布宽高比）时两者恰好
@@ -1389,6 +1377,9 @@ export function createRenderer(canvas, opts = {}) {
         plu = toLayerU(plu); plv = toLayerV(plv)
       }
     }
+    // 停车必须在换算**之后**盖：换算是给真实指针的（屏幕 UV → 层 UV），
+    // 停车的目标本身就是层 UV（见 XRAY_IDLE_LAYER_UV）。
+    if (parkXray) { pu = XRAY_IDLE_LAYER_UV; pv = XRAY_IDLE_LAYER_UV; plu = pu; plv = pv }
     setVal(uni, 'g_PointerPosition', (l) => gl.uniform2f(l, pu, pv))
     setVal(uni, 'g_PointerPositionLast', (l) => gl.uniform2f(l, plu, plv))
     // g_PointerState：只有 cursorripple_apply_force.frag 用，且只读 `.z`
@@ -1446,26 +1437,28 @@ export function createRenderer(canvas, opts = {}) {
       if (!entry) continue
       setConstant(uni, entry.uniform, value)
     }
-    // 未提供的常数用 shader 注释里的 default。
-    // xray 的 size 例外走 constantFallback（注释 0.2 是编辑器初值不是运行时缺省）。
+    // 未提供的常数用 shader 注释里的 default。xray 的 `g_PointerScale` 不再例外：
+    // 官方对「material 没写值」就是用声明里的 default（旧版声明 5 = exponent、
+    // 新版声明 0.2 经 1/g 也是 5），两者等价且都是小开窗。曾经按「1 = 恒等」
+    // 给这个 uniform 单独塞过一个缺省常量，那是给改写后的 1/g 语义配的锚；
+    // 换成官方 ×g 后 1 反而把开窗放到最大（1368497013 的 csv 里本来就没有 size，
+    // 它会吃到这个错缺省）。判据见 verify-pointer「缺省统一用声明 default」。
     // 「已提供」的判断同样大小写不敏感 —— 否则同一名义键会先按大写设一次值、
     // 再在这里被 default 二次覆盖，作者设置等于没设。
     const providedLower = new Set(Object.keys(constants || {}).map((k) => k.toLowerCase()))
     for (const [matKey, entry] of Object.entries(matMeta || {})) {
       if (providedLower.has(matKey.toLowerCase())) continue
-      const dflt = constantFallback(entry.uniform, entry.default)
-      if (dflt !== undefined) setConstant(uni, entry.uniform, dflt)
+      if (entry.default !== undefined) setConstant(uni, entry.uniform, entry.default)
     }
   }
 
-  // 未收到鼠标时 xray 开窗已停在相机外；size>1 时 saturate 会把屏外开窗的边沿
-  // 染成整屏亮斑，必须把 g_PointerScale 打到 0（frag mix → 999，开窗缩成看不见
-  // 的点）。必须在 bindConstants **之后**调用，否则用户的 xraysize 会把 0 盖掉。
-  function parkXrayUntilPointer(uni) {
-    const p = readPointer()
-    if (!xrayShouldParkPointer(!!(p && p.has), !!uni.get('g_PointerScale'))) return
-    setVal(uni, 'g_PointerScale', (l) => gl.uniform1f(l, 0))
-  }
+  // 这里曾有一个 `parkXrayUntilPointer`（idle 时把 g_PointerScale 打到 0 藏窗），
+  // 已在 2026-09-24 删除。idle 的藏窗现在只靠 bindSystemUniforms 把开窗中心停到
+  // **层 UV** (-1,-1)（见上面 g_PointerPosition 的换算）：屏内每个像素的 d 都 ≥1，
+  // saturate 夹平 ⇒ d′ 落在 halo 盘外，任何 size（官方语义 s=g≥1 或 1/size≥1）都不显形。
+  // **不要**再改 g_PointerScale：官方 ×g 语义下 g=0 会让 uv 缩放系数塌成 0、
+  // `d′` 全屏落到 halo 圆心 = 整屏全亮 —— 与 1/g 时代「打 0 藏窗」的意图正好相反。
+  // 见 docs/CASEBOOK.md「1586038665 初始加载图层断层 + x-ray 范围异常大」。
 
   // ---- 效果常量脚本（constantshadervalues 里的 {script, value}）----
   // [we-scene patch] 这类脚本此前**完全没有实现**：setConstant 只读 `.value`，
@@ -3982,7 +3975,6 @@ export function createRenderer(canvas, opts = {}) {
         ),
         progEntry.matMeta,
       )
-      parkXrayUntilPointer(uni)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
       // 更新乒乓
       if (!mp.target) {

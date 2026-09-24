@@ -63,6 +63,13 @@ function main() {
     const textures = new Map()
     textures.set('util/white', { glTex: rndMod.makeTexture(gl, new Uint8Array([255,255,255,255]), 1, 1), width: 1, height: 1 })
     textures.set('util/noflow', { glTex: rndMod.makeTexture(gl, new Uint8Array([127,127,127,255]), 1, 1), width: 1, height: 1 })
+    /**
+     * 环绕标记必须与真实路径一致（scene-mount 的两处 clampUvs 赋值）：
+     * 缺了它，效果链会把 halo_6 当 REPEAT 平铺 —— xray 的 uv 在开窗外落在 [0,1]
+     * 外，环绕回来正好盖满整屏「无数个相同开窗」，本 bench 上量到的「整屏洗白」
+     * 会全是夹具伪影（真实页面按 isBuiltinClampUvsName 走 CLAMP_TO_EDGE）。
+     */
+    const CLAMP = new Set(['particle/halo_6'])
     async function loadTex(name) {
       if (textures.has(name)) return textures.get(name)
       const e = pkgMod.getEntry(pk, `materials/${name}.tex`)
@@ -70,7 +77,8 @@ function main() {
         if (ptexMod.isBuiltinParticleTextureName(name)) {
           const gen = ptexMod.buildBuiltinParticleTexture(name)
           if (gen) {
-            const entry = { glTex: rndMod.makeTextureMip(gl, [gen], false), width: gen.width, height: gen.height }
+            const entry = { glTex: rndMod.makeTextureMip(gl, [gen], false), width: gen.width, height: gen.height,
+              clampUvs: gen.clampUvs === true || ptexMod.isBuiltinClampUvsName(name) || CLAMP.has(name) }
             textures.set(name, entry); return entry
           }
         }
@@ -79,13 +87,14 @@ function main() {
       const pt = texMod.parseTex(e)
       const m = texMod.decodeMip0(pt)
       if (!m || m.video !== undefined) return null
+      const clampUvs = (Number(pt.flags) & 2) !== 0
       let entry = null
       if (m.png !== undefined || (m.image !== undefined && m.fif === texMod.FIF.JPEG)) {
         const blob = new Blob([m.png || m.image], { type: m.png ? 'image/png' : 'image/jpeg' })
         const bmp = await createImageBitmap(blob)
-        entry = { glTex: rndMod.makeTexture(gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height }
+        entry = { glTex: rndMod.makeTexture(gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height, clampUvs }
       } else if (m.image === undefined) {
-        entry = { glTex: rndMod.makeTextureMip(gl, [m], pt.format === 8), width: m.width, height: m.height }
+        entry = { glTex: rndMod.makeTextureMip(gl, [m], pt.format === 8), width: m.width, height: m.height, clampUvs }
       }
       if (entry) { textures.set(name, entry); diag.texOk.push(name + '@' + entry.width + 'x' + entry.height) }
       else diag.texFail.push(name)
