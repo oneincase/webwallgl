@@ -86,6 +86,51 @@ const ids = fs.existsSync(LIB)
   }
 }
 
+// ---------- 1b. 预设包：project.json.preset 必须是生效的属性表 ----------
+// WE 的预设壁纸（工坊模板类）把**用户配置**整套存在 `project.json.preset`，
+// 而 scene.json 只有作者导出时的默认快照、`general.properties` 为空。此前只读
+// general.properties，于是城市名/窗口标题/用户选的 GIF（files/*.gif）全部回落到
+// 作者默认值（用户报「下载的预设壁纸预设不生效」）。
+{
+  const { presetToProperties } = await imp("renderer/vendor/we-scene/scene/parse.js");
+  // (a) 形状推断：null 跳过、bool/数值/数值向量/文本各自归类
+  {
+    const props = presetToProperties({
+      city1: "SÃO PAULO", boolv: true, numv: 42, vec: "0.75 0.75 0.75", one: "0", nil: null,
+    });
+    if (
+      props.city1?.type !== "textinput" ||
+      props.boolv?.type !== "bool" ||
+      props.numv?.type !== "slider" ||
+      props.vec?.type !== "color" ||
+      props.one?.type !== "slider" ||
+      props.nil !== undefined
+    ) {
+      fail(`presetToProperties 形状推断错误：${JSON.stringify(props)}`);
+    } else if (props.city1?.value !== "SÃO PAULO") {
+      fail("preset 值必须原样保留");
+    } else ok("presetToProperties：null 跳过、bool/数值/向量/文本 各自推断");
+  }
+  // (b) 真实预设包：preset 值必须覆盖 scene 快照（文本类最直观）
+  {
+    const d = load("3427522122");
+    if (!d) {
+      ok("跳过 3427522122（本机无此壁纸）");
+    } else {
+      const s = parseScene(d.scene, d.proj);
+      const texts = s.layers.map((l) => String(l.text ?? ""));
+      // preset 的 city1/city2 = SÃO PAULO/TOKYO；作者快照是 TYO/NYC
+      if (!texts.includes("SÃO PAULO") && !texts.includes("TOKYO")) {
+        fail(`3427522122 应取到 preset 的城市名（SÃO PAULO/TOKYO），实得 ${JSON.stringify(texts.slice(0, 8))}`);
+      } else if (texts.includes("NYC")) {
+        fail("预设生效时不应再出现作者默认快照 NYC（说明 preset 没覆盖快照）");
+      } else {
+        ok("3427522122：preset 的城市名覆盖了作者默认快照（preset 属性表生效）");
+      }
+    }
+  }
+}
+
 // ---------- 2. 撞车项必须退回快照 ----------
 // 每条都是全库扫出来的真实撞车：字段期望的类型与属性声明的类型对不上。
 //

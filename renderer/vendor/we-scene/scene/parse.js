@@ -112,8 +112,47 @@ export function composeChildTransform(parentWorld, childLocal, parentScalePropag
   }
 }
 
+/**
+ * [we-scene patch] `project.json.preset` → 与 general.properties 同形的属性表。
+ *
+ * WE 的**预设壁纸**（工坊模板类，如 3427522122）把用户配置整套存在
+ * `project.json.preset`（`{属性名: 原始值}`），而 **scene.json 里只有作者导出时的
+ * 默认快照、`general.properties` 为空** —— 之前只读 general.properties，于是所有
+ * `{user: ...}` 绑定都回落到作者默认值：城市名、三个窗口标题、用户选的 GIF
+ * （`files/*.gif`）等一概不生效（用户报「预设不生效」）。
+ *
+ * 两种表的形状不同：properties 的条目是 `{value, type, options…}`，preset 是原始值。
+ * 这里按值的形状补出 type，使 resolveUserValue 的形状核对（文本/布尔/数值向量）
+ * 与显式声明一致：'' 保持缺省（不覆盖快照）、bool→bool、数字/数值串→slider、
+ * 纯数值向量串（"0 0 0" 这类颜色）→color、其余→textinput。
+ */
+export function presetToProperties(preset) {
+  const out = {}
+  if (!preset || typeof preset !== 'object') return out
+  for (const [k, v] of Object.entries(preset)) {
+    if (v === null || v === undefined) continue
+    let type
+    if (typeof v === 'boolean') type = 'bool'
+    else if (typeof v === 'number') type = 'slider'
+    else if (typeof v === 'string') {
+      const parts = v.trim().split(/\s+/).filter(Boolean)
+      if (parts.length > 0 && parts.every((x) => Number.isFinite(Number(x)))) {
+        type = parts.length > 1 ? 'color' : 'slider'
+      } else type = 'textinput'
+    } else continue
+    out[k] = { value: v, type }
+  }
+  return out
+}
+
 export function parseScene(sceneJson, project) {
-  const properties = (project && project.general && project.general.properties) || {}
+  const gp = (project && project.general && project.general.properties) || {}
+  // 预设包（general.properties 为空、project.preset 有值）用 preset 当属性表；
+  // 两者都在时以 general.properties 为准，preset 只补缺（后者是用户改动过的值）。
+  const presetProps = presetToProperties(project && project.preset)
+  const properties = Object.keys(gp).length
+    ? { ...presetProps, ...gp }
+    : presetProps
   const objects = sceneJson.objects || []
   // [we-scene patch] 先把所有 {user, value} 包装解成生效值（详见文件头注释），
   // 之后的字段读取一律拿到已解引用的值。

@@ -3236,6 +3236,46 @@ export function createRenderer(canvas, opts = {}) {
         }
       }
     }
+    // [we-scene patch] 动图贴图（预设壁纸用户选的 .gif，见 scene-mount 的
+    // loadWallpaperFile）：<img> 由浏览器推进动画帧，这里逐帧把它画进离屏 canvas
+    // 再上传（GIF 没有可读的帧时间戳，无法像视频那样按 currentTime 去重，
+    // 只在帧率上限内每帧上传一次）。
+    if (texObj && texObj.animatedImage) {
+      const img = texObj.animatedImage
+      if (img.complete && img.naturalWidth > 0) {
+        gl.bindTexture(gl.TEXTURE_2D, texObj.glTex)
+        try {
+          let vw = img.naturalWidth || texObj.width
+          let vh = img.naturalHeight || texObj.height
+          const targetMax = Math.max(width || 0, height || 0)
+          const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0
+          let limit = VIDEO_TEX_HARD_CAP
+          if (maxTex > 0) limit = Math.min(limit, maxTex)
+          if (targetMax > 0) limit = Math.min(limit, targetMax)
+          limit = Math.max(limit, VIDEO_TEX_MIN_CAP)
+          let scale = 1
+          if (Math.max(vw, vh) > limit) scale = limit / Math.max(vw, vh)
+          const uw = Math.max(1, Math.round(vw * scale))
+          const uh = Math.max(1, Math.round(vh * scale))
+          let src = img
+          if (videoCanvas && uw > 0 && uh > 0) {
+            if (videoCanvas.width !== uw || videoCanvas.height !== uh) {
+              videoCanvas.width = uw
+              videoCanvas.height = uh
+            }
+            const vctx = videoCanvas.getContext('2d')
+            if (vctx) {
+              vctx.clearRect(0, 0, uw, uh)
+              vctx.drawImage(img, 0, 0, uw, uh)
+              src = videoCanvas
+            }
+          }
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src)
+        } catch (e) {
+          // 动图帧不可用（解码中/跨域）：保留上一帧
+        }
+      }
+    }
     // [we-scene patch] 组渲染目标的容器：层内容 = 刚渲染好的子层合成图（groupTex）。
     const srcTex = layer.groupTex
       ? layer.groupTex

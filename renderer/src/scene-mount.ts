@@ -1459,10 +1459,81 @@ cfg, source, pkgAbort.signal);
       }
 
       const texInflight = new Map<string, Promise<any | null>>();
+      /**
+       * [we-scene patch] 壁纸目录下的**散装文件**贴图（`files/xxx.gif` 这类）。
+       *
+       * 预设壁纸（工坊模板，如 3427522122）把用户选的图/动图存在壁纸目录的
+       * `files/` 下，通过 `project.json.preset` 的属性值引用（`customimageleft`
+       * = `files/drift-gif.gif`）。这些文件不在 pkg 里，宿主按
+       * `/media/<token>/<itemId>/<相对路径>` 提供（与 scene.pkg 同一 base）。
+       *
+       * 动图（.gif）用 `<img>` 元素承载：浏览器自己推进动画帧，渲染端逐帧
+       * texImage2D 上传（与视频纹理同一条思路，见 renderer 的 video 分支）。
+       * 静态图走 createImageBitmap。
+       */
+      const loadWallpaperFile = async (relPath: string): Promise<any | null> => {
+        const rel = String(relPath || "").replace(/^\/+/, "");
+        if (!rel || /\.\.\//.test(rel)) return null;
+        const url = `${source.key}/${rel.split("/").map(encodeURIComponent).join("/")}`;
+        const isGif = /\.gif(\?|$)/i.test(rel);
+        try {
+          if (isGif) {
+            const img = new Image();
+            img.decoding = "async";
+            const ready = new Promise<void>((resolve, reject) => {
+              img.onload = () => resolve();
+              img.onerror = () => reject(new Error("decode fail"));
+            });
+            img.src = url;
+            await ready;
+            const w = img.naturalWidth || 1;
+            const h = img.naturalHeight || 1;
+            const entry = {
+              glTex: rnd.makeTexture(renderer.gl, new Uint8Array([0, 0, 0, 0]), 1, 1),
+              width: w,
+              height: h,
+              rg88: false,
+              animatedImage: img,
+              generated: false,
+            };
+            reportDiag(rt, cfg, `user file tex '${rel}': ${w}x${h} (gif, animated)`);
+            return entry;
+          }
+          const res = await fetch(url, { signal: pkgAbort?.signal });
+          if (!res.ok) return null;
+          const bmp = await decodeTexImageBitmap(await res.blob(), null, 0, 0, 1);
+          if (!bmp) return null;
+          const entry = {
+            glTex: rnd.makeTexture(renderer.gl, null, 0, 0, bmp),
+            width: bmp.width,
+            height: bmp.height,
+            rg88: false,
+            generated: false,
+          };
+          reportDiag(rt, cfg, `user file tex '${rel}': ${bmp.width}x${bmp.height}`);
+          return entry;
+        } catch (e) {
+          reportDiag(rt, cfg, `user file tex '${rel}' 失败：${(e as Error)?.message}`);
+          return null;
+        }
+      };
       const loadTexInner = async (name: string): Promise<any | null> => {
         currentTexName = name;
         currentTexNoScale = false;
         if (textures.has(name)) return textures.get(name);
+        // [we-scene patch] 属性槽（预设壁纸的 `customimage*` 等）：槽名是一个**用户
+        // 属性名**，其现值是壁纸目录下的相对路径（`files/xxx.gif`）。先按这条通路
+        // 取用户选的图；取不到再走下面的 pkg / 内置 / 占位回落。
+        {
+          const uv = (liveUserProps as Record<string, unknown> | null)?.[name];
+          if (typeof uv === "string" && uv && /\.[a-z0-9]{2,5}$/i.test(uv) && uv.includes("/")) {
+            const fileEntry = await loadWallpaperFile(uv);
+            if (fileEntry) {
+              textures.set(name, fileEntry);
+              return fileEntry;
+            }
+          }
+        }
         const texEntry = pkg.getEntry(parsedPkg, `materials/${name}.tex`);
         if (!texEntry) {
           // [we-scene patch] WE 内置资源不在 pkg 里（作者的 pkg 只存自制素材）。
@@ -2208,6 +2279,31 @@ cfg, source, pkgAbort.signal);
           }
           // 图层材质可能有多槽（flowimage = background + flowmask）。只载 [0]
           // 会让流水 shader 的 g_Texture1 落到白纹理，位移恒 0，星云完全不动。
+          // [we-scene patch] 图层材质的 `usertextures`（预设壁纸的**用户图片槽**）：
+          // 材质声明 `textures:["City Video"], usertextures:["customimageright"]`
+          // —— 槽名是用户属性名，现值是壁纸目录下的相对路径（`files/xxx.gif`）。
+          // 属性有值就加载用户选的图并**注册到属性名**下（渲染端按合并后的槽名
+          // 查表，命中即用；查不到才回落到作者占位），槽 0 同时改写
+          // layer.textureName，使视频/动图纹理的起播与探针都指向真实内容。
+          const layerUts = (pass as { usertextures?: Array<string | { name?: string } | null> } | undefined)
+            ?.usertextures;
+          const utNameAt = (i: number): string | null => {
+            const u = layerUts?.[i];
+            if (typeof u === "string" && u) return u;
+            if (u && typeof u === "object" && typeof u.name === "string" && u.name) return u.name;
+            return null;
+          };
+          for (let si = 0; si < Math.max(texSlots.length, layerUts?.length || 0); si++) {
+            const propName = utNameAt(si);
+            if (!propName) continue;
+            const pv = (liveUserProps as Record<string, unknown> | null)?.[propName];
+            if (typeof pv !== "string" || !pv || !pv.includes("/") || !/\.[a-z0-9]{2,5}$/i.test(pv)) continue;
+            texJobs.push(
+              loadTex(propName).then((entry) => {
+                if (entry && si === 0) layer.textureName = propName;
+              }),
+            );
+          }
           for (let si = 0; si < texSlots.length; si++) {
             const tn = texSlots[si];
             if (typeof tn !== "string" || !tn || tn.startsWith("util/") || tn.startsWith("_rt_")) continue;
