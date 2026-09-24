@@ -1955,6 +1955,49 @@ const wireErrors = [];
   wireErrors.push(...cErr);
 }
 
+// ---------- 未绑 sampler 槽的 paintdefaultcolor（编辑器专用元数据） ----------
+// paintdefaultcolor 只在 WE 编辑器视口里给未绑槽绘制一张默认色；运行时不生成该纹理、
+// 纹理关联 combo 只随**真实绑定**开启（ShaderUnit.cpp 按槽位有无纹理决定）。
+// 曾把空槽按 painted 视为已提供并开 combo：tint（1888636115）作者没绑 mask 槽，
+// MASK 被误开后落到白遮罩（mask=1），整张壁纸被 tint 色全屏刷成纯色。
+{
+  const pErr = [];
+  const rendererPath = join(ROOT, "renderer/vendor/we-scene/render/renderer.js");
+  const { parseSamplerPaintDefaultColor } = await import(rendererPath);
+
+  // 单元：命中 paintdefaultcolor 槽；无声明槽不入表；非 sampler 行不被误认
+  {
+    const src = [
+      'uniform sampler2D g_Texture0; // {"hidden":true}',
+      'uniform sampler2D g_Texture2; // {"label":"mask","paintdefaultcolor":"0 0 0 1"}',
+      'uniform vec4 g_Foo; // {"paintdefaultcolor":"1 1 1 1"}',
+    ].join("\n");
+    const map = parseSamplerPaintDefaultColor(src);
+    if (map.size !== 1) pErr.push(`应只解析出 1 个 paintdefaultcolor 槽，实得 ${map.size}`);
+    if (map.get(2) !== "0 0 0 1") pErr.push("slot 2 应为 0 0 0 1");
+    if (map.has(0)) pErr.push("hidden 槽无 paintdefaultcolor，不应入表");
+  }
+  // 真实语料：blur_precise 的 mask 槽声明黑默认色（仓库内置效果 = 官方编辑器导出）
+  {
+    const fragPath = join(ROOT, "local-assets/effects/blurprecise/shaders/effects/blur_precise_gaussian.frag");
+    if (fs.existsSync(fragPath)) {
+      const frag = fs.readFileSync(fragPath, "utf8");
+      const map = parseSamplerPaintDefaultColor(frag);
+      if (map.get(2) !== "0 0 0 1") {
+        pErr.push("blur_precise_gaussian 的 mask 槽（slot2）paintdefaultcolor 应为 0 0 0 1（证据文件被改动）");
+      }
+    }
+  }
+  // 源码守卫：空槽不得开启纹理关联 combo（paintdefaultcolor 是编辑器行为）
+  {
+    const src = fs.readFileSync(rendererPath, "utf8");
+    if (/paintDefaultSlots|src\.paintDefaultSlots\.has\(tc\.slot\)/.test(src)) {
+      pErr.push("纹理关联 combo 不得把声明 paintdefaultcolor 的空槽视为已提供（tint 未绑 mask 被刷成纯色）");
+    }
+  }
+  wireErrors.push(...pErr);
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

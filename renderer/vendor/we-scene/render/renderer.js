@@ -600,6 +600,24 @@ export function indexMatMetaLower(matMeta) {
   return m
 }
 
+/**
+ * [we-scene patch] 解析 sampler 槽注释里的 paintdefaultcolor：
+ * `uniform sampler2D g_Texture2; // {"paintdefaultcolor":"0 0 0 1"}`
+ * → Map(slot → "r g b a")。WE 编辑器对未绑槽绘制该颜色；纹理关联 combo
+ * 也按"槽位有纹理"启用。blur_precise 未绑 mask 时黑遮罩 = 不模糊
+ * （3476557017 日期/时钟发虚：旧路径槽空落白纹理且 MASK combo 未开启）。
+ */
+export function parseSamplerPaintDefaultColor(src) {
+  const out = new Map()
+  const re = /uniform\s+sampler2D\s+g_Texture(\d+)\s*;\s*\/\/([^\n]*)/g
+  let m
+  while ((m = re.exec(src))) {
+    const pc = /"paintdefaultcolor"\s*:\s*"([^"]+)"/.exec(m[2])
+    if (pc && pc[1]) out.set(Number(m[1]), pc[1])
+  }
+  return out
+}
+
 /** 先精确后小写；再退「ui_editor_properties_ 前缀名 → 短名」（本机库 23 处
  * strength / 17 speed / 11 friction / 10 bounds 用这种键 —— 粒子侧的
  * `ui_editor_properties_overbright` 是同一写入方的同款行为，overbright 当年
@@ -1024,6 +1042,14 @@ export function createRenderer(canvas, opts = {}) {
     }
     return out
   }
+  // [we-scene patch] sampler 槽未绑贴图时的「绘制默认色」：`//
+  // {"paintdefaultcolor":"0 0 0 1"}`。WE 编辑器对未绑槽画这个颜色，不是白。
+  // 典型：blur_precise_gaussian 的 mask 槽（"paintdefaultcolor":"0 0 0 1"）——
+  // 作者不绑遮罩时遮罩恒黑，mix 权重 0 = 不模糊；落白纹理会满强度模糊，
+  // 3476557017 的日期/时钟因此字体发虚。
+  function parseSamplerPaintDefaults(src) {
+    return parseSamplerPaintDefaultColor(src)
+  }
   // 纹理关联 combo：sampler uniform 注释声明 combo，且该槽提供了纹理 → combo = 1（ShaderUnit.cpp:545-617）
   function parseTextureCombos(src) {
     const out = []
@@ -1046,10 +1072,18 @@ export function createRenderer(canvas, opts = {}) {
     if (src === undefined) {
       const fragSrc = (await shaderResolver('shaders/' + shaderName + '.frag')) || ''
       const vertSrc = (await shaderResolver('shaders/' + shaderName + '.vert')) || ''
-      src = { frag: fragSrc, vert: vertSrc, texCombos: parseTextureCombos(fragSrc) }
+      src = {
+        frag: fragSrc,
+        vert: vertSrc,
+        texCombos: parseTextureCombos(fragSrc),
+      }
       shaderSrcCache.set(shaderName, src)
     }
-    // 纹理关联 combo 并入 combos（有显式值则不覆盖）
+    // 纹理关联 combo 只随**真实绑定的纹理**开启（ShaderUnit.cpp 按槽位是否有纹理决定）。
+    // paintdefaultcolor 只是 WE 编辑器视口对未绑槽的绘制色，运行时既不生成那张纹理、
+    // 也不开 combo：未绑槽的 shader 走自身默认路径（tint 的 mask → g_BlendAlpha 权重；
+    // blur_precise 的 mask → 全屏模糊）。曾按「painted 也算已提供」处理，导致 tint
+    // 壁纸被白遮罩按 mask=1 全屏刷成纯色、blur 未绑遮罩时反而不模糊。
     const effectiveCombos = { ...combos }
     for (const tc of src.texCombos) {
       if (providedTextures && providedTextures[tc.slot] && effectiveCombos[tc.combo] === undefined) {
@@ -1106,7 +1140,9 @@ export function createRenderer(canvas, opts = {}) {
           !/[aA]_Position[\s\S]{0,40}mul\s*\(/.test(src.vert)
         // sampler 槽的默认贴图名（scene.json 该槽为 null 时回退用）
         const samplerDefaults = new Map([...parseSamplerDefaults(src.vert), ...parseSamplerDefaults(src.frag)])
-        const entry = { prog, uni, matMeta, samplerDefaults, fragGlsl, vertGlsl, ndcDirect }
+        // sampler 槽未绑贴图时的绘制默认色（vert/frag 都声明时 frag 优先）
+        const samplerPaintDefaults = new Map([...parseSamplerPaintDefaults(src.vert), ...parseSamplerPaintDefaults(src.frag)])
+        const entry = { prog, uni, matMeta, samplerDefaults, samplerPaintDefaults, fragGlsl, vertGlsl, ndcDirect }
         progCache.set(key, entry)
         return entry
       }
@@ -1120,6 +1156,23 @@ export function createRenderer(canvas, opts = {}) {
   const whiteTex = makeTexture(gl, new Uint8Array([255, 255, 255, 255]), 1, 1)
   // 无纹理的非 solid 层（纯效果层/文字对象层）：WE 语义为空层内容透明（白会导致纯白方块）
   const transparentTex = makeTexture(gl, new Uint8Array([0, 0, 0, 0]), 1, 1)
+  // shader 声明 paintdefaultcolor 的未绑槽：按色缓存 1×1 纹理（见 getPaintDefaultEntry）
+  const paintDefaultTexCache = new Map()
+  function getPaintDefaultEntry(colorStr) {
+    let entry = paintDefaultTexCache.get(colorStr)
+    if (entry) return entry
+    const parts = String(colorStr).trim().split(/\s+/).map(Number)
+    const c = (i) => {
+      const v = parts[i]
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : (i < 3 ? 0 : 1)
+    }
+    const rgba = new Uint8Array([
+      Math.round(c(0) * 255), Math.round(c(1) * 255), Math.round(c(2) * 255), Math.round(c(3) * 255),
+    ])
+    entry = { glTex: makeTexture(gl, rgba, 1, 1), width: 1, height: 1 }
+    paintDefaultTexCache.set(colorStr, entry)
+    return entry
+  }
 
   // ---- 视差（cameraparallax + 对象 parallaxDepth）----
   // [we-scene patch] 指针不再由本文件自挂监听器，改由宿主注入的统一指针源提供
@@ -3892,6 +3945,14 @@ export function createRenderer(canvas, opts = {}) {
         }
         // WE 语义：槽 0 为空 = 当前输入 FBO（asInput）；'previous' 同义
         let entry
+        // 槽为空且 shader 声明了 paintdefaultcolor：按该色兜底（WE 编辑器行为），
+        // 比白纹理优先。blur_precise 未绑 mask 槽时遮罩恒黑 = 不模糊
+        // （3476557017 日期/时钟发虚）。
+        let paintDefault = null
+        if (ti !== 0 && (name === null || name === undefined || name === '') && progEntry.samplerPaintDefaults) {
+          const pc = progEntry.samplerPaintDefaults.get(ti)
+          if (pc) paintDefault = getPaintDefaultEntry(pc)
+        }
         if (ti === 0 && (name === null || name === undefined || name === '')) {
           entry = passInput
         } else {
@@ -3906,7 +3967,7 @@ export function createRenderer(canvas, opts = {}) {
           entry = resolveTextureName(name, passInput, effectFBOs, textures)
         }
         if (name === 'previous') entry = passInput
-        if (entry === null) entry = { glTex: whiteTex, width: 1, height: 1, tex: whiteTex }
+        if (entry === null) entry = paintDefault || { glTex: whiteTex, width: 1, height: 1, tex: whiteTex }
         const t = entry.fbo ? entry : { tex: entry.glTex || whiteTex, width: entry.width || 1, height: entry.height || 1 }
         gl.activeTexture(gl.TEXTURE0 + ti)
         gl.bindTexture(gl.TEXTURE_2D, t.tex)
