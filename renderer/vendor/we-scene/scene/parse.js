@@ -387,7 +387,8 @@ export function parseScene(sceneJson, project) {
         const out = {}
         // [we-scene patch] 白名单扩到散字段（P2-1，2026-09 共 25 段/12 张）：
         // maxwidth/pointsize 是文字布局、volume 是声音层音量、intensity/exponent
-        // 是灯光参数（本仓无灯光对象，值存层上无害）。写回槽见 scene-mount 的
+        // 是灯光参数（灯光对象见下方 isLight/lightRadius，这两个字段就是它的
+        // 逐帧写回槽）。写回槽见 scene-mount 的
         // fieldWriteSlot（maxwidth→textMaxwidth、pointsize→textPointsize、
         // volume→soundprops.volume）。
         for (const f of ['scale', 'origin', 'color', 'alpha', 'brightness', 'angles', 'visible',
@@ -399,6 +400,40 @@ export function parseScene(sceneJson, project) {
         }
         return Object.keys(out).length ? out : null
       })(),
+      // [we-scene patch] 场景**灯光对象**（`light: "point"/"lpoint"/"spot"/"lspot"/
+      // "directional"/"ldirectional"）：官方 genericimage* 材质在 `combos.LIGHTING=1`
+      // 时吃 4 盏灯的直接光照，而灯对象自身的几何**不参与渲染**（编辑器手柄只在
+      // 编辑器里画）。此前本仓完全不认它：灯被当成 `solid:true`、size=[0,0] 的纯色层
+      // 装配，既什么都不画，也不给 LIGHTING 材质任何直射光 —— 2890473419 的三个
+      // 用户可见光源（「光源1/2/3」颜色·开关·亮度）因此整条链失效（用户报
+      // 「光源效果不生效」）。
+      //
+      // 语义与坑：
+      // - `color` 可能绑用户属性，已被 resolveUserProps 就地解成现值；
+      // - `intensity`/`exponent` 可能带脚本（本仓对象脚本白名单已含这两项，
+      //   逐帧写回 layer.intensity/layer.exponent，见 scene-mount 的
+      //   scalarFieldSlot）——带脚本时快照在 `.value` 里，别当普通数字读；
+      // - **灯类型串决定它进哪条 uniform 通道**（`lightLane`，2026-09-24 定）：
+      //   `l` 前缀的 4 种（lpoint/lspot/ltube/ldirectional）是同一代 V1 灯，
+      //   引擎按颜色×强度、半径、exponent 填 `g_L{Point,Spot,Tube,Directional}_*`
+      //   并**按 `lightconfig` 限槽**；去掉前缀的 `point`（及未知串）是**另一条
+      //   老通道**，填 4 槽的 `g_LightsPosition/g_LightsColorRadius(+/Premultiplied)`。
+      //   两条通道的衰减公式也不同（见 renderer.js 的 lightModel 注释），所以这里
+      //   必须把原始串留下来 —— 归一化成 'point' 会把 lpoint 的老通道身份丢掉。
+      // - `visible` 已被沿父链折叠（effVisible），灯关掉时整槽留零。
+      isLight: typeof o.light === 'string' && o.light !== '',
+      lightType: (() => {
+        const t = String(o.light || '').replace(/^l/, '')
+        return t === 'spot' || t === 'directional' ? t : 'point'
+      })(),
+      lightLane: typeof o.light === 'string' && /^l/.test(o.light) ? 'v1' : 'legacy',
+      // 标量字段的「初值」：脚本包装取快照 .value，纯数字/字符串直接解析。
+      lightRadius: parseNum(o.radius && typeof o.radius === 'object' ? o.radius.value : o.radius, 1000),
+      intensity: parseNum(o.intensity && typeof o.intensity === 'object' ? o.intensity.value : o.intensity, 1),
+      // exponent 缺省 2.0 = 官方 LightObject 注册表里的默认（Waple 逆向 §1.3：
+      // offset +0x2ec / 默认 0x1401904a8）。只有 V1 通道的灯用它（衰减指数），
+      // 老通道不吃这个字段。
+      exponent: parseNum(o.exponent && typeof o.exponent === 'object' ? o.exponent.value : o.exponent, 2),
       // [we-scene patch] 字段关键帧动画（`animation: {c0:[...], options:{...}}`）。
       // 与 objectScripts 同理：不在这里留下来，渲染侧就只能读那份静态 `value` 快照。
       // 全库 126 处 / 25 张壁纸，三大挂载点是 effect 常量 `multiply`(32)、

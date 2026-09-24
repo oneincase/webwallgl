@@ -344,7 +344,10 @@ vec3 ComputePBRLightShadowInfinite(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lig
   return (diffuse * albedo / M_PI + specular * specularTint) * lightColor * NL;
 }
 
-// 场景灯光驱动的总直射：本仓无灯光对象，恒为 0（见头注释）。
+// 场景灯光驱动的总直射：**效果 pass 这条路上仍是 0**（灯 uniform 只喂给图片层
+// 的基色着色路径 COPY_LIT_FRAG，没喂给效果 pass —— 全库 4 个 LIGHTING pass 里
+// 只有 fluidsimulation 的 combine 属于此类，且它的场景都没有灯光对象）。
+// 图片层（2890473419 等 13 张）的直射光不走这里，别按这个函数判断整库行为。
 vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewVector,
   vec3 specularTint, vec3 f0, float roughness, float metallic) {
   return vec3(0.0);

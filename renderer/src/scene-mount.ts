@@ -64,8 +64,9 @@ const foldVisibleRet = wtext.foldVisibleReturn as (ret: unknown) => boolean | un
  * scene.json 字段名与渲染层字段名不总是一致——直接写 layer.maxwidth 没有任何
  * 消费者（文字排版读 textMaxwidth，与关键帧动画 volume/maxwidth/zoom 同族）。
  * volume 还要同步到 HTMLAudio（声音层）；pointsize/maxwidth 是文字布局输入，
- * 下帧 drawText 自动重读；intensity/exponent 是灯光参数（本仓无灯光对象），
- * 值存层上无害（作者滑条/脚本仍可读写）。
+ * 下帧 drawText 自动重读；intensity/exponent 是**灯光对象**的参数（场景里
+ * `light:"point"` 的对象，见 renderer 的 collectSceneLights），逐帧写回后由
+ * 光照着色路径消费。
  */
 function scalarFieldSlot(layer: any, field: string): { get: () => number; set: (n: number) => void } {
   if (field === "maxwidth") {
@@ -2275,6 +2276,35 @@ cfg, source, pkgAbort.signal);
               if (kl === "lighting" && Number(pass.combos[k]) === 1) {
                 (layer as any).lightingEnabled = true;
               }
+            }
+          }
+          // [we-scene patch] 材质 shader 名 → 直射光模型（渲染侧
+          // `lightModelForShader` 查表）：`genericimage2` 那代走**老通道**
+          // （`point` 灯 + radius²/d²），genericimage3 走 V1 通道的 radius²/d²，
+          // generic4/genericimage4 走 V1 通道的 `saturate(1−d/radius)^exponent`。
+          // 这里只记材质事实，公式与通道分派留在渲染侧一处，免得两边各写一份映射。
+          // 灯对象按**类型串**分通道（`l*` vs `point`），两层要对上才出光：
+          // 3737267090 是 lpoint + genericimage4（V1 对 V1），2890473419 是
+          // point + genericimage2（老通道对老通道），互补。
+          if ((layer as any).lightingEnabled && typeof pass?.shader === "string") {
+            (layer as any).lightShader = pass.shader;
+          }
+          // [we-scene patch] PBR 材质参数（官方 common_pbr.h 的 ComputePBRLight 吃
+          // f0/roughness/metallic）：材质 constantshadervalues 的 metallic/roughness，
+          // 缺省 0.5/0.5（官方 uniform 声明的 default）。只给开了 LIGHTING 的层读，
+          // 别的层不碰。铁律：roughness=0 时 GGX 的 NDF 恒 0 → 镜面项为 0
+          // （2890473419 的材质正是 metallic 0 / roughness 0，最终只有漫反射项）。
+          {
+            const csv = (pass as { constantshadervalues?: Record<string, unknown> } | undefined)
+              ?.constantshadervalues;
+            const num = (v: unknown, d: number): number => {
+              const raw = (v && typeof v === "object" && "value" in (v as object)) ? (v as any).value : v;
+              const n = Number(raw);
+              return Number.isFinite(n) ? n : d;
+            };
+            if ((layer as any).lightingEnabled && csv && (csv.metallic !== undefined || csv.roughness !== undefined)) {
+              (layer as any).lightMetallic = num(csv.metallic, 0.5);
+              (layer as any).lightRoughness = num(csv.roughness, 0.5);
             }
           }
           // 图层材质可能有多槽（flowimage = background + flowmask）。只载 [0]
@@ -4984,6 +5014,12 @@ cfg, source, pkgAbort.signal);
           if (uA && uA in changed) layer.alpha = scn.parseNum(src.alpha, 1);
           const uB = boundUserName(src.brightness);
           if (uB && uB in changed) layer.brightness = scn.parseNum(src.brightness, 1);
+          // [we-scene patch] 灯光对象的 `radius` 可能就是用户的「亮度」滑条
+          // （2890473419 的「光源1亮度」绑在 radius 上）：resolveUserProps 只改了
+          // src 上的值，layer.lightRadius 是装配期读出来的副本，不回写就出现
+          // 「滑条能拖、画面不变」。
+          const uRad = boundUserName(src.radius);
+          if (uRad && uRad in changed) (layer as any).lightRadius = scn.parseNum(src.radius, 1000);
           const uVol = boundUserName(src.volume);
           if (uVol && uVol in changed) {
             const vol = scn.parseNum(src.volume, 1);

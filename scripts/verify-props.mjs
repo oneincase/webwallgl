@@ -585,6 +585,7 @@ const ids = fs.existsSync(LIB)
 // PBR）时结果 = albedo × g_LightAmbientColor。
 // **g_LightAmbientColor = min(1, ambientcolor×π)**（2026-09-18 实测标定，
 // 3737267090「整体太黑」：raw 0.3 直乘压暗 70%；详见 CASEBOOK「环境光 π 标定」）。
+// 直射光那一半见第 12 节（2026-09-24 起场景灯光对象已接线）。
 // 语料锁：LIGHTING=1 的 genericimage* pass（2026-09-18 本机库 8 pass / 4 张：
 // 2894296965×4 / 3737267090×2 / 3047405322×1 / 3509243656×1），数量变了要人看一眼；
 // 这条断言同时守住「不要给未开光照的材质全局压暗」的回归红线。
@@ -623,8 +624,14 @@ const ids = fs.existsSync(LIB)
       }
     } catch { /* 个别包读取失败不影响 */ }
   }
-  if (litPasses !== 8) fail(`LIGHTING=1 的 genericimage pass 应是 8（2026-09-18 台账），实得 ${litPasses}`);
-  const expectWalls = ["2894296965", "3047405322", "3509243656", "3737267090"];
+  // 台账更新（2026-09-24）：本机库长大后 LIGHTING 语料已是 55 pass / 13 张
+  // （2026-09-18 记的 8 pass / 4 张是当时的库）。这条锁的是**素材面貌**，
+  // 与代码路径无关 —— 数量再变仍要人看一眼（确认不是 combo 解析把别的材质算进来）。
+  if (litPasses !== 55) fail(`LIGHTING=1 的 genericimage pass 应是 55（2026-09-24 台账），实得 ${litPasses}`);
+  const expectWalls = [
+    "2890473419", "2894296965", "2952574984", "3047405322", "3281559867", "3285446145",
+    "3351179520", "3416122407", "3471294034", "3509243656", "3589454154", "3662790108", "3737267090",
+  ];
   for (const w of expectWalls) {
     if (!litWalls.has(w)) fail(`LIGHTING 壁纸 ${w} 未扫到（材质路径/combo 解析回退？）`);
   }
@@ -644,6 +651,327 @@ const ids = fs.existsSync(LIB)
   // 真 3D MDL 材质路径（parseMDL.materialPath）也要标 lightingEnabled
   if (!/pass0\?\.combos\?\.LIGHTING/.test(msrc))
     fail("scene-mount 未在静态 MDL 材质解析 LIGHTING combo");
+}
+
+// ---------- 12. 场景灯光对象 → LIGHTING 材质的直射光 ----------
+//
+// **两条通道 × 两代衰减**（2026-09-24 定性；官方 shader 明文 + Waple 对
+// wallpaper64.exe 的逆向 `docs/re/scene-lighting.md` 互证，详见 renderer.js
+// 顶部的灯光通道注释与 renderer-glsl.js 的 lightRadiance）：
+//   - `l*` 前缀（lpoint/lspot/ltube/ldirectional）→ **V1 通道**：
+//     `g_LPoint_Color.rgb = color×intensity`、`.w = radius`、`g_LPoint_Origin.w = exponent`，
+//     消费方是 generic4/genericimage4 那代材质 —— 官方 PerformLighting_V1 是引擎
+//     按场景灯清单**生成**的字符串，正文 = common_pbr_2.h::ComputePBRLightShadow：
+//     `radiance = 色 × saturate(1−d/radius)^exponent`（无 1/d²）。
+//   - 不带前缀的 `point`（官方 enum=5）→ **老通道**：`g_LightsColorRadius` +
+//     `g_LightsPosition`（另发一份预乘 `g_LightsColorPremultiplied = 色×radius²`），
+//     消费方 genericimage2 的 common_pbr.h 1/d² ⇒ `色×radius²/d²`。
+//
+// 现象（2026-09-24 用户报「3737267090 红框框选部分光源太亮」）：把这盏 `lpoint`
+// 按老通道公式算，灯正下方辐照度 = 1.79×(2048/609)² ≈ **20** ⇒ 桌面整片饱和，
+// bloom 再抹成大白斑（本仓实机 A/B：8.13% 像素亮度 ≥250，灯关掉 0%）。按 V1
+// 公式 = 1.79×(1−609/2048)^4 ≈ **0.436**，实机灯心只比关灯亮 +16/255（见 (d)）。
+{
+  const renderer = await imp("renderer/vendor/we-scene/render/renderer.js");
+  const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+  const near3 = (a, b, eps = 1e-6) => a.every((x, i) => Math.abs(x - b[i]) <= eps);
+
+  // (a) V1 通道打包：色 = color×intensity（**不预乘 radius²** —— 那是老通道的
+  //     g_LightsColorPremultiplied），radius/exponent 各自随槽走、缺省 1000/2
+  //     （官方 LightObject 注册默认，Waple §1.3）。
+  const c1 = renderer.lightColorIntensity({ color: [1, 0.97647, 0.91765], intensity: 1.79 });
+  if (!near3(c1, [1.79, 1.7479, 1.6426], 1e-4))
+    fail(`V1 颜色槽应为 color×intensity（3737267090 灯 = [1.79,1.748,1.643]），实得 ${c1.map((v) => v.toFixed(4))}`);
+  const c2 = renderer.lightColorIntensity({ color: [0.5, 0.25, 0], intensity: 2 });
+  if (!near3(c2, [1, 0.5, 0], 1e-9)) fail(`V1 颜色槽应按 color×intensity 逐分量，实得 ${c2}`);
+  if (!near3(renderer.lightColorIntensity({ color: [1, 1, 1] }), [1, 1, 1], 1e-9))
+    fail("intensity 缺省应为 1（全库有灯壁纸都显式写了或绑了用户属性）");
+  if (!near(renderer.lightRadiusOf({}), 1000)) fail(`radius 缺省应为 1000，实得 ${renderer.lightRadiusOf({})}`);
+  if (!near(renderer.lightRadiusOf({ lightRadius: 2048 }), 2048)) fail("radius 应读装配侧的 lightRadius");
+  if (!near(renderer.lightExponentOf({}), 2)) fail(`exponent 缺省应为官方默认 2，实得 ${renderer.lightExponentOf({})}`);
+  if (!near(renderer.lightExponentOf({ exponent: 4 }), 4)) fail("exponent 应读层上的 exponent");
+
+  // (a2) 模型分派表（材质 shader → 公式 + 通道）。这张表错一格就是**整族过曝或整族变黑**：
+  //      genericimage2 那代在老通道（吃 `point` 灯 + radius²/d²），generic3/generic4 那代
+  //      在 V1 通道（吃 `l*` 灯）但公式不同 —— v0 是 radius²/d²、v1 是 falloff^exponent。
+  const modelTable = [
+    ["genericimage4", "v1"], ["generic4", "v1"], ["chroma4", "v1"], ["fur4", "v1"],
+    ["foliage4", "v1"], ["genericparticle", "v1"], ["genericropeparticle", "v1"],
+    ["genericimage3", "v0"], ["generic3", "v0"],
+    ["genericimage2", "lit2d"], ["generic", "lit2d"], ["generic2", "lit2d"],
+  ];
+  for (const [shader, model] of modelTable) {
+    const got = renderer.lightModelForShader(shader);
+    if (got !== model) fail(`材质 ${shader} 应分派到模型 ${model}，实得 ${got}`);
+  }
+  const laneTable = [["v1", "v1"], ["v0", "v1"], ["lit2d", "legacy"]];
+  for (const [model, lane] of laneTable) {
+    const got = renderer.lightLaneForModel(model);
+    if (got !== lane) fail(`模型 ${model} 应吃 ${lane} 通道的灯，实得 ${got}`);
+  }
+  // 灯 → 通道只由类型串的前缀决定（`l*` = V1；`point`/未知 = 老通道）
+  {
+    const lw = load("3737267090");
+    if (lw) {
+      const ls = parseScene(lw.scene, lw.proj).layers.filter((l) => l.isLight);
+      if (ls.length !== 1) fail(`3737267090 应有 1 盏灯，实得 ${ls.length}`);
+      else {
+        if (ls[0].lightLane !== "v1") fail(`3737267090 的 lpoint 应进 V1 通道，实得 ${ls[0].lightLane}`);
+        if (ls[0].lightType !== "point") fail(`lpoint 的归一化类型仍是 point，实得 ${ls[0].lightType}`);
+      }
+    }
+  }
+
+  // (b) 世界位置：2D 场景 y 取 projH−origin.y（与 layerModelMatrix 同约定）；
+  //     透视场景原样。灯与层必须同约定，否则 L 的 z 分量看着对、x/y 反向。
+  const w2d = renderer.lightWorldPosition({ origin: [949.56714, 1515.98413, 500] }, { projH: 1440 });
+  if (!near3(w2d, [949.56714, 1440 - 1515.98413, 500], 1e-4))
+    fail(`2D 场景灯光世界位置应为 [x, projH−y, z]，实得 ${w2d}`);
+  const w3d = renderer.lightWorldPosition({ origin: [1, 2, 3] }, { projH: 1440, perspective: true });
+  if (!near3(w3d, [1, 2, 3], 1e-9)) fail(`透视场景灯光位置应原样，实得 ${w3d}`);
+
+  // (c) 收集：**按通道过滤**（V1 只收 l*、老通道只收 point/未知），两条通道各自
+  //     按对象顺序取前 4 盏；不可见的灯**占槽留零**（官方 continue 不压缩）；
+  //     第 5 盏及以后不再进 uniform；radius/exponent 随槽一起走。
+  const mkLight = (id, visible, lane = "v1") => ({
+    isLight: true, lightLane: lane, id, visible, origin: [id * 100, 0, 0], color: [1, 1, 1], intensity: 1,
+    lightRadius: 10 + id, exponent: id,
+  });
+  const col = renderer.collectSceneLights(
+    [{ name: "背景" }, mkLight(1, true), mkLight(2, false), mkLight(3, true), mkLight(4, true), mkLight(5, true)],
+    { projH: 100 },
+    "v1",
+  );
+  if (col.count !== 4) fail(`最多 4 盏灯进 uniform，实得 ${col.count}`);
+  if (!near3([col.colors[3], col.colors[4], col.colors[5]], [0, 0, 0], 1e-9))
+    fail("隐藏的灯必须占槽留零（否则后面的灯会顶到它的槽位，槽序与官方不一致）");
+  if (!near3([col.colors[6], col.colors[7], col.colors[8]], [1, 1, 1], 1e-9))
+    fail("第 3 盏可见灯应落在自己的槽位（槽位不得因隐藏灯而压缩）");
+  if (!near(col.positions[9], 400, 1e-6) || !near(col.colors[9], 1, 1e-9))
+    fail("第 4 盏灯应落在最后一槽（id 4）");
+  if (!near(col.radii[0], 11, 1e-6) || !near(col.exponents[3], 4, 1e-6))
+    fail(`radius/exponent 必须随灯进槽（实得 r=${col.radii[0]} e=${col.exponents[3]}）`);
+  if (!near3([col.positions[3], col.positions[4], col.positions[5]], [0, 0, 0], 1e-9))
+    fail("隐藏灯的槽位位置也该留零");
+  const col5 = renderer.collectSceneLights(
+    [mkLight(1, true), mkLight(2, true), mkLight(3, true), mkLight(4, true), mkLight(5, true)],
+    { projH: 100 },
+    "v1",
+  );
+  if (col5.count !== 4) fail(`5 盏灯时仍只该喂 4 槽，实得 ${col5.count}`);
+  if (!near(col5.positions[9], 400, 1e-6)) fail("第 5 盏灯不得顶掉第 4 槽（官方上限 4）");
+  // 通道互斥：老通道的 point 灯不得出现在 V1 包里（反之亦然）—— 官方两个 packer
+  // 按 [light+0x2c0] 分派，混进去就是「用错公式的那一族又被点亮了」。
+  const mixLights = [mkLight(1, true, "legacy"), mkLight(2, true, "v1")];
+  const v1only = renderer.collectSceneLights(mixLights, { projH: 100 }, "v1");
+  const legacyOnly = renderer.collectSceneLights(mixLights, { projH: 100 }, "legacy");
+  if (v1only.count !== 1 || legacyOnly.count !== 1)
+    fail(`两条通道必须各自只收本通道的灯（实得 v1=${v1only.count} legacy=${legacyOnly.count}）`);
+  if (!near(v1only.positions[0], 200, 1e-6) || !near(legacyOnly.positions[0], 100, 1e-6))
+    fail("两条通道各自打包时不得越界取到别通道的灯");
+  // 老装配/离线夹具没带 lightLane 时按 V1 收（缺省通道，见 collectSceneLights）
+  if (renderer.collectSceneLights([{ isLight: true, origin: [0, 0, 0], color: [1, 1, 1] }], { projH: 10 }).count !== 1)
+    fail("无 lightLane 字段的灯应落缺省 V1 通道（旧夹具兼容）");
+
+  // (d) 语料一：2890473419 的三盏 **point**（老通道）+ genericimage2 材质
+  //     —— 这族的模型是 radius²/d²，本次改动对它零行为差（灯进老通道、公式不变）。
+  const LW = load("2890473419");
+  if (LW) {
+    const scene = parseScene(LW.scene, LW.proj);
+    const lights = scene.layers.filter((l) => l.isLight);
+    if (lights.length !== 3) fail(`2890473419 应有 3 盏灯（scene.json 对象 19/22/26），实得 ${lights.length}`);
+    const byId = new Map(lights.map((l) => [l.id, l]));
+    const l1 = byId.get(19), l2 = byId.get(22), l3 = byId.get(26);
+    if (!l1 || !l2 || !l3) fail("2890473419 灯具对象 id 应为 19/22/26");
+    else {
+      if (lights.some((l) => l.lightType !== "point")) fail("2890473419 三盏灯都应是 point");
+      if (lights.some((l) => l.lightLane !== "legacy"))
+        fail("2890473419 的 point 灯应进老通道（不带 l 前缀 = 官方 enum 5 的 4 槽通道）");
+      if (!near3(l1.color, [0.32941, 0.27059, 0.97255], 1e-4))
+        fail(`光源1 颜色应取用户属性 _1（0.329 0.271 0.973），实得 ${l1.color}`);
+      if (!near3(l2.color, [0.4549, 0.14118, 0.34902], 1e-4))
+        fail(`光源2 颜色应取用户属性 _2，实得 ${l2.color}`);
+      if (!near3(l3.color, [1, 1, 1], 1e-6)) fail(`光源3 颜色应取用户属性 _3（白），实得 ${l3.color}`);
+      for (const [name, l] of [["光源1", l1], ["光源2", l2], ["光源3", l3]]) {
+        if (l.lightRadius !== 2048) fail(`${name} 亮度（radius）应取用户属性（2048），实得 ${l.lightRadius}`);
+        if (l.intensity !== 1) fail(`${name} intensity 快照应为 1，实得 ${l.intensity}`);
+      }
+    }
+    // lightingEnabled 由 scene-mount 的材质解析阶段（读 pkg 里的
+    // materials/*.json）写到层上，parseScene 本身看不到材质 —— 这里直接查包：
+    // 人物层引用 models/101272156_p0.json，该模型指向 LIGHTING=1 的 genericimage2 材质。
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(join(LIB, "2890473419", "scene.pkg"))));
+    const matJson = JSON.parse(dec.decode(getEntry(pkg, "materials/101272156_p0.json")));
+    const p0 = (matJson.passes || [])[0] || {};
+    if (Number(p0.combos && p0.combos.LIGHTING) !== 1)
+      fail("2890473419 的 materials/101272156_p0.json 应是 LIGHTING=1 的 genericimage2");
+    if (p0.shader !== "genericimage2")
+      fail(`2890473419 的 LIGHTING 材质 shader 应是 genericimage2（老通道 + d²），实得 ${p0.shader}`);
+    if (renderer.lightModelForShader(p0.shader) !== "lit2d")
+      fail("genericimage2 必须分派到 lit2d（老通道 + radius²/d²），否则这族整体偏暗");
+    if (p0.constantshadervalues?.metallic !== 0 || p0.constantshadervalues?.roughness !== 0)
+      fail(`2890473419 人物材质 metallic/roughness 应声明 0/0（实得 ${JSON.stringify(p0.constantshadervalues)}）`);
+    const chUsers = ["124", "13", "82"].filter((id) => {
+      const o = (LW.scene.objects || []).find((x) => String(x.id) === id);
+      return o && o.image === "models/101272156_p0.json";
+    });
+    if (chUsers.length !== 3) fail("2890473419 的三个人物层应都引用 models/101272156_p0.json（LIGHTING 材质）");
+    if (scene.layers.some((l) => l.isLight && l.lightingEnabled))
+      fail("灯对象自身不是 LIGHTING 材质层，不该被标 lightingEnabled");
+    // 灯不该被画出来：渲染端跳过「无图无文字无粒子」的灯层
+    const rsrc0 = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/if \(layer\.isLight && !layer\.image && !layer\.isText && !layer\.particle && !layer\.isComponent\) return/.test(rsrc0))
+      fail("renderer 未跳过纯灯层的绘制（灯不该出现在画面里）");
+    ok(`灯光：2890473419 三盏 point 灯（色/亮度/开关全绑用户属性）走老通道，人物层 LIGHTING 材质参数 0/0`);
+  }
+
+  // (d2) 语料二：3737267090 的 **lpoint**（V1 通道）+ genericimage4 材质 ——
+  //      用户报「红框里光源太亮」的那张。判据 = **两代公式在这盏灯上的辐照度差**：
+  //      V1（正确）≈ 0.44，老通道（改动前）≈ 20。这条同时是「改回旧公式会红」
+  //      的探针：把 lightModelForShader 的 genericimage4 改成 'lit2d' 立刻翻红。
+  //      注：这里的两个数按同一份**真实打包值**（lightColorIntensity / lightRadiusOf
+  //      / lightExponentOf）与着色器里的公式形状算 —— 权威判据是 verify-props 的
+  //      shader 文本断言 + 实机 A/B（8.13% 饱和像素 → 0%，灯心 +16/255）。
+  {
+    const lw = load("3737267090");
+    if (!lw) note("3737267090 语料缺失，跳过 V1 通道直射光数值判据");
+    else {
+      const scene = parseScene(lw.scene, lw.proj);
+      const ls = scene.layers.filter((l) => l.isLight);
+      if (ls.length !== 1) fail(`3737267090 应有 1 盏灯，实得 ${ls.length}`);
+      else {
+        const light = ls[0];
+        if (light.lightLane !== "v1") fail(`3737267090 的 lpoint 应进 V1 通道，实得 ${light.lightLane}`);
+        if (!near(light.lightRadius, 2048, 1e-3)) fail(`灯 radius 应为 2048，实得 ${light.lightRadius}`);
+        if (!near(light.exponent, 4, 1e-3)) fail(`灯 exponent 应为 4，实得 ${light.exponent}`);
+        if (!near(light.intensity, 1.79, 1e-4)) fail(`灯 intensity 应为 1.79，实得 ${light.intensity}`);
+        const projH = Number(scene.general?.orthogonalprojection?.height ?? 2160);
+        const wp = renderer.lightWorldPosition(light, { projH });
+        if (!near(wp[0], 2748.92871, 1e-3) || !near(wp[1], projH - 609.05267, 1e-3) || !near(wp[2], 609, 1e-3))
+          fail(`灯世界位置应为 [2748.93, projH−609.05, 609]，实得 ${wp}`);
+        // 灯正下方（层平面 z=0）的辐照度：d 含 z=609 这一份
+        const dist = Math.hypot(wp[0] - wp[0], wp[1] - wp[1], wp[2]);
+        const c = renderer.lightColorIntensity(light);
+        const r = renderer.lightRadiusOf(light);
+        const e = renderer.lightExponentOf(light);
+        const peakV1 = Math.max(...c) * Math.pow(Math.max(0, 1 - dist / r), e);
+        const peakOld = (Math.max(...c) * r * r) / Math.max(dist * dist, 1e-6);
+        if (!(peakV1 < 1)) fail(`V1 公式下这盏灯的峰值辐照度应 <1（不过曝），实得 ${peakV1.toFixed(3)}`);
+        if (!(peakOld > 10)) fail(`老通道公式在同一点应 >10（改动前过曝的证据），实得 ${peakOld.toFixed(2)}`);
+        if (!(peakOld / peakV1 > 30)) fail(`两代公式在这盏灯上应差 30 倍以上（实得 ${(peakOld / peakV1).toFixed(1)}×）`);
+        ok(`灯光：3737267090 的 lpoint 走 V1 通道，峰值辐照度 ${peakV1.toFixed(3)}（老通道公式为 ${peakOld.toFixed(1)}，相差 ${(peakOld / peakV1).toFixed(0)} 倍）`);
+      }
+    }
+  }
+
+  // (d3) 全库台账：LIGHTING=1 的材质只出现这四种 shader —— 少一种说明材质解析
+  //      变了，多一种（尤其 generic/generic2）说明出现本仓**未实现**的
+  //      `saturate(1−d/radius)²` 老式 shader，必须人看一眼别静默套错公式。
+  {
+    const knownLint = new Set(["genericimage2", "genericimage3", "genericimage4", "generic4"]);
+    const seen = new Map();
+    for (const id of ids) {
+      const p = join(LIB, id, "scene.pkg");
+      let pkg;
+      try { pkg = parsePkg(new Uint8Array(fs.readFileSync(p))); } catch { continue; }
+      for (const e of pkg.entries || pkg) {
+        const name = e.name ?? e.path;
+        if (!/^materials\/.*\.json$/.test(name)) continue;
+        let txt;
+        try { txt = dec.decode(getEntry(pkg, name)); } catch { continue; }
+        if (!/"LIGHTING"\s*:\s*1/.test(txt)) continue;
+        for (const m of txt.matchAll(/"shader"\s*:\s*"([^"]+)"/g)) {
+          if (!seen.has(m[1])) seen.set(m[1], id);
+        }
+      }
+    }
+    for (const [shader, id] of seen) {
+      if (!knownLint.has(shader))
+        fail(`LIGHTING 材质出现未建模的 shader "${shader}"（${id}）：先确认它吃哪条通道、用哪代衰减，再补 lightModelForShader`);
+    }
+    if (seen.size) ok(`灯光模型台账：LIGHTING 材质的 shader = ${[...seen.keys()].sort().join("/")}`);
+  }
+
+  // (e) 效果链底图的「局部 → 世界」矩阵（2890473419 实测踩过：合成顺序写反，
+  //     平移量被缩放吞掉，片元世界坐标偏半个层宽/高 → 灯距离高估 ~1.5 倍、
+  //     人物只亮一点点，画面看起来"像是对了"，没有这条断言就发现不了）。
+  // 判据用真实实现函数 litBaseLocalToWorld：局部四角必须落在层世界矩形的四角。
+  const math = await imp("renderer/vendor/we-scene/render/math.js");
+  {
+    const { mat4Identity, mat4Translate, mat4Scale, mat4RotateZ, mat4Multiply, mat4TransformPoint } = math;
+    const w = 691.84, h = 1380;                       // 层 82 实测：size1504×scale0.46
+    let world = mat4Translate(mat4Identity(), 1720, 723.64, 0);
+    world = mat4RotateZ(world, 0.3);                  // 带一个 Z 旋转，顺序错就露馅
+    world = mat4Scale(world, w, h, 1);
+    const l2w = renderer.litBaseLocalToWorld(world, 692, 1380);
+    const p00 = mat4TransformPoint(l2w, 0, 0, 0);
+    const p11 = mat4TransformPoint(l2w, 692, 1380, 0);
+    const mid = mat4TransformPoint(l2w, 346, 690, 0);
+    const c = Math.cos(0.3), s = Math.sin(0.3);
+    // 局部 (0,0) 对应「层原点 + R·(−w/2,−h/2)」；局部中心对应层原点。
+    const rot = (x, y) => [c * x - s * y, s * x + c * y];
+    const r00 = rot(-w / 2, -h / 2);
+    const exp00 = [1720 + r00[0], 723.64 + r00[1]];
+    const expMid = [1720, 723.64];
+    const near2 = (a, b, eps = 1e-3) => Math.abs(a[0] - b[0]) <= eps && Math.abs(a[1] - b[1]) <= eps;
+    if (!near2(p00, exp00, 0.02))
+      fail(`LIGHTING 底图局部→世界：局部(0,0) 应落在层世界角 ${exp00.map((v) => v.toFixed(2))}，实得 ${p00.slice(0, 2).map((v) => v.toFixed(2))}（mat4Translate/Scale 是右乘，合成顺序写反就会偏半个层宽/高）`);
+    if (!near2(mid, expMid, 0.02))
+      fail(`LIGHTING 底图局部→世界：局部中心应落在层原点 ${expMid}，实得 ${mid.slice(0, 2).map((v) => v.toFixed(2))}`);
+    if (Math.abs((p11[0] - p00[0]) ** 2 + (p11[1] - p00[1]) ** 2 - (w * w + h * h)) > 1)
+      fail("LIGHTING 底图局部→世界：对角线长度应等于层世界矩形对角线（缩放没丢）");
+    // 渲染端必须走这个函数（别在调用点手搓 toUnit）
+    const rsrcL = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/bindLitUniforms\(litBaseLocalToWorld\(layerWorldModelMatrix\(layer, cam\), fboW, fboH\), layer\)/.test(rsrcL))
+      fail("效果链底图未用 litBaseLocalToWorld 造光照矩阵（手搓 toUnit 极易把合成顺序写反）");
+  }
+
+  // (f) 接线断言：着色器是官方公式的形状；渲染端把灯喂给 LIGHTING 层
+  const gsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer-glsl.js"), "utf8");
+  if (!/COPY_LIT_FRAG/.test(gsrc)) fail("renderer-glsl 缺少 LIGHTING 直射光着色器 COPY_LIT_FRAG");
+  // V1 模型（`l*` 灯 + generic4/genericimage4）：官方 ComputePBRLightShadow 的
+  // 逐字转写。别把它换成 1/d² —— 3737267090 的 20 倍过曝就是这个错。
+  if (!/clamp\(1\.0 - distance \/ max\(radius, 0\.0001\), 0\.0, 1\.0\)/.test(gsrc))
+    fail("COPY_LIT_FRAG 的 V1 分支缺少官方 falloff = saturate(1−d/radius)");
+  if (!/pow\(falloff \+ fltMin, exponent\)/.test(gsrc) || !/step\(0\.0, falloff - fltMin\)/.test(gsrc))
+    fail("COPY_LIT_FRAG 的 V1 分支未按官方 GLSL 分支写 pow(falloff+flt_min, exponent)（含 step 门）");
+  // 老通道 / V0 模型：CPU 预乘 radius² 后 1/d²（官方 common_pbr.h）
+  if (!/lightColor \* \(radius \* radius\) \/ max\(distance \* distance, 0\.0001\)/.test(gsrc))
+    fail("COPY_LIT_FRAG 缺少 radius²/d² 分支（genericimage2/genericimage3 那两代用）");
+  if (!/u_LightModel/.test(gsrc) || !/int model/.test(gsrc))
+    fail("COPY_LIT_FRAG 未按 u_LightModel 在两代公式间选路");
+  if (!/\(diffuse \* albedo \/ PI \+ specular\) \* radiance \* NL/.test(gsrc))
+    fail("COPY_LIT_FRAG 未按官方口径合成（(diffuse*albedo/PI+specular)*radiance*NL）");
+  if (!/clamp\(ambient \+ light, 0\.0, 1\.0\) \+ light \* overbright/.test(gsrc))
+    fail("COPY_LIT_FRAG 缺少官方 CombineLighting 的 HDR 过曝分支");
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  if (!/v1: collectSceneLights\(scene\.layers, cam, 'v1'\)/.test(rsrc) || !/legacy: collectSceneLights\(scene\.layers, cam, 'legacy'\)/.test(rsrc))
+    fail("renderScene 未每帧按两条通道收集场景灯光（脚本/用户属性会逐帧改灯）");
+  if (!/gl\.uniform3fv\(u\.lightColor, pack\.colors\)/.test(rsrc) || !/gl\.uniform3fv\(u\.lightPos, pack\.positions\)/.test(rsrc))
+    fail("bindLitUniforms 未把灯位置/颜色喂给着色器");
+  if (!/gl\.uniform1fv\(u\.lightRadius, pack\.radii\)/.test(rsrc) || !/gl\.uniform1fv\(u\.lightExponent, pack\.exponents\)/.test(rsrc))
+    fail("bindLitUniforms 未把 radius/exponent 喂给着色器（V1 衰减的两个参数）");
+  if (!/const pack = sceneLights\[lightLaneForModel\(model\)\]/.test(rsrc))
+    fail("bindLitUniforms 未按模型取对应通道的灯（模型与通道必须同源）");
+  if (!/model === 'v1' \? 0 : 1/.test(rsrc)) fail("bindLitUniforms 未把模型翻成 u_LightModel");
+  if (!/const baseProg = layer\.lightingEnabled \? copyLitProg : copyProg/.test(rsrc))
+    fail("效果链底图那一趟未按 lightingEnabled 切到直射光着色器（LIGHTING 层的效果链是主路径）");
+  if (!/layer\.lightingEnabled \? copyLitProg : copyProg,/.test(rsrc))
+    fail("无效果直出路径未按 lightingEnabled 切到直射光着色器");
+  if (!/bindLitUniforms\(m, layer\)/.test(rsrc))
+    fail("合成趟未用同一份模型矩阵给光照定世界位置（局部空间→世界的换算必须与合成同源）");
+  if (!/lightRadius = scn\.parseNum\(src\.radius, 1000\)/.test(msrc2()))
+    fail("用户属性热更未回写 lightRadius（「亮度」滑条会拖了不动）");
+  // 装配侧把材质 shader 记下来，渲染侧才知道该用哪代公式
+  if (!/\(layer as any\)\.lightShader = pass\.shader/.test(msrc2()))
+    fail("scene-mount 未把 LIGHTING 材质的 shader 名写到层上（模型分派会整体退回缺省）");
+  if (!/lightLane: typeof o\.light === 'string' && \/\^l\/\.test\(o\.light\) \? 'v1' : 'legacy'/.test(
+    fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8"),
+  ))
+    fail("parse 未按 `l` 前缀给灯标通道（lpoint/lspot 走 V1，point 走老通道）");
+}
+function msrc2() {
+  return fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
 }
 
 for (const n of notes) console.log("  ✓ " + n);

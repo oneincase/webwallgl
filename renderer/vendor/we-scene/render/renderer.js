@@ -2,7 +2,7 @@ import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4Ro
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
@@ -300,7 +300,8 @@ export function clampCompositeFboSize(swRaw, shRaw, maxTex) {
  * 官方 genericimage2/3/4 与 genericparticle 在 `#if LIGHTING` 下：
  *   ambient = max(0.001, g_LightAmbientColor) * color
  *   color   = CombineLighting(directLight, ambient)
- * 本仓不跑完整 PBR，直射项按 0 处理 → CombineLighting 退化为 albedo × ambient。
+ * 直射项由 COPY_LIT_FRAG 那条路径按官方 common_pbr.h 实算（场景有灯光对象时不再
+ * 是 0），本函数只负责 ambient 那一半。
  * **g_LightAmbientColor ≠ 原始 ambientcolor**：引擎按辐照度口径喂入
  * ambientcolor×π（3737267090 实测：ambient=0.3 灰默认 + 无灯光时，官方
  * preview/反照率整帧比值 ≈0.94~1.03；3047405322 同为 0.87——raw 0.3 直乘会
@@ -310,9 +311,9 @@ export function clampCompositeFboSize(swRaw, shRaw, maxTex) {
  * - true：逐分量 min(1, max(0.001, a)×π)（0.3 灰默认 ≙ 0.94 近原亮度，
  *   白色封顶 1，纯黑保官方 0.001 下限×π）。
  *
- * 场景灯光对象（lpoint/lspot，3737267090 有一盏 intensity 1.79 的点光）本仓
- * 不解析；按官方 LightingV1 公式其全帧平均贡献仅 ~2%（falloff^exponent 衰减
- * 极快），并入 ambient 误差可忽略。
+ * 场景灯光对象的**直射项**不在这里（2026-09-24 起已实现，见 COPY_LIT_FRAG 与
+ * collectSceneLights）：本函数只管 ambient 那一半。注意 ambient 也要在 LIGHTING
+ * 层里只应用一次（color4 侧给恒等，见 renderLayer）。
  *
  * 纯函数供离线 verifier 直接跑（不创建 WebGL 上下文）。
  */
@@ -324,6 +325,149 @@ export function layerColorAmbient(lightingEnabled, ambient) {
     Math.min(1, Math.max(0.001, Number(a[1]) || 0) * Math.PI),
     Math.min(1, Math.max(0.001, Number(a[2]) || 0) * Math.PI),
   ]
+}
+
+// ---------- 场景灯光对象（light: point/lpoint/spot/lspot/directional） ----------
+//
+// **两条通道 × 两代衰减公式**（2026-09-24 定性；依据 = 官方 shader 明文
+// `local-assets/shaders/{common_pbr.h,common_pbr_2.h,common_fragment.h,generic*.frag}`
+// ＋ Waple 对 wallpaper64.exe 的逆向 `docs/re/scene-lighting.md`（给出生成器
+// `0x140169140` 打出的字符串原文），两者互证）：
+//
+//   ① **V1 通道**：`light` 串**带** `l` 前缀（lpoint/lspot/ltube/ldirectional）。
+//      引擎把 `color×intensity` 填 `g_LPoint_Color[i].rgb`、**radius 填同一个
+//      `.w`**、exponent 填 `g_LPoint_Origin[i].w`，并**只按 `lightconfig` 给的
+//      槽位数装箱**（未写 lightconfig ⇒ 一盏都不装；`point` 这类老串被这条通道
+//      整个丢掉）。消费它的是 generic4 / genericimage4 这一代材质——官方那份
+//      `PerformLighting_V1` **不在 .frag 文件里**，是引擎按场景灯清单生成的字
+//      符串（Waple §2.1），正文转 `common_pbr_2.h::ComputePBRLightShadow`：
+//          radiance = color×intensity × saturate(1 − d/radius)^exponent
+//      没有 1/d²：**radius 是衰减半径、exponent 是衰减指数**（这就是 scene.json
+//      里那个 exponent 的唯一读者）。
+//
+//   ② **老通道（4 槽固定）**：`light` 串**不带** `l`（`point` 或未知串，官方
+//      enum = 5）。引擎填 `g_LightsPosition[4]` + `g_LightsColorRadius[4]`
+//      （rgb = color×intensity、w = radius），另有一份预乘 `g_LightsColorPremultiplied`
+//      = color×intensity×radius²。消费者是 genericimage2（2D 图层：
+//      `ComputePBRLight(..., g_LightsColorPremultiplied[i].rgb, …)`
+//      ⇒ `radiance = color×intensity×radius²/d²`，官方 common_pbr.h 的 1/d²）
+//      与 generic/generic2（`ComputeLight` 的 `color × saturate(1−d/radius)²`，
+//      **本仓未实现**，全库没有 LIGHTING pass 用它——verify-props 有名单断言）。
+//
+// **两代公式不能互相替换**：3737267090 的 `lpoint`（i=1.79 r=2048 e=4，灯在桌
+// 前 z=609）按老通道的 radius²/d² 算，灯正下方权重 ≈ 1.79×(2048/609)² ≈ **20**，
+// 整片桌面饱和过曝再被 bloom 抹成大白斑（实测 8.14% 像素 ≥250，灯关掉 0%）；
+// 按 V1 的 `1.79×(1−609/2048)^4 ≈ 0.44` 才是作者 preview 里的柔和暖光。
+// 反过来 2890473419 的三盏是 `point`（老通道），换成 V1 公式会整体偏暗。
+// 判据见 verify-props 第 12 节（模型分派 + 两条公式形状 + 真实语料峰值 <1）。
+
+/** 灯光世界位置：与 layerModelMatrix 同一套坐标约定（2D 场景 y 取 projH−origin.y）。 */
+export function lightWorldPosition(light, cam) {
+  const o = (light && light.origin) || [0, 0, 0]
+  const z = Number(o[2]) || 0
+  if (cam && cam.perspective) return [Number(o[0]) || 0, Number(o[1]) || 0, z]
+  const projH = cam && Number.isFinite(cam.projH) ? cam.projH : 0
+  return [Number(o[0]) || 0, projH - (Number(o[1]) || 0), z]
+}
+
+/**
+ * V1 通道的颜色槽：官方 `g_LPoint_Color[i].rgb = color × intensity`
+ * （Waple §3.3 实测 `0x140193283`–`0x1401932c8`）。radius² 不在 CPU 侧预乘，
+ * 由着色器按模型决定要不要乘（老通道的 `g_LightsColorPremultiplied` 才是预乘版）。
+ * 缺省 intensity 1（灯对象默认 0 只在作者没写时生效，本仓保留 1 以兼容无该字段
+ * 的旧语料；全库有灯壁纸都显式写了 intensity 或绑了用户属性）。
+ */
+export function lightColorIntensity(light) {
+  const c = (light && light.color) || [1, 1, 1]
+  const i = Number(light && light.intensity)
+  const k = Number.isFinite(i) ? i : 1
+  return [(Number(c[0]) || 0) * k, (Number(c[1]) || 0) * k, (Number(c[2]) || 0) * k]
+}
+
+/** 灯的衰减半径：装配侧字段名 lightRadius，兼容直接传 `radius` 的夹具。缺省 1000。 */
+export function lightRadiusOf(light) {
+  const r = Number(light && (light.lightRadius !== undefined ? light.lightRadius : light.radius))
+  return Number.isFinite(r) ? r : 1000
+}
+
+/** 灯的衰减指数（仅 V1 通道用）。缺省 2 = 官方 LightObject 注册默认。 */
+export function lightExponentOf(light) {
+  const e = Number(light && light.exponent)
+  return Number.isFinite(e) ? e : 2
+}
+
+/** 一盏灯最多占 4 槽（老通道固定 4；V1 的 `lightconfig` 上限 15，本仓按 4 装配）。 */
+export const MAX_SCENE_LIGHTS = 4
+
+/**
+ * 材质 shader → 光照模型（官方两代分派表，见上面的通道注释）：
+ *   'v1'    generic4 / genericimage4 / chroma4 / fur4 / foliage4（＋两种粒子）：
+ *           V1 通道 + `saturate(1−d/radius)^exponent`
+ *   'v0'    generic3 / genericimage3：V1 通道 + `radius²/d²`（SHADERVERSION≥62 口径）
+ *   'lit2d' genericimage2：老通道 + `radius²/d²`
+ * 未知 shader 落 'lit2d'（老通道 + d²，即改动前的行为），并由 verify-props 的
+ * 台账断言「全库 LIGHTING pass 只出现上述四种 shader」兜住——generic/generic2
+ * 那条 `saturate(1−d/radius)²` 通道没实现，真出现时要人看一眼，别静默套错公式。
+ */
+export function lightModelForShader(shader) {
+  const s = String(shader || '').toLowerCase()
+  if (s === 'generic4' || s === 'genericimage4' || s === 'chroma4' || s === 'fur4' ||
+      s === 'foliage4' || s === 'genericparticle' || s === 'genericropeparticle') return 'v1'
+  if (s === 'generic3' || s === 'genericimage3') return 'v0'
+  return 'lit2d'
+}
+
+/** 模型 → 它消费的灯通道（'v1' = l* 前缀的灯；'legacy' = 不带前缀的 `point`）。 */
+export function lightLaneForModel(model) {
+  return model === 'lit2d' ? 'legacy' : 'v1'
+}
+
+/**
+ * [we-scene patch] 效果链底图那一趟的「局部 → 世界」矩阵：底图 quad 的局部空间是
+ * [0,fboW]×[0,fboH]（layerQuadVerts），而 layerWorldModelMatrix 期望的局部空间是
+ * [-0.5,0.5]²（两者的 UV 都等于 (x/w, y/h)，只差一次归一化平移）。
+ *
+ * **矩阵合成顺序是这条链上最容易静默错的一处**：math.js 的 mat4Translate/mat4Scale
+ * 都是右乘（M·T / M·S），所以「先缩放 1/f、再平移 −0.5」必须写成 scale(translate(I))
+ * —— 写反成 translate(scale(I)) 会把平移量一起缩放掉，u_Model 的平移变成层原点附近，
+ * 片元世界坐标整体偏半个层宽/高（2890473419 实测：灯距离被高估 ~1.5 倍，人物只亮了
+ * 一点点，一眼看不出是矩阵错）。判据见 verify-props 第 12 节：局部四角必须映射到
+ * 「层世界矩形」的四角。
+ */
+export function litBaseLocalToWorld(worldModel, fboW, fboH) {
+  const toUnit = mat4Scale(mat4Translate(mat4Identity(), -0.5, -0.5, 0), 1 / fboW, 1 / fboH, 1)
+  return mat4Multiply(worldModel, toUnit)
+}
+
+/**
+ * 收集本帧喂给着色器的灯（按通道装箱，语义照官方两个 packer）：
+ * 只收 `lane` 这条通道的灯（'v1' = 带 `l` 前缀；'legacy' = `point`/未知串），
+ * 按**场景对象顺序**取前 4 盏，不可见的灯**占槽但留零**（引擎是 `continue`
+ * 不压缩下标，槽位零色自然不贡献）—— 与「按可见性过滤后压缩」只在灯多于 4 盏
+ * 且有隐藏灯时才有差别，这里照官方保真。
+ */
+export function collectSceneLights(layers, cam, lane = 'v1') {
+  const positions = new Float32Array(MAX_SCENE_LIGHTS * 3)
+  const colors = new Float32Array(MAX_SCENE_LIGHTS * 3)
+  const radii = new Float32Array(MAX_SCENE_LIGHTS)
+  const exponents = new Float32Array(MAX_SCENE_LIGHTS)
+  const used = []
+  let count = 0
+  for (const layer of layers || []) {
+    if (!layer || !layer.isLight) continue
+    if ((layer.lightLane === 'legacy' ? 'legacy' : 'v1') !== lane) continue
+    if (count >= MAX_SCENE_LIGHTS) break
+    const slot = count++
+    used.push(layer.visible === false ? null : layer)
+    if (layer.visible === false) continue
+    const p = lightWorldPosition(layer, cam)
+    const c = lightColorIntensity(layer)
+    positions.set(p, slot * 3)
+    colors.set(c, slot * 3)
+    radii[slot] = lightRadiusOf(layer)
+    exponents[slot] = lightExponentOf(layer)
+  }
+  return { count, positions, colors, radii, exponents, used }
 }
 
 export function bloomPostParams(general) {
@@ -774,6 +918,9 @@ export function createRenderer(canvas, opts = {}) {
   let bloomDebugFrames = typeof opts.bloomDebugFrames === 'number' ? opts.bloomDebugFrames : 3
 
   const copyProg = linkProgram(gl, COPY_VERT, COPY_FRAG)
+  // [we-scene patch] 材质 LIGHTING combo 的直射光变体（见 renderer-glsl.js 的
+  // COPY_LIT_FRAG 注释）：只有 lightingEnabled 的层走它，其余层完全不变。
+  const copyLitProg = linkProgram(gl, COPY_LIT_VERT, COPY_LIT_FRAG)
   const compProg = linkProgram(gl, COPY_VERT, COMPOSITE_FRAG)
   const backdropProg = linkProgram(gl, COPY_VERT, BACKDROP_FRAG)
   // [we-scene patch] 内置 Bloom 后期（general.bloom；HDR 开关绑在这里）。
@@ -1665,6 +1812,62 @@ export function createRenderer(canvas, opts = {}) {
     tex: gl.getUniformLocation(compProg, 'u_Tex'),
     blendPrep: gl.getUniformLocation(compProg, 'u_BlendPrep'),
   }
+  // [we-scene patch] LIGHTING 直射光变体的 uniform 表（COPY_LIT_FRAG）。
+  const copyLitUni = {
+    mvp: gl.getUniformLocation(copyLitProg, 'u_MVP'),
+    tex: gl.getUniformLocation(copyLitProg, 'u_Tex'),
+    color: gl.getUniformLocation(copyLitProg, 'u_Color4'),
+    frameOrigin: gl.getUniformLocation(copyLitProg, 'u_FrameOrigin'),
+    frameU: gl.getUniformLocation(copyLitProg, 'u_FrameU'),
+    frameV: gl.getUniformLocation(copyLitProg, 'u_FrameV'),
+    blendPrep: gl.getUniformLocation(copyLitProg, 'u_BlendPrep'),
+    model: gl.getUniformLocation(copyLitProg, 'u_Model'),
+    lightCount: gl.getUniformLocation(copyLitProg, 'u_LightCount'),
+    lightPos: gl.getUniformLocation(copyLitProg, 'u_LightPos'),
+    lightColor: gl.getUniformLocation(copyLitProg, 'u_LightColor'),
+    lightRadius: gl.getUniformLocation(copyLitProg, 'u_LightRadius'),
+    lightExponent: gl.getUniformLocation(copyLitProg, 'u_LightExponent'),
+    lightModel: gl.getUniformLocation(copyLitProg, 'u_LightModel'),
+    lightAmbient: gl.getUniformLocation(copyLitProg, 'u_LightAmbient'),
+    lightRoughness: gl.getUniformLocation(copyLitProg, 'u_LightRoughness'),
+    lightMetallic: gl.getUniformLocation(copyLitProg, 'u_LightMetallic'),
+    lightHdr: gl.getUniformLocation(copyLitProg, 'u_LightHdr'),
+  }
+  // 本帧灯光状态（renderScene 每帧刷新，见 collectSceneLights 的通道语义注释）：
+  // 两条通道各存一份，绘制时按层的模型取对应那份。
+  const emptyLights = () => ({
+    count: 0,
+    positions: new Float32Array(MAX_SCENE_LIGHTS * 3),
+    colors: new Float32Array(MAX_SCENE_LIGHTS * 3),
+    radii: new Float32Array(MAX_SCENE_LIGHTS),
+    exponents: new Float32Array(MAX_SCENE_LIGHTS),
+  })
+  let sceneLights = { v1: emptyLights(), legacy: emptyLights() }
+  // [we-scene patch] 给 LIGHTING 直射光那一趟绑灯：modelM = 本趟局部空间 → 世界
+  // （必须与 u_LightPos 同空间 —— 两类层的局部空间不同：图片层是 [0,fboW]×[0,fboH]
+  // 或 [-0.5,0.5]，真 3D 网格是网格局部坐标）。
+  function bindLitUniforms(modelM, layer) {
+    const u = copyLitUni
+    // 模型分派与通道取灯必须同源：'lit2d'（genericimage2）吃老通道的 `point` 灯，
+    // 其余（V1 那代）吃 `l*` 灯。装配侧没记 lightShader（旧装配/离线夹具）时按
+    // genericimage2 走，与改动前「全部灯 + d²」的老行为在单通道语料上一致。
+    const model = lightModelForShader((layer && layer.lightShader) || 'genericimage2')
+    const pack = sceneLights[lightLaneForModel(model)] || emptyLights()
+    gl.uniformMatrix4fv(u.model, false, modelM)
+    gl.uniform1i(u.lightCount, pack.count)
+    gl.uniform3fv(u.lightPos, pack.positions)
+    gl.uniform3fv(u.lightColor, pack.colors)
+    gl.uniform1fv(u.lightRadius, pack.radii)
+    gl.uniform1fv(u.lightExponent, pack.exponents)
+    gl.uniform1i(u.lightModel, model === 'v1' ? 0 : 1)
+    const amb = layerColorAmbient(true, sceneAmbient)
+    gl.uniform3f(u.lightAmbient, amb[0], amb[1], amb[2])
+    const rough = Number((layer && layer.lightRoughness))
+    const metal = Number((layer && layer.lightMetallic))
+    gl.uniform1f(u.lightRoughness, Number.isFinite(rough) ? rough : 0.5)
+    gl.uniform1f(u.lightMetallic, Number.isFinite(metal) ? metal : 0.5)
+    gl.uniform1i(u.lightHdr, hdrActive ? 1 : 0)
+  }
   const backdropUni = {
     mvp: gl.getUniformLocation(backdropProg, 'u_MVP'),
     tex: gl.getUniformLocation(backdropProg, 'u_Tex'),
@@ -1953,6 +2156,21 @@ export function createRenderer(canvas, opts = {}) {
     return { m, w, h }
   }
 
+  /**
+   * [we-scene patch] 「local [-0.5,0.5]² → 世界」的模型矩阵，供合成 quad 与
+   * LIGHTING 直射光共用同一份（两处必须逐字同源：光照的 L 向量用 worldPos 算，
+   * 一旦和实际绘制的落点差一点，光斑就整体偏移）。
+   */
+  function layerWorldModelMatrix(layer, cam, contentRect = null) {
+    const base = layerModelMatrix(layer, cam)
+    if (!contentRect) return mat4Scale(base.m, base.w, base.h, 1)
+    const cx = (contentRect[0] + contentRect[2] / 2) * layer.scale[0]
+    const cy = (contentRect[1] + contentRect[3] / 2) * layer.scale[1]
+    let m = mat4Translate(base.m, cx, -cy, 0)
+    m = mat4Scale(m, contentRect[2] * layer.scale[0], contentRect[3] * layer.scale[1], 1)
+    return m
+  }
+
   function compositeLayer(prog, inputTex, color4, layer, cam, viewProj, width, height, premultiplied = false, frameBasis = null, contentRect = null) {
     const base = layerModelMatrix(layer, cam)
     // [we-scene patch] contentRect（puppet 网格超出层矩形时）：层 FBO 覆盖的是
@@ -2009,8 +2227,12 @@ export function createRenderer(canvas, opts = {}) {
       gl.activeTexture(gl.TEXTURE0)
       return
     }
-    const uni = prog === compProg ? compUni : copyUni
+    const uni = prog === compProg ? compUni : (prog === copyLitProg ? copyLitUni : copyUni)
     gl.useProgram(prog)
+    // [we-scene patch] LIGHTING 层：直射光要在**这一趟**算（本地 quad 的空间位置
+    // 经 m 映到世界，再和灯的世界位置求 L）。m 就是本函数下面用的模型矩阵，
+    // 即「local [-0.5,0.5] → 世界」；灯位置与它同空间（见 collectSceneLights）。
+    if (prog === copyLitProg) bindLitUniforms(m, layer)
     // [we-scene patch] 容器效果画布（空容器 + 音频可视化等）的合成方式。
     // 两类容器效果的输出约定**正好相反**，必须分流，一刀切必然牺牲一类：
     //  [A] 形状在 alpha（Simple_Audio_Bars，TRANSPARENCY=REPLACE 为声明默认 1）：
@@ -2463,6 +2685,14 @@ export function createRenderer(canvas, opts = {}) {
     }
     lastFrameTimeStamp = time
     const cam = buildCamera(scene, width, height, fit, alignX, alignY)
+    // [we-scene patch] 本帧灯光（场景灯光对象的可见性/颜色/强度可能被脚本或用户
+    // 属性逐帧改：2890473419 的「光源3」强度挂音频响应脚本、三盏灯的颜色与开关
+    // 都是用户属性）。相机建好后按通道各算一次，供所有 LIGHTING 层的绘制使用：
+    // `l*` 灯（V1 通道）给 genericimage4 那代，`point` 灯（老通道）给 genericimage2。
+    sceneLights = {
+      v1: collectSceneLights(scene.layers, cam, 'v1'),
+      legacy: collectSceneLights(scene.layers, cam, 'legacy'),
+    }
     let viewProj = mat4Multiply(cam.projection, cam.view)
     ffbStamp++
     sceneCanvasW = width
@@ -3161,6 +3391,11 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   async function renderLayer(layer, textures, cam, viewProj, width, height, time) {
+    // [we-scene patch] 场景灯光对象（light: point/…）**不画自己**：它在 WE 里是
+    // 只照亮 LIGHTING 材质的光源，编辑器手柄只在编辑器出现。此前本仓按普通层
+    // 走绘制路径（solid 纯色、size=[0,0] 才恰好没露相），现在明确跳过，
+    // 免得作者把灯的 size/scale 调过之后突然多出一块纯色方块。
+    if (layer.isLight && !layer.image && !layer.isText && !layer.particle && !layer.isComponent) return
     // [we-scene patch] puppet 图层：几何由 MDL 网格提供，而非层 quad
     const isPuppet = !!(layer.puppet && puppetDrawFn)
     const texObj = !layer.solid && layer.textureName ? textures.get(layer.textureName) : null
@@ -3330,9 +3565,10 @@ export function createRenderer(canvas, opts = {}) {
     }
     const w = Math.max(1, Math.round(contentW))
     const h = Math.max(1, Math.round(contentH))
-    // [we-scene patch] 材质 LIGHTING combo 开启时乘场景环境光（官方
-    // genericimage*：ambient = g_LightAmbientColor * albedo，无直射灯时结果
-    // = albedo × min(1, ambientcolor×π)；口径与实测依据见 layerColorAmbient）。
+    // [we-scene patch] 材质 LIGHTING combo 开启时**不在 color4 里乘环境光**：
+    // 那一半由着色器负责（直射光路径 COPY_LIT_FRAG，或无灯时按官方
+    // ambient = max(0.001, g_LightAmbientColor) * albedo），避免乘两次。
+    // 口径与实测依据见 layerColorAmbient。
     // g_LightAmbientColor uniform 现已在 bindSystemUniforms 绑定（shader 自己
     // 乘 ambient），故 LIGHTING 层的 color4 给恒等、由 shader 单次应用，避免
     // 0.3 灰被 color4 与 shader 各乘一次（0.94²≈0.88 偏暗）；非 LIGHTING 层
@@ -3374,7 +3610,10 @@ export function createRenderer(canvas, opts = {}) {
       if (isPuppet) drawPuppetDirect(layer, cam, viewProj, width, height, time)
       else {
         compositeLayer(
-          copyProg, srcTex, color4, layer, cam, viewProj, width, height, false,
+          // [we-scene patch] LIGHTING 层走直射光变体（color4 里没有 ambient，
+          // 由着色器按官方公式把 ambient 与直射项一起算，见 COPY_LIT_FRAG）。
+          layer.lightingEnabled ? copyLitProg : copyProg,
+          srcTex, color4, layer, cam, viewProj, width, height, false,
           spriteFrameBasis(layer, texObj, time),
         )
       }
@@ -3432,7 +3671,19 @@ export function createRenderer(canvas, opts = {}) {
       uploadQuad('layer' + fboW + 'x' + fboH, layerQuad(fboW, fboH))
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, srcTex)
-      gl.uniform1i(copyUni.tex, 0)
+      // [we-scene patch] LIGHTING 层这一趟换成直射光着色器：贴图→层色这一步就是
+      // 官方 genericimage* 的 albedo 着色点（效果链跑在着色**之后**，与 WE 的
+      // 「材质先出图、效果再改图」一致）。本趟局部空间是 [0,fboW]×[0,fboH]，
+      // 而合成 quad 的局部空间是 [-0.5,0.5]²，两者的 UV 约定都等于 (x/w, y/h)，
+      // 故世界位置 = m · (x/w−0.5, y/h−0.5)——用 layerWorldModelMatrix（与合成
+      // 同一份矩阵）右乘这个归一化平移即可。
+      const baseProg = layer.lightingEnabled ? copyLitProg : copyProg
+      const baseUni = baseProg === copyLitProg ? copyLitUni : copyUni
+      gl.useProgram(baseProg)
+      if (baseProg === copyLitProg) {
+        bindLitUniforms(litBaseLocalToWorld(layerWorldModelMatrix(layer, cam), fboW, fboH), layer)
+      }
+      gl.uniform1i(baseUni.tex, 0)
       // [we-scene patch] 图层材质 shader（_layerMaterial，如 workshop tint）自己吃
       // g_TintColor / 纹理色；copy 若再乘 layer.color，作者把层色设成黑（3789604238
       // Dark Revamped 的 Simple Visualizer）会在进效果链前把贴图乘成全黑，音谱消失。
@@ -3440,15 +3691,15 @@ export function createRenderer(canvas, opts = {}) {
       const copyColor = effects.some((e) => e && e.layerMaterial)
         ? [1, 1, 1, color4[3]]
         : color4
-      gl.uniform4f(copyUni.color, copyColor[0], copyColor[1], copyColor[2], copyColor[3])
+      gl.uniform4f(baseUni.color, copyColor[0], copyColor[1], copyColor[2], copyColor[3])
       // 序列帧：只采样当前帧那一格（非序列帧层为整图直通）
-      setFrameBasis(copyUni, spriteFrameBasis(layer, texObj, time))
+      setFrameBasis(baseUni, spriteFrameBasis(layer, texObj, time))
       // 层 FBO 初始 copy 是纯直通：写进 FBO 的就是纹理原样，不做 Screen/Multiply
       // 预处理。那些只在最终合成到画布时才用，留在 compositeLayer 里设置。
-      if (copyUni.blendPrep !== null && copyUni.blendPrep !== undefined) {
-        gl.uniform1i(copyUni.blendPrep, 0)
+      if (baseUni.blendPrep !== null && baseUni.blendPrep !== undefined) {
+        gl.uniform1i(baseUni.blendPrep, 0)
       }
-      gl.uniformMatrix4fv(copyUni.mvp, false, layerOrtho)
+      gl.uniformMatrix4fv(baseUni.mvp, false, layerOrtho)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
     }
 

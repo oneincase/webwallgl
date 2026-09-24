@@ -424,6 +424,148 @@ void main() {
   fragColor = c;
 }`
 
+// [we-scene patch] 材质 LIGHTING combo 的**直射光**变体（官方 genericimage2/3/4 的
+// `#if LIGHTING` 段逐行转写）。为什么必须新开一条纹理→画布/画布 FBO 的着色路径，
+// 而不是像环境光那样在 JS 侧乘进 u_Color4：
+//   PBR 的 L 向量是**逐像素**的（`L = 灯位置 - worldPos`，worldPos 随片元变化），
+//   而灯是点光源、权重在几千像素的层上能差几倍 —— 整层乘同一个数会把「靠近灯的
+//   一侧被照亮」压成均匀染色（2890473419 的人物卡 1504×3000，三盏灯的 d 从
+//   ~700 到 ~1700）。
+// 口径（官方 shader 明文 + Waple 逆向互证，不要再自创公式）：
+//   - **两代灯走两条通道、两套衰减**（详见 renderer.js 的灯光通道注释与
+//     `lightModelForShader`）：`l*` 前缀的 V1 灯供 generic4/genericimage4，
+//     衰减 = `saturate(1−d/radius)^exponent`；不带前缀的 `point` 供
+//     genericimage2，CPU 预乘 `color×intensity×radius²` 后 `radiance = 色/d²`。
+//     `u_LightModel` 在两者间选路（0 = V1、1 = d²）。
+//   - 公共尾巴 `(diffuse·albedo/π + specular·specularTint) × radiance × max(dot(N,L),0)`
+//     照官方 common_pbr_2.h::ComputePBRLightShadow（镜面 GGX/Smith/Schlick 与
+//     common_pbr.h 逐字相同；roughness=0 时 NDF 恒 0，只剩漫反射，2890473419
+//     正是这个退化情形）。
+//   - 合成：CombineLighting(light, ambient)，HDR 场景多一段 >2 的过曝项。
+const COPY_LIT_VERT = `#version 300 es
+in vec3 a_Position;
+in vec2 a_TexCoord;
+uniform mat4 u_MVP;
+out vec2 v_UV;
+out vec3 v_Local;
+void main() {
+  gl_Position = u_MVP * vec4(a_Position, 1.0);
+  v_UV = a_TexCoord;
+  v_Local = a_Position;
+}`
+
+const COPY_LIT_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_UV;
+in vec3 v_Local;
+uniform sampler2D u_Tex;
+uniform vec4 u_Color4;
+uniform vec2 u_FrameOrigin;
+uniform vec2 u_FrameU;
+uniform vec2 u_FrameV;
+uniform int u_BlendPrep;
+uniform mat4 u_Model;          // 本趟局部空间 → 世界（与 u_LightPos 同空间）
+uniform int u_LightCount;
+uniform vec3 u_LightPos[4];
+uniform vec3 u_LightColor[4];  // 官方 V1 打包：color × intensity（不预乘 radius²）
+uniform float u_LightRadius[4];   // 官方 g_LPoint_Color[i].w
+uniform float u_LightExponent[4]; // 官方 g_LPoint_Origin[i].w（只有 V1 模型读它）
+uniform int u_LightModel;      // 0 = V1 falloff^exponent；1 = radius²/d²（见 lightRadiance）
+uniform vec3 u_LightAmbient;   // g_LightAmbientColor（ambientcolor×π 封顶 1）
+uniform float u_LightRoughness;
+uniform float u_LightMetallic;
+uniform int u_LightHdr;
+out vec4 fragColor;
+
+const float PI = 3.141592653589793;
+
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+  return f0 + (1.0 - f0) * pow(max(1.0 - cosTheta, 0.001), 5.0);
+}
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+  float rSqr = roughness * roughness;
+  float rSqr2 = rSqr * rSqr;
+  float NH = max(dot(N, H), 0.0);
+  float denom = NH * NH * (rSqr2 - 1.0) + 1.0;
+  return rSqr2 / (PI * denom * denom);
+}
+float schlickGGX(float NV, float roughness) {
+  float base = roughness + 1.0;
+  float scaled = (base * base) / 8.0;
+  return NV / (NV * (1.0 - scaled) + scaled);
+}
+float geoSmith(vec3 N, vec3 V, vec3 L, float roughness) {
+  return schlickGGX(max(dot(N, V), 0.001), roughness) * schlickGGX(max(dot(N, L), 0.001), roughness);
+}
+// 官方两代灯的辐照度（均为「已含 intensity、未除 d²」的口径，详见 renderer.js 的灯光通道注释）：
+//   模型 0 —— common_pbr_2.h::ComputePBRLightShadow（引擎生成的 PerformLighting_V1
+//     调它，供 generic4/genericimage4）：radiance = 色 × saturate(1−d/radius)^exponent。
+//     GLSL 分支的写法照抄官方（含 flt_min 与 step 门）：falloff 落到 0 时整项归零，
+//     否则 pow(falloff + 6.103515625e-5, exponent)。
+//   模型 1 —— common_pbr.h::ComputePBRLight 的 radiance = 色/d²，配 CPU 侧预乘
+//     color×intensity×radius²（genericimage2 的 g_LightsColorPremultiplied、
+//     genericimage3 的 g_LPoint_Color.rgb × .w × .w）。这里半径由着色器现乘，
+//     与官方 CPU 预乘是同一个数。
+vec3 lightRadiance(vec3 lightColor, float radius, float exponent, float distance, int model) {
+  if (model == 0) {
+    float falloff = clamp(1.0 - distance / max(radius, 0.0001), 0.0, 1.0);
+    float fltMin = 6.103515625e-5;
+    return lightColor * mix(0.0, pow(falloff + fltMin, exponent), step(0.0, falloff - fltMin));
+  }
+  return lightColor * (radius * radius) / max(distance * distance, 0.0001);
+}
+// 官方 common_pbr.h ComputePBRLight / common_pbr_2.h ComputePBRLightShadow 的公共尾巴：
+// (diffuse·albedo/π + specular·specularTint) × radiance × max(dot(N,L),0)。
+// specularTint 取 1：generic4 的调用点写死 CAST3(1.0)，genericimage4 传材质的
+// speculartint，而全库 LIGHTING 材质没有一个设过它（声明默认 1 1 1）。
+vec3 shadePBRLight(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 radiance, vec3 f0, float roughness, float metallic) {
+  float distance = length(L);
+  vec3 l = L / max(distance, 0.0001);
+  vec3 H = normalize(V + l);
+  float NDF = distributionGGX(N, H, roughness);
+  float G = geoSmith(N, V, l, roughness);
+  vec3 F = fresnelSchlick(max(dot(H, V), 0.0), f0);
+  vec3 numerator = NDF * G * F;
+  float NL = max(dot(N, l), 0.0);
+  vec3 specular = numerator / max(4.0 * max(dot(N, V), 0.0) * NL, 0.001);
+  vec3 diffuse = (1.0 - metallic) * (vec3(1.0) - F);
+  return (diffuse * albedo / PI + specular) * radiance * NL;
+}
+// 官方 CombineLighting：HDR 场景对 >2 的过曝部分额外加权
+vec3 combineLighting(vec3 light, vec3 ambient) {
+  if (u_LightHdr == 0) return ambient + light;
+  float len = length(light);
+  float overbright = (clamp(len - 2.0, 0.0, 1.0) * 0.5) / max(0.01, len);
+  return clamp(ambient + light, 0.0, 1.0) + light * overbright;
+}
+
+void main() {
+  vec2 uv = u_FrameOrigin + v_UV.x * u_FrameU + v_UV.y * u_FrameV;
+  // 官方顺序：albedo 先乘 g_Color4（版本 2 材质 = 层色×亮度），光照作用在它上面
+  vec4 c = texture(u_Tex, uv) * u_Color4;
+  vec3 albedo = c.rgb;
+  // NORMALMAP=0 分支：法线 = 局部 +Z 经模型矩阵变换（全库 4 个 LIGHTING pass 的
+  // NORMALMAP 都是 0，法线贴图分支不在本仓覆盖面内）
+  vec3 worldPos = (u_Model * vec4(v_Local, 1.0)).xyz;
+  vec3 N = normalize(mat3(u_Model) * vec3(0.0, 0.0, 1.0));
+  vec3 V = vec3(0.0, 0.0, 1.0); // 正交场景：官方注释「用真实视向量在正交下很难看」
+  float metallic = u_LightMetallic;
+  float roughness = u_LightRoughness;
+  vec3 f0 = mix(vec3(0.04), albedo, metallic);
+  vec3 light = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    if (i >= u_LightCount) break;
+    vec3 lv = u_LightPos[i] - worldPos;
+    vec3 radiance = lightRadiance(u_LightColor[i], u_LightRadius[i], u_LightExponent[i], length(lv), u_LightModel);
+    light += shadePBRLight(N, lv, V, albedo, radiance, f0, roughness, metallic);
+  }
+  vec3 ambient = max(vec3(0.001), u_LightAmbient) * albedo;
+  c.rgb = combineLighting(light, ambient);
+  if (u_BlendPrep == 1) c.rgb *= c.a;
+  else if (u_BlendPrep == 2) c.rgb = mix(vec3(1.0), c.rgb, c.a);
+  fragColor = c;
+}`
+
 const COMPOSITE_FRAG = `#version 300 es
 precision mediump float;
 in vec2 v_UV;
@@ -549,4 +691,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
