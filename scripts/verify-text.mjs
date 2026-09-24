@@ -186,6 +186,47 @@ function runLayout() {
       const grown = wtext.textCanvasMarginGrow(lShort, 2, 2, 4);
       if (grown <= 4) errors.push("短词超出小边距时 grow 必须 > 基础边距");
     }
+
+    // 13) 静态文字层溢出：预设值常比作者导出时的快照长，必须按墨水扩边，否则
+    //     画布右缘切字。3427522122 的城市名 "SÃO PAULO"（盒 150×113，pointsize 24
+    //     → em 96，实测宽 432）从盒中线 x=75 起排到 507，基础边距只有 200 → 画布
+    //     止于 550，屏幕上只剩 "SÃO P" + 半个 A（看着像 "SÃO PF"）。
+    //     注意基础边距本身**小于** em（textCanvasMargin 内部封顶 256），所以
+    //     「按字号估的边距」不可能覆盖长文本，扩边是唯一出路。
+    {
+      const em = 96;
+      const city = wtext.layoutText("SÃO PAULO", { boxW: 150, boxH: 113, pointsize: em, lineHeight: em * 1.25, halign: "left", valign: "center" }, (s) => s.length * 48);
+      const need = 150 / 2 + 9 * 48 - 150; // 盒中线 + 行宽 − 盒宽 = 357
+      eq(need, 357, "城市名墨水右溢应为 357（本判据的算术自查）");
+      const grow = wtext.textCanvasMarginGrow(city, 150, 113, 200);
+      if (grow < need) errors.push(`城市名 "SÃO PAULO" 扩边应覆盖墨水右溢 ${need}，实得 ${grow}`);
+      // 作者默认的 "TYO"（9 字缩到 3 字）在基础边距内：不扩边，原布局一字不动
+      const tyo = wtext.layoutText("TYO", { boxW: 150, boxH: 113, pointsize: em, lineHeight: em * 1.25, halign: "left", valign: "center" }, (s) => s.length * 48);
+      eq(wtext.textCanvasMarginGrow(tyo, 150, 113, 200), 200, "短城市名（TYO）应退回基础边距");
+    }
+  }
+  // 14) 接线：挂载期必须对**静态**文字层调用上面的扩边，且护栏齐全
+  //     （无脚本 / 无可见效果 / 无 tint 蒙版 / 锚点安全）。纯函数的算术对不代表
+  //     渲染路径用了它 —— 3427522122 的回归就是「函数在、没人调」。
+  {
+    const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const at = src.indexOf("let margin = Math.min(marginCap");
+    const block = at >= 0 ? src.slice(at, at + 4000) : "";
+    if (!block) errors.push("scene-mount 找不到文字挂载边距段（textCanvasMarginGrow 的调用点）");
+    const need = [
+      ["textCanvasMarginGrow(layout, item.boxW, item.boxH, margin)", "挂载期必须按墨水扩边"],
+      ["!item.sandbox", "扩边必须排除脚本层（脚本改 thisLayer.size，且命中区由脚本驱动）"],
+      ["hasVisibleEffects", "扩边必须排除有效果层（效果 UV 按盒归一）"],
+      ["textLayerHasTintMask", "扩边必须排除 tint 蒙版层"],
+      ["anchorSafe", "扩边必须排除方向锚点层（origin 在挂载期按原盒平移过）"],
+    ];
+    for (const [needle, why] of need) {
+      if (!src.includes(needle)) errors.push(`${why}（缺 ${needle}）`);
+    }
+    // limitwidth 的层由作者显式要求换行，扩边同样按排版结果的墨水算，不能改用盒子
+    if (!block.includes("limitwidth: !!layer.textLimitwidth")) {
+      errors.push("挂载期排版入参必须与逐帧路径同源（limitwidth/maxwidth 等）");
+    }
   }
   return errors;
 }

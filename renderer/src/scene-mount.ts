@@ -3359,9 +3359,66 @@ cfg, source, pkgAbort.signal);
             const em0 = TEXT_EM_SCALE * Math.max(1, layer.textPointsize);
             // tint 蒙版按原盒绘制：扩边一超过几像素，UV 就对不上字形（世界时钟粉条/缺色）。
             const marginCap = wtext.textLayerHasTintMask(layer) ? 8 : 256;
-            const margin = Math.min(marginCap, wtext.textCanvasMargin(em0, 0));
+            let margin = Math.min(marginCap, wtext.textCanvasMargin(em0, 0));
             item.boxW = layer.size[0] > 0 ? layer.size[0] : em0 * 4;
             item.boxH = layer.size[1] > 0 ? layer.size[1] : em0 * 1.6;
+            // [we-scene patch] 静态文字层按墨水扩边（挂载期算一次，与逐帧的媒体文字层
+            // 同一机制）：盒只是定位框，WE 不裁剪溢出文字，而我们的画布 = 盒 + 基础
+            // 边距，超出的墨水被纹理边缘切掉。预设壁纸最容易撞上——用户值常比作者导出
+            // 时的快照长：3427522122 的城市名 "SÃO PAULO" 96px 下宽 432，盒只有 150，
+            // 文字从盒中线（x=275）起排到 707、画布止于 550，屏幕上只剩 "SÃO P"+ 半个
+            // A（看着像 SÃO PF）。扩边对称（盒中心 = 画布中心 = 层 origin），墨水位置
+            // 不变；装得下时 textCanvasMarginGrow 退回基础边距，作者原布局一字不动。
+            // 只做**静态**层（内容不变 ⇒ 画布不抖），护栏与媒体层同源再加一条：
+            //   - 无脚本沙箱：脚本会改 thisLayer.size/text，且点击命中区由脚本驱动，
+            //     扩出的大片透明边距会变成无声的点击陷阱；
+            //   - 无可见效果：效果 UV 按盒归一，扩边让圆环/蒙版错位（3396722575 丝带）；
+            //   - 无 tint 蒙版：同上（3122339805 世界时钟粉条）；
+            //   - 锚点 none/center：方向锚点的 origin 在挂载期按原盒平移过，扩边会把盒挪走。
+            {
+              const anchorSafe =
+                !layer.textAnchor || layer.textAnchor === "center" || layer.textAnchor === "none";
+              const hasVisibleEffects = ((layer.effects as Array<{ visible?: boolean }>) || []).some(
+                (e) => e && e.visible !== false,
+              );
+              if (
+                textCtx &&
+                !item.sandbox &&
+                anchorSafe &&
+                !hasVisibleEffects &&
+                !wtext.textLayerHasTintMask(layer)
+              ) {
+                const pts = Math.max(1, layer.textPointsize);
+                const em = TEXT_EM_SCALE * pts;
+                const fontPath = layer.textFont || "";
+                const fam = fontPath ? fontFamilies.get(fontPath) || "sans-serif" : "sans-serif";
+                textCtx.setTransform(1, 0, 0, 1, 0, 0);
+                textCtx.font = `${em}px "${fam}", sans-serif`;
+                const met = textCtx.measureText("");
+                const fontH = (met.fontBoundingBoxAscent || 0) + (met.fontBoundingBoxDescent || 0);
+                const spacing = layer.textSpacing || [0, 0];
+                const layout = wtext.layoutText(
+                  String(layer.text ?? ""),
+                  {
+                    boxW: item.boxW,
+                    boxH: item.boxH,
+                    pointsize: em,
+                    lineHeight: (fontH > 0 ? fontH : em * 1.25) + spacing[1],
+                    spacing,
+                    padding: layer.textPadding || 0,
+                    maxwidth: layer.textMaxwidth || 0,
+                    limitwidth: !!layer.textLimitwidth,
+                    maxrows: layer.textMaxrows || 0,
+                    limitrows: !!layer.textLimitrows,
+                    limituseellipsis: !!layer.textLimituseellipsis,
+                    halign: layer.textHAlign,
+                    valign: layer.textVAlign,
+                  },
+                  (s: string) => textCtx!.measureText(s).width,
+                );
+                margin = Math.max(margin, wtext.textCanvasMarginGrow(layout, item.boxW, item.boxH, margin));
+              }
+            }
             item.margin = margin;
             layer.size = [item.boxW + margin * 2, item.boxH + margin * 2];
             item.entry = {
