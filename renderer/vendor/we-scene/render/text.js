@@ -618,6 +618,48 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     // origin 需支持 add/subtract 链式向量运算（歌曲标题脚本等 2 处用到）
     origin: makeVec3(opts.origin || [0, 0, 0]),
   }
+  // [we-scene patch] text/pointsize/font 三字段在宿主给了 opts.layer 时**写穿到
+  // 真图层**（2938612768 时钟缩字）：pointsize 等字段脚本走对象沙箱代理，写的是
+  // layer.textPointsize；而绘制 key 读的是本沙箱快照 —— 两边不同源，缩字脚本
+  // （shared.a 展开时 30→21）永远画不上去，时钟保持 30 号宽出 535px 间隙、压上
+  // 署名。写穿后两条通道同源，媒体回调（mediaPropertiesChanged 改 pointsize/font，
+  // 见文件头第 22 行注释）也落到真图层，与 WE 单一图层属性语义一致。
+  // 离线 verifier 不传 layer，保持原快照行为。
+  if (opts.layer && typeof opts.layer === 'object') {
+    const L = opts.layer
+    const snap = { text: thisLayer.text, pointsize: thisLayer.pointsize, font: thisLayer.font }
+    Object.defineProperty(thisLayer, 'text', {
+      get: () => (L.text !== undefined && L.text !== null ? String(L.text) : snap.text),
+      set: (v) => {
+        if (typeof v === 'boolean') return // 与对象代理同款：bool 不是文本
+        const s = v == null ? '' : String(v)
+        L.text = s
+        snap.text = s
+      },
+      enumerable: true,
+      configurable: true,
+    })
+    Object.defineProperty(thisLayer, 'pointsize', {
+      get: () => Number(L.textPointsize) || snap.pointsize,
+      set: (v) => {
+        const n = Number(v) || 24
+        L.textPointsize = n
+        snap.pointsize = n
+      },
+      enumerable: true,
+      configurable: true,
+    })
+    Object.defineProperty(thisLayer, 'font', {
+      get: () => (L.textFont ? String(L.textFont) : snap.font),
+      set: (v) => {
+        const s = String(v || '')
+        L.textFont = s
+        snap.font = s
+      },
+      enumerable: true,
+      configurable: true,
+    })
+  }
   const engine = {
     // [we-scene patch] registerAsset 必须把路径**原样返回**：脚本拿到的返回值
     // 会直接喂给 thisScene.createLayer（1712475860 的金币 coinget）。

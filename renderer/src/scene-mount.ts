@@ -3315,6 +3315,9 @@ cfg, source, pkgAbort.signal);
             };
             if (layer.textScript) {
               item.sandbox = wtext.evalTextScript(layer.textScript, layer.textScriptProps, {
+                // [we-scene patch] layer：text/pointsize/font 写穿到真图层
+                //（与对象字段脚本同源，见 text.js evalTextScript 写穿段）
+                layer,
                 text: layer.text ?? "",
                 font: layer.textFont || "",
                 pointsize: layer.textPointsize,
