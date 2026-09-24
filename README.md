@@ -4,7 +4,7 @@
 
 ## 简介
 
-让 Wallpaper Engine 实现再次伟大！！！恭喜你发现宝藏，这是全网复刻程度最高，功能最强，更新最快的 Wallpaper Engine 自研核心库，纯 TypeScript/JS 实现。webwallgl 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。下游如果进行了库的引用，麻烦给个 star，非常感谢！
+让 Wallpaper Engine 实现再次伟大！！！恭喜你发现宝藏，这是全网复刻程度最高，功能最强，更新最快的 Wallpaper Engine 自研核心库，纯 TypeScript/JS 实现。webwallgl 是一个浏览器端的 Wallpaper Engine「scene」场景、视频、web 网页壁纸渲染库：主要功能是把创意工坊场景包（scene.pkg）在 WebGL 里实时还原，支持图层效果链、粒子、3D 木偶骨骼、文字挂件、脚本沙箱、场景灯光（PBR 直射光）与 HDR 色调映射、音频响应与用户自定义属性热更新；网页类型壁纸经 sandbox iframe + 加载前 WE shim 注入运行。后续版本将加入本库独有效果支持，请敬请期待。下游如果进行了库的引用，麻烦给个 star，非常感谢！
 
 - [GitHub 开源仓库](https://github.com/oneincase/webwallgl)
 - [在线版（GitHub Pages）](https://oneincase.github.io/webwallgl/)
@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.4.1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.4.1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -92,7 +92,7 @@ console.log(wp.canvas);
 
 - 类型不用你判断：mount() 先取 project.json，type 为 "web" 走网页路径，其余一律走场景装配
 - 网页入口 URL 的解析顺序是 Source.webEntry() → {httpSource 基址}/{project.file 或 index.html}；两者都给不出就抛错
-- 网页路径下 fit / renderDpr / features 这些 WebGL 侧选项自然不适用；pause/resume、setVolume、setProperties 仍然有效（经 shim 转达给作者代码）
+- 网页路径下 fit / renderDpr / features 这些 WebGL 侧选项自然不适用；pause/resume、setVolume、setProperties 仍然有效（同源经 shim 直访转达给作者代码；跨源或 webSandbox: "strict" 时自动改走 postMessage 控制通道，指针/滚轮/音频/媒体同此）
 
 ## 资源来源 Source
 
@@ -127,8 +127,9 @@ input.addEventListener("change", () => {
 | `volume` | `0` | 0..1。默认静音起步（浏览器自动播放策略）；就绪后再设非零音量 |
 | `autoplay` | `true` | false 时挂载后保持暂停 |
 | `properties` | `{}` | 初始用户属性覆盖值（键为属性名） |
-| `pointer / audio / media` | `内置` | 指针跟随 canvas、音频/系统媒体为确定性模拟；传 null 禁用 |
+| `pointer / audio / media` | `内置` | 指针跟随 canvas；音频/系统媒体无注入时为占位源（频谱恒静默、「无媒体」快照，壁纸显示作者烘焙的占位外观）；传 null 禁用 |
 | `features` | `全开` | 调试开关：models / text / particles / effects / components |
+| `webSandbox` | `"legacy"` | 网页壁纸 iframe 沙箱档：legacy = allow-scripts + allow-same-origin（默认，与 WallpaperEM 一致）；strict = 只给 allow-scripts（宿主与壁纸共享 origin 时，防作者脚本以宿主身份调用宿主 API）。strict 下控制/指针/滚轮/音频/媒体自动改走 postMessage 通道，API 面完全一致 |
 | `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
 
@@ -150,7 +151,7 @@ input.addEventListener("change", () => {
 | `setQuality(patch) / getQuality()` | 质量档位热更（部分更新），就地生效不重挂载；换场景/load() 后保持 |
 | `setProperties(props)` | 属性热更新：就地改属性表/效果常量/脚本沙箱，不重新拉包 |
 | `getProperties()` | 当前生效的扁平化属性值表 |
-| `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置模拟。换场景不清空。scene 与 web 都生效 |
+| `setAudio(src)` | 换音频频谱源（拉模式，每帧一次）；null 回落内置静默占位。换场景不清空。scene 与 web 都生效 |
 | `setMedia(src)` | 换系统媒体源（Now Playing）；scene 与 web 共用同一实例，换场景不清空 |
 | `media` | 媒体控制面：读 snapshot，以及 skipNext / skipPrevious / play / pause / playPause 反向控制 |
 | `pushPointer(u, v, buttons?, mods?)` | 外部指针注入（u/v 为 0..1 归一化；mods 为 ctrl/shift/alt/meta 掩码）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
@@ -246,7 +247,7 @@ media.set({ title: "下一首", position: 0 });
 
 // 也可以挂载后再装／换／撤
 wp.setMedia(media);
-wp.setMedia(null);        // 回落内置模拟源
+wp.setMedia(null);        // 回落「无媒体」占位
 
 // 宿主侧也能读快照与发控制指令
 console.log(wp.media.snapshot.title);
@@ -279,14 +280,14 @@ wp.setAudio({ snapshot: () => latest });
 // 例：订阅宿主的频谱推送后更新 latest
 evtSource.onmessage = (e) => { latest = JSON.parse(e.data); };
 
-wp.setAudio(null);             // 撤源，回落内置模拟
+wp.setAudio(null);             // 撤源，回落静默占位
 ```
 
 - 指针注入与 canvas 自身的 DOM 监听并存，谁后写谁赢；scene 与 web 壁纸都生效，媒体壁纸没有指针概念，调用静默无效
 - pushWheel 只对网页壁纸生效：场景壁纸没有滚轮 API（实测 194 张场景壁纸零消费）。网页侧会同时合成现代 wheel 与旧式 mousewheel——语料里唯一真正用滚轮的 360° 全景（3406740580）只听旧式，而 three.js OrbitControls 只听现代；不发 DOMMouseScroll，否则同一滚动会被处理两遍
 - Mac 触摸板：双指滚动直接喂像素级 delta（mode=0）；双指捏合按浏览器约定映射成 ctrl+滚轮（mods bit0），OrbitControls / pano2vr 都靠它区分缩放与滚动
 - 音频契约：left/right 各 64 段、值域 0..1。段数不足补零、超出截断；32/16 段降采样与响度、静音判定由库派生
-- snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置模拟源——宿主采集还没就绪时不必特殊处理
+- snapshot() 返回 null（或抛错）表示本帧无数据，引擎自动回落内置静默占位——宿主采集还没就绪时不必特殊处理
 - setAudio 换场景不清空：装一次对之后 load() 的所有场景都生效
 - 音频注入对 scene 与 web 壁纸都生效：网页侧经 iframe shim 的音频泵收到同一份数据；两个泵都逐帧选源，所以 mount() 之后再 setAudio 同样有效
 
@@ -332,12 +333,12 @@ b.pause(); // 不影响 a
 - Failed to fetch 且无状态码：自定义协议/WKWebView 对缺失路径的行为，属正常容错路径，看最后一条错误即可
 - stats.fps 为 0 但画面在动：读数是「真正提交渲染」的帧，标签页被遮挡时浏览器会暂停 rAF，属预期
 - 有声音但延迟起播：自动播放策略要求用户交互后才允许出声，volume 默认 0 正是为此
-- 网页壁纸无音频/属性：入口 HTML 必须同源或 CORS 可读，库才能改写注入 WE shim；跨域不可读时会退回裸 iframe（无官方 API）
+- 网页壁纸无音频/属性：入口 HTML 必须同源或 CORS 可读，库才能改写注入 WE shim；跨域不可读时会退回裸 iframe（无官方 API）。webSandbox: "strict" 不属此列：shim 照常注入、API 齐全，只是控制/音频/媒体走 postMessage 通道
 - 网页壁纸相对资源 404：依赖 &lt;base href> 指回原站点目录；依赖 location.href 拼路径的壁纸在 blob 加载下可能异常
 
 ## 版本更新说明
 
-当前版本 1.4.1。这里不再维护逐版本列表：每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。
+当前版本 1.4.2。这里不再维护逐版本列表：每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。
 
 ## 版权与合规
 

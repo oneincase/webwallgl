@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Make Wallpaper Engine great again!!! Congratulations — you've found a treasure. This is the most faithful, most feature-complete, and fastest-updated self-built Wallpaper Engine core on the web, implemented in pure TypeScript/JS. WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned. If your project uses this library, please give it a star — many thanks!
+Make Wallpaper Engine great again!!! Congratulations — you've found a treasure. This is the most faithful, most feature-complete, and fastest-updated self-built Wallpaper Engine core on the web, implemented in pure TypeScript/JS. WebWallGL is a browser-side renderer for Wallpaper Engine wallpapers — scene, video, and web: its main job is replaying workshop scene packages (scene.pkg) in WebGL in real time, with layer effect chains, particles, 3D puppet bones, text widgets, script sandboxes, scene lighting (PBR direct light) with HDR tone mapping, audio response and live user-property updates; web wallpapers run in a sandboxed iframe with a WE API shim injected before author scripts. Upcoming versions will add effects exclusive to this library — stay tuned. If your project uses this library, please give it a star — many thanks!
 
 - [GitHub repository](https://github.com/oneincase/webwallgl)
 - [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)
@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.4.1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.4.1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -93,7 +93,7 @@ console.log(wp.canvas);
 
 - You never branch on type yourself: mount() reads project.json first — type "web" takes the web path, everything else goes through scene assembly
 - The web entry URL resolves as Source.webEntry() → {httpSource base}/{project.file or index.html}; if neither yields a URL, mount throws
-- On the web path the WebGL-side options (fit / renderDpr / features) do not apply; pause/resume, setVolume and setProperties still work, relayed to author code through the shim
+- On the web path the WebGL-side options (fit / renderDpr / features) do not apply; pause/resume, setVolume and setProperties still work — relayed to author code through the shim on same-origin access, and automatically over the postMessage control channel when cross-origin or under webSandbox: "strict" (pointer/wheel/audio/media travel the same way)
 
 ## Loading scenes: Source
 
@@ -128,8 +128,9 @@ input.addEventListener("change", () => {
 | `volume` | `0` | 0..1. Starts muted (autoplay policy); set a non-zero volume after ready |
 | `autoplay` | `true` | When false, stays paused after mount |
 | `properties` | `{}` | Initial user property overrides (keys are property names) |
-| `pointer / audio / media` | `built-in` | Pointer follows the canvas; audio/media are deterministic sims; pass null to disable |
+| `pointer / audio / media` | `built-in` | Pointer follows the canvas; with nothing injected, audio/media run placeholder sources (silent spectrum, a "no media" snapshot — the wallpaper shows its author-baked placeholder look); pass null to disable |
 | `features` | `all on` | Debug switches: models / text / particles / effects / components |
+| `webSandbox` | `"legacy"` | Web wallpaper iframe sandbox tier: legacy = allow-scripts + allow-same-origin (default, WallpaperEM behavior); strict = allow-scripts only (when the host shares its origin with the wallpaper, so author scripts cannot act as the host). Under strict, control/pointer/wheel/audio/media automatically travel over a postMessage channel — the API surface is identical |
 | `quality` | `all defaults` | Render quality tiers (like the WE client's performance options): antiAliasing "off" (default)/"fxaa"/"msaa2"/"msaa4", particles "high" (default)/"medium"/"low"/"off" (low/medium scale both the count cap and emission rate), postProcessing "high" (default)/"medium"/"low"/"off" (low/medium cap effect-chain FBO resolution; off bypasses effect chains, fullscreen post layers and Bloom). Supersampling lives in renderDpr |
 | `onReady / onError / onDiagnostic` | `—` | Callback surface; can also subscribe later via instance.on() |
 
@@ -151,7 +152,7 @@ VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and bot
 | `setQuality(patch) / getQuality()` | Live quality-tier patch (partial update), applied in place with no remount; survives scene/load() changes |
 | `setProperties(props)` | Live property updates: patches the property table / effect constants / script sandboxes in place, no re-fetch |
 | `getProperties()` | The current flattened property value map |
-| `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in sim. Survives scene changes. Works for scene and web |
+| `setAudio(src)` | Swap the audio spectrum source (pull model, once per frame); null falls back to the built-in silent placeholder. Survives scene changes. Works for scene and web |
 | `setMedia(src)` | Swap the system media source (Now Playing); shared by scene and web, survives scene changes |
 | `media` | Media control surface: read snapshot, plus skipNext / skipPrevious / play / pause / playPause transport control |
 | `pushPointer(u, v, buttons?, mods?)` | Inject pointer state (u/v normalized 0..1; mods is a ctrl/shift/alt/meta mask). For hosts whose window cannot receive the mouse; works for scene and web |
@@ -247,7 +248,7 @@ media.set({ title: "Next Track", position: 0 });
 
 // You can also install / swap / remove it after mounting
 wp.setMedia(media);
-wp.setMedia(null);        // fall back to the built-in simulation
+wp.setMedia(null);        // fall back to the "no media" placeholder
 
 // The host can read the snapshot and issue transport commands too
 console.log(wp.media.snapshot.title);
@@ -280,14 +281,14 @@ wp.setAudio({ snapshot: () => latest });
 // e.g. update `latest` from the host's spectrum stream
 evtSource.onmessage = (e) => { latest = JSON.parse(e.data); };
 
-wp.setAudio(null);             // remove the source, fall back to the built-in sim
+wp.setAudio(null);             // remove the source; audio falls silent
 ```
 
 - Injected pointer state coexists with the canvas's own DOM listeners — last writer wins. It works for scene and web wallpapers; media wallpapers have no pointer concept, so the call is silently inert
 - pushWheel only affects web wallpapers: scenes have no wheel API (zero consumers across 194 scene wallpapers tested). The web side synthesizes both the modern wheel and the legacy mousewheel — the only wallpaper that genuinely uses the wheel (a 360° panorama, 3406740580) listens solely to the legacy event, while three.js OrbitControls listens solely to the modern one. DOMMouseScroll is deliberately not dispatched, or the same scroll would be processed twice
 - macOS trackpad: feed two-finger scrolls as pixel deltas (mode=0); map a two-finger pinch to ctrl+wheel (mods bit0), exactly as browsers do — OrbitControls / pano2vr rely on that bit to tell zoom from scroll
 - Audio contract: 64 bands per channel, values 0..1. Short arrays are zero-padded and long ones truncated; the 32/16-band downsamples plus level and silence detection are derived by the library
-- Returning null (or throwing) from snapshot() means "no data this frame" and the engine falls back to the built-in simulation — no special handling needed while host capture is still warming up
+- Returning null (or throwing) from snapshot() means "no data this frame" and the engine falls back to the built-in silent placeholder — no special handling needed while host capture is still warming up
 - setAudio survives scene changes: install it once and it applies to every scene loaded afterwards
 - Audio injection works for both scene and web wallpapers: the web side receives the same data through the iframe shim audio pump, and both pumps pick their source per frame so calling setAudio after mount() works too
 
@@ -333,12 +334,12 @@ b.pause(); // does not affect a
 - Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error
 - stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected
 - Audio starts late: autoplay policy requires user interaction before sound; that's why volume defaults to 0
-- Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs)
+- Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs). webSandbox: "strict" is not this case — the shim is injected and the full API works (control/audio/media travel over postMessage)
 - Web wallpaper relative assets 404: resources rely on &lt;base href> pointing at the original directory; wallpapers that build URLs from location.href may break under blob loading
 
 ## Changelog
 
-Current version: 1.4.1. Per-version lists are no longer maintained here: every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
+Current version: 1.4.2. Per-version lists are no longer maintained here: every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
 
 ## Copyright & compliance
 
