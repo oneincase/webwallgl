@@ -1915,6 +1915,21 @@ console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
     if (d2.up.length !== 2 || d2.click.length !== 1 || d2.click[0] !== A) {
       fail(`拖到层外松手：up 应给按下集两层、click 只给仍在层内的 A（实得 up=${d2.up.length} click=${d2.click.length}）`)
     } else ok('拖到层外松手：up 发给按下集全部，click 只给仍命中的层')
+    // [we-scene patch] 按住期间拖出命中区：**move 仍要发给按下集**（捕获语义）。
+    // 拖拽脚本靠连续 move 更新位置；只发命中层会让拖动在移出图层边界的第一帧
+    // 冻住（3444812600「双击时间可自由拖动」：命中框 ~116×47 屏幕像素）。
+    {
+      const m1 = planCursorDispatch({ hovered: [A], pressed: [], lastLeftDown: false }, [A], true)
+      const m2 = planCursorDispatch(m1.next, [], true) // 拖出边界，仍按住
+      const hasA = m2.move.indexOf(A) >= 0
+      const m3 = planCursorDispatch(m2.next, [], false) // 松手后不再补发
+      const movedAfterUp = m3.move.length
+      if (!hasA) {
+        fail('按住拖出层外：move 应仍发给按下集（捕获语义）—— 缺失则拖拽移出边界即冻住')
+      } else if (movedAfterUp !== 0) {
+        fail(`松手后 move 不该再发给未命中层（实得 ${movedAfterUp}）`)
+      } else ok('按住拖出层外：move 按捕获语义继续发给按下集，松手即停')
+    }
     // 空命中集不该产生任何事件（且不能因为 undefined 崩）
     const e0 = planCursorDispatch(st2, [], false)
     if (e0.click.length || e0.down.length || e0.up.length || e0.enter.length) {

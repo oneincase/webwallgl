@@ -25,7 +25,6 @@
 // 21 张壁纸也没有一处用到。放在这里是为了给宿主/自制壁纸提供统一数据源，
 // 通过 mediaLyricsChanged 派发，不与 WE 的四类语义混淆。
 
-import { MEDIA_LOGO_DATA_URL } from './media-logo.js'
 
 export const MEDIA_PLAYBACK = { STOPPED: 0, PLAYING: 1, PAUSED: 2 }
 
@@ -54,214 +53,40 @@ class MediaVec3 {
 
 export function mediaVec3(x, y, z) { return new MediaVec3(x, y, z) }
 
-// [we-scene patch] 模拟播放列表 = 库自己的品牌曲：曲名一律 WebWallGL、歌手一律
-// oneincase、封面一律本库 logo（media-logo.js 的 data URL），专辑名区分四首
-// （Scene / Web / Video / Live，正好对应库支持的壁纸类型，切歌时肉眼仍能确认
-// 轮换链路是通的）。配色取 logo 的橙日 / 深蓝夜空 / 钢蓝山脉，四首一致 ——
-// 与场景侧从封面位图重采样得到的调色板保持同色。
-// 此前是四首虚构乐队歌（夜航星/Amber Lantern/苔痕/Neon Ashes）+ 程序化渐变封面，
-// 用户明确要求换成库品牌；时长仍取真实歌曲量级（3~4 分钟）。
-const LOGO_COLORS = {
-  primary: [0.96, 0.65, 0.14],   // 橙日
-  secondary: [0.08, 0.11, 0.18], // 深蓝夜空
-  tertiary: [0.66, 0.74, 0.88],  // 钢蓝山脉
-  text: [0.96, 0.97, 1.0],
+// [we-scene patch] 无系统媒体时的中性驱动（hasMedia 恒 false）。
+// 不再伪造品牌曲目/封面/歌词：媒体回调以「无媒体」派发，$mediaThumbnail
+// 保留名不被占用 —— shader 与脚本因此显示作者烘焙进壁纸的占位设计。
+const NEUTRAL_MEDIA = {
+  hasMedia: false,
+  state: MEDIA_PLAYBACK.STOPPED,
+  title: '', artist: '', album: '', albumArtist: '',
+  position: 0, duration: 0,
+  hasThumbnail: false,
+  thumbnail: '',
+  primaryColor: new MediaVec3(0, 0, 0),
+  secondaryColor: new MediaVec3(0, 0, 0),
+  tertiaryColor: new MediaVec3(0, 0, 0),
+  textColor: new MediaVec3(1, 1, 1),
+  highContrastColor: new MediaVec3(1, 1, 1),
+  trackIndex: -1,
+  lyrics: [],
+  lyricLine: '',
+  lyricIndex: -1,
 }
-const PLAYLIST = [
-  {
-    title: 'WebWallGL', artist: 'oneincase', album: 'Scene', albumArtist: 'oneincase',
-    duration: 212,
-    colors: LOGO_COLORS,
-    thumbnail: MEDIA_LOGO_DATA_URL,
-    lyrics: [
-      [0, '场景一层层亮起'], [12, '骨骼与粒子各就各位'], [26, '脚本在沙箱里苏醒'],
-      [41, '把每一帧交给时间'], [58, 'WebWallGL'], [72, '场景正在呼吸'],
-      [95, '（间奏）'], [126, '图层排成星轨'], [140, '效果链一寸寸点亮'],
-      [158, '我们不渲染黑暗'], [176, '只渲染光'], [198, '……'],
-    ],
-  },
-  {
-    title: 'WebWallGL', artist: 'oneincase', album: 'Web', albumArtist: 'oneincase',
-    duration: 187,
-    colors: LOGO_COLORS,
-    thumbnail: MEDIA_LOGO_DATA_URL,
-    lyrics: [
-      [0, 'iframe 里有一座城'], [14, 'shim 为它点亮路灯'], [30, '指针翻过山脊'],
-      [46, '事件按时到达'], [63, 'WebWallGL，网页正在播放'],
-      [88, '(instrumental)'], [118, '每一帧都是同源'], [134, '每一次点击都有回声'],
-      [152, '网页正在播放'], [170, '不停歇'],
-    ],
-  },
-  {
-    title: 'WebWallGL', artist: 'oneincase', album: 'Video', albumArtist: 'oneincase',
-    duration: 241,
-    colors: LOGO_COLORS,
-    thumbnail: MEDIA_LOGO_DATA_URL,
-    lyrics: [
-      [0, '解码器推开第一帧'], [16, '循环点没有缝隙'], [33, '帧率贴着心跳走'],
-      [52, '画面不旧'], [70, '时间一直新'], [92, '（间奏）'],
-      [130, '把像素交给硬件'], [148, '把流畅留给眼睛'], [172, '一圈一圈'], [200, '都是第一圈'], [226, '……'],
-    ],
-  },
-  {
-    title: 'WebWallGL', artist: 'oneincase', album: 'Live', albumArtist: 'oneincase',
-    duration: 168,
-    colors: LOGO_COLORS,
-    thumbnail: MEDIA_LOGO_DATA_URL,
-    lyrics: [
-      [0, '麦克风听见房间'], [11, '频谱开出六十四个窗口'], [24, '正在播放的歌'],
-      [38, '有名字也有封面'], [55, 'WebWallGL 实况'], [76, '(drop)'],
-      [104, '系统在说它在听'], [122, '壁纸在跟着唱'], [146, '…'],
-    ],
-  },
-]
-
-const GAP = 3 // 曲间空隙（秒）：这段 state=STOPPED，用于验证「停止态」分支
 
 /**
- * 创建模拟媒体源。
- * @param {number} seed 保留参数，与 createSimulatedAudio 对齐（当前播放列表是固定的）
- *
- * 默认仍是**纯时间函数**（seekOffset=0、未暂停）：同 t 同结果，verify-media
- * 的周期/三态/歌词断言不用改。切歌 / 暂停是叠在时间轴上的控制面，接真实
- * 系统媒体时只需换成另一套 provider，快照字段与 skipNext/playPause 名字不变。
+ * 无媒体回落驱动。保留 createSimulatedMedia 名字（调用点/类型不变），
+ * 但返回恒定的「无媒体」快照：没有真实 Now Playing 时壁纸显示自带占位。
  */
 export function createSimulatedMedia(seed = 20260901) {
-  const tracks = PLAYLIST
-  const cycle = tracks.reduce((s, t) => s + t.duration + GAP, 0)
-
-  const snapshot = {
-    hasMedia: false,
-    state: MEDIA_PLAYBACK.STOPPED,
-    title: '', artist: '', album: '', albumArtist: '',
-    position: 0, duration: 0,
-    hasThumbnail: false,
-    /** 当前曲封面（data URL）。网页壁纸的 mediaThumbnailChanged 直接透传；
-     * 场景壁纸由宿主解码上传成 $mediaThumbnail 纹理（1.3.7 通道） */
-    thumbnail: '',
-    // 颜色恒为 Vec3 实例（见文件头的类型约定）
-    primaryColor: new MediaVec3(0, 0, 0),
-    secondaryColor: new MediaVec3(0, 0, 0),
-    tertiaryColor: new MediaVec3(0, 0, 0),
-    textColor: new MediaVec3(1, 1, 1),
-    highContrastColor: new MediaVec3(1, 1, 1),
-    trackIndex: -1,
-    // 自定义扩展：歌词
-    lyrics: [],
-    lyricLine: '',
-    lyricIndex: -1,
-  }
-
-  let seekOffset = 0
-  let held = false
-  let holdT = 0
-  let lastWall = 0
-
-  function trackStart(i) {
-    let t = 0
-    const n = ((i % tracks.length) + tracks.length) % tracks.length
-    for (let k = 0; k < n; k++) t += tracks[k].duration + GAP
-    return t
-  }
-
-  function applyAt(time) {
-    let x = cycle > 0 ? time % cycle : 0
-    if (x < 0) x += cycle
-    let idx = -1
-    let pos = 0
-    let inGap = false
-    for (let i = 0; i < tracks.length; i++) {
-      const d = tracks[i].duration
-      if (x < d) { idx = i; pos = x; break }
-      x -= d
-      if (x < GAP) { idx = i; pos = d; inGap = true; break }
-      x -= GAP
-    }
-    if (idx < 0) { idx = tracks.length - 1; pos = tracks[idx].duration; inGap = true }
-    const tr = tracks[idx]
-
-    snapshot.hasMedia = true
-    snapshot.trackIndex = idx
-    snapshot.title = tr.title
-    snapshot.artist = tr.artist
-    snapshot.album = tr.album
-    snapshot.albumArtist = tr.albumArtist
-    snapshot.duration = tr.duration
-    snapshot.position = pos
-    // 曲间空隙 = 停止；每首曲子的 70%~76% 处模拟一次短暂暂停，用来验证
-    // PAUSED 分支（唱针抬起、碟盘停转这类效果只在这个状态下能看出来）
-    const frac = tr.duration > 0 ? pos / tr.duration : 0
-    if (held) snapshot.state = MEDIA_PLAYBACK.PAUSED
-    else if (inGap) snapshot.state = MEDIA_PLAYBACK.STOPPED
-    else if (frac > 0.70 && frac < 0.76) snapshot.state = MEDIA_PLAYBACK.PAUSED
-    else snapshot.state = MEDIA_PLAYBACK.PLAYING
-
-    snapshot.hasThumbnail = !inGap
-    // 曲间空隙没有封面（与 hasThumbnail 同步）；有曲时给当前曲封面（本库 logo）
-    snapshot.thumbnail = inGap ? '' : (tr.thumbnail || '')
-    const c = tr.colors
-    snapshot.primaryColor = new MediaVec3(c.primary[0], c.primary[1], c.primary[2])
-    snapshot.secondaryColor = new MediaVec3(c.secondary[0], c.secondary[1], c.secondary[2])
-    snapshot.tertiaryColor = new MediaVec3(c.tertiary[0], c.tertiary[1], c.tertiary[2])
-    snapshot.textColor = new MediaVec3(c.text[0], c.text[1], c.text[2])
-    // 高对比色：按亮度取黑或白，供描边/阴影用
-    const lum = 0.2126 * c.primary[0] + 0.7152 * c.primary[1] + 0.0722 * c.primary[2]
-    snapshot.highContrastColor = lum > 0.5 ? new MediaVec3(0, 0, 0) : new MediaVec3(1, 1, 1)
-
-    snapshot.lyrics = tr.lyrics
-    let li = -1
-    for (let i = 0; i < tr.lyrics.length; i++) if (pos >= tr.lyrics[i][0]) li = i
-    snapshot.lyricIndex = li
-    snapshot.lyricLine = li >= 0 ? tr.lyrics[li][1] : ''
-    return snapshot
-  }
-
-  /** 把墙钟 t 折进播放列表。暂停时钉在 holdT，不往前走。 */
-  function update(t) {
-    lastWall = Number(t) || 0
-    const time = held ? holdT : lastWall + seekOffset
-    return applyAt(time)
-  }
-
-  function skipToTrack(i) {
-    held = false
-    const start = trackStart(i)
-    seekOffset = start - lastWall
-    return applyAt(start)
-  }
-
-  function skipNext() {
-    const i = snapshot.trackIndex < 0 ? 0 : snapshot.trackIndex + 1
-    return skipToTrack(i)
-  }
-
-  function skipPrevious() {
-    const i = snapshot.trackIndex < 0 ? tracks.length - 1 : snapshot.trackIndex - 1
-    return skipToTrack(i)
-  }
-
-  function pause() {
-    if (held) return snapshot
-    holdT = lastWall + seekOffset
-    held = true
-    snapshot.state = MEDIA_PLAYBACK.PAUSED
-    return snapshot
-  }
-
-  function play() {
-    if (!held) return snapshot
-    held = false
-    seekOffset = holdT - lastWall
-    return applyAt(holdT)
-  }
-
-  function playPause() {
-    return held ? play() : pause()
-  }
-
   return {
-    update, snapshot, tracks, cycle, MEDIA_PLAYBACK,
-    skipNext, skipPrevious, play, pause, playPause,
+    snapshot: NEUTRAL_MEDIA,
+    tracks: [],
+    cycle: 0,
+    MEDIA_PLAYBACK,
+    update(_t) { return NEUTRAL_MEDIA },
+    skipNext() {}, skipPrevious() {},
+    play() {}, pause() {}, playPause() {},
   }
 }
 

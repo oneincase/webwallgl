@@ -2513,7 +2513,10 @@ export function resizeScreen(size) { c = [engine.canvasSize.x, engine.canvasSize
       errors.push("resizeScreen 改动了 engine.canvasSize（设计尺寸必须保持 4096×2296）");
   }
 
-  // ---- 4) 三振熔断：resize 抛错 3 次后 disabled ----
+  // ---- 4) 三振熔断：**按入口独立**（resize 抛错 3 次只熔断 resize）----
+  // [we-scene patch] update 每帧抛错（WE 非严格模式下是静默 no-op 的写法）不该
+  // 连带熔断 cursor*/resize 等入口，故熔断标记从 `disabled` 改为按入口的
+  // `entryDisabled.<entry>`（`disabled` 仅由 update 熔断置位，供外部逐帧门控）。
   {
     // 带 update：避免依赖「纯 resize 脚本被闸门保留」（那个性质由第 1 组测），
     // 这里只测熔断本身。
@@ -2527,9 +2530,12 @@ export function resizeScreen() { throw new Error('boom'); }`,
       errors.push("resizeScreen：熔断用例沙箱创建失败");
     } else {
       sb.callResize(10, 10); sb.callResize(10, 10);
-      if (sb.disabled) errors.push("resizeScreen：两次错误就熔断（应三振）");
+      if (sb.entryDisabled.resize) errors.push("resizeScreen：两次错误就熔断（应三振）");
       sb.callResize(10, 10);
-      if (!sb.disabled) errors.push("resizeScreen：三次错误后未熔断");
+      if (!sb.entryDisabled.resize) errors.push("resizeScreen：三次错误后未熔断");
+      // 关键：resize 熔断不得牵连 update（同沙箱的 update 仍应正常返回）
+      if (sb.disabled) errors.push("resizeScreen：熔断牵连了整个沙箱（update 也停摆）");
+      if (sb.callUpdate(1) !== 1) errors.push("resizeScreen 熔断后 update 应继续工作（按入口独立）");
     }
   }
 

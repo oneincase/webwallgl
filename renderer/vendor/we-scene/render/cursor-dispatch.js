@@ -13,7 +13,8 @@
 //   只派发给最上层那一个时人物的 cursorClick 永远收不到点击。
 // ---- 逐事件规则 ----
 //   enter/leave：命中集变化时**逐层**成对派发；
-//   move：每帧发给全部命中层（拖拽脚本需要连续位置）；
+//   move：每帧发给全部命中层 +（按住时）按下集里的图层 —— 拖动必须持续收到
+//       位置，指针拖出图层边界后仍属捕获状态；
 //   down：按下那一帧的「按下集」= 当帧命中集；
 //   up：发给按下集里的**每一层**（拖到层外松手也要收尾 —— Mirage 的 captured
 //       buttons 同语义），不是只发给当帧命中的层；
@@ -43,7 +44,6 @@ export function planCursorDispatch(prev, hits, leftDown) {
   const click = []
   for (const l of hovered) if (!hitSet.has(l)) leave.push(l)
   for (const l of list) if (!hovered.includes(l)) enter.push(l)
-  for (const l of list) move.push(l)
   let pressed = pressedPrev
   if (leftDown && !lastLeftDown) {
     pressed = list.slice()
@@ -52,6 +52,15 @@ export function planCursorDispatch(prev, hits, leftDown) {
     for (const l of pressedPrev) up.push(l)
     for (const l of pressedPrev) if (hitSet.has(l)) click.push(l)
     pressed = []
+  }
+  for (const l of list) move.push(l)
+  // [we-scene patch] 按住期间的**捕获语义**：cursorMove 也要发给「按下集」里
+  // 已不在命中区的图层。拖拽脚本靠连续 move 更新位置，而拖动中指针必然移出
+  // 图层的小命中框 —— 只发命中层会让拖拽在移出边界的第一帧就冻住
+  // （3444812600「双击时间可自由拖动」：命中框 ~116×47 屏幕像素，一动就出界）。
+  // 与 up/click 发给按下集同源（Mirage 的 captured buttons）。
+  if (leftDown) {
+    for (const l of pressed) if (!hitSet.has(l)) move.push(l)
   }
   return {
     leave,

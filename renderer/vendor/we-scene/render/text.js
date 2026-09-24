@@ -715,7 +715,9 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
       'Vec3', 'Vec2', 'input',
       'MediaPlaybackEvent', 'localStorage',
-      '"use strict";\n' + body +
+      // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
+      // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
+      '"use strict";\nvar localstorage = localStorage;\n' + body +
       '\n;return {' +
       'update: typeof update === "function" ? update : null,' +
       'init: typeof init === "function" ? init : null,' +
@@ -826,6 +828,13 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     hasResizeHook,
     errCount: 0,
     disabled: false,
+    // [we-scene patch] 错误预算按**入口独立**：update 每帧抛错（WE 非严格模式
+    // 下是静默 no-op 的写法，如对 boolean 原始值赋属性）不该把 cursor*/媒体/
+    // 动画/resize 回调一起熔断 —— 3444812600 的「双击时间可自由拖动」脚本正是
+    // 因为 update 把 visible 的布尔入参当 origin 用（`value = weizhi; value.x=…`）
+    // 每帧 TypeError，三次后整沙箱 disabled，拖拽回调全部失效。
+    errByEntry: {},
+    entryDisabled: {},
     init(value) {
       if (!fns.init) return undefined
       // [we-scene patch] init(value) 的返回值是属性的**新初值**（WE 官方语义：
@@ -841,28 +850,24 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     /** 直调 update 不做文本加工：层可见性脚本（visible.script）要拿原始返回值
      *  ——布尔控可见，callUpdate 会把它吞成 null（防画到画面上的文字版语义）。 */
     callUpdateRaw(value) {
-      if (!fns.update || sandbox.disabled) return undefined
+      if (!fns.update || sandbox.entryDisabled.update) return undefined
       try {
         return fns.update(value)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'update')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('update', e)
         return undefined
       }
     },
     /** 求值当前文本：返回新文本；undefined/null 保留原值；连续出错 3 次熔断回退静态文本 */
     callUpdate(value) {
       void value // 保留签名兼容调用方；value 链只走沙箱 store（见 thisLayer 声明处注释）
-      if (!fns.update || sandbox.disabled) return null
+      if (!fns.update || sandbox.entryDisabled.update) return null
       const before = thisLayer.text
       let ret
       try {
         ret = fns.update(before)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'update')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('update', e)
         return null
       }
       if (typeof ret === 'string') {
@@ -883,15 +888,13 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     // [we-scene patch] 文字脚本也有 cursor* 回调（3786330502 的鼠标悬停/显隐
     // 交互按钮挂在文字层上）。语义同对象脚本的 callCursor。
     callCursor(name, event) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.cursor) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
         return fn(event)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, name)
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('cursor', e)
         return undefined
       }
     },
@@ -900,29 +903,25 @@ export function evalTextScript(script, scriptprops, opts = {}) {
      * 与 callCursor 同构；宿主只在快照变化时调用。
      */
     callMedia(name, event) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.media) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
         return fn(event)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, name)
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('cursor', e)
         return undefined
       }
     },
     // [we-scene patch] 官方 AnimationEvent 消费口：value 是当前文本，返回
     // 字符串成为新文本（undefined = 保持不变，宿主按 update 同构规则写回）。
     callAnimationEvent(event, value) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.anim) return undefined
       if (typeof fns.animationEvent !== 'function') return undefined
       try {
         return fns.animationEvent(event, value)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'animationEvent')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('anim', e)
         return undefined
       }
     },
@@ -939,7 +938,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
      * 与 callCursor 同构：三振熔断 + onError。返回字符串时按文字写回处理。
      */
     callResize(width, height) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.resize) return undefined
       if (typeof fns.resizeScreen !== 'function') return undefined
       const w = Number(width) || 0
       const h = Number(height) || 0
@@ -950,15 +949,26 @@ export function evalTextScript(script, scriptprops, opts = {}) {
         if (typeof ret === 'string') thisLayer.text = ret
         return ret
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'resizeScreen')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('resize', e)
         return undefined
       }
     },
     // [we-scene patch] 脚本是写回式 update（无 return，打字机模板）：value 链从
     // 空串起步，沙箱创建时 store 已清空。
     updateIsWriteback,
+  }
+  // [we-scene patch] 按入口记错误并熔断该入口（见 sandbox.errByEntry 注释）。
+  // update 熔断时同步置 disabled：外部逐帧循环都以 callUpdate 为门控。
+  const noteEntryErr = (entry, err) => {
+    sandbox.errCount++
+    const n = (sandbox.errByEntry[entry] || 0) + 1
+    sandbox.errByEntry[entry] = n
+    if (err && opts.onError) opts.onError(err, entry)
+    if (n >= 3) {
+      sandbox.entryDisabled[entry] = true
+      // 外部门控语义：update 熔断后逐帧循环不再调用本沙箱（其余入口照常）。
+      if (entry === 'update') sandbox.disabled = true
+    }
   }
   return sandbox
 }
@@ -1925,7 +1935,9 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
       'Vec3', 'Vec2', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
       'MediaPlaybackEvent',
-      '"use strict";\n' + body +
+      // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
+      // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
+      '"use strict";\nvar localstorage = localStorage;\n' + body +
       '\n;return {' +
       'update: typeof update === "function" ? update : null,' +
       'init: typeof init === "function" ? init : null,' +
@@ -2021,6 +2033,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     hasApplyHook,
     errCount: 0,
     disabled: false,
+    // [we-scene patch] 错误预算按**入口独立**：update 每帧抛错（WE 非严格模式
+    // 下是静默 no-op 的写法，如对 boolean 原始值赋属性）不该把 cursor*/媒体/
+    // 动画/resize 回调一起熔断 —— 3444812600 的「双击时间可自由拖动」脚本正是
+    // 因为 update 把 visible 的布尔入参当 origin 用（`value = weizhi; value.x=…`）
+    // 每帧 TypeError，三次后整沙箱 disabled，拖拽回调全部失效。
+    errByEntry: {},
+    entryDisabled: {},
     init(value) {
       if (!fns.init) return undefined
       // [we-scene patch] 同对象沙箱：init 返回值是属性新初值，透传给宿主消费。
@@ -2033,15 +2052,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     },
     /** 求值：value 为字段当前值（可变对象/数字），返回脚本的原始返回值（可能 undefined） */
     callUpdate(value) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.update) return undefined
       if (!fns.update) return undefined
       let ret
       try {
         ret = fns.update(asScriptVec3(value))
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'update')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('update', e)
         return undefined
       }
       return ret
@@ -2054,15 +2071,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 与 callUpdate 共用三振熔断：坏脚本不会每帧刷错误日志。
      */
     callCursor(name, event) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.cursor) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
         return fn(event)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, name)
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('cursor', e)
         return undefined
       }
     },
@@ -2076,15 +2091,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 每帧调用会让动画永远卡在第 0 帧重放。
      */
     callMedia(name, event) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.media) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
         return fn(event)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, name)
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('cursor', e)
         return undefined
       }
     },
@@ -2095,14 +2108,12 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     //（undefined = 保持不变，与 update 的写回规则同构）。
     hasAnimEventHook,
     callAnimationEvent(event, value) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.anim) return undefined
       if (typeof fns.animationEvent !== 'function') return undefined
       try {
         return fns.animationEvent(event, asScriptVec3(value))
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'animationEvent')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('anim', e)
         return undefined
       }
     },
@@ -2115,7 +2126,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 返回脚本原值（可能改写 thisLayer / thisObject）。
      */
     callResize(width, height) {
-      if (sandbox.disabled) return undefined
+      if (sandbox.entryDisabled.resize) return undefined
       if (typeof fns.resizeScreen !== 'function') return undefined
       const w = Number(width) || 0
       const h = Number(height) || 0
@@ -2124,12 +2135,23 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       try {
         return fns.resizeScreen(size)
       } catch (e) {
-        sandbox.errCount++
-        if (opts.onError) opts.onError(e, 'resizeScreen')
-        if (sandbox.errCount >= 3) sandbox.disabled = true
+        noteEntryErr('resize', e)
         return undefined
       }
     },
+  }
+  // [we-scene patch] 按入口记错误并熔断该入口（见 sandbox.errByEntry 注释）。
+  // update 熔断时同步置 disabled：外部逐帧循环都以 callUpdate 为门控。
+  const noteEntryErr = (entry, err) => {
+    sandbox.errCount++
+    const n = (sandbox.errByEntry[entry] || 0) + 1
+    sandbox.errByEntry[entry] = n
+    if (err && opts.onError) opts.onError(err, entry)
+    if (n >= 3) {
+      sandbox.entryDisabled[entry] = true
+      // 外部门控语义：update 熔断后逐帧循环不再调用本沙箱（其余入口照常）。
+      if (entry === 'update') sandbox.disabled = true
+    }
   }
   return sandbox
 }

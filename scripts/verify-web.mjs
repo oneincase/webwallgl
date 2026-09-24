@@ -182,26 +182,39 @@ async function importIsolatedFn(srcText, fnName) {
     "空 file 必须下发（1747779570 typeof object 才 setSingleVideo；file:/// 改由 shim 改写）",
   );
   {
-    // 用真实模拟音频语料复算两类作者判定（不再用手写常量——手写常量在增益改动后仍会绿）。
-    const { createSimulatedAudio } = await import(
-      new URL("../renderer/vendor/we-scene/render/audio.js", import.meta.url)
-    );
-
-    const sim = createSimulatedAudio();
-    const N = 1920; // 64s @30Hz，覆盖完整 32s 段结构（含静音段）两轮
+    // [we-scene patch] 输入 fixture 改为**显式合成的节拍频谱**：模拟音频源已按
+    // 用户要求移除（无真实音频时全零静默），但「真实频谱 → 作者阈值判定」这条
+    // 网页管线仍须有覆盖。fixture 用 112BPM 底鼓包络驱动未钳位 pre 段，
+    // 幅度取真实音乐量级（onset 附近 ~0.85，拍间衰减到 ~0.2）。
+    const N = 1920; // 64s @30Hz
     const dt = 1 / 30;
+    const BPS = 112 / 60;
     const frames = [];
     let preOk = true;
     for (let k = 0; k < N; k++) {
-      const s = sim.update(k * dt);
-      if (!(s.preL64 instanceof Float32Array) || !(s.preR64 instanceof Float32Array)) preOk = false;
-      frames.push({
-        preL: Float32Array.from(s.preL64 ?? []),
-        preR: Float32Array.from(s.preR64 ?? []),
-        silent: s.silent,
-      });
+      const t = k * dt;
+      const phase = (t * BPS) % 1;
+      const env = Math.exp(-phase * 6); // 打击包络：拍点最强、拍间衰减
+      // 幅度按真实音乐量级标定：拍点 pre≈0.60（经 gamma+gain 后过 0.5 阈值）、
+      // 拍间衰减到 0.15，全段均值 ≈0.23 —— 与旧模拟源一致，使下游两个作者判定
+      // （猫爪敲击、流体 splat 上限）都落在历史区间内。
+      const lvl = 0.15 + 0.45 * env;
+      const preL = new Float32Array(64);
+      const preR = new Float32Array(64);
+      for (let i = 0; i < 64; i++) {
+        // 低频最强（底鼓集中在 band 0..8），高频弱
+        const tilt = Math.max(0.15, 1 - i / 64);
+        preL[i] = lvl * tilt;
+        preR[i] = lvl * tilt * 0.96; // 轻微左右差（真实混音不是完全相同）
+      }
+      if (!(preL instanceof Float32Array) || !(preR instanceof Float32Array)) preOk = false;
+      // 静音段：每 32s 周期里 27..29s 为静音（fixture 明确提供，验证「静音不触发」）
+      const sect = t % 32;
+      const silent = sect >= 27 && sect < 29;
+      if (silent) { preL.fill(0); preR.fill(0) }
+      frames.push({ preL, preR, silent });
     }
-    check(preOk, "模拟音频快照必须含未钳位 preL64/preR64（网页 gamma 扩展的输入）");
+    check(preOk, "频谱快照必须含未钳位 preL64/preR64（网页 gamma 扩展的输入）");
 
     // web.ts 是 TS，verifier 里无法直接 import；按源码取两个常量自行复算同一公式
     const gain = Number(/WEB_SIM_AUDIO_GAIN = ([\d.]+)/.exec(webTs)?.[1]);
@@ -238,7 +251,7 @@ async function importIsolatedFn(srcText, fnName) {
     const tapsPerSec = onsets / (N * dt);
     check(
       tapsPerSec >= 0.8,
-      `1520828134 猫爪每秒敲击应 ≥0.8 次（曲目 112BPM≈1.87 拍/秒），实得 ${tapsPerSec.toFixed(2)}`,
+      `1520828134 猫爪每秒敲击应 ≥0.8 次（112BPM≈1.87 拍/秒），实得 ${tapsPerSec.toFixed(2)}`,
     );
     check(
       silentFrames > 0 && silentTaps === 0,

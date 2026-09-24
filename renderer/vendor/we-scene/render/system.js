@@ -13,37 +13,19 @@
 
 import { createSimulatedMedia } from './media.js'
 
-const TAB_HOLD = 14 // 秒：模拟「用户在几个标签之间切换」
-
-const TABS = [
-  { app: 'Safari', title: 'GitHub · we-scene-renderer', url: 'https://github.com/oneincase/we-scene-renderer' },
-  { app: 'Google Chrome', title: 'YouTube', url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
-  { app: 'Google Chrome', title: 'Wallpaper Engine - Workshop', url: 'https://steamcommunity.com/app/431960/workshop/' },
-  { app: 'Safari', title: 'MDN Web Docs', url: 'https://developer.mozilla.org/en-US/docs/Web/API' },
-  { app: 'Music', title: '夜航星 — 相位迁移', url: '' },
-  { app: 'Code', title: 'we-scene-renderer — text.js', url: '' },
-]
+const EMPTY_WINDOW = { app: '', title: '', url: '', index: -1 }
 
 /**
- * 模拟「前台窗口 / 浏览器标签」轮换。纯时间函数：同 t 同结果。
- * 真实源替换 update 即可，snapshot 形状不变。
+ * 无真实前台窗口/标签时的中性驱动（恒为空）。
+ * 不再轮换虚构标签；宿主注入窗口信息前，windowTitle 保持空串。
  */
 export function createSimulatedWindowTitle() {
-  const snapshot = { app: '', title: '', url: '', index: -1 }
-
-  function update(t) {
-    const time = Number(t) || 0
-    const i = TABS.length ? Math.floor(time / TAB_HOLD) % TABS.length : 0
-    const tab = TABS[i] || TABS[0]
-    snapshot.app = tab.app
-    snapshot.title = tab.title
-    snapshot.url = tab.url
-    snapshot.index = i
-    return snapshot
+  return {
+    snapshot: EMPTY_WINDOW,
+    tabs: [],
+    hold: 0,
+    update(_t) { return EMPTY_WINDOW },
   }
-
-  update(0)
-  return { update, snapshot, tabs: TABS, hold: TAB_HOLD }
 }
 
 /**

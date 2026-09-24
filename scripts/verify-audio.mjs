@@ -27,84 +27,29 @@ const { hlsl2glsl } = await imp("renderer/vendor/we-scene/render/hlsl2glsl.js");
 
 const { check, errors } = createChecker();
 
-// ---------- 1. 模拟频谱流 ----------
+// ---------- 1. 无真实音频源时的静默契约 ----------
+// [we-scene patch] 模拟频谱流已移除（用户要求：没有真实音频时壁纸显示自带占位，
+// 而不是合成一段假音乐让音条跳动）。本节断言新契约：恒定全零、silent=true、
+// level=0，且对任意（含负）时间都有限。
 {
   const sim = createSimulatedAudio(1);
-  let maxLevel = 0;
-  let playingLevelSum = 0;
-  let playingN = 0;
-  let silentMax = 0;
-  let beatBassSum = 0;
-  let beatBassN = 0;
-  let offBassSum = 0;
-  let offBassN = 0;
-  const BEAT = 60 / 112;
+  let maxAbs = 0;
   for (let i = 0; i < 60 * 60; i++) {
     const t = i / 60;
     const s = sim.update(t);
-    const section = t % 32;
-    for (const arr of [s.left64, s.right64, s.left32, s.right32, s.left16, s.right16]) {
+    for (const arr of [s.left64, s.right64, s.left32, s.right32, s.left16, s.right16, s.preL64, s.preR64]) {
       for (const v of arr) {
         check(Number.isFinite(v), `t=${t}: 频谱出现非有限值`);
-        check(v >= 0 && v <= 1, `t=${t}: 频谱值越界 ${v}`);
+        check(v === 0, `t=${t}: 无音频源时频谱必须为零（实得 ${v}）`);
+        maxAbs = Math.max(maxAbs, Math.abs(v));
       }
     }
-    check(Number.isFinite(s.level) && s.level >= 0 && s.level <= 1, `t=${t}: level 越界 ${s.level}`);
-    maxLevel = Math.max(maxLevel, s.level);
-    if (section < 24) {
-      playingLevelSum += s.level;
-      playingN++;
-      // 底鼓节拍结构：拍点窗口（打击包络峰值处）低频均值显著高于拍间中段
-      const beatPhase = (t % BEAT) / BEAT;
-      if (beatPhase < 0.1) {
-        beatBassSum += s.left64[1];
-        beatBassN++;
-      } else if (beatPhase > 0.55 && beatPhase < 0.7) {
-        offBassSum += s.left64[1];
-        offBassN++;
-      }
-    }
-    if (section >= 27.5 && section < 28.5) {
-      silentMax = Math.max(silentMax, s.level);
-    }
+    check(s.level === 0, `t=${t}: 无音频源时 level 必须为 0（实得 ${s.level}）`);
+    check(s.silent === true, `t=${t}: 无音频源时必须标记 silent`);
   }
-  const beatBass = beatBassSum / beatBassN;
-  const offBass = offBassSum / offBassN;
-  check(maxLevel > 0.3, `播放段整体响度过低 max=${maxLevel}`);
-  check(playingLevelSum / playingN > 0.08, `播放段平均响度过低 avg=${playingLevelSum / playingN}`);
-  check(silentMax < 0.05, `静音段响度过高 max=${silentMax}`);
-  check(beatBass > offBass * 1.5, `节拍结构不成立 beat=${beatBass.toFixed(3)} off=${offBass.toFixed(3)}`);
-
-  // 真立体声：左右声道**内容**去相关（底鼓居中、军鼓偏左、踩镲偏右、和弦左右
-  // 独立游走），不是同一波形乘 (1±pan) 的伪立体声 —— 旧实现左右条完全同相，
-  // 双声道可视化看着是镜像单声道（用户实测要求改）。同时左右能量必须保持平衡
-  // （GAIN=3.2 按双声道总和标定的场景音条不能歪）。
-  {
-    const simS = createSimulatedAudio(7);
-    let sumAbsDiff = 0;
-    let sumL = 0;
-    let sumR = 0;
-    let n = 0;
-    for (let f = 0; f < 1200; f++) {
-      const s = simS.update(1 + f / 60); // 跳过开头，取稳定播放段
-      for (let i = 0; i < 64; i++) {
-        sumAbsDiff += Math.abs(s.left64[i] - s.right64[i]);
-        sumL += s.left64[i];
-        sumR += s.right64[i];
-        n++;
-      }
-    }
-    const meanDiff = sumAbsDiff / n;
-    check(meanDiff > 0.05, `立体声去相关不足：L/R 平均绝对差 ${meanDiff.toFixed(4)}（伪立体声 ≈0.02，应 >0.05）`);
-    check(meanDiff < 0.45, `立体声分离过度：L/R 平均绝对差 ${meanDiff.toFixed(4)}（应 <0.45，否则左右完全不像一首歌）`);
-    const ratio = sumL / Math.max(1e-9, sumR);
-    check(ratio > 0.85 && ratio < 1.15, `左右能量失衡：L/R=${ratio.toFixed(3)}（应 0.85~1.15）`);
-    // pre 系列同样要立体声（网页 gamma 扩展驱动的是 preL64/preR64）
-    const s2 = createSimulatedAudio(7).update(5.5);
-    let preDiff = 0;
-    for (let i = 0; i < 64; i++) preDiff += Math.abs(s2.preL64[i] - s2.preR64[i]);
-    check(preDiff / 64 > 0.01, `preL64/preR64 去相关不足：${(preDiff / 64).toFixed(4)}`);
-  }
+  check(maxAbs === 0, `静默频谱应恒为零（最大幅值 ${maxAbs}）`);
+  check(sim.bands === 64 || sim.bands === undefined, '频段基数应为 64');
+}
 
   // 确定性：同 t 重复调用结果一致（暂停/回卷安全）
   const a = createSimulatedAudio(1).update(7.77);
@@ -143,7 +88,6 @@ const { check, errors } = createChecker();
       "帧循环的场景时间必须钳非负（首帧 rAF 时间戳可早于挂载时刻）",
     );
   }
-}
 
 // ---------- 2. audioResponse：与 pulse.vert CreateAudioResponse 逐公式对照 ----------
 {
