@@ -3526,13 +3526,16 @@ cfg, source, pkgAbort.signal);
               //   - 锚点须为 none/center（方向锚点的 origin 在挂载期按原盒平移过，
               //     扩边会把盒子挪走——2938612768 的教训）。
               const anchorSafe = !layer.textAnchor || layer.textAnchor === "center" || layer.textAnchor === "none";
-              if (
-                !!it.sandbox?.hasMediaHook &&
-                !wtext.textLayerHasTintMask(layer) &&
-                anchorSafe
-              ) {
+              // [we-scene patch] 内容变长的文字层同样要按墨水扩边。此前只有挂媒体回调
+              // 的层能扩，「脚本产出的值比作者快照长」一律被画布右缘切掉：
+              //   3155776049 的日期 → 2003年2月16日（实测溢出 83px）、
+              //   3662790108 的信息行 → 银河系公转速度: 828000 km/h（溢出 465px）、
+              //   3509243656 的 2×2 占位横条 → 溢出 1801px。
+              // 这些层没有媒体回调，闸门一挡就永远是挂载时那点边距。只增不减：
+              // 时钟/进度这类每帧变长的内容把画布撑到用过的最大值后不再回缩，字不抖。
+              if (!wtext.textLayerHasTintMask(layer) && anchorSafe) {
                 const grow = wtext.textCanvasMarginGrow(layout, bw, bh, M);
-                if (wtext.shouldGrowMediaPlaceholder(bw, bh, true)) {
+                if (!!it.sandbox?.hasMediaHook && wtext.shouldGrowMediaPlaceholder(bw, bh, true)) {
                   // 2×2 占位层：跟随内容双向扩/缩（旧行为；短词 Paused/Playing
                   // 时 grow 退回基础边距，size 与挂载一致）
                   layer.size[0] = bw + grow * 2;
@@ -3545,6 +3548,26 @@ cfg, source, pkgAbort.signal);
                   // 内部盒在新画布里的位置 = 新边距（盒中心 = 画布中心）
                   it.margin = grow;
                   M = grow;
+                }
+              }
+              // [we-scene patch] 裁字诊断：扩边后仍装不下的墨水说明这层被纹理边缘切了
+              // （tint 蒙版层刻意不扩边——蒙版 UV 按盒对齐，扩边会错位；方向锚点层
+              // 的 origin 在挂载期按原盒平移过）。以前只会静默少几个字，看着像字形
+              // 或编码错了（"SÃO PAULO"→"SÃO PF" 排查了半天），这里留一条痕迹：
+              // 每层每次挂载报一次 + 进 __textClip 供抽查。
+              if (!it.clipReported) {
+                const ink = wtext.inkOverflow(layout, bw, bh);
+                const over = Math.max(ink[0], ink[1], ink[2], ink[3]) - M;
+                if (over > 2) {
+                  it.clipReported = true;
+                  const rec = {
+                    name: String(layer.name ?? ""),
+                    over: Math.round(over),
+                    text: String(content).slice(0, 24),
+                  };
+                  const list = ((rt as { textClip?: typeof rec[] }).textClip ??= []);
+                  list.push(rec);
+                  reportDiag(rt, cfg, `文字被画布裁切：${rec.name || "(无名)"} 溢出 ${rec.over}px：「${rec.text}」`);
                 }
               }
               // 非扩边层**不碰** layer.size（挂载时已按 box+margin 设好；脚本/动画

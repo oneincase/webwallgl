@@ -228,6 +228,22 @@ function runLayout() {
       errors.push("挂载期排版入参必须与逐帧路径同源（limitwidth/maxwidth 等）");
     }
   }
+  // 15) 逐帧扩边：内容变长的**脚本/媒体**文字层都要按墨水扩边，闸门只能挡 tint 蒙版
+  //     与方向锚点两类（都是扩边会错位的几何约束），不能再要求 hasMediaHook ——
+  //     否则「脚本产出比作者快照长」的值全是静默截断：3155776049 日期
+  //     2003年2月16日 溢出 83px、3662790108 银河系公转速度 溢出 465px、
+  //     3509243656 的 2×2 占位横条 溢出 1801px。
+  {
+    const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const perFrame = /if \(!wtext\.textLayerHasTintMask\(layer\) && anchorSafe\) \{\s*\n\s*const grow = wtext\.textCanvasMarginGrow\(layout, bw, bh, M\);/;
+    if (!perFrame.test(src)) {
+      errors.push("逐帧扩边闸门应只排除 tint 蒙版/方向锚点，不得再要求 hasMediaHook（脚本层长文本会静默截断）");
+    }
+    // 裁字诊断：扩边后仍装不下必须留痕（tint 蒙版层刻意不扩，以前只会静默少几个字）
+    if (!src.includes("文字被画布裁切")) {
+      errors.push("缺少裁字诊断（updateTexts 里应报告仍被画布切掉的文字层）");
+    }
+  }
   return errors;
 }
 
