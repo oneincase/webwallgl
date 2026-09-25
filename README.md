@@ -132,6 +132,7 @@ input.addEventListener("change", () => {
 | `webSandbox` | `"legacy"` | 网页壁纸 iframe 沙箱档：legacy = allow-scripts + allow-same-origin（默认，与 WallpaperEM 一致）；strict = 只给 allow-scripts（宿主与壁纸共享 origin 时，防作者脚本以宿主身份调用宿主 API）。strict 下控制/指针/滚轮/音频/媒体自动改走 postMessage 通道，API 面完全一致 |
 | `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
 | `autoQuality` | `true` | 自动降档（**只填你没显式指定的键**）：① 探到**软件渲染（无 GPU）**时自动关后处理并把画布 DPR 压到 0.5；② 运行期帧率连续 3 秒低于上限 85% 时把后处理降一档（high→medium→low→off，只降不升，每档间隔 6 秒）。显式的 quality.postProcessing 永远优先；传 false 整体关闭（query ?autoq=0 同效）。实际生效值读 getQuality() |
+| `bake` | `true` | 贴图烘焙（B3）：内嵌 PNG/JPEG 的**预缩放缓存**，默认开（传 false / query ?bake=0 关闭）。内嵌图的现状路径是「解全尺寸再缩」，实测大图最贵的就是这一步；命中缓存后只做一次解码（52 张内嵌图实测解码 470ms → 94ms，-80%；端到端 TTFF 热加载 -14%，冷加载与不烘持平），**像素与不烘时逐位一致**（缓存存的是处理完 EXIF 回滚后的最终位图）。未命中走原路径并把结果排进后台队列（首帧后才开跑，不拖慢本次加载）；键 = 壁纸指纹 + 贴图指纹 + 资源档位，窗口缩放不会导致重烘 |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
 
 显存与清晰度：显存的大头是纹理与画布/效果链缓冲，两者都随挂载选项自动伸缩，不需要手动管理——

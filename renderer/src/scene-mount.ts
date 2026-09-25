@@ -16,6 +16,14 @@ import {
   type ResolvedQuality,
 } from "./quality";
 import { isSoftwareRenderer } from "./gpu-probe";
+import {
+  bakeCacheKey,
+  bitmapToPngBlob,
+  createBakeQueue,
+  defaultBakeCache,
+  shouldBakeEmbedded,
+  type BakeCache,
+} from "./bake-cache";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { createSpectrumCalibrator } from "./audio-calibrate";
@@ -360,6 +368,22 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 资源来源：库形态走 cfg.source；旧形态由 mediaBase/src 合成 HTTP 源
       //（httpSource 内部保留「先试根目录、逐个 try/catch」的 WKWebView 踩坑逻辑）
       const source = cfg.source ?? httpSource(`${cfg.mediaBase}/${cfg.src}`);
+      // 贴图烘焙（B3）：内嵌 PNG/JPEG 的预缩放缓存。`bake === false` / `?bake=0` 关闭。
+      // 命中只做一次 createImageBitmap（产物是处理完 EXIF 回滚后的最终位图，像素等价）；
+      // 未命中走现状路径，并把结果排进后台队列 —— 队列在**首帧之后**才开跑，
+      // 所以第一次加载不为编码付代价（那笔钱服务的是下一次加载）。
+      const bakeEnabled = cfg.bake !== false;
+      const bakeCache: BakeCache | null = bakeEnabled ? defaultBakeCache() : null;
+      const bakeQueue = createBakeQueue({
+        onDrained: () =>
+          reportDiag(
+            rt,
+            cfg,
+            `bake: 后台补烘完成 ${bakeQueue.stats.done} 张（失败 ${bakeQueue.stats.failed}，产物 ${(bakeQueue.stats.bytes / 1e6).toFixed(1)}MB）`,
+          ),
+      });
+      let bakeHits = 0;
+      let bakeMisses = 0;
       if (!cfg.source && (!cfg.mediaBase || !cfg.src)) {
         throw new Error("场景壁纸缺少 mediaBase/src");
       }
@@ -1876,13 +1900,64 @@ cfg, source, pkgAbort.signal);
           currentTexNoScale = pngSkip;
           const pngTarget = pngSkip ? pngNative : texTargetLong(normalizedResScale(name), parsedTex) || pngNative;
           const pngScale = Math.min(1, pngTarget / pngNative);
-          const bmp = await decodeTexImageBitmap(
-            blob,
-            m.png ? null : (m.image as Uint8Array),
-            m.width,
-            m.height,
-            pngScale,
-          );
+          // [we-scene patch 2026-09-25] 烘焙命中路径：缓存里是**预缩放后的最终位图**
+          // （已含 EXIF 方向回滚），所以命中时不再走 decodeTexImageBitmap 的解码/回滚，
+          // 只做一次 createImageBitmap。产物按**档位上限**尺寸烘（足迹只会更小），
+          // 因此命中后若与本纹理想要的尺寸不同，再做一次廉价的二次缩放 ——
+          // 这样 entry.width/height 与现状路径逐位相同，纯贴图尺寸的语义不漂。
+          const bakeKey = bakeCache
+            ? bakeCacheKey({
+                wallKey: source.key ?? `${cfg.mediaBase}/${cfg.src}`,
+                texName: name,
+                srcBytes: (m.png ?? (m.image as Uint8Array)) as Uint8Array,
+                tier: normalizedResScale(name),
+              })
+            : null;
+          const bakeDecision = shouldBakeEmbedded({
+            enabled: !!bakeCache,
+            scale: pngScale,
+            nativeLong: pngNative,
+            srcBytes: ((m.png ?? m.image) as Uint8Array)?.length ?? 0,
+          });
+          const cachedBlob = bakeKey && bakeDecision.bake ? await bakeCache!.get(bakeKey) : null;
+          let bmp: ImageBitmap;
+          if (cachedBlob) {
+            bakeHits++;
+            let got = await createImageBitmap(cachedBlob, { premultiplyAlpha: "none" });
+            const wantW = Math.max(1, Math.round(Number(m.width || 0) * pngScale));
+            const wantH = Math.max(1, Math.round(Number(m.height || 0) * pngScale));
+            if (got.width !== wantW || got.height !== wantH) {
+              const small = await createImageBitmap(got, {
+                resizeWidth: wantW,
+                resizeHeight: wantH,
+                resizeQuality: "high",
+              });
+              got.close?.();
+              got = small;
+            }
+            bmp = got;
+          } else {
+            if (bakeKey && bakeDecision.bake) bakeMisses++;
+            bmp = await decodeTexImageBitmap(
+              blob,
+              m.png ? null : (m.image as Uint8Array),
+              m.width,
+              m.height,
+              pngScale,
+            );
+            // 后台烘焙：bmp 上传后不 close（见下），可安全留给队列编码
+            if (bakeKey && bakeDecision.bake) {
+              const key = bakeKey;
+              const src = bmp;
+              bakeQueue.enqueue(async () => {
+                const png = await bitmapToPngBlob(src);
+                if (!png) return;
+                await bakeCache!.set(key, png);
+                bakeQueue.stats.bytes += png.size;
+                bakeQueue.stats.done++;
+              });
+            }
+          }
           if (pngScale < 0.999) {
             mem.scaled.push({
               name,
@@ -2528,6 +2603,14 @@ cfg, source, pkgAbort.signal);
         }
       }
       await Promise.all(texJobs);
+      if (bakeEnabled) {
+        reportDiag(
+          rt,
+          cfg,
+          `bake: 内嵌图缓存命中 ${bakeHits} / 待后台补烘 ${bakeMisses}` +
+            (bakeMisses ? "（首帧后开始，不影响本次加载）" : ""),
+        );
+      }
 
       // [we-scene patch] orthogonalprojection auto（GIF 导入模板等不带
       // width/height 的工程）：WE 桌面端按**内容边界**取景。贴图装载完成、
@@ -5126,6 +5209,9 @@ cfg, source, pkgAbort.signal);
       const kickLoop = () => {
         if (disposed || rt.paused) return;
         if (rt.raf !== undefined) return;
+        // 烘焙队列从这里（装配完成、马上要出第一帧）才开始消化：编码 PNG 的开销
+        // 只服务下一次加载，不许在本次加载期抢主线程（见 bake-cache 的 createBakeQueue）。
+        bakeQueue.arm();
         rt.raf = requestAnimationFrame(renderLoop);
       };
       const applyLiveProps = (wire: Record<string, { value: unknown }>) => {

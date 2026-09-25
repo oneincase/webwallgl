@@ -365,6 +365,13 @@ export type MountOptions = {
    * 实际生效值请读 `getQuality()`（返回的是生效值，可能已被自动降档改写）。
    */
   autoQuality?: boolean;
+  /**
+   * 贴图烘焙（默认开）：内嵌 PNG/JPEG 贴图的预缩放缓存。命中后省掉「解全尺寸再缩」
+   * （实测 −80% 解码耗时，缓存产物比原图小），像素与不烘时逐位一致；
+   * 未命中走原路径并后台补烘。传 `false`（或 `?bake=0`）关闭。目标尺寸取资源档位上限，
+   * 所以窗口缩放不会导致重烘。详见 docs/BAKE-PLAN.md。
+   */
+  bake?: boolean;
 
   /** 诊断回调。替代旧的 GET /diag 上报 */
   onDiagnostic?: SceneEvents["diagnostic"];

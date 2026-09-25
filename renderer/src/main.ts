@@ -487,6 +487,8 @@ const initialCfg: WallpaperConfig = {
   mediaBase: params.get("mediaBase") ?? undefined,
   // 自动降档开关：`?autoq=0` 关闭（量基线 / A-B 对照用）
   autoQuality: params.get("autoq") === "0" ? false : undefined,
+  // 贴图烘焙开关：`?bake=0` 关闭（量基线 / A-B 对照用）
+  bake: params.get("bake") === "0" ? false : undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
   opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
   // 严格沙箱（网页壁纸）：宿主与壁纸共享 origin 时置 "strict"，

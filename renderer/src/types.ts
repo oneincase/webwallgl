@@ -50,6 +50,16 @@ export type WallpaperConfig = {
    * 生效结果见 `getQuality()`（读的是实际生效值，不是请求值）。
    */
   autoQuality?: boolean;
+  /**
+   * 贴图烘焙（B3）：内嵌 PNG/JPEG 的**预缩放缓存**，默认开（`false` / `?bake=0` 关闭）。
+   *
+   * 内嵌图的现状路径是「解全尺寸再缩」，实测大图最贵的就是这一步（52 张内嵌图
+   * 470ms → 94ms，-80%；缓存产物还比原图小 ×0.61）。命中缓存时只做一次
+   * createImageBitmap，**像素与现状逐位一致**（缓存存的是处理完 EXIF 回滚后的最终位图）。
+   * 未命中走现状路径，并把结果排进后台队列（首帧之后才开跑，不拖慢本次加载）。
+   * 键 = 壁纸指纹 + 贴图指纹 + 资源档位；档位变了会重烘。详见 docs/BAKE-PLAN.md。
+   */
+  bake?: boolean;
   muted?: boolean;
   loop?: boolean;
   /**
