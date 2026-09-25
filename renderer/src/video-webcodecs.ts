@@ -18,7 +18,24 @@ import {
   type VideoSample,
 } from "mediabunny";
 
+/**
+ * WebKitGTK（Linux 桌面 WebKit，Tauri/wry 在 Linux 上的宿主）守卫。
+ *
+ * UA 特征：Linux + AppleWebKit + 无 Chrome/Chromium 字样（Safari on Linux
+ * 不存在，命中即 WebKitGTK）。这个实现上 VideoDecoder 走 GStreamer 后端，
+ * 实测对高码率/高帧率 H.264（如 1440p120 High@L5.1）有三种失败形态：
+ * configure 的 colorSpace 校验抛异常（可捕获）、解码泵启动挂死（无超时）、
+ * WebProcess 直接崩溃（整页白屏，JS 层无从防御）。逐条兜底不如整体绕开：
+ * 该平台一律回退 A/B <video>（GStreamer 管线直出，久经考验）。
+ */
+function isWebKitGtk(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return /Linux/.test(ua) && /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua);
+}
+
 export function supportsWebCodecsVideo(): boolean {
+  if (isWebKitGtk()) return false;
   return typeof VideoDecoder === "function" && typeof VideoFrame === "function";
 }
 
@@ -105,6 +122,16 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
   let lastDrawnTs = -1;
   let lastDrawAt = 0;
   let firstFrameSignalled = false;
+
+  // 初始化+首帧看门狗：mediabunny 的 UrlSource 解封装（HTTP 随机读 + mp4
+  // 解析）与解码器启动都可能在个别实现上无限挂起（宿主连 onFatal 都收
+  // 不到）。限时未出首帧即判死走 onFatal，调用方回退 A/B <video>。
+  // 20s 上限覆盖大工程冷启动（百 MB 容器 + 慢速网络）；正常路径零成本。
+  const watchdog = setTimeout(() => {
+    if (disposed || firstFrameSignalled) return;
+    opts.onFatal("初始化/首帧超时（20s 看门狗）");
+  }, 20_000);
+  const clearWatchdog = () => clearTimeout(watchdog);
 
   const drawFit = (s: VideoSample) => {
     const cw = canvas.width;
@@ -193,6 +220,7 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
     opts.onFrame?.();
     if (!firstFrameSignalled) {
       firstFrameSignalled = true;
+      clearWatchdog();
       opts.onFirstFrame?.();
     }
   };
@@ -272,6 +300,7 @@ export function mountWebCodecsVideo(opts: WebCodecsVideoOpts): WebCodecsVideoPla
     destroy() {
       if (disposed) return;
       disposed = true;
+      clearWatchdog();
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
       window.removeEventListener("resize", sizeCanvas);
