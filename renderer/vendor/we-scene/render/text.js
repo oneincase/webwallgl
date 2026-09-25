@@ -1544,7 +1544,13 @@ function makeObjectLayerProxy(layer, opts) {
       // 必须写 visibleSelf：parse 把「父隐藏」折进了子孙的 .visible，
       // 只改父层 .visible 不会让子层复活（3122339805 Eyes/Numbers 粉条）。
       layer.visibleSelf = !!v
-      if (typeof opts.recomputeVisibility === 'function') {
+      // [we-scene patch 2026-09-25] 宿主给了 markVisibilityDirty 就走**合并通道**：
+      // 帧内脚本批量写 visible 时逐次全树重算会把 O(层数) 变成 O(层数×写次数)
+      // （847 层场景实测近三成稳态 CPU 在这条链上，见 scene-mount 的同名注释）。
+      // 没有这个通道时行为不变（立即重算，或退化成直接写 .visible）。
+      if (typeof opts.markVisibilityDirty === 'function') {
+        opts.markVisibilityDirty()
+      } else if (typeof opts.recomputeVisibility === 'function') {
         opts.recomputeVisibility()
       } else {
         layer.visible = !!v

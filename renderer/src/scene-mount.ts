@@ -409,6 +409,28 @@ cfg, source, pkgAbort.signal);
       // 见 parse.recomputeLayerVisibility / 3122339805 Eyes·Numbers。
       // 必须在文字/对象脚本装配之前建好，两边 opts 都注入同一引用。
       const recomputeVisibility = () => scn.recomputeLayerVisibility(scene.layers);
+      /**
+       * 帧内脚本批量写 `visible` 的**合并通道**：写一次只打脏标记，帧内脚本/动画阶段
+       * 结束后统一重算一次。
+       *
+       * 为什么需要：`recomputeLayerVisibility` 是 O(层数) 的重算（重建 id 索引 + 逐层
+       * 上溯父链），而脚本里的 `thisLayer.visible = x` / `thisObject.visible = x` 会
+       * **逐次**触发它。847 层的 3662790108（672 个对象脚本）实测：稳态 V8 采样里
+       * `recomputeLayerVisibility` 自时间 16-18%、proxy 的 `set visible` 5.3%、
+       * `makeObjectLayerProxy` 3.1%、GC 3.5% —— 近三成 CPU 花在这条链上。
+       *
+       * 语义边界（刻意保守）：只有**帧内脚本阶段**（`visibilityDeferred` 为真）才合并，
+       * 阶段外（挂载期装配、cursor 回调、显式 `thisScene.recomputeVisibility()`、
+       * `markLayerDestroyed`）一律立即重算 —— 那些地方写完就可能被读。
+       * 帧内与既有的 `visibilityDirty`（动画写 visibleSelf 走的就是这个）**同一条刷写点**，
+       * 所以「脚本改可见性」与「动画改可见性」在本帧内的可见时刻完全一致。
+       */
+      let visibilityDeferred = false;
+      let visibilityPending = false;
+      const markVisibilityDirty = () => {
+        if (visibilityDeferred) visibilityPending = true;
+        else recomputeVisibility();
+      };
       // 库化桥接：场景装配完成，报告基本信息（首帧前，onReady 之前）
       if (rt.onSceneInfo) {
         const ortho = (scene as any).general?.orthogonalprojection || {};
@@ -3757,6 +3779,9 @@ cfg, source, pkgAbort.signal);
           1 + Math.max(0, ...(scene.layers as any[]).map((l: any) => Number(l.id) || 0));
         const sceneApi = {
           recomputeVisibility,
+          // 帧内合并通道（见 markVisibilityDirty 的注释）：沙箱的 `visible` setter
+          // 优先用它，只有阶段外才落到上面的立即重算
+          markVisibilityDirty,
           markTransformDirty: (layer: any) => {
             if (layer && layer.id !== undefined && layer.id !== null) {
               scriptedTransformDirty.add(layer.id);
@@ -4610,6 +4635,9 @@ cfg, source, pkgAbort.signal);
           particleClock.dt = clockDt;
           particleClock.t = t;
           let visibilityDirty = false;
+          // 本帧的脚本/动画阶段内，脚本写 visible 只打脏标记（见 markVisibilityDirty）。
+          // 刷写点与 visibilityDirty 同在下面 `if (visibilityDirty) recomputeVisibility()`。
+          visibilityDeferred = true;
           // [we-scene patch] 帧事件派发（图层级广播，官方 AnimationEvent 语义）：
           // 该层任一动画出事件，这层所有带 animationEvent 的沙箱都被叫到；
           // 每个拿到的 value 是各自属性的当前值，返回值按 update 同构规则立即写回
@@ -4882,6 +4910,14 @@ cfg, source, pkgAbort.signal);
                 ? wtext.scriptAnglesToRad(o)
                 : [o.x || 0, o.y || 0, o.z || 0];
             }
+          }
+          visibilityDeferred = false;
+          // 脚本经 proxy 写 visibleSelf 的合并结果并入同一次重算（两者语义完全等价：
+          // 都只改 visibleSelf、都在本帧绘制前生效）。阶段外的写仍然是立即重算，
+          // 所以这里只需要把 pending 并进来。
+          if (visibilityPending) {
+            visibilityPending = false;
+            visibilityDirty = true;
           }
           if (visibilityDirty) recomputeVisibility();
           // [we-scene patch] 父子变换重算：把 local 三件套合成回 world。
