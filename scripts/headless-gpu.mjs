@@ -145,8 +145,8 @@ function freePort() {
 
 const CDP_TIMEOUT_MS = 30000;
 
-/** 一条 CDP 连接（WebSocket + id 配对 + 超时）。 */
-class Cdp {
+/** 一条 CDP 连接（WebSocket + id 配对 + 超时）。导出供 perf-bench 开新 target 用。 */
+export class Cdp {
   constructor(ws, label) {
     this.ws = ws;
     this.label = label;
@@ -238,6 +238,7 @@ async function launchOnce({
   software = false,
   gpuRequired = !software,
   keep = false,
+  headless = true,
   bin,
   port,
   extraArgs = [],
@@ -260,7 +261,7 @@ async function launchOnce({
     ? ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
     : ["--use-angle=metal"]; // ← 真 GPU。绝不能顺手加 --enable-unsafe-swiftshader
   const args = [
-    "--headless=new",
+    ...(headless ? ["--headless=new"] : []),
     `--user-data-dir=${profileDir}`,
     `--remote-debugging-port=${debugPort}`,
     `--window-size=${width},${height}`,
@@ -510,8 +511,7 @@ export function instrument(session, { width = 1280, height = 720 } = {}) {
   };
 
   /** 按 type 分组的 CPU 秒（GPU 那项就是软件渲染的元凶）。 */
-  session.processInfo = async () => {
-    const { processInfo } = await session.browserCdp.send("SystemInfo.getProcessInfo");
+  session.processInfo = async () => {    const { processInfo } = await session.browserCdp.send("SystemInfo.getProcessInfo");
     const byType = {};
     let cpu = 0;
     for (const p of processInfo) {
@@ -541,6 +541,74 @@ export function instrument(session, { width = 1280, height = 720 } = {}) {
       byType,
       result,
     };
+  };
+
+  /**
+   * 在同一浏览器里新开一个 page target，返回该页自己的 CDP 会话。
+   *
+   * 为什么需要：量多张壁纸时，每张都要**全新的 JS 状态与 GL 上下文**（进程内
+   * 缓存、shader 程序、纹理都会跨壁纸串味），但又不必重启浏览器（启动成本
+   * ~1s/次）。新 target = 新 renderer 进程，两个诉求同时满足。
+   *
+   * 用 Target.createTarget 拿 targetId 再精确取回 ws，不靠 URL 匹配：并发开页时
+   * URL 相同的 target 不止一个。
+   */
+  session.newPage = async (url = "about:blank", { timeoutMs = 15000 } = {}) => {
+    const { targetId } = await session.browserCdp.send("Target.createTarget", { url });
+    const t = await (async () => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const list = await (await fetch(`http://127.0.0.1:${session.debugPort}/json/list`)).json();
+        const hit = list.find((x) => x.id === targetId && x.webSocketDebuggerUrl);
+        if (hit) return hit;
+        await sleep(50);
+      }
+      throw new Error("找不到新建的 page target");
+    })();
+    const cdp = await Cdp.connect(t.webSocketDebuggerUrl, `page-${targetId.slice(0, 6)}`);
+    await cdp.send("Runtime.enable");
+    await cdp.send("Page.enable");
+
+    const page = {
+      targetId,
+      cdp,
+      async evaluate(expression, { awaitPromise = false, timeoutMs: tmo = 30000 } = {}) {
+        const { result, exceptionDetails } = await cdp.send(
+          "Runtime.evaluate",
+          { expression, awaitPromise, returnByValue: true },
+          tmo,
+        );
+        if (exceptionDetails) {
+          throw new Error(`页面表达式抛错：${exceptionDetails.exception?.description || exceptionDetails.text}`);
+        }
+        return result.value;
+      },
+      async waitFor(expression, { timeoutMs: tmo = 30000, pollMs = 25 } = {}) {
+        const t0 = Date.now();
+        let last;
+        while (Date.now() - t0 < tmo) {
+          try {
+            last = await page.evaluate(expression);
+            if (last) return last;
+          } catch (e) {
+            last = e.message;
+          }
+          await sleep(pollMs);
+        }
+        throw new Error(`等条件超时 ${tmo}ms：${expression}（最后一次 ${JSON.stringify(last)}）`);
+      },
+      /** 关页：先 Page.close（会走正常卸载），再兜底 Target.closeTarget。 */
+      async close() {
+        try {
+          await cdp.send("Page.close", {}, 5000);
+        } catch {}
+        try {
+          await session.browserCdp.send("Target.closeTarget", { targetId });
+        } catch {}
+        cdp.close();
+      },
+    };
+    return page;
   };
 
   return session;

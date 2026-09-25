@@ -37,6 +37,11 @@ const STABLE = [
   "verify-web",
   "verify-resolution",
   "verify-quality",
+  // 解码/定位类判据：LZ4（逐位对账 + 惰性 mip 契约）、MDL 段定位（单趟扫描 vs 独立扫描）
+  "verify-lz4",
+  "verify-mdl-sections",
+  // 自动降档策略：显式优先 / 开关失效 / 阶梯只降不升 / 守门抗抖动（纯函数，离线）
+  "verify-quality-auto",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */
