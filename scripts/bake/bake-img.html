@@ -1,0 +1,72 @@
+<!doctype html><html><head><meta charset="utf-8"><title>img bake A/B</title></head>
+<body><canvas id="c2d" width="8" height="8"></canvas><pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (s) => { out.textContent += s + "\n"; };
+window.__bakeStep = "boot"; window.__bakeError = null;
+const fail = (e) => { window.__bakeError = String(e && (e.stack || e.message) || e); log("!! " + window.__bakeError); document.title = "done"; };
+window.addEventListener("error", fail); window.addEventListener("unhandledrejection", fail);
+try {
+  const q = new URLSearchParams(location.search);
+  const ids = (q.get("items") || "").split(",").filter(Boolean);
+  const RES = Number(q.get("res") || 0.6);
+  const { parseTex, decodeMip0, FIF } = await import("/vendor/we-scene/pkg/texture.js");
+  const c2d = document.getElementById("c2d").getContext("2d", { willReadFrequently: true });
+
+  let tA = 0, tB = 0, tBake = 0, n = 0, mismatch = 0, bytesA = 0, bytesB = 0;
+  const per = [];
+  for (const id of ids) {
+    window.__bakeStep = "list:" + id;
+    const list = await (await fetch(`/bake/list/${id}.json`)).json();
+    let ia = 0, ib = 0, cnt = 0;
+    for (const ent of list) {
+      // 只看「内嵌 PNG/JPEG」的贴图：这类运行时是 createImageBitmap(blob, {resize})
+      const raw = new Uint8Array(await (await fetch(`/bake/${id}/${ent.src}`)).arrayBuffer());
+      const parsed = parseTex(raw);
+      const dec = decodeMip0(parsed);
+      if (!(dec?.png || dec?.image)) continue;   // 非内嵌图走别的路径，不在此列
+      const mime = dec.png ? "image/png" : "image/jpeg";
+      const blob = new Blob([dec.png || dec.image], { type: mime });
+      bytesA += blob.size;
+      // 目标尺寸（与运行时同规则：档位缩放，上界）
+      const nat = Math.max(dec.width, dec.height);
+      const target = Math.max(32, Math.round(nat * RES));
+      const k = target / nat;
+      const tw = Math.max(1, Math.round(dec.width * k)), th = Math.max(1, Math.round(dec.height * k));
+
+      // ---- 现状路径：全尺寸解码 + 顺带缩放
+      let t0 = performance.now();
+      const bmpA = await createImageBitmap(blob, { premultiplyAlpha: "none", resizeWidth: tw, resizeHeight: th, resizeQuality: "high" });
+      ia += performance.now() - t0;
+      // ---- 烘焙路径：缓存里存「已缩放」的小图（这里用 canvas 产出等价缓存产物）
+      t0 = performance.now();
+      c2d.canvas.width = tw; c2d.canvas.height = th;
+      c2d.clearRect(0, 0, tw, th); c2d.drawImage(bmpA, 0, 0, tw, th);
+      const bakedBlob = await new Promise((r) => c2d.canvas.toBlob(r, "image/png"));
+      tBake += performance.now() - t0;
+      bytesB += bakedBlob.size;
+      t0 = performance.now();
+      const bmpB = await createImageBitmap(bakedBlob, { premultiplyAlpha: "none" });
+      ib += performance.now() - t0;
+      // ---- 像素等价（都经 2D 画布同一条读回路径，预乘舍入两边一致）
+      const read = (bmp) => { c2d.canvas.width = bmp.width; c2d.canvas.height = bmp.height; c2d.clearRect(0, 0, bmp.width, bmp.height); c2d.drawImage(bmp, 0, 0); return c2d.getImageData(0, 0, bmp.width, bmp.height).data; };
+      const ra = read(bmpA), rb = read(bmpB);
+      if (ra.length !== rb.length) { mismatch++; log(`  ✗ ${ent.name}: 尺寸不同`); }
+      else {
+        for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) { mismatch++; log(`  ✗ ${ent.name}: 第 ${i} 字节不同`); break; }
+      }
+      bmpA.close?.(); bmpB.close?.();
+      cnt++;
+    }
+    per.push({ id, count: cnt, aMs: +ia.toFixed(1), bMs: +ib.toFixed(1) });
+    log(`${id}: ${cnt} 张内嵌图  现状全尺寸解码+缩放 ${ia.toFixed(0)}ms  烘焙后直解小图 ${ib.toFixed(0)}ms  ${ia > 0 ? `省 ${(100 - ib / ia * 100).toFixed(0)}%` : ""}`);
+    n += cnt; tA += ia; tB += ib;
+  }
+  log(`\n合计 ${n} 张：现状 ${tA.toFixed(0)}ms → 烘焙 ${tB.toFixed(0)}ms（${tA > 0 ? (100 - tB / tA * 100).toFixed(0) : 0}% 省）`);
+  log(`烘焙产物生成（一次性，不计运行时）：${tBake.toFixed(0)}ms`);
+  log(`字节：原内嵌图 ${(bytesA / 1e6).toFixed(1)}MB → 预缩放 PNG ${(bytesB / 1e6).toFixed(1)}MB（×${(bytesB / Math.max(1, bytesA)).toFixed(2)}）`);
+  log(`像素等价：${mismatch ? `✗ ${mismatch} 张不一致` : `✓ ${n} 张逐位一致`}`);
+  window.__bakeResult = { per, tA, tB, tBake, n, mismatch, bytesA, bytesB };
+  document.title = "done";
+} catch (e) { fail(e); }
+</script></body></html>

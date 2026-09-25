@@ -223,7 +223,7 @@ function scanLibrary(lib) {
 }
 
 /** 渲染器页 query（对齐 bench/bench.ts 的 buildQuery，逐字段含义见那里） */
-function rendererUrl({ origin, item, mediaBase, webBase, dpr = 0, aa, pp, pq, fps = 60, noQuality = false, extra = {} }) {
+function rendererUrl({ origin, item, mediaBase, webBase, dpr = 0, aa, pp, pq, fps = 60, noQuality = false, noBake = false, extra = {} }) {
   const p = new URLSearchParams();
   p.set("type", item.hasScene ? "scene" : item.type);
   if (item.hasScene || item.type === "scene") p.set("src", item.itemId);
@@ -242,6 +242,8 @@ function rendererUrl({ origin, item, mediaBase, webBase, dpr = 0, aa, pp, pq, fp
   }
   p.set("muted", "true");
   p.set("loop", "true");
+  // --no-bake：关掉贴图烘焙（内嵌图预缩放缓存），量基线用
+  if (noBake) p.set("bake", "0");
   for (const [k, v] of Object.entries(extra)) p.set(k, String(v));
   return `${origin}/renderer/index.html?${p.toString()}`;
 }
@@ -429,6 +431,8 @@ function parseArgs(argv) {
     dpr: 0,
     fps: 60,
     noQuality: false,
+    noBake: false,
+    abBake: false,
     aa: null,
     pp: null,
     pq: null,
@@ -454,6 +458,8 @@ function parseArgs(argv) {
     else if (k === "--dpr") a.dpr = Number(v());
     else if (k === "--fps") a.fps = Number(v());
     else if (k === "--no-quality") a.noQuality = true;
+    else if (k === "--no-bake") a.noBake = true;
+    else if (k === "--ab-bake") a.abBake = true;
     else if (k === "--aa") a.aa = v();
     else if (k === "--pp") a.pp = v();
     else if (k === "--pq") a.pq = v();
@@ -694,7 +700,7 @@ export async function main(argv = process.argv) {
   console.log(
     `[perf-bench] 库 ${lib.length} 张，本次 ${selected.length} 张（${Object.entries(typeCount)
       .map(([k, v]) => `${k}×${v}`)
-      .join(" / ")}），trace=${args.trace} profile=${args.profile} 后端=${args.software ? "software" : "gpu"} dpr=${args.dpr || "auto"} fps=${args.fps} ${args.noQuality ? "quality=auto" : `aa=${args.aa ?? "off"} pp=${args.pp ?? "high"} pq=${args.pq ?? "high"}`}`,
+      .join(" / ")}），trace=${args.trace} profile=${args.profile} 后端=${args.software ? "software" : "gpu"} dpr=${args.dpr || "auto"} fps=${args.fps} bake=${args.noBake ? "off" : "on"} ${args.noQuality ? "quality=auto" : `aa=${args.aa ?? "off"} pp=${args.pp ?? "high"} pq=${args.pq ?? "high"}`}`,
   );
 
   const { server, port, diag } = await startServer({ dist: args.dist, lib: args.lib, allowCache: args.cache });
@@ -719,8 +725,23 @@ export async function main(argv = process.argv) {
     session.__diag = diag;
 
     for (const item of selected) {
-      for (let r = 0; r < args.repeat; r++) {
-        const url = rendererUrl({ origin, item, mediaBase, webBase, dpr: args.dpr, aa: args.aa, pp: args.pp, pq: args.pq, fps: args.fps, noQuality: args.noQuality });
+      // --ab-bake：同一浏览器会话内交替跑「烘焙开（冷/热）/烘焙关」——
+      // 本机常驻壁纸应用会让绝对值漂（见备忘「性能实测口径」），跨会话比对不可信，
+      // 必须靠交替 + 同会话来抵消漂移。
+      const schedule = args.abBake
+        ? [
+            // 顺序刻意让「关烘焙」先跑：会话第 1 次自带冷启动惩罚（profile 初始化、
+            // JIT 未热），不能让某个配置永远垫在它后面 —— 那样会把启动惩罚算进它的头上。
+            { label: "bake-off", noBake: true },
+            { label: "bake-on-cold", noBake: false },
+            { label: "bake-off-2", noBake: true },
+            { label: "bake-on-warm", noBake: false },
+          ]
+        : Array.from({ length: args.repeat }, () => ({ label: args.label ?? "", noBake: args.noBake }));
+      let rr = 0;
+      for (const step of schedule) {
+        const r = rr++;
+        const url = rendererUrl({ origin, item, mediaBase, webBase, dpr: args.dpr, aa: args.aa, pp: args.pp, pq: args.pq, fps: args.fps, noQuality: args.noQuality, noBake: step.noBake });
         const t = Date.now();
         let rec;
         try {
@@ -756,10 +777,12 @@ export async function main(argv = process.argv) {
         }
         rec.fileBytes = item.sizeBytes;
         rec.title = item.title;
+        rec.bake = args.noBake ? "off" : "on";
         rec.quality = args.noQuality
           ? { auto: true, dpr: args.dpr, fps: args.fps, label: args.label }
           : { aa: args.aa ?? "off", pp: args.pp ?? "high", pq: args.pq ?? "high", dpr: args.dpr, fps: args.fps, label: args.label };
         rec.round = r;
+        rec.label = step.label;
         rec.at = new Date(t).toISOString();
         results.push(rec);
       }

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>bake A/B</title></head>
+<body>
+<canvas id="gl" width="16" height="16"></canvas>
+<canvas id="c2d" width="16" height="16"></canvas>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (s) => { out.textContent += s + "\n"; };
+window.__bakeError = null;
+window.__bakeStep = "boot";
+const fail = (e) => {
+  window.__bakeError = String(e && (e.stack || e.message) || e);
+  log("!! " + window.__bakeError);
+  document.title = "done";
+};
+window.addEventListener("error", fail);
+window.addEventListener("unhandledrejection", fail);
+
+try {
+  const q = new URLSearchParams(location.search);
+  const ids = (q.get("items") || "").split(",").filter(Boolean);
+  const RES = Number(q.get("res") || 0.6);
+  const gl = document.getElementById("gl").getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: true });
+  const c2d = document.getElementById("c2d").getContext("2d", { willReadFrequently: true });
+  if (!gl) throw new Error("无 WebGL2");
+
+  window.__bakeStep = "import";
+  const { parseTex, decodeMipLevel } = await import("/vendor/we-scene/pkg/texture.js");
+  window.__bakeStep = "imported";
+
+  /** 与运行时同规则选级（只按资源档位；图层足迹只会更小 → 这是上界） */
+  function pickLevel(parsed) {
+    const im0 = parsed.images?.[0]?.[0];
+    const long = Math.max(Number(im0?.width || 0), Number(im0?.height || 0));
+    const target = Math.max(32, Math.round(long * RES));
+    const mips = parsed.images?.[0] || [];
+    let level = 0;
+    for (let k = 0; k < mips.length; k++) {
+      const l = Math.max(mips[k].width, mips[k].height);
+      if (l >= target) level = k; else break;
+    }
+    return level;
+  }
+  function uploadBytes(tex, w, h, rgba) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    gl.finish();
+  }
+  function uploadBitmap(tex, bmp) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+    gl.finish();
+  }
+  const texA = gl.createTexture();
+  const texB = gl.createTexture();
+  // 经 FBO 读回**GPU 上的纹理像素**（绕开 2D 画布的预乘舍入：那会把半透明像素
+  // 变化 1 LSB，判据就失效了）。这才是「烘焙不改像素」该比的地方。
+  const fbo = gl.createFramebuffer();
+  function readTexture(tex, w, h) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return buf;
+  }
+
+  let tA = 0, tB = 0, fetchA = 0, fetchB = 0, bytesA = 0, bytesB = 0, n = 0, mismatch = 0, skipped = 0;
+  const splitA = { parse: 0, decode: 0, upload: 0 };
+  const splitB = { decode: 0, upload: 0 };
+  const perItem = [];
+  for (const id of ids) {
+    window.__bakeStep = "list:" + id;
+    const listRaw = await fetch(`/bake/list/${id}.json`);
+    const list = await listRaw.json();
+    log(`清单 ${id}: HTTP ${listRaw.status} 条数 ${Array.isArray(list) ? list.length : typeof list}`);
+    let ia = 0, ib = 0, cnt = 0;
+    for (const ent of list) {
+      // ---- 现状路径：.tex → parseTex（含 LZ4）→ decodeMipLevel → 上传
+      let dec = null;
+      let costA = 0;
+      try {
+        let t0 = performance.now();
+        const resp = await fetch(`/bake/${id}/${ent.src}`);
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        fetchA += performance.now() - t0;
+        bytesA += buf.length;
+        t0 = performance.now();
+        const parsed = parseTex(buf);            // ← 这一步 = LZ4 解压（DXT 源运行时只到这）
+        const parseMs = performance.now() - t0;
+        const t1 = performance.now();
+        dec = decodeMipLevel(parsed, pickLevel(parsed));   // ← DXT 源运行时**跳过**（压缩直传）
+        const decMs = performance.now() - t1;
+        if (!dec?.rgba) throw new Error("解不出 rgba");
+        const t2 = performance.now();
+        uploadBytes(texA, dec.width, dec.height, dec.rgba);
+        splitA.parse += parseMs; splitA.decode += decMs; splitA.upload += performance.now() - t2;
+        costA = performance.now() - t0;
+      } catch (e) { log(`  A 路失败 ${ent.name}: ${e.message}`); skipped++; continue; }
+      // ---- 烘焙路径：PNG → createImageBitmap → 上传
+      let bmp = null;
+      try {
+        let t0 = performance.now();
+        const png = await (await fetch(`/bake/${id}/${ent.file}`)).arrayBuffer();
+        fetchB += performance.now() - t0;
+        bytesB += png.byteLength;
+        t0 = performance.now();
+        bmp = await createImageBitmap(new Blob([png], { type: "image/png" }), { premultiplyAlpha: "none" });
+        const bmpMs = performance.now() - t0;
+        const t2 = performance.now();
+        uploadBitmap(texB, bmp);
+        splitB.decode += bmpMs; splitB.upload += performance.now() - t2;
+        ib += performance.now() - t0;
+      } catch (e) { log(`  B 路失败 ${ent.name}: ${e.message}`); skipped++; continue; }
+      ia += costA;
+      // ---- 像素等价（解码后的 CPU 像素）
+      if (bmp.width !== dec.width || bmp.height !== dec.height) {
+        mismatch++; log(`  ✗ ${ent.name}: 尺寸 ${dec.width}x${dec.height} vs ${bmp.width}x${bmp.height}`); cnt++; continue;
+      }
+      // 比对 GPU 上的纹理：A 路上传引擎解出的 rgba，B 路上传烘焙 PNG 的位图
+      const ra = readTexture(texA, dec.width, dec.height);
+      const rb = readTexture(texB, dec.width, dec.height);
+      let bad = -1;
+      for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) { bad = i; break; }
+      if (bad >= 0) { mismatch++; log(`  ✗ ${ent.name}: GPU 纹理第 ${bad} 字节不同（A=${ra[bad]} B=${rb[bad]}）`); }
+      cnt++;
+    }
+    perItem.push({ id, count: cnt, aMs: +ia.toFixed(1), bMs: +ib.toFixed(1) });
+    log(`${id}: ${cnt} 张  现状 ${ia.toFixed(0)}ms  烘焙 ${ib.toFixed(0)}ms  ${ia > 0 ? `省 ${(100 - (ib / ia) * 100).toFixed(0)}%` : ""}`);
+    n += cnt;
+    tA += ia; tB += ib;
+  }
+  log(`\n合计 ${n} 张：现状 ${tA.toFixed(0)}ms → 烘焙 ${tB.toFixed(0)}ms（解码+上传，${tA > 0 ? (100 - (tB / tA) * 100).toFixed(0) : 0}% 省）`);
+  log(`取字节：现状 .tex ${fetchA.toFixed(0)}ms（生产里 pkg 已在内存，可视为 0） / 烘焙 PNG ${fetchB.toFixed(0)}ms`);
+  log(`字节：.tex ${(bytesA / 1e6).toFixed(1)}MB → PNG ${(bytesB / 1e6).toFixed(1)}MB（×${(bytesB / Math.max(1, bytesA)).toFixed(2)}）`);
+  log(`像素等价：${mismatch ? `✗ ${mismatch} 张不一致` : `✓ ${n} 张逐位一致`}${skipped ? `（跳过 ${skipped}）` : ""}`);
+  log(`路径拆解（ms）：现状 parseTex/LZ4 ${splitA.parse.toFixed(0)} + 解码 ${splitA.decode.toFixed(0)} + 上传 ${splitA.upload.toFixed(0)}；烘焙 PNG 解码 ${splitB.decode.toFixed(0)} + 上传 ${splitB.upload.toFixed(0)}`);
+  window.__bakeResult = { perItem, tA, tB, fetchA, fetchB, bytesA, bytesB, mismatch, n, skipped, splitA, splitB };
+  document.title = "done";
+} catch (e) {
+  fail(e);
+}
+</script>
+</body>
+</html>

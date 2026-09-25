@@ -1,0 +1,90 @@
+<!doctype html><html><head><meta charset="utf-8"><title>draw bench</title></head>
+<body><canvas id="c" width="1920" height="1080"></canvas><pre id="out"></pre>
+<script type="module">
+// 绘制次数的成本上界：N 个「图层 quad」vs 1 张预合成纹理的 quad。
+// 同一张最终画面（预合成 = 把 N 层烘进一张纹理），所以两者的差异就是「逐层绘制」本身。
+const out = document.getElementById("out");
+const log = (s) => { out.textContent += s + "\n"; };
+window.__drawError = null; window.__drawStep = "boot";
+const fail = (e) => { window.__drawError = String(e && (e.stack || e.message) || e); log("!! " + window.__drawError); document.title = "done"; };
+window.addEventListener("error", fail); window.addEventListener("unhandledrejection", fail);
+try {
+  const q = new URLSearchParams(location.search);
+  const N = Number(q.get("n") || 300);
+  const cv = document.getElementById("c");
+  const gl = cv.getContext("webgl2", { premultipliedAlpha: false, antialias: false });
+  if (!gl) throw new Error("无 WebGL2");
+  const vs = `#version 300 es
+  in vec2 p; in vec2 uv; out vec2 v; void main(){ v = uv; gl_Position = vec4(p, 0.0, 1.0); }`;
+  const fs = `#version 300 es
+  precision mediump float; in vec2 v; uniform sampler2D t; uniform float alpha; out vec4 o;
+  void main(){ vec4 c = texture(t, v); o = vec4(c.rgb, c.a * alpha); }`;
+  const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  // 一个覆盖全屏的 quad 几何（每层复用，层与层之间只改 uniform + 平移缩放近似）
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  const FS = Number(q.get("fs") || 1);          // quad 边长占屏幕的比例（面积 = FS²）
+  const quad = (x, y, s) => {
+    const u = s * 0.5;
+    return [x - u, y - u, 0, 0,  x + u, y - u, 1, 0,  x - u, y + u, 0, 1,
+            x - u, y + u, 0, 1,  x + u, y - u, 1, 0,  x + u, y + u, 1, 1];
+  };
+  const verts = [];
+  for (let i = 0; i < Math.max(1, N); i++) {
+    // 交错铺开（不同位置，模拟层叠但避免完全重合的单点测试）
+    const x = ((i % 8) / 7) * 2 - 1, y = (((i / 8) | 0) % 8) / 7 * 2 - 1;
+    verts.push(...quad(x, y, FS));
+  }
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+  const locP = gl.getAttribLocation(prog, "p"), locU = gl.getAttribLocation(prog, "uv");
+  gl.enableVertexAttribArray(locP); gl.vertexAttribPointer(locP, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(locU); gl.vertexAttribPointer(locU, 2, gl.FLOAT, false, 16, 8);
+  // 一张真实感贴图（半透明渐变，模拟图层）
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  const px = new Uint8Array(256 * 256 * 4);
+  for (let i = 0; i < 256 * 256; i++) { px[i * 4] = (i % 256); px[i * 4 + 1] = ((i / 256) | 0); px[i * 4 + 2] = 128; px[i * 4 + 3] = 160; }
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0, 0, 0, 1);
+  const uT = gl.getUniformLocation(prog, "t"), uA = gl.getUniformLocation(prog, "alpha");
+  gl.uniform1i(uT, 0);
+
+  async function measure(drawsPerFrame, seconds) {
+    let frames = 0;
+    const t0 = performance.now();
+    await new Promise((res) => {
+      const tick = () => {
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform1f(uA, 1 / Math.max(1, drawsPerFrame) * 2);
+        for (let i = 0; i < drawsPerFrame; i++) gl.drawArrays(gl.TRIANGLES, i * 6, 6);
+        frames++;
+        if (performance.now() - t0 < seconds * 1000) requestAnimationFrame(tick); else res();
+      };
+      requestAnimationFrame(tick);
+    });
+    gl.finish();
+    return { fps: frames / ((performance.now() - t0) / 1000), draws: drawsPerFrame };
+  }
+  window.__drawStep = "warm";
+  await measure(N, 1);
+  const a = await measure(N, 3);
+  const b = await measure(1, 3);
+  log(`${N} 次/帧：${a.fps.toFixed(1)} fps`);
+  log(`1 次/帧（预合成）：${b.fps.toFixed(1)} fps`);
+  log(`每绘制成本 ≈ ${((1000 / a.fps - 1000 / b.fps) / Math.max(1, N - 1) * 1000).toFixed(2)}µs（帧时间差 / 绘制数差，quad 边长占屏 ${FS}）`);
+  const fs2 = FS;
+  window.__drawResult = { n: N, fs: fs2, fpsN: a.fps, fps1: b.fps, perDrawUs: (1000 / a.fps - 1000 / b.fps) / Math.max(1, N - 1) * 1000 };
+  document.title = "done";
+} catch (e) { fail(e); }
+</script></body></html>
