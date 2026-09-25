@@ -23,6 +23,7 @@ import {
   defaultBakeCache,
   shouldBakeEmbedded,
   type BakeCache,
+  type BakeStats,
 } from "./bake-cache";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
@@ -374,16 +375,27 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 所以第一次加载不为编码付代价（那笔钱服务的是下一次加载）。
       const bakeEnabled = cfg.bake !== false;
       const bakeCache: BakeCache | null = bakeEnabled ? defaultBakeCache() : null;
+      // 烘焙统计（正式字段）：单一来源，同时喂 __memStats().bake（结构化台账）与
+      // reportDiag 的文本行 —— 两处各记各的迟早会漂。
+      const bakeStats: BakeStats = {
+        enabled: bakeEnabled,
+        backend: bakeCache?.backend ?? "off",
+        hits: 0,
+        misses: 0,
+        baked: 0,
+        failed: 0,
+        bytes: 0,
+        ms: 0,
+      };
       const bakeQueue = createBakeQueue({
+        stats: bakeStats,
         onDrained: () =>
           reportDiag(
             rt,
             cfg,
-            `bake: 后台补烘完成 ${bakeQueue.stats.done} 张（失败 ${bakeQueue.stats.failed}，产物 ${(bakeQueue.stats.bytes / 1e6).toFixed(1)}MB）`,
+            `bake: 后台补烘完成 ${bakeStats.baked} 张（失败 ${bakeStats.failed}，产物 ${(bakeStats.bytes / 1e6).toFixed(1)}MB，耗时 ${bakeStats.ms.toFixed(0)}ms）`,
           ),
       });
-      let bakeHits = 0;
-      let bakeMisses = 0;
       if (!cfg.source && (!cfg.mediaBase || !cfg.src)) {
         throw new Error("场景壁纸缺少 mediaBase/src");
       }
@@ -1922,7 +1934,7 @@ cfg, source, pkgAbort.signal);
           const cachedBlob = bakeKey && bakeDecision.bake ? await bakeCache!.get(bakeKey) : null;
           let bmp: ImageBitmap;
           if (cachedBlob) {
-            bakeHits++;
+            bakeStats.hits++;
             let got = await createImageBitmap(cachedBlob, { premultiplyAlpha: "none" });
             const wantW = Math.max(1, Math.round(Number(m.width || 0) * pngScale));
             const wantH = Math.max(1, Math.round(Number(m.height || 0) * pngScale));
@@ -1937,7 +1949,7 @@ cfg, source, pkgAbort.signal);
             }
             bmp = got;
           } else {
-            if (bakeKey && bakeDecision.bake) bakeMisses++;
+            if (bakeKey && bakeDecision.bake) bakeStats.misses++;
             bmp = await decodeTexImageBitmap(
               blob,
               m.png ? null : (m.image as Uint8Array),
@@ -1953,8 +1965,8 @@ cfg, source, pkgAbort.signal);
                 const png = await bitmapToPngBlob(src);
                 if (!png) return;
                 await bakeCache!.set(key, png);
-                bakeQueue.stats.bytes += png.size;
-                bakeQueue.stats.done++;
+                bakeStats.bytes += png.size;
+                bakeStats.baked++;
               });
             }
           }
@@ -2306,6 +2318,18 @@ cfg, source, pkgAbort.signal);
         scaledCount: mem.scaled.length,
         scaled: mem.scaled.slice(0, 40),
         textures: mem.textures.slice(0, 60),
+        // 贴图烘焙（B3）的正式统计：命中/补烘/产物/后台耗时。后端说明：
+        // cache-api = 跨页面与跨启动持久，memory = 仅本页，off = 烘焙已关闭
+        bake: {
+          enabled: bakeStats.enabled,
+          backend: bakeStats.backend,
+          hits: bakeStats.hits,
+          misses: bakeStats.misses,
+          baked: bakeStats.baked,
+          failed: bakeStats.failed,
+          bytesMB: +(bakeStats.bytes / 1e6).toFixed(2),
+          ms: Math.round(bakeStats.ms),
+        },
       });
       let loadedTex = 0;
       const texJobs: Promise<unknown>[] = [];
@@ -2607,8 +2631,8 @@ cfg, source, pkgAbort.signal);
         reportDiag(
           rt,
           cfg,
-          `bake: 内嵌图缓存命中 ${bakeHits} / 待后台补烘 ${bakeMisses}` +
-            (bakeMisses ? "（首帧后开始，不影响本次加载）" : ""),
+          `bake: 内嵌图缓存命中 ${bakeStats.hits} / 待后台补烘 ${bakeStats.misses}` +
+            (bakeStats.misses ? "（首帧后开始，不影响本次加载）" : ""),
         );
       }
 

@@ -141,6 +141,7 @@ input.addEventListener("change", () => {
 - 压缩纹理（DXT1/3/5、BC7、ETC2）按文件自带的 mip 链直传给 GPU，不解成 RGBA；单通道 R8 走 GL_R8 直传。浏览器不支持对应扩展时自动回退解码路径，观感不变
 - 上传完成后立即释放 CPU 侧解码副本（多帧动画 .tex 除外），最坏单墙可省数百 MB
 - 白名单不缩：LUT 数据栅格、多帧动画、视频纹理保持原样；法线/蒙版可降但有独立下限。挂载后 window.__memStats() 给出 pkg/解码/上传的分项台账
+- window.__memStats().bake 是**贴图烘焙的正式统计**：{ enabled, backend, hits, misses, baked, failed, bytesMB, ms }。backend 如实报缓存落在哪（cache-api = 跨页面/跨启动持久，memory = 仅本页，off = 烘焙已关）；hits/misses 是内嵌图的命中率，baked/bytesMB/ms 是首帧之后后台补烘的量与耗时。诊断文本（bake: …）与这个字段同源
 - 低内存设备的推荐组合：清晰度 0.8 + 质量 low（粒子/后处理 low、抗锯齿关）。4K 屏上画布与效果链 FBO 才是大头（随 DPR 平方增长，MSAA4 再 ×4），纹理反而是其次
 - 性能与省电：三个杠杆，数字都是本机实测（Apple M5，真 GPU 与 SwiftShader 两档）——
 - ① **帧率上限**（fps: 30）：scene 壁纸稳态 CPU 降 25~38%（847 层的实时太阳系 73%→46%、效果链重的 Persona 5 场景 59%→45%），代价是 30fps 的观感；网页壁纸几乎无效（负载在壁纸自己的进程里，实测 89%→89%）

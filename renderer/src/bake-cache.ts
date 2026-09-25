@@ -24,8 +24,28 @@ export const BAKE_VERSION = 1;
 
 /** 缓存后端：get/set 一个 PNG Blob。宿主可换实现（例如存到自己的目录） */
 export type BakeCache = {
+  /** 后端名（诊断用：cache-api = 跨启动持久，memory = 仅本页） */
+  backend: "cache-api" | "memory";
   get(key: string): Promise<Blob | null>;
   set(key: string, blob: Blob): Promise<void>;
+};
+
+/**
+ * 烘焙的**正式统计字段**（单一来源）。
+ *
+ * 它同时喂两处：`__memStats().bake`（结构化台账）与 reportDiag 的文本行 ——
+ * 两者各记各的迟早会漂，所以只留这一份。宿主读 `window.__memStats().bake`
+ * 就能拿到「命中多少 / 补烘多少 / 产物多大 / 后台花多久」。
+ */
+export type BakeStats = {
+  enabled: boolean;
+  backend: "cache-api" | "memory" | "off";
+  hits: number;
+  misses: number;
+  baked: number;
+  failed: number;
+  bytes: number;
+  ms: number;
 };
 
 /** 单张贴图的烘焙判定（纯函数，离线判据直接测它） */
@@ -127,6 +147,7 @@ export function defaultBakeCache(): BakeCache {
   const cacheName = `webwallgl-bake-v${BAKE_VERSION}`;
   const hasCacheApi = typeof caches !== "undefined";
   return {
+    backend: hasCacheApi ? "cache-api" : "memory",
     async get(key) {
       if (!hasCacheApi) return memory.get(key) ?? null;
       try {
@@ -154,20 +175,23 @@ export function defaultBakeCache(): BakeCache {
  * 烘焙队列：**首帧之后**才开跑（arm()），串行、逐条让出（条间 setTimeout），
  * 这样编码 PNG 的开销不会拖住加载期 —— 它只服务"下一次加载"，不服务当前这一次。
  */
-export function createBakeQueue(opts: { onDrained?: () => void } = {}) {
+export function createBakeQueue(opts: { stats: BakeStats; onDrained?: () => void }) {
+  const stats = opts.stats;
   const jobs: Array<() => Promise<void>> = [];
   let armed = false;
   let running = false;
-  const stats = { queued: 0, done: 0, failed: 0, bytes: 0, ms: 0 };
   const drain = async () => {
     if (running) return;
     running = true;
     while (jobs.length) {
       const job = jobs.shift()!;
+      const t0 = performance.now();
       try {
         await job();
       } catch {
         stats.failed++;
+      } finally {
+        stats.ms += performance.now() - t0;
       }
       await new Promise((r) => setTimeout(r, 8)); // 逐条让出，别连着吃一整段主线程
     }
@@ -179,10 +203,8 @@ export function createBakeQueue(opts: { onDrained?: () => void } = {}) {
     }
   };
   return {
-    stats,
     enqueue(job: () => Promise<void>) {
       jobs.push(job);
-      stats.queued++;
       if (armed) void drain();
     },
     /** 首帧之后调用一次：从这以后才开始消化队列 */

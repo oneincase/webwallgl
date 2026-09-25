@@ -649,6 +649,10 @@ async function measureOne(session, { item, url, steady, settle, budget, trace, p
         .catch(() => null);
     }
 
+    // 烘焙的正式统计字段（__memStats().bake）：A/B 报告要能看出命中/补烘，而不是只看耗时
+    rec.bakeStats = await page
+      .evaluate("(() => { const m = window.__memStats && window.__memStats(); return (m && m.bake) || null; })()")
+      .catch(() => null);
     rec.diag = (session.__diag ?? []).slice(diagFrom).slice(profile ? -60 : -12);
     rec.errors = (await page.evaluate("window.__perf && window.__perf.errors").catch(() => [])) ?? [];
     return rec;
@@ -764,6 +768,9 @@ export async function main(argv = process.argv) {
         } else {
           console.log(
             `✓ ${item.itemId} ${String(rec.type).padEnd(5)} ${String(rec.ttffMs).padStart(6)}ms  cpu ${String(rec.steady.cpuPercent).padStart(6)}%  fps ${String(rec.steady.fpsAvg).padStart(5)}${rec.steady.fpsTail !== undefined ? `（尾 ${String(rec.steady.fpsTail).padStart(5)}）` : ""}` +
+              (rec.bakeStats
+                ? `  bake[命中 ${rec.bakeStats.hits} 补烘 ${rec.bakeStats.baked} 未命中 ${rec.bakeStats.misses} ${rec.bakeStats.backend}]`
+                : "") +
               (rec.trace ? `  ${rec.trace.netCount}req/${rec.trace.netMs}ms 解码 ${rec.trace.decodeMs}ms(${rec.trace.decodeCount}) 上传 ${rec.trace.upload.ms}ms(${(rec.trace.upload.bytes / 1e6).toFixed(1)}MB) shader ${rec.trace.shader.ms}ms(${rec.trace.shader.compiles}c)` : ""),
           );
           const pr = rec.profileLoad ?? rec.profileSteady;

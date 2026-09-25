@@ -89,6 +89,18 @@ try {
   // 未命中必须仍走现状解码路径
   check(/decodeTexImageBitmap\(/.test(sm), "未命中路径必须保留 decodeTexImageBitmap（现状语义）");
   check(/bitmapToPngBlob\(/.test(sm), "未命中路径必须排进后台烘焙");
+  // ④ 正式统计字段：__memStats().bake 是宿主唯一的结构化台账，必须齐：
+  //    enabled/backend（开关与后端如实报）、hits/misses（命中率）、baked/failed/bytes/ms（后台补烘）
+  const memStats = sm.slice(sm.indexOf("__memStats"));
+  for (const f of ["enabled", "backend", "hits", "misses", "baked", "failed", "bytesMB", "ms"]) {
+    check(new RegExp(`\\b${f}\\b`).test(memStats), `__memStats().bake 必须带 ${f}（宿主排查/统计要用）`);
+  }
+  // 计数必须真的在命中/未命中路径上累加（不是只在装配期初始化成 0）
+  check(/bakeStats\.hits\+\+/.test(sm), "命中路径必须累加 hits");
+  check(/bakeStats\.misses\+\+/.test(sm), "未命中路径必须累加 misses");
+  check(/bakeStats\.baked\+\+/.test(sm), "补烘成功必须累加 baked");
+  // 单一来源：诊断文本与 memStats 都读 bakeStats，不许各记各的
+  check(/\$\{bakeStats\.hits\}/.test(sm) && /\$\{bakeStats\.misses\}/.test(sm), "diag 文本必须读 bakeStats（与 memStats 同源）");
 }
 
 console.log(errors.length === 0 ? "\nverify-bake: 全部通过 ✓" : `\nverify-bake: ${errors.length} 项失败 ✗`);
