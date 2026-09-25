@@ -1498,22 +1498,23 @@ function makeThisScene(opts) {
 }
 
 function makeObjectLayerProxy(layer, opts) {
-  const vec = (arr) => makeVec3(Array.isArray(arr) ? arr : [0, 0, 0])
   // 骨骼覆写表：宿主按图层持有一份（与 computeSkinMatrices 第 4 参同一引用）。
   // getBoneOverrides 是函数，因为 thisScene.getLayer(name) 拿到的是**别的**图层，
   // 各层的覆写表互不相同。
   const boneOverrides = opts && typeof opts.getBoneOverrides === 'function' && layer
     ? opts.getBoneOverrides(layer)
     : null
-  const store = {
-    origin: vec(layer ? layer.origin : [0, 0, 0]),
-    scale: vec(layer ? layer.scale : [1, 1, 1]),
-    // SceneScript 的 angles 是**角度**；图层数组是弧度（scene.json / layerModelMatrix）。
-    // 分量赋值 `layer.angles.z = -5` 必须当场写回，不能只改本地 store。
-    angles: makeScriptAngleVec(layer, opts),
-    size: vec(layer ? layer.size : [0, 0, 0]),
-    color: vec(layer ? layer.color : [1, 1, 1]),
-  }
+  // [we-scene patch 2026-09-25] **惰性 store**：这几个 Vec3 只被 setter 当落笔前的暂存
+  // （向量 getter 一律从图层读实时值并返回新快照，见下面 accessor 的注释），所以
+  // 「以读为主」的访问（thisLayer / thisScene.getLayer / getParent / getChildren）
+  // 过去为每次构造白建 5 个 Vec3 + 一个 angles 代理 —— 每个 Vec3 是对象 + getter/setter
+  // 闭包共十余个分配。847 层 / 672 脚本的场景实测：makeObjectLayerProxy 自时间 3.1%、
+  // makeVec3 2.2%（占 busy 时间约一成），其中大头就是这批没人读的 store。
+  // 契约不变：store 里的值**从不被读回**（angles 除外，它按设计就是共享引用）。
+  const store = {}
+  const storeVec = (key) =>
+    (store[key] ??= makeVec3(key === 'scale' || key === 'color' ? [1, 1, 1] : [0, 0, 0]))
+  const storeAngles = () => (store.angles ??= makeScriptAngleVec(layer, opts))
   const proxy = {
     get name() { return (layer && layer.name) || '' },
     get id() { return (layer && layer.id) || 0 },
@@ -1788,7 +1789,7 @@ function makeObjectLayerProxy(layer, opts) {
   }
   Object.defineProperty(proxy, 'angles', {
     enumerable: true,
-    get() { return store.angles },
+    get() { return storeAngles() },
     set(v) {
       if (layer && Array.isArray(layer.angles)) {
         const r = scriptAnglesToRad(v)
@@ -1843,7 +1844,8 @@ function makeObjectLayerProxy(layer, opts) {
       },
       set(v) {
         const a = normVec(v)
-        store[key].x = a[0]; store[key].y = a[1]; store[key].z = a[2]
+        const sv = storeVec(key)
+        sv.x = a[0]; sv.y = a[1]; sv.z = a[2]
         const localSlot = LOCAL_VEC_SLOT[key]
         if (!layer) return
         if (localSlot) {
