@@ -39,6 +39,17 @@ export type WallpaperConfig = {
   /** 渲染质量设置（抗锯齿/粒子/后处理档位，见 quality.ts）。缺省 = 全默认
    *  （AA off、粒子 high、后处理 high），与引入前的行为一致。 */
   quality?: QualityOptions;
+  /**
+   * 自动降档开关，默认开（`false` / `?autoq=0` 关闭）。
+   *
+   * 开时两件事：① 探到**软件渲染（无 GPU）**就把后处理关掉、画布 DPR 压到 0.5
+   * （实测 0fps → 46fps）；② 运行期帧率**连续 3 秒**低于上限 85% 就把后处理降一档
+   * （high→medium→low→off，只降不升）。
+   *
+   * **只改宿主没显式指定的字段**：`quality.postProcessing` 传了值就以它为准。
+   * 生效结果见 `getQuality()`（读的是实际生效值，不是请求值）。
+   */
+  autoQuality?: boolean;
   muted?: boolean;
   loop?: boolean;
   /**

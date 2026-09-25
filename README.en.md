@@ -132,6 +132,7 @@ input.addEventListener("change", () => {
 | `features` | `all on` | Debug switches: models / text / particles / effects / components |
 | `webSandbox` | `"legacy"` | Web wallpaper iframe sandbox tier: legacy = allow-scripts + allow-same-origin (default, WallpaperEM behavior); strict = allow-scripts only (when the host shares its origin with the wallpaper, so author scripts cannot act as the host). Under strict, control/pointer/wheel/audio/media automatically travel over a postMessage channel — the API surface is identical |
 | `quality` | `all defaults` | Render quality tiers (like the WE client's performance options): antiAliasing "off" (default)/"fxaa"/"msaa2"/"msaa4", particles "high" (default)/"medium"/"low"/"off" (low/medium scale both the count cap and emission rate), postProcessing "high" (default)/"medium"/"low"/"off" (low/medium cap effect-chain FBO resolution; off bypasses effect chains, fullscreen post layers and Bloom). Supersampling lives in renderDpr |
+| `autoQuality` | `true` | Automatic downgrade (only fills keys you did not set explicitly): (1) on **software rendering (no GPU)** it disables post-processing and caps the canvas DPR at 0.5; (2) at runtime, 3 consecutive seconds below 85% of the fps cap downgrades post-processing one step (high→medium→low→off, down-only, 6s between steps). An explicit quality.postProcessing always wins; pass false to turn it off (?autoq=0 equivalent). Read getQuality() for the effective values |
 | `onReady / onError / onDiagnostic` | `—` | Callback surface; can also subscribe later via instance.on() |
 
 VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and both scale automatically with the mount options — no manual management required:
@@ -141,6 +142,10 @@ VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and bot
 - CPU-side decoded copies are freed right after upload (except multi-frame animated .tex) — up to hundreds of MB on the worst wallpapers
 - Whitelisted assets never shrink: LUT data grids, multi-frame animations and video textures stay native; normal/mask maps have their own floor. window.__memStats() after mount reports per-bucket usage (package/decoded/uploaded)
 - Recommended combo for low-memory devices: clarity 0.8 + quality low (particles/post low, anti-aliasing off). On 4K screens the canvas and effect-chain FBOs dominate — they grow with DPR squared and MSAA4 multiplies by 4 — textures come second
+- Performance & power: three levers, all figures measured on an Apple M5 under both a real GPU and SwiftShader —
+- (1) **fps cap** (fps: 30) — steady-state CPU on scene wallpapers drops 25-38% (the 847-layer solar system 73%→46%, the effect-chain-heavy Persona 5 scene 59%→45%) at the cost of 30fps smoothness; nearly no effect on web wallpapers (their load lives in their own process: 89%→89% measured)
+- (2) **post-processing tier** (quality.postProcessing) — off saves 25-40% CPU consistently and pulls a 43fps scene back to 60. The particle tier is **inert except at off** (1630 live particles: high 85.8% / medium 84.9% / off 14.2% — medium is a placebo, off wipes out snow/rain/sparks), which is why the automatic downgrade only touches post-processing
+- (3) **no GPU (software rendering)** — post-processing off **plus** canvas DPR 0.5, neither alone suffices: pp=off alone gives 16fps, DPR 0.5 alone still 0fps, both together 46fps. autoQuality applies this pair at mount time (an explicit choice is never overridden)
 
 ## The SceneInstance API
 

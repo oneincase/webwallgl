@@ -1,7 +1,8 @@
 // 共享 Runtime：每实例独立（cfg/画布/渲染器互不可见），作 web/media/scene-mount 首参。
 import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math.js";
 import type { WallpaperConfig, WallpaperFit } from "./types";
-import type { QualityOptions } from "./quality";
+import { softwareDprCap } from "./quality";
+import type { QualityOptions, ResolvedQuality } from "./quality";
 import type { VideoLoopPair } from "./video-loop";
 
 /**
@@ -19,6 +20,11 @@ export function effectiveDpr(rt: Runtime, cfg?: WallpaperConfig): number {
   } else {
     target = Math.max(0.25, Number(raw));
   }
+  // 软件渲染（无 GPU）：自动档再压一道 —— 画布面积直接决定软件光栅化的成本，
+  // 实测「后处理 off + DPR 0.5」是 0fps → 46fps 的那个组合（见 quality.ts）。
+  // 宿主显式给了 renderDpr 就不动它（softwareDprCap 内部判）。
+  const cap = softwareDprCap(rt.softwareRenderer === true, raw);
+  if (cap !== null) target = Math.min(target, cap);
   // 物理最长边保护：按 CSS 最长边算出目标 backing，超 4096 就等比收。
   const cssLongEdge = Math.max(window.innerWidth || 0, window.innerHeight || 0, 1);
   const byCap = MAX_BACKING_EDGE / cssLongEdge;
@@ -184,6 +190,17 @@ export type Runtime = {
    * 投影画布）。缺省（媒体/网页壁纸、未挂场景）视为两轴都溢出 = 既有行为。
    */
   coverPeek?: { contentW: number; contentH: number; projW: number; projH: number };
+  /**
+   * **实际生效**的质量档位（含自动降档的结果）。与 `cfg.quality`（宿主请求值）
+   * 分开存：自动降档只动这个，`getQuality()` 读它，宿主据此能看出「我给的 high
+   * 为什么没生效」。未挂载/未应用时为 undefined。
+   */
+  qualityEffective?: ResolvedQuality;
+  /**
+   * 软件渲染（无 GPU）标记：挂载时由 gpu-probe 探到后写入，供 DPR 封顶与自动降档用。
+   * 未探测 = undefined（按「有 GPU」处理）。
+   */
+  softwareRenderer?: boolean;
   /** 实例级帧率计（见 frameStats） */
   frameMeter: { stamps: number[]; last: number; fps: number };
   /** 实例注册的 window/document 级监听，destroy 时成对摘除（**跨壁纸存活**） */

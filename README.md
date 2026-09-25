@@ -131,6 +131,7 @@ input.addEventListener("change", () => {
 | `features` | `全开` | 调试开关：models / text / particles / effects / components |
 | `webSandbox` | `"legacy"` | 网页壁纸 iframe 沙箱档：legacy = allow-scripts + allow-same-origin（默认，与 WallpaperEM 一致）；strict = 只给 allow-scripts（宿主与壁纸共享 origin 时，防作者脚本以宿主身份调用宿主 API）。strict 下控制/指针/滚轮/音频/媒体自动改走 postMessage 通道，API 面完全一致 |
 | `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
+| `autoQuality` | `true` | 自动降档（**只填你没显式指定的键**）：① 探到**软件渲染（无 GPU）**时自动关后处理并把画布 DPR 压到 0.5；② 运行期帧率连续 3 秒低于上限 85% 时把后处理降一档（high→medium→low→off，只降不升，每档间隔 6 秒）。显式的 quality.postProcessing 永远优先；传 false 整体关闭（query ?autoq=0 同效）。实际生效值读 getQuality() |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
 
 显存与清晰度：显存的大头是纹理与画布/效果链缓冲，两者都随挂载选项自动伸缩，不需要手动管理——
@@ -140,6 +141,10 @@ input.addEventListener("change", () => {
 - 上传完成后立即释放 CPU 侧解码副本（多帧动画 .tex 除外），最坏单墙可省数百 MB
 - 白名单不缩：LUT 数据栅格、多帧动画、视频纹理保持原样；法线/蒙版可降但有独立下限。挂载后 window.__memStats() 给出 pkg/解码/上传的分项台账
 - 低内存设备的推荐组合：清晰度 0.8 + 质量 low（粒子/后处理 low、抗锯齿关）。4K 屏上画布与效果链 FBO 才是大头（随 DPR 平方增长，MSAA4 再 ×4），纹理反而是其次
+- 性能与省电：三个杠杆，数字都是本机实测（Apple M5，真 GPU 与 SwiftShader 两档）——
+- ① **帧率上限**（fps: 30）：scene 壁纸稳态 CPU 降 25~38%（847 层的实时太阳系 73%→46%、效果链重的 Persona 5 场景 59%→45%），代价是 30fps 的观感；网页壁纸几乎无效（负载在壁纸自己的进程里，实测 89%→89%）
+- ② **后处理档位**（quality.postProcessing）：off 稳定省 25~40% CPU，并把掉到 43fps 的场景拉回 60。粒子档**除 off 外基本无效**（1630 live 粒子的场景：high 85.8% / medium 84.9% / off 14.2% —— medium 是安慰剂，off 会让雪/雨/火花整片消失），所以自动降档只走后处理
+- ③ **无 GPU（软件渲染）**：后处理 off **加**画布 DPR 0.5 缺一不可 —— 单用 pp=off 是 16fps、单用 DPR 0.5 仍是 0fps、两者同时 46fps。这一对由 autoQuality 在挂载期自动套用（显式指定则不覆盖）
 
 ## 实例 API SceneInstance
 

@@ -153,7 +153,11 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/particles\.js/.test("particles.js") && /MAX_POOL_BY_QUALITY/.test(particlesSrc), "particles 有按质量档的池容量上限");
   check(/particleQualityOff = q\.particles === "off"/.test(mountSrc), "粒子 off 档走推进/渲染跳过");
   check(/setQualityImpl = applyQuality/.test(mountSrc), "sceneCtl.setQuality 热更已接线");
-  check(/applyQuality\(normalizeQuality\(cfg\.quality\)\)/.test(mountSrc), "挂载时按 cfg.quality 应用初值");
+  // 挂载初值：cfg.quality 仍是唯一来源，只是现在**经过自动降档**再应用
+  // （软件渲染预设 / 帧率守门，见 verify-quality-auto）。守卫跟着切口搬家而不是删掉。
+  check(/quality: normalizeQuality\(cfg\.quality\)/.test(mountSrc), "挂载初值仍以 cfg.quality 为来源");
+  check(/applyQuality\(autoRes\.quality\)/.test(mountSrc), "挂载时必须应用自动降档后的档位");
+  check(/enabled: cfg\.autoQuality !== false/.test(mountSrc), "自动降档开关必须接到 cfg.autoQuality（默认开、可关）");
   check(/qualityFromQuery/.test(mainSrc), "main.ts 解析 aa/pq/pp query");
   check(/setQuality\(patch: QualityOptions\)/.test(mainSrc), "__wp.setQuality 存在");
   check(/getQuality\(\)/.test(mainSrc), "__wp.getQuality 存在");

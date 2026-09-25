@@ -32,6 +32,10 @@ export function resourceScaleFor(rt: Runtime, cfg?: WallpaperConfig): number {
   const raw = cfg?.renderDpr ?? rt.cfg?.renderDpr;
   const n = Number(raw);
   if (raw === undefined || raw === null || raw === 0 || Number.isNaN(n)) {
+    // 软件渲染（无 GPU）：画布被压到 SOFTWARE_DPR_CAP，贴图跟着走省电档 ——
+    // 上传与解码都省在 CPU 上（软件渲染的瓶颈全在 CPU），且画布本身就小，
+    // 高分辨率贴图没有对应的像素可显示。
+    if (rt.softwareRenderer === true) return 0.6;
     const device = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     return Math.max(0.6, Math.min(1, device / RESOURCE_REF_DPR));
   }

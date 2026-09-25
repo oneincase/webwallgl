@@ -6,7 +6,16 @@ import type { Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
-import { normalizeQuality, particleQualityScale, postFboCapFactor, type ResolvedQuality } from "./quality";
+import {
+  applyAutoQuality,
+  createAdaptiveQuality,
+  normalizeQuality,
+  particleQualityScale,
+  postFboCapFactor,
+  softwareDprCap,
+  type ResolvedQuality,
+} from "./quality";
+import { isSoftwareRenderer } from "./gpu-probe";
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { createSpectrumCalibrator } from "./audio-calibrate";
@@ -263,6 +272,9 @@ async function loadParsedPkg(
 
 export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
+  // GPU 探测必须在**算 DPR 之前**：软件渲染要把画布压到 SOFTWARE_DPR_CAP，
+  // 而画布尺寸在下面几行就定死了（探测本身整页只做一次并缓存，见 gpu-probe）。
+  rt.softwareRenderer = isSoftwareRenderer();
   // 库形态：调用方给了 canvas 就画在它上面（可非全屏、可多实例）；
   // 旧形态：自建 canvas 铺满内部 wrap 容器。backing store 按显示尺寸折算：
   // 嵌入式 canvas 用 CSS 尺寸（全屏 canvas 的 clientWidth == innerWidth，等价）。
@@ -323,6 +335,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   // 性能设置（抗锯齿/粒子/后处理）热更入口。cfg.quality 是真源：impl 未就绪
   // （渲染器还没建出来）时只写 cfg，装配到建渲染器那步会按 cfg.quality 应用。
   let setQualityImpl: ((q: ResolvedQuality) => void) | undefined;
+  /** 宿主**请求**的档位（cfg.quality，显式优先判据用）与**实际生效**档位分开存：
+   *  自动降档只动后者，getQuality() 读后者 —— 宿主才能看出「我给的 high 为什么没生效」。 */
+  const requestedQuality = () => normalizeQuality(rt.cfg.quality);
   rt.sceneCtl = {
     pause() {
       pauseImpl?.();
@@ -3003,6 +3018,7 @@ cfg, source, pkgAbort.signal);
       // 全部就地生效不重挂载：AA/后处理是渲染器门控，粒子倍率是池重建（粒子重生，
       // 与 WE 改档位时的表现一致）。
       const applyQuality = (q: ResolvedQuality) => {
+        rt.qualityEffective = q;
         renderer.setAntiAliasing?.(q.antiAliasing);
         renderer.setEffectsEnabled?.(q.postProcessing !== "off");
         renderer.setFboCapFactor?.(postFboCapFactor(q.postProcessing));
@@ -3015,7 +3031,26 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt, cfg, `quality: aa=${q.antiAliasing} particles=${q.particles} post=${q.postProcessing}`);
       };
       setQualityImpl = applyQuality;
-      applyQuality(normalizeQuality(cfg.quality));
+      // [we-scene patch 2026-09-25] 自动降档（挂载期）：软件渲染（无 GPU）时把后处理
+      // 关掉。**只填宿主没显式指定的字段** —— 宿主在设置面板里明确选了 pp=high 就
+      // 尊重它；`autoQuality:false` / `?autoq=0` 整段不生效。
+      // 依据见 quality.ts：软件渲染下「pp=off + DPR 0.5」是 0fps → 46fps 的那个组合，
+      // 而单独任一项都救不回来。
+      const autoRes = applyAutoQuality({
+        quality: normalizeQuality(cfg.quality),
+        explicit: cfg.quality,
+        software: rt.softwareRenderer === true,
+        enabled: cfg.autoQuality !== false,
+      });
+      for (const line of autoRes.applied) reportDiag(rt, cfg, `autoQuality: ${line}`);
+      if (rt.softwareRenderer === true) {
+        reportDiag(
+          rt,
+          cfg,
+          `软件渲染（无 GPU）：画布 DPR 封顶 ${softwareDprCap(true, cfg.renderDpr) ?? "（宿主已指定，跳过）"}`,
+        );
+      }
+      applyQuality(autoRes.quality);
       reportDiag(rt,
         cfg,
         `particles: ${particleSystems.length} systems, ${builtinTexCount} builtin tex generated`,
@@ -4490,6 +4525,24 @@ cfg, source, pkgAbort.signal);
       // 60Hz 屏设 60 也周期性掉到 30/58fps；高刷屏 cap60 长期均值甚至只有 ~48fps。
       const frameGate = new FrameGate(rt.cfg.sceneFps || 60);
       let gateFps = rt.cfg.sceneFps || 60;
+      /**
+       * 帧率守门（运行期自动降档，状态机在 quality.ts）。
+       * 只在「挂载期自动降档之后后处理还有坡可下」时接管：宿主显式定了 pp、
+       * 或 `autoQuality:false` 时都不介入。降档走 applyQuality（热更，不重挂载）。
+       */
+      const adaptive = autoRes.allowAdaptive
+        ? createAdaptiveQuality({
+            onDowngrade: (next, reason) => {
+              // 基准取**当前生效**档位：自动降档只写 qualityEffective，不写 cfg.quality
+              // （那是宿主请求值），所以这里必须读 effective —— 读 cfg 会让阶梯卡在
+              // 「high→medium」反复横跳（实测踩过：连报两次 → medium）。
+              applyQuality({ ...(rt.qualityEffective ?? requestedQuality()), postProcessing: next });
+              reportDiag(rt, cfg, `autoQuality: postProcessing → ${next}（${reason}）`);
+            },
+          })
+        : null;
+      let adaptiveAccum = 0;
+      let lastAdaptiveT = 0;
       // 关键帧动画的上一帧时刻（真实时钟，秒）。**不能用固定的目标帧间隔累加**：
       // 实际出帧周期总略大于 interval，每帧只加 interval 就是系统性欠计 ——
       // 骨骼动画走真实时钟 t，两条时间轴会持续发散（3233141951：理想满帧下
@@ -4511,6 +4564,24 @@ cfg, source, pkgAbort.signal);
         }
         if (frameGate.shouldRender(now)) {
           markFrame(rt, now);
+          // 帧率守门：按**真实经过时间**每秒喂一次读数（不是每帧喂 —— 否则高刷屏上
+          // 判断频率随时间被放大）。读数取 frameMeter 的实测 fps（被上限跳过的帧不计入，
+          // 反映的是真实出帧能力）；上限取配置值，宿主 setFps 改上限时这里自动跟上。
+          if (adaptive) {
+            if (lastAdaptiveT > 0) adaptiveAccum += rt.frameMeter.last - lastAdaptiveT;
+            lastAdaptiveT = rt.frameMeter.last;
+            if (adaptiveAccum >= 1000) {
+              const dtS = adaptiveAccum / 1000;
+              adaptiveAccum = 0;
+              adaptive.tick(
+                rt.frameMeter.fps,
+                rt.cfg.sceneFps || 60,
+                dtS,
+                // 阶梯位置同样取生效值（见 onDowngrade 的注释）
+                (rt.qualityEffective ?? requestedQuality()).postProcessing,
+              );
+            }
+          }
           syncCanvasSize(rt, c, rt.cfg);
           // [we-scene patch] resizeScreen 派发（官方生命周期事件）：画布 CSS 尺寸
           // 变化（含首帧：resize 模板在 init 里手动调

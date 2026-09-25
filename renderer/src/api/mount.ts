@@ -455,7 +455,9 @@ export function createScene(
       rt.sceneCtl?.setQuality?.(patch ?? {});
     },
     getQuality(): ResolvedQuality {
-      return normalizeQuality(currentOptions.quality ?? rt.cfg.quality);
+      // 读**生效值**：自动降档（软件渲染预设 / 帧率守门）只改 rt.qualityEffective，
+      // 这里若读 cfg.quality 会让宿主以为请求值生效了，进而看不出为什么画质变差。
+      return rt.qualityEffective ?? normalizeQuality(currentOptions.quality ?? rt.cfg.quality);
     },
 
     setProperties(props: Record<string, PropertyValue>) {

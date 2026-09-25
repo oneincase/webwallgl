@@ -363,7 +363,8 @@ window.__wp = {
     rt.sceneCtl?.setQuality?.(patch ?? {});
   },
   getQuality() {
-    return normalizeQuality(rt.cfg.quality);
+    // 生效值优先（自动降档会改写它，见 scene-mount 的 applyQuality）
+    return rt.qualityEffective ?? normalizeQuality(rt.cfg.quality);
   },
   // 切换滤镜（beta）：查白名单后应用到 wrap，CSS 合成层处理，无需重挂载
   setFilter(filter: string) {
@@ -484,6 +485,8 @@ const initialCfg: WallpaperConfig = {
   loop: params.get("loop") !== "false",
   filter: params.get("filter") ?? undefined,
   mediaBase: params.get("mediaBase") ?? undefined,
+  // 自动降档开关：`?autoq=0` 关闭（量基线 / A-B 对照用）
+  autoQuality: params.get("autoq") === "0" ? false : undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
   opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
   // 严格沙箱（网页壁纸）：宿主与壁纸共享 origin 时置 "strict"，

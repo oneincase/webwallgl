@@ -358,6 +358,13 @@ export type MountOptions = {
    * 挂载后可用 `SceneInstance.setQuality()` 热调。
    */
   quality?: QualityOptions;
+  /**
+   * 自动降档（默认开）：探到软件渲染（无 GPU）时自动关后处理 + 压画布分辨率；
+   * 运行期帧率连续 3 秒低于上限 85% 时把后处理降一档（high→medium→low→off，只降不升）。
+   * **只填宿主没显式指定的键** —— 显式的 `quality.postProcessing` 永远优先；传 `false` 整体关闭。
+   * 实际生效值请读 `getQuality()`（返回的是生效值，可能已被自动降档改写）。
+   */
+  autoQuality?: boolean;
 
   /** 诊断回调。替代旧的 GET /diag 上报 */
   onDiagnostic?: SceneEvents["diagnostic"];
