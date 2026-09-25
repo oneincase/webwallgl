@@ -349,6 +349,40 @@ export function cropBlocks(data, srcW, dstW, dstH, blockBytes) {
   return out
 }
 
+/**
+ * [we-scene patch 2026-09-25] **惰性 LZ4 mip**：压着压缩块，第一次读 `.data` 才解压并缓存。
+ *
+ * 为什么值：`.tex` 的 mip 链是「每级各自 LZ4」，而消费端只取**够用的最小一级**
+ * （`pickMipLevel`，按图层在设备像素上的足迹算）或从 baseLevel 起截链。过去 parseTex
+ * 把每一级都展开 —— 8K 贴图 mip0 解出 134MB RGBA 后直接被丢弃；全库 269/277 张是
+ * 多级贴图，量级最大的那批（8K 行星贴图）每张白解压 3-5 级。
+ *
+ * 为什么用 getter 而不是改调用方：所有消费点读的都是 `mip.data`（decodeMip0 /
+ * decodeMipLevel / 压缩直传的 `cMips[k].data` / 视频与内嵌图片分支），getter 让它们
+ * **一行都不用改**，只有真被读到的层级才付解压成本。
+ *
+ * 附带的峰值内存收益：解压产物不再全量常驻（同一份语料解压总量 776MB，实际用到的
+ * 只是其中一小部分）。
+ *
+ * 注意：`lz4Decompress` 本身**不要**再改写 —— 实测这份语料是 token 密集型的
+ * （5900 万个 token、平均匹配 21.6 字节），逐字节循环 682ms 反而快过任何
+ * `set`/`copyWithin` 版本（同 buffer 的 `set` 会走 clone 路径，1.4s = 慢一倍）。
+ * 真正该省的是「解了不用的层级」，不是「每字节怎么解」。
+ */
+export function lazyLz4Mip(width, height, raw, uncompressedSize) {
+  let cache
+  const mip = { width, height, compression: 1, raw, uncompressedSize }
+  Object.defineProperty(mip, "data", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      if (cache === undefined) cache = lz4Decompress(raw, uncompressedSize)
+      return cache
+    },
+  })
+  return mip
+}
+
 export function lz4Decompress(src, outSize) {
   const out = new Uint8Array(outSize)
   let ip = 0

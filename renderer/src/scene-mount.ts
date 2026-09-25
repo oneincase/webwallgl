@@ -1100,6 +1100,31 @@ cfg, source, pkgAbort.signal);
               Math.max(Number(im0?.width || 0), Number(im0?.height || 0));
       };
       /**
+       * 贴图**分类**（等价于 decodeMip0 的三个免解码分支），不碰像素。
+       *
+       * decodeMip0 对原始格式（DXT/BC/ETC/RGBA…）会做一次全尺寸像素解码，而调用方
+       * 只在 video / 内嵌 PNG / 内嵌 JPEG 这三个分支读它的结果；原始格式那一支用的是
+       * 头部尺寸 + 下游自己的 decodeMipLevel / 压缩直传。所以这里按头部返回同样形状的
+       * 对象，把「要不要像素」的决定权交还给真正的消费分支 —— 少掉的是一次纯浪费的
+       * 全尺寸展开（8K DXT 单张 ~390ms，见挂载路径注释）。
+       *
+       * 分支顺序与 decodeMip0 逐条对齐（含 freeImageFormat 非 PNG/JPEG 时的
+       * `image` 分支），返回的 `data` 是 pkg 缓冲区上的视图（不复制）。
+       */
+      const classifyTexHeader = (parsedTex: any): any => {
+        const im = parsedTex?.images?.[0]?.[0];
+        // 与 decodeMip0 同口径：没有图像数据就当坏贴图抛出（调用方按张 catch）
+        if (!im) throw new Error("无图像数据");
+        const w = Number(im.width || 0);
+        const h = Number(im.height || 0);
+        if (parsedTex?.isVideo) return { width: w, height: h, video: im.data };
+        const fif = parsedTex?.freeImageFormat;
+        if (fif === tex.FIF.PNG) return { width: w, height: h, png: im.data };
+        if (fif !== tex.FIF.UNKNOWN) return { width: w, height: h, image: im.data, fif };
+        // 原始格式：像素解码交给下面的 else 分支（压缩直传命中就完全不需要像素）
+        return { width: Number(parsedTex?.width || w), height: Number(parsedTex?.height || h) };
+      };
+      /**
        * [S4] 目标最长边 = min(档位上限, 图层足迹)。
        * `?resources=native` 时严格 no-op（返回原生，供 A/B 对照）。
        */
@@ -1685,7 +1710,13 @@ cfg, source, pkgAbort.signal);
             }
           }
         }
-        const m = tex.decodeMip0(parsedTex);
+        // 这里**只做分类，不解码像素**。分类所需的三个分支全部由 .tex 头部决定
+        // （isVideo / freeImageFormat / 尺寸），而 decodeMip0 对「原始格式」这一支
+        // 会把整张贴图展开成 RGBA —— 那种贴图的像素结果在本函数里**一次都没被读**
+        // （真正要像素的路径在下面的 else 分支，走 decodeMipLevel + 压缩直传）。
+        // 实测代价：3662790108（Live Solar System，569MB / 277 张）加载期 4.2s 花在
+        // decodeDxtCommon 家族上，全部是这一次被丢掉的展开。
+        const m = classifyTexHeader(parsedTex);
         const rg88 = parsedTex.format === 8;
         let entry: any = null;
         if (m.video !== undefined) {

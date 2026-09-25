@@ -3,7 +3,7 @@
 // [we-scene patch] 模块结构（本仓库拆分，见 docs/ARCHITECTURE.md）：
 //   tex-codecs.js  格式表 + mip 解码 + 像素编解码 + LZ4 + u32/i32/f32 原语
 //   texture.js     本文件：.tex 容器解析（parseTex）+ 公共出口（re-export）
-import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, u32, i32, f32 } from './tex-codecs.js'
+import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, lazyLz4Mip, u32, i32, f32 } from './tex-codecs.js'
 
 /** FreeImage 容器的魔数（用于「变体布局」的载荷自校验，见 mip 记录那段注释） */
 const FREE_IMAGE_MAGIC = {
@@ -153,9 +153,15 @@ export function parseTex(buf) {
       if (compression === 0) uncompressedSize = compressedSize
       const raw = buf.subarray(p, p + compressedSize)
       p += compressedSize
-      let data = raw
-      if (compression === 1) data = lz4Decompress(raw, uncompressedSize)
-      mips.push({ width: mw, height: mh, compression, data })
+      // [we-scene patch 2026-09-25] LZ4 块**惰性解压**（见 lazyLz4Mip）：过去在这里
+      // 把每一级 mip 都展开，而消费端通常只取「够用的最小一级」上传（pickMipLevel）
+      // 或从 baseLevel 起截压缩链 —— 8K 贴图的 mip0 一张就是 33.5MB 解压产物，
+      // 全库 269/277 张是多级贴图，解出来的大头直接进垃圾。
+      mips.push(
+        compression === 1
+          ? lazyLz4Mip(mw, mh, raw, uncompressedSize)
+          : { width: mw, height: mh, compression, data: raw },
+      )
     }
     images.push(mips)
   }
@@ -349,4 +355,4 @@ function asciiTex(buf, start, len) {
   return s
 }
 
-export { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress }
+export { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, lazyLz4Mip }
