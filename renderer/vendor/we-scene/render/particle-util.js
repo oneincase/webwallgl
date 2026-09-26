@@ -78,9 +78,81 @@ function audioGate(bounds, level) {
 }
 
 
+// ---------------------------------------------------------------------------
+// hash3 的记忆化（噪声求值是这个渲染器最大的单点 CPU 开销）
+//
+// 为什么值得做：turbulence 算子每粒子每帧调 `noiseVec3(..., oct=3)`，展开是
+// 3 次 fbm3 × 3 个倍频 × 8 个角点 = **72 次 hash3**，每次都是一条 Math.sin。
+// 1039919954（两张 25000 maxcount 的烟带，各带一个 turbulence）实测：
+//   每帧 hash3 调用 160 万次（240 帧 / 4s 计数），其中真算 sin 的只有 5.7 万次；
+//   稳态 V8 剖面里 vnoise3 自时间 53%，改前 renderer 占满一核（96.8%）。
+//   注：hash3 的在场景内成本约 10ns（由「调用数 ÷ renderer CPU 秒」反推），
+//   脱离场景的 Node 微基准会高估到 40~55ns —— 独立函数调用没被内联。
+//
+// 为什么能cache：vnoise3 传给 hash3 的是**整数格点**（floor 之后的值），
+// 同格点的结果按定义完全相同 —— 这是纯复用，不是近似，输出逐位不变。
+// （等价性用真模块对拍过：120 万组随机整数格点 + 12 万组 vnoise3/fbm3/noiseVec3
+//   开关记忆化逐位一致，含强制整表冲突的用例。）
+//
+// 为什么不是「每粒子缓存」：粒子池按 maxcount 预分配（本库最大 100000），
+// 每粒子每算子要存 9 个 vnoise3 × 8 个角点 = 72 个 double，几十 MB 量级，不可行。
+// 反过来，格点空间是**全局共享**的：同一帧里成千上万个粒子反复落在同一批格点上
+// （turbulence 的 scale 小到 0.0053，x/y 格点只有十几个取值），所以用一张
+// 全进程共享的直接映射表就够了，命中率实测 96.2%，且零每粒子内存。
+//
+// 表结构：直接映射（槽 = 三元素哈希 & MASK），冲突即覆盖。不做链表/淘汰 ——
+// 噪声的工作集小且访问有强局部性，覆盖式命中的代价只是重算一次 sin。
+// 收益（同会话交替 A/B，1039919954，3 轮）：renderer 96.8% → 71.0%（-26.7% 相对），
+// 全进程树 -25 个百分点，fps 不变。
+const NM_BITS = 13
+const NM_SIZE = 1 << NM_BITS
+const NM_MASK = NM_SIZE - 1
+const nmTag = new Float64Array(NM_SIZE * 3)
+const nmVal = new Float64Array(NM_SIZE)
+// 出厂即 NaN：整数值永远不会等于 NaN，于是「未命中」不需要额外的有效位数组
+nmTag.fill(NaN)
+// 测试钩子（都只在首次调用时解析一次，稳态零开销）：
+//   __noiseMemoOff   = true → 关掉记忆化（A/B 基线用）
+//   __noiseMemoCount = true → 统计命中/未命中。**默认关**：热路径上是 160 万次/帧，
+//                            计数据的自增本身就会吃掉几个百分点，只在诊断时开。
+let nmOff = false
+let nmCount = false
+let nmProbed = false
+let nmHits = 0
+let nmMisses = 0
+/** 命中率是判断「这张壁纸值不值得走记忆化」的唯一依据（需先开 __noiseMemoCount） */
+export function noiseMemoStats() {
+  return { hits: nmHits, misses: nmMisses, size: NM_SIZE, off: nmOff, counting: nmCount }
+}
+// 页面级诊断钩子
+globalThis.__noiseMemoStats = noiseMemoStats
+
 function hash3(x, y, z) {
+  if (!nmProbed) {
+    nmProbed = true
+    nmOff = globalThis.__noiseMemoOff === true
+    nmCount = globalThis.__noiseMemoCount === true
+  }
+  if (nmOff) {
+    const n0 = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
+    return n0 - Math.floor(n0)
+  }
+  // 三元素混合哈希：位运算会把参数按 ToInt32 截断，对大值只丢高位 —— 只当槽号用，
+  // 命中判定靠下面的整值比对，所以截断不影响正确性。
+  const slot = ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) & NM_MASK
+  const t = slot * 3
+  if (nmTag[t] === x && nmTag[t + 1] === y && nmTag[t + 2] === z) {
+    if (nmCount) nmHits++
+    return nmVal[slot]
+  }
+  if (nmCount) nmMisses++
   const n = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
-  return n - Math.floor(n)
+  const v = n - Math.floor(n)
+  nmTag[t] = x
+  nmTag[t + 1] = y
+  nmTag[t + 2] = z
+  nmVal[slot] = v
+  return v
 }
 function vnoise3(x, y, z) {
   const ix = Math.floor(x)
