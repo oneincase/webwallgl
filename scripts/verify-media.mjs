@@ -783,6 +783,58 @@ const { check, errors } = createChecker();
   console.log(`  实例层迟到绑定：全库 ${totalPending} 层，3 张报障壁纸的 5 层全部在案`);
 }
 
+// ---------- 5d. 图层自身材质 usertextures 保留名（3151551777 album 层；全库 24 处 / 19 张） ----------
+// 与 5c 同属「装配期定死、真实封面异步到达」，但位置在**普通图层自身材质**：
+// materials/*.json 的 textures[0]=作者内置封面（album2）、usertextures[0]=$mediaThumbnail。
+// 旧路径只把它当用户图片槽（认属性文件路径），保留名被漏掉 → 真封面已就绪仍画内置
+// 占位图。修法：槽 0 已就绪立刻切 textureName，没就绪登记同一张 pending 表迟到补绑。
+{
+  const expected3151 = "3151551777";
+  let totalBaseReserved = 0;
+  let wall3151 = 0;
+  let ids5d = [];
+  try { ids5d = fs.readdirSync(LIB); } catch { ids5d = []; }
+  for (const id of ids5d) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let pkg;
+    try { pkg = parsePkg(fs.readFileSync(pkgPath)); } catch { continue; }
+    const entryNames = pkg.entries.map((e) => e.name);
+    let wall = 0;
+    for (const en of entryNames) {
+      if (!en.startsWith("models/") || !en.endsWith(".json")) continue;
+      let model;
+      try { model = JSON.parse(Buffer.from(getEntry(pkg, en)).toString("utf8")); } catch { continue; }
+      if (typeof model.material !== "string" || !entryNames.includes(model.material)) continue;
+      let mat;
+      try { mat = JSON.parse(Buffer.from(getEntry(pkg, model.material)).toString("utf8")); } catch { continue; }
+      for (const p of mat.passes || []) {
+        for (const u of p.usertextures || []) {
+          const nm = u && typeof u === "object" ? u.name : u;
+          if (typeof nm === "string" && nm.startsWith("$media")) wall++;
+        }
+      }
+    }
+    totalBaseReserved += wall;
+    if (id === expected3151) wall3151 = wall;
+  }
+  check(totalBaseReserved >= 20,
+    `全库应至少有 20 处图层自身材质的保留名绑定（5d 语料前提），实得 ${totalBaseReserved}`);
+  check(wall3151 === 1,
+    `3151551777 的 models/album.json 应有 1 处材质级 $mediaThumbnail，实得 ${wall3151}`);
+
+  const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  // 自身材质保留名：就绪即切 / 未就绪登记 pending，守卫要落在「!layer.solid」材质处理块
+  check(/图层\*\*自身材质\*\*的 usertextures 保留名/.test(smSrc),
+    "scene-mount 必须处理图层自身材质的 usertextures 保留名");
+  check(/if \(!layer\.solid\) \{[\s\S]{0,600}textures\.has\(reserved\)[\s\S]{0,200}else \{[\s\S]{0,120}pendingInstanceMedia\.push/.test(smSrc),
+    "自身材质保留名必须就绪即切 textureName、未就绪登记 pendingInstanceMedia");
+  // 默认槽回写要避让已登记保留名，否则 album2 的异步 then 会把真封面覆盖回占位图
+  check(/!instBoundTex && !pendingInstanceMedia\.some\(\(p\) => p\.layer === layer\)/.test(smSrc),
+    "模型默认贴图回写必须避让登记了保留名的层（否则内置占位图覆盖真封面）");
+  console.log(`  自身材质保留名：全库 ${totalBaseReserved} 处 / 19 张，3151551777 album 层在案`);
+}
+
 // ---------- 6. 图层声音 / 视频纹理控制 ----------
 {
   const spyCtl = () => {

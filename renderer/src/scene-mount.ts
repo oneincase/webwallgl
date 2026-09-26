@@ -2522,14 +2522,34 @@ cfg, source, pkgAbort.signal);
               }),
             );
           }
+          // [we-scene patch] 图层**自身材质**的 usertextures 保留名（全库 24 处 /
+          // 19 张；3151551777 的 models/album.json：textures[0]=album2 内置封面、
+          // usertextures[0]=$mediaThumbnail）：真实封面优先级高于作者内置封面。
+          // 上面的用户图片槽循环只认属性文件路径，保留名会被漏掉；槽 0 已就绪就
+          // 立刻切 textureName，没就绪则登记**迟到绑定**（与实例层同一张表），
+          // 真实封面上传后顶替掉内置占位图。只处理非 solid 普通层，不碰实例
+          // （实例的保留名在 instance.usertextures，前面已处理）。
+          if (!layer.solid) {
+            for (let si = 0; si < (layerUts?.length || 0); si++) {
+              const reserved = utNameAt(si);
+              if (!reserved || !reserved.startsWith("$")) continue;
+              if (si === 0) {
+                if (textures.has(reserved)) {
+                  layer.textureName = reserved;
+                } else {
+                  pendingInstanceMedia.push({ layer, name: reserved });
+                }
+              }
+            }
+          }
           for (let si = 0; si < texSlots.length; si++) {
             const tn = texSlots[si];
             if (typeof tn !== "string" || !tn || tn.startsWith("util/") || tn.startsWith("_rt_")) continue;
             texJobs.push(
               loadTex(tn).then((entry) => {
                 if (!entry) return;
-                // 实例用户纹理占用槽 0 时不得回写模型默认贴图（异步 then 晚于上面的绑定）
-                if (si === 0 && !instBoundTex) {
+                // 实例/材质保留纹理占用槽 0 时不得回写模型默认贴图（异步 then 晚于绑定）
+                if (si === 0 && !instBoundTex && !pendingInstanceMedia.some((p) => p.layer === layer)) {
                   layer.textureName = tn;
                   loadedTex++;
                   if (entry.videoCtl) (layer as any).videoCtl = entry.videoCtl;
