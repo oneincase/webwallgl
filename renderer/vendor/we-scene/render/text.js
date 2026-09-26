@@ -1426,7 +1426,32 @@ function extractWorkshopId(script) {
  * （3789604238 等 7 张 Simple Visualizer；此前 typeof 非 object → 空层）
  */
 function makeThisScene(opts) {
-  const layerProxy = (layer) => makeObjectLayerProxy(layer || null, opts)
+  // [we-scene patch] 按图层缓存代理：对象脚本常按名反复取同一批图层。
+  // 3662790108（847 层 / 672 脚本）的 update 里 `thisScene.getLayer(name)` 数百次/帧，
+  // 每次调用都重建一份带十余个闭包的代理 —— 稳态剖面里 makeObjectLayerProxy 自时间
+  // 3.2%、getLayer 1.2%、GC 1.7%（调用链 renderLoop → callUpdate → update → getLayer）。
+  //
+  // 复用是**等价语义**，不是放宽：代理的 getter 一律从 layer 读实时值，代理内部没有
+  // 「每次调用」的状态（store 只作 setter 的落笔暂存、从不被读回；boneOverrides 由
+  // getBoneOverrides 按图层返回同一份表）。官方 IThisSceneObject.getLayer 返回的也是
+  // 稳定对象，缓存后反而更贴近官方。
+  //
+  // 缓存作用域 = 一个 sandbox（opts 每 sandbox 一份常量，含 targetEffect，不能跨
+  // sandbox 共享）。WeakMap 键图层对象本身：createLayer 造出的新层、destroyLayer
+  // 销毁的层都跟着对象生命周期走，不需要手动失效。
+  // A/B 钩子：__noProxyCache=true 关掉缓存跑基线（对照跑法见提交说明）。每 sandbox
+  // 只解析一次，稳态零额外开销。
+  const proxyCacheOff = globalThis.__noProxyCache === true
+  const proxyCache = new WeakMap()
+  const layerProxy = (layer) => {
+    if (proxyCacheOff || !layer) return makeObjectLayerProxy(layer || null, opts)
+    let p = proxyCache.get(layer)
+    if (p === undefined) {
+      p = makeObjectLayerProxy(layer, opts)
+      proxyCache.set(layer, p)
+    }
+    return p
+  }
   return {
     getLayer(name) {
       if (opts.getSceneLayer) {
