@@ -1,4 +1,24 @@
 // 媒体壁纸：合成单图层 scene 走 we-scene；无 WebGL2 时回退 DOM。
+//
+// 按需渲染（静态媒体壁纸不再每帧重绘）
+// ------------------------------------
+// 图片 / GIF 这类媒体壁纸的全部时变输入只有四项：纹理内容、画布尺寸、fit、
+// cover 窥视偏移。四项都不变时，这一帧的输出与上一帧**逐像素相同**
+// （实测 image 壁纸 4.8s 内 6 次采样帧差恒为 0，即渲染器侧不依赖场景时间 t），
+// 于是每帧走一遍 clear + 全屏光栅化是纯浪费：1920×937 全屏图片壁纸稳态
+// 12.5%~18.7% 单核里，绝大部分就是这份重绘。
+//
+// 三条纪律：
+// 1. **不停 rAF 循环，只是不提交渲染**。窥视 lerp 收敛、GIF 换帧、画布尺寸变化、
+//    宿主热改 fit 都挂在循环上；而且 frameStats 在 400ms 无帧后会把 running 判成
+//    false，停循环会让宿主与测试台以为壁纸出事。收益也不在 rAF 回调上 —— 实测
+//    60fps→10fps 就拿到约八成收益，成本在渲染提交。
+// 2. **首帧必须提交**（renderedOnce）：渲染器要在首次 render 里建 program/FBO。
+// 3. **静止位要如实上报**（rt.renderIdleAt → frameStats().idle）：静止期间没有帧提交，
+//    没有这一位就分不清「静止待命」和「暂停/挂了」。
+//
+// capture 无需改动：本路径保留 preserveDrawingBuffer:true（实测它对 CPU 无影响，
+// 见提交记录），画布在静止期间也不被 clear，所以 toDataURL 仍拿到最后一帧。
 import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, reapplyVolume, reportDiag, syncCanvasSize, type Runtime } from "./shell";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
@@ -391,8 +411,9 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
 
       const TEX = "__media";
       const textures = new Map<string, any>();
-      /** 每帧刷新纹理（gif 用；video 由渲染器内部按 currentTime 上传） */
-      let refreshTex: (() => void) | undefined;
+      /** 每帧刷新纹理（gif 用；video 由渲染器内部按 currentTime 上传）。
+       *  返回「纹理是否真的换了帧」 —— 按需渲染的静止判据之一。 */
+      let refreshTex: (() => boolean) | undefined;
       let mediaW = 0;
       let mediaH = 0;
 
@@ -413,12 +434,15 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
                 rg88: false,
               };
               textures.set(TEX, entry);
-              // 按各帧自己的 duration 推进（GIF 每帧时长可不同），到末帧回环
+              // 按各帧自己的 duration 推进（GIF 每帧时长可不同），到末帧回环。
+              // 返回值 = 纹理内容是否真的换了新帧：按需渲染靠它判断这一帧要不要提交
+              // （见下方 renderLoop 的静止判据）。未到时长、或单帧上传失败（保留上
+              // 一帧）都返回 false —— 那两种情况画面与上一帧逐像素相同。
               let idx = 0;
               let nextAt = performance.now() + gifFrames.frames[0].durationMs;
               refreshTex = () => {
                 const now = performance.now();
-                if (now < nextAt) return;
+                if (now < nextAt) return false;
                 idx = (idx + 1) % gifFrames.frames.length;
                 nextAt = now + gifFrames.frames[idx].durationMs;
                 gl.bindTexture(gl.TEXTURE_2D, entry.glTex);
@@ -433,7 +457,9 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
                   );
                 } catch {
                   /* 单帧上传失败：保留上一帧 */
+                  return false;
                 }
+                return true;
               };
               // 卸载时释放解码出的位图（每帧一张 ImageBitmap，不释放会积压显存）
               const prev = rt.sceneCleanup;
@@ -482,8 +508,23 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
       // 帧率上限门：相位累加调度（见 shell.ts FrameGate），替代会误丢整帧的死重闸门
       const frameGate = new FrameGate(rt.cfg.sceneFps || 60);
       let gateFps = rt.cfg.sceneFps || 60;
+      // 按需渲染状态（见文件头注释）：renderedOnce 保证首帧一定提交（渲染器要在
+      // 首次 render 里建 program/FBO，跳过它就等于永远不初始化）；lastFit /
+      // lastPeek* 记上一帧真正提交时用过的输入，逐项精确比对。
+      let renderedOnce = false;
+      let lastFit = normalizeFit(rt.cfg.fit);
+      let lastPeekX = rt.coverAlign.x;
+      let lastPeekY = rt.coverAlign.y;
+      let lastCanvasW = c.width;
+      let lastCanvasH = c.height;
+      // A/B 钩子：__noMediaIdle=true 关掉按需渲染跑基线（对照跑法见提交说明）
+      const mediaIdleOff = (globalThis as any).__noMediaIdle === true;
       const renderLoop = (now: number) => {
         if (disposed || rt.paused) return;
+        // 静止心跳按 **rAF 节奏**刷新，不按出帧节奏：帧率门会把大部分 rAF 拦在
+        // shouldRender 之外，只在放行的帧上刷新的话，心跳会随 sceneFps 上限一起变慢
+        // ——sceneFps 调到 1~2 时心跳就超时，静止待命被误报成「没在跑」。
+        if (rt.renderIdleAt) rt.renderIdleAt = now;
         // 帧率上限：比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
         // 热改 fps 同步进调度器（保留节拍相位，平滑收敛）。
         const fps = rt.cfg.sceneFps || 60;
@@ -492,10 +533,45 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
           frameGate.setFps(fps);
         }
         if (frameGate.shouldRender(now)) {
-          markFrame(rt, now);
+          // 画布尺寸变化会让 backing store 失效（尺寸一改内容即作废），必须先同步。
+          // **保持裸调用语句**：verify-arch 有一条守卫要求媒体与场景循环每帧都出现
+          // `syncCanvasSize(rt, c, rt.cfg)`（窗口改比例后 cover 才跟着裁，见那里的注释）。
           syncCanvasSize(rt, c, rt.cfg);
-          refreshTex?.();
+          // 「尺寸真的变了没有」与上一帧提交时用过的尺寸比对 —— 与 peek/fit 同一口径：
+          // 四项输入都跟「上次提交时的值」精确比，而不是跟「挂载时的值」比。
+          const sizeChanged = c.width !== lastCanvasW || c.height !== lastCanvasH;
+          // GIF：只有到了它自己的帧时长才换帧（refreshTex 内部的时长闸门）
+          const texAdvanced = refreshTex?.() === true;
           const peek = rt.coverAlign;
+          // 窥视偏移与「上一帧真正提交时用过的值」做**精确比较**，不用阈值：
+          // advanceCoverAlign 在误差 <1e-3 时会**吸附**到目标（shell.ts），
+          // 用阈值判「还在动」会让最后一次渲染发生在吸附之前 —— 画布就永久停在
+          // 偏离目标 ≤1e-4 的那一帧上（亚像素偏移，肉眼无感，但逐像素比对能看出
+          // 0.18 的像素差）。精确比较下吸附那一下也算「变了」，于是补渲一帧正好落在
+          // 目标值上；之后 align 不再变化，自然停帧，收敛后不会自激。
+          const peekMoved = peek.x !== lastPeekX || peek.y !== lastPeekY;
+          const fit = normalizeFit(rt.cfg.fit);
+          const fitChanged = fit !== lastFit;
+          // 这四项是静态媒体壁纸**全部的时变输入**：纹理内容、画布尺寸、fit、窥视偏移。
+          // 都不变时这一帧的输出与上一帧逐像素相同（实测 image 壁纸 4.8s 内 6 次采样
+          // 帧差恒为 0，即渲染器侧不依赖 t），重新提交是纯浪费。
+          //
+          // 注意这里**不是停循环**，只是不提交：rAF 照跑，因为窥视收敛、GIF 换帧、
+          // 画布尺寸变化、宿主热改 fit 都挂在循环上；而且 frameStats 在 400ms 无帧
+          // 后会把 running 判成 false，停循环会让宿主/测试台以为壁纸出事。
+          // 收益本来也不在 rAF 回调上：实测 60fps→10fps 已拿到约八成，成本在渲染提交。
+          if (!mediaIdleOff && renderedOnce && !sizeChanged && !texAdvanced && !peekMoved && !fitChanged) {
+            rt.renderIdleAt = now; // 进入静止待命：从这里起由循环开头逐 rAF 刷新心跳
+            rt.raf = requestAnimationFrame(renderLoop);
+            return;
+          }
+          markFrame(rt, now);
+          rt.renderIdleAt = 0;
+          lastFit = fit;
+          lastPeekX = peek.x;
+          lastPeekY = peek.y;
+          lastCanvasW = c.width;
+          lastCanvasH = c.height;
           void renderer
             .render(
               scene,
@@ -503,11 +579,12 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
               c.width,
               c.height,
               (now - start - pauseAccum) / 1000,
-              normalizeFit(rt.cfg.fit),
+              fit,
               peek.x,
               peek.y,
             )
             .then(() => {
+              renderedOnce = true;
               // 库化桥接：首帧**画完之后**才 resolve mount()（一次性）。
               // 放在 render() 之前会早一帧落地，调用方拿到实例时画布还是空的；
               // autoplay:false 紧接着 pause()，画面就永远停在一片 clearcolor。

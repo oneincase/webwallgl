@@ -205,6 +205,12 @@ export type Runtime = {
   softwareRenderer?: boolean;
   /** 实例级帧率计（见 frameStats） */
   frameMeter: { stamps: number[]; last: number; fps: number };
+  /**
+   * 按需渲染的静止心跳：静态媒体壁纸（图片 / 已解码 GIF）在当前输入没变而跳过
+   * 渲染提交时，由渲染循环每帧刷新为 performance.now()。frameStats 靠它的**时效**
+   * 把「静止待命」与「循环已死」区分开（见那里注释）。
+   */
+  renderIdleAt?: number;
   /** 实例注册的 window/document 级监听，destroy 时成对摘除（**跨壁纸存活**） */
   disposers: Array<() => void>;
   /**
@@ -443,6 +449,9 @@ export function clear(rt: Runtime) {
   // 调试出口持有整张场景图与全部贴图的 CPU 侧缓冲，拆场景时一并清掉
   clearSceneDebugGlobals();
   resetFrameMeter(rt);
+  // 按需渲染的静止心跳属于刚拆掉的那张壁纸：不清会让下一张（场景/视频）的
+  // 观测面板继续显示「静止」。
+  rt.renderIdleAt = 0;
 }
 
 /**
@@ -505,12 +514,24 @@ export function resetFrameMeter(rt: Runtime) {
 /**
  * 当前帧率快照。停下来（暂停 / 释放 / 循环出错熔断）时读数要归零而不是
  * 冻在最后一个值上 —— 一个不再更新的 60 会让人以为壁纸还在跑。
+ *
+ * `idle` 用来把「静止待命」与「真的没在出帧（暂停/挂了）」区分开：按需渲染的
+ * 静态媒体壁纸循环还活着、画面完好，只是这一帧的输出与上一帧逐像素相同、
+ * 不需要重新提交（见 media.ts 的按需渲染）。没有这一位的话，测试台只能靠
+ * fps=0 判断，会把健康的静止壁纸显示成待机态。
  */
-export function frameStats(rt: Runtime): { fps: number; running: boolean } {
-  if (!rt.frameMeter.last || rt.paused) return { fps: 0, running: false };
-  const idle = performance.now() - rt.frameMeter.last;
-  if (idle > Math.max(FPS_WINDOW_MS, 400)) return { fps: 0, running: false };
-  return { fps: rt.frameMeter.fps, running: true };
+export function frameStats(rt: Runtime): { fps: number; running: boolean; idle: boolean } {
+  if (!rt.frameMeter.last || rt.paused) return { fps: 0, running: false, idle: false };
+  const now = performance.now();
+  // 静止位带心跳：按需渲染期间循环每帧刷新它，所以「活着但不出帧」是有时效的。
+  // 循环一旦死掉（渲染出错熔断 / 释放），心跳过期，这里自动落回「没在跑」——
+  // 不需要在每条退出路径上手动清位（漏一处就会把挂掉的壁纸报成健康）。
+  const idle = !!rt.renderIdleAt && now - rt.renderIdleAt < Math.max(FPS_WINDOW_MS, 400);
+  if (now - rt.frameMeter.last > Math.max(FPS_WINDOW_MS, 400)) {
+    // 静止待命期间本就没有帧提交，不能因此判成没在跑；fps 如实为 0
+    return { fps: 0, running: idle, idle };
+  }
+  return { fps: rt.frameMeter.fps, running: true, idle };
 }
 
 /**

@@ -246,10 +246,12 @@ declare global {
     /**
      * 运行时观测面（只读）。宿主 / 测试台轮询取真实帧率：
      * fps 是渲染循环最近 500ms 的实测值，running=false 表示已暂停或没在出帧。
+     * idle=true 表示「静止待命」：循环活着、画面完好，只是这一帧的输出与上一帧
+     * 逐像素相同而无需重新提交（静态媒体壁纸的按需渲染），此时 fps 如实为 0。
      * 网页壁纸经 shim postMessage 打点，可读。
      */
     __wpStats?: {
-      frame(): { fps: number; running: boolean };
+      frame(): { fps: number; running: boolean; idle?: boolean };
     };
   }
 }

@@ -68,7 +68,7 @@ type RendererWindow = Window & {
   };
   /** 渲染器运行时观测面（见 renderer/src/main.ts 的 __wpStats） */
   __wpStats?: {
-    frame(): { fps: number; running: boolean };
+    frame(): { fps: number; running: boolean; idle?: boolean };
   };
 };
 
@@ -837,12 +837,21 @@ function resetLiveFps() {
 
 function pollLiveFps() {
   const w = frameEl.contentWindow as RendererWindow | null;
-  let stats: { fps: number; running: boolean } | undefined;
+  let stats: { fps: number; running: boolean; idle?: boolean } | undefined;
   try {
     // 跨源时读 contentWindow 会抛（渲染器同源，仅兜底）
     stats = w?.__wpStats?.frame();
   } catch {
     stats = undefined;
+  }
+  // 静止待命：循环活着、画面完好，只是这一帧的输出与上一帧逐像素相同因而没提交
+  // （静态媒体壁纸的按需渲染，见 media.ts 文件头）。它与「没在出帧（暂停/没挂上）」
+  // 必须分开显示 —— 没有这一支，健康的静止壁纸会被显示成待机态，看起来像出错。
+  if (stats?.running && stats.idle) {
+    statusLiveFpsEl.textContent = t("status.idle");
+    statusLiveFpsEl.classList.add("idle");
+    statusLiveFpsEl.classList.remove("low");
+    return;
   }
   if (!stats?.running || !(stats.fps > 0)) {
     resetLiveFps();
