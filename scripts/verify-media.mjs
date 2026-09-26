@@ -730,6 +730,59 @@ const { check, errors } = createChecker();
   }
 }
 
+// ---------- 5c. 实例层封面迟到绑定（3122339805 / 3151551777 / 3155776049） ----------
+// instance.usertextures 绑 $mediaThumbnail 的层：真实封面由系统实况在装配期之后
+// 才异步上传，装配循环那一刻纹素表里没有保留名 → 实例层留在 solid，封面位永远
+// 是占位块。修法是把这些层登记成 pending，封面纹理一进表就 solid→texture 补绑。
+// 功能判据在真 headless 上跑（真实封面到达后层 textureName=$mediaThumbnail、
+// solid=false，画面出真封面）；本节钉住语料存在与三处接线，删任一接线都会红。
+{
+  const expected = {
+    "3122339805": 2,   // Album Cover / Album Cover Hider
+    "3151551777": 1,   // Solid Placeholder=Audio Album Cover
+    "3155776049": 2,   // 两个 Album（200 / 300）
+  };
+  let totalPending = 0;
+  let ids5c = [];
+  try { ids5c = fs.readdirSync(LIB); } catch { ids5c = []; }
+  for (const id of ids5c) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let n = 0;
+    try {
+      const pkg = parsePkg(fs.readFileSync(pkgPath));
+      const sj = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8").replace(/^﻿/, ""));
+      const scene = parseScene(sj, null);
+      for (const l of scene.layers) {
+        const ut = l.srcObject?.instance?.usertextures;
+        if (Array.isArray(ut) && ut[0] && typeof ut[0].name === "string"
+          && ut[0].name.startsWith("$media")) n++;
+      }
+    } catch { n = 0; }
+    totalPending += n;
+    if (expected[id] !== undefined) {
+      check(n === expected[id],
+        `${id} 应有 ${expected[id]} 个实例层绑 $media 保留名，实得 ${n}`);
+    }
+  }
+  check(totalPending >= 5,
+    `全库应至少有 5 个实例层封面绑定（迟到绑定的语料前提），实得 ${totalPending}`);
+
+  const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/const pendingInstanceMedia/.test(smSrc), "scene-mount 必须有 pendingInstanceMedia 登记表");
+  // 装配循环：绑不到时必须登记（旧实现直接什么都不做）
+  check(/else if \(instUtName\) \{\s*pendingInstanceMedia\.push/.test(smSrc),
+    "实例层绑不到保留纹理时必须登记 pendingInstanceMedia");
+  // 两个触发点：texJobs 完成（壁纸自带封面等）与真实封面上传进表（系统实况）
+  check(/await Promise\.all\(texJobs\);[\s\S]{0,120}bindPendingInstanceMedia\(\)/.test(smSrc),
+    "texJobs 完成后必须补绑一次 pending 实例层");
+  const uploadIdx5c = smSrc.indexOf("const uploadThumbnailBitmap");
+  check(uploadIdx5c >= 0 &&
+    /bindPendingInstanceMedia\(\)/.test(smSrc.slice(uploadIdx5c, uploadIdx5c + 2600)),
+    "真实封面上传后必须在 uploadThumbnailBitmap 内补绑 pending 实例层");
+  console.log(`  实例层迟到绑定：全库 ${totalPending} 层，3 张报障壁纸的 5 层全部在案`);
+}
+
 // ---------- 6. 图层声音 / 视频纹理控制 ----------
 {
   const spyCtl = () => {

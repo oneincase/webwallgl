@@ -1335,6 +1335,22 @@ cfg, source, pkgAbort.signal);
         );
       }
 
+      // [we-scene patch] 实例层（instance.usertextures 绑保留名）的**迟到绑定**：
+      // 真实封面由系统实况在装配期之后异步上传，装配循环此刻查不到 `$mediaThumbnail`，
+      // 实例层只能留在 solid 兜底（3122339805 / 3151551777 / 3155776049 封面位
+      // 永远画成 solid 占位块）。把这些层收集起来，纹理一就绪就补绑；纹理像素在
+      // 同一 glTex 上原地更新，晚几帧切换 solid→texture 不影响引用方。
+      const pendingInstanceMedia: Array<{ layer: any; name: string }> = [];
+      const bindPendingInstanceMedia = () => {
+        for (let i = pendingInstanceMedia.length - 1; i >= 0; i--) {
+          const { layer, name } = pendingInstanceMedia[i];
+          if (!textures.has(name)) continue;
+          layer.textureName = name;
+          layer.solid = false;
+          pendingInstanceMedia.splice(i, 1);
+        }
+      };
+
       // [we-scene patch] WE 的两个保留纹理名：当前封面 / 上一张封面。
       // 全库 35 + 29 处引用（作者直接把它们填进 image 或 textures 槽）。
       // 独立测试台没有真实专辑封面，用模拟媒体源的程序化封面填充；
@@ -1428,6 +1444,8 @@ cfg, source, pkgAbort.signal);
             prev.generated = false;
           }
         }
+        // 真实封面刚进纹素表：登记在案的实例层此刻可以从 solid 切到封面纹理
+        bindPendingInstanceMedia();
         return palette;
       };
 
@@ -2363,11 +2381,14 @@ cfg, source, pkgAbort.signal);
             instUt?.[0] && typeof instUt[0].name === "string" && instUt[0].name.startsWith("$")
               ? instUt[0].name
               : null;
-          // 只在保留纹理真实就绪时才占位；否则维持 solid/默认槽兜底
+          // 只在保留纹理真实就绪时才占位；否则维持 solid 兜底并登记**迟到绑定**：
+          // 真实封面多在装配完成后才上传，不回头补绑的话封面位永远是 solid 块
           const instBoundTex = instUtName && textures.has(instUtName) ? instUtName : null;
           if (instBoundTex) {
             (layer as any).textureName = instBoundTex;
             (layer as any).solid = false;
+          } else if (instUtName) {
+            pendingInstanceMedia.push({ layer, name: instUtName });
           }
           // [we-scene patch] 图层 size 缺省时从模型尺寸回退：820654165 等场景的
           // 简单图片层不带 size 字段，parseScene 默认 [0, 0]，导致 layerModelMatrix
@@ -2627,6 +2648,8 @@ cfg, source, pkgAbort.signal);
         }
       }
       await Promise.all(texJobs);
+      // 贴图装载完成后再扫一遍：部分保留纹理（壁纸自带封面等）是 texJobs 拉进来的
+      bindPendingInstanceMedia();
       if (bakeEnabled) {
         reportDiag(
           rt,
