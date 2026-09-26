@@ -12,6 +12,7 @@ export default defineConfig({
     port: 1430,
     strictPort: true,
     open: true,
+    host: true,
   },
   build: {
     target: "es2022",
