@@ -483,6 +483,25 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         // xScale 是 `float xScale = max(1.0, …)`，减号右边那个裸 1 才是 int，
         // 报 `'-' : … 'float' and … 'int'`。上面那条只覆盖变量在右的方向。
         code = code.replace(new RegExp('\\b(' + alt + ')\\s*([+-])\\s*(\\d+)(?![\\d.])', 'g'), '$1 $2 $3.0')
+
+        // [we-scene patch] 浮点变量 乘/除（或加/减）一个**纯整型字面量括号**：
+        // `u_gap / (100 * 32)`（3461168300 simple_gradient_audio_bar，两种音条共用）。
+        // `100 * AUDIOSAMPLES` 经宏展开成 `100 * 32`，int×int 折成 const int；`u_gap` 是
+        // uniform float，GLSL ES 报 `'/' : … 'uniform float' and 'const int'`，整条音条
+        // 效果被跳过 —— 音条区只剩底层白色四边形，表现为「整块白屏」，与音频无关。
+        // 上面各条 `*`/`/` 规则的右操作数都要求裸字面量/标识符，`(` 一律漏掉；括号扫描
+        // （445）又只认**左侧是 int 字面量**的方向。这里补「float 名在左 / 在右」两向。
+        // 仅当括号内是**纯整数字面量**（无标识符、无小数点）才补 .0：有标识符时其类型
+        // 未知（可能是 int 下标/计数），留给别的规则或原样，避免污染整型上下文成 float。
+        const promoteIntParen = (inner) => inner.replace(/(^|[\s(*+/-])(\d+)(?![\d.])/g, '$1$2.0')
+        // 捕获正则 `[\d\s*+/-]+` 已保证 inner 只含数字/空白/运算符（无标识符、无小数点），
+        // guard 只需再确认至少有一个数字（排除空/纯运算符）。（注意别用 `\w` 判「非数字」——
+        // `\w` 含数字，会把 `100 * 32` 误判成非纯 int 而自我否决。）
+        const pureIntParen = (inner) => /\d/.test(inner)
+        code = code.replace(new RegExp('\\b(' + alt + ')\\s*([*/+-])\\s*\\(([\\d\\s*+/-]+)\\)', 'g'),
+          (all, name, op, inner) => (pureIntParen(inner) ? `${name} ${op} (${promoteIntParen(inner)})` : all))
+        code = code.replace(new RegExp('\\(([\\d\\s*+/-]+)\\)\\s*([*/+-])\\s*\\b(' + alt + ')', 'g'),
+          (all, inner, op, name) => (pureIntParen(inner) ? `(${promoteIntParen(inner)}) ${op} ${name}` : all))
       }
     }
 
