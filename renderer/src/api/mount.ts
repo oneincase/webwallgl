@@ -14,7 +14,7 @@ import {
 import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
 import type { WallpaperConfig, WallpaperFit } from "../types";
-import { normalizeQuality } from "../quality";
+import { normalizeQuality, normalizeVideoTexScale } from "../quality";
 import type { QualityOptions, ResolvedQuality } from "./types";
 import { weShimCall } from "../web";
 import { sniffMediaType, workshopIdFromSourceKey } from "./source";
@@ -74,6 +74,9 @@ async function resolveMountConfig(
 
     // 0 = 自动跟随设备 DPR（Retina 原生清晰，默认）；显式正数 = 目标 DPR
     renderDpr: o.renderDpr ?? 0,
+    // 视频纹理上传倍率：0 = 自动（帧率守门按实测压）；正数 = 固定（1 = 不压）。
+    // 原样透传，规范化在消费方（scene-mount 走 normalizeVideoTexScale）。
+    videoTexScale: o.videoTexScale ?? 0,
     sceneFps: o.fps ?? 60,
     muted: (o.volume ?? 0) <= 0,
     loop: true,
@@ -458,6 +461,20 @@ export function createScene(
       // 读**生效值**：自动降档（软件渲染预设 / 帧率守门）只改 rt.qualityEffective，
       // 这里若读 cfg.quality 会让宿主以为请求值生效了，进而看不出为什么画质变差。
       return rt.qualityEffective ?? normalizeQuality(currentOptions.quality ?? rt.cfg.quality);
+    },
+
+    // 视频纹理上传倍率热更（画质页「视频纹理清晰度」）：0 = 自动（帧率守门接管），
+    // 正数 = 固定（1 = 不压最清晰、0.5 = 半幅最省）。就地生效、不重挂载；
+    // 与 setQuality 同纪律合并进 currentOptions —— load()/restore() 后仍保持。
+    setVideoTexScale(scale: number) {
+      const v = normalizeVideoTexScale(scale);
+      currentOptions = { ...currentOptions, videoTexScale: v };
+      rt.cfg.videoTexScale = v;
+      rt.sceneCtl?.setVideoTexScale?.(v);
+    },
+    /** 当前**请求**的倍率（0 = 自动）。生效值（含守门下坡结果）见诊断上报。 */
+    getVideoTexScale(): number {
+      return normalizeVideoTexScale(rt.cfg.videoTexScale);
     },
 
     setProperties(props: Record<string, PropertyValue>) {

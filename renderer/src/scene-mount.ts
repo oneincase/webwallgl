@@ -9,6 +9,9 @@ import type { WallpaperConfig } from "./types";
 import {
   applyAutoQuality,
   createAdaptiveQuality,
+  createAdaptiveVideoScale,
+  nextVideoScale,
+  normalizeVideoTexScale,
   normalizeQuality,
   particleQualityScale,
   postFboCapFactor,
@@ -344,6 +347,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   // 性能设置（抗锯齿/粒子/后处理）热更入口。cfg.quality 是真源：impl 未就绪
   // （渲染器还没建出来）时只写 cfg，装配到建渲染器那步会按 cfg.quality 应用。
   let setQualityImpl: ((q: ResolvedQuality) => void) | undefined;
+  /** 视频纹理上传倍率热更入口（画质页「视频纹理清晰度」）。同 setQuality 纪律：
+   *  impl 未就绪时只写 cfg，建渲染器那步按 cfg 应用。 */
+  let applyVideoScaleImpl: ((v: number) => void) | undefined;
   /** 宿主**请求**的档位（cfg.quality，显式优先判据用）与**实际生效**档位分开存：
    *  自动降档只动后者，getQuality() 读后者 —— 宿主才能看出「我给的 high 为什么没生效」。 */
   const requestedQuality = () => normalizeQuality(rt.cfg.quality);
@@ -361,6 +367,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
     setQuality(q) {
       rt.cfg.quality = { ...normalizeQuality(rt.cfg.quality), ...(q ?? {}) };
       setQualityImpl?.(normalizeQuality(rt.cfg.quality));
+    },
+    /** 视频纹理上传倍率（0=自动交给守门，>0 固定）。显式值优先于自动下坡。 */
+    setVideoTexScale(scale) {
+      rt.cfg.videoTexScale = normalizeVideoTexScale(scale);
+      applyVideoScaleImpl?.(rt.cfg.videoTexScale);
     },
   };
 
@@ -3467,7 +3478,6 @@ cfg, source, pkgAbort.signal);
         const textShared: Record<string, unknown> = {}; // 同场景文字脚本共享状态（WE shared 全局）
       let textCanvas: HTMLCanvasElement | null = null;
       let textCtx: CanvasRenderingContext2D | null = null;
-      let textEvalDue = 0; // 求值节流（时钟类脚本 1s 粒度，100ms 足够）
       if (!SKIP_TEXT && scene.layers.some((l: any) => l.isText)) {
         const ortho = (scene as any).general?.orthogonalprojection;
         const projW = ortho?.width || c.width;
@@ -3719,7 +3729,7 @@ cfg, source, pkgAbort.signal);
             for (const it of textWidgets) renderer.gl.deleteTexture(it.entry.glTex);
           };
         }
-        // 每帧（100ms 节流）：沙箱求值 → 内容变化才重排版/重绘/上传纹理。
+        // 每帧：沙箱求值 → 内容变化才重排版/重绘/上传纹理（求值不再节流，见调用处注释）。
         // 求值对全部文字层执行（含隐藏层：World Time 类脚本跨层读它们），绘制只画可见层。
         const updateTexts = (t: number) => {
           if (!textCtx || !textCanvas) return;
@@ -4691,6 +4701,30 @@ cfg, source, pkgAbort.signal);
             },
           })
         : null;
+      // 帧率守门第二段：视频纹理上传倍率。后处理降到底仍然不够时，缺口多半在
+      // 「逐帧 texImage2D(DOM 源)」这条路径上（WKWebView 要同步跨进程取像素，
+      // 代价随像素数线性），而它**不受后处理/粒子档影响**——实测 post 一路降到 off
+      // 帧率纹丝不动。所以这里单独下坡，且只在渲染器确实在逐帧传视频纹理时介入
+      // （没视频的场景降它只会变糊不变快）。
+      // 显式倍率（画质页「视频纹理清晰度」）优先：给了就不再参与自动下坡。
+      const requestedVideoScale = () => normalizeVideoTexScale(rt.cfg.videoTexScale);
+      let videoTexScale = 1;
+      const applyVideoScale = (v: number) => {
+        const next = v > 0 ? v : 1; // 0/非法 = 不额外压，之后交给阶梯
+        if (next === videoTexScale) return;
+        videoTexScale = next;
+        renderer.setVideoTexScale?.(next);
+      };
+      applyVideoScale(requestedVideoScale());
+      applyVideoScaleImpl = applyVideoScale;
+      const adaptiveVideo = autoRes.allowAdaptive
+        ? createAdaptiveVideoScale({
+            onStepDown: (next, reason) => {
+              applyVideoScale(next);
+              reportDiag(rt, cfg, `autoQuality: 视频纹理上传倍率 → ${next}（${reason}）`);
+            },
+          })
+        : null;
       let adaptiveAccum = 0;
       let lastAdaptiveT = 0;
       // 关键帧动画的上一帧时刻（真实时钟，秒）。**不能用固定的目标帧间隔累加**：
@@ -4723,13 +4757,33 @@ cfg, source, pkgAbort.signal);
             if (adaptiveAccum >= 1000) {
               const dtS = adaptiveAccum / 1000;
               adaptiveAccum = 0;
-              adaptive.tick(
-                rt.frameMeter.fps,
-                rt.cfg.sceneFps || 60,
-                dtS,
-                // 阶梯位置同样取生效值（见 onDowngrade 的注释）
-                (rt.qualityEffective ?? requestedQuality()).postProcessing,
-              );
+              const postNow = (rt.qualityEffective ?? requestedQuality()).postProcessing;
+              const capNow = rt.cfg.sceneFps || 60;
+              const upNow = renderer.videoUploadStats?.();
+              const videoDone = nextVideoScale(videoTexScale) === null;
+              // 视频上传本身就是主要成本时**先压它**：实测这种场景（2570×1446 逐帧上传
+              // 占帧时间 ~70%）把后处理从 medium 一路降到 off，帧率纹丝不动 —— 先走后处理
+              // 阶梯既慢（~18s）又纯丢画质。「主要成本」的判据用实测值：单次上传耗时
+              // 超过帧预算的 25%（30fps 下 8.3ms）。
+              const budgetMs = capNow > 0 ? (1000 / capNow) * 0.25 : 8;
+              const videoHeavy = !!(upNow && upNow.uploadsPerSec > 0 && upNow.costMs >= budgetMs);
+              const videoPinned = requestedVideoScale() > 0; // 显式指定 → 阶梯不碰
+              if (adaptiveVideo && !videoPinned && videoHeavy && !videoDone) {
+                adaptiveVideo.tick(rt.frameMeter.fps, capNow, dtS, videoTexScale);
+              } else {
+                adaptive.tick(
+                  rt.frameMeter.fps,
+                  capNow,
+                  dtS,
+                  // 阶梯位置同样取生效值（见 onDowngrade 的注释）
+                  postNow,
+                );
+                // 第二段：后处理已经没坡可下，且这个场景确实在逐帧传视频纹理 ——
+                // 此时唯一的减压手段是压上传倍率（见 createAdaptiveVideoScale）。
+                if (adaptiveVideo && !videoPinned && postNow === "off" && !videoDone && upNow && upNow.uploadsPerSec > 0) {
+                  adaptiveVideo.tick(rt.frameMeter.fps, capNow, dtS, videoTexScale);
+                }
+              }
             }
           }
           syncCanvasSize(rt, c, rt.cfg);
@@ -5256,11 +5310,16 @@ cfg, source, pkgAbort.signal);
               } catch (e) { /* 单个回调出错已在沙箱里熔断，这里兜底不打断渲染 */ }
               // 消费完毕再推进 last：下一帧才能看到「上一帧位置 vs 新位置」。
               pointerSrc.beginFrame();
+              // [we-scene patch 2026-09-26] 文字脚本**每帧求值**（原来 100ms 节流）。
+              // 节流是 1.0.0-beta1 起就有的、没有依据的保守优化，但它把「文字脚本的
+              // 调用节奏」暴露给了脚本：作者常写 `fps = 1000/(now-lastCall)` 这种
+              // 自算帧率的小挂件（3510729512 的 newproperty46「当前帧率显示」就是），
+              // 于是挂件恒读 ~9~10（= 1000/100ms），与真实帧率无关、把用户带偏。
+              // WE 官方每帧调 update()，本仓跟着对齐。
+              // 代价可控：重排版/重绘/上传纹理本来就有「内容不变就跳过」的门控
+              // （见 updateTexts），每帧多做的是沙箱里的纯 JS 求值。
               try {
-                if (rt.sceneTextUpdate && now >= textEvalDue) {
-                  textEvalDue = now + 100;
-                  rt.sceneTextUpdate(t);
-                }
+                if (rt.sceneTextUpdate) rt.sceneTextUpdate(t);
               } catch (e) { /* 文字更新失败忽略 */ }
               rt.raf = requestAnimationFrame(renderLoop);
             })

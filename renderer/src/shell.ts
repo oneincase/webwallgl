@@ -96,6 +96,8 @@ export type Runtime = {
     applyUserProperties(props: Record<string, { value: unknown }>): void;
     /** 性能设置热更（抗锯齿/粒子/后处理档位，就地生效不重挂载） */
     setQuality?(q: QualityOptions): void;
+    /** 视频纹理上传倍率热更（0=自动交给帧率守门，>0 固定；显式值优先于自动下坡） */
+    setVideoTexScale?(scale: number): void;
   };
   /**
    * 外部指针注入句柄（桌面壁纸窗口在桌面 underlay 层收不到鼠标事件，由宿主

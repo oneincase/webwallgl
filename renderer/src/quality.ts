@@ -218,3 +218,93 @@ export function createAdaptiveQuality(opts: { onDowngrade: (next: PostQuality, r
     },
   };
 }
+
+// ---- 帧率守门第二段：视频纹理上传倍率（后处理到底之后的唯一减压手段）----
+
+/**
+ * 视频纹理上传倍率阶梯。
+ *
+ * 为什么需要第二段：后处理降到底仍然不够时，剩下的缺口常常来自**逐帧把视频帧传成
+ * GL 纹理**。**注意**：2026-09-27 起上传默认直传视频元素（省掉同步跨进程取位图，
+ * 每帧 1~2ms），直传可用时这段阶梯根本不会触发；它留给直传失败走了 canvas 中转的
+ * WebView（那时上传代价随像素数线性，压尺寸是唯一杠杆）。WKWebView 下 WebGL 在 GPU 进程，`texImage2D(DOM 源)` 要把像素同步取回
+ * 页面进程，代价随像素数线性（3510729512 实测：上传 2570×1446 → 16fps；压到
+ * 1280×720 → 29fps；完全不传 → 满帧 30。同一页面同配置在 Chromium 直接满帧）。
+ * 这条路径**降后处理/粒子都救不回来** —— 实测 post 从 medium 一路降到 off，
+ * 帧率纹丝不动，白丢画质。
+ *
+ * 台阶取 0.5 / 0.35 / 0.25：上传代价随**像素数**线性，而像素数跟着画布走 ——
+ * 同样的 0.35，在 2570 宽的画布上是 899×506（够，回满帧），在 3024 宽的画布上
+ * 是 1058×595（仍差，实测 18.6ms/帧只到 24fps），所以要留一档 0.25。
+ * 更精的技术路线是把 `willReadFrequently` 画布或像素数据上传用起来绕开同步取像素，
+ * 实测都更慢（见 docs 里的诊断），尺寸是唯一有效杠杆。
+ */
+export const VIDEO_SCALE_LADDER: readonly number[] = [0.5, 0.35, 0.25];
+
+/**
+ * 宿主显式指定倍率时的合法性判定：`0`/`undefined`/负数/非法 = 自动（交给阶梯），
+ * 其它收敛到 (0,1]。显式值**优先于阶梯**（同「显式优先」纪律，见 applyAutoQuality）。
+ */
+export function normalizeVideoTexScale(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0; // 0 = 自动
+  return Math.min(1, Math.max(0.05, n));
+}
+
+/** 视频倍率的下一档（已是最后一档返回 null）。 */
+export function nextVideoScale(cur: number): number | null {
+  const v = Number(cur);
+  if (!Number.isFinite(v) || v >= 1) return VIDEO_SCALE_LADDER[0] ?? null;
+  // 取「严格小于当前值」的第一档：宿主传来的可能是 0.5 这种正好等于台阶的值
+  for (const step of VIDEO_SCALE_LADDER) {
+    if (step < v - 1e-6) return step;
+  }
+  return null;
+}
+
+/** 视频倍率下坡的判据：后处理已无坡可下，所以节奏比后处理那段更紧。 */
+export const VIDEO_STRIKES = 2;
+export const VIDEO_COOLDOWN_S = 5;
+export const VIDEO_GRACE_S = 3;
+
+/**
+ * 帧率守门第二段的独立状态机。与后处理那段分开的理由：
+ *  1. 只有渲染器**确实在逐帧传视频纹理**时宿主才该喂它（没视频的场景降它毫无意义）；
+ *  2. 那段到底之后节奏可以更紧（后处理一次降档涉及 shader 链重建，要留观察期）。
+ * 当前倍率**由调用方传入**（同后处理那段的纪律：宿主手里才是生效值）。
+ */
+export function createAdaptiveVideoScale(opts: {
+  onStepDown: (next: number, reason: string) => void;
+}) {
+  let strikes = 0;
+  let cooldown = 0;
+  let elapsed = 0;
+  return {
+    /** 每秒调用一次；current 为当前生效倍率（1 = 不额外压）。 */
+    tick(fps: number, cap: number, dtS: number, current: number): number | null {
+      elapsed += dtS;
+      if (elapsed < VIDEO_GRACE_S) return null;
+      if (cooldown > 0) {
+        cooldown -= dtS;
+        return null;
+      }
+      if (!(cap > 0) || !(fps > 0)) {
+        strikes = 0;
+        return null;
+      }
+      if (fps >= cap * ADAPTIVE_FPS_RATIO) {
+        strikes = 0;
+        return null;
+      }
+      strikes++;
+      if (strikes < VIDEO_STRIKES) return null;
+      strikes = 0;
+      const next = nextVideoScale(current);
+      if (next === null) return null;
+      cooldown = VIDEO_COOLDOWN_S;
+      const reason = `连续 ${VIDEO_STRIKES} 秒 ${fps.toFixed(0)}fps < 上限 ${cap} 的 ${ADAPTIVE_FPS_RATIO * 100}%（后处理已到底）`;
+      opts.onStepDown(next, reason);
+      return next;
+    },
+  };
+}

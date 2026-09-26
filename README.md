@@ -131,7 +131,8 @@ input.addEventListener("change", () => {
 | `features` | `全开` | 调试开关：models / text / particles / effects / components |
 | `webSandbox` | `"legacy"` | 网页壁纸 iframe 沙箱档：legacy = allow-scripts + allow-same-origin（默认，与 WallpaperEM 一致）；strict = 只给 allow-scripts（宿主与壁纸共享 origin 时，防作者脚本以宿主身份调用宿主 API）。strict 下控制/指针/滚轮/音频/媒体自动改走 postMessage 通道，API 面完全一致 |
 | `quality` | `全默认` | 渲染质量档位（对标 WE 客户端性能选项）：antiAliasing: "off"（默认）/"fxaa"/"msaa2"/"msaa4"、particles: "high"（默认）/"medium"/"low"/"off"（低/中档按倍率同时缩数量上限与发射率）、postProcessing: "high"（默认）/"medium"/"low"/"off"（低/中档压效果链 FBO 分辨率；off=效果链直通+跳整屏后期层+关 Bloom）。超采样走 renderDpr |
-| `autoQuality` | `true` | 自动降档（**只填你没显式指定的键**）：① 探到**软件渲染（无 GPU）**时自动关后处理并把画布 DPR 压到 0.5；② 运行期帧率连续 3 秒低于上限 85% 时把后处理降一档（high→medium→low→off，只降不升，每档间隔 6 秒）。显式的 quality.postProcessing 永远优先；传 false 整体关闭（query ?autoq=0 同效）。实际生效值读 getQuality() |
+| `videoTexScale` | `0` | 视频纹理上传倍率：`0` = 自动（帧率守门按实测帧率往下压），正数 = 固定（1 = 不压最清晰、0.5 = 半幅）。macOS WKWebView 下逐帧 `texImage2D(视频帧)` 要把像素**同步**取回页面进程，代价随像素数线性（全屏视频层 2570×1446 → 16fps，1285×723 → 29fps，上限 30），全屏视频层只有压尺寸这一条路。**显式值优先于自动下坡**（画质页「视频纹理清晰度」就是它） |
+| `autoQuality` | `true` | 自动降档（**只填你没显式指定的键**）：① 探到**软件渲染（无 GPU）**时自动关后处理并把画布 DPR 压到 0.5；② 运行期帧率连续 3 秒低于上限 85% 时把后处理降一档（high→medium→low→off，只降不升，每档间隔 6 秒）；③ 后处理已到底仍不够、且这个场景确实在逐帧传视频纹理时，继续把**视频纹理上传倍率**往下压（1→0.5→0.35：WKWebView 下逐帧 texImage2D 的同步取像素代价随像素数线性，这是唯一的减压手段）。显式的 quality.postProcessing 永远优先；传 false 整体关闭（query ?autoq=0 同效）。实际生效值读 getQuality() |
 | `bake` | `true` | 贴图烘焙（B3）：内嵌 PNG/JPEG 的**预缩放缓存**，默认开（传 false / query ?bake=0 关闭）。内嵌图的现状路径是「解全尺寸再缩」，实测大图最贵的就是这一步；命中缓存后只做一次解码（52 张内嵌图实测解码 470ms → 94ms，-80%；端到端 TTFF 热加载 -14%，冷加载与不烘持平），**像素与不烘时逐位一致**（缓存存的是处理完 EXIF 回滚后的最终位图）。未命中走原路径并把结果排进后台队列（首帧后才开跑，不拖慢本次加载）；键 = 壁纸指纹 + 贴图指纹 + 资源档位，窗口缩放不会导致重烘 |
 | `onReady / onError / onDiagnostic` | `—` | 回调面；也可之后用 instance.on() 订阅 |
 
@@ -147,6 +148,7 @@ input.addEventListener("change", () => {
 - ① **帧率上限**（fps: 30）：scene 壁纸稳态 CPU 降 25~38%（847 层的实时太阳系 73%→46%、效果链重的 Persona 5 场景 59%→45%），代价是 30fps 的观感；网页壁纸几乎无效（负载在壁纸自己的进程里，实测 89%→89%）
 - ② **后处理档位**（quality.postProcessing）：off 稳定省 25~40% CPU，并把掉到 43fps 的场景拉回 60。粒子档**除 off 外基本无效**（1630 live 粒子的场景：high 85.8% / medium 84.9% / off 14.2% —— medium 是安慰剂，off 会让雪/雨/火花整片消失），所以自动降档只走后处理
 - ③ **无 GPU（软件渲染）**：后处理 off **加**画布 DPR 0.5 缺一不可 —— 单用 pp=off 是 16fps、单用 DPR 0.5 仍是 0fps、两者同时 46fps。这一对由 autoQuality 在挂载期自动套用（显式指定则不覆盖）
+- ④ **视频纹理上传**（WKWebView 专属坑）：WebGL 在 GPU 进程、页面在 WebContent 进程，逐帧 `texImage2D(视频/画布)` 要把像素**同步**取回本进程，代价随该帧像素数线性。实测（macOS 14" XDR，DPR2，画布 2570×1669，fps 上限 30）：上传 2570×1446 时主线程每帧堵 ~40ms（**16~17fps**，后处理从 medium 降到 off 帧率纹丝不动 —— 这条路径不受后处理档影响）、压到 1285×723 → 29fps、899×506 → 30fps（满帧），同一页面同配置在 Chromium 直接满帧。**根因与解**：WebKit 下 `texImage2D(canvas)` 要把位图**同步**取回页面进程（`RemoteNativeImageProxy::platformImage`，实测 3024 宽上传每帧堵主线程 40~80ms），而 `texImage2D(视频元素)` 走加速面 —— 实测同一场景同尺寸**每帧只要 1~2ms**、满分辨率 3024×1701 也能 30fps 满帧（主线程最长停顿 11~12ms），把 fps 上限调到 60 更是 60fps 满帧。所以改成**直传视频元素优先**，直传失败（个别 WebView）才回退离屏 canvas 中转；另外视频纹理按**图层屏幕足迹**封顶（需要多少传多少），并给帧率守门加了第二段下坡（1 → 0.5 → 0.35，仅在直传不可用、后处理又已到底时才介入）
 
 ## 实例 API SceneInstance
 

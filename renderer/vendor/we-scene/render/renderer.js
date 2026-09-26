@@ -704,6 +704,16 @@ export function createRenderer(canvas, opts = {}) {
     videoCanvas.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0'
   }
   let videoCanvasReported = false
+  // [we-scene patch 2026-09-27] 上传源策略：**优先直传视频元素**。
+  // WKWebView 实测（同一场景 / 3024 宽画布 / 30fps 上限）：
+  //   离屏 canvas 中转 → 每帧把位图**同步**取回本进程（RemoteNativeImageProxy::
+  //     platformImage），3024 宽上传堵主线程 40~80ms，视频得压到 0.35 才勉强 24~30fps；
+  //   直传视频元素 → 同样满分辨率（3024×1701）30fps 满帧，主线程最长停顿 11~12ms。
+  // 即当年那句「video→GL 直传在部分 WebView 受限」加的中转，在 macOS 上正是病根：
+  // WebKit 能给视频元素走加速面，canvas 每次都要跨进程取像素。
+  // 直传失败一次就永久回退中转（保留旧行为兜底）。
+  let videoDirectChecked = false
+  let videoDirectFailed = false
   // [we-scene patch] 上次上报的视频纹理上传尺寸（"WxH"）。上限随渲染目标变化，
   // 变了就重报一次，便于确认清晰度设置是否真的生效。
   let videoTexReportedSize = ''
@@ -713,6 +723,55 @@ export function createRenderer(canvas, opts = {}) {
   // MIN_CAP：渲染目标尺寸在首帧前可能是 0/1，别据此把纹理压成一条线。
   const VIDEO_TEX_HARD_CAP = 3840
   const VIDEO_TEX_MIN_CAP = 1024
+  // [we-scene patch 2026-09-26] 视频纹理上传的两个新约束。原因（实测，3510729512）：
+  // WKWebView 下 WebGL 在 GPU 进程、页面在 WebContent 进程，**逐帧 `texImage2D(DOM 源)`
+  // 要把像素同步取回本进程**（`RemoteNativeImageProxy::platformImage` → 同步 IPC），
+  // 代价随该帧像素数线性走：上传 2570×1446 时主线程每帧堵 ~40ms（16fps / 上限 30），
+  // 压到 1280×720 回到 29fps，完全不传 30fps。Chromium 无此代价（同页面满帧）。
+  //   ① 图层足迹封顶（免费）：只需要 ≥ 该层在屏幕上占的设备像素，多传的采样阶段就扔掉。
+  //   ② 上传倍率（取舍，只降不升）：宿主帧率守门把后处理降到底后，从这里继续下坡。
+  //      `setVideoTexScale(0.5)` 即半幅上传 —— 全屏视频层唯一的减压手段。
+  let videoTexScale = 1
+  let videoUploadsPerSec = 0
+  /** 近 1 秒内的上传次数窗口（守门用它判断「这个场景到底在不在传视频」） */
+  let videoUploadCount = 0
+  let videoUploadWindowAt = 0
+  /** 单次上传的耗时（EMA，含同步取像素的等待；诊断出口用） */
+  let videoUploadCostMs = 0
+  /** 自适应下限：压到这个尺寸以下就没意义了（比首帧兜底 VIDEO_TEX_MIN_CAP 更低） */
+  const VIDEO_TEX_ADAPTIVE_MIN = 640
+  // 场景声明的正交视口（每帧在 renderScene 刷新）——图层足迹要用它把世界尺寸折成设备像素。
+  // 透视场景保持 null：那里世界单位与像素的换算不是常数，不做足迹封顶（与 S4 同纪律）。
+  let sceneOrtho = null
+  /**
+   * [we-scene patch 2026-09-26] 视频层的设备像素足迹（口径与宿主 [S4] 图层足迹表一致：
+   * 正交投影下 devicePx = 世界尺寸 × 画布设备像素 / 视口世界尺寸，旋转取 AABB，
+   * 有尺寸/缩放动画的层放宽 1.4）。
+   *
+   * 为什么视频纹理需要它：视频是**逐帧**上传的，多传的像素每帧都要付一次
+   * （WKWebView 下还要同步跨进程取一回），不像图片只在装载时付一次。层没写 size
+   * 时返回 0 = 算不出，调用方保持原上限（宁可多传，不擅自压糊）。
+   */
+  function videoLayerFootprintPx(layer, width, height) {
+    if (!sceneOrtho) return 0
+    const sz = (layer && layer.size) || null
+    const sc = (layer && layer.scale) || [1, 1, 1]
+    const w = Math.abs(Number(sz && sz[0]) || 0) * Math.abs(Number(sc[0]) || 1)
+    const h = Math.abs(Number(sz && sz[1]) || 0) * Math.abs(Number(sc[1]) || 1)
+    if (!(w > 0) || !(h > 0)) return 0
+    const angles = (layer && layer.angles) || [0, 0, 0]
+    const ang = Number(angles[2]) || 0
+    const c = Math.abs(Math.cos(ang))
+    const s = Math.abs(Math.sin(ang))
+    const bw = w * c + h * s
+    const bh = w * s + h * c
+    const pxX = (width || 0) / Math.max(1, sceneOrtho.w)
+    const pxY = (height || 0) / Math.max(1, sceneOrtho.h)
+    const animLayers = layer && layer.animationlayers
+    const animated = !!((layer && (layer.sizeAnimation || layer.scaleAnimation)) || (animLayers && animLayers.length))
+    const safety = 1.15 * (animated ? 1.4 : 1)
+    return Math.max(bw * pxX, bh * pxY) * safety
+  }
   // FBO 分辨率限幅系数：0 = 关闭（全质量）；>0 时效果链 FBO 上限 = 屏幕占比 × 系数
   let fboCapFactor = opts.fboCapFactor === undefined ? 0 : opts.fboCapFactor
   // [we-scene patch] 性能设置（对标 WE 客户端：抗锯齿 / 后处理开关）。
@@ -2706,6 +2765,15 @@ export function createRenderer(canvas, opts = {}) {
     bindFinal()
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
+    // [we-scene patch 2026-09-26] 视频纹理的「图层足迹」需要世界→设备像素的常数换算：
+    // 只有显式正交投影（orthogonalprojection.width/height 且 auto 不为 true）才有。
+    // 口径与宿主侧的 [S4] 图层足迹表一致（那边用它定图片贴图的尺寸）。
+    {
+      const ortho = general.orthogonalprojection
+      const ow = Number(ortho && ortho.width) || 0
+      const oh = Number(ortho && ortho.height) || 0
+      sceneOrtho = ow > 0 && oh > 0 && !(ortho && ortho.auto === true) ? { w: ow, h: oh } : null
+    }
     // HDR 目标首帧不清零会残留上一场景；clearColor 作用于当前绑定的 HDR FBO。
     if (!hdrDiagDone) { hdrDiagDone = true; if (hdrActive) diag(`hdr scene target: RGBA16F ${width}x${height}`) }
     // [we-scene patch] 场景环境光（g_LightAmbientColor）：材质 combos.LIGHTING=1
@@ -3470,12 +3538,22 @@ export function createRenderer(canvas, opts = {}) {
           if (targetMax > 0) limit = Math.min(limit, targetMax)
           // 渲染目标异常小（首帧前 width/height 可能是 0/1）时别把纹理压成一条线
           limit = Math.max(limit, VIDEO_TEX_MIN_CAP)
+          // [we-scene patch 2026-09-26] ① 图层足迹封顶（免费，不减画质）：
+          // 只需要 ≥ 这层在屏幕上占的设备像素，超出的采样阶段就被扔掉，纯白付
+          // 每帧同步取像素的代价。口径同宿主 [S4]（正交场景才做；旋转取 AABB；
+          // 有尺寸/缩放动画的层放宽 1.4 —— 动画会把足迹撑大，宁可少省不可变糊）。
+          const footprint = videoLayerFootprintPx(layer, width, height)
+          if (footprint > 0) limit = Math.min(limit, Math.max(VIDEO_TEX_ADAPTIVE_MIN, footprint))
+          // [we-scene patch 2026-09-26] ② 自适应倍率（宿主帧率守门驱动，只降不升）。
+          if (videoTexScale < 1) {
+            limit = Math.min(limit, Math.max(VIDEO_TEX_ADAPTIVE_MIN, limit * videoTexScale))
+          }
           let scale = 1
           if (Math.max(vw, vh) > limit) scale = limit / Math.max(vw, vh)
           const uw = Math.max(1, Math.round(vw * scale))
           const uh = Math.max(1, Math.round(vh * scale))
           let src = v
-          if (videoCanvas && uw > 0 && uh > 0) {
+          if (videoDirectFailed && videoCanvas && uw > 0 && uh > 0) {
             if (videoCanvas.width !== uw || videoCanvas.height !== uh) {
               videoCanvas.width = uw
               videoCanvas.height = uh
@@ -3487,15 +3565,47 @@ export function createRenderer(canvas, opts = {}) {
               src = videoCanvas
             }
           }
+          // [we-scene patch 2026-09-26] 单次上传耗时（EMA）。WKWebView 下这里会包含
+          // 同步取像素的等待 —— 正是要找的那个数；诊断出口与守门判断都看它。
+          const uploadT0 = typeof performance !== 'undefined' ? performance.now() : 0
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src)
-          // canvas 直传失败（部分 WebView）：回退为像素数据上传
-          if (gl.getError() !== gl.NO_ERROR && videoCanvas) {
-            try {
-              const vctx2 = videoCanvas.getContext('2d')
-              const id = vctx2.getImageData(0, 0, videoCanvas.width, videoCanvas.height)
-              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, videoCanvas.width, videoCanvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(id.data.buffer))
-              while (gl.getError() !== gl.NO_ERROR) {}
-            } catch (e) {  }
+          if (uploadT0 > 0) {
+            const cost = performance.now() - uploadT0
+            videoUploadCostMs = videoUploadCostMs > 0 ? videoUploadCostMs * 0.8 + cost * 0.2 : cost
+          }
+          // 上传次数窗口（每秒结算一次，供 videoUploadsPerSec）
+          {
+            const nowMs = typeof performance !== 'undefined' ? performance.now() : 0
+            if (!videoUploadWindowAt) videoUploadWindowAt = nowMs
+            videoUploadCount++
+            const span = nowMs - videoUploadWindowAt
+            if (span >= 1000) {
+              videoUploadsPerSec = Math.round((videoUploadCount * 1000) / span)
+              videoUploadCount = 0
+              videoUploadWindowAt = nowMs
+            }
+          }
+          // [we-scene patch 2026-09-27] 直传首次失败（个别 WebView）：标记 + 立刻
+          // 改用离屏 canvas 中转重传本帧，之后永久走中转。
+          if (!videoDirectChecked) {
+            videoDirectChecked = true
+            if (gl.getError() !== gl.NO_ERROR && videoCanvas) {
+              videoDirectFailed = true
+              try {
+                if (videoCanvas.width !== uw || videoCanvas.height !== uh) {
+                  videoCanvas.width = uw
+                  videoCanvas.height = uh
+                }
+                const vctx2 = videoCanvas.getContext('2d')
+                if (vctx2) {
+                  vctx2.clearRect(0, 0, uw, uh)
+                  vctx2.drawImage(v, 0, 0, uw, uh)
+                  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoCanvas)
+                  while (gl.getError() !== gl.NO_ERROR) {}
+                }
+              } catch (e) {  }
+              diag('video upload: 直传失败，改用离屏 canvas 中转')
+            }
           }
           texObj.width = uw
           texObj.height = uh
@@ -3505,7 +3615,11 @@ export function createRenderer(canvas, opts = {}) {
           if (videoTexReportedSize !== uw + 'x' + uh) {
             videoTexReportedSize = uw + 'x' + uh
             videoCanvasReported = true
-            diag('video tex ready ' + uw + 'x' + uh + ' (src ' + vw + 'x' + vh + ', limit ' + limit + ')')
+            diag(
+              'video tex ready ' + uw + 'x' + uh + ' (src ' + vw + 'x' + vh + ', limit ' + limit +
+                ', footprint ' + (footprint > 0 ? Math.round(footprint) : 'n/a') +
+                ', texScale ' + videoTexScale + ', upload ' + videoUploadCostMs.toFixed(1) + 'ms)',
+            )
           }
         } catch (e) {
           if (!videoCanvasReported) {
@@ -4089,6 +4203,27 @@ export function createRenderer(canvas, opts = {}) {
     progCache,
     shaderResolver,
     whiteTex,
+    /**
+     * [we-scene patch 2026-09-26] 视频纹理上传倍率（1 = 不额外压；0.5 = 半幅上传）。
+     *
+     * 宿主帧率守门在后处理降到底之后用它继续下坡。存在意义：WKWebView 逐帧
+     * `texImage2D(DOM 源)` 要同步跨进程取像素，代价随像素数线性（实测 2570×1446
+     * → 16fps、1280×720 → 29fps、不传 → 满帧），全屏视频层没有别的减压手段。
+     * 只由宿主调用；非法值按 1（原行为）。
+     */
+    setVideoTexScale: function (s) {
+      const v = Number(s)
+      videoTexScale = Number.isFinite(v) && v > 0 && v <= 1 ? v : 1
+    },
+    /** [we-scene patch 2026-09-26] 诊断出口：视频纹理上传现状（守门据此跳过无视频的场景） */
+    videoUploadStats: function () {
+      return {
+        uploadsPerSec: videoUploadsPerSec,
+        costMs: Math.round(videoUploadCostMs * 10) / 10,
+        texScale: videoTexScale,
+        tex: videoTexReportedSize,
+      }
+    },
     // 场景切换时清空 shader 相关缓存（避免复用上一个场景的 shader 源/程序）
     resetShaderCaches: function () {
       progCache.clear()

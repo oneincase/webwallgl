@@ -480,6 +480,8 @@ const initialCfg: WallpaperConfig = {
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
   // query 缺省 0 = 自动跟随设备 DPR（Retina 原生清晰）；显式数字是目标 DPR
   renderDpr: Number(params.get("renderDpr")) || 0,
+  // 视频纹理上传倍率：0/缺省 = 自动（帧率守门接管）；正数 = 固定（1 = 不压）
+  videoTexScale: Number(params.get("vidscale")) || 0,
   sceneFps: Number(params.get("sceneFps")) || 60,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",

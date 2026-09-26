@@ -90,6 +90,33 @@ const q = await loadQuality();
   const bad = q.qualityFromQuery((k) => (k === "aa" ? "msaa9" : null));
   check(bad.antiAliasing === "off", "query 非法档位回退默认");
 }
+// 视频纹理上传倍率阶梯（帧率守门第二段）：只降不升、到底返回 null、非法按 1
+{
+  check(q.VIDEO_SCALE_LADDER.length > 0 && q.VIDEO_SCALE_LADDER.every((v) => v > 0 && v < 1),
+    "视频倍率阶梯都是 (0,1) 区间内的值");
+  check(q.nextVideoScale(1) === q.VIDEO_SCALE_LADDER[0], "nextVideoScale(1) = 阶梯第一档");
+  check(q.nextVideoScale(q.VIDEO_SCALE_LADDER[0]) === (q.VIDEO_SCALE_LADDER[1] ?? null),
+    "nextVideoScale 沿阶梯往下（0.5 → 0.35）");
+  const last = q.VIDEO_SCALE_LADDER[q.VIDEO_SCALE_LADDER.length - 1];
+  check(q.nextVideoScale(last) === null, "到底返回 null（守门据此停手）");
+  check(q.nextVideoScale(NaN) === q.VIDEO_SCALE_LADDER[0], "非法倍率按 1 处理");
+
+  const steps = [];
+  const m = q.createAdaptiveVideoScale({ onStepDown: (n) => steps.push(n) });
+  let scale = 1;
+  for (let i = 0; i < 14; i++) {
+    const got = m.tick(15, 30, 1, scale);
+    if (got !== null) scale = got;
+  }
+  check(steps.length >= 1 && steps[0] === q.VIDEO_SCALE_LADDER[0], "持续低帧率驱动视频倍率下坡");
+  check(scale < 1, "下坡后倍率真的变小了");
+
+  let up = 0;
+  const m2 = q.createAdaptiveVideoScale({ onStepDown: () => { up++; } });
+  for (let i = 0; i < 20; i++) m2.tick(30, 30, 1, 1);
+  check(up === 0, "满帧时视频倍率不动（不无谓降画质）");
+}
+
 // ---------- 2) 接线断言 ----------
 
 const rendererSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
@@ -108,6 +135,14 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/getFrameTarget:\s*function/.test(rendererSrc), "renderer 返回对象有 getFrameTarget（粒子 MSAA 绑定用）");
   check(/captureSceneTexture:\s*function/.test(rendererSrc), "renderer 返回对象有 captureSceneTexture（REFRACT 粒子用）");
   check(/renderbufferStorageMultisample/.test(rendererSrc), "MSAA 走多重采样 renderbuffer");
+  check(/setVideoTexScale:\s*function/.test(rendererSrc) && /videoUploadStats:\s*function/.test(rendererSrc),
+    "renderer 返回对象有 setVideoTexScale / videoUploadStats（视频下坡的两个出口）");
+  check(/videoLayerFootprintPx/.test(rendererSrc), "视频纹理按图层足迹封顶（免费那半）");
+  check(/let videoDirectFailed = false/.test(rendererSrc) && /videoDirectFailed && videoCanvas/.test(rendererSrc),
+    "视频纹理**直传优先**（canvas 中转只在直传失败后启用）");
+  check(/videoDirectFailed = true[\s\S]{0,400}drawImage\(v, 0, 0, uw, uh\)[\s\S]{0,200}texImage2D/.test(rendererSrc),
+    "直传失败会当场改用 canvas 中转重传（兜底不丢画面）");
+  check(/limit \* videoTexScale/.test(rendererSrc), "自适应倍率真的参与上传尺寸计算");
   check(/blitFramebuffer/.test(rendererSrc), "MSAA resolve 走 blitFramebuffer");
   // WebKit 变通（2026-09-15 实测定案）：「MSAA → 默认帧缓冲」的 blit 在 WebKit
   // （WKWebView/ANGLE Metal）一律 INVALID_OPERATION 静默失败，画面冻在切换前
@@ -167,6 +202,13 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/setQuality\(patch: QualityOptions\)/.test(apiMountSrc), "SceneInstance.setQuality 存在");
   check(/p\.set\("aa", aaEl\.value\)/.test(benchSrc) && /p\.set\("pq", pqEl\.value\)/.test(benchSrc) && /p\.set\("pp", ppEl\.value\)/.test(benchSrc),
     "测试台 buildQuery 带 aa/pq/pp");
+  check(/createAdaptiveVideoScale/.test(mountSrc) && /adaptiveVideo/.test(mountSrc),
+    "scene-mount 接了视频纹理倍率下坡（守门第二段）");
+  check(/videoUploadStats\?\.\(\)/.test(mountSrc), "下坡前先确认这个场景确实在传视频");
+  check(/vidscale/.test(mainSrc), "库 main.ts 解析 ?vidscale（视频纹理倍率）");
+  check(/videoTexScale: o\.videoTexScale/.test(apiMountSrc), "resolveMountConfig 透传 videoTexScale");
+  check(/normalizeVideoTexScale/.test(mountSrc) && /videoPinned/.test(mountSrc),
+    "宿主显式倍率优先于自动下坡（videoPinned 闸门）");
   check(/webwallgl-quality/.test(benchSrc), "测试台质量设置 localStorage 持久化");
   check(/id="aa"/.test(indexSrc) && /id="pq"/.test(indexSrc) && /id="pp"/.test(indexSrc), "测试台工具条有三个档位下拉");
 }

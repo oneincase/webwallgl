@@ -36,6 +36,16 @@ export type WallpaperConfig = {
   renderDpr?: number;
   /** 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低；默认 60 */
   sceneFps?: number;
+  /**
+   * 视频纹理上传倍率：`0`/缺省 = 自动（帧率守门按实测帧率压，见 quality.ts），
+   * 正数 = 固定倍率（1 = 不压，最清晰；0.5 = 半幅）。**显式值优先于守门**。
+   *
+   * 存在的理由（macOS WKWebView 实测）：逐帧 `texImage2D(视频帧)` 要把像素同步取回
+   * 页面进程，代价随像素数线性 —— 全屏视频层上传 2570×1446 时主线程每帧堵 ~40ms
+   * （16fps / 上限 30），压到 1285×723 回到 29fps。宿主把它暴露成用户可选项
+   * （画质页「视频纹理清晰度」），让用户在清晰与流畅之间自己定。
+   */
+  videoTexScale?: number;
   /** 渲染质量设置（抗锯齿/粒子/后处理档位，见 quality.ts）。缺省 = 全默认
    *  （AA off、粒子 high、后处理 high），与引入前的行为一致。 */
   quality?: QualityOptions;

@@ -323,6 +323,15 @@ export type MountOptions = {
    * 物理最长边封顶 4096 防爆显存，超出等比回收。调低（如 1）可省显存。
    */
   renderDpr?: number;
+  /**
+   * 视频纹理上传倍率：0/缺省 = 自动（帧率守门按实测帧率压，见 quality.ts），
+   * 正数 = 固定（1 = 不压最清晰、0.5 = 半幅最省）。显式值优先于自动下坡。
+   *
+   * 为什么需要：macOS WKWebView 下逐帧 `texImage2D(视频帧)` 要同步跨进程取像素，
+   * 代价随像素数线性（全屏视频层 2570×1446 → 16fps，1285×723 → 29fps，上限 30）。
+   * 宿主把它做成用户可选项（画质页），在清晰与流畅之间自己定。
+   */
+  videoTexScale?: number;
   /** 帧率上限。默认 60。渲染循环跳过比目标更快的帧，降低 GPU 占用 */
   fps?: number;
   /**
@@ -407,6 +416,10 @@ export type SceneInstance = {
    * 换场景/load() 之后保持（与 setAudio 同纪律，合并进挂载选项）。
    */
   setQuality(patch: QualityOptions): void;
+  /** 视频纹理上传倍率热更（0 = 自动交给帧率守门；>0 固定，1 = 不压） */
+  setVideoTexScale(scale: number): void;
+  /** 当前请求的倍率（0 = 自动） */
+  getVideoTexScale(): number;
   /** 当前生效的质量设置（三项齐全，缺省键已按默认值补全） */
   getQuality(): ResolvedQuality;
 
