@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@1.4.2/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -346,7 +346,16 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 1.4.2. Per-version lists are no longer maintained here: every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
+Current version: 2.0.0 — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.
+
+- Performance (measured on real scenes): removed two wasted steps in texture decode — heavy-scene load −50~80%; MDL four-section signatures now scanned in one pass — model corpus scan −75%; merged in-frame visibility recomputation — steady-state CPU −39% on an 847-layer scene; layer-proxy read-only paths no longer pre-build 5 Vec3 — script-heavy scene CPU −19%.
+- Embedded-image bake cache: a hit saves ~80% of decode cost, on by default and toggleable; bake hit / back-fill counts are published as proper __memStats fields, same source as diagnostics and queryable at runtime.
+- Automatic quality downgrading without a GPU: a low-quality preset is selected automatically when no GPU is present, with an FPS watchdog for stability; explicit quality choices take priority and it can be disabled.
+- Song-cover priority fixes: a real cover now outranks the built-in cover at all three binding positions — solid instances (late re-binding), effect passes, and the layer's own material; fixes 3122339805 / 3151551777 / 3155776049 showing only a placeholder or built-in image, benefiting 55+ bindings across the library.
+- Web-wallpaper compatibility: fixed a first-screen white page for workshop apps in a strict sandbox (localStorage / cookie fallback for opaque sources), and a fully white page for web wallpapers with an author &lt;base> tag (relative base rewritten in place).
+- Tooling: added the perf-bench performance harness and a bake comparison mode; new checks including verify-bake joined the stable set. The B1 bake proposal was also validated on 48 samples (median saving only 15ms) and rejected as not worth it.
+
+Every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
 
 ## Copyright & compliance
 

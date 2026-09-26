@@ -506,8 +506,44 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: `当前版本 ${version}。这里不再维护逐版本列表：每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。`,
-          en: `Current version: ${version}. Per-version lists are no longer maintained here: every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.`,
+          zh: `当前版本 ${version}（自 1.4.2 起的大版本更新，共 15 个提交）。这一版主线是「重场景性能」与「真实媒体封面」：渲染/装配/解码链路做了多轮基于实测的优化，新增内嵌图烘焙缓存与无 GPU 自动降档，并补齐了歌曲封面在全部三个绑定位置上的优先级。`,
+          en: `Current version: ${version} — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.`,
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          {
+            zh: "性能优化（均为真实场景实测）：贴图解码去掉两笔白做的工作，重场景加载耗时 −50~80%；MDL 四个段签名改为单趟扫描，模型语料扫描 −75%；帧内合并可见性重算，847 层场景稳态 CPU −39%；图层代理只读路径不再预建 5 个 Vec3，脚本重场景 CPU −19%。",
+            en: "Performance (measured on real scenes): removed two wasted steps in texture decode — heavy-scene load −50~80%; MDL four-section signatures now scanned in one pass — model corpus scan −75%; merged in-frame visibility recomputation — steady-state CPU −39% on an 847-layer scene; layer-proxy read-only paths no longer pre-build 5 Vec3 — script-heavy scene CPU −19%.",
+          },
+          {
+            zh: "内嵌图烘焙缓存：命中时省约 80% 解码开销，默认开启、可关闭；烘焙命中/补烘统计写入 __memStats 正式字段，与诊断同源，可在运行时查询。",
+            en: "Embedded-image bake cache: a hit saves ~80% of decode cost, on by default and toggleable; bake hit / back-fill counts are published as proper __memStats fields, same source as diagnostics and queryable at runtime.",
+          },
+          {
+            zh: "无 GPU 自动降档：检测到无 GPU 时自动切到低质量预设，帧率守门保证稳定；显式质量选择优先，可关闭。",
+            en: "Automatic quality downgrading without a GPU: a low-quality preset is selected automatically when no GPU is present, with an FPS watchdog for stability; explicit quality choices take priority and it can be disabled.",
+          },
+          {
+            zh: "歌曲封面优先级修复：真实封面现在在三个绑定位置都高于壁纸内置封面——solid 实例（迟到补绑）、效果 pass、图层自身材质；修复 3122339805 / 3151551777 / 3155776049 封面位只显示占位图或内置图的问题，全库共 55+ 处绑定受益。",
+            en: "Song-cover priority fixes: a real cover now outranks the built-in cover at all three binding positions — solid instances (late re-binding), effect passes, and the layer's own material; fixes 3122339805 / 3151551777 / 3155776049 showing only a placeholder or built-in image, benefiting 55+ bindings across the library.",
+          },
+          {
+            zh: "网页壁纸兼容：修复严格沙箱下工坊应用首屏白屏（不透明源的 localStorage / cookie 兜底），以及自带 <base> 标签的网页壁纸整页白屏（相对 base 就地改写）。",
+            en: "Web-wallpaper compatibility: fixed a first-screen white page for workshop apps in a strict sandbox (localStorage / cookie fallback for opaque sources), and a fully white page for web wallpapers with an author <base> tag (relative base rewritten in place).",
+          },
+          {
+            zh: "工具链与工程：新增性能实测台 perf-bench 与烘焙对照模式；verify-bake 等新判据接入稳定集。另对 B1 烘焙方案做了 48 张样本认证（中位仅可省 15ms），实测收益不足，按结论不做。",
+            en: "Tooling: added the perf-bench performance harness and a bake comparison mode; new checks including verify-bake joined the stable set. The B1 bake proposal was also validated on 48 samples (median saving only 15ms) and rejected as not worth it.",
+          },
+        ],
+      },
+      {
+        k: "p",
+        v: {
+          zh: "每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。",
+          en: "Every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.",
         },
       },
     ],
