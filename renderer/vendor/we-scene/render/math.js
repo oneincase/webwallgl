@@ -329,16 +329,31 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
   // 仍忽略 eye/center —— 那是编辑器视口，运行时不用。
   if (isPerspectiveScene(scene)) {
     const aspect = height > 0 ? width / height : 16 / 9
-    const fov = numField(general.fov, 50)
+    // 运行时相机位姿优先取相机实体（引擎把相机 attach 到它的节点）；
+    // 没有相机实体时回落到顶层 scene.camera 的编辑器视口快照。
+    const rc = scene.runtimeCamera
+    const fov = rc && rc.fov > 0 ? rc.fov : numField(general.fov, 50)
     const near = Math.max(numField(general.nearz, 0.01), 1e-4)
     const far = Math.max(numField(general.farz, 10000), near + 1)
-    const view = mat4LookAt(eyeV, centerV, upV)
+    let rEye, rCenter
+    if (rc) {
+      rEye = rc.eye.slice()
+      // 零旋转看向 -z；按相机实体 angles（角度）旋转朝向。
+      let fwd = [0, 0, -1]
+      const ang = rc.angles || [0, 0, 0]
+      if (Number(ang[0]) || Number(ang[1])) fwd = rotateFwd(fwd, Number(ang[0]) || 0, Number(ang[1]) || 0)
+      rCenter = [rEye[0] + fwd[0], rEye[1] + fwd[1], rEye[2] + fwd[2]]
+    } else {
+      rEye = eyeV
+      rCenter = centerV
+    }
+    const view = mat4LookAt(rEye, rCenter, upV)
     const projection = mat4Perspective(fov, aspect, near, far)
     return {
       view,
       projection,
-      eye: eyeV,
-      center: centerV,
+      eye: rEye,
+      center: rCenter,
       projW: aspect,
       projH: 1,
       offX: 0,
@@ -417,6 +432,18 @@ function clamp01(v) {
 
 function parseVec(s) {
   return String(s).trim().split(/\s+/).map(Number)
+}
+
+// 相机实体 angles（角度，y-up 世界）旋转默认朝向 (0,0,-1)：先绕 Y 偏航、再绕 X 俯仰。
+function rotateFwd(fwd, pitchDeg, yawDeg) {
+  const toRad = Math.PI / 180
+  const yaw = yawDeg * toRad
+  let x = fwd[0] * Math.cos(yaw) + fwd[2] * Math.sin(yaw)
+  let z = -fwd[0] * Math.sin(yaw) + fwd[2] * Math.cos(yaw)
+  const pitch = pitchDeg * toRad
+  let y = fwd[1] * Math.cos(pitch) - z * Math.sin(pitch)
+  z = fwd[1] * Math.sin(pitch) + z * Math.cos(pitch)
+  return [x, y, z]
 }
 
 function normalize(v) {
