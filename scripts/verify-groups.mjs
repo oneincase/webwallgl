@@ -2244,6 +2244,80 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
         `如 ${sample.slice(0, 2).map((s) => `${s.id}#${s.ref}<-${s.dep}`).join("、")}`,
     );
   }
+
+  // ---------- P. 属性槽的原槽贴图也算合成源引用（3243449890）----------
+  // parse 把 `usertextures` 绑定的槽名换成属性名（`newproperty58`），原槽贴图只留在
+  // `textureFallbacks` 里，而用户没选自定义图时**渲染端正是回落到原槽名采样**。
+  // 合成源扫描（noteName / depOrder 的 scan）只看 `textures` 时，原槽是
+  // `_rt_imageLayerComposite_<id>_a` 的槽永远拿不到合成图 → resolveTextureName 落
+  // inputFBO 兜底（= 本层自己的输入）。clipping_mask 的
+  // `ApplyBlending(BLENDMODE, albedo, clip, mask)` 于是把本层占位图混回自己：3243449890
+  // 的四块三角从「背景蒙版合成图」变成一片纯白（实测近白像素 73196 → 12096，品红
+  // 探针图 61095 px 只在新链路下出现）。
+  {
+    const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    check(
+      /for \(const t of p\.textureFallbacks \|\| \[\]\) noteName\(t\)/.test(rsrc),
+      "合成源收集必须把 pass 的 textureFallbacks 算进引用（属性槽的原槽贴图）",
+    );
+    check(
+      /scan\(p\.textureFallbacks\)/.test(rsrc),
+      "合成源依赖序的 scan 同样要覆盖 textureFallbacks（否则拓扑序退化）",
+    );
+    // 语料：并集扫描两个视图 —— 合并后仍被引用的 RT，以及只在 fallback 里的 RT
+    const refRe2 = /^_rt_imageLayerComposite_(\d+)_[a-z]$/;
+    const onlyFallback = new Map(); // RT 名 → [壁纸 id]
+    const fbUsers = new Map(); // RT 名 → 引用方图层数
+    for (const w of wallpapers) {
+      const merged = new Set();
+      const fb = new Set();
+      for (const o of w.scene.objects || []) {
+        for (const e of o.effects || []) {
+          if (e.visible === false) continue;
+          for (const p of e.passes || []) {
+            const base = p.textures || [];
+            const ut = p.usertextures;
+            const m = base.slice();
+            if (Array.isArray(ut)) {
+              for (let i = 0; i < ut.length; i++) {
+                const u = ut[i];
+                const nm = u && typeof u === "object" ? u.name : typeof u === "string" ? u : null;
+                if (!nm) continue;
+                m[i] = nm;
+                if (typeof base[i] === "string" && refRe2.test(base[i])) {
+                  fb.add(base[i]);
+                  fbUsers.set(base[i], (fbUsers.get(base[i]) || 0) + 1);
+                }
+              }
+            }
+            for (const t of m) if (typeof t === "string" && refRe2.test(t)) merged.add(t);
+          }
+        }
+      }
+      for (const n of fb) if (!merged.has(n)) {
+        if (!onlyFallback.has(n)) onlyFallback.set(n, []);
+        onlyFallback.get(n).push(w.id);
+      }
+    }
+    check(
+      onlyFallback.size >= 3,
+      `语料里应存在「只有属性槽 fallback 引用」的合成源（否则判据没有意义），实得 ${onlyFallback.size}`,
+    );
+    check(
+      (onlyFallback.get("_rt_imageLayerComposite_16613_a") || []).includes("3243449890"),
+      "3243449890 的背景蒙版合成图必须只在属性槽 fallback 里被引用（语料前提）",
+    );
+    check(
+      (fbUsers.get("_rt_imageLayerComposite_16613_a") || 0) >= 4,
+      `3243449890 的四块三角都要引用 16613 的合成图，实得 ${fbUsers.get("_rt_imageLayerComposite_16613_a")}`,
+    );
+    console.log(
+      `   P. 属性槽原槽贴图：全库 ${onlyFallback.size} 个合成源只在 fallback 里被引用（` +
+        `${[...onlyFallback.values()].reduce((a, v) => a + v.length, 0)} 处 / ` +
+        `${new Set([...onlyFallback.values()].flat()).size} 张），如 ` +
+        `${[...onlyFallback.keys()].slice(0, 2).join("、")}`,
+    );
+  }
 }
 
 if (errors.length) {

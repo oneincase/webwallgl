@@ -603,6 +603,11 @@ export function parseScene(sceneJson, project) {
           // （本壁纸是 workshop/2978738836/500x500 灰色占位）。只存不删，渲染端
           // 在保留名解析不到内容时才用它。
           let textureFallbacks = null;
+          // [we-scene patch 3243449890] 被 `usertextures` 顶掉的槽名单独记一份：
+          // 属性名（`custombackground` / `newproperty58`）与真贴图名在合并后的
+          // `textures` 里**看不出区别**，装配期热更链路要靠这份表才知道「哪些槽是
+          // 用户图片槽、改了值要重新加载贴图」（见 scene-mount 的 propTexSlots）。
+          let userTextureNames = null;
           if (Array.isArray(ut)) {
             for (let i = 0; i < ut.length; i++) {
               const u = ut[i];
@@ -614,6 +619,8 @@ export function parseScene(sceneJson, project) {
                 if (!textureFallbacks) textureFallbacks = []
                 textureFallbacks[i] = base[i]
               }
+              if (!userTextureNames) userTextureNames = []
+              userTextureNames[i] = name
               textures[i] = name;
             }
           }
@@ -622,6 +629,7 @@ export function parseScene(sceneJson, project) {
             constantshadervalues: p.constantshadervalues || {},
             textures,
             textureFallbacks,
+            userTextureNames,
           };
         }),
       })),

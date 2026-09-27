@@ -587,6 +587,17 @@ cfg, source, pkgAbort.signal);
         (scene as any).properties || {},
       ) as Record<string, unknown>;
       rt.liveUserProps = liveUserProps;
+      // [we-scene patch 3243449890] 宿主**在装配期就下发**的属性值要先落进属性表。
+      // 装配末尾的 applyLiveProps(pendingWire) 只做图层/脚本/常量那一轮传播，而
+      // 「用户图片槽」的贴图预载（loadTexInner 的属性分支）在这之前就跑完了 ——
+      // 那时 liveUserProps 还是作者默认值（scenetexture / file 一律 ""），于是**带默认
+      // 覆盖启动**（用户上次选的图已存盘）也按空值加载，画面停在作者原槽贴图，
+      // 直到用户再动一次属性才可能生效。这里先做一次纯值合并（就地改
+      // scene.properties[].value 与 liveUserProps），预载与装配期的 resolveUserProps
+      // 就都读到用户值；末尾那轮照旧跑（幂等，脚本的 applyUserProperties 仍只派发一次）。
+      if (pendingWire) {
+        mergeUserPropertyValues((scene as any).properties || {}, liveUserProps, pendingWire);
+      }
       // 脚本写 thisLayer.visible 时改 visibleSelf，再整树重算有效 visible。
       // 见 parse.recomputeLayerVisibility / 3122339805 Eyes·Numbers。
       // 必须在文字/对象脚本装配之前建好，两边 opts 都注入同一引用。
@@ -1707,6 +1718,12 @@ cfg, source, pkgAbort.signal);
       }
 
       const texInflight = new Map<string, Promise<any | null>>();
+      // [we-scene patch 3243449890] 绑到**场景用户属性**的贴图槽（`usertextures`，
+      // 属性类型 file/scenetexture/usershortcut）：属性名集合 + 各自当前实际用到的
+      // 值。装配期预载时登记，热更时据此判断「值真的变了才重取图」——宿主整表重发
+      // 属性（切语言、改别的滑条）时不能白删白建 GL 纹理。
+      const propTexSlots = new Set<string>();
+      const propTexLoadedValue = new Map<string, string>();
       /**
        * [we-scene patch] 壁纸目录下的**散装文件**贴图（`files/xxx.gif` 这类）。
        *
@@ -2424,6 +2441,48 @@ cfg, source, pkgAbort.signal);
         });
         return p;
       };
+      /**
+       * [we-scene patch 3243449890] 用户图片槽的**热更**取图。
+       *
+       * 三条语义，缺一条都表现为「属性改了画面不动或回不去」：
+       *  - 新值可取图 → 换成新贴图（loadTexInner 的属性分支按现值拉文件）；
+       *  - 值被清空 → 删条目，渲染端自然回落到作者原槽贴图（parse 的
+       *    textureFallbacks，可能正是跨层合成图 `_rt_imageLayerComposite_*`）；
+       *  - 值没变 → 直接返回（宿主整表重发属性时不白删白建 GL 纹理）。
+       * 删条目要连 GL 纹理一起删，否则每换一次图就漏一张；但同一条目可能被两个
+       * 名字共用（`$mediaPreviousThumbnail` 顺位共用当前封面），被别处引用时只解表。
+       */
+      const refreshPropTexture = async (name: string) => {
+        const val = (liveUserProps as Record<string, unknown> | null)?.[name];
+        const next =
+          typeof val === "string" && val.includes("/") && /\.[a-z0-9]{2,5}$/i.test(val) ? val : "";
+        if (propTexLoadedValue.get(name) === next) return;
+        propTexLoadedValue.set(name, next);
+        const prev = textures.get(name);
+        if (prev) {
+          let refs = 0;
+          for (const e of textures.values()) if (e === prev) refs++;
+          if (refs <= 1) {
+            try {
+              prev.videoCtl?.stop?.();
+            } catch {
+              /* 停不掉也不影响换图 */
+            }
+            if (prev.glTex) (renderer.gl as WebGL2RenderingContext).deleteTexture(prev.glTex);
+          }
+          textures.delete(name);
+        }
+        if (!next) {
+          reportDiag(rt, cfg, `prop tex '${name}' → 空，回落作者原槽贴图`);
+          return;
+        }
+        const entry = await loadTex(name);
+        reportDiag(
+          rt,
+          cfg,
+          `prop tex '${name}' → ${next}${entry ? ` ${entry.width}x${entry.height}` : "（取图失败，回落原槽贴图）"}`,
+        );
+      };
 
       // [we-scene patch] 预载效果 shader 里 sampler 槽声明的默认贴图。
       // 形如 `uniform sampler2D g_Texture2; // {"material":"sprite","default":"particle/halo_6"}`
@@ -2645,6 +2704,17 @@ cfg, source, pkgAbort.signal);
           for (let si = 0; si < Math.max(texSlots.length, layerUts?.length || 0); si++) {
             const propName = utNameAt(si);
             if (!propName) continue;
+            // [we-scene patch 3243449890] 材质槽上的属性名同样登记进用户图片槽表：
+            // 热更时按新值重取图/清空回落，与效果 pass 槽走同一条链路。
+            if (!propName.startsWith("$")) {
+              propTexSlots.add(propName);
+              propTexLoadedValue.set(
+                propName,
+                typeof liveUserProps[propName] === "string" && liveUserProps[propName]
+                  ? String(liveUserProps[propName])
+                  : "",
+              );
+            }
             const pv = (liveUserProps as Record<string, unknown> | null)?.[propName];
             if (typeof pv !== "string" || !pv || !pv.includes("/") || !/\.[a-z0-9]{2,5}$/i.test(pv)) continue;
             texJobs.push(
@@ -2770,6 +2840,18 @@ cfg, source, pkgAbort.signal);
                   !tn.startsWith("_rt_")
                 ) {
                   texJobs.push(loadTex(tn));
+                }
+              }
+              // [we-scene patch 3243449890] 用户图片槽登记（parse 的 userTextureNames
+              // 记的是被 `usertextures` 顶掉的槽名 = 属性名）：热更时要按它重取图。
+              // 保留名（`$mediaThumbnail`）不走属性表，排除。
+              for (const tn of p.userTextureNames || []) {
+                if (typeof tn === "string" && tn !== "" && !tn.startsWith("$")) {
+                  propTexSlots.add(tn);
+                  propTexLoadedValue.set(
+                    tn,
+                    typeof liveUserProps[tn] === "string" && liveUserProps[tn] ? String(liveUserProps[tn]) : "",
+                  );
                 }
               }
             }
@@ -5482,6 +5564,13 @@ cfg, source, pkgAbort.signal);
         const properties = (scene as any).properties || {};
         const changed = mergeUserPropertyValues(properties, liveUserProps, wire) as Record<string, unknown>;
         if (!Object.keys(changed).length) return;
+        // [we-scene patch 3243449890] 用户图片槽（`usertextures` 绑的属性）热更后要
+        // 重新取图。属性值一律是壁纸目录下的相对路径，装配期的预载只服务「挂载
+        // 那一刻的值」，热更链路此前完全不碰贴图 —— 用户选完自定义图，画面照旧是
+        // 作者原槽贴图（3243449890 的「三角组件背景」选图后四块三角一动不动）。
+        for (const name of propTexSlots) {
+          if (name in changed) void refreshPropTexture(name);
+        }
         // general 字段同样可能绑用户属性：clearcolor 绑 schemecolor（3792579196）、
         // HDR 开关绑 bloom（2902406982 / 3299228616 / 3764725758 等一整族）。
         // 此前只逐层 resolve，general 绑定的 .value 永远停在挂载快照 —— 开关

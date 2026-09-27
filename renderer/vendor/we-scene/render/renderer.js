@@ -3203,6 +3203,15 @@ export function createRenderer(canvas, opts = {}) {
         // scene.json 侧的贴图槽（作者在编辑器里填的）
         for (const p of eff.passes || []) {
           for (const t of p.textures || []) noteName(t)
+          // [we-scene patch 3243449890] **属性槽被顶掉的原槽贴图也要算引用。**
+          // parse 把 `usertextures` 绑定的槽名换成了属性名（`newproperty58`），原名
+          // 只留在 textureFallbacks 里；用户没选图时渲染端正是回落到这个名字采样
+          // （见下方 ov.textureFallbacks 那段）。漏掉它 → 合成源永远不预渲染 →
+          // resolveTextureName 落 inputFBO 兜底：3243449890 的四块三角拿自己的
+          // 白底占位当 clip，`ApplyBlending` 出来仍是纯白，而 WE 里这四块是
+          // 「背景蒙版」层的合成图（身后画面）。全库 18 张 / 143 槽是同一结构
+          // （`$mediaThumbnail -> _rt_imageLayerComposite_*` 的封面槽占大头）。
+          for (const t of p.textureFallbacks || []) noteName(t)
         }
         // effect.json 侧的 bind（binds 挂在 materialPasses 上，不是 scene 的 passes）
         for (const mp of eff.materialPasses || []) {
@@ -3255,7 +3264,12 @@ export function createRenderer(canvas, opts = {}) {
           }
           for (const eff of l.effects || []) {
             if (!eff.visible) continue
-            for (const p of eff.passes || []) for (const t of p.textures || []) scan(t)
+            for (const p of eff.passes || []) {
+              for (const t of p.textures || []) scan(t)
+              // 属性槽的原槽贴图同算依赖（与上面的 noteName 同一理由）：源层之间的
+              // 引用方向决定了预渲染顺序，漏了 fallback 这一路，拓扑序会退化成插入序。
+              scan(p.textureFallbacks)
+            }
             for (const mp of eff.materialPasses || []) {
               for (const b of mp.binds || []) scan(b && b.name)
               for (const t of mp.textures || []) scan(t)

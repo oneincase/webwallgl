@@ -1810,6 +1810,96 @@ function sniffMediaType(url) {
   }
 }
 
+// ---------- 6d. 用户图片槽：跨层合成回落 + 装配/热更取图（3243449890） ----------
+// 场景壁纸的「选一张自定义图」属性（`type: "scenetexture"`）在 scene.json 里写成
+// pass 级 `usertextures`，属性值是壁纸目录下的相对路径。两条链路此前都是断的：
+//   ① 装配期预载读的是 liveUserProps（作者默认值，属性一律 ""），而宿主下发值
+//      （pendingWire）要等装配末尾那一轮 applyLiveProps —— 带覆盖启动也按空值加载；
+//   ② 热更链路只搬 visible/color/alpha/scale 那几类，**完全不碰贴图**：用户选完图
+//      画面照旧是原槽贴图（3243449890 的四块三角选完图一动不动）。
+{
+  const parseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  check(
+    /userTextureNames\[i\] = name/.test(parseSrc),
+    "parse 必须记录被 usertextures 顶掉的槽名（装配期靠它认用户图片槽）",
+  );
+  const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  // ① 装配期：先把宿主已下发的值并进属性表，再排贴图预载任务
+  const earlyMerge = smSrc.indexOf("if (pendingWire) {");
+  const firstPreload = smSrc.indexOf("texJobs.push(loadTex(");
+  check(
+    earlyMerge >= 0 && /mergeUserPropertyValues\(\(scene as any\)\.properties/.test(smSrc),
+    "装配期必须先把 pendingWire 并进属性表（否则带覆盖启动按空值加载贴图）",
+  );
+  check(
+    earlyMerge >= 0 && firstPreload > 0 && earlyMerge < firstPreload,
+    "属性合并必须早于贴图预载任务入队",
+  );
+  check(
+    /const propTexSlots = new Set<string>\(\)/.test(smSrc) &&
+      /propTexSlots\.add\(tn\)/.test(smSrc),
+    "用户图片槽必须登记进 propTexSlots（供热更重取图）",
+  );
+  // ② 热更：数值没变不动、清空删条目回落原槽、新值重新取图
+  check(
+    /for \(const name of propTexSlots\) \{\s*\n\s*if \(name in changed\) void refreshPropTexture\(name\);/.test(smSrc),
+    "applyLiveProps 必须对变化的用户图片槽调用 refreshPropTexture",
+  );
+  check(
+    /if \(propTexLoadedValue\.get\(name\) === next\) return;/.test(smSrc),
+    "热更重取图要带「值没变就返回」：宿主整表重发属性时不白删白建 GL 纹理",
+  );
+  check(
+    /textures\.delete\(name\);/.test(smSrc) && /refs <= 1/.test(smSrc),
+    "清空图片槽要删纹理表条目（回落作者原槽贴图），共用条目不得重复 deleteTexture",
+  );
+  // ③ 真实语料前提：3243449890 的四块三角绑同一个 scenetexture 属性，原槽是
+  //    「背景蒙版」的跨层合成图 —— 用户没选图时那才是该显示的画面
+  {
+    const id = "3243449890";
+    const p = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(p)) {
+      console.log("  （跳过 3243449890 语料：本机无此壁纸）");
+    } else {
+      const pkg = parsePkg(fs.readFileSync(p));
+      const sj = JSON.parse(Buffer.from(getEntry(pkg, "scene.json")).toString("utf8").replace(/^﻿/, ""));
+      const bound = (sj.objects || []).filter((o) =>
+        (o.effects || []).some((e) =>
+          (e.passes || []).some((pp) =>
+            (pp.usertextures || []).some((u) => (u && typeof u === "object" ? u.name : u) === "newproperty58"),
+          ),
+        ),
+      );
+      check(bound.length >= 4, `3243449890 应有 4 块三角绑 newproperty58，实得 ${bound.length}`);
+      check(
+        bound.every((o) => {
+          const pp = o.effects[0].passes[0];
+          return pp.textures[1] === "_rt_imageLayerComposite_16613_a";
+        }),
+        "3243449890 三角槽的原槽必须是背景蒙版的合成图（回落到它才是原版观感）",
+      );
+      const project = JSON.parse(fs.readFileSync(join(LIB, id, "project.json"), "utf8"));
+      const def = project.general.properties.newproperty58;
+      check(
+        def && def.type === "scenetexture" && def.value === "",
+        "newproperty58 应是默认值为空的 scenetexture 属性（空值即走合成图回落）",
+      );
+      const scene = parseScene(sj, project);
+      const layer = scene.layers.find((l) => l.name === "主三角");
+      const parsedPass = layer && layer.effects[0].passes[0];
+      check(
+        parsedPass && parsedPass.textures[1] === "newproperty58" &&
+          parsedPass.textureFallbacks && parsedPass.textureFallbacks[1] === "_rt_imageLayerComposite_16613_a" &&
+          parsedPass.userTextureNames && parsedPass.userTextureNames[1] === "newproperty58",
+        "parse 必须把 newproperty58 放进 textures/userTextureNames、合成图放进 textureFallbacks",
+      );
+      console.log(
+        `   用户图片槽：3243449890 的 ${bound.length} 块三角绑 newproperty58（scenetexture，默认空）→ 原槽为背景蒙版合成图`,
+      );
+    }
+  }
+}
+
 if (errors.length) {
   console.error(`verify-media: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);
