@@ -514,13 +514,33 @@ cfg, source, pkgAbort.signal);
         if ((globalThis as any).__noBuiltinMatTint) return;
         if (!layer || layer.matTint) return;
         const pass0 = material && material.passes && material.passes[0];
-        if (!pass0 || pass0.shader !== "generic4") return;
+        if (!pass0) return;
         const cv = pass0.constantshadervalues;
         if (!cv || typeof cv !== "object") return;
+        const sh = String(pass0.shader || "");
+        // 哪条分支由材质的 `combos.version` 选（官方 genericimage* 里是
+        // `#ifndef VERSION` 旧分支 / `#else` g_Color4 新分支；WE 自带内置材质模板写的是
+        // `"combos": {"version": 2}`，即**只有写了 version:2 才走 g_Color4**）。
+        // 全库内置 albedo 材质 pass：无 version 的 2623 个、version=2 的 1334 个 ——
+        // 也就是多数壁纸在 WE 里走的是「材质 Brightness/Alpha 生效」那条。
+        let ver: number | null = null;
+        for (const k of Object.keys((pass0 as any).combos || {})) {
+          if (k.toLowerCase() === "version") ver = Number((pass0 as any).combos[k]);
+        }
+        // 可折的槽位按 shader 分：
+        //  · generic4：color/alpha/brightness **无条件**生效（该 shader 根本没有 g_Color4 分支）
+        //  · genericimage / genericimage2 / genericimage3 的 **v1**（无 version 或 <2）：
+        //    只有 alpha/brightness（旧分支就是这么乘的），且这类 shader 没有 color 载体；
+        //    version>=2 走 g_Color4（层色×亮度），材质这两个常量不生效 → 不能折（会双重相乘）
+        const v1 = ver === null || ver < 2;
+        let allow: string[] = [];
+        if (sh === "generic4") allow = ["color", "alpha", "brightness"];
+        else if (v1 && /^generic(image)?[123]?$/i.test(sh)) allow = ["alpha", "brightness"];
+        if (!allow.length) return;
         const nodes: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(cv)) {
           const kl = k.toLowerCase();
-          if (kl === "color" || kl === "alpha" || kl === "brightness") nodes[kl] = v;
+          if (allow.includes(kl)) nodes[kl] = v;
         }
         if (!Object.keys(nodes).length) return;
         // 基准值只记一次（重折时从这里出发，避免反复相乘）
