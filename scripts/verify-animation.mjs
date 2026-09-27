@@ -337,6 +337,33 @@ const kf = (frame, value, front, back) => ({
   for (let i = 0; i < 10; i++) once.advance(0.5);
   check(endedCount === 2, `重播后 ended 应再触发一次（累计 2），实得 ${endedCount}`);
 
+  // [we-scene patch] 官方 Play() 语义：single **播完后**不 stop 直接再 play() 必须从 0 重播
+  //（OWE Scene.cpp：`!loop && !mirror && End>0 && Frame() >= FrameCount()` → position=0）。
+  // 3801397319 右上角切换按钮就是「play() 播完 → 脚本 pause()」的循环，
+  // 缺这条复位时第二次之后每次 play() 下一帧即到 end ⇒ 永久切不动。
+  const restart = createAnimation({
+    c0: [kf(0, 0), kf(30, 10)],
+    options: { fps: 30, length: 30, mode: "single", startpaused: true },
+  });
+  restart.play();
+  for (let i = 0; i < 10; i++) restart.advance(0.5);
+  check(
+    restart.getFrame() === 30 && !restart.playing,
+    `重播用例前置：应先播到 30 并停住，实得 ${restart.getFrame()}`,
+  );
+  restart.play(); // 不 stop，直接重播
+  check(
+    restart.getFrame() === 0,
+    `single 播完后 play() 应复位到 0 帧（官方 Play 语义），实得 ${restart.getFrame()}`,
+  );
+  restart.pause();
+  const midFrame = restart.getFrame();
+  restart.play();
+  check(
+    restart.getFrame() === midFrame,
+    `中途 play() 不应复位播放头（实得 ${restart.getFrame()}，期望 ${midFrame}）`,
+  );
+
   // 回调抛错不能拖垮推进
   const boom = createAnimation({ c0: [kf(0, 0), kf(10, 1)], options: { fps: 10, length: 10 } });
   boom.addEndedCallback(() => {

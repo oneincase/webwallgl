@@ -2083,6 +2083,39 @@ console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
             ok(`3801397319 右上角一次点击切到形态 2（789 播到 45 帧停，alpha ${Number(alpha1).toFixed(2)}），` +
               `再点一次切回（alpha ${Number(alpha2).toFixed(2)}）；水印同时闪（alpha ${Number(alphaMark).toFixed(2)}）`)
           }
+
+          // 第三次点击：此时 789 停在 90 帧（length），脚本再调 play() ——
+          // 官方 SceneAnimationPlayback::Play() 要求「到头后再 play() 从 0 重播」，
+          // 缺了它 789 下一帧又到头，按钮从此永久失效（用户报的「点两次就切不动」）。
+          timers.length = 0
+          for (const name of ['纯色-右上角', '纯色-右上角-水印']) {
+            const def = cursorDef.get(name)
+            const sb = evalObjectScript(def.script, def.props, {
+              layer: byName.get(name),
+              userProperties: userProps,
+              getSceneLayer: (n) => byName.get(String(n)) || null,
+              setTimeout: (fn, ms) => { timers.push({ name, fn, ms }); return () => {} },
+              clearTimeout: () => {},
+              onError: () => {},
+            })
+            sb.init()
+            sb.applyUserProperties(userProps)
+            sb.callCursor('cursorClick', { worldPosition: makeCursorEventVec(0, 0, 0) })
+          }
+          const frameAtThirdPlay = a789.getFrame()
+          for (let i = 0; i < 45; i++) {
+            a789.advance(1 / 30)
+            a7899.advance(1 / 30)
+          }
+          for (const t of timers) t.fn()
+          const alpha3 = a789.applyTo(a789.baseNumeric)
+          if (frameAtThirdPlay !== 0) {
+            fail(`3801397319 第三次点击 play() 应从 0 帧重播（官方 Play 语义），实得 frame=${frameAtThirdPlay} —— 未复位即「点两次后永久卡死」`)
+          } else if (Math.abs(a789.frame - 45) > 1.5 || Math.abs(alpha3 - 1) > 0.05) {
+            fail(`3801397319 第三次点击后应再切成形态 2（frame≈45, alpha 1），实得 frame=${a789.frame.toFixed(1)} alpha=${Number(alpha3).toFixed(3)}`)
+          } else {
+            ok(`3801397319 第三次点击照样切换（789 复位到 0 再播到 ${a789.frame.toFixed(0)} 帧，alpha ${Number(alpha3).toFixed(2)}）—— 点 N 次可无限切换`)
+          }
         }
       }
     }

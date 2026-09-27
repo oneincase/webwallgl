@@ -330,6 +330,17 @@ export function createAnimation(def) {
     set ended(v) { if (anim.parent) anim.parent.ended = !!v; else anim._ended = !!v },
     play() {
       if (anim.parent) return anim.parent.play()
+      // [we-scene patch] 官方语义：single 动画**播完后**再 play() 要从头重播。
+      //（OWE Scene.cpp SceneAnimationPlayback::Play()：`!loop && !mirror &&
+      // m_clip->End() > 0 && Frame() >= FrameCount()` → position 归 0 再置 playing；
+      // 官方同时把 m_previous_frame 置 -0.5，让 frame-0 的事件在重启后的首 tick
+      // 被越过 —— 本仓事件沿用「从 0 起播不补发」的装载约定，这里只复位播放头。）
+      // 缺了它：3801397319 右上角那个「play() 后 1500ms pause()」的切换按钮，
+      // 90 帧 single 动画播完后 frame 恒 ≥ length，之后每次 play() 下一帧就走到
+      // 头 —— 表现为「点两次能切、再点永远切不动」。
+      if (mode === 'single' && length > 0 && anim.frame >= length) {
+        anim.frame = 0
+      }
       anim._playing = true
       anim._ended = false
       return anim
