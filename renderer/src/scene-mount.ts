@@ -476,6 +476,76 @@ cfg, source, pkgAbort.signal);
       };
       /** 读一份材质文档（登记 + 解析其中的 {user} 绑定） */
       const readMaterialDoc = (entry: Uint8Array) => registerMaterialDoc(JSON.parse(readText(entry)));
+      /**
+       * `generic4` 材质的 color/alpha/brightness 常量折入图层（渲染侧每帧活读，见 renderer
+       * 的 color4 注释）。官方 generic4.frag 里这三个常量是**无条件**应用的，而该 shader
+       * 没有 genericimage 那套 `#ifdef VERSION … g_Color4` 分支 —— 这类图层的颜色在 WE 里
+       * 就靠材质常量承载。本仓库用自己的替身着色器、此前只读 layer.color/brightness/alpha，
+       * 于是这些常量被整片忽略（全库 263 处 color + 27 处 brightness：EmMumbiesEye 的红眼
+       * `1 0 0`、EfIceCubeWarp 的浅蓝 `0.427 0.745 1`、sun 的 brightness=10、行星的 2）。
+       *
+       * 只认 generic4：genericimage2/3 的 Brightness/Alpha 属于 `#ifndef VERSION` 旧分支，
+       * 与 g_Color4（本仓库实现的那条）**互斥**，照折会双重相乘；genericimage4 恒用 g_Color4。
+       *
+       * 挂**节点**而非折成数值：热更时 resolveUserProps 就地改 .value，渲染侧每帧现读，
+       * 属性热更自动生效，不需要「记原值再重折」那套簿记。
+       *
+       * 两条材质链都要挂：`o.image → models/*.json → material`，以及
+       * `o.model → *.mdl → materialPath`（后者才是 .mdl 网格层，3281559867 有 158 层走这条）。
+       */
+      const matTintNum = (node: unknown, idx: number, dflt: number): number => {
+        const raw = node && typeof node === "object" && "value" in (node as object) ? (node as any).value : node;
+        if (raw === undefined || raw === null) return dflt;
+        if (typeof raw === "number") return Number.isFinite(raw) ? raw : dflt;
+        const parts = String(raw).trim().split(/[\s,]+/);
+        const v = Number(parts[idx] !== undefined ? parts[idx] : parts[0]);
+        return Number.isFinite(v) ? v : dflt;
+      };
+      /**
+       * 把 `generic4` 材质常量 color/alpha/brightness **烘进图层自身字段**（保留基准值
+       * 供热更重折，见 applyLiveProps 的 matTint 重折）。
+       *
+       * 为什么烘字段而不是在渲染侧折：MDL 网格层走 `drawPuppetDirect → puppetDrawFn`，
+       * 颜色在那里算，**不读 renderLayer 的 color4**；copy / lit / puppet 各有一套。
+       * 逐条绘制路径去折必然漏（实测先在 color4 折：`gl.uniform4f` 下发的颜色元组两臂
+       * 完全一致，材质色一个都没出现）。图层字段是所有路径的公共输入，一处即可。
+       */
+      const attachBuiltinMatTint = (layer: any, material: any) => {
+        if ((globalThis as any).__noBuiltinMatTint) return;
+        if (!layer || layer.matTint) return;
+        const pass0 = material && material.passes && material.passes[0];
+        if (!pass0 || pass0.shader !== "generic4") return;
+        const cv = pass0.constantshadervalues;
+        if (!cv || typeof cv !== "object") return;
+        const nodes: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(cv)) {
+          const kl = k.toLowerCase();
+          if (kl === "color" || kl === "alpha" || kl === "brightness") nodes[kl] = v;
+        }
+        if (!Object.keys(nodes).length) return;
+        // 基准值只记一次（重折时从这里出发，避免反复相乘）
+        layer.tintBase = {
+          color: [(layer.color?.[0] ?? 1), (layer.color?.[1] ?? 1), (layer.color?.[2] ?? 1)],
+          alpha: layer.alpha === undefined ? 1 : layer.alpha,
+          brightness: layer.brightness === undefined ? 1 : layer.brightness,
+        };
+        layer.matTint = nodes;
+        applyBuiltinMatTint(layer);
+      };
+      /** 按当前材质常量值重算图层字段（装配期一次 + 每次热更） */
+      const applyBuiltinMatTint = (layer: any) => {
+        const mt = layer && layer.matTint;
+        const base = layer && layer.tintBase;
+        if (!mt || !base) return;
+        const tr = matTintNum(mt.color, 0, 1);
+        const tg = matTintNum(mt.color, 1, 1);
+        const tb = matTintNum(mt.color, 2, 1);
+        const tBright = matTintNum(mt.brightness, 0, 1);
+        const tAlpha = matTintNum(mt.alpha, 0, 1);
+        layer.color = [base.color[0] * tr, base.color[1] * tg, base.color[2] * tb];
+        layer.brightness = base.brightness * tBright;
+        layer.alpha = base.alpha * tAlpha;
+      };
       // 宿主覆盖清屏色。场景作者按「铺满 PC 全屏」设 clearcolor，不少填的是浅灰；
       // 手机竖屏用 contain 适配 16:9 场景时，上下留白会露出这块浅灰，像是渲染坏了。
       // 宿主传 "0 0 0" 即可把留白压成中性黑。
@@ -2639,6 +2709,21 @@ cfg, source, pkgAbort.signal);
           if (pass?.shader && pkg.getEntry(parsedPkg, `shaders/${pass.shader}.frag`)) {
             eff.attachLayerMaterialEffect(layer, pass);
           }
+          // [we-scene patch] `generic4` 材质的 color/alpha/brightness 常量：官方该 shader 里
+          // `albedo.rgb *= g_TintColor` / `*= g_Brightness` / `albedo.a *= g_TintAlpha` 是
+          // **无条件**应用的，而且它没有 genericimage 那套 `#ifdef VERSION … g_Color4` 分支
+          // —— 这类图层的颜色在 WE 里就靠材质常量承载。本仓库用替身着色器、此前只读
+          // layer.color/brightness/alpha，于是这些常量被整片忽略（全库 263 处 color +
+          // 27 处 brightness，例：EmMumbiesEye 的红眼 `1 0 0`、EfIceCubeWarp 的浅蓝
+          // `0.427 0.745 1`、sun 的 brightness=10、行星的 brightness=2）。
+          //
+          // 只认 generic4：genericimage2/3 的 Brightness/Alpha 属于 `#ifndef VERSION`
+          // 旧分支，与 g_Color4（本仓库实现的那条）**互斥**，照折会双重相乘；
+          // genericimage4 恒用 g_Color4，材质里本就没有这三个常量。
+          //
+          // 挂**节点**而不是折成数值：热更时 resolveUserProps 就地改 .value，渲染侧每帧
+          // 现读，所以属性热更自动生效，不需要「记原值再重折」那套簿记（见 renderer 的 color4）。
+          attachBuiltinMatTint(layer, material);
           for (const e of layer.effects || []) {
             eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc);
           }
@@ -3381,6 +3466,7 @@ cfg, source, pkgAbort.signal);
               // u_color 乘场景环境光（见 renderer drawPuppetDirect）。
               const L = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
               if (Number(L) === 1) (layer as any).lightingEnabled = true;
+              attachBuiltinMatTint(layer, material);
             }
           }
           if (texName) {
@@ -4128,6 +4214,7 @@ cfg, source, pkgAbort.signal);
                 const matEntry = mat && pkg.getEntry(parsedPkg, mat.materialPath);
                 const material = matEntry ? readMaterialDoc(matEntry) : null;
                 const pass = material?.passes?.[0];
+                if (material) attachBuiltinMatTint(clone, material);
                 if (pass?.combos) {
                   for (const k of Object.keys(pass.combos)) {
                     if (k.toLowerCase() === "spritesheet" && Number(pass.combos[k]) === 1) {
@@ -5383,6 +5470,11 @@ cfg, source, pkgAbort.signal);
         // 材质文档里的绑定也要重解：它们不在 srcObject 树里（见 materialDocs 的注释）。
         // 少这一步，「音频条颜色 / 可视化器透明度」这类**只绑在材质上**的属性热更后画面不动。
         for (const doc of materialDocs) resolveUserProps(doc, properties, 0);
+        // generic4 材质常量已烘进图层字段（见 attachBuiltinMatTint）：材质文档重解后
+        // 必须按新值重折一遍，否则「音频条颜色/亮度」这类只绑在材质上的属性热更仍不动。
+        for (const layer of scene.layers as any[]) {
+          if (layer.matTint) applyBuiltinMatTint(layer);
+        }
         for (const layer of scene.layers as any[]) {
           const src = layer.srcObject;
           if (!src) continue;
