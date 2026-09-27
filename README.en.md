@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -348,7 +348,7 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 2.0.0 — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.
+Current version: 2.0.1 — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.
 
 - Performance (measured on real scenes): removed two wasted steps in texture decode — heavy-scene load −50~80%; MDL four-section signatures now scanned in one pass — model corpus scan −75%; merged in-frame visibility recomputation — steady-state CPU −39% on an 847-layer scene; layer-proxy read-only paths no longer pre-build 5 Vec3 — script-heavy scene CPU −19%.
 - Embedded-image bake cache: a hit saves ~80% of decode cost, on by default and toggleable; bake hit / back-fill counts are published as proper __memStats fields, same source as diagnostics and queryable at runtime.

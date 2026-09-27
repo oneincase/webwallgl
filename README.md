@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.0/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -347,7 +347,7 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 2.0.0（自 1.4.2 起的大版本更新，共 15 个提交）。这一版主线是「重场景性能」与「真实媒体封面」：渲染/装配/解码链路做了多轮基于实测的优化，新增内嵌图烘焙缓存与无 GPU 自动降档，并补齐了歌曲封面在全部三个绑定位置上的优先级。
+当前版本 2.0.1（自 1.4.2 起的大版本更新，共 15 个提交）。这一版主线是「重场景性能」与「真实媒体封面」：渲染/装配/解码链路做了多轮基于实测的优化，新增内嵌图烘焙缓存与无 GPU 自动降档，并补齐了歌曲封面在全部三个绑定位置上的优先级。
 
 - 性能优化（均为真实场景实测）：贴图解码去掉两笔白做的工作，重场景加载耗时 −50~80%；MDL 四个段签名改为单趟扫描，模型语料扫描 −75%；帧内合并可见性重算，847 层场景稳态 CPU −39%；图层代理只读路径不再预建 5 个 Vec3，脚本重场景 CPU −19%。
 - 内嵌图烘焙缓存：命中时省约 80% 解码开销，默认开启、可关闭；烘焙命中/补烘统计写入 __memStats 正式字段，与诊断同源，可在运行时查询。
