@@ -143,6 +143,41 @@ export function parseMDL(buf) {
     for (let i = 0; i < indexCount; i++) indices[i] = dv.getUint16(idxStart + i * 2, true)
   }
 
+  // [we-scene patch 2026-09-28] MDLV 部件表（mdlv>=21 才有）。渲染侧要按**零件**决定
+  // 本帧画不画（见 render/mdl.js「收拢的零件盖住了谁」），所以这里连静止包围盒一起备好。
+  // 布局（open-wallpaper-engine 的 MdlParser::ParseMesh 实测）：紧跟索引区之后是若干
+  // 可变长块（uv2 extras / masks），部件表没有长度指针可用，只能**锚扫 + 自校验**：
+  // 16B 记录 = u32 id / i32 draw_order_offset / u32 start / u32 size，要求 start 从 0 起、
+  // 逐条首尾相接、末尾恰好 == indexCount，且 id ≤ 4096、|offset| ≤ 1e6。
+  // 命中不了就返回 null（该模型不参与规则，行为与改动前逐位一致）。
+  // 本机 3629379075 眼睛件命中 41 条，与 OWE 逐条一致。
+  const parts = (() => {
+    const idxEnd = idxStart + idxByteLen
+    const limit = Math.min(
+      ...[SEC.MDLS, SEC.MDAT, SEC.MDLA, SEC.MDLE].filter((v) => v > idxEnd).concat([buf.byteLength]),
+    )
+    const readChain = (p) => {
+      let end = 0
+      const recs = []
+      for (let q = p; q + 16 <= limit && recs.length < 4096; q += 16) {
+        const id = dv.getUint32(q, true)
+        const offset = dv.getInt32(q + 4, true)
+        const start = dv.getUint32(q + 8, true)
+        const size = dv.getUint32(q + 12, true)
+        if (id > 4096 || Math.abs(offset) > 1e6 || size === 0 || start !== end || start + size > indexCount) break
+        recs.push({ id, offset, start, size })
+        end = start + size
+        if (end === indexCount) return recs
+      }
+      return null
+    }
+    for (let p = idxEnd; p + 16 <= limit; p++) {
+      const recs = readChain(p)
+      if (recs && recs.length >= 2) return recs
+    }
+    return null
+  })()
+
   const skel = parseSkeleton(buf, dv, SEC.MDLS)
   const bones = skel.bones
   // 无 MDLA 的模型（全库 80 个 puppet 里 3 个：3186328539 单车、3226487183 左侧手 /
@@ -274,6 +309,41 @@ export function parseMDL(buf) {
     if (!staticPose.permutationIdentity) staticPermutation = staticPose.permutation
   }
 
+  // 零件元数据（给渲染侧的「收拢盖住刚性件」规则用）：主导骨 / 静止包围盒 / 顶点集。
+  // 只在这里算一次，逐帧那侧只做「按顶点求当前包围盒」这一件事（且仅在真有骨缩放时）。
+  let partsMeta = null
+  if (parts && parts.length >= 2) {
+    partsMeta = parts.map((p) => {
+      const verts = new Set()
+      const boneW = new Map()
+      for (let t = p.start; t < p.start + p.size; t++) {
+        const v = indices[t]
+        verts.add(v)
+        for (let k = 0; k < 4; k++) {
+          const w = weights[v * 4 + k]
+          if (w > 0) boneW.set(boneIdx[v * 4 + k], (boneW.get(boneIdx[v * 4 + k]) || 0) + w)
+        }
+      }
+      let bone = -1
+      let best = -1
+      for (const [b, w] of boneW) if (w > best) { best = w; bone = b }
+      const list = Uint32Array.from(verts)
+      let x0 = Infinity
+      let x1 = -Infinity
+      let y0 = Infinity
+      let y1 = -Infinity
+      for (const v of list) {
+        const x = positions[v * 3]
+        const y = positions[v * 3 + 1]
+        if (x < x0) x0 = x
+        if (x > x1) x1 = x
+        if (y < y0) y0 = y
+        if (y > y1) y1 = y
+      }
+      return { id: p.id, start: p.start, size: p.size, bone, verts: list, x0, x1, y0, y1 }
+    })
+  }
+
   return {
     magic,
     materialPath: mat.value,
@@ -298,6 +368,8 @@ export function parseMDL(buf) {
     bindTRS: bindTRS9.length > 0 ? bindTRS9 : null,
     attachments: attachments.length > 0 ? attachments : null,
     restCorrection: restCorrection.length > 0 ? restCorrection : null,
+    // MDLV 部件表 + 每零件元数据（主导骨/静止包围盒/顶点集）；无该表为 null
+    parts: partsMeta,
     bounds: { minX, maxX, minY, maxY },
   }
 }

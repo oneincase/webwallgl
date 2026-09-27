@@ -3621,6 +3621,9 @@ cfg, source, pkgAbort.signal);
               {
                 time: o.time,
                 animLayers: layer.animationLayers,
+                // [we-scene patch 2026-09-28] 「被收拢的零件盖住 → 同步压扁」补偿规则：
+                // 按壁纸白名单生效（见 render/mdl.js 的 COLLAPSED_PART_CULL_WORKSHOPS）
+                syncCoveredParts: (mdl as any).shouldSyncCoveredParts?.(cfg.src) ?? false,
                 // [we-scene patch] 脚本层的骨骼平移覆写（thisLayer.setBoneTransform）。
                 // 骨骼拖拽壁纸的 puppet 动画数为 0，蒙皮完全由脚本驱动，
                 // 所以这个表是它们唯一的形变来源。

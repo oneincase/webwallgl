@@ -72,6 +72,8 @@ uniform mat4 u_mvp;
 uniform mat4 u_skin[${maxBones}];
 uniform int u_boneCount;
 uniform float u_keepZ;
+uniform vec2 u_partScale;
+uniform vec2 u_partPivot;
 out vec2 v_uv;
 void main() {
   vec4 p = vec4(a_pos, 1.0);
@@ -88,6 +90,8 @@ void main() {
     }
   }
   vec4 local = total > 0.0 ? skinned / total : p;
+  // [we-scene patch 2026-09-28] 每零件竖直缩放（「被收拢的零件盖住」时同步压扁，见 collapsedPartSquash）
+  local.xy = u_partPivot + (local.xy - u_partPivot) * u_partScale;
   gl_Position = u_mvp * vec4(local.xy, local.z * u_keepZ, 1.0);
   v_uv = a_uv;
 }`
@@ -107,6 +111,257 @@ void main() {
   vec4 t = texture(u_tex, v_uv);
   fragColor = t * u_color;
 }`
+
+// [we-scene patch 2026-09-28] 这条补偿规则**按壁纸白名单生效**：全库扫描（324 张 /
+// 158 个带部件表的 puppet）显示它会命中 13 张，其中 3226487183 会在 8/24 帧里隐藏
+// 9 个脸部零件（与作者素材无关的误伤）。先只对**已与作者素材逐帧核对过**的
+// 3629379075 生效；后续每核对一张往这里加一个 id。与 math.js 的
+// MIRAGE_PARALLAX_WALLPAPERS 同一套做法（场景装配时把 workshopId 传进来）。
+// [维护者拍板 2026-09-28] **保持白名单**：试过把门控换成纯形状/行为命中
+//（深压 rmin<0.8 + 命中件高度≥最高件 60% + 命中数≤3），真眼组能全部通过，
+// 但仍有 6 处误伤（3461168300/3479521040「人物」、3521337568「Lucy」、3629379075「嘴巴」…），
+// 再收口需要「被盖件面积占比 + 覆盖件宽高比」两条且要重跑全库——性价比不高，就停在白名单。
+// 新增一张的流程：① 作者素材（preview.gif / 工坊图）确认闭眼无眼球
+// ② 离线跑 collapsedPartSquash 看命中件是不是「眼球」③ 实机合成帧眼区虹膜像素应降到个位数。
+export const COLLAPSED_PART_CULL_WORKSHOPS = Object.freeze([
+  '3629379075', // 若叶睦 眨眼：与作者 preview.gif / 工坊宣传图逐帧核对过
+  '3655429099', // 同一类型（双眼同步闭）：用户核对；两只眼的眼睑压缩幅度不同，靠阈值统一
+])
+
+/** 该壁纸是否启用「被收拢的零件盖住 → 同步压扁」这条补偿规则（见 collapsedPartSquash） */
+export function shouldSyncCoveredParts(workshopId) {
+  // 名单门控（外层，维护者拍板）＋下面 collapsedPartSquash 内部的形状判据（内层）。
+  const id = workshopId == null ? '' : String(workshopId)
+  return id !== '' && COLLAPSED_PART_CULL_WORKSHOPS.includes(id)
+}
+
+
+/**
+ * [we-scene patch 2026-09-28] 该网格是否出现**真正的零件塌陷**（高度压到静止的 80% 以下）。
+ *
+ * 为什么用它代替白名单：全库配对表（`docs/CASEBOOK.md`「配对表」小节）显示，
+ * 「塌陷件↔刚性件」这种几何配对在身体/头发/披风里同样成立（15+ 张误伤），
+ * 但**它们的覆盖件只是抖到 0.94~0.98**；而真正闭眼的眼睑是压到 **0.47~0.65**。
+ * 也就是说「有没有零件被压扁」这件事本身就是分水岭——比任何尺寸/比例阈值都干净，
+ * 而且不依赖壁纸 ID。判据只在能算出「深压」的网格上生效，其余模型零影响。
+ * 结果按网格缓存（`mdl._deepCollapse`），只在首帧算一次（16 个采样点）。
+ */
+function hasDeepPartCollapse(mdl, animLayers) {
+  if (mdl._deepCollapse !== undefined) return mdl._deepCollapse
+  mdl._deepCollapse = false
+  const parts = mdl.parts
+  if (!parts || parts.length < 2 || !mdl.animations.length) return false
+  const pos = mdl.positions
+  const idx = mdl.boneIdx
+  const wts = mdl.weights
+  // **不要**只用「当前可见的动画层」判定：脚本会在装配后改可见性/播放态，
+  // 首帧拿到的是空的层列表就会把 _deepCollapse 永久记成 false（实测 3655429099
+  // 因此「又没压扁」）。改为「配置层 + 每条 clip 单独」都扫一遍，结果取或。
+  const candidates = []
+  if (animLayers && animLayers.length) candidates.push(animLayers)
+  for (const a of mdl.animations) candidates.push([{ animation: a.id, visible: true, additive: false, blend: 1, rate: 1 }])
+  // 扫的时候**不能**动 mdl._skin：draw() 刚拿到的 skin 就是它的同一个引用，
+  // 覆盖了下游就会用错误姿势上传 uniform。临时换成独立缓冲，扫完还原。
+  const savedSkin = mdl._skin
+  mdl._skin = mdl._deepSkin || (mdl._deepSkin = new Float32Array(mdl.bones.length * 16))
+  try {
+    for (const layers of candidates) {
+      const maxDur = Math.max(1e-3, ...layers.map((L) => {
+        const a = mdl.animations.find((x) => x.id === L.animation)
+        return a ? a.duration : 0
+      }))
+      for (let si = 0; si < 16 && !mdl._deepCollapse; si++) {
+        computeSkinMatrices(mdl, (maxDur * si) / 16, layers)
+        const skin = mdl._skin
+        for (const part of parts) {
+          const restH = part.y1 - part.y0
+          if (!(restH > 1e-3)) continue
+          let y0 = Infinity
+          let y1 = -Infinity
+          for (let vi = 0; vi < part.verts.length; vi++) {
+            const v = part.verts[vi]
+            let y = 0
+            for (let k = 0; k < 4; k++) {
+              const w = wts[v * 4 + k]
+              if (!w) continue
+              const off = idx[v * 4 + k] * 16
+              y += w * (skin[off + 1] * pos[v * 3] + skin[off + 5] * pos[v * 3 + 1] + skin[off + 13])
+            }
+            if (y < y0) y0 = y
+            if (y > y1) y1 = y
+          }
+          if ((y1 - y0) / restH < 0.8) {
+            mdl._deepCollapse = true
+            break
+          }
+        }
+      }
+      if (mdl._deepCollapse) break
+    }
+  } catch {
+    mdl._deepCollapse = false
+  } finally {
+    mdl._skin = savedSkin
+  }
+  return mdl._deepCollapse
+}
+
+// 零件「收拢 / 刚性 / 被盖住」的阈值，见 collapsedPartSquash 头注
+// PART_SQUASH_ENTER：判定「被盖住」关系的入场阈值（只要有压缩就判，压缩比越小压得越狠）
+const PART_SQUASH_ENTER = 0.98
+const PART_RIGID_RATIO = 0.9
+const PART_ENCLOSE_Y = 0.9
+const PART_ENCLOSE_X = 0.6
+const PART_AREA_CAP = 6
+
+/**
+ * [we-scene patch 2026-09-28] 「被收拢的零件盖住」的零件，本帧竖直压扁多少（对齐 mdl.parts，
+ * 1 = 不压；返回 null 表示本帧不用改）。
+ *
+ * 为什么需要：3629379075（若叶睦 眨眼）的闭眼是把眼睑/睫毛零件**压扁成一条线**
+ * （眼睑 60→25、上睫毛 43→…），而眼球零件 100% 绑在一根在四条 clip 里都恒定不动的骨上
+ * （scale 恒 1.000、平移只动 8~11 单位）——文件里没有任何数据能让它消失或变形：
+ * 无绘制顺序曲线、无 masks、无脚本驱动，MDLE 只是同一套绑定姿势换轴序（实测），
+ * 每骨 skin pivot / 4×4 矩阵也都会推歪身体。但作者随包的 preview.gif 与工坊宣传图里
+ * 闭眼时看不到眼球（同尺度实测闭/睁虹膜像素：作者 30%、我们 93%）。
+ * 用户拍板的做法：**别藏，跟着同步压扁**——眼睑开始压缩时眼球就按同一进度变扁，
+ * 压到一半时收完，全程连续、不跳变（藏掉会「漏眼睛」且眨眼不顺滑）。
+ *
+ * 判据（纯几何，静止帧零影响）：
+ *   1. 某零件本帧压扁（高度比 < PART_SQUASH_ENTER）→ 它是「收拢件」；
+ *   2. 另一个**刚性件**（本帧高度仍 > 静止的 90%）满足三条才判为被盖住：
+ *      ① 收拢件的**中心**落在它的当前盒内（不用「90%/60% 包含」：左右眼原画形状可以不同，
+ *         包含关系只对一只眼成立，实测 3655429099 只收一只眼）；
+ *      ② 它的静止**宽度**小于收拢件（「眼睑宽 → 眼球窄」；这条同时排掉睫毛带，
+ *         见下面命中循环里的长注）；
+ *      ③ 它的当前面积不超过收拢件的 6 倍（挡掉「脸包住嘴」这类大容器）；
+ *   3. 压扁系数 k = clamp(5r − 4, 0, 1)（r = 收拢件的高度比）：r≥1 不压、r=0.9 压到一半、
+ *      r≤0.8 收完。阈值取 0.8 是因为**同一台里两只眼的眼睑压缩幅度可以不同**
+ *      （3655429099 实测 0.66 / 0.74），阈值落在两者之间就只收一只眼。
+ *   4. k < 0.25 直接**不画**（用户实测：完全闭眼时压扁的残留仍会露出来，要求压到一定程度就隐藏；
+ *      回弹时 k 升过 0.25 又会自动出现，同一条判据双向适用）。
+ * 恒等帧（静止、纯位移/旋转）在骨头缩放预筛处直接返回，零额外成本。
+ * **按壁纸白名单生效**，见 COLLAPSED_PART_CULL_WORKSHOPS。
+
+ */
+export function collapsedPartSquash(mdl, skin, animLayers) {
+  const parts = mdl.parts
+  if (!parts || parts.length < 2 || !skin) return null
+  if (!hasDeepPartCollapse(mdl, arguments[2])) return null // 行为命中：只有真出现「深压」的网格才参与
+  // 快速预筛：本帧有骨头缩放明显偏离 1 才值得逐零件算包围盒。
+  let scaled = false
+  for (let i = 0; i < mdl.bones.length; i++) {
+    const m = skin.subarray(i * 16, i * 16 + 16)
+    if (Math.abs(Math.hypot(m[0], m[1]) - 1) > 0.02 || Math.abs(Math.hypot(m[4], m[5]) - 1) > 0.02) {
+      scaled = true
+      break
+    }
+  }
+  if (!scaled) return null
+
+  const pos = mdl.positions
+  const idx = mdl.boneIdx
+  const wts = mdl.weights
+  const box = mdl._partBox && mdl._partBox.length === parts.length
+    ? mdl._partBox
+    : (mdl._partBox = parts.map(() => new Float32Array(5))) // x0,x1,y0,y1,ratio
+  for (let p = 0; p < parts.length; p++) {
+    const part = parts[p]
+    const b = box[p]
+    let x0 = Infinity
+    let x1 = -Infinity
+    let y0 = Infinity
+    let y1 = -Infinity
+    for (let vi = 0; vi < part.verts.length; vi++) {
+      const v = part.verts[vi]
+      let x = 0
+      let y = 0
+      for (let k = 0; k < 4; k++) {
+        const w = wts[v * 4 + k]
+        if (!w) continue
+        const off = idx[v * 4 + k] * 16
+        x += w * (skin[off] * pos[v * 3] + skin[off + 4] * pos[v * 3 + 1] + skin[off + 12])
+        y += w * (skin[off + 1] * pos[v * 3] + skin[off + 5] * pos[v * 3 + 1] + skin[off + 13])
+      }
+      if (x < x0) x0 = x
+      if (x > x1) x1 = x
+      if (y < y0) y0 = y
+      if (y > y1) y1 = y
+    }
+    const restH = part.y1 - part.y0
+    b[0] = Number.isFinite(x0) ? x0 : 0
+    b[1] = Number.isFinite(x1) ? x1 : 0
+    b[2] = Number.isFinite(y0) ? y0 : 0
+    b[3] = Number.isFinite(y1) ? y1 : 0
+    b[4] = restH > 1e-3 ? (b[3] - b[2]) / restH : 1
+  }
+
+  const hits = []
+  for (let r = 0; r < parts.length; r++) {
+    const rb = box[r]
+    if (rb[4] < PART_RIGID_RATIO) continue
+    const rArea = Math.max(1e-6, (rb[1] - rb[0]) * (rb[3] - rb[2]))
+    let k = 1
+    let px = 0
+    let py = 0
+    for (let c = 0; c < parts.length; c++) {
+      if (c === r) continue
+      const cb = box[c]
+      if (!(cb[4] < PART_SQUASH_ENTER)) continue
+      const h = cb[3] - cb[2]
+      const w = cb[1] - cb[0]
+      if (!(h > 1e-6) || !(w > 1e-6)) continue
+      if (rArea > PART_AREA_CAP * Math.max(1e-6, w * h)) continue
+      // 判据用「收拢件的**中心**落在刚性件盒内」+ 面积上限。
+      // 不用「竖直 90%/横向 60% 包含」的原因：同一台壁纸的左右眼**原画形状可以不同**
+      // （3655429099 是 wink 角色，两眼素材不对称），包含判据只对一只眼成立 →
+      // 实测「一只眼收、另一只不收」。这里放宽后由白名单兜住误伤面（全库扫描见 CASEBOOK）。
+      const cx = (cb[0] + cb[1]) / 2
+      const cy = (cb[2] + cb[3]) / 2
+      if (cx < rb[0] || cx > rb[1] || cy < rb[2] || cy > rb[3]) continue
+      // **能盖住**：被盖件的当前宽度必须小于收拢件的**静止**宽度 —— 「眼睑/皮肤（宽）盖住眼球（窄）」。
+      // 这条是相对判据（两个零件互相比较），绝对判据全试过并且都失败（见 CASEBOOK）：
+      //   静止更高：3655429099 眼球(70/67) 比眼睑(80) 矮 → 两颗眼都不命中（旧版的 bug）
+      //   静止面积更小：3629379075 眼睑 139×67 比眼球 91×107 还小 → 只剩一只眼
+      //   静止盒被包含：3655429099 右眼当前盒比眼睑高 33%，包含关系不成立 → 只剩左眼
+      // 而宽度关系两台都成立：眼球 82/54 < 眼睑 140/84；3629379075 眼球 91/90 < 眼睑 139。
+      // 关键是它同时**排除睫毛带**（3655429099 的 157 比眼睑 140 更宽）——那条是闭眼时
+      // 该留下的深色睑线，旧版被当成「被盖件」藏掉，就是用户看到的左眼异常。
+      const cRestW = parts[c].x1 - parts[c].x0
+      if (!((rb[1] - rb[0]) < cRestW)) continue
+      // 同步压扁：k = clamp(5r − 4, 0, 1)，即眼睑压到 80% 起跟随、压到 80% 以下就收完。
+      // 为什么阈值取 0.8 而不是更小：同一台壁纸**两只眼的眼睑压缩程度并不相同**——
+      // 3655429099 实测 r=0.66 与 r=0.74（两声道的录制幅度不同），任何落在两者之间的阈值
+      // 都会只收一只眼（用户实测「只有左眼匹配上」）。取 0.8 让「眼睑明显压了」= 眼球收完。
+      // 3629379075（r 最低 0.40）在这条映射下同样收干净。
+      const kk = Math.max(0, Math.min(1, 5 * cb[4] - 4))
+      if (kk < k) {
+        k = kk
+        // 枢轴取**收拢件的当前中心**：被盖件往眼睑带里塌，而不是原地压缩成条纹
+        //（原地压缩时它的原画被压成一道道横纹，就是用户看到的「残影」）
+        px = (cb[0] + cb[1]) / 2
+        py = (cb[2] + cb[3]) / 2
+      }
+    }
+    if (k < 1) hits.push({ r, k, px, py })
+  }
+  // 配对表（CASEBOOK）给出的两条收敛条件：只保留「高度 ≥ 最高命中件 60%」的件，
+  // 且**同网格命中的刚性件不超过 3 个**。前者剔掉睫毛/高光这类小件（3629379075 里
+  // h31/h37 会被丢掉、只剩两颗眼球 h107/h104），后者挡掉 Lucy(37)/人物(8)/头(20)
+  // 这类「躯干零件自己也会深压」的模型——它们光是命中数就远超 3。
+  if (!hits.length) return null
+  const tallest = Math.max(...hits.map((h) => parts[h.r].y1 - parts[h.r].y0))
+  const kept = hits.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
+  if (kept.length > 3) return null
+  const out = new Float32Array(parts.length * 3)
+  for (let i = 0; i < parts.length; i++) out[i * 3] = 1
+  for (const h of kept) {
+    out[h.r * 3] = h.k
+    out[h.r * 3 + 1] = h.px
+    out[h.r * 3 + 2] = h.py
+  }
+  return out
+}
 
 export function createMDLRenderer(gl) {
   const compile = (type, src) => {
@@ -152,6 +407,8 @@ export function createMDLRenderer(gl) {
     boneCount: gl.getUniformLocation(prog, 'u_boneCount'),
     color: gl.getUniformLocation(prog, 'u_color'),
     keepZ: gl.getUniformLocation(prog, 'u_keepZ'),
+    partScale: gl.getUniformLocation(prog, 'u_partScale'),
+    partPivot: gl.getUniformLocation(prog, 'u_partPivot'),
   }
   const identitySkin = new Float32Array(MAX_BONES * 16)
   for (let i = 0; i < MAX_BONES; i++) identitySkin.set(IDENTITY, i * 16)
@@ -222,6 +479,13 @@ export function createMDLRenderer(gl) {
       gl.uniform1f(uni.keepZ, opts.keepZ ? 1 : 0)
       const col = opts.color || [1, 1, 1, 1]
       gl.uniform4f(uni.color, col[0], col[1], col[2], col[3])
+      // 每零件缩放先复位成恒等——**必须每帧设**，不能只在下面的白名单分支里设：
+      // GL 的 uniform 默认值是 (0,0)，而顶点着色器里 `local.xy = u_partPivot + (local.xy
+      // − u_partPivot) * u_partScale` 在 (0,0) 下会把整张网格乘成 0 → 所有非白名单的
+      // puppet 全部塌到原点（实测 3798926489/3791967416/3737267090/3707219547 等整批
+      // 人物消失只剩零碎头发片）。恒等值下这一行是逐位恒等（×1 再加 0）。
+      gl.uniform2f(uni.partScale, 1, 1)
+      gl.uniform2f(uni.partPivot, 0, 0)
       const skin = computeSkinMatrices(mdl, opts.time || 0, opts.animLayers, opts.boneOverrides)
       const count = Math.min(mdl.bones.length, MAX_BONES)
       if (skin && count > 0) {
@@ -241,7 +505,22 @@ export function createMDLRenderer(gl) {
         gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
       }
       const idxType = mdl.indexType === 'u32' ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
-      gl.drawElements(gl.TRIANGLES, mdl.indexCount, idxType, 0)
+      const squash = opts.syncCoveredParts ? collapsedPartSquash(mdl, skin, opts.animLayers) : null
+      if (squash || (mdl.parts && opts.syncCoveredParts)) {
+        const bytes = idxType === gl.UNSIGNED_INT ? 4 : 2
+        for (let i = 0; i < mdl.parts.length; i++) {
+          const k = squash ? squash[i * 3] : 1
+          if (k < 0.25) continue // 压到 1/4 以下视同收完：不画（回弹时同一条判据自动恢复）
+          const part = mdl.parts[i]
+          const pivotX = squash && k < 1 ? squash[i * 3 + 1] : (part.x0 + part.x1) / 2
+          const pivotY = squash && k < 1 ? squash[i * 3 + 2] : (part.y0 + part.y1) / 2
+          gl.uniform2f(uni.partScale, 1, k)
+          gl.uniform2f(uni.partPivot, pivotX, pivotY)
+          gl.drawElements(gl.TRIANGLES, part.size, idxType, part.start * bytes)
+        }
+      } else {
+        gl.drawElements(gl.TRIANGLES, mdl.indexCount, idxType, 0)
+      }
       gl.bindVertexArray(null)
     },
   }

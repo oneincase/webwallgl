@@ -1,0 +1,205 @@
+<!doctype html>
+<!-- [TEMP-DEBUG] 3629379075 眼睛部件 puppet 最小复现页（眨眼排查）。
+     只画 若叶睦 眼睛部件 一层（无效果链），生产 draw 路径；?t=<秒> 冻结动画时间，
+     ?rate=<倍速> 改层速率，?fx=1 挂回原效果链，?layer=眉毛 换层。 -->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>puppet isolate 3629379075</title>
+<style>
+  body { margin: 0; background: #303030; }
+  canvas { width: 100vw; height: 100vh; display: block; }
+  #info { position: fixed; top: 8px; left: 8px; color: #0f0; font: 12px monospace; pre-wrap: white-space: pre; }
+</style>
+</head>
+<body>
+<div id="info">loading…</div>
+<script>
+  window.addEventListener("error", (e) => { document.getElementById("info").textContent = "ERROR: " + e.message; });
+  window.addEventListener("unhandledrejection", (e) => { document.getElementById("info").textContent = "REJECTION: " + (e.reason && e.reason.message || e.reason); });
+</script>
+<script type="module">
+  const q = new URLSearchParams(location.search);
+  const FX = q.get("fx") === "1";
+  const LAYER = q.get("layer") || "若叶睦 眼睛部件";
+  const T = q.has("t") ? Number(q.get("t")) : null;   // null = 真实时钟
+  const RATE = q.has("rate") ? Number(q.get("rate")) : null;
+  const ID = "3629379075";
+  const BASE = "http://127.0.0.1:1430/media/dev/" + ID;
+  const info = (s) => (document.getElementById("info").textContent = s);
+
+  const pkgMod = await import("/renderer/vendor/we-scene/pkg/container.js");
+  const texMod = await import("/renderer/vendor/we-scene/pkg/texture.js");
+  const scnMod = await import("/renderer/vendor/we-scene/scene/parse.js");
+  const mdlMod = await import("/renderer/vendor/we-scene/render/mdl.js");
+  const rndMod = await import("/renderer/vendor/we-scene/render/renderer.js");
+  const pkg = pkgMod.parsePkg(new Uint8Array(await (await fetch(BASE + "/scene.pkg")).arrayBuffer()));
+  const dec = new TextDecoder();
+
+  const sceneJson = JSON.parse(dec.decode(pkgMod.getEntry(pkg, "scene.json")));
+  const proj = JSON.parse(await (await fetch(BASE + "/project.json")).text());
+  const scene = scnMod.parseScene(sceneJson, proj);
+  const layer = scene.layers.find(l => l.name === LAYER);
+  if (!layer) { info("找不到层 " + LAYER); throw new Error("no layer"); }
+
+  const modelJson = JSON.parse(dec.decode(pkgMod.getEntry(pkg, layer.image)));
+  layer.puppet = mdlMod.parseMDL(pkgMod.getEntry(pkg, modelJson.puppet));
+  // ?voff=X / ?uoff=X ：给所有 UV 加偏移（texel 归一化），用来定位「该采样图集的哪一块」
+  if (q.get("voff") !== null || q.get("uoff") !== null) {
+    const dv0 = Number(q.get("voff") || 0), du0 = Number(q.get("uoff") || 0);
+    const uv = layer.puppet.uvs;
+    for (let i = 0; i < uv.length; i += 2) { uv[i] += du0; uv[i + 1] += dv0; }
+    info(`UV 偏移 u=${du0} v=${dv0}`);
+  }
+
+  // ?flipv=1 ：把 UV 的 v 翻转（判断贴图/UV 的上下朝向是否是问题所在）
+  if (q.get("flipv") === "1") {
+    const uv = layer.puppet.uvs;
+    for (let i = 1; i < uv.length; i += 2) uv[i] = 1 - uv[i];
+    info("flipv=1：UV 已上下翻转");
+  }
+
+  // ?hidebone=N ：丢掉主导骨为 N 的三角形（用来判断某零件在最终画面里还看不看得见）
+  const HIDEBONE = q.get("hidebone");
+  if (HIDEBONE !== null) {
+    const mdl = layer.puppet;
+    const triCount = mdl.indices.length / 3;
+    const keep = [];
+    let dropped = 0;
+    for (let t = 0; t < triCount; t++) {
+      const bw = new Map();
+      for (let k = 0; k < 3; k++) {
+        const v = mdl.indices[t * 3 + k];
+        for (let j = 0; j < 4; j++) {
+          const w = mdl.weights[v * 4 + j]; if (!w) continue;
+          const b = mdl.boneIdx[v * 4 + j];
+          bw.set(b, (bw.get(b) || 0) + w);
+        }
+      }
+      let best = -1, bestW = -1;
+      for (const [b, w] of bw) if (w > bestW) { bestW = w; best = b; }
+      if (String(best) === HIDEBONE) { dropped++; continue; }
+      keep.push(mdl.indices[t * 3], mdl.indices[t * 3 + 1], mdl.indices[t * 3 + 2]);
+    }
+    mdl.indices = new Uint16Array(keep);
+    mdl.indexCount = keep.length;   // 必须同步：draw 用的是 indexCount，不同步会 GL_INVALID_OPERATION 整批不画
+    window.__droppedTris = dropped;
+    info("hidebone=" + HIDEBONE + "：丢弃 " + dropped + " 个三角形（剩 " + (triCount - dropped) + "）");
+  }
+
+  const ONLY = q.get("only");
+  if (ONLY) for (const a of (layer.animationLayers || [])) a.visible = String(a.animation) === ONLY;
+  if (q.get("noanim") === "1") for (const a of (layer.animationLayers || [])) a.visible = false;
+
+  // ?order=bybone ：按 MDLS 每骨 draw_order（升序=先画=在后）重排三角形，
+  // 复刻 WE 的 PuppetLayer::DrawOrder。默认保持文件索引顺序。
+  if (q.get("order") === "bybone") {
+    const bytes = new Uint8Array(pkgMod.getEntry(pkg, modelJson.puppet));
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let a = -1;
+    for (let i = 0; i < dv.byteLength - 12; i++) {
+      if (bytes[i] === 0x4d && bytes[i+1] === 0x44 && bytes[i+2] === 0x4c && bytes[i+3] === 0x53) { a = i; break; }
+    }
+    const cstr = (p) => { let s = ""; while (bytes[p] !== 0 && p < bytes.length) { s += String.fromCharCode(bytes[p]); p++; } return { s, next: p + 1 }; };
+    let o = a + 9;
+    o += 4;                                   // endPos
+    const boneNum = dv.getUint32(o, true); o += 4;
+    for (let i = 0; i < boneNum; i++) { const nm = cstr(o); o = nm.next; o += 8; const size = dv.getUint32(o, true); o += 4 + size; const js = cstr(o); o = js.next; }
+    o += 2;                                   // extras_flag
+    o += 1 + 4 + 4;                           // zero_b + pair0 + pair1
+    if (dv.getUint8(o)) { o += 1 + boneNum * (12 + 64); } else { o += 1; }
+    if (dv.getUint8(o)) { o += 1 + boneNum * 4; } else { o += 1; }
+    const hasDepth = dv.getUint8(o); o += 1;
+    if (!hasDepth) { info("MDLS 无 draw_order，保持文件顺序"); }
+    else {
+    const drawOrder = [];
+    for (let i = 0; i < boneNum; i++) { drawOrder.push(dv.getInt32(o, true)); o += 4; }
+    // 每个三角形的代表骨 = 三个顶点主骨里权重和最大者
+    const mdl = layer.puppet;
+    const triCount = mdl.indices.length / 3;
+    const tris = [];
+    for (let t = 0; t < triCount; t++) {
+      const boneWeight = new Map();
+      for (let k = 0; k < 3; k++) {
+        const v = mdl.indices[t * 3 + k];
+        for (let j = 0; j < 4; j++) {
+          const w = mdl.weights[v * 4 + j]; if (!w) continue;
+          const b = mdl.boneIdx[v * 4 + j];
+          boneWeight.set(b, (boneWeight.get(b) || 0) + w);
+        }
+      }
+      let best = -1, bestW = -1;
+      for (const [b, w] of boneWeight) if (w > bestW) { bestW = w; best = b; }
+      tris.push({ t, key: drawOrder[best] ?? 0, bone: best });
+    }
+    tris.sort((x, y) => (x.key - y.key) || (x.t - y.t));
+    const idx = new Uint16Array(triCount * 3);
+    for (let i = 0; i < tris.length; i++) {
+      const t = tris[i].t;
+      idx[i * 3] = mdl.indices[t * 3];
+      idx[i * 3 + 1] = mdl.indices[t * 3 + 1];
+      idx[i * 3 + 2] = mdl.indices[t * 3 + 2];
+    }
+    mdl.indices = idx;
+    mdl.indexCount = idx.length;
+    const summary = {};
+    for (const tr of tris) summary[tr.bone] = (summary[tr.bone] || 0) + 1;
+    info("order=bybone：按 draw_order 重排 " + triCount + " 个三角形；顺序前 6 骨=" +
+      tris.slice(0, 6).map(t => t.bone + "(" + t.key + ")").join(",") +
+      " 后 6 骨=" + tris.slice(-6).map(t => t.bone + "(" + t.key + ")").join(","));
+    }
+  }
+  const matJson = JSON.parse(dec.decode(pkgMod.getEntry(pkg, modelJson.material)));
+  const texName = matJson.passes[0].textures[0];
+  const parsedTex = texMod.parseTex(pkgMod.getEntry(pkg, "materials/" + texName + ".tex"));
+  const m0 = texMod.decodeMip0(parsedTex);
+  if (!FX) layer.effects = [];
+
+  const c = document.createElement("canvas");
+  c.width = 640; c.height = 760;
+  document.body.appendChild(c);
+  const renderer = rndMod.createRenderer(c, { fboCapFactor: 0 });
+  const mdlRenderer = mdlMod.createMDLRenderer(renderer.gl);
+  mdlRenderer.upload(layer.puppet);
+
+  const textures = new Map();
+  const key = layer.textureName || texName;
+  if (m0.png) {
+    const bmp = await createImageBitmap(new Blob([m0.png], { type: "image/png" }));
+    textures.set(key, { glTex: rndMod.makeTexture(renderer.gl, null, 0, 0, bmp), width: bmp.width, height: bmp.height });
+    info(`${LAYER} 贴图 ImageBitmap ${bmp.width}x${bmp.height}`);
+  } else {
+    textures.set(key, { glTex: rndMod.makeTextureMip(renderer.gl, [m0], false), width: m0.width, height: m0.height });
+    info(`${LAYER} 贴图 rgba ${m0.width}x${m0.height}`);
+  }
+  textures.set("util/white", { glTex: rndMod.makeTexture(renderer.gl, new Uint8Array([255,255,255,255]), 1, 1), width: 1, height: 1 });
+
+  const minimal = { general: scene.general, camera: scene.camera, layers: [layer] };
+  window.__scene = minimal;
+  window.__layer = layer;
+  window.__mdl = layer.puppet;
+  renderer.setPuppetRenderer((l, mvp, o) => {
+    mdlRenderer.draw(mvp, layer.puppet, {
+      time: o.time,
+      animLayers: layer.animationLayers,
+      overrideTex: o.overrideTex || null,
+      keepZ: !!o.keepZ,
+      color: [layer.color[0], layer.color[1], layer.color[2], layer.alpha],
+    }, textures.get(key));
+  });
+
+  info(`${LAYER} v=${layer.puppet.vertexCount} bones=${layer.puppet.bones.length} ` +
+       `animLayers=${(layer.animationLayers||[]).map(a=>a.animation+(a.visible?'':'(hidden)')).join(',')} ` +
+       `t=${T === null ? 'live' : T} fx=${FX}`);
+
+  let live = 0;
+  const loop = () => {
+    if (RATE !== null) for (const a of (layer.animationLayers || [])) a.rate = RATE;
+    const t = T === null ? (live += 1/60) : T;
+    renderer.render(minimal, textures, c.width, c.height, t, "cover").catch(e => info("render error: " + e.message));
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+</script>
+</body>
+</html>
