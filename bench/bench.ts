@@ -268,11 +268,12 @@ const TYPE_KEY = "we-bench-type-filter";
 let typeFilter: WallpaperKind = "scene";
 
 /**
- * 条目归到哪一类。库里 project.json 的 type 大小写混用（scene/Scene、web/Web），
- * 所以一律小写比较；另有个别条目 type 缺失（写成 unknown）。
- * scene 以 hasScene 为准而不是看 type —— 真正决定能否走场景渲染的是有没有
- * scene.pkg/scene.json（buildQuery 也是这么判的）。比如 843532366 声明 scene
- * 但只有 gifscene.json，归到 scene 会挂不起来。
+ * 条目归到哪一类。`type` 已由 host 侧按原生规则规范/推断过
+ * （`host/we-library-scan.mjs`），这里只做小写比较，防上游漏改。
+ * scene 以 hasScene 为准而不是看 type —— 真正决定能否走场景渲染的是有没有场景包
+ * （buildQuery 也是这么判的）。`hasScene` 含 gifscene.pkg 布局：843532366 是 WE 的
+ * GIF 导入模板场景（包名 gifscene.pkg、入口 gifscene.json），渲染器能挂
+ * （`renderer/src/api/source.ts` 的 PKG_PATHS 与 `scene-mount` 都认），实测 60fps 出画。
  */
 function kindOf(it: LibraryItem): WallpaperKind | null {
   if (it.hasScene) return "scene";

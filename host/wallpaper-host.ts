@@ -13,7 +13,8 @@
  *   GET /default-wallpaper/index.html      降级默认壁纸（由 public/ 静态提供）
  *
  * 额外提供测试台自己用的：
- *   GET /api/library                       扫描壁纸库，列出可测试条目
+ *   GET /api/library                       扫描壁纸库，列出可测试条目（类型/入口/封面判据见
+ *                                          we-library-scan.mjs，与原生 library.rs、perf-bench 共用一份）
  *   POST /api/library-dir                  运行时改壁纸库目录（body `{dir}` 或 `{pick:true}` 调系统选文件夹）
  *   POST /api/reveal                       用系统文件管理器打开指定壁纸目录（body `{itemId}`）
  *   POST /api/delete                       删除壁纸目录，优先移入系统废纸篓（body `{itemId}`）
@@ -40,6 +41,13 @@ import { homedir } from "node:os";
 import type { Connect, Plugin, ViteDevServer } from "vite";
 import { describe, overrideProps, readOverrides, writeOverrides } from "./we-props";
 import { injectWebShim, isHtmlPath } from "./we-web-html.mjs";
+import {
+  SCENE_PKG_PATHS,
+  WEB_ENTRY_PATHS,
+  classifyWallpaper,
+  pickEntryFile,
+  pickPreviewFile,
+} from "./we-library-scan.mjs";
 import {
   controlNowPlaying,
   getAudioStatus,
@@ -479,19 +487,56 @@ async function scanLibrary(dir: string) {
       } catch {
         /* 无 project.json 也允许，靠文件探测判类型 */
       }
-      const hasScene =
-        !!(await statFile(join(base, "scene.pkg"))) ||
-        !!(await statFile(join(base, "scenes", "scene.pkg")));
-      const preview: string | undefined = project?.preview;
-      const hasPreview = preview ? !!(await statFile(join(base, preview))) : false;
-      // project.json 的 file 字段是入口（scene.json / *.mp4 / index.html）
-      const file: string | undefined = project?.file;
+      // 类型判定走共用模块（与 perf-bench 同一份、也与原生 library.rs 同规则）：
+      // 此前这里只做 `project.type ?? (hasScene ? scene : unknown)` 且 hasScene 不认
+      // gifscene.pkg，于是两个条目在测试台的**任何标签里都不出现**：843532366
+      // （GIF 导入模板场景，场景包叫 gifscene.pkg）+ 4_15488492008902
+      // （无 project.json 的单文件 mp4）。原生库对同一目录给出 321 场景 / 11 视频，
+      // 测试台是 320 / 10。
+      let dirNames: string[] = [];
+      try {
+        dirNames = await fs.readdir(base);
+      } catch {
+        /* 读不到目录名：按无内容推断 */
+      }
+      const probe = async (rel: string) => !!(await statFile(join(base, rel)));
+      let hasScene = false;
+      for (const rel of SCENE_PKG_PATHS) {
+        if (await probe(rel)) {
+          hasScene = true;
+          break;
+        }
+      }
+      let hasWebEntry = false;
+      let webEntry: string | null = null;
+      for (const rel of WEB_ENTRY_PATHS) {
+        if (await probe(rel)) {
+          hasWebEntry = true;
+          webEntry = rel;
+          break;
+        }
+      }
+      // 封面：project.json 声明的优先（旧行为），声明缺失/文件不在盘上时按原生
+      // PREVIEW_EXTS 找 `preview.*` —— 单文件导入的视频（无 project.json）磁盘上
+      // 有 preview.png，不兜底就只在列表里显示一行光秃秃的文字。
+      const declaredPreview = typeof project?.preview === "string" ? project.preview : "";
+      const preview =
+        declaredPreview && (await statFile(join(base, declaredPreview)))
+          ? declaredPreview
+          : pickPreviewFile(dirNames);
+      const type = classifyWallpaper({ declared: project?.type, hasScene, hasWebEntry, names: dirNames });
+      // 入口文件（scene 不需要，src 就是 itemId）：project.json 没声明时按内容兜底，
+      // 否则「无 project.json 的单文件视频」即使列出来也挂不上（src 拼不出来）。
+      const file: string | undefined =
+        typeof project?.file === "string" && project.file
+          ? project.file
+          : pickEntryFile({ type, names: dirNames, webEntry });
       return {
         itemId,
         title: project?.title ?? itemId,
-        type: project?.type ?? (hasScene ? "scene" : "unknown"),
+        type,
         file,
-        preview: hasPreview ? preview : undefined,
+        preview,
         hasScene,
         properties: project?.general?.properties ?? null,
       };

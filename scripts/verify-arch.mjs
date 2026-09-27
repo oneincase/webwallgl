@@ -423,6 +423,44 @@ for (const name of REQUIRED_WP) {
   );
 }
 
+// ---------- 壁纸库分类：规则只有一份，且与原生 library.rs 对齐 ----------
+// host/wallpaper-host.ts 与 scripts/perf-bench.mjs 各写一份判据时两份都比原生弱
+// （不认 gifscene.pkg、不做内容推断）⇒ 843532366（GIF 导入模板场景，包名 gifscene.pkg）
+// 与 4_15488492008902（无 project.json 的单文件 mp4）在测试台的**任何标签里都不显示**：
+// 原生 app.db 是 321 场景 / 11 视频 / 26 网页，测试台列表只有 320 / 10 / 26。
+// 规则已抽进 host/we-library-scan.mjs，两个调用方共用（纯函数，可直接跑夹具）。
+{
+  const scan = await import(pathToFileURL(path.join(ROOT, "host/we-library-scan.mjs")).href);
+  const cases = [
+    ["声明的类型优先于内容探测（含大写 Scene）", scan.classifyWallpaper({ declared: "Scene", hasScene: true }), "scene"],
+    ["场景包布局 gifscene.pkg 也要算 scene（843532366）", scan.classifyWallpaper({ hasScene: true, names: ["gifscene.pkg", "preview.jpg"] }), "scene"],
+    ["无 project.json 的单文件视频按扩展名判 video", scan.classifyWallpaper({ names: ["4_15488492008902.mp4", "preview.png"] }), "video"],
+    ["preview.* 是封面，不参与类型推断", scan.classifyWallpaper({ names: ["preview.gif"] }), "image"],
+    ["index.html 与场景包同时存在时按原生顺序取 web", scan.classifyWallpaper({ hasWebEntry: true, hasScene: true, names: ["index.html"] }), "web"],
+    ["视频/图片混合目录取 video（原生 rank）", scan.classifyWallpaper({ names: ["a.png", "b.gif", "c.mp4"] }), "video"],
+    ["什么都没有时兜底 image（原生 best.unwrap_or(image)）", scan.classifyWallpaper({ names: [] }), "image"],
+    ["白名单外的 type 值要落到内容推断", scan.classifyWallpaper({ declared: "weird", names: ["a.png"] }), "image"],
+    ["入口文件：无声明时按名排序取第一个视频", scan.pickEntryFile({ type: "video", names: ["b.mp4", "A.mp4", "preview.png"] }), "A.mp4"],
+    ["入口文件：project.json 声明的优先", scan.pickEntryFile({ declared: "own.mp4", type: "video", names: ["a.mp4"] }), "own.mp4"],
+    ["封面按 PREVIEW_EXTS 优先级且大小写不敏感", scan.pickPreviewFile(["x.png", "PREVIEW.PNG"]), "PREVIEW.PNG"],
+  ];
+  for (const [what, got, want] of cases) check(got === want, `${what}：期望 ${want}，实得 ${got}`);
+  check(
+    scan.SCENE_PKG_PATHS.includes("gifscene.pkg"),
+    "SCENE_PKG_PATHS 必须含 gifscene.pkg（WE 的 GIF 导入模板场景，渲染器 PKG_PATHS 也认）",
+  );
+  const hostScanSrc = fs.readFileSync(path.join(ROOT, "host/wallpaper-host.ts"), "utf8");
+  check(
+    /we-library-scan/.test(hostScanSrc) && /classifyWallpaper/.test(hostScanSrc),
+    "wallpaper-host 扫库必须用共用分类模块（别在端点里另写一份判据）",
+  );
+  const benchScanSrc = fs.readFileSync(path.join(ROOT, "scripts/perf-bench.mjs"), "utf8");
+  check(
+    /we-library-scan/.test(benchScanSrc) && /classifyWallpaper/.test(benchScanSrc),
+    "perf-bench 扫库必须用共用分类模块（否则与测试台 / 原生三份判据发散）",
+  );
+}
+
 // ---------- 汇总 ----------
 if (errors.length) {
   console.error(`verify-arch：${errors.length} 处边界破坏`);

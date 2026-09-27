@@ -41,6 +41,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { launchHeadless, instrument } from "./headless-gpu.mjs";
+import { SCENE_PKG_PATHS, WEB_ENTRY_PATHS, classifyWallpaper, pickEntryFile } from "../host/we-library-scan.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -171,9 +172,19 @@ function startServer({ dist, lib, token = "dev", allowCache = false }) {
   });
 }
 
-/** 扫库：与 host/wallpaper-host.ts 的 scanLibrary 同判据（hasScene 优先 → scene） */
+/**
+ * 扫库：类型判据与 host/wallpaper-host.ts 共用 `host/we-library-scan.mjs`
+ * （同一条规则也曾各写一份，两份都会漏 gifscene.pkg 场景 —— 见该文件头注释）。
+ */
 function scanLibrary(lib) {
   const items = [];
+  const isFile = (dir, rel) => {
+    try {
+      return fs.statSync(path.join(dir, rel)).isFile();
+    } catch {
+      return false;
+    }
+  };
   for (const name of fs.readdirSync(lib)) {
     if (name.startsWith(".")) continue;
     const dir = path.join(lib, name);
@@ -190,10 +201,18 @@ function scanLibrary(lib) {
     } catch {
       /* 无 project.json 也允许 */
     }
-    const hasScene =
-      fs.existsSync(path.join(dir, "scene.pkg")) || fs.existsSync(path.join(dir, "scenes/scene.pkg"));
-    const file = project?.file;
-    const type = hasScene ? "scene" : String(project?.type ?? "unknown").toLowerCase();
+    let dirNames = [];
+    try {
+      dirNames = fs.readdirSync(dir);
+    } catch {}
+    const hasScene = SCENE_PKG_PATHS.some((rel) => isFile(dir, rel));
+    const webEntry = WEB_ENTRY_PATHS.find((rel) => isFile(dir, rel)) ?? null;
+    const hasWebEntry = webEntry !== null;
+    const type = classifyWallpaper({ declared: project?.type, hasScene, hasWebEntry, names: dirNames });
+    const file =
+      typeof project?.file === "string" && project.file
+        ? project.file
+        : pickEntryFile({ type, names: dirNames, webEntry });
     let size = 0;
     try {
       for (const f of fs.readdirSync(dir)) {
@@ -210,7 +229,7 @@ function scanLibrary(lib) {
       hasScene,
       sizeBytes: size,
       pkgBytes: (() => {
-        for (const rel of ["scene.pkg", "scenes/scene.pkg", "gifscene.pkg"]) {
+        for (const rel of SCENE_PKG_PATHS) {
           try {
             return fs.statSync(path.join(dir, rel)).size;
           } catch {}
