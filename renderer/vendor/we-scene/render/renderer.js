@@ -1303,33 +1303,59 @@ export function createRenderer(canvas, opts = {}) {
   // 现在只有宿主显式 fade:true 才接线；场景显式写 false 的仍不放（缺省按关处理），
   // 默认无开场动画的壁纸不再叠加全局开场动画。
   const fadeEnabled = (general) => opts.fade === true && boolProp(general.camerafade, false)
-  // [we-scene patch] camerashake：相机持续抖动（全库 5 个场景开启）。
-  // 三个参数齐全（amplitude / roughness / speed），无需猜测：
-  //   2800248288 amp=0.35 rough=0   speed=1
-  //   3789602510 amp=0.5  rough=1   speed=0.81
-  //   3790769971 amp=0.2  rough=0   speed=0.9
-  // 用两条不同频率的正弦叠加取代真随机：抖动必须**逐帧连续**，用 Math.random()
-  // 会得到每帧跳变的抽帧感；roughness 控制高频分量的权重（0=纯低频平滑摆动）。
-  // [we-scene patch 2026-09-23 issue#3] 幅度与频率收敛：WE 的 camerashake 实现
-  // 未公开（linux-wallpaperengine 只解析不实现），此前的「amp=1 → ±2% 视宽」
-  // 是观感近似、无数据出处 —— 实测 amp=0.5 时整屏 ±38px@4K、~2.5Hz，属剧烈晃动。
-  // 现按 issue #3 的验收口径（轻微、缓慢）标定：amp=1 → ±0.5% 视宽
-  // （amp=0.5 → ±9.6px@4K），高频分量频率减半（rough=1 主频 ≤~1.5Hz）。
-  // 两个数字同样是标定值而非 WE 逆向值；rough=1 仍明显快于 rough=0，语义不变。
-  function cameraShakeOffset(general, time) {
+  // [we-scene patch 2026-09-27] camerashake 运动模型重写 —— 对齐 linux-wallpaperengine
+  // 的逆向实现（AzPepoze/linux-wallpaperengine src/wallpaper/2d/camera/parallax.cpp
+  // 的 camera_shake_update；8 方向表 × {0.8,1.0,0.45,0.6} 系数这种组合不可能凭空
+  // 发明，按官方运行时行为逆向而来，Almamu 原版只是没实现、并非官方语义）。
+  // 旧实现（两条正弦乘积，issue#3 标定）的两处偏差（3463520581 amp=0.5 rough=1.0
+  // speed=0.64 实测对比）：
+  //   1. roughness 语义反了：旧码把它当 [0,1] 的低/高频混合权重，rough=1 → 100%
+  //      高频连续细碎晃；官方语义是 [0,2]，≤1 全是平静基准档（grow=0），只有 >1
+  //      才按 (rough-1)² 把方向系数放大到 6~8 倍。库里 roughness=1.0 的场景
+  //      （3789602510 / 3463520581）官方观感是基准慢摆，旧码却跑最抖档。
+  //   2. 运动模型不同：官方是「8 方向节拍 + smoothstep 缓动 + 正弦旁弯」——
+  //      每 (π/2)/(2·speed) 秒切一拍（奇数拍停在中心，速度过零），
+  //      dir0→中心→dir1→中心… 的沉稳慢摆；正弦乘积则是连续往返。
+  //      同参数仿真：旧码峰值速度 ~38px/s vs 逆向实现 ~19px/s（4K），旧码快一倍。
+  // 幅度：amp·min(viewW,viewH)·0.01（amp=1 → ±1% 短边；16:9 下 ≈ ±0.56% 视宽，
+  // 与 issue#3 的 ±0.5% 同量级，标定不回退）。返回值直接是世界像素 ——
+  // 旧版返回归一化值再由调用点乘比例，两处拆写让 verify 与实现漂移过，收敛到一处。
+  const SHAKE_DIRS = [
+    [-1, 1], [1, -1], [-1, 1], [1, -1], [1, 1], [-1, -1], [1, 1], [-1, -1],
+  ]
+  const SHAKE_BASE = [0.8, 1.0, 0.45, 0.6, 0.8, 1.0, 0.45, 0.6]
+  const SHAKE_ROUGH = [6.0, 8.0, 1.0, 1.0, 6.0, 8.0, 1.0, 1.0]
+  function cameraShakeOffset(general, time, viewW, viewH) {
     if (!boolProp(general.camerashake, false)) return null
     const amp = numProp2(general.camerashakeamplitude, 0)
     if (amp === 0) return null
-    const rough = Math.max(0, Math.min(1, numProp2(general.camerashakeroughness, 0)))
     const speed = numProp2(general.camerashakespeed, 1)
-    const t = time * speed
-    const lowX = Math.sin(t * 2.1) * Math.cos(t * 0.7)
-    const lowY = Math.cos(t * 1.7) * Math.sin(t * 0.9)
-    const hiX = Math.sin(t * 5.65) * Math.cos(t * 3.55)
-    const hiY = Math.cos(t * 4.2) * Math.sin(t * 5.0)
+    // roughness ∈ [0,2]：≤1 基准档（grow=0），>1 才按平方放大抖动系数
+    const rough = Math.max(0, Math.min(2, numProp2(general.camerashakeroughness, 0)))
+    const growSq = Math.max(0, rough - 1) ** 2
+    // 节拍：每 (π/2)/(2·speed) 秒一拍（speed=1 → ~0.785s；3463520581 → ~1.23s）
+    const beatPos = Math.max(0, time * speed * 2) / (Math.PI * 0.5)
+    const beat = Math.floor(beatPos)
+    const local = beatPos - beat
+    // 奇数拍停在中心（速度过零），偶数拍按 (拍号/2)%8 取方向
+    const sample = (i) => {
+      if (i & 1) return [0, 0]
+      const d = (i >> 1) % 8
+      const f = SHAKE_BASE[d] * (1 + (SHAKE_ROUGH[d] - 1) * growSq)
+      return [SHAKE_DIRS[d][0] * f, SHAKE_DIRS[d][1] * f]
+    }
+    const [ax, ay] = sample(beat)
+    const [bx, by] = sample(beat + 1)
+    const dx = bx - ax
+    const dy = by - ay
+    const len = Math.hypot(dx, dy) || 1
+    const amount = local * local * (3 - 2 * local) // smoothstep：拍内缓入缓出
+    // 旁弯：沿节拍位移的垂直方向叠一点正弦弧线，往返不是直线（官方观感）
+    const bend = Math.sin(local * Math.PI) * (0.09 + growSq * 0.04) * len
+    const scale = amp * Math.min(viewW, viewH) * 0.01
     return {
-      x: (lowX * (1 - rough) + hiX * rough) * amp,
-      y: (lowY * (1 - rough) + hiY * rough) * amp,
+      x: (ax * (1 - amount) + bx * amount + (-dy / len) * bend) * scale,
+      y: (ay * (1 - amount) + by * amount + (dx / len) * bend) * scale,
     }
   }
   // [we-scene patch] g_Daytime：WE 语义是「一天中的时刻」，取 [0,1)（0=午夜）。
@@ -2894,15 +2920,11 @@ export function createRenderer(canvas, opts = {}) {
     // 几十像素的偏移被当成十几个屏幕宽，画面直接跑飞。
     let shakeM = null
     if (!cam.perspective && opts.shake !== false) {
-      const sh = cameraShakeOffset(general, time)
-      if (sh) {
-        // amp=1 → ±0.5% 视宽（issue#3 标定收敛，见 cameraShakeOffset 注释）
-        const px = sh.x * cam.viewW * 0.005
-        const py = sh.y * cam.viewH * 0.005
-        if (px !== 0 || py !== 0) {
-          shakeM = mat4Translate(mat4Identity(), px, py, 0)
-          viewProj = mat4Multiply(viewProj, shakeM)
-        }
+      // 返回值已是世界像素（amp·min(viewW,viewH)·0.01，见 cameraShakeOffset 注释）
+      const sh = cameraShakeOffset(general, time, cam.viewW, cam.viewH)
+      if (sh && (sh.x !== 0 || sh.y !== 0)) {
+        shakeM = mat4Translate(mat4Identity(), sh.x, sh.y, 0)
+        viewProj = mat4Multiply(viewProj, shakeM)
       }
     }
 
