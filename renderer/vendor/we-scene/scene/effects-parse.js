@@ -19,7 +19,10 @@ function parseEffectJson(text) {
 }
 
 // pkg: parsePkg 结果；effect: scene.json 的效果条目（file/passes/visible）
-export function resolveEffectChain(pkg, effect, readText) {
+// onMaterialDoc: 可选回调。效果链里的材质是**独立文档**（materials/*.json），其中的
+//   `{"user":"名"}` 绑定不在 layer.srcObject 树里，resolveUserProps 够不到；宿主用它
+//   把文档登记下来，装配期与热更期各解析一次（见 scene-mount 的 materialDocs）。
+export function resolveEffectChain(pkg, effect, readText, onMaterialDoc) {
   const entry = getEntry(pkg, effect.file)
   if (entry === null) return
   let ej
@@ -73,6 +76,8 @@ export function resolveEffectChain(pkg, effect, readText) {
       return { shader: null, copyCommand: false, target: p.target || null, binds: p.bind || [], blending: 'normal', textures: [], combos: {}, constants: {} }
     }
     const mj = parseEffectJson(readText(me))
+    // 材质文档交给宿主登记 + 解析其 {user} 绑定（见函数头注释）
+    if (typeof onMaterialDoc === 'function') onMaterialDoc(mj)
     const mp = (mj.passes && mj.passes[0]) || {}
     return {
       shader: mp.shader || null,

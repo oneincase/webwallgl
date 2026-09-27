@@ -446,6 +446,36 @@ cfg, source, pkgAbort.signal);
         pkg.getEntry(parsedPkg, "scenes/gifscene.json");
       if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
       const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
+      /**
+       * 本场景加载过的**材质文档**（materials/*.json），用于解析其中的用户属性绑定。
+       *
+       * 为什么必须单独收集：`{"user":"名"}` 绑定不只在 scene.json —— 音频条/可视化器的
+       * 颜色与透明度常绑在材质文件的 `passes[k].constantshadervalues.X` 上（全库按槽位
+       * 统计：`Alpha` 6 张、`color` 11 张）。而 `resolveUserProps` 只在 scene.json 的
+       * `objects` 与 `general` 上被调用（parse.js 装配期、applyLiveProps 热更期），材质是
+       * **独立文档**、不在 `layer.srcObject` 树里 —— 于是这些绑定从装配到热更**一路都没被
+       * 解析过**，表现为「UI 里有滑条（如 Visualizer Transparency），拖动永远无效」。
+       *
+       * 就地改 `.value` 就够，不需要别的失效机制：材质 pass 的 `constantshadervalues`
+       * 以**引用**进到绘制侧（effects-parse 的 `constants: mp.constantshadervalues`、
+       * attachLayerMaterialEffect 同理），而渲染器每次绘制都
+       * `constMerged = {...mp.constants, ...ov.constantshadervalues}` 现读（见 renderer.js）。
+       *
+       * 已知仍会滞后的一处（全库无壁纸用到，故不写无法验证的代码）：LIGHTING 层的
+       * `layer.lightMetallic/lightRoughness` 是装配期从材质常量抄出来的副本（见下方装配处）。
+       * 若将来有壁纸把 metallic/roughness 绑到用户属性，需要在热更里一并刷新那两个字段。
+       */
+      const materialDocs: any[] = [];
+      // A/B 钩子：__noMaterialProps=true 回到改动前行为（材质文档完全不解析）
+      const noMaterialProps = (globalThis as any).__noMaterialProps === true;
+      const registerMaterialDoc = (doc: any) => {
+        if (noMaterialProps || !doc || typeof doc !== "object") return doc;
+        materialDocs.push(doc);
+        resolveUserProps(doc, (scene as any).properties || {}, 0);
+        return doc;
+      };
+      /** 读一份材质文档（登记 + 解析其中的 {user} 绑定） */
+      const readMaterialDoc = (entry: Uint8Array) => registerMaterialDoc(JSON.parse(readText(entry)));
       // 宿主覆盖清屏色。场景作者按「铺满 PC 全屏」设 clearcolor，不少填的是浅灰；
       // 手机竖屏用 contain 适配 16:9 场景时，上下留白会露出这块浅灰，像是渲染坏了。
       // 宿主传 "0 0 0" 即可把留白压成中性黑。
@@ -1089,7 +1119,7 @@ cfg, source, pkgAbort.signal);
             if (!matEntry) continue;
             let names: string[] = [];
             try {
-              const mat = JSON.parse(readText(matEntry));
+              const mat = readMaterialDoc(matEntry);
               names = (mat?.passes || []).flatMap((p: any) => (Array.isArray(p?.textures) ? p.textures : []));
             } catch {
               names = [];
@@ -2430,7 +2460,7 @@ cfg, source, pkgAbort.signal);
                 continue;
               }
             } else {
-              material = JSON.parse(readText(matEntry));
+              material = readMaterialDoc(matEntry);
             }
           }
           const pass = (material as {
@@ -2610,7 +2640,7 @@ cfg, source, pkgAbort.signal);
             eff.attachLayerMaterialEffect(layer, pass);
           }
           for (const e of layer.effects || []) {
-            eff.resolveEffectChain(parsedPkg, e, readText);
+            eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc);
           }
           for (const e of layer.effects || []) {
             for (const p of e.passes || []) {
@@ -2657,7 +2687,7 @@ cfg, source, pkgAbort.signal);
           if (!layer.isText || !(layer.effects || []).length) continue;
           try {
             for (const e of layer.effects || []) {
-              eff.resolveEffectChain(parsedPkg, e, readText);
+              eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc);
             }
             for (const e of layer.effects || []) {
               for (const p of e.passes || []) {
@@ -2857,7 +2887,7 @@ cfg, source, pkgAbort.signal);
         if (model.material) {
           const matEntry = pkg.getEntry(parsedPkg, model.material);
           if (matEntry) {
-            const mat = JSON.parse(readText(matEntry));
+            const mat = readMaterialDoc(matEntry);
             ps.setMaterial(mat);
             const slots = mat?.passes?.[0]?.textures || [];
             texName = slots[0] || null;
@@ -3342,7 +3372,7 @@ cfg, source, pkgAbort.signal);
           if (mdlObj.materialPath) {
             const matEntry = pkg.getEntry(parsedPkg, mdlObj.materialPath);
             if (matEntry) {
-              const material = JSON.parse(readText(matEntry));
+              const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
               const tex = pass0?.textures?.[0];
               if (typeof tex === "string" && tex) texName = tex;
@@ -4096,7 +4126,7 @@ cfg, source, pkgAbort.signal);
                 const model = JSON.parse(readText(pkg.getEntry(parsedPkg, imagePath)!));
                 const mat = scn.resolveMaterial(model);
                 const matEntry = mat && pkg.getEntry(parsedPkg, mat.materialPath);
-                const material = matEntry ? JSON.parse(readText(matEntry)) : null;
+                const material = matEntry ? readMaterialDoc(matEntry) : null;
                 const pass = material?.passes?.[0];
                 if (pass?.combos) {
                   for (const k of Object.keys(pass.combos)) {
@@ -5350,6 +5380,9 @@ cfg, source, pkgAbort.signal);
         // 此前只逐层 resolve，general 绑定的 .value 永远停在挂载快照 —— 开关
         // 切了、画面不变。resolveUserProps 就地改 .value，渲染端每帧解包读取。
         resolveUserProps((scene as any).general || {}, properties, 0);
+        // 材质文档里的绑定也要重解：它们不在 srcObject 树里（见 materialDocs 的注释）。
+        // 少这一步，「音频条颜色 / 可视化器透明度」这类**只绑在材质上**的属性热更后画面不动。
+        for (const doc of materialDocs) resolveUserProps(doc, properties, 0);
         for (const layer of scene.layers as any[]) {
           const src = layer.srcObject;
           if (!src) continue;
