@@ -2,7 +2,7 @@ import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4Ro
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
@@ -1884,6 +1884,17 @@ export function createRenderer(canvas, opts = {}) {
   // 静态 quad 单例 + 变更才上传：避免每帧每 pass 新建 Float32Array 与 bufferData
   const PASS_QUAD = passQuadVerts()
   const LOCAL_QUAD = localQuadVerts()
+  const LOCAL_QUAD_YUP = localQuadVertsYup()
+  // 最终合成 quad 按**世界朝向约定**选：
+  //   2D 场景世界 y 向下，model 矩阵含 projH−y 翻转，LOCAL_QUAD（+y 采 v=1）与之对消 → 正立；
+  //   3D 透视场景世界 y 向上，model 矩阵不翻 y，必须用 LOCAL_QUAD_YUP（+y 采 v=0）才正立。
+  // 两种输入（无效果直画源纹理、效果链 FBO）在各自空间里朝向约定一致，故只看 cam.perspective。
+  // 返回 [缓存 key, 顶点]：两条路径 key 必须不同，否则同一帧里切到另一套会让
+  // uploadQuad 因 key 相同而跳过上传，拿错 quad（场景整体 2D 或 3D 时本不会混用，
+  // 但 key 相同是隐性坑）。
+  function localQuadForCam(cam) {
+    return cam && cam.perspective ? ['local-yup', LOCAL_QUAD_YUP] : ['local', LOCAL_QUAD]
+  }
   const layerQuadCache = new Map()
   function layerQuad(w, h) {
     const key = w + 'x' + h
@@ -2311,7 +2322,7 @@ export function createRenderer(canvas, opts = {}) {
       bindFinal()
       gl.viewport(0, 0, width, height)
       gl.bindVertexArray(vao)
-      uploadQuad('local', LOCAL_QUAD)
+      { const [k, v] = localQuadForCam(cam); uploadQuad(k, v) }
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, inputTex)
       gl.uniform1i(compBlendUni.tex, 0)
@@ -2384,7 +2395,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.viewport(0, 0, width, height)
     }
     gl.bindVertexArray(vao)
-    uploadQuad('local', LOCAL_QUAD)
+    { const [k, v] = localQuadForCam(cam); uploadQuad(k, v) }
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, inputTex)
     gl.uniform1i(uni.tex, 0)

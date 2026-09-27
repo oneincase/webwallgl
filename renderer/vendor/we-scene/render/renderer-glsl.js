@@ -656,6 +656,17 @@ function layerQuadVerts(w, h) {
     w, 0, 0, 1, 0,
   ])
 }
+// 透视 y-up 世界、输入纹理正立（v=0=图像顶）时用的 local quad：world +y 采 v=0。
+function localQuadVertsYup() {
+  return new Float32Array([
+    -0.5, 0.5, 0, 0, 0,
+    -0.5, -0.5, 0, 0, 1,
+    0.5, 0.5, 0, 1, 0,
+    0.5, 0.5, 0, 1, 0,
+    -0.5, -0.5, 0, 0, 1,
+    0.5, -0.5, 0, 1, 1,
+  ])
+}
 function passQuadVerts() {
   return new Float32Array([
     -1, 1, 0, 0, 1, // NDC 顶 v=1（FBO 纹理 v=1=顶行，顶采顶直通）
@@ -691,4 +702,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES }
