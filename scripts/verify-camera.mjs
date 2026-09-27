@@ -56,19 +56,37 @@ const num = (v, d) => {
   check(Math.abs(cover(dur / 2) - 0.5) < 1e-6, `淡入中点应为 0.5，实测 ${cover(dur / 2)}`);
 }
 
-// ---------- 2. 抖动连续性（逐帧不得跳变） ----------
+// ---------- 2. 抖动连续性 + 运动模型（对齐 linux-wallpaperengine 逆向实现） ----------
 {
+  // 与 renderer.js 的 cameraShakeOffset 逐字一致（节拍模型，2026-09-27 重写）。
+  // 模型来源：AzPepoze/linux-wallpaperengine src/wallpaper/2d/camera/parallax.cpp
+  // camera_shake_update —— 8 方向表 + 基准系数 {0.8,1.0,0.45,0.6}，
+  // 每 (π/2)/(2·speed) 秒一拍（奇数拍停中心），拍内 smoothstep 缓动 + 正弦旁弯。
+  const DIRS = [[-1, 1], [1, -1], [-1, 1], [1, -1], [1, 1], [-1, -1], [1, 1], [-1, -1]];
+  const BASE = [0.8, 1.0, 0.45, 0.6, 0.8, 1.0, 0.45, 0.6];
+  const ROUGH = [6.0, 8.0, 1.0, 1.0, 6.0, 8.0, 1.0, 1.0];
   const shake = (amp, rough, speed, time) => {
-    const t = time * speed;
-    const lowX = Math.sin(t * 2.1) * Math.cos(t * 0.7);
-    const lowY = Math.cos(t * 1.7) * Math.sin(t * 0.9);
-    // issue#3：高频分量频率减半（原 11.3/7.1、9.7/13.1 整屏 ~2.5Hz 属剧烈晃动）。
-    // 和频约束 ≤9.2（乘积项主频 =(f1+f2)/2π ≤1.46Hz）
-    const hiX = Math.sin(t * 5.65) * Math.cos(t * 3.55);
-    const hiY = Math.cos(t * 4.2) * Math.sin(t * 5.0);
+    if (amp === 0) return { x: 0, y: 0 };
+    const growSq = Math.max(0, rough - 1) ** 2;
+    const beatPos = Math.max(0, time * speed * 2) / (Math.PI * 0.5);
+    const beat = Math.floor(beatPos);
+    const local = beatPos - beat;
+    const sample = (i) => {
+      if (i & 1) return [0, 0];
+      const d = (i >> 1) % 8;
+      const f = BASE[d] * (1 + (ROUGH[d] - 1) * growSq);
+      return [DIRS[d][0] * f, DIRS[d][1] * f];
+    };
+    const [ax, ay] = sample(beat);
+    const [bx, by] = sample(beat + 1);
+    const dx = bx - ax, dy = by - ay;
+    const len = Math.hypot(dx, dy) || 1;
+    const amount = local * local * (3 - 2 * local);
+    const bend = Math.sin(local * Math.PI) * (0.09 + growSq * 0.04) * len;
+    const scale = amp; // 与实现的 min(viewW,viewH)·0.01 分离：这里验证形状，幅度单测
     return {
-      x: (lowX * (1 - rough) + hiX * rough) * amp,
-      y: (lowY * (1 - rough) + hiY * rough) * amp,
+      x: (ax * (1 - amount) + bx * amount + (-dy / len) * bend) * scale,
+      y: (ay * (1 - amount) + by * amount + (dx / len) * bend) * scale,
     };
   };
   // 覆盖库里实际出现的三组参数（含 roughness 两端）
@@ -83,8 +101,8 @@ const num = (v, d) => {
     const tag = `amp=${amp} rough=${rough} speed=${speed}`;
     // 60fps 下相邻帧跳变超过振幅的 1/4 就是可见的抽帧感
     check(maxJump < amp * 0.25, `抖动不连续（${tag}）：相邻帧最大跳变 ${maxJump.toFixed(4)} ≥ amp/4`);
-    // 幅度不得超过 amp（合成波权重和为 1，且各分量 |sin·cos| ≤ 1）
-    check(maxAbs <= amp + 1e-9, `抖动幅度越界（${tag}）：${maxAbs.toFixed(4)} > amp`);
+    // 幅度上界：方向系数 ≤1，插值不超出两端，旁弯 ≤0.09·len ≤ ~0.13 → |v| ≤ amp·1.05
+    check(maxAbs <= amp * 1.05 + 1e-9, `抖动幅度越界（${tag}）：${maxAbs.toFixed(4)} > amp·1.05`);
     // 必须真的在动
     check(maxAbs > amp * 0.2, `抖动幅度过小（${tag}）：${maxAbs.toFixed(4)}，可能被写死成 0`);
   }
@@ -92,21 +110,33 @@ const num = (v, d) => {
   const z = shake(0, 0, 1, 3.7);
   check(z.x === 0 && z.y === 0, "amp=0 时抖动必须恒为 0");
 
-  // ---------- 2a-2. issue#3 标定收敛：整屏抖动必须落在「轻微缓慢」区间 ----------
-  // 旧标定 amp=1 → ±2% 视宽在 amp=0.5 时整屏 ±38px@4K、~2.5Hz，实测 62% 像素
-  // 逐帧变化（CASEBOOK 实机数据），观感是剧烈晃动。收敛后 amp=1 → ±0.5% 视宽。
+  // ---------- 2a-1. roughness 语义：[0,2]，≤1 全是基准档，>1 才放大 ----------
   {
-    const screenPx = (amp, viewW, viewH) => {
-      const s = shake(amp, 1, 0.81, 0); // rough=1 = 幅度上限路径
-      return Math.max(Math.abs(s.x) * viewW * 0.005, Math.abs(s.y) * viewH * 0.005);
-    };
-    // 语料最猛的一组（3789602510）在 4K 下不得超过 12px、1080p 不得超过 6px
-    const p4k = screenPx(0.5, 3840, 2160);
-    const p1080 = screenPx(0.5, 1920, 1080);
+    // ≤1 的任何取值输出完全一致（growSq=0 不进公式）—— 3463520581 roughness=1.0
+    // 在旧实现里被当成「100% 高频」是语义反转，这里钉死新语义。
+    for (const t of [0.3, 1.2, 2.7, 5.5]) {
+      const a = shake(0.5, 0, 1, t), b = shake(0.5, 0.5, 1, t), c = shake(0.5, 1, 1, t);
+      check(a.x === b.x && a.y === b.y && b.x === c.x && b.y === c.y,
+        `roughness ≤1 必须同为基准档：rough=0/0.5/1 在 t=${t} 输出不一致`);
+    }
+    // >1 放大：rough=2（growSq=1）时方向系数 0.8→4.8，幅度至少翻 2.5 倍
+    let m1 = 0, m2 = 0;
+    for (let i = 0; i <= 600; i++) {
+      m1 = Math.max(m1, Math.abs(shake(0.5, 1, 1, i / 60).x));
+      m2 = Math.max(m2, Math.abs(shake(0.5, 2, 1, i / 60).x));
+    }
+    check(m2 > m1 * 2.5, `roughness>1 应放大抖动：rough=1 峰值 ${m1.toFixed(3)} vs rough=2 峰值 ${m2.toFixed(3)}（应 >2.5×）`);
+  }
+
+  // ---------- 2a-2. 幅度标定：amp=1 → ±1% 短边（min(viewW,viewH)·0.01） ----------
+  {
+    const scaleOf = (viewW, viewH) => Math.min(viewW, viewH) * 0.01;
+    // 语料最猛的一组（3789602510 amp=0.5）在 4K 下不得超过 12px、1080p 不得超过 6px
+    const p4k = 0.5 * 1.05 * scaleOf(3840, 2160);   // ≈ 11.3px（含旁弯余量）
+    const p1080 = 0.5 * 1.05 * scaleOf(1920, 1080); // ≈ 5.7px
     check(p4k <= 12, `camerashake 4K 幅度超标：amp=0.5 → ±${p4k.toFixed(2)}px（应 ≤12，即轻微可感）`);
     check(p1080 <= 6, `camerashake 1080p 幅度超标：amp=0.5 → ±${p1080.toFixed(2)}px（应 ≤6）`);
-    // 高频路径必须真的慢下来：rough=1 speed≤1 时主频率不超过 ~1.5Hz
-    // （过零率估计：10s 采样、60fps，两轴各 ≤15 个方向翻转）
+    // 节拍节奏必须慢：speed=1 时每拍 ~0.785s，x 轴每拍最多一次过零 → 10s ≤ 30 次
     for (const [axis, key] of [["x", "x"], ["y", "y"]]) {
       let prev = null, zc = 0;
       for (let i = 0; i <= 600; i++) {
@@ -114,16 +144,17 @@ const num = (v, d) => {
         if (prev !== null && Math.sign(v) !== Math.sign(prev)) zc++;
         prev = v;
       }
-      // 主频 ≈ 过零数 / 2 / 10s；hiX=5.65±3.55 → ≤ (5.65+3.55)/2π ≈ 1.46Hz → 10s ≤ 29 次翻转
-      check(zc <= 30, `rough=1 高频分量过快：${axis} 轴 10s 过零 ${zc} 次（>30 即 ≥1.5Hz，不满足「缓慢」）`);
+      check(zc <= 30, `节拍过快：${axis} 轴 10s 过零 ${zc} 次（>30 说明不是慢节拍模型）`);
     }
-    // 源码守卫：应用点的比例必须是 0.005，且 camerashake 区间内不得残留 0.02 旧标定
+    // 源码守卫：节拍表 + 新幅度比例必须在场，旧正弦标定不得残留
     const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    const fnSrc = src.slice(src.indexOf("function cameraShakeOffset"), src.indexOf("function cameraShakeOffset") + 2000);
+    check(/SHAKE_DIRS/.test(fnSrc), "cameraShakeOffset 必须是 8 方向节拍模型（SHAKE_DIRS 表）");
+    check(/Math\.min\(viewW, viewH\) \* 0\.01/.test(fnSrc), "幅度必须是 amp·min(viewW,viewH)·0.01（±1% 短边）");
+    check(/Math\.min\(2, numProp2\(general\.camerashakeroughness/.test(fnSrc), "roughness 必须按 [0,2] 夹取（≤1 基准档）");
+    check(!/5\.65|3\.55/.test(fnSrc), "不得残留旧正弦乘积标定（5.65/3.55）");
     const appBlock = src.slice(src.indexOf("camerashake：相机整体抖动"));
-    check(/cam\.viewW \* 0\.005/.test(appBlock), "抖动幅度必须是 ±0.5% 视宽（cam.viewW * 0.005）");
-    check(!/cam\.viewW \* 0\.02/.test(appBlock), "不得退回 ±2% 视宽旧标定（整屏 ±38px@4K = 剧烈晃动）");
-    const fnSrc = src.slice(src.indexOf("function cameraShakeOffset"), src.indexOf("function cameraShakeOffset") + 900);
-    check(/Math\.sin\(t \* 5\.65\)/.test(fnSrc), "高频 x 分量频率应为 5.65（issue#3 减半后）");
+    check(!/cam\.viewW \* 0\.0\d/.test(appBlock), "调用点不得残留按视宽百分比换算（比例已收进函数）");
   }
 }
 
