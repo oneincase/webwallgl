@@ -2320,6 +2320,55 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   }
 }
 
+// ---------- Q. 覆盖写效果 pass 的目标先清透明（3486806915 音频条白楔）----------
+// 效果链 ping-pong FBO 按尺寸缓存、跨层共享。覆盖写 pass（setBlend else 分支 =
+// 关混合，WE 镜像 Normal/Disable → loadOp DONT_CARE）只写自己栅格化到的像素，
+// 目标里的旧内容在**没画到的区域**原样留下：skew Vertex 顶点位移把 quad 挪开后
+// 腾出的空条 = fboA 里 copy 阶段写入的 solid 白底 → 音频条右侧整块白楔
+// （3486806915 #384：三角 = 原 quad − 位移 quad 的集合差，实测 ROI 近白 4479px）。
+// translucent/additive 是 LOAD 语义（保留目标内容），不清。
+{
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const bindI = rsrc.indexOf("gl.bindFramebuffer(gl.FRAMEBUFFER, outFBO.fbo)");
+  check(bindI > 0, "renderer.js 未找到效果 pass 绑定 outFBO 的位置（判据锚点失效）");
+  const drawI = rsrc.indexOf("gl.drawArrays(gl.TRIANGLES, 0, 6)", bindI);
+  const passWindow = bindI > 0 && drawI > 0 ? rsrc.slice(bindI, drawI) : "";
+  check(/gl\.clear\(gl\.COLOR_BUFFER_BIT\)/.test(passWindow),
+    "效果 pass 绑定 outFBO 后、drawArrays 前必须 gl.clear 目标（覆盖写不画的空区会露出 fboA 的 copy 白底 → 3486806915 白楔）");
+  check(/blendMode\s*!==\s*'translucent'/.test(passWindow) && /blendMode\s*!==\s*'additive'/.test(passWindow),
+    "清目标必须按 blend 分流：translucent/additive 是 LOAD 语义，清了会丢叠加目标的既有内容");
+  check(/!mp\.target/.test(passWindow),
+    "清目标只应发生在 ping-pong（!mp.target）路径：命名目标可能被其他 pass 当历史读，不能盲目清");
+
+  // 语料前提：顶点位移的 skew 在全库真实存在，且多数挂在多 pass 链的**非首位**
+  // （位移 pass 不是第一个才有「前序 pass 写的 copy 底」可露；单 pass 位移则露
+  // 跨层共享 FBO 的残留）。
+  const skewHits = [];
+  for (const { id, scene } of wallpapers) {
+    for (const o of scene.objects || []) {
+      const effs = (o.effects || []).filter((e) => e.visible !== false);
+      for (let ei = 0; ei < effs.length; ei++) {
+        if (!/effects\/skew/.test(effs[ei].file || "")) continue;
+        for (const ps of effs[ei].passes || []) {
+          const top = (ps.constantshadervalues || {}).top;
+          if ((ps.combos || {}).MODE === 1 && typeof top === "number" && top !== 0) {
+            skewHits.push({ id, obj: o.id, pos: ei, n: effs.length });
+          }
+        }
+      }
+    }
+  }
+  const skewWalls = new Set(skewHits.map((h) => h.id));
+  const chained = skewHits.filter((h) => h.n >= 2 && h.pos >= 1);
+  check(skewHits.length >= 12 && skewWalls.size >= 4,
+    `语料应含 ≥12 个 skew 顶点位移层 / ≥4 张壁纸，实得 ${skewHits.length} / ${skewWalls.size}`);
+  check(chained.length >= 5,
+    `语料应含 ≥5 个「位移 pass 在非首位」的多 pass 链（白楔结构），实得 ${chained.length}`);
+  check(skewHits.some((h) => h.id === "3486806915"),
+    "3486806915 必须在语料里（本案例壁纸）");
+  console.log(`   Q. skew 顶点位移层 ${skewHits.length} 个 / ${skewWalls.size} 张，其中链中非首位 ${chained.length} 个`);
+}
+
 if (errors.length) {
   console.error(`\n发现 ${errors.length} 个问题：`);
   for (const e of errors) console.error("  ✗ " + e);

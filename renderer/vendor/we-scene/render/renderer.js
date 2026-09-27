@@ -4068,9 +4068,21 @@ export function createRenderer(canvas, opts = {}) {
         passInput = curInput
       }
       gl.useProgram(prog)
-      setBlend(mp.blending || 'normal')
+      const blendMode = mp.blending || 'normal'
+      setBlend(blendMode)
       gl.bindFramebuffer(gl.FRAMEBUFFER, outFBO.fbo)
       gl.viewport(0, 0, outFBO.width, outFBO.height)
+      // [we-scene patch 3486806915] 覆盖写 pass（setBlend else 分支=关混合；WE 镜像
+      // Normal/Disable → loadOp DONT_CARE + 层目标 force_clear）先把 ping-pong 目标
+      // 清透明：栅格化没画到的区域会原样留下目标旧内容 —— fboA 在 copy 阶段写的
+      // solid 白底，被 skew Vertex 顶点位移（top≠0）的 quad 腾出来就是音频条旁的
+      // 白楔（三角 = 原 quad − 位移 quad 的集合差，3486806915 #384）。
+      // translucent/additive 是 LOAD 语义（保留目标），不清；!mp.target 保证
+      // outFBO ≠ passInput 且不会被其他 pass 按名当历史读。
+      if (!mp.target && blendMode !== 'translucent' && blendMode !== 'additive') {
+        gl.clearColor(0, 0, 0, 0)
+        gl.clear(gl.COLOR_BUFFER_BIT)
+      }
       gl.bindVertexArray(vao)
       // [we-scene patch] 效果 pass 顶点空间按 shader 约定二选一（判定见 getEffectProgram）：
       //   mul(MVP) 系 → 像素 quad(0..w) + 转置像素正交 MVP（WE 像素顶点语义，
