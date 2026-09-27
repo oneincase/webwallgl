@@ -2,6 +2,41 @@
 // 覆盖 MDLV0023 顶点/索引、MDLS0004 骨架、MDLA0006 动画轨道、MDLE0002 绑定姿势。
 // 全部 DOM/GPU-free，Node 直载（verify-groups / verify-pointer 在离线侧直接调 parseMDL）。
 import { IDENTITY, mat4Mul, mat4Invert, composeTRS, readCStr, findMdlSections } from './mdl-math.js'
+
+// [we-scene patch] 布局选择的内容自洽检验。
+// 光靠「顶点字节数能被 stride 整除」无法区分两种合法布局：stride 80 的 puppet 顶点数
+// 与 stride 48 的真 3D 网格顶点数之比为 3:5，当真网格的字节数恰好是 240 的倍数时，
+// 80 布局也整除 —— 解析器按顺序优先选 80，顶点数读少（只有真值的 60%），
+// 后 40% 网格的合法索引在 WebGL 的顶点范围校验下全部「越界」，drawElements
+// 报 INVALID_OPERATION、整块模型一个三角都画不出来（3662790108，21 个模型）。
+// 抽查若干顶点的字段内容：puppet 的 4 个蒙皮权重之和恒为 1；真 3D 网格的法线、
+// 切线（xyz 部分）恒为单位向量。读错布局时这些字段落到错位字节，几乎不可能同时成立。
+function layoutFieldsSelfConsistent(dv, vertStart, count, cand) {
+  if (count <= 0) return false
+  const picks = new Set([0, 1, count >> 1, count - 1])
+  for (let i = 0; i < count; i += Math.max(1, count >> 4)) picks.add(i)
+  for (const i of picks) {
+    const b = vertStart + i * cand.stride
+    if (cand.bone < 0) {
+      const nl = Math.hypot(dv.getFloat32(b + 12, true), dv.getFloat32(b + 16, true), dv.getFloat32(b + 20, true))
+      const tl = Math.hypot(dv.getFloat32(b + 24, true), dv.getFloat32(b + 28, true), dv.getFloat32(b + 32, true))
+      const u = dv.getFloat32(b + cand.uv, true)
+      const v = dv.getFloat32(b + cand.uv + 4, true)
+      if (!(nl > 0.95 && nl < 1.05 && tl > 0.95 && tl < 1.05)) return false
+      // UV 不限制范围：环面/卫星类网格用 REPEAT 平铺，UV 可远超 [0,1]（GLONASS、木星环）。
+      if (!(Number.isFinite(u) && Number.isFinite(v))) return false
+    } else {
+      let wsum = 0
+      for (let k = 0; k < 4; k++) wsum += dv.getFloat32(b + cand.weight + k * 4, true)
+      if (Math.abs(wsum - 1) > 0.02) return false
+      const u = dv.getFloat32(b + cand.uv, true)
+      const v = dv.getFloat32(b + cand.uv + 4, true)
+      if (!(Number.isFinite(u) && Number.isFinite(v))) return false
+    }
+  }
+  return true
+}
+
 export function parseMDL(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
   // [we-scene patch 2026-09-25] 四个段签名（MDAT/MDLS/MDLA/MDLE）**一趟扫完**：
@@ -60,7 +95,8 @@ export function parseMDL(buf) {
     if (off + 4 > buf.byteLength) continue
     const n = dv.getUint32(off, true)
     const markerOk = cand.formatMarker === undefined || dv.getUint32(mat.next + 28, true) === cand.formatMarker
-    if (markerOk && n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength) {
+    if (markerOk && n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength
+      && layoutFieldsSelfConsistent(dv, off + 4, n / cand.stride, cand)) {
       L = cand
       vertexBytes = n
       vbOff = off

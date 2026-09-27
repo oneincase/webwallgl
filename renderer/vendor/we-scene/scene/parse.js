@@ -289,6 +289,13 @@ export function parseScene(sceneJson, project) {
       // 全库目前只有 3509243656 的恒星/天空盒/地球。丢掉的话装配循环看不到模型。
       model: typeof o.model === 'string' ? o.model : null,
       isSkybox: typeof o.name === 'string' && o.name.indexOf('天空盒') >= 0,
+      // [we-scene patch] 相机实体（scene.json 里带 "camera":"default" 的对象）：
+      // 引擎在透视场景把运行时相机 attach 到它的世界节点（SceneObjectParsers.cpp
+      // ParseCameraObj），顶层 scene.camera 只是编辑器视口快照、运行时不用。
+      // 此前 buildCamera 只吃 scene.camera：3662790108 的视口位在场景侧下方，
+      // 相机实体 origin（0 0 0.454）才是作者设计位，整屏看向空地 = 黑屏。
+      isCamera: typeof o.camera === 'string' && o.camera !== '',
+      cameraFov: parseNum(o.fov && typeof o.fov === 'object' ? o.fov.value : o.fov, 0),
       particle: typeof o.particle === 'string' ? o.particle : null,
       // [we-scene patch] 粒子参数覆盖 + 声音 + 文字 + 组件
       instanceoverride: o.instanceoverride || null,
@@ -709,8 +716,21 @@ export function parseScene(sceneJson, project) {
     }
   }
 
+  // 运行时相机实体（透视场景用；多个时取第一个）。
+  // 存它的世界位姿与 fov —— buildCamera 据此构视图，而不是顶层编辑器视口快照。
+  const cameraNode = layers.find((l) => l.isCamera)
+  const runtimeCamera = cameraNode
+    ? {
+        eye: cameraNode.origin.slice(),
+        angles: cameraNode.angles.slice(),
+        fov: cameraNode.cameraFov,
+        zoom: parseNum(cameraNode.srcObject && cameraNode.srcObject.zoom, 1),
+      }
+    : null
+
   return {
     camera: sceneJson.camera || null,
+    runtimeCamera,
     general,
     generalScripts,
     generalAnimations,
