@@ -695,6 +695,114 @@ function runShim(extras, opts) {
     check(ticks >= beforePauseTicks + 3, `恢复后主循环应持续自递归，实得 ticks=${ticks}`);
   }
 
+  // ---------- rAF 跳帧节流在「饿死」后的间隔放大（#8）----------
+  //
+  // 交付判据原本数的是**回调次数**（`slot % n`），与经过的时间无关。长任务/系统负载
+  // 期间浏览器只补发**一个** rAF 回调（这段时间里的若干 vsync 被合并），slot 只 +1
+  // 而墙钟过去了上百毫秒 ⇒ 还要再等 (n - slot%n) 帧才交付，间隔被放大成「饿死时长 +
+  // 最多 (n-1)×vsync」，尾部呈目标间隔的整数倍（67/133/199/265…）。下游实测的表征是
+  // **p50 精确（节流本身没错）、尾部只按倍数飘**。
+  //
+  // 判据量**交付时刻**（虚拟时钟 + 真 shim 源码，不看真实 rAF）。虚拟钟同时喂
+  // `performance.now()` 与 rAF 时间戳；两者在真实引擎里**不等价**（回调的 now 是该帧的
+  // vsync 时刻，追赶时同刻连发的两个回调时间戳能差上百毫秒），所以这里也分开建模：
+  //   pumpAt(dt) 推进墙钟 dt 并跑一次回调；pumpAt(0) 就是「同刻的第二次回调」。
+  // 四条：
+  //   1. 稳态：15fps 上限 + 60Hz ⇒ 恒 4 个 vsync 一帧；
+  //   2. 长任务结束后**第一次**回调就该交付，额外等待 ≤1 个 vsync —— 这条就是 #8；
+  //   3. 追赶（同刻连发两个回调）后不得在目标间隔内连交两帧 —— 「到点才交」的下界；
+  //   4. 持续过载（每帧都超 EMA 阈值）时上限仍守得住 —— 「见长 dt 就交付」那种写法会
+  //      在这条上露馅（机器越慢交付越密，等于把 cap 绕过去了）。
+  {
+    const VSYNC = 1000 / 60;
+    const TARGET = 1000 / 15; // 15fps 上限 = 66.7ms
+    /** 虚拟时钟：pumpAt(dt) 推进墙钟 dt 毫秒并跑一次 rAF 回调 */
+    function harness() {
+      const pending = new Map();
+      let seq = 0;
+      let t = 0; // 虚拟墙钟：performance.now() 与 rAF 时间戳都从它取
+      const { win } = runShim({
+        performance: { now: () => t },
+        requestAnimationFrame: (cb) => {
+          pending.set(++seq, cb);
+          return seq;
+        },
+        cancelAnimationFrame: (id) => pending.delete(id),
+      });
+      win.__weSetFps(15);
+      const delivered = [];
+      // 作者侧的自递归主循环：交付回调里立刻登记下一帧（真实页面的普遍形态）
+      const author = (ts) => {
+        delivered.push(t);
+        win.requestAnimationFrame(author);
+        return ts;
+      };
+      win.requestAnimationFrame(author);
+      return {
+        delivered,
+        pumpAt(dt) {
+          t += dt;
+          const list = [...pending.entries()];
+          pending.clear();
+          for (const [, cb] of list) cb(t);
+          return t;
+        },
+      };
+    }
+    const intervals = (d) => d.slice(1).map((v, i) => v - d[i]);
+
+    // 1 + 2：40 拍稳态 → 150ms 长任务 → 8 拍，按相位扫 8 个落点（长任务落在交付节拍的哪一帧）
+    const phases = [];
+    for (let phase = 0; phase < 8; phase++) {
+      const h = harness();
+      for (let i = 0; i < 40; i++) h.pumpAt(VSYNC);
+      for (let i = 0; i < phase; i++) h.pumpAt(VSYNC);
+      const blockEnd = h.pumpAt(150);
+      for (let i = 0; i < 8; i++) h.pumpAt(VSYNC);
+      const iv = intervals(h.delivered);
+      const after = h.delivered.find((v) => v >= blockEnd);
+      phases.push({
+        steady: iv[0],
+        recover: after - blockEnd, // 机器已经恢复，却还在等 modulo 槽位的那一段
+      });
+    }
+    check(
+      phases.every((p) => Math.round(p.steady) === 67),
+      `15fps 上限 + 60Hz 稳态交付应恒为 67ms（4 个 vsync），实得 ${phases.map((p) => Math.round(p.steady)).join(",")}`,
+    );
+    check(
+      Math.max(...phases.map((p) => p.recover)) <= VSYNC + 0.5,
+      `长任务结束后第一次回调就该交付（#8）：额外等待应 ≤1 个 vsync，实得 ${phases.map((p) => Math.round(p.recover)).join(",")}ms`,
+    );
+
+    // 3：追赶 —— 长任务结束后浏览器会把「被推迟的那个」和「当前帧的」回调同刻连发，
+    // 交付间隔不得因此被压到目标以下（真机实测：按回调计数会连交 26~50ms 的两帧）
+    for (let phase = 0; phase < 8; phase++) {
+      const h = harness();
+      for (let i = 0; i < 40; i++) h.pumpAt(VSYNC);
+      for (let i = 0; i < phase; i++) h.pumpAt(VSYNC);
+      h.pumpAt(150);
+      h.pumpAt(0); // 同刻的第二次回调
+      for (let i = 0; i < 8; i++) h.pumpAt(VSYNC);
+      const tail = intervals(h.delivered).slice(-4);
+      check(
+        Math.min(...tail) >= TARGET - 1,
+        `追赶（同刻连发两个回调）不得在目标间隔内连交两帧，相位 ${phase} 实得最小 ${Math.round(Math.min(...tail))}ms / 目标 ${Math.round(TARGET)}ms`,
+      );
+    }
+
+    // 4：持续过载 —— 每拍 45ms（>40ms 的 EMA 阈值），交付间隔不得被压到目标以下
+    const h = harness();
+    for (let i = 0; i < 40; i++) h.pumpAt(VSYNC);
+    for (let i = 0; i < 60; i++) h.pumpAt(45);
+    const tail = intervals(h.delivered).slice(-20);
+    check(tail.length >= 8, `持续过载下节流不得停摆，实得 ${tail.length} 个间隔`);
+    check(
+      Math.min(...tail) >= TARGET - 1,
+      `持续过载时交付间隔不得低于目标（否则 cap 被绕过，机器越慢交付越密），实得最小 ${Math.round(Math.min(...tail))}ms / 目标 ${Math.round(TARGET)}ms`,
+    );
+  }
+
   // ---------- 暂停必须冻结 CSS 动画（1444432396 Glitch Clock 无法暂停）----------
   //
   // CSS `animation` 由浏览器**合成器**驱动，与 JS 主线程无关 —— 冻结 rAF 与定时器
