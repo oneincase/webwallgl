@@ -1049,8 +1049,8 @@ function installWebCtl(rt: Runtime) {
     /**
      * 遮挡暂停（V5）：只发 shim 的 setPaused，**不碰 rt.paused**（用户暂停
      * 意图不被遮挡解除顺带清掉，同 scene 路径语义）。fps 的档位收敛不在这里
-     * 做 —— applyBandTransition 跨界时紧随调 setOcclusionBand(band)，单一
-     * 真源（曾在这里补发 setFps，与 setOcclusionBand 双轨漂移过）。
+     * 做 —— applyOcclusionState（shell.ts）每次推送都紧随调 setOcclusionBand(band)，
+     * 单一真源（曾在这里补发 setFps，与 setOcclusionBand 双轨漂移过）。
      */
     setOccluded(on: boolean) {
       // 解除时不掀用户暂停：rt.paused 立着就不发 setPaused false —— shim 侧

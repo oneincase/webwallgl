@@ -7,6 +7,7 @@ import {
   fitObjectFit,
   frameStats,
   normalizeFit,
+  occlusionCfgOf,
   pushOcclusion,
   reportDiag,
   resetCoverAlign,
@@ -17,9 +18,9 @@ import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
 import type { WallpaperConfig, WallpaperFit } from "../types";
 import { normalizeQuality, normalizeVideoTexScale } from "../quality";
-import { normalizeOcclusionConfig } from "../occlusion";
+import { normalizeOcclusionConfig, occlusionFpsCap } from "../occlusion";
 import type { QualityOptions, ResolvedQuality } from "./types";
-import { weShimCall } from "../web";
+import { weShimCall, weShimSend } from "../web";
 import { sniffMediaType, workshopIdFromSourceKey } from "./source";
 import { mediaColor } from "./media-source";
 import type {
@@ -461,7 +462,16 @@ export function createScene(
     },
     setFps(fps: number) {
       rt.cfg.sceneFps = fps;
-      weShimCall(rt, (w) => w.__weSetFps?.(fps));
+      // [遮挡审计 P2 收敛] 与 main.ts 的 setSceneFps 收敛到同一口径：web shim 是
+      // **推送式**的，档位收敛必须在下发那一刻做（遮挡只往下压、不抬升宿主上限；
+      // pause 档整页已停，直接播宿主值）——原先这里直推裸 fps，处于 light/heavy
+      // 档的网页壁纸会被一行 setFps 顶回满帧，且因同档心跳不复述而不会自愈。
+      // scene / media 有库侧渲染循环逐帧读 rt.cfg.sceneFps 自行收敛，这里不必管。
+      // 通道也从 weShimCall 换成 weShimSend：跨源/严格沙箱网页壁纸下 contentWindow
+      // 不可达，直调会静默丢弃帧率设置（shim 侧 message 通道落到同一批实现上）。
+      const band = rt.occlusion?.band;
+      const n = band && band !== "pause" ? occlusionFpsCap(band, occlusionCfgOf(rt), fps) : fps;
+      weShimSend(rt, "setFps", { n });
     },
     setVolume(volume: number) {
       const v = Math.max(0, Math.min(1, volume));

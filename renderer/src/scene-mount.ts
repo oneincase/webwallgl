@@ -1,6 +1,6 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
 import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
-import { occlusionFpsCap } from "./occlusion";
+import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
@@ -5547,36 +5547,26 @@ cfg, source, pkgAbort.signal);
           const peek = rt.coverAlign;
           // ROI 图层裁剪（V5 方案 E）：遮挡可见矩形 → 世界矩形。映射用 fitWindow
           // 同源数学（含 peek 对齐；backing 与 CSS 等比，窗口结果一致），**相机本身
-          // 不动** —— ROI 只是 isLayerOffscreen 之外的第二个裁剪查询窗口。可见区
-          // 覆盖整画布（单矩形全幅）时传 undefined，渲染器走原路径零行为差。
-          let roiWorld: Array<{ x0: number; y0: number; x1: number; y1: number }> | undefined;
+          // 不动** —— ROI 只是 isLayerOffscreen 之外的第二个裁剪查询窗口。
+          // 逆映射本体在 occlusion.roiWorldRects（纯函数，可离线行为断言）：
+          // 可见区覆盖整画布时它返回 undefined，渲染器据此走原路径零行为差。
+          let roiWorld: WorldRect[] | undefined;
           const occSnap = rt.occlusion;
           if (occSnap && occSnap.rects.length) {
             const cssW = c.clientWidth || 1;
             const cssH = c.clientHeight || 1;
-            const full =
-              occSnap.rects.length === 1 &&
-              occSnap.rects[0].x <= 0 && occSnap.rects[0].y <= 0 &&
-              occSnap.rects[0].w >= cssW && occSnap.rects[0].h >= cssH;
-            if (!full) {
-              const ortho = (scene as any).general?.orthogonalprojection || {};
-              const projW = ortho.width || c.width;
-              const projH = ortho.height || c.height;
-              const roiFit = normalizeFit(rt.cfg.fit);
-              const win = fitWindow(roiFit, projW, projH, cssW, cssH, peek.x, peek.y);
-              // zoom 收缩与 buildCamera 同源（V5 修补）：曾用裸 fitWindow 逆映射，
-              // zoom<1（脚本 zoom-out）时可见窗算小 → 可见区边缘图层被静默误裁
-              //（独立评审实测 0.9 → 每侧 107px，超 64px 裁剪余量）；zoom>1 只是
-              // 保守多画。透视场景 cam.perspective 时 layerCullBounds 返回 null，
-              // ROI 本就不生效。
-              applyCameraZoom(win, cameraZoomOf(scene));
-              roiWorld = occSnap.rects.map((r) => ({
-                x0: win.offX + (r.x / cssW) * win.viewW,
-                x1: win.offX + ((r.x + r.w) / cssW) * win.viewW,
-                y0: win.offY + (r.y / cssH) * win.viewH,
-                y1: win.offY + ((r.y + r.h) / cssH) * win.viewH,
-              }));
-            }
+            const ortho = (scene as any).general?.orthogonalprojection || {};
+            const projW = ortho.width || c.width;
+            const projH = ortho.height || c.height;
+            const roiFit = normalizeFit(rt.cfg.fit);
+            const win = fitWindow(roiFit, projW, projH, cssW, cssH, peek.x, peek.y);
+            // zoom 收缩与 buildCamera 同源（V5 修补）：曾用裸 fitWindow 逆映射，
+            // zoom<1（脚本 zoom-out）时可见窗算小 → 可见区边缘图层被静默误裁
+            //（独立评审实测 0.9 → 每侧 107px，超 64px 裁剪余量）；zoom>1 只是
+            // 保守多画。透视场景 cam.perspective 时 layerCullBoundsOf 返回 null，
+            // ROI 本就不生效。
+            applyCameraZoom(win, cameraZoomOf(scene));
+            roiWorld = roiWorldRects(occSnap.rects, win, cssW, cssH);
           }
           void renderer
             .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y, roiWorld)

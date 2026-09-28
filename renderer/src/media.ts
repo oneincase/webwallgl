@@ -901,6 +901,19 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       player = null;
       reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`);
       mountAbPair();
+      // [遮挡审计 P1 修复] 下面（mountWebCodecsVideo 之后）会把 rt.sceneCtl 换成
+      // 「只认闭包 player」的 WebCodecs 实现；player 已在上面销毁 → 它的
+      // pause/resume/setOccluded 全成 no-op。而宿主的包装器正是靠
+      //「rt.sceneCtl?.setOccluded 是否存在」决定要不要自己接管 A/B 对
+      //（main.ts / api/mount.ts 的 `if (rt.sceneCtl?.setOccluded) return;`），
+      // 于是遮挡暂停与用户 pause() 双双静默失效 —— 现象是窗口被完全遮住后
+      // A/B 对继续解码、**继续出声**。开声音的视频壁纸走的正是这条路：
+      // setVolume(>0) → fallbackToAb。
+      // A/B 路径的不变量是「没有 sceneCtl」：直接走 mountAbPair 的那条分支
+      // （wantLoop && muted && supportsWebCodecsVideo 为假）本来就不设它，
+      // 宿主包装器里那套 rt.videoPairs 停启逻辑正是为这个状态写的。
+      // 这里恢复不变量，而不是再手写一份 ctl（避免第二份实现漂移）。
+      rt.sceneCtl = undefined;
       if (!allowReturn) rt.webcodecsPreferred = false;
     };
     player = mountWebCodecsVideo({

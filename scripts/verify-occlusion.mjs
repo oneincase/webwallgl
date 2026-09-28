@@ -2,13 +2,20 @@
 /**
  * verify-occlusion —— 遮挡感知降载（V5）的离线判据。
  *
- * 三层断言（同 verify-quality 的纪律）：
+ * 四层断言（同 verify-quality 的纪律）：
  *   1. 数值：occlusion.ts 的几何与分档语义（esbuild bundle 后真跑）——
  *      网格覆盖率 vs 精确分解互检、保守扩大红线、滞回/驻留分档、
  *      fail-open 失联判定、fps 收敛（宿主上限优先、20fps 下限）；
  *   2. 接线：shell/scene-mount/renderer/api 各入口真的调了这些函数
- *      （文本断言，防「实现了但没人调」）；
- *   3. 变异红测：把 ROI 裁剪门/守门挂起在内存里改坏，确认断言会变红。
+ *      （**文本断言**，防「实现了但没人调」—— 只证形状存在，不证行为正确）；
+ *   3. 变异红测：把 ROI 裁剪门/守门挂起在内存里改坏，确认断言会变红
+ *      （同为文本层：证明的是接线正则对变异敏感）；
+ *   4. ROI 剔除**真行为**断言（审计后补）：几何本体与逆映射已抽成模块级纯函数
+ *      （renderer 的 layerCullBoundsOf / layerBoundsOutsideRoi、occlusion 的
+ *      roiWorldRects），直接跑真实现断言「哪些层会被裁」——
+ *      余量 64px、多矩形、遮挡洞、跨边界红线、无 ROI 零行为差、视差余量，
+ *      以及与**真实投影矩阵**的逆映射往返（含 zoom<1 回归与负对照）。
+ *      本条覆盖的正是原先只有正则的那块（ROI 是唯一可能「多裁一层」的环节）。
  */
 import { build } from "esbuild";
 import fs from "node:fs";
@@ -523,11 +530,33 @@ function loadShell() {
     advance(500);
     shell.pushOcclusion(rt, { occluders: full, gen: 2 });
     check(rt.occlusion.band === "pause", "持续全遮挡过驻留 → pause");
-    check(calls.length === 1 && calls[0] === true, "跨界到 pause 时调 sceneCtl.setOccluded(true)");
+    check(calls.length === 2 && calls.every((c) => c === true),
+      `每次推送都复述 setOccluded(true)（同档心跳也复述，不只跨界那一次），实得 [${calls.join(",")}]`);
     const st = shell.frameStats(rt);
     check(st.occluded === true && st.running === false, "frameStats 报 occluded=true / running=false");
     // ROI：全屏遮挡下可见矩形为空（图层全裁）
     check(rt.occlusion.rects.length === 0, "全屏遮挡 → 可见矩形为空");
+  }
+
+  // 5a-2) 审计 P2-2 回归：遮挡暂停期间用户 `resume()` 会把媒体/页面掀起来
+  //（web.ts / media.ts 的 resume() 是用户意图通道，直接下发 setPaused(false) /
+  // player.resume()，它们没有 scene 路径那种 occlPaused 闸门）。宿主按契约
+  // ≤2s 心跳**重推同一载荷**时必须把暂停复述回去 —— 旧实现 `prevBand === band`
+  // 早退，会永久停在「以为在暂停、实则在满帧跑」且 frameStats 仍报 occluded。
+  {
+    const { rt, calls } = mkRt();
+    const full = [[0, 0, 1920, 1080]];
+    shell.pushOcclusion(rt, { occluders: full, gen: 1 });
+    check(rt.occlusion.band === "pause" && calls.length === 1 && calls[0] === true,
+      "遮挡进入 pause → setOccluded(true)");
+    // 模拟用户 resume：媒体/页面真的起来了（记一笔 false）
+    calls.push(false);
+    advance(1000);
+    shell.pushOcclusion(rt, { occluders: full, gen: 2 }); // 同档心跳（band 未变）
+    check(rt.occlusion.band === "pause" && calls[calls.length - 1] === true,
+      "同档心跳必须复述 setOccluded(true)（否则用户 resume 后永久满帧跑）");
+    check(calls.join(",") === "true,false,true",
+      `复述序列正确（进入 true → 用户 resume false → 心跳 true），实得 ${calls.join(",")}`);
   }
 
   // 5b) 部分遮挡 → 降帧档（throttled）→ 解除 → run + setOccluded(false)
@@ -596,6 +625,239 @@ function loadShell() {
     check(rt.occlusion !== undefined, "推送后遮挡态存在");
     shell.clear(rt);
     check(rt.occlusion === undefined, "clear() 清掉遮挡态（重挂后宿主重推）");
+  }
+}
+
+// ---------- 6) ROI 图层剔除：真行为断言（几何 + 逆映射往返） ----------
+// 审计后补的一层。原先 §3 对 renderer.js / scene-mount 的 ROI 接线**只有正则文本断言**
+// （本文件头注自己标了「文本断言」），而 ROI 剔除正是本功能唯一可能「多裁一层」的环节
+// —— 漏画在 preserveDrawingBuffer 画布上会留陈旧像素，且 ROI 抖动时肉眼可见。
+// 现在几何本体已提到模块级纯函数（layerCullBoundsOf / layerBoundsOutsideRoi）与
+// occlusion.roiWorldRects，可以直接跑**真实现**并断言行为后果，不再依赖文本形状。
+{
+  const R = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")).href);
+  const M = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/math.js")).href);
+
+  const noPar = { active: false };
+  const cam = { perspective: false, projW: 1920, projH: 1080, offX: 0, offY: 0, viewW: 1920, viewH: 1080 };
+  const L = (o = {}) => ({ size: [100, 100], scale: [1, 1], angles: [0, 0, 0], origin: [960, 540], ...o });
+  const bounds = (layer, cx = cam, par = noPar) => R.layerCullBoundsOf(layer, cx, par);
+  const outside = (layer, rois, par = noPar) => R.layerBoundsOutsideRoi(bounds(layer, cam, par), rois);
+
+  check(typeof R.layerCullBoundsOf === "function" && typeof R.layerBoundsOutsideRoi === "function",
+    "renderer.js 导出 ROI 几何纯函数（可离线行为断言，不再只靠正则）");
+
+  // 6a) 三处「不裁」必须返回 null —— 守的是 forbidden 级红线：多裁一层就是事故
+  check(bounds(L()) !== null, "普通层有裁剪包围盒");
+  check(bounds(L(), { ...cam, perspective: true }) === null,
+    "透视场景不裁（世界单位非像素，2D AABB 判据不成立）");
+  check(bounds(L({ perspective: true })) === null,
+    "perspective 图层不裁（X/Y 旋转可把屏外边缘转进画面）");
+  check(bounds(L({ size: [0, 100] })) === null,
+    "size 为 0 的层不裁（文字/声音/纯效果层的 size 常为 0，但仍可能有内容）");
+
+  // 6b) AABB 几何：中心 / y 翻转 / 镜像取绝对值 / 旋转换轴
+  const b0 = bounds(L());
+  check(b0.cx === 960 && b0.cy === 540 && b0.halfW === 50 && b0.halfH === 50,
+    `AABB 中心与半宽（origin=[960,540] size=100² → 960/540/50/50），实得 ${b0.cx}/${b0.cy}/${b0.halfW}/${b0.halfH}`);
+  check(bounds(L({ origin: [100, 200] })).cy === 880,
+    "世界 y 翻成 cam.projH − origin.y（origin.y=200 → 880）");
+  const bMirror = bounds(L({ scale: [-1, 1] }));
+  check(bMirror.halfW === 50 && bMirror.halfH === 50, "负缩放（镜像）取绝对值当包围盒");
+  const bRot = bounds(L({ size: [100, 20], angles: [0, 0, Math.PI / 2] }));
+  check(near(bRot.halfW, 10, 1e-9) && near(bRot.halfH, 50, 1e-9),
+    `旋转 90° 后 AABB 换轴（100×20 → 半宽 10 / 半高 50），实得 ${bRot.halfW}/${bRot.halfH}`);
+
+  // 6c) 余量 64px 用**行为**锚定（不复算常数）：AABB 右缘离 ROI 外侧 64.5px 剔除、
+  //     63.5px 保留。余量是「边缘层不被误裁」的唯一屏障，写小了就是漏画。
+  const roiMid = [{ x0: 500, y0: 0, x1: 1500, y1: 1080 }];
+  check(outside(L({ origin: [385.5, 540] }), roiMid) === true,
+    "余量 64：AABB 右缘落在 ROI 外 64.5px → 剔除");
+  check(outside(L({ origin: [386.5, 540] }), roiMid) === false,
+    "余量 64：AABB 右缘落在 ROI 外 63.5px → 不裁（余量保住边缘层）");
+
+  // 6d) 多矩形 + 遮挡洞剔除 + 跨边界不裁（红线）
+  const twoRois = [{ x0: 0, y0: 0, x1: 400, y1: 1080 }, { x0: 1400, y0: 0, x1: 1920, y1: 1080 }];
+  check(outside(L({ origin: [900, 540] }), twoRois) === true,
+    "多矩形：落在两个可见区之间的遮挡洞里 → 剔除");
+  check(outside(L({ origin: [1400, 540] }), twoRois) === false,
+    "多矩形：与任一矩形相交即不裁（第二块可见区）");
+  check(outside(L({ origin: [420, 540] }), twoRois) === false,
+    "跨在可见/遮挡边界上的层不裁（红线：绝不能漏画可见部分）");
+
+  // 6e) 严格相交语义：边界恰好接触＝不相交＝可跳过
+  check(outside(L({ origin: [1114, 540] }), [{ x0: 0, y0: 0, x1: 1000, y1: 1080 }]) === true,
+    "边界恰好接触判不相交 → 剔除（严格 >/<；余量已外扩，接触＝本体离可见区 ≥1 个余量）");
+
+  // 6f) 无 ROI = 不裁 —— 宿主没推遮挡时与引入本功能前零行为差
+  check(R.layerBoundsOutsideRoi(bounds(L()), undefined) === false, "无 ROI（undefined）→ 不裁");
+  check(R.layerBoundsOutsideRoi(bounds(L()), []) === false, "空 ROI 表 → 不裁");
+  check(R.layerBoundsOutsideRoi(null, roiMid) === false, "包围盒未知（null）→ 不裁");
+
+  // 6g) 视差余量：把「本来会被裁」的层救回来 —— 断言行为后果，不复算公式。
+  //     legacy 上界 = |d|/2 × |parOff|（parallaxDepthFactor(1)=0.5，parOff 已 60px 封顶）。
+  const farPar = L({ origin: [380, 540], parallaxDepth: [1, 1] });
+  const parActive = { active: true, mode: "legacy", lx: 60, ly: 0, mx: 0, my: 0, cx: 960, cy: 540, amount: 1 };
+  check(outside(farPar, roiMid, noPar) === true,
+    "带视差深度的层在遮挡洞里（无视差余量时）→ 剔除");
+  check(outside(farPar, roiMid, parActive) === false,
+    "视差余量按活动 parallaxCtx 放大后同一层不裁（不裁方向 = 保守多画）");
+  const mira = { active: true, mode: "mirage", lx: 0, ly: 0, mx: 400, my: 0, cx: 960, cy: 540, amount: 1 };
+  const farMira = L({ origin: [380, 540], parallaxDepthProp: [1, 1], parallaxAnchor: [1400, 540] });
+  check(outside(farMira, roiMid, noPar) === true && outside(farMira, roiMid, mira) === false,
+    "mirage 白名单路径的静态项上界同样计入余量（|anchor−center+mouse|×|d|×amount）");
+
+  // 6h) 逆映射往返：把 occlusion.roiWorldRects 的结果与**真实投影矩阵**互检。
+  //     前提：scene-mount 用 CSS 尺寸算 fitWindow、buildCamera 用 backing 尺寸算 —— 等比
+  //     所以窗口必须一致（不一致则整条逆映射从一开始就偏）。
+  const cssW = 1600, cssH = 900;
+  const scene2d = {
+    general: { orthogonalprojection: { width: 1920, height: 1080 } },
+    camera: { eye: "0 0 0", center: "0 0 -1", up: "0 1 0" },
+    layers: [],
+  };
+  const camReal = M.buildCamera(scene2d, cssW * 2, cssH * 2, "cover", 0.5, 0.5);
+  const win = M.fitWindow("cover", 1920, 1080, cssW, cssH, 0.5, 0.5);
+  M.applyCameraZoom(win, M.cameraZoomOf(scene2d));
+  check(near(win.offX, camReal.offX, 1e-9) && near(win.offY, camReal.offY, 1e-9) &&
+    near(win.viewW, camReal.viewW, 1e-9) && near(win.viewH, camReal.viewH, 1e-9),
+    "CSS 与 backing 等比 → 两处 fitWindow 结果一致（逆映射的前提）");
+  // 真实投影：世界点 → NDC → 画布 CSS 像素（与渲染器同一条 mat4Ortho）
+  const project = (wx, wy) => {
+    const ndc = M.mat4TransformPoint(camReal.projection, wx, wy, 0);
+    return { x: ((ndc[0] + 1) / 2) * cssW, y: ((1 - ndc[1]) / 2) * cssH };
+  };
+  const EPS = 1e-6;
+  const N = 20; // 采样栅格密度：矩形越小命中点越少，20 格保证每个测例 ≥20 个采样点
+  // 采样世界窗口内的点；只对「真实投影落在该可见矩形内」的点断言其世界坐标也被 ROI 覆盖
+  const roundTrip = (rect, map) => {
+    const rois = map(rect);
+    let total = 0, hit = 0;
+    for (let i = 0; i <= N; i++) {
+      for (let j = 0; j <= N; j++) {
+        const wx = win.offX + (i / N) * win.viewW;
+        const wy = win.offY + (j / N) * win.viewH;
+        const cp = project(wx, wy);
+        if (cp.x < rect.x - EPS || cp.x > rect.x + rect.w + EPS) continue;
+        if (cp.y < rect.y - EPS || cp.y > rect.y + rect.h + EPS) continue;
+        total++;
+        for (const r of rois) {
+          if (wx >= r.x0 - EPS && wx <= r.x1 + EPS && wy >= r.y0 - EPS && wy <= r.y1 + EPS) { hit++; break; }
+        }
+      }
+    }
+    return { total, hit, rois };
+  };
+  const correct = (r) => oc.roiWorldRects([r], win, cssW, cssH);
+  for (const [name, rect] of [
+    ["上半屏", { x: 0, y: 0, w: cssW, h: cssH / 2 }],
+    ["左上四分之一", { x: 0, y: 0, w: cssW / 2, h: cssH / 2 }],
+    ["右半屏", { x: cssW / 2, y: 0, w: cssW / 2, h: cssH }],
+    // 非零 x/y 偏移的块：把 x0/y0 的映射也钉住（全 0 起点的矩形测不出「用错边」的笔误）
+    ["右下偏移块", { x: cssW * 0.35, y: cssH * 0.4, w: cssW * 0.4, h: cssH * 0.35 }],
+    ["左下偏移块", { x: cssW * 0.05, y: cssH * 0.55, w: cssW * 0.3, h: cssH * 0.4 }],
+  ]) {
+    const res = roundTrip(rect, correct);
+    check(res.total > 20 && res.hit === res.total,
+      `逆映射往返（${name}）：真实投影落进该可见区的 ${res.hit}/${res.total} 个点全部回落到 ROI 世界矩形内（漏 1 个 = 可见层会被误裁）`);
+  }
+  // 负对照：证明上面的判据能分辨「写对」与「写了但写错」。
+  const rect45 = { x: 0, y: 0, w: cssW, h: cssH * 0.45 };
+  const mirrored = roundTrip(rect45, (r) => [{
+    x0: win.offX + (r.x / cssW) * win.viewW,
+    x1: win.offX + ((r.x + r.w) / cssW) * win.viewW,
+    y0: 1080 - (win.offY + ((r.y + r.h) / cssH) * win.viewH),
+    y1: 1080 - (win.offY + (r.y / cssH) * win.viewH),
+  }]);
+  check(mirrored.total > 20 && mirrored.hit === 0,
+    `负对照：世界 y 少翻一次（按 projH 镜像）应全部落空，实得 ${mirrored.hit}/${mirrored.total}`);
+  const swapped = roundTrip(rect45, (r) => [{
+    x0: win.offY + (r.y / cssH) * win.viewH,
+    x1: win.offY + ((r.y + r.h) / cssH) * win.viewH,
+    y0: win.offX + (r.x / cssW) * win.viewW,
+    y1: win.offX + ((r.x + r.w) / cssW) * win.viewW,
+  }]);
+  check(swapped.hit < swapped.total,
+    `负对照：x/y 轴对调应出现落空，实得 ${swapped.hit}/${swapped.total}`);
+
+  // 6i) 整画布可见 → undefined（渲染器走原路径零行为差）
+  check(oc.roiWorldRects([{ x: 0, y: 0, w: cssW, h: cssH }], win, cssW, cssH) === undefined,
+    "可见区覆盖整画布 → 返回 undefined（渲染器不做 ROI，零行为差）");
+  check(oc.roiWorldRects([], win, cssW, cssH) === undefined, "无可见矩形 → undefined");
+
+  // 6j) zoom≠1 回归（本 PR 的修补点）：正确窗口往返通过，而**裸 fitWindow** 必须出现落空
+  //     —— 后者正是「zoom<1 时可见区边缘层被静默误裁」的成因，用真投影把它变成断言。
+  const zoomScene = { ...scene2d, cameraTransforms: { zoom: 0.9 } };
+  const camZoom = M.buildCamera(zoomScene, cssW * 2, cssH * 2, "cover", 0.5, 0.5);
+  const winZoom = M.fitWindow("cover", 1920, 1080, cssW, cssH, 0.5, 0.5);
+  M.applyCameraZoom(winZoom, M.cameraZoomOf(zoomScene));
+  const projectZoom = (wx, wy) => {
+    const ndc = M.mat4TransformPoint(camZoom.projection, wx, wy, 0);
+    return { x: ((ndc[0] + 1) / 2) * cssW, y: ((1 - ndc[1]) / 2) * cssH };
+  };
+  const rtZoom = (winUse, rect) => {
+    const rois = oc.roiWorldRects([rect], winUse, cssW, cssH);
+    let total = 0, hit = 0;
+    for (let i = 0; i <= N; i++) {
+      for (let j = 0; j <= N; j++) {
+        const wx = winZoom.offX + (i / N) * winZoom.viewW;
+        const wy = winZoom.offY + (j / N) * winZoom.viewH;
+        const cp = projectZoom(wx, wy);
+        if (cp.x < rect.x - EPS || cp.x > rect.x + rect.w + EPS) continue;
+        if (cp.y < rect.y - EPS || cp.y > rect.y + rect.h + EPS) continue;
+        total++;
+        for (const r of rois) {
+          if (wx >= r.x0 - EPS && wx <= r.x1 + EPS && wy >= r.y0 - EPS && wy <= r.y1 + EPS) { hit++; break; }
+        }
+      }
+    }
+    return { total, hit };
+  };
+  const halfRect = { x: cssW / 2, y: 0, w: cssW / 2, h: cssH };
+  const okZoom = rtZoom(winZoom, halfRect);
+  check(okZoom.total > 20 && okZoom.hit === okZoom.total,
+    `zoom=0.9 逆映射（过 applyCameraZoom 的窗口）：${okZoom.hit}/${okZoom.total} 全部命中`);
+  const bareWin = M.fitWindow("cover", 1920, 1080, cssW, cssH, 0.5, 0.5);
+  const badZoom = rtZoom(bareWin, halfRect);
+  check(badZoom.hit < badZoom.total,
+    `负对照：zoom=0.9 却用裸 fitWindow 逆映射 → 出现落空 ${badZoom.hit - badZoom.total} 个点（= 可见区边缘层被误裁，本 PR 修的正是这条）`);
+
+  // 6k) 单一真源接线：几何/逆映射都被抽成导出函数，且调用点确实走它们
+  check(typeof oc.roiWorldRects === "function", "occlusion.ts 导出 roiWorldRects（逆映射单一真源）");
+  check(/roiWorldRects\(occSnap\.rects, win, cssW, cssH\)/.test(mountSrc),
+    "scene-mount 的 ROI 逆映射调该真源（不再内联一份数学）");
+  check(/layerCullBoundsOf\(layer, cam, parallaxCtx\)/.test(rendererSrc),
+    "renderer 闭包把 parallaxCtx 传进 layerCullBoundsOf（几何本体单源）");
+  check(/layerBoundsOutsideRoi\(layerCullBounds\(layer, cam\), roiRects\)/.test(rendererSrc),
+    "isLayerOutsideRoi 只做转发（判定语义单源，可离线断言）");
+  check(/layerCullBoundsOf\(layer, cam, parallaxCtx\)/.test(rendererSrc) &&
+    !/let margin = 64[\s\S]{0,400}?function isLayerOutsideRoi/.test(rendererSrc),
+    "余量/旋转数学不再在闭包里复制第二份");
+
+  // 6l) zoom 必须在逆映射**之前**叠上窗口（顺序反了 = zoom 白修）
+  {
+    const iZoom = mountSrc.indexOf("applyCameraZoom(win, cameraZoomOf(scene))");
+    const iRoi = mountSrc.indexOf("roiWorldRects(occSnap.rects, win, cssW, cssH)");
+    check(iZoom > 0 && iRoi > iZoom, "scene-mount 先 applyCameraZoom 再 roiWorldRects（zoom 真的进了逆映射）");
+  }
+
+  // 6m) 审计 P1 修复：WebCodecs → A/B 回退必须把 rt.sceneCtl 清掉。
+  // 这一条是**形状断言**而非行为断言 —— 该缺陷在 mountVideoDom 的 DOM/媒体生命周期里，
+  // 离线（无 <video>/WebCodecs/DOM）跑不起来。缺陷机理：回退后 rt.sceneCtl 仍指向
+  // 已销毁的 player，其 pause/resume/setOccluded 全是 no-op，而宿主包装器以
+  // 「rt.sceneCtl?.setOccluded 是否存在」为路由闸门（§3 已断言两处都在）→ 遮挡暂停
+  // 与用户 pause 双双失效（现象：窗口全遮后 A/B 对继续解码、继续出声）。
+  {
+    const i = mediaSrc.indexOf("const fallbackToAb = (");
+    const body = i >= 0 ? mediaSrc.slice(i, i + 1600) : "";
+    check(i >= 0 && /mountAbPair\(\);[\s\S]*?rt\.sceneCtl = undefined;/.test(body),
+      "fallbackToAb 在挂起 A/B 对后清掉 sceneCtl（悬垂钩子不再挡住宿主的 A/B 兜底）");
+    check(!/rt\.sceneCtl = \{/.test(body),
+      "fallbackToAb 不另写第二份 sceneCtl（A/B 路径的不变量是「没有 sceneCtl」）");
+    // 路由闸门必须在场（否则清了 sceneCtl 也没人接管）
+    check(/if \(rt\.sceneCtl\?\.setOccluded\) return;/.test(apiMountSrc) &&
+      /if \(rt\.sceneCtl\?\.setOccluded\) return;/.test(mainSrc),
+      "宿主两处包装器都有 A/B 兜底分支（清了 sceneCtl 后由它们接管 media 停启）");
   }
 }
 

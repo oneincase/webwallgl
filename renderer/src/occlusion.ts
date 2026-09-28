@@ -236,6 +236,49 @@ export function expandQuantize(rects: Rect[], screen: Screen, gridPx = 8): Rect[
   });
 }
 
+// ---- 消费层 → 渲染器：可见矩形逆映射成相机世界矩形 ----
+
+/** 相机窗口（fitWindow + applyCameraZoom 之后的**最终**可见世界矩形） */
+export type CameraWindow = { offX: number; offY: number; viewW: number; viewH: number };
+
+/** 渲染器 ROI 查询窗口（世界坐标，y 与 cam.projH 同向） */
+export type WorldRect = { x0: number; y0: number; x1: number; y1: number };
+
+/**
+ * 遮挡可见矩形（画布 CSS 像素）→ 渲染器 ROI 世界矩形（相机窗口坐标）。
+ *
+ * 映射是渲染器正交投影的**精确逆**：相机把 [offX, offX+viewW]×[offY, offY+viewH]
+ * 整块映到画布（buildCamera 的 mat4Ortho），所以画布比例 → 线性内插即可。
+ * 传入的 win 必须是**最终**窗口（已过 applyCameraZoom）—— 曾用裸 fitWindow 逆映射，
+ * zoom<1 时窗口算小、可见区边缘图层被静默误裁（超 64px 裁剪余量）。
+ *
+ * 可见区已覆盖整张画布时返回 undefined：调用方据此把 undefined 交给渲染器，
+ * 走「无 ROI」原路径（零行为差，也避免整屏 ROI 矩形把剔除统计口径搅乱）。
+ *
+ * 搬进本模块（而非留在 scene-mount 内联）是为了可离线做**行为断言** ——
+ * 这是 ROI 剔除唯一可能「多裁一层」的数学环节，靠正则检查接线抓不到错。
+ */
+export function roiWorldRects(
+  rects: Rect[],
+  win: CameraWindow,
+  canvasW: number,
+  canvasH: number,
+): WorldRect[] | undefined {
+  if (!rects.length) return undefined;
+  if (!(canvasW > 0) || !(canvasH > 0)) return undefined;
+  const full =
+    rects.length === 1 &&
+    rects[0].x <= 0 && rects[0].y <= 0 &&
+    rects[0].w >= canvasW && rects[0].h >= canvasH;
+  if (full) return undefined;
+  return rects.map((r) => ({
+    x0: win.offX + (r.x / canvasW) * win.viewW,
+    x1: win.offX + ((r.x + r.w) / canvasW) * win.viewW,
+    y0: win.offY + (r.y / canvasH) * win.viewH,
+    y1: win.offY + ((r.y + r.h) / canvasH) * win.viewH,
+  }));
+}
+
 // ---- 分档状态机（滞回 + 最小驻留）----
 
 export type OcclusionBand = "run" | "light" | "heavy" | "pause";

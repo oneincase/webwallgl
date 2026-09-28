@@ -669,9 +669,23 @@ function stopOcclusionTimer(rt: Runtime): void {
   rt.occlusionTick = undefined;
 }
 
-/** 档位跨界时做媒体停启 + 降帧推送（有渲染循环的路径逐帧读档位；推送服务 web shim） */
-function applyBandTransition(rt: Runtime, prevBand: OcclusionBand, band: OcclusionBand): void {
-  if (prevBand === band) return;
+/**
+ * 把当前遮挡档位施加到媒体（有库侧渲染循环的路径逐帧读档位；推送服务 web shim）。
+ *
+ * **幂等，且每次推送都复述一遍** —— 不只是跨界那一刻。原先这里有
+ * `if (prevBand === band) return;`：宿主按契约 ≤2s 心跳重推同一档时直接早退，
+ * 于是「用户 `resume()` 在遮挡期间把暂停掀了」这件事永远没人纠正 ——
+ * scene 路径有 kickLoop / renderLoop 的 `occlPaused` 闸门兜着，web 与 media
+ * 没有（`web.ts` 的 `resume()` 会直接下发 setPaused(false)、`media.ts` 的
+ * `resume()` 会 player.resume()），错过那一刻就**永久**停在「以为在暂停、
+ * 实则在满帧跑」，而 frameStats 仍报 occluded:true，宿主看门狗看不出异常。
+ * 复述把三条路径收敛成同一语义。
+ *
+ * 幂等性由各实现保证，重复调用无副作用：scene / media 的 `setOccluded(true)`
+ * 在 `pauseStarted ≠ 0` 时只记账、不重复捕获媒体；web 的 setPaused 重复下发无害；
+ * `setOcclusionBand` 只是重算一次 fps 再下发。
+ */
+function applyOcclusionState(rt: Runtime, prevBand: OcclusionBand, band: OcclusionBand): void {
   if (band === "pause") rt.sceneCtl?.setOccluded?.(true);
   else if (prevBand === "pause") rt.sceneCtl?.setOccluded?.(false);
   // web 无库侧渲染循环，shim 侧 fps 全靠推送（scene/media 循环自己逐帧收敛，
@@ -720,7 +734,7 @@ export function pushOcclusion(rt: Runtime, payload: OcclusionPayload | null): vo
     gen: Number.isFinite(gen) ? gen : prev?.gen ?? 0,
   };
   ensureOcclusionTimer(rt);
-  applyBandTransition(rt, prev?.band ?? "run", band);
+  applyOcclusionState(rt, prev?.band ?? "run", band);
 }
 
 /**
@@ -750,7 +764,7 @@ export function tickOcclusion(rt: Runtime, now: number): void {
     canvasW: canvas.w,
     canvasH: canvas.h,
   };
-  applyBandTransition(rt, occ.band, band);
+  applyOcclusionState(rt, occ.band, band);
 }
 
 /**
