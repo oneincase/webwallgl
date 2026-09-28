@@ -2815,7 +2815,9 @@ cfg, source, pkgAbort.signal);
           // 现读，所以属性热更自动生效，不需要「记原值再重折」那套簿记（见 renderer 的 color4）。
           attachBuiltinMatTint(layer, material);
           for (const e of layer.effects || []) {
-            eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc);
+            eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
+                reportDiag(rt, cfg, m),
+              );
           }
           for (const e of layer.effects || []) {
             for (const p of e.passes || []) {
@@ -2874,7 +2876,9 @@ cfg, source, pkgAbort.signal);
           if (!layer.isText || !(layer.effects || []).length) continue;
           try {
             for (const e of layer.effects || []) {
-              eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc);
+              eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
+                reportDiag(rt, cfg, m),
+              );
             }
             for (const e of layer.effects || []) {
               for (const p of e.passes || []) {
@@ -4959,7 +4963,9 @@ cfg, source, pkgAbort.signal);
       // 作者的 `mix(cur, target, speed * frametime)` 在 dt 过大时会越过目标来回荡。
       // 0.05 = 20fps，与粒子时钟的 50ms 封顶同口径。
       const MAX_SCRIPT_FRAME_DT = 0.05;
-      const renderLoop = (now: number) => {
+      // 循环体。**不要直接把它交给 requestAnimationFrame** —— 外面必须套
+      // renderLoop 守卫壳（见其定义处注释：回调里抛错会让 rAF 链断死）。
+      const renderLoopImpl = (now: number) => {
         if (disposed || rt.paused) return;
         // 帧率上限：相位累加调度，比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
         // 热改 fps（工具条滑条）只改 rt.cfg.sceneFps，这里同步进调度器、保留节拍相位。
@@ -5202,8 +5208,8 @@ cfg, source, pkgAbort.signal);
             const slot = run.slot || field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (Array.isArray(out)) {
-              const cur = run.layer[slot];
-              if (Array.isArray(cur)) for (let i = 0; i < out.length && i < cur.length; i++) cur[i] = out[i];
+              // 逐分量写回，形状契约见 anim.writeAnimSlot（判据跑真实现）
+              anim.writeAnimSlot(run.layer, slot, out);
             } else if (Number.isFinite(out)) {
               // [we-scene patch] visible 动画必须写 visibleSelf 并重算子孙——
               // 直接写 layer.visible（有效可见性）会被任何一次 recomputeVisibility
@@ -5229,7 +5235,15 @@ cfg, source, pkgAbort.signal);
                 // 消费方是 cameraTransforms.zoom（math.js 每帧读；3521337568
                 // 相机路径对象的开场 zoom 3→1）。与 general zoom 同一消费通道。
                 if (out > 0) (scene as any).cameraTransforms.zoom = out;
-              } else run.layer[slot] = out;
+              } else {
+                // [we-scene patch issue #9] 通用槽写回必须**保住槽的形状**：
+                // 标量写进向量槽要广播（WE 的标量→向量约定），绝不能把
+                // origin/scale/angles 的 local 数组槽换成 number —— 那会让下一帧
+                // recomposeWorld 的 `.slice()` 抛 TypeError，异常逃出 rAF 回调、
+                // 渲染循环无声死亡，首帧永不完成且 mount() 无成功也无失败。
+                // 规则实现与判据都在 anim.writeAnimSlot（verify-transform 跑真实现）。
+                anim.writeAnimSlot(run.layer, slot, out);
+              }
             }
           }
           // [we-scene patch] 粒子 override 动画与对象字段动画同一时钟推进，
@@ -5557,6 +5571,34 @@ cfg, source, pkgAbort.signal);
             });
         } else {
           if (!rt.paused) rt.raf = requestAnimationFrame(renderLoop);
+        }
+      };
+      /**
+       * [we-scene patch issue #9] rAF 自递归的守卫壳。
+       *
+       * 渲染循环的唯一续帧动作是函数体末尾的 `requestAnimationFrame(renderLoop)`。
+       * 循环体里任一同步异常都会让那行永远执行不到 —— 循环**无声死亡**：既没有
+       * 下一帧，也没有任何诊断，调用方只看到 mount() 的 Promise 再也不落地
+       * （宿主无法区分「还在加载」和「已经死了」，只能自己加看门狗猜）。
+       *
+       * 实测触发形态：畸形关键帧动画把 `localAngles` 写成标量，recomposeWorld
+       * 的 `l.localAngles.slice()` 抛 TypeError（见 animRuns 写回处的注释）。
+       *
+       * 这里把它兜成「一条诊断 + onError」：宿主立刻拿到失败原因，不再是黑洞。
+       */
+      const renderLoop = (now: number) => {
+        try {
+          renderLoopImpl(now);
+        } catch (e) {
+          const err = e instanceof Error ? e : new Error(String(e));
+          if (disposed) return;
+          reportDiag(rt, cfg, `failed: renderLoop 异常，渲染循环终止 — ${String(err.message || err).slice(0, 200)}`);
+          disposed = true;
+          rt.raf = undefined;
+          // 与装配期失败同一条出口：公共 API 设了 onError 就交回调用方
+          // （mount() 的 Promise 立刻 reject），旧壁纸页维持降级页行为。
+          if (rt.onError) rt.onError(err);
+          else rt.fallbackPage?.();
         }
       };
       const kickLoop = () => {

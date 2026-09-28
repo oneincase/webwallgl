@@ -25,6 +25,10 @@ const STABLE = [
   "verify-props",
   "verify-text",
   "verify-shaders",
+  // 效果链解析的**诊断契约**：该报的必须报（效果文件/材质缺失、pass 直写 shader、
+  // 材质缺 shader、坏 JSON、同一处只报一次），不该报的一个都不许报（官方两段式、
+  // copy/swap 命令 pass、全库 10420 个效果零误报）—— issue #11
+  "verify-effects",
   "verify-animation",
   "verify-attachments",
   "verify-transform",

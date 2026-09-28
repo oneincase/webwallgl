@@ -468,6 +468,53 @@ export function createAnimation(def) {
   return anim
 }
 
+/**
+ * [we-scene patch issue #9] 把动画求值结果写回图层字段，并**保住槽的形状**。
+ *
+ * 通道数决定求值结果的形状（见文件头：1/2/3 通道 = 标量 / vec2 / vec3），而
+ * 变换三件套（origin/scale/angles）的 local 槽是 `recomposeWorld` 每帧
+ * `.slice()` 的**数组**。两者一旦错配，槽就被写坏，而且后果是灾难性的：
+ *
+ *   畸形数据（单条通道却装 vec3 字符串值）→ sampleChannel 返回标量 0 →
+ *   旧代码 `layer[slot] = 0` 把 localAngles 整个换成 number →
+ *   下一帧 `recomposeWorld` 的 `l.localAngles.slice()` 抛 TypeError →
+ *   异常逃出 rAF 回调 ⇒ 下一帧永不排 ⇒ 渲染循环**无声死亡**，
+ *   首帧永不完成、`mount()` 既不 resolve 也不 reject（issue #9）。
+ *
+ * 之所以「只有 angles 挂、origin 不挂」：recomposeWorld 的 `!l.localOrigin`
+ * 守卫恰好把 `localOrigin = 0` 的层整个跳过（动画静默失效而已），
+ * 而 `localAngles = 0` 时 localOrigin 仍是数组、守卫放行，随后就在 `.slice()`
+ * 上炸。
+ *
+ * 规则（与 parse.js 的「标量→向量广播」同一条 WE 约定）：
+ *   - 槽是数组 + 结果是数组   → 逐分量写回（长度取两者较短的，沿用原行为）
+ *   - 槽是数组 + 结果是有限标量 → **广播到全分量**（WE 语义；这就是本修复）
+ *   - 槽不是数组 + 结果是有限标量 → 直接赋值（alpha/brightness 等标量字段）
+ *   - 其余（形状推不出的错配）→ 丢弃，保持原值，绝不把槽写成另一个形状
+ *
+ * @returns {boolean} 是否写入了
+ */
+export function writeAnimSlot(layer, slot, out) {
+  if (!layer || typeof slot !== 'string' || !slot) return false
+  const cur = layer[slot]
+  if (Array.isArray(cur)) {
+    if (Array.isArray(out)) {
+      for (let i = 0; i < out.length && i < cur.length; i++) cur[i] = out[i]
+      return true
+    }
+    if (Number.isFinite(out)) {
+      for (let i = 0; i < cur.length; i++) cur[i] = out
+      return true
+    }
+    return false
+  }
+  if (Number.isFinite(out)) {
+    layer[slot] = out
+    return true
+  }
+  return false
+}
+
 /** 中性控制器：字段上没有 animation 时给脚本用，保证 `.play()` 不炸 */
 export function createNeutralAnimation() {
   const a = {

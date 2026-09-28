@@ -18,22 +18,81 @@ function parseEffectJson(text) {
   }
 }
 
+/**
+ * [we-scene patch issue #11] 效果链解析的诊断闸门。
+ *
+ * 本文件此前**每一处失败都是静默 return / 空 pass**：效果文件不在包内、JSON 解析
+ * 失败、`passes[]` 直写 `shader`（漏了 material 那一层）、material 指向的文件不在
+ * 包内 —— 四种写法都表现为「图层退回内置材质的纯色块」，作者看不出是字段层数写错
+ * 还是 shader/贴图名写错，只能逐项试。
+ *
+ * 闸门语义：
+ *   - 同一个 (effect 文件, pass 序号, 类别) 只报一次 —— 本函数在装配期与热更期各跑
+ *     一遍，同一张壁纸也会挂在多个图层上，不去重就是同一条刷屏；
+ *   - 诊断文案必须**指到具体文件与字段层数**，而不是「效果没生效」。
+ */
+const _reportedEffectDiag = new Set()
+const REPORT_CAP = 400
+function diagOnce(onDiag, key, msg) {
+  if (typeof onDiag !== 'function') return
+  if (_reportedEffectDiag.has(key)) return
+  if (_reportedEffectDiag.size < REPORT_CAP) _reportedEffectDiag.add(key)
+  onDiag(msg)
+}
+
+/**
+ * [we-scene patch issue #11] `materials/util/*` 是 WE **引擎内置**材质的命名空间
+ * （与 `models/util/*` 同一约定，见本文件 BUILTIN_MATERIALS）：它们随引擎发行、
+ * 不随壁纸 pkg 走，本仓也刻意不把官方材质 JSON 喂进运行时（见 renderer/src/local-assets.ts
+ * 的「消费面」说明）。所以「不在包内」在这一族里是**预期状态**，不是作者写错了 ——
+ * 报出来只会在用到它们的真壁纸上刷无关噪声（实测 3281559867 / 3505674701 各一处，
+ * 都被 verify-effects 的「全库零误报」判据逮到）。
+ * 其它路径缺失才是真的写错（或 pkg 不完整），照报。
+ */
+function isBuiltinAssetPath(p) {
+  return typeof p === 'string' && (p.startsWith('materials/util/') || p.startsWith('models/util/'))
+}
+
 // pkg: parsePkg 结果；effect: scene.json 的效果条目（file/passes/visible）
 // onMaterialDoc: 可选回调。效果链里的材质是**独立文档**（materials/*.json），其中的
 //   `{"user":"名"}` 绑定不在 layer.srcObject 树里，resolveUserProps 够不到；宿主用它
 //   把文档登记下来，装配期与热更期各解析一次（见 scene-mount 的 materialDocs）。
-export function resolveEffectChain(pkg, effect, readText, onMaterialDoc) {
+// onDiag: 可选回调（issue #11）。解析失败/字段不认识时上报一条可执行的诊断。
+export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag) {
+  const file = (effect && effect.file) || '(未命名)'
   const entry = getEntry(pkg, effect.file)
-  if (entry === null) return
+  if (entry === null) {
+    diagOnce(onDiag, `${file}|missing-effect`, `effect ${file}: 效果文件不在包内，整条效果链已跳过（检查 scene.json 里 effects[].file 与 pkg 内的实际路径大小写）`)
+    return
+  }
   let ej
   try {
     ej = parseEffectJson(readText(entry))
   } catch (e) {
+    diagOnce(onDiag, `${file}|bad-json`, `effect ${file}: JSON 解析失败（${(e && e.message) || e}），整条效果链已跳过`)
     return
   }
   effect.fbos = ej.fbos || []
-  effect.materialPasses = (ej.passes || []).map((p) => {
+  effect.materialPasses = (ej.passes || []).map((p, pi) => {
     if (!p.material) {
+      // [we-scene patch issue #11] 既没有 `material` 也没有 `command` —— 最典型的
+      // 是把材质里的写法（`passes[].shader`）直接搬到了效果文件里。WE 的效果文件是
+      // **两段式**：效果文件写 `material`，真正的 `shader` 写在 material 指向的材质
+      // JSON 里（官方形态见 local-assets/effects/cursorripple/effect.json）。
+      // 旧代码把这一支一律当命令 pass（copy），于是 `{shader:...}` 变成 target=null
+      // 的 copy → 整条链什么都不画，且无任何输出。
+      if (p.command !== 'copy' && p.command !== 'swap') {
+        const hint = p.shader
+          ? `检测到直写 shader="${p.shader}" —— 效果文件不支持直接写 shader，` +
+            `要写在 material 指向的材质里（形如 {"passes":[{"material":"materials/effects/x.json"}]}，` +
+            `材质文件内才是 {"passes":[{"shader":"effects/x"}]}）`
+          : '该 pass 既没有 material 也不是 copy/swap 命令 pass'
+        diagOnce(
+          onDiag,
+          `${file}|pass${pi}|unrecognized`,
+          `effect ${file}: pass ${pi} 未识别（${hint}），已按空 pass 处理`,
+        )
+      }
       // 无 material 的命令 pass：copy（source→target 整块拷）或 swap（交换两个 FBO）。
       // [we-scene patch] copy 命令 pass：`{"command":"copy","target":X,"source":Y}`。
       // [we-scene patch] 必须带上 source —— 此前只存 target，渲染器又完全没实现 copy，
@@ -73,12 +132,38 @@ export function resolveEffectChain(pkg, effect, readText, onMaterialDoc) {
     }
     const me = getEntry(pkg, p.material)
     if (me === null) {
+      // [we-scene patch issue #11] material 指向的文件不在包内 → 旧代码返回一个
+      // `shader: null` 的空 pass（什么都不画），且一声不吭。内置命名空间除外
+      // （见 isBuiltinAssetPath：那是预期状态，报出来是噪声）。
+      if (!isBuiltinAssetPath(p.material)) {
+        diagOnce(
+          onDiag,
+          `${file}|pass${pi}|missing-material`,
+          `effect ${file}: pass ${pi} 的材质 ${p.material} 不在包内，该 pass 已跳过（整条链可能因此什么都不画）`,
+        )
+      }
       return { shader: null, copyCommand: false, target: p.target || null, binds: p.bind || [], blending: 'normal', textures: [], combos: {}, constants: {} }
     }
-    const mj = parseEffectJson(readText(me))
+    let mj
+    try {
+      mj = parseEffectJson(readText(me))
+    } catch (e) {
+      // 材质 JSON 坏掉此前同样静默。
+      diagOnce(onDiag, `${file}|pass${pi}|bad-material-json`, `effect ${file}: pass ${pi} 的材质 ${p.material} JSON 解析失败（${(e && e.message) || e}），该 pass 已跳过`)
+      return { shader: null, copyCommand: false, target: p.target || null, binds: p.bind || [], blending: 'normal', textures: [], combos: {}, constants: {} }
+    }
     // 材质文档交给宿主登记 + 解析其 {user} 绑定（见函数头注释）
     if (typeof onMaterialDoc === 'function') onMaterialDoc(mj)
     const mp = (mj.passes && mj.passes[0]) || {}
+    if (!mp.shader) {
+      // 材质存在但里面没有 shader：旧代码给出 `shader: null` 的空 pass，
+      // 图层退回内置材质 —— 作者只会看到「效果没生效」。
+      diagOnce(
+        onDiag,
+        `${file}|pass${pi}|material-no-shader`,
+        `effect ${file}: pass ${pi} 的材质 ${p.material} 里没有 passes[0].shader，该 pass 已跳过`,
+      )
+    }
     return {
       shader: mp.shader || null,
       copyCommand: false,

@@ -1131,6 +1131,21 @@ export function createRenderer(canvas, opts = {}) {
     if (src === undefined) {
       const fragSrc = (await shaderResolver('shaders/' + shaderName + '.frag')) || ''
       const vertSrc = (await shaderResolver('shaders/' + shaderName + '.vert')) || ''
+      // [we-scene patch issue #10] **缺 stage 必须出声**。效果 shader 一律 .frag + .vert
+      // 成对提供（官方效果、全库语料都是），这里少一半时旧代码把源当空串继续走：
+      // 链接必然失败 → 上层 catch 只 console.warn → 图层退回内置材质画出纯色块。
+      // 作者看到的只是「效果没生效」，会先去怀疑 effects/*.json、材质字段、贴图名，
+      // 其实只差一个 .vert。这条诊断指名到具体缺哪个文件，且天然一次性
+      // （shaderSrcCache 已缓存该名字，不会每帧重报）。
+      if (!fragSrc.length || !vertSrc.length) {
+        const missing = []
+        if (!fragSrc.length) missing.push('shaders/' + shaderName + '.frag')
+        if (!vertSrc.length) missing.push('shaders/' + shaderName + '.vert')
+        diag(
+          'effect shader ' + shaderName + ': 缺少 ' + missing.join(' + ') +
+            '（效果 shader 必须 .frag/.vert 成对），该 pass 无法编译、已跳过 —— 图层会退回内置材质',
+        )
+      }
       src = {
         frag: fragSrc,
         vert: vertSrc,
@@ -3648,7 +3663,16 @@ export function createRenderer(canvas, opts = {}) {
                   vctx2.clearRect(0, 0, uw, uh)
                   vctx2.drawImage(v, 0, 0, uw, uh)
                   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoCanvas)
-                  while (gl.getError() !== gl.NO_ERROR) {}
+                  // [we-scene patch issue #10] 清空 GL 错误队列，但**必须有上限**：
+                  // 原写法 `while (gl.getError() !== gl.NO_ERROR) {}` 在粘性错误
+                  // （CONTEXT_LOST_WEBGL）下永远拿不到 NO_ERROR —— 这是个不带让出的
+                  // 死循环，直接卡死主线程：连 rAF 都不再走，表现为整页冻死。
+                  // 有上限 + CONTEXT_LOST 立刻放弃（上下文没了，排空也没有意义）。
+                  for (let drain = 0; drain < 16; drain++) {
+                    const glErr = gl.getError()
+                    if (glErr === gl.NO_ERROR) break
+                    if (glErr === gl.CONTEXT_LOST_WEBGL) break
+                  }
                 }
               } catch (e) {  }
               diag('video upload: 直传失败，改用离屏 canvas 中转')
@@ -4037,6 +4061,13 @@ export function createRenderer(canvas, opts = {}) {
         }
         continue
       }
+      // [we-scene patch issue #10/#11] 空 pass（没有 shader 也不是命令 pass）直接跳过。
+      // 形状来自 effects-parse 的「材质缺失 / 里没有 shader / pass 未识别」三条分支，
+      // 那三处**已经**各自报了诊断。继续往下走会拿 `shader: null` 去解析
+      // `shaders/null.frag` / `shaders/null.vert`，于是同一个根因后面再挂两条误导
+      // 信息（「缺少 shaders/null.vert」+「pass 编译失败 shader=null」）——
+      // 真正的原因反而被淹掉。
+      if (!mp.shader) continue
       let progEntry
       try {
         progEntry = await getEffectProgram(mp.shader, combos, mergedTex)
@@ -4044,7 +4075,13 @@ export function createRenderer(canvas, opts = {}) {
         const msg = (e && e.message) || String(e)
         // 已缓存的失败每帧每层都会再进这里；只在首次编译失败时打日志，避免刷屏拖垮 FPS 观感。
         if (!/已缓存/.test(msg)) {
-          console.warn('[we-scene] 跳过效果（pass 编译失败）:', mp.shader, msg)
+          // [we-scene patch issue #10] 编译失败摘要**显式**走诊断通道（shader 名 +
+          // 错误首行）。此前只有下面那句 console.warn，靠 scene-mount 的 `[we-scene]`
+          // 前缀桥接才到得了宿主 —— 那层桥是给「忘了加诊断的告警」兜底的，
+          // 关键失败不该依赖它。这里去掉前缀，避免同一件事被桥接再报一遍
+          // （宿主侧要是同一条诊断出现两次，比不报还难读）。
+          diag('跳过效果（pass 编译失败）: ' + mp.shader + ' — ' + String(msg).split('\n')[0].slice(0, 160))
+          console.warn('跳过效果（pass 编译失败）:', mp.shader, msg)
         }
         failedEffects.add(eff)
         continue

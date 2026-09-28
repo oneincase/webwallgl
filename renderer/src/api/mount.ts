@@ -7,6 +7,7 @@ import {
   fitObjectFit,
   frameStats,
   normalizeFit,
+  reportDiag,
   resetCoverAlign,
   resetFrameMeter,
   type Runtime,
@@ -38,6 +39,12 @@ function isWebProject(project: unknown): boolean {
 }
 
 const MEDIA_TYPES = new Set(["video", "gif", "image"]);
+
+/**
+ * 首帧看门狗默认上限（见 armWatchdog）。相当宽：它要抓的是「循环已死」，
+ * 不是「这次有点慢」——真实装配（含 100MB+ 场景包）在数秒内出首帧。
+ */
+const MOUNT_WATCHDOG_MS = 60000;
 
 function mediaProjectType(project: unknown): string | null {
   const t = (project as { type?: unknown } | null)?.type;
@@ -327,6 +334,34 @@ export function createScene(
   };
 
   /**
+   * 首帧看门狗（issue #9）：`mount()` 的 Promise 只由 onFirstFrame / onError 落地，
+   * 两者都不触发就是**永久挂起** —— 调用方既拿不到成功也拿不到失败，无法区分
+   * 「还在加载」和「已经死了」。挂表超时后 reject + 上报诊断，把黑洞变成结论。
+   *
+   * 默认 60000ms（`mountTimeoutMs` 可调，0 = 关闭）。取这个量级是因为首帧成本
+   * 与 pkg 体积/解码相关：本机最大的 100MB+ 场景包也在数秒内出首帧，60s 只可能
+   * 是「真死了」。超时**不**销毁实例：调用方拿到 reject 后仍可自行 destroy()，
+   * 也可能选择继续等（极慢的冷启动），这里不替它做决定。
+   */
+  const armWatchdog = (): { promise: Promise<never>; off: () => void } => {
+    const ms = currentOptions.mountTimeoutMs === undefined ? MOUNT_WATCHDOG_MS : Number(currentOptions.mountTimeoutMs);
+    if (!Number.isFinite(ms) || ms <= 0) return { promise: new Promise<never>(() => {}), off: () => {} };
+    let timer: ReturnType<typeof setTimeout>;
+    const promise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(
+          `mount 首帧超时（${Math.round(ms)}ms）：渲染循环没有产出首帧，也没有触发 onError。` +
+            `若不是在极慢的冷启动，多半是渲染循环已无声死亡 —— 开 onDiagnostic 看最后一条诊断。` +
+            `（可用 mountTimeoutMs 调整或传 0 关闭本看门狗）`,
+        );
+        reportDiag(rt, rt.cfg, `failed: mount 首帧超时 ${Math.round(ms)}ms（渲染循环无首帧、无 onError）`);
+        reject(err);
+      }, ms);
+    });
+    return { promise, off: () => clearTimeout(timer) };
+  };
+
+  /**
    * 用当前配置原地重挂（setRenderDpr / restore 共用）。
    *
    * 必须换画布，不能沿用 `rt.cfg.canvas`：`clear()` 里 `renderer.dispose()` 调
@@ -572,11 +607,13 @@ export function createScene(
       }
       const firstFrame = armFirstFrame();
       const failure = armFailure();
+      const watchdog = armWatchdog();
       mountWallpaper(rt, cfg);
       try {
-        await Promise.race([firstFrame, failure.promise]);
+        await Promise.race([firstFrame, failure.promise, watchdog.promise]);
       } finally {
         failure.off();
+        watchdog.off();
       }
     },
 
@@ -656,11 +693,13 @@ export function createScene(
     }
     const firstFrame = armFirstFrame();
     const failure = armFailure();
+    const watchdog = armWatchdog();
     mountWallpaper(rt, rt.cfg);
     try {
-      await Promise.race([firstFrame, failure.promise]);
+      await Promise.race([firstFrame, failure.promise, watchdog.promise]);
     } finally {
       failure.off();
+      watchdog.off();
     }
     if (o.autoplay === false) instance.pause();
     if ((o.volume ?? 0) > 0) instance.setVolume(o.volume as number);

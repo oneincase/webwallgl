@@ -839,10 +839,19 @@ export function recomposeWorld(layers, dirty) {
   }
   const targets = []
   for (const l of layers) {
-    if (!l || !l.localOrigin) continue
+    if (!l) continue
     // isPostProcess 的 world 被强制成整幅画布（见上方 isPost 分支），local 对它无意义。
     if (l.isPostProcess) continue
     if (dirty && !dirty.has(l.id)) continue
+    // [we-scene patch issue #9] local 三件套**必须同时是数组**才参与重算。
+    // 此前只查 `!l.localOrigin`：上游若把 localAngles / localScale 写成标量
+    // （畸形关键帧动画，标量直写向量槽），本函数末尾的 `l.localAngles.slice()`
+    // 就在 rAF 回调里抛 TypeError；异常逃出 renderLoop ⇒ 下一帧永不排 ⇒
+    // 渲染循环无声死亡、mount() 既不 resolve 也不 reject。缺任一槽按
+    // 「无 local 变换的合成层」跳过（世界值保持 parse 结果）——与 localOrigin
+    // 缺失时完全同一条既有路径，也就与 origin 变体今天的表现一致。
+    // 本函数是逐帧调用点，**不许抛**：它的异常代价是整个渲染循环。
+    if (!Array.isArray(l.localOrigin) || !Array.isArray(l.localScale) || !Array.isArray(l.localAngles)) continue
     targets.push(l)
   }
   targets.sort((a, b) => depthOf(a) - depthOf(b))

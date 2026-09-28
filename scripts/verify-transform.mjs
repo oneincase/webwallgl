@@ -296,6 +296,210 @@ const { evalObjectScript } = await import(path.join(ROOT, "renderer/vendor/we-sc
   }
 }
 
+// ---- 7. recomposeWorld 必须「永不抛」，且不得把 NaN 灌进 world（issue #9）----
+// 事故形状：畸形关键帧动画（单条通道却装 vec3 字符串 "0 0 -0.05"）经
+// sampleChannel 求值成标量 0，旧写回 `layer[slot] = 0` 把 localAngles 整个换成
+// number；下一帧 recomposeWorld 里 `l.localAngles.slice()` 抛 TypeError，异常逃出
+// rAF 回调 → 渲染循环无声死亡 → 首帧永不完成、mount() 既不 resolve 也不 reject。
+// 本函数是逐帧调用点，**它的异常代价是整个渲染循环**，所以判据是「不抛」+
+// 「world 保持有限且不变」。
+//
+// 两条子路径都要覆盖，因为坏法不同：
+//   · 根层（无父）：走 `localOrigin/localScale/localAngles.slice()` → 直接抛；
+//   · 子层：走 composeChildTransform，`.slice()` 根本不执行，标量槽会被
+//     `childLocal.angles[0]` 读成 undefined → world angles 变 [undefined,undefined,NaN]
+//     **静默毒化**（不抛但更坏，NaN 会顺着矩阵传染到整个渲染链）。
+{
+  const mkLayer = (id, parentId, origin) => ({
+    id, name: "L" + id, parentId: parentId ?? null,
+    origin: origin.slice(), localOrigin: origin.slice(),
+    scale: [1, 1, 1], localScale: [1, 1, 1],
+    angles: [0, 0, 0], localAngles: [0, 0, 0],
+    size: [100, 100, 0], visible: true, visibleSelf: true, alpha: 1, color: [1, 1, 1],
+    childIds: [], isPostProcess: false,
+  })
+  const corruptions = [
+    ["localAngles 被写成标量（事故原形）", (l) => { l.localAngles = 0 }],
+    ["localScale 被写成标量", (l) => { l.localScale = 0 }],
+    ["localScale 被写成 null", (l) => { l.localScale = null }],
+    ["localOrigin 被写成 0", (l) => { l.localOrigin = 0 }],
+  ]
+  // root：目标层无父；child：目标层挂在会动的父层下（父动 → 子必进脏集）
+  const setups = [
+    ["根层", (target) => []],
+    ["子层", (target) => [mkLayer(1, null, [100, 200, 0])] ],
+  ]
+  const problems = []
+  let ran = 0
+  for (const [setupName, mkParents] of setups) {
+    for (const [name, breakIt] of corruptions) {
+      const parents = mkParents()
+      const target = mkLayer(2, parents.length ? 1 : null, [10, 20, 0])
+      const worldBefore = target.origin.slice()
+      const anglesBefore = target.angles.slice()
+      breakIt(target)
+      const layers = [...parents, target]
+      const dirty = collectTransformDirty(layers, [target])
+      if (!dirty.has(2)) { problems.push(`${setupName}/${name}：脏集不含目标层，判据无效`); continue }
+      if (parents.length) parents[0].localOrigin[0] += 500 // 父动，子理应跟 500
+      ran++
+      try {
+        recomposeWorld(layers, dirty)
+      } catch (e) {
+        problems.push(`${setupName}/${name}：抛出 ${(e && e.message) || e} —— 渲染循环会因此无声死亡`)
+        continue
+      }
+      const finite = (a) => Array.isArray(a) && a.every(Number.isFinite)
+      if (!finite(target.origin) || !finite(target.angles)) {
+        problems.push(`${setupName}/${name}：world 被灌成非有限值 origin=${JSON.stringify(target.origin)} angles=${JSON.stringify(target.angles)}`)
+        continue
+      }
+      if (!target.origin.every((v, i) => v === worldBefore[i]) || !target.angles.every((v, i) => v === anglesBefore[i])) {
+        problems.push(`${setupName}/${name}：坏层未被跳过，world 被改写（原 ${JSON.stringify(worldBefore)} → ${JSON.stringify(target.origin)}）`)
+      }
+    }
+  }
+  if (problems.length) {
+    for (const p of problems) fail(p)
+  } else {
+    console.log(`  ✓ recomposeWorld 永不抛：${setups.length} 种层级 × ${corruptions.length} 种畸形槽 = ${ran} 例全部安全跳过（world 有限且不变）`)
+  }
+}
+
+// ---- 8. 动画写回的**形状契约**：标量进向量槽必须广播，绝不改槽的形状（issue #9）----
+// 判据跑真实现 anim.writeAnimSlot（不是复算一份公式），并用**issue 报的原数据**
+// 走一遍 createAnimation → applyTo → writeAnimSlot 全链。
+{
+  const animMod = await import(path.join(ROOT, "renderer/vendor/we-scene/render/animation.js"));
+  const { createAnimation, writeAnimSlot } = animMod
+  const L = () => ({ localAngles: [0, 0, 0], localOrigin: [5, 6, 7], alpha: 0.5 })
+  // a) 向量槽 + 标量 → 广播，长度不变
+  {
+    const l = L()
+    const ok = writeAnimSlot(l, "localAngles", 0.25)
+    const good = ok && Array.isArray(l.localAngles) && l.localAngles.length === 3 &&
+      l.localAngles.every((v) => Math.abs(v - 0.25) < 1e-12)
+    check(good, `writeAnimSlot 标量进向量槽应广播成 [0.25,0.25,0.25]，got ${JSON.stringify(l.localAngles)}`)
+    if (good) console.log("  ✓ writeAnimSlot：标量进向量槽 → 广播全分量（形状保住）")
+  }
+  // b) 向量槽 + 数组 → 逐分量写回
+  {
+    const l = L()
+    writeAnimSlot(l, "localOrigin", [1, 2, 3])
+    check(l.localOrigin.join() === "1,2,3", `writeAnimSlot 数组应逐分量写回，got ${JSON.stringify(l.localOrigin)}`)
+  }
+  // c) 标量槽 + 标量 → 直接赋值（alpha/brightness 等既有行为不变）
+  {
+    const l = L()
+    writeAnimSlot(l, "alpha", 0.9)
+    check(l.alpha === 0.9, `writeAnimSlot 标量槽应直接赋值，got ${l.alpha}`)
+  }
+  // d) 标量槽 + 数组 → 丢弃（形状错配，不得把布尔/数值槽写成数组）
+  {
+    const l = { visible: true }
+    writeAnimSlot(l, "visible", [1, 0, 0])
+    check(l.visible === true, `数组写进标量槽必须丢弃，got ${JSON.stringify(l.visible)}`)
+  }
+  // e) 向量槽 + 非有限标量 → 丢弃（NaN/Infinity 不得污染变换）
+  {
+    const l = L()
+    writeAnimSlot(l, "localAngles", NaN)
+    check(l.localAngles.join() === "0,0,0", `NaN 不得污染向量槽，got ${JSON.stringify(l.localAngles)}`)
+  }
+  // f) issue 原数据全链：单通道 + vec3 字符串值 → 槽仍是 3 元数组
+  {
+    const def = {
+      c0: [
+        { frame: 0, value: "0 0 -0.05", lockangle: true, locklength: true },
+        { frame: 150, value: "0 0 0.05", lockangle: true, locklength: true },
+        { frame: 300, value: "0 0 -0.05", lockangle: true, locklength: true },
+      ],
+      options: { fps: 30, length: 300, mode: "loop" },
+    }
+    const ctrl = createAnimation(def)
+    const l = L()
+    let violated = null
+    for (let i = 0; i < 60; i++) {
+      ctrl.advance(1 / 30)
+      const out = ctrl.applyTo([0, 0, 0])
+      writeAnimSlot(l, "localAngles", out)
+      if (!Array.isArray(l.localAngles) || l.localAngles.length !== 3 || !l.localAngles.every(Number.isFinite)) {
+        violated = `第 ${i} 帧后 localAngles = ${JSON.stringify(l.localAngles)}（out=${JSON.stringify(out)}）`
+        break
+      }
+    }
+    check(!violated, `issue #9 原数据把 localAngles 写坏了：${violated}`)
+    if (!violated) console.log("  ✓ issue #9 原数据（单通道 vec3 值）60 帧写回后 localAngles 仍是 3 元有限数组")
+  }
+}
+
+// ---- 9. 语料断言：真实变换动画求值写回后，槽形状与 recomposeWorld 都必须成立 ----
+// 「修好一处畸形数据」不等于「真实语料不受影响」：全库变换动画一条条走
+// createAnimation → applyTo → writeAnimSlot → recomposeWorld，任何一条把
+// local 槽写成非数组、或让 recomposeWorld 抛，都算回归。
+{
+  const animMod = await import(path.join(ROOT, "renderer/vendor/we-scene/render/animation.js"));
+  const { createAnimation, writeAnimSlot } = animMod
+  const TRANSFORM = ["origin", "scale", "angles"]
+  let scenes = 0
+  let anims = 0
+  let broke = 0
+  const samples = []
+  for (const d of readdirSync(LIB)) {
+    if (!/^\d+$/.test(d)) continue
+    let sj, project
+    try {
+      project = JSON.parse(fs.readFileSync(path.join(LIB, d, "project.json"), "utf8"))
+      if (String(project.type || "").toLowerCase() !== "scene") continue
+      const pkg = parsePkg(new Uint8Array(fs.readFileSync(path.join(LIB, d, "scene.pkg"))))
+      sj = JSON.parse(dec.decode(getEntry(pkg, "scene.json")))
+    } catch { continue }
+    let scene
+    try { scene = parseScene(sj, project) } catch { continue }
+    scenes++
+    const dirty = collectTransformDirty(scene.layers, [])
+    const byId = new Map(scene.layers.map((l) => [l.id, l]))
+    for (const l of scene.layers) {
+      const defs = l.objectAnimations
+      if (!defs) continue
+      for (const f of TRANSFORM) {
+        if (!defs[f]) continue
+        anims++
+        const ctrl = createAnimation(defs[f].animation)
+        const slot = f === "origin" ? "localOrigin" : f === "scale" ? "localScale" : "localAngles"
+        if (!Array.isArray(l[slot])) { broke++; if (samples.length < 8) samples.push(`${d} ${l.name} ${f}: 槽不是数组（parse 期）`); continue }
+        const before = l[slot].slice()
+        try {
+          for (let i = 0; i < 40; i++) {
+            ctrl.advance(1 / 30)
+            writeAnimSlot(l, slot, ctrl.applyTo(before))
+          }
+          // 形状不变量
+          if (!Array.isArray(l[slot]) || l[slot].length !== before.length || !l[slot].every(Number.isFinite)) {
+            broke++
+            if (samples.length < 8) samples.push(`${d} ${l.name} ${f}: 写回后形状坏了 → ${JSON.stringify(l[slot])}`)
+            continue
+          }
+          // 逐帧调用点不得抛（父层被带动 → 该层必在脏集里）
+          if (dirty.has(l.id)) recomposeWorld(scene.layers, dirty)
+        } catch (e) {
+          broke++
+          if (samples.length < 8) samples.push(`${d} ${l.name} ${f}: recomposeWorld 抛 ${(e && e.message) || e}`)
+        }
+        for (let k = 0; k < before.length; k++) l[slot][k] = before[k]
+      }
+    }
+  }
+  if (anims === 0) {
+    console.log("  - 跳过语料动画形状断言（本机库中无场景壁纸）")
+  } else if (broke > 0) {
+    fail(`语料变换动画写回/重算不变量被破坏：${broke} 处 / ${anims} 条（${scenes} 场景）`)
+    for (const s of samples) console.log("    " + s)
+  } else {
+    console.log(`  ✓ 语料形状不变量：${scenes} 场景 ${anims} 条变换动画，40 帧写回 + recomposeWorld 全部保持数组形状且不抛`)
+  }
+}
+
 console.log("")
 if (errors.length > 0) {
   console.log(`✗ 共 ${errors.length} 处问题`)
