@@ -1499,20 +1499,50 @@ function makeThisScene(opts) {
     },
     getCameraTransforms() {
       const c = opts.cameraTransforms || { zoom: 1 }
+      // [we-scene patch 2026-09-28] **必须返回 Vec3 实例，不能是裸数组/null**。
+      // WE 的 `ICameraTransforms.eye/center` 是向量对象，作者脚本按
+      // `initValue instanceof Vec2/Vec3` 分流（Free Cam 的 mixValue：不是向量就走
+      // `result = 0` 再 `result.x = …` → `Cannot create property 'x' on number '0'`），
+      // 也会直接 `.subtract()/.add()`（裸数组/null 立刻 TypeError，3281559867 实测
+      // 两条错误都出在这里）。eye/center 缺省取“当前相机”，不留 null。
+      const eye = c.eye && c.eye.length !== undefined ? c.eye : null
+      const center = c.center && c.center.length !== undefined ? c.center : null
+      const e = eye
+        ? new Vec3(Number(eye[0]) || 0, Number(eye[1]) || 0, Number(eye[2]) || 0)
+        : new Vec3(0, 0, 0)
+      const ct = center
+        ? new Vec3(Number(center[0]) || 0, Number(center[1]) || 0, Number(center[2]) || 0)
+        : new Vec3(e.x, e.y, e.z - 1)
       return {
         zoom: typeof c.zoom === 'number' ? c.zoom : 1,
-        center: c.center || null,
-        eye: c.eye || null,
+        center: ct,
+        eye: e,
         parallaxAmount: typeof c.parallaxAmount === 'number' ? c.parallaxAmount : 0,
       }
     },
     setCameraTransforms(t) {
       const c = opts.cameraTransforms
       if (!c || !t || typeof t !== 'object') return
+      // 向量字段归一到 [x,y,z] 数组（渲染侧 buildCamera 读的是数组）
+      const toArr = (v) => {
+        if (!v) return undefined
+        if (Array.isArray(v)) return v.length >= 3 ? [Number(v[0]), Number(v[1]), Number(v[2])] : undefined
+        if (typeof v === 'object' && Number.isFinite(Number(v.x)) && Number.isFinite(Number(v.y))) {
+          return [Number(v.x), Number(v.y), Number(v.z) || 0]
+        }
+        return undefined
+      }
       if (typeof t.zoom === 'number' && Number.isFinite(t.zoom) && t.zoom > 0) c.zoom = t.zoom
-      if (t.center !== undefined) c.center = t.center
-      if (t.eye !== undefined) c.eye = t.eye
+      const ce = toArr(t.center)
+      if (ce) c.center = ce
+      const ey = toArr(t.eye)
+      if (ey) c.eye = ey
       if (typeof t.parallaxAmount === 'number') c.parallaxAmount = t.parallaxAmount
+      // [we-scene patch 2026-09-28] 写入时间戳：宿主每帧只在**最近写过的**情况下
+      // 才让脚本位姿接管相机（见 scene-mount 的 refreshRuntimeCamera）。
+      // 没有它，Free Cam 脚本停止运行（切回其它机位）后，残留的 eye/center 会
+      // 永久钉住相机。用 performance.now()（沙箱内可用；离线 verifier 也有）。
+      try { c.stamp = (typeof performance !== 'undefined' ? performance.now() : Date.now()) } catch { /* 忽略 */ }
     },
     getInitialLayerConfig(arg) {
       if (typeof opts.getInitialLayerConfig === 'function') return opts.getInitialLayerConfig(arg)
@@ -1520,6 +1550,59 @@ function makeThisScene(opts) {
       return layer || null
     },
   }
+}
+
+/**
+ * [we-scene patch 2026-09-28] WE 文档化的相机控制面 `shared.camera`。
+ *
+ * 官方脚本模板（本机 3281559867 的 Free Cam by Gariam）头部就写着这几个字段：
+ *   targetPosition [Vec3] / targetAngles [Vec2] / targetDistance [number] —— 可写；
+ *   currentPosition [Vec3] / currentAngles [Vec2] / currentDistance [number] —— 只读镜像；
+ *   isDragging / mouseInput / mode('firstPerson'|'thirdPerson')。
+ *
+ * 缺它的后果：脚本顶层 `shared.camera.targetAngles.subtract(new Vec2(0, 90))`
+ * 立刻 `Cannot read properties of null (reading 'subtract')` → 三振熔断 →
+ * 作者写的「Free Camera mode 可用鼠标拖拽」整段消失（全库 28 处调用都在这张）。
+ *
+ * current* 必须是**活的**（每次读都取当前相机），否则脚本的拖拽增量算在快照上，
+ * 相机纹丝不动 —— 所以用 getter，不用快照字段。
+ */
+export function makeSharedCamera(getLive) {
+  const live = () => {
+    const l = typeof getLive === 'function' ? getLive() : null
+    return l && typeof l === 'object' ? l : null
+  }
+  const radToDeg = (r) => (r * 180) / Math.PI
+  const cam = {
+    targetPosition: new Vec3(0, 0, 0),
+    targetAngles: new Vec2(0, 0),
+    targetDistance: 0,
+    mode: 'thirdPerson',
+    mouseInput: true,
+    isDragging: false,
+    get currentPosition() {
+      const l = live()
+      const e = l && l.eye
+      return e ? new Vec3(e[0], e[1], e[2]) : new Vec3(0, 0, 0)
+    },
+    get currentAngles() {
+      const l = live()
+      const e = l && l.eye
+      const c = l && l.center
+      if (!e || !c) return new Vec2(0, 0)
+      const dx = c[0] - e[0]
+      const dy = c[1] - e[1]
+      const dz = c[2] - e[2]
+      const heading = radToDeg(Math.atan2(dx, dz))
+      const elevation = radToDeg(Math.atan2(dy, Math.hypot(dx, dz)))
+      return new Vec2(heading, elevation)
+    },
+    get currentDistance() {
+      const l = live()
+      return l && Number.isFinite(Number(l.distance)) ? Number(l.distance) : 0
+    },
+  }
+  return cam
 }
 
 function makeObjectLayerProxy(layer, opts) {

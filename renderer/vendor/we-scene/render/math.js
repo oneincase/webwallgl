@@ -338,11 +338,19 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
     let rEye, rCenter
     if (rc) {
       rEye = rc.eye.slice()
-      // 零旋转看向 -z；按相机实体 angles（角度）旋转朝向。
-      let fwd = [0, 0, -1]
-      const ang = rc.angles || [0, 0, 0]
-      if (Number(ang[0]) || Number(ang[1])) fwd = rotateFwd(fwd, Number(ang[0]) || 0, Number(ang[1]) || 0)
-      rCenter = [rEye[0] + fwd[0], rEye[1] + fwd[1], rEye[2] + fwd[2]]
+      // [we-scene patch 2026-09-28] 脚本直给的看向点（`setCameraTransforms({eye, center})`，
+      // 见 scene-mount 的 refreshRuntimeCamera）：有 center 就用它，别再按 angles 推 ——
+      // Free Cam 的自由视角没有「角度」这个概念，只有一对 eye/center。
+      const ctr = Array.isArray(rc.center) && rc.center.length >= 3 ? rc.center : null
+      if (ctr && ctr.every((v) => Number.isFinite(Number(v)))) {
+        rCenter = [Number(ctr[0]), Number(ctr[1]), Number(ctr[2])]
+      } else {
+        // 零旋转看向 -z；按相机实体 angles（角度）旋转朝向。
+        let fwd = [0, 0, -1]
+        const ang = rc.angles || [0, 0, 0]
+        if (Number(ang[0]) || Number(ang[1])) fwd = rotateFwd(fwd, Number(ang[0]) || 0, Number(ang[1]) || 0)
+        rCenter = [rEye[0] + fwd[0], rEye[1] + fwd[1], rEye[2] + fwd[2]]
+      }
     } else {
       rEye = eyeV
       rCenter = centerV

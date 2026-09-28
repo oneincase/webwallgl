@@ -35,7 +35,7 @@ import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, anim, camPath as camPathLib, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -3761,6 +3761,44 @@ cfg, source, pkgAbort.signal);
         }
       }
 
+      // [we-scene patch 2026-09-28] 运行时相机实体逐帧重选。
+      //
+      // 为什么要逐帧：相机实体的 origin/angles 绑脚本（3281559867 的 10 台全都绑了
+      // 追目标的转向脚本），可见性也可能是脚本驱动的切换（Alternating 那对
+      // `Cam Kirby/Dedede Alter` 每 30s 互换、`camerastyle` 改用户属性后
+      // recomputeLayerVisibility 才更新）。parse 期那份快照只够画第一帧。
+      //
+      // 选择规则 = 参考引擎 ParseCameraObj 的 attach 语义：**最后一个可见的相机
+      // 实体**（后 attach 覆盖先 attach）；一台都不可见时退回"作者没选机位"的
+      // 场景语义 —— 顶层 scene.camera 快照（runtimeCamera=null，buildCamera 自会回落）。
+      // [we-scene patch 2026-09-29] **相机路径**（`path: "scripts/camera_paths_*.json"`）。
+      // 文件里是若干 clip（eye/center/up/fov/zoom 的关键帧曲线 + fps/length/mode），
+      // 相机按 clip 依次飞行；`queuemode` 决定下一段顺序还是随机。
+      // 本仓此前完全不解析 `path`：Dynamic 档（camerastyle=9）的机位一动不动，
+      // 而作者那条「Dynamic Cam」正是靠 9 段路径做环绕运镜的。
+      // 语义对齐参考引擎 SceneCameraPath::TickQueue（见 render/camera-path.js 头注）。
+      for (const layer of scene.layers as any[]) {
+        const src = layer && layer.srcObject;
+        if (!src || typeof src.path !== "string" || !src.path) continue;
+        try {
+          const entry = pkg.getEntry(parsedPkg, src.path);
+          if (!entry) {
+            reportDiag(rt, cfg, `camera path '${src.path}' 不在包内（图层 ${layer.name}）`);
+            continue;
+          }
+          const doc = JSON.parse(readText(entry));
+          const path = camPathLib.createCameraPath(doc, typeof src.queuemode === "string" ? src.queuemode : "sequential");
+          if (!path.clips.length) {
+            reportDiag(rt, cfg, `camera path '${src.path}' 没有 clip（图层 ${layer.name}）`);
+            continue;
+          }
+          layer.cameraPath = path;
+          reportDiag(rt, cfg, `camera path '${layer.name}': ${path.clips.length} 段（queuemode=${src.queuemode || "sequential"}）`);
+        } catch (e) {
+          reportDiag(rt, cfg, `camera path '${src.path}' 解析失败: ${String((e as Error).message || e).slice(0, 80)}`);
+        }
+      }
+
       // [we-scene patch 2026-09-28] 场景平行光 → 3D 网格光照。
       //
       // 为什么必须做：WE 的真 3D 网格（generic4 材质）是**上光**的 —— 作者素材实测
@@ -3813,6 +3851,76 @@ cfg, source, pkgAbort.signal);
       const layersHaveNormals = (l: any) =>
         !!(l && l.puppet && l.puppet.meshes && l.puppet.meshes.some((m: any) => m && m.normals));
 
+      const cameraLayers: any[] = scene.layers.filter((l: any) => l.isCamera)
+      const refreshRuntimeCamera = (tSec: number) => {
+        const rcAny: any = (scene as any).runtimeCamera
+        if (!rcAny) return
+        // [we-scene patch 2026-09-28] **脚本驱动的相机位姿优先**：Free Cam 这类模式
+        // 经 `thisScene.setCameraTransforms({eye, center})` 直接摆相机（见 text.js 的
+        // stamp）。只在最近 250ms 内写过才接管 —— 切回其它机位后脚本不再写，
+        // 残留值不许永久钉住相机。
+        const ct: any = (scene as any).cameraTransforms
+        if (
+          ct &&
+          typeof ct.stamp === "number" &&
+          typeof performance !== "undefined" &&
+          performance.now() - ct.stamp < 250 &&
+          Array.isArray(ct.eye) &&
+          Array.isArray(ct.center) &&
+          ct.eye.every((v: unknown) => Number.isFinite(Number(v))) &&
+          ct.center.every((v: unknown) => Number.isFinite(Number(v)))
+        ) {
+          rcAny.eye[0] = Number(ct.eye[0]); rcAny.eye[1] = Number(ct.eye[1]); rcAny.eye[2] = Number(ct.eye[2])
+          rcAny.center = [Number(ct.center[0]), Number(ct.center[1]), Number(ct.center[2])]
+          return
+        }
+        if (rcAny.center) rcAny.center = null
+        if (!cameraLayers.length) return
+        let active: any = null
+        for (const c of cameraLayers) if (c.visible) active = c
+        if (!active) return
+        const rc: any = rcAny
+        // [we-scene patch 2026-09-29] **相机路径**：有 path 的机位由 clip 队列驱动，
+        // 基准位姿取该相机实体脚本算出的当前位姿（OWE 的 queue_base 语义）。
+        const camPath: any = (active as any).cameraPath
+        if (camPath) {
+          const basePose = {
+            eye: [rc.eye[0], rc.eye[1], rc.eye[2]],
+            center: Array.isArray(rc.center) && rc.center.length >= 3
+              ? [rc.center[0], rc.center[1], rc.center[2]]
+              : undefined,
+            up: [0, 1, 0],
+            fov: Number(rc.fov) || 50,
+            zoom: Number(rc.zoom) || 1,
+          };
+          if (!basePose.center) {
+            const a = rc.angles || [0, 0, 0];
+            const yaw = Number(a[1]) || 0;
+            const pitch = Number(a[0]) || 0;
+            basePose.center = [rc.eye[0] + pitch * 0, rc.eye[1] + pitch, rc.eye[2] - 1];
+          }
+          const pose = camPath.tick(tSec, basePose);
+          if (pose) {
+            rc.eye[0] = pose.eye[0]; rc.eye[1] = pose.eye[1]; rc.eye[2] = pose.eye[2];
+            rc.center = [pose.center[0], pose.center[1], pose.center[2]];
+            if (Number.isFinite(pose.fov) && pose.fov > 0) rc.fov = pose.fov;
+            const ct2: any = (scene as any).cameraTransforms;
+            if (ct2 && Number.isFinite(pose.zoom) && pose.zoom > 0) ct2.zoom = pose.zoom;
+            return;
+          }
+        }
+        rc.eye[0] = active.origin[0]
+        rc.eye[1] = active.origin[1]
+        rc.eye[2] = active.origin[2]
+        // 相机朝向：angles 是世界角（子层由 recomposeWorld 合成）。
+        rc.angles[0] = active.angles[0]
+        rc.angles[1] = active.angles[1]
+        rc.angles[2] = active.angles[2]
+        // fov<=0 表示这台没写 fov（参考引擎同口径：`if (cam.fov > 0) SetFov`），保留上一个。
+        const f = Number(active.cameraFov)
+        if (Number.isFinite(f) && f > 0) rc.fov = f
+      }
+
       // ---- 文字对象 / 组件挂件（时钟、日期、星期等动态文本）----
       // 文字渲到离屏 2D canvas → GL 纹理 → 挂回图层本身（textureName），以**普通图层身份**
       // 进入渲染管线：z 序与图片层一致、可走效果链/混合/视差。旧 2D overlay 方案永远
@@ -3825,6 +3933,25 @@ cfg, source, pkgAbort.signal);
         const deferredTextInits: Array<{ sandbox: any; layer: any }> = [];
         const textLayerText = new Map<string, string>(); // 层名 → 当前文本（thisScene.getLayer 跨层读）
         const textShared: Record<string, unknown> = {}; // 同场景文字脚本共享状态（WE shared 全局）
+        // [we-scene patch 2026-09-28] `shared.camera`（WE 文档化相机控制面）。
+        // current* 走 getter 取**活**相机，见 text.js makeSharedCamera 的注释。
+        textShared.camera = wtext.makeSharedCamera(() => {
+          const rc: any = (scene as any).runtimeCamera;
+          const ct: any = (scene as any).cameraTransforms;
+          if (ct && Array.isArray(ct.eye) && Array.isArray(ct.center)) {
+            return { eye: ct.eye, center: ct.center, distance: 0 };
+          }
+          if (!rc || !Array.isArray(rc.eye)) return null;
+          const a = rc.angles || [0, 0, 0];
+          const yaw = Number(a[1]) || 0;
+          const pitch = Number(a[0]) || 0;
+          const fwd = [
+            -Math.sin(yaw) * Math.cos(pitch),
+            pitch,
+            -Math.cos(yaw) * Math.cos(pitch),
+          ];
+          return { eye: rc.eye, center: [rc.eye[0] + fwd[0], rc.eye[1] + fwd[1], rc.eye[2] + fwd[2]], distance: 0 };
+        });
       let textCanvas: HTMLCanvasElement | null = null;
       let textCtx: CanvasRenderingContext2D | null = null;
       if (!SKIP_TEXT && scene.layers.some((l: any) => l.isText)) {
@@ -4265,6 +4392,28 @@ cfg, source, pkgAbort.signal);
       // ---- WE 对象脚本（scale/origin/color/alpha/brightness/angles 绑定的脚本）----
       // 经典用法：音频条的 scale 脚本读 registerAudioBuffers 按频段改写 scale.y
       // （3078285611 底部 11 根音条即此）。逐帧求值，出错熔断回退字段静态快照。
+      // [we-scene patch 2026-09-28] 每帧把**活相机**灌进 cameraTransforms.eye/center，供脚本
+      // `getCameraTransforms()` 读到真实位姿（Free Cam 的 initPos/restore 依赖它）。
+      // 脚本随后写回的值会打 stamp（见 text.js setCameraTransforms），refreshRuntimeCamera
+      // 只在 stamp 新鲜时让脚本位姿接管 → 顺序天然正确。
+      const seedCameraTransforms = () => {
+        const ct: any = (scene as any).cameraTransforms;
+        const rc: any = (scene as any).runtimeCamera;
+        if (!ct || !rc || !Array.isArray(rc.eye)) return;
+        ct.eye = [rc.eye[0], rc.eye[1], rc.eye[2]];
+        if (Array.isArray(rc.center) && rc.center.length >= 3) {
+          ct.center = [rc.center[0], rc.center[1], rc.center[2]];
+        } else {
+          const a = rc.angles || [0, 0, 0];
+          const yaw = Number(a[1]) || 0;
+          const pitch = Number(a[0]) || 0;
+          ct.center = [
+            rc.eye[0] - Math.sin(yaw) * Math.cos(pitch),
+            rc.eye[1] + pitch,
+            rc.eye[2] - Math.cos(yaw) * Math.cos(pitch),
+          ];
+        }
+      };
       const objectScriptRuns: Array<{ layer: any; field: string; slot: string; kind: "vec3" | "scalar" | "bool"; sandbox: any; last?: unknown }> = [];
       // [we-scene patch] 跨层脚本（thisScene.getLayer(x).origin/scale = …）写了某个
       // **子层** local 变换槽后，目标层要进本帧 recompose 集合（顶层 local===world
@@ -5513,6 +5662,7 @@ cfg, source, pkgAbort.signal);
             sb.engine.screenResolution = screenRes;
             sb.engine.timeOfDay = timeOfDayValue;
           }
+          seedCameraTransforms();
           for (const run of objectScriptRuns) {
             if (run.sandbox.disabled) continue;
             run.sandbox.engine.frametime = animDt;
@@ -5582,6 +5732,8 @@ cfg, source, pkgAbort.signal);
           // 只重算 transformDirty（变换绑了脚本/动画的层及其整棵子树，外加挂件子树），
           // 其余图层保持 parse 时的 world 一个字节都不碰。
           if (transformDirty.size) scn.recomposeWorld(scene.layers, transformDirty);
+          // 相机实体：脚本写完 local、world 合成完之后、绘制之前刷新（见上面的长注释）。
+          refreshRuntimeCamera(t);
           // 音频流推进并重填文字脚本的频谱视图。优先级：宿主注入 > 系统实况 >
           // 内置模拟（确定性：同 t 同频谱）。hostAudio.pump 内部会在宿主无数据时
           // 自行置 active=false，于是这一帧自动回落到后两者。

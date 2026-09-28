@@ -553,6 +553,107 @@ if (fs.existsSync(LIB)) {
   }
 }
 
+// ---------- 6. 相机路径（`path: scripts/camera_paths_*.json`，2026-09-29）----------
+//
+// WE 的相机对象可以带一条路径：文件里是若干 clip（eye/center/up/fov/zoom 的关键帧
+// 曲线 + fps/length/mode），相机按 clip 依次飞行，`queuemode` 决定顺序还是随机。
+// 语义对齐参考引擎 SceneCameraPath::TickQueue（见 render/camera-path.js 头注）。
+//
+// 判据用**合成路径**（自造帧值，不依赖被测实现的公式）+ **真实语料**两条：
+//   ① 段内推进：t=0 在首帧、t=半个时长在中点（线性曲线 ⇒ 期望值可手算）；
+//   ② 段尾换段：sequential 模式过段末必须换到下一段并从 frame 0 起；
+//   ③ random 模式随 Math.random（打桩成定值验证它真的在抽，而不是顺序走）；
+//   ④ 基准语义：relative 曲线叠加在「段开始时相机位姿」上，绝对曲线整段替换；
+//   ⑤ **通道归一化**：fps/length/mode 写在 path 层、标量通道是扁平数组 —— 不归一化
+//      会 length=0 ⇒ 曲线永远停在 frame 0（实测 Dynamic 档相机切段但段内不动）；
+//   ⑥ 真实语料：3281559867 的 camera_paths_1129.json 能建出 9 段，且跨 10 秒 tick
+//      时 eye 真的在动、fov 随段变化。
+{
+  const pErr = [];
+  const { createCameraPath } = await imp("renderer/vendor/we-scene/render/camera-path.js");
+
+  const kf = (frame, value) => ({
+    frame,
+    value,
+    front: { enabled: false, x: 1, y: 0 },
+    back: { enabled: false, x: 1, y: 0 },
+    lockangle: true,
+    locklength: true,
+  });
+  // 真实格式：向量通道是 c0/c1/c2 三条（本张 eye/center/up 都是），标量通道是扁平数组。
+  const chan = (vals, frames) => ({
+    c0: vals.map((v, i) => kf(frames[i], v)),
+    c1: vals.map((_, i) => kf(frames[i], 0)),
+    c2: vals.map((_, i) => kf(frames[i], 0)),
+  });
+  const doc = {
+    paths: [
+      { id: 1, name: "A", options: { fps: 10, length: 10, mode: "single" }, eye: chan([0, 10], [0, 10]), fov: [kf(0, 50), kf(10, 90)] },
+      { id: 2, name: "B", options: { fps: 10, length: 10, mode: "single" }, eye: chan([0, -10], [0, 10]) },
+    ],
+  };
+  const base = { eye: [0, 0, 0], center: [0, 0, -1], up: [0, 1, 0], fov: 50, zoom: 1 };
+
+  const seq = createCameraPath(doc, "sequential");
+  const p0 = seq.tick(100, base);
+  if (!p0 || Math.abs(p0.eye[0] - 0) > 1e-6) pErr.push(`相机路径 t=0 应在首帧（eye.x=0），实得 ${p0 && p0.eye[0]}`);
+  const pMid = seq.tick(100.5, base);
+  if (!pMid || Math.abs(pMid.eye[0] - 5) > 1e-3) pErr.push(`相机路径段内应线性推进（t=0.5s ⇒ eye.x=5），实得 ${pMid && pMid.eye[0]}`);
+  const pEnd = seq.tick(101.0, base);
+  if (!pEnd || seq.index !== 1) pErr.push(`段末应换到下一段（sequential），实得 index=${seq.index}`);
+  if (!pEnd || Math.abs(pEnd.eye[0] - 0) > 1e-3) pErr.push(`换段后应从 frame 0 起（eye.x=0），实得 ${pEnd && pEnd.eye[0]}`);
+  // 标量通道（扁平数组）必须被归一化：fov 从 50 → 90
+  const fovMid = createCameraPath(doc, "sequential");
+  fovMid.tick(0, base);
+  const fv = fovMid.tick(0.5, base);
+  if (!fv || Math.abs(fv.fov - 70) > 1) pErr.push(`fov 标量通道未生效（扁平数组归一化回归）：t=0.5s 期望 ≈70，实得 ${fv && fv.fov}`);
+
+  // random 模式：打桩 Math.random 到 0.9 → 恒选最后一段（index = 1）
+  const rnd0 = Math.random;
+  Math.random = () => 0.9;
+  const rndPath = createCameraPath(doc, "random");
+  rndPath.tick(0, base);
+  Math.random = rnd0;
+  if (rndPath.index !== 1) pErr.push(`random 队列没有随机抽段（桩 0.9 应选 index=1，实得 ${rndPath.index}）`);
+
+  // relative 曲线：叠加在段基准上（基准 eye.x=100 ⇒ 到位 100+10）
+  const relDoc = {
+    paths: [{ id: 3, name: "rel", relative: true, options: { fps: 10, length: 10, mode: "single" }, eye: { ...chan([0, 10], [0, 10]), relative: true } }],
+  };
+  const relPath = createCameraPath(relDoc, "sequential");
+  const relBase = { eye: [100, 0, 0], center: [100, 0, -1], up: [0, 1, 0], fov: 50, zoom: 1 };
+  relPath.tick(0, relBase);
+  // 注意采样点要落在段内：t = 时长（1s）正好是换段边界（单段路径环绕回 frame 0）
+  const relMid = relPath.tick(0.5, relBase);
+  if (!relMid || Math.abs(relMid.eye[0] - 105) > 1e-3) pErr.push(`relative 曲线应在段基准上叠加（t=0.5s 期望 eye.x=105），实得 ${relMid && relMid.eye[0]}`);
+  const relStart = createCameraPath(relDoc, "sequential");
+  const relAt0 = relStart.tick(0, relBase);
+  if (!relAt0 || Math.abs(relAt0.eye[0] - 100) > 1e-3) pErr.push(`relative 曲线 t=0 应等于段基准（100），实得 ${relAt0 && relAt0.eye[0]}`);
+
+  // 真实语料
+  const pkgPath = join(LIB, "3281559867", "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const doc2 = JSON.parse(dec.decode(getEntry(pkg, "scripts/camera_paths_1129.json")));
+    const path2 = createCameraPath(doc2, "random");
+    if (path2.clips.length !== 9) pErr.push(`Dynamic Cam 路径应有 9 段，实得 ${path2.clips.length}`);
+    const rnd1 = Math.random;
+    Math.random = () => 0; // 固定选第 0 段，保证可复现
+    const q0 = path2.tick(0, base);
+    const q1 = path2.tick(5, base);
+    const q2 = path2.tick(9.9, base);
+    Math.random = rnd1;
+    const moved = q0 && q1 && Math.hypot(q1.eye[0] - q0.eye[0], q1.eye[1] - q0.eye[1], q1.eye[2] - q0.eye[2]);
+    if (!(moved > 1)) pErr.push(`真实路径段内不动（5 秒位移 ${moved}）——通道归一化或时钟回归`);
+    const moved2 = q1 && q2 && Math.hypot(q2.eye[0] - q1.eye[0], q2.eye[1] - q1.eye[1], q2.eye[2] - q1.eye[2]);
+    if (!(moved2 > 0.5)) pErr.push(`真实路径后半段不动（位移 ${moved2}）`);
+  } else {
+    console.log("  （跳过相机路径真实语料：本机没有 3281559867）");
+  }
+
+  for (const e of pErr) errors.push(e);
+}
+
 if (errors.length) {
   console.error(`verify-camera: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

@@ -716,9 +716,23 @@ export function parseScene(sceneJson, project) {
     }
   }
 
-  // 运行时相机实体（透视场景用；多个时取第一个）。
+  // 运行时相机实体（透视场景用）。
   // 存它的世界位姿与 fov —— buildCamera 据此构视图，而不是顶层编辑器视口快照。
-  const cameraNode = layers.find((l) => l.isCamera)
+  //
+  // [we-scene patch 2026-09-28] **取当前可见的那一台**，不能取第一个。
+  // 3281559867（Kirby Gourmet Race）有 11 台相机实体，作者在每台上写
+  // `visible: {user:{name:"camerastyle", condition:"N"}}`，默认 camerastyle="4"
+  // 只让「Cam Static Middle」可见。取第一个 = 用作者没选的机位（Cam Food：
+  // eye y=11 / z=39.3 / fov 30，而设计位是 y=3.39 / z=29.3 / fov 50）——
+  // 取景整个错位：地面/舞台/看台全在画面外，只剩零散模型浮在黑色里。
+  // 参考引擎同一处也是「按可见性 attach 到相机节点」（SceneObjectParsers.cpp
+  // ParseCameraObj：`if (cam.visible) camera_owner->AttatchNode(node)`，后
+  // attach 的覆盖先 attach 的 ⇒ 等价于「最后一个可见相机」）。
+  // 这里只做 parse 期的静态选择（用户属性 condition 已求出）；脚本驱动的可见性
+  // （Alternating 那对 Alter 相机、切 camerastyle）由 scene-mount 每帧重选，
+  // 见 refreshRuntimeCamera。
+  const cameraNodes = layers.filter((l) => l.isCamera)
+  const cameraNode = cameraNodes.filter((l) => l.visible).pop() || cameraNodes[0]
   const runtimeCamera = cameraNode
     ? {
         eye: cameraNode.origin.slice(),
