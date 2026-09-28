@@ -4494,6 +4494,13 @@ cfg, source, pkgAbort.signal);
             return null;
           },
           cameraTransforms: (scene as any).cameraTransforms,
+          // [we-scene patch 2026-09-28] 效果材质常量动画的**渲染侧**控制器
+          //（脚本 `getEffect(i).getMaterial(j).getAnimation("fade")` 要拿到正在
+          // 推进的那一份，自己 new 一个只是另一个播放头）。见 text.js makeMaterialBag。
+          getConstantAnimation: (def: unknown) =>
+            typeof (renderer as any).getConstantAnimation === "function"
+              ? (renderer as any).getConstantAnimation(def)
+              : null,
           getInitialLayerConfig: (arg: any) => {
             const name = arg && typeof arg === "object" ? arg.name : String(arg || "");
             return (scene.layers as any[]).find((l) => l.name === name) || null;
@@ -4915,6 +4922,19 @@ cfg, source, pkgAbort.signal);
                 ...timerOpts,
                 onError: (e: unknown) =>
                   reportDiag(rt, cfg, `object script '${layer.name}.${field}' 失败: ${String((e as Error).message || e).slice(0, 90)}`),
+                // [we-scene patch 2026-09-28] `layer.emitParticles(n)`：按图层 id 找它的
+                // 粒子系统并一次性爆发 n 颗（见 particles.js emitBurst）。缺失时这条
+                // API 会静默返回 0，而比赛主控脚本每次吃食物都要调它 —— 旧版直接
+                // TypeError，三振熔断后两个角色永不动（3281559867 的动画全灭）。
+                emitParticles: (target: { id?: number }, count: number) => {
+                  const lid = target && target.id;
+                  if (lid === undefined) return 0;
+                  const list = particleSystemsByLayer.get(lid);
+                  if (!list) return 0;
+                  let made = 0;
+                  for (const ps of list) made += ps.emitBurst(count) | 0;
+                  return made;
+                },
               });
               if (sandbox) {
                 propSandboxes.push(sandbox);

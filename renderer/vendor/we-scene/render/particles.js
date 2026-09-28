@@ -199,6 +199,8 @@ class Particle {
   }
 }
 
+const ZERO3 = [0, 0, 0]
+
 export class ParticleSystem {
   constructor(gl, model, override, layer) {
     this.gl = gl
@@ -1988,6 +1990,31 @@ export class ParticleSystem {
       keep.push(b)
     }
     this._bound = keep
+  }
+
+  /**
+   * [we-scene patch 2026-09-28] 脚本一次性爆发 n 颗（WE `layer.emitParticles(n)`）。
+   *
+   * 与 `_burstAt` 的区别：`_burstAt` 放的是**发射器自己声明的** instantaneous 颗
+   * （几何/效果随时间自播用），这里颗数由脚本给（柯比吃食物 20/50 颗、撞击 3/10 颗）。
+   * 位置/方向/尺寸/寿命的随机化完全走 spawn()，与常规发射同源，所以视觉上是
+   * 「该发射器喷了一簇」，不是另画一套。
+   *
+   * 只看常规发射器（`_bound` 是事件子发射器的绑定项，由父粒子事件驱动，不该被脚本引爆）。
+   * 池满时 spawn 返回 null，这里按实际生成数返回，不循环重试（避免脚本里一次 50 颗
+   * 卡住整帧）。
+   */
+  emitBurst(count) {
+    const n = Math.max(0, Math.min(4096, Math.floor(Number(count) || 0)))
+    if (!n) return 0
+    const ems = (this.emitters || []).filter((em) => em && em.kind !== undefined)
+    if (!ems.length) return 0
+    let made = 0
+    for (let i = 0; i < n; i++) {
+      const em = ems[i % ems.length]
+      if (this.spawn(em, ZERO3)) made++
+    }
+    return made
   }
 
   // 在指定基点（本系统局部坐标）爆发：该发射器的 instantaneous 颗全放出去

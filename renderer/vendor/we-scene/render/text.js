@@ -359,6 +359,20 @@ const WEVECTOR = {
     y: (a.y || 0) + ((b.y || 0) - (a.y || 0)) * t,
     z: (a.z || 0) + ((b.z || 0) - (a.z || 0)) * t,
   }),
+  // [we-scene patch 2026-09-28] `vectorAngle2`：两向量夹角（**带符号**，绕 y 轴），
+  // 单位与 WE 的 angles 一致（度）。Free Cam by Gariam 用它把鼠标位移转成偏航增量
+  // （`rotateAngles(axis, WEVector.vectorAngle2(a, b))`），缺失即 TypeError 熔断。
+  // 实现：先按 x-z 平面投影算夹角，再按叉积的 y 分量判正负。
+  vectorAngle2: (a, b) => {
+    const ax = a.x || 0, az = a.z || 0
+    const bx = b.x || 0, bz = b.z || 0
+    const la = Math.hypot(ax, az) || 1
+    const lb = Math.hypot(bx, bz) || 1
+    const cos = Math.max(-1, Math.min(1, (ax * bx + az * bz) / (la * lb)))
+    const ang = (Math.acos(cos) * 180) / Math.PI
+    const cross = ax * bz - az * bx
+    return cross < 0 ? -ang : ang
+  },
 }
 
 // [we-scene patch] WE 的媒体播放状态枚举。取值由语料反推确定：
@@ -1331,13 +1345,82 @@ function makeBoneApi(layer, overrides) {
  * 写 visible 直接落到 layer.effects[i].visible，渲染端每帧 `filter(e => e.visible)`
  * 读它，下一帧即生效。
  */
-function makeEffectHandle(eff) {
+/**
+ * [we-scene patch 2026-09-28] 效果 pass 的「材质常量袋」。
+ *
+ * `IThisSceneObject.getEffect(i).getMaterial(j)` 在 WE 里返回该 pass 的材质句柄：
+ * 既读写材质常量，也能按**动画名**取到材质上的关键帧动画
+ * （3281559867 的越界保险丝：
+ *   `thisScene.getLayer("Fade").getEffect(0).getMaterial(0).getAnimation("fade").play()`）。
+ *
+ * 旧实现 `getMaterial: () => null` —— 全库 5 处调用全在这一张，每帧 TypeError，
+ * **三次就把 `kirby.origin`/`dedede.origin` 熔断**：两个角色跑出场地后保险丝一响，
+ * 整场比赛的脚本就永久死了（分数停在那一刻、两人定在原地）。
+ *
+ * 读回写成 `{value}` 解包（与脚本 API 的单值语义一致），写回落到同一处，
+ * 渲染侧 `bindConstants` 当帧读到；找不到的动画名返回中性对象（**永不返回 null**）。
+ */
+function makeMaterialBag(constants, opts) {
+  if (!constants) return null
+  return new Proxy(constants, {
+    get(target, prop) {
+      if (prop === 'getAnimation') {
+        return (name) => {
+          const want = String(name)
+          for (const [key, v] of Object.entries(target)) {
+            if (!v || typeof v !== 'object' || !v.animation) continue
+            const an = v.animation.options && v.animation.options.name
+            if (key !== want && an !== want) continue
+            const ctrl = opts && typeof opts.getConstantAnimation === 'function'
+              ? opts.getConstantAnimation(v.animation)
+              : null
+            if (ctrl) return ctrl
+            // 定义有了但渲染侧还没建控制器（当帧未绘制到）：退中性对象，别抛
+            return makeNeutralAnimation()
+          }
+          return makeNeutralAnimation()
+        }
+      }
+      if (typeof prop === 'symbol') return target[prop]
+      const v = target[prop]
+      if (v && typeof v === 'object' && !Array.isArray(v) && 'value' in v) {
+        const raw = v.value
+        // Vec3 常量（color 之类）在 WE 里是对象；保持对象形态交给脚本
+        return raw != null && typeof raw === 'object' ? raw : raw
+      }
+      return v
+    },
+    set(target, prop, value) {
+      if (typeof prop === 'symbol') { target[prop] = value; return true }
+      const cur = target[prop]
+      if (cur && typeof cur === 'object' && !Array.isArray(cur) && 'value' in cur) cur.value = value
+      else target[prop] = value
+      return true
+    },
+  })
+}
+
+function makeEffectHandle(eff, opts) {
   return {
     get visible() { return eff ? !!eff.visible : false },
     set visible(v) { if (eff) eff.visible = !!v },
     get name() { return (eff && eff.name) || '' },
-    // 语料里没见到别的成员，但保持链式安全
-    getMaterial: () => null,
+    /**
+     * IMaterial getMaterial(index)：该效果的**第 index 个 pass** 的常量袋。
+     * pass 列表按 `eff.materialPasses`（渲染侧解析出的实际 pass）；取不到时给
+     * 一个可读写的临时袋（脚本不判空，返回 null 会 TypeError 熔断整段脚本）。
+     */
+    getMaterial(index) {
+      const passes = eff && Array.isArray(eff.materialPasses) ? eff.materialPasses : null
+      let mp = passes ? passes[Number(index)] : null
+      // 还没解析出 materialPasses（或该效果没有 pass 记录）时，退化到
+      // 场景数据里那条 pass 的 constantshadervalues —— 脚本读写的就是它。
+      if (!mp && eff && Array.isArray(eff.passes)) mp = eff.passes[Number(index)] || null
+      if (!mp) return null
+      mp.constantshadervalues = mp.constantshadervalues || {}
+      const bag = makeMaterialBag(mp.constantshadervalues, opts)
+      return bag || mp.constantshadervalues
+    },
   }
 }
 
@@ -1779,17 +1862,30 @@ function makeObjectLayerProxy(layer, opts) {
       else if (typeof key === "string" && /^\d+$/.test(key)) target = al[Number(key)] || null
       else if (typeof key === "string") target = al.find((x) => x && x.name === key) || null
       if (target) {
-        return {
+        // [we-scene patch 2026-09-28] IAnimationLayer 的完整面：
+        //   · setFrame(n)：把该 clip 的播放头钉到第 n 帧（WE 攻击/受击脚本常用
+        //     `getAnimationLayer("Attack Hammer").setFrame(5)` 起手）；
+        //   · getAnimation(name)：返回该层里**命名的动画**控制器（"go"/"appear"/
+        //     "fade"…）。本仓一条 animationlayer 就是一个 clip，子动画名即它本身，
+        //     所以直接返回同一个包装器 —— play/pause/setFrame/isPlaying 语义一致。
+        //   缺这两条时 3281559867 的 `getAnimationLayer("Trip").getAnimation("go").play()`
+        //   每帧 TypeError（全库 82 处调用，全都在这张），主控脚本三振熔断 ⇒ 两个角色
+        //   永远不动。
+        const ctrl = {
           play: () => target.play?.(),
           pause: () => target.pause?.(),
           stop: () => target.stop?.(),
+          setFrame: (f) => target.setFrame?.(f),
           isPlaying: () => target.playing !== false && !target.paused,
+          get frame() { return target.clock && typeof target.clock.frame === "number" ? target.clock.frame : null },
           get visible() { return target.visible !== false },
           set visible(v) { target.visible = !!v },
           get rate() { return target.rate ?? 1 },
           set rate(v) { target.rate = Number(v) || 1 },
           get name() { return target.name || "" },
         }
+        ctrl.getAnimation = () => ctrl
+        return ctrl
       }
       // 回落到属性动画控制器（旧调用方：数字索引的字段动画）
       const map = layer && layer.animations
@@ -1858,14 +1954,34 @@ function makeObjectLayerProxy(layer, opts) {
       return { m }
     },
     // 见 makeEffectHandle：名字或索引取效果，取不到也返回句柄（脚本不判空）
+    /**
+     * [we-scene patch 2026-09-28] `ILayer.emitParticles(count)`（WE 官方 API，
+     * IThisSceneObject 也有）：在粒子层上一次性爆发 count 颗。
+     *
+     * 为什么必须实现：3281559867 的比赛主控脚本（kirby/dedede/Food 的 origin）
+     * 每次吃食物/撞块都调它 —— 缺失时 `thisScene.getLayer("Food_Sparkles_K")
+     * .emitParticles is not a function` 每帧 TypeError，三振之后**整个 update 熔断**，
+     * 于是两个角色永远停在原地、状态机永不推进（「动画完全不对」的真根因）。
+     * 宿主经 opts.emitParticles 提供实现（scene-mount 里按 layer.id 找粒子系统）；
+     * 没接上时静默 0 —— 与其它"未接线 API"同约定，绝不抛。
+     */
+    emitParticles: (count) => {
+      try {
+        const fn = opts && opts.emitParticles
+        if (typeof fn !== 'function' || !layer) return 0
+        return fn(layer, count) | 0
+      } catch {
+        return 0
+      }
+    },
     getEffect: (key) => {
       const list = (layer && layer.effects) || null
-      if (!list || list.length === 0) return makeEffectHandle(null)
+      if (!list || list.length === 0) return makeEffectHandle(null, opts)
       if (typeof key === 'number' || (typeof key === 'string' && /^\d+$/.test(key))) {
-        return makeEffectHandle(list[Number(key)] || null)
+        return makeEffectHandle(list[Number(key)] || null, opts)
       }
       const name = String(key)
-      return makeEffectHandle(list.find((e) => e && e.name === name) || null)
+      return makeEffectHandle(list.find((e) => e && e.name === name) || null, opts)
     },
     // [we-scene patch] IMaterial getMaterial(index)（1712475860 Dino Run：
     // applyUserProperties 按关卡改 godrays pass 的 raythreshold/rayintensity）。

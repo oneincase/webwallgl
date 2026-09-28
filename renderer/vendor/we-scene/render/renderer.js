@@ -1922,6 +1922,10 @@ export function createRenderer(canvas, opts = {}) {
   //（旧序：animatedConstants 在外层后跑），getAnimationForProperty 落空拿到
   // 中性哑对象，play() 静默丢失，startpaused 的淡入永远停在 alpha 0 ——
   // 歌名/歌手/专辑整行不显示，且无任何报错。
+  // [we-scene patch 2026-09-28] 动画定义对象 → 控制器。脚本 API
+  // `getEffect(i).getMaterial(j).getAnimation("fade")` 要拿到**同一个**控制器
+  //（自己 new 一个只是另一个播放头，play() 影响不到渲染那一份）。
+  const constAnimByDef = new WeakMap()
   function ensureConstAnimRecs(constants, cacheKey, time) {
     if (!constants) return
     for (const [key, v] of Object.entries(constants)) {
@@ -1934,6 +1938,7 @@ export function createRenderer(canvas, opts = {}) {
         ctrl.baseNumeric = Array.isArray(raw) ? raw.slice() : raw
         rec = { ctrl, prevTime: time }
         constAnimCache.set(sk, rec)
+        if (v.animation && typeof v.animation === 'object') constAnimByDef.set(v.animation, ctrl)
       }
     }
   }
@@ -1960,6 +1965,7 @@ export function createRenderer(canvas, opts = {}) {
         ctrl.baseNumeric = Array.isArray(raw) ? raw.slice() : raw
         rec = { ctrl, prevTime: time }
         constAnimCache.set(sk, rec)
+        if (v.animation && typeof v.animation === 'object') constAnimByDef.set(v.animation, ctrl)
       }
       siblings.set(key, rec.ctrl)
     }
@@ -4534,6 +4540,12 @@ export function createRenderer(canvas, opts = {}) {
       }
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
       return out
+    },
+    // [we-scene patch 2026-09-28] 效果常量动画控制器（按动画**定义对象**查）。
+    // 给脚本 API `IMaterial.getAnimation(name)` 用（见 text.js makeEffectHandle）：
+    // 返回渲染侧正在推进的那个控制器，play()/setFrame() 才真的作用到画面。
+    getConstantAnimation: function (def) {
+      return def && constAnimByDef.get(def) ? constAnimByDef.get(def) : null
     },
     // [we-scene patch] 注入 puppet 网格绘制回调：fn(layer, mvp, { time })
     // 由宿主用 MDL 渲染器实现；puppet 图层按自身 z 序参与图层循环与效果链。
