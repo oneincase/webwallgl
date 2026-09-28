@@ -3,6 +3,34 @@
 // computeSkinMatrices 是 verify-groups I4 区块的直接被测对象。
 import { mat4Mul, mat4Invert, composeTRS } from './mdl-math.js'
 
+/**
+ * [we-scene patch 2026-09-28] 本动画层的采样时间（秒）。
+ *
+ * 默认（脚本没碰过）与历史行为逐位一致：`场景时间 × rate`。
+ * 脚本一旦调过 play()/pause()/setFrame()（WE 的
+ * `thisLayer.getAnimationLayer("Attack").getAnimation("go").play()`），改用该层
+ * **自己的帧号**推进：帧号按 `dt × rate × fps` 增长，采样时间 = 帧号 / fps。
+ *
+ * 为什么非做不可：`single` clip 在绝对时钟下会被 clamp 到末帧 —— 作者用 `play()`
+ * 表达「从现在开始播这段」（攻击/受击/入场都是 single + startpaused），绝对时钟
+ * 下表现为**立刻停在收势**，整场动画退化成定格。3281559867 的跑动/撞击/攻击全灭
+ * 就是这个（脚本还被三振熔断，见 emitParticles）。
+ *
+ * clock 字段语义见 scene/parse.js 的 animationLayers 注释：
+ *   frame = null → 首次采样按绝对时钟接手（只 pause 未 play 的层，姿势不跳变）
+ *   anchor = -1 → 本帧重新锚定，不重置帧号（play/setFrame 后的第一帧）
+ */
+function clipLocalTime(L, time) {
+  const clip = L.clip
+  const c = clip && clip.clock
+  if (!c) return time * L.rate
+  const fps = L.anim && L.anim.fps > 0 ? L.anim.fps : 30
+  if (c.frame === null || c.frame === undefined) c.frame = time * L.rate * fps
+  else if (c.anchor >= 0 && clip.paused !== true) c.frame += (time - c.anchor) * L.rate * fps
+  c.anchor = time
+  return c.frame / fps
+}
+
 // 在 time（秒）处求 anim 某轨的 TRS 分量，写入 out9 = [tx,ty,tz, rx,ry,rz, sx,sy,sz]。
 // 拆出 TRS（不直接出矩阵）是为了让多条动画层能按 WE 语义在 TRS 空间叠加/加权。
 // [we-scene patch] 槽位语义修正：k[3..5] 是**欧拉角**、k[6..8] 是**三轴缩放**。
@@ -173,7 +201,7 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
       //（3396722575 错帧机制：init 停掉错位层、帧事件到达再 play）。
       if (l.playing === false) continue
       const a = mdl.animations.find((x) => x.id === l.animation)
-      if (a) layers.push({ anim: a, additive: !!l.additive, blend: typeof l.blend === 'number' ? l.blend : 1, rate: typeof l.rate === 'number' ? l.rate : 1 })
+      if (a) layers.push({ anim: a, additive: !!l.additive, blend: typeof l.blend === 'number' ? l.blend : 1, rate: typeof l.rate === 'number' ? l.rate : 1, clip: l })
     }
   }
   // [we-scene patch] 标记「零动画且无覆写」：draw 仍按 identitySkin 走（绑定姿势蒙皮
@@ -232,7 +260,7 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
       // 那不是任何参考姿势 —— 非 additive 会把骨混向原点、additive 会叠出
       // (恒等−参考) 的垃圾增量。跳过 = 该骨保持此前的 acc（绑定/其它层）。
       if (!track || !track.keyframes.length) continue
-      sampleTrackTRS(track, L.anim, time * L.rate, smp)
+      sampleTrackTRS(track, L.anim, clipLocalTime(L, time), smp)
       const w = L.blend
       if (L.additive) {
         // 增量参考 = **本轨道自己的首关键帧**（clip 的参考姿势），不是绑定姿势。

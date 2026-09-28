@@ -4432,6 +4432,11 @@ cfg, source, pkgAbort.signal);
       // [we-scene patch] animationlayers[].visible 脚本（puppet clip 层开关，
       // 24 段/8 张）：init 停错位层、帧事件 play；visible 返回值折叠后控制该层。
       const animLayerScriptRuns: Array<{ layer: any; index: number; sandbox: any }> = [];
+      // [we-scene patch 2026-09-28] animationlayers[].blend/rate 的脚本形态
+      //（blend 是 clip 权重：0→1 淡入；rate 是播放倍速）。见 parse.js 的字段注释。
+      const animLayerFieldRuns: Array<{ layer: any; index: number; field: "blend" | "rate"; sandbox: any }> = [];
+      // blend 的**关键帧动画**形态（Attack/Bump 这类「按事件起停的短曲线」）
+      const animLayerBlendAnims: Array<{ layer: any; index: number; field: "blend"; ctrl: any }> = [];
       const generalAnimRuns: Array<{ field: string; ctrl: any; write: (v: unknown) => void }> = [];
       const sceneNamedAnims: Record<string, any> = {};
       // 效果开关脚本（effects[i].visible.script）：逐帧决定该效果是否参与渲染
@@ -4795,6 +4800,81 @@ cfg, source, pkgAbort.signal);
             }
           } catch (e) {
             reportDiag(rt, cfg, `animationlayer script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+          }
+        });
+      }
+      // [we-scene patch 2026-09-28] animationlayers[].blend / .rate 的脚本与动画。
+      // 与 visible 脚本同一套沙箱装配（init 收当前值、animationEvent 进 sinks），
+      // 差别只是逐帧写回 blend/rate 而不是 visible。
+      for (const layer of scene.layers as any[]) {
+        const als = Array.isArray(layer.animationLayers) ? layer.animationLayers : [];
+        als.forEach((al: any, index: number) => {
+          for (const field of ["blend", "rate"] as const) {
+            const def = field === "blend" ? al.blendScript : al.rateScript;
+            if (!def) continue;
+            try {
+              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+                canvasSize: { width: objProjW, height: objProjH },
+                timeOfDay: timeOfDayValue,
+                userProperties: objUserProps,
+                audioViews,
+                inputView,
+                layer,
+                ...timerOpts,
+                ...sceneApi,
+                shared: textShared,
+                storage: sceneStorage,
+                onError: (e: unknown) =>
+                  reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+              });
+              if (!sandbox) continue;
+              propSandboxes.push(sandbox);
+              const cur = Number(al[field]);
+              const ir = sandbox.init(Number.isFinite(cur) ? cur : field === "blend" ? 1 : 1);
+              const f0 = typeof ir === "number" ? ir : Number((ir as any)?.value);
+              if (Number.isFinite(f0)) al[field] = f0;
+              sandbox.applyUserProperties(objUserProps);
+              if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+              registerResizeHook(sandbox);
+              animLayerFieldRuns.push({ layer, index, field, sandbox });
+              // 关键：clip 的帧事件要能进这个脚本的 animationEvent
+              //（Trip 的 end → `shared.kirbystate = 0`）
+              if (sandbox.hasAnimEventHook) {
+                registerAnimEventSink(layer, { sandbox, kind: "animLayerField", animLayerIndex: index, field });
+              }
+            } catch (e) {
+              reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+            }
+          }
+          // blend 的关键帧动画形态（Attack/Bump/Trip：一段 single 曲线，权重 0→1→0）
+          const ba = al.blendAnimation;
+          if (ba && ba.animation) {
+            try {
+              const ctrl = anim.createAnimation(ba.animation);
+              ctrl.baseNumeric = Number.isFinite(Number(ba.value)) ? Number(ba.value) : 0;
+              animLayerBlendAnims.push({ layer, index, field: "blend", ctrl });
+              // [we-scene patch 2026-09-28] **把 blend 曲线挂到该动画层上**：
+              // 作者写 `getAnimationLayer("Bump").getAnimation("go").play()` 的意思是
+              // 「从现在开始播这一段」，而这一段 = clip + blend 曲线。曲线是
+              // `startpaused`（等 play），不联动的话它永远停在首帧 —— 后果不只是
+              // 权重不动：**帧事件 `recover` 永不触发**，`shared.kirbystate` 卡在 1
+              //（撞人）或 2（绊倒），角色带着击退速度一直滑出场地、分数停住。
+              const origPlay = al.play ? al.play.bind(al) : null;
+              al.play = function () {
+                if (origPlay) origPlay();
+                try {
+                  if (typeof ctrl.setFrame === "function") ctrl.setFrame(0);
+                  if (typeof ctrl.play === "function") ctrl.play();
+                  else ctrl.playing = true;
+                } catch { /* 控制器形态差异不致命 */ }
+              };
+              // init 里可能已经 play 过一次（装配顺序：可见性脚本先跑），补一次起播
+              if (al.playing !== false && typeof ctrl.play === "function") {
+                try { ctrl.play() } catch { /* 忽略 */ }
+              }
+            } catch (e) {
+              reportDiag(rt, cfg, `animationlayer blend animation '${layer.name}[${index}]' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+            }
           }
         });
       }
@@ -5483,6 +5563,16 @@ cfg, source, pkgAbort.signal);
                   if (sink.run && (typeof ret === "boolean" || (typeof ret === "number" && Number.isFinite(ret)))) sink.run.last = ret;
                   const folded = foldVisibleRet(ret);
                   if (folded !== undefined) sink.effect.visible = folded;
+                } else if (sink.kind === "animLayerField") {
+                  // animationlayers[].blend / .rate 脚本的 animationEvent：
+                  // 当前值从该层的对应字段读，返回数字写回（Trip 的 end → kirbystate 复位
+                  // 就是在这里面做的）
+                  const al = layer.animationLayers?.[sink.animLayerIndex];
+                  if (!al) continue;
+                  const cur = Number(al[sink.field]);
+                  const ret = sb.callAnimationEvent(ev, Number.isFinite(cur) ? cur : 1);
+                  const n = typeof ret === "number" ? ret : Number(ret && ret.value);
+                  if (Number.isFinite(n)) al[sink.field] = sink.field === "blend" ? Math.max(0, Math.min(1, n)) : n;
                 } else if (sink.kind === "const") {
                   const ret = sb.callAnimationEvent(ev, (sb as any).__lastConstValue);
                   if (typeof ret === "number" && Number.isFinite(ret)) (sb as any).__lastConstValue = ret;
@@ -5582,6 +5672,31 @@ cfg, source, pkgAbort.signal);
             const out = run.sandbox.callUpdate(al.visible !== false);
             const f = foldVisibleRet(out);
             if (f !== undefined) al.visible = f;
+          }
+          // [we-scene patch 2026-09-28] blend / rate 脚本逐帧求值（蒙皮前）
+          for (const run of animLayerFieldRuns) {
+            if (run.sandbox.disabled) continue;
+            run.sandbox.engine.frametime = animDt;
+            run.sandbox.engine.runtime = t;
+            run.sandbox.engine.timeOfDay = timeOfDayValue;
+            const al = run.layer.animationLayers?.[run.index];
+            if (!al) continue;
+            const cur = Number(al[run.field]);
+            const out = run.sandbox.callUpdate(Number.isFinite(cur) ? cur : 1);
+            const n = typeof out === "number" ? out : Number((out as any)?.value);
+            if (!Number.isFinite(n)) continue;
+            al[run.field] = run.field === "blend" ? Math.max(0, Math.min(1, n)) : n;
+          }
+          // blend 关键帧动画：推进 + 事件（事件要派给该层脚本）
+          for (const run of animLayerBlendAnims) {
+            const al = run.layer.animationLayers?.[run.index];
+            if (!al) continue;
+            run.ctrl.advance(clockDt);
+            const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
+            const n = Array.isArray(out) ? Number(out[0]) : Number(out);
+            if (Number.isFinite(n)) al.blend = Math.max(0, Math.min(1, n));
+            const evs = run.ctrl.takeEvents();
+            if (evs.length) dispatchAnimEvents(run.layer, evs);
           }
           for (const run of overrideScriptRuns) {
             if (run.sandbox.disabled) continue;

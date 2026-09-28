@@ -1780,6 +1780,114 @@ const kf = (frame, value, front, back) => ({
   for (const e of pErr) errors.push(e);
 }
 
+// ---------- 动画层播放时钟：play()/pause()/setFrame()（3281559867）----------
+//
+// 背景：puppet 的 animationlayers 采样时间原本恒为「场景时间 × rate」，脚本拿不到
+// 自己的播放头。作者写 `thisLayer.getAnimationLayer("Attack").getAnimation("go").play()`
+// 表达的是「**从现在开始**播这段攻击动画」（这类 clip 都是 mode:"single" + startpaused），
+// 而 single 在绝对时钟下会被 clamp 到**末帧** —— 于是 play() 表现为立刻停在收势，
+// 跑动/撞击/攻击/受击全部退化成定格（3281559867「动画完全不对」的主因之一）。
+//
+// 判据全部走**真实产物**：animationlayers 对象来自 parseScene（不是本文件重写的仿制品），
+// 采样走 computeSkinMatrices 的输出；期望值用「把时钟钉到第 n 帧」的同一函数取，
+// 不比对具体数值、只比对姿态等价，因此不受绑定姿势/父链细节影响。
+{
+  const pErr = [];
+  const { computeSkinMatrices } = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
+  const pkgPath = `${LIB}/3640755971/scene.pkg`;
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const dec = new TextDecoder();
+    const scene = JSON.parse(dec.decode(getEntry(pkg, "scene.json")));
+    const obj = (scene.objects || []).find((o) => o.id === 224);
+    const imgEntry = obj && obj.image ? getEntry(pkg, obj.image) : null;
+    const mdlPath = imgEntry ? JSON.parse(dec.decode(imgEntry)).puppet : null;
+    const mdl = mdlPath ? parseMDL(getEntry(pkg, mdlPath)) : null;
+    if (!mdl || !mdl.animations || !mdl.bones.length) {
+      pErr.push("语料缺失：播放时钟判据拿不到模型");
+    } else {
+      // 造一个线性可观察的轨道：第 f 帧的骨 0 平移 x = f（21 帧 / 10fps / single）
+      const FRAMES = 21;
+      const anim = mdl.animations[0];
+      anim.mode = "single";
+      anim.fps = 10;
+      anim.frameCount = FRAMES;
+      anim.tracks = mdl.bones.map((_, i) => ({
+        frameCount: FRAMES,
+        keyframes: Float32Array.from(
+          Array.from({ length: FRAMES }, (_, f) => (i === 0 ? [f, 0, 0, 0, 0, 0, 1, 1, 1] : [0, 0, 0, 0, 0, 0, 1, 1, 1])).flat(),
+        ),
+      }));
+      // 用 parseScene 产出**真实**的 animationlayer 对象（play/pause/setFrame/clock 都在它身上）
+      const liteScene = parseScene(
+        {
+          objects: [
+            { id: 1, name: "p", model: mdlPath, origin: "0 0 0", scale: "1 1 1", angles: "0 0 0",
+              animationlayers: [{ animation: anim.id, name: "Run", rate: 1, blend: 1, visible: true }] },
+          ],
+          general: {},
+        },
+        null,
+      );
+      const clip = liteScene.layers[0].animationLayers[0];
+      if (!clip || typeof clip.play !== "function" || typeof clip.setFrame !== "function") {
+        pErr.push("animationlayers 缺少 play()/setFrame()（脚本 API 面回归）");
+      } else {
+        const poseAt = (ls, t) => Array.from(computeSkinMatrices(mdl, t, ls, null));
+        const same = (a, b) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 1e-4);
+        // 参考姿态：把时钟直接钉在第 f 帧（对照组自己造，不依赖被测语义）
+        const pinned = (f) => {
+          const c = { ...clip, visible: true, playing: true, paused: false, clock: { frame: f, anchor: -1 } };
+          return poseAt([c], 3.7);
+        };
+        // ① 未被脚本碰过 = 绝对时钟（历史行为逐位不变）：t=5s × 10fps = 第 50 帧 → single 夹到末帧
+        const legacy = { ...clip, clock: null, visible: true, playing: true, paused: false };
+        if (!same(poseAt([legacy], 5), pinned(FRAMES - 1))) {
+          pErr.push("绝对时钟路径变了：未接管时 t=5s 应等于第 20 帧（single 夹到末帧）");
+        }
+        // ② play() = **从头**播这一段（不是停在末帧）
+        clip.play();
+        if (!same(poseAt([clip], 5), pinned(0))) {
+          pErr.push("play() 没有复位到第 0 帧（攻击/受击/入场会立刻停在收势）");
+        }
+        // ③ 播放在推进：0.5s × 10fps = 第 5 帧
+        if (!same(poseAt([clip], 5.5), pinned(5))) {
+          pErr.push("play() 之后帧号没有按 rate×fps 推进");
+        }
+        // ③b **推进中再 play() 也要回到第 0 帧**（作者靠这一条重放攻击；只测「首次 play
+        //     时 clock 恰好是新建的 0」会漏掉「play 不复位」的实现）
+        clip.play();
+        if (!same(poseAt([clip], 6), pinned(0))) {
+          pErr.push("play() 在推进中没有复位到第 0 帧（重放攻击/受击会接着上一段播）");
+        }
+        // ④ setFrame(n) = 精确定位（作者用它起手：`setFrame(5)`）
+        clip.setFrame(7);
+        if (!same(poseAt([clip], 9), pinned(7))) {
+          pErr.push("setFrame(n) 没有把播放头钉到第 n 帧");
+        }
+        // ⑤ pause() 冻结：之后再过 3 秒姿态不变
+        clip.play();
+        clip.pause();
+        const frozen = poseAt([clip], 12);
+        if (!same(poseAt([clip], 15), frozen)) {
+          pErr.push("pause() 之后姿态仍在推进（没有冻结）");
+        }
+        // ⑥ stop() 回到「不参与蒙皮」，再 play() 仍从第 0 帧开始
+        clip.stop();
+        if (!clip.clock === null) { /* stop 后 clock 清空，允许重建 */ }
+        clip.play();
+        if (!same(poseAt([clip], 20), pinned(0))) {
+          pErr.push("stop() → play() 之后没有从第 0 帧重新开始");
+        }
+      }
+    }
+  } else {
+    console.log("  （跳过动画播放时钟判据：本机没有 3640755971 语料）");
+  }
+  for (const e of pErr) errors.push(e);
+}
+
 if (errors.length) {
   console.error(`verify-animation: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);
