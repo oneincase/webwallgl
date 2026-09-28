@@ -5000,8 +5000,19 @@ cfg, source, pkgAbort.signal);
                 // 五个 eval 点统一走 engineTimers（SCENESCRIPT-PLAN P1-1），
                 // 句柄语义与卸载 dispose 见 render/engine-timers.js。
                 ...timerOpts,
-                onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `object script '${layer.name}.${field}' 失败: ${String((e as Error).message || e).slice(0, 90)}`),
+                onError: (e: unknown) => {
+                  // [we-scene patch 2026-09-28] 带上出错行：脚本被拼进 new Function
+                  // 后行号与源文件一一对应（transform 只剥 import/export 与撞名声明），
+                  // 没有它只能靠现象反推（本轮 Free Cam 就是靠这一条定位到具体调用的）。
+                  const stack = (e as Error)?.stack ? String((e as Error).stack).split("\n") : [];
+                  const where = stack.find((l) => /<anonymous>:\d+/.test(l)) || "";
+                  const loc = (where.match(/<anonymous>:(\d+)/) || [])[1];
+                  reportDiag(
+                    rt,
+                    cfg,
+                    `object script '${layer.name}.${field}' 失败: ${String((e as Error).message || e).slice(0, 90)}${loc ? ` @line ${loc}` : ""}`,
+                  );
+                },
                 // [we-scene patch 2026-09-28] `layer.emitParticles(n)`：按图层 id 找它的
                 // 粒子系统并一次性爆发 n 颗（见 particles.js emitBurst）。缺失时这条
                 // API 会静默返回 0，而比赛主控脚本每次吃食物都要调它 —— 旧版直接
@@ -5194,6 +5205,11 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt, cfg, `object scripts: ${objectScriptRuns.length}`);
         // 调试出口：读/改对象脚本的实时字段值（音条 scale 等）
         (window as unknown as Record<string, unknown>).__objScripts = objectScriptRuns;
+        // [we-scene patch 2026-09-28] 调试出口：场景脚本共享状态（WE 的 `shared` 全局）。
+        // 排查「脚本在跑但状态机不动」类问题必需 —— 全库 100+ 张壁纸用 shared 传状态
+        //（3281559867 的 kirbystate/dededestate/foodx… 就是整场比赛的寄存器），
+        // 没有它只能靠画面反推。只读出口，与 __scene/__objScripts 同约定。
+        (window as unknown as Record<string, unknown>).__shared = textShared;
         // 调试出口：效果开关脚本队列（run.last = 未折叠的淡出进度，A/B 验证用）
         (window as unknown as Record<string, unknown>).__effectScripts = effectVisibleRuns;
       }
