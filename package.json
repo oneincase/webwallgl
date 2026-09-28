@@ -43,6 +43,7 @@
     "verify:web": "node scripts/verify-web.mjs",
     "verify:resolution": "node scripts/verify-resolution.mjs",
     "verify:quality": "node scripts/verify-quality.mjs",
+    "verify:occlusion": "node scripts/verify-occlusion.mjs",
     "verify": "node scripts/verify-all.mjs",
     "verify:all": "node scripts/verify-all.mjs --all",
     "check": "npm run typecheck && node scripts/verify-arch.mjs && npm run verify",

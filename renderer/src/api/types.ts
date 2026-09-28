@@ -397,6 +397,15 @@ export type MountOptions = {
    */
   mountTimeoutMs?: number;
 
+  /**
+   * 遮挡分档配置（V5，可选）。宿主用 `setOcclusion()` 推遮挡矩形时按这套
+   * 阈值分档（暂停 / 降帧 / 全量）；缺省全默认（见 OcclusionBands）。
+   * 传 `false` 显式关闭：之后 `setOcclusion()` 静默无效（什么都不改）。
+   * **不传或传配置对象都不改变默认行为** —— 没有推送就没有降载，
+   * 不推遮挡的宿主与引入本功能前逐字节一致。
+   */
+  occlusion?: OcclusionBands | false;
+
   /** 诊断回调。替代旧的 GET /diag 上报 */
   onDiagnostic?: SceneEvents["diagnostic"];
   /** 装配或渲染失败。库不自带降级页，由调用方决定怎么兜 */
@@ -409,6 +418,74 @@ export type MountOptions = {
 export type FrameStats = {
   fps: number;
   running: boolean;
+  /**
+   * 遮挡暂停中（setOcclusion 推送的可见比例低于暂停阈值）：渲染循环已停、
+   * 画面停在最后一帧。与用户 pause() 的区别：宿主撤掉遮挡载荷即自动恢复，
+   * 不需要 resume()。stats 里显式带出，宿主看门狗才不会把「主动暂停」误判成故障。
+   */
+  occluded?: boolean;
+  /** 遮挡降帧中（可见比例处于中/重降载档，帧率上限被压低） */
+  throttled?: boolean;
+};
+
+// ---- 遮挡感知降载（V5）：宿主推遮挡矩形，库内算覆盖率分档 ----
+
+/** 遮挡矩形：画布 CSS 像素、左上原点。四元组 [x, y, w, h] 或对象形态都收 */
+export type OcclusionRectLike = [number, number, number, number] | { x: number; y: number; w: number; h: number };
+
+/** 归一化后的遮挡矩形（库内部统一形态：四元组） */
+export type OcclusionRect = [number, number, number, number];
+
+/**
+ * 一次遮挡推送。宿主枚举上层窗口矩形、换算到壁纸窗口的 CSS 像素空间后推给
+ * `setOcclusion()`；推送频率与去抖由宿主决定（建议变化才推、30~50ms 合并，
+ * **且需 ≤2s 心跳重推当前态** —— 库的 fail-open 以「3s 无推送」为准，纯
+ * 变化才推会在静态遮挡 3s 后被误判失联恢复全量，下次变化再暂停来回抖动）。
+ *
+ * - `occluders`：遮挡矩形列表（空数组 = 完全可见）
+ * - `ratio`：宿主侧算好的**可见比例** 0..1（可选；缺省库内用遮挡分解的精确
+ *   可见比例，见 occlusion.ts 头注 —— 网格覆盖率只作对照读数）
+ * - `epoch`/`gen`：宿主会话 id 与会话内单调序号。`epoch` 变化或 `gen` 回退
+ *   视为宿主重启，库整体重置跟踪状态（防新会话的载荷被当乱序丢弃）
+ * - **fail-open**：超过 3 秒没有新推送，库自动恢复全量渲染（宿主崩溃/通道
+ *   断连不能把壁纸冻在暂停态）
+ */
+export type OcclusionPayload = {
+  occluders: OcclusionRectLike[];
+  ratio?: number;
+  epoch?: number | string;
+  gen?: number;
+};
+
+/**
+ * 遮挡分档配置（缺省键按默认值补全）。阈值语义为**可见比例**（越小遮得越狠）：
+ * `≤pause`（默认 0.05，对齐 Lively Grid 算法 95% 覆盖暂停）→ 暂停；
+ * `≤heavy`（默认 0.30）→ 压到 heavyFps（默认 24）；
+ * `≤light`（默认 0.70）→ 压到 lightFps（默认 40）；其余全量。
+ * 档位切换带滞回（默认 5pp）与最小驻留（默认 400ms），拖动窗口不会抖档。
+ * fps 档位下限 20：低于它粒子/脚本与骨骼动画会肉眼可辨地失步（双时钟约束）。
+ */
+export type OcclusionBands = {
+  pause?: number;
+  heavy?: number;
+  light?: number;
+  heavyFps?: number;
+  lightFps?: number;
+  /** 滞回量（0..0.15，比例点） */
+  hysteresis?: number;
+  /** 档位切换最小驻留（0..2000ms） */
+  dwellMs?: number;
+};
+
+/** 三档齐全的规范化结果（normalizeOcclusionConfig 的输出，库内部用） */
+export type OcclusionBandConfig = {
+  pause: number;
+  heavy: number;
+  light: number;
+  heavyFps: number;
+  lightFps: number;
+  hysteresis: number;
+  dwellMs: number;
 };
 
 export type SceneInstance = {
@@ -435,6 +512,22 @@ export type SceneInstance = {
   setVideoTexScale(scale: number): void;
   /** 当前请求的倍率（0 = 自动） */
   getVideoTexScale(): number;
+
+  /**
+   * 遮挡推送（V5）：把宿主算好的遮挡矩形列表喂给库，库按 `MountOptions.occlusion`
+   * 的分档配置自动暂停/降帧/恢复（见 OcclusionPayload 的字段契约与 fail-open 语义）。
+   *
+   * - 传 `null` 或不再推送：恢复全量渲染（与 fail-open 同语义）
+   * - 降帧覆盖面：scene 与 GL/WebCodecs 媒体由渲染循环逐帧收敛；web 壁纸经
+   *   shim setFps 推送（**尽力降帧** —— 只覆盖 shim 注入的 rAF 驱动主循环，
+   *   setTimeout 循环 / CSS 合成器动画 / 页内媒体管不到）；DOM `<video>`
+   *   直显只能 pause（视频元素无法限帧）；image/gif 走 GL 路径同样有降帧
+   * - **换场景/load() 之后保持生效**（与 setAudio 同纪律），重挂（setRenderDpr/
+   *   restore）后 ROI 状态不保留 —— 宿主在重挂完成事件后重推一次即可
+   * - 与用户 pause() 独立记账：遮挡暂停不会清掉用户的暂停意图，
+   *   `stats.occluded` / `stats.throttled` 如实反映遮挡侧状态
+   */
+  setOcclusion(payload: OcclusionPayload | null): void;
   /** 当前生效的质量设置（三项齐全，缺省键已按默认值补全） */
   getQuality(): ResolvedQuality;
 

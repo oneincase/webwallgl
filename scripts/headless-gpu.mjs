@@ -259,7 +259,9 @@ async function launchOnce({
 
   const glArgs = software
     ? ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
-    : ["--use-angle=metal"]; // ← 真 GPU。绝不能顺手加 --enable-unsafe-swiftshader
+    : process.platform === "darwin"
+      ? ["--use-angle=metal"] // ← macOS 真 GPU（ANGLE Metal Renderer）。绝不能顺手加 --enable-unsafe-swiftshader
+      : ["--use-angle=gl"]; // Linux：ANGLE GL 后端走真 GPU（Mesa/NVIDIA 皆可；metal 后端不存在会静默回软件）
   const args = [
     ...(headless ? ["--headless=new"] : []),
     `--user-data-dir=${profileDir}`,

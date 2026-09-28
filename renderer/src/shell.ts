@@ -4,6 +4,17 @@ import type { WallpaperConfig, WallpaperFit } from "./types";
 import { softwareDprCap } from "./quality";
 import type { QualityOptions, ResolvedQuality } from "./quality";
 import type { VideoLoopPair } from "./video-loop";
+import {
+  DEFAULT_OCCLUSION_CONFIG,
+  computeOcclusionFrame,
+  isOcclusionStale,
+  nextBand,
+  normalizeOccluders,
+  type BandState,
+  type OcclusionBand,
+  type Rect,
+} from "./occlusion";
+import type { OcclusionBandConfig, OcclusionPayload, OcclusionRect } from "./api/types";
 
 /**
  * 有效渲染 DPR。0=跟 devicePixelRatio；正数=目标（可高于设备上报，WKWebView 恒报 1 时仍能超采样）；
@@ -82,14 +93,20 @@ export type Runtime = {
    */
   userVolume?: number;
   /** 当前场景渲染器（含 dispose 释放 WebGL 上下文） */
-  renderer?: { dispose?: () => void };
+  renderer?: {
+    dispose?: () => void;
+    /** [we-scene patch] ROI 图层剔除统计（getOcclusion / perf-bench 诊断读） */
+    roiCullStats?: () => { lastFrame: number; gateLastFrame: number; frames: number; totalCulled: number };
+  };
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
   objectUrls?: string[];
   /** 场景内视频纹理元素（暂停并移除） */
   videoTextures?: HTMLVideoElement[];
   /** 文字挂件逐帧求值回调（渲染循环内调用；无文字对象时为空） */
   sceneTextUpdate?: (t: number) => void;
-  /** 场景/媒体壁纸的暂停·恢复·属性热更句柄（闭包内 rAF，不能从外部直接重启） */
+  /**
+   * 场景/媒体壁纸的暂停·恢复·属性热更句柄（闭包内 rAF，不能从外部直接重启）
+   */
   sceneCtl?: {
     pause(): void;
     resume(): void;
@@ -98,6 +115,21 @@ export type Runtime = {
     setQuality?(q: QualityOptions): void;
     /** 视频纹理上传倍率热更（0=自动交给帧率守门，>0 固定；显式值优先于自动下坡） */
     setVideoTexScale?(scale: number): void;
+    /**
+     * 遮挡暂停的媒体停启（V5）。与 pause()/resume() 分开成对：**不碰 rt.paused**
+     * —— 遮挡暂停期间用户仍可 pause()（不冲突，二者叠加），解除遮挡也不会
+     * 顺带把用户的暂停意图清掉。on=true 停渲染循环+停音视频，on=false 恢复
+     * （实现各自复用本路径的 pauseImpl/resumeImpl 或等价通道）。
+     */
+    setOccluded?(on: boolean): void;
+    /**
+     * 遮挡降帧的档位推送（V5）。有库侧渲染循环的路径（scene / GL 媒体）逐帧
+     * 读 rt.occlusion.band 自行收敛 fps，用不到本钩子；**web 壁纸没有库侧
+     * 循环**，shim 侧 fps 只能靠推送变更 —— 每次档位变化（含回到 run、
+     * fail-open 清态）都会调。收到 "pause" 时实现可忽略（整页暂停归
+     * setOccluded(true) 管，且 0fps 不能播种给 shim）。
+     */
+    setOcclusionBand?(band: OcclusionBand): void;
   };
   /**
    * 外部指针注入句柄（桌面壁纸窗口在桌面 underlay 层收不到鼠标事件，由宿主
@@ -203,6 +235,40 @@ export type Runtime = {
    * 未探测 = undefined（按「有 GPU」处理）。
    */
   softwareRenderer?: boolean;
+  /**
+   * 遮挡分档配置（`MountOptions.occlusion` 规范化结果；`false` = 显式关闭，
+   * undefined = 未配置 → 用默认档）。setOcclusion/pushOcclusion 消费。
+   */
+  occlusionCfg?: OcclusionBandConfig | false;
+  /**
+   * 遮挡感知降载的当前状态（pushOcclusion 写入；渲染循环、frameStats、
+   * ROI 图层裁剪消费）。undefined = 宿主从没推过遮挡（零行为差）。
+   * 字段语义见 occlusion.ts；坐标系 = 画布 CSS 像素。
+   */
+  occlusion?: {
+    /** 归一化遮挡矩形（画布 CSS 像素；画布 resize 后按原值重算） */
+    occluders: OcclusionRect[];
+    /** 分档用可见比例（宿主 ratio 优先，缺省精确分解口径） */
+    ratio: number;
+    /** 网格覆盖率（Lively 语义对照读数；不参与分档） */
+    gridCoverage: number;
+    /** 消费层可见矩形（碎片已保守合并 + 向外量化；ROI 图层裁剪用） */
+    rects: Rect[];
+    /** 当前生效档位（run/light/heavy/pause） */
+    band: OcclusionBand;
+    /** 档位状态机（滞回 + 驻留） */
+    bandState: BandState;
+    /** 最近一次有效载荷时刻（performance.now；超 OCCLUSION_STALE_MS fail-open） */
+    receivedAt: number;
+    /** 载荷对应的画布 CSS 尺寸（变化时重算 rects/ratio） */
+    canvasW: number;
+    canvasH: number;
+    /** 宿主会话 id / 会话内序号（epoch 变化或 gen 回退 = 宿主重启，重置跟踪） */
+    epoch?: number | string;
+    gen: number;
+  };
+  /** fail-open 心跳定时器 id（遮挡态存在期间才有；见 ensureOcclusionTimer） */
+  occlusionTick?: number;
   /** 实例级帧率计（见 frameStats） */
   frameMeter: { stamps: number[]; last: number; fps: number };
   /**
@@ -446,6 +512,11 @@ export function clear(rt: Runtime) {
   rt.canvas = undefined;
   rt.ctx = undefined;
   rt.info = undefined;
+  // 遮挡态不跨重挂保留（评估报告 R5）：旧载荷的画布尺寸/媒体停启状态都属于
+  // 上一代装配，宿主在重挂完成后重推一次即可；这里直接清掉（不触恢复 ——
+  // 媒体元素正随装配一起拆除），fail-open 心跳也一并停掉。
+  rt.occlusion = undefined;
+  stopOcclusionTimer(rt);
   // 调试出口持有整张场景图与全部贴图的 CPU 侧缓冲，拆场景时一并清掉
   clearSceneDebugGlobals();
   resetFrameMeter(rt);
@@ -519,9 +590,18 @@ export function resetFrameMeter(rt: Runtime) {
  * 静态媒体壁纸循环还活着、画面完好，只是这一帧的输出与上一帧逐像素相同、
  * 不需要重新提交（见 media.ts 的按需渲染）。没有这一位的话，测试台只能靠
  * fps=0 判断，会把健康的静止壁纸显示成待机态。
+ *
+ * 遮挡态扩展（V5）：`occluded` = 遮挡暂停中（画面停在最后一帧，宿主撤载荷
+ * 即恢复）；`throttled` = 遮挡降帧中（帧率上限被压低）。宿主看门狗靠这两个
+ * 字段把「主动降载」与「故障停帧」区分开（评估报告 R6）。
  */
-export function frameStats(rt: Runtime): { fps: number; running: boolean; idle: boolean } {
-  if (!rt.frameMeter.last || rt.paused) return { fps: 0, running: false, idle: false };
+export function frameStats(rt: Runtime): { fps: number; running: boolean; idle: boolean; occluded?: boolean; throttled?: boolean } {
+  const occ = rt.occlusion;
+  const throttled = !!occ && occ.band !== "run";
+  // 遮挡暂停优先上报：循环确实停着（running=false），但 occluded=true 表明
+  // 这是主动降载而非故障 —— 宿主看门狗据此免报假警。
+  if (occ && occ.band === "pause") return { fps: 0, running: false, idle: false, occluded: true, throttled: false };
+  if (!rt.frameMeter.last || rt.paused) return { fps: 0, running: false, idle: false, occluded: false, throttled };
   const now = performance.now();
   // 静止位带心跳：按需渲染期间循环每帧刷新它，所以「活着但不出帧」是有时效的。
   // 循环一旦死掉（渲染出错熔断 / 释放），心跳过期，这里自动落回「没在跑」——
@@ -529,9 +609,148 @@ export function frameStats(rt: Runtime): { fps: number; running: boolean; idle: 
   const idle = !!rt.renderIdleAt && now - rt.renderIdleAt < Math.max(FPS_WINDOW_MS, 400);
   if (now - rt.frameMeter.last > Math.max(FPS_WINDOW_MS, 400)) {
     // 静止待命期间本就没有帧提交，不能因此判成没在跑；fps 如实为 0
-    return { fps: 0, running: idle, idle };
+    return { fps: 0, running: idle, idle, occluded: false, throttled };
   }
-  return { fps: rt.frameMeter.fps, running: true, idle };
+  return { fps: rt.frameMeter.fps, running: true, idle, occluded: false, throttled };
+}
+
+// ---- 遮挡感知降载（V5）：推送管线（setOcclusion 的实现层，api/mount 转发到这里）----
+
+/** 遮挡矩形的参考坐标系 = 挂载元素的 CSS 尺寸（web 壁纸是容器，其余是画布） */
+function occlusionCanvasSize(rt: Runtime): { w: number; h: number } {
+  const el = rt.cfg.canvas;
+  const w = el?.clientWidth || (typeof window !== "undefined" ? window.innerWidth : 0) || 0;
+  const h = el?.clientHeight || (typeof window !== "undefined" ? window.innerHeight : 0) || 0;
+  return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+}
+
+/** 分档配置取值（undefined = 未配置 → 默认档；false 已在入口挡掉） */
+export const occlusionCfgOf = (rt: Runtime): OcclusionBandConfig => {
+  const c = rt.occlusionCfg;
+  return c === undefined || c === false ? DEFAULT_OCCLUSION_CONFIG : c;
+};
+
+/** 遮挡暂停中（独立函数防属性链窄化误报；渲染循环各早退点统一用它） */
+export const occlPaused = (rt: Runtime): boolean =>
+  rt.occlusion !== undefined && rt.occlusion.band === "pause";
+
+/** 清空遮挡态并解除遮挡暂停（payload null / fail-open 的公共出口） */
+function clearOcclusion(rt: Runtime): void {
+  stopOcclusionTimer(rt);
+  const prev = rt.occlusion;
+  rt.occlusion = undefined;
+  if (prev?.band === "pause") rt.sceneCtl?.setOccluded?.(false);
+  // 恢复全量帧率：web shim 没有循环可逐帧读档位，必须显式推回 run
+  //（scene/media 的渲染循环见遮挡态为空，自然回 base fps）。
+  if (prev) rt.sceneCtl?.setOcclusionBand?.("run");
+}
+
+/**
+ * fail-open 心跳：只在遮挡态存在期间跑（1s 一拍，调 tickOcclusion）。
+ *
+ * 为什么不能用渲染循环兜底：视频壁纸（DOM 直显）与网页壁纸没有库侧 rAF
+ * 循环，宿主失联后没人调 tickOcclusion，壁纸会冻在暂停态 —— 定时器对所有
+ * 壁纸类型统一兜底；scene/media 的渲染循环另有逐帧 tick（响应更快），双跑
+ * 无害（tickOcclusion 幂等）。
+ */
+function ensureOcclusionTimer(rt: Runtime): void {
+  if (rt.occlusionTick !== undefined) return;
+  const start = setInterval(() => {
+    tickOcclusion(rt, performance.now());
+  }, 1000) as unknown as number;
+  // Node（verify 脚本）下 unref 掉：定时器不能把进程挂住不退出；浏览器无此方法
+  (start as unknown as { unref?: () => void }).unref?.();
+  rt.occlusionTick = start;
+}
+
+function stopOcclusionTimer(rt: Runtime): void {
+  if (rt.occlusionTick === undefined) return;
+  clearInterval(rt.occlusionTick);
+  rt.occlusionTick = undefined;
+}
+
+/** 档位跨界时做媒体停启 + 降帧推送（有渲染循环的路径逐帧读档位；推送服务 web shim） */
+function applyBandTransition(rt: Runtime, prevBand: OcclusionBand, band: OcclusionBand): void {
+  if (prevBand === band) return;
+  if (band === "pause") rt.sceneCtl?.setOccluded?.(true);
+  else if (prevBand === "pause") rt.sceneCtl?.setOccluded?.(false);
+  // web 无库侧渲染循环，shim 侧 fps 全靠推送（scene/media 循环自己逐帧收敛，
+  // 实现里可以不接）。顺序在 setOccluded 之后：pause→X 先恢复再按新档限帧。
+  rt.sceneCtl?.setOcclusionBand?.(band);
+}
+
+/**
+ * 处理一次遮挡推送（公共 API `setOcclusion` 的实现；null = 清除/恢复全量）。
+ *
+ * 流水线：归一化（钳到画布、滤非法）→ 决策层 ratio（宿主值优先，缺省用
+ * 消费层分解的精确可见比例 —— 网格只作对照读数）+ 消费层矩形（精确分解 +
+ * 保守合并）→ 滞回分档 → 跨界时停/启媒体。
+ * epoch 变化或 gen 回退视为宿主重启：档位状态机整体重置（防新会话的载荷被
+ * 当乱序丢弃，评估报告 §2.5 契约）。
+ */
+export function pushOcclusion(rt: Runtime, payload: OcclusionPayload | null): void {
+  if (rt.occlusionCfg === false) return; // MountOptions.occlusion: false 显式关闭
+  if (!payload || !Array.isArray(payload.occluders)) {
+    clearOcclusion(rt);
+    return;
+  }
+  const now = performance.now();
+  const prev = rt.occlusion;
+  const epoch = payload.epoch;
+  const gen = Number(payload.gen);
+  // 宿主重启检测：epoch 更换，或 gen 比上一个会话还小
+  const restarted =
+    !!prev && ((epoch !== undefined && prev.epoch !== undefined && epoch !== prev.epoch)
+      || (Number.isFinite(gen) && gen < prev.gen));
+  const canvas = occlusionCanvasSize(rt);
+  const occluders = normalizeOccluders(canvas, payload.occluders);
+  const frame = computeOcclusionFrame(canvas, occluders, payload.ratio);
+  const { state, band } = nextBand(restarted ? null : prev?.bandState ?? null, frame.ratio, now, occlusionCfgOf(rt));
+  rt.occlusion = {
+    occluders,
+    ratio: frame.ratio,
+    gridCoverage: frame.gridCoverage,
+    rects: frame.rects,
+    band,
+    bandState: state,
+    receivedAt: now,
+    canvasW: canvas.w,
+    canvasH: canvas.h,
+    epoch,
+    gen: Number.isFinite(gen) ? gen : prev?.gen ?? 0,
+  };
+  ensureOcclusionTimer(rt);
+  applyBandTransition(rt, prev?.band ?? "run", band);
+}
+
+/**
+ * 渲染循环每帧调用的遮挡维护（两件事，都很便宜）：
+ *   1. fail-open：超过 OCCLUSION_STALE_MS 没收到新推送 → 视为宿主失联，
+ *      清空遮挡态并恢复全量（宿主崩溃不能把壁纸冻在暂停态）；
+ *   2. 画布 resize 后按原遮挡矩形重算（宿主随后会带新坐标重推，这只是过渡）。
+ */
+export function tickOcclusion(rt: Runtime, now: number): void {
+  const occ = rt.occlusion;
+  if (!occ) return;
+  if (isOcclusionStale(occ.receivedAt, now)) {
+    clearOcclusion(rt);
+    return;
+  }
+  const canvas = occlusionCanvasSize(rt);
+  if (canvas.w === occ.canvasW && canvas.h === occ.canvasH) return;
+  const frame = computeOcclusionFrame(canvas, occ.occluders, undefined);
+  const { state, band } = nextBand(occ.bandState, frame.ratio, now, occlusionCfgOf(rt));
+  rt.occlusion = {
+    ...occ,
+    ratio: frame.ratio,
+    gridCoverage: frame.gridCoverage,
+    rects: frame.rects,
+    band,
+    bandState: state,
+    canvasW: canvas.w,
+    canvasH: canvas.h,
+  };
+  applyBandTransition(rt, occ.band, band);
 }
 
 /**

@@ -65,10 +65,21 @@ type RendererWindow = Window & {
     pushPointer(u: number, v: number, buttons?: number): void;
     pointerLeave(): void;
     loadSceneFile(file: File, project?: File): void;
+    /** 遮挡推送（V5）：矩形 = 渲染器视口 CSS 像素；null = 恢复全量 */
+    setOcclusion(payload: { occluders: Array<[number, number, number, number]>; gen?: number } | null): void;
+    getOcclusion(): {
+      band: string;
+      ratio: number;
+      gridCoverage: number;
+      rectCount: number;
+      rectAreaFrac: number;
+      roiCulled: number | null;
+      roiGate: number | null;
+    } | null;
   };
   /** 渲染器运行时观测面（见 renderer/src/main.ts 的 __wpStats） */
   __wpStats?: {
-    frame(): { fps: number; running: boolean; idle?: boolean };
+    frame(): { fps: number; running: boolean; idle?: boolean; occluded?: boolean; throttled?: boolean };
   };
 };
 
@@ -103,6 +114,10 @@ const resnEl = $<HTMLSelectElement>("#resn");
 const localAssetsEl = $<HTMLInputElement>("#local-assets");
 const pointerPushEl = $<HTMLInputElement>("#pointer-push");
 const pointerVeilEl = $<HTMLElement>("#pointer-veil");
+const occSimEl = $<HTMLInputElement>("#occ-sim");
+const occVeilEl = $<HTMLElement>("#occ-veil");
+const occGridEl = $<HTMLElement>("#occ-grid");
+const occHudEl = $<HTMLElement>("#occ-hud");
 const resolutionEl = $<HTMLSelectElement>("#resolution");
 const stageFrameEl = $<HTMLElement>("#stage-frame");
 const stageScaleEl = $<HTMLElement>("#stage-scale");
@@ -1045,6 +1060,258 @@ try {
   /* 隐私模式忽略 */
 }
 applyPointerPush();
+
+// ---------- 遮挡模拟器（V5） ----------
+// 对标 Lively 的 Grid Detection Overlay：舞台上拖出「遮挡窗口」，经
+// __wp.setOcclusion 推给渲染器（与宿主同一条通道），实时观察覆盖率分档
+// （暂停 / 降帧 / ROI 图层裁剪）与网格覆盖可视化。矩形用归一化坐标存
+//（#stage 固定分辨率模式带 CSS transform 缩放，归一化天然免疫缩放），
+// 推送时再乘渲染器视口尺寸换算成 CSS 像素。
+type OccRect = { x: number; y: number; w: number; h: number };
+const occWins: OccRect[] = [];
+let occGen = 0;
+let occPushQueued = false;
+/** 网格分块数与库内决策层同源（occlusion.ts computeGridCoverage 的 tiles） */
+const OCC_TILES = 16;
+
+function occVeilSize(): { w: number; h: number } {
+  const r = occVeilEl.getBoundingClientRect();
+  return { w: r.width > 0 ? r.width : 1, h: r.height > 0 ? r.height : 1 };
+}
+
+function occToNormalized(ev: MouseEvent): { x: number; y: number } {
+  const r = occVeilEl.getBoundingClientRect();
+  return {
+    x: Math.min(1, Math.max(0, r.width > 0 ? (ev.clientX - r.left) / r.width : 0)),
+    y: Math.min(1, Math.max(0, r.height > 0 ? (ev.clientY - r.top) / r.height : 0)),
+  };
+}
+
+/** 渲染器视口的 CSS 像素尺寸（推送换算用） */
+function occRendererSize(): { w: number; h: number } {
+  const w = frameEl.contentWindow?.innerWidth || occVeilSize().w;
+  const h = frameEl.contentWindow?.innerHeight || occVeilSize().h;
+  return { w, h };
+}
+
+function occRender() {
+  // 网格分块：与库内同口径 —— tile 与任一窗口相交即算被覆盖（保守方向）
+  occGridEl.textContent = "";
+  const cell = 100 / OCC_TILES;
+  for (let i = 0; i < OCC_TILES; i++) {
+    for (let j = 0; j < OCC_TILES; j++) {
+      const tx = i / OCC_TILES, ty = j / OCC_TILES;
+      const covered = occWins.some(
+        (r) => tx < r.x + r.w && r.x < tx + 1 / OCC_TILES && ty < r.y + r.h && r.y < ty + 1 / OCC_TILES,
+      );
+      const tile = document.createElement("div");
+      tile.className = covered ? "occ-tile covered" : "occ-tile";
+      tile.style.left = `${i * cell}%`;
+      tile.style.top = `${j * cell}%`;
+      tile.style.width = `${cell}%`;
+      tile.style.height = `${cell}%`;
+      occGridEl.appendChild(tile);
+    }
+  }
+  // 窗口矩形（归一化 → 百分比定位）
+  for (const el of [...occVeilEl.querySelectorAll(".occ-win")]) el.remove();
+  occWins.forEach((r, i) => {
+    const el = document.createElement("div");
+    el.className = "occ-win";
+    el.style.left = `${r.x * 100}%`;
+    el.style.top = `${r.y * 100}%`;
+    el.style.width = `${r.w * 100}%`;
+    el.style.height = `${r.h * 100}%`;
+    const badge = document.createElement("span");
+    badge.className = "occ-win-badge";
+    badge.textContent = `#${i + 1}`;
+    el.appendChild(badge);
+    occVeilEl.appendChild(el);
+  });
+  occUpdateHud();
+}
+
+/** 覆盖率（tile 口径）与档位读数；档位以渲染器回报为准（无推送时本地估） */
+function occUpdateHud() {
+  const cellArea = 1 / (OCC_TILES * OCC_TILES);
+  let covered = 0;
+  for (let i = 0; i < OCC_TILES; i++) {
+    for (let j = 0; j < OCC_TILES; j++) {
+      const tx = i / OCC_TILES, ty = j / OCC_TILES;
+      if (
+        occWins.some(
+          (r) => tx < r.x + r.w && r.x < tx + 1 / OCC_TILES && ty < r.y + r.h && r.y < ty + 1 / OCC_TILES,
+        )
+      ) {
+        covered++;
+      }
+    }
+  }
+  const coverage = covered * cellArea;
+  const st = wpQuiet()?.getOcclusion?.() ?? null;
+  const frame = (frameEl.contentWindow as RendererWindow | null)?.__wpStats?.frame();
+  const band = st?.band ?? (coverage >= 0.95 ? "pause" : coverage >= 0.7 ? "heavy" : coverage >= 0.3 ? "light" : "run");
+  const bandLabel: Record<string, string> = {
+    pause: "PAUSE 暂停",
+    heavy: "HEAVY 重降载",
+    light: "LIGHT 降载",
+    run: "RUN 全量",
+  };
+  occHudEl.innerHTML =
+    `遮挡覆盖率 ${(coverage * 100).toFixed(1)}% · 可见 ${((1 - coverage) * 100).toFixed(1)}%\n` +
+    `档位 <span class="occ-band-${band}">${bandLabel[band] ?? band}</span>` +
+    (st ? ` · ROI 块 ${st.rectCount} · ROI 面积 ${(st.rectAreaFrac * 100).toFixed(0)}%` : "") +
+    (st && st.roiGate != null ? ` · 图层剔除 ${st.roiCulled ?? 0}/${st.roiGate}` : "") +
+    (frame
+      ? ` · fps ${frame.fps.toFixed(0)}${frame.occluded ? "（遮停）" : frame.running ? "" : "（停）"}${frame.throttled ? "·限" : ""}`
+      : "");
+}
+
+/** 推送（合帧去抖：一帧最多一次） */
+function occPush() {
+  if (occPushQueued) return;
+  occPushQueued = true;
+  requestAnimationFrame(() => {
+    occPushQueued = false;
+    if (occVeilEl.hidden) return;
+    const size = occRendererSize();
+    const occluders = occWins.map((r) => [
+      Math.round(r.x * size.w),
+      Math.round(r.y * size.h),
+      Math.round(r.w * size.w),
+      Math.round(r.h * size.h),
+    ]) as Array<[number, number, number, number]>;
+    wpQuiet()?.setOcclusion?.({ occluders, gen: ++occGen, epoch: "bench" });
+    occRender();
+  });
+}
+
+// 交互：空白处按下拖出新窗口；窗口内拖动移动；右下角手柄缩放；双击删除。
+// 全部走归一化坐标 + 纯几何命中（不依赖 DOM target：occRender 每次重建
+// .occ-win 元素，dataset.idx 不可靠；且按 DOM target 判时压在边框上的
+// 按压会落到 veil 上被当"新建"）。手柄命中按 CSS 像素半径判，允许压线/
+// 稍出界抓取 —— 视觉手柄见 bench.css 的 .occ-win::after。双击用 pointerup
+// 手动判定：pointerdown 的 preventDefault 会吞掉浏览器合成的兼容鼠标事件
+// （mousedown/click/dblclick 都不再派发），原生 dblclick 永远收不到。
+let occDrag: {
+  idx: number;
+  mode: "new" | "move" | "resize";
+  startX: number;
+  startY: number;
+  orig: OccRect;
+  /** 是否产生过位移（区分"轻点"与"拖动"，双击只认轻点） */
+  moved: boolean;
+} | null = null;
+let occLastTap: { idx: number; t: number } | null = null;
+
+/** 命中检测（自顶向下）：16px 抓取半径容差，右下角命中即 resize */
+function occHit(x: number, y: number): { idx: number; mode: "move" | "resize" } | null {
+  const size = occVeilSize();
+  const gx = 16 / size.w;
+  const gy = 16 / size.h;
+  for (let i = occWins.length - 1; i >= 0; i--) {
+    const r = occWins[i];
+    if (x >= r.x - gx && x <= r.x + r.w + gx && y >= r.y - gy && y <= r.y + r.h + gy) {
+      const corner = x >= r.x + r.w - gx && y >= r.y + r.h - gy;
+      return { idx: i, mode: corner ? "resize" : "move" };
+    }
+  }
+  return null;
+}
+
+occVeilEl.addEventListener("pointerdown", (ev) => {
+  if (occVeilEl.hidden || ev.button !== 0) return;
+  const { x, y } = occToNormalized(ev);
+  const hit = occHit(x, y);
+  if (hit) {
+    occDrag = { idx: hit.idx, mode: hit.mode, startX: x, startY: y, orig: { ...occWins[hit.idx] }, moved: false };
+  } else {
+    const r = { x, y, w: 0, h: 0 };
+    occWins.push(r);
+    occDrag = { idx: occWins.length - 1, mode: "new", startX: x, startY: y, orig: { ...r }, moved: false };
+    occRender();
+  }
+  occVeilEl.setPointerCapture(ev.pointerId);
+  ev.preventDefault();
+});
+
+occVeilEl.addEventListener("pointermove", (ev) => {
+  if (!occDrag) return;
+  const { x, y } = occToNormalized(ev);
+  const dx = x - occDrag.startX;
+  const dy = y - occDrag.startY;
+  if (Math.abs(dx) > 0.004 || Math.abs(dy) > 0.004) occDrag.moved = true;
+  const r = occWins[occDrag.idx];
+  if (!r) return;
+  if (occDrag.mode === "move") {
+    r.x = Math.min(1 - occDrag.orig.w, Math.max(0, occDrag.orig.x + dx));
+    r.y = Math.min(1 - occDrag.orig.h, Math.max(0, occDrag.orig.y + dy));
+  } else {
+    r.w = Math.max(0.04, Math.min(1 - r.x, occDrag.orig.w + dx));
+    r.h = Math.max(0.04, Math.min(1 - r.y, occDrag.orig.h + dy));
+  }
+  occRender();
+  // 拖动中也持续推送（合帧去抖）：让分档跟着窗口实时变化，而不是松手才更新
+  occPush();
+});
+
+occVeilEl.addEventListener("pointerup", () => {
+  if (!occDrag) return;
+  const drag = occDrag;
+  occDrag = null;
+  const r = occWins[drag.idx];
+  // 拖出的新窗口太小（<3% 边长）当误触丢弃
+  if (drag.mode === "new" && r && (r.w < 0.03 || r.h < 0.03)) {
+    occWins.splice(drag.idx, 1);
+    occRender();
+    return;
+  }
+  // 手动双击判定：同一窗口两次轻点（无位移）间隔 < 400ms → 删除
+  const now = performance.now();
+  if (drag.mode === "move" && !drag.moved && r) {
+    if (occLastTap && occLastTap.idx === drag.idx && now - occLastTap.t < 400) {
+      occLastTap = null;
+      occWins.splice(drag.idx, 1);
+      occRender();
+      occPush();
+      return;
+    }
+    occLastTap = { idx: drag.idx, t: now };
+  } else {
+    occLastTap = null;
+  }
+  occPush();
+});
+
+occVeilEl.addEventListener("pointercancel", () => {
+  occDrag = null;
+});
+
+occSimEl.onchange = () => {
+  const on = occSimEl.checked;
+  occVeilEl.hidden = !on;
+  if (on) {
+    occRender();
+    occPush();
+  } else {
+    wpQuiet()?.setOcclusion?.(null);
+    log(t("log.occSimOff"));
+    return;
+  }
+  log(t("log.occSimOn"));
+};
+
+// HUD 刷新（0.5s 轮询渲染器回报的档位/ROI/帧率）
+setInterval(() => {
+  if (!occVeilEl.hidden) occUpdateHud();
+}, 500);
+
+// 宿主心跳模拟：真实宿主按 2~4Hz 持续重推（窗口不动也推）。模拟器若只在
+// 交互时推一次，松手 3s 后渲染端会按 OCCLUSION_STALE_MS 判"宿主失联"
+// fail-open 恢复全量 —— 表现为档位自己从 24fps 回升到 60fps。
+setInterval(() => {
+  if (!occVeilEl.hidden) occPush();
+}, 1000);
 
 function layoutStage() {
   const val = resolutionEl.value;

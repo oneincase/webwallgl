@@ -7,6 +7,7 @@ import {
   fitObjectFit,
   frameStats,
   normalizeFit,
+  pushOcclusion,
   reportDiag,
   resetCoverAlign,
   resetFrameMeter,
@@ -16,6 +17,7 @@ import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
 import type { WallpaperConfig, WallpaperFit } from "../types";
 import { normalizeQuality, normalizeVideoTexScale } from "../quality";
+import { normalizeOcclusionConfig } from "../occlusion";
 import type { QualityOptions, ResolvedQuality } from "./types";
 import { weShimCall } from "../web";
 import { sniffMediaType, workshopIdFromSourceKey } from "./source";
@@ -26,6 +28,7 @@ import type {
   MediaControl,
   MediaSource,
   MountOptions,
+  OcclusionPayload,
   PropertyValue,
   SceneEvents,
   SceneInfo,
@@ -270,6 +273,11 @@ export function createScene(
       // 显式传 null = 禁用（不是"回落模拟源"）；见 Runtime.mediaDisabled
       rt.mediaDisabled = o.media === null;
     }
+    // 遮挡分档配置（V5）：同 audio/media 纪律，只在选项里显式出现时才动 ——
+    // load() 换场景不冲掉已生效配置；false = 显式关闭（setOcclusion 静默无效）
+    if ("occlusion" in o) {
+      rt.occlusionCfg = o.occlusion === false ? false : normalizeOcclusionConfig(o.occlusion);
+    }
   };
 
   /**
@@ -510,6 +518,35 @@ export function createScene(
     /** 当前**请求**的倍率（0 = 自动）。生效值（含守门下坡结果）见诊断上报。 */
     getVideoTexScale(): number {
       return normalizeVideoTexScale(rt.cfg.videoTexScale);
+    },
+
+    /**
+     * 遮挡推送（V5，见 SceneInstance.setOcclusion 与 OcclusionPayload 的契约）。
+     * 推送管线在 shell.pushOcclusion（分档/滞回/fail-open）；这里只补一类媒体：
+     * **A/B 视频循环对**（video 壁纸 DOM 路径，mountAbPair）没有 sceneCtl 钩子，
+     * 跨界时直接停/启。门控必须看 sceneCtl?.setOccluded 是否存在 —— scene 壁纸
+     * 的 rt.videoPairs 装的是**全部**场景视频纹理（含隐藏层/脚本停用层），其恢复
+     * 由 sceneCtl.setOccluded→resumeImpl 按 pause 时捕获的清单精确还原；这里若
+     * 无差别 resume() 会把从不播放的隐藏层视频全部起播（评审 P0：解码/纹理上传
+     * 开销凭空回来）。其余路径（scene/web/webcodecs）同理由 setOccluded 接管。
+     * 用户暂停（rt.paused）期间解除遮挡不启媒体。
+     */
+    setOcclusion(payload: OcclusionPayload | null) {
+      const prevBand = rt.occlusion?.band;
+      pushOcclusion(rt, payload);
+      const band = rt.occlusion?.band;
+      if (band === prevBand) return;
+      if (rt.sceneCtl?.setOccluded) return; // 有 sceneCtl 钩子的路径已由 pushOcclusion 处理
+      if (band === "pause") {
+        for (const p of rt.videoPairs ?? []) p.pause();
+        if (!rt.videoPairs?.length) rt.video?.pause();
+      } else if (prevBand === "pause" && !rt.paused) {
+        if (rt.videoPairs?.length) {
+          for (const p of rt.videoPairs) p.resume();
+        } else if (rt.video) {
+          void rt.video.play().catch(() => {});
+        }
+      }
     },
 
     setProperties(props: Record<string, PropertyValue>) {

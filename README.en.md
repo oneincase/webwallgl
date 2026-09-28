@@ -167,10 +167,11 @@ VRAM & clarity: textures plus canvas/effect-chain buffers dominate VRAM, and bot
 | `pushPointer(u, v, buttons?, mods?)` | Inject pointer state (u/v normalized 0..1; mods is a ctrl/shift/alt/meta mask). For hosts whose window cannot receive the mouse; works for scene and web |
 | `pointerLeave()` | Pointer left: clears buttons but keeps the last position (dropping it makes parallax and xray visibly jump) |
 | `pushWheel(dx, dy, mode?, mods?)` | Inject wheel / trackpad gestures (web wallpapers only). Positive dy scrolls content down; a macOS pinch maps to the ctrl bit in mods |
+| `setOcclusion(payload | null)` | Occlusion push (V5): the host enumerates overlapping window rects (converted to wallpaper-window CSS pixels) and pushes them; the library auto-bands by the exact visible ratio — ≤5% pause, ≤30% throttles to 24fps, ≤70% to 40fps; entry is immediate while exit uses symmetric hysteresis (each band exits past its own entry + 0.05: 0.10/0.35/0.75), steps up one band at a time with a 400ms dwell (banding uses the exact decomposition ratio, not a Lively-style grid — grid quantization error of ±2 tile edges crosses the hysteresis band, so the grid stays only as a reference readout); pausing stops media too, and layers outside the visible rects are skipped (ROI culling). null restores full rendering; pushes need a ≤2s heartbeat, and 3s without one auto-restores (fail-open). The occlusion mount option tunes the thresholds; false disables |
 | `load(source)` | Switch scenes reusing the same canvas and WebGL context; resolves after the first frame |
 | `release() / restore()` | Free GL resources keeping the config (display sleep) / rebuild from the kept config |
 | `destroy()` | Terminal: frees resources, unbinds listeners; the instance is dead afterwards |
-| `stats / info` | Measured FPS ({fps, running}, zeroes out instead of freezing) / scene info (logical size, layer count, has models/particles/text) |
+| `stats / info` | Measured FPS ({fps, running}, zeroes out instead of freezing; the occlusion state adds occluded / throttled flags so host watchdogs can tell deliberate throttling from a dead frame loop) / scene info (logical size, layer count, has models/particles/text) |
 | `on(ev, fn)` | Subscribe to ready / error / diagnostic; returns an unsubscribe function |
 
 ## User properties
@@ -342,6 +343,7 @@ b.pause(); // does not affect a
 - HTTP 404: make sure the httpSource directory really contains a scene.pkg (all three layouts are tried before failing)
 - Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error
 - stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected
+- stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). Use the bench toolbar's "Occlusion sim" to reproduce: the HUD shows the band, ROI rect count/area (the renderer's exact decomposition) and layer culling c/g (denominator = layers passing the gate) live, plus a tile-granularity coverage readout for comparison (mirrors Lively's Grid Detection Overlay). Drag the occluder and watch "ROI area ≈ visible area" (hole-swallowing would show up as ROI area far exceeding visibility)
 - Audio starts late: autoplay policy requires user interaction before sound; that's why volume defaults to 0
 - Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs). webSandbox: "strict" is not this case — the shim is injected and the full API works (control/audio/media travel over postMessage)
 - Web wallpaper relative assets 404: resources rely on &lt;base href> pointing at the original directory; wallpapers that build URLs from location.href may break under blob loading

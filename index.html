@@ -193,6 +193,10 @@
               <input id="pointer-push" type="checkbox" />
               <span data-i18n="toolbar.pointerPush">指针注入</span>
             </label>
+            <label class="check" data-i18n-title="toolbar.occSimTip" title="遮挡模拟器（对标 Lively Grid Pause Algorithm 的调试视图）：在舞台上拖出遮挡窗口，经 __wp.setOcclusion 推给渲染器 —— 覆盖率分档（暂停/降帧/ROI 图层裁剪）实时可见。关掉即恢复全量渲染">
+              <input id="occ-sim" type="checkbox" />
+              <span data-i18n="toolbar.occSim">遮挡模拟</span>
+            </label>
             <button type="button" id="pause" data-i18n="toolbar.pause">暂停</button>
             <button type="button" id="reload" data-i18n="toolbar.reload">重挂载</button>
             <button type="button" id="release" data-i18n="toolbar.release">释放</button>
@@ -227,6 +231,14 @@
                        模拟桌面 underlay 层（页面收不到 mousemove），坐标改由
                        __wp.pushPointer 推送。默认 hidden，不影响真鼠标路径。 -->
                   <div id="pointer-veil" hidden></div>
+                  <!-- 遮挡模拟器（V5）：在舞台上拖拽出「遮挡窗口」矩形，
+                       经 __wp.setOcclusion 推给渲染器。网格分块 + 覆盖率
+                       读数对标 Lively 的 Grid Detection Overlay。 -->
+                  <div id="occ-veil" hidden>
+                    <div id="occ-grid"></div>
+                    <div id="occ-hud"></div>
+                    <div id="occ-tip" data-i18n="occ.tip">拖出遮挡窗口 · 双击删除</div>
+                  </div>
                 </div>
               </div>
               <div id="stage-badge" hidden></div>

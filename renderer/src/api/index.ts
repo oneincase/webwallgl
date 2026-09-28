@@ -33,4 +33,9 @@ export type {
   PostQuality,
   QualityOptions,
   ResolvedQuality,
+  OcclusionRectLike,
+  OcclusionRect,
+  OcclusionPayload,
+  OcclusionBands,
+  OcclusionBandConfig,
 } from "./types";

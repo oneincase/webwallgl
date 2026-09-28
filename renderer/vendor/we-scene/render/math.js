@@ -371,9 +371,18 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
   // [we-scene patch] 脚本 thisScene.setCameraTransforms({zoom}) 叠在 fit 窗口上。
   // zoom=1.01（3151551777 火车震动）= 视口缩小 1%、画面略放大。zoom=1 是无操作，
   // 不改 cover/contain 的既有窗口，也不碰 16:9 设计比例匹配。
-  const zRaw = scene && scene.cameraTransforms ? scene.cameraTransforms.zoom : (general && general.zoom)
-  const zVal = zRaw && typeof zRaw === 'object' ? zRaw.value : zRaw
-  const zoom = Number(zVal)
+  applyCameraZoom(win, cameraZoomOf(scene))
+  const projection = mat4Ortho(win.offX, win.offX + win.viewW, win.offY + win.viewH, win.offY, -10000, 10000)
+  return { view, projection, eye: eyeV, projW, projH, offX: win.offX, offY: win.offY, viewW: win.viewW, viewH: win.viewH, perspective: false }
+}
+
+// [we-scene patch] 相机 zoom 收缩（buildCamera 与 scene-mount 的 ROI 世界逆映射
+// 共用的单一真源）：以窗口中心锚定把 viewW/viewH 除以 zoom。曾只在 buildCamera
+// 内联 —— ROI 映射用裸 fitWindow，zoom<1 时算出的可见窗偏小、可见区边缘图层
+// 被静默误裁（独立评审实测 0.9 → 每侧 107px，超 64px 裁剪余量）。
+// zoom=1.01（3151551777 火车震动）= 视口缩小 1%、画面略放大。zoom=1 是无操作：
+// 不改 cover/contain 的既有窗口，也不碰 16:9 设计比例匹配。
+export function applyCameraZoom(win, zoom) {
   if (Number.isFinite(zoom) && zoom > 0 && Math.abs(zoom - 1) > 1e-6) {
     const cx = win.offX + win.viewW / 2
     const cy = win.offY + win.viewH / 2
@@ -384,8 +393,14 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
     win.viewW = vw
     win.viewH = vh
   }
-  const projection = mat4Ortho(win.offX, win.offX + win.viewW, win.offY + win.viewH, win.offY, -10000, 10000)
-  return { view, projection, eye: eyeV, projW, projH, offX: win.offX, offY: win.offY, viewW: win.viewW, viewH: win.viewH, perspective: false }
+}
+
+// [we-scene patch] zoom 取值：cameraTransforms.zoom 优先（脚本/动画运行时改写），
+// 回落 general.zoom（挂载静态值）。WE 属性可能是 {value} 包装，两种形态都收。
+export function cameraZoomOf(scene) {
+  const zRaw = scene && scene.cameraTransforms ? scene.cameraTransforms.zoom : (scene && scene.general ? scene.general.zoom : undefined)
+  const zVal = zRaw && typeof zRaw === 'object' ? zRaw.value : zRaw
+  return Number(zVal)
 }
 
 // [we-scene patch] 2D 场景里「perspective 图层」（脚本 thisLayer.perspective=true，
