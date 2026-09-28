@@ -45,6 +45,18 @@ import {
 import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
 import { decodeTexImageBitmap, resampleRgba } from "./tex-decode";
 
+/**
+ * [we-scene patch 2026-09-28] 平行光强度 → 漫反射系数的标定常数。
+ *
+ * WE 的 3D 网格着色（LightV1）里，平行光的贡献 ≈ color × intensity × N·L × K。
+ * K 由作者素材回归：3281559867 的 `Scene Light` intensity = 2.1，受光面实测
+ * ≈ 反照率 × 1.2，背光面 = 反照率 × ambientcolor(0.6078)；解 0.6078 + 2.1 × N·L × K = 1.2
+ * 且该面法线朝上（N·L = 光向的 y 分量 ≈ 0.725）⇒ K ≈ 0.39。取 1/π ≈ 0.318 会偏暗约
+ * 10%（1.09 vs 1.20），这里按实测取 0.4 —— 与 ambient 一样，属于「用作者出帧标定的
+ * 经验口径」，不是引擎常数。改这张的观感前请先重量一遍墙/地两块。
+ */
+const SCENE_LIGHT_K = 0.4;
+
 // WE 的 systemfont_* 内置字体 → 本机系统字体栈（WE 桌面端映射 Windows 系统字体，
 // macOS/Linux 上按近似度回退；都带 sans-serif 兜底，不命中也只是字形差异）。
 export const SYSTEM_FONT_FAMILIES: Record<string, string> = {
@@ -3604,11 +3616,46 @@ cfg, source, pkgAbort.signal);
             reportDiag(rt, cfg, `model '${layer.name}' 无贴图，跳过`);
             continue;
           }
+          // [we-scene patch 2026-09-28] 多子网格：**每个子网格带自己的材质与贴图**
+          // （stage.mdl 15 个子网格 = 地面/看台/远景…，各自 materials/models/stage/*.json）。
+          // 只画第一个子网格 = 只有「立在场地顶上那块招牌」，整场没有地面（3281559867
+          // 的黑色大底、3662790108 的太阳系缺件）。第 0 个沿用本层已解析的贴图（就是
+          // 该网格的材质贴图），其余逐个按材质 json 解析；某个网格的贴图缺失只让那一个
+          // 网格回落到层贴图，不拖垮整层。
+          if (mdlObj.meshes && mdlObj.meshes.length > 1) {
+            const meshTex: (unknown | null)[] = [texObj];
+            for (let mi = 1; mi < mdlObj.meshes.length; mi++) {
+              const mesh = mdlObj.meshes[mi];
+              let t: unknown | null = null;
+              const mp: string | null = mesh.materialPath;
+              if (mp) {
+                const matEntry = pkg.getEntry(parsedPkg, mp);
+                if (matEntry) {
+                  const material = readMaterialDoc(matEntry);
+                  const pass0 = material?.passes?.[0];
+                  const tn = pass0?.textures?.[0];
+                  if (typeof tn === "string" && tn) {
+                    try {
+                      await loadTex(tn);
+                      t = textures.get(tn) ?? null;
+                    } catch {
+                      t = null;
+                    }
+                  }
+                  const lightCombo = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
+                  if (Number(lightCombo) === 1) (layer as any).lightingEnabled = true;
+                }
+              }
+              meshTex.push(t);
+            }
+            (layer as any).meshTextures = meshTex;
+          }
           layer.puppet = mdlObj;
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
           reportDiag(rt,
             cfg,
-            `model '${layer.name}' v=${mdlObj.vertexCount} static ${mdlObj.materialPath || ""}`,
+            `model '${layer.name}' v=${mdlObj.vertexCount} static ${mdlObj.materialPath || ""}` +
+              (mdlObj.meshes && mdlObj.meshes.length > 1 ? ` meshes=${mdlObj.meshes.length}` : ""),
           );
         } catch (e) {
           console.warn(`model 图层 ${layer.name} 加载失败: ${(e as Error).message}`);
@@ -3626,6 +3673,8 @@ cfg, source, pkgAbort.signal);
           renderer.setPuppetRenderer((layer: any, mvp: any, o: any) => {
             const item = byLayer.get(layer);
             if (!item) return;
+            // 着色器光照是否接管了这一层（见 sceneLight 的构造与 color 的注释）
+            const shaderLit = !!(o.sceneLight && layersHaveNormals(layer));
             mdlRenderer.draw(
               mvp,
               item.mdl,
@@ -3642,15 +3691,31 @@ cfg, source, pkgAbort.signal);
                 // [we-scene patch] 效果链输出（贴图空间的合成结果）。
                 // 无效果链时为 null，网格照常采样原始贴图。
                 overrideTex: o.overrideTex || null,
+                // [we-scene patch 2026-09-28] 逐子网格贴图（见挂载里 model 分支）。
+                // 缺席时 mdl 渲染器逐网格回落到整层贴图，单网格模型行为不变。
+                meshTextures: (layer as any).meshTextures || null,
+                // [we-scene patch 2026-09-28] 场景光照 + 法线矩阵（只在网格带法线时生效）。
+                sceneLight: sceneLight && layersHaveNormals(layer) ? sceneLight : null,
+                normalMat: (() => {
+                  const m = o.model;
+                  if (!m || m.length !== 16) return null;
+                  // 旋转部分（3x3）；图层多为等比缩放，直接取左上 3x3 再归一化列长即可
+                  return [
+                    m[0], m[1], m[2],
+                    m[4], m[5], m[6],
+                    m[8], m[9], m[10],
+                  ];
+                })(),
                 // [we-scene patch] 顶点 z 是否参与投影：透视场景的真 3D 网格要保留
                 // （renderer 按 cam.perspective 给），2D puppet 压平到 z=0。
                 keepZ: !!o.keepZ,
                 color: [
                   // [we-scene patch] 真 3D 网格 LIGHTING 材质乘场景环境光
-                  //（o.ambient，未开光照时是 [1,1,1]）。
-                  layer.color[0] * layer.brightness * (o.ambient?.[0] ?? 1),
-                  layer.color[1] * layer.brightness * (o.ambient?.[1] ?? 1),
-                  layer.color[2] * layer.brightness * (o.ambient?.[2] ?? 1),
+                  //（o.ambient，未开光照时是 [1,1,1]）。**着色器光照接管时不再乘**
+                  //：环境光已经作为 u_lightBase 进了片元，乘两遍会把背光面压到 0.36×。
+                  layer.color[0] * layer.brightness * (shaderLit ? 1 : (o.ambient?.[0] ?? 1)),
+                  layer.color[1] * layer.brightness * (shaderLit ? 1 : (o.ambient?.[1] ?? 1)),
+                  layer.color[2] * layer.brightness * (shaderLit ? 1 : (o.ambient?.[2] ?? 1)),
                   layer.alpha,
                 ],
               },
@@ -3695,6 +3760,58 @@ cfg, source, pkgAbort.signal);
           for (const ps of list) particleDirty.push(ps);
         }
       }
+
+      // [we-scene patch 2026-09-28] 场景平行光 → 3D 网格光照。
+      //
+      // 为什么必须做：WE 的真 3D 网格（generic4 材质）是**上光**的 —— 作者素材实测
+      // （3281559867，preview.gif 逐区域量）：背光面 = 反照率 × ambientcolor（墙面贴图
+      // 均值 233 → 渲染 135，比值 0.58 ≈ ambientcolor 0.6078），受光面 ≈ 反照率 × 1.2
+      // （棋盘地坪/草地贴图 177/163 → 渲染 207/200）。不做的话舞台的墙面/建筑就是
+      // 「白块」—— 用户报的正是这个。
+      //
+      // 取景语义：`light:"ldirectional"` 的对象 angles 是**弧度**，光向 = 该节点 -z 轴
+      // 旋转后的方向（与相机同一套旋转约定，见 math.js rotateFwd）；`visible` 为假或
+      // `general.lightconfig.directional` 关掉时不打光。点光/聚光（UFO Light、帽灯）不进这一版
+      // —— 它们有半径/衰减/锥角，且只影响局部发光物，平均贡献按官方 LightingV1 很小。
+      const lightLayer = scene.layers.find(
+        (l: any) => l.visible && l.srcObject && l.srcObject.light === "ldirectional",
+      );
+      let sceneLight: { dir: [number, number, number]; base: [number, number, number]; add: [number, number, number] } | null = null;
+      {
+        const lightCfg = (scene as any).general?.lightconfig;
+        const dirOn = !lightCfg || lightCfg.directional === undefined || Number(lightCfg.directional) !== 0;
+        if (lightLayer && dirOn) {
+          const ang = lightLayer.angles || [0, 0, 0];
+          // rotateFwd 的弧度版：从 -z 出发按 pitch(ang[0]) → yaw(ang[1]) 旋转。
+          const yaw = Number(ang[1]) || 0;
+          const pitch = Number(ang[0]) || 0;
+          let x = -Math.sin(yaw);
+          let z = -Math.cos(yaw);
+          let y = 0;
+          const y2 = y * Math.cos(pitch) - z * Math.sin(pitch);
+          z = y * Math.sin(pitch) + z * Math.cos(pitch);
+          y = y2;
+          const len = Math.hypot(x, y, z) || 1;
+          const rgb = String((lightLayer.srcObject && lightLayer.srcObject.color) || "1 1 1")
+            .split(/\s+/)
+            .map((v: string) => Number(v) || 0);
+          const intensity = Number((lightLayer.srcObject && lightLayer.srcObject.intensity) ?? 1) || 0;
+          const amb = String((scene as any).general?.ambientcolor ?? "1 1 1")
+            .split(/\s+/)
+            .map((v: string) => Number(v) || 0);
+          sceneLight = {
+            dir: [x / len, y / len, z / len],
+            base: [amb[0] ?? 1, amb[1] ?? 1, amb[2] ?? 1],
+            add: [
+              (rgb[0] ?? 1) * intensity * SCENE_LIGHT_K,
+              (rgb[1] ?? 1) * intensity * SCENE_LIGHT_K,
+              (rgb[2] ?? 1) * intensity * SCENE_LIGHT_K,
+            ],
+          };
+        }
+      }
+      const layersHaveNormals = (l: any) =>
+        !!(l && l.puppet && l.puppet.meshes && l.puppet.meshes.some((m: any) => m && m.normals));
 
       // ---- 文字对象 / 组件挂件（时钟、日期、星期等动态文本）----
       // 文字渲到离屏 2D canvas → GL 纹理 → 挂回图层本身（textureName），以**普通图层身份**

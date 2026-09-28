@@ -68,13 +68,16 @@ in vec3 a_pos;
 in vec2 a_uv;
 in vec4 a_bone;
 in vec4 a_weight;
+in vec3 a_normal;
 uniform mat4 u_mvp;
+uniform mat3 u_normalMat;
 uniform mat4 u_skin[${maxBones}];
 uniform int u_boneCount;
 uniform float u_keepZ;
 uniform vec2 u_partScale;
 uniform vec2 u_partPivot;
 out vec2 v_uv;
+out vec3 v_wnormal;
 void main() {
   vec4 p = vec4(a_pos, 1.0);
   vec4 skinned = vec4(0.0);
@@ -94,6 +97,10 @@ void main() {
   local.xy = u_partPivot + (local.xy - u_partPivot) * u_partScale;
   gl_Position = u_mvp * vec4(local.xy, local.z * u_keepZ, 1.0);
   v_uv = a_uv;
+  // [we-scene patch 2026-09-28] 3D 网格的光照法线（世界向）。u_normalMat 由宿主按
+  // 图层世界矩阵的旋转部分给（见 draw 的 opts.normalMat）。2D puppet 没有法线属性，
+  // 属性槽喂的是常量 (0,0,1)，且 u_lightOn=0 时片元里整段光照被短路，逐位不影响。
+  v_wnormal = u_normalMat * a_normal;
 }`
 
 // UV 对层 FBO 同样是恒等的，不要在这里翻 v。层 FBO 虽然「视觉上倒置」
@@ -104,12 +111,32 @@ void main() {
 const MDL_FRAG = `#version 300 es
 precision mediump float;
 in vec2 v_uv;
+in vec3 v_wnormal;
 uniform sampler2D u_tex;
 uniform vec4 u_color;
+// [we-scene patch 2026-09-28] 场景光照（**只对带法线的真 3D 网格生效**）：
+//   base = 场景 ambientcolor（作者素材实测：背光面 = 反照率 × ambientcolor，3281559867
+//          舞台墙面 0.58×、贴图均值 233 → 135）
+//   add  = 平行光 color × intensity × K（K 见 scene-mount 的 SCENE_LIGHT_K）
+//   结果 = clamp(base + add × max(0, N·L), 0, 1)
+// u_lightOn = 0 时逐位等价于改动前（t * u_color）。
+uniform vec3 u_lightDir;
+uniform vec3 u_lightBase;
+uniform vec3 u_lightAdd;
+uniform float u_lightOn;
 out vec4 fragColor;
 void main() {
   vec4 t = texture(u_tex, v_uv);
-  fragColor = t * u_color;
+  vec3 mul = vec3(1.0);
+  if (u_lightOn > 0.5) {
+    vec3 n = normalize(v_wnormal);
+    float ndl = max(dot(n, normalize(u_lightDir)), 0.0);
+    // 只钳下界，**不钳上界**：作者素材里受光面就是过 1 的（棋盘/草地实测 1.2×），
+    // 钳到 1 会正好把它压成「不亮的白」。非 HDR 目标写帧缓冲时由 GL 自然截断，
+    // 与钳上界等价；HDR 场景则进 RGBA16F 交给 bloom/tonemap，与 WE 同一条路。
+    mul = max(u_lightBase + u_lightAdd * ndl, 0.0);
+  }
+  fragColor = t * u_color * vec4(mul, 1.0);
 }`
 
 // [we-scene patch 2026-09-28] 这条补偿规则**按壁纸白名单生效**：全库扫描（324 张 /
@@ -386,6 +413,7 @@ export function createMDLRenderer(gl) {
       gl.bindAttribLocation(p, 1, 'a_uv')
       gl.bindAttribLocation(p, 2, 'a_bone')
       gl.bindAttribLocation(p, 3, 'a_weight')
+      gl.bindAttribLocation(p, 4, 'a_normal')
       gl.linkProgram(p)
       linked = !!gl.getProgramParameter(p, gl.LINK_STATUS)
     } catch (e) {
@@ -409,36 +437,54 @@ export function createMDLRenderer(gl) {
     keepZ: gl.getUniformLocation(prog, 'u_keepZ'),
     partScale: gl.getUniformLocation(prog, 'u_partScale'),
     partPivot: gl.getUniformLocation(prog, 'u_partPivot'),
+    normalMat: gl.getUniformLocation(prog, 'u_normalMat'),
+    lightDir: gl.getUniformLocation(prog, 'u_lightDir'),
+    lightBase: gl.getUniformLocation(prog, 'u_lightBase'),
+    lightAdd: gl.getUniformLocation(prog, 'u_lightAdd'),
+    lightOn: gl.getUniformLocation(prog, 'u_lightOn'),
   }
+  const IDENTITY3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1])
   const identitySkin = new Float32Array(MAX_BONES * 16)
   for (let i = 0; i < MAX_BONES; i++) identitySkin.set(IDENTITY, i * 16)
 
-  // 每个网格一套 VAO/VBO（顶点数据静态，蒙皮在 GPU 完成）
+  // 每个网格一套 VAO/VBO（顶点数据静态，蒙皮在 GPU 完成）。
+  // [we-scene patch 2026-09-28] 键从 mdl 换成**子网格记录**：一个 MDL 可以有多个
+  // 子网格（stage.mdl 15 个、TDRS 64 个），各自独立的顶点/索引缓冲。mdl 只有 1 个
+  // 子网格时键仍是「伪网格对象」（见 draw 里 legacyMesh），与改动前逐位等价。
   const meshes = new WeakMap()
-  function ensureMesh(mdl) {
-    let m = meshes.get(mdl)
+  function ensureMesh(mesh) {
+    let m = meshes.get(mesh)
     if (m) return m
     const vao = gl.createVertexArray()
     gl.bindVertexArray(vao)
-    const n = mdl.vertexCount
-    // 交错：pos(3) uv(2) bone(4) weight(4) = 13 float / 52B
-    const data = new Float32Array(n * 13)
+    const n = mesh.vertexCount
+    // 交错：pos(3) uv(2) bone(4) weight(4) [normal(3)] = 13 或 16 float
+    // 有法线的（真 3D 网格 / 无骨骼模型）多交错 3 个 float 供片元光照用；
+    // 2D puppet 的 flag 里没有 NORMAL → 布局与改动前逐位一致。
+    const hasN = !!mesh.normals
+    const F = hasN ? 16 : 13
+    const data = new Float32Array(n * F)
     for (let i = 0; i < n; i++) {
-      const o = i * 13
-      data[o] = mdl.positions[i * 3]
-      data[o + 1] = mdl.positions[i * 3 + 1]
-      data[o + 2] = mdl.positions[i * 3 + 2]
-      data[o + 3] = mdl.uvs[i * 2]
-      data[o + 4] = mdl.uvs[i * 2 + 1]
+      const o = i * F
+      data[o] = mesh.positions[i * 3]
+      data[o + 1] = mesh.positions[i * 3 + 1]
+      data[o + 2] = mesh.positions[i * 3 + 2]
+      data[o + 3] = mesh.uvs[i * 2]
+      data[o + 4] = mesh.uvs[i * 2 + 1]
       for (let k = 0; k < 4; k++) {
-        data[o + 5 + k] = mdl.boneIdx[i * 4 + k]
-        data[o + 9 + k] = mdl.weights[i * 4 + k]
+        data[o + 5 + k] = mesh.boneIdx[i * 4 + k]
+        data[o + 9 + k] = mesh.weights[i * 4 + k]
+      }
+      if (hasN) {
+        data[o + 13] = mesh.normals[i * 3]
+        data[o + 14] = mesh.normals[i * 3 + 1]
+        data[o + 15] = mesh.normals[i * 3 + 2]
       }
     }
     const vbuf = gl.createBuffer()
     gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW)
-    const S = 52
+    const S = F * 4
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, S, 0)
     gl.enableVertexAttribArray(1)
@@ -447,34 +493,56 @@ export function createMDLRenderer(gl) {
     gl.vertexAttribPointer(2, 4, gl.FLOAT, false, S, 20)
     gl.enableVertexAttribArray(3)
     gl.vertexAttribPointer(3, 4, gl.FLOAT, false, S, 36)
+    if (hasN) {
+      gl.enableVertexAttribArray(4)
+      gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, 52)
+    } else {
+      gl.disableVertexAttribArray(4)
+      gl.vertexAttrib3f(4, 0, 0, 1)
+    }
     const ibuf = gl.createBuffer()
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf)
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mdl.indices, gl.STATIC_DRAW)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
-    m = { vao, vbuf, ibuf }
-    meshes.set(mdl, m)
+    m = { vao, vbuf, ibuf, hasNormals: hasN }
+    meshes.set(mesh, m)
     return m
   }
+
+  // 单网格模型（绝大多数 2D puppet）把顶层字段包成一条「伪子网格」，让 draw/upload
+  // 只有一条代码路径；多网格模型直接走 mdl.meshes。
+  const legacyMeshOf = (mdl) => ({
+    positions: mdl.positions,
+    uvs: mdl.uvs,
+    boneIdx: mdl.boneIdx,
+    weights: mdl.weights,
+    vertexCount: mdl.vertexCount,
+    indices: mdl.indices,
+    indexCount: mdl.indexCount,
+    indexType: mdl.indexType,
+  })
+  const meshListOf = (mdl) => (mdl.meshes && mdl.meshes.length > 1 ? mdl.meshes : null)
 
   return {
     gl,
     prog,
     maxBones: MAX_BONES,
     upload(mdl) {
-      ensureMesh(mdl)
+      const list = meshListOf(mdl)
+      if (list) {
+        for (const mesh of list) if (mesh.vertexCount) ensureMesh(mesh)
+      } else {
+        ensureMesh(legacyMeshOf(mdl))
+      }
     },
-    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex, keepZ }
+    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex, keepZ, meshTextures }
     // overrideTex：puppet 层跑过效果链时采样源是链尾 FBO 的纹理，而不是原始贴图
     // （效果在贴图空间合成，见 renderer.js 中部那段长注释）。传裸 WebGLTexture。
     // keepZ：顶点 z 是否参与投影（透视场景的真 3D 网格 = true，2D puppet = 缺省 false）。
+    // meshTextures：**逐子网格贴图**（宿主按每个子网格的材质 json 解析，见
+    // scene-mount 的 model 分支）。缺省/缺项回落到 texture —— 单网格模型行为不变。
     draw(mvp, mdl, opts, texture) {
-      const m = ensureMesh(mdl)
       gl.useProgram(prog)
-      gl.bindVertexArray(m.vao)
-      gl.activeTexture(gl.TEXTURE0)
-      const src = opts.overrideTex || (texture && texture.glTex ? texture.glTex : texture)
-      gl.bindTexture(gl.TEXTURE_2D, src)
-      gl.uniform1i(uni.tex, 0)
       gl.uniformMatrix4fv(uni.mvp, false, mvp)
       gl.uniform1f(uni.keepZ, opts.keepZ ? 1 : 0)
       const col = opts.color || [1, 1, 1, 1]
@@ -486,6 +554,7 @@ export function createMDLRenderer(gl) {
       // 人物消失只剩零碎头发片）。恒等值下这一行是逐位恒等（×1 再加 0）。
       gl.uniform2f(uni.partScale, 1, 1)
       gl.uniform2f(uni.partPivot, 0, 0)
+      // 蒙皮与混合对**整个模型**只算一次（骨架只有一套），逐子网格只换 VAO/贴图/索引。
       const skin = computeSkinMatrices(mdl, opts.time || 0, opts.animLayers, opts.boneOverrides)
       const count = Math.min(mdl.bones.length, MAX_BONES)
       if (skin && count > 0) {
@@ -504,22 +573,89 @@ export function createMDLRenderer(gl) {
         gl.enable(gl.BLEND)
         gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
       }
-      const idxType = mdl.indexType === 'u32' ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
-      const squash = opts.syncCoveredParts ? collapsedPartSquash(mdl, skin, opts.animLayers) : null
-      if (squash || (mdl.parts && opts.syncCoveredParts)) {
-        const bytes = idxType === gl.UNSIGNED_INT ? 4 : 2
-        for (let i = 0; i < mdl.parts.length; i++) {
-          const k = squash ? squash[i * 3] : 1
-          if (k < 0.25) continue // 压到 1/4 以下视同收完：不画（回弹时同一条判据自动恢复）
-          const part = mdl.parts[i]
-          const pivotX = squash && k < 1 ? squash[i * 3 + 1] : (part.x0 + part.x1) / 2
-          const pivotY = squash && k < 1 ? squash[i * 3 + 2] : (part.y0 + part.y1) / 2
-          gl.uniform2f(uni.partScale, 1, k)
-          gl.uniform2f(uni.partPivot, pivotX, pivotY)
-          gl.drawElements(gl.TRIANGLES, part.size, idxType, part.start * bytes)
-        }
+      gl.activeTexture(gl.TEXTURE0)
+      gl.uniform1i(uni.tex, 0)
+      // [we-scene patch 2026-09-28] 场景光照：宿主给 {dir:[x,y,z], base:[r,g,b], add:[r,g,b]}
+      //（base = 场景 ambientcolor，add = 平行光 color×intensity×K）。只对**带法线的网格**生效，
+      // 逐网格在下面的循环里开关 u_lightOn；关着时片元里 `mul ≡ 1`，与改动前逐位一致。
+      const SL = opts.sceneLight
+      gl.uniformMatrix3fv(uni.normalMat, false, (opts.normalMat && opts.normalMat.length === 9) ? opts.normalMat : IDENTITY3)
+      if (SL) {
+        gl.uniform3f(uni.lightDir, SL.dir[0], SL.dir[1], SL.dir[2])
+        gl.uniform3f(uni.lightBase, SL.base[0], SL.base[1], SL.base[2])
+        gl.uniform3f(uni.lightAdd, SL.add[0], SL.add[1], SL.add[2])
       } else {
-        gl.drawElements(gl.TRIANGLES, mdl.indexCount, idxType, 0)
+        gl.uniform3f(uni.lightBase, 1, 1, 1)
+        gl.uniform3f(uni.lightAdd, 0, 0, 0)
+        gl.uniform3f(uni.lightDir, 0, 1, 0)
+      }
+      const identity = opts.overrideTex || (texture && texture.glTex ? texture.glTex : texture) || null
+      // 多子网格：mdl.meshes 是 parseMeshes 的产物（1 个网格时与上面这份伪网格等价）。
+      // 零件表（parts）只挂在第一个子网格上：那是 2D puppet 的「收拢零件」规则用的
+      // 元数据，而那批模型都是单网格；多网格的 3D 模型不做零件剔除（画满索引区）。
+      const list = meshListOf(mdl)
+      const legacyMesh = list ? null : legacyMeshOf(mdl)
+      const n = list ? list.length : 1
+      // [we-scene patch 2026-09-28] **真 3D 网格之间要开深度测试**。
+      //
+      // 为什么：一个 .mdl 的多个子网格是**同一个物体的不同部件**，它们相互遮挡靠的是
+      // 深度，不是绘制顺序。关掉深度测试时后画的网格会整片盖住先画的：3281559867 的
+      // 舞台 15 个网格里，场地地砖在前（mesh0/3/7…），四周草地/远景在后（mesh4/12），
+      // 于是「棋盘地砖被草地整片涂绿」—— 作者 preview 里那块清清楚楚的棋盘完全看不见。
+      // （实验：把绘制顺序反过来地砖立刻出现，证明是顺序遮挡而非贴图/UV 问题。）
+      //
+      // 只在透视场景（keepZ，即真 3D）开：2D puppet 的网格 z 是建模残留、本来就该
+      // 按图层 z 序压平绘制（见 drawPuppetDirect 的 keepZ 注释），开深度测试会把它们
+      // 按 z 互相裁剪。
+      //
+      // 深度缓冲在**本次绘制前清一次**：图层合成语义仍然由 z 序 + 混合决定（跨图层
+      // 不互相裁），深度只负责这**一个模型内部**的部件前后。宿主给的 FBO 没有深度
+      // 附件时（效果链 FBO）深度测试退化为恒通过，与改动前一致。
+      const useDepth = !!opts.keepZ
+      if (useDepth) {
+        // 顺序不能反：`clear(DEPTH_BUFFER_BIT)` 会被**深度写掩码**拦住 —— 上一次绘制
+        // 结尾把 depthMask 置 false 后，先 clear 等于没清（深度残留上一帧/上一层的值，
+        // 遮挡关系全错）。必须先开写掩码再清。
+        gl.depthMask(true)
+        gl.clearDepth(1)
+        gl.clear(gl.DEPTH_BUFFER_BIT)
+        gl.enable(gl.DEPTH_TEST)
+        gl.depthFunc(gl.LEQUAL)
+      }
+      for (let gi = 0; gi < n; gi++) {
+        const mesh = list ? list[gi] : legacyMesh
+        if (!mesh || !mesh.vertexCount || !mesh.indexCount) continue
+        const m = ensureMesh(mesh)
+        gl.bindVertexArray(m.vao)
+        // 带法线且场景有光 → 走上光路径（片元里 N·L）；否则常量 1（逐位等价旧行为）
+        gl.uniform1f(uni.lightOn, SL && m.hasNormals ? 1 : 0)
+        // 每网格贴图：overrideTex（效果链输出）优先，其次该网格自己的材质贴图，
+        // 最后回落整层贴图（单网格模型走的就是这一条）。
+        const per = opts.meshTextures && opts.meshTextures[gi]
+        const src = opts.overrideTex || (per && per.glTex ? per.glTex : per) || identity
+        gl.bindTexture(gl.TEXTURE_2D, src)
+        const idxType = mesh.indexType === 'u32' ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
+        const parts = gi === 0 ? mdl.parts : null
+        const squash = parts && opts.syncCoveredParts ? collapsedPartSquash(mdl, skin, opts.animLayers) : null
+        if (squash || (parts && opts.syncCoveredParts)) {
+          const bytes = idxType === gl.UNSIGNED_INT ? 4 : 2
+          for (let i = 0; i < parts.length; i++) {
+            const k = squash ? squash[i * 3] : 1
+            if (k < 0.25) continue // 压到 1/4 以下视同收完：不画（回弹时同一条判据自动恢复）
+            const part = parts[i]
+            const pivotX = squash && k < 1 ? squash[i * 3 + 1] : (part.x0 + part.x1) / 2
+            const pivotY = squash && k < 1 ? squash[i * 3 + 2] : (part.y0 + part.y1) / 2
+            gl.uniform2f(uni.partScale, 1, k)
+            gl.uniform2f(uni.partPivot, pivotX, pivotY)
+            gl.drawElements(gl.TRIANGLES, part.size, idxType, part.start * bytes)
+          }
+        } else {
+          gl.drawElements(gl.TRIANGLES, mesh.indexCount, idxType, 0)
+        }
+      }
+      if (useDepth) {
+        gl.depthMask(false)
+        gl.disable(gl.DEPTH_TEST)
       }
       gl.bindVertexArray(null)
     },

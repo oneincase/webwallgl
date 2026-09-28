@@ -907,6 +907,7 @@ export function createRenderer(canvas, opts = {}) {
     if (hdrSceneFbo) {
       gl.deleteFramebuffer(hdrSceneFbo.fbo)
       gl.deleteTexture(hdrSceneFbo.tex)
+      if (hdrSceneFbo.depthRbo) gl.deleteRenderbuffer(hdrSceneFbo.depthRbo)
     }
     const fbo = gl.createFramebuffer()
     const tex = gl.createTexture()
@@ -918,8 +919,23 @@ export function createRenderer(canvas, opts = {}) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    // [we-scene patch 2026-09-28] HDR 目标必须带**深度附件**。
+    //
+    // 没有深度缓冲时，`gl.enable(DEPTH_TEST)` 是**空转**（GL 规定：帧缓冲没有深度
+    // 附件时深度测试恒通过），而 hdr:true 的场景整帧都画进这张 FBO（见 bindFinal）。
+    // 后果是真 3D 网格之间的前后关系完全失效：3281559867 的舞台 15 个子网格里，
+    // 后画的草地（mesh5/mesh12）把几何上更近的棋盘地坪（mesh8，深度差 1e-5）整片盖住，
+    // 作者 preview 里那块棋盘地坪看不见。
+    // 定界手法（一分钟出结论）：把 depthFunc 临时改成 `NEVER` —— 画面纹丝不动
+    // 就说明深度测试根本没参与（若真生效，3D 网格应当整块消失）。同一手法也验过
+    // `GREATER` 反号，那时画面有变化只是因为它改的是默认帧缓冲那条路径。
+    const depthRbo = gl.createRenderbuffer()
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRbo)
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRbo)
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    hdrSceneFbo = { fbo, tex, width, height }
+    hdrSceneFbo = { fbo, tex, depthRbo, width, height }
     return hdrSceneFbo
   }
   // 粒子系统（particles.js）绘制自己绑帧缓冲，经返回对象的 getFrameTarget 取同一目标。
@@ -951,23 +967,32 @@ export function createRenderer(canvas, opts = {}) {
     gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, width, height)
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rbo)
+    // [we-scene patch 2026-09-28] MSAA 目标同样要深度附件（理由见 ensureHdrTarget）：
+    // 缺了它时 `aa=msaa*` 的场景里 3D 网格深度测试静默失效。分辨率/采样数必须与
+    // 颜色附件完全一致，否则 FBO 不完整（下面那条 checkFramebufferStatus 会兜住）。
+    const depthRbo = gl.createRenderbuffer()
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRbo)
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, width, height)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRbo)
     const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
     gl.bindRenderbuffer(gl.RENDERBUFFER, null)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     if (!ok) {
       gl.deleteFramebuffer(fbo)
       gl.deleteRenderbuffer(rbo)
+      gl.deleteRenderbuffer(depthRbo)
       if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: FBO 不完整（${want}x ${width}x${height}），回退 off`) }
       aaMode = 'off'
       return
     }
-    msaaTarget = { fbo, rbo, width, height, samples }
+    msaaTarget = { fbo, rbo, depthRbo, width, height, samples }
     if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: on ${samples}x ${width}x${height}`) }
   }
   function destroyMsaaTarget() {
     if (!msaaTarget) return
     gl.deleteFramebuffer(msaaTarget.fbo)
     gl.deleteRenderbuffer(msaaTarget.rbo)
+    if (msaaTarget.depthRbo) gl.deleteRenderbuffer(msaaTarget.depthRbo)
     msaaTarget = null
   }
   // MSAA → 默认帧缓冲 resolve（多重采样缓冲不能被采样，只能 blit 解析）。
@@ -2601,7 +2626,8 @@ export function createRenderer(canvas, opts = {}) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
       gl.generateMipmap(gl.TEXTURE_2D)
     }
-    const mvp = mat4Multiply(viewProj, puppetModelMatrix(layer, cam))
+    const layerModel = puppetModelMatrix(layer, cam)
+    const mvp = mat4Multiply(viewProj, layerModel)
     // [we-scene patch] 真 3D 静态网格（generic4 + LIGHTING，仅 3509243656 的
     // 球体/天空盒）同样受场景环境光：u_color 乘 max(0.001, ambientcolor)。
     // 2D puppet（人物）材质是 puppettexturechannels、不开 LIGHTING，乘子为 1。
@@ -2609,6 +2635,8 @@ export function createRenderer(canvas, opts = {}) {
       time,
       overrideTex: overrideTex || null,
       ambient: layerColorAmbient(layer.lightingEnabled, sceneAmbient),
+      // [we-scene patch 2026-09-28] 图层模型矩阵（3D 网格光照要它的旋转部分当法线矩阵）
+      model: layerModel,
       // [we-scene patch] 顶点 z 只有透视场景该参与投影：2D puppet 的网格 z 是建模残留
       // （3737267090 人物 z∈[111,435]），放过去会按深度被别的层挡住；而透视场景里的
       // 真 3D 网格（三体的天空盒/恒星/地球）必须保留 z，否则球体被压平在相机平面上
@@ -2929,7 +2957,13 @@ export function createRenderer(canvas, opts = {}) {
     } else {
       gl.clearColor(0, 0, 0, 1)
     }
-    gl.clear(gl.COLOR_BUFFER_BIT)
+    // [we-scene patch 2026-09-28] 深度缓冲也一起清：真 3D 网格的深度测试需要它
+    // （HDR/MSAA 目标本轮补上了深度附件）。顺序不能反 —— 深度清同样受**深度写掩码**
+    // 约束，mask 在前一帧末尾被置 false 时先清等于没清。2D 场景没有深度附件，
+    // 这一位是空操作。
+    gl.depthMask(true)
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+    gl.depthMask(false)
     // [we-scene patch] 帧间隔（g_Frametime）。用场景时间差分而非 performance.now()，
     // 与 g_Time 同源，暂停/限帧时不会算出虚高的 dt。异常值（首帧、跳变、标签页
     // 切回的巨大间隔）钳到 [1/1000, 1/10]：cursorripple 的冲量与 dt 成正比，
