@@ -1,5 +1,6 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
-import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
+import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 import type { Source } from "./api/types";
@@ -33,7 +34,7 @@ import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
-import { fitWindow, coverContentBounds, layerParallaxOffset } from "../vendor/we-scene/render/math.js";
+import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, anim, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
@@ -344,6 +345,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   let applyLiveImpl: ((wire: Record<string, { value: unknown }>) => void) | undefined;
   let pauseImpl: (() => void) | undefined;
   let resumeImpl: (() => void) | undefined;
+  /** 遮挡暂停（V5）：与用户 pause 共用媒体停启，但不碰 rt.paused。装配期未就绪时静默。 */
+  let setOccludedImpl: ((on: boolean) => void) | undefined;
   // 性能设置（抗锯齿/粒子/后处理）热更入口。cfg.quality 是真源：impl 未就绪
   // （渲染器还没建出来）时只写 cfg，装配到建渲染器那步会按 cfg.quality 应用。
   let setQualityImpl: ((q: ResolvedQuality) => void) | undefined;
@@ -372,6 +375,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
     setVideoTexScale(scale) {
       rt.cfg.videoTexScale = normalizeVideoTexScale(scale);
       applyVideoScaleImpl?.(rt.cfg.videoTexScale);
+    },
+    /** 遮挡暂停（V5）：媒体停启走 setOccludedImpl（装配后才有）。 */
+    setOccluded(on: boolean) {
+      setOccludedImpl?.(on);
     },
   };
 
@@ -4967,19 +4974,36 @@ cfg, source, pkgAbort.signal);
       // renderLoop 守卫壳（见其定义处注释：回调里抛错会让 rAF 链断死）。
       const renderLoopImpl = (now: number) => {
         if (disposed || rt.paused) return;
+        // 遮挡维护（V5）：fail-open（推送失联恢复全量）+ 画布 resize 重算。
+        // 放在一切渲染工作之前 —— 失联恢复必须当帧生效。
+        tickOcclusion(rt, now);
+        if (disposed || rt.paused || rt.occlusion?.band === "pause") return;
         // 帧率上限：相位累加调度，比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
         // 热改 fps（工具条滑条）只改 rt.cfg.sceneFps，这里同步进调度器、保留节拍相位。
-        const fps = rt.cfg.sceneFps || 60;
+        // 遮挡降帧（V5）：档位 fps 与宿主上限取 min —— 宿主显式 setFps 永远是上限，
+        // 遮挡只往下压不往上抬（评估报告 §4-B）。
+        const occlBand = rt.occlusion?.band;
+        const baseFps = rt.cfg.sceneFps || 60;
+        const fps = occlusionFpsCap(occlBand, occlusionCfgOf(rt), baseFps);
         if (fps !== gateFps) {
           gateFps = fps;
           frameGate.setFps(fps);
         }
         if (frameGate.shouldRender(now)) {
           markFrame(rt, now);
+          // 帧率守门挂起（V5，评估报告 R1）：遮挡降帧/暂停期间实测 fps 天然低于
+          // 宿主上限，照常喂守门会误降后处理档位；且暂停时长会把 adaptiveAccum
+          // 毒成一次巨大 dtS 直接清空冷却。挂起期间清零累计，解除后从当前帧
+          // 重新起算（lastAdaptiveT=0 → 下一 tick 只记账不累计）。
+          const occlActive = occlBand !== undefined && occlBand !== "run";
+          if (occlActive) {
+            adaptiveAccum = 0;
+            lastAdaptiveT = 0;
+          }
           // 帧率守门：按**真实经过时间**每秒喂一次读数（不是每帧喂 —— 否则高刷屏上
           // 判断频率随时间被放大）。读数取 frameMeter 的实测 fps（被上限跳过的帧不计入，
           // 反映的是真实出帧能力）；上限取配置值，宿主 setFps 改上限时这里自动跟上。
-          if (adaptive) {
+          if (adaptive && !occlActive) {
             if (lastAdaptiveT > 0) adaptiveAccum += rt.frameMeter.last - lastAdaptiveT;
             lastAdaptiveT = rt.frameMeter.last;
             if (adaptiveAccum >= 1000) {
@@ -5521,8 +5545,31 @@ cfg, source, pkgAbort.signal);
             }
           }
           const peek = rt.coverAlign;
+          // ROI 图层裁剪（V5 方案 E）：遮挡可见矩形 → 世界矩形。映射用 fitWindow
+          // 同源数学（含 peek 对齐；backing 与 CSS 等比，窗口结果一致），**相机本身
+          // 不动** —— ROI 只是 isLayerOffscreen 之外的第二个裁剪查询窗口。
+          // 逆映射本体在 occlusion.roiWorldRects（纯函数，可离线行为断言）：
+          // 可见区覆盖整画布时它返回 undefined，渲染器据此走原路径零行为差。
+          let roiWorld: WorldRect[] | undefined;
+          const occSnap = rt.occlusion;
+          if (occSnap && occSnap.rects.length) {
+            const cssW = c.clientWidth || 1;
+            const cssH = c.clientHeight || 1;
+            const ortho = (scene as any).general?.orthogonalprojection || {};
+            const projW = ortho.width || c.width;
+            const projH = ortho.height || c.height;
+            const roiFit = normalizeFit(rt.cfg.fit);
+            const win = fitWindow(roiFit, projW, projH, cssW, cssH, peek.x, peek.y);
+            // zoom 收缩与 buildCamera 同源（V5 修补）：曾用裸 fitWindow 逆映射，
+            // zoom<1（脚本 zoom-out）时可见窗算小 → 可见区边缘图层被静默误裁
+            //（独立评审实测 0.9 → 每侧 107px，超 64px 裁剪余量）；zoom>1 只是
+            // 保守多画。透视场景 cam.perspective 时 layerCullBoundsOf 返回 null，
+            // ROI 本就不生效。
+            applyCameraZoom(win, cameraZoomOf(scene));
+            roiWorld = roiWorldRects(occSnap.rects, win, cssW, cssH);
+          }
           void renderer
-            .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y)
+            .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y, roiWorld)
             .then(() => {
               // 库化桥接：首帧**画完之后**才 resolve mount() 的 Promise（一次性）。
               // 必须在 render().then 里，不能放在调用之前：那样 Promise 会早一帧
@@ -5536,7 +5583,9 @@ cfg, source, pkgAbort.signal);
                   first();
                 } catch { /* 订阅者抛错不打断渲染 */ }
               }
-              if (disposed || rt.paused) return;
+              // 遮挡暂停跨到渲染回调里也要拦住重排（setOccluded(true) 取消的是
+              // 挂起的 rAF，正在飞的这帧完成后不能再排下一帧）
+              if (disposed || rt.paused || occlPaused(rt)) return;
               // [we-scene patch] 常量动画的帧事件在 render 内（bindConstants）推进
               // 产生，render 后立刻做图层级广播（当帧派发；脚本对事件启动的动画
               // 从下一帧开始生效，与官方「播完检测」的用法兼容）。
@@ -5570,7 +5619,7 @@ cfg, source, pkgAbort.signal);
               disposed = true;
             });
         } else {
-          if (!rt.paused) rt.raf = requestAnimationFrame(renderLoop);
+          if (!rt.paused && !occlPaused(rt)) rt.raf = requestAnimationFrame(renderLoop);
         }
       };
       /**
@@ -5602,7 +5651,7 @@ cfg, source, pkgAbort.signal);
         }
       };
       const kickLoop = () => {
-        if (disposed || rt.paused) return;
+        if (disposed || rt.paused || occlPaused(rt)) return;
         if (rt.raf !== undefined) return;
         // 烘焙队列从这里（装配完成、马上要出第一帧）才开始消化：编码 PNG 的开销
         // 只服务下一次加载，不许在本次加载期抢主线程（见 bake-cache 的 createBakeQueue）。
@@ -5731,11 +5780,16 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt, cfg, `props hot: ${Object.keys(changed).join(",")}`);
       };
       pauseImpl = () => {
+        // 重入幂等：遮挡暂停 → 用户 pause() 的交织下会跑第二次，重捕获时
+        // 媒体已停 → playingVideos 清空成空表 → 之后谁都恢复不出来（评审 P0）。
+        // 首次调用已取消 rAF、已停媒体，kickLoop 又有 rt.paused/occlPaused 守卫，
+        // 早退不漏事。
+        if (pauseStarted) return;
         if (rt.raf !== undefined) {
           cancelAnimationFrame(rt.raf);
           rt.raf = undefined;
         }
-        if (!pauseStarted) pauseStarted = performance.now();
+        pauseStarted = performance.now();
         playingVideos.length = 0;
         for (const entry of textures.values()) {
           if (entry?.videoCtl?.isPlaying?.()) {
@@ -5771,6 +5825,32 @@ cfg, source, pkgAbort.signal);
         // 恢复后首帧立即出，不被暂停期间冻结的节拍相位挡住
         frameGate.reset();
         kickLoop();
+      };
+      /**
+       * 遮挡暂停（V5）：与用户 pause() 的三种交织（评估报告 §4-A 的语义边界）：
+       *
+       *   ① 纯遮挡：on=true 若已在暂停（pauseStarted≠0，用户先暂停过）就只记账
+       *      不重复捕获媒体（重复跑 pauseImpl 会把 playingVideos 清空重捕成空表，
+       *      用户 resume 时就什么都恢复不出来了）；on=false 复用 resumeImpl。
+       *   ② 用户暂停期间解除遮挡：**不恢复媒体、不 kickLoop**（rt.paused 还立着），
+       *      只把 pauseStarted 的账结掉 —— 否则遮挡解除会顺带把用户的暂停掀了。
+       *   ③ 用户在遮挡暂停期间手动 resume：resumeImpl 照常跑，kickLoop 有
+       *      rt.paused 守卫；渲染侧由 renderLoop 的遮挡档守卫兜住（不开画）。
+       */
+      setOccludedImpl = (on: boolean) => {
+        if (on) {
+          if (!pauseStarted) pauseImpl?.();
+          return;
+        }
+        if (!rt.paused) {
+          resumeImpl?.();
+          return;
+        }
+        // 用户暂停仍生效：只结暂停账（场景时间连续性），媒体与循环保持暂停
+        if (pauseStarted) {
+          pauseAccum += performance.now() - pauseStarted;
+          pauseStarted = 0;
+        }
       };
       applyLiveImpl = applyLiveProps;
       if (pendingWire) {

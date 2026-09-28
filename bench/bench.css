@@ -1376,3 +1376,101 @@ html[data-theme="light"] {
   font-size: 12px;
   line-height: 1.6;
 }
+
+/* ---------- 遮挡模拟器（V5，对标 Lively Grid Detection Overlay） ---------- */
+#occ-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  cursor: crosshair;
+  outline: 1px dashed rgba(255, 140, 90, 0.55);
+  outline-offset: -1px;
+  touch-action: none;
+}
+
+/* 网格分块层：与库内决策层（computeGridCoverage）同一近似口径的可视化 */
+#occ-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+#occ-grid .occ-tile {
+  position: absolute;
+  border: 1px solid rgba(255, 120, 80, 0.18);
+}
+
+#occ-grid .occ-tile.covered {
+  background: rgba(255, 90, 60, 0.38);
+  border-color: rgba(255, 120, 80, 0.5);
+}
+
+/* 模拟的「遮挡窗口」矩形 */
+#occ-veil .occ-win {
+  position: absolute;
+  background: rgba(255, 110, 70, 0.16);
+  border: 1.5px solid rgba(255, 130, 90, 0.9);
+  box-sizing: border-box;
+  cursor: move;
+}
+
+/* 右下角缩放手柄：命中判定在 bench.ts 按 16px 像素半径做（允许压线/出界） */
+#occ-veil .occ-win::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border-left: 1.5px solid rgba(255, 130, 90, 0.9);
+  border-top: 1.5px solid rgba(255, 130, 90, 0.9);
+  background: linear-gradient(135deg, transparent 49%, rgba(255, 130, 90, 0.4) 51%);
+  cursor: nwse-resize;
+}
+
+#occ-veil .occ-win .occ-win-badge {
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 6px;
+  background: rgba(255, 130, 90, 0.9);
+  color: #200;
+  border-radius: 0 0 4px 0;
+  white-space: nowrap;
+}
+
+#occ-hud {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  pointer-events: none;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(8, 10, 14, 0.72);
+  color: #9fe0ff;
+  border: 1px solid rgba(120, 180, 255, 0.35);
+  border-radius: 6px;
+  padding: 6px 10px;
+  white-space: pre;
+}
+
+#occ-hud .occ-band-pause { color: #ff7d66; }
+#occ-hud .occ-band-heavy { color: #ffb366; }
+#occ-hud .occ-band-light { color: #ffe066; }
+#occ-hud .occ-band-run { color: #8dff9e; }
+
+#occ-tip {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  pointer-events: none;
+  font-size: 11px;
+  background: rgba(8, 10, 14, 0.72);
+  color: #cfe3ff;
+  border: 1px solid rgba(120, 180, 255, 0.3);
+  border-radius: 6px;
+  padding: 3px 8px;
+}

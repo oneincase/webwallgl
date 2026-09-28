@@ -19,7 +19,8 @@
 //
 // capture 无需改动：本路径保留 preserveDrawingBuffer:true（实测它对 CPU 无影响，
 // 见提交记录），画布在静止期间也不被 clear，所以 toDataURL 仍拿到最后一帧。
-import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, reapplyVolume, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, reapplyVolume, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { occlusionFpsCap } from "./occlusion";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
@@ -361,6 +362,8 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   };
   let pauseImpl: (() => void) | undefined;
   let resumeImpl: (() => void) | undefined;
+  /** 遮挡暂停实现（装配后赋值；与 scene 路径同三种交织语义） */
+  let setOccludedImpl: ((on: boolean) => void) | undefined;
   let videoWasPlaying = false;
   // [1.3.0] 音量控制：setVolume 打的是 rt.sceneAudio，此前只有 mountScene 设，
   // 媒体壁纸调 setVolume 完全无效（视频照旧静音或照旧响）。这里直接操作 <video>。
@@ -388,6 +391,10 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
     },
     resume() {
       resumeImpl?.();
+    },
+    /** 遮挡暂停（V5）：同 scene 路径语义 —— 不碰 rt.paused，用户暂停不被遮挡解除掀掉 */
+    setOccluded(on: boolean) {
+      setOccludedImpl?.(on);
     },
     applyUserProperties() {
       /* 媒体壁纸没有效果链用户属性 */
@@ -520,14 +527,17 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
       // A/B 钩子：__noMediaIdle=true 关掉按需渲染跑基线（对照跑法见提交说明）
       const mediaIdleOff = (globalThis as any).__noMediaIdle === true;
       const renderLoop = (now: number) => {
-        if (disposed || rt.paused) return;
+        if (disposed || rt.paused || occlPaused(rt)) return;
         // 静止心跳按 **rAF 节奏**刷新，不按出帧节奏：帧率门会把大部分 rAF 拦在
         // shouldRender 之外，只在放行的帧上刷新的话，心跳会随 sceneFps 上限一起变慢
         // ——sceneFps 调到 1~2 时心跳就超时，静止待命被误报成「没在跑」。
         if (rt.renderIdleAt) rt.renderIdleAt = now;
         // 帧率上限：比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
         // 热改 fps 同步进调度器（保留节拍相位，平滑收敛）。
-        const fps = rt.cfg.sceneFps || 60;
+        // 遮挡降帧（V5）：档位 fps 与宿主上限取 min，同 scene 路径。
+        const occlBand = rt.occlusion?.band;
+        const baseFps = rt.cfg.sceneFps || 60;
+        const fps = occlusionFpsCap(occlBand, occlusionCfgOf(rt), baseFps);
         if (fps !== gateFps) {
           gateFps = fps;
           frameGate.setFps(fps);
@@ -596,25 +606,28 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
                   first();
                 } catch { /* 订阅者抛错不打断渲染循环 */ }
               }
-              if (disposed || rt.paused) return;
+              if (disposed || rt.paused || occlPaused(rt)) return;
               rt.raf = requestAnimationFrame(renderLoop);
             })
             .catch((e: Error) => fail(String(e.message || e).slice(0, 200)));
-        } else if (!rt.paused) {
+        } else if (!rt.paused && !occlPaused(rt)) {
           rt.raf = requestAnimationFrame(renderLoop);
         }
       };
       const kickLoop = () => {
-        if (disposed || rt.paused) return;
+        if (disposed || rt.paused || occlPaused(rt)) return;
         if (rt.raf !== undefined) return;
         rt.raf = requestAnimationFrame(renderLoop);
       };
       pauseImpl = () => {
+        // 重入幂等（同 scene 路径）：遮挡暂停 → 用户 pause() 交织下第二次跑
+        // 会把 videoWasPlaying 覆写成 false，恢复时视频永远不再起播（评审 P0）。
+        if (pauseStarted) return;
         if (rt.raf !== undefined) {
           cancelAnimationFrame(rt.raf);
           rt.raf = undefined;
         }
-        if (!pauseStarted) pauseStarted = performance.now();
+        pauseStarted = performance.now();
         const v = rt.video;
         videoWasPlaying = !!(v && !v.paused && !v.ended);
         v?.pause();
@@ -628,6 +641,22 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
         videoWasPlaying = false;
         frameGate.reset();
         kickLoop();
+      };
+      // 遮挡暂停（V5）：与 scene 路径同构 —— 已在暂停就只记账；用户暂停期间
+      // 解除遮挡只结账不恢复；正常解除走完整 resumeImpl。
+      setOccludedImpl = (on: boolean) => {
+        if (on) {
+          if (!pauseStarted) pauseImpl?.();
+          return;
+        }
+        if (!rt.paused) {
+          resumeImpl?.();
+          return;
+        }
+        if (pauseStarted) {
+          pauseAccum += performance.now() - pauseStarted;
+          pauseStarted = 0;
+        }
       };
       kickLoop();
     } catch (e) {
@@ -872,6 +901,19 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       player = null;
       reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`);
       mountAbPair();
+      // [遮挡审计 P1 修复] 下面（mountWebCodecsVideo 之后）会把 rt.sceneCtl 换成
+      // 「只认闭包 player」的 WebCodecs 实现；player 已在上面销毁 → 它的
+      // pause/resume/setOccluded 全成 no-op。而宿主的包装器正是靠
+      //「rt.sceneCtl?.setOccluded 是否存在」决定要不要自己接管 A/B 对
+      //（main.ts / api/mount.ts 的 `if (rt.sceneCtl?.setOccluded) return;`），
+      // 于是遮挡暂停与用户 pause() 双双静默失效 —— 现象是窗口被完全遮住后
+      // A/B 对继续解码、**继续出声**。开声音的视频壁纸走的正是这条路：
+      // setVolume(>0) → fallbackToAb。
+      // A/B 路径的不变量是「没有 sceneCtl」：直接走 mountAbPair 的那条分支
+      // （wantLoop && muted && supportsWebCodecsVideo 为假）本来就不设它，
+      // 宿主包装器里那套 rt.videoPairs 停启逻辑正是为这个状态写的。
+      // 这里恢复不变量，而不是再手写一份 ctl（避免第二份实现漂移）。
+      rt.sceneCtl = undefined;
       if (!allowReturn) rt.webcodecsPreferred = false;
     };
     player = mountWebCodecsVideo({
@@ -879,7 +921,14 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       container,
       cssText: css,
       fit: () => normalizeFit(rt.cfg.fit),
-      fps: () => rt.cfg.sceneFps || 60,
+      // fps 按当前遮挡档收敛（V5）：本路径逐帧调度有能力降帧，此前漏接（DOM
+      // <video> 直显才真只能 pause）。pause 档映射回 base —— 整页暂停归
+      // player.pause() 管，cap=0 会被调度器当「不限帧」。
+      fps: () => occlusionFpsCap(
+        rt.occlusion?.band === "pause" ? undefined : rt.occlusion?.band,
+        occlusionCfgOf(rt),
+        rt.cfg.sceneFps || 60,
+      ),
       paused: () => !!rt.paused,
       renderDpr: cfg.renderDpr,
       onFirstFrame: signalFirstFrame,
@@ -891,6 +940,11 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
     rt.sceneCtl = {
       pause: () => player?.pause(),
       resume: () => player?.resume(),
+      // 遮挡暂停（V5）：player.pause 幂等；解除时用户暂停仍生效就不恢复
+      setOccluded: (on: boolean) => {
+        if (on) player?.pause();
+        else if (!rt.paused) player?.resume();
+      },
       applyUserProperties() {},
     };
     // 取消静音需要音轨（本路径整体忽略音轨）：回退 A/B 让声音回来。

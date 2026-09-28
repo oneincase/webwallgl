@@ -19,6 +19,8 @@ import {
   clear,
   fitObjectFit,
   frameStats,
+  occlusionCfgOf,
+  pushOcclusion,
   reportDiag,
   resetCoverAlign,
   resetFrameMeter,
@@ -26,6 +28,8 @@ import {
   effectiveDpr,
   type Runtime,
 } from "./shell";
+import { occlusionFpsCap } from "./occlusion";
+import type { OcclusionPayload } from "./api/types";
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
 import { normalizeQuality, qualityFromQuery, type QualityOptions, type ResolvedQuality } from "./quality";
@@ -242,6 +246,25 @@ declare global {
        * 字段见 MediaSourceInit；未知字段忽略。
        */
       setMedia(init: Record<string, unknown> | null): void;
+      /**
+       * 遮挡推送（V5）：宿主枚举上层窗口矩形（换算到本窗口 CSS 像素）后推入，
+       * 库按分档配置自动暂停/降帧/恢复（语义见 api/types.ts OcclusionPayload）。
+       * 传 null 清除（恢复全量）。坐标 = 渲染器页视口（本 iframe）CSS 像素。
+       */
+      setOcclusion(payload: OcclusionPayload | null): void;
+      /** 遮挡态快照（测试台 HUD 用）：无推送时 null */
+      getOcclusion(): {
+        band: string;
+        ratio: number;
+        /** 网格覆盖率（Lively 口径对照；分档用 ratio） */
+        gridCoverage: number;
+        rectCount: number;
+        /** 消费层矩形总面积占画布比（远大于可见占比 = 合并在吞洞） */
+        rectAreaFrac: number;
+        /** 上一帧因 ROI 剔除的图层数 / 到达 ROI 闸门的图层数（非场景壁纸为 null） */
+        roiCulled: number | null;
+        roiGate: number | null;
+      } | null;
     };
     /**
      * 运行时观测面（只读）。宿主 / 测试台轮询取真实帧率：
@@ -251,7 +274,7 @@ declare global {
      * 网页壁纸经 shim postMessage 打点，可读。
      */
     __wpStats?: {
-      frame(): { fps: number; running: boolean; idle?: boolean };
+      frame(): { fps: number; running: boolean; idle?: boolean; occluded?: boolean; throttled?: boolean };
     };
   }
 }
@@ -356,7 +379,13 @@ window.__wp = {
   // 调整场景帧率：渲染循环每帧读取 rt.cfg.sceneFps，无需重挂载即可实时生效
   setSceneFps(fps: number) {
     rt.cfg.sceneFps = fps;
-    weShimSend(rt, "setFps", { n: fps });
+    // web shim 侧 fps 是推送式的：宿主改上限也要过档位收敛（min 语义，与
+    // 渲染循环路径的逐帧读一致 —— 遮挡只往下压不往上抬）。pause 档页已停，
+    // 直接播新上限即可。
+    const band = rt.occlusion?.band;
+    weShimSend(rt, "setFps", {
+      n: band && band !== "pause" ? occlusionFpsCap(band, occlusionCfgOf(rt), fps) : fps,
+    });
   },
   // 性能设置热更（抗锯齿/粒子/后处理档位）：就地生效不重挂载；写回 cfg 让
   // setRenderDpr 这类重挂路径之后仍保持。只传要改的键（部分更新）。
@@ -456,6 +485,47 @@ window.__wp = {
   },
   setMedia(init: Record<string, unknown> | null) {
     webSetMedia(rt, init);
+  },
+  // 遮挡推送（V5）：与公共 API SceneInstance.setOcclusion 同一条推送管线
+  // （shell.pushOcclusion 做分档/滞回/fail-open），A/B 视频对在这里补停启，
+  // 但仅限没有 sceneCtl.setOccluded 钩子的路径（mountAbPair 的 DOM 直显对）；
+  // scene 壁纸的 videoPairs 是全部场景纹理（含隐藏层/脚本停用层），无差别
+  // resume 会把它们全部起播（评审 P0）——scene/web/webcodecs 由
+  // sceneCtl.setOccluded 管。
+  setOcclusion(payload: OcclusionPayload | null) {
+    const prevBand = rt.occlusion?.band;
+    pushOcclusion(rt, payload);
+    const band = rt.occlusion?.band;
+    if (band === prevBand) return;
+    if (rt.sceneCtl?.setOccluded) return; // 有 sceneCtl 钩子的路径已由 pushOcclusion 处理
+    if (band === "pause") {
+      for (const p of rt.videoPairs ?? []) p.pause();
+      if (!rt.videoPairs?.length) rt.video?.pause();
+    } else if (prevBand === "pause" && !rt.paused) {
+      if (rt.videoPairs?.length) {
+        for (const p of rt.videoPairs) p.resume();
+      } else if (rt.video) {
+        void rt.video.play().catch(() => {});
+      }
+    }
+  },
+  getOcclusion() {
+    const occ = rt.occlusion;
+    if (!occ) return null;
+    // ROI 图层剔除读数：仅场景壁纸有渲染器（视频/网页路径无图层概念 → null）
+    const rs = rt.renderer?.roiCullStats?.();
+    // 消费层矩形总面积占画布比：rectArea ≫ 可见占比 = 合并在吞洞（回归观测点）
+    const canvasArea = Math.max(1, occ.canvasW * occ.canvasH);
+    const rectAreaFrac = Math.min(1, occ.rects.reduce((a, r) => a + r.w * r.h, 0) / canvasArea);
+    return {
+      band: occ.band,
+      ratio: Math.round(occ.ratio * 1000) / 1000,
+      gridCoverage: Math.round(occ.gridCoverage * 1000) / 1000,
+      rectCount: occ.rects.length,
+      rectAreaFrac: Math.round(rectAreaFrac * 1000) / 1000,
+      roiCulled: rs ? rs.lastFrame : null,
+      roiGate: rs ? rs.gateLastFrame : null,
+    };
   },
   getState() {
     const st = (rt as unknown as { webState?: { loaded: boolean; error: string | null } }).webState;

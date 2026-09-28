@@ -32,6 +32,11 @@
  *   --steady <ms>    稳态采样窗口（默认 4000）
  *   --settle <ms>    首帧后等待进入稳态的时间（默认 1500）
  *   --budget <ms>    单张总时限，超时算 fail（默认 60000）
+ *   --occlude        遮挡 A/B（减法协议拆贡献）：基线后同页量五个稳态窗口
+ *                    —— fps24/fps40（纯降帧，setSceneFps 压上限、不推遮挡）+ pause/
+ *                    heavy/light（1s 心跳推送合成遮挡窗，降帧+剔除叠加）。
+ *                    剔除贡献 = 纯降帧 − 组合；降帧贡献 = 基线 − 纯降帧。
+ *                    heavy=内部大窗留条带（ROI 剔除参与）、light=半屏
  *   --out <file>     JSON 输出路径（默认 /tmp/perf-bench/<ts>.json）
  *   --no-cache       保留 HTTP 缓存（默认禁用，量冷加载）
  */
@@ -473,6 +478,7 @@ function parseArgs(argv) {
     else if (k === "--budget") a.budget = Number(v());
     else if (k === "--trace") a.trace = true;
     else if (k === "--profile") a.profile = true;
+    else if (k === "--occlude") a.occlude = true;
     else if (k === "--software") a.software = true;
     else if (k === "--dpr") a.dpr = Number(v());
     else if (k === "--fps") a.fps = Number(v());
@@ -568,7 +574,7 @@ function aggregateProfile(profile, intervalMs) {
 }
 
 /** 一张壁纸：开新 target → 计时 → 稳态采样 → 关闭 */
-async function measureOne(session, { item, url, steady, settle, budget, trace, profile, allowCache, dpr }) {
+async function measureOne(session, { item, url, steady, settle, budget, trace, profile, allowCache, dpr, occlude, fpsBase }) {
   const rec = {
     itemId: item.itemId,
     title: item.title,
@@ -647,6 +653,81 @@ async function measureOne(session, { item, url, steady, settle, budget, trace, p
       fpsMin: fpsSamples.length ? Math.min(...fpsSamples) : 0,
       samples: fpsSamples.length,
     };
+
+    // 遮挡 A/B（--occlude）：同页在基线之后依次量五个稳态窗口，与基线同一把
+    // 尺（进程树 CPU 秒 + fps 探针 + getOcclusion 读数）。**减法协议拆贡献**：
+    //   ① 纯降帧：只 setSceneFps(24/40)、不推遮挡 —— 量帧率维度单独的贡献；
+    //   ② 组合：1s 心跳推送合成遮挡窗（heavy=内部大窗四边留条带让 ROI 图层
+    //      剔除真的参与；light=半屏）—— 降帧 + 剔除叠加；
+    //   剔除贡献 = 纯降帧 − 组合；降帧贡献 = 基线 − 纯降帧。
+    // 心跳必须有：fail-open 以 3s 无推送为失联判据，steady≥4s 的窗口不持续推
+    // 会被自己清态（bench 模拟器同款纪律）。
+    if (occlude) {
+      rec.occlusion = {};
+      const measureWindow = async (key, setupExpr, teardownExpr) => {
+        const ok = await page.evaluate(`!!(${setupExpr})`).catch(() => false);
+        if (!ok) {
+          rec.occlusion[key] = { fail: `setup 失败：${setupExpr.slice(0, 60)}` };
+          return;
+        }
+        await sleep(Math.max(settle, 1500)); // 分档驻留 400ms + 候选提交 + ROI/调度稳定
+        await page.evaluate(FPS_PROBE).catch(() => {});
+        const b2 = await session.processInfo();
+        const w2 = Date.now();
+        await sleep(steady);
+        const fs2 = (await page.evaluate("window.__fpsProbe ? window.__fpsProbe() : []").catch(() => [])) ?? [];
+        const a2 = await session.processInfo();
+        const ms2 = Date.now() - w2;
+        const occ2 = await page
+          .evaluate("window.__wp && window.__wp.getOcclusion ? window.__wp.getOcclusion() : null")
+          .catch(() => null);
+        if (teardownExpr) await page.evaluate(`(${teardownExpr})`).catch(() => {});
+        const { cpu: cpu2, byType: byType2 } = cpuDelta(b2, a2);
+        rec.occlusion[key] = {
+          ms: ms2,
+          cpuSeconds: cpu2,
+          cpuPercent: +((cpu2 / (ms2 / 1000)) * 100).toFixed(1),
+          byType: byType2,
+          fpsAvg: fs2.length ? +(fs2.reduce((x, y) => x + y, 0) / fs2.length).toFixed(1) : 0,
+          occ: occ2 && {
+            band: occ2.band,
+            ratio: occ2.ratio,
+            rectCount: occ2.rectCount,
+            rectAreaFrac: occ2.rectAreaFrac,
+            roiCulled: occ2.roiCulled,
+            roiGate: occ2.roiGate,
+          },
+        };
+        await sleep(700); // 清态/档位退出/调度回落缓冲，别渗进下一窗口
+      };
+      const fps0 = fpsBase ?? 60;
+      // ① 纯降帧（宿主上限压到档位值，无遮挡、无剔除）
+      await measureWindow("fps24", `window.__wp.setSceneFps ? (window.__wp.setSceneFps(24), true) : false`,
+        `window.__wp.setSceneFps(${fps0})`);
+      await measureWindow("fps40", `window.__wp.setSceneFps ? (window.__wp.setSceneFps(40), true) : false`,
+        `window.__wp.setSceneFps(${fps0})`);
+      // ② 组合（降帧 + ROI 剔除）
+      for (const mode of ["pause", "heavy", "light"]) {
+        await measureWindow(
+          mode,
+          `(() => {
+            if (!window.__wp || !window.__wp.setOcclusion) return false;
+            const mode = ${JSON.stringify(mode)};
+            const W = window.innerWidth, H = window.innerHeight;
+            const rects = mode === "pause" ? [[0, 0, W, H]]
+              : mode === "heavy" ? [[W * 0.06, H * 0.07, W * 0.88, H * 0.87]]
+              : [[0, 0, W / 2, H]];
+            let gen = 1;
+            const push = () => window.__wp.setOcclusion({ occluders: rects, gen: ++gen });
+            const t = setInterval(push, 1000);
+            window.__occStop = () => { clearInterval(t); window.__wp.setOcclusion(null); };
+            push();
+            return true;
+          })()`,
+          `window.__occStop ? (window.__occStop(), true) : true`,
+        );
+      }
+    }
 
     if (trace) {
       rec.trace = await page
@@ -778,6 +859,8 @@ export async function main(argv = process.argv) {
             profile: args.profile,
             allowCache: args.cache,
             dpr: args.dpr,
+            occlude: args.occlude,
+            fpsBase: args.fps || 60,
           });
         } catch (e) {
           rec = { itemId: item.itemId, title: item.title, type: item.type, sizeBytes: item.sizeBytes, fail: String(e.message).slice(0, 200) };
@@ -792,6 +875,31 @@ export async function main(argv = process.argv) {
                 : "") +
               (rec.trace ? `  ${rec.trace.netCount}req/${rec.trace.netMs}ms 解码 ${rec.trace.decodeMs}ms(${rec.trace.decodeCount}) 上传 ${rec.trace.upload.ms}ms(${(rec.trace.upload.bytes / 1e6).toFixed(1)}MB) shader ${rec.trace.shader.ms}ms(${rec.trace.shader.compiles}c)` : ""),
           );
+          if (rec.occlusion) {
+            for (const [mode, o] of Object.entries(rec.occlusion)) {
+              if (o.fail) { console.log(`   遮挡[${mode}] ✗ ${o.fail}`); continue; }
+              const base = rec.steady.cpuPercent;
+              const cut = base > 0 ? Math.round((1 - o.cpuPercent / base) * 100) : 0;
+              console.log(
+                `   遮挡[${mode.padEnd(5)}] band=${String(o.occ?.band).padEnd(5)} cpu ${String(o.cpuPercent).padStart(6)}%（基线 ${base}%，降 ${cut}%）  fps ${String(o.fpsAvg).padStart(5)}  ROI ${o.occ?.rectCount ?? "?"} 块/${Math.round((o.occ?.rectAreaFrac ?? 0) * 100)}%  剔除 ${o.occ?.roiCulled ?? 0}/${o.occ?.roiGate ?? "?"}`,
+              );
+            }
+            // 贡献度分解（减法协议）：剔除贡献 = 纯降帧 − 组合，降帧贡献 = 基线 − 纯降帧
+            const b = rec.steady.cpuPercent;
+            const parts = [
+              ["heavy", "fps24", "60→24"],
+              ["light", "fps40", "60→40"],
+            ];
+            for (const [comb, pure, label] of parts) {
+              const c = rec.occlusion[comb], p = rec.occlusion[pure];
+              if (!c || !p || c.fail || p.fail) continue;
+              const pp = Math.round(10 * (b - p.cpuPercent)) / 10;
+              const cp = Math.round(10 * (p.cpuPercent - c.cpuPercent)) / 10;
+              console.log(
+                `   分解[${comb}] 降帧(${label}) ${pp}pp + 剔除 ${cp}pp ≈ 合计 ${Math.round(10 * (b - c.cpuPercent)) / 10}pp（基线 ${b}%）`,
+              );
+            }
+          }
           const pr = rec.profileLoad ?? rec.profileSteady;
           if (args.profile && pr?.top?.length) {
             console.log(`   加载期热点：` + pr.top.slice(0, 6).map((t) => `${t.fn.split(" @ ")[0]} ${t.pct}%`).join(" · "));

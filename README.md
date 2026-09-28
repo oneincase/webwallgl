@@ -166,10 +166,11 @@ input.addEventListener("change", () => {
 | `pushPointer(u, v, buttons?, mods?)` | 外部指针注入（u/v 为 0..1 归一化；mods 为 ctrl/shift/alt/meta 掩码）。用于窗口收不到鼠标的宿主；scene 与 web 均生效 |
 | `pointerLeave()` | 指针离开：只清按键、保留最后位置（清位置会让视差与 xray 明显抽一下） |
 | `pushWheel(dx, dy, mode?, mods?)` | 滚轮 / 触摸板注入（仅网页壁纸）。dy 正=内容向下；Mac 触摸板双指捏合映射成 mods 的 ctrl 位 |
+| `setOcclusion(payload | null)` | 遮挡推送（V5）：宿主枚举上层窗口矩形（换算到壁纸窗口 CSS 像素）后推入，库按精确可见比例自动分档 —— ≤5% 暂停、≤30% 压帧到 24、≤70% 压到 40，进入立即、退出走对称滞回（各档退出阈 = 本档入阈 + 0.05：0.10/0.35/0.75）并逐级上爬 + 400ms 驻留（分档用遮挡分解的精确比例而非 Lively 式网格覆盖 —— 网格量化误差 ±2 tile 边会越过滞回带，网格只保留为对照读数）；暂停时媒体同步停、可见区外的图层跳过渲染（ROI 裁剪）。null 恢复全量；推送需 ≤2s 心跳，3 秒无推送自动恢复（fail-open）。挂载选项 occlusion 可调阈值，false 关闭 |
 | `load(source)` | 换场景，复用同一 canvas 与 WebGL 上下文；首帧后 resolve |
 | `release() / restore()` | 释放显存但保留配置（显示器睡眠）/ 用保留的配置重建 |
 | `destroy()` | 终态：释放资源、解绑监听，之后实例不可再用 |
-| `stats / info` | 实测帧率（{fps, running}，停了会归零而不是冻住）/ 场景基本信息（逻辑分辨率、图层数、是否含模型/粒子/文字） |
+| `stats / info` | 实测帧率（{fps, running}，停了会归零而不是冻住；遮挡态另有 occluded / throttled 两个标志位——宿主看门狗据此区分「主动降载」与「故障停帧」）/ 场景基本信息（逻辑分辨率、图层数、是否含模型/粒子/文字） |
 | `on(ev, fn)` | 订阅 ready / error / diagnostic，返回取消函数 |
 
 ## 用户属性 properties
@@ -341,6 +342,7 @@ b.pause(); // 不影响 a
 - HTTP 404 加载失败：确认 httpSource 指向的目录里真的有 scene.pkg（三种布局会依次尝试，全部失败才报错）
 - Failed to fetch 且无状态码：自定义协议/WKWebView 对缺失路径的行为，属正常容错路径，看最后一条错误即可
 - stats.fps 为 0 但画面在动：读数是「真正提交渲染」的帧，标签页被遮挡时浏览器会暂停 rAF，属预期
+- stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就开测试台工具条的「遮挡模拟」：HUD 实时显示档位、ROI 块数/面积（渲染器回报的精确分解）与图层剔除 c/g（分母 = 参与闸门的图层数），外加 tile 口径的覆盖率对照读数（对标 Lively 的 Grid Detection Overlay）。拖动遮挡窗可观察「ROI 面积 ≈ 可见面积」（吞洞会表现为 ROI 面积远超可见）
 - 有声音但延迟起播：自动播放策略要求用户交互后才允许出声，volume 默认 0 正是为此
 - 网页壁纸无音频/属性：入口 HTML 必须同源或 CORS 可读，库才能改写注入 WE shim；跨域不可读时会退回裸 iframe（无官方 API）。webSandbox: "strict" 不属此列：shim 照常注入、API 齐全，只是控制/音频/媒体走 postMessage 通道
 - 网页壁纸相对资源 404：依赖 &lt;base href> 指回原站点目录；依赖 location.href 拼路径的壁纸在 blob 加载下可能异常

@@ -29,6 +29,103 @@ export function puppetAnimMargin(layer) {
 }
 
 /**
+ * [we-scene patch] 图层的「裁剪包围盒」：世界 AABB 中心/半宽高 + 余量（**纯函数**）。
+ *
+ * 从 isLayerOffscreen 的闭包内提到模块级导出，理由与上面的 puppetAnimMargin 逐字相同：
+ * 视锥裁剪与 ROI 图层裁剪（V5 方案 E）必须共用**同一份** AABB/余量口径（视差上界、
+ * puppet 动画余量这类「多裁一层就是事故」的逻辑只允许一个真源），而内联在
+ * createRenderer 闭包里时 verify 只能用正则近似检查接线 —— **改坏了测不出来**。
+ * 提到模块级之后 verify-occlusion 可以直接调用它做行为断言（同 puppetAnimMargin 被
+ * verify-groups 直接调用的先例）。
+ *
+ * parallaxCtx 必须由调用方传入（renderScene 每帧就地更新它，是闭包态）；
+ * 其余输入全部来自 layer / cam。返回 null = 该层不参与任何 AABB 裁剪
+ * （透视场景 / 透视图层 / 尺寸未知），调用方照画。
+ */
+export function layerCullBoundsOf(layer, cam, parallaxCtx) {
+  // 透视场景的世界单位不是像素，2D AABB 裁剪会把几乎所有层判到窗外。
+  if (cam && cam.perspective) return null
+  // perspective 图层：X/Y 旋转 + 透视投影后 2D AABB 不再成立（旋转可以把屏外
+  // 边缘转进画面），停用裁剪。
+  if (layer.perspective) return null
+  const sw = layer.size[0] * layer.scale[0]
+  const sh = layer.size[1] * layer.scale[1]
+  // 尺寸未知（0）的层不裁：文字/声音/纯效果层的 size 常为 0，但仍可能有内容
+  if (sw === 0 || sh === 0) return null
+  // 负缩放（镜像）会让宽高为负，取绝对值才是真实包围盒
+  let halfW = Math.abs(sw) / 2
+  let halfH = Math.abs(sh) / 2
+  // 旋转后的 AABB：用旋转矩阵作用于半宽半高向量，取绝对值之和
+  const ang = layer.angles[2]
+  if (ang !== 0) {
+    const c = Math.abs(Math.cos(ang))
+    const s = Math.abs(Math.sin(ang))
+    const rw = halfW * c + halfH * s
+    const rh = halfW * s + halfH * c
+    halfW = rw
+    halfH = rh
+  }
+  const cx = layer.origin[0]
+  const cy = cam.projH - layer.origin[1]
+  // 视差与相机抖动会让层浮动；留余量避免边缘层被误裁。
+  // 注意：**相机抖动（camerashake）没有进这个余量**（它右乘到 viewProj 上做世界平移，
+  // cam 自身不变）。当前语料 21 张开启抖动的场景 roughness 全部 ≤1，峰值 ≤12.2px
+  // （1080p）≪ 64px，所以不可触发；若将来出现 roughness>1 且 amp 较大的场景，
+  // 这里需要补上 shake 位移，否则 ROI 会在摇镜时误裁可见区边缘的层。
+  let margin = 64
+  if (layer.parallaxDepthOwn || layer.parallaxDepth || layer.parallaxDepthProp) {
+    if (parallaxCtx.active && parallaxCtx.mode === 'mirage') {
+      // 引擎原式上界 = |anchor − center + mouse| × |d| × amount（静态项也计入，
+      // 见 math.js mirageParallaxOffset）
+      const depth = layer.parallaxDepthProp || layer.parallaxDepth || [0, 0]
+      const anchor = layer.parallaxAnchor || [cx, cam.projH - cy]
+      const ox = Math.abs(anchor[0] - parallaxCtx.cx + parallaxCtx.mx) * Math.abs(depth[0]) * parallaxCtx.amount
+      const oy = Math.abs(anchor[1] - parallaxCtx.cy + parallaxCtx.my) * Math.abs(depth[1]) * parallaxCtx.amount
+      margin += ox + oy
+    } else if (parallaxCtx.active && layer.parallaxDepth) {
+      // Legacy 上界 = |d|/2 × |parOff|（parOff 已 60px 封顶）
+      margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[0]) * parallaxCtx.lx)
+      margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[1]) * parallaxCtx.ly)
+    }
+  }
+  // [we-scene patch] puppet 的骨骼动画会把网格推离 origin，而这里判的是**静态** origin，
+  // 于是「停在屏外、靠动画开进来」的层会被每帧裁掉，动画永远播不出来。
+  // 2477602742 的三节火车 origin 在 x=5613/11478/17315（场景仅 2560 宽），
+  // 动画把根骨从 +102 拉到 -17944 —— 那正是火车驶过道口的那几秒。
+  // 症状是道口灯闪、栏杆落、汽笛响，唯独没有车。
+  const ext = puppetAnimMargin(layer)
+  return { cx, cy, halfW, halfH, marginX: margin + ext[0], marginY: margin + ext[1] }
+}
+
+/**
+ * [we-scene patch] ROI 相交判定（**纯函数**，isLayerOutsideRoi 与 verify 共用）：
+ * 包围盒（已含与视锥裁剪同源的余量）与**全部** ROI 世界矩形都不相交 → true（可跳过）。
+ * 多矩形天然支持：任一相交就画。
+ *
+ * 这里是**严格**相交（`>` / `<`）：边界接触算不相交 → 跳过。余量已把 AABB 外扩，
+ * 边界接触意味着图层本体离 ROI 至少一个余量，必然落在可见区之外 —— 保守方向仍是
+ * 「多画」，只有确认完全不相交才跳（漏画在 preserveDrawingBuffer 画布上会留陈旧像素）。
+ */
+export function layerBoundsOutsideRoi(b, roiRects) {
+  // 没有 ROI（undefined / 空表）= 不裁 —— 宿主没推遮挡时与引入本功能前**零行为差**
+  if (!roiRects || roiRects.length === 0) return false
+  // 包围盒未知（透视场景 / 透视图层 / 尺寸 0）→ 不裁，照画
+  if (!b) return false
+  for (let i = 0; i < roiRects.length; i++) {
+    const r = roiRects[i]
+    if (
+      b.cx + b.halfW + b.marginX > r.x0 &&
+      b.cx - b.halfW - b.marginX < r.x1 &&
+      b.cy + b.halfH + b.marginY > r.y0 &&
+      b.cy - b.halfH - b.marginY < r.y1
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
  * [we-scene patch] 容器效果链输出的 alpha 是否携带形状信息（合成方式判据）。
  * 抽成纯函数供 renderer 与 verifier 单源共用（复合层合成 3395777145 白屏根因）：
  *  - 任一 pass 写 `float alpha = <非 scene.a>`（Simple_Audio_Bars 的 bar*opacity）→ 有信息；
@@ -1639,6 +1736,18 @@ export function createRenderer(canvas, opts = {}) {
   // 3396722575 / 3405117965）。每帧 renderScene 更新，比沙箱默认 1920×1080 准。
   let renderWidth = 1920
   let renderHeight = 1080
+  // [we-scene patch] ROI 图层裁剪（V5 方案 E）：矩形走 renderScene 的**局部变量**
+  // （roiRectsLocal，逐次调用传参）—— 不用模块态：render 调用点是 fire-and-forget
+  //（scene-mount 里 void renderer.render().then()），帧超时重叠时上一次调用的
+  // 帧末语句会改写/清掉下一次调用还在读的状态，剔除整帧失效。统计口径：
+  // lastFrame = 上一帧因 ROI 跳过的层数，gateLastFrame = 到达 ROI 闸门的层数
+  // （分母），frames/totalCulled 是累计 —— verify-occlusion 的判据读这里。
+  let roiCullLastFrame = 0
+  let roiCullFrames = 0
+  let roiCullTotal = 0
+  // 到达 ROI 闸门的图层数（过了视锥裁剪、粒子/容器/合成源分支之后的普通图层）：
+  // 作为剔除数的分母，"本帧 42 层里剔了 5 层"才可读 —— 测试台 HUD 与 perf-bench 都读它
+  let roiGateLastFrame = 0
   function scriptedConstants(constants, cacheKey, time, layer) {
     if (!constants) return constants
     let hasScript = false
@@ -2124,65 +2233,38 @@ export function createRenderer(canvas, opts = {}) {
     gl.drawArrays(gl.TRIANGLES, 0, 6)
   }
 
+  // [we-scene patch] 图层的「裁剪包围盒」：世界 AABB 中心/半宽高 + 余量。
+  // 几何本体已提到模块级 layerCullBoundsOf（纯函数，供 verify 直接调用做行为断言）；
+  // 这里只把闭包态 parallaxCtx 传进去 —— 视锥裁剪与 ROI 图层裁剪（V5 方案 E）必须用
+  // **逐字相同**的 AABB/余量口径，两处各写一份迟早漂移（见模块级函数的注释）。
+  function layerCullBounds(layer, cam) {
+    return layerCullBoundsOf(layer, cam, parallaxCtx)
+  }
+
   // 图层的世界空间 AABB 与可见窗口是否完全不相交。
   // 世界坐标同 layerModelMatrix：y 已翻成 cam.projH - origin.y，可见窗口是
   // [offX, offX+viewW] × [offY, offY+viewH]（见 buildCamera 的 fitWindow）。
   function isLayerOffscreen(layer, cam) {
-    // 透视场景的世界单位不是像素，2D AABB 裁剪会把几乎所有层判到窗外。
-    if (cam && cam.perspective) return false
-    // perspective 图层：X/Y 旋转 + 透视投影后 2D AABB 不再成立（旋转可以把屏外
-    // 边缘转进画面），停用裁剪。
-    if (layer.perspective) return false
-    const sw = layer.size[0] * layer.scale[0]
-    const sh = layer.size[1] * layer.scale[1]
-    // 尺寸未知（0）的层不裁：文字/声音/纯效果层的 size 常为 0，但仍可能有内容
-    if (sw === 0 || sh === 0) return false
-    // 负缩放（镜像）会让宽高为负，取绝对值才是真实包围盒
-    let halfW = Math.abs(sw) / 2
-    let halfH = Math.abs(sh) / 2
-    // 旋转后的 AABB：用旋转矩阵作用于半宽半高向量，取绝对值之和
-    const ang = layer.angles[2]
-    if (ang !== 0) {
-      const c = Math.abs(Math.cos(ang))
-      const s = Math.abs(Math.sin(ang))
-      const rw = halfW * c + halfH * s
-      const rh = halfW * s + halfH * c
-      halfW = rw
-      halfH = rh
-    }
-    const cx = layer.origin[0]
-    const cy = cam.projH - layer.origin[1]
-    // 视差与相机抖动会让层浮动；留余量避免边缘层被误裁。
-    let margin = 64
-    if (layer.parallaxDepthOwn || layer.parallaxDepth || layer.parallaxDepthProp) {
-      if (parallaxCtx.active && parallaxCtx.mode === 'mirage') {
-        // 引擎原式上界 = |anchor − center + mouse| × |d| × amount（静态项也计入，
-        // 见 math.js mirageParallaxOffset）
-        const depth = layer.parallaxDepthProp || layer.parallaxDepth || [0, 0]
-        const anchor = layer.parallaxAnchor || [cx, cam.projH - cy]
-        const ox = Math.abs(anchor[0] - parallaxCtx.cx + parallaxCtx.mx) * Math.abs(depth[0]) * parallaxCtx.amount
-        const oy = Math.abs(anchor[1] - parallaxCtx.cy + parallaxCtx.my) * Math.abs(depth[1]) * parallaxCtx.amount
-        margin += ox + oy
-      } else if (parallaxCtx.active && layer.parallaxDepth) {
-        // Legacy 上界 = |d|/2 × |parOff|（parOff 已 60px 封顶）
-        margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[0]) * parallaxCtx.lx)
-        margin += Math.abs(parallaxDepthFactor(layer.parallaxDepth[1]) * parallaxCtx.ly)
-      }
-    }
-    // [we-scene patch] puppet 的骨骼动画会把网格推离 origin，而这里判的是**静态** origin，
-    // 于是「停在屏外、靠动画开进来」的层会被每帧裁掉，动画永远播不出来。
-    // 2477602742 的三节火车 origin 在 x=5613/11478/17315（场景仅 2560 宽），
-    // 动画把根骨从 +102 拉到 -17944 —— 那正是火车驶过道口的那几秒。
-    // 症状是道口灯闪、栏杆落、汽笛响，唯独没有车。
-    const ext = puppetAnimMargin(layer)
-    const marginX = margin + ext[0]
-    const marginY = margin + ext[1]
+    const b = layerCullBounds(layer, cam)
+    if (!b) return false
     return (
-      cx + halfW + marginX < cam.offX ||
-      cx - halfW - marginX > cam.offX + cam.viewW ||
-      cy + halfH + marginY < cam.offY ||
-      cy - halfH - marginY > cam.offY + cam.viewH
+      b.cx + b.halfW + b.marginX < cam.offX ||
+      b.cx - b.halfW - b.marginX > cam.offX + cam.viewW ||
+      b.cy + b.halfH + b.marginY < cam.offY ||
+      b.cy - b.halfH - b.marginY > cam.offY + cam.viewH
     )
+  }
+
+  // [we-scene patch] ROI 图层裁剪（V5 方案 E）：图层的 AABB（含与视锥裁剪同源的
+  // 余量）与**全部** ROI 世界矩形都不相交才跳过。世界矩形由宿主把遮挡可见区
+  // 经 fitWindow 逆映射得到（相机不动，ROI 只是第二个裁剪查询窗口），随
+  // renderScene 逐次调用传入（局部态，帧重叠安全）。
+  // 多矩形天然支持：任一相交就画。只做**纯渲染期跳过** —— 绝不写 visible/
+  // visibleSelf（否则触发 recomputeVisibility 抖动、遮挡区图层收不到
+  // cursorLeave）；renderCompositeSources 的合成源预渲染不经这里（那是要
+  // 「绕开 visible/offscreen 两道门」的既有约定，动了引用方吃白块）。
+  function isLayerOutsideRoi(layer, cam, roiRects) {
+    return layerBoundsOutsideRoi(layerCullBounds(layer, cam), roiRects)
   }
 
   // [we-scene patch] 序列帧动画：算出当前该采样 sprite sheet 的哪一格。
@@ -2798,9 +2880,16 @@ export function createRenderer(canvas, opts = {}) {
   }
 
 
-  async function renderScene(scene, textures, width, height, time, fit, alignX, alignY) {
+  async function renderScene(scene, textures, width, height, time, fit, alignX, alignY, roiRects) {
     renderWidth = width
     renderHeight = height
+    // ROI 图层裁剪（V5 方案 E）：宿主把遮挡可见区逆映射成世界矩形传入；本帧
+    // 生效（局部变量，帧重叠安全）。统计**每帧无条件复位**（ROI 没生效的帧也
+    // 清零）—— 否则"全幅跳过"的帧不复位，分母跨帧累加只增不减。
+    const roiRectsLocal = roiRects && roiRects.length ? roiRects : null
+    roiCullLastFrame = 0
+    roiGateLastFrame = 0
+    if (roiRectsLocal) roiCullFrames++
     fboStamp++
     // [we-scene patch] HDR：general.hdr=true 时场景画进 fp16 目标（SDR 路径
     // hdrActive 恒 false，下面所有 bindFinal/captureBackdrop/粒子目标零行为差）。
@@ -3092,6 +3181,15 @@ export function createRenderer(canvas, opts = {}) {
       // 而屏幕只有 3840 宽），这些层的效果链 FBO 会按整层尺寸分配 —— 跳过屏外层
       // 既省显存与逐 pass 开销，也不会改变画面（屏外内容本就被裁掉）。
       if (isLayerOffscreen(layer, cam)) continue
+      roiGateLastFrame++
+      // [we-scene patch] ROI 图层裁剪（V5 方案 E）：与全部遮挡可见矩形都不相交的层
+      // 跳过。与视锥裁剪同一位置（合成源/容器/粒子分支都在它之前各自处理，
+      // 本判定只作用于普通图层渲染 —— 与既有裁剪语义一致，不越界）。
+      if (roiRectsLocal && isLayerOutsideRoi(layer, cam, roiRectsLocal)) {
+        roiCullLastFrame++
+        roiCullTotal++
+        continue
+      }
       await renderLayer(layer, textures, cam, layerVP, width, height, time)
     }
     // [we-scene patch] camerafade 幕布：实现为「最后叠一层由不透明渐变到全透明的
@@ -4319,6 +4417,15 @@ export function createRenderer(canvas, opts = {}) {
         texScale: videoTexScale,
         tex: videoTexReportedSize,
       }
+    },
+    /**
+     * [we-scene patch] ROI 图层裁剪统计（V5 方案 E 的可观测面，verify-occlusion
+     * 与宿主诊断读这里）：lastFrame = 上一帧因 ROI 跳过的层数；gateLastFrame =
+     * 到达 ROI 闸门的层数（分母）；frames = 带 ROI 渲染的帧数；totalCulled =
+     * 累计跳过层数。
+     */
+    roiCullStats: function () {
+      return { lastFrame: roiCullLastFrame, gateLastFrame: roiGateLastFrame, frames: roiCullFrames, totalCulled: roiCullTotal }
     },
     // 场景切换时清空 shader 相关缓存（避免复用上一个场景的 shader 源/程序）
     resetShaderCaches: function () {

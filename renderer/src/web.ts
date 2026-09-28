@@ -4,9 +4,12 @@ import {
   effectiveUserVolume,
   markFrame,
   normalizeFit,
+  occlPaused,
+  occlusionCfgOf,
   reportDiag,
   type Runtime,
 } from "./shell";
+import { occlusionFpsCap, type OcclusionBand } from "./occlusion";
 import { createSpectrumCalibrator } from "./audio-calibrate";
 import type { WallpaperConfig } from "./types";
 import { startLiveSystem, type LiveSystemHandle } from "./live-system";
@@ -22,6 +25,19 @@ export function weShimCall(rt: Runtime, call: (win: any) => void) {
   } catch {
     /* 非同源 iframe 不可访问则忽略 */
   }
+}
+
+/**
+ * 重挂/种子播种的 fps（V5）：按当前遮挡档收敛 —— 档位推送只发生在跨界
+ * 一刻，重放路径（load 重发、buildSeedScript）必须自己看当前态，否则遮挡
+ * 中重挂的网页以满帧跑。pause 档播 base：页本身已被 setPaused 停掉，
+ * occlusionFpsCap("pause")=0 也不能播种（shim 会丢弃 <=0）。
+ */
+function seedFpsOf(rt: Runtime): number {
+  const band = rt.occlusion?.band;
+  const base = rt.cfg.sceneFps ?? 60;
+  if (!band || band === "pause") return base;
+  return occlusionFpsCap(band, occlusionCfgOf(rt), base);
 }
 
 /**
@@ -703,11 +719,15 @@ function attachIframe(
     const wire: Record<string, { value: unknown }> = {};
     for (const [k, v] of Object.entries(rt.liveUserProps ?? {})) wire[k] = { value: v };
     weShimSend(rt, "applyProps", { props: wire });
-    weShimSend(rt, "setFps", { n: rt.cfg.sceneFps ?? 60 });
+    // 重挂播种按当前遮挡态收敛（曾按裸 sceneFps 播种：遮挡中 load 重放的
+    // 新 iframe 满帧跑，遮停中重挂甚至整页跑起来 —— 档位推送只发生在跨界
+    // 那一刻，重放路径必须自己看当前态）。
+    weShimSend(rt, "setFps", { n: seedFpsOf(rt) });
     // 重放宿主的精确音量（重挂后 iframe 的 shim 是全新的，hostVolume 从 1
     // 起步；种子脚本已尽量早，这里兜 load 晚于种子执行的窗口）
     weShimSend(rt, "setVolume", { v: effectiveUserVolume(rt) });
-    if (rt.paused) weShimSend(rt, "setPaused", { v: true });
+    // 用户暂停或遮挡暂停都要重放 setPaused（新 iframe 的 shim 不知道旧状态）
+    if (rt.paused || occlPaused(rt)) weShimSend(rt, "setPaused", { v: true });
     // 首帧钩子：网页没有 GL 提交，load 即视为就绪
     try {
       rt.onFirstFrame?.();
@@ -1026,6 +1046,29 @@ function installWebCtl(rt: Runtime) {
       rt.paused = false;
       weShimSend(rt, "setPaused", { v: false });
     },
+    /**
+     * 遮挡暂停（V5）：只发 shim 的 setPaused，**不碰 rt.paused**（用户暂停
+     * 意图不被遮挡解除顺带清掉，同 scene 路径语义）。fps 的档位收敛不在这里
+     * 做 —— applyOcclusionState（shell.ts）每次推送都紧随调 setOcclusionBand(band)，
+     * 单一真源（曾在这里补发 setFps，与 setOcclusionBand 双轨漂移过）。
+     */
+    setOccluded(on: boolean) {
+      // 解除时不掀用户暂停：rt.paused 立着就不发 setPaused false —— shim 侧
+      // setPaused 是全局的，发了会把用户 pause() 停下的网页一并解停（评审
+      // P0：其余三条路径都有此守卫，唯独 web 漏了）。
+      if (on || !rt.paused) weShimSend(rt, "setPaused", { v: on });
+    },
+    /**
+     * 遮挡降帧（V5）：web 没有库侧渲染循环可逐帧读档位（scene/media 有），
+     * shim 侧 fps 全靠这里推送；shim 的节流每次 rAF 现读 fps 变量，换档下一
+     * 帧即平滑生效。pause 档跳过 —— 整页暂停归 setOccluded(true) 管，且
+     * occlusionFpsCap("pause")=0 不能播种给 shim（<=0 会被丢弃）。
+     */
+    setOcclusionBand(band: OcclusionBand) {
+      if (band === "pause") return;
+      const cap = occlusionFpsCap(band, occlusionCfgOf(rt), rt.cfg.sceneFps || 60);
+      weShimSend(rt, "setFps", { n: cap });
+    },
     applyUserProperties(props) {
       const flat: Record<string, unknown> = { ...(rt.liveUserProps ?? {}) };
       for (const [k, v] of Object.entries(props ?? {})) {
@@ -1286,8 +1329,9 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       const rewritten = rewriteHtml(html, shimSource, {
         baseHref: entryDirUrl(entry),
         // 种子用精确音量（宿主 setVolume 过的值）：cfg.muted 的 0/1 近似会让
-        // 重挂后的网页壁纸在 load 完成前以全音量出声（shim 初始 hostVolume=1）
-        seedScript: buildSeedScript(wire, cfg.sceneFps, effectiveUserVolume(rt, cfg)),
+        // 重挂后的网页壁纸在 load 完成前以全音量出声（shim 初始 hostVolume=1）；
+        // fps 同理按当前遮挡档收敛（seedFpsOf），防重挂瞬间满帧跑
+        seedScript: buildSeedScript(wire, seedFpsOf(rt), effectiveUserVolume(rt, cfg)),
       });
       const blob = new Blob([rewritten], { type: "text/html;charset=utf-8" });
       const blobUrl = URL.createObjectURL(blob);
