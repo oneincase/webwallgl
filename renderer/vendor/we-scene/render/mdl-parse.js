@@ -60,6 +60,11 @@ export function parseMDL(buf) {
   //      （max 误差 5.75e-8 / 5.35e-8，W/H 取图层 size）。
   const mat = readCStr(dv, 0x15)
   const ver = parseInt(magic.slice(4), 10)
+  // 头部三件套（magic(8) + u8 0 + u32 mdl_flag + u32 skin_count + u32 mesh_count，
+  // 材质路径起于 0x15）：只有多子网格遍历用得到，见 parseMeshes。
+  const mdlFlag = dv.getUint32(9, true)
+  const skinCount = dv.getUint32(13, true)
+  const meshCount = dv.getUint32(17, true)
   // 版本 → [长度字段相对 mat.next 的偏移, 顶点 stride, 各字段在顶点内的偏移]
   // 注意 readCStr 的 next 已跳过 null 终止符，所以这里的偏移是「null 之后」再数。
   // [we-scene patch] **MDLV0013 是「null 之后 +4、stride 52」** —— 顶点布局与 0016
@@ -355,6 +360,11 @@ export function parseMDL(buf) {
     indexCount,
     indexType: useU32 ? 'u32' : 'u16',
     indices,
+    // [we-scene patch 2026-09-28] 全部子网格（见 parseMeshes 头注）。1 个网格的模型
+    // 与上面那套单网格字段逐位相同；>1 时渲染侧必须逐个画，否则只剩第一个子网格。
+    // 起点 0x15 = 第一条材质路径（与上面读 mat 同一个锚点）：遍历自己会把
+    // skin_count 条材质全部读掉，不能从 mat.next 起（那会多吃一条）。
+    meshes: parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, 0x15),
     bones,
     // MDLS 尾部的静态装配姿势（无 MDLA 的模型才有）：TRS 九分量 + 原始局部矩阵
     staticPoseTRS: staticTRS,
@@ -372,6 +382,203 @@ export function parseMDL(buf) {
     parts: partsMeta,
     bounds: { minX, maxX, minY, maxY },
   }
+}
+
+// [we-scene patch 2026-09-28] **多子网格模型**（MDLV 头里的 mesh_count）。
+//
+// 现象：3281559867（Kirby Gourmet Race）整场没有地面、天空只剩一小块贴图、
+// 大半屏幕是黑 —— 舞台模型的 mesh_count=15，地面在 mesh1、看台在 mesh7…，
+// 而历史实现只读**第一个**子网格（mesh0 是立在场地顶上的招牌，就是画面里那条
+// 「橙色横线」）。带模型的 3D 场景家族同样中招（3662790108 mesh_count=64、
+// 3477054430/3292361861/3441873795/3589454154 各 1 个）。
+//
+// 布局（open-wallpaper-engine MdlParser::ParseMesh 逐字段对照，本机 568 个模型
+// 568/568 走通、mesh0 与既有单网格解析 564/564 逐位一致）：
+//   CStr mat_json[skin_count] + u32 flag_a + (flag_a==2 ? u32) + (v>=17 ? aabb 6f)
+//   + (v>14 ? u32 mesh_flag) + u32 vertex_size + Vertex[] + u32 indices_size + Tri[]
+//   + (v>=21 ? Parts) + (v>21 ? Masks)   ← 每个子网格重复一遍，直到 mesh_count 条
+// 顶点内字段偏移**由 mesh_flag 的位推出**（同一套位在 OWE 里是 MDL_FLAG_*）：
+//   NORMAL 0x2(+12) / TANGENT 0x4(+16) / UV 0x8(+8) / UV2 0x20(+8) /
+//   EXTRA4 0x10000(+4) / SKIN_BLEND 0x800000(+16) / SKIN_WEIGHT 0x1000000(+16)
+// 这套位与本仓库原来的三条硬编码布局逐位吻合（80B = 权重+UV 的 puppet、
+// 84B = 多一个 EXTRA4、52B = MDLV0013/0016、48B = 无蒙皮的真 3D 网格），
+// 也就是「猜布局」其实是这一件事的特例。
+//
+// 失败一律返回 null（保留单网格行为），不抛：与 parseSkeleton 同一条「绝不返回
+// 残缺数据」的约定。
+const MDL_FLAG_NORMAL = 0x2
+const MDL_FLAG_TANGENT = 0x4
+const MDL_FLAG_UV = 0x8
+const MDL_FLAG_UV2 = 0x20
+const MDL_FLAG_EXTRA4 = 0x10000
+const MDL_FLAG_SKIN_BLEND = 0x800000
+const MDL_FLAG_SKIN_WEIGHT = 0x1000000
+
+function vertexLayoutOf(flag) {
+  let off = 12
+  // [we-scene patch 2026-09-28] normal 偏移：文件里法线恒紧跟在位置之后（12 字节）。
+  // 3D 网格的材质要按 N·L 上光（见 mdl.js 的场景光），所以这一路要读出来。
+  const o = { stride: 0, uv: -1, bone: -1, weight: -1, normal: -1 }
+  if (flag & MDL_FLAG_NORMAL) { o.normal = off; off += 12 }
+  if (flag & MDL_FLAG_TANGENT) off += 16
+  if (flag & MDL_FLAG_EXTRA4) off += 4
+  if (flag & MDL_FLAG_SKIN_BLEND) { o.bone = off; off += 16 }
+  if (flag & MDL_FLAG_SKIN_WEIGHT) { o.weight = off; off += 16 }
+  if (flag & (MDL_FLAG_UV | MDL_FLAG_UV2)) { o.uv = off; off += 8 }
+  if (flag & MDL_FLAG_UV2) off += 8
+  o.stride = off
+  return o
+}
+
+function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
+  // firstMatOff = 第一条材质路径的偏移（0x15）；每条材质路径都是 cstr。
+  if (!(skinCount > 0 && skinCount <= 8 && meshCount > 0 && meshCount <= 512)) return null
+  const meshes = []
+  let p = firstMatOff
+  for (let m = 0; m < meshCount; m++) {
+    const materials = []
+    for (let i = 0; i < skinCount; i++) {
+      if (p >= dv.byteLength) return null
+      const c = readCStr(dv, p)
+      materials.push(c.value)
+      p = c.next
+    }
+    if (p + 4 > dv.byteLength) return null
+    const flagA = dv.getUint32(p, true)
+    p += 4
+    if (flagA === 2) p += 4
+    let aabb = null
+    if (ver >= 17) {
+      if (p + 24 > dv.byteLength) return null
+      aabb = [0, 1, 2, 3, 4, 5].map((k) => dv.getFloat32(p + k * 4, true))
+      p += 24
+    }
+    const meshFlag = ver > 14 ? dv.getUint32(p, true) : mdlFlag
+    if (ver > 14) p += 4
+    if (p + 4 > dv.byteLength) return null
+    const vertexBytes = dv.getUint32(p, true)
+    p += 4
+    const lay = vertexLayoutOf(meshFlag)
+    if (lay.stride <= 0 || vertexBytes % lay.stride !== 0) return null
+    const vertexCount = vertexBytes / lay.stride
+    if (p + vertexBytes > dv.byteLength) return null
+    const positions = new Float32Array(vertexCount * 3)
+    const uvs = new Float32Array(vertexCount * 2)
+    const boneIdx = new Float32Array(vertexCount * 4)
+    const weights = new Float32Array(vertexCount * 4)
+    // 法线（3D 网格的光照用；2D puppet 的 flag 里没有 NORMAL，保持 null 不影响任何既有路径）
+    const normals = lay.normal >= 0 ? new Float32Array(vertexCount * 3) : null
+    for (let i = 0; i < vertexCount; i++) {
+      const b = p + i * lay.stride
+      positions[i * 3] = dv.getFloat32(b, true)
+      positions[i * 3 + 1] = dv.getFloat32(b + 4, true)
+      positions[i * 3 + 2] = dv.getFloat32(b + 8, true)
+      if (normals) {
+        normals[i * 3] = dv.getFloat32(b + lay.normal, true)
+        normals[i * 3 + 1] = dv.getFloat32(b + lay.normal + 4, true)
+        normals[i * 3 + 2] = dv.getFloat32(b + lay.normal + 8, true)
+      }
+      if (lay.uv >= 0) {
+        uvs[i * 2] = dv.getFloat32(b + lay.uv, true)
+        uvs[i * 2 + 1] = dv.getFloat32(b + lay.uv + 4, true)
+      }
+      if (lay.bone >= 0 && lay.weight >= 0) {
+        for (let k = 0; k < 4; k++) {
+          boneIdx[i * 4 + k] = dv.getUint32(b + lay.bone + k * 4, true)
+          weights[i * 4 + k] = dv.getFloat32(b + lay.weight + k * 4, true)
+        }
+      } else {
+        boneIdx[i * 4] = 0
+        weights[i * 4] = 1
+      }
+    }
+    p += vertexBytes
+    if (p + 4 > dv.byteLength) return null
+    const idxBytes = dv.getUint32(p, true)
+    p += 4
+    // 索引宽度与顶点数同源（OWE UsesUint32Indices：v>=23 且顶点数超 u16）
+    const useU32 = ver >= 23 && vertexCount > 65535
+    const iw = useU32 ? 4 : 2
+    if (idxBytes % iw !== 0 || p + idxBytes > dv.byteLength) return null
+    const indexCount = idxBytes / iw
+    const indices = useU32 ? new Uint32Array(indexCount) : new Uint16Array(indexCount)
+    for (let i = 0; i < indexCount; i++) {
+      indices[i] = useU32 ? dv.getUint32(p + i * 4, true) : dv.getUint16(p + i * 2, true)
+    }
+    p += idxBytes
+    let parts = null
+    if (ver >= 21) {
+      if (p + 1 > dv.byteLength) return null
+      const unkA = dv.getUint8(p)
+      p += 1
+      if (unkA === 1) {
+        const unkB = dv.getUint8(p)
+        p += 1
+        if (unkB) {
+          p += 3 // u16 unk_c + u8 vert_section_marker
+          const payload = dv.getUint32(p, true)
+          p += 4
+          if (payload % 12 !== 0 || p + payload > dv.byteLength) return null
+          p += payload
+        }
+      } else if (unkA !== 0) return null
+      if (p + 1 > dv.byteLength) return null
+      const hasParts = dv.getUint8(p)
+      p += 1
+      if (hasParts) {
+        if (p + 4 > dv.byteLength) return null
+        const partsBytes = dv.getUint32(p, true)
+        p += 4
+        if (partsBytes % 16 !== 0 || p + partsBytes > dv.byteLength) return null
+        parts = []
+        for (let k = 0; k < partsBytes / 16; k++) {
+          parts.push({
+            id: dv.getUint32(p, true),
+            offset: dv.getInt32(p + 4, true),
+            start: dv.getUint32(p + 8, true),
+            size: dv.getUint32(p + 12, true),
+          })
+          p += 16
+        }
+      }
+      if (ver > 21) {
+        if (p + 4 > dv.byteLength) return null
+        const maskCount = dv.getUint32(p, true)
+        p += 4
+        for (let k = 0; k < maskCount; k++) {
+          if (p + 8 > dv.byteLength) return null
+          p += 8 // leading_a + zero_a
+          const c = readCStr(dv, p)
+          p = c.next + 4 // 材质 json + zero_pad
+          if (p + 4 > dv.byteLength) return null
+          const ac = dv.getUint32(p, true)
+          p += 4 + ac * 4
+          if (p + 4 > dv.byteLength) return null
+          const bc = dv.getUint32(p, true)
+          p += 4 + bc * 4
+          if (p > dv.byteLength) return null
+        }
+      }
+    }
+    if (p > dv.byteLength) return null
+    meshes.push({
+      materialPath: materials[0] || null,
+      materials,
+      meshFlag,
+      aabb,
+      positions,
+      uvs,
+      boneIdx,
+      weights,
+      normals,
+      vertexCount,
+      indices,
+      indexCount,
+      indexType: useU32 ? 'u32' : 'u16',
+      parts,
+    })
+  }
+  return meshes
 }
 
 // [we-scene patch] MDAT0001：骨骼附着点表。实测布局（全库 18 个 mdl 全部自洽）：
@@ -401,10 +608,20 @@ function parseAttachments(buf, dv, boneCount, a) {
 }
 
 // MDLS0004：魔数(8) + u8 + u32 nextOff + u32 boneCount，逐骨**可变长**条目。
-// 实测三种记录布局：
-//  A. 常规（全库绝大多数，龙/Lucy/lainpw…），每条 78B：
-//       [u8 00 占位名][u32 id][i32 parent][u32 len=64][64B 矩阵][name cstr 常在矩阵后]
-//     无名骨 name 为单个 00。旧实现按此固定步进（id@1 parent@5 matrix@13、name@77）。
+//
+// R. **WE 真实记录布局**（参考引擎 MdlParser.cpp::ParseMDLS 逐字段对照，2026-09-28）：
+//       [name cstr][i32 sim_type][u32 parent][u32 len=64][64B 矩阵][JSON cstr]
+//    name 与 JSON 都是可空 cstr（空 = 单个 00），记录长 78B ~ 200+B 不等；JSON 是
+//    骨骼仿真元数据（形如 `[{"a":null,...,"tm":100,"tp":".. .. .."}]`）。A/B/C 三种
+//    「实测布局」其实是同一条布局的特例：A = 名空+JSON 空（1+12+64+1 = 78B）、
+//    B = 有名+JSON 空、C = 有名+JSON 非空。A 把矩阵后那条 cstr 当成「name」，
+//    在名/JSON 都空时恰好等价，因此历史实现看着能跑。
+// R 之前的失步：重扫路径矩阵尾**只在下一字节是 '{' 时才跳 JSON cstr**，空 JSON 时
+//    漏跳 1 字节 → 第二条骨起永久错位 → 重扫校验不过 → 回退固定解析的**垃圾骨架**
+//    （parent 全 −1、矩阵全零/NaN）。该类模型（3281559867 的 kirby/dedede/elfilin…
+//    第一个骨名就不是空串）绑定矩阵求逆得 Infinity，蒙皮顶点炸到 1e31 量级：
+//    elfilin 被画成盖住半屏的巨型色块，其余角色散架、穿插、抽搐。
+// A. 常规固定步进（名空+JSON 空的历史路径，id@1 parent@5 matrix@13、cstr@77）。
 //  B. 名字前置且变长（3463520581，骨名 legs/skirt）：
 //       [name cstr][u32 id][i32 parent][u32 len=64][64B 矩阵]
 //     无名时 name 是单个 00（记录 77B），带名时把后续记录整体推后。固定 77B 步进在
@@ -415,13 +632,11 @@ function parseAttachments(buf, dv, boneCount, a) {
 //       [name cstr][u32 id][i32 parent][u32 len=64][64B 矩阵][JSON cstr]
 //     记录长 199~205B 不等；固定步进在第 4 条（命名骨「主」）失步，旧解析 parent
 //     =−16777216、矩阵读成全零——绑定姿势串了，消失动画推进后残留错乱模型。
-// 策略：**先按 A 固定布局整体解析并校验**（parent 全合法 + 每矩阵两列单位长度 +
-// 平移有限），通过就逐位采用（旧模型零回归）；任一骨非法才判定为 B/C 变长布局，
-// 顺序重解析：记录起点是 name cstr（UTF-8，可空），其后 12B 头在 ~80B 窗口内用
-// 「id 有界 + parent 合法 + len 恰 64 + 矩阵正交有限」严格合取定位（矩阵内部偶然的
-// 0x3F800000 不可能误命中）；矩阵尾若紧跟 '{'（布局 C）则跳过 JSON cstr 再到下一
-// 条，否则（布局 B）矩阵尾即下一记录起点。重扫必须拿全所有骨且全合法才采用，
-// 否则回退固定解析，绝不返回残缺骨架。
+// 策略：**先按 R 逐骨顺序解析并整体校验**（每骨 len 恰 64 + parent 合法 + 矩阵正交有限），
+// 全部通过就采用（名空模型逐位等价于旧 A 路径，零回归）；任一骨不合法才退回历史链：
+// 先按 A 固定布局整体校验，再不行才按 B/C 重扫（记录起点是 name cstr，12B 头在 ~80B
+// 窗口内用「id 有界 + parent 合法 + len 恰 64 + 矩阵正交有限」合取定位，矩阵尾若紧跟
+// '{' 才跳 JSON）。重扫必须拿全所有骨且全合法才采用，否则回退固定解析，绝不返回残缺骨架。
 function parseSkeleton(buf, dv, s) {
   if (s < 0) return { bones: [], sectionStart: -1, recordsEnd: -1, nextOff: -1, permutation: null }
   const boneCount = dv.getUint32(s + 13, true)
@@ -431,6 +646,38 @@ function parseSkeleton(buf, dv, s) {
     Number.isFinite(m[12]) && Number.isFinite(m[13]) && Number.isFinite(m[14]) &&
     Math.abs(Math.hypot(m[0], m[1]) - 1) < 0.05 &&
     Math.abs(Math.hypot(m[4], m[5]) - 1) < 0.05
+
+  // ---- 布局 R：name cstr + 12B 头（sim_type/parent/len）+ 64B 矩阵 + JSON cstr ----
+  // 校验**不能**用 orthMatrix：真实绑定矩阵带大幅缩放（kirby 骨1 的 m0=[0,0,10000,0]、
+  // elfilin 骨1 的 m0=[100,0,0,0]、2D puppet 的 m10 甚至为 0），「两列单位长度」这条
+  // 会把正常模型判死。改用布局本身的结构约束：逐骨 len 恰 64 + parent 合法 + 16 个
+  // 分量全有限 + 二维行列式非零（可逆，求逆不会炸成 Infinity）+ 走完不越过
+  // endOffset（段头 +9 处的 3 字节，参考引擎也是拿它兜底 seek）。
+  const sectionEnd = (() => {
+    const v = buf[s + 9] | (buf[s + 10] << 8) | (buf[s + 11] << 16)
+    return v > s && v <= dv.byteLength ? v : -1
+  })()
+  const parseReference = () => {
+    const bones = []
+    let j = s + 17
+    for (let b = 0; b < boneCount; b++) {
+      const nm = readCStr(dv, j)
+      const head = nm.next
+      if (head + 12 + 64 > dv.byteLength) return null
+      const parent = dv.getInt32(head + 4, true)
+      if (!(parent === -1 || (parent >= 0 && parent < boneCount))) return null
+      if (dv.getUint32(head + 8, true) !== 64) return null
+      const matrix = new Float32Array(16)
+      for (let k = 0; k < 16; k++) matrix[k] = dv.getFloat32(head + 12 + k * 4, true)
+      for (let k = 0; k < 16; k++) if (!Number.isFinite(matrix[k])) return null
+      const det = matrix[0] * matrix[5] - matrix[4] * matrix[1]
+      if (!(Math.abs(det) > 1e-9)) return null
+      bones.push({ id: dv.getUint32(head, true), name: nm.value, parent, matrix })
+      j = readCStr(dv, head + 12 + 64).next
+    }
+    if (sectionEnd > 0 && j > sectionEnd) return null
+    return { bones, end: j }
+  }
 
   // ---- 布局 A：固定 id@1 parent@5 matrix@13（64B），name cstr@77 ----
   const parseFixed = () => {
@@ -458,6 +705,9 @@ function parseSkeleton(buf, dv, s) {
     nextOff: dv.getUint32(s + 9, true),
     permutation: null,
   })
+
+  const reference = parseReference()
+  if (reference) return section(reference.bones, reference.end)
 
   const fixed = parseFixed()
   if (fixed.ok) return section(fixed.bones, fixed.end)
