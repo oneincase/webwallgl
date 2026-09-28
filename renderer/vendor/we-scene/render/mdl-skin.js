@@ -244,7 +244,25 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
         // 贡献相对录制起点的真实运动（人物2 最大 29px）；t=0 时加算层精确
         // 无贡献（3797270925 的「绑定姿势 t=0 应恒等」断言依赖这一点）。
         // keyframes 扁平存储 n*9，首关键帧的第 k 分量恰是 keyframes[k]。
+        //
+        // [we-scene patch 3640755971] **一次性（mode:"single"）clip 的参考帧取末帧**。
+        // 上面的「取首帧」对**循环/摆动** clip 是对的（首帧≈录制起点≈静置位），
+        // 但对 single clip 方向会整个反过来：这类 clip 是「从某处走到静置位」的
+        // 入场动画，首帧是它的**出发位**、末帧才是**落定位**（也是同层其它循环 clip
+        // 的常量值、等于绑定姿势）。按首帧取增量 = 模型从落定位出发、按入场幅度
+        // 往反方向飞出去：3640755971 中央的吊坠（十字架，#224，动画层 305
+        // `mode:"single"` 骨0 ty 1394.7→169.3）开场 1 秒内匀速下滑 250px/s 出画，
+        // 之后再也不回来（作者本意是「从上方落下来挂在手边」）。
+        // 改取末帧后，同一段数据变成「从落定位上方 1225 出发 → 落到落定位」。
+        // 只对 mode==="single" 生效：循环 clip 首末帧一般相同（改了也是无操作），
+        // 不等时保持原行为以免动到已验证的摆动语料。
+        // 影响面（全库扫描：加算层引用 single clip 且首末帧差 >1px 的共 5 条 /
+        // 5 张壁纸）：单条加算层的栈**逐位不变**（基准与参考同源、正负抵消），
+        // 只有 3306942838 / 3521337568 这类「多条加算 + 一条 single」会变，
+        // 方向都是「收敛到落定位」而不是「从落定位飘走」。
         const rest = track.keyframes
+        const kfCount = rest.length / 9
+        const restAt = L.anim.mode === 'single' && kfCount > 1 ? (kfCount - 1) * 9 : 0
         // **全加算层栈的基准**：这条骨没有非加算层、加算增量还没基准时，第一条
         // 加算 clip 的首帧就是基准姿势——把 acc 从绑定（= 图集散开位）换成装配位。
         // katanabody(3238423642) 10 条加算、无替换层，骨 6/16/22 绑定平移
@@ -252,11 +270,11 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
         // 不换基准人物缺头少臂（头骨钉在图集位）；Lucy 那类 kf0==绑定的全加算
         // 栈此步是无操作，行为与旧公式一致。
         if (!seenNonAdd && !addBaseSet) {
-          for (let k = 0; k < 9; k++) acc[k] = rest[k]
+          for (let k = 0; k < 9; k++) acc[k] = rest[restAt + k]
           addBaseSet = true
         }
         for (let k = 0; k < 9; k++) {
-          let d = smp[k] - rest[k]
+          let d = smp[k] - rest[restAt + k]
           if (k >= 3 && k <= 5) {
             if (d > Math.PI) d -= 2 * Math.PI
             else if (d < -Math.PI) d += 2 * Math.PI
@@ -265,8 +283,8 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
             //（3226487183「眨眼」骨 37/40/41 kf0 sy=0，眨眼瞬间 sy→1）。
             // 采样值爆炸（同 clip 骨 56 sx=-7）是录制穿越 0 的符号翻转，不能当增量。
             // 跳过这两类，合法的闭眼缩放（rest=1、sampled→0.03，骨 43）仍生效。
-            if (!(Math.abs(rest[k]) > 1e-3)) continue
-            if (Math.abs(smp[k]) > 3 && Math.abs(rest[k]) < 1.5) continue
+            if (!(Math.abs(rest[restAt + k]) > 1e-3)) continue
+            if (Math.abs(smp[k]) > 3 && Math.abs(rest[restAt + k]) < 1.5) continue
           }
           addDelta[k] += d * w
         }

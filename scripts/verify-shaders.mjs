@@ -1998,6 +1998,153 @@ const wireErrors = [];
   wireErrors.push(...pErr);
 }
 
+
+// ---------- 混合宽度二元运算 / 整型实参喂浮点形参（3640755971 部分图层白屏） ----------
+//
+// 两个工坊效果的 pass 在真实 WebGL 里编译失败后被静默跳过，而症状不是「少个效果」：
+// 3224559305 texture_override 失败的 solid 层退回**白底兜底**，可调整组合层的出场
+// 动画（opacity alpha，90 帧 @45fps ≈ 2s）一放完，组画布上的白底就整屏显出来
+// （实测占屏 81.9%，与作者 preview.gif 的暗色调完全相反）。同一张壁纸里
+// 3235948233 auto_sway 也编不过（翅膀不摆动），3221939295 波纹的强度算式同样编不过。
+// 成因见 docs/CASEBOOK.md「3640755971 白屏」。这里钉两条不变量，判定都在**转译产物**
+// 上独立复算（不共享转译器的公式），语料取自本机壁纸库：
+//   ① 二元运算两侧宽度不等（`vec2 / vec4`）—— GLSL ES 的二元运算符没有任何尺寸
+//      转换，ANGLE 报 `'/' : wrong operand types`；HLSL 按较窄的一侧算（DXBC 写掩码）。
+//   ② 浮点形参收到**可确证整型**的实参 —— HLSL 在调用点提升 int→float，GLSL ES
+//      不提升，报 `no matching overloaded function found`。
+// 库里没有 3640755971 时跳过（其他机器 / CI 无本地素材）。
+{
+  const wErr = [];
+
+  // 宽度可确证的「简单操作数」：裸标识符（宽度取行首 uniform/varying/attribute 声明）、
+  // vecN(...) 构造、带分量 swizzle 的引用；数值字面量与函数调用宽度未知。
+  const operands = (glsl) => {
+    const width = new Map();
+    {
+      const re = /^[ \t]*(?:uniform|varying|attribute|in|out)\s+vec([234])\s+([A-Za-z_]\w*)/gm;
+      let m;
+      while ((m = re.exec(glsl)) !== null) width.set(m[2], Number(m[1]));
+    }
+    const wOf = (t) => {
+      const sw = /\.([xyzwrgba]{1,4})$/.exec(t);
+      if (sw) return sw[1].length;
+      const ctor = /^vec([234])\s*\(/.exec(t);
+      if (ctor) return Number(ctor[1]);
+      if (/^[0-9]/.test(t)) return 0;
+      return width.get(t) || 0;
+    };
+    return { wOf, width };
+  };
+  // ① 宽度不等的二元运算（乘除）：返回命中列表
+  const widthMismatches = (glsl) => {
+    const { wOf } = operands(glsl);
+    const OP = "([A-Za-z_]\\w*(?:\\.[xyzwrgba]{1,4})?|vec[234]\\s*\\([^()]*\\)|\\d+(?:\\.\\d+)?)";
+    const re = new RegExp(OP + "\\s*([*/])\\s*" + OP, "g");
+    const hits = [];
+    let m;
+    while ((m = re.exec(glsl)) !== null) {
+      const before = m.index > 0 ? glsl[m.index - 1] : "";
+      const after = glsl[m.index + m[0].length] || "";
+      if (/[A-Za-z0-9_.]/.test(before) || /[A-Za-z0-9_.]/.test(after)) continue;
+      const wa = wOf(m[1]);
+      const wb = wOf(m[3]);
+      if (wa >= 2 && wb >= 2 && wa !== wb) hits.push(`${m[1]} ${m[2]} ${m[3]}`);
+    }
+    return hits;
+  };
+  // ② 浮点形参收到整型实参：返回命中列表
+  const intArgsToFloatParams = (glsl) => {
+    const intNames = new Set();
+    {
+      const re = /\b(?:const\s+)?int\s+([A-Za-z_]\w*)\s*[=;,)]/g;
+      let m;
+      while ((m = re.exec(glsl)) !== null) intNames.add(m[1]);
+    }
+    const isIntArg = (a) => {
+      const t = a.trim();
+      if (!t || /\./.test(t)) return false;
+      if (/^[+-]?\d+$/.test(t)) return true;
+      if (/[A-Za-z_]\w*\s*\(/.test(t)) return false;
+      const ids = t.match(/[A-Za-z_]\w*/g) || [];
+      return ids.length > 0 && ids.every((x) => intNames.has(x));
+    };
+    const hits = [];
+    // 用户自定义函数：形参为 float 的位置（同一名字的所有重载都必须在该位置是 float）
+    const sigs = new Map();
+    {
+      const re = /\b([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\{/g;
+      let m;
+      while ((m = re.exec(glsl)) !== null) {
+        if (/^(for|if|while|switch|do|else|return|main)$/.test(m[1])) continue;
+        const kinds = m[2].split(",").map((p) => (/^\s*(?:in|out|inout)?\s*(?:const\s+)?float\b/.test(p) ? "float" : "other"));
+        if (!sigs.has(m[1])) sigs.set(m[1], []);
+        sigs.get(m[1]).push(kinds);
+      }
+    }
+    for (const [fn, list] of sigs) {
+      const pos = [];
+      for (let i = 0; i < list[0].length; i++) if (list.every((k) => k[i] === "float")) pos.push(i);
+      if (!pos.length) continue;
+      const callRe = new RegExp("\\b" + fn + "\\s*\\(([^()]*)\\)", "g");
+      let m;
+      while ((m = callRe.exec(glsl)) !== null) {
+        // 定义行本身跳过（形参声明里没有可确证整型实参，但保持语义清晰）
+        const args = m[1].split(",");
+        for (const i of pos) {
+          if (i < args.length && isIntArg(args[i])) hits.push(`${fn}(${args.map((a) => a.trim()).join(", ")})`);
+        }
+      }
+    }
+    return hits;
+  };
+  // 判定器自检（防「永远不报」的空判据）：夹具必须报，干净样本必须不报
+  {
+    const bad = "uniform vec4 g_R;\nuniform vec2 g_O;\nvoid main() { vec2 o = g_O / g_R; }";
+    const good = "uniform vec4 g_R;\nuniform vec2 g_O;\nvoid main() { vec2 o = g_O / g_R.xy; }";
+    if (widthMismatches(bad).length !== 1) wErr.push("宽度不匹配判定器自检失败（该报未报）");
+    if (widthMismatches(good).length !== 0) wErr.push("宽度不匹配判定器自检失败（干净样本被误报）");
+    const badInt = "float f(in float x, in float y) { return x + y; }\nvoid main() { float r = f(2, 3); }";
+    if (intArgsToFloatParams(badInt).length !== 2) wErr.push("整型实参判定器自检失败（该报未报）");
+    if (intArgsToFloatParams("float f(in float x) { return x; }\nvoid main() { float r = f(2.0); }").length !== 0) {
+      wErr.push("整型实参判定器自检失败（干净样本被误报）");
+    }
+  }
+
+  // 真实语料：3640755971 的三个效果 pass（每条都实测过编译失败）
+  const item = join(LIB, "3640755971");
+  const pkgPath = join(item, "scene.pkg");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const resolver = makeResolver(pkg);
+    const cases = [
+      { shader: "workshop/3224559305/effects/texture_override", combos: { NORMAL_OFFSET: 0, POS: 0, SCALE: 0, RETAIN_ORIG: 0, ENABLE: 1 } },
+      { shader: "workshop/3221939295/effects/____________________", combos: { PERSPECTIVE: 0, DUALWAVES: 0, MASK: 1, TIMEOFFSET: 0, STD_TIME: 1 } },
+      { shader: "workshop/3235948233/effects/auto_sway", combos: { DEBUG: 0, NODE_COUNT: 5 } },
+    ];
+    for (const c of cases) {
+      const frag = resolver("shaders/" + c.shader + ".frag");
+      const vert = resolver("shaders/" + c.shader + ".vert");
+      if (!frag || !vert) {
+        wErr.push(`语料缺失：${c.shader}（3640755971 的证据 shader 被改动）`);
+        continue;
+      }
+      const gv = hlsl2glsl(vert, "vert", c.combos, resolver, frag);
+      const gf = hlsl2glsl(frag, "frag", c.combos, resolver, vert);
+      for (const [stage, g] of [["vert", gv], ["frag", gf]]) {
+        const mm = widthMismatches(g);
+        if (mm.length) wErr.push(`${c.shader}.${stage} 仍有宽度不等的二元运算：${mm.slice(0, 3).join(" | ")}`);
+        const ia = intArgsToFloatParams(g);
+        if (ia.length) wErr.push(`${c.shader}.${stage} 仍把整型实参喂给浮点形参：${ia.slice(0, 3).join(" | ")}`);
+      }
+    }
+    // 源码守卫：两条规则不得被静默删掉
+    const tsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hlsl2glsl.js"), "utf8");
+    if (!/9c\) \[we-scene patch 3640755971\]/.test(tsrc)) wErr.push("转译器缺少 9c（混合宽度二元运算截断）");
+    if (!/10b-4\) \[we-scene patch 3640755971\]/.test(tsrc)) wErr.push("转译器缺少 10b-4（整型实参→浮点形参）");
+  }
+  wireErrors.push(...wErr);
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

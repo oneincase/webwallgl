@@ -22,7 +22,7 @@ const { sampleChannel, wrapFrame, createAnimation, createNeutralAnimation } = aw
 );
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
 const { evalObjectScript, foldVisibleReturn } = await imp("renderer/vendor/we-scene/render/text.js");
-const { linkAnimations, crossedEvents } = await imp("renderer/vendor/we-scene/render/animation.js");
+const { linkAnimations, crossedEvents, INITIAL_PREV_FRAME } = await imp("renderer/vendor/we-scene/render/animation.js");
 const { parseMDL } = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
 
 const { check, errors } = createChecker();
@@ -1189,6 +1189,7 @@ const kf = (frame, value, front, back) => ({
 {
   console.log("\n[缓修] 联动组 / 帧事件 / 死槽 / 骨骼事件");
   const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const animSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/animation.js"), "utf8");
   const rendererSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   const textSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
   const mdlParseSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl-parse.js"), "utf8");
@@ -1357,8 +1358,8 @@ const kf = (frame, value, front, back) => ({
           ctrl.advance(1 / 60);
           for (const e of ctrl.takeEvents()) seq.push(e.name);
         }
-        check(JSON.stringify(seq) === '["mAvAni10","mAvAni20","mAvAni40","mAvAniS"]',
-          `mAvAni 正放事件序列（frame-0 事件装载不补发），实得 ${JSON.stringify(seq)}`);
+        check(JSON.stringify(seq) === '["mAvUpdate","mAvAniH","mAvAni10","mAvAni20","mAvAni40","mAvAniS"]',
+          `mAvAni 正放事件序列（装载首帧要先越过 frame-0 的 mAvUpdate/mAvAniH：OWE prev 初值 −0.5），实得 ${JSON.stringify(seq)}`);
         // 倒放：从 60 回 0，H/mAvUpdate（frame-0）必须触发——作者拿它当「倒放结束」信号
         ctrl.stop();
         ctrl.setFrame(60);
@@ -1488,6 +1489,105 @@ const kf = (frame, value, front, back) => ({
       check(mdl.animations.every((a) => !a.events || a.events.length === 0), "无事件 mdl 不得误报事件");
     }
   }
+  // ---- 帧事件装载语义：frame-0 必须被**首次推进**越过（2477602742 两个红灯交替闪）----
+  // 半开区间 (prev, cur] 下，播放头起始位置若等于 frame 0，frame-0 的事件永远不被越过。
+  // 旧实现就是 prev=cur（「装载不补发」的假设），后果：2477602742 的红灯脚本靠
+  // flashStart(frame 0) 给左右两灯 `getAnimation("flash").play()` —— 事件不来，右灯
+  // （startpaused）就冻结在 frame 0 的 alpha=1 常亮，只剩左灯自播闪烁。
+  // 真值 = 参考引擎 OWE `SceneAnimationPlayback::m_previous_frame { -0.5 }`（初值、
+  // Stop()、播完再 Play() 都复位 −0.5）：播放头起点在 frame 0 **之前**。
+  // 判据全部跑真实实现（createAnimation / crossedEvents / parseMDL）+ 真实语料，
+  // 并自带「判据能区分好坏」的自检（未 play 的右灯必须仍然常亮）。
+  {
+    console.log("   [装载语义] frame-0 事件必须被首次推进越过（INITIAL_PREV_FRAME）");
+    check(INITIAL_PREV_FRAME === -0.5, `INITIAL_PREV_FRAME 必须是 −0.5（实得 ${INITIAL_PREV_FRAME}）`);
+    check(/_prevFrame: INITIAL_PREV_FRAME/.test(animSrc), "createAnimation 的 _prevFrame 初值必须是 INITIAL_PREV_FRAME");
+    check(/advance\(dt\) \{\s*\n\s*if \(anim\.parent\) return\s*\n\s*if \(!anim\._playing\) return\s*\n\s*const prev = anim\._prevFrame/.test(animSrc),
+      "advance 的跨帧检查必须用 _prevFrame（不能用 anim.frame，否则首帧 prev=cur）");
+    check(/anim\.INITIAL_PREV_FRAME/.test(mountSrc),
+      "scene-mount 骨骼事件的首帧 prev 必须取 anim.INITIAL_PREV_FRAME");
+    // 语义表（真实控制器）：首次推进 / stop 后重播 / 播完再播 → frame-0 都触发；setFrame 不触发
+    {
+      const kf = (f, v) => ({ frame: f, value: v, front: { enabled: false, x: 1, y: 0 }, back: { enabled: false, x: 1, y: 0 }, lockangle: true, locklength: true });
+      const def = {
+        c0: [kf(0, 0), kf(15, 1)],
+        options: { fps: 30, length: 15, mode: "single", name: "appear", events: [{ frame: 0, name: "blockoff" }, { frame: 15, name: "blockon" }] },
+      };
+      const c = createAnimation(def);
+      c.advance(1 / 30);
+      check(JSON.stringify(c.takeEvents().map((e) => e.name)) === '["blockoff"]',
+        `autoplay 首次推进必须越过 frame-0 事件 blockoff（实得 ${JSON.stringify(c.takeEvents().map((e) => e.name))}）`);
+      c.setFrame(7);
+      check(c.takeEvents().length === 0, "setFrame 不得触发事件（脚本 seek 不算越过帧）");
+      for (let i = 0; i < 20; i++) c.advance(1 / 30);
+      check(JSON.stringify(c.takeEvents().map((e) => e.name)) === '["blockon"]', "播到 length 必须触发末帧事件 blockon");
+      c.stop(); c.play(); c.advance(1 / 30);
+      check(JSON.stringify(c.takeEvents().map((e) => e.name)) === '["blockoff"]',
+        "stop() 后重播（OWE Stop→prev=−0.5）必须重新越过 frame-0 事件");
+      const c2 = createAnimation(def);
+      for (let i = 0; i < 20; i++) c2.advance(1 / 30);
+      c2.takeEvents(); c2.play(); c2.advance(1 / 30);
+      check(JSON.stringify(c2.takeEvents().map((e) => e.name)) === '["blockoff"]',
+        "single 播完再 play() 必须重新越过 frame-0 事件（OWE Play 复位 prev）");
+    }
+    // 真实语料 1：骨骼事件装载帧 —— 全库只允许 2477602742 在装载帧出事件
+    //（其余「错帧/插针」事件帧 ≥5，装载帧（t=1/60s）不该越过；这条同时是「改动面受控」的证明）
+    {
+      const loadHits = [];
+      for (const id of fs.existsSync(LIB) ? fs.readdirSync(LIB) : []) {
+        const pk = join(LIB, id, "scene.pkg");
+        if (!fs.existsSync(pk)) continue;
+        let pkg;
+        try { pkg = parsePkg(new Uint8Array(fs.readFileSync(pk))); } catch { continue; }
+        for (const e of pkg.entries.filter((x) => /\.mdl$/i.test(x.name))) {
+          let m;
+          try { m = parseMDL(getEntry(pkg, e.name)); } catch { continue; }
+          for (const a of m.animations || []) {
+            if (!a.events?.length) continue;
+            const cur = (1 / 60) * 1 * a.fps; // 首帧 t=1/60s × rate 1
+            const names = crossedEvents(a.events, INITIAL_PREV_FRAME, cur, a.frameCount,
+              a.mode === "loop" ? "loop" : a.mode === "mirror" ? "mirror" : "single").map((x) => x.name);
+            if (names.length) loadHits.push(`${id}/${e.name}@${a.id} -> ${JSON.stringify(names)}`);
+          }
+        }
+      }
+      check(loadHits.length === 1 && /^2477602742\/models\/FrontPole_puppet\.mdl@52 -> \["flashStart"\]$/.test(loadHits[0]),
+        `装载帧只允许 2477602742 flashStart 命中，实得 ${JSON.stringify(loadHits)}`);
+      console.log(`   骨骼事件装载帧：${loadHits.length ? loadHits[0] : "（无语料）"}`);
+    }
+    // 真实语料 2：两灯 alpha 是一条互补对 —— L+R 恒 1（= 用户要的「交替闪」）
+    // 右灯刻意 startpaused：只有 flashStart 补上（脚本对两灯都 play()）才成对。
+    {
+      const pk = join(LIB, "2477602742", "scene.pkg");
+      if (fs.existsSync(pk)) {
+        const raw = JSON.parse(new TextDecoder().decode(getEntry(parsePkg(new Uint8Array(fs.readFileSync(pk))), "scene.json")));
+        const objL = (raw.objects || []).find((o) => o.name === "Red Light Left");
+        const objR = (raw.objects || []).find((o) => o.name === "Red Light Right");
+        check(!!objL?.alpha?.animation && !!objR?.alpha?.animation, "2477602742 两个红灯都要有 alpha 关键帧动画");
+        const scriptText = (raw.objects || []).filter((o) => o.name === "Pole Front").map((o) => o.visible?.script || "").join("\n");
+        check(/flashStart/.test(scriptText) && (scriptText.match(/getAnimation\("flash"\)\.play\(\)/g) || []).length === 2,
+          "Pole Front 的 flashStart 回调必须对**两盏**灯的 flash 动画 play()（只 play 一盏就还是单灯闪）");
+        const opts = objR?.alpha?.animation?.options || {};
+        check(opts.startpaused === true, "右灯 flash 必须 startpaused（这正是它依赖 flashStart 的原因）");
+        const L = createAnimation(objL.alpha.animation);
+        const R = createAnimation(objR.alpha.animation);
+        L.play(); R.play(); // = flashStart 回调的动作
+        let worst = 0, worstFrame = -1;
+        for (let i = 0; i < 180; i++) {
+          L.advance(1 / 60); R.advance(1 / 60);
+          const dev = Math.abs(Number(L.value()) + Number(R.value()) - 1);
+          if (dev > worst) { worst = dev; worstFrame = L.getFrame(); }
+        }
+        check(worst < 1e-6, `两灯 alpha 必须互补（L+R≡1，实测最大偏差 ${worst.toExponential(2)} @frame ${worstFrame.toFixed(2)}）`);
+        // 自检：判据能区分坏态 —— 漏掉 flashStart（右灯不 play）时右灯恒 1、互补性崩
+        const R2 = createAnimation(objR.alpha.animation);
+        let frozenWorst = 0;
+        for (let i = 0; i < 180; i++) { L.setFrame(0); R2.advance(1 / 60); frozenWorst = Math.max(frozenWorst, Math.abs(Number(R2.value()) - 1)); }
+        check(frozenWorst < 1e-9, `自检：右灯未 play 时必须恒 alpha=1（实得偏差 ${frozenWorst}）—— 判据必须能区分这个坏态`);
+        console.log(`   两灯互补：180 帧最大偏差 ${worst.toExponential(2)}（未 play 的坏态恒 1，可区分）`);
+      }
+    }
+  }
   // ---- 框架阻断性沙箱缺口（2026-09-09 补：isRunningInEditor 对偶 / 颜色 Vec3 / 文字 init 时序）----
   {
     console.log("   [沙箱缺口] isRunningInEditor / 颜色 Vec3 / 文字 init 时序");
@@ -1603,6 +1703,81 @@ const kf = (frame, value, front, back) => ({
   }
   check(monotone, "钳后趋近应逐步逼近目标（不得越过目标后回升）");
   console.log(`   单帧 dt 封顶：卡顿 ${0.37}s 未钳时过冲 ${overshoot.toFixed(0)}px → 钳 0.05s 后 ${clampedOver.toFixed(1)}px`);
+}
+
+
+// ---------- 一次性（single）加算 clip 的参考帧必须是末帧（3640755971 吊坠入场）----------
+// 3640755971 的中央吊坠 = 对象 #224「十字架」（挂在 #2242 上的挂件），三条动画层全是加算：
+// 动画 373/408 是 loop（常量摆姿 + 极小的 rz 摆动），动画 305 是 `mode:"single"` 的入场
+// —— 骨0 ty 从 1394.7 落到 169.3（= 另两条的常量值 = 绑定姿势 = 落定位）。
+// 加算增量按「本轨道**首**关键帧」取参考时，这条入场方向整个反过来：模型从落定位出发、
+// 按入场幅度往反方向飞出去（实测开场 1 秒内匀速下滑 250px/s 冲出画面，之后不再回来）。
+// 参考帧取**末**帧后，同一段数据变成「从落定位上方落下、停在落定位」= 作者本意。
+// 这里钉三件事（语料缺失时跳过，其他机器 / CI 无本地素材）：
+//   ① 前提：那条 clip 确实是 single，且骨0.ty 首末帧差 > 500；
+//   ② 方向：入场从上方往下落（模型局部 y 向上 → 起始 y 更大），落差 > 200；
+//   ③ 收敛：入场播完后姿态回到「只留非 single 层」的静止位（残留只允许摆动量级）。
+// 判定器不共享转译/蒙皮里的公式：全部走 computeSkinMatrices 的**输出**。
+{
+  const pErr = [];
+  const { computeSkinMatrices } = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const pkgPath = `${LIB}/3640755971/scene.pkg`;
+  if (fs.existsSync(pkgPath)) {
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const dec = new TextDecoder();
+    const scene = JSON.parse(dec.decode(getEntry(pkg, "scene.json")));
+    const obj = (scene.objects || []).find((o) => o.id === 224);
+    const imgEntry = obj && obj.image ? getEntry(pkg, obj.image) : null;
+    const mdlPath = imgEntry ? JSON.parse(dec.decode(imgEntry)).puppet : null;
+    const mdl = mdlPath ? parseMDL(getEntry(pkg, mdlPath)) : null;
+    if (!obj || !mdl || !mdl.animations) {
+      pErr.push("3640755971 吊坠语料缺失（对象 224 / puppet 模型被改动）");
+    } else {
+      const layers = (obj.animationlayers || []).map((a) => ({ ...a, visible: true, playing: true }));
+      const animOf = (L) => mdl.animations.find((x) => x.id === L.animation);
+      const single = layers.filter((L) => (animOf(L) || {}).mode === "single");
+      const loops = layers.filter((L) => !single.includes(L));
+      if (single.length !== 1 || loops.length !== 2) {
+        pErr.push(`吊坠动画层结构变了：single=${single.length} 非 single=${loops.length}（预期 1 / 2）`);
+      } else {
+        const anim = animOf(single[0]);
+        const tr = anim.tracks[0];
+        const n = tr.keyframes.length / 9;
+        const first = tr.keyframes[1];
+        const last = tr.keyframes[(n - 1) * 9 + 1];
+        if (anim.mode !== "single" || !(Math.abs(first - last) > 500)) {
+          pErr.push(`入场 clip 变了：mode=${anim.mode} 骨0.ty 首 ${first.toFixed(1)} / 末 ${last.toFixed(1)}（应在 single 下相差 >500）`);
+        }
+        const pose = (ls, t) => Float32Array.from(computeSkinMatrices(mdl, t, ls, null));
+        const at0 = pose(layers, 0)[13];
+        const atEnd = pose(layers, 2)[13];
+        const restEnd = pose(loops, 2)[13];
+        // ② 起点在**静止位**上方（模型局部 y 向上）：被做反时起点恰好落在静止位上
+        if (!(at0 - restEnd > 200)) {
+          pErr.push(`吊坠入场起点不对：t=0 骨0 y=${at0.toFixed(1)}（静止位 ${restEnd.toFixed(1)}）——应「从静止位上方落下」，起点须高出 >200`);
+        }
+        // ③ 收敛：播完（t≥duration）回到非 single 层的静止位
+        const a = pose(layers, 4);
+        const b = pose(loops, 4);
+        let maxD = 0;
+        for (let i = 0; i < mdl.bones.length; i++) {
+          maxD = Math.max(maxD, Math.hypot(a[i * 16 + 12] - b[i * 16 + 12], a[i * 16 + 13] - b[i * 16 + 13]));
+        }
+        if (maxD > 25) {
+          pErr.push(`吊坠入场播完后没回到静止位：与「只留循环层」的姿态差 ${maxD.toFixed(1)}px（应 ≤25，残留只该是摆动幅度）`);
+        }
+        if (!pErr.length) {
+          console.log(`   加算 single clip：骨0 y ${at0.toFixed(0)} → ${atEnd.toFixed(0)}（静止位 ${restEnd.toFixed(0)}），播完残留 ${maxD.toFixed(1)}px`);
+        }
+      }
+    }
+  }
+  // 源码守卫：参考帧规则不得被静默删掉
+  const skinSrc = fs.readFileSync(`${ROOT}/renderer/vendor/we-scene/render/mdl-skin.js`, "utf8");
+  if (!/const restAt = L\.anim\.mode === 'single'/.test(skinSrc)) {
+    pErr.push("mdl-skin 缺少「single clip 参考帧取末帧」的 restAt 闸门（3640755971 吊坠会反向飞出去）");
+  }
+  for (const e of pErr) errors.push(e);
 }
 
 if (errors.length) {

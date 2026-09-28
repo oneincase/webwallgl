@@ -49,7 +49,24 @@
 //（event = {name, frame}）。触发按语料魔数反推为半开区间：前进 `prev < f <= cur`、
 // 后退 `cur <= f < prev`；setFrame 不触发（脚本 seek 不算"passes"）；换向不补发；
 // single 钳到 length 时末帧事件触发（24/24 的 S 事件都钉在 frame==length）；
-// 装载时 frame-0 事件**不补发**（假设，语料两种解读都自洽）。
+// **frame-0 事件在首次推进时就触发**（2026-09-28 更正，见 INITIAL_PREV_FRAME）。
+// 旧版写成「装载不补发」的假设，后果见 2477602742：flashStart 永不发生，
+// 右红灯 alpha 动画（startpaused）停在 frame 0 常亮，两个红灯不再交替闪。
+
+/**
+ * [we-scene patch 2026-09-28] 播放头「第 0 帧之前」的哨兵帧号。
+ *
+ * 跨帧检测是半开区间 `prev < f <= cur`，播放头的**起始位置必须落在 frame 0 之前**，
+ * 否则 frame-0 的事件（前进时 f>prev 恒假）永远不被越过。参考引擎同一约定：
+ * OWE `SceneAnimationPlayback::m_previous_frame { -0.5 }` 初值 −0.5，`Stop()` 与
+ * 「single 播完再 Play()」也复位成 −0.5（源码 Scene.cpp:1323 / 1126 / 1136）。
+ *
+ * 2477602742 实证（用户报「两个红灯是交替闪的」）：父级「Pole Front」的骨骼动画
+ * （360s 循环，fps 1）把 flashStart 钉在 frame 0，脚本在它的回调里对左右红灯
+ * `getAnimation("flash").play()`。补不到 frame-0 事件 → 右灯动画 startpaused 停在
+ * frame 0（alpha=1）常亮，只剩左灯自播闪烁，交替彻底不成对。
+ */
+export const INITIAL_PREV_FRAME = -0.5
 
 /** 三次贝塞尔的一维分量 */
 function bez1(p0, p1, p2, p3, t) {
@@ -314,6 +331,9 @@ export function createAnimation(def) {
     _ended: false,
     _events: events,
     _eventQueue: [],
+    // 跨帧检测的「上一帧」：初值 = frame 0 之前（见 INITIAL_PREV_FRAME）。
+    // stop()/播完后重播都回到这个值，setFrame 则跟随 seek 目标（seek 不触发事件）。
+    _prevFrame: INITIAL_PREV_FRAME,
     get frameCount() { return length },
     // [we-scene patch] playing/rate/ended 是访问器：linked child 全部镜像/委托
     // leader —— 语料里作者直接读写 `ani.rate`（不是 setRate），纯数据字段拦不住。
@@ -334,12 +354,13 @@ export function createAnimation(def) {
       //（OWE Scene.cpp SceneAnimationPlayback::Play()：`!loop && !mirror &&
       // m_clip->End() > 0 && Frame() >= FrameCount()` → position 归 0 再置 playing；
       // 官方同时把 m_previous_frame 置 -0.5，让 frame-0 的事件在重启后的首 tick
-      // 被越过 —— 本仓事件沿用「从 0 起播不补发」的装载约定，这里只复位播放头。）
+      // 被越过 —— 本仓同步跟随该约定（见 INITIAL_PREV_FRAME）。）
       // 缺了它：3801397319 右上角那个「play() 后 1500ms pause()」的切换按钮，
       // 90 帧 single 动画播完后 frame 恒 ≥ length，之后每次 play() 下一帧就走到
       // 头 —— 表现为「点两次能切、再点永远切不动」。
       if (mode === 'single' && length > 0 && anim.frame >= length) {
         anim.frame = 0
+        anim._prevFrame = INITIAL_PREV_FRAME
       }
       anim._playing = true
       anim._ended = false
@@ -354,13 +375,21 @@ export function createAnimation(def) {
       if (anim.parent) return anim.parent.stop()
       anim._playing = false
       anim.frame = 0
+      // OWE Stop()：播放头归零同时把 m_previous_frame 置 -0.5 —— 归零后的首 tick
+      // 要能越过 frame-0 事件（2477602742 的 flashStop 停掉两灯、flashStart 再启）。
+      anim._prevFrame = INITIAL_PREV_FRAME
       anim._ended = false
       return anim
     },
     setFrame(f) {
       if (anim.parent) return anim.parent.setFrame(f)
       const n = Number(f)
-      if (Number.isFinite(n)) anim.frame = n
+      if (Number.isFinite(n)) {
+        anim.frame = n
+        // 脚本 seek 不算「越过帧」（OWE SetFrame 同步 m_previous_frame），
+        // 所以下一帧从 n 起算，落点之间的事件不补发。
+        anim._prevFrame = n
+      }
       return anim
     },
     getFrame() { return anim.parent ? anim.parent.getFrame() : anim.frame },
@@ -383,7 +412,7 @@ export function createAnimation(def) {
     advance(dt) {
       if (anim.parent) return
       if (!anim._playing) return
-      const prev = anim.frame
+      const prev = anim._prevFrame
       anim.frame += (Number(dt) || 0) * fps * anim._rate
       if (mode === 'single') {
         if (anim.frame >= length) {
@@ -400,6 +429,7 @@ export function createAnimation(def) {
         }
       }
       collectCrossedEvents(anim, prev, anim.frame)
+      anim._prevFrame = anim.frame
     },
     /** 取出并清空本帧越过的事件（宿主统一做图层级广播；setFrame 不产生事件） */
     takeEvents() {

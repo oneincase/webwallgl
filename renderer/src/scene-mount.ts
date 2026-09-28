@@ -5471,7 +5471,12 @@ cfg, source, pkgAbort.signal);
           // 与时间轴事件同一套半开区间跨帧检测（animation.js crossedEvents），
           // 同一套图层级广播（2477602742 flashStart → bell.play；
           // 3396722575/3351179520/3405117965 的「错帧/插针」事件）。
-          // 首帧 prev=cur 不补发（与时间轴事件的装载语义一致）。
+          // 首个推进帧的 prev 取「第 0 帧之前半个帧」（anim.INITIAL_PREV_FRAME，
+          // 与 OWE SceneAnimationPlayback::m_previous_frame 初值 −0.5 同约定）：
+          // 装载当帧就要越过 frame 0 的事件。取 prev=cur 会让 2477602742 的
+          // flashStart（它的 pole 动画 360s 循环把它钉在 frame 0）永远不发生 ——
+          // 右灯 alpha 动画 startpaused 停在 frame 0（=1）常亮，只剩左灯自播闪烁，
+          // 「两个红灯交替闪」退化成「一灯闪 + 一灯常亮」，且铃铛也永不响。
           for (const item of mdlItems) {
             const mdlObj = item.mdl;
             const layer = item.layer;
@@ -5489,7 +5494,7 @@ cfg, source, pkgAbort.signal);
               const a = anims.find((x: any) => x.id === al.animation);
               if (!a || !a.events || !a.events.length) continue;
               const curFrame = t * (typeof al.rate === "number" ? al.rate : 1) * a.fps;
-              const prev = prevMap.has(li) ? (prevMap.get(li) as number) : curFrame;
+              const prev = prevMap.has(li) ? (prevMap.get(li) as number) : anim.INITIAL_PREV_FRAME;
               const crossed = anim.crossedEvents(
                 a.events,
                 prev,

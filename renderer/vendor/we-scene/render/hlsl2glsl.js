@@ -899,6 +899,68 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     }
   }
 
+  // 9c) [we-scene patch 3640755971] **二元运算两侧宽度不等**：把更宽的一侧截断。
+  //    HLSL/WE 的编译器按 DXBC 的写掩码算（运算按较窄的宽度进行），GLSL ES 的二元
+  //    运算符**没有任何尺寸转换** —— `vec2 / vec4` 直接
+  //    `'/' : wrong operand types - no operation '/' exists…`，整条 pass 报废。
+  //    实测两处（同一形态：像素量 ÷ 分辨率 vec4）：
+  //      - texture_override.vert `vec2 offset = g_TexOffset / g_Texture0Resolution;`
+  //        → 整个 pass 被跳过 → 用它的 solid 层退回**白底兜底**：3640755971 的
+  //        可调整组合层出场动画（opacity alpha，90 帧 @45fps）一放完，组画布上的
+  //        白底就整屏刷出来（占屏 82%，与作者 preview.gif 的暗色调完全相反）。
+  //      - 3221939295 波纹 .frag `vec2 strength = CAST2(500) / g_Texture0Resolution;`
+  //    只处理「两侧宽度都**可确证**」的形态，推不出来就不动（与 9/9b 同尺度）：
+  //      - 裸标识符：宽度取自**行首的 uniform/varying/attribute 声明**。局部变量
+  //        不认 —— 宽度表是「全文扫、同名后者胜」，不同 #if 分支里同名 `timer`
+  //        可能是 vec3 也可能是 vec4（2134765860 的 lens_flare_sun 会被误改）；
+  //      - `vecN(...)` 构造：宽度写在名字里；
+  //      - 带分量 swizzle 的引用：宽度 = swizzle 长度（`g_PointerUV.xy`）。
+  //    数值字面量与函数调用一律不算（标量 / 返回类型未知），**等宽表达式一个字不动**
+  //    —— 全库文本差异只落在真正编不过的那几条语句上。
+  {
+    const width = new Map()
+    let wm
+    const wre = /^[ \t]*(?:uniform|varying|attribute|in|out)\s+(vec([234]))\s+([A-Za-z_]\w*)/gm
+    while ((wm = wre.exec(code)) !== null) width.set(wm[3], Number(wm[2]))
+    if (width.size > 0) {
+      const OPERAND = '([A-Za-z_]\\w*(?:\\.[xyzwrgba]{1,4})?|vec[234]\\s*\\([^()]*\\)|\\d+(?:\\.\\d+)?)'
+      const widthOf = (t) => {
+        const s = t.trim()
+        const ctor = /^vec([234])\s*\(/.exec(s)
+        if (ctor) return Number(ctor[1])
+        const sw = /\.([xyzwrgba]{1,4})$/.exec(s)
+        if (sw) return sw[1].length
+        if (/^[0-9]/.test(s)) return 0 // 标量
+        return width.get(s) || 0
+      }
+      const SW = { 2: 'xy', 3: 'xyz' }
+      code = code.replace(
+        new RegExp(OPERAND + '\\s*([*/])\\s*' + OPERAND, 'g'),
+        (all, a, op, b, offset, str) => {
+          // 词边界：别从标识符/成员中间起匹配
+          const before = offset > 0 ? str[offset - 1] : ''
+          const after = str[offset + all.length] || ''
+          if (/[A-Za-z0-9_.]/.test(before) || /[A-Za-z0-9_.]/.test(after)) return all
+          const wa = widthOf(a)
+          const wb = widthOf(b)
+          if (wa < 2 || wb < 2 || wa === wb) return all
+          const sw = SW[Math.min(wa, wb)]
+          if (!sw) return all
+          // 只截断**更宽的那个**，且它必须是裸标识符或带 swizzle 的引用
+          // （`vecN(...)` 构造本身就是那个宽度，改了反而多套一层）
+          const cut = (t, tw) => {
+            if (tw <= Math.min(wa, wb)) return t
+            const body = t.trim()
+            if (!/^[A-Za-z_]\w*$/.test(body) && !/\.[xyzwrgba]{1,4}$/.test(body)) return t
+            const trail = (t.match(/\s*$/) || [''])[0]
+            return t.slice(0, t.length - trail.length) + '.' + sw + trail
+          }
+          return cut(a, wa) + ' ' + op + ' ' + cut(b, wb)
+        },
+      )
+    }
+  }
+
   // 10) [we-scene patch] **裸整数赋给 float**：
   //    HLSL 允许 `v_TexCoord.w = 0;`、`float x = 1;`，GLSL ES 没有 int→float 隐式转换，
   //    报 `'=' : cannot convert from 'const int' to 'highp float'`。
@@ -1031,6 +1093,149 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         new RegExp(`\\b(${fAlt})\\s*([*/+-])\\s*(${iAlt})\\b`, 'g'),
         (all, a, op, b) => `${a} ${op} float(${b})`,
       )
+    }
+  }
+
+  // 10b-4) [we-scene patch 3640755971] **整型实参喂给浮点形参**：
+  //    HLSL 在调用点做 int→float 提升，GLSL ES **没有任何隐式转换** —— 实参类型
+  //    不匹配直接 `no matching overloaded function found`，整条 pass 报废。
+  //    两处来源都在同一类工坊效果里（3235948233 auto_sway，全库 9 张壁纸在用）：
+  //      ① 作者自定义函数：`float linearStep(in float lower, in float upper, in float x)`
+  //         被 `linearStep(2, NODE_COUNT, nodeNum)` 调用，而 nodeNum 是 `in int`
+  //         —— collectIntNames 的尾随字符集 `[=;)]` 收不到**形参**声明，里面是空的；
+  //      ② 内建 float 函数：`step(0.5, nodeNum)` 同样喂了 int 变量。
+  //    做法：从本 stage 的函数**定义**读出「哪些形参位置是 float」，把这些位置上的
+  //    可确证整型实参转成 float（纯整数字面量补 .0；int 变量 / 纯 int 表达式包 float()）。
+  //    内建只碰**没有整数重载**的那批，且要求同一次调用里至少还有一个可确证的浮点
+  //    实参 —— abs/min/max/clamp/mod/sign 都有 int 重载，int 语境下误转会反向破坏
+  //    （`int n = abs(i)`）。
+  //    两条闸门（否则是「全文类型表 + 作用域失配」的经典误伤，实测两次）：
+  //      - 同名同时被声明成 int 与 float（公共头形参 + 局部变量重名）→ 放弃
+  //        （2134765860 的 `return rotateVec2(v.xy, a)` 会被改成 `float(a)`）；
+  //      - 同名被声明成任何向量类型 → 也放弃（`float rand(vec2 n)` 里的 n 会被当成
+  //        别处 `int n` 的 n，改成 `dot(float(n), …)`，2869415541）。
+  {
+    const intNames = collectIntNames(code)
+    {
+      // 形参形态（`in int nodeNum,` / `in int i)`）：尾随逗号或右括号
+      const ipre = /\b(?:const\s+)?int\s+([A-Za-z_]\w*)\s*[,)]/g
+      let im
+      while ((im = ipre.exec(code)) !== null) intNames.add(im[1])
+    }
+    const floatNames = new Set()
+    const vecNames = new Set()
+    {
+      const fre = /\b(?:const\s+|uniform\s+|varying\s+|in\s+|out\s+)*float\s+([A-Za-z_]\w*)/g
+      let fm
+      while ((fm = fre.exec(code)) !== null) floatNames.add(fm[1])
+      const vre = /\b(?:const\s+|uniform\s+|varying\s+|attribute\s+|in\s+|out\s+|inout\s+)*(?:vec[234]|mat[234])\s+([A-Za-z_]\w*)/g
+      let vm
+      while ((vm = vre.exec(code)) !== null) vecNames.add(vm[1])
+    }
+    for (const n of [...intNames]) {
+      if (floatNames.has(n) || vecNames.has(n)) intNames.delete(n)
+    }
+    // 可确证为整型的实参：纯整数字面量，或「不含小数点、不含调用、标识符全是已知 int」
+    const isIntArg = (a) => {
+      const t = a.trim()
+      if (!t || /\./.test(t)) return false
+      if (/^[+-]?\d+$/.test(t)) return true
+      if (/[A-Za-z_]\w*\s*\(/.test(t)) return false
+      const ids = t.match(/[A-Za-z_]\w*/g) || []
+      return ids.length > 0 && ids.every((x) => intNames.has(x))
+    }
+    const asFloatArg = (a) => (/^[+-]?\d+$/.test(a.trim()) ? a.trim() + '.0' : 'float(' + a.trim() + ')')
+    // 按「实参 / 分隔符」切片重建，**原样保留逗号后的空白**（不重排、不 trim）
+    const mapArgs = (inner, convert) => {
+      const segs = []
+      let depth = 0
+      let cur = ''
+      let i = 0
+      while (i < inner.length) {
+        const ch = inner[i]
+        if (ch === '(') depth++
+        else if (ch === ')') depth--
+        if (ch === ',' && depth === 0) {
+          segs.push({ arg: cur, sep: ',' })
+          cur = ''
+          i++
+          while (i < inner.length && /\s/.test(inner[i])) {
+            segs[segs.length - 1].sep += inner[i]
+            i++
+          }
+          continue
+        }
+        cur += ch
+        i++
+      }
+      segs.push({ arg: cur, sep: '' })
+      let changed = false
+      let n = 0
+      let out = ''
+      for (const seg of segs) {
+        const conv = convert(seg.arg, n)
+        if (conv !== undefined && conv !== null) {
+          seg.arg = conv
+          changed = true
+        }
+        out += seg.arg + seg.sep
+        n++
+      }
+      return changed ? out : null
+    }
+    // ① 自定义函数：收集每个名字的**全部重载**，只有所有重载在位置 i 都是 float 才动
+    //    —— 存在 `f(float)` / `f(int)` 双份重载时，HLSL 的实参提升另有选择规则，
+    //    改了就成另一个重载。
+    const sigs = new Map()
+    {
+      // 只认真正的函数定义：`for (...)` / `if (...)` / `while (...)` 后面的 `{`
+      // 同样满足「名字(无嵌套括号){」，不过滤会把 for/if 当成函数名，
+      // 于是 rewriteCall('for', …) 把 `for (` 重写成 `for(`（实测 depthparallax）。
+      const KEYWORDS = new Set(['for', 'if', 'while', 'switch', 'do', 'else', 'return', 'main'])
+      const defRe = /\b([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\{/g
+      let dm
+      while ((dm = defRe.exec(code)) !== null) {
+        const nm = dm[1]
+        if (KEYWORDS.has(nm)) continue
+        const kinds = splitArgs(dm[2]).map((p) => {
+          if (/^\s*(?:in|out|inout)?\s*(?:const\s+)?float\b/.test(p)) return 'float'
+          if (/^\s*(?:in|out|inout)?\s*(?:const\s+)?(?:int|uint|bool)\b/.test(p)) return 'int'
+          return 'other'
+        })
+        if (!sigs.has(nm)) sigs.set(nm, [])
+        sigs.get(nm).push(kinds)
+      }
+    }
+    for (const [nm, list] of sigs) {
+      const pos = []
+      for (let i = 0; i < list[0].length; i++) {
+        if (list.every((k) => k[i] === 'float')) pos.push(i)
+      }
+      if (!pos.length) continue
+      code = rewriteCall(code, nm, (inner) => {
+        const out = mapArgs(inner, (arg, i) => (pos.includes(i) && isIntArg(arg) ? asFloatArg(arg) : undefined))
+        return nm + '(' + (out === null ? inner : out) + ')'
+      })
+    }
+    // ② 内建（无整数重载的那批）：`step(0.5, nodeNum)` → `step(0.5, float(nodeNum))`
+    const FLOAT_ONLY_BUILTINS = [
+      'smoothstep', 'step', 'mix', 'pow', 'fract', 'atan', 'sqrt', 'inversesqrt',
+      'exp', 'log', 'exp2', 'log2', 'floor', 'ceil', 'length', 'distance', 'dot',
+      'reflect', 'refract', 'faceforward', 'normalize', 'cross',
+    ]
+    const isFloatArg = (a) => {
+      const t = a.trim()
+      if (/\d\.\d|\.\d|\d\./.test(t)) return true
+      if (floatNames.has(t)) return true
+      return /\.[xyzwrgba]{1,4}$/.test(t)
+    }
+    for (const fn of FLOAT_ONLY_BUILTINS) {
+      code = rewriteCall(code, fn, (inner) => {
+        const args = splitArgs(inner)
+        if (args.length < 2 || !args.some(isFloatArg)) return fn + '(' + inner + ')'
+        const out = mapArgs(inner, (arg) => (isIntArg(arg) ? asFloatArg(arg) : undefined))
+        return fn + '(' + (out === null ? inner : out) + ')'
+      })
     }
   }
 
