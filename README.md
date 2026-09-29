@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -351,14 +351,15 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 2.0.1（自 1.4.2 起的大版本更新，共 15 个提交）。这一版主线是「重场景性能」与「真实媒体封面」：渲染/装配/解码链路做了多轮基于实测的优化，新增内嵌图烘焙缓存与无 GPU 自动降档，并补齐了歌曲封面在全部三个绑定位置上的优先级。
+当前版本 2.0.2（自 2.0.1 起 14 个提交）。这一版主线是「3D 场景真实感」「脚本与动画层补齐」与「诊断契约」：3D 网格改为真深度测试的逐网格绘制、相机路径与脚本相机通道落地、动画层的 blend/rate 与逐层播放时钟补齐，另外把诊断级别变成由库声明并随请求发出的稳定契约。
 
-- 性能优化（均为真实场景实测）：贴图解码去掉两笔白做的工作，重场景加载耗时 −50~80%；MDL 四个段签名改为单趟扫描，模型语料扫描 −75%；帧内合并可见性重算，847 层场景稳态 CPU −39%；图层代理只读路径不再预建 5 个 Vec3，脚本重场景 CPU −19%。
-- 内嵌图烘焙缓存：命中时省约 80% 解码开销，默认开启、可关闭；烘焙命中/补烘统计写入 __memStats 正式字段，与诊断同源，可在运行时查询。
-- 无 GPU 自动降档：检测到无 GPU 时自动切到低质量预设，帧率守门保证稳定；显式质量选择优先，可关闭。
-- 歌曲封面优先级修复：真实封面现在在三个绑定位置都高于壁纸内置封面——solid 实例（迟到补绑）、效果 pass、图层自身材质；修复 3122339805 / 3151551777 / 3155776049 封面位只显示占位图或内置图的问题，全库共 55+ 处绑定受益。
-- 网页壁纸兼容：修复严格沙箱下工坊应用首屏白屏（不透明源的 localStorage / cookie 兜底），以及自带 &lt;base> 标签的网页壁纸整页白屏（相对 base 就地改写）。
-- 工具链与工程：新增性能实测台 perf-bench 与烘焙对照模式；verify-bake 等新判据接入稳定集。另对 B1 烘焙方案做了 48 张样本认证（中位仅可省 15ms），实测收益不足，按结论不做。
+- 真 3D 网格绘制：逐网格贴图 + 深度测试（含 HDR/MSAA 深度附件）+ 场景平行光；修 MDL 逐骨记录布局失步与多子网格只读首个 —— 3281559867 角色炸成巨块、整场没有地面的问题不再复现。
+- 相机：实体取「可见那台」并逐帧刷新，支持相机路径（path，随机/顺序抽段）与脚本相机位姿通道；跟拍类壁纸的镜头不再中途跑偏。
+- 窗口遮挡感知渲染：窗口被遮挡时暂停渲染、按档降帧，并做 ROI 图层剔除；宿主可推送遮挡矩形（可显式关闭），与用户 pause() 严格区分，撤掉遮挡自动恢复。
+- 脚本沙箱与动画层补齐：新增 emitParticles / getMaterial().getAnimation / getConstantAnimation（主控脚本不再三振熔断）；animationlayers 的 blend/rate 脚本与关键帧求值、每层自己的播放时钟（play/pause/setFrame）—— 绊倒/撞人后角色卡死、分数停住的问题已修。
+- 诊断级别成为稳定契约（issue #13）：级别由库自己声明并随 /diag 请求一起发出（`/diag?msg=…&lvl=&lt;level>`），三档 error / warn / info 语义写进类型与本文档；嵌入方不必再对诊断文案做关键字匹配。
+- 稳定性：rAF 跳帧节流改为纯时间判据（长任务后不再放大间隔，#8）、变换槽形状契约 + 渲染循环不许抛 + 效果链失败出声（#9 #10 #11）、加算 single clip 取末帧参考与 frame-0 帧事件补发、转译宽度与整型提升修复；cover 窥视门控只认「出像素的层」（放大镜类壁纸鼠标一碰边缘就把视窗滑出画面）。
+- 工具链：新增 __shared 调试出口（场景脚本共享状态只读快照）、脚本报错带出错行；verify-diag 契约锁进稳定集（含变异红测）。
 
 每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。
 

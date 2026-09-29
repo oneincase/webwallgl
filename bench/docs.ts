@@ -517,36 +517,40 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: `当前版本 ${version}（自 1.4.2 起的大版本更新，共 15 个提交）。这一版主线是「重场景性能」与「真实媒体封面」：渲染/装配/解码链路做了多轮基于实测的优化，新增内嵌图烘焙缓存与无 GPU 自动降档，并补齐了歌曲封面在全部三个绑定位置上的优先级。`,
-          en: `Current version: ${version} — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.`,
+          zh: `当前版本 ${version}（自 2.0.1 起 14 个提交）。这一版主线是「3D 场景真实感」「脚本与动画层补齐」与「诊断契约」：3D 网格改为真深度测试的逐网格绘制、相机路径与脚本相机通道落地、动画层的 blend/rate 与逐层播放时钟补齐，另外把诊断级别变成由库声明并随请求发出的稳定契约。`,
+          en: `Current version: ${version} — 14 commits since 2.0.1. Three themes: real 3D scene fidelity, script & animation-layer completion, and a diagnostics contract. 3D meshes now draw per-mesh with real depth testing, camera paths and a script camera channel landed, animation-layer blend/rate plus per-layer playback clocks are in place, and the diagnostic level is now a stable contract declared by the library and sent with every request.`,
         },
       },
       {
         k: "ul",
         items: [
           {
-            zh: "性能优化（均为真实场景实测）：贴图解码去掉两笔白做的工作，重场景加载耗时 −50~80%；MDL 四个段签名改为单趟扫描，模型语料扫描 −75%；帧内合并可见性重算，847 层场景稳态 CPU −39%；图层代理只读路径不再预建 5 个 Vec3，脚本重场景 CPU −19%。",
-            en: "Performance (measured on real scenes): removed two wasted steps in texture decode — heavy-scene load −50~80%; MDL four-section signatures now scanned in one pass — model corpus scan −75%; merged in-frame visibility recomputation — steady-state CPU −39% on an 847-layer scene; layer-proxy read-only paths no longer pre-build 5 Vec3 — script-heavy scene CPU −19%.",
+            zh: "真 3D 网格绘制：逐网格贴图 + 深度测试（含 HDR/MSAA 深度附件）+ 场景平行光；修 MDL 逐骨记录布局失步与多子网格只读首个 —— 3281559867 角色炸成巨块、整场没有地面的问题不再复现。",
+            en: "Real 3D mesh rendering: per-mesh textures, depth testing (with HDR/MSAA depth attachments) and scene directional light; fixed the MDL per-bone record layout slipping out of step and only the first sub-mesh being read — 3281559867 no longer blows characters into giant blocks or loses the whole ground plane.",
           },
           {
-            zh: "内嵌图烘焙缓存：命中时省约 80% 解码开销，默认开启、可关闭；烘焙命中/补烘统计写入 __memStats 正式字段，与诊断同源，可在运行时查询。",
-            en: "Embedded-image bake cache: a hit saves ~80% of decode cost, on by default and toggleable; bake hit / back-fill counts are published as proper __memStats fields, same source as diagnostics and queryable at runtime.",
+            zh: "相机：实体取「可见那台」并逐帧刷新，支持相机路径（path，随机/顺序抽段）与脚本相机位姿通道；跟拍类壁纸的镜头不再中途跑偏。",
+            en: "Camera: the visible camera entity is picked and refreshed per frame, with camera paths (random / sequential clip queue) and a script camera pose channel — follow-cam wallpapers no longer drift mid-shot.",
           },
           {
-            zh: "无 GPU 自动降档：检测到无 GPU 时自动切到低质量预设，帧率守门保证稳定；显式质量选择优先，可关闭。",
-            en: "Automatic quality downgrading without a GPU: a low-quality preset is selected automatically when no GPU is present, with an FPS watchdog for stability; explicit quality choices take priority and it can be disabled.",
+            zh: "窗口遮挡感知渲染：窗口被遮挡时暂停渲染、按档降帧，并做 ROI 图层剔除；宿主可推送遮挡矩形（可显式关闭），与用户 pause() 严格区分，撤掉遮挡自动恢复。",
+            en: "Occlusion-aware rendering: rendering pauses, frame rate steps down by band, and ROI layer culling kicks in when the window is occluded. Hosts push occlusion rectangles (opt-out supported), and it is kept strictly separate from user pause() — removing the occlusion resumes automatically.",
           },
           {
-            zh: "歌曲封面优先级修复：真实封面现在在三个绑定位置都高于壁纸内置封面——solid 实例（迟到补绑）、效果 pass、图层自身材质；修复 3122339805 / 3151551777 / 3155776049 封面位只显示占位图或内置图的问题，全库共 55+ 处绑定受益。",
-            en: "Song-cover priority fixes: a real cover now outranks the built-in cover at all three binding positions — solid instances (late re-binding), effect passes, and the layer's own material; fixes 3122339805 / 3151551777 / 3155776049 showing only a placeholder or built-in image, benefiting 55+ bindings across the library.",
+            zh: "脚本沙箱与动画层补齐：新增 emitParticles / getMaterial().getAnimation / getConstantAnimation（主控脚本不再三振熔断）；animationlayers 的 blend/rate 脚本与关键帧求值、每层自己的播放时钟（play/pause/setFrame）—— 绊倒/撞人后角色卡死、分数停住的问题已修。",
+            en: "Script sandbox & animation layers: added emitParticles / getMaterial().getAnimation / getConstantAnimation (main controller scripts no longer trip the breaker), plus evaluation of animation-layer blend/rate scripts and keyframes and a per-layer playback clock (play/pause/setFrame) — the freeze after a trip/bump, with the score stuck, is fixed.",
           },
           {
-            zh: "网页壁纸兼容：修复严格沙箱下工坊应用首屏白屏（不透明源的 localStorage / cookie 兜底），以及自带 <base> 标签的网页壁纸整页白屏（相对 base 就地改写）。",
-            en: "Web-wallpaper compatibility: fixed a first-screen white page for workshop apps in a strict sandbox (localStorage / cookie fallback for opaque sources), and a fully white page for web wallpapers with an author <base> tag (relative base rewritten in place).",
+            zh: "诊断级别成为稳定契约（issue #13）：级别由库自己声明并随 /diag 请求一起发出（`/diag?msg=…&lvl=<level>`），三档 error / warn / info 语义写进类型与本文档；嵌入方不必再对诊断文案做关键字匹配。",
+            en: "The diagnostic level is now a stable contract (issue #13): declared by the library and sent with every /diag request (`/diag?msg=…&lvl=<level>`) across three documented tiers — error / warn / info — so embedders no longer need keyword matching on diagnostic text.",
           },
           {
-            zh: "工具链与工程：新增性能实测台 perf-bench 与烘焙对照模式；verify-bake 等新判据接入稳定集。另对 B1 烘焙方案做了 48 张样本认证（中位仅可省 15ms），实测收益不足，按结论不做。",
-            en: "Tooling: added the perf-bench performance harness and a bake comparison mode; new checks including verify-bake joined the stable set. The B1 bake proposal was also validated on 48 samples (median saving only 15ms) and rejected as not worth it.",
+            zh: "稳定性：rAF 跳帧节流改为纯时间判据（长任务后不再放大间隔，#8）、变换槽形状契约 + 渲染循环不许抛 + 效果链失败出声（#9 #10 #11）、加算 single clip 取末帧参考与 frame-0 帧事件补发、转译宽度与整型提升修复；cover 窥视门控只认「出像素的层」（放大镜类壁纸鼠标一碰边缘就把视窗滑出画面）。",
+            en: "Stability: rAF frame throttling is now a pure time gate (#8), transform-slot shape contract + the render loop may not throw + effect-chain failures now speak up (#9 #10 #11), additive single clips take the end frame as reference and frame-0 events fire at load, plus transpilation width / integer-promotion fixes; the cover-peek gate only counts layers that actually paint pixels (magnifier-style wallpapers no longer slide the viewport off-screen at the screen edge).",
+          },
+          {
+            zh: "工具链：新增 __shared 调试出口（场景脚本共享状态只读快照）、脚本报错带出错行；verify-diag 契约锁进稳定集（含变异红测）。",
+            en: "Tooling: added the __shared debug export (read-only snapshot of scene-script shared state) and script errors now carry the failing line; the verify-diag contract check (with mutation testing) joined the stable set.",
           },
         ],
       },

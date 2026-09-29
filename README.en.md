@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.1/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -352,14 +352,15 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 2.0.1 — a major release since 1.4.2 (15 commits). The two themes are heavy-scene performance and real media artwork: the render / assembly / decode pipelines went through several measurement-driven optimizations, we added an embedded-image bake cache and automatic quality downgrading without a GPU, and real song covers now take priority at all three binding positions.
+Current version: 2.0.2 — 14 commits since 2.0.1. Three themes: real 3D scene fidelity, script & animation-layer completion, and a diagnostics contract. 3D meshes now draw per-mesh with real depth testing, camera paths and a script camera channel landed, animation-layer blend/rate plus per-layer playback clocks are in place, and the diagnostic level is now a stable contract declared by the library and sent with every request.
 
-- Performance (measured on real scenes): removed two wasted steps in texture decode — heavy-scene load −50~80%; MDL four-section signatures now scanned in one pass — model corpus scan −75%; merged in-frame visibility recomputation — steady-state CPU −39% on an 847-layer scene; layer-proxy read-only paths no longer pre-build 5 Vec3 — script-heavy scene CPU −19%.
-- Embedded-image bake cache: a hit saves ~80% of decode cost, on by default and toggleable; bake hit / back-fill counts are published as proper __memStats fields, same source as diagnostics and queryable at runtime.
-- Automatic quality downgrading without a GPU: a low-quality preset is selected automatically when no GPU is present, with an FPS watchdog for stability; explicit quality choices take priority and it can be disabled.
-- Song-cover priority fixes: a real cover now outranks the built-in cover at all three binding positions — solid instances (late re-binding), effect passes, and the layer's own material; fixes 3122339805 / 3151551777 / 3155776049 showing only a placeholder or built-in image, benefiting 55+ bindings across the library.
-- Web-wallpaper compatibility: fixed a first-screen white page for workshop apps in a strict sandbox (localStorage / cookie fallback for opaque sources), and a fully white page for web wallpapers with an author &lt;base> tag (relative base rewritten in place).
-- Tooling: added the perf-bench performance harness and a bake comparison mode; new checks including verify-bake joined the stable set. The B1 bake proposal was also validated on 48 samples (median saving only 15ms) and rejected as not worth it.
+- Real 3D mesh rendering: per-mesh textures, depth testing (with HDR/MSAA depth attachments) and scene directional light; fixed the MDL per-bone record layout slipping out of step and only the first sub-mesh being read — 3281559867 no longer blows characters into giant blocks or loses the whole ground plane.
+- Camera: the visible camera entity is picked and refreshed per frame, with camera paths (random / sequential clip queue) and a script camera pose channel — follow-cam wallpapers no longer drift mid-shot.
+- Occlusion-aware rendering: rendering pauses, frame rate steps down by band, and ROI layer culling kicks in when the window is occluded. Hosts push occlusion rectangles (opt-out supported), and it is kept strictly separate from user pause() — removing the occlusion resumes automatically.
+- Script sandbox & animation layers: added emitParticles / getMaterial().getAnimation / getConstantAnimation (main controller scripts no longer trip the breaker), plus evaluation of animation-layer blend/rate scripts and keyframes and a per-layer playback clock (play/pause/setFrame) — the freeze after a trip/bump, with the score stuck, is fixed.
+- The diagnostic level is now a stable contract (issue #13): declared by the library and sent with every /diag request (`/diag?msg=…&lvl=&lt;level>`) across three documented tiers — error / warn / info — so embedders no longer need keyword matching on diagnostic text.
+- Stability: rAF frame throttling is now a pure time gate (#8), transform-slot shape contract + the render loop may not throw + effect-chain failures now speak up (#9 #10 #11), additive single clips take the end frame as reference and frame-0 events fire at load, plus transpilation width / integer-promotion fixes; the cover-peek gate only counts layers that actually paint pixels (magnifier-style wallpapers no longer slide the viewport off-screen at the screen edge).
+- Tooling: added the __shared debug export (read-only snapshot of scene-script shared state) and script errors now carry the failing line; the verify-diag contract check (with mutation testing) joined the stable set.
 
 Every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
 
