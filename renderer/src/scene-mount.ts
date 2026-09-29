@@ -6302,6 +6302,12 @@ cfg, source, pkgAbort.signal);
               projH,
             };
             reportDiag(rt, cfg, `cover peek gate: content ${Math.round(b.maxX - b.minX)}x${Math.round(b.maxY - b.minY)}`);
+          } else {
+            // 没有任何出像素的层（或全是空 composelayer 画布）→ 记 0×0 基准而不是
+            // 不设基准：`peekAxes` 对「无基准」是两轴放行（媒体/网页壁纸的既有行为），
+            // 场景侧不设就等于「算不出内容在哪反而随便滑」。0×0 恒判无溢出 → 钉住居中。
+            rt.coverPeek = { contentW: 0, contentH: 0, projW, projH };
+            reportDiag(rt, cfg, `cover peek gate: content 0x0 (无出像素的层)`);
           }
         }
       }

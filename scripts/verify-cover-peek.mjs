@@ -9,6 +9,14 @@
  *
  * 本文件离线可跑：math.js 纯函数直接 Node import；scene-mount 的包围盒统计
  * 与 shell 的门控接线用源码断言锁住。
+ *
+ * 第二类误伤（3257420414「放大镜」）：门控基准是**所有可见层**的包围盒，而辅助层
+ * 的矩形比画面大得多 —— 7000×3000 的全局调色画布（空 composelayer）+ 1002×5460
+ * 的镜头长条（alpha 挂 newproperty13=0）把基准从真实画面 2560×1440 撑到 7000×4986，
+ * 于是 16:9 下两轴都判溢出，鼠标一碰左右热区就把视窗滑出画面（露出 clearcolor、
+ * 画面整体左移）。修法 = layerPaintsContent 只认出像素的层；空基准写 0×0 而不是
+ * 不设（「无基准」是媒体/网页壁纸的放行语义，场景侧借它会变成「算不出内容反而
+ * 随便滑」）。[0b]/[0c] 锁这两条。
  */
 import fs from 'node:fs'
 import { join } from 'node:path'
@@ -57,6 +65,49 @@ console.log('\n[0] coverContentBounds：旋转横条的真实数值（1920911984
   check(Math.abs((b3.maxX - b3.minX) - 610.2) < 0.5, '对照组：同层不旋转时包围盒是 610×3254（证明换轴断言真的在测旋转）')
 }
 
+console.log('\n[0b] layerPaintsContent：辅助层不计入内容包围盒（3257420414 放大镜）')
+{
+  const { layerPaintsContent } = math
+  check(typeof layerPaintsContent === 'function', 'math.js 应导出 layerPaintsContent')
+  const base = { visible: true, size: [100, 100], scale: [1, 1, 1], angles: [0, 0, 0], origin: [0, 0, 0] }
+  check(layerPaintsContent({ ...base }) === true, '普通层照常计入')
+  check(layerPaintsContent({ ...base, alpha: 0 }) === false, 'alpha=0 的层不计入（映射边缘1 的 newproperty13）')
+  check(layerPaintsContent({ ...base, alpha: { user: 'p', value: 0 } }) === false, '{user,value} 包装的 alpha=0 同样不计入')
+  check(layerPaintsContent({ ...base, alpha: 0.5 }) === true, 'alpha>0 照常计入')
+  check(layerPaintsContent({ ...base, isContainer: true, hasChildren: false }) === false, '空 composelayer（效果画布/捕获源）不计入')
+  check(layerPaintsContent({ ...base, isContainer: true, hasChildren: true }) === true, '带子层的分组容器照常计入')
+  check(layerPaintsContent({ ...base, visible: false }) === false && layerPaintsContent({ ...base, destroyed: true }) === false, '不可见/销毁层不计入')
+
+  // 3257420414「放大镜」的可见层实测值（origin 取居中态）：真实画面 = 两张 2560×1440 贴图层。
+  // 旧口径把空 composelayer 与 alpha=0 的长条算进来 → 7000×4986 → 两轴判溢出 → 视窗被滑出画面。
+  const L = [
+    { visible: true, size: [2560, 1440], scale: [1, 1, 1], angles: [0, 0, 0], origin: [2560, 720, 0] },            // 5月8日(1)
+    { visible: true, size: [2560, 1440], scale: [1, 1, 1], angles: [0, 0, 0], origin: [2560, 720, 0] },            // 5月8日
+    { visible: true, size: [1002, 5460], scale: [0.35, 1, 1], angles: [0, 0, 0.4887], origin: [2560, 720, 0], alpha: 0 },        // 映射边缘1
+    { visible: true, size: [1000, 5460], scale: [0.35, 1, 1], angles: [0, 0, 0.4887], origin: [2560, 720, 0], isContainer: true, hasChildren: false }, // 映射顶部1
+    { visible: true, size: [7000, 3000], scale: [1, 1, 1], angles: [0, 0, 0], origin: [2560, 720, 0], isContainer: true, hasChildren: false },          // 鼠标事件
+    { visible: true, size: [800, 500], scale: [0.14, 0.14, 0.14], angles: [0, 0, 0], origin: [3750, 1380, 0] },     // kai
+  ]
+  const b = coverContentBounds(L)
+  const w = b.maxX - b.minX, h = b.maxY - b.minY
+  check(Math.abs(w - 2560) < 1 && Math.abs(h - 1440) < 1, `3257420414 内容包围盒应为 2560×1440，实得 ${w.toFixed(0)}×${h.toFixed(0)}`)
+  const v = coverViewSize(5120, 1440, 1440, 810)
+  const got = coverPeekOverflow(w, h, v.viewW, v.viewH)
+  check(got.x === false && got.y === false, `3257420414 在 16:9 视窗下两轴都不溢出（不该滑），实得 x=${got.x} y=${got.y}`)
+  // 对照：把辅助层照旧计入（模拟旧口径）——必须判溢出，证明这条真值表真的在区分
+  const bOld = coverContentBounds(L.map((l) => ({ ...l, alpha: 1, isContainer: false })))
+  const old = coverPeekOverflow(bOld.maxX - bOld.minX, bOld.maxY - bOld.minY, v.viewW, v.viewH)
+  check(old.x === true && old.y === true, '对照组：辅助层计入时两轴都溢出（证明上面的断言真的在测排除规则）')
+}
+
+console.log('\n[0c] 空内容 → 0×0 基准 → 不滑（不得回落成「无基准=放行」）')
+{
+  const b = coverContentBounds([])
+  check(!Number.isFinite(b.minX) && !Number.isFinite(b.maxY), '空层集的包围盒各分量为 ±Infinity')
+  const g = coverPeekOverflow(0, 0, 1080, 607.5)
+  check(g.x === false && g.y === false, '0×0 基准恒判无溢出（钉住居中）')
+}
+
 console.log('\n[1] coverPeekOverflow 真值表')
 {
   const T = [
@@ -103,7 +154,10 @@ console.log('\n[3] 接线：scene-mount 写基准、shell 按轴门控')
 
   const mathSrc = fs.readFileSync(join(ROOT, 'renderer/vendor/we-scene/render/math.js'), 'utf8')
   check(/l\.angles\?\.\[2\]/.test(mathSrc), '包围盒必须吃图层 z 旋转（旋转横条的 AABB 换轴）')
+  check(/layerPaintsContent\(l\)/.test(mathSrc), '包围盒按 layerPaintsContent 过滤（空 composelayer / alpha=0 不计入）')
   check(/l\.visible === false \|\| l\.destroyed/.test(mathSrc), '只统计可见层')
+  check(/l\.isContainer && !l\.hasChildren/.test(mathSrc), '空 composelayer 必须排除出包围盒')
+  check(/contentW: 0, contentH: 0/.test(mount), '场景侧算不出内容包围盒时写 0×0 基准（不得回落成「无基准=两轴放行」）')
 
   const shell = fs.readFileSync(join(ROOT, 'renderer/src/shell.ts'), 'utf8')
   check(/function peekAxes\(rt: Runtime\)/.test(shell), 'shell 应有 peekAxes 门控函数')

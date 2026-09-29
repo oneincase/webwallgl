@@ -240,10 +240,37 @@ export function coverViewSize(projW, projH, width, height) {
 }
 
 /**
+ * 该层是否真会往画面里画像素 —— cover 窥视门控只认「画面覆盖范围」。
+ *
+ * 判据不能只看 visible：辅助层的矩形普遍比画面大得多，算进包围盒会让门控
+ * 误判「两轴都溢出」，于是鼠标一碰左右热区就把视窗滑出真实画面（露出
+ * clearcolor）。3257420414「放大镜」实测就是这个链路：`鼠标事件` 是 7000×3000
+ * 的全局调色画布、`映射边缘1`/`映射顶部1` 是 1002×5460 的镜头长条（alpha 挂
+ * newproperty13=0、转 28° 后 AABB 2872×4986），把基准从真实画面 2560×1440
+ * 撑到 7000×4986，视窗 2560×1440 于是「两轴都溢出」。
+ *
+ *   - alpha ≤ 0：完全透明，不产生像素；
+ *   - 空 composelayer（无子层）：效果画布/`_rt_imageLayerComposite` 捕获源，
+ *     层内容本就是空白，尺寸是作者随手拉的画布而不是画面；
+ *   - 其余（含带子层的分组容器、纯色层、贴图层、粒子/文字）照常计入。
+ *
+ * 纯函数，verify-cover-peek 直接跑。
+ */
+export function layerPaintsContent(l) {
+  if (!l || l.visible === false || l.destroyed) return false
+  const a = l.alpha != null && typeof l.alpha === 'object' && !Array.isArray(l.alpha) ? l.alpha.value : l.alpha
+  if (a != null && Number.isFinite(Number(a)) && Number(a) <= 0) return false
+  if (l.isContainer && !l.hasChildren) return false
+  return true
+}
+
+/**
  * 可见图层的世界包围盒（旋转矩形取 AABB 并集），cover 窥视门控的内容基准。
  * layers 是 parse 产出的层（visible 已折叠父链；origin/scale/angles 为 world 值）。
- * 只统计「会画出来」的层：visible:false / destroyed / 零尺寸跳过。
- * 返回 {minX,minY,maxX,maxY}；没有任何可见层时各分量为 Infinity/-Infinity。
+ * 只统计「会画出来」的层（layerPaintsContent）：不可见 / 透明 / 零尺寸 /
+ * 空 composelayer 跳过。
+ * 返回 {minX,minY,maxX,maxY}；没有任何出像素的层时各分量为 Infinity/-Infinity
+ * —— **这不等于「随便滑」**，调用方要按「无内容 → 无溢出」处理。
  */
 export function coverContentBounds(layers) {
   let minX = Infinity
@@ -251,7 +278,7 @@ export function coverContentBounds(layers) {
   let maxX = -Infinity
   let maxY = -Infinity
   for (const l of layers || []) {
-    if (!l || l.visible === false || l.destroyed) continue
+    if (!layerPaintsContent(l)) continue
     const w = Math.abs((l.size?.[0] ?? 0) * (l.scale?.[0] ?? 1))
     const h = Math.abs((l.size?.[1] ?? 0) * (l.scale?.[1] ?? 1))
     if (!(w > 0) && !(h > 0)) continue
