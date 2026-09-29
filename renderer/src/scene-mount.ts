@@ -36,7 +36,7 @@ import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf } from "../vendor/we-scene/render/math.js";
-import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, anim, camPath as camPathLib, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
+import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, anim, camPath as camPathLib, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
   mergeUserPropertyValues,
@@ -1073,8 +1073,14 @@ cfg, source, pkgAbort.signal);
       };
       // 控制方法在注入源上是**可选**的（宿主可能只提供元数据、不支持反向控制）。
       // 缺失时静默跳过再照常派发一次：壁纸按钮点了没反应好过整个脚本 TypeError 熔断。
+      // [we-scene patch 3794460976] 控制源与显示源**分离**（媒体桥接正式接入 / 控制反转）：
+      // 显示源按 hasMedia 排优先级（没在播不占驱动位，2388299037），但控制优先交给注入源
+      // 本身 —— 没在播时点「播放」要能唤醒真实播放器（测试台 media-bridge / 宿主命令通道），
+      // 而不是掉到模拟源去切模拟曲目。选择逻辑在 vendor/media-buttons.js（可离线判据）。
+      const controlMediaDriver = (): any =>
+        mediaButtons.pickControlDriver(liveMediaOverride, rt.mediaSource, currentMediaDriver());
       const callDriver = (name: "skipNext" | "skipPrevious" | "play" | "pause" | "playPause") => {
-        const drv = currentMediaDriver();
+        const drv = controlMediaDriver();
         const fn = drv?.[name];
         if (typeof fn === "function") {
           try {
@@ -5311,7 +5317,25 @@ cfg, source, pkgAbort.signal);
         for (const l of plan.move) fire(l, "cursorMove", ev);
         for (const l of plan.down) fire(l, "cursorDown", ev);
         for (const l of plan.up) fire(l, "cursorUp", ev);
-        for (const l of plan.click) fire(l, "cursorClick", ev);
+        for (const l of plan.click) {
+          fire(l, "cursorClick", ev);
+          // [we-scene patch 3794460976] 音乐控制接入：媒体组件按钮（Media Info.
+          // Collection 的 PlayerPlayBold2/PlayerPauseBold2/Previous song/Next song）
+          // 点击推断成播放控制 —— 组件脚本走 openUserShortcut，但本壁纸属性被建成
+          // bool（无快捷方式绑定可执行）、暂停图标的调用还被作者注释，WE 语义下
+          // 这些按钮本来就是死的。**控制反转**：这里只产出动作名，执行走注入的
+          // mediaControl —— 后端由宿主选（测试台 liveSystem → media-bridge、
+          // 宿主 setMedia 源、离线回落模拟源）。推断与闸门在 vendor/media-buttons.js。
+          const mediaAct = mediaButtons.mediaButtonActionForLayer(l);
+          if (mediaAct) {
+            reportDiag(rt, cfg, `media button: ${l.name} → ${mediaAct}`, "info");
+            try {
+              (mediaControl as unknown as Record<string, () => void>)[mediaAct]();
+            } catch (e) {
+              reportDiag(rt, cfg, `media button ${mediaAct} 失败: ${(e as Error)?.message}`, "warn");
+            }
+          }
+        }
       };
 
       const start = performance.now();

@@ -35,6 +35,12 @@ const { evalTextScript, evalObjectScript, makeCursorEventVec, Vec3: ScriptVec3 }
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
 const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
 const { flattenUserProperties } = await imp("renderer/vendor/we-scene/scene/user-props.js");
+const {
+  mediaButtonAction,
+  mediaButtonActionForLayer,
+  hasMediaControl,
+  pickControlDriver,
+} = await imp("renderer/vendor/we-scene/render/media-buttons.js");
 
 const { check, errors } = createChecker();
 
@@ -1897,6 +1903,177 @@ function sniffMediaType(url) {
         `   用户图片槽：3243449890 的 ${bound.length} 块三角绑 newproperty58（scenetexture，默认空）→ 原槽为背景蒙版合成图`,
       );
     }
+  }
+}
+
+// ---------- 11. 媒体按钮点击 → 播放控制（3794460976 音乐控制接入 / 控制反转） ----------
+//
+// 现象：3794460976「蓝屏大肥鱼」Now Playing 组件的 ▶/⏮/⏭ 点了没反应。根因是
+// 内容级三重缺陷（详见 vendor/media-buttons.js 文件头）：组件按钮走
+// `openUserShortcut("newproperty12/13/14")` 而本壁纸把属性建成 bool（同组件
+// 3582294895/3584071721 是 usershortcut，默认空绑定）、暂停图标的调用被作者
+// 注释、渲染器的快捷方式执行器没有宿主实现。修法 = 点击推断成播放控制 +
+// 控制源与显示源分离（执行面走注入的 mediaControl：测试台 media-bridge /
+// 宿主 setMedia 源 / 离线模拟）。
+//
+// 三条不变量：
+//   ① 推断只认组件按钮：真实语料 4 键 → 4 动作，名字闸门 + openUserShortcut
+//      锚点闸门各自能红（自带播放列表壁纸的 playerplay 绝不能被劫持）；
+//   ② 控制源选择**不读 snapshot.hasMedia**（空播点播放要打到注入源）；
+//   ③ scene-mount 真接线：click 派发循环调推断、callDriver 走 pickControlDriver。
+{
+  const EXPECT_NAMES = {
+    PlayerPlayBold2: "play",
+    PlayerPauseBold2: "pause",
+    "Previous song": "skipPrevious",
+    "Next song": "skipNext",
+  };
+  const COMPONENT_IDS = ["3794460976", "3582294895", "3584071721"];
+
+  // --- ①a 真实语料：同组件三张壁纸的按钮必须各推断出一个动作、四种动作齐 ---
+  for (const id of COMPONENT_IDS) {
+    const pkgPath = join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) {
+      console.log(`   媒体按钮：语料 ${id} 不在本机库，跳过（其余判据不受影响）`);
+      continue;
+    }
+    let sj;
+    try {
+      const parsed = parsePkg(fs.readFileSync(pkgPath));
+      const e = getEntry(parsed, "scene.json");
+      if (!e) continue;
+      sj = JSON.parse(Buffer.from(e).toString("utf8"));
+    } catch {
+      continue;
+    }
+    const found = {};
+    for (const o of sj.objects || []) {
+      // 走生产同一条路：名字 + srcObject 收集脚本源（layerScriptSources）
+      const act = mediaButtonActionForLayer({ name: o.name, srcObject: o });
+      if (act) found[o.name] = act;
+    }
+    const actions = Object.values(found).sort();
+    check(
+      actions.length === 4 &&
+        actions.join(",") === "pause,play,skipNext,skipPrevious",
+      `${id} 的媒体按钮应恰好推断出4个动作（play/pause/skipPrevious/skipNext），实得 ${JSON.stringify(found)}`,
+    );
+    check(
+      Object.keys(found).every((n) => /^(player(play|pause)bold\d*|(previous|next)\s*song)$/i.test(n)),
+      `${id} 不应认出组件之外的图层名：${Object.keys(found).join(",")}`,
+    );
+    if (id === "3794460976") {
+      for (const [n, act] of Object.entries(EXPECT_NAMES)) {
+        check(found[n] === act, `3794460976 的「${n}」应推断为 ${act}，实得 ${found[n]}`);
+      }
+      // 暂停图标的 cursorClick 被作者注释掉，锚点只在注释文本里 —— 必须照样认出，
+      // 否则播放中可见的那个图标（唯一可点的）永远点不出暂停。
+      check(found["PlayerPauseBold2"] === "pause", "3794460976 暂停图标（脚本被注释）必须仍推断出 pause");
+      console.log(`   媒体按钮：3794460976 四键 → ${JSON.stringify(found)}`);
+    }
+  }
+
+  // --- ①b 负例：两道闸门各自能红 ---
+  const clickOnly = ["export function cursorClick(event) { playTrack(); }"].join("\n");
+  const shortcutClick = ["export function cursorClick(event) {", "  engine.openUserShortcut('bplay');", "}"].join("\n");
+  check(mediaButtonAction("playerplay", [shortcutClick]) === null, "名字不在组件模式内必须 null（自带播放列表壁纸不可劫持）");
+  check(mediaButtonAction("Play Icon", [shortcutClick]) === null, "Play Icon（3219510589 展示组件）不得被认成控制");
+  check(mediaButtonAction("Tnext+", [shortcutClick]) === null, "Tnext+（3662790108）不得被认成控制");
+  check(mediaButtonAction("Next", [shortcutClick]) === null, "泛化短名 Next 不得被认成控制");
+  check(mediaButtonAction("Next song", [clickOnly]) === null, "名字对但无 openUserShortcut 锚点必须 null");
+  check(mediaButtonAction("PlayerPauseBold2", []) === null, "名字对但脚本源为空必须 null");
+  check(mediaButtonAction(null, [shortcutClick]) === null, "无图层名必须 null");
+  // 真实负例：另一套音乐播放器（自带播放列表，2847470774 的 playerplay 挂着
+  // cursorClick → playTrack）—— 名字闸门必须把它挡在外面
+  {
+    const p = join(LIB, "2847470774", "scene.pkg");
+    if (fs.existsSync(p)) {
+      try {
+        const parsed = parsePkg(fs.readFileSync(p));
+        const e = getEntry(parsed, "scene.json");
+        const sj = e ? JSON.parse(Buffer.from(e).toString("utf8")) : null;
+        const pl = sj && (sj.objects || []).find((o) => o.name === "playerplay");
+        if (pl) {
+          check(
+            mediaButtonActionForLayer({ name: pl.name, srcObject: pl }) === null,
+            "2847470774 playerplay（自带播放列表）必须推断为 null",
+          );
+        }
+      } catch {
+        /* 语料解析失败不阻断（负例是加固不是主判据） */
+      }
+    }
+  }
+
+  // --- ② 控制源选择：不读 hasMedia、无控制方法的源不得当选 ---
+  {
+    const ctl = (tag) => ({
+      __tag: tag,
+      snapshot: { hasMedia: false },
+      play() {},
+      pause() {},
+      playPause() {},
+      skipNext() {},
+      skipPrevious() {},
+    });
+    const live = ctl("live");
+    check(pickControlDriver(live, null, "display") === live, "实况注入源必须是控制源首选");
+    const injected = ctl("injected");
+    check(pickControlDriver(null, injected, "display") === injected, "无实况时宿主注入源应成为控制源");
+    const metaOnly = { snapshot: { hasMedia: true } };
+    check(
+      pickControlDriver(null, metaOnly, "display") === "display",
+      "只有元数据（无控制方法）的注入源不得当控制源，应回落显示源",
+    );
+    check(pickControlDriver(null, null, "display") === "display", "两者皆缺时回落显示源（壁纸音频/模拟兜底）");
+    check(pickControlDriver(null, null, null) === null, "全空返回 null");
+    // 敌意对象：读到 snapshot 就抛 —— 钉死「控制源选择不得看 hasMedia」
+    const hostile = {
+      get snapshot() {
+        throw new Error("pickControlDriver 不得读 snapshot（那是显示语义）");
+      },
+      playPause() {},
+    };
+    let threw = null;
+    try {
+      pickControlDriver(hostile, null, "display");
+    } catch (e) {
+      threw = e;
+    }
+    check(threw === null, `控制源选择不得读 snapshot.hasMedia：${threw && threw.message}`);
+    check(hasMediaControl({ play() {} }) === true, "有 play 方法即算有控制能力");
+    check(hasMediaControl({ snapshot: { hasMedia: true } }) === false, "只有快照不算控制能力");
+    check(hasMediaControl(null) === false, "null 无控制能力");
+  }
+
+  // --- ③ 接线：scene-mount 真的把推断与控制源接上了 ---
+  {
+    const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    check(
+      /for \(const l of plan\.click\) \{/.test(smSrc) &&
+        /mediaButtons\.mediaButtonActionForLayer\(l\)/.test(smSrc),
+      "dispatchCursor 的 click 派发循环必须调用媒体按钮推断（音乐控制接入的落点）",
+    );
+    check(
+      /mediaButtons\.pickControlDriver\(liveMediaOverride, rt\.mediaSource, currentMediaDriver\(\)\)/.test(smSrc),
+      "控制源必须走 pickControlDriver（控制反转：实况注入 > 宿主注入 > 显示源）",
+    );
+    check(
+      /const drv = controlMediaDriver\(\);/.test(smSrc),
+      "callDriver 必须用 controlMediaDriver —— 改回 currentMediaDriver 会让空播点播放去切模拟曲",
+    );
+    // 推断产出的四个动作必须都打得到 mediaControl 的方法
+    for (const k of ["skipNext", "skipPrevious", "play", "pause"]) {
+      check(
+        new RegExp(`${k}: \\(\\) => callDriver\\("${k}"\\)`).test(smSrc),
+        `mediaControl.${k} 必须存在（推断动作的执行落点）`,
+      );
+    }
+    const vendorSrc = fs.readFileSync(join(ROOT, "renderer/src/vendor.ts"), "utf8");
+    check(
+      /mediaButtonsMod/.test(vendorSrc) && /, mediaButtons,/.test(vendorSrc),
+      "vendor.ts 必须导出 mediaButtons（scene-mount 的取用点）",
+    );
   }
 }
 

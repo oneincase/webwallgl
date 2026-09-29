@@ -2129,7 +2129,9 @@ console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
   const src = fs.readFileSync(path.join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
   const okAll = /hitTest\.hitTestLayersAll\(/.test(src)
   const okPlan = /planCursorDispatch\(cursorState,\s*hits,\s*p\.leftDown\)/.test(src)
-  const okFire = /for \(const l of plan\.click\) fire\(l, "cursorClick", ev\)/.test(src)
+  // 单行（fire 紧跟循环头）或块体（fire 是循环体第一条语句，其后可挂
+  // 3794460976 的媒体按钮推断）两种形状都算接线完整；fire 被挪走/删掉仍会红
+  const okFire = /for \(const l of plan\.click\)\s*\{?\s*fire\(l, "cursorClick", ev\)/.test(src)
   if (!okAll || !okPlan || !okFire) {
     fail(`scene-mount 派发接线不完整（All=${okAll} plan=${okPlan} click=${okFire}）`)
   } else if (/const hit = hitTest\.hitTestLayers\(/.test(src)) {

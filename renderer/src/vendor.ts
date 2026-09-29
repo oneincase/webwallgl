@@ -15,6 +15,7 @@ import * as textMod from "../vendor/we-scene/render/text.js";
 import * as timersMod from "../vendor/we-scene/render/engine-timers.js";
 import * as audioMod from "../vendor/we-scene/render/audio.js";
 import * as mediaMod from "../vendor/we-scene/render/media.js";
+import * as mediaButtonsMod from "../vendor/we-scene/render/media-buttons.js";
 import * as systemMod from "../vendor/we-scene/render/system.js";
 import * as animMod from "../vendor/we-scene/render/animation.js";
 import * as camPathMod from "../vendor/we-scene/render/camera-path.js";
@@ -39,6 +40,7 @@ const mdl = asAny(mdlMod);
 const wtext = asAny(textMod);
 const wtimers = asAny(timersMod);
 const media = asAny(mediaMod);
+const mediaButtons = asAny(mediaButtonsMod);
 const system = asAny(systemMod);
 const anim = asAny(animMod);
 const camPath = asAny(camPathMod);
@@ -47,5 +49,5 @@ const hitTest = asAny(hitTestMod);
 const cursorDispatch = asAny(cursorDispatchMod);
 
 export {
-  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, system, pointerLib, hitTest, cursorDispatch, anim, camPath, audioMod,
+  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, pointerLib, hitTest, cursorDispatch, anim, camPath, audioMod,
 };
