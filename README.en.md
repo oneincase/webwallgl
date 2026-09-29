@@ -315,6 +315,8 @@ wp.on("ready", (info) => {
 });
 ```
 
+The level is declared by the library, never guessed from the message text: `error` = the wallpaper failed to mount or has died and the caller must act (mount failure, render-loop termination, first-frame timeout, no container / missing src / no WebGL2); `warn` = the picture is affected or degraded while the wallpaper keeps running (a script failed to start, a resource is missing or failed to decode, effects and textures fell back or were skipped, text got clipped, auto-downgrade kicked in); `info` = process and statistics (sizes, counts, hits, normal completion). The same level also travels on the legacy `/diag` pixel request (`/diag?msg=…&lvl=&lt;level>`), so hosts going through a middleware or content server no longer need keyword matching on the text.
+
 The library ships no fallback page and phones home nowhere: diagnostics and errors arrive via callbacks only. What to do on failure (show a hint, swap the wallpaper, destroy the instance) is your call.
 
 ## Multiple instances per page

@@ -583,10 +583,15 @@ export function wallpaperHost(): Plugin {
         const path = decodeURIComponent(url.pathname);
 
         // --- 渲染器诊断上报（对齐 content_server.rs 的 /diag）---
+        // lvl= 是**发送端声明**的级别（issue #13）：渲染器把级别随请求一起发出来，
+        // 宿主/嵌入方不必再对文案做关键字匹配。老渲染器没有这一位，退回不带级别的旧行为。
         if (path === "/diag") {
           const msg = url.searchParams.get("msg") ?? "";
-          server.config.logger.info(`\x1b[36m[renderer diag]\x1b[0m ${msg}`);
-          const line = `data: ${JSON.stringify({ t: Date.now(), msg })}\n\n`;
+          const raw = url.searchParams.get("lvl") ?? "";
+          const level = raw === "error" || raw === "warn" || raw === "info" ? raw : undefined;
+          const color = level === "error" ? "\x1b[31m" : level === "warn" ? "\x1b[33m" : "\x1b[36m";
+          server.config.logger.info(`${color}[renderer diag${level ? ` ${level}` : ""}]\x1b[0m ${msg}`);
+          const line = `data: ${JSON.stringify({ t: Date.now(), msg, ...(level ? { level } : {}) })}\n\n`;
           for (const c of diagClients) {
             try {
               c.write(line);

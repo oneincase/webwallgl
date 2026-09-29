@@ -1,5 +1,6 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
 import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
+import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
@@ -274,7 +275,7 @@ async function loadParsedPkg(
     const hit = pkgCache.get(cacheKey);
     if (hit) {
       hit.at = Date.now();
-      reportDiag(rt, cfg, `pkg cache hit: ${hit.parsed.fileSize} bytes`);
+      reportDiag(rt, cfg, `pkg cache hit: ${hit.parsed.fileSize} bytes`, "info");
       return hit.parsed;
     }
   }
@@ -285,7 +286,7 @@ async function loadParsedPkg(
     if (signal.aborted) throw e;
     throw e instanceof Error ? e : new Error(String(e));
   }
-  reportDiag(rt, cfg, `pkg body: ${pkgBytes.byteLength} bytes`);
+  reportDiag(rt, cfg, `pkg body: ${pkgBytes.byteLength} bytes`, "info");
   const bytes = pkgBytes instanceof Uint8Array ? pkgBytes : new Uint8Array(pkgBytes);
   const parsed = pkg.parsePkg(bytes);
   if (!cacheKey) return parsed;
@@ -327,7 +328,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       .join(" ");
     if (s.includes("[we-scene]")) {
       try {
-        reportDiag(rt, cfg, s.slice(0, 300));
+        reportDiag(rt, cfg, s.slice(0, 300), classifyDiag(s));
       } catch {
         
       }
@@ -424,12 +425,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             rt,
             cfg,
             `bake: 后台补烘完成 ${bakeStats.baked} 张（失败 ${bakeStats.failed}，产物 ${(bakeStats.bytes / 1e6).toFixed(1)}MB，耗时 ${bakeStats.ms.toFixed(0)}ms）`,
+            bakeStats.failed > 0 ? "warn" : "info",
           ),
       });
       if (!cfg.source && (!cfg.mediaBase || !cfg.src)) {
         throw new Error("场景壁纸缺少 mediaBase/src");
       }
-      reportDiag(rt, cfg, "mountScene start");
+      reportDiag(rt, cfg, "mountScene start", "info");
       const parsedPkg = await loadParsedPkg(
 rt,
 cfg, source, pkgAbort.signal);
@@ -706,7 +708,7 @@ cfg, source, pkgAbort.signal);
       };
       const renderer = rnd.createRenderer(c, {
         shaderResolver,
-        diag: (msg: string) => reportDiag(rt, cfg, `renderer: ${msg}`),
+        diag: (msg: string) => reportDiag(rt, cfg, `renderer: ${msg}`, classifyDiag(msg)),
         // 效果链 FBO 降采样：0=全质量，0.5≈效果分辨率减半→内存约 1/4。
         // 用全质量：降采样会让「层 alpha 再乘一张羽化 mask」的效果（opacity）在
         // 低分辨率下把过渡带插得更淡，再经后续 waterwaves 的 UV 位移搬移、
@@ -938,13 +940,14 @@ cfg, source, pkgAbort.signal);
         rt,
         cfg,
         `audio: ${audioDriverRef.current ? "live system" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+        "info",
       );
 
       // ---- 媒体集成（模拟或实况）----
       // 回调是**事件**不是轮询：只在快照变化时派发。语料里 mediaThumbnailChanged
       // 常写 `anim.stop(); anim.play();`，每帧广播会让动画永远卡在第 0 帧。
       const shortcuts = system.createShortcutHandler((name: string) => {
-        reportDiag(rt, cfg, `openUserShortcut: ${name}`);
+        reportDiag(rt, cfg, `openUserShortcut: ${name}`, "info");
       });
       // rt.mediaDisabled = 调用方 MountOptions.media:null 显式禁用系统媒体
       const mediaSim = { enabled: !rt.mediaDisabled, override: null as Record<string, unknown> | null };
@@ -1048,7 +1051,7 @@ cfg, source, pkgAbort.signal);
         try {
           Object.assign(mediaSnapshot(), patch || {});
         } catch {
-          reportDiag(rt, cfg, "__mediaSet: 当前媒体快照为只读视图（壁纸音频驱动），覆写跳过");
+          reportDiag(rt, cfg, "__mediaSet: 当前媒体快照为只读视图（壁纸音频驱动），覆写跳过", "info");
         }
         const evts = media.diffMediaEvents(lastMediaSnap, mediaSnapshot());
         for (const { name, event } of evts) for (const sb of mediaHooks) sb.callMedia(name, event);
@@ -1077,7 +1080,7 @@ cfg, source, pkgAbort.signal);
           try {
             fn.call(drv);
           } catch (e) {
-            reportDiag(rt, cfg, `media ${name} 失败: ${(e as Error)?.message}`);
+            reportDiag(rt, cfg, `media ${name} 失败: ${(e as Error)?.message}`, "warn");
           }
         }
         dispatchMediaNow();
@@ -1162,7 +1165,7 @@ cfg, source, pkgAbort.signal);
             return (e: unknown) => {
               if (reported) return;
               reported = true;
-              reportDiag(rt, cfg, `engine 定时器回调抛错（此后同类静默）: ${String((e as Error)?.message || e).slice(0, 90)}`);
+              reportDiag(rt, cfg, `engine 定时器回调抛错（此后同类静默）: ${String((e as Error)?.message || e).slice(0, 90)}`, "warn");
             };
           })(),
         },
@@ -1272,9 +1275,10 @@ cfg, source, pkgAbort.signal);
             rt,
             cfg,
             `[S4] 图层足迹表 ${texFootprint.size} 个贴图（视口 ${viewW}x${viewH} 世界 → 画布 ${Math.round(canvasDeviceW)}x${Math.round(canvasDeviceH)} 设备像素，safety=${FOOTPRINT_SAFETY}）`,
+            "info",
           );
         } else {
-          reportDiag(rt, cfg, "[S4] 正交投影非显式（auto/透视）：跳过图层足迹模型，回退到全局档位");
+          reportDiag(rt, cfg, "[S4] 正交投影非显式（auto/透视）：跳过图层足迹模型，回退到全局档位", "warn");
         }
       }
       const textures = new Map<string, any>();
@@ -1448,7 +1452,7 @@ cfg, source, pkgAbort.signal);
         try {
           st = await installLocalAssets();
         } catch (e) {
-          reportDiag(rt, cfg, `local assets 装载失败（忽略）：${(e as Error)?.message}`);
+          reportDiag(rt, cfg, `local assets 装载失败（忽略）：${(e as Error)?.message}`, "warn");
         }
         if (st) {
           reportDiag(
@@ -1457,6 +1461,7 @@ cfg, source, pkgAbort.signal);
             `local assets: ${st.loaded}/${st.requested} tex（util ${st.util} / particle ${st.particle}）` +
               ` ${(st.bytes / 1e6).toFixed(1)}MB ${st.ms}ms source=${st.source} mode=${st.mode}` +
               (st.failed ? ` failed=${st.failed}` : ""),
+            "info",
           );
         }
       }
@@ -1653,12 +1658,13 @@ cfg, source, pkgAbort.signal);
               }
               snap.hasThumbnail = true;
               liveHold.lastSnap.setHasThumbnail(false);
-              reportDiag(rt, cfg, `liveSystem: artwork ${info.title || info.trackKey}`);
+              reportDiag(rt, cfg, `liveSystem: artwork ${info.title || info.trackKey}`, "info");
             } catch (e) {
               reportDiag(
                 rt,
                 cfg,
                 `liveSystem: artwork 失败 (${e instanceof Error ? e.message : e})`,
+                "warn",
               );
             }
           };
@@ -1705,11 +1711,13 @@ cfg, source, pkgAbort.signal);
               `liveSystem: audio=${st.audio} media=${st.media} window=${st.window}` +
                 (st.title ? ` title="${st.title}"` : "") +
                 (st.hasArtwork ? " artwork=1" : ""),
+              "info",
             );
             reportDiag(
               rt,
               cfg,
               `audio: ${audioDriverRef.current ? "live system" : "simulated"} stream, supportsaudioprocessing=${supportsAudioProcessing}`,
+              "info",
             );
             (window as unknown as Record<string, unknown>).__system = {
               media: mediaControl,
@@ -1720,7 +1728,7 @@ cfg, source, pkgAbort.signal);
             (window as unknown as Record<string, unknown>).__liveSystem = () => live!.status();
           }
         } catch (e) {
-          reportDiag(rt, cfg, `liveSystem: 启动失败，回退模拟源 (${e instanceof Error ? e.message : e})`);
+          reportDiag(rt, cfg, `liveSystem: 启动失败，回退模拟源 (${e instanceof Error ? e.message : e})`, "warn");
           live = null;
         }
       }
@@ -1780,7 +1788,7 @@ cfg, source, pkgAbort.signal);
               animatedImage: img,
               generated: false,
             };
-            reportDiag(rt, cfg, `user file tex '${rel}': ${w}x${h} (gif, animated)`);
+            reportDiag(rt, cfg, `user file tex '${rel}': ${w}x${h} (gif, animated)`, "info");
             return entry;
           }
           const res = await fetch(url, { signal: pkgAbort?.signal });
@@ -1794,10 +1802,10 @@ cfg, source, pkgAbort.signal);
             rg88: false,
             generated: false,
           };
-          reportDiag(rt, cfg, `user file tex '${rel}': ${bmp.width}x${bmp.height}`);
+          reportDiag(rt, cfg, `user file tex '${rel}': ${bmp.width}x${bmp.height}`, "info");
           return entry;
         } catch (e) {
-          reportDiag(rt, cfg, `user file tex '${rel}' 失败：${(e as Error)?.message}`);
+          reportDiag(rt, cfg, `user file tex '${rel}' 失败：${(e as Error)?.message}`, "warn");
           return null;
         }
       };
@@ -1963,6 +1971,7 @@ cfg, source, pkgAbort.signal);
                 rt,
                 cfg,
                 `tex '${name}': animated multi-image, ${frameData.length} frames @ ${contentW}x${contentH}`,
+                "info",
               );
               return entry;
             }
@@ -1996,10 +2005,10 @@ cfg, source, pkgAbort.signal);
           (rt.objectUrls ??= []).push(url);
           (rt.videoPairs ??= []).push(pair);
           pair.active.addEventListener("loadedmetadata", () => {
-            reportDiag(rt, cfg, `video tex '${name}': ${pair.active.videoWidth}x${pair.active.videoHeight}`);
+            reportDiag(rt, cfg, `video tex '${name}': ${pair.active.videoWidth}x${pair.active.videoHeight}`, "info");
           });
           pair.active.addEventListener("error", () => {
-            reportDiag(rt, cfg, `video tex '${name}' ERROR: ${pair.active.error?.code}`);
+            reportDiag(rt, cfg, `video tex '${name}' ERROR: ${pair.active.error?.code}`, "warn");
           });
           // 不要在这里 play()。隐藏层（2887099508「健康壁纸」）一加载就 play，
           // 随后被备用元素/切壁纸 pause 打断，日志刷 AbortError；脚本 init 里
@@ -2068,11 +2077,11 @@ cfg, source, pkgAbort.signal);
             // 诊断：首次 + 每 10/100 次上报，确认纹理无缝交换持续生效
             texSwapCount++;
             if (texSwapCount === 1 || texSwapCount === 10 || texSwapCount === 100) {
-              reportDiag(rt, cfg, `video tex '${name}' loop swap ok x${texSwapCount}`);
+              reportDiag(rt, cfg, `video tex '${name}' loop swap ok x${texSwapCount}`, "info");
             }
           };
           pair.onFallback = () => {
-            reportDiag(rt, cfg, `video tex '${name}' loop fallback (native loop used)`);
+            reportDiag(rt, cfg, `video tex '${name}' loop fallback (native loop used)`, "warn");
           };
           textures.set(name, entry);
           return entry;
@@ -2446,6 +2455,7 @@ cfg, source, pkgAbort.signal);
           rt,
           cfg,
           `tex '${name}': ${entry.width}x${entry.height} declared=${entry.declaredWidth}x${entry.declaredHeight} R=${entry.resourceScale} lvl=${entry.mipLevel ?? 0} frames=${Array.isArray(entry.frames) ? entry.frames.length : "none"} video=${!!entry.videoCtl}`,
+          "info",
         );
         return entry;
       };
@@ -2492,7 +2502,7 @@ cfg, source, pkgAbort.signal);
           textures.delete(name);
         }
         if (!next) {
-          reportDiag(rt, cfg, `prop tex '${name}' → 空，回落作者原槽贴图`);
+          reportDiag(rt, cfg, `prop tex '${name}' → 空，回落作者原槽贴图`, "warn");
           return;
         }
         const entry = await loadTex(name);
@@ -2500,6 +2510,7 @@ cfg, source, pkgAbort.signal);
           rt,
           cfg,
           `prop tex '${name}' → ${next}${entry ? ` ${entry.width}x${entry.height}` : "（取图失败，回落原槽贴图）"}`,
+          "warn",
         );
       };
 
@@ -2781,6 +2792,7 @@ cfg, source, pkgAbort.signal);
                     rt,
                     cfg,
                     `autosize gate: model.autosize=${(model as any)?.autosize} size=${layer.size?.[0]}x${layer.size?.[1]}`,
+                    "info",
                   );
                   if (
                     (model as any)?.autosize &&
@@ -2803,10 +2815,10 @@ cfg, source, pkgAbort.signal);
                     if (w > 0 && h > 0) {
                       layer.size = [w, h];
                       // [临时诊断]
-                      reportDiag(rt, cfg, `autosize applied: layer.size=${w}x${h}`);
+                      reportDiag(rt, cfg, `autosize applied: layer.size=${w}x${h}`, "info");
                     } else {
                       // [临时诊断]
-                      reportDiag(rt, cfg, `autosize skipped: fw=${fw} fh=${fh} declared=${entry.declaredWidth}x${entry.declaredHeight}`);
+                      reportDiag(rt, cfg, `autosize skipped: fw=${fw} fh=${fh} declared=${entry.declaredWidth}x${entry.declaredHeight}`, "info");
                     }
                   }
                 }
@@ -2835,7 +2847,7 @@ cfg, source, pkgAbort.signal);
           attachBuiltinMatTint(layer, material);
           for (const e of layer.effects || []) {
             eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
-                reportDiag(rt, cfg, m),
+                reportDiag(rt, cfg, m, classifyDiag(m)),
               );
           }
           for (const e of layer.effects || []) {
@@ -2896,7 +2908,7 @@ cfg, source, pkgAbort.signal);
           try {
             for (const e of layer.effects || []) {
               eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
-                reportDiag(rt, cfg, m),
+                reportDiag(rt, cfg, m, classifyDiag(m)),
               );
             }
             for (const e of layer.effects || []) {
@@ -2927,6 +2939,7 @@ cfg, source, pkgAbort.signal);
           cfg,
           `bake: 内嵌图缓存命中 ${bakeStats.hits} / 待后台补烘 ${bakeStats.misses}` +
             (bakeStats.misses ? "（首帧后开始，不影响本次加载）" : ""),
+          "info",
         );
       }
 
@@ -2951,6 +2964,7 @@ cfg, source, pkgAbort.signal);
             rt,
             cfg,
             `auto ortho probe: auto=${ortho.auto} explicit=${explicit} bounds=${Math.round(b0.minX)},${Math.round(b0.minY)}..${Math.round(b0.maxX)},${Math.round(b0.maxY)} sizes=${(scene.layers as any[]).map((l) => `${l.size?.[0]}x${l.size?.[1]}`).join("|")}`,
+            "info",
           );
         }
         if (ortho && ortho.auto === true && !explicit) {
@@ -2965,6 +2979,7 @@ cfg, source, pkgAbort.signal);
               rt,
               cfg,
               `auto ortho: content ${Math.round(w)}x${Math.round(h)}（orthogonalprojection.auto）`,
+              "info",
             );
           }
         }
@@ -2983,6 +2998,7 @@ cfg, source, pkgAbort.signal);
           ` scaled=${mem.scaled.length}` +
           (mem.scaled.length ? ` 例: ${mem.scaled.slice(0, 3).map((x) => `${x.name}(${x.how} ${x.from}→${x.to})`).join(" ")}` : "") +
           (mem.framesScaled.length ? ` 帧图集缩放: ${mem.framesScaled.slice(0, 3).join(" ")}` : ""),
+        "info",
       );
       for (const [texName, texEntry] of textures) {
         if (!texEntry?.videoCtl) continue;
@@ -3085,7 +3101,7 @@ cfg, source, pkgAbort.signal);
         if (depth > 3) return null; // children 可嵌套，设上限防病态数据造成指数展开
         const modelEntry = pkg.getEntry(parsedPkg, particlePath);
         if (!modelEntry) {
-          reportDiag(rt, cfg, `particle '${particlePath}' 不在 pkg，跳过`);
+          reportDiag(rt, cfg, `particle '${particlePath}' 不在 pkg，跳过`, "warn");
           return null;
         }
         const model = JSON.parse(readText(modelEntry));
@@ -3107,7 +3123,7 @@ cfg, source, pkgAbort.signal);
         // 材质缺失或未声明贴图时，用通用光晕兜底（宁可近似也不整层消失）
         const te = await loadParticleTex(texName || "particle/halo");
         if (!te) {
-          reportDiag(rt, cfg, `particle '${particlePath}' 无贴图可用，跳过`);
+          reportDiag(rt, cfg, `particle '${particlePath}' 无贴图可用，跳过`, "warn");
           return null;
         }
         ps.setTexture({ glTex: te.glTex, width: te.width, height: te.height, frames: te.frames });
@@ -3223,7 +3239,7 @@ cfg, source, pkgAbort.signal);
             await buildParticleSystem(layer.particle, layer, layer.instanceoverride, 0);
           } catch (e) {
             console.warn(`粒子图层 ${layer.name} 加载失败: ${(e as Error).message}`);
-            reportDiag(rt, cfg, `particle '${layer.name}' FAIL: ${(e as Error).message.slice(0, 80)}`);
+            reportDiag(rt, cfg, `particle '${layer.name}' FAIL: ${(e as Error).message.slice(0, 80)}`, "warn");
           }
         }
       }
@@ -3401,7 +3417,7 @@ cfg, source, pkgAbort.signal);
             particleDiagFrame++;
             if (particleDiagFrame === 2) {
               const live = particleSystems.reduce((s, ps) => s + ps.liveCount(), 0);
-              reportDiag(rt, cfg, `particles live: ${live} across ${particleSystems.length} systems`);
+              reportDiag(rt, cfg, `particles live: ${live} across ${particleSystems.length} systems`, "info");
             }
           }
         },
@@ -3429,7 +3445,7 @@ cfg, source, pkgAbort.signal);
         // count=5000 的雪）。off 不经过这里（上面已门控推进与渲染）。
         particles.setParticleDensityTier?.(q.particles === "off" ? "high" : q.particles);
         for (const ps of particleSystems) ps._applyOverride?.();
-        reportDiag(rt, cfg, `quality: aa=${q.antiAliasing} particles=${q.particles} post=${q.postProcessing}`);
+        reportDiag(rt, cfg, `quality: aa=${q.antiAliasing} particles=${q.particles} post=${q.postProcessing}`, "info");
       };
       setQualityImpl = applyQuality;
       // [we-scene patch 2026-09-25] 自动降档（挂载期）：软件渲染（无 GPU）时把后处理
@@ -3443,18 +3459,20 @@ cfg, source, pkgAbort.signal);
         software: rt.softwareRenderer === true,
         enabled: cfg.autoQuality !== false,
       });
-      for (const line of autoRes.applied) reportDiag(rt, cfg, `autoQuality: ${line}`);
+      for (const line of autoRes.applied) reportDiag(rt, cfg, `autoQuality: ${line}`, "warn");
       if (rt.softwareRenderer === true) {
         reportDiag(
           rt,
           cfg,
           `软件渲染（无 GPU）：画布 DPR 封顶 ${softwareDprCap(true, cfg.renderDpr) ?? "（宿主已指定，跳过）"}`,
+          "warn",
         );
       }
       applyQuality(autoRes.quality);
       reportDiag(rt,
         cfg,
         `particles: ${particleSystems.length} systems, ${builtinTexCount} builtin tex generated`,
+        "info",
       );
       // 调试出口：测试台/控制台可读粒子系统状态（存活数、世界包围盒、尺寸区间、
       // 图层名、override 动画的 opacityMul 曲线、场景时钟 t），
@@ -3552,7 +3570,7 @@ cfg, source, pkgAbort.signal);
           // 贴图：与普通图层同一条材质链，已在上面的循环里 loadTex 过
           const texObj = layer.textureName ? textures.get(layer.textureName) : null;
           if (!texObj) {
-            reportDiag(rt, cfg, `puppet '${layer.name}' 无贴图，跳过`);
+            reportDiag(rt, cfg, `puppet '${layer.name}' 无贴图，跳过`, "warn");
             continue;
           }
           layer.puppet = mdlObj;
@@ -3562,10 +3580,11 @@ cfg, source, pkgAbort.signal);
             cfg,
             `puppet '${layer.name}' v=${mdlObj.vertexCount} bones=${mdlObj.bones.length}` +
               (an ? ` anim='${an.name}' ${an.fps}fps×${an.frameCount}` : " 无动画"),
+            "info",
           );
         } catch (e) {
           console.warn(`puppet 图层 ${layer.name} 加载失败: ${(e as Error).message}`);
-          reportDiag(rt, cfg, `puppet '${layer.name}' 失败: ${(e as Error).message}`);
+          reportDiag(rt, cfg, `puppet '${layer.name}' 失败: ${(e as Error).message}`, "warn");
         }
       }
       // [we-scene patch] scene.json 直接挂 `model: "*.mdl"` 的真 3D 网格
@@ -3608,12 +3627,13 @@ cfg, source, pkgAbort.signal);
                 rt,
                 cfg,
                 `model '${layer.name}' 的贴图 '${texName}' 加载失败，跳过该层：${(e as Error)?.message}`,
+                "warn",
               );
             }
           }
           const texObj = texName ? textures.get(texName) : null;
           if (!texObj) {
-            reportDiag(rt, cfg, `model '${layer.name}' 无贴图，跳过`);
+            reportDiag(rt, cfg, `model '${layer.name}' 无贴图，跳过`, "warn");
             continue;
           }
           // [we-scene patch 2026-09-28] 多子网格：**每个子网格带自己的材质与贴图**
@@ -3656,10 +3676,11 @@ cfg, source, pkgAbort.signal);
             cfg,
             `model '${layer.name}' v=${mdlObj.vertexCount} static ${mdlObj.materialPath || ""}` +
               (mdlObj.meshes && mdlObj.meshes.length > 1 ? ` meshes=${mdlObj.meshes.length}` : ""),
+            "info",
           );
         } catch (e) {
           console.warn(`model 图层 ${layer.name} 加载失败: ${(e as Error).message}`);
-          reportDiag(rt, cfg, `model '${layer.name}' 失败: ${(e as Error).message}`);
+          reportDiag(rt, cfg, `model '${layer.name}' 失败: ${(e as Error).message}`, "warn");
         }
       }
       let mdlRenderer: any = null;
@@ -3724,13 +3745,13 @@ cfg, source, pkgAbort.signal);
           });
         } catch (e) {
           console.warn(`puppet 渲染器初始化失败: ${(e as Error).message}`);
-          reportDiag(rt, cfg, `puppet renderer 失败: ${(e as Error).message}`);
+          reportDiag(rt, cfg, `puppet renderer 失败: ${(e as Error).message}`, "warn");
           mdlRenderer = null;
           for (const item of mdlItems) item.layer.puppet = null;
         }
       }
       if (disposed) return;
-      reportDiag(rt, cfg, `puppet: ${mdlItems.length} meshes`);
+      reportDiag(rt, cfg, `puppet: ${mdlItems.length} meshes`, "info");
 
       // ---- puppet 附着点挂件 ----
       // parse 只合并了父 origin + 子 local；MDAT 附着点要等 puppet 装上才能加。
@@ -3740,7 +3761,7 @@ cfg, source, pkgAbort.signal);
       // 逐帧：origin = base + (当前附着点 − 绑定附着点)，挂件随骨摆。
       const attachFollows = mdl.applyAttachmentBindOrigins(scene.layers);
       if (attachFollows.length) {
-        reportDiag(rt, cfg, `attachments: ${attachFollows.length} hanging layers`);
+        reportDiag(rt, cfg, `attachments: ${attachFollows.length} hanging layers`, "info");
       }
 
       // [we-scene patch] 逐帧需要重算父子变换的图层集合（见 scene/parse.js
@@ -3753,7 +3774,7 @@ cfg, source, pkgAbort.signal);
         attachFollows.map((f: any) => f.layer),
       );
       if (transformDirty.size) {
-        reportDiag(rt, cfg, `transform graph: ${transformDirty.size} live layers`);
+        reportDiag(rt, cfg, `transform graph: ${transformDirty.size} live layers`, "info");
         // 脏子树里的粒子层：发射器变换要跟着图层每帧重读（见 syncLayerTransform）。
         for (const [lid, list] of particleSystemsByLayer) {
           if (!transformDirty.has(lid)) continue;
@@ -3783,19 +3804,19 @@ cfg, source, pkgAbort.signal);
         try {
           const entry = pkg.getEntry(parsedPkg, src.path);
           if (!entry) {
-            reportDiag(rt, cfg, `camera path '${src.path}' 不在包内（图层 ${layer.name}）`);
+            reportDiag(rt, cfg, `camera path '${src.path}' 不在包内（图层 ${layer.name}）`, "warn");
             continue;
           }
           const doc = JSON.parse(readText(entry));
           const path = camPathLib.createCameraPath(doc, typeof src.queuemode === "string" ? src.queuemode : "sequential");
           if (!path.clips.length) {
-            reportDiag(rt, cfg, `camera path '${src.path}' 没有 clip（图层 ${layer.name}）`);
+            reportDiag(rt, cfg, `camera path '${src.path}' 没有 clip（图层 ${layer.name}）`, "warn");
             continue;
           }
           layer.cameraPath = path;
-          reportDiag(rt, cfg, `camera path '${layer.name}': ${path.clips.length} 段（queuemode=${src.queuemode || "sequential"}）`);
+          reportDiag(rt, cfg, `camera path '${layer.name}': ${path.clips.length} 段（queuemode=${src.queuemode || "sequential"}）`, "info");
         } catch (e) {
-          reportDiag(rt, cfg, `camera path '${src.path}' 解析失败: ${String((e as Error).message || e).slice(0, 80)}`);
+          reportDiag(rt, cfg, `camera path '${src.path}' 解析失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn");
         }
       }
 
@@ -4070,7 +4091,7 @@ cfg, source, pkgAbort.signal);
                 openUserShortcut: shortcuts.openUserShortcut,
                 getLayerText: (name: string) => textLayerText.get(name),
                 onError: (e: unknown) => {
-                  reportDiag(rt, cfg, `text script '${layer.name}' 失败: ${String((e as Error).message || e).slice(0, 120)}`);
+                  reportDiag(rt, cfg, `text script '${layer.name}' 失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
                 },
               });
               if (item.sandbox) {
@@ -4329,7 +4350,7 @@ cfg, source, pkgAbort.signal);
                   };
                   const list = ((rt as { textClip?: typeof rec[] }).textClip ??= []);
                   list.push(rec);
-                  reportDiag(rt, cfg, `文字被画布裁切：${rec.name || "(无名)"} 溢出 ${rec.over}px：「${rec.text}」`);
+                  reportDiag(rt, cfg, `文字被画布裁切：${rec.name || "(无名)"} 溢出 ${rec.over}px：「${rec.text}」`, "warn");
                 }
               }
               // 非扩边层**不碰** layer.size（挂载时已按 box+margin 设好；脚本/动画
@@ -4386,6 +4407,7 @@ cfg, source, pkgAbort.signal);
           cfg,
           `text widgets: ${textWidgets.length} (scripts ${textWidgets.filter((i) => i.sandbox).length}, ` +
             `fonts ${fontFamilies.size}, quality ${quality.toFixed(2)})`,
+          "info",
         );
       }
       if (disposed) return;
@@ -4560,6 +4582,7 @@ cfg, source, pkgAbort.signal);
                     rt,
                     cfg,
                     `createLayer('${imagePath}') 找不到已加载的同模型层`,
+                    "warn",
                   );
                   return null;
                 }
@@ -4636,12 +4659,12 @@ cfg, source, pkgAbort.signal);
                   });
                 }
               } catch (e) {
-                reportDiag(rt, cfg, `createLayer('${imagePath}') 资产实例化失败: ${String((e as Error).message || e).slice(0, 120)}`);
+                reportDiag(rt, cfg, `createLayer('${imagePath}') 资产实例化失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
               }
             } else if (assetToMount && assetToMount.kind === "particle") {
               const ppath = assetToMount.path;
               void buildParticleSystem(ppath, clone, null, 0).then((ps) => {
-                if (!ps) reportDiag(rt, cfg, `createLayer('${ppath}') 粒子系统装配失败`);
+                if (!ps) reportDiag(rt, cfg, `createLayer('${ppath}') 粒子系统装配失败`, "warn");
               });
             }
             return clone;
@@ -4728,7 +4751,7 @@ cfg, source, pkgAbort.signal);
               if (ctrl.name) layer.animations[ctrl.name] = ctrl;
               animRuns.push({ layer, field, slot, ctrl });
             } catch (e) {
-              reportDiag(rt, cfg, `animation '${layer.name}.${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `animation '${layer.name}.${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
           // [we-scene patch] 时间轴联动组接线：同层字段间按 key 链接
@@ -4739,7 +4762,7 @@ cfg, source, pkgAbort.signal);
           if (layer.animationList.length) {
             const siblings = new Map<string, any>();
             for (const ctrl of layer.animationList) siblings.set(ctrl.field, ctrl);
-            anim.linkAnimations(siblings, (msg: string) => reportDiag(rt, cfg, `${layer.name}: ${msg}`));
+            anim.linkAnimations(siblings, (msg: string) => reportDiag(rt, cfg, `${layer.name}: ${msg}`, classifyDiag(msg)));
             layer.animationsByField = Object.fromEntries(siblings);
           }
         }
@@ -4757,7 +4780,7 @@ cfg, source, pkgAbort.signal);
               ctrl.baseNumeric = typeof def.value === "number" ? def.value : Number(def.value) || 0;
               overrideAnimRuns.push({ layer, key, ctrl });
             } catch (e) {
-              reportDiag(rt, cfg, `override animation '${layer.name}.${key}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `override animation '${layer.name}.${key}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
         }
@@ -4781,7 +4804,7 @@ cfg, source, pkgAbort.signal);
               shared: textShared,
               storage: sceneStorage,
               onError: (e: unknown) =>
-                reportDiag(rt, cfg, `animationlayer visible script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+                reportDiag(rt, cfg, `animationlayer visible script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
             });
             if (!sandbox) return;
             propSandboxes.push(sandbox);
@@ -4799,7 +4822,7 @@ cfg, source, pkgAbort.signal);
               registerAnimEventSink(layer, { sandbox, kind: "animLayer", animLayerIndex: index });
             }
           } catch (e) {
-            reportDiag(rt, cfg, `animationlayer script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+            reportDiag(rt, cfg, `animationlayer script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
           }
         });
       }
@@ -4825,7 +4848,7 @@ cfg, source, pkgAbort.signal);
                 shared: textShared,
                 storage: sceneStorage,
                 onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+                  reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -4843,7 +4866,7 @@ cfg, source, pkgAbort.signal);
                 registerAnimEventSink(layer, { sandbox, kind: "animLayerField", animLayerIndex: index, field });
               }
             } catch (e) {
-              reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
           // blend 的关键帧动画形态（Attack/Bump/Trip：一段 single 曲线，权重 0→1→0）
@@ -4873,7 +4896,7 @@ cfg, source, pkgAbort.signal);
                 try { ctrl.play() } catch { /* 忽略 */ }
               }
             } catch (e) {
-              reportDiag(rt, cfg, `animationlayer blend animation '${layer.name}[${index}]' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `animationlayer blend animation '${layer.name}[${index}]' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
         });
@@ -4901,7 +4924,7 @@ cfg, source, pkgAbort.signal);
                 shared: textShared,
                 storage: sceneStorage,
                 onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `override script '${layer.name}.${key}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+                  reportDiag(rt, cfg, `override script '${layer.name}.${key}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -4912,7 +4935,7 @@ cfg, source, pkgAbort.signal);
               registerResizeHook(sandbox);
               if (sandbox.hasUpdate) overrideScriptRuns.push({ layer, key, sandbox });
             } catch (e) {
-              reportDiag(rt, cfg, `override script '${layer.name}.${key}' 求值失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `override script '${layer.name}.${key}' 求值失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
         }
@@ -4943,7 +4966,7 @@ cfg, source, pkgAbort.signal);
                 shared: textShared,
                 storage: sceneStorage,
                 onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+                  reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -5011,6 +5034,7 @@ cfg, source, pkgAbort.signal);
                     rt,
                     cfg,
                     `object script '${layer.name}.${field}' 失败: ${String((e as Error).message || e).slice(0, 90)}${loc ? ` @line ${loc}` : ""}`,
+                    "warn",
                   );
                 },
                 // [we-scene patch 2026-09-28] `layer.emitParticles(n)`：按图层 id 找它的
@@ -5158,7 +5182,7 @@ cfg, source, pkgAbort.signal);
                 shared: textShared,
                 storage: sceneStorage,
                 onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `general script '${field}' 失败: ${String((e as Error).message || e).slice(0, 80)}`),
+                  reportDiag(rt, cfg, `general script '${field}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -5173,7 +5197,7 @@ cfg, source, pkgAbort.signal);
             }
           }
           if (generalScriptRuns.length) {
-            reportDiag(rt, cfg, `general scripts: ${generalScriptRuns.map((r) => r.field).join(",")}`);
+            reportDiag(rt, cfg, `general scripts: ${generalScriptRuns.map((r) => r.field).join(",")}`, "info");
           }
         }
         // general.*.animation（全库 2 处）：2887099508 zoom 开场从 3 拉到 1，
@@ -5193,16 +5217,16 @@ cfg, source, pkgAbort.signal);
               if (ctrl.name) sceneNamedAnims[ctrl.name] = ctrl;
               generalAnimRuns.push({ field, ctrl, write: (v) => writeGeneralField(field, v) });
             } catch (e) {
-              reportDiag(rt, cfg, `general animation '${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`);
+              reportDiag(rt, cfg, `general animation '${field}' 建控制器失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
           }
           if (generalAnimRuns.length) {
-            reportDiag(rt, cfg, `general animations: ${generalAnimRuns.map((r) => r.field).join(",")}`);
+            reportDiag(rt, cfg, `general animations: ${generalAnimRuns.map((r) => r.field).join(",")}`, "info");
           }
         }
       }
       if (objectScriptRuns.length) {
-        reportDiag(rt, cfg, `object scripts: ${objectScriptRuns.length}`);
+        reportDiag(rt, cfg, `object scripts: ${objectScriptRuns.length}`, "info");
         // 调试出口：读/改对象脚本的实时字段值（音条 scale 等）
         (window as unknown as Record<string, unknown>).__objScripts = objectScriptRuns;
         // [we-scene patch 2026-09-28] 调试出口：场景脚本共享状态（WE 的 `shared` 全局）。
@@ -5237,7 +5261,7 @@ cfg, source, pkgAbort.signal);
       // 命中判定用 OBB（render/hittest.js），几何与 layerModelMatrix 逐字一致。
       const cursorLayers = Array.from(cursorHooks.keys());
       if (cursorLayers.length) {
-        reportDiag(rt, cfg, `cursor hooks: ${cursorLayers.length} layers`);
+        reportDiag(rt, cfg, `cursor hooks: ${cursorLayers.length} layers`, "info");
       }
       // 命中集（z 序自上而下）。**同一帧可以有多个图层同时命中**：WE 的 cursor
       // 回调按图层各自判定、不做上层遮挡（open-wallpaper-engine TickAll 逐 script
@@ -5312,7 +5336,7 @@ cfg, source, pkgAbort.signal);
               // （那是宿主请求值），所以这里必须读 effective —— 读 cfg 会让阶梯卡在
               // 「high→medium」反复横跳（实测踩过：连报两次 → medium）。
               applyQuality({ ...(rt.qualityEffective ?? requestedQuality()), postProcessing: next });
-              reportDiag(rt, cfg, `autoQuality: postProcessing → ${next}（${reason}）`);
+              reportDiag(rt, cfg, `autoQuality: postProcessing → ${next}（${reason}）`, "warn");
             },
           })
         : null;
@@ -5336,7 +5360,7 @@ cfg, source, pkgAbort.signal);
         ? createAdaptiveVideoScale({
             onStepDown: (next, reason) => {
               applyVideoScale(next);
-              reportDiag(rt, cfg, `autoQuality: 视频纹理上传倍率 → ${next}（${reason}）`);
+              reportDiag(rt, cfg, `autoQuality: 视频纹理上传倍率 → ${next}（${reason}）`, "warn");
             },
           })
         : null;
@@ -5505,12 +5529,13 @@ cfg, source, pkgAbort.signal);
                     s.textColor = media.mediaVec3(0.98, 0.98, 1);
                     s.highContrastColor = media.mediaVec3(1, 1, 1);
                   }
-                  reportDiag(rt, cfg, `media: $mediaThumbnail 已更新（${bw}×${bh}）`);
+                  reportDiag(rt, cfg, `media: $mediaThumbnail 已更新（${bw}×${bh}）`, "info");
                 } catch (e) {
                   reportDiag(
                     rt,
                     cfg,
                     `media: 封面上传失败（${e instanceof Error ? e.message : e}）`,
+                    "warn",
                   );
                 }
               })();
@@ -6035,7 +6060,7 @@ cfg, source, pkgAbort.signal);
             })
             .catch((e: Error) => {
               console.warn("scene render error:", e);
-              reportDiag(rt, cfg, `render: ${String(e.message || e).slice(0, 200)}`);
+              reportDiag(rt, cfg, `render: ${String(e.message || e).slice(0, 200)}`, "error");
               disposed = true;
             });
         } else {
@@ -6061,7 +6086,7 @@ cfg, source, pkgAbort.signal);
         } catch (e) {
           const err = e instanceof Error ? e : new Error(String(e));
           if (disposed) return;
-          reportDiag(rt, cfg, `failed: renderLoop 异常，渲染循环终止 — ${String(err.message || err).slice(0, 200)}`);
+          reportDiag(rt, cfg, `failed: renderLoop 异常，渲染循环终止 — ${String(err.message || err).slice(0, 200)}`, "error");
           disposed = true;
           rt.raf = undefined;
           // 与装配期失败同一条出口：公共 API 设了 onError 就交回调用方
@@ -6197,7 +6222,7 @@ cfg, source, pkgAbort.signal);
         }
         (renderer as any).applyConstUserProperties?.(changed);
         for (const it of textWidgets) it.lastKey = null;
-        reportDiag(rt, cfg, `props hot: ${Object.keys(changed).join(",")}`);
+        reportDiag(rt, cfg, `props hot: ${Object.keys(changed).join(",")}`, "info");
       };
       pauseImpl = () => {
         // 重入幂等：遮挡暂停 → 用户 pause() 的交织下会跑第二次，重捕获时
@@ -6287,6 +6312,7 @@ cfg, source, pkgAbort.signal);
         reportDiag(rt,
           cfg,
           `fit ${fit}: view ${Math.round(win.viewW)}x${Math.round(win.viewH)} scene ${projW}x${projH} canvas ${c.width}x${c.height}`,
+          "info",
         );
         // cover 窥视的逐轴门控基准：**可见内容的世界包围盒**（旋转矩形取 AABB 并集）。
         // 画布溢出 ≠ 内容溢出——1920911984 这类「竖版画布 + 旋转 90° 横条」壁纸，
@@ -6301,24 +6327,24 @@ cfg, source, pkgAbort.signal);
               projW,
               projH,
             };
-            reportDiag(rt, cfg, `cover peek gate: content ${Math.round(b.maxX - b.minX)}x${Math.round(b.maxY - b.minY)}`);
+            reportDiag(rt, cfg, `cover peek gate: content ${Math.round(b.maxX - b.minX)}x${Math.round(b.maxY - b.minY)}`, "info");
           } else {
             // 没有任何出像素的层（或全是空 composelayer 画布）→ 记 0×0 基准而不是
             // 不设基准：`peekAxes` 对「无基准」是两轴放行（媒体/网页壁纸的既有行为），
             // 场景侧不设就等于「算不出内容在哪反而随便滑」。0×0 恒判无溢出 → 钉住居中。
             rt.coverPeek = { contentW: 0, contentH: 0, projW, projH };
-            reportDiag(rt, cfg, `cover peek gate: content 0x0 (无出像素的层)`);
+            reportDiag(rt, cfg, `cover peek gate: content 0x0 (无出像素的层)`, "info");
           }
         }
       }
-      reportDiag(rt, cfg, `renderer started: ${scene.layers.length} layers`);
+      reportDiag(rt, cfg, `renderer started: ${scene.layers.length} layers`, "info");
     } catch (e) {
       if (disposed) return;
       if (e && (e as Error).name === "AbortError") return;
       // 场景加载/渲染失败：diag 上报 + 降级画布演示
       console.warn("scene render failed:", e);
       const err = e instanceof Error ? e : new Error(String(e));
-      reportDiag(rt, cfg, `failed: ${String(err.message || err).slice(0, 200)}`);
+      reportDiag(rt, cfg, `failed: ${String(err.message || err).slice(0, 200)}`, "error");
       // 库化桥接：公共 API 设了 onError 就交回调用方兜底；
       // 旧路径（壁纸页）维持「失败挂降级页」的既有行为
       if (rt.onError) rt.onError(err);

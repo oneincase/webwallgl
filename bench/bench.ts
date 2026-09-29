@@ -322,28 +322,37 @@ typeFilterEl.onclick = (e) => {
 
 // ---------- 日志区 ----------
 
-function log(msg: string, isErr = false) {
+function log(msg: string, level: "info" | "warn" | "error" = "info") {
   const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   const line = document.createElement("span");
-  line.className = isErr ? "err" : "";
+  line.className = level === "error" ? "err" : level === "warn" ? "warn" : "";
   line.textContent = `${time}  ${msg}\n`;
   logBodyEl.appendChild(line);
   logBodyEl.scrollTop = logBodyEl.scrollHeight;
 }
 
-// 渲染器的 reportDiag 走 <img src="/diag?msg=..."> → 宿主中间件 → SSE 回推到这里。
+// 渲染器的 reportDiag 走 <img src="/diag?msg=...&lvl=..."> → 宿主中间件 → SSE 回推到这里。
+// 级别由渲染器自己声明并随请求发出（issue #13）：这里只管按它染色，不再对文案
+// 做关键字匹配。老渲染器没有这一位时才退回文案判据。
 // 仅本机后端存在时连接（静态托管下探测后跳过，避免误报「诊断流断开」）。
 function connectDiag() {
   const diag = new EventSource("/api/diag-stream");
   diag.onmessage = (ev) => {
     try {
-      const { msg } = JSON.parse(ev.data) as { msg: string };
-      log(msg, /fail|error|ERROR/.test(msg));
+      const { msg, level } = JSON.parse(ev.data) as { msg: string; level?: string };
+      log(
+        msg,
+        level === "error" || level === "warn" || level === "info"
+          ? level
+          : /fail|error|失败|ERROR/.test(msg)
+            ? "error"
+            : "info",
+      );
     } catch {
       /* 忽略心跳等非 JSON 帧 */
     }
   };
-  diag.onerror = () => log(t("err.diagStream"), true);
+  diag.onerror = () => log(t("err.diagStream"), "error");
 }
 
 $<HTMLButtonElement>("#clear-logs").onclick = () => {
@@ -441,7 +450,7 @@ pickLibEl.onclick = async () => {
     clearSelection();
     await loadLibrary();
   } catch (e) {
-    log(t("err.pickLib", { msg: (e as Error).message }), true);
+    log(t("err.pickLib", { msg: (e as Error).message }), "error");
   } finally {
     pickLibEl.disabled = false;
   }
@@ -455,7 +464,7 @@ async function loadLibrary() {
   statusLibEl.textContent = data.dir;
   statusLibEl.title = data.dir;
   if (data.error) {
-    log(data.error, true);
+    log(data.error, "error");
     return;
   }
   items = data.items;
@@ -586,7 +595,7 @@ async function revealItem(itemId: string) {
     if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
     log(t("ok.reveal", { id: itemId }));
   } catch (e) {
-    log(t("err.reveal", { msg: (e as Error).message }), true);
+    log(t("err.reveal", { msg: (e as Error).message }), "error");
   }
 }
 
@@ -663,7 +672,7 @@ async function deleteItem(it: LibraryItem) {
     if (selected?.itemId === it.itemId) clearSelection(); // 正在预览的壁纸被删：清空舞台
     await loadLibrary();
   } catch (e) {
-    log(t("err.delete", { msg: (e as Error).message }), true);
+    log(t("err.delete", { msg: (e as Error).message }), "error");
   }
 }
 
@@ -732,7 +741,7 @@ function mount() {
 function wp() {
   const w = frameEl.contentWindow as RendererWindow | null;
   if (!w?.__wp) {
-    log(t("err.wpNotReady"), true);
+    log(t("err.wpNotReady"), "error");
     return null;
   }
   return w.__wp;
@@ -782,7 +791,7 @@ pkgFileEl.onchange = async () => {
     setRunToggle(true); // loadSceneFile 在渲染器侧回到运行态
     log(t("log.filePreview", { name: file.name }));
   } catch (e) {
-    log(t("err.filePreview", { msg: (e as Error).message }), true);
+    log(t("err.filePreview", { msg: (e as Error).message }), "error");
   }
 };
 
@@ -1555,7 +1564,7 @@ async function uploadPropFile(name: string, file: File, btn: HTMLButtonElement) 
     if (!res.ok || data.error || !data.value) throw new Error(data.error || `HTTP ${res.status}`);
     changeProp(name, data.value);
   } catch (e) {
-    log(t("err.pickFile", { msg: (e as Error).message }), true);
+    log(t("err.pickFile", { msg: (e as Error).message }), "error");
     btn.disabled = false;
     btn.textContent = prev;
   }
@@ -1582,7 +1591,7 @@ async function pickPropDir(name: string, btn: HTMLButtonElement) {
     }
     if (data.value) changeProp(name, data.value);
   } catch (e) {
-    log(t("err.pickDir", { msg: (e as Error).message }), true);
+    log(t("err.pickDir", { msg: (e as Error).message }), "error");
   } finally {
     btn.disabled = false;
   }
@@ -1890,7 +1899,7 @@ function setPropsOpen(open: boolean) {
 
 togglePropsEl.onclick = () => {
   if (!selected) {
-    log(t("err.selectFirst"), true);
+    log(t("err.selectFirst"), "error");
     return;
   }
   const next = propsEl.hidden;

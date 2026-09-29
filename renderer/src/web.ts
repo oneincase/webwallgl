@@ -424,7 +424,7 @@ function resolveContainer(rt: Runtime, cfg: WallpaperConfig): HTMLElement | null
   if (el instanceof HTMLCanvasElement) {
     const parent = el.parentElement;
     if (parent) {
-      reportDiag(rt, cfg, "网页壁纸挂在 canvas 父容器上（canvas 不能有子节点；更适合空 div）");
+      reportDiag(rt, cfg, "网页壁纸挂在 canvas 父容器上（canvas 不能有子节点；更适合空 div）", "warn");
       return parent;
     }
     return null;
@@ -495,6 +495,7 @@ function installLetterboxFix(rt: Runtime, f: HTMLIFrameElement, container: HTMLE
         rt,
         rt.cfg,
         `网页壁纸露底自适配：视口按内容比例改为 ${Math.round(vp.width)}×${Math.round(vp.height)}（cover 居中裁切）`,
+        "warn",
       );
     }
   };
@@ -1175,13 +1176,13 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   rt.cfg = cfg;
   const container = resolveContainer(rt, cfg);
   if (!container) {
-    reportDiag(rt, cfg, "网页壁纸：无可用容器");
+    reportDiag(rt, cfg, "网页壁纸：无可用容器", "error");
     rt.onError?.(new Error("网页壁纸：无可用容器"));
     return;
   }
   const entry = cfg.src ?? "";
   if (!entry) {
-    reportDiag(rt, cfg, "网页壁纸：缺少 src");
+    reportDiag(rt, cfg, "网页壁纸：缺少 src", "error");
     rt.onError?.(new Error("网页壁纸：缺少 src"));
     return;
   }
@@ -1208,7 +1209,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
       : (cfgExt._webMedia ?? defaultMediaDriver());
 
   const finishBare = (why: string) => {
-    reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`);
+    reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`, "warn");
     attachIframe(rt, cfg, container, entry, { injected: false, strictSandbox: cfg.webSandbox === "strict" });
     startAudioPump(rt, null);
     startMediaPump(rt, null);
@@ -1268,12 +1269,12 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
           const st = live.status();
           if (st.audio === "live") {
             liveHold.driver = liveAudioDriver(live);
-            reportDiag(rt, cfg, "liveSystem: 网页壁纸音频改用系统实况频谱");
+            reportDiag(rt, cfg, "liveSystem: 网页壁纸音频改用系统实况频谱", "info");
           } else {
-            reportDiag(rt, cfg, `liveSystem: 系统音频不可用（${st.audio}），网页壁纸沿用模拟源`);
+            reportDiag(rt, cfg, `liveSystem: 系统音频不可用（${st.audio}），网页壁纸沿用模拟源`, "warn");
           }
         } catch (e) {
-          reportDiag(rt, cfg, `liveSystem: 启动失败，网页壁纸沿用模拟源 (${(e as Error)?.message ?? e})`);
+          reportDiag(rt, cfg, `liveSystem: 启动失败，网页壁纸沿用模拟源 (${(e as Error)?.message ?? e})`, "warn");
         }
       })();
     }
@@ -1307,6 +1308,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
               rt,
               cfg,
               "网页壁纸：同源入口未检测到 WE shim（host 未注入？）；Spine 类壁纸请确认 /web/ HTML 改写",
+              "warn",
             );
           }
         },

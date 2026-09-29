@@ -300,7 +300,23 @@ export type SceneInfo = {
   hasText: boolean;
 };
 
-/** 诊断级别。库内部所有 reportDiag 都归到这三档 */
+/**
+ * 诊断级别 —— **由库自己声明**，随每条诊断一起给出（回调的第 2 参、`/diag` 像素
+ * 请求的 `lvl=` query 参数都是同一个值），嵌入方不必再对文案做关键字匹配
+ * （issue #13）。三档按**后果**分：
+ *
+ * - `error`：壁纸挂不上或已经死了，**需要调用方介入** —— 挂载失败、渲染循环终止、
+ *   首帧超时、宿主/环境缺位到挂不上（无可用容器、缺 src、WEBGL2 不可用）。
+ * - `warn`：画面受影响或有损降级，**壁纸仍在跑** —— 脚本没跑起来、资源缺失或
+ *   解码失败、效果/贴图回退与跳过、文字被裁切、自动降档限速、非致命的失败。
+ * - `info`：过程与统计 —— 尺寸、计数、命中、状态、正常完成（含「失败 0」这类
+ *   零计数的正常完成）。
+ *
+ * 需要「宿主/环境级故障」这类**别的维度**的嵌入方可按自己的口径映射；库不替
+ * 调用方判定宿主环境。历史文案判据（`/fail|error|失败|ERROR/`）已被淘汰：它把
+ * `bake: …（失败 0，…）` 这种**正常完成**打成 error，也漏掉 `不可用`/`fallback`
+ * 这类降级。
+ */
 export type DiagnosticLevel = "info" | "warn" | "error";
 
 export type SceneEvents = {
@@ -406,7 +422,10 @@ export type MountOptions = {
    */
   occlusion?: OcclusionBands | false;
 
-  /** 诊断回调。替代旧的 GET /diag 上报 */
+  /**
+   * 诊断回调（msg + 级别）。级别由库声明，与旧的 GET /diag 像素上报**同源**：
+   * 两条通道带同一个 `DiagnosticLevel`，`/diag` 的 query 里另有 `lvl=` 显式给出。
+   */
   onDiagnostic?: SceneEvents["diagnostic"];
   /** 装配或渲染失败。库不自带降级页，由调用方决定怎么兜 */
   onError?: SceneEvents["error"];

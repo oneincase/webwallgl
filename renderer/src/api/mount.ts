@@ -363,7 +363,7 @@ export function createScene(
             `若不是在极慢的冷启动，多半是渲染循环已无声死亡 —— 开 onDiagnostic 看最后一条诊断。` +
             `（可用 mountTimeoutMs 调整或传 0 关闭本看门狗）`,
         );
-        reportDiag(rt, rt.cfg, `failed: mount 首帧超时 ${Math.round(ms)}ms（渲染循环无首帧、无 onError）`);
+        reportDiag(rt, rt.cfg, `failed: mount 首帧超时 ${Math.round(ms)}ms（渲染循环无首帧、无 onError）`, "error");
         reject(err);
       }, ms);
     });

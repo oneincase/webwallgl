@@ -40,6 +40,7 @@
     "verify:textures": "node scripts/verify-textures.mjs",
     "verify:bloom": "node scripts/verify-bloom.mjs",
     "verify:cover-peek": "node scripts/verify-cover-peek.mjs",
+    "verify:diag": "node scripts/verify-diag.mjs",
     "verify:web": "node scripts/verify-web.mjs",
     "verify:resolution": "node scripts/verify-resolution.mjs",
     "verify:quality": "node scripts/verify-quality.mjs",

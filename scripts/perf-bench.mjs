@@ -142,7 +142,9 @@ function startServer({ dist, lib, token = "dev", allowCache = false }) {
 
     if (p === "/diag") {
       const msg = u.searchParams.get("msg") ?? "";
-      if (msg) diag.push(msg);
+      // lvl= 是发送端声明的级别（issue #13）：带进报告文本，好按档筛选/统计
+      const lvl = u.searchParams.get("lvl") ?? "";
+      if (msg) diag.push(lvl ? `[${lvl}] ${msg}` : msg);
       res.setHeader("Content-Type", "image/gif");
       res.setHeader("Cache-Control", "no-store");
       res.end(Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"));

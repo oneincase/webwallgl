@@ -29,6 +29,9 @@ const STABLE = [
   // 材质缺 shader、坏 JSON、同一处只报一次），不该报的一个都不许报（官方两段式、
   // copy/swap 命令 pass、全库 10420 个效果零误报）—— issue #11
   "verify-effects",
+  // 诊断**级别**契约：级别由上报方声明并随 /diag 一起发（lvl=）、三档语义、
+  // 文本判据只兜外部透传文案且零计数豁免 —— issue #13
+  "verify-diag",
   "verify-animation",
   "verify-attachments",
   "verify-transform",

@@ -1,5 +1,6 @@
 // 共享 Runtime：每实例独立（cfg/画布/渲染器互不可见），作 web/media/scene-mount 首参。
 import { coverPeekOverflow, coverViewSize } from "../vendor/we-scene/render/math.js";
+import { diagLevelOf, diagUrl } from "./diag-level";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 import { softwareDprCap } from "./quality";
 import type { QualityOptions, ResolvedQuality } from "./quality";
@@ -14,7 +15,7 @@ import {
   type OcclusionBand,
   type Rect,
 } from "./occlusion";
-import type { OcclusionBandConfig, OcclusionPayload, OcclusionRect } from "./api/types";
+import type { DiagnosticLevel, OcclusionBandConfig, OcclusionPayload, OcclusionRect } from "./api/types";
 
 /**
  * 有效渲染 DPR。0=跟 devicePixelRatio；正数=目标（可高于设备上报，WKWebView 恒报 1 时仍能超采样）；
@@ -203,8 +204,9 @@ export type Runtime = {
   info?: unknown;
 
   // ---- 库化桥接钩子：公共 API 在触发装配前设置；装配层只管调用 ----
-  /** 诊断回调（reportDiag 先走这里，再走旧的 /diag img 上报） */
-  onDiagnostic?: (msg: string, level: "info" | "warn" | "error") => void;
+  /** 诊断回调（reportDiag 先走这里，再走旧的 /diag img 上报）。级别名固定为
+   *  api/types.ts 的 DiagnosticLevel —— 三档语义见该类型注释 */
+  onDiagnostic?: (msg: string, level: DiagnosticLevel) => void;
   /** 装配失败回调。设了它，mountScene 的 catch 不再自动挂降级页（交回调用方兜） */
   onError?: (err: Error) => void;
   /** 首帧真正提交渲染后触发一次（mount() 的 Promise 靠它 resolve） */
@@ -832,11 +834,15 @@ export class FrameGate {
 }
 
 
-/** 渲染器诊断上报。先交给库化桥接的 onDiagnostic（公共 API 的回调面），
- *  再走旧的 /diag img 通道（宿主日志；经内容服务器，用 <img> 免 CORS） */
-export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string) {
+/** 渲染器诊断上报。**级别由上报方声明**（第 4 参，三档语义见 api/types.ts 的
+ *  DiagnosticLevel）：本仓库自己的调用点逐处给级别，纯文本判据只兜外部透传文案。
+ *  两条通道带同一个级别 —— 库化桥接的 onDiagnostic（公共 API 的回调面）与旧的
+ *  /diag img 通道（宿主日志；经内容服务器，用 <img> 免 CORS）；后者的 query 里
+ *  也带 lvl=，嵌入方不必再对文案做关键字匹配（issue #13）。 */
+export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string, level: DiagnosticLevel) {
+  const lvl = diagLevelOf(msg, level);
   try {
-    rt.onDiagnostic?.(msg, /fail|error|失败|ERROR/.test(msg) ? "error" : "info");
+    rt.onDiagnostic?.(msg, lvl);
   } catch {
     /* 回调抛错不打断渲染 */
   }
@@ -846,7 +852,7 @@ export function reportDiag(rt: Runtime, cfg: WallpaperConfig, msg: string) {
     const origin = cfg.mediaBase ? new URL(cfg.mediaBase, window.location.href).origin : "";
     if (origin) {
       const img = new Image();
-      img.src = `${origin}/diag?msg=${encodeURIComponent(`scene ${cfg.src ?? "?"}: ${msg.slice(0, 500)}`)}`;
+      img.src = diagUrl(origin, cfg.src, msg, lvl);
     }
   } catch {
     /* 忽略 */

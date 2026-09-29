@@ -441,6 +441,13 @@ export const DOC: DocSection[] = [
       {
         k: "p",
         v: {
+          zh: "级别由库自己声明（不是从文案里猜的）：`error` = 壁纸挂不上或已经死了、需要调用方介入（挂载失败、渲染循环终止、首帧超时、无容器 / 缺 src / WEBGL2 不可用）；`warn` = 画面受影响或有损降级、壁纸仍在跑（脚本没跑起来、资源缺失或解码失败、效果与贴图回退或跳过、文字被裁切、自动降档）；`info` = 过程与统计（尺寸、计数、命中、正常完成）。同一个级别也随旧的 `/diag` 像素上报发出（`/diag?msg=…&lvl=<level>`），走中间件或内容服务器的宿主不必再对文案做关键字匹配。",
+          en: "The level is declared by the library, never guessed from the message text: `error` = the wallpaper failed to mount or has died and the caller must act (mount failure, render-loop termination, first-frame timeout, no container / missing src / no WebGL2); `warn` = the picture is affected or degraded while the wallpaper keeps running (a script failed to start, a resource is missing or failed to decode, effects and textures fell back or were skipped, text got clipped, auto-downgrade kicked in); `info` = process and statistics (sizes, counts, hits, normal completion). The same level also travels on the legacy `/diag` pixel request (`/diag?msg=…&lvl=<level>`), so hosts going through a middleware or content server no longer need keyword matching on the text.",
+        },
+      },
+      {
+        k: "p",
+        v: {
           zh: "库不自带降级页，也不向任何服务器上报：诊断与错误全部经回调交给你，渲染失败的兜底（提示、换壁纸、卸载实例）由调用方决定。",
           en: "The library ships no fallback page and phones home nowhere: diagnostics and errors arrive via callbacks only. What to do on failure (show a hint, swap the wallpaper, destroy the instance) is your call.",
         },

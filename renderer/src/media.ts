@@ -20,6 +20,7 @@
 // capture 无需改动：本路径保留 preserveDrawingBuffer:true（实测它对 CPU 无影响，
 // 见提交记录），画布在静止期间也不被 clear，所以 toDataURL 仍拿到最后一帧。
 import { clear, effectiveDpr, fitObjectFit, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, reapplyVolume, reportDiag, syncCanvasSize, type Runtime } from "./shell";
+import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap } from "./occlusion";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
@@ -138,7 +139,7 @@ function attachVideoSpectrum(rt: Runtime, cfg: WallpaperConfig, v: HTMLVideoElem
   } catch (e) {
     // 同一个 <video> 只能 createMediaElementSource 一次；重挂载时会抛，
     // 属预期，静默回落即可
-    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`);
+    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`, "warn");
     return;
   }
   const bins = new Uint8Array(analyser.frequencyBinCount);
@@ -220,7 +221,7 @@ function attachPairSpectrum(
       nodes.set(el, an);
     }
   } catch (e) {
-    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`);
+    reportDiag(rt, cfg, `media 频谱接管跳过: ${(e as Error)?.message ?? e}`, "warn");
     return undefined;
   }
   let cur = nodes.get(a)!;
@@ -272,7 +273,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   // Promise.race([onFirstFrame, onError]) —— 两个钩子都不触发就是永久挂起，
   // 调用方连超时都没法区分「还在加载」和「已经死了」。
   const failHard = (why: string) => {
-    reportDiag(rt, cfg, `media ${cfg.type} 失败: ${why}`);
+    reportDiag(rt, cfg, `media ${cfg.type} 失败: ${why}`, "error");
     rt.onError?.(new Error(`媒体壁纸（${cfg.type}）${why}`));
     rt.fallbackPage?.();
   };
@@ -322,7 +323,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
     // 库形态没有 rt.wrap，DOM 回退的元素挂不上去也就永远看不见 —— 与其假装
     // 成功，不如如实报错让调用方决定（提示 / 换壁纸 / 卸载实例）。
     // 视频不会走到这里：它在上面已分流到 mountVideoDom（DOM 直显是默认路径）。
-    reportDiag(rt, cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE`);
+    reportDiag(rt, cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE`, embedded ? "error" : "warn");
     if (embedded) {
       rt.onError?.(new Error("WEBGL2_UNAVAILABLE"));
       return;
@@ -379,7 +380,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
       // 如实经诊断报出，不要静默吞掉——否则表现为「设了音量但没声音」。
       if (vol > 0 && vid.paused && !rt.paused) {
         void vid.play().catch((e: unknown) => {
-          reportDiag(rt, cfg, `media 取消静音后自动播放被拒绝: ${(e as Error)?.message ?? e}`);
+          reportDiag(rt, cfg, `media 取消静音后自动播放被拒绝: ${(e as Error)?.message ?? e}`, "warn");
         });
       }
     },
@@ -410,7 +411,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
   void (async () => {
     try {
       const renderer = rnd.createRenderer(c, {
-        diag: (msg: string) => reportDiag(rt, cfg, `renderer: ${msg}`),
+        diag: (msg: string) => reportDiag(rt, cfg, `renderer: ${msg}`, classifyDiag(msg)),
         fboCapFactor: 0,
       });
       rt.renderer = renderer;
@@ -478,10 +479,11 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
               reportDiag(rt,
                 cfg,
                 `media gif ${mediaW}x${mediaH} ${gifFrames.frames.length} 帧 → scene 渲染`,
+                "info",
               );
             }
           } catch (e) {
-            reportDiag(rt, cfg, `gif 解码失败，回退静态首帧: ${String((e as Error).message).slice(0, 80)}`);
+            reportDiag(rt, cfg, `gif 解码失败，回退静态首帧: ${String((e as Error).message).slice(0, 80)}`, "warn");
           }
         }
         if (!decoded) {
@@ -503,7 +505,7 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
             height: mediaH,
             rg88: false,
           });
-          reportDiag(rt, cfg, `media ${cfg.type} ${mediaW}x${mediaH} → scene 渲染`);
+          reportDiag(rt, cfg, `media ${cfg.type} ${mediaW}x${mediaH} → scene 渲染`, "info");
         }
       }
 
@@ -690,7 +692,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
   if (!container) {
     // 库形态传了裸 canvas 且它没有父节点：挂不上去就别假装成功
     const why = "视频壁纸需要一个容器元素（传入的 canvas 没有父节点）";
-    reportDiag(rt, cfg, `media video 失败: ${why}`);
+    reportDiag(rt, cfg, `media video 失败: ${why}`, "error");
     rt.onError?.(new Error(`媒体壁纸（video）${why}`));
     return;
   }
@@ -708,7 +710,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
     if (failed) return;
     failed = true;
     const why = `解码/加载失败（code ${code ?? "?"}）`;
-    reportDiag(rt, cfg, `media video 失败: ${why}`);
+    reportDiag(rt, cfg, `media video 失败: ${why}`, "error");
     rt.onError?.(new Error(`媒体壁纸（video）${why}`));
     rt.fallbackPage?.();
   };
@@ -830,7 +832,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
     if (v.readyState >= 2) signalFirstFrame();
     attachVideoSpectrum(rt, cfg, v);
     pumpFrames(() => v);
-    reportDiag(rt, cfg, "media video → DOM 直显（单元素，不循环）");
+    reportDiag(rt, cfg, "media video → DOM 直显（单元素，不循环）", "info");
     return;
   }
 
@@ -845,7 +847,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       renderDpr: cfg.renderDpr,
       maxW: container.clientWidth || window.innerWidth,
       maxH: container.clientHeight || window.innerHeight,
-      onRecover: (msg) => reportDiag(rt, cfg, `media video 自愈: ${msg}`),
+      onRecover: (msg) => reportDiag(rt, cfg, `media video 自愈: ${msg}`, "warn"),
     });
     for (const el of [pair.active, pair.standby]) {
       el.style.cssText = css;
@@ -865,7 +867,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       // 只能调一次，所以两个元素各自接一次、按当前主元素取值（见 attachPairSpectrum）
       swapSpectrum?.(pair.active);
     };
-    pair.onFallback = () => reportDiag(rt, cfg, "media video: 无缝循环兜底（退回原生 loop）");
+    pair.onFallback = () => reportDiag(rt, cfg, "media video: 无缝循环兜底（退回原生 loop）", "warn");
     (rt.videoPairs ??= []).push(pair);
     // A/B 路径 = 有声/回退形态；重新静音时允许切回 WebCodecs 静音循环
     // （mount.ts setVolume 在音量归 0 时读这个标记重挂）。WebCodecs 解码失败
@@ -881,7 +883,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
     // 打点跟着主元素走：交接后读新主元素，否则每圈换手都会静默 400ms 被判定为已停
     pumpFrames(() => pair.active);
     if (!rt.paused) pair.resume();
-    reportDiag(rt, cfg, "media video → DOM 直显（A/B 无缝循环）");
+    reportDiag(rt, cfg, "media video → DOM 直显（A/B 无缝循环）", "info");
   };
 
   // 优先 WebCodecs 逐帧调度（静音循环场景）：循环点帧级精确、没有元素级
@@ -899,7 +901,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       pathActive = false;
       player?.destroy();
       player = null;
-      reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`);
+      reportDiag(rt, cfg, `media video: ${why}，回退 A/B <video>`, "warn");
       mountAbPair();
       // [遮挡审计 P1 修复] 下面（mountWebCodecsVideo 之后）会把 rt.sceneCtl 换成
       // 「只认闭包 player」的 WebCodecs 实现；player 已在上面销毁 → 它的
@@ -933,7 +935,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       renderDpr: cfg.renderDpr,
       onFirstFrame: signalFirstFrame,
       onFrame: () => markFrame(rt, performance.now()),
-      onDiag: (m) => reportDiag(rt, cfg, `media video(webcodecs): ${m}`),
+      onDiag: (m) => reportDiag(rt, cfg, `media video(webcodecs): ${m}`, classifyDiag(m)),
       onFatal: (why) => fallbackToAb(`WebCodecs 路径失败（${why}）`, false),
     });
     // 暂停/恢复走 sceneCtl（与场景路径同一套钩子，mount.ts 统一调用）
@@ -961,7 +963,7 @@ export function mountVideoDom(rt: Runtime, cfg: WallpaperConfig) {
       player = null;
     });
     rt.canvas = player.canvas;
-    reportDiag(rt, cfg, "media video → WebCodecs 逐帧调度（静音循环）");
+    reportDiag(rt, cfg, "media video → WebCodecs 逐帧调度（静音循环）", "info");
     return;
   }
 

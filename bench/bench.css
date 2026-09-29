@@ -1027,6 +1027,10 @@ select:hover {
   color: var(--danger);
 }
 
+#logbody .warn {
+  color: var(--warn);
+}
+
 /* ---------- 状态栏 ---------- */
 
 #statusbar {
