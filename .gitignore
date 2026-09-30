@@ -37,3 +37,5 @@ article-promo.md
 .zcode/
 docs/
 renderer/vendor/we-scene/README.md
+# pnpm 本地存储
+.pnpm-store/
