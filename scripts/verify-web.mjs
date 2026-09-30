@@ -1152,6 +1152,54 @@ function runShim(extras, opts) {
     void w2.fetch("js/main.js");
     check(fetched === "js/main.js", "fetch 里没逃逸的相对 URL 保持原样", fetched);
   }
+
+  // 宿主显式声明的站点根（window.__weSiteRoot）：站点形态不止 /web/<token>/<itemId>/
+  // 一种 —— dsh-wallpaper-engine 是 /wallpaper-engine/scene-files/<token>/，段位识别
+  // 认不出它，只能靠宿主在注入 shim 前声明。声明优先、非法回落段位识别，两条都要判。
+  {
+    const entry = "http://127.0.0.1:5150/wallpaper-engine/scene-files/abc123/index.html";
+    const shimDoc = (baseURI) => ({
+      readyState: "complete",
+      addEventListener() {},
+      documentElement: { setAttribute() {}, getAttribute() { return null; } },
+      querySelectorAll() {
+        return [];
+      },
+      baseURI,
+    });
+    const { win: w3 } = runShim({ document: shimDoc(entry), location: { href: entry, protocol: "http:" } });
+    w3.__weSiteRoot = "/wallpaper-engine/scene-files/abc123/";
+    check(
+      w3.__weRewriteFileUrl("../assets/8k/CH0334_home.skel") ===
+        "http://127.0.0.1:5150/wallpaper-engine/scene-files/abc123/assets/8k/CH0334_home.skel",
+      "声明了站点根后，段位识别认不出的形态（/scene-files/<token>/）也夹回条目目录",
+    );
+    check(w3.__weRewriteFileUrl("js/main.js") === "js/main.js", "声明形态下没逃逸的相对 URL 同样原样返回");
+    check(
+      w3.__weRewriteFileUrl("../../etc/passwd") === "http://127.0.0.1:5150/wallpaper-engine/scene-files/abc123/etc/passwd",
+      "声明形态下多级 .. 同样逐级丢弃在声明根上",
+    );
+    // 声明缺省 / 非法 ⇒ 必须回落段位识别，而不是整层失效
+    const { win: w4 } = runShim({ document: shimDoc(entry), location: { href: entry, protocol: "http:" } });
+    check(w4.__weRewriteFileUrl("../assets/x.skel") === "../assets/x.skel", "没有声明时该形态不夹（形态认不出，保持原样）");
+    for (const bad of [42, "", "scene-files/abc123/", {}]) {
+      const { win: w5 } = runShim({ document: shimDoc(entry), location: { href: entry, protocol: "http:" } });
+      w5.__weSiteRoot = bad;
+      check(w5.__weRewriteFileUrl("../assets/x.skel") === "../assets/x.skel", `非法声明（${JSON.stringify(bad)}）不得生效`);
+    }
+    const webShape = "http://localhost:1430/web/dev/999999/index.html";
+    const { win: w6 } = runShim({ document: shimDoc(webShape), location: { href: webShape, protocol: "http:" } });
+    w6.__weSiteRoot = 42; // 非法 ⇒ 段位识别仍要顶住
+    check(
+      w6.__weRewriteFileUrl("../assets/x.skel") === "http://localhost:1430/web/dev/999999/assets/x.skel",
+      "非法声明必须回落段位识别（/web/ 形态照旧夹住）",
+    );
+    // 声明根内的子目录入口：`../` 是根内的合法上一级，不得改写（声明的无尾斜杠要归一）
+    const subEntry = "http://127.0.0.1:5150/wallpaper-engine/scene-files/abc123/web/index.html";
+    const { win: w7 } = runShim({ document: shimDoc(subEntry), location: { href: subEntry, protocol: "http:" } });
+    w7.__weSiteRoot = "/wallpaper-engine/scene-files/abc123";
+    check(w7.__weRewriteFileUrl("../assets/x.skel") === "../assets/x.skel", "声明根内的 ../ 属于合法上一级，不得改写（无尾斜杠也归一）");
+  }
 }
 
 // ---------- 3c. 外部指针注入（桌面 underlay 通道的网页侧：合成 DOM 事件）----------
