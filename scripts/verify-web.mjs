@@ -1068,6 +1068,90 @@ function runShim(extras, opts) {
     win.__weRewriteFileUrl("file:///files/wallpaper.webm") === "file:///files/wallpaper.webm",
     "file: 协议页应保留 file:///（真本地嵌入）",
   );
+
+  // ---------- 站点根夹住：相对 URL 逃出 /web/<token>/<itemId>/ 时按官方语义夹回根 ----------
+  //
+  // 官方把壁纸目录当**站点根**（一壁纸一站点，`..` 解析到根即丢弃）；本仓与
+  // WallpaperEM 的站点形态是 /web/<token>/<itemId>/…，条目目录比根深一层 ⇒
+  // 作者写的 `../assets/…` 会逃出条目目录落到 /web/<token>/assets/… → 404。
+  // 3650874083 / 3650880224（Blue Archive spine 网页壁纸）因此整页黑屏：
+  // `js/main.js` 里 skel/atlas 走 XHR、贴图走 Image.src，全是 `../assets/8k/…`，
+  // AssetManager 一个文件都拿不到 → `load()` 打着 Model assets not found 死循环、一帧不画。
+  {
+    const entry = "http://localhost:1430/web/dev/3650874083/index.html";
+    win.location = { href: entry, protocol: "http:" };
+    win.document.baseURI = entry;
+    check(
+      win.__weRewriteFileUrl("../assets/8k/CH0334_home.skel") ===
+        "http://localhost:1430/web/dev/3650874083/assets/8k/CH0334_home.skel",
+      "逃出站点根的 ../assets/… 应夹回条目目录（3650874083 黑屏根因）",
+    );
+    check(
+      win.__weRewriteFileUrl("../../etc/passwd") === "http://localhost:1430/web/dev/3650874083/etc/passwd",
+      "多级 .. 越过根的必须逐级丢弃（官方语义），不得逃到 /web/dev/",
+    );
+    check(win.__weRewriteFileUrl("js/main.js") === "js/main.js", "没逃逸的相对 URL 必须原样返回（连绝对化都不做）");
+    check(win.__weRewriteFileUrl("./assets/audio/x.ogg") === "./assets/audio/x.ogg", "./ 同样不改");
+    check(win.__weRewriteFileUrl("/js/main.js") === "/js/main.js", "根路径不经过本站点解析，不碰");
+    check(win.__weRewriteFileUrl("https://cdn.example/x.js") === "https://cdn.example/x.js", "跨源绝对 URL 不碰");
+    check(win.__weRewriteFileUrl("data:image/png;base64,AA") === "data:image/png;base64,AA", "data: 不碰");
+    // 入口在 <itemId>/web/index.html 时 `../` 是**合法**上一级，不得夹
+    const webEntry = "http://localhost:1430/web/dev/999999/web/index.html";
+    win.location = { href: webEntry, protocol: "http:" };
+    win.document.baseURI = webEntry;
+    check(
+      win.__weRewriteFileUrl("../assets/x.skel") === "../assets/x.skel",
+      "web/index.html 入口的 ../ 属于合法上一级，不得改写",
+    );
+    // file: 页没有 /web/<token>/<id> 形态，整套夹住必须不生效
+    win.location = { href: "file:///Users/me/wp/index.html", protocol: "file:" };
+    win.document.baseURI = "file:///Users/me/wp/index.html";
+    check(win.__weRewriteFileUrl("../assets/x.skel") === "../assets/x.skel", "file: 页不套站点根夹住");
+  }
+
+  // XHR / fetch 也要夹：spine 的 .skel/.atlas 是 XHR 下的、贴图按需走 fetch，
+  // 只挂元素 src/href 钩子修不到黑屏 —— 这两条必须各有一条行为判据。
+  {
+    let opened = null;
+    function FakeXHR() {}
+    FakeXHR.prototype.open = function (_m, url) {
+      opened = url;
+    };
+    let fetched = null;
+    const { win: w2 } = runShim({
+      XMLHttpRequest: FakeXHR,
+      fetch: function (u) {
+        fetched = typeof u === "string" ? u : u && u.url;
+        return Promise.resolve({ ok: true });
+      },
+      document: {
+        readyState: "complete",
+        addEventListener() {},
+        documentElement: { setAttribute() {}, getAttribute() { return null; } },
+        querySelectorAll() {
+          return [];
+        },
+        baseURI: "http://localhost:1430/web/dev/3650880224/index.html",
+      },
+    });
+    const x = new w2.XMLHttpRequest();
+    x.open("GET", "../assets/8k/CH0335_home.skel");
+    check(
+      opened === "http://localhost:1430/web/dev/3650880224/assets/8k/CH0335_home.skel",
+      "XHR.open 的 ../assets/… 必须被夹回条目目录（spine skel/atlas 下载入口）",
+      opened,
+    );
+    x.open("GET", "js/main.js");
+    check(opened === "js/main.js", "XHR 里没逃逸的相对 URL 保持原样", opened);
+    void w2.fetch("../assets/8k/x.png");
+    check(
+      fetched === "http://localhost:1430/web/dev/3650880224/assets/8k/x.png",
+      "fetch 的 ../assets/… 必须被夹回条目目录",
+      fetched,
+    );
+    void w2.fetch("js/main.js");
+    check(fetched === "js/main.js", "fetch 里没逃逸的相对 URL 保持原样", fetched);
+  }
 }
 
 // ---------- 3c. 外部指针注入（桌面 underlay 通道的网页侧：合成 DOM 事件）----------
