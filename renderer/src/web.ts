@@ -193,6 +193,19 @@ export function webSetMedia(rt: Runtime, init: Record<string, unknown> | null) {
   }
 }
 
+/**
+ * 宿主注入的媒体**控制面**（`__wp.setMediaControl`）：五个可选方法
+ * （play/pause/playPause/skipNext/skipPrevious），点击壁纸里的播放按钮时由
+ * scene-mount 的 mediaControl 打到它（控制反转，见 vendor/media-buttons.js）。
+ *
+ * **与 webSetMedia 分开是刻意的**：那是显示数据（按 hasMedia 换档、没在播时存
+ * null），控制面则要一直在位 —— 空播点「播放」得打到真实播放器。传 null 注销，
+ * 非法输入静默忽略（调用方是跨文档宿主，宁可少一个控制面也不能把渲染页打断）。
+ */
+export function webSetMediaControl(rt: Runtime, controls: Record<string, unknown> | null) {
+  rt.mediaHostCtl = controls && typeof controls === "object" ? controls : null;
+}
+
 /** 向网页壁纸 iframe 注入 GPU 降级（shim 已接管则跳过） */
 export function injectGpuThrottle(rt: Runtime, f: HTMLIFrameElement, _doc: Document) {
   const win = f.contentWindow;

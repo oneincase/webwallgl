@@ -191,6 +191,19 @@ export type Runtime = {
    */
   audioDisabled?: boolean;
   mediaDisabled?: boolean;
+  /**
+   * 宿主注入的**控制面**（`__wp.setMediaControl`）。
+   *
+   * 与 `mediaSource`（显示源）**刻意分开**：显示源按 `hasMedia` 换档，没在播时
+   * 根本不占驱动位（2388299037）；而控制要一直在位 —— 空播时点壁纸上的「播放」
+   * 得唤醒真实播放器（控制反转），不能掉到模拟源去切模拟曲目。iframe 宿主尤其
+   * 需要分开：数据面用 `setMedia(null)` 停掉时，控制面不该跟着消失。
+   *
+   * 五个方法全部可选（宿主可能只提供部分控制），选择与闸门在
+   * render/media-buttons.js 的 hasMediaControl / pickControlDriver。
+   * 与 mediaSource 同纪律：换壁纸不清空（装一次对之后所有场景生效）。
+   */
+  mediaHostCtl?: Record<string, unknown> | null;
   /** 当前生效的媒体控制面（mountScene 装配后写入；实例的 media 属性转发到它） */
   mediaCtl?: {
     readonly snapshot: unknown;

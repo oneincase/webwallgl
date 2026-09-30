@@ -33,7 +33,7 @@ import type { OcclusionPayload } from "./api/types";
 import { mountWallpaper } from "./dispatch";
 import { fileSource } from "./api/source";
 import { normalizeQuality, qualityFromQuery, type QualityOptions, type ResolvedQuality } from "./quality";
-import { weShimCall, weShimSend, webSetMedia } from "./web";
+import { weShimCall, weShimSend, webSetMedia, webSetMediaControl } from "./web";
 import type { WallpaperConfig, WallpaperFit } from "./types";
 
 // ---- 滤镜（beta）----
@@ -246,6 +246,16 @@ declare global {
        * 字段见 MediaSourceInit；未知字段忽略。
        */
       setMedia(init: Record<string, unknown> | null): void;
+      /**
+       * 媒体**控制面**（控制反转）：宿主提供真实播放器的控制方法
+       * （play / pause / playPause / skipNext / skipPrevious，任意子集）。
+       * 场景壁纸里 Now Playing 组件的按钮点击被推断成动作后打到这里
+       * （见 vendor/media-buttons.js），由宿主决定后端（媒体桥 / 播放器命令）。
+       *
+       * 与 `setMedia` **分开**：那是显示数据（没在播时存 null），控制面要一直在位
+       * —— 空播时点「播放」得唤醒真实播放器。传 null 注销。
+       */
+      setMediaControl(controls: Record<string, unknown> | null): void;
       /**
        * 遮挡推送（V5）：宿主枚举上层窗口矩形（换算到本窗口 CSS 像素）后推入，
        * 库按分档配置自动暂停/降帧/恢复（语义见 api/types.ts OcclusionPayload）。
@@ -485,6 +495,9 @@ window.__wp = {
   },
   setMedia(init: Record<string, unknown> | null) {
     webSetMedia(rt, init);
+  },
+  setMediaControl(controls: Record<string, unknown> | null) {
+    webSetMediaControl(rt, controls);
   },
   // 遮挡推送（V5）：与公共 API SceneInstance.setOcclusion 同一条推送管线
   // （shell.pushOcclusion 做分档/滞回/fail-open），A/B 视频对在这里补停启，

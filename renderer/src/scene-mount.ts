@@ -1077,8 +1077,16 @@ cfg, source, pkgAbort.signal);
       // 显示源按 hasMedia 排优先级（没在播不占驱动位，2388299037），但控制优先交给注入源
       // 本身 —— 没在播时点「播放」要能唤醒真实播放器（测试台 media-bridge / 宿主命令通道），
       // 而不是掉到模拟源去切模拟曲目。选择逻辑在 vendor/media-buttons.js（可离线判据）。
+      //
+      // 宿主控制面有两条注入路径，都要认：① `setMedia` 源自带控制方法（库 API 的
+      // MountOptions.media / 实例 setMedia）；② `__wp.setMediaControl` **单独**注入
+      //（iframe 宿主的数据面与控制面生命周期不同：setMedia(null) 之后控制仍在位）。
+      const injectedControlSource = (): any => {
+        if (mediaButtons.hasMediaControl(rt.mediaSource)) return rt.mediaSource;
+        return mediaButtons.hasMediaControl(rt.mediaHostCtl) ? rt.mediaHostCtl : null;
+      };
       const controlMediaDriver = (): any =>
-        mediaButtons.pickControlDriver(liveMediaOverride, rt.mediaSource, currentMediaDriver());
+        mediaButtons.pickControlDriver(liveMediaOverride, injectedControlSource(), currentMediaDriver());
       const callDriver = (name: "skipNext" | "skipPrevious" | "play" | "pause" | "playPause") => {
         const drv = controlMediaDriver();
         const fn = drv?.[name];

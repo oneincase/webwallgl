@@ -132,6 +132,11 @@ const REQUIRED_WP = [
   // 滚轮注入（含 macOS 触摸板双指滚动与捏合）。同样是静默失效类契约：
   // 宿主推了没人接，网页壁纸只是不响应滚轮。
   "pushWheel",
+  // 媒体集成两条：显示数据（`setMedia`）与控制面（`setMediaControl`）。iframe 宿主
+  // （dsh-wallpaper-engine）按名调用，缺失时静默 no-op —— 壁纸只是永远显示模拟曲目、
+  // 播放按钮点了没反应，没有任何报错。控制面是控制反转（壁纸按钮 → 真实播放器）的注入点。
+  "setMedia",
+  "setMediaControl",
 ];
 for (const name of REQUIRED_WP) {
   check(defined.has(name), `契约面：window.__wp.${name} 在 main.ts 里缺失（见 docs/INTEGRATION.md）`);

@@ -1920,7 +1920,9 @@ function sniffMediaType(url) {
 //   ① 推断只认组件按钮：真实语料 4 键 → 4 动作，名字闸门 + openUserShortcut
 //      锚点闸门各自能红（自带播放列表壁纸的 playerplay 绝不能被劫持）；
 //   ② 控制源选择**不读 snapshot.hasMedia**（空播点播放要打到注入源）；
-//   ③ scene-mount 真接线：click 派发循环调推断、callDriver 走 pickControlDriver。
+//   ③ scene-mount 真接线：click 派发循环调推断、callDriver 走 pickControlDriver，
+//      注入候选覆盖两条路径（`setMedia` 源自带控制方法 / `__wp.setMediaControl`
+//      单独注入 —— iframe 宿主的数据面与控制面生命周期不同，见 shell.ts 的说明）。
 {
   const EXPECT_NAMES = {
     PlayerPlayBold2: "play",
@@ -2055,8 +2057,15 @@ function sniffMediaType(url) {
       "dispatchCursor 的 click 派发循环必须调用媒体按钮推断（音乐控制接入的落点）",
     );
     check(
-      /mediaButtons\.pickControlDriver\(liveMediaOverride, rt\.mediaSource, currentMediaDriver\(\)\)/.test(smSrc),
+      /mediaButtons\.pickControlDriver\(liveMediaOverride, injectedControlSource\(\), currentMediaDriver\(\)\)/.test(smSrc),
       "控制源必须走 pickControlDriver（控制反转：实况注入 > 宿主注入 > 显示源）",
+    );
+    // 宿主控制面两条注入路径都要认（iframe 宿主用 setMediaControl 单独注入 ——
+    // setMedia(null) 之后控制仍在位是它的全部意义）：
+    check(
+      /mediaButtons\.hasMediaControl\(rt\.mediaSource\)/.test(smSrc) &&
+        /mediaButtons\.hasMediaControl\(rt\.mediaHostCtl\)/.test(smSrc),
+      "控制源候选必须覆盖 setMedia 源自带方法 + __wp.setMediaControl 单独注入两条路径",
     );
     check(
       /const drv = controlMediaDriver\(\);/.test(smSrc),
@@ -2074,6 +2083,21 @@ function sniffMediaType(url) {
       /mediaButtonsMod/.test(vendorSrc) && /, mediaButtons,/.test(vendorSrc),
       "vendor.ts 必须导出 mediaButtons（scene-mount 的取用点）",
     );
+    // 控制面的宿主注入面（iframe 宿主靠它接后端；缺失时按名调用静默 no-op）：
+    //   main.ts `__wp.setMediaControl` → web.ts `webSetMediaControl` → shell.ts `mediaHostCtl`。
+    const wSrc = fs.readFileSync(join(ROOT, "renderer/src/web.ts"), "utf8");
+    const mSrc = fs.readFileSync(join(ROOT, "renderer/src/main.ts"), "utf8");
+    const shSrc = fs.readFileSync(join(ROOT, "renderer/src/shell.ts"), "utf8");
+    check(
+      /export function webSetMediaControl/.test(wSrc) && /rt\.mediaHostCtl =/.test(wSrc),
+      "web.ts 必须提供 webSetMediaControl（写入 mediaHostCtl）",
+    );
+    check(
+      /setMediaControl\(controls: Record<string, unknown> \| null\): void;/.test(mSrc) &&
+        /setMediaControl\(controls: Record<string, unknown> \| null\) \{\s*webSetMediaControl\(rt, controls\);/.test(mSrc),
+      "main.ts 必须暴露 __wp.setMediaControl（契约面，见 verify-arch 的 REQUIRED_WP）",
+    );
+    check(/mediaHostCtl\?:/.test(shSrc), "shell.ts 必须声明 Runtime.mediaHostCtl（控制面存档位）");
   }
 }
 
