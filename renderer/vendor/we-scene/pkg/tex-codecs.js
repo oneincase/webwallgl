@@ -2,7 +2,10 @@
 // [we-scene patch] 容器解析（texture.js 的 parseTex）与像素解码是两类依赖：
 // 本文件是纯数据→纯数据的编解码库（含 LZ4 解压），Node 直载。
 // TEXTURE_FORMATS / FIF 是格式元数据表、u32/i32/f32 是两侧共用的小原语，
-// 放在这里保持依赖单向：texture.js → tex-codecs.js，无环。
+// 放在这里保持依赖单向：texture.js → tex-codecs.js → limits.js，无环。
+// （limits.js 是零依赖的边界常量与断言；接进这条链是为了让 LZ4 的**分配点**
+//   自己也有一道闸门，而不是只靠调用方在解析期挡。）
+import { assertDecodeSize } from './limits.js'
 export const TEXTURE_FORMATS = {
   0: 'ARGB8888',
   1: 'RGB888',
@@ -384,6 +387,10 @@ export function lazyLz4Mip(width, height, raw, uncompressedSize) {
 }
 
 export function lz4Decompress(src, outSize) {
+  // 闸门：outSize 是素材声明值（.tex 的 uncompressedSize，i32）。负值 → 旧实现抛
+  // 「Invalid typed array length」这种没有上下文的 RangeError；超大值 → 一次 GB 级
+  // 虚拟保留（真正吃内存的是随后的解压写入）。上界由真实语料标定：最大 256MB。
+  assertDecodeSize(outSize, 'LZ4')
   const out = new Uint8Array(outSize)
   let ip = 0
   let op = 0

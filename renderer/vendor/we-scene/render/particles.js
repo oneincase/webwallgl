@@ -3,6 +3,7 @@
 import { TAU, rand, randExp, parseVec, parseRandomVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
 import { buildParticleProgram } from './particle-shaders.js'
 import { audioResponse } from './audio.js'
+import { MAX_SEQUENCE_MUL } from '../pkg/limits.js'
 
 // [we-scene patch] 粒子质量倍率（性能设置面板「粒子」档）：同时缩 maxcount 上限
 // 与发射率，语义与 instanceoverride 的 count 倍率一致（见 _applyOverride 注释）。
@@ -248,7 +249,10 @@ export class ParticleSystem {
     // 序列帧（sprite sheet）。优先用贴图 TEXS 段里的**真实帧矩形**；
     // 只有在贴图没有 TEXS 时才退回按 sequencemultiplier 猜 N×N 方格
     // （猜测对横排/竖排的 sheet 是错的，会采样到跨帧的错位图块）。
-    this.sequenceMul = Math.max(1, Math.round(num(this.model.sequencemultiplier, 1)))
+    // 上界由真实语料标定（344 个包 / 208 个用到该字段，实测 max 500）—— 取 4096 是
+    // 8× 余量、真实素材零改动；只约束 frameCount 的算术量级，不改采样语义
+    // （frameCount 仍等于 N²，见 pkg/limits.js 的 MAX_SEQUENCE_MUL 说明）。
+    this.sequenceMul = Math.max(1, Math.min(MAX_SEQUENCE_MUL, Math.round(num(this.model.sequencemultiplier, 1))))
     this.animationMode = this.model.animationmode || null
     this.texFrames = null // 由 setTexture 填充
     this.frameCount = this.sequenceMul * this.sequenceMul
@@ -2330,8 +2334,15 @@ export class ParticleSystem {
     if (!list && this.sequenceMul > 1) {
       const n = this.sequenceMul
       list = []
-      for (let r = 0; r < n; r++)
-        for (let c = 0; c < n; c++) list.push({ ou: c / n, ov: r / n, su: 1 / n, sv: 1 / n })
+      // 只造「消费端读得到的那几项」：uniform 数组是 u_frames[128]，下面是
+      // `cap = Math.min(list.length, 128)`，所以 N×N 里第 129 项之后永远无人读取。
+      // 语料里 N 最大 500（= 25 万项），按 128 截断后**输出逐字节相同**，
+      // 但把「素材可控字段 → 分配量」这条路封死了（未截断时 N 可被构造成 DoS：
+      // 实测 N=100000 时这里要造 1e10 个对象 / 273 秒，见 docs/ENGINE-REVIEW-2026-10.md §9.2）。
+      const frameCap = 128
+      for (let r = 0; r < n && list.length < frameCap; r++)
+        for (let c = 0; c < n && list.length < frameCap; c++)
+          list.push({ ou: c / n, ov: r / n, su: 1 / n, sv: 1 / n })
     }
     if (!list || list.length === 0) {
       this._frameData = null

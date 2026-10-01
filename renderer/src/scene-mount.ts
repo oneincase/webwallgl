@@ -1921,7 +1921,9 @@ cfg, source, pkgAbort.signal);
           }
           return null;
         }
-        const parsedTex = tex.parseTex(texEntry);
+        // name 带进解析器：越界/畸形素材的报错要能直接指到是哪张 .tex
+        // （否则只有计数与 img/mip 序号，见 renderer/vendor/we-scene/pkg/limits.js）
+        const parsedTex = tex.parseTex(texEntry, { name: `materials/${name}.tex` });
         // [we-scene patch] 多图 .tex（GIF 导入模板 843532366 等）：WE 把动图逐帧
         // 编译成多个 image（每张 POT 画布 2048x1024，内容在左上
         // textureWidth x textureHeight）。WE 桌面端轮播这些 image 实现动画。

@@ -4,6 +4,7 @@
 //   tex-codecs.js  格式表 + mip 解码 + 像素编解码 + LZ4 + u32/i32/f32 原语
 //   texture.js     本文件：.tex 容器解析（parseTex）+ 公共出口（re-export）
 import { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, lazyLz4Mip, u32, i32, f32 } from './tex-codecs.js'
+import { TEX_LIMITS, assertCount, assertDims, assertPayload, assertDecodeSize } from './limits.js'
 
 /** FreeImage 容器的魔数（用于「变体布局」的载荷自校验，见 mip 记录那段注释） */
 const FREE_IMAGE_MAGIC = {
@@ -13,11 +14,15 @@ const FREE_IMAGE_MAGIC = {
   [FIF.WEBP]: [0x52, 0x49, 0x46, 0x46],
 }
 
-export function parseTex(buf) {
+export function parseTex(buf, opts = {}) {
+  // opts.name：装配层知道文件名，带上后越界报错能直接指到素材。缺省时错误里只有
+  // 计数/尺寸与 img/mip 序号 —— 比原来那句没有上下文的 RangeError 强，但仍不如带名。
+  const name = typeof opts.name === 'string' && opts.name ? opts.name : ''
+  const at = (suffix) => (name ? name + (suffix || '') : (suffix || 'tex'))
   let p = 0
   const magic1 = asciiTex(buf, p, 9)
   p += 9
-  if (magic1 === 'TEXV0004\0') return parseTexV4(buf)
+  if (magic1 === 'TEXV0004\0') return parseTexV4(buf, { name })
   if (magic1 !== 'TEXV0005\0') throw new Error('不是 .tex 文件: ' + magic1)
   const magic2 = asciiTex(buf, p, 9)
   p += 9
@@ -56,6 +61,10 @@ export function parseTex(buf) {
   p += 9
   const imageCount = u32(buf, p)
   p += 4
+  // 闸门：imageCount 是纯 u32 字段（实测语料 7647 张 max 8）。没有它，截断文件会让
+  // 这个 for 空转到 4e9 次 —— u32 越界读返回 0 ⇒ mipCount=0 ⇒ 每轮只 push 一个空数组，
+  // 内存涨到 GB 级后进程被 OOM 杀掉（实测 4.6s，见 pkg/limits.js 头注）。
+  assertCount('imageCount', imageCount, TEX_LIMITS.maxImages, at(''))
 
   let freeImageFormat = FIF.UNKNOWN
   let containerVersion = 0
@@ -97,6 +106,8 @@ export function parseTex(buf) {
   for (let i = 0; i < imageCount; i++) {
     const mipCount = u32(buf, p)
     p += 4
+    // 闸门：与 imageCount 同源（实测语料 max 12），无它同样会空转到 4e9 次
+    assertCount('mipCount', mipCount, TEX_LIMITS.maxMips, at('[img' + i + ']'))
     const mips = []
     for (let m = 0; m < mipCount; m++) {
       if (containerVersion === 4) {
@@ -109,6 +120,7 @@ export function parseTex(buf) {
       p += 4
       const mh = u32(buf, p)
       p += 4
+      assertDims(mw, mh, at('[img' + i + '/mip' + m + ']'))
       // [we-scene patch] `flags & 0x40` 的导出器（WE 自带颜色分级 LUT，28/28 个
       // `materials/lut/*.tex`）**在每条 mip 记录前也多写一个 u32**（头部同样多一个，
       // 见上面的容器定位）。按标准布局读会把 `lz4_compressed` 读成 32、`src_size`
@@ -150,6 +162,11 @@ export function parseTex(buf) {
         p = buf.length
         continue
       }
+      // 载荷闸门：负的 compressedSize（i32 误读/畸形）旧实现会让 p 回退、subarray 静默变空，
+      // 循环继续迭代到下一个垃圾记录。越界与负值这里一律抛，并带上文件名与 img/mip。
+      const mipWhere = at('[img' + i + '/mip' + m + ']')
+      if (containerVersion >= 2 && compression === 1) assertDecodeSize(uncompressedSize, mipWhere)
+      assertPayload(p, compressedSize, buf.length, mipWhere)
       if (compression === 0) uncompressedSize = compressedSize
       const raw = buf.subarray(p, p + compressedSize)
       p += compressedSize
@@ -313,7 +330,9 @@ export function parseTex(buf) {
  * 判据：verify-textures【TEXV0004 旧容器】—— 合成文件按此布局打包必须解析出
  * 与 TEXV0005 路径相同的字段与像素；真实语料（本机这五张）必须解析出 2048²/512²。
  */
-function parseTexV4(buf) {
+function parseTexV4(buf, opts = {}) {
+  const name = typeof opts.name === 'string' && opts.name ? opts.name : ''
+  const at = (suffix) => (name ? name + (suffix || '') : (suffix || 'tex'))
   let p = 9
   const format = u32(buf, p); p += 4
   const flags = u32(buf, p); p += 4
@@ -322,12 +341,15 @@ function parseTexV4(buf) {
   const width = u32(buf, p); p += 4
   const height = u32(buf, p); p += 4
   const imageCount = u32(buf, p); p += 4
+  // 闸门：与 V5 同源（V4 已有越界抛错，但计数本身仍无上界）
+  assertCount('imageCount', imageCount, TEX_LIMITS.maxImages, at(''))
   const images = []
   for (let i = 0; i < imageCount; i++) {
     if (p + 12 > buf.length) throw new Error('TEXV0004 mip 记录越界 @' + i)
     const mw = u32(buf, p); p += 4
     const mh = u32(buf, p); p += 4
     const size = u32(buf, p); p += 4
+    assertDims(mw, mh, at('[img' + i + ']'))
     if (p + size > buf.length) throw new Error('TEXV0004 载荷越界 @' + i)
     images.push([{ width: mw, height: mh, compression: 0, data: buf.subarray(p, p + size) }])
     p += size

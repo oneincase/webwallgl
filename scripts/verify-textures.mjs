@@ -29,6 +29,87 @@ function check(ok, msg) {
   }
 }
 
+// ─────────────────────── 解析闸门（pkg/limits.js）的用例 ───────────────────────
+// 最小 TEXV0005 / TEXI0001 / TEXB0003 容器，字段全由参数决定（缺省是合法文件）。
+// 布局与 pkg/texture.js 的 TEXB0003 分支逐字段对应：TEXB magic 落在 46（扫描窗口
+// 34..64 内命中），imageCount 在 55，freeImageFormat 在 59，mip 记录从 63 起。
+function buildTexV5({ imageCount = 1, mipCount = 1, mw = 4, mh = 4, compression = 0, uncompressedSize = 0, compressedSize = 0, payload = Buffer.alloc(0), flags = 0, truncate = 0 } = {}) {
+  const head = Buffer.alloc(46);
+  head.write("TEXV0005\0", 0, "latin1");
+  head.write("TEXI0001\0", 9, "latin1");
+  head.writeUInt32LE(0, 18); // format
+  head.writeUInt32LE(flags, 22);
+  head.writeUInt32LE(4, 26); // textureWidth
+  head.writeUInt32LE(4, 30); // textureHeight
+  head.writeUInt32LE(4, 34); // width（containerOffset-12）
+  head.writeUInt32LE(4, 38); // height（containerOffset-8）
+  head.writeUInt32LE(0, 42); // ignored
+  const body = Buffer.alloc(17);
+  body.write("TEXB0003\0", 0, "latin1");
+  body.writeUInt32LE(imageCount, 9);
+  body.writeUInt32LE(0, 13); // freeImageFormat
+  const mip = Buffer.alloc(24);
+  mip.writeUInt32LE(mipCount, 0);
+  mip.writeUInt32LE(mw, 4);
+  mip.writeUInt32LE(mh, 8);
+  mip.writeUInt32LE(compression, 12);
+  mip.writeInt32LE(uncompressedSize, 16);
+  mip.writeInt32LE(compressedSize, 20);
+  const all = Buffer.concat([head, body, mip, payload]);
+  return truncate ? all.subarray(0, truncate) : all;
+}
+
+/**
+ * id → { buf 工厂, want：错误文案里必须出现的片段, 可选的 ok：true 表示**不该**抛 }
+ *
+ * 两类用例分开：
+ *   · 边界契约（imageCount-65 / mipCount-33 / dims-boundary-ok）——**逐闸门**可变异：
+ *     摘掉哪道闸门，只有它自己那几条会红。这是判据的主力。
+ *   · 失控终态（*-huge 系列）——验的是「闸门链整体兜得住」，单摘一道仍会被别的
+ *     闸门拦住（实测：摘掉 imageCount 后 *-huge 仍绿），所以它**不能**当逐闸门的判据。
+ *     顺带记录一条事实：加了载荷/尺寸断言后，每轮至少推进 16 字节且载荷不得越界，
+ *     循环本身就必然终止 —— 计数闸门是冗余的早期拦截层（更早、报错更清楚），
+ *     不是唯一的终止保证。
+ */
+const LIMIT_CASES = [
+  // imageCount 系用例都带一条**合法**的尾随 mip 记录：这样摘掉 imageCount 闸门后，
+  // 第 1 轮能正常解析、第 2 轮才会撞上别的闸门，报错文案里就没有「imageCount」→ 判红。
+  // （若尾随记录不合法，别的闸门会在第 1 轮先抛，这条用例就永远绿，等于没测。）
+  { id: "imageCount-65", want: "imageCount", buf: () => buildTexV5({ imageCount: 65, mipCount: 1, mw: 4, mh: 4, compressedSize: 0 }) },
+  { id: "imageCount-huge", want: "imageCount", buf: () => buildTexV5({ imageCount: 0xffffffff, mipCount: 1, mw: 4, mh: 4, compressedSize: 0 }) },
+  { id: "imageCount-zero", want: "imageCount", buf: () => buildTexV5({ imageCount: 0, mipCount: 0 }) },
+  { id: "mipCount-33", want: "mipCount", buf: () => buildTexV5({ imageCount: 1, mipCount: 33 }) },
+  { id: "mipCount-huge", want: "mipCount", buf: () => buildTexV5({ imageCount: 1, mipCount: 0xffffffff }) },
+  { id: "mipCount-zero", want: "mipCount", buf: () => buildTexV5({ imageCount: 1, mipCount: 0 }) },
+  { id: "mip-dims-zero", want: "mip 尺寸", buf: () => buildTexV5({ mw: 0, mh: 4 }) },
+  { id: "mip-dims-axis", want: "单轴", buf: () => buildTexV5({ mw: 20000, mh: 4 }) },
+  { id: "mip-dims-pixels", want: "像素数", buf: () => buildTexV5({ mw: 16384, mh: 16384 }) },
+  // 边界下侧：恰好 16384×8192 = 1<<27 = maxPixels，必须**放行**（上界是含端点）
+  { id: "dims-boundary-ok", ok: true, buf: () => buildTexV5({ mw: 16384, mh: 8192, compressedSize: 0 }) },
+  { id: "payload-negative", want: "载荷长度", buf: () => buildTexV5({ compressedSize: -1 }) },
+  { id: "payload-overrun", want: "载荷越界", buf: () => buildTexV5({ compressedSize: 9999 }) },
+  { id: "lz4-negative", want: "解压目标尺寸", buf: () => buildTexV5({ compression: 1, uncompressedSize: -1, compressedSize: 4, payload: Buffer.alloc(4) }) },
+  { id: "lz4-huge", want: "解压目标尺寸", buf: () => buildTexV5({ compression: 1, uncompressedSize: 0x7fffffff, compressedSize: 4, payload: Buffer.alloc(4) }) },
+];
+
+// 闸门用例的**子进程模式**：危险的畸形输入不能在 verifier 进程里跑 —— 闸门一旦被移除，
+// imageCount=0xFFFFFFFF 会把 verifier 自己拖到 OOM（实测 4.6s SIGABRT），报错还会长成
+// 「进程被杀」这种看不出根因的样子。所以放到子进程（小堆 + 硬超时）里：
+// 闸门在 → 每个用例立即抛且带上下文；闸门没了 → 子进程超时/OOM，父进程明确判失败。
+if (process.argv.includes("--limits-child")) {
+  const { parseTex } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+  for (const c of LIMIT_CASES) {
+    let msg = null;
+    try {
+      parseTex(c.buf(), { name: "probe.tex" });
+    } catch (e) {
+      msg = String((e && e.message) || e);
+    }
+    console.log(JSON.stringify({ id: c.id, threw: msg !== null, msg }));
+  }
+  process.exit(0);
+}
+
 async function bundleTexDecode() {
   const out = await build({
     entryPoints: [join(ROOT, "renderer/src/tex-decode.ts")],
@@ -1450,7 +1531,73 @@ async function builtinPatterns() {
   check(/patTex\.setPatternTextureProvider/.test(la), "local-assets 必须给纹样装 provider（本机官方像素覆盖）");
 }
 
+// ─────────────── [6] 解析闸门：素材可控计数/尺寸/载荷必须有上界 ───────────────
+// 依据：docs/ENGINE-REVIEW-2026-10.md §2.2 —— imageCount / mipCount 未加约束时，
+// 一个几十字节的畸形 .tex 就能让解析器空转到 OOM（实测 4.6s SIGABRT）。
+// 上界由真实语料标定（见 renderer/vendor/we-scene/pkg/limits.js 头注），
+// 所以本节既查「畸形必须被拦」，也查「合法文件不得被误伤」。
+async function texLimits() {
+  console.log("\n[6] 解析闸门：imageCount/mipCount/尺寸/载荷（pkg/limits.js）");
+  const { parseTex } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+
+  // 正例：合法文件照旧解析
+  let happy = null;
+  try {
+    const t = parseTex(buildTexV5({ compressedSize: 4, payload: Buffer.alloc(4) }));
+    happy = t.images.length === 1 && t.images[0].length === 1 && t.images[0][0].width === 4;
+  } catch (e) {
+    happy = "异常 " + e.message;
+  }
+  check(happy === true, `合法 .tex 必须照旧解析（闸门不得误伤，实得 ${happy}）`);
+
+  // 正例：报错要能指到素材（装配层传 name）
+  let named = "";
+  try {
+    parseTex(buildTexV5({ compressedSize: -1 }), { name: "materials/x.tex" });
+  } catch (e) {
+    named = e.message;
+  }
+  check(named.includes("materials/x.tex"), `越界报错必须带文件名（实得：${named || "（无异常）"}）`);
+
+  // 危险用例在子进程里跑：闸门被移除时子进程会 OOM/超时，这里要能识别成"闸门缺失"
+  const { spawnSync } = await import("node:child_process");
+  const r = spawnSync(
+    process.execPath,
+    ["--max-old-space-size=256", fileURLToPath(import.meta.url), "--limits-child"],
+    { timeout: 20000, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+  );
+  const got = new Map();
+  for (const line of (r.stdout || "").split("\n")) {
+    const s = line.trim();
+    if (!s.startsWith("{")) continue;
+    try {
+      const o = JSON.parse(s);
+      got.set(o.id, o);
+    } catch {
+      /* 半行截断，忽略 */
+    }
+  }
+  const missing = LIMIT_CASES.filter((c) => !got.has(c.id)).map((c) => c.id);
+  check(
+    missing.length === 0,
+    `闸门子进程必须为每个用例产出结果（缺 ${missing.length} 项：${missing.join(",") || "无"}；signal=${r.signal || "-"} exit=${r.status} —— 缺项通常意味着闸门被移除）`,
+  );
+  for (const c of LIMIT_CASES) {
+    const o = got.get(c.id);
+    if (!o) continue;
+    if (c.ok) {
+      check(!o.threw, `${c.id}：边界内的合法值必须放行（实得异常：${String(o.msg || "").slice(0, 88)}）`);
+    } else {
+      check(
+        o.threw && String(o.msg || "").includes(c.want),
+        `${c.id}：必须抛出含「${c.want}」的错误（实得 threw=${o.threw} msg=${String(o.msg || "").slice(0, 88)}）`,
+      );
+    }
+  }
+}
+
 await builtinPatterns();
+await texLimits();
 
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);
