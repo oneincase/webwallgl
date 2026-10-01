@@ -414,6 +414,17 @@ export type MountOptions = {
   mountTimeoutMs?: number;
 
   /**
+   * 调试钩子开关（默认 **关**）。
+   *
+   * 引擎侧有三个「改渲染行为」的手工排障开关：`__noMaterialProps`（材质文档不解析）、
+   * `__noBuiltinMatTint`（跳过内置 material tint）、`__shaderPatch`（按名改写 shader 源）。
+   * 壁纸页（`main.ts` 的全屏形态）默认允许它们 —— 那是既有排障工作流；但**库实例默认关**：
+   * 库嵌进宿主页时，宿主页面上的同名全局不该能静默改变渲染（也不该被误当成配置读）。
+   * 库调用方要复现这些 A/B 就显式传 `debugHooks: true`。
+   */
+  debugHooks?: boolean;
+
+  /**
    * 遮挡分档配置（V5，可选）。宿主用 `setOcclusion()` 推遮挡矩形时按这套
    * 阈值分档（暂停 / 降帧 / 全量）；缺省全默认（见 OcclusionBands）。
    * 传 `false` 显式关闭：之后 `setOcclusion()` 静默无效（什么都不改）。

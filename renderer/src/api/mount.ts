@@ -269,6 +269,8 @@ export function createScene(
   };
 
   const wireOptions = (o: MountOptions) => {
+    // 库实例默认**不**读宿主页上的调试全局（见 MountOptions.debugHooks 的说明）
+    rt.debugHooks = o.debugHooks === true;
     rt.onDiagnostic = (msg, level) => {
       try {
         o.onDiagnostic?.(msg, level);

@@ -1,5 +1,5 @@
 // 场景壁纸：mountScene 装配全链路（parse → assets → rAF）。
-import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
+import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, ownSceneDebugGlobals, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
 import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
@@ -318,11 +318,24 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   }
   rt.canvas = c;
   let disposed = false;
+  /**
+   * 调试钩子开关（§3.4）：页面形态（fullscreen）默认开 —— 那是既有的手工排障工作流；
+   * **库实例默认关** —— 库嵌进宿主页时，宿主上的同名全局不该能静默改渲染
+   * （`__shaderPatch` 能改写 shader 源，`__noMaterialProps`/`__noBuiltinMatTint` 改材质）。
+   * 库调用方要复现 A/B 就传 MountOptions.debugHooks。
+   */
+  const hooksOn = () => (rt.debugHooks ?? rt.fullscreen) === true;
   // [we-scene patch] 挂载期 console.warn → diag 桥：效果 pass 编译失败等渲染端
   // 告警只走 console.warn（CDP 看不见、vite 日志也收不到），排错全靠盲猜。
   // 桥接 [we-scene] 前缀到 reportDiag，卸载时还原。
-  const origWarn = console.warn.bind(console);
-  console.warn = (...args: unknown[]) => {
+  // [we-scene patch] 补丁必须**可嵌套、可乱序卸载**（§3.4）：多实例时后挂的实例在前一个的
+  // 补丁之上再包一层。原先卸载一律 `console.warn = origWarn`：
+  //   · 先挂的先卸载 → 把后挂实例的补丁一起摘掉（它从此失去 [we-scene] 桥）；
+  //   · 旧实例的补丁还会把新实例的日志上报到旧 rt。
+  // 现在：还原只在自己仍是**栈顶**时做；已卸载的那层直接透传（disposed 早退）。
+  const prevWarn = console.warn;
+  const myWarn = (...args: unknown[]) => {
+    if (disposed) return prevWarn(...args);
     const s = args
       .map((a) => (typeof a === "string" ? a : String((a as Error)?.message ?? a)))
       .join(" ");
@@ -330,10 +343,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       try {
         reportDiag(rt, cfg, s.slice(0, 300), classifyDiag(s));
       } catch {
-        
+        /* 忽略 */
       }
     }
-    origWarn(...args);
+    prevWarn(...args);
   };
   const pkgAbort = new AbortController();
   // 粒子系统注册的 mousemove 监听（控制点跟随鼠标）；卸载时必须摘掉，
@@ -341,7 +354,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   let particleCleanup: (() => void) | undefined;
   rt.sceneCleanup = () => {
     disposed = true;
-    console.warn = origWarn;
+    // 只在**栈顶仍是自己**时还原；已被别人包在外面（或自己早已被绕过）就别动，
+    // 否则会把还活着的实例的补丁摘掉。
+    if (console.warn === myWarn) console.warn = prevWarn;
     pkgAbort.abort();
     rt.sceneTextUpdate = undefined;
     if (particleCleanup) {
@@ -488,7 +503,7 @@ cfg, source, pkgAbort.signal);
        */
       const materialDocs: any[] = [];
       // A/B 钩子：__noMaterialProps=true 回到改动前行为（材质文档完全不解析）
-      const noMaterialProps = (globalThis as any).__noMaterialProps === true;
+      const noMaterialProps = hooksOn() && (globalThis as any).__noMaterialProps === true;
       const registerMaterialDoc = (doc: any) => {
         if (noMaterialProps || !doc || typeof doc !== "object") return doc;
         materialDocs.push(doc);
@@ -532,7 +547,7 @@ cfg, source, pkgAbort.signal);
        * 完全一致，材质色一个都没出现）。图层字段是所有路径的公共输入，一处即可。
        */
       const attachBuiltinMatTint = (layer: any, material: any) => {
-        if ((globalThis as any).__noBuiltinMatTint) return;
+        if (hooksOn() && (globalThis as any).__noBuiltinMatTint) return;
         if (!layer || layer.matTint) return;
         const pass0 = material && material.passes && material.passes[0];
         if (!pass0) return;
@@ -696,7 +711,7 @@ cfg, source, pkgAbort.signal);
         // 键可带或不带扩展名。把某个 pass 的输出染成纯色即可判定「这块像素是谁画的」——
         // 定位 2134765860 的纯白矩形时，正是靠它排除了 blur_combine / blend / 音频条
         // 三条线，最后才落到容器合成上。
-        const patch = (window as unknown as Record<string, any>).__shaderPatch;
+        const patch = hooksOn() ? (window as unknown as Record<string, any>).__shaderPatch : undefined;
         if (src && patch) {
           const key = file.replace(/\.(frag|vert|h)$/, "");
           const fn = patch[key] || patch[file];
@@ -5304,6 +5319,9 @@ cfg, source, pkgAbort.signal);
       // [we-scene patch] 调试出口：已加载的纹理表（排查「效果引用的贴图没进来 →
       // 落到 whiteTex → 遮罩恒为 1」这类问题）
       (window as unknown as Record<string, unknown>).__textures = textures;
+      // 探针归属登记：上面这一串（含 media/web 侧写的）刚由本实例写入，
+      // 卸载时**只有仍是自己名下**才删 —— 否则会把还活着的另一实例的调试面删掉（§3.4）。
+      ownSceneDebugGlobals(rt);
 
       // ---- WE 指针回调派发（cursorEnter/Leave/Move/Down/Up/Click）----
       // 全库 267 处挂钩 / 19 壁纸，是 WE 场景互动的主入口。

@@ -121,6 +121,14 @@ export type Runtime = {
    * 的首帧（docs/ENGINE-REVIEW-2026-10.md §3.3）。
    */
   gen?: number;
+  /** 页面形态（main.ts 的壁纸页）：调试钩子默认开、探针归属按实例记账 */
+  fullscreen?: boolean;
+  /**
+   * 调试钩子开关（`__noMaterialProps` / `__noBuiltinMatTint` / `__shaderPatch`）。
+   * 默认 = 页面形态（fullscreen）开、**库实例关** —— 库嵌进宿主页时不该把宿主的同名全局
+   * 当成配置读（宿主页面能靠它静默改变渲染），库调用方要调试就显式传 true。
+   */
+  debugHooks?: boolean;
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
   objectUrls?: string[];
   /** 场景内视频纹理元素（暂停并移除） */
@@ -401,6 +409,7 @@ export function createRuntime(opts?: { fullscreen?: boolean }): Runtime {
     frameMeter: { stamps: [], last: 0, fps: 0 },
     disposers: [],
     gen: 0,
+    fullscreen: opts?.fullscreen === true,
   };
   if (opts?.fullscreen) setupFullscreen(rt);
   return rt;
@@ -560,7 +569,7 @@ export function clear(rt: Runtime) {
   rt.occlusion = undefined;
   stopOcclusionTimer(rt);
   // 调试出口持有整张场景图与全部贴图的 CPU 侧缓冲，拆场景时一并清掉
-  clearSceneDebugGlobals();
+  clearSceneDebugGlobals(rt);
   resetFrameMeter(rt);
   // 按需渲染的静止心跳属于刚拆掉的那张壁纸：不清会让下一张（场景/视频）的
   // 观测面板继续显示「静止」。
@@ -1013,11 +1022,32 @@ const SCENE_DEBUG_GLOBALS = [
   "__mediaHooks", "__mediaControl", "__mediaStats", "__mediaSet", "__system",
   "__liveSystem", "__audioStats", "__audioMute", "__particleStats",
   "__particleToggle", "__pointerStats", "__compositeStats", "__compositeEnable",
+  // [we-scene patch] 2026-10 补漏：这 6 个同样往 window 写（实测逐点核对过），
+  // 原先不在表里 ⇒ 卸载后它们把场景图/沙箱/资源列表钉在宿主页上，
+  // 要等下一次同类壁纸挂载才被覆盖。
+  "__shared", "__effectScripts", "__memStats",
+  "__animEventsFired", "__animEventLog", "__localAssets",
 ] as const;
 
-function clearSceneDebugGlobals() {
+/**
+ * 探针当前的归属实例。多实例下「卸载 A」不能删掉 B 还在用的调试面 —— 原先
+ * clearSceneDebugGlobals() 是无条件全局 delete，A 一卸载 B 的 __scene/__textures 就没了
+ * （docs/ENGINE-REVIEW-2026-10.md §3.4）。
+ *
+ * 归属 = **最后一个写它的实例**：装配完成时登记，卸载时只有仍是自己名下才删。
+ */
+const probeOwner = new Map<string, Runtime>();
+
+/** 装配完成时调用：这些键的值刚由本实例写入，归属改记到本实例名下。 */
+export function ownSceneDebugGlobals(rt: Runtime) {
+  for (const k of SCENE_DEBUG_GLOBALS) probeOwner.set(k, rt);
+}
+
+function clearSceneDebugGlobals(rt: Runtime) {
   const w = window as unknown as Record<string, unknown>;
   for (const k of SCENE_DEBUG_GLOBALS) {
+    if (probeOwner.get(k) !== rt) continue; // 已被别的实例接管：不删（删了就是删别人的）
+    probeOwner.delete(k);
     if (k in w) delete w[k];
   }
 }
