@@ -35,6 +35,7 @@
 //   mdl.js       本文件：GPU 预算 + shader 源 + createMDLRenderer + 公共出口
 // 以下 re-export 维持既有 import 方（main.ts / verify-*.mjs）的路径不变。
 import { parseMDL } from './mdl-parse.js'
+import { linkProgram } from './gl-util.js'
 import { computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments } from './mdl-skin.js'
 import { IDENTITY } from './mdl-math.js'
 
@@ -391,36 +392,30 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
 }
 
 export function createMDLRenderer(gl) {
-  const compile = (type, src) => {
-    const s = gl.createShader(type)
-    gl.shaderSource(s, src)
-    gl.compileShader(s)
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-      throw new Error('MDL 着色器编译失败: ' + gl.getShaderInfoLog(s))
-    }
-    return s
-  }
-  // 按 GPU 上报的 uniform 预算编译；链接失败（驱动实际容量更小）时逐级减半重试
+  // 按 GPU 上报的 uniform 预算编译；链接失败（驱动实际容量更小）时逐级减半重试。
+  // 链接本身走 gl-util 的共享实现（B3 收敛）：原来这里有一份本地 compile + 内联链接，
+  // 失败路径还会漏 shader（编译出的两个 shader 没有任何引用可删）。
+  // 重试语义**必须原样保留** —— 它是骨预算的判据（verify-mdl-uniforms 覆盖）。
   let maxBones = boneBudget(gl)
   let prog = null
+  const ATTRIBS = [
+    [0, 'a_pos'],
+    [1, 'a_uv'],
+    [2, 'a_bone'],
+    [3, 'a_weight'],
+    [4, 'a_normal'],
+  ]
   for (;;) {
-    const p = gl.createProgram()
-    let linked = false
+    let p = null
     try {
-      gl.attachShader(p, compile(gl.VERTEX_SHADER, mdlVertSrc(maxBones)))
-      gl.attachShader(p, compile(gl.FRAGMENT_SHADER, MDL_FRAG))
-      gl.bindAttribLocation(p, 0, 'a_pos')
-      gl.bindAttribLocation(p, 1, 'a_uv')
-      gl.bindAttribLocation(p, 2, 'a_bone')
-      gl.bindAttribLocation(p, 3, 'a_weight')
-      gl.bindAttribLocation(p, 4, 'a_normal')
-      gl.linkProgram(p)
-      linked = !!gl.getProgramParameter(p, gl.LINK_STATUS)
+      p = linkProgram(gl, mdlVertSrc(maxBones), MDL_FRAG, { attribs: ATTRIBS })
     } catch (e) {
-      linked = false
+      p = null
     }
-    if (linked) { prog = p; break }
-    gl.deleteProgram(p)
+    if (p) {
+      prog = p
+      break
+    }
     if (maxBones <= MAX_BONES_FLOOR) {
       throw new Error('MDL 着色器链接失败（骨数已降到 ' + MAX_BONES_FLOOR + '）')
     }

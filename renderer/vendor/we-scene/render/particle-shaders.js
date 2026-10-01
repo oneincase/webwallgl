@@ -2,6 +2,7 @@
 // [we-scene patch] _buildProgram 的方法体只吃 gl 参数、不读实例状态，
 // 抽成自由函数后 Simulation 与 GPU 装配解耦（ParticleSystem.render 里的
 // this._prog 消费方不变）。
+import { linkProgram } from './gl-util.js'
 export function buildParticleProgram(gl) {
     const vs = `#version 300 es
 // 单位 quad（TRIANGLE_STRIP 4 顶点），按实例的 size/rot 展开为朝屏幕的精灵
@@ -143,18 +144,9 @@ void main(){
   }
   fragColor = col;
 }`
-    const compile = (type, src) => {
-      const s = gl.createShader(type)
-      gl.shaderSource(s, src)
-      gl.compileShader(s)
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('粒子 shader: ' + gl.getShaderInfoLog(s))
-      return s
-    }
-    const prog = gl.createProgram()
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs))
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs))
-    gl.linkProgram(prog)
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('粒子 shader 链接失败: ' + gl.getProgramInfoLog(prog))
+    // 共享链接器（B3 收敛）；attribs: [] = **不绑** —— 粒子 shader 自带
+    // `layout(location=…)` 声明属性位置，再绑反而会覆盖作者/引擎的约定。
+    const prog = linkProgram(gl, vs, fs, { attribs: [] })
 
     // 静态 quad 角点
     const quadBuf = gl.createBuffer()

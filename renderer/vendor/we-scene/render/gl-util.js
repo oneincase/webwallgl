@@ -2,14 +2,28 @@
 // [we-scene patch] 此前 renderer.js / mdl.js / particles.js 各有一份 compile/link
 // 隐性重复（见 docs/ARCHITECTURE.md「重复代码」）；本模块是收敛的第一步——
 // renderer.js 侧改用这里，mdl/particles 侧待后续轮次切换。
-function linkProgram(gl, vsSrc, fsSrc) {
+/**
+ * 编译并链接一个程序。**全引擎唯一的 link 实现**（2026-10 B3 收敛）。
+ *
+ * `opts.attribs`：顶点属性绑定表 `[[index, name], ...]`，缺省是渲染器那套
+ * `0=a_Position / 1=a_TexCoord`。传 `[]` 表示**不绑**（粒子侧靠 shader 自带的
+ * `layout(location=…)`）。收敛前有三份实现：这里、mdl.js（绑 0..4，且带骨预算重试）、
+ * particle-shaders.js（不绑）—— 三份的 shader 生命周期纪律还不一样（见下）。
+ *
+ * 生死纪律（M3 定的，对三处统一生效）：失败时删掉已创建的对象再抛；成功时释放
+ * shader 中间物（程序已持有编译产物）。mdl 原来那两份在失败路径上会漏 shader。
+ */
+function linkProgram(gl, vsSrc, fsSrc, opts) {
+  const attribs = (opts && opts.attribs) || [
+    [0, 'a_Position'],
+    [1, 'a_TexCoord'],
+  ]
   const vs = compile(gl, gl.VERTEX_SHADER, vsSrc)
   const fs = compile(gl, gl.FRAGMENT_SHADER, fsSrc)
   const p = gl.createProgram()
   gl.attachShader(p, vs)
   gl.attachShader(p, fs)
-  gl.bindAttribLocation(p, 0, 'a_Position')
-  gl.bindAttribLocation(p, 1, 'a_TexCoord')
+  for (const [index, name] of attribs) gl.bindAttribLocation(p, index, name)
   gl.linkProgram(p)
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
     throw new Error('着色器链接失败: ' + gl.getProgramInfoLog(p))
