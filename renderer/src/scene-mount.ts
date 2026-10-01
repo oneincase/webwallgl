@@ -4142,6 +4142,14 @@ cfg, source, pkgAbort.signal);
               if (a.includes("right")) adx -= hw;
               if (a.includes("top")) ady -= hh;
               if (a.includes("bottom")) ady += hh;
+              // [we-scene patch] none = 无锚点 ⇒ 盒的左下角落在 origin 上（盒向右上方长）。
+              // 3694771168 周几层的官方截图：方框 [origin, origin+size]，与逐像素量到的
+              // [3295,3379]×[293,377] 吻合（见 parse.js textAnchor 注释）。none 不含任何
+              // 方向词，上面四条都不会命中，这里单独补。
+              if (a === "none") {
+                adx += hw;
+                ady += hh;
+              }
               layer.origin[0] += adx;
               layer.origin[1] += ady;
               if (layer.localOrigin) {
@@ -4155,8 +4163,24 @@ cfg, source, pkgAbort.signal);
             // geometric_transform 的 UV 圆变形作用在近乎方形的透明画布上，丝带塌成直线。
             const em0 = TEXT_EM_SCALE * Math.max(1, layer.textPointsize);
             // tint 蒙版按原盒绘制：扩边一超过几像素，UV 就对不上字形（世界时钟粉条/缺色）。
-            const marginCap = wtext.textLayerHasTintMask(layer) ? 8 : 256;
-            let margin = Math.min(marginCap, wtext.textCanvasMargin(em0, 0));
+            const isTintMask = wtext.textLayerHasTintMask(layer);
+            const marginCap = isTintMask ? 8 : 256;
+            const anchorSafe =
+              !layer.textAnchor || layer.textAnchor === "center" || layer.textAnchor === "none";
+            const hasVisibleEffects = ((layer.effects as Array<{ visible?: boolean }>) || []).some(
+              (e) => e && e.visible !== false,
+            );
+            // [we-scene patch] 带可见效果的文字层不吃**基础**边距：效果链 FBO 与最终合成 quad
+            // 都按 layer.size 走（renderer.js 的 contentW/H = |size×scale|），而基础边距按字号估
+            //（32 号字 = 2×128+8 = 256、两侧共 +512），会把整层几何撑到盒子的 4.6 倍 ——
+            // 3694771168 的周几盒 141×141，hollow_out 方块被画成 392px 的黑块（官方 84.6px）。
+            // 本文件自己的护栏写着「效果 UV 按盒归一」（见下方），但基础边距是无条件加的，
+            // 护栏形同虚设。这类层改为只按**实际墨水**扩边：装得下 ⇒ layer.size 就是原盒，
+            // 效果几何与官方一致；真溢出时照扩（WE 不裁字，不能为了对齐几何把字切了）。
+            const baseMargin = hasVisibleEffects && !isTintMask
+              ? 0
+              : Math.min(marginCap, wtext.textCanvasMargin(em0, 0));
+            let margin = baseMargin;
             item.boxW = layer.size[0] > 0 ? layer.size[0] : em0 * 4;
             item.boxH = layer.size[1] > 0 ? layer.size[1] : em0 * 1.6;
             // [we-scene patch] 静态文字层按墨水扩边（挂载期算一次，与逐帧的媒体文字层
@@ -4170,21 +4194,12 @@ cfg, source, pkgAbort.signal);
             //   - 无脚本沙箱：脚本会改 thisLayer.size/text，且点击命中区由脚本驱动，
             //     扩出的大片透明边距会变成无声的点击陷阱；
             //   - 无可见效果：效果 UV 按盒归一，扩边让圆环/蒙版错位（3396722575 丝带）；
+            //     —— 这条只对**基础**边距生效（见上面 baseMargin）：带效果的层仍按墨水扩，
+            //     否则溢出的字会被画布切掉；墨水装得下时 margin=0，效果几何 = 原盒。
             //   - 无 tint 蒙版：同上（3122339805 世界时钟粉条）；
             //   - 锚点 none/center：方向锚点的 origin 在挂载期按原盒平移过，扩边会把盒挪走。
             {
-              const anchorSafe =
-                !layer.textAnchor || layer.textAnchor === "center" || layer.textAnchor === "none";
-              const hasVisibleEffects = ((layer.effects as Array<{ visible?: boolean }>) || []).some(
-                (e) => e && e.visible !== false,
-              );
-              if (
-                textCtx &&
-                !item.sandbox &&
-                anchorSafe &&
-                !hasVisibleEffects &&
-                !wtext.textLayerHasTintMask(layer)
-              ) {
+              if (textCtx && !item.sandbox && anchorSafe && !isTintMask) {
                 const pts = Math.max(1, layer.textPointsize);
                 const em = TEXT_EM_SCALE * pts;
                 const fontPath = layer.textFont || "";
@@ -4210,6 +4225,9 @@ cfg, source, pkgAbort.signal);
                     limituseellipsis: !!layer.textLimituseellipsis,
                     halign: layer.textHAlign,
                     valign: layer.textVAlign,
+                    // 对齐参考点 = 盒内与 origin 重合的那一点。anchor:none 时盒的
+                    // 左下角贴 origin（上面已按锚点平移过），参考点跟着换到 (0, boxH)。
+                    ...(layer.textAnchor === "none" ? { refX: 0, refY: item.boxH } : {}),
                   },
                   (s: string) => textCtx!.measureText(s).width,
                 );
@@ -4299,6 +4317,8 @@ cfg, source, pkgAbort.signal);
                 limituseellipsis: !!layer.textLimituseellipsis,
                 halign: layer.textHAlign,
                 valign: layer.textVAlign,
+                // 同挂载期：anchor:none 的参考点 = 盒左下角（见 mount 处注释）。
+                ...(layer.textAnchor === "none" ? { refX: 0, refY: bh } : {}),
               }, (s: string) => ctx.measureText(s).width);
               // [we-scene patch] 媒体组件的歌名/歌手层盒子是 WE 占位尺寸（2×2，
               // WE 运行时按内容重排），墨水远超盒子，旧实现把字截在画布边缘
@@ -5919,6 +5939,15 @@ cfg, source, pkgAbort.signal);
               run.layer[slot] = run.field === "angles"
                 ? wtext.scriptAnglesToRad(o)
                 : [o.x || 0, o.y || 0, o.z || 0];
+              // [we-scene patch] 文字层的绘制色读的是 `textColor` 这份**拷贝**
+              //（drawTextLayer 的 opts.color 就是它），只写 layer.color 等于没写：
+              // 3694771168 的时钟文字把 color 绑在共享颜色上，方块的 Hole Color
+              // 修对之后字仍旧是 scene.json 快照的 0 0 0（纯黑）。user 属性热更那条
+              // 路径早有这两行（applyUserProperties 里 `textColor = color`），
+              // 逐帧脚本这条漏了 —— 这里补齐，两条路径同源。
+              if (run.field === "color" && (run.layer as { isText?: boolean }).isText) {
+                (run.layer as { textColor: number[] }).textColor = run.layer.color;
+              }
             }
           }
           visibilityDeferred = false;

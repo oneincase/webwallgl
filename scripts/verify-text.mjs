@@ -206,17 +206,19 @@ function runLayout() {
     }
   }
   // 14) 接线：挂载期必须对**静态**文字层调用上面的扩边，且护栏齐全
-  //     （无脚本 / 无可见效果 / 无 tint 蒙版 / 锚点安全）。纯函数的算术对不代表
-  //     渲染路径用了它 —— 3427522122 的回归就是「函数在、没人调」。
+  //     （无脚本 / 无 tint 蒙版 / 锚点安全；有效果层只吃**墨水**、不吃基础边距）。
+  //     纯函数的算术对不代表渲染路径用了它 —— 3427522122 的回归就是「函数在、没人调」。
   {
     const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
-    const at = src.indexOf("let margin = Math.min(marginCap");
+    const at = src.indexOf("let margin = baseMargin");
     const block = at >= 0 ? src.slice(at, at + 4000) : "";
     if (!block) errors.push("scene-mount 找不到文字挂载边距段（textCanvasMarginGrow 的调用点）");
     const need = [
       ["textCanvasMarginGrow(layout, item.boxW, item.boxH, margin)", "挂载期必须按墨水扩边"],
       ["!item.sandbox", "扩边必须排除脚本层（脚本改 thisLayer.size，且命中区由脚本驱动）"],
-      ["hasVisibleEffects", "扩边必须排除有效果层（效果 UV 按盒归一）"],
+      // 有效果层：链 FBO/合成 quad 都按 layer.size，基础边距（32 号字 +256×2）会把
+      // 几何撑到盒子 4.6 倍 —— 3694771168 的 hollow_out 方块从 84.6px 长成 392px。
+      ["hasVisibleEffects && !isTintMask", "带效果层不吃基础边距（效果链几何按盒归一）"],
       ["textLayerHasTintMask", "扩边必须排除 tint 蒙版层"],
       ["anchorSafe", "扩边必须排除方向锚点层（origin 在挂载期按原盒平移过）"],
     ];

@@ -488,6 +488,48 @@ function audioBufferSize(n) {
 }
 
 /**
+ * [we-scene patch] `addColor({...})` / `addVec*(...)` 声明的脚本属性，scene.json 里
+ * 存的是**颜色字符串**（"0.96 0.96 0.63"，与图层 color 字段同形态），而 WE 运行时
+ * 交给脚本的是 Vec3。此前原样透传，3694771168 的时钟组脚本
+ * `shared.jpTime_color = scriptProperties.textColor_jpTime` 拿到字符串后：
+ *   - 对象字段 color 的回写只收带 .x/.y 的对象，字符串被打回 scene.json 快照
+ *     "0 0 0" ⇒ 整块时钟文字恒黑；
+ *   - 效果常量 Hole Color 同样被 constShapeOk 打回 "0 0 0" ⇒ 方块是纯黑。
+ * 按声明类型就地转成 Vec3，与 WE 对齐（颜色字符串只在这两个 addXxx 通道里出现，
+ * 不做全局猜测，避免误伤 addText 的普通文本属性）。
+ */
+function coerceVec3Prop(methodName, cur) {
+  if (!/^add(?:Vec\d*|Color|Vector)/.test(methodName)) return cur
+  if (typeof cur !== 'string') return cur
+  const parts = cur.trim().split(/[\s,]+/).filter(Boolean)
+  if (parts.length < 2 || parts.length > 4) return cur
+  const n = parts.map(Number)
+  if (n.some((x) => !Number.isFinite(x))) return cur
+  return makeVec3([n[0], n[1], n[2] || 0])
+}
+
+/** 声明类型落在 Vec/Color 上的属性：scene 字符串 → Vec3（活属性保留读现值语义）。 */
+function applyDeclaredType(spValues, methodName, name) {
+  const cur = spValues[name]
+  const next = coerceVec3Prop(methodName, cur)
+  if (next === cur) return
+  const desc = Object.getOwnPropertyDescriptor(spValues, name)
+  if (desc && desc.get) {
+    const raw = desc.get
+    Object.defineProperty(spValues, name, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        return coerceVec3Prop(methodName, raw.call(spValues))
+      },
+      set: desc.set,
+    })
+  } else {
+    spValues[name] = next
+  }
+}
+
+/**
  * [we-scene patch] WE 的 engine.isRunningInEditor：官方语料里既有按布尔读的，
  * 也有按方法调的 —— 3163060610 的「基础脚本」写 `engine.isRunningInEditor()`，
  * 它 TypeError 后 shared.CAniClass / CAniTaskListClass / eventDispatcher 全部
@@ -604,8 +646,13 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       if (name === 'finish') return () => spValues
       if (typeof name === 'string' && ADD_METHOD_RE.test(name)) {
         return (def) => {
-          if (def && typeof def === 'object' && typeof def.name === 'string' && !(def.name in spValues)) {
-            spValues[def.name] = propValue(def.value)
+          if (def && typeof def === 'object' && typeof def.name === 'string') {
+            if (!(def.name in spValues)) {
+              spValues[def.name] = propValue(def.value)
+            } else {
+              // scene 值已存在（含 {user,value} 包装解出的快照）：按声明类型补转换
+              applyDeclaredType(spValues, name, def.name)
+            }
           }
           return builder
         }
@@ -2129,8 +2176,13 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       if (name === 'finish') return () => spValues
       if (typeof name === 'string' && ADD_METHOD_RE.test(name)) {
         return (def) => {
-          if (def && typeof def === 'object' && typeof def.name === 'string' && !(def.name in spValues)) {
-            spValues[def.name] = propValue(def.value)
+          if (def && typeof def === 'object' && typeof def.name === 'string') {
+            if (!(def.name in spValues)) {
+              spValues[def.name] = propValue(def.value)
+            } else {
+              // scene 值已存在（含 {user,value} 包装解出的快照）：按声明类型补转换
+              applyDeclaredType(spValues, name, def.name)
+            }
           }
           return builder
         }

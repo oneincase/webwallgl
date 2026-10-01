@@ -87,25 +87,34 @@ export function layoutText(content, opts, measure) {
   // 盒内定位（y 向下，与 Canvas 一致）。
   // WE 官方：horizontalalign/verticalalign 是相对**图层 origin** 的贴齐边，不是 CSS
   // 那样在盒子里左/右排（开发者原话：「left-alignment aligns the text along the
-  // horizontal (X) position of the text element」）。我们的层 quad 以 origin 为中心，
-  // 故 left/right/top/bottom 应对准盒子中线（= origin），center 仍居中整段文字。
+  // horizontal (X) position of the text element」）。对齐参考点 = 盒内**与 origin
+  // 重合的那一点**：anchor:center 时盒心 = origin（我们层 quad 以 origin 为中心），
+  // left/right/top/bottom 因此应对准盒子中线，center 仍居中整段文字。
   // 2974757317 歌名 ha=left：origin 在头像右侧，旧实现贴盒左缘 → 字叠进圆标。
+  // [we-scene patch] anchor:none 时盒的**左下角**贴 origin（scene-mount 按锚点平移过
+  // origin），参考点随之换成 (0, boxH) —— 否则文字会跟着盒心一起右移半盒。
+  // 3694771168 官方截图可两头核：盒 [origin, origin+size]，而周几字的起笔仍在
+  // origin 上（两者只差字形左边距），说明「文字钉 origin」与「盒贴 origin 左下」并存。
   const widths = lines.map((t) => measure(t))
   const totalH = lines.length * lineHeight
   const halign = opts.halign || 'center'
   const valign = opts.valign || 'center'
   const midX = boxW / 2
   const midY = boxH / 2
+  // 参考点（盒局部坐标，y 向下）。缺省 = 盒心，与历史行为逐字节等价：
+  // top → refY、bottom → refY−totalH、center → refY−totalH/2 展开后即 (boxH−totalH)/2。
+  const refX = Number.isFinite(opts.refX) ? opts.refX : midX
+  const refY = Number.isFinite(opts.refY) ? opts.refY : midY
   const y0 =
-    valign === 'top' ? midY
-      : valign === 'bottom' ? midY - totalH
-        : (boxH - totalH) / 2
+    valign === 'top' ? refY
+      : valign === 'bottom' ? refY - totalH
+        : refY - totalH / 2
   const out = lines.map((text, i) => {
     const w = widths[i]
     const x =
-      halign === 'left' ? midX
-        : halign === 'right' ? midX - w
-          : (boxW - w) / 2
+      halign === 'left' ? refX
+        : halign === 'right' ? refX - w
+          : refX - w / 2
     return { text, width: w, x, y: y0 + i * lineHeight }
   })
   return { lines: out, lineHeight, totalH, truncated, boxW, boxH }

@@ -352,10 +352,15 @@ export function parseScene(sceneJson, project) {
       textPointsize: parseNum(o.pointsize, 24) || 24,
       textColor: parseColor(o.color),
       // anchor 是盒子相对 origin 的锚点（同 image alignment 枚举，外加 "none"）。
-      // 本机 563 个文字层：none 237 / 缺省 301 / center 20 —— none 与缺省都按 center 处理
+      // 本机 563 个文字层：none 237 / 缺省 301 / center 20 —— 缺省按 center 处理
       // （WE 对象缺省对齐就是 center；显式 center 的挂件与时钟层行为一致）。
       // 2780710296 实验过默认改 top：竖直阶梯对了，但会平移其它壁纸文字相对图元的位置，已回滚。
-      textAnchor: typeof o.anchor === 'string' && o.anchor !== 'none' ? o.anchor : 'center',
+      // [we-scene patch] `none` **不等于** center：none = 没有锚点，盒的**左下角**贴在
+      // origin 上（盒向右上方长）。3694771168 的周几盒 anchor:"none"，官方截图里方框
+      // 外沿 = [origin, origin+size]（84.6 = 141×0.6，左沿与组原点 3297.54 只差 2.5px、
+      // 下沿与 2160−1783.18 = 376.8 只差 0.2px）；按 center 处理会整盒偏 (−hw,+hh)。
+      // 方向锚点（left/top/…）仍走 scene-mount 的一次性 origin 平移，none 同样平移。
+      textAnchor: o.anchor === 'none' ? 'none' : typeof o.anchor === 'string' ? o.anchor : 'center',
       textMaxwidth: parseNum(o.maxwidth, 0),
       textMaxrows: parseNum(o.maxrows, 0),
       textLimitwidth: parseBool(o.limitwidth, false),
