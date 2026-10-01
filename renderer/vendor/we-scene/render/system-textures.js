@@ -1,3 +1,4 @@
+import { mulberry32 } from './rng.js'
 // WE 系统内置贴图（materials/util/*）的程序化复刻供给入口。
 // 背景：工坊壁纸的效果链 / 材质 / sampler 默认值会引用 WE 安装目录的公共 util
 // 贴图（`materials/util/<名>.tex`），它们不在壁纸 pkg 里。linux-wallpaperengine
@@ -57,17 +58,6 @@ const NOMIP = new Set(['util/flatnormal', 'util/fur', 'util/noflow', 'util/noise
 
 export function isNomipSystemTexture(name) {
   return NOMIP.has(name)
-}
-
-function mulberry32(seed) {
-  let a = seed >>> 0
-  return function () {
-    a |= 0
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
 }
 
 

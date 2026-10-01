@@ -1,3 +1,4 @@
+import { mulberry32 } from './rng.js'
 // [we-scene patch] WE 内置粒子贴图的素材供给：**全程序化生成 + 宿主覆盖接口**。
 // 为什么需要这个文件：粒子材质引用的贴图（particle/halo、particle/drop、
 // particle/fog/fog1 …）**不在 scene.pkg 里** —— 它们是 Wallpaper Engine 安装目录
@@ -97,17 +98,6 @@ function conditionTexture(tex, targetAvg) {
 
 // 固定种子 PRNG（与 noise.js / audio.js 的 mulberry32 同款；三份重复是既有的
 // 零依赖约定的代价）。只用于确定性散点，禁 Math.random。
-function mulberry32(seed) {
-  let a = seed >>> 0
-  return function () {
-    a |= 0
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
 
 const smooth01 = (t) => t * t * (3 - 2 * t)
 const smooth5 = (t) => t * t * t * (t * (t * 6 - 15) + 10) // 五次插值（C²）

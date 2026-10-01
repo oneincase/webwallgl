@@ -1,3 +1,4 @@
+import { mulberry32 } from './rng.js'
 // [we-scene patch] WE 内置纹样贴图（materials/pattern/*）的程序化复刻。
 //
 // ## 为什么需要
@@ -88,17 +89,6 @@ const LC_G = 0.3 // 被第三种子接管时的衰减率
 const LC_FALLBACK = 24 // 无任何边权重（理论不发生）时的缺省胞边长度
 
 /** 固定种子 PRNG（与 system-textures.js / particle-textures.js / noise.js 同款）。 */
-function mulberry32(seed) {
-  let a = seed >>> 0
-  return function () {
-    a |= 0
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
 /** 分量取模到 [−SIZE/2, SIZE/2)：环绕（toroidal）距离的最简写法。 */
 function wrap(d) {
   return d - SIZE * Math.round(d / SIZE)
