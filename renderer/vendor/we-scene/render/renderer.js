@@ -1127,7 +1127,12 @@ export function createRenderer(canvas, opts = {}) {
   // 里）推进，事件由此推入，宿主帧循环在 render 后统一做图层级广播
   //（官方 AnimationEvent：同层全部脚本的 animationEvent(event, value)）。
   let constAnimEventQueue = null
-  const constScriptDiag = { total: 0, ok: 0, failed: 0 }
+  const constScriptDiag = { total: 0, ok: 0, failed: 0, updateFails: 0 }
+  // 脚本失败的一次性上报表（docs/ENGINE-REVIEW-2026-10.md §3.5）：
+  // 两条静默路径原先只有计数没有文案 —— 求值失败只 `failed++`，update 抛错连计数都没有。
+  // 现象都是「脚本没跑/停更，画面不动但一切看起来正常」，排查时不知道是哪个脚本、为什么。
+  // 这里按 sk（含图层+常量名）去重，每条只报一次，避免逐帧刷屏。
+  const oneShotDiag = new Set()
   function setConstantScriptRuntime(evalFn, opts) {
     evalObjectScriptFn = typeof evalFn === 'function' ? evalFn : null
     userProps = (opts && opts.userProperties) || null
@@ -1876,7 +1881,14 @@ export function createRenderer(canvas, opts = {}) {
               return rec ? rec.ctrl : null
             },
           })
-        } catch { sb = null }
+        } catch (e) {
+          sb = null
+          // 一次性上报：不带文案时这个 catch 完全不可见（只有 failed 计数）
+          if (!oneShotDiag.has(sk)) {
+            oneShotDiag.add(sk)
+            diag(`脚本求值失败（该常量退回 scene.json 快照值）：${sk} — ${String((e && e.message) || e).slice(0, 160)}`)
+          }
+        }
         if (sb) constScriptDiag.ok++
         else constScriptDiag.failed++
         constScriptCache.set(sk, sb)
@@ -1945,7 +1957,19 @@ export function createRenderer(canvas, opts = {}) {
       }
       const arg = sb.__lastConstValue
       let ret
-      try { ret = sb.callUpdate(arg) } catch { ret = undefined }
+      try {
+        ret = sb.callUpdate(arg)
+      } catch (e) {
+        // 逐帧路径：原先连计数都没有（异常被完全吞掉，脚本从此静默停更、画面「不动」
+        // 而其它一切正常）。按 图层+常量 去重报一次，并累加计数供宿主看总量。
+        ret = undefined
+        constScriptDiag.updateFails++
+        const failKey = 'u:' + (layer && layer.id !== undefined ? layer.id + '|' + key : cacheKey + '|' + key)
+        if (!oneShotDiag.has(failKey)) {
+          oneShotDiag.add(failKey)
+          diag(`脚本 update 抛错（此后每帧静默跳过，该常量不再更新）：${failKey.slice(2)} — ${String((e && e.message) || e).slice(0, 160)}`)
+        }
+      }
       // WE 语义：脚本可以「原地改写传入对象」或「返回新值」，两种都要支持。
       const src = ret !== undefined && ret !== null ? ret : arg
       // 本帧输出回流为下帧输入（形状合法才收，防 NaN 入反馈环）。
@@ -3929,7 +3953,14 @@ export function createRenderer(canvas, opts = {}) {
           }
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src)
         } catch (e) {
-          // 动图帧不可用（解码中/跨域）：保留上一帧
+          // 动图帧不可用（解码中/跨域）：保留上一帧。
+          // 一次性上报 —— 这条路径逐帧都在跑，静默的话现象只是「GIF 层黑块/不动」，
+          // 没有任何线索指向这里（与脚本那两条同属 §3.5 的静默清单）。
+          const gifKey = 'gif:' + (layer && layer.id !== undefined ? layer.id : '?')
+          if (!oneShotDiag.has(gifKey)) {
+            oneShotDiag.add(gifKey)
+            diag(`动图帧上传失败（保留上一帧）：层 ${(layer && layer.id) ?? '?'}${layer && layer.textureName ? ' ' + layer.textureName : ''} — ${String((e && e.message) || e).slice(0, 140)}`)
+          }
         }
       }
     }
@@ -4367,7 +4398,22 @@ export function createRenderer(canvas, opts = {}) {
           entry = resolveTextureName(name, passInput, effectFBOs, textures)
         }
         if (name === 'previous') entry = passInput
-        if (entry === null) entry = paintDefault || { glTex: whiteTex, width: 1, height: 1, tex: whiteTex }
+        if (entry === null) {
+          // 只在「**声明了名字**却解析不到」时上报。空槽（ti ≥ 声明数 —— 上面的
+          // `maxTex = Math.max(texNames.length, 8)` 会把槽补齐到 8 个）本来就该回落白，
+          // paintDefault 命中的是作者意图的兜底 —— 这两种都不是故障，报了就是假警报
+          // （实测：不改这条会 3/4 张壁纸各刷一条「名 null」）。
+          // 真故障是「有名字但拿不到贴图」：这也是 blend 类效果把白当真实输入、
+          // 进而整屏白的头号来源，故按 层+槽+名 去重报一次（§3.5 的静默清单）。
+          if (!paintDefault && typeof name === 'string' && name) {
+            const missKey = 'texmiss:' + (layer && layer.id !== undefined ? layer.id + '|' : '') + ti + '|' + name
+            if (!oneShotDiag.has(missKey)) {
+              oneShotDiag.add(missKey)
+              diag(`纹理缺失，回落白色：层 ${(layer && layer.id) ?? '?'} 槽 ${ti} 名 ${name}`)
+            }
+          }
+          entry = paintDefault || { glTex: whiteTex, width: 1, height: 1, tex: whiteTex }
+        }
         const t = entry.fbo ? entry : { tex: entry.glTex || whiteTex, width: entry.width || 1, height: entry.height || 1 }
         gl.activeTexture(gl.TEXTURE0 + ti)
         gl.bindTexture(gl.TEXTURE_2D, t.tex)
