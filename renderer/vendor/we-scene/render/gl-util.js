@@ -26,8 +26,20 @@ function linkProgram(gl, vsSrc, fsSrc, opts) {
   for (const [index, name] of attribs) gl.bindAttribLocation(p, index, name)
   gl.linkProgram(p)
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    throw new Error('着色器链接失败: ' + gl.getProgramInfoLog(p))
+    // 失败路径要自己收尾：这三个对象已经创建出来了，不删就一直是活上下文里的垃圾
+    // （docs/ENGINE-REVIEW-2026-10.md §3.1 —— 失败时 progCache 也不会留引用，没人再删它）
+    const log = gl.getProgramInfoLog(p)
+    gl.deleteProgram(p)
+    gl.deleteShader(vs)
+    gl.deleteShader(fs)
+    throw new Error('着色器链接失败: ' + log)
   }
+  // 链接成功后可释放 shader：程序已持有编译产物，shader 只是中间物。这是 GL 的标准做法，
+  // 也避免「每编译一个程序留两个 shader 对象」的长期占用（300+ 效果的场景量级可观）。
+  gl.detachShader(p, vs)
+  gl.detachShader(p, fs)
+  gl.deleteShader(vs)
+  gl.deleteShader(fs)
   return p
 }
 
@@ -36,7 +48,10 @@ function compile(gl, type, src) {
   gl.shaderSource(s, src)
   gl.compileShader(s)
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    throw new Error('着色器编译失败: ' + gl.getShaderInfoLog(s))
+    // 同上：失败时先删再抛
+    const log = gl.getShaderInfoLog(s)
+    gl.deleteShader(s)
+    throw new Error('着色器编译失败: ' + log)
   }
   return s
 }

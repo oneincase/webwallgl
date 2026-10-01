@@ -447,6 +447,9 @@ export function createMDLRenderer(gl) {
   // 子网格（stage.mdl 15 个、TDRS 64 个），各自独立的顶点/索引缓冲。mdl 只有 1 个
   // 子网格时键仍是「伪网格对象」（见 draw 里 legacyMesh），与改动前逐位等价。
   const meshes = new WeakMap()
+  // 可枚举的存活表：WeakMap 是**查询**用的（按键缓存），GC 到了也枚举不出来，
+  // 里面的 VAO/VBO 就没人删。释放需要一份强引用清单（见下面的 dispose）。
+  const liveMeshes = new Set()
   function ensureMesh(mesh) {
     let m = meshes.get(mesh)
     if (m) return m
@@ -501,6 +504,7 @@ export function createMDLRenderer(gl) {
     gl.bindVertexArray(null)
     m = { vao, vbuf, ibuf, hasNormals: hasN }
     meshes.set(mesh, m)
+    liveMeshes.add(m)
     return m
   }
 
@@ -522,6 +526,35 @@ export function createMDLRenderer(gl) {
     gl,
     prog,
     maxBones: MAX_BONES,
+    /**
+     * 释放本渲染器创建的 GL 对象：program + 每套网格的 VAO/VBO。
+     *
+     * 为什么必须显式释放：网格缓存是 WeakMap（按网格记录缓存），GC 到了也**无法枚举**，
+     * 里面的 VAO/VBO 只能等上下文回收 —— 与 renderer 侧 gl-registry 的
+     * 「自己回收 + 扩展兜底」原则不一致（docs/ENGINE-REVIEW-2026-10.md §3.1）。
+     * 原先 mdl.js 里除「链接失败删 program」外没有任何 delete。
+     * 调用方：装配层在场景卸载时（scene-mount 的 sceneCleanup）。
+     */
+    dispose() {
+      for (const m of liveMeshes) {
+        try {
+          gl.deleteVertexArray(m.vao)
+          gl.deleteBuffer(m.vbuf)
+          gl.deleteBuffer(m.ibuf)
+        } catch (e) {
+          /* 上下文可能已丢失 */
+        }
+      }
+      liveMeshes.clear()
+      if (prog) {
+        try {
+          gl.deleteProgram(prog)
+        } catch (e) {
+          /* 同上 */
+        }
+        prog = null
+      }
+    },
     upload(mdl) {
       const list = meshListOf(mdl)
       if (list) {

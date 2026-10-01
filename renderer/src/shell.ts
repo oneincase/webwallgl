@@ -98,6 +98,12 @@ export type Runtime = {
     dispose?: () => void;
     /** [we-scene patch] ROI 图层剔除统计（getOcclusion / perf-bench 诊断读） */
     roiCullStats?: () => { lastFrame: number; gateLastFrame: number; frames: number; totalCulled: number };
+    /**
+     * [we-scene patch] GPU 资源在册数量（诊断出口，见 render/gl-registry.js）。
+     * 卸载（dispose）之后应归零 —— 不归零说明有创建点漏登记或漏释放。
+     * 主要给测试/宿主排查用，正常渲染路径不读它（避免每帧分配）。
+     */
+    glStats?: () => Record<string, number>;
   };
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
   objectUrls?: string[];

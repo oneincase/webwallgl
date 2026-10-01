@@ -4,6 +4,7 @@ import { hlsl2glsl } from './hlsl2glsl.js'
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
 import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
+import { createGlRegistry } from './gl-registry.js'
 import { createAnimation, linkAnimations } from './animation.js'
 // applyBlending：WE 32 个混合模式的 CPU 逐字实现，供 applyColorBlendCPU 在
 // shader 侧混合的模式下做参考（effects.js 零 import，不构成环）。
@@ -793,6 +794,9 @@ export function createRenderer(canvas, opts = {}) {
   gl.getExtension('EXT_color_buffer_float')
   gl.getExtension('EXT_color_buffer_half_float')
   gl.getExtension('OES_texture_float_linear')
+  // [we-scene patch] GPU 资源登记表（docs/ENGINE-REVIEW-2026-10.md §3.1）：创建点登记、
+  // 正常释放路径销账、dispose 全量兜底。设计取舍与「为什么不 Proxy 包装 gl」见 gl-registry.js 头注。
+  const glReg = createGlRegistry(gl)
   const shaderResolver = opts.shaderResolver || (async () => null)
   const diag = opts.diag || (() => {})
   // [we-scene patch] 视频帧中转离屏 canvas（video→GL 直传在部分 WebView 受限，用 drawImage 中转更稳）
@@ -908,9 +912,13 @@ export function createRenderer(canvas, opts = {}) {
       gl.deleteFramebuffer(hdrSceneFbo.fbo)
       gl.deleteTexture(hdrSceneFbo.tex)
       if (hdrSceneFbo.depthRbo) gl.deleteRenderbuffer(hdrSceneFbo.depthRbo)
+      // 销账：这三件已显式删除，dispose 时不该再删一遍（重复 delete 无害，但计数会失真）
+      glReg.release(hdrSceneFbo.fbo)
+      glReg.release(hdrSceneFbo.tex)
+      if (hdrSceneFbo.depthRbo) glReg.release(hdrSceneFbo.depthRbo)
     }
-    const fbo = gl.createFramebuffer()
-    const tex = gl.createTexture()
+    const fbo = glReg.framebuffer(gl.createFramebuffer())
+    const tex = glReg.texture(gl.createTexture())
     gl.bindTexture(gl.TEXTURE_2D, tex)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, width, height, 0, gl.RGBA, gl.HALF_FLOAT, null)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
@@ -929,7 +937,7 @@ export function createRenderer(canvas, opts = {}) {
     // 定界手法（一分钟出结论）：把 depthFunc 临时改成 `NEVER` —— 画面纹丝不动
     // 就说明深度测试根本没参与（若真生效，3D 网格应当整块消失）。同一手法也验过
     // `GREATER` 反号，那时画面有变化只是因为它改的是默认帧缓冲那条路径。
-    const depthRbo = gl.createRenderbuffer()
+    const depthRbo = glReg.renderbuffer(gl.createRenderbuffer())
     gl.bindRenderbuffer(gl.RENDERBUFFER, depthRbo)
     gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height)
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRbo)
@@ -961,8 +969,8 @@ export function createRenderer(canvas, opts = {}) {
       aaMode = 'off'
       return
     }
-    const fbo = gl.createFramebuffer()
-    const rbo = gl.createRenderbuffer()
+    const fbo = glReg.framebuffer(gl.createFramebuffer())
+    const rbo = glReg.renderbuffer(gl.createRenderbuffer())
     gl.bindRenderbuffer(gl.RENDERBUFFER, rbo)
     gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, width, height)
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
@@ -970,7 +978,7 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch 2026-09-28] MSAA 目标同样要深度附件（理由见 ensureHdrTarget）：
     // 缺了它时 `aa=msaa*` 的场景里 3D 网格深度测试静默失效。分辨率/采样数必须与
     // 颜色附件完全一致，否则 FBO 不完整（下面那条 checkFramebufferStatus 会兜住）。
-    const depthRbo = gl.createRenderbuffer()
+    const depthRbo = glReg.renderbuffer(gl.createRenderbuffer())
     gl.bindRenderbuffer(gl.RENDERBUFFER, depthRbo)
     gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, width, height)
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRbo)
@@ -981,6 +989,9 @@ export function createRenderer(canvas, opts = {}) {
       gl.deleteFramebuffer(fbo)
       gl.deleteRenderbuffer(rbo)
       gl.deleteRenderbuffer(depthRbo)
+      glReg.release(fbo)
+      glReg.release(rbo)
+      glReg.release(depthRbo)
       if (!msaaDiagDone) { msaaDiagDone = true; diag(`msaa: FBO 不完整（${want}x ${width}x${height}），回退 off`) }
       aaMode = 'off'
       return
@@ -993,6 +1004,9 @@ export function createRenderer(canvas, opts = {}) {
     gl.deleteFramebuffer(msaaTarget.fbo)
     gl.deleteRenderbuffer(msaaTarget.rbo)
     if (msaaTarget.depthRbo) gl.deleteRenderbuffer(msaaTarget.depthRbo)
+    glReg.release(msaaTarget.fbo)
+    glReg.release(msaaTarget.rbo)
+    if (msaaTarget.depthRbo) glReg.release(msaaTarget.depthRbo)
     msaaTarget = null
   }
   // MSAA → 默认帧缓冲 resolve（多重采样缓冲不能被采样，只能 blit 解析）。
@@ -1103,28 +1117,28 @@ export function createRenderer(canvas, opts = {}) {
   let bloomFrameCount = 0
   let bloomDebugFrames = typeof opts.bloomDebugFrames === 'number' ? opts.bloomDebugFrames : 3
 
-  const copyProg = linkProgram(gl, COPY_VERT, COPY_FRAG)
+  const copyProg = glReg.program(linkProgram(gl, COPY_VERT, COPY_FRAG))
   // [we-scene patch] 材质 LIGHTING combo 的直射光变体（见 renderer-glsl.js 的
   // COPY_LIT_FRAG 注释）：只有 lightingEnabled 的层走它，其余层完全不变。
-  const copyLitProg = linkProgram(gl, COPY_LIT_VERT, COPY_LIT_FRAG)
-  const compProg = linkProgram(gl, COPY_VERT, COMPOSITE_FRAG)
-  const backdropProg = linkProgram(gl, COPY_VERT, BACKDROP_FRAG)
+  const copyLitProg = glReg.program(linkProgram(gl, COPY_LIT_VERT, COPY_LIT_FRAG))
+  const compProg = glReg.program(linkProgram(gl, COPY_VERT, COMPOSITE_FRAG))
+  const backdropProg = glReg.program(linkProgram(gl, COPY_VERT, BACKDROP_FRAG))
   // [we-scene patch] 内置 Bloom 后期（general.bloom；HDR 开关绑在这里）。
   // 三段 program 见 renderer-glsl.js 的 BLOOM_* 注释，语义 = WE localeffects/Bloom。
-  const bloomLightProg = linkProgram(gl, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG)
-  const bloomBlurProg = linkProgram(gl, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG)
-  const bloomApplyProg = linkProgram(gl, COPY_VERT, BLOOM_APPLY_FRAG)
+  const bloomLightProg = glReg.program(linkProgram(gl, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG))
+  const bloomBlurProg = glReg.program(linkProgram(gl, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG))
+  const bloomApplyProg = glReg.program(linkProgram(gl, COPY_VERT, BLOOM_APPLY_FRAG))
   // [we-scene patch] 固定管线表达不了的 colorBlendMode（ColorBurn/Overlay/HSL 系…）
   // 走这条：回读背景当纹理，在 shader 里用 ApplyBlending 算完直接写。见 shaderBlendMode。
-  const compBlendProg = linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG)
+  const compBlendProg = glReg.program(linkProgram(gl, COPY_VERT, COMPOSITE_BLEND_FRAG))
   // [we-scene patch] FXAA 抗锯齿（aaMode='fxaa' 时帧末执行，见 renderScene 末尾）
-  const fxaaProg = linkProgram(gl, COPY_VERT, FXAA_FRAG)
+  const fxaaProg = glReg.program(linkProgram(gl, COPY_VERT, FXAA_FRAG))
   // [we-scene patch] HDR 色调映射（general.hdr=true 时把 fp16 场景目标映射回 SDR 画布）
-  const tonemapProg = linkProgram(gl, COPY_VERT, TONEMAP_FRAG)
+  const tonemapProg = glReg.program(linkProgram(gl, COPY_VERT, TONEMAP_FRAG))
 
-  const vao = gl.createVertexArray()
+  const vao = glReg.vertexArray(gl.createVertexArray())
   gl.bindVertexArray(vao)
-  const vbuf = gl.createBuffer()
+  const vbuf = glReg.buffer(gl.createBuffer())
   gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
   gl.enableVertexAttribArray(0)
   gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 20, 0)
@@ -1156,8 +1170,8 @@ export function createRenderer(canvas, opts = {}) {
       hit.stamp = fboStamp
       return hit
     }
-    const fbo = gl.createFramebuffer()
-    const tex = gl.createTexture()
+    const fbo = glReg.framebuffer(gl.createFramebuffer())
+    const tex = glReg.texture(gl.createTexture())
     gl.bindTexture(gl.TEXTURE_2D, tex)
     gl.texImage2D(gl.TEXTURE_2D, 0, fm.ifmt, w, h, 0, fm.fmt, fm.type, null)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
@@ -1180,6 +1194,8 @@ export function createRenderer(canvas, opts = {}) {
       if (entry.stamp === fboStamp) continue
       if (entry.fbo) gl.deleteFramebuffer(entry.fbo)
       if (entry.tex) gl.deleteTexture(entry.tex)
+      glReg.release(entry.fbo)
+      glReg.release(entry.tex)
       fboCache.delete(key)
     }
   }
@@ -1310,7 +1326,7 @@ export function createRenderer(canvas, opts = {}) {
       if (missing.size === 0) {
         let prog
         try {
-          prog = linkProgram(gl, vertGlsl, fragGlsl)
+          prog = glReg.program(linkProgram(gl, vertGlsl, fragGlsl))
         } catch (e) {
           progCache.set(key, null)
           throw new Error('shader=' + shaderName + ' ' + (e && e.message))
@@ -1349,9 +1365,9 @@ export function createRenderer(canvas, opts = {}) {
     throw new Error('include 解析失败: ' + shaderName)
   }
 
-  const whiteTex = makeTexture(gl, new Uint8Array([255, 255, 255, 255]), 1, 1)
+  const whiteTex = glReg.texture(makeTexture(gl, new Uint8Array([255, 255, 255, 255]), 1, 1))
   // 无纹理的非 solid 层（纯效果层/文字对象层）：WE 语义为空层内容透明（白会导致纯白方块）
-  const transparentTex = makeTexture(gl, new Uint8Array([0, 0, 0, 0]), 1, 1)
+  const transparentTex = glReg.texture(makeTexture(gl, new Uint8Array([0, 0, 0, 0]), 1, 1))
   // shader 声明 paintdefaultcolor 的未绑槽：按色缓存 1×1 纹理（见 getPaintDefaultEntry）
   const paintDefaultTexCache = new Map()
   function getPaintDefaultEntry(colorStr) {
@@ -1365,7 +1381,7 @@ export function createRenderer(canvas, opts = {}) {
     const rgba = new Uint8Array([
       Math.round(c(0) * 255), Math.round(c(1) * 255), Math.round(c(2) * 255), Math.round(c(3) * 255),
     ])
-    entry = { glTex: makeTexture(gl, rgba, 1, 1), width: 1, height: 1 }
+    entry = { glTex: glReg.texture(makeTexture(gl, rgba, 1, 1)), width: 1, height: 1 }
     paintDefaultTexCache.set(colorStr, entry)
     return entry
   }
@@ -2714,7 +2730,7 @@ export function createRenderer(canvas, opts = {}) {
       return fbo.tex
     }
     if (backdropTex === null) {
-      backdropTex = gl.createTexture()
+      backdropTex = glReg.texture(gl.createTexture())
       gl.bindTexture(gl.TEXTURE_2D, backdropTex)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
@@ -2919,7 +2935,11 @@ export function createRenderer(canvas, opts = {}) {
     hdrActive = !!(scene.general && (scene.general.hdr === true || (scene.general.hdr && scene.general.hdr.value === true)))
     if (hdrActive) {
       ensureHdrTarget(width, height)
-      msaaTarget = null
+      // [we-scene patch] 这里原来是 `msaaTarget = null` —— 只丢引用、不删 FBO/RBO，
+      // 在**活着的上下文里**是真泄漏（docs/ENGINE-REVIEW-2026-10.md §3.1）。
+      // 走 destroyMsaaTarget()：删对象 + 销账。语料实测 393 个条目里 `"hdr"` 出现 0 次，
+      // 该分支目前不可达，但运行期由脚本/属性把 hdr 打开即会踩到，属隐患清理。
+      destroyMsaaTarget()
     }
     // [we-scene patch] MSAA：尺寸/档位变化时重建多重采样目标，并把「最终绘制
     // 目标」切到它（aaMode=off 时 bindFinal 就是默认帧缓冲，零行为差）。
@@ -3299,7 +3319,7 @@ export function createRenderer(canvas, opts = {}) {
       let sceneTex
       if (hdrActive) {
         if (backdropTex === null) {
-          backdropTex = gl.createTexture()
+          backdropTex = glReg.texture(gl.createTexture())
           gl.bindTexture(gl.TEXTURE_2D, backdropTex)
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
@@ -4455,6 +4475,14 @@ export function createRenderer(canvas, opts = {}) {
     },
     // 场景切换时清空 shader 相关缓存（避免复用上一个场景的 shader 源/程序）
     resetShaderCaches: function () {
+      // 清 Map 的同时**真的删掉** GL program：原来只 clear Map，程序对象留在上下文里
+      // 直到 GC 或上下文回收（docs/ENGINE-REVIEW-2026-10.md §3.1）。
+      for (const p of progCache.values()) {
+        if (p) {
+          gl.deleteProgram(p)
+          glReg.release(p)
+        }
+      }
       progCache.clear()
       includeCache.clear()
       if (shaderSrcCache) shaderSrcCache.clear()
@@ -4557,9 +4585,17 @@ export function createRenderer(canvas, opts = {}) {
     // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
     dispose: function () {
       try {
+        // 再全量释放：**必须在 loseContext() 之前** —— 上下文一旦丢失，后续 delete
+        // 全是 no-op，等于没释放。这一步把「靠扩展回收」变成「自己回收 + 扩展兜底」，
+        // 扩展不可用时也能确定性归还（docs/ENGINE-REVIEW-2026-10.md §3.1）。
+        glReg.destroyAll()
         const ext = gl.getExtension('WEBGL_lose_context')
         if (ext) ext.loseContext()
       } catch (e) { /* 忽略：无法强制释放时交给 GC 兜底 */ }
+    },
+    /** GPU 资源在册数量（诊断出口）：卸载后应归零，否则说明有创建点漏登记或漏释放。 */
+    glStats: function () {
+      return glReg.stats()
     },
   }
 }

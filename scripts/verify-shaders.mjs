@@ -2126,6 +2126,40 @@ const wireErrors = [];
   wireErrors.push(...wErr);
 }
 
+// [GL 资源登记] 登记表的守卫（docs/ENGINE-REVIEW-2026-10.md §3.1）
+//
+// 登记表刻意**不**对 gl 做 Proxy 包装（每帧数千次 GL 调用不该多一层属性查找），
+// 代价是「新增创建点必须记得登记」。这条把代价变成会失败的断言 —— 漏登记的直接后果
+// 就是 dispose 漏释放（正是这轮修掉的那个洞）。
+//
+// 注意：源码级守卫必须**先剥注释**再匹配。第一版没剥，结果被我自己那段
+// 「这里原来是 msaaTarget = null」的解释性注释判红（同源坑：模板字面量里的 `\/`）。
+{
+  const src = stripComments(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8"));
+  const bare = [];
+  const lines = src.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/(^|[^.\w])gl\.create([A-Za-z]+)\(/.test(lines[i])) continue;
+    // 合法形态是 `glReg.xxx(gl.createYyy(...))`：同一行必须出现 glReg 调用
+    if (!/glReg\.\w+\(/.test(lines[i])) bare.push(`createXxx 未走 glReg：${lines[i].trim().slice(0, 88)}`);
+  }
+  if (bare.length) wireErrors.push(`GL 资源登记：${bare.length} 处创建点漏登记`, ...bare);
+
+  // 卸载必须「先全量释放、再丢上下文」：上下文丢失之后所有 delete 都是 no-op
+  if (!/dispose: function[\s\S]{0,1500}?glReg\.destroyAll\(\)[\s\S]{0,500}?loseContext\(\)/.test(src)) {
+    wireErrors.push("GL 资源登记：dispose 必须先 glReg.destroyAll() 再 loseContext()");
+  }
+  // 「丢引用不删对象」的写法不得回来（HDR 分支的 msaaTarget = null 曾是活上下文里的真泄漏）
+  if (/ensureHdrTarget\(width, height\)[\s\S]{0,300}?msaaTarget = null/.test(src)) {
+    wireErrors.push("GL 资源登记：HDR 分支不得直接 msaaTarget = null（应走 destroyMsaaTarget()）");
+  }
+  // 编译/链接失败路径要自收尾（throw 前删掉已创建的对象）
+  const util = stripComments(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/gl-util.js"), "utf8"));
+  if (!/getProgramParameter\(p, gl\.LINK_STATUS\)\) \{[\s\S]{0,400}?gl\.deleteProgram\(p\)/.test(util)) {
+    wireErrors.push("GL 资源登记：linkProgram 失败路径必须先 deleteProgram/deleteShader 再抛");
+  }
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

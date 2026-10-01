@@ -3703,6 +3703,19 @@ cfg, source, pkgAbort.signal);
       if (mdlItems.length > 0) {
         try {
           mdlRenderer = mdl.createMDLRenderer(renderer.gl);
+          // 卸载时释放 puppet 侧的 GL 资源（program + 每套网格的 VAO/VBO）。
+          // mdl.js 的网格缓存是 WeakMap（枚举不出来），没有显式 dispose 就只能等
+          // 上下文回收 —— 与「自己回收 + 扩展兜底」的原则不一致（§3.1）。
+          const prevMdlCleanup = rt.sceneCleanup;
+          const thisMdl = mdlRenderer;
+          rt.sceneCleanup = () => {
+            try {
+              thisMdl.dispose?.();
+            } catch (e) {
+              /* 上下文可能已丢失 */
+            }
+            prevMdlCleanup?.();
+          };
           for (const item of mdlItems) mdlRenderer.upload(item.mdl);
           // 注入绘制回调：renderer 在图层循环里按 z 序调用
           const byLayer = new Map<any, { mdl: any; tex: any; layer: any }>();
