@@ -17,6 +17,7 @@
  *
  * 退出码非 0 表示发现问题，可直接用于 CI。
  */
+import { parsePkg, getEntry } from "../renderer/vendor/we-scene/pkg/container.js";
 import fs from "node:fs";
 import { join } from "node:path";
 import zlib from "node:zlib";
@@ -42,33 +43,6 @@ const texMod = await imp("renderer/vendor/we-scene/pkg/texture.js");
 
 // ---------- scene.pkg 读取（container.js 的最小子集，避免拖入浏览器依赖） ----------
 
-function parsePkg(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const magicLen = dv.getUint32(0, true);
-  let magic = "";
-  for (let i = 4; i < 4 + magicLen; i++) magic += String.fromCharCode(buf[i]);
-  if (!magic.startsWith("PKGV")) throw new Error("不是 scene.pkg: " + magic);
-  const count = dv.getUint32(4 + magicLen, true);
-  let p = 4 + magicLen + 4;
-  const entries = [];
-  for (let i = 0; i < count; i++) {
-    const nameLen = dv.getUint32(p, true);
-    p += 4;
-    const name = new TextDecoder("utf-8").decode(buf.subarray(p, p + nameLen));
-    p += nameLen;
-    const offset = dv.getUint32(p, true);
-    p += 4;
-    const size = dv.getUint32(p, true);
-    p += 4;
-    entries.push({ name, offset, size });
-  }
-  return { entries, dataStart: p, buf };
-}
-function getEntry(pkg, name) {
-  const e = pkg.entries.find((x) => x.name === name);
-  if (!e) return null;
-  return pkg.buf.subarray(pkg.dataStart + e.offset, pkg.dataStart + e.offset + e.size);
-}
 const readText = (b) => new TextDecoder().decode(b);
 const parseVec = (s, dflt) => {
   if (s === undefined || s === null) return dflt ? dflt.slice() : [0, 0, 0];

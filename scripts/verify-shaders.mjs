@@ -24,7 +24,9 @@
  *
  * 退出码非 0 表示发现问题。
  */
+import { parsePkg, getEntry } from "../renderer/vendor/we-scene/pkg/container.js";
 import fs from "node:fs";
+import { stripComments as stripCommentsShared } from "./lib/source-scan.mjs";
 import { join } from "node:path";
 
 import { LIB, ROOT, imp } from "./lib/verify-kit.mjs";
@@ -40,33 +42,6 @@ const listUndefined = argv.includes("--undefined");
 
 // ---------- scene.pkg 读取（container.js 的最小子集，与 verify-text.mjs 同源） ----------
 
-function parsePkg(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const magicLen = dv.getUint32(0, true);
-  let magic = "";
-  for (let i = 4; i < 4 + magicLen; i++) magic += String.fromCharCode(buf[i]);
-  if (!magic.startsWith("PKGV")) throw new Error("不是 scene.pkg: " + magic);
-  const count = dv.getUint32(4 + magicLen, true);
-  let p = 4 + magicLen + 4;
-  const entries = [];
-  for (let i = 0; i < count; i++) {
-    const nameLen = dv.getUint32(p, true);
-    p += 4;
-    const name = new TextDecoder("utf-8").decode(buf.subarray(p, p + nameLen));
-    p += nameLen;
-    const offset = dv.getUint32(p, true);
-    p += 4;
-    const size = dv.getUint32(p, true);
-    p += 4;
-    entries.push({ name, offset, size });
-  }
-  return { entries, dataStart: p, buf, magic };
-}
-function getEntry(pkg, name) {
-  const e = pkg.entries.find((x) => x.name === name);
-  if (!e) return null;
-  return pkg.buf.subarray(pkg.dataStart + e.offset, pkg.dataStart + e.offset + e.size);
-}
 const readText = (b) => new TextDecoder().decode(b).replace(/^\uFEFF/, "");
 
 // 与 main.ts 的 shaderResolver 同语义：pkg 内嵌优先，缺失时回落内置公共头。
@@ -119,10 +94,16 @@ const GLSL_BUILTINS = new Set([
 // ---------- 未定义符号扫描 ----------
 
 function stripComments(src) {
-  // 保留换行，便于报行号
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .replace(/\/\/[^\n]*/g, "");
+  // 保留换行，便于报行号。
+  // 实现换成 scripts/lib/source-scan.mjs 的**字符串感知**版：朴素正则会把字符串里的
+  // `/*` 当成块注释开头，一路吃到后面某个 `*/`，反而删掉真代码（本轮实测踩到 —— 见
+  // 该文件头注）。行号保留的语义不变。
+  const stripped = stripCommentsShared(src);
+  const rawLines = src.split("\n").length;
+  const outLines = stripped.split("\n");
+  // 行数一致时原样返回；不一致说明有多行块注释被压掉，补足换行以维持行号
+  if (outLines.length === rawLines) return stripped;
+  return outLines.join("\n") + "\n".repeat(Math.max(0, rawLines - outLines.length));
 }
 
 // 本文件内定义的函数名：`TYPE NAME(` 后跟 { 或 ;（含 struct 返回类型），以及函数宏

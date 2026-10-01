@@ -3,37 +3,11 @@
  * 全库扫 scene.json 脚本里的 API 引用，对照沙箱已实现面，列出待补清单。
  * 一次性排查脚本，不进 pnpm check。
  */
+import { parsePkg, getEntry } from "../renderer/vendor/we-scene/pkg/container.js";
 import fs from "node:fs";
 import { join } from "node:path";
 import { LIB, dec } from "./lib/verify-kit.mjs";
 
-function parsePkg(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const magicLen = dv.getUint32(0, true);
-  let magic = "";
-  for (let i = 4; i < 4 + magicLen; i++) magic += String.fromCharCode(buf[i]);
-  if (!magic.startsWith("PKGV")) throw new Error("不是 scene.pkg");
-  const count = dv.getUint32(4 + magicLen, true);
-  let p = 4 + magicLen + 4;
-  const entries = [];
-  for (let i = 0; i < count; i++) {
-    const nameLen = dv.getUint32(p, true);
-    p += 4;
-    const name = dec.decode(buf.subarray(p, p + nameLen));
-    p += nameLen;
-    const offset = dv.getUint32(p, true);
-    p += 4;
-    const size = dv.getUint32(p, true);
-    p += 4;
-    entries.push({ name, offset, size });
-  }
-  return { entries, dataStart: p, buf };
-}
-function getEntry(pkg, name) {
-  const e = pkg.entries.find((x) => x.name === name);
-  if (!e) return null;
-  return pkg.buf.subarray(pkg.dataStart + e.offset, pkg.dataStart + e.offset + e.size);
-}
 
 function walkScripts(node, out, depth = 0) {
   if (depth > 40 || node == null) return;
