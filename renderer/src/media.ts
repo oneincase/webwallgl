@@ -25,7 +25,7 @@ import { occlusionFpsCap } from "./occlusion";
 import { createLoopingVideo } from "./video-loop";
 import { mountWebCodecsVideo, supportsWebCodecsVideo } from "./video-webcodecs";
 import type { WallpaperConfig } from "./types";
-import { rnd, noise } from "./vendor";
+import { rnd } from "./vendor";
 
 /** 合成单图层场景（fit 语义同 object-fit） */
 export function buildMediaScene(width: number, height: number, textureName: string) {

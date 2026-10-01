@@ -4,7 +4,6 @@ import * as texMod from "../vendor/we-scene/pkg/texture.js";
 import * as sceneMod from "../vendor/we-scene/scene/parse.js";
 import * as effMod from "../vendor/we-scene/scene/effects-parse.js";
 import * as rndMod from "../vendor/we-scene/render/renderer.js";
-import * as noiseMod from "../vendor/we-scene/render/noise.js";
 import * as particlesMod from "../vendor/we-scene/render/particles.js";
 import * as particleTexMod from "../vendor/we-scene/render/particle-textures.js";
 import * as sysTexMod from "../vendor/we-scene/render/system-textures.js";
@@ -30,7 +29,6 @@ const tex = asAny(texMod);
 const scn = asAny(sceneMod);
 const eff = asAny(effMod);
 const rnd = asAny(rndMod);
-const noise = asAny(noiseMod);
 const particles = asAny(particlesMod);
 const ptex = asAny(particleTexMod);
 const sysTex = asAny(sysTexMod);
@@ -49,5 +47,5 @@ const hitTest = asAny(hitTestMod);
 const cursorDispatch = asAny(cursorDispatchMod);
 
 export {
-  pkg, tex, scn, eff, rnd, noise, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, pointerLib, hitTest, cursorDispatch, anim, camPath, audioMod,
+  pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, pointerLib, hitTest, cursorDispatch, anim, camPath, audioMod,
 };

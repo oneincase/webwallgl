@@ -2252,18 +2252,6 @@ export function createRenderer(canvas, opts = {}) {
       setBlend('translucent')
     }
   }
-  function drawQuad(prog, fbo, w, h, verts, mvp, blending) {
-    gl.useProgram(prog)
-    setBlend(blending)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo ? fbo.fbo : null)
-    gl.viewport(0, 0, w, h)
-    gl.bindVertexArray(vao)
-    uploadQuad('draw', verts)
-    const loc = gl.getUniformLocation(prog, 'u_MVP')
-    gl.uniformMatrix4fv(loc, false, mvp)
-    gl.drawArrays(gl.TRIANGLES, 0, 6)
-  }
-
   // [we-scene patch] 图层的「裁剪包围盒」：世界 AABB 中心/半宽高 + 余量。
   // 几何本体已提到模块级 layerCullBoundsOf（纯函数，供 verify 直接调用做行为断言）；
   // 这里只把闭包态 parallaxCtx 传进去 —— 视锥裁剪与 ROI 图层裁剪（V5 方案 E）必须用
@@ -4278,7 +4266,6 @@ export function createRenderer(canvas, opts = {}) {
       const texNames = mp.textures || []
       const maxTex = Math.max(texNames.length, 8)
       const resolutions = new Map()
-      const usedUnits = new Set()
       for (let ti = 0; ti < maxTex; ti++) {
         // 本槽的名字 = 上面合并好的 mergedTex（含 `$` 保留名 / 用户属性名的原槽回落）。
         // 这里曾经按 mp.textures / ov.textures 重新推一遍，与 mergedTex 是同一段逻辑的
@@ -4342,7 +4329,6 @@ export function createRenderer(canvas, opts = {}) {
           // 贴图对象（entry）在多个 pass / 多帧之间共享，设一次即可，避免每帧的冗余调用。
           entry.samplerWrapSet = true
         }
-        usedUnits.add(ti)
         resolutions.set(ti, [t.width, t.height, t.width, t.height])
       }
       // 系统 uniform（mvp 随 quad 空间，见上方说明）
