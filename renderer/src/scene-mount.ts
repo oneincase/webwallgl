@@ -6092,6 +6092,12 @@ cfg, source, pkgAbort.signal);
           void renderer
             .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y, roiWorld)
             .then(() => {
+              // [we-scene patch] 本代已拆（clear/destroy）就立刻退出：**不得**再触发
+              // rt.onFirstFrame —— 那个槽位是新代装的，旧代在飞的这一帧会把新代的
+              // mount() 提前 resolve（docs/ENGINE-REVIEW-2026-10.md §3.3）。
+              // 注意与下面的 `rt.paused` 早退区分：paused 是「本代还活着但停着」，
+              // 首帧仍要落地（autoplay:false 的语义就是「就绪但静止」）。
+              if (disposed) return;
               // 库化桥接：首帧**画完之后**才 resolve mount() 的 Promise（一次性）。
               // 必须在 render().then 里，不能放在调用之前：那样 Promise 会早一帧
               // 落地，调用方拿到实例时画布还是空的 —— autoplay:false 紧接着

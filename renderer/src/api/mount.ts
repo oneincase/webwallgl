@@ -61,11 +61,16 @@ function mediaProjectType(project: unknown): string | null {
  * 场景需要真 canvas。`reuse=false` 时必换新画布：`loseContext()` 异步生效，
  * `isContextLost()` 不可信；建过 GL 的旧画布重挂会拿到死上下文（黑屏）。
  */
-function ensureSceneCanvas(el: HTMLElement, reuse = true): HTMLCanvasElement {
+function ensureSceneCanvas(el: HTMLElement): HTMLCanvasElement {
   if (el instanceof HTMLCanvasElement) return el;
   const existing = el.querySelector(":scope > canvas[data-webwallgl]");
   if (existing instanceof HTMLCanvasElement) {
-    if (reuse || existing.getAttribute("data-webwallgl-gl") !== "1") return existing;
+    // 只要这块画布**建过 GL 上下文**，它的上下文就一定已经不可用：destroy()/release()
+    // 走 renderer.dispose() → loseContext()，而 loseContext 异步生效，同步查
+    // isContextLost() 不可信（见 remountCurrent 的说明）。所以「建过就换」，不看调用方。
+    // 原先有个 reuse=true 的快捷路径，导致 destroy() 之后再 mount() 到同一容器会
+    // 复用那块**死画布**（黑屏）—— docs/ENGINE-REVIEW-2026-10.md §3.3。
+    if (existing.getAttribute("data-webwallgl-gl") !== "1") return existing;
     existing.remove();
   }
   const c = document.createElement("canvas");
@@ -74,6 +79,12 @@ function ensureSceneCanvas(el: HTMLElement, reuse = true): HTMLCanvasElement {
   if (getComputedStyle(el).position === "static") el.style.position = "relative";
   el.appendChild(c);
   return c;
+}
+
+/** 装配中途退出时回收「库自建的那块画布」（调用方自己传的画布不碰）。 */
+function releaseOwnCanvas(cfg: { canvas?: unknown }, el: HTMLElement) {
+  const c = cfg.canvas;
+  if (c instanceof HTMLCanvasElement && c !== el && c.parentElement) c.remove();
 }
 
 async function resolveMountConfig(
@@ -227,6 +238,26 @@ export function createScene(
   // 对外仍暴露 .canvas：场景是真 canvas；网页是传入的容器元素
   let boundEl: HTMLElement = el;
 
+  // [we-scene patch] 实例终态与代际（docs/ENGINE-REVIEW-2026-10.md §3.3）。
+  //
+  // 没有它们时的两个洞：destroy() 落在 `await resolveMountConfig` 的窗口里不生效 ——
+  // 异步体接着往下走，在一个已销毁的 runtime 上装配出完整场景 + rAF（「复活」）；
+  // 同理 load(A) 的 await 期间再来 load(B)，A 的尾巴会把 B 的配置覆盖掉。
+  // destroyed 是**终态**（destroy 之后所有公开方法只 no-op，不复活）；
+  // gen 是**代际**（同一实例上的连续 load/mount 各自一代，旧代在每个 await 后自行退出）。
+  let destroyed = false;
+  let gen = 0;
+  const beginGen = () => ++gen;
+  const isCurrent = (g: number) => g === gen && !destroyed;
+  /**
+   * 当前这一代「等首帧」的收尾钩子。destroy() 用它把挂起的 mount()/load() 明确拒掉 ——
+   * 否则代际作废之后那个 Promise 永远不落地（看门狗也因代际核对而不触发），
+   * 又变回 issue #9 要消灭的「既不 resolve 也不 reject」黑洞。
+   * 注意：被**新的 load 取代**（而非 destroy）时故意不落地 —— 那一次装配的结论已经
+   * 没人关心，而新的一代自带自己的 Promise；调用方想确定收尾就 await 每一次 load。
+   */
+  let settlePending: (() => void) | null = null;
+
   const emitError = (err: Error) => {
     for (const fn of events.error) {
       try {
@@ -303,11 +334,19 @@ export function createScene(
     };
   };
 
-  const armFirstFrame = (): Promise<void> => {
-    return new Promise<void>((resolve) => {
+  const armFirstFrame = (g: number): Promise<void> => {
+    return new Promise<void>((resolve, reject) => {
+      settlePending = () => {
+        settlePending = null;
+        reject(new Error("实例已销毁：挂载/加载未完成"));
+      };
       const prev = rt.onFirstFrame;
       rt.onFirstFrame = () => {
         rt.onFirstFrame = undefined;
+        // 旧代的回调可能被新代链着（prev?.()）：只让**本代**的 Promise 落地，
+        // 否则 clear→重挂后旧代在飞的帧会提前 resolve 新代的 mount()。
+        if (!isCurrent(g)) return;
+        settlePending = null;
         prev?.();
         const info = (rt.info as SceneInfo) ?? {
           width: 0,
@@ -334,10 +373,14 @@ export function createScene(
     });
   };
 
-  const armFailure = (): { promise: Promise<never>; off: () => void } => {
+  const armFailure = (g: number): { promise: Promise<never>; off: () => void } => {
     let off: () => void = () => {};
     const promise = new Promise<never>((_, reject) => {
-      off = instance.on("error", (e) => reject(e));
+      // 事件总线是**实例级**的（跨代共享）：不加代际核对时，旧代装配失败会顺手把
+      // 新代正在等的 Promise 也 reject 掉（两代共用一个 error 通道）。
+      off = instance.on("error", (e) => {
+        if (isCurrent(g)) reject(e);
+      });
     });
     return { promise, off };
   };
@@ -352,12 +395,14 @@ export function createScene(
    * 是「真死了」。超时**不**销毁实例：调用方拿到 reject 后仍可自行 destroy()，
    * 也可能选择继续等（极慢的冷启动），这里不替它做决定。
    */
-  const armWatchdog = (): { promise: Promise<never>; off: () => void } => {
+  const armWatchdog = (g: number): { promise: Promise<never>; off: () => void } => {
     const ms = currentOptions.mountTimeoutMs === undefined ? MOUNT_WATCHDOG_MS : Number(currentOptions.mountTimeoutMs);
     if (!Number.isFinite(ms) || ms <= 0) return { promise: new Promise<never>(() => {}), off: () => {} };
     let timer: ReturnType<typeof setTimeout>;
     const promise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        // 代际核对：被取代/已销毁的那一代不该再报超时（它早已不是调用方在等的那件事）
+        if (!isCurrent(g)) return;
         const err = new Error(
           `mount 首帧超时（${Math.round(ms)}ms）：渲染循环没有产出首帧，也没有触发 onError。` +
             `若不是在极慢的冷启动，多半是渲染循环已无声死亡 —— 开 onDiagnostic 看最后一条诊断。` +
@@ -378,7 +423,7 @@ export function createScene(
    * 同一 canvas 再 `getContext("webgl2")` 拿回的还是那个 lost 对象。
    * 而 `loseContext()` 是**异步生效**的，`clear()` 之后同步查 `isContextLost()`
    * 仍是 false，所以只能按「建过上下文就换」这个确定性事实决策
-   * （`ensureSceneCanvas(el, false)`），不去猜它此刻死没死。
+   * （ensureSceneCanvas 里「建过 GL 就换」这条规则），不去猜它此刻死没死。
    *
    * 先 clear 再换画布：clear 要读 `rt.canvas` 等旧引用做回收，换早了就漏。
    * 装配函数开头自己也会 clear 一次，幂等，多调只是空转。
@@ -403,7 +448,7 @@ export function createScene(
         );
         return;
       }
-      const fresh = ensureSceneCanvas(el, false);
+      const fresh = ensureSceneCanvas(el);
       if (fresh !== rt.cfg.canvas) {
         rt.cfg = { ...rt.cfg, canvas: fresh };
         boundEl = fresh;
@@ -637,9 +682,25 @@ export function createScene(
           /* 忽略 */
         }
       }
+      if (destroyed) {
+        // 终态：destroy 之后不再复活（原先会重新装配出整场景 + rAF）。
+        // 用**拒绝**而不是静默 no-op 收场：destroy 已经把 onDiagnostic 清掉、
+        // mediaBase 缺省时连 /diag 的 Image 通道也是关的 —— 「no-op + 上报」在库形态下
+        // 仍然是静默的，而静默正是这轮要消灭的东西（issue #9 / §3.5 同理）。
+        // 调用方在清理路径里忘了 catch 会看到一条 unhandled rejection —— 那正是它该知道的。
+        throw new Error("实例已销毁：实例是终态，load 不会复活它（请重新 mount()）");
+      }
+      const g = beginGen();
       currentOptions = { ...currentOptions, source };
       wireOptions(currentOptions);
       const cfg = await resolveMountConfig(boundEl, currentOptions);
+      // destroy 落在上面这个 await 的窗口里时，settlePending 还没装上（那是 armFirstFrame
+      // 的事），所以这里必须自己收尾：明确拒绝 + 把刚建的画布撤掉，不留孤儿元素。
+      if (destroyed) {
+        releaseOwnCanvas(cfg, boundEl);
+        throw new Error("实例已销毁：加载未完成");
+      }
+      if (!isCurrent(g)) return; // 被新的一次 load 取代：静默退出（调用方 await 的是新那次）
       // scene 与媒体都画在 canvas 上（resolveMountConfig 里 ensureSceneCanvas 取到
       // 的那一块）；网页路径没有 canvas，boundEl 保持调用方传入的容器。
       if (cfg.type !== "web" && cfg.canvas instanceof HTMLCanvasElement) {
@@ -652,22 +713,31 @@ export function createScene(
       if (currentOptions.properties) {
         rt.liveUserProps = { ...currentOptions.properties };
       }
-      const firstFrame = armFirstFrame();
-      const failure = armFailure();
-      const watchdog = armWatchdog();
+      const firstFrame = armFirstFrame(g);
+      const failure = armFailure(g);
+      const watchdog = armWatchdog(g);
       mountWallpaper(rt, cfg);
       try {
         await Promise.race([firstFrame, failure.promise, watchdog.promise]);
       } finally {
+        settlePending = null;
         failure.off();
         watchdog.off();
       }
     },
 
     release() {
+      if (destroyed) {
+        reportDiag(rt, rt.cfg, "release: 实例已销毁，忽略本次调用", "warn");
+        return;
+      }
       clear(rt);
     },
     restore() {
+      if (destroyed) {
+        reportDiag(rt, rt.cfg, "restore: 实例已销毁，忽略本次调用", "warn");
+        return;
+      }
       remountCurrent();
     },
     /**
@@ -680,6 +750,13 @@ export function createScene(
      * 多实例共享同一 key 时，另一实例只是下次重挂多一次下载，不影响正确性。
      */
     destroy(opts?: { releasePkgCache?: boolean }) {
+      // 先置终态、再作废代际，最后才拆运行时：顺序反了的话，正在飞的装配体会在
+      // destroyRuntime 与 gen++ 之间的窗口里继续往下走（复活）。
+      destroyed = true;
+      gen++;
+      const pending = settlePending;
+      settlePending = null;
+      pending?.(); // 挂起中的 mount()/load() 明确 reject，不留悬空 Promise
       destroyRuntime(rt);
       if (opts?.releasePkgCache) {
         dropPkgCache(rt.cfg.source?.key ?? currentOptions.source?.key);
@@ -718,9 +795,17 @@ export function createScene(
   };
 
   const applyOptions = async (o: MountOptions) => {
+    // 同 load()：终态实例上的挂载请求明确拒绝，不静默 no-op
+    if (destroyed) throw new Error("实例已销毁：实例是终态，不能用它继续挂载");
+    const g = beginGen();
     currentOptions = o;
     wireOptions(o);
     const cfg = await resolveMountConfig(el, o);
+    if (destroyed) {
+      releaseOwnCanvas(cfg, el);
+      throw new Error("实例已销毁：挂载未完成");
+    }
+    if (!isCurrent(g)) return;
     // 同 load()：scene 与媒体都以 canvas 为绑定元素，网页保持容器
     if (cfg.type !== "web" && cfg.canvas instanceof HTMLCanvasElement) {
       boundEl = cfg.canvas;
@@ -738,16 +823,18 @@ export function createScene(
     if (o.properties && Object.keys(o.properties).length) {
       rt.liveUserProps = { ...o.properties };
     }
-    const firstFrame = armFirstFrame();
-    const failure = armFailure();
-    const watchdog = armWatchdog();
+    const firstFrame = armFirstFrame(g);
+    const failure = armFailure(g);
+    const watchdog = armWatchdog(g);
     mountWallpaper(rt, rt.cfg);
     try {
       await Promise.race([firstFrame, failure.promise, watchdog.promise]);
     } finally {
+      settlePending = null;
       failure.off();
       watchdog.off();
     }
+    if (!isCurrent(g)) return; // 等首帧期间被 destroy：不要再 pause/setVolume/setProperties
     if (o.autoplay === false) instance.pause();
     if ((o.volume ?? 0) > 0) instance.setVolume(o.volume as number);
     // 网页种子属性已在 HTML 改写时灌入；再推一次覆盖热更路径
@@ -770,6 +857,18 @@ export async function mount(
 ): Promise<SceneInstance> {
   const instance = createScene(el, options);
   const withApply = instance as unknown as { __applyOptions: (o: MountOptions) => Promise<void> };
-  await withApply.__applyOptions(options);
+  try {
+    await withApply.__applyOptions(options);
+  } catch (e) {
+    // 失败/超时时调用方拿不到实例就没法回收（GL 上下文、画布、监听、pkg 缓存全留着）。
+    // 看门狗刻意**不**替调用方销毁（它可能想再等等极慢的冷启动），所以这里把实例
+    // 附在错误上：`catch (e) { e.instance?.destroy() }` 就能收尾，也可以选择继续等。
+    const err = e instanceof Error ? e : new Error(String(e));
+    if (!("instance" in err)) {
+      Object.defineProperty(err, "instance", { value: instance, enumerable: false, configurable: true });
+      err.message += "（实例已附在 err.instance：可 destroy() 回收，或继续等待）";
+    }
+    throw err;
+  }
   return instance;
 }

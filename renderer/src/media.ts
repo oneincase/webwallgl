@@ -597,6 +597,10 @@ export function mountMedia(rt: Runtime, cfg: WallpaperConfig) {
             )
             .then(() => {
               renderedOnce = true;
+              // [we-scene patch] 与 scene-mount 同款：本代已拆就不再触发首帧回调，
+              // 免得旧代在飞的帧把新代的 mount() 提前 resolve（paused 不在此列，
+              // 那只是「本代停着」，首帧仍要落地）。
+              if (disposed) return;
               // 库化桥接：首帧**画完之后**才 resolve mount()（一次性）。
               // 放在 render() 之前会早一帧落地，调用方拿到实例时画布还是空的；
               // autoplay:false 紧接着 pause()，画面就永远停在一片 clearcolor。

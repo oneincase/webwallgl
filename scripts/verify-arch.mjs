@@ -232,9 +232,16 @@ for (const name of REQUIRED_WP) {
   const apiMount = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
   const sceneMount = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   const media = fs.readFileSync(path.join(ROOT, "renderer/src/media.ts"), "utf8");
+  // [2026-10 契约变更] 这条规则从「调用方传 reuse=false」升级为「**函数内部建过就换**」：
+  // loseContext 异步生效，任何调用方都可能拿着死画布来（不只是 remountCurrent），
+  // 把判断收进 ensureSceneCanvas 才是唯一可靠的位置。守卫跟着契约搬家（不变量 6）。
   check(
-    /function ensureSceneCanvas\(el: HTMLElement, reuse = true\)/.test(apiMount),
-    "ensureSceneCanvas 必须带 reuse 形参（重挂时传 false 强制换画布）",
+    /function ensureSceneCanvas\(el: HTMLElement\): HTMLCanvasElement/.test(apiMount),
+    "ensureSceneCanvas 不得再有 reuse 捷径参数（换不换画布由函数自己按 data-webwallgl-gl 判定）",
+  );
+  check(
+    /if \(existing\.getAttribute\("data-webwallgl-gl"\) !== "1"\) return existing;\n\s*existing\.remove\(\);/m.test(apiMount),
+    "ensureSceneCanvas 必须「建过 GL 上下文就换画布」（loseContext 后同一 canvas 拿不回可用上下文）",
   );
   check(
     /const remountCurrent\s*=/.test(apiMount),
@@ -257,8 +264,8 @@ for (const name of REQUIRED_WP) {
     check(body.length > 0, "verify-arch 无法定位 remountCurrent 函数体（重构后请同步本检查）");
     const code = body.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
     check(
-      /ensureSceneCanvas\(\s*el\s*,\s*false\s*\)/.test(code),
-      "remountCurrent 必须 ensureSceneCanvas(el, false) 强制换画布 —— 复用建过 GL 上下文的画布会拿到 loseContext 后的死上下文",
+      /ensureSceneCanvas\(\s*el\s*\)/.test(code),
+      "remountCurrent 必须走 ensureSceneCanvas 取画布（换新由该函数内部按 GL 标记决定 —— 契约 2026-10 变更）",
     );
     check(
       !/isContextLost\(\)/.test(code),

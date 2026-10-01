@@ -59,6 +59,9 @@ const STABLE = [
   // dist/ 归属边界：站点构建不许删 dist/lib（宿主 WallpaperEM 的 file: 依赖指着它；
   // 2026-10-01 被站点构建清空 dist/ 连累过 —— 宿主侧全线 ENOENT）
   "verify-dist",
+  // 实例生命周期/代际（M4）：终态、await 后代际核对、旧代不触发新代首帧、画布所有权
+  // （源码守卫；行为面见 scripts/_probe-review-lifecycle.mjs 的无头真装配）
+  "verify-lifecycle",
   // 噪声路径逐位等价（粒子热点的单元格角点缓存；0 容差对拍 + A/B 开关）
   "verify-noise",
   // 内置贴图像素金样（mulberry32 收敛 B1；82 张 + 种子表）

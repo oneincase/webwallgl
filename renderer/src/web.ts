@@ -1294,7 +1294,13 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
   };
 
   void (async () => {
+    // [we-scene patch] 代际核对（docs/ENGINE-REVIEW-2026-10.md §3.3）：这个异步体里有两个
+    // await（拉 project.json / 拉 HTML），期间宿主可能又 setWallpaper 了一次（clear 会
+    // 把 rt.gen 自增）。此前两代都会走到 attachIframe —— 第二个 iframe 挂进容器、rt.iframe
+    // 只指向后者，**孤儿 iframe 永久联网跑脚本**且下一次 clear 再也回收不到它。
+    const g = rt.gen;
     const defaults = await fetchProjectWire(entry);
+    if (g !== rt.gen) return; // 已被新的一代/卸载取代：本次丢弃，什么都不挂
     const wire = mergeLiveIntoWire(defaults, rt.liveUserProps);
     rt.liveUserProps = Object.fromEntries(Object.entries(wire).map(([k, w]) => [k, w.value]));
 
@@ -1348,8 +1354,15 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
         // fps 同理按当前遮挡档收敛（seedFpsOf），防重挂瞬间满帧跑
         seedScript: buildSeedScript(wire, seedFpsOf(rt), effectiveUserVolume(rt, cfg)),
       });
+      // 第二个 await（fetch HTML）之后再核一次代际：这是最后一道门 —— blob 一旦创建
+      // 又没挂上，就必须自己 revoke，否则连内存都留着。
+      if (g !== rt.gen) return;
       const blob = new Blob([rewritten], { type: "text/html;charset=utf-8" });
       const blobUrl = URL.createObjectURL(blob);
+      if (g !== rt.gen) {
+        URL.revokeObjectURL(blobUrl);
+        return;
+      }
       attachIframe(rt, cfg, container, blobUrl, { blobUrl, injected: true, frameClock, strictSandbox: cfg.webSandbox === "strict" });
       startPumps();
     } catch (e) {

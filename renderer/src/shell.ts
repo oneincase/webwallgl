@@ -112,6 +112,15 @@ export type Runtime = {
      */
     glStats?: () => Record<string, number>;
   };
+  /**
+   * [we-scene patch] 代际令牌：**每次 clear() 自增**（换壁纸 / 卸载 / 重挂都会走 clear）。
+   *
+   * 异步装配体（mountWeb 的 fetch 链、createScene 的 await 链）必须在每个 await 之后
+   * 核对代际：装配途中来了新的一代（或实例被 destroy），旧的一代继续往下走就会
+   * 「两代同时落地」—— 孤儿 iframe、destroy 后被复活、旧 render 提前 resolve 新代
+   * 的首帧（docs/ENGINE-REVIEW-2026-10.md §3.3）。
+   */
+  gen?: number;
   /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
   objectUrls?: string[];
   /** 场景内视频纹理元素（暂停并移除） */
@@ -391,6 +400,7 @@ export function createRuntime(opts?: { fullscreen?: boolean }): Runtime {
     coverAlign: { x: 0.5, y: 0.5, tx: 0.5, ty: 0.5 },
     frameMeter: { stamps: [], last: 0, fps: 0 },
     disposers: [],
+    gen: 0,
   };
   if (opts?.fullscreen) setupFullscreen(rt);
   return rt;
@@ -430,6 +440,10 @@ function setupFullscreen(rt: Runtime) {
 })();
 
 export function clear(rt: Runtime) {
+  // 代际自增：所有「装配途中」的异步体在这一刻起作废（它们逐 await 核对 rt.gen）。
+  // 放在函数最前面 —— clear 的后半段会拆掉画布/iframe/监听，任何还在飞的装配体
+  // 都不该再往这个 runtime 上落地任何东西。
+  rt.gen = (rt.gen ?? 0) + 1;
   // iframe 先导航走再移除：WKWebView 对带活动文档的 iframe 回收迟缓，
   // 置空 src 促发文档立即拆毁（网页壁纸大堆内存随文档释放）
   if (rt.iframe) {
