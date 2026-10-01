@@ -120,9 +120,25 @@ let nmCount = false
 let nmProbed = false
 let nmHits = 0
 let nmMisses = 0
+// 单元格缓存的计数（同一开关 nmCount；默认关 —— 热路径上别留自增）
+let ncHits = 0
+let ncMisses = 0
 /** 命中率是判断「这张壁纸值不值得走记忆化」的唯一依据（需先开 __noiseMemoCount） */
 export function noiseMemoStats() {
-  return { hits: nmHits, misses: nmMisses, size: NM_SIZE, off: nmOff, counting: nmCount }
+  return {
+    hits: nmHits,
+    misses: nmMisses,
+    size: NM_SIZE,
+    off: nmOff,
+    counting: nmCount,
+    cellOff: ncOff,
+    cellSize: NC_SIZE,
+    // 单元格缓存命中率才是「还有没有复用空间」的判据：
+    //   · 命中率高 → 省下的是查表，成本在未命中的 hash3 上（sin）；
+    //   · 命中率低 → 复用本来就不存在，只剩「少算几次噪声」这种改语义的路。
+    cellHits: ncHits,
+    cellMisses: ncMisses,
+  }
 }
 // 页面级诊断钩子
 globalThis.__noiseMemoStats = noiseMemoStats
@@ -132,6 +148,7 @@ function hash3(x, y, z) {
     nmProbed = true
     nmOff = globalThis.__noiseMemoOff === true
     nmCount = globalThis.__noiseMemoCount === true
+    ncOff = globalThis.__noiseCellOff === true
   }
   if (nmOff) {
     const n0 = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
@@ -154,6 +171,57 @@ function hash3(x, y, z) {
   nmVal[slot] = v
   return v
 }
+// 单元格角点缓存（2026-10-01）。
+//
+// 动因是实测：重粒子场景（3262691944，19 个粒子系统）稳态热点里 hash3 占 **67.1%**、
+// vnoise3 8.1%，而 updateParticle 只有 4% —— 瓶颈不在每粒子的分配/算子求值，
+// 而在噪声本身（profile 见 docs/ENGINE-REVIEW-2026-10.md §11）。
+//
+// 一次 vnoise3 要取三线性插值的 **8 个角点**，每个角点都是一次「哈希 + 三次整值比对 + 数组读」。
+// 但角点只由**整数格点**决定，与小数偏移无关 —— 所以可以按单元格缓存这 8 个值，
+// 把 8 次查表压成 1 次（命中时只是 8 个连续 double 的读取）。
+//
+// 与原实现**逐位等价**：存的就是 hash3 的返回值，插值顺序与权重公式一字未改
+// （见 verify-particles 的对拍 + 下面的 nmCellOff A/B 开关）。
+// 表大小实测过：4096 → 16384 只多 0.5fps（29.5 → 30.0，同会话交替两轮一致），说明命中率
+// 受**结构**限制而非表大小 —— 噪声的 z 轴常带时间（particles.js「turbulence」用
+// `t + p.seed*phaseMax`），x/y 随粒子位置散开，所以单元格天然只有部分复用。
+// +1.7% 换 4 倍内存（1.4MB）不划算，保持 4096（tag+值 ≈ 360KB）。
+const NC_BITS = 12
+const NC_SIZE = 1 << NC_BITS
+const NC_MASK = NC_SIZE - 1
+const ncTag = new Float64Array(NC_SIZE * 3)
+const ncVal = new Float64Array(NC_SIZE * 8)
+ncTag.fill(NaN)
+// A/B 开关（只关单元格缓存、保留 hash3 记忆化）：__noiseCellOff = true
+let ncOff = false
+/** 角点顺序与下面的插值一一对应：(0,0,0)(1,0,0)(0,1,0)(1,1,0)(0,0,1)(1,0,1)(0,1,1)(1,1,1) */
+function cellSlot(ix, iy, iz) {
+  const slot = ((ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791)) & NC_MASK
+  const t = slot * 3
+  if (ncTag[t] === ix && ncTag[t + 1] === iy && ncTag[t + 2] === iz) {
+    if (nmCount) ncHits++
+    return slot
+  }
+  if (nmCount) ncMisses++
+  ncTag[t] = ix
+  ncTag[t + 1] = iy
+  ncTag[t + 2] = iz
+  const v = slot * 8
+  ncVal[v] = hash3(ix, iy, iz)
+  ncVal[v + 1] = hash3(ix + 1, iy, iz)
+  ncVal[v + 2] = hash3(ix, iy + 1, iz)
+  ncVal[v + 3] = hash3(ix + 1, iy + 1, iz)
+  ncVal[v + 4] = hash3(ix, iy, iz + 1)
+  ncVal[v + 5] = hash3(ix + 1, iy, iz + 1)
+  ncVal[v + 6] = hash3(ix, iy + 1, iz + 1)
+  ncVal[v + 7] = hash3(ix + 1, iy + 1, iz + 1)
+  return slot
+}
+// 提到模块级：原来每次 vnoise3 都要新建这个闭包（正是本轮本想优化的那类分配）
+function lerp3(a, b, t) {
+  return a + (b - a) * t
+}
 function vnoise3(x, y, z) {
   const ix = Math.floor(x)
   const iy = Math.floor(y)
@@ -164,12 +232,23 @@ function vnoise3(x, y, z) {
   const sx = fx * fx * (3 - 2 * fx)
   const sy = fy * fy * (3 - 2 * fy)
   const sz = fz * fz * (3 - 2 * fz)
-  const l = (a, b, t) => a + (b - a) * t
-  const c00 = l(hash3(ix, iy, iz), hash3(ix + 1, iy, iz), sx)
-  const c10 = l(hash3(ix, iy + 1, iz), hash3(ix + 1, iy + 1, iz), sx)
-  const c01 = l(hash3(ix, iy, iz + 1), hash3(ix + 1, iy, iz + 1), sx)
-  const c11 = l(hash3(ix, iy + 1, iz + 1), hash3(ix + 1, iy + 1, iz + 1), sx)
-  return l(l(c00, c10, sy), l(c01, c11, sy), sz)
+  let c00
+  let c10
+  let c01
+  let c11
+  if (ncOff) {
+    c00 = lerp3(hash3(ix, iy, iz), hash3(ix + 1, iy, iz), sx)
+    c10 = lerp3(hash3(ix, iy + 1, iz), hash3(ix + 1, iy + 1, iz), sx)
+    c01 = lerp3(hash3(ix, iy, iz + 1), hash3(ix + 1, iy, iz + 1), sx)
+    c11 = lerp3(hash3(ix, iy + 1, iz + 1), hash3(ix + 1, iy + 1, iz + 1), sx)
+  } else {
+    const v = cellSlot(ix, iy, iz) * 8
+    c00 = lerp3(ncVal[v], ncVal[v + 1], sx)
+    c10 = lerp3(ncVal[v + 2], ncVal[v + 3], sx)
+    c01 = lerp3(ncVal[v + 4], ncVal[v + 5], sx)
+    c11 = lerp3(ncVal[v + 6], ncVal[v + 7], sx)
+  }
+  return lerp3(lerp3(c00, c10, sy), lerp3(c01, c11, sy), sz)
 }
 function fbm3(x, y, z, oct) {
   let v = 0
