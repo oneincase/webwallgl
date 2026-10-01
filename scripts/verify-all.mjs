@@ -56,6 +56,9 @@ const STABLE = [
   "verify-bake",
   // 遮挡感知降载（V5）：几何/分档数值 + 全链接线 + 变异红测（纯逻辑，离线）
   "verify-occlusion",
+  // dist/ 归属边界：站点构建不许删 dist/lib（宿主 WallpaperEM 的 file: 依赖指着它；
+  // 2026-10-01 被站点构建清空 dist/ 连累过 —— 宿主侧全线 ENOENT）
+  "verify-dist",
   // 噪声路径逐位等价（粒子热点的单元格角点缓存；0 容差对拍 + A/B 开关）
   "verify-noise",
 ];
