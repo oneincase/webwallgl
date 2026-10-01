@@ -1,3 +1,4 @@
+import { mat4Multiply } from './math.js'
 // MDL 共享底座：列主序 4x4 工具 + 二进制读取原语（从 mdl.js 拆出）
 // [we-scene patch] 解析（mdl-parse.js）、蒙皮（mdl-skin.js）、渲染（mdl.js）
 // 三段都要用这批纯函数，单独成模块以消除曾经的 mat4Mul/mat4Invert 双实现
@@ -5,18 +6,19 @@
 const IDENTITY = Object.freeze([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 
 
+/**
+ * 与 render/math.js 的 mat4Multiply 是**同一份实现**（2026-10 B4 合并）。
+ * 原来这里是显式四项求和，与 math.js 的 `let s = 0; s += …` 在**零的符号**上不同：
+ * 实测 1e5 组随机矩阵有 244 组位型不一致，全部是 `+0` / `-0`（`0 + (-0)` 归一成 `+0`）。
+ * 零的符号不影响任何比较（`+0 === -0`）、也不影响渲染像素，但合并的意义就是只留一处
+ * —— 保留第二份等于把漂移风险留着。合并后本函数在 ±0 上跟随 math.js，由
+ * scripts/verify-mat.mjs 钉住（含 9 处三参调用的 out 缓冲语义）。
+ *
+ * 注意 **mat4Invert 不合并**：下面是 f64 高斯消元，math.js 那份是 f32 余子式，
+ * 数值路径不同，且骨骼绑定矩阵依赖这里的精度（docs/ENGINE-REVIEW-2026-10.md §4.4）。
+ */
 function mat4Mul(a, b, out) {
-  const o = out || new Float32Array(16)
-  for (let c = 0; c < 4; c++) {
-    for (let r = 0; r < 4; r++) {
-      o[c * 4 + r] =
-        a[r] * b[c * 4] +
-        a[4 + r] * b[c * 4 + 1] +
-        a[8 + r] * b[c * 4 + 2] +
-        a[12 + r] * b[c * 4 + 3]
-    }
-  }
-  return o
+  return mat4Multiply(a, b, out)
 }
 
 // 高斯消元求逆（骨骼绑定矩阵含平移/旋转/缩放，不保证正交，故用通用求逆）

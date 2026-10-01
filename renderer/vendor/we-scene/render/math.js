@@ -3,16 +3,25 @@ export function mat4Identity() {
   return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 }
 
-export function mat4Multiply(a, b) {
-  const out = new Float32Array(16)
+/**
+ * 列主序 4x4 相乘。**全引擎唯一实现**（2026-10 B4 合并，见 mdl-math.js 的同名委托）；
+ * `out` 可选，省略则新分配。
+ *
+ * 合并记录：mdl-math 那份原来是显式四项求和，与这里的 `let s = 0; s += …` 在
+ * **零的符号**上不同（实测 1e5 组随机矩阵 244 组位型不一致，全是 `+0` / `-0` ——
+ * `0 + (-0)` 会归一成 `+0`）。零的符号不影响比较也不影响渲染像素，但既然合并就只留一处；
+ * 合并后 MDL 侧跟随本实现（差异由 scripts/verify-mat.mjs 钉住）。
+ */
+export function mat4Multiply(a, b, out) {
+  const o = out || new Float32Array(16)
   for (let c = 0; c < 4; c++) {
     for (let r = 0; r < 4; r++) {
       let s = 0
       for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]
-      out[c * 4 + r] = s
+      o[c * 4 + r] = s
     }
   }
-  return out
+  return o
 }
 
 // 正交投影（世界 y 向下：top=0, bottom=height）

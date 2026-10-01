@@ -63,6 +63,8 @@ const STABLE = [
   "verify-noise",
   // 内置贴图像素金样（mulberry32 收敛 B1；82 张 + 种子表）
   "verify-rng",
+  // 4x4 乘法唯一实现契约（B4：值等价 + 位等价 + out 语义 + invert 不合并）
+  "verify-mat",
   // 着色器链接唯一实现契约（B3：属性表 / 不绑语义 / mdl 骨预算重试保留）
   "verify-link",
 ];
