@@ -799,6 +799,42 @@ export function createRenderer(canvas, opts = {}) {
   const glReg = createGlRegistry(gl)
   const shaderResolver = opts.shaderResolver || (async () => null)
   const diag = opts.diag || (() => {})
+  // [we-scene patch] WebGL 上下文丢失（docs/ENGINE-REVIEW-2026-10.md §3.2）。
+  //
+  // 实测（真 GPU / ANGLE Metal）：丢失后画面**静默冻结** —— 相隔 1.5s 的两张截图逐字节
+  // 相同，而 rAF 照跑、fps 照计、console 与 /diag 全空。这与 resolveMsaa 那段注释记录过的
+  // MSAA blit 静默失败**症状完全一致**，没有任何信号能把两者区分开。
+  //
+  // 更硬的一条是规范级的：丢失事件无人 preventDefault() 时上下文**不可恢复** ——
+  // 实测随后调 restoreContext() 画面依旧冻结、webglcontextrestored 一次都不触发。
+  //
+  // 所以这里只做三件必须的事，**不**重建 GL 资源（那需要独立里程碑）：
+  //   1. preventDefault() —— 让浏览器保留恢复的可能（不调就永远恢复不了）；
+  //   2. 标记 + 一次性诊断 —— 把「静默」变成宿主看得见的事件；
+  //   3. 对外暴露 contextLost() —— 恢复/重挂载的决定权交给宿主（装配层接到 onError）。
+  let contextLost = false
+  let lostDiagDone = false
+  let restoredDiagDone = false
+  const onContextLost = (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault()
+    contextLost = true
+    if (!lostDiagDone) {
+      lostDiagDone = true
+      diag('上下文丢失：画面已冻结且不会再更新（rAF 仍在跑、fps 仍照计）—— 已 preventDefault 保留恢复可能，宿主应重挂载')
+    }
+  }
+  const onContextRestored = () => {
+    // 浏览器把上下文还回来了，但引擎缓存里的 program/FBO/纹理句柄全部失效 ——
+    // 不重建就等于继续冻结，如实上报，由宿主决定重挂载。
+    if (!restoredDiagDone) {
+      restoredDiagDone = true
+      diag('上下文丢失：浏览器已恢复上下文，但引擎不重建 GL 资源（句柄已失效）—— 宿主应重挂载')
+    }
+  }
+  if (canvas && typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('webglcontextlost', onContextLost)
+    canvas.addEventListener('webglcontextrestored', onContextRestored)
+  }
   // [we-scene patch] 视频帧中转离屏 canvas（video→GL 直传在部分 WebView 受限，用 drawImage 中转更稳）
   const videoCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null
   if (videoCanvas) {
@@ -2919,6 +2955,15 @@ export function createRenderer(canvas, opts = {}) {
 
 
   async function renderScene(scene, textures, width, height, time, fit, alignX, alignY, roiRects) {
+    // 上下文丢失/已判死时立刻短路：继续跑只会把每帧的 GL 调用全变成 no-op（部分实现还会
+    // 刷警告），既白耗 CPU 又让「rAF 照跑、fps 照计」这个迷惑现象继续骗人。诊断已上报过。
+    if (contextLost || (typeof gl.isContextLost === 'function' && gl.isContextLost())) {
+      if (!contextLost) {
+        contextLost = true
+        onContextLost(null)
+      }
+      return
+    }
     renderWidth = width
     renderHeight = height
     // ROI 图层裁剪（V5 方案 E）：宿主把遮挡可见区逆映射成世界矩形传入；本帧
@@ -4438,6 +4483,10 @@ export function createRenderer(canvas, opts = {}) {
   return {
     gl,
     render: renderScene,
+    /** 上下文是否已丢失（或浏览器已判死）。宿主据此决定重挂载；见 onContextLost 的说明。 */
+    contextLost: function () {
+      return contextLost || (typeof gl.isContextLost === 'function' && gl.isContextLost())
+    },
     getFBO,
     getEffectProgram,
     progCache,
@@ -4585,6 +4634,12 @@ export function createRenderer(canvas, opts = {}) {
     // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
     dispose: function () {
       try {
+        // 先摘监听：loseContext() 会触发 webglcontextlost，若不先摘，每次正常卸载
+        // 都会被自己的处理器记成「上下文丢失」并上报一条诊断（假故障）。
+        if (canvas && typeof canvas.removeEventListener === 'function') {
+          canvas.removeEventListener('webglcontextlost', onContextLost)
+          canvas.removeEventListener('webglcontextrestored', onContextRestored)
+        }
         // 再全量释放：**必须在 loseContext() 之前** —— 上下文一旦丢失，后续 delete
         // 全是 no-op，等于没释放。这一步把「靠扩展回收」变成「自己回收 + 扩展兜底」，
         // 扩展不可用时也能确定性归还（docs/ENGINE-REVIEW-2026-10.md §3.1）。

@@ -6107,6 +6107,18 @@ cfg, source, pkgAbort.signal);
               // 遮挡暂停跨到渲染回调里也要拦住重排（setOccluded(true) 取消的是
               // 挂起的 rAF，正在飞的这帧完成后不能再排下一帧）
               if (disposed || rt.paused || occlPaused(rt)) return;
+              // [we-scene patch] 上下文丢失：实测画面会**静默冻结**（rAF 照跑、fps 照计、
+              // console 与 /diag 全空），与 MSAA blit 静默失败症状无法区分。引擎已经做了
+              // preventDefault + 一次性诊断（renderer.contextLost，见其注释），这里把它
+              // 接到调用方：库走 onError，全屏页走降级页 —— 而不是让宿主对着白板干等。
+              if (rt.renderer?.contextLost?.()) {
+                const err = new Error("WebGL 上下文丢失：画面已冻结且不再更新，需要重挂载");
+                reportDiag(rt, cfg, `上下文丢失：渲染已停止更新（引擎不重建 GL 资源）`, "error");
+                disposed = true;
+                if (rt.onError) rt.onError(err);
+                else rt.fallbackPage?.();
+                return;
+              }
               // [we-scene patch] 常量动画的帧事件在 render 内（bindConstants）推进
               // 产生，render 后立刻做图层级广播（当帧派发；脚本对事件启动的动画
               // 从下一帧开始生效，与官方「播完检测」的用法兼容）。
@@ -6135,9 +6147,16 @@ cfg, source, pkgAbort.signal);
               rt.raf = requestAnimationFrame(renderLoop);
             })
             .catch((e: Error) => {
+              // [we-scene patch] 这条 catch 原先只 console.warn + diag + disposed：循环
+              // **无声死亡**（没有下一帧、宿主拿不到任何 error，只看到画面停在最后一帧）。
+              // 与装配期/守卫壳同一条出口：有 onError 交回调用方，否则挂降级页。
               console.warn("scene render error:", e);
-              reportDiag(rt, cfg, `render: ${String(e.message || e).slice(0, 200)}`, "error");
+              const err = e instanceof Error ? e : new Error(String(e));
+              if (disposed) return;
+              reportDiag(rt, cfg, `render: ${String(err.message || err).slice(0, 200)}`, "error");
               disposed = true;
+              if (rt.onError) rt.onError(err);
+              else rt.fallbackPage?.();
             });
         } else {
           if (!rt.paused && !occlPaused(rt)) rt.raf = requestAnimationFrame(renderLoop);

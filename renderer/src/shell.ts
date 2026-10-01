@@ -99,6 +99,13 @@ export type Runtime = {
     /** [we-scene patch] ROI 图层剔除统计（getOcclusion / perf-bench 诊断读） */
     roiCullStats?: () => { lastFrame: number; gateLastFrame: number; frames: number; totalCulled: number };
     /**
+     * [we-scene patch] WebGL 上下文是否已丢失。渲染循环据此把「静默冻结」变成 onError：
+     * 丢失后引擎不再渲染（实测画面冻结、rAF 照跑、零诊断，见 docs/ENGINE-REVIEW-2026-10.md §3.2）。
+     * 引擎已 preventDefault 保留恢复可能（实测 restoreContext 后 webglcontextrestored 会触发），
+     * 但**不重建** GL 资源 —— 重挂载由宿主决定。
+     */
+    contextLost?: () => boolean;
+    /**
      * [we-scene patch] GPU 资源在册数量（诊断出口，见 render/gl-registry.js）。
      * 卸载（dispose）之后应归零 —— 不归零说明有创建点漏登记或漏释放。
      * 主要给测试/宿主排查用，正常渲染路径不读它（避免每帧分配）。
