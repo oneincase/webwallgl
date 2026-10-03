@@ -80,9 +80,9 @@ const parseEffectJson = parseJsonTolerant
 /**
  * [we-scene patch issue #11] 效果链解析的诊断闸门。
  *
- * 本文件此前**每一处失败都是静默 return / 空 pass**：效果文件不在包内、JSON 解析
+ * 本文件此前**每一处失败都是静默 return / 空 pass**：效果文件不在来源里、JSON 解析
  * 失败、`passes[]` 直写 `shader`（漏了 material 那一层）、material 指向的文件不在
- * 包内 —— 四种写法都表现为「图层退回内置材质的纯色块」，作者看不出是字段层数写错
+ * 来源里 —— 四种写法都表现为「图层退回内置材质的纯色块」，作者看不出是字段层数写错
  * 还是 shader/贴图名写错，只能逐项试。
  *
  * 闸门语义：
@@ -100,6 +100,21 @@ function diagOnce(onDiag, key, msg) {
 }
 
 /**
+ * 取一个场景资源的字节 —— 两种装载形态的统一入口（见 renderer/src/api/source.ts）。
+ *
+ * 首参允许两种形态，是为了**同一份实现同时服务运行时与离线判据**：
+ *   - 函数：`async (name) => Uint8Array | null`，运行时用（包形态来自 pkg 入口表，
+ *     松散目录形态来自按相对路径 HTTP 取；两者都是异步）；
+ *   - 对象：parsePkg 结果，**旧签名兼容**（verify-effects / verify-defprojects 的
+ *     离线 fixture 直接喂 pkg 对象，同步 getEntry）。
+ * 返回值语义两者一致：未命中 `null`，命中 `Uint8Array`。
+ */
+async function readAssetName(readOrPkg, name) {
+  if (typeof readOrPkg === 'function') return await readOrPkg(name)
+  return getEntry(readOrPkg, name)
+}
+
+/**
  * [we-scene patch issue #11] `materials/util/*` 是 WE **引擎内置**材质的命名空间
  * （与 `models/util/*` 同一约定，见本文件 BUILTIN_MATERIALS）：它们随引擎发行、
  * 不随壁纸 pkg 走，本仓也刻意不把官方材质 JSON 喂进运行时（见 renderer/src/local-assets.ts
@@ -112,12 +127,16 @@ function isBuiltinAssetPath(p) {
   return typeof p === 'string' && (p.startsWith('materials/util/') || p.startsWith('models/util/'))
 }
 
-// pkg: parsePkg 结果；effect: scene.json 的效果条目（file/passes/visible）
+// readOrPkg: 取资源入口 —— 函数 = 异步读取器（`await read(name)`，运行时两形态都走它），
+//   对象 = parsePkg 结果（离线判据的旧签名，同步 getEntry）。见 readAssetName。
+// effect: scene.json 的效果条目（file/passes/visible）
 // onMaterialDoc: 可选回调。效果链里的材质是**独立文档**（materials/*.json），其中的
 //   `{"user":"名"}` 绑定不在 layer.srcObject 树里，resolveUserProps 够不到；宿主用它
 //   把文档登记下来，装配期与热更期各解析一次（见 scene-mount 的 materialDocs）。
 // onDiag: 可选回调（issue #11）。解析失败/字段不认识时上报一条可执行的诊断。
-export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag) {
+// where: 诊断文案里「文件在哪找」的说法（默认「包内」；松散目录形态传「场景目录内」）。
+//   诊断字符串是判据的一部分（verify-effects 断言 `不在包内`），所以缺省必须逐字不变。
+export async function resolveEffectChain(readOrPkg, effect, readText, onMaterialDoc, onDiag, where = '包内') {
   // [we-scene patch] **合成条目不是文件**：attachLayerMaterialEffect 为「非内置 shader
   // 的层材质」造的条目（file 恒为空串、layerMaterial:true），materialPasses/fbos 在造
   // 的时候就已经填好，没有任何文件可按。此前它照样走下面「文件不在包内」分支，于是
@@ -126,9 +145,9 @@ export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag)
   // 的 2D 工程每层都会刷）。
   if (effect && effect.layerMaterial === true) return
   const file = (effect && effect.file) || '(未命名)'
-  const entry = getEntry(pkg, effect.file)
+  const entry = await readAssetName(readOrPkg, effect.file)
   if (entry === null) {
-    diagOnce(onDiag, `${file}|missing-effect`, `effect ${file}: 效果文件不在包内，整条效果链已跳过（检查 scene.json 里 effects[].file 与 pkg 内的实际路径大小写）`)
+    diagOnce(onDiag, `${file}|missing-effect`, `effect ${file}: 效果文件不在${where}，整条效果链已跳过（检查 scene.json 里 effects[].file 与${where}的实际路径大小写）`)
     return
   }
   let ej
@@ -139,7 +158,9 @@ export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag)
     return
   }
   effect.fbos = ej.fbos || []
-  effect.materialPasses = (ej.passes || []).map((p, pi) => {
+  // 每个 pass 的材质要按名取（松散目录形态是网络请求），所以整段是异步的；
+  // Promise.all 保序，pass 顺序与串行等价。
+  effect.materialPasses = await Promise.all((ej.passes || []).map(async (p, pi) => {
     if (!p.material) {
       // [we-scene patch issue #11] 既没有 `material` 也没有 `command` —— 最典型的
       // 是把材质里的写法（`passes[].shader`）直接搬到了效果文件里。WE 的效果文件是
@@ -196,16 +217,16 @@ export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag)
         constants: {},
       }
     }
-    const me = getEntry(pkg, p.material)
+    const me = await readAssetName(readOrPkg, p.material)
     if (me === null) {
-      // [we-scene patch issue #11] material 指向的文件不在包内 → 旧代码返回一个
+      // [we-scene patch issue #11] material 指向的文件不在来源里 → 旧代码返回一个
       // `shader: null` 的空 pass（什么都不画），且一声不吭。内置命名空间除外
       // （见 isBuiltinAssetPath：那是预期状态，报出来是噪声）。
       if (!isBuiltinAssetPath(p.material)) {
         diagOnce(
           onDiag,
           `${file}|pass${pi}|missing-material`,
-          `effect ${file}: pass ${pi} 的材质 ${p.material} 不在包内，该 pass 已跳过（整条链可能因此什么都不画）`,
+          `effect ${file}: pass ${pi} 的材质 ${p.material} 不在${where}，该 pass 已跳过（整条链可能因此什么都不画）`,
         )
       }
       return { shader: null, copyCommand: false, target: p.target || null, binds: p.bind || [], blending: 'normal', textures: [], combos: {}, constants: {} }
@@ -240,7 +261,7 @@ export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag)
       combos: mp.combos || {},
       constants: mp.constantshadervalues || {},
     }
-  })
+  }))
 }
 
 // 内置模型（pkg 内没有 models/util/*）：返回内置 material 路径或 null

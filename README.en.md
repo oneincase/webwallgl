@@ -97,11 +97,11 @@ console.log(wp.canvas);
 
 ## Loading scenes: Source
 
-The library makes only two network requests (scene.pkg and optional project.json), so the resource abstraction is one interface with three built-in implementations:
+The library makes few network requests (scene.pkg, or the loose files of a source project, plus an optional project.json), so the resource abstraction is one interface with three built-in implementations:
 
 | Factory | Use case |
 | --- | --- |
-| `httpSource(baseUrl, init?)` | HTTP base URL; falls back through the three real layouts: scene.pkg → scenes/scene.pkg → gifscene.pkg |
+| `httpSource(baseUrl, init?)` | HTTP base URL; auto-detects both scene forms: containers (scene.pkg → scenes/scene.pkg → gifscene.pkg) and loose project directories (per-file fetch following project.json's file) |
 | `fileSource(file, project?)` | A local .pkg from &lt;input type=file> or drag & drop |
 | `bytesSource(pkg, project?, key?)` | Bytes already in hand (bundled, IndexedDB cache, custom transport) |
 
@@ -114,7 +114,10 @@ input.addEventListener("change", () => {
 ```
 
 - httpSource tries the root scene.pkg first and tolerates each fetch separately — WKWebView/custom protocols throw Failed to fetch instead of a 404; the wrong order breaks every wallpaper
-- source.key feeds the library's parse cache: packages with the same key are parsed once (pause/property changes cost zero network)
+- **The form is decided by project.json's file suffix**: `.json` → loose project directory (WE editor projects ship as loose folders — no packing needed), `.pkg` → container; anything else uses the container path. If the loose entry cannot be fetched it **falls back to the container** automatically
+- The loose form needs the host to serve files by relative path (the existing `GET {mediaBase}/{itemId}/&lt;path>` route suffices — no new endpoint); missing .tex textures fall back to materials/&lt;name>.png|jpg, same as source projects
+- source.key feeds the library's parse cache: the same key is not re-parsed (pause/property changes cost zero network); for the loose form the already-fetched file bytes are cached
+- Two known differences, loose form only and both visible in diagnostics: (1) without a directory listing the library cannot preload every font inside the package, so switching to an unreferenced font at runtime falls back to a system font (0 of the 17 loose items on this machine ship a fonts/ dir); (2) a script's thisScene.createLayer("models/…") is created optimistically and verified asynchronously — a missing asset drops the layer with a warning (the container form still decides synchronously and exactly)
 - A missing project.json is normal: without a property table, fields fall back to the scene.json snapshot values
 
 ## Mount options
@@ -342,7 +345,8 @@ b.pause(); // does not affect a
 ## Troubleshooting
 
 - Black screen with WEBGL2_UNAVAILABLE: no WebGL2 in this environment; there is no software fallback
-- HTTP 404: make sure the httpSource directory really contains a scene.pkg (all three layouts are tried before failing)
+- HTTP 404: make sure the httpSource directory really contains a scene.pkg (all three layouts are tried before failing); for source projects (project.json's file ends with .json) make sure that json and the materials/, models/, shaders/ … it references all live in that directory
+- Loose project renders differently from the packed build: check which form was chosen — a project.json whose file ends with .json uses the loose form, and only falls back to scene.pkg when the entry is unreachable; add `?form=pkg` or `?form=loose` to force one arm for an A/B (diagnostics print `scene form: …`); `node scripts/verify-loose.mjs --headless` compares layer fingerprints and requests across both forms
 - Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error
 - stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected
 - stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). Use the bench toolbar's "Occlusion sim" to reproduce: the HUD shows the band, ROI rect count/area (the renderer's exact decomposition) and layer culling c/g (denominator = layers passing the gate) live, plus a tile-granularity coverage readout for comparison (mirrors Lively's Grid Detection Overlay). Drag the occluder and watch "ROI area ≈ visible area" (hole-swallowing would show up as ROI area far exceeding visibility)

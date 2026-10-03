@@ -23,6 +23,8 @@ type LibraryItem = {
   file?: string;
   preview?: string;
   hasScene: boolean;
+  /** 松散工程形态（源码目录，无 scene.pkg）：入口是 project.json 的 file 指向的 json */
+  hasLooseScene?: boolean;
   properties: Record<string, unknown> | null;
 };
 
@@ -285,13 +287,15 @@ let typeFilter: WallpaperKind = "scene";
 /**
  * 条目归到哪一类。`type` 已由 host 侧按原生规则规范/推断过
  * （`host/we-library-scan.mjs`），这里只做小写比较，防上游漏改。
- * scene 以 hasScene 为准而不是看 type —— 真正决定能否走场景渲染的是有没有场景包
- * （buildQuery 也是这么判的）。`hasScene` 含 gifscene.pkg 布局：843532366 是 WE 的
- * GIF 导入模板场景（包名 gifscene.pkg、入口 gifscene.json），渲染器能挂
+ * scene 以 hasScene / hasLooseScene 为准而不是看 type —— 真正决定能否走场景渲染的是
+ * 「有没有场景来源」（scene.pkg 或散装工程目录，buildQuery 也是这么判的）。
+ * `hasScene` 含 gifscene.pkg 布局：843532366 是 WE 的 GIF 导入模板场景
+ * （包名 gifscene.pkg、入口 gifscene.json），渲染器能挂
  * （`renderer/src/api/source.ts` 的 PKG_PATHS 与 `scene-mount` 都认），实测 60fps 出画。
+ * `hasLooseScene` 是官方内置工程那一族（arsenal/audiophile/… 无 scene.pkg）。
  */
 function kindOf(it: LibraryItem): WallpaperKind | null {
-  if (it.hasScene) return "scene";
+  if (it.hasScene || it.hasLooseScene) return "scene";
   const t = it.type.toLowerCase();
   if (t === "web") return "web";
   if (t === "video" || t === "gif") return "video";
@@ -683,11 +687,12 @@ filterEl.oninput = renderList;
 /** 把库条目翻译成渲染器 query，语义对齐原生侧 wallpaper/mod.rs */
 function buildQuery(it: LibraryItem): string {
   // project.json type 大小写混用（Web/Scene）；与 kindOf / dispatch 一样先小写
-  const type = it.hasScene ? "scene" : it.type.toLowerCase();
+  const type = it.hasScene || it.hasLooseScene ? "scene" : it.type.toLowerCase();
   const p = new URLSearchParams();
   p.set("type", type);
   if (type === "scene") {
-    p.set("src", it.itemId); // 场景：src 是 itemId，渲染器自行拼 scene.pkg
+    // 场景：src 是 itemId，渲染器自行拼 scene.pkg 或按 project.json 的 file 走松散目录
+    p.set("src", it.itemId);
   } else if (type === "web") {
     p.set("src", `${WEB_BASE}/${it.itemId}/${it.file ?? "index.html"}`);
   } else if (it.file) {

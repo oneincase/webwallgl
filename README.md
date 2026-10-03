@@ -96,11 +96,11 @@ console.log(wp.canvas);
 
 ## 资源来源 Source
 
-库对网络只发两个请求（scene.pkg 与可选的 project.json），所以资源抽象只有一个接口、三个内置实现：
+库对网络只发少量请求（scene.pkg 或松散工程目录里的散装文件，外加可选的 project.json），所以资源抽象只有一个接口、三个内置实现：
 
 | 工厂 | 用途 |
 | --- | --- |
-| `httpSource(baseUrl, init?)` | HTTP 基址；自动按 scene.pkg → scenes/scene.pkg → gifscene.pkg 三种真实布局回退 |
+| `httpSource(baseUrl, init?)` | HTTP 基址；**自动识别两种场景形态**：包容器（scene.pkg → scenes/scene.pkg → gifscene.pkg 回退）与松散工程目录（按 project.json 的 file 逐文件取） |
 | `fileSource(file, project?)` | &lt;input type=file> 或拖拽进来的 .pkg 本地文件 |
 | `bytesSource(pkg, project?, key?)` | 已经拿到字节（bundle 内嵌、IndexedDB 缓存、自定义通道） |
 
@@ -113,7 +113,10 @@ input.addEventListener("change", () => {
 ```
 
 - httpSource 必须先试根目录 scene.pkg，且每个 fetch 单独容错 —— WKWebView/自定义协议对缺失路径抛 Failed to fetch 而不是 404，顺序错了会「一片壁纸全坏」
-- source.key 参与库内解析缓存：相同 key 的包不会重复解析（暂停/改属性零网络）
+- **形态判定只看 project.json 的 file 后缀**：`.json` → 松散工程目录（WE 编辑器工程/官方内置工程在盘上就是散装目录，无需打包），`.pkg` → 容器；缺失或其它值按容器走。松散入口取不到时**自动回退容器**（真实库里大量条目的 project.json 声明 file: "scene.json" 而盘上只有 scene.pkg）
+- 松散形态要求宿主按相对路径提供文件（`GET {mediaBase}/{itemId}/&lt;path>` 这条路由本来就够用，无需新增端点）；贴图缺 .tex 时按 materials/&lt;名>.png|jpg 回退，与源码工程一致
+- source.key 参与库内解析缓存：相同 key 的包不会重复解析（暂停/改属性零网络）；松散形态缓存的是已取到的文件字节
+- 松散形态的两处已知差异（都只在松散形态、都有诊断可查）：① 没有目录清单 ⇒ 不做「全量预载 pkg 里所有字体」那一手，运行期切到未引用的字体时回落系统字体（本机 17 个松散条目 0 个带 fonts/）；② 脚本 thisScene.createLayer("models/…") 的存在性判定改成「乐观创建 + 异步取回校验」，缺资产时撤销该层并报一条 warn（包形态仍是同步精确判定）
 - project 缺失是常态：没有属性表时场景字段用 scene.json 内的快照值
 
 ## 挂载选项 MountOptions
@@ -341,7 +344,8 @@ b.pause(); // 不影响 a
 ## 故障排查
 
 - 黑屏且 onError 报 WEBGL2_UNAVAILABLE：环境没有 WebGL2，库不做软件回退
-- HTTP 404 加载失败：确认 httpSource 指向的目录里真的有 scene.pkg（三种布局会依次尝试，全部失败才报错）
+- HTTP 404 加载失败：确认 httpSource 指向的目录里真的有 scene.pkg（三种布局会依次尝试，全部失败才报错）；源码工程（project.json 的 file 以 .json 结尾）则要确认该 json 与它引用的 materials/、models/、shaders/ 等文件都在同一目录下
+- 松散工程渲染结果与打包版不一致：先确认形态判定的走向 —— project.json 的 file 以 .json 结尾就走松散、取不到入口才回退 scene.pkg；测试台/调试页加 `?form=pkg` 或 `?form=loose` 可强制单臂做 A/B（诊断里会打出 scene form: …）；本仓 `node scripts/verify-loose.mjs --headless` 会跑两形态的图层指纹与请求对照
 - Failed to fetch 且无状态码：自定义协议/WKWebView 对缺失路径的行为，属正常容错路径，看最后一条错误即可
 - stats.fps 为 0 但画面在动：读数是「真正提交渲染」的帧，标签页被遮挡时浏览器会暂停 rAF，属预期
 - stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就开测试台工具条的「遮挡模拟」：HUD 实时显示档位、ROI 块数/面积（渲染器回报的精确分解）与图层剔除 c/g（分母 = 参与闸门的图层数），外加 tile 口径的覆盖率对照读数（对标 Lively 的 Grid Detection Overlay）。拖动遮挡窗可观察「ROI 面积 ≈ 可见面积」（吞洞会表现为 ROI 面积远超可见）

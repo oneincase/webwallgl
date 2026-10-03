@@ -130,6 +130,16 @@ export type WallpaperConfig = {
   source?: Source;
 
   /**
+   * 场景形态强制开关（**调试/验证用**，`?form=pkg|loose`）：松散目录形态
+   * （源码工程）与包形态（scene.pkg）的自动判定见 `api/source.ts::sceneFormOf`。
+   *
+   * 本仓自有的 A/B 通道 —— 同一条目两形态都齐全时（如 arsenal），一条 URL 就能
+   * 把两条装载路各跑一遍对比像素；也用于 `verify-loose` 的双臂取证。
+   * 缺省 / `"auto"` = 按 project.json 的 `file` 后缀自动判定。
+   */
+  sceneForm?: "auto" | "pkg" | "loose";
+
+  /**
    * SceneScript `localStorage` 的持久后端（WE 语义：按壁纸共享、跨会话保留）。
    * 契约：{get,set,remove,clear,keys}，全部同步；screen 是默认位置（每壁纸一份），
    * global 是跨壁纸共享位置（LOCATION_GLOBAL）。
