@@ -121,6 +121,40 @@ export function layoutText(content, opts, measure) {
 }
 
 /**
+ * [we-scene patch 2026-10-04] `anchor:"none"` 文字层的**盒放置**（`3509578940` 文字时钟
+ * 被剪贴蒙版抹掉那次回归的定案）。按文字自己的 horizontalalign/verticalalign 决定两件事，
+ * 且两件事必须**同源**（否则字的落点与盒差一个 (±hw, ±hh)）：
+ *   · `sx/sy`：挂载期 origin 平移的**半盒系数**（世界 w 轴，y 朝上）—— 盒的
+ *     （左/右 × 下/上）边贴 origin：左 +1、右 −1、中 0；下 +1、上 −1、中 0。
+ *     scene-mount 用它算 `origin += (sx*hw, sy*hh)`；
+ *   · `refX/refY`：layoutText 的**对齐参考点**（盒局部，y 朝下）—— 参考点 = 盒内与
+ *     origin 重合的那一点，由同一组系数派生：`refX = 盒宽/2 × (1 − sx)`、
+ *     `refY = 盒高/2 × (1 + sy)`。两者合起来保证「墨迹的 (halign,valign) 对齐点
+ *     落在作者给的 origin 上」。
+ *
+ * 为什么不是「左下角」（此前写死的行为）：全库 2194 个 anchor:none 文字层里
+ * left+bottom 只有 **8 个**，center+center 有 **1750 个** —— 按那 8 个写死规则，
+ * 其余 99% 的层整盒偏 (±hw, ±hh)。两张墙的官方截图钉死了规则：
+ *  · 3694771168 周几（left+bottom）：方框 = [origin, origin+size] —— 与写死左下角一致；
+ *  · 3509578940 时钟（center+center）：官方墨迹中心 ≈ 脚本 origin（3024×1964 截图按
+ *    2560×1440 正交场量到 (510,975)，脚本 origin=(486,979)）—— 写死左下角把整盒推
+ *    (−hw,−hh)，时钟正好落进剪贴蒙版的实心带里被抹掉（用户报的「文字时钟被回归」）。
+ *
+ * 残留（另一件事，未修）：origin 被**脚本/关键帧逐帧改写**的层，挂载期平移会被那次
+ * 改写冲掉。center/center（796/864）平移量本就是 0、不受影响；其余 68 个对齐组合
+ * （left/center 27、center/top 13、right/top 12、right/bottom 10、right/center 5、
+ * center/bottom 1）仍少这一次平移 —— 要修得在两条 localOrigin 回写路径上补。
+ *
+ * 判据：`verify-text` 的【anchor:none 放置】一节 —— 9 组对齐的语义表（期望值独立列出，
+ * 不复算本函数）＋「墨迹对齐点世界坐标 = origin」不变量 ＋ 两处接线源码守卫。
+ */
+export function anchorNonePlacement(h, v, boxW, boxH) {
+  const sx = h === 'left' ? 1 : h === 'right' ? -1 : 0
+  const sy = v === 'bottom' ? 1 : v === 'top' ? -1 : 0
+  return { sx, sy, refX: (boxW / 2) * (1 - sx), refY: (boxH / 2) * (1 + sy) }
+}
+
+/**
  * 墨水量界 → 画布边距（scene-mount updateTexts 用，纯函数、可离线校验）。
  * 返回 [marginLeft, marginTop, marginRight, marginBottom]：盒外四个方向各需要
  * 多少额外边距才能完整装下排版结果（不含字形超出行盒的少量抗锯齿墨晕，

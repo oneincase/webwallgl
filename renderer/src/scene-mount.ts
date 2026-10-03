@@ -96,6 +96,16 @@ export const fontFaceCache = new Map<string, { family: string; refs: number }>()
 const foldVisibleRet = wtext.foldVisibleReturn as (ret: unknown) => boolean | undefined;
 
 /**
+ * [we-scene patch 2026-10-04] `anchor:"none"` 文字层在 layoutText 里的对齐参考点
+ * （盒局部坐标，y 朝下）—— 与挂载期 origin 平移**同源**，实现与两张墙的官方证据见
+ * `render/text-layout.js` 的 `anchorNonePlacement` 头注。
+ */
+function anchorNoneRef(layer: any, boxW: number, boxH: number): { refX: number; refY: number } {
+  const { refX, refY } = wtext.anchorNonePlacement(layer.textHAlign, layer.textVAlign, boxW, boxH);
+  return { refX, refY };
+}
+
+/**
  * [we-scene patch] 对象散字段脚本（P2-1）的真实读写槽：
  * scene.json 字段名与渲染层字段名不总是一致——直接写 layer.maxwidth 没有任何
  * 消费者（文字排版读 textMaxwidth，与关键帧动画 volume/maxwidth/zoom 同族）。
@@ -4633,13 +4643,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               if (a.includes("right")) adx -= hw;
               if (a.includes("top")) ady -= hh;
               if (a.includes("bottom")) ady += hh;
-              // [we-scene patch] none = 无锚点 ⇒ 盒的左下角落在 origin 上（盒向右上方长）。
-              // 3694771168 周几层的官方截图：方框 [origin, origin+size]，与逐像素量到的
-              // [3295,3379]×[293,377] 吻合（见 parse.js textAnchor 注释）。none 不含任何
-              // 方向词，上面四条都不会命中，这里单独补。
+              // [we-scene patch 2026-10-04] `none` = 无**固定**锚点 ⇒ 盒按**文字自己的
+              // 对齐**（horizontalalign/verticalalign）贴 origin。规则、两张墙的官方
+              // 证据与残留（脚本改写 origin 的 68 层）都写在 anchorNonePlacement 的头注里。
               if (a === "none") {
-                adx += hw;
-                ady += hh;
+                const p = wtext.anchorNonePlacement(layer.textHAlign, layer.textVAlign, layer.size[0], layer.size[1]);
+                adx += p.sx * hw;
+                ady += p.sy * hh;
               }
               layer.origin[0] += adx;
               layer.origin[1] += ady;
@@ -4716,9 +4726,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                     limituseellipsis: !!layer.textLimituseellipsis,
                     halign: layer.textHAlign,
                     valign: layer.textVAlign,
-                    // 对齐参考点 = 盒内与 origin 重合的那一点。anchor:none 时盒的
-                    // 左下角贴 origin（上面已按锚点平移过），参考点跟着换到 (0, boxH)。
-                    ...(layer.textAnchor === "none" ? { refX: 0, refY: item.boxH } : {}),
+                    // 对齐参考点 = 盒内与 origin 重合的那一点，与挂载期平移同源（见
+                    // anchorNonePlacement）。
+                    ...(layer.textAnchor === "none"
+                      ? anchorNoneRef(layer, item.boxW, item.boxH)
+                      : {}),
                   },
                   (s: string) => textCtx!.measureText(s).width,
                 );
@@ -4808,8 +4820,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 limituseellipsis: !!layer.textLimituseellipsis,
                 halign: layer.textHAlign,
                 valign: layer.textVAlign,
-                // 同挂载期：anchor:none 的参考点 = 盒左下角（见 mount 处注释）。
-                ...(layer.textAnchor === "none" ? { refX: 0, refY: bh } : {}),
+                // 同挂载期：anchor:none 的参考点 = 盒内与 origin 重合的那一点（见
+                // anchorNonePlacement）。
+                ...(layer.textAnchor === "none"
+                  ? anchorNoneRef(layer, bw, bh)
+                  : {}),
               }, (s: string) => ctx.measureText(s).width);
               // [we-scene patch] 媒体组件的歌名/歌手层盒子是 WE 占位尺寸（2×2，
               // WE 运行时按内容重排），墨水远超盒子，旧实现把字截在画布边缘

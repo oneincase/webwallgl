@@ -34,6 +34,101 @@ const readText = (b) => new TextDecoder().decode(b);
 
 // ---------- 布局校验（等宽 measure：1 字符 = 10px） ----------
 
+// ---------- anchor:"none" 的盒放置（2026-10-04，3509578940 文字时钟被回归） ----------
+/**
+ * 规则：`anchor:"none"` 的文字层按**文字自己的对齐**贴 origin —— 盒的
+ * left/right/center × bottom/top/center 边（或中线）落在 origin 上，layoutText 的
+ * 对齐参考点 = 盒内与 origin 重合的那一点。两张墙的官方截图钉死了它：
+ *  · 3694771168 周几（left+bottom）方框 = [origin, origin+size]（盒左下角贴 origin）；
+ *  · 3509578940 时钟（center+center）官方墨迹中心 ≈ 脚本 origin —— 写死「左下角」
+ *    会把整盒推 (−hw,−hh)，时钟落进剪贴蒙版的实心带里被整块抹掉（用户报的回归）。
+ *
+ * 判据**不做自证**：期望的 (sx, sy, refX, refY) 由本文件按语义**独立列出**（不复算
+ * 实现公式），再断言「墨迹的 (halign,valign) 对齐点落在作者给的 origin 上」这条
+ * 不变量 —— 旧实现（平移写死左下角 + 参考点写死 (0, boxH)）在 center/center 上
+ * 正好差 (−hw,−hh)，本节能当场逮住。
+ */
+function runAnchorNone() {
+  const errors = [];
+  const place = wtext.anchorNonePlacement;
+  if (typeof place !== "function") {
+    errors.push("text.js 未转出 anchorNonePlacement");
+    return errors;
+  }
+
+  // 1) 9 组对齐的语义表（独立列出）+「墨迹对齐点 = origin」不变量
+  const W = 324, H = 168, hw = W / 2, hh = H / 2;
+  const TABLE = [
+    // h          v         sx  sy   refX  refY
+    ["left", "bottom", 1, 1, 0, H],
+    ["left", "center", 1, 0, 0, hh],
+    ["left", "top", 1, -1, 0, 0],
+    ["center", "bottom", 0, 1, hw, H],
+    ["center", "center", 0, 0, hw, hh],
+    ["center", "top", 0, -1, hw, 0],
+    ["right", "bottom", -1, 1, W, H],
+    ["right", "center", -1, 0, W, hh],
+    ["right", "top", -1, -1, W, 0],
+  ];
+  for (const [h, v, sx, sy, refX, refY] of TABLE) {
+    const p = place(h, v, W, H);
+    if (p.sx !== sx || p.sy !== sy)
+      errors.push(`anchor:none ${h}/${v} 的半盒系数应是 (${sx},${sy})，实得 (${p.sx},${p.sy})`);
+    if (Math.abs(p.refX - refX) > 1e-9 || Math.abs(p.refY - refY) > 1e-9)
+      errors.push(`anchor:none ${h}/${v} 的参考点应是 (${refX},${refY})，实得 (${p.refX},${p.refY})`);
+    // 不变量：把「盒（按系数平移后，以 origin 为心）内的 ref 点」映到世界，必须落在 origin。
+    // 盒左缘（世界 x）= sx*hw − hw，加盒局部 refX；y 世界朝上、盒局部朝下，盒下缘 = sy*hh − hh。
+    const worldX = sx * hw - hw + p.refX;
+    const worldY = sy * hh - hh + (H - p.refY);
+    if (Math.abs(worldX) > 1e-9 || Math.abs(worldY) > 1e-9)
+      errors.push(`anchor:none ${h}/${v}: 墨迹对齐点世界坐标 (${worldX},${worldY}) 不在 origin 上（应 (0,0)）`);
+  }
+
+  // 2) 接线源码守卫：挂载期平移与两处布局参考点都必须走同一个出口
+  const mount = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const callSites = (mount.match(/wtext\.anchorNonePlacement/g) || []).length + (mount.match(/anchorNoneRef\(/g) || []).length;
+  if (callSites < 3)
+    errors.push(`anchor:none 的放置出口应有 3 处接线（挂载期 + 静态文字 + 媒体文字），实得 ${callSites}`);
+  if (/if \(a === "none"\) \{\s*\n\s*adx \+= hw;/.test(mount))
+    errors.push("anchor:none 的平移又写死了左下角（adx += hw / ady += hh），应走 anchorNonePlacement");
+
+  // 3) 语料：anchor:none 必须真的存在，且 center/center 是多数派（规则就是按它定的）
+  try {
+    let noneTotal = 0, centerCenter = 0;
+    for (const id of fs.readdirSync(LIB)) {
+      const pkgPath = join(LIB, id, "scene.pkg");
+      if (!fs.existsSync(pkgPath)) continue;
+      let pkg;
+      try {
+        pkg = parsePkg(fs.readFileSync(pkgPath));
+      } catch {
+        continue;
+      }
+      const sj = getEntry(pkg, "scene.json");
+      if (!sj) continue;
+      let scene;
+      try {
+        scene = JSON.parse(readText(sj));
+      } catch {
+        continue;
+      }
+      for (const o of scene.objects || []) {
+        if (o.text === undefined || o.anchor !== "none") continue;
+        noneTotal++;
+        if ((o.horizontalalign || "center") === "center" && (o.verticalalign || "center") === "center") centerCenter++;
+      }
+    }
+    if (noneTotal > 0) {
+      if (noneTotal < 1000) errors.push(`anchor:none 语料只有 ${noneTotal} 层，夹具可疑（本机约 2194）`);
+      if (centerCenter < noneTotal * 0.5)
+        errors.push(`anchor:none 里 center/center 只占 ${centerCenter}/${noneTotal} —— 规则依据的多数派不成立，夹具/语料变了`);
+    }
+  } catch {
+    /* 没装壁纸库：跳过语料项（与其它 verifier 同策略） */
+  }
+  return errors;
+}
+
 function runLayout() {
   const errors = [];
   const CHAR_W = 10;
@@ -3120,6 +3215,13 @@ if (action === "all" || action === "script" || action === "storage") {
 if (action === "all" || action === "script" || action === "p21") {
   const errors = await runP21Scripts();
   console.log(`\n【P2-1 未装配挂点】粒子 override/animLayer/散字段/originalOrigin/getMaterial/BGM → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
+
+if (action === "all" || action === "script" || action === "anchor") {
+  const errors = runAnchorNone();
+  console.log(`\n【anchor:none 放置】按文字对齐贴 origin（3509578940 时钟回归） → 问题 ${errors.length}`);
   errors.forEach((e) => console.log("  ! " + e));
   failed += errors.length;
 }

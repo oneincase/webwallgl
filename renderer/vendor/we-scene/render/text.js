@@ -2620,5 +2620,5 @@ export function textLayerHasTintMask(layer) {
 // [we-scene patch] 脚本沙箱与排版是两类依赖：沙箱吃 engine/属性/媒体视图，
 // 排版只吃 measure 回调与 Canvas2D。拆开后 Node 侧可只加载排版做布局判据，
 // 未来 WE 脚本兼容性扩展（见 docs/SCRIPT-COMPAT.md）只改沙箱一半。
-import { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder } from './text-layout.js'
-export { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder, Vec3 }
+import { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder, anchorNonePlacement } from './text-layout.js'
+export { layoutText, drawTextLayer, effectiveTextPadding, inkOverflow, textCanvasMarginGrow, shouldGrowMediaPlaceholder, anchorNonePlacement, Vec3 }
