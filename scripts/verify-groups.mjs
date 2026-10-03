@@ -338,7 +338,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     // CLAMP 下整张桌子贴到边缘纹素（木头糊成条纹），**法线贴图**同样采到边缘 ⇒
     // 切线空间法线指向侧向 ⇒ N·L ≤ 0（桌面一点动态光都不吃）。
     const meshMatStart = rsrc.indexOf("function drawMeshMaterialInner")
-    const meshMatBody = meshMatStart >= 0 ? rsrc.slice(meshMatStart, meshMatStart + 9000) : ""
+    // 窗口与 F40/F41/F46 那几条一致（12000）：9000 时只要在函数体里补一段注释，
+    // 采样器那段就会被挤出窗口 —— 判据假红，而它断言的东西其实还在（本轮踩到）。
+    const meshMatBody = meshMatStart >= 0 ? rsrc.slice(meshMatStart, meshMatStart + 12000) : ""
     check(/clampUvs === true \? gl\.CLAMP_TO_EDGE : gl\.REPEAT/.test(meshMatBody),
       "材质路径未按 clampUvs 设纹理环绕（模型平铺 uv 会被 CLAMP 采成边缘纹素，F36）");
 
@@ -364,6 +366,23 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
         "材质路径未按 depthtest/depthwrite 逐网格设深度状态（F40）");
       check(/depthTest: pass0\.depthtest !== "disabled"/.test(hostSrc) && /depthWrite: pass0\.depthwrite !== "disabled"/.test(hostSrc),
         "宿主未把材质的 depthtest/depthwrite 带进材质规格（F40）");
+    }
+
+    // F46 混合 pass（translucent/additive）**不写深度**：alpha≈0 的像素不是遮挡物，
+    // 写进深度就会把后画的图层整片拒掉 —— neon_sunset 的太阳方块因此在它身后的地形上
+    // 凿出一个黑方块（用户实测；运行时把该层 depthWrite 置 false 即恢复）。深度**测试**
+    // 仍按材质声明开：先画的近物照样挡得住它、后画的不透明几何也会盖住它（太阳下沿
+    // 被山脊切掉）。判据三条（源码护栏）：① dWrite 与 blended 联动；② 混合判定按
+    // 「非 normal」而不是只认 additive（translucent 同样不能写）；③ 宿主把 blending
+    // 原样带进材质规格 —— 少了它判定拿不到混合模式，规则会静默变回「全都写深度」。
+    {
+      const inner = rsrc.slice(rsrc.indexOf("function drawMeshMaterialInner"), rsrc.indexOf("function drawMeshMaterialInner") + 12000);
+      check(/spec\.blending !== 'normal'/.test(inner),
+        "材质路径的深度写未排除混合 pass（translucent/additive 的透明像素会凿穿后画图层，F46）");
+      check(/gl\.depthMask\(dWrite\)/.test(inner) && /!blended/.test(inner),
+        "dWrite 未与 blended 联动（F46）");
+      check(/blending: typeof pass0\.blending === "string"/.test(hostSrc),
+        "宿主未把 pass 的 blending 带进材质规格（F46 判定拿不到混合模式）");
     }
 
     // F41 贴着相机的壳（`gl_Position = M * (a_Position + g_EyePosition)`）不参与深度：

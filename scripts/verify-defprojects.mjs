@@ -212,6 +212,11 @@ function auditProject(dirName) {
       if (typeof mp.shader === "string" && mp.shader) {
         const builtin = eff.isBuiltinAlbedoShader(mp.shader);
         seenShader.add(mp.shader);
+        // 判据 8（F46）非空转闸门：混合 pass（translucent/additive）是「材质路径的
+        // 深度写必须排除它们」这条源码护栏的可观测面。样本要能追到具体模型
+        // （neon_sunset 的 neonsun/neongrid 就是用户实测的回归样本）。
+        const bl = typeof mp.blending === "string" ? mp.blending : "";
+        if (bl && bl !== "normal") blendedPassAll.push(`${why}:${mp.shader}:${bl}:depthwrite=${mp.depthwrite ?? "缺省→enabled"}`);
         if (!builtin) {
           requireShader(mp.shader, `${why}→shader`);
           layerMaterialEffects.push(mp.shader);
@@ -490,6 +495,8 @@ const pendingBuiltinAll = new Map();
 const builtinImplementedAll = new Map();
 /** 判据 7：多子网格模型（判据见 auditProject）——{ models, distinct, samples } 全语料汇总 */
 const multiMeshAll = { models: 0, distinct: 0, samples: [] };
+/** 判据 8（F46）：混合（translucent/additive）材质 pass 的全语料清单，见 auditProject */
+const blendedPassAll = [];
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
   if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
@@ -580,6 +587,19 @@ check(multiMeshAll.distinct >= 3,
   `多子网格 + 槽 0 各不相同的模型只有 ${multiMeshAll.distinct} 个（基线 4：arsenal/fantasticcar/ricepod×2）—— F43 判据可能空转`);
 console.log(`  - usershadervalues 审计：${usvBindings} 条绑定（离线覆盖 42 / 语料全部 51）`);
 check(usvBindings >= 38, `usershadervalues 审计到的绑定数异常：${usvBindings}（基线 42）—— 判据可能空转`);
+
+// 判据 8 的非空转闸门（F46）：材质路径「混合 pass 不写深度」这条规则的可观测面是
+// 语料里那些 blending 非 normal 的模型材质 —— 首当其冲就是 neon_sunset 的 neonsun/
+// neongrid（显式 depthwrite=enabled + translucent，用户实测的「太阳外围黑方块」）。
+// 语料换了形态、或 blending 的读取链走丢，这里必须响：源码护栏还绿着，但它已经空转。
+if (blendedPassAll.length) {
+  const modelBlended = blendedPassAll.filter((s) => /模型|mdl/i.test(s));
+  console.log(`  - 混合材质 pass（F46）：${blendedPassAll.length} 处（其中模型材质 ${modelBlended.length} 处）：${blendedPassAll.slice(0, 6).join("、")}${blendedPassAll.length > 6 ? "…" : ""}`);
+}
+check(blendedPassAll.length >= 30,
+  `审计到的混合材质 pass 只有 ${blendedPassAll.length} 处（基线 40+，含 neon_sunset 的 neonsun/neongrid）—— F46 判据可能空转`);
+check(blendedPassAll.some((s) => s.includes(":neonsun:translucent")),
+  "语料里应能认到 neon_sunset 的 neonsun:translucent（F46 的实测样本），实际一条未命中");
 
 console.log("");
 if (errors.length > 0) {
