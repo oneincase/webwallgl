@@ -1370,7 +1370,14 @@ export function createRenderer(canvas, opts = {}) {
           prog = glReg.program(linkProgram(gl, vertGlsl, fragGlsl))
         } catch (e) {
           progCache.set(key, null)
-          throw new Error('shader=' + shaderName + ' ' + (e && e.message))
+          // [we-scene patch 2026-10-03] 把**出错那一行转译产物**带进错误信息：
+          // GL 的 info log 只给行号（`ERROR: 0:87: …`），而这一行在多级改写之后
+          // 早已不是作者写的样子 —— 没有这段，排查只能在「离线复现」里盲猜参数差异
+          // （backgroundsphere 的 opaque 赋值就是这么耗掉的）。上限 160 字符。
+          const msg = String((e && e.message) || e)
+          const mline = /ERROR:\s*\d+:(\d+):/.exec(msg)
+          const bad = mline ? (fragGlsl.split('\n')[Number(mline[1]) - 1] || '') : ''
+          throw new Error('shader=' + shaderName + ' ' + msg + (bad ? '  ← ' + bad.trim().slice(0, 160) : ''))
         }
         const uni = new Map()
         const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS)
@@ -2643,6 +2650,179 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] puppet 骨骼网格图层：由外部注入的 MDL 渲染器绘制（见 setPuppetRenderer）
   // 网格坐标 = 图层局部像素、y 轴朝上，故 model 矩阵在层变换后翻转 y。
   let puppetDrawFn = null
+  // [we-scene patch 2026-10-03] **材质 shader 路径**（F13）：模型层若带 `layer.meshMaterial`
+  // （该模型材质的 pass shader 不是内置 albedo 一族），就用**材质自己的 GLSL** 画网格。
+  //
+  // 为什么必须做：官方内置 defaultprojects 的 3D 模型材质全是自定义 GLSL
+  // （`skybox`/`dome`/`car`/`core`/`ricepod*`/`techno*`/`pistols/knife_df`…），
+  // 本仓此前一律走通用网格程序（u_tex × u_light*），等于把作者的光照/渐变/自发光
+  // 整片丢掉 —— 观感是「带贴图的素模」。天空盒（skybox.vert 把相机位置加进顶点）
+  // 这类只要不走材质 shader 就必然画错。
+  //
+  // 与 quad 效果 pass 共用同一条编译链（getEffectProgram：hlsl2glsl + include 解析 +
+  // 常量元数据），uniform 复用 bindSystemUniforms / bindConstants；
+  // 几何由宿主注入（setMeshProvider(mdlRenderer)，见 mdl.js 的 resolveMeshes/resolveMesh）。
+  let meshProvider = null
+  // 材质路径总开关：宿主注入（scene-mount 按 debugHooks + __noMeshMaterial 决定）。
+  // 关闭时全部模型退回通用网格程序 —— 排查回归 / 线上兜底用，见 drawMeshMaterial 注释。
+  let meshMaterialEnabled = true
+  const meshMatProgCache = new Map() // shader|combos → entry | null（编译中/失败）
+  const meshMatVaoCache = new Map() // 程序键|网格号 → VAO | null（不支持的属性组合）
+  const meshIdOf = (() => {
+    const ids = new WeakMap()
+    let n = 0
+    return (m) => {
+      let id = ids.get(m)
+      if (id === undefined) {
+        id = ++n
+        ids.set(m, id)
+      }
+      return id
+    }
+  })()
+  const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Tangent4', 'a_Color', 'a_TexCoordVec4', 'a_TexCoordVec4C1', 'a_TexCoordC2']
+
+  /** 按程序声明的 attribute 位置，把 mdl 的交错 VBO 绑成一套 VAO（按程序+网格缓存） */
+  function meshMatVao(progKey, entry, info) {
+    const key = progKey + '|' + meshIdOf(info)
+    if (meshMatVaoCache.has(key)) return meshMatVaoCache.get(key)
+    const locPos = gl.getAttribLocation(entry.prog, 'a_Position')
+    const locUv = gl.getAttribLocation(entry.prog, 'a_TexCoord')
+    const locNrm = gl.getAttribLocation(entry.prog, 'a_Normal')
+    let vao = null
+    if (locPos >= 0) {
+      const stride = info.floatStride * 4
+      vao = glReg.vertexArray(gl.createVertexArray()) // 登记表：上下文丢失/卸载时可确定性释放
+      gl.bindVertexArray(vao)
+      gl.bindBuffer(gl.ARRAY_BUFFER, info.vbuf)
+      gl.enableVertexAttribArray(locPos)
+      gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, stride, 0)
+      if (locUv >= 0) {
+        gl.enableVertexAttribArray(locUv)
+        gl.vertexAttribPointer(locUv, 2, gl.FLOAT, false, stride, 12)
+      }
+      if (locNrm >= 0 && info.hasNormals) {
+        gl.enableVertexAttribArray(locNrm)
+        gl.vertexAttribPointer(locNrm, 3, gl.FLOAT, false, stride, 52)
+      }
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, info.ibuf)
+      gl.bindVertexArray(null)
+    }
+    meshMatVaoCache.set(key, vao)
+    return vao
+  }
+
+  /**
+   * 用材质 shader 画模型层。返回 true = 已由本路径绘制（调用方跳过通用网格程序）。
+   * 任意一步不满足（程序还在编译 / 声明了不支持的 attribute / 没有几何）都返回 false，
+   * 由通用网格程序兜底 —— 宁可退化成素模，也不能让图层消失。
+   */
+  function drawMeshMaterial(layer, cam, viewProj, mvp, modelM, width, height, time) {
+    try {
+      return drawMeshMaterialInner(layer, cam, viewProj, mvp, modelM, width, height, time)
+    } catch (e) {
+      const mm = layer.meshMaterial
+      if (mm) mm.failed = true
+      diag('模型材质 shader ' + ((mm && mm.shader) || '?') + ': 绘制抛错（' + String((e && e.message) || e).slice(0, 120) + '），该层回退通用网格程序')
+      return false
+    }
+  }
+  function drawMeshMaterialInner(layer, cam, viewProj, mvp, modelM, width, height, time) {
+    const mm = layer.meshMaterial
+    const mdl = layer.puppet
+    if (!mm || !mdl || !meshProvider || !mm.shader) return false
+    // 自愈闸门：本层/本材质一旦失败过（抛错、或一个网格都没画出来）就永久回退通用网格程序。
+    // 判据来自 neon_sunset：把两个模型材质的 frag 染成纯红/纯蓝后画面**依然纯黑** ——
+    // 说明材质路径没把几何画出来，而它又「成功」地接管了这一层（通用程序不再画），
+    // 于是整屏只剩 clearcolor。宁可退化成素模，也绝不能让图层消失。
+    if (mm.failed === true) return false
+    // [we-scene patch 2026-10-03] 逃生开关（与 __shaderPatch/__noMaterialProps 同一套约定）：
+    // `window.__noMeshMaterial = true` 让所有模型退回通用网格程序。
+    // 存在理由：材质路径对个别壁纸仍有回归（neon_sunset 实测 F13 开 mean=0 / 关 mean=143，
+    // 两个模型材质 own shader 画成黑），留一个免改代码的回退口，排查与线上兜底都用它。
+    if (!meshMaterialEnabled) return false
+    const progKey = mm.shader + '|' + JSON.stringify(mm.combos || {})
+    const entry = meshMatProgCache.get(progKey)
+    if (entry === undefined) {
+      // 首帧异步编译（与效果 pass 同一个缓存/编译器）：本帧用通用程序画，下一帧起走材质
+      meshMatProgCache.set(progKey, null)
+      getEffectProgram(mm.shader, mm.combos || {}, mm.textures || {})
+        .then((e) => meshMatProgCache.set(progKey, e))
+        .catch((e) => {
+          diag('模型材质 shader ' + mm.shader + ': 编译失败（' + String((e && e.message) || e).split('\n')[0].slice(0, 140) + '），改用通用网格程序画')
+        })
+      return false
+    }
+    if (!entry) return false
+    if (MESH_MAT_UNSUPPORTED_ATTRS.some((n) => gl.getAttribLocation(entry.prog, n) >= 0)) return false
+    const list = meshProvider.resolveMeshes(mdl)
+    if (!list || !list.length) return false
+    const useDepth = !!(cam && cam.perspective)
+    if (useDepth) {
+      gl.depthMask(true)
+      gl.clearDepth(1)
+      gl.clear(gl.DEPTH_BUFFER_BIT)
+      gl.enable(gl.DEPTH_TEST)
+      gl.depthFunc(gl.LEQUAL)
+    }
+    gl.useProgram(entry.prog)
+    bindSystemUniforms(entry.uni, layer, time, width, height, mvp, modelM, viewProj, [], null, cam, null)
+    bindConstants(entry.uni, mm.constants || {}, entry.matMeta)
+    const blending = mm.blending || 'normal'
+    if (blending === 'additive') {
+      gl.enable(gl.BLEND)
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE)
+    } else if (blending === 'normal') {
+      gl.disable(gl.BLEND)
+    } else {
+      gl.enable(gl.BLEND)
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    }
+    // 采样器：槽 0 = 该网格贴图（多子网格各自材质）/ 整层贴图；槽 1+ 取材质声明的
+    // 其余贴图（car 的法线贴图就在 g_Texture1 —— 不绑的话采样全黑、N·L=0，整车全黑）。
+    // 缺槽一律给白纹理：GLSL 采样未绑定 sampler 会得到 (0,0,0,1)，乘进光照即整片黑。
+    const maxSlot = 4
+    let drew = false
+    for (let i = 0; i < list.length; i++) {
+      const info = meshProvider.resolveMesh(list[i])
+      if (!info || !info.vertexCount || !info.indexCount) continue
+      const vao = meshMatVao(progKey, entry, info)
+      if (!vao) continue
+      // 每网格贴图优先（多子网格各有材质），其次整层贴图，最后白纹理（无贴图材质）
+      const per = layer.meshTextures && layer.meshTextures[i]
+      const pickGl = (t) => (t && t.glTex ? t.glTex : t) || null
+      gl.bindVertexArray(vao)
+      for (let s = 0; s < maxSlot; s++) {
+        const u = gl.getUniformLocation(entry.prog, 'g_Texture' + s)
+        if (!u) continue
+        const decl = mm.textures && mm.textures[s]
+        const tx = s === 0 ? pickGl(per) || pickGl(mm.texture) || null : pickGl(decl)
+        gl.activeTexture(gl.TEXTURE0 + s)
+        gl.bindTexture(gl.TEXTURE_2D, tx || whiteTex)
+        gl.uniform1i(u, s)
+      }
+      gl.activeTexture(gl.TEXTURE0)
+      gl.drawElements(gl.TRIANGLES, info.indexCount, info.indexU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0)
+      drew = true
+    }
+    gl.bindVertexArray(null)
+    if (!drew) {
+      mm.failed = true
+      diag('模型材质 shader ' + mm.shader + ': 一个网格都没画出来，该层回退通用网格程序')
+      return false
+    }
+    // [we-scene patch 2026-10-03] **收尾必须还原深度状态**（与 mdl.js 内置路径逐字同纪律）：
+    // 开着 DEPTH_TEST + 深度写掩码进入后续图层，会把 z=0 的 2D 四边形按模型的深度值
+    // 拒掉 —— neon_sunset 因此整屏变黑（实测：F13 开 mean=0、关 mean=143）。
+    if (useDepth) {
+      // 与 mdl.js 内置路径逐字一致（depthMask 收尾置 false，不是 true）——
+      // 二分实验（只画一帧即回退）曾把整帧救回 143，说明破坏是**逐帧累积**的；
+      // 收尾留下的 depthMask 差异是首要嫌疑。
+      gl.depthMask(false)
+      gl.disable(gl.DEPTH_TEST)
+    }
+    return drew
+  }
   // [we-scene patch] 当前组渲染目标（非 null 时，图层的最终合成写进这个 FBO 而非画布）。
   // 见 renderContainerGroup：带子层的容器要先把子层合成到组 FBO 再整体跑效果。
   let groupTarget = null
@@ -2698,6 +2878,12 @@ export function createRenderer(canvas, opts = {}) {
     }
     const layerModel = puppetModelMatrix(layer, cam)
     const mvp = mat4Multiply(viewProj, layerModel)
+    // [we-scene patch 2026-10-03] **材质 shader 优先**：带 meshMaterial 的模型层用材质
+    // 自己的 GLSL 画（见 drawMeshMaterial）；编译中就先用通用程序画这一帧。
+    if (layer.meshMaterial && drawMeshMaterial(layer, cam, viewProj, mvp, layerModel, width, height, time)) {
+      currentQuadKey = null
+      return
+    }
     // [we-scene patch] 真 3D 静态网格（generic4 + LIGHTING，仅 3509243656 的
     // 球体/天空盒）同样受场景环境光：u_color 乘 max(0.001, ambientcolor)。
     // 2D puppet（人物）材质是 puppettexturechannels、不开 LIGHTING，乘子为 1。
@@ -4660,6 +4846,42 @@ export function createRenderer(canvas, opts = {}) {
     // 由宿主用 MDL 渲染器实现；puppet 图层按自身 z 序参与图层循环与效果链。
     setPuppetRenderer: function (fn) {
       puppetDrawFn = fn
+    },
+    /**
+     * [we-scene patch 2026-10-03] **装配期预编译**模型材质程序（F17）。
+     *
+     * 为什么必须预编译而不是首帧 fire-and-forget：`getEffectProgram` 的 include 解析是
+     * **异步**的（官方头文件按需从 local-assets 取），而编译失败会把 null 写进 progCache
+     * 当**永久哨兵** —— 首帧抢跑时头还没到，这条 shader 就被判死刑，表现是
+     * `core`/`backgroundsphere` 这类材质**时好时坏**（同一构建两次运行一次报 undeclared
+     * 一次通过）。装配期 `await` 一次把所有 include 落进缓存，之后每帧都是缓存命中。
+     * 失败仍回落通用网格程序（返回 false），不影响挂载。
+     */
+    async prepareMeshMaterial(shader, combos, textures) {
+      if (!shader) return false
+      const key = shader + '|' + JSON.stringify(combos || {})
+      if (meshMatProgCache.get(key)) return true
+      try {
+        const e = await getEffectProgram(shader, combos || {}, textures || {})
+        meshMatProgCache.set(key, e)
+        return !!e
+      } catch (err) {
+        meshMatProgCache.set(key, null)
+        diag(
+          '模型材质 shader ' + shader + ': 预编译失败（' +
+            String((err && err.message) || err).split('\n')[0].slice(0, 140) + '），该模型回落通用网格程序',
+        )
+        return false
+      }
+    },
+    // [we-scene patch 2026-10-03] 注入**模型几何提供者**（宿主的 mdl 渲染器实例）：
+    // 材质 shader 路径要用它的 resolveMeshes/resolveMesh 取交错 VBO 与索引缓冲。
+    setMeshProvider: function (p) {
+      meshProvider = p
+    },
+    /** [we-scene patch 2026-10-03] 模型材质路径总开关（false = 全部走通用网格程序） */
+    setMeshMaterialEnabled: function (on) {
+      meshMaterialEnabled = on !== false
     },
     // [we-scene patch] 注入音频频谱快照源：fn() → { left16, right16, …, left64, right64 }。
     // 宿主每帧先推进模拟器/采集器再进入 render；这里是纯读取（见 render/audio.js）。
