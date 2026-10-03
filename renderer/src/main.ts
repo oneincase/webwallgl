@@ -582,6 +582,13 @@ const initialCfg: WallpaperConfig = {
   // iframe 只给 allow-scripts（详见 types.ts 的 webSandbox 注释）。
   webSandbox: params.get("webSandbox") === "strict" ? "strict" : undefined,
   clearColor: params.get("clearColor") ?? undefined,
+  // 场景形态强制开关（调试 / A-B 用）：`?form=pkg` 强制 scene.pkg、`?form=loose`
+  // 强制松散目录（取不到入口即报错、不静默回退 —— 否则 A/B 双臂会变成同一条路）。
+  // 缺省 = 按 project.json 的 file 后缀自动判定（api/source.ts::sceneFormOf）。
+  sceneForm: (() => {
+    const f = params.get("form");
+    return f === "pkg" || f === "loose" ? f : undefined;
+  })(),
   // 性能设置（aa/pq/pp）：测试台工具条与宿主的抗锯齿/粒子/后处理档位
   quality: qualityFromQuery((k) => params.get(k)),
 };

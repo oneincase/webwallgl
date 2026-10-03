@@ -80,6 +80,10 @@ const STABLE = [
   "verify-mat",
   // 着色器链接唯一实现契约（B3：属性表 / 不绑语义 / mdl 骨预算重试保留）
   "verify-link",
+  // 松散目录形态的场景壁纸（源码工程 / 官方内置 defaultprojects）：判定表与回退语义
+  // 真跑（含本地 HTTP 服务器）、本地库 17 个条目的引用闭包审计、接线守卫、变异红测。
+  // 真 GPU A/B 不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-loose.mjs --headless`
+  "verify-loose",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */

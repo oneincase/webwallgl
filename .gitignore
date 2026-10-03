@@ -39,3 +39,6 @@ docs/
 renderer/vendor/we-scene/README.md
 # pnpm 本地存储
 .pnpm-store/
+
+# 校验脚本的临时产物（如 verify-loose --headless 的 A/B 截图）
+scripts/.tmp-*/

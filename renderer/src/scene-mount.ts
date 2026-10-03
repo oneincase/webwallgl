@@ -4,7 +4,7 @@ import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
-import type { Source } from "./api/types";
+import type { SceneDirAssets, Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
@@ -221,19 +221,40 @@ function releaseFontFaces(keys: string[]) {
   }
 }
 
-/** 按缓存键缓存已解析的 scene.pkg。暂停恢复 / 改属性不再走网络与解析；
- *  上限「≤2 份且总字节 ≤512MB」：解析后的包（条目字节+模型/动画）单份可达数百 MB，
- *  只按份数上限会让两张巨包常驻 GB 级堆；超限从最旧淘汰（当前键除外）。
- *  键来自 Source.key（HTTP 源即 baseUrl，与旧的 mediaBase/itemId 等价）。 */
-const pkgCache = new Map<string, { parsed: any; at: number }>();
-const PKG_CACHE_MAX_BYTES = 512 * 1024 * 1024;
-let pkgCacheBytes = 0;
+/**
+ * 已装载的场景来源。**两种形态共用一套缓存**（暂停恢复 / 改属性不再走网络与解析）：
+ * 上限「≤2 份且总字节 ≤512MB」——包（条目字节+模型/动画）单份可达数百 MB，只按
+ * 份数上限会让两张巨包常驻 GB 级堆；超限从最旧淘汰（当前键除外）。
+ * 键来自 Source.key（HTTP 源即 baseUrl，与旧的 mediaBase/itemId 等价）。
+ *
+ * `bytes` 按形态现算：包 = 文件大小；松散 = 读取器已缓存字节（随按需读取增长，
+ * 所以预算检查与淘汰都用「当前总和」而不是增量记账 —— 记账会在懒加载下漂）。
+ */
+type CachedSceneSource = {
+  at: number;
+  mode: "pkg" | "dir";
+  /** mode=pkg：parsePkg 结果 */
+  parsed?: any;
+  /** mode=dir：松散目录读取器（自带按名缓存） */
+  dir?: SceneDirAssets;
+};
+const sceneCache = new Map<string, CachedSceneSource>();
+const SCENE_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 
-function pkgCacheEvict(currentKey: string) {
-  while (pkgCache.size > 0 && (pkgCache.size > 2 || pkgCacheBytes > PKG_CACHE_MAX_BYTES)) {
+function cachedSourceBytes(e: CachedSceneSource): number {
+  return e.mode === "pkg" ? Number(e.parsed?.fileSize || 0) : Number(e.dir?.bytes?.() ?? 0);
+}
+function sceneCacheBytesNow(): number {
+  let n = 0;
+  for (const e of sceneCache.values()) n += cachedSourceBytes(e);
+  return n;
+}
+
+function sceneCacheEvict(currentKey: string) {
+  while (sceneCache.size > 0 && (sceneCache.size > 2 || sceneCacheBytesNow() > SCENE_CACHE_MAX_BYTES)) {
     let oldestKey: string | null = null;
     let oldestAt = Infinity;
-    for (const [k, v] of pkgCache) {
+    for (const [k, v] of sceneCache) {
       if (k === currentKey) continue;
       if (v.at < oldestAt) {
         oldestAt = v.at;
@@ -242,42 +263,79 @@ function pkgCacheEvict(currentKey: string) {
     }
     // 只剩当前键还超限：放着（正在用的那一份不能被自己挤掉）
     if (!oldestKey) break;
-    const victim = pkgCache.get(oldestKey)!;
-    pkgCacheBytes -= victim.parsed.fileSize || 0;
-    pkgCache.delete(oldestKey);
+    sceneCache.delete(oldestKey);
   }
 }
 
 /**
- * 显式淘汰指定 source.key 的 pkg 缓存（配合实例 destroy 的 releasePkgCache）。
+ * 显式淘汰指定 source.key 的场景缓存（配合实例 destroy 的 releasePkgCache）。
  *
  * 缓存的存在意义是同壁纸的重挂不重新下载（暂停恢复/setRenderDpr/显示器
  * 重载），但宿主**销毁**实例时语义是"这张壁纸我不再要了"——再留一份几百 MB
  * 的解析包就违背直觉，Activity Monitor 里表现为"换了壁纸内存就是不降"。
  * 宿主逐张显式释放，而不是收紧全局上限：多实例页面（同一 key 两个实例）
  * 共享缓存仍然成立，只有明确声明放弃的那个 key 会被清。
+ * 松散形态同样适用：读取器持有的散装文件字节一并释放。
  */
 export function dropPkgCache(key: string | undefined) {
   if (!key) return;
-  const hit = pkgCache.get(key);
-  if (!hit) return;
-  pkgCacheBytes -= hit.parsed.fileSize || 0;
-  pkgCache.delete(key);
+  sceneCache.delete(key);
 }
 
-async function loadParsedPkg(
+/**
+ * 取场景来源：**先试松散目录形态**（project.json 的 `file` 以 `.json` 结尾且
+ * 入口 json 取得到），否则回退 scene.pkg。判定表与理由见 docs/LIBRARY-PLAN.md §4
+ * 与 api/source.ts::sceneFormOf（实测：全库 0 个条目声明 `.pkg`、351 个声明
+ * `scene.json`，其中 350 个盘上只有 pkg —— `.json` 分支必须带这条回退）。
+ *
+ * `cfg.sceneForm`（`?form=pkg|loose`）是调试/验证用的强制开关：`pkg` 跳过松散
+ * 探测；`loose` 强制松散并在拿不到入口时**报错而不是静默回退**（否则 A/B 的
+ * 双臂会变成同一条路，量出来的差值是假的）。
+ */
+async function loadSceneSource(
   rt: Runtime,
   cfg: WallpaperConfig,
   source: Source,
   signal: AbortSignal,
-): Promise<any> {
+): Promise<CachedSceneSource> {
   const cacheKey = source.key;
   if (cacheKey) {
-    const hit = pkgCache.get(cacheKey);
+    const hit = sceneCache.get(cacheKey);
     if (hit) {
       hit.at = Date.now();
-      reportDiag(rt, cfg, `pkg cache hit: ${hit.parsed.fileSize} bytes`, "info");
-      return hit.parsed;
+      reportDiag(rt, cfg, `scene cache hit: ${hit.mode} (${cachedSourceBytes(hit)} bytes)`, "info");
+      return hit;
+    }
+  }
+  const form = cfg.sceneForm ?? "auto";
+  // 强制松散但来源根本不支持松散（fileSource/bytesSource 这类单文件来源）：**报错而不是
+  // 静默回退** —— 否则 A/B 的双臂会变成同一条路，量出来的差值是假的。
+  if (form === "loose" && !source.sceneDir) {
+    throw new Error("松散形态不可用：当前 Source 没有 sceneDir（fileSource/bytesSource 只有单个包文件）");
+  }
+  if (form !== "pkg" && source.sceneDir) {
+    let dir: SceneDirAssets | null = null;
+    try {
+      dir = (await source.sceneDir(signal)) ?? null;
+    } catch (e) {
+      if (signal.aborted) throw e;
+      // 形态探测本身失败不致命：落回 pkg，真正的失败原因由 scenePkg 报出
+      dir = null;
+    }
+    if (dir) {
+      reportDiag(rt, cfg, `scene form: loose（入口 ${dir.entry}）`, "info");
+      const entry: CachedSceneSource = { at: Date.now(), mode: "dir", dir };
+      if (cacheKey) {
+        sceneCache.set(cacheKey, entry);
+        sceneCacheEvict(cacheKey);
+      }
+      return entry;
+    }
+    if (form === "loose") {
+      throw new Error(
+        "松散形态不可用：project.json 的 file 不是 .json 结尾，或入口 json 取不到" +
+          "（?form=loose 是强制开关；去掉它即按 file 后缀自动判定并回退 scene.pkg）",
+      );
     }
   }
   let pkgBytes: ArrayBuffer | Uint8Array;
@@ -287,14 +345,15 @@ async function loadParsedPkg(
     if (signal.aborted) throw e;
     throw e instanceof Error ? e : new Error(String(e));
   }
-  reportDiag(rt, cfg, `pkg body: ${pkgBytes.byteLength} bytes`, "info");
+  reportDiag(rt, cfg, `scene form: pkg（body ${pkgBytes.byteLength} bytes）`, "info");
   const bytes = pkgBytes instanceof Uint8Array ? pkgBytes : new Uint8Array(pkgBytes);
   const parsed = pkg.parsePkg(bytes);
-  if (!cacheKey) return parsed;
-  pkgCache.set(cacheKey, { parsed, at: Date.now() });
-  pkgCacheBytes += parsed.fileSize || 0;
-  pkgCacheEvict(cacheKey);
-  return parsed;
+  const entry: CachedSceneSource = { at: Date.now(), mode: "pkg", parsed };
+  if (cacheKey) {
+    sceneCache.set(cacheKey, entry);
+    sceneCacheEvict(cacheKey);
+  }
+  return entry;
 }
 
 export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
@@ -448,10 +507,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         throw new Error("场景壁纸缺少 mediaBase/src");
       }
       reportDiag(rt, cfg, "mountScene start", "info");
-      const parsedPkg = await loadParsedPkg(
-rt,
-cfg, source, pkgAbort.signal);
+      const sceneSrc = await loadSceneSource(rt, cfg, source, pkgAbort.signal);
       if (disposed) return;
+      const parsedPkg = sceneSrc.mode === "pkg" ? sceneSrc.parsed : null;
+      const sceneDir = sceneSrc.mode === "dir" ? (sceneSrc.dir as SceneDirAssets) : null;
+      /**
+       * 装配期按名取资源 —— **两种形态的唯一入口**，调用方一律 `await`：
+       *  · 包形态：`getEntry(parsedPkg, name)`，精确名字、返回 pkg 缓冲区的**零拷贝视图**、
+       *    未命中 null（与改造前逐字一致，只是包了一层 Promise）；
+       *  · 松散形态：`dir.read(name, signal)`，按相对路径取、按名缓存、404 → null、
+       *    切场景 abort 如实抛出。
+       * 两者的「命中 / 未命中 / 抛错」语义一一对应，所以下面所有取资源的点位
+       * 不需要知道形态差异（原先它们直接调 pkg.getEntry）。
+       */
+      const readAsset = async (name: string): Promise<Uint8Array | null> =>
+        sceneDir ? await sceneDir.read(name, pkgAbort.signal) : pkg.getEntry(parsedPkg, name);
 
       // project.json（可选；属性表缺失是常态，source.project 返回 null 合法）
       let project: unknown = null;
@@ -479,15 +549,30 @@ cfg, source, pkgAbort.signal);
       // 由 project.json.file 指定、名字随意**（audiophile.json / techno.json …），
       // 所以候选表由 scn.sceneEntryCandidates 给出：file 优先，其余四条兜底。
       // getEntry 是精确匹配，逐个候选回退。
-      let sceneEntry = null;
-      for (const name of scn.sceneEntryCandidates(project) as string[]) {
-        const e = pkg.getEntry(parsedPkg, name);
-        if (e) {
-          sceneEntry = e;
-          break;
+      //
+      // 松散目录形态不同：入口在形态判定时就已经取到（`dir.entry` 就是 file 声明的
+      // 那个 json，来源层已探过 200），不再走候选表 —— 候选表的意义是「包里尽量找
+      // 一个能用的」，而松散形态下入口名字是作者声明的，猜别的名字反而会命中
+      // 同目录里的别的 json。
+      let sceneEntry: Uint8Array | null = null;
+      if (sceneDir) {
+        sceneEntry = await sceneDir.read(sceneDir.entry, pkgAbort.signal);
+      } else {
+        for (const name of scn.sceneEntryCandidates(project) as string[]) {
+          const e = await readAsset(name);
+          if (e) {
+            sceneEntry = e;
+            break;
+          }
         }
       }
-      if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
+      if (!sceneEntry) {
+        throw new Error(
+          sceneDir
+            ? `松散工程入口不存在（${sceneDir.entry}）`
+            : "pkg 中没有 scene.json（不是场景壁纸？）",
+        );
+      }
       const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
       /**
        * 本场景加载过的**材质文档**（materials/*.json），用于解析其中的用户属性绑定。
@@ -756,7 +841,7 @@ cfg, source, pkgAbort.signal);
       const shaderResolver = async (rel: string): Promise<string | null> => {
         const inner = rel.startsWith("shaders/") ? rel : "shaders/" + rel;
         const file = rel.startsWith("shaders/") ? rel.slice("shaders/".length) : rel;
-        const e = pkg.getEntry(parsedPkg, inner);
+        const e = await readAsset(inner);
         // [we-scene patch 2026-10-03] **引擎内置 shader 的本仓实现**（F42）：WE 自带
         // （`assets/shaders/**`）而不进 pkg 的那一族，如 `flag`（官方内置工程
         // eagleflag 的图层材质）。放在 local-assets 之前：这条是仓内实现、任何环境
@@ -1332,7 +1417,7 @@ cfg, source, pkgAbort.signal);
             try {
               if (eff.BUILTIN_MODELS[img]) model = eff.BUILTIN_MODELS[img];
               else {
-                const me = pkg.getEntry(parsedPkg, img);
+                const me = await readAsset(img);
                 // [S4 保守] 网格/骨骼模型（puppet）的屏幕范围由骨骼动画决定，layer.size 不是上界
                 if (me) model = JSON.parse(readText(me));
               }
@@ -1342,7 +1427,7 @@ cfg, source, pkgAbort.signal);
             if (!model || (model as any).meshes || (model as any).puppet) continue;
             const matPath = model.material;
             if (!matPath) continue;
-            const matEntry = pkg.getEntry(parsedPkg, matPath);
+            const matEntry = await readAsset(matPath);
             if (!matEntry) continue;
             let names: string[] = [];
             try {
@@ -1542,8 +1627,12 @@ cfg, source, pkgAbort.signal);
           return null;
         }
       };
-      // pkg 字节进台账（解析后的整份容器常驻，是记忆体里最大的一块之一）
-      mem.pkgBytes = Number((parsedPkg as { fileSize?: number })?.fileSize || 0);
+      // 场景来源字节进台账（包 = 整份容器常驻；松散 = 已取到的散装文件之和，
+      // 是记忆体里最大的一块之一）。懒加载会让松散的数字随装配增长，读 __memStats 即最新。
+      mem.pkgBytes =
+        sceneSrc.mode === "pkg"
+          ? Number((parsedPkg as { fileSize?: number })?.fileSize || 0)
+          : Number(sceneDir?.bytes?.() ?? 0);
 
 
       // [we-scene patch] 本机引擎内置素材（WE 安装目录的 materials/**）：贴图 + 法线。
@@ -1930,18 +2019,19 @@ cfg, source, pkgAbort.signal);
             }
           }
         }
-        const texEntry = pkg.getEntry(parsedPkg, `materials/${name}.tex`);
+        const texEntry = await readAsset(`materials/${name}.tex`);
         if (!texEntry) {
           // [we-scene patch] **源码工程的贴图源图回退**：WE 编辑器工程（含官方内置
           // defaultprojects）里 `materials/X.png` 是贴图源、`X.tex` 是编译产物，但
           // 编译产物**可能缺席**——audiophile 的 `materials/grid/grid.png` 就没有对应
           // 的 grid.tex（模型 skin 0 的贴图），此时引用有效、只是没编译。工坊包里不存在
           // 这种形态（.tex 一定在），所以这条只在缺 .tex 时兜底，对既有语料是恒等变换。
+          // 松散目录形态同理（源码工程就是这条回退的来源），且更常见。
           // 只试**工程自制命名空间**：内置命名空间（particle/util/gradient/…）的缺席是
-          // 预期状态，且 getEntry 是线性扫描，不该为它们白扫三遍大包（PKGV0023 实测）。
+          // 预期状态，且按名取资源（包形态是线性扫描）不该为它们白试三遍（PKGV0023 实测）。
           if (!/^(particle|util|gradient|pattern|lut|cookie)\//.test(name)) {
             for (const ext of ["png", "jpg", "jpeg"]) {
-              const imgEntry = pkg.getEntry(parsedPkg, `materials/${name}.${ext}`);
+              const imgEntry = await readAsset(`materials/${name}.${ext}`);
               if (!imgEntry) continue;
               try {
                 const bmp = await decodeTexImageBitmap(new Blob([imgEntry]), null, 0, 0, 1);
@@ -2665,8 +2755,8 @@ cfg, source, pkgAbort.signal);
         for (const mp of effect.materialPasses || []) {
           if (!mp.shader) continue;
           for (const stage of ["frag", "vert"]) {
-            // getEntry 缺条目返回 null，readText 收 Uint8Array —— 必须先判空
-            const bytes = pkg.getEntry(parsedPkg, `shaders/${mp.shader}.${stage}`);
+            // 缺条目返回 null，readText 收 Uint8Array —— 必须先判空
+            const bytes = await readAsset(`shaders/${mp.shader}.${stage}`);
             if (!bytes) continue;
             const src = readText(bytes);
             SAMPLER_DEFAULT_RE.lastIndex = 0;
@@ -2692,7 +2782,8 @@ cfg, source, pkgAbort.signal);
         gpuUploadedMB: +(mem.gpuUploaded / 1e6).toFixed(1),
         compressedMB: +(mem.compressed / 1e6).toFixed(1),
         r8NativeMB: +(mem.r8Native / 1e6).toFixed(1),
-        pkgBytes: mem.pkgBytes || 0,
+        // 松散形态的字节随按需读取增长，所以这里现读（不能用挂载期快照）
+        pkgBytes: sceneSrc.mode === "pkg" ? mem.pkgBytes || 0 : Number(sceneDir?.bytes?.() ?? 0),
         framesScaled: mem.framesScaled.slice(0, 20),
         scaledCount: mem.scaled.length,
         scaled: mem.scaled.slice(0, 40),
@@ -2720,7 +2811,7 @@ cfg, source, pkgAbort.signal);
           if (eff.BUILTIN_MODELS[layer.image]) {
             model = eff.BUILTIN_MODELS[layer.image];
           } else {
-            const modelEntry = pkg.getEntry(parsedPkg, layer.image);
+            const modelEntry = await readAsset(layer.image);
             if (!modelEntry) continue;
             model = JSON.parse(readText(modelEntry));
           }
@@ -2769,7 +2860,7 @@ cfg, source, pkgAbort.signal);
           if (eff.BUILTIN_MATERIALS[mat.materialPath]) {
             material = eff.BUILTIN_MATERIALS[mat.materialPath];
           } else {
-            const matEntry = pkg.getEntry(parsedPkg, mat.materialPath);
+            const matEntry = await readAsset(mat.materialPath);
             if (!matEntry) {
               // 实例 solid 的 material 是 util/solidlayer_instance*.json，pkg 里没有。
               // 不能 continue：否则连挂在这层上的效果链都不解析，而且即便已置 solid，
@@ -2972,10 +3063,10 @@ cfg, source, pkgAbort.signal);
           // 由 registerMaterialDoc 的 applyUserShaderValues 统一注入 —— 材质文档一读进来
           // 就处理了，与本条挂载门无关（F42 只修「挂不上」这一段）。
           // [we-scene patch 2026-10-03] **引擎内置 shader 不再被「包内有没有」挡掉**（F42）：
-          // WE 自带 shader（`flag` 等）本就不进 pkg，此前 `pkg.getEntry` 为 null ⇒ 整条材质
+          // WE 自带 shader（`flag` 等）本就不进 pkg，此前取条目为 null ⇒ 整条材质
           // 条目从不建，图层退回「贴图直出」—— eagleflag 的通道图（r/g/b = 三个颜色权重）
-          // 被当反照率画出来，就是荧光绿/品红一片。现在：包内有 OR 本仓内置表里有 → 挂。
-          if (pass?.shader && (pkg.getEntry(parsedPkg, `shaders/${pass.shader}.frag`) || WE_BUILTIN_SHADERS[`${pass.shader}.frag`])) {
+          // 被当反照率画出来，就是荧光绿/品红一片。现在：来源里有 OR 本仓内置表里有 → 挂。
+          if (pass?.shader && ((await readAsset(`shaders/${pass.shader}.frag`)) || WE_BUILTIN_SHADERS[`${pass.shader}.frag`])) {
             eff.attachLayerMaterialEffect(layer, pass);
           }
           // [we-scene patch] `generic4` 材质的 color/alpha/brightness 常量：官方该 shader 里
@@ -2994,9 +3085,14 @@ cfg, source, pkgAbort.signal);
           // 现读，所以属性热更自动生效，不需要「记原值再重折」那套簿记（见 renderer 的 color4）。
           attachBuiltinMatTint(layer, material);
           for (const e of layer.effects || []) {
-            eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
-                reportDiag(rt, cfg, m, classifyDiag(m)),
-              );
+            await eff.resolveEffectChain(
+              readAsset,
+              e,
+              readText,
+              registerMaterialDoc,
+              (m: string) => reportDiag(rt, cfg, m, classifyDiag(m)),
+              sceneDir ? "场景目录内" : "包内",
+            );
           }
           for (const e of layer.effects || []) {
             for (const p of e.passes || []) {
@@ -3055,8 +3151,13 @@ cfg, source, pkgAbort.signal);
           if (!layer.isText || !(layer.effects || []).length) continue;
           try {
             for (const e of layer.effects || []) {
-              eff.resolveEffectChain(parsedPkg, e, readText, registerMaterialDoc, (m: string) =>
-                reportDiag(rt, cfg, m, classifyDiag(m)),
+              await eff.resolveEffectChain(
+                readAsset,
+                e,
+                readText,
+                registerMaterialDoc,
+                (m: string) => reportDiag(rt, cfg, m, classifyDiag(m)),
+                sceneDir ? "场景目录内" : "包内",
               );
             }
             for (const e of layer.effects || []) {
@@ -3179,10 +3280,10 @@ cfg, source, pkgAbort.signal);
       //   ② TEXS 序列帧表：rain_drops_sheet 16 帧、fog1 64 帧、rain1 4 帧，不传就退化成
       //      「整张图集当一帧」，画面上是一坨糊（3801012392 实测）。
       const loadParticleTex = async (name: string, purpose: "albedo" | "normal" = "albedo"): Promise<any | null> => {
-        // 只在 pkg 真的有这张贴图时走 pkg 路径。不能无条件 `await loadTex(name)`：
+        // 只在来源里真的有这张贴图时走普通贴图路径。不能无条件 `await loadTex(name)`：
         // loadTexInner 自己也会把内置粒子贴图**程序化建出来**并返回，于是下面的
         // 格式转换 / 真实帧表永远轮不到（本机接入原版素材时正是这个坑）。
-        const inPkg = pkg.getEntry(parsedPkg, `materials/${name}.tex`) ? await loadTex(name) : null;
+        const inPkg = (await readAsset(`materials/${name}.tex`)) ? await loadTex(name) : null;
         if (inPkg) return inPkg;
         // 本机装了 WE 原版素材（local-assets/，见 local-assets.ts）时按需拉这一张：
         // 粒子图集很大（164 张解完 ~180MB），不做全量预载。没装素材时它立刻返回 false。
@@ -3247,9 +3348,9 @@ cfg, source, pkgAbort.signal);
         depth: number,
       ): Promise<any | null> => {
         if (depth > 3) return null; // children 可嵌套，设上限防病态数据造成指数展开
-        const modelEntry = pkg.getEntry(parsedPkg, particlePath);
+        const modelEntry = await readAsset(particlePath);
         if (!modelEntry) {
-          reportDiag(rt, cfg, `particle '${particlePath}' 不在 pkg，跳过`, "warn");
+          reportDiag(rt, cfg, `particle '${particlePath}' 不在场景资源里，跳过`, "warn");
           return null;
         }
         const model = JSON.parse(readText(modelEntry));
@@ -3259,7 +3360,7 @@ cfg, source, pkgAbort.signal);
         let texName: string | null = null;
         let texName1: string | null = null;
         if (model.material) {
-          const matEntry = pkg.getEntry(parsedPkg, model.material);
+          const matEntry = await readAsset(model.material);
           if (matEntry) {
             const mat = readMaterialDoc(matEntry);
             ps.setMaterial(mat);
@@ -3278,8 +3379,8 @@ cfg, source, pkgAbort.signal);
               typeof pass0.shader === "string" &&
               pass0.shader &&
               eff.canUseMaterialMeshPath(pass0.shader) &&
-              pkg.getEntry(parsedPkg, `shaders/${pass0.shader}.frag`) &&
-              pkg.getEntry(parsedPkg, `shaders/${pass0.shader}.vert`)
+              (await readAsset(`shaders/${pass0.shader}.frag`)) &&
+              (await readAsset(`shaders/${pass0.shader}.vert`))
             ) {
               const pShader = pass0.shader;
               const pCombos = pass0.combos || {};
@@ -3438,7 +3539,7 @@ cfg, source, pkgAbort.signal);
         if (!layer.sound || !layer.sound.length) continue;
         try {
           for (const snd of layer.sound) {
-            const entry = pkg.getEntry(parsedPkg, snd);
+            const entry = await readAsset(snd);
             if (!entry) continue;
             // 尝试多种 mime（WE 声音多为 wav/mp3/ogg/flac）
             const ext = (snd.split(".").pop() || "").toLowerCase();
@@ -3731,11 +3832,11 @@ cfg, source, pkgAbort.signal);
         if (SKIP_3D_MODELS) continue;
         try {
           if (eff.BUILTIN_MODELS[layer.image]) continue; // 内置模型无 puppet
-          const modelEntry = pkg.getEntry(parsedPkg, layer.image);
+          const modelEntry = await readAsset(layer.image);
           if (!modelEntry) continue;
           const model = JSON.parse(readText(modelEntry));
           if (!model.puppet) continue;
-          const mdlEntry = pkg.getEntry(parsedPkg, model.puppet);
+          const mdlEntry = await readAsset(model.puppet);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
           // 贴图：与普通图层同一条材质链，已在上面的循环里 loadTex 过
@@ -3769,7 +3870,7 @@ cfg, source, pkgAbort.signal);
         if (SKIP_3D_MODELS) continue;
         if (layer.puppet) continue;
         try {
-          const mdlEntry = pkg.getEntry(parsedPkg, layer.model);
+          const mdlEntry = await readAsset(layer.model);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
           // [we-scene patch 2026-10-03] `reflected: true` 的对象要**同时**画进
@@ -3779,7 +3880,7 @@ cfg, source, pkgAbort.signal);
           (layer as any).reflected = (layer as any).srcObject?.reflected === true;
           let texName: string | null = null;
           if (mdlObj.materialPath) {
-            const matEntry = pkg.getEntry(parsedPkg, mdlObj.materialPath);
+            const matEntry = await readAsset(mdlObj.materialPath);
             if (matEntry) {
               const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
@@ -3889,7 +3990,7 @@ cfg, source, pkgAbort.signal);
                 meshSpecs.push((layer as any).meshMaterial || null);
                 continue;
               }
-              const matEntry = pkg.getEntry(parsedPkg, mp);
+              const matEntry = await readAsset(mp);
               if (!matEntry) {
                 meshSpecs.push(null);
                 continue;
@@ -4125,9 +4226,9 @@ cfg, source, pkgAbort.signal);
         const src = layer && layer.srcObject;
         if (!src || typeof src.path !== "string" || !src.path) continue;
         try {
-          const entry = pkg.getEntry(parsedPkg, src.path);
+          const entry = await readAsset(src.path);
           if (!entry) {
-            reportDiag(rt, cfg, `camera path '${src.path}' 不在包内（图层 ${layer.name}）`, "warn");
+            reportDiag(rt, cfg, `camera path '${src.path}' 不在场景资源里（图层 ${layer.name}）`, "warn");
             continue;
           }
           const doc = JSON.parse(readText(entry));
@@ -4166,7 +4267,7 @@ cfg, source, pkgAbort.signal);
           for (const rel of declPaths) {
             if (typeof rel !== "string" || !rel) continue;
             try {
-              const entry = pkg.getEntry(parsedPkg, rel);
+              const entry = await readAsset(rel);
               if (!entry) {
                 missing++;
                 continue;
@@ -4387,10 +4488,16 @@ cfg, source, pkgAbort.signal);
         const usedFontKeys: string[] = []; // 本次挂载引入的缓存键（cleanup 时 refs--）
         const fontPaths = new Set<string>();
         for (const l of scene.layers as any[]) if (l.isText && l.textFont) fontPaths.add(l.textFont);
-        // 脚本可能在 applyUserProperties 里把 font 切到包内其它字体（3396722575 有 18 个）。
-        // 只预载层快照路径的话，切档时 FontFace 不存在，字形回落成系统黑体。
-        for (const e of (parsedPkg as { entries?: Array<{ name: string }> }).entries || []) {
-          if (typeof e.name === "string" && /^fonts\/.+\.(ttf|otf|woff2?)$/i.test(e.name)) fontPaths.add(e.name);
+        // 脚本可能在包内其它字体间切换（3396722575 有 18 个）。只预载层快照路径的话，
+        // 切档时 FontFace 不存在，字形回落成系统黑体。
+        // **只有包形态能这样枚举**：pkg 的入口表在内存里；松散目录没有清单（宿主只有
+        // 按路径取文件这一条路由），所以只预载 scene.json 直接引用到的字体 —— 松散
+        // 工程「运行期切到未引用字体」这一档会回落系统字体（本机 17 个松散条目
+        // 0 个带 fonts/，影响面目前为零；要补齐需要宿主提供目录清单端点）。
+        if (!sceneDir) {
+          for (const e of (parsedPkg as { entries?: Array<{ name: string }> }).entries || []) {
+            if (typeof e.name === "string" && /^fonts\/.+\.(ttf|otf|woff2?)$/i.test(e.name)) fontPaths.add(e.name);
+          }
         }
         for (const fp of fontPaths) {
           const key = `${cfg.src}|${fp}`;
@@ -4407,8 +4514,8 @@ cfg, source, pkgAbort.signal);
             continue;
           }
           try {
-            const fe = pkg.getEntry(parsedPkg, fp);
-            // pkg 没内嵌时找本机 WE 原版素材树（local-assets/fonts/**，见
+            const fe = await readAsset(fp);
+            // 来源里没有时找本机 WE 原版素材树（local-assets/fonts/**，见
             // local-assets.ts 的消费面说明）：引用官方字体（NotoSans 等）的文字层
             // 不再回落系统黑体；没装素材 fetchLocalAssetFile 返回 null → 照旧兜底。
             const raw = fe
@@ -4967,9 +5074,16 @@ cfg, source, pkgAbort.signal);
                 ) ||
                 null;
               if (!src) {
-                // 没有模板层可克隆 → 从包内资产实例化（engine.registerAsset +
+                // 没有模板层可克隆 → 从场景资产实例化（engine.registerAsset +
                 // createLayer 的常规路径；1712475860 Dino Run 的金币/收集特效）。
-                if (/^models\//.test(imagePath) && pkg.getEntry(parsedPkg, imagePath)) {
+                //
+                // 存在性判定：包形态是**同步**的（入口表在内存里，getEntry 即刻给答案）；
+                // 松散形态没有清单，只能乐观创建、由下面的异步收尾取回后校验 ——
+                // createSceneLayer 是脚本沙箱的同步 API（返回值当场被脚本使用），
+                // 这里不能 await。
+                const assetExists = (p: string): boolean =>
+                  sceneDir ? true : !!pkg.getEntry(parsedPkg, p);
+                if (/^models\//.test(imagePath) && assetExists(imagePath)) {
                   assetToMount = { path: imagePath, kind: "model" };
                   src = {
                     image: imagePath,
@@ -4982,7 +5096,7 @@ cfg, source, pkgAbort.signal);
                     alpha: 1,
                     brightness: 1,
                   };
-                } else if (/^particles\//.test(imagePath) && pkg.getEntry(parsedPkg, imagePath)) {
+                } else if (/^particles\//.test(imagePath) && assetExists(imagePath)) {
                   assetToMount = { path: imagePath, kind: "particle" };
                   src = {
                     particle: imagePath,
@@ -5043,42 +5157,56 @@ cfg, source, pkgAbort.signal);
             // 粒子层起运行时粒子系统（登记到 clone.id，z 序由 renderByLayer 分发）。
             if (assetToMount && assetToMount.kind === "model") {
               const imagePath = assetToMount.path;
-              try {
-                const model = JSON.parse(readText(pkg.getEntry(parsedPkg, imagePath)!));
-                const mat = scn.resolveMaterial(model);
-                const matEntry = mat && pkg.getEntry(parsedPkg, mat.materialPath);
-                const material = matEntry ? readMaterialDoc(matEntry) : null;
-                const pass = material?.passes?.[0];
-                if (material) attachBuiltinMatTint(clone, material);
-                if (pass?.combos) {
-                  for (const k of Object.keys(pass.combos)) {
-                    if (k.toLowerCase() === "spritesheet" && Number(pass.combos[k]) === 1) {
-                      clone.spriteSheet = true;
-                      break;
+              // 同步 API 里的异步收尾：`createSceneLayer` 必须当场返回层对象，
+              // 所以资产读取放在这个 IIFE 里（原先用非空断言假定同步取到的字节还在）。
+              void (async () => {
+                try {
+                  const modelBytes = await readAsset(imagePath);
+                  if (!modelBytes) {
+                    // 只有松散形态会走到这里（乐观创建落空的唯一入口）：撤销这一层，
+                    // 不让脚本拿着一层永远没资产的空壳。
+                    reportDiag(rt, cfg, `createLayer('${imagePath}') 的模型不存在，已撤销该层`, "warn");
+                    clone.destroyed = true;
+                    const at = (scene.layers as any[]).indexOf(clone);
+                    if (at >= 0) (scene.layers as any[]).splice(at, 1);
+                    return;
+                  }
+                  const model = JSON.parse(readText(modelBytes));
+                  const mat = scn.resolveMaterial(model);
+                  const matEntry = mat ? await readAsset(mat.materialPath) : null;
+                  const material = matEntry ? readMaterialDoc(matEntry) : null;
+                  const pass = material?.passes?.[0];
+                  if (material) attachBuiltinMatTint(clone, material);
+                  if (pass?.combos) {
+                    for (const k of Object.keys(pass.combos)) {
+                      if (k.toLowerCase() === "spritesheet" && Number(pass.combos[k]) === 1) {
+                        clone.spriteSheet = true;
+                        break;
+                      }
                     }
+                  }
+                  const tn = pass?.textures?.[0];
+                  if (typeof tn === "string" && tn && !tn.startsWith("util/") && !tn.startsWith("_rt_")) {
+                    void loadTex(tn).then((entry) => {
+                      if (!entry) return;
+                      clone.textureName = tn;
+                      // autosize：序列帧按帧尺寸（WE autosize 语义），否则按贴图尺寸
+                      if (clone.size[0] === 0 || clone.size[1] === 0) {
+                        // [we-scene patch 2026-09-20] 几何取**原始**尺寸（geomFrame/declared），
+                        // 不能用被资源倍率缩过的 entry.frames / entry.width，否则动态建层变小
+                        const gf = entry.geomFrame;
+                        const fl = entry.frames && Array.isArray(entry.frames) ? entry.frames[0] : null;
+                        clone.size = [
+                          (gf && gf.width) || (fl && fl.width) || entry.declaredWidth || entry.width,
+                          (gf && gf.height) || (fl && fl.height) || entry.declaredHeight || entry.height,
+                        ];
+                      }
+                    });
+                  }
+                } catch (e) {
+                  reportDiag(rt, cfg, `createLayer('${imagePath}') 资产实例化失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
                 }
-                }
-                const tn = pass?.textures?.[0];
-                if (typeof tn === "string" && tn && !tn.startsWith("util/") && !tn.startsWith("_rt_")) {
-                  void loadTex(tn).then((entry) => {
-                    if (!entry) return;
-                    clone.textureName = tn;
-                    // autosize：序列帧按帧尺寸（WE autosize 语义），否则按贴图尺寸
-                    if (clone.size[0] === 0 || clone.size[1] === 0) {
-                      // [we-scene patch 2026-09-20] 几何取**原始**尺寸（geomFrame/declared），
-                      // 不能用被资源倍率缩过的 entry.frames / entry.width，否则动态建层变小
-                      const gf = entry.geomFrame;
-                      const fl = entry.frames && Array.isArray(entry.frames) ? entry.frames[0] : null;
-                      clone.size = [
-                        (gf && gf.width) || (fl && fl.width) || entry.declaredWidth || entry.width,
-                        (gf && gf.height) || (fl && fl.height) || entry.declaredHeight || entry.height,
-                      ];
-                    }
-                  });
-                }
-              } catch (e) {
-                reportDiag(rt, cfg, `createLayer('${imagePath}') 资产实例化失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
-              }
+              })();
             } else if (assetToMount && assetToMount.kind === "particle") {
               const ppath = assetToMount.path;
               void buildParticleSystem(ppath, clone, null, 0).then((ps) => {

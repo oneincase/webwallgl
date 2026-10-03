@@ -200,6 +200,37 @@ for (const name of REQUIRED_WP) {
     source.includes("读取 scene.pkg 体失败"),
     "httpSource 必须单独接住 arrayBuffer 失败（HTTP 200 后 Failed to fetch 是 body 被掐，不是缺路径）",
   );
+  // 松散目录形态（源码工程）：判定只看 project.json 的 file 后缀，且**入口取不到必须
+  // 回退 pkg**。全库实测 0 个条目声明 .pkg、351 个声明 scene.json（其中 350 个盘上只有
+  // scene.pkg）—— 少了这条回退，那 350 个条目会整场挂掉。判据同源真跑见 verify-loose。
+  check(
+    /sceneFormOf\(project\) !== "loose"\) return null/.test(source),
+    "httpSource.sceneDir 必须在「入口 json 取不到」时返回 null（回退 scene.pkg 的唯一开关）",
+  );
+  check(
+    /function normalizeRelPath/.test(source) && /seg === "\.\."/.test(source),
+    "松散读取器必须拒绝 `..` 目录穿越（宿主侧也会拦，这里拦是为了不发注定失败的请求）",
+  );
+  check(
+    /if \(sceneFormOf\(project\) !== "loose"\) return null/.test(source) && /sceneFormOf\(project\)/.test(source),
+    "形态判定必须走唯一的纯函数 sceneFormOf（判据与实现同源）",
+  );
+}
+
+// 松散形态的装配接线：装配期只有 readAsset 一个取资源入口 —— 任何一处退回
+// `pkg.getEntry(parsedPkg, …)` 都会让那张贴图/模型在松散形态下静默缺席
+// （包形态毫发无损，所以只有拿松散条目 A/B 才看得出）。数值面见 verify-loose。
+{
+  const mount = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const direct = [...mount.matchAll(/pkg\.getEntry\(parsedPkg/g)].length;
+  check(direct <= 2, `scene-mount 只剩 readAsset 与 assetExists 两处直接 getEntry（实得 ${direct} 处）`);
+  check(
+    /sceneDir \? await sceneDir\.read\(name, pkgAbort\.signal\) : pkg\.getEntry\(parsedPkg, name\)/.test(mount),
+    "readAsset 必须按形态分流（松散=按名 HTTP、包=零拷贝视图）",
+  );
+  check(/sceneEntry = await sceneDir\.read\(sceneDir\.entry/.test(mount), "松散形态必须直接用 file 声明的入口，不再猜候选表");
+  const types = fs.readFileSync(path.join(ROOT, "renderer/src/api/types.ts"), "utf8");
+  check(/export type SceneDirAssets/.test(types) && /sceneDir\?\(signal\?: AbortSignal\)/.test(types), "Source 契约必须暴露可选 sceneDir（可选=不破坏既有宿主实现）");
 }
 
 // 超宽场景（3264246690 的 5120×1440）靠 cover 按窗口宽高比裁切。画布 backing
@@ -418,8 +449,8 @@ for (const name of REQUIRED_WP) {
     "pause/resume/updateWebProps 必须接到 sceneCtl（渲染循环闭包在 scene-mount 里）",
   );
   check(
-    /pkg cache hit/.test(mount) && /pkgCache/.test(mount),
-    "scene-mount 必须缓存已读完的 scene.pkg（同壁纸暂停/重挂不要再拉 100MB+）",
+    /scene cache hit/.test(mount) && /sceneCache/.test(mount),
+    "scene-mount 必须缓存已读完的场景来源（同壁纸暂停/重挂不要再拉 100MB+；松散形态同理，缓存读取器）",
   );
   check(
     !/\.subarray\(\s*start\s*,\s*end\s*\)\.slice\(\s*\)/.test(container),

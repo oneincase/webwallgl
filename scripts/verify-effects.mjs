@@ -52,10 +52,12 @@ function fakePkg(files) {
 }
 
 /** 跑一条效果，收集诊断 */
-function run(pkg, file, { name = "", visible = true } = {}) {
+async function run(pkg, file, { name = "", visible = true } = {}) {
   const effect = { file, name, visible };
   const diags = [];
-  resolveEffectChain(pkg, effect, readText, () => {}, (m) => diags.push(m));
+  // 首参仍可传 pkg 对象（readAssetName 的旧签名兼容），但解析过程是异步的
+  // —— 松散目录形态要按名取文件，不能同步返回
+  await resolveEffectChain(pkg, effect, readText, () => {}, (m) => diags.push(m));
   return { effect, diags };
 }
 
@@ -70,7 +72,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
     })],
     ["materials/effects/x.json", JSON.stringify({ passes: [{ shader: "effects/x", blending: "normal", cullmode: "nocull" }] })],
   ]);
-  const { effect, diags } = run(pkg, "effects/x/effect.json");
+  const { effect, diags } = await run(pkg, "effects/x/effect.json");
   check(diags.length === 0, `官方两段式形态不得产生诊断，got ${JSON.stringify(diags)}`);
   check(effect.materialPasses.length === 1 && effect.materialPasses[0].shader === "effects/x",
     `官方形态应解析出 shader="effects/x"，got ${JSON.stringify(effect.materialPasses.map((p) => p.shader))}`);
@@ -87,7 +89,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
   const pkg = fakePkg([
     ["effects/bad/effect.json", JSON.stringify({ passes: [{ shader: "effects/bad", blending: "normal" }] })],
   ]);
-  const { diags } = run(pkg, "effects/bad/effect.json");
+  const { diags } = await run(pkg, "effects/bad/effect.json");
   check(diags.length === 1, `直写 shader 应恰好产生 1 条诊断，got ${diags.length}: ${JSON.stringify(diags)}`);
   const d = diags[0] || "";
   check(d.includes("pass 0") && d.includes("未识别"), `诊断应点名 pass 序号与「未识别」：${d}`);
@@ -103,7 +105,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
 // ───────────────────────────────────────────────────────────────────────────
 {
   const pkg = fakePkg([["effects/c/effect.json", JSON.stringify({ passes: [{ target: null }] })]]);
-  const { diags } = run(pkg, "effects/c/effect.json");
+  const { diags } = await run(pkg, "effects/c/effect.json");
   check(diags.length === 1 && diags[0].includes("未识别"), `空 pass 应报「未识别」，got ${JSON.stringify(diags)}`);
 }
 
@@ -112,7 +114,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
 // ───────────────────────────────────────────────────────────────────────────
 {
   const pkg = fakePkg([["scene.json", "{}"]]);
-  const { diags } = run(pkg, "effects/nope/effect.json");
+  const { diags } = await run(pkg, "effects/nope/effect.json");
   check(diags.length === 1 && diags[0].includes("不在包内") && diags[0].includes("effects/nope/effect.json"),
     `效果文件缺失应报「不在包内」并回显路径，got ${JSON.stringify(diags)}`);
 }
@@ -124,7 +126,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
   const pkg = fakePkg([
     ["effects/e/effect.json", JSON.stringify({ passes: [{ material: "materials/effects/nope.json", target: null }] })],
   ]);
-  const { diags } = run(pkg, "effects/e/effect.json");
+  const { diags } = await run(pkg, "effects/e/effect.json");
   check(diags.length === 1 && diags[0].includes("materials/effects/nope.json") && diags[0].includes("不在包内"),
     `材质缺失应报「不在包内」并回显材质路径，got ${JSON.stringify(diags)}`);
 }
@@ -137,7 +139,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
     ["effects/f/effect.json", JSON.stringify({ passes: [{ material: "materials/effects/f.json", target: null }] })],
     ["materials/effects/f.json", JSON.stringify({ passes: [{ blending: "normal" }] })],
   ]);
-  const { diags } = run(pkg, "effects/f/effect.json");
+  const { diags } = await run(pkg, "effects/f/effect.json");
   check(diags.length === 1 && diags[0].includes("shader"),
     `材质缺 shader 应报出来，got ${JSON.stringify(diags)}`);
 }
@@ -147,13 +149,13 @@ function run(pkg, file, { name = "", visible = true } = {}) {
 // ───────────────────────────────────────────────────────────────────────────
 {
   const pkg = fakePkg([["effects/g/effect.json", "{ this is not json"]]);
-  const { diags } = run(pkg, "effects/g/effect.json");
+  const { diags } = await run(pkg, "effects/g/effect.json");
   check(diags.length === 1 && diags[0].includes("JSON"), `坏效果 JSON 应报，got ${JSON.stringify(diags)}`);
   const pkg2 = fakePkg([
     ["effects/g2/effect.json", JSON.stringify({ passes: [{ material: "materials/effects/g2.json" }] })],
     ["materials/effects/g2.json", "{{{ broken"],
   ]);
-  const r2 = run(pkg2, "effects/g2/effect.json");
+  const r2 = await run(pkg2, "effects/g2/effect.json");
   check(r2.diags.length === 1 && r2.diags[0].includes("JSON"), `坏材质 JSON 应报，got ${JSON.stringify(r2.diags)}`);
 }
 
@@ -169,7 +171,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
       ],
     })],
   ]);
-  const { effect, diags } = run(pkg, "effects/h/effect.json");
+  const { effect, diags } = await run(pkg, "effects/h/effect.json");
   check(diags.length === 0, `copy/swap 命令 pass 不得产生诊断，got ${JSON.stringify(diags)}`);
   check(effect.materialPasses.length === 2 && effect.materialPasses[0].copyCommand === true && effect.materialPasses[1].swapCommand === true,
     `copy/swap 语义应保留（copyCommand/swapCommand），got ${JSON.stringify(effect.materialPasses.map((p) => [p.copyCommand, p.swapCommand]))}`);
@@ -181,9 +183,9 @@ function run(pkg, file, { name = "", visible = true } = {}) {
 // ───────────────────────────────────────────────────────────────────────────
 {
   const pkg = fakePkg([["effects/i/effect.json", JSON.stringify({ passes: [{ shader: "effects/i" }] })]]);
-  const first = run(pkg, "effects/i/effect.json");
-  const second = run(pkg, "effects/i/effect.json");
-  const third = run(pkg, "effects/i/effect.json");
+  const first = await run(pkg, "effects/i/effect.json");
+  const second = await run(pkg, "effects/i/effect.json");
+  const third = await run(pkg, "effects/i/effect.json");
   check(first.diags.length === 1, `首次应报 1 条，got ${first.diags.length}`);
   check(second.diags.length === 0 && third.diags.length === 0,
     `重复解析同一效果只应报一次，got second=${second.diags.length} third=${third.diags.length}`);
@@ -219,7 +221,7 @@ function run(pkg, file, { name = "", visible = true } = {}) {
         const stub = { file: ef.file || "", name: ef.name || "", visible: true };
         const diags = [];
         try {
-          resolveEffectChain(pkg, stub, readText, () => {}, (m) => diags.push(m));
+          await resolveEffectChain(pkg, stub, readText, () => {}, (m) => diags.push(m));
         } catch (e) {
           diags.push("抛异常: " + ((e && e.message) || e));
         }

@@ -14,6 +14,30 @@ export type Fit = "cover" | "contain" | "stretch";
  */
 export type PropertyValue = boolean | number | string;
 
+/**
+ * 松散目录（源码工程）形态的场景资源读取器。
+ *
+ * 为什么需要：WE 编辑器工程（官方内置 `defaultprojects`、`myprojects/`）在盘上是
+ * **散装目录** —— `project.json` / `scene.json` / `materials/` / `models/` /
+ * `shaders/` …，没有 scene.pkg。形态判定只看一个字段：`project.json` 的 `file`
+ * 以 `.json` 结尾 = 松散、以 `.pkg` 结尾 = 包（见 `api/source.ts::sceneFormOf`）。
+ *
+ * 松散形态没有目录清单（宿主只有 `GET {mediaBase}/{itemId}/<path>` 一条路由），
+ * 所以资源按相对路径**按名取**、缺文件返回 null —— 与 pkg 形态 `getEntry` 的
+ * 「命中 / 未命中」语义一一对应，装配期代码不必知道形态差异。
+ */
+export type SceneDirAssets = {
+  /** 场景入口 json 的相对路径（来自 project.json 的 `file`，如 scene.json / audiophile.json） */
+  readonly entry: string;
+  /**
+   * 按相对路径取一个资源；不存在返回 null。实现方按名缓存（同一路径不重复走网络）；
+   * 切场景的 abort 如实抛出 —— 不能把 abort 当成「文件不存在」写进缓存。
+   */
+  read(name: string, signal?: AbortSignal): Promise<Uint8Array | null>;
+  /** 已缓存字节数（缓存配额与诊断口径用）。可选 */
+  bytes?(): number;
+};
+
 /** 场景资源来源。库对外只发两个请求，所以接口只有两个方法（见 LIBRARY-PLAN §4） */
 export type Source = {
   /**
@@ -22,6 +46,16 @@ export type Source = {
    * 网页壁纸（project.type=web）不会调用本方法。
    */
   scenePkg(signal?: AbortSignal): Promise<ArrayBuffer | Uint8Array>;
+  /**
+   * 松散目录形态的读取器（可选）。返回非 null = 这张场景以散装工程渲染，
+   * 装配期所有「按名取资源」都走它；返回 null = 按 scene.pkg 走。
+   *
+   * 判定与回退都在实现方（httpSource）：`project.file` 以 `.json` 结尾才试松散，
+   * 入口 json 取不到就返回 null 让调用方回退 pkg —— 真实库里大量条目的
+   * project.json 声明 `file: "scene.json"` 而盘上只有 scene.pkg，没有这条回退
+   * 它们会整场挂掉。
+   */
+  sceneDir?(signal?: AbortSignal): Promise<SceneDirAssets | null>;
   /**
    * 属性表（project.json）。可选，且返回 null 合法 —— 真实壁纸库里大量场景
    * 没有 project.json，此时场景字段一律用 scene.json 内的快照值。

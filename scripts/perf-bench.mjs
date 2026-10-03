@@ -46,7 +46,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { launchHeadless, instrument } from "./headless-gpu.mjs";
-import { SCENE_PKG_PATHS, WEB_ENTRY_PATHS, classifyWallpaper, pickEntryFile } from "../host/we-library-scan.mjs";
+import { SCENE_PKG_PATHS, WEB_ENTRY_PATHS, classifyWallpaper, isLooseSceneProject, pickEntryFile } from "../host/we-library-scan.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -213,9 +213,12 @@ function scanLibrary(lib) {
       dirNames = fs.readdirSync(dir);
     } catch {}
     const hasScene = SCENE_PKG_PATHS.some((rel) => isFile(dir, rel));
+    // 松散工程（源码目录）形态：没有 scene.pkg 的 WE 编辑器工程（入口是 project.json
+    // 的 file 指向的 json）。判据与 host/wallpaper-host.ts、渲染器同源。
+    const hasLooseScene = isLooseSceneProject({ declared: project?.file, names: dirNames });
     const webEntry = WEB_ENTRY_PATHS.find((rel) => isFile(dir, rel)) ?? null;
     const hasWebEntry = webEntry !== null;
-    const type = classifyWallpaper({ declared: project?.type, hasScene, hasWebEntry, names: dirNames });
+    const type = classifyWallpaper({ declared: project?.type, hasScene, hasLooseScene, hasWebEntry, names: dirNames });
     const file =
       typeof project?.file === "string" && project.file
         ? project.file
@@ -234,6 +237,7 @@ function scanLibrary(lib) {
       type,
       file,
       hasScene,
+      hasLooseScene,
       sizeBytes: size,
       pkgBytes: (() => {
         for (const rel of SCENE_PKG_PATHS) {

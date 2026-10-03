@@ -116,7 +116,7 @@ console.log(`语料：${root}`);
 }
 
 /** 收集一个工程的全部引用（scene.json → 材质链 → shader/贴图） */
-function auditProject(dirName) {
+async function auditProject(dirName) {
   const dir = path.join(root, dirName);
   const projectRaw = fs.readFileSync(path.join(dir, "project.json"), "utf8");
   const project = parseJsonLoose(projectRaw);
@@ -467,7 +467,7 @@ function auditProject(dirName) {
     const layer = { effects: [] };
     eff.attachLayerMaterialEffect(layer, { shader, textures: [], combos: {}, constantshadervalues: {} });
     for (const e of layer.effects) {
-      eff.resolveEffectChain(pkg, e, readText, () => {}, (m) => diags.push(`${shader}: ${m}`));
+      await eff.resolveEffectChain(pkg, e, readText, () => {}, (m) => diags.push(`${shader}: ${m}`));
     }
   }
   check(
@@ -493,7 +493,7 @@ const multiMeshAll = { models: 0, distinct: 0, samples: [] };
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
   if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
-  const r = auditProject(d);
+  const r = await auditProject(d);
   if (r.skip) {
     skips++;
     console.log(`  - ${d}: 跳过（type=${r.skip}）`);

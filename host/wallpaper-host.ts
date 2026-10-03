@@ -45,6 +45,7 @@ import {
   SCENE_PKG_PATHS,
   WEB_ENTRY_PATHS,
   classifyWallpaper,
+  isLooseSceneProject,
   pickEntryFile,
   pickPreviewFile,
 } from "./we-library-scan.mjs";
@@ -507,6 +508,10 @@ async function scanLibrary(dir: string) {
           break;
         }
       }
+      // 松散工程（源码目录）形态：WE 编辑器工程没有 scene.pkg，入口是 project.json
+      // 的 `file` 指向的 json（scene.json / audiophile.json…）。判据与渲染器同源
+      // （见 we-library-scan.mjs::isLooseSceneProject 的注释）。
+      const hasLooseScene = isLooseSceneProject({ declared: project?.file, names: dirNames });
       let hasWebEntry = false;
       let webEntry: string | null = null;
       for (const rel of WEB_ENTRY_PATHS) {
@@ -524,7 +529,7 @@ async function scanLibrary(dir: string) {
         declaredPreview && (await statFile(join(base, declaredPreview)))
           ? declaredPreview
           : pickPreviewFile(dirNames);
-      const type = classifyWallpaper({ declared: project?.type, hasScene, hasWebEntry, names: dirNames });
+      const type = classifyWallpaper({ declared: project?.type, hasScene, hasLooseScene, hasWebEntry, names: dirNames });
       // 入口文件（scene 不需要，src 就是 itemId）：project.json 没声明时按内容兜底，
       // 否则「无 project.json 的单文件视频」即使列出来也挂不上（src 拼不出来）。
       const file: string | undefined =
@@ -538,6 +543,7 @@ async function scanLibrary(dir: string) {
         file,
         preview,
         hasScene,
+        hasLooseScene,
         properties: project?.general?.properties ?? null,
       };
     }),

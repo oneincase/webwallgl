@@ -29,6 +29,31 @@ export const SCENE_PKG_PATHS = ["scene.pkg", "scenes/scene.pkg", "gifscene.pkg",
 /** 目录根下的网页入口（原生 `infer_type` 也只认这两个位置） */
 export const WEB_ENTRY_PATHS = ["index.html", "web/index.html"];
 
+/**
+ * 松散工程（源码目录）形态的场景入口候选。
+ *
+ * 形态判定的**真源在渲染器侧**（`renderer/src/api/source.ts::sceneFormOf`）：只看
+ * `project.json` 的 `file` 后缀 —— `.json` = 松散、`.pkg` = 包。这里只服务扫库/测试台
+ * 的**标签归属**，所以宁松勿漏（判不到档的条目会在列表里整条消失，见文件头注），
+ * 并额外容忍「没声明 file、但根上就摆着 scene.json」的工程形态。
+ *
+ * 已知盲区（本机 0 例）：入口 json 在子目录（如 `scenes/scene.json`）且 project.json
+ * 没声明 file 时这里认不出；渲染器侧不受影响（它按 file 后缀判定）。
+ */
+export const LOOSE_SCENE_ENTRIES = ["scene.json", "gifscene.json"];
+
+/**
+ * 松散工程形态判定（扫库侧，纯函数）。
+ * @param {{ declared?: unknown, names?: Iterable<string> }} facts
+ * @returns {boolean}
+ */
+export function isLooseSceneProject(facts = {}) {
+  const lower = new Set([...((facts.names ?? []))].map((n) => String(n).toLowerCase()));
+  const decl = typeof facts.declared === "string" ? facts.declared.trim().replace(/^\/+/, "") : "";
+  if (decl && /\.json$/i.test(decl) && !/^preview\./i.test(decl) && lower.has(decl.toLowerCase())) return true;
+  return LOOSE_SCENE_ENTRIES.some((n) => lower.has(n));
+}
+
 /** 扩展名分组，逐字抄自原生 `library.rs` 的 VIDEO_EXTS / GIF_EXTS / IMAGE_EXTS / WEB_EXTS */
 export const EXT_GROUPS = {
   video: ["mp4", "webm", "mov", "mkv", "m4v", "avi"],
@@ -63,14 +88,16 @@ export function normalizeDeclaredType(declared) {
 
 /**
  * 判一个壁纸目录的**内容形态**（不含 project.json 的 type）。
- * @param {{ hasScene?: boolean, hasWebEntry?: boolean, names?: Iterable<string> }} contents
+ * @param {{ hasScene?: boolean, hasLooseScene?: boolean, hasWebEntry?: boolean, names?: Iterable<string> }} contents
  * @returns {"scene" | "web" | "gif" | "image" | "video" | null} 推断不出返回 null
  */
-export function inferTypeFromContents({ hasScene = false, hasWebEntry = false, names = [] } = {}) {
+export function inferTypeFromContents({ hasScene = false, hasLooseScene = false, hasWebEntry = false, names = [] } = {}) {
   // 原生顺序：先 index.html 再场景包。两者同时存在的目录在本机库为 0 张，
   // 但顺序必须与原生一致，否则同库两边的标签会对不上。
   if (hasWebEntry) return "web";
-  if (hasScene) return "scene";
+  // 包形态与松散工程同属场景：松散目录没有 scene.pkg（WE 编辑器工程就是散装目录），
+  // 只有 hasScene 这一条会让 17 个内置工程在测试台落到 image/video 标签甚至整条消失。
+  if (hasScene || hasLooseScene) return "scene";
   let best = null;
   for (const raw of names) {
     const name = String(raw).toLowerCase();
@@ -88,7 +115,7 @@ export function inferTypeFromContents({ hasScene = false, hasWebEntry = false, n
 
 /**
  * 一个库条目的最终类型。
- * @param {{ declared?: unknown, hasScene?: boolean, hasWebEntry?: boolean, names?: Iterable<string> }} facts
+ * @param {{ declared?: unknown, hasScene?: boolean, hasLooseScene?: boolean, hasWebEntry?: boolean, names?: Iterable<string> }} facts
  * @returns {string} scene | web | video | gif | image | application
  */
 export function classifyWallpaper(facts = {}) {
