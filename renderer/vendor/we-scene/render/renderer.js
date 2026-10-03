@@ -3103,7 +3103,23 @@ export function createRenderer(canvas, opts = {}) {
           if (anchored) diag('模型材质 shader ' + spec.shader + ': 顶点把几何挂在相机上（gl_Position 含 + g_EyePosition），按背景处理、不参与深度')
         }
         const dTest = spec.depthTest !== false && !anchored && !(isSkybox && spec.depthTest === undefined)
-        const dWrite = spec.depthWrite !== false && !anchored && !isSkybox
+        // [we-scene patch 2026-10-03] **混合 pass 不写深度**（F46）。
+        //
+        // alpha 混合 / 加算的图层里，**alpha≈0 的像素不是遮挡物**：太阳方块的透明边角、
+        // 加算光晕的黑底，它们对画面零贡献，但一旦写进深度就会把**后画的图层整片拒掉**。
+        // 用户实测的 neon_sunset「太阳外围一个黑方块」就是它 —— 层序 太阳(2)→地形(3)，
+        // 太阳方块写深度后，它覆盖区里的地形（远处的山谷/山脊）全被 LEQUAL 拒掉，
+        // 露出 clearcolor 黑块；把该层 `depthWrite` 运行时置 false 即恢复（A/B 实测
+        // 黑块区黑像素占比 25.8% → 12.3%，剩下的是天光本身）。深度**测试**仍按材质
+        // 声明开：先画的近物照样挡得住它，后画的几何也照常按各自的深度叠上去。
+        //
+        // 为什么连显式 `depthwrite: enabled` 也不认：内置语料里混合 pass 显式写
+        // depthwrite 的只有 neon_sunset 这两处（neonsun/neongrid），而作者自己的
+        // 官方预览**没有**这个黑块 —— 说明 WE 的这条 flag 在它手里不会凿洞（WE 要么
+        // 按距离排序后画它、要么同样忽略混合 pass 的深度写）。其余混合 pass 一律是
+        // 显式 disabled 或留空，所以这条规则对别的壁纸是恒等变换。
+        const blended = !!spec.blending && spec.blending !== 'normal'
+        const dWrite = spec.depthWrite !== false && !blended && !anchored && !isSkybox
         if (dTest) {
           gl.enable(gl.DEPTH_TEST)
           gl.depthFunc(gl.LEQUAL)
