@@ -112,8 +112,223 @@ void main() {
 }
 `;
 
+// ---------------------------------------------------------------------------
+// generic（F47）：官方内置工程 arsenal 的**模型**着色器
+//
+// 为什么需要它：`local-assets/shaders/**` 是**开发机可选通路**（本机装了 WE 才有；
+// dev server 的 `/api/local-assets` 提供，产品形态没有这一档）。arsenal 的 6 个材质
+// 全是 `"shader": "generic"`（引擎内置、不进 pkg），于是「没有原版素材」的机器上
+// 这条解析链整段落空 → 模型退回通用网格程序（只有贴图 × 常量光照），与官方观感
+// 差别巨大：光池/法线细节/高光/地板倒影全丢。按 F42（flag）的同一惯例，这里给出
+// 仓内实现，**语义逐句对齐**官方 `assets/shaders/generic.vert|frag`。
+//
+// 组合（材质 combos，小写写在 json 里，本仓预处理器按大小写不敏感匹配）：
+//   LIGHTMAP      槽 1/2 是光照图（有 NORMALMAP 时是 g_Texture2，否则 g_Texture1），
+//                 且 a_TexCoordVec4 = [uv, 光照图 uv] 一条 vec4
+//   NORMALMAP     槽 1 是法线图（DXT5nm，走 DecompressNormal）；光照方向改到**切线空间**
+//   REFLECTION    g_Texture3 = `_rt_Reflection`（屏幕 UV 采样，见 renderer 的反射通道）
+//   DIFFUSETINT   反照率乘 Color/Alpha 两个物性（官方材质面板的 tint）
+//   DETAILINALPHA 反照率再乘「自身 uv×3 的 alpha × 2」（arsenal 的枪身/桌面用它加细节）
+//
+// 光路是**四盏场景点光 + 环境项**：前三盏的「方向 + 半径内第 3 盏的分量」打进
+// varying 的 xyz/w（官方为了省 varying 把第 4 盏拆成 3 个 w），第 4 盏在片元里重组；
+// 每盏走 ComputeLightSpecular（漫反射 + 半兰伯特混合 + 金属 rim + 高光累加）。
+//
+// uniform 名与 `// {"material": …}` 注释是契约：arsenal 的
+// `constantshadervalues`（Metal/Rough/Light）靠 material 名经 matMeta 落到这些
+// uniform 上（见 renderer.js 的 parseMaterialMeta / bindConstants）。
+const GENERIC_VERT = `// WE 引擎内置 shaders/generic.vert（本仓实现，语义对齐官方 assets 源）
+#include "common_vertex.h"
+
+uniform mat4 g_ModelMatrix;
+uniform mat4 g_ViewProjectionMatrix;
+uniform vec3 g_EyePosition;
+uniform vec3 g_LightsPosition[4];
+uniform vec3 g_LightAmbientColor;
+uniform vec3 g_LightSkylightColor;
+
+attribute vec3 a_Position;
+attribute vec3 a_Normal;
+#if LIGHTMAP
+attribute vec4 a_TexCoordVec4;
+#else
+attribute vec2 a_TexCoord;
+#endif
+
+#if NORMALMAP
+attribute vec4 a_Tangent4;
+#else
+varying vec3 v_Normal;
+#endif
+
+varying vec3 v_ViewDir;
+#if LIGHTMAP
+varying vec4 v_TexCoord;
+#else
+varying vec2 v_TexCoord;
+#endif
+varying vec4 v_Light0DirectionL3X;
+varying vec4 v_Light1DirectionL3Y;
+varying vec4 v_Light2DirectionL3Z;
+
+#if REFLECTION
+varying vec3 v_ScreenPos;
+#endif
+
+varying vec3 v_LightAmbientColor;
+
+void main() {
+	vec4 worldPos = mul(vec4(a_Position, 1.0), g_ModelMatrix);
+	gl_Position = mul(worldPos, g_ViewProjectionMatrix);
+	vec3 normal = normalize(mul(a_Normal, CAST3X3(g_ModelMatrix)));
+#if LIGHTMAP
+	v_TexCoord = a_TexCoordVec4;
+#else
+	v_TexCoord = a_TexCoord;
+#endif
+
+#if REFLECTION
+	v_ScreenPos = gl_Position.xyw;
+#endif
+
+	v_ViewDir = g_EyePosition - worldPos.xyz;
+
+	v_Light0DirectionL3X.xyz = g_LightsPosition[0] - worldPos.xyz;
+	v_Light1DirectionL3Y.xyz = g_LightsPosition[1] - worldPos.xyz;
+	v_Light2DirectionL3Z.xyz = g_LightsPosition[2] - worldPos.xyz;
+
+	vec3 l3 = g_LightsPosition[3] - worldPos.xyz;
+
+#if NORMALMAP
+	// 有法线图时，**光照方向与视线方向都换到切线空间**（片元里法线也是切线空间的），
+	// 于是片元不必再传 TBN 矩阵。tangentSpace 的构造见 headers.ts 的 BuildTangentSpace。
+	mat3 tangentSpace = BuildTangentSpace(CAST3X3(g_ModelMatrix), a_Normal, a_Tangent4);
+	v_Light0DirectionL3X.xyz = mul(tangentSpace, v_Light0DirectionL3X.xyz);
+	v_Light1DirectionL3Y.xyz = mul(tangentSpace, v_Light1DirectionL3Y.xyz);
+	v_Light2DirectionL3Z.xyz = mul(tangentSpace, v_Light2DirectionL3Z.xyz);
+	l3 = mul(tangentSpace, l3);
+	v_ViewDir = mul(tangentSpace, v_ViewDir);
+#else
+	v_Normal = normal;
+#endif
+
+	v_Light0DirectionL3X.w = l3.x;
+	v_Light1DirectionL3Y.w = l3.y;
+	v_Light2DirectionL3Z.w = l3.z;
+	// 环境项按法线的「朝天程度」在天空色与地面环境色之间插值（朝上偏 skylight）
+	v_LightAmbientColor = mix(g_LightSkylightColor, g_LightAmbientColor, dot(normal, vec3(0, 1, 0)) * 0.5 + 0.5);
+}
+`;
+
+const GENERIC_FRAG = `// WE 引擎内置 shaders/generic.frag（本仓实现，语义对齐官方 assets 源）
+#include "common_fragment.h"
+
+uniform vec4 g_LightsColorRadius[4];
+
+uniform float g_Metallic; // {"material":"Metal","default":0,"range":[0,1]}
+uniform float g_Roughness; // {"material":"Rough","default":0,"range":[0,1]}
+uniform float g_Light; // {"material":"Light","default":0,"range":[0,1]}
+
+#if DIFFUSETINT
+uniform vec3 g_TintColor; // {"material":"Color", "type": "color", "default":"1 1 1"}
+uniform float g_TintAlpha; // {"material":"Alpha","default":0,"range":[0,1]}
+#endif
+
+uniform sampler2D g_Texture0;
+
+#if NORMALMAP
+uniform sampler2D g_Texture1;
+#define g_NormalMapSampler g_Texture1
+
+#if LIGHTMAP
+uniform sampler2D g_Texture2;
+#define g_LightmapMapSampler g_Texture2
+#endif
+
+#else
+
+#if LIGHTMAP
+uniform sampler2D g_Texture1;
+#define g_LightmapMapSampler g_Texture1
+#endif
+
+varying vec3 v_Normal;
+
+#endif
+
+#if REFLECTION
+uniform sampler2D g_Texture3;
+#define g_ReflectionSampler g_Texture3
+varying vec3 v_ScreenPos;
+#endif
+
+#if LIGHTMAP
+varying vec4 v_TexCoord;
+#else
+varying vec2 v_TexCoord;
+#endif
+
+varying vec3 v_ViewDir;
+varying vec4 v_Light0DirectionL3X;
+varying vec4 v_Light1DirectionL3Y;
+varying vec4 v_Light2DirectionL3Z;
+varying vec3 v_LightAmbientColor;
+
+void main() {
+	vec4 albedo = texSample2D(g_Texture0, v_TexCoord.xy);
+	vec3 specularResult = vec3(0, 0, 0);
+
+#if DIFFUSETINT
+	albedo.rgb *= g_TintColor;
+	albedo.a *= g_TintAlpha;
+#endif
+
+#if DETAILINALPHA
+	// 自身 uv×3 处的 alpha 当细节层（官方原样 ×2，arsenal 的枪身刻线/桌面木纹靠它）
+	albedo.rgb *= texSample2D(g_Texture0, v_TexCoord.xy * 3).a * 2.0;
+#endif
+
+	vec3 viewDir = normalize(v_ViewDir);
+	float specularPower = ComputeMaterialSpecularPower(g_Roughness, g_Metallic);
+	float specularStrength = ComputeMaterialSpecularStrength(g_Roughness, g_Metallic);
+
+#if NORMALMAP
+	vec3 normal = DecompressNormal(texSample2D(g_NormalMapSampler, v_TexCoord.xy));
+#else
+	vec3 normal = normalize(v_Normal);
+#endif
+
+	// 四盏点光：0/1/2 用 varyings，第 3 盏由三个 w 分量重组（见 vert）
+	vec3 light = ComputeLightSpecular(normal, v_Light0DirectionL3X.xyz, g_LightsColorRadius[0].rgb, g_LightsColorRadius[0].w, viewDir, specularPower, specularStrength, g_Light, g_Metallic, specularResult);
+
+#if LIGHTMAP
+	vec3 lightmap = texSample2D(g_LightmapMapSampler, v_TexCoord.zw).rgb;
+	light *= lightmap;
+	specularResult *= lightmap;
+#endif
+
+	light += ComputeLightSpecular(normal, v_Light1DirectionL3Y.xyz, g_LightsColorRadius[1].rgb, g_LightsColorRadius[1].w, viewDir, specularPower, specularStrength, g_Light, g_Metallic, specularResult);
+	light += ComputeLightSpecular(normal, v_Light2DirectionL3Z.xyz, g_LightsColorRadius[2].rgb, g_LightsColorRadius[2].w, viewDir, specularPower, specularStrength, g_Light, g_Metallic, specularResult);
+	light += ComputeLightSpecular(normal, vec3(v_Light0DirectionL3X.w, v_Light1DirectionL3Y.w, v_Light2DirectionL3Z.w), g_LightsColorRadius[3].rgb, g_LightsColorRadius[3].w, viewDir, specularPower, specularStrength, g_Light, g_Metallic, specularResult);
+
+	light += v_LightAmbientColor;
+	albedo.rgb = albedo.rgb * light + specularResult;
+
+#if REFLECTION
+	// 屏幕 UV 采样本帧的镜像目标（renderer 的 renderReflectionPass），法线 xy 做少量偏移。
+	// 官方的 HLSL_SM30 半像素补偿对 GL 路径不适用（那条只在 HLSL 目标下编译）。
+	vec2 screenUV = (v_ScreenPos.xy / v_ScreenPos.z) * 0.5 + 0.5;
+	albedo.rgb += texSample2D(g_ReflectionSampler, screenUV + normal.xy * 0.01).rgb * 0.35;
+#endif
+
+	gl_FragColor = albedo;
+}
+`;
+
 /** 引擎内置 shader 源（键 = `shaders/` 下的文件名，调用方按需加前缀） */
 export const WE_BUILTIN_SHADERS: Record<string, string> = {
   'flag.vert': FLAG_VERT,
   'flag.frag': FLAG_FRAG,
+  'generic.vert': GENERIC_VERT,
+  'generic.frag': GENERIC_FRAG,
 };
