@@ -660,6 +660,35 @@ const wireErrors = [];
       }
     }
   }
+  // ---- F47：`generic`（官方内置**模型**着色器）的仓内实现 ----
+  // 为什么与 F42 分开列：`generic` 的消费面不是图层材质而是**模型材质**（arsenal 的 6 个），
+  // 此前只在「本机装了 WE 素材」时靠 local-assets 拿到官方源 —— 产品形态没有那一档，
+  // 整个模型于是回落通用网格程序（观感 = 素模：光池/法线细节/高光/地板倒影全丢，
+  // 实测同一机位 mean 24.1 → 37.8、桌面从木纹光池变成一片平铺条纹）。
+  // 判据两条：① 表里成对且非空；② 复刻件**真的实现了官方语义**（关键锚点逐个钉住：
+  // 四盏点光的 w 分量重组、ComputeLightSpecular、光照图/法线图/反射三条分支、
+  // 切线空间构造、天空色-环境色混合）。非空转门在 verify-defprojects（判据 9）。
+  for (const ext of ["frag", "vert"]) {
+    if (typeof WE_BUILTIN_SHADERS[`generic.${ext}`] !== "string" || !WE_BUILTIN_SHADERS[`generic.${ext}`].trim()) {
+      wireErrors.push(`WE_BUILTIN_SHADERS 缺 generic.${ext}（arsenal 的模型材质在无原版素材的机器上会整体回落素模）`);
+    }
+  }
+  {
+    const gf = WE_BUILTIN_SHADERS["generic.frag"] || "";
+    const gv = WE_BUILTIN_SHADERS["generic.vert"] || "";
+    const pins = [
+      [/ComputeLightSpecular\s*\(\s*normal\s*,\s*v_Light0DirectionL3X\.xyz/.test(gf), "frag 未按官方语义对第 0 盏点光调 ComputeLightSpecular"],
+      [/ComputeMaterialSpecularPower\s*\(\s*g_Roughness\s*,\s*g_Metallic\s*\)/.test(gf), "frag 未用 Rough/Metal 求高光指数（物性名是材质契约）"],
+      [/vec3\s*\(\s*v_Light0DirectionL3X\.w\s*,\s*v_Light1DirectionL3Y\.w\s*,\s*v_Light2DirectionL3Z\.w\s*\)/.test(gf), "frag 未重组第 3 盏点光（官方把它的方向拆进 3 个 varying 的 w）"],
+      [/#if\s+LIGHTMAP/.test(gf) && /g_LightmapMapSampler/.test(gf), "frag 缺 LIGHTMAP 分支（arsenal 全部材质都开它）"],
+      [/#if\s+NORMALMAP/.test(gf) && /DecompressNormal\s*\(\s*texSample2D\s*\(\s*g_NormalMapSampler/.test(gf), "frag 缺 NORMALMAP 分支/法线解码"],
+      [/#if\s+REFLECTION/.test(gf) && /g_ReflectionSampler/.test(gf), "frag 缺 REFLECTION 分支（arsenal 的桌面 planks 用它）"],
+      [/BuildTangentSpace\s*\(\s*CAST3X3\s*\(\s*g_ModelMatrix\s*\)\s*,\s*a_Normal\s*,\s*a_Tangent4\s*\)/.test(gv), "vert 未按官方语义构造切线空间（NORMALMAP 下光照与视线方向要换到切线空间）"],
+      [/v_Light0DirectionL3X\.w\s*=\s*l3\.x/.test(gv) && /v_Light1DirectionL3Y\.w\s*=\s*l3\.y/.test(gv), "vert 未把第 3 盏点光的方向拆进 w 分量"],
+      [/mix\s*\(\s*g_LightSkylightColor\s*,\s*g_LightAmbientColor\s*,\s*dot\s*\(\s*normal\s*,\s*vec3\s*\(\s*0\s*,\s*1\s*,\s*0\s*\)\s*\)\s*\*\s*0\.5\s*\+\s*0\.5\s*\)/.test(gv), "vert 缺「按法线朝天程度混合天空色/环境色」"],
+    ];
+    for (const [ok, why] of pins) if (!ok) wireErrors.push(`generic 复刻与官方语义不符：${why}（F47）`);
+  }
   // ---- F44：粒子材质自带 shader（作者写的 `shaders/particle.*`）----
   // ① 宿主必须把粒子材质的 shader 接上（不接 = 作者的颜色/形变逻辑整条丢掉，
   //    shimmering_particles 的「每颗颜色 = mix(color1,color2,随机)」就是这么丢的）；

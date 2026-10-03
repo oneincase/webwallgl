@@ -336,6 +336,18 @@ function auditProject(dirName) {
       continue; // 残缺资产（audiophile grid）由 verify-mdl-source 负责报，这里只数材料
     }
     const meshes = mdl.meshes ?? [];
+    // 判据 9（F47）的采集点：模型材质里引用引擎内置 `generic` 的条数。它与多子网格
+    // 无关（arsenal 的枪械是 6 网格、桌面是单网格），所以放在 `meshes.length < 2`
+    // 的早退**之前**。语料里没有它 → 源码护栏（verify-shaders 的语义钉）就空转。
+    for (const m of meshes) {
+      const me9 = m.materialPath ? getEntry(pkg, m.materialPath) : null;
+      if (!me9) continue;
+      const p9 = (eff.parseJsonTolerant(readText(me9)).passes ?? [])[0];
+      if (p9 && String(p9.shader ?? "").toLowerCase() === "generic") {
+        genericModelMatAll++;
+        if (genericModelMatSamples.length < 6) genericModelMatSamples.push(`${dirName}/${o.name ?? o.id}（${m.materialPath}）`);
+      }
+    }
     if (meshes.length < 2) continue;
     multiMesh.models++;
     const slots = new Set();
@@ -497,6 +509,9 @@ const builtinImplementedAll = new Map();
 const multiMeshAll = { models: 0, distinct: 0, samples: [] };
 /** 判据 8（F46）：混合（translucent/additive）材质 pass 的全语料清单，见 auditProject */
 const blendedPassAll = [];
+/** 判据 9（F47）：模型材质引用引擎内置 `generic` 的条数与样本（非空转门） */
+let genericModelMatAll = 0;
+const genericModelMatSamples = [];
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
   if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
@@ -600,6 +615,20 @@ check(blendedPassAll.length >= 30,
   `审计到的混合材质 pass 只有 ${blendedPassAll.length} 处（基线 40+，含 neon_sunset 的 neonsun/neongrid）—— F46 判据可能空转`);
 check(blendedPassAll.some((s) => s.includes(":neonsun:translucent")),
   "语料里应能认到 neon_sunset 的 neonsun:translucent（F46 的实测样本），实际一条未命中");
+
+// 判据 9 的非空转闸门（F47）：引擎内置模型着色器 `generic` 的仓内实现（shaders-builtin.ts）
+// 只有在内置语料真的引用它时才有意义 —— arsenal 的 6 个模型材质就是它的全部消费面
+// （工坊 366 包里另有 1 个）。数字跳水说明语料换了形态、或 .mdl→材质链走丢。
+if (genericModelMatAll) {
+  console.log(`  - 模型材质引用内置 generic（F47）：${genericModelMatAll} 处，如 ${genericModelMatSamples.join("、")}`);
+}
+check(genericModelMatAll >= 5,
+  `模型材质引用内置 generic 的只有 ${genericModelMatAll} 处（基线 6，全在 arsenal）—— F47 判据可能空转`);
+check(
+  typeof WE_BUILTIN_SHADERS["generic.frag"] === "string" && WE_BUILTIN_SHADERS["generic.frag"].trim() &&
+    typeof WE_BUILTIN_SHADERS["generic.vert"] === "string" && WE_BUILTIN_SHADERS["generic.vert"].trim(),
+  "generic 的仓内实现缺失：无原版素材的机器上 arsenal 会整体回落素模（F47）",
+);
 
 console.log("");
 if (errors.length > 0) {
