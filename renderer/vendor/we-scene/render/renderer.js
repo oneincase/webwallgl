@@ -2,7 +2,7 @@ import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4Ro
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, HDR_BLOOM_VERT, HDR_BLOOM_EXTRACT_FRAG, HDR_BLOOM_BOX_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
 import { createGlRegistry } from './gl-registry.js'
 import { createAnimation, linkAnimations } from './animation.js'
@@ -597,28 +597,17 @@ export function bloomPostParams(general) {
   const hdrMode = boolOf(g.hdr, false)
   const strength = hdrMode ? numOf(g.bloomhdrstrength, 1.5) : numOf(g.bloomstrength, 1.5)
   const tint = parseVec3Local(g.bloomtint || '1 1 1')
-  const threshold = hdrMode ? numOf(g.bloomhdrthreshold, 0.1) : numOf(g.bloomthreshold, 0.65)
-  // HDR 家族：官方 hdr_downsample.frag 的 soft-knee 参数（linux-wallpaperengine 同式）：
-  //   knee = threshold × feather；blend = (t, t-knee, 2knee, knee>0 ? 0.25/knee : 0)
-  const feather = hdrMode ? numOf(g.bloomhdrfeather, 0.5) : 0.5
-  const knee = Math.max(0, threshold) * Math.max(0, feather)
-  const blend = [threshold, threshold - knee, 2 * knee, knee > 0 ? 0.25 / knee : 0]
   return {
     enabled: true,
     hdr: hdrMode,
     strength,
-    threshold,
-    // HDR 家族：`bloomhdriterations` = 金字塔层数（官方 default 8，corpus 2~8）；
-    // 经典家族：固定 4 段链，这里的 8 只是既有 blur 的 ±iterations 上限。
+    threshold: hdrMode ? numOf(g.bloomhdrthreshold, 0.1) : numOf(g.bloomthreshold, 0.65),
     iterations: Math.max(1, Math.round(hdrMode ? numOf(g.bloomhdriterations, 8) : 8)),
-    // HDR 家族：`bloomhdrscatter` = 每级升采样的权重（0 → 1，官方 shader 的 default）；
-    // 经典家族：Scatter 是模糊核步长。
-    radius: hdrMode ? (numOf(g.bloomhdrscatter, 1) > 0 ? numOf(g.bloomhdrscatter, 1) : 1) : Math.max(0, 3),
-    damp: feather,
+    radius: Math.max(0, hdrMode ? numOf(g.bloomhdrscatter, 3) : 3),
+    damp: hdrMode ? numOf(g.bloomhdrfeather, 0.5) : 0.5,
     alpha: 1,
     tint,
-    blend,
-    // 亮度判定口径：HDR 家族走官方 fp16 金字塔链（u_Metric 不再参与），
+    // 亮度判定口径：HDR 家族 = raw sRGB 亮度 + 软窗口（shader u_Metric=1），
     // 经典家族 = 引擎 downsample_quarter_bloom 软拐点（u_Metric=0）。见上方注释。
     metric: hdrMode ? 1 : 0,
   }
@@ -1206,9 +1195,6 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 内置 Bloom 后期（general.bloom；HDR 开关绑在这里）。
   // 三段 program 见 renderer-glsl.js 的 BLOOM_* 注释，语义 = WE localeffects/Bloom。
   const bloomLightProg = glReg.program(linkProgram(gl, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG))
-  // HDR 家族（hdr + bloomhdr*）：官方 hdr_downsample / combine_hdr 那两个 pass
-  const hdrBloomExtractProg = glReg.program(linkProgram(gl, HDR_BLOOM_VERT, HDR_BLOOM_EXTRACT_FRAG))
-  const hdrBloomBoxProg = glReg.program(linkProgram(gl, HDR_BLOOM_VERT, HDR_BLOOM_BOX_FRAG))
   const bloomBlurProg = glReg.program(linkProgram(gl, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG))
   const bloomApplyProg = glReg.program(linkProgram(gl, COPY_VERT, BLOOM_APPLY_FRAG))
   // [we-scene patch] 固定管线表达不了的 colorBlendMode（ColorBurn/Overlay/HSL 系…）
@@ -2391,20 +2377,7 @@ export function createRenderer(canvas, opts = {}) {
     alpha: gl.getUniformLocation(bloomLightProg, 'u_Alpha'),
     strength: gl.getUniformLocation(bloomLightProg, 'u_Strength'),
     threshold: gl.getUniformLocation(bloomLightProg, 'u_Threshold'),
-  }
-  const hdrBloomExtractUni = {
-    tex: gl.getUniformLocation(hdrBloomExtractProg, 'u_Tex'),
-    texel: gl.getUniformLocation(hdrBloomExtractProg, 'u_Texel'),
-    offsetScale: gl.getUniformLocation(hdrBloomExtractProg, 'u_OffsetScale'),
-    strength: gl.getUniformLocation(hdrBloomExtractProg, 'u_Strength'),
-    blend: gl.getUniformLocation(hdrBloomExtractProg, 'u_Blend'),
-    tint: gl.getUniformLocation(hdrBloomExtractProg, 'u_Tint'),
-  }
-  const hdrBloomBoxUni = {
-    tex: gl.getUniformLocation(hdrBloomBoxProg, 'u_Tex'),
-    texel: gl.getUniformLocation(hdrBloomBoxProg, 'u_Texel'),
-    offsetScale: gl.getUniformLocation(hdrBloomBoxProg, 'u_OffsetScale'),
-    scale: gl.getUniformLocation(hdrBloomBoxProg, 'u_Scale'),
+    metric: gl.getUniformLocation(bloomLightProg, 'u_Metric'),
   }
   const bloomBlurUni = {
     tex: gl.getUniformLocation(bloomBlurProg, 'u_Tex'),
@@ -3430,9 +3403,6 @@ export function createRenderer(canvas, opts = {}) {
   // 纹素，降采样带锯齿是 WE 原样（它的 first pass 也直接吃全分辨率 previous）。
   function applyBloomPost(p, width, height) {
     const sceneTex = captureBackdrop(width, height)
-    // HDR 家族走官方 fp16 金字塔链（hdr_downsample/combine_hdr 那一族）；
-    // 经典家族仍是 downsample_quarter_bloom 那一族的四段链。
-    if (p.hdr) return applyHdrBloomPost(p, width, height, sceneTex)
     const bw = Math.max(1, Math.round(width / 4))
     const bh = Math.max(1, Math.round(height / 4))
     // HDR：亮部/模糊缓冲也用 fp16（>1 的能量不被 8bit 截断），bloom 在
@@ -3455,6 +3425,7 @@ export function createRenderer(canvas, opts = {}) {
     gl.uniform1f(bloomLightUni.alpha, p.alpha)
     gl.uniform1f(bloomLightUni.strength, p.strength)
     gl.uniform1f(bloomLightUni.threshold, p.threshold)
+    gl.uniform1i(bloomLightUni.metric, p.metric)
     gl.drawArrays(gl.TRIANGLES, 0, 6)
     // 2) 高斯横/纵各一趟（±iterations 抽头，exp(-|n|*0.1) 权重，Scatter 缩放步长）
     gl.useProgram(bloomBlurProg)
@@ -3490,117 +3461,22 @@ export function createRenderer(canvas, opts = {}) {
     gl.drawArrays(gl.TRIANGLES, 0, 6)
     // 恢复默认混合（后续帧的第一趟 draw 各自会设，这里保守复原）
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
-    bloomDiagSample(p, bufA)
-  }
-
-  /**
-   * bloom 诊断采样（两个家族共用）：1/4 亮部图中心那一像素的读回。
-   *
-   * [we-scene patch 2026-10-03] **HDR 回读必须用 FLOAT/32 位**（F31）。
-   * 此前写的是 `HALF_FLOAT` + `Float32Array` —— 类型与数组位宽不匹配，readPixels
-   * 当场抛 INVALID_OPERATION（1282）、一个字节都不写，于是：
-   *   · 诊断本身成了「可疑渲染异常」（razer_bedroom / shimmering_particles 的
-   *     `bloom glErr=1282` 就是它，被记进 DEFAULTPROJECTS-PLAN 的疑似缺陷清单）；
-   *   · 读回来恒是 `[0,0,0,0]`，把「HDR 场景的 bloom 强度」这条观测整个废掉。
-   * WebGL2 对浮点目标的规定组合是 RGBA + FLOAT + Float32Array（HALF_FLOAT 要配
-   * Uint16Array）；RGBA16F 可渲染本身就意味着 EXT_color_buffer_float 在位。
-   */
-  function bloomDiagSample(p, lvl) {
     bloomFrameCount++
-    if (!(bloomFrameCount === 1 || bloomFrameCount === 120 || bloomFrameCount === 600)) return
-    const px = hdrActive ? new Float32Array(4) : new Uint8Array(4)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, lvl.fbo)
-    gl.readPixels(Math.max(0, lvl.width >> 1), Math.max(0, lvl.height >> 1), 1, 1, gl.RGBA, hdrActive ? gl.FLOAT : gl.UNSIGNED_BYTE, px)
-    bindFinal()
-    diag(
-      `bloom frame ${bloomFrameCount}: center=[${[...px].map((x) => +x.toFixed(3))}] glErr=${gl.getError()}` +
-        ` threshold=${p.threshold} strength=${p.strength} metric=${p.metric} hdr=${hdrActive} family=${p.hdr ? 'hdr' : 'classic'}` +
-        (p.hdr ? ` knee=${(p.blend && p.blend[1] !== undefined ? (p.threshold - p.blend[1]).toFixed(4) : '?')} levels=${p.iterations} scatter=${p.radius}` : ''),
-    )
-  }
-
-  /**
-   * [we-scene patch 2026-10-03] **HDR 家族 Bloom**（`general.hdr === true` + `bloomhdr*`）。
-   *
-   * 官方链路（与 linux-wallpaperengine 的 scene_2d.cpp 同构）：
-   *   ① 亮部提取（全分辨率 fp16 场景 → 1/4，hdr_downsample 的 BLOOM 分支：
-   *      4 抽头平均 → soft-knee 软窗口（threshold/feather）→ ×strength×tint）；
-   *   ② 逐级降采样（hdr_downsample：4 抽头 × 0.25，每级半分辨率）；
-   *   ③ 逐级升采样（hdr_upsample：4 抽头 × 0.25 × scatter，**加算**回上一级）；
-   *   ④ 合并（combine_hdr 的 LINEAR 分支思路：把 1/4 亮部加回场景；能量已在 ① 乘过
-   *      strength，这里 strength=1、tint=1，色调映射仍由帧末的 tonemap 负责）。
-   *
-   * 此前这里是「SDR 等效」近似（`u_Metric=1`：raw sRGB 亮度 + 平滑窗口 + strength 双乘），
-   * 那是当年为 4 张 HDR 壁纸做的标定；真身是上面这条**线性空间的 fp16 金字塔** ——
-   * 阈值口径（线性 vs sRGB）、软窗口形状（soft-knee vs smoothstep）与模糊来源
-   * （金字塔 vs 固定核）三处都不同（shimmering_particles 与官方 preview 的
-   * 亮度/糊度差就是它）。层数 = `bloomhdriterations`，升采样权重 = `bloomhdrscatter`。
-   */
-  function applyHdrBloomPost(p, width, height, sceneTex) {
-    const bufFmt = hdrActive ? 'rgba161616f' : undefined
-    const depth = Math.max(1, Math.min(8, Math.round(p.iterations) || 1))
-    const levels = []
-    let lw = Math.max(1, Math.round(width / 4))
-    let lh = Math.max(1, Math.round(height / 4))
-    for (let i = 0; i < depth; i++) {
-      levels.push(getFBO(lw, lh, 'hdrBloom' + i, bufFmt))
-      lw = Math.max(1, lw >> 1)
-      lh = Math.max(1, lh >> 1)
+    if (bloomFrameCount === 1 || bloomFrameCount === 120 || bloomFrameCount === 600) {
+      // [we-scene patch 2026-10-03] **HDR 回读必须用 FLOAT/32 位**（F31）。
+      // 这里此前写的是 `type = HALF_FLOAT` + `Float32Array` —— 类型与数组位宽不匹配，
+      // readPixels 当场抛 INVALID_OPERATION（1282）、像素一个字节都不写，于是：
+      //   · 诊断本身成了「可疑渲染异常」（razer_bedroom / shimmering_particles 的
+      //     `bloom glErr=1282` 就是它，被记进 DEFAULTPROJECTS-PLAN 的疑似缺陷清单）；
+      //   · 读回来恒是 `[0,0,0,0]`，把「HDR 场景的 bloom 强度」这条观测整个废掉。
+      // WebGL2 对浮点目标的规定组合是 RGBA + FLOAT + Float32Array（HALF_FLOAT 要配
+      // Uint16Array）；RGBA16F 可渲染本身就意味着 EXT_color_buffer_float 在位。
+      const px = hdrActive ? new Float32Array(4) : new Uint8Array(4)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bufA.fbo)
+      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, hdrActive ? gl.FLOAT : gl.UNSIGNED_BYTE, px)
+      bindFinal()
+      diag(`bloom frame ${bloomFrameCount}: center=[${[...px].map((x) => +x.toFixed(3))}] glErr=${gl.getError()} threshold=${p.threshold} strength=${p.strength} metric=${p.metric} hdr=${hdrActive}`)
     }
-    gl.bindVertexArray(vao)
-    uploadQuad('pass', PASS_QUAD)
-    gl.activeTexture(gl.TEXTURE0)
-    gl.disable(gl.BLEND)
-    // ① 亮部提取：场景 → 1/4
-    {
-      const lvl = levels[0]
-      gl.useProgram(hdrBloomExtractProg)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, lvl.fbo)
-      gl.viewport(0, 0, lvl.width, lvl.height)
-      gl.bindTexture(gl.TEXTURE_2D, sceneTex)
-      gl.uniform1i(hdrBloomExtractUni.tex, 0)
-      gl.uniform2f(hdrBloomExtractUni.texel, 1 / width, 1 / height)
-      gl.uniform1f(hdrBloomExtractUni.offsetScale, 1)
-      gl.uniform1f(hdrBloomExtractUni.strength, p.strength)
-      const b = p.blend || [p.threshold, p.threshold, 0, 0]
-      gl.uniform4f(hdrBloomExtractUni.blend, b[0], b[1], b[2], b[3])
-      gl.uniform3f(hdrBloomExtractUni.tint, p.tint[0], p.tint[1], p.tint[2])
-      gl.drawArrays(gl.TRIANGLES, 0, 6)
-    }
-    // ② 逐级降采样（每级 4 抽头 × 0.25，抽头跨 ±0.5 源纹素）
-    gl.useProgram(hdrBloomBoxProg)
-    const boxPass = (src, dst, scale, blend) => {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo)
-      gl.viewport(0, 0, dst.width, dst.height)
-      gl.bindTexture(gl.TEXTURE_2D, src.tex)
-      gl.uniform1i(hdrBloomBoxUni.tex, 0)
-      gl.uniform2f(hdrBloomBoxUni.texel, 1 / src.width, 1 / src.height)
-      gl.uniform1f(hdrBloomBoxUni.offsetScale, 0.5)
-      gl.uniform1f(hdrBloomBoxUni.scale, scale)
-      if (blend) gl.enable(gl.BLEND)
-      else gl.disable(gl.BLEND)
-      gl.drawArrays(gl.TRIANGLES, 0, 6)
-    }
-    for (let i = 1; i < depth; i++) boxPass(levels[i - 1], levels[i], 1, false)
-    // ③ 逐级升采样：加算回上一级，×scatter（官方 UPSAMPLE 分支的 albedo *= 0.25*scatter）
-    gl.blendFunc(gl.ONE, gl.ONE)
-    for (let i = depth - 1; i >= 1; i--) boxPass(levels[i], levels[i - 1], p.radius, true)
-    gl.disable(gl.BLEND)
-    // ④ 合并：把 1/4 亮部加回场景（fp16 目标；SDR 场景则加回画布）
-    gl.useProgram(bloomApplyProg)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, hdrActive && hdrSceneFbo ? hdrSceneFbo.fbo : null)
-    gl.viewport(0, 0, width, height)
-    gl.enable(gl.BLEND)
-    gl.blendFunc(gl.ONE, gl.ONE)
-    gl.bindTexture(gl.TEXTURE_2D, levels[0].tex)
-    gl.uniform1i(bloomApplyUni.tex, 0)
-    gl.uniformMatrix4fv(bloomApplyUni.mvp, false, IDENT_M4)
-    gl.uniform1f(bloomApplyUni.alpha, p.alpha)
-    gl.uniform1f(bloomApplyUni.strength, 1)
-    gl.uniform3f(bloomApplyUni.tint, 1, 1, 1)
-    gl.drawArrays(gl.TRIANGLES, 0, 6)
-    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
-    bloomDiagSample(p, levels[0])
   }
 
   // 把画布内容按层矩形的屏幕投影画进层 FBO（passthrough 层的效果链输入）。
