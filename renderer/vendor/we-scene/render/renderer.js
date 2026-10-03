@@ -1402,10 +1402,23 @@ export function createRenderer(canvas, opts = {}) {
           // GL 的 info log 只给行号（`ERROR: 0:87: …`），而这一行在多级改写之后
           // 早已不是作者写的样子 —— 没有这段，排查只能在「离线复现」里盲猜参数差异
           // （backgroundsphere 的 opaque 赋值就是这么耗掉的）。上限 160 字符。
+          //
+          // [we-scene patch 2026-10-03 续] 两个 stage 都要查：GL 的错误行号只在**它正在
+          // 编译的那个 stage** 里成立，而这里先编译 vert。此前只查 fragGlsl 的行 ——
+          // vert 出错时按同一行号去 frag 里取，取到的是无关行或空串（arsenal 的
+          // `generic` 报 `ERROR: 0:123` 时就是这样，诊断尾巴是空的，白瞎一次排查）。
           const msg = String((e && e.message) || e)
           const mline = /ERROR:\s*\d+:(\d+):/.exec(msg)
-          const bad = mline ? (fragGlsl.split('\n')[Number(mline[1]) - 1] || '') : ''
-          throw new Error('shader=' + shaderName + ' ' + msg + (bad ? '  ← ' + bad.trim().slice(0, 160) : ''))
+          let bad = ''
+          if (mline) {
+            const ln = Number(mline[1])
+            const vLine = vertGlsl.split('\n')[ln - 1]
+            const fLine = fragGlsl.split('\n')[ln - 1]
+            const pick = vLine && vLine.trim() ? { stage: 'vert', line: vLine } : fLine && fLine.trim() ? { stage: 'frag', line: fLine } : null
+            if (pick) bad = pick.stage + ': ' + pick.line.trim().slice(0, 150)
+          }
+          const sizes = '[vert ' + vertGlsl.split('\n').length + ' / frag ' + fragGlsl.split('\n').length + ' 行]'
+          throw new Error('shader=' + shaderName + ' ' + msg + ' ' + sizes + (bad ? '  ← ' + bad : ''))
         }
         const uni = new Map()
         const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS)
@@ -1627,6 +1640,25 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 「层局部像素、原点在层中心」的正交投影，供指针反投影用。
   // 见 g_ModelViewProjectionMatrixInverse 的绑定注释：只有反投影到这个空间，
   // xray 的开窗中心才落在指针处。按尺寸缓存，避免每帧每 pass 新建矩阵。
+  // 老通道灯的派生数组（vec4 = color×intensity + radius；预乘 = rgb × radius²）。
+  // 每次 bindSystemUniforms 重算：只有 4 盏灯 × 数个乘加，比缓存失效管理便宜。
+  const legacyLightColorRadius = new Float32Array(MAX_SCENE_LIGHTS * 4)
+  const legacyLightPremultiplied = new Float32Array(MAX_SCENE_LIGHTS * 3)
+  function refreshLegacyLightArrays() {
+    const L = sceneLights.legacy
+    for (let i = 0; i < MAX_SCENE_LIGHTS; i++) {
+      const r = L.radii[i] || 0
+      const cr = r * r
+      for (let k = 0; k < 3; k++) {
+        const c = L.colors[i * 3 + k] || 0
+        legacyLightColorRadius[i * 4 + k] = c
+        legacyLightPremultiplied[i * 3 + k] = c * cr
+      }
+      legacyLightColorRadius[i * 4 + 3] = r
+    }
+    return legacyLightColorRadius
+  }
+
   function bindSystemUniforms(uni, layer, time, projW, projH, mvp, modelM, viewProjM, resolutions, passProj, cam, effectScreenMVP) {
     setVal(uni, 'g_Time', (l) => gl.uniform1f(l, time))
     setVal(uni, 'g_Daytime', (l) => gl.uniform1f(l, daytimeFraction()))
@@ -1649,6 +1681,20 @@ export function createRenderer(canvas, opts = {}) {
     setVal(uni, 'g_EyePosition', (l) => {
       const e = (cam && cam.eye) || [0, 0, 0]
       gl.uniform3f(l, Number(e[0]) || 0, Number(e[1]) || 0, Number(e[2]) || 0)
+    })
+    // [we-scene patch 2026-10-03] **老通道点光**（F34）：官方 `generic.frag` 用
+    // `g_LightsPosition[4]`（世界位置）+ `g_LightsColorRadius[4]`（rgb = color×intensity、
+    // w = radius）驱动 `ComputeLightSpecular`；`light: "point"` 这类不带 `l` 前缀的灯
+    // 正是这条通道（见 collectSceneLights / parse.js 的 lightLane 注释）。
+    // 此前这两个 uniform 全仓没有绑定点 —— 材质路径下的场景点光等于不存在，
+    // 模型只剩 albedo × 环境项（arsenal 的桌面/手枪没有明暗就是这个原因）。
+    // `g_LightsColorPremultiplied` 是同一份数据的预乘版（rgb × radius²，genericimage2 用）。
+    refreshLegacyLightArrays()
+    setVal(uni, 'g_LightsPosition', (l) => gl.uniform3fv(l, sceneLights.legacy.positions))
+    setVal(uni, 'g_LightsColorRadius', (l) => gl.uniform4fv(l, legacyLightColorRadius))
+    setVal(uni, 'g_LightsColorPremultiplied', (l) => gl.uniform3fv(l, legacyLightPremultiplied))
+    setVal(uni, 'g_LightSkylightColor', (l) => {
+      gl.uniform3f(l, sceneSkylight[0] || 0, sceneSkylight[1] || 0, sceneSkylight[2] || 0)
     })
     // [we-scene patch] g_LightAmbientColor：genericimage*/PBR shader 的
     // `ambient = g_LightAmbientColor * albedo`。genericimage* 层在 JS 侧已乘
@@ -1862,6 +1908,11 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] 当前帧场景环境光颜色（g_LightAmbientColor），renderScene
   // 每帧更新；LIGHTING combo 开启的图层基色乘它（见 renderLayer color4）。
   let sceneAmbient = [1, 1, 1]
+  // [we-scene patch 2026-10-03] `general.skylightcolor`（F34）：官方 generic.vert 的
+  // `v_LightAmbientColor = mix(g_LightSkylightColor, g_LightAmbientColor, dot(normal, up)*0.5+0.5)`
+  // —— 天空光/环境光按法线朝向插值。此前从没绑过这个 uniform（恒 (0,0,0)），
+  // arsenal 的暖色天空光（0.396 0.329 0.200）因此整条丢失。
+  let sceneSkylight = [0, 0, 0]
   // [we-scene patch] 当前渲染尺寸：scriptedConstants 里沙箱创建时要给
   // engine.screenResolution 一个真实默认值（resize 模板的 init 立即读它：
   // `init(value){ originalValue = value; resizeScreen(engine.screenResolution) }`，
@@ -2729,7 +2780,7 @@ export function createRenderer(canvas, opts = {}) {
   // car 的材质路径因此可以真正接管。**声明了却拿到 null 数据**时仍要回落 ——
   // 属性数组未启用会让该 attribute 读常量 (0,0,0,0)（法线归零即整片黑），
   // 所以判定从「名字黑名单」改成「名字 + 数据可用性」（见 meshMatVao/drawMeshMaterialInner）。
-  const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Color', 'a_TexCoordVec4', 'a_TexCoordVec4C1', 'a_TexCoordC2']
+  const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Color', 'a_TexCoordVec4C1', 'a_TexCoordC2']
   /**
    * 程序声明了某属性、但网格没有对应数据 → 不能走材质路径。
    *
@@ -2740,6 +2791,9 @@ export function createRenderer(canvas, opts = {}) {
    */
   function meshMatAttrUnavailable(prog, info) {
     if (gl.getAttribLocation(prog, 'a_Tangent4') >= 0 && !info.hasTangents) return true
+    // a_TexCoordVec4 = [uv, uv2] 一条连续 vec4（官方 generic.vert 的 LIGHTMAP 分支用它
+    // 取光照图 UV）。网格没有第二套 UV 时不能绑，否则 zw 会读到越界/别的属性数据。
+    if (gl.getAttribLocation(prog, 'a_TexCoordVec4') >= 0 && !info.hasUv2) return true
     return false
   }
 
@@ -2762,10 +2816,12 @@ export function createRenderer(canvas, opts = {}) {
     const locUv = gl.getAttribLocation(entry.prog, 'a_TexCoord')
     const locNrm = gl.getAttribLocation(entry.prog, 'a_Normal')
     const locTan = gl.getAttribLocation(entry.prog, 'a_Tangent4')
+    const locUv4 = gl.getAttribLocation(entry.prog, 'a_TexCoordVec4')
     const bindNrm = locNrm >= 0 && info.hasNormals
     const bindTan = locTan >= 0 && info.hasTangents
+    const bindUv4 = locUv4 >= 0 && info.hasUv2
     let vao = null
-    if (locPos >= 0 || locUv >= 0 || bindNrm || bindTan) {
+    if (locPos >= 0 || locUv >= 0 || bindNrm || bindTan || bindUv4) {
       const stride = info.floatStride * 4
       vao = glReg.vertexArray(gl.createVertexArray()) // 登记表：上下文丢失/卸载时可确定性释放
       gl.bindVertexArray(vao)
@@ -2777,6 +2833,11 @@ export function createRenderer(canvas, opts = {}) {
       if (locUv >= 0) {
         gl.enableVertexAttribArray(locUv)
         gl.vertexAttribPointer(locUv, 2, gl.FLOAT, false, stride, 12)
+      }
+      // a_TexCoordVec4 = uv(2) + uv2(2) 连续四个 float，起点就是 uv 的偏移（见 mdl.js 的交错布局）
+      if (bindUv4) {
+        gl.enableVertexAttribArray(locUv4)
+        gl.vertexAttribPointer(locUv4, 4, gl.FLOAT, false, stride, 12)
       }
       if (bindNrm) {
         gl.enableVertexAttribArray(locNrm)
@@ -2901,23 +2962,40 @@ export function createRenderer(canvas, opts = {}) {
     // 存在理由：材质路径对个别壁纸仍有回归（neon_sunset 实测 F13 开 mean=0 / 关 mean=143，
     // 两个模型材质 own shader 画成黑），留一个免改代码的回退口，排查与线上兜底都用它。
     if (!meshMaterialEnabled) return false
-    const progKey = mm.shader + '|' + JSON.stringify(mm.combos || {})
-    const entry = meshMatProgCache.get(progKey)
-    if (entry === undefined) {
-      // 首帧异步编译（与效果 pass 同一个缓存/编译器）：本帧用通用程序画，下一帧起走材质
-      meshMatProgCache.set(progKey, null)
-      getEffectProgram(mm.shader, mm.combos || {}, mm.textures || {})
-        .then((e) => meshMatProgCache.set(progKey, e))
-        .catch((e) => {
-          diag('模型材质 shader ' + mm.shader + ': 编译失败（' + String((e && e.message) || e).split('\n')[0].slice(0, 140) + '），改用通用网格程序画')
-        })
-      return false
+    // [we-scene patch 2026-10-03] **逐子网格材质**（F35）：多子网格模型里每个网格有自己的
+    // 材质 JSON，**combos 也可能不同**（arsenal：刀 = lightmap+normalmap、桌面 =
+    // +reflection+detailinalpha）—— combos 决定编译哪套 `#if` 分支，所以每个网格各自要
+    // 一个程序、各自的常量与槽位贴图。宿主在 `layer.meshMaterials` 里按 resolveMeshes()
+    // 的顺序给出规格，缺项回落到层级的 `mm`（单材质模型的旧行为一字不变）。
+    const meshSpecs = layer.meshMaterials && layer.meshMaterials.length ? layer.meshMaterials : null
+    const specOf = (i) => (meshSpecs && meshSpecs[i]) || mm
+    const keyOf = (spec) => spec.shader + '|' + JSON.stringify(spec.combos || {})
+    const primaryKey = keyOf(mm)
+    // 本帧要用到的全部规格先查缓存：任一还在编译就先让通用程序画这一帧
+    // （与旧行为一致：首帧异步编译，下一帧起走材质）。
+    for (let i = 0; i < (meshSpecs ? meshSpecs.length : 1); i++) {
+      const spec = specOf(i)
+      if (!spec || !spec.shader) continue
+      const k = keyOf(spec)
+      const cached = meshMatProgCache.get(k)
+      if (cached === undefined) {
+        meshMatProgCache.set(k, null)
+        getEffectProgram(spec.shader, spec.combos || {}, spec.textures || {})
+          .then((e) => meshMatProgCache.set(k, e))
+          .catch((e) => {
+            diag('模型材质 shader ' + spec.shader + ': 编译失败（' + String((e && e.message) || e).split('\n')[0].slice(0, 140) + '），改用通用网格程序画')
+          })
+        return false
+      }
+      if (!cached) return false
+      if (MESH_MAT_UNSUPPORTED_ATTRS.some((n) => gl.getAttribLocation(cached.prog, n) >= 0)) return false
     }
+    const entry = meshMatProgCache.get(primaryKey)
     if (!entry) return false
-    if (MESH_MAT_UNSUPPORTED_ATTRS.some((n) => gl.getAttribLocation(entry.prog, n) >= 0)) return false
     // `_rt_Reflection` 是本帧的反射渲染目标：第一次遇到需要它的层时先把反射画出来
     // （同帧只画一次；本函数随后就把 RT 当纹理采样）。层列表由 renderScene 每帧填。
-    if (mm.needsReflection && reflectionStamp !== ffbStamp && frameLayers.length) {
+    const needsReflection = mm.needsReflection || (meshSpecs ? meshSpecs.some((sp) => sp && sp.needsReflection) : false)
+    if (needsReflection && reflectionStamp !== ffbStamp && frameLayers.length) {
       reflectionStamp = ffbStamp
       renderReflectionPass(frameLayers, cam, viewProj, width, height, time)
     }
@@ -2927,7 +3005,9 @@ export function createRenderer(canvas, opts = {}) {
     // 缺一条就整层回落通用网格程序，不在半路画出「一部分网格有光照、一部分全黑」。
     for (let i = 0; i < list.length; i++) {
       const info = meshProvider.resolveMesh(list[i])
-      if (info && meshMatAttrUnavailable(entry.prog, info)) return false
+      const spec = specOf(i)
+      const ent = spec && spec.shader ? meshMatProgCache.get(keyOf(spec)) : null
+      if (info && ent && meshMatAttrUnavailable(ent.prog, info)) return false
     }
     const useDepth = !!(cam && cam.perspective)
     if (useDepth) {
@@ -2937,7 +3017,13 @@ export function createRenderer(canvas, opts = {}) {
       gl.enable(gl.DEPTH_TEST)
       gl.depthFunc(gl.LEQUAL)
     }
-    gl.useProgram(entry.prog)
+    let curProgKey = null
+    let curEntry = null
+    const bindForSpec = (spec, ent) => {
+      if (curProgKey === keyOf(spec)) return
+      curProgKey = keyOf(spec)
+      curEntry = ent
+      gl.useProgram(ent.prog)
     // [we-scene patch 2026-10-03] **矩阵必须转置上传**（F22）。
     //
     // WE 的 shader 是 HLSL 行向量语义（`mul(vec4(p,1), M)`），hlsl2glsl 把每个调用
@@ -2949,21 +3035,22 @@ export function createRenderer(canvas, opts = {}) {
     // 与 `g_EffectModelViewProjectionMatrix`（`mat4Transpose(mat4Multiply(viewProj, em))`），
     // 两处都是为了满足 HLSL 行向量约定。bindSystemUniforms 内部只把这几个矩阵
     // 原样 uniformMatrix4fv 上传（不参与别的推导），所以在这里转置是唯一改动点。
-    bindSystemUniforms(
-      entry.uni, layer, time, width, height,
-      mat4Transpose(mvp), mat4Transpose(modelM), mat4Transpose(viewProj),
-      [], null, cam, null,
-    )
-    bindConstants(entry.uni, mm.constants || {}, entry.matMeta)
-    const blending = mm.blending || 'normal'
-    if (blending === 'additive') {
-      gl.enable(gl.BLEND)
-      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE)
-    } else if (blending === 'normal') {
-      gl.disable(gl.BLEND)
-    } else {
-      gl.enable(gl.BLEND)
-      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+      bindSystemUniforms(
+        ent.uni, layer, time, width, height,
+        mat4Transpose(mvp), mat4Transpose(modelM), mat4Transpose(viewProj),
+        [], null, cam, null,
+      )
+      bindConstants(ent.uni, spec.constants || {}, ent.matMeta)
+      const blending = spec.blending || 'normal'
+      if (blending === 'additive') {
+        gl.enable(gl.BLEND)
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE)
+      } else if (blending === 'normal') {
+        gl.disable(gl.BLEND)
+      } else {
+        gl.enable(gl.BLEND)
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+      }
     }
     // 采样器：槽 0 = 该网格贴图（多子网格各自材质）/ 整层贴图；槽 1+ 取材质声明的
     // 其余贴图（car 的法线贴图就在 g_Texture1 —— 不绑的话采样全黑、N·L=0，整车全黑）。
@@ -2973,27 +3060,51 @@ export function createRenderer(canvas, opts = {}) {
     for (let i = 0; i < list.length; i++) {
       const info = meshProvider.resolveMesh(list[i])
       if (!info || !info.vertexCount || !info.indexCount) continue
-      const vao = meshMatVao(progKey, entry, info)
+      const spec = specOf(i)
+      if (!spec || !spec.shader) continue
+      const ent = meshMatProgCache.get(keyOf(spec))
+      if (!ent) continue
+      bindForSpec(spec, ent)
+      const vao = meshMatVao(curProgKey, ent, info)
       if (!vao) continue
       // 每网格贴图优先（多子网格各有材质），其次整层贴图，最后白纹理（无贴图材质）
       const per = layer.meshTextures && layer.meshTextures[i]
       const pickGl = (t) => (t && t.glTex ? t.glTex : t) || null
       gl.bindVertexArray(vao)
       for (let s = 0; s < maxSlot; s++) {
-        const u = gl.getUniformLocation(entry.prog, 'g_Texture' + s)
+        const u = gl.getUniformLocation(ent.prog, 'g_Texture' + s)
         if (!u) continue
-        const decl = mm.textures && mm.textures[s]
+        const decl = spec.textures && spec.textures[s]
         // `"_rt_*"` 的名字由宿主标成 `{rtName}`（见 scene-mount 的 model 分支）：
         // 目前只解析 `_rt_Reflection`（本帧的反射目标，见 renderReflectionPass）。
         // 注意 `{rtName}` **不是纹理对象**，不能走 pickGl（否则 bindTexture 抛
         // TypeError 并被自愈闸门判成「绘制抛错」→ 整层回落通用程序）。
         let tx = null
-        if (s === 0) tx = pickGl(per) || pickGl(mm.texture) || null
-        else if (decl && typeof decl === 'object' && decl.rtName) {
+        let txEntry = null
+        if (s === 0) {
+          txEntry = per || mm.texture || null
+          tx = pickGl(txEntry)
+        } else if (decl && typeof decl === 'object' && decl.rtName) {
           tx = decl.rtName === '_rt_Reflection' && reflectionRT ? reflectionRT.tex : null
-        } else tx = pickGl(decl)
+        } else {
+          txEntry = decl || null
+          tx = pickGl(txEntry)
+        }
         gl.activeTexture(gl.TEXTURE0 + s)
         gl.bindTexture(gl.TEXTURE_2D, tx || whiteTex)
+        // [we-scene patch 2026-10-03] **环绕模式**（F36）：模型的材质贴图按 WE 缺省
+        // REPEAT，`.tex flags bit1`（clampUvs）标了才 CLAMP。材质路径此前完全不设，
+        // 纹理留着上传时的默认 —— 而**模型材质的 uv 常常是平铺的**（arsenal 桌面
+        // uv ∈ [-3.4, 4.7]，8 个瓦片）：CLAMP 采样让整张桌子贴到边缘那一列纹素上
+        // （木头纹理糊成条纹），更要命的是**法线贴图**也采到边缘纹素 → 切线空间法线
+        // 指向侧向 → `lightDot ≤ 0` → 桌子一点光都不吃（实测 light 项恒 0，
+        // 而它的光照图其实是亮的）。效果链那条（槽 1+）早就有这套规则，材质路径漏了。
+        // 渲染目标（`{rtName}` / entry.fbo）保持 CLAMP：它按屏幕 UV 采样，回绕只会串图。
+        if (txEntry && !txEntry.fbo && txEntry.glTex) {
+          const mode = txEntry.clampUvs === true ? gl.CLAMP_TO_EDGE : gl.REPEAT
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, mode)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, mode)
+        }
         gl.uniform1i(u, s)
       }
       gl.activeTexture(gl.TEXTURE0)
@@ -3447,6 +3558,7 @@ export function createRenderer(canvas, opts = {}) {
     // layerColorAmbient 注释，3737267090 实测标定）。每帧缓存供 renderLayer
     // 的 color4 使用。
     sceneAmbient = parseVec3Local(general.ambientcolor || '1 1 1')
+    sceneSkylight = parseVec3Local(general.skylightcolor || '0 0 0')
     if (general.clearenabled !== false) {
       const cc = parseVec3Local(general.clearcolor || '0 0 0')
       gl.clearColor(cc[0], cc[1], cc[2], 1)
@@ -5100,7 +5212,7 @@ export function createRenderer(canvas, opts = {}) {
         meshMatProgCache.set(key, null)
         diag(
           '模型材质 shader ' + shader + ': 预编译失败（' +
-            String((err && err.message) || err).split('\n')[0].slice(0, 140) + '），该模型回落通用网格程序',
+            String((err && err.message) || err).split('\n')[0].slice(0, 400) + '）【stack: ' + String((err && err.stack) || '').split('\n').slice(1, 4).join(' | ').slice(0, 300) + '】，该模型回落通用网格程序',
         )
         return false
       }

@@ -301,11 +301,41 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     let c2
     while ((c2 = comboRe2.exec(rawSrc)) !== null) comboNames.add(c2[1])
     // effective 里已有的键（material/scene 显式给的 combos）同样需要按标识符替换
-    for (const k of Object.keys(effective)) comboNames.add(k)
+    // [we-scene patch 2026-10-03] **声明过的变量名不参与替换**（F34）。此前是无条件
+    // `replaceWord`：combo 名与 shader 里的变量同名时会把变量一起改掉。官方
+    // `generic.frag` 就是这么炸的 —— 材质写 `{"lightmap":1}`（combo），shader 里有
+    // `vec3 lightmap = texSample2D(g_LightmapMapSampler, …)`（变量），替换后成为
+    // `vec3 1 = texture(…)` ⇒ `ERROR: 0:123: '1' : syntax error` → 整个 `generic`
+    // 材质编译失败、arsenal 整车回落通用程序（贴图/材质/光照全丢）。
+    // 判据：一个名字只要在本 shader 里被声明过（uniform/attribute/varying/局部变量/函数），
+    // 它在代码里的裸用就该解析成那个符号而不是 combo 值 —— 与 C 的作用域直觉一致，
+    // 也正是 WE 的行为（WE 按**大写**注入 combo 定义，小写同名变量因此不受影响）。
+    // 替换集合同时收「原样」与「全大写」两种写法：材质键与 shader 里的标识符写法
+    // 常不一致（`{"spritesheet":1}` ↔ `SPRITESHEET`），两种都要能命中。
+    const declaredNames = (() => {
+      const out = new Set()
+      const declRe = /\b(?:uniform|attribute|varying|in|out|const)\s+(?:lowp\s+|mediump\s+|highp\s+)?(?:void|bool|int|uint|float|double|vec[234]|ivec[234]|bvec[234]|mat[234](?:x[234])?|sampler2D|sampler3D|samplerCube|sampler2DArray|half)\s+([A-Za-z_]\w*)/g
+      let m
+      while ((m = declRe.exec(code)) !== null) out.add(m[1])
+      // 无限定符的声明（局部变量 / 函数）：`vec3 lightmap = …`、`float ComputeLight(…)`
+      const bareRe = /\b(?:void|bool|int|uint|float|double|vec[234]|ivec[234]|bvec[234]|mat[234](?:x[234])?|sampler2D|sampler3D|samplerCube|sampler2DArray|half)\s+([A-Za-z_]\w*)\s*[=;(]/g
+      while ((m = bareRe.exec(code)) !== null) out.add(m[1])
+      return out
+    })()
+    for (const k of Object.keys(effective)) {
+      comboNames.add(k)
+      comboNames.add(k.toUpperCase())
+    }
     comboNames.delete('GLSL') // 平台宏由 #if 消费，不参与标识符替换
     for (const name of comboNames) {
-      const v = effective[name] !== undefined ? effective[name] : 0
-      code = replaceWord(code, name, String(v))
+      if (declaredNames.has(name)) continue // 同名变量优先（见上）
+      // 值查找同样大小写不敏感（三写：原样 / 全大写 / 全小写）—— 材质键常是小写
+      // （`{"spritesheet":1}`），而 shader 里的标识符是大写（`SPRITESHEET`）；
+      // 只查「原样 + 全大写」会让这种组合落到 0（verify-shaders 的控制组当场逮到）。
+      const cv = effective[name] !== undefined ? effective[name]
+        : effective[name.toUpperCase()] !== undefined ? effective[name.toUpperCase()]
+        : effective[name.toLowerCase()]
+      code = replaceWord(code, name, String(cv !== undefined ? cv : 0))
     }
   }
 

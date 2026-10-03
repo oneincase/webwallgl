@@ -456,19 +456,32 @@ export function createMDLRenderer(gl) {
     const vao = gl.createVertexArray()
     gl.bindVertexArray(vao)
     const n = mesh.vertexCount
-    // 交错：pos(3) uv(2) bone(4) weight(4) [normal(3)] [tangent(4)] = 13 / 16 / 20 float
+    // 交错：pos(3) uv(2) [uv2(2)] bone(4) weight(4) [normal(3)] [tangent(4)]
     // 有法线的（真 3D 网格 / 无骨骼模型）多交错 3 个 float 供片元光照用；
     // 2D puppet 的 flag 里没有 NORMAL → 布局与改动前逐位一致。
-    // [we-scene patch 2026-10-03] **切线**（F22）追加在末尾：官方 3D 材质 shader 的
-    // NORMALMAP 分支要 `a_Tangent4`（xyz + handedness，fantasticcar `car.vert`），
-    // 没有它整条材质路径 b 掉、只剩黑车壳。只有源码族里声明了 TANGENT 位的网格才多
-    // 交错这 4 个 float；工坊语料（无 TANGENT 位）的布局与改动前逐位一致。
+    // [we-scene patch 2026-10-03] **切线**（F22）：官方 3D 材质 shader 的 NORMALMAP 分支要
+    // `a_Tangent4`（xyz + handedness，fantasticcar `car.vert`），没有它整条材质路径 b 掉。
+    // [we-scene patch 2026-10-03] **第二套 UV**（F34）：官方 `generic.vert` 在 LIGHTMAP 组合下
+    // 声明 `attribute vec4 a_TexCoordVec4`（xy = 反照率 UV、zw = 光照图 UV）。vec4 属性要求
+    // 四个分量**连续**，所以 uv2 紧跟 uv 之后（而不是像 normal/tangent 那样挂在尾部）——
+    // 这样材质路径才能用一条 `vertexAttribPointer(loc, 4, …, 12)` 直接把它交给 shader。
+    // 其余属性（bone/weight/normal/tangent）的偏移随之整体后移，改成按表算而不是写死。
     const hasN = !!mesh.normals
     const hasT = !!mesh.tangents
-    const F = (hasN ? 16 : 13) + (hasT ? 4 : 0)
-    const normalOff = hasN ? 52 : -1
-    // 切线紧跟法线；没有法线时直接接在 weight 之后（flag 允许，源码族暂无此形态）
-    const tangentOff = hasT ? (hasN ? 64 : 52) : -1
+    const hasUv2 = !!mesh.uv2
+    // 偏移表（单位 float）：uv2 紧跟 uv 之后，其余属性顺延；无 uv2 时与改动前逐位一致
+    let cursor = 5 // pos(3) + uv(2)
+    const uv2Off = hasUv2 ? cursor : -1
+    if (hasUv2) cursor += 2
+    const boneOff = cursor
+    cursor += 4
+    const weightOff = cursor
+    cursor += 4
+    const normalOff = hasN ? cursor : -1
+    if (hasN) cursor += 3
+    const tangentOff = hasT ? cursor : -1
+    if (hasT) cursor += 4
+    const F = cursor
     const data = new Float32Array(n * F)
     for (let i = 0; i < n; i++) {
       const o = i * F
@@ -477,18 +490,21 @@ export function createMDLRenderer(gl) {
       data[o + 2] = mesh.positions[i * 3 + 2]
       data[o + 3] = mesh.uvs[i * 2]
       data[o + 4] = mesh.uvs[i * 2 + 1]
+      if (hasUv2) {
+        data[o + uv2Off] = mesh.uv2[i * 2]
+        data[o + uv2Off + 1] = mesh.uv2[i * 2 + 1]
+      }
       for (let k = 0; k < 4; k++) {
-        data[o + 5 + k] = mesh.boneIdx[i * 4 + k]
-        data[o + 9 + k] = mesh.weights[i * 4 + k]
+        data[o + boneOff + k] = mesh.boneIdx[i * 4 + k]
+        data[o + weightOff + k] = mesh.weights[i * 4 + k]
       }
       if (hasN) {
-        data[o + 13] = mesh.normals[i * 3]
-        data[o + 14] = mesh.normals[i * 3 + 1]
-        data[o + 15] = mesh.normals[i * 3 + 2]
+        data[o + normalOff] = mesh.normals[i * 3]
+        data[o + normalOff + 1] = mesh.normals[i * 3 + 1]
+        data[o + normalOff + 2] = mesh.normals[i * 3 + 2]
       }
       if (hasT) {
-        const t = hasN ? 16 : 13
-        for (let k = 0; k < 4; k++) data[o + t + k] = mesh.tangents[i * 4 + k]
+        for (let k = 0; k < 4; k++) data[o + tangentOff + k] = mesh.tangents[i * 4 + k]
       }
     }
     const vbuf = gl.createBuffer()
@@ -500,12 +516,12 @@ export function createMDLRenderer(gl) {
     gl.enableVertexAttribArray(1)
     gl.vertexAttribPointer(1, 2, gl.FLOAT, false, S, 12)
     gl.enableVertexAttribArray(2)
-    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, S, 20)
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, S, boneOff * 4)
     gl.enableVertexAttribArray(3)
-    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, S, 36)
+    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, S, weightOff * 4)
     if (hasN) {
       gl.enableVertexAttribArray(4)
-      gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, 52)
+      gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, normalOff * 4)
     } else {
       gl.disableVertexAttribArray(4)
       gl.vertexAttrib3f(4, 0, 0, 1)
@@ -527,9 +543,12 @@ export function createMDLRenderer(gl) {
       vertexCount: n,
       floatStride: F,
       // 属性字节偏移（-1 = 该网格没有这条数据，声明了它的程序必须回落通用网格程序）
-      normalOffset: normalOff,
-      tangentOffset: tangentOff,
+      normalOffset: normalOff >= 0 ? normalOff * 4 : -1,
+      tangentOffset: tangentOff >= 0 ? tangentOff * 4 : -1,
+      // uv2（光照图 UV）：材质路径的 `a_TexCoordVec4` 就是 [uv, uv2] 这一条连续 vec4
+      uv2Offset: uv2Off >= 0 ? uv2Off * 4 : -1,
       hasTangents: hasT,
+      hasUv2: hasUv2,
       indexCount: mesh.indexCount,
       indexU32: mesh.indices instanceof Uint32Array,
     }
@@ -565,6 +584,7 @@ export function createMDLRenderer(gl) {
       // 只能从这里拿；缺字段时与改动前一致（两处都是 null → 布局不变）。
       normals: mdl.normals || null,
       tangents: mdl.tangents || null,
+      uv2: mdl.uv2 || null,
       vertexCount: mdl.vertexCount,
       indices: mdl.indices,
       indexCount: mdl.indexCount,

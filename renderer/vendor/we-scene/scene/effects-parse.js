@@ -288,6 +288,25 @@ export function isEngineMeshShader(name) {
   )
 }
 
+/**
+ * [we-scene patch 2026-10-03] **模型材质是否交给「材质自己的 shader 画网格」这条路径**（F34）。
+ *
+ * F13 的原始判据是 `!isEngineMeshShader(name)` —— 引擎内置族一律走本仓的通用网格程序。
+ * 这条对 `generic4`（工坊 276 处模型材质）是硬要求（误接会换掉整批壁纸的观感），
+ * 但对 **`generic`** 恰恰相反：它是官方那套「带 lightmap / normalmap / 反射槽 + 场景点光」
+ * 的**模型**着色器，全库用得极少 —— 官方内置里只有 arsenal 的 6 个材质，工坊 366 包里只有 1 个。
+ * 不接就等于把这些材质的第二套 UV、光照图、金属度粗糙度、点光与反射**整条丢掉**：
+ * 实测 arsenal「手枪一片白、桌面没有明暗」（用户报的「贴图/材质/光照都没出来」）。
+ *
+ * 注意 `genericimage*` / `generic4` / `foliage4` / `puppettexturechannels` / `sprite` / `flat`
+ * 仍然排除（前四个是 2D 图层族，后两个是引擎内建直通）。
+ */
+export function canUseMaterialMeshPath(name) {
+  if (!name || typeof name !== 'string') return false
+  if (name.toLowerCase() === 'generic') return true
+  return !isEngineMeshShader(name)
+}
+
 // 把图层 material pass 变成效果链的第一趟。渲染器已有 GPU pass 管线
 // （g_Time / 多槽贴图 / constantshadervalues → material 名），不必另开一条。
 export function attachLayerMaterialEffect(layer, pass) {

@@ -3719,6 +3719,10 @@ cfg, source, pkgAbort.signal);
           reportDiag(rt, cfg, `puppet '${layer.name}' 失败: ${(e as Error).message}`, "warn");
         }
       }
+      const meshTexPush = (arr: (unknown | null)[], mi: number, t: unknown | null, dflt: unknown | null) => {
+        while (arr.length < mi) arr.push(dflt);
+        arr[mi] = t;
+      };
       // [we-scene patch] scene.json 直接挂 `model: "*.mdl"` 的真 3D 网格
       // （3509243656 恒星/天空盒）。不经 image→json→puppet，材质路径在 MDL 头里。
       for (const layer of scene.layers) {
@@ -3752,7 +3756,10 @@ cfg, source, pkgAbort.signal);
               // pass shader 不是内置 albedo 一族（官方内置的 skybox/dome/car/core/
               // ricepod*/techno*/knife_df… 全是自定义 GLSL）时，交给渲染器用材质自己的
               // 着色器画网格，而不是通用网格程序。编译失败/属性不支持时渲染侧自动回落。
-              if (typeof pass0?.shader === "string" && pass0.shader && !eff.isEngineMeshShader(pass0.shader)) {
+              // [we-scene patch 2026-10-03] 判据由 `!isEngineMeshShader` 收紧成
+              // `canUseMaterialMeshPath`（F34）：`generic`（官方模型着色器，带
+              // lightmap/normalmap/点光/反射）也要走材质路径，其余内置族（generic4 等）照旧排除。
+              if (typeof pass0?.shader === "string" && pass0.shader && eff.canUseMaterialMeshPath(pass0.shader)) {
                 (layer as any).meshMaterial = {
                   shader: pass0.shader,
                   combos: pass0.combos || {},
@@ -3823,31 +3830,70 @@ cfg, source, pkgAbort.signal);
           // 网格回落到层贴图，不拖垮整层。
           if (mdlObj.meshes && mdlObj.meshes.length > 1) {
             const meshTex: (unknown | null)[] = [texObj];
-            for (let mi = 1; mi < mdlObj.meshes.length; mi++) {
+            // [we-scene patch 2026-10-03] **逐子网格的完整材质**（F35）：多子网格模型里
+            // 每个网格有自己的材质 JSON —— 不只是 tex0 不同，**combos 也可能不同**
+            // （arsenal：刀 = lightmap+normalmap，桌面 = +reflection+detailinalpha），
+            // 而 combos 决定编译哪套 `#if` 分支 ⇒ 每个网格可能需要**不同的程序**。
+            // 此前只按 mesh0 的材质建一个 meshMaterial：其余网格既用了错的槽贴图
+            // （刀的法线/光照图贴到桌面上，桌面因此整片黑），也丢了 REFLECTION/DETAILINALPHA。
+            const meshSpecs: any[] = [];
+            for (let mi = 0; mi < mdlObj.meshes.length; mi++) {
               const mesh = mdlObj.meshes[mi];
-              let t: unknown | null = null;
               const mp: string | null = mesh.materialPath;
-              if (mp) {
-                const matEntry = pkg.getEntry(parsedPkg, mp);
-                if (matEntry) {
-                  const material = readMaterialDoc(matEntry);
-                  const pass0 = material?.passes?.[0];
-                  const tn = pass0?.textures?.[0];
-                  if (typeof tn === "string" && tn) {
-                    try {
-                      await loadTex(tn);
-                      t = textures.get(tn) ?? null;
-                    } catch {
-                      t = null;
-                    }
+              if (mi === 0 || !mp) {
+                meshSpecs.push((layer as any).meshMaterial || null);
+                continue;
+              }
+              const matEntry = pkg.getEntry(parsedPkg, mp);
+              if (!matEntry) {
+                meshSpecs.push(null);
+                continue;
+              }
+              const material = readMaterialDoc(matEntry);
+              const pass0 = material?.passes?.[0];
+              let spec: any = null;
+              if (pass0 && typeof pass0.shader === "string" && eff.canUseMaterialMeshPath(pass0.shader)) {
+                spec = {
+                  shader: pass0.shader,
+                  combos: pass0.combos || {},
+                  constants: pass0.constantshadervalues || {},
+                  blending: typeof pass0.blending === "string" ? pass0.blending : null,
+                  textures: [],
+                  needsReflection: false,
+                };
+                for (const tn of pass0.textures || []) {
+                  if (typeof tn !== "string" || !tn) {
+                    spec.textures.push(null);
+                    continue;
                   }
-                  const lightCombo = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
-                  if (Number(lightCombo) === 1) (layer as any).lightingEnabled = true;
+                  if (tn.startsWith("_rt_")) {
+                    spec.textures.push({ rtName: tn });
+                    if (tn === "_rt_Reflection") spec.needsReflection = true;
+                    continue;
+                  }
+                  try {
+                    await loadTex(tn);
+                    spec.textures.push(textures.get(tn) || null);
+                  } catch {
+                    spec.textures.push(null);
+                  }
                 }
               }
-              meshTex.push(t);
+              const tn0 = pass0?.textures?.[0];
+              if (typeof tn0 === "string" && tn0 && !spec) {
+                try {
+                  await loadTex(tn0);
+                  meshTexPush(meshTex, mi, textures.get(tn0) ?? null, texObj);
+                } catch {
+                  meshTexPush(meshTex, mi, null, texObj);
+                }
+              }
+              const lightCombo = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
+              if (Number(lightCombo) === 1) (layer as any).lightingEnabled = true;
+              meshSpecs.push(spec);
             }
             (layer as any).meshTextures = meshTex;
+            (layer as any).meshMaterials = meshSpecs;
           }
           layer.puppet = mdlObj;
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
@@ -3895,13 +3941,20 @@ cfg, source, pkgAbort.signal);
           // 首帧抢跑会让「编译失败」的 null 永久哨兵钉死这条 shader（core/backgroundsphere
           // 时好时坏就是这么来的）。这里 await 一次，失败也只是回落通用网格程序。
           for (const item of mdlItems) {
-            const mm = (item.layer as any).meshMaterial;
-            if (!mm || !mm.shader) continue;
-            const provided: Record<number, unknown> = {};
-            (mm.textures || []).forEach((t: any, i: number) => {
-              if (t) provided[i] = t;
-            });
-            await renderer.prepareMeshMaterial(mm.shader, mm.combos, provided);
+            // [we-scene patch 2026-10-03] 逐子网格材质（F35）也要预编译：多子网格模型里
+            // 每个网格的 combos 决定一个独立程序（arsenal 的刀/桌面/枪各自一套分支），
+            // 只预热 mesh0 的会让其余网格「首帧才开编译」，第一帧整层退回通用程序。
+            const specs: any[] = [(item.layer as any).meshMaterial];
+            const perMesh: any[] = (item.layer as any).meshMaterials || [];
+            for (const sp of perMesh) if (sp && sp.shader && !specs.includes(sp)) specs.push(sp);
+            for (const spec of specs) {
+              if (!spec || !spec.shader) continue;
+              const provided: Record<number, unknown> = {};
+              (spec.textures || []).forEach((t: any, i: number) => {
+                if (t) provided[i] = t;
+              });
+              await renderer.prepareMeshMaterial(spec.shader, spec.combos, provided);
+            }
           }
           renderer.setPuppetRenderer((layer: any, mvp: any, o: any) => {
             const item = byLayer.get(layer);

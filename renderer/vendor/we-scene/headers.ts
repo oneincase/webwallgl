@@ -485,21 +485,33 @@ vec4 ConvertTextureFormat(int format, vec4 _sample) {
   // 静默回落通用网格程序（观感是「带贴图的素模」，车漆/高光/条纹全丢）。
   // 三个重载逐字按官方 `assets/shaders/common_vertex.h`（23 行）复刻；`mul` 由
   // hlsl2glsl 的调用改写处理（include 在 preprocess 阶段先内联、改写在其后）。
-  'common_vertex.h': `// WE common_vertex.h（重建：BuildTangentSpace 三态，与官方语义逐字一致）
+  'common_vertex.h': `// WE common_vertex.h（重建）
+//
+// [we-scene patch 2026-10-03] **mat3 构造子的行列语义**（F37）：HLSL 的
+// \`mat3(a, b, c)\` 填的是**行**（HLSL 是行向量/行主序），GLSL 的 \`mat3(a, b, c)\`
+// 填的是**列**；hlsl2glsl 对构造子原样透传。官方这份头写成
+// \`return mat3(tangent, bitangent, normal);\` —— 意思是「三行分别是 t/b/n」，
+// 调用点再 \`mul(tangentSpace, v)\`（= M·v）得到 (dot(t,v), dot(b,v), dot(n,v))
+// —— 这才是切线坐标。原样照抄进 GLSL 后，M 的三列才是 t/b/n，
+// \`M·v\` 得到的是 (v.x, v.z, −v.y) 这种**置换/反号**结果：切线空间的「法线轴」
+// 落到别的分量上（实测 arsenal 桌面 \`v_Light0DirectionL3X.z ≈ -1\` 而世界方向
+// y ≈ +0.9），法线贴图的光照因此整片取反 —— 桌面、枪身都不吃动态光。
+// 修法：在重建头里显式 \`transpose(...)\` 还原 HLSL 的「行」语义，不改转译器
+// （构造子语义是全库级改动，风险面太大，见 docs/DEFAULTPROJECTS-PLAN.md 续十四）。
 mat3 BuildTangentSpace(const vec3 normal, const vec4 signedTangent)
 {
     vec3 tangent = signedTangent.xyz;
     vec3 bitangent = cross(normal, tangent) * signedTangent.w;
-    return mat3(tangent, bitangent, normal);
+    return transpose(mat3(tangent, bitangent, normal));
 }
 
 mat3 BuildTangentSpace(const mat3 modelTransform, const vec3 normal, const vec4 signedTangent)
 {
     vec3 tangent = signedTangent.xyz;
     vec3 bitangent = cross(normal, tangent) * signedTangent.w;
-    return mat3(mul(tangent, modelTransform),
+    return transpose(mat3(mul(tangent, modelTransform),
         mul(bitangent, modelTransform),
-        mul(normal, modelTransform));
+        mul(normal, modelTransform)));
 }
 
 void BuildTangentSpace(const mat3 modelTransform, const vec3 normal, const vec4 signedTangent, out vec3 worldTangent, out vec3 worldBitangent)

@@ -185,8 +185,8 @@ export function parseMDL(buf) {
         const predicted = stride === lay.stride && lay.stride > 0
         srcCandidates.push(
           predicted
-            ? { lenOff, stride, uv: lay.uv, bone: lay.bone, weight: lay.weight, normal: lay.normal, tangent: lay.tangent, predicted: true }
-            : { lenOff, stride, uv: stride - 8, bone: -1, weight: -1, normal: -1, tangent: -1 },
+            ? { lenOff, stride, uv: lay.uv, uv2: lay.uv2, bone: lay.bone, weight: lay.weight, normal: lay.normal, tangent: lay.tangent, predicted: true }
+            : { lenOff, stride, uv: stride - 8, uv2: -1, bone: -1, weight: -1, normal: -1, tangent: -1 },
         )
       }
     }
@@ -257,6 +257,8 @@ export function parseMDL(buf) {
   // 两个字段都按 vertexLayoutOf 的位推导，未声明时保持 null（与改动前逐位一致）。
   const normals = L.normal >= 0 ? new Float32Array(vertexCount * 3) : null
   const tangents = L.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
+  // [we-scene patch 2026-10-03] 第二套 UV（光照图 UV，见 vertexLayoutOf 的 UV2 注释）
+  const uv2s = L.uv2 >= 0 && L.uv2 !== undefined ? new Float32Array(vertexCount * 2) : null
   for (let i = 0; i < vertexCount; i++) {
     const b = vertStart + i * L.stride
     positions[i * 3] = dv.getFloat32(b, true)
@@ -272,6 +274,10 @@ export function parseMDL(buf) {
     }
     uvs[i * 2] = dv.getFloat32(b + L.uv, true)
     uvs[i * 2 + 1] = dv.getFloat32(b + L.uv + 4, true)
+    if (uv2s) {
+      uv2s[i * 2] = dv.getFloat32(b + L.uv2, true)
+      uv2s[i * 2 + 1] = dv.getFloat32(b + L.uv2 + 4, true)
+    }
     if (L.bone >= 0 && L.weight >= 0) {
       for (let k = 0; k < 4; k++) {
         boneIdx[i * 4 + k] = dv.getUint32(b + L.bone + k * 4, true)
@@ -509,6 +515,7 @@ export function parseMDL(buf) {
     // 模型走这一路）；无对应位时为 null，消费端（mdl.js 的交错布局）据此决定是否多交错。
     normals,
     tangents,
+    uv2: uv2s,
     indexCount,
     indexType: useU32 ? 'u32' : 'u16',
     indices,
@@ -570,7 +577,7 @@ function vertexLayoutOf(flag) {
   let off = 12
   // [we-scene patch 2026-09-28] normal 偏移：文件里法线恒紧跟在位置之后（12 字节）。
   // 3D 网格的材质要按 N·L 上光（见 mdl.js 的场景光），所以这一路要读出来。
-  const o = { stride: 0, uv: -1, bone: -1, weight: -1, normal: -1, tangent: -1 }
+  const o = { stride: 0, uv: -1, uv2: -1, bone: -1, weight: -1, normal: -1, tangent: -1 }
   if (flag & MDL_FLAG_NORMAL) { o.normal = off; off += 12 }
   // [we-scene patch 2026-10-03] 切线（vec4：xyz + handedness）与法线同为材质 shader 的
   // 顶点输入：官方 3D 材质（fantasticcar `car.vert`）在 NORMALMAP 分支调
@@ -580,7 +587,11 @@ function vertexLayoutOf(flag) {
   if (flag & MDL_FLAG_SKIN_BLEND) { o.bone = off; off += 16 }
   if (flag & MDL_FLAG_SKIN_WEIGHT) { o.weight = off; off += 16 }
   if (flag & (MDL_FLAG_UV | MDL_FLAG_UV2)) { o.uv = off; off += 8 }
-  if (flag & MDL_FLAG_UV2) off += 8
+  // [we-scene patch 2026-10-03] **第二套 UV**（F34）：官方 `generic.vert` 在 LIGHTMAP 组合下
+  // 要 `attribute vec4 a_TexCoordVec4` —— xy = 反照率 UV、zw = **光照图 UV**，两套 UV 分开烘。
+  // arsenal 的 6 个子网格（flag 0x27 = pos+normal+uv+uv2+tangent）就靠它把烘焙光照贴到模型上；
+  // 不读 = 那套材质只剩 albedo × 环境项（实测「手枪一片白、桌面没有明暗」）。
+  if (flag & MDL_FLAG_UV2) { o.uv2 = off; off += 8 }
   o.stride = off
   return o
 }
@@ -625,6 +636,7 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
     const normals = lay.normal >= 0 ? new Float32Array(vertexCount * 3) : null
     // 切线（vec4：xyz + handedness，材质 shader 的 a_Tangent4；见 vertexLayoutOf 注释）
     const tangents = lay.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
+    const uv2s = lay.uv2 >= 0 ? new Float32Array(vertexCount * 2) : null
     for (let i = 0; i < vertexCount; i++) {
       const b = p + i * lay.stride
       positions[i * 3] = dv.getFloat32(b, true)
@@ -641,6 +653,10 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
       if (lay.uv >= 0) {
         uvs[i * 2] = dv.getFloat32(b + lay.uv, true)
         uvs[i * 2 + 1] = dv.getFloat32(b + lay.uv + 4, true)
+      }
+      if (uv2s) {
+        uv2s[i * 2] = dv.getFloat32(b + lay.uv2, true)
+        uv2s[i * 2 + 1] = dv.getFloat32(b + lay.uv2 + 4, true)
       }
       if (lay.bone >= 0 && lay.weight >= 0) {
         for (let k = 0; k < 4; k++) {
@@ -732,6 +748,7 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
       weights,
       normals,
       tangents,
+      uv2: uv2s,
       vertexCount,
       indices,
       indexCount,
