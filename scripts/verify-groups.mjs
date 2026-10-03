@@ -327,6 +327,17 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/clampUvs === true \? gl\.CLAMP_TO_EDGE : gl\.REPEAT/.test(meshMatBody),
       "材质路径未按 clampUvs 设纹理环绕（模型平铺 uv 会被 CLAMP 采成边缘纹素，F36）");
 
+    // F38 反射通道的三条约束：① 没有 `reflected` 清单时按「整场」处理（arsenal 一个
+    // 都没标，桌面照样采样 `_rt_Reflection`）；② 反射通道里跳过**镜面自身**的网格
+    // （与镜面共面，映出来是自己 ⇒ 自反馈丢绘制 + 自我涂抹的污渍）；
+    // ③ 反射通道内不得再采样 `_rt_Reflection`（同一个反馈环）。
+    check(/const hasExplicit = layers\.some/.test(rsrc) && /hasExplicit \? l\.reflected : true/.test(rsrc),
+      "反射通道没有「无清单则整场」的回退（arsenal 这类工程永远拿不到反射，F38）");
+    check(/reflectionPassActive && spec\.needsReflection/.test(rsrc),
+      "反射通道未跳过镜面自身网格（自反射污渍 / 反馈环，F38）");
+    check(/reflectionRT && !reflectionPassActive/.test(rsrc),
+      "反射通道内仍会采样 _rt_Reflection 自身（反馈环丢绘制，F38）");
+
     // F32 shader-blend 的底图不得与当前渲染目标同一张纹理（HDR 下 captureBackdrop
     // 返回的就是场景纹理）：采样同时是渲染目标 = 反馈环，drawArrays 被丢弃，
     // razer_bedroom 的 6 个 cbm=11/12 图层（neon glow / hue-bulb / wave）整批不出现。

@@ -2876,6 +2876,10 @@ export function createRenderer(canvas, opts = {}) {
    */
   let reflectionRT = null // { tex, fbo, w, h }
   let reflectionStamp = -1 // 本帧是否已画过（对齐 ffbStamp）
+  // 反射通道进行中：此时**不能**再采样 `_rt_Reflection` 自己（采样同时是渲染目标 =
+  // 反馈环 ⇒ drawArrays 抛 INVALID_OPERATION、整次绘制被丢弃）。反射面自身的
+  // 材质在反射通道里按「无反射贴图」处理（白纹理），物理上镜面也不该映出自己。
+  let reflectionPassActive = false
   let frameClearColor = [0, 0, 0, 1] // 帧首 clearColor（反射 RT 清完要还原）
   /** 本帧参与绘制的层（renderScene 每帧填；`_rt_Reflection` 要用它找回 reflected 层） */
   let frameLayers = []
@@ -2912,7 +2916,19 @@ export function createRenderer(canvas, opts = {}) {
   /** 画一趟反射（每个需要 `_rt_Reflection` 的帧只画一次）；返回是否可用 */
   function renderReflectionPass(layers, cam, viewProj, width, height, time) {
     const rt = ensureReflectionRT(width, height)
-    const targets = layers.filter((l) => l && l.reflected && l.meshMaterial)
+    reflectionPassActive = true
+    // [we-scene patch 2026-10-03] **没有显式反射清单时，整场都要进反射缓冲**（F38）。
+    //
+    // `reflected: true` 是「这个对象也画进 `_rt_Reflection`」的清单（fantasticcar
+    // 的 Dome/Car、audiophile 的 bars），但**清单可以不存在**：arsenal 三个对象
+    // 一个都没标，而它的桌面材质照样 `textures: [planks, planks_normal,
+    // planks_lightmap, "_rt_Reflection"]` + `reflection: 1` —— 官方那面桌子是有倒影的
+    // （作者做的是「整桌木地板 + 灯下高光」的景，桌面本就该映出枪/刀）。
+    // 语义取舍：**场里有任何 `reflected: true` 就只画那些（作者显式挑过）；
+    // 一个都没有时按「整场」处理** —— 否则这类工程永远拿不到反射（用户实测：
+    // 「感觉还缺反射效果」）。
+    const hasExplicit = layers.some((l) => l && l.reflected)
+    const targets = layers.filter((l) => l && l.meshMaterial && (hasExplicit ? l.reflected : true))
     const prevFbo = groupTarget ? groupTarget.fbo.fbo : null
     gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo)
     gl.viewport(0, 0, width, height)
@@ -2926,6 +2942,7 @@ export function createRenderer(canvas, opts = {}) {
       const mvp = mat4Multiply(viewProj, mirrorM)
       if (drawMeshMaterial(l, cam, viewProj, mvp, mirrorM, width, height, time)) drew = true
     }
+    reflectionPassActive = false
     // 还原：帧缓冲回到调用方原本的目标（画布 / 组 FBO），视口与清屏色复位
     gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo)
     gl.viewport(0, 0, width, height)
@@ -3062,6 +3079,11 @@ export function createRenderer(canvas, opts = {}) {
       if (!info || !info.vertexCount || !info.indexCount) continue
       const spec = specOf(i)
       if (!spec || !spec.shader) continue
+      // 反射通道里**跳过镜面自身的网格**（材质采样 `_rt_Reflection` 的那些，如
+      // arsenal 的桌面 planks、fantasticcar 的 grid）：它们与镜面共面，
+      // 映出来的就是自己 —— 采样即自反馈（丢绘制），即便绕开也只是一层自我涂抹的
+      // 污渍。剔掉之后「桌面映出枪与刀」才是作者要的画面（F38）。
+      if (reflectionPassActive && spec.needsReflection) continue
       const ent = meshMatProgCache.get(keyOf(spec))
       if (!ent) continue
       bindForSpec(spec, ent)
@@ -3085,7 +3107,7 @@ export function createRenderer(canvas, opts = {}) {
           txEntry = per || mm.texture || null
           tx = pickGl(txEntry)
         } else if (decl && typeof decl === 'object' && decl.rtName) {
-          tx = decl.rtName === '_rt_Reflection' && reflectionRT ? reflectionRT.tex : null
+          tx = decl.rtName === '_rt_Reflection' && reflectionRT && !reflectionPassActive ? reflectionRT.tex : null
         } else {
           txEntry = decl || null
           tx = pickGl(txEntry)
