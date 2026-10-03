@@ -149,6 +149,11 @@ if (argv[0] === "--pair") {
   const toPng = (src, dst) => {
     // 本工具零依赖：JPEG/GIF 交给系统 sips 转 PNG（macOS）。失败则跳过该条。
     const { execFileSync } = require("node:child_process");
+    // ⚠️ 先删旧目标：sips 对不存在的输入会静默 exit 0 且不碰输出，而临时名只由 basename
+    // 决定 —— 不删就会把上一轮同名文件的转换结果当成本次的图读进来（文件末尾同款注释）。
+    try {
+      fs.rmSync(dst, { force: true });
+    } catch {}
     try {
       execFileSync("/usr/bin/sips", ["-s", "format", "png", src, "--out", dst], { stdio: "ignore" });
       return fs.existsSync(dst);
@@ -191,9 +196,27 @@ if (argv[0] === "--pair") {
   for (const f of argv) {
     const png = /\.png$/i.test(f) ? f : null;
     if (!png) {
+      // ⚠️ sips 对**不存在的输入**会静默 exit 0 且不碰输出文件 —— 而临时名只由 basename
+      // 决定，于是「上一轮同名文件转出来的旧 PNG」会被当成这次的图读进来：换个路径的
+      // 缺失文件照常打出一行看上去很正常的数字（实测踩到：razer_bedroom 没有 preview.jpg，
+      // 却报出 shimmering_particles 的 preview 数值，差点据此下结论）。
+      // 两道闸：源文件必须先存在；转换前先删旧目标，转完再确认目标真的（重新）出现。
+      if (!fs.existsSync(f)) {
+        console.error(`  ✗ 文件不存在：${f}`);
+        process.exitCode = 1;
+        continue;
+      }
       const { execFileSync } = require("node:child_process");
       const dst = path.join(require("node:os").tmpdir(), "shot-stats-" + path.basename(f).replace(/[^\w.]/g, "_") + ".png");
+      try {
+        fs.rmSync(dst, { force: true });
+      } catch {}
       execFileSync("/usr/bin/sips", ["-s", "format", "png", f, "--out", dst], { stdio: "ignore" });
+      if (!fs.existsSync(dst)) {
+        console.error(`  ✗ 转换失败：${f}`);
+        process.exitCode = 1;
+        continue;
+      }
       console.log(fmt(path.basename(f), stats(readImage(dst))));
       continue;
     }
