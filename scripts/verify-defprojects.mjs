@@ -33,6 +33,7 @@ const { isPerspectiveScene } = await imp("renderer/vendor/we-scene/render/math.j
 const scn = await imp("renderer/vendor/we-scene/scene/parse.js");
 const eff = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
 const camPath = await imp("renderer/vendor/we-scene/render/camera-path.js");
+const { WE_BUILTIN_SHADERS } = await imp("renderer/vendor/we-scene/shaders-builtin.ts");
 
 const readText = (bytes) => dec.decode(bytes).replace(/^\uFEFF/, "");
 
@@ -44,8 +45,10 @@ const BUILTIN_MODEL_PREFIX = /^models\/util\//;
 /**
  * WE 安装自带素材树（`<安装根>/assets`）。用于区分「引用真的断了」和
  * 「这是 WE 内置素材、不在工程里」：后者不判失败，但**列出来**——
- * 本仓对内置 shader 只原生实现了 albedo 一族（generic*），其余（如 `flag`）
- * 目前会退回通用材质，属已知缺口而非装载错误（见 DEFAULTPROJECTS-PLAN §5.3）。
+ * 本仓对内置 shader 分三档：albedo 一族（generic*）在通用网格/图层程序里原生实现；
+ * `WE_BUILTIN_SHADERS`（`renderer/vendor/we-scene/shaders-builtin.ts`，当前含官方
+ * eagleflag 用的 `flag`）走本仓内置源；两者之外的 WE 内置 shader 仍会退回通用材质，
+ * 属已知缺口而非装载错误（见 DEFAULTPROJECTS-PLAN §5.3 与附录 D 续十九）。
  */
 let weAssets = null;
 function weAssetExists(rel) {
@@ -129,6 +132,7 @@ function auditProject(dirName) {
   const has = (rel) => !!getEntry(pkg, rel);
   const missing = [];
   const pendingBuiltin = [];
+  const builtinImplemented = [];
   const require1 = (rel, why) => {
     if (!rel || typeof rel !== "string") return false;
     if (has(rel)) return true;
@@ -136,12 +140,19 @@ function auditProject(dirName) {
     return false;
   };
   /**
-   * shader 引用：包内没有时，先看 WE 安装的 assets/shaders —— 存在 = WE 内置素材
-   * （记入 pendingBuiltin，说明本仓未原生实现，该层会退回通用材质），
-   * 不存在才算引用断裂。
+   * shader 引用：包内没有时按两级判 ——
+   *   · 本仓**已实现**的引擎内置 shader（`WE_BUILTIN_SHADERS`，如 `flag`）：引用成立，
+   *     记入 builtinImplemented（该层正常出图，见 DEFAULTPROJECTS-PLAN 续十九 / F42）；
+   *   · WE 安装 assets/shaders 里存在、本仓未实现：记入 pendingBuiltin，说明该层会
+   *     退回通用材质（已知缺口，不是装载错误）；
+   * 两档都不成立才算引用断裂。
    */
   const requireShader = (name, why) => {
     if (has(`shaders/${name}.frag`) && has(`shaders/${name}.vert`)) return true;
+    if (WE_BUILTIN_SHADERS[`${name}.frag`] && WE_BUILTIN_SHADERS[`${name}.vert`]) {
+      builtinImplemented.push(`${name}（${why}）`);
+      return true;
+    }
     if (weAssetExists(`shaders/${name}.frag`) && weAssetExists(`shaders/${name}.vert`)) {
       pendingBuiltin.push(`${name}（${why}）`);
       return true;
@@ -417,7 +428,7 @@ function auditProject(dirName) {
     `${dirName}: 层材质合成条目出现 ${diags.length} 条诊断（应为 0）—— ${diags[0] ?? ""}`,
   );
 
-  return { pkg, missing, pendingBuiltin, sourceImages, scene, files: files.length, shaders: seenShader.size, tex: seenTex.size };
+  return { pkg, missing, pendingBuiltin, builtinImplemented, sourceImages, scene, files: files.length, shaders: seenShader.size, tex: seenTex.size };
 }
 
 let scenes = 0;
@@ -429,6 +440,7 @@ const usvAudited = new Set();
 /** 判据 6 里「值指向 shader 未声明的物性名」的样本（只报数，不是失败） */
 const usvUnknownValue = [];
 const pendingBuiltinAll = new Map();
+const builtinImplementedAll = new Map();
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
   if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
@@ -440,6 +452,7 @@ for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n
   }
   scenes++;
   for (const p of r.pendingBuiltin ?? []) pendingBuiltinAll.set(p.split("（")[0], d);
+  for (const p of r.builtinImplemented ?? []) builtinImplementedAll.set(p.split("（")[0], d);
   for (const s of r.sourceImages ?? []) sourceImageAll.set(s.split("（")[0], d);
   if (r.missing.length) {
     fail(`${d}: ${r.missing.length} 处引用在包内解析不到`);
@@ -468,9 +481,17 @@ if (sourceImageAll.size) {
       [...sourceImageAll.entries()].map(([s, d]) => `${s}（${d}）`).join("、"),
   );
 }
+if (builtinImplementedAll.size) {
+  // 正面信息：这些 shader 引用不在包内（WE 引擎自带），但由本仓 `WE_BUILTIN_SHADERS`
+  // 实现 —— 与「待补」相对，说明该层能正常出图。
+  console.log(
+    `  - 引擎内置 shader（本仓已实现，正常出图）：` +
+      [...builtinImplementedAll.entries()].map(([s, d]) => `${s}（${d}）`).join("、"),
+  );
+}
 if (pendingBuiltinAll.size) {
-  // 已知缺口，不是装载错误：WE 内置图像 shader 本仓只原生实现了 albedo（generic*）一族，
-  // 其余（本语料里是 flag）会退回通用材质 —— 该层的自定义顶点/像素效果丢失。
+  // 已知缺口，不是装载错误：本仓只原生实现了 albedo（generic*）一族与
+  // WE_BUILTIN_SHADERS 表（当前含 flag）；两者之外的 WE 内置 shader 会退回通用材质。
   console.log(
     `  - 待补内置 shader（本仓未原生实现，该层退回通用材质）：` +
       [...pendingBuiltinAll.entries()].map(([s, d]) => `${s}（${d}）`).join("、"),
@@ -487,6 +508,14 @@ else console.log(`共审计 ${scenes} 个 scene 工程（跳过 ${skips} 个非�
 // 材质记录引用，离线这里只读第一个内嵌材质路径（那一层由 verify-mdl 系列 + 运行时的
 // 多子网格链覆盖）。审计路径写错（材质链走不到、shader 源读不到）会让这个数字跳水，
 // 那时「方向正确」就不再是判据，只是没查。
+// 引擎内置 shader 判据的非空转闸门：语料里唯一一条（eagleflag 的 `flag`）认不到就说明
+// 「包内没有 → 看内置表」这条链断了（判据会静默变成永不触发的空转）。
+if (weAssets) {
+  check(
+    [...builtinImplementedAll.keys()].includes("flag"),
+    "引擎内置 shader 判据空转：语料里应有 flag（eagleflag），实际一条未认到",
+  );
+}
 console.log(`  - usershadervalues 审计：${usvBindings} 条绑定（离线覆盖 42 / 语料全部 51）`);
 check(usvBindings >= 38, `usershadervalues 审计到的绑定数异常：${usvBindings}（基线 42）—— 判据可能空转`);
 

@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { LIB, ROOT, imp } from "./lib/verify-kit.mjs";
 const { hlsl2glsl } = await imp("renderer/vendor/we-scene/render/hlsl2glsl.js");
 const { WE_SHADER_HEADERS } = await imp("renderer/vendor/we-scene/headers.ts");
+const { WE_BUILTIN_SHADERS } = await imp("renderer/vendor/we-scene/shaders-builtin.ts");
 
 const argv = process.argv.slice(2);
 const onlyItem = (() => {
@@ -44,14 +45,17 @@ const listUndefined = argv.includes("--undefined");
 
 const readText = (b) => new TextDecoder().decode(b).replace(/^\uFEFF/, "");
 
-// 与 main.ts 的 shaderResolver 同语义：pkg 内嵌优先，缺失时回落内置公共头。
+// 与 scene-mount 的 shaderResolver 同语义：pkg 内嵌优先 → 重建公共头 →
+// **引擎内置 shader 的本仓实现**（`shaders-builtin.ts`，eagleflag 的 `flag`）。
+// 最后那档只在开发机上才有的 local-assets 不在这里复刻：判据必须离线可复现，
+// 而内置实现是仓内资产、任何机器都拿得到。
 function makeResolver(pkg) {
   return (rel) => {
     const inner = rel.startsWith("shaders/") ? rel : "shaders/" + rel;
     const file = rel.startsWith("shaders/") ? rel.slice("shaders/".length) : rel;
     const e = getEntry(pkg, inner);
     if (e) return readText(e);
-    return WE_SHADER_HEADERS[file] ?? null;
+    return WE_SHADER_HEADERS[file] ?? WE_BUILTIN_SHADERS[file] ?? null;
   };
 }
 
@@ -387,7 +391,10 @@ function collectShaderJobs(pkg) {
     let mj;
     try { mj = JSON.parse(readText(matEntry)); } catch { continue; }
     const mp = (mj.passes && mj.passes[0]) || {};
-    if (!mp.shader || !getEntry(pkg, `shaders/${mp.shader}.frag`)) continue;
+    // 与 scene-mount 的挂载门同语义（F42）：包内没有 `shaders/<名>.frag` 时，
+    // **引擎内置 shader 仍然要收**（eagleflag 的 `flag` 就是这样），否则这条壁纸的
+    // 唯一 shader 永远不进转译扫描 —— 判据空转、回归也测不出来。
+    if (!mp.shader || (!getEntry(pkg, `shaders/${mp.shader}.frag`) && !WE_BUILTIN_SHADERS[`${mp.shader}.frag`])) continue;
     const key = mp.shader + "|" + JSON.stringify(mp.combos || {});
     if (seen.has(key)) continue;
     seen.add(key);
@@ -604,6 +611,30 @@ const wireErrors = [];
   }
   if (!/texSlots/.test(mountSrc) && !/textures \|\| \[\]/.test(mountSrc)) {
     wireErrors.push("scene-mount.ts 必须遍历 material 全部纹理槽（不能只 load textures[0]）");
+  }
+  // ---- F42：引擎内置 shader（WE 自带、不进 pkg）----
+  // ① 表里必须有成对的 flag.frag/.vert（少一半 → getEffectProgram 直接判缺 stage，
+  //    整个 pass 跳过，画面退回「贴图直出」＝荧光通道图）；
+  // ② scene-mount 的挂载门必须**同时**认 pkg 与内置表 —— 只看 pkg 就是本次缺陷的成因；
+  // ③ 判据非空转：本机库里的 eagleflag 必须真的收到 `flag` 这个 shader 作业。
+  for (const ext of ["frag", "vert"]) {
+    if (typeof WE_BUILTIN_SHADERS[`flag.${ext}`] !== "string" || !WE_BUILTIN_SHADERS[`flag.${ext}`].trim()) {
+      wireErrors.push(`WE_BUILTIN_SHADERS 缺 flag.${ext}（内置 shader 表不完整）`);
+    }
+  }
+  if (!/WE_BUILTIN_SHADERS/.test(mountSrc)) {
+    wireErrors.push("scene-mount.ts 的图层材质挂载门未接入 WE_BUILTIN_SHADERS（内置 shader 会被「包内没有」挡掉）");
+  }
+  {
+    const p = join(LIB, "eagleflag", "scene.pkg");
+    if (fs.existsSync(p)) {
+      let pkg = null;
+      try { pkg = parsePkg(fs.readFileSync(p)); } catch { pkg = null; }
+      const jobs = pkg ? collectShaderJobs(pkg) : [];
+      if (!jobs.some((j) => j.shader === "flag")) {
+        wireErrors.push("eagleflag 的 flag shader 必须进入 shader 扫描（内置 shader 漏收 → 判据空转）");
+      }
+    }
   }
   // 真实语料：两张 flowimage 壁纸的 shader 必须被 collectShaderJobs 收到
   for (const id of ["833227004", "820654165"]) {
