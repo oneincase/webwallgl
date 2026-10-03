@@ -274,17 +274,26 @@ export function parseScene(sceneJson, project) {
     }
   }
   const effVisible = objects.map(() => true)
+  // [we-scene patch] 「祖先可见性」= 只沿父链、**不看自身**的可见性。命中判定用它的
+  // 原因见 render/hittest.js 文件头（隐形 Solid 点击区 + 两个参考实现都不看自身）；
+  // 这里与 effVisible 同一次上溯算出来，避免两处各走一遍父链走出去两种结果。
+  const ancVisible = objects.map(() => true)
   for (let i = 0; i < objects.length; i++) {
     let vis = visibleSelf[i]
+    let ancVis = true
     let p = objects[i].parent
     // 沿父链上溯，任一祖先隐藏则本层隐藏；深度设上限以防数据里存在环
-    for (let guard = 0; vis && p !== undefined && p !== null && guard < 64; guard++) {
+    for (let guard = 0; (vis || ancVis) && p !== undefined && p !== null && guard < 64; guard++) {
       const pi = idxById.get(p)
       if (pi === undefined) break
-      if (!visibleSelf[pi]) vis = false
+      if (!visibleSelf[pi]) {
+        vis = false
+        ancVis = false
+      }
       p = objects[pi].parent
     }
     effVisible[i] = vis
+    ancVisible[i] = ancVis
   }
 
   const layers = objects.map((o, i) => {
@@ -313,6 +322,9 @@ export function parseScene(sceneJson, project) {
       // 自身可见性（未沿父链折叠）。热更用户属性时据此重算继承，避免把脚本改过的
       // 子层 visible 和「父组开关」揉成一份后无法局部刷新。
       visibleSelf: visibleSelf[i],
+      // 命中判定门槛（祖先可见性，自身 visible 不参与）：渲染照旧用 visible，
+      // 两者只在这里分叉 —— 见 render/hittest.js 的「隐形 Solid 点击区」一节。
+      ancestorsVisible: ancVisible[i],
       // 指向 scene.json 原对象（resolveUserProps 就地解 {user,value}）。
       // 自定义配置热更时只重解这棵树并回写绑定字段，不必整包重挂。
       srcObject: o,
@@ -845,12 +857,16 @@ export function parseScene(sceneJson, project) {
 }
 
 /**
- * 按 visibleSelf + 父链重算每层的有效 visible。
+ * 按 visibleSelf + 父链重算每层的有效 visible（以及命中用的 ancestorsVisible）。
  *
  * 脚本写 `thisLayer.visible = true` 时必须先改 visibleSelf，再调本函数：
  * 否则子层仍停在 parse 期「父隐藏 → 子孙 visible=false」的快照上。
  * 3122339805 的 Eyes/Numbers 窗口绑 hide*=false，脚本翻成显示后若只改父层
  * `.visible`，画面上只剩 30px 粉条标题栏，内容/边框全无。
+ *
+ * 两个字段的差：`visible` = 自身 AND 祖先（渲染用）；`ancestorsVisible` = 只沿父链
+ * （命中用，自身隐藏的隐形点击区仍可命中）。窗口类脚本把父层翻成显示/隐藏时，
+ * 两者都要跟着刷新，漏掉 ancestorsVisible 会让「关掉的窗口」一直吃指针事件。
  */
 export function recomputeLayerVisibility(layers) {
   if (!Array.isArray(layers)) return
@@ -862,17 +878,23 @@ export function recomputeLayerVisibility(layers) {
     if (!l) continue
     if (l.destroyed) {
       l.visible = false
+      l.ancestorsVisible = false
       continue
     }
     let vis = l.visibleSelf !== false
+    let ancVis = true
     let p = l.parentId
-    for (let g = 0; vis && p != null && g < 64; g++) {
+    for (let g = 0; (vis || ancVis) && p != null && g < 64; g++) {
       const parent = byId.get(p)
       if (!parent) break
-      if (parent.visibleSelf === false || parent.destroyed) vis = false
+      if (parent.visibleSelf === false || parent.destroyed) {
+        vis = false
+        ancVis = false
+      }
       p = parent.parentId
     }
     l.visible = vis
+    l.ancestorsVisible = ancVis
   }
 }
 

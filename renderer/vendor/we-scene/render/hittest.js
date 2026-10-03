@@ -38,12 +38,33 @@ import { layerParallaxOffset } from './math.js'
  * 求交，交点再经 Rᵀ 逆旋回局部。z=0 平面上两个相机逐像素重合，所以非透视层
  * 不受影响仍走原路径。
  *
- * ---- 可见性必须沿父链 ----
+ * ---- 可见性必须沿父链，但**不看自身** ----
  *
- * parse.js 已经把「沿父链求得的有效可见性」算进 layer.visible，这里直接用。
- * 不这么做的后果很具体：3299228616 有 6 套语言变体图层，只有 ENG 根层可见，
- * 但**子层自己都是 visible=true** —— 只看自身可见性会让 5 套隐藏语言的图层
- * 一起参与命中，指针永远打在最上面那个隐藏层上，可见层反而收不到回调。
+ * 命中门槛用 `layer.ancestorsVisible`（parse.js / recomputeLayerVisibility 维护），
+ * **不是** 渲染用的 `layer.visible`。两者只差「自身 visible」这一项，而这正是必需的分叉：
+ *
+ *   - 官方 SceneScript 参考页（scene/scenescript/reference/event/cursor）写明
+ *     「All mouse cursor events will only work on objects marked as Solid」——
+ *     Solid 层就是作者的**点击区**，而点击区常被设成 `visible:false` 当隐形热区。
+ *     3810092560（鲸鱼娘 点击互动）25 个 Solid 点击区全部 `visible:false`，挂 scale
+ *     脚本按 `targetLayerNames` 挤压对应的模型层：按有效可见性排除 = 整张壁纸点不动。
+ *   - 两个参考实现也都不看自身：open-wallpaper-engine `Script.cpp::TickAll` 的
+ *     `HitTestNode(node, cursor)` 完全不查可见性；Mirage `ScriptRuntime.cpp` 走
+ *     `ResolveCursorNode` + `ancestors_visible`（只看祖先）。
+ *   - 3012694124 的「MEDIA SHOW WINDOW」「Show window clock」按钮本身就是 `value:false`
+ *     的隐藏层，click 里把自己藏起来、把窗口组显示出来 —— 自身不可命中的话窗口关了
+ *     就再也打不开。
+ *
+ * 祖先可见性仍然必须查：3299228616 有 6 套语言变体图层，只有 ENG 根层可见，但
+ * **子层自己都是 visible=true** —— 只看自身会让 5 套隐藏语言的图层一起参与命中。
+ * 本仓早先用「有效可见性」把这个用例和上面的隐形热区一起排除了，是过收紧。
+ *
+ * ---- 不要按「只对 Solid 生效」加图层类型闸门 ----
+ *
+ * 上面那句官方文案是**编辑器**口径，不是运行时过滤：WE 自带示例 dino_run 的
+ * `mario_walk_1#28` 是 model 层（非 Solid），cursorDown 就是它的点击跳跃；
+ * 本仓语料 1001 个 cursor 钩子里 613 个挂在非 Solid 层上。按类型设闸会把
+ * 这些一起打死（2026-10-03 查证：WE 安装目录 projects/defaultprojects 实测）。
  */
 
 /**
@@ -204,8 +225,11 @@ export function hitTestLayersAll(layers, wx, wy, projH, opts = {}) {
   // 从上往下扫：layers 顺序即绘制顺序，后画的在上面
   for (let i = layers.length - 1; i >= 0; i--) {
     const layer = layers[i]
-    // 可见性已由 parse.js 沿父链求得（见文件头说明），隐藏层不参与命中
-    if (!layer || !layer.visible || layer.destroyed) continue
+    // 命中门槛 = 祖先可见性（见文件头）：自身 visible 不参与 —— 隐形 Solid 点击区
+    // 靠的就是它。`ancestorsVisible` 缺席时（手工构造的层/老调用方）退回有效可见性。
+    if (!layer || layer.destroyed) continue
+    const ancVis = layer.ancestorsVisible !== undefined ? layer.ancestorsVisible : layer.visible
+    if (ancVis === false) continue
     if (filter && !filter(layer)) continue
     const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye, parallaxCtx)
     if (!loc) continue
