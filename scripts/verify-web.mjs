@@ -2122,6 +2122,16 @@ function runShim(extras, opts) {
     /injectWebShim/.test(hostTs) && /isHtmlPath/.test(hostTs),
     "wallpaper-host 必须对 /web/ HTML 响应注入 WE shim",
   );
+  // 官方 CEF 的属性表按字母序下发（C++ 有序容器遍历），不是 project.json 声明序。
+  // corsair_collection（官方内置）：activateWallpaper 处理 "scene" 时直接
+  // currentEffect.reset()，而 currentEffect 只由 "effect" 键的发射创建 —— 声明序
+  // （scene 第 1、effect 第 6）必然 TypeError → 路由导航被掐死 → 白屏。
+  // 字母序（effect < logo < scene）与「官方能跑」自洽；作者脚本都逐键取值，键序不可见。
+  check(
+    /function weOrderUserProperties/.test(shim) &&
+      /applyUserProperties\(weOrderUserProperties\(/.test(shim),
+    "applyUserProperties 必须按官方键序（字母序）重排后下发（corsair_collection 白屏判据）",
+  );
 }
 
 // ---------- 8. 网页壁纸「露底」cover 自适配（1731760875 16:10 底部黑条）----------

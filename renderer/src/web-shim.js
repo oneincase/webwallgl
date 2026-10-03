@@ -577,10 +577,27 @@
     status: null,
   };
 
+  /**
+   * 官方语义：applyUserProperties 的对象键序 = 官方 CEF 的遍历序。
+   * 官方 C++ 侧属性存于有序容器，键按字母序下发（非 project.json 声明序）。
+   * 证据：corsair_collection（官方内置 web 壁纸）的主组件 activateWallpaper 在收到
+   * "scene" 时直接 `effectProvider.currentEffect.reset()`，而 currentEffect 只由
+   * "effect" 键的发射创建 —— 按 project.json 序（scene 第 1、effect 第 6）下发必然
+   * TypeError → 路由导航被掐死 → 白屏。它在官方能跑 ⇒ 官方序必是 effect 先于 scene，
+   * 字母序（effect < logo < scene）自洽。作者脚本都是逐键取值（if (properties.x)），
+   * 键序对它们不可见，重排对既有语料恒等。
+   */
+  function weOrderUserProperties(props) {
+    var keys = Object.keys(props).sort();
+    var out = {};
+    for (var i = 0; i < keys.length; i++) out[keys[i]] = props[keys[i]];
+    return out;
+  }
+
   function callApplyUserProperties(props) {
     if (!propertyListener || typeof propertyListener.applyUserProperties !== "function") return;
     try {
-      propertyListener.applyUserProperties(props || {});
+      propertyListener.applyUserProperties(weOrderUserProperties(props || {}));
     } catch (_) {
       /* 壁纸脚本抛错不打断宿主 */
     }
