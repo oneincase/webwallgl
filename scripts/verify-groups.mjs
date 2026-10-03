@@ -262,6 +262,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
 // ---------- C. 实现必须真的接线 ----------
 {
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
 
   // A 的接线：puppet 的效果链跑在**贴图空间**，网格形变留到链尾
   //
@@ -307,6 +308,24 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     // `bloom glErr=1282` 就是它）。
     check(!/readPixels\([^)]*HALF_FLOAT/.test(rsrc),
       "readPixels 用了 HALF_FLOAT（浮点目标必须 RGBA+FLOAT+Float32Array，否则整条回读静默失效）");
+
+    // F35 多子网格模型的**逐网格材质**：每个网格有独立材质 JSON，combos 也可能不同
+    // （arsenal：刀 = lightmap+normalmap、桌面 = +reflection+detailinalpha），
+    // 只按 mesh0 建一个程序 ⇒ 其余网格用错槽贴图（刀的光照图贴到桌面上 → 桌面全黑）、
+    // 还丢掉各自的 `#if` 分支。宿主产出逐网格规格、渲染侧逐网格切程序/常量/贴图。
+    check(/\.meshMaterials = meshSpecs/.test(hostSrc),
+      "scene-mount 未产出逐子网格材质规格（layer.meshMaterials，F35）");
+    check(/const specOf = \(i\) =>/.test(rsrc) && /const bindForSpec = \(spec, ent\)/.test(rsrc),
+      "材质路径未逐网格切换程序/常量/贴图（F35）");
+
+    // F36 材质路径必须套用 WE 的环绕规则：缺省 REPEAT、`.tex flags bit1`（clampUvs）才 CLAMP。
+    // 不设就吃上传默认值 —— 模型材质 uv 常常平铺（arsenal 桌面 uv ∈ [-3.4, 4.7]），
+    // CLAMP 下整张桌子贴到边缘纹素（木头糊成条纹），**法线贴图**同样采到边缘 ⇒
+    // 切线空间法线指向侧向 ⇒ N·L ≤ 0（桌面一点动态光都不吃）。
+    const meshMatStart = rsrc.indexOf("function drawMeshMaterialInner")
+    const meshMatBody = meshMatStart >= 0 ? rsrc.slice(meshMatStart, meshMatStart + 9000) : ""
+    check(/clampUvs === true \? gl\.CLAMP_TO_EDGE : gl\.REPEAT/.test(meshMatBody),
+      "材质路径未按 clampUvs 设纹理环绕（模型平铺 uv 会被 CLAMP 采成边缘纹素，F36）");
 
     // F32 shader-blend 的底图不得与当前渲染目标同一张纹理（HDR 下 captureBackdrop
     // 返回的就是场景纹理）：采样同时是渲染目标 = 反馈环，drawArrays 被丢弃，

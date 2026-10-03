@@ -2160,6 +2160,49 @@ const wireErrors = [];
   }
 }
 
+// ---------- 两处「转译器语义」缺陷（F34 / F37，2026-10-03） ----------
+//
+// 两处都是官方内置 3D 工程的模型材质踩到、工坊语料从未覆盖的语义差异：
+//   ① **combo 名与 shader 里的变量同名**时，标识符替换把变量一起改掉：官方
+//      `generic.frag` 有局部变量 `lightmap`，而材质 combo 键也叫 `lightmap` ⇒
+//      `vec3 lightmap = …` 被改写成 `vec3 1 = …`（`ERROR: 0:123: '1' : syntax error`），
+//      整个 `generic` 材质编译失败、arsenal 整车回落通用程序（贴图/材质/光照全丢）。
+//   ② **HLSL `mat3(a,b,c)` 填行、GLSL 填列**，转译器对构造子原样透传 ⇒ 重建头里的
+//      `BuildTangentSpace`（官方语义是「三行 = t/b/n」）在 GLSL 里成了转置矩阵 ⇒
+//      切线空间的法线轴落到别的分量上（实测 `v_Light0DirectionL3X.z ≈ -1` 而世界方向
+//      y ≈ +0.9）⇒ 法线贴图光照整片取反（arsenal 桌面 N·L ≤ 0，一点动态光都不吃）。
+// 判据都在转译产物 / 重建头文本上复算，并带控制组防「一律不替换」的假通过。
+{
+  const tErr = [];
+  const src = [
+    "uniform sampler2D g_Texture1;",
+    "void main() {",
+    "  vec3 lightmap = texSample2D(g_Texture1, vec2(0.5)).rgb;",
+    "  float light = 1.0;",
+    "  light *= lightmap;",
+    "  float mode = BLENDMODE;",
+    "  gl_FragColor = vec4(light, mode, 0.0, 1.0);",
+    "}",
+  ].join("\n");
+  const out = hlsl2glsl(src, "frag", { lightmap: 1, blendmode: 2 }, () => null, "");
+  if (!/vec3\s+lightmap\s*=/.test(out)) {
+    tErr.push("combo 键与局部变量同名时变量被改掉（官方 generic.frag 的 lightmap ⇒ 整条材质编译失败）");
+  }
+  if (!/float\s+mode\s*=\s*2\.?0?\b/.test(out)) {
+    tErr.push("combo 作为值使用时未被替换（控制组：BLENDMODE 应换成 2）");
+  }
+  // 匹配前剥注释：F37 的说明文字里就写着 `return mat3(tangent, bitangent, normal);`，
+  // 不剥会把注释算进定义计数（第一版判据正是这样误报的）。
+  const hdr = (WE_SHADER_HEADERS["common_vertex.h"] || "").replace(/\/\/[^\n]*/g, "");
+  const vectorReturns = hdr.match(/return\s+[^;]*mat3\(/g) || [];
+  const transposed = hdr.match(/return\s+transpose\(mat3\(/g) || [];
+  if (vectorReturns.length < 2) tErr.push("common_vertex.h 的 BuildTangentSpace 定义数异常（应有两个返回 mat3 的重载）");
+  if (transposed.length !== vectorReturns.length) {
+    tErr.push("BuildTangentSpace 未按 HLSL 行语义构造矩阵（GLSL mat3(a,b,c) 填列 ⇒ 切线空间转置）");
+  }
+  for (const e of tErr) wireErrors.push(e);
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);
