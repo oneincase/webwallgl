@@ -137,8 +137,18 @@ function numField(v, dflt) {
   return typeof r === 'number' && Number.isFinite(r) ? r : dflt
 }
 
-// 有 fov、没有 orthogonalprojection = 真 3D 透视场景。
-// 全库目前只有 3509243656。2D 场景即使写了 fov（编辑器残留）也带正交投影，必须走正交。
+// 有没有声明 `orthogonalprojection` 决定 2D / 3D：
+// **声明了（非空）= 2D 正交场景**（即使写了 fov，那是编辑器残留，必须走正交）；
+// **没声明（缺失 / null / 空对象）= 3D 透视场景**，fov 缺省由 buildCamera 落 50。
+//
+// [we-scene patch 2026-10-03] 判据此前多要求 `fov > 0`，依据是工坊语料里唯一一个
+// 「有 fov、无正交投影」的三体（3509243656）。但**官方内置 defaultprojects 的 8 个
+// 3D 工程（arsenal/audiophile/demon_core/dna_fragment/fantasticcar/neon_sunset/
+// ricepod/techno）都不写 fov**：旧判据把它们当 2D 像素正交，模型层的 MVP 变成
+// 像素空间矩阵（实测 arsenal 的 puppets MVP 缩放 0.002 = 世界单位 1 ≈ 0.002px），
+// `keepZ=false` ⇒ 整屏黑。语料对照：本机 349 个包里「无正交投影且无 fov」的
+// 场景是 **0 个**，「有 fov 无正交」5 个（判据不变），其余 344 个都带正交投影 ——
+// 所以去掉 fov 要求对工坊语料是恒等变换，只把这一类场景拉回它本来的语义。
 //
 // 「没有」= 键缺失 / null / **空对象**。scene.json 里透视场景写的是
 // `"orthogonalprojection": null`，装配期另有代码会拿到 general 就顺手补字段
@@ -154,7 +164,7 @@ export function isPerspectiveScene(scene) {
   } else if (o) {
     return false
   }
-  return numField(g.fov, 0) > 0
+  return true
 }
 
 // 透视天空盒必须包住相机。作者常把盒放在原点（3509243656 scale 8×12×8、

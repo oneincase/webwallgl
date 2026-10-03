@@ -502,30 +502,65 @@ export function createMDLRenderer(gl) {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
-    m = { vao, vbuf, ibuf, hasNormals: hasN }
+    m = {
+      vao,
+      vbuf,
+      ibuf,
+      hasNormals: hasN,
+      // [we-scene patch 2026-10-03] 供**材质 shader 路径**（F13）复用的几何信息：
+      // 交错布局 pos(3f)@0 / uv(2f)@12 / bone(4f)@20 / weight(4f)@36 / normal(3f)@52，
+      // stride = floatStride*4。材质程序自己声明 attribute 名字与数量，这里只暴露
+      // 「顶点数 / 交错宽度 / 索引类型」，具体绑定由渲染侧按程序的位置做。
+      vertexCount: n,
+      floatStride: F,
+      indexCount: mesh.indexCount,
+      indexU32: mesh.indices instanceof Uint32Array,
+    }
     meshes.set(mesh, m)
     liveMeshes.add(m)
     return m
   }
+  // 材质 shader 路径取几何信息（先建后取，语义与 ensureMesh 一致）
+  const resolveMesh = (mesh) => (mesh ? ensureMesh(mesh) : null)
+  /** [we-scene patch 2026-10-03] 材质 shader 路径用：返回 mdl 的子网格列表（单网格给伪网格） */
+  const resolveMeshes = (mdl) => {
+    const list = meshListOf(mdl)
+    return list && list.length ? list : [legacyMeshOf(mdl)]
+  }
 
   // 单网格模型（绝大多数 2D puppet）把顶层字段包成一条「伪子网格」，让 draw/upload
   // 只有一条代码路径；多网格模型直接走 mdl.meshes。
-  const legacyMeshOf = (mdl) => ({
-    positions: mdl.positions,
-    uvs: mdl.uvs,
-    boneIdx: mdl.boneIdx,
-    weights: mdl.weights,
-    vertexCount: mdl.vertexCount,
-    indices: mdl.indices,
-    indexCount: mdl.indexCount,
-    indexType: mdl.indexType,
-  })
+  // [we-scene patch 2026-10-03] **单网格模型的伪网格必须按 mdl 记忆化**：
+  // ensureMesh（VBO/VAO 缓存）与材质路径的 VAO 缓存都以「网格对象」为键，
+  // 每次新建对象 = **每帧新建一整套 VBO/VAO**。neon_sunset 的两个模型都是单网格，
+  // 实测这条每帧泄漏把整帧拖成零像素（fps 仍 60、无报错、连 2D 层也不出图）。
+  const legacyCache = new WeakMap()
+  const legacyMeshOf = (mdl) => {
+    let m = legacyCache.get(mdl)
+    if (m) return m
+    m = {
+      positions: mdl.positions,
+      uvs: mdl.uvs,
+      boneIdx: mdl.boneIdx,
+      weights: mdl.weights,
+      vertexCount: mdl.vertexCount,
+      indices: mdl.indices,
+      indexCount: mdl.indexCount,
+      indexType: mdl.indexType,
+    }
+    legacyCache.set(mdl, m)
+    return m
+  }
   const meshListOf = (mdl) => (mdl.meshes && mdl.meshes.length > 1 ? mdl.meshes : null)
 
   return {
     gl,
     prog,
     maxBones: MAX_BONES,
+    /** [we-scene patch 2026-10-03] 材质 shader 路径用：取某子网格的几何信息（含 VBO/IBO） */
+    resolveMesh,
+    /** [we-scene patch 2026-10-03] 材质 shader 路径用：mdl 的子网格列表（多网格或单网格伪网格） */
+    resolveMeshes,
     /**
      * 释放本渲染器创建的 GL 对象：program + 每套网格的 VAO/VBO。
      *

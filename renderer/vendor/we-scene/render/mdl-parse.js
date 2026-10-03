@@ -37,6 +37,51 @@ function layoutFieldsSelfConsistent(dv, vertStart, count, cand) {
   return true
 }
 
+/**
+ * [we-scene patch 2026-10-03] 源码工程模型的候选打分。返回 <0 = 不合格。
+ *
+ * 只对**静态网格**（bone < 0）用：位置必须有限且量级合理，末 8 字节（UV 槽）必须有限；
+ * 分数 = 抽样的 (u,v) 落在 |uv| ≤ 8 的占比（平铺网格通常也只有几个周期；
+ * stride 猜错时这里读到的是位置分量，往往偏大或偏零 → 分数低）。
+ * 索引区也要能读通（长度可整除、抽样索引 < 顶点数），否则直接判不合格。
+ */
+function layoutSourceScore(dv, vertStart, count, cand) {
+  if (count <= 0 || vertStart + count * cand.stride + 4 > dv.byteLength) return -1
+  const picks = new Set([0, 1, count >> 1, count - 1])
+  for (let i = 0; i < count; i += Math.max(1, count >> 4)) picks.add(i)
+  let uvOk = 0
+  let seen = 0
+  for (const i of picks) {
+    const b = vertStart + i * cand.stride
+    // 逐顶点边界闸：候选来自位掩码推导，落点可能越界（越界读到的是别的段的数据，
+    // 会让范围检查抛 RangeError 而不是优雅地判「这个候选不合格」——本函数是候选
+    // 筛选器，任何候选都不该让整个解析炸掉）
+    if (b + cand.stride > dv.byteLength) return -1
+    for (let k = 0; k < 3; k++) {
+      const x = dv.getFloat32(b + k * 4, true)
+      if (!Number.isFinite(x) || Math.abs(x) > 1e5) return -1
+    }
+    const u = dv.getFloat32(b + cand.uv, true)
+    const v = dv.getFloat32(b + cand.uv + 4, true)
+    if (!Number.isFinite(u) || !Number.isFinite(v)) return -1
+    if (Math.abs(u) <= 8 && Math.abs(v) <= 8) uvOk++
+    seen++
+  }
+  const idxByteLen = dv.getUint32(vertStart + count * cand.stride, true)
+  if (!(idxByteLen > 0)) return -1
+  const useU32 = count > 65535 && idxByteLen % 4 === 0
+  const iw = useU32 ? 4 : 2
+  if (idxByteLen % iw !== 0) return -1
+  const idxStart = vertStart + count * cand.stride + 4
+  if (idxStart + idxByteLen > dv.byteLength) return -1
+  const idxCount = idxByteLen / iw
+  for (let i = 0; i < Math.min(idxCount, 512); i++) {
+    const idx = useU32 ? dv.getUint32(idxStart + i * 4, true) : dv.getUint16(idxStart + i * 2, true)
+    if (idx >= count) return -1
+  }
+  return seen === 0 ? -1 : uvOk / seen
+}
+
 export function parseMDL(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
   // [we-scene patch 2026-09-25] 四个段签名（MDAT/MDLS/MDLA/MDLE）**一趟扫完**：
@@ -92,6 +137,40 @@ export function parseMDL(buf) {
        { lenOff: 4, stride: 52, uv: 44, bone: 12, weight: 28 },
        // 兜底：未见过的中间版本按已知布局各试一次，取自洽的那个
        { lenOff: 32, stride: 80, uv: 72, bone: 40, weight: 56 }]
+  // [we-scene patch 2026-10-03] **源码工程模型是另一族布局**（官方内置 defaultprojects /
+  // WE 编辑器工程）。判据是头部 `u32@9`（mdlFlag）的高位：打包器产出恒带 0x01800000
+  // 标记（本机语料 MDLV0013 实测 0x01800009），源码族没有。
+  //
+  // 源码族的形状（26 个模型实测，见 docs/DEFAULTPROJECTS-PLAN.md §4.2）：
+  //   · 顶点区长度字段在 material 串后 **+4**（MDLV0004/0014）或 **+32**（MDLV0017/0023）；
+  //   · **stride 由 mdlFlag 的位掩码决定**，不是版本：bit0 pos(12) / bit1 normal(12) /
+  //     bit2 tangent(12) / bit3 uv(8) / bit4 color(4) / bit5 额外 20B；
+  //     UV 恒在末 8 字节（stride-8），22/26 的预测 stride 直接命中自洽校验；
+  //   · **26/26 没有 MDLS/MDLA 段**：静态网格，无骨骼无动画（bone=-1 的既有分支即可画）。
+  // 打包族（带高位标记）**完全走原表**，这条新增对工坊语料是恒等变换。
+  const packedFamily = (mdlFlag & 0x01800000) !== 0
+  const srcCandidates = []
+  if (!packedFamily) {
+    // **属性表只有一份**：复用多子网格路径的 vertexLayoutOf(mdlFlag)（tangent 16B、
+    // 可选 skinBlend/skinWeight 各 16B）。此前这里另写过一套尺寸表（tangent 记 12B），
+    // 与子网格路径各算一套 —— 3509243656 的 Hollow Cylinder（flag 0xf）两条路径给出
+    // 44 vs 48，verify-mdl-sections 的「子网格0 必须与单网格字段同源」当场逮住。
+    const lay = vertexLayoutOf(mdlFlag)
+    const lenOffs = [...new Set([ver >= 23 || ver === 17 ? 32 : 4, 32, 8, 4])]
+    const strides = []
+    if (lay.stride > 0) strides.push(lay.stride)
+    for (const s of [20, 32, 44, 48, 52, 56, 64, 80]) if (!strides.includes(s)) strides.push(s)
+    for (const lenOff of lenOffs) {
+      for (const stride of strides) {
+        const predicted = stride === lay.stride && lay.stride > 0
+        srcCandidates.push(
+          predicted
+            ? { lenOff, stride, uv: lay.uv, bone: lay.bone, weight: lay.weight, predicted: true }
+            : { lenOff, stride, uv: stride - 8, bone: -1, weight: -1 },
+        )
+      }
+    }
+  }
   let L = null
   let vertexBytes = 0
   let vbOff = 0
@@ -108,8 +187,34 @@ export function parseMDL(buf) {
       break
     }
   }
+  if (!L && srcCandidates.length) {
+    // 源码族：多个候选都「结构自洽」是常态（stride 16 之类也能整除），所以按分数取最优 ——
+    // 预测 stride 优先，其次看末 8 字节是否像 UV（落在有限区间内的占比）。
+    let best = null
+    let bestScore = -1
+    for (const cand of srcCandidates) {
+      const off = mat.next + cand.lenOff
+      if (off + 4 > buf.byteLength) continue
+      const n = dv.getUint32(off, true)
+      if (!(n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength)) continue
+      const count = n / cand.stride
+      const score = layoutSourceScore(dv, off + 4, count, cand)
+      if (score < 0) continue
+      const total = score + (cand.predicted ? 2 : 0)
+      if (total > bestScore) {
+        bestScore = total
+        best = { L: cand, n, off }
+      }
+    }
+    if (best) {
+      L = best.L
+      vertexBytes = best.n
+      vbOff = best.off
+    }
+  }
   if (!L) {
-    throw new Error('顶点区长度异常（' + magic + '，已试 stride ' + LAYOUTS.map((c) => c.stride).join('/') + '）')
+    const tried = [...LAYOUTS, ...srcCandidates].map((c) => c.stride)
+    throw new Error('顶点区长度异常（' + magic + '，已试 stride ' + [...new Set(tried)].join('/') + '）')
   }
   const vertStart = vbOff + 4
   const vertexCount = vertexBytes / L.stride
