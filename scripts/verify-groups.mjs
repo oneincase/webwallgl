@@ -318,6 +318,21 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/const specOf = \(i\) =>/.test(rsrc) && /const bindForSpec = \(spec, ent\)/.test(rsrc),
       "材质路径未逐网格切换程序/常量/贴图（F35）");
 
+    // F43 「逐网格材质」差的那一半：**槽 0 贴图**。
+    // 渲染侧槽 0 的来源是 `layer.meshTextures[i] || mm.texture`，而宿主此前只给
+    // **没有材质规格**的网格填过 meshTextures（`&& !spec`）：有材质的子网格一律落到
+    // `mm.texture` ＝ **mesh 0 的基色**。fantasticcar 六个子网格因此全在采样车漆那张
+    // **通道图**（r/g/b 打包的权重图，直出即青/品红）—— 用户报的「前唇/侧裙/后视镜/
+    // 轮辋蓝青、进气格栅深蓝」就是它，而官方预览这些件是银灰/深灰。同一条缺陷在
+    // arsenal（桌面在采样刀的贴图 → 整片错纹，同会话 A/B：桌面从刀图变回木板 + 光池）
+    // 与 ricepod（船体采样 mesh0 的贴图）上同样成立，只是没有那种刺眼的颜色证据。
+    // 语料侧的非空转闸门在 verify-defprojects（判据 7：内置语料里应有 ≥3 个
+    // 「多子网格且槽 0 各不同」的模型）。
+    check(!/typeof tn0 === "string" && tn0 && !spec/.test(hostSrc),
+      "槽 0 的每网格贴图仍被 `!spec` 挡着（有材质的子网格会落到 mesh 0 的贴图，F43）");
+    check(/meshTexPush\(meshTex, mi, textures\.get\(tn0\)/.test(hostSrc),
+      "宿主未把每个子网格材质自己的 textures[0] 填进 layer.meshTextures（F43）");
+
     // F36 材质路径必须套用 WE 的环绕规则：缺省 REPEAT、`.tex flags bit1`（clampUvs）才 CLAMP。
     // 不设就吃上传默认值 —— 模型材质 uv 常常平铺（arsenal 桌面 uv ∈ [-3.4, 4.7]），
     // CLAMP 下整张桌子贴到边缘纹素（木头糊成条纹），**法线贴图**同样采到边缘 ⇒

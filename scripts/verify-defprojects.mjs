@@ -34,6 +34,7 @@ const scn = await imp("renderer/vendor/we-scene/scene/parse.js");
 const eff = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
 const camPath = await imp("renderer/vendor/we-scene/render/camera-path.js");
 const { WE_BUILTIN_SHADERS } = await imp("renderer/vendor/we-scene/shaders-builtin.ts");
+const mdlMod = await imp("renderer/vendor/we-scene/render/mdl.js");
 
 const readText = (bytes) => dec.decode(bytes).replace(/^\uFEFF/, "");
 
@@ -302,6 +303,52 @@ function auditProject(dirName) {
     // font 不查：官方字体在 WE 安装 assets/fonts（工程外），本仓回退系统字体
   }
 
+  // ---- 判据 7：多子网格模型的「每网格槽 0 贴图」必须**因网格而异**（F43 非空转闸门）----
+  //
+  // 背景：材质路径里槽 0（基色）的来源是 `layer.meshTextures[i] || mm.texture`，而宿主
+  // 一度只给**没有材质规格**的网格填过 meshTextures ⇒ 有材质的子网格全落到 mesh 0 的
+  // 基色（fantasticcar 六个子网格都在采样车漆那张通道图 → 前唇/后视镜/轮辋整片蓝青）。
+  // 修完之后，这条判据要回答的是「语料里还有没有可观测的差异」：如果哪天语料里所有
+  // 多子网格模型的槽 0 都一样，源码护栏就退化成空转，这里必须响。
+  const multiMesh = { models: 0, distinct: 0, samples: [] };
+  for (const o of scene.objects ?? []) {
+    let mdlRel = typeof o.model === "string" ? o.model : null;
+    if (!mdlRel && typeof o.image === "string") {
+      if (/\.mdl$/i.test(o.image)) mdlRel = o.image;
+      else if (/\.json$/i.test(o.image)) {
+        const e = getEntry(pkg, o.image);
+        const mj = e ? parseJsonLoose(readText(e)) : null;
+        if (mj && typeof mj.puppet === "string") mdlRel = mj.puppet;
+      }
+    }
+    if (!mdlRel) continue;
+    const bytes = getEntry(pkg, mdlRel);
+    if (!bytes) continue;
+    let mdl;
+    try {
+      mdl = mdlMod.parseMDL(new Uint8Array(bytes));
+    } catch {
+      continue; // 残缺资产（audiophile grid）由 verify-mdl-source 负责报，这里只数材料
+    }
+    const meshes = mdl.meshes ?? [];
+    if (meshes.length < 2) continue;
+    multiMesh.models++;
+    const slots = new Set();
+    for (const m of meshes) {
+      const me = m.materialPath ? getEntry(pkg, m.materialPath) : null;
+      // 材质文档要**容忍 `//` 行注释**（fantasticcar 的 glass.json 就带一条被注释掉的
+      // `"cullmode"`）：运行时走 eff.parseJsonTolerant，判据必须同一条链，否则这里
+      // 会抛 JSON 语法错、把整个语料审计带崩。
+      const p0 = me ? (eff.parseJsonTolerant(readText(me)).passes ?? [])[0] : null;
+      const t0 = p0 && (p0.textures ?? [])[0];
+      if (typeof t0 === "string" && t0) slots.add(t0);
+    }
+    if (slots.size >= 3) {
+      multiMesh.distinct++;
+      multiMesh.samples.push(`${dirName}/${o.name ?? o.id}（${meshes.length} 网格 / ${slots.size} 种槽 0）`);
+    }
+  }
+
   // ---- 判据 3：2D/3D 判据（isPerspectiveScene）与场景内容一致 ----
   // 官方内置里 8 个 3D 工程（含 model 对象、general 无 orthogonalprojection 也不写 fov）
   // 必须被判成透视场景 —— 旧判据要求 fov>0，把它们当 2D 像素正交，模型层 MVP 退化成
@@ -428,7 +475,7 @@ function auditProject(dirName) {
     `${dirName}: 层材质合成条目出现 ${diags.length} 条诊断（应为 0）—— ${diags[0] ?? ""}`,
   );
 
-  return { pkg, missing, pendingBuiltin, builtinImplemented, sourceImages, scene, files: files.length, shaders: seenShader.size, tex: seenTex.size };
+  return { pkg, missing, pendingBuiltin, builtinImplemented, sourceImages, scene, files: files.length, shaders: seenShader.size, tex: seenTex.size, multiMesh };
 }
 
 let scenes = 0;
@@ -441,6 +488,8 @@ const usvAudited = new Set();
 const usvUnknownValue = [];
 const pendingBuiltinAll = new Map();
 const builtinImplementedAll = new Map();
+/** 判据 7：多子网格模型（判据见 auditProject）——{ models, distinct, samples } 全语料汇总 */
+const multiMeshAll = { models: 0, distinct: 0, samples: [] };
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
   if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
@@ -454,6 +503,11 @@ for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n
   for (const p of r.pendingBuiltin ?? []) pendingBuiltinAll.set(p.split("（")[0], d);
   for (const p of r.builtinImplemented ?? []) builtinImplementedAll.set(p.split("（")[0], d);
   for (const s of r.sourceImages ?? []) sourceImageAll.set(s.split("（")[0], d);
+  if (r.multiMesh) {
+    multiMeshAll.models += r.multiMesh.models;
+    multiMeshAll.distinct += r.multiMesh.distinct;
+    multiMeshAll.samples.push(...r.multiMesh.samples);
+  }
   if (r.missing.length) {
     fail(`${d}: ${r.missing.length} 处引用在包内解析不到`);
     for (const m of r.missing.slice(0, 8)) console.log(`      · ${m}`);
@@ -516,6 +570,14 @@ if (weAssets) {
     "引擎内置 shader 判据空转：语料里应有 flag（eagleflag），实际一条未认到",
   );
 }
+// 判据 7 的非空转闸门（F43）：内置语料里必须有**若干**多子网格模型、其槽 0 贴图因网格而异
+// —— 这正是「材质路径的槽 0 必须按网格取」这条源码护栏的可观测面。实测：arsenal/pistols 6/6、
+// fantasticcar/Car 6/5、ricepod 两个模型 3/3。数字跳水说明语料换了形态或解析链走丢。
+if (multiMeshAll.samples.length) {
+  console.log(`  - 多子网格模型槽 0 因网格而异（F43）：${multiMeshAll.samples.join("、")}`);
+}
+check(multiMeshAll.distinct >= 3,
+  `多子网格 + 槽 0 各不相同的模型只有 ${multiMeshAll.distinct} 个（基线 4：arsenal/fantasticcar/ricepod×2）—— F43 判据可能空转`);
 console.log(`  - usershadervalues 审计：${usvBindings} 条绑定（离线覆盖 42 / 语料全部 51）`);
 check(usvBindings >= 38, `usershadervalues 审计到的绑定数异常：${usvBindings}（基线 42）—— 判据可能空转`);
 
