@@ -35,6 +35,7 @@ import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
+import { WE_BUILTIN_SHADERS } from "../vendor/we-scene/shaders-builtin";
 import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, anim, camPath as camPathLib, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
@@ -756,7 +757,15 @@ cfg, source, pkgAbort.signal);
         const inner = rel.startsWith("shaders/") ? rel : "shaders/" + rel;
         const file = rel.startsWith("shaders/") ? rel.slice("shaders/".length) : rel;
         const e = pkg.getEntry(parsedPkg, inner);
-        let src: string | null = e ? readText(e) : (WE_SHADER_HEADERS[file] ?? null);
+        // [we-scene patch 2026-10-03] **引擎内置 shader 的本仓实现**（F42）：WE 自带
+        // （`assets/shaders/**`）而不进 pkg 的那一族，如 `flag`（官方内置工程
+        // eagleflag 的图层材质）。放在 local-assets 之前：这条是仓内实现、任何环境
+        // 都拿得到（官方素材只在开发机上有），行为才可复现；要拿官方源做逐像素
+        // 对照时开 `__noBuiltinShaders`（见下）退到 local-assets 那一档。
+        const builtinOff = hooksOn() && (globalThis as any).__noBuiltinShaders === true;
+        let src: string | null = e
+          ? readText(e)
+          : ((WE_SHADER_HEADERS[file] ?? (builtinOff ? undefined : WE_BUILTIN_SHADERS[file])) ?? null);
         // [we-scene patch 2026-10-03] **官方安装素材回退**（F14）：本仓 `WE_SHADER_HEADERS`
         // 是按需**重建的子集**，官方 `common_pbr.h` 一族并不完整。作者的自定义模型/效果
         // shader include 官方头时（fantasticcar `car.frag` 用 `g_SpecularPower`、
@@ -2957,9 +2966,16 @@ cfg, source, pkgAbort.signal);
               }),
             );
           }
-          // [we-scene patch] pkg 里的图层材质 shader（非 genericimage*）挂进效果链。
+          // [we-scene patch] 图层材质 shader（非 genericimage*）挂进效果链。
           // 833227004 / 820654165 的「会动」写在 flowimage，不在 scene.effects。
-          if (pass?.shader && pkg.getEntry(parsedPkg, `shaders/${pass.shader}.frag`)) {
+          // 颜色类物性（eagleflag 的 `{schemecolor:color1, flagcolor1:color2, flagcolor2:color3}`）
+          // 由 registerMaterialDoc 的 applyUserShaderValues 统一注入 —— 材质文档一读进来
+          // 就处理了，与本条挂载门无关（F42 只修「挂不上」这一段）。
+          // [we-scene patch 2026-10-03] **引擎内置 shader 不再被「包内有没有」挡掉**（F42）：
+          // WE 自带 shader（`flag` 等）本就不进 pkg，此前 `pkg.getEntry` 为 null ⇒ 整条材质
+          // 条目从不建，图层退回「贴图直出」—— eagleflag 的通道图（r/g/b = 三个颜色权重）
+          // 被当反照率画出来，就是荧光绿/品红一片。现在：包内有 OR 本仓内置表里有 → 挂。
+          if (pass?.shader && (pkg.getEntry(parsedPkg, `shaders/${pass.shader}.frag`) || WE_BUILTIN_SHADERS[`${pass.shader}.frag`])) {
             eff.attachLayerMaterialEffect(layer, pass);
           }
           // [we-scene patch] `generic4` 材质的 color/alpha/brightness 常量：官方该 shader 里
