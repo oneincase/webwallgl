@@ -384,6 +384,16 @@ export function clampCompositeFboSize(swRaw, shRaw, maxTex) {
  * 软边取材质默认 8 / 3 / 0.5。strength ≤ 0.001 时 WE 原 shader 全部分支直通
  * （light_map/blur 输出 0、apply 直通场景），等价于无 bloom —— 调用方据此跳过。
  *
+ * ⛔ **HDR 家族（metric=1）的分支是「冻结」的，禁止再动**（用户指令，2026-10-03）：
+ * 2026-10-03 曾按官方素材把 HDR 家族换成 `hdr_downsample`/`combine_hdr` 的 **fp16 金字塔链**
+ * （提交 c936db5），实机验证显示**改坏了 HDR 壁纸**，随后整条回滚（提交 f147d8a）。结论：
+ * HDR 家族**保持本文件这套 SDR 等效校准**（raw sRGB 亮度 + smoothstep 软窗口 + strength 双乘），
+ * 它是当年对 4 张 HDR 壁纸实测对齐的既有口径，也是本仓对 HDR 壁纸的**验收基线**。
+ * 官方那条链（含 `bloomhdriterations` 当层数、`bloomhdrfeather` 当 knee 的读法）在 3299228616
+ * 上能对上官方 preview，但整体观感与既有基线冲突（例如 2927608774 过曝、暗部被抬起来）；
+ * 除非有**官方运行时同属性出帧**做定标，否则不要重开这件事 —— 判据（verify-bloom）锁的
+ * 就是这套口径，改它等于改验收基线。
+ *
  * **亮度判定口径（metric）**：
  * 经典家族（metric=0）= WE 引擎 `downsample_quarter_bloom` 原样——
  * `albedo × saturate(max(r,g,b) − threshold)` 软拐点（只留超阈能量，亮场景

@@ -263,7 +263,9 @@ uniform float u_Alpha;
 uniform float u_Strength;
 uniform float u_Threshold;
 // 0 = 经典家族（WE 引擎 downsample_quarter_bloom 逐行转写）
-// 1 = HDR 家族（bloomhdr*）的 SDR 等效判定，见 renderer.js bloomPostParams 注释
+// 1 = HDR 家族（bloomhdr*）的 SDR 等效判定，见 renderer.js bloomPostParams 注释。
+// ⛔ 这个分支是**冻结**的：2026-10-03 换成官方 fp16 金字塔链（c936db5）后改坏了 HDR 壁纸，
+// 已整条回滚（f147d8a）；用户指令「以后禁止再动」。viate verify-bloom 锁着口径。
 uniform int u_Metric;
 out vec4 fragColor;
 void main() {
