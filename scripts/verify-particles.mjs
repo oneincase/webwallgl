@@ -1645,6 +1645,105 @@ function runParticleRotation3D() {
   } else {
     console.log(`  · 粒子模型 ${models} 个，其中带 x/y 旋转 ${withXY} 个`);
   }
+
+  // ⑥ colorrandom：三个分量**各自独立**取随机（官方 VecRandom 语义）。
+  //    此前三分量共用同一个 t：`min=(0,0,0) max=(255,255,255)` 这种整色域随机直接
+  //    退化成**灰阶**（r=g=b），区间逐通道不同的系统更是整条错 —— 症状就是
+  //    shimmering_particles「只有黑白」（官方 preview 是花色光斑）。
+  //    官方语义：引擎 `VecRandom` 逐分量 `min[c] + rand()*(max[c]-min[c])`；参考实现
+  //    linux-wallpaperengine 的 particle_spawner.cpp 里 colorrandom 就是逐分量循环。
+  {
+    const live = (model) => {
+      const ps = mk(model);
+      for (let i = 0; i < 90; i++) ps.advance(1 / 60);
+      return ps.pool.filter((p) => p.alive);
+    };
+    const base = {
+      maxcount: 200,
+      flags: 0,
+      emitter: [{ name: "boxrandom", rate: 200, distancemax: "0 0 0" }],
+      initializer: [
+        { name: "lifetimerandom", min: 3, max: 3 },
+        { name: "sizerandom", min: 20, max: 20 },
+      ],
+    };
+    // 全色域随机：灰阶占比必须很低（旧实现 100% 灰）
+    const full = live({ ...base, initializer: [...base.initializer, { name: "colorrandom", min: "0 0 0", max: "255 255 255" }] });
+    const gray = full.filter((p) => Math.abs(p.r - p.g) < 0.01 && Math.abs(p.g - p.b) < 0.01).length;
+    if (full.length < 50) errors.push(`colorrandom 判据样本不足（${full.length} 颗）`);
+    else if (gray > full.length * 0.05) {
+      errors.push(`colorrandom 三分量必须是独立随机：${gray}/${full.length} 颗退化成灰阶（r=g=b）`);
+    }
+    // 逐通道区间不同：每个分量都要落在**自己**的区间里（共用 t 会把 g/b 压到 r 的取值上）
+    const rng = live({
+      ...base,
+      initializer: [...base.initializer, { name: "colorrandom", min: "220 40 10", max: "255 90 60" }],
+    });
+    const offRange = rng.filter(
+      (p) =>
+        p.r < 220 / 255 - 1e-6 ||
+        p.r > 255 / 255 + 1e-6 ||
+        p.g < 40 / 255 - 1e-6 ||
+        p.g > 90 / 255 + 1e-6 ||
+        p.b < 10 / 255 - 1e-6 ||
+        p.b > 60 / 255 + 1e-6,
+    ).length;
+    if (offRange > 0) errors.push(`colorrandom 有 ${offRange}/${rng.length} 颗分量越出各自区间`);
+    // 常量区间（min==max）仍必须是常量，不能被独立随机改掉
+    const constColor = live({
+      ...base,
+      initializer: [...base.initializer, { name: "colorrandom", min: "12 34 56", max: "12 34 56" }],
+    });
+    const bad = constColor.filter(
+      (p) => Math.abs(p.r - 12 / 255) > 1e-6 || Math.abs(p.g - 34 / 255) > 1e-6 || Math.abs(p.b - 56 / 255) > 1e-6,
+    ).length;
+    if (bad > 0) errors.push(`colorrandom min==max 时必须恒为常量：${bad}/${constColor.length} 颗偏离`);
+  }
+  // 真实语料：本库确有「三分量区间互不相同」的 colorrandom（判据非空转）
+  {
+    let cr = 0;
+    let perChannel = 0;
+    for (const id of fs.readdirSync(LIB)) {
+      const pkgPath = join(LIB, id, "scene.pkg");
+      if (!fs.existsSync(pkgPath)) continue;
+      let pkg;
+      try {
+        pkg = parsePkg(fs.readFileSync(pkgPath));
+      } catch {
+        continue;
+      }
+      for (const e of pkg.entries) {
+        if (!/^particles\/.*\.json$/i.test(e.name)) continue;
+        let j;
+        try {
+          j = JSON.parse(new TextDecoder().decode(getEntry(pkg, e.name)));
+        } catch {
+          continue;
+        }
+        const scan = (node) => {
+          if (!node || typeof node !== "object") return;
+          if (Array.isArray(node)) {
+            for (const v of node) scan(v);
+            return;
+          }
+          for (const z of node.initializer || []) {
+            if (!z || z.name !== "colorrandom") continue;
+            cr++;
+            const mn = String(z.min || "").trim().split(/\s+/).map(Number);
+            const mx = String(z.max || "").trim().split(/\s+/).map(Number);
+            if (mn.length === 3 && mx.length === 3 && (mn[1] - mn[0] !== mx[1] - mx[0] || mn[2] - mn[0] !== mx[2] - mx[0])) perChannel++;
+          }
+          for (const k of Object.keys(node)) if (k === "children") scan(node[k]);
+        };
+        scan(j);
+      }
+    }
+    if (!(perChannel >= 300)) {
+      errors.push(`本库应有 ≥300 处「三分量区间不同」的 colorrandom（实测 ${perChannel}/${cr}）—— 判据可能空转`);
+    } else {
+      console.log(`  · colorrandom ${cr} 处，其中三分量区间互不相同 ${perChannel} 处`);
+    }
+  }
   return { errors };
 }
 

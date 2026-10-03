@@ -400,6 +400,30 @@ function collectShaderJobs(pkg) {
     seen.add(key);
     jobs.push({ shader: mp.shader, combos: mp.combos || {}, effect: model.material });
   }
+  // 粒子材质的 shader（F44）：`objects[].particle → 粒子 JSON → material → passes[0].shader`。
+  // 作者的粒子 shader（官方内置 shimmering_particles 的 `particle`）此前完全不进扫描 ——
+  // 它的 `common_particles.h` 里 `mul(mat3,mat3)` 会被转译器**原样漏进 GLSL**
+  // （转译器只改写 mul(vec, mat)），而本文件就是唯一能逮住这类残留的判据。
+  for (const o of sj.objects || []) {
+    if (!o || typeof o.particle !== "string") continue;
+    const pj = getEntry(pkg, o.particle) ? JSON.parse(readText(getEntry(pkg, o.particle))) : null;
+    if (!pj || typeof pj.material !== "string") continue;
+    const matEntry = getEntry(pkg, pj.material);
+    if (!matEntry) continue;
+    let mj;
+    try { mj = JSON.parse(readText(matEntry)); } catch { continue; }
+    const mp = (mj.passes && mj.passes[0]) || {};
+    // 引擎族（genericparticle 等）由 render/particle-shaders.js 原生实现，不进转译扫描
+    if (
+      !mp.shader ||
+      /^generic/i.test(mp.shader) ||
+      (!getEntry(pkg, `shaders/${mp.shader}.frag`) && !WE_BUILTIN_SHADERS[`${mp.shader}.frag`])
+    ) continue;
+    const key = "particle:" + mp.shader + "|" + JSON.stringify(mp.combos || {});
+    if (seen.has(key)) continue;
+    seen.add(key);
+    jobs.push({ shader: mp.shader, combos: mp.combos || {}, effect: pj.material });
+  }
   return jobs;
 }
 
@@ -633,6 +657,29 @@ const wireErrors = [];
       const jobs = pkg ? collectShaderJobs(pkg) : [];
       if (!jobs.some((j) => j.shader === "flag")) {
         wireErrors.push("eagleflag 的 flag shader 必须进入 shader 扫描（内置 shader 漏收 → 判据空转）");
+      }
+    }
+  }
+  // ---- F44：粒子材质自带 shader（作者写的 `shaders/particle.*`）----
+  // ① 宿主必须把粒子材质的 shader 接上（不接 = 作者的颜色/形变逻辑整条丢掉，
+  //    shimmering_particles 的「每颗颜色 = mix(color1,color2,随机)」就是这么丢的）；
+  // ② 渲染侧必须有那条材质路径与内置路径的回落；
+  // ③ 非空转：本机库里的 shimmering_particles 必须真的收到 `particle` 这个作业。
+  {
+    const pSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/particles.js"), "utf8");
+    if (!/ps\.setMaterialShader\(/.test(mountSrc)) {
+      wireErrors.push("scene-mount.ts 未把粒子材质的 shader 接线（setMaterialShader 缺失，F44）");
+    }
+    if (!/_renderMaterialShader\(/.test(pSrc) || !/_pollMaterialShader\(/.test(pSrc)) {
+      wireErrors.push("particles.js 缺粒子材质 shader 的渲染/编译路径（F44）");
+    }
+    const p = join(LIB, "shimmering_particles", "scene.pkg");
+    if (fs.existsSync(p)) {
+      let pkg = null;
+      try { pkg = parsePkg(fs.readFileSync(p)); } catch { pkg = null; }
+      const jobs = pkg ? collectShaderJobs(pkg) : [];
+      if (!jobs.some((j) => j.shader === "particle")) {
+        wireErrors.push("shimmering_particles 的粒子材质 shader 必须进入 shader 扫描（未收 → 判据空转）");
       }
     }
   }
