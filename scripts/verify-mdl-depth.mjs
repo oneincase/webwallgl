@@ -244,6 +244,75 @@ const names = (calls) => calls.map((c) => c.name);
   }
 }
 
+// ───────────────── ⑦ 子网格顺序：声明不透明的先画（F50） ─────────────────
+//
+// 3477054430 的树卡片（贴图 65% 像素 alpha=0、材质**没声明** blending）在文件序里排在
+// 楼房（声明 `blending: normal`）之前，它的透明像素写进深度 ⇒ 后画的楼房整片被拒
+// ⇒ 每棵树四周一个黑方块。修法：真 3D 模型内按「声明了 normal 的先画、其余后画」排。
+// 这里用记录型假 GL 直接看**两次 drawElements 的先后**（不是看源码文本）。
+{
+  const gl = makeMockGL();
+  const r = createMDLRenderer(gl);
+  const m0 = fakeMesh(); m0.indexCount = 3;
+  const m1 = fakeMesh(); m1.indexCount = 6;
+  const multi = { ...fakeMDL(), meshes: [m0, m1] };
+  // mesh0 = 未声明（树），mesh1 = normal（楼房）⇒ 期望先画 6 后画 3
+  gl.__log.length = 0;
+  r.draw(MVP, multi, { keepZ: true, meshBlending: [null, "normal"] }, null);
+  const seq = gl.__log.filter((c) => c.name === "drawElements").map((c) => c.args[1]);
+  check(seq.length === 2, `多子网格画了两次（实测 ${seq.length}）`);
+  check(seq[0] === 6 && seq[1] === 3,
+    `未按「声明不透明的先画」排序：实测顺序 ${JSON.stringify(seq)}（应为 [6,3] —— 3477054430 的楼房必须先于树卡片）`);
+
+  // 两类同类时不重排（文件序）
+  gl.__log.length = 0;
+  r.draw(MVP, multi, { keepZ: true, meshBlending: [null, null] }, null);
+  const seq2 = gl.__log.filter((c) => c.name === "drawElements").map((c) => c.args[1]);
+  check(JSON.stringify(seq2) === JSON.stringify([3, 6]),
+    `同类网格不该重排：实测 ${JSON.stringify(seq2)}（应为文件序 [3,6]）`);
+
+  // 2D（keepZ:false）不重排：没有深度测试，绘制顺序就是合成顺序
+  gl.__log.length = 0;
+  r.draw(MVP, multi, { meshBlending: [null, "normal"] }, null);
+  const seq3 = gl.__log.filter((c) => c.name === "drawElements").map((c) => c.args[1]);
+  check(JSON.stringify(seq3) === JSON.stringify([3, 6]),
+    `2D 场景（keepZ:false）不该重排子网格：实测 ${JSON.stringify(seq3)}（顺序即合成顺序）`);
+}
+
+// ───────────────── ⑧ 全透明像素不是遮挡物：着色器里必须真的 discard（F50） ─────────────────
+{
+  // 去注释再断言：把 discard 注释掉（本仓排查时的常见手法）必须照样转红
+  const msrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8").replace(/\/\/[^\n]*/g, "");
+  check(/if \(t\.a \* u_color\.a < 0\.004\) discard;/.test(msrc),
+    "模型片元着色器没有丢弃全透明像素：alpha=0 的卡片留白仍会写深度，把身后几何拒成黑块（F50）");
+  check(/function meshDrawOrder/.test(msrc), "缺少 meshDrawOrder（F50 排序实现）");
+  check(/opts\.keepZ \? meshDrawOrder\(list, opts\.meshBlending\) : null/.test(msrc),
+    "排序没有按 keepZ 门控（2D 场景会被重排，绘制顺序即合成顺序）");
+}
+
+// ───────────────── ⑨ 接线：宿主必须把两个字段**转发进真渲染调用**（F49/F50 的断点） ─────────────────
+//
+// 踩过的坑：renderer 侧把 `skybox`/`meshBlending` 塞进 puppetDrawFn 的 opts，但真正调
+// `mdlRenderer.draw` 的是 scene-mount 的 setPuppetRenderer 回调，它按字段挑着转发 ——
+// 漏一行 = 规则在实机上从未生效（F49 的天空盒护栏就这么被吞掉的，而只断言两侧源码文本的
+// 判据全绿）。所以这里把断言**钉在回调体内**（setPuppetRenderer 到 "puppet: ${mdlItems.length}"）。
+{
+  const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const cbAt = hostSrc.indexOf("renderer.setPuppetRenderer(");
+  const cbEnd = hostSrc.indexOf("puppet: ${mdlItems.length}", cbAt);
+  const cb = cbAt >= 0 && cbEnd > cbAt ? hostSrc.slice(cbAt, cbEnd) : "";
+  check(cb.length > 0, "找得到 setPuppetRenderer 回调体（F49/F50 接线断言的范围）");
+  check(/meshBlending:\s*\(layer as any\)\.meshBlending \|\| null/.test(cb),
+    "setPuppetRenderer 回调没有转发 meshBlending：F50 排序在实机上不生效（渲染侧收到 undefined）");
+  check(/skybox:\s*!!layer\.isSkybox/.test(cb),
+    "setPuppetRenderer 回调没有转发 skybox：F49 天空盒护栏在实机上不生效（曾被漏掉一轮）");
+  check(/\(layer as any\)\.meshBlending = meshBlend/.test(hostSrc),
+    "宿主没有把逐网格 blending 挂到图层上（meshBlending 表缺来源）");
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  check(/meshBlending:\s*layer\.meshBlending \|\| null/.test(rsrc),
+    "renderer 没把 layer.meshBlending 传进 puppetDrawFn opts（F50 断点之一）");
+}
+
 console.log(
   errors.length === 0
     ? "verify-mdl-depth: 全部通过 ✓"

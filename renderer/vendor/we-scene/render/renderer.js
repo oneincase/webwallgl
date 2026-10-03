@@ -3305,6 +3305,10 @@ export function createRenderer(canvas, opts = {}) {
       // [we-scene patch 2026-10-04] 天空盒：帧内深度共享后（F49），它的近侧壳会把
       // 场内所有模型拒掉 —— 交给绘制方按「只测不写」画（与 F40 材质路径同一规则）。
       skybox: !!layer.isSkybox,
+      // [we-scene patch 2026-10-04] 逐子网格 blending（F50）：多子网格 3D 模型按
+      // 「显式声明不透明的先画、其余后画」排序 —— 树卡片这类 alpha 网格要排在它身后的
+      // 楼房之后，透明像素才不会把楼房写没（3477054430「树图层黑色方块」）。
+      meshBlending: layer.meshBlending || null,
     })
     // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
     // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——

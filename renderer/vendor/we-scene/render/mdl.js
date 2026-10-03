@@ -128,6 +128,20 @@ uniform float u_lightOn;
 out vec4 fragColor;
 void main() {
   vec4 t = texture(u_tex, v_uv);
+  // [we-scene patch 2026-10-04] **全透明的像素不是遮挡物**（F50）。
+  //
+  // 3477054430（Cat with headphones on the roof）的树是「卡片网格」：贴图 65% 的像素
+  // alpha=0（树冠四周的画布留白），而树卡片在层序上排在楼房网格**之前**。alpha=0 的像素
+  // 颜色贡献本来就是 0（SRC_ALPHA 混合下），但它们照写深度 ⇒ 后画的楼房整片被 LEQUAL
+  // 拒掉，画面上就是「每棵树四周一个黑方块」（用户报「树图层黑色方块」）。实测定界：
+  // 把该网格贴图换成纯透明洋红 1×1，区域里洋红 0%、黑洞反而更大 —— 证明颜色走的是
+  // 混合、深度照写。
+  //
+  // 只在**完全**透明（含图层 alpha）时 discard：实心/半透明边缘照旧写深度，所以
+  // 猫与城市之间的层间遮挡（F49）不受影响，作者画的柔边也保留。官方 generic4.frag
+  // 的 ALPHATOCOVERAGE 分支做的是同一件事（阈值 0.5 + fwidth 抗锯齿），我们取更保守的
+  // 阈值以免把柔边整圈削成硬边（官方那条留给 ALPHATOCOVERAGE combo 真正接上时再用）。
+  if (t.a * u_color.a < 0.004) discard;
   vec3 mul = vec3(1.0);
   if (u_lightOn > 0.5) {
     vec3 n = normalize(v_wnormal);
@@ -595,6 +609,30 @@ export function createMDLRenderer(gl) {
   }
   const meshListOf = (mdl) => (mdl.meshes && mdl.meshes.length > 1 ? mdl.meshes : null)
 
+  // [we-scene patch 2026-10-04] **子网格绘制顺序：显式不透明的先画**（F50）。
+  //
+  // `blendings[i]` 是宿主按第 i 个子网格的材质读出的 `passes[0].blending`（字符串或 null）。
+  // 只有显式 `normal` 才算「声明了不透明」；`translucent`/`additive`/`alphatocoverage` 与
+  // **未声明**都排到后面（未声明 = 未知，按可能透明保守处理）。同类内保持文件序。
+  // 返回 null 表示「无需重排」（单网格、缺排序表、或两类都空/只有一类）——
+  // 调用方这时走原下标，逐位等价。
+  // 判据：`verify-mdl-depth` 的 F50 节（顺序 + 接线 + 未给表时不重排）。
+  function meshDrawOrder(list, blendings) {
+    if (!list || list.length < 2 || !blendings || !blendings.length) return null
+    const isDeclaredOpaque = (i) => {
+      const b = blendings[i]
+      return typeof b === 'string' && b.toLowerCase() === 'normal'
+    }
+    const head = []
+    const tail = []
+    for (let i = 0; i < list.length; i++) (isDeclaredOpaque(i) ? head : tail).push(i)
+    if (head.length === 0 || tail.length === 0) return null // 全同类：保持文件序
+    const order = head.concat(tail)
+    // 顺序与文件序一致时不返回（避免无谓的分支差异）
+    for (let i = 0; i < order.length; i++) if (order[i] !== i) return order
+    return null
+  }
+
   return {
     gl,
     prog,
@@ -701,6 +739,19 @@ export function createMDLRenderer(gl) {
       const list = meshListOf(mdl)
       const legacyMesh = list ? null : legacyMeshOf(mdl)
       const n = list ? list.length : 1
+      // [we-scene patch 2026-10-04] **子网格绘制顺序：显式不透明的先画**（F50）。
+      //
+      // 3477054430 的城模型：mesh0 = 树（贴图 65% 像素 alpha=0 的卡片网格，材质**没声明**
+      // blending），mesh1 = 楼房（材质声明 `blending: normal`）。文件序把树排在前面，树的
+      // 透明像素写进深度 ⇒ 随后画的楼房整片被 LEQUAL 拒掉 ⇒ 每棵树四周一个黑方块
+      // （用户报「树图层黑色方块」）。官方引擎的规则是先不透明、后透明（透明网格必须能
+      // 混合到它身后的背景上），所以这里按材质声明排序：`normal` = 不透明先画，
+      // 其余（translucent/additive/alphatocoverage/**未声明**）后画；同类内保持文件序（稳定）。
+      // 未声明按「可能透明」排后面是保守选择：排序只影响先后，遮挡仍由深度测试裁决（F49）。
+      // 只在**真 3D（keepZ）**重排：2D 场景（含 2D 场景里的 model 层）没有深度测试，
+      // 绘制顺序就是合成顺序（后画的盖先画的），重排会改观感。深度测试只在透视场景开
+      // （见下一条），所以「透明网格排在身后几何之后」这条规则也只在那里成立。
+      const order = opts.keepZ ? meshDrawOrder(list, opts.meshBlending) : null
       // [we-scene patch 2026-09-28] **真 3D 网格之间要开深度测试**。
       //
       // 为什么：一个 .mdl 的多个子网格是**同一个物体的不同部件**，它们相互遮挡靠的是
@@ -734,7 +785,9 @@ export function createMDLRenderer(gl) {
         gl.depthFunc(gl.LEQUAL)
         gl.depthMask(!opts.skybox)
       }
-      for (let gi = 0; gi < n; gi++) {
+      for (let k = 0; k < n; k++) {
+        // 绘制顺序由 meshDrawOrder 决定（F50）；单网格/未给排序表时 gi === k（逐位不变）。
+        const gi = order ? order[k] : k
         const mesh = list ? list[gi] : legacyMesh
         if (!mesh || !mesh.vertexCount || !mesh.indexCount) continue
         const m = ensureMesh(mesh)
@@ -742,7 +795,8 @@ export function createMDLRenderer(gl) {
         // 带法线且场景有光 → 走上光路径（片元里 N·L）；否则常量 1（逐位等价旧行为）
         gl.uniform1f(uni.lightOn, SL && m.hasNormals ? 1 : 0)
         // 每网格贴图：overrideTex（效果链输出）优先，其次该网格自己的材质贴图，
-        // 最后回落整层贴图（单网格模型走的就是这一条）。
+        // 最后回落整层贴图（单网格模型走的就是这一条）。索引必须用**原始** gi ——
+        // meshTextures 是按子网格下标填的，用重排后的 k 会把贴图错配给另一个网格。
         const per = opts.meshTextures && opts.meshTextures[gi]
         const src = opts.overrideTex || (per && per.glTex ? per.glTex : per) || identity
         gl.bindTexture(gl.TEXTURE_2D, src)

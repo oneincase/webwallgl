@@ -3889,11 +3889,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // Dome 与 Car 是官方内置里唯一的两个）。
           (layer as any).reflected = (layer as any).srcObject?.reflected === true;
           let texName: string | null = null;
+          // [we-scene patch 2026-10-04] mesh 0 的 blending（F50）：多子网格 3D 模型要按
+          // 「显式声明不透明（blending: normal）的先画」排序 —— 树卡片这类 alpha 网格必须
+          // 排在它身后的楼房**之后**，否则它的透明像素写进深度、把楼房整片拒掉
+          // （3477054430「树图层黑色方块」）。未声明 blending 的按「可能透明」处理、排后面。
+          let firstBlending: string | null = null;
           if (mdlObj.materialPath) {
             const matEntry = await readAsset(mdlObj.materialPath);
             if (matEntry) {
               const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
+              firstBlending = typeof pass0?.blending === "string" ? pass0.blending : null;
               const tex = pass0?.textures?.[0];
               if (typeof tex === "string" && tex) texName = tex;
               // [we-scene patch] 真 3D 网格材质的 LIGHTING combo（3509243656
@@ -3993,20 +3999,26 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             // 此前只按 mesh0 的材质建一个 meshMaterial：其余网格既用了错的槽贴图
             // （刀的法线/光照图贴到桌面上，桌面因此整片黑），也丢了 REFLECTION/DETAILINALPHA。
             const meshSpecs: any[] = [];
+            // [we-scene patch 2026-10-04] 逐网格 blending（F50 排序用）：mesh0 用层级那份，
+            // 其余按各自材质读；缺材质/缺字段一律 null = 「未声明」= 可能透明 → 排后面。
+            const meshBlend: (string | null)[] = [firstBlending];
             for (let mi = 0; mi < mdlObj.meshes.length; mi++) {
               const mesh = mdlObj.meshes[mi];
               const mp: string | null = mesh.materialPath;
               if (mi === 0 || !mp) {
                 meshSpecs.push((layer as any).meshMaterial || null);
+                if (mi > 0) meshBlend.push(null);
                 continue;
               }
               const matEntry = await readAsset(mp);
               if (!matEntry) {
                 meshSpecs.push(null);
+                meshBlend.push(null);
                 continue;
               }
               const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
+              meshBlend.push(typeof pass0?.blending === "string" ? pass0.blending : null);
               let spec: any = null;
               if (pass0 && typeof pass0.shader === "string" && eff.canUseMaterialMeshPath(pass0.shader)) {
                 spec = {
@@ -4063,6 +4075,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             }
             (layer as any).meshTextures = meshTex;
             (layer as any).meshMaterials = meshSpecs;
+            (layer as any).meshBlending = meshBlend;
           }
           layer.puppet = mdlObj;
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
@@ -4149,6 +4162,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // [we-scene patch 2026-09-28] 逐子网格贴图（见挂载里 model 分支）。
                 // 缺席时 mdl 渲染器逐网格回落到整层贴图，单网格模型行为不变。
                 meshTextures: (layer as any).meshTextures || null,
+                // [we-scene patch 2026-10-04] 逐子网格 blending（F50 排序用）与天空盒标记（F49）。
+                // **这两个字段必须在这里透传**：renderer 那侧虽然把 `skybox`/`meshBlending`
+                // 塞进了 puppetDrawFn 的 opts，但真正调 `mdlRenderer.draw` 的是本回调、
+                // 它按字段挑着转发 —— 漏一行就等于那条规则在实机上从未生效（F49 的天空盒
+                // 护栏就是这么被吞掉的：verify-mdl-depth 断言的是两侧的源码文本，
+                // 抓不到这中间的转发断点）。接线断言见 verify-mdl-depth 的 F50 节。
+                meshBlending: (layer as any).meshBlending || null,
+                skybox: !!layer.isSkybox,
                 // [we-scene patch 2026-09-28] 场景光照 + 法线矩阵（只在网格带法线时生效）。
                 sceneLight: sceneLight && layersHaveNormals(layer) ? sceneLight : null,
                 normalMat: (() => {
