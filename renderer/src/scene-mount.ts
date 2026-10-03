@@ -3263,9 +3263,32 @@ cfg, source, pkgAbort.signal);
           if (matEntry) {
             const mat = readMaterialDoc(matEntry);
             ps.setMaterial(mat);
-            const slots = mat?.passes?.[0]?.textures || [];
+            const pass0 = mat?.passes?.[0];
+            const slots = pass0?.textures || [];
             texName = slots[0] || null;
             texName1 = slots[1] || null;
+            // [we-scene patch 2026-10-03] **粒子材质自己的 shader**（F44）：作者在 pkg 里
+            // 写了 `shaders/<名>.frag|.vert` 时，WE 用它画粒子（引擎按 common_particles.h
+            // 的顶点约定喂属性）。不接的话作者的颜色/形变逻辑整条丢掉 —— 官方内置
+            // shimmering_particles 的「每颗颜色 = mix(color1, color2, 随机)」只在那个
+            // shader 里，丢了就只剩内置精灵程序的随机色（用户报的「只有黑白」）。
+            // 引擎族（genericparticle 等）排除：它们由 render/particle-shaders.js 原生实现。
+            if (
+              pass0 &&
+              typeof pass0.shader === "string" &&
+              pass0.shader &&
+              eff.canUseMaterialMeshPath(pass0.shader) &&
+              pkg.getEntry(parsedPkg, `shaders/${pass0.shader}.frag`) &&
+              pkg.getEntry(parsedPkg, `shaders/${pass0.shader}.vert`)
+            ) {
+              const pShader = pass0.shader;
+              const pCombos = pass0.combos || {};
+              const pConstants = pass0.constantshadervalues || {};
+              ps.setMaterialShader(
+                () => renderer.getEffectProgram(pShader, pCombos, {}),
+                { name: pShader, constants: pConstants },
+              );
+            }
           }
         }
         // 材质缺失或未声明贴图时，用通用光晕兜底（宁可近似也不整层消失）

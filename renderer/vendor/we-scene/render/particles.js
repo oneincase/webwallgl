@@ -76,6 +76,66 @@ export function particlePassRefract(mat) {
   return !!(c && Number(c.REFRACT) === 1)
 }
 
+// ---- 粒子材质 shader（F44）用的小工具 ----
+
+const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+
+/** 列主元 16 float 矩阵转置（HLSL 行向量约定要转置上传，见 F22） */
+function mat4Transpose(m) {
+  if (!m || m.length < 16) return IDENTITY4
+  return new Float32Array([
+    m[0], m[4], m[8], m[12],
+    m[1], m[5], m[9], m[13],
+    m[2], m[6], m[10], m[14],
+    m[3], m[7], m[11], m[15],
+  ])
+}
+
+/**
+ * 材质常量 → uniform（material 名经 shader 注释里的 `{"material":"名"}` 映射）。
+ *
+ * 与效果链（renderer.js 的 bindConstants）同语义：先按材质名设作者给的值
+ * （含宿主注入的 `{user}` 包装，如 `color1 ← schemecolor`），再给未提供的常量补
+ * 注释里声明的 default —— 否则作者没写的槽停在 GL 默认的 0，颜色直接变黑。
+ */
+function bindParticleMaterialConstants(gl, entry, constants) {
+  const meta = (entry && entry.matMeta) || {}
+  const uni = (entry && entry.uni) || null
+  if (!uni) return
+  const lower = new Map()
+  for (const [k, v] of Object.entries(meta)) lower.set(k.toLowerCase(), v)
+  const setOne = (name, value) => {
+    const u = uni.get(name)
+    if (!u || u.loc === null || u.loc === undefined) return false
+    const raw = value && typeof value === 'object' && 'value' in value ? value.value : value
+    const arr = String(raw == null ? '' : raw)
+      .trim()
+      .split(/\s+/)
+      .map(Number)
+    if (!arr.length || arr.some((x) => !Number.isFinite(x))) return false
+    switch (u.type) {
+      case 'float': gl.uniform1f(u.loc, arr[0]); break
+      case 'int':
+      case 'bool': gl.uniform1i(u.loc, Math.round(arr[0])); break
+      case 'vec2': gl.uniform2f(u.loc, arr[0], arr[1]); break
+      case 'vec3': gl.uniform3f(u.loc, arr[0], arr[1], arr[2]); break
+      case 'vec4': gl.uniform4f(u.loc, arr[0], arr[1], arr[2], arr[3]); break
+      default: return false
+    }
+    return true
+  }
+  const provided = new Set()
+  for (const [key, value] of Object.entries(constants || {})) {
+    const m = meta[key] || lower.get(String(key).toLowerCase())
+    if (!m) continue
+    if (setOne(m.uniform, value)) provided.add(String(key).toLowerCase())
+  }
+  for (const [matKey, m] of Object.entries(meta)) {
+    if (provided.has(matKey.toLowerCase())) continue
+    if (m.default !== undefined) setOne(m.uniform, m.default)
+  }
+}
+
 /**
  * 贴图是否是 REFRACT 用的空白白占位（每像素 rgb≈255 且 a≈255）。
  * 2464842912 Raindrops Splatter Small 的 `particles 256x1280 blank` 就是这种：
@@ -235,6 +295,16 @@ export class ParticleSystem {
     this._vao = null
     this._data = null
     this._sceneTex = null
+    // [we-scene patch 2026-10-03] 粒子**材质 shader**（F44）：作者在粒子材质里写自己的
+    // shader 时（pkg 内 `shaders/<名>.frag|.vert` 成对存在），用它的着色器画粒子，
+    // 而不是内置精灵程序 —— WE 就是这么做的，而作者逻辑（例如 shimmering_particles 的
+    // 「每颗颜色 = mix(color1, color2, 随机)」）只在那个 shader 里，丢掉它颜色整条不对。
+    // 程序由宿主提供（它拿得到 shaderResolver/pkg）；首帧异步编译，未就绪先用内置路径画。
+    this.matShader = null
+    this._matEntry = undefined // undefined=未请求 / null=失败 / 对象=就绪
+    this._matVao = null
+    this._matVbuf = null
+    this._matData = null
     // [we-scene patch] 序列帧**帧间交叉淡入**：官方在 animationmode==SEQUENCE 且
     // 模型 flags 的 `spritenoframeblending`(bit1=2) 未置位时开启 SPRITESHEETBLEND
     // （SceneCompiler.cpp:4535），frag 里 `mix(frame, nextFrame, frac(lifetime*numFrames))`。
@@ -866,6 +936,49 @@ export class ParticleSystem {
     this.overbright = rawOb == null || !Number.isFinite(ob) ? 1 : Math.max(0, ob)
   }
 
+  /**
+   * [we-scene patch 2026-10-03] **粒子材质自己的 shader**（F44）。
+   *
+   * WE 的粒子材质可以写任意 shader（`materials/x.json` 的 `passes[0].shader`，源在
+   * pkg 的 `shaders/<名>.frag|.vert`），引擎按 `common_particles.h` 那套顶点约定喂它：
+   * a_Position = 粒子中心、a_TexCoordVec4 = (角点 uv.xy, rot.z, size)、a_TexCoordC2 =
+   * (rot.x, rot.y)、a_Color = 粒子色。作者的颜色/形变逻辑都写在里面 —— 官方内置
+   * shimmering_particles 的 `try { v_Color.rgb = mix(g_Color1, g_Color2, rand) }` 就是
+   * 唯一决定颜色的地方，不跑它就只剩内置精灵程序的白/随机色（用户报的「只有黑白」）。
+   *
+   * `load` 由宿主提供（只有它拿得到 pkg 与 shaderResolver）：返回 `getEffectProgram`
+   * 的条目 `{prog, uni, matMeta, ...}`。首帧异步、失败永久回落内置精灵路径。
+   */
+  setMaterialShader(load, opts) {
+    if (typeof load !== 'function') return
+    const o = opts || {}
+    this.matShader = {
+      name: typeof o.name === 'string' ? o.name : '',
+      constants: o.constants || {},
+      load,
+    }
+    this._matEntry = undefined
+  }
+
+  /** 同步一次材质 shader 的编译状态；返回就绪的条目或 null（未就绪/失败按内置路径画） */
+  _pollMaterialShader() {
+    const ms = this.matShader
+    if (!ms) return null
+    if (this._matEntry === undefined) {
+      this._matEntry = null // 先占位，避免每帧重复发起
+      Promise.resolve()
+        .then(() => ms.load())
+        .then((e) => {
+          this._matEntry = e || null
+        })
+        .catch(() => {
+          this._matEntry = null
+        })
+      return null
+    }
+    return this._matEntry || null
+  }
+
   setNormalTexture(tex) {
     this.normalTex = tex || null
     // [we-scene patch] 法线通道布局（官方打包 vs 我们的生成器）：由贴图层判定后带过来，
@@ -1343,11 +1456,16 @@ export class ParticleSystem {
     if (I.color) {
       const mn = I.color.min
       const mx = I.color.max
-      // min/max 无序（实测大量 min>max），逐分量取区间
-      const t = Math.random()
-      p.baseR = (mn[0] + (mx[0] - mn[0]) * t) / 255
-      p.baseG = (mn[1] + (mx[1] - mn[1]) * t) / 255
-      p.baseB = (mn[2] + (mx[2] - mn[2]) * t) / 255
+      // min/max 无序（实测大量 min>max），逐分量取区间 —— **每个分量一个独立随机**。
+      // 官方语义（引擎 VecRandom：`for (c) color[c] = min[c] + rand()*(max[c]-min[c])`；
+      // 参考实现 linux-wallpaperengine particle_spawner.cpp 的 colorrandom 就是逐
+      // 分量循环）。此前三个分量共用同一个 t：`min=(0,0,0) max=(255,255,255)` 这种
+      // 「整色域随机」直接退化成**灰阶**（r=g=b），区间逐通道不同的 929 处更是全错 ——
+      // shimmering_particles（全库 1120 处 colorrandom）官方出图是粉/紫/橙/白的花色
+      // 光斑，我们是一整屏灰白光斑，用户报的「只有黑白」就是它。
+      p.baseR = (mn[0] + (mx[0] - mn[0]) * Math.random()) / 255
+      p.baseG = (mn[1] + (mx[1] - mn[1]) * Math.random()) / 255
+      p.baseB = (mn[2] + (mx[2] - mn[2]) * Math.random()) / 255
     } else {
       p.baseR = p.baseG = p.baseB = 1
     }
@@ -2066,6 +2184,125 @@ export class ParticleSystem {
 
 
   // viewProj：场景投影矩阵；projH 用于 y 翻转（世界 y 向下 → 投影空间）
+  /**
+   * [we-scene patch 2026-10-03] 用**粒子材质自己的 shader** 画（F44）。
+   *
+   * 顶点流按官方 `common_particles.h` 的约定：每颗粒子 6 个顶点（两个三角形，
+   * 角点 uv ∈ {0,1}²，`ComputeParticlePosition` 里减 0.5 展开成对称 quad），
+   * 每顶点 13 float：a_Position(3) + a_TexCoordVec4(4: uv.xy, rot.z, size) +
+   * a_Color(4) + a_TexCoordC2(2: rot.x, rot.y)。位置/尺寸/颜色与内置精灵路径**同源**
+   * （同一个 toWorld/sizePx/bright），所以两条路径的几何完全一致，差别只在着色。
+   *
+   * 矩阵要**转置上传**：官方 shader 写 `mul(vec4(p,1), g_ModelViewProjectionMatrix)`
+   * （HLSL 行向量），转译后是 `transpose(M) * p`（F22），喂 viewProj 的转置才等价。
+   * 返回值 false = 这一帧放弃材质路径（缺属性/缺程序），交给下面的内置路径。
+   */
+  _renderMaterialShader(gl, entry, viewProj, pool, toWorld, sizePx, bright) {
+    const prog = entry && entry.prog
+    if (!prog) return false
+    // 属性按名取位置（程序是通用效果程序构建器编的，不预设 location）
+    const locPos = gl.getAttribLocation(prog, 'a_Position')
+    const locUv = gl.getAttribLocation(prog, 'a_TexCoordVec4')
+    const locCol = gl.getAttribLocation(prog, 'a_Color')
+    const locRot = gl.getAttribLocation(prog, 'a_TexCoordC2')
+    if (locPos < 0 || locUv < 0) return false
+    let live = 0
+    for (let i = 0; i < pool.length; i++) if (pool[i].alive) live++
+    if (!live) return false
+    const STRIDE = 13 // float/顶点
+    const need = live * 6 * STRIDE
+    if (!this._matData || this._matData.length < need) this._matData = new Float32Array(Math.max(need, 4096))
+    const data = this._matData
+    let k = 0
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i]
+      if (!p.alive) continue
+      const c = toWorld(p.x, p.y)
+      // 官方几何把 `size` 当**半宽**用（引擎喂进顶点流的 `a_TexCoordVec4.w` 是
+      // `p.size * 0.5`，见本文件 render() 里「官方几何 size=p.size*0.5」那条注释与
+      // 内置精灵 shader 的 a_stretchFrame 标定）——直接喂 size 会让每个 quad 大一倍，
+      // 满屏粒子糊成一片（实测：整帧橙红一团、看不到独立光斑）。
+      const size = sizePx(p.size) * 0.5
+      const rz = p.rot || 0
+      const rx = p.rotX || 0
+      const ry = p.rotY || 0
+      const cr = p.r * bright
+      const cg = p.g * bright
+      const cb = p.b * bright
+      // 两个三角形：(0,0)-(1,0)-(0,1) 与 (1,0)-(1,1)-(0,1)
+      for (let v = 0; v < 6; v++) {
+        const u = v === 1 || v === 3 || v === 4 ? 1 : 0
+        const vv = v === 2 || v === 4 || v === 5 ? 1 : 0
+        data[k++] = c[0]
+        data[k++] = c[1]
+        data[k++] = 0
+        data[k++] = u
+        data[k++] = vv
+        data[k++] = rz
+        data[k++] = size
+        data[k++] = cr
+        data[k++] = cg
+        data[k++] = cb
+        data[k++] = p.alpha
+        data[k++] = rx
+        data[k++] = ry
+      }
+    }
+    if (!this._matVbuf) this._matVbuf = gl.createBuffer()
+    if (!this._matVao) this._matVao = gl.createVertexArray()
+    gl.bindVertexArray(this._matVao)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._matVbuf)
+    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, k), gl.DYNAMIC_DRAW)
+    const S = STRIDE * 4
+    gl.enableVertexAttribArray(locPos)
+    gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, S, 0)
+    gl.enableVertexAttribArray(locUv)
+    gl.vertexAttribPointer(locUv, 4, gl.FLOAT, false, S, 12)
+    if (locCol >= 0) {
+      gl.enableVertexAttribArray(locCol)
+      gl.vertexAttribPointer(locCol, 4, gl.FLOAT, false, S, 28)
+    }
+    if (locRot >= 0) {
+      gl.enableVertexAttribArray(locRot)
+      gl.vertexAttribPointer(locRot, 2, gl.FLOAT, false, S, 44)
+    }
+
+    bindParticleFrameTarget(gl)
+    gl.useProgram(prog)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.texture.glTex)
+    const set1i = (n, v) => {
+      const l = gl.getUniformLocation(prog, n)
+      if (l) gl.uniform1i(l, v)
+    }
+    set1i('g_Texture0', 0)
+    const uRes = gl.getUniformLocation(prog, 'g_Texture0Resolution')
+    if (uRes) {
+      const tw = this.texture.width || 1
+      const th = this.texture.height || 1
+      gl.uniform4f(uRes, tw, th, 1 / tw, 1 / th)
+    }
+    // 矩阵：官方 mul(v, M) 行向量 → 转译成 transpose(M)*v，故喂转置（见 F22）。
+    // g_ModelMatrix 只被 WORLDBLUR 用来取「世界 z」判模糊；我们的顶点位置已经是
+    // 投影空间世界坐标（图层变换已含），再乘图层矩阵会二次施加 ⇒ 给单位阵。
+    const uMvp = gl.getUniformLocation(prog, 'g_ModelViewProjectionMatrix')
+    if (uMvp) gl.uniformMatrix4fv(uMvp, false, mat4Transpose(viewProj))
+    const uModel = gl.getUniformLocation(prog, 'g_ModelMatrix')
+    if (uModel) gl.uniformMatrix4fv(uModel, false, IDENTITY4)
+    const uR0 = gl.getUniformLocation(prog, 'g_RenderVar0')
+    if (uR0) gl.uniform4f(uR0, 0, 0, 0, 0)
+    bindParticleMaterialConstants(gl, entry, (this.matShader && this.matShader.constants) || {})
+
+    gl.enable(gl.BLEND)
+    if (this.blend === 'additive') gl.blendFunc(gl.SRC_ALPHA, gl.ONE)
+    else gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+    gl.depthMask(false)
+    gl.drawArrays(gl.TRIANGLES, 0, live * 6)
+    gl.depthMask(true)
+    gl.bindVertexArray(null)
+    return true
+  }
+
   render(viewProj, width, height, projW, projH) {
     if (!this._ready || !this.visible) return
     if (!this.renderers.length) return
@@ -2124,6 +2361,17 @@ export class ParticleSystem {
       const px = lx * sx
       const py = ly * sy
       return [ox + px * cos - py * sin, projH - (oy + px * sin + py * cos)]
+    }
+
+    // [we-scene patch 2026-10-03] 粒子材质自带 shader 时走它（F44）：形变/颜色都由
+    // 作者 shader 决定（官方 shimmering_particles 的颜色就整条写在那儿）。程序未就绪
+    // 或编译失败时**照常走下面的内置精灵路径**，与模型材质的「首帧异步、失败永久回落」
+    // 同策略；rope/trail 渲染器不吃材质 shader（官方 THICKFORMAT 是另一套顶点约定）。
+    if (!rope && !trail && !spriteTrail) {
+      const matEntry = this._pollMaterialShader()
+      if (matEntry) {
+        if (this._renderMaterialShader(gl, matEntry, viewProj, pool, toWorld, sizePx, bright)) return
+      }
     }
 
     if (rope) {
@@ -2376,7 +2624,9 @@ export class ParticleSystem {
     try {
       if (this._vbuf) gl.deleteBuffer(this._vbuf)
       if (this._quadBuf) gl.deleteBuffer(this._quadBuf)
+      if (this._matVbuf) gl.deleteBuffer(this._matVbuf)
       if (this._vao) gl.deleteVertexArray(this._vao)
+      if (this._matVao) gl.deleteVertexArray(this._matVao)
       if (this._prog && this._prog.prog) gl.deleteProgram(this._prog.prog)
       if (this._sceneTex) gl.deleteTexture(this._sceneTex)
     } catch (e) {

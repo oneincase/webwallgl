@@ -522,4 +522,86 @@ void BuildTangentSpace(const mat3 modelTransform, const vec3 normal, const vec4 
     worldBitangent = mul(bitangent, modelTransform);
 }
 `,
+  // WE common_particles.h（重建子集）：**粒子材质 shader**（作者自己写的
+  // `shaders/particle.*`，如官方内置 shimmering_particles）要用的四个函数与 uniform。
+  // 引擎族 genericparticle 不走它（那份由 render/particle-shaders.js 原生实现）。
+  'common_particles.h': `// WE common_particles.h（重建子集：粒子材质 shader 用到的函数与声明）
+uniform mat4 g_ModelViewProjectionMatrix;
+uniform mat4 g_ModelMatrixInverse;
+
+uniform vec3 g_OrientationUp;
+uniform vec3 g_OrientationRight;
+uniform vec3 g_OrientationForward;
+
+uniform vec3 g_ViewUp;
+uniform vec3 g_ViewRight;
+uniform vec3 g_EyePosition;
+
+uniform vec4 g_RenderVar0;
+uniform vec4 g_RenderVar1;
+uniform vec4 g_Texture0Resolution;
+
+#if REFRACT
+uniform float g_RefractAmount; // {"material":"ui_editor_properties_refract_amount","default":0.05,"range":[-1,1]}
+#endif
+
+// 官方用 mat3(...) + mul(mul(Rz,Rx),Ry) 行向量合成；本仓转译器**只改写
+// mul(vec, mat)**，mul(mat,mat) 会原样漏进 GLSL（实测转译产物里留下裸 mul( → 编译失败），
+// 而 mat3(a,b,c) 构造子在 HLSL 填行、进 GLSL 填列（F37）。故这里按同一套旋转基
+// **显式展开成分量式**：right/up 取的就是内置精灵 shader（particle-shaders.js）里
+// 已按官方出图标定过的右/上轴，再补上 z 分量。改任何一项都要与那份实现同步。
+void ComputeParticleTangents(in vec3 rotation, out vec3 right, out vec3 up)
+{
+    float cz = cos(rotation.z), sz = sin(rotation.z);
+    float cx = cos(rotation.x), sx = sin(rotation.x);
+    float cy = cos(rotation.y), sy = sin(rotation.y);
+    right = vec3(cz * cy - sz * sx * sy, sz * cy + cz * sx * sy, -cx * sy);
+    up    = vec3(-sz * cx, cz * cx, sx);
+}
+
+void ComputeParticleTrailTangents(vec3 localPosition, vec3 localVelocity, out vec3 right, out vec3 up)
+{
+    vec3 eyeDirection = localPosition - mul(vec4(g_EyePosition, 1.0), g_ModelMatrixInverse).xyz;
+    right = cross(eyeDirection, localVelocity);
+    right = normalize(right);
+    float trailLength = length(localVelocity);
+    localVelocity /= trailLength;
+    up = localVelocity * max(g_RenderVar0.z, min(trailLength * g_RenderVar0.x, g_RenderVar0.y));
+}
+
+vec3 ComputeParticlePosition(vec2 uvs, float textureRatio, vec4 positionAndSize, vec3 right, vec3 up)
+{
+    return positionAndSize.xyz +
+        (positionAndSize.w * right * (uvs.x - 0.5) -
+        positionAndSize.w * up * (uvs.y - 0.5) * textureRatio);
+}
+
+void ComputeSpriteFrame(float lifetime, out vec4 uvs, out vec2 uvFrameSize, out float frameBlend)
+{
+    float numFrames = g_RenderVar1.z;
+    float frameWidth = g_RenderVar1.x;
+    float frameHeight = g_RenderVar1.y;
+
+    float currentFrame = floor(lifetime * numFrames);
+    float nextFrame = min(numFrames - 1.0, currentFrame + 1.0);
+    uvs.y = floor(currentFrame * frameWidth) * frameHeight;
+    uvs.x = frac(currentFrame * frameWidth);
+    uvs.w = floor(nextFrame * frameWidth) * frameHeight;
+    uvs.z = frac(nextFrame * frameWidth);
+    frameBlend = frac(lifetime * numFrames);
+    uvFrameSize = vec2(frameWidth, frameHeight);
+}
+
+void ComputeScreenRefractionTangents(in vec3 projectedPositionXYW, in vec3 right, in vec3 up, out vec3 v_ScreenCoord, out vec4 v_ScreenTangents)
+{
+    v_ScreenCoord = projectedPositionXYW;
+    right = normalize(right);
+    up = normalize(up);
+    v_ScreenTangents.xy = vec2(dot(right, g_ViewRight), dot(up, g_ViewRight));
+    v_ScreenTangents.zw = vec2(dot(right, g_ViewUp), dot(up, g_ViewUp));
+#if REFRACT
+    v_ScreenTangents *= g_RefractAmount;
+#endif
+}
+`,
 };
