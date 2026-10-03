@@ -262,40 +262,24 @@ uniform sampler2D u_Tex;
 uniform float u_Alpha;
 uniform float u_Strength;
 uniform float u_Threshold;
-// 0 = 经典家族（WE 引擎 downsample_quarter_bloom 逐行转写）
-// 1 = HDR 家族（bloomhdr*）的 SDR 等效判定，见 renderer.js bloomPostParams 注释
-uniform int u_Metric;
 out vec4 fragColor;
 void main() {
   vec3 lightMap = vec3(0.0);
   if (u_Strength > 0.001 && u_Alpha > 0.001) {
-    if (u_Metric == 0) {
-      // 引擎原文：4 抽头平均 → saturate(max 通道 - threshold) 软拐点
-      // → 饱和度 ×2（-grayscale*sat + albedo*(1+sat)，sat=1）→ ×strength（一次）。
-      // saturate 在 GLSL 不存在，clamp(x,0,1) 等价。
-      vec3 albedo = texture(u_Tex, v_TexCoord[0]).rgb +
-                    texture(u_Tex, v_TexCoord[1]).rgb +
-                    texture(u_Tex, v_TexCoord[2]).rgb +
-                    texture(u_Tex, v_TexCoord[3]).rgb;
-      albedo *= 0.25;
-      float scale = max(max(albedo.x, albedo.y), albedo.z);
-      albedo *= clamp(scale - u_Threshold, 0.0, 1.0);
-      float grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
-      albedo = -grayscale + albedo * 2.0;
-      lightMap = max(vec3(0.0), albedo * u_Strength);
-    } else {
-      // HDR 家族既有校准（2646504847）：raw sRGB 亮度 + 软窗口。
-      // strength 在此乘两次，补偿 blur 不再乘（与旧行为逐位一致）。
-      float weight = 0.0;
-      vec3 samplec;
-      for (int i = 0; i < 4; ++i) {
-        samplec = texture(u_Tex, v_TexCoord[i]).rgb;
-        float w = smoothstep(u_Threshold - 0.2, u_Threshold + 0.4, dot(samplec, vec3(0.2126, 0.7152, 0.0722)));
-        lightMap += samplec * w;
-        weight += w;
-      }
-      lightMap = lightMap * max(0.001, mix(weight, 1.0, v_Damp)) / 4.0 * u_Strength * u_Strength;
-    }
+    // 引擎原文：4 抽头平均 → saturate(max 通道 - threshold) 软拐点
+    // → 饱和度 ×2（-grayscale*sat + albedo*(1+sat)，sat=1）→ ×strength（一次）。
+    // saturate 在 GLSL 不存在，clamp(x,0,1) 等价。
+    // （HDR 家族不走这里：见本文件 HDR_BLOOM_* —— 官方 fp16 金字塔链。）
+    vec3 albedo = texture(u_Tex, v_TexCoord[0]).rgb +
+                  texture(u_Tex, v_TexCoord[1]).rgb +
+                  texture(u_Tex, v_TexCoord[2]).rgb +
+                  texture(u_Tex, v_TexCoord[3]).rgb;
+    albedo *= 0.25;
+    float scale = max(max(albedo.x, albedo.y), albedo.z);
+    albedo *= clamp(scale - u_Threshold, 0.0, 1.0);
+    float grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
+    albedo = -grayscale + albedo * 2.0;
+    lightMap = max(vec3(0.0), albedo * u_Strength);
   }
   fragColor = vec4(lightMap, 1.0);
 }`
@@ -360,6 +344,75 @@ void main() {
   // Add（ApplyBlending 31）：rgb = base + bloom；GL 侧 blendFunc(ONE, ONE)，
   // dst 就是画布里的 base。alpha +0 = 保持场景 alpha（画布本就无 alpha 通道）。
   fragColor = vec4(bloom, 0.0);
+}`
+
+
+// ---------------------------------------------------------------------------
+// HDR Bloom 家族（`general.hdr === true` + `bloomhdr*`）。
+//
+// 官方链路（`assets/shaders/hdr_downsample.frag` 的 BLOOM/UPSAMPLE 分支 +
+// `combine_hdr.frag` 的 LINEAR 分支；材质 `materials/util/hdr_downsample_bloom.json`
+// → `hdr_downsample.json` → `hdr_upsample.json`（additive）→
+// `combine_hdr_upsample_linear.json`；linux-wallpaperengine 的 scene_2d.cpp 同构）：
+//
+//   亮部提取(1/4，软拐点) → 逐级降采样 → 逐级升采样（**加算**，×scatter）→ 合并
+//
+// 与经典家族（BLOOM_LIGHTMAP_* 那一族）的三条口径差异：
+//   1. 阈值作用在**线性 fp16 场景**上（经典家族在画布 sRGB 上判定）；
+//   2. 软窗口是官方那段 soft-knee：`soft = clamp(b - (t-knee), 0, 2knee)`；
+//      `soft *= soft * 0.25/knee`（knee = threshold × feather），
+//      `c = max(soft, b - t) / b`；
+//   3. 模糊来自**金字塔**（多级降采样 + 加算升采样），不是固定核高斯；
+//      能量只在提取段乘一次 strength，升采样段乘 scatter。
+//
+// `bloomhdriterations` = 金字塔层数（默认 8；corpus 实测 2~8），`bloomhdrscatter` =
+// 每级升采样的权重（0 时按 1 处理，官方 shader 的 default 就是 1）。
+const HDR_BLOOM_VERT = `#version 300 es
+in vec3 a_Position;
+in vec2 a_TexCoord;
+uniform vec2 u_Texel;        // 1/源纹理尺寸
+uniform float u_OffsetScale; // 1 = 4 抽头跨 ±1 源纹素（4× 降采样）；0.5 = ±0.5 源纹素（2×）
+out vec2 v_TexCoord[4];
+void main() {
+  gl_Position = vec4(a_Position, 1.0);
+  vec2 o = u_Texel * u_OffsetScale;
+  v_TexCoord[0] = a_TexCoord + vec2(-o.x, -o.y);
+  v_TexCoord[1] = a_TexCoord + vec2( o.x, -o.y);
+  v_TexCoord[2] = a_TexCoord + vec2(-o.x,  o.y);
+  v_TexCoord[3] = a_TexCoord + vec2( o.x,  o.y);
+}`
+
+const HDR_BLOOM_EXTRACT_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_TexCoord[4];
+uniform sampler2D u_Tex;
+uniform float u_Strength;
+uniform vec4 u_Blend;  // (threshold, threshold-knee, 2*knee, knee>0 ? 0.25/knee : 0)
+uniform vec3 u_Tint;
+out vec4 fragColor;
+void main() {
+  vec3 albedo = texture(u_Tex, v_TexCoord[0]).rgb + texture(u_Tex, v_TexCoord[1]).rgb +
+                texture(u_Tex, v_TexCoord[2]).rgb + texture(u_Tex, v_TexCoord[3]).rgb;
+  albedo *= 0.25;
+  albedo = max(vec3(0.0), albedo);
+  float brightness = max(albedo.r, max(albedo.g, albedo.b));
+  float soft = clamp(brightness - u_Blend.y, 0.0, u_Blend.z);
+  soft = soft * soft * u_Blend.w;
+  float contribution = max(soft, brightness - u_Blend.x) / max(brightness, 0.00001);
+  albedo *= contribution * u_Strength * u_Tint;
+  fragColor = vec4(albedo, 1.0);
+}`
+
+const HDR_BLOOM_BOX_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_TexCoord[4];
+uniform sampler2D u_Tex;
+uniform float u_Scale; // 降采样 = 1；升采样 = scatter（UPSAMPLE 分支 albedo *= 0.25 * scatter）
+out vec4 fragColor;
+void main() {
+  vec3 albedo = (texture(u_Tex, v_TexCoord[0]).rgb + texture(u_Tex, v_TexCoord[1]).rgb +
+                 texture(u_Tex, v_TexCoord[2]).rgb + texture(u_Tex, v_TexCoord[3]).rgb) * 0.25;
+  fragColor = vec4(albedo * u_Scale, 1.0);
 }`
 
 
@@ -702,4 +755,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, HDR_BLOOM_VERT, HDR_BLOOM_EXTRACT_FRAG, HDR_BLOOM_BOX_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES }
