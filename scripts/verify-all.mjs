@@ -65,7 +65,10 @@ const STABLE = [
   "verify-occlusion",
   // dist/ 归属边界：站点构建不许删 dist/lib（宿主 WallpaperEM 的 file: 依赖指着它；
   // 2026-10-01 被站点构建清空 dist/ 连累过 —— 宿主侧全线 ENOENT）
-  "verify-dist",
+  // 文件名一直是 verify-dist-layout.mjs（package.json 的 verify:dist 也指它）——
+  // 这里写成 "verify-dist" 会让本项**从未真正跑过**（spawn 一个不存在的脚本，
+  // 每轮稳定集固定多一条 MODULE_NOT_FOUND 的「新失败」）。
+  "verify-dist-layout",
   // 实例生命周期/代际（M4）：终态、await 后代际核对、旧代不触发新代首帧、画布所有权
   // （源码守卫；行为面见 scripts/_probe-review-lifecycle.mjs 的无头真装配）
   "verify-lifecycle",
