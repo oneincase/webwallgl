@@ -11,9 +11,12 @@
  * 判据：
  *   1. **冻结表**：16 个内置工程的 26 个模型，顶点数 / 索引数 / 内嵌材质路径必须与
  *      EXPECT 逐项相等（打包-装载链的定点回归；数字来自 P1 落地时的实测）；
- *   2. 唯一例外是 `audiophile/models/grid/grid.mdl` —— 全文件没有任何可自洽的顶点区
- *      （176 字节的残缺资产，连 .tex 都没编译），必须**明确失败**而不是崩或静默；把它
- *      当「已知残缺」白名单，并要求它抛的是布局错误而不是 RangeError；
+ *   2. `audiophile/models/grid/grid.mdl` 曾是表里唯一的 null（当时判为「176 字节的残缺
+ *      资产、必须明确失败而不是崩或静默」）—— 2026-10-03 更正：它是 **skin_count=2** 的
+ *      合法模型（grid.json + grid2.json 两张材质），而顶点区长度字段在**全部材质串之后**；
+ *      旧解析只跳过第一条串，锚点落进第二条里 → 读到垃圾长度 → 26 个候选全废（F30，
+ *      「顶点区长度异常」）。补上「全部皮肤」锚点后解析出的几何与 fantasticcar 的同名
+ *      地板**逐项相同**（同一资产的单皮肤版本），所以现在它按普通条目比对；
  *   3. 打包语料（本机库存在时）：577 个 .mdl 必须**全部可解析**——打包族走原表，
  *      这条锁的是「源码族分支不得干扰打包族」与「语料里不得再出现解析不了的新形态」。
  *
@@ -29,7 +32,7 @@ const { parseMDL } = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
 
 /**
- * 冻结表：[顶点数, 索引数, 内嵌材质路径]；null = 已知残缺资产（必须失败）。
+ * 冻结表：[顶点数, 索引数, 内嵌材质路径]。
  * 数字以**属性表 vertexLayoutOf(mdlFlag)** 为准（与多子网格路径同一份实现）：
  * 例如 flag=0xf 是 pos+normal+tangent(16B)+uv = 48B/顶点。早先按「tangent 12B」
  * 的口径算出的 44/32 也自洽，但与子网格记录对不上（verify-mdl-sections 逮住），
@@ -40,7 +43,7 @@ const EXPECT = {
   "audiophile/models/audiophile/bars.mdl": [384, 576, "materials/audiophile/bars.json"],
   "audiophile/models/audiophile/flow.mdl": [163, 600, "materials/audiophile/flow.json"],
   "audiophile/models/audiophile/glow.mdl": [4, 6, "materials/audiophile/glow.json"],
-  "audiophile/models/grid/grid.mdl": null,
+  "audiophile/models/grid/grid.mdl": [4, 6, "materials/grid/grid.json"],
   "demon_core/models/backgroundsphere/backgroundsphere.mdl": [1087, 5952, "materials/backgroundsphere/background_diamond.json"],
   "demon_core/models/core/core.mdl": [970, 1440, "materials/core/core.json"],
   "dna_fragment/models/bg/bg.mdl": [4, 6, "materials/bg/bg.json"],

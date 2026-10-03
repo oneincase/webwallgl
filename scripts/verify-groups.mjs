@@ -286,6 +286,37 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   check(/currentQuadKey = null[\s\S]{0,240}uploadQuad\('layer'/.test(cpCode),
     "puppet 的 copy pass 未在 uploadQuad 前失效 quad 缓存（会复用 MDL 的顶点缓冲，人物碎裂）");
 
+  // ---------- C2. 三条「静默丢像素」的实现约束（2026-10-03，F29/F31/F32）----------
+  //
+  // 这三条的共同形态：GL 只报一个错误码、画面少一块，而日志里看不出是谁干的。
+  // 每条都有实测的官方内置工程受害样本，所以立源码判据（离线可断，不需要 GPU）。
+  {
+    // F29 NDC 直通顶点：`bg.vert`（dna_fragment / retro 的全屏背景层）声明了 a_Position
+    // 却没用它，位置由 `gl_Position = vec4(a_TexCoord*2-1, 0.5, 1)` 算 —— GL 会把未使用
+    // 的属性优化掉，`getAttribLocation('a_Position')` 返回 -1。VAO 构建若以
+    // 「locPos >= 0」为前提就会整层放弃（自愈闸门判「一个网格都没画出来」→ 永久回落
+    // 通用程序），作者的云层/图案混合整条丢失。
+    check(!/if \(locPos >= 0\) \{[\s\S]{0,120}meshMatVaoCache\.set/.test(rsrc),
+      "meshMatVao 仍以 a_Position 存在为前提（NDC 直通 shader 的 a_Position 会被优化掉 → 整层放弃）");
+    check(/locPos >= 0 \|\| locUv >= 0/.test(rsrc),
+      "meshMatVao 未放宽到「程序要的属性里至少有一条能供给就建 VAO」（F29）");
+
+    // F31 HDR 回读的 type/数组必须同宽：`HALF_FLOAT` + `Float32Array` 是非法组合，
+    // readPixels 抛 INVALID_OPERATION 且一个字节都不写 —— 诊断读数恒 [0,0,0,0]，
+    // 还会把错误码算到同帧的 bloom 头上（razer_bedroom / shimmering_particles 的
+    // `bloom glErr=1282` 就是它）。
+    check(!/readPixels\([^)]*HALF_FLOAT/.test(rsrc),
+      "readPixels 用了 HALF_FLOAT（浮点目标必须 RGBA+FLOAT+Float32Array，否则整条回读静默失效）");
+
+    // F32 shader-blend 的底图不得与当前渲染目标同一张纹理（HDR 下 captureBackdrop
+    // 返回的就是场景纹理）：采样同时是渲染目标 = 反馈环，drawArrays 被丢弃，
+    // razer_bedroom 的 6 个 cbm=11/12 图层（neon glow / hue-bulb / wave）整批不出现。
+    check(/const backdrop = backdropForDraw\(width, height\)/.test(rsrc),
+      "shader-blend 路径未走 backdropForDraw（HDR 下会采样当前渲染目标，反馈环丢绘制）");
+    check(/function backdropForDraw\(/.test(rsrc) && /blitFramebuffer/.test(rsrc.slice(rsrc.indexOf("function backdropForDraw("), rsrc.indexOf("function backdropForDraw(") + 900)),
+      "backdropForDraw 未把 HDR 场景纹理 blit 到独立 FBO 再采样（反馈环未解）");
+  }
+
   // mdl.js：overrideTex 必须真的成为采样源；且不能翻 v。
   // 层 FBO 由 v=1 的顶点写入 NDC 顶，采样恒有 FBO(v) == 源贴图(v)，UV 是恒等的；
   // 翻了会让腿采样到空白区直接消失（实测双腿整条不见）。
