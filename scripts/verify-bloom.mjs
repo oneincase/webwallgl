@@ -10,6 +10,12 @@
  *
  * 端到端数值判据（3299228616 测试台实测，交替开关抵动画漂移）：
  *   bloom on/off 全帧精确均值 = 58.97 / 54.71 / 58.87 / 53.83 / 58.94（+8.5%）。
+ *
+ * [2026-10-03] HDR 家族从「SDR 等效校准」（u_Metric=1：raw sRGB 亮度 + smoothstep 窗口 +
+ * strength 双乘）换成**官方 fp16 金字塔链**（hdr_downsample 的 BLOOM/UPSAMPLE 分支 +
+ * combine_hdr 的 LINEAR 分支，与 linux-wallpaperengine 的 scene_2d.cpp 同构）：
+ * 阈值作用在线性场景、软窗口是官方 soft-knee、模糊来自多级降采样 + 加算升采样。
+ * 判据（3299228616 官方 preview.gif 首帧 mean 102.5）：修前 72.7 → 修后 105.6。
  */
 import fs from 'node:fs'
 import { join } from 'node:path'
@@ -68,10 +74,19 @@ console.log('\n[1] bloomPostParams 真值表（fixtures 取自真实壁纸 scene
   check(!!h && h.hdr === true && h.strength === 1 && h.threshold === 1, 'HDR 家族：strength/threshold 取 bloomhdrstrength/bloomhdrthreshold')
   check(!!h && h.iterations === 8 && h.radius === 1.619 && Math.abs(h.damp - 0.3) < 1e-6, 'HDR 家族：iterations/scatter→radius/feather→damp')
   check(!!h && Math.abs(h.tint[0] - 0.83922) < 1e-4, 'HDR 家族 tint 仍取 bloomtint')
-  check(!!h && h.metric === 1, 'HDR 家族 = raw sRGB 亮度软窗口判定（过曝修复）')
+  // HDR 家族 = 官方 fp16 金字塔链（hdr_downsample / combine_hdr），软窗口是官方 soft-knee：
+  //   knee = threshold × feather；blend = (t, t-knee, 2knee, knee>0 ? 0.25/knee : 0)
+  check(!!h && h.metric === 1, 'HDR 家族走官方金字塔链（family=hdr，不参与经典 u_Metric 判定）')
+  check(
+    !!h && h.blend && Math.abs(h.blend[0] - 1) < 1e-6 && Math.abs(h.blend[1] - 0.7) < 1e-6 && Math.abs(h.blend[2] - 0.6) < 1e-6 && Math.abs(h.blend[3] - (0.25 / 0.3)) < 1e-3,
+    'HDR 家族 soft-knee：knee = threshold×feather = 0.3，blend=(1, 0.7, 0.6, 0.25/0.3)',
+  )
+  check(!!h && h.radius > 0, 'HDR 家族 scatter=0 时按官方默认 1 处理（不出现 0 权重升采样）')
 
   const h2 = bloomPostParams(F.w2902406982)
   check(!!h2 && h2.strength === 0.75 && h2.iterations === 5 && Math.abs(h2.radius - 0.85) < 1e-4 && h2.damp === 0, '2902406982 参数组')
+  // feather=0 ⇒ knee=0：soft 项消失、contribution 退化成硬阈值（官方那段 clamp(…,0,0)）
+  check(!!h2 && h2.blend[2] === 0 && h2.blend[3] === 0, 'feather=0 ⇒ knee=0：blend 退化成硬阈值（2knee=0、权重 0）')
 
   const z = bloomPostParams(F.w3287715210)
   check(!!z && z.strength === 0, '3287715210 strength=0 → 解析成功但调用方按 WE 原语义跳过（三段 shader 全直通）')
@@ -96,10 +111,16 @@ console.log('\n[2] shader 保真（renderer-glsl.js 与 localeffects/Bloom 28229
     [/albedo \*= clamp\(scale - u_Threshold, 0\.0, 1\.0\);/, 'saturate(scale - threshold) 软拐点（只留超阈能量）'],
     [/albedo = -grayscale \+ albedo \* 2\.0;/, '饱和度 ×2（引擎 sat=1 原式）'],
     [/lightMap = max\(vec3\(0\.0\), albedo \* u_Strength\);/, 'strength 在亮部提取段乘一次'],
-    [/uniform int u_Metric;/, '亮度判定口径开关（经典/HDR 家族分流）'],
-    // HDR 家族的 SDR 等效判定：raw sRGB 亮度 + 软窗口（2646504847 过曝修复，保持既有校准）
-    [/smoothstep\(u_Threshold - 0\.2, u_Threshold \+ 0\.4, dot\(samplec, vec3\(0\.2126, 0.7152, 0.0722\)\)\)/, 'HDR 家族：raw sRGB 亮度软窗口（threshold 以 1.0=白点标定）'],
-    [/lightMap = lightMap \* max\(0\.001, mix\(weight, 1\.0, v_Damp\)\) \/ 4\.0 \* u_Strength \* u_Strength;/, 'HDR 分支 strength 双乘（补偿 blur 不再乘，与旧行为逐位一致）'],
+    // HDR 家族 = 官方 hdr_downsample.frag 的 BLOOM/UPSAMPLE 分支 + combine_hdr 的 LINEAR 分支
+    [/const HDR_BLOOM_VERT = `#version 300 es/, 'HDR_BLOOM_VERT 定义（官方 hdr_downsample 的四抽头顶点）'],
+    [/const HDR_BLOOM_EXTRACT_FRAG = `#version 300 es/, 'HDR_BLOOM_EXTRACT_FRAG 定义（官方 BLOOM 分支）'],
+    [/const HDR_BLOOM_BOX_FRAG = `#version 300 es/, 'HDR_BLOOM_BOX_FRAG 定义（官方 downsample/upsample 共用）'],
+    [/float soft = clamp\(brightness - u_Blend\.y, 0\.0, u_Blend\.z\);/, '官方 soft-knee：clamp(b - (t-knee), 0, 2knee)'],
+    [/soft = soft \* soft \* u_Blend\.w;/, '官方 soft-knee 二次项 ×0.25/knee'],
+    [/float contribution = max\(soft, brightness - u_Blend\.x\) \/ max\(brightness, 0\.00001\);/, '官方 contribution = max(soft, b-t)/b'],
+    [/albedo \*= contribution \* u_Strength \* u_Tint;/, 'HDR 提取段乘 strength×tint（一次）'],
+    [/texture\(u_Tex, v_TexCoord\[3\]\)\.rgb\) \* 0\.25;/, 'HDR 金字塔：四抽头 ×0.25（能量守恒）'],
+    [/fragColor = vec4\(albedo \* u_Scale, 1\.0\);/, 'HDR 升采样 ×scatter（官方 UPSAMPLE 分支 albedo *= 0.25*scatter）'],
     // blur：能量守恒归一，不乘 strength（引擎 blur_h_bloom 同）；±iterations、exp(-|n|*0.1) 权重、Scatter 步长
     [/weight = exp\(-abs\(n\) \* 0\.1\);/, '高斯权重 exp(-|n|*0.1)'],
     [/u_Dir \* \(n \* v_SizeMultiplier\)/, '方向 × Scatter 缩放步长'],
@@ -132,6 +153,12 @@ console.log('\n[3] 接线：renderScene 尾部挂后期 + 缓冲 1/4 分辨率 +
   check(/hdrActive\s*=/.test(rd), 'HDR：每帧按 general.hdr 旗标激活（SDR 恒 false）')
   check(/gl\.RGBA16F/.test(rd) && /ensureHdrTarget/.test(rd), 'HDR：场景画进 RGBA16F 目标')
   check(/hdrActive\s*&&\s*hdrSceneFbo\s*\?\s*hdrSceneFbo\.fbo/.test(rd), 'HDR：bloom apply 累加进 fp16 而非画布')
+  // HDR 家族链：分流 + fp16 层缓冲 + 金字塔降/升采样（升采样加算）+ 合并
+  check(/if \(p\.hdr\) return applyHdrBloomPost\(p, width, height, sceneTex\)/.test(rd), 'HDR 家族分流到 applyHdrBloomPost')
+  check(/getFBO\(lw, lh, 'hdrBloom' \+ i, bufFmt\)/.test(rd), 'HDR 金字塔逐级 FBO（HDR 时 fp16）')
+  check(/for \(let i = 1; i < depth; i\+\+\) boxPass\(levels\[i - 1\], levels\[i\], 1, false\)/.test(rd), 'HDR 正金字塔：逐级降采样（×1、不加算）')
+  check(/for \(let i = depth - 1; i >= 1; i--\) boxPass\(levels\[i\], levels\[i - 1\], p\.radius, true\)/.test(rd), 'HDR 反金字塔：逐级升采样加算（×scatter）')
+  check(/gl\.uniform4f\(hdrBloomExtractUni\.blend, b\[0\], b\[1\], b\[2\], b\[3\]\)/.test(rd), 'HDR 提取段喂 soft-knee blend 四元组')
   check(/tonemapProg/.test(rd) && /m\s*>\s*1\.0/.test(fs.readFileSync(join(ROOT, 'renderer/vendor/we-scene/render/renderer-glsl.js'), 'utf8')), 'HDR：帧末 tonemap，[0,1] 恒等、>1 高光 rolloff')
 
   const mount = fs.readFileSync(join(ROOT, 'renderer/src/scene-mount.ts'), 'utf8')
