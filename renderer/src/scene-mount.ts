@@ -3765,6 +3765,12 @@ cfg, source, pkgAbort.signal);
                   combos: pass0.combos || {},
                   constants: pass0.constantshadervalues || {},
                   blending: typeof pass0.blending === "string" ? pass0.blending : null,
+                  // [we-scene patch 2026-10-03] 深度的两条材质开关（F40）：WE 的材质 pass 用
+                  // `depthtest`/`depthwrite` 的 disabled/enabled 控制层间遮挡，未声明时按
+                  // **都开启**（neongrid 显式写 enabled 是同一默认的确认）。此前材质路径
+                  // 只读 blending，深度全按「每层清一次」的粗暴策略 —— 见 renderer.js 的 F40 注释。
+                  depthTest: pass0.depthtest !== "disabled",
+                  depthWrite: pass0.depthwrite !== "disabled",
                   // 材质声明的**全部**槽位（car 的 g_Texture1 是法线贴图）：缺槽渲染侧绑白纹理，
                   // 不预载的话采样得到 (0,0,0,1) → 光照项为 0 → 模型整片黑。
                   textures: [],
@@ -3858,6 +3864,8 @@ cfg, source, pkgAbort.signal);
                   combos: pass0.combos || {},
                   constants: pass0.constantshadervalues || {},
                   blending: typeof pass0.blending === "string" ? pass0.blending : null,
+                  depthTest: pass0.depthtest !== "disabled",
+                  depthWrite: pass0.depthwrite !== "disabled",
                   textures: [],
                   needsReflection: false,
                 };

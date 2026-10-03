@@ -3042,14 +3042,20 @@ export function createRenderer(canvas, opts = {}) {
       const ent = spec && spec.shader ? meshMatProgCache.get(keyOf(spec)) : null
       if (info && ent && meshMatAttrUnavailable(ent.prog, info)) return false
     }
+    // [we-scene patch 2026-10-03] **深度：帧内不再每层清，交给深度测试做层间遮挡**（F40）。
+    //
+    // 此前每画一个模型层就 `clear(DEPTH_BUFFER_BIT)` —— 于是**后画的层无条件覆盖先画的层**：
+    // fantasticcar 的地板（层序在车之后）整片盖住车身，用户看到的正是「底板穿透了上层车模型」
+    // （网格线还印在车漆上）。深度测试本来就该负责这件事，而帧首已经统一清过一次
+    // （见 renderScene 的「深度缓冲也一起清」）。
+    //
+    // 唯一的例外是**天空盒**：它的几何把整台相机包在里面，「近侧壳」比场景里任何东西都近，
+    // 写进深度后会把后面所有模型全拒掉（实测 ricepod mean 35 → 13）。天空盒本来就是背景，
+    // 按「不写深度」画（standard 做法）——它被 drawLayers 排在最前，先画不会盖任何东西。
+    // 天空盒兜底：材质没声明 depthtest/depthwrite 时（ricepod 的 skybox.json 声明了，
+    // 但工件里存在不声明的），天空盒一律不写深度 —— 它包着相机，写深度会把全场拒掉。
+    const isSkybox = !!layer.isSkybox
     const useDepth = !!(cam && cam.perspective)
-    if (useDepth) {
-      gl.depthMask(true)
-      gl.clearDepth(1)
-      gl.clear(gl.DEPTH_BUFFER_BIT)
-      gl.enable(gl.DEPTH_TEST)
-      gl.depthFunc(gl.LEQUAL)
-    }
     let curProgKey = null
     let curEntry = null
     const bindForSpec = (spec, ent) => {
@@ -3068,6 +3074,21 @@ export function createRenderer(canvas, opts = {}) {
     // 与 `g_EffectModelViewProjectionMatrix`（`mat4Transpose(mat4Multiply(viewProj, em))`），
     // 两处都是为了满足 HLSL 行向量约定。bindSystemUniforms 内部只把这几个矩阵
     // 原样 uniformMatrix4fv 上传（不参与别的推导），所以在这里转置是唯一改动点。
+      // [we-scene patch 2026-10-03] **逐网格深度状态**（F40）：按材质声明的
+      // `depthtest`/`depthwrite`（缺省都开）设置，配合「帧内不再每层清深度」，
+      // 层间遮挡由深度测试负责 —— 这才是 WE 的行为；此前每层清一次等于「后画的层
+      // 无条件盖住先画的层」（fantasticcar 地板盖车）。
+      if (useDepth) {
+        const dTest = spec.depthTest !== false && !(isSkybox && spec.depthTest === undefined)
+        const dWrite = spec.depthWrite !== false && !isSkybox
+        if (dTest) {
+          gl.enable(gl.DEPTH_TEST)
+          gl.depthFunc(gl.LEQUAL)
+        } else {
+          gl.disable(gl.DEPTH_TEST)
+        }
+        gl.depthMask(dWrite)
+      }
       bindSystemUniforms(
         ent.uni, layer, time, width, height,
         mat4Transpose(mvp), mat4Transpose(modelM), mat4Transpose(viewProj),
@@ -3158,7 +3179,7 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch 2026-10-03] **收尾必须还原深度状态**（与 mdl.js 内置路径逐字同纪律）：
     // 开着 DEPTH_TEST + 深度写掩码进入后续图层，会把 z=0 的 2D 四边形按模型的深度值
     // 拒掉 —— neon_sunset 因此整屏变黑（实测：F13 开 mean=0、关 mean=143）。
-    if (useDepth) {
+    if (useDepth && !isSkybox) {
       // 与 mdl.js 内置路径逐字一致（depthMask 收尾置 false，不是 true）——
       // 二分实验（只画一帧即回退）曾把整帧救回 143，说明破坏是**逐帧累积**的；
       // 收尾留下的 depthMask 差异是首要嫌疑。

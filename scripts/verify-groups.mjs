@@ -338,6 +338,19 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(/reflectionRT && !reflectionPassActive/.test(rsrc),
       "反射通道内仍会采样 _rt_Reflection 自身（反馈环丢绘制，F38）");
 
+    // F40 层间深度：**帧内不再每层清深度**（清了 = 后画的层无条件盖住先画的层：
+    // fantasticcar 的地板整片盖住车身、网格线印在车漆上），层间遮挡交给深度测试；
+    // 每条材质声明的 `depthtest`/`depthwrite`（缺省都开）决定该网格是否参与。
+    {
+      const inner = rsrc.slice(rsrc.indexOf("function drawMeshMaterialInner"), rsrc.indexOf("function drawMeshMaterialInner") + 12000);
+      check(!/gl\.clear\(gl\.DEPTH_BUFFER_BIT\)/.test(inner),
+        "材质路径又按层清深度了：后画的层会无条件盖住先画的层（fantasticcar 地板盖车，F40）");
+      check(/gl\.depthMask\(dWrite\)/.test(inner) && /spec\.depthTest !== false/.test(inner),
+        "材质路径未按 depthtest/depthwrite 逐网格设深度状态（F40）");
+      check(/depthTest: pass0\.depthtest !== "disabled"/.test(hostSrc) && /depthWrite: pass0\.depthwrite !== "disabled"/.test(hostSrc),
+        "宿主未把材质的 depthtest/depthwrite 带进材质规格（F40）");
+    }
+
     // F32 shader-blend 的底图不得与当前渲染目标同一张纹理（HDR 下 captureBackdrop
     // 返回的就是场景纹理）：采样同时是渲染目标 = 反馈环，drawArrays 被丢弃，
     // razer_bedroom 的 6 个 cbm=11/12 图层（neon glow / hue-bulb / wave）整批不出现。
