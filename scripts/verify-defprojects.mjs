@@ -32,6 +32,7 @@ const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container
 const { isPerspectiveScene } = await imp("renderer/vendor/we-scene/render/math.js");
 const scn = await imp("renderer/vendor/we-scene/scene/parse.js");
 const eff = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
+const camPath = await imp("renderer/vendor/we-scene/render/camera-path.js");
 
 const readText = (bytes) => dec.decode(bytes).replace(/^\uFEFF/, "");
 
@@ -190,6 +191,7 @@ function auditProject(dirName) {
   const resolveMaterial = (rel, why) => {
     if (!require1(rel, why)) return;
     const doc = parseJsonLoose(readText(getEntry(pkg, rel)));
+    auditUserShaderValues(rel, doc); // 判据 6（函数声明提升，见下方定义）
     for (const mp of doc.passes ?? []) {
       if (mp.material) {
         if (!rel.startsWith("materials/util/")) resolveMaterial(mp.material, `${why}→材质嵌套`);
@@ -249,7 +251,18 @@ function auditProject(dirName) {
     if (typeof o.particle === "string") {
       if (require1(o.particle, `${who}→粒子配置`)) {
         const pj = parseJsonLoose(readText(getEntry(pkg, o.particle)));
-        if (typeof pj.material === "string" && pj.material) require1(pj.material, `${who}→粒子材质`);
+        if (typeof pj.material === "string" && pj.material) {
+          require1(pj.material, `${who}→粒子材质`);
+          // 判据 6 也挂在粒子材质上（它不走 resolveMaterial，是被 require1 直接引用的）
+          const pmEntry = getEntry(pkg, pj.material);
+          if (pmEntry) {
+            try {
+              auditUserShaderValues(pj.material, parseJsonLoose(readText(pmEntry)));
+            } catch {
+              /* JSON 坏掉由上面的 require1/解析路径负责 */
+            }
+          }
+        }
       }
     }
     if (typeof o.sprite === "string") {
@@ -296,6 +309,100 @@ function auditProject(dirName) {
     );
   }
 
+  // ---- 判据 5：场景级相机路径（`scene.json` 的 `camera.paths[]`）可解析且真的换机位 ----
+  //
+  // 官方 6 个 3D 工程（arsenal/demon_core/dna_fragment/fantasticcar/neon_sunset/ricepod）
+  // 都是「没有相机实体 + 录了一条编辑器相机路径」：不解析就只能回落 `scene.camera`
+  // 的编辑器视口快照，取景与官方出图整个不同（fantasticcar 实测：快照在车尾、
+  // 路径首帧在车头右前方）。这里锁三件事：文件在包内、能建出 clip、首帧与
+  // **静态快照**明显不同（否则判据没有区分力）。语义判据在 verify-camera §7。
+  {
+    const declPaths = scene.camera && scene.camera.paths;
+    if (Array.isArray(declPaths) && declPaths.length) {
+      const clips = [];
+      for (const rel of declPaths) {
+        if (!require1(rel, "scene.camera.paths")) continue;
+        try {
+          const doc = parseJsonLoose(readText(getEntry(pkg, rel)));
+          for (const c of (Array.isArray(doc) ? doc : doc.paths) || []) clips.push(c);
+        } catch (err) {
+          errors.push(`${dirName}: 相机路径 ${rel} 解析失败（${(err && err.message) || err}）`);
+        }
+      }
+      const built = camPath.createSceneCameraPath(clips);
+      check(built.clips.length > 0, `${dirName}: scene.camera.paths 声明了路径但没建出 clip`);
+      const first = built.tick(0);
+      check(!!first, `${dirName}: 相机路径首帧求值失败`);
+      const staticEye = String((scene.camera && scene.camera.eye) || "").trim().split(/\s+/).map(Number);
+      if (first && staticEye.length >= 3 && staticEye.every(Number.isFinite)) {
+        const d = Math.hypot(first.eye[0] - staticEye[0], first.eye[1] - staticEye[1], first.eye[2] - staticEye[2]);
+        // 「路径首帧 ≠ 静态快照」只在 fantasticcar 成立：另外 5 个工程保存场景时相机
+        // 正好停在路径首帧（距离 0.00），在那里这条判据没有区分力 —— 也正是这个「重合」
+        // 让整条缺口（不解析路径）长期看不出来。故只对 fantasticcar 硬判，其余只报数。
+        if (dirName === "fantasticcar") {
+          check(d > 1, `${dirName}: 相机路径首帧与静态快照几乎重合（距离 ${d.toFixed(2)}）——判据失去区分力`);
+        } else if (d > 1) {
+          console.log(`  - ${dirName}: 相机路径首帧与静态快照相差 ${d.toFixed(2)}`);
+        }
+      }
+    }
+  }
+
+  // ---- 判据 6：`usershadervalues` 的映射方向（挂在 resolveMaterial 上，见下） ----
+  //
+  // 语义（极易读反，故立判据）：**键 = project.json general.properties 的属性名，
+  // 值 = shader 里 `// {"material":"名"}` 声明的物性名**。官方内置 9 个工程 51 条绑定
+  // 全部符合（键 51/51 是属性、值 49/51 命中同名 shader 的物性名，余 2 条指向官方
+  // genericparticle 的 tint，由内置实现消费）；工坊语料 0 条。方向反了会让
+  // 「作者调的背景色/车漆色」整片不生效（fantasticcar 实测整场近黑）。
+  //
+  // 审计点选在 resolveMaterial：它对每条材质引用（对象/模型 sidecar/效果链/粒子）
+  // 都已解析过文档，挂在这里天然覆盖全 —— 自己再走一遍对象列表会漏掉
+  // 「效果链里的材质」「粒子材质」这些支路（实测漏 14/51）。
+  function auditUserShaderValues(rel, doc) {
+    if (usvAudited.has(rel)) return;
+    usvAudited.add(rel);
+    const props = Object.keys((project.general && project.general.properties) || {});
+    const preset = project.preset && typeof project.preset === "object" ? Object.keys(project.preset) : [];
+    const matNamesOf = (shader) => {
+      const out = new Set();
+      for (const ext of [".frag", ".vert"]) {
+        let src = null;
+        const inPkg = getEntry(pkg, `shaders/${shader}${ext}`);
+        if (inPkg) src = readText(inPkg);
+        else if (weAssets) {
+          try {
+            src = fs.readFileSync(path.join(weAssets, `shaders/${shader}${ext}`), "utf8");
+          } catch {
+            src = null;
+          }
+        }
+        if (!src) continue;
+        for (const m of src.matchAll(/"material"\s*:\s*"([^"]+)"/g)) out.add(m[1]);
+      }
+      return out;
+    };
+    for (const mp of doc.passes ?? []) {
+      const usv = mp.usershadervalues;
+      if (!usv || typeof usv !== "object") continue;
+      const mats = mp.shader ? matNamesOf(mp.shader) : new Set();
+      for (const [k, v] of Object.entries(usv)) {
+        usvBindings++;
+        check(
+          props.includes(k) || preset.includes(k),
+          `${dirName}: usershadervalues 的键 '${k}'（${rel}）不是 project.json 属性名 —— 绑定方向反了？`,
+        );
+        // 值只报数、不硬判：官方语料里就有 2 条指向 shader 里不存在的物性名
+        // （demon_core / dna_fragment 的粒子材质 `schemecolor → tint`，而官方
+        // `genericparticle.frag` 根本没有 tint 这个物性 —— WE 自己也只会静默忽略）。
+        // 硬判它们等于要求语料比官方引擎更严格。方向由**键**锁住就够。
+        if (mats.size > 0 && !mats.has(String(v))) {
+          usvUnknownValue.push(`${dirName} ${rel}: '${k}' → '${v}'（shader ${mp.shader} 未声明该物性名）`);
+        }
+      }
+    }
+  }
+
   // ---- 判据 4：合成层材质条目零诊断 ----
   const diags = [];
   for (const shader of layerMaterialEffects) {
@@ -315,6 +422,12 @@ function auditProject(dirName) {
 
 let scenes = 0;
 let skips = 0;
+/** 判据 6 审计到的 usershadervalues 绑定总数（非空转判据，见文件末尾） */
+let usvBindings = 0;
+/** 判据 6 已审计过的材质路径（同一份文档可能被多条引用链到达，只算一次） */
+const usvAudited = new Set();
+/** 判据 6 里「值指向 shader 未声明的物性名」的样本（只报数，不是失败） */
+const usvUnknownValue = [];
 const pendingBuiltinAll = new Map();
 const sourceImageAll = new Map();
 for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
@@ -340,6 +453,13 @@ for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n
   }
 }
 
+if (usvUnknownValue.length) {
+  console.log(
+    `  - usershadervalues 指向 shader 未声明的物性名（官方语料也有，WE 侧静默忽略）：` +
+      usvUnknownValue.join("；"),
+  );
+}
+
 console.log("");
 if (sourceImageAll.size) {
   // 源码工程特有形态：引用有效、.tex 从未编译，运行时按源图回退（loadTex 已实现）
@@ -360,6 +480,15 @@ if (pendingBuiltinAll.size) {
 console.log("");
 if (scenes === 0) console.log("  - 跳过：语料中没有 scene 工程");
 else console.log(`共审计 ${scenes} 个 scene 工程（跳过 ${skips} 个非场景）`);
+
+// 判据 6 的非空转闸门：语料 9 个工程共 51 条绑定，离线审计覆盖 42 条。未覆盖的 9 条
+// 挂在**多子网格模型的非首网格材质**上（fantasticcar 的 car/interior|matte|taillights|
+// wheel、techno 的 orbit*）与 dna_fragment 的粒子材质上 —— 前者只从 .mdl 内的逐网格
+// 材质记录引用，离线这里只读第一个内嵌材质路径（那一层由 verify-mdl 系列 + 运行时的
+// 多子网格链覆盖）。审计路径写错（材质链走不到、shader 源读不到）会让这个数字跳水，
+// 那时「方向正确」就不再是判据，只是没查。
+console.log(`  - usershadervalues 审计：${usvBindings} 条绑定（离线覆盖 42 / 语料全部 51）`);
+check(usvBindings >= 38, `usershadervalues 审计到的绑定数异常：${usvBindings}（基线 42）—— 判据可能空转`);
 
 console.log("");
 if (errors.length > 0) {

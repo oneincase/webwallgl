@@ -654,6 +654,76 @@ if (fs.existsSync(LIB)) {
   for (const e of pErr) errors.push(e);
 }
 
+// ---------- 7. 场景级相机路径（`scene.json` 的 `camera.paths[]`，2026-10-03）----------
+//
+// 与第 6 节是**两种不同的文件格式**（见 render/camera-path.js 的 createSceneCameraPath
+// 头注）：对象级是动画通道格式，场景级是 `{duration, transforms:[{eye,center,up,timestamp}]}`
+// 关键帧格式，挂在 `scene.camera.paths`。官方内置 6 个 3D 工程用它，工坊语料 0 个。
+//
+// 本节只判**合成路径的语义**（不依赖真实语料，任何机器都能跑）；真实语料那半在
+// verify-defprojects（它已经负责定位 WE 安装目录）：
+//   ① 段内线性插值：t=0 首帧、t=半段中点（可手算）；
+//   ② 段末保持末帧（时间轴语义：关键帧摆在哪就何时到位），跨段后走下一段；
+//   ③ 整圈回绕：t = Σduration 回到第 0 段首帧；
+//   ④ eye/center/up 是**字符串**（"2.182 1.986 4.634"）—— 本模块既有的 vec3 只认
+//      数组/对象，用它会静默得到 [0,0,0]（相机瞬移到原点），这条专门锁字符串解析；
+//   ⑤ 坏数据（空文档 / 零时长）返回 null，宿主据此回落静态相机。
+{
+  const sErr = [];
+  const { createSceneCameraPath } = await imp("renderer/vendor/we-scene/render/camera-path.js");
+  const doc = {
+    paths: [
+      // 关键帧只摆到 ts=4、段时长 10 ⇒ t=5 之后是「保持末帧」那一支（时间轴语义）
+      {
+        duration: 10,
+        name: "A",
+        transforms: [
+          { timestamp: 0, eye: "0 0 0", center: "0 0 -1", up: "0 1 0" },
+          { timestamp: 4, eye: "1 2 3", center: "0 0 -1", up: "0 1 0" },
+        ],
+      },
+      {
+        duration: 20,
+        name: "B",
+        transforms: [
+          { timestamp: 0, eye: "-5 -5 -5", center: "0 0 -1", up: "1 0 0" },
+          { timestamp: 20, eye: "-6 -6 -6", center: "0 0 -1", up: "1 0 0" },
+        ],
+      },
+    ],
+  };
+  const sp = createSceneCameraPath(doc);
+  if (sp.clips.length !== 2 || Math.abs(sp.duration - 30) > 1e-6) {
+    sErr.push(`场景路径应 2 段 / 30s，实得 ${sp.clips.length} 段 / ${sp.duration}s`);
+  }
+  const s0 = sp.tick(0);
+  if (!s0 || Math.abs(s0.eye[0]) > 1e-6) sErr.push(`场景路径 t=0 应在首帧（eye.x=0），实得 ${s0 && s0.eye[0]}`);
+  const sMid = sp.tick(2);
+  if (!sMid || Math.abs(sMid.eye[0] - 0.5) > 1e-6 || Math.abs(sMid.eye[2] - 1.5) > 1e-6) {
+    sErr.push(`场景路径段内应线性插值（t=2s = 半程 期望 eye=0.5/1/1.5），实得 ${sMid && sMid.eye.join("/")}`);
+  }
+  const sHold = sp.tick(9.9);
+  if (!sHold || Math.abs(sHold.eye[0] - 1) > 1e-3) sErr.push(`关键帧之后应保持末帧（eye.x=1），实得 ${sHold && sHold.eye[0]}`);
+  const sSwap = sp.tick(10.5);
+  if (!sSwap || Math.abs(sSwap.eye[0] + 5.025) > 1e-3) sErr.push(`跨段后应走第 2 段（t=10.5s 期望 eye.x=-5.025），实得 ${sSwap && sSwap.eye[0]}`);
+  if (!sSwap || Math.abs(sSwap.up[0] - 1) > 1e-6) sErr.push(`up 通道应随段走（第 2 段 up=(1,0,0)），实得 ${sSwap && sSwap.up.join("/")}`);
+  const sWrap = sp.tick(30);
+  if (!sWrap || Math.abs(sWrap.eye[0]) > 1e-6) sErr.push(`整圈回绕后应回到第 0 段首帧（eye.x=0），实得 ${sWrap && sWrap.eye[0]}`);
+  if (createSceneCameraPath([]).tick(1) !== null) sErr.push("空路径文档应返回 null（宿主回退静态相机）");
+  if (createSceneCameraPath([{ duration: 0, transforms: [] }]).tick(1) !== null) sErr.push("无关键帧/零时长应返回 null");
+  // 乱序时间戳必须排序后插值（编辑器允许关键帧顺序与时间不一致）
+  const shuffled = createSceneCameraPath({
+    paths: [{ duration: 10, transforms: [
+      { timestamp: 10, eye: "1 0 0", center: "0 0 -1", up: "0 1 0" },
+      { timestamp: 0, eye: "0 0 0", center: "0 0 -1", up: "0 1 0" },
+    ] }],
+  });
+  const shMid = shuffled.tick(5);
+  if (!shMid || Math.abs(shMid.eye[0] - 0.5) > 1e-6) sErr.push(`乱序关键帧应按时戳排序（t=5s 期望 eye.x=0.5），实得 ${shMid && shMid.eye[0]}`);
+
+  for (const e of sErr) errors.push(e);
+}
+
 if (errors.length) {
   console.error(`verify-camera: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);
