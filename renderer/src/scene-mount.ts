@@ -3903,13 +3903,24 @@ cfg, source, pkgAbort.signal);
                   }
                 }
               }
+              // [we-scene patch 2026-10-03] **槽 0 的每网格基色必须对每个子网格都填**（F43）。
+              //
+              // 渲染侧材质路径里槽 0 的来源是 `layer.meshTextures[i] || mm.texture`
+              // （见 renderer.js「每网格贴图优先…其次整层贴图」），而 meshTex 此前只给
+              // **没有 spec** 的网格填过：有 spec 的网格一律落到 `mm.texture` ＝ **mesh 0
+              // 的基色**。多子网格模型于是整机都在采样第一个子网格的贴图 —— fantasticcar
+              // 六个子网格全在采样车漆那张**通道图**（r/g/b 打包的权重图，直出就是青/品红），
+              // 用户看到的就是「前唇/侧裙/后视镜/轮辋蓝青、进气格栅深蓝」（官方预览这些件
+              // 是银灰/深灰）。有 spec 时贴图已在上面按 `spec.textures` 载好，这里只是把它
+              // 同步进那张「每网格槽 0」表。
               const tn0 = pass0?.textures?.[0];
-              if (typeof tn0 === "string" && tn0 && !spec) {
+              if (typeof tn0 === "string" && tn0) {
+                const gapDefault = spec ? null : texObj;
                 try {
                   await loadTex(tn0);
-                  meshTexPush(meshTex, mi, textures.get(tn0) ?? null, texObj);
+                  meshTexPush(meshTex, mi, textures.get(tn0) ?? null, gapDefault);
                 } catch {
-                  meshTexPush(meshTex, mi, null, texObj);
+                  meshTexPush(meshTex, mi, null, gapDefault);
                 }
               }
               const lightCombo = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
