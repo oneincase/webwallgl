@@ -33,6 +33,7 @@
     "verify:camera": "node scripts/verify-camera.mjs",
     "verify:sprites": "node scripts/verify-sprites.mjs",
     "verify:groups": "node scripts/verify-groups.mjs",
+    "verify:mdl-depth": "node scripts/verify-mdl-depth.mjs",
     "verify:props": "node scripts/verify-props.mjs",
     "verify:animation": "node scripts/verify-animation.mjs",
     "verify:attachments": "node scripts/verify-attachments.mjs",

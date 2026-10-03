@@ -3302,6 +3302,9 @@ export function createRenderer(canvas, opts = {}) {
       // 真 3D 网格（三体的天空盒/恒星/地球）必须保留 z，否则球体被压平在相机平面上
       // 退化成一条边（天空盒只剩一条细缝、整屏近黑）。
       keepZ: !!(cam && cam.perspective),
+      // [we-scene patch 2026-10-04] 天空盒：帧内深度共享后（F49），它的近侧壳会把
+      // 场内所有模型拒掉 —— 交给绘制方按「只测不写」画（与 F40 材质路径同一规则）。
+      skybox: !!layer.isSkybox,
     })
     // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
     // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——

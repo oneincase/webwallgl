@@ -713,19 +713,26 @@ export function createMDLRenderer(gl) {
       // 按图层 z 序压平绘制（见 drawPuppetDirect 的 keepZ 注释），开深度测试会把它们
       // 按 z 互相裁剪。
       //
-      // 深度缓冲在**本次绘制前清一次**：图层合成语义仍然由 z 序 + 混合决定（跨图层
-      // 不互相裁），深度只负责这**一个模型内部**的部件前后。宿主给的 FBO 没有深度
-      // 附件时（效果链 FBO）深度测试退化为恒通过，与改动前一致。
+      // [we-scene patch 2026-10-04] **深度缓冲帧内共享，逐模型不再清**（F49）。
+      //
+      // 此前这里每画一个模型就 `clear(DEPTH_BUFFER_BIT)`：等于把先画的模型从深度缓冲里
+      // 抹掉，深度测试无从比较 ⇒ **后画的模型无条件盖住先画的**。3477054430 的猫
+      // （层序 0/1）被后画的城市（层序 5）整片涂掉，只剩探出楼顶轮廓的那圈耳机带可见
+      // （用户报「没有显示 cat」）。同一根因在材质路径上已于 F40 修掉（fantasticcar
+      // 地板盖住车身），这是另一条绘制路径（通用网格程序）。
+      //
+      // 帧首 renderScene 已统一 `clear(COLOR|DEPTH)`（HDR/MSAA 目标都带深度附件），
+      // 模型之间就该按真实深度比较。宿主给的 FBO 没有深度附件时（效果链 FBO）深度
+      // 测试退化为恒通过，与改动前一致。
+      //
+      // 天空盒是唯一例外：它的壳把相机包在里面，近侧壳比场内任何东西都近，写进深度
+      // 会把后面所有模型拒掉。它本来就是背景（drawLayers 已把它排在最前），按
+      // 「只测不写」画 —— 与 F40 对天空盒的处理同一条规则。
       const useDepth = !!opts.keepZ
       if (useDepth) {
-        // 顺序不能反：`clear(DEPTH_BUFFER_BIT)` 会被**深度写掩码**拦住 —— 上一次绘制
-        // 结尾把 depthMask 置 false 后，先 clear 等于没清（深度残留上一帧/上一层的值，
-        // 遮挡关系全错）。必须先开写掩码再清。
-        gl.depthMask(true)
-        gl.clearDepth(1)
-        gl.clear(gl.DEPTH_BUFFER_BIT)
         gl.enable(gl.DEPTH_TEST)
         gl.depthFunc(gl.LEQUAL)
+        gl.depthMask(!opts.skybox)
       }
       for (let gi = 0; gi < n; gi++) {
         const mesh = list ? list[gi] : legacyMesh
