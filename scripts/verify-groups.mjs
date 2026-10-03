@@ -351,6 +351,21 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
         "宿主未把材质的 depthtest/depthwrite 带进材质规格（F40）");
     }
 
+    // F41 贴着相机的壳（`gl_Position = M * (a_Position + g_EyePosition)`）不参与深度：
+    // 它的 z 是「离相机多远」而不是场景深度，半径常常只有 2~4 个单位，写进深度会把
+    // 后面的模型整片拒掉（ricepod 的 orbit FX：飞船只剩前半截，官方 preview 是完整的一条船）。
+    // 判据：识别规则必须在（表达式里含 `+ g_EyePosition`），且深度决策里用上它。
+    // 全库只有 ricepod 的 3 个 vert 命中，这条对别的壁纸是恒等变换。
+    {
+      const inner = rsrc.slice(rsrc.indexOf("function drawMeshMaterialInner"), rsrc.indexOf("function drawMeshMaterialInner") + 12000);
+      // 用**字面量包含**而不是拼正则：正则里的 `[^;]` / `\+` 在判据文件里要写两层转义，
+      // 第一版就是被这层转义坑成恒红（断言的是「识别规则与它的深度决策都在」）。
+      check(rsrc.includes("meshMatCameraAnchored") && rsrc.includes("g_EyePosition/s.test(ent.vertGlsl"),
+        "未识别「贴着相机的壳」（判据：gl_Position 表达式含 + g_EyePosition，F41）");
+      check(/!anchored/.test(inner),
+        "相机锚定壳未从深度决策里排除（ricepod 飞船会被自己的光环截断，F41）");
+    }
+
     // F32 shader-blend 的底图不得与当前渲染目标同一张纹理（HDR 下 captureBackdrop
     // 返回的就是场景纹理）：采样同时是渲染目标 = 反馈环，drawArrays 被丢弃，
     // razer_bedroom 的 6 个 cbm=11/12 图层（neon glow / hue-bulb / wave）整批不出现。

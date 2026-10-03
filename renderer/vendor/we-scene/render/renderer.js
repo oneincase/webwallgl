@@ -2797,6 +2797,13 @@ export function createRenderer(canvas, opts = {}) {
   // 属性数组未启用会让该 attribute 读常量 (0,0,0,0)（法线归零即整片黑），
   // 所以判定从「名字黑名单」改成「名字 + 数据可用性」（见 meshMatVao/drawMeshMaterialInner）。
   const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Color', 'a_TexCoordVec4C1', 'a_TexCoordC2']
+  // [we-scene patch 2026-10-03] **贴着相机的壳**（F41）：`gl_Position = M * (a_Position + g_EyePosition)`
+  // 这类顶点把几何整体挂在相机上（天空壳/大气/光环），它的 z 是「离相机多远」而不是场景深度 ——
+  // 半径常常只有 2~4 个单位，比场景里任何还在写深度的东西都近，写进深度就会把后面的模型
+  // 整片拒掉（ricepod 的 orbit FX：飞船只剩前半截，官方 preview 是完整的一条船）。
+  // 判据：只认 **gl_Position 表达式里出现 `+ g_EyePosition`**；全库（366 包 + 官方内置）
+  // 只有 ricepod 的 3 个 vert 命中，改这条对别的壁纸是恒等变换。
+  const meshMatCameraAnchored = new Map() // progKey → bool
   /**
    * 程序声明了某属性、但网格没有对应数据 → 不能走材质路径。
    *
@@ -3079,8 +3086,14 @@ export function createRenderer(canvas, opts = {}) {
       // 层间遮挡由深度测试负责 —— 这才是 WE 的行为；此前每层清一次等于「后画的层
       // 无条件盖住先画的层」（fantasticcar 地板盖车）。
       if (useDepth) {
-        const dTest = spec.depthTest !== false && !(isSkybox && spec.depthTest === undefined)
-        const dWrite = spec.depthWrite !== false && !isSkybox
+        let anchored = meshMatCameraAnchored.get(curProgKey)
+        if (anchored === undefined) {
+          anchored = /gl_Position\s*=[^;]*\+[^;]*g_EyePosition/s.test(ent.vertGlsl || '')
+          meshMatCameraAnchored.set(curProgKey, anchored)
+          if (anchored) diag('模型材质 shader ' + spec.shader + ': 顶点把几何挂在相机上（gl_Position 含 + g_EyePosition），按背景处理、不参与深度')
+        }
+        const dTest = spec.depthTest !== false && !anchored && !(isSkybox && spec.depthTest === undefined)
+        const dWrite = spec.depthWrite !== false && !anchored && !isSkybox
         if (dTest) {
           gl.enable(gl.DEPTH_TEST)
           gl.depthFunc(gl.LEQUAL)
