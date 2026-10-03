@@ -368,7 +368,13 @@ export function buildCamera(scene, width, height, fit, alignX, alignY) {
   const cam = scene.camera
   const eyeV = cam && cam.eye ? parseVec(cam.eye) : [0, 0, 0]
   const centerV = cam && cam.center ? parseVec(cam.center) : [0, 0, -1]
-  const upV = cam && cam.up ? parseVec(cam.up) : [0, 1, 0]
+  // [we-scene patch 2026-10-03] **运行时相机的 up 优先**：场景级相机路径的每个关键帧
+  // 都带 up（滚转），宿主把它写进 runtimeCamera.up —— 只认顶层 scene.camera.up 会
+  // 把作者录的侧倾整个丢掉（画面水平了，但取景与官方出图不符）。
+  const rcUp = scene.runtimeCamera && Array.isArray(scene.runtimeCamera.up) && scene.runtimeCamera.up.length >= 3
+    ? scene.runtimeCamera.up
+    : null
+  const upV = rcUp ? [Number(rcUp[0]), Number(rcUp[1]), Number(rcUp[2])] : cam && cam.up ? parseVec(cam.up) : [0, 1, 0]
   // [we-scene patch] 3509243656（三体）是全库唯一「fov 有、orthogonalprojection 无」
   // 的场景。改动前这里算了 lookAt，投影却永远是像素正交：世界单位 ≈ 1 的星星
   // 被当成 1 个像素画在画布角落，画面只剩黑底。正交场景（带 orthogonalprojection）

@@ -510,9 +510,51 @@ cfg, source, pkgAbort.signal);
       const materialDocs: any[] = [];
       // A/B 钩子：__noMaterialProps=true 回到改动前行为（材质文档完全不解析）
       const noMaterialProps = hooksOn() && (globalThis as any).__noMaterialProps === true;
+      /**
+       * [we-scene patch 2026-10-03] `usershadervalues`：把**用户属性**绑到材质 uniform。
+       *
+       * 语义（方向容易读反，证据见下）：**键 = project.json `general.properties` 的属性名，
+       * 值 = shader 里 `// {"material":"名"}` 声明的物性名**。fantasticcar `materials/car/body.json`
+       * 写 `{"carbodycolor":"paintcolor","carstripescolor":"paintcolorstripes","schemecolor":"ambientcolor"}`，
+       * 而 `car.frag` 声明的物性正是 paintcolor/paintcolorstripes/ambientcolor，
+       * `carbodycolor`/`schemecolor` 只在 project.json 的属性表里 —— 两个方向各自成立、
+       * 反向不成立。内置 16 工程 51 条绑定全库普查：键 51/51 都是属性名，
+       * 值 49/51 命中同名 shader 的物性名（剩 2 条指向官方 genericparticle 的 tint，
+       * 由官方头/内置实现消费），且**没有一条与 constantshadervalues 撞名**。
+       *
+       * 为什么必须做：整个内置官方 3D 组的颜色都靠它 —— 不做的话 shader 用的是注释里
+       * 声明的 default（dome 的 `0.315,0.135,0.1125` 深棕、car 的纯白车漆），
+       * 与 project.json 里作者调的「背景 #92A8CE / 车漆 #FF0000」毫无关系；
+       * 实测 fantasticcar 整场近黑（mean=6）而官方是蓝天空+红车漆。
+       *
+       * 实现方式：注入 `{user: <属性名>}` 包装而不是当场取值 —— resolveUserProps 会
+       * 就地解成现值（下游 setConstant 读 `.value`），而包装本身留在文档里，
+       * 于是 applyLiveProps 的「材质文档重解」那一步能继续跟随属性热更
+       * （写死数值就会在用户拖滑条后失效）。
+       *
+       * 已有的同名常量不覆盖：编辑器同时写了 `constantshadervalues` 时应以显式值为准
+       * （本机语料 0 例，属防御）。比较大小写不敏感 —— bindConstants 的物性名匹配就是
+       * 大小写不敏感的（见 renderer 的 indexMatMetaLower）。
+       */
+      const applyUserShaderValues = (doc: any): void => {
+        const passes = Array.isArray(doc?.passes) ? doc.passes : [];
+        for (const pass of passes) {
+          const usv = pass && typeof pass === "object" ? pass.usershadervalues : null;
+          if (!usv || typeof usv !== "object") continue;
+          const csv = (pass.constantshadervalues = pass.constantshadervalues || {});
+          const taken = new Set(Object.keys(csv).map((k) => k.toLowerCase()));
+          for (const [propName, matName] of Object.entries(usv)) {
+            if (typeof matName !== "string" || !matName) continue;
+            if (taken.has(matName.toLowerCase())) continue;
+            csv[matName] = { user: propName };
+            taken.add(matName.toLowerCase());
+          }
+        }
+      };
       const registerMaterialDoc = (doc: any) => {
         if (noMaterialProps || !doc || typeof doc !== "object") return doc;
         materialDocs.push(doc);
+        applyUserShaderValues(doc);
         resolveUserProps(doc, (scene as any).properties || {}, 0);
         return doc;
       };
@@ -3687,6 +3729,11 @@ cfg, source, pkgAbort.signal);
           const mdlEntry = pkg.getEntry(parsedPkg, layer.model);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
+          // [we-scene patch 2026-10-03] `reflected: true` 的对象要**同时**画进
+          // `_rt_Reflection`（关于 y=0 平面的镜像），供地板/桌面这类材质按屏幕 UV 采样。
+          // 标在图层上，渲染侧的 renderReflectionPass 按它筛（fantasticcar 的
+          // Dome 与 Car 是官方内置里唯一的两个）。
+          (layer as any).reflected = (layer as any).srcObject?.reflected === true;
           let texName: string | null = null;
           if (mdlObj.materialPath) {
             const matEntry = pkg.getEntry(parsedPkg, mdlObj.materialPath);
@@ -3714,10 +3761,20 @@ cfg, source, pkgAbort.signal);
                   // 材质声明的**全部**槽位（car 的 g_Texture1 是法线贴图）：缺槽渲染侧绑白纹理，
                   // 不预载的话采样得到 (0,0,0,1) → 光照项为 0 → 模型整片黑。
                   textures: [],
+                  // [we-scene patch 2026-10-03] `"_rt_Reflection"` 槽（fantasticcar 的地板
+                  // grid.frag 拿它当反照率）要的是**本帧的镜像渲染目标**，不是一个文件：
+                  // 宿主把名字标成 `{rtName}` 传给渲染侧，渲染侧在画这层之前先跑一趟
+                  // 反射（`reflected: true` 的模型层 + y=0 镜像），见 renderReflectionPass。
+                  needsReflection: false,
                 };
                 for (const tn of pass0.textures || []) {
-                  if (typeof tn !== "string" || !tn || tn.startsWith("_rt_")) {
+                  if (typeof tn !== "string" || !tn) {
                     (layer as any).meshMaterial.textures.push(null);
+                    continue;
+                  }
+                  if (tn.startsWith("_rt_")) {
+                    (layer as any).meshMaterial.textures.push({ rtName: tn });
+                    if (tn === "_rt_Reflection") (layer as any).meshMaterial.needsReflection = true;
                     continue;
                   }
                   try {
@@ -3975,6 +4032,68 @@ cfg, source, pkgAbort.signal);
         }
       }
 
+      /**
+       * [we-scene patch 2026-10-03] **场景级相机路径**（`scene.json` 的
+       * `camera.paths: ["scripts/camera_00.json", …]`）。
+       *
+       * 与上面那段（相机**对象**的 `path`）是同名的两种格式，见
+       * `render/camera-path.js` 的 createSceneCameraPath 头注。这里只负责装配：
+       * 逐文件取包内 JSON，合成一个 ticker 挂在场景上。
+       *
+       * 为什么必须做：官方内置 6 个 3D 工程（arsenal/demon_core/dna_fragment/
+       * fantasticcar/neon_sunset/ricepod）**都没有相机实体**、只录了路径 ——
+       * 全库 366 个场景里带 scene.camera.paths 的正好是这 6 个（工坊作者不用这条）。
+       * 不解析就回落顶层 `scene.camera` 的编辑器视口快照：实测 fantasticcar 静照
+       * 机位在车尾、路径第 0 段在车头右前方，与官方出图整个取景不同。
+       */
+      let sceneCamPath: any = null;
+      {
+        const declPaths = (scene as any)?.camera?.paths;
+        if (Array.isArray(declPaths) && declPaths.length) {
+          const clips: any[] = [];
+          let missing = 0;
+          for (const rel of declPaths) {
+            if (typeof rel !== "string" || !rel) continue;
+            try {
+              const entry = pkg.getEntry(parsedPkg, rel);
+              if (!entry) {
+                missing++;
+                continue;
+              }
+              const doc = eff.parseJsonTolerant(readText(entry));
+              for (const c of (Array.isArray(doc) ? doc : doc?.paths) || []) clips.push(c);
+            } catch (e) {
+              reportDiag(rt, cfg, `场景相机路径 '${rel}' 解析失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn");
+            }
+          }
+          const built = camPathLib.createSceneCameraPath(clips);
+          if (built.clips.length) {
+            sceneCamPath = built;
+            // 相机实体优先（作者显式摆的机位比编辑器录的路径更具体）；没有实体才用路径。
+            if (!(scene as any).runtimeCamera) {
+              const first = built.tick(0);
+              if (first) {
+                (scene as any).runtimeCamera = {
+                  eye: first.eye.slice(),
+                  center: first.center.slice(),
+                  up: first.up.slice(),
+                  fov: first.fov ?? 0,
+                  angles: [0, 0, 0],
+                };
+              }
+            }
+            reportDiag(
+              rt,
+              cfg,
+              `场景相机路径: ${built.clips.length} 段 / ${Math.round(built.duration)}s（${declPaths.length} 个文件${missing ? `，${missing} 个不在包内` : ""}）`,
+              missing ? "warn" : "info",
+            );
+          } else if (missing === declPaths.length) {
+            reportDiag(rt, cfg, `场景相机路径: ${declPaths.length} 个文件都不在包内，回退静态相机`, "warn");
+          }
+        }
+      }
+
       // [we-scene patch 2026-09-28] 场景平行光 → 3D 网格光照。
       //
       // 为什么必须做：WE 的真 3D 网格（generic4 材质）是**上光**的 —— 作者素材实测
@@ -4051,6 +4170,19 @@ cfg, source, pkgAbort.signal);
           return
         }
         if (rcAny.center) rcAny.center = null
+        // [we-scene patch 2026-10-03] **场景级相机路径**（无相机实体时的运行时相机）：
+        // 每帧按场景时间求值，写 eye/center/up（up 也要写 —— 路径录了滚转，
+        // 只给 eye/center 会丢掉侧倾，见 buildCamera 的 upV 分支）。
+        if (sceneCamPath && !cameraLayers.length) {
+          const pose = sceneCamPath.tick(tSec)
+          if (pose) {
+            rcAny.eye[0] = pose.eye[0]; rcAny.eye[1] = pose.eye[1]; rcAny.eye[2] = pose.eye[2]
+            rcAny.center = [pose.center[0], pose.center[1], pose.center[2]]
+            if (Array.isArray(pose.up)) rcAny.up = [pose.up[0], pose.up[1], pose.up[2]]
+            if (Number.isFinite(pose.fov) && pose.fov > 0) rcAny.fov = pose.fov
+            return
+          }
+        }
         if (!cameraLayers.length) return
         let active: any = null
         for (const c of cameraLayers) if (c.visible) active = c
