@@ -110,6 +110,26 @@ export function parseMDL(buf) {
   const mdlFlag = dv.getUint32(9, true)
   const skinCount = dv.getUint32(13, true)
   const meshCount = dv.getUint32(17, true)
+  /**
+   * [we-scene patch 2026-10-03] **顶点区长度字段在全部 `skinCount` 条材质串之后**（F30）。
+   *
+   * 此前的锚点是「第一条材质串的 null 之后」—— 单皮肤模型（skin_count=1）恰好也是
+   * 「全部材质串之后」，所以 573/577 的工坊语料看不出问题；**多皮肤**模型则整层解析失败：
+   * audiophile `models/grid/grid.mdl`（176B，skin_count=2：`grid/grid.json` +
+   * `grid/grid2.json`）在旧锚点读到 1818323314（第二条串里的 "id2." 四个字节）→
+   * 24 个候选全不自洽 → 抛「顶点区长度异常」→ 那面会反光的网格地板整层不画
+   * （官方 preview 里它托着所有音条）。
+   *
+   * 旧锚点仍**排在前面**（单皮肤模型行为逐位不变；多皮肤模型先试旧锚点、失败再试新锚点，
+   * 打分/自洽规则完全复用）。锚点走到文件尾就放弃，不越界读。
+   */
+  let matAll = mat.next
+  for (let i = 1; i < skinCount && matAll < dv.byteLength; i++) {
+    const c = readCStr(dv, matAll)
+    if (!c || !(c.next > matAll)) break
+    matAll = c.next
+  }
+  const anchors = mat.next === matAll ? [mat.next] : [mat.next, matAll]
   // 版本 → [长度字段相对 mat.next 的偏移, 顶点 stride, 各字段在顶点内的偏移]
   // 注意 readCStr 的 next 已跳过 null 终止符，所以这里的偏移是「null 之后」再数。
   // [we-scene patch] **MDLV0013 是「null 之后 +4、stride 52」** —— 顶点布局与 0016
@@ -174,36 +194,42 @@ export function parseMDL(buf) {
   let L = null
   let vertexBytes = 0
   let vbOff = 0
-  for (const cand of LAYOUTS) {
-    const off = mat.next + cand.lenOff
-    if (off + 4 > buf.byteLength) continue
-    const n = dv.getUint32(off, true)
-    const markerOk = cand.formatMarker === undefined || dv.getUint32(mat.next + 28, true) === cand.formatMarker
-    if (markerOk && n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength
-      && layoutFieldsSelfConsistent(dv, off + 4, n / cand.stride, cand)) {
-      L = cand
-      vertexBytes = n
-      vbOff = off
-      break
+  for (const anchor of anchors) {
+    for (const cand of LAYOUTS) {
+      const off = anchor + cand.lenOff
+      if (off + 4 > buf.byteLength) continue
+      const n = dv.getUint32(off, true)
+      const markerOk = cand.formatMarker === undefined || dv.getUint32(anchor + 28, true) === cand.formatMarker
+      if (markerOk && n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength
+        && layoutFieldsSelfConsistent(dv, off + 4, n / cand.stride, cand)) {
+        L = cand
+        vertexBytes = n
+        vbOff = off
+        break
+      }
     }
+    if (L) break
   }
   if (!L && srcCandidates.length) {
     // 源码族：多个候选都「结构自洽」是常态（stride 16 之类也能整除），所以按分数取最优 ——
     // 预测 stride 优先，其次看末 8 字节是否像 UV（落在有限区间内的占比）。
+    // 锚点先旧后新；`total > bestScore` 是严格比较，同分时旧锚点胜（单皮肤行为不变）。
     let best = null
     let bestScore = -1
-    for (const cand of srcCandidates) {
-      const off = mat.next + cand.lenOff
-      if (off + 4 > buf.byteLength) continue
-      const n = dv.getUint32(off, true)
-      if (!(n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength)) continue
-      const count = n / cand.stride
-      const score = layoutSourceScore(dv, off + 4, count, cand)
-      if (score < 0) continue
-      const total = score + (cand.predicted ? 2 : 0)
-      if (total > bestScore) {
-        bestScore = total
-        best = { L: cand, n, off }
+    for (const anchor of anchors) {
+      for (const cand of srcCandidates) {
+        const off = anchor + cand.lenOff
+        if (off + 4 > buf.byteLength) continue
+        const n = dv.getUint32(off, true)
+        if (!(n > 0 && n % cand.stride === 0 && off + 4 + n <= buf.byteLength)) continue
+        const count = n / cand.stride
+        const score = layoutSourceScore(dv, off + 4, count, cand)
+        if (score < 0) continue
+        const total = score + (cand.predicted ? 2 : 0)
+        if (total > bestScore) {
+          bestScore = total
+          best = { L: cand, n, off }
+        }
       }
     }
     if (best) {

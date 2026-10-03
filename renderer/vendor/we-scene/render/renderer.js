@@ -1635,6 +1635,21 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] g_EffectModelMatrix：PBR 头的 v_WorldPos 用它算世界坐标
     // （fluidsimulation combine LIGHTING=1 的 vert）。此前只有 g_EffectModelViewProjectionMatrix。
     setVal(uni, 'g_EffectModelMatrix', (l) => gl.uniformMatrix4fv(l, false, modelM))
+    // [we-scene patch 2026-10-03] **g_EyePosition**（世界空间眼点，F33）此前从未绑定 ——
+    // 它一直是 uniform 默认的 (0,0,0)，而 WE 的 3D 模型 shader 普遍拿它算视方向：
+    //   `vec3 eyeDir = normalize(g_EyePosition - a_Position);`（technohex 的菲涅尔项
+    //   直接拿它当 glow 强度、car 的 v_Var1 是 viewDir、grid 的 v_HalfDir 是半角向量）。
+    // 影响面：全库 12 个 shader 文件 / 6 张壁纸，**全部是官方内置 3D 族**
+    // （audiophile/fantasticcar 的 grid、demon_core core、dna_fragment dna、ricepod、
+    // techno）—— 工坊作者不写它，与 F21–F28 同族：只在内置壁纸上暴露。
+    // 实测 techno：`v_Dot = pow(dot(eyeDir, normal)*0.5+0.5, 4) * |dot| * 12`，眼点在原点时
+    // 整片地板算出 0 → 六边形网格全黑（官方 preview 是青/黄发光的网格地面）。
+    // 透视场景给世界眼点；2D 正交场景的 cam.eye 是编辑器视口快照（与未绑定时的
+    // (0,0,0) 同为「无意义值」，但至少是确定值），这一族 uniform 只有 3D shader 消费。
+    setVal(uni, 'g_EyePosition', (l) => {
+      const e = (cam && cam.eye) || [0, 0, 0]
+      gl.uniform3f(l, Number(e[0]) || 0, Number(e[1]) || 0, Number(e[2]) || 0)
+    })
     // [we-scene patch] g_LightAmbientColor：genericimage*/PBR shader 的
     // `ambient = g_LightAmbientColor * albedo`。genericimage* 层在 JS 侧已乘
     // ambient（color4），但效果 pass（fluid combine LIGHTING=1）直接读此 uniform，
@@ -2568,7 +2583,7 @@ export function createRenderer(canvas, opts = {}) {
     const useShaderBlend =
       !premultiplied && !groupTarget && needsShaderBlend(layer.colorBlendMode)
     if (useShaderBlend) {
-      const backdrop = captureBackdrop(width, height)
+      const backdrop = backdropForDraw(width, height)
       gl.useProgram(compBlendProg)
       // 结果由 shader 直接算出，GL 混合必须关掉（再叠一次等于混两遍）
       gl.disable(gl.BLEND)
@@ -2728,7 +2743,18 @@ export function createRenderer(canvas, opts = {}) {
     return false
   }
 
-  /** 按程序声明的 attribute 位置，把 mdl 的交错 VBO 绑成一套 VAO（按程序+网格缓存） */
+  /**
+   * 按程序声明的 attribute 位置，把 mdl 的交错 VBO 绑成一套 VAO（按程序+网格缓存）。
+   *
+   * [we-scene patch 2026-10-03] **不要求程序有 a_Position**（F29）。WE 的 shader 里有一类
+   * **NDC 直通**顶点：`bg.vert`（dna_fragment 与 retro 的全屏背景层）声明了 a_Position
+   * 却一次没用，位置由 `gl_Position = vec4(a_TexCoord * 2 - 1, 0.5, 1)` 直接从 UV 算 ——
+   * GL 会把未使用的属性**优化掉**，`getAttribLocation('a_Position')` 返回 -1。
+   * 旧实现在 locPos < 0 时整层放弃（返回 null）→ 自愈闸门判「一个网格都没画出来」→
+   * 该层永久回落通用网格程序（作者的云层/图案混合整条丢失）。
+   * 现在改为「程序要的属性里**至少有一条**能从交错 VBO 供给就建 VAO」：位置由着色器
+   * 自己算的这类 shader 只需要 a_TexCoord。
+   */
   function meshMatVao(progKey, entry, info) {
     const key = progKey + '|' + meshIdOf(info)
     if (meshMatVaoCache.has(key)) return meshMatVaoCache.get(key)
@@ -2736,24 +2762,28 @@ export function createRenderer(canvas, opts = {}) {
     const locUv = gl.getAttribLocation(entry.prog, 'a_TexCoord')
     const locNrm = gl.getAttribLocation(entry.prog, 'a_Normal')
     const locTan = gl.getAttribLocation(entry.prog, 'a_Tangent4')
+    const bindNrm = locNrm >= 0 && info.hasNormals
+    const bindTan = locTan >= 0 && info.hasTangents
     let vao = null
-    if (locPos >= 0) {
+    if (locPos >= 0 || locUv >= 0 || bindNrm || bindTan) {
       const stride = info.floatStride * 4
       vao = glReg.vertexArray(gl.createVertexArray()) // 登记表：上下文丢失/卸载时可确定性释放
       gl.bindVertexArray(vao)
       gl.bindBuffer(gl.ARRAY_BUFFER, info.vbuf)
-      gl.enableVertexAttribArray(locPos)
-      gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, stride, 0)
+      if (locPos >= 0) {
+        gl.enableVertexAttribArray(locPos)
+        gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, stride, 0)
+      }
       if (locUv >= 0) {
         gl.enableVertexAttribArray(locUv)
         gl.vertexAttribPointer(locUv, 2, gl.FLOAT, false, stride, 12)
       }
-      if (locNrm >= 0 && info.hasNormals) {
+      if (bindNrm) {
         gl.enableVertexAttribArray(locNrm)
         gl.vertexAttribPointer(locNrm, 3, gl.FLOAT, false, stride, info.normalOffset >= 0 ? info.normalOffset : 52)
       }
       // 切线（vec4：xyz + handedness），交错布局的末段（见 mdl.js ensureMesh）
-      if (locTan >= 0 && info.hasTangents) {
+      if (bindTan) {
         gl.enableVertexAttribArray(locTan)
         gl.vertexAttribPointer(locTan, 4, gl.FLOAT, false, stride, info.tangentOffset >= 0 ? info.tangentOffset : 64)
       }
@@ -3155,6 +3185,30 @@ export function createRenderer(canvas, opts = {}) {
     return backdropTex
   }
 
+  /**
+   * [we-scene patch 2026-10-03] 给「采样身后画面」的绘制取一张**不会与自己打架**的底图（F32）。
+   *
+   * 为什么需要它：`captureBackdrop` 在 HDR 场景下**故意**返回 fp16 场景纹理本身
+   * （passthrough/REFRACT/效果链读它才不会被 8bit 截断），而 shader-blend 这一趟
+   * 是先 `bindFinal()`（HDR 下就是同一个 FBO）再采样它 —— **采样目标同时是渲染目标**，
+   * WebGL 判为反馈环，`drawArrays` 抛 INVALID_OPERATION（1282）并**丢弃这次绘制**。
+   * 症状：razer_bedroom 的 6 个 cbm=11/12 图层（glow2/3/4、NEON、hue-bulb、一条 wave）
+   * 全部不出现，诊断里只留两条 `bloom glErr=1282`（错误被 bloom 的 getError 顺带读走）。
+   * 修法与 MSAA 分支同款：先把场景纹理 blit 到一块独立 FBO，采样那份拷贝。
+   * 池化 FBO 按 `fboStamp` 在本帧末回收，逐帧复用不会累积。
+   */
+  function backdropForDraw(width, height) {
+    const bd = captureBackdrop(width, height)
+    if (!(hdrActive && hdrSceneFbo && bd === hdrSceneFbo.tex)) return bd
+    const scratch = getFBO(width, height, 'hdrBackdrop')
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, hdrSceneFbo.fbo)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, scratch.fbo)
+    gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null)
+    return scratch.tex
+  }
+
   // [we-scene patch] 内置 Bloom 后期（general.bloom）。「部分壁纸提供 HDR 属性、
   // 切换后无任何效果」的根因：hdr 属性绑在 general.bloom 上（2902406982 /
   // 3287715210 / 3299228616 / 3764725758），而内置 Bloom 此前没有任何消费者。
@@ -3226,9 +3280,17 @@ export function createRenderer(canvas, opts = {}) {
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
     bloomFrameCount++
     if (bloomFrameCount === 1 || bloomFrameCount === 120 || bloomFrameCount === 600) {
+      // [we-scene patch 2026-10-03] **HDR 回读必须用 FLOAT/32 位**（F31）。
+      // 这里此前写的是 `type = HALF_FLOAT` + `Float32Array` —— 类型与数组位宽不匹配，
+      // readPixels 当场抛 INVALID_OPERATION（1282）、像素一个字节都不写，于是：
+      //   · 诊断本身成了「可疑渲染异常」（razer_bedroom / shimmering_particles 的
+      //     `bloom glErr=1282` 就是它，被记进 DEFAULTPROJECTS-PLAN 的疑似缺陷清单）；
+      //   · 读回来恒是 `[0,0,0,0]`，把「HDR 场景的 bloom 强度」这条观测整个废掉。
+      // WebGL2 对浮点目标的规定组合是 RGBA + FLOAT + Float32Array（HALF_FLOAT 要配
+      // Uint16Array）；RGBA16F 可渲染本身就意味着 EXT_color_buffer_float 在位。
       const px = hdrActive ? new Float32Array(4) : new Uint8Array(4)
       gl.bindFramebuffer(gl.FRAMEBUFFER, bufA.fbo)
-      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, hdrActive ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, px)
+      gl.readPixels(bw >> 1, bh >> 1, 1, 1, gl.RGBA, hdrActive ? gl.FLOAT : gl.UNSIGNED_BYTE, px)
       bindFinal()
       diag(`bloom frame ${bloomFrameCount}: center=[${[...px].map((x) => +x.toFixed(3))}] glErr=${gl.getError()} threshold=${p.threshold} strength=${p.strength} metric=${p.metric} hdr=${hdrActive}`)
     }
