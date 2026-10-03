@@ -1738,7 +1738,14 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   {
     const seen = new Set()
     code = code.split('\n').map((line) => {
-      const m = /^[ \t]*uniform[ \t]+(?:highp|mediump|lowp[ \t]+)?[A-Za-z0-9_]+[ \t]+([A-Za-z_][A-Za-z0-9_]*)/.exec(line)
+      // [we-scene patch 2026-10-03] 限定符分组**三种都要带尾随空白**：此前只有 `lowp`
+      // 带 `[ \t]+`，`highp|mediump` 没有 —— 于是 `uniform mediump float gA;` 会回退成
+      // 「限定符不匹配」，让 `[A-Za-z0-9_]+` 吃掉 `mediump`、名字组捕获到 **`float`**：
+      // 连续两条 `uniform mediump float …` 就被当成「同名重复声明」，**第二条整行被删**。
+      // 表现是 GL 编译期 `'g_SpecularPower' : undeclared`（fantasticcar car.frag 的
+      // 第二条 material uniform），整条材质链静默回落。极简复现：两条相邻
+      // `uniform mediump float g_A/g_B; // {"material":…}` → g_B 消失。
+      const m = /^[ \t]*uniform[ \t]+(?:(?:highp|mediump|lowp)[ \t]+)?[A-Za-z0-9_]+[ \t]+([A-Za-z_][A-Za-z0-9_]*)/.exec(line)
       if (!m) return line
       const name = m[1]
       if (seen.has(name)) return ''
@@ -1748,6 +1755,21 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   }
 
   // [we-scene patch 3448845950] 四条与「作者手写 GLSL 风格代码」有关的规则。
+  // [we-scene patch 2026-10-03] **textureLod 的字面量 lod**：GLSL ES 3.0 里
+  // `textureLod(sampler2D, vec2, int)` 没有可用重载（无隐式 int→float），
+  // demon_core 的 backgroundsphere 用 `texSample2DLod(tex, uv, 3)` 反复采样云层细节，
+  // 整条材质因此在 GL 编译期失败并静默回落。这里把**字面量 lod** 的调用整体改写为
+  // `texture(...)`（lod 常量下的层级选择在浏览器端本就没有 mip 意义：我们的 .tex 上传
+  // 带 mip，但按层尺寸缩放的采样路径与 WE 的 lod 语义不可比）**只动字面量**：
+  // lod 是变量/表达式时原样保留，宁可让它在编译期报错，也不做语义上说不清的改写。
+  // 回调必须返回**完整调用**（含函数名）——rewriteCall 替换的是整段调用，
+  // 只返回实参会把函数名吃掉（曾产出 `g_Texture1, uv, 3.r` 这种残码）。
+  code = rewriteCall(code, 'textureLod', (inner) => {
+    const args = splitArgs(inner)
+    if (args.length === 3 && /^\s*-?\d+\s*$/.test(args[2])) return 'texture(' + args[0] + ', ' + args[1] + ')'
+    return 'textureLod(' + args.join(', ') + ')'
+  })
+
   // ① `int(expr)` 强制转换参与**浮点**运算/比较：HLSL 会把 int 隐式提升为 float
   //    （`(int(barFreq1) + 0.5) / audioResolution` 是 3082978660 的
   //    Simple_Audio_Bars 取外部音频缓冲的写法），GLSL ES 3.0 报

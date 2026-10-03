@@ -367,6 +367,53 @@ vec3 DecompressNormal(vec4 tex) {
     vec2 xy = tex.xy * 2.0 - 1.0;
     return vec3(xy, sqrt(clamp(1.0 - dot(xy, xy), 0.0, 1.0)));
 }
+// [we-scene patch 2026-10-03] 下面这批按**官方语义**补齐（F18）：官方头里还有
+// DecompressNormalWithMask / ComputeMaterialSpecular* / ComputeLight* / Convert* 一族，
+// 作者的 PBR 类材质 shader（fantasticcar car、demon_core core/backgroundsphere…）
+// 直接调用它们；缺了就在 GL 编译期报 no matching overload，整条材质静默回落。
+// 与格式相关的分支按「**本仓贴图一律解码成 RGBA**」折叠：ETC1/DXT/RG88 的通道重排
+// 在运行时不可达（解码层已经还原成 RGBA），保留分支只会引入未定义宏的比较。
+vec4 DecompressNormalWithMask(vec4 normal) {
+    normal.xw = normal.wx;
+    normal.xy = normal.xy * 2.0 - 1.0;
+    normal.z = sqrt(clamp(1.0 - normal.x * normal.x - normal.y * normal.y, 0.0, 1.0));
+    return normal;
+}
+float ComputeMaterialSpecularPower(float roughness, float metallic) {
+    return (1.01 - roughness) * mix(400.0, 250.0, metallic);
+}
+float ComputeMaterialSpecularStrength(float roughness, float metallic) {
+    return (0.5 + metallic * 0.5) * (1.0 - roughness * 0.9);
+}
+vec3 ComputeLight(vec3 normal, vec3 lightDelta, vec3 color, float radius) {
+    float lightDistance = length(lightDelta);
+    float lightAttn = clamp((radius - lightDistance) / radius, 0.0, 1.0);
+    return color * clamp(dot(lightDelta / lightDistance, normal), 0.0, 1.0) * lightAttn * lightAttn;
+}
+vec3 ComputeLightSpecular(vec3 normal, vec3 lightDelta, vec3 color, float radius, vec3 viewDir,
+                          float specularPower, float specularStrength, float halfLambert,
+                          float metallicTerm, inout vec3 specularResult) {
+    float lightDistance = length(lightDelta);
+    float lightAttn = clamp((radius - lightDistance) / radius, 0.0, 1.0);
+    vec3 lightDir = lightDelta / lightDistance;
+    float specular = max(0.0, dot(normalize(viewDir + lightDir), normal));
+    specularResult += pow(specular, specularPower) * specularStrength * lightAttn * color;
+    float lightDot = dot(lightDir, normal);
+    float halfLambertLight = lightDot * 0.5 + 0.5;
+    lightDot = mix(lightDot, halfLambertLight, halfLambert);
+    float rim = metallicTerm * 2.0;
+    rim = pow((1.0 - clamp(dot(normal, viewDir), 0.0, 1.0)) * pow(halfLambertLight, 0.25), 6.0 - rim) * rim;
+    return color * (clamp(lightDot, 0.0, 1.0) + rim) * lightAttn * lightAttn;
+}
+float ConvertSampleR8(vec4 sample0) {
+    return sample0.r;
+}
+vec4 ConvertTexture0Format(vec4 sample0) {
+    return sample0;
+}
+vec4 ConvertTextureFormat(int format, vec4 sample0) {
+    return sample0;
+}
 `,
   // WE common_vertex.h：**只被 include，不提供任何符号**。
   // 全库仅 2 个文件包含它（flowimage.vert / cutout_vignette.vert），
