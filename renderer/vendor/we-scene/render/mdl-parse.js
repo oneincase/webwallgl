@@ -243,22 +243,24 @@ export function parseMDL(buf) {
     throw new Error('顶点区长度异常（' + magic + '，已试 stride ' + [...new Set(tried)].join('/') + '）')
   }
   const vertStart = vbOff + 4
-  const vertexCount = vertexBytes / L.stride
+  // 单网格字段：**上面那套布局猜测**读出来的（无 mesh 表的模型只有这一套）。
+  // 有 mesh 表且两套顶点数不一致时，下面会被 mesh0 覆盖 —— 见「同源闸门」注释。
+  let vertexCount = vertexBytes / L.stride
 
-  const positions = new Float32Array(vertexCount * 3)
-  const uvs = new Float32Array(vertexCount * 2)
-  const boneIdx = new Float32Array(vertexCount * 4) // 顶点属性用 float 传（WebGL2 attribute）
-  const weights = new Float32Array(vertexCount * 4)
+  let positions = new Float32Array(vertexCount * 3)
+  let uvs = new Float32Array(vertexCount * 2)
+  let boneIdx = new Float32Array(vertexCount * 4) // 顶点属性用 float 传（WebGL2 attribute）
+  let weights = new Float32Array(vertexCount * 4)
   // [we-scene patch 2026-10-03] **法线 / 切线**（F22）：源码族的候选布局此前只继承
   // uv/bone/weight —— 预测命中时 `lay.normal` 没带过来，于是内置 3D 工程（fantasticcar
   // dome/car/grid/shadow…）的单网格模型**一个法线都没读出来**。材质路径的
   // `a_Normal` 因此没有可绑的数据：声明了法线的程序要么 b 掉、要么读到常量 (0,0,0)，
   // 车漆的 N·L 全零 → 整车黑。切线同理（car.vert 的 NORMALMAP 分支要 a_Tangent4）。
   // 两个字段都按 vertexLayoutOf 的位推导，未声明时保持 null（与改动前逐位一致）。
-  const normals = L.normal >= 0 ? new Float32Array(vertexCount * 3) : null
-  const tangents = L.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
+  let normals = L.normal >= 0 ? new Float32Array(vertexCount * 3) : null
+  let tangents = L.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
   // [we-scene patch 2026-10-03] 第二套 UV（光照图 UV，见 vertexLayoutOf 的 UV2 注释）
-  const uv2s = L.uv2 >= 0 && L.uv2 !== undefined ? new Float32Array(vertexCount * 2) : null
+  let uv2s = L.uv2 >= 0 && L.uv2 !== undefined ? new Float32Array(vertexCount * 2) : null
   for (let i = 0; i < vertexCount; i++) {
     const b = vertStart + i * L.stride
     positions[i * 3] = dv.getFloat32(b, true)
@@ -292,13 +294,44 @@ export function parseMDL(buf) {
   const idxByteLen = dv.getUint32(vertStart + vertexBytes, true)
   const idxStart = vertStart + vertexBytes + 4
   // 真 3D 网格顶点常超过 65535（3509243656 地球 52 万顶点），索引是 u32。
-  const useU32 = vertexCount > 65535 && idxByteLen % 4 === 0
-  const indexCount = useU32 ? idxByteLen / 4 : idxByteLen / 2
-  const indices = useU32 ? new Uint32Array(indexCount) : new Uint16Array(indexCount)
+  let useU32 = vertexCount > 65535 && idxByteLen % 4 === 0
+  let indexCount = useU32 ? idxByteLen / 4 : idxByteLen / 2
+  let indices = useU32 ? new Uint32Array(indexCount) : new Uint16Array(indexCount)
   if (useU32) {
     for (let i = 0; i < indexCount; i++) indices[i] = dv.getUint32(idxStart + i * 4, true)
   } else {
     for (let i = 0; i < indexCount; i++) indices[i] = dv.getUint16(idxStart + i * 2, true)
+  }
+
+  // [we-scene patch 2026-10-04] **mesh 表（文件声明的布局）压过单网格猜测**（F48）。
+  //
+  // 现象：3254178774 的古风人物 puppet 整个炸成横扫屏幕的碎三角 —— 顶点被扯到图集各处。
+  // 原因：顶点区字节数同时被多个 stride 整除时，上面那套**猜测**会命中错的候选。本例
+  //   MDLV0019 的顶点区 10848B = 226×48（mesh 表声明的 flag 0xf 布局：pos/normal/
+  //   tangent/uv）也 = 339×32（源码族回退候选：只声明 pos+uv，UV 读在 stride−8=24）。
+  //   两个候选都「结构自洽」（位置落在 ±2053 像素、UV 落在 [0,1] —— 后者读到的是记录
+  //   里的切线/法线/扁平 z 分量，恰好也在这个区间），评分挑了 32 ⇒ 单网格字段整体
+  //   错位解读：位置每 32B 取一个、骨索引全 0、权重恒 (1,0,0,0)（回退候选没声明
+  //   bone/weight，走 else 分支）。单网格模型（mesh_count=1）用的正是这套字段，
+  //   于是整个模型炸开。
+  //
+  // 判据只一条：**mesh0 的顶点数与单网格字段不一致 ⇒ 猜测走偏**，整块换成 mesh0。
+  // 一致时逐位不变（全库 597 个模型实测只有本文件不一致；verify-mdl-sections 的
+  // 「子网格0 与单网格字段同源」断言就是这条的常设门）。
+  const meshes = parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, 0x15)
+  if (meshes && meshes.length > 0 && meshes[0].vertexCount !== vertexCount) {
+    const m0 = meshes[0]
+    vertexCount = m0.vertexCount
+    positions = m0.positions
+    uvs = m0.uvs
+    boneIdx = m0.boneIdx
+    weights = m0.weights
+    normals = m0.normals || null
+    tangents = m0.tangents || null
+    uv2s = m0.uv2 || null
+    indices = m0.indices
+    indexCount = m0.indexCount
+    useU32 = m0.indexType === 'u32'
   }
 
   // [we-scene patch 2026-09-28] MDLV 部件表（mdlv>=21 才有）。渲染侧要按**零件**决定
@@ -520,10 +553,11 @@ export function parseMDL(buf) {
     indexType: useU32 ? 'u32' : 'u16',
     indices,
     // [we-scene patch 2026-09-28] 全部子网格（见 parseMeshes 头注）。1 个网格的模型
-    // 与上面那套单网格字段逐位相同；>1 时渲染侧必须逐个画，否则只剩第一个子网格。
+    // 与上面那套单网格字段逐位相同（**同源闸门**：不一致时上面已换成 mesh0，见那条
+    // 注释）；>1 时渲染侧必须逐个画，否则只剩第一个子网格。
     // 起点 0x15 = 第一条材质路径（与上面读 mat 同一个锚点）：遍历自己会把
     // skin_count 条材质全部读掉，不能从 mat.next 起（那会多吃一条）。
-    meshes: parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, 0x15),
+    meshes,
     bones,
     // MDLS 尾部的静态装配姿势（无 MDLA 的模型才有）：TRS 九分量 + 原始局部矩阵
     staticPoseTRS: staticTRS,
