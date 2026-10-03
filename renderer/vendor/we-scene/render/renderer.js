@@ -547,6 +547,17 @@ export function litBaseLocalToWorld(worldModel, fboW, fboH) {
 export function collectSceneLights(layers, cam, lane = 'v1') {
   const positions = new Float32Array(MAX_SCENE_LIGHTS * 3)
   const colors = new Float32Array(MAX_SCENE_LIGHTS * 3)
+  // [we-scene patch 2026-10-03] **纯颜色**（不乘 intensity，F39）：同一条老通道的两份
+  // uniform 面向**不同消费公式**，引擎给的量也不同 ——
+  //   · `g_LightsColorRadius.rgb`（generic/generic2 走 `ComputeLight`）
+  //   · `g_LightsColorPremultiplied.rgb`（genericimage2 走 `color×强度×radius²/d²`）
+  // 证据链：① arsenal 官方 `preview.jpg` 的最亮 5% 均值 RGB = (182,158,121)（暖、不饱和），
+  // 而我们（rgb=色×强度=1.87 白灯主导）是 (253,248,235) 且 ≥250 占 3.2% —— 官方那盏白灯
+  // 的贡献明显更小；② 同一份取证里 genericimage2 的 `color×强度×radius²/d²` 是**已被
+  // 2890473419 的官方预览标定过**的，不能动 ⇒ 强度只进预乘那一份。
+  // 影响面（全库 366 包 + 官方 assets 交叉查）：读 `g_LightsColorRadius` 的只有
+  // arsenal 的 `generic` 与 demon_core 的 `core`；`g_LightsColorPremultiplied` 本仓无人读。
+  const plainColors = new Float32Array(MAX_SCENE_LIGHTS * 3)
   const radii = new Float32Array(MAX_SCENE_LIGHTS)
   const exponents = new Float32Array(MAX_SCENE_LIGHTS)
   const used = []
@@ -560,12 +571,14 @@ export function collectSceneLights(layers, cam, lane = 'v1') {
     if (layer.visible === false) continue
     const p = lightWorldPosition(layer, cam)
     const c = lightColorIntensity(layer)
+    const raw = (layer && layer.color) || [1, 1, 1]
     positions.set(p, slot * 3)
     colors.set(c, slot * 3)
+    plainColors.set([Number(raw[0]) || 0, Number(raw[1]) || 0, Number(raw[2]) || 0], slot * 3)
     radii[slot] = lightRadiusOf(layer)
     exponents[slot] = lightExponentOf(layer)
   }
-  return { count, positions, colors, radii, exponents, used }
+  return { count, positions, colors, plainColors, radii, exponents, used }
 }
 
 export function bloomPostParams(general) {
@@ -1650,8 +1663,11 @@ export function createRenderer(canvas, opts = {}) {
       const r = L.radii[i] || 0
       const cr = r * r
       for (let k = 0; k < 3; k++) {
-        const c = L.colors[i * 3 + k] || 0
-        legacyLightColorRadius[i * 4 + k] = c
+        const c = L.colors[i * 3 + k] || 0            // color × intensity（预乘那份用）
+        const plain = (L.plainColors && L.plainColors[i * 3 + k]) || 0
+        // `g_LightsColorRadius.rgb` = 纯颜色（见 collectSceneLights 的 F39 注释：官方
+        // generic.frag 这条通道不含 intensity —— arsenal 官方预览的暖色池子是判据）
+        legacyLightColorRadius[i * 4 + k] = plain
         legacyLightPremultiplied[i * 3 + k] = c * cr
       }
       legacyLightColorRadius[i * 4 + 3] = r

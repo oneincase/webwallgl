@@ -970,6 +970,31 @@ const ids = fs.existsSync(LIB)
   ))
     fail("parse 未按 `l` 前缀给灯标通道（lpoint/lspot 走 V1，point 走老通道）");
 }
+// ---------- 13. 老通道两份 light uniform 的**量不同**（F39）----------
+//
+// 引擎给同一条老通道两份 uniform，面向不同消费公式、量也不同：
+//   · `g_LightsColorRadius.rgb` = **纯颜色**（generic/generic2 → `ComputeLight`）
+//   · `g_LightsColorPremultiplied.rgb` = 色×强度×radius²（genericimage2 → `color×强度×radius²/d²`，
+//     已被 2890473419 的官方预览标定过，不能动）
+// 证据：arsenal 官方 `preview.jpg` 最亮 5% 均值 RGB=(182,158,121) 暖而不饱和、整图 ≥250 占 0.02%；
+// 而按「色×强度」绑（白灯 1.87 主导）实测 (253,248,235)、≥250 占 3.2% —— 修后是 (112,115,148)、
+// 0.01%，与官方均值 61.2 vs 60.8 基本重合。影响面：全库读 ColorRadius 的只有 arsenal `generic`
+// 与 demon_core `core`（`Premultiplied` 本仓无人读，官方 assets 里是 genericimage2）。
+{
+  const rsrc2 = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  // 绑定**使用** plain 是关键（只断言表存在会漏：改成 c 也能通过 —— 第一版判据就被变异测试逮到）
+  if (!/legacyLightColorRadius\[i \* 4 \+ k\] = plain/.test(rsrc2)) {
+    fail("g_LightsColorRadius 必须绑纯颜色（plain）：色×强度是预乘那份的口径（F39）");
+  }
+  if (!/legacyLightPremultiplied\[i \* 3 \+ k\] = c \* cr/.test(rsrc2)) {
+    fail("g_LightsColorPremultiplied 必须保持 色×强度×radius²（genericimage2 的标定口径）");
+  }
+  if (!/const plainColors = new Float32Array\(MAX_SCENE_LIGHTS \* 3\)/.test(rsrc2)) {
+    fail("collectSceneLights 未产出纯颜色表（F39）");
+  }
+  if (!errors.length) ok("老通道两份 light uniform 口径正确（ColorRadius=纯色 / Premultiplied=色×强度×r²，F39）");
+}
+
 function msrc2() {
   return fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
 }
