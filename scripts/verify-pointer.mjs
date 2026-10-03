@@ -10,7 +10,7 @@
  * 八组校验：
  *   1. OBB hit-test：正变换（逐字复刻 layerModelMatrix + compositeLayer 的
  *      mat4Scale）→ 逆变换往返误差；旋转/缩放/alignment/视差组合；z 序取最上层；
- *      父链隐藏层不参与命中。
+ *      自身不可见的隐形 Solid 点击区仍命中、祖先隐藏才排除。
  *   2. 屏幕→世界换算：cover / contain / stretch 三种 fit 下的往返一致性。
  *   3. 指针源状态机：last 按帧推进（不是按事件）、leftDown 只跟左键、
  *      离开窗口清 leftDown、首帧 last 与 current 对齐。
@@ -343,14 +343,24 @@ console.log('\n【1. OBB hit-test】')
   // z 序 / 可见性
   const big = L({ origin: [500, 500, 0], size: [400, 400], name: 'big' })
   const small = L({ origin: [500, 500, 0], size: [200, 200], name: 'small' })
-  const hidden = L({ origin: [500, 500, 0], size: [300, 300], name: 'hidden', visible: false })
+  // 自身不可见、祖先可见 = 隐形 Solid 点击区（WE 的 cursor 回调只对 Solid 生效，
+  // 点击区被作者设成 visible:false —— 3810092560 的 25 个点击区全是这种）。
+  const hiddenSelf = L({ origin: [500, 500, 0], size: [300, 300], name: 'hiddenSelf', visible: false, ancestorsVisible: true })
+  // 祖先隐藏（parse.js / recomputeLayerVisibility 折叠出的有效 visible=false）：
+  // 仍然不参与命中 —— 3299228616 的 5 套隐藏语言变体靠这一条被排除。
+  const hiddenByAncestor = L({ origin: [500, 500, 0], size: [350, 350], name: 'hiddenByAncestor', visible: false, ancestorsVisible: false })
   const p = forward(small, 0, 0)
-  const top = hitTestLayers([big, hidden, small], p[0], p[1], projH, { alignTable: ALIGN_TABLE })
+  const top = hitTestLayers([big, hiddenSelf, small], p[0], p[1], projH, { alignTable: ALIGN_TABLE })
   if (!top || top.name !== 'small') fail(`z 序未取最上层（得到 ${top && top.name}）`)
   else ok('z 序取最上层命中')
-  const skip = hitTestLayers([big, hidden], p[0], p[1], projH, { alignTable: ALIGN_TABLE })
-  if (!skip || skip.name !== 'big') fail(`隐藏层未被跳过（得到 ${skip && skip.name}）`)
-  else ok('隐藏层（父链不可见）不参与命中')
+  const selfHidden = hitTestLayers([big, hiddenSelf], p[0], p[1], projH, { alignTable: ALIGN_TABLE })
+  if (!selfHidden || selfHidden.name !== 'hiddenSelf') {
+    fail(`自身不可见的层被排除（得到 ${selfHidden && selfHidden.name}）—— 隐形点击区点不动`)
+  } else ok('自身不可见的层仍参与命中（隐形 Solid 点击区；祖先可见即可）')
+  const ancestorHidden = hitTestLayers([big, hiddenByAncestor], p[0], p[1], projH, { alignTable: ALIGN_TABLE })
+  if (!ancestorHidden || ancestorHidden.name !== 'big') {
+    fail(`祖先隐藏的层未被跳过（得到 ${ancestorHidden && ancestorHidden.name}）`)
+  } else ok('祖先隐藏的层不参与命中（含被祖先折叠出 visible=false 的后代）')
   // filter：只在挂了回调的层里找
   const only = hitTestLayers([big, small], p[0], p[1], projH, { alignTable: ALIGN_TABLE, filter: (l) => l.name === 'big' })
   if (!only || only.name !== 'big') fail('filter 未生效（应跳过未挂回调的上层）')
@@ -1879,14 +1889,15 @@ console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
   })
   const lower = mkLayer('lower')
   const upper = mkLayer('upper')
-  const hidden = mkLayer('hidden', false)
+  // 祖先隐藏的层（有效 visible=false 且祖先不可见）：不参与命中
+  const hidden = Object.assign(mkLayer('hidden', false), { ancestorsVisible: false })
   const px = 500
   const py = projH - 500
   const all = hitTestLayersAll([lower, hidden, upper], px, py, projH, { alignTable: ALIGN_TABLE })
   const names = all.map((l) => l.name)
   if (names.join(',') !== 'upper,lower') {
     fail(`同位两层都应命中且按 z 序自上而下（期望 upper,lower，实得 ${names.join(',') || '空'}）`)
-  } else ok('同位两层都命中并按 z 序自上而下；隐藏层不参与')
+  } else ok('同位两层都命中并按 z 序自上而下；祖先隐藏的层不参与')
   const one = hitTestLayers([lower, hidden, upper], px, py, projH, { alignTable: ALIGN_TABLE })
   if (!one || one.name !== 'upper') fail(`单点查询仍应返回最上层 upper，实得 ${one && one.name}`)
   else ok('单点查询仍是 z 序最上层（与 All 同一实现）')
@@ -2117,6 +2128,190 @@ console.log('\n【9. 光标多命中派发（同位交互区都收事件）】')
             ok(`3801397319 第三次点击照样切换（789 复位到 0 再播到 ${a789.frame.toFixed(0)} 帧，alpha ${Number(alpha3).toFixed(2)}）—— 点 N 次可无限切换`)
           }
         }
+      }
+    }
+  }
+}
+
+
+// ------------------------------- 10. 隐形 Solid 点击区（3810092560 点击互动）
+// 官方 scenescript 参考页：cursor 事件「只对标记为 Solid 的图层生效」——
+// Solid 层就是作者画的点击区，而点击区常被设成 visible:false 当**隐形热区**。
+// 这条判据锁两件事：① 命中门槛必须看祖先可见性而非自身 visible；② 命中之后
+// 整条链（沙箱 cursorDown → thisScene.getLayer 写目标层 → 逐帧 update 挤压 → 复位）
+// 真的能把画面改掉。3810092560 是首个「所有互动层都自身不可见」的语料。
+console.log('\n【10. 隐形点击区（Solid 层 visible:false 仍收 cursor 回调）】')
+{
+  const item = '3810092560'
+  const pkgPath = path.join(LIB, item, 'scene.pkg')
+  if (!fs.existsSync(pkgPath)) {
+    ok(`跳过 ${item} 语料（本机无此壁纸）`)
+  } else {
+    const pkg = parsePkg(fs.readFileSync(pkgPath))
+    const sj = JSON.parse(new TextDecoder().decode(getEntry(pkg, 'scene.json')))
+    const projPath = path.join(LIB, item, 'project.json')
+    const pj = fs.existsSync(projPath) ? JSON.parse(fs.readFileSync(projPath, 'utf8')) : null
+    const scene = parseScene(sj, pj)
+    const orthoH = scene.general && scene.general.orthogonalprojection && scene.general.orthogonalprojection.height
+    const projH = Number(orthoH) || 1440
+    // 运行时 thisScene.getLayer 取**首个**同名层（scene-mount 的 sceneApi.getSceneLayer）。
+    // 不能像别处那样用 Map(名→层) —— 那张图后写覆盖，会指到同名的 Solid 层自身。
+    const getSceneLayer = (n) => scene.layers.find((l) => l.name === String(n) && !l.destroyed) || null
+    const hookLayers = []
+    const scriptDef = new Map()
+    for (const o of sj.objects || []) {
+      for (const f of ['visible', 'origin', 'scale', 'angles', 'alpha', 'color', 'brightness']) {
+        const v = o[f]
+        if (!v || typeof v !== 'object' || typeof v.script !== 'string') continue
+        if (!/export\s+function\s+cursorDown/.test(v.script)) continue
+        const layer = scene.layers.find((l) => l.id === o.id)
+        if (layer) {
+          hookLayers.push(layer)
+          scriptDef.set(layer.id, { script: v.script, props: v.scriptproperties || null })
+        }
+        break
+      }
+    }
+    if (hookLayers.length === 0) {
+      fail(`${item} 语料过期：没有任何 cursorDown 字段脚本`)
+    } else if (!hookLayers.every((l) => l.visibleSelf === false)) {
+      fail(`${item} 语料过期：点击区应全部自身不可见（实得 ${hookLayers.filter((l) => l.visibleSelf !== false).length} 个可见）`)
+    } else if (!hookLayers.every((l) => l.visible === false)) {
+      fail(`${item} 点击区自身不可见时有效 visible 必须是 false（否则渲染会画出黑块）`)
+    } else {
+      // 每个点击区在自己的锚点处必须命中（这些层 alignment 缺省=center、无视差）。
+      // 允许漏的只有「祖先隐藏」的那些（作者本来就把 5 个模型/其父级关掉了：
+      // 22/23 与其父、14/15C —— 它们的目标模型也不上屏，命中与否无画面影响）；
+      // 任何「祖先可见却点不到」的都必须判红，那正是本次修的 bug。
+      const parentHidden = (l) => {
+        let p = l.parentId
+        for (let g = 0; p != null && g < 64; g++) {
+          const par = scene.layers.find((x) => x.id === p)
+          if (!par) return false
+          if (par.visibleSelf === false) return true
+          p = par.parentId
+        }
+        return false
+      }
+      const opt = { alignTable: ALIGN_TABLE, filter: (l) => hookLayers.includes(l) }
+      let hit = 0
+      let unexplained = 0
+      for (const l of hookLayers) {
+        const hits = hitTestLayersAll(scene.layers, l.origin[0], projH - l.origin[1], projH, opt)
+        if (hits.includes(l)) hit++
+        else if (!parentHidden(l)) unexplained++
+      }
+      if (unexplained) {
+        fail(`${item} 有 ${unexplained} 个隐形点击区祖先可见却点不到（自身 visible 被当成命中门槛）`)
+      } else if (hit < 20) {
+        fail(`${item} 只有 ${hit}/${hookLayers.length} 个点击区可命中，低于预期`)
+      } else {
+        ok(`${item} ${hit}/${hookLayers.length} 个隐形 Solid 点击区（visible:false）可命中，` +
+          `其余 ${hookLayers.length - hit} 个祖先隐藏（目标模型本来就不上屏）`)
+      }
+    }
+    // 端到端：真脚本 + 真图层。cursorDown → 目标模型层挤压 → duration 后复位。
+    {
+      const area = hookLayers[0]
+      const def = area && scriptDef.get(area.id)
+      if (!def) {
+        fail(`${item} 取不到点击区脚本（用例过期）`)
+      } else {
+        const shared = {}
+        const dirty = []
+        const sb = evalObjectScript(def.script, def.props, {
+          layer: area,
+          shared,
+          userProperties: {},
+          getSceneLayer,
+          markTransformDirty: (l) => dirty.push(l),
+          onError: () => {},
+        })
+        const tname = String((def.props && def.props.targetLayerNames) || '').split(',')[0].trim()
+        const target = getSceneLayer(tname)
+        if (!sb) {
+          fail(`${item} 点击区脚本沙箱求值返回 null`)
+        } else if (!target || target === area) {
+          fail(`${item} targetLayerNames='${tname}' 未解析到模型层（实得 ${target && target.name}）`)
+        } else {
+          sb.init({ x: 1, y: 1, z: 1 })
+          const st = shared.__squashStretchStates && shared.__squashStretchStates['__squash_' + area.name]
+          const init = (target.localScale || target.scale || []).slice()
+          const realNow = Date.now
+          let fake = 1e6
+          Date.now = () => fake
+          let animating = false
+          let rx = 0
+          let ry = 0
+          let restored = false
+          try {
+            sb.callCursor('cursorDown', { worldPosition: makeCursorEventVec(0, 0, 0) })
+            animating = !!(st && st.animating === true)
+            // t = 0.25 × duration（0.4s → 100ms）正落在挤压峰值：
+            // 第一段末 x = stretchX、第二段初 y = squashY（两段在 t=0.25 处相接）
+            fake += 100
+            sb.callUpdate({ x: 1, y: 1, z: 1 })
+            const mid = target.localScale || target.scale || []
+            rx = mid[0] / (init[0] || 1)
+            ry = mid[1] / (init[1] || 1)
+            // 跑过 duration → 脚本把 target 恢复成 initScales 快照
+            fake += 500
+            sb.callUpdate({ x: 1, y: 1, z: 1 })
+            const end = target.localScale || target.scale || []
+            restored = Math.abs(end[0] - init[0]) < 1e-6 && Math.abs(end[1] - init[1]) < 1e-6
+          } finally {
+            Date.now = realNow
+          }
+          const wantX = Number(def.props && def.props.stretchX) || 1.06
+          const wantY = Number(def.props && def.props.squashY) || 0.82
+          if (sb.errCount > 0) {
+            fail(`${item} cursorDown/update 抛错（errCount=${sb.errCount}）`)
+          } else if (!animating) {
+            fail(`${item} cursorDown 没把挤压状态机打起来（shared 里 animating 非 true）`)
+          } else if (Math.abs(rx - wantX) > 0.02 || Math.abs(ry - wantY) > 0.02) {
+            fail(`${item} 挤压幅度不符：x ${rx.toFixed(3)}（应 ≈${wantX}）、y ${ry.toFixed(3)}（应 ≈${wantY}）`)
+          } else if (!restored) {
+            fail(`${item} duration 过后目标层 scale 未复位（下一轮点击基准会漂）`)
+          } else if (!dirty.includes(target)) {
+            fail(`${item} 目标层是子层，写 scale 必须 markTransformDirty（否则 recompose 会把 local 冲掉）`)
+          } else {
+            ok(`${item} 点击区命中 → 模型层「${target.name}」挤压 x×${rx.toFixed(3)} / y×${ry.toFixed(3)}，` +
+              `${Number(def.props.duration)}s 后复位`)
+          }
+        }
+      }
+    }
+    // 反向对照：祖先隐藏的互动层必须仍被排除（3299228616 的 5 套语言变体）
+    {
+      const p2 = path.join(LIB, '3299228616', 'scene.pkg')
+      if (!fs.existsSync(p2)) {
+        ok('跳过 3299228616 反向对照（本机无此壁纸）')
+      } else {
+        const scene2 = parseScene(JSON.parse(new TextDecoder().decode(getEntry(parsePkg(fs.readFileSync(p2)), 'scene.json'))), null)
+        const hook2 = []
+        for (const l of scene2.layers) {
+          const os = l.objectScripts
+          if (!os) continue
+          if (Object.values(os).some((d) => d && typeof d.script === 'string' && /export\s+function\s+cursor/.test(d.script))) hook2.push(l)
+        }
+        // 每层的语言根层：命中集必须与「根层可见」的那一套一致，且只该有一套
+        const rootOf = (l) => {
+          let cur = l
+          let p = l.parentId
+          for (let g = 0; p != null && g < 64; g++) {
+            const par = scene2.layers.find((x) => x.id === p)
+            if (!par) break
+            cur = par
+            p = par.parentId
+          }
+          return cur
+        }
+        const exposed = hook2.filter((l) => l.ancestorsVisible !== false)
+        const visibleRootCount = new Set(hook2.filter((l) => rootOf(l).visibleSelf !== false).map((l) => rootOf(l).name)).size
+        if (!hook2.length) fail('3299228616 语料过期：没有 cursor 字段脚本层')
+        else if (visibleRootCount !== 1 || exposed.length !== 1) {
+          fail(`3299228616 应只剩 1 套可见语言的互动层可命中（实得可见根 ${visibleRootCount} 套、可命中 ${exposed.length} 层）`)
+        } else ok(`3299228616 反向对照：${hook2.length} 个互动层里只有可见那 1 套（${rootOf(exposed[0]).name}）可命中`)
       }
     }
   }
