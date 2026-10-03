@@ -936,8 +936,10 @@ async function stockTexFormats() {
   check(ptex.convertParticleNormalFormat(plain, 0) === plain, "非 RG88 法线不得被转换");
 
   // 接线：粒子取贴图路径（scene-mount）必须按用途转换格式、优先真帧表、按需拉本机素材、
-  // 且只在 pkg 真有该贴图时才走 pkg 分支（否则 loadTexInner 会把内置贴图提前程序化建出，
+  // 且只在来源真有该贴图时才走普通贴图分支（否则 loadTexInner 会把内置贴图提前程序化建出，
   // 转换与真帧表永远轮不到 —— 这正是接入原版素材后仍然「效果太差」的第二个坑）。
+  // 2026-10-03：「pkg 命中」的说法随松散目录形态（LIBRARY-PLAN §4.3）改成 readAsset ——
+  // 包形态是 pkg 条目（零拷贝视图）、松散形态是按名取散装文件，两者都算「来源命中」。
   const sm = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   const wiring = [
     [/ptex\.convertParticleTexFormat\(gen, gen\.format\)/, "反照率必须过 convertParticleTexFormat"],
@@ -945,7 +947,7 @@ async function stockTexFormats() {
     [/frames: gen\.frames && gen\.frames\.length \? gen\.frames : ptex\.builtinParticleFrames\(name\)/, "帧表必须「原版 TEXS 优先、内置猜测兜底」"],
     [/await ensureLocalAsset\(name\)/, "本机素材必须按需拉取（provider 否则拿不到像素）"],
     [/loadParticleTex\(nrmName, "normal"\)/, "法线槽调用必须带 purpose=normal"],
-    [/pkg\.getEntry\(parsedPkg, `materials\/\$\{name\}\.tex`\) \? await loadTex\(name\) : null/, "必须只在 pkg 命中时走 pkg 分支"],
+    [/\(await readAsset\(`materials\/\$\{name\}\.tex`\)\) \? await loadTex\(name\) : null/, "必须只在来源命中时走普通贴图分支（readAsset：包条目 / 松散散装文件）"],
   ];
   for (const [re, msg] of wiring) check(re.test(sm), `接线：${msg}`);
   // 本机素材装载端也要带上格式与帧表（否则上面两条无从谈起）
