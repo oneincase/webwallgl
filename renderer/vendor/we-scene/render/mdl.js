@@ -456,11 +456,19 @@ export function createMDLRenderer(gl) {
     const vao = gl.createVertexArray()
     gl.bindVertexArray(vao)
     const n = mesh.vertexCount
-    // 交错：pos(3) uv(2) bone(4) weight(4) [normal(3)] = 13 或 16 float
+    // 交错：pos(3) uv(2) bone(4) weight(4) [normal(3)] [tangent(4)] = 13 / 16 / 20 float
     // 有法线的（真 3D 网格 / 无骨骼模型）多交错 3 个 float 供片元光照用；
     // 2D puppet 的 flag 里没有 NORMAL → 布局与改动前逐位一致。
+    // [we-scene patch 2026-10-03] **切线**（F22）追加在末尾：官方 3D 材质 shader 的
+    // NORMALMAP 分支要 `a_Tangent4`（xyz + handedness，fantasticcar `car.vert`），
+    // 没有它整条材质路径 b 掉、只剩黑车壳。只有源码族里声明了 TANGENT 位的网格才多
+    // 交错这 4 个 float；工坊语料（无 TANGENT 位）的布局与改动前逐位一致。
     const hasN = !!mesh.normals
-    const F = hasN ? 16 : 13
+    const hasT = !!mesh.tangents
+    const F = (hasN ? 16 : 13) + (hasT ? 4 : 0)
+    const normalOff = hasN ? 52 : -1
+    // 切线紧跟法线；没有法线时直接接在 weight 之后（flag 允许，源码族暂无此形态）
+    const tangentOff = hasT ? (hasN ? 64 : 52) : -1
     const data = new Float32Array(n * F)
     for (let i = 0; i < n; i++) {
       const o = i * F
@@ -477,6 +485,10 @@ export function createMDLRenderer(gl) {
         data[o + 13] = mesh.normals[i * 3]
         data[o + 14] = mesh.normals[i * 3 + 1]
         data[o + 15] = mesh.normals[i * 3 + 2]
+      }
+      if (hasT) {
+        const t = hasN ? 16 : 13
+        for (let k = 0; k < 4; k++) data[o + t + k] = mesh.tangents[i * 4 + k]
       }
     }
     const vbuf = gl.createBuffer()
@@ -508,11 +520,16 @@ export function createMDLRenderer(gl) {
       ibuf,
       hasNormals: hasN,
       // [we-scene patch 2026-10-03] 供**材质 shader 路径**（F13）复用的几何信息：
-      // 交错布局 pos(3f)@0 / uv(2f)@12 / bone(4f)@20 / weight(4f)@36 / normal(3f)@52，
-      // stride = floatStride*4。材质程序自己声明 attribute 名字与数量，这里只暴露
-      // 「顶点数 / 交错宽度 / 索引类型」，具体绑定由渲染侧按程序的位置做。
+      // 交错布局 pos(3f)@0 / uv(2f)@12 / bone(4f)@20 / weight(4f)@36 / normal(3f)@52
+      // / tangent(4f)@64（后两段按数据存在与否），stride = floatStride*4。
+      // 材质程序自己声明 attribute 名字与数量，这里暴露「顶点数 / 交错宽度 /
+      // 各属性字节偏移 / 索引类型」，具体绑定由渲染侧按程序的位置做。
       vertexCount: n,
       floatStride: F,
+      // 属性字节偏移（-1 = 该网格没有这条数据，声明了它的程序必须回落通用网格程序）
+      normalOffset: normalOff,
+      tangentOffset: tangentOff,
+      hasTangents: hasT,
       indexCount: mesh.indexCount,
       indexU32: mesh.indices instanceof Uint32Array,
     }
@@ -543,6 +560,11 @@ export function createMDLRenderer(gl) {
       uvs: mdl.uvs,
       boneIdx: mdl.boneIdx,
       weights: mdl.weights,
+      // [we-scene patch 2026-10-03] 法线/切线也要透传（F22）：单网格 3D 模型
+      // （retro/ricepod… 的网格层）走这条伪网格，材质 shader 的 a_Normal/a_Tangent4
+      // 只能从这里拿；缺字段时与改动前一致（两处都是 null → 布局不变）。
+      normals: mdl.normals || null,
+      tangents: mdl.tangents || null,
       vertexCount: mdl.vertexCount,
       indices: mdl.indices,
       indexCount: mdl.indexCount,

@@ -170,10 +170,45 @@ function expandMacrosIn(text, depth) {
   return text
 }
 
+/**
+ * [we-scene patch 2026-10-03] **combo 名大小写不敏感**（WE 语义）—— 预处理器里
+ * `#if`/`#ifdef`/`#ifndef` 共用的取值器。
+ *
+ * 判据（官方内置 fantasticcar `materials/car/body.json` + 作者自己的 `car.frag`）：
+ * 材质写 `"combos": {"normalmap":1,"paintwork":1,"metal":1}`（**全小写**），
+ * shader 写 `#ifdef NORMALMAP` / `#if PAINTWORK`（**全大写**）—— 而这张壁纸在 WE 里
+ * 就是这套组合出图的。精确匹配会把三段可选分支整段编译掉：车漆只剩「albedo × 纯白」、
+ * 法线贴图不参与光照（车头朝向镜头的那一面因此全黑）。
+ * 语料分布：工坊 4508 份带 combos 的材质里 2223 个键全大写 / 338 个全小写，
+ * 两侧都有真实样本 ⇒ 只能按「名字相等（忽略大小写）」匹配，不能单边归一化。
+ * **影响面实测**（全库 366 包）：材质键与 shader 里的 combo 名**仅差大小写**的共 11 处 /
+ * 4 张壁纸（fantasticcar 8、retro `dots`、ricepod `selfillum`，全是官方内置族），
+ * 另有 344 处本就精确相等 —— 工坊作者写的键与 shader 一致，本轮对它们零影响。
+ *
+ * 注意只改**预处理器**的求值：代码里作为标识符使用的 combo（`ApplyBlending(BLENDMODE…)`）
+ * 仍按原样替换（见 hlsl2glsl 的 comboNames 段）—— 那里加别名会把作者的普通变量名
+ * 也换掉（例如 combo `VERSION` 的别名会命中代码里的 `version`）。
+ */
+function makeComboLookup(combos) {
+  let lower = null
+  return (name) => {
+    if (!combos) return undefined
+    if (combos[name] !== undefined) return combos[name]
+    if (!lower) {
+      lower = new Map()
+      for (const k of Object.keys(combos)) if (!lower.has(k.toLowerCase())) lower.set(k.toLowerCase(), k)
+    }
+    const k = lower.get(String(name).toLowerCase())
+    return k === undefined ? undefined : combos[k]
+  }
+}
+
 // 求值 #if 表达式（安全自写求值器：|| && ! ( ) == != < > <= >= 数字 标识符）
 function evalIfExpr(expr, combos, defs) {
+  const comboOf = makeComboLookup(combos)
   const resolve = (name) => {
-    if (combos[name] !== undefined) return String(combos[name])
+    const v = comboOf(name)
+    if (v !== undefined) return String(v)
     if (defs.has(name)) return '(' + defs.get(name) + ')'
     return '0'
   }
@@ -344,12 +379,15 @@ function preprocess(src, combos, includeResolver, depth) {
     if (t.startsWith('#ifdef') || t.startsWith('#ifndef') || t.startsWith('#if')) {
       const parent = allActive(stack)
       let cond = false
+      // 预处理器里的 combo 名大小写不敏感（见 makeComboLookup 的注释）：官方内置
+      // 材质写小写 combos、shader 写大写 #ifdef，精确匹配会整段编译掉可选分支。
+      const comboOf = makeComboLookup(combos)
       if (t.startsWith('#ifdef')) {
         const name = t.slice(6).trim().split(/\s+/)[0]
-        cond = combos[name] !== undefined || defs.has(name)
+        cond = comboOf(name) !== undefined || defs.has(name)
       } else if (t.startsWith('#ifndef')) {
         const name = t.slice(7).trim().split(/\s+/)[0]
-        cond = !(combos[name] !== undefined || defs.has(name))
+        cond = !(comboOf(name) !== undefined || defs.has(name))
       } else {
         try {
           cond = !!evalIfExpr(t.slice(3).trim(), combos, defs)

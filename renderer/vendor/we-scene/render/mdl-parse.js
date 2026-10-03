@@ -165,8 +165,8 @@ export function parseMDL(buf) {
         const predicted = stride === lay.stride && lay.stride > 0
         srcCandidates.push(
           predicted
-            ? { lenOff, stride, uv: lay.uv, bone: lay.bone, weight: lay.weight, predicted: true }
-            : { lenOff, stride, uv: stride - 8, bone: -1, weight: -1 },
+            ? { lenOff, stride, uv: lay.uv, bone: lay.bone, weight: lay.weight, normal: lay.normal, tangent: lay.tangent, predicted: true }
+            : { lenOff, stride, uv: stride - 8, bone: -1, weight: -1, normal: -1, tangent: -1 },
         )
       }
     }
@@ -223,11 +223,27 @@ export function parseMDL(buf) {
   const uvs = new Float32Array(vertexCount * 2)
   const boneIdx = new Float32Array(vertexCount * 4) // 顶点属性用 float 传（WebGL2 attribute）
   const weights = new Float32Array(vertexCount * 4)
+  // [we-scene patch 2026-10-03] **法线 / 切线**（F22）：源码族的候选布局此前只继承
+  // uv/bone/weight —— 预测命中时 `lay.normal` 没带过来，于是内置 3D 工程（fantasticcar
+  // dome/car/grid/shadow…）的单网格模型**一个法线都没读出来**。材质路径的
+  // `a_Normal` 因此没有可绑的数据：声明了法线的程序要么 b 掉、要么读到常量 (0,0,0)，
+  // 车漆的 N·L 全零 → 整车黑。切线同理（car.vert 的 NORMALMAP 分支要 a_Tangent4）。
+  // 两个字段都按 vertexLayoutOf 的位推导，未声明时保持 null（与改动前逐位一致）。
+  const normals = L.normal >= 0 ? new Float32Array(vertexCount * 3) : null
+  const tangents = L.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
   for (let i = 0; i < vertexCount; i++) {
     const b = vertStart + i * L.stride
     positions[i * 3] = dv.getFloat32(b, true)
     positions[i * 3 + 1] = dv.getFloat32(b + 4, true)
     positions[i * 3 + 2] = dv.getFloat32(b + 8, true)
+    if (normals) {
+      normals[i * 3] = dv.getFloat32(b + L.normal, true)
+      normals[i * 3 + 1] = dv.getFloat32(b + L.normal + 4, true)
+      normals[i * 3 + 2] = dv.getFloat32(b + L.normal + 8, true)
+    }
+    if (tangents) {
+      for (let k = 0; k < 4; k++) tangents[i * 4 + k] = dv.getFloat32(b + L.tangent + k * 4, true)
+    }
     uvs[i * 2] = dv.getFloat32(b + L.uv, true)
     uvs[i * 2 + 1] = dv.getFloat32(b + L.uv + 4, true)
     if (L.bone >= 0 && L.weight >= 0) {
@@ -462,6 +478,11 @@ export function parseMDL(buf) {
     uvs,
     boneIdx,
     weights,
+    // [we-scene patch 2026-10-03] 单网格模型的法线/切线（F22）。源码族按 vertexLayoutOf
+    // 的位读出（fantasticcar 的 car 走多子网格路径，但 retro/ricepod 这类单网格 3D
+    // 模型走这一路）；无对应位时为 null，消费端（mdl.js 的交错布局）据此决定是否多交错。
+    normals,
+    tangents,
     indexCount,
     indexType: useU32 ? 'u32' : 'u16',
     indices,
@@ -523,9 +544,12 @@ function vertexLayoutOf(flag) {
   let off = 12
   // [we-scene patch 2026-09-28] normal 偏移：文件里法线恒紧跟在位置之后（12 字节）。
   // 3D 网格的材质要按 N·L 上光（见 mdl.js 的场景光），所以这一路要读出来。
-  const o = { stride: 0, uv: -1, bone: -1, weight: -1, normal: -1 }
+  const o = { stride: 0, uv: -1, bone: -1, weight: -1, normal: -1, tangent: -1 }
   if (flag & MDL_FLAG_NORMAL) { o.normal = off; off += 12 }
-  if (flag & MDL_FLAG_TANGENT) off += 16
+  // [we-scene patch 2026-10-03] 切线（vec4：xyz + handedness）与法线同为材质 shader 的
+  // 顶点输入：官方 3D 材质（fantasticcar `car.vert`）在 NORMALMAP 分支调
+  // `BuildTangentSpace(…, a_Normal, a_Tangent4)`，没有它整条材质路径 b 掉。
+  if (flag & MDL_FLAG_TANGENT) { o.tangent = off; off += 16 }
   if (flag & MDL_FLAG_EXTRA4) off += 4
   if (flag & MDL_FLAG_SKIN_BLEND) { o.bone = off; off += 16 }
   if (flag & MDL_FLAG_SKIN_WEIGHT) { o.weight = off; off += 16 }
@@ -573,6 +597,8 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
     const weights = new Float32Array(vertexCount * 4)
     // 法线（3D 网格的光照用；2D puppet 的 flag 里没有 NORMAL，保持 null 不影响任何既有路径）
     const normals = lay.normal >= 0 ? new Float32Array(vertexCount * 3) : null
+    // 切线（vec4：xyz + handedness，材质 shader 的 a_Tangent4；见 vertexLayoutOf 注释）
+    const tangents = lay.tangent >= 0 ? new Float32Array(vertexCount * 4) : null
     for (let i = 0; i < vertexCount; i++) {
       const b = p + i * lay.stride
       positions[i * 3] = dv.getFloat32(b, true)
@@ -582,6 +608,9 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
         normals[i * 3] = dv.getFloat32(b + lay.normal, true)
         normals[i * 3 + 1] = dv.getFloat32(b + lay.normal + 4, true)
         normals[i * 3 + 2] = dv.getFloat32(b + lay.normal + 8, true)
+      }
+      if (tangents) {
+        for (let k = 0; k < 4; k++) tangents[i * 4 + k] = dv.getFloat32(b + lay.tangent + k * 4, true)
       }
       if (lay.uv >= 0) {
         uvs[i * 2] = dv.getFloat32(b + lay.uv, true)
@@ -676,6 +705,7 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
       boneIdx,
       weights,
       normals,
+      tangents,
       vertexCount,
       indices,
       indexCount,

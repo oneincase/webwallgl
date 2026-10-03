@@ -699,6 +699,20 @@ export function indexMatMetaLower(matMeta) {
 }
 
 /**
+ * [we-scene patch 2026-10-03] uniform 声明里的**精度限定符**槽位（F25）。
+ *
+ * 三处解析 uniform 的正则（parseMaterialMeta / sampler 默认槽 / sampler 默认色）
+ * 都必须吃掉它：`uniform lowp vec3 g_Tint;` 若按「一个词 + 名字」解析，
+ * 名字组会捕获到 `vec3`，于是 matMeta 指向一个不存在的 uniform、作者的值与
+ * 注释 default 双双静默失效。工坊作者不写限定符、官方内置工程写，
+ * 所以症状只在内置官方壁纸上暴露（fantasticcar 全黑）。
+ *
+ * 三个限定符**各自带尾随空白** —— 与 hlsl2glsl 的 uniform 去重正则同款写法，
+ * 那处踩过「只有 lowp 带空白、回溯后把 mediump 当类型」的坑（见 F15）。
+ */
+const UNIFORM_QUALIFIER = '(?:(?:lowp|mediump|highp)[ \\t]+)?'
+
+/**
  * [we-scene patch] 解析 sampler 槽注释里的 paintdefaultcolor：
  * `uniform sampler2D g_Texture2; // {"paintdefaultcolor":"0 0 0 1"}`
  * → Map(slot → "r g b a")。WE 编辑器对未绑槽绘制该颜色；纹理关联 combo
@@ -707,7 +721,8 @@ export function indexMatMetaLower(matMeta) {
  */
 export function parseSamplerPaintDefaultColor(src) {
   const out = new Map()
-  const re = /uniform\s+sampler2D\s+g_Texture(\d+)\s*;\s*\/\/([^\n]*)/g
+  // 精度限定符同样要吃掉（见 parseMaterialMeta 的注释）
+  const re = new RegExp('uniform\\s+' + UNIFORM_QUALIFIER + 'sampler2D\\s+g_Texture(\\d+)\\s*;\\s*\\/\\/([^\\n]*)', 'g')
   let m
   while ((m = re.exec(src))) {
     const pc = /"paintdefaultcolor"\s*:\s*"([^"]+)"/.exec(m[2])
@@ -1246,9 +1261,22 @@ export function createRenderer(canvas, opts = {}) {
   const includeCache = new Map()
   const shaderSrcCache = new Map()
   // 解析 material 元数据：uniform 声明行注释里的 {"material":"speedx","default":1} → { speedx: { uniform, default } }
+  //
+  // [we-scene patch 2026-10-03] **精度限定符必须吃掉**（F25）。此前模式串只有
+  // `uniform\s+<一个词>\s+<名字>`，遇到 `uniform lowp vec3 g_Tint;` 时那「一个词」吃掉
+  // `lowp`、**名字组捕获到 `vec3`** —— 于是 matMeta 里 `tint` 指向一个不存在的 uniform
+  // `vec3`，`setConstant` 查不到就静默返回：作者的值与注释 default 双双失效，
+  // 该 uniform 停在 GL 默认的 (0,0,0)。
+  // 实测口径（全库 6020 个 shader / 23804 条带 material 注释的声明）：只有 21 条带
+  // 精度限定符，集中在**官方内置 6 个工程**（fantasticcar `g_Tint`/`g_PaintColor` 一族、
+  // demon_core、audiophile、retro…）—— 工坊作者不写限定符，所以症状此前只在
+  // 「内置官方壁纸」这条线上暴露：fantasticcar 的穹顶/车漆/网格全黑（mean=6）而
+  // 官方出图是蓝天+红车+反光地板。
+  // 三个限定符各自带尾随空白（与 hlsl2glsl 的 uniform 去重正则同款写法，那处踩过
+  // 「只有 lowp 带空白」的坑：分组失配后回溯，把 mediump 当类型、名字组吃到 float）。
   function parseMaterialMeta(src) {
     const meta = {}
-    const re = /uniform\s+[A-Za-z0-9_]+\s+([A-Za-z_][A-Za-z0-9_]*)[^;]*;\s*\/\/([^\n]*)/g
+    const re = new RegExp('uniform\\s+' + UNIFORM_QUALIFIER + '[A-Za-z0-9_]+\\s+([A-Za-z_][A-Za-z0-9_]*)[^;]*;\\s*\\/\\/([^\\n]*)', 'g')
     let m
     while ((m = re.exec(src)) !== null) {
       const uniformName = m[1]
@@ -1270,7 +1298,7 @@ export function createRenderer(canvas, opts = {}) {
   // 画面对鼠标零响应。这个缺口对所有带 "default":"贴图名" 的 sampler 槽通用，不止 xray。
   function parseSamplerDefaults(src) {
     const out = new Map()
-    const re = /uniform\s+sampler2D\s+g_Texture(\d+)\s*;\s*\/\/([^\n]*)/g
+    const re = new RegExp('uniform\\s+' + UNIFORM_QUALIFIER + 'sampler2D\\s+g_Texture(\\d+)\\s*;\\s*\\/\\/([^\\n]*)', 'g')
     let m
     while ((m = re.exec(src)) !== null) {
       const slot = Number(m[1])
@@ -1291,7 +1319,7 @@ export function createRenderer(canvas, opts = {}) {
   // 纹理关联 combo：sampler uniform 注释声明 combo，且该槽提供了纹理 → combo = 1（ShaderUnit.cpp:545-617）
   function parseTextureCombos(src) {
     const out = []
-    const re = /uniform\s+sampler2D\s+(g_Texture(\d+))[^;]*;\s*\/\/([^\n]*)/g
+    const re = new RegExp('uniform\\s+' + UNIFORM_QUALIFIER + 'sampler2D\\s+(g_Texture(\\d+))[^;]*;\\s*\\/\\/([^\\n]*)', 'g')
     let m
     while ((m = re.exec(src)) !== null) {
       const combo = /"combo"\s*:\s*"([^"]+)"/.exec(m[3])
@@ -2680,7 +2708,25 @@ export function createRenderer(canvas, opts = {}) {
       return id
     }
   })()
-  const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Tangent4', 'a_Color', 'a_TexCoordVec4', 'a_TexCoordVec4C1', 'a_TexCoordC2']
+  // 材质程序声明了、但网格数据里**没有**对应属性的名字。
+  // [we-scene patch 2026-10-03] `a_Tangent4` 从这张表里移出（F22）：源码族的网格
+  // 现在会解析切线（mdl-parse 按 TANGENT 位读 vec4、mdl.js 交错到 VBO 尾部），
+  // car 的材质路径因此可以真正接管。**声明了却拿到 null 数据**时仍要回落 ——
+  // 属性数组未启用会让该 attribute 读常量 (0,0,0,0)（法线归零即整片黑），
+  // 所以判定从「名字黑名单」改成「名字 + 数据可用性」（见 meshMatVao/drawMeshMaterialInner）。
+  const MESH_MAT_UNSUPPORTED_ATTRS = ['a_Color', 'a_TexCoordVec4', 'a_TexCoordVec4C1', 'a_TexCoordC2']
+  /**
+   * 程序声明了某属性、但网格没有对应数据 → 不能走材质路径。
+   *
+   * 只对**新增能力**（a_Tangent4）做这条要求：它此前恒在名字黑名单里、任何模型材质
+   * 都会回落，所以「有数据才放行」是**纯增量**（不会让任何既有壁纸改走别的路径）。
+   * a_Normal 的旧行为保持不变（有数据才绑、没数据就不绑）—— 把它也纳入要求会改动
+   * 工坊语料的既有行为（打包族单网格模型本来就没有法线），不是本次的目标。
+   */
+  function meshMatAttrUnavailable(prog, info) {
+    if (gl.getAttribLocation(prog, 'a_Tangent4') >= 0 && !info.hasTangents) return true
+    return false
+  }
 
   /** 按程序声明的 attribute 位置，把 mdl 的交错 VBO 绑成一套 VAO（按程序+网格缓存） */
   function meshMatVao(progKey, entry, info) {
@@ -2689,6 +2735,7 @@ export function createRenderer(canvas, opts = {}) {
     const locPos = gl.getAttribLocation(entry.prog, 'a_Position')
     const locUv = gl.getAttribLocation(entry.prog, 'a_TexCoord')
     const locNrm = gl.getAttribLocation(entry.prog, 'a_Normal')
+    const locTan = gl.getAttribLocation(entry.prog, 'a_Tangent4')
     let vao = null
     if (locPos >= 0) {
       const stride = info.floatStride * 4
@@ -2703,13 +2750,96 @@ export function createRenderer(canvas, opts = {}) {
       }
       if (locNrm >= 0 && info.hasNormals) {
         gl.enableVertexAttribArray(locNrm)
-        gl.vertexAttribPointer(locNrm, 3, gl.FLOAT, false, stride, 52)
+        gl.vertexAttribPointer(locNrm, 3, gl.FLOAT, false, stride, info.normalOffset >= 0 ? info.normalOffset : 52)
+      }
+      // 切线（vec4：xyz + handedness），交错布局的末段（见 mdl.js ensureMesh）
+      if (locTan >= 0 && info.hasTangents) {
+        gl.enableVertexAttribArray(locTan)
+        gl.vertexAttribPointer(locTan, 4, gl.FLOAT, false, stride, info.tangentOffset >= 0 ? info.tangentOffset : 64)
       }
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, info.ibuf)
       gl.bindVertexArray(null)
     }
     meshMatVaoCache.set(key, vao)
     return vao
+  }
+
+  /**
+   * [we-scene patch 2026-10-03] **`_rt_Reflection`（镜像反射渲染目标）**。
+   *
+   * 谁需要它：官方内置 fantasticcar 的地板 `grid.frag` 采样 `g_Texture1`（材质里
+   * 写的是 `"_rt_Reflection"`）当反照率 —— 反射目标缺失时该槽落白纹理，整块地板
+   * 变成一团纯白高光（实测 mean 里地板占掉半个画面），既没有条纹也没有倒影。
+   * 全库用到它的场景只有 2 个（fantasticcar 的 grid、arsenal 的 planks，后者走
+   * 引擎内置 generic 程序、不在材质路径上）。
+   *
+   * WE 的语义（由 grid.frag 的采样方式反推，判据唯一）：地板按**屏幕 UV** 采样
+   * （`screenUV = (v_ScreenPos.xy / v_ScreenPos.z) * 0.5 + 0.5`），所以 RT 必须与
+   * 主画面同尺寸、同相机、同投影 —— 于是「把 mirrored 几何用同一台相机画进 RT」
+   * 就是正确解：地板像素 F 与它反射出的物点 M·P 在**同一条从眼点出发的射线**上，
+   * 屏幕坐标必然相同，按 screenUV 取回即得镜像。
+   *
+   * 实现：只在**本帧第一次有层需要它**时画一趟（`reflected: true` 的模型层，
+   * 模型矩阵左乘 scale(1,-1,1) = 关于 y=0 平面的镜像），画完恢复帧缓冲与视口。
+   * 深度/混合沿用材质路径自己的处理（那一路本来就在画前清深度）。
+   */
+  let reflectionRT = null // { tex, fbo, w, h }
+  let reflectionStamp = -1 // 本帧是否已画过（对齐 ffbStamp）
+  let frameClearColor = [0, 0, 0, 1] // 帧首 clearColor（反射 RT 清完要还原）
+  /** 本帧参与绘制的层（renderScene 每帧填；`_rt_Reflection` 要用它找回 reflected 层） */
+  let frameLayers = []
+  function ensureReflectionRT(w, h) {
+    if (reflectionRT && reflectionRT.w === w && reflectionRT.h === h) return reflectionRT
+    if (reflectionRT) {
+      try {
+        gl.deleteTexture(reflectionRT.tex)
+        gl.deleteFramebuffer(reflectionRT.fbo)
+        glReg.release(reflectionRT.tex)
+        glReg.release(reflectionRT.fbo)
+      } catch {
+        /* 上下文可能已丢失 */
+      }
+      reflectionRT = null
+    }
+    const tex = glReg.texture(gl.createTexture())
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    const fbo = glReg.framebuffer(gl.createFramebuffer())
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    reflectionRT = { tex, fbo, w, h }
+    return reflectionRT
+  }
+
+  /** 关于 y=0 平面的镜像（世界坐标；WE 的地板就是 y=0 平面） */
+  const MIRROR_Y = mat4Scale(mat4Identity(), 1, -1, 1)
+
+  /** 画一趟反射（每个需要 `_rt_Reflection` 的帧只画一次）；返回是否可用 */
+  function renderReflectionPass(layers, cam, viewProj, width, height, time) {
+    const rt = ensureReflectionRT(width, height)
+    const targets = layers.filter((l) => l && l.reflected && l.meshMaterial)
+    const prevFbo = groupTarget ? groupTarget.fbo.fbo : null
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo)
+    gl.viewport(0, 0, width, height)
+    gl.disable(gl.BLEND)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    let drew = false
+    for (const l of targets) {
+      const modelM = puppetModelMatrix(l, cam)
+      const mirrorM = mat4Multiply(MIRROR_Y, modelM)
+      const mvp = mat4Multiply(viewProj, mirrorM)
+      if (drawMeshMaterial(l, cam, viewProj, mvp, mirrorM, width, height, time)) drew = true
+    }
+    // 还原：帧缓冲回到调用方原本的目标（画布 / 组 FBO），视口与清屏色复位
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo)
+    gl.viewport(0, 0, width, height)
+    gl.clearColor(frameClearColor[0], frameClearColor[1], frameClearColor[2], frameClearColor[3])
+    return drew
   }
 
   /**
@@ -2755,8 +2885,20 @@ export function createRenderer(canvas, opts = {}) {
     }
     if (!entry) return false
     if (MESH_MAT_UNSUPPORTED_ATTRS.some((n) => gl.getAttribLocation(entry.prog, n) >= 0)) return false
+    // `_rt_Reflection` 是本帧的反射渲染目标：第一次遇到需要它的层时先把反射画出来
+    // （同帧只画一次；本函数随后就把 RT 当纹理采样）。层列表由 renderScene 每帧填。
+    if (mm.needsReflection && reflectionStamp !== ffbStamp && frameLayers.length) {
+      reflectionStamp = ffbStamp
+      renderReflectionPass(frameLayers, cam, viewProj, width, height, time)
+    }
     const list = meshProvider.resolveMeshes(mdl)
     if (!list || !list.length) return false
+    // 程序要的顶点属性必须**每个子网格都有数据**（法线/切线，见 meshMatAttrUnavailable）：
+    // 缺一条就整层回落通用网格程序，不在半路画出「一部分网格有光照、一部分全黑」。
+    for (let i = 0; i < list.length; i++) {
+      const info = meshProvider.resolveMesh(list[i])
+      if (info && meshMatAttrUnavailable(entry.prog, info)) return false
+    }
     const useDepth = !!(cam && cam.perspective)
     if (useDepth) {
       gl.depthMask(true)
@@ -2766,7 +2908,22 @@ export function createRenderer(canvas, opts = {}) {
       gl.depthFunc(gl.LEQUAL)
     }
     gl.useProgram(entry.prog)
-    bindSystemUniforms(entry.uni, layer, time, width, height, mvp, modelM, viewProj, [], null, cam, null)
+    // [we-scene patch 2026-10-03] **矩阵必须转置上传**（F22）。
+    //
+    // WE 的 shader 是 HLSL 行向量语义（`mul(vec4(p,1), M)`），hlsl2glsl 把每个调用
+    // 改写成 `transpose(M) * v` —— 所以喂进去的矩阵得是 GL 列主元阵的**转置**，
+    // 否则平移项落在最后一行（被当成 0）→ 几何错位/退化。这条路此前没转置：
+    // fantasticcar 的穹顶/车漆/网格全画在错误的位置与大小（实测车占满屏幕上半、
+    // 地平线跑到屏幕中间），而**单帧无害**的假象让它一直在「着色」方向被排查。
+    // 同一约定在既有代码里有两处先例：效果 pass 的 `passMVP`（`mat4Transpose(mat4Ortho…)`）
+    // 与 `g_EffectModelViewProjectionMatrix`（`mat4Transpose(mat4Multiply(viewProj, em))`），
+    // 两处都是为了满足 HLSL 行向量约定。bindSystemUniforms 内部只把这几个矩阵
+    // 原样 uniformMatrix4fv 上传（不参与别的推导），所以在这里转置是唯一改动点。
+    bindSystemUniforms(
+      entry.uni, layer, time, width, height,
+      mat4Transpose(mvp), mat4Transpose(modelM), mat4Transpose(viewProj),
+      [], null, cam, null,
+    )
     bindConstants(entry.uni, mm.constants || {}, entry.matMeta)
     const blending = mm.blending || 'normal'
     if (blending === 'additive') {
@@ -2796,7 +2953,15 @@ export function createRenderer(canvas, opts = {}) {
         const u = gl.getUniformLocation(entry.prog, 'g_Texture' + s)
         if (!u) continue
         const decl = mm.textures && mm.textures[s]
-        const tx = s === 0 ? pickGl(per) || pickGl(mm.texture) || null : pickGl(decl)
+        // `"_rt_*"` 的名字由宿主标成 `{rtName}`（见 scene-mount 的 model 分支）：
+        // 目前只解析 `_rt_Reflection`（本帧的反射目标，见 renderReflectionPass）。
+        // 注意 `{rtName}` **不是纹理对象**，不能走 pickGl（否则 bindTexture 抛
+        // TypeError 并被自愈闸门判成「绘制抛错」→ 整层回落通用程序）。
+        let tx = null
+        if (s === 0) tx = pickGl(per) || pickGl(mm.texture) || null
+        else if (decl && typeof decl === 'object' && decl.rtName) {
+          tx = decl.rtName === '_rt_Reflection' && reflectionRT ? reflectionRT.tex : null
+        } else tx = pickGl(decl)
         gl.activeTexture(gl.TEXTURE0 + s)
         gl.bindTexture(gl.TEXTURE_2D, tx || whiteTex)
         gl.uniform1i(u, s)
@@ -3223,8 +3388,10 @@ export function createRenderer(canvas, opts = {}) {
     if (general.clearenabled !== false) {
       const cc = parseVec3Local(general.clearcolor || '0 0 0')
       gl.clearColor(cc[0], cc[1], cc[2], 1)
+      frameClearColor = [cc[0], cc[1], cc[2], 1]
     } else {
       gl.clearColor(0, 0, 0, 1)
+      frameClearColor = [0, 0, 0, 1]
     }
     // [we-scene patch 2026-09-28] 深度缓冲也一起清：真 3D 网格的深度测试需要它
     // （HDR/MSAA 目标本轮补上了深度附件）。顺序不能反 —— 深度清同样受**深度写掩码**
@@ -3417,6 +3584,8 @@ export function createRenderer(canvas, opts = {}) {
     const drawLayers = cam.perspective
       ? scene.layers.slice().sort((a, b) => Number(!!b.isSkybox) - Number(!!a.isSkybox))
       : scene.layers
+    // 供 `_rt_Reflection` 找回 `reflected: true` 的模型层（见 renderReflectionPass）
+    frameLayers = drawLayers
     for (const layer of drawLayers) {
       // destroyed：thisScene.destroyLayer 的墓碑。visible 字段脚本的
       // `return value` 可能在拆层的同一帧把 visible 写回 true

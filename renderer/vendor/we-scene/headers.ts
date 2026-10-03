@@ -360,25 +360,71 @@ vec3 CombineLighting(vec3 light, vec3 baseAmbient, vec3 ambient) {
   return max(baseAmbient, ambient + light);
 }
 `,
-  'common_fragment.h': `// WE common_fragment.h（重建）
+  'common_fragment.h': `// WE common_fragment.h（重建；逐条对齐官方 assets/shaders/common_fragment.h）
+//
+// [we-scene patch 2026-10-03] **格式宏与 DecompressNormal 的通道语义必须照抄**（F26）。
+// 此前版本把「与格式相关的分支」按「本仓贴图一律解码成 RGBA」折叠掉了 —— 折叠的
+// 前提是错的：分支选的是**通道语义**，不是解码格式。官方默认分支读的是
+// \`normal.wy\`（x 在 **alpha**、y 在 **green**，即经典 DXT5nm 排布），只有
+// FORMAT_RG88 才读 \`rg\`；WE 给法线贴图标的就是 TEX1FORMAT=4（FORMAT_DXT5）⇒ 官方
+// 走的是 \`normal.yx = normal.yw * 2 - vec2(0.965, 1)\`。折叠成 \`rg\` 之后，
+// 法线整体错位（x 取到反照率的红通道），材质的光照方向全错 —— 实测 fantasticcar
+// 车漆「上表面红、朝向镜头的一面全黑」，就是这条。我们的贴图解码保留原始通道值
+// （DXT5 → RGBA 逐通道等价），所以按 TEX1FORMAT 分支是正确的，也是唯一正确的做法。
+//
+// 与官方的唯一差异：\`HLSL_SM30\` 保持**未定义**（本仓转译目标是 GLSL ES 3.0，
+// 见 hlsl2glsl 的平台宏注入注释），于是 ConvertSample* 走 \`#else\` 的 GLSL 分支。
+#define FORMAT_RGBA8888 0
+#define FORMAT_RGB888 1
+#define FORMAT_RGB565 2
+
+#define FORMAT_ETC1_RGB8 3
+#define FORMAT_DXT5 4
+#define FORMAT_ETC2_RGBA8 5
+#define FORMAT_DXT3 6
+#define FORMAT_DXT1 7
+
 #define FORMAT_RG88 8
 #define FORMAT_R8 9
-vec3 DecompressNormal(vec4 tex) {
-    vec2 xy = tex.xy * 2.0 - 1.0;
-    return vec3(xy, sqrt(clamp(1.0 - dot(xy, xy), 0.0, 1.0)));
+#define FORMAT_RG1616F 10
+#define FORMAT_R16F 11
+
+#define FORMAT_BC7 12
+
+vec3 DecompressNormal(vec4 normal)
+{
+#if TEX1FORMAT >= FORMAT_ETC1_RGB8 && TEX1FORMAT <= FORMAT_DXT1 || TEX1FORMAT == FORMAT_BC7
+    normal.yx = normal.yw * 2.0 - vec2(0.965, 1.0);
+#else
+#if TEX1FORMAT == FORMAT_RG88
+    normal.xy = normal.rg * 2.0 - 1.0;
+#else
+    normal.xy = normal.wy * 2.0 - 1.0;
+#endif
+#endif
+    normal.z = sqrt(clamp(1.0 - normal.x * normal.x - normal.y * normal.y, 0.0, 1.0));
+    return normal.xyz;
 }
-// [we-scene patch 2026-10-03] 下面这批按**官方语义**补齐（F18）：官方头里还有
-// DecompressNormalWithMask / ComputeMaterialSpecular* / ComputeLight* / Convert* 一族，
-// 作者的 PBR 类材质 shader（fantasticcar car、demon_core core/backgroundsphere…）
-// 直接调用它们；缺了就在 GL 编译期报 no matching overload，整条材质静默回落。
-// 与格式相关的分支按「**本仓贴图一律解码成 RGBA**」折叠：ETC1/DXT/RG88 的通道重排
-// 在运行时不可达（解码层已经还原成 RGBA），保留分支只会引入未定义宏的比较。
-vec4 DecompressNormalWithMask(vec4 normal) {
+
+vec4 DecompressNormalWithMask(vec4 normal)
+{
+#if TEX1FORMAT >= FORMAT_ETC1_RGB8 && TEX1FORMAT <= FORMAT_DXT1 || TEX1FORMAT == FORMAT_BC7
+    normal.xw = normal.wx;
+    normal.xy = normal.xy * 2.0 - vec2(0.965, 1.0);
+#else
+#if TEX1FORMAT == FORMAT_RG88
+    normal.xy = normal.gr * 2.0 - 1.0;
+#else
     normal.xw = normal.wx;
     normal.xy = normal.xy * 2.0 - 1.0;
+#endif
+#endif
     normal.z = sqrt(clamp(1.0 - normal.x * normal.x - normal.y * normal.y, 0.0, 1.0));
     return normal;
 }
+// [we-scene patch 2026-10-03] PBR 函数族按官方语义补齐（F18）：作者的 PBR 类材质
+// shader（fantasticcar car、demon_core core/backgroundsphere…）直接调用它们；
+// 缺了就在 GL 编译期报 no matching overload，整条材质静默回落。
 float ComputeMaterialSpecularPower(float roughness, float metallic) {
     return (1.01 - roughness) * mix(400.0, 250.0, metallic);
 }
@@ -405,21 +451,63 @@ vec3 ComputeLightSpecular(vec3 normal, vec3 lightDelta, vec3 color, float radius
     rim = pow((1.0 - clamp(dot(normal, viewDir), 0.0, 1.0)) * pow(halfLambertLight, 0.25), 6.0 - rim) * rim;
     return color * (clamp(lightDot, 0.0, 1.0) + rim) * lightAttn * lightAttn;
 }
-float ConvertSampleR8(vec4 sample0) {
-    return sample0.r;
+float ConvertSampleR8(vec4 _sample) {
+#if HLSL_SM30
+    return _sample.a;
+#else
+    return _sample.r;
+#endif
 }
-vec4 ConvertTexture0Format(vec4 sample0) {
-    return sample0;
+vec4 ConvertTexture0Format(vec4 _sample) {
+#if TEX0FORMAT == FORMAT_RG88 || TEX0FORMAT == FORMAT_RG1616F
+    return _sample.rrrg;
+#endif
+#if TEX0FORMAT == FORMAT_R8 || TEX0FORMAT == FORMAT_R16F
+    return vec4(1.0, 1.0, 1.0, _sample.r);
+#endif
+    return _sample;
 }
-vec4 ConvertTextureFormat(int format, vec4 sample0) {
-    return sample0;
+vec4 ConvertTextureFormat(int format, vec4 _sample) {
+    if (format == FORMAT_RG88 || format == FORMAT_RG1616F) {
+        return _sample.rrrg;
+    }
+    if (format == FORMAT_R8 || format == FORMAT_R16F) {
+        return vec4(1.0, 1.0, 1.0, _sample.r);
+    }
+    return _sample;
 }
 `,
-  // WE common_vertex.h：**只被 include，不提供任何符号**。
-  // 全库仅 2 个文件包含它（flowimage.vert / cutout_vignette.vert），
-  // 两者用到的 uniform / attribute / varying 全部自行声明，
-  // 其余标识符都是 GLSL 内建或由 hlsl2glsl 处理的 HLSL 方言（mul / CAST2）。
-  // 真实 WE 里它是声明宏与平台 #define 的样板头，这里给空实现即可。
-  'common_vertex.h': `// WE common_vertex.h（重建：空占位，见 headers.ts 注释）
+  // WE common_vertex.h（重建）。**不是空占位** —— 此前按工坊语料判断「只被 include、
+  // 不提供任何符号」（全库仅 flowimage/cutout_vignette 两个 vert 包含它，且都自声明了
+  // 一切），但**官方内置 defaultprojects 的源码 shader 不受工坊语料覆盖**：
+  // fantasticcar `car.vert` 的 NORMALMAP 分支调用 `BuildTangentSpace(CAST3X3(g_ModelMatrix),
+  // a_Normal, a_Tangent4)`，函数缺定义 → GL 编译期 `no matching overload` → 整车材质
+  // 静默回落通用网格程序（观感是「带贴图的素模」，车漆/高光/条纹全丢）。
+  // 三个重载逐字按官方 `assets/shaders/common_vertex.h`（23 行）复刻；`mul` 由
+  // hlsl2glsl 的调用改写处理（include 在 preprocess 阶段先内联、改写在其后）。
+  'common_vertex.h': `// WE common_vertex.h（重建：BuildTangentSpace 三态，与官方语义逐字一致）
+mat3 BuildTangentSpace(const vec3 normal, const vec4 signedTangent)
+{
+    vec3 tangent = signedTangent.xyz;
+    vec3 bitangent = cross(normal, tangent) * signedTangent.w;
+    return mat3(tangent, bitangent, normal);
+}
+
+mat3 BuildTangentSpace(const mat3 modelTransform, const vec3 normal, const vec4 signedTangent)
+{
+    vec3 tangent = signedTangent.xyz;
+    vec3 bitangent = cross(normal, tangent) * signedTangent.w;
+    return mat3(mul(tangent, modelTransform),
+        mul(bitangent, modelTransform),
+        mul(normal, modelTransform));
+}
+
+void BuildTangentSpace(const mat3 modelTransform, const vec3 normal, const vec4 signedTangent, out vec3 worldTangent, out vec3 worldBitangent)
+{
+    vec3 tangent = signedTangent.xyz;
+    vec3 bitangent = cross(normal, tangent) * signedTangent.w;
+    worldTangent = mul(tangent, modelTransform);
+    worldBitangent = mul(bitangent, modelTransform);
+}
 `,
 };
