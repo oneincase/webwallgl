@@ -3,20 +3,79 @@ import { getEntry } from '../pkg/container.js'
 // 产出 layer.effects[i] 的 { materialPasses, fbos, binds }，供通用 pass 管线使用。
 
 /**
- * [we-scene patch] WE 自带 effect/material json 允许**尾逗号**（其引擎 JSON 解析器
- * 容忍，如 fluidsimulation/effect.json 的 dependencies 末尾 `…, ]`），JSON.parse
- * 严格模式会抛错，使 resolveEffectChain 在 catch 处静默退出 —— 表现为整个特效
- * materialPasses/fbos 全空、效果消失且无报错。
- * 仅在严格解析失败时尝试「去尾逗号」，合法文件原样解析，避免改动正常内容；
- * 正则只匹配紧贴 }/] 的逗号，WE 数据里不会出现在字符串值中。
+ * [we-scene patch] WE 的数据文件普遍带**尾逗号**（其引擎的 JSON 解析器容忍），
+ * 严格 JSON.parse 会抛错。效果文件、材质文档（materials/*.json）、粒子配置都会遇到
+ * ——fantasticcar 的 `materials/car/glass.json` 就是尾逗号，严格解析下整个 Car 模型
+ * 图层被丢弃（「model 'Car' 失败: Expected double-quoted property name…」）。
+ *
+ * 只在严格解析失败时尝试「去尾逗号」，合法文件原样返回；正则只匹配紧贴 }/] 的逗号，
+ * WE 数据里不会出现在字符串值中。**唯一实现**：效果链、材质文档、粒子都要用它，
+ * 各写一份迟早会漂。
  */
-function parseEffectJson(text) {
+export function parseJsonTolerant(text) {
   try {
     return JSON.parse(text)
-  } catch (e) {
-    return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1'))
+  } catch {
+    /* 继续放宽 */
+  }
+  const noTrailingComma = text.replace(/,(\s*[}\]])/g, '$1')
+  try {
+    return JSON.parse(noTrailingComma)
+  } catch {
+    /* 继续放宽 */
+  }
+  // 再放宽一档：**JS 风格注释**。WE 编辑器保存的数据里确实有 ——
+  // fantasticcar/materials/car/glass.json 第 6 行是 `//"cullmode": "nocull",`
+  // （作者注释掉一整行），严格解析与「只去尾逗号」都过不了。
+  try {
+    return JSON.parse(stripJsonComments(text))
+  } catch {
+    return JSON.parse(stripJsonComments(noTrailingComma))
   }
 }
+
+/**
+ * 剥掉 JSON 文本里的 `//` 行注释与 `/* *​/` 块注释，**字符串内原样保留**。
+ * 只在严格解析失败后作为兜底使用（见 parseJsonTolerant）。
+ */
+function stripJsonComments(src) {
+  let out = ''
+  let inStr = false
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]
+    if (inStr) {
+      out += ch
+      if (ch === '\\') {
+        out += src[i + 1] ?? ''
+        i++
+      } else if (ch === '"') {
+        inStr = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inStr = true
+      out += ch
+      continue
+    }
+    if (ch === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++
+      out += '\n'
+      continue
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      i += 2
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++
+      i++
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+// 兼容旧名（本文件内部的调用点）
+const parseEffectJson = parseJsonTolerant
 
 /**
  * [we-scene patch issue #11] 效果链解析的诊断闸门。
@@ -59,6 +118,13 @@ function isBuiltinAssetPath(p) {
 //   把文档登记下来，装配期与热更期各解析一次（见 scene-mount 的 materialDocs）。
 // onDiag: 可选回调（issue #11）。解析失败/字段不认识时上报一条可执行的诊断。
 export function resolveEffectChain(pkg, effect, readText, onMaterialDoc, onDiag) {
+  // [we-scene patch] **合成条目不是文件**：attachLayerMaterialEffect 为「非内置 shader
+  // 的层材质」造的条目（file 恒为空串、layerMaterial:true），materialPasses/fbos 在造
+  // 的时候就已经填好，没有任何文件可按。此前它照样走下面「文件不在包内」分支，于是
+  // **每一层自定义图像 shader 都刷一条假诊断**（「effect (未命名): 效果文件不在包内」），
+  // 与真缺失混在一起，会污染 verify-effects「全库零误报」这条判据（官方内置 defaultprojects
+  // 的 2D 工程每层都会刷）。
+  if (effect && effect.layerMaterial === true) return
   const file = (effect && effect.file) || '(未命名)'
   const entry = getEntry(pkg, effect.file)
   if (entry === null) {
@@ -198,6 +264,28 @@ export function isBuiltinAlbedoShader(name) {
   if (!name || typeof name !== 'string') return true
   const n = name.toLowerCase()
   return n === 'generic' || n === 'sprite' || n === 'flat' || n.startsWith('genericimage')
+}
+
+/**
+ * [we-scene patch 2026-10-03] **引擎内置网格 shader**（WE 在渲染器内部实现的网格着色）：
+ * `generic` / `genericimage*` / `generic4` / `genericparticle` / `foliage4` /
+ * `puppettexturechannels` / `flat` / `sprite`。
+ *
+ * 本仓对**模型层**的这几个 shader 是在通用网格程序里原生实现的（`u_tex × u_light*`，
+ * 其中 3D 网格的环境光折 K=0.4 是按官方出帧标定过的）。F13 的「模型走材质 shader」
+ * 路径必须把它们排除在外 —— 工坊语料里模型材质用 `generic4` 的有 **252 处**，
+ * 误接等于把整批壁纸的观感换掉。
+ */
+export function isEngineMeshShader(name) {
+  if (!name || typeof name !== 'string') return true
+  const n = name.toLowerCase()
+  return (
+    n.indexOf('generic') === 0 ||
+    n === 'foliage4' ||
+    n === 'puppettexturechannels' ||
+    n === 'sprite' ||
+    n === 'flat'
+  )
 }
 
 // 把图层 material pass 变成效果链的第一趟。渲染器已有 GPU pass 管线

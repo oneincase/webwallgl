@@ -36,6 +36,7 @@
     "verify:props": "node scripts/verify-props.mjs",
     "verify:animation": "node scripts/verify-animation.mjs",
     "verify:attachments": "node scripts/verify-attachments.mjs",
+    "verify:defprojects": "node scripts/verify-defprojects.mjs",
     "verify:media": "node scripts/verify-media.mjs",
     "verify:textures": "node scripts/verify-textures.mjs",
     "verify:bloom": "node scripts/verify-bloom.mjs",

@@ -29,6 +29,13 @@ const STABLE = [
   // 材质缺 shader、坏 JSON、同一处只报一次），不该报的一个都不许报（官方两段式、
   // copy/swap 命令 pass、全库 10420 个效果零误报）—— issue #11
   "verify-effects",
+  // 官方内置**源码工程**的装载判据：场景条目按 project.json.file 命中、
+  // 引用完整性（材质链/模型内嵌材质/贴子/sprite/音效）、层材质合成条目零假诊断
+  // —— DEFAULTPROJECTS-PLAN P0
+  "verify-defprojects",
+  // MDL **源码族**（官方内置/编辑器工程）判据：属性位掩码驱动的顶点布局、
+  // 26 个模型冻结表、打包语料 577 个 .mdl 全部可解析 —— DEFAULTPROJECTS-PLAN P1
+  "verify-mdl-source",
   // 诊断**级别**契约：级别由上报方声明并随 /diag 一起发（lvl=）、三档语义、
   // 文本判据只兜外部透传文案且零计数豁免 —— issue #13
   "verify-diag",

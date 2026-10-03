@@ -474,12 +474,18 @@ cfg, source, pkgAbort.signal);
 
       // 场景描述条目：常规工程是 scene.json；WE 的 GIF 场景模板工程编译产物
       // 叫 gifscene.json（project.json 的 file 指向 gifscene.json，见 843532366），
-      // 少数放进 scenes/ 子目录。getEntry 是精确匹配，逐个候选回退。
-      const sceneEntry =
-        pkg.getEntry(parsedPkg, "scene.json") ??
-        pkg.getEntry(parsedPkg, "gifscene.json") ??
-        pkg.getEntry(parsedPkg, "scenes/scene.json") ??
-        pkg.getEntry(parsedPkg, "scenes/gifscene.json");
+      // 少数放进 scenes/ 子目录。**源码工程（官方内置 defaultprojects）的场景文件名
+      // 由 project.json.file 指定、名字随意**（audiophile.json / techno.json …），
+      // 所以候选表由 scn.sceneEntryCandidates 给出：file 优先，其余四条兜底。
+      // getEntry 是精确匹配，逐个候选回退。
+      let sceneEntry = null;
+      for (const name of scn.sceneEntryCandidates(project) as string[]) {
+        const e = pkg.getEntry(parsedPkg, name);
+        if (e) {
+          sceneEntry = e;
+          break;
+        }
+      }
       if (!sceneEntry) throw new Error("pkg 中没有 scene.json（不是场景壁纸？）");
       const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
       /**
@@ -510,8 +516,11 @@ cfg, source, pkgAbort.signal);
         resolveUserProps(doc, (scene as any).properties || {}, 0);
         return doc;
       };
-      /** 读一份材质文档（登记 + 解析其中的 {user} 绑定） */
-      const readMaterialDoc = (entry: Uint8Array) => registerMaterialDoc(JSON.parse(readText(entry)));
+      /** 读一份材质文档（登记 + 解析其中的 {user} 绑定）。
+       *  [we-scene patch] 用**容忍尾逗号**的解析：WE 自己的数据里普遍带尾逗号
+       *  （fantasticcar/materials/car/glass.json 就是），严格 JSON.parse 会让
+       *  整个模型图层被丢弃（「model 'Car' 失败」）。与效果链同一实现。 */
+      const readMaterialDoc = (entry: Uint8Array) => registerMaterialDoc(eff.parseJsonTolerant(readText(entry)));
       /**
        * `generic4` 材质的 color/alpha/brightness 常量折入图层（渲染侧每帧活读，见 renderer
        * 的 color4 注释）。官方 generic4.frag 里这三个常量是**无条件**应用的，而该 shader
@@ -701,11 +710,26 @@ cfg, source, pkgAbort.signal);
         }
       }
 
-      const shaderResolver = (rel: string): Promise<string | null> => {
+      const shaderResolver = async (rel: string): Promise<string | null> => {
         const inner = rel.startsWith("shaders/") ? rel : "shaders/" + rel;
         const file = rel.startsWith("shaders/") ? rel.slice("shaders/".length) : rel;
         const e = pkg.getEntry(parsedPkg, inner);
-        let src = e ? readText(e) : (WE_SHADER_HEADERS[file] ?? null);
+        let src: string | null = e ? readText(e) : (WE_SHADER_HEADERS[file] ?? null);
+        // [we-scene patch 2026-10-03] **官方安装素材回退**（F14）：本仓 `WE_SHADER_HEADERS`
+        // 是按需**重建的子集**，官方 `common_pbr.h` 一族并不完整。作者的自定义模型/效果
+        // shader include 官方头时（fantasticcar `car.frag` 用 `g_SpecularPower`、
+        // demon_core `core`/`backgroundsphere` 同理），包内没有、重建集也没有 → GL 编译期
+        // 报 `undeclared` → 整个模型退回通用程序（观感是素模）。
+        // 这条回退与贴图共用同一条 local-assets 通道（`/api/local-assets/<id>/shaders/...`）：
+        // 只在前两条来源都缺时按需取官方源；取不到就保持原行为（null），不引入新失败面。
+        if (src == null) {
+          try {
+            const bytes = await fetchLocalAssetFile(`shaders/${file}`);
+            if (bytes && bytes.length) src = new TextDecoder().decode(bytes).replace(/^\uFEFF/, "");
+          } catch {
+            /* 忽略：拿不到官方素材时行为与本改动前一致 */
+          }
+        }
         // [we-scene patch] 调试钩子：在控制台改写任意 shader 源，用于定位画面异常。
         //   __shaderPatch = { 'effects/blur_combine': (src) => src.replace(...) }
         // 键可带或不带扩展名。把某个 pass 的输出染成纯色即可判定「这块像素是谁画的」——
@@ -1857,6 +1881,41 @@ cfg, source, pkgAbort.signal);
         }
         const texEntry = pkg.getEntry(parsedPkg, `materials/${name}.tex`);
         if (!texEntry) {
+          // [we-scene patch] **源码工程的贴图源图回退**：WE 编辑器工程（含官方内置
+          // defaultprojects）里 `materials/X.png` 是贴图源、`X.tex` 是编译产物，但
+          // 编译产物**可能缺席**——audiophile 的 `materials/grid/grid.png` 就没有对应
+          // 的 grid.tex（模型 skin 0 的贴图），此时引用有效、只是没编译。工坊包里不存在
+          // 这种形态（.tex 一定在），所以这条只在缺 .tex 时兜底，对既有语料是恒等变换。
+          // 只试**工程自制命名空间**：内置命名空间（particle/util/gradient/…）的缺席是
+          // 预期状态，且 getEntry 是线性扫描，不该为它们白扫三遍大包（PKGV0023 实测）。
+          if (!/^(particle|util|gradient|pattern|lut|cookie)\//.test(name)) {
+            for (const ext of ["png", "jpg", "jpeg"]) {
+              const imgEntry = pkg.getEntry(parsedPkg, `materials/${name}.${ext}`);
+              if (!imgEntry) continue;
+              try {
+                const bmp = await decodeTexImageBitmap(new Blob([imgEntry]), null, 0, 0, 1);
+                if (bmp) {
+                  const entry = {
+                    glTex: rnd.makeTexture(renderer.gl, null, 0, 0, bmp),
+                    width: bmp.width,
+                    height: bmp.height,
+                    rg88: false,
+                    generated: false,
+                  };
+                  reportDiag(
+                    rt,
+                    cfg,
+                    `tex '${name}': 包内无 .tex，回退源图 materials/${name}.${ext}（${bmp.width}x${bmp.height}）`,
+                    "info",
+                  );
+                  textures.set(name, entry);
+                  return entry;
+                }
+              } catch (e) {
+                reportDiag(rt, cfg, `tex '${name}' 源图回退失败：${(e as Error)?.message}`, "warn");
+              }
+            }
+          }
           // [we-scene patch] WE 内置资源不在 pkg 里（作者的 pkg 只存自制素材）。
           // 最典型的是 `particle/halo_6` —— 它是 xray 效果的 **sprite**，
           // 官方描述「This is the shape image that will be used to define how the
@@ -3642,6 +3701,33 @@ cfg, source, pkgAbort.signal);
               const L = pass0?.combos?.LIGHTING ?? pass0?.combos?.lighting;
               if (Number(L) === 1) (layer as any).lightingEnabled = true;
               attachBuiltinMatTint(layer, material);
+              // [we-scene patch 2026-10-03] **材质 shader 路径**（F13）：该模型材质的
+              // pass shader 不是内置 albedo 一族（官方内置的 skybox/dome/car/core/
+              // ricepod*/techno*/knife_df… 全是自定义 GLSL）时，交给渲染器用材质自己的
+              // 着色器画网格，而不是通用网格程序。编译失败/属性不支持时渲染侧自动回落。
+              if (typeof pass0?.shader === "string" && pass0.shader && !eff.isEngineMeshShader(pass0.shader)) {
+                (layer as any).meshMaterial = {
+                  shader: pass0.shader,
+                  combos: pass0.combos || {},
+                  constants: pass0.constantshadervalues || {},
+                  blending: typeof pass0.blending === "string" ? pass0.blending : null,
+                  // 材质声明的**全部**槽位（car 的 g_Texture1 是法线贴图）：缺槽渲染侧绑白纹理，
+                  // 不预载的话采样得到 (0,0,0,1) → 光照项为 0 → 模型整片黑。
+                  textures: [],
+                };
+                for (const tn of pass0.textures || []) {
+                  if (typeof tn !== "string" || !tn || tn.startsWith("_rt_")) {
+                    (layer as any).meshMaterial.textures.push(null);
+                    continue;
+                  }
+                  try {
+                    await loadTex(tn);
+                    (layer as any).meshMaterial.textures.push(textures.get(tn) || null);
+                  } catch {
+                    (layer as any).meshMaterial.textures.push(null);
+                  }
+                }
+              }
             }
           }
           if (texName) {
@@ -3653,6 +3739,8 @@ cfg, source, pkgAbort.signal);
             try {
               await loadTex(texName);
               layer.textureName = texName;
+              // 材质 shader 路径（F13）的槽 0 贴图：给渲染侧一个可直接 bind 的条目
+              if ((layer as any).meshMaterial) (layer as any).meshMaterial.texture = textures.get(texName) || null;
             } catch (e) {
               reportDiag(
                 rt,
@@ -3663,7 +3751,10 @@ cfg, source, pkgAbort.signal);
             }
           }
           const texObj = texName ? textures.get(texName) : null;
-          if (!texObj) {
+          // [we-scene patch 2026-10-03] 无贴图材质（fantasticcar dome/shadow 只有 shader、
+          // 没有 textures）在**材质 shader 路径**下是合法的：着色器自己算颜色（渐变/自发光）。
+          // 只有既没贴图又不能走材质路径时才跳过（原行为）。
+          if (!texObj && !(layer as any).meshMaterial) {
             reportDiag(rt, cfg, `model '${layer.name}' 无贴图，跳过`, "warn");
             continue;
           }
@@ -3735,6 +3826,26 @@ cfg, source, pkgAbort.signal);
           // 注入绘制回调：renderer 在图层循环里按 z 序调用
           const byLayer = new Map<any, { mdl: any; tex: any; layer: any }>();
           for (const item of mdlItems) byLayer.set(item.layer, item);
+          // [we-scene patch 2026-10-03] 几何提供者：材质 shader 路径要从 mdl 层取
+          // 交错 VBO/索引（resolveMeshes/resolveMesh），见 renderer 的 drawMeshMaterial
+          renderer.setMeshProvider(mdlRenderer);
+          // 模型材质路径开关：调试钩子模式下允许用 window.__noMeshMaterial 一键回退
+          // （材质路径对个别壁纸仍有回归，见 renderer.js drawMeshMaterial 的头注）
+          renderer.setMeshMaterialEnabled(
+            !(hooksOn() && (window as unknown as Record<string, unknown>).__noMeshMaterial === true),
+          );
+          // [we-scene patch 2026-10-03] 装配期预编译模型材质程序（F17）：include 是异步取来的，
+          // 首帧抢跑会让「编译失败」的 null 永久哨兵钉死这条 shader（core/backgroundsphere
+          // 时好时坏就是这么来的）。这里 await 一次，失败也只是回落通用网格程序。
+          for (const item of mdlItems) {
+            const mm = (item.layer as any).meshMaterial;
+            if (!mm || !mm.shader) continue;
+            const provided: Record<number, unknown> = {};
+            (mm.textures || []).forEach((t: any, i: number) => {
+              if (t) provided[i] = t;
+            });
+            await renderer.prepareMeshMaterial(mm.shader, mm.combos, provided);
+          }
           renderer.setPuppetRenderer((layer: any, mvp: any, o: any) => {
             const item = byLayer.get(layer);
             if (!item) return;

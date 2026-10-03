@@ -145,6 +145,38 @@ export function presetToProperties(preset) {
   return out
 }
 
+/**
+ * 场景描述条目的候选名（按尝试顺序）。
+ *
+ * 工坊包恒为 `scene.json`，GIF 导入模板为 `gifscene.json`，少数放进 `scenes/` 子目录
+ * （843532366 的编译产物）——这四条候选是历史行为，不认 project.json 也能命中。
+ *
+ * [we-scene patch] **源码工程（WE 编辑器工程 / 官方默认壁纸）另有一类**：场景文件由
+ * `project.json` 的 `file` 指定，名字随意（defaultprojects 里就有 audiophile.json /
+ * fantasticcar.json / ricepod.json / techno.json 四个）。只按四条候选找会报
+ * 「pkg 中没有 scene.json（不是场景壁纸？）」而整场挂载失败 —— 与渲染能力无关的
+ * 装载失败，排查时极易误判成「这个内置壁纸不支持」。
+ *
+ * 位置：`file` 优先（这是 WE 的权威声明），其余候选保持原顺序兜底。
+ * 只收 `.json`：`file` 这个字段在 web/媒体壁纸里指向 index.html / scene.mp4，
+ * 同一个字段多用途，不能一律当场景描述（本函数只在 scene 分支被调用，仍显式设闸）。
+ *
+ * @param {unknown} project project.json 解析结果（可为 null）
+ * @returns {string[]} pkg 内的条目名，按尝试顺序
+ */
+export function sceneEntryCandidates(project) {
+  const out = []
+  const declared = project && typeof project === 'object' ? project.file : null
+  if (typeof declared === 'string') {
+    const name = declared.trim().replace(/^\.?\//, '')
+    if (name && /\.json$/i.test(name) && !/^preview\./i.test(name) && !out.includes(name)) out.push(name)
+  }
+  for (const name of ['scene.json', 'gifscene.json', 'scenes/scene.json', 'scenes/gifscene.json']) {
+    if (!out.includes(name)) out.push(name)
+  }
+  return out
+}
+
 export function parseScene(sceneJson, project) {
   const gp = (project && project.general && project.general.properties) || {}
   // 预设包（general.properties 为空、project.preset 有值）用 preset 当属性表；
