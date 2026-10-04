@@ -1,0 +1,44 @@
+# npm 发布：push 无 v 前缀的版本标签（如 2.1.0、2.1.1-beta1）触发。
+#
+# 走 npm「可信发布」（Trusted Publishing / OIDC）：npmjs.com 包设置里登记
+# 仓库 + 本文件名（publish.yml），发布凭证由 GitHub OIDC 现场换取
+# （要求 npm >= 11.5.1），不需要 NPM_TOKEN secret。本文件改名的话，
+# npm 上的登记要同步改。
+name: Publish to npm
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"] # 2.1.0 / 2.1.1-beta1，无 v 前缀
+
+permissions:
+  contents: read
+  id-token: write # 可信发布必需（OIDC）
+
+concurrency:
+  group: npm-publish
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4 # 版本取自 package.json 的 packageManager 字段
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org/
+      - run: npm install -g npm@latest # 可信发布要求 npm >= 11.5.1
+      - run: pnpm install --frozen-lockfile
+      # 防呆：npm 按 package.json 的版本发布，标签写错会指到错误版本
+      - name: 标签与 package.json 版本一致性
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if [ "$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 package.json 版本 $v 不一致 —— 先提交版本号改动再打标签"
+            exit 1
+          fi
+      - run: pnpm run build:lib
+      - run: node scripts/publish-npm.mjs --ci
+        env:
+          npm_config_provenance: true # npmjs 上带「已验证来源」标记

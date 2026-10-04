@@ -7,6 +7,11 @@
  *   npm run publish:npm -- --dry-run    # 只看会发什么，不真发
  *   npm run publish:npm -- --latest     # 预发布版本也打 latest tag（默认打 beta）
  *
+ * CI（GitHub Actions 打标签触发）：node scripts/publish-npm.mjs --ci
+ *   走 npm 可信发布（Trusted Publishing / OIDC）：不查登录、不落长期 token，
+ *   发布时由 npm 用 GitHub OIDC 现场换取短期凭证；npmjs 上登记的工作流
+ *   文件名必须与触发本命令的 workflow 一致，且 npm >= 11.5.1。
+ *
  * 前置（本机一次性）：npm login --registry https://registry.npmjs.org 完成浏览器授权。
  * 注意：本机 ~/.npmrc 默认走 npmmirror 镜像（装包用），镜像站不能发布，
  * 本脚本所有 registry 调用都显式指定官方源，不影响日常装包。
@@ -22,6 +27,7 @@ const REGISTRY = "https://registry.npmjs.org/";
 const argv = process.argv.slice(2);
 const dryRun = argv.includes("--dry-run");
 const forceLatest = argv.includes("--latest");
+const ci = argv.includes("--ci");
 
 // ---- 预检 1：发布物完整（缺任何一件都不发）----
 const pkg = JSON.parse(readFileSync(join(libDir, "package.json"), "utf8"));
@@ -58,6 +64,10 @@ if (published) {
 
 if (dryRun) {
   console.log(`--dry-run：跳过登录检查，只看打包清单（webwallgl@${pkg.version}）`);
+} else if (ci) {
+  // 可信发布：凭证在 publish 时用 GitHub OIDC 现场换取，whoami 无从验证；
+  // 发布者身份由 npmjs 的 Trusted Publisher 登记（仓库 + 工作流文件名）保证。
+  console.log("CI 可信发布：跳过登录预检（OIDC 在 publish 时换取短期凭证）");
 } else {
   // ---- 预检 3：已登录 npm（官方源）----
   try {
