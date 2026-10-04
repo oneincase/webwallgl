@@ -9,7 +9,7 @@
 - [GitHub 开源仓库](https://github.com/oneincase/webwallgl)
 - [在线版（GitHub Pages）](https://oneincase.github.io/webwallgl/)
 
-- 零运行时依赖，单文件引入（min ESM 约 930KB / gzip 约 295KB）
+- 零运行时依赖，单文件引入（min ESM 约 1075KB / gzip 约 331KB）
 - 可 npm 安装，也可 &lt;script> CDN 引入；一页可开多个互不干扰的实例
 - 本测试台本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API
 
@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.1.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>：暴露全局 WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.1.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -355,15 +355,15 @@ b.pause(); // 不影响 a
 
 ## 版本更新说明
 
-当前版本 2.0.2（自 2.0.1 起 14 个提交）。这一版主线是「3D 场景真实感」「脚本与动画层补齐」与「诊断契约」：3D 网格改为真深度测试的逐网格绘制、相机路径与脚本相机通道落地、动画层的 blend/rate 与逐层播放时钟补齐，另外把诊断级别变成由库声明并随请求发出的稳定契约。
+当前版本 2.1.0（自 2.0.2 起 61 个提交）。这一版主线是「官方内置示例工程全量兼容」「引擎加固」与「松散目录形态」：官方 19 个内置源码工程（defaultprojects）从素模/错色恢复到官方画面，解析器与生命周期补上失控边界，场景壁纸不再需要打包 scene.pkg 也能装载。
 
-- 真 3D 网格绘制：逐网格贴图 + 深度测试（含 HDR/MSAA 深度附件）+ 场景平行光；修 MDL 逐骨记录布局失步与多子网格只读首个 —— 3281559867 角色炸成巨块、整场没有地面的问题不再复现。
-- 相机：实体取「可见那台」并逐帧刷新，支持相机路径（path，随机/顺序抽段）与脚本相机位姿通道；跟拍类壁纸的镜头不再中途跑偏。
-- 窗口遮挡感知渲染：窗口被遮挡时暂停渲染、按档降帧，并做 ROI 图层剔除；宿主可推送遮挡矩形（可显式关闭），与用户 pause() 严格区分，撤掉遮挡自动恢复。
-- 脚本沙箱与动画层补齐：新增 emitParticles / getMaterial().getAnimation / getConstantAnimation（主控脚本不再三振熔断）；animationlayers 的 blend/rate 脚本与关键帧求值、每层自己的播放时钟（play/pause/setFrame）—— 绊倒/撞人后角色卡死、分数停住的问题已修。
-- 诊断级别成为稳定契约（issue #13）：级别由库自己声明并随 /diag 请求一起发出（`/diag?msg=…&lvl=&lt;level>`），三档 error / warn / info 语义写进类型与本文档；嵌入方不必再对诊断文案做关键字匹配。
-- 稳定性：rAF 跳帧节流改为纯时间判据（长任务后不再放大间隔，#8）、变换槽形状契约 + 渲染循环不许抛 + 效果链失败出声（#9 #10 #11）、加算 single clip 取末帧参考与 frame-0 帧事件补发、转译宽度与整型提升修复；cover 窥视门控只认「出像素的层」（放大镜类壁纸鼠标一碰边缘就把视窗滑出画面）。
-- 工具链：新增 __shared 调试出口（场景脚本共享状态只读快照）、脚本报错带出错行；verify-diag 契约锁进稳定集（含变异红测）。
+- 官方内置示例工程全量兼容（F1–F50）：源码工程装载链、模型层走材质 shader + 多槽贴图、场景级相机路径与 usershadervalues 绑定、arsenal 的贴图/材质/光照链、引擎内置 shader 三档识别（工坊包里没有也能挂）、内置 generic shader 的逐像素复刻、粒子材质自带 shader + colorrandom 逐分量随机 —— eagleflag、fantasticcar、shimmering_particles、arsenal、ricepod 等从素模/错色恢复到官方画面。
+- 深度与遮挡重做：层间深度持久化并按材质 depthtest/depthwrite 逐网格设置、贴着相机的壳不参与深度、混合 pass 不写深度、真 3D 模型帧内共享深度、透明像素不写深度 + 子网格按材质排序 —— neon_sunset 太阳外围黑方块、3477054430 城市盖住猫/树黑方块、3254178774 模型炸成碎三角不再复现。
+- 引擎加固：素材可控字段的解析闸门（几十字节的畸形 .tex 不再把解析器拖到 OOM）、GL 资源登记表（卸载后资源确定性归零）、上下文丢失从静默冻结变成可见事件、实例终态与代际令牌（destroy 不再复活、多实例的调试面互不误删）、四条静默失败路径接一次性诊断。
+- 松散目录形态：project.json 的 file 以 .json 结尾即按源码工程装载（materials/、models/、shaders/ 等按名取文件），无需打包 scene.pkg；测试台/调试页可加 ?form=pkg 或 ?form=loose 强制单臂做 A/B。
+- 交互与文字：命中门槛改为祖先可见性 —— 隐形 Solid 点击区（3810092560 点击互动）照常可点；anchor:none 按文字对齐贴 origin，修 3509578940 文字时钟被剪贴蒙版抹掉，以及 3694771168 周几盒偏移与时钟黑字。
+- Web 壁纸与宿主控制：相对 URL 逃出站点根时按官方语义夹回根（3650874083/3650880224 Blue Archive spine 整页黑屏）、站点根夹住支持宿主声明、__wp.setMediaControl 控制反转 + 媒体按钮点击推断（3794460976 音乐控制接入）、applyUserProperties 按官方字母序下发（corsair_collection 白屏）。
+- 性能与内部收敛：粒子三线性插值的单元格角点缓存 —— 重粒子场景稳态 fps 25.6 → 29.5（+15.2%）；mulberry32 / parsePkg / linkProgram / mat4Mul 各四份拷贝分别收敛为一份。
 
 每一次变化的症状、根因、影响面数字与验证方式都写在对应的提交信息里，完整历史见 GitHub 仓库的提交记录与 Release。
 

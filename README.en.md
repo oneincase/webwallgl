@@ -9,7 +9,7 @@ Make Wallpaper Engine great again!!! Congratulations — you've found a treasure
 - [GitHub repository](https://github.com/oneincase/webwallgl)
 - [Live demo (GitHub Pages)](https://oneincase.github.io/webwallgl/)
 
-- Zero runtime dependencies, single-file delivery (min ESM ~930KB / gzip ~295KB)
+- Zero runtime dependencies, single-file delivery (min ESM ~1075KB / gzip ~331KB)
 - Installable via npm or a &lt;script> CDN tag; multiple isolated instances per page
 - This bench is the library's first consumer — everything you see here is public API
 
@@ -36,12 +36,12 @@ import { mount, httpSource } from "webwallgl";
 
 ```
 // 2) ESM CDN via jsDelivr (without a bundler)
-import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.min.mjs";
+import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@2.1.0/webwallgl.min.mjs";
 ```
 
 ```
 <!-- 3) UMD <script>: exposes the global WebWallGL -->
-<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.0.2/webwallgl.global.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webwallgl@2.1.0/webwallgl.global.min.js"></script>
 <script>
   const { mount, httpSource } = WebWallGL;
 </script>
@@ -356,15 +356,15 @@ b.pause(); // does not affect a
 
 ## Changelog
 
-Current version: 2.0.2 — 14 commits since 2.0.1. Three themes: real 3D scene fidelity, script & animation-layer completion, and a diagnostics contract. 3D meshes now draw per-mesh with real depth testing, camera paths and a script camera channel landed, animation-layer blend/rate plus per-layer playback clocks are in place, and the diagnostic level is now a stable contract declared by the library and sent with every request.
+Current version: 2.1.0 — 61 commits since 2.0.2. Three themes: full compatibility with the official built-in sample projects, engine hardening, and the loose-directory form. The 19 built-in source projects (defaultprojects) recover from blank models / wrong colors to official visuals, the parser and the lifecycle gain bounded failure modes, and scene wallpapers no longer need a packed scene.pkg to load.
 
-- Real 3D mesh rendering: per-mesh textures, depth testing (with HDR/MSAA depth attachments) and scene directional light; fixed the MDL per-bone record layout slipping out of step and only the first sub-mesh being read — 3281559867 no longer blows characters into giant blocks or loses the whole ground plane.
-- Camera: the visible camera entity is picked and refreshed per frame, with camera paths (random / sequential clip queue) and a script camera pose channel — follow-cam wallpapers no longer drift mid-shot.
-- Occlusion-aware rendering: rendering pauses, frame rate steps down by band, and ROI layer culling kicks in when the window is occluded. Hosts push occlusion rectangles (opt-out supported), and it is kept strictly separate from user pause() — removing the occlusion resumes automatically.
-- Script sandbox & animation layers: added emitParticles / getMaterial().getAnimation / getConstantAnimation (main controller scripts no longer trip the breaker), plus evaluation of animation-layer blend/rate scripts and keyframes and a per-layer playback clock (play/pause/setFrame) — the freeze after a trip/bump, with the score stuck, is fixed.
-- The diagnostic level is now a stable contract (issue #13): declared by the library and sent with every /diag request (`/diag?msg=…&lvl=&lt;level>`) across three documented tiers — error / warn / info — so embedders no longer need keyword matching on diagnostic text.
-- Stability: rAF frame throttling is now a pure time gate (#8), transform-slot shape contract + the render loop may not throw + effect-chain failures now speak up (#9 #10 #11), additive single clips take the end frame as reference and frame-0 events fire at load, plus transpilation width / integer-promotion fixes; the cover-peek gate only counts layers that actually paint pixels (magnifier-style wallpapers no longer slide the viewport off-screen at the screen edge).
-- Tooling: added the __shared debug export (read-only snapshot of scene-script shared state) and script errors now carry the failing line; the verify-diag contract check (with mutation testing) joined the stable set.
+- Full compatibility with the official built-in sample projects (F1–F50): a source-project loading chain, model layers running material shaders with multi-slot textures, scene-level camera paths and usershadervalues bindings, arsenal's texture/material/lighting chain, three-tier built-in shader recognition (mounts even when the package lacks them), a pixel-exact replica of the built-in generic shader, and particle materials with their own shaders plus per-component colorrandom — eagleflag, fantasticcar, shimmering_particles, arsenal and ricepod recover from blank models / wrong colors to official visuals.
+- Depth & occlusion rework: inter-layer depth is now persistent and set per mesh from material depthtest/depthwrite, camera-adjacent shells are excluded from depth testing, blended passes no longer write depth, true-3D models share depth within the frame, and transparent pixels no longer write depth with sub-meshes sorted by material — the black squares around neon_sunset's sun, 3477054430's city covering the cat / tree black squares, and 3254178774's model exploding into broken triangles no longer reproduce.
+- Engine hardening: parse gates on attacker-controlled fields (a few dozen malformed bytes in a .tex can no longer drag the parser into OOM), a GL resource registry (teardown deterministically returns resource counts to zero), context loss turns from a silent freeze into a visible event, instance finality & generation tokens (destroy no longer resurrects, and multi-instance debug surfaces no longer delete each other), plus one-shot diagnostics on four previously silent failure paths.
+- Loose-directory form: a project.json whose file ends with .json loads as a source project (materials/, models/, shaders/ etc. fetched by name) — no scene.pkg packing needed; the bench/debug pages accept ?form=pkg or ?form=loose to force one arm for an A/B.
+- Interaction & text: the hit-test gate now walks ancestor visibility — invisible Solid click zones (3810092560's click interaction) still receive clicks; anchor:none hugs origin by text alignment, fixing 3509578940's text clock being wiped by a clipping mask, plus 3694771168's weekday-box offset and black clock digits.
+- Web wallpapers & host control: relative URLs escaping the site root are clamped back per official semantics (3650874083/3650880224 Blue Archive spine full-page blackout), the site-root clamp supports host declarations, __wp.setMediaControl lands control inversion plus media-button click inference (3794460976 music control), and applyUserProperties is sent in the official alphabetical order (corsair_collection blank screen).
+- Performance & internal convergence: per-cell corner caching for particle trilinear interpolation — steady-state fps on heavy-particle scenes went 25.6 → 29.5 (+15.2%); four copies each of mulberry32 / parsePkg / linkProgram / mat4Mul converge into one.
 
 Every change records its symptom, root cause, measured scope and verification method in the corresponding commit message — see the commit history and Releases on the GitHub repository.
 
