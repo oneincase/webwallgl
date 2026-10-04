@@ -377,4 +377,4 @@ b.pause(); // 不影响 a
 
 | 微信支付 | 支付宝 |
 | --- | --- |
-| ![微信支付赞赏码](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/wechat.png) | ![支付宝赞赏码](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/alipay.png) |
+| ![微信支付赞赏码](https://cdn.jsdelivr.net/gh/oneincase/webwallgl@main/public/imgs/wechat.png) | ![支付宝赞赏码](https://cdn.jsdelivr.net/gh/oneincase/webwallgl@main/public/imgs/alipay.png) |

@@ -378,4 +378,4 @@ If this rendering core helped your project, buying the author a coffee is always
 
 | WeChat Pay | Alipay |
 | --- | --- |
-| ![WeChat Pay QR code](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/wechat.png) | ![Alipay QR code](https://raw.githubusercontent.com/oneincase/webwallgl/main/public/imgs/alipay.png) |
+| ![WeChat Pay QR code](https://cdn.jsdelivr.net/gh/oneincase/webwallgl@main/public/imgs/wechat.png) | ![Alipay QR code](https://cdn.jsdelivr.net/gh/oneincase/webwallgl@main/public/imgs/alipay.png) |

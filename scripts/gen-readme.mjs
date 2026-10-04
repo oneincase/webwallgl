@@ -45,11 +45,12 @@ try {
 
 // 赞赏收款码清单（与 index.html #sponsor-card 保持一致；key 取 bench/i18n.ts 文案）。
 // README 必须用绝对 URL：npm 渲染 README 时不带仓库文件上下文，相对路径图片会裂；
-// raw.githubusercontent.com 在 GitHub 与 npm 上都能正常显示。
-const SPONSOR_REPO_RAW = "https://raw.githubusercontent.com/oneincase/webwallgl/main";
+// 走 jsDelivr 而非 raw.githubusercontent.com：后者在大陆常年不可达，赞赏码会裂图。
+// 注意 @main 走 jsDelivr 分支缓存（约 12h），换图后要即时生效就 Purge 或改用 commit SHA。
+const SPONSOR_CDN_BASE = "https://cdn.jsdelivr.net/gh/oneincase/webwallgl@main";
 const SPONSOR = [
-  { key: "sponsor.wechat", img: `${SPONSOR_REPO_RAW}/public/imgs/wechat.png`, alt: { zh: "微信支付赞赏码", en: "WeChat Pay QR code" } },
-  { key: "sponsor.alipay", img: `${SPONSOR_REPO_RAW}/public/imgs/alipay.png`, alt: { zh: "支付宝赞赏码", en: "Alipay QR code" } },
+  { key: "sponsor.wechat", img: `${SPONSOR_CDN_BASE}/public/imgs/wechat.png`, alt: { zh: "微信支付赞赏码", en: "WeChat Pay QR code" } },
+  { key: "sponsor.alipay", img: `${SPONSOR_CDN_BASE}/public/imgs/alipay.png`, alt: { zh: "支付宝赞赏码", en: "Alipay QR code" } },
 ];
 
 // 正文（非代码块）里的裸 HTML 标签（<script>、<input type=file> 等）会被
