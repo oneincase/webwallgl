@@ -988,6 +988,18 @@ export function recomposeWorld(layers, dirty) {
     targets.push(l)
   }
   targets.sort((a, b) => depthOf(a) - depthOf(b))
+  // 后处理父层的 origin 只为渲染被强制成画布中心；parse 合并子层用的是它**强制前**的
+  // 世界变换。这里同口径，否则一重算，挂在 fullscreenlayer 下的子层整体偏移半幅画布
+  //（2955378002「MANUAL」下的播放器控件：+1920,+1080）。
+  const basisOf = (p, guard = 0) => {
+    if (!p.isPostProcess || guard > 64) return { origin: p.origin, scale: p.scale, angles: p.angles }
+    const lo = Array.isArray(p.localOrigin) ? p.localOrigin : [0, 0, 0]
+    const ls = Array.isArray(p.localScale) ? p.localScale : p.scale
+    const la = Array.isArray(p.localAngles) ? p.localAngles : p.angles
+    const gp = p.parentId !== undefined && p.parentId !== null ? byId.get(p.parentId) : null
+    if (!gp) return { origin: lo, scale: ls, angles: la }
+    return composeChildTransform(basisOf(gp, guard + 1), { origin: lo, scale: ls, angles: la }, true)
+  }
   for (const l of targets) {
     const parent = l.parentId !== undefined && l.parentId !== null ? byId.get(l.parentId) : null
     let w
@@ -998,7 +1010,7 @@ export function recomposeWorld(layers, dirty) {
       // 2026-09-20 用 Mirage 出帧推翻了旧的「渲染惰性纯容器不传 scale」守卫）。
       const propagateScale = true
       w = composeChildTransform(
-        { origin: parent.origin, scale: parent.scale, angles: parent.angles },
+        basisOf(parent),
         { origin: l.localOrigin, scale: l.localScale, angles: l.localAngles },
         propagateScale,
       )
