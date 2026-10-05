@@ -695,3 +695,102 @@ export type SceneInstance = {
   /** 事件订阅，返回取消函数 */
   on<K extends keyof SceneEvents>(ev: K, fn: SceneEvents[K]): () => void;
 };
+
+// ─── 公共包（webwallgl/core）引擎底座类型 ────────────────────────────────
+// docs/EDITOR-PLAN.md §0.5：公共包只收「自包含、Node 可载、零装配依赖」的引擎
+// 底座面。类型跟着实现走：Pkg/Tex 与 vendor/we-scene/pkg/{container,texture}.js
+// 的返回对象逐字段对应，改实现必须同步这里（api/core.d.ts 手写契约引用它们）。
+
+/** scene.pkg 入口表项（offset 相对 dataStart） */
+export type PkgEntry = {
+  readonly name: string;
+  readonly offset: number;
+  readonly size: number;
+};
+
+/** parsePkg 结果。buf 是入参字节的原引用（getEntry 返回其零拷贝视图） */
+export type Pkg = {
+  readonly magic: string;
+  readonly version: string;
+  readonly count: number;
+  readonly entries: PkgEntry[];
+  readonly dataStart: number;
+  readonly fileSize: number;
+  readonly buf: Uint8Array;
+};
+
+/** verifyLayout 结果：入口数据末尾应恰好贴住文件末尾（结构自检） */
+export type PkgLayout = {
+  readonly dataEnd: number;
+  readonly fileSize: number;
+  readonly ok: boolean;
+};
+
+/** .tex 内的单条 mip 记录（compression=1 时 data 是 LZ4 压缩块，惰性解压） */
+export type TexMip = {
+  readonly width: number;
+  readonly height: number;
+  readonly compression: number;
+  readonly data: Uint8Array;
+};
+
+/**
+ * TEXS 序列帧表的单帧。轴对齐帧的 uDir=(w,0)、vDir=(0,h)；rotated=true 时是
+ * 仿射打包，取帧矩形必须走 origin + s·uDir + t·vDir，不能退化成 (x,y,w,h)。
+ */
+export type TexFrame = {
+  readonly imageId: number;
+  readonly duration: number;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly uDir: [number, number];
+  readonly vDir: [number, number];
+  readonly rotated: boolean;
+};
+
+export type TexFrames = {
+  readonly magic: string;
+  readonly frameWidth: number;
+  readonly frameHeight: number;
+  /** 帧矩形归一化分母（mip0 真实像素尺寸，不是头部 textureWidth/Height） */
+  readonly atlasWidth: number;
+  readonly atlasHeight: number;
+  readonly list: readonly TexFrame[];
+};
+
+/** parseTex 结果（TEXV0005 主路径与旧 TEXV0004 同形；字段与实现逐字对应） */
+export type Tex = {
+  readonly format: number;
+  readonly formatName: string;
+  readonly flags: number;
+  /** TEXI 头部声明的逻辑尺寸 */
+  readonly textureWidth: number;
+  readonly textureHeight: number;
+  /** TEXB 容器侧的图像尺寸（常为 POT 对齐填充值，解码端按需裁剪） */
+  readonly width: number;
+  readonly height: number;
+  readonly freeImageFormat: number;
+  readonly containerMagic: string;
+  readonly containerVersion: number;
+  readonly isVideo: boolean;
+  readonly images: readonly (readonly TexMip[])[];
+  /** 序列帧表；无 TEXS 段时为 null */
+  readonly frames: TexFrames | null;
+};
+
+/** decodeMip0 / decodeMipLevel / decodeMips 的解码产物：按载荷类型四选一 */
+export type DecodedMip =
+  | { width: number; height: number; rgba: Uint8Array; level?: number }
+  | { width: number; height: number; png: Uint8Array; level?: number }
+  | { width: number; height: number; image: Uint8Array; fif: number; level?: number }
+  | { width: number; height: number; video: Uint8Array; level?: number };
+
+/** fitWindow 结果：设计尺寸坐标系里的可见窗口 */
+export type FitWindowResult = {
+  readonly offX: number;
+  readonly offY: number;
+  readonly viewW: number;
+  readonly viewH: number;
+};

@@ -2,12 +2,15 @@
 /**
  * 库发布物组装（docs/LIBRARY-PLAN.md 第 6 步）。
  *
- * `vite build -c vite.lib.config.ts` 产出 JS 双格式的**可读版 + sourcemap**；
+ * `node scripts/build-lib.mjs`（build:lib 第 2 步）产出 JS 双格式的**可读版 + sourcemap**（播放包
+ * ES+UMD 两格式；公共包/编辑器包各一份自包含 ESM，见 docs/EDITOR-PLAN.md §0.5）；
  * tsc 从 api/types.ts（公共类型唯一真源，零 import）生成类型声明；
  * 本脚本再用 esbuild 压出对应的 .min 版（各带 sourcemap），拼成最终发布物 dist/lib/：
  *   webwallgl.mjs / webwallgl.min.mjs
  *   webwallgl.global.js / webwallgl.global.min.js
- *   各自 .map / webwallgl.d.ts / types.d.ts / package.json
+ *   webwallgl-core.mjs / webwallgl-core.min.mjs
+ *   webwallgl-editor.mjs / webwallgl-editor.min.mjs
+ *   各自 .map / webwallgl.d.ts / core.d.ts / editor.d.ts / types.d.ts / package.json
  *   README.md / README.en.md / LICENSE / imgs/（使用说明、许可、收款码随包发布）
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -20,9 +23,9 @@ import esbuild from "esbuild";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const libDir = join(root, "dist", "lib");
 
-for (const f of ["webwallgl.mjs", "webwallgl.global.js"]) {
+for (const f of ["webwallgl.mjs", "webwallgl.global.js", "webwallgl-core.mjs", "webwallgl-editor.mjs"]) {
   if (!existsSync(join(libDir, f))) {
-    throw new Error(`缺少 ${f} —— 先跑 vite build -c vite.lib.config.ts`);
+    throw new Error(`缺少 ${f} —— 先跑 npm run build:lib`);
   }
 }
 
@@ -35,6 +38,11 @@ if (!existsSync(emitted)) {
 }
 const entry = readFileSync(join(root, "renderer", "src", "api", "entry.d.ts"), "utf8");
 writeFileSync(join(libDir, "webwallgl.d.ts"), entry);
+// 公共包 / 编辑器包的手写契约类型（core.d.ts / editor.d.ts 的类型同样只来自
+// ./types，发布目录里与 types.d.ts 同目录所以 import 可解析）
+for (const f of ["core.d.ts", "editor.d.ts"]) {
+  copyFileSync(join(root, "renderer", "src", "api", f), join(libDir, f));
+}
 copyFileSync(emitted, join(libDir, "types.d.ts"));
 rmSync(join(libDir, "types"), { recursive: true, force: true });
 
@@ -49,6 +57,8 @@ rmSync(join(libDir, "types"), { recursive: true, force: true });
 const MINIFY = [
   { in: "webwallgl.mjs", out: "webwallgl.min.mjs", format: "esm" },
   { in: "webwallgl.global.js", out: "webwallgl.global.min.js", format: null },
+  { in: "webwallgl-core.mjs", out: "webwallgl-core.min.mjs", format: "esm" },
+  { in: "webwallgl-editor.mjs", out: "webwallgl-editor.min.mjs", format: "esm" },
 ];
 for (const { in: inFile, out: outFile, format } of MINIFY) {
   const source = readFileSync(join(libDir, inFile), "utf8");
@@ -113,8 +123,14 @@ writeFileSync(
         "webwallgl.min.mjs",
         "webwallgl.global.js",
         "webwallgl.global.min.js",
+        "webwallgl-core.mjs",
+        "webwallgl-core.min.mjs",
+        "webwallgl-editor.mjs",
+        "webwallgl-editor.min.mjs",
         "*.map",
         "webwallgl.d.ts",
+        "core.d.ts",
+        "editor.d.ts",
         "types.d.ts",
         "imgs",
       ],
@@ -124,10 +140,23 @@ writeFileSync(
       unpkg: "./webwallgl.global.min.js",
       jsdelivr: "./webwallgl.global.min.js",
       exports: {
+        // 三包产物（docs/EDITOR-PLAN.md §0.5）：根 = 播放包（不变），./core = 公共包
+        // 引擎底座，./editor = 编辑器包（播放包超集）。子路径仅 ESM（bundler / Node
+        // 工具面）；CDN <script> 仍走根出口 UMD。
         ".": {
           types: "./webwallgl.d.ts",
           import: "./webwallgl.mjs",
           default: "./webwallgl.global.min.js",
+        },
+        "./core": {
+          types: "./core.d.ts",
+          import: "./webwallgl-core.mjs",
+          default: "./webwallgl-core.min.mjs",
+        },
+        "./editor": {
+          types: "./editor.d.ts",
+          import: "./webwallgl-editor.mjs",
+          default: "./webwallgl-editor.min.mjs",
         },
       },
       sideEffects: false,
@@ -137,5 +166,5 @@ writeFileSync(
   ) + "\n",
 );
 console.log(
-  "dist/lib 组装完成：webwallgl(.min).mjs / webwallgl.global(.min).js（各带 .map）/ webwallgl.d.ts / types.d.ts / package.json / README ×2 / LICENSE / imgs",
+  "dist/lib 组装完成：三包（webwallgl / webwallgl-core / webwallgl-editor）×（可读 + min，各带 .map）/ 各包 .d.ts / types.d.ts / package.json / README ×2 / LICENSE / imgs",
 );

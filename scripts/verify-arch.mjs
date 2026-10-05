@@ -466,6 +466,54 @@ for (const name of REQUIRED_WP) {
   );
 }
 
+// 公共包 / 编辑器包的契约面（docs/EDITOR-PLAN.md §0.5）：规则与 api/index.ts ↔
+// entry.d.ts 相同 —— 导出清单机器比对 + 类型本体只能来自 ./types，外加一条分层
+// 断言：公共包只准依赖引擎与 ./types，触碰装配层即分层倒置（底座反依赖编排）。
+{
+  const coreTs = fs.readFileSync(path.join(ROOT, "renderer/src/api/core.ts"), "utf8");
+  const coreDts = fs.readFileSync(path.join(ROOT, "renderer/src/api/core.d.ts"), "utf8");
+  const runtime = new Set();
+  const reExportRe = /export\s+\{([^}]*)\}\s+from/g;
+  let m;
+  while ((m = reExportRe.exec(coreTs))) {
+    if (/export\s+type\s*\{/.test(coreTs.slice(Math.max(0, m.index - 20), m.index + m[0].length))) continue;
+    for (const raw of m[1].split(",")) {
+      const name = raw.trim().split(/\s+as\s+/).pop()?.trim();
+      if (name && !name.startsWith("type ")) runtime.add(name);
+    }
+  }
+  check(runtime.size > 0, "契约面：无法从 api/core.ts 解析出运行时导出清单");
+  for (const name of runtime) {
+    check(
+      new RegExp(`export declare (?:function|const) ${name}\\b`).test(coreDts),
+      `契约面：api/core.ts 导出了 ${name}，但 api/core.d.ts 未声明 —— 消费方 import 会 TS2305`,
+    );
+  }
+  for (const d of coreDts.matchAll(/export declare (?:function|const) (\w+)/g)) {
+    check(runtime.has(d[1]), `契约面：api/core.d.ts 声明了 ${d[1]}，但 api/core.ts 并未导出它`);
+  }
+  check(
+    /from "\.\/types"/.test(coreDts) && !/from "\.\/(?!types")/.test(coreDts),
+    "契约面：api/core.d.ts 只能从 ./types 导入类型（别处的类型不进发布的 types.d.ts）",
+  );
+  for (const spec of [...coreTs.matchAll(/from\s+["']([^"']+)["']/g)].map((x) => x[1])) {
+    check(
+      /^(\.\.\/)+vendor\//.test(spec) || spec === "./types",
+      `api/core.ts 不得 import 引擎与 ./types 之外的模块 —— "${spec}"（公共包反依赖装配层 = 分层倒置）`,
+    );
+  }
+  const editorTs = fs.readFileSync(path.join(ROOT, "renderer/src/api/editor.ts"), "utf8");
+  check(
+    /export\s+\*\s+from\s+["']\.\/index["']/.test(editorTs),
+    "api/editor.ts 必须 export * from ./index（编辑器包 = 播放包超集，见 EDITOR-PLAN §0.5）",
+  );
+  const editorDts = fs.readFileSync(path.join(ROOT, "renderer/src/api/editor.d.ts"), "utf8");
+  check(
+    /export\s+\*\s+from\s+["']\.\/webwallgl["']/.test(editorDts),
+    "api/editor.d.ts 必须 re-export 播放包类型（./webwallgl），编辑器包与播放包类型不许分叉",
+  );
+}
+
 // ---------- 壁纸库分类：规则只有一份，且与原生 library.rs 对齐 ----------
 // host/wallpaper-host.ts 与 scripts/perf-bench.mjs 各写一份判据时两份都比原生弱
 // （不认 gifscene.pkg、不做内容推断）⇒ 843532366（GIF 导入模板场景，包名 gifscene.pkg）

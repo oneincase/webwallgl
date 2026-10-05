@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * npm 发布：发布物就是 build:lib 产出的 dist/lib/（代码 ×4 + sourcemap + 类型
- * + README 使用说明 + LICENSE + 收款码图）。
+ * npm 发布：发布物就是 build:lib 产出的 dist/lib/（三包产物：播放包 ES+UMD ×4、
+ * 公共包/编辑器包各 ESM ×2，全部带 sourcemap；+ 类型 + README 使用说明 + LICENSE
+ * + 收款码图。三包形态见 docs/EDITOR-PLAN.md §0.5）。
  *
  *   npm run publish:npm                 # 构建 + 预检 + 发布
  *   npm run publish:npm -- --dry-run    # 只看会发什么，不真发
@@ -36,7 +37,13 @@ const NEED = [
   "webwallgl.min.mjs",
   "webwallgl.global.js",
   "webwallgl.global.min.js",
+  "webwallgl-core.mjs",
+  "webwallgl-core.min.mjs",
+  "webwallgl-editor.mjs",
+  "webwallgl-editor.min.mjs",
   "webwallgl.d.ts",
+  "core.d.ts",
+  "editor.d.ts",
   "types.d.ts",
   "README.md",
   "README.en.md",
