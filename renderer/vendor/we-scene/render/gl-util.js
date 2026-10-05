@@ -2,6 +2,7 @@
 // [we-scene patch] 此前 renderer.js / mdl.js / particles.js 各有一份 compile/link
 // 隐性重复（见 docs/ARCHITECTURE.md「重复代码」）；本模块是收敛的第一步——
 // renderer.js 侧改用这里，mdl/particles 侧待后续轮次切换。
+import { repairGlsl, parseInfoLog } from './glsl-repair.js'
 /**
  * 编译并链接一个程序。**全引擎唯一的 link 实现**（2026-10 B3 收敛）。
  *
@@ -43,17 +44,39 @@ function linkProgram(gl, vsSrc, fsSrc, opts) {
   return p
 }
 
-function compile(gl, type, src) {
+// 原始源码 → 修复后源码（null = 修不好）。同一 shader 在多个图层/壁纸间反复编译，修复只做一次。
+const repairCache = new Map()
+
+function tryCompile(gl, type, src) {
   const s = gl.createShader(type)
   gl.shaderSource(s, src)
   gl.compileShader(s)
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    // 同上：失败时先删再抛
-    const log = gl.getShaderInfoLog(s)
-    gl.deleteShader(s)
-    throw new Error('着色器编译失败: ' + log)
+  if (gl.getShaderParameter(s, gl.COMPILE_STATUS)) return { s, log: '' }
+  const log = gl.getShaderInfoLog(s)
+  gl.deleteShader(s)
+  return { s: null, log }
+}
+
+function compile(gl, type, src) {
+  const first = tryCompile(gl, type, src)
+  if (first.s) return first.s
+  // 转译器漏掉的 HLSL 隐式转换按报错就地修（见 glsl-repair.js）
+  let fixed = repairCache.get(src)
+  if (fixed === undefined) {
+    const r = repairGlsl(src, (cand) => {
+      const t = tryCompile(gl, type, cand)
+      if (t.s) { gl.deleteShader(t.s); return [] }
+      return parseInfoLog(t.log)
+    })
+    fixed = r.ok ? r.src : null
+    repairCache.set(src, fixed)
+    if (r.ok) console.info(`[we-scene] 着色器编译报错已自动修复（${r.fixes} 处）`)
   }
-  return s
+  if (fixed) {
+    const t = tryCompile(gl, type, fixed)
+    if (t.s) return t.s
+  }
+  throw new Error('着色器编译失败: ' + first.log)
 }
 
 function parseVec3Local(s) {

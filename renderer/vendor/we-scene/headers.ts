@@ -33,6 +33,13 @@ export const WE_SHADER_HEADERS: Record<string, string> = {
 #define M_PI_2 6.28318530718
 // 真正的 π/2 在 WE 里叫 M_PI_HALF（本机库暂无引用，补全以对齐真实头的符号面）
 #define M_PI_HALF 1.57079632679
+#define SQRT_2 1.41421356237
+#define SQRT_3 1.73205080756
+// greyscale 必须返回 **float** —— 调用点几乎全是 \`noise = CAST3(greyscale(noise))\`
+// （filmgrain/vhs），CAST3 只能作用于标量。\`albedo.rgb = greyscale(albedo.rgb)\`
+// （color_grading）由赋值端的 vec3 = float 广播承接。
+// 权重 vec3(0.11, 0.59, 0.3) 是 Rec.601 的**逆序**，逐字照官方 common.h。
+float greyscale(vec3 color) { return dot(color, vec3(0.11, 0.59, 0.3)); }
 vec2 rotateVec2(vec2 v, float a) {
     float c = cos(a);
     float s = sin(a);
@@ -83,39 +90,107 @@ vec3 hsv2rgb(vec3 c) {
   // 不在这里再抄一份：同一份实现同时供效果 shader 的 #include 与图层
   // colorBlendMode 的画布合成（COMPOSITE_BLEND_FRAG）使用。两份必然发散 ——
   // 「哪些模式不套 opacity 二次加权」这类代数细节改一处漏一处，画面错了还查不出来。
+  //
+  // 下面按官方 common_blending.h 导出全部按名可调的符号。官方的 Blend* 是**宏**，
+  // 这里改写成 float / vec3 两个重载的函数：既能直接调用，也能当 BlendOpacity 的
+  // 第 3 实参（宏展开后就是普通调用）。逐通道三元式的模式（Screen/Overlay/…）
+  // 只能写成 vec3 = 逐分量 float 版，GLSL 的 ?: 不接受 bvec。
+  // 不定义 LUMINANCE_FACTOR / greyscale：前者官方没有（tone_mapping.frag 自己写
+  // `const vec3 LUMINANCE_FACTOR = …`，这里若是宏会展开成语法错误），后者在官方
+  // common.h 里。
   'common_blending.h': `${WE_BLENDING_GLSL}
-// greyscale 必须返回 **float** 而不是 vec3 —— 调用点几乎全是
-// \`noise = CAST3(greyscale(noise))\`（filmgrain/vhs），CAST3 只能作用于标量；
-// 若声明成 vec3 版本，这些点会变成非法的 vec3(vec3)。
-// 唯一的 \`albedo.rgb = greyscale(albedo.rgb)\`（color_grading）在 HLSL 里靠标量
-// 自动广播成立，转译到 GLSL 后由赋值端的 vec3 = float 广播承接。
-// 权重是 **vec3(0.11, 0.59, 0.3)**，即 Rec.601 (0.30,0.59,0.11) 的**逆序**——
-// WE 第一方 shader 里的历史遗留（BGR 时代）。依据是 4 个第一方文件把它内联写死：
-// localcontrast_combine.frag（正是 blur_combine 的免头文件版，#if GREYSCALE 下
-// 做的就是 greyscale 的事）、shine_downsample2.frag 等，跨 6 个壁纸字节一致。
-// 注意工坊 shader 大多用 Rec.709 (0.2126,0.7152,0.0722)，但它们都是**本地自定义**
-// 的宏，不经过这个头；color_grading.frag 甚至同文件内两种并存 ——
-// 它自己 #define LUMINANCE_FACTOR 为 709，同时又调用本头的 greyscale，
-// 正说明 greyscale 不是 709 那套。
-#define LUMINANCE_FACTOR vec3(0.11, 0.59, 0.3)
-float greyscale(vec3 color) { return dot(vec3(0.11, 0.59, 0.3), color); }
-// BlendLinearDodge 必须按名存在：它被当作**实参**传给 BlendOpacity，
-// 自身从不带括号调用（故按调用扫描的校验器看不到它，但缺了会展开失败）。
+vec4 Desaturate(vec3 color, float Desaturation) {
+    vec3 gray = vec3(dot(vec3(0.3, 0.59, 0.11), color));
+    return vec4(mix(color, gray, Desaturation), 1.0);
+}
+float HueToRGB(float f1, float f2, float hue) { return weHueToRgb(f1, f2, hue); }
+// 实参顺序与函数名相反：(color, brightness, saturation, contrast)，1.0 为恒等。
+vec3 ContrastSaturationBrightness(vec3 color, float brt, float sat, float con) {
+    vec3 brtColor = color * brt;
+    vec3 intensity = vec3(dot(brtColor, vec3(0.2125, 0.7154, 0.0721)));
+    vec3 satColor = mix(intensity, brtColor, sat);
+    return mix(vec3(0.5), satColor, con);
+}
+
+float BlendLinearDodgef(float base, float blend) { return base + blend; }
+vec3 BlendLinearDodgef(vec3 base, vec3 blend) { return base + blend; }
+float BlendLinearBurnf(float base, float blend) { return max(base + blend - 1.0, 0.0); }
+vec3 BlendLinearBurnf(vec3 base, vec3 blend) { return max(base + blend - 1.0, vec3(0.0)); }
+float BlendLightenf(float base, float blend) { return max(blend, base); }
+vec3 BlendLightenf(vec3 base, vec3 blend) { return max(blend, base); }
+float BlendDarkenf(float base, float blend) { return min(blend, base); }
+vec3 BlendDarkenf(vec3 base, vec3 blend) { return min(blend, base); }
+float BlendLinearLightf(float base, float blend) { return blend < 0.5 ? BlendLinearBurnf(base, 2.0 * blend) : BlendLinearDodgef(base, 2.0 * (blend - 0.5)); }
+float BlendScreenf(float base, float blend) { return 1.0 - ((1.0 - base) * (1.0 - blend)); }
+float BlendOverlayf(float base, float blend) { return base < 0.5 ? (2.0 * base * blend) : (1.0 - 2.0 * (1.0 - base) * (1.0 - blend)); }
+float BlendSoftLightf(float base, float blend) { return (blend < 0.5) ? (2.0 * base * blend + base * base * (1.0 - 2.0 * blend)) : (sqrt(base) * (2.0 * blend - 1.0) + 2.0 * base * (1.0 - blend)); }
+float BlendColorDodgef(float base, float blend) { return (blend == 1.0) ? blend : min(base / (1.0 - blend), 1.0); }
+float BlendColorBurnf(float base, float blend) { return (blend == 0.0) ? blend : max((1.0 - ((1.0 - base) / blend)), 0.0); }
+float BlendVividLightf(float base, float blend) { return (blend < 0.5) ? BlendColorBurnf(base, 2.0 * blend) : BlendColorDodgef(base, 2.0 * (blend - 0.5)); }
+float BlendPinLightf(float base, float blend) { return (blend < 0.5) ? BlendDarkenf(base, 2.0 * blend) : BlendLightenf(base, 2.0 * (blend - 0.5)); }
+float BlendHardMixf(float base, float blend) { return (BlendVividLightf(base, blend) < 0.5) ? 0.0 : 1.0; }
+float BlendReflectf(float base, float blend) { return (blend == 1.0) ? blend : min(base * base / (1.0 - blend), 1.0); }
+
+float BlendNormal(float base, float blend) { return blend; }
+vec3 BlendNormal(vec3 base, vec3 blend) { return blend; }
+float BlendLighten(float base, float blend) { return max(blend, base); }
+vec3 BlendLighten(vec3 base, vec3 blend) { return max(blend, base); }
+float BlendDarken(float base, float blend) { return min(blend, base); }
+vec3 BlendDarken(vec3 base, vec3 blend) { return min(blend, base); }
+float BlendMultiply(float base, float blend) { return base * blend; }
+vec3 BlendMultiply(vec3 base, vec3 blend) { return base * blend; }
+float BlendAverage(float base, float blend) { return (base + blend) / 2.0; }
+vec3 BlendAverage(vec3 base, vec3 blend) { return (base + blend) / 2.0; }
+float BlendAdd(float base, float blend) { return min(base + blend, 1.0); }
+vec3 BlendAdd(vec3 base, vec3 blend) { return min(base + blend, vec3(1.0)); }
+float BlendSubstract(float base, float blend) { return max(base + blend - 1.0, 0.0); }
+vec3 BlendSubstract(vec3 base, vec3 blend) { return max(base + blend - vec3(1.0), vec3(0.0)); }
+float BlendDifference(float base, float blend) { return abs(base - blend); }
+vec3 BlendDifference(vec3 base, vec3 blend) { return abs(base - blend); }
+float BlendNegation(float base, float blend) { return 1.0 - abs(1.0 - base - blend); }
+vec3 BlendNegation(vec3 base, vec3 blend) { return vec3(1.0) - abs(vec3(1.0) - base - blend); }
+float BlendExclusion(float base, float blend) { return base + blend - 2.0 * base * blend; }
+vec3 BlendExclusion(vec3 base, vec3 blend) { return base + blend - 2.0 * base * blend; }
+vec3 BlendScreen(vec3 base, vec3 blend) { return vec3(BlendScreenf(base.r, blend.r), BlendScreenf(base.g, blend.g), BlendScreenf(base.b, blend.b)); }
+vec3 BlendOverlay(vec3 base, vec3 blend) { return vec3(BlendOverlayf(base.r, blend.r), BlendOverlayf(base.g, blend.g), BlendOverlayf(base.b, blend.b)); }
+// splitTone 等直接调用（2 参、无 opacity，0.5 为恒等）
+vec3 BlendSoftLight(vec3 base, vec3 blend) { return vec3(BlendSoftLightf(base.r, blend.r), BlendSoftLightf(base.g, blend.g), BlendSoftLightf(base.b, blend.b)); }
+vec3 BlendHardLight(vec3 base, vec3 blend) { return BlendOverlay(blend, base); }
+vec3 BlendColorDodge(vec3 base, vec3 blend) { return vec3(BlendColorDodgef(base.r, blend.r), BlendColorDodgef(base.g, blend.g), BlendColorDodgef(base.b, blend.b)); }
+vec3 BlendColorBurn(vec3 base, vec3 blend) { return vec3(BlendColorBurnf(base.r, blend.r), BlendColorBurnf(base.g, blend.g), BlendColorBurnf(base.b, blend.b)); }
+vec3 BlendLinearLight(vec3 base, vec3 blend) { return vec3(BlendLinearLightf(base.r, blend.r), BlendLinearLightf(base.g, blend.g), BlendLinearLightf(base.b, blend.b)); }
+vec3 BlendVividLight(vec3 base, vec3 blend) { return vec3(BlendVividLightf(base.r, blend.r), BlendVividLightf(base.g, blend.g), BlendVividLightf(base.b, blend.b)); }
+vec3 BlendPinLight(vec3 base, vec3 blend) { return vec3(BlendPinLightf(base.r, blend.r), BlendPinLightf(base.g, blend.g), BlendPinLightf(base.b, blend.b)); }
+vec3 BlendHardMix(vec3 base, vec3 blend) { return vec3(BlendHardMixf(base.r, blend.r), BlendHardMixf(base.g, blend.g), BlendHardMixf(base.b, blend.b)); }
+vec3 BlendReflect(vec3 base, vec3 blend) { return vec3(BlendReflectf(base.r, blend.r), BlendReflectf(base.g, blend.g), BlendReflectf(base.b, blend.b)); }
+vec3 BlendGlow(vec3 base, vec3 blend) { return BlendReflect(blend, base); }
+vec3 BlendPhoenix(vec3 base, vec3 blend) { return min(base, blend) - max(base, blend) + vec3(1.0); }
+// BlendLinearDodge 常被当作 BlendOpacity 的第 3 实参（裸函数名），必须按名存在
+float BlendLinearDodge(float base, float blend) { return min(base + blend, 1.0); }
 vec3 BlendLinearDodge(vec3 base, vec3 blend) { return min(base + blend, vec3(1.0)); }
-// BlendSoftLight 按名导出（splitTone 直接调用，2 参、无 opacity，0.5 为恒等）
-vec3 BlendSoftLight(vec3 a, vec3 b) { return weBlendSoftLight(a, b); }
-// BlendOpacity 只能是**函数式宏**，不能是函数 —— 第 3 个实参是裸函数名
+float BlendLinearBurn(float base, float blend) { return max(base + blend - 1.0, 0.0); }
+vec3 BlendLinearBurn(vec3 base, vec3 blend) { return max(base + blend - vec3(1.0), vec3(0.0)); }
+vec3 BlendTint(vec3 base, vec3 blend) { return vec3(max(base.x, max(base.y, base.z))) * blend; }
+vec3 BlendHue(vec3 base, vec3 blend) {
+    vec3 baseHSL = RGBToHSL(base);
+    return HSLToRGB(vec3(RGBToHSL(blend).r, baseHSL.g, baseHSL.b));
+}
+vec3 BlendSaturation(vec3 base, vec3 blend) {
+    vec3 baseHSL = RGBToHSL(base);
+    return HSLToRGB(vec3(baseHSL.r, RGBToHSL(blend).g, baseHSL.b));
+}
+vec3 BlendColor(vec3 base, vec3 blend) {
+    vec3 blendHSL = RGBToHSL(blend);
+    return HSLToRGB(vec3(blendHSL.r, blendHSL.g, RGBToHSL(base).b));
+}
+vec3 BlendLuminosity(vec3 base, vec3 blend) {
+    vec3 baseHSL = RGBToHSL(base);
+    return HSLToRGB(vec3(baseHSL.r, baseHSL.g, RGBToHSL(blend).b));
+}
+// BlendOpacity 只能是**函数式宏** —— 第 3 个实参是裸函数名
 // （\`BlendOpacity(albedo.rgb, smoothstep(...), BlendLinearDodge, blend)\`），
 // 而 GLSL ES 没有函数指针。hlsl2glsl 的 expandFunctionMacro 会在 JS 侧预展开。
 #define BlendOpacity(base, blend, F, O) mix((base), F((base), (blend)), (O))
-// ContrastSaturationBrightness 的实参顺序与函数名相反：
-// 实测唯一调用点为 (albedo.rgb, 1.0 + c_brightness, 1.0 + c_saturation, 1.0 + c_contrast)，
-// 三个 uniform 的 range 均为 [-1,1]，故三个参数都是 [0,2] 的倍率、1.0 为恒等。
-vec3 ContrastSaturationBrightness(vec3 color, float brt, float sat, float con) {
-    vec3 brtColor = color * brt;
-    vec3 satColor = mix(vec3(dot(brtColor, LUMINANCE_FACTOR)), brtColor, sat);
-    return mix(vec3(0.5), satColor, con);
-}
 `,
   // WE common_perspective.h（重建）。缺失时 waterwaves（全库 344 处引用 / 44 壁纸）、
   // waterripple、perspective、reflection 等整体被跳过 —— 是影响面最大的一个头。
@@ -166,17 +241,19 @@ mat3 squareToQuad(vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
                 g, h, 1.0);
 }
 `,
-  // WE common_blur.h（重建）。blurNa 的权重不是估算的 —— 壁纸 1444077782 里存着
-  // **加公共头之前的旧版** blur_precise_gaussian.frag，把 13/7/3 抽样的系数
-  // 逐项内联写死，这里逐字照抄（已核对原文）。
-  // 两个关键约定：
+  // WE common_blur.h（重建；逐条对齐官方 assets/shaders/common_blur.h）。
+  // 关键约定：
   //  1. **隐式采样 g_Texture0**，不传 sampler —— 调用形式恒为 blurNa(uv, step)，
   //     而包含本头的文件都声明了 uniform sampler2D g_Texture0；
   //  2. step 由**顶点着色器**算好：VERTICAL 时 (0, g_Scale.y / g_Texture0Resolution.w)，
   //     否则 (g_Scale.x / g_Texture0Resolution.z, 0) —— 即已经除过分辨率的单texel步长，
-  //     未使用的轴为 0。所以这里直接按 ±1..±6 倍 step 取样即可。
-  // 注意 precise 版的 3 抽样权重是 0.27901/0.44198/0.27901（真高斯，和为 1），
-  // 与 blur_gaussian.frag 的 0.25/0.5/0.25 **不同**，不要统一。
+  //     未使用的轴为 0；
+  //  3. blur13/blur7 是**线性采样**的高斯：偏移是非整数 texel（1.409、3.298…），
+  //     依赖 g_Texture0 的双线性过滤一次取两个 texel 的加权和（效果链 FBO 均为 LINEAR）。
+  //     壁纸 1444077782 里内联的 13/7 抽样离散版本是加公共头之前的旧写法，与此近似等价；
+  //     但旧版 3 抽样的 0.279/0.442/0.279 与官方当前的 0.25/0.5/0.25 **不同**，以官方为准；
+  //  4. blurRadialNa 是绕 center 的**旋转（角向）模糊**，不是沿半径的缩放模糊：
+  //     每个样本把 (uv - center) 旋转 amt * 0.025 * o 弧度。
   // g_Texture0Resolution 四个分量都是像素尺寸：.xy 是补齐后的纹理尺寸（POT），
   // .zw 是图像实际尺寸；都是被除数，不是倒数。
   // **本头必须自己声明 g_Texture0**：`#include "common_blur.h"` 在文件第 4 行，
@@ -187,84 +264,124 @@ mat3 squareToQuad(vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
   //（见 dedupeUniforms）。这里照常声明，由去重保证只留一份。
   'common_blur.h': `// WE common_blur.h（重建）
 uniform sampler2D g_Texture0;
-vec4 blur13a(vec2 uv, vec2 stp) {
-    return texture(g_Texture0, uv - stp * 6.0) * 0.006299
-         + texture(g_Texture0, uv - stp * 5.0) * 0.017298
-         + texture(g_Texture0, uv - stp * 4.0) * 0.039533
-         + texture(g_Texture0, uv - stp * 3.0) * 0.075189
-         + texture(g_Texture0, uv - stp * 2.0) * 0.119007
-         + texture(g_Texture0, uv - stp) * 0.156756
-         + texture(g_Texture0, uv) * 0.171834
-         + texture(g_Texture0, uv + stp) * 0.156756
-         + texture(g_Texture0, uv + stp * 2.0) * 0.119007
-         + texture(g_Texture0, uv + stp * 3.0) * 0.075189
-         + texture(g_Texture0, uv + stp * 4.0) * 0.039533
-         + texture(g_Texture0, uv + stp * 5.0) * 0.017298
-         + texture(g_Texture0, uv + stp * 6.0) * 0.006299;
+vec4 blur13a(vec2 u, vec2 d) {
+    vec2 o1 = vec2(1.4091998770852122) * d;
+    vec2 o2 = vec2(3.2979348079914822) * d;
+    vec2 o3 = vec2(5.2062900776825969) * d;
+    return texture(g_Texture0, u) * 0.1976406528809576
+         + texture(g_Texture0, u + o1) * 0.2959855056006557
+         + texture(g_Texture0, u - o1) * 0.2959855056006557
+         + texture(g_Texture0, u + o2) * 0.0935333619980593
+         + texture(g_Texture0, u - o2) * 0.0935333619980593
+         + texture(g_Texture0, u + o3) * 0.0116608059608062
+         + texture(g_Texture0, u - o3) * 0.0116608059608062;
 }
-vec4 blur7a(vec2 uv, vec2 stp) {
-    return texture(g_Texture0, uv - stp * 3.0) * 0.071303
-         + texture(g_Texture0, uv - stp * 2.0) * 0.131514
-         + texture(g_Texture0, uv - stp) * 0.189879
-         + texture(g_Texture0, uv) * 0.214607
-         + texture(g_Texture0, uv + stp) * 0.189879
-         + texture(g_Texture0, uv + stp * 2.0) * 0.131514
-         + texture(g_Texture0, uv + stp * 3.0) * 0.071303;
+vec4 blur7a(vec2 u, vec2 d) {
+    vec2 o1 = vec2(2.3515644035337887) * d;
+    vec2 o2 = vec2(0.469433779698372) * d;
+    vec2 o3 = vec2(1.4091998770852121) * d;
+    vec2 o4 = vec2(3.0) * d;
+    return texture(g_Texture0, u + o1) * 0.2028175528299753
+         + texture(g_Texture0, u + o2) * 0.4044856614512112
+         + texture(g_Texture0, u - o3) * 0.3213933537319605
+         + texture(g_Texture0, u - o4) * 0.0713034319868530;
 }
-vec4 blur3a(vec2 uv, vec2 stp) {
-    return texture(g_Texture0, uv - stp) * 0.27901
-         + texture(g_Texture0, uv) * 0.44198
-         + texture(g_Texture0, uv + stp) * 0.27901;
+vec4 blur3a(vec2 u, vec2 d) {
+    return texture(g_Texture0, u + d) * 0.25
+         + texture(g_Texture0, u) * 0.5
+         + texture(g_Texture0, u - d) * 0.25;
 }
-// 径向模糊：blurRadialNa(uv, center, scale)。它的 .vert 不传分辨率也不传步长，
-// 故步长只能由 (uv - center) 自行导出 —— 按「沿指向中心的方向按比例取样」实现，
-// 系数取 1/64 使 scale=1 时的最大位移约为半径的 1/10（与 u_Scale 的 [0.01,2] 量程匹配）。
-vec4 blurRadial13a(vec2 uv, vec2 center, float scale) {
-    return blur13a(uv, (uv - center) * scale * 0.015625);
+vec3 blur13(vec2 u, vec2 d) { return blur13a(u, d).rgb; }
+vec3 blur7(vec2 u, vec2 d) { return blur7a(u, d).rgb; }
+vec3 blur3(vec2 u, vec2 d) { return blur3a(u, d).rgb; }
+vec2 blurRotateVec2(vec2 v, float r) {
+    vec2 cs = vec2(cos(r), sin(r));
+    return vec2(v.x * cs.x - v.y * cs.y, v.x * cs.y + v.y * cs.x);
 }
-vec4 blurRadial7a(vec2 uv, vec2 center, float scale) {
-    return blur7a(uv, (uv - center) * scale * 0.015625);
+vec4 blurRadial13a(vec2 u, vec2 center, float amt) {
+    vec2 delta = u - center;
+    amt = amt * 0.025;
+    vec2 r1 = blurRotateVec2(delta, 1.4091998770852122 * amt) - delta;
+    vec2 r2 = blurRotateVec2(delta, 3.2979348079914822 * amt) - delta;
+    vec2 r3 = blurRotateVec2(delta, 5.2062900776825969 * amt) - delta;
+    return texture(g_Texture0, u) * 0.1976406528809576
+         + texture(g_Texture0, center + r1 + delta) * 0.2959855056006557
+         + texture(g_Texture0, center - r1 + delta) * 0.2959855056006557
+         + texture(g_Texture0, center + r2 + delta) * 0.0935333619980593
+         + texture(g_Texture0, center - r2 + delta) * 0.0935333619980593
+         + texture(g_Texture0, center + r3 + delta) * 0.0116608059608062
+         + texture(g_Texture0, center - r3 + delta) * 0.0116608059608062;
 }
-vec4 blurRadial3a(vec2 uv, vec2 center, float scale) {
-    return blur3a(uv, (uv - center) * scale * 0.015625);
+vec4 blurRadial7a(vec2 u, vec2 center, float amt) {
+    vec2 delta = u - center;
+    amt = amt * 0.025;
+    vec2 r1 = blurRotateVec2(delta, 2.3515644035337887 * amt) - delta;
+    vec2 r2 = blurRotateVec2(delta, 0.469433779698372 * amt) - delta;
+    vec2 r3 = blurRotateVec2(delta, -1.4091998770852121 * amt) - delta;
+    vec2 r4 = blurRotateVec2(delta, -3.0 * amt) - delta;
+    return texture(g_Texture0, center + r1 + delta) * 0.2028175528299753
+         + texture(g_Texture0, center + r2 + delta) * 0.4044856614512112
+         + texture(g_Texture0, center + r3 + delta) * 0.3213933537319605
+         + texture(g_Texture0, center + r4 + delta) * 0.0713034319868530;
+}
+vec4 blurRadial3a(vec2 u, vec2 center, float amt) {
+    vec2 delta = u - center;
+    amt = amt * 0.025;
+    vec2 r1 = blurRotateVec2(delta, amt) - delta;
+    return texture(g_Texture0, center + delta) * 0.5
+         + texture(g_Texture0, center + r1 + delta) * 0.25
+         + texture(g_Texture0, center - r1 + delta) * 0.25;
 }
 `,
-  // WE common_composite.h（重建）。仅被 blur_combine.frag 使用（全库 4 个调用点）。
+  // WE common_composite.h（重建；逐条对齐官方 assets/shaders/common_composite.h）。
+  // 被 blur_combine.frag 使用：
   //   vec4 blurred = texSample2D(g_Texture0, ApplyCompositeOffset(uv, g_Texture0Resolution.xy));
   //   blurred = ApplyComposite(albedoOld, vec4(blurred.rgb / div, blurred.a));
-  // 第 1 参是**原始画面**（g_Texture2 显式标注 "material":"previous"），第 2 参是新的模糊结果。
-  // COMPOSITE 取值 0 normal / 1 blend / 2 under / 3 cutout；本机库只出现 0 与 1
-  // （3 处 scene.json 覆盖成 1），2/3 无实例，按语义实现备用。
-  // COMPOSITEMONO 全库从未被覆盖，恒为 0。
-  // ApplyCompositeOffset 在 normal 下必须是恒等 —— 否则所有未改 COMPOSITE 的
-  // blur 效果都会整体偏移。
-  // 两条**必须自洽**的约束（踩过）：
-  //  1. **不能调用 ApplyBlending** —— blur_combine.frag 只 include 本头，
-  //     不 include common_blending.h。真实 WE 的 common_composite.h 必须自给自足，
-  //     否则这 2 个文件（3 个壁纸）会因 ApplyBlending 未定义而整体编译失败。
-  //     故这里内联所需的少量混合，不外借 common_blending.h 的符号；
-  //  2. **不能用 #elif** —— 本仓库的预处理器明确不支持（见 hlsl2glsl.js 的
-  //     「不支持 #elif」注释），遇到会当作条件终止，导致后续分支全部漏掉。
-  //     一律写成独立的 #if / #endif。
+  // 第 1 参是**原始画面**（g_Texture2 "material":"previous"），第 2 参是新的模糊结果。
+  // COMPOSITE 取值 0 normal / 1 blend / 2 under / 3 cutout。
+  // 官方本头自己 include common.h 与 common_blending.h（ApplyBlending / greyscale），
+  // 重复包含由预处理器的 include-once 兜住。
+  // 三个 g_Composite* uniform 的默认值写在声明注释里，由 renderer 的
+  // parseMaterialMeta 连同 include 一并解析；g_CompositeColor 缺省若落成 0，
+  // 所有 blur 都会被乘成黑色。
   'common_composite.h': `// WE common_composite.h（重建）
-vec2 ApplyCompositeOffset(vec2 uv, vec2 res) {
-    return uv;
+#include "common.h"
+#include "common_blending.h"
+
+#ifndef BLENDMODE
+#define BLENDMODE 0
+#endif
+
+uniform float g_CompositeAlpha; // {"material":"compositealpha","label":"ui_editor_properties_alpha","default":1,"range":[0.0, 2.0]}
+uniform vec2 g_CompositeOffset; // {"material":"compositeoffset","label":"ui_editor_properties_offset","default":"0 0","linked":true,"range":[-10.0, 10.0]}
+uniform vec3 g_CompositeColor; // {"material":"compositecolor","label":"ui_editor_properties_color","default":"1 1 1","type":"color"}
+
+vec2 ApplyCompositeOffset(vec2 texCoords, vec2 textureResolution) {
+#if COMPOSITE != 0
+    return texCoords + g_CompositeOffset / textureResolution;
+#else
+    return texCoords;
+#endif
 }
-vec4 ApplyComposite(vec4 backdrop, vec4 source) {
-    vec4 result = source;
+
+vec4 ApplyComposite(vec4 original, vec4 effect) {
+#if COMPOSITEMONO == 1
+    effect.rgb = vec3(greyscale(effect.rgb));
+#endif
+    effect.rgb *= g_CompositeColor;
 #if COMPOSITE == 1
-    result = vec4(mix(backdrop.rgb, source.rgb, source.a), max(backdrop.a, source.a));
+    effect.rgb = ApplyBlending(BLENDMODE, original.rgb, effect.rgb, effect.a * g_CompositeAlpha);
+    effect.a = max(effect.a * clamp(g_CompositeAlpha, 0.0, 1.0), original.a);
 #endif
 #if COMPOSITE == 2
-    result = vec4(mix(source.rgb, backdrop.rgb, backdrop.a), max(backdrop.a, source.a));
+    effect.a *= clamp(g_CompositeAlpha, 0.0, 1.0);
+    effect = mix(effect, original, original.a);
 #endif
 #if COMPOSITE == 3
-    result = vec4(backdrop.rgb, backdrop.a * (1.0 - source.a));
+    effect.a *= clamp(g_CompositeAlpha, 0.0, 1.0);
+    effect.a *= 1.0 - original.a;
 #endif
-#if COMPOSITEMONO == 1
-    result.rgb = vec3(dot(vec3(0.11, 0.59, 0.3), result.rgb));
-#endif
-    return result;
+    return effect;
 }
 `,
   // WE common_fragment.h（重建）。当前只需 DecompressNormal 与两个格式宏。
@@ -288,6 +405,14 @@ vec4 ApplyComposite(vec4 backdrop, vec4 source) {
 
 vec3 FresnelSchlick(float lightTheta, vec3 baseReflectance) {
   return baseReflectance + (vec3(1.0) - baseReflectance) * pow(max(1.0 - lightTheta, 0.001), 5.0);
+}
+
+vec3 PointSegmentDelta(vec3 pos, vec3 segmentA, vec3 segmentB) {
+  vec3 delta = segmentB - segmentA;
+  float v = dot(delta, delta);
+  if (v == 0.0)
+    return segmentA - pos;
+  return segmentA + clamp(dot(pos - segmentA, segmentB - segmentA) / v, 0.0, 1.0) * (segmentB - segmentA) - pos;
 }
 
 float Distribution_GGX(vec3 N, vec3 H, float roughness) {
@@ -354,10 +479,22 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewVector
 }
 
 vec3 CombineLighting(vec3 light, vec3 ambient) {
+#if HDR
+  float lightLen = length(light);
+  float overbright = (clamp(lightLen - 2.0, 0.0, 1.0) * 0.5) / max(0.01, lightLen);
+  return clamp(ambient + light, 0.0, 1.0) + (light * overbright);
+#else
   return ambient + light;
+#endif
 }
 vec3 CombineLighting(vec3 light, vec3 baseAmbient, vec3 ambient) {
+#if HDR
+  float lightLen = length(light);
+  float overbright = (clamp(lightLen - 2.0, 0.0, 1.0) * 0.5) / max(0.01, lightLen);
+  return max(baseAmbient, clamp(ambient + light, 0.0, 1.0)) + (light * overbright);
+#else
   return max(baseAmbient, ambient + light);
+#endif
 }
 `,
   'common_fragment.h': `// WE common_fragment.h（重建；逐条对齐官方 assets/shaders/common_fragment.h）
@@ -592,6 +729,12 @@ void ComputeSpriteFrame(float lifetime, out vec4 uvs, out vec2 uvFrameSize, out 
     uvFrameSize = vec2(frameWidth, frameHeight);
 }
 
+// HLSL 下官方会翻转 y；本仓目标是 GLSL，直接透传。
+void ComputeScreenRefractionCoord(in vec3 projectedPositionXYW, out vec3 v_ScreenCoord)
+{
+    v_ScreenCoord = projectedPositionXYW;
+}
+
 void ComputeScreenRefractionTangents(in vec3 projectedPositionXYW, in vec3 right, in vec3 up, out vec3 v_ScreenCoord, out vec4 v_ScreenTangents)
 {
     v_ScreenCoord = projectedPositionXYW;
@@ -602,6 +745,393 @@ void ComputeScreenRefractionTangents(in vec3 projectedPositionXYW, in vec3 right
 #if REFRACT
     v_ScreenTangents *= g_RefractAmount;
 #endif
+}
+`,
+  // WE common_fog.h（逐条对齐官方）。FOG_DIST / FOG_HEIGHT 未开时全部退化为恒等，
+  // 所以本仓不解析场景雾参数时，引用它的 generic4 / genericimage4 / foliage4 等
+  // 只需能编译，画面与无雾一致。
+  'common_fog.h': `// WE common_fog.h（重建）
+#if FOG_DIST
+uniform vec3 g_FogDistanceColor;
+uniform vec4 g_FogDistanceParams;
+#endif
+
+#if FOG_HEIGHT
+uniform vec3 g_FogHeightColor;
+uniform vec4 g_FogHeightParams;
+#endif
+
+vec2 CalculateFogPixelState(float viewDirLength, float worldPosHeight) {
+    vec2 result = vec2(0.0);
+#if FOG_DIST
+    result.x = (viewDirLength - g_FogDistanceParams.x) / g_FogDistanceParams.y;
+#endif
+#if FOG_HEIGHT
+    result.y = (worldPosHeight - g_FogHeightParams.x) / g_FogHeightParams.y;
+#endif
+    return result;
+}
+
+vec3 ApplyFog(in vec3 color, in vec2 fogPixelState) {
+#if FOG_HEIGHT
+    float fogHeight = clamp(fogPixelState.y, 0.0, 1.0);
+    color.rgb = mix(color.rgb, g_FogHeightColor,
+        g_FogHeightParams.z + g_FogHeightParams.w * fogHeight * fogHeight);
+#endif
+#if FOG_DIST
+    float fogDistance = clamp(fogPixelState.x, 0.0, 1.0);
+    color.rgb = mix(color.rgb, g_FogDistanceColor,
+        g_FogDistanceParams.z + g_FogDistanceParams.w * fogDistance * fogDistance);
+#endif
+    return color;
+}
+
+float ApplyFogAlpha(in float alpha, in vec2 fogPixelState) {
+#if FOG_DIST
+    float fogDistance = clamp(fogPixelState.x, 0.0, 1.0);
+    fogDistance = g_FogDistanceParams.z + g_FogDistanceParams.w * fogDistance * fogDistance;
+#else
+    float fogDistance = 0.0;
+#endif
+#if FOG_HEIGHT
+    float fogHeight = clamp(fogPixelState.y, 0.0, 1.0);
+    fogHeight = g_FogHeightParams.z + g_FogHeightParams.w * fogHeight * fogHeight;
+#else
+    float fogHeight = 0.0;
+#endif
+    float fogFactor = clamp(max(fogDistance, fogHeight), 0.0, 1.0);
+    return alpha * (1.0 - (fogFactor * fogFactor));
+}
+`,
+  // WE common_pbr.h（逐条对齐官方；V0 灯光模型，genericimage2/3、generic3、
+  // fluidsimulation 预览版 combine 使用）。与 common_pbr_2.h 同名函数并存，
+  // 官方也不允许两者同时 include。辐照度是 lightColor / d²（radius² 由 CPU 预乘）。
+  'common_pbr.h': `// WE common_pbr.h（重建）
+#include "common.h"
+
+vec3 FresnelSchlick(float lightTheta, vec3 baseReflectance) {
+    return baseReflectance + (vec3(1.0) - baseReflectance) * pow(max(1.0 - lightTheta, 0.001), 5.0);
+}
+
+vec3 PointSegmentDelta(vec3 pos, vec3 segmentA, vec3 segmentB) {
+    vec3 delta = segmentB - segmentA;
+    float v = dot(delta, delta);
+    if (v == 0.0)
+        return segmentA - pos;
+    return segmentA + clamp(dot(pos - segmentA, segmentB - segmentA) / v, 0.0, 1.0) * (segmentB - segmentA) - pos;
+}
+
+float Distribution_GGX(vec3 N, vec3 H, float roughness) {
+    float rSqr = roughness * roughness;
+    float rSqr2 = rSqr * rSqr;
+    float NH = max(dot(N, H), 0.0);
+    float denominator = (NH * NH * (rSqr2 - 1.0) + 1.0);
+    return rSqr2 / (M_PI * denominator * denominator);
+}
+
+float Schlick_GGX(float NV, float roughness) {
+    float roughnessBase = roughness + 1.0;
+    float roughnessScaled = (roughnessBase * roughnessBase) / 8.0;
+    return NV / (NV * (1.0 - roughnessScaled) + roughnessScaled);
+}
+
+float GeoSmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    return Schlick_GGX(max(dot(N, V), 0.001), roughness) * Schlick_GGX(max(dot(N, L), 0.001), roughness);
+}
+
+vec3 ComputePBRLight(vec3 N, vec3 L, vec3 V,
+    vec3 albedo, vec3 lightColor, vec3 baseReflectance, float roughness, float metallic) {
+    float lightDistance = length(L);
+    L = L / lightDistance;
+    vec3 H = normalize(V + L);
+
+    float NDF = Distribution_GGX(N, H, roughness);
+    float G = GeoSmith(N, V, L, roughness);
+    vec3 F = FresnelSchlick(max(dot(H, V), 0.0), baseReflectance);
+    vec3 numerator = NDF * G * F;
+
+    float dNL = dot(N, L);
+
+#ifdef GRADIENT_SAMPLER
+    vec3 NL = vec3(max(dNL * 0.5 + 0.5, 0.0));
+#if TEX4FORMAT == FORMAT_R8 || TEX4FORMAT == FORMAT_RG88
+    NL = texture(GRADIENT_SAMPLER, vec2(NL.x, 0.0)).rrr;
+#else
+    NL = texture(GRADIENT_SAMPLER, vec2(NL.x, 0.0)).rgb;
+#endif
+#if RIMLIGHTING
+    float rimTerm = 1.0 - max(dot(N, V), 0.0);
+    rimTerm = pow(rimTerm, RIM_LIGHTING_EXPONENT) * RIM_LIGHTING_AMOUNT * NL.x * step(0.01, lightColor.x + lightColor.y + lightColor.z);
+    NL = max(NL, vec3(rimTerm));
+    metallic -= clamp(rimTerm, 0.0, 1.0);
+#endif
+    vec3 denominator = 4.0 * max(dot(N, V), 0.0) * NL;
+    vec3 specular = numerator / max(denominator, vec3(0.001));
+#else
+    float NL = max(dNL, 0.0);
+#if RIMLIGHTING
+    float rimTerm = 1.0 - max(dot(N, V), 0.0);
+    rimTerm = pow(rimTerm, RIM_LIGHTING_EXPONENT) * RIM_LIGHTING_AMOUNT * NL * step(0.01, lightColor.x + lightColor.y + lightColor.z);
+    NL = max(NL, rimTerm);
+    metallic -= clamp(rimTerm, 0.0, 1.0);
+#endif
+    float denominator = 4.0 * max(dot(N, V), 0.0) * NL;
+    vec3 specular = numerator / max(denominator, 0.001);
+#endif
+
+    vec3 diffuse = (1.0 - metallic) * (vec3(1.0) - F);
+    vec3 radiance = lightColor.xyz / (lightDistance * lightDistance);
+    return (diffuse * albedo / M_PI + specular) * radiance * NL;
+}
+
+vec3 CombineLighting(vec3 light, vec3 ambient) {
+#if HDR
+    float lightLen = length(light);
+    float overbright = (clamp(lightLen - 2.0, 0.0, 1.0) * 0.5) / max(0.01, lightLen);
+    return clamp(ambient + light, 0.0, 1.0) + (light * overbright);
+#else
+    return ambient + light;
+#endif
+}
+`,
+  // WE base/model_vertex_v1.h（逐条对齐官方；chroma4 / fur4 / foliage4 及其 shadowcaster
+  // 的 vert 使用）。foliage4 被 isEngineMeshShader 排除、走原生网格程序；chroma4 / fur4
+  // 经 canUseMaterialMeshPath 走材质 shader 路径，才真正吃到本头。
+  // SKINNING / MORPHING 目前没有任何来源会置 1（渲染器不喂 g_Bones / morph 贴图），
+  // 两个分支只保证能编译。骨骼乘法不经 mul 改写、直接写成 GLSL 形式：
+  // 约定 g_Bones[i] 的 4 列 = HLSL float4x3 的 4 行，于是 HLSL 的
+  // mul(vec4(p,1), bone) = bone * vec4(p,1)，mul(n, (float3x3)bone) = mat3(bone) * n。
+  // 接入骨骼上传时必须按这个布局喂数据。
+  'base/model_vertex_v1.h': `// WE base/model_vertex_v1.h（重建）
+#include "common_vertex.h"
+
+uniform mat4 g_ModelMatrix;
+uniform mat3 g_NormalModelMatrix;
+uniform vec3 g_LightAmbientColor;
+uniform vec3 g_LightSkylightColor;
+
+#if SKINNING
+uniform mat4x3 g_Bones[BONECOUNT];
+
+attribute uvec4 a_BlendIndices;
+attribute vec4 a_BlendWeights;
+#endif
+
+#if (LIGHTING || REFLECTION) && NORMALMAP
+attribute vec4 a_Tangent4;
+#endif
+
+#if MORPHING
+uniform int g_MorphOffsets[12];
+uniform float g_MorphWeights[12];
+
+void ApplyMorphPositionNormal(in int vertexID, sampler2D morphTexture, in vec4 morphTextureTexel, in int morphOffsets[12], in float morphWeights[12], inout vec3 localPos, inout vec3 localNormal) {
+    vec3 morphPos = vec3(0.0);
+    vec3 morphNormal = vec3(0.0);
+    for (int morphTarget = 0; morphTarget < morphOffsets[0] % 12; ++morphTarget) {
+        float morphMapOffset = float(vertexID + morphOffsets[1 + morphTarget]);
+        vec2 offset = 0.5 * morphTextureTexel.xy;
+#if MORPHING_NORMALS
+        float morphMapIndex = floor(morphMapOffset * 6.0 / 4.0);
+        float morphMapFlip = mod(morphMapOffset * 6.0, 4.0);
+        float morphPixel1x = mod(morphMapIndex, floor(morphTextureTexel.z));
+        float morphPixel1y = floor(morphMapIndex / floor(morphTextureTexel.w));
+        float morphPixel2x = mod(morphMapIndex + 1.0, floor(morphTextureTexel.z));
+        float morphPixel2y = floor((morphMapIndex + 1.0) / floor(morphTextureTexel.w));
+        vec4 morphCol1 = textureLod(morphTexture, vec2(morphPixel1x, morphPixel1y) * morphTextureTexel.xy + offset, 0.0);
+        vec4 morphCol2 = textureLod(morphTexture, vec2(morphPixel2x, morphPixel2y) * morphTextureTexel.xy + offset, 0.0);
+        vec3 posDelta = mix(morphCol1.xyz, vec3(morphCol1.zw, morphCol2.x), step(1.0, morphMapFlip));
+        morphPos += posDelta.rgb * morphWeights[1 + morphTarget];
+        vec3 normalDelta = mix(vec3(morphCol1.w, morphCol2.xy), morphCol2.yzw, step(1.0, morphMapFlip));
+        morphNormal += normalDelta * morphWeights[1 + morphTarget];
+#else
+        float morphMapIndex = floor(morphMapOffset * 3.0 / 4.0);
+        float morphMapFlip = mod(morphMapOffset * 3.0, 4.0);
+        float morphPixel1x = mod(morphMapIndex, floor(morphTextureTexel.z));
+        float morphPixel1y = floor(morphMapIndex / floor(morphTextureTexel.w));
+        float morphPixel2x = mod(morphMapIndex + 1.0, floor(morphTextureTexel.z));
+        float morphPixel2y = floor((morphMapIndex + 1.0) / floor(morphTextureTexel.w));
+        vec4 morphCol1 = textureLod(morphTexture, vec2(morphPixel1x, morphPixel1y) * morphTextureTexel.xy + offset, 0.0);
+        vec4 morphCol2 = textureLod(morphTexture, vec2(morphPixel2x, morphPixel2y) * morphTextureTexel.xy + offset, 0.0);
+        vec3 posDeltaV1 = morphCol1.xyz;
+        vec3 posDeltaV2 = vec3(morphCol1.w, morphCol2.xy);
+        vec3 posDeltaV3 = vec3(morphCol1.zw, morphCol2.x);
+        vec3 posDeltaV4 = morphCol1.yzw;
+        vec3 posDelta = mix(posDeltaV1, mix(posDeltaV4, mix(posDeltaV3, posDeltaV2,
+            step(2.5, morphMapFlip)), step(1.5, morphMapFlip)), step(0.5, morphMapFlip));
+        morphPos += posDelta.rgb * morphWeights[1 + morphTarget];
+#endif
+    }
+    localPos += morphPos * morphWeights[0];
+#if MORPHING_NORMALS
+    localNormal = normalize(localNormal + morphNormal * 3.465);
+#endif
+}
+
+void ApplyMorphPosition(in int vertexID, sampler2D morphTexture, in vec4 morphTextureTexel, in int morphOffsets[12], in float morphWeights[12], inout vec3 localPos) {
+    vec3 morphPos = vec3(0.0);
+    for (int morphTarget = 0; morphTarget < morphOffsets[0] % 12; ++morphTarget) {
+        float morphMapOffset = float(vertexID + morphOffsets[1 + morphTarget]);
+        vec2 offset = 0.5 * morphTextureTexel.xy;
+#if MORPHING_NORMALS
+        float morphMapIndex = floor(morphMapOffset * 6.0 / 4.0);
+        float morphMapFlip = mod(morphMapOffset * 6.0, 4.0);
+        float morphPixel1x = mod(morphMapIndex, floor(morphTextureTexel.z));
+        float morphPixel1y = floor(morphMapIndex / floor(morphTextureTexel.w));
+        float morphPixel2x = mod(morphMapIndex + 1.0, floor(morphTextureTexel.z));
+        float morphPixel2y = floor((morphMapIndex + 1.0) / floor(morphTextureTexel.w));
+        vec4 morphCol1 = textureLod(morphTexture, vec2(morphPixel1x, morphPixel1y) * morphTextureTexel.xy + offset, 0.0);
+        vec4 morphCol2 = textureLod(morphTexture, vec2(morphPixel2x, morphPixel2y) * morphTextureTexel.xy + offset, 0.0);
+        vec3 posDelta = mix(morphCol1.xyz, vec3(morphCol1.zw, morphCol2.x), step(1.0, morphMapFlip));
+        morphPos += posDelta.rgb * morphWeights[1 + morphTarget];
+#else
+        float morphMapIndex = floor(morphMapOffset * 3.0 / 4.0);
+        float morphMapFlip = mod(morphMapOffset * 3.0, 4.0);
+        float morphPixel1x = mod(morphMapIndex, floor(morphTextureTexel.z));
+        float morphPixel1y = floor(morphMapIndex / floor(morphTextureTexel.w));
+        float morphPixel2x = mod(morphMapIndex + 1.0, floor(morphTextureTexel.z));
+        float morphPixel2y = floor((morphMapIndex + 1.0) / floor(morphTextureTexel.w));
+        vec4 morphCol1 = textureLod(morphTexture, vec2(morphPixel1x, morphPixel1y) * morphTextureTexel.xy + offset, 0.0);
+        vec4 morphCol2 = textureLod(morphTexture, vec2(morphPixel2x, morphPixel2y) * morphTextureTexel.xy + offset, 0.0);
+        vec3 posDeltaV1 = morphCol1.xyz;
+        vec3 posDeltaV2 = vec3(morphCol1.w, morphCol2.xy);
+        vec3 posDeltaV3 = vec3(morphCol1.zw, morphCol2.x);
+        vec3 posDeltaV4 = morphCol1.yzw;
+        vec3 posDelta = mix(posDeltaV1, mix(posDeltaV4, mix(posDeltaV3, posDeltaV2,
+            step(2.5, morphMapFlip)), step(1.5, morphMapFlip)), step(0.5, morphMapFlip));
+        morphPos += posDelta.rgb * morphWeights[1 + morphTarget];
+#endif
+    }
+    localPos += morphPos * morphWeights[0];
+}
+#endif
+
+#if SKINNING
+mat4x3 weSkinBone(uvec4 blendIndices, vec4 blendWeights) {
+    return g_Bones[blendIndices.x] * blendWeights.x +
+        g_Bones[blendIndices.y] * blendWeights.y +
+        g_Bones[blendIndices.z] * blendWeights.z +
+        g_Bones[blendIndices.w] * blendWeights.w;
+}
+#endif
+
+void ApplySkinningPositionNormal(in vec3 position, in vec3 normal, in uvec4 blendIndices, in vec4 blendWeights, out vec4 worldPosition, out vec3 worldNormal) {
+#if SKINNING
+    mat4x3 bone = weSkinBone(blendIndices, blendWeights);
+    position.xyz = bone * vec4(position, 1.0);
+    normal = mat3(bone) * normal;
+#endif
+    worldPosition = mul(vec4(position, 1.0), g_ModelMatrix);
+    worldNormal = mul(normal, g_NormalModelMatrix);
+}
+
+void ApplyPositionNormal(in vec3 position, in vec3 normal, out vec4 worldPosition, out vec3 worldNormal) {
+    worldPosition = mul(vec4(position, 1.0), g_ModelMatrix);
+    worldNormal = mul(normal, g_NormalModelMatrix);
+}
+
+void ApplySkinningPosition(in vec3 position, in uvec4 blendIndices, in vec4 blendWeights, out vec4 worldPosition) {
+#if SKINNING
+    position.xyz = weSkinBone(blendIndices, blendWeights) * vec4(position, 1.0);
+#endif
+    worldPosition = mul(vec4(position, 1.0), g_ModelMatrix);
+}
+
+void ApplyPosition(in vec3 position, out vec4 worldPosition) {
+    worldPosition = mul(vec4(position, 1.0), g_ModelMatrix);
+}
+
+void ApplySkinningTangentSpace(in vec3 localNormal, in vec4 modelTangent, in uvec4 blendIndices, in vec4 blendWeights, out vec3 worldTangent, out vec3 worldBitangent) {
+#if SKINNING
+    vec3 tangent = mat3(weSkinBone(blendIndices, blendWeights)) * modelTangent.xyz;
+#else
+    vec3 tangent = modelTangent.xyz;
+#endif
+    BuildTangentSpace(g_NormalModelMatrix, localNormal, vec4(tangent, modelTangent.w), worldTangent, worldBitangent);
+}
+
+void ApplyTangentSpace(in vec3 localNormal, in vec4 modelTangent, out vec3 worldTangent, out vec3 worldBitangent) {
+    BuildTangentSpace(g_NormalModelMatrix, localNormal, modelTangent, worldTangent, worldBitangent);
+}
+
+vec3 ApplyAmbientLighting(in vec3 normal) {
+    return mix(g_LightSkylightColor, g_LightAmbientColor, dot(normal, vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5);
+}
+
+// HLSL 下官方翻转 y；本仓目标是 GLSL，直接取 xyw。
+void ClipSpaceToScreenSpace(in vec4 clipSpacePosition, out vec3 screenSpacePosition) {
+    screenSpacePosition = clipSpacePosition.xyw;
+}
+`,
+  // WE base/model_fragment_v1.h（逐条对齐官方）。取 GLSL、非 Android 分支：
+  // 反射位移按 X 归一（g_Screen.z 是宽高比），ALPHATOCOVERAGE 走 discard。
+  'base/model_fragment_v1.h': `// WE base/model_fragment_v1.h（重建）
+#include "common_fragment.h"
+
+uniform mat4 g_ViewProjectionMatrix;
+uniform vec3 g_Screen;
+
+#if REFLECTION
+vec3 ApplyReflection(sampler2D reflectionTexture, float reflectionTextureMipMapInfo, float reflectivity, float roughness, float metallic, vec3 screenPos, vec3 normal, vec3 normalizedViewVector) {
+    vec2 screenUV = (screenPos.xy / screenPos.z) * 0.5 + 0.5;
+    float fresnelTerm = abs(dot(normal, normalizedViewVector));
+    normal = normalize(mul(normal, CAST3X3(g_ViewProjectionMatrix)));
+    normal.xy = normal.xy * vec2(0.15, 0.15 * g_Screen.z);
+    screenUV += normal.xy * pow(fresnelTerm, 4.0) * 10.0;
+    float clipReflection = smoothstep(1.3, 1.0, screenUV.x) * smoothstep(-0.3, 0.0, screenUV.x) *
+        smoothstep(1.3, 1.0, screenUV.y) * smoothstep(-0.3, 0.0, screenUV.y);
+    vec3 reflectionColor = textureLod(reflectionTexture, screenUV, roughness * reflectionTextureMipMapInfo).rgb * clipReflection;
+    reflectionColor = reflectionColor * (1.0 - fresnelTerm) * reflectivity;
+    reflectionColor = pow(max(vec3(0.001), reflectionColor), vec3(2.0 - metallic));
+    return clamp(reflectionColor, 0.0, 1.0);
+}
+#endif
+
+void ApplyAlphaToCoverage(inout float alpha) {
+#if ALPHATOCOVERAGE
+    alpha = clamp((alpha - 0.5) / max(fwidth(alpha), 0.0001) + 0.5, 0.0, 1.0);
+    if (alpha < 0.5) discard;
+#endif
+}
+`,
+  // WE common_foliage.h（逐条对齐官方；foliage4.vert / shadowcasterfoliage4.vert 使用）。
+  'common_foliage.h': `// WE common_foliage.h（重建）
+float CalcLeavesUVWeight(vec2 uvs, vec2 uvBounds) {
+#if LEAVESUVMODE == 1
+    return clamp((1.0 - uvs.y - uvBounds.x) * uvBounds.y, 0.0, 1.0);
+#elif LEAVESUVMODE == 2
+    return clamp((uvs.y - uvBounds.x) * uvBounds.y, 0.0, 1.0);
+#elif LEAVESUVMODE == 3
+    return clamp((uvs.x - uvBounds.x) * uvBounds.y, 0.0, 1.0);
+#elif LEAVESUVMODE == 4
+    return clamp((1.0 - uvs.x - uvBounds.x) * uvBounds.y, 0.0, 1.0);
+#endif
+    return 1.0;
+}
+
+vec3 CalcFoliageAnimation(vec3 worldPos, vec3 localPos, vec2 uvs, float direction, float time, float speedLeaves, float speedBase, float strengthLeaves, float strengthBase, float phase, float scale, float cutoff, float treeHeight, float treeRadius, vec2 uvBounds) {
+    vec3 foliageOffsetForward = vec3(cos(direction), 0.0, sin(direction));
+    vec3 foliageOffsetUp = vec3(0.0, 1.0, 0.0);
+
+    vec4 fastSines = sin(phase + speedLeaves * time * vec4(1.71717171, -1.56161616, -1.9333, 1.041666666) + worldPos.xzzy * scale * 3.333);
+    vec4 slowSines = sin(phase + speedBase * time * vec4(0.53333, -0.019841, -0.13888889, 0.0024801587) + worldPos.xyyx * scale);
+    fastSines = smoothstep(vec4(cutoff) + fastSines * 0.1, vec4(1.0 - cutoff) - fastSines.zwyx * 0.1, fastSines * vec4(0.5) + vec4(0.5)) * vec4(2.0) - vec4(1.0);
+    float cutoffBase = cutoff * 0.6666;
+    slowSines = smoothstep(vec4(cutoffBase) + slowSines * 0.1, vec4(1.0 - cutoffBase) - slowSines.zwyx * 0.1, slowSines * vec4(0.5) + vec4(0.5)) * vec4(2.0) - vec4(1.0);
+
+    float leafMask = strengthLeaves * smoothstep(-1.2, -0.3, sin(dot(worldPos.xyz, foliageOffsetForward) + speedBase * time));
+    float leafDistance = dot(localPos.xz, localPos.xz);
+    float baseMask = smoothstep(0.0, treeHeight, localPos.y);
+
+    vec2 blendParamsA = vec2(treeRadius * treeRadius, treeRadius);
+    vec2 blendParamsB = vec2(treeRadius, treeRadius * treeRadius);
+    vec2 blendParams = mix(blendParamsA, blendParamsB, step(1.0, treeRadius));
+    leafMask *= mix(smoothstep(blendParams.x, blendParams.y, leafDistance), baseMask, baseMask) * CalcLeavesUVWeight(uvs, uvBounds);
+    baseMask *= strengthBase;
+
+    vec4 strengthMask = vec4(leafMask, leafMask, baseMask, baseMask);
+    return dot(strengthMask, vec4(fastSines.xy, slowSines.xy)) * foliageOffsetForward +
+        dot(strengthMask, vec4(fastSines.zw, slowSines.zw)) * foliageOffsetUp;
 }
 `,
 };

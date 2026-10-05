@@ -245,7 +245,7 @@ export function applyBlending(mode, A, B, opacity) {
     case 12: return per((a, b) => softLight3(a, b)) // SoftLight
     case 13: return per((a, b) => overlay3(b, a)) // HardLight
     case 14: return per((a, b) => [vivid(a[0], b[0]), vivid(a[1], b[1]), vivid(a[2], b[2])]) // VividLight
-    case 15: return per((a, b) => [b[0] < 0.5 ? Math.max(a[0] + 2 * b[0] - 1, 0) : Math.min(a[0] + 2 * (b[0] - 0.5), 1), b[1] < 0.5 ? Math.max(a[1] + 2 * b[1] - 1, 0) : Math.min(a[1] + 2 * (b[1] - 0.5), 1), b[2] < 0.5 ? Math.max(a[2] + 2 * b[2] - 1, 0) : Math.min(a[2] + 2 * (b[2] - 0.5), 1)]) // LinearLight
+    case 15: return per((a, b) => [b[0] < 0.5 ? Math.max(a[0] + 2 * b[0] - 1, 0) : a[0] + 2 * (b[0] - 0.5), b[1] < 0.5 ? Math.max(a[1] + 2 * b[1] - 1, 0) : a[1] + 2 * (b[1] - 0.5), b[2] < 0.5 ? Math.max(a[2] + 2 * b[2] - 1, 0) : a[2] + 2 * (b[2] - 0.5)]) // LinearLight（上半段 LinearDodgef 不截断）
     case 16: return per((a, b) => [b[0] < 0.5 ? Math.min(a[0], 2 * b[0]) : Math.max(a[0], 2 * (b[0] - 0.5)), b[1] < 0.5 ? Math.min(a[1], 2 * b[1]) : Math.max(a[1], 2 * (b[1] - 0.5)), b[2] < 0.5 ? Math.min(a[2], 2 * b[2]) : Math.max(a[2], 2 * (b[2] - 0.5))]) // PinLight
     case 17: return per((a, b) => [vivid(a[0], b[0]) < 0.5 ? 0 : 1, vivid(a[1], b[1]) < 0.5 ? 0 : 1, vivid(a[2], b[2]) < 0.5 ? 0 : 1]) // HardMix
     case 18: return per((a, b) => [Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2])]) // Difference

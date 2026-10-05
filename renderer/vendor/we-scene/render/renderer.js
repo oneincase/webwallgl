@@ -1452,7 +1452,24 @@ export function createRenderer(canvas, opts = {}) {
           // 连续排布，用首元素 location + uniform1fv 一次设完
           uni.set(base, { loc: gl.getUniformLocation(prog, info.name), type: GL_TYPES[info.type] || 'unknown', size: info.size })
         }
-        const matMeta = { ...parseMaterialMeta(src.vert), ...parseMaterialMeta(src.frag) }
+        // 公共头也声明带 material/default 的 uniform（common_composite.h 的
+        // g_CompositeColor 默认 "1 1 1"）：不解析就停在 GL 的 0，结果被乘成黑。
+        // 作者 shader 自身的声明优先。
+        const includeMeta = {}
+        const seenInc = new Set()
+        const walkIncludes = (text) => {
+          for (const m of String(text).matchAll(/#include[ \t]+"([^"]+)"/g)) {
+            if (seenInc.has(m[1])) continue
+            seenInc.add(m[1])
+            const inc = includeCache.get(m[1])
+            if (!inc) continue
+            Object.assign(includeMeta, parseMaterialMeta(inc))
+            walkIncludes(inc)
+          }
+        }
+        walkIncludes(src.vert)
+        walkIncludes(src.frag)
+        const matMeta = { ...includeMeta, ...parseMaterialMeta(src.vert), ...parseMaterialMeta(src.frag) }
         // [we-scene patch] 效果 vert 有两种顶点约定（全库并存）：
         //   A. `mul(vec4(a_Position,1), g_ModelViewProjectionMatrix)` —— 像素空间
         //      quad(0..w) + 转置像素正交 MVP（skew 等顶点位移 shader，3470764447）。
@@ -2523,6 +2540,9 @@ export function createRenderer(canvas, opts = {}) {
 
     let idx = 0
     const anim = layer.textureAnimation
+    let total = 0
+    for (const f of list) total += f.duration > 0 ? f.duration : 1 / 30
+    layer.spriteDuration = total
     if (anim && anim.frame !== null && anim.frame !== undefined) {
       // 脚本钉帧：取整并夹到合法区间（语料里有 `setFrame(bool*1)`、
       // `setFrame((n+1)%3)` 这类写法，值可能是布尔或越界数）
@@ -2530,12 +2550,23 @@ export function createRenderer(canvas, opts = {}) {
       if (!(idx >= 0)) idx = 0
       if (idx >= list.length) idx = list.length - 1
     } else if (list.length > 1) {
-      // 自动播放；被 pause()/stop() 过的层停在第 0 帧
-      const paused = anim && anim.playing === false
-      let total = 0
-      for (const f of list) total += f.duration > 0 ? f.duration : 1 / 30
-      if (!paused && total > 0) {
-        let t = time % total
+      // 自动播放。有脚本控制器时按相位推进：每帧加 dt × rate（rate 可被脚本改，
+      // 2847470774 等 `getTextureAnimation().rate = 9`）；pause() 冻结在当前帧，
+      // stop() 回第 0 帧（restart），再 play() 从头播。
+      let phase = time
+      if (anim) {
+        const dt = anim.lastTime === undefined ? 0 : Math.max(0, time - anim.lastTime)
+        anim.lastTime = time
+        if (anim.restart) anim.phase = 0
+        if (anim.restart && anim.playing !== false) anim.restart = false
+        if (anim.playing !== false) {
+          const r = Number(anim.rate)
+          anim.phase = (anim.phase || 0) + dt * (Number.isFinite(r) ? r : 1)
+        }
+        phase = anim.phase || 0
+      }
+      if (total > 0) {
+        let t = phase % total
         if (t < 0) t += total
         for (let i = 0; i < list.length; i++) {
           const d = list[i].duration > 0 ? list[i].duration : 1 / 30
@@ -2545,6 +2576,7 @@ export function createRenderer(canvas, opts = {}) {
         }
       }
     }
+    layer.spriteFrameIndex = idx
 
     const f = list[idx]
     // TEXS 的 y 是**从贴图顶部**量的，而层 FBO 的 copy pass 已经把内容上下倒置
@@ -3302,6 +3334,8 @@ export function createRenderer(canvas, opts = {}) {
       // 真 3D 网格（三体的天空盒/恒星/地球）必须保留 z，否则球体被压平在相机平面上
       // 退化成一条边（天空盒只剩一条细缝、整屏近黑）。
       keepZ: !!(cam && cam.perspective),
+      // [we-scene patch 2026-10-05] 世界眼点（场景距离雾按到它的距离算；只有透视场景有意义）
+      eye: cam && cam.perspective && cam.eye ? cam.eye : null,
       // [we-scene patch 2026-10-04] 天空盒：帧内深度共享后（F49），它的近侧壳会把
       // 场内所有模型拒掉 —— 交给绘制方按「只测不写」画（与 F40 材质路径同一规则）。
       skybox: !!layer.isSkybox,

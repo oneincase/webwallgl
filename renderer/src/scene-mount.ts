@@ -4185,6 +4185,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // [we-scene patch] 顶点 z 是否参与投影：透视场景的真 3D 网格要保留
                 // （renderer 按 cam.perspective 给），2D puppet 压平到 z=0。
                 keepZ: !!o.keepZ,
+                // [we-scene patch 2026-10-05] 场景雾。天空盒除外：它的壳贴着相机（锁 cam.eye），
+                // 几何距离不代表远近，按距离加雾只会让整片天恒定蒙一层起点浓度
+                model: o.model || null,
+                fog:
+                  sceneFog && o.keepZ && o.eye && !layer.isSkybox &&
+                  !(hooksOn() && (window as unknown as Record<string, unknown>).__noSceneFog === true)
+                    ? { ...sceneFog, eye: o.eye }
+                    : null,
                 color: [
                   // [we-scene patch] 真 3D 网格 LIGHTING 材质乘场景环境光
                   //（o.ambient，未开光照时是 [1,1,1]）。**着色器光照接管时不再乘**
@@ -4385,6 +4393,54 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             ],
           };
         }
+      }
+      // [we-scene patch 2026-10-05] 场景雾（general.fogdistance* / fogheight*，官方编辑器
+      // 「Distance Fog / Height Fog」）。换算成 common_fog.h 的 Params：
+      //   (start, end - start, startDensity, endDensity - startDensity)
+      // —— 着色器的混合系数是 z + w·t²，t 在 start 处为 0、end 处为 1，于是 start 处
+      // = startDensity、end 处 = endDensity，与官方文档对两档浓度的定义一致。
+      // 全库目前只有 3477054430（猫与城市）开了距离雾。
+      const sceneFog = (() => {
+        const g = (scene as any).general || {};
+        const val = (v: any) => (v !== null && typeof v === "object" && "value" in v ? v.value : v);
+        const on = (k: string) => {
+          const v = val(g[k]);
+          return v === true || v === 1 || v === "1" || v === "true";
+        };
+        const n = (k: string, d: number) => {
+          const v = Number(val(g[k]));
+          return Number.isFinite(v) ? v : d;
+        };
+        const col = (k: string) => {
+          const p = String(val(g[k]) ?? "0 0 0").trim().split(/\s+/).map((x) => Number(x) || 0);
+          return [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0];
+        };
+        const params = (pre: string) => {
+          if (!on(pre)) return null;
+          const s = n(pre + "start", 0);
+          const e = n(pre + "end", s + 1);
+          const ds = n(pre + "startdensity", 0);
+          const de = n(pre + "enddensity", 1);
+          // end == start 时官方会除零；给一个极小跨度，效果等价于「过了 start 就是终点浓度」
+          return [s, e - s || 1e-4, ds, de - ds];
+        };
+        const dist = params("fogdistance");
+        const height = params("fogheight");
+        if (!dist && !height) return null;
+        return {
+          dist,
+          distColor: dist ? col("fogdistancecolor") : null,
+          height,
+          heightColor: height ? col("fogheightcolor") : null,
+        };
+      })();
+      if (sceneFog) {
+        reportDiag(
+          rt,
+          cfg,
+          `scene fog: dist=${sceneFog.dist ? sceneFog.dist.map((x) => +x.toFixed(3)).join(",") : "off"} height=${sceneFog.height ? sceneFog.height.map((x) => +x.toFixed(3)).join(",") : "off"}`,
+          "info",
+        );
       }
       const layersHaveNormals = (l: any) =>
         !!(l && l.puppet && l.puppet.meshes && l.puppet.meshes.some((m: any) => m && m.normals));

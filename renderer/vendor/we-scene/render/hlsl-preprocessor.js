@@ -340,11 +340,14 @@ function stripComments(src) {
   return out
 }
 
-function preprocess(src, combos, includeResolver, depth) {
+// 同一编译单元内每个头只展开一次（WE 的行为）：官方公共头之间互相 include
+// （common_composite.h → common.h + common_blending.h，common_pbr*.h → common.h），
+// 而作者 shader 常同时直接 include 其中几个；GLSL 不允许函数重复定义。
+// defs 同样整个编译单元共享：主文件的 #define 在头里的 #if 可见，反之亦然（C 语义）。
+function preprocess(src, combos, includeResolver, depth, included = new Set(), defs = new Map()) {
   const lines = src.split('\n')
   const out = []
   const stack = [] // { parent, hit, done }（done = 本条 #if/#elif/#else 链是否已有分支命中）
-  const defs = new Map()
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const t = line.trim()
@@ -352,12 +355,14 @@ function preprocess(src, combos, includeResolver, depth) {
       if (allActive(stack)) {
         const m = /^#include[ \t]+"([^"]+)"|^#include[ \t]+<([^>]+)>/.exec(t)
         const file = m && (m[1] || m[2])
+        if (file && included.has(file)) continue
         const inc = file && includeResolver ? includeResolver(file) : null
         if (inc !== null && inc !== undefined) {
+          included.add(file)
           // include 进来的头同样要去注释：头里也可能有被注释掉的 #define，
           // 且我们自己重建的公共头带大量中文说明注释（其中的半角括号会干扰
           // 后续 rewriteCall 的取参）。
-          out.push(preprocess(stripComments(inc), combos, includeResolver, depth + 1))
+          out.push(preprocess(stripComments(inc), combos, includeResolver, depth + 1, included, defs))
         } else {
           out.push('// [include 缺失: ' + file + ']')
         }

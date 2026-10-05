@@ -337,6 +337,13 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         : effective[name.toLowerCase()]
       code = replaceWord(code, name, String(cv !== undefined ? cv : 0))
     }
+    // TEXnFORMAT 是引擎按绑定贴图注入的宏，不写 [COMBO]：#if 里按 0 求值，
+    // 表达式里（fur4 的 `ConvertTextureFormat(TEX8FORMAT, …)`）也必须落成同一个值。
+    code = code.replace(/\bTEX\d+FORMAT\b/g, (m) => {
+      if (declaredNames.has(m)) return m
+      const cv = effective[m] !== undefined ? effective[m] : effective[m.toLowerCase()]
+      return String(cv !== undefined ? cv : 0)
+    })
   }
 
   // GLSL ES 3.0 保留字（WE 变量名与之冲突）
@@ -1107,6 +1114,10 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     let fm
     const fDeclRe = /\b(?:const\s+|uniform\s+|varying\s+|in\s+|out\s+)*float\s+([A-Za-z_]\w*)/g
     while ((fm = fDeclRe.exec(code)) !== null) floatNames.add(fm[1])
+    // 同名被声明成向量也放弃：common.h 的 `rand(vec2 n, float m)` 里 `n * m` 会被
+    // 当成作者循环变量 `int n`，改成 `float(n) * m`（2869415541 water_caustics）
+    const vecDeclRe = /\b(?:const\s+|uniform\s+|varying\s+|attribute\s+|in\s+|out\s+|inout\s+)*(?:vec[234]|mat[234])\s+([A-Za-z_]\w*)/g
+    while ((fm = vecDeclRe.exec(code)) !== null) intNames.delete(fm[1])
     for (const n of [...intNames]) {
       if (floatNames.has(n)) { intNames.delete(n); floatNames.delete(n) }
     }
@@ -1522,6 +1533,15 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
   // CAST3X3(m)：mat4 → mat3 左上角。与 CAST2/3/4 同族的引擎内建宏，
   // 使用它的 3 个文件同样零 include。
   code = rewriteCall(code, 'CAST3X3', (inner) => 'mat3(' + inner + ')')
+  // 标量转型宏（fur4 的 `CASTU(gl_VertexID)`、morph 索引运算）。CASTU 落成 int：
+  // 本转译器把 uint 声明统一改成 int（见 % 取模那段），转型必须跟着走，否则重载对不上。
+  code = rewriteCall(code, 'CASTF', (inner) => 'float(' + inner + ')')
+  code = rewriteCall(code, 'CASTU', (inner) => 'int(' + inner + ')')
+  code = rewriteCall(code, 'CASTI', (inner) => 'int(' + inner + ')')
+  // 采样器形参 / 实参宏（HLSL 下展开成 Texture2D + SamplerState 两个参数，GLSL 下就是 sampler2D）：
+  // `ApplyReflection(MAKE_SAMPLER2D_ARGUMENT(g_Texture3), …)` 写在 chroma4/fur4 主文件里。
+  code = rewriteCall(code, 'DECLARE_SAMPLER2D_PARAMETER', (inner) => 'sampler2D ' + inner.trim())
+  code = rewriteCall(code, 'MAKE_SAMPLER2D_ARGUMENT', (inner) => inner.trim())
 
   // varying/attribute → in/out
   if (stage === 'vert') {
@@ -1656,7 +1676,11 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
         }).join('\n')
       }
     }
-
+  }
+  {
+    // [we-scene patch] 顶点阶段同理：HLSL 允许改写顶点输入，shadow.vert 直接
+    // `a_TexCoord *= atFactor;`（3396722575 / 3450697231）。attribute 绑定靠名字，
+    // 声明不能改名，所以与片元一样走 `_rw` 局部副本。
     // [we-scene patch] 片元阶段**写入 varying**：GLSL ES 3.0 的 `in` 是只读的，
     // 报 `'assign' : l-value required (can't modify an input "v_TexCoord")`；
     // 而 HLSL / GLSL 1.x 允许把插值量当可写局部量用，作者据此就地改 UV

@@ -78,7 +78,7 @@ function makeMockGL() {
   for (const m of [
     "clear", "clearDepth", "clearColor", "depthMask", "depthFunc", "enable", "disable",
     "blendFunc", "blendFuncSeparate", "useProgram", "uniform1f", "uniform1i", "uniform2f",
-    "uniform3f", "uniform4f", "uniformMatrix3fv", "uniformMatrix4fv", "activeTexture",
+    "uniform3f", "uniform4f", "uniform3fv", "uniform4fv", "uniformMatrix3fv", "uniformMatrix4fv", "activeTexture",
     "bindTexture", "bindVertexArray", "bindBuffer", "bufferData", "enableVertexAttribArray",
     "disableVertexAttribArray", "vertexAttribPointer", "vertexAttrib3f", "drawElements",
     "drawArrays", "attachShader", "detachShader", "bindAttribLocation", "linkProgram",
@@ -311,6 +311,38 @@ const names = (calls) => calls.map((c) => c.name);
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   check(/meshBlending:\s*layer\.meshBlending \|\| null/.test(rsrc),
     "renderer 没把 layer.meshBlending 传进 puppetDrawFn opts（F50 断点之一）");
+}
+
+// ───────────────── ⑩ 场景雾：只对真 3D 生效、宿主两跳接线不断 ─────────────────
+// 3477054430 的距离雾（远处楼房隐入夜色）。官方 generic4 默认 FOG=1；我们的通用网格程序
+// 用 u_fogOn 开关，关着时片元整段短路（与改动前逐位一致）。
+{
+  const fogOn = (log) => log.filter((c) => c.name === "uniform1f" && c.args[0]?.name === "u_fogOn").map((c) => c.args[1]);
+  const FOG = { eye: [0, 0, 0], dist: [6.53, 493.47, 0, 0.98], distColor: [0, 0, 0], height: null, heightColor: null };
+  const MODEL = new Float32Array(MVP);
+  const gl = makeMockGL();
+  const r = createMDLRenderer(gl);
+  gl.__log.length = 0;
+  r.draw(MVP, fakeMDL(), { keepZ: true, fog: FOG, model: MODEL }, null);
+  check(fogOn(gl.__log).at(-1) === 1, "透视场景 + 宿主给了雾与模型矩阵 → u_fogOn=1");
+  check(gl.__log.some((c) => c.name === "uniform4fv" && c.args[0]?.name === "u_fogDist"), "开雾时上传了 u_fogDist");
+  gl.__log.length = 0;
+  r.draw(MVP, fakeMDL(), { fog: FOG, model: MODEL }, null);
+  check(fogOn(gl.__log).at(-1) === 0, "2D 场景（无 keepZ）即使给了雾也不加（2D puppet 没有世界距离）");
+  gl.__log.length = 0;
+  r.draw(MVP, fakeMDL(), { keepZ: true }, null);
+  check(fogOn(gl.__log).at(-1) === 0, "没给雾 → u_fogOn=0（每帧显式复位，不吃上一个模型的残留）");
+
+  const msrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8");
+  check(/if \(u_fogOn > 0\.5\) fragColor = applySceneFog\(fragColor\);/.test(msrc), "片元着色器在最终颜色上应用场景雾");
+  const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const cbAt = hostSrc.indexOf("renderer.setPuppetRenderer(");
+  const cb = cbAt >= 0 ? hostSrc.slice(cbAt, hostSrc.indexOf("puppet: ${mdlItems.length}", cbAt)) : "";
+  check(/model:\s*o\.model/.test(cb), "setPuppetRenderer 回调没有转发 model：雾拿不到世界坐标");
+  check(/\{\s*\.\.\.sceneFog,\s*eye:\s*o\.eye\s*\}/.test(cb), "setPuppetRenderer 回调没有转发 fog（含眼点）：场景雾在实机上不生效");
+  check(/\[s,\s*e - s \|\| 1e-4,\s*ds,\s*de - ds\]/.test(hostSrc), "雾参数换算应为 (start, end-start, startDensity, endDensity-startDensity)");
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  check(/eye:\s*cam && cam\.perspective && cam\.eye \? cam\.eye : null/.test(rsrc), "renderer 没把透视相机眼点传进 puppetDrawFn opts");
 }
 
 console.log(

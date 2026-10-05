@@ -63,13 +63,17 @@ float weBlendVivid(float a, float b) {
 }
 // Reflect 单独成函数：Glow = Reflect(B,A)。GLSL 禁止递归，不能在 ApplyBlending
 // 内部调 ApplyBlending(21, …)（整个函数会编译失败，效果被静默跳过）。
-vec3 weBlendReflect(vec3 A, vec3 B) {
+// 参数语义同官方 BlendReflectf(base, blend)：分母与 ==1 判定看 blend，平方的是 base。
+vec3 weBlendReflect(vec3 base, vec3 blend) {
     return vec3(
-        A.r == 1.0 ? 1.0 : min(B.r * B.r / (1.0 - A.r), 1.0),
-        A.g == 1.0 ? 1.0 : min(B.g * B.g / (1.0 - A.g), 1.0),
-        A.b == 1.0 ? 1.0 : min(B.b * B.b / (1.0 - A.b), 1.0));
+        blend.r == 1.0 ? 1.0 : min(base.r * base.r / (1.0 - blend.r), 1.0),
+        blend.g == 1.0 ? 1.0 : min(base.g * base.g / (1.0 - blend.g), 1.0),
+        blend.b == 1.0 ? 1.0 : min(base.b * base.b / (1.0 - blend.b), 1.0));
 }
 vec3 RGBToHSL(vec3 c) {
+#ifdef HDR
+    c = clamp(c, 0.0, 1.0);
+#endif
     float fmin = min(c.r, min(c.g, c.b));
     float fmax = max(c.r, max(c.g, c.b));
     float delta = fmax - fmin;
@@ -85,7 +89,7 @@ vec3 RGBToHSL(vec3 c) {
         float deltaB = ((fmax - c.b) / 6.0 + delta / 2.0) / delta;
         if (c.r == fmax) h.x = deltaB - deltaG;
         else if (c.g == fmax) h.x = 1.0 / 3.0 + deltaR - deltaB;
-        else if (c.b == fmax) h.x = 2.0 / 3.0 + deltaG - deltaB;
+        else if (c.b == fmax) h.x = 2.0 / 3.0 + deltaG - deltaR;
         if (h.x < 0.0) h.x += 1.0;
         else if (h.x > 1.0) h.x -= 1.0;
     }
@@ -138,10 +142,11 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
         r = vec3(weBlendVivid(A.r, B.r), weBlendVivid(A.g, B.g), weBlendVivid(A.b, B.b));
     }
     else if (mode == 15) {                                  // LinearLight
+        // 上半段是官方 BlendLinearDodgef（base + blend，不截断），mix 之前不能 min 到 1
         r = vec3(
-            B.r < 0.5 ? max(A.r + 2.0 * B.r - 1.0, 0.0) : min(A.r + 2.0 * (B.r - 0.5), 1.0),
-            B.g < 0.5 ? max(A.g + 2.0 * B.g - 1.0, 0.0) : min(A.g + 2.0 * (B.g - 0.5), 1.0),
-            B.b < 0.5 ? max(A.b + 2.0 * B.b - 1.0, 0.0) : min(A.b + 2.0 * (B.b - 0.5), 1.0));
+            B.r < 0.5 ? max(A.r + 2.0 * B.r - 1.0, 0.0) : A.r + 2.0 * (B.r - 0.5),
+            B.g < 0.5 ? max(A.g + 2.0 * B.g - 1.0, 0.0) : A.g + 2.0 * (B.g - 0.5),
+            B.b < 0.5 ? max(A.b + 2.0 * B.b - 1.0, 0.0) : A.b + 2.0 * (B.b - 0.5));
     }
     else if (mode == 16) {                                  // PinLight
         r = vec3(

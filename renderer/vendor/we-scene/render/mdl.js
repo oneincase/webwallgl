@@ -77,8 +77,10 @@ uniform int u_boneCount;
 uniform float u_keepZ;
 uniform vec2 u_partScale;
 uniform vec2 u_partPivot;
+uniform mat4 u_model;
 out vec2 v_uv;
 out vec3 v_wnormal;
+out highp vec3 v_wpos;
 void main() {
   vec4 p = vec4(a_pos, 1.0);
   vec4 skinned = vec4(0.0);
@@ -96,7 +98,10 @@ void main() {
   vec4 local = total > 0.0 ? skinned / total : p;
   // [we-scene patch 2026-09-28] 每零件竖直缩放（「被收拢的零件盖住」时同步压扁，见 collapsedPartSquash）
   local.xy = u_partPivot + (local.xy - u_partPivot) * u_partScale;
-  gl_Position = u_mvp * vec4(local.xy, local.z * u_keepZ, 1.0);
+  vec4 lp = vec4(local.xy, local.z * u_keepZ, 1.0);
+  gl_Position = u_mvp * lp;
+  // 世界坐标只给场景雾用（官方 generic4.vert 的 v_ViewDir = g_EyePosition - worldPos）
+  v_wpos = (u_model * lp).xyz;
   v_uv = a_uv;
   // [we-scene patch 2026-09-28] 3D 网格的光照法线（世界向）。u_normalMat 由宿主按
   // 图层世界矩阵的旋转部分给（见 draw 的 opts.normalMat）。2D puppet 没有法线属性，
@@ -125,7 +130,38 @@ uniform vec3 u_lightDir;
 uniform vec3 u_lightBase;
 uniform vec3 u_lightAdd;
 uniform float u_lightOn;
+// [we-scene patch 2026-10-05] 场景雾（官方 common_fog.h 逐条对齐，generic4 默认 FOG=1）。
+// Params = (start, end-start, startDensity, endDensity-startDensity)：
+//   t = saturate((d - start) / (end - start))，混合系数 = startDensity + Δdensity·t²
+// d = 到眼点的距离（距离雾）/ 世界 y（高度雾）。u_fogOn = 0 时整段短路，逐位等价旧行为。
+in highp vec3 v_wpos;
+uniform float u_fogOn;
+uniform float u_fogAdditive;
+uniform highp vec3 u_eye;
+uniform highp vec4 u_fogDist;
+uniform vec3 u_fogDistColor;
+uniform highp vec4 u_fogHeight;
+uniform vec3 u_fogHeightColor;
 out vec4 fragColor;
+vec4 applySceneFog(vec4 c) {
+  float fd = 0.0;
+  float fh = 0.0;
+  if (u_fogHeight.y != 0.0) {
+    float t = clamp((v_wpos.y - u_fogHeight.x) / u_fogHeight.y, 0.0, 1.0);
+    fh = u_fogHeight.z + u_fogHeight.w * t * t;
+    c.rgb = mix(c.rgb, u_fogHeightColor, fh);
+  }
+  if (u_fogDist.y != 0.0) {
+    float t = clamp((length(u_eye - v_wpos) - u_fogDist.x) / u_fogDist.y, 0.0, 1.0);
+    fd = u_fogDist.z + u_fogDist.w * t * t;
+    c.rgb = mix(c.rgb, u_fogDistColor, fd);
+  }
+  if (u_fogAdditive > 0.5) {
+    float f = clamp(max(fd, fh), 0.0, 1.0);
+    c.a *= 1.0 - f * f;
+  }
+  return c;
+}
 void main() {
   vec4 t = texture(u_tex, v_uv);
   // [we-scene patch 2026-10-04] **全透明的像素不是遮挡物**（F50）。
@@ -152,6 +188,7 @@ void main() {
     mul = max(u_lightBase + u_lightAdd * ndl, 0.0);
   }
   fragColor = t * u_color * vec4(mul, 1.0);
+  if (u_fogOn > 0.5) fragColor = applySceneFog(fragColor);
 }`
 
 // [we-scene patch 2026-09-28] 这条补偿规则**按壁纸白名单生效**：全库扫描（324 张 /
@@ -451,8 +488,18 @@ export function createMDLRenderer(gl) {
     lightBase: gl.getUniformLocation(prog, 'u_lightBase'),
     lightAdd: gl.getUniformLocation(prog, 'u_lightAdd'),
     lightOn: gl.getUniformLocation(prog, 'u_lightOn'),
+    model: gl.getUniformLocation(prog, 'u_model'),
+    fogOn: gl.getUniformLocation(prog, 'u_fogOn'),
+    fogAdditive: gl.getUniformLocation(prog, 'u_fogAdditive'),
+    eye: gl.getUniformLocation(prog, 'u_eye'),
+    fogDist: gl.getUniformLocation(prog, 'u_fogDist'),
+    fogDistColor: gl.getUniformLocation(prog, 'u_fogDistColor'),
+    fogHeight: gl.getUniformLocation(prog, 'u_fogHeight'),
+    fogHeightColor: gl.getUniformLocation(prog, 'u_fogHeightColor'),
   }
   const IDENTITY3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1])
+  const ZERO3 = new Float32Array(3)
+  const ZERO4 = new Float32Array(4)
   const identitySkin = new Float32Array(MAX_BONES * 16)
   for (let i = 0; i < MAX_BONES; i++) identitySkin.set(IDENTITY, i * 16)
 
@@ -732,6 +779,18 @@ export function createMDLRenderer(gl) {
         gl.uniform3f(uni.lightAdd, 0, 0, 0)
         gl.uniform3f(uni.lightDir, 0, 1, 0)
       }
+      // [we-scene patch 2026-10-05] 场景雾：宿主给 { eye, dist:[4], distColor:[3], height:[4], heightColor:[3] }，
+      // 只对真 3D（keepZ）且带模型矩阵时生效；某一项未开时其 Params.y 为 0，片元里跳过该项。
+      const FOG = opts.keepZ && opts.fog && opts.model && opts.model.length === 16 ? opts.fog : null
+      gl.uniformMatrix4fv(uni.model, false, FOG ? opts.model : IDENTITY)
+      gl.uniform1f(uni.fogOn, FOG ? 1 : 0)
+      if (FOG) {
+        gl.uniform3fv(uni.eye, FOG.eye)
+        gl.uniform4fv(uni.fogDist, FOG.dist || ZERO4)
+        gl.uniform3fv(uni.fogDistColor, FOG.distColor || ZERO3)
+        gl.uniform4fv(uni.fogHeight, FOG.height || ZERO4)
+        gl.uniform3fv(uni.fogHeightColor, FOG.heightColor || ZERO3)
+      }
       const identity = opts.overrideTex || (texture && texture.glTex ? texture.glTex : texture) || null
       // 多子网格：mdl.meshes 是 parseMeshes 的产物（1 个网格时与上面这份伪网格等价）。
       // 零件表（parts）只挂在第一个子网格上：那是 2D puppet 的「收拢零件」规则用的
@@ -794,6 +853,12 @@ export function createMDLRenderer(gl) {
         gl.bindVertexArray(m.vao)
         // 带法线且场景有光 → 走上光路径（片元里 N·L）；否则常量 1（逐位等价旧行为）
         gl.uniform1f(uni.lightOn, SL && m.hasNormals ? 1 : 0)
+        // 官方只在 ADDITIVE 下让雾吃掉 alpha（ApplyFogAlpha）：加算网格靠 alpha 而非颜色淡出
+        if (FOG) {
+          const mb = opts.meshBlending && opts.meshBlending[gi]
+          const b = String(typeof mb === 'string' ? mb : opts.blending || '').toLowerCase()
+          gl.uniform1f(uni.fogAdditive, b === 'additive' ? 1 : 0)
+        }
         // 每网格贴图：overrideTex（效果链输出）优先，其次该网格自己的材质贴图，
         // 最后回落整层贴图（单网格模型走的就是这一条）。索引必须用**原始** gi ——
         // meshTextures 是按子网格下标填的，用重排后的 k 会把贴图错配给另一个网格。
