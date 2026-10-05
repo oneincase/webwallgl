@@ -1200,9 +1200,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 于是画面永远停在 "Wallpaper Music" / "Name of artist"。
       // 用 diff(null, snapshot) 生成全量事件补给新沙箱，与首帧语义一致。
       const mediaSnapshot = () => currentMediaDriver().snapshot;
-      const registerMediaHook = (sb: any) => {
-        if (!sb || !sb.hasMediaHook || mediaHooks.includes(sb)) return;
-        mediaHooks.push(sb);
+      // 挂载期补发要等全部 init 跑完：2955378002 的 playerplay 收到补发的
+      // mediaPropertiesChanged 就读 shared.maxTitleLineTxt，它由后面 Player Options 的 init 写入。
+      let pendingMediaReplay: any[] | null = null;
+      const replayMedia = (sb: any) => {
         // 建场阶段（首帧 update 之前）快照还是空的，补发只会送一轮「无媒体」；
         // 那批沙箱由首帧的 diff 正常覆盖，这里跳过。只有真正迟到的才需要补。
         if (!mediaSnapshot().hasMedia) return;
@@ -1213,6 +1214,20 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             /* 沙箱内部已有三振熔断，这里只防止一个坏脚本打断其余登记 */
           }
         }
+      };
+      const registerMediaHook = (sb: any) => {
+        if (!sb || !sb.hasMediaHook || mediaHooks.includes(sb)) return;
+        mediaHooks.push(sb);
+        if (pendingMediaReplay) pendingMediaReplay.push(sb);
+        else replayMedia(sb);
+      };
+      const holdMediaReplay = () => {
+        pendingMediaReplay ??= [];
+      };
+      const flushMediaReplay = () => {
+        const list = pendingMediaReplay;
+        pendingMediaReplay = null;
+        if (list) for (const sb of list) replayMedia(sb);
       };
       (window as unknown as Record<string, unknown>).__mediaStats = () => ({
         enabled: mediaSim.enabled,
@@ -4538,6 +4553,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         // 文字脚本的 init/applyUserProperties 延后队列（框架脚本装在 shared 上的
         // helper 要等对象脚本顶层跑完才存在——时钟1 的 registerListener）。
         const deferredTextInits: Array<{ sandbox: any; layer: any }> = [];
+        const deferredAnimLayerInits: Array<() => void> = [];
+        const deferredObjectInits: Array<() => void> = [];
+        holdMediaReplay();
         const textLayerText = new Map<string, string>(); // 层名 → 当前文本（thisScene.getLayer 跨层读）
         const textShared: Record<string, unknown> = {}; // 同场景文字脚本共享状态（WE shared 全局）
         // [we-scene patch 2026-09-28] `shared.camera`（WE 文档化相机控制面）。
@@ -4682,6 +4700,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 windowTitle: windowDriver.snapshot,
                 openUserShortcut: shortcuts.openUserShortcut,
                 getLayerText: (name: string) => textLayerText.get(name),
+                // thisLayer.getParent/getChildren/getParticleSystem 借对象代理时的查表口
+                getSceneLayerById: (id: unknown) =>
+                  (scene.layers as any[]).find((l) => l.id === id && !l.destroyed) || null,
+                getBoneOverrides,
+                getParticleSystems: (target: { id?: number }) =>
+                  (target && target.id !== undefined && particleSystemsByLayer.get(target.id)) || [],
                 onError: (e: unknown) => {
                   reportDiag(rt, cfg, `text script '${layer.name}' 失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
                 },
@@ -5129,6 +5153,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           getSceneLayerById: (id: unknown) =>
             (scene.layers as any[]).find((l) => l.id === id && !l.destroyed) || null,
           enumerateSceneLayers: () => (scene.layers as any[]).filter((l) => !l.destroyed),
+          getParticleSystems: (target: { id?: number }) =>
+            (target && target.id !== undefined && particleSystemsByLayer.get(target.id)) || [],
+          emitParticles: (target: { id?: number }, count: number) => {
+            const list = target && target.id !== undefined ? particleSystemsByLayer.get(target.id) : null;
+            if (!list) return 0;
+            let made = 0;
+            for (const ps of list) made += ps.emitBurst(count) | 0;
+            return made;
+          },
           getSceneAnimation: (name: string) => {
             if (name == null || name === "") return null;
             if (sceneNamedAnims[name]) return sceneNamedAnims[name];
@@ -5446,12 +5479,19 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             });
             if (!sandbox) return;
             propSandboxes.push(sandbox);
-            // init(value) 收到该层当前 visible（bool），返回值折叠后写回；
-            // init 内对 getAnimationLayer(name).stop() 的调用此刻已生效。
-            const ir = sandbox.init(al.visible !== false);
-            const f = foldVisibleRet(ir);
-            if (f !== undefined) al.visible = f;
-            sandbox.applyUserProperties(objUserProps);
+            // init(value) 收到该层当前 visible（bool），返回值折叠后写回。
+            // 推迟到对象脚本顶层全部执行之后（同 deferredTextInits）：3363252053 的
+            // 错帧层 init 调 `shared.offsetedStartAni(...)`，那是第 0 个对象「脚本层」
+            // 顶层挂上去的，立即 init 会 TypeError。
+            deferredAnimLayerInits.push(() => {
+              try {
+                const f = foldVisibleRet(sandbox.init(al.visible !== false));
+                if (f !== undefined) al.visible = f;
+                sandbox.applyUserProperties(objUserProps);
+              } catch (e) {
+                reportDiag(rt, cfg, `animationlayer visible script '${layer.name}[${index}]' init 失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
+              }
+            });
             if (sandbox.hasMediaHook) registerMediaHook(sandbox);
             registerResizeHook(sandbox);
             animLayerScriptRuns.push({ layer, index, sandbox });
@@ -5490,19 +5530,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
-              const cur = Number(al[field]);
-              const ir = sandbox.init(Number.isFinite(cur) ? cur : field === "blend" ? 1 : 1);
-              const f0 = typeof ir === "number" ? ir : Number((ir as any)?.value);
-              if (Number.isFinite(f0)) al[field] = f0;
-              sandbox.applyUserProperties(objUserProps);
-              if (sandbox.hasMediaHook) registerMediaHook(sandbox);
-              registerResizeHook(sandbox);
-              animLayerFieldRuns.push({ layer, index, field, sandbox });
-              // 关键：clip 的帧事件要能进这个脚本的 animationEvent
-              //（Trip 的 end → `shared.kirbystate = 0`）
-              if (sandbox.hasAnimEventHook) {
-                registerAnimEventSink(layer, { sandbox, kind: "animLayerField", animLayerIndex: index, field });
-              }
+              deferredObjectInits.push(() => {
+                const cur = Number(al[field]);
+                const ir = sandbox.init(Number.isFinite(cur) ? cur : 1);
+                const f0 = typeof ir === "number" ? ir : Number((ir as any)?.value);
+                if (Number.isFinite(f0)) al[field] = f0;
+                sandbox.applyUserProperties(objUserProps);
+                if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+                registerResizeHook(sandbox);
+                animLayerFieldRuns.push({ layer, index, field, sandbox });
+                // 关键：clip 的帧事件要能进这个脚本的 animationEvent
+                //（Trip 的 end → `shared.kirbystate = 0`）
+                if (sandbox.hasAnimEventHook) {
+                  registerAnimEventSink(layer, { sandbox, kind: "animLayerField", animLayerIndex: index, field });
+                }
+              });
             } catch (e) {
               reportDiag(rt, cfg, `animationlayer ${field} script '${layer.name}[${index}]' 求值失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
@@ -5566,12 +5608,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
-              // init(value) 收到该 override 键的快照值（倍率/数量/颜色）。
-              sandbox.init(def.value);
-              sandbox.applyUserProperties(objUserProps);
-              if (sandbox.hasMediaHook) registerMediaHook(sandbox);
-              registerResizeHook(sandbox);
-              if (sandbox.hasUpdate) overrideScriptRuns.push({ layer, key, sandbox });
+              deferredObjectInits.push(() => {
+                // init(value) 收到该 override 键的快照值（倍率/数量/颜色）。
+                sandbox.init(def.value);
+                sandbox.applyUserProperties(objUserProps);
+                if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+                registerResizeHook(sandbox);
+                if (sandbox.hasUpdate) overrideScriptRuns.push({ layer, key, sandbox });
+              });
             } catch (e) {
               reportDiag(rt, cfg, `override script '${layer.name}.${key}' 求值失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
             }
@@ -5608,6 +5652,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
+              deferredObjectInits.push(() => {
               // WE 语义：init(value) 收到字段的**当前值**（visible 字段 = 布尔），
               // 返回值成为新初值 —— 淡出脚本静音加载时 `return 0` 应把效果藏掉，
               // 此前返回值被丢弃、效果恒显。number 按 WE 折叠（≠0 = 可见）。
@@ -5628,6 +5673,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // 转发脚本常无 update，必须独立于 hasUpdate 登记——3163060610 的
               // 调度框架就是这种形态）。
               if (sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox, kind: "effectVisible", effect, run: animRun });
+              });
             } catch (e) {
               console.warn(`效果开关脚本 ${layer.name}#${ei} 求值失败: ${(e as Error).message}`);
             }
@@ -5675,22 +5721,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                     "warn",
                   );
                 },
-                // [we-scene patch 2026-09-28] `layer.emitParticles(n)`：按图层 id 找它的
-                // 粒子系统并一次性爆发 n 颗（见 particles.js emitBurst）。缺失时这条
-                // API 会静默返回 0，而比赛主控脚本每次吃食物都要调它 —— 旧版直接
-                // TypeError，三振熔断后两个角色永不动（3281559867 的动画全灭）。
-                emitParticles: (target: { id?: number }, count: number) => {
-                  const lid = target && target.id;
-                  if (lid === undefined) return 0;
-                  const list = particleSystemsByLayer.get(lid);
-                  if (!list) return 0;
-                  let made = 0;
-                  for (const ps of list) made += ps.emitBurst(count) | 0;
-                  return made;
-                },
               });
               if (sandbox) {
                 propSandboxes.push(sandbox);
+                // 官方两阶段：全部对象脚本顶层先求值，再按序 init。2932157836 的
+                // 「Media Background 1」(#15) 在 init/applyUserProperties 里调
+                // shared.mCheckMediaLock()，它由「Music Cover」(#20) 的顶层挂上。
+                deferredObjectInits.push(() => {
                 // WE 语义：init(value) 收到字段的**当前值**。向量字段（scale/origin/
                 // angles）在 WE 里是带 .x/.y/.z 的对象，本仓图层用数组存储——
                 // 这里包成同形对象；标量/布尔字段原样传。
@@ -5778,27 +5815,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                     slot: initSlot,
                   });
                 }
+                });
               }
             } catch (e) {
               console.warn(`对象脚本 ${layer.name}.${field} 求值失败: ${(e as Error).message}`);
             }
           }
         }
-        // [we-scene patch] 文字脚本的 init/applyUserProperties 在这里统一补跑：
-        // 此时对象/效果/general 脚本的**顶层代码都已执行**，框架装在 shared 上的
-        // helper（eventDispatcher/CAniClass/CAniTaskListClass，3163060610 基础脚本）
-        // 已经就位，文字脚本 init 里的 registerListener 才拿得到（时钟1 此前连环
-        // TypeError「reading registerListener」）。
-        for (const d of deferredTextInits) {
-          // WE 语义：init(value) 收到字段当前值（文字字段 = 当前文本），
-          // 返回字符串成为初始文本。
-          const tir = d.sandbox.init(d.layer.text ?? "");
-          if (typeof tir === "string") d.layer.text = tir;
-          d.sandbox.applyUserProperties(liveUserProps);
-        }
-        // 挂载期 init 返回值改写过的 visibleSelf 统一重算一次（效果链/粒子分发
-        // 都在重算之后装配，避免先拿旧可见性建资源）。
-        if (mountVisibilityDirty) recomputeVisibility();
         // general.*.script（全库 3 处）：3151551777 zoom、2134765860 bloomstrength、
         // 3790527023 cameraparallax 场景切换。不是图层字段，漏加载等于这三张
         // 壁纸的火车震动 / 音频 bloom / 多场景轮换全部不跑。
@@ -5824,20 +5847,45 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
-              sandbox.init(def.value);
-              sandbox.applyUserProperties(objUserProps);
-              if (sandbox.hasMediaHook) registerMediaHook(sandbox);
-              registerResizeHook(sandbox);
-              const write = (v: unknown) => writeGeneralField(field, v);
-              if (sandbox.hasUpdate) generalScriptRuns.push({ field, sandbox, write });
+              deferredObjectInits.push(() => {
+                sandbox.init(def.value);
+                sandbox.applyUserProperties(objUserProps);
+                if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+                registerResizeHook(sandbox);
+                const write = (v: unknown) => writeGeneralField(field, v);
+                if (sandbox.hasUpdate) generalScriptRuns.push({ field, sandbox, write });
+              });
             } catch (e) {
               console.warn(`general 脚本 ${field} 求值失败: ${(e as Error).message}`);
             }
           }
-          if (generalScriptRuns.length) {
-            reportDiag(rt, cfg, `general scripts: ${generalScriptRuns.map((r) => r.field).join(",")}`, "info");
+        }
+        // 官方两阶段的第二段：以上全部脚本（对象字段/效果开关/粒子 override/动画层/
+        // 文字/general）的顶层代码都已执行，框架装在 shared 上的 helper 已就位
+        //（3163060610 的 eventDispatcher/CAniClass：时钟1 文字 init 的 registerListener；
+        // 2932157836 的 shared.mCheckMediaLock），再按序 init + applyUserProperties。
+        for (const run of deferredObjectInits) {
+          try {
+            run();
+          } catch (e) {
+            reportDiag(rt, cfg, `object script init 失败: ${String((e as Error).message).slice(0, 80)}`, "warn");
           }
         }
+        for (const run of deferredAnimLayerInits) run();
+        for (const d of deferredTextInits) {
+          // WE 语义：init(value) 收到字段当前值（文字字段 = 当前文本），
+          // 返回字符串成为初始文本。
+          const tir = d.sandbox.init(d.layer.text ?? "");
+          if (typeof tir === "string") d.layer.text = tir;
+          d.sandbox.applyUserProperties(liveUserProps);
+        }
+        if (generalScriptRuns.length) {
+          reportDiag(rt, cfg, `general scripts: ${generalScriptRuns.map((r) => r.field).join(",")}`, "info");
+        }
+        // 挂载期 init 返回值改写过的 visibleSelf 统一重算一次（效果链/粒子分发
+        // 都在重算之后装配，避免先拿旧可见性建资源）。
+        if (mountVisibilityDirty) recomputeVisibility();
+        flushMediaReplay();
         // general.*.animation（全库 2 处）：2887099508 zoom 开场从 3 拉到 1，
         // 3793152178 bloomstrength 循环。图层 objectAnimations 进不了 general，
         // 不在这里建控制器的话 zoom 永远停在快照 3。

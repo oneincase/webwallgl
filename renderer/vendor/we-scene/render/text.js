@@ -76,7 +76,25 @@ function defaultEngineTimer(fn, ms) {
  * 都是可替换接口，未注入时给可调用空实现，避免 `is not a function`。
  */
 function applyEngineHost(engine, opts) {
-  engine.isScreensaver = !!opts.isScreensaver
+  // 官方 IEngine 的运行形态查询都是方法（全库调用形态 100% 是 `engine.isScreensaver()`）
+  const screensaver = !!opts.isScreensaver
+  engine.isScreensaver = () => screensaver
+  engine.isWallpaper = () => !screensaver
+  engine.isDesktopDevice = () => true
+  engine.isMobileDevice = () => false
+  // WE 的 frametime 恒 > 0。宿主在首帧 / 同时间戳帧会写 0，Free Cam 的
+  // `frametime * (1 / frametime)` 得 NaN，距离被污染后逐帧 TypeError（3281559867）——
+  // 非正值忽略，保留上一帧的值。
+  let frametime = Number(engine.frametime) > 0 ? Number(engine.frametime) : 1 / 60
+  Object.defineProperty(engine, 'frametime', {
+    get: () => frametime,
+    set: (v) => {
+      const n = Number(v)
+      if (n > 0 && Number.isFinite(n)) frametime = n
+    },
+    enumerable: true,
+    configurable: true,
+  })
   if (typeof opts.isRunningInEditor === 'boolean') engine.isRunningInEditor = dualFlag(opts.isRunningInEditor)
   if (!engine.setInterval) engine.setInterval = opts.setInterval || defaultEngineTimer
   if (!engine.setTimeout) engine.setTimeout = opts.setTimeout || defaultEngineTimer
@@ -109,9 +127,27 @@ function applyEngineHost(engine, opts) {
 
 // WE 脚本 Vec3 类（官方 3D 时钟阴影脚本等使用）。构造器接受 (x,y,z) / (对象, z) /
 // (数字)，对象按 x||width、y||height 取值（engine.canvasSize 会被直接传入做除法）。
+//
+// 方法面对齐官方 assets/scripts/jsclasses/baseclasses.js。所有运算结果经 `_new`
+// 走 `this.constructor`，Vec2 上的运算仍得 Vec2（作者靠 `v.constructor` 分派维度）。
+const VEC_EPS = 0.00001
+const VEC_D2R = Math.PI / 180
+const VEC_R2D = 180 / Math.PI
+const vecComp = (v, k) => (typeof v === 'number' ? v : v[k])
+const smooth01 = (lo, hi, x) => {
+  const t = Math.max(0, Math.min(1, (x - lo) / (hi - lo)))
+  return t * t * (3 - 2 * t)
+}
+
 class Vec3 {
   constructor(x, y, z) {
-    if (x !== null && typeof x === 'object') {
+    if (typeof x === 'string') {
+      // 官方允许 `new Vec3("1 2 3")`（属性默认值/配置串的写法）
+      const p = x.trim().split(/\s+/)
+      this.x = parseFloat(p[0]) || 0
+      this.y = parseFloat(p[1]) || 0
+      this.z = parseFloat(p[2]) || 0
+    } else if (x !== null && typeof x === 'object') {
       this.x = x.x !== undefined ? x.x : x.width || 0
       // [we-scene patch] 首参是向量时**第二参是 z**（WE 的 `new Vec3(vec, z)` 形态）。
       // 2890473419 透视模板 `new Vec3(engine.canvasSize.divide(r), 1)` 要的是
@@ -133,25 +169,39 @@ class Vec3 {
       this.z = Number(z) || 0
     }
   }
-  add(v) { const o = new Vec3(v); return new Vec3(this.x + o.x, this.y + o.y, this.z + o.z) }
-  subtract(v) { const o = new Vec3(v); return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z) }
+  static fromSpherical(r, theta, phi) {
+    const t = theta * VEC_D2R
+    const p = phi * VEC_D2R
+    const st = Math.sin(t)
+    return new Vec3(r * st * Math.cos(p), r * Math.cos(t), r * st * Math.sin(p))
+  }
+  _new(x, y, z) { return new this.constructor(x, y, z) }
+  add(v) { const o = new Vec3(v); return this._new(this.x + o.x, this.y + o.y, this.z + o.z) }
+  subtract(v) { const o = new Vec3(v); return this._new(this.x - o.x, this.y - o.y, this.z - o.z) }
   multiply(v) {
-    if (v && typeof v === 'object') return new Vec3(this.x * v.x, this.y * v.y, this.z * v.z)
-    return new Vec3(this.x * v, this.y * v, this.z * v)
+    if (v && typeof v === 'object') return this._new(this.x * v.x, this.y * v.y, this.z * (v.z || 0))
+    return this._new(this.x * v, this.y * v, this.z * v)
   }
   divide(v) {
-    const safe = (a, b) => (b === 0 ? 0 : a / b)
-    if (v && typeof v === 'object') return new Vec3(safe(this.x, v.x), safe(this.y, v.y), safe(this.z, v.z))
-    return new Vec3(safe(this.x, v), safe(this.y, v), safe(this.z, v))
+    const safe = (a, b) => (b === 0 || b === undefined ? 0 : a / b)
+    if (v && typeof v === 'object') return this._new(safe(this.x, v.x), safe(this.y, v.y), safe(this.z, v.z))
+    return this._new(safe(this.x, v), safe(this.y, v), safe(this.z, v))
   }
-  copy() { return new Vec3(this.x, this.y, this.z) }
+  copy() { return this._new(this.x, this.y, this.z) }
   // 3790527023 按钮：`currentScale = currentScale.mix(targetScale, frametime)`。
   // t 不夹取：模板传的是 `frametime * SPEED`，经常 > 1。
   mix(v, t) {
     const o = new Vec3(v)
+    if (t !== null && typeof t === 'object') {
+      return this._new(
+        this.x + (o.x - this.x) * (t.x || 0),
+        this.y + (o.y - this.y) * (t.y || 0),
+        this.z + (o.z - this.z) * (t.z || 0),
+      )
+    }
     const k = Number(t)
     const a = Number.isFinite(k) ? k : 0
-    return new Vec3(
+    return this._new(
       this.x + (o.x - this.x) * a,
       this.y + (o.y - this.y) * a,
       this.z + (o.z - this.z) * a,
@@ -161,18 +211,196 @@ class Vec3 {
   // [we-scene patch] WE Vec3 的平方长度（1712475860 金币距离判定在用；
   // makeVec3 同款缺口的另一处补齐）。
   lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z }
+  distance(v) { return Math.sqrt(this.distanceSqr(v)) }
+  distanceSqr(v) {
+    const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - (v.z || 0)
+    return dx * dx + dy * dy + dz * dz
+  }
   normalize() {
     const l = this.length()
-    return l === 0 ? new Vec3(0, 0, 0) : new Vec3(this.x / l, this.y / l, this.z / l)
+    return l === 0 ? this._new(0, 0, 0) : this._new(this.x / l, this.y / l, this.z / l)
   }
+  equals(v) {
+    if (!(v instanceof Vec3)) return false
+    return Math.abs(this.x - v.x) < VEC_EPS && Math.abs(this.y - v.y) < VEC_EPS && Math.abs(this.z - v.z) < VEC_EPS
+  }
+  isFinite() { return Number.isFinite(this.x) && Number.isFinite(this.y) && Number.isFinite(this.z) }
+  negate() { return this._new(-this.x, -this.y, -this.z) }
   dot(v) { const o = new Vec3(v); return this.x * o.x + this.y * o.y + this.z * o.z }
+  cross(v) {
+    const vz = v.z || 0
+    return this._new(this.y * vz - this.z * v.y, this.z * v.x - this.x * vz, this.x * v.y - this.y * v.x)
+  }
+  // 2955378002 弹跳 logo：`direction = direction.reflect(new Vec3(1, 0))`
+  reflect(n) { return this.subtract(new Vec3(n).multiply(2 * this.dot(n))) }
+  refract(n, eta) {
+    const ni = new Vec3(n).dot(this)
+    const k = 1 - eta * eta * (1 - ni * ni)
+    if (k < 0) return this._new(0, 0, 0)
+    return this.multiply(eta).subtract(new Vec3(n).multiply(eta * ni + Math.sqrt(k)))
+  }
+  project(v) {
+    const o = new Vec3(v)
+    const d = o.lengthSqr()
+    if (d === 0) return this._new(0, 0, 0)
+    const k = this.dot(o) / d
+    return this._new(o.x * k, o.y * k, o.z * k)
+  }
+  angleBetween(v) {
+    const o = new Vec3(v)
+    const den = Math.sqrt(this.lengthSqr() * o.lengthSqr())
+    if (den === 0) return 0
+    return Math.acos(Math.max(-1, Math.min(1, this.dot(o) / den))) * VEC_R2D
+  }
+  toSpherical() {
+    const r = this.length()
+    if (r === 0) return new Vec3(0, 0, 0)
+    return new Vec3(r, Math.acos(this.y / r) * VEC_R2D, Math.atan2(this.z, this.x) * VEC_R2D)
+  }
+  _map(f) { return this._new(f(this.x), f(this.y), f(this.z)) }
+  _zip(v, f) { return this._new(f(this.x, vecComp(v, 'x')), f(this.y, vecComp(v, 'y')), f(this.z, vecComp(v, 'z') || 0)) }
+  min(v) { return this._zip(v, Math.min) }
+  max(v) { return this._zip(v, Math.max) }
+  clamp(lo, hi) {
+    return this._new(
+      Math.max(vecComp(lo, 'x'), Math.min(vecComp(hi, 'x'), this.x)),
+      Math.max(vecComp(lo, 'y'), Math.min(vecComp(hi, 'y'), this.y)),
+      Math.max(vecComp(lo, 'z') || 0, Math.min(vecComp(hi, 'z') || 0, this.z)),
+    )
+  }
+  abs() { return this._map(Math.abs) }
+  sign() { return this._map(Math.sign) }
+  round() { return this._map(Math.round) }
+  floor() { return this._map(Math.floor) }
+  ceil() { return this._map(Math.ceil) }
+  fract() { return this._map((a) => a - Math.floor(a)) }
+  mod(v) { return this._zip(v, (a, b) => (b ? a - b * Math.floor(a / b) : 0)) }
+  step(edge) { return this._zip(edge, (a, e) => (a < e ? 0 : 1)) }
+  smoothStep(lo, hi) {
+    return this._new(
+      smooth01(vecComp(lo, 'x'), vecComp(hi, 'x'), this.x),
+      smooth01(vecComp(lo, 'y'), vecComp(hi, 'y'), this.y),
+      smooth01(vecComp(lo, 'z') || 0, vecComp(hi, 'z') || 0, this.z),
+    )
+  }
   toString() { return this.x + ' ' + this.y + ' ' + this.z }
+  toConfigString() { return this.toString() }
 }
 
-// WE 另有 Vec2。构造 (x, y) 时 Vec3 的 z 落成 0，算术与 Vec3 同构。
-// 全库 17 处 / 13 张：3791967416 聚光灯 `new Vec2(cursor/screenRes)`，
-// 音频条模板 `bar.parallaxDepth = new Vec2(0,0)`。不注入是 ReferenceError 熔断。
-const Vec2 = Vec3
+// WE 的 Vec2 是独立类型。全库 17 处 / 13 张：3791967416 聚光灯
+// `new Vec2(cursor/screenRes)`，音频条模板 `bar.parallaxDepth = new Vec2(0,0)`。
+// 不能是 Vec3 的别名：3363252053 等 9 张的相等判断按 `switch (v.constructor)
+// { case Vec2: …2 维; case Vec3: …3 维 }` 分派，别名会让所有 Vec3 只比 x/y。
+// 继承 Vec3 是为了宿主侧 `instanceof Vec3` 与 asScriptVec3 照常放行；z 恒为 0。
+class Vec2 extends Vec3 {
+  constructor(x, y) {
+    super(0, 0, 0)
+    if (typeof x === 'string') {
+      const p = x.trim().split(/\s+/)
+      this.x = parseFloat(p[0]) || 0
+      this.y = parseFloat(p[1]) || 0
+    } else if (x !== null && typeof x === 'object') {
+      this.x = x.x !== undefined ? Number(x.x) || 0 : x.width || 0
+      this.y = x.y !== undefined ? Number(x.y) || 0 : x.height || 0
+    } else if (x !== undefined) {
+      this.x = Number(x) || 0
+      this.y = typeof y === 'number' ? y || 0 : this.x
+    }
+  }
+  _new(x, y) { return new Vec2(x, y) }
+  equals(v) {
+    if (!(v instanceof Vec2)) return false
+    return Math.abs(this.x - v.x) < VEC_EPS && Math.abs(this.y - v.y) < VEC_EPS
+  }
+  perpendicular() { return new Vec2(this.y, -this.x) }
+  angle() { return Math.atan2(this.y, this.x) * VEC_R2D }
+  angleBetween(v) { return Math.atan2(this.x * v.y - this.y * v.x, this.x * v.x + this.y * v.y) * VEC_R2D }
+  rotate(angle) {
+    const r = angle * VEC_D2R
+    const c = Math.cos(r), s = Math.sin(r)
+    return new Vec2(c * this.x - s * this.y, s * this.x + c * this.y)
+  }
+  toString() { return this.x + ' ' + this.y }
+}
+
+class Vec4 {
+  constructor(x, y, z, w) {
+    if (typeof x === 'string') {
+      const p = x.trim().split(/\s+/)
+      this.x = parseFloat(p[0]) || 0
+      this.y = parseFloat(p[1]) || 0
+      this.z = parseFloat(p[2]) || 0
+      this.w = parseFloat(p[3]) || 0
+    } else if (x !== null && typeof x === 'object') {
+      this.x = Number(x.x) || 0
+      this.y = Number(x.y) || 0
+      this.z = Number(x.z) || 0
+      this.w = Number(x.w) || 0
+    } else if (x !== undefined) {
+      this.x = Number(x) || 0
+      // NaN 一律落 0（与 Vec3 的 `Number(v) || 0` 一致），否则 NaN 会顺着反馈链传下去
+      this.y = typeof y === 'number' ? y || 0 : this.x
+      this.z = typeof z === 'number' ? z || 0 : typeof y === 'number' ? 0 : this.x
+      this.w = typeof w === 'number' ? w || 0 : typeof z === 'number' ? this.z : typeof y === 'number' ? 0 : this.x
+    } else {
+      this.x = 0; this.y = 0; this.z = 0; this.w = 0
+    }
+  }
+  _zip(v, f) {
+    return new Vec4(
+      f(this.x, vecComp(v, 'x') || 0), f(this.y, vecComp(v, 'y') || 0),
+      f(this.z, vecComp(v, 'z') || 0), f(this.w, vecComp(v, 'w') || 0),
+    )
+  }
+  _map(f) { return new Vec4(f(this.x), f(this.y), f(this.z), f(this.w)) }
+  length() { return Math.sqrt(this.lengthSqr()) }
+  lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w }
+  distance(v) { return this.subtract(v).length() }
+  distanceSqr(v) { return this.subtract(v).lengthSqr() }
+  normalize() { const l = this.length(); return l === 0 ? new Vec4(0, 0, 0, 0) : this.divide(l) }
+  copy() { return new Vec4(this.x, this.y, this.z, this.w) }
+  equals(v) {
+    if (!(v instanceof Vec4)) return false
+    return Math.abs(this.x - v.x) < VEC_EPS && Math.abs(this.y - v.y) < VEC_EPS &&
+      Math.abs(this.z - v.z) < VEC_EPS && Math.abs(this.w - v.w) < VEC_EPS
+  }
+  isFinite() { return [this.x, this.y, this.z, this.w].every(Number.isFinite) }
+  negate() { return this._map((a) => -a) }
+  add(v) { return this._zip(v, (a, b) => a + b) }
+  subtract(v) { return this._zip(v, (a, b) => a - b) }
+  multiply(v) { return this._zip(v, (a, b) => a * b) }
+  divide(v) { return this._zip(v, (a, b) => (b === 0 ? 0 : a / b)) }
+  dot(v) { return this.x * v.x + this.y * v.y + this.z * (v.z || 0) + this.w * (v.w || 0) }
+  reflect(n) { return this.subtract(new Vec4(n).multiply(2 * this.dot(n))) }
+  project(v) {
+    const o = new Vec4(v)
+    const d = o.lengthSqr()
+    return d === 0 ? new Vec4(0, 0, 0, 0) : o.multiply(this.dot(o) / d)
+  }
+  mix(v, t) {
+    return new Vec4(
+      this.x + ((v.x || 0) - this.x) * vecComp(t, 'x'), this.y + ((v.y || 0) - this.y) * vecComp(t, 'y'),
+      this.z + ((v.z || 0) - this.z) * vecComp(t, 'z'), this.w + ((v.w || 0) - this.w) * vecComp(t, 'w'),
+    )
+  }
+  min(v) { return this._zip(v, Math.min) }
+  max(v) { return this._zip(v, Math.max) }
+  clamp(lo, hi) { return this.max(lo).min(hi) }
+  abs() { return this._map(Math.abs) }
+  sign() { return this._map(Math.sign) }
+  round() { return this._map(Math.round) }
+  floor() { return this._map(Math.floor) }
+  ceil() { return this._map(Math.ceil) }
+  fract() { return this._map((a) => a - Math.floor(a)) }
+  mod(v) { return this._zip(v, (a, b) => (b ? a - b * Math.floor(a / b) : 0)) }
+  step(edge) { return this._zip(edge, (a, e) => (a < e ? 0 : 1)) }
+  smoothStep(lo, hi) {
+    const k = ['x', 'y', 'z', 'w'].map((c) => smooth01(vecComp(lo, c), vecComp(hi, c), this[c]))
+    return new Vec4(k[0], k[1], k[2], k[3])
+  }
+  toString() { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w }
+  toConfigString() { return this.toString() }
+}
 
 /**
  * 把 `{x,y,z}` 字面量升到 Vec3 原型，保持**同一对象身份**。
@@ -278,6 +506,8 @@ export function createInputView() {
 // WE 内置脚本库 WEMath（`import * as WEMath from 'WEMath'`，import 行被剥掉后由
 // 沙箱以同名全局提供）。全库 335 个脚本实际只用到 mix，其余按 WE 语义补常见项。
 const WEMATH = {
+  deg2rad: VEC_D2R,
+  rad2deg: VEC_R2D,
   mix: (a, b, t) => a + (b - a) * t,
   lerp: (a, b, t) => a + (b - a) * t,
   clamp: (v, lo, hi) => Math.min(hi, Math.max(lo, v)),
@@ -340,10 +570,12 @@ const WECOLOR = {
     }
     return new Vec3(h, mx === 0 ? 0 : d / mx, mx)
   },
+  normalizeColor: (c) => new Vec3((c.x || 0) / 255, (c.y || 0) / 255, (c.z || 0) / 255),
+  expandColor: (c) => new Vec3((c.x || 0) * 255, (c.y || 0) * 255, (c.z || 0) * 255),
 }
 
-// [we-scene patch] WE 内置脚本库 WEVector（全库 3 个脚本 import 它）。
-// 缺失同样是 ReferenceError 熔断，只补语料会用到的分量运算。
+// [we-scene patch] WE 内置脚本库 WEVector（全库 22 张壁纸 import 它）。
+// 缺失同样是 ReferenceError 熔断。add…mix 是早期按语料补的非官方扩展，保留无害。
 const WEVECTOR = {
   add: (a, b) => ({ x: (a.x || 0) + (b.x || 0), y: (a.y || 0) + (b.y || 0), z: (a.z || 0) + (b.z || 0) }),
   subtract: (a, b) => ({ x: (a.x || 0) - (b.x || 0), y: (a.y || 0) - (b.y || 0), z: (a.z || 0) - (b.z || 0) }),
@@ -359,20 +591,11 @@ const WEVECTOR = {
     y: (a.y || 0) + ((b.y || 0) - (a.y || 0)) * t,
     z: (a.z || 0) + ((b.z || 0) - (a.z || 0)) * t,
   }),
-  // [we-scene patch 2026-09-28] `vectorAngle2`：两向量夹角（**带符号**，绕 y 轴），
-  // 单位与 WE 的 angles 一致（度）。Free Cam by Gariam 用它把鼠标位移转成偏航增量
-  // （`rotateAngles(axis, WEVector.vectorAngle2(a, b))`），缺失即 TypeError 熔断。
-  // 实现：先按 x-z 平面投影算夹角，再按叉积的 y 分量判正负。
-  vectorAngle2: (a, b) => {
-    const ax = a.x || 0, az = a.z || 0
-    const bx = b.x || 0, bz = b.z || 0
-    const la = Math.hypot(ax, az) || 1
-    const lb = Math.hypot(bx, bz) || 1
-    const cos = Math.max(-1, Math.min(1, (ax * bx + az * bz) / (la * lb)))
-    const ang = (Math.acos(cos) * 180) / Math.PI
-    const cross = ax * bz - az * bx
-    return cross < 0 ? -ang : ang
-  },
+  // 以下两个是官方 jsmodules/wevector.js 的全部导出，语义照抄（单位：度）。
+  // Free Cam（3281559867）`180 + WEVector.vectorAngle2(new Vec2(dx, dz))` 是**单参**；
+  // 圆周排布模板（21 张）`new Vec3(WEVector.angleVector2(angle)).multiply(r)`。
+  vectorAngle2: (d) => Math.atan2(d.y || 0, d.x || 0) * VEC_R2D,
+  angleVector2: (angle) => new Vec2(Math.cos(angle * VEC_D2R), Math.sin(angle * VEC_D2R)),
 }
 
 // [we-scene patch] WE 的媒体播放状态枚举。取值由语料反推确定：
@@ -384,6 +607,25 @@ const MEDIA_PLAYBACK_EVENT = Object.freeze({
   PLAYBACK_PLAYING: 1,
   PLAYBACK_PAUSED: 2,
 })
+
+// 媒体事件进沙箱前把颜色等向量字段换成沙箱 Vec3。宿主侧颜色来自 media.js 的
+// MediaVec3 / 公共 API 的 Color，方法面都不全：11 张壁纸的封面主色渐变写
+// `oldColor.mix(event.primaryColor, t)`，拿到它们会 TypeError。
+const scriptMediaEvents = new WeakMap()
+function toScriptMediaEvent(event) {
+  if (!event || typeof event !== 'object') return event
+  let out = scriptMediaEvents.get(event)
+  if (out) return out
+  out = { ...event }
+  for (const k of Object.keys(out)) {
+    const v = out[k]
+    if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Vec3) && typeof v.x === 'number') {
+      out[k] = new Vec3(v.x, v.y, v.z)
+    }
+  }
+  scriptMediaEvents.set(event, out)
+  return out
+}
 
 // [we-scene patch] 媒体回调名。两个沙箱都要收集并暴露给宿主派发。
 // 前四个是 WE 原生；mediaLyricsChanged 是本仓库的自定义扩展（见 render/media.js）。
@@ -403,17 +645,23 @@ const SANDBOX_PARAM_NAMES = [
   'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
   'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
   'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
-  'Vec3', 'Vec2', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
+  'Vec3', 'Vec2', 'Vec4', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
   // [we-scene patch] 媒体播放状态枚举。全库 111 处脚本裸用
   // `MediaPlaybackEvent.PLAYBACK_PLAYING` 之类做状态比较，不注入会 ReferenceError
   // 熔断（三振后整个 update 停摆）。既然进了形参表，就必须同时列在这里，
   // 否则脚本顶层若声明同名变量会 SyntaxError 报废整个脚本。
   'MediaPlaybackEvent',
 ]
+// 行内空白：JS 把 NBSP/全角空格/BOM 都当空白，富文本编辑器粘贴来的脚本常带 NBSP
+//（9 张壁纸的 `export\u00a0var scriptProperties` 因只认 [ \t] 而没被剥，整段 SyntaxError）。
+const HWS = '[ \\t\\u00a0\\u3000\\ufeff]'
 const SANDBOX_PARAM_DECL_RE = new RegExp(
-  `(^[ \\t]*|;|\\})[ \\t]*(?:var|let|const)[ \\t]+(?=(?:${SANDBOX_PARAM_NAMES.join('|')})\\b)`,
+  `(^${HWS}*|;|\\})${HWS}*(?:var|let|const)${HWS}+(?=(?:${SANDBOX_PARAM_NAMES.join('|')})\\b)`,
   'gm',
 )
+const IMPORT_STAR_RE = new RegExp(`\\bimport\\s*\\*\\s*as\\s+(\\w+)\\s+from\\s*['"]([^'"]+)['"]\\s*;?`, 'g')
+const IMPORT_LINE_RE = new RegExp(`(^${HWS}*|;|\\})${HWS}*import\\s+(?:[^;'"]+\\s+from\\s+)?['"][^'"]*['"];?${HWS}*`, 'gm')
+const EXPORT_DECL_RE = new RegExp(`(^${HWS}*|;|\\})${HWS}*export${HWS}+(?=(?:async${HWS}+)?function\\b|(?:var|let|const)\\b)`, 'gm')
 
 const WE_IMPORT_MODULES = { WEMath: true, WEColor: true, WEVector: true }
 
@@ -445,15 +693,17 @@ export function rewriteComboStringEq(src) {
 
 function scriptToFunctionBody(script) {
   return rewriteComboStringEq(script)
-    .replace(/\bimport\s*\*\s*as\s+(\w+)\s+from\s*['"]([^'"]+)['"]\s*;?/g, (_, alias, spec) => {
-      const mod = String(spec)
+    .replace(IMPORT_STAR_RE, (_, alias, spec) => {
+      // 混淆器把模块名写成转义串（3463692991：'\x57\x45\x4d\x61\x74\x68' = WEMath）
+      const mod = String(spec).replace(/\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})/g, (_m, h, u) =>
+        String.fromCharCode(parseInt(h || u, 16)))
       if (WE_IMPORT_MODULES[mod]) {
         return alias === mod ? '' : `var ${alias} = ${mod};`
       }
       return `var ${alias} = {};`
     })
-    .replace(/(^[ \t]*|;|\})[ \t]*import\s+(?:[^;'"]+\s+from\s+)?['"][^'"]*['"];?[ \t]*/gm, '$1')
-    .replace(/(^[ \t]*|;|\})[ \t]*export[ \t]+(?=(?:async[ \t]+)?function\b|(?:var|let|const)\b)/gm, '$1')
+    .replace(IMPORT_LINE_RE, '$1')
+    .replace(EXPORT_DECL_RE, '$1')
     .replace(SANDBOX_PARAM_DECL_RE, '$1')
 }
 
@@ -720,6 +970,15 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       enumerable: true,
       configurable: true,
     })
+    // 文字层同为 ILayer：getParent/getChildren/getEffect/getAnimation… 借对象代理的实现
+    // （3802432712 的 Song Title 在 text 脚本里 `thisLayer.getParent()`）。只补方法，
+    // 不覆盖上面的快照/写穿字段。
+    const objProxy = makeObjectLayerProxy(L, opts)
+    for (const k of Object.getOwnPropertyNames(objProxy)) {
+      if (k in thisLayer) continue
+      const d = Object.getOwnPropertyDescriptor(objProxy, k)
+      if (d && typeof d.value === 'function') thisLayer[k] = d.value
+    }
   }
   const engine = {
     // [we-scene patch] registerAsset 必须把路径**原样返回**：脚本拿到的返回值
@@ -816,7 +1075,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
       'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
       'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
-      'Vec3', 'Vec2', 'input',
+      'Vec3', 'Vec2', 'Vec4', 'input',
       'MediaPlaybackEvent', 'localStorage',
       // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
       // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
@@ -853,9 +1112,11 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       sandboxGlobal.console, undefined, sandboxGlobal, sandboxGlobal, sandboxGlobal,
       undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      // 裸 setTimeout 系列走引擎计时器（宿主管理、卸载即清）：2955378002 音量条
+      // init 里 `setTimeout(() => bar.visible = true, 10)`，遮成 undefined 会熔断
+      undefined, undefined, undefined, engine.setTimeout, engine.setInterval, engine.clearTimeout, engine.clearInterval,
       undefined, undefined, undefined, undefined,
-      Vec3, Vec2, input,
+      Vec3, Vec2, Vec4, input,
       MEDIA_PLAYBACK_EVENT,
       // [we-scene patch] 文字沙箱也拿按壁纸共享的 localStorage（P1-2）：
       // 此前形参表里没有 localStorage，脚本读它得到的是消毒全局上的 undefined，
@@ -1010,7 +1271,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
-        return fn(event)
+        return fn(toScriptMediaEvent(event))
       } catch (e) {
         noteEntryErr('cursor', e)
         return undefined
@@ -1092,9 +1353,12 @@ function makeNeutralAnimation() {
     // isPlaying 两种调用形态都有：属性读（`if (a.isPlaying)`）与方法调
     // （`if (a.isPlaying())`）。用函数并挂 valueOf/toString，两种写法都不炸。
     isPlaying: Object.assign(() => false, { valueOf: () => false, toString: () => 'false' }),
+    getFrame: () => 0,
     get frame() { return 0 },
     get frameCount() { return 0 },
+    get duration() { return 0 },
     get rate() { return 1 },
+    set rate(_) {},
   }
   return self
 }
@@ -1123,12 +1387,15 @@ function makeTextureAnimation(layer) {
     frame: null, // null = 未被脚本钉帧（走时间自动播）
     playing: true,
     rate: 1,
+    // 渲染端推进的播放相位（秒）；stop() 置 restart，渲染端归零后 play() 从头播
+    restart: false,
+    phase: 0,
   }
   const api = {
     play: () => { state.playing = true; return api },
     pause: () => { state.playing = false; return api },
-    // stop 语义上是「停并回到起点」；脚本随后基本都会 setFrame，故只落 playing
-    stop: () => { state.playing = false; return api },
+    // stop = 停并回到起点。3363252053 烟花：播到末帧 stop()，延时后 play() 重放
+    stop: () => { state.playing = false; state.restart = true; return api },
     setFrame: (n) => {
       // 语料里传布尔（`setFrame(shared.x * 1)` 里 x 可能是布尔）、越界数都有，
       // 一律转数字，夹取交给渲染端（它才知道帧总数）
@@ -1143,9 +1410,13 @@ function makeTextureAnimation(layer) {
       valueOf: () => state.playing,
       toString: () => String(state.playing),
     }),
+    // 官方 ITextureAnimation.getFrame()：当前显示帧。自动播放时由渲染端回写
+    getFrame: () => (state.frame !== null ? state.frame : layer.spriteFrameIndex || 0),
     get frame() { return state.frame === null ? 0 : state.frame },
     get frameCount() { return layer.spriteFrameCount || 0 },
+    get duration() { return layer.spriteDuration || 0 },
     get rate() { return state.rate },
+    set rate(r) { const v = Number(r); if (Number.isFinite(v)) state.rate = v },
   }
   state.api = api
   layer.textureAnimation = state
@@ -1336,6 +1607,13 @@ function makeBoneApi(layer, overrides) {
 
   return {
     getBoneCount: () => count,
+    // 按骨骼名查下标；找不到返回 0（根骨）——Gariam 父子脚本（3509578940）以 `== 0` 判未命中
+    getBoneIndex: (name) => {
+      if (!bones) return 0
+      const s = String(name ?? '')
+      const k = bones.findIndex((b) => b && b.name === s)
+      return k > 0 ? k : 0
+    },
     getBoneTransform: (i) => {
       const k = Math.floor(Number(i))
       if (!bones || !(k >= 0) || k >= count) {
@@ -1359,6 +1637,76 @@ function makeBoneApi(layer, overrides) {
     },
     // 见函数头「已知边界」
     applyBonePhysicsImpulse: () => {},
+  }
+}
+
+/**
+ * 官方 IParticleSystem（thisLayer.getParticleSystem()）：`instance` 是
+ * IParticleSystemInstance 的倍率（写入即落到该层全部粒子系统），play/pause/stop
+ * 控制发射。非粒子层也返回句柄（全部空操作）——3448877775 直接对返回值写 `.rate`。
+ * 宿主经 opts.getParticleSystems(layer) 提供该层的系统列表。
+ */
+const PS_INSTANCE_KEYS = ['alpha', 'size', 'count', 'speed', 'lifetime', 'rate', 'brightness']
+function makeParticleSystemHandle(layer, opts) {
+  const list = () => {
+    try {
+      const fn = opts && opts.getParticleSystems
+      const l = typeof fn === 'function' && layer ? fn(layer) : null
+      return Array.isArray(l) ? l : []
+    } catch {
+      return []
+    }
+  }
+  const vals = {}
+  let paused = false
+  let stopped = false
+  const instance = {}
+  for (const k of PS_INSTANCE_KEYS) {
+    Object.defineProperty(instance, k, {
+      enumerable: true,
+      get: () => (vals[k] === undefined ? 1 : vals[k]),
+      set: (v) => {
+        const n = Number(v)
+        if (!Number.isFinite(n)) return
+        vals[k] = n
+        if (k === 'count' && (paused || stopped)) return
+        for (const ps of list()) ps.setOverrideValue(k, n)
+      },
+    })
+  }
+  // colorn / controlpointN：只存值（本仓粒子侧尚无逐帧写入口）
+  const resumeEmission = () => {
+    const n = vals.count === undefined ? 1 : vals.count
+    for (const ps of list()) ps.setOverrideValue('count', n)
+  }
+  return {
+    instance,
+    play() {
+      paused = false
+      stopped = false
+      resumeEmission()
+    },
+    pause() {
+      paused = true
+      for (const ps of list()) ps.setOverrideValue('count', 0)
+    },
+    stop() {
+      stopped = true
+      for (const ps of list()) {
+        ps.setOverrideValue('count', 0)
+        if (Array.isArray(ps.pool)) for (const p of ps.pool) if (p) p.alive = false
+      }
+    },
+    isPlaying: () => !paused && !stopped && list().length > 0,
+    emitParticles(count) {
+      try {
+        const fn = opts && opts.emitParticles
+        if (typeof fn !== 'function' || !layer) return 0
+        return fn(layer, count) | 0
+      } catch {
+        return 0
+      }
+    },
   }
 }
 
@@ -1463,7 +1811,8 @@ function makeEffectHandle(eff, opts) {
       // 还没解析出 materialPasses（或该效果没有 pass 记录）时，退化到
       // 场景数据里那条 pass 的 constantshadervalues —— 脚本读写的就是它。
       if (!mp && eff && Array.isArray(eff.passes)) mp = eff.passes[Number(index)] || null
-      if (!mp) return null
+      // 取不到 pass 也给可读写临时袋：2922240701 的 `getMaterial(0).color = c` 不判空
+      if (!mp) mp = {}
       mp.constantshadervalues = mp.constantshadervalues || {}
       const bag = makeMaterialBag(mp.constantshadervalues, opts)
       return bag || mp.constantshadervalues
@@ -1831,6 +2180,7 @@ function makeObjectLayerProxy(layer, opts) {
       ? makeBoneApi(layer, boneOverrides)
       : {
           getBoneCount: () => 0,
+          getBoneIndex: () => 0,
           getBoneTransform: () => {
             // 注意 translation 必须支持**无参 getter**：语料里 14 次这样用，
             // 返回 undefined 会让紧接的 .copy()/.subtract() 立刻 TypeError。
@@ -2021,6 +2371,7 @@ function makeObjectLayerProxy(layer, opts) {
         return 0
       }
     },
+    getParticleSystem: () => makeParticleSystemHandle(layer, opts),
     getEffect: (key) => {
       const list = (layer && layer.effects) || null
       if (!list || list.length === 0) return makeEffectHandle(null, opts)
@@ -2259,7 +2610,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
       'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
       'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
-      'Vec3', 'Vec2', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
+      'Vec3', 'Vec2', 'Vec4', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
       'MediaPlaybackEvent',
       // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
       // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
@@ -2297,9 +2648,11 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       sandboxGlobal.console, undefined, sandboxGlobal, sandboxGlobal, sandboxGlobal,
       undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      // 裸 setTimeout 系列走引擎计时器（宿主管理、卸载即清）：2955378002 音量条
+      // init 里 `setTimeout(() => bar.visible = true, 10)`，遮成 undefined 会熔断
+      undefined, undefined, undefined, engine.setTimeout, engine.setInterval, engine.clearTimeout, engine.clearInterval,
       undefined, undefined, undefined, undefined,
-      Vec3, Vec2, input, thisLayer, thisScene, thisLayer,
+      Vec3, Vec2, Vec4, input, thisLayer, thisScene, thisLayer,
       // [we-scene patch] 按壁纸共享的同一份存储（opts.storage，P1-2）：
       // 五 eval 点注入同一实例，脚本间互相可见；未注入时 makeSandboxStorage
       // 内部退化为进程内 Map（离线 verifier 路径）。
@@ -2421,7 +2774,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
       try {
-        return fn(event)
+        return fn(toScriptMediaEvent(event))
       } catch (e) {
         noteEntryErr('cursor', e)
         return undefined

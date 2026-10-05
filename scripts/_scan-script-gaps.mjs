@@ -41,6 +41,19 @@ const KNOWN_INPUT = new Set([
   "cursorLeftDown", "x", "y", "z",
 ]);
 
+// 官方 assets/scripts/jsclasses/baseclasses.js 里 Vec2/Vec3/Vec4/Mat3/Mat4 的实例方法全集。
+const OFFICIAL_VEC_METH = [
+  "length", "lengthSqr", "distance", "distanceSqr", "normalize", "copy", "equals", "isFinite",
+  "negate", "add", "subtract", "multiply", "divide", "dot", "cross", "reflect", "refract",
+  "perpendicular", "project", "angle", "angleBetween", "rotate", "mix", "min", "max", "clamp",
+  "abs", "sign", "round", "floor", "ceil", "fract", "mod", "step", "smoothStep", "toSpherical",
+  "toConfigString", "transformPoint", "transformDirection", "transpose", "inverse",
+  "determinant", "decompose", "translation", "right", "up", "forward", "extractEuler",
+  "normalMatrix", "translate", "scale",
+];
+const vecMethHits = new Map();
+const classHits = new Map();
+
 const engineHits = new Map();
 const sceneHits = new Map();
 const layerMethHits = new Map();
@@ -86,6 +99,11 @@ for (const id of ids) {
       bump(otherHits, m[1], id);
     }
     for (const m of src.matchAll(/\bengine\[/g)) bump(engineHits, "[computed]", id);
+    const meth = new RegExp(`(?<!\\bMath|\\bNumber|\\bconsole|\\bObject|\\bArray|\\bJSON)\\.(${OFFICIAL_VEC_METH.join("|")})\\s*\\(`, "g");
+    for (const m of src.matchAll(meth)) bump(vecMethHits, m[1], id);
+    for (const m of src.matchAll(/\b(Vec2|Vec3|Vec4|Mat3|Mat4)\b(\.\w+|\s*\()?/g)) {
+      bump(classHits, m[1] + (m[2] ? (m[2].startsWith(".") ? m[2] : "()") : ""), id);
+    }
   }
 }
 
@@ -105,3 +123,5 @@ dump("thisScene.*", sceneHits, KNOWN_SCENE);
 dump("thisLayer/thisObject.meth()", layerMethHits, KNOWN_LAYER_METH);
 dump("input.*", inputHits, KNOWN_INPUT);
 dump("其它宿主符号", otherHits, new Set());
+dump("向量/矩阵方法 .meth()（含 WEMath.mix 等同名调用，需人工甄别）", vecMethHits, null);
+dump("向量/矩阵类引用", classHits, null);

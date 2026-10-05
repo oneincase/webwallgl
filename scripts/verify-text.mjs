@@ -607,7 +607,7 @@ function runScripts() {
       if (r !== "2.5") errors.push(`minified import*as 别名未绑到 WEMath：${r}`);
     }
     const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
-    if (!src.includes("import\\s*\\*\\s*as")) {
+    if (!src.includes("import\\s*\\*\\s*as") && !src.includes("import\\\\s*\\\\*\\\\s*as")) {
       errors.push("scriptToFunctionBody 必须匹配 import*as（无空格），否则混淆脚本 SyntaxError");
     }
   }
@@ -819,10 +819,93 @@ function runScripts() {
     }
   }
 
+  // ---- 向量类/内置模块对齐官方 baseclasses.js + jsmodules（WEVector/WEMath/WEColor）----
+  {
+    const sb = wtext.evalObjectScript(
+      "'use strict';\n" +
+        "import * as WEVector from 'WEVector';\n" +
+        "export function update(value) {\n" +
+        "  const eq = (a, b) => { switch (a.constructor) { case Vec2: return 2; case Vec3: return 3; case Vec4: return 4; } return 0 };\n" +
+        "  const v2 = new Vec2(3, 4);\n" +
+        "  return {\n" +
+        "    dims: [eq(new Vec2(1, 2)), eq(new Vec3(1, 2, 3)), eq(new Vec4(1, 2, 3, 4)), eq(v2.add(1))],\n" +
+        "    reflect: new Vec3(1, -1).reflect(new Vec3(0, 1)).toString(),\n" +
+        "    cross: new Vec3(1, 0, 0).cross(new Vec3(0, 1, 0)).toString(),\n" +
+        "    v2str: v2.toString(), v2rot: v2.rotate(90).round().toString(),\n" +
+        "    fromStr: new Vec3('1 2 3').toString(),\n" +
+        "    ang: WEVector.vectorAngle2(new Vec2(0, 1)),\n" +
+        "    av: new Vec3(WEVector.angleVector2(90)).round().toString(),\n" +
+        "    d2r: WEMath.deg2rad, norm: WEColor.normalizeColor(new Vec3(255, 0, 51)).toString(),\n" +
+        "    misc: [new Vec3(-1.5, 2.5, 7).clamp(0, 2).toString(), new Vec3(5, -7, 1).mod(3).toString(),\n" +
+        "      new Vec3(1, 2, 3).equals(new Vec3(1, 2, 3.000001)), new Vec3(0.5).step(0.4).toString()],\n" +
+        "    v4: new Vec4(1, 2, 3, 4).add(new Vec4(1)).toString(),\n" +
+        "  };\n" +
+        "}\n",
+      {},
+      {},
+    );
+    const r = sb && sb.callUpdate({ x: 0, y: 0, z: 0 });
+    const want = {
+      dims: [2, 3, 4, 2],
+      reflect: "1 1 0", cross: "0 0 1", v2str: "3 4", v2rot: "-4 3", fromStr: "1 2 3",
+      ang: 90, av: "0 1 0", d2r: Math.PI / 180, norm: "1 0 0.2",
+      misc: ["0 2 2", "2 2 1", true, "1 1 1"],
+      v4: "2 3 4 5",
+    };
+    if (!r || typeof r !== "object") errors.push("向量 API 用例沙箱构建/执行失败（Vec4/WEVector 未注入？）");
+    else {
+      for (const k of Object.keys(want)) {
+        if (JSON.stringify(r[k]) !== JSON.stringify(want[k])) {
+          errors.push(`向量 API ${k}：期望 ${JSON.stringify(want[k])}，实得 ${JSON.stringify(r[k])}`);
+        }
+      }
+    }
+  }
+
+  // ---- ILayer 补全：getBoneIndex / getParticleSystem / 文字层 getParent / getMaterial 不判空 ----
+  {
+    const setCalls = [];
+    const ps = { pool: [{ alive: true }], setOverrideValue: (k, v) => setCalls.push(`${k}=${v}`) };
+    const parent = { id: 1, name: "box", visible: true };
+    const layer = {
+      id: 2, name: "stars", parentId: 1, origin: [0, 0, 0], scale: [1, 1, 1],
+      puppet: { bones: [{ name: "root", parent: -1, matrix: new Array(16).fill(0) }, { name: "hair", parent: -1, matrix: new Array(16).fill(0) }] },
+      effects: [{ name: "Hue", visible: true, passes: [] }],
+    };
+    const opts = {
+      layer,
+      getSceneLayerById: (id) => (id === 1 ? parent : null),
+      getBoneOverrides: () => new Map(),
+      getParticleSystems: (l) => (l === layer ? [ps] : []),
+    };
+    const sb = wtext.evalObjectScript(
+      "export function update(v) {\n" +
+        "  const p = thisLayer.getParticleSystem();\n" +
+        "  p.instance.alpha = 0.5; p.rate = 3; p.pause(); const playing = p.isPlaying(); p.stop();\n" +
+        "  thisLayer.getEffect('Hue').getMaterial(0).color = new Vec3(1, 0, 0);\n" +
+        "  return { hair: thisLayer.getBoneIndex('hair'), miss: thisLayer.getBoneIndex('nope'), playing, a: p.instance.alpha };\n" +
+        "}\n",
+      {},
+      opts,
+    );
+    const r = sb && sb.callUpdate(true);
+    if (!r || r.hair !== 1 || r.miss !== 0) errors.push(`getBoneIndex 按名查下标/未命中 0，实得 ${JSON.stringify(r)}`);
+    if (r && (r.playing !== false || r.a !== 0.5)) errors.push(`getParticleSystem pause/instance 读回不对：${JSON.stringify(r)}`);
+    if (!setCalls.includes("alpha=0.5") || !setCalls.includes("count=0")) errors.push(`getParticleSystem 未落到粒子系统：${setCalls.join(",")}`);
+    if (ps.pool[0].alive) errors.push("getParticleSystem().stop() 应清掉存活粒子");
+    const tsb = wtext.evalTextScript(
+      "export function update(v) { const p = thisLayer.getParent(); return p ? p.name : 'none'; }\n",
+      {},
+      { ...opts, text: "" },
+    );
+    const tr = tsb && tsb.callUpdate("");
+    if (tr !== "box") errors.push(`文字脚本 thisLayer.getParent() 应返回父层 box，实得 ${tr}`);
+  }
+
   // ---- Vec2 + 效果常量读指针（3791967416 聚光灯 delayedPointer）----
   {
     const src = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/text.js"), "utf8");
-    if (!/const Vec2 = Vec3/.test(src) || !/'Vec2'/.test(src)) {
+    if (!/class Vec2 extends Vec3/.test(src) || !/'Vec2'/.test(src)) {
       errors.push("沙箱未注入 Vec2（3791967416 new Vec2(...) 会 ReferenceError 熔断）");
     }
     const iv = wtext.createInputView();
@@ -1878,7 +1961,7 @@ function runSceneApiGaps() {
     let skipped = 0;
     const sb = wtext.evalObjectScript(
       "export function init(){\n" +
-        "  shared.ss = engine.isScreensaver;\n" +
+        "  shared.ss = engine.isScreensaver();\n" +
         "  shared.title = engine.windowTitle;\n" +
         "  engine.media.skipNext();\n" +
         "}\nexport function update(v){ return v; }\n",
@@ -2192,8 +2275,8 @@ function runEngineTimers() {
     const msrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
     if (!msrc.includes("wtimers.createEngineTimers(")) errors.push("scene-mount 未创建 engineTimers（P1-1 接线被拆）");
     const spreadCount = (msrc.match(/\.\.\.timerOpts/g) || []).length;
-    // 4 个直连 eval 点 + 粒子 override 脚本 + animLayer 脚本（P2-1 新增）= 6
-    if (spreadCount !== 6)
+    // 4 个直连 eval 点 + 粒子 override 脚本 + animLayer visible / blend·rate 脚本 = 7
+    if (spreadCount !== 7)
       errors.push(`四个直连 eval 点 + 两个粒子脚本队列应各有一处 ...timerOpts，实得 ${spreadCount}`);
     if (!/timers:\s*engineTimers/.test(msrc))
       errors.push("setConstantScriptRuntime 未传 timers: engineTimers（效果常量定时器缺口，renderer 只提取白名单字段）");
@@ -2748,8 +2831,8 @@ export function resizeScreen() { throw new Error('boom'); }`,
     const regCalls = (msrc.match(/registerResizeHook\(/g) || []).length;
     // 五个 eval 点各一处调用：文字 / 常量 onSandbox / 效果开关 / 对象字段 / general。
     // 定义形如 `const registerResizeHook = (sb)`（= 号隔开）不被本正则命中。
-    // 5 个 eval 点 + 粒子 override 脚本 + animLayer 脚本 = 7 处
-    if (regCalls !== 7)
+    // 5 个 eval 点 + 粒子 override 脚本 + animLayer visible / blend·rate 脚本 = 8 处
+    if (regCalls !== 8)
       errors.push(`五个 eval 点 + 两个粒子脚本队列都应登记 resize 沙箱，实得 ${regCalls} 处调用`);
     if (!/cssW !== lastResizeW[\s\S]{0,300}dispatchResize\(cssW, cssH\)/.test(msrc))
       errors.push("resize 必须按 CSS 尺寸变化派发（含首帧 lastResizeW=0 哨兵）");
@@ -2871,8 +2954,8 @@ export function update(){ return n; }`,
       errors.push("scene-mount 未创建按壁纸共享的 sceneStorage");
     const inj = (msrc.match(/storage: sceneStorage/g) || []).length;
     // 5 个 eval 点 + 粒子 instanceoverride 脚本 + animationlayers.visible
-    // 脚本（2026-09 P2-1 新增两个逐帧队列，同样共享壁纸存储）= 7 处。
-    if (inj !== 7) errors.push(`五个 eval 点 + 两个粒子脚本队列都应注入 storage: sceneStorage，实得 ${inj}`);
+    // 脚本 + animationlayers.blend/rate 脚本（同样共享壁纸存储）= 8 处。
+    if (inj !== 8) errors.push(`五个 eval 点 + 两个粒子脚本队列都应注入 storage: sceneStorage，实得 ${inj}`);
     if (!/cfg\.storageProvider/.test(msrc))
       errors.push("scene-mount 未支持 cfg.storageProvider（宿主文件后端入口）");
     const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
