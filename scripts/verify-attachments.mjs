@@ -32,6 +32,15 @@ const {
 
 const hypot = (x, y) => Math.hypot(x, y);
 
+// 对照壁纸按本机订阅情况跳过（与其它 verifier「本机无此壁纸」同约定）；
+// 全部缺席时整条校验等于空跑，结尾判失败。
+const FIXTURE_COUNT = 8;
+const skipped = new Set();
+function skipMissing(id) {
+  skipped.add(id);
+  console.log(`   （跳过 ${id}：本机无此壁纸）`);
+}
+
 function loadWallpaper(id) {
   const dir = path.join(LIB, String(id));
   const pkgPath = path.join(dir, "scene.pkg");
@@ -106,7 +115,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3790987854);
   if (!wp) {
-    fail("壁纸库缺少 3790987854");
+    skipMissing("3790987854");
   } else {
     const head = findLayer(wp.scene, "头", "头");
     check(!!head, "3790987854 解析后应有 attachment='头' 的「头」层");
@@ -157,7 +166,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3436945972);
   if (!wp) {
-    fail("壁纸库缺少 3436945972");
+    skipMissing("3436945972");
   } else {
     attachPuppets(wp.scene, wp.parsed);
     applyAttachmentBindOrigins(wp.scene.layers);
@@ -186,7 +195,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3786330502);
   if (!wp) {
-    fail("壁纸库缺少 3786330502");
+    skipMissing("3786330502");
   } else {
     const hair = wp.scene.layers.find((l) => l.name === "头发" && l.attachment === "头发");
     check(!!hair, "3786330502 应有 attachment='头发' 的「头发」层");
@@ -230,7 +239,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3790371777);
   if (!wp) {
-    fail("壁纸库缺少 3790371777");
+    skipMissing("3790371777");
   } else {
     attachPuppets(wp.scene, wp.parsed);
     const head = wp.scene.layers.find((l) => l.name === "黍头" && l.attachment === "黍头");
@@ -259,7 +268,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3791001607);
   if (!wp) {
-    fail("壁纸库缺少 3791001607");
+    skipMissing("3791001607");
   } else {
     attachPuppets(wp.scene, wp.parsed);
     const hair = wp.scene.layers.find((l) => l.name === "头发" && l.id === 2754);
@@ -295,7 +304,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3786330502);
   if (!wp) {
-    fail("壁纸库缺少 3786330502");
+    skipMissing("3786330502");
   } else {
     const { recomposeWorld, collectTransformDirty } = await imp("renderer/vendor/we-scene/scene/parse.js");
     attachPuppets(wp.scene, wp.parsed);
@@ -337,7 +346,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3463520581);
   if (!wp) {
-    fail("壁纸库缺少 3463520581");
+    skipMissing("3463520581");
   } else {
     attachPuppets(wp.scene, wp.parsed);
     const byImage = (img) => wp.scene.layers.find((l) => l.image === img);
@@ -444,7 +453,7 @@ function neckOf(parent, attName) {
 {
   const wp = loadWallpaper(3479521040);
   if (!wp) {
-    fail("壁纸库缺少 3479521040");
+    skipMissing("3479521040");
   } else {
     attachPuppets(wp.scene, wp.parsed);
     const person = wp.scene.layers.find((l) => l.image === "models/人物.json");
@@ -707,6 +716,9 @@ function neckOf(parent, attName) {
   }
 }
 
+if (skipped.size >= FIXTURE_COUNT - 1) {
+  fail(`对照壁纸几乎全部缺席（跳过 ${skipped.size} 张），附着点语义未被实测`);
+}
 if (errors.length) {
   console.error(`\nverify-attachments：${errors.length} 项失败`);
   process.exit(1);

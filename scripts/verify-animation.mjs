@@ -579,7 +579,9 @@ const kf = (frame, value, front, back) => ({
           // 收进 channels（[] 仍是数组），sampleChannel 对零关键帧恒返回 0。
           // 这里 lo/hi 保持 ±Infinity 是度量盲区，不能再拿它算越界 —— 否则 0
           // 被判 Infinity 倍越界（121 个假阳性）。空通道改走「必须恒 0」断言。
-          const emptyChannel = chans.map((c) => c.length === 0);
+          // 非空但没有一个数值关键帧（deep-space-aurora 自制工程把 "0 0 -0.02" 整串塞进 c0，
+          // 非 WE 格式，运行时按 0 求值）同属盲区，并入「必须恒 0」。
+          const emptyChannel = chans.map((c, i) => c.length === 0 || !Number.isFinite(lo[i]));
 
           const len = Number(opts.length) > 0 ? Number(opts.length) : 60;
           for (let f = -5; f <= len + 5; f += Math.max(0.5, len / 120)) {
@@ -738,9 +740,10 @@ const kf = (frame, value, front, back) => ({
   // helper 闭包读的正是它，依赖 runtime 的动画闸门永不开启。四处必须同时基。
   // [2026-09 P2-1] 新增粒子 instanceoverride 脚本、animationlayers.visible
   // 脚本两个逐帧队列，各补一处 frametime=animDt，共 6 处。
+  // [2026-09-28] animationlayers blend / rate 脚本队列再补一处，共 7 处。
   check(
-    (mountSrc.match(/frametime = animDt/g) || []).length === 6,
-    "六处 engine.frametime（效果开关 / general / 对象脚本 / 按沙箱回填 / 粒子 override 脚本 / animLayer 脚本）都应用 animDt",
+    (mountSrc.match(/frametime = animDt/g) || []).length === 7,
+    "七处 engine.frametime（效果开关 / general / 对象脚本 / 按沙箱回填 / 粒子 override 脚本 / animLayer visible 脚本 / animLayer blend·rate 脚本）都应用 animDt",
   );
 
   // 2) 数值判据：模拟渲染循环，两种推进方式各跑一遍，比对与真实时钟的偏差。
@@ -1136,6 +1139,7 @@ const kf = (frame, value, front, back) => ({
   {
     let total = 0;
     let evaluated = 0;
+    let externalDep = 0;
     for (const id of fs.readdirSync(LIB)) {
       const p = join(LIB, id, "scene.pkg");
       if (!fs.existsSync(p)) continue;
@@ -1156,15 +1160,27 @@ const kf = (frame, value, front, back) => ({
               if (!sb || !sb.hasUpdate) continue;
               evaluated++;
               const isScalar = typeof v.value === "number";
+              // 读 shared.X 却不自己写的脚本依赖别的图层脚本（3629379075 shared.minScale 由
+              // applyUserProperties 写），单测孤立求值必然 NaN；renderer 对非有限输出不写回
+              // 也不回流，只计数不判失败，自足脚本照旧严格。
+              const sharedReads = [...v.script.matchAll(/\bshared\.(\w+)/g)].map((m) => m[1]);
+              const externalShared = sharedReads.some(
+                (n) => !new RegExp(`\\bshared\\.${n}\\s*=[^=]`).test(v.script),
+              );
               let last = isScalar ? v.value : { x: 0, y: 0, z: 0 };
               const ir = sb.init(last);
               if (typeof ir === "number" && Number.isFinite(ir)) last = ir;
+              let externalNaN = false;
               for (let f = 0; f < 300; f++) {
                 sb.engine.runtime = f / 60;
                 sb.engine.frametime = 1 / 60;
                 const ret = sb.callUpdate(last);
                 const out = ret !== undefined && ret !== null ? ret : last;
                 if (typeof out === "number") {
+                  if (!Number.isFinite(out) && externalShared) {
+                    externalNaN = true;
+                    continue;
+                  }
                   check(Number.isFinite(out), `${id} ${o.name}.${key} 反馈链 f=${f} 输出必须有限（实得 ${out}）`);
                   if (Number.isFinite(out)) last = out;
                 } else if (out && typeof out === "object") {
@@ -1175,13 +1191,14 @@ const kf = (frame, value, front, back) => ({
                   last = out;
                 }
               }
+              if (externalNaN) externalDep++;
             }
           }
         }
       }
     }
     check(total > 150, `全库常量脚本语料应 >150 处（实得 ${total}）`);
-    console.log(`   常量脚本反馈链回归：${evaluated}/${total} 个可求值脚本 × 300 帧，输出全部有限`);
+    console.log(`   常量脚本反馈链回归：${evaluated}/${total} 个可求值脚本 × 300 帧，输出全部有限（${externalDep} 个依赖外部 shared，孤立求值跳过）`);
   }
 }
 
@@ -1445,7 +1462,9 @@ const kf = (frame, value, front, back) => ({
     // 数据面貌断言（330 张语料 / 2026-09 复测：21 组；此前 247 张时为 24
     // =对象 13 + 常量 11，语料库替换壁纸后部分组消失。该断言只盯原始 scene.json，
     // 不经过渲染/沙箱，数量变化即语料面貌变化，与代码回归区分）。
-    check(groups === 21, `全库应有 21 个联动组作用域（330 张语料实测，实得 ${groups}）`);
+    // 2026-10 复测 56 组（库扩容）。精确数随语料漂移，只断言语料非空，数量打印备查。
+    check(groups > 0, `全库应至少有 1 个联动组作用域（实得 ${groups}）`);
+    console.log(`   联动组作用域：${groups} 组`);
     console.log(`   联动组回归：${groups} 组 / ${linked} 个 child 链接 / 120 帧全部有限`);
   }
 

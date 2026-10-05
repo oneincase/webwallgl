@@ -93,8 +93,13 @@ for (const f of texsFiles) {
 console.log(`【TEXS 帧表】${texsFiles.length} 张带帧表的贴图，旋转打包帧 ${rotTotal} 个`);
 if (fs.existsSync(LIB)) {
   check(texsFiles.length >= 30, `带 TEXS 段的贴图数异常偏低: ${texsFiles.length}（预期 ≥30）`);
-  // 旋转帧是本实现存在的理由之一；归零说明解析退化回了矩形
-  check(rotTotal >= 3, `旋转打包帧数异常: ${rotTotal}（预期 ≥3，样本 Raiden Friends）`);
+  // 旋转帧是本实现存在的理由之一；归零说明解析退化回了矩形。
+  // 语料里只有 2623473016 Raiden Friends 带旋转帧，本机未订阅时这条无从实测。
+  if (fs.existsSync(join(LIB, "2623473016", "scene.pkg"))) {
+    check(rotTotal >= 3, `旋转打包帧数异常: ${rotTotal}（预期 ≥3，样本 Raiden Friends）`);
+  } else {
+    console.log("   （跳过旋转帧计数：本机无 2623473016 Raiden Friends）");
+  }
 }
 
 // ---------- 2. 三个已知样本的精确断言 ----------
@@ -231,7 +236,7 @@ if (fs.existsSync(LIB)) {
   check(/u_FrameOrigin\s*\+\s*v_UV\.x\s*\*\s*u_FrameU\s*\+\s*v_UV\.y\s*\*\s*u_FrameV/.test(gsrc),
     "COPY_FRAG 必须按 origin + u·uDir + v·vDir 做仿射采样");
   // 无效果链的图层也要传帧基（猫层就走这条路径）
-  check(/compositeLayer\([\s\S]{0,200}spriteFrameBasis\(/.test(rsrc),
+  check(/compositeLayer\([\s\S]{0,500}spriteFrameBasis\(/.test(rsrc),
     "无效果链路径未把帧基传给 compositeLayer（序列帧层会整图铺满）");
   // 脚本钉帧优先于时间自动播
   check(/layer\.textureAnimation/.test(rsrc), "renderer.js 未读取 layer.textureAnimation（脚本钉帧不生效）");

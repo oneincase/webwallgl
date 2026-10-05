@@ -271,7 +271,8 @@ const num = (v, d) => {
   const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/uniform float u_keepZ;/.test(mdlSrc), "mdl 顶点着色器必须有 u_keepZ");
   check(
-    /gl_Position = u_mvp \* vec4\(local\.xy, local\.z \* u_keepZ, 1\.0\)/.test(mdlSrc),
+    /gl_Position = u_mvp \* vec4\(local\.xy, local\.z \* u_keepZ, 1\.0\)/.test(mdlSrc) ||
+      /vec4 (\w+) = vec4\(local\.xy, local\.z \* u_keepZ, 1\.0\);\s*\n\s*gl_Position = u_mvp \* \1;/.test(mdlSrc),
     "mdl 顶点着色器必须写成 local.z * u_keepZ（直接写 local.z 会把 2D puppet 的建模 z 放进深度）",
   );
   check(/gl\.uniform1f\(uni\.keepZ, opts\.keepZ \? 1 : 0\)/.test(mdlSrc), "mdl.draw 必须按 opts.keepZ 设置 u_keepZ（缺省 = 压平）");
@@ -393,7 +394,8 @@ if (fs.existsSync(LIB)) {
   // 或数据读取出了问题。字段分布与是否播放无关 —— 幕布默认不播（见第 4 组守卫）。
   check(fadeOn > total * 0.8, `camerafade 开启数异常偏低：${fadeOn}/${total}（预期 >80%）`);
   // 缺字段的场景**不该**淡入（默认关），这是 renderer.js 里 boolProp(...,false) 的依据
-  check(fadeMissing <= 2, `camerafade 缺字段的场景数异常：${fadeMissing}（预期 ≤2）`);
+  // 按比例而非绝对数：库会长（2026-10-06：356 场景里 8 个缺字段，约 2%）
+  check(fadeMissing <= total * 0.05, `camerafade 缺字段的场景数异常：${fadeMissing}/${total}（预期 ≤5%）`);
   check(shakeOn > 0, "库内应至少有 1 个 camerashake 场景（否则抖动实现无样本可依）");
   for (const p of shakeParams) {
     check(p.amp > 0 && p.amp <= 2, `${p.id} camerashakeamplitude 越界: ${p.amp}`);
@@ -428,8 +430,10 @@ if (fs.existsSync(LIB)) {
   const shakeFn = src.slice(src.indexOf("function cameraShakeOffset"), src.indexOf("function cameraShakeOffset") + 900);
   check(!/Math\.random/.test(shakeFn), "cameraShakeOffset 不得使用 Math.random（逐帧跳变=抽帧感）");
   check(/cam\.perspective/.test(src), "renderer.js 未引用 cam.perspective（透视层变换/裁剪未接线）");
+  // 裁剪包围盒已抽成 layerCullBoundsOf（isLayerOffscreen / ROI 裁剪共用）：返回 null = 不裁
+  const cullsViaBounds = /function isLayerOffscreen[\s\S]{0,120}layerCullBounds\(layer, cam\)[\s\S]{0,40}if \(!b\) return false/.test(src);
   check(/if\s*\(\s*cam\s*&&\s*cam\.perspective\s*\)\s*return false/.test(src) ||
-    /if\s*\(cam\s*&&\s*cam\.perspective\)\s*return false/.test(src),
+    (cullsViaBounds && /function layerCullBoundsOf[\s\S]{0,200}if \(cam && cam\.perspective\) return null/.test(src)),
     "isLayerOffscreen 对透视场景必须停用像素 AABB 裁剪");
   check(/layerWorldOrigin/.test(src), "renderer.js 未调用 layerWorldOrigin（天空盒未锁到相机）");
 }
@@ -541,7 +545,9 @@ if (fs.existsSync(LIB)) {
     // （isLayerOffscreen 里也有同样的前缀，会切错位置）。
     check(/if \(layer\.angles\[1\]\) m = mat4RotateY\(m, -layer\.angles\[1\]\)[\s\S]{0,120}if \(layer\.angles\[0\]\) m = mat4RotateX\(m, layer\.angles\[0\]\)/.test(src2),
       "layerModelMatrix 透视分支必须是 Rz → Ry(-y) → Rx(+x)（顺序/符号错=倾斜轴向错：+y 会让卡片背向指针左右反转）");
-    check(/if \(layer\.perspective\) return false/.test(src2), "isLayerOffscreen 必须跳过 perspective 层");
+    check(/if \(layer\.perspective\) return false/.test(src2) ||
+      /function layerCullBoundsOf[\s\S]{0,500}if \(layer\.perspective\) return null/.test(src2),
+      "isLayerOffscreen 必须跳过 perspective 层");
     const hit = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/hittest.js"), "utf8");
     check(/perspLayerLocal/.test(hit) && /layer\.perspective && perspEye/.test(hit),
       "hittest.js 必须接 perspective 射线-平面求交分支");

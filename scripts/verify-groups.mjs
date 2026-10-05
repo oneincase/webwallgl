@@ -81,6 +81,27 @@ const readJson = (pkg, name) => {
   catch (e) { return null; }
 };
 
+// 按花括号配对截整个函数体：固定字符窗口会被函数头注释撑爆（captureBackdrop
+// 前面加了组 FBO/HDR/MSAA 三个分支后 900 字窗口就看不到 copyTexImage2D 了）
+const fnBody = (src, name) => {
+  const at = src.indexOf(`function ${name}(`);
+  if (at < 0) return "";
+  const open = src.indexOf("{", src.indexOf(")", at));
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}" && --depth === 0) return src.slice(at, i + 1);
+  }
+  return src.slice(at);
+};
+
+// 定点样本是报障壁纸，本机库不一定有（库会换血）：缺了跳过并记一笔，不算失败
+const skippedSamples = new Set();
+const skipMissing = (id) => {
+  if (!skippedSamples.has(id)) console.log(`   （跳过：壁纸库无样本 ${id}）`);
+  skippedSamples.add(id);
+};
+
 const wallpapers = [];
 for (const id of fs.readdirSync(LIB)) {
   const p = join(LIB, id, "scene.pkg");
@@ -496,7 +517,8 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     console.log(`   ${s.ok ? "✓" : "✗"} ${s.id} ${s.name} mip=${s.mipCount} ${s.mw}x${s.mh} (头部 ${s.texW}x${s.texH})`);
   }
   check(nTex > 1500, `.tex 样本过少: ${nTex}`);
-  check(nV4 >= 4, `带 V4 扩展块的贴图样本异常偏低: ${nV4}（预期 ≥4）`);
+  // 精确数随语料漂移（2026-10 库换血后 3 张），只要求布局断言还有样本可验
+  check(nV4 >= 1, `带 V4 扩展块的贴图样本为 0，下面的布局断言失去意义`);
   check(layoutBad === 0, `${layoutBad} 张按 V4 布局解析后 mipCount/尺寸与头部不符`);
 
   // 端到端：这 4 张必须真的能解出与头部一致的图像，而不是 1x0
@@ -574,6 +596,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   check(nRot >= 50 && nNegScale >= 50,
     `带旋转/负缩放的 passthrough 层过少（${nRot}/${nNegScale}）—— 逐角投影的必要性依据没了`);
   for (const id of ["3789131791", "3789630124", "3790302364"]) {
+    if (!wallpapers.some((w) => w.id === id)) { skipMissing(id); continue; }
     check(preserve.has(id), `样本 ${id} 应含 TRANSPARENCY=PRESERVE 的 passthrough 效果`);
   }
 
@@ -587,8 +610,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     "renderer.js 未实现 drawBackdropToFBO（passthrough 层仍拿到空画布）");
   check(/usePassthrough/.test(rsrc), "renderLayer 未按 passthrough 分流 copy pass");
 
-  const cStart = rsrc.indexOf("function captureBackdrop");
-  const cCode = rsrc.slice(cStart, cStart + 900).replace(/\/\/[^\n]*/g, "");
+  const cCode = fnBody(rsrc, "captureBackdrop").replace(/\/\/[^\n]*/g, "");
   // 画布是 alpha:false，默认帧缓冲没有 alpha 通道；copyTexImage2D 要求目标
   // 每个分量在源里都存在，拿 RGBA8 去拷会 INVALID_OPERATION(1282) 且**静默留下全零纹理**
   check(/copyTexImage2D\([^)]*gl\.RGB8/.test(cCode),
@@ -718,7 +740,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(!!bg && bg.solid, "2872267921「背景」是真 solidlayer，必须保持 solid=true");
     console.log(`   样本 2872267921：39/109 容器 solid=false，19 背景 solid=${bg && bg.solid}`);
   } else {
-    errors.push("壁纸库缺少样本 2872267921");
+    skipMissing("2872267921");
   }
 
   const psrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8")
@@ -895,7 +917,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       // 容差放到 0.01：作者的 UV 会有微量溢出（2468489223 的鱼有两个 -0.0022），
       // 那是建模精度而非解析错位 —— 布局错位会让 UV 变成成千上万的乱数，
       // 1e-3 的严格阈值只会把正常模型误判成坏的。
-      for (const u of m.uvs) if (u < -0.01 || u > 1.01) badUV++;
+      // 2026-10 再放宽到 ±0.5：2645592994 挂饰 UV 到 −0.124/1.073、2704773569 到 1.026，
+      // 仍是作者溢出；错位产生的是量级上万的乱数，±0.5 照样一眼抓住。
+      for (const u of m.uvs) if (u < -0.5 || u > 1.5) badUV++;
       if (badW === 0 && badUV === 0 && m.vertexCount > 0) v13ok++;
       else v13bad.push(`${w.id} ${name}: 权重异常 ${badW} / UV 越界 ${badUV}`);
     }
@@ -1042,7 +1066,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       }
     }
   } else {
-    errors.push("壁纸库缺少样本 3797270925");
+    skipMissing("3797270925");
   }
 
   // G3b. additive 动画层的增量参考必须是**本轨道首关键帧**（clip 参考姿势），不是绑定姿势。
@@ -1112,7 +1136,8 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     // visible 字段形态不一，find 会命中隐藏层（G3c 第一版就踩了）。
     const L = rin ? parseScene(rin.scene).layers.find((l) => l.name === "kkkk" && l.visible === true) : null;
     const mjs = L && L.image && readJson(rin.pkg, L.image);
-    check(!!(L && mjs && mjs.puppet), "3223543799 缺少可见 kkkk puppet 图层");
+    if (!rin) skipMissing("3223543799");
+    else check(!!(L && mjs && mjs.puppet), "3223543799 缺少可见 kkkk puppet 图层");
     if (L && mjs && mjs.puppet) {
       let m;
       try {
@@ -1231,9 +1256,11 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   // G4. 接线：isLayerOffscreen 必须真的用上 puppetAnimMargin（G2 直接调的是导出函数，
   // 这里补一刀确保它确实接进了裁剪判据，而不是只导出没人用）
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
-  const at = rsrc.indexOf("function isLayerOffscreen");
-  const cull = at < 0 ? "" : rsrc.slice(at, at + 2600);
-  check(/puppetAnimMargin\s*\(/.test(cull),
+  // 余量已下沉：isLayerOffscreen → layerCullBounds → layerCullBoundsOf → puppetAnimMargin
+  const cullChain = ["isLayerOffscreen", "layerCullBounds", "layerCullBoundsOf"].map((n) => fnBody(rsrc, n));
+  const chainLinked = /layerCullBounds\s*\(/.test(cullChain[0]) && /layerCullBoundsOf\s*\(/.test(cullChain[1]);
+  const cull = cullChain.join("\n");
+  check(/puppetAnimMargin\s*\(/.test(cullChain[0]) || (chainLinked && /puppetAnimMargin\s*\(/.test(cullChain[2])),
     "isLayerOffscreen 必须调用 puppetAnimMargin（否则靠动画开进画面的层被每帧裁掉）");
   check(/marginX/.test(cull) && /marginY/.test(cull),
     "裁剪余量必须分 X/Y 轴（animBound 两轴量级差很大）");
@@ -1304,7 +1331,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   //     的白色 solidlayer：inputTex 是 1×1 白图，src.a=1。若 compBlend 只拿 src.a，
   //     就会按 op=1 把 Overlay(背景, 白)=白 写满全屏 —— 即整屏过曝。
   const sakura = wallpapers.find((w) => w.id === "3793592591");
-  check(!!sakura, "壁纸库缺少样本 3793592591");
+  if (!sakura) skipMissing("3793592591");
   if (sakura) {
     const solid = parseScene(sakura.scene).layers.find((l) => l.id === 471);
     check(!!solid && solid.name === "Katı" && solid.colorBlendMode === 11 && solid.alpha === 0,
@@ -1508,6 +1535,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
         const eO = Math.hypot(
           (1 - 2 * (Y * Y + Z * Z)) * k[7] - real[0], 2 * (X * Y + Z * W) * k[7] - real[1],
           2 * (X * Y - Z * W) * k[8] - real[2], (1 - 2 * (X * X + Z * Z)) * k[8] - real[3]);
+        // frame0 ≠ 绑定姿势的骨两种解释都对不上（3186328539「33362」骨 15：绑定角 0、
+        // frame0 rz=2.793，误差 2.79 vs 2.66），胜负是巧合，不参与比较。
+        if (Math.min(eN, eO) > 0.1) { bigAngle--; continue; }
         errBigA.push(eN); errBigQ.push(eO);
         if (eN < eO - 1e-6) angleWins++;
         else if (eO < eN - 1e-6) quatWins++;
@@ -1562,7 +1592,16 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   // 指标：t=0 顶点归位是恒等式（非 additive 层 blend=1 时把 base 整个替换掉），
   // 两套姿势都恒为 0；「单边拉伸比」也不行（<30px 短边在骨混合下天然放大到 10x，
   // 正常模型同样测得出）。全库翻转总数：正确 = 4xx，两套参考系混用 = 3264。
+  //
+  // [2026-10] 改为**比例**判据并剔除两类非撕裂：
+  // ① 合法镜像：关键帧里缩放本身过零（3306942838 乌鸦翅膀骨 9/15 的 sy 从 1 平滑降到
+  //    −0.504/−1.704，旋转连续、无 π 跳变 = 作者拖过零点的翻折），子骨继承镜像，
+  //    这些骨覆盖的三角形翻面是正确结果，单张就贡献 6826 个；
+  // ② 退化：翻后面积不足原面积 1%（缩放归零藏起来的部件，符号只是浮点噪声）。
+  // 库从 247 张涨到 400+ 张，绝对数阈值随语料漂移；比例才可比。2026-10 实测：
+  // 正确 2.81/万；注入「invBindWorld 取主动画 frame0」的旧 bug → 14.92/万（5.3×）。
   let flipSum = 0;
+  let triSum = 0;
   for (const { pkg, scene } of wallpapers) {
     for (const L of parseScene(scene).layers) {
       if (!L.image) continue;
@@ -1577,6 +1616,27 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       const layers = (L.animationLayers || []).filter((a) => a.visible !== false);
       if (!layers.length) continue;
       const P = mdl.positions, I = mdl.indices, BI = mdl.boneIdx, WT = mdl.weights;
+      const usedAnims = new Set(layers.map((a) => a.animation));
+      const mirrored = new Uint8Array(mdl.bones.length);
+      for (const an of mdl.animations) {
+        if (!usedAnims.has(an.id)) continue;
+        an.tracks.forEach((tr, b) => {
+          const k = tr && tr.keyframes;
+          if (!k) return;
+          for (let f = 0; f * 9 + 7 < k.length; f++) {
+            if (k[f * 9 + 6] < 0 || k[f * 9 + 7] < 0) { mirrored[b] = 1; break; }
+          }
+        });
+      }
+      for (let b = 0; b < mdl.bones.length; b++) {
+        for (let q = mdl.bones[b].parent; !mirrored[b] && q >= 0; q = mdl.bones[q].parent) {
+          if (mirrored[q]) mirrored[b] = 1;
+        }
+      }
+      const onMirror = (i) => {
+        for (let k = 0; k < 4; k++) if (WT[i * 4 + k] > 0 && mirrored[BI[i * 4 + k]]) return true;
+        return false;
+      };
       for (const t of [1, 3, 5, 8]) {
         const sk = computeSkinMatrices(mdl, t, layers);
         if (!sk) continue;
@@ -1595,15 +1655,18 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
           const a0 = (P[b * 3] - P[a * 3]) * (P[c * 3 + 1] - P[a * 3 + 1])
             - (P[c * 3] - P[a * 3]) * (P[b * 3 + 1] - P[a * 3 + 1]);
           if (Math.abs(a0) < 10) continue;
+          if (onMirror(a) || onMirror(b) || onMirror(c)) continue;
+          triSum++;
           const A = sp(a), B = sp(b), C = sp(c);
-          if (((B[0] - A[0]) * (C[1] - A[1]) - (C[0] - A[0]) * (B[1] - A[1])) / a0 < 0) flipSum++;
+          if (((B[0] - A[0]) * (C[1] - A[1]) - (C[0] - A[0]) * (B[1] - A[1])) / a0 < -0.01) flipSum++;
         }
       }
     }
   }
-  console.log(`   蒙皮三角形法向翻转总数：${flipSum}（参考：绑定姿势串了会涨到 3264）`);
-  check(flipSum < 1200,
-    `蒙皮出现 ${flipSum} 个三角形法向翻转 —— invBindWorld 与 bindTRS 可能用了不同的绑定姿势`);
+  const flipPer10k = triSum ? (flipSum / triSum) * 1e4 : 0;
+  console.log(`   蒙皮三角形法向翻转：${flipSum} / ${triSum}（${flipPer10k.toFixed(2)}/万；参考：绑定姿势串了 ≈15/万）`);
+  check(flipPer10k < 6,
+    `蒙皮三角形法向翻转 ${flipPer10k.toFixed(2)}/万（≥6）—— invBindWorld 与 bindTRS 可能用了不同的绑定姿势`);
 
   // I5. 图集散件必须按 frame0 拼回脸上；层全关必须回到绑定姿势（3233141951）
   check(/hadExplicitLayers/.test(src),
@@ -1817,8 +1880,7 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     "renderCompositeSources 必须恢复源层的 origin");
 
   // 查表必须先于回退：顺序反了等于没实现
-  const rStart = rsrc.indexOf("function resolveTextureName");
-  const rCode = rStart >= 0 ? rsrc.slice(rStart, rStart + 1800) : "";
+  const rCode = fnBody(rsrc, "resolveTextureName");
   const hasIdx = rCode.indexOf("compositeFBOs.has");
   const retIdx = rCode.indexOf("return inputFBO", hasIdx >= 0 ? hasIdx : 0);
   check(hasIdx >= 0, "resolveTextureName 未查 compositeFBOs");
@@ -1966,7 +2028,8 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
       "空 composelayer 捕获必须走 drawBackdropToFBO（RGB8 回读），不能预渲染全透明");
     check(/compositeFBOs\.set/.test(capCode),
       "捕获结果必须写入 compositeFBOs，否则 resolveTextureName 仍回退 inputFBO（白三角）");
-    check(/bindFramebuffer[\s\S]{0,80}null/.test(capCode) &&
+    // bindFinal() 在 HDR/MSAA 下绑回真正的最终目标，比 bindFramebuffer(null) 更对
+    check((/bindFramebuffer[\s\S]{0,80}null/.test(capCode) || /bindFinal\(\)/.test(capCode)) &&
       /viewport\(\s*0\s*,\s*0\s*,\s*width\s*,\s*height\s*\)/.test(capCode),
       "回读后必须恢复画布 FBO/viewport，否则后续层画进合成 FBO 尺寸的角落");
     // 带可见效果的 copybackground 源（Beam：scroll/transform）要在回读的内容上

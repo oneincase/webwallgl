@@ -421,8 +421,10 @@ function runShim(extras, opts) {
   win.window = win;
   const ctx = vm.createContext(win);
   if (opts && opts.opaqueStorage) {
-    // 必须在**上下文内部**定义这些访问器：从外层 Object.defineProperty 装在 sandbox 上的
-    // 访问器，在 vm 里读出来是 `undefined`（既不抛也不给值，实测），测试会假绿。
+    // vm 的上下文全局对象上装访问器不可靠：外层装的读出来是 `undefined`，Node 26 起
+    // 上下文内部装的同样读成 `undefined`（既不抛也不给值），测试会假失败/假绿。
+    // 所以 `window` 换成一个**普通对象**（原型指向全局，document/location 等照常可达），
+    // 抛错访问器装在它自己身上 —— shim 是 `(function (w) {…})(window)`，作用面相同。
     vm.runInContext(`
       (function () {
         function boom(what) {
@@ -431,8 +433,10 @@ function runShim(extras, opts) {
           }
           return { configurable: true, get: fail, set: fail };
         }
-        Object.defineProperty(globalThis, "localStorage", boom("localStorage"));
-        Object.defineProperty(globalThis, "sessionStorage", boom("sessionStorage"));
+        var W = Object.create(globalThis);
+        Object.defineProperty(W, "localStorage", boom("localStorage"));
+        Object.defineProperty(W, "sessionStorage", boom("sessionStorage"));
+        globalThis.window = W;
         // document.cookie 在真实引擎里挂在 **Document.prototype** 上（不是 document 自有属性），
         // 假环境必须同构：否则 shim 定义到原型上的兜底访问不到，测试同样假绿。
         function Document() {}

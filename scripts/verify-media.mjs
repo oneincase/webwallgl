@@ -44,160 +44,44 @@ const {
 
 const { check, errors } = createChecker();
 
-// ---------- 1. 模拟媒体源 ----------
+// ---------- 1. 无媒体回落源（2f30107 起不再伪造品牌曲目） ----------
+// 没有真实 Now Playing 时必须是恒定「无媒体」快照，壁纸回落到作者烘焙的占位。
 {
   const sim = createSimulatedMedia();
-  const cycle = sim.cycle;
-  check(cycle > 0, "播放列表周期应为正");
-
-  const states = new Set();
-  const titles = new Set();
-  const albums = new Set();
-  const trackIdx = new Set();
-  let thumbOk = 0;
-  let thumbChecked = 0;
-  let lastTrack = -1;
-  let posResets = 0;
-  let badPos = 0;
-  let lyricMismatch = 0;
-
-  for (let t = 0; t < cycle + 5; t += 0.5) {
+  check(sim.cycle === 0 && Array.isArray(sim.tracks) && sim.tracks.length === 0, "回落源不应带播放列表");
+  let leaked = 0;
+  for (const t of [0, 13.5, 97, 210, 400, 777.25]) {
     sim.update(t);
     const s = sim.snapshot;
-    states.add(s.state);
-    if (s.title) titles.add(s.title);
-    if (s.album) albums.add(s.album);
-    if (s.trackIndex >= 0) trackIdx.add(s.trackIndex);
-    if (s.trackIndex !== lastTrack) {
-      posResets++;
-      lastTrack = s.trackIndex;
-    }
-    // 封面通道：有曲（非曲间空隙）时必须带 data URL 封面（本库 logo）
-    if (s.hasThumbnail) {
-      thumbChecked++;
-      if (typeof s.thumbnail === "string" && s.thumbnail.startsWith("data:image/")) thumbOk++;
-    }
-    if (!(s.position >= 0 && s.position <= s.duration + 1e-6)) badPos++;
-    // 歌词行必须与时间戳一致：找最后一个 ts <= position 的行
-    if (Array.isArray(s.lyrics) && s.lyrics.length) {
-      let want = -1;
-      for (let i = 0; i < s.lyrics.length; i++) {
-        const ts = Array.isArray(s.lyrics[i]) ? s.lyrics[i][0] : s.lyrics[i].time;
-        if (ts <= s.position) want = i;
-        else break;
-      }
-      if (want !== s.lyricIndex) lyricMismatch++;
-    }
+    if (s.hasMedia || s.title || s.artist || s.album || s.hasThumbnail || s.thumbnail ||
+        s.state !== MEDIA_PLAYBACK.STOPPED || s.trackIndex !== -1) leaked++;
   }
-
-  check(
-    states.has(MEDIA_PLAYBACK.PLAYING),
-    "一个周期内应出现 PLAYING 状态",
-  );
-  check(states.has(MEDIA_PLAYBACK.PAUSED), "一个周期内应出现 PAUSED 状态（暂停分支未被覆盖）");
-  check(states.has(MEDIA_PLAYBACK.STOPPED), "一个周期内应出现 STOPPED 状态（曲间空隙）");
-  // 品牌曲播放列表：曲名一律 WebWallGL、歌手一律 oneincase（用户要求的库品牌），
-  // 轮换靠专辑名（Scene/Web/Video/Live）与 trackIndex 区分
-  check(titles.size === 1 && titles.has("WebWallGL"), `曲名应一律为 WebWallGL，实得 ${[...titles].join(",")}`);
-  check(albums.size >= 4, `一个周期内应轮换完整播放列表（专辑区分），实得 ${albums.size} 张`);
-  check(trackIdx.size >= 4, `一个周期内应轮换完整播放列表（trackIndex），实得 ${trackIdx.size} 首`);
-  check(thumbChecked > 0 && thumbOk === thumbChecked,
-    `有曲时封面必须一律是 data URL（本库 logo），${thumbChecked - thumbOk}/${thumbChecked} 处不是`);
-  check(badPos === 0, `进度应始终落在 [0, duration]，越界 ${badPos} 次`);
-  check(lyricMismatch === 0, `歌词行与时间戳不符 ${lyricMismatch} 次`);
-
-  // 确定性：同一时刻两次求值必须完全一致（暂停 / 回卷安全）
-  const a = createSimulatedMedia();
-  const b = createSimulatedMedia();
-  let drift = 0;
-  for (const t of [0, 13.5, 97, 210, 400, 777.25]) {
-    a.update(t);
-    b.update(t);
-    const x = a.snapshot;
-    const y = b.snapshot;
-    if (
-      x.title !== y.title ||
-      x.state !== y.state ||
-      Math.abs(x.position - y.position) > 1e-9 ||
-      x.lyricIndex !== y.lyricIndex
-    ) {
-      drift++;
-    }
-  }
-  check(drift === 0, `模拟源应为纯时间函数（同 t 同结果），${drift} 处不一致`);
-
-  // 回卷：先跳到后面再回到前面，结果应与直接求值一致
-  const fwd = createSimulatedMedia();
-  fwd.update(500);
-  fwd.update(42);
-  const direct = createSimulatedMedia();
-  direct.update(42);
-  check(
-    fwd.snapshot.title === direct.snapshot.title &&
-      Math.abs(fwd.snapshot.position - direct.snapshot.position) < 1e-9,
-    "回卷后应与直接求值一致（模拟源不应有隐藏累积状态）",
-  );
-
-  // 周期性：t 与 t+cycle 应等价
-  const p1 = createSimulatedMedia();
-  const p2 = createSimulatedMedia();
-  p1.update(30);
-  p2.update(30 + cycle);
-  check(
-    p1.snapshot.title === p2.snapshot.title &&
-      Math.abs(p1.snapshot.position - p2.snapshot.position) < 1e-6,
-    "模拟源应以 cycle 为周期",
-  );
+  check(leaked === 0, `回落源应恒为无媒体快照，${leaked} 个时刻泄出了伪造数据`);
 }
 
-// ---------- 1b. 切歌 / 暂停控制面（模拟 provider，不是真系统媒体）----------
+// ---------- 1b. 控制面在无媒体时是安全的 no-op ----------
 {
   const sim = createSimulatedMedia();
   sim.update(10);
-  const first = sim.snapshot.album;
-  const firstIdx = sim.snapshot.trackIndex;
-  sim.skipNext();
-  check(sim.snapshot.trackIndex !== firstIdx, `skipNext 应换曲，仍停在 ${firstIdx} ${sim.snapshot.album}`);
-  check(sim.snapshot.album !== first, `skipNext 后专辑应变（品牌曲同名不同专辑），仍是 ${first}`);
-  check(sim.snapshot.title === "WebWallGL" && sim.snapshot.artist === "oneincase",
-    `品牌曲名/歌手应为 WebWallGL / oneincase，实得 ${sim.snapshot.title} / ${sim.snapshot.artist}`);
-  check(sim.snapshot.position < 1, `skipNext 应落到下一首开头，position=${sim.snapshot.position}`);
-  const mid = sim.snapshot.album;
-  sim.skipPrevious();
-  check(sim.snapshot.album === first, `skipPrevious 应回到上一首，实得 ${sim.snapshot.album} 期望 ${first}`);
-  sim.pause();
-  check(sim.snapshot.state === MEDIA_PLAYBACK.PAUSED, `pause 后 state 应为 PAUSED，实得 ${sim.snapshot.state}`);
-  const pos = sim.snapshot.position;
-  sim.update(10 + 30);
-  check(sim.snapshot.album === first, "暂停后时间推进不应换歌");
-  check(Math.abs(sim.snapshot.position - pos) < 1e-9, "暂停后进度应冻结");
-  sim.play();
-  check(sim.snapshot.state !== MEDIA_PLAYBACK.PAUSED, "play 后不应再保持用户暂停");
-  sim.playPause();
-  check(sim.snapshot.state === MEDIA_PLAYBACK.PAUSED, "playPause 应从播放切到暂停");
-  void mid;
+  let threw = null;
+  try {
+    sim.skipNext(); sim.skipPrevious(); sim.pause(); sim.play(); sim.playPause();
+  } catch (e) { threw = e; }
+  check(!threw, `无媒体时控制面不应抛错：${threw && threw.message}`);
+  check(sim.snapshot.state === MEDIA_PLAYBACK.STOPPED && !sim.snapshot.title, "无媒体时控制面不应凭空造出曲目");
 }
 
-// ---------- 1c. 窗口标题模拟源（浏览器标签名的可替换接口）----------
+// ---------- 1c. 窗口标题回落源 ----------
 {
   const w = createSimulatedWindowTitle();
-  check(typeof w.snapshot.title === "string" && w.snapshot.title.length > 0, "窗口标题快照应有 title");
-  const a = createSimulatedWindowTitle();
-  const b = createSimulatedWindowTitle();
-  a.update(0);
-  b.update(0);
-  check(a.snapshot.title === b.snapshot.title, "窗口标题应为纯时间函数（同 t 同结果）");
-  a.update(0);
-  const t0 = a.snapshot.title;
-  a.update(w.hold + 0.1);
-  check(a.snapshot.title !== t0, "超过 hold 后应换到下一个模拟标签");
+  w.update(0);
+  check(w.snapshot && w.snapshot.title === "", "无宿主时窗口标题应为空（不再轮换模拟标签）");
   const sys = createSimulatedSystem();
   check(sys.media && typeof sys.media.skipNext === "function", "createSimulatedSystem 应带媒体控制面");
   check(sys.windowTitle && sys.windowTitle.snapshot, "createSimulatedSystem 应带窗口标题源");
   sys.shortcuts.openUserShortcut("newproperty13");
   check(sys.shortcuts.last.name === "newproperty13", "openUserShortcut 应记下属性名");
 }
-
 // ---------- 2. 颜色必须是 Vec3 实例 ----------
 {
   const sim = createSimulatedMedia();
@@ -720,7 +604,8 @@ const { check, errors } = createChecker();
       for (const e of layer.effects || []) {
         for (const p of e.passes || []) {
           const texArr = p.textures || [];
-          if (texArr.some((t) => typeof t === "string" && t.startsWith("$media"))) mergedOk++;
+          // 按纹理数而非 pass 数：一个 pass 可同时绑 $mediaThumbnail 与 $mediaPreviousThumbnail
+          mergedOk += texArr.filter((t) => typeof t === "string" && t.startsWith("$media")).length;
           if (id === "3785267658" && texArr.includes("$mediaThumbnail")) niulaiCover = layer.name;
         }
       }
@@ -728,8 +613,12 @@ const { check, errors } = createChecker();
   }
   if (totalBound > 0) {
     check(mergedOk >= totalBound,
-      `pass 级 usertextures 合并不完整：scene.json 绑定 ${totalBound} 处，parse 后仅 ${mergedOk} 个 pass 带保留名`);
-    check(niulaiCover !== null, "3785267658 牛来的封面效果应在 parse 后绑定 $mediaThumbnail");
+      `pass 级 usertextures 合并不完整：scene.json 绑定 ${totalBound} 处，parse 后仅 ${mergedOk} 处保留名`);
+    if (fs.existsSync(join(LIB, "3785267658", "scene.pkg"))) {
+      check(niulaiCover !== null, "3785267658 牛来的封面效果应在 parse 后绑定 $mediaThumbnail");
+    } else {
+      console.log("  （跳过牛来封面断言：库内无 3785267658）");
+    }
     console.log(`  pass 级 usertextures：${totalBound} 处绑定全部合并（牛来封面层 = ${niulaiCover}）`);
   } else {
     console.log("  （跳过 usertextures 语料：库内无绑定）");
@@ -1654,7 +1543,10 @@ function sniffMediaType(url) {
     // 误命中渲染循环起始的那句早退（1.3.7 挂过一次）。
     const then = src.lastIndexOf(".then(", ff);
     const render = src.lastIndexOf(".render(", then);
-    const early = src.indexOf("if (disposed || rt.paused) return;", ff);
+    const earlyRe = /if \(disposed \|\| rt\.paused[^)]*\)\) return;|if \(disposed \|\| rt\.paused\) return;/g;
+    earlyRe.lastIndex = ff;
+    const em = earlyRe.exec(src);
+    const early = em ? em.index : -1;
     check(render > 0 && then > render && ff > then,
       `${name} 的 onFirstFrame 必须在 render().then 内触发（放在 render 之前会早一帧，autoplay:false 拿到空画布）`);
     check(early > 0 && ff < early,
@@ -1706,7 +1598,7 @@ function sniffMediaType(url) {
     const at = shellTs.indexOf("export function clear(");
     return at < 0 ? "" : shellTs.slice(at, shellTs.indexOf("\n}", at));
   })();
-  check(/clearSceneDebugGlobals\(\)/.test(clearBody2),
+  check(/clearSceneDebugGlobals\((rt)?\)/.test(clearBody2),
     "clear() 必须调用 clearSceneDebugGlobals");
   for (const g of ["__scene", "__textures", "__sceneLayers"]) {
     check(shellTs.includes(`"${g}"`), `调试出口清理表应包含 ${g}`);
