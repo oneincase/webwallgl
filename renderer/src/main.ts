@@ -123,7 +123,7 @@ function mountDefaultWallpaper(rt: Runtime) {
   f.setAttribute("sandbox", "allow-scripts");
   f.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;border:none;background:transparent;";
-  // BASE_URL 前缀兼容子路径部署（如 GitHub Pages 的 /webwallgl/）
+  // BASE_URL 前缀兼容子路径部署（如 /webwallgl/）
   f.src = `${import.meta.env.BASE_URL}default-wallpaper/index.html`;
   rt.wrap?.appendChild(f);
   const blockIframe = () => {

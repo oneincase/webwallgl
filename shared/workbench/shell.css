@@ -1,0 +1,1125 @@
+/*
+ * WebWallGL 工作台外壳（测试台 / 编辑器共用）：布局骨架 + 通用控件。
+ * 依赖 tokens.css；页面私有样式（bench.css / editor.css）只排各自的内容区。
+ *
+ * 骨架：
+ *   body.wb-app
+ *     header.wb-titlebar      品牌 + 菜单 + 模式切换 + 标题 + 右侧图标
+ *     div.wb-toolbar          主工具条（可选）
+ *     div.wb-workbench        面板区：.wb-panel / .wb-col 之间插 .wb-split
+ *     footer.wb-statusbar
+ */
+
+[hidden] {
+  display: none !important;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body.wb-app {
+  margin: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  font: var(--wb-font) / 1.4 var(--ui-font);
+  background: var(--wb-bg-0);
+  color: var(--wb-fg);
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+body.wb-app > .wb-workbench {
+  grid-row: 3;
+}
+
+body.wb-app > .wb-statusbar {
+  grid-row: 4;
+}
+
+.wb-app button,
+.wb-app select,
+.wb-app input,
+.wb-app textarea {
+  font: inherit;
+  color: inherit;
+}
+
+.wb-app input,
+.wb-app textarea,
+.wb-selectable {
+  user-select: text;
+}
+
+.wb-app :focus-visible {
+  outline: 1px solid var(--wb-accent);
+  outline-offset: -1px;
+}
+
+.wb-spacer {
+  flex: 1;
+}
+
+.wb-mono {
+  font-family: var(--mono);
+}
+
+/* 线性图标：<svg class="i" viewBox="0 0 16 16">，填充型加 .i-fill */
+svg.i {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+svg.i.i-fill {
+  fill: currentColor;
+  stroke: none;
+}
+
+svg.i.i-sm {
+  width: 14px;
+  height: 14px;
+}
+
+/* ---------- 标题栏（Electron 下即窗口拖动区） ---------- */
+
+.wb-titlebar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--wb-titlebar-h);
+  padding: 0 8px;
+  background: var(--wb-bg-0);
+  -webkit-app-region: drag;
+}
+
+.wb-titlebar button,
+.wb-titlebar a,
+.wb-titlebar select,
+.wb-titlebar input,
+.wb-titlebar label,
+.wb-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* macOS 下 Electron 用 hiddenInset 标题栏：左侧给原生红绿灯让位 */
+.is-electron.platform-mac .wb-titlebar {
+  padding-left: 80px;
+}
+
+.wb-brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 2px;
+  color: var(--wb-fg);
+  font-weight: 600;
+  font-size: var(--wb-font-lg);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.wb-brand-mark {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: linear-gradient(135deg, #3d8bfd 0%, #7a5cff 100%);
+  color: #fff;
+}
+
+.wb-version {
+  color: var(--wb-fg-mute);
+  font: var(--wb-font-xs) var(--mono);
+  font-weight: 400;
+}
+
+.wb-menubar {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.wb-menu-btn {
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--wb-radius);
+  background: transparent;
+  color: var(--wb-fg-dim);
+  cursor: default;
+}
+
+.wb-menu-btn:hover,
+.wb-menu-btn.is-open {
+  background: var(--wb-bg-3);
+  color: var(--wb-fg);
+}
+
+.wb-title-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 36vw;
+  overflow: hidden;
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* 窄窗口下绝对居中会压到菜单 / 模式切换，改回参与流式布局 */
+@media (max-width: 1280px) {
+  .wb-title-center {
+    position: static;
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: none;
+    margin: 0 12px;
+    transform: none;
+    text-align: center;
+  }
+}
+
+.wb-title-center strong {
+  color: var(--wb-fg);
+  font-weight: 500;
+}
+
+/* 测试台 / 编辑器 模式切换（Unity 顶栏的「场景 / 游戏」那种分段） */
+.wb-modes {
+  display: flex;
+  gap: 2px;
+  margin-left: 6px;
+  padding: 2px;
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+}
+
+.wb-mode {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: var(--wb-radius);
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.wb-mode:hover {
+  color: var(--wb-fg);
+  background: var(--wb-bg-3);
+}
+
+.wb-mode.is-active {
+  background: var(--wb-bg-4);
+  color: var(--wb-fg-strong);
+}
+
+.wb-title-right {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* ---------- 下拉菜单 / 右键菜单 ---------- */
+
+.wb-menu-pop {
+  position: fixed;
+  z-index: 1000;
+  min-width: 220px;
+  padding: 4px;
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+  box-shadow: var(--wb-shadow-pop);
+  color: var(--wb-fg);
+  font-size: var(--wb-font);
+}
+
+.wb-menu-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 26px;
+  padding: 0 10px 0 6px;
+  border: 0;
+  border-radius: var(--wb-radius);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.wb-menu-item:hover:not(:disabled) {
+  background: var(--wb-accent);
+  color: var(--wb-on-accent);
+}
+
+.wb-menu-item:hover:not(:disabled) .wb-kbd {
+  color: inherit;
+  opacity: 0.85;
+}
+
+.wb-menu-item:disabled {
+  color: var(--wb-fg-mute);
+}
+
+.wb-menu-item.danger {
+  color: var(--wb-danger);
+}
+
+.wb-menu-item.danger:hover:not(:disabled) {
+  background: var(--wb-danger);
+  color: #fff;
+}
+
+.wb-menu-item svg {
+  display: block;
+}
+
+.wb-menu-check {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  font-size: 11px;
+}
+
+.wb-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--wb-line);
+}
+
+.wb-kbd {
+  color: var(--wb-fg-mute);
+  font: var(--wb-font-xs) var(--mono);
+}
+
+/* ---------- 主工具条 ---------- */
+
+.wb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--wb-toolbar-h);
+  padding: 0 8px 2px;
+  background: var(--wb-bg-0);
+}
+
+.wb-tb-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+}
+
+.wb-tb-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--wb-line);
+}
+
+/* 居中的运行控制组（Unity 的 Play / Pause / Step） */
+.wb-transport {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.wb-toolbar {
+  position: relative;
+}
+
+/* ---------- 按钮 ---------- */
+
+.wb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--wb-ctl-h);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--wb-radius);
+  background: transparent;
+  color: var(--wb-fg);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.wb-btn:hover:not(:disabled) {
+  background: var(--wb-bg-4);
+}
+
+.wb-btn:active:not(:disabled) {
+  background: var(--wb-bg-3);
+}
+
+.wb-btn:disabled,
+.wb-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.wb-btn svg,
+.wb-icon-btn svg {
+  flex: none;
+  display: block;
+}
+
+.wb-btn.is-filled {
+  background: var(--wb-bg-3);
+}
+
+.wb-btn.is-filled:hover:not(:disabled) {
+  background: var(--wb-bg-4);
+}
+
+.wb-btn.is-primary {
+  background: var(--wb-accent);
+  color: var(--wb-on-accent);
+}
+
+.wb-btn.is-primary:hover:not(:disabled) {
+  background: var(--wb-accent-hover);
+}
+
+.wb-btn.is-danger {
+  color: var(--wb-danger);
+}
+
+.wb-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: var(--wb-ctl-h);
+  padding: 0;
+  border: 0;
+  border-radius: var(--wb-radius);
+  background: transparent;
+  color: var(--wb-fg-dim);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.wb-icon-btn.is-sm {
+  width: 22px;
+  height: var(--wb-ctl-h-sm);
+}
+
+.wb-icon-btn:hover:not(:disabled) {
+  background: var(--wb-bg-4);
+  color: var(--wb-fg);
+}
+
+.wb-icon-btn.is-on,
+.wb-btn.is-on,
+.wb-icon-btn[aria-pressed="true"] {
+  background: var(--wb-accent-soft);
+  color: var(--wb-accent-hover);
+}
+
+.wb-icon-btn.is-play {
+  color: var(--wb-play);
+}
+
+/* 复选框做成的开关芯片：保留原生 input（脚本读 .checked / onchange），只隐藏外观 */
+.wb-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--wb-ctl-h);
+  padding: 0 9px;
+  border-radius: var(--wb-radius);
+  color: var(--wb-fg-dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.wb-chip:hover {
+  background: var(--wb-bg-4);
+  color: var(--wb-fg);
+}
+
+.wb-chip > input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.wb-chip:has(> input:checked) {
+  background: var(--wb-accent-soft);
+  color: var(--wb-accent-hover);
+}
+
+.wb-chip:has(> input:focus-visible) {
+  outline: 1px solid var(--wb-accent);
+  outline-offset: -1px;
+}
+
+/* ---------- 表单控件 ---------- */
+
+.wb-app select,
+.wb-input,
+.wb-app input[type="search"],
+.wb-app input[type="text"],
+.wb-app input[type="number"] {
+  height: var(--wb-ctl-h);
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-input);
+  color: var(--wb-fg);
+  outline: none;
+}
+
+.wb-app textarea {
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-input);
+  color: var(--wb-fg);
+  outline: none;
+}
+
+.wb-app select {
+  padding: 0 22px 0 8px;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%23888' d='M0 0h8L4 5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+  cursor: pointer;
+}
+
+.wb-app select:hover,
+.wb-app input[type="search"]:hover,
+.wb-app input[type="text"]:hover,
+.wb-app input[type="number"]:hover {
+  border-color: var(--wb-line-strong);
+}
+
+.wb-app select:focus,
+.wb-app input[type="search"]:focus,
+.wb-app input[type="text"]:focus,
+.wb-app input[type="number"]:focus,
+.wb-app textarea:focus {
+  border-color: var(--wb-accent);
+}
+
+.wb-app select option {
+  background: var(--wb-bg-2);
+  color: var(--wb-fg);
+}
+
+.wb-app input[type="range"],
+.wb-app input[type="checkbox"],
+.wb-app input[type="radio"] {
+  accent-color: var(--wb-accent);
+}
+
+.wb-app input[type="range"] {
+  height: 16px;
+  margin: 0;
+}
+
+.wb-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.wb-search > svg {
+  position: absolute;
+  left: 7px;
+  color: var(--wb-fg-mute);
+  pointer-events: none;
+}
+
+.wb-search > input {
+  width: 100%;
+  padding-left: 24px !important;
+}
+
+/* 分段控件（类型筛选、模式等） */
+.wb-seg,
+.seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--wb-radius);
+  background: var(--wb-input);
+  border: 1px solid var(--wb-line);
+}
+
+.wb-seg > button,
+.seg > .seg-btn {
+  flex: 1;
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--wb-radius-sm);
+  background: transparent;
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+  cursor: pointer;
+}
+
+.wb-seg > button:hover:not(.active),
+.seg > .seg-btn:hover:not(.active) {
+  background: var(--wb-bg-3);
+  color: var(--wb-fg);
+}
+
+.wb-seg > button.active,
+.seg > .seg-btn.active {
+  background: var(--wb-bg-4);
+  color: var(--wb-fg-strong);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--wb-fg-dim);
+  cursor: pointer;
+}
+
+/* ---------- 工作台面板区 ---------- */
+
+.wb-workbench {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 4px;
+  overflow: hidden;
+}
+
+.wb-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.wb-row {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.wb-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-1);
+}
+
+/* 固定尺寸的停靠面板（宽/高由 splitter.ts 写 flex-basis）；整列停靠同理 */
+.wb-panel.is-dock,
+.wb-col.is-dock {
+  flex: none;
+}
+
+.wb-panel.is-fill {
+  flex: 1 1 0;
+}
+
+.wb-panel.is-collapsed,
+.wb-col.is-collapsed {
+  display: none;
+}
+
+.wb-panel-head {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: var(--wb-panel-head-h);
+  padding: 0 4px 0 2px;
+  background: var(--wb-bg-2);
+  border-bottom: 1px solid var(--wb-bg-0);
+}
+
+.wb-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--wb-fg);
+  font-size: var(--wb-font-sm);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.wb-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  margin-top: 3px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--wb-radius) var(--wb-radius) 0 0;
+  background: transparent;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.wb-tab > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wb-tab:hover {
+  color: var(--wb-fg);
+}
+
+.wb-tab.active {
+  background: var(--wb-bg-1);
+  color: var(--wb-fg-strong);
+}
+
+.wb-tab.active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: var(--wb-accent);
+}
+
+.wb-tab svg {
+  flex: none;
+  opacity: 0.8;
+}
+
+.wb-panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.wb-panel-body {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-panel-body.is-scroll {
+  overflow: auto;
+}
+
+/* 面板内的次级工具条（视口工具条、控制台过滤条） */
+.wb-subbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--wb-line-soft);
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+
+.wb-subbar::-webkit-scrollbar {
+  display: none;
+}
+
+.wb-subbar .wb-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 3px;
+  background: var(--wb-line);
+}
+
+.wb-labeled {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+  white-space: nowrap;
+}
+
+.wb-labeled > select {
+  color: var(--wb-fg);
+}
+
+/* ---------- 分隔条 ---------- */
+
+.wb-split {
+  position: relative;
+  flex: none;
+  z-index: 5;
+}
+
+.wb-split[data-axis="x"] {
+  width: var(--wb-gap);
+  margin: 0 1px;
+  cursor: col-resize;
+}
+
+.wb-split[data-axis="y"] {
+  height: var(--wb-gap);
+  margin: 1px 0;
+  cursor: row-resize;
+}
+
+/* 命中区比可见缝隙宽，好抓 */
+.wb-split::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.wb-split[data-axis="x"]::before {
+  left: -4px;
+  right: -4px;
+}
+
+.wb-split[data-axis="y"]::before {
+  top: -4px;
+  bottom: -4px;
+}
+
+.wb-split::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.wb-split:hover::after,
+.wb-split.is-dragging::after {
+  background: var(--wb-accent);
+  transition-delay: 0.15s;
+}
+
+.wb-split.is-dragging::after {
+  transition-delay: 0s;
+}
+
+/* 面板收起后分隔条变成可点的细把手（双击 / 单击展开） */
+.wb-split.is-collapsed[data-axis="x"] {
+  width: 6px;
+}
+
+.wb-split.is-collapsed[data-axis="y"] {
+  height: 6px;
+}
+
+.wb-split.is-collapsed::after {
+  background: var(--wb-bg-3);
+}
+
+.wb-split.is-collapsed:hover::after {
+  background: var(--wb-accent);
+}
+
+body.wb-resizing,
+body.wb-resizing * {
+  user-select: none !important;
+}
+
+body.wb-resizing iframe,
+body.wb-resizing canvas {
+  pointer-events: none;
+}
+
+body.wb-resizing-x {
+  cursor: col-resize !important;
+}
+
+body.wb-resizing-y {
+  cursor: row-resize !important;
+}
+
+/* ---------- 检视器：字段行 / 折叠分组 ---------- */
+
+.wb-section {
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+.wb-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  color: var(--wb-fg);
+  font-size: var(--wb-font-sm);
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+
+.wb-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+.wb-section > summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--wb-fg-mute);
+  transition: transform 0.12s;
+}
+
+.wb-section:not([open]) > summary::before {
+  transform: rotate(-90deg);
+}
+
+.wb-section > summary:hover {
+  background: var(--wb-bg-2);
+}
+
+.wb-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 10px 12px;
+}
+
+.wb-field {
+  display: grid;
+  grid-template-columns: minmax(72px, 38%) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: var(--wb-ctl-h);
+}
+
+.wb-field > .wb-field-label {
+  overflow: hidden;
+  color: var(--wb-fg-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-field > select,
+.wb-field > input,
+.wb-field > .wb-field-ctl {
+  width: 100%;
+  min-width: 0;
+}
+
+.wb-field-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wb-field-ctl > input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.wb-field-val {
+  min-width: 34px;
+  color: var(--wb-fg-dim);
+  font: var(--wb-font-sm) var(--mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 开关（检视器里的布尔项） */
+.wb-switch {
+  position: relative;
+  display: inline-block;
+  width: 30px;
+  height: 16px;
+  flex: none;
+}
+
+.wb-switch > input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.wb-switch > i {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  background: var(--wb-bg-4);
+  transition: background 0.15s;
+}
+
+.wb-switch > i::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--wb-fg-dim);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.wb-switch > input:checked + i {
+  background: var(--wb-accent);
+}
+
+.wb-switch > input:checked + i::after {
+  transform: translateX(14px);
+  background: #fff;
+}
+
+.wb-switch > input:focus-visible + i {
+  outline: 1px solid var(--wb-accent);
+  outline-offset: 1px;
+}
+
+.wb-hint {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+  line-height: 1.5;
+}
+
+.wb-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 16px;
+  color: var(--wb-fg-mute);
+  text-align: center;
+  line-height: 1.6;
+}
+
+.wb-empty svg {
+  opacity: 0.5;
+}
+
+.wb-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--wb-bg-3);
+  color: var(--wb-fg-dim);
+  font: var(--wb-font-xs) var(--mono);
+}
+
+/* ---------- 状态栏 ---------- */
+
+.wb-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--wb-statusbar-h);
+  padding: 0 10px;
+  background: var(--wb-bg-0);
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+  white-space: nowrap;
+}
+
+.wb-statusbar > span {
+  padding: 0 6px;
+}
+
+.wb-status-sep,
+.status-sep {
+  width: 1px;
+  height: 12px;
+  padding: 0 !important;
+  background: var(--wb-line);
+}
+
+.wb-status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--wb-fg-mute);
+  vertical-align: 0;
+}
+
+.wb-status-dot.is-ok {
+  background: var(--wb-ok);
+}
+
+.wb-status-dot.is-err {
+  background: var(--wb-danger);
+}
+
+/* ---------- 滚动条 ---------- */
+
+.wb-app ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.wb-app ::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background: var(--scroll-thumb) padding-box;
+}
+
+.wb-app ::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover) padding-box;
+}
+
+.wb-app ::-webkit-scrollbar-track,
+.wb-app ::-webkit-scrollbar-corner {
+  background: transparent;
+}

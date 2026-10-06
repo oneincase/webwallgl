@@ -17,9 +17,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "build:pages": "tsc --noEmit && vite build --base=/webwallgl/",
-    "build:lib": "node scripts/gen-readme.mjs && node scripts/build-lib.mjs && tsc -p tsconfig.lib-types.json && node scripts/assemble-lib.mjs",
-    "gen:readme": "node scripts/gen-readme.mjs",
+    "build:lib": "node scripts/build-lib.mjs && tsc -p tsconfig.lib-types.json && node scripts/assemble-lib.mjs",
     "gen:icons": "node scripts/gen-icons.mjs",
     "publish:npm": "npm run build:lib && node scripts/publish-npm.mjs",
     "export:github": "node scripts/export-github.mjs",

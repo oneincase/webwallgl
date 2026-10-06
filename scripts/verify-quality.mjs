@@ -125,7 +125,7 @@ const particlesSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render
 const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
 const mainSrc = fs.readFileSync(join(ROOT, "renderer/src/main.ts"), "utf8");
 const apiMountSrc = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
-const benchSrc = fs.readFileSync(join(ROOT, "bench/bench.ts"), "utf8");
+const benchSrc = fs.readFileSync(join(ROOT, "bench/render-settings.ts"), "utf8");
 const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
 
 // 2a) renderer.js：AA/MSAA/后处理门控
@@ -210,7 +210,7 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/normalizeVideoTexScale/.test(mountSrc) && /videoPinned/.test(mountSrc),
     "宿主显式倍率优先于自动下坡（videoPinned 闸门）");
   check(/webwallgl-quality/.test(benchSrc), "测试台质量设置 localStorage 持久化");
-  check(/id="aa"/.test(indexSrc) && /id="pq"/.test(indexSrc) && /id="pp"/.test(indexSrc), "测试台工具条有三个档位下拉");
+  check(/id="aa"/.test(indexSrc) && /id="pq"/.test(indexSrc) && /id="pp"/.test(indexSrc), "测试台渲染设置有三个档位下拉");
 }
 
 // ---------- 3) 变异红测（在内存里改坏源码，确认对应断言变红）----------

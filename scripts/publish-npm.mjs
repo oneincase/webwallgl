@@ -46,7 +46,6 @@ const NEED = [
   "editor.d.ts",
   "types.d.ts",
   "README.md",
-  "README.en.md",
   "LICENSE",
   "imgs/wechat.png",
   "imgs/alipay.png",

@@ -1,0 +1,143 @@
+/*
+ * WebWallGL 工作台设计令牌（测试台 / 编辑器共用）。
+ *
+ * 视觉参照 Unity 6 / Unreal 5：深灰中性色分层（应用底 → 面板 → 面板头 → 控件），
+ * 面板之间留 2px 缝隙露出应用底色，强调色只用在选中 / 焦点 / 运行态。
+ * 深色为 :root 默认，浅色由 html[data-theme="light"] 覆盖（shared/workbench/theme.ts 写入）。
+ *
+ * 下半段的旧变量名（--sidebar / --editor / --widget-border …）是兼容别名：
+ * 页面私有样式仍在用，统一指向新层级，不再单独取色。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 分层底色：0 = 应用底（面板缝隙）、1 = 面板、2 = 面板头/工具条、3 = 控件悬停 */
+  --wb-bg-0: #0e0f11;
+  --wb-bg-1: #1a1b1e;
+  --wb-bg-2: #222327;
+  --wb-bg-3: #2b2c31;
+  --wb-bg-4: #34363c;
+  --wb-input: #131417;
+  --wb-viewport: #0a0a0b;
+
+  --wb-line: #2c2e33;
+  --wb-line-strong: #3a3c42;
+  --wb-line-soft: #212226;
+
+  --wb-fg: #d8d9dd;
+  --wb-fg-dim: #a0a2a9;
+  --wb-fg-mute: #6c6f77;
+  --wb-fg-strong: #ffffff;
+
+  --wb-accent: #3d8bfd;
+  --wb-accent-hover: #5a9cff;
+  --wb-accent-press: #2f74db;
+  --wb-accent-soft: rgba(61, 139, 253, 0.18);
+  --wb-accent-line: rgba(61, 139, 253, 0.55);
+  --wb-on-accent: #ffffff;
+
+  --wb-ok: #4cc38a;
+  --wb-warn: #e5b454;
+  --wb-danger: #f2686a;
+  --wb-play: #4cc38a;
+
+  --wb-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.6);
+  --wb-shadow-stage: 0 6px 30px rgba(0, 0, 0, 0.55);
+
+  --wb-radius-sm: 3px;
+  --wb-radius: 4px;
+  --wb-radius-lg: 6px;
+
+  --wb-gap: 2px;
+  --wb-ctl-h: 24px;
+  --wb-ctl-h-sm: 20px;
+  --wb-titlebar-h: 36px;
+  --wb-toolbar-h: 40px;
+  --wb-panel-head-h: 30px;
+  --wb-statusbar-h: 24px;
+
+  --wb-font-xs: 10.5px;
+  --wb-font-sm: 11.5px;
+  --wb-font: 12px;
+  --wb-font-lg: 13px;
+
+  --ui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+
+  /* ---------- 兼容别名（页面私有样式在用） ---------- */
+  --fg: var(--wb-fg);
+  --fg-dim: var(--wb-fg-dim);
+  --fg-mute: var(--wb-fg-mute);
+  --accent: var(--wb-accent);
+  --accent-hover: var(--wb-accent-hover);
+  --focus: var(--wb-accent);
+  --danger: var(--wb-danger);
+  --warn: var(--wb-warn);
+  --link: #6cb2ff;
+  --titlebar: var(--wb-bg-0);
+  --activity: var(--wb-bg-0);
+  --sidebar: var(--wb-bg-1);
+  --editor: var(--wb-bg-1);
+  --panel: var(--wb-bg-1);
+  --status: var(--wb-bg-0);
+  --input: var(--wb-input);
+  --hover: var(--wb-bg-3);
+  --inactive-sel: var(--wb-bg-3);
+  --active-sel: var(--wb-accent-soft);
+  --border: var(--wb-line);
+  --widget-border: var(--wb-line-strong);
+  --hairline: var(--wb-line-soft);
+  --bezel: var(--wb-viewport);
+  --icon: var(--wb-fg-dim);
+  --icon-dim: var(--wb-fg-mute);
+  --icon-active: var(--wb-fg);
+  --toolbar-hover: var(--wb-bg-3);
+  --btn-hover: var(--wb-bg-4);
+  --list-active-fg: var(--wb-fg-strong);
+  --tab-active-fg: var(--wb-fg-strong);
+  --panel-active-fg: var(--wb-fg-strong);
+  --checked-border: var(--wb-accent-line);
+  --shadow: var(--wb-shadow-pop);
+  --scroll-thumb: #3a3c42;
+  --scroll-thumb-hover: #4a4d55;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+
+  --wb-bg-0: #c9cbd0;
+  --wb-bg-1: #eeeff1;
+  --wb-bg-2: #e3e4e7;
+  --wb-bg-3: #d8dadd;
+  --wb-bg-4: #cdd0d4;
+  --wb-input: #ffffff;
+  --wb-viewport: #2a2b2f;
+
+  --wb-line: #c4c6cb;
+  --wb-line-strong: #b3b6bc;
+  --wb-line-soft: #dcdde0;
+
+  --wb-fg: #24262b;
+  --wb-fg-dim: #50535b;
+  --wb-fg-mute: #82858d;
+  --wb-fg-strong: #000000;
+
+  --wb-accent: #1f6fe0;
+  --wb-accent-hover: #2b7cf0;
+  --wb-accent-press: #185bbb;
+  --wb-accent-soft: rgba(31, 111, 224, 0.16);
+  --wb-accent-line: rgba(31, 111, 224, 0.5);
+
+  --wb-ok: #1f9d63;
+  --wb-warn: #a66f00;
+  --wb-danger: #cc3a3d;
+  --wb-play: #1f9d63;
+
+  --wb-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.12);
+  --wb-shadow-stage: 0 6px 24px rgba(0, 0, 0, 0.3);
+
+  --link: #1f6fe0;
+  --scroll-thumb: #b9bcc2;
+  --scroll-thumb-hover: #a2a5ac;
+}

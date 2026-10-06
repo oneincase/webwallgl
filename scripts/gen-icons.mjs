@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * PWA 图标生成（一次性资产，改设计后重跑 `pnpm gen:icons`）。
+ * 应用图标生成（页面 favicon，后续桌面壳也用；一次性资产，改设计后重跑 `pnpm gen:icons`）。
+ * 文件名保留历史的 pwa- 前缀，避免外部引用失效。
  *
  * 纯 Node 实现：手写 PNG 编码（zlib deflate + CRC32），零额外依赖。
  * 画面 = 壁纸隐喻的极简风景：夜空渐变 + 暖日 + 两层山。

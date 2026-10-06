@@ -68,6 +68,16 @@ for (const f of listFiles(path.join(ROOT, "host"), ".ts")) {
   check(!bad, `host/${path.basename(f)}：宿主模拟不得 import 引擎或渲染器源码`);
 }
 
+// shared/（测试台与编辑器共用的工作台外壳）是纯 UI 层：不碰引擎，也不反向依赖页面
+const SHARED_DIR = path.join(ROOT, "shared");
+if (fs.existsSync(SHARED_DIR)) {
+  for (const f of listFiles(SHARED_DIR, ".ts")) {
+    const src = fs.readFileSync(f, "utf8");
+    const bad = /from\s+['"][^'"]*(renderer|bench|editor)\//.exec(src);
+    check(!bad, `${path.relative(ROOT, f)}：工作台外壳不得 import renderer / bench / editor`);
+  }
+}
+
 // editor/（测试台编辑器页，docs/EDITOR-PLAN.md §3A）只经公开出口驱动引擎：
 // renderer/ 下只准 import api/editor 与 api/core；不得读调试探针 —— 页面缺能力就补公开 API。
 const EDITOR_DIR = path.join(ROOT, "editor");

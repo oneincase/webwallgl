@@ -20,7 +20,10 @@ import {
   type SceneInstance,
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
+import { applyPlatformClasses } from "../shared/workbench/platform";
+import { bindThemeButton } from "../shared/workbench/theme";
 import { applyEditorStatic, et } from "./i18n";
+import { resetEditorLayout } from "./layout";
 import { overlayAssets, type OverlayAssets } from "./assets";
 import {
   RESOLUTIONS,
@@ -202,49 +205,21 @@ $<HTMLButtonElement>("#ed-con-clear").onclick = () => {
   conCountEl.textContent = "";
 };
 
-// ---------- 主题 / 语言（与测试台共用 localStorage 键） ----------
+// ---------- 外壳：平台、主题、语言、面板布局（与测试台共用 shared/workbench） ----------
 
-type ThemeMode = "auto" | "dark" | "light";
-const THEME_KEY = "webwallgl-theme";
-const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
-const themeToggleEl = $<HTMLButtonElement>("#theme-toggle");
-let themeMode: ThemeMode = "auto";
+applyPlatformClasses();
+const themeBtn = bindThemeButton($("#theme-toggle"), (mode) => t(`theme.${mode}`));
 
-function applyTheme(mode: ThemeMode) {
-  themeMode = mode;
-  document.documentElement.dataset.theme = mode === "auto" ? (darkQuery.matches ? "dark" : "light") : mode;
-  themeToggleEl.title = t(`theme.${mode}`);
-  for (const ic of themeToggleEl.querySelectorAll<SVGSVGElement>(".ic")) {
-    if (ic.classList.contains(`ic-${mode}`)) ic.removeAttribute("hidden");
-    else ic.setAttribute("hidden", "");
-  }
-}
-
-themeToggleEl.onclick = () => {
-  const next: ThemeMode = themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
-  try {
-    localStorage.setItem(THEME_KEY, next);
-  } catch {
-    /* 隐私模式 */
-  }
-  applyTheme(next);
+$<HTMLButtonElement>("#layout-reset").onclick = () => {
+  resetEditorLayout();
+  log(t("log.layoutReset"));
 };
-
-try {
-  const saved = localStorage.getItem(THEME_KEY);
-  applyTheme(saved === "dark" || saved === "light" ? saved : "auto");
-} catch {
-  applyTheme("auto");
-}
-darkQuery.addEventListener("change", () => {
-  if (themeMode === "auto") applyTheme("auto");
-});
 
 const langEl = $<HTMLSelectElement>("#lang");
 langEl.value = getLang();
 langEl.onchange = () => setLang(langEl.value as Lang);
 onChangeLang(() => {
-  applyTheme(themeMode);
+  themeBtn.refresh();
   renderLibrary();
   renderTree();
   renderInspector();
@@ -260,16 +235,18 @@ function layoutStage() {
   const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
   const availW = Math.max(0, viewportEl.clientWidth - padX);
   const availH = Math.max(0, viewportEl.clientHeight - padY);
-  let w = availW;
-  let h = availH;
+  let w = Math.floor(availW);
+  let h = Math.floor(availH);
   if (aspectEl.value !== "fill") {
+    // 按宽高比的整数倍取尺寸：宽高各自取整会让比例漂离精确值，
+    // 画面 ↔ 世界坐标的 x / y 换算就不再一致（手柄拖拽会轻微走样）
     const [aw, ah] = aspectEl.value.split(":").map(Number);
-    const r = aw / ah;
-    if (availW / availH > r) w = availH * r;
-    else h = availW / r;
+    const k = Math.max(0, Math.floor(Math.min(availW / aw, availH / ah)));
+    w = k * aw;
+    h = k * ah;
   }
-  stageEl.style.width = `${Math.floor(w)}px`;
-  stageEl.style.height = `${Math.floor(h)}px`;
+  stageEl.style.width = `${w}px`;
+  stageEl.style.height = `${h}px`;
 }
 
 new ResizeObserver(layoutStage).observe(viewportEl);

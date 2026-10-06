@@ -252,7 +252,7 @@ function scanLibrary(lib) {
   return items;
 }
 
-/** 渲染器页 query（对齐 bench/bench.ts 的 buildQuery，逐字段含义见那里） */
+/** 渲染器页 query（对齐 bench/session.ts 的 buildQuery，逐字段含义见那里） */
 function rendererUrl({ origin, item, mediaBase, webBase, dpr = 0, aa, pp, pq, fps = 60, noQuality = false, noBake = false, extra = {} }) {
   const p = new URLSearchParams();
   p.set("type", item.hasScene ? "scene" : item.type);

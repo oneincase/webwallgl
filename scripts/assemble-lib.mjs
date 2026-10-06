@@ -11,14 +11,14 @@
  *   webwallgl-core.mjs / webwallgl-core.min.mjs
  *   webwallgl-editor.mjs / webwallgl-editor.min.mjs
  *   各自 .map / webwallgl.d.ts / core.d.ts / editor.d.ts / types.d.ts / package.json
- *   README.md / README.en.md / LICENSE / imgs/（使用说明、许可、收款码随包发布）
+ *   README.md / LICENSE / imgs/（简介、许可、收款码随包发布）
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
 
-// 同 gen-readme.mjs：`.pathname` 在 Windows 上是 "/D:/..."，join 后成 "\D:\..."，
+// `.pathname` 在 Windows 上是 "/D:/..."，join 后成 "\D:\..."，
 // 会让后续 existsSync / esbuild 全部找不到文件。必须 fileURLToPath。
 const root = fileURLToPath(new URL("..", import.meta.url));
 const libDir = join(root, "dist", "lib");
@@ -76,13 +76,9 @@ for (const { in: inFile, out: outFile, format } of MINIFY) {
   writeFileSync(join(libDir, `${outFile}.map`), `${JSON.stringify(map)}\n`);
 }
 
-// 使用说明与许可随包发布：npm 包根的 README.md 会被 registry 页面渲染
-// （build:lib 链条开头已先跑 gen-readme，这里拷的是最新版）。
-// README 里的收款码图片路径 public/imgs/… 重写为包内的 imgs/…，图片一并拷入。
-for (const f of ["README.md", "README.en.md"]) {
-  const src = readFileSync(join(root, f), "utf8");
-  writeFileSync(join(libDir, f), src.replaceAll("public/imgs/", "imgs/"));
-}
+// 简介与许可随包发布：npm 包根的 README.md 会被 registry 页面渲染。
+// README 里的收款码走 jsDelivr 绝对地址，原样拷贝即可；图片另拷一份进包内 imgs/。
+copyFileSync(join(root, "README.md"), join(libDir, "README.md"));
 copyFileSync(join(root, "LICENSE"), join(libDir, "LICENSE"));
 mkdirSync(join(libDir, "imgs"), { recursive: true });
 for (const img of readdirSync(join(root, "public", "imgs"))) {
@@ -166,5 +162,5 @@ writeFileSync(
   ) + "\n",
 );
 console.log(
-  "dist/lib 组装完成：三包（webwallgl / webwallgl-core / webwallgl-editor）×（可读 + min，各带 .map）/ 各包 .d.ts / types.d.ts / package.json / README ×2 / LICENSE / imgs",
+  "dist/lib 组装完成：三包（webwallgl / webwallgl-core / webwallgl-editor）×（可读 + min，各带 .map）/ 各包 .d.ts / types.d.ts / package.json / README / LICENSE / imgs",
 );
