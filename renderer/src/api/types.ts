@@ -793,7 +793,8 @@ export type EditorControls = {
   getLayerProps(id: number): EditorLayerProps | null;
   /**
    * 热改图层属性（W2-lite），当帧生效（拾取与轮廓立即同步）。暂停中会补画一帧，
-   * Promise 在该帧画完后落地。变换绑了脚本/动画的层，下一帧会被脚本覆盖。
+   * Promise 在该帧画完后落地。变换绑了脚本的层，下一帧会被脚本覆盖；
+   * 字段上有关键帧动画时，该字段的曲线写回暂停到下一次 seek（编辑器拖拽 / 输入跟手，提交后由页面落关键帧并 seek 复原）。
    */
   setLayerProps(id: number, patch: Partial<EditorLayerProps>): Promise<void>;
   /** 图层轮廓（选中框用，W5 过渡方案）；透视相机场景 / id 不存在返回 null */

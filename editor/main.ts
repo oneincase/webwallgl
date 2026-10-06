@@ -117,6 +117,7 @@ import {
   getAnim,
   isAnimated,
   keyTimes,
+  moveKeyTime,
   removeKey,
   setAnimOption,
   setKey,
@@ -537,19 +538,62 @@ function setTimelineMax(max: number) {
   renderKeyMarks();
 }
 
-/** 时间轴上画选中层的关键帧（首个周期内的时刻） */
+/** 时间轴上画选中层的关键帧（首个周期内的时刻）；可编辑时拖动标记改关键帧时刻 */
 function renderKeyMarks() {
   tlKeysEl.textContent = "";
   const n = selectedNode();
   if (!n) return;
+  const editable = !!editor && !!doc?.scene && !!current?.assets && !isLocked(n.id);
   for (const t of keyTimes(n.obj)) {
     if (t > tlMax) continue;
     const m = document.createElement("i");
     m.className = "tl-key";
     m.dataset.t = String(t);
+    m.title = `${fmtTime(t)}${editable ? ` · ${et("anim.dragMark")}` : ""}`;
     m.style.left = `${(t / tlMax) * 100}%`;
+    if (editable) {
+      m.classList.add("is-draggable");
+      m.addEventListener("pointerdown", (e) => startKeyDrag(e, m, n, t));
+    }
     tlKeysEl.appendChild(m);
   }
+}
+
+function startKeyDrag(e: PointerEvent, m: HTMLElement, n: LayerNode, from: number) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  m.setPointerCapture(e.pointerId);
+  m.classList.add("is-dragging");
+  scrubbing = true;
+  const box = tlKeysEl.getBoundingClientRect();
+  const snap = (t: number) => Math.round(t * 30) / 30;
+  let to = from;
+  const move = (ev: PointerEvent) => {
+    to = snap(Math.max(0, Math.min(tlMax, ((ev.clientX - box.left) / box.width) * tlMax)));
+    m.style.left = `${(to / tlMax) * 100}%`;
+    tlTimeEl.textContent = fmtTime(to);
+  };
+  const end = () => {
+    m.removeEventListener("pointermove", move);
+    m.removeEventListener("pointerup", end);
+    m.removeEventListener("pointercancel", end);
+    m.classList.remove("is-dragging");
+    scrubbing = false;
+    if (Math.abs(to - from) < 1e-3) return renderKeyMarks();
+    const ok = objEditOk(
+      et("log.keyMoved", { layer: nodeName(n.id), from: fmtTime(from), to: fmtTime(to) }),
+      n.id,
+      (o) => moveKeyTime(o, from, to),
+    );
+    if (!ok) {
+      log(et("log.keyMoveBad", { to: fmtTime(to) }), "warn");
+      renderKeyMarks();
+    }
+  };
+  m.addEventListener("pointermove", move);
+  m.addEventListener("pointerup", end);
+  m.addEventListener("pointercancel", end);
 }
 
 function resetTimelineRange() {
@@ -2569,7 +2613,7 @@ function soundGroup(node: LayerNode): HTMLElement {
 // ---------- 关键帧动画：字段开 / 关动画、当前帧打关键帧、改动自动落关键帧、时长 / 模式 / 插值 ----------
 
 const canAnimate = (n: LayerNode) => n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model";
-const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha" };
+const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color" };
 
 /** 画面上的当前值（动画字段 = 曲线在当前时刻的值）；没有引擎时退回静态值 */
 function liveValue(node: LayerNode, f: AnimField): number[] {

@@ -1863,6 +1863,7 @@ section("AA2. 声音层闭环（新建 → 导入两段音频、撤掉一层 →
 
 section("AB. 关键帧动画 editor/keyframes.ts + 引擎 seekTime");
 const kfMod = await loadEditorModule("keyframes");
+const near3 = (a, b, eps = 1e-3) => a.every((v, i) => Math.abs(v - b[i]) < eps);
 const animMod = await imp("renderer/vendor/we-scene/render/animation.js");
 {
   const near = (a, b, eps = 1e-3) => (Array.isArray(a) ? a.every((v, i) => Math.abs(v - b[i]) < eps) : Math.abs(a - b) < eps);
@@ -1942,6 +1943,34 @@ const animMod = await imp("renderer/vendor/we-scene/render/animation.js");
   kfMod.enableAnim(o, "alpha", [0.25]);
   check(json(kfMod.splitAnimated(o, { alpha: 0.6 }).keyed) === json({ alpha: [0.6] }), "alpha 标量转单元素数组");
   check(json(kfMod.keyTimes(o)) === json([0, 2]), "keyTimes：全部动画字段关键帧的时刻（秒）去重排序");
+}
+
+section("AC. 关键帧补完：颜色动画 / 拖动关键帧改时刻");
+{
+  const key = (frame, v) => ({ back: { enabled: true, x: -1, y: 0 }, frame, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: v });
+  check(json(kfMod.baseValue({}, "color")) === json([1, 1, 1]) && json(kfMod.baseValue({ color: "0.5 0.25 1" }, "color")) === json([0.5, 0.25, 1]), "颜色基准：缺省白、\"r g b\" 串");
+  const c = { color: "1 1 1" };
+  check(kfMod.enableAnim(c, "color", [1, 1, 1]) && kfMod.setKey(c, "color", 30, [1, 0, 0]) && kfMod.getAnim(c, "color").channels === 3 && c.color.value === "1 1 1", "颜色开动画：3 通道、静态值保留");
+  const Lc = parseMod.parseScene({ general: {}, objects: [{ id: 1, text: "x", ...structuredClone(c) }] }, { type: "scene" }).layers[0];
+  check(!!Lc.objectAnimations?.color, "引擎 parseScene 认得颜色动画");
+  check(near3(animMod.createAnimation(c.color.animation).seekTime(1).value(), [1, 0, 0]), "★ 引擎求值：1s = 红");
+  check(json(kfMod.splitAnimated(c, { color: [0, 1, 0], alpha: 0.5 }).keyed) === json({ color: [0, 1, 0] }), "颜色改动也拎出来落关键帧");
+  check(kfMod.enableAnim({}, "color", [1, 1, 1]) && !kfMod.enableAnim({}, "color", [1, 1]), "无 color 字段的层开颜色动画补缺省；维度不对拒绝");
+
+  const mk = () => ({
+    origin: { value: "0 0 0", animation: { c0: [key(0, 0), key(30, 1), key(60, 2)], c1: [key(0, 0), key(30, 0), key(60, 0)], c2: [key(0, 0), key(30, 0), key(60, 0)], options: { fps: 30, length: 90, mode: "loop" } } },
+    alpha: { value: 1, animation: { c0: [key(0, 1), key(30, 0)], options: { fps: 30, length: 90, mode: "loop" } } },
+  });
+  const m = mk();
+  check(kfMod.moveKeyTime(m, 1, 1.5) && json(m.origin.animation.c0.map((k) => k.frame)) === json([0, 45, 60]) && json(m.alpha.animation.c0.map((k) => k.frame)) === json([0, 45]) && m.origin.animation.c1[1].frame === 45, "拖动 1s → 1.5s：该时刻所有字段、所有通道的关键帧一起挪（值不变）");
+  const snap = json(m);
+  check(!kfMod.moveKeyTime(m, 1.5, 2) && json(m) === snap, "目标帧已有关键帧（位置在 2s 有一枚）：整体拒绝、一处不改（alpha 在 2s 没有也不挪）");
+  check(kfMod.moveKeyTime(m, 1.5, 0.5) && json(m.origin.animation.c0.map((k) => [k.frame, k.value])) === json([[0, 0], [15, 1], [60, 2]]), "越过别的关键帧也行：重排后仍按帧号有序、值跟着走");
+  const m2 = mk();
+  check(kfMod.moveKeyTime(m2, 2, 99) && m2.origin.animation.c0.at(-1).frame === 90, "挪出时长：钳到最后一帧");
+  check(!kfMod.moveKeyTime(mk(), 0.7, 1.2) && !kfMod.moveKeyTime(mk(), 1, 1) && !kfMod.moveKeyTime(mk(), NaN, 1), "该时刻没有关键帧 / 原地 / 非法时刻：不算改动");
+  const m3 = { origin: { value: "0 0 0", animation: { c0: [key(0, 0), key(12, 1)], c1: [key(0, 0)], c2: [key(0, 0)], options: { fps: 12, length: 24, mode: "loop" } } } };
+  check(kfMod.moveKeyTime(m3, 1, 1.5) && m3.origin.animation.c0[1].frame === 18, "按各条动画自己的 fps 换帧（外来 12fps 动画：1.5s = 第 18 帧）");
 }
 
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
@@ -2067,6 +2096,9 @@ section("I. 接线");
   check(/function commit\(cmd: PropsCmd\) \{\s*const keyed = pendingKeys\.get\(String\(cmd\.id\)\);[\s\S]{0,200}keyEdit\(node, keyed\);/.test(main) && /setKey\(o, f, frameAt\(v, t\), keyed\[f\]!\)/.test(main), "提交（检视器 change / 拖拽松手）时，动画字段的改动变成当前帧的关键帧（objEdit，可撤销）");
   check(/if \(canAnimate\(node\)\) inspectorEl\.appendChild\(animGroup\(node\)\);/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
   check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
+  check(/for \(const run of animRuns\) \{\s*if \(run\.layer === l && \(p as Record<string, unknown>\)\[run\.field\] !== undefined\) run\.held = true;/.test(sm) && /else run\.ctrl\.advance\(clockDt\);\s*if \(run\.held\) continue;/.test(sm) && /animSeekPending = true;\s*for \(const run of animRuns\) run\.held = false;/.test(sm), "引擎：热改动画字段后曲线写回暂停到下一次 seek（拖拽 / 输入跟手）");
+  check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(sm) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(sm), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
+  check(/m\.addEventListener\("pointerdown", \(e\) => startKeyDrag\(e, m, n, t\)\)/.test(main) && /\(o\) => moveKeyTime\(o, from, to\)/.test(main) && /log\(et\("log\.keyMoveBad"/.test(main), "时间轴关键帧标记可拖动改时刻（objEdit，冲突时提示并复原）");
   check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -2305,6 +2337,14 @@ section("J. 变异红测");
   const ko2 = { origin: "0 0 0" };
   km2.enableAnim(ko2, "origin", [0, 0, 0]);
   check("origin" in km2.splitAnimated(ko2, { origin: [1, 2, 3] }).plain, "不拎出时「动画字段改动不写静态值」判据变红");
+  const km4 = await kfMut("    if (v.keys.some((k) => k.frame === to)) return false;\n", "", "挪关键帧的占位检查");
+  const k4 = { origin: { value: "0 0 0", animation: { c0: [{ frame: 0, value: 0 }, { frame: 30, value: 1 }, { frame: 60, value: 2 }], options: { fps: 30, length: 90, mode: "loop" } } } };
+  km4.moveKeyTime(k4, 1, 2);
+  check(new Set(k4.origin.animation.c0.map((k) => k.frame)).size < 3, "不查占位时「目标帧被占整体拒绝」判据变红（同帧两枚关键帧）");
+  const km5 = await kfMut("      c.sort((x, y) => Number(x.frame) - Number(y.frame));\n", "", "挪关键帧后重排");
+  const k5 = { origin: { value: "0 0 0", animation: { c0: [{ frame: 0, value: 0 }, { frame: 30, value: 1 }, { frame: 60, value: 2 }], options: { fps: 30, length: 90, mode: "loop" } } } };
+  km5.moveKeyTime(k5, 2, 0.5);
+  check(json(k5.origin.animation.c0.map((k) => k.frame)) !== json([0, 15, 30]), "不重排时「挪后仍按帧号有序」判据变红");
   const km3 = await kfMut("const v = r5(abs[i] - (base ? base[i] ?? 0 : 0));", "const v = r5(abs[i]);", "relative 减基准");
   const ko3 = { origin: { value: "100 0 0", animation: { relative: true, c0: [{ frame: 0, value: 0 }], c1: [{ frame: 0, value: 0 }], c2: [{ frame: 0, value: 0 }], options: { fps: 30, length: 60, mode: "loop" } } } };
   km3.setKey(ko3, "origin", 30, [130, 0, 0]);

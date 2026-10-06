@@ -459,6 +459,15 @@ html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
   transform: translateX(-50%) rotate(45deg);
 }
 
+.tl-key.is-draggable {
+  pointer-events: auto;
+  cursor: ew-resize;
+}
+
+.tl-key.is-dragging {
+  outline: 1px solid var(--wb-fg);
+}
+
 #tl-max {
   min-width: 36px;
   color: var(--wb-fg-mute);

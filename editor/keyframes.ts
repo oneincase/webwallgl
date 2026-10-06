@@ -1,6 +1,6 @@
 // 关键帧动画：图层字段的 `{ value, animation: { c0..cN, options, relative } }`（WE 原生格式，
 // 引擎 render/animation.js 求值）。语料 350 张场景壁纸实测：
-// - 变换三件套 3 通道（angles 为弧度），alpha 1 通道；
+// - 变换三件套与 color 3 通道（angles 为弧度），alpha 1 通道；
 // - options 最常见 `{ fps: 30, length, mode, wraploop: false }`，mode = loop / single / mirror；
 // - 关键帧恒为 6 字段 `{ back, frame, front, lockangle, locklength, value }`，frame 为整数；
 //   front {enabled:true,x:1,y:0} + back {enabled:true,x:-1,y:0} = 平滑（缓入缓出），enabled:false = 线性。
@@ -9,9 +9,9 @@
 import { unwrap, type SceneObject } from "./doc";
 import type { EditorLayerProps } from "../renderer/src/api/editor";
 
-export const ANIM_FIELDS = ["origin", "scale", "angles", "alpha"] as const;
+export const ANIM_FIELDS = ["origin", "scale", "angles", "alpha", "color"] as const;
 export type AnimField = (typeof ANIM_FIELDS)[number];
-export const CHANNELS: Record<AnimField, number> = { origin: 3, scale: 3, angles: 3, alpha: 1 };
+export const CHANNELS: Record<AnimField, number> = { origin: 3, scale: 3, angles: 3, alpha: 1, color: 3 };
 
 export const ANIM_MODES = ["loop", "mirror", "single"] as const;
 export type AnimMode = (typeof ANIM_MODES)[number];
@@ -61,7 +61,7 @@ function channelsOf(a: Anim): Key[][] {
 export function baseValue(obj: SceneObject, field: AnimField): number[] {
   const raw = unwrap(obj[field]);
   const n = CHANNELS[field];
-  const dflt = field === "scale" || field === "alpha" ? 1 : 0;
+  const dflt = field === "scale" || field === "alpha" || field === "color" ? 1 : 0;
   const arr =
     typeof raw === "string"
       ? raw.trim().split(/\s+/).map(Number)
@@ -149,7 +149,7 @@ export function enableAnim(obj: SceneObject, field: AnimField, cur: readonly num
 }
 
 function defaultRaw(field: AnimField): unknown {
-  return field === "alpha" ? 1 : field === "scale" ? "1 1 1" : "0 0 0";
+  return field === "alpha" ? 1 : field === "scale" || field === "color" ? "1 1 1" : "0 0 0";
 }
 
 const validLength = (n: number) => Number.isInteger(n) && n >= 1 && n <= MAX_LENGTH;
@@ -209,6 +209,31 @@ export function removeKey(obj: SceneObject, field: AnimField, frame: number): bo
   if (chans.some((c) => c.every((k) => Number(k.frame) === frame))) return false;
   chans.forEach((c, i) => (a[`c${i}`] = c.filter((k) => Number(k.frame) !== frame)));
   return true;
+}
+
+/**
+ * 把时刻 fromT（秒）上的关键帧整体挪到 toT：图层上每条动画在 fromT 有关键帧的都挪（各按自己的 fps 换帧、
+ * 钳进 [0, length]）。任一条的目标帧已被别的关键帧占用就整体拒绝、一处不改（结构编辑不回滚，必须先验后改）。
+ */
+export function moveKeyTime(obj: SceneObject, fromT: number, toT: number): boolean {
+  if (!Number.isFinite(fromT) || !Number.isFinite(toT)) return false;
+  const plan: Array<{ a: Anim; from: number; to: number }> = [];
+  for (const f of animatedFields(obj)) {
+    const v = getAnim(obj, f)!;
+    const from = Math.round(fromT * v.fps);
+    if (!v.keys.some((k) => k.frame === from)) continue;
+    const to = Math.max(0, Math.min(v.length, Math.round(toT * v.fps)));
+    if (to === from) continue;
+    if (v.keys.some((k) => k.frame === to)) return false;
+    plan.push({ a: animOf(obj, f)!, from, to });
+  }
+  for (const { a, from, to } of plan) {
+    for (const c of channelsOf(a)) {
+      for (const k of c) if (Number(k.frame) === from) k.frame = to;
+      c.sort((x, y) => Number(x.frame) - Number(y.frame));
+    }
+  }
+  return plan.length > 0;
 }
 
 /** 时长（帧）不能短于最后一个关键帧；模式三选一 */

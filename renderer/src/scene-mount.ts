@@ -5121,7 +5121,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 每帧 recompose 前并入 transformDirty 后清空。
       const scriptedTransformDirty = new Set<unknown>();
       // 关键帧动画：逐帧推进并把结果写回图层字段
-      const animRuns: Array<{ layer: any; field: string; slot: string; ctrl: any }> = [];
+      // held：编辑器热改了这个字段（setLayerProps），曲线写回暂停到下一次 seek。
+      const animRuns: Array<{ layer: any; field: string; slot: string; ctrl: any; held?: boolean }> = [];
       // 粒子 instanceoverride 的关键帧动画（与对象字段动画同一时钟/同一推进队列）：
       // 写回目标是该层所有粒子系统的倍率，不是图层字段。
       const overrideAnimRuns: Array<{ layer: any; key: string; ctrl: any }> = [];
@@ -6425,6 +6426,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           for (const run of animRuns) {
             if (seekAnims) run.ctrl.seekTime(t);
             else run.ctrl.advance(clockDt);
+            if (run.held) continue;
             const field = run.field;
             const slot = run.slot || field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
@@ -6456,6 +6458,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // 消费方是 cameraTransforms.zoom（math.js 每帧读；3521337568
                 // 相机路径对象的开场 zoom 3→1）。与 general zoom 同一消费通道。
                 if (out > 0) (scene as any).cameraTransforms.zoom = out;
+              } else if (field === "color" && run.layer.matTint && run.layer.tintBase) {
+                // [we-scene patch] generic4 材质常量烘进了颜色（applyBuiltinMatTint）：
+                // 曲线写对象自身的颜色（tintBase），再重折出最终色，否则材质色倍率丢失。
+                anim.writeAnimSlot(run.layer.tintBase, "color", out);
+                applyBuiltinMatTint(run.layer);
               } else {
                 // [we-scene patch issue #9] 通用槽写回必须**保住槽的形状**：
                 // 标量写进向量槽要广播（WE 的标量→向量约定），绝不能把
@@ -6464,6 +6471,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // 渲染循环无声死亡，首帧永不完成且 mount() 无成功也无失败。
                 // 规则实现与判据都在 anim.writeAnimSlot（verify-transform 跑真实现）。
                 anim.writeAnimSlot(run.layer, slot, out);
+                // [we-scene patch] 文字层绘制读 textColor 这份拷贝（同逐帧脚本 color 那条），
+                // 颜色曲线只写 layer.color 等于没写。
+                if (field === "color" && run.layer.isText) run.layer.textColor = run.layer.color;
               }
             }
           }
@@ -7260,6 +7270,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         const l = layerById(id);
         if (!l) return Promise.reject(new Error(`setLayerProps: layer ${id} not found`));
         const p = patch ?? {};
+        for (const run of animRuns) {
+          if (run.layer === l && (p as Record<string, unknown>)[run.field] !== undefined) run.held = true;
+        }
         if (p.origin || p.scale || p.angles) {
           // 写 local 槽（与脚本/动画同一空间），再把该子树合成回 world。
           // 后处理层的 world 被强制成整幅画布，变换对它无意义（recomposeWorld 也跳过）。
@@ -7307,6 +7320,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
         rebaseClock(t, performance.now());
         animSeekPending = true;
+        for (const run of animRuns) run.held = false;
         return renderOnce();
       };
       editorImpl = {

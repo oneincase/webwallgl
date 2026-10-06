@@ -1569,7 +1569,7 @@ async function runCreateAndDraft(ctx) {
   let ao = await rawObj();
   const abW = sizeOf(ao)[0] / 2;
   const origin0 = ao.origin;
-  check(await ev(`document.querySelectorAll('.ed-anim [data-anim-on]').length === 4 && [...document.querySelectorAll('.ed-anim [data-anim-on]')].every((c) => !c.checked)`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度四个开关，缺省全关");
+  check(await ev(`document.querySelectorAll('.ed-anim [data-anim-on]').length === 5 && [...document.querySelectorAll('.ed-anim [data-anim-on]')].every((c) => !c.checked)`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色五个开关，缺省全关");
   if (!(await ev(`document.querySelector('#tb-play .ic-play').hidden === false`))) await clickSel("#tb-play");
   await seekTo(0);
 
@@ -1617,6 +1617,57 @@ async function runCreateAndDraft(ctx) {
   await fxAct(`document.querySelector('.ed-anim-keys[data-field="origin"] [data-key-del="30"]').click()`);
   check(json(keysOf(await rawObj()).map((k) => k[0])) === json([0, 60]), "× 删掉第 30 帧");
 
+  section("AC. 关键帧补完（暂停时改动画字段画面跟手 → 时间轴拖关键帧改时刻 / 冲突拒绝 → 颜色动画）");
+  await seekTo(1);
+  await ev(`(() => { const el = document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')[0]; el.focus(); el.value = '1500'; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await settle();
+  inkR = await inkIn(...worldBox(crA, [1500, 540], [abW, 110]));
+  inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
+  check(inkR.frac > 0.1 && inkL.frac < 0.02, `★ 暂停在 1s 改动画层 x（只 input 未提交）：画面跟手到 1500，不被曲线拉回（新位置墨水 ${inkR.frac.toFixed(3)}，原位 ${inkL.frac.toFixed(3)}）`);
+  ra = await h.readyCount();
+  await ev(`(() => { const el = document.activeElement; el.dispatchEvent(new Event('change', { bubbles: true })); el.blur(); return true; })()`);
+  await h.waitRemount(ra);
+  check(json(keysOf(await rawObj())) === json([[0, 960], [30, 1500], [60, 1260]]), "提交后落第 30 帧关键帧 x = 1500");
+
+  const markAt = (t) =>
+    ev(`(() => { const box = document.querySelector('#tl-keys').getBoundingClientRect(); const m = [...document.querySelectorAll('#tl-keys .tl-key')].find((e) => Math.abs(Number(e.dataset.t) - ${t}) < 1e-3); if (!m) return null; const r = m.getBoundingClientRect(); return { y: r.top + r.height / 2, x: r.left + r.width / 2, left: box.left, width: box.width, max: Number(document.querySelector('#tl-range').max), drag: m.classList.contains('is-draggable') }; })()`);
+  const m1 = await markAt(1);
+  check(!!m1 && m1.drag, "时间轴关键帧标记可拖（is-draggable）");
+  const xOf = (mk, t) => mk.left + (t / mk.max) * mk.width;
+  ra = await h.readyCount();
+  await drag([m1.x, m1.y], [xOf(m1, 1.5), m1.y]);
+  await h.waitRemount(ra);
+  let fr = (await rawObj()).origin.animation.c0.map((k) => k.frame);
+  check(fr.length === 3 && fr[0] === 0 && fr[2] === 60 && Math.abs(fr[1] - 45) <= 1 && (await rawObj()).origin.animation.c0[1].value === 1500, `★ 把 1s 的关键帧拖到 1.5s：帧号 ${json(fr)}，值不变`);
+  const tMid = fr[1] / 30;
+  const m2 = await markAt(tMid);
+  const rb = await h.readyCount();
+  await drag([m2.x, m2.y], [xOf(m2, 2), m2.y]);
+  await settle();
+  check((await h.readyCount()) === rb && json((await rawObj()).origin.animation.c0.map((k) => k.frame)) === json(fr) && (await ev(`document.querySelectorAll('#tl-keys .tl-key').length`)) === 3, "拖到已有关键帧的 2s：拒绝（不重挂、帧号不变、标记复原）");
+  ra = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(ra);
+  check(json((await rawObj()).origin.animation.c0.map((k) => k.frame)) === json([0, 30, 60]), "撤销：关键帧回到 1s");
+  await fxAct(`document.querySelector('.ed-anim-keys[data-field="origin"] [data-key-del="30"]').click()`);
+  check(json(keysOf(await rawObj()).map((k) => k[0])) === json([0, 60]), "删掉 1s 关键帧，回到两帧");
+
+  await seekTo(0);
+  await animOn("color", true);
+  await seekTo(2);
+  ra = await h.readyCount();
+  await ev(`(() => { const el = document.querySelector('#ed-inspector fieldset.ed-form input[type=color]'); el.focus(); el.value = '#ff0000'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); el.blur(); return true; })()`);
+  await h.waitRemount(ra);
+  ao = await rawObj();
+  check(ao.color?.animation?.c0?.length === 2 && ao.color.animation.c1.at(-1).frame === 60 && ao.color.animation.c1.at(-1).value === 0, `颜色开动画、2s 处改红：自动落第 60 帧颜色关键帧（${json(ao.color?.animation?.c1?.map((k) => [k.frame, k.value]))}）`);
+  const inkRed = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
+  await seekTo(0);
+  const inkWhite = await inkIn(...worldBox(crA, [960, 540], [abW, 110]));
+  check(inkRed.color[0] > 180 && inkRed.color[1] < 80 && inkWhite.color.every((v) => v > 200), `★ 画面：2s 文字红 ${json(inkRed.color)}，0s 白 ${json(inkWhite.color)}（文字层颜色曲线真的写到绘制色）`);
+  await seekTo(1);
+  const inkPink = await inkIn(...worldBox(crA, [1110, 540], [abW, 110]), 120);
+  check(inkPink.color[0] > 180 && inkPink.color[1] > 60 && inkPink.color[1] < 200, `1s 颜色在白与红之间（${json(inkPink.color)}）`);
+
   await animSet("mode", "origin", "mirror");
   await animSet("length", "origin", "4");
   await animSet("smooth", "origin", false);
@@ -1639,6 +1690,7 @@ async function runCreateAndDraft(ctx) {
   check(savedAB.length === 1, `另存到壁纸库：新条目 ${savedAB[0]}`);
   const oAB = JSON.parse(fs.readFileSync(path.join(lib, savedAB[0], "scene.json"), "utf8")).objects[0];
   check(json(oAB.origin.animation.options) === json({ fps: 30, length: 120, mode: "mirror", wraploop: false }) && json(keysOf(oAB)) === json([[0, 960], [60, 1260]]), "盘上 scene.json：WE 原生动画格式、关键帧齐全");
+  check(oAB.color?.animation?.c0?.length === 2 && typeof oAB.color.value === "string", "盘上 scene.json：颜色动画也按 WE 格式落盘");
 
   await cdp.send("Page.navigate", {
     url: `${origin}/renderer/index.html?type=scene&src=${savedAB[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
