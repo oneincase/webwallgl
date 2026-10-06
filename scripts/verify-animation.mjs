@@ -1267,6 +1267,35 @@ const kf = (frame, value, front, back) => ({
     check(orphan.parent === null && diag2.length === 1, "悬空 parent 必须退化为独立并记一条诊断");
     orphan.advance(0.5);
     check(orphan.frame === 5, "退化独立后必须照常自播");
+    // 多级 parent（R2c）：A ← B ← C，C 挂到根 A；播放头 / play / rate 全走 A
+    const mk = (opts) => createAnimation({ c0: [kf(0, 0), kf(10, 100)], options: { fps: 10, length: 10, mode: "single", ...opts } });
+    const A = mk({ startpaused: true });
+    const B = mk({ parent: { key: "a" } });
+    const C = mk({ parent: { key: "b" } });
+    const diag3 = [];
+    linkAnimations(new Map([["c", C], ["b", B], ["a", A]]), (m) => diag3.push(m));
+    check(B.parent === A && C.parent === A && diag3.length === 0, `多级 parent：B、C 都挂到根 leader A，无诊断（${diag3.join(" / ")}）`);
+    C.play();
+    A.advance(0.3);
+    C.advance(0.3);
+    B.advance(0.3);
+    check(A.playing && near(B.value(), 30) && near(C.value(), 30) && A.frame === 3, `★ 孙级 play 委托到根，三者同一播放头（B ${B.value()} / C ${C.value()}）`);
+    C.rate = 2;
+    check(A.rate === 2 && B.rate === 2, "孙级 rate 赋值落到根");
+    // 中间级悬空：C → B → ghost，B 退化独立、C 挂 B
+    const B2 = mk({ parent: { key: "ghost" } });
+    const C2 = mk({ parent: { key: "b" } });
+    const diag4 = [];
+    linkAnimations(new Map([["b", B2], ["c", C2]]), (m) => diag4.push(m));
+    check(B2.parent === null && C2.parent === B2 && diag4.length === 1, "中间级悬空：它退化独立（一条诊断），孙级挂到它");
+    // 成环：X ↔ Y
+    const X = mk({ parent: { key: "y" } });
+    const Y = mk({ parent: { key: "x" } });
+    const diag5 = [];
+    linkAnimations(new Map([["x", X], ["y", Y]]), (m) => diag5.push(m));
+    check(X.parent === null && Y.parent === null && diag5.length === 2 && diag5.every((m) => /成环/.test(m)), "成环：两条都退化独立、各记一条诊断（不死循环）");
+    X.advance(0.5);
+    check(X.frame === 5, "成环退化后照常自播");
   }
 
   // ---- 联动组真实语料 A/B：自治组联动前后视觉必须逐位一致 ----

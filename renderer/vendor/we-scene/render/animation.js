@@ -43,7 +43,8 @@
 // 实测全同，frame 恒等映射；relative/绝对/通道/wraploop 各自独立，3233141951
 // 火1 同组内 relative 3 通道 + 绝对 1 通道）。child 的 play/pause/stop/setFrame/
 // setRate/rate 赋值全部委托 leader（语料实证作者直接写 `ani.rate = ±x`）。
-// 悬空 parent（目标无动画，2 处）容忍退化为独立；无多级/无环（53/53）。
+// 悬空 parent（目标无动画，2 处）容忍退化为独立；语料无多级/无环（53/53），
+// 多级按链挂到根 leader、成环退化独立（防御）。
 // `options.events`（帧事件，24 处全在 3163060610；骨骼动画事件表另 4 张）：
 // 官方语义 = 播放头**越过**某帧时触发同层脚本的 `animationEvent(event, value)`
 //（event = {name, frame}）。触发按语料魔数反推为半开区间：前进 `prev < f <= cur`、
@@ -260,7 +261,9 @@ function collectCrossedEvents(anim, prev, cur) {
 /**
  * [we-scene patch] 时间轴联动组接线：按同作用域字段 key 把 child 挂到 leader 上
  *（child.parent = leader）。siblings 为 Map<key, ctrl> 或 {key: ctrl}。
- * 悬空 parent（目标无动画/自指）与多级 parent 不链接，经 onDiag 记一条。
+ * 多级 parent（A → B → C）沿链挂到**根 leader**：委托与采样都读 `parent.frame` 等自有状态，
+ * 挂到中间层会读到不推进的播放头。链上某级悬空则停在那一级（它退化为独立、即根）；
+ * 悬空 / 自指 / 成环不链接，经 onDiag 记一条。语料 53/53 都是单级，多级与环是防御。
  */
 export function linkAnimations(siblings, onDiag) {
   const map = siblings instanceof Map ? siblings : new Map(Object.entries(siblings || {}))
@@ -271,11 +274,24 @@ export function linkAnimations(siblings, onDiag) {
       if (onDiag) onDiag(`动画联动 parent 悬空（退化为独立）：${key} -> ${ctrl.parentKey}`)
       continue
     }
-    if (leader.parentKey) {
-      if (onDiag) onDiag(`动画联动多级 parent（不支持，退化为独立）：${key} -> ${ctrl.parentKey}`)
+    const seen = new Set([ctrl])
+    let root = leader
+    let cycle = false
+    while (root.parentKey) {
+      seen.add(root)
+      const up = map.get(root.parentKey)
+      if (!up || up === root) break
+      if (seen.has(up)) {
+        cycle = true
+        break
+      }
+      root = up
+    }
+    if (cycle) {
+      if (onDiag) onDiag(`动画联动 parent 成环（退化为独立）：${key} -> ${ctrl.parentKey}`)
       continue
     }
-    ctrl.parent = leader
+    ctrl.parent = root
   }
   return map
 }
