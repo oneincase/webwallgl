@@ -19,6 +19,7 @@ import {
   type EditorLayer,
   type EditorLayerProps,
   type Fit,
+  type MdlBoneDelta,
   type SceneInstance,
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
@@ -223,6 +224,13 @@ import {
   setAnimLayerField,
   soloAnimLayers,
   type AnimLayerView,
+  BONE_RADII,
+  boneDepths,
+  boneEditFiles,
+  clipFrameAt,
+  defaultClipId,
+  isZeroDelta,
+  type BoneEdit,
 } from "./model";
 import {
   DRAG_THRESHOLD,
@@ -490,6 +498,21 @@ let mounting = false;
 let animSolo: { id: number | string; index: number } | null = null;
 /** 「挂到模型」分组里为某层选中的目标模型 / 附着点（视口标记据此高亮），换选中即失效 */
 let attachPick: { layer: number | string; model: number | string; name: string } | null = null;
+/**
+ * 骨骼面板（W18）的当前选择与未提交的增量（r 用角度，提交时换弧度）。引擎里只有 setBonePose 预览，
+ * 换层 / 重挂即失效（重挂后新模型没有预览）
+ */
+type BoneVec = [number, number, number];
+let bonePick: {
+  layer: number | string;
+  clip: number;
+  bone: number;
+  frame: number | null;
+  radius: number;
+  t: BoneVec;
+  r: BoneVec;
+  s: BoneVec;
+} | null = null;
 /** 只有用户点了播放才走时钟；打开文档、重挂都停在当前帧 */
 let userPlaying = false;
 
@@ -498,6 +521,7 @@ async function mountCurrent(keepTime = false) {
   mounting = true;
   animSolo = null;
   const gen = ++openGen;
+  if (bonePick) bonePick = { ...bonePick, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
   const resumeAt = keepTime ? editor?.time ?? 0 : 0;
   destroyInstance();
   syncPlayButton();
@@ -1619,6 +1643,39 @@ function drawOverlay() {
   overlayCtx.lineTo(ax, ay + 6);
   overlayCtx.stroke();
   drawAttachMarkers();
+  drawBoneMarkers();
+}
+
+/** 骨骼面板展开时（W18）：关节点 + 父子连线，选中的骨高亮 */
+function drawBoneMarkers() {
+  if (!editor || !bonePick || selectedId === null || !same(bonePick.layer, selectedId)) return;
+  const pts = editor.getBonePoints(Number(bonePick.layer));
+  if (!pts?.length) return;
+  overlayCtx.lineWidth = 1;
+  overlayCtx.strokeStyle = "rgba(120,200,255,0.7)";
+  overlayCtx.beginPath();
+  pts.forEach((p, i) => {
+    const q = p.parent >= 0 && p.parent !== i ? pts[p.parent]?.screen : null;
+    if (!p.screen || !q) return;
+    overlayCtx.moveTo(q[0], q[1]);
+    overlayCtx.lineTo(p.screen[0], p.screen[1]);
+  });
+  overlayCtx.stroke();
+  pts.forEach((p, i) => {
+    if (!p.screen) return;
+    const on = i === bonePick!.bone;
+    overlayCtx.fillStyle = on ? SNAP_COLOR : "rgba(120,200,255,0.9)";
+    overlayCtx.beginPath();
+    overlayCtx.arc(p.screen[0], p.screen[1], on ? 4.5 : 2.5, 0, Math.PI * 2);
+    overlayCtx.fill();
+    if (on) {
+      overlayCtx.font = "11px system-ui, sans-serif";
+      overlayCtx.fillStyle = "rgba(0,0,0,0.6)";
+      overlayCtx.fillText(p.name || `#${i}`, p.screen[0] + 8, p.screen[1] - 5);
+      overlayCtx.fillStyle = SNAP_COLOR;
+      overlayCtx.fillText(p.name || `#${i}`, p.screen[0] + 7, p.screen[1] - 6);
+    }
+  });
 }
 
 /** 附着点十字标记：选中模型层时画它自己的；选中普通层时画「挂到模型」里选的那个模型的（选中的附着点高亮） */
@@ -3108,6 +3165,230 @@ async function replaceModelTexture(layerId: number | string, mesh: number, img: 
   });
 }
 
+function dropBonePick() {
+  if (!bonePick) return;
+  void editor?.setBonePose(Number(bonePick.layer), bonePick.bone, null).catch(() => {});
+  bonePick = null;
+}
+
+const DEG = Math.PI / 180;
+const boneDeltaOf = (p: NonNullable<typeof bonePick>): MdlBoneDelta => ({
+  t: [...p.t],
+  r: p.r.map((v) => v * DEG) as BoneVec,
+  s: [...p.s],
+});
+
+/**
+ * 骨骼（W18a）：片段 + 骨 + 帧 → 增量（平移 / 角度 / 缩放）。输入即推引擎预览，「应用」写时复制 .mdl
+ * 改该片段该骨的轨道（按衰减半径淡出）并重挂；「复位」撤掉预览
+ */
+function boneGroup(node: LayerNode): HTMLElement | null {
+  const id = Number(node.id);
+  const info = editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+  if (!info || !info.bones.length) return null;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-bones";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.bones");
+  group.appendChild(h);
+  const clips = info.animations.filter((c) => c.frames > 0);
+  if (!clips.length) {
+    group.appendChild(note(et("bn.noClips")));
+    return group;
+  }
+  if (bonePick && !same(bonePick.layer, node.id)) {
+    void editor!.setBonePose(Number(bonePick.layer), bonePick.bone, null).catch(() => {});
+    bonePick = null;
+  }
+  const layers = getAnimLayers(node.obj);
+  if (!bonePick || !clips.some((c) => c.id === bonePick!.clip) || bonePick.bone >= info.bones.length) {
+    bonePick = {
+      layer: node.id,
+      clip: defaultClipId(clips, layers) ?? clips[0].id,
+      bone: bonePick && bonePick.bone < info.bones.length ? bonePick.bone : 0,
+      frame: null,
+      radius: 0,
+      t: [0, 0, 0],
+      r: [0, 0, 0],
+      s: [1, 1, 1],
+    };
+  }
+  const pick = bonePick;
+  const clip = clips.find((c) => c.id === pick.clip)!;
+  const rate = layers.find((l) => l.animation === clip.id)?.rate ?? 1;
+  const frame = Math.min(clip.frames - 1, pick.frame ?? clipFrameAt(clip, editor!.time * rate));
+  const editable = !!overlay && !isLocked(node.id);
+  group.appendChild(note(et("bn.note")));
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.appendChild(el);
+    form.append(l, box);
+    return box;
+  };
+  const select = (cls: string, opts: Array<[string, string]>, value: string, onChange: (v: string) => void) => {
+    const s = document.createElement("select");
+    s.className = cls;
+    for (const [v, text] of opts) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = text;
+      s.appendChild(o);
+    }
+    s.value = value;
+    s.addEventListener("change", () => onChange(s.value));
+    return s;
+  };
+  const dirty = () => !isZeroDelta(boneDeltaOf(pick));
+  const clearPreview = () => editor!.setBonePose(id, pick.bone, null).catch(() => {});
+  const preview = () =>
+    void editor!
+      .setBonePose(id, pick.bone, dirty() ? boneDeltaOf(pick) : null)
+      .then(() => drawOverlay())
+      .catch(() => {});
+  const reselect = (patch: Partial<typeof pick>) => {
+    void clearPreview();
+    bonePick = { ...pick, ...patch, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+    renderInspector();
+    drawOverlay();
+  };
+  row(
+    "bn.clip",
+    select("ed-bn-clip", clips.map((c) => [String(c.id), `${c.name || `#${c.id}`} · ${c.mode} · ${c.frames}f`]), String(clip.id), (v) =>
+      reselect({ clip: Number(v), frame: null }),
+    ),
+  );
+  const depth = boneDepths(info.bones);
+  row(
+    "bn.bone",
+    select(
+      "ed-bn-bone",
+      info.bones.map((b, i) => [String(i), `${"\u00a0\u00a0".repeat(Math.min(depth[i], 12))}${b.name || `#${i}`}`]),
+      String(pick.bone),
+      (v) => reselect({ bone: Number(v) }),
+    ),
+  );
+  const fr = document.createElement("input");
+  fr.type = "number";
+  fr.className = "ed-bn-frame";
+  fr.min = "0";
+  fr.max = String(clip.frames - 1);
+  fr.step = "1";
+  fr.value = String(frame);
+  fr.addEventListener("change", () => {
+    const v = Math.round(Number(fr.value));
+    pick.frame = Number.isFinite(v) ? Math.min(Math.max(v, 0), clip.frames - 1) : null;
+    fr.value = String(pick.frame ?? frame);
+  });
+  const now = document.createElement("button");
+  now.type = "button";
+  now.className = "ed-icon ed-bn-now";
+  now.textContent = "⟲";
+  now.title = et("bn.frameNow");
+  now.onclick = () => {
+    pick.frame = null;
+    renderInspector();
+  };
+  row("bn.frame", fr).appendChild(now);
+  const vec = (key: string, cls: string, v: BoneVec, step: string) => {
+    const box = row(key, document.createElement("span"));
+    box.replaceChildren();
+    box.classList.add("ed-bn-vec");
+    v.forEach((x, k) => {
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.className = `${cls} ${cls}-${"xyz"[k]}`;
+      inp.step = step;
+      inp.value = fmtNum(x);
+      inp.disabled = !editable;
+      inp.addEventListener("input", () => {
+        const n = Number(inp.value);
+        if (!Number.isFinite(n)) return;
+        v[k] = n;
+        preview();
+      });
+      box.appendChild(inp);
+    });
+  };
+  vec("bn.t", "ed-bn-t", pick.t, "1");
+  vec("bn.r", "ed-bn-r", pick.r, "1");
+  vec("bn.s", "ed-bn-s", pick.s, "0.05");
+  row(
+    "bn.radius",
+    select(
+      "ed-bn-radius",
+      BONE_RADII.map((r) => [String(r), r < 0 ? et("bn.radius.all") : r === 0 ? et("bn.radius.one") : et("bn.radius.n", { n: r })]),
+      String(pick.radius),
+      (v) => (pick.radius = Number(v)),
+    ),
+  );
+  group.appendChild(form);
+  const actions = document.createElement("div");
+  actions.className = "ed-insp-actions";
+  const apply = document.createElement("button");
+  apply.type = "button";
+  apply.className = "ed-btn ed-bn-apply";
+  apply.textContent = et("bn.apply");
+  apply.disabled = !editable;
+  apply.onclick = () => {
+    if (!dirty()) return;
+    const edit: BoneEdit = { animId: clip.id, bone: pick.bone, frame: pick.frame ?? frame, delta: boneDeltaOf(pick), radius: pick.radius };
+    void applyBoneEdit(node.id, edit, info.bones[pick.bone]?.name || `#${pick.bone}`, clip.name || `#${clip.id}`);
+  };
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "ed-btn ed-bn-reset";
+  reset.textContent = et("bn.reset");
+  reset.onclick = () => reselect({});
+  actions.append(apply, reset);
+  group.appendChild(actions);
+  return group;
+}
+
+async function applyBoneEdit(layerId: number | string, e: BoneEdit, boneName: string, clipName: string) {
+  const d = doc;
+  const node = d && findNode(d.roots, layerId);
+  const assets = overlay;
+  if (!d || !node || !assets || !node.modelForm) return;
+  const o = node.obj;
+  const fail = (key: string, path: string) => void log(et(key, { path }), "warn");
+  let modelJson: Record<string, unknown> | null = null;
+  let from: string;
+  let mdlPath: string;
+  if (node.modelForm === "puppet") {
+    from = String(o.image);
+    modelJson = parseJsonBytes(await assets.read(from));
+    if (!modelJson || typeof modelJson.puppet !== "string") return fail("bn.fail.read", from);
+    mdlPath = modelJson.puppet;
+  } else {
+    from = mdlPath = String(o.model);
+  }
+  const bytes = await assets.read(mdlPath);
+  if (!bytes) return fail("bn.fail.read", mdlPath);
+  const listed = new Set(assets.list());
+  const slug = imageSlug(`${String(o.name || "model").replace(/\./g, "-")}-pose`, (s) => [modelPathOf(s), editorMdlOf(s)].some((p) => assets.has(p) || listed.has(p)));
+  const r = boneEditFiles(modelJson, bytes, slug, e);
+  if (!r) return fail("bn.fail.mdl", mdlPath);
+  if (d !== doc) return;
+  for (const f of r.files) assets.put(f.name, f.data, r.path);
+  assets.share(from, r.path);
+  const puppetMdl = modelJson ? editorMdlOf(slug) : null;
+  if (puppetMdl) d.puppets = new Map([...(d.puppets ?? []), [r.path, puppetMdl]]);
+  if (bonePick && same(bonePick.layer, layerId)) bonePick = { ...bonePick, frame: e.frame, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+  structEdit(et("log.boneEdited", { layer: nodeName(layerId), bone: boneName, clip: clipName, frame: e.frame }), (dd) => {
+    const n = findNode(dd.roots, layerId);
+    if (!n) return undefined;
+    if (puppetMdl) n.obj.image = r.path;
+    else n.obj.model = r.path;
+    return n.id;
+  });
+}
+
 const flatNodes = (roots: LayerNode[]): LayerNode[] => roots.flatMap((n) => [n, ...flatNodes(n.children)]);
 
 /** 「挂到模型」（W14）：选模型层 + 附着点 → 绑定；已挂时可解绑。都是结构编辑（重挂），当前时刻画面不变 */
@@ -4593,6 +4874,7 @@ function renderInspector() {
   }
   const node = selectedId !== null ? findNode(doc.roots, selectedId) : null;
   if (!node) {
+    dropBonePick();
     const p = doc.project;
     const res = sceneResolution(doc.scene);
     const props = (p?.general as Record<string, unknown> | undefined)?.properties;
@@ -4623,6 +4905,9 @@ function renderInspector() {
   if (node.modelForm) inspectorEl.appendChild(animLayersGroup(node));
   const mt = node.modelForm ? modelTexGroup(node) : null;
   if (mt) inspectorEl.appendChild(mt);
+  const bn = node.modelForm ? boneGroup(node) : null;
+  if (bn) inspectorEl.appendChild(bn);
+  else dropBonePick();
   const att = attachGroup(node);
   if (att) inspectorEl.appendChild(att);
   if (isVideoNode(node)) inspectorEl.appendChild(videoInfoGroup(node));

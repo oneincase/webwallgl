@@ -103,6 +103,8 @@ export async function mountVideoStage(stage: HTMLElement, bytes: Uint8Array, fit
     setLayerProps: async () => {},
     setAnimationLayers: async () => {},
     getAttachmentPoints: () => null,
+    setBonePose: async () => {},
+    getBonePoints: () => null,
     getLayerOutline: () => null,
     screenDeltaToLocal: () => null,
     getScriptIssues: () => [],

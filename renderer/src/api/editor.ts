@@ -8,7 +8,7 @@ export * from "./index";
 export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
 export { buildScenePkg } from "../editor/pkg-export";
-export { mdlMeshMaterials, retargetMdlMaterial } from "../editor/mdl-edit";
+export { mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights } from "../editor/mdl-edit";
 export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 export type {
   ScenePkgFile,
@@ -26,4 +26,8 @@ export type {
   EditorLayerOutline,
   EditorModelInfo,
   EditorAttachmentPoint,
+  EditorBonePose,
+  EditorBonePoint,
+  MdlBoneDelta,
+  MdlClip,
 } from "./types";

@@ -15,6 +15,10 @@ import type {
   EditorLayerOutline,
   EditorModelInfo,
   EditorAttachmentPoint,
+  EditorBonePose,
+  EditorBonePoint,
+  MdlBoneDelta,
+  MdlClip,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -39,6 +43,10 @@ export type {
   EditorLayerOutline,
   EditorModelInfo,
   EditorAttachmentPoint,
+  EditorBonePose,
+  EditorBonePoint,
+  MdlBoneDelta,
+  MdlClip,
 };
 
 /**
@@ -71,6 +79,28 @@ export declare function mdlMeshMaterials(bytes: Uint8Array): Array<string | null
  * 其余字节（顶点 / 索引 / 骨骼 / 动画）不变。越界或无法结构化读出时返回 null。
  */
 export declare function retargetMdlMaterial(bytes: Uint8Array, meshIndex: number, materialPath: string): Uint8Array | null;
+
+/** .mdl 的动画片段表（无动画段给 []）；网格表无法结构化读出时返回 null */
+export declare function mdlClips(bytes: Uint8Array): MdlClip[] | null;
+
+/**
+ * 关键帧影响权重（逐帧）：radius < 0 整段 1；0 只有该帧；否则余弦衰减、距离 > radius 为 0。
+ * loop 片段按周期 frames − 1 计距离（末帧与首帧重合）
+ */
+export declare function boneDeltaWeights(frames: number, frame: number, radius: number, loop: boolean): Float64Array;
+
+/**
+ * 片段 animId 中骨 bone 的轨道在 frame 处叠局部 TRS 增量（平移 / 欧拉角相加、缩放相乘），按 radius 向两侧衰减，
+ * 返回新 .mdl 字节（其余轨道 / 网格逐字节不变；loop 首末帧重合关系保持）。片段 / 轨道 / 帧不存在时返回 null
+ */
+export declare function applyBoneDelta(
+  bytes: Uint8Array,
+  animId: number,
+  bone: number,
+  frame: number,
+  delta: MdlBoneDelta,
+  radius: number,
+): Uint8Array | null;
 
 /**
  * WE 内置字体名（scene.json 里的 font: "systemfont_*"）→ 本机 CSS font-family 栈。

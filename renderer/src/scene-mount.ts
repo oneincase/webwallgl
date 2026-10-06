@@ -12,6 +12,8 @@ import type {
   EditorLayerProps,
   EditorModelInfo,
   EditorAttachmentPoint,
+  EditorBonePoint,
+  EditorBonePose,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneDirAssets,
@@ -7540,6 +7542,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               mode: String(a.mode ?? ""),
               fps: a.fps,
               frameCount: a.frameCount,
+              frames: Math.max(0, ...(a.tracks || []).map((t: any) => Number(t?.frameCount) || 0)),
               duration: a.fps > 0 ? a.frameCount / a.fps : 0,
               events: (a.events || []).map((e: any) => ({ frame: e.frame, name: String(e.name ?? "") })),
             })),
@@ -7584,6 +7587,49 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             }
             return [{ name, offset: [off[0], off[1]] as [number, number], screen }];
           });
+        },
+        setBonePose(id: number, bone: number, pose: EditorBonePose | null): Promise<void> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          const l: any = layerById(id);
+          const m = l?.puppet;
+          if (!m || !l.modelSrc) return Promise.reject(new Error(`setBonePose: layer ${id} is not a model layer`));
+          if (!(Number.isInteger(bone) && bone >= 0 && bone < m.bones.length)) {
+            return Promise.reject(new Error(`setBonePose: bone ${bone} out of range`));
+          }
+          if (!m._editPose) m._editPose = new Map();
+          if (!pose) m._editPose.delete(bone);
+          else {
+            const t = pose.t ?? [0, 0, 0];
+            const r = pose.r ?? [0, 0, 0];
+            const s = pose.s ?? [1, 1, 1];
+            m._editPose.set(bone, Float32Array.of(t[0], t[1], t[2], r[0], r[1], r[2], s[0], s[1], s[2]));
+          }
+          return renderOnce();
+        },
+        getBonePoints(id: number): EditorBonePoint[] | null {
+          if (disposed) return null;
+          const l: any = layerById(id);
+          const m = l?.puppet;
+          if (!m || !l.modelSrc || !m.bones?.length || typeof renderer.getModelMvp !== "function") return null;
+          const mvp = renderer.getModelMvp(l);
+          if (!mvp) return null;
+          const ev = editorView();
+          mdl.computeSkinMatrices(m, currentTime(), l.animationLayers, getBoneOverrides(l));
+          const n = m.bones.length;
+          const pos = new Float32Array(n * 3);
+          for (let i = 0; i < n; i++) {
+            const w = m._world?.[i];
+            if (!w) continue;
+            pos[i * 3] = w[12];
+            pos[i * 3 + 1] = w[13];
+            pos[i * 3 + 2] = ev.perspective ? w[14] : 0;
+          }
+          const p = hitTest.projectMeshesToScreen([{ pos, indices: [], vertexCount: n, indexCount: 0 }], mvp, ev.cssW, ev.cssH)[0];
+          return m.bones.map((b: any, i: number) => ({
+            name: String(b.name ?? ""),
+            parent: Number.isInteger(b.parent) ? b.parent : -1,
+            screen: p.ok[i] ? ([p.xy[i * 2], p.xy[i * 2 + 1]] as [number, number]) : null,
+          }));
         },
         getLayerOutline(id: number): EditorLayerOutline | null {
           if (disposed) return null;

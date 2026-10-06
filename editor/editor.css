@@ -971,6 +971,29 @@ input.ed-al-name {
   color: var(--wb-fg-mute);
 }
 
+.ed-bones .ed-fx-params select {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+.ed-bones .ed-bn-frame {
+  flex: 1;
+  min-width: 0;
+}
+
+.ed-bn-vec {
+  gap: 4px;
+}
+
+.ed-bn-vec input {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+}
+
 .ed-prop-add {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 72px auto;

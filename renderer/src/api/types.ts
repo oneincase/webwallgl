@@ -807,6 +807,8 @@ export type EditorModelInfo = {
     mode: string;
     fps: number;
     frameCount: number;
+    /** 轨道实际关键帧数（通常 frameCount + 1；loop 首末重合），骨骼编辑的帧号范围 0..frames−1（W18） */
+    frames: number;
     /** 片段时长（秒）= frameCount / fps */
     duration: number;
     events: Array<{ frame: number; name: string }>;
@@ -829,6 +831,35 @@ export type EditorAttachmentPoint = {
   name: string;
   offset: [number, number];
   screen: [number, number] | null;
+};
+
+/**
+ * 骨骼局部 TRS 增量（W18）：t 平移、r 欧拉角（弧度）相加，s 三轴缩放相乘；缺省分量 = 不变。
+ * 引擎预览（setBonePose）与写回 .mdl 轨道（applyBoneDelta）同一语义
+ */
+export type EditorBonePose = {
+  t?: [number, number, number];
+  r?: [number, number, number];
+  s?: [number, number, number];
+};
+export type MdlBoneDelta = EditorBonePose;
+
+/** 模型骨骼此刻的屏幕位置（W18）：骨世界原点投到画布 CSS 像素；落在相机身后为 null */
+export type EditorBonePoint = {
+  name: string;
+  parent: number;
+  screen: [number, number] | null;
+};
+
+/** .mdl 里一条动画片段的头信息（W18）；frames = 轨道实际帧数（通常 frameCount + 1，loop 首末重合） */
+export type MdlClip = {
+  id: number;
+  name: string;
+  mode: string;
+  fps: number;
+  frameCount: number;
+  frames: number;
+  tracks: number;
 };
 
 export type EditorHitTestOptions = {
@@ -877,6 +908,14 @@ export type EditorControls = {
   setAnimationLayers(id: number, layers: ReadonlyArray<Record<string, unknown>>): Promise<void>;
   /** 模型层附着点在当前姿势下的偏移与屏幕位置（W14）；不是模型层 / 模型没装上 / id 不存在返回 null */
   getAttachmentPoints(id: number): EditorAttachmentPoint[] | null;
+  /**
+   * 骨骼姿势预览（W18）：在当前姿势之上给骨 bone 叠一个局部 TRS 增量（null = 撤掉），子骨随父链跟随，
+   * 当帧生效（暂停中补画一帧）。只是预览，不进文档；写回模型请用 applyBoneDelta 改 .mdl 后重挂。
+   * 不是模型层 / 骨号越界时 reject
+   */
+  setBonePose(id: number, bone: number, pose: EditorBonePose | null): Promise<void>;
+  /** 模型层骨骼在当前姿势下的屏幕位置（W18，含预览增量）；不是模型层 / 没有骨骼返回 null */
+  getBonePoints(id: number): EditorBonePoint[] | null;
   /** 图层轮廓（选中框用，W5 过渡方案）；透视相机场景 / id 不存在返回 null */
   getLayerOutline(id: number): EditorLayerOutline | null;
   /** 画布 CSS 像素位移 → 该层 origin 的 local 位移（拖拽移动用）；透视相机场景返回 null */

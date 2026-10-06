@@ -165,6 +165,10 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   const count = bones.length
   if (count === 0) return null
   const hasOverride = !!(boneOverrides && boneOverrides.size > 0)
+  // [we-scene patch 2026-10-07] 编辑器骨骼预览（W18，EditorControls.setBonePose）：
+  // Map<骨, Float32Array(9)> = 局部 TRS 增量（平移 / 欧拉角相加，缩放相乘），挂在解析结果上、
+  // 与脚本覆写表分开；只有编辑器会写，播放路径恒为空。
+  const editPose = mdl._editPose && mdl._editPose.size > 0 ? mdl._editPose : null
   if (!mdl._skin || mdl._skin.length !== count * 16) {
     mdl._skin = new Float32Array(count * 16)
     mdl._local = []
@@ -232,7 +236,7 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     if (!a) {
       // 有静态装配姿势时**不能**早退：蒙皮矩阵 = 静态姿势世界链 · invBindWorld ≠ 单位，
       // 早退会让 draw 用 identitySkin 把散件原样画出来（就是本函数要修的病）。
-      identityEarlyOut = !hasOverride && !useStaticPose
+      identityEarlyOut = !hasOverride && !useStaticPose && !editPose
     } else {
       layers.push({ anim: a, additive: false, blend: 1, rate: 1 })
     }
@@ -337,6 +341,12 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
     }
     if (addW > 0) {
       for (let k = 0; k < 9; k++) acc[k] += addDelta[k]
+    }
+    const ed = editPose ? editPose.get(i) : undefined
+    if (ed) {
+      for (let k = 0; k < 6; k++) acc[k] += ed[k]
+      for (let k = 6; k < 9; k++) acc[k] *= ed[k]
+      touched = true
     }
     // [we-scene patch] 脚本覆写：绝对写入平移分量（旋转/缩放不动 —— 全库 19 处
     // Transform 调用只用 translation()，rotation/scale 零调用）。

@@ -176,6 +176,10 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
       await runRetexHeadless({ check, section, session, origin, fixtures });
       return;
     }
+    if (only === "mf2") {
+      await runBoneHeadless({ check, section, session, origin, fixtures, LIB });
+      return;
+    }
     for (const id of fixtures) {
       const truth = modelTruth(LIB, id);
       await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
@@ -238,6 +242,7 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
     await runAttachHeadless({ check, section, session, origin, fixtures, LIB });
     await runPickHeadless({ check, section, session, origin, fixtures });
     await runRetexHeadless({ check, section, session, origin, fixtures });
+    await runBoneHeadless({ check, section, session, origin, fixtures, LIB });
   } finally {
     await session.close();
     await server.close();
@@ -838,6 +843,193 @@ async function runRetexHeadless({ check, section, session, origin, fixtures }) {
     );
   }
   check(tested >= 4 && multi >= 1, `至少 4 张夹具做了换贴图真引擎判据，含 1 个多子网格模型换非首个子网格（${tested} 张 / 多子网格 ${multi}）`);
+}
+
+/**
+ * MF2（W18a）：骨骼姿势编辑的真引擎判据。目标 = 动画层无包装、父链不随时间变的模型层，只留它与祖先可见：
+ *   ① 预览：setBonePose 绕骨 z 转 30° → 画面变；该骨自身与子树外的骨屏幕位置不动，子树里有骨移动；撤掉预览逐像素复原
+ *   ② 应用：applyBoneDelta（半径 0）写回 .mdl 重挂 → 在该帧 ≡ 预览画面（单层 blend 1 时）、远帧 ≡ 原画面
+ *   ③ 存库闭环：buildScenePkg → 从包重挂，该帧画面与松散形态一致
+ */
+async function runBoneHeadless({ check, section, session, origin, fixtures, LIB }) {
+  section("MF2. 骨骼姿势编辑（真浏览器）：预览只动子树、撤销复原、写回 .mdl ≡ 预览、远帧不变、打包一致");
+  let tested = 0;
+  let exactN = 0;
+  for (const id of fixtures) {
+    const targets = hotAnimTargets(modelTruth(LIB, id)?.scene).slice(0, 4);
+    if (!targets.length) continue;
+    await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
+    await session.waitFor("!!window.__wp", { timeoutMs: 60000 });
+    let r;
+    try {
+      r = await session.evaluate(`(async () => {
+        window.__wp.pause();
+        const api = await import('/renderer/src/api/editor.ts');
+        const C = await import('/renderer/vendor/we-scene/pkg/container.js');
+        const M = await import('/editor/model.ts');
+        const base = api.httpSource('${origin}/media/dev/${id}');
+        const pkg = C.parsePkg(new Uint8Array(await base.scenePkg()));
+        const sceneText = new TextDecoder().decode(C.getEntry(pkg, 'scene.json')).replace(/^\\uFEFF/, '');
+        const extra = new Map();
+        let sceneBytes = new TextEncoder().encode(sceneText);
+        const read = async (n) => (n === 'scene.json' ? sceneBytes : extra.get(n) ?? C.getEntry(pkg, n) ?? null);
+        const host = document.createElement('div');
+        host.style.cssText = 'position:fixed;left:0;top:0;width:960px;height:540px;z-index:9';
+        document.body.appendChild(host);
+        let inst = null, ed = null;
+        const mountWith = async (source) => {
+          if (inst) inst.destroy();
+          host.textContent = '';
+          inst = await api.mount(host, { source, fit: 'cover', renderDpr: 1, volume: 0, autoplay: false });
+          ed = api.editorOf(inst);
+          inst.pause();
+          const gen = window.__scene?.general;
+          if (gen) gen.bloom = false;
+        };
+        const loose = () => ({ scenePkg: () => base.scenePkg(), sceneDir: async () => ({ entry: 'scene.json', read }), project: base.project ? (s) => base.project(s) : undefined });
+        const grab = async () => {
+          const bm = await createImageBitmap(await ed.capture());
+          const cv = new OffscreenCanvas(bm.width, bm.height);
+          const g = cv.getContext('2d');
+          g.drawImage(bm, 0, 0);
+          return { w: bm.width, h: bm.height, d: g.getImageData(0, 0, bm.width, bm.height).data };
+        };
+        const df = (P, Q, i) => Math.abs(P.d[i] - Q.d[i]) + Math.abs(P.d[i + 1] - Q.d[i + 1]) + Math.abs(P.d[i + 2] - Q.d[i + 2]);
+        const diffN = (P, Q, region) => { let n = 0; for (let k = 0; k < P.w * P.h; k++) if ((!region || region[k]) && df(P, Q, k * 4) > 24) n++; return n; };
+        const isolate = async (keep) => {
+          for (const l of ed.getLayers()) if (!keep.includes(l.id)) await ed.setLayerProps(l.id, { visible: false });
+        };
+        const drawnMask = async (mid, t) => {
+          await ed.seek(t);
+          const A = await grab();
+          await ed.setLayerProps(mid, { visible: false });
+          const B = await grab();
+          await ed.setLayerProps(mid, { visible: true });
+          const m = new Uint8Array(A.w * A.h); let n = 0;
+          for (let k = 0; k < m.length; k++) if (df(A, B, k * 4) > 24) { m[k] = 1; n++; }
+          return { A, m, n };
+        };
+        const at = async (t) => { await ed.seek(t); return grab(); };
+        const targets = ${JSON.stringify(targets)};
+        await mountWith(loose());
+        const scene = JSON.parse(sceneText);
+        for (const tg of targets) {
+          const mid = tg.id;
+          const info = ed.getModelInfo(mid);
+          if (!info || !info.bones.length) continue;
+          const vis = tg.layers.filter((a) => a.visible !== false);
+          const lay = vis[0];
+          const clip = lay && info.animations.find((c) => c.id === lay.animation && c.frames > 4);
+          if (!clip) continue;
+          const rate = typeof lay.rate === 'number' && lay.rate > 0 ? lay.rate : 1;
+          // 单层 blend 1：非 additive 直接取轨道，additive 取相对参考帧（loop 首帧）的增量 —— 编辑中间帧时两者都 ≡ 预览
+          const exact = vis.length === 1 && (lay.blend ?? 1) === 1;
+          const frame = Math.floor(clip.frames / 2);
+          const far = frame - Math.max(2, Math.floor(clip.frames / 4));
+          const Tf = (frame + 1e-4) / (clip.fps * rate);
+          const Tfar = (far + 1e-4) / (clip.fps * rate);
+          await mountWith(loose());
+          await isolate(tg.chain);
+          const s0 = await drawnMask(mid, Tf);
+          if (s0.n < 200) continue;
+          const far0 = await at(Tfar);
+          await ed.seek(Tf);
+          await ed.seek(Tf * 0.37);
+          const farNoise = diffN(far0, await at(Tfar));
+          await ed.seek(Tf);
+          const pts0 = ed.getBonePoints(mid);
+          const depth = M.boneDepths(info.bones);
+          const kids = (b) => { const s = new Set([b]); let grew = true; while (grew) { grew = false; info.bones.forEach((x, i) => { if (!s.has(i) && s.has(x.parent)) { s.add(i); grew = true; } }); } return s; };
+          const order = info.bones.map((_, i) => i).filter((i) => pts0?.[i]?.screen).sort((a, b) => (depth[a] >= 1 ? 0 : 1) - (depth[b] >= 1 ? 0 : 1) || kids(b).size - kids(a).size);
+          const delta = { r: [0, 0, Math.PI / 6] };
+          for (const bone of order.slice(0, 6)) {
+            const obj = scene.objects.find((o) => o.id === mid);
+            let res = null;
+            const edit = { animId: clip.id, bone, frame, delta, radius: 0 };
+            if (info.form === 'puppet') {
+              const mj = M.parseJsonBytes(await read(obj.image));
+              res = mj && M.boneEditFiles(mj, await read(String(mj.puppet)), 'bp', edit);
+            } else res = M.boneEditFiles(null, await read(obj.model), 'bp', edit);
+            if (!res) continue;
+            await ed.setBonePose(mid, bone, delta);
+            const P1 = await at(Tf);
+            const pts1 = ed.getBonePoints(mid);
+            const changed = diffN(s0.A, P1);
+            if (changed < 50) { await ed.setBonePose(mid, bone, null); continue; }
+            const sub = kids(bone);
+            let outMoved = 0, inMoved = 0, selfMove = 0;
+            pts0.forEach((p, i) => {
+              const q = pts1[i];
+              if (!p.screen || !q?.screen) return;
+              const d = Math.hypot(p.screen[0] - q.screen[0], p.screen[1] - q.screen[1]);
+              if (i === bone) selfMove = d;
+              else if (sub.has(i)) { if (d > 1) inMoved++; }
+              else if (d > 0.5) outMoved++;
+            });
+            await ed.setBonePose(mid, bone, null);
+            const R = await at(Tf);
+            const restored = diffN(s0.A, R);
+            let rejected = 0;
+            await ed.setBonePose(mid, info.bones.length, delta).catch(() => rejected++);
+            await ed.setBonePose(987654, 0, delta).catch(() => rejected++);
+            // 同一工程原样重挂一次：跨挂载本身的差异（有状态的模拟等）作为远帧判据的底噪
+            await mountWith(loose());
+            await isolate(tg.chain);
+            await ed.seek(Tf);
+            const remountNoise = diffN(far0, await at(Tfar));
+            // 写回 .mdl 重挂
+            const prevImage = obj.image, prevModel = obj.model;
+            if (info.form === 'puppet') obj.image = res.path; else obj.model = res.path;
+            for (const f of res.files) extra.set(f.name, f.data);
+            sceneBytes = new TextEncoder().encode(JSON.stringify(scene));
+            await mountWith(loose());
+            await isolate(tg.chain);
+            const E1 = await at(Tf);
+            const Efar = await at(Tfar);
+            const files = [];
+            for (const e of pkg.entries ?? []) if (e.name !== 'scene.json' && !extra.has(e.name)) files.push({ path: e.name, data: C.getEntry(pkg, e.name) });
+            files.push({ path: 'scene.json', data: sceneBytes });
+            for (const [n, d] of extra) files.push({ path: n, data: d });
+            const built = api.buildScenePkg(files);
+            await mountWith(api.bytesSource(built.pkg, base.project ? await base.project() : undefined));
+            await isolate(tg.chain);
+            const K1 = await at(Tf);
+            inst.destroy();
+            obj.image = prevImage; obj.model = prevModel;
+            return {
+              layers: tg.layers,
+              mid, name: tg.name, form: info.form, bone, boneName: info.bones[bone].name, clip: clip.name, mode: clip.mode, frame, far, exact, subtree: sub.size,
+              n0: s0.n, changed, outMoved, inMoved, selfMove, restored, rejected,
+              commitVsPreview: diffN(P1, E1), commitVsOrig: diffN(s0.A, E1), farDiff: diffN(far0, Efar), farNoise, remountNoise, pkgDiff: diffN(E1, K1),
+            };
+          }
+        }
+        if (inst) inst.destroy();
+        return { skip: 'no posable model' };
+      })()`, { awaitPromise: true, timeoutMs: 600000 });
+    } catch (e) {
+      check(false, `${id}: 骨骼编辑判据执行失败 ${String(e.message).slice(0, 200)}`);
+      continue;
+    }
+    if (r.skip) {
+      console.log(`  · ${id}: ${r.skip}，跳过`);
+      continue;
+    }
+    tested++;
+    if (r.exact) exactN++;
+    if (process.env.VEM_DEBUG) console.log(JSON.stringify(r));
+    const tol = Math.max(30, r.n0 * 0.002);
+    const subtreeOk = r.subtree > 1 ? r.inMoved >= 1 : true;
+    check(
+      r.changed >= 50 && r.outMoved === 0 && r.selfMove <= 0.5 && subtreeOk && r.restored <= tol && r.rejected === 2,
+      `${id} #${r.mid} ${r.name}（${r.form}）骨「${r.boneName}」#${r.bone}（子树 ${r.subtree}）z 转 30°：画面变 ${r.changed} px；子树外骨移动 ${r.outMoved}、自身 ${r.selfMove.toFixed(2)} px、子树内移动 ${r.inMoved}；撤掉预览差 ${r.restored} px；越界拒绝 ${r.rejected}/2`,
+    );
+    check(
+      (r.exact ? r.commitVsPreview <= tol : r.commitVsOrig >= 50) && r.farDiff <= r.remountNoise + tol && r.pkgDiff <= tol,
+      `${id} 写回片段「${r.clip}」（${r.mode}）第 ${r.frame} 帧：${r.exact ? `重挂 vs 预览差 ${r.commitVsPreview} px` : `多层混合，重挂 vs 原画面差 ${r.commitVsOrig} px`}；远帧 ${r.far} 差 ${r.farDiff} px（原样重挂底噪 ${r.remountNoise}）；打包重挂差 ${r.pkgDiff} px`,
+    );
+  }
+  check(tested >= 2 && exactN >= 1, `至少 2 张夹具做了骨骼编辑真引擎判据，含 1 个单层 blend 1（写回 ≡ 预览）（${tested} 张 / 单层 ${exactN}）`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

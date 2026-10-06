@@ -31,6 +31,8 @@ export function editorOf(instance: SceneInstance): EditorControls | null {
     setLayerProps: (id, patch) => cur().setLayerProps(id, patch),
     setAnimationLayers: (id, layers) => cur().setAnimationLayers(id, layers),
     getAttachmentPoints: (id) => rt.sceneCtl?.editor?.getAttachmentPoints(id) ?? null,
+    setBonePose: (id, bone, pose) => cur().setBonePose(id, bone, pose),
+    getBonePoints: (id) => rt.sceneCtl?.editor?.getBonePoints(id) ?? null,
     getLayerOutline: (id) => rt.sceneCtl?.editor?.getLayerOutline(id) ?? null,
     screenDeltaToLocal: (id, dx, dy) => rt.sceneCtl?.editor?.screenDeltaToLocal(id, dx, dy) ?? null,
     getScriptIssues: () => rt.sceneCtl?.editor?.getScriptIssues() ?? [],

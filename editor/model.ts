@@ -3,7 +3,14 @@
 // 所以打开后由 scanPuppets 异步扫一遍，结果存在 doc.puppets，建树时据此标 modelForm。
 // 模型内容（骨骼 / 动画 / 附着点）一律经引擎 getModelInfo 取，页面不解析 .mdl。
 
-import { mdlMeshMaterials, retargetMdlMaterial, type EditorModelInfo } from "../renderer/src/api/editor";
+import {
+  applyBoneDelta,
+  mdlMeshMaterials,
+  retargetMdlMaterial,
+  type EditorModelInfo,
+  type MdlBoneDelta,
+  type MdlClip,
+} from "../renderer/src/api/editor";
 import { modelPathOf, type ImageInput } from "./create";
 import { composeXform, localXform, rebuildTree, relativeXform, writeObjProps, type EditorDoc, type SceneObject, type Xform } from "./doc";
 
@@ -406,4 +413,74 @@ export function meshRetexture(
 /** mesh 第 meshIndex 个子网格当前的材质路径（以 .mdl 本身为准，不信引擎缓存） */
 export function meshMaterialPath(mdlBytes: Uint8Array, meshIndex: number): string | null {
   return mdlMeshMaterials(mdlBytes)?.[meshIndex] ?? null;
+}
+
+// ---------- 骨骼姿势 / 片段关键帧（W18a）：增量编辑，写时复制同 W16 ----------
+// 编辑量是相对当前轨道的增量（平移 / 欧拉角相加、缩放相乘），在片段的某一帧落下、按衰减半径
+// 向两侧淡出。预览走引擎 setBonePose（不进文档），「应用」才把 .mdl 复制一份改轨道并改指向。
+
+/** 衰减半径选项（帧）：0 = 只改这一帧，−1 = 整段 */
+export const BONE_RADII = [0, 5, 15, 30, -1] as const;
+
+/** 片段局部时刻 localTime（秒，已乘层 rate）对应的最近关键帧，环绕规则同引擎 sampleTrackTRS */
+export function clipFrameAt(clip: Pick<MdlClip, "mode" | "fps" | "frames">, localTime: number): number {
+  const n = clip.frames;
+  if (n <= 1) return 0;
+  const span = n - 1;
+  const f = localTime * clip.fps;
+  if (!Number.isFinite(f)) return 0;
+  if (clip.mode === "loop") {
+    const w = Math.round(((f % span) + span) % span);
+    return w >= span ? 0 : w;
+  }
+  if (clip.mode === "mirror") {
+    let w = ((f % (2 * span)) + 2 * span) % (2 * span);
+    if (w > span) w = 2 * span - w;
+    return Math.round(w);
+  }
+  return Math.round(Math.min(Math.max(f, 0), span));
+}
+
+/** 骨骼面板默认片段：第一条可见动画层用的片段，没有就第一个片段 */
+export function defaultClipId(clips: ReadonlyArray<{ id: number }>, layers: readonly AnimLayerView[]): number | null {
+  const ids = new Set(clips.map((c) => c.id));
+  const l = layers.find((x) => x.visible && ids.has(x.animation));
+  return l ? l.animation : (clips[0]?.id ?? null);
+}
+
+/** 骨骼在父链里的深度（下拉缩进用）；父号非法 / 成环时按根处理 */
+export function boneDepths(bones: ReadonlyArray<{ parent: number }>): number[] {
+  const depth: number[] = new Array(bones.length).fill(-1);
+  const at = (i: number, guard: number): number => {
+    if (depth[i] >= 0) return depth[i];
+    const p = bones[i].parent;
+    const d = p >= 0 && p < bones.length && p !== i && guard < bones.length ? at(p, guard + 1) + 1 : 0;
+    return (depth[i] = d);
+  };
+  return bones.map((_, i) => at(i, 0));
+}
+
+export const isZeroDelta = (d: MdlBoneDelta) =>
+  [...(d.t ?? []), ...(d.r ?? [])].every((v) => v === 0) && (d.s ?? []).every((v) => v === 1);
+
+export type BoneEdit = { animId: number; bone: number; frame: number; delta: MdlBoneDelta; radius: number };
+
+/**
+ * 把一次骨骼编辑落成副本文件：puppet 给 model json（puppet 改指向 editor/<slug>.mdl）+ .mdl，
+ * mesh 只有 .mdl。modelJson = null 表示 mesh。片段 / 骨 / 帧不存在或 .mdl 不可编辑时 null
+ */
+export function boneEditFiles(modelJson: Record<string, unknown> | null, mdlBytes: Uint8Array, slug: string, e: BoneEdit): RetextureResult | null {
+  if (modelJson && (typeof modelJson.puppet !== "string" || !modelJson.puppet)) return null;
+  const mdl = applyBoneDelta(mdlBytes, e.animId, e.bone, e.frame, e.delta, e.radius);
+  if (!mdl) return null;
+  const mdlPath = editorMdlOf(slug);
+  if (!modelJson) return { path: mdlPath, files: [{ name: mdlPath, data: mdl }] };
+  const path = modelPathOf(slug);
+  return {
+    path,
+    files: [
+      { name: path, data: jsonBytes({ ...structuredClone(modelJson), puppet: mdlPath }) },
+      { name: mdlPath, data: mdl },
+    ],
+  };
 }
