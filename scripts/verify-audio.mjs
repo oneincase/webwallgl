@@ -83,9 +83,13 @@ const { check, errors } = createChecker();
     }
     // 接线断言：帧循环的场景时间必须钳非负（负 t 对一切下游无意义）
     const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    // 编辑器时钟（W1）把原式泛化成 sceneTimeAt：缺省参数下必须与
+    // (now - start - pauseAccum) / 1000 等价，且整体钳非负。
     check(
-      /const t = Math\.max\(0, \(now - start - pauseAccum\) \/ 1000\)/.test(mountSrc),
-      "帧循环的场景时间必须钳非负（首帧 rAF 时间戳可早于挂载时刻）",
+      /const t = sceneTimeAt\(now, forced \? pausedTotal\(now\) : pauseAccum\)/.test(mountSrc) &&
+        /const sceneTimeAt = \(now: number, paused: number\) =>\s*Math\.max\(0, clockBase \+ \(\(now - clockAnchor - \(paused - clockPauseAtAnchor\)\) \/ 1000\) \* clockScale\)/.test(mountSrc) &&
+        /let clockBase = 0;\s*let clockAnchor = start;\s*let clockPauseAtAnchor = 0;\s*let clockScale = 1;/.test(mountSrc),
+      "帧循环的场景时间必须钳非负（首帧 rAF 时间戳可早于挂载时刻），缺省时钟参数须与原式等价",
     );
   }
 

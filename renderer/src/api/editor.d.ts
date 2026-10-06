@@ -1,6 +1,32 @@
 // WebWallGL 编辑器包类型入口（随 dist 发布为 dist/lib/editor.d.ts）。
 //
-// 现阶段 = 播放包公共类型的全量 re-export（编辑器包是播放包的超集，见
-// docs/EDITOR-PLAN.md §0.5）。E0–E3 落地时在本文件追加编辑器专属声明，并与
-// api/editor.ts 的导出清单保持同步（verify-arch 会比对两端）。
+// 编辑器包是播放包的超集（docs/EDITOR-PLAN.md §0.5）：先全量 re-export 播放包
+// 公共类型，再追加编辑器专属声明。导出清单与 api/editor.ts 保持同步（verify-arch
+// 机器比对）；类型本体只能来自 ./types。
+import type {
+  SceneInstance,
+  EditorControls,
+  EditorLayer,
+  EditorLayerKind,
+  EditorCaptureOptions,
+  EditorHitTestOptions,
+  EditorLayerProps,
+  EditorLayerOutline,
+} from "./types";
+
 export * from "./webwallgl";
+export type {
+  EditorControls,
+  EditorLayer,
+  EditorLayerKind,
+  EditorCaptureOptions,
+  EditorHitTestOptions,
+  EditorLayerProps,
+  EditorLayerOutline,
+};
+
+/**
+ * 取实例的编辑器控制面（时钟 / 出图 / 拾取 / 活层 / 热改）。只有场景壁纸有；
+ * 网页、视频壁纸，或场景尚未装配完成时返回 null。
+ */
+export declare function editorOf(instance: SceneInstance): EditorControls | null;

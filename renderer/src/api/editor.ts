@@ -2,6 +2,16 @@
 //
 // 定位：编辑器使能层，播放包的**超集** —— EDITOR-PLAN 里程碑 E0–E3 的编辑器 API
 // （可控时钟、场景图可变、拾取、单帧出图、保存链路、效果库）全部落在本文件与
-// renderer/src/editor/ 下。现阶段全部内容是播放包公共面的 re-export：编辑器应用
-// 只 import 这一个出口，播放包根出口保持最小面不动（桌面 App 的 file: 依赖零改动）。
+// renderer/src/editor/ 下。编辑器应用只 import 这一个出口，播放包根出口保持最小面
+// 不动（桌面 App 的 file: 依赖零改动）。导出清单与 editor.d.ts 由 verify-arch 比对。
 export * from "./index";
+export { editorOf } from "../editor/controls";
+export type {
+  EditorControls,
+  EditorLayer,
+  EditorLayerKind,
+  EditorCaptureOptions,
+  EditorHitTestOptions,
+  EditorLayerProps,
+  EditorLayerOutline,
+} from "./types";

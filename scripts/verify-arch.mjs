@@ -68,6 +68,27 @@ for (const f of listFiles(path.join(ROOT, "host"), ".ts")) {
   check(!bad, `host/${path.basename(f)}：宿主模拟不得 import 引擎或渲染器源码`);
 }
 
+// editor/（测试台编辑器页，docs/EDITOR-PLAN.md §3A）只经公开出口驱动引擎：
+// renderer/ 下只准 import api/editor 与 api/core；不得读调试探针 —— 页面缺能力就补公开 API。
+const EDITOR_DIR = path.join(ROOT, "editor");
+if (fs.existsSync(EDITOR_DIR)) {
+  const PROBES = /\b(__wp|__wpStats|__sceneLayers|__textWidgets|__objScripts)\b/;
+  for (const f of listFiles(EDITOR_DIR, ".ts")) {
+    const rel = path.relative(ROOT, f);
+    const src = fs.readFileSync(f, "utf8");
+    const importRe = /from\s+['"]([^'"]*renderer\/[^'"]*)['"]/g;
+    let m;
+    while ((m = importRe.exec(src))) {
+      check(
+        /renderer\/src\/api\/(editor|core)$/.test(m[1]),
+        `${rel}：编辑器页只准 import renderer/src/api/editor 或 api/core —— "${m[1]}"`,
+      );
+    }
+    const probe = PROBES.exec(src);
+    check(!probe, `${rel}：编辑器页不得使用调试探针 ${probe?.[1]}（缺能力请在 api/editor 补公开 API）`);
+  }
+}
+
 // ---------- 3. 全部引擎模块 Node 可加载 ----------
 for (const f of jsFiles) {
   const rel = path.relative(ROOT, f);
@@ -511,6 +532,27 @@ for (const name of REQUIRED_WP) {
   check(
     /export\s+\*\s+from\s+["']\.\/webwallgl["']/.test(editorDts),
     "api/editor.d.ts 必须 re-export 播放包类型（./webwallgl），编辑器包与播放包类型不许分叉",
+  );
+  // 编辑器专属运行时导出：editor.ts 的 `export { … } from` ↔ editor.d.ts 的 declare 双向比对
+  const edRuntime = new Set();
+  for (const em of editorTs.matchAll(/export\s+\{([^}]*)\}\s+from/g)) {
+    for (const raw of em[1].split(",")) {
+      const name = raw.trim().split(/\s+as\s+/).pop()?.trim();
+      if (name) edRuntime.add(name);
+    }
+  }
+  for (const name of edRuntime) {
+    check(
+      new RegExp(`export declare (?:function|const) ${name}\\b`).test(editorDts),
+      `契约面：api/editor.ts 导出了 ${name}，但 api/editor.d.ts 未声明 —— 消费方 import 会 TS2305`,
+    );
+  }
+  for (const d of editorDts.matchAll(/export declare (?:function|const) (\w+)/g)) {
+    check(edRuntime.has(d[1]), `契约面：api/editor.d.ts 声明了 ${d[1]}，但 api/editor.ts 并未导出它`);
+  }
+  check(
+    !/from "\.\/(?!types"|webwallgl")/.test(editorDts),
+    "契约面：api/editor.d.ts 只能从 ./types 导入类型、从 ./webwallgl re-export",
   );
 }
 

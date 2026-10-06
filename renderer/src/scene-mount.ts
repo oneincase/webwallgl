@@ -4,7 +4,7 @@ import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
-import type { SceneDirAssets, Source } from "./api/types";
+import type { EditorControls, EditorLayer, EditorLayerKind, EditorLayerProps, SceneDirAssets, Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
@@ -36,7 +36,7 @@ import { createSpectrumCalibrator } from "./audio-calibrate";
 import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { WE_BUILTIN_SHADERS } from "../vendor/we-scene/shaders-builtin";
-import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf } from "../vendor/we-scene/render/math.js";
+import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf, isPerspectiveScene } from "../vendor/we-scene/render/math.js";
 import { pkg, tex, scn, eff, rnd, particles, ptex, sysTex, gtex, patTex, mdl, wtext, wtimers, media, mediaButtons, system, anim, camPath as camPathLib, pointerLib, hitTest, cursorDispatch, audioMod } from "./vendor";
 import {
   flattenUserProperties,
@@ -451,6 +451,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   /** 视频纹理上传倍率热更入口（画质页「视频纹理清晰度」）。同 setQuality 纪律：
    *  impl 未就绪时只写 cfg，建渲染器那步按 cfg 应用。 */
   let applyVideoScaleImpl: ((v: number) => void) | undefined;
+  /** 编辑器控制面（E0）：渲染循环闭包建好后才有，见 sceneCtl.editor */
+  let editorImpl: EditorControls | undefined;
   /** 宿主**请求**的档位（cfg.quality，显式优先判据用）与**实际生效**档位分开存：
    *  自动降档只动后者，getQuality() 读后者 —— 宿主才能看出「我给的 high 为什么没生效」。 */
   const requestedQuality = () => normalizeQuality(rt.cfg.quality);
@@ -477,6 +479,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
     /** 遮挡暂停（V5）：媒体停启走 setOccludedImpl（装配后才有）。 */
     setOccluded(on: boolean) {
       setOccludedImpl?.(on);
+    },
+    get editor() {
+      return editorImpl;
     },
   };
 
@@ -4866,7 +4871,6 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         // 求值对全部文字层执行（含隐藏层：World Time 类脚本跨层读它们），绘制只画可见层。
         const updateTexts = (t: number) => {
           if (!textCtx || !textCanvas) return;
-          const ctx = textCtx;
           for (const it of textWidgets) {
             const layer = it.layer;
             let content = String(layer.text ?? "");
@@ -4893,6 +4897,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             if (it.lastKey === key) continue;
             it.lastKey = key;
             try {
+              if (!it.canvas) {
+                it.canvas = document.createElement("canvas");
+                it.ctx = it.canvas.getContext("2d");
+              }
+              // 每个文字层自己的画布。共享一张时，尺寸不同的层会轮流改 width，
+              // 把别的层刚设好的 2D 状态清掉，并且每层都整张重传。
+              const ctx = it.ctx;
+              const textCanvas = it.canvas;
               // 字号语义：WE 的 pointsize 经 TEXT_EM_SCALE 放大后才是场景像素（实测三路
               // 证据：预览图字高、盒子高/pointsize 全库众数、字号滑条 3~5 的量纲）
               const em = TEXT_EM_SCALE * pts;
@@ -5032,7 +5044,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               });
               const entry = it.entry;
               renderer.gl.bindTexture(renderer.gl.TEXTURE_2D, entry.glTex);
-              renderer.gl.texImage2D(renderer.gl.TEXTURE_2D, 0, renderer.gl.RGBA, renderer.gl.RGBA, renderer.gl.UNSIGNED_BYTE, textCanvas);
+              if (it.upW === cw && it.upH === ch) {
+                renderer.gl.texSubImage2D(renderer.gl.TEXTURE_2D, 0, 0, 0, renderer.gl.RGBA, renderer.gl.UNSIGNED_BYTE, textCanvas);
+              } else {
+                renderer.gl.texImage2D(renderer.gl.TEXTURE_2D, 0, renderer.gl.RGBA, renderer.gl.RGBA, renderer.gl.UNSIGNED_BYTE, textCanvas);
+                it.upW = cw;
+                it.upH = ch;
+              }
               entry.width = cw;
               entry.height = ch;
             } catch (e) {
@@ -6024,6 +6042,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       const start = performance.now();
       let pauseAccum = 0;
       let pauseStarted = 0;
+      // 编辑器时钟（W1）：t = clockBase + (自 clockAnchor 起、扣掉其后暂停的墙钟增量) × clockScale。
+      // 缺省 base=0 / anchor=start / pauseAtAnchor=0 / scale=1 时，渲染循环里的
+      // sceneTimeAt(now, pauseAccum) 与原式 (now - start - pauseAccum) / 1000 逐字等价。
+      let clockBase = 0;
+      let clockAnchor = start;
+      let clockPauseAtAnchor = 0;
+      let clockScale = 1;
+      const pausedTotal = (now: number) => pauseAccum + (pauseStarted ? now - pauseStarted : 0);
+      const sceneTimeAt = (now: number, paused: number) =>
+        Math.max(0, clockBase + ((now - clockAnchor - (paused - clockPauseAtAnchor)) / 1000) * clockScale);
+      const rebaseClock = (t: number, now: number) => {
+        clockBase = Math.max(0, t);
+        clockAnchor = now;
+        clockPauseAtAnchor = pausedTotal(now);
+      };
       const playingVideos: Array<{ play: () => void }> = [];
       const playingAudios: HTMLAudioElement[] = [];
       // 帧率上限门：相位累加调度（见 shell.ts FrameGate）。旧的
@@ -6085,12 +6118,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       const MAX_SCRIPT_FRAME_DT = 0.05;
       // 循环体。**不要直接把它交给 requestAnimationFrame** —— 外面必须套
       // renderLoop 守卫壳（见其定义处注释：回调里抛错会让 rAF 链断死）。
-      const renderLoopImpl = (now: number) => {
-        if (disposed || rt.paused) return;
+      // forced = 编辑器单帧（暂停中 seek/step/capture）：越过暂停与帧率门画一帧，
+      // 不计帧率、不喂守门、不续排 rAF。
+      const renderLoopImpl = (now: number, forced = false) => {
+        if (disposed || (rt.paused && !forced)) return;
         // 遮挡维护（V5）：fail-open（推送失联恢复全量）+ 画布 resize 重算。
         // 放在一切渲染工作之前 —— 失联恢复必须当帧生效。
         tickOcclusion(rt, now);
-        if (disposed || rt.paused || rt.occlusion?.band === "pause") return;
+        if (disposed || (!forced && (rt.paused || rt.occlusion?.band === "pause"))) return;
         // 帧率上限：相位累加调度，比目标更快的 rAF 不渲染只继续排队，降低 GPU 占用。
         // 热改 fps（工具条滑条）只改 rt.cfg.sceneFps，这里同步进调度器、保留节拍相位。
         // 遮挡降帧（V5）：档位 fps 与宿主上限取 min —— 宿主显式 setFps 永远是上限，
@@ -6102,8 +6137,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           gateFps = fps;
           frameGate.setFps(fps);
         }
-        if (frameGate.shouldRender(now)) {
-          markFrame(rt, now);
+        if (forced || frameGate.shouldRender(now)) {
+          if (!forced) markFrame(rt, now);
           // 帧率守门挂起（V5，评估报告 R1）：遮挡降帧/暂停期间实测 fps 天然低于
           // 宿主上限，照常喂守门会误降后处理档位；且暂停时长会把 adaptiveAccum
           // 毒成一次巨大 dtS 直接清空冷却。挂起期间清零累计，解除后从当前帧
@@ -6116,6 +6151,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // 帧率守门：按**真实经过时间**每秒喂一次读数（不是每帧喂 —— 否则高刷屏上
           // 判断频率随时间被放大）。读数取 frameMeter 的实测 fps（被上限跳过的帧不计入，
           // 反映的是真实出帧能力）；上限取配置值，宿主 setFps 改上限时这里自动跟上。
+          // 单帧路径不打 markFrame，frameMeter.last 不动 → 这里累计增量为 0，守门不受影响
           if (adaptive && !occlActive) {
             if (lastAdaptiveT > 0) adaptiveAccum += rt.frameMeter.last - lastAdaptiveT;
             lastAdaptiveT = rt.frameMeter.last;
@@ -6151,7 +6187,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               }
             }
           }
-          syncCanvasSize(rt, c, rt.cfg);
+          // 出图（W3）指定了输出尺寸：本帧 backing store 直接设成目标尺寸（CSS 尺寸不动），
+          // 下一帧 syncCanvasSize 自然复原。
+          if (captureReq) {
+            if (c.width !== captureReq.w) c.width = captureReq.w;
+            if (c.height !== captureReq.h) c.height = captureReq.h;
+            captureReq.armed = true;
+          } else {
+            syncCanvasSize(rt, c, rt.cfg);
+          }
           // [we-scene patch] resizeScreen 派发（官方生命周期事件）：画布 CSS 尺寸
           // 变化（含首帧：resize 模板在 init 里手动调
           // resizeScreen(engine.screenResolution)，首帧不补发它拿到的是沙箱
@@ -6170,7 +6214,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // performance.now()（vsync 对齐），负的场景时间会让下游按相位取模的
           // 消费者越界（模拟音频 patterns[i16<0] = undefined → NaN 毒化共享视图，
           // 3233141951 反光层永久隐形）。负场景时间对一切下游都无意义。
-          const t = Math.max(0, (now - start - pauseAccum) / 1000);
+          // 单帧路径在暂停中：pauseStarted 未结账，要按「含进行中暂停」的总量扣。
+          const t = sceneTimeAt(now, forced ? pausedTotal(now) : pauseAccum);
           // 指针 last 在本帧 render 完成后再推进（见下方 then）。事件驱动下
           // rAF 之间的 mousemove 已经更新了 current；若在消费前 last=current，
           // cursorripple 的 v_PointDelta.x 恒为 0，涟漪完全不触发。
@@ -6729,7 +6774,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             applyCameraZoom(win, cameraZoomOf(scene));
             roiWorld = roiWorldRects(occSnap.rects, win, cssW, cssH);
           }
-          void renderer
+          renderInFlight = renderer
             .render(scene, textures, c.width, c.height, t, normalizeFit(rt.cfg.fit), peek.x, peek.y, roiWorld)
             .then(() => {
               // [we-scene patch] 本代已拆（clear/destroy）就立刻退出：**不得**再触发
@@ -6737,7 +6782,27 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // mount() 提前 resolve（docs/ENGINE-REVIEW-2026-10.md §3.3）。
               // 注意与下面的 `rt.paused` 早退区分：paused 是「本代还活着但停着」，
               // 首帧仍要落地（autoplay:false 的语义就是「就绪但静止」）。
-              if (disposed) return;
+              if (disposed) {
+                failEditorWaiters(new Error("scene disposed"));
+                return;
+              }
+              // 出图（W3）：画布是 preserveDrawingBuffer，帧画完即可整幅拷走。
+              // 只认「本帧已按目标尺寸渲染」的请求（armed），在飞的旧尺寸帧不算。
+              if (captureReq?.armed) {
+                const req = captureReq;
+                captureReq = null;
+                try {
+                  const out = document.createElement("canvas");
+                  out.width = c.width;
+                  out.height = c.height;
+                  const ctx2d = out.getContext("2d");
+                  if (!ctx2d) throw new Error("capture: 2d context unavailable");
+                  ctx2d.drawImage(c, 0, 0);
+                  req.resolve(out);
+                } catch (e) {
+                  req.reject(e instanceof Error ? e : new Error(String(e)));
+                }
+              }
               // 库化桥接：首帧**画完之后**才 resolve mount() 的 Promise（一次性）。
               // 必须在 render().then 里，不能放在调用之前：那样 Promise 会早一帧
               // 落地，调用方拿到实例时画布还是空的 —— autoplay:false 紧接着
@@ -6752,7 +6817,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               }
               // 遮挡暂停跨到渲染回调里也要拦住重排（setOccluded(true) 取消的是
               // 挂起的 rAF，正在飞的这帧完成后不能再排下一帧）
-              if (disposed || rt.paused || occlPaused(rt)) return;
+              if (!forced && (rt.paused || occlPaused(rt))) {
+                flushEditorWaiters();
+                return;
+              }
               // [we-scene patch] 上下文丢失：实测画面会**静默冻结**（rAF 照跑、fps 照计、
               // console 与 /diag 全空），与 MSAA blit 静默失败症状无法区分。引擎已经做了
               // preventDefault + 一次性诊断（renderer.contextLost，见其注释），这里把它
@@ -6761,6 +6829,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 const err = new Error("WebGL 上下文丢失：画面已冻结且不再更新，需要重挂载");
                 reportDiag(rt, cfg, `上下文丢失：渲染已停止更新（引擎不重建 GL 资源）`, "error");
                 disposed = true;
+                failEditorWaiters(err);
                 if (rt.onError) rt.onError(err);
                 else rt.fallbackPage?.();
                 return;
@@ -6790,7 +6859,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               try {
                 if (rt.sceneTextUpdate) rt.sceneTextUpdate(t);
               } catch (e) { /* 文字更新失败忽略 */ }
-              rt.raf = requestAnimationFrame(renderLoop);
+              flushEditorWaiters();
+              if (!forced) rt.raf = requestAnimationFrame(renderLoop);
             })
             .catch((e: Error) => {
               // [we-scene patch] 这条 catch 原先只 console.warn + diag + disposed：循环
@@ -6798,6 +6868,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // 与装配期/守卫壳同一条出口：有 onError 交回调用方，否则挂降级页。
               console.warn("scene render error:", e);
               const err = e instanceof Error ? e : new Error(String(e));
+              failEditorWaiters(err);
               if (disposed) return;
               reportDiag(rt, cfg, `render: ${String(err.message || err).slice(0, 200)}`, "error");
               disposed = true;
@@ -6806,6 +6877,30 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             });
         } else {
           if (!rt.paused && !occlPaused(rt)) rt.raf = requestAnimationFrame(renderLoop);
+        }
+      };
+      // ---- 编辑器单帧通道（E0）----
+      // 等「下一帧画完」的调用方（seek/step/capture）。播放中由循环自然的下一帧结清，
+      // 暂停中由 renderOnce 补画一帧结清。
+      let renderInFlight: Promise<unknown> | null = null;
+      let forcedQueued = false;
+      let captureReq: {
+        w: number;
+        h: number;
+        armed: boolean;
+        resolve: (c: HTMLCanvasElement) => void;
+        reject: (e: Error) => void;
+      } | null = null;
+      const frameWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
+      const flushEditorWaiters = () => {
+        for (const w of frameWaiters.splice(0)) w.resolve();
+      };
+      const failEditorWaiters = (err: Error) => {
+        for (const w of frameWaiters.splice(0)) w.reject(err);
+        if (captureReq) {
+          const req = captureReq;
+          captureReq = null;
+          req.reject(err);
         }
       };
       /**
@@ -6821,11 +6916,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
        *
        * 这里把它兜成「一条诊断 + onError」：宿主立刻拿到失败原因，不再是黑洞。
        */
-      const renderLoop = (now: number) => {
+      const renderLoop = (now: number, forced = false) => {
         try {
-          renderLoopImpl(now);
+          renderLoopImpl(now, forced);
         } catch (e) {
           const err = e instanceof Error ? e : new Error(String(e));
+          failEditorWaiters(err);
           if (disposed) return;
           reportDiag(rt, cfg, `failed: renderLoop 异常，渲染循环终止 — ${String(err.message || err).slice(0, 200)}`, "error");
           disposed = true;
@@ -7037,6 +7133,266 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           pauseAccum += performance.now() - pauseStarted;
           pauseStarted = 0;
         }
+      };
+      // ---- 编辑器控制面（E0：W1 时钟 / W3 出图 / W4 拾取 / W2a 活层）----
+      const nextFrame = () =>
+        new Promise<void>((resolve, reject) => frameWaiters.push({ resolve, reject }));
+      // 暂停中补画一帧；连续 seek（拖时间轴）合并成一帧 —— t 在真正出帧时才取，
+      // 排队中的那帧天然用最新时钟。与在飞的帧串行，避免两次 render 交叠。
+      const renderOnce = (): Promise<void> => {
+        if (disposed) return Promise.reject(new Error("scene disposed"));
+        const p = nextFrame();
+        if ((rt.paused || occlPaused(rt)) && !forcedQueued) {
+          forcedQueued = true;
+          void (renderInFlight ?? Promise.resolve())
+            .catch(() => {})
+            .then(() => {
+              forcedQueued = false;
+              if (!disposed) renderLoop(performance.now(), true);
+            });
+        }
+        return p;
+      };
+      const currentTime = () => {
+        const now = performance.now();
+        return sceneTimeAt(now, pausedTotal(now));
+      };
+      const layerKindOf = (l: any): EditorLayerKind => {
+        if (l.isText) return "text";
+        if (l.particle) return "particle";
+        if (l.isSound) return "sound";
+        if (l.isLight) return "light";
+        if (l.isContainer) return "container";
+        return l.srcObject?.image || l.srcObject?.model ? "image" : "group";
+      };
+      const layerView = (l: any, index: number): EditorLayer => ({
+        id: Number(l.id),
+        name: String(l.name ?? ""),
+        kind: layerKindOf(l),
+        parentId: l.parentId ?? null,
+        visible: l.visible !== false,
+        index,
+      });
+      // 画布 CSS 像素 ↔ 世界像素（y 向下）的窗口。与渲染相机同源：fitWindow（含 cover
+      // 的 peek 对齐）+ 相机 zoom 收缩，与 ROI 逆映射同一套数学（见渲染循环里 roiWorld 的注释）。
+      // 透视相机场景（无 orthogonalprojection）不适用，调用方自行判 perspective。
+      const editorView = () => {
+        const cssW = c.clientWidth || 1;
+        const cssH = c.clientHeight || 1;
+        const ortho = (scene as any).general?.orthogonalprojection || {};
+        const projW = ortho.width || c.width;
+        const projH = ortho.height || c.height;
+        const peek = rt.coverAlign;
+        const view = fitWindow(normalizeFit(rt.cfg.fit), projW, projH, cssW, cssH, peek.x, peek.y);
+        applyCameraZoom(view, cameraZoomOf(scene));
+        return { view, cssW, cssH, projH, perspective: !!isPerspectiveScene(scene) };
+      };
+      const layerById = (id: number): any =>
+        (scene.layers as any[]).find((l) => l && !l.destroyed && String(l.id) === String(id));
+      const vec3 = (v: unknown, d: number): [number, number, number] => {
+        const a = Array.isArray(v) ? v : [];
+        return [0, 1, 2].map((i) => (Number.isFinite(Number(a[i])) ? Number(a[i]) : d)) as [number, number, number];
+      };
+      // 该层及其整棵子树（父动子跟：重算 world 时必须一起进脏集合）
+      const subtreeIds = (root: any): Set<unknown> => {
+        const ids = new Set<unknown>([root.id]);
+        let grew = true;
+        while (grew) {
+          grew = false;
+          for (const l of scene.layers as any[]) {
+            if (l && !ids.has(l.id) && l.parentId !== null && l.parentId !== undefined && ids.has(l.parentId)) {
+              ids.add(l.id);
+              grew = true;
+            }
+          }
+        }
+        return ids;
+      };
+      const getLayerPropsImpl = (id: number): EditorLayerProps | null => {
+        const l = layerById(id);
+        if (!l) return null;
+        // generic4 材质常量烘进了 color/alpha（applyBuiltinMatTint）：对外给对象自身的值
+        const base = l.matTint && l.tintBase ? l.tintBase : l;
+        return {
+          origin: vec3(l.localOrigin ?? l.origin, 0),
+          scale: vec3(l.localScale ?? l.scale, 1),
+          angles: vec3(l.localAngles ?? l.angles, 0),
+          visible: l.visibleSelf !== false,
+          alpha: Number.isFinite(Number(base.alpha)) ? Number(base.alpha) : 1,
+          color: vec3(base.color, 1),
+        };
+      };
+      const setLayerPropsImpl = (id: number, patch: Partial<EditorLayerProps>): Promise<void> => {
+        if (disposed) return Promise.reject(new Error("scene disposed"));
+        const l = layerById(id);
+        if (!l) return Promise.reject(new Error(`setLayerProps: layer ${id} not found`));
+        const p = patch ?? {};
+        if (p.origin || p.scale || p.angles) {
+          // 写 local 槽（与脚本/动画同一空间），再把该子树合成回 world。
+          // 后处理层的 world 被强制成整幅画布，变换对它无意义（recomposeWorld 也跳过）。
+          const hasLocal = Array.isArray(l.localOrigin) && Array.isArray(l.localScale) && Array.isArray(l.localAngles);
+          const put = (slot: string, worldSlot: string, v: [number, number, number] | undefined) => {
+            if (!v) return;
+            const target = hasLocal ? l[slot] : l[worldSlot];
+            for (let i = 0; i < 3; i++) if (Number.isFinite(v[i])) target[i] = v[i];
+          };
+          put("localOrigin", "origin", p.origin);
+          put("localScale", "scale", p.scale);
+          put("localAngles", "angles", p.angles);
+          if (hasLocal) {
+            const ids = subtreeIds(l);
+            scn.recomposeWorld(scene.layers, ids);
+            // 粒子发射器变换只在 particleDirty 里的系统逐帧重读；静态层改了要补登记
+            for (const lid of ids) {
+              for (const ps of particleSystemsByLayer.get(lid as number) ?? []) {
+                if (!particleDirty.includes(ps)) particleDirty.push(ps);
+              }
+            }
+          }
+        }
+        if (p.visible !== undefined) {
+          l.visibleSelf = !!p.visible;
+          recomputeVisibility();
+          for (const layer of scene.layers as any[]) {
+            if (!layer.particle) continue;
+            for (const ps of particleSystemsByLayer.get(layer.id) ?? []) ps.setVisible(!!layer.visible);
+          }
+        }
+        if (p.alpha !== undefined || p.color) {
+          const tinted = l.matTint && l.tintBase;
+          const base = tinted ? l.tintBase : l;
+          if (p.alpha !== undefined && Number.isFinite(p.alpha)) base.alpha = p.alpha;
+          if (p.color) {
+            base.color = vec3(p.color, 1);
+            if (l.isText && !tinted) l.textColor = base.color;
+          }
+          if (tinted) applyBuiltinMatTint(l);
+        }
+        return renderOnce();
+      };
+      const seekImpl = (t: number): Promise<void> => {
+        if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
+        rebaseClock(t, performance.now());
+        return renderOnce();
+      };
+      editorImpl = {
+        get time() {
+          return currentTime();
+        },
+        get timeScale() {
+          return clockScale;
+        },
+        seek: seekImpl,
+        setTimeScale(scale: number) {
+          const now = performance.now();
+          rebaseClock(sceneTimeAt(now, pausedTotal(now)), now);
+          clockScale = Number.isFinite(scale) && scale > 0 ? scale : 0;
+        },
+        async step(frames = 1, fps = 60) {
+          const n = Math.max(1, Math.floor(frames));
+          const dt = 1 / (fps > 0 ? fps : 60);
+          if (!rt.paused) return seekImpl(currentTime() + n * dt);
+          // 逐帧推进：有状态模拟（粒子/脚本）每帧吃到真实的 dt，而不是一步跳 n 帧
+          for (let i = 0; i < n; i++) await seekImpl(currentTime() + dt);
+        },
+        async capture(opts = {}) {
+          if (opts.time !== undefined) await seekImpl(opts.time);
+          if (disposed) throw new Error("scene disposed");
+          const MAX = 8192;
+          const baseW = c.width || 1;
+          const baseH = c.height || 1;
+          let w = opts.width && opts.width > 0 ? opts.width : 0;
+          let h = opts.height && opts.height > 0 ? opts.height : 0;
+          if (w && !h) h = (w * baseH) / baseW;
+          else if (h && !w) w = (h * baseW) / baseH;
+          else if (!w && !h) {
+            w = baseW;
+            h = baseH;
+          }
+          w = Math.max(1, Math.min(MAX, Math.round(w)));
+          h = Math.max(1, Math.min(MAX, Math.round(h)));
+          const resized = w !== baseW || h !== baseH;
+          const shot = await new Promise<HTMLCanvasElement>((resolve, reject) => {
+            if (captureReq) captureReq.reject(new Error("capture superseded"));
+            captureReq = { w, h, armed: false, resolve, reject };
+            renderOnce().catch(reject);
+          });
+          // 暂停中改过 backing store：补画一帧把可见画面复原到容器尺寸
+          if (resized && rt.paused && !disposed) await renderOnce();
+          return await new Promise<Blob>((resolve, reject) =>
+            shot.toBlob(
+              (b) => (b ? resolve(b) : reject(new Error("capture: toBlob failed"))),
+              opts.type || "image/png",
+              opts.quality,
+            ),
+          );
+        },
+        hitTestAt(x: number, y: number, opts = {}) {
+          if (disposed) return [];
+          const ev = editorView();
+          const wx = ev.view.offX + (x / ev.cssW) * ev.view.viewW;
+          const wy = ev.view.offY + (y / ev.cssH) * ev.view.viewH;
+          const projH = ev.projH;
+          const hits: any[] = hitTest.hitTestLayersAll(scene.layers, wx, wy, projH, {
+            parallaxCtx: renderer.getParallaxOffset ? renderer.getParallaxOffset() : null,
+            alignTable: rnd.ALIGN,
+            perspEye: renderer.getPerspectiveEye ? renderer.getPerspectiveEye() : null,
+            // 缺省排除看不见的层：visible=false 与 alpha=0（WE 惯用的透明点击区）
+            filter: opts.includeHidden
+              ? undefined
+              : (l: any) => l.visible !== false && !(typeof l.alpha === "number" && l.alpha <= 0),
+          });
+          const indexOf = new Map<any, number>();
+          (scene.layers as any[]).forEach((l, i) => indexOf.set(l, i));
+          return hits.map((l) => layerView(l, indexOf.get(l) ?? -1));
+        },
+        getLayers() {
+          if (disposed) return [];
+          const out: EditorLayer[] = [];
+          (scene.layers as any[]).forEach((l, i) => {
+            if (l && !l.destroyed) out.push(layerView(l, i));
+          });
+          return out;
+        },
+        getLayerProps: getLayerPropsImpl,
+        setLayerProps: setLayerPropsImpl,
+        getLayerOutline(id: number) {
+          if (disposed) return null;
+          const l = layerById(id);
+          const ev = editorView();
+          if (!l || ev.perspective) return null;
+          const q = hitTest.layerQuadWorld(
+            l,
+            ev.projH,
+            rnd.ALIGN,
+            renderer.getParallaxOffset ? renderer.getParallaxOffset() : null,
+          );
+          const toCss = (p: [number, number]): [number, number] => [
+            ((p[0] - ev.view.offX) / ev.view.viewW) * ev.cssW,
+            ((p[1] - ev.view.offY) / ev.view.viewH) * ev.cssH,
+          ];
+          return { anchor: toCss(q.anchor), corners: q.corners ? q.corners.map(toCss) : null };
+        },
+        screenDeltaToLocal(id: number, dx: number, dy: number) {
+          if (disposed) return null;
+          const l = layerById(id);
+          const ev = editorView();
+          if (!l || ev.perspective) return null;
+          // CSS 像素 → 世界像素（y 向下）→ WE 坐标（y 向上）
+          const wx = (dx / ev.cssW) * ev.view.viewW;
+          const wy = -(dy / ev.cssH) * ev.view.viewH;
+          const parent = l.parentId !== null && l.parentId !== undefined ? layerById(l.parentId) : null;
+          if (!parent || !Array.isArray(l.localOrigin)) return [wx, wy];
+          // composeChildTransform 的逆：world Δ = R(父角) · S(父缩放) · local Δ
+          const a = parent.angles?.[2] || 0;
+          const cs = Math.cos(-a);
+          const sn = Math.sin(-a);
+          const rx = wx * cs - wy * sn;
+          const ry = wx * sn + wy * cs;
+          const sx = parent.scale?.[0] || 1;
+          const sy = parent.scale?.[1] || 1;
+          return [rx / sx, ry / sy];
+        },
       };
       applyLiveImpl = applyLiveProps;
       if (pendingWire) {

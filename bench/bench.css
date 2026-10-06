@@ -172,6 +172,10 @@ input {
   color: var(--fg);
 }
 
+#activitybar a.act {
+  text-decoration: none;
+}
+
 #activitybar .act.active {
   color: var(--icon-active);
   border-left-color: var(--accent);

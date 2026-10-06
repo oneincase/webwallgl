@@ -2336,5 +2336,39 @@ console.log('\n【10. 隐形点击区（Solid 层 visible:false 仍收 cursor �
   }
 }
 
+// 编辑器选中框（W5 过渡方案）：layerQuadWorld 必须是 worldToLayerLocal 的精确逆 ——
+// 四角逆变换回局部必须恰好落在 (±0.5, ±0.5)，锚点处不得有误差，否则框与命中区错开。
+{
+  const { layerQuadWorld } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/hittest.js'))
+  const projH = 1080
+  const parallaxCtx = { active: true, lx: 37, ly: -21 }
+  const want = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]
+  let worst = 0
+  let cases = 0
+  for (const alignment of Object.keys(ALIGN_TABLE)) {
+    for (const ang of [0, 0.4, -1.3, Math.PI]) {
+      for (const parallaxDepth of [null, [0.5, 1.2]]) {
+        const layer = {
+          origin: [700, 300, 0], size: [320, 180], scale: [1.5, 0.75, 1],
+          angles: [0, 0, ang], alignment, parallaxDepth,
+        }
+        const q = layerQuadWorld(layer, projH, ALIGN_TABLE, parallaxCtx)
+        if (!q.corners) { fail(`layerQuadWorld：有尺寸的层不该缺四角（${alignment}）`); continue }
+        q.corners.forEach(([wx, wy], i) => {
+          const loc = worldToLayerLocal(layer, wx, wy, projH, 0, 0, ALIGN_TABLE, null, parallaxCtx)
+          worst = Math.max(worst, Math.abs(loc.lx - want[i][0]), Math.abs(loc.ly - want[i][1]))
+        })
+        cases++
+      }
+    }
+  }
+  if (worst > 1e-9) fail(`layerQuadWorld 与 worldToLayerLocal 不互逆：最大偏差 ${worst}`)
+  else ok(`layerQuadWorld ↔ worldToLayerLocal 精确互逆（${cases} 组 对齐×旋转×视差）`)
+  const zero = layerQuadWorld({ origin: [10, 20, 0], size: [0, 0] }, projH, ALIGN_TABLE, null)
+  if (zero.corners !== null || zero.anchor[0] !== 10 || zero.anchor[1] !== projH - 20) {
+    fail('layerQuadWorld：零尺寸层应只给锚点（y 按 projH 翻转）')
+  } else ok('layerQuadWorld：零尺寸层只给锚点')
+}
+
 console.log(errors.length === 0 ? '\n✓ 全部通过' : `\n✗ 共 ${errors.length} 处问题`)
 process.exit(errors.length === 0 ? 0 : 1)

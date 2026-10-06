@@ -633,8 +633,32 @@ function ctxMenuItem(
   return btn;
 }
 
+function editorIcon(): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("width", "16");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("fill", "currentColor");
+  path.setAttribute(
+    "d",
+    "M13.2 1.6a1.6 1.6 0 0 0-2.3 0L3 9.5l-1 4.5 4.5-1 7.9-7.9a1.6 1.6 0 0 0 0-2.3l-1.2-1.2zM4 10.2l5.6-5.6 1.8 1.8L5.8 12l-2.3.5.5-2.3z",
+  );
+  svg.appendChild(path);
+  return svg;
+}
+
+function openInEditor(itemId: string) {
+  window.open(`${import.meta.env.BASE_URL}editor/?item=${encodeURIComponent(itemId)}`, "_blank");
+}
+
 function openCtxMenu(it: LibraryItem, x: number, y: number) {
   ctxMenuEl.textContent = "";
+  ctxMenuEl.appendChild(
+    ctxMenuItem(t("ctx.openEditor"), editorIcon(), "", () => openInEditor(it.itemId)),
+  );
   ctxMenuEl.appendChild(
     ctxMenuItem(t("reveal.open"), folderIcon(), "", () => void revealItem(it.itemId)),
   );

@@ -1,0 +1,658 @@
+/* 编辑器页：配色 / 标题栏 / 活动栏 / 状态栏沿用 bench.css，这里只排工作区 */
+
+#ed-workbench {
+  display: grid;
+  grid-template-columns: 48px 260px minmax(0, 1fr) 300px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#ed-doc-title:not(:empty)::before {
+  content: " — ";
+  color: var(--fg-mute);
+}
+
+#ed-doc-title {
+  color: var(--fg-dim);
+}
+
+/* ---------- 侧栏与面板 ---------- */
+
+.ed-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--sidebar);
+}
+
+#ed-left {
+  border-right: 1px solid var(--border);
+}
+
+#ed-right {
+  border-left: 1px solid var(--border);
+}
+
+.ed-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#ed-library {
+  flex: 0 1 38%;
+  border-bottom: 1px solid var(--border);
+}
+
+.ed-grow {
+  flex: 1 1 0;
+}
+
+.ed-pane-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px 0 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+
+.ed-count {
+  flex: 1;
+  font-weight: 400;
+  text-transform: none;
+  color: var(--fg-mute);
+}
+
+.ed-pane-tools {
+  flex: none;
+  padding: 0 10px 6px;
+}
+
+.ed-pane-tools input {
+  width: 100%;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--widget-border);
+  border-radius: 2px;
+  background: var(--input);
+  outline: none;
+}
+
+.ed-pane-tools input:focus {
+  border-color: var(--focus);
+}
+
+.ed-list {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: auto;
+}
+
+.ed-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 14px;
+  cursor: pointer;
+}
+
+.ed-list li:hover {
+  background: var(--hover);
+}
+
+.ed-list li.active {
+  background: var(--active-sel);
+  color: var(--list-active-fg);
+}
+
+.ed-list img {
+  flex: none;
+  width: 40px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 2px;
+  background: var(--bezel);
+}
+
+.ed-list .meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ed-list .title,
+.ed-list .sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-list .sub {
+  color: var(--fg-mute);
+  font-size: 11px;
+}
+
+.ed-note {
+  margin: 0;
+  padding: 6px 14px;
+  color: var(--fg-mute);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ---------- 图层树 ---------- */
+
+.ed-tree {
+  flex: 1;
+  overflow: auto;
+  padding-bottom: 8px;
+}
+
+.ed-node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding-right: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ed-node:hover {
+  background: var(--hover);
+}
+
+.ed-node.selected {
+  background: var(--active-sel);
+  color: var(--list-active-fg);
+}
+
+.ed-node.hidden-layer .ed-node-name {
+  opacity: 0.45;
+}
+
+.ed-twisty {
+  flex: none;
+  width: 16px;
+  text-align: center;
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.ed-kind {
+  flex: none;
+  min-width: 34px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--input);
+  color: var(--fg-dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+.ed-kind[data-kind="image"] { color: #4fc1ff; }
+.ed-kind[data-kind="model"] { color: #c586c0; }
+.ed-kind[data-kind="particle"] { color: #d7ba7d; }
+.ed-kind[data-kind="text"] { color: #89d185; }
+.ed-kind[data-kind="sound"] { color: #f48771; }
+.ed-kind[data-kind="light"] { color: #e2c08d; }
+
+.ed-node-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ed-node-id {
+  color: var(--fg-mute);
+  font: 10px var(--mono);
+}
+
+/* ---------- 中央：工具栏 + 视口 + 控制台 ---------- */
+
+#ed-center {
+  display: grid;
+  grid-template-rows: 34px minmax(0, 1fr) 34px 168px;
+  /* 舞台尺寸由 JS 按视口算出；列若按内容定宽，窗口变窄时舞台会把列反向撑住 */
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  background: var(--editor);
+}
+
+#ed-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.ed-btn {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--widget-border);
+  border-radius: 2px;
+  background: var(--input);
+  cursor: pointer;
+}
+
+.ed-btn:hover:not(:disabled) {
+  background: var(--btn-hover);
+}
+
+.ed-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 24px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--icon);
+  cursor: pointer;
+}
+
+.ed-icon:hover:not(:disabled) {
+  background: var(--toolbar-hover);
+}
+
+.ed-btn:disabled,
+.ed-icon:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ed-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+}
+
+.ed-spacer {
+  flex: 1;
+}
+
+.ed-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.ed-field select {
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--widget-border);
+  border-radius: 2px;
+  background: var(--input);
+  color: var(--fg);
+  outline: none;
+}
+
+#ed-viewport {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  overflow: hidden;
+  background-color: var(--bezel);
+  background-image:
+    linear-gradient(45deg, rgba(255, 255, 255, 0.025) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.025) 75%),
+    linear-gradient(45deg, rgba(255, 255, 255, 0.025) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.025) 75%);
+  background-size: 24px 24px;
+  background-position: 0 0, 12px 12px;
+}
+
+#ed-stage {
+  position: relative;
+  background: #000;
+  box-shadow: 0 0 0 1px var(--widget-border), var(--shadow);
+  overflow: hidden;
+}
+
+#ed-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: none;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+.ed-empty-title {
+  font-size: 18px;
+  color: var(--fg);
+}
+
+.ed-empty-hint {
+  max-width: 420px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+#ed-drop {
+  position: absolute;
+  inset: 8px;
+  border: 2px dashed var(--accent);
+  border-radius: 6px;
+  background: rgba(0, 120, 212, 0.08);
+  pointer-events: none;
+}
+
+#ed-stage canvas {
+  cursor: crosshair;
+}
+
+/* ---------- 时间轴 ---------- */
+
+#ed-timeline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  white-space: nowrap;
+}
+
+#tl-time {
+  min-width: 64px;
+  color: var(--fg);
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+#tl-range {
+  flex: 1;
+  min-width: 80px;
+  accent-color: var(--accent);
+}
+
+#tl-max {
+  min-width: 36px;
+  color: var(--fg-mute);
+  font: 11px var(--mono);
+}
+
+#ed-console {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.ed-link {
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+#ed-con-body {
+  flex: 1;
+  margin: 0;
+  padding: 2px 14px 8px;
+  overflow: auto;
+  font: 11px/1.5 var(--mono);
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+
+#ed-con-body .warn {
+  color: var(--warn);
+}
+
+#ed-con-body .error {
+  color: var(--danger);
+}
+
+/* ---------- 检视器 ---------- */
+
+#ed-inspector {
+  flex: 1;
+  overflow: auto;
+  padding: 0 12px 12px;
+  user-select: text;
+}
+
+.ed-insp-group {
+  margin: 4px 0 12px;
+}
+
+.ed-insp-title {
+  margin: 8px 0 6px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ed-kv {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 4px 8px;
+  font-size: 12px;
+}
+
+.ed-kv dt {
+  color: var(--fg-mute);
+}
+
+.ed-kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+}
+
+.ed-insp-raw {
+  max-height: 320px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bezel);
+  font: 11px/1.45 var(--mono);
+  color: var(--fg-dim);
+  white-space: pre;
+}
+
+.ed-form {
+  display: grid;
+  grid-template-columns: 52px repeat(3, minmax(0, 1fr));
+  gap: 4px 4px;
+  align-items: center;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: 12px;
+}
+
+.ed-form > label {
+  color: var(--fg-mute);
+}
+
+.ed-form input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--widget-border);
+  border-radius: 2px;
+  background: var(--input);
+  color: var(--fg);
+  font: 11px var(--mono);
+  outline: none;
+}
+
+.ed-form input[type="number"]:focus {
+  border-color: var(--focus);
+}
+
+.ed-form .span3 {
+  grid-column: span 3;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ed-form input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.ed-form input[type="color"] {
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--widget-border);
+  background: transparent;
+}
+
+.ed-form .ed-val {
+  min-width: 36px;
+  color: var(--fg-dim);
+  font: 11px var(--mono);
+  text-align: right;
+}
+
+.ed-hint {
+  margin: 6px 0 0;
+  color: var(--fg-mute);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ed-node-actions {
+  display: flex;
+  flex: none;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.ed-eye,
+.ed-lock {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-mute);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.ed-node:hover .ed-eye,
+.ed-node:hover .ed-lock,
+.ed-node.hidden-layer .ed-eye,
+.ed-node.locked-layer .ed-lock {
+  opacity: 1;
+}
+
+.ed-node.locked-layer .ed-node-name {
+  font-style: italic;
+}
+
+.ed-layer-tools {
+  display: flex;
+  gap: 0;
+  margin-left: auto;
+}
+
+.ed-layer-tools .ed-icon {
+  width: 22px;
+  height: 22px;
+}
+
+.ed-layer-tools .ed-icon:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+#ed-stage[data-cursor="move"] canvas {
+  cursor: move;
+}
+
+#ed-stage[data-cursor="scale"] canvas {
+  cursor: nwse-resize;
+}
+
+#ed-stage[data-cursor="rotate"] canvas {
+  cursor: alias;
+}
+
+fieldset.ed-form:disabled {
+  opacity: 0.55;
+}
+
+#ed-overlay {
+  position: absolute;
+  inset: 0;
+  /* 画布是替换元素，只设 inset 会退回内在尺寸（= 后备存储像素）撑大网格列 */
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.ed-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 1px solid var(--widget-border);
+  vertical-align: -1px;
+}
+
+#st-doc {
+  max-width: 36vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#st-fps {
+  min-width: 58px;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#st-fps.idle {
+  color: var(--fg-mute);
+}

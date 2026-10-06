@@ -15,7 +15,13 @@ import {
   type OcclusionBand,
   type Rect,
 } from "./occlusion";
-import type { DiagnosticLevel, OcclusionBandConfig, OcclusionPayload, OcclusionRect } from "./api/types";
+import type {
+  DiagnosticLevel,
+  EditorControls,
+  OcclusionBandConfig,
+  OcclusionPayload,
+  OcclusionRect,
+} from "./api/types";
 
 /**
  * 有效渲染 DPR。0=跟 devicePixelRatio；正数=目标（可高于设备上报，WKWebView 恒报 1 时仍能超采样）；
@@ -153,6 +159,11 @@ export type Runtime = {
      * （实现各自复用本路径的 pauseImpl/resumeImpl 或等价通道）。
      */
     setOccluded?(on: boolean): void;
+    /**
+     * 编辑器控制面（E0：可控时钟 / 单帧出图 / 拾取 / 活层快照）。实现在
+     * scene-mount 渲染循环闭包内；场景装配完成前为空，经 api/editor 的 editorOf 透出。
+     */
+    editor?: EditorControls;
     /**
      * 遮挡降帧的档位推送（V5）。有库侧渲染循环的路径（scene / GL 媒体）逐帧
      * 读 rt.occlusion.band 自行收敛 fps，用不到本钩子；**web 壁纸没有库侧

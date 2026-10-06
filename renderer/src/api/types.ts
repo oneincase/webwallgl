@@ -696,6 +696,104 @@ export type SceneInstance = {
   on<K extends keyof SceneEvents>(ev: K, fn: SceneEvents[K]): () => void;
 };
 
+// ─── 编辑器包（webwallgl/editor）E0 能力面 ───────────────────────────────
+// docs/EDITOR-PLAN.md W1–W4 + W2a：只在编辑器包出口经 editorOf(instance) 取得，
+// 播放包的 SceneInstance 不加方法（播放宿主零感知）。
+
+/** 引擎活层的种类（由解析后的层字段归类，与 scene.json 对象一一对应） */
+export type EditorLayerKind =
+  | "image"
+  | "text"
+  | "particle"
+  | "sound"
+  | "light"
+  | "container"
+  | "group";
+
+/** 引擎活层的只读快照（W2a）。`id` 即 scene.json 对象 id，可与文档树对应 */
+export type EditorLayer = {
+  readonly id: number;
+  readonly name: string;
+  readonly kind: EditorLayerKind;
+  readonly parentId: number | null;
+  /** 有效可见性（含祖先与脚本写入） */
+  readonly visible: boolean;
+  /** 绘制顺序（scene.layers 下标，大的在上） */
+  readonly index: number;
+};
+
+export type EditorCaptureOptions = {
+  /** 先 seek 到该场景时刻再出图（秒）；缺省 = 当前画面 */
+  time?: number;
+  /** 输出像素尺寸；缺省 = 画布 backing store 尺寸。只给一边按画布比例补另一边 */
+  width?: number;
+  height?: number;
+  /** MIME，缺省 "image/png" */
+  type?: string;
+  /** 有损格式质量 0..1 */
+  quality?: number;
+};
+
+/**
+ * 图层可热改属性（W2-lite），单位与 scene.json 一致：origin/scale/angles 是
+ * **父级相对**（local）值，angles 为弧度，color 为 0..1 RGB。
+ */
+export type EditorLayerProps = {
+  origin: [number, number, number];
+  scale: [number, number, number];
+  angles: [number, number, number];
+  /** 自身可见性（不含祖先） */
+  visible: boolean;
+  alpha: number;
+  color: [number, number, number];
+};
+
+/** 图层在画布上的轮廓（CSS 像素，相对画布左上角） */
+export type EditorLayerOutline = {
+  anchor: [number, number];
+  /** OBB 四角（左上起顺时针）；零尺寸层 / 透视层为 null */
+  corners: Array<[number, number]> | null;
+};
+
+export type EditorHitTestOptions = {
+  /** 连 visible=false / alpha=0 的层也算（WE 的隐形点击区）；缺省只认看得见的层 */
+  includeHidden?: boolean;
+};
+
+/**
+ * 编辑器控制面（E0）。时钟语义：场景时间 = 可重设基准 + 墙钟增量 × 倍速。
+ * 关键帧/骨骼/音频模拟按绝对时刻求值，seek 精确；粒子、对象脚本、跟随类
+ * 动画是有状态的增量模拟，seek 后从当前状态继续推进（近似，不回放历史）。
+ */
+export type EditorControls = {
+  /** 当前场景时间（秒） */
+  readonly time: number;
+  readonly timeScale: number;
+  /** 跳到场景时刻 t（秒）。暂停中会立即渲染一帧，Promise 在该帧画完后落地 */
+  seek(t: number): Promise<void>;
+  /** 倍速（0 = 冻结时间但继续出帧；负值按 0 处理） */
+  setTimeScale(scale: number): void;
+  /** 暂停中逐帧推进 frames 帧（每帧 1/fps 秒，缺省 60fps）；播放中等价于 seek */
+  step(frames?: number, fps?: number): Promise<void>;
+  /** 单帧出图（W3） */
+  capture(opts?: EditorCaptureOptions): Promise<Blob>;
+  /** 画布 CSS 像素坐标（相对画布左上角）命中的图层，自上而下（W4） */
+  hitTestAt(x: number, y: number, opts?: EditorHitTestOptions): EditorLayer[];
+  /** 全部引擎活层，按绘制顺序（W2a） */
+  getLayers(): EditorLayer[];
+  /** 读图层当前可热改属性；id 不存在返回 null */
+  getLayerProps(id: number): EditorLayerProps | null;
+  /**
+   * 热改图层属性（W2-lite），当帧生效（拾取与轮廓立即同步）。暂停中会补画一帧，
+   * Promise 在该帧画完后落地。变换绑了脚本/动画的层，下一帧会被脚本覆盖。
+   */
+  setLayerProps(id: number, patch: Partial<EditorLayerProps>): Promise<void>;
+  /** 图层轮廓（选中框用，W5 过渡方案）；透视相机场景 / id 不存在返回 null */
+  getLayerOutline(id: number): EditorLayerOutline | null;
+  /** 画布 CSS 像素位移 → 该层 origin 的 local 位移（拖拽移动用）；透视相机场景返回 null */
+  screenDeltaToLocal(id: number, dx: number, dy: number): [number, number] | null;
+};
+
 // ─── 公共包（webwallgl/core）引擎底座类型 ────────────────────────────────
 // docs/EDITOR-PLAN.md §0.5：公共包只收「自包含、Node 可载、零装配依赖」的引擎
 // 底座面。类型跟着实现走：Pkg/Tex 与 vendor/we-scene/pkg/{container,texture}.js

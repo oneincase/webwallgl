@@ -32,7 +32,8 @@ function cleanSiteOutput(): Plugin {
   };
 }
 
-// 双入口：/ 测试台，/renderer/index.html 渲染器页（与主项目 WallpaperEM 同路径同 query 协议）
+// 三入口：/ 测试台，/renderer/index.html 渲染器页（与主项目 WallpaperEM 同路径同 query 协议），
+// /editor/ 编辑器页（docs/EDITOR-PLAN.md §3A）
 export default defineConfig({
   plugins: [wallpaperHost(), cleanSiteOutput()],
   clearScreen: false,
@@ -50,6 +51,7 @@ export default defineConfig({
       input: {
         bench: here("index.html"),
         renderer: here("renderer/index.html"),
+        editor: here("editor/index.html"),
       },
     },
   },

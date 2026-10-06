@@ -16,5 +16,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["vite/client", "node"]
   },
-  "include": ["renderer", "bench", "host", "vite.config.ts"]
+  "include": ["renderer", "bench", "editor", "host", "vite.config.ts"]
 }

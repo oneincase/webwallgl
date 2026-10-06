@@ -248,3 +248,41 @@ export function hitTestLayers(layers, wx, wy, projH, opts = {}) {
   const all = hitTestLayersAll(layers, wx, wy, projH, opts)
   return all.length ? all[0] : null
 }
+
+/**
+ * [we-scene patch] worldToLayerLocal 的**正变换**：图层锚点与 OBB 四角的世界坐标
+ * （像素，y 向下）。编辑器画选中框用；两边公式必须逐字互逆，否则框与命中区错开。
+ *
+ * 零尺寸层（组 / 粒子 / 声音）与 perspective 层只给锚点，corners 为 null
+ * （后者的四角在透视相机下不落在 z=0 平面上，正交换算画不准）。
+ *
+ * @returns {{anchor:[number,number], corners:Array<[number,number]>|null}}
+ */
+export function layerQuadWorld(layer, projH, alignTable, parallaxCtx) {
+  const origin = layer.origin || [0, 0, 0]
+  let cx = origin[0]
+  let cy = projH - origin[1]
+  if (layer.parallaxDepth && parallaxCtx) {
+    const off = layerParallaxOffset(layer, parallaxCtx)
+    cx += off[0]
+    cy += off[1]
+  }
+  const size = layer.size || [0, 0]
+  const scale = layer.scale || [1, 1, 1]
+  const w = size[0] * scale[0]
+  const h = size[1] * scale[1]
+  if (!(w > 0) || !(h > 0) || layer.perspective) return { anchor: [cx, cy], corners: null }
+  const ang = layer.angles ? layer.angles[2] : 0
+  const c = Math.cos(-ang)
+  const s = Math.sin(-ang)
+  const a = (alignTable && alignTable[layer.alignment]) || [0.5, 0.5]
+  const offX = (0.5 - a[0]) * w
+  const offY = (0.5 - a[1]) * h
+  const corners = []
+  for (const [lx, ly] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]) {
+    const qx = lx * w + offX
+    const qy = ly * h + offY
+    corners.push([cx + c * qx - s * qy, cy + s * qx + c * qy])
+  }
+  return { anchor: [cx, cy], corners }
+}

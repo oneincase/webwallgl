@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WebWallGL 编辑器</title>
+    <meta name="theme-color" content="#0d111a" />
+    <link rel="icon" type="image/png" href="/icons/pwa-192.png" />
+    <link rel="stylesheet" href="/bench/bench.css" />
+    <link rel="stylesheet" href="/editor/editor.css" />
+  </head>
+  <body class="ed">
+    <header id="titlebar">
+      <div class="traffic" aria-hidden="true">
+        <span class="dot close"></span>
+        <span class="dot min"></span>
+        <span class="dot max"></span>
+      </div>
+      <div class="titlebar-title">
+        <span data-et="app.title">WebWallGL 编辑器</span><span id="ed-doc-title"></span>
+      </div>
+      <label class="lang-box" data-i18n-title="lang.title">
+        <select id="lang" aria-label="Language">
+          <option value="zh">简体中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </header>
+
+    <div id="ed-workbench">
+      <nav id="activitybar" aria-label="活动栏">
+        <a class="act" id="act-bench" href="../" data-et-title="act.bench" title="返回测试台">
+          <svg viewBox="0 0 16 16" width="22" height="22" aria-hidden="true">
+            <path fill="currentColor" d="M7.4 2.2 1.6 8l5.8 5.8.8-.8L3.7 8.6H14.5V7.4H3.7l4.5-4.4z" />
+          </svg>
+        </a>
+        <button type="button" class="act active" id="act-layers" data-et-title="act.layers" title="图层" aria-current="page">
+          <svg viewBox="0 0 16 16" width="22" height="22" aria-hidden="true">
+            <path fill="currentColor" d="M8 1 .8 4.8 8 8.6l7.2-3.8L8 1zm0 1.4 4.6 2.4L8 7.2 3.4 4.8 8 2.4zM2 7.4.8 8 8 11.8 15.2 8 14 7.4l-6 3.1-6-3.1zm0 3.2-1.2.6L8 15l7.2-3.8-1.2-.6-6 3.1-6-3.1z" />
+          </svg>
+        </button>
+        <div class="act-bottom">
+          <button type="button" class="act theme-btn" id="theme-toggle" title="主题：跟随系统">
+            <svg class="ic ic-auto" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true">
+              <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.2" />
+              <path fill="currentColor" d="M8 3.2a4.8 4.8 0 0 0 0 9.6V3.2z" />
+            </svg>
+            <svg class="ic ic-dark" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" hidden>
+              <path fill="currentColor" d="M9.8 1.2a6.8 6.8 0 1 0 4.9 11.5A7.6 7.6 0 0 1 9.8 1.2z" />
+            </svg>
+            <svg class="ic ic-light" viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" hidden>
+              <circle cx="8" cy="8" r="3" fill="currentColor" />
+              <path stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3 3l1.1 1.1M11.9 11.9 13 13M3 13l1.1-1.1M11.9 4.1 13 3" />
+            </svg>
+          </button>
+        </div>
+      </nav>
+
+      <aside id="ed-left" class="ed-side">
+        <section id="ed-library" class="ed-pane">
+          <div class="ed-pane-head">
+            <span data-et="sec.library">壁纸库</span>
+            <span id="ed-lib-count" class="ed-count"></span>
+          </div>
+          <div class="ed-pane-tools">
+            <input id="ed-filter" type="search" data-et-ph="ph.filter" placeholder="过滤标题 / itemId" />
+          </div>
+          <ul id="ed-lib-list" class="ed-list"></ul>
+        </section>
+        <section id="ed-layers" class="ed-pane ed-grow">
+          <div class="ed-pane-head">
+            <span data-et="sec.layers">图层</span>
+            <span id="ed-layer-count" class="ed-count"></span>
+            <span class="ed-layer-tools">
+              <button type="button" class="ed-icon" id="ly-up" disabled data-et-title="ly.up" title="前移">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 2.6 3 7.6l.85.85L7.4 4.9V13.4h1.2V4.9l3.55 3.55.85-.85z" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="ly-down" disabled data-et-title="ly.down" title="后移">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 13.4 3 8.4l.85-.85L7.4 11.1V2.6h1.2v8.5l3.55-3.55.85.85z" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="ly-dup" disabled data-et-title="ly.dup" title="复制">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M5 1.5h8.5V10H12V3H5zM2.5 4.5h8v9h-8zm1.2 1.2v6.6h5.6V5.7z" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="ly-del" disabled data-et-title="ly.del" title="删除">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M6 1.5h4v1.2h3.5v1.2h-11V2.7H6zM3.6 5h1.2l.6 8.3h5.2l.6-8.3h1.2l-.7 9.5H4.3zM6.4 6.2h1.2v6H6.4zm2 0h1.2v6H8.4z" /></svg>
+              </button>
+            </span>
+          </div>
+          <div id="ed-tree" class="ed-tree" role="tree"></div>
+        </section>
+      </aside>
+
+      <main id="ed-center">
+        <div id="ed-toolbar" role="toolbar">
+          <button type="button" class="ed-btn" id="tb-new" disabled data-et="tb.new" data-et-title="tb.newTitle">新建</button>
+          <button type="button" class="ed-btn" id="tb-open-pkg" data-et="tb.openPkg" data-et-title="tb.openPkgTitle">打开 .pkg</button>
+          <button type="button" class="ed-btn" id="tb-open-dir" data-et="tb.openDir" data-et-title="tb.openDirTitle">打开文件夹</button>
+          <button type="button" class="ed-btn" id="tb-save" disabled data-et="tb.save" data-et-title="tb.saveTitle">保存</button>
+          <span class="ed-sep"></span>
+          <button type="button" class="ed-icon" id="tb-undo" disabled data-et-title="tb.undo" title="撤销（⌘Z）">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M5.3 4H11a4 4 0 0 1 0 8H6v-1.2h5a2.8 2.8 0 0 0 0-5.6H5.3l2 2-.8.8L3 4.6 6.5 1.2l.8.8z" /></svg>
+          </button>
+          <button type="button" class="ed-icon" id="tb-redo" disabled data-et-title="tb.redo" title="重做">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M10.7 4H5a4 4 0 0 0 0 8h5v-1.2H5a2.8 2.8 0 0 1 0-5.6h5.7l-2 2 .8.8L13 4.6 9.5 1.2l-.8.8z" /></svg>
+          </button>
+          <span class="ed-sep"></span>
+          <label class="ed-field"><span data-et="tb.aspect">宽高比</span>
+            <select id="tb-aspect">
+              <option value="16:9">16:9</option>
+              <option value="21:9">21:9</option>
+              <option value="16:10">16:10</option>
+              <option value="4:3">4:3</option>
+              <option value="9:16">9:16</option>
+              <option value="fill" data-et="aspect.fill">填满视口</option>
+            </select>
+          </label>
+          <label class="ed-field"><span data-et="tb.fit">适配</span>
+            <select id="tb-fit">
+              <option value="cover" data-et="fit.cover">裁切填满</option>
+              <option value="contain" data-et="fit.contain">完整显示</option>
+              <option value="stretch" data-et="fit.stretch">拉伸</option>
+            </select>
+          </label>
+          <label class="ed-field"><span data-et="tb.dpr">渲染 DPR</span>
+            <select id="tb-dpr">
+              <option value="0" data-et="dpr.auto">自动</option>
+              <option value="1">1</option>
+              <option value="1.5">1.5</option>
+              <option value="2">2</option>
+            </select>
+          </label>
+          <span class="ed-spacer"></span>
+          <button type="button" class="ed-icon" id="tb-play" disabled data-et-title="tb.pause" title="暂停">
+            <svg class="ic-pause" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M4 2.5h2.6v11H4zM9.4 2.5H12v11H9.4z" /></svg>
+            <svg class="ic-play" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" hidden><path fill="currentColor" d="M4 2.2v11.6L13.4 8z" /></svg>
+          </button>
+          <button type="button" class="ed-btn" id="tb-export" disabled data-et="tb.export" data-et-title="tb.exportTitle">导出 PNG</button>
+          <button type="button" class="ed-icon" id="tb-reload" disabled data-et-title="tb.reload" title="重新加载">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M13.4 3.3V7H9.7l1.5-1.5A4.2 4.2 0 1 0 12.2 9h1.2a5.4 5.4 0 1 1-1.4-4.5z" /></svg>
+          </button>
+        </div>
+
+        <div id="ed-viewport">
+          <div id="ed-stage"></div>
+          <div id="ed-empty">
+            <div class="ed-empty-title" data-et="empty.title">把壁纸拖到这里</div>
+            <div class="ed-empty-hint" data-et="empty.hint"></div>
+          </div>
+          <div id="ed-drop" hidden></div>
+        </div>
+
+        <div id="ed-timeline" role="toolbar">
+          <button type="button" class="ed-icon" id="tl-start" disabled data-et-title="tl.start" title="回到开头">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M3 2.5h1.4v11H3zM13 2.4v11.2L5.6 8z" /></svg>
+          </button>
+          <button type="button" class="ed-icon" id="tl-prev" disabled data-et-title="tl.prev" title="上一帧">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M2.6 2.5H4v11H2.6zM12.6 2.4v11.2L5.2 8z" /></svg>
+          </button>
+          <button type="button" class="ed-icon" id="tl-next" disabled data-et-title="tl.next" title="下一帧">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M4.4 2.4v11.2L11.8 8zM12 2.5h1.4v11H12z" /></svg>
+          </button>
+          <span id="tl-time">0.00s</span>
+          <input id="tl-range" type="range" min="0" max="30" step="0.01" value="0" disabled />
+          <span id="tl-max">30s</span>
+          <label class="ed-field"><span data-et="tl.speed">倍速</span>
+            <select id="tl-speed" disabled>
+              <option value="0">0×</option>
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+            </select>
+          </label>
+        </div>
+
+        <section id="ed-console">
+          <div class="ed-pane-head">
+            <span data-et="sec.console">控制台</span>
+            <span id="ed-con-count" class="ed-count"></span>
+            <button type="button" class="ed-link" id="ed-con-clear" data-et="con.clear">清空</button>
+          </div>
+          <pre id="ed-con-body"></pre>
+        </section>
+      </main>
+
+      <aside id="ed-right" class="ed-side">
+        <div class="ed-pane-head"><span data-et="sec.inspector">检视器</span></div>
+        <div id="ed-inspector"></div>
+      </aside>
+    </div>
+
+    <footer id="statusbar">
+      <span id="st-doc"></span>
+      <span class="status-sep"></span>
+      <span id="st-form"></span>
+      <span class="status-sep"></span>
+      <span id="st-layers"></span>
+      <span class="status-sep"></span>
+      <span id="st-res"></span>
+      <span class="ed-spacer"></span>
+      <span id="st-fps" class="idle">— FPS</span>
+    </footer>
+
+    <input type="file" id="in-pkg" accept=".pkg,.json" multiple hidden />
+    <input type="file" id="in-dir" webkitdirectory multiple hidden />
+
+    <script type="module" src="/editor/main.ts"></script>
+  </body>
+</html>

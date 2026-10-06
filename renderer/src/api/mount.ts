@@ -16,6 +16,7 @@ import {
 } from "../shell";
 import { mountWallpaper } from "../dispatch";
 import { dropPkgCache } from "../scene-mount";
+import { linkRuntime } from "../runtime-link";
 import type { WallpaperConfig, WallpaperFit } from "../types";
 import { normalizeQuality, normalizeVideoTexScale } from "../quality";
 import { normalizeOcclusionConfig, occlusionFpsCap } from "../occlusion";
@@ -845,6 +846,7 @@ export function createScene(
 
   (instance as unknown as { __applyOptions?: (o: MountOptions) => Promise<void> }).__applyOptions =
     applyOptions;
+  linkRuntime(instance, rt);
 
   return instance;
 }
