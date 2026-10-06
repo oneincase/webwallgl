@@ -1162,6 +1162,75 @@ section("S3. 效果闭环（新建 → 图片层 + 2 个内置效果 → 保存 
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// U. 脚本编辑（W8）：checkSceneScript / scriptErrorLine / editor/scripts.ts
+// ───────────────────────────────────────────────────────────────────────────
+section("U. 脚本预检 checkSceneScript（库出口）");
+const wtextMod = await imp("renderer/vendor/we-scene/render/text.js");
+const { checkSceneScript } = await imp("renderer/src/editor/scripts.ts");
+const scMod = await loadEditorModule("scripts");
+{
+  const tpl = "'use strict';\n\nexport function update(value) {\n\treturn value;\n}\n";
+  let r = checkSceneScript(tpl);
+  check(r.ok && json(r.entries) === json(["update"]) && !r.noEntry && r.line === null, "合法脚本：ok，入口 update");
+  r = checkSceneScript("import * as WEMath from 'WEMath';\nexport let scriptProperties = createScriptProperties().addSlider({ name: 's', value: 1 }).finish();\nexport function update(v) { return WEMath.mix(v, 0, scriptProperties.s); }");
+  check(r.ok, `官方模板写法（import WEMath / export let scriptProperties 撞形参名）同沙箱 transform 能编过${r.ok ? "" : `：${r.message}`}`);
+  r = checkSceneScript("export function update(value) {\n\tlet a = 1;\n\n\treturn a +;\n}\n");
+  check(!r.ok && r.line === 4 && /Unexpected token/.test(r.message), `语法错误：定位到第 4 行（实得 ${r.line}：${r.message}）`);
+  r = checkSceneScript("let x = 1;\nlet y = 2;\nlet x = 3;\nexport function update(v) { return v; }");
+  check(!r.ok && r.line === 3 && /already been declared/.test(r.message), `重复声明：定位到第 3 行（实得 ${r.line}）`);
+  r = checkSceneScript("export function update(value) {\n\treturn value;\n");
+  check(!r.ok && r.line !== null && r.line >= 1 && r.line <= 2, `缺右括号：报错并给出行（实得 ${r.line}：${r.message}）`);
+  r = checkSceneScript("export function update(v) {\n\twith (v) { return x; }\n}");
+  check(!r.ok && r.line === 2, "严格模式规则与沙箱一致（with 语句报错，第 2 行）");
+  globalThis.__wwglRan = 0;
+  r = checkSceneScript("globalThis.__wwglRan = 1;\nthrow new Error('top');\nexport function update(v) { return v; }");
+  check(r.ok && globalThis.__wwglRan === 0, "只编译不执行：顶层抛错 / 副作用都不发生");
+  delete globalThis.__wwglRan;
+  check(json(checkSceneScript("export function cursorClick(e) { thisLayer.visible = false; }").entries) === json(["cursorClick"]), "纯指针回调：入口 cursorClick");
+  check(checkSceneScript("let a = 1;").noEntry && !checkSceneScript("let t = engine.runtime;").noEntry, "无入口 → noEntry；读 engine.runtime 的引擎层脚本不算无入口（同闸门）");
+  check(json(checkSceneScript("export const init = (v) => v;\nexport async function mediaPlaybackChanged(e) {}").entries) === json(["init", "mediaPlaybackChanged"]), "箭头函数常量 / async 函数也认作入口");
+  check(checkSceneScript(42).ok === false, "非字符串拒绝");
+
+  const errs = [];
+  const sb = wtextMod.evalObjectScript("let k = 2;\nexport function update(value) {\n\tconst o = null;\n\treturn o.x + k;\n}\n", null, { onError: (e, phase) => errs.push({ line: wtextMod.scriptErrorLine(e), phase }) });
+  sb.callUpdate(1);
+  check(errs.length === 1 && errs[0].line === 4 && errs[0].phase === "update", `运行期错误行号映射回源码第 4 行（实得 ${json(errs)}）`);
+  check(wtextMod.scriptErrorLine(new Error("x")) === null && wtextMod.scriptErrorLine(null) === null, "非沙箱错误 → null");
+}
+
+section("U2. 脚本挂点 editor/scripts.ts");
+{
+  const s = scMod;
+  const obj = {
+    id: 1,
+    origin: { script: "export function update(v){return v;}", value: "1 2 3" },
+    alpha: { user: "op", value: 0.5 },
+    visible: true,
+    effects: [{ file: "effects/x/effect.json", visible: { script: "export function update(v){return v;}", scriptproperties: { a: 1 }, value: true } }],
+  };
+  const slots = s.scriptSlots(obj);
+  check(json(slots.map((x) => x.target)) === json(["origin", "effects[0].visible"]) && slots[0].value === "1 2 3" && slots[1].hasProps, "scriptSlots：对象字段与效果开关，带快照值 / 是否有 scriptproperties");
+  check(s.getScript(obj, "origin")?.includes("update") && s.getScript(obj, "alpha") === null && s.getScript(obj, "nope") === null, "getScript：有脚本才返回源码，未知挂点 null");
+  check(s.setScript(obj, "visible", "export function update(v){return !v;}") && json(obj.visible) === json({ script: "export function update(v){return !v;}", value: true }), "setScript：裸值就地包装，原值成为快照");
+  check(s.setScript(obj, "alpha", "export function update(v){return v;}") && obj.alpha.user === "op" && obj.alpha.value === 0.5 && typeof obj.alpha.script === "string", "setScript：与用户属性绑定共存，绑定与快照保留");
+  check(!s.setScript(obj, "origin", obj.origin.script) && !s.setScript(obj, "origin", "  ") && !s.setScript(obj, "bogus", "x"), "相同源码 / 空白源码 / 非法挂点：不算修改");
+  check(s.setScript(obj, "effects[0].visible", "export function update(v){return false;}") && obj.effects[0].visible.scriptproperties.a === 1, "效果开关：改源码保留 scriptproperties");
+  check(s.removeScript(obj, "origin") && obj.origin === "1 2 3", "removeScript：只剩快照时解包回裸值");
+  check(s.removeScript(obj, "alpha") && json(obj.alpha) === json({ user: "op", value: 0.5 }), "removeScript：有用户属性绑定时保留包装");
+  check(s.removeScript(obj, "effects[0].visible") && obj.effects[0].visible === true && !s.removeScript(obj, "origin"), "效果开关去脚本解包；没有脚本时返回 false");
+  const bare = { id: 2 };
+  check(s.setScript(bare, "scale", "export function update(v){return v;}") && bare.scale.value === "1.00000 1.00000 1.00000", "字段缺省时快照取该字段的 WE 缺省值");
+  check(s.removeScript(bare, "scale") && bare.scale === "1.00000 1.00000 1.00000", "去脚本后回到缺省快照");
+  check(s.addableTargets("text")[0] === "text" && s.addableTargets("image").includes("brightness") && json(s.addableTargets("sound")) === json(["volume"]), "可加脚本的挂点按图层种类给出");
+  const bad = [];
+  for (const t of ["text", ...s.OBJECT_SCRIPT_FIELDS]) {
+    const r = checkSceneScript(s.scriptTemplate(t));
+    if (!r.ok || json(r.entries) !== json(["update"])) bad.push(t);
+  }
+  check(bad.length === 0, `每个挂点的新脚本模板都能编过、入口为 update（失败 ${json(bad)}）`);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1181,9 +1250,17 @@ section("I. 接线");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
   check(/const referencedGroups = [^\n]*referencedModels\(d\)[^\n]*referencedEffects\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件（写进来的效果随引用进出保存清单）");
-  check(/from "\.\/effects"/.test(main) && /function fxEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
+  check(/from "\.\/effects"/.test(main) && /function objEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
   check(/overlay\.put\(f\.name, f\.data, effectFileOf\(fxId\)\)/.test(main), "添加效果时把四件写进叠加层，分组 = effect.json 路径");
   check(/inp\.addEventListener\("change", \(\) => commit\(/.test(main), "参数在 change 时提交（拖动中只更新读数，不反复重挂）");
+  check(/checkSceneScript,\s*\n\s*editorOf,/.test(main) && /from "\.\/scripts"/.test(main), "脚本面板：预检取库出口 checkSceneScript，挂点读写取 editor/scripts.ts");
+  check(/apply\.disabled = !editable \|\| !ok \|\| ta\.value === s\.script/.test(main), "语法不过 / 未改动时「应用」不可点");
+  check(/objEdit\([^\n]*setScript\(o, s\.target, ta\.value\)\)/.test(main), "应用脚本走结构编辑（可撤销、整场景重挂，新脚本当帧生效）");
+  check(/editor\?\.getScriptIssues\(\)/.test(main) && /refreshScriptIssues\(\);\s*\}, 500\)/.test(main), "运行期错误从控制面 getScriptIssues 取，定时刷新到对应挂点");
+  check(/scriptDrafts\.clear\(\)/.test(main) && /scriptDrafts\.get\(draftKey\) \?\? s\.script/.test(main), "未应用的脚本改动在检视器重绘时保留，换文档清空");
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check((sm.match(/noteScriptIssue\((layer|null), /g) ?? []).length === 4, "引擎登记四类挂点的脚本错误：对象字段 / 文字 / 效果开关 / general");
+  check(/getScriptIssues\(\) \{\s*return \[\.\.\.scriptIssues\.values\(\)\]/.test(sm) && /const scriptIssues = new Map/.test(sm), "控制面 getScriptIssues 读本次装配的登记表（每次装配重建）");
   const i18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const missingFx = [];
   for (const e of fxMod.EFFECTS) {
@@ -1276,6 +1353,26 @@ section("J. 变异红测");
   const fm2 = await loadEditorModule("effects", { [fxPath]: mutFx2 });
   const tintNotes = uniformNotes(fm2.effectById("tint").frag);
   check(tintNotes.get("g_FxAmount")?.note.material !== "amount", "material 名与参数名对不上时「scene.json 常量落到 uniform」判据变红");
+
+  const txtPath = path.join(ROOT, "renderer/vendor/we-scene/render/text.js");
+  const txtSrc = fs.readFileSync(txtPath, "utf8");
+  const mutTxt = txtSrc.replace("if (same(mid)) hi = mid", "if (!same(mid)) hi = mid");
+  check(mutTxt !== txtSrc, "注入点存在（语法错误行的二分方向）");
+  const mutFile = path.join(path.dirname(txtPath), `.verify-mut-text-${process.pid}.js`);
+  fs.writeFileSync(mutFile, mutTxt);
+  cleanups.push(() => fs.rmSync(mutFile, { force: true }));
+  const tm = await import(pathToFileURL(mutFile).href);
+  check(tm.checkSceneScript("export function update(value) {\n\tlet a = 1;\n\n\treturn a +;\n}\n").line !== 4, "二分方向反了时「定位到第 4 行」判据变红");
+  fs.rmSync(mutFile, { force: true });
+
+  const scPath = path.join(ROOT, "editor/scripts.ts");
+  const scSrc = fs.readFileSync(scPath, "utf8");
+  const mutSc = scSrc.replace("at.host[at.key] = rest.length ? cur : cur.value;", "at.host[at.key] = cur.value;");
+  check(mutSc !== scSrc, "注入点存在（去脚本时保留用户属性绑定）");
+  const smut = await loadEditorModule("scripts", { [scPath]: mutSc });
+  const so = { alpha: { user: "op", script: "x", value: 0.5 } };
+  smut.removeScript(so, "alpha");
+  check(json(so.alpha) !== json({ user: "op", value: 0.5 }), "去脚本时一并丢掉绑定，「绑定保留」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

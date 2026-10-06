@@ -885,4 +885,102 @@ async function runCreateAndDraft(ctx) {
   check(close(bOutT, [0, 0, 0], 8), "测试台：背景不受效果影响");
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/effects-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/effects-in-bench.jpg`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("U. 脚本面板端到端（预检 → 应用 → 运行期错误回显 → 撤销 → 存库 → 测试台）");
+  const scSel = (target) => `.ed-script[data-target="${target}"]`;
+  const scType = async (target, src) => {
+    await ev(`(() => { const ta = document.querySelector('${scSel(target)} .ed-script-src'); ta.value = ${JSON.stringify(src)}; ta.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+    await new Promise((r) => setTimeout(r, 300));
+  };
+  const scStatus = (target) => ev(`(() => { const s = document.querySelector('${scSel(target)} .ed-script-status'); return { cls: s.className, text: s.textContent }; })()`);
+  const scApply = async (target) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => { document.querySelector('${scSel(target)} .ed-script-apply').click(); return true; })()`);
+    await h.waitRemount(r0);
+  };
+  const BGU = [0x20, 0x20, 0x20];
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  await newBlank("#202020");
+  await addImage(stripePath);
+  const crU = await h.canvasRect();
+  const uTop = worldToPage(crU, [1110, 590]);
+  check(await ev(`!!document.querySelector('.ed-scripts') && document.querySelectorAll('.ed-script').length === 0 && !document.querySelector('#script-add').disabled`), "检视器有「脚本」分组，图片层初始无脚本、可添加");
+  check((await ev(`[...document.querySelectorAll('#script-add option')].map((o) => o.value).filter(Boolean)`)).join() === "origin,scale,angles,visible,alpha,color,brightness", "图片层可加脚本的字段列表");
+
+  await fxAct(`const s = document.querySelector('#script-add'); s.value = 'alpha'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  check(await ev(`!!document.querySelector('${scSel("alpha")}') && /export function update\\(value\\)/.test(document.querySelector('${scSel("alpha")} .ed-script-src').value)`), "添加 alpha 脚本：出现编辑框，内容为 update(value) 模板");
+  let st = await scStatus("alpha");
+  check(/ok/.test(st.cls) && /update/.test(st.text) && (await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), `模板预检通过、未改动时「应用」不可点（${st.text}）`);
+  check(isRed(await pixelAt(uTop)), "模板原样返回 value：画面不变");
+
+  await scType("alpha", "export function update(value) {\n\treturn value +;\n}\n");
+  st = await scStatus("alpha");
+  check(/err/.test(st.cls) && /第 2 行|Line 2/.test(st.text) && (await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), `语法错误：实时标红并定位第 2 行，「应用」不可点（${st.text}）`);
+  await scType("alpha", "let x = 1;\n");
+  check(/warn/.test((await scStatus("alpha")).cls), "没有入口：黄色提醒引擎会忽略");
+
+  await scType("alpha", "export function update(value) {\n\treturn 0;\n}\n");
+  await scApply("alpha");
+  check(close(await pixelAt(uTop), BGU, 10), "应用 `return 0`：图层隐去，露出背景（新脚本当帧生效）");
+  check((await h.dirtyTitle()) && (await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), "应用后带脏标记，编辑框与文档一致（「应用」回到不可点）");
+  await undoRedo(false);
+  check(isRed(await pixelAt(uTop)) && /return value;/.test(await ev(`document.querySelector('${scSel("alpha")} .ed-script-src').value`)), "撤销：画面与脚本源码都回到模板");
+  await undoRedo(true);
+  check(close(await pixelAt(uTop), BGU, 10), "重做：脚本再次生效");
+
+  await scType("alpha", "export function update(value) {\n\tconst o = null;\n\treturn o.x;\n}\n");
+  await scApply("alpha");
+  await waitFor(`!document.querySelector('${scSel("alpha")} .ed-script-issues').hidden`, 10000);
+  const issueText = await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').textContent`);
+  check(/\[update\]/.test(issueText) && /第 3 行|line 3/.test(issueText) && /×\d+/.test(issueText), `运行期错误回显在该挂点下：阶段 / 源码行 / 次数（${issueText.split("\n")[0]}）`);
+  check(isRed(await pixelAt(uTop)), "脚本出错时字段保持快照值（图层照常显示）");
+  check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("alpha' 失败"), "诊断流（控制台）同时有文案");
+
+  // 未应用的改动在切换选中后保留
+  rc = await h.readyCount();
+  await ev(`(async () => {
+    const c = new OffscreenCanvas(100, 100); const g = c.getContext('2d'); g.fillStyle = 'rgb(30,220,30)'; g.fillRect(0, 0, 100, 100);
+    const file = new File([await c.convertToBlob({ type: 'image/png' })], 'dot.png', { type: 'image/png' });
+    const dt = new DataTransfer(); dt.items.add(file);
+    window.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await h.waitRemount(rc);
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('${scSel("alpha")}')`, 10000);
+  await scType("alpha", "export function update(value) {\n\treturn 0.5;\n}\n");
+  await click(await h.rowCenter("dot"));
+  await waitFor(`!document.querySelector('${scSel("alpha")}')`, 10000);
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('${scSel("alpha")}')`, 10000);
+  check(/return 0\.5;/.test(await ev(`document.querySelector('${scSel("alpha")} .ed-script-src').value`)) && !(await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), "未应用的改动：切换选中再回来仍在，「应用」可点");
+  await scApply("alpha");
+  const half = await pixelAt(uTop);
+  const halfWant = RED.map((c, i) => Math.round(c * 0.5 + BGU[i] * 0.5));
+  check(close(half, halfWant, 14), `return 0.5：半透明叠在背景上（期望 ≈${halfWant}，实得 ${half}）`);
+  check(await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').hidden`), "重挂后旧错误清空（登记表随装配重建）");
+
+  const libBeforeU = new Set(fs.readdirSync(lib));
+  const scU = await h.savedCount();
+  await clickSel("#tb-save");
+  await clickSel("#save-lib");
+  await h.waitSaved(scU);
+  const savedU = fs.readdirSync(lib).filter((n) => !libBeforeU.has(n));
+  const sceneU = JSON.parse(fs.readFileSync(path.join(lib, savedU[0], "scene.json"), "utf8"));
+  const alphaU = sceneU.objects.find((o) => o.name === "stripe")?.alpha;
+  check(alphaU && /return 0\.5;/.test(alphaU.script) && alphaU.value === 1, `盘上 scene.json：alpha 包装为 {script, value: 1}（${JSON.stringify(alphaU)?.slice(0, 60)}）`);
+  const errsU = (await h.errorLines()).filter((l) => !/alpha' 失败/.test(l));
+  check(errsU.length === 0, `脚本流程除故意制造的错误外无错误${errsU.length ? `：${errsU.slice(0, 2).join(" / ")}` : ""}`);
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedU[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpU = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const bHalf = await pixelAt(worldToPage({ x: 0, y: 0, w: vpU.w, h: vpU.h }, [1110, 590]));
+  check(close(bHalf, half, 12), `测试台：脚本照样运行，出帧与编辑器一致（测试台 ${bHalf} / 编辑器 ${half}）`);
 }

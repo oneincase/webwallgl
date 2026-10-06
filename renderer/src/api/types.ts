@@ -792,6 +792,36 @@ export type EditorControls = {
   getLayerOutline(id: number): EditorLayerOutline | null;
   /** 画布 CSS 像素位移 → 该层 origin 的 local 位移（拖拽移动用）；透视相机场景返回 null */
   screenDeltaToLocal(id: number, dx: number, dy: number): [number, number] | null;
+  /** 本次装配以来的脚本错误，按「图层 + 挂点 + 阶段 + 文案」去重计数（W8） */
+  getScriptIssues(): EditorScriptIssue[];
+};
+
+/**
+ * 一条脚本错误。target 为挂点：对象字段名（`origin` / `visible` …）、文字层 `text`、
+ * 效果开关 `effects[i].visible`、场景级 `general.<字段>`（此时 layerId 为 null）。
+ */
+export type EditorScriptIssue = {
+  layerId: number | null;
+  layerName: string;
+  target: string;
+  /** parse（编译 / 顶层）、init、update、cursor、applyUserProperties、anim、resize、timer */
+  phase: string;
+  message: string;
+  /** 脚本源码行号（取不到为 null） */
+  line: number | null;
+  count: number;
+};
+
+/** 脚本语法预检结果（只编译不执行，与引擎沙箱同一 transform） */
+export type SceneScriptCheck = {
+  ok: boolean;
+  message: string;
+  /** 语法错误所在的源码行（ok 时为 null） */
+  line: number | null;
+  /** 宿主能派发的入口（update / init / cursor* / 媒体回调 …） */
+  entries: string[];
+  /** 没有任何入口且不读 engine 时钟：引擎会丢弃这段脚本 */
+  noEntry: boolean;
 };
 
 // ─── 公共包（webwallgl/core）引擎底座类型 ────────────────────────────────

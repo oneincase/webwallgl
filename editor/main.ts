@@ -10,6 +10,7 @@
  */
 
 import {
+  checkSceneScript,
   editorOf,
   mount,
   type EditorControls,
@@ -51,6 +52,7 @@ import {
   type EffectValue,
   type EffectView,
 } from "./effects";
+import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
   duplicateLayer,
   findNode,
@@ -373,6 +375,7 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   selectedId = null;
   collapsed.clear();
   locked.clear();
+  scriptDrafts.clear();
   docDriven = !!opts.docDriven;
   origin = opts.origin ?? null;
   lastSave = null;
@@ -1034,6 +1037,7 @@ setInterval(() => {
   }
   stFpsEl.textContent = et("st.fps", { n: Math.round(s.fps) });
   stFpsEl.classList.remove("idle");
+  refreshScriptIssues();
 }, 500);
 
 // ---------- 壁纸库 ----------
@@ -1725,8 +1729,8 @@ const canHaveEffects = (n: LayerNode) => n.kind === "image" || n.kind === "text"
 
 const fxLabel = (v: Pick<EffectView, "def" | "name">) => (v.def ? et(`fx.${v.def.id}`) : v.name);
 
-/** 对选中层的效果做一次可撤销修改；mutate 返回 false = 没改成 */
-function fxEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean) {
+/** 对一个图层对象做一次可撤销的结构编辑（效果 / 脚本）；mutate 返回 false = 没改成 */
+function objEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean) {
   structEdit(label, (d) => {
     const n = findNode(d.roots, id);
     return n && mutate(n.obj) ? n.id : undefined;
@@ -1737,7 +1741,7 @@ function addEffectTo(n: LayerNode, fxId: string) {
   const d = effectById(fxId);
   if (!d || !overlay) return;
   for (const f of effectFiles(d)) overlay.put(f.name, f.data, effectFileOf(fxId));
-  fxEdit(et("log.fxAdded", { name: et(`fx.${fxId}`), layer: nodeName(n.id) }), n.id, (o) => addEffect(o, fxId) !== null);
+  objEdit(et("log.fxAdded", { name: et(`fx.${fxId}`), layer: nodeName(n.id) }), n.id, (o) => addEffect(o, fxId) !== null);
 }
 
 function effectsGroup(node: LayerNode): HTMLElement {
@@ -1776,11 +1780,11 @@ function effectsGroup(node: LayerNode): HTMLElement {
     head.append(
       name,
       iconBtn("ed-fx-eye", v.visible ? "◉" : "○", et("fx.eye"), () =>
-        fxEdit(et("log.fxToggled", { name: label }), node.id, (o) => setEffectVisible(o, v.index, !v.visible)),
+        objEdit(et("log.fxToggled", { name: label }), node.id, (o) => setEffectVisible(o, v.index, !v.visible)),
       ),
-      iconBtn("ed-fx-up", "↑", et("fx.up"), () => fxEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, -1)), v.index === 0),
-      iconBtn("ed-fx-down", "↓", et("fx.down"), () => fxEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, 1)), v.index === views.length - 1),
-      iconBtn("ed-fx-del", "✕", et("fx.del"), () => fxEdit(et("log.fxRemoved", { name: label }), node.id, (o) => removeEffect(o, v.index))),
+      iconBtn("ed-fx-up", "↑", et("fx.up"), () => objEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, -1)), v.index === 0),
+      iconBtn("ed-fx-down", "↓", et("fx.down"), () => objEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, 1)), v.index === views.length - 1),
+      iconBtn("ed-fx-del", "✕", et("fx.del"), () => objEdit(et("log.fxRemoved", { name: label }), node.id, (o) => removeEffect(o, v.index))),
     );
     item.appendChild(head);
     if (!v.def) {
@@ -1793,7 +1797,7 @@ function effectsGroup(node: LayerNode): HTMLElement {
         l.textContent = et(`fxp.${p.key}`);
         const val = v.values[p.key];
         const commit = (next: EffectValue) =>
-          fxEdit(et("log.fxParam", { name: label, param: et(`fxp.${p.key}`) }), node.id, (o) => setEffectParam(o, v.index, p.key, next));
+          objEdit(et("log.fxParam", { name: label, param: et(`fxp.${p.key}`) }), node.id, (o) => setEffectParam(o, v.index, p.key, next));
         const box = document.createElement("div");
         box.className = "ed-fx-param";
         if (p.type === "color") {
@@ -1846,6 +1850,147 @@ function effectsGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 脚本（W8）：语法预检 → 应用（结构编辑重挂）→ 运行期错误按挂点回显 ----------
+
+/** 未应用的脚本改动（检视器重绘时不丢），键 = 图层 id | 挂点；换文档即清空 */
+const scriptDrafts = new Map<string, string>();
+
+function showScriptCheck(el: HTMLElement, src: string): boolean {
+  const r = checkSceneScript(src);
+  el.classList.remove("ok", "warn", "err");
+  if (!r.ok) {
+    el.classList.add("err");
+    el.textContent = et("sc.syntaxErr", { line: r.line ?? "?", msg: r.message });
+  } else if (r.noEntry) {
+    el.classList.add("warn");
+    el.textContent = et("sc.noEntry");
+  } else {
+    el.classList.add("ok");
+    el.textContent = et("sc.ok", { entries: r.entries.join(", ") });
+  }
+  return r.ok;
+}
+
+/** 运行期错误（引擎按「图层 + 挂点」登记），定时刷新到打开着的脚本面板 */
+function refreshScriptIssues() {
+  const boxes = inspectorEl.querySelectorAll<HTMLElement>(".ed-script-issues");
+  if (!boxes.length) return;
+  const issues = editor?.getScriptIssues() ?? [];
+  for (const box of boxes) {
+    const id = box.dataset.layer;
+    const mine = issues.filter((x) => String(x.layerId) === id && x.target === box.dataset.target);
+    const text = mine
+      .map((x) => et("sc.issue", { phase: x.phase, line: x.line ?? "?", msg: x.message, n: x.count }))
+      .join("\n");
+    if (box.textContent !== text) box.textContent = text;
+    box.hidden = !mine.length;
+  }
+}
+
+function scriptsGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-scripts";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.scripts");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!current?.assets && !isLocked(node.id);
+  const slots = scriptSlots(node.obj);
+  if (!slots.length) group.appendChild(note(et("sc.none")));
+  for (const s of slots) {
+    const item = document.createElement("div");
+    item.className = "ed-script";
+    item.dataset.target = s.target;
+    const head = document.createElement("div");
+    head.className = "ed-fx-head";
+    const name = document.createElement("span");
+    name.className = "ed-fx-name";
+    name.textContent = s.target;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ed-icon ed-script-del";
+    del.textContent = "✕";
+    del.title = et("sc.del");
+    del.disabled = !editable;
+    del.onclick = () => objEdit(et("log.scRemoved", { target: s.target, layer: nodeName(node.id) }), node.id, (o) => removeScript(o, s.target));
+    head.append(name, del);
+    const draftKey = `${node.id}|${s.target}`;
+    const ta = document.createElement("textarea");
+    ta.className = "ed-script-src";
+    ta.spellcheck = false;
+    ta.value = scriptDrafts.get(draftKey) ?? s.script;
+    ta.readOnly = !editable;
+    ta.rows = Math.min(16, Math.max(5, s.script.split("\n").length + 1));
+    const status = document.createElement("div");
+    status.className = "ed-script-status";
+    const apply = document.createElement("button");
+    apply.type = "button";
+    apply.className = "ed-btn ed-script-apply";
+    apply.textContent = et("sc.apply");
+    const sync = () => {
+      const ok = showScriptCheck(status, ta.value);
+      apply.disabled = !editable || !ok || ta.value === s.script;
+    };
+    let timer = 0;
+    ta.addEventListener("input", () => {
+      if (ta.value === s.script) scriptDrafts.delete(draftKey);
+      else scriptDrafts.set(draftKey, ta.value);
+      clearTimeout(timer);
+      timer = window.setTimeout(sync, 150);
+    });
+    const commit = () => {
+      sync();
+      if (apply.disabled) return;
+      scriptDrafts.delete(draftKey);
+      objEdit(et("log.scApplied", { target: s.target, layer: nodeName(node.id) }), node.id, (o) => setScript(o, s.target, ta.value));
+    };
+    apply.onclick = commit;
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Tab" && !e.shiftKey && !ta.readOnly) {
+        e.preventDefault();
+        ta.setRangeText("\t", ta.selectionStart, ta.selectionEnd, "end");
+        ta.dispatchEvent(new Event("input"));
+      } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        commit();
+      }
+    });
+    const issues = document.createElement("pre");
+    issues.className = "ed-script-issues";
+    issues.dataset.layer = String(node.id);
+    issues.dataset.target = s.target;
+    issues.hidden = true;
+    const foot = document.createElement("div");
+    foot.className = "ed-script-foot";
+    foot.append(status, apply);
+    item.append(head, ta, foot, issues);
+    group.appendChild(item);
+    sync();
+  }
+  const taken = new Set(slots.map((s) => s.target));
+  const free = addableTargets(node.kind).filter((t) => !taken.has(t));
+  const add = document.createElement("select");
+  add.id = "script-add";
+  add.disabled = !editable || !free.length;
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = et("sc.add");
+  add.appendChild(first);
+  for (const t of free) {
+    const o = document.createElement("option");
+    o.value = t;
+    o.textContent = t;
+    add.appendChild(o);
+  }
+  add.addEventListener("change", () => {
+    const t = add.value;
+    if (t) objEdit(et("log.scAdded", { target: t, layer: nodeName(node.id) }), node.id, (o) => setScript(o, t, scriptTemplate(t)));
+  });
+  group.appendChild(add);
+  queueMicrotask(refreshScriptIssues);
+  return group;
+}
+
 function renderInspector() {
   inspectorEl.textContent = "";
   if (!doc) {
@@ -1872,6 +2017,7 @@ function renderInspector() {
   }
   inspectorEl.appendChild(editGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
+  inspectorEl.appendChild(scriptsGroup(node));
   const o = node.obj;
   const effects = Array.isArray(o.effects)
     ? (o.effects as Array<Record<string, unknown>>)

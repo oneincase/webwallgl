@@ -12,10 +12,14 @@ import type {
   EditorHitTestOptions,
   EditorLayerProps,
   EditorLayerOutline,
+  EditorScriptIssue,
+  SceneScriptCheck,
 } from "./types";
 
 export * from "./webwallgl";
 export type {
+  EditorScriptIssue,
+  SceneScriptCheck,
   EditorControls,
   EditorLayer,
   EditorLayerKind,
@@ -30,3 +34,9 @@ export type {
  * 网页、视频壁纸，或场景尚未装配完成时返回 null。
  */
 export declare function editorOf(instance: SceneInstance): EditorControls | null;
+
+/**
+ * SceneScript 语法预检：与引擎沙箱同一 transform、同为严格模式，只编译不执行。
+ * 给出出错行与可派发入口；noEntry 表示引擎会丢弃这段脚本。
+ */
+export declare function checkSceneScript(script: string): SceneScriptCheck;

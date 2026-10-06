@@ -6,8 +6,11 @@
 // 不动（桌面 App 的 file: 依赖零改动）。导出清单与 editor.d.ts 由 verify-arch 比对。
 export * from "./index";
 export { editorOf } from "../editor/controls";
+export { checkSceneScript } from "../editor/scripts";
 export type {
   EditorControls,
+  EditorScriptIssue,
+  SceneScriptCheck,
   EditorLayer,
   EditorLayerKind,
   EditorCaptureOptions,

@@ -707,6 +707,70 @@ function scriptToFunctionBody(script) {
     .replace(SANDBOX_PARAM_DECL_RE, '$1')
 }
 
+// [we-scene patch] 两个沙箱拼进 new Function 的前缀（与 evalTextScript / evalObjectScript 一致）。
+const SANDBOX_PRELUDE = '"use strict";\nvar localstorage = localStorage;\n'
+// V8 给 new Function 体加 2 行函数头，再加 SANDBOX_PRELUDE 的 2 行：
+// 运行期栈里 `<anonymous>:N` 的 N - 4 = 脚本源码行号（transform 不增删行）。
+const SANDBOX_LINE_OFFSET = 4
+
+/** 可被宿主派发的脚本入口（判据同 evalObjectScript 的闸门） */
+export const SCRIPT_ENTRY_NAMES = Object.freeze([
+  'update', 'init', 'applyUserProperties',
+  'cursorClick', 'cursorEnter', 'cursorLeave', 'cursorDown', 'cursorUp', 'cursorMove',
+  ...MEDIA_CALLBACKS, 'animationEvent', 'resizeScreen',
+])
+
+/** 运行期错误 → 脚本源码行号（取不到返回 null） */
+export function scriptErrorLine(err) {
+  const stack = err && err.stack ? String(err.stack).split('\n') : []
+  const where = stack.find((l) => /<anonymous>:\d+/.test(l)) || ''
+  const n = Number((where.match(/<anonymous>:(\d+)/) || [])[1])
+  return Number.isFinite(n) && n > SANDBOX_LINE_OFFSET ? n - SANDBOX_LINE_OFFSET : null
+}
+
+function compileSandboxBody(script) {
+  // 只编译不调用：顶层代码一行都不执行
+  // eslint-disable-next-line no-new-func
+  new Function(...SANDBOX_PARAM_NAMES, SANDBOX_PRELUDE + scriptToFunctionBody(script))
+}
+
+/**
+ * [we-scene patch] 编辑器脚本面板（EDITOR-PLAN W8）的语法预检：与沙箱同一 transform、
+ * 同一形参表、同为严格模式，**只编译不执行**。V8 的 SyntaxError 不带位置，
+ * 出错行靠「报同一条错误的最短行前缀」二分得到（前缀也走 transform，行号即作者原文行号）。
+ * entries = 能被宿主派发的入口；为空且不读 engine 时钟时脚本会被闸门丢弃（noEntry）。
+ */
+export function checkSceneScript(script) {
+  if (typeof script !== 'string') return { ok: false, message: 'script must be a string', line: null, entries: [], noEntry: true }
+  try {
+    compileSandboxBody(script)
+  } catch (e) {
+    const message = String((e && e.message) || e)
+    const lines = script.split('\n')
+    const same = (k) => {
+      try {
+        compileSandboxBody(lines.slice(0, k).join('\n'))
+        return false
+      } catch (x) {
+        return String((x && x.message) || x) === message
+      }
+    }
+    let lo = 1
+    let hi = lines.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (same(mid)) hi = mid
+      else lo = mid + 1
+    }
+    return { ok: false, message, line: lo, entries: [], noEntry: false }
+  }
+  const body = scriptToFunctionBody(script)
+  const entries = SCRIPT_ENTRY_NAMES.filter((n) =>
+    new RegExp(`\\bfunction\\s*\\*?\\s*${n}\\s*\\(|\\b(?:var|let|const)\\s+${n}\\s*=`).test(body))
+  const usesClock = /\bengine\s*\.\s*(runtime|frametime)\b/.test(body)
+  return { ok: true, message: '', line: null, entries, noEntry: !entries.length && !usesClock }
+}
+
 /**
  * [we-scene patch] WE 语义：visible 属性脚本返回 **number 时折叠成 bool**
  *（≠ 0 = 可见）。淡出计时器脚本把同一份 `update(value) → mix(value, 0, …)`

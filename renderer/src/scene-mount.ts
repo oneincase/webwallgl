@@ -4,7 +4,7 @@ import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
-import type { EditorControls, EditorLayer, EditorLayerKind, EditorLayerProps, SceneDirAssets, Source } from "./api/types";
+import type { EditorControls, EditorLayer, EditorLayerKind, EditorLayerProps, EditorScriptIssue, SceneDirAssets, Source } from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
@@ -831,6 +831,27 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         hook(info);
       }
       const propSandboxes: any[] = [];
+      // 编辑器脚本面板（W8）：脚本错误按「图层 + 挂点」结构化登记（诊断流文案照旧），
+      // 每次装配从空开始 —— 编辑器改脚本后重挂即拿到新脚本的错误。
+      const scriptIssues = new Map<string, EditorScriptIssue>();
+      const noteScriptIssue = (layer: { id?: unknown; name?: unknown } | null, target: string, e: unknown, phase: unknown) => {
+        const message = String((e as Error)?.message || e).slice(0, 200);
+        const ph = typeof phase === "string" ? phase : "update";
+        const layerId = typeof layer?.id === "number" ? layer.id : null;
+        const key = `${layerId}|${target}|${ph}|${message}`;
+        const hit = scriptIssues.get(key);
+        if (hit) hit.count++;
+        else if (scriptIssues.size < 500)
+          scriptIssues.set(key, {
+            layerId,
+            layerName: typeof layer?.name === "string" ? layer.name : "",
+            target,
+            phase: ph,
+            message,
+            line: wtext.scriptErrorLine(e) as number | null,
+            count: 1,
+          });
+      };
       // [we-scene patch] SceneScript localStorage（P1-2）：WE 语义是**按壁纸
       // 共享 + 跨会话持久**。五个 eval 点必须拿到同一份 storage 实例（脚本 A
       // 写、脚本 B 读）。后端优先级：
@@ -4711,7 +4732,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 getBoneOverrides,
                 getParticleSystems: (target: { id?: number }) =>
                   (target && target.id !== undefined && particleSystemsByLayer.get(target.id)) || [],
-                onError: (e: unknown) => {
+                onError: (e: unknown, phase?: unknown) => {
+                  noteScriptIssue(layer, "text", e, phase);
                   reportDiag(rt, cfg, `text script '${layer.name}' 失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
                 },
               });
@@ -5665,8 +5687,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 ...sceneApi,
                 shared: textShared,
                 storage: sceneStorage,
-                onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
+                onError: (e: unknown, phase?: unknown) => {
+                  noteScriptIssue(layer, `effects[${ei}].visible`, e, phase);
+                  reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn");
+                },
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -5725,13 +5749,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // 五个 eval 点统一走 engineTimers（SCENESCRIPT-PLAN P1-1），
                 // 句柄语义与卸载 dispose 见 render/engine-timers.js。
                 ...timerOpts,
-                onError: (e: unknown) => {
+                onError: (e: unknown, phase?: unknown) => {
+                  noteScriptIssue(layer, field, e, phase);
                   // [we-scene patch 2026-09-28] 带上出错行：脚本被拼进 new Function
                   // 后行号与源文件一一对应（transform 只剥 import/export 与撞名声明），
                   // 没有它只能靠现象反推（本轮 Free Cam 就是靠这一条定位到具体调用的）。
-                  const stack = (e as Error)?.stack ? String((e as Error).stack).split("\n") : [];
-                  const where = stack.find((l) => /<anonymous>:\d+/.test(l)) || "";
-                  const loc = (where.match(/<anonymous>:(\d+)/) || [])[1];
+                  const loc = wtext.scriptErrorLine(e);
                   reportDiag(
                     rt,
                     cfg,
@@ -5860,8 +5883,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 ...sceneApi,
                 shared: textShared,
                 storage: sceneStorage,
-                onError: (e: unknown) =>
-                  reportDiag(rt, cfg, `general script '${field}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn"),
+                onError: (e: unknown, phase?: unknown) => {
+                  noteScriptIssue(null, `general.${field}`, e, phase);
+                  reportDiag(rt, cfg, `general script '${field}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn");
+                },
               });
               if (!sandbox) continue;
               propSandboxes.push(sandbox);
@@ -7392,6 +7417,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const sx = parent.scale?.[0] || 1;
           const sy = parent.scale?.[1] || 1;
           return [rx / sx, ry / sy];
+        },
+        getScriptIssues() {
+          return [...scriptIssues.values()].map((x) => ({ ...x }));
         },
       };
       applyLiveImpl = applyLiveProps;
