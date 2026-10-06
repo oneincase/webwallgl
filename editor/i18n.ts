@@ -251,7 +251,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "insp.readonly": "原始 JSON 与上方字段为文档值（scene.json）",
     "insp.edit": "变换与外观",
     "insp.editHint":
-      "改动当帧生效并写回文档；角度以度显示。画面上：拖图层移动，拖角点缩放（⇧ 等比），拖顶部圆柄旋转（⇧ 吸附 15°）。变换绑了脚本/动画的层会被脚本覆盖。",
+      "改动当帧生效并写回文档；角度以度显示。画面上：拖图层移动（自动吸附画面边缘 / 中线和其他层的边缘 / 中心，显示粉色参考线；按住 ⌘ / Ctrl 临时关闭），拖角点缩放（⇧ 等比），拖顶部圆柄旋转（⇧ 吸附 15°）。变换绑了脚本/动画的层会被脚本覆盖。",
     "insp.locked": "该图层已锁定：不参与画面点选、不能拖动或编辑。在图层树里点锁形图标解锁。",
     "insp.noEdit": "当前壁纸不支持热改（仅场景壁纸）",
     "insp.notLive": "引擎里没有这个对象的活层（可能是被跳过的组件或声音）",
@@ -570,7 +570,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "insp.readonly": "The raw JSON and fields above are document values (scene.json)",
     "insp.edit": "Transform & appearance",
     "insp.editHint":
-      "Edits apply on the current frame and are written back to the document; angles are shown in degrees. In the viewport: drag the layer to move, drag a corner to scale (⇧ keeps proportions), drag the round top handle to rotate (⇧ snaps to 15°). Layers whose transform is driven by scripts/animations get overwritten by them.",
+      "Edits apply on the current frame and are written back to the document; angles are shown in degrees. In the viewport: drag the layer to move (snaps to the frame edges / center lines and other layers' edges / centers with pink guides; hold ⌘ / Ctrl to disable), drag a corner to scale (⇧ keeps proportions), drag the round top handle to rotate (⇧ snaps to 15°). Layers whose transform is driven by scripts/animations get overwritten by them.",
     "insp.locked": "This layer is locked: it is skipped by viewport picking and cannot be dragged or edited. Click the lock icon in the layer tree to unlock.",
     "insp.noEdit": "Live editing is not available for this wallpaper (scene wallpapers only)",
     "insp.notLive": "The engine has no live layer for this object (skipped component or sound)",

@@ -508,7 +508,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/reopened.jpg`);
 
-  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
+  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
 
   await session.close();
   await server.close();
@@ -548,7 +548,7 @@ export function stripePng(w, h, top, bottom) {
  * 不读编辑器页任何内部状态。
  */
 async function runCreateAndDraft(ctx) {
-  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: h, objects } = ctx;
+  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, helpers: h, objects } = ctx;
   const RED = [220, 30, 30];
   const BLUE = [30, 30, 220];
   const BG = "#336699";
@@ -1798,4 +1798,52 @@ async function runCreateAndDraft(ctx) {
   await settle();
   const crD2 = await h.canvasRect();
   check((await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)) && (await depthOf())[id2] === 1 && (await inkIn(...worldBox(crD2, [400, 540], [50, 30]))).frac > 0.05 && (await inkIn(...worldBox(crD2, [1700, 540], [50, 30]))).frac > 0.05, "重新打开：锁定状态、组结构、画面都还在");
+
+  section("AE. 视口拖拽吸附（贴画面竖中线 + 粉色参考线 → 松手消失 → ⌘ 关吸附 → 贴另一层中心）");
+  const guidePx = () =>
+    ev(`(() => { const c = document.querySelector('#ed-overlay'); const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 40 && d[i] > d[i + 1] + 60 && d[i + 2] > d[i + 1] + 30) n++; return n; })()`);
+  const holdDrag = async ([x0, y0], [x1, y1], modifiers = 0) => {
+    await mouse("mouseMoved", x0, y0, { modifiers });
+    await mouse("mousePressed", x0, y0, { buttons: 1, modifiers });
+    for (let i = 1; i <= 10; i++) {
+      await mouse("mouseMoved", x0 + ((x1 - x0) * i) / 10, y0 + ((y1 - y0) * i) / 10, { buttons: 1, modifiers });
+      await new Promise((r) => setTimeout(r, 16));
+    }
+    await new Promise((r) => setTimeout(r, 150));
+    return async () => {
+      await mouse("mouseReleased", x1, y1, { modifiers });
+      await settle();
+    };
+  };
+  await gotoEditor();
+  await newBlank("#000000");
+  await addTextPreset("plain");
+  await setText("content", "MMM");
+  await setText("size", "60");
+  await h.setInputs({ 0: 600, 1: 700 });
+  await settle();
+  const crE = await h.canvasRect();
+  let release = await holdDrag(worldToPage(crE, [600, 700]), worldToPage(crE, [963, 700]));
+  const gDuring = await guidePx();
+  await release();
+  let pos = await h.numInputs();
+  check(Math.abs(pos[0] - 960) < 0.05 && Math.abs(pos[1] - 700) < 0.5, `★ 拖到离画面竖中线 3 个单位处松手：吸到 x = ${pos[0]}（y ${pos[1]} 不动）`);
+  check(gDuring > 200 && (await guidePx()) === 0, `拖动中画出粉色参考线（${gDuring} 像素），松手后消失`);
+  release = await holdDrag(worldToPage(crE, [960, 700]), worldToPage(crE, [970, 700]), MOD.meta);
+  const gMeta = await guidePx();
+  await release();
+  pos = await h.numInputs();
+  check(Math.abs(pos[0] - 970) < 1 && gMeta === 0, `按住 ⌘ 拖 10 个单位（无 ⌘ 时会被吸回中线）：不吸附、无参考线（x = ${pos[0].toFixed(2)}）`);
+  await addTextPreset("plain");
+  await setText("content", "WWW");
+  await setText("size", "60");
+  await h.setInputs({ 0: 1400, 1: 300 });
+  await settle();
+  await click(await ev(`(() => { const n = [...document.querySelectorAll('#ed-tree .ed-node')][0]; const r = n.getBoundingClientRect(); return [r.left + 60, r.top + r.height / 2]; })()`));
+  await settle();
+  release = await holdDrag(worldToPage(crE, [pos[0], 700]), worldToPage(crE, [1403, 700]));
+  await release();
+  pos = await h.numInputs();
+  check(Math.abs(pos[0] - 1400) < 0.05, `★ 拖到另一层中心附近：吸到它的中心线 x = ${pos[0]}`);
+  check((await h.errorLines()).length === 0, "吸附拖拽全程无错误");
 }

@@ -147,6 +147,7 @@ import {
   type PropType,
   type PropView,
 } from "./userprops";
+import { boxOf, sceneFrame, snapMove, snapTargets, type Box, type SnapTargets } from "./snap";
 import { scriptsAllowedByDefault, scriptsOverrideFrom } from "./trust";
 import {
   duplicateLayer,
@@ -1128,6 +1129,21 @@ function drawOverlay() {
       overlayCtx.strokeRect(x - HANDLE / 2, y - HANDLE / 2, HANDLE, HANDLE);
     }
   }
+  if (snapGuides) {
+    overlayCtx.strokeStyle = SNAP_COLOR;
+    overlayCtx.lineWidth = 1;
+    overlayCtx.beginPath();
+    for (const x of snapGuides.gx) {
+      overlayCtx.moveTo(x, -1e4);
+      overlayCtx.lineTo(x, 1e4);
+    }
+    for (const y of snapGuides.gy) {
+      overlayCtx.moveTo(-1e4, y);
+      overlayCtx.lineTo(1e4, y);
+    }
+    overlayCtx.stroke();
+    overlayCtx.lineWidth = 1.5;
+  }
   const [ax, ay] = outline.anchor;
   overlayCtx.strokeStyle = accent;
   overlayCtx.beginPath();
@@ -1153,8 +1169,37 @@ let drag: {
   ax: Pt;
   ay: Pt;
   moved: boolean;
+  /** 移动吸附：起拖时选中层的包围盒与候选线（画面边缘 / 中线、其他可见层的边缘 / 中心） */
+  box: Box | null;
+  snap: SnapTargets | null;
 } | null = null;
 let suppressClick = false;
+let snapGuides: { gx: number[]; gy: number[] } | null = null;
+const SNAP_COLOR = "#ff3d9a";
+
+function snapSetup(id: number | string, corners: ReadonlyArray<readonly number[]> | null): { box: Box | null; snap: SnapTargets | null } {
+  const box = corners ? boxOf(corners) : null;
+  const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
+  const res = sceneResolution(doc?.scene ?? null);
+  if (!editor || !box || !canvas || !res) return { box: null, snap: null };
+  const layers = editor.getLayers();
+  const byId = new Map(layers.map((l) => [l.id, l]));
+  const insideSelf = (l: (typeof layers)[number]) => {
+    for (let cur: (typeof layers)[number] | undefined = l, n = 0; cur && n < 64; cur = byId.get(cur.parentId ?? NaN), n++) {
+      if (String(cur.id) === String(id)) return true;
+    }
+    return false;
+  };
+  const others: Box[] = [];
+  for (const l of layers) {
+    if (!l.visible || insideSelf(l)) continue;
+    const c = editor.getLayerOutline(l.id)?.corners;
+    const b = c ? boxOf(c) : null;
+    if (b) others.push(b);
+  }
+  const r = canvas.getBoundingClientRect();
+  return { box, snap: snapTargets(sceneFrame(fitEl.value, r.width, r.height, res.w, res.h), others) };
+}
 
 const DRAG_FIELD: Record<DragMode, keyof EditorLayerProps> = { move: "origin", scale: "scale", rotate: "angles" };
 
@@ -1188,6 +1233,7 @@ stageEl.addEventListener("pointerdown", (e) => {
     anchor: gizmo?.anchor ?? [p.x, p.y],
     ...layerAxes(gizmo?.corners ?? []),
     moved: false,
+    ...(handle ? { box: null, snap: null } : snapSetup(selectedId, gizmo?.corners ?? null)),
   };
   stageEl.setPointerCapture(e.pointerId);
 });
@@ -1208,7 +1254,16 @@ stageEl.addEventListener("pointermove", (e) => {
   drag.moved = true;
   const p0 = drag.props0;
   if (drag.mode === "move") {
-    const d = editor.screenDeltaToLocal(Number(drag.id), dx, dy);
+    let mx = dx;
+    let my = dy;
+    snapGuides = null;
+    if (drag.box && drag.snap && !(e.metaKey || e.ctrlKey)) {
+      const r = snapMove(drag.box, dx, dy, drag.snap);
+      mx = r.dx;
+      my = r.dy;
+      if (r.gx.length || r.gy.length) snapGuides = { gx: r.gx, gy: r.gy };
+    }
+    const d = editor.screenDeltaToLocal(Number(drag.id), mx, my);
     if (!d) return;
     void applyPatch(drag.id, { origin: [p0.origin[0] + d[0], p0.origin[1] + d[1], p0.origin[2]] });
     return;
@@ -1227,6 +1282,7 @@ function endDrag(e: PointerEvent) {
   if (!drag || e.pointerId !== drag.pointerId) return;
   const d = drag;
   drag = null;
+  snapGuides = null;
   if (!d.moved || !editor) return;
   suppressClick = true;
   const after = editor.getLayerProps(Number(d.id));

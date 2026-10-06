@@ -1863,6 +1863,7 @@ section("AA2. 声音层闭环（新建 → 导入两段音频、撤掉一层 →
 
 section("AB. 关键帧动画 editor/keyframes.ts + 引擎 seekTime");
 const kfMod = await loadEditorModule("keyframes");
+const snapMod = await loadEditorModule("snap");
 const near3 = (a, b, eps = 1e-3) => a.every((v, i) => Math.abs(v - b[i]) < eps);
 const animMod = await imp("renderer/vendor/we-scene/render/animation.js");
 {
@@ -2060,6 +2061,37 @@ section("AD. 图层树拖拽改父级 / 成组 / 锁定写入文档");
   check(historyMod.structCommand(mk(), "x", 2, (dd) => (docMod.placeLayer(dd, 2, 2, "inside") === "ok" ? 2 : undefined)) === null, "拒绝时不产生撤销记录");
 }
 
+section("AE. 视口拖拽吸附 snap.ts");
+{
+  const S = snapMod;
+  check(json(S.boxOf([[10, 20], [50, 5], [40, 60], [0, 30]])) === json({ x0: 0, y0: 5, x1: 50, y1: 60 }) && S.boxOf([]) === null, "boxOf：旋转层取四角的轴对齐包围盒");
+  const fcv = S.sceneFrame("cover", 800, 600, 1920, 1080);
+  check(Math.abs(fcv.x0 + 133.333) < 1e-3 && Math.abs(fcv.x1 - 933.333) < 1e-3 && fcv.y0 === 0 && fcv.y1 === 600, "sceneFrame cover：取大比例、两侧裁出画布");
+  const fc = S.sceneFrame("contain", 800, 600, 1920, 1080);
+  const fs2 = S.sceneFrame("stretch", 800, 600, 1920, 1080);
+  check(Math.abs(fc.y0 - 75) < 1e-6 && fc.x0 === 0 && fc.x1 === 800 && json(fs2) === json({ x0: 0, y0: 0, x1: 800, y1: 600 }), "sceneFrame contain 上下留黑边居中；stretch 铺满");
+  const frame = { x0: 0, y0: 0, x1: 1000, y1: 500 };
+  const T = S.snapTargets(frame, [{ x0: 700, y0: 100, x1: 800, y1: 200 }]);
+  check(json(T.xs) === json([0, 500, 1000, 700, 750, 800]) && json(T.ys) === json([0, 250, 500, 100, 150, 200]), "候选线：画面左 / 中 / 右、上 / 中 / 下 + 其他层的边缘与中心");
+  const box = { x0: 100, y0: 300, x1: 200, y1: 340 };
+  let r = S.snapMove(box, 346, 0, T);
+  check(r.dx === 350 && json(r.gx) === json([500]), `中心贴画面竖中线：位移 346 → ${r.dx}，参考线 x=500`);
+  r = S.snapMove(box, 496, -103, T);
+  check(r.dx === 500 && r.dy === -100 && json(r.gx) === json([700]) && json(r.gy) === json([200]), `左缘贴另一层左缘 700、下缘……上缘贴另一层下缘 200（${r.dx}, ${r.dy}）`);
+  r = S.snapMove(box, 320, 20, T);
+  check(r.dx === 320 && r.dy === 20 && !r.gx.length && !r.gy.length, "离所有线都超过 6px：不吸、无参考线");
+  r = S.snapMove(box, 343.9, 0, T);
+  check(r.dx === 343.9 && !r.gx.length, "刚好超出阈值（6.1px）不吸");
+  r = S.snapMove(box, 344, 0, T);
+  check(r.dx === 350, "阈值内（6px）吸上");
+  r = S.snapMove({ x0: 0, y0: 0, x1: 100, y1: 10 }, 448, 0, S.snapTargets(frame, [{ x0: 400, y0: 0, x1: 450, y1: 10 }]));
+  check(r.dx === 450 && json(r.gx.sort((a, b) => a - b)) === json([450, 500]), "同时对齐两条线（左缘贴 450、中心贴 500）时两条参考线都画");
+  r = S.snapMove({ x0: 0, y0: 0, x1: 100, y1: 10 }, 497, 0, S.snapTargets(frame, []), 2);
+  check(r.dx === 497, "阈值可调（2px 时 3px 外不吸）");
+  r = S.snapMove({ x0: 0, y0: 0, x1: 100, y1: 10 }, 452, 0, S.snapTargets(frame, [{ x0: 551, y0: 0, x1: 560, y1: 10 }]));
+  check(r.dx === 451, "多个候选取最近的那条（右缘 552 → 551，而不是中心 502 → 500）");
+}
+
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
 {
   const realFetch = globalThis.fetch;
@@ -2189,6 +2221,8 @@ section("I. 接线");
   check(/row\.addEventListener\("pointerdown", \(e\) => startTreeDrag\(e, n, row\)\)/.test(main) && /\(res = placeLayer\(d, n\.id, target\.id, where\)\) === "ok"/.test(main) && /if \(treeDragged\) return;/.test(main), "图层树行可拖：放下走 placeLayer 结构编辑，拖完不误触点选");
   check(/isLockedObj\(n\.obj\)/.test(main) && /setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(main) && !/const locked = new Set/.test(main), "锁定状态以文档 locktransforms 为准（页面不再另存一份）");
   check(/id="ly-group"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /groupLayer\(d, n\.id, et\("layer\.groupName"\)\)/.test(main), "图层工具条「成组」");
+  check(/if \(drag\.box && drag\.snap && !\(e\.metaKey \|\| e\.ctrlKey\)\) \{\s*const r = snapMove\(drag\.box, dx, dy, drag\.snap\);/.test(main) && /screenDeltaToLocal\(Number\(drag\.id\), mx, my\)/.test(main) && /snapTargets\(sceneFrame\(fitEl\.value, r\.width, r\.height, res\.w, res\.h\), others\)/.test(main), "视口移动走吸附（⌘ / Ctrl 关），候选 = 画面框（按当前 fit）+ 其他层");
+  check(/if \(!l\.visible \|\| insideSelf\(l\)\) continue;/.test(main) && /handle \? \{ box: null, snap: null \}/.test(main) && /drag = null;\s*snapGuides = null;/.test(main), "吸附只对移动生效；自己与子层、隐藏层不当候选；松手清参考线");
   check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -2251,6 +2285,17 @@ section("J. 变异红测");
   const fa = placeFix();
   fa[1].origin = { value: "10 20 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
   check(m5.placeLayer(m5.makeDoc("x", null, { general: {}, objects: fa }, "loose"), 2, 3, "inside") !== "animated", "不拒动画层时「换父级被拒」判据变红");
+
+  const snapPath = path.join(ROOT, "editor/snap.ts");
+  const snapSrc = fs.readFileSync(snapPath, "utf8");
+  const mutSnap = snapSrc.replace("if (!(Math.abs(best) <= thr)) return { d, guides: [] };", "if (!(Math.abs(best) <= thr * 10)) return { d, guides: [] };");
+  check(mutSnap !== snapSrc, "注入点存在（吸附阈值）");
+  const snm1 = await loadEditorModule("snap", { [snapPath]: mutSnap });
+  check(snm1.snapMove({ x0: 100, y0: 300, x1: 200, y1: 340 }, 320, 20, snm1.snapTargets({ x0: 0, y0: 0, x1: 1000, y1: 500 }, [])).dx !== 320, "阈值失守时「远处不吸」判据变红");
+  const mutSnap2 = snapSrc.replace("if (Math.abs(gap) < Math.abs(best)) {", "if (Math.abs(gap) > 0 && best === Infinity) {");
+  check(mutSnap2 !== snapSrc, "注入点存在（取最近候选）");
+  const snm2 = await loadEditorModule("snap", { [snapPath]: mutSnap2 });
+  check(snm2.snapMove({ x0: 0, y0: 0, x1: 100, y1: 10 }, 452, 0, snm2.snapTargets({ x0: 0, y0: 0, x1: 1000, y1: 500 }, [{ x0: 551, y0: 0, x1: 560, y1: 10 }])).dx !== 451, "不取最近时「多个候选取最近」判据变红");
 
   const gizPath = path.join(ROOT, "editor/gizmo.ts");
   const gizSrc = fs.readFileSync(gizPath, "utf8");
