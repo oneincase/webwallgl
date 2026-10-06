@@ -1861,6 +1861,124 @@ section("AA2. 声音层闭环（新建 → 导入两段音频、撤掉一层 →
   }
 }
 
+section("AB. 关键帧动画 editor/keyframes.ts + 引擎 seekTime");
+const kfMod = await loadEditorModule("keyframes");
+const animMod = await imp("renderer/vendor/we-scene/render/animation.js");
+{
+  const near = (a, b, eps = 1e-3) => (Array.isArray(a) ? a.every((v, i) => Math.abs(v - b[i]) < eps) : Math.abs(a - b) < eps);
+  check(json(kfMod.baseValue({ origin: "10 20" }, "origin")) === json([10, 20, 0]) && json(kfMod.baseValue({}, "scale")) === json([1, 1, 1]) && json(kfMod.baseValue({ alpha: { user: "a", value: 0.4 } }, "alpha")) === json([0.4]), "baseValue：\"x y z\" 串 / 缺省 / 包装都读成定长数组");
+
+  const o = { id: 1, origin: "10 20 0", alpha: { user: "fade", value: 0.5 } };
+  check(kfMod.enableAnim(o, "origin", [10, 20, 0]), "开动画");
+  const key0 = (v) => ({ back: { enabled: true, x: -1, y: 0 }, frame: 0, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: v });
+  check(json(o.origin) === json({ animation: { options: { fps: 30, length: 90, mode: "loop", wraploop: false }, relative: false, c0: [key0(10)], c1: [key0(20)], c2: [key0(0)] }, value: "10 20 0" }), "形态与语料最常见写法一致：options {fps 30, length, mode, wraploop}、relative:false、每通道一条、关键帧 6 字段平滑手柄、静态值保留");
+  check(!kfMod.enableAnim(o, "origin", [1, 2, 3]) && !kfMod.enableAnim({}, "origin", [1, 2]) && !kfMod.enableAnim({}, "alpha", [NaN]), "已开 / 维度不对 / 非有限值拒绝");
+  check(kfMod.enableAnim(o, "alpha", [0.5]) && o.alpha.user === "fade" && o.alpha.value === 0.5 && Array.isArray(o.alpha.animation.c0), "绑了用户属性的字段：包装保留、动画并存");
+  check(json(kfMod.animatedFields(o)) === json(["origin", "alpha"]), "animatedFields");
+  const L = parseMod.parseScene({ general: {}, objects: [{ ...structuredClone(o), image: "models/x.json" }] }, { type: "scene" }).layers[0];
+  check(!!L.objectAnimations?.origin && !!L.objectAnimations?.alpha, "引擎 parseScene 认得编辑器写的字段动画");
+
+  check(kfMod.setKey(o, "origin", 45, [110, 20, 0]) && kfMod.setKey(o, "origin", 20, [50, 20, 0]), "打关键帧");
+  check(json(o.origin.animation.c0.map((k) => k.frame)) === json([0, 20, 45]) && o.origin.animation.c0[1].value === 50, "关键帧按帧号有序插入（引擎二分要求单调）");
+  check(kfMod.setKey(o, "origin", 20, [60, 20, 0]) && o.origin.animation.c0.length === 3 && o.origin.animation.c0[1].value === 60 && !kfMod.setKey(o, "origin", 20, [60, 20, 0]), "同帧再打 = 改值；同值不算改动");
+  check([91, -1, 1.5].every((f) => !kfMod.setKey(o, "origin", f, [0, 0, 0])) && !kfMod.setKey(o, "origin", 10, [1, 2]) && !kfMod.setKey({ origin: "0 0 0" }, "origin", 0, [1, 1, 1]), "越过时长 / 负数 / 非整数帧、维度不对、未开动画拒绝");
+  const v = kfMod.getAnim(o, "origin");
+  check(v.fps === 30 && v.length === 90 && v.mode === "loop" && !v.relative && v.smooth && json(v.keys.map((k) => k.frame)) === json([0, 20, 45]) && json(v.keys[2].value) === json([110, 20, 0]), "getAnim 视图");
+
+  kfMod.removeKey(o, "origin", 20);
+  const ctrl = animMod.createAnimation(o.origin.animation);
+  check(near(ctrl.seekTime(1.5).value(), [110, 20, 0]) && near(ctrl.seekTime(0).value(), [10, 20, 0]), "★ 引擎求值：第 45 帧（1.5s）= 打下的值，第 0 帧 = 起始值");
+  check(near(ctrl.seekTime(0.75).value()[0], 60), "平滑插值关于段中点对称：22.5 帧正好过中值 60");
+  const easeQ = ctrl.seekTime(0.375).value()[0];
+  check(easeQ < 35 - 5, `平滑 = 缓入：1/4 处（${easeQ.toFixed(2)}）明显落后于线性的 35`);
+  kfMod.setSmooth(o, "origin", false);
+  check(!kfMod.getAnim(o, "origin").smooth && near(animMod.createAnimation(o.origin.animation).seekTime(0.375).value()[0], 35), "改线性后 1/4 处正好 35");
+  kfMod.setSmooth(o, "origin", true);
+  check(near(ctrl.seekTime(3 + 1.5).value(), [110, 20, 0]) && ctrl.playing, "loop：seekTime 越过一个周期折回（3s + 1.5s ≡ 1.5s），仍在播");
+  check(near(ctrl.seekTime(1.5).frame, 45) && ctrl.seekTime(1.5)._prevFrame === 45, "seekTime 同 setFrame：上一帧同步到落点（不补发帧事件）");
+  const single = animMod.createAnimation({ c0: [key0(0), { ...key0(1), frame: 30 }], options: { fps: 30, length: 30, mode: "single" } });
+  single.seekTime(5);
+  check(single.frame === 30 && !single.playing && single.ended, "single：越过时长停在末帧、不再播");
+  single.seekTime(0.5);
+  check(single.frame === 15 && single.playing && !single.ended, "single：往回拖到时长内又能播（编辑器来回拖时间轴）");
+  const paused = animMod.createAnimation({ c0: [key0(0)], options: { fps: 30, length: 30, mode: "loop", startpaused: true } });
+  paused.seekTime(0.5);
+  check(paused.frame === 0 && !paused.playing, "startpaused（等脚本 play）的动画不受 seek 影响");
+  const leader = animMod.createAnimation({ c0: [key0(0)], options: { fps: 30, length: 60, mode: "loop" } });
+  const child = animMod.createAnimation({ c0: [key0(0)], options: { fps: 30, length: 60, mode: "loop", parent: { key: "alpha" } } });
+  child.parent = leader;
+  leader.seekTime(1);
+  child.seekTime(0.2);
+  check(leader.frame === 30 && child.getFrame() === 30, "联动 child 不自己定位，播放头跟 leader");
+  check(typeof animMod.createNeutralAnimation().seekTime === "function", "中性控制器也有 seekTime（统一调用不炸）");
+
+  check(kfMod.frameAt({ fps: 30, length: 90, mode: "loop" }, 4) === 30 && kfMod.frameAt({ fps: 30, length: 90, mode: "mirror" }, 4) === 60 && kfMod.frameAt({ fps: 30, length: 90, mode: "single" }, 4) === 90 && kfMod.frameAt({ fps: 30, length: 90, mode: "loop" }, 0.51) === 15, "frameAt：与引擎 wrapFrame 同口径（loop 取模 / mirror 折返 / single 钳住），取整");
+
+  check(!kfMod.removeKey(o, "origin", 7) && kfMod.removeKey(o, "origin", 45) && o.origin.animation.c0.length === 1 && !kfMod.removeKey(o, "origin", 0), "删关键帧；不存在的帧 / 最后一个拒绝（那该是关闭动画）");
+  kfMod.setKey(o, "origin", 60, [0, 0, 0]);
+  check(!kfMod.setAnimOption(o, "origin", "length", 50) && kfMod.setAnimOption(o, "origin", "length", 120) && o.origin.animation.options.length === 120, "时长不能短于最后一个关键帧");
+  check([0, 1.5, 1e9, "120"].every((n) => !kfMod.setAnimOption(o, "origin", "length", n)), "时长只收 1..上限的整数帧");
+  check(kfMod.setAnimOption(o, "origin", "mode", "mirror") && !kfMod.setAnimOption(o, "origin", "mode", "pingpong") && kfMod.getAnim(o, "origin").mode === "mirror", "模式只收 loop / mirror / single");
+
+  const rel = { origin: { value: "100 0 0", animation: { relative: true, c0: [key0(0)], c1: [key0(0)], c2: [key0(0)], options: { fps: 30, length: 60, mode: "loop" } } } };
+  kfMod.setKey(rel, "origin", 30, [130, 5, 0]);
+  check(json(rel.origin.animation.c0.map((k) => k.value)) === json([0, 30]) && rel.origin.animation.c1[1].value === 5, "外来 relative 动画：关键帧写「值 − 基准」");
+  const relCtl = animMod.createAnimation(rel.origin.animation);
+  check(near(relCtl.seekTime(1).applyTo("100 0 0"), [130, 5, 0]), "★ 引擎按基准叠加后正好是画面上要的值");
+  const lin = { alpha: { value: 1, animation: { c0: [{ ...key0(1), front: { enabled: false, x: 1, y: 0 }, back: { enabled: false, x: -1, y: 0 } }], options: { fps: 30, length: 30, mode: "loop" } } } };
+  kfMod.setKey(lin, "alpha", 15, [0]);
+  check(lin.alpha.animation.c0[1].front.enabled === false, "新关键帧沿用现有插值风格（线性动画里打的还是线性）");
+  const mism = { origin: { value: "0 0 0", animation: { c0: [key0(1), { ...key0(2), frame: 10 }], c1: [key0(3)], c2: [key0(4)], options: { fps: 30, length: 30, mode: "loop" } } } };
+  const mv = kfMod.getAnim(mism, "origin");
+  check(json(mv.keys.map((k) => k.frame)) === json([0, 10]) && Number.isNaN(mv.keys[1].value[1]), "各通道关键帧数不同（语料 4 处）：帧号取并集，缺的通道记 NaN");
+
+  const d1 = { origin: "1 2 3" };
+  kfMod.enableAnim(d1, "origin", [1, 2, 3]);
+  check(kfMod.disableAnim(d1, "origin", [5, 6, 7]) && d1.origin === "5 6 7", "关动画：去掉 animation，只剩值时解包，值取画面上的当前值");
+  check(kfMod.disableAnim(o, "alpha", [0.25]) && json(o.alpha) === json({ user: "fade", value: 0.25 }) && !kfMod.disableAnim(o, "alpha"), "关动画：用户属性绑定保留；没开过的拒绝");
+
+  const sp = kfMod.splitAnimated(o, { origin: [1, 2, 3], alpha: 0.3, visible: true });
+  check(json(sp.plain) === json({ alpha: 0.3, visible: true }) && json(sp.keyed) === json({ origin: [1, 2, 3] }), "splitAnimated：落在已开动画字段的改动另拎出来做关键帧");
+  kfMod.enableAnim(o, "alpha", [0.25]);
+  check(json(kfMod.splitAnimated(o, { alpha: 0.6 }).keyed) === json({ alpha: [0.6] }), "alpha 标量转单元素数组");
+  check(json(kfMod.keyTimes(o)) === json([0, 2]), "keyTimes：全部动画字段关键帧的时刻（秒）去重排序");
+}
+
+section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("动画测试", 1280, 720, [0, 0, 0]);
+    const id = textMod.addTextLayer(doc, "plain", "标题", "Hi", fakeMeasure);
+    const o = doc.scene.objects.find((x) => x.id === id);
+    const base = kfMod.baseValue(o, "origin");
+    kfMod.enableAnim(o, "origin", base, { length: 60, mode: "mirror" });
+    kfMod.setKey(o, "origin", 60, [base[0] + 300, base[1], base[2]]);
+    kfMod.enableAnim(o, "alpha", [0], { length: 30, mode: "single" });
+    kfMod.setKey(o, "alpha", 30, [1]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const ov = assetsMod.overlayAssets("scene.json", empty, () => new Set());
+    const files = await saveMod.collectProject(doc, ov, null);
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(json(reopened.doc.scene) === json(doc.scene), "重新打开：两条动画逐字段一致");
+    const L = parseMod.parseScene(structuredClone(reopened.doc.scene), { type: "scene" }).layers.find((l) => l.id === id);
+    const pos = animMod.createAnimation(L.objectAnimations.origin.animation);
+    const al = animMod.createAnimation(L.objectAnimations.alpha.animation);
+    check(Math.abs(pos.seekTime(2).value()[0] - (base[0] + 300)) < 1e-3 && Math.abs(pos.seekTime(4).value()[0] - base[0]) < 1e-3, "★ 位置 mirror：2s 到最右、4s 折返回起点");
+    check(al.seekTime(0).value() === 0 && al.seekTime(5).value() === 1 && !al.playing, "★ 不透明度 single：0 → 1 淡入后停住");
+    const { packed } = saveMod.packProject(files);
+    const inPkg = JSON.parse(new TextDecoder().decode(pkgC.getEntry(pkgC.parsePkg(packed.pkg), "scene.json")));
+    check(json(inPkg.objects.find((x) => x.id === id).origin) === json(o.origin), "打成 scene.pkg 后动画原样在包里");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
@@ -1945,6 +2063,16 @@ section("I. 接线");
   const sndKeys = [...main.matchAll(/et\(\s*"((?:snd)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addSound", "log.soundAdded", "log.soundEdited", "log.soundMissing", "log.soundFailed", "insp.sound"], sndMod.PLAYBACK_MODES.map((m) => `snd.mode.${m}`));
   const missingSnd = [...new Set(sndKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingSnd.length === 0, `声音层文案中英文都有（缺 ${json(missingSnd)}）`);
+  check(/from "\.\/keyframes"/.test(main) && /const split = splitAnimated\(node\.obj, patch\);[\s\S]{0,200}pendingKeys\.set\([\s\S]{0,80}writeObjProps\(node\.obj, plain\);[\s\S]{0,120}mergeLiveEdit\(liveEdits, id, plain\);/.test(main), "热改：落在动画字段上的改动不写静态值、不进重放账，记为待落关键帧");
+  check(/function commit\(cmd: PropsCmd\) \{\s*const keyed = pendingKeys\.get\(String\(cmd\.id\)\);[\s\S]{0,200}keyEdit\(node, keyed\);/.test(main) && /setKey\(o, f, frameAt\(v, t\), keyed\[f\]!\)/.test(main), "提交（检视器 change / 拖拽松手）时，动画字段的改动变成当前帧的关键帧（objEdit，可撤销）");
+  check(/if \(canAnimate\(node\)\) inspectorEl\.appendChild\(animGroup\(node\)\);/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
+  check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
+  check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
+  check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
+  check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
+  const animKeys = [...main.matchAll(/et\(\s*"((?:anim|insp\.anim|log\.anim|log\.key)[\w.]*)"/g)].map((m) => m[1]).concat(kfMod.ANIM_MODES.map((m) => `anim.mode.${m}`));
+  const missingAnim = [...new Set(animKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(animKeys.length > 15 && missingAnim.length === 0, `关键帧文案中英文都有（缺 ${json(missingAnim)}）`);
   const ptSrc = fs.readFileSync(path.join(ROOT, "editor/particles.ts"), "utf8");
   check(!/local-assets|\.tex"/.test(ptSrc) && /export const PARTICLE_TEXTURE = "particle\/halo";/.test(ptSrc), "粒子模板只引用内置贴图名，不碰 local-assets / 官方素材文件");
   const typesTs = fs.readFileSync(path.join(ROOT, "renderer/src/types.ts"), "utf8");
@@ -2160,6 +2288,28 @@ section("J. 变异红测");
   const sd3 = docMod.makeDoc("s", { type: "scene" }, { objects: [{ id: 1, sound: ["sounds/a.mp3", "sounds/b.ogg"] }] }, "loose");
   check(sm3.referencedSounds(sd3).size !== 2, "只认第一首时「每一首都算引用」判据变红（多首列表的其余音频会从保存清单丢掉）");
 
+  const kfPath = path.join(ROOT, "editor/keyframes.ts");
+  const kfSrc = fs.readFileSync(kfPath, "utf8");
+  const kfMut = async (from, to, tag) => {
+    const mut = kfSrc.replace(from, to);
+    check(mut !== kfSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("keyframes", { [kfPath]: mut });
+  };
+  const km1 = await kfMut("c.splice(ins < 0 ? c.length : ins, 0, makeKey(frame, v, smooth));", "c.push(makeKey(frame, v, smooth));", "关键帧有序插入");
+  const ko1 = { origin: "0 0 0" };
+  km1.enableAnim(ko1, "origin", [0, 0, 0]);
+  km1.setKey(ko1, "origin", 40, [1, 0, 0]);
+  km1.setKey(ko1, "origin", 20, [2, 0, 0]);
+  check(json(ko1.origin.animation.c0.map((k) => k.frame)) !== json([0, 20, 40]), "追加到末尾时「关键帧按帧号有序」判据变红（引擎二分会采错段）");
+  const km2 = await kfMut("    delete plain[f];\n", "", "动画字段从静态改动里拎出");
+  const ko2 = { origin: "0 0 0" };
+  km2.enableAnim(ko2, "origin", [0, 0, 0]);
+  check("origin" in km2.splitAnimated(ko2, { origin: [1, 2, 3] }).plain, "不拎出时「动画字段改动不写静态值」判据变红");
+  const km3 = await kfMut("const v = r5(abs[i] - (base ? base[i] ?? 0 : 0));", "const v = r5(abs[i]);", "relative 减基准");
+  const ko3 = { origin: { value: "100 0 0", animation: { relative: true, c0: [{ frame: 0, value: 0 }], c1: [{ frame: 0, value: 0 }], c2: [{ frame: 0, value: 0 }], options: { fps: 30, length: 60, mode: "loop" } } } };
+  km3.setKey(ko3, "origin", 30, [130, 0, 0]);
+  check(ko3.origin.animation.c0[1].value !== 30, "不减基准时「relative 写值 − 基准」判据变红（画面会多偏一个基准）");
+
   let mutSeq = 0;
   const vendorMut = async (rel, from, to, tag) => {
     const abs = path.join(ROOT, rel);
@@ -2175,6 +2325,15 @@ section("J. 变异红测");
       fs.rmSync(file, { force: true });
     }
   };
+  const am1 = await vendorMut("renderer/vendor/we-scene/render/animation.js", "if (anim.parent || !autoPlay) return anim", "if (anim.parent) return anim", "seekTime 跳过 startpaused");
+  const amc = am1.createAnimation({ c0: [{ frame: 0, value: 0 }], options: { fps: 30, length: 30, mode: "loop", startpaused: true } });
+  amc.seekTime(0.5);
+  check(amc.frame !== 0, "seek 也定位 startpaused 动画时「等脚本 play 的不动」判据变红");
+  const am2 = await vendorMut("renderer/vendor/we-scene/render/animation.js", "anim._playing = !done", "if (done) anim._playing = false", "single 往回拖恢复播放");
+  const ams = am2.createAnimation({ c0: [{ frame: 0, value: 0 }], options: { fps: 30, length: 30, mode: "single" } });
+  ams.seekTime(5);
+  ams.seekTime(0.5);
+  check(!(ams.frame === 15 && ams.playing), "不恢复 playing 时「single 往回拖又能播」判据变红");
   const twm = await vendorMut("renderer/vendor/we-scene/pkg/tex-write.js", "out[op++] = off & 255\n    out[op++] = off >> 8", "out[op++] = (off + 1) & 255\n    out[op++] = (off + 1) >> 8", "LZ4 匹配偏移");
   const lz = new Uint8Array(4096).map((_, i) => i % 50);
   check(!same(texR.lz4Decompress(twm.lz4CompressBlock(lz), lz.length), lz), "匹配偏移写错时「LZ4 往返一致」判据变红");

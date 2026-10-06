@@ -6134,6 +6134,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 30s 就差 164 帧≈5.5s，头发相对头顶最大错位 40px、发饰 79px，看起来就是
       // 「头发和头不同步、漏模」）。
       let lastAnimT = 0;
+      // [we-scene patch] 编辑器 seek 后的下一帧：字段 / 粒子 override 关键帧按绝对时间
+      // 定位（ctrl.seekTime），而不是按 dt 增量推进（往回拖 dt=0 会停在原处）。
+      let animSeekPending = false;
       // [we-scene patch 3448845950] 单帧 dt 上限（秒）。见 animDt 处注释：
       // 作者的 `mix(cur, target, speed * frametime)` 在 dt 过大时会越过目标来回荡。
       // 0.05 = 20fps，与粒子时钟的 50ms 封顶同口径。
@@ -6417,8 +6420,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               }
             }
           };
+          const seekAnims = animSeekPending;
+          animSeekPending = false;
           for (const run of animRuns) {
-            run.ctrl.advance(clockDt);
+            if (seekAnims) run.ctrl.seekTime(t);
+            else run.ctrl.advance(clockDt);
             const field = run.field;
             const slot = run.slot || field;
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
@@ -6465,7 +6471,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // 写回该层全部粒子系统的倍率（轻量 setter，不动 pool）。
           // 必须在 render 之前：ps.advance/render 当帧就要读到新 opacityMul。
           for (const run of overrideAnimRuns) {
-            run.ctrl.advance(clockDt);
+            if (seekAnims) run.ctrl.seekTime(t);
+            else run.ctrl.advance(clockDt);
             const out = run.ctrl.applyTo(run.ctrl.baseNumeric);
             if (typeof out !== "number" || !Number.isFinite(out)) continue;
             const list = particleSystemsByLayer.get(run.layer.id);
@@ -7299,6 +7306,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       const seekImpl = (t: number): Promise<void> => {
         if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
         rebaseClock(t, performance.now());
+        animSeekPending = true;
         return renderOnce();
       };
       editorImpl = {

@@ -263,7 +263,10 @@
               <svg class="i" viewBox="0 0 16 16"><path d="M6 3.5L10.5 8 6 12.5" /></svg>
             </button>
             <span id="tl-time">0.00s</span>
-            <input id="tl-range" type="range" min="0" max="30" step="0.01" value="0" disabled />
+            <div id="tl-track">
+              <input id="tl-range" type="range" min="0" max="30" step="0.01" value="0" disabled />
+              <div id="tl-keys" aria-hidden="true"></div>
+            </div>
             <span id="tl-max">30s</span>
             <label class="wb-labeled"><span data-et="tl.speed">倍速</span>
               <select id="tl-speed" disabled>

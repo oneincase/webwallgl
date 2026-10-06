@@ -431,6 +431,28 @@ export function createAnimation(def) {
       collectCrossedEvents(anim, prev, anim.frame)
       anim._prevFrame = anim.frame
     },
+    /**
+     * [we-scene patch] 编辑器时间轴 seek：把**自动播放**的独立动画定位到场景时间 t
+     * 对应的帧（= t·fps·rate）。增量 advance 在往回拖时 dt=0，动画停在原处不倒退；
+     * 编辑器打关键帧后重挂、seek 回原时刻，也要看到该时刻的值。
+     * startpaused（等脚本 play）与 linked child（播放头属于 leader）不动；
+     * 同 setFrame，不触发帧事件。single 越过 length 时停在末帧、不回调 ended。
+     */
+    seekTime(t) {
+      if (anim.parent || !autoPlay) return anim
+      const n = Number(t)
+      if (!Number.isFinite(n)) return anim
+      let f = Math.max(0, n) * fps * anim._rate
+      if (mode === 'single') {
+        const done = f >= length
+        if (done) f = length
+        anim._playing = !done
+        anim._ended = done
+      }
+      anim.frame = f
+      anim._prevFrame = f
+      return anim
+    },
     /** 取出并清空本帧越过的事件（宿主统一做图层级广播；setFrame 不产生事件） */
     takeEvents() {
       if (!anim._eventQueue.length) return []
@@ -526,7 +548,7 @@ export function createNeutralAnimation() {
     setFrame() { return a }, getFrame() { return 0 }, setRate() { return a },
     addEndedCallback() { return a }, isPlaying() { return false },
     setBlend() { return a }, setVisible() { return a },
-    advance() {}, takeEvents() { return [] }, value() { return 0 }, applyTo(base) { return base },
+    advance() {}, seekTime() { return a }, takeEvents() { return [] }, value() { return 0 }, applyTo(base) { return base },
   }
   return a
 }

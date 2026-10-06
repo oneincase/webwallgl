@@ -429,9 +429,34 @@ html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
   text-align: right;
 }
 
+#tl-track {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 80px;
+  align-self: stretch;
+}
+
 #tl-range {
   flex: 1;
-  min-width: 80px;
+  min-width: 0;
+}
+
+/* 关键帧标记：滑块两端各留半个滑块宽，标记与滑块中心对齐 */
+#tl-keys {
+  position: absolute;
+  inset: 0 7px;
+  pointer-events: none;
+}
+
+.tl-key {
+  position: absolute;
+  top: 4px;
+  width: 7px;
+  height: 7px;
+  background: var(--wb-accent);
+  transform: translateX(-50%) rotate(45deg);
 }
 
 #tl-max {
@@ -716,6 +741,55 @@ fieldset.ed-form:disabled {
   padding: 3px 4px;
   resize: vertical;
   line-height: 1.45;
+}
+
+.ed-anim-head .ed-btn {
+  height: 20px;
+  padding: 0 6px;
+}
+
+.ed-anim-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.ed-anim-key {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-bg-3);
+  font: 10px var(--mono);
+}
+
+.ed-anim-key.is-current {
+  border-color: var(--wb-accent);
+  color: var(--wb-accent);
+}
+
+.ed-anim-key button {
+  padding: 1px 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ed-anim-key button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.ed-anim-opts input[type="number"] {
+  width: 52px;
+}
+
+.ed-anim-smooth {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
 .ed-snd-file {

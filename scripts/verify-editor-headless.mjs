@@ -508,7 +508,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/reopened.jpg`);
 
-  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, errorLines }, objects, session });
+  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, errorLines }, objects, session });
 
   await session.close();
   await server.close();
@@ -548,7 +548,7 @@ export function stripePng(w, h, top, bottom) {
  * 不读编辑器页任何内部状态。
  */
 async function runCreateAndDraft(ctx) {
-  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, key, clickSel, MOD, helpers: h, objects } = ctx;
+  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: h, objects } = ctx;
   const RED = [220, 30, 30];
   const BLUE = [30, 30, 220];
   const BG = "#336699";
@@ -1548,4 +1548,106 @@ async function runCreateAndDraft(ctx) {
     return { res, playing: window.__sceneLayers.find((x) => x.soundCtl).soundCtl.isPlaying(), rs: el?.readyState, dur: el?.duration, loop: el?.loop };
   })()`);
   check(auAA.res === "ok" && auAA.playing && auAA.rs >= 2 && Math.abs(auAA.dur - 0.8) < 0.05 && auAA.loop, `★ 脚本侧 play() 后真的在播：解码出 ${auAA.dur?.toFixed(2)}s（bird.wav），循环 ${auAA.loop}，结果 ${auAA.res}`);
+
+  section("AB. 关键帧动画端到端（文字层 → 开位置动画 → 2s 处改 x 自动落关键帧 → 跳关键帧 → 1s 处拖拽 → 撤销 → 删帧 / 模式 / 时长 / 插值 → 存库 → 测试台在动）");
+  const animOn = (f, on) =>
+    fxAct(`const el = document.querySelector('.ed-anim [data-anim-on="${f}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const animSet = (attr, f, value) =>
+    fxAct(`const el = document.querySelector('.ed-anim [data-anim-${attr}="${f}"]'); ${typeof value === "boolean" ? `el.checked = ${value}` : `el.value = ${JSON.stringify(value)}`}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const seekTo = async (t) => {
+    await ev(`(() => { const r = document.querySelector('#tl-range'); r.value = '${t}'; r.dispatchEvent(new Event('input', { bubbles: true })); r.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await settle();
+  };
+  const json = JSON.stringify;
+  const keysOf = (o, c = 0) => o.origin.animation[`c${c}`].map((k) => [k.frame, Math.round(k.value * 100) / 100]);
+
+  await gotoEditor();
+  await newBlank("#000000");
+  await addTextPreset("plain");
+  await setText("content", "MMM");
+  await setText("size", "60");
+  let ao = await rawObj();
+  const abW = sizeOf(ao)[0] / 2;
+  const origin0 = ao.origin;
+  check(await ev(`document.querySelectorAll('.ed-anim [data-anim-on]').length === 4 && [...document.querySelectorAll('.ed-anim [data-anim-on]')].every((c) => !c.checked)`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度四个开关，缺省全关");
+  if (!(await ev(`document.querySelector('#tb-play .ic-play').hidden === false`))) await clickSel("#tb-play");
+  await seekTo(0);
+
+  await animOn("origin", true);
+  ao = await rawObj();
+  check(ao.origin.value === origin0 && json(keysOf(ao)) === json([[0, 960]]) && ao.origin.animation.options.mode === "loop", `开位置动画：第 0 帧关键帧 = 当前值，静态值保留（${json(keysOf(ao))}）`);
+  check(await ev(`!!document.querySelector('.ed-anim [data-anim-key="origin"]') && document.querySelectorAll('.ed-anim-keys[data-field="origin"] .ed-anim-key').length === 1`), "出现「◆ 关键帧」按钮与关键帧列表");
+
+  await seekTo(2);
+  let ra = await h.readyCount();
+  await h.setInputs({ 0: 1260 });
+  await h.waitRemount(ra);
+  ao = await rawObj();
+  check(json(keysOf(ao)) === json([[0, 960], [60, 1260]]) && ao.origin.value === origin0, `★ 2s 处改 x = 1260：自动落第 60 帧关键帧，静态值不动（${json(keysOf(ao))}）`);
+  check(Math.abs((await h.numInputs())[0] - 1260) < 0.5 && (await ev(`document.querySelector('#tl-time').textContent`)) === "2.00s", "重挂后仍停在 2s，检视器显示该时刻的值");
+  check((await ev(`document.querySelectorAll('#tl-keys .tl-key').length`)) === 2, "时间轴上两枚关键帧标记");
+  const crA = await h.canvasRect();
+  let inkR = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
+  let inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
+  check(inkR.frac > 0.1 && inkL.frac < 0.02, `画面：2s 时文字在 x=1260（右框墨水 ${inkR.frac.toFixed(3)}，原位左半 ${inkL.frac.toFixed(3)}）`);
+
+  await clickSel('.ed-anim-keys[data-field="origin"] button[data-frame="0"]');
+  await settle();
+  inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
+  check(Math.abs((await h.numInputs())[0] - 960) < 0.5 && inkL.frac > 0.1, `点关键帧「0.00s」：跳回 0s，文字回到 x=960（墨水 ${inkL.frac.toFixed(3)}）`);
+
+  await seekTo(1);
+  const mid = await h.numInputs();
+  check(Math.abs(mid[0] - 1110) < 1, `★ 往回 / 往前拖时间轴都按绝对时间定位：1s 时 x = ${mid[0]}（平滑插值的段中点 1110）`);
+  ra = await h.readyCount();
+  const from = worldToPage(crA, [1110, 540]);
+  await drag(from, [from[0], from[1] - 60]);
+  await h.waitRemount(ra);
+  ao = await rawObj();
+  const y30 = ao.origin.animation.c1.find((k) => k.frame === 30)?.value;
+  check(json(keysOf(ao).map((k) => k[0])) === json([0, 30, 60]) && y30 > 560 && Math.abs(ao.origin.animation.c0[1].value - 1110) < 1, `★ 1s 处拖拽：落第 30 帧关键帧（x ${ao.origin.animation.c0[1].value}，y ${y30}）`);
+  ra = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(ra);
+  check((await rawObj()).origin.animation.c0.length === 2, "撤销：第 30 帧关键帧撤回");
+  ra = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(ra);
+  check((await rawObj()).origin.animation.c0.length === 3, "重做：回来");
+  await fxAct(`document.querySelector('.ed-anim-keys[data-field="origin"] [data-key-del="30"]').click()`);
+  check(json(keysOf(await rawObj()).map((k) => k[0])) === json([0, 60]), "× 删掉第 30 帧");
+
+  await animSet("mode", "origin", "mirror");
+  await animSet("length", "origin", "4");
+  await animSet("smooth", "origin", false);
+  ao = await rawObj();
+  check(ao.origin.animation.options.mode === "mirror" && ao.origin.animation.options.length === 120 && ao.origin.animation.c0.every((k) => !k.front.enabled && !k.back.enabled), `模式往返 / 时长 4s（120 帧）/ 线性：${json(ao.origin.animation.options)}`);
+  const lenBefore = (await h.readyCount());
+  await ev(`(() => { const el = document.querySelector('.ed-anim [data-anim-length="origin"]'); el.value = '1'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await settle();
+  check((await h.readyCount()) === lenBefore && (await ev(`document.querySelector('.ed-anim [data-anim-length="origin"]').value`)) === "4" && (await rawObj()).origin.animation.options.length === 120, "时长短于最后关键帧（2s）：拒绝并复原输入框");
+  const errsAB = (await h.errorLines()).filter((l) => !/时长不能短于|shorter than the last/.test(l));
+  check(errsAB.length === 0, `关键帧编辑全程无错误${errsAB.length ? `：${errsAB.slice(0, 2).join(" / ")}` : ""}`);
+
+  const libBeforeAB = new Set(fs.readdirSync(lib));
+  const scAB = await h.savedCount();
+  await clickSel("#tb-save");
+  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
+  await clickSel("#save-lib");
+  await h.waitSaved(scAB);
+  const savedAB = fs.readdirSync(lib).filter((n) => !libBeforeAB.has(n));
+  check(savedAB.length === 1, `另存到壁纸库：新条目 ${savedAB[0]}`);
+  const oAB = JSON.parse(fs.readFileSync(path.join(lib, savedAB[0], "scene.json"), "utf8")).objects[0];
+  check(json(oAB.origin.animation.options) === json({ fps: 30, length: 120, mode: "mirror", wraploop: false }) && json(keysOf(oAB)) === json([[0, 960], [60, 1260]]), "盘上 scene.json：WE 原生动画格式、关键帧齐全");
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedAB[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.some((l) => l.animationsByField?.origin)`, 90000);
+  const xs = [];
+  for (let i = 0; i < 4; i++) {
+    xs.push(await ev(`window.__sceneLayers.find((l) => l.animationsByField?.origin).localOrigin[0]`));
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  check(new Set(xs.map((x) => Math.round(x))).size >= 3 && xs.every((x) => x >= 959 && x <= 1261), `★ 测试台：文字沿关键帧来回移动（x 采样 ${xs.map((x) => x.toFixed(0)).join(" → ")}）`);
 }

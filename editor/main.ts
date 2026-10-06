@@ -108,6 +108,24 @@ import {
   type SoundFields,
 } from "./sound";
 import {
+  ANIM_FIELDS,
+  ANIM_MODES,
+  baseValue,
+  disableAnim,
+  enableAnim,
+  frameAt,
+  getAnim,
+  isAnimated,
+  keyTimes,
+  removeKey,
+  setAnimOption,
+  setKey,
+  setSmooth,
+  splitAnimated,
+  type AnimField,
+  type AnimMode,
+} from "./keyframes";
+import {
   PROP_TYPES,
   bindProp,
   bindableFor,
@@ -221,6 +239,7 @@ const tlNextEl = $<HTMLButtonElement>("#tl-next");
 const tlTimeEl = $<HTMLElement>("#tl-time");
 const tlRangeEl = $<HTMLInputElement>("#tl-range");
 const tlMaxEl = $<HTMLElement>("#tl-max");
+const tlKeysEl = $<HTMLElement>("#tl-keys");
 const tlSpeedEl = $<HTMLSelectElement>("#tl-speed");
 const undoEl = $<HTMLButtonElement>("#tb-undo");
 const redoEl = $<HTMLButtonElement>("#tb-redo");
@@ -352,6 +371,7 @@ async function mountCurrent(keepTime = false) {
   if (!current) return;
   const gen = ++openGen;
   const resumeAt = keepTime ? editor?.time ?? 0 : 0;
+  const stayPaused = keepTime && !!instance?.paused;
   destroyInstance();
   syncPlayButton();
   try {
@@ -376,6 +396,7 @@ async function mountCurrent(keepTime = false) {
     if (editor) {
       editor.setTimeScale(Number(tlSpeedEl.value));
       await replayLiveEdits();
+      if (stayPaused) inst.pause();
       if (resumeAt > 0) await editor.seek(resumeAt).catch(() => {});
     } else {
       log(et("log.noEditor"), "warn");
@@ -513,6 +534,22 @@ function setTimelineMax(max: number) {
   tlMax = max;
   tlRangeEl.max = String(max);
   tlMaxEl.textContent = `${max}s`;
+  renderKeyMarks();
+}
+
+/** 时间轴上画选中层的关键帧（首个周期内的时刻） */
+function renderKeyMarks() {
+  tlKeysEl.textContent = "";
+  const n = selectedNode();
+  if (!n) return;
+  for (const t of keyTimes(n.obj)) {
+    if (t > tlMax) continue;
+    const m = document.createElement("i");
+    m.className = "tl-key";
+    m.dataset.t = String(t);
+    m.style.left = `${(t / tlMax) * 100}%`;
+    tlKeysEl.appendChild(m);
+  }
 }
 
 function resetTimelineRange() {
@@ -548,9 +585,20 @@ function pauseForStepping() {
 
 const seekLogged = (p: Promise<void>) => p.catch((e) => log(String((e as Error)?.message ?? e), "warn"));
 
+/** 停在某时刻后，动画层的检视器（数值框 / 当前帧 / 关键帧高亮）要跟着刷新 */
+function afterSeek(p: Promise<void>) {
+  void seekLogged(p).then(() => {
+    const n = selectedNode();
+    if (n && ANIM_FIELDS.some((f) => isAnimated(n.obj, f))) renderInspector();
+  });
+}
+
 tlRangeEl.addEventListener("pointerdown", () => (scrubbing = true));
 tlRangeEl.addEventListener("pointerup", () => (scrubbing = false));
-tlRangeEl.addEventListener("change", () => (scrubbing = false));
+tlRangeEl.addEventListener("change", () => {
+  scrubbing = false;
+  if (editor) afterSeek(editor.seek(Number(tlRangeEl.value)));
+});
 tlRangeEl.addEventListener("input", () => {
   if (!editor) return;
   const t = Number(tlRangeEl.value);
@@ -558,17 +606,17 @@ tlRangeEl.addEventListener("input", () => {
   void seekLogged(editor.seek(t));
 });
 tlStartEl.onclick = () => {
-  if (editor) void seekLogged(editor.seek(0));
+  if (editor) afterSeek(editor.seek(0));
 };
 tlPrevEl.onclick = () => {
   if (!editor) return;
   pauseForStepping();
-  void seekLogged(editor.seek(Math.max(0, editor.time - FRAME)));
+  afterSeek(editor.seek(Math.max(0, editor.time - FRAME)));
 };
 tlNextEl.onclick = () => {
   if (!editor) return;
   pauseForStepping();
-  void seekLogged(editor.step(1, 60));
+  afterSeek(editor.step(1, 60));
 };
 tlSpeedEl.onchange = () => editor?.setTimeScale(Number(tlSpeedEl.value));
 
@@ -759,6 +807,11 @@ function selectLayer(id: number | string | null) {
 // ---------- 编辑：热改 + 写回文档 + 撤销重做（W2-lite） ----------
 
 const edits = new EditHistory();
+/**
+ * 落在已开动画字段上的改动（检视器输入 / 视口拖拽的中间态）。引擎每帧按曲线重写这些字段，
+ * 改动只能在提交时变成「当前帧的关键帧」，不能直接写静态值。
+ */
+const pendingKeys = new Map<string, Partial<Record<AnimField, number[]>>>();
 /** 本文档累计的热改（按层合并）：重挂后原样重放，保证「重挂 ≡ 热改」 */
 const liveEdits = new Map<string, Patch>();
 let dirty = false;
@@ -766,6 +819,7 @@ let dirty = false;
 function resetHistory() {
   edits.clear();
   liveEdits.clear();
+  pendingKeys.clear();
   dirty = false;
   syncHistoryButtons();
 }
@@ -788,11 +842,15 @@ function nodeName(id: number | string): string {
 /** 写引擎 + 写文档 + 记账，不进撤销栈（拖拽/滑条的中间态也走这里） */
 function applyPatch(id: number | string, patch: Patch): Promise<void> {
   const node = doc ? findNode(doc.roots, id) : null;
+  let plain = patch;
   if (node) {
-    writeObjProps(node.obj, patch);
+    const split = splitAnimated(node.obj, patch);
+    plain = split.plain;
+    if (Object.keys(split.keyed).length) pendingKeys.set(String(id), { ...pendingKeys.get(String(id)), ...split.keyed });
+    writeObjProps(node.obj, plain);
     if (patch.visible !== undefined) node.visible = patch.visible;
   }
-  mergeLiveEdit(liveEdits, id, patch);
+  mergeLiveEdit(liveEdits, id, plain);
   markDirty();
   return editor ? editor.setLayerProps(Number(id), patch).catch((e) => log(String(e?.message ?? e), "warn")) : Promise.resolve();
 }
@@ -805,6 +863,15 @@ function markDirty() {
 }
 
 function commit(cmd: PropsCmd) {
+  const keyed = pendingKeys.get(String(cmd.id));
+  pendingKeys.delete(String(cmd.id));
+  const node = doc ? findNode(doc.roots, cmd.id) : null;
+  if (keyed && node) {
+    keyEdit(node, keyed);
+    const plainKeys = Object.keys(splitAnimated(node.obj, cmd.after).plain) as Array<keyof EditorLayerProps>;
+    cmd = { ...cmd, before: pickProps(cmd.before as EditorLayerProps, plainKeys), after: pickProps(cmd.after as EditorLayerProps, plainKeys) };
+    if (!plainKeys.length) return;
+  }
   if (isNoopEdit(cmd)) return;
   edits.push(cmd);
   syncHistoryButtons();
@@ -902,6 +969,7 @@ function undoRedo(dir: "undo" | "redo") {
     return;
   }
   void applyPatch(cmd.id, dir === "undo" ? cmd.before : cmd.after);
+  pendingKeys.delete(String(cmd.id));
   renderTree();
   renderInspector();
   log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.name }));
@@ -1882,6 +1950,13 @@ function objEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"
   });
 }
 
+/** 同 objEdit，返回是否改成（校验不过时调用方要把控件复原） */
+function objEditOk(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean): boolean {
+  let ok = false;
+  objEdit(label, id, (o) => (ok = mutate(o)));
+  return ok;
+}
+
 function addEffectTo(n: LayerNode, fxId: string) {
   const d = effectById(fxId);
   if (!d || !overlay) return;
@@ -2491,6 +2566,182 @@ function soundGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 关键帧动画：字段开 / 关动画、当前帧打关键帧、改动自动落关键帧、时长 / 模式 / 插值 ----------
+
+const canAnimate = (n: LayerNode) => n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model";
+const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha" };
+
+/** 画面上的当前值（动画字段 = 曲线在当前时刻的值）；没有引擎时退回静态值 */
+function liveValue(node: LayerNode, f: AnimField): number[] {
+  const p = editor?.getLayerProps(Number(node.id));
+  if (!p) return baseValue(node.obj, f);
+  return f === "alpha" ? [p.alpha] : [...p[f]];
+}
+
+const nowTime = () => editor?.time ?? 0;
+
+/** 把改动写成各字段当前帧的关键帧（一次可撤销的结构编辑） */
+function keyEdit(node: LayerNode, keyed: Partial<Record<AnimField, number[]>>) {
+  const t = nowTime();
+  const fields = Object.keys(keyed) as AnimField[];
+  const v0 = getAnim(node.obj, fields[0]);
+  const frame = v0 ? frameAt(v0, t) : 0;
+  objEdit(
+    et("log.keySet", { layer: nodeName(node.id), fields: fields.map((f) => et(ANIM_LABEL[f])).join(" / "), frame }),
+    node.id,
+    (o) => {
+      let changed = false;
+      for (const f of fields) {
+        const v = getAnim(o, f);
+        if (v && setKey(o, f, frameAt(v, t), keyed[f]!)) changed = true;
+      }
+      return changed;
+    },
+  );
+}
+
+/** 跳到关键帧：暂停后 seek，再刷新检视器（数值框要显示该时刻的值） */
+async function seekToKey(t: number) {
+  if (!editor) return;
+  pauseForStepping();
+  await seekLogged(editor.seek(t));
+  renderInspector();
+}
+
+function animGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-anim";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.anim");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!current?.assets && !isLocked(node.id) && !!editor;
+  const t = nowTime();
+  const layer = nodeName(node.id);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  for (const f of ANIM_FIELDS) {
+    const view = getAnim(node.obj, f);
+    const l = document.createElement("label");
+    l.textContent = et(ANIM_LABEL[f]);
+    const head = document.createElement("div");
+    head.className = "ed-fx-param ed-anim-head";
+    head.dataset.field = f;
+    const on = document.createElement("input");
+    on.type = "checkbox";
+    on.checked = !!view;
+    on.disabled = !editable;
+    on.dataset.animOn = f;
+    on.title = et("anim.on");
+    on.addEventListener("change", () =>
+      objEdit(et(on.checked ? "log.animOn" : "log.animOff", { layer, field: et(ANIM_LABEL[f]) }), node.id, (o) =>
+        on.checked ? enableAnim(o, f, liveValue(node, f)) : disableAnim(o, f, liveValue(node, f)),
+      ),
+    );
+    head.appendChild(on);
+    form.append(l, head);
+    if (!view) continue;
+    const cur = frameAt(view, t);
+    const key = document.createElement("button");
+    key.type = "button";
+    key.className = "ed-btn";
+    key.dataset.animKey = f;
+    key.textContent = et("anim.key");
+    key.title = et("anim.keyTitle", { frame: cur });
+    key.disabled = !editable;
+    key.onclick = () => keyEdit(node, { [f]: liveValue(node, f) });
+    const at = document.createElement("span");
+    at.className = "ed-val";
+    at.textContent = et("anim.at", { frame: cur, len: view.length });
+    head.append(key, at);
+
+    const keysBox = document.createElement("div");
+    keysBox.className = "ed-anim-keys";
+    keysBox.dataset.field = f;
+    for (const k of view.keys) {
+      const chip = document.createElement("span");
+      chip.className = "ed-anim-key";
+      if (k.frame === cur) chip.classList.add("is-current");
+      const go = document.createElement("button");
+      go.type = "button";
+      go.dataset.frame = String(k.frame);
+      go.textContent = `${(k.frame / view.fps).toFixed(2)}s`;
+      go.title = `#${k.frame} · ${k.value.map((v) => (Number.isFinite(v) ? fmtNum(f === "angles" ? v / RAD : v) : "—")).join(" ")}`;
+      go.onclick = () => void seekToKey(k.frame / view.fps);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "ed-anim-del";
+      del.dataset.keyDel = String(k.frame);
+      del.textContent = "×";
+      del.title = et("anim.del");
+      del.disabled = !editable || view.keys.length < 2;
+      del.onclick = () =>
+        objEdit(et("log.keyDel", { layer, field: et(ANIM_LABEL[f]), frame: k.frame }), node.id, (o) => removeKey(o, f, k.frame));
+      chip.append(go, del);
+      keysBox.appendChild(chip);
+    }
+    const kl = document.createElement("label");
+    kl.textContent = et("anim.keys");
+    form.append(kl, keysBox);
+
+    const optBox = document.createElement("div");
+    optBox.className = "ed-fx-param ed-anim-opts";
+    const mode = document.createElement("select");
+    mode.dataset.animMode = f;
+    for (const m of ANIM_MODES) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = et(`anim.mode.${m}`);
+      mode.appendChild(opt);
+    }
+    mode.value = view.mode;
+    mode.disabled = !editable;
+    mode.addEventListener("change", () =>
+      objEdit(et("log.animEdited", { layer, field: et(ANIM_LABEL[f]) }), node.id, (o) => setAnimOption(o, f, "mode", mode.value as AnimMode)),
+    );
+    const len = document.createElement("input");
+    len.type = "number";
+    len.min = "0.1";
+    len.step = "0.1";
+    len.value = fmtNum(view.length / view.fps);
+    len.title = et("anim.length");
+    len.disabled = !editable;
+    len.dataset.animLength = f;
+    len.addEventListener("change", () => {
+      const frames = Math.round(Number(len.value) * view.fps);
+      if (frames === view.length) return;
+      if (!objEditOk(et("log.animEdited", { layer, field: et(ANIM_LABEL[f]) }), node.id, (o) => setAnimOption(o, f, "length", frames))) {
+        len.value = fmtNum(view.length / view.fps);
+        log(et("log.animLengthBad", { min: fmtNum((view.keys.at(-1)?.frame ?? 0) / view.fps) }), "warn");
+      }
+    });
+    const sec = document.createElement("span");
+    sec.className = "ed-val";
+    sec.textContent = "s";
+    const smoothLabel = document.createElement("label");
+    smoothLabel.className = "ed-anim-smooth";
+    const smooth = document.createElement("input");
+    smooth.type = "checkbox";
+    smooth.checked = view.smooth;
+    smooth.disabled = !editable;
+    smooth.dataset.animSmooth = f;
+    smooth.addEventListener("change", () =>
+      objEdit(et("log.animEdited", { layer, field: et(ANIM_LABEL[f]) }), node.id, (o) => setSmooth(o, f, smooth.checked)),
+    );
+    smoothLabel.append(smooth, document.createTextNode(et("anim.smooth")));
+    optBox.append(mode, len, sec, smoothLabel);
+    const ol = document.createElement("label");
+    ol.textContent = et("anim.play");
+    form.append(ol, optBox);
+    if (view.relative) {
+      form.append(document.createElement("span"), note(et("anim.relative")));
+    }
+  }
+  group.appendChild(form);
+  group.appendChild(note(et("anim.hint")));
+  return group;
+}
+
 // ---------- 脚本（W8）：语法预检 → 应用（结构编辑重挂）→ 运行期错误按挂点回显 ----------
 
 /** 未应用的脚本改动（检视器重绘时不丢），键 = 图层 id | 挂点；换文档即清空 */
@@ -2878,6 +3129,7 @@ function bindingsGroup(node: LayerNode): HTMLElement {
 
 function renderInspector() {
   inspectorEl.textContent = "";
+  renderKeyMarks();
   if (!doc) {
     inspectorEl.appendChild(note(et("insp.none")));
     return;
@@ -2904,6 +3156,7 @@ function renderInspector() {
     return;
   }
   inspectorEl.appendChild(editGroup(node));
+  if (canAnimate(node)) inspectorEl.appendChild(animGroup(node));
   if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
   if (node.kind === "particle") inspectorEl.appendChild(particleGroup(node));
   if (node.kind === "sound") inspectorEl.appendChild(soundGroup(node));
