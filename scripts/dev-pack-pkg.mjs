@@ -30,9 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-
-/** 与 parsePkg 对齐的容器魔数；WE 实测 PKGV0012 ~ PKGV0023，本仓解析器都吃 */
-const PKG_MAGIC = "PKGV0012";
+import { writePkg } from "../renderer/vendor/we-scene/pkg/container.js";
 
 /** 运行时不会读的文件（判据见文件头）。返回 true = 丢弃。 */
 export function defaultSkip(absPath, relPath) {
@@ -76,31 +74,19 @@ export function packSourceProject(srcDir, opts = {}) {
   })(srcDir, "");
 
   keep.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
-  const nameBuf = (f) => Buffer.from(f.rel, "utf8");
-
-  const entries = [];
-  const chunks = [];
-  let offset = 0;
-  for (const f of keep) {
-    const data = fs.readFileSync(f.abs);
-    entries.push({ nameBuf: nameBuf(f), offset, size: data.length });
-    chunks.push(data);
-    offset += data.length;
-  }
-
-  const u32 = (v) => {
-    const b = Buffer.alloc(4);
-    b.writeUInt32LE(v >>> 0, 0);
-    return b;
-  };
-  const parts = [u32(PKG_MAGIC.length), Buffer.from(PKG_MAGIC, "ascii"), u32(keep.length)];
-  for (const e of entries) parts.push(u32(e.nameBuf.length), e.nameBuf, u32(e.offset), u32(e.size));
-  parts.push(...chunks);
+  let bytes = 0;
+  const packed = writePkg(
+    keep.map((f) => {
+      const data = fs.readFileSync(f.abs);
+      bytes += data.length;
+      return { name: f.rel, data };
+    }),
+  );
   return {
-    buffer: Buffer.concat(parts),
+    buffer: Buffer.from(packed.buffer, packed.byteOffset, packed.byteLength),
     files: keep.map((f) => f.rel),
     dropped,
-    bytes: offset,
+    bytes,
   };
 }
 

@@ -751,6 +751,21 @@ fieldset.ed-form:disabled {
   color: var(--wb-on-accent);
 }
 
+.ed-menu-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 6px 10px 4px;
+  border-top: 1px solid var(--wb-line);
+  color: var(--wb-fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ed-menu-check > input {
+  margin: 0;
+}
 
 .ed-new-menu {
   min-width: 240px;

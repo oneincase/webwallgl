@@ -15,10 +15,14 @@ import type {
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
+  ScenePkgFile,
+  ScenePkgResult,
 } from "./types";
 
 export * from "./webwallgl";
 export type {
+  ScenePkgFile,
+  ScenePkgResult,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -42,3 +46,10 @@ export declare function editorOf(instance: SceneInstance): EditorControls | null
  * 给出出错行与可派发入口；noEntry 表示引擎会丢弃这段脚本。
  */
 export declare function checkSceneScript(script: string): SceneScriptCheck;
+
+/**
+ * 保存清单打成 WE 原生 scene.pkg（PKGV0012）。materials 下没有同名 .tex 的
+ * png/jpg 原字节包成 .tex（官方 WE 只认 .tex），源图不进包；其余文件原样入包。
+ * project.json / 封面应留在包外，由调用方剔除。
+ */
+export declare function buildScenePkg(files: readonly ScenePkgFile[]): ScenePkgResult;

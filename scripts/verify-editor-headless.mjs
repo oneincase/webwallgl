@@ -1143,4 +1143,63 @@ async function runCreateAndDraft(ctx) {
   await settle();
   const crW2 = await h.canvasRect();
   check(close(await pixelAt(worldToPage(crW2, [1110, 590])), BGV, 10) && !(await bannerOn()), "安全模式下新建的工程：用户自己写的脚本照常执行");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("X. 导出 WE 原生 scene.pkg（空白 → 图片层 + 效果 → 勾选原生格式存库 → 测试台 / 重新打开出帧一致）");
+  const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
+  const { parseTex, decodeMip0 } = await imp("renderer/vendor/we-scene/pkg/texture.js");
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  await newBlank("#000000");
+  await addImage(stripePath);
+  await fxAdd("tint");
+  await settle();
+  const crX = await h.canvasRect();
+  const xTop = await pixelAt(worldToPage(crX, [1110, 590]));
+  const xBot = await pixelAt(worldToPage(crX, [1110, 490]));
+  check(close(xTop, tintWant, 6), `编辑器：红色图层叠上缺省橙色 50%（期望 ${tintWant}，实得 ${xTop}）`);
+
+  const libBeforeX = new Set(fs.readdirSync(lib));
+  const scX = await h.savedCount();
+  await clickSel("#tb-save");
+  check(await ev(`!document.querySelector('#save-menu').hidden && document.querySelector('#save-pkg').checked === false`), "保存菜单有「WE 原生格式」勾选，缺省不勾（默认仍是松散工程）");
+  await clickSel("#save-pkg");
+  check(await ev(`document.querySelector('#save-pkg').checked && !document.querySelector('#save-menu').hidden`), "勾选后菜单不收起");
+  await clickSel("#save-lib");
+  await h.waitSaved(scX);
+  const savedX = fs.readdirSync(lib).filter((n) => !libBeforeX.has(n));
+  check(savedX.length === 1, `另存到壁纸库：新条目 ${savedX[0]}`);
+  const dirX = path.join(lib, savedX[0]);
+  const filesX = fs.readdirSync(dirX).filter((n) => !n.startsWith(".")).sort();
+  check(JSON.stringify(filesX) === JSON.stringify(["preview.jpg", "project.json", "scene.pkg"]), `盘上 = project.json + scene.pkg + 封面，无散装资源（${JSON.stringify(filesX)}）`);
+  const projX = JSON.parse(fs.readFileSync(path.join(dirX, "project.json"), "utf8"));
+  check(projX.file === "scene.json" && projX.type === "scene", "project.json：file 指包内 scene.json");
+  const pkX = parsePkg(new Uint8Array(fs.readFileSync(path.join(dirX, "scene.pkg"))));
+  const namesX = pkX.entries.map((e) => e.name);
+  check(namesX.includes("scene.json") && namesX.includes("materials/editor/stripe.tex") && !namesX.some((n) => /\.(png|jpe?g)$/i.test(n)) && namesX.includes("shaders/effects/wwgl_tint.frag"), `包内：入口 + .tex 贴图 + 效果四件，无源图（${namesX.length} 项）`);
+  const texX = decodeMip0(parseTex(getEntry(pkX, "materials/editor/stripe.tex")));
+  check(texX.png && Buffer.compare(Buffer.from(texX.png), fs.readFileSync(stripePath)) === 0 && texX.width === 400 && texX.height === 200, ".tex 内嵌的就是拖进来的 PNG 原字节（400×200，零重编码）");
+  check(/已打包 scene\.pkg|Packed scene\.pkg/.test(await ev(`document.querySelector('#ed-con-body').textContent`)), "控制台记一条打包摘要");
+  const errsX = await h.errorLines();
+  check(errsX.length === 0, `导出全程无错误${errsX.length ? `：${errsX.slice(0, 2).join(" / ")}` : ""}`);
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedX[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpX = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const benchX = { x: 0, y: 0, w: vpX.w, h: vpX.h };
+  const bTopX = await pixelAt(worldToPage(benchX, [1110, 590]));
+  const bBotX = await pixelAt(worldToPage(benchX, [1110, 490]));
+  check(close(bTopX, xTop, 12) && close(bBotX, xBot, 12), `★ 测试台按 scene.pkg 出帧，与编辑器一致（测试台 ${bTopX} / ${bBotX}，编辑器 ${xTop} / ${xBot}）`);
+  await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/pkg-in-bench.jpg") });
+  console.log(`  截图：scripts/.tmp-editor-e2e/pkg-in-bench.jpg`);
+
+  await gotoEditor(`?item=${savedX[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(firstFrame, 90000);
+  await settle();
+  check(close(await pixelAt(worldToPage(await h.canvasRect(), [1110, 590])), xTop, 12), "编辑器重新打开导出的包条目：画面一致");
 }

@@ -1,8 +1,11 @@
-// 保存链路（EDITOR-PLAN E2 W6-lite / §3A.4）：产物一律松散形态 ——
+// 保存链路（EDITOR-PLAN E2 W6-lite / §3A.4）：默认产物是松散形态 ——
 // project.json + 入口 scene.json（文档序列化）+ 资源原样散装 + 封面。
 // pkg 来源的条目按原名写成散装文件即可被松散读端加载：两种形态的装配只在
 // 「按名取资源」一处分叉，名字一一对应。
+// W6-full 的 WE 原生形态（packProject）：除 project.json / 封面外全部进 scene.pkg，
+// project.json 的 file 仍指入口 json —— 与创意工坊条目同形（读端先试散装入口、取不到回退 pkg）。
 
+import { buildScenePkg, type ScenePkgResult } from "../renderer/src/api/editor";
 import type { EditorDoc } from "./doc";
 import type { SceneAssets } from "./open";
 import { buildZip } from "./zip";
@@ -47,6 +50,18 @@ export async function collectProject(
   if (preview) out.push({ path: PREVIEW_NAME, data: new Uint8Array(await preview.arrayBuffer()) });
   out.push({ path: "project.json", data: enc.encode(JSON.stringify(projectJson(doc, assets.entry, !!preview), null, 2)) });
   return out;
+}
+
+export const SCENE_PKG_NAME = "scene.pkg";
+const OUTSIDE_PKG = new Set(["project.json", PREVIEW_NAME]);
+
+/** 松散清单 → WE 原生形态：project.json + 封面 + scene.pkg */
+export function packProject(files: SaveFile[]): { files: SaveFile[]; packed: ScenePkgResult } {
+  const packed = buildScenePkg(files.filter((f) => !OUTSIDE_PKG.has(f.path)));
+  return {
+    files: [...files.filter((f) => OUTSIDE_PKG.has(f.path)), { path: SCENE_PKG_NAME, data: packed.pkg }],
+    packed,
+  };
 }
 
 export const totalBytes = (files: SaveFile[]) => files.reduce((s, f) => s + f.data.length, 0);

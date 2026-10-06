@@ -53,6 +53,50 @@ export function getEntry(pkg, name) {
   return pkg.buf.subarray(start, end)
 }
 
+// [we-scene patch] parsePkg 的对偶：把 { name, data } 列表写成 PKGV0012 容器（纯 Uint8Array，
+// 浏览器与 Node 通用；scripts/dev-pack-pkg.mjs 与编辑器导出共用）。入口按名字字节序排序，
+// 同输入产出逐字节相同；重名抛错（WE 与本仓解析器都只认第一个，静默会丢数据）。
+export const PKG_WRITE_MAGIC = 'PKGV0012'
+export function writePkg(files) {
+  const enc = new TextEncoder()
+  const list = files
+    .map((f) => ({ name: f.name, nameBytes: enc.encode(f.name), data: f.data }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  for (let i = 1; i < list.length; i++) {
+    if (list[i].name === list[i - 1].name) throw new Error('writePkg: 入口重名 ' + list[i].name)
+  }
+  let headLen = 4 + PKG_WRITE_MAGIC.length + 4
+  let dataLen = 0
+  for (const f of list) {
+    headLen += 4 + f.nameBytes.length + 8
+    dataLen += f.data.length
+  }
+  const out = new Uint8Array(headLen + dataLen)
+  const dv = new DataView(out.buffer)
+  let p = 0
+  dv.setUint32(p, PKG_WRITE_MAGIC.length, true)
+  p += 4
+  for (let i = 0; i < PKG_WRITE_MAGIC.length; i++) out[p++] = PKG_WRITE_MAGIC.charCodeAt(i)
+  dv.setUint32(p, list.length, true)
+  p += 4
+  let offset = 0
+  for (const f of list) {
+    dv.setUint32(p, f.nameBytes.length, true)
+    p += 4
+    out.set(f.nameBytes, p)
+    p += f.nameBytes.length
+    dv.setUint32(p, offset, true)
+    dv.setUint32(p + 4, f.data.length, true)
+    p += 8
+    offset += f.data.length
+  }
+  for (const f of list) {
+    out.set(f.data, p)
+    p += f.data.length
+  }
+  return out
+}
+
 // 入口数据末尾应恰好贴住文件末尾（结构自检）
 export function verifyLayout(pkg) {
   let end = 0

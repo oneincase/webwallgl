@@ -852,6 +852,21 @@ export type SceneScriptCheck = {
   noEntry: boolean;
 };
 
+/** buildScenePkg 的输入条目：包内相对路径 + 字节 */
+export type ScenePkgFile = { path: string; data: Uint8Array };
+
+/** buildScenePkg 产物 */
+export type ScenePkgResult = {
+  /** PKGV0012 容器字节 */
+  pkg: Uint8Array;
+  /** 包内入口（排序后） */
+  entries: string[];
+  /** 由 materials 下 png/jpg 包成的 .tex */
+  converted: string[];
+  /** 未进包的源文件（已转成 .tex 或已有同名 .tex 的源图、嵌套 .pkg） */
+  dropped: string[];
+};
+
 // ─── 公共包（webwallgl/core）引擎底座类型 ────────────────────────────────
 // docs/EDITOR-PLAN.md §0.5：公共包只收「自包含、Node 可载、零装配依赖」的引擎
 // 底座面。类型跟着实现走：Pkg/Tex 与 vendor/we-scene/pkg/{container,texture}.js

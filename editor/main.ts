@@ -131,6 +131,7 @@ import {
   collectProject,
   downloadZip,
   newLibraryItemId,
+  packProject,
   pickDirectory,
   saveToLibrary,
   slugName,
@@ -536,13 +537,14 @@ exportEl.onclick = async () => {
   }
 };
 
-// ---------- 保存（W6-lite：松散工程 → 壁纸库 / 文件夹 / zip） ----------
+// ---------- 保存（W6-lite 松散工程 / W6-full WE 原生 scene.pkg → 壁纸库 / 文件夹 / zip） ----------
 
 type SaveTarget = "lib" | "dir" | "zip";
 const saveEl = $<HTMLButtonElement>("#tb-save");
 const saveMenuEl = $<HTMLElement>("#save-menu");
 const saveLibEl = $<HTMLButtonElement>("#save-lib");
 const saveDirEl = $<HTMLButtonElement>("#save-dir");
+const savePkgEl = $<HTMLInputElement>("#save-pkg");
 let saving = false;
 /** 本文档上次保存的目标：⌘S 直接重复；库条目 id 复用，再存即覆盖同一条 */
 let lastSave: { target: SaveTarget; itemId?: string; dir?: Awaited<ReturnType<typeof pickDirectory>> } | null = null;
@@ -605,7 +607,12 @@ async function runSave(target: SaveTarget) {
   try {
     log(et("log.saving"));
     const preview = await capturePreview();
-    const files = await collectProject(doc, current.assets, preview);
+    let files = await collectProject(doc, current.assets, preview);
+    if (savePkgEl.checked) {
+      const { files: pkgFiles, packed } = packProject(files);
+      files = pkgFiles;
+      log(et("log.packedPkg", { n: packed.entries.length, tex: packed.converted.length, mb: (packed.pkg.length / 1e6).toFixed(1) }));
+    }
     const mb = (totalBytes(files) / 1e6).toFixed(1);
     let progressStep = 0;
     const progress = (done: number, total: number) => {

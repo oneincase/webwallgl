@@ -80,8 +80,14 @@ const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
 const sourceAlias = {
   name: "editor-source-alias",
   setup(b) {
-    b.onResolve({ filter: /renderer\/src\/api\/editor$/ }, () => ({
-      path: path.join(ROOT, "renderer/src/api/source.ts"),
+    b.onResolve({ filter: /renderer\/src\/api\/editor$/ }, () => ({ path: "editor-api", namespace: "editor-api" }));
+    b.onLoad({ filter: /.*/, namespace: "editor-api" }, () => ({
+      contents: [
+        `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
+        `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
+      ].join("\n"),
+      loader: "ts",
+      resolveDir: ROOT,
     }));
   },
 };
@@ -1346,6 +1352,152 @@ const trustMod = await loadEditorModule("trust");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// X. 导出 WE 原生 scene.pkg（W6-full）：.tex 编码 / 容器写 / buildScenePkg / 闭环
+// ───────────────────────────────────────────────────────────────────────────
+section("X. 导出 scene.pkg（tex-write / writePkg / buildScenePkg）");
+const texW = await imp("renderer/vendor/we-scene/pkg/tex-write.js");
+const texR = await imp("renderer/vendor/we-scene/pkg/texture.js");
+const pkgC = await imp("renderer/vendor/we-scene/pkg/container.js");
+const { stripePng } = await imp("scripts/verify-editor-headless.mjs");
+const { buildScenePkg } = await imp("renderer/src/editor/pkg-export.ts");
+const same = (a, b) => !!a && !!b && Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
+/** 最小 JPEG 头：SOI + APP0 + SOF0（只供读尺寸） */
+const jpegHead = (w, h) => new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8, h >> 8, h & 255, w >> 8, w & 255, 1, 1, 0x11, 0, 0xff, 0xd9]);
+{
+  const sizes = [0, 1, 4, 5, 12, 13, 64, 4096, 70000];
+  const bad = [];
+  for (const n of sizes) {
+    const s = new Uint8Array(n);
+    for (let i = 0; i < n; i++) s[i] = (i % 7) * (i % 3) + ((i >> 9) & 1 ? i & 255 : 0);
+    if (!same(texR.lz4Decompress(texW.lz4CompressBlock(s), n), s)) bad.push(n);
+  }
+  const rnd = crypto.getRandomValues(new Uint8Array(60000));
+  if (!same(texR.lz4Decompress(texW.lz4CompressBlock(rnd), rnd.length), rnd)) bad.push("random");
+  check(bad.length === 0, `LZ4 块压缩 → 引擎 lz4Decompress 往返一致（空 / 短于尾部约束 / 长匹配 / 不可压随机；失败 ${json(bad)}）`);
+  const zeros = new Uint8Array(1 << 20);
+  check(texW.lz4CompressBlock(zeros).length < zeros.length / 200, "LZ4 对纯色像素真压缩（1MB 零 → < 5KB）");
+
+  const W = 37;
+  const H = 21;
+  const px = new Uint8Array(W * H * 4).map((_, i) => (i * 13) & 255);
+  const t = texR.parseTex(texW.encodeTexRgba({ rgba: px, width: W, height: H }));
+  const m0 = texR.decodeMip0(t);
+  check(t.format === 0 && t.flags === 2 && t.freeImageFormat === -1 && t.containerMagic === "TEXB0003\0" && same(m0.rgba, px) && m0.width === W, "encodeTexRgba：ARGB8888 + LZ4，parseTex / decodeMip0 读回原像素（非 POT 不补边）");
+  check(json(t.images[0].map((m) => `${m.width}x${m.height}`)) === json(["37x21", "18x10", "9x5", "4x2", "2x1", "1x1"]), "encodeTexRgba：mip 链逐级减半到 1×1");
+  const mips = texR.decodeMips(t);
+  check(mips.length === 6 && mips[5].rgba.length === 4 && mips[1].rgba[0] === ((px[0] + px[4] + px[W * 4] + px[W * 4 + 4] + 2) >> 2), "下级 mip = 2×2 box 平均（引擎 decodeMips 可逐级取）");
+  const raw = texR.parseTex(texW.encodeTexRgba({ rgba: px, width: W, height: H, mips: false, lz4: false }));
+  check(raw.images[0].length === 1 && raw.images[0][0].compression === 0 && same(texR.decodeMip0(raw).rgba, px), "encodeTexRgba：可关 mip / 关压缩");
+
+  const png = stripePng(300, 120, [200, 10, 10], [10, 10, 200]);
+  check(json(texW.imageSize(png)) === json({ width: 300, height: 120 }) && json(texW.imageSize(jpegHead(640, 360))) === json({ width: 640, height: 360 }) && texW.imageSize(new Uint8Array([1, 2, 3])) === null, "imageSize：PNG IHDR / JPEG SOF 读宽高，认不出返回 null");
+  const tp = texR.parseTex(texW.encodeTexImage({ bytes: png, width: 300, height: 120 }));
+  check(tp.containerMagic === "TEXB0004\0" && tp.freeImageFormat === 13 && tp.flags === 2 && tp.textureWidth === 300 && tp.width === 300 && same(texR.decodeMip0(tp).png, png), "encodeTexImage：TEXB0004 内嵌 PNG 原字节、不补 POT、flags=2（官方导出器形态）");
+  const jh = jpegHead(64, 32);
+  const tj = texR.parseTex(texW.encodeTexImage({ bytes: jh, width: 64, height: 32 }));
+  const dj = texR.decodeMip0(tj);
+  check(tj.freeImageFormat === 2 && dj.fif === 2 && same(dj.image, jh), "encodeTexImage：内嵌 JPEG（fif=2）");
+  let threw = false;
+  try {
+    texW.encodeTexImage({ bytes: new Uint8Array([1, 2, 3, 4]), width: 1, height: 1 });
+  } catch {
+    threw = true;
+  }
+  check(threw, "encodeTexImage：非 PNG / JPEG 字节拒绝");
+
+  const entries = [
+    { name: "scene.json", data: enc.encode("{}") },
+    { name: "materials/中文.tex", data: png },
+    { name: "a.txt", data: new Uint8Array(0) },
+  ];
+  const pk = pkgC.parsePkg(pkgC.writePkg(entries));
+  check(pk.magic === "PKGV0012" && json(pk.entries.map((e) => e.name)) === json(["a.txt", "materials/中文.tex", "scene.json"]) && same(pkgC.getEntry(pk, "materials/中文.tex"), png) && pkgC.getEntry(pk, "a.txt").length === 0 && pkgC.verifyLayout(pk).ok, "writePkg → parsePkg / getEntry 往返（排序、UTF-8 名、空文件、布局自检）");
+  check(same(pkgC.writePkg(entries), pkgC.writePkg([...entries].reverse())), "writePkg：输入顺序无关，产物逐字节确定");
+  threw = false;
+  try {
+    pkgC.writePkg([entries[0], { name: "scene.json", data: new Uint8Array(1) }]);
+  } catch {
+    threw = true;
+  }
+  check(threw, "writePkg：入口重名拒绝（读端只认第一个，静默会丢数据）");
+  const packDir = path.join(tmpRoot, "pack-same");
+  for (const e of entries) {
+    fs.mkdirSync(path.dirname(path.join(packDir, e.name)), { recursive: true });
+    fs.writeFileSync(path.join(packDir, e.name), e.data);
+  }
+  check(same(packSourceProject(packDir).buffer, pkgC.writePkg(entries)), "dev-pack-pkg 与编辑器导出共用 writePkg（同输入同字节）");
+
+  const r = buildScenePkg([
+    { path: "scene.json", data: enc.encode("{}") },
+    { path: "materials/editor/bg.png", data: png },
+    { path: "materials/editor/ph.jpg", data: jh },
+    { path: "materials/editor/bg.json", data: enc.encode("{}") },
+    { path: "materials/old.png", data: png },
+    { path: "materials/old.tex", data: new Uint8Array([7]) },
+    { path: "materials/broken.png", data: new Uint8Array([1, 2]) },
+    { path: "files/user.png", data: png },
+    { path: "nested/scene.pkg", data: new Uint8Array(4) },
+  ]);
+  check(json(r.converted.sort()) === json(["materials/editor/bg.tex", "materials/editor/ph.tex"]), `buildScenePkg：materials 下没有 .tex 的 png/jpg 转成 .tex（${json(r.converted)}）`);
+  check(json(r.entries) === json(["files/user.png", "materials/broken.png", "materials/editor/bg.json", "materials/editor/bg.tex", "materials/editor/ph.tex", "materials/old.tex", "scene.json"]), `buildScenePkg：源图不进包、已有 .tex 的源图丢弃、materials 外图片与认不出的图原样保留、嵌套 pkg 丢弃（${json(r.entries)}）`);
+  const rp = pkgC.parsePkg(r.pkg);
+  check(same(texR.decodeMip0(texR.parseTex(pkgC.getEntry(rp, "materials/editor/bg.tex"))).png, png) && pkgC.getEntry(rp, "materials/old.tex")[0] === 7, "buildScenePkg：包内 .tex 解出源图原字节；已有 .tex 原样");
+
+  const pp = saveMod.packProject([
+    { path: "scene.json", data: enc.encode("{}") },
+    { path: "materials/editor/bg.png", data: png },
+    { path: "project.json", data: enc.encode("{}") },
+    { path: "preview.jpg", data: jh },
+  ]);
+  check(json(pp.files.map((f) => f.path)) === json(["project.json", "preview.jpg", "scene.pkg"]) && json(pp.packed.entries) === json(["materials/editor/bg.tex", "scene.json"]), "packProject：project.json / 封面留在包外，其余进 scene.pkg");
+}
+
+section("X2. 导出闭环（新建 → 图片层 + 效果 → 打成 scene.pkg 存库 → 重新打开）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("导出测试", 1280, 720, [0, 0, 0]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const ov = assetsMod.overlayAssets("scene.json", empty, () => new Set([...createMod.referencedModels(doc), ...fxMod.referencedEffects(doc)]));
+    const bgPng = stripePng(320, 180, [250, 0, 0], [0, 0, 250]);
+    const img = { name: "bg.png", bytes: bgPng, ext: "png", width: 320, height: 180 };
+    for (const x of createMod.imageLayerFiles("bg", img)) ov.put(x.name, x.data, createMod.modelPathOf("bg"));
+    const id = createMod.addImageLayer(doc, "bg", img, "cover");
+    const obj = doc.scene.objects.find((o) => o.id === id);
+    for (const x of fxMod.effectFiles(fxMod.effectById("tint"))) ov.put(x.name, x.data, fxMod.effectFileOf("tint"));
+    fxMod.addEffect(obj, "tint");
+    const loose = await saveMod.collectProject(doc, ov, new Blob([jpegHead(64, 36)]));
+    const { files, packed } = saveMod.packProject(loose);
+    check(packed.converted.length === 1 && packed.converted[0] === "materials/editor/bg.tex" && !packed.entries.some((n) => /\.png$/.test(n)), "导出：图片层源图转 .tex，包里不留 png");
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const onDisk = fs.readdirSync(path.join(hostLib, itemId)).filter((n) => !n.startsWith(".")).sort();
+    check(json(onDisk) === json(["preview.jpg", "project.json", "scene.pkg"]), `库目录 = project.json + scene.pkg + 封面（${json(onDisk)}）`);
+    const proj = JSON.parse(fs.readFileSync(path.join(hostLib, itemId, "project.json"), "utf8"));
+    check(proj.type === "scene" && proj.file === "scene.json" && proj.preview === "preview.jpg", "project.json：file 指包内入口 scene.json（与创意工坊条目同形）");
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    check(!!it && it.hasScene && !it.hasLooseScene && openMod.libraryKind(it) === "scene", "库识别为场景包条目（hasScene，非松散）");
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(reopened.doc.form === "pkg" && json(reopened.doc.scene) === json(doc.scene), "重新打开：按包形态，scene.json（含效果链）逐字段一致");
+    const tex = await reopened.assets.read("materials/editor/bg.tex");
+    check(same(texR.decodeMip0(texR.parseTex(tex)).png, bgPng), "重新打开：包内 .tex 解出原 PNG 字节");
+    const frag = await reopened.assets.read("shaders/effects/wwgl_tint.frag");
+    check(frag && dec.decode(frag) === fxMod.effectById("tint").frag, "重新打开：效果 shader 随包自包含");
+    const local = await openMod.openLocalFiles([
+      localFile("exp/project.json", fs.readFileSync(path.join(hostLib, itemId, "project.json"))),
+      localFile("exp/scene.pkg", fs.readFileSync(path.join(hostLib, itemId, "scene.pkg"))),
+    ]);
+    check(local.doc.form === "pkg" && json(local.doc.scene) === json(doc.scene), "导出的 project.json + scene.pkg 当本地文件打开同样成立（file: scene.json 回退到包）");
+    const again = saveMod.packProject(await saveMod.collectProject(reopened.doc, reopened.assets, null));
+    check(again.packed.converted.length === 0 && same(again.files.find((f) => f.path === "scene.pkg").data, packed.pkg), "再导出：已是 .tex 不重复转换，包字节与首次导出一致（幂等）");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1399,6 +1551,13 @@ section("I. 接线");
   const html = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/id="tb-new"(?![^>]*disabled)/.test(html) && /id="ly-add"/.test(html) && /id="in-image" accept="image\/\*"/.test(html) && /id="ed-draft"/.test(html), "页面：新建可用，有添加图片 / 图片选择框 / 草稿横幅");
   check(/const EDITOR_MARK = "\.webwallgl-editor"/.test(HOST_TS) && /exists && !marked/.test(HOST_TS), "宿主：无标记目录拒绝覆盖");
+  check(/const savePkgEl = \$<HTMLInputElement>\("#save-pkg"\);/.test(main) && /if \(savePkgEl\.checked\) \{\s*const \{ files: pkgFiles, packed \} = packProject\(files\);\s*files = pkgFiles;/.test(main), "勾选 WE 原生格式时保存清单先过 packProject，三种目标都写 scene.pkg 形态");
+  check(/id="save-pkg"/.test(html) && /data-et="save\.pkg"/.test(html), "保存菜单有「WE 原生格式（scene.pkg）」勾选");
+  check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
+  const saveTs = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
+  check(/import \{ buildScenePkg, type ScenePkgResult \} from "\.\.\/renderer\/src\/api\/editor";/.test(saveTs) && !/writePkg|encodeTex/.test(saveTs), "页面只经库出口 buildScenePkg 打包（不直连 vendor 编码器）");
+  const devPack = fs.readFileSync(path.join(ROOT, "scripts/dev-pack-pkg.mjs"), "utf8");
+  check(/import \{ writePkg \} from "\.\.\/renderer\/vendor\/we-scene\/pkg\/container\.js";/.test(devPack) && !/writeUInt32LE|Buffer\.concat/.test(devPack), "dev-pack-pkg 不再有第二份容器写实现");
   const pkgJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   check(pkgJson.scripts?.["verify:editor"] === "node scripts/verify-editor.mjs", "package.json 有 verify:editor");
   const all = fs.readFileSync(path.join(ROOT, "scripts/verify-all.mjs"), "utf8");
@@ -1539,6 +1698,48 @@ section("J. 变异红测");
   check(mutTr2 !== trSrc, "注入点存在（无宿主默认不执行）");
   const tm3 = await loadEditorModule("trust", { [trPath]: mutTr2 });
   check(tm3.scriptsAllowedByDefault("local", false, null), "无宿主也执行时「在线版外来内容默认不执行」判据变红");
+
+  const peAbs = path.join(ROOT, "renderer/src/editor/pkg-export.ts");
+  const peSrc = fs.readFileSync(peAbs, "utf8");
+  const mutPe = peSrc.replace("if (byLower.has(texPath.toLowerCase()) || out.has(texPath)) {", "if (false) {");
+  check(mutPe !== peSrc, "注入点存在（已有同名 .tex 的源图不再转换）");
+  const smod = await loadEditorModule("save", { [peAbs]: mutPe });
+  const mp2 = smod.packProject([
+    { path: "materials/old.tex", data: new Uint8Array([7]) },
+    { path: "materials/old.png", data: stripePng(4, 4, [0, 0, 0], [0, 0, 0]) },
+  ]);
+  check(pkgC.getEntry(pkgC.parsePkg(mp2.packed.pkg), "materials/old.tex")?.[0] !== 7, "源图覆盖已有 .tex 时「已有 .tex 原样」判据变红");
+
+  let mutSeq = 0;
+  const vendorMut = async (rel, from, to, tag) => {
+    const abs = path.join(ROOT, rel);
+    const src = fs.readFileSync(abs, "utf8");
+    const mut = src.replace(from, to);
+    check(mut !== src, `注入点存在（${tag}）`);
+    const file = path.join(path.dirname(abs), `.verify-mut-${path.basename(abs, ".js")}-${process.pid}-${++mutSeq}.js`);
+    fs.writeFileSync(file, mut);
+    cleanups.push(() => fs.rmSync(file, { force: true }));
+    try {
+      return await import(pathToFileURL(file).href);
+    } finally {
+      fs.rmSync(file, { force: true });
+    }
+  };
+  const twm = await vendorMut("renderer/vendor/we-scene/pkg/tex-write.js", "out[op++] = off & 255\n    out[op++] = off >> 8", "out[op++] = (off + 1) & 255\n    out[op++] = (off + 1) >> 8", "LZ4 匹配偏移");
+  const lz = new Uint8Array(4096).map((_, i) => i % 50);
+  check(!same(texR.lz4Decompress(twm.lz4CompressBlock(lz), lz.length), lz), "匹配偏移写错时「LZ4 往返一致」判据变红");
+  const twm2 = await vendorMut("renderer/vendor/we-scene/pkg/tex-write.js", "w.i32(fif)\n", "w.i32(FIF.UNKNOWN)\n", "TEXB0004 的 freeImageFormat");
+  let ok2 = false;
+  try {
+    const p2 = stripePng(8, 8, [1, 2, 3], [4, 5, 6]);
+    ok2 = same(texR.decodeMip0(texR.parseTex(twm2.encodeTexImage({ bytes: p2, width: 8, height: 8 }))).png, p2);
+  } catch {
+    ok2 = false;
+  }
+  check(!ok2, "freeImageFormat 写成 -1（读端当裸像素）时「内嵌 PNG 原字节」判据变红");
+  const cm2 = await vendorMut("renderer/vendor/we-scene/pkg/container.js", ".sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))\n  for", "\n  for", "writePkg 排序");
+  const e2 = [{ name: "b", data: new Uint8Array([1]) }, { name: "a", data: new Uint8Array([2]) }];
+  check(!same(cm2.writePkg(e2), cm2.writePkg([...e2].reverse())), "不排序时「产物逐字节确定」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

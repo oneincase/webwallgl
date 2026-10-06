@@ -7,7 +7,10 @@
 export * from "./index";
 export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
+export { buildScenePkg } from "../editor/pkg-export";
 export type {
+  ScenePkgFile,
+  ScenePkgResult,
   EditorControls,
   EditorScriptIssue,
   EditorUserPropertyDecl,
