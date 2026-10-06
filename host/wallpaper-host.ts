@@ -18,6 +18,8 @@
  *   POST /api/library-dir                  运行时改壁纸库目录（body `{dir}` 或 `{pick:true}` 调系统选文件夹）
  *   POST /api/reveal                       用系统文件管理器打开指定壁纸目录（body `{itemId}`）
  *   POST /api/delete                       删除壁纸目录，优先移入系统废纸篓（body `{itemId}`）
+ *   POST /api/editor/save-begin?item=      编辑器另存：新建（或清空编辑器自建的）库内松散工程目录
+ *   POST /api/editor/save-file?item=&path= 编辑器另存：写入一个文件（body 为原始字节）
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
  *   GET /api/props?item=                   壁纸自定义属性定义（含本地化文案与当前值）
  *   POST /api/props?item=                  保存属性覆盖值（body 为 name→wire 值）
@@ -62,6 +64,9 @@ import {
   startLiveSystemService,
   type MediaControl,
 } from "./system-live";
+
+/** 编辑器保存产物的目录标记：有它才允许 /api/editor/save-* 覆盖该目录 */
+const EDITOR_MARK = ".webwallgl-editor";
 
 /** 与原生侧一致的媒体访问 token；独立测试台无鉴权需求，固定值方便手拼 URL */
 export const DEV_TOKEN = "dev";
@@ -790,6 +795,60 @@ export function wallpaperHost(): Plugin {
           lib = resolved;
           server.config.logger.info(`[host] 壁纸库目录改为：${lib}`);
           sendJson(res, 200, { dir: lib, ok: true });
+          return;
+        }
+
+        // --- 编辑器页保存（EDITOR-PLAN §3A.4）：写成库内松散工程 ---
+        // 只准新建、或覆盖带 EDITOR_MARK 的目录（编辑器自己建的）；作者原始条目一律 409，
+        // 页面侧总是「另存为新条目」。begin 清空旧产物（上次保存删掉的资源不能残留），
+        // file 逐个写（避免一次性上传几百 MB 的请求体）。
+        if (path === "/api/editor/save-begin" || path === "/api/editor/save-file") {
+          if (req.method !== "POST") {
+            sendJson(res, 405, { error: "需要 POST" });
+            return;
+          }
+          const itemId = url.searchParams.get("item") ?? "";
+          if (!/^[A-Za-z0-9_-]{1,80}$/.test(itemId)) {
+            sendJson(res, 400, { error: "非法 itemId" });
+            return;
+          }
+          const dir = safeJoin(lib, itemId);
+          if (!dir) {
+            sendJson(res, 403, { error: "路径非法" });
+            return;
+          }
+          const exists = !!(await asDirectory(dir));
+          const marked = exists && !!(await statFile(join(dir, EDITOR_MARK)));
+          if (exists && !marked) {
+            sendJson(res, 409, { error: `目标不是编辑器创建的目录，拒绝覆盖：${itemId}` });
+            return;
+          }
+          try {
+            if (path === "/api/editor/save-begin") {
+              if (exists) await fs.rm(dir, { recursive: true, force: true });
+              await fs.mkdir(dir, { recursive: true });
+              await fs.writeFile(join(dir, EDITOR_MARK), `${new Date().toISOString()}\n`);
+              server.config.logger.info(`[host] 编辑器保存：${itemId}`);
+              sendJson(res, 200, { ok: true, itemId, dir });
+              return;
+            }
+            if (!exists) {
+              sendJson(res, 409, { error: "先调 save-begin" });
+              return;
+            }
+            const rel = url.searchParams.get("path") ?? "";
+            const target = rel && rel !== EDITOR_MARK ? safeJoin(dir, rel) : null;
+            if (!target || target === dir) {
+              sendJson(res, 400, { error: `非法文件路径：${rel}` });
+              return;
+            }
+            const body = await readRawBody(req, 1024 * 1024 * 1024);
+            await fs.mkdir(resolve(target, ".."), { recursive: true });
+            await fs.writeFile(target, body);
+            sendJson(res, 200, { ok: true, bytes: body.length });
+          } catch (e) {
+            sendJson(res, 500, { error: (e as Error).message });
+          }
           return;
         }
 

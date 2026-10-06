@@ -179,13 +179,18 @@ export function removeLayer(doc: EditorDoc, id: number | string): boolean {
   return true;
 }
 
+/** 新对象可用的 id：现有最大数值 id + 1（字符串 / 缺失 id 不参与） */
+export function nextObjectId(objs: readonly SceneObject[]): number {
+  return objs.reduce((m, o) => Math.max(m, Number.isFinite(Number(o.id)) ? Number(o.id) : 0), 0) + 1;
+}
+
 /** 连同子树原位复制（插在原子树之后），返回副本根的 id */
 export function duplicateLayer(doc: EditorDoc, id: number | string, suffix: string): number | null {
   const objs = objectsOf(doc);
   if (!objs) return null;
   const idx = subtreeIndices(objs, id);
   if (!idx.length) return null;
-  let next = objs.reduce((m, o) => Math.max(m, Number.isFinite(Number(o.id)) ? Number(o.id) : 0), 0) + 1;
+  let next = nextObjectId(objs);
   const remap = new Map<string, number>();
   for (const i of idx) remap.set(String(objs[i].id), next++);
   const clones = idx.map((i) => {
@@ -227,6 +232,25 @@ export function moveLayer(doc: EditorDoc, id: number | string, dir: -1 | 1): boo
   objs.splice(insertAt, 0, ...blockObjs);
   rebuildTree(doc);
   return true;
+}
+
+/** 根到目标节点的路径（含目标）。引擎活层 id 是数值，文档 id 可能是字符串，按字符串比 */
+export function findPath(nodes: LayerNode[], id: number | string): LayerNode[] | null {
+  for (const n of nodes) {
+    if (String(n.id) === String(id)) return [n];
+    const sub = findPath(n.children, id);
+    if (sub) return [n, ...sub];
+  }
+  return null;
+}
+
+export function findNode(nodes: LayerNode[], id: number | string): LayerNode | null {
+  for (const n of nodes) {
+    if (n.id === id) return n;
+    const hit = findNode(n.children, id);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /** scene.json 场景逻辑分辨率（general.orthogonalprojection） */

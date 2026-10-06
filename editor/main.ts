@@ -20,10 +20,28 @@ import {
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
 import { applyEditorStatic, et } from "./i18n";
+import { overlayAssets, type OverlayAssets } from "./assets";
+import {
+  RESOLUTIONS,
+  addImageLayer,
+  blankScene,
+  hexToRgb,
+  imageLayerFiles,
+  imageSlug,
+  isImageFile,
+  modelPathOf,
+  newProject,
+  readImageFile,
+  referencedModels,
+  type ImageInput,
+} from "./create";
+import { applyDraft, idbDraftStore, makeDraft, type Draft, type DraftOrigin } from "./draft";
 import {
   duplicateLayer,
+  findNode,
+  findPath,
+  makeDoc,
   moveLayer,
-  rebuildTree,
   removeLayer,
   sceneResolution,
   unwrap,
@@ -31,6 +49,29 @@ import {
   type EditorDoc,
   type LayerNode,
 } from "./doc";
+import {
+  DRAG_THRESHOLD,
+  HANDLE,
+  cyclePick,
+  gizmoOf,
+  handleAt,
+  layerAxes,
+  rotateZ,
+  scaleXY,
+  type Gizmo,
+  type Pt,
+} from "./gizmo";
+import {
+  EditHistory,
+  isNoopEdit,
+  isStruct,
+  mergeLiveEdit,
+  pickProps,
+  restoreObjects as restoreDocObjects,
+  structCommand,
+  type Patch,
+  type PropsCmd,
+} from "./history";
 import {
   collectDropped,
   fetchLibrary,
@@ -41,7 +82,19 @@ import {
   sourceFromDoc,
   type LibraryItem,
   type Opened,
+  type SceneAssets,
 } from "./open";
+import {
+  canPickDirectory,
+  collectProject,
+  downloadZip,
+  newLibraryItemId,
+  pickDirectory,
+  saveToLibrary,
+  slugName,
+  totalBytes,
+  writeToDirectory,
+} from "./save";
 
 const TOKEN = "dev"; // 与 host/wallpaper-host.ts 的 DEV_TOKEN 一致
 const MEDIA_BASE = `${location.origin}/media/${TOKEN}`;
@@ -204,6 +257,10 @@ const isLocked = (id: number | string | null) => id !== null && locked.has(Strin
  * 还能吃库内 pkg 缓存。
  */
 let docDriven = false;
+/** 当前文档的资源表（原始来源 + 页面新增素材）；非场景 / 取不到场景资源时为 null */
+let overlay: OverlayAssets | null = null;
+/** 草稿来源；null = 本地文件 / 目录（刷新后 File 句柄失效，不做草稿） */
+let origin: DraftOrigin | null = null;
 
 function destroyInstance() {
   if (!instance) return;
@@ -268,7 +325,15 @@ async function mountCurrent(keepTime = false) {
   renderStatus();
 }
 
-async function openWith(name: string, load: () => Promise<Opened>) {
+type OpenOptions = {
+  origin?: DraftOrigin | null;
+  /** 新建工程没有原始来源可挂，一开始就从文档挂载 */
+  docDriven?: boolean;
+  /** 文档就位、首次挂载之前执行（新建时放背景图、恢复草稿时套用快照） */
+  after?: () => void;
+};
+
+async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOptions = {}) {
   log(et("log.opening", { name }));
   const gen = ++openGen;
   let opened: Opened;
@@ -282,13 +347,19 @@ async function openWith(name: string, load: () => Promise<Opened>) {
   }
   if (gen !== openGen) return;
   current?.source.dispose?.();
+  overlay =
+    opened.assets && opened.doc.scene ? overlayAssets(opened.assets.entry, opened.assets, () => referencedModels(doc)) : null;
+  if (overlay) opened = { ...opened, assets: overlay };
   current = opened;
   doc = opened.doc;
   selectedId = null;
   collapsed.clear();
   locked.clear();
-  docDriven = false;
+  docDriven = !!opts.docDriven;
+  origin = opts.origin ?? null;
+  lastSave = null;
   resetHistory();
+  opts.after?.();
   if (doc.type === "scene" && !doc.scene) log(et("log.noScene"), "warn");
   emptyEl.hidden = true;
   syncDocTitle();
@@ -418,6 +489,112 @@ exportEl.onclick = async () => {
   }
 };
 
+// ---------- 保存（W6-lite：松散工程 → 壁纸库 / 文件夹 / zip） ----------
+
+type SaveTarget = "lib" | "dir" | "zip";
+const saveEl = $<HTMLButtonElement>("#tb-save");
+const saveMenuEl = $<HTMLElement>("#save-menu");
+const saveLibEl = $<HTMLButtonElement>("#save-lib");
+const saveDirEl = $<HTMLButtonElement>("#save-dir");
+let saving = false;
+/** 本文档上次保存的目标：⌘S 直接重复；库条目 id 复用，再存即覆盖同一条 */
+let lastSave: { target: SaveTarget; itemId?: string; dir?: Awaited<ReturnType<typeof pickDirectory>> } | null = null;
+
+function syncSaveButton() {
+  saveEl.disabled = saving || !doc?.scene || !current?.assets;
+}
+
+function closeSaveMenu() {
+  saveMenuEl.hidden = true;
+}
+
+saveEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!saveMenuEl.hidden) {
+    closeSaveMenu();
+    return;
+  }
+  closeNewMenu();
+  saveLibEl.hidden = libState !== "ready";
+  saveDirEl.hidden = !canPickDirectory();
+  const r = saveEl.getBoundingClientRect();
+  saveMenuEl.style.left = `${r.left}px`;
+  saveMenuEl.style.top = `${r.bottom + 2}px`;
+  saveMenuEl.hidden = false;
+};
+document.addEventListener("click", (e) => {
+  if (!saveMenuEl.hidden && !saveMenuEl.contains(e.target as Node)) closeSaveMenu();
+});
+saveLibEl.onclick = () => void runSave("lib");
+saveDirEl.onclick = () => void runSave("dir");
+$<HTMLButtonElement>("#save-zip").onclick = () => void runSave("zip");
+
+async function capturePreview(): Promise<Blob | null> {
+  if (!editor || !doc) return null;
+  const res = sceneResolution(doc.scene);
+  const w = 640;
+  const h = res ? Math.max(1, Math.round((w * res.h) / res.w)) : 360;
+  try {
+    return await editor.capture({ width: w, height: h, type: "image/jpeg", quality: 0.85 });
+  } catch (e) {
+    log(et("log.previewFailed", { msg: (e as Error).message }), "warn");
+    return null;
+  }
+}
+
+async function runSave(target: SaveTarget) {
+  closeSaveMenu();
+  if (saving || !doc?.scene || !current?.assets) return;
+  const sameDoc = lastSave?.target === target;
+  let dir = sameDoc ? lastSave?.dir ?? null : null;
+  // 选目录必须紧跟用户手势（showDirectoryPicker 的要求），先选再干重活
+  if (target === "dir" && !dir) {
+    dir = await pickDirectory();
+    if (!dir) return;
+  }
+  saving = true;
+  syncSaveButton();
+  const t0 = performance.now();
+  try {
+    log(et("log.saving"));
+    const preview = await capturePreview();
+    const files = await collectProject(doc, current.assets, preview);
+    const mb = (totalBytes(files) / 1e6).toFixed(1);
+    let progressStep = 0;
+    const progress = (done: number, total: number) => {
+      const step = Math.floor((done / total) * 4);
+      if (step > progressStep && done < total) {
+        progressStep = step;
+        log(et("log.saveProgress", { done, total }));
+      }
+    };
+    if (target === "zip") {
+      const size = downloadZip(files, slugName(doc.title));
+      log(et("log.savedZip", { n: files.length, mb: (size / 1e6).toFixed(1) }));
+      lastSave = { target };
+    } else if (target === "dir") {
+      await writeToDirectory(dir!, files, progress);
+      log(et("log.savedDir", { name: dir!.name, n: files.length, mb }));
+      lastSave = { target, dir };
+    } else {
+      const itemId = (sameDoc && lastSave?.itemId) || newLibraryItemId(doc.title);
+      await saveToLibrary(itemId, files, progress);
+      log(et("log.savedLib", { id: itemId, n: files.length, mb }));
+      lastSave = { target, itemId };
+      void loadLibrary(false);
+    }
+    dirty = false;
+    discardDraft();
+    syncDocTitle();
+    log(et("log.saveTook", { s: ((performance.now() - t0) / 1000).toFixed(1) }));
+  } catch (e) {
+    log(et("log.saveFailed", { msg: (e as Error).message }), "error");
+  } finally {
+    saving = false;
+    syncSaveButton();
+  }
+}
+
 // ---------- 画面点选（W4 拾取） ----------
 
 let lastPick: { key: string; idx: number } | null = null;
@@ -437,17 +614,17 @@ stageEl.addEventListener("click", (e) => {
   }
   const r = canvas.getBoundingClientRect();
   const hits = editor.hitTestAt(e.clientX - r.left, e.clientY - r.top).filter((h) => !isLocked(h.id));
-  if (!hits.length) {
-    lastPick = null;
+  lastPick = cyclePick(
+    hits.map((h) => h.id),
+    lastPick,
+    e.altKey,
+  );
+  if (!lastPick) {
     log(et("log.pickNone"));
     selectLayer(null);
     return;
   }
-  // Alt+点击：同一叠层内逐层向下切换
-  const key = hits.map((h) => h.id).join(",");
-  const idx = e.altKey && lastPick?.key === key ? (lastPick.idx + 1) % hits.length : 0;
-  lastPick = { key, idx };
-  const hit: EditorLayer = hits[idx];
+  const hit: EditorLayer = hits[lastPick.idx];
   log(et("log.picked", { name: hit.name || `#${hit.id}`, n: hits.length }));
   selectLayer(hit.id);
 });
@@ -468,37 +645,21 @@ function selectLayer(id: number | string | null) {
 
 // ---------- 编辑：热改 + 写回文档 + 撤销重做（W2-lite） ----------
 
-type Patch = Partial<EditorLayerProps>;
-type PropsCmd = { id: number | string; name: string; before: Patch; after: Patch };
-/** 结构编辑以整份对象数组快照记账（文档级，撤销即换回快照再重挂） */
-type StructCmd = {
-  kind: "struct";
-  label: string;
-  before: string;
-  after: string;
-  selBefore: number | string | null;
-  selAfter: number | string | null;
-};
-type EditCmd = PropsCmd | StructCmd;
-const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
-
-const undoStack: EditCmd[] = [];
-const redoStack: EditCmd[] = [];
+const edits = new EditHistory();
 /** 本文档累计的热改（按层合并）：重挂后原样重放，保证「重挂 ≡ 热改」 */
 const liveEdits = new Map<string, Patch>();
 let dirty = false;
 
 function resetHistory() {
-  undoStack.length = 0;
-  redoStack.length = 0;
+  edits.clear();
   liveEdits.clear();
   dirty = false;
   syncHistoryButtons();
 }
 
 function syncHistoryButtons() {
-  undoEl.disabled = !undoStack.length;
-  redoEl.disabled = !redoStack.length;
+  undoEl.disabled = !edits.canUndo;
+  redoEl.disabled = !edits.canRedo;
 }
 
 function syncDocTitle() {
@@ -511,13 +672,6 @@ function nodeName(id: number | string): string {
   return n?.name || `#${id}`;
 }
 
-/** 只取 patch 里出现的键（撤销记录的 before 与 after 键集一致） */
-function pick(props: EditorLayerProps, keys: Array<keyof EditorLayerProps>): Patch {
-  const out: Patch = {};
-  for (const k of keys) (out as Record<string, unknown>)[k] = structuredClone(props[k]);
-  return out;
-}
-
 /** 写引擎 + 写文档 + 记账，不进撤销栈（拖拽/滑条的中间态也走这里） */
 function applyPatch(id: number | string, patch: Patch): Promise<void> {
   const node = doc ? findNode(doc.roots, id) : null;
@@ -525,40 +679,33 @@ function applyPatch(id: number | string, patch: Patch): Promise<void> {
     writeObjProps(node.obj, patch);
     if (patch.visible !== undefined) node.visible = patch.visible;
   }
-  const key = String(id);
-  liveEdits.set(key, { ...(liveEdits.get(key) ?? {}), ...structuredClone(patch) });
+  mergeLiveEdit(liveEdits, id, patch);
   markDirty();
   return editor ? editor.setLayerProps(Number(id), patch).catch((e) => log(String(e?.message ?? e), "warn")) : Promise.resolve();
 }
 
-function pushHistory(cmd: EditCmd) {
-  undoStack.push(cmd);
-  if (undoStack.length > 200) undoStack.shift();
-  redoStack.length = 0;
-  syncHistoryButtons();
-}
-
 function markDirty() {
+  scheduleDraft();
   if (dirty) return;
   dirty = true;
   syncDocTitle();
 }
 
 function commit(cmd: PropsCmd) {
-  const same = JSON.stringify(cmd.before) === JSON.stringify(cmd.after);
-  if (same) return;
-  pushHistory(cmd);
+  if (isNoopEdit(cmd)) return;
+  edits.push(cmd);
+  syncHistoryButtons();
   log(et("log.edited", { name: cmd.name, fields: Object.keys(cmd.after).join(", ") }));
 }
 
 /** 文档对象数组整体换成某个快照，然后整场景重挂（结构编辑 / 其撤销重做共用） */
 function restoreObjects(json: string, sel: number | string | null) {
   if (!doc?.scene) return;
-  doc.scene.objects = JSON.parse(json);
-  rebuildTree(doc);
+  restoreDocObjects(doc, json);
   // 文档已含全部改动，旧的按层热改账作废（被删的层也不该再重放）
   liveEdits.clear();
   docDriven = true;
+  scheduleDraft();
   selectedId = sel !== null && findNode(doc.roots, sel) ? sel : null;
   renderTree();
   renderInspector();
@@ -572,16 +719,13 @@ function structEdit(label: string, mutate: (d: EditorDoc) => number | string | n
     log(et("log.structUnavailable"), "warn");
     return;
   }
-  const before = JSON.stringify(doc.scene.objects ?? []);
-  const selBefore = selectedId;
-  const sel = mutate(doc);
-  if (sel === undefined) return;
-  const after = JSON.stringify(doc.scene.objects ?? []);
-  if (after === before) return;
-  pushHistory({ kind: "struct", label, before, after, selBefore, selAfter: sel });
+  const cmd = structCommand(doc, label, selectedId, mutate);
+  if (!cmd) return;
+  edits.push(cmd);
+  syncHistoryButtons();
   markDirty();
   log(label);
-  restoreObjects(after, sel);
+  restoreObjects(cmd.after, cmd.selAfter);
 }
 
 function selectedNode(): LayerNode | null {
@@ -616,17 +760,14 @@ function edit(id: number | string, patch: Patch) {
   const cur = editor?.getLayerProps(Number(id));
   if (!cur) return;
   const keys = Object.keys(patch) as Array<keyof EditorLayerProps>;
-  const before = pick(cur, keys);
+  const before = pickProps(cur, keys);
   void applyPatch(id, patch);
   commit({ id, name: nodeName(id), before, after: structuredClone(patch) });
 }
 
 function undoRedo(dir: "undo" | "redo") {
-  const from = dir === "undo" ? undoStack : redoStack;
-  const to = dir === "undo" ? redoStack : undoStack;
-  const cmd = from.pop();
+  const cmd = edits.take(dir);
   if (!cmd) return;
-  to.push(cmd);
   syncHistoryButtons();
   if (isStruct(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
@@ -651,6 +792,11 @@ window.addEventListener("keydown", (e) => {
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
     e.preventDefault();
     undoRedo("redo");
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+    e.preventDefault();
+    if (saveEl.disabled) return;
+    if (lastSave) void runSave(lastSave.target);
+    else saveEl.click();
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d") {
     e.preventDefault();
     duplicateSelected();
@@ -674,39 +820,8 @@ const overlayEl = document.createElement("canvas");
 overlayEl.id = "ed-overlay";
 const overlayCtx = overlayEl.getContext("2d")!;
 
-type Pt = [number, number];
-/** 手柄边长 / 命中半径（CSS 像素） */
-const HANDLE = 8;
-const ROTATE_OFFSET = 22;
-/**
- * 当前选中层的手柄几何（画布 CSS 坐标），drawOverlay 每帧刷新，pointerdown 据此判命中。
- * corners 顺序同 layerQuadWorld：层局部的左上、右上、右下、左下（未旋转时即屏幕方位），
- * 旋转柄挂在局部上边（c0→c1）中点外侧，跟着层一起转。
- */
-let gizmo: { anchor: Pt; corners: Pt[]; rotate: Pt | null } | null = null;
-
-function gizmoOf(anchor: readonly number[], corners: ReadonlyArray<readonly number[]> | null) {
-  const a: Pt = [anchor[0], anchor[1]];
-  if (!corners) return { anchor: a, corners: [] as Pt[], rotate: null };
-  const cs = corners.map((c) => [c[0], c[1]] as Pt);
-  const cx = cs.reduce((s, c) => s + c[0], 0) / 4;
-  const cy = cs.reduce((s, c) => s + c[1], 0) / 4;
-  const mx = (cs[0][0] + cs[1][0]) / 2;
-  const my = (cs[0][1] + cs[1][1]) / 2;
-  const len = Math.hypot(mx - cx, my - cy) || 1;
-  const rotate: Pt = [mx + ((mx - cx) / len) * ROTATE_OFFSET, my + ((my - cy) / len) * ROTATE_OFFSET];
-  return { anchor: a, corners: cs, rotate };
-}
-
-type HandleHit = { kind: "scale"; corner: number } | { kind: "rotate" } | null;
-
-function handleAt(x: number, y: number): HandleHit {
-  if (!gizmo) return null;
-  const near = (p: Pt) => Math.hypot(p[0] - x, p[1] - y) <= HANDLE;
-  if (gizmo.rotate && near(gizmo.rotate)) return { kind: "rotate" };
-  const i = gizmo.corners.findIndex(near);
-  return i >= 0 ? { kind: "scale", corner: i } : null;
-}
+/** 当前选中层的手柄几何（画布 CSS 坐标），drawOverlay 每帧刷新，pointerdown 据此判命中 */
+let gizmo: Gizmo | null = null;
 
 function drawOverlay() {
   if (overlayEl.parentElement !== stageEl) stageEl.appendChild(overlayEl);
@@ -795,11 +910,6 @@ let drag: {
 let suppressClick = false;
 
 const DRAG_FIELD: Record<DragMode, keyof EditorLayerProps> = { move: "origin", scale: "scale", rotate: "angles" };
-const unit = (x: number, y: number): Pt => {
-  const l = Math.hypot(x, y) || 1;
-  return [x / l, y / l];
-};
-const dot = (a: Pt, b: Pt) => a[0] * b[0] + a[1] * b[1];
 
 function canvasPoint(e: PointerEvent | MouseEvent): { x: number; y: number } | null {
   const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
@@ -817,12 +927,10 @@ stageEl.addEventListener("pointerdown", (e) => {
   if (!editor || selectedId === null || isLocked(selectedId) || e.button !== 0 || e.altKey) return;
   const p = canvasPoint(e);
   if (!p) return;
-  const handle = handleAt(p.x, p.y);
+  const handle = handleAt(gizmo, p.x, p.y);
   if (!handle && !overSelected(p.x, p.y)) return;
   const props = editor.getLayerProps(Number(selectedId));
   if (!props) return;
-  const g = gizmo;
-  const c = g?.corners ?? [];
   drag = {
     mode: handle?.kind ?? "move",
     id: selectedId,
@@ -830,9 +938,8 @@ stageEl.addEventListener("pointerdown", (e) => {
     x0: p.x,
     y0: p.y,
     props0: structuredClone(props),
-    anchor: g?.anchor ?? [p.x, p.y],
-    ax: c.length ? unit(c[1][0] - c[0][0], c[1][1] - c[0][1]) : [1, 0],
-    ay: c.length ? unit(c[3][0] - c[0][0], c[3][1] - c[0][1]) : [0, 1],
+    anchor: gizmo?.anchor ?? [p.x, p.y],
+    ...layerAxes(gizmo?.corners ?? []),
     moved: false,
   };
   stageEl.setPointerCapture(e.pointerId);
@@ -843,14 +950,14 @@ stageEl.addEventListener("pointermove", (e) => {
   if (!p) return;
   if (!drag || e.pointerId !== drag.pointerId || !editor) {
     if (e.buttons) return;
-    const h = !isLocked(selectedId) ? handleAt(p.x, p.y) : null;
+    const h = !isLocked(selectedId) ? handleAt(gizmo, p.x, p.y) : null;
     const cursor = h ? h.kind : !isLocked(selectedId) && overSelected(p.x, p.y) ? "move" : "";
     if ((stageEl.dataset.cursor ?? "") !== cursor) stageEl.dataset.cursor = cursor;
     return;
   }
   const dx = p.x - drag.x0;
   const dy = p.y - drag.y0;
-  if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+  if (!drag.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
   drag.moved = true;
   const p0 = drag.props0;
   if (drag.mode === "move") {
@@ -859,28 +966,14 @@ stageEl.addEventListener("pointermove", (e) => {
     void applyPatch(drag.id, { origin: [p0.origin[0] + d[0], p0.origin[1] + d[1], p0.origin[2]] });
     return;
   }
-  const a = drag.anchor;
-  const v0: Pt = [drag.x0 - a[0], drag.y0 - a[1]];
-  const v1: Pt = [p.x - a[0], p.y - a[1]];
+  const from: Pt = [drag.x0, drag.y0];
+  const to: Pt = [p.x, p.y];
   if (drag.mode === "rotate") {
-    // 屏幕 y 向下、WE 角度 y 向上：屏幕顺时针 = 角度减小
-    let z = p0.angles[2] - (Math.atan2(v1[1], v1[0]) - Math.atan2(v0[1], v0[0]));
-    if (e.shiftKey) z = Math.round(z / (15 * RAD)) * 15 * RAD;
+    const z = rotateZ(p0.angles[2], drag.anchor, from, to, e.shiftKey ? 15 : 0);
     void applyPatch(drag.id, { angles: [p0.angles[0], p0.angles[1], z] });
     return;
   }
-  // 角点缩放：沿层自身两轴分别求「现距 / 原距」；锚点恰在该轴上（如左上对齐拖左上角）时该轴不动
-  const ratio = (axis: Pt) => {
-    const d0 = dot(v0, axis);
-    return Math.abs(d0) < 4 ? 1 : dot(v1, axis) / d0;
-  };
-  let sx = ratio(drag.ax);
-  let sy = ratio(drag.ay);
-  if (e.shiftKey) sx = sy = Math.hypot(v1[0], v1[1]) / (Math.hypot(v0[0], v0[1]) || 1);
-  const MIN = 0.01;
-  void applyPatch(drag.id, {
-    scale: [Math.max(MIN, p0.scale[0] * sx), Math.max(MIN, p0.scale[1] * sy), p0.scale[2]],
-  });
+  void applyPatch(drag.id, { scale: scaleXY(p0.scale, drag.anchor, from, to, drag, e.shiftKey) });
 });
 
 function endDrag(e: PointerEvent) {
@@ -892,7 +985,7 @@ function endDrag(e: PointerEvent) {
   const after = editor.getLayerProps(Number(d.id));
   if (after) {
     const key = DRAG_FIELD[d.mode];
-    commit({ id: d.id, name: nodeName(d.id), before: pick(d.props0, [key]), after: pick(after, [key]) });
+    commit({ id: d.id, name: nodeName(d.id), before: pickProps(d.props0, [key]), after: pickProps(after, [key]) });
     renderInspector();
   }
 }
@@ -902,6 +995,7 @@ stageEl.addEventListener("pointercancel", endDrag);
 // ---------- 状态栏 ----------
 
 function renderStatus() {
+  syncSaveButton();
   stDocEl.textContent = doc ? doc.title : et("st.none");
   stDocEl.title = stDocEl.textContent;
   stFormEl.textContent = doc ? (doc.form ? et(`form.${doc.form}`) : doc.type) : "";
@@ -981,12 +1075,19 @@ function openLibrary(it: LibraryItem) {
   const url = new URL(location.href);
   url.searchParams.set("item", it.itemId);
   history.replaceState(null, "", url);
-  void openWith(it.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE));
+  void openWith(it.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), {
+    origin: { kind: "library", itemId: it.itemId },
+  });
 }
 
 filterEl.oninput = renderLibrary;
 
-async function loadLibrary() {
+let libLoaded: () => void = () => {};
+/** 首次读库结束（成功或失败）。恢复库来源的草稿要等它 */
+const libReady = new Promise<void>((ok) => (libLoaded = ok));
+
+/** autoOpen=false：保存后刷新列表用，不要按地址栏 ?item 再打开一遍（会丢掉当前编辑） */
+async function loadLibrary(autoOpen = true) {
   try {
     const lib = await fetchLibrary();
     if (!lib) {
@@ -997,6 +1098,7 @@ async function loadLibrary() {
     libItems = lib.items;
     libState = "ready";
     renderLibrary();
+    if (!autoOpen) return;
     const want = new URL(location.href).searchParams.get("item");
     const hit = want ? libItems.find((i) => i.itemId === want) : undefined;
     if (hit) openLibrary(hit);
@@ -1004,18 +1106,24 @@ async function loadLibrary() {
     libState = "static";
     renderLibrary();
     log(et("log.libFailed", { msg: (e as Error).message }), "error");
+  } finally {
+    libLoaded();
   }
 }
 
 // ---------- 本地打开 / 拖放 ----------
 
-function openLocal(files: ReturnType<typeof filesFromInput>) {
-  if (!files.length) return;
+function leaveLibraryItem() {
   activeItemId = null;
   renderLibrary();
   const url = new URL(location.href);
   url.searchParams.delete("item");
   history.replaceState(null, "", url);
+}
+
+function openLocal(files: ReturnType<typeof filesFromInput>) {
+  if (!files.length) return;
+  leaveLibraryItem();
   const name = files[0].path.split("/")[0] || files[0].file.name;
   void openWith(name, () => openLocalFiles(files));
 }
@@ -1053,10 +1161,241 @@ window.addEventListener("drop", (e) => {
   dragDepth = 0;
   dropEl.hidden = true;
   void collectDropped(e.dataTransfer).then((files) => {
-    if (files.length) openLocal(files);
-    else log(et("log.dropEmpty"), "warn");
+    if (!files.length) log(et("log.dropEmpty"), "warn");
+    else if (files.every((f) => isImageFile(f.file))) void dropImages(files.map((f) => f.file));
+    else openLocal(files);
   });
 });
+
+// ---------- 新建（模板）/ 图片成层 ----------
+
+const newEl = $<HTMLButtonElement>("#tb-new");
+const newMenuEl = $<HTMLElement>("#new-menu");
+const newResEl = $<HTMLSelectElement>("#new-res");
+const newColorEl = $<HTMLInputElement>("#new-color");
+const inImageEl = $<HTMLInputElement>("#in-image");
+/** 图片选择框的用途：给当前文档加层，或作为新建工程的背景 */
+let imagePickFor: "layer" | "template" = "layer";
+
+function closeNewMenu() {
+  newMenuEl.hidden = true;
+}
+
+newEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!newMenuEl.hidden) {
+    closeNewMenu();
+    return;
+  }
+  closeSaveMenu();
+  const r = newEl.getBoundingClientRect();
+  newMenuEl.style.left = `${r.left}px`;
+  newMenuEl.style.top = `${r.bottom + 2}px`;
+  newMenuEl.hidden = false;
+};
+document.addEventListener("click", (e) => {
+  if (!newMenuEl.hidden && !newMenuEl.contains(e.target as Node)) closeNewMenu();
+});
+
+function selectedResolution() {
+  const [w, h] = newResEl.value.split("x").map(Number);
+  return RESOLUTIONS.find((r) => r.w === w && r.h === h) ?? RESOLUTIONS[0];
+}
+
+$<HTMLButtonElement>("#new-blank").onclick = () => void createNew([]);
+$<HTMLButtonElement>("#new-image").onclick = () => {
+  imagePickFor = "template";
+  inImageEl.click();
+};
+inImageEl.onchange = () => {
+  const files = Array.from(inImageEl.files ?? []);
+  inImageEl.value = "";
+  if (!files.length) return;
+  if (imagePickFor === "template") void createNew(files);
+  else void addImageFiles(files);
+};
+
+const EMPTY_ASSETS: SceneAssets = { entry: "scene.json", read: async () => null, list: () => [] };
+
+/** 新建工程的「来源」：没有任何原始资源，全部在资源表叠加层里 */
+function newOpened(title: string, project: Record<string, unknown>, scene: Record<string, unknown>): Opened {
+  const d = makeDoc(title, project, scene, "loose");
+  return {
+    doc: d,
+    source: {
+      async scenePkg() {
+        throw new Error("新建工程只有松散形态");
+      },
+      async sceneDir() {
+        return EMPTY_ASSETS;
+      },
+      project: async () => d.project,
+    },
+    assets: EMPTY_ASSETS,
+  };
+}
+
+async function readImages(files: File[]): Promise<ImageInput[]> {
+  const out: ImageInput[] = [];
+  for (const f of files) {
+    try {
+      out.push(await readImageFile(f));
+    } catch (e) {
+      log(et("log.imageFailed", { name: f.name, msg: (e as Error).message }), "warn");
+    }
+  }
+  return out;
+}
+
+/** 把图片写进资源表并在文档末尾追加图层；第一张可铺满（背景），其余按 fit。返回最后一个新层 id */
+function placeImages(d: EditorDoc, imgs: ImageInput[], firstCover: boolean): number | undefined {
+  if (!overlay) return undefined;
+  let last: number | undefined;
+  imgs.forEach((img, i) => {
+    const refs = referencedModels(d);
+    const slug = imageSlug(img.name, (s) => overlay!.has(modelPathOf(s)) || refs.has(modelPathOf(s)));
+    for (const f of imageLayerFiles(slug, img)) overlay!.put(f.name, f.data, modelPathOf(slug));
+    last = addImageLayer(d, slug, img, firstCover && i === 0 ? "cover" : "fit") ?? last;
+  });
+  return last;
+}
+
+/** 新建：所选分辨率 + 背景色；images 非空时第一张铺满做背景、其余作为普通图层 */
+async function createNew(images: File[]) {
+  closeNewMenu();
+  const imgs = images.length ? await readImages(images) : [];
+  if (images.length && !imgs.length) return;
+  const res = selectedResolution();
+  const title = et("new.untitled");
+  leaveLibraryItem();
+  await openWith(title, async () => newOpened(title, newProject(title), blankScene(res.w, res.h, hexToRgb(newColorEl.value))), {
+    origin: { kind: "new" },
+    docDriven: true,
+    after: () => {
+      log(et("log.newDoc", { w: res.w, h: res.h }));
+      if (!imgs.length || !doc) return;
+      selectedId = placeImages(doc, imgs, true) ?? null;
+      markDirty();
+    },
+  });
+}
+
+async function addImageFiles(files: File[]) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const target = doc;
+  const imgs = await readImages(files);
+  if (!imgs.length || doc !== target) return;
+  structEdit(et("log.imagesAdded", { names: imgs.map((i) => i.name).join(", ") }), (d) => placeImages(d, imgs, false));
+}
+
+/** 拖进来的全是图片：有打开的场景就加层，否则以它们新建 */
+function dropImages(files: File[]) {
+  if (doc?.scene && overlay && doc.type === "scene") return addImageFiles(files);
+  return createNew(files);
+}
+
+// ---------- 草稿（IndexedDB，单槽位） ----------
+
+const DRAFT_DELAY = 800;
+const drafts = idbDraftStore();
+const draftEl = $<HTMLElement>("#ed-draft");
+const draftTextEl = $<HTMLElement>("#ed-draft-text");
+let draftTimer = 0;
+/** IDB 操作串行：保存成功后的清除不能被更早排队的写入盖回去 */
+let draftQueue: Promise<void> = Promise.resolve();
+let pendingDraft: Draft | null = null;
+
+function queueDraftOp(op: () => Promise<void>) {
+  draftQueue = draftQueue.then(op).catch((e) => log(et("log.draftFailed", { msg: (e as Error).message }), "warn"));
+}
+
+function scheduleDraft() {
+  if (!origin || !doc?.scene) return;
+  clearTimeout(draftTimer);
+  draftTimer = window.setTimeout(writeDraft, DRAFT_DELAY);
+}
+
+function writeDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = 0;
+  if (!origin || !doc?.scene || !dirty) return;
+  const d = makeDraft(doc, origin, current?.assets?.entry ?? "scene.json", overlay?.added() ?? []);
+  if (!d) return;
+  // 新草稿顶掉了启动时发现的那份，横幅失去意义
+  hideDraftBanner();
+  queueDraftOp(() => drafts.save(d));
+}
+
+function discardDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = 0;
+  hideDraftBanner();
+  queueDraftOp(() => drafts.clear());
+}
+
+function hideDraftBanner() {
+  pendingDraft = null;
+  draftEl.hidden = true;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && draftTimer) writeDraft();
+});
+
+async function checkDraft() {
+  let d: Draft | null = null;
+  try {
+    d = await drafts.load();
+  } catch (e) {
+    log(et("log.draftFailed", { msg: (e as Error).message }), "warn");
+  }
+  if (!d) return;
+  pendingDraft = d;
+  draftTextEl.textContent = et("draft.found", { title: d.title, time: new Date(d.savedAt).toLocaleString() });
+  draftEl.hidden = false;
+}
+
+async function restoreDraft(d: Draft) {
+  hideDraftBanner();
+  const apply = () => {
+    if (!doc) return;
+    applyDraft(doc, d);
+    for (const f of d.files) overlay?.put(f.name, f.data, f.group);
+    docDriven = true;
+    dirty = true;
+    log(et("log.draftRestored", { title: d.title }));
+  };
+  if (d.origin.kind === "new") {
+    leaveLibraryItem();
+    await openWith(d.title, async () => newOpened(d.title, d.project ?? newProject(d.title), d.scene), {
+      origin: { kind: "new" },
+      docDriven: true,
+      after: apply,
+    });
+    return;
+  }
+  await libReady;
+  const itemId = d.origin.itemId;
+  const it = libItems.find((i) => i.itemId === itemId);
+  if (!it) {
+    log(et("log.draftMissing", { id: itemId }), "error");
+    return;
+  }
+  activeItemId = it.itemId;
+  renderLibrary();
+  const url = new URL(location.href);
+  url.searchParams.set("item", it.itemId);
+  history.replaceState(null, "", url);
+  await openWith(d.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), { origin: d.origin, after: apply });
+}
+
+$<HTMLButtonElement>("#draft-restore").onclick = () => {
+  if (pendingDraft) void restoreDraft(pendingDraft);
+};
+$<HTMLButtonElement>("#draft-discard").onclick = () => discardDraft();
 
 // ---------- 图层树（P0 只读：来自 scene.json） ----------
 
@@ -1069,6 +1408,11 @@ const lyUpEl = $<HTMLButtonElement>("#ly-up");
 const lyDownEl = $<HTMLButtonElement>("#ly-down");
 const lyDupEl = $<HTMLButtonElement>("#ly-dup");
 const lyDelEl = $<HTMLButtonElement>("#ly-del");
+const lyAddEl = $<HTMLButtonElement>("#ly-add");
+lyAddEl.onclick = () => {
+  imagePickFor = "layer";
+  inImageEl.click();
+};
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -1077,6 +1421,7 @@ lyDelEl.onclick = () => deleteSelected();
 function syncLayerTools() {
   const off = !selectedNode() || !current?.assets || doc?.type !== "scene";
   for (const b of [lyUpEl, lyDownEl, lyDupEl, lyDelEl]) b.disabled = off;
+  lyAddEl.disabled = !overlay || doc?.type !== "scene";
 }
 
 function renderTree() {
@@ -1178,25 +1523,6 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
   return row;
 }
 
-/** 根到目标节点的路径（含目标）。引擎活层 id 是数值，文档 id 可能是字符串，按字符串比 */
-function findPath(nodes: LayerNode[], id: number | string): LayerNode[] | null {
-  for (const n of nodes) {
-    if (String(n.id) === String(id)) return [n];
-    const sub = findPath(n.children, id);
-    if (sub) return [n, ...sub];
-  }
-  return null;
-}
-
-function findNode(nodes: LayerNode[], id: number | string): LayerNode | null {
-  for (const n of nodes) {
-    if (n.id === id) return n;
-    const hit = findNode(n.children, id);
-    if (hit) return hit;
-  }
-  return null;
-}
-
 // ---------- 检视器（P0 只读） ----------
 
 function fmt(v: unknown): string {
@@ -1286,7 +1612,7 @@ function editGroup(node: LayerNode): HTMLElement {
   const done = (keys: Array<keyof EditorLayerProps>) => {
     const after = editor?.getLayerProps(Number(id));
     if (!before || !after) return;
-    commit({ id, name: nodeName(id), before: pick(before, keys), after: pick(after, keys) });
+    commit({ id, name: nodeName(id), before: pickProps(before, keys), after: pickProps(after, keys) });
     before = after;
   };
   const label = (key: string) => {
@@ -1451,3 +1777,4 @@ syncPlayButton();
 syncTimeline();
 requestAnimationFrame(tickTimeline);
 void loadLibrary();
+void checkDraft();

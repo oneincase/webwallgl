@@ -90,6 +90,10 @@ const STABLE = [
   // 真跑（含本地 HTTP 服务器）、本地库 17 个条目的引用闭包审计、接线守卫、变异红测。
   // 真 GPU A/B 不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-loose.mjs --headless`
   "verify-loose",
+  // 编辑器页（EDITOR-PLAN §3A）：文档模型 / 记账 / 手柄几何 / zip / 保存 / 打开 / 宿主保存端点
+  // 的单测 + 「打开 → 编辑 → 存进库 → 重新打开」闭环 + 变异红测。
+  // 真浏览器端到端不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-editor.mjs --headless`
+  "verify-editor",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */

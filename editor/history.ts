@@ -1,0 +1,100 @@
+// 编辑记账（W2-lite）：属性热改与结构编辑共用一条撤销栈。
+// 属性命令只记涉及的字段；结构命令以整份对象数组快照记账，撤销即换回快照再重挂。
+
+import type { EditorLayerProps } from "../renderer/src/api/editor";
+import { rebuildTree, type EditorDoc } from "./doc";
+
+export type Patch = Partial<EditorLayerProps>;
+export type LayerId = number | string;
+
+export type PropsCmd = { id: LayerId; name: string; before: Patch; after: Patch };
+export type StructCmd = {
+  kind: "struct";
+  label: string;
+  before: string;
+  after: string;
+  selBefore: LayerId | null;
+  selAfter: LayerId | null;
+};
+export type EditCmd = PropsCmd | StructCmd;
+
+export const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
+
+export const HISTORY_LIMIT = 200;
+
+/** 只取 keys 里的字段（撤销记录的 before 与 after 键集一致） */
+export function pickProps(props: EditorLayerProps, keys: ReadonlyArray<keyof EditorLayerProps>): Patch {
+  const out: Patch = {};
+  for (const k of keys) (out as Record<string, unknown>)[k] = structuredClone(props[k]);
+  return out;
+}
+
+/** 前后一致的属性命令不入栈（点一下没拖、改回原值） */
+export const isNoopEdit = (cmd: PropsCmd) => JSON.stringify(cmd.before) === JSON.stringify(cmd.after);
+
+export class EditHistory {
+  readonly undoStack: EditCmd[] = [];
+  readonly redoStack: EditCmd[] = [];
+
+  constructor(readonly limit = HISTORY_LIMIT) {}
+
+  get canUndo() {
+    return this.undoStack.length > 0;
+  }
+  get canRedo() {
+    return this.redoStack.length > 0;
+  }
+
+  /** 新编辑入栈：超出上限丢最早的，重做栈作废 */
+  push(cmd: EditCmd) {
+    this.undoStack.push(cmd);
+    if (this.undoStack.length > this.limit) this.undoStack.shift();
+    this.redoStack.length = 0;
+  }
+
+  /** 取出要撤销 / 重做的命令并挪到另一侧栈；调用方按命令方向落地 */
+  take(dir: "undo" | "redo"): EditCmd | undefined {
+    const from = dir === "undo" ? this.undoStack : this.redoStack;
+    const to = dir === "undo" ? this.redoStack : this.undoStack;
+    const cmd = from.pop();
+    if (cmd) to.push(cmd);
+    return cmd;
+  }
+
+  clear() {
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+  }
+}
+
+/** 本文档累计的热改（按层合并，后写覆盖先写）：重挂后原样重放，保证「重挂 ≡ 热改」 */
+export function mergeLiveEdit(live: Map<string, Patch>, id: LayerId, patch: Patch) {
+  const key = String(id);
+  live.set(key, { ...(live.get(key) ?? {}), ...structuredClone(patch) });
+}
+
+/** 文档对象数组整体换成快照（结构编辑落地 / 撤销 / 重做共用） */
+export function restoreObjects(doc: EditorDoc, json: string) {
+  if (!doc.scene) return;
+  doc.scene.objects = JSON.parse(json);
+  rebuildTree(doc);
+}
+
+/**
+ * 一次结构编辑：快照 → mutate 改文档 → 产出命令。mutate 返回新的选中 id，
+ * undefined = 没改成；对象数组前后一致也不算编辑。返回 null 时文档未变。
+ */
+export function structCommand(
+  doc: EditorDoc,
+  label: string,
+  selBefore: LayerId | null,
+  mutate: (d: EditorDoc) => LayerId | null | undefined,
+): StructCmd | null {
+  if (!doc.scene) return null;
+  const before = JSON.stringify(doc.scene.objects ?? []);
+  const sel = mutate(doc);
+  if (sel === undefined) return null;
+  const after = JSON.stringify(doc.scene.objects ?? []);
+  if (after === before) return null;
+  return { kind: "struct", label, before, after, selBefore, selAfter: sel };
+}

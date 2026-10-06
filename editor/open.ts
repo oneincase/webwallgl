@@ -21,7 +21,27 @@ export type SceneAssets = {
   /** 场景入口 json 的名字（scene.json / gifscene.json / project.file 声明的 json） */
   entry: string;
   read(name: string, signal?: AbortSignal): Promise<Uint8Array | null>;
+  /**
+   * 保存时要写出的资源名（不含入口 json）。包 = 全部条目；本地目录 = 全部文件；
+   * 库里的松散工程没有目录清单，只能给出「引擎实际读到过的」—— 渲染所需已齐，
+   * 脚本运行时按名动态读的文件可能漏。
+   */
+  list(): string[];
 };
+
+/** 包一层读取器，记下命中过的名字（库内松散工程无目录清单，靠它凑保存清单） */
+function trackReads(entry: string, read: SceneAssets["read"]): SceneAssets {
+  const seen = new Set<string>();
+  return {
+    entry,
+    async read(name, signal) {
+      const bytes = await read(name, signal);
+      if (bytes) seen.add(name);
+      return bytes;
+    },
+    list: () => [...seen].filter((n) => n !== entry),
+  };
+}
 
 export type Opened = { doc: EditorDoc; source: Source; assets?: SceneAssets };
 
@@ -56,7 +76,8 @@ function pkgAssets(bytes: ArrayBuffer, project: Record<string, unknown> | null):
   const names = /\.json$/i.test(declared) ? [declared, ...SCENE_JSON_CANDIDATES] : SCENE_JSON_CANDIDATES;
   const entry = names.find((name) => getEntry(pkg, name));
   if (!entry) return null;
-  return { entry, read: async (name) => getEntry(pkg, name) as Uint8Array | null };
+  const all = (pkg.entries as Array<{ name: string }>).map((e) => e.name).filter((n) => n !== entry);
+  return { entry, read: async (name) => getEntry(pkg, name) as Uint8Array | null, list: () => all };
 }
 
 async function sceneJsonOf(assets: SceneAssets | null) {
@@ -117,8 +138,11 @@ export async function openLibraryItem(it: LibraryItem, mediaBase: string, webBas
 
   const dir = await hs.sceneDir?.();
   if (dir) {
-    const assets: SceneAssets = { entry: dir.entry, read: (name, signal) => dir.read(name, signal) };
-    return { doc: makeDoc(it.title, project, await sceneJsonOf(assets), "loose"), source: hs, assets };
+    const assets = trackReads(dir.entry, (name, signal) => dir.read(name, signal));
+    // 引擎也经同一个读取器取资源，保存清单才凑得齐。去掉 key：库内场景缓存命中时会
+    // 复用上一次打开留下的读取器，新的这份就记不到读取（dir 自己按名缓存，不怕重复拉）
+    const source: Source = { ...hs, key: undefined, sceneDir: async () => assets };
+    return { doc: makeDoc(it.title, project, await sceneJsonOf(assets), "loose"), source, assets };
   }
   // 页面先取一次包字节：既解析图层树，也原样交给引擎，避免同一个包下载两遍
   const raw = await hs.scenePkg();
@@ -196,6 +220,7 @@ export async function openLocalFiles(input: LocalFile[]): Promise<Opened> {
         cache.set(name, bytes);
         return bytes;
       },
+      list: () => files.map((f) => f.path).filter((p) => p !== entry),
     };
     const source: Source = {
       key: `local-dir:${title}:${Date.now()}`,
