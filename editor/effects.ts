@@ -1,4 +1,4 @@
-// 效果库基础集（EDITOR-PLAN §3 W7 基础集 / §3A 效果库面板）。
+// 效果库（EDITOR-PLAN §3 W7 基础集 + 扩充集 / §3A 效果库面板）。
 //
 // 新建壁纸没有 pkg 可蹭官方效果，于是添加效果时把三件套**写进工程**（与 WE 发布时
 // 把用到的效果打进包是同一形态），保存产物自包含，现有读链原样加载：
@@ -155,6 +155,96 @@ export const EFFECTS: readonly EffectDef[] = [
 	c.a *= 1.0 - g_FxAmount * (0.5 + 0.5 * sin(g_Time * g_FxSpeed * 6.2831853));
 	gl_FragColor = c;`,
     "uniform float g_Time;\n",
+  ),
+  def(
+    "outline",
+    [
+      { key: "color", type: "color", default: [0, 0, 0] },
+      { key: "width", type: "float", default: 3, min: 0, max: 16, step: 0.5 },
+    ],
+    `	vec2 px = g_FxWidth / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
+	vec4 c = texSample2D(g_Texture0, v_TexCoord);
+	float a = 0.0;
+	for (int i = 0; i < 16; i++) {
+		float t = float(i) * 0.39269908;
+		a = max(a, texSample2D(g_Texture0, v_TexCoord + vec2(cos(t), sin(t)) * px).a);
+	}
+	gl_FragColor = vec4(mix(g_FxColor, c.rgb, c.a), max(c.a, a));`,
+    "uniform vec4 g_Texture0Resolution;\n",
+  ),
+  def(
+    "glow",
+    [
+      { key: "color", type: "color", default: [1, 0.85, 0.4] },
+      { key: "radius", type: "float", default: 4, min: 0, max: 16, step: 0.1 },
+      { key: "strength", type: "float", default: 1.5, min: 0, max: 4, step: 0.05 },
+    ],
+    `	vec2 px = g_FxRadius / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
+	vec4 c = texSample2D(g_Texture0, v_TexCoord);
+	float a = 0.0;
+	float wsum = 0.0;
+	for (int i = -3; i <= 3; i++) {
+		for (int j = -3; j <= 3; j++) {
+			float w = exp(-float(i * i + j * j) / 8.0);
+			a += texSample2D(g_Texture0, v_TexCoord + vec2(float(i), float(j)) * px).a * w;
+			wsum += w;
+		}
+	}
+	a = clamp(a / wsum * g_FxStrength, 0.0, 1.0);
+	gl_FragColor = vec4(mix(g_FxColor, c.rgb, c.a), max(c.a, a));`,
+    "uniform vec4 g_Texture0Resolution;\n",
+  ),
+  def(
+    "chroma",
+    [
+      { key: "amount", type: "float", default: 0.006, min: 0, max: 0.05, step: 0.0005 },
+      { key: "angle", type: "float", default: 0, min: 0, max: 6.2832, step: 0.01 },
+    ],
+    `	vec2 d = vec2(cos(g_FxAngle), sin(g_FxAngle)) * g_FxAmount;
+	vec4 r = texSample2D(g_Texture0, v_TexCoord + d);
+	vec4 c = texSample2D(g_Texture0, v_TexCoord);
+	vec4 b = texSample2D(g_Texture0, v_TexCoord - d);
+	gl_FragColor = vec4(r.r, c.g, b.b, max(max(r.a, c.a), b.a));`,
+  ),
+  def(
+    "pixelate",
+    [{ key: "size", type: "float", default: 8, min: 1, max: 64, step: 1 }],
+    `	vec2 cell = max(g_FxSize, 1.0) / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
+	vec2 uv = (floor(v_TexCoord / cell) + vec2(0.5, 0.5)) * cell;
+	gl_FragColor = texSample2D(g_Texture0, uv);`,
+    "uniform vec4 g_Texture0Resolution;\n",
+  ),
+  def(
+    "shine",
+    [
+      { key: "color", type: "color", default: [1, 1, 1] },
+      { key: "width", type: "float", default: 0.12, min: 0.01, max: 0.5, step: 0.01 },
+      { key: "speed", type: "float", default: 0.4, min: 0, max: 4, step: 0.01 },
+      { key: "angle", type: "float", default: 0.6, min: 0, max: 6.2832, step: 0.01 },
+      { key: "strength", type: "float", default: 0.8, min: 0, max: 2, step: 0.01 },
+    ],
+    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
+	float p = dot(v_TexCoord - vec2(0.5, 0.5), vec2(cos(g_FxAngle), sin(g_FxAngle))) + 0.5;
+	float pos = fract(g_Time * g_FxSpeed) * (1.0 + 4.0 * g_FxWidth) - 2.0 * g_FxWidth;
+	float band = 1.0 - smoothstep(0.0, g_FxWidth, abs(p - pos));
+	c.rgb = clamp(c.rgb + g_FxColor * band * g_FxStrength, 0.0, 1.0);
+	gl_FragColor = c;`,
+    "uniform float g_Time;\n",
+  ),
+  def(
+    "fade",
+    [
+      { key: "angle", type: "float", default: 0, min: 0, max: 6.2832, step: 0.01 },
+      { key: "start", type: "float", default: 0.2, min: -0.5, max: 1.5, step: 0.01 },
+      { key: "end", type: "float", default: 0.8, min: -0.5, max: 1.5, step: 0.01 },
+    ],
+    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
+	float p = dot(v_TexCoord - vec2(0.5, 0.5), vec2(cos(g_FxAngle), sin(g_FxAngle))) + 0.5;
+	float lo = min(g_FxStart, g_FxEnd);
+	float hi = max(g_FxStart, g_FxEnd) + 0.0001;
+	float m = smoothstep(lo, hi, p);
+	c.a *= g_FxStart <= g_FxEnd ? m : 1.0 - m;
+	gl_FragColor = c;`,
   ),
 ];
 

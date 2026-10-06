@@ -807,7 +807,7 @@ async function runCreateAndDraft(ctx) {
   const tTop = worldToPage(crT, [1110, 590]);
   const tBot = worldToPage(crT, [1110, 490]);
   const tOut = worldToPage(crT, [300, 540]);
-  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 8`), "选中图片层：检视器有「效果」分组，下拉列出 7 个内置效果");
+  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 14`), "选中图片层：检视器有「效果」分组，下拉列出 13 个内置效果");
   check((await fxNames()).length === 0, "初始无效果");
 
   await fxAdd("tint");
@@ -1908,4 +1908,133 @@ async function runCreateAndDraft(ctx) {
   await settle();
   check((await ev(`[...document.querySelectorAll('#ed-tree .ed-node.selected')].map((n) => n.dataset.id).sort().join()`)) === [f1, f3].sort().join(), "画面上 ⇧ 点另一层：加入选中");
   check((await h.errorLines()).length === 0, "多选全程无错误");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AG. 效果扩充集出帧（描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩）");
+  /** 页面矩形内各类像素占比（黑底；选中框画布已隐藏） */
+  const fxStats = async ([x0, y0], [x1, y1]) => {
+    const clip = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.max(2, Math.abs(x1 - x0)), height: Math.max(2, Math.abs(y1 - y0)), scale: 1 };
+    const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip });
+    return ev(`(async () => {
+      const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
+      const c = new OffscreenCanvas(bmp.width, bmp.height); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0);
+      const d = g.getImageData(0, 0, bmp.width, bmp.height).data; const n = d.length / 4; let white = 0, red = 0, blue = 0, lit = 0, edges = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], gg = d[i + 1], b = d[i + 2];
+        if (r + gg + b > 690) white++;
+        if (r > 120 && gg < 90 && b < 90) red++;
+        if (b > 120 && r < 90 && gg < 90) blue++;
+        if (r + gg + b > 90) lit++;
+        if (i % (bmp.width * 4) !== 0 && Math.abs(r + gg + b - d[i - 4] - d[i - 3] - d[i - 2]) > 300) edges++;
+      }
+      return { white: white / n, red: red / n, blue: blue / n, lit: lit / n, edges };
+    })()`);
+  };
+  await gotoEditor();
+  await newBlank("#000000");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  await addTextPreset("plain");
+  await setText("content", "MMM");
+  await setText("size", "24");
+  await h.setInputs({ 0: 960, 1: 540 });
+  await settle();
+  const gBox = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [450, 200]));
+  const base = await fxStats(...(await gBox()));
+  check(base.white > 0.01 && base.red === 0 && base.blue === 0, `基线：白字黑底，无红无蓝（白 ${base.white.toFixed(3)}）`);
+
+  await fxAdd("outline");
+  await fxSet(0, "color", "#ff0000");
+  await fxSet(0, "width", "4");
+  await settle();
+  const ol = await fxStats(...(await gBox()));
+  check(ol.red > 0.005 && ol.white > base.white * 0.6, `★ 描边：字形外出现红边、白字仍在（红 ${ol.red.toFixed(3)} / 白 ${ol.white.toFixed(3)}）`);
+  await fxSet(0, "width", "0");
+  await settle();
+  const ol0 = await fxStats(...(await gBox()));
+  check(ol0.red < ol.red * 0.2, `描边宽 0：红边消失（红 ${ol0.red.toFixed(3)}）`);
+  await fxBtn(0, "ed-fx-del");
+
+  await fxAdd("glow");
+  await fxSet(0, "color", "#ff0000");
+  await fxSet(0, "radius", "5");
+  await fxSet(0, "strength", "3");
+  await settle();
+  const gw = await fxStats(...(await gBox()));
+  check(gw.red > 0.005 && gw.white > base.white * 0.6, `★ 外发光：字周围红色光晕、白字不被盖住（红 ${gw.red.toFixed(3)}）`);
+  await fxSet(0, "strength", "0");
+  await settle();
+  check((await fxStats(...(await gBox()))).red < gw.red * 0.2, "外发光强度 0：光晕消失");
+  await fxBtn(0, "ed-fx-del");
+
+  await fxAdd("chroma");
+  await fxSet(0, "amount", "0.02");
+  await settle();
+  const ch = await fxStats(...(await gBox()));
+  check(ch.red > 0.002 && ch.blue > 0.002, `★ 色差：一侧红边一侧蓝边（红 ${ch.red.toFixed(3)} / 蓝 ${ch.blue.toFixed(3)}）`);
+  await fxSet(0, "amount", "0");
+  await settle();
+  const ch0 = await fxStats(...(await gBox()));
+  check(ch0.red < 0.0005 && ch0.blue < 0.0005, "色差 0：红蓝边消失");
+  await fxBtn(0, "ed-fx-del");
+  await settle();
+  check(Math.abs((await fxStats(...(await gBox()))).white - base.white) < base.white * 0.1, "删掉效果：回到基线");
+
+  await gotoEditor();
+  await newBlank("#000000");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  await addImage(stripePath);
+  await settle();
+  const crS = await h.canvasRect();
+  const sRed = worldToPage(crS, [1110, 590]);
+  const sBlue = worldToPage(crS, [1110, 490]);
+  const nearTop = worldToPage(crS, [1110, 560]);
+  const nearBot = worldToPage(crS, [1110, 520]);
+  const sideL = worldToPage(crS, [790, 590]);
+  const sideR = worldToPage(crS, [1130, 590]);
+  check(isRed(await pixelAt(nearTop)) && isBlue(await pixelAt(nearBot)), "条纹图基线：分界线两侧 20 单位一红一蓝");
+
+  await fxAdd("pixelate");
+  await fxSet(0, "size", "64");
+  await settle();
+  const pT = await pixelAt(nearTop);
+  const pB = await pixelAt(nearBot);
+  check(close(pT, pB, 10) && (isRed(pT) || isBlue(pT)), `★ 像素化 64：分界线所在的 64px 格整体同色（上 ${pT} / 下 ${pB}）`);
+  check(isRed(await pixelAt(sRed)) && isBlue(await pixelAt(sBlue)), "远离分界的格子颜色不变");
+  await fxSet(0, "size", "1");
+  await settle();
+  check(isRed(await pixelAt(nearTop)) && isBlue(await pixelAt(nearBot)), "像素块 1：等同原图");
+  await fxBtn(0, "ed-fx-del");
+
+  await fxAdd("fade");
+  await fxSet(0, "start", "0");
+  await fxSet(0, "end", "1");
+  await settle();
+  const fdL = await pixelAt(sideL);
+  const fdR = await pixelAt(sideR);
+  check(fdL[0] < 40 && isRed(fdR), `★ 渐隐遮罩 0→1：左缘透明（露黑底 ${fdL}）、右缘不透明（${fdR}）`);
+  await fxSet(0, "start", "1");
+  await fxSet(0, "end", "0");
+  await settle();
+  const fdL2 = await pixelAt(sideL);
+  const fdR2 = await pixelAt(sideR);
+  check(isRed(fdL2) && fdR2[0] < 40, `起点 > 终点：方向反过来（左 ${fdL2} / 右 ${fdR2}）`);
+  await fxBtn(0, "ed-fx-del");
+
+  await fxAdd("shine");
+  await fxSet(0, "color", "#00ff00");
+  await fxSet(0, "speed", "1");
+  await fxSet(0, "width", "0.3");
+  await fxSet(0, "strength", "2");
+  const greens = [];
+  for (let i = 0; i < 12; i++) {
+    greens.push((await pixelAt(worldToPage(await h.canvasRect(), [960, 590])))[1]);
+    await new Promise((r) => setTimeout(r, 110));
+  }
+  check(Math.max(...greens) > 150 && Math.min(...greens) < 60, `★ 扫光：同一点绿色随时间扫过又离开（G 序列 ${greens.join(",")}）`);
+  await fxSet(0, "speed", "0");
+  await fxSet(0, "strength", "0");
+  await settle();
+  check(isRed(await pixelAt(sRed)), "扫光强度 0：原图");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  check((await h.errorLines()).length === 0, "效果扩充集全程无错误");
 }

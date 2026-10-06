@@ -1022,7 +1022,20 @@ const uniformNotes = (frag) => {
 };
 {
   const f = fxMod;
-  check(json(f.EFFECTS.map((e) => e.id)) === json(["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse"]), "基础集 7 个：颜色叠加 / 色彩调整 / 暗角 / 模糊 / 波浪 / 滚动 / 呼吸");
+  check(json(f.EFFECTS.map((e) => e.id).slice(0, 7)) === json(["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse"]), "基础集 7 个：颜色叠加 / 色彩调整 / 暗角 / 模糊 / 波浪 / 滚动 / 呼吸");
+  check(json(f.EFFECTS.map((e) => e.id).slice(7)) === json(["outline", "glow", "chroma", "pixelate", "shine", "fade"]), "扩充集 6 个：描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩");
+  check(f.EFFECTS.filter((e) => /g_Texture0Resolution\b/.test(e.frag)).every((e) => /uniform vec4 g_Texture0Resolution;/.test(e.frag)) && ["outline", "glow", "pixelate"].every((id) => /g_Texture0Resolution\.xy/.test(f.effectById(id).frag)), "按像素取样的效果（描边 / 发光 / 像素化 / 模糊）都声明并使用源贴图尺寸");
+  {
+    const ol = f.effectById("outline").frag;
+    const gl = f.effectById("glow").frag;
+    const fd = f.effectById("fade").frag;
+    check(/mix\(g_FxColor, c\.rgb, c\.a\), max\(c\.a, a\)\)/.test(ol) && /mix\(g_FxColor, c\.rgb, c\.a\), max\(c\.a, a\)\)/.test(gl), "描边 / 发光画在原图后面：rgb 按原 alpha 混色，alpha 取 max（不盖住原图）");
+    check(/i < 16/.test(ol) && /i <= 3/.test(gl) && /exp\(/.test(gl), "描边 16 方向取最大 alpha；发光 7×7 高斯");
+    check(/floor\(v_TexCoord \/ cell\) \+ vec2\(0\.5, 0\.5\)/.test(f.effectById("pixelate").frag), "像素化取格子中心（不是左上角，避免整体偏移半格）");
+    check(/r\.r, c\.g, b\.b/.test(f.effectById("chroma").frag), "色差：R 正偏、G 居中、B 反偏");
+    check(/g_FxStart <= g_FxEnd \? m : 1\.0 - m/.test(fd) && /min\(g_FxStart, g_FxEnd\)/.test(fd), "渐隐遮罩起点 > 终点时反向（smoothstep 不吃倒序区间）");
+    check(/fract\(g_Time \* g_FxSpeed\)/.test(f.effectById("shine").frag), "扫光按 g_Time 循环");
+  }
   check(new Set(f.EFFECTS.map((e) => e.id)).size === f.EFFECTS.length && f.EFFECTS.every((e) => /^[a-z0-9]+$/.test(e.id)), "id 唯一且只含小写字母数字（effectIdOf 的正则能认回）");
   let annotOk = true;
   const annotBad = [];
@@ -2295,6 +2308,16 @@ section("I. 接线");
 // ───────────────────────────────────────────────────────────────────────────
 section("J. 变异红测");
 {
+  {
+    const fxPath = path.join(ROOT, "editor/effects.ts");
+    const fxSrc = fs.readFileSync(fxPath, "utf8");
+    const mutFx = fxSrc.replace("g_FxStart <= g_FxEnd ? m : 1.0 - m", "m").replace("(floor(v_TexCoord / cell) + vec2(0.5, 0.5)) * cell", "floor(v_TexCoord / cell) * cell");
+    check(mutFx !== fxSrc && (mutFx.match(/g_FxStart <= g_FxEnd/g) ?? []).length === 0, "注入点存在（渐隐方向 / 像素化格心）");
+    const mf = await loadEditorModule("effects", { [fxPath]: mutFx });
+    const fd = mf.effectById("fade").frag;
+    const px = mf.effectById("pixelate").frag;
+    check(!/g_FxStart <= g_FxEnd \? m : 1\.0 - m/.test(fd) && !/floor\(v_TexCoord \/ cell\) \+ vec2\(0\.5, 0\.5\)/.test(px), "渐隐不处理倒序 / 像素化取格角时判据变红");
+  }
   const docPath = path.join(ROOT, "editor/doc.ts");
   const docSrc = fs.readFileSync(docPath, "utf8");
   const mutated = docSrc.replace("const insertAt = dir < 0 ? otherIdx[0] : otherIdx[otherIdx.length - 1] + 1;", "const insertAt = otherIdx[0];");
