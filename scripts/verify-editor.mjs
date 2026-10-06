@@ -995,6 +995,173 @@ section("P. 新建闭环（模板 → 图片层 → 保存 → 重新打开）")
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// S. 效果库基础集 effects.ts
+// ───────────────────────────────────────────────────────────────────────────
+section("S. 效果库 effects.ts");
+const fxMod = await loadEditorModule("effects");
+const uniformNotes = (frag) => {
+  const out = new Map();
+  for (const m of frag.matchAll(/^uniform\s+(float|vec3)\s+(\w+);\s*\/\/\s*(\{.*\})\s*$/gm)) out.set(m[2], { type: m[1], note: JSON.parse(m[3]) });
+  return out;
+};
+{
+  const f = fxMod;
+  check(json(f.EFFECTS.map((e) => e.id)) === json(["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse"]), "基础集 7 个：颜色叠加 / 色彩调整 / 暗角 / 模糊 / 波浪 / 滚动 / 呼吸");
+  check(new Set(f.EFFECTS.map((e) => e.id)).size === f.EFFECTS.length && f.EFFECTS.every((e) => /^[a-z0-9]+$/.test(e.id)), "id 唯一且只含小写字母数字（effectIdOf 的正则能认回）");
+  let annotOk = true;
+  const annotBad = [];
+  for (const e of f.EFFECTS) {
+    const notes = uniformNotes(e.frag);
+    for (const p of e.params) {
+      const u = notes.get(f.uniformName(p.key));
+      const want = p.type === "color" ? "vec3" : "float";
+      const def = typeof p.default === "number" ? p.default : p.default.join(" ");
+      const got = u?.note.default;
+      const defOk = typeof p.default === "number" ? near(got, p.default, 1e-4) : json(String(got).split(" ").map(Number)) === json([...p.default]);
+      if (!u || u.type !== want || u.note.material !== p.key || !defOk || (p.type === "color" && u.note.type !== "color")) {
+        annotOk = false;
+        annotBad.push(`${e.id}.${p.key}(${def})`);
+      }
+      if (p.type === "float" && !(p.min <= p.default && p.default <= p.max && p.step > 0)) {
+        annotOk = false;
+        annotBad.push(`${e.id}.${p.key} 范围`);
+      }
+    }
+    if (notes.size !== e.params.length) {
+      annotOk = false;
+      annotBad.push(`${e.id} 多出 uniform 注释`);
+    }
+    if (!/gl_FragColor\s*=/.test(e.frag) || !/g_Texture0;\s*\/\/ \{"hidden":true\}/.test(e.frag)) {
+      annotOk = false;
+      annotBad.push(`${e.id} 缺输出 / 源贴图`);
+    }
+  }
+  check(annotOk, `每个参数都有同名 uniform：类型对、material = 参数名、default 与面板一致、颜色标 type（${annotBad.join(", ") || "ok"}）`);
+  check(f.EFFECTS.filter((e) => /g_Time\b/.test(e.frag)).every((e) => /uniform float g_Time;/.test(e.frag)) && /uniform vec4 g_Texture0Resolution;/.test(f.effectById("blur").frag), "用到 g_Time / g_Texture0Resolution 的都声明了（引擎按名绑定）");
+
+  const tint = f.effectById("tint");
+  const files = f.effectFiles(tint);
+  check(json(files.map((x) => x.name)) === json(["effects/wwgl_tint/effect.json", "materials/effects/wwgl_tint.json", "shaders/effects/wwgl_tint.frag", "shaders/effects/wwgl_tint.vert"]), "写进工程的四件：effect.json / 材质 / frag / vert（wwgl_ 前缀）");
+  const ej = JSON.parse(dec.decode(files[0].data));
+  const mj = JSON.parse(dec.decode(files[1].data));
+  check(ej.passes?.[0]?.material === files[1].name && json(ej.dependencies) === json(files.slice(1).map((x) => x.name)), "effect.json：pass 指向材质，dependencies 列全另外三件");
+  check(mj.passes?.[0]?.shader === "effects/wwgl_tint" && mj.passes[0].depthtest === "disabled", "材质：shader = effects/wwgl_tint（引擎补 shaders/ 与 .frag/.vert）");
+  check(dec.decode(files[2].data) === tint.frag && /g_ModelViewProjectionMatrix/.test(dec.decode(files[3].data)), "frag 即定义里的源码；vert 是通用全层顶点着色器");
+  check(f.effectFileOf("blur") === "effects/wwgl_blur/effect.json" && f.effectIdOf("effects/wwgl_blur/effect.json") === "blur", "effectFileOf / effectIdOf 互逆");
+  check(f.effectIdOf("effects/waterripple/effect.json") === null && f.effectIdOf("effects/wwgl_nope/effect.json") === null && f.effectIdOf(3) === null, "官方效果 / 未知 id / 非字符串 → null（面板只读展示）");
+
+  const amount = tint.params[1];
+  const color = tint.params[0];
+  check(f.encodeValue(amount, 2) === 1 && f.encodeValue(amount, -1) === 0 && f.encodeValue(amount, 0.123456) === 0.1235, "标量：按范围夹住、保留 4 位");
+  check(f.encodeValue(color, [1, 0.5, 2]) === "1 0.5 1" && f.encodeValue(color, 0.25) === "0.25 0.25 0.25", "颜色：写成 \"r g b\" 字符串（与 WE 同），分量夹到 0..1");
+  check(json(f.decodeValue(color, "0.1 0.2 0.3")) === json([0.1, 0.2, 0.3]) && json(f.decodeValue(color, { user: "c", value: "1 0 0" })) === json([1, 0, 0]) && json(f.decodeValue(color, "bad")) === json([1, 0.45, 0.2]), "颜色解码：字符串 / {user,value} 包装 / 非法回缺省");
+  check(f.decodeValue(amount, "0.7") === 0.7 && f.decodeValue(amount, { script: "x", value: 0.3 }) === 0.3 && f.decodeValue(amount, undefined) === 0.5, "标量解码：数字串 / {script,value} 包装 / 缺失回缺省");
+
+  const o = { id: 1, image: "models/x.json" };
+  check(f.addEffect(o, "nope") === null && o.effects === undefined, "未知效果拒绝，不留空数组");
+  check(f.addEffect(o, "tint") === 0 && f.addEffect(o, "vignette") === 1, "addEffect：追加到效果链末尾，返回序号");
+  check(json(o.effects[0]) === json({ file: "effects/wwgl_tint/effect.json", name: "tint", visible: true, passes: [{ constantshadervalues: { color: "1 0.45 0.2", amount: 0.5 } }] }), "新效果条目：file / name / visible / 缺省常量（scene.json 形状）");
+  check(f.setEffectParam(o, 0, "amount", 0.9) && o.effects[0].passes[0].constantshadervalues.amount === 0.9, "setEffectParam：直接值");
+  o.effects[0].passes[0].constantshadervalues.color = { user: "fxcolor", value: "1 1 1" };
+  check(f.setEffectParam(o, 0, "color", [0, 1, 0]) && json(o.effects[0].passes[0].constantshadervalues.color) === json({ user: "fxcolor", value: "0 1 0" }), "setEffectParam：{user,value} 包装只改 value，绑定保留");
+  check(!f.setEffectParam(o, 0, "nope", 1) && !f.setEffectParam(o, 9, "amount", 1), "未知参数 / 越界序号拒绝");
+  o.effects.push({ file: "effects/waterripple/effect.json", visible: { user: "rip", value: false }, passes: [{ constantshadervalues: { speed: 2 } }] });
+  check(!f.setEffectParam(o, 2, "speed", 1), "非本库效果不改参数");
+  const v = f.effectViews(o);
+  check(v.length === 3 && v[0].def?.id === "tint" && json(v[0].values.color) === json([0, 1, 0]) && v[0].values.amount === 0.9, "effectViews：本库效果解出参数值（含包装）");
+  check(v[2].def === null && v[2].name === "waterripple" && v[2].visible === false && json(v[2].values) === "{}", "effectViews：外部效果只给名字 / 开关，名字取目录名");
+  check(f.setEffectVisible(o, 2, true) && json(o.effects[2].visible) === json({ user: "rip", value: true }), "setEffectVisible：包装只改 value");
+  check(f.setEffectVisible(o, 0, false) && o.effects[0].visible === false && !f.isEffectVisible(o.effects[0]) && f.isEffectVisible({}) && !f.isEffectVisible({ visible: "0" }), "开关：直接值 / 缺省为开 / \"0\" 为关");
+  check(f.moveEffect(o, 0, 1) && o.effects[1].name === "tint" && !f.moveEffect(o, 0, -1) && !f.moveEffect(o, 2, 1), "moveEffect：与相邻交换，首尾越界拒绝");
+  check(f.removeEffect(o, 2) && f.removeEffect(o, 0) && o.effects.length === 1 && f.removeEffect(o, 0) && !("effects" in o) && !f.removeEffect(o, 0), "removeEffect：删空后去掉 effects 字段（与没加过一致）");
+
+  const d = freshDoc();
+  f.addEffect(d.scene.objects[0], "blur");
+  f.addEffect(d.scene.objects[1], "tint");
+  d.scene.objects[1].effects.push({ file: "effects/shake/effect.json" });
+  check(json([...f.referencedEffects(d)].sort()) === json(["effects/shake/effect.json", "effects/wwgl_blur/effect.json", "effects/wwgl_tint/effect.json"]) && f.referencedEffects(null).size === 0, "referencedEffects：收集全部图层的效果文件");
+}
+
+section("S2. 效果 shader 真编译（hlsl2glsl → glslang，无需修复）");
+if (spawnSync("glslangValidator", ["--version"]).status !== 0) {
+  console.log("  （跳过：未找到 glslangValidator）");
+} else {
+  const { hlsl2glsl } = await imp("renderer/vendor/we-scene/render/hlsl2glsl.js");
+  const { WE_SHADER_HEADERS } = await imp("renderer/vendor/we-scene/headers.ts");
+  const { parseInfoLog } = await imp("renderer/vendor/we-scene/render/glsl-repair.js");
+  const GL_HEAD = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+  const glDir = fs.mkdtempSync(path.join(tmpRoot, "glsl-"));
+  const glc = (stage, src) => {
+    const file = path.join(glDir, `s.${stage}`);
+    fs.writeFileSync(file, src);
+    const r = spawnSync("glslangValidator", [file], { encoding: "utf8" });
+    return r.status === 0 ? [] : parseInfoLog(String(r.stdout));
+  };
+  const resolver = (rel) => WE_SHADER_HEADERS[rel.replace(/^shaders\//, "")] ?? null;
+  const transpile = (stage, src, sib) => {
+    const out = hlsl2glsl(src, stage, {}, resolver, sib);
+    return /^\s*#version/.test(out) ? out : GL_HEAD + out;
+  };
+  for (const e of fxMod.EFFECTS) {
+    const [, , fragF, vertF] = fxMod.effectFiles(e);
+    const frag = dec.decode(fragF.data);
+    const vert = dec.decode(vertF.data);
+    const fe = glc("frag", transpile("frag", frag, vert));
+    const ve = glc("vert", transpile("vert", vert, frag));
+    check(fe.length === 0 && ve.length === 0, `${e.id}：frag / vert 转译后直接编过${fe.length || ve.length ? ` —— ${[...fe, ...ve].map((x) => x.msg).join(" | ")}` : ""}`);
+  }
+  const broken = glc("frag", transpile("frag", fxMod.effectById("tint").frag.replace("g_FxAmount);", "g_FxAmount;"), ""));
+  check(broken.length > 0, "反例：故意写坏的 frag 确实编不过（编译判据是真的）");
+}
+
+section("S3. 效果闭环（新建 → 图片层 + 2 个内置效果 → 保存 → 重新打开）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("效果测试", 1920, 1080, [0, 0, 0]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const refs = () => new Set([...createMod.referencedModels(doc), ...fxMod.referencedEffects(doc)]);
+    const ov = assetsMod.overlayAssets("scene.json", empty, refs);
+    const img = { name: "bg.png", bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1]), ext: "png", width: 1920, height: 1080 };
+    for (const x of createMod.imageLayerFiles("bg", img)) ov.put(x.name, x.data, createMod.modelPathOf("bg"));
+    const id = createMod.addImageLayer(doc, "bg", img, "cover");
+    const obj = doc.scene.objects.find((o) => o.id === id);
+    const addFx = (fxId) => {
+      for (const x of fxMod.effectFiles(fxMod.effectById(fxId))) ov.put(x.name, x.data, fxMod.effectFileOf(fxId));
+      return fxMod.addEffect(obj, fxId);
+    };
+    addFx("tint");
+    addFx("vignette");
+    addFx("wave");
+    fxMod.removeEffect(obj, 2);
+    fxMod.setEffectParam(obj, 0, "color", [0, 1, 0]);
+    fxMod.setEffectParam(obj, 0, "amount", 1);
+    const files = await saveMod.collectProject(doc, ov, null);
+    const names = files.map((x) => x.path);
+    const fxNames = names.filter((n) => /wwgl_/.test(n)).sort();
+    check(fxNames.length === 8 && fxNames.every((n) => /wwgl_(tint|vignette)/.test(n)), `保存清单：两个效果各四件，删掉的 wave 不带（实得 ${json(fxNames)}）`);
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(json(reopened.doc.scene) === json(doc.scene), "重新打开：scene.json（含效果链与参数）逐字段一致");
+    const v = fxMod.effectViews(reopened.doc.scene.objects[0]);
+    check(v.length === 2 && v[0].def?.id === "tint" && json(v[0].values.color) === json([0, 1, 0]) && v[0].values.amount === 1 && v[1].def?.id === "vignette", "重新打开：面板认回两个内置效果与改过的参数");
+    const frag = await reopened.assets.read("shaders/effects/wwgl_tint.frag");
+    const mat = JSON.parse(dec.decode(await reopened.assets.read("materials/effects/wwgl_vignette.json")));
+    check(frag && dec.decode(frag) === fxMod.effectById("tint").frag && mat.passes[0].shader === "effects/wwgl_vignette", "重新打开：shader / 材质原样可读（自包含，不依赖编辑器）");
+    for (const x of fxMod.effectFiles(fxMod.effectById("tint"))) await reopened.assets.read(x.name);
+    const ov2 = assetsMod.overlayAssets("scene.json", reopened.assets, () => new Set([...createMod.referencedModels(reopened.doc), ...fxMod.referencedEffects(reopened.doc)]));
+    const l2 = ov2.list();
+    check(fxMod.effectFiles(fxMod.effectById("tint")).every((x) => l2.includes(x.name)), "再次打开（引擎读过效果四件后）文件来自原始来源，照样进保存清单");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1012,7 +1179,19 @@ section("I. 接线");
   }
   check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /saveToLibrary\(itemId, files, progress\)/.test(main), "保存走 collectProject → 目标写出");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
-  check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedModels\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
+  check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
+  check(/const referencedGroups = [^\n]*referencedModels\(d\)[^\n]*referencedEffects\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件（写进来的效果随引用进出保存清单）");
+  check(/from "\.\/effects"/.test(main) && /function fxEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
+  check(/overlay\.put\(f\.name, f\.data, effectFileOf\(fxId\)\)/.test(main), "添加效果时把四件写进叠加层，分组 = effect.json 路径");
+  check(/inp\.addEventListener\("change", \(\) => commit\(/.test(main), "参数在 change 时提交（拖动中只更新读数，不反复重挂）");
+  const i18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const missingFx = [];
+  for (const e of fxMod.EFFECTS) {
+    for (const k of [`fx.${e.id}`, ...e.params.map((p) => `fxp.${p.key}`)]) {
+      if ((i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length !== 2) missingFx.push(k);
+    }
+  }
+  check(missingFx.length === 0, `效果名 / 参数名中英文都有（缺 ${json([...new Set(missingFx)])}）`);
   check(/structEdit\([^\n]*placeImages\(d, imgs, false\)\)/.test(main), "添加图片层走结构编辑（可撤销、整场景重挂）");
   check(/files\.every\(\(f\) => isImageFile\(f\.file\)\)\) void dropImages/.test(main), "拖入全是图片时走图片成层 / 新建");
   check(/dirty = false;\s*discardDraft\(\);/.test(main), "保存成功后清掉草稿");
@@ -1080,6 +1259,23 @@ section("J. 变异红测");
   const ao = am.overlayAssets("scene.json", null, () => new Set());
   ao.put("models/editor/k.json", enc.encode("k"), "models/editor/k.json");
   check(ao.list().length !== 0, "不按引用过滤时「撤销掉的图片不进保存清单」判据变红");
+
+  const fxPath = path.join(ROOT, "editor/effects.ts");
+  const fxSrc = fs.readFileSync(fxPath, "utf8");
+  const mutFx = fxSrc.replace("(cur as { value: unknown }).value = enc;", "pass.constantshadervalues[key] = enc;");
+  check(mutFx !== fxSrc, "注入点存在（setEffectParam 保留 {user,value} 包装）");
+  const fm = await loadEditorModule("effects", { [fxPath]: mutFx });
+  const fo = { id: 1 };
+  fm.addEffect(fo, "tint");
+  fo.effects[0].passes[0].constantshadervalues.amount = { user: "a", value: 0.5 };
+  fm.setEffectParam(fo, 0, "amount", 0.2);
+  check(json(fo.effects[0].passes[0].constantshadervalues.amount) !== json({ user: "a", value: 0.2 }), "覆盖掉包装时「绑定保留」判据变红");
+
+  const mutFx2 = fxSrc.replace('"material":"${p.key}"', '"material":"${p.key}_"');
+  check(mutFx2 !== fxSrc, "注入点存在（uniform 注释的 material 名）");
+  const fm2 = await loadEditorModule("effects", { [fxPath]: mutFx2 });
+  const tintNotes = uniformNotes(fm2.effectById("tint").frag);
+  check(tintNotes.get("g_FxAmount")?.note.material !== "amount", "material 名与参数名对不上时「scene.json 常量落到 uniform」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

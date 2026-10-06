@@ -37,6 +37,21 @@ import {
 } from "./create";
 import { applyDraft, idbDraftStore, makeDraft, type Draft, type DraftOrigin } from "./draft";
 import {
+  EFFECTS,
+  addEffect,
+  effectById,
+  effectFileOf,
+  effectFiles,
+  effectViews,
+  moveEffect,
+  referencedEffects,
+  removeEffect,
+  setEffectParam,
+  setEffectVisible,
+  type EffectValue,
+  type EffectView,
+} from "./effects";
+import {
   duplicateLayer,
   findNode,
   findPath,
@@ -325,6 +340,9 @@ async function mountCurrent(keepTime = false) {
   renderStatus();
 }
 
+/** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 */
+const referencedGroups = (d: EditorDoc | null) => new Set([...referencedModels(d), ...referencedEffects(d)]);
+
 type OpenOptions = {
   origin?: DraftOrigin | null;
   /** 新建工程没有原始来源可挂，一开始就从文档挂载 */
@@ -348,7 +366,7 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   if (gen !== openGen) return;
   current?.source.dispose?.();
   overlay =
-    opened.assets && opened.doc.scene ? overlayAssets(opened.assets.entry, opened.assets, () => referencedModels(doc)) : null;
+    opened.assets && opened.doc.scene ? overlayAssets(opened.assets.entry, opened.assets, () => referencedGroups(doc)) : null;
   if (overlay) opened = { ...opened, assets: overlay };
   current = opened;
   doc = opened.doc;
@@ -1701,6 +1719,133 @@ function editGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 效果（W7 基础集）：增删 / 开关 / 排序 / 参数，全走结构编辑 ----------
+
+const canHaveEffects = (n: LayerNode) => n.kind === "image" || n.kind === "text";
+
+const fxLabel = (v: Pick<EffectView, "def" | "name">) => (v.def ? et(`fx.${v.def.id}`) : v.name);
+
+/** 对选中层的效果做一次可撤销修改；mutate 返回 false = 没改成 */
+function fxEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean) {
+  structEdit(label, (d) => {
+    const n = findNode(d.roots, id);
+    return n && mutate(n.obj) ? n.id : undefined;
+  });
+}
+
+function addEffectTo(n: LayerNode, fxId: string) {
+  const d = effectById(fxId);
+  if (!d || !overlay) return;
+  for (const f of effectFiles(d)) overlay.put(f.name, f.data, effectFileOf(fxId));
+  fxEdit(et("log.fxAdded", { name: et(`fx.${fxId}`), layer: nodeName(n.id) }), n.id, (o) => addEffect(o, fxId) !== null);
+}
+
+function effectsGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-fx";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.effects");
+  group.appendChild(h);
+  const editable = !!overlay && !!editor && !isLocked(node.id);
+  const views = effectViews(node.obj);
+  if (!views.length) group.appendChild(note(et("fx.none")));
+  const iconBtn = (cls: string, text: string, title: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-icon ${cls}`;
+    b.textContent = text;
+    b.title = title;
+    b.disabled = !editable || disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  for (const v of views) {
+    const item = document.createElement("div");
+    item.className = "ed-fx-item";
+    item.dataset.fxIndex = String(v.index);
+    item.dataset.fxId = v.def?.id ?? "";
+    if (!v.visible) item.classList.add("hidden-layer");
+    const head = document.createElement("div");
+    head.className = "ed-fx-head";
+    const name = document.createElement("span");
+    name.className = "ed-fx-name";
+    name.textContent = fxLabel(v);
+    name.title = v.file;
+    const label = fxLabel(v);
+    head.append(
+      name,
+      iconBtn("ed-fx-eye", v.visible ? "◉" : "○", et("fx.eye"), () =>
+        fxEdit(et("log.fxToggled", { name: label }), node.id, (o) => setEffectVisible(o, v.index, !v.visible)),
+      ),
+      iconBtn("ed-fx-up", "↑", et("fx.up"), () => fxEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, -1)), v.index === 0),
+      iconBtn("ed-fx-down", "↓", et("fx.down"), () => fxEdit(et("log.fxMoved", { name: label }), node.id, (o) => moveEffect(o, v.index, 1)), v.index === views.length - 1),
+      iconBtn("ed-fx-del", "✕", et("fx.del"), () => fxEdit(et("log.fxRemoved", { name: label }), node.id, (o) => removeEffect(o, v.index))),
+    );
+    item.appendChild(head);
+    if (!v.def) {
+      item.appendChild(note(et("fx.external")));
+    } else {
+      const form = document.createElement("div");
+      form.className = "ed-fx-params";
+      for (const p of v.def.params) {
+        const l = document.createElement("label");
+        l.textContent = et(`fxp.${p.key}`);
+        const val = v.values[p.key];
+        const commit = (next: EffectValue) =>
+          fxEdit(et("log.fxParam", { name: label, param: et(`fxp.${p.key}`) }), node.id, (o) => setEffectParam(o, v.index, p.key, next));
+        const box = document.createElement("div");
+        box.className = "ed-fx-param";
+        if (p.type === "color") {
+          const inp = document.createElement("input");
+          inp.type = "color";
+          inp.dataset.param = p.key;
+          inp.value = toHex(val as number[]);
+          inp.disabled = !editable;
+          inp.addEventListener("change", () => commit(fromHex(inp.value)));
+          box.appendChild(inp);
+        } else {
+          const inp = document.createElement("input");
+          inp.type = "range";
+          inp.dataset.param = p.key;
+          inp.min = String(p.min ?? 0);
+          inp.max = String(p.max ?? 1);
+          inp.step = String(p.step ?? 0.01);
+          inp.value = String(val);
+          inp.disabled = !editable;
+          const out = document.createElement("span");
+          out.className = "ed-val";
+          out.textContent = fmtNum(val as number);
+          inp.addEventListener("input", () => (out.textContent = fmtNum(Number(inp.value))));
+          inp.addEventListener("change", () => commit(Number(inp.value)));
+          box.append(inp, out);
+        }
+        form.append(l, box);
+      }
+      item.appendChild(form);
+    }
+    group.appendChild(item);
+  }
+  const add = document.createElement("select");
+  add.id = "fx-add";
+  add.disabled = !editable;
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = et("fx.add");
+  add.appendChild(first);
+  for (const d of EFFECTS) {
+    const o = document.createElement("option");
+    o.value = d.id;
+    o.textContent = et(`fx.${d.id}`);
+    add.appendChild(o);
+  }
+  add.addEventListener("change", () => {
+    if (add.value) addEffectTo(node, add.value);
+  });
+  group.appendChild(add);
+  return group;
+}
+
 function renderInspector() {
   inspectorEl.textContent = "";
   if (!doc) {
@@ -1726,6 +1871,7 @@ function renderInspector() {
     return;
   }
   inspectorEl.appendChild(editGroup(node));
+  if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
   const o = node.obj;
   const effects = Array.isArray(o.effects)
     ? (o.effects as Array<Record<string, unknown>>)

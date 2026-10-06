@@ -547,6 +547,85 @@
   text-align: right;
 }
 
+.ed-fx-item {
+  margin: 0 0 6px;
+  padding: 4px 6px 6px;
+  border: 1px solid var(--widget-border);
+  border-radius: 4px;
+}
+
+.ed-fx-item.hidden-layer .ed-fx-name,
+.ed-fx-item.hidden-layer .ed-fx-params {
+  opacity: 0.45;
+}
+
+.ed-fx-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ed-fx-head .ed-icon {
+  width: 22px;
+  height: 22px;
+}
+
+.ed-fx-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-fx-params {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 4px;
+  align-items: center;
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.ed-fx-params > label {
+  color: var(--fg-mute);
+}
+
+.ed-fx-param {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ed-fx-param input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.ed-fx-param input[type="color"] {
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--widget-border);
+  background: transparent;
+}
+
+.ed-fx-param .ed-val {
+  min-width: 36px;
+  color: var(--fg-dim);
+  font: 11px var(--mono);
+  text-align: right;
+}
+
+#fx-add {
+  width: 100%;
+  height: 24px;
+  color: inherit;
+  background: var(--input-bg, transparent);
+  border: 1px solid var(--widget-border);
+}
+
 .ed-hint {
   margin: 6px 0 0;
   color: var(--fg-mute);

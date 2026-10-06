@@ -776,4 +776,113 @@ async function runCreateAndDraft(ctx) {
   check(!(await bannerShown()), "保存后草稿被清除（刷新不再提示）");
   const errsR = await h.errorLines();
   check(errsR.length === 0, `草稿流程无错误${errsR.length ? `：${errsR.slice(0, 2).join(" / ")}` : ""}`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）");
+  const fxNames = () => ev(`[...document.querySelectorAll('.ed-fx-item')].map((e) => e.dataset.fxId)`);
+  const fxAct = async (js) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => { ${js}; return true; })()`);
+    await h.waitRemount(r0);
+  };
+  const fxAdd = (id) => fxAct(`const s = document.querySelector('#fx-add'); s.value = '${id}'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const fxSet = (i, param, value) =>
+    fxAct(`const el = document.querySelector('.ed-fx-item[data-fx-index="${i}"] input[data-param="${param}"]'); el.value = '${value}'; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const fxBtn = (i, cls) => fxAct(`document.querySelector('.ed-fx-item[data-fx-index="${i}"] .${cls}').click()`);
+  const undoRedo = async (shift) => {
+    const r0 = await h.readyCount();
+    await key("z", shift ? MOD.meta | MOD.shift : MOD.meta);
+    await h.waitRemount(r0);
+  };
+
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  await newBlank("#000000");
+  await addImage(stripePath);
+  const crT = await h.canvasRect();
+  const tTop = worldToPage(crT, [1110, 590]);
+  const tBot = worldToPage(crT, [1110, 490]);
+  const tOut = worldToPage(crT, [300, 540]);
+  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 8`), "选中图片层：检视器有「效果」分组，下拉列出 7 个内置效果");
+  check((await fxNames()).length === 0, "初始无效果");
+
+  await fxAdd("tint");
+  check(JSON.stringify(await fxNames()) === JSON.stringify(["tint"]) && (await h.selectedName()) === "stripe", "添加「颜色叠加」：列表一项，选中仍是该层");
+  const tint0 = await pixelAt(tTop);
+  const tintWant = RED.map((c, i) => Math.round(c * 0.5 + [255, 115, 51][i] * 0.5));
+  check(close(tint0, tintWant, 6), `缺省橙色 50% 叠在红色上（期望 ${tintWant}，实得 ${tint0}）`);
+  await fxSet(0, "color", "#00ff00");
+  await fxSet(0, "amount", "1");
+  const g1 = await pixelAt(tTop);
+  const g2 = await pixelAt(tBot);
+  check(isGreen(g1) && isGreen(g2), `改成绿色、强度 1：上下两半都变绿（上 ${g1} / 下 ${g2}）`);
+  check(await ev(`document.querySelector('.ed-fx-item[data-fx-index="0"] input[data-param="amount"]').value === '1' && document.querySelector('.ed-fx-item[data-fx-index="0"] input[data-param="color"]').value === '#00ff00'`), "重挂后面板显示改后的参数");
+
+  await fxAdd("adjust");
+  await fxSet(1, "brightness", "-0.5");
+  check(JSON.stringify(await fxNames()) === JSON.stringify(["tint", "adjust"]), "第二个效果「色彩调整」排在后面");
+  const dim = await pixelAt(tTop);
+  check(dim[0] < 30 && dim[2] < 30 && dim[1] > 100 && dim[1] < 160, `效果链串联：先绿再压暗一半（实得 ${dim}）`);
+  check(close(await pixelAt(tOut), [0, 0, 0], 8), "效果只作用在图层上，背景不受影响");
+
+  await fxBtn(1, "ed-fx-up");
+  check(JSON.stringify(await fxNames()) === JSON.stringify(["adjust", "tint"]), "上移：顺序对调");
+  const swapped = await pixelAt(tTop);
+  check(isGreen(swapped) && swapped[1] > 200, `先压暗再整色替换成绿 → 纯绿（实得 ${swapped}），顺序真的影响出帧`);
+  await undoRedo(false);
+  check(JSON.stringify(await fxNames()) === JSON.stringify(["tint", "adjust"]) && close(await pixelAt(tTop), dim, 12), "撤销上移：顺序与画面复原");
+
+  await fxBtn(1, "ed-fx-eye");
+  const off = await pixelAt(tTop);
+  check(await ev(`document.querySelector('.ed-fx-item[data-fx-index="1"]').classList.contains('hidden-layer')`) && isGreen(off) && off[1] > 200, `停用「色彩调整」：画面回到亮绿（${off}）`);
+  await undoRedo(false);
+  check(close(await pixelAt(tTop), dim, 12), "撤销停用：压暗回来");
+
+  await fxBtn(1, "ed-fx-del");
+  check((await fxNames()).length === 1 && isGreen(await pixelAt(tTop)), "移除第二个效果");
+  await undoRedo(false);
+  check((await fxNames()).length === 2 && close(await pixelAt(tTop), dim, 12), "撤销移除：效果与参数一并回来");
+  const editorTop = await pixelAt(tTop);
+  const editorBot = await pixelAt(tBot);
+
+  const libBeforeT = new Set(fs.readdirSync(lib));
+  let scT = await h.savedCount();
+  await clickSel("#tb-save");
+  await clickSel("#save-lib");
+  await h.waitSaved(scT);
+  const savedT = fs.readdirSync(lib).filter((n) => !libBeforeT.has(n));
+  check(savedT.length === 1, `另存到壁纸库：新条目 ${savedT[0]}`);
+  const dirT = path.join(lib, savedT[0]);
+  const sceneT = JSON.parse(fs.readFileSync(path.join(dirT, "scene.json"), "utf8"));
+  const effs = sceneT.objects[0]?.effects ?? [];
+  check(effs.length === 2 && effs[0].file === "effects/wwgl_tint/effect.json" && effs[1].file === "effects/wwgl_adjust/effect.json", "盘上 scene.json：图层带两条效果，顺序正确");
+  check(effs[0].passes[0].constantshadervalues.color === "0 1 0" && effs[0].passes[0].constantshadervalues.amount === 1 && effs[1].passes[0].constantshadervalues.brightness === -0.5, "盘上参数：颜色 \"0 1 0\"、强度 1、亮度 -0.5");
+  const fxFiles = ["tint", "adjust"].flatMap((id) => [`effects/wwgl_${id}/effect.json`, `materials/effects/wwgl_${id}.json`, `shaders/effects/wwgl_${id}.frag`, `shaders/effects/wwgl_${id}.vert`]);
+  check(fxFiles.every((f) => fs.existsSync(path.join(dirT, f))), "盘上效果文件齐全（两个效果各四件，产物自包含）");
+  check(!fs.existsSync(path.join(dirT, "effects")) || fs.readdirSync(path.join(dirT, "effects")).length === 2, "没用到的效果不进产物");
+  const errsT = await h.errorLines();
+  check(errsT.length === 0, `效果编辑全程控制台无错误${errsT.length ? `：${errsT.slice(0, 2).join(" / ")}` : ""}`);
+
+  await gotoEditor(`?item=${savedT[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`document.querySelectorAll('.ed-fx-item').length === 2`, 20000);
+  check(JSON.stringify(await fxNames()) === JSON.stringify(["tint", "adjust"]) && (await ev(`document.querySelector('.ed-fx-item[data-fx-index="1"] input[data-param="brightness"]').value`)) === "-0.5", "编辑器重新打开：面板认回两个效果与参数");
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedT[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpT = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const benchT = { x: 0, y: 0, w: vpT.w, h: vpT.h };
+  const bTopT = await pixelAt(worldToPage(benchT, [1110, 590]));
+  const bBotT = await pixelAt(worldToPage(benchT, [1110, 490]));
+  const bOutT = await pixelAt(worldToPage(benchT, [300, 540]));
+  check(close(bTopT, editorTop, 12) && close(bBotT, editorBot, 12), `★ 测试台出帧与编辑器预览一致（测试台 ${bTopT} / ${bBotT}，编辑器 ${editorTop} / ${editorBot}）`);
+  check(close(bOutT, [0, 0, 0], 8), "测试台：背景不受效果影响");
+  await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/effects-in-bench.jpg") });
+  console.log(`  截图：scripts/.tmp-editor-e2e/effects-in-bench.jpg`);
 }
