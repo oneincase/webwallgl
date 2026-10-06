@@ -74,6 +74,7 @@ import {
   type PropType,
   type PropView,
 } from "./userprops";
+import { scriptsAllowedByDefault, scriptsOverrideFrom } from "./trust";
 import {
   duplicateLayer,
   findNode,
@@ -295,6 +296,9 @@ const isLocked = (id: number | string | null) => id !== null && locked.has(Strin
  * 还能吃库内 pkg 缓存。
  */
 let docDriven = false;
+const SCRIPTS_OVERRIDE = scriptsOverrideFrom(location.search);
+/** 本文档的壁纸脚本是否执行（见 trust.ts）；放行后对本文档的每次重挂都生效 */
+let scriptsAllowed = true;
 /** 当前文档的资源表（原始来源 + 页面新增素材）；非场景 / 取不到场景资源时为 null */
 let overlay: OverlayAssets | null = null;
 /** 草稿来源；null = 本地文件 / 目录（刷新后 File 句柄失效，不做草稿） */
@@ -331,6 +335,7 @@ async function mountCurrent(keepTime = false) {
       fit: fitEl.value as Fit,
       renderDpr: Number(dprEl.value),
       volume: 0,
+      scripts: scriptsAllowed,
       onDiagnostic: (msg, level) => log(msg, level),
     });
     if (gen !== openGen) {
@@ -349,6 +354,7 @@ async function mountCurrent(keepTime = false) {
     resetTimelineRange();
     renderTree();
     renderInspector();
+    syncScriptsBanner();
     const info = inst.info;
     if (info && doc?.type === "scene") log(et("log.ready", { w: info.width, h: info.height, n: info.layerCount }));
     else log(et("log.readyPlain"));
@@ -362,6 +368,24 @@ async function mountCurrent(keepTime = false) {
   syncTimeline();
   renderStatus();
 }
+
+// ---------- 外来脚本（W10 过渡：在线版默认不执行，逐文档放行） ----------
+
+const scriptsBannerEl = $<HTMLElement>("#ed-scripts-off");
+const scriptsBannerTextEl = $<HTMLElement>("#ed-scripts-off-text");
+
+function syncScriptsBanner() {
+  const skipped = !scriptsAllowed ? editor?.getSkippedScripts() ?? 0 : 0;
+  scriptsBannerEl.hidden = skipped === 0;
+  if (skipped) scriptsBannerTextEl.textContent = et("scripts.blocked", { n: skipped });
+}
+
+$<HTMLButtonElement>("#scripts-allow").onclick = () => {
+  scriptsAllowed = true;
+  scriptsBannerEl.hidden = true;
+  log(et("log.scriptsAllowed"), "warn");
+  void mountCurrent(true);
+};
 
 /** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 */
 const referencedGroups = (d: EditorDoc | null) => new Set([...referencedModels(d), ...referencedEffects(d)]);
@@ -386,6 +410,8 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
     log(msg === "no-wallpaper" ? et("log.dropEmpty") : et("log.openFailed", { msg }), "error");
     return;
   }
+  // 本地文件的脚本策略取决于宿主在不在（首次读库结束才知道）
+  if (!opts.origin) await libReady;
   if (gen !== openGen) return;
   current?.source.dispose?.();
   overlay =
@@ -399,6 +425,8 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   scriptDrafts.clear();
   docDriven = !!opts.docDriven;
   origin = opts.origin ?? null;
+  scriptsAllowed = scriptsAllowedByDefault(origin?.kind ?? "local", libState === "ready", SCRIPTS_OVERRIDE);
+  scriptsBannerEl.hidden = true;
   lastSave = null;
   resetHistory();
   opts.after?.();
@@ -1073,6 +1101,7 @@ setInterval(() => {
   stFpsEl.textContent = et("st.fps", { n: Math.round(s.fps) });
   stFpsEl.classList.remove("idle");
   refreshScriptIssues();
+  syncScriptsBanner();
 }, 500);
 
 // ---------- 壁纸库 ----------

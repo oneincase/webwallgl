@@ -109,6 +109,7 @@ async function resolveMountConfig(
     // （scene-mount applyQuality / getQuality），这里不引依赖 —— 本函数会被
     // verify-media 抽出来脱离 import 单独执行。
     quality: o.quality,
+    scripts: o.scripts !== false,
   };
   let project: unknown = null;
   try {

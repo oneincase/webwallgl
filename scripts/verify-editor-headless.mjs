@@ -1103,4 +1103,44 @@ async function runCreateAndDraft(ctx) {
   const vpV = await ev(`({ w: innerWidth, h: innerHeight })`);
   const bV = await pixelAt(worldToPage({ x: 0, y: 0, w: vpV.w, h: vpV.h }, [1110, 590]));
   check(close(bV, editorV, 12), `测试台：按存盘属性值出帧，与编辑器一致（测试台 ${bV} / 编辑器 ${editorV}）`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("W. 外来脚本拦截（W10 过渡：在线版默认不执行，逐文档放行）");
+  const firstFrame = `${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`;
+  const bannerOn = () => ev(`!document.querySelector('#ed-scripts-off').hidden`);
+  // U 段存进库的条目：stripe 的 alpha 脚本 `return 0.5`
+  await gotoEditor(`?scripts=off&item=${savedU[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
+  await waitFor(firstFrame, 90000);
+  await settle();
+  const crW = await h.canvasRect();
+  const wTop = worldToPage(crW, [1110, 590]);
+  const blocked = await pixelAt(wTop);
+  check(isRed(blocked), `?scripts=off 打开带脚本的库条目：脚本不执行，alpha 停在快照 1（实得 ${blocked}）`);
+  check((await bannerOn()) && /1/.test(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)), "视口底部提示「已拦截 1 段脚本」并给「仍然执行」");
+  check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("scripts disabled: skipped 1"), "诊断流记一条拦截计数");
+  const rAllow = await h.readyCount();
+  await clickSel("#scripts-allow");
+  await h.waitRemount(rAllow);
+  await settle();
+  const allowed = await pixelAt(wTop);
+  check(close(allowed, half, 14) && !(await bannerOn()), `「仍然执行」：原地重挂，脚本生效（半透明 ${allowed}），提示收起`);
+
+  await gotoEditor(`?item=${savedU[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
+  await waitFor(firstFrame, 90000);
+  await settle();
+  check(close(await pixelAt(worldToPage(await h.canvasRect(), [1110, 590])), half, 14) && !(await bannerOn()), "dev 宿主默认（无覆盖）：照常执行，无提示");
+
+  await gotoEditor(`?scripts=off`);
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor(`?scripts=off`);
+  await newBlank("#202020");
+  await addImage(stripePath);
+  await fxAct(`const s = document.querySelector('#script-add'); s.value = 'alpha'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  await scType("alpha", "export function update(value) {\n\treturn 0;\n}\n");
+  await scApply("alpha");
+  await settle();
+  const crW2 = await h.canvasRect();
+  check(close(await pixelAt(worldToPage(crW2, [1110, 590])), BGV, 10) && !(await bannerOn()), "安全模式下新建的工程：用户自己写的脚本照常执行");
 }

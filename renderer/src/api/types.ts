@@ -395,6 +395,14 @@ export type MountOptions = {
   /** 用户属性覆盖值（键为 project.json 里的属性名） */
   properties?: Record<string, PropertyValue>;
 
+  /**
+   * 是否执行壁纸自带的 SceneScript（对象字段 / 文字 / 效果开关 / 材质常量脚本）。默认 true。
+   * 传 `false` 时一律不求值，字段停在 scene.json 的快照值。沙箱并非安全边界
+   * （`Function` / `eval` 无法遮蔽），打开来路不明的壁纸、且与宿主页面同源时应关掉。
+   * 只影响场景壁纸；网页壁纸本身就是页面脚本，不受此项控制。
+   */
+  scripts?: boolean;
+
   /** 指针源。**当前未接线**，见 PointerSource 说明；外部喂指针请用 pushPointer() */
   pointer?: PointerSource | null;
   /**
@@ -794,6 +802,8 @@ export type EditorControls = {
   screenDeltaToLocal(id: number, dx: number, dy: number): [number, number] | null;
   /** 本次装配以来的脚本错误，按「图层 + 挂点 + 阶段 + 文案」去重计数（W8） */
   getScriptIssues(): EditorScriptIssue[];
+  /** 挂载时 `scripts: false` 跳过求值的脚本段数（含惰性求值的材质常量脚本，随播放可能增长） */
+  getSkippedScripts(): number;
   /**
    * 运行时声明用户属性（W9）：未声明的名字按声明补进属性表，绑定链与脚本随即可见并热更；
    * 已声明的名字只更新值（等价 setProperties）。暂停中会补画一帧，Promise 在该帧画完后落地。

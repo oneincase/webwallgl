@@ -1323,6 +1323,29 @@ const upEngine = await imp("renderer/vendor/we-scene/scene/user-props.js");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// W. 外来脚本策略（W10 过渡）：editor/trust.ts + 引擎 scripts 开关
+// ───────────────────────────────────────────────────────────────────────────
+section("W. 外来脚本策略 editor/trust.ts");
+const trustMod = await loadEditorModule("trust");
+{
+  const { scriptsAllowedByDefault: allow, scriptsOverrideFrom: ov } = trustMod;
+  check(allow("library", true, null) && allow("local", true, null), "dev 宿主在：库条目 / 本地文件照常执行（与测试台一致）");
+  check(!allow("library", false, null) && !allow("local", false, null), "在线版（无宿主）：外来内容默认不执行");
+  check(allow("new", false, null) && allow("new", true, "off"), "编辑器里新建的工程（含其草稿）永远执行——用户自己的内容");
+  check(!allow("local", true, "off") && allow("local", false, "on"), "?scripts=off / on 覆盖宿主判断");
+  check(ov("?scripts=off&item=1") === "off" && ov("?scripts=on") === "on" && ov("?scripts=1") === null && ov("") === null, "scriptsOverrideFrom：只认 on / off");
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(!/wtext\.eval(Object|Text)Script\(/.test(sm) && !/setConstantScriptRuntime\?\.\(wtext\./.test(sm), "引擎所有脚本求值点（对象字段 / 文字 / 效果开关 / general / 材质常量）都走开关后的求值函数");
+  check(/const scriptsOff = cfg\.scripts === false;/.test(sm) && /evalObjectScript: typeof wtext\.evalObjectScript = scriptsOff \? skipScript/.test(sm), "scripts: false 时求值函数换成「计数并返回 null」");
+  const mountSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  check(/scripts: o\.scripts !== false,/.test(mountSrc), "MountOptions.scripts 透传到装配配置，缺省执行");
+  const main = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/scripts: scriptsAllowed,/.test(main) && /scriptsAllowedByDefault\(origin\?\.kind \?\? "local", libState === "ready", SCRIPTS_OVERRIDE\)/.test(main), "编辑器按来源 + 宿主决定每份文档的脚本开关");
+  check(/if \(!opts\.origin\) await libReady;/.test(main), "本地文件等首次读库结束再判（宿主在不在要读库才知道）");
+  check(/#scripts-allow"\)\.onclick = \(\) => \{\s*scriptsAllowed = true;[\s\S]{0,120}mountCurrent\(true\)/.test(main), "「仍然执行」只放行本文档并原地重挂");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1348,7 +1371,7 @@ section("I. 接线");
   check(/checkSceneScript,\s*\n\s*editorOf,/.test(main) && /from "\.\/scripts"/.test(main), "脚本面板：预检取库出口 checkSceneScript，挂点读写取 editor/scripts.ts");
   check(/apply\.disabled = !editable \|\| !ok \|\| ta\.value === s\.script/.test(main), "语法不过 / 未改动时「应用」不可点");
   check(/objEdit\([^\n]*setScript\(o, s\.target, ta\.value\)\)/.test(main), "应用脚本走结构编辑（可撤销、整场景重挂，新脚本当帧生效）");
-  check(/editor\?\.getScriptIssues\(\)/.test(main) && /refreshScriptIssues\(\);\s*\}, 500\)/.test(main), "运行期错误从控制面 getScriptIssues 取，定时刷新到对应挂点");
+  check(/editor\?\.getScriptIssues\(\)/.test(main) && /refreshScriptIssues\(\);\s*(syncScriptsBanner\(\);\s*)?\}, 500\)/.test(main), "运行期错误从控制面 getScriptIssues 取，定时刷新到对应挂点");
   check(/scriptDrafts\.clear\(\)/.test(main) && /scriptDrafts\.get\(draftKey\) \?\? s\.script/.test(main), "未应用的脚本改动在检视器重绘时保留，换文档清空");
   check(/from "\.\/userprops"/.test(main) && !/general\.properties\s*=/.test(main), "用户属性面板从 userprops.ts 读写声明 / 绑定（页面不直接改属性表）");
   check(/sourceFromDoc\(current\.source, current\.assets, JSON\.stringify\(doc\.scene\), doc\.project\)/.test(main), "文档挂载连 project 一起以文档为准（声明随重挂进引擎）");
@@ -1505,6 +1528,17 @@ section("J. 变异红测");
   const uo = { brightness: { user: "op", script: "x", value: 1 } };
   umod.unbindProp(uo, "brightness");
   check(json(uo.brightness) !== json({ script: "x", value: 1 }), "解绑时连脚本一起丢掉，「脚本保留」判据变红");
+
+  const trPath = path.join(ROOT, "editor/trust.ts");
+  const trSrc = fs.readFileSync(trPath, "utf8");
+  const mutTr = trSrc.replace('if (kind === "new") return true;\n', "");
+  check(mutTr !== trSrc, "注入点存在（新建工程永远执行）");
+  const tm2 = await loadEditorModule("trust", { [trPath]: mutTr });
+  check(!tm2.scriptsAllowedByDefault("new", false, null), "新建工程也按宿主判时「用户自己的内容永远执行」判据变红");
+  const mutTr2 = trSrc.replace("return hostAvailable;", "return true;");
+  check(mutTr2 !== trSrc, "注入点存在（无宿主默认不执行）");
+  const tm3 = await loadEditorModule("trust", { [trPath]: mutTr2 });
+  check(tm3.scriptsAllowedByDefault("local", false, null), "无宿主也执行时「在线版外来内容默认不执行」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

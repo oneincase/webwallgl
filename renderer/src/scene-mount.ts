@@ -869,6 +869,16 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       //   3) 都没有时 makeSandboxStorage 内部退化为进程内 Map。
       // LOCATION_GLOBAL 走不带壁纸命名空间的全局后端（跨壁纸共享）。
       const sceneStorage = createSceneStorage(cfg, source.key);
+      // W10 过渡：宿主关掉脚本（在线版打开外来壁纸，沙箱可逃逸）时，所有 SceneScript
+      // 一律不求值 —— 求值点本就要处理「无沙箱」（空脚本 / 编不过），字段停在快照值。
+      const scriptsOff = cfg.scripts === false;
+      let skippedScripts = 0;
+      const skipScript = (script: unknown) => {
+        if (typeof script === "string" && script) skippedScripts++;
+        return null;
+      };
+      const evalObjectScript: typeof wtext.evalObjectScript = scriptsOff ? skipScript : wtext.evalObjectScript;
+      const evalTextScript: typeof wtext.evalTextScript = scriptsOff ? skipScript : wtext.evalTextScript;
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
@@ -4709,7 +4719,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               quality,
             };
             if (layer.textScript) {
-              item.sandbox = wtext.evalTextScript(layer.textScript, layer.textScriptProps, {
+              item.sandbox = evalTextScript(layer.textScript, layer.textScriptProps, {
                 // [we-scene patch] layer：text/pointsize/font 写穿到真图层
                 //（与对象字段脚本同源，见 text.js evalTextScript 写穿段）
                 layer,
@@ -5399,7 +5409,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         // 靠 update() 每帧返回 WEColor.hsv2rgb(...) 改写颜色。不注入这套运行时，
         // 渲染器只能读初始快照 —— 音频可视化等效果的颜色会是**整块固定值**。
         // 复用对象脚本的同一份 userProperties 与 audioViews，语义保持一致。
-        (renderer as any).setConstantScriptRuntime?.(wtext.evalObjectScript, {
+        (renderer as any).setConstantScriptRuntime?.(evalObjectScript, {
           userProperties: objUserProps,
           audioViews,
           shared: textShared,
@@ -5512,7 +5522,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const vs = al.visibleScript as { script: string; scriptproperties: unknown; value: unknown } | null;
           if (!vs) return;
           try {
-            const sandbox = wtext.evalObjectScript(vs.script, vs.scriptproperties, {
+            const sandbox = evalObjectScript(vs.script, vs.scriptproperties, {
               canvasSize: { width: objProjW, height: objProjH },
               timeOfDay: timeOfDayValue,
               userProperties: objUserProps,
@@ -5563,7 +5573,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const def = field === "blend" ? al.blendScript : al.rateScript;
             if (!def) continue;
             try {
-              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+              const sandbox = evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
@@ -5641,7 +5651,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (!defs) continue;
           for (const [key, def] of Object.entries(defs)) {
             try {
-              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+              const sandbox = evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
@@ -5682,7 +5692,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const vs = effect.visibleScript as { script: string; scriptproperties: any } | null;
             if (!vs) continue;
             try {
-              const sandbox = wtext.evalObjectScript(vs.script, vs.scriptproperties, {
+              const sandbox = evalObjectScript(vs.script, vs.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
@@ -5733,7 +5743,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (!scripts) continue;
           for (const [field, def] of Object.entries(scripts)) {
             try {
-              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+              const sandbox = evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 screenResolution: { x: c.clientWidth || window.innerWidth || 1, y: c.clientHeight || window.innerHeight || 1 },
                 // 初值同 timeOfDayValue；帧循环每秒回填，昼夜脚本不再冻结。
@@ -5882,7 +5892,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (generalScripts) {
           for (const [field, def] of Object.entries(generalScripts)) {
             try {
-              const sandbox = wtext.evalObjectScript(def.script, def.scriptproperties, {
+              const sandbox = evalObjectScript(def.script, def.scriptproperties, {
                 canvasSize: { width: objProjW, height: objProjH },
                 timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
@@ -7434,6 +7444,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         getScriptIssues() {
           return [...scriptIssues.values()].map((x) => ({ ...x }));
         },
+        getSkippedScripts() {
+          return skippedScripts;
+        },
         declareUserProperties(decls: Record<string, EditorUserPropertyDecl>) {
           if (disposed) return Promise.reject(new Error("scene disposed"));
           applyLiveProps(decls as unknown as Record<string, { value: unknown }>);
@@ -7441,6 +7454,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         },
       };
       applyLiveImpl = applyLiveProps;
+      if (skippedScripts) reportDiag(rt, cfg, `scripts disabled: skipped ${skippedScripts}`, "warn");
       if (pendingWire) {
         applyLiveProps(pendingWire);
         pendingWire = null;

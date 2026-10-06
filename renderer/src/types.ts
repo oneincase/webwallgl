@@ -150,6 +150,9 @@ export type WallpaperConfig = {
     screen?: StorageProviderLike;
     global?: StorageProviderLike;
   };
+
+  /** 是否执行 SceneScript（见 MountOptions.scripts）。缺省 = 执行 */
+  scripts?: boolean;
 };
 
 /** 同步 KV 后端（SceneScript localStorage 持久化用）。 */

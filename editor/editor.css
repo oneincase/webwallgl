@@ -844,7 +844,8 @@
   height: 22px;
 }
 
-#ed-draft {
+#ed-draft,
+#ed-scripts-off {
   position: absolute;
   top: 10px;
   left: 50%;
@@ -862,11 +863,19 @@
   font-size: 12px;
 }
 
-#ed-draft[hidden] {
+#ed-draft[hidden],
+#ed-scripts-off[hidden] {
   display: none;
 }
 
-#ed-draft-text {
+#ed-scripts-off {
+  top: auto;
+  bottom: 10px;
+  border-color: var(--warn);
+}
+
+#ed-draft-text,
+#ed-scripts-off-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
