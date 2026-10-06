@@ -159,6 +159,18 @@
   line-height: 1.5;
 }
 
+.ed-layer-tools {
+  flex: none;
+  gap: 1px;
+}
+
+.wb-panel-head:has(.ed-layer-tools) .wb-tab {
+  min-width: 0;
+  padding: 0 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 .ed-layer-tools .ed-icon {
   width: 22px;
   height: 22px;
@@ -704,6 +716,24 @@ fieldset.ed-form:disabled {
   padding: 3px 4px;
   resize: vertical;
   line-height: 1.45;
+}
+
+.ed-snd-file {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--wb-fg-dim);
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-sound .ed-fx-params select {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 11px;
 }
 
 .ed-text .ed-fx-params textarea[readonly] {

@@ -194,6 +194,7 @@ export const BINDABLE_FIELDS: readonly BindableField[] = [
   { field: "scale", types: ["slider"] },
   { field: "color", types: ["color"], kinds: ["image", "text"] },
   { field: "text", types: ["textinput"], kinds: ["text"] },
+  { field: "volume", types: ["slider"], kinds: ["sound"] },
 ];
 
 export const bindableFor = (kind: string) => BINDABLE_FIELDS.filter((f) => !f.kinds || f.kinds.includes(kind));
@@ -208,7 +209,7 @@ export function bindingOf(obj: SceneObject, field: string): Binding | null {
   return null;
 }
 
-const FIELD_DEFAULT: Record<string, unknown> = { visible: true, alpha: 1, brightness: 1, scale: "1.00000 1.00000 1.00000", color: "1.00000 1.00000 1.00000", text: "" };
+const FIELD_DEFAULT: Record<string, unknown> = { visible: true, alpha: 1, brightness: 1, scale: "1.00000 1.00000 1.00000", color: "1.00000 1.00000 1.00000", text: "", volume: 1 };
 
 /** 绑定字段到属性（combo 绑 visible 时给 condition）；类型不兼容拒绝 */
 export function bindProp(doc: EditorDoc, obj: SceneObject, field: string, name: string, condition?: string): boolean {

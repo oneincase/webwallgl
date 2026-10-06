@@ -385,6 +385,9 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await click(await rowButton(topName, ".ed-lock"));
   check(!(await ev(`document.querySelector('#ed-inspector fieldset.ed-form').disabled`)), "解锁后恢复可编辑");
 
+  const hiddenTools = await ev(`[...document.querySelectorAll('.ed-layer-tools button')].filter((b) => { const r = b.getBoundingClientRect(); const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return !(hit === b || b.contains(hit)); }).map((b) => b.id)`);
+  check(hiddenTools.length === 0, `图层工具条按钮都在可视区内、点得到${hiddenTools.length ? `（被挤掉：${hiddenTools.join(", ")}）` : ""}`);
+
   // 结构编辑：复制 / 重排 / 删除 + 撤销重做（整场景重挂）
   const n0 = objects.length;
   let rc = await readyCount();
@@ -1444,4 +1447,105 @@ async function runCreateAndDraft(ctx) {
   check(benchZ.frac > snowInk.frac && top.color[0] > 80 && top.color[0] > top.color[2] + 30, `★ 测试台出帧：红色大雪花 + 火花（墨水 ${benchZ.frac.toFixed(4)}，上半屏色 ${top.color}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/particles-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/particles-in-bench.jpg`);
+
+  section("AA. 声音层端到端（空白 → 导入 WAV → 试听 → 音量 / 模式 / 开始静音 → 撤销 → 替换 → 存库 → 测试台装上音频）");
+  const wavBytes = (sec, freq, rate = 8000) => {
+    const n = Math.round(sec * rate);
+    const b = Buffer.alloc(44 + n * 2);
+    b.write("RIFF", 0); b.writeUInt32LE(36 + n * 2, 4); b.write("WAVE", 8); b.write("fmt ", 12);
+    b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(rate, 24);
+    b.writeUInt32LE(rate * 2, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write("data", 36); b.writeUInt32LE(n * 2, 40);
+    for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 8000), 44 + i * 2);
+    return b;
+  };
+  const rainWav = path.join(tmpRoot, "rain.wav");
+  const birdWav = path.join(tmpRoot, "bird.wav");
+  fs.writeFileSync(rainWav, wavBytes(1.5, 330));
+  fs.writeFileSync(birdWav, wavBytes(0.8, 880));
+  const sndSet = (name, value) =>
+    fxAct(`const el = document.querySelector('.ed-sound [data-sound="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const sndCheck = (name, on) =>
+    fxAct(`const el = document.querySelector('.ed-sound [data-sound="${name}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const playing = () => ev(`document.querySelector('.ed-sound [data-sound="preview"]')?.dataset.playing`);
+
+  await gotoEditor();
+  check(await ev(`document.querySelector('#ly-add-sound').disabled`), "未打开场景时「添加声音层」不可用");
+  await newBlank("#000000");
+  check(!(await ev(`document.querySelector('#ly-add-sound').disabled`)), "新建后「添加声音层」可用");
+  let rs = await h.readyCount();
+  await clickSel("#ly-add-sound");
+  await setFiles("#in-sound", [rainWav]);
+  await h.waitRemount(rs);
+  check((await h.treeNames()).length === 1 && (await h.selectedName()) === "rain", `导入 rain.wav：树里一层「${await h.selectedName()}」并选中`);
+  check(await ev(`!!document.querySelector('.ed-sound') && document.querySelector('.ed-sound [data-sound="playbackmode"]').value === 'loop' && document.querySelector('.ed-sound [data-sound="volume"]').value === '1' && !document.querySelector('.ed-sound [data-sound="startsilent"]').checked && document.querySelector('.ed-snd-file').textContent === 'rain.wav'`), "检视器有「声音」分组：文件名、循环、音量 1、不静音开始");
+  check(await ev(`!!document.querySelector('.ed-bindings')`), "声音层也有「属性绑定」分组（音量可绑用户滑条，离线单测覆盖绑定本身）");
+  let so = await rawObj();
+  check(so.sound?.[0] === "sounds/rain.wav" && so.playbackmode === "loop" && so.volume === 1 && so.startsilent === false, `文档：${JSON.stringify({ sound: so.sound, playbackmode: so.playbackmode, volume: so.volume })}`);
+
+  await clickSel('.ed-sound [data-sound="preview"]');
+  await waitFor(`document.querySelector('.ed-sound [data-sound="preview"]').dataset.playing === '1'`, 8000).catch(() => {});
+  check((await playing()) === "1", "点「试听」：按钮进入播放态");
+  await clickSel('.ed-sound [data-sound="preview"]');
+  check((await playing()) === "0", "再点：停止试听");
+
+  await sndSet("volume", "0.5");
+  await sndSet("playbackmode", "single");
+  await sndCheck("startsilent", true);
+  so = await rawObj();
+  check(so.volume === 0.5 && so.playbackmode === "single" && so.startsilent === true, `音量 0.5 / 单次 / 开始静音写进文档：${JSON.stringify({ volume: so.volume, playbackmode: so.playbackmode, startsilent: so.startsilent })}`);
+  check(await ev(`document.querySelector('.ed-sound [data-sound="volume"]').value === '0.5' && document.querySelector('.ed-sound [data-sound="playbackmode"]').value === 'single' && document.querySelector('.ed-sound [data-sound="startsilent"]').checked`), "检视器重绘后控件与文档一致");
+  rs = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rs);
+  so = await rawObj();
+  check(so.startsilent === false && so.playbackmode === "single", "撤销：开始静音撤回，模式仍是单次");
+  rs = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(rs);
+  so = await rawObj();
+  check(so.startsilent === true, "重做：开始静音回来");
+  await sndSet("playbackmode", "loop");
+
+  rs = await h.readyCount();
+  await clickSel('.ed-sound [data-sound="replace"]');
+  await setFiles("#in-sound", [birdWav]);
+  await h.waitRemount(rs);
+  so = await rawObj();
+  check((await h.treeNames()).length === 1 && so.sound?.[0] === "sounds/bird.wav" && so.volume === 0.5, `替换音频：仍一层，sound → ${so.sound?.[0]}，音量保留`);
+  const errsAA = await h.errorLines();
+  check(errsAA.length === 0, `声音层编辑全程无错误${errsAA.length ? `：${errsAA.slice(0, 2).join(" / ")}` : ""}`);
+
+  const libBeforeAA = new Set(fs.readdirSync(lib));
+  const scAA = await h.savedCount();
+  await clickSel("#tb-save");
+  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
+  await clickSel("#save-lib");
+  await h.waitSaved(scAA);
+  const savedAA = fs.readdirSync(lib).filter((n) => !libBeforeAA.has(n));
+  check(savedAA.length === 1, `另存到壁纸库：新条目 ${savedAA[0]}`);
+  const dirAA = path.join(lib, savedAA[0]);
+  const sceneAA = JSON.parse(fs.readFileSync(path.join(dirAA, "scene.json"), "utf8"));
+  const sAA = sceneAA.objects[0];
+  check(sceneAA.objects.length === 1 && sAA.sound?.[0] === "sounds/bird.wav" && sAA.volume === 0.5 && sAA.playbackmode === "loop" && sAA.startsilent === true, "盘上 scene.json：声音层字段齐全");
+  const birdOnDisk = path.join(dirAA, "sounds/bird.wav");
+  check(fs.existsSync(birdOnDisk) && Buffer.compare(fs.readFileSync(birdOnDisk), fs.readFileSync(birdWav)) === 0, "盘上 sounds/bird.wav 与导入的原文件逐字节相同");
+  check(!fs.existsSync(path.join(dirAA, "sounds/rain.wav")), "被替换掉的 rain.wav 不再引用，不写盘");
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedAA[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.some((l) => l.soundCtl)`, 90000);
+  const benchAA = await ev(`(() => { const l = window.__sceneLayers.find((x) => x.soundCtl); return { vol: l.soundCtl.getVolume(), playing: l.soundCtl.isPlaying(), mode: l.soundprops?.playbackmode, silent: !!l.soundprops?.startsilent }; })()`);
+  check(Math.abs(benchAA.vol - 0.5) < 1e-6 && benchAA.mode === "loop" && benchAA.silent && !benchAA.playing, `★ 测试台装上声音层：音量 ${benchAA.vol}、模式 ${benchAA.mode}、开始静音 → 未自动播放`);
+  await click([20, 20]);
+  const auAA = await ev(`(async () => {
+    const orig = HTMLMediaElement.prototype.play;
+    let el = null, res = null;
+    HTMLMediaElement.prototype.play = function () { el = this; const p = orig.call(this); p.then(() => (res = 'ok'), (e) => (res = e.name)); return p; };
+    window.__sceneLayers.find((x) => x.soundCtl).soundCtl.play();
+    for (let i = 0; i < 40 && !res; i++) await new Promise((r) => setTimeout(r, 100));
+    HTMLMediaElement.prototype.play = orig;
+    return { res, playing: window.__sceneLayers.find((x) => x.soundCtl).soundCtl.isPlaying(), rs: el?.readyState, dur: el?.duration, loop: el?.loop };
+  })()`);
+  check(auAA.res === "ok" && auAA.playing && auAA.rs >= 2 && Math.abs(auAA.dur - 0.8) < 0.05 && auAA.loop, `★ 脚本侧 play() 后真的在播：解码出 ${auAA.dur?.toFixed(2)}s（bird.wav），循环 ${auAA.loop}，结果 ${auAA.res}`);
 }

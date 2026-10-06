@@ -1758,6 +1758,110 @@ section("Z2. 粒子层闭环（新建 → 雪 + 光点，撤掉一层 → 存库
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// AA. 声音层：editor/sound.ts 导入成层 / 字段读写 / 音量可绑用户属性
+// ───────────────────────────────────────────────────────────────────────────
+section("AA. 声音层 editor/sound.ts");
+const sndMod = await loadEditorModule("sound");
+const upMod2 = await loadEditorModule("userprops");
+/** 16-bit 单声道 PCM WAV（正弦），测试用音频 */
+function wavBytes(sec = 0.5, freq = 440, rate = 8000) {
+  const n = Math.round(sec * rate);
+  const buf = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, s) => [...s].forEach((c, i) => buf.setUint8(o + i, c.charCodeAt(0)));
+  str(0, "RIFF");
+  buf.setUint32(4, 36 + n * 2, true);
+  str(8, "WAVEfmt ");
+  buf.setUint32(16, 16, true);
+  buf.setUint16(20, 1, true);
+  buf.setUint16(22, 1, true);
+  buf.setUint32(24, rate, true);
+  buf.setUint32(28, rate * 2, true);
+  buf.setUint16(32, 2, true);
+  buf.setUint16(34, 16, true);
+  str(36, "data");
+  buf.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) buf.setInt16(44 + i * 2, Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 12000), true);
+  return new Uint8Array(buf.buffer);
+}
+{
+  check(["a.mp3", "b.OGG", "c.wav", "d.flac"].every((n) => sndMod.isAudioFile({ name: n })) && !sndMod.isAudioFile({ name: "e.m4a" }) && !sndMod.isAudioFile({ name: "f.png" }), "isAudioFile：只收引擎认得的 mp3 / ogg / wav / flac");
+  check(sndMod.soundPathOf("My Song.MP3", () => false) === "sounds/my-song.mp3" && sndMod.soundPathOf("雨声.ogg", () => false) === "sounds/sound.ogg" && sndMod.soundPathOf("x.m4a", () => false) === null, "soundPathOf：sounds/<ASCII slug>.<小写扩展名>，全非 ASCII 退 sound");
+  check(sndMod.soundPathOf("a.wav", (p) => p === "sounds/a.wav") === "sounds/a-2.wav", "soundPathOf 判重加 -2");
+
+  const doc = createMod.newDocument("s", 1920, 1080, [0, 0, 0]);
+  const id = sndMod.addSoundLayer(doc, "bgm", "sounds/bgm.mp3");
+  const o = doc.scene.objects.find((x) => x.id === id);
+  check(doc.roots.some((n) => n.id === id && n.kind === "sound"), "新声音层进图层树，种类 sound");
+  check(json(o) === json({ id, maxtime: 5, mintime: 1, muteineditor: false, name: "bgm", playbackmode: "loop", sound: ["sounds/bgm.mp3"], startsilent: false, volume: 1 }), "与 WE 编辑器新建的声音对象同形（mintime 1 / maxtime 5 是语料 430/444 的缺省），默认循环、满音量");
+  check(sndMod.addSoundLayer(doc, "x", "sounds/x.m4a") === null, "不认得的扩展名拒绝");
+  const L = parseMod.parseScene(structuredClone(doc.scene), { type: "scene" }).layers.find((l) => l.id === id);
+  check(!!L && L.isSound && json(L.sound) === json(["sounds/bgm.mp3"]) && L.soundprops.playbackmode === "loop" && L.soundprops.volume === 1 && L.soundprops.startsilent === false, "引擎 parseScene 认得新声音层（路径 / 模式 / 音量 / 开始静音）");
+
+  const f0 = sndMod.getSoundFields({ sound: ["a.wav"] });
+  check(f0.playbackmode === "single" && f0.volume === 1 && f0.startsilent === false && json(f0.files) === json(["a.wav"]), "缺省按引擎口径补齐（single / 1 / false）");
+  check(sndMod.setSoundField(o, "volume", 0.5) && o.volume === 0.5 && !sndMod.setSoundField(o, "volume", 0.5), "改音量，同值不算改动");
+  check([-0.1, 1.5, NaN, "0.5"].every((v) => !sndMod.setSoundField(o, "volume", v)), "音量越界 / NaN / 非数拒绝");
+  check(sndMod.setSoundField(o, "volume", 0.33333) && o.volume === 0.333, "音量取 3 位小数");
+  check(sndMod.setSoundField(o, "playbackmode", "single") && o.playbackmode === "single" && !sndMod.setSoundField(o, "playbackmode", "shuffle"), "播放模式只收 loop / single / random");
+  check(sndMod.setSoundField(o, "startsilent", true) && o.startsilent === true && !sndMod.setSoundField(o, "startsilent", "yes"), "开始静音只收布尔");
+  check(!sndMod.setSoundField({ image: "m.json" }, "volume", 0.5) && !sndMod.replaceSoundFile({ image: "m.json" }, "sounds/a.mp3"), "非声音层一律拒绝");
+  const bound = { sound: ["a.mp3"], volume: { user: "musicvolume", value: 0.7 } };
+  check(sndMod.setSoundField(bound, "volume", 0.4) && json(bound.volume) === json({ user: "musicvolume", value: 0.4 }) && sndMod.getSoundFields(bound).volume === 0.4, "音量绑了用户属性（语料约一半）：只改 value，绑定保留");
+  const multi = { sound: ["a.mp3", "b.mp3"], playbackmode: "random" };
+  check(sndMod.replaceSoundFile(multi, "sounds/c.ogg") && json(multi.sound) === json(["sounds/c.ogg", "b.mp3"]) && !sndMod.replaceSoundFile(multi, "sounds/c.ogg") && !sndMod.replaceSoundFile(multi, "sounds/c.txt"), "替换音频：只换第一首（引擎只播它），列表其余保留；同值 / 非音频拒绝");
+  const sd = docMod.makeDoc("s", { type: "scene" }, { objects: [{ id: 1, sound: ["sounds/a.mp3", "sounds/b.ogg"] }, { id: 2, sound: ["sounds/c.wav"] }, { id: 3, image: "m.json" }] }, "loose");
+  check(json([...sndMod.referencedSounds(sd)].sort()) === json(["sounds/a.mp3", "sounds/b.ogg", "sounds/c.wav"]), "referencedSounds：所有声音层列表里的每一首都算引用");
+
+  check(upMod2.bindableFor("sound").some((f) => f.field === "volume") && !upMod2.bindableFor("image").some((f) => f.field === "volume"), "用户属性绑定：声音层可绑 volume，图片层不出现");
+  const bd = createMod.newDocument("b", 1920, 1080, [0, 0, 0]);
+  upMod2.declareProp(bd, "musicvolume", "slider");
+  const bid = sndMod.addSoundLayer(bd, "bgm", "sounds/bgm.mp3");
+  const bo = bd.scene.objects.find((x) => x.id === bid);
+  sndMod.setSoundField(bo, "volume", 0.6);
+  check(upMod2.bindProp(bd, bo, "volume", "musicvolume") && json(bo.volume) === json({ user: "musicvolume", value: 0.6 }), "音量绑滑条：{ user, value } 包装、保留当前值（与语料同形）");
+  check(!upMod2.bindProp(bd, bo, "volume", "nope"), "绑不存在的属性拒绝");
+  check(upMod2.unbindProp(bo, "volume") && bo.volume === 0.6, "解绑：回到裸值");
+}
+
+section("AA2. 声音层闭环（新建 → 导入两段音频、撤掉一层 → 存库 → 重新打开）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("声音测试", 1280, 720, [0, 0, 0]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const ov = assetsMod.overlayAssets("scene.json", empty, () => new Set([...createMod.referencedModels(doc), ...fxMod.referencedEffects(doc), ...textMod.referencedFonts(doc), ...ptMod.referencedParticles(doc), ...sndMod.referencedSounds(doc)]));
+    const rain = wavBytes(0.5, 300);
+    const bird = wavBytes(0.3, 900);
+    const imp = (name, bytes) => {
+      const p = sndMod.soundPathOf(name, (x) => ov.has(x));
+      ov.put(p, bytes, p);
+      return sndMod.addSoundLayer(doc, name.replace(/\.[^.]+$/, ""), p);
+    };
+    const rainId = imp("rain.wav", rain);
+    const birdId = imp("bird.wav", bird);
+    docMod.removeLayer(doc, birdId);
+    const o = doc.scene.objects.find((x) => x.id === rainId);
+    sndMod.setSoundField(o, "volume", 0.5);
+    sndMod.setSoundField(o, "startsilent", true);
+    const files = await saveMod.collectProject(doc, ov, null);
+    const names = files.map((f) => f.path).sort();
+    check(names.includes("sounds/rain.wav") && !names.includes("sounds/bird.wav"), `保存清单带上被引用的音频、不带撤掉那层的（${json(names)}）`);
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(json(reopened.doc.scene) === json(doc.scene), "重新打开：声音层（音量 / 开始静音）逐字段一致");
+    check(same(await reopened.assets.read("sounds/rain.wav"), rain), "重新打开：音频原字节可读");
+    const { packed } = saveMod.packProject(files);
+    check(packed.entries.includes("sounds/rain.wav") && same(pkgC.getEntry(pkgC.parsePkg(packed.pkg), "sounds/rain.wav"), rain), "打成 scene.pkg 时音频原字节入包");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1776,7 +1880,7 @@ section("I. 接线");
   check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /saveToLibrary\(itemId, files, progress\)/.test(main), "保存走 collectProject → 目标写出");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
-  check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)[^;]*referencedParticles\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体 ∪ 粒子文件（写进来的文件随引用进出保存清单）");
+  check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)[^;]*referencedParticles\(d\)[^;]*referencedSounds\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体 ∪ 粒子文件 ∪ 音频（写进来的文件随引用进出保存清单）");
   check(/from "\.\/effects"/.test(main) && /function objEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
   check(/overlay\.put\(f\.name, f\.data, effectFileOf\(fxId\)\)/.test(main), "添加效果时把四件写进叠加层，分组 = effect.json 路径");
   check(/inp\.addEventListener\("change", \(\) => commit\(/.test(main), "参数在 change 时提交（拖动中只更新读数，不反复重挂）");
@@ -1833,6 +1937,14 @@ section("I. 接线");
   const ptKeys = [...main.matchAll(/et\(\s*"((?:pt)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addParticle", "log.particleAdded", "log.particleEdited", "insp.particle"], ptMod.PARTICLE_PRESETS.map((p) => `pt.${p}`), ptMod.PARTICLE_PARAMS.map((p) => `pt.${p}`));
   const missingPt = [...new Set(ptKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingPt.length === 0, `粒子层文案中英文都有（缺 ${json(missingPt)}）`);
+  check(/from "\.\/sound"/.test(main) && /overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);\s*return path;/.test(main) && /structEdit\(et\("log\.soundAdded"[^\n]*\n[^\n]*\n\s*for \(const it of items\) last = addSoundLayer\(d, it\.name, it\.path\)/.test(main), "添加声音层取 sound.ts、音频原字节写进叠加层（分组 = 自身路径）、走结构编辑");
+  check(/else if \(files\.every\(\(f\) => isAudioFile\(f\.file\)\)\) void addSoundFiles\(/.test(main), "拖入全是音频时加声音层");
+  check(/if \(node\.kind === "sound"\) inspectorEl\.appendChild\(soundGroup\(node\)\);/.test(main) && /objEdit\(et\("log\.soundEdited"[^\n]*setSoundField\(o, field, v\)\)/.test(main) && /replaceSoundFile\(o, path\)/.test(main), "声音层检视器有「声音」分组，模式 / 音量 / 开始静音 / 替换音频经 objEdit（可撤销）");
+  check(/const au = new Audio\(url\);/.test(main) && /stopPreview\(\);\s*overlay =/.test(main) && /volume: 0,/.test(main), "试听用页面自己的 audio 元素（引擎恒静音挂载），换文档即停");
+  check(/id="ly-add-sound"/.test(html) && /id="in-sound" accept="\.mp3,\.ogg,\.wav,\.flac/.test(html) && /lyAddSoundEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加声音层按钮 + 音频选择框，可用性跟随添加图片");
+  const sndKeys = [...main.matchAll(/et\(\s*"((?:snd)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addSound", "log.soundAdded", "log.soundEdited", "log.soundMissing", "log.soundFailed", "insp.sound"], sndMod.PLAYBACK_MODES.map((m) => `snd.mode.${m}`));
+  const missingSnd = [...new Set(sndKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missingSnd.length === 0, `声音层文案中英文都有（缺 ${json(missingSnd)}）`);
   const ptSrc = fs.readFileSync(path.join(ROOT, "editor/particles.ts"), "utf8");
   check(!/local-assets|\.tex"/.test(ptSrc) && /export const PARTICLE_TEXTURE = "particle\/halo";/.test(ptSrc), "粒子模板只引用内置贴图名，不碰 local-assets / 官方素材文件");
   const typesTs = fs.readFileSync(path.join(ROOT, "renderer/src/types.ts"), "utf8");
@@ -2030,6 +2142,23 @@ section("J. 变异红测");
   const pl = { particle: "x.json", instanceoverride: { color: "255 0 0" } };
   pm4.setParticleColor(pl, [0, 1, 0]);
   check("color" in pl.instanceoverride, "不去裸 color 时「两者都在后写的生效」判据变红");
+
+  const sndPath = path.join(ROOT, "editor/sound.ts");
+  const sndSrc = fs.readFileSync(sndPath, "utf8");
+  const sndMut = async (from, to, tag) => {
+    const mut = sndSrc.replace(from, to);
+    check(mut !== sndSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("sound", { [sndPath]: mut });
+  };
+  const sm1 = await sndMut('if (isWrapped(cur) && ("value" in cur || "user" in cur || "script" in cur)) {', "if (false) {", "音量写入保留包装");
+  const sb = { sound: ["a.mp3"], volume: { user: "musicvolume", value: 0.7 } };
+  sm1.setSoundField(sb, "volume", 0.4);
+  check(json(sb.volume) !== json({ user: "musicvolume", value: 0.4 }), "写穿包装时「音量绑定保留」判据变红");
+  const sm2 = await sndMut("n < 0 || n > 1", "false", "音量范围校验");
+  check(sm2.setSoundField({ sound: ["a.mp3"] }, "volume", 1.5), "不校验范围时「音量越界拒绝」判据变红");
+  const sm3 = await sndMut('for (const s of o.sound) if (typeof s === "string" && s) out.add(s);', 'if (typeof o.sound[0] === "string") out.add(o.sound[0]);', "列表里每一首都算引用");
+  const sd3 = docMod.makeDoc("s", { type: "scene" }, { objects: [{ id: 1, sound: ["sounds/a.mp3", "sounds/b.ogg"] }] }, "loose");
+  check(sm3.referencedSounds(sd3).size !== 2, "只认第一首时「每一首都算引用」判据变红（多首列表的其余音频会从保存清单丢掉）");
 
   let mutSeq = 0;
   const vendorMut = async (rel, from, to, tag) => {

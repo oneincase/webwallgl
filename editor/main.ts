@@ -34,6 +34,7 @@ import {
   imageLayerFiles,
   imageSlug,
   isImageFile,
+  layerNameOf,
   modelPathOf,
   newProject,
   readImageFile,
@@ -93,6 +94,19 @@ import {
   type ParticleParam,
   type ParticlePreset,
 } from "./particles";
+import {
+  PLAYBACK_MODES,
+  addSoundLayer,
+  getSoundFields,
+  isAudioFile,
+  referencedSounds,
+  replaceSoundFile,
+  setSoundField,
+  soundLabel,
+  soundPathOf,
+  type SoundField,
+  type SoundFields,
+} from "./sound";
 import {
   PROP_TYPES,
   bindProp,
@@ -402,9 +416,15 @@ $<HTMLButtonElement>("#scripts-allow").onclick = () => {
   void mountCurrent(true);
 };
 
-/** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 + 工程字体 + 粒子文件 */
+/** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 + 工程字体 + 粒子文件 + 音频 */
 const referencedGroups = (d: EditorDoc | null) =>
-  new Set([...referencedModels(d), ...referencedEffects(d), ...referencedFonts(d), ...referencedParticles(d)]);
+  new Set([
+    ...referencedModels(d),
+    ...referencedEffects(d),
+    ...referencedFonts(d),
+    ...referencedParticles(d),
+    ...referencedSounds(d),
+  ]);
 
 type OpenOptions = {
   origin?: DraftOrigin | null;
@@ -430,6 +450,7 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   if (!opts.origin) await libReady;
   if (gen !== openGen) return;
   current?.source.dispose?.();
+  stopPreview();
   overlay =
     opened.assets && opened.doc.scene ? overlayAssets(opened.assets.entry, opened.assets, () => referencedGroups(doc)) : null;
   if (overlay) opened = { ...opened, assets: overlay };
@@ -1271,6 +1292,7 @@ window.addEventListener("drop", (e) => {
   void collectDropped(e.dataTransfer).then((files) => {
     if (!files.length) log(et("log.dropEmpty"), "warn");
     else if (files.every((f) => isImageFile(f.file))) void dropImages(files.map((f) => f.file));
+    else if (files.every((f) => isAudioFile(f.file))) void addSoundFiles(files.map((f) => f.file));
     else openLocal(files);
   });
 });
@@ -1550,6 +1572,11 @@ function presetMenu(btn: HTMLButtonElement, menu: HTMLElement, pick: (preset: st
 }
 presetMenu(lyAddTextEl, textMenuEl, (p) => addText(p as TextPreset));
 presetMenu(lyAddParticleEl, particleMenuEl, (p) => addParticle(p as ParticlePreset));
+const lyAddSoundEl = $<HTMLButtonElement>("#ly-add-sound");
+lyAddSoundEl.onclick = () => {
+  soundPickFor = null;
+  inSoundEl.click();
+};
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -1561,6 +1588,7 @@ function syncLayerTools() {
   lyAddEl.disabled = !overlay || doc?.type !== "scene";
   lyAddTextEl.disabled = lyAddEl.disabled;
   lyAddParticleEl.disabled = lyAddEl.disabled;
+  lyAddSoundEl.disabled = lyAddEl.disabled;
 }
 
 function renderTree() {
@@ -2264,6 +2292,205 @@ function particleGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 声音层：导入音频成层 + 检视器（模式 / 音量 / 开始静音 / 试听） ----------
+
+const inSoundEl = $<HTMLInputElement>("#in-sound");
+/** 音频选择框的用途：null = 新建声音层，否则 = 给这一层换音频 */
+let soundPickFor: number | string | null = null;
+inSoundEl.onchange = () => {
+  const files = Array.from(inSoundEl.files ?? []);
+  inSoundEl.value = "";
+  const id = soundPickFor;
+  soundPickFor = null;
+  if (!files.length) return;
+  if (id === null) void addSoundFiles(files);
+  else void replaceSound(id, files[0]);
+};
+
+/** 音频原字节写进叠加层（分组 = 自身路径），返回工程内路径 */
+async function importSound(file: File): Promise<string | null> {
+  if (!overlay || !isAudioFile(file)) return null;
+  const listed = new Set(overlay.list());
+  const refs = referencedSounds(doc);
+  const path = soundPathOf(file.name, (p) => overlay!.has(p) || listed.has(p) || refs.has(p));
+  if (!path) return null;
+  overlay.put(path, new Uint8Array(await file.arrayBuffer()), path);
+  return path;
+}
+
+async function addSoundFiles(files: File[]) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const target = doc;
+  const audio = files.filter(isAudioFile);
+  const items: Array<{ name: string; path: string }> = [];
+  for (const f of audio) {
+    const path = await importSound(f);
+    if (path) items.push({ name: layerNameOf(f.name), path });
+  }
+  if (!items.length || doc !== target) return;
+  structEdit(et("log.soundAdded", { names: items.map((i) => i.name).join(", ") }), (d) => {
+    let last: number | undefined;
+    for (const it of items) last = addSoundLayer(d, it.name, it.path) ?? last;
+    return last;
+  });
+}
+
+async function replaceSound(id: number | string, file: File) {
+  const target = doc;
+  const path = await importSound(file);
+  if (!path || doc !== target) return;
+  objEdit(et("log.soundEdited", { layer: nodeName(id), field: et("snd.file") }), id, (o) => replaceSoundFile(o, path));
+}
+
+/** 试听：页面自己的 audio 元素（引擎在编辑器里恒静音挂载） */
+let preview: { path: string; au: HTMLAudioElement; url: string } | null = null;
+function stopPreview() {
+  if (!preview) return;
+  preview.au.pause();
+  URL.revokeObjectURL(preview.url);
+  preview = null;
+}
+
+async function togglePreview(path: string, volume: number, loop: boolean, btn: HTMLButtonElement) {
+  const was = preview?.path;
+  stopPreview();
+  btn.dataset.playing = "0";
+  btn.textContent = et("snd.preview");
+  if (was === path || !current?.assets) return;
+  const bytes = await current.assets.read(path);
+  if (!bytes) {
+    log(et("log.soundMissing", { path }), "warn");
+    return;
+  }
+  const ext = path.split(".").pop()!.toLowerCase();
+  const mime = ext === "mp3" ? "audio/mpeg" : ext === "ogg" ? "audio/ogg" : ext === "flac" ? "audio/flac" : "audio/wav";
+  const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
+  const au = new Audio(url);
+  au.volume = Math.max(0, Math.min(1, volume));
+  au.loop = loop;
+  const p = { path, au, url };
+  preview = p;
+  au.onended = () => {
+    if (preview !== p) return;
+    stopPreview();
+    btn.dataset.playing = "0";
+    btn.textContent = et("snd.preview");
+  };
+  try {
+    await au.play();
+    if (preview !== p) return;
+    btn.dataset.playing = "1";
+    btn.textContent = et("snd.stop");
+  } catch (e) {
+    if (preview === p) stopPreview();
+    log(et("log.soundFailed", { path, msg: (e as Error).message }), "warn");
+  }
+}
+
+function soundGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-sound";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.sound");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!overlay && !isLocked(node.id);
+  const f = getSoundFields(node.obj);
+  const path = f.files[0] ?? "";
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    form.append(l, el);
+  };
+  const setField = <K extends SoundField>(field: K, key: string, v: SoundFields[K]) =>
+    objEdit(et("log.soundEdited", { layer: nodeName(node.id), field: et(key) }), node.id, (o) => setSoundField(o, field, v));
+
+  const fileBox = document.createElement("div");
+  fileBox.className = "ed-fx-param";
+  const name = document.createElement("span");
+  name.className = "ed-snd-file";
+  name.textContent = path ? soundLabel(path) : "—";
+  name.title = path;
+  const play = document.createElement("button");
+  play.type = "button";
+  play.className = "ed-btn";
+  play.dataset.sound = "preview";
+  const playing = !!path && preview?.path === path;
+  play.dataset.playing = playing ? "1" : "0";
+  play.textContent = et(playing ? "snd.stop" : "snd.preview");
+  play.disabled = !path;
+  play.onclick = () => void togglePreview(path, f.volume, f.playbackmode === "loop", play);
+  const swap = document.createElement("button");
+  swap.type = "button";
+  swap.className = "ed-btn";
+  swap.dataset.sound = "replace";
+  swap.textContent = et("snd.replace");
+  swap.disabled = !editable;
+  swap.onclick = () => {
+    soundPickFor = node.id;
+    inSoundEl.click();
+  };
+  fileBox.append(name, play, swap);
+  row("snd.file", fileBox);
+
+  const mode = document.createElement("select");
+  mode.dataset.sound = "playbackmode";
+  for (const m of PLAYBACK_MODES) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = et(`snd.mode.${m}`);
+    mode.appendChild(opt);
+  }
+  mode.value = f.playbackmode;
+  mode.disabled = !editable;
+  mode.addEventListener("change", () => setField("playbackmode", "snd.mode", mode.value as SoundFields["playbackmode"]));
+  row("snd.mode", mode);
+
+  const volBox = document.createElement("div");
+  volBox.className = "ed-fx-param";
+  const vol = document.createElement("input");
+  vol.type = "range";
+  vol.min = "0";
+  vol.max = "1";
+  vol.step = "0.01";
+  vol.value = String(f.volume);
+  vol.disabled = !editable;
+  vol.dataset.sound = "volume";
+  const volVal = document.createElement("span");
+  volVal.className = "ed-val";
+  volVal.textContent = fmtNum(f.volume);
+  vol.addEventListener("input", () => {
+    volVal.textContent = fmtNum(Number(vol.value));
+    if (preview?.path === path) preview.au.volume = Number(vol.value);
+  });
+  vol.addEventListener("change", () => setField("volume", "snd.volume", Number(vol.value)));
+  volBox.append(vol, volVal);
+  row("snd.volume", volBox);
+
+  const silent = document.createElement("input");
+  silent.type = "checkbox";
+  silent.checked = f.startsilent;
+  silent.disabled = !editable;
+  silent.dataset.sound = "startsilent";
+  silent.addEventListener("change", () => setField("startsilent", "snd.startsilent", silent.checked));
+  const silentBox = document.createElement("div");
+  silentBox.className = "ed-fx-param";
+  silentBox.appendChild(silent);
+  row("snd.startsilent", silentBox);
+
+  group.appendChild(form);
+  const notes = [et("snd.hint")];
+  if (f.playbackmode === "random") notes.push(et("snd.randomNote"));
+  if (f.files.length > 1) notes.push(et("snd.multi", { n: f.files.length }));
+  for (const n of notes) group.appendChild(note(n));
+  return group;
+}
+
 // ---------- 脚本（W8）：语法预检 → 应用（结构编辑重挂）→ 运行期错误按挂点回显 ----------
 
 /** 未应用的脚本改动（检视器重绘时不丢），键 = 图层 id | 挂点；换文档即清空 */
@@ -2679,6 +2906,7 @@ function renderInspector() {
   inspectorEl.appendChild(editGroup(node));
   if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
   if (node.kind === "particle") inspectorEl.appendChild(particleGroup(node));
+  if (node.kind === "sound") inspectorEl.appendChild(soundGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
   inspectorEl.appendChild(bindingsGroup(node));
   inspectorEl.appendChild(scriptsGroup(node));
