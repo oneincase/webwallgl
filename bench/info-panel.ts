@@ -4,7 +4,7 @@ import { $, kindOf, on, state } from "./store";
 import { t } from "./i18n";
 import { MEDIA_BASE } from "./bridge";
 import { ICONS, deleteItem, revealItem } from "./library";
-import { openInEditor, openInNewWindow } from "./session";
+import { openInNewWindow } from "./session";
 
 const bodyEl = $<HTMLElement>("#info-body");
 
@@ -85,7 +85,6 @@ export function renderInfo() {
     const actions = document.createElement("div");
     actions.className = "info-actions";
     actions.append(
-      action(t("ctx.openEditor"), ICONS.editor, () => openInEditor(it.itemId)),
       action(t("menu.reveal"), ICONS.folder, () => void revealItem(it.itemId)),
       action(t("menu.newWindow"), ICONS.external, openInNewWindow),
       action(t("ctx.delete"), ICONS.trash, () => void deleteItem(it), true),

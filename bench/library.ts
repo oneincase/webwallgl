@@ -9,7 +9,7 @@ import { $, emit, kindOf, on, state, type LibraryItem, type WallpaperKind } from
 import { t } from "./i18n";
 import { MEDIA_BASE } from "./bridge";
 import { log } from "./console";
-import { clearSelection, openInEditor, select } from "./session";
+import { clearSelection, select } from "./session";
 import { setStatusCount, syncBackend } from "./statusbar";
 import { openMenu } from "../shared/workbench/menu";
 import { load, save } from "../shared/workbench/storage";
@@ -248,7 +248,6 @@ export const ICONS = {
 function openItemMenu(it: LibraryItem, x: number, y: number) {
   openMenu(
     [
-      { label: () => t("ctx.openEditor"), icon: ICONS.editor, action: () => openInEditor(it.itemId) },
       { label: () => t("reveal.open"), icon: ICONS.folder, action: () => void revealItem(it.itemId) },
       "sep",
       { label: () => t("ctx.delete"), icon: ICONS.trash, danger: true, action: () => void deleteItem(it) },

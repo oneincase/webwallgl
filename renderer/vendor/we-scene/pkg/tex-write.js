@@ -128,6 +128,74 @@ export function encodeTexImage(o) {
   return w.done()
 }
 
+/** WE 贴图 flags 位：32 = 视频贴图（载荷是 mp4） */
+export const TEX_FLAG_VIDEO = 32
+
+/** mp4 字节是否以 ftyp 盒开头（ISO BMFF） */
+export function isMp4Bytes(bytes) {
+  return bytes.length >= 12 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70
+}
+
+/** 从 mp4 的 moov/trak/tkhd 读第一条有画面的轨道宽高（16.16 定点，不解码）；读不到返回 null */
+export function mp4Size(bytes) {
+  if (!isMp4Bytes(bytes)) return null
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const type = (p) => String.fromCharCode(bytes[p + 4], bytes[p + 5], bytes[p + 6], bytes[p + 7])
+  const boxes = function* (start, end) {
+    let p = start
+    while (p + 8 <= end) {
+      let size = dv.getUint32(p)
+      let head = 8
+      if (size === 1) {
+        if (p + 16 > end) return
+        size = dv.getUint32(p + 8) * 2 ** 32 + dv.getUint32(p + 12)
+        head = 16
+      } else if (size === 0) size = end - p
+      if (size < head || p + size > end) return
+      yield { t: type(p), body: p + head, end: p + size }
+      p += size
+    }
+  }
+  for (const moov of boxes(0, bytes.length)) {
+    if (moov.t !== 'moov') continue
+    for (const trak of boxes(moov.body, moov.end)) {
+      if (trak.t !== 'trak') continue
+      for (const tkhd of boxes(trak.body, trak.end)) {
+        if (tkhd.t !== 'tkhd' || tkhd.end - tkhd.body < 84) continue
+        const width = Math.round(dv.getUint32(tkhd.end - 8) / 65536)
+        const height = Math.round(dv.getUint32(tkhd.end - 4) / 65536)
+        if (width > 0 && height > 0) return { width, height }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * mp4 原字节包成视频 .tex。口径逐字段取自官方导出器（壁纸库 8 张视频贴图实测一致）：
+ * format=0、flags=34（视频 + clampUVs）、TEXB0003、freeImageFormat=-1、单 mip、
+ * compression=0、uncompressedSize=0、compressedSize=mp4 字节数，头部共 87 字节。
+ * @param {{ bytes: Uint8Array, width: number, height: number }} o
+ */
+export function encodeTexVideo(o) {
+  if (!isMp4Bytes(o.bytes)) throw new Error('encodeTexVideo: 只接受 mp4 字节')
+  const { width, height } = o
+  if (!(width > 0 && height > 0)) throw new Error('encodeTexVideo: 尺寸无效')
+  const w = new Writer(o.bytes.length + 96)
+  header(w, 0, TEX_FLAG_VIDEO | TEX_FLAG_CLAMP, width, height, width, height)
+  w.magic('TEXB0003')
+  w.u32(1)
+  w.i32(FIF.UNKNOWN)
+  w.u32(1)
+  w.u32(width)
+  w.u32(height)
+  w.u32(0)
+  w.i32(0)
+  w.i32(o.bytes.length)
+  w.bytes(o.bytes)
+  return w.done()
+}
+
 /** RGBA 半尺寸 box 下采样（奇数边取边缘像素补齐） */
 function halve(rgba, w, h) {
   const nw = Math.max(1, w >> 1)

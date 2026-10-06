@@ -231,6 +231,14 @@ export function hitTestLayersAll(layers, wx, wy, projH, opts = {}) {
     const ancVis = layer.ancestorsVisible !== undefined ? layer.ancestorsVisible : layer.visible
     if (ancVis === false) continue
     if (filter && !filter(layer)) continue
+    // [we-scene patch 2026-10-07] 编辑器（W15）：模型层按蒙皮网格精判。回调返回
+    // true/false 即为结论（网格可以伸出图层矩形，所以排在 OBB 之前）；undefined =
+    // 没有网格几何，落回 OBB。播放路径不传 meshHit，逐位不变。
+    if (opts.meshHit) {
+      const r = opts.meshHit(layer)
+      if (r === true) { out.push(layer); continue }
+      if (r === false) continue
+    }
     const loc = worldToLayerLocal(layer, wx, wy, projH, parOffX, parOffY, alignTable, opts.perspEye, parallaxCtx)
     if (!loc) continue
     if (Math.abs(loc.lx) <= 0.5 && Math.abs(loc.ly) <= 0.5) out.push(layer)
@@ -285,4 +293,183 @@ export function layerQuadWorld(layer, projH, alignTable, parallaxCtx) {
     corners.push([cx + c * qx - s * qy, cy + s * qx + c * qy])
   }
   return { anchor: [cx, cy], corners }
+}
+
+/**
+ * [we-scene patch 2026-10-07] 编辑器（W15）：把蒙皮后的网格（mdl-skin `skinnedMeshes`）
+ * 用绘制同一个 MVP 投到画布 CSS 像素。保留裁剪坐标：跨近裁剪面（GL 的 z = −w）的三角形
+ * 要像 GPU 那样裁掉面外部分再参与命中/凸包 —— 整个丢掉的话，铺到相机身后的地面
+ * （3477054430 城镇）近处画出来的像素就点不中。远裁剪面不裁（只会让命中区略大）。
+ *
+ * @returns {Array<{clip:Float64Array, xy:Float64Array, ok:Uint8Array, indices:ArrayLike<number>, indexCount:number, cssW:number, cssH:number}>}
+ */
+export function projectMeshesToScreen(meshes, mvp, cssW, cssH) {
+  const m = mvp
+  return meshes.map((me) => {
+    const n = me.vertexCount
+    const p = me.pos
+    const clip = new Float64Array(n * 4)
+    const xy = new Float64Array(n * 2)
+    const ok = new Uint8Array(n)
+    for (let i = 0; i < n; i++) {
+      const x = p[i * 3]
+      const y = p[i * 3 + 1]
+      const z = p[i * 3 + 2]
+      const cx = m[0] * x + m[4] * y + m[8] * z + m[12]
+      const cy = m[1] * x + m[5] * y + m[9] * z + m[13]
+      const cz = m[2] * x + m[6] * y + m[10] * z + m[14]
+      const cw = m[3] * x + m[7] * y + m[11] * z + m[15]
+      clip[i * 4] = cx
+      clip[i * 4 + 1] = cy
+      clip[i * 4 + 2] = cz
+      clip[i * 4 + 3] = cw
+      if (!(cz + cw >= 0) || !(cw > 1e-9)) continue
+      xy[i * 2] = ((cx / cw + 1) / 2) * cssW
+      xy[i * 2 + 1] = ((1 - cy / cw) / 2) * cssH
+      ok[i] = 1
+    }
+    return { clip, xy, ok, indices: me.indices, indexCount: me.indexCount, cssW, cssH }
+  })
+}
+
+/** 跨近裁剪面的三角形：裁掉面外部分，返回屏幕多边形（凸，3–4 点）；整个在面外返回 null */
+function clippedTriangle(me, i0, i1, i2) {
+  const C = me.clip
+  const vs = [i0, i1, i2]
+  const out = []
+  for (let k = 0; k < 3; k++) {
+    const a = vs[k]
+    const b = vs[(k + 1) % 3]
+    const da = C[a * 4 + 2] + C[a * 4 + 3]
+    const db = C[b * 4 + 2] + C[b * 4 + 3]
+    if (da >= 0) out.push([C[a * 4], C[a * 4 + 1], C[a * 4 + 3]])
+    if ((da >= 0) !== (db >= 0)) {
+      const t = da / (da - db)
+      out.push([
+        C[a * 4] + t * (C[b * 4] - C[a * 4]),
+        C[a * 4 + 1] + t * (C[b * 4 + 1] - C[a * 4 + 1]),
+        C[a * 4 + 3] + t * (C[b * 4 + 3] - C[a * 4 + 3]),
+      ])
+    }
+  }
+  if (out.length < 3) return null
+  const poly = []
+  for (const [cx, cy, cw] of out) {
+    if (!(cw > 1e-9)) return null
+    poly.push([((cx / cw + 1) / 2) * me.cssW, ((1 - cy / cw) / 2) * me.cssH])
+  }
+  return poly
+}
+
+/** 投影网格的凸包（Andrew 单调链，屏幕 y 向下）。只收被三角形引用的顶点（跨近裁剪面的取裁剪后的点）。 */
+export function screenMeshesHull(proj) {
+  const pts = []
+  for (const me of proj) {
+    const used = new Uint8Array(me.ok.length)
+    const idx = me.indices
+    for (let k = 0; k + 2 < me.indexCount; k += 3) {
+      const i0 = idx[k]
+      const i1 = idx[k + 1]
+      const i2 = idx[k + 2]
+      const all = me.ok[i0] && me.ok[i1] && me.ok[i2]
+      if (!all && (me.ok[i0] || me.ok[i1] || me.ok[i2] || crossesNear(me, i0, i1, i2))) {
+        const poly = clippedTriangle(me, i0, i1, i2)
+        if (poly) for (const q of poly) pts.push(q)
+        continue
+      }
+      if (!all) continue
+      for (const i of [i0, i1, i2]) {
+        if (!used[i]) { used[i] = 1; pts.push([me.xy[i * 2], me.xy[i * 2 + 1]]) }
+      }
+    }
+  }
+  if (pts.length < 3) return pts.length ? pts : null
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+  const lower = []
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop()
+    lower.push(p)
+  }
+  const upper = []
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop()
+    upper.push(p)
+  }
+  lower.pop()
+  upper.pop()
+  return lower.concat(upper)
+}
+
+// 三个顶点都没进可见集时，仍可能有顶点在面内（只是 w 极小）——按裁剪距离判断是否跨面
+function crossesNear(me, i0, i1, i2) {
+  const C = me.clip
+  const d0 = C[i0 * 4 + 2] + C[i0 * 4 + 3] >= 0
+  const d1 = C[i1 * 4 + 2] + C[i1 * 4 + 3] >= 0
+  const d2 = C[i2 * 4 + 2] + C[i2 * 4 + 3] >= 0
+  return (d0 || d1 || d2) && !(d0 && d1 && d2)
+}
+
+function pointInConvex(hull, x, y) {
+  let sign = 0
+  for (let i = 0; i < hull.length; i++) {
+    const a = hull[i]
+    const b = hull[(i + 1) % hull.length]
+    const c = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+    if (c === 0) continue
+    const s = c > 0 ? 1 : -1
+    if (sign === 0) sign = s
+    else if (s !== sign) return false
+  }
+  return true
+}
+
+function polyArea2(P) {
+  let a = 0
+  for (let i = 0; i < P.length; i++) {
+    const p = P[i]
+    const q = P[(i + 1) % P.length]
+    a += p[0] * q[1] - q[0] * p[1]
+  }
+  return a
+}
+
+/**
+ * 点 (x, y)（CSS 像素）是否落在投影网格的某个三角形内（含边）。先凸包粗判再逐三角形。
+ * hull 可传 screenMeshesHull 的结果省一次计算。
+ */
+export function screenMeshesContain(proj, x, y, hull) {
+  const h = hull === undefined ? screenMeshesHull(proj) : hull
+  if (!h || h.length < 3 || !pointInConvex(h, x, y)) return false
+  for (const me of proj) {
+    const xy = me.xy
+    const ok = me.ok
+    const idx = me.indices
+    for (let k = 0; k + 2 < me.indexCount; k += 3) {
+      const i0 = idx[k]
+      const i1 = idx[k + 1]
+      const i2 = idx[k + 2]
+      if (!ok[i0] || !ok[i1] || !ok[i2]) {
+        if (!(ok[i0] || ok[i1] || ok[i2] || crossesNear(me, i0, i1, i2))) continue
+        const poly = clippedTriangle(me, i0, i1, i2)
+        if (poly && polyArea2(poly) !== 0 && pointInConvex(poly, x, y)) return true
+        continue
+      }
+      const ax = xy[i0 * 2]
+      const ay = xy[i0 * 2 + 1]
+      const bx = xy[i1 * 2]
+      const by = xy[i1 * 2 + 1]
+      const cx = xy[i2 * 2]
+      const cy = xy[i2 * 2 + 1]
+      if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) continue
+      const d1 = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+      const d2 = (cx - bx) * (y - by) - (cy - by) * (x - bx)
+      const d3 = (ax - cx) * (y - cy) - (ay - cy) * (x - cx)
+      const neg = d1 < 0 || d2 < 0 || d3 < 0
+      const pos = d1 > 0 || d2 > 0 || d3 > 0
+      if (!(neg && pos)) return true
+    }
+  }
+  return false
 }

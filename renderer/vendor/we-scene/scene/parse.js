@@ -177,6 +177,90 @@ export function sceneEntryCandidates(project) {
   return out
 }
 
+/**
+ * scene.json 对象的 `animationlayers` → 渲染侧动画层列表（puppet clip 混合，见 render/mdl-skin.js）。
+ * 解析路径与编辑器热改（EditorControls.setAnimationLayers）共用这一份映射。
+ */
+export function parseAnimationLayers(list) {
+  return (Array.isArray(list) ? list : [])
+    .filter((a) => a && typeof a.animation === 'number')
+    .map((a) => ({
+      animation: a.animation,
+      // [we-scene patch] 层名：脚本经 thisLayer.getAnimationLayer(name)
+      // 控制特定 clip（3396722575 的「错帧」机制：init 停掉错位层，收到
+      // 帧事件后 play）。visible 是 {script} 时 parseBool 吃默认 true，
+      // 脚本装配后逐帧决定（见 scene-mount animLayerScriptRuns）。
+      name: typeof a.name === 'string' ? a.name : '',
+      visibleScript: a.visible && typeof a.visible === 'object' && typeof a.visible.script === 'string' && a.visible.script
+        ? { script: a.visible.script, scriptproperties: a.visible.scriptproperties || null, value: a.visible.value }
+        : null,
+      visible: parseBool(a.visible, true),
+      additive: parseBool(a.additive, false),
+      blend: parseNum(a.blend, 1),
+      rate: parseNum(a.rate, 1),
+      // [we-scene patch 2026-09-28] **blend / rate 的脚本与关键帧动画形态**。
+      //
+      // WE 的 animationlayers[] 三个字段（visible/blend/rate）都可以是
+      // `{script}` 或 `{animation}`。此前只做了 visible，blend/rate 只取初始字面量 ——
+      // 后果最严重的是 3281559867：Kirby「绊倒」时 `kirbystate = 2`，
+      // 而**把它复位回 0 的 `end` 事件处理写在 Trip 层的 blend 脚本里**
+      //（`export function animationEvent`），脚本没被编译 ⇒ 事件没人接 ⇒
+      // 绊倒后状态永远回不去 ⇒ 角色定在原地不动（分数也停住）。
+      // 同库 23 处 blend 脚本 / 20 处 blend 动画（另 3306942838 也用）/
+      // 455 处 rate 脚本（5 张，调 clip 播放速度）。
+      blendScript: a.blend && typeof a.blend === 'object' && typeof a.blend.script === 'string' && a.blend.script
+        ? { script: a.blend.script, scriptproperties: a.blend.scriptproperties || null, value: a.blend.value }
+        : null,
+      blendAnimation: a.blend && typeof a.blend === 'object' && a.blend.animation && a.blend.animation.options
+        ? { animation: a.blend.animation, value: a.blend.value }
+        : null,
+      rateScript: a.rate && typeof a.rate === 'object' && typeof a.rate.script === 'string' && a.rate.script
+        ? { script: a.rate.script, scriptproperties: a.rate.scriptproperties || null, value: a.rate.value }
+        : null,
+      // 运行态：play()/pause()/stop()/setFrame() 控制（脚本），默认播放；不参与序列化。
+      playing: true,
+      paused: false,
+      // [we-scene patch 2026-09-28] **每层自己的播放时钟**。
+      //
+      // null = 绝对时钟（历史行为）：采样时间 = 场景时间 × rate，装载即推进，
+      // 与改动前逐位一致 —— 全库绝大多数 puppet 走这条。
+      // 一旦脚本用 play()/pause()/setFrame() 接管（WE 的
+      // `thisLayer.getAnimationLayer("Attack").getAnimation("go").play()`），
+      // 改用本层自己的帧号推进：
+      //   frame  = clip 自己的帧号（rate 只影响推进速度；与 WE setFrame 同口径）
+      //   anchor = 上次采样的场景时间（-1 = 下一帧采样时重新锚定，不重置帧号）
+      //   null 帧号 = 脚本只 pause 没 play：首次采样时按绝对时钟取当前帧接手，
+      //              姿势不跳变
+      // 为什么必须做：`single` clip 的采样在绝对时钟下会被 clamp 到**末帧**，
+      // 于是 `play()`（作者语义 = 从头播这段入场/攻击动画）表现为「立刻停在收势」，
+      // 3281559867 的跑动/撞击/攻击/受击全部退化成定格 → 「动画完全不对」。
+      clock: null,
+      play() {
+        this.playing = true
+        this.paused = false
+        const c = this.clock || (this.clock = { frame: 0, anchor: -1 })
+        c.frame = 0
+        c.anchor = -1
+      },
+      pause() {
+        this.paused = true
+        if (!this.clock) this.clock = { frame: null, anchor: -1 }
+      },
+      stop() { this.playing = false; this.paused = false; this.clock = null },
+      setFrame(f) {
+        const c = this.clock || (this.clock = { frame: 0, anchor: -1 })
+        c.frame = Math.max(0, Number(f) || 0)
+        c.anchor = -1
+      },
+      isPlaying() { return this.playing !== false && this.paused !== true },
+      // IAnimationLayer.getAnimation(name)：WE 里「动画层 → 该层内命名的动画」。
+      // 本仓一条 animationlayer 就是一个 clip，子动画名（go/appear/fade…）即它本身，
+      // 所以返回同一控制器：play/pause/stop/setFrame/isPlaying 语义完全一致
+      // （3281559867 全库唯一用到，82 处调用）。
+      getAnimation() { return this },
+    }))
+}
+
 export function parseScene(sceneJson, project) {
   const gp = (project && project.general && project.general.properties) || {}
   // 预设包（general.properties 为空、project.preset 有值）用 preset 当属性表；
@@ -512,83 +596,7 @@ export function parseScene(sceneJson, project) {
         }
         return Object.keys(out).length ? out : null
       })(),
-      animationLayers: (o.animationlayers || [])
-        .filter((a) => a && typeof a.animation === 'number')
-        .map((a) => ({
-          animation: a.animation,
-          // [we-scene patch] 层名：脚本经 thisLayer.getAnimationLayer(name)
-          // 控制特定 clip（3396722575 的「错帧」机制：init 停掉错位层，收到
-          // 帧事件后 play）。visible 是 {script} 时 parseBool 吃默认 true，
-          // 脚本装配后逐帧决定（见 scene-mount animLayerScriptRuns）。
-          name: typeof a.name === 'string' ? a.name : '',
-          visibleScript: a.visible && typeof a.visible === 'object' && typeof a.visible.script === 'string' && a.visible.script
-            ? { script: a.visible.script, scriptproperties: a.visible.scriptproperties || null, value: a.visible.value }
-            : null,
-          visible: parseBool(a.visible, true),
-          additive: parseBool(a.additive, false),
-          blend: parseNum(a.blend, 1),
-          rate: parseNum(a.rate, 1),
-          // [we-scene patch 2026-09-28] **blend / rate 的脚本与关键帧动画形态**。
-          //
-          // WE 的 animationlayers[] 三个字段（visible/blend/rate）都可以是
-          // `{script}` 或 `{animation}`。此前只做了 visible，blend/rate 只取初始字面量 ——
-          // 后果最严重的是 3281559867：Kirby「绊倒」时 `kirbystate = 2`，
-          // 而**把它复位回 0 的 `end` 事件处理写在 Trip 层的 blend 脚本里**
-          //（`export function animationEvent`），脚本没被编译 ⇒ 事件没人接 ⇒
-          // 绊倒后状态永远回不去 ⇒ 角色定在原地不动（分数也停住）。
-          // 同库 23 处 blend 脚本 / 20 处 blend 动画（另 3306942838 也用）/
-          // 455 处 rate 脚本（5 张，调 clip 播放速度）。
-          blendScript: a.blend && typeof a.blend === 'object' && typeof a.blend.script === 'string' && a.blend.script
-            ? { script: a.blend.script, scriptproperties: a.blend.scriptproperties || null, value: a.blend.value }
-            : null,
-          blendAnimation: a.blend && typeof a.blend === 'object' && a.blend.animation && a.blend.animation.options
-            ? { animation: a.blend.animation, value: a.blend.value }
-            : null,
-          rateScript: a.rate && typeof a.rate === 'object' && typeof a.rate.script === 'string' && a.rate.script
-            ? { script: a.rate.script, scriptproperties: a.rate.scriptproperties || null, value: a.rate.value }
-            : null,
-          // 运行态：play()/pause()/stop()/setFrame() 控制（脚本），默认播放；不参与序列化。
-          playing: true,
-          paused: false,
-          // [we-scene patch 2026-09-28] **每层自己的播放时钟**。
-          //
-          // null = 绝对时钟（历史行为）：采样时间 = 场景时间 × rate，装载即推进，
-          // 与改动前逐位一致 —— 全库绝大多数 puppet 走这条。
-          // 一旦脚本用 play()/pause()/setFrame() 接管（WE 的
-          // `thisLayer.getAnimationLayer("Attack").getAnimation("go").play()`），
-          // 改用本层自己的帧号推进：
-          //   frame  = clip 自己的帧号（rate 只影响推进速度；与 WE setFrame 同口径）
-          //   anchor = 上次采样的场景时间（-1 = 下一帧采样时重新锚定，不重置帧号）
-          //   null 帧号 = 脚本只 pause 没 play：首次采样时按绝对时钟取当前帧接手，
-          //              姿势不跳变
-          // 为什么必须做：`single` clip 的采样在绝对时钟下会被 clamp 到**末帧**，
-          // 于是 `play()`（作者语义 = 从头播这段入场/攻击动画）表现为「立刻停在收势」，
-          // 3281559867 的跑动/撞击/攻击/受击全部退化成定格 → 「动画完全不对」。
-          clock: null,
-          play() {
-            this.playing = true
-            this.paused = false
-            const c = this.clock || (this.clock = { frame: 0, anchor: -1 })
-            c.frame = 0
-            c.anchor = -1
-          },
-          pause() {
-            this.paused = true
-            if (!this.clock) this.clock = { frame: null, anchor: -1 }
-          },
-          stop() { this.playing = false; this.paused = false; this.clock = null },
-          setFrame(f) {
-            const c = this.clock || (this.clock = { frame: 0, anchor: -1 })
-            c.frame = Math.max(0, Number(f) || 0)
-            c.anchor = -1
-          },
-          isPlaying() { return this.playing !== false && this.paused !== true },
-          // IAnimationLayer.getAnimation(name)：WE 里「动画层 → 该层内命名的动画」。
-          // 本仓一条 animationlayer 就是一个 clip，子动画名（go/appear/fade…）即它本身，
-          // 所以返回同一控制器：play/pause/stop/setFrame/isPlaying 语义完全一致
-          // （3281559867 全库唯一用到，82 处调用）。
-          getAnimation() { return this },
-        })),
+      animationLayers: parseAnimationLayers(o.animationlayers),
       // WE 的 solid 层：无 image/particle，或 image 指向内置 models/util/*（纯色层，无纹理）
       // [we-scene patch] **composelayer 必须排除在外。** 它不是纯色层而是一块
       // 「效果画布」—— 层内容本该是**空白（全 0）**，让效果链自己往上画。

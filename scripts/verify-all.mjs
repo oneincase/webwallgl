@@ -56,6 +56,8 @@ const STABLE = [
   // 解码/定位类判据：LZ4（逐位对账 + 惰性 mip 契约）、MDL 段定位（单趟扫描 vs 独立扫描）
   "verify-lz4",
   "verify-mdl-sections",
+  // .mdl 编码器（W17）：语料逐字节往返、文档与 parseMDL 同源、从零编码 MDLV0023 的语义往返
+  "verify-mdl-write",
   // MDL 顶点着色器 uniform 契约：每个 uniform 每条绘制路径都要赋值（否则走 GL 默认值 (0,0)，
   // 曾把除白名单两张外的全部 puppet 塌到原点 —— 见 verify-mdl-uniforms 头注）
   "verify-mdl-uniforms",

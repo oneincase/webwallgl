@@ -25,6 +25,10 @@ export type VideoLoopPair = {
   setVolume(vol: number): void;
   pause(): void;
   resume(): void;
+  /** 定位到 t 秒（超出时长按循环取模），画面解出来（seeked）或超时后 resolve */
+  seek(t: number, timeoutMs?: number): Promise<void>;
+  /** 播放倍速；0 = 定格（不改暂停状态，倍速调回后继续走） */
+  setRate(rate: number): void;
   destroy(): void;
 };
 
@@ -94,6 +98,8 @@ export function createLoopingVideo(src: string, opts: VideoLoopOpts): VideoLoopP
   let prevTime = -1; // 主元素上一帧时间，用于检测原生循环回绕
   let raf = 0;
   let destroyed = false;
+  let rate = 1;
+  let wantPlay = false;
 
   /** ended 处理：只有主元素会触发（爬行后 loop 已关）；备用触发即忽略 */
   const handleEnded = (el: HTMLVideoElement) => {
@@ -112,7 +118,7 @@ export function createLoopingVideo(src: string, opts: VideoLoopOpts): VideoLoopP
     // **快速淡出**而不是硬切 —— 元素级 API 的 1~3 帧不精度（ended 分发、换层
     // 合成）全部被淡变掩掉：对无缝循环内容两层几乎一致，淡出过程本身不可见；
     // 观众视线跟着下层"继续运动"的内容走，定格/跳跃不再存在。
-    standby.playbackRate = 1;
+    standby.playbackRate = rate || 1;
     const prev = active;
     fading = true;
     prev.style.transition = `opacity ${LOOP_FADE_MS}ms linear`;
@@ -180,7 +186,7 @@ export function createLoopingVideo(src: string, opts: VideoLoopOpts): VideoLoopP
     stallGraceUntil = performance.now() + Math.max(800, crawlLead * 1000 + 300);
     // 新主元素在爬行阶段就已经在播放，速率也已拨回 1x；仅当意外暂停时兜底拉起
     if (active.paused) void active.play().catch(() => {});
-    if (active.playbackRate !== 1) active.playbackRate = 1;
+    if (active.playbackRate !== (rate || 1)) active.playbackRate = rate || 1;
     active.muted = userMuted;
     active.volume = userVolume;
     // 旧主元素停在末帧：切走后归零静音、恢复原生 loop 兜底姿态，成为下一个备用
@@ -398,14 +404,61 @@ export function createLoopingVideo(src: string, opts: VideoLoopOpts): VideoLoopP
       standby.volume = userVolume;
     },
     pause() {
+      wantPlay = false;
       // 放弃未完成的预热：备用停掉归零，恢复时重新走预热流程
       disarm();
       active.pause();
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
     },
+    seek(t: number, timeoutMs = 2000) {
+      if (destroyed || !Number.isFinite(t)) return Promise.resolve();
+      disarm();
+      const el = active;
+      return new Promise<void>((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          el.removeEventListener("seeked", finish);
+          resolve();
+        };
+        const timer = window.setTimeout(finish, timeoutMs);
+        const go = () => {
+          if (done) return;
+          const d = el.duration;
+          const target = Number.isFinite(d) && d > 0 ? ((t % d) + d) % d : Math.max(0, t);
+          prevTime = -1;
+          if (Math.abs(el.currentTime - target) < 1e-4 && el.readyState >= 2) return finish();
+          el.addEventListener("seeked", finish);
+          try {
+            el.currentTime = target;
+          } catch {
+            finish();
+          }
+        };
+        if (el.readyState >= 1) go();
+        else el.addEventListener("loadedmetadata", go, { once: true });
+      });
+    },
+    setRate(r: number) {
+      rate = Number.isFinite(r) && r > 0 ? r : 0;
+      if (rate > 0) {
+        active.playbackRate = rate;
+        if (wantPlay && active.paused) void active.play().catch(() => {});
+        if (wantPlay && !raf) raf = requestAnimationFrame(tick);
+      } else {
+        disarm();
+        active.pause();
+        if (raf) cancelAnimationFrame(raf);
+        raf = 0;
+      }
+    },
     resume() {
       if (destroyed) return;
+      wantPlay = true;
+      if (rate === 0) return;
       void active.play().catch((e: unknown) => {
         // pause()/load()/切壁纸打断未完成的 play() 是浏览器预期（AbortError）
         if (e && (e as { name?: string }).name === "AbortError") return;

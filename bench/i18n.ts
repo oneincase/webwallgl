@@ -9,8 +9,8 @@ export type Lang = "zh" | "en";
 const LANG_KEY = "webwallgl-lang";
 
 export const DICT: Record<Lang, Record<string, string>> = {  zh: {
-    "app.title": "WebWallGL 测试台",
-    "mode.bench": "测试台",
+    "app.title": "WebWallGL 预览",
+    "mode.bench": "预览",
     "act.docs": "使用说明",
     "act.editor": "编辑器",
     "ctx.openEditor": "在编辑器中打开",
@@ -32,7 +32,7 @@ export const DICT: Record<Lang, Record<string, string>> = {  zh: {
     "sidebar.pickLib": "选择壁纸库文件夹（也可继续用 WE_LIBRARY）",
     "btn.pickLib": "选择壁纸库",
     "lib.refresh": "刷新壁纸库",
-    "backend.down": "连不上宿主后端（/api/library）。请用 pnpm dev 或桌面版启动测试台。",
+    "backend.down": "连不上宿主后端（/api/library）。请用 pnpm dev 或桌面版启动预览。",
     "backend.retry": "重试",
     "status.backendDown": "宿主后端不可用",
     "err.backend": "宿主后端不可用：{msg}",
@@ -210,8 +210,8 @@ export const DICT: Record<Lang, Record<string, string>> = {  zh: {
     "prompt.libDir": "壁纸库目录",
   },
   en: {
-    "app.title": "WebWallGL Bench",
-    "mode.bench": "Bench",
+    "app.title": "WebWallGL Preview",
+    "mode.bench": "Preview",
     "act.docs": "User guide",
     "act.editor": "Editor",
     "ctx.openEditor": "Open in editor",

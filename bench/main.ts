@@ -31,7 +31,6 @@ import "./render-settings";
 import {
   isRunning,
   mount,
-  openInEditor,
   openInNewWindow,
   pickLocalFile,
   release,
@@ -144,7 +143,6 @@ const menubar = createMenubar($("#menubar"), [
       { label: () => t("menu.refreshLib"), action: () => void loadLibrary() },
       "sep",
       { label: () => t("menu.newWindow"), disabled: () => !hasItem(), action: openInNewWindow },
-      { label: () => t("ctx.openEditor"), keys: "mod+e", disabled: () => !hasItem(), action: () => openInEditor() },
       {
         label: () => t("menu.reveal"),
         disabled: () => !hasItem(),

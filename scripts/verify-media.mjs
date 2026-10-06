@@ -724,9 +724,13 @@ const { check, errors } = createChecker();
     "scene-mount 必须处理图层自身材质的 usertextures 保留名");
   check(/if \(!layer\.solid\) \{[\s\S]{0,600}textures\.has\(reserved\)[\s\S]{0,200}else \{[\s\S]{0,120}pendingInstanceMedia\.push/.test(smSrc),
     "自身材质保留名必须就绪即切 textureName、未就绪登记 pendingInstanceMedia");
-  // 默认槽回写要避让已登记保留名，否则 album2 的异步 then 会把真封面覆盖回占位图
-  check(/!instBoundTex && !pendingInstanceMedia\.some\(\(p\) => p\.layer === layer\)/.test(smSrc),
-    "模型默认贴图回写必须避让登记了保留名的层（否则内置占位图覆盖真封面）");
+  // 默认槽回写要避让**已绑上**的保留名（否则 album2 的异步 then 会把真封面覆盖回占位图），
+  // 但保留名还在等时必须写占位图：2026-10-07 前守卫是「登记了就不写」，封面不来时
+  // 层永远没有 textureName（3465215190 的 puppet「画」因此被整层跳过）。
+  check(/const reservedBound = typeof layer\.textureName === "string" && layer\.textureName\.startsWith\("\$"\);\s*if \(si === 0 && !instUtName && !reservedBound\) \{/.test(smSrc),
+    "模型默认贴图回写只避让已绑上的保留名 / 实例绑定；封面未到时先写作者内置贴图占位");
+  check(!/!pendingInstanceMedia\.some\(\(p\) => p\.layer === layer\)/.test(smSrc),
+    "默认贴图回写不再以「登记了迟到绑定」为拒绝条件（那会让封面不来的层永远无贴图）");
   console.log(`  自身材质保留名：全库 ${totalBaseReserved} 处 / 19 张，3151551777 album 层在案`);
 }
 

@@ -391,6 +391,63 @@ export function bindWorldOf(mdl, boneIndex) {
   return mat4Invert(mdl.invBindWorld[boneIndex])
 }
 
+/**
+ * [we-scene patch 2026-10-07] 编辑器（W15）：CPU 蒙皮后的顶点，逐子网格（列表规则同
+ * mdl.js draw：多于 1 个子网格走 mdl.meshes，否则用顶层字段）。公式与 mdl.js 顶点着色器
+ * 逐项一致：Σ w·(skin[bi]·p) / Σw，无有效权重留原位；keepZ=false 时 z 置 0（2D puppet）。
+ * skin = computeSkinMatrices 的返回值（null = 绑定姿势 → 原始位置）。
+ * 不含「收拢零件压扁」（collapsedPartSquash，名单壁纸专用）。只读，绘制路径不调用。
+ *
+ * @returns {Array<{pos:Float32Array, indices:ArrayLike<number>, vertexCount:number, indexCount:number}>}
+ */
+export function skinnedMeshes(mdl, skin, keepZ) {
+  if (!mdl) return []
+  const list = mdl.meshes && mdl.meshes.length > 1 ? mdl.meshes : [mdl]
+  const boneCount = skin && mdl.bones ? mdl.bones.length : 0
+  const out = []
+  for (const me of list) {
+    const n = me.vertexCount | 0
+    const src = me.positions
+    if (!n || !src || !me.indices) continue
+    const pos = new Float32Array(n * 3)
+    const bi4 = me.boneIdx
+    const w4 = me.weights
+    for (let i = 0; i < n; i++) {
+      const px = src[i * 3]
+      const py = src[i * 3 + 1]
+      const pz = src[i * 3 + 2]
+      let x = 0
+      let y = 0
+      let z = 0
+      let total = 0
+      if (boneCount > 0 && bi4 && w4) {
+        for (let k = 0; k < 4; k++) {
+          const w = w4[i * 4 + k]
+          if (!(w > 0)) continue
+          const b = Math.trunc(bi4[i * 4 + k])
+          if (b < 0 || b >= boneCount) continue
+          const o = b * 16
+          x += w * (skin[o] * px + skin[o + 4] * py + skin[o + 8] * pz + skin[o + 12])
+          y += w * (skin[o + 1] * px + skin[o + 5] * py + skin[o + 9] * pz + skin[o + 13])
+          z += w * (skin[o + 2] * px + skin[o + 6] * py + skin[o + 10] * pz + skin[o + 14])
+          total += w
+        }
+      }
+      if (total > 0) {
+        pos[i * 3] = x / total
+        pos[i * 3 + 1] = y / total
+        pos[i * 3 + 2] = keepZ ? z / total : 0
+      } else {
+        pos[i * 3] = px
+        pos[i * 3 + 1] = py
+        pos[i * 3 + 2] = keepZ ? pz : 0
+      }
+    }
+    out.push({ pos, indices: me.indices, vertexCount: n, indexCount: me.indexCount | 0 || me.indices.length })
+  }
+  return out
+}
+
 /** [we-scene patch] 4x4 乘法（列主序），供宿主组合附着点变换 */
 export function mat4MulOut(a, b) {
   return mat4Mul(a, b)
@@ -476,6 +533,34 @@ export function parentMeshToWorldDelta(parent, dx, dy) {
   return [ox * cos - oy * sin, ox * sin + oy * cos]
 }
 
+/** 附着点绑定偏移是否按图集散开位压成 0（判定依据见 applyAttachmentBindOrigins 内注释） */
+export function attachmentAtlasBind(parent) {
+  const m = parent && parent.puppet
+  if (!m) return false
+  return !(m.animations && m.animations.length) &&
+    !m.staticPoseTRS &&
+    m.magic === 'MDLV0019' &&
+    puppetUvMatchesLayout(m, parent.size)
+}
+
+/**
+ * [we-scene patch 2026-10-07] 挂在 `parent` 的附着点 `name` 上的层，此刻被引擎额外加进局部 origin 的
+ * 网格空间偏移（Y-up，未乘父缩放 / 旋转）= 绑定偏移（图集散开位为 0）+ 跟随增量（当前 − 绑定）。
+ * 与 applyAttachmentBindOrigins + followAttachments 合起来的效果逐项相同。
+ * 调用方须先以本帧的 time / animationLayers / 骨骼覆盖跑过 computeSkinMatrices。
+ * 父级不是 puppet 或没有这个附着点 → null。
+ */
+export function attachmentEffectiveOffset(parent, name) {
+  const m = parent && parent.puppet
+  if (!m) return null
+  const bindM = attachmentBind(m, name)
+  if (!bindM) return null
+  const cur = attachmentWorld(m, name) || bindM
+  const baseX = attachmentAtlasBind(parent) ? 0 : bindM[12]
+  const baseY = attachmentAtlasBind(parent) ? 0 : bindM[13]
+  return [baseX + cur[12] - bindM[12], baseY + cur[13] - bindM[13]]
+}
+
 /**
  * parse.js 只合并了「父 origin + 子 local」。有 attachment 且父级已挂上 puppet 时，
  * 再把绑定姿势附着点加进去：
@@ -542,11 +627,7 @@ export function applyAttachmentBindOrigins(layers) {
     // 消失（用户报「头发错位」）。全库 132 行附着点实测：这条判定只影响本壁纸 26 行，
     // 另有 1 行 bind=[0,0]（压不压等价）；MDLV0019 的 4 个父模型（全在 3226487183）
     // 本来就被「有动画 / 有静态姿势」两条排除，一行未动。
-    const atlasBind = !(parent.puppet.animations && parent.puppet.animations.length) &&
-      !parent.puppet.staticPoseTRS &&
-      parent.puppet.magic === 'MDLV0019' &&
-      puppetUvMatchesLayout(parent.puppet, parent.size)
-    const d = atlasBind ? [0, 0] : parentMeshToWorldDelta(parent, bx, by)
+    const d = attachmentAtlasBind(parent) ? [0, 0] : parentMeshToWorldDelta(parent, bx, by)
     const desc = []
     collectDesc(layer, desc)
     layer.origin[0] += d[0]

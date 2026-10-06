@@ -13,6 +13,7 @@ import {
   SYSTEM_FONT_FAMILIES,
   checkSceneScript,
   editorOf,
+  mediaSource,
   mount,
   type EditorControls,
   type EditorLayer,
@@ -41,7 +42,6 @@ import {
   referencedModels,
   type ImageInput,
 } from "./create";
-import { applyDraft, idbDraftStore, makeDraft, type Draft, type DraftOrigin } from "./draft";
 import {
   EFFECTS,
   addEffect,
@@ -132,6 +132,18 @@ import {
 } from "./keyframes";
 import { allowRecover, isContextLost, RECOVER_MAX } from "./recover";
 import {
+  VIDEO_SLUG_PREFIX,
+  isCanceled,
+  isEditorVideoModel,
+  isVideoFile,
+  normalizeVideo,
+  probeVideo,
+  recordVideo,
+  videoLayerFiles,
+  videoMaterialPathOf,
+  type VideoInput,
+} from "./video";
+import {
   PROP_TYPES,
   bindProp,
   bindableFor,
@@ -164,7 +176,7 @@ import {
   type Box,
   type SnapTargets,
 } from "./snap";
-import { scriptsAllowedByDefault, scriptsOverrideFrom } from "./trust";
+import { scriptsAllowedByDefault, scriptsOverrideFrom, type ContentKind } from "./trust";
 import {
   duplicateLayer,
   findNode,
@@ -175,6 +187,7 @@ import {
   makeDoc,
   moveLayer,
   placeLayer,
+  rebuildTree,
   removeLayer,
   sceneResolution,
   setLocked,
@@ -186,6 +199,31 @@ import {
   type PlaceResult,
   type PlaceWhere,
 } from "./doc";
+import {
+  addAnimLayer,
+  animLayersHot,
+  attachmentOf,
+  attachToModel,
+  detachFromModel,
+  type AttachOffsetOf,
+  type AttachResult,
+  getAnimLayers,
+  editorMaterialOf,
+  editorMdlOf,
+  meshMaterialPath,
+  meshRetexture,
+  modelInfoRows,
+  modelTextureSlots,
+  parseJsonBytes,
+  puppetRetexture,
+  type RetextureResult,
+  moveAnimLayer,
+  removeAnimLayer,
+  scanPuppets,
+  setAnimLayerField,
+  soloAnimLayers,
+  type AnimLayerView,
+} from "./model";
 import {
   DRAG_THRESHOLD,
   HANDLE,
@@ -204,6 +242,8 @@ import {
   isBatch,
   isNoopEdit,
   isStruct,
+  isVideoCmd,
+  type VideoClip,
   mergeLiveEdit,
   pickProps,
   restoreObjects as restoreDocObjects,
@@ -215,37 +255,31 @@ import {
   collectDropped,
   fetchLibrary,
   filesFromInput,
-  libraryKind,
-  openLibraryItem,
   openLocalFiles,
   sourceFromDoc,
-  type LibraryItem,
   type Opened,
   type SceneAssets,
 } from "./open";
 import {
   canPickDirectory,
   collectProject,
+  collectVideoProject,
   downloadZip,
-  newLibraryItemId,
+  filesFromDirectory,
   packProject,
   pickDirectory,
-  saveToLibrary,
+  probeWritable,
+  removeProjectFile,
   slugName,
-  totalBytes,
   writeToDirectory,
+  type DirHandle,
+  type SaveFile,
 } from "./save";
-
-const TOKEN = "dev"; // 与 host/wallpaper-host.ts 的 DEV_TOKEN 一致
-const MEDIA_BASE = `${location.origin}/media/${TOKEN}`;
-const WEB_BASE = `${location.origin}/web/${TOKEN}`;
+import { mountVideoStage, videoProjectJson } from "./video-project";
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
 const docTitleEl = $<HTMLElement>("#ed-doc-title");
-const libListEl = $<HTMLUListElement>("#ed-lib-list");
-const libCountEl = $<HTMLElement>("#ed-lib-count");
-const filterEl = $<HTMLInputElement>("#ed-filter");
 const treeEl = $<HTMLElement>("#ed-tree");
 const layerCountEl = $<HTMLElement>("#ed-layer-count");
 const inspectorEl = $<HTMLElement>("#ed-inspector");
@@ -274,11 +308,11 @@ const tlSpeedEl = $<HTMLSelectElement>("#tl-speed");
 const undoEl = $<HTMLButtonElement>("#tb-undo");
 const redoEl = $<HTMLButtonElement>("#tb-redo");
 const inPkgEl = $<HTMLInputElement>("#in-pkg");
-const inDirEl = $<HTMLInputElement>("#in-dir");
 const stDocEl = $<HTMLElement>("#st-doc");
 const stFormEl = $<HTMLElement>("#st-form");
 const stLayersEl = $<HTMLElement>("#st-layers");
 const stResEl = $<HTMLElement>("#st-res");
+const stSaveEl = $<HTMLElement>("#st-save");
 const stFpsEl = $<HTMLElement>("#st-fps");
 
 // ---------- 控制台 ----------
@@ -321,7 +355,6 @@ langEl.value = getLang();
 langEl.onchange = () => setLang(langEl.value as Lang);
 onChangeLang(() => {
   themeBtn.refresh();
-  renderLibrary();
   renderTree();
   renderInspector();
   renderStatus();
@@ -362,6 +395,11 @@ let doc: EditorDoc | null = null;
 let current: Opened | null = null;
 let instance: SceneInstance | null = null;
 let editor: EditorControls | null = null;
+/** 视频壁纸工程的预览元素（场景文档时为 null） */
+let videoEl: HTMLVideoElement | null = null;
+/** 视频壁纸工程的入点 / 出点（页面状态，「应用裁剪」后清空） */
+let trimIn: number | null = null;
+let trimOut: number | null = null;
 let openGen = 0;
 let selectedId: number | string | null = null;
 const collapsed = new Set<number | string>();
@@ -416,7 +454,7 @@ let scriptsAllowed = true;
 /** 当前文档的资源表（原始来源 + 页面新增素材）；非场景 / 取不到场景资源时为 null */
 let overlay: OverlayAssets | null = null;
 /** 草稿来源；null = 本地文件 / 目录（刷新后 File 句柄失效，不做草稿） */
-let origin: DraftOrigin | null = null;
+let origin: { kind: ContentKind } | null = null;
 
 function destroyInstance() {
   if (!instance) return;
@@ -427,6 +465,7 @@ function destroyInstance() {
   }
   instance = null;
   editor = null;
+  videoEl = null;
   drag = null;
   stageEl.textContent = "";
   syncTimeline();
@@ -446,14 +485,41 @@ function onContextLost(gen: number) {
   void mountCurrent(true);
 }
 
+let mounting = false;
+/** 动画层「单独预览」：只改了引擎、文档未动；重挂 / 换选中 / 任一提交都会结束 */
+let animSolo: { id: number | string; index: number } | null = null;
+/** 「挂到模型」分组里为某层选中的目标模型 / 附着点（视口标记据此高亮），换选中即失效 */
+let attachPick: { layer: number | string; model: number | string; name: string } | null = null;
+/** 只有用户点了播放才走时钟；打开文档、重挂都停在当前帧 */
+let userPlaying = false;
+
 async function mountCurrent(keepTime = false) {
   if (!current) return;
+  mounting = true;
+  animSolo = null;
   const gen = ++openGen;
   const resumeAt = keepTime ? editor?.time ?? 0 : 0;
-  const stayPaused = keepTime && !!instance?.paused;
   destroyInstance();
   syncPlayButton();
   try {
+    if (doc?.video) {
+      const vs = await mountVideoStage(stageEl, doc.video.bytes, fitEl.value as Fit);
+      if (gen !== openGen) {
+        vs.instance.destroy();
+        return;
+      }
+      instance = vs.instance;
+      editor = vs.editor;
+      videoEl = vs.video;
+      editor.setTimeScale(Number(tlSpeedEl.value));
+      if (userPlaying) instance.resume();
+      await editor.seek(Math.min(resumeAt, vs.video.duration || 0));
+      resetTimelineRange();
+      renderTree();
+      renderInspector();
+      log(et("log.videoReady", { w: vs.video.videoWidth, h: vs.video.videoHeight, dur: (vs.video.duration || 0).toFixed(2) }));
+      return;
+    }
     const source =
       docDriven && current.assets && doc?.scene
         ? sourceFromDoc(current.source, current.assets, JSON.stringify(doc.scene), doc.project)
@@ -475,11 +541,12 @@ async function mountCurrent(keepTime = false) {
     }
     instance = inst;
     editor = editorOf(inst);
+    if (!userPlaying) inst.pause();
     if (editor) {
       editor.setTimeScale(Number(tlSpeedEl.value));
       await replayLiveEdits();
-      if (stayPaused) inst.pause();
-      if (resumeAt > 0) await editor.seek(resumeAt).catch(() => {});
+      // 首帧时文字层的贴图还没上传（第二帧才画出来）；停着不动时要在同一时刻补画一帧
+      if (resumeAt > 0 || !userPlaying) await editor.seek(resumeAt > 0 ? resumeAt : editor.time).catch(() => {});
     } else {
       log(et("log.noEditor"), "warn");
     }
@@ -495,10 +562,15 @@ async function mountCurrent(keepTime = false) {
     const err = e as Error & { instance?: SceneInstance };
     instance = err.instance ?? null;
     log(et("log.mountFailed", { msg: err.message }), "error");
+  } finally {
+    if (gen === openGen) {
+      syncPlayButton();
+      syncTimeline();
+      renderStatus();
+      mounting = false;
+      if (saveTimer) scheduleAutosave();
+    }
   }
-  syncPlayButton();
-  syncTimeline();
-  renderStatus();
 }
 
 // ---------- 外来脚本（W10 过渡：在线版默认不执行，逐文档放行） ----------
@@ -529,8 +601,18 @@ const referencedGroups = (d: EditorDoc | null) =>
     ...referencedSounds(d),
   ]);
 
+/** dev 宿主是否在（只用来决定外来脚本默认是否执行，不再用来打开壁纸库条目） */
+let hostUp = false;
+const hostProbe = (async () => {
+  try {
+    hostUp = !!(await fetchLibrary());
+  } catch {
+    hostUp = false;
+  }
+})();
+
 type OpenOptions = {
-  origin?: DraftOrigin | null;
+  origin?: { kind: ContentKind } | null;
   /** 新建工程没有原始来源可挂，一开始就从文档挂载 */
   docDriven?: boolean;
   /** 文档就位、首次挂载之前执行（新建时放背景图、恢复草稿时套用快照） */
@@ -549,8 +631,7 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
     log(msg === "no-wallpaper" ? et("log.dropEmpty") : et("log.openFailed", { msg }), "error");
     return;
   }
-  // 本地文件的脚本策略取决于宿主在不在（首次读库结束才知道）
-  if (!opts.origin) await libReady;
+  await hostProbe;
   if (gen !== openGen) return;
   current?.source.dispose?.();
   stopPreview();
@@ -565,11 +646,12 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   scriptDrafts.clear();
   docDriven = !!opts.docDriven;
   origin = opts.origin ?? null;
-  scriptsAllowed = scriptsAllowedByDefault(origin?.kind ?? "local", libState === "ready", SCRIPTS_OVERRIDE);
+  userPlaying = false;
+  scriptsAllowed = scriptsAllowedByDefault(origin?.kind ?? "local", hostUp, SCRIPTS_OVERRIDE);
   scriptsBannerEl.hidden = true;
-  lastSave = null;
   resetHistory();
   opts.after?.();
+  void detectPuppets();
   if (doc.type === "scene" && !doc.scene) log(et("log.noScene"), "warn");
   emptyEl.hidden = true;
   syncDocTitle();
@@ -578,6 +660,19 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   renderInspector();
   renderStatus();
   await mountCurrent();
+}
+
+/** 认出 puppet 层（要读 model json，异步）；扫完标进图层树。换了文档就作废 */
+async function detectPuppets() {
+  const d = doc;
+  const assets = current?.assets;
+  if (!d?.scene || !assets) return;
+  const found = await scanPuppets(d, (name) => assets.read(name));
+  if (d !== doc || !found.size) return;
+  d.puppets = found;
+  rebuildTree(d);
+  renderTree();
+  renderInspector();
 }
 
 fitEl.onchange = () => instance?.setFit(fitEl.value as Fit);
@@ -596,7 +691,8 @@ function syncPlayButton() {
 
 playEl.onclick = () => {
   if (!instance) return;
-  if (instance.paused) instance.resume();
+  userPlaying = instance.paused;
+  if (userPlaying) instance.resume();
   else instance.pause();
   syncPlayButton();
 };
@@ -623,6 +719,21 @@ function setTimelineMax(max: number) {
 function renderKeyMarks() {
   tlKeysEl.textContent = "";
   renderLanes();
+  if (doc?.video) {
+    for (const [t, which] of [
+      [trimIn, "in"],
+      [trimOut, "out"],
+    ] as const) {
+      if (t === null) continue;
+      const m = document.createElement("i");
+      m.className = "tl-key tl-trim";
+      m.dataset.trim = which;
+      m.title = `${et(which === "in" ? "vp.in" : "vp.out")} ${fmtTime(t)}`;
+      m.style.left = `${(Math.min(t, tlMax) / tlMax) * 100}%`;
+      tlKeysEl.appendChild(m);
+    }
+    return;
+  }
   const n = selectedNode();
   if (!n) return;
   const editable = !!editor && !!doc?.scene && !!current?.assets && !isLocked(n.id);
@@ -739,7 +850,8 @@ function startKeyDrag(e: PointerEvent, m: HTMLElement, n: LayerNode, from: numbe
 }
 
 function resetTimelineRange() {
-  setTimelineMax(TL_WINDOW);
+  const d = videoEl?.duration;
+  setTimelineMax(videoEl && d && Number.isFinite(d) ? Math.round(d * 100) / 100 : TL_WINDOW);
 }
 
 function syncTimeline() {
@@ -763,6 +875,7 @@ function tickTimeline() {
 }
 
 function pauseForStepping() {
+  userPlaying = false;
   if (instance && !instance.paused) {
     instance.pause();
     syncPlayButton();
@@ -830,52 +943,192 @@ exportEl.onclick = async () => {
   }
 };
 
-// ---------- 保存（W6-lite 松散工程 / W6-full WE 原生 scene.pkg → 壁纸库 / 文件夹 / zip） ----------
+// ---------- 录制为视频：逐帧 seek → 出图 → 编码（不丢帧，比实时慢） ----------
 
-type SaveTarget = "lib" | "dir" | "zip";
-const saveEl = $<HTMLButtonElement>("#tb-save");
-const saveMenuEl = $<HTMLElement>("#save-menu");
-const saveLibEl = $<HTMLButtonElement>("#save-lib");
-const saveDirEl = $<HTMLButtonElement>("#save-dir");
-const savePkgEl = $<HTMLInputElement>("#save-pkg");
-let saving = false;
-/** 本文档上次保存的目标：⌘S 直接重复；库条目 id 复用，再存即覆盖同一条 */
-let lastSave: { target: SaveTarget; itemId?: string; dir?: Awaited<ReturnType<typeof pickDirectory>> } | null = null;
+const recMenuEl = $<HTMLElement>("#rec-menu");
+const recDurEl = $<HTMLInputElement>("#rec-duration");
+const recFpsEl = $<HTMLSelectElement>("#rec-fps");
+const recResEl = $<HTMLSelectElement>("#rec-res");
+const recBarEl = $<HTMLProgressElement>("#rec-bar");
+const recStartEl = $<HTMLButtonElement>("#rec-start");
+let recording: AbortController | null = null;
 
-function syncSaveButton() {
-  saveEl.disabled = saving || !doc?.scene || !current?.assets;
+/** 默认时长：最长那条动画的一个周期（没有动画时 10 秒），封顶 60 秒 */
+function defaultRecordDuration(): number {
+  let longest = 0;
+  const walk = (nodes: LayerNode[]) => {
+    for (const n of nodes) {
+      const s = canAnimate(n) ? animSummary(n.obj) : null;
+      if (s) longest = Math.max(longest, s.length);
+      walk(n.children);
+    }
+  };
+  if (doc) walk(doc.roots);
+  return longest > 0 ? Math.min(60, Math.round(longest * 100) / 100) : 10;
 }
 
-function closeSaveMenu() {
-  saveMenuEl.hidden = true;
+function recordSize(): { w: number; h: number } {
+  const res = (doc?.scene && sceneResolution(doc.scene)) || { w: 1920, h: 1080 };
+  const long = Number(recResEl.value);
+  if (!long) return res;
+  const k = long / Math.max(res.w, res.h);
+  return { w: Math.round(res.w * k), h: Math.round(res.h * k) };
 }
 
-saveEl.onclick = (e) => {
+function closeRecMenu() {
+  if (recording) return;
+  recMenuEl.hidden = true;
+}
+
+$<HTMLButtonElement>("#export-video").onclick = (e) => {
   e.stopPropagation();
-  if (!saveMenuEl.hidden) {
-    closeSaveMenu();
+  closeExportMenu();
+  if (!doc?.scene || !editor) return;
+  recDurEl.value = String(defaultRecordDuration());
+  recBarEl.hidden = true;
+  recStartEl.disabled = false;
+  const r = packEl.getBoundingClientRect();
+  recMenuEl.style.left = `${r.left}px`;
+  recMenuEl.style.top = `${r.bottom + 2}px`;
+  recMenuEl.hidden = false;
+};
+document.addEventListener("click", (e) => {
+  if (!recMenuEl.hidden && !recMenuEl.contains(e.target as Node)) closeRecMenu();
+});
+$<HTMLButtonElement>("#rec-cancel").onclick = () => {
+  if (recording) recording.abort();
+  else closeRecMenu();
+};
+recStartEl.onclick = () => void recordScene();
+
+async function recordScene() {
+  if (!doc?.scene || !editor || recording) return;
+  const ed = editor;
+  const title = doc.title;
+  const duration = Math.min(600, Math.max(0.5, Number(recDurEl.value) || 10));
+  const fps = Number(recFpsEl.value) || 30;
+  const { w, h } = recordSize();
+  pauseForStepping();
+  const t0 = ed.time;
+  const ctl = new AbortController();
+  recording = ctl;
+  recStartEl.disabled = true;
+  recBarEl.hidden = false;
+  recBarEl.value = 0;
+  let lastPct = -1;
+  try {
+    const out = await recordVideo({
+      width: w,
+      height: h,
+      fps,
+      duration,
+      signal: ctl.signal,
+      frameAt: (t) => ed.captureFrame({ time: t, width: w, height: h, keepSize: true }),
+      onProgress: (p) => {
+        recBarEl.value = p;
+        const pct = Math.floor(p * 10) * 10;
+        if (pct === lastPct || pct >= 100) return;
+        lastPct = pct;
+        log(et("log.recording", { pct }));
+      },
+    });
+    if (out.ext === "webm") log(et("log.recordWebm"), "warn");
+    const url = URL.createObjectURL(out.blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title.replace(/[\\/:*?"<>|]+/g, "_")}.${out.ext}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    log(et("log.recorded", { frames: out.frames, mb: mb(out.blob.size), ext: out.ext }));
+  } catch (e) {
+    if (isCanceled(e) || ctl.signal.aborted) log(et("log.recordCanceled"), "warn");
+    else log(et("log.recordFailed", { msg: (e as Error).message }), "error");
+  } finally {
+    recording = null;
+    recMenuEl.hidden = true;
+    if (editor === ed) await seekLogged(ed.seek(t0));
+  }
+}
+
+// ---------- 项目文件夹：松散文件自动保存；导出才打 scene.pkg 或 zip ----------
+
+const packEl = $<HTMLButtonElement>("#tb-pack");
+const exportMenuEl = $<HTMLElement>("#export-menu");
+let projectDir: DirHandle | null = null;
+let saving = false;
+let saveAgain = false;
+let saveTimer = 0;
+const AUTOSAVE_MS = 400;
+/** 已写出内容的签名，没变的文件跳过 */
+const writtenSig = new Map<string, string>();
+/** 本次会话写出过的路径；不再引用时从项目文件夹删掉 */
+const ownedPaths = new Set<string>();
+
+function fileSig(data: Uint8Array): string {
+  let h = 2166136261;
+  for (let i = 0; i < data.length; i++) h = Math.imul(h ^ data[i], 16777619);
+  return `${data.length}:${h >>> 0}`;
+}
+
+function adoptProject(dir: DirHandle) {
+  projectDir = dir;
+  writtenSig.clear();
+  ownedPaths.clear();
+  saveAgain = false;
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+}
+
+/** 有东西可写：场景文档 + 资源表，或视频壁纸工程 */
+const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets);
+
+async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> {
+  if (doc?.video) return collectVideoProject(doc, preview);
+  if (doc?.scene && current?.assets) return collectProject(doc, current.assets, preview);
+  return null;
+}
+
+function syncExportButton() {
+  packEl.disabled = !canSave();
+  $<HTMLButtonElement>("#export-video").disabled = !doc?.scene || !editor;
+}
+
+function renderSaveStatus() {
+  if (!projectDir || !doc) {
+    stSaveEl.textContent = "";
+    return;
+  }
+  stSaveEl.textContent = saving ? et("st.saving") : dirty ? et("st.unsaved") : et("st.saved");
+  stSaveEl.title = projectDir.name;
+}
+
+function closeExportMenu() {
+  exportMenuEl.hidden = true;
+}
+
+packEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!exportMenuEl.hidden) {
+    closeExportMenu();
     return;
   }
   closeNewMenu();
-  saveLibEl.hidden = libState !== "ready";
-  saveDirEl.hidden = !canPickDirectory();
-  const r = saveEl.getBoundingClientRect();
-  saveMenuEl.style.left = `${r.left}px`;
-  saveMenuEl.style.top = `${r.bottom + 2}px`;
-  saveMenuEl.hidden = false;
+  const r = packEl.getBoundingClientRect();
+  exportMenuEl.style.left = `${r.left}px`;
+  exportMenuEl.style.top = `${r.bottom + 2}px`;
+  exportMenuEl.hidden = false;
 };
 document.addEventListener("click", (e) => {
-  if (!saveMenuEl.hidden && !saveMenuEl.contains(e.target as Node)) closeSaveMenu();
+  if (!exportMenuEl.hidden && !exportMenuEl.contains(e.target as Node)) closeExportMenu();
 });
-saveLibEl.onclick = () => void runSave("lib");
-saveDirEl.onclick = () => void runSave("dir");
-$<HTMLButtonElement>("#save-zip").onclick = () => void runSave("zip");
+$<HTMLButtonElement>("#export-pkg").onclick = () => void runExport("pkg");
+$<HTMLButtonElement>("#export-zip").onclick = () => void runExport("zip");
 
 async function capturePreview(): Promise<Blob | null> {
   if (!editor || !doc) return null;
   const res = sceneResolution(doc.scene);
   const w = 640;
-  const h = res ? Math.max(1, Math.round((w * res.h) / res.w)) : 360;
+  const h = doc.video ? undefined : res ? Math.max(1, Math.round((w * res.h) / res.w)) : 360;
   try {
     return await editor.capture({ width: w, height: h, type: "image/jpeg", quality: 0.85 });
   } catch (e) {
@@ -884,61 +1137,85 @@ async function capturePreview(): Promise<Blob | null> {
   }
 }
 
-async function runSave(target: SaveTarget) {
-  closeSaveMenu();
-  if (saving || !doc?.scene || !current?.assets) return;
-  const sameDoc = lastSave?.target === target;
-  let dir = sameDoc ? lastSave?.dir ?? null : null;
-  // 选目录必须紧跟用户手势（showDirectoryPicker 的要求），先选再干重活
-  if (target === "dir" && !dir) {
-    dir = await pickDirectory();
-    if (!dir) return;
+function scheduleAutosave() {
+  if (!projectDir || !canSave()) return;
+  clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    if (mounting) {
+      scheduleAutosave();
+      return;
+    }
+    void flushAutosave();
+  }, AUTOSAVE_MS);
+}
+
+/** 把当前文档写成项目文件夹里的松散文件。⌘S 与编辑防抖都走这里。 */
+async function flushAutosave() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  if (!projectDir || !canSave()) return;
+  if (saving) {
+    saveAgain = true;
+    return;
   }
+  const dir = projectDir;
+  const snap = doc;
   saving = true;
-  syncSaveButton();
+  renderSaveStatus();
   const t0 = performance.now();
   try {
-    log(et("log.saving"));
     const preview = await capturePreview();
-    let files = await collectProject(doc, current.assets, preview);
-    if (savePkgEl.checked) {
-      const { files: pkgFiles, packed } = packProject(files);
-      files = pkgFiles;
-      log(et("log.packedPkg", { n: packed.entries.length, tex: packed.converted.length, mb: (packed.pkg.length / 1e6).toFixed(1) }));
+    if (dir !== projectDir || doc !== snap) return;
+    const files = await collectCurrent(preview);
+    if (!files) return;
+    const changed = files.filter((f) => fileSig(f.data) !== writtenSig.get(f.path));
+    if (changed.length) await writeToDirectory(dir, changed);
+    for (const f of changed) writtenSig.set(f.path, fileSig(f.data));
+    const keep = new Set(files.map((f) => f.path));
+    for (const p of [...ownedPaths]) {
+      if (keep.has(p)) continue;
+      await removeProjectFile(dir, p);
+      ownedPaths.delete(p);
+      writtenSig.delete(p);
     }
-    const mb = (totalBytes(files) / 1e6).toFixed(1);
-    let progressStep = 0;
-    const progress = (done: number, total: number) => {
-      const step = Math.floor((done / total) * 4);
-      if (step > progressStep && done < total) {
-        progressStep = step;
-        log(et("log.saveProgress", { done, total }));
-      }
-    };
-    if (target === "zip") {
-      const size = downloadZip(files, slugName(doc.title));
-      log(et("log.savedZip", { n: files.length, mb: (size / 1e6).toFixed(1) }));
-      lastSave = { target };
-    } else if (target === "dir") {
-      await writeToDirectory(dir!, files, progress);
-      log(et("log.savedDir", { name: dir!.name, n: files.length, mb }));
-      lastSave = { target, dir };
-    } else {
-      const itemId = (sameDoc && lastSave?.itemId) || newLibraryItemId(doc.title);
-      await saveToLibrary(itemId, files, progress);
-      log(et("log.savedLib", { id: itemId, n: files.length, mb }));
-      lastSave = { target, itemId };
-      void loadLibrary(false);
+    for (const f of files) ownedPaths.add(f.path);
+    if (doc === snap) {
+      dirty = false;
+      syncDocTitle();
+      log(et("log.autosaved", { name: dir.name }));
+      log(et("log.saveTook", { s: ((performance.now() - t0) / 1000).toFixed(1) }));
     }
-    dirty = false;
-    discardDraft();
-    syncDocTitle();
-    log(et("log.saveTook", { s: ((performance.now() - t0) / 1000).toFixed(1) }));
   } catch (e) {
     log(et("log.saveFailed", { msg: (e as Error).message }), "error");
   } finally {
     saving = false;
-    syncSaveButton();
+    renderSaveStatus();
+    if (saveAgain) {
+      saveAgain = false;
+      scheduleAutosave();
+    }
+  }
+}
+
+async function runExport(kind: "pkg" | "zip") {
+  closeExportMenu();
+  if (!doc || !canSave()) return;
+  packEl.disabled = true;
+  try {
+    const preview = await capturePreview();
+    let files = await collectCurrent(preview);
+    if (!files) return;
+    if (kind === "pkg" && doc.scene) {
+      const { files: pkgFiles, packed } = packProject(files);
+      files = pkgFiles;
+      log(et("log.packedPkg", { n: packed.entries.length, tex: packed.converted.length, mb: (packed.pkg.length / 1e6).toFixed(1) }));
+    }
+    const size = downloadZip(files, `${slugName(doc.title)}${kind === "pkg" ? "-pkg" : ""}`);
+    log(et("log.savedZip", { n: files.length, mb: (size / 1e6).toFixed(1) }));
+  } catch (e) {
+    log(et("log.saveFailed", { msg: (e as Error).message }), "error");
+  } finally {
+    syncExportButton();
   }
 }
 
@@ -1047,10 +1324,11 @@ function applyPatch(id: number | string, patch: Patch): Promise<void> {
 }
 
 function markDirty() {
-  scheduleDraft();
+  scheduleAutosave();
   if (dirty) return;
   dirty = true;
   syncDocTitle();
+  renderSaveStatus();
 }
 
 /** 几层一起改：带关键帧的层各自落关键帧，其余合成一步撤销 */
@@ -1091,7 +1369,7 @@ function restoreObjects(json: string, sel: number | string | null, props?: strin
   // 文档已含全部改动，旧的按层热改账作废（被删的层也不该再重放）
   liveEdits.clear();
   docDriven = true;
-  scheduleDraft();
+  markDirty();
   selectedId = sel !== null && findNode(doc.roots, sel) ? sel : null;
   extraSel.clear();
   renderTree();
@@ -1103,8 +1381,14 @@ function restoreObjects(json: string, sel: number | string | null, props?: strin
 /**
  * 一次结构编辑：快照 → 改文档 → 入栈 → 重挂。mutate 返回新的选中 id（undefined = 没改成）。
  * hot：只动了属性表、对象数组没变时改走热更（引擎已与文档一致，不必重挂）；撤销重做仍重挂。
+ * hotAlways：对象变了也走 hot（调用方保证 hot 能把引擎带到与文档一致，如动画层整表替换）。
  */
-function structEdit(label: string, mutate: (d: EditorDoc) => number | string | null | undefined, hot?: () => void) {
+function structEdit(
+  label: string,
+  mutate: (d: EditorDoc) => number | string | null | undefined,
+  hot?: () => void,
+  hotAlways = false,
+) {
   if (!doc?.scene || !current?.assets) {
     log(et("log.structUnavailable"), "warn");
     return;
@@ -1115,7 +1399,7 @@ function structEdit(label: string, mutate: (d: EditorDoc) => number | string | n
   syncHistoryButtons();
   markDirty();
   log(label);
-  if (hot && editor && cmd.after === cmd.before) {
+  if (hot && editor && (hotAlways || cmd.after === cmd.before)) {
     docDriven = true;
     hot();
     renderInspector();
@@ -1179,6 +1463,11 @@ function undoRedo(dir: "undo" | "redo") {
   const cmd = edits.take(dir);
   if (!cmd) return;
   syncHistoryButtons();
+  if (isVideoCmd(cmd)) {
+    log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    setProjectVideo(dir === "undo" ? cmd.before : cmd.after);
+    return;
+  }
   if (isBatch(cmd)) {
     for (const c of cmd.cmds) void applyPatch(c.id, dir === "undo" ? c.before : c.after);
     renderTree();
@@ -1216,9 +1505,7 @@ window.addEventListener("keydown", (e) => {
     undoRedo("redo");
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
     e.preventDefault();
-    if (saveEl.disabled) return;
-    if (lastSave) void runSave(lastSave.target);
-    else saveEl.click();
+    void flushAutosave();
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d") {
     e.preventDefault();
     duplicateSelected();
@@ -1269,19 +1556,23 @@ function drawOverlay() {
   const lockedSel = isLocked(selectedId);
   gizmo = lockedSel ? null : gizmoOf(outline.anchor, outline.corners);
   overlayCtx.lineWidth = 1.5;
-  if (outline.corners) {
-    overlayCtx.setLineDash(lockedSel ? [4, 3] : []);
+  const strokePoly = (pts: Array<[number, number]>, dash: number[], width: number) => {
+    overlayCtx.setLineDash(dash);
     overlayCtx.beginPath();
-    outline.corners.forEach(([x, y], i) => (i ? overlayCtx.lineTo(x, y) : overlayCtx.moveTo(x, y)));
+    pts.forEach(([x, y], i) => (i ? overlayCtx.lineTo(x, y) : overlayCtx.moveTo(x, y)));
     overlayCtx.closePath();
     overlayCtx.strokeStyle = "rgba(0,0,0,0.6)";
-    overlayCtx.lineWidth = 3;
+    overlayCtx.lineWidth = width + 1.5;
     overlayCtx.stroke();
     overlayCtx.strokeStyle = accent;
-    overlayCtx.lineWidth = 1.5;
+    overlayCtx.lineWidth = width;
     overlayCtx.stroke();
     overlayCtx.setLineDash([]);
-  }
+    overlayCtx.lineWidth = 1.5;
+  };
+  // 模型层：网格凸包是主轮廓（拾取区就是网格），图层矩形退成细虚线只给手柄定位
+  if (outline.hull) strokePoly(outline.hull, lockedSel ? [4, 3] : [], 1.5);
+  if (outline.corners) strokePoly(outline.corners, outline.hull ? [3, 3] : lockedSel ? [4, 3] : [], outline.hull ? 1 : 1.5);
   if (gizmo?.rotate) {
     const [c0, c1] = gizmo.corners;
     const [rx, ry] = gizmo.rotate;
@@ -1327,6 +1618,42 @@ function drawOverlay() {
   overlayCtx.moveTo(ax, ay - 6);
   overlayCtx.lineTo(ax, ay + 6);
   overlayCtx.stroke();
+  drawAttachMarkers();
+}
+
+/** 附着点十字标记：选中模型层时画它自己的；选中普通层时画「挂到模型」里选的那个模型的（选中的附着点高亮） */
+function drawAttachMarkers() {
+  if (!editor || !doc || selectedId === null) return;
+  const node = findNode(doc.roots, selectedId);
+  const pick = attachPick && attachPick.layer === selectedId ? attachPick : null;
+  const modelId = node?.modelForm && !pick ? node.id : pick?.model;
+  if (modelId === undefined || modelId === null) return;
+  const pts = editor.getAttachmentPoints(Number(modelId));
+  if (!pts?.length) return;
+  overlayCtx.font = "11px system-ui, sans-serif";
+  overlayCtx.lineWidth = 1.5;
+  for (const p of pts) {
+    if (!p.screen) continue;
+    const [x, y] = p.screen;
+    const on = pick?.name === p.name;
+    overlayCtx.strokeStyle = "rgba(0,0,0,0.6)";
+    overlayCtx.lineWidth = 3;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(x - 5, y - 5);
+    overlayCtx.lineTo(x + 5, y + 5);
+    overlayCtx.moveTo(x + 5, y - 5);
+    overlayCtx.lineTo(x - 5, y + 5);
+    overlayCtx.stroke();
+    overlayCtx.strokeStyle = on ? SNAP_COLOR : "#ffd166";
+    overlayCtx.lineWidth = on ? 2 : 1.5;
+    overlayCtx.stroke();
+    if (on || node?.modelForm) {
+      overlayCtx.fillStyle = "rgba(0,0,0,0.6)";
+      overlayCtx.fillText(p.name, x + 8, y - 5);
+      overlayCtx.fillStyle = on ? SNAP_COLOR : "#ffd166";
+      overlayCtx.fillText(p.name, x + 7, y - 6);
+    }
+  }
 }
 
 function drawExtraOutlines() {
@@ -1338,7 +1665,8 @@ function drawExtraOutlines() {
   overlayCtx.setTransform(dpr, 0, 0, dpr, (cr.left - sr.left) * dpr, (cr.top - sr.top) * dpr);
   const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0078d4";
   for (const id of extraSel) {
-    const c = editor.getLayerOutline(Number(id))?.corners;
+    const o = editor.getLayerOutline(Number(id));
+    const c = o?.hull ?? o?.corners;
     if (!c) continue;
     overlayCtx.beginPath();
     c.forEach(([x, y], i) => (i ? overlayCtx.lineTo(x, y) : overlayCtx.moveTo(x, y)));
@@ -1518,7 +1846,8 @@ stageEl.addEventListener("pointercancel", endDrag);
 // ---------- 状态栏 ----------
 
 function renderStatus() {
-  syncSaveButton();
+  syncExportButton();
+  renderSaveStatus();
   stDocEl.textContent = doc ? doc.title : et("st.none");
   stDocEl.title = stDocEl.textContent;
   stFormEl.textContent = doc ? (doc.form ? et(`form.${doc.form}`) : doc.type) : "";
@@ -1543,125 +1872,66 @@ setInterval(() => {
   syncScriptsBanner();
 }, 500);
 
-// ---------- 壁纸库 ----------
+// ---------- 打开项目文件夹 / 导入 .pkg ----------
 
-let libItems: LibraryItem[] = [];
-let libState: "loading" | "ready" | "static" = "loading";
-let activeItemId: string | null = null;
-
-function renderLibrary() {
-  libListEl.textContent = "";
-  if (libState !== "ready") {
-    const note = document.createElement("p");
-    note.className = "ed-note";
-    note.textContent = et(libState === "loading" ? "lib.loading" : "static.notice");
-    libListEl.appendChild(note);
-    libCountEl.textContent = "";
-    return;
+async function requireProjectDir(): Promise<DirHandle | null> {
+  if (!canPickDirectory()) {
+    log(et("log.needDir"), "error");
+    return null;
   }
-  const kw = filterEl.value.trim().toLowerCase();
-  let shown = 0;
-  for (const it of libItems) {
-    if (kw && !`${it.title} ${it.itemId}`.toLowerCase().includes(kw)) continue;
-    shown++;
-    const li = document.createElement("li");
-    if (it.itemId === activeItemId) li.classList.add("active");
-    if (it.preview) {
-      const img = document.createElement("img");
-      img.loading = "lazy";
-      img.src = `${MEDIA_BASE}/${it.itemId}/${it.preview}`;
-      li.appendChild(img);
-    }
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const title = document.createElement("span");
-    title.className = "title";
-    title.textContent = it.title;
-    const sub = document.createElement("span");
-    sub.className = "sub";
-    sub.textContent = `${libraryKind(it)} · ${it.itemId}`;
-    meta.append(title, sub);
-    li.appendChild(meta);
-    li.onclick = () => openLibrary(it);
-    libListEl.appendChild(li);
-  }
-  if (!shown) {
-    const note = document.createElement("p");
-    note.className = "ed-note";
-    note.textContent = et("lib.empty");
-    libListEl.appendChild(note);
-  }
-  libCountEl.textContent = String(shown);
-}
-
-function openLibrary(it: LibraryItem) {
-  activeItemId = it.itemId;
-  renderLibrary();
-  const url = new URL(location.href);
-  url.searchParams.set("item", it.itemId);
-  history.replaceState(null, "", url);
-  void openWith(it.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), {
-    origin: { kind: "library", itemId: it.itemId },
-  });
-}
-
-filterEl.oninput = renderLibrary;
-
-let libLoaded: () => void = () => {};
-/** 首次读库结束（成功或失败）。恢复库来源的草稿要等它 */
-const libReady = new Promise<void>((ok) => (libLoaded = ok));
-
-/** autoOpen=false：保存后刷新列表用，不要按地址栏 ?item 再打开一遍（会丢掉当前编辑） */
-async function loadLibrary(autoOpen = true) {
+  let dir: DirHandle | null;
   try {
-    const lib = await fetchLibrary();
-    if (!lib) {
-      libState = "static";
-      renderLibrary();
-      return;
-    }
-    libItems = lib.items;
-    libState = "ready";
-    renderLibrary();
-    if (!autoOpen) return;
-    const want = new URL(location.href).searchParams.get("item");
-    const hit = want ? libItems.find((i) => i.itemId === want) : undefined;
-    if (hit) openLibrary(hit);
+    dir = await pickDirectory();
   } catch (e) {
-    libState = "static";
-    renderLibrary();
-    log(et("log.libFailed", { msg: (e as Error).message }), "error");
-  } finally {
-    libLoaded();
+    log(et("log.pickFailed", { msg: `${(e as Error).name}: ${(e as Error).message}` }), "error");
+    return null;
   }
-}
-
-// ---------- 本地打开 / 拖放 ----------
-
-function leaveLibraryItem() {
-  activeItemId = null;
-  renderLibrary();
-  const url = new URL(location.href);
-  url.searchParams.delete("item");
-  history.replaceState(null, "", url);
-}
-
-function openLocal(files: ReturnType<typeof filesFromInput>) {
-  if (!files.length) return;
-  leaveLibraryItem();
-  const name = files[0].path.split("/")[0] || files[0].file.name;
-  void openWith(name, () => openLocalFiles(files));
+  if (!dir) {
+    log(et("log.pickCancelled"), "warn");
+    return null;
+  }
+  try {
+    await probeWritable(dir);
+  } catch (e) {
+    log(et("log.dirNotWritable", { name: dir.name, msg: `${(e as Error).name}: ${(e as Error).message}` }), "error");
+    return null;
+  }
+  log(et("log.projectDir", { name: dir.name }));
+  return dir;
 }
 
 $<HTMLButtonElement>("#tb-open-pkg").onclick = () => inPkgEl.click();
-$<HTMLButtonElement>("#tb-open-dir").onclick = () => inDirEl.click();
+$<HTMLButtonElement>("#tb-open-dir").onclick = () =>
+  void (async () => {
+    const dir = await requireProjectDir();
+    if (!dir) return;
+    try {
+      const files = await filesFromDirectory(dir);
+      // .DS_Store / Thumbs.db 这类系统文件不算内容
+      if (!files.some((f) => !/(^|\/)(\.[^/]*|Thumbs\.db|desktop\.ini)$/i.test(f.path))) {
+        log(et("log.emptyDirNew", { name: dir.name }));
+        await createNew([], dir);
+        return;
+      }
+      adoptProject(dir);
+      await openWith(dir.name, () => openLocalFiles(files), { origin: { kind: "local" } });
+    } catch (e) {
+      log(et("log.openFailed", { msg: (e as Error).message }), "error");
+    }
+  })();
+
 inPkgEl.onchange = () => {
-  openLocal(filesFromInput(inPkgEl.files));
+  const files = filesFromInput(inPkgEl.files);
   inPkgEl.value = "";
-};
-inDirEl.onchange = () => {
-  openLocal(filesFromInput(inDirEl.files));
-  inDirEl.value = "";
+  if (!files.length) return;
+  void (async () => {
+    const dir = await requireProjectDir();
+    if (!dir) return;
+    const name = files[0].path.split("/")[0] || files[0].file.name;
+    adoptProject(dir);
+    await openWith(name, () => openLocalFiles(files), { origin: { kind: "local" } });
+    await flushAutosave();
+  })();
 };
 
 let dragDepth = 0;
@@ -1685,12 +1955,40 @@ window.addEventListener("drop", (e) => {
   e.preventDefault();
   dragDepth = 0;
   dropEl.hidden = true;
-  void collectDropped(e.dataTransfer).then((files) => {
-    if (!files.length) log(et("log.dropEmpty"), "warn");
-    else if (files.every((f) => isImageFile(f.file))) void dropImages(files.map((f) => f.file));
-    else if (files.every((f) => isAudioFile(f.file))) void addSoundFiles(files.map((f) => f.file));
-    else openLocal(files);
+  const dt = e.dataTransfer;
+  const needsFolder = !doc?.scene;
+  const dirPick = needsFolder ? requireProjectDir() : Promise.resolve(null);
+  void collectDropped(dt).then(async (files) => {
+    const dir = await dirPick;
+    if (!files.length) {
+      log(et("log.dropEmpty"), "warn");
+      return;
+    }
+    if (files.every((f) => isImageFile(f.file))) {
+      void dropImages(files.map((f) => f.file), dir);
+      return;
+    }
+    if (files.every((f) => isAudioFile(f.file))) {
+      void addSoundFiles(files.map((f) => f.file));
+      return;
+    }
+    if (files.every((f) => isVideoFile(f.file))) {
+      void dropVideos(files.map((f) => f.file), dir);
+      return;
+    }
+    if (!dir) {
+      log(et("log.needDir"), "warn");
+      return;
+    }
+    const name = files[0].path.split("/")[0] || files[0].file.name;
+    adoptProject(dir);
+    await openWith(name, () => openLocalFiles(files), { origin: { kind: "local" } });
+    await flushAutosave();
   });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") void flushAutosave();
 });
 
 // ---------- 新建（模板）/ 图片成层 ----------
@@ -1713,7 +2011,7 @@ newEl.onclick = (e) => {
     closeNewMenu();
     return;
   }
-  closeSaveMenu();
+  closeExportMenu();
   const r = newEl.getBoundingClientRect();
   newMenuEl.style.left = `${r.left}px`;
   newMenuEl.style.top = `${r.bottom + 2}px`;
@@ -1728,7 +2026,13 @@ function selectedResolution() {
   return RESOLUTIONS.find((r) => r.w === w && r.h === h) ?? RESOLUTIONS[0];
 }
 
-$<HTMLButtonElement>("#new-blank").onclick = () => void createNew([]);
+$<HTMLButtonElement>("#new-blank").onclick = () =>
+  void (async () => {
+    closeNewMenu();
+    const dir = await requireProjectDir();
+    if (!dir) return;
+    await createNew([], dir);
+  })();
 $<HTMLButtonElement>("#new-image").onclick = () => {
   imagePickFor = "template";
   inImageEl.click();
@@ -1737,8 +2041,15 @@ inImageEl.onchange = () => {
   const files = Array.from(inImageEl.files ?? []);
   inImageEl.value = "";
   if (!files.length) return;
-  if (imagePickFor === "template") void createNew(files);
-  else void addImageFiles(files);
+  if (imagePickFor !== "template") {
+    void addImageFiles(files);
+    return;
+  }
+  void (async () => {
+    const dir = await requireProjectDir();
+    if (!dir) return;
+    await createNew(files, dir);
+  })();
 };
 
 const EMPTY_ASSETS: SceneAssets = { entry: "scene.json", read: async () => null, list: () => [] };
@@ -1787,24 +2098,35 @@ function placeImages(d: EditorDoc, imgs: ImageInput[], firstCover: boolean): num
 }
 
 /** 新建：所选分辨率 + 背景色；images 非空时第一张铺满做背景、其余作为普通图层 */
-async function createNew(images: File[]) {
+async function createNew(
+  images: File[],
+  dir: DirHandle,
+  videos: File[] = [],
+  title0?: string,
+  res0?: { w: number; h: number },
+) {
   closeNewMenu();
   const imgs = images.length ? await readImages(images) : [];
   if (images.length && !imgs.length) return;
-  const res = selectedResolution();
-  const title = et("new.untitled");
-  leaveLibraryItem();
+  const vids = videos.length ? await readVideos(videos) : [];
+  if (videos.length && !vids.length) return;
+  const res = res0 ?? selectedResolution();
+  const title = title0 || et("new.untitled");
+  adoptProject(dir);
   await openWith(title, async () => newOpened(title, newProject(title), blankScene(res.w, res.h, hexToRgb(newColorEl.value))), {
     origin: { kind: "new" },
     docDriven: true,
     after: () => {
       log(et("log.newDoc", { w: res.w, h: res.h }));
-      if (!imgs.length || !doc) return;
-      selectedId = placeImages(doc, imgs, true) ?? null;
+      if ((!imgs.length && !vids.length) || !doc) return;
+      const lastVideo = vids.length ? placeVideos(doc, vids, true) : undefined;
+      const lastImage = imgs.length ? placeImages(doc, imgs, !vids.length) : undefined;
+      selectedId = lastImage ?? lastVideo ?? null;
       extraSel.clear();
       markDirty();
     },
   });
+  scheduleAutosave();
 }
 
 async function addImageFiles(files: File[]) {
@@ -1818,111 +2140,291 @@ async function addImageFiles(files: File[]) {
   structEdit(et("log.imagesAdded", { names: imgs.map((i) => i.name).join(", ") }), (d) => placeImages(d, imgs, false));
 }
 
-/** 拖进来的全是图片：有打开的场景就加层，否则以它们新建 */
-function dropImages(files: File[]) {
+/** 拖进来的全是图片：有打开的场景就加层，否则以它们新建（文件夹已在 drop 里选好） */
+function dropImages(files: File[], dir: DirHandle | null) {
   if (doc?.scene && overlay && doc.type === "scene") return addImageFiles(files);
-  return createNew(files);
+  if (!dir) {
+    log(et("log.needDir"), "warn");
+    return;
+  }
+  return createNew(files, dir);
 }
 
-// ---------- 草稿（IndexedDB，单槽位） ----------
+// ---------- 视频成层 ----------
 
-const DRAFT_DELAY = 800;
-const drafts = idbDraftStore();
-const draftEl = $<HTMLElement>("#ed-draft");
-const draftTextEl = $<HTMLElement>("#ed-draft-text");
-let draftTimer = 0;
-/** IDB 操作串行：保存成功后的清除不能被更早排队的写入盖回去 */
-let draftQueue: Promise<void> = Promise.resolve();
-let pendingDraft: Draft | null = null;
+const inVideoEl = $<HTMLInputElement>("#in-video");
+/** 视频选择框的用途：加层 / 新建场景的背景 / 新建视频壁纸工程 / 替换视频工程的视频 */
+let videoPickFor: "layer" | "template" | "wallpaper" | "replace" = "layer";
+/** 视频层元数据缓存（按 slug）：检视器显示时长 / 尺寸，重开工程时懒探测补齐 */
+const videoMeta = new Map<string, { width: number; height: number; duration: number; size: number }>();
+let videoBusy: AbortController | null = null;
 
-function queueDraftOp(op: () => Promise<void>) {
-  draftQueue = draftQueue.then(op).catch((e) => log(et("log.draftFailed", { msg: (e as Error).message }), "warn"));
-}
+const mb = (n: number) => (n / 1048576).toFixed(1);
+const videoSlugOf = (model: unknown) =>
+  isEditorVideoModel(model) ? String(model).replace(/^models\/editor\/|\.json$/g, "") : null;
+const isVideoNode = (n: LayerNode) => n.kind === "image" && isEditorVideoModel(n.obj.image);
 
-function scheduleDraft() {
-  if (!origin || !doc?.scene) return;
-  clearTimeout(draftTimer);
-  draftTimer = window.setTimeout(writeDraft, DRAFT_DELAY);
-}
-
-function writeDraft() {
-  clearTimeout(draftTimer);
-  draftTimer = 0;
-  if (!origin || !doc?.scene || !dirty) return;
-  const d = makeDraft(doc, origin, current?.assets?.entry ?? "scene.json", overlay?.added() ?? []);
-  if (!d) return;
-  // 新草稿顶掉了启动时发现的那份，横幅失去意义
-  hideDraftBanner();
-  queueDraftOp(() => drafts.save(d));
-}
-
-function discardDraft() {
-  clearTimeout(draftTimer);
-  draftTimer = 0;
-  hideDraftBanner();
-  queueDraftOp(() => drafts.clear());
-}
-
-function hideDraftBanner() {
-  pendingDraft = null;
-  draftEl.hidden = true;
-}
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden" && draftTimer) writeDraft();
-});
-
-async function checkDraft() {
-  let d: Draft | null = null;
+/** 逐个归一成 mp4 / H.264（已是则原字节），转码时把进度打到控制台 */
+async function readVideos(
+  files: File[],
+  keepAudio = false,
+  trim?: { start: number; end: number },
+): Promise<VideoInput[]> {
+  const out: VideoInput[] = [];
+  videoBusy?.abort();
+  const ctl = new AbortController();
+  videoBusy = ctl;
   try {
-    d = await drafts.load();
-  } catch (e) {
-    log(et("log.draftFailed", { msg: (e as Error).message }), "warn");
+    for (const f of files) {
+      if (ctl.signal.aborted) break;
+      let lastPct = -1;
+      try {
+        const v = await normalizeVideo(f, f.name, {
+          keepAudio,
+          trim,
+          signal: ctl.signal,
+          onProgress: (p) => {
+            const pct = Math.floor(p * 10) * 10;
+            if (pct === lastPct || pct >= 100) return;
+            lastPct = pct;
+            log(et("log.videoConverting", { name: f.name, pct }));
+          },
+        });
+        if (v.converted) log(et("log.videoConverted", { name: f.name, mb: mb(v.bytes.length) }));
+        out.push(v);
+      } catch (e) {
+        if (isCanceled(e)) log(et("log.videoCanceled", { name: f.name }), "warn");
+        else log(et("log.videoFailed", { name: f.name, msg: (e as Error).message }), "warn");
+      }
+    }
+  } finally {
+    if (videoBusy === ctl) videoBusy = null;
   }
-  if (!d) return;
-  pendingDraft = d;
-  draftTextEl.textContent = et("draft.found", { title: d.title, time: new Date(d.savedAt).toLocaleString() });
-  draftEl.hidden = false;
+  return out;
 }
 
-async function restoreDraft(d: Draft) {
-  hideDraftBanner();
-  const apply = () => {
-    if (!doc) return;
-    applyDraft(doc, d);
-    for (const f of d.files) overlay?.put(f.name, f.data, f.group);
-    docDriven = true;
-    dirty = true;
-    log(et("log.draftRestored", { title: d.title }));
-  };
-  if (d.origin.kind === "new") {
-    leaveLibraryItem();
-    await openWith(d.title, async () => newOpened(d.title, d.project ?? newProject(d.title), d.scene), {
-      origin: { kind: "new" },
-      docDriven: true,
-      after: apply,
-    });
-    return;
-  }
-  await libReady;
-  const itemId = d.origin.itemId;
-  const it = libItems.find((i) => i.itemId === itemId);
-  if (!it) {
-    log(et("log.draftMissing", { id: itemId }), "error");
-    return;
-  }
-  activeItemId = it.itemId;
-  renderLibrary();
-  const url = new URL(location.href);
-  url.searchParams.set("item", it.itemId);
-  history.replaceState(null, "", url);
-  await openWith(d.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), { origin: d.origin, after: apply });
+/** 视频写进资源表并追加图层（与图片层同一形态，只是贴图源是 mp4）；返回最后一个新层 id */
+function placeVideos(d: EditorDoc, vids: VideoInput[], firstCover: boolean): number | undefined {
+  if (!overlay) return undefined;
+  let last: number | undefined;
+  vids.forEach((v, i) => {
+    const refs = referencedModels(d);
+    const taken = (s: string) => overlay!.has(modelPathOf(VIDEO_SLUG_PREFIX + s)) || refs.has(modelPathOf(VIDEO_SLUG_PREFIX + s));
+    const slug = VIDEO_SLUG_PREFIX + imageSlug(v.name, taken);
+    for (const f of videoLayerFiles(slug, v)) overlay!.put(f.name, f.data, modelPathOf(slug));
+    videoMeta.set(slug, { width: v.width, height: v.height, duration: v.duration, size: v.bytes.length });
+    last = addImageLayer(d, slug, v, firstCover && i === 0 ? "cover" : "fit") ?? last;
+  });
+  return last;
 }
 
-$<HTMLButtonElement>("#draft-restore").onclick = () => {
-  if (pendingDraft) void restoreDraft(pendingDraft);
+async function addVideoFiles(files: File[]) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const target = doc;
+  const vids = await readVideos(files);
+  if (!vids.length || doc !== target) return;
+  structEdit(et("log.videosAdded", { names: vids.map((v) => v.name).join(", ") }), (d) => placeVideos(d, vids, false));
+}
+
+/** 拖进来的全是视频：有场景就加层；没有时第一个视频当背景新建场景 */
+function dropVideos(files: File[], dir: DirHandle | null) {
+  if (doc?.scene && overlay && doc.type === "scene") return addVideoFiles(files);
+  if (!dir) {
+    log(et("log.needDir"), "warn");
+    return;
+  }
+  return createNew([], dir, files);
+}
+
+$<HTMLButtonElement>("#new-video").onclick = () => {
+  videoPickFor = "template";
+  inVideoEl.multiple = false;
+  inVideoEl.click();
 };
-$<HTMLButtonElement>("#draft-discard").onclick = () => discardDraft();
+$<HTMLButtonElement>("#new-video-wp").onclick = () => {
+  videoPickFor = "wallpaper";
+  inVideoEl.multiple = false;
+  inVideoEl.click();
+};
+inVideoEl.onchange = () => {
+  const files = Array.from(inVideoEl.files ?? []);
+  inVideoEl.value = "";
+  inVideoEl.multiple = true;
+  if (!files.length) return;
+  const purpose = videoPickFor;
+  videoPickFor = "layer";
+  if (purpose === "layer") {
+    void addVideoFiles(files);
+    return;
+  }
+  if (purpose === "replace") {
+    void replaceProjectVideo(files[0]);
+    return;
+  }
+  closeNewMenu();
+  void (async () => {
+    const dir = await requireProjectDir();
+    if (!dir) return;
+    if (purpose === "wallpaper") await createVideoProject(files[0], dir);
+    else await createNew([], dir, files.slice(0, 1));
+  })();
+};
+
+// ---------- 视频壁纸工程（project.type = video） ----------
+
+const videoPathOf = (fileName: string) => `${imageSlug(fileName, () => false).replace(/^image$/, "video")}.mp4`;
+
+function videoOpened(title: string, path: string, bytes: Uint8Array): Opened {
+  const d = makeDoc(title, videoProjectJson(title, path), null, null);
+  d.video = { path, bytes };
+  return { doc: d, source: mediaSource(new File([bytes as BlobPart], path, { type: "video/mp4" })) };
+}
+
+/** 新建视频壁纸工程：视频归一成 mp4 / H.264（保留音轨）后作为工程本体 */
+async function createVideoProject(file: File, dir: DirHandle) {
+  const [v] = await readVideos([file], true);
+  if (!v) return;
+  const title = layerNameOf(file.name);
+  const path = videoPathOf(file.name);
+  adoptProject(dir);
+  await openWith(title, async () => videoOpened(title, path, v.bytes), { origin: { kind: "new" } });
+  log(et("log.videoProject", { name: title, w: v.width, h: v.height, dur: v.duration.toFixed(2) }));
+  markDirty();
+}
+
+/** 换视频本体（裁剪 / 替换 / 撤销重做共用）：清掉入出点、整段重挂预览 */
+function setProjectVideo(clip: VideoClip) {
+  if (!doc?.video) return;
+  doc.video = { path: clip.path, bytes: clip.bytes };
+  if (doc.project) doc.project.file = clip.path;
+  trimIn = trimOut = null;
+  markDirty();
+  void mountCurrent();
+}
+
+function videoEdit(label: string, after: VideoClip) {
+  if (!doc?.video) return;
+  edits.push({ kind: "video", label, before: { ...doc.video }, after });
+  syncHistoryButtons();
+  log(label);
+  setProjectVideo(after);
+}
+
+async function applyTrim() {
+  if (!doc?.video || !videoEl) return;
+  const target = doc;
+  const dur = videoEl.duration || 0;
+  const start = trimIn ?? 0;
+  const end = trimOut ?? dur;
+  if (!(end - start > 0.05)) {
+    log(et("log.trimInvalid"), "warn");
+    return;
+  }
+  const src = new File([doc.video.bytes as BlobPart], doc.video.path, { type: "video/mp4" });
+  const [v] = await readVideos([src], true, { start, end });
+  if (!v || doc !== target || !doc.video) return;
+  const path = doc.video.path.replace(/\.[^./]+$/, "") + ".mp4";
+  videoEdit(et("log.trimmed", { start: start.toFixed(2), end: end.toFixed(2), dur: v.duration.toFixed(2) }), { path, bytes: v.bytes });
+}
+
+async function replaceProjectVideo(file: File) {
+  if (!doc?.video) return;
+  const target = doc;
+  const [v] = await readVideos([file], true);
+  if (!v || doc !== target) return;
+  videoEdit(et("log.videoReplaced", { name: file.name }), { path: videoPathOf(file.name), bytes: v.bytes });
+}
+
+/** 视频壁纸 → 场景：另选文件夹新建场景，视频作为铺满的底层，分辨率取视频本身（长边不超过 4K） */
+async function videoToScene() {
+  if (!doc?.video || !videoEl) return;
+  const title = doc.title;
+  const file = new File([doc.video.bytes as BlobPart], doc.video.path, { type: "video/mp4" });
+  const k = Math.min(1, 3840 / Math.max(videoEl.videoWidth || 1920, videoEl.videoHeight || 1080));
+  const res = { w: Math.round((videoEl.videoWidth || 1920) * k), h: Math.round((videoEl.videoHeight || 1080) * k) };
+  const dir = await requireProjectDir();
+  if (!dir) return;
+  await createNew([], dir, [file], title, res);
+  log(et("log.toScene", { name: title }));
+}
+
+function videoProjectGroup(): HTMLElement {
+  const v = videoEl;
+  const g = kvGroup(et("vp.title"), [
+    ["f.videoFile", doc?.video?.path ?? "—"],
+    ["f.resolution", v ? `${v.videoWidth} × ${v.videoHeight}` : "…"],
+    ["f.duration", v ? `${(v.duration || 0).toFixed(2)}s` : "…"],
+    ["f.bytes", doc?.video ? `${mb(doc.video.bytes.length)} MB` : "—"],
+    ["vp.in", trimIn === null ? "—" : `${trimIn.toFixed(2)}s`],
+    ["vp.out", trimOut === null ? "—" : `${trimOut.toFixed(2)}s`],
+  ]);
+  g.classList.add("ed-video-project");
+  const bar = document.createElement("div");
+  bar.className = "ed-fx-param ed-vp-actions";
+  const btn = (key: string, act: string, onclick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ed-btn";
+    b.dataset.vp = act;
+    b.textContent = et(key);
+    b.disabled = disabled || !editor;
+    b.onclick = onclick;
+    bar.appendChild(b);
+  };
+  btn("vp.setIn", "in", () => {
+    trimIn = editor?.time ?? 0;
+    renderKeyMarks();
+    renderInspector();
+  });
+  btn("vp.setOut", "out", () => {
+    trimOut = editor?.time ?? 0;
+    renderKeyMarks();
+    renderInspector();
+  });
+  btn("vp.clearTrim", "clear", () => {
+    trimIn = trimOut = null;
+    renderKeyMarks();
+    renderInspector();
+  }, trimIn === null && trimOut === null);
+  btn("vp.applyTrim", "apply", () => void applyTrim(), trimIn === null && trimOut === null);
+  btn("vp.replace", "replace", () => {
+    videoPickFor = "replace";
+    inVideoEl.multiple = false;
+    inVideoEl.click();
+  });
+  btn("vp.toScene", "to-scene", () => void videoToScene());
+  g.append(bar, note(et("vp.trimHint")));
+  return g;
+}
+
+/** 检视器里的视频信息；重开的工程没有缓存时探测一次再重画 */
+function videoInfoGroup(node: LayerNode): HTMLElement {
+  const slug = videoSlugOf(node.obj.image)!;
+  const meta = videoMeta.get(slug);
+  if (!meta && overlay) {
+    void (async () => {
+      const bytes = await overlay!.read(videoMaterialPathOf(slug));
+      if (!bytes) return;
+      const p = await probeVideo(new Blob([bytes as BlobPart], { type: "video/mp4" })).catch(() => null);
+      if (!p) return;
+      videoMeta.set(slug, { width: p.width, height: p.height, duration: p.duration, size: bytes.length });
+      if (selectedId === node.id) renderInspector();
+    })();
+  }
+  const g = kvGroup(et("insp.video"), [
+    ["f.videoFile", videoMaterialPathOf(slug)],
+    ["f.resolution", meta ? `${meta.width} × ${meta.height}` : "…"],
+    ["f.duration", meta ? `${meta.duration.toFixed(2)}s` : "…"],
+    ["f.bytes", meta ? `${mb(meta.size)} MB` : "…"],
+  ]);
+  g.classList.add("ed-video");
+  g.appendChild(note(et("insp.videoSync")));
+  return g;
+}
+
 
 // ---------- 图层树（P0 只读：来自 scene.json） ----------
 
@@ -1969,6 +2471,11 @@ function presetMenu(btn: HTMLButtonElement, menu: HTMLElement, pick: (preset: st
 }
 presetMenu(lyAddTextEl, textMenuEl, (p) => addText(p as TextPreset));
 presetMenu(lyAddParticleEl, particleMenuEl, (p) => addParticle(p as ParticlePreset));
+const lyAddVideoEl = $<HTMLButtonElement>("#ly-add-video");
+lyAddVideoEl.onclick = () => {
+  videoPickFor = "layer";
+  inVideoEl.click();
+};
 const lyAddSoundEl = $<HTMLButtonElement>("#ly-add-sound");
 lyAddSoundEl.onclick = () => {
   soundPickFor = null;
@@ -2068,6 +2575,7 @@ function syncLayerTools() {
   lyAddTextEl.disabled = lyAddEl.disabled;
   lyAddParticleEl.disabled = lyAddEl.disabled;
   lyAddSoundEl.disabled = lyAddEl.disabled;
+  lyAddVideoEl.disabled = lyAddEl.disabled;
 }
 
 function renderTree() {
@@ -2079,7 +2587,7 @@ function renderTree() {
     return;
   }
   if (doc.type !== "scene") {
-    treeEl.appendChild(note(et("layers.notScene", { type: doc.type })));
+    treeEl.appendChild(note(doc.video ? et("vp.layers") : et("layers.notScene", { type: doc.type })));
     return;
   }
   layerCountEl.textContent = et("layers.count", { n: doc.objectCount });
@@ -2123,8 +2631,10 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
   }
   const kind = document.createElement("span");
   kind.className = "ed-kind";
-  kind.dataset.kind = n.kind;
-  kind.textContent = et(`kind.${n.kind}`);
+  kind.dataset.kind = n.modelForm ? "model" : n.kind;
+  if (isVideoNode(n)) kind.dataset.kind = "video";
+  kind.textContent = et(isVideoNode(n) ? "kind.video" : n.modelForm ? "kind.model" : `kind.${n.kind}`);
+  if (n.modelForm) kind.title = et(`model.form.${n.modelForm}`);
   const name = document.createElement("span");
   name.className = "ed-node-name";
   name.textContent = n.name || `#${n.id}`;
@@ -2276,6 +2786,430 @@ function kvGroup(title: string, rows: Array<[string, unknown, ((dd: HTMLElement)
   }
   group.append(h, dl);
   return group;
+}
+
+/** 模型层只读信息（W12）：全部经引擎 getModelInfo 取，模型没装上时只给一句说明 */
+function modelGroup(node: LayerNode): HTMLElement {
+  const id = Number(node.id);
+  const info = editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+  if (!info) {
+    const g = kvGroup(et("insp.model"), [["model.form", et(`model.form.${node.modelForm}`)]]);
+    g.appendChild(note(et("model.notLoaded")));
+    return g;
+  }
+  const g = kvGroup(
+    et("insp.model"),
+    modelInfoRows(info).map(([k, v]) => [k, k === "model.form" ? et(`model.form.${v}`) : v]),
+  );
+  g.classList.add("ed-model-group");
+  return g;
+}
+
+/** 把引擎里该层的动画层表推回文档原样（结束单独预览 / 拖动预览后复位） */
+function pushAnimLayers(id: number | string, list: unknown) {
+  const n = Number(id);
+  if (!editor || !Number.isFinite(n)) return;
+  editor
+    .setAnimationLayers(n, Array.isArray(list) ? (list as Array<Record<string, unknown>>) : [])
+    .catch((e) => log(et("log.animLayerFailed", { msg: (e as Error).message }), "warn"));
+}
+
+function endAnimSolo() {
+  if (!animSolo) return;
+  const n = doc && findNode(doc.roots, animSolo.id);
+  animSolo = null;
+  if (n) pushAnimLayers(n.id, n.obj.animationlayers);
+}
+
+/** 动画层的一次可撤销编辑：表里没有包装时整表热替换，否则重挂（包装的脚本 / 曲线 / 绑定按下标挂在装配期） */
+function animLayerEdit(label: string, node: LayerNode, mutate: (o: LayerNode["obj"]) => boolean) {
+  animSolo = null;
+  const id = Number(node.id);
+  const hot = !!editor && Number.isFinite(id) && !!editor.getModelInfo(id) && animLayersHot(node.obj);
+  structEdit(
+    label,
+    (d) => {
+      const n = findNode(d.roots, node.id);
+      return n && mutate(n.obj) ? n.id : undefined;
+    },
+    hot ? () => pushAnimLayers(node.id, findNode(doc!.roots, node.id)?.obj.animationlayers) : undefined,
+    hot,
+  );
+}
+
+/** 动画层（W13）：片段 / 速率 / 混合 / 可见 / 叠加 / 名称、排序、增删、单独预览 */
+function animLayersGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-fx ed-animlayers";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.animLayers");
+  group.appendChild(h);
+  const id = Number(node.id);
+  const info = editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+  const clips = info?.animations ?? [];
+  const views = getAnimLayers(node.obj);
+  const editable = !!overlay && !!editor && !isLocked(node.id);
+  const hot = animLayersHot(node.obj);
+  if (!clips.length) {
+    group.appendChild(note(et(info ? "al.noClips" : "model.notLoaded")));
+    if (!views.length) return group;
+  }
+  if (!views.length) group.appendChild(note(et("al.none")));
+  if (views.length && !hot) group.appendChild(note(et("al.remount")));
+  const iconBtn = (cls: string, text: string, title: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-icon ${cls}`;
+    b.textContent = text;
+    b.title = title;
+    b.disabled = !editable || disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  const clipLabel = (c: (typeof clips)[number]) => `${c.name || `#${c.id}`} · ${fmtNum(c.duration)}s`;
+  for (const v of views) {
+    const label = v.name || `#${v.index + 1}`;
+    const edit = (field: string, mutate: (o: LayerNode["obj"]) => boolean) =>
+      animLayerEdit(et("log.animLayerEdited", { layer: nodeName(node.id), name: label, field: et(field) }), node, mutate);
+    const item = document.createElement("div");
+    item.className = "ed-fx-item";
+    item.dataset.alIndex = String(v.index);
+    if (!v.visible) item.classList.add("hidden-layer");
+    const head = document.createElement("div");
+    head.className = "ed-fx-head";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.className = "ed-fx-name ed-al-name";
+    name.value = v.name;
+    name.disabled = !editable;
+    name.addEventListener("change", () => edit("al.name", (o) => setAnimLayerField(o, v.index, "name", name.value)));
+    const solo = animSolo?.id === node.id && animSolo.index === v.index;
+    const soloBtn = iconBtn("ed-al-solo", solo ? "◎" : "◌", et("al.solo"), () => {
+      if (solo) return void (endAnimSolo(), renderInspector());
+      animSolo = { id: node.id, index: v.index };
+      pushAnimLayers(node.id, soloAnimLayers(node.obj, v.index));
+      renderInspector();
+    }, !hot || !info);
+    if (solo) soloBtn.classList.add("on");
+    head.append(
+      name,
+      soloBtn,
+      iconBtn("ed-al-up", "↑", et("fx.up"), () => animLayerEdit(et("log.animLayerMoved", { name: label }), node, (o) => moveAnimLayer(o, v.index, -1)), v.index === 0),
+      iconBtn("ed-al-down", "↓", et("fx.down"), () => animLayerEdit(et("log.animLayerMoved", { name: label }), node, (o) => moveAnimLayer(o, v.index, 1)), v.index === views.length - 1),
+      iconBtn("ed-al-del", "✕", et("fx.del"), () => animLayerEdit(et("log.animLayerRemoved", { name: label }), node, (o) => removeAnimLayer(o, v.index))),
+    );
+    item.appendChild(head);
+    const form = document.createElement("div");
+    form.className = "ed-fx-params";
+    const row = (key: string, el: HTMLElement) => {
+      const l = document.createElement("label");
+      l.textContent = et(key);
+      const box = document.createElement("div");
+      box.className = "ed-fx-param";
+      box.appendChild(el);
+      form.append(l, box);
+      return box;
+    };
+    const wrapNote = (f: keyof AnimLayerView["wrapped"], el: HTMLInputElement) => {
+      const w = v.wrapped[f];
+      if (!w) return;
+      el.disabled = true;
+      el.title = et(`al.wrap.${w}`);
+    };
+    const clipSel = document.createElement("select");
+    clipSel.className = "ed-al-clip";
+    clipSel.disabled = !editable || !clips.length;
+    for (const c of clips) {
+      const o = document.createElement("option");
+      o.value = String(c.id);
+      o.textContent = clipLabel(c);
+      clipSel.appendChild(o);
+    }
+    if (!clips.some((c) => c.id === v.animation)) {
+      const o = document.createElement("option");
+      o.value = String(v.animation);
+      o.textContent = et("al.missingClip", { id: v.animation });
+      clipSel.appendChild(o);
+    }
+    clipSel.value = String(v.animation);
+    clipSel.addEventListener("change", () => edit("al.clip", (o) => setAnimLayerField(o, v.index, "animation", Number(clipSel.value))));
+    row("al.clip", clipSel);
+    /** 拖动中只推引擎预览（文档不动），松手才入栈；有包装时不预览（热替换会丢绑定） */
+    const preview = (field: "blend" | "rate", value: number) => {
+      if (!hot || !info || animSolo) return;
+      const list = structuredClone(node.obj.animationlayers) as Array<Record<string, unknown>>;
+      if (list[v.index]) list[v.index][field] = value;
+      pushAnimLayers(node.id, list);
+    };
+    const rate = document.createElement("input");
+    rate.type = "number";
+    rate.className = "ed-al-rate";
+    rate.min = "0";
+    rate.step = "0.1";
+    rate.value = fmtNum(v.rate);
+    rate.disabled = !editable;
+    wrapNote("rate", rate);
+    rate.addEventListener("change", () => {
+      if (!objEditOkAnim(node, "al.rate", label, (o) => setAnimLayerField(o, v.index, "rate", Number(rate.value)))) rate.value = fmtNum(v.rate);
+    });
+    row("al.rate", rate);
+    const blend = document.createElement("input");
+    blend.type = "range";
+    blend.className = "ed-al-blend";
+    blend.min = "0";
+    blend.max = "1";
+    blend.step = "0.01";
+    blend.value = String(v.blend);
+    blend.disabled = !editable;
+    wrapNote("blend", blend);
+    const out = document.createElement("span");
+    out.className = "ed-val";
+    out.textContent = fmtNum(v.blend);
+    blend.addEventListener("input", () => {
+      out.textContent = fmtNum(Number(blend.value));
+      preview("blend", Number(blend.value));
+    });
+    blend.addEventListener("change", () => edit("al.blend", (o) => setAnimLayerField(o, v.index, "blend", Number(blend.value))));
+    row("al.blend", blend).appendChild(out);
+    for (const f of ["visible", "additive"] as const) {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = `ed-al-${f}`;
+      cb.checked = v[f];
+      cb.disabled = !editable;
+      if (f === "visible") wrapNote("visible", cb);
+      cb.addEventListener("change", () => edit(`al.${f}`, (o) => setAnimLayerField(o, v.index, f, cb.checked)));
+      row(`al.${f}`, cb);
+    }
+    item.appendChild(form);
+    group.appendChild(item);
+  }
+  if (clips.length) {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "ed-btn ed-al-add";
+    add.textContent = et("al.add");
+    add.disabled = !editable;
+    add.onclick = () => {
+      const used = new Set(views.map((v) => v.animation));
+      const clip = clips.find((c) => !used.has(c.id)) ?? clips[0];
+      const name = et("al.defaultName", { n: views.length + 1 });
+      animLayerEdit(et("log.animLayerAdded", { name, layer: nodeName(node.id) }), node, (o) => doc !== null && addAnimLayer(doc, o, clip.id, name) !== null);
+    };
+    group.appendChild(add);
+  }
+  return group;
+}
+
+/** 页面给 attachToModel / detachFromModel 的偏移来源：引擎此刻的附着点状态 */
+const attachOffsetOf: AttachOffsetOf = (mid, name) =>
+  editor?.getAttachmentPoints(Number(mid))?.find((p) => p.name === name)?.offset ?? null;
+
+/** 子网格贴图（W16）：每个子网格一行「贴图名 + 替换」；换图走写时复制 + 结构编辑（重挂） */
+function modelTexGroup(node: LayerNode): HTMLElement | null {
+  const id = Number(node.id);
+  const info = editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+  if (!info) return null;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-model-tex";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.modelTex");
+  group.appendChild(h);
+  group.appendChild(note(et("mt.note")));
+  const editable = !!overlay && !isLocked(node.id);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  for (const s of modelTextureSlots(info)) {
+    const l = document.createElement("label");
+    l.textContent = `#${s.index}`;
+    if (s.materialPath) l.title = s.materialPath;
+    const box = document.createElement("div");
+    box.className = "ed-fx-param ed-mt-row";
+    box.dataset.mesh = String(s.index);
+    const name = document.createElement("span");
+    name.className = "ed-mt-name";
+    name.textContent = s.texture ?? et("mt.noTexture");
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ed-btn ed-mt-replace";
+    b.textContent = et("mt.replace");
+    b.disabled = !editable;
+    b.onclick = () => {
+      modelTexPick = { layer: node.id, mesh: s.index };
+      inModelTexEl.click();
+    };
+    box.append(name, b);
+    form.append(l, box);
+  }
+  group.appendChild(form);
+  return group;
+}
+
+const inModelTexEl = $<HTMLInputElement>("#in-model-tex");
+let modelTexPick: { layer: number | string; mesh: number } | null = null;
+inModelTexEl.onchange = async () => {
+  const file = inModelTexEl.files?.[0];
+  inModelTexEl.value = "";
+  const pick = modelTexPick;
+  modelTexPick = null;
+  if (!file || !pick || !isImageFile(file)) return;
+  const [img] = await readImages([file]);
+  if (img) await replaceModelTexture(pick.layer, pick.mesh, img);
+};
+
+async function replaceModelTexture(layerId: number | string, mesh: number, img: ImageInput) {
+  const d = doc;
+  const node = d && findNode(d.roots, layerId);
+  const assets = overlay;
+  if (!d || !node || !assets || !node.modelForm) return;
+  const o = node.obj;
+  const listed = new Set(assets.list());
+  const slug = imageSlug(img.name, (s) =>
+    [modelPathOf(s), editorMdlOf(s), editorMaterialOf(s)].some((p) => assets.has(p) || listed.has(p)),
+  );
+  const fail = (key: string, path: string) => void log(et(key, { path }), "warn");
+  let r: RetextureResult | null;
+  let from: string;
+  let puppet: string | null = null;
+  if (node.modelForm === "puppet") {
+    from = String(o.image);
+    const modelJson = parseJsonBytes(await assets.read(from));
+    if (!modelJson) return fail("mt.fail.read", from);
+    const matPath = String(modelJson.material ?? "");
+    const material = parseJsonBytes(matPath ? await assets.read(matPath) : null);
+    if (!material) return fail("mt.fail.read", matPath || from);
+    r = puppetRetexture(modelJson, material, slug, img);
+    if (!r) return fail("mt.fail.material", matPath);
+    puppet = String(modelJson.puppet);
+  } else {
+    from = String(o.model);
+    const bytes = await assets.read(from);
+    if (!bytes) return fail("mt.fail.read", from);
+    const matPath = meshMaterialPath(bytes, mesh);
+    if (!matPath) return fail("mt.fail.mdl", from);
+    const material = parseJsonBytes(await assets.read(matPath));
+    if (!material) return fail("mt.fail.read", matPath);
+    r = meshRetexture(bytes, mesh, material, slug, img);
+    if (!r) return fail("mt.fail.material", matPath);
+  }
+  if (d !== doc) return;
+  const res = r;
+  for (const f of res.files) assets.put(f.name, f.data, res.path);
+  assets.share(from, res.path);
+  if (puppet) d.puppets = new Map([...(d.puppets ?? []), [res.path, puppet]]);
+  structEdit(et("log.modelTexReplaced", { layer: nodeName(layerId), index: mesh, name: img.name }), (dd) => {
+    const n = findNode(dd.roots, layerId);
+    if (!n) return undefined;
+    if (puppet) n.obj.image = res.path;
+    else n.obj.model = res.path;
+    return n.id;
+  });
+}
+
+const flatNodes = (roots: LayerNode[]): LayerNode[] => roots.flatMap((n) => [n, ...flatNodes(n.children)]);
+
+/** 「挂到模型」（W14）：选模型层 + 附着点 → 绑定；已挂时可解绑。都是结构编辑（重挂），当前时刻画面不变 */
+function attachGroup(node: LayerNode): HTMLElement | null {
+  if (!doc || !editor) return null;
+  const subtree = new Set(flatNodes([node]).map((n) => String(n.id)));
+  const models = flatNodes(doc.roots)
+    .filter((n) => n.modelForm && !subtree.has(String(n.id)))
+    .map((n) => ({ node: n, points: editor!.getAttachmentPoints(Number(n.id)) ?? [] }))
+    .filter((m) => m.points.length);
+  const cur = attachmentOf(node.obj);
+  if (!models.length && !cur) return null;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-attach";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.attach");
+  group.appendChild(h);
+  const editable = !!overlay && !isLocked(node.id);
+  const parentId = node.obj.parent;
+  if (cur) group.appendChild(note(et("att.current", { model: nodeName(parentId as number | string), name: cur })));
+  if (!attachPick || attachPick.layer !== node.id || !models.some((m) => same(m.node.id, attachPick!.model))) {
+    const m0 = models.find((m) => same(m.node.id, parentId)) ?? models[0];
+    attachPick = m0 ? { layer: node.id, model: m0.node.id, name: cur && same(m0.node.id, parentId) ? cur : m0.points[0].name } : null;
+  }
+  const pick = attachPick;
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    form.append(l, el);
+  };
+  if (pick) {
+    const modelSel = document.createElement("select");
+    modelSel.className = "ed-att-model";
+    modelSel.disabled = !editable;
+    for (const m of models) {
+      const o = document.createElement("option");
+      o.value = String(m.node.id);
+      o.textContent = `${m.node.name || `#${m.node.id}`} (${m.points.length})`;
+      modelSel.appendChild(o);
+    }
+    modelSel.value = String(pick.model);
+    modelSel.addEventListener("change", () => {
+      const m = models.find((x) => String(x.node.id) === modelSel.value);
+      if (m) attachPick = { layer: node.id, model: m.node.id, name: m.points[0].name };
+      renderInspector();
+    });
+    row("att.model", modelSel);
+    const ptSel = document.createElement("select");
+    ptSel.className = "ed-att-point";
+    ptSel.disabled = !editable;
+    for (const p of models.find((m) => same(m.node.id, pick.model))?.points ?? []) {
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.name;
+      ptSel.appendChild(o);
+    }
+    ptSel.value = pick.name;
+    ptSel.addEventListener("change", () => {
+      attachPick = { ...pick, name: ptSel.value };
+    });
+    row("att.point", ptSel);
+  }
+  group.appendChild(form);
+  const btns = document.createElement("div");
+  btns.className = "ed-att-btns";
+  const mk = (cls: string, key: string, onClick: () => void, disabled: boolean) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.textContent = et(key);
+    b.disabled = !editable || disabled;
+    b.onclick = onClick;
+    btns.appendChild(b);
+  };
+  const report = (r: AttachResult) => {
+    if (r !== "ok" && r !== "noop") log(et(`att.fail.${r}`), "warn");
+    return r === "ok";
+  };
+  mk("ed-att-bind", "att.bind", () => {
+    const p = attachPick;
+    if (!p) return;
+    structEdit(et("log.attached", { layer: nodeName(node.id), model: nodeName(p.model), name: p.name }), (d) =>
+      report(attachToModel(d, node.id, p.model, p.name, attachOffsetOf)) ? node.id : undefined,
+    );
+  }, !pick);
+  mk("ed-att-unbind", "att.unbind", () => {
+    structEdit(et("log.detached", { layer: nodeName(node.id) }), (d) => (report(detachFromModel(d, node.id, attachOffsetOf)) ? node.id : undefined));
+  }, !cur);
+  group.appendChild(btns);
+  return group;
+}
+
+const same = (a: unknown, b: unknown) => a !== undefined && a !== null && String(a) === String(b);
+
+/** 速率这类会校验失败的字段：返回是否改成，失败时调用方把控件复原 */
+function objEditOkAnim(node: LayerNode, field: string, name: string, mutate: (o: LayerNode["obj"]) => boolean): boolean {
+  let ok = false;
+  animLayerEdit(et("log.animLayerEdited", { layer: nodeName(node.id), name, field: et(field) }), node, (o) => (ok = mutate(o)));
+  return ok;
 }
 
 function rawGroup(obj: unknown): HTMLElement {
@@ -3650,6 +4584,7 @@ function bindingsGroup(node: LayerNode): HTMLElement {
 }
 
 function renderInspector() {
+  if (animSolo && animSolo.id !== selectedId) endAnimSolo();
   inspectorEl.textContent = "";
   renderKeyMarks();
   if (!doc) {
@@ -3675,6 +4610,7 @@ function renderInspector() {
       inspectorEl.appendChild(userPropsGroup());
       inspectorEl.appendChild(note(et("insp.none")));
     }
+    if (doc.video) inspectorEl.appendChild(videoProjectGroup());
     return;
   }
   if (extraSel.size) inspectorEl.appendChild(multiGroup());
@@ -3683,6 +4619,13 @@ function renderInspector() {
   if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
   if (node.kind === "particle") inspectorEl.appendChild(particleGroup(node));
   if (node.kind === "sound") inspectorEl.appendChild(soundGroup(node));
+  if (node.modelForm) inspectorEl.appendChild(modelGroup(node));
+  if (node.modelForm) inspectorEl.appendChild(animLayersGroup(node));
+  const mt = node.modelForm ? modelTexGroup(node) : null;
+  if (mt) inspectorEl.appendChild(mt);
+  const att = attachGroup(node);
+  if (att) inspectorEl.appendChild(att);
+  if (isVideoNode(node)) inspectorEl.appendChild(videoInfoGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
   inspectorEl.appendChild(bindingsGroup(node));
   inspectorEl.appendChild(scriptsGroup(node));
@@ -3729,12 +4672,13 @@ function renderInspector() {
 
 applyEditorStatic();
 layoutStage();
-renderLibrary();
 renderTree();
 renderInspector();
 renderStatus();
 syncPlayButton();
 syncTimeline();
 requestAnimationFrame(tickTimeline);
-void loadLibrary();
-void checkDraft();
+void (async () => {
+  const item = new URL(location.href).searchParams.get("item");
+  if (item) log(et("log.noLibraryEdit", { id: item }), "warn");
+})();

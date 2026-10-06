@@ -11,14 +11,14 @@ export const EDITOR_DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: "编辑器用来新建或修改 Wallpaper Engine 场景壁纸：在画面上直接拖动图层，在检视器里改变换、效果、脚本与用户属性，改动当帧生效；完成后可存回壁纸库、存到文件夹，或打成官方 Wallpaper Engine 能直接加载的 scene.pkg。",
-          en: "The editor creates and modifies Wallpaper Engine scene wallpapers: drag layers right on the canvas, edit transforms, effects, scripts and user properties in the inspector, and see every change on the next frame. When done, save back to the library, to a folder, or as a scene.pkg that the official Wallpaper Engine loads directly.",
+          zh: "编辑器按项目工作：新建时必须先选一个保存文件夹，之后松散文件（scene.json、资源）会自动保存。不直接修改壁纸库里的壁纸。导出时才选择打成 scene.pkg，或打成 zip 压缩包。",
+          en: "The editor works on projects: creating one asks for a save folder first, then loose files (scene.json and assets) autosave. Library wallpapers are not edited in place. Export is when you choose a scene.pkg package or a zip archive.",
         },
       },
       {
         k: "ul",
         items: [
-          { zh: "入口：测试台标题栏的「编辑器」、文件菜单「在编辑器中打开」（⌘E），或壁纸库条目右键菜单；本地开发地址为 http://localhost:1430/editor/", en: "Entry points: \"Editor\" in the bench title bar, File → Open in editor (⌘E), or the right-click menu of a library item; the local dev URL is http://localhost:1430/editor/" },
+          { zh: "入口：预览标题栏的「编辑器」；本地开发地址为 http://localhost:1430/editor/。壁纸库条目不能直接拿来改", en: "Entry: \"Editor\" in the preview title bar; the local dev URL is http://localhost:1430/editor/. Library items are not opened for editing" },
           { zh: "可编辑的只有场景（Scene）壁纸；网页与视频壁纸会以只读方式预览", en: "Only scene wallpapers are editable; web and video wallpapers open as read-only previews" },
           { zh: "快捷键里的 ⌘ 在 Windows / Linux 上对应 Ctrl", en: "⌘ in shortcuts means Ctrl on Windows / Linux" },
         ],
@@ -36,8 +36,8 @@ export const EDITOR_DOC: DocSection[] = [
           { zh: "用途", en: "What it does" },
         ],
         rows: [
-          [{ zh: "主工具条（顶）", en: "Main toolbar (top)" }, { zh: "新建 / 打开 / 保存、撤销 / 重做、播放 / 暂停、重新加载、导出 PNG、重置布局", en: "New / Open / Save, undo / redo, play / pause, reload, export PNG, reset layout" }],
-          [{ zh: "壁纸库 + 图层（左）", en: "Library + Layers (left)" }, { zh: "上半是壁纸库，点选即打开；下半是图层树，显示当前场景的全部对象", en: "The top half is the library — click to open; the bottom half is the layer tree listing every object in the scene" }],
+          [{ zh: "主工具条（顶）", en: "Main toolbar (top)" }, { zh: "新建 / 打开项目 / 导出、撤销 / 重做、播放 / 暂停、重新加载、导出 PNG、重置布局", en: "New / Open project / Export, undo / redo, play / pause, reload, export PNG, reset layout" }],
+          [{ zh: "图层（左）", en: "Layers (left)" }, { zh: "图层树，显示当前项目场景的全部对象", en: "The layer tree, listing every object in the current project" }],
           [{ zh: "视口 + 时间轴（中）", en: "Viewport + Timeline (center)" }, { zh: "视口工具条切宽高比、适配方式与渲染 DPR；时间轴负责回到开头、逐帧、拖动定位和倍速", en: "The viewport bar switches aspect ratio, fit and render DPR; the timeline handles rewind, frame stepping, scrubbing and speed" }],
           [{ zh: "检视器（右）", en: "Inspector (right)" }, { zh: "不选图层时显示工程信息与用户属性；选中图层后显示变换与外观、效果、脚本、属性绑定和原始 JSON", en: "With nothing selected it shows project info and user properties; with a layer selected it shows transform & appearance, effects, scripts, property bindings and raw JSON" }],
           [{ zh: "控制台（底）", en: "Console (bottom)" }, { zh: "打开、保存、编辑操作与渲染器诊断的日志", en: "Logs for opening, saving, edits and renderer diagnostics" }],
@@ -59,11 +59,11 @@ export const EDITOR_DOC: DocSection[] = [
       {
         k: "ul",
         items: [
-          { zh: "新建：从模板创建场景 —— 先选分辨率（含 1080 × 1920 竖屏）和背景色，再选「空白（纯色背景）」或「以图片为背景…」", en: "New: create a scene from a template — choose a resolution (including 1080 × 1920 portrait) and a background color, then pick \"Blank (solid color)\" or \"Image background…\"" },
-          { zh: "打开 .pkg：选本地 scene.pkg，可同时选上 project.json 以带上标题和属性", en: "Open .pkg: pick a local scene.pkg; select its project.json too to bring along the title and properties" },
-          { zh: "打开文件夹：松散工程目录（project.json + scene.json + 资源）或含 scene.pkg 的壁纸目录", en: "Open folder: a loose project folder (project.json + scene.json + assets) or a wallpaper folder containing scene.pkg" },
-          { zh: "拖入：把 scene.pkg、壁纸目录或图片直接拖进视口；拖入图片时，未打开场景则以它为背景新建，已打开则添加为图片层", en: "Drag in: drop a scene.pkg, a wallpaper folder or images onto the viewport. Images start a new scene with that background when nothing is open, or become image layers otherwise" },
-          { zh: "草稿：编辑中的内容会自动存为草稿，意外关闭后再次进入会提示「恢复 / 丢弃」", en: "Drafts: work in progress is autosaved; after an unexpected close you'll be offered Restore / Discard on the next visit" },
+          { zh: "新建：先弹出文件夹选择，选定项目保存位置，再选分辨率和「空白」或「以图片为背景」", en: "New: pick the project folder first, then a resolution and \"Blank\" or \"Image background\"" },
+          { zh: "打开项目：选择已有项目文件夹，之后的改动自动写回这里的松散文件", en: "Open project: pick an existing project folder; later edits autosave loose files back into it" },
+          { zh: "打开 .pkg：选 scene.pkg 后还要选一个新的项目文件夹，内容解开成松散文件再编辑", en: "Open .pkg: after picking a scene.pkg you also pick a new project folder; the package is unpacked to loose files" },
+          { zh: "拖入图片：已打开项目则加为图片层；还没有项目时会先选保存文件夹再新建", en: "Drop images: they become layers when a project is open; otherwise you pick a save folder and start a new project" },
+          { zh: "自动保存：改动后约半秒写回项目文件夹（scene.json、资源、封面），⌘S 立刻再写一次", en: "Autosave: edits are written back to the project folder after about half a second (scene.json, assets, cover). ⌘S writes immediately" },
           { zh: "壁纸自带的脚本默认被拦截（画面停在脚本初始值），确认来源可信后可点「仍然执行」，仅对本次打开有效", en: "Scripts bundled with a wallpaper are blocked by default (the canvas stays at their initial values); click \"Run anyway\" once you trust the source — it applies to this session only" },
         ],
       },
@@ -136,26 +136,25 @@ export const EDITOR_DOC: DocSection[] = [
   },
   {
     id: "ed-save",
-    title: { zh: "保存", en: "Saving" },
+    title: { zh: "自动保存与导出", en: "Autosave and export" },
     blocks: [
       {
         k: "table",
         head: [
-          { zh: "目标", en: "Target" },
+          { zh: "动作", en: "Action" },
           { zh: "说明", en: "Details" },
         ],
         rows: [
-          [{ zh: "另存到壁纸库", en: "Save to library" }, { zh: "写入本机壁纸库（需本地后端），保存后测试台即可直接播放", en: "Writes into the local library (needs the local backend); the bench can play it right away" }],
-          [{ zh: "保存到文件夹…", en: "Save to folder…" }, { zh: "写到你选的目录（需浏览器支持目录读写）", en: "Writes into a folder you choose (needs browser directory access)" }],
-          [{ zh: "下载 .zip", en: "Download .zip" }, { zh: "打包整个工程下载", en: "Downloads the whole project as an archive" }],
-          [{ zh: "WE 原生格式（scene.pkg）", en: "WE native format (scene.pkg)" }, { zh: "勾选后按 scene.pkg 输出，图片贴图转为 .tex，官方 Wallpaper Engine 可直接加载；不勾选则输出松散工程", en: "When checked, output is a scene.pkg with image textures converted to .tex, loadable by the official Wallpaper Engine; otherwise a loose project is written" }],
+          [{ zh: "自动保存", en: "Autosave" }, { zh: "改动写入项目文件夹里的松散文件，不写进壁纸库", en: "Edits go to loose files in the project folder, not into the wallpaper library" }],
+          [{ zh: "打包导出 scene.pkg", en: "Export scene.pkg" }, { zh: "下载一个 zip：project.json、封面和 scene.pkg（图片贴图转为 .tex），官方 Wallpaper Engine 可直接加载", en: "Downloads a zip of project.json, the cover and scene.pkg (image textures become .tex) that the official Wallpaper Engine loads" }],
+          [{ zh: "压缩包导出 .zip", en: "Export .zip" }, { zh: "下载松散工程的 zip 压缩包", en: "Downloads a zip of the loose project" }],
         ],
       },
       {
         k: "p",
         v: {
-          zh: "保存时会自动生成封面图。⌘S 重复上一次的保存目标；有未保存的修改时状态栏会提示。",
-          en: "A preview image is generated on save. ⌘S repeats the last save target; the status bar shows when there are unsaved changes.",
+          zh: "导出不会改项目文件夹里的松散文件。状态栏显示保存中 / 已保存 / 未保存。⌘S 立刻把当前文档再写一次。",
+          en: "Export does not replace the loose files in the project folder. The status bar shows Saving / Saved / Unsaved. ⌘S writes the current document immediately.",
         },
       },
     ],
@@ -174,7 +173,7 @@ export const EDITOR_DOC: DocSection[] = [
         rows: [
           [{ zh: "⌘Z", en: "⌘Z" }, { zh: "撤销", en: "Undo" }],
           [{ zh: "⇧⌘Z / ⌘Y", en: "⇧⌘Z / ⌘Y" }, { zh: "重做", en: "Redo" }],
-          [{ zh: "⌘S", en: "⌘S" }, { zh: "按上次的目标保存", en: "Save to the last target" }],
+          [{ zh: "⌘S", en: "⌘S" }, { zh: "立刻自动保存到项目文件夹", en: "Autosave to the project folder now" }],
           [{ zh: "⌘D", en: "⌘D" }, { zh: "复制选中图层", en: "Duplicate the selected layer" }],
           [{ zh: "Delete / Backspace", en: "Delete / Backspace" }, { zh: "删除选中图层", en: "Delete the selected layer" }],
           [{ zh: "Alt + 点击", en: "Alt + click" }, { zh: "逐层切换选中", en: "Cycle selection through stacked layers" }],

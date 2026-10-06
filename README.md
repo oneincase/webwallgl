@@ -13,7 +13,7 @@ WebWallGL 是一个用 WebGL2 在浏览器里播放 Wallpaper Engine 壁纸的�
 - 场景壁纸（scene.pkg / 松散工程目录）、网页壁纸、视频壁纸三类都能播放
 - 还原图层、效果、粒子、模型、SceneScript 脚本、用户属性与音频可视化
 - 可嵌入桌面壁纸软件（Tauri / Electron / WebView）、网页背景、仪表盘、OBS 背景板等任意需要动态背景的地方
-- 附带测试台（壁纸播放器）与场景壁纸编辑器，可新建、修改并导出官方 Wallpaper Engine 能直接加载的 scene.pkg
+- 附带预览（壁纸播放器）与场景壁纸编辑器，可新建项目并导出官方 Wallpaper Engine 能直接加载的 scene.pkg
 
 **安装**
 
@@ -47,7 +47,7 @@ pnpm add webwallgl   # 或 npm i webwallgl
 
 **使用说明**
 
-完整文档在测试台里：运行 `pnpm install && pnpm dev`，打开 <http://localhost:1430/>，进入「使用说明」标签页，可以在「播放库」（库 API、测试台）和「编辑器」两份说明之间切换。编辑器地址是 <http://localhost:1430/editor/>。
+完整文档在预览里：运行 `pnpm install && pnpm dev`，打开 <http://localhost:1430/>，进入「使用说明」标签页，可以在「播放库」（库 API、预览）和「编辑器」两份说明之间切换。编辑器地址是 <http://localhost:1430/editor/>。
 
 **版权与合规**
 

@@ -193,7 +193,11 @@ export async function openLocalFiles(input: LocalFile[]): Promise<Opened> {
   const title = typeof project?.title === "string" && project.title.trim() ? project.title.trim() : fallbackTitle;
 
   if (MEDIA_TYPES.has(type) && declared && lookup(declared)) {
-    return { doc: makeDoc(title, project, null, null), source: mediaSource(lookup(declared)!) };
+    const file = lookup(declared)!;
+    const doc = makeDoc(title, project, null, null);
+    // 视频壁纸进编辑器可编辑（裁剪 / 替换 / 转场景），预览由页面自己的 <video> 承担
+    if (type === "video") doc.video = { path: declared, bytes: new Uint8Array(await file.arrayBuffer()) };
+    return { doc, source: mediaSource(file) };
   }
   if (type === "web") {
     throw new Error("本地网页壁纸目录暂不支持在编辑器里打开（相对资源无法从 blob 地址解析），请从壁纸库打开");

@@ -6,10 +6,10 @@
  *      逐个 API 断言数值语义（时钟 / 出图 / 拾取 / 活层 / 热改 / 轮廓 / 位移换算）。
  *   L. 编辑器页端到端（松散形态）：真鼠标 / 键盘事件（CDP Input）驱动 —— 树选中、
  *      检视器热改、旋转柄 / 角点 / 平移拖拽、点选与 Alt 轮换、锁定、复制 / 重排 / 删除、
- *      撤销重做、逐帧、导出 PNG、下载 zip、另存到壁纸库、重新打开、⌘S 覆盖。
+ *      撤销重做、逐帧、导出 PNG、下载 zip、自动保存到项目文件夹、重新打开、⌘S 覆盖。
  *   Q. 新建端到端：空白 / 纯色 / 图片背景模板，选图与拖入（含 webp 转码）加层，撤销重做，
- *      另存到壁纸库，编辑器重新打开与测试台渲染页播放 —— 判据是 CDP 截图的真实像素。
- *   R. 草稿：编辑后刷新出横幅 → 恢复（新建来源 / 库来源）、丢弃、保存后清除。
+ *      自动保存到项目文件夹，编辑器重新打开与预览渲染页播放 —— 判据是 CDP 截图的真实像素。
+ *   R. 自动保存：刷新没有草稿横幅；再打开同一项目文件夹，图层还在。
  *
  * 编辑器页本身不暴露任何调试探针（verify-arch 断言），所以 L 只看 DOM 状态与盘上产物；
  * 需要的几何（手柄位置）由 K 那个同尺寸的旁挂实例经公开 API 算出 —— 两者同一套 fit 数学。
@@ -69,6 +69,19 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   cleanups.push(() => session.close());
   instrument(session, { width: 1440, height: 900 });
   const cdp = session.pageCdp;
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+    source: fs.readFileSync(path.join(ROOT, "scripts/e2e-dir-picker.js"), "utf8"),
+  });
+  const walkRel = (dir, base, out = []) => {
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(".")) continue;
+      const abs = path.join(dir, name);
+      if (fs.statSync(abs).isDirectory()) walkRel(abs, base, out);
+      else out.push(path.relative(base, abs).split(path.sep).join("/"));
+    }
+    return out;
+  };
+  const beachFiles = walkRel(path.join(lib, FIXTURE), path.join(lib, FIXTURE));
   const ev = (expr, timeoutMs = 60000) => session.evaluate(expr, { awaitPromise: true, timeoutMs });
   const waitFor = (expr, timeoutMs = 60000) => session.waitFor(expr, { timeoutMs });
 
@@ -166,7 +179,11 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   // ════════════════════════════════════════════════════════════════════════
   // 打开编辑器页（松散形态）
   // ════════════════════════════════════════════════════════════════════════
-  await cdp.send("Page.navigate", { url: `${origin}/editor/index.html?item=${FIXTURE}` });
+  const editorReady = `(document.querySelector('#ed-empty .ed-empty-hint')?.textContent || '').length > 8`;
+  await cdp.send("Page.navigate", { url: `${origin}/editor/index.html` });
+  await waitFor(editorReady, 90000);
+  await ev(`(() => { window.__e2eMode = 'seed'; window.__e2eSeed = ${JSON.stringify({ base: `${origin}/media/dev/${FIXTURE}/`, paths: beachFiles })}; return true; })()`);
+  await clickSel("#tb-open-dir");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${objects.length}`, 90000);
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
   await waitFor(`${READY}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
@@ -443,8 +460,8 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
 
   // 下载 zip
   const zipDl = await captureDownload(async () => {
-    await clickSel("#tb-save");
-    await clickSel("#save-zip");
+    await clickSel("#tb-pack");
+    await clickSel("#export-zip");
   });
   const zipPath = path.join(tmpRoot, "e2e.zip");
   fs.writeFileSync(zipPath, Buffer.from(zipDl.base64, "base64"));
@@ -453,17 +470,15 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   const zipNames = (ul.stdout || "").trim().split("\n");
   check(ut.status === 0, "下载的 zip 通过 unzip -t");
   check(["scene.json", "project.json", "preview.jpg"].every((n) => zipNames.includes(n)) && zipNames.some((n) => n.startsWith("materials/")), `zip 内含入口 / 工程 / 封面 / 资源（${zipNames.length} 个）`);
-  await waitFor(`!document.querySelector('#tb-save').disabled`);
+  await waitFor(`!document.querySelector('#tb-pack').disabled`);
 
-  // 另存到壁纸库
-  const libBefore = new Set(fs.readdirSync(lib));
+  // 自动保存进项目文件夹（⌘S 立刻再写一次）
   let sc = await savedCount();
-  await clickSel("#tb-save");
-  check(await ev(`!document.querySelector('#save-lib').hidden`), "壁纸库可用时显示「另存到壁纸库」");
-  await clickSel("#save-lib");
+  await key("s", MOD.meta);
   await waitSaved(sc);
-  const saved = fs.readdirSync(lib).filter((n) => !libBefore.has(n));
-  check(saved.length === 1 && /^editor-/.test(saved[0]), `新库条目（${saved[0]}）`);
+  const savedId = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+  const saved = [savedId];
+  check(typeof savedId === "string" && /^editor-/.test(savedId), `项目文件夹（${savedId}）`);
   const itemDir = path.join(lib, saved[0]);
   const sScene = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
   const sProject = JSON.parse(fs.readFileSync(path.join(itemDir, "project.json"), "utf8"));
@@ -476,8 +491,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   check(sProject.type === "scene" && sProject.file === "scene.json" && sProject.preview === "preview.jpg", "project.json 指向文档与新封面");
   const jpg = fs.readFileSync(path.join(itemDir, "preview.jpg"));
   check(jpg[0] === 0xff && jpg[1] === 0xd8 && jpg.length > 2000, `封面是有效 JPEG（${(jpg.length / 1024).toFixed(0)} KB）`);
-  check(!(await dirtyTitle()), "保存后脏标记清除");
-  check(await ev(`[...document.querySelectorAll('#ed-lib-list li .sub')].some((s) => s.textContent.includes(${JSON.stringify(saved[0])}))`), "保存后库列表刷新出新条目");
+  check(!(await dirtyTitle()) && /已保存|Saved/.test(await ev(`document.querySelector('#st-save').textContent`)), "保存后脏标记清除，状态栏显示已保存");
 
   // ⌘S：重复上次目标，覆盖同一条目
   await click(await rowCenter(copyName));
@@ -487,15 +501,18 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   sc = await savedCount();
   await key("s", MOD.meta);
   await waitSaved(sc);
-  const afterCmdS = fs.readdirSync(lib).filter((n) => !libBefore.has(n));
+  const afterCmdS = fs.readdirSync(lib).filter((n) => /^editor-/.test(n));
   const sScene2 = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
-  check(afterCmdS.length === 1 && sScene2.objects.length === n0, "⌘S 覆盖同一库条目（不新建）");
+  check(afterCmdS.includes(saved[0]) && (await ev(`sessionStorage.getItem('wwgl-e2e-project')`)) === saved[0] && sScene2.objects.length === n0, "⌘S 覆盖同一项目文件夹（不新建）");
 
   const errs1 = await errorLines();
   check(errs1.length === 0, `编辑全程控制台无错误${errs1.length ? `：${errs1.slice(0, 2).join(" / ")}` : ""}`);
 
   // 重新打开保存产物
-  await cdp.send("Page.navigate", { url: `${origin}/editor/index.html?item=${saved[0]}` });
+  await cdp.send("Page.navigate", { url: `${origin}/editor/index.html` });
+  await waitFor(editorReady, 90000);
+  await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(saved[0])}; return true; })()`);
+  await clickSel("#tb-open-dir");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${n0}`, 90000);
   await waitFor(`${READY}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   check(JSON.stringify(await treeNames()) === JSON.stringify(sScene2.objects.map((o) => o.name)), "重新打开：图层树与盘上 scene.json 一致");
@@ -508,7 +525,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/reopened.jpg`);
 
-  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
+  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
 
   await session.close();
   await server.close();
@@ -548,7 +565,7 @@ export function stripePng(w, h, top, bottom) {
  * 不读编辑器页任何内部状态。
  */
 async function runCreateAndDraft(ctx) {
-  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, helpers: h, objects } = ctx;
+  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, helpers: h, objects } = ctx;
   const RED = [220, 30, 30];
   const BLUE = [30, 30, 220];
   const BG = "#336699";
@@ -581,7 +598,22 @@ async function runCreateAndDraft(ctx) {
   const EDITOR = `${origin}/editor/index.html`;
   const gotoEditor = async (query = "") => {
     await cdp.send("Page.navigate", { url: `${EDITOR}${query}` });
-    await waitFor(`document.readyState === 'complete' && !!document.querySelector('#ed-lib-list li')`, 90000);
+    await waitFor(`(document.querySelector('#ed-empty .ed-empty-hint')?.textContent || '').length > 8`, 90000);
+  };
+  /** 再打开某个已经自动保存过的项目文件夹（不靠 ?item=） */
+  const reopen = async (id, query = "") => {
+    await gotoEditor(query);
+    await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(id)}; return true; })()`);
+    await clickSel("#tb-open-dir");
+  };
+  /** ⌘S 立刻写入当前项目文件夹，返回条目 id */
+  const saveLoose = async () => {
+    const sc = await h.savedCount();
+    await key("s", MOD.meta);
+    await h.waitSaved(sc);
+    const id = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+    check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(path.join(lib, id, "scene.json")), `项目写入文件夹（${id}）`);
+    return id;
   };
   /** 编辑器画布上世界坐标（y 朝上）→ 页面坐标；场景 16:9 与舞台同比例 */
   const worldToPage = (cr, [wx, wy], W = 1920, H = 1080) => {
@@ -603,7 +635,7 @@ async function runCreateAndDraft(ctx) {
   };
 
   // ════════════════════════════════════════════════════════════════════════
-  section("Q. 新建端到端（模板 → 图片层 → 存库 → 编辑器与测试台播放）");
+  section("Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）");
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
   await gotoEditor();
@@ -621,7 +653,7 @@ async function runCreateAndDraft(ctx) {
   check(/未命名|Untitled/.test(await ev(`document.querySelector('#ed-doc-title').textContent`)) && !(await h.dirtyTitle()), "标题 = 未命名壁纸，新建即干净（无脏标记）");
   const bg0 = await pixelAt(worldToPage(cr, [960, 540]));
   check(close(bg0, BG_RGB, 10), `画面 = 所选背景色（期望 ${BG_RGB}，实得 ${bg0}）`);
-  check(!(await ev(`document.querySelector('#ly-add').disabled`)) && !(await ev(`document.querySelector('#tb-save').disabled`)), "新建后「添加图片」「保存」可用");
+  check(!(await ev(`document.querySelector('#ly-add').disabled`)) && !(await ev(`document.querySelector('#tb-pack').disabled`)), "新建后「添加图片」「导出」可用");
 
   // 选图加层：400×200，上红下蓝，放在中心、不缩放
   await addImage(stripePath);
@@ -663,14 +695,7 @@ async function runCreateAndDraft(ctx) {
   cTop = await pixelAt(topPt);
   check(isGreen(cMid) && isRed(cTop), `新层盖在上面，旧层未被遮住的部分照常显示（中 ${cMid} / 旁 ${cTop}）`);
 
-  // 存进库
-  const libBefore = new Set(fs.readdirSync(lib));
-  let sc = await h.savedCount();
-  await clickSel("#tb-save");
-  await clickSel("#save-lib");
-  await h.waitSaved(sc);
-  const saved = fs.readdirSync(lib).filter((n) => !libBefore.has(n));
-  check(saved.length === 1, `另存到壁纸库：新条目 ${saved[0]}`);
+  const saved = [await saveLoose()];
   const dir = path.join(lib, saved[0]);
   const scene = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
   check(scene.general.clearcolor === "0.200 0.400 0.600" && scene.objects.length === 2, "盘上 scene.json：背景色 + 两个图片层");
@@ -684,7 +709,7 @@ async function runCreateAndDraft(ctx) {
   check(errsQ.length === 0, `新建全程控制台无错误${errsQ.length ? `：${errsQ.slice(0, 2).join(" / ")}` : ""}`);
 
   // 编辑器重新打开
-  await gotoEditor(`?item=${saved[0]}`);
+  await reopen(saved[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(`${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await new Promise((r) => setTimeout(r, 400));
@@ -726,59 +751,43 @@ async function runCreateAndDraft(ctx) {
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
 
   // ════════════════════════════════════════════════════════════════════════
-  section("R. 草稿（IndexedDB）");
-  // 新建来源：加图后刷新 → 恢复
+  section("R. 项目自动保存（刷新不靠草稿；再打开文件夹图层还在）");
   await gotoEditor();
-  check(!(await bannerShown()), "保存过后再打开：没有草稿横幅");
+  check(!(await bannerShown()), "打开编辑器没有草稿横幅");
+  {
+    const rcE = await h.readyCount();
+    await clickSel("#tb-open-dir");
+    await h.waitRemount(rcE);
+    check((await h.treeNames()).length === 0 && /1920×1080/.test(await ev(`document.querySelector('#st-res').textContent`)), "「打开项目」选空文件夹：在里面新建空白项目");
+    const idE = await saveLoose();
+    check(fs.existsSync(path.join(lib, idE, "project.json")), "空文件夹项目写出 scene.json / project.json");
+    await gotoEditor();
+  }
   await newBlank("#202020");
   await addImage(stripePath);
-  await new Promise((r) => setTimeout(r, 1500));
+  const idR = await saveLoose();
+  check(!(await h.dirtyTitle()) && !(await bannerShown()), "写入文件夹后脏标记清除，仍然没有草稿横幅");
   await gotoEditor();
-  await waitFor(`!document.querySelector('#ed-draft').hidden`, 20000);
-  check(/未命名|Untitled/.test(await ev(`document.querySelector('#ed-draft-text').textContent`)), "刷新后出现草稿横幅（标题正确）");
-  let rc2 = await h.readyCount();
-  await clickSel("#draft-restore");
-  await h.waitRemount(rc2);
-  check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && (await h.dirtyTitle()), "恢复新建草稿：图层回来、标记为未保存");
+  await new Promise((r) => setTimeout(r, 400));
+  check(!(await bannerShown()), "刷新后没有草稿横幅");
+  await reopen(idR);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
   const cr3 = await h.canvasRect();
-  check(isRed(await pixelAt(worldToPage(cr3, [1110, 590]))) && close(await pixelAt(worldToPage(cr3, [200, 200])), [0x20, 0x20, 0x20], 10), "恢复后画面一致（图片字节从草稿里来，背景色保留）");
-  check(!(await bannerShown()), "恢复后横幅收起");
-
-  // 丢弃
-  await gotoEditor();
-  await waitFor(`!document.querySelector('#ed-draft').hidden`, 20000);
-  await clickSel("#draft-discard");
-  check(!(await bannerShown()), "点丢弃：横幅收起");
-  await gotoEditor();
-  await new Promise((r) => setTimeout(r, 1500));
-  check(!(await bannerShown()), "丢弃后刷新：不再提示");
-
-  // 库来源：热改后刷新 → 恢复 → 保存后清除
-  await gotoEditor(`?item=${FIXTURE}`);
-  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${objects.length}`, 90000);
-  await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
-  const topName = objects[objects.length - 1].name;
-  await click(await h.rowCenter(topName));
+  check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && !(await h.dirtyTitle()), "再打开项目文件夹：图层还在，已是保存态");
+  check(isRed(await pixelAt(worldToPage(cr3, [1110, 590]))) && close(await pixelAt(worldToPage(cr3, [200, 200])), [0x20, 0x20, 0x20], 10), "再打开后画面一致（图片与背景色都在文件夹里）");
+  await click(await h.rowCenter("stripe"));
   await h.setInputs({ 0: 777, 1: 333 });
-  await new Promise((r) => setTimeout(r, 1500));
-  await gotoEditor(`?item=${FIXTURE}`);
-  await waitFor(`!document.querySelector('#ed-draft').hidden`, 20000);
+  const idR2 = await saveLoose();
+  check(idR2 === idR, "继续编辑仍写回同一文件夹");
+  await reopen(idR);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
-  rc2 = await h.readyCount();
-  await clickSel("#draft-restore");
-  await h.waitRemount(rc2);
-  await click(await h.rowCenter(topName));
-  v = await h.numInputs();
-  check(near(v[0], 777, 1e-6) && near(v[1], 333, 1e-6) && (await h.dirtyTitle()), `恢复库来源草稿：热改回来（origin ${v[0]},${v[1]}）`);
-  sc = await h.savedCount();
-  await key("s", MOD.meta);
-  await clickSel("#save-lib");
-  await h.waitSaved(sc);
-  await gotoEditor();
-  await new Promise((r) => setTimeout(r, 1500));
-  check(!(await bannerShown()), "保存后草稿被清除（刷新不再提示）");
+  await click(await h.rowCenter("stripe"));
+  const vR = await h.numInputs();
+  check(near(vR[0], 777, 1e-6) && near(vR[1], 333, 1e-6), `再打开读到刚保存的变换（origin ${vR[0]},${vR[1]}）`);
   const errsR = await h.errorLines();
-  check(errsR.length === 0, `草稿流程无错误${errsR.length ? `：${errsR.slice(0, 2).join(" / ")}` : ""}`);
+  check(errsR.length === 0, `自动保存流程无错误${errsR.length ? `：${errsR.slice(0, 2).join(" / ")}` : ""}`);
 
   // ════════════════════════════════════════════════════════════════════════
   section("T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）");
@@ -849,13 +858,7 @@ async function runCreateAndDraft(ctx) {
   const editorTop = await pixelAt(tTop);
   const editorBot = await pixelAt(tBot);
 
-  const libBeforeT = new Set(fs.readdirSync(lib));
-  let scT = await h.savedCount();
-  await clickSel("#tb-save");
-  await clickSel("#save-lib");
-  await h.waitSaved(scT);
-  const savedT = fs.readdirSync(lib).filter((n) => !libBeforeT.has(n));
-  check(savedT.length === 1, `另存到壁纸库：新条目 ${savedT[0]}`);
+  const savedT = [await saveLoose()];
   const dirT = path.join(lib, savedT[0]);
   const sceneT = JSON.parse(fs.readFileSync(path.join(dirT, "scene.json"), "utf8"));
   const effs = sceneT.objects[0]?.effects ?? [];
@@ -867,7 +870,7 @@ async function runCreateAndDraft(ctx) {
   const errsT = await h.errorLines();
   check(errsT.length === 0, `效果编辑全程控制台无错误${errsT.length ? `：${errsT.slice(0, 2).join(" / ")}` : ""}`);
 
-  await gotoEditor(`?item=${savedT[0]}`);
+  await reopen(savedT[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(`${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await click(await h.rowCenter("stripe"));
@@ -966,12 +969,7 @@ async function runCreateAndDraft(ctx) {
   check(close(half, halfWant, 14), `return 0.5：半透明叠在背景上（期望 ≈${halfWant}，实得 ${half}）`);
   check(await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').hidden`), "重挂后旧错误清空（登记表随装配重建）");
 
-  const libBeforeU = new Set(fs.readdirSync(lib));
-  const scU = await h.savedCount();
-  await clickSel("#tb-save");
-  await clickSel("#save-lib");
-  await h.waitSaved(scU);
-  const savedU = fs.readdirSync(lib).filter((n) => !libBeforeU.has(n));
+  const savedU = [await saveLoose()];
   const sceneU = JSON.parse(fs.readFileSync(path.join(lib, savedU[0], "scene.json"), "utf8"));
   const alphaU = sceneU.objects.find((o) => o.name === "stripe")?.alpha;
   check(alphaU && /return 0\.5;/.test(alphaU.script) && alphaU.value === 1, `盘上 scene.json：alpha 包装为 {script, value: 1}（${JSON.stringify(alphaU)?.slice(0, 60)}）`);
@@ -1083,12 +1081,7 @@ async function runCreateAndDraft(ctx) {
   const editorV = await pixelAt(vTop);
   check(isRed(editorV), "重做删除");
 
-  const libBeforeV = new Set(fs.readdirSync(lib));
-  const scV = await h.savedCount();
-  await clickSel("#tb-save");
-  await clickSel("#save-lib");
-  await h.waitSaved(scV);
-  const savedV = fs.readdirSync(lib).filter((n) => !libBeforeV.has(n));
+  const savedV = [await saveLoose()];
   const sceneV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "scene.json"), "utf8"));
   const projV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "project.json"), "utf8"));
   const stripeV = sceneV.objects.find((o) => o.name === "stripe");
@@ -1112,7 +1105,7 @@ async function runCreateAndDraft(ctx) {
   const firstFrame = `${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`;
   const bannerOn = () => ev(`!document.querySelector('#ed-scripts-off').hidden`);
   // U 段存进库的条目：stripe 的 alpha 脚本 `return 0.5`
-  await gotoEditor(`?scripts=off&item=${savedU[0]}`);
+  await reopen(savedU[0], "?scripts=off");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(firstFrame, 90000);
   await settle();
@@ -1129,7 +1122,7 @@ async function runCreateAndDraft(ctx) {
   const allowed = await pixelAt(wTop);
   check(close(allowed, half, 14) && !(await bannerOn()), `「仍然执行」：原地重挂，脚本生效（半透明 ${allowed}），提示收起`);
 
-  await gotoEditor(`?item=${savedU[0]}`);
+  await reopen(savedU[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(firstFrame, 90000);
   await settle();
@@ -1163,22 +1156,26 @@ async function runCreateAndDraft(ctx) {
   const xBot = await pixelAt(worldToPage(crX, [1110, 490]));
   check(close(xTop, tintWant, 6), `编辑器：红色图层叠上缺省橙色 50%（期望 ${tintWant}，实得 ${xTop}）`);
 
-  const libBeforeX = new Set(fs.readdirSync(lib));
-  const scX = await h.savedCount();
-  await clickSel("#tb-save");
-  check(await ev(`!document.querySelector('#save-menu').hidden && document.querySelector('#save-pkg').checked === false`), "保存菜单有「WE 原生格式」勾选，缺省不勾（默认仍是松散工程）");
-  await clickSel("#save-pkg");
-  check(await ev(`document.querySelector('#save-pkg').checked && !document.querySelector('#save-menu').hidden`), "勾选后菜单不收起");
-  await clickSel("#save-lib");
-  await h.waitSaved(scX);
-  const savedX = fs.readdirSync(lib).filter((n) => !libBeforeX.has(n));
-  check(savedX.length === 1, `另存到壁纸库：新条目 ${savedX[0]}`);
-  const dirX = path.join(lib, savedX[0]);
-  const filesX = fs.readdirSync(dirX).filter((n) => !n.startsWith(".")).sort();
-  check(JSON.stringify(filesX) === JSON.stringify(["preview.jpg", "project.json", "scene.pkg"]), `盘上 = project.json + scene.pkg + 封面，无散装资源（${JSON.stringify(filesX)}）`);
-  const projX = JSON.parse(fs.readFileSync(path.join(dirX, "project.json"), "utf8"));
+  const idX = await saveLoose();
+  const dirLoose = path.join(lib, idX);
+  check(fs.existsSync(path.join(dirLoose, "scene.json")) && fs.existsSync(path.join(dirLoose, "materials/editor/stripe.png")) && !fs.existsSync(path.join(dirLoose, "scene.pkg")), "项目文件夹保持松散文件，不含 scene.pkg");
+  const pkgDl = await captureDownload(async () => {
+    await clickSel("#tb-pack");
+    await clickSel("#export-pkg");
+  });
+  check(/-pkg\.zip$/.test(pkgDl.name), `打包导出是 zip 下载（${pkgDl.name}）`);
+  const pkgZip = path.join(tmpRoot, "e2e-pkg.zip");
+  fs.writeFileSync(pkgZip, Buffer.from(pkgDl.base64, "base64"));
+  const pkgOut = path.join(tmpRoot, "e2e-pkg-out");
+  fs.rmSync(pkgOut, { recursive: true, force: true });
+  fs.mkdirSync(pkgOut, { recursive: true });
+  const uzX = spawnSync("unzip", ["-o", pkgZip, "-d", pkgOut], { encoding: "utf8" });
+  check(uzX.status === 0, "打包 zip 能解开");
+  const filesX = fs.readdirSync(pkgOut).filter((n) => !n.startsWith(".")).sort();
+  check(JSON.stringify(filesX) === JSON.stringify(["preview.jpg", "project.json", "scene.pkg"]), `压缩包内 = project.json + scene.pkg + 封面，无散装资源（${JSON.stringify(filesX)}）`);
+  const projX = JSON.parse(fs.readFileSync(path.join(pkgOut, "project.json"), "utf8"));
   check(projX.file === "scene.json" && projX.type === "scene", "project.json：file 指包内 scene.json");
-  const pkX = parsePkg(new Uint8Array(fs.readFileSync(path.join(dirX, "scene.pkg"))));
+  const pkX = parsePkg(new Uint8Array(fs.readFileSync(path.join(pkgOut, "scene.pkg"))));
   const namesX = pkX.entries.map((e) => e.name);
   check(namesX.includes("scene.json") && namesX.includes("materials/editor/stripe.tex") && !namesX.some((n) => /\.(png|jpe?g)$/i.test(n)) && namesX.includes("shaders/effects/wwgl_tint.frag"), `包内：入口 + .tex 贴图 + 效果四件，无源图（${namesX.length} 项）`);
   const texX = decodeMip0(parseTex(getEntry(pkX, "materials/editor/stripe.tex")));
@@ -1187,8 +1184,11 @@ async function runCreateAndDraft(ctx) {
   const errsX = await h.errorLines();
   check(errsX.length === 0, `导出全程无错误${errsX.length ? `：${errsX.slice(0, 2).join(" / ")}` : ""}`);
 
+  const playId = "editor-e2e-pkgplay";
+  fs.rmSync(path.join(lib, playId), { recursive: true, force: true });
+  fs.cpSync(pkgOut, path.join(lib, playId), { recursive: true });
   await cdp.send("Page.navigate", {
-    url: `${origin}/renderer/index.html?type=scene&src=${savedX[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+    url: `${origin}/renderer/index.html?type=scene&src=${playId}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
@@ -1200,7 +1200,9 @@ async function runCreateAndDraft(ctx) {
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/pkg-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/pkg-in-bench.jpg`);
 
-  await gotoEditor(`?item=${savedX[0]}`);
+  await gotoEditor();
+  await ev(`(() => { window.__e2eMode = 'seed'; window.__e2eSeed = ${JSON.stringify({ base: `${origin}/media/dev/${playId}/`, paths: ["preview.jpg", "project.json", "scene.pkg"] })}; return true; })()`);
+  await clickSel("#tb-open-dir");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(firstFrame, 90000);
   await settle();
@@ -1311,14 +1313,7 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(r1);
   check((await h.treeNames()).length === 2, "重做：时钟回来");
 
-  const libBeforeY = new Set(fs.readdirSync(lib));
-  const scY = await h.savedCount();
-  await clickSel("#tb-save");
-  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
-  await clickSel("#save-lib");
-  await h.waitSaved(scY);
-  const savedY = fs.readdirSync(lib).filter((n) => !libBeforeY.has(n));
-  check(savedY.length === 1, `另存到壁纸库：新条目 ${savedY[0]}`);
+  const savedY = [await saveLoose()];
   const dirY = path.join(lib, savedY[0]);
   const sceneY = JSON.parse(fs.readFileSync(path.join(dirY, "scene.json"), "utf8"));
   const [tPlain, tClock] = sceneY.objects;
@@ -1331,7 +1326,7 @@ async function runCreateAndDraft(ctx) {
   const errsY = await h.errorLines();
   check(errsY.length === 0, `文字层编辑全程无错误${errsY.length ? `：${errsY.slice(0, 2).join(" / ")}` : ""}`);
 
-  await gotoEditor(`?item=${savedY[0]}`);
+  await reopen(savedY[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(firstFrame, 90000);
   await new Promise((r) => setTimeout(r, 800));
@@ -1420,14 +1415,7 @@ async function runCreateAndDraft(ctx) {
   const errsZ = await h.errorLines();
   check(errsZ.length === 0, `粒子层编辑全程无错误${errsZ.length ? `：${errsZ.slice(0, 2).join(" / ")}` : ""}`);
 
-  const libBeforeZ = new Set(fs.readdirSync(lib));
-  const scZ = await h.savedCount();
-  await clickSel("#tb-save");
-  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
-  await clickSel("#save-lib");
-  await h.waitSaved(scZ);
-  const savedZ = fs.readdirSync(lib).filter((n) => !libBeforeZ.has(n));
-  check(savedZ.length === 1, `另存到壁纸库：新条目 ${savedZ[0]}`);
+  const savedZ = [await saveLoose()];
   const dirZ = path.join(lib, savedZ[0]);
   const sceneZ = JSON.parse(fs.readFileSync(path.join(dirZ, "scene.json"), "utf8"));
   const [zSnow, zEmbers] = sceneZ.objects;
@@ -1515,14 +1503,7 @@ async function runCreateAndDraft(ctx) {
   const errsAA = await h.errorLines();
   check(errsAA.length === 0, `声音层编辑全程无错误${errsAA.length ? `：${errsAA.slice(0, 2).join(" / ")}` : ""}`);
 
-  const libBeforeAA = new Set(fs.readdirSync(lib));
-  const scAA = await h.savedCount();
-  await clickSel("#tb-save");
-  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
-  await clickSel("#save-lib");
-  await h.waitSaved(scAA);
-  const savedAA = fs.readdirSync(lib).filter((n) => !libBeforeAA.has(n));
-  check(savedAA.length === 1, `另存到壁纸库：新条目 ${savedAA[0]}`);
+  const savedAA = [await saveLoose()];
   const dirAA = path.join(lib, savedAA[0]);
   const sceneAA = JSON.parse(fs.readFileSync(path.join(dirAA, "scene.json"), "utf8"));
   const sAA = sceneAA.objects[0];
@@ -1570,7 +1551,7 @@ async function runCreateAndDraft(ctx) {
   const abW = sizeOf(ao)[0] / 2;
   const origin0 = ao.origin;
   check(await ev(`document.querySelectorAll('.ed-anim [data-anim-on]').length === 5 && [...document.querySelectorAll('.ed-anim [data-anim-on]')].every((c) => !c.checked)`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色五个开关，缺省全关");
-  if (!(await ev(`document.querySelector('#tb-play .ic-play').hidden === false`))) await clickSel("#tb-play");
+  if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
   await seekTo(0);
 
   await animOn("origin", true);
@@ -1680,14 +1661,7 @@ async function runCreateAndDraft(ctx) {
   const errsAB = (await h.errorLines()).filter((l) => !/时长不能短于|shorter than the last/.test(l));
   check(errsAB.length === 0, `关键帧编辑全程无错误${errsAB.length ? `：${errsAB.slice(0, 2).join(" / ")}` : ""}`);
 
-  const libBeforeAB = new Set(fs.readdirSync(lib));
-  const scAB = await h.savedCount();
-  await clickSel("#tb-save");
-  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
-  await clickSel("#save-lib");
-  await h.waitSaved(scAB);
-  const savedAB = fs.readdirSync(lib).filter((n) => !libBeforeAB.has(n));
-  check(savedAB.length === 1, `另存到壁纸库：新条目 ${savedAB[0]}`);
+  const savedAB = [await saveLoose()];
   const oAB = JSON.parse(fs.readFileSync(path.join(lib, savedAB[0], "scene.json"), "utf8")).objects[0];
   check(json(oAB.origin.animation.options) === json({ fps: 30, length: 120, mode: "mirror", wraploop: false }) && json(keysOf(oAB)) === json([[0, 960], [60, 1260]]), "盘上 scene.json：WE 原生动画格式、关键帧齐全");
   check(oAB.color?.animation?.c0?.length === 2 && typeof oAB.color.value === "string", "盘上 scene.json：颜色动画也按 WE 格式落盘");
@@ -1774,25 +1748,19 @@ async function runCreateAndDraft(ctx) {
   await clickRow(id1);
   await click(await h.rowButton((await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"] .ed-node-name').textContent`)), ".ed-lock"));
   await settle();
-  check((await rawObj()).locktransforms === true && (await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)) && (await h.dirtyTitle()), "锁定：写进文档 locktransforms = true，标记未保存");
+  check((await rawObj()).locktransforms === true && (await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)), "锁定：写进文档 locktransforms = true");
   rd = await dragRow(id1, gid, 0.5);
   await settle();
   check((await h.readyCount()) === rd && (await depthOf())[id1] === 0, "锁定的层拖不动");
   const errsAD = await h.errorLines();
   check(errsAD.length === 0, `图层树编辑全程无错误${errsAD.length ? `：${errsAD.slice(0, 2).join(" / ")}` : ""}`);
 
-  const libBeforeAD = new Set(fs.readdirSync(lib));
-  const scAD = await h.savedCount();
-  await clickSel("#tb-save");
-  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
-  await clickSel("#save-lib");
-  await h.waitSaved(scAD);
-  const savedAD = fs.readdirSync(lib).filter((n) => !libBeforeAD.has(n));
+  const savedAD = [await saveLoose()];
   const objsAD = JSON.parse(fs.readFileSync(path.join(lib, savedAD[0], "scene.json"), "utf8")).objects;
   const by = (id) => objsAD.find((o) => String(o.id) === id);
   check(savedAD.length === 1 && by(id1).locktransforms === true && String(by(id2).parent) === gid && !("parent" in by(id1)) && !by(gid).image && json(objsAD.map((o) => String(o.id))) === json([id1, gid, id2]), `盘上 scene.json：锁定字段、父子关系、组对象、绘制顺序都在（${savedAD[0]}）`);
 
-  await gotoEditor(`?item=${savedAD[0]}`);
+  await reopen(savedAD[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 3`, 90000);
   await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await settle();
@@ -2025,6 +1993,7 @@ async function runCreateAndDraft(ctx) {
   await fxSet(0, "speed", "1");
   await fxSet(0, "width", "0.3");
   await fxSet(0, "strength", "2");
+  if (!(await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`))) await clickSel("#tb-play");
   const greens = [];
   for (let i = 0; i < 12; i++) {
     greens.push((await pixelAt(worldToPage(await h.canvasRect(), [960, 590])))[1]);
@@ -2053,7 +2022,7 @@ async function runCreateAndDraft(ctx) {
   const lanes = () => ev(`document.querySelector('#tl-lanes').hidden ? null : [...document.querySelectorAll('#tl-lanes .tl-lane')].map((r) => ({ id: r.dataset.id, keys: [...r.querySelectorAll('.tl-lane-key')].map((k) => Number(k.dataset.t)), repeat: !!r.querySelector('.tl-lane-bar.is-repeat'), sel: r.classList.contains('selected') }))`);
   check((await lanes()) === null, "没有动画层：动画条区隐藏");
   await clickRow(hA);
-  if (!(await ev(`document.querySelector('#tb-play .ic-play').hidden === false`))) await clickSel("#tb-play");
+  if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
   await seekTo(0);
   await animOn("origin", true);
   let ln = await lanes();
@@ -2123,7 +2092,7 @@ async function runCreateAndDraft(ctx) {
   check((await conHas(/上下文丢失，正在按当前文档重建|lost its WebGL context/)) === 1, "控制台记一条「上下文丢失，正在重建」");
   check(await ev(`(() => { const cs = document.querySelectorAll('#ed-stage canvas[data-webwallgl]'); return cs.length === 1 && cs[0].dataset.probe !== 'old'; })()`), "换了一块新画布（旧的死画布已移除）");
   const ink1 = await inkC();
-  check(ink1 > 0.05 && json(await h.treeNames()) === json(names0) && (await h.dirtyTitle()), `★ 重挂后画面恢复（墨水 ${ink1.toFixed(3)}），图层与未保存状态都在`);
+  check(ink1 > 0.05 && json(await h.treeNames()) === json(names0), `★ 重挂后画面恢复（墨水 ${ink1.toFixed(3)}），图层还在`);
   check(Math.abs((await h.numInputs())[0] - 600) < 0.5, "检视器里的编辑值仍在（x = 600）");
   for (let i = 0; i < 2; i++) {
     rCtx = await h.readyCount();
@@ -2142,4 +2111,134 @@ async function runCreateAndDraft(ctx) {
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   check((await inkC()) > 0.05, "手动「重新加载」：画面回来");
   await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AJ. 视频（页面现录测试视频 → 以视频为背景 → 存盘 → 测试台 → 视频壁纸工程裁剪 / 撤销 / 存盘 / 转场景 → 场景录制为视频）");
+  await runVideoSection();
+  async function runVideoSection() {
+  await gotoEditor();
+  // 用编辑器自己的 recordVideo 现录 2 秒 320×180：上红下蓝，白块从左往右走
+  const gen = await ev(`(async () => {
+    const m = await import('/editor/video.ts');
+    const c = new OffscreenCanvas(320, 180); const g = c.getContext('2d');
+    const out = await m.recordVideo({ width: 320, height: 180, fps: 30, duration: 2, frameAt: async (t) => {
+      g.fillStyle = 'rgb(220,30,30)'; g.fillRect(0, 0, 320, 90);
+      g.fillStyle = 'rgb(30,30,220)'; g.fillRect(0, 90, 320, 90);
+      g.fillStyle = '#fff'; g.fillRect((t / 2) * 300, 80, 20, 20);
+      return c;
+    } });
+    const u = new Uint8Array(await out.blob.arrayBuffer()); let s = '';
+    for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+    return { ext: out.ext, frames: out.frames, base64: btoa(s) };
+  })()`, 120000);
+  if (gen.ext !== "mp4") {
+    console.log(`  · 无头浏览器不能编码 H.264（得到 ${gen.ext}），跳过视频端到端`);
+    return;
+  }
+  const clipPath = path.join(tmpRoot, "clip.mp4");
+  const clipBytes = Buffer.from(gen.base64, "base64");
+  fs.writeFileSync(clipPath, clipBytes);
+  check(gen.frames === 60 && clipBytes.readUInt32BE(4) === 0x66747970, `recordVideo 现录测试视频：60 帧 H.264 mp4（${clipBytes.length} 字节）`);
+
+  const pixelUntil = async (pt, pred, ms = 6000) => {
+    const t0 = Date.now();
+    let c = await pixelAt(pt);
+    while (!pred(c) && Date.now() - t0 < ms) {
+      await new Promise((r) => setTimeout(r, 250));
+      c = await pixelAt(pt);
+    }
+    return c;
+  };
+  await clickSel("#tb-new");
+  const rcV = await h.readyCount();
+  await clickSel("#new-video");
+  await setFiles("#in-video", [clipPath]);
+  await h.waitRemount(rcV);
+  check(json(await h.treeNames()) === json(["clip"]) && (await ev(`document.querySelector('#ed-tree .ed-node .ed-kind')?.dataset.kind`)) === "video", "以视频为背景：一层视频层，树里标「视频」");
+  const crV = await h.canvasRect();
+  const vUp = await pixelUntil(worldToPage(crV, [150, 900]), isRed);
+  const vDown = await pixelUntil(worldToPage(crV, [150, 150]), isBlue);
+  check(isRed(vUp) && isBlue(vDown), `视频层铺满场景、引擎真画出视频帧（上 ${vUp} / 下 ${vDown}）`);
+  await click(await h.rowCenter("clip"));
+  check(/video-clip\.mp4/.test(await ev(`document.querySelector('#ed-inspector').textContent`)), "检视器显示视频文件信息");
+  const idV = await saveLoose();
+  const dirV = path.join(lib, idV);
+  check(["models/editor/video-clip.json", "materials/editor/video-clip.json"].every((f) => fs.existsSync(path.join(dirV, f))) && Buffer.compare(fs.readFileSync(path.join(dirV, "materials/editor/video-clip.mp4")), clipBytes) === 0, "盘上视频层三件套，H.264 无音轨的 mp4 原字节保存（不重编码）");
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${idV}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
+  const vpB = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const benchV = { x: 0, y: 0, w: vpB.w, h: vpB.h };
+  const bvUp = await pixelUntil(worldToPage(benchV, [150, 900]), isRed, 10000);
+  const bvDown = await pixelUntil(worldToPage(benchV, [150, 150]), isBlue, 10000);
+  check(isRed(bvUp) && isBlue(bvDown), `测试台渲染页：松散 mp4 包成视频贴图播放（上 ${bvUp} / 下 ${bvDown}）`);
+
+  // 视频壁纸工程
+  await gotoEditor();
+  await clickSel("#tb-new");
+  await clickSel("#new-video-wp");
+  await setFiles("#in-video", [clipPath]);
+  const VREADY = `[...document.querySelectorAll('#ed-con-body > div')].filter((d) => /视频已就绪|Video ready/.test(d.textContent)).length`;
+  await waitFor(`${VREADY} > 0`, 90000);
+  const tlMax = () => ev(`Number(document.querySelector('#tl-range').max)`);
+  check(!!(await ev(`document.querySelector('#ed-stage video[data-webwallgl-video]')`)) && Math.abs((await tlMax()) - 2) < 0.15, `视频壁纸工程：舞台放视频、时间轴长度 = 视频时长（${await tlMax()}s）`);
+  check(/没有图层|no layers/.test(await ev(`document.querySelector('#ed-tree').textContent`)) && (await ev(`document.querySelectorAll('#ed-inspector [data-vp]').length`)) === 6, "图层面板说明无图层；检视器有入点 / 出点 / 清除 / 应用裁剪 / 替换 / 转场景");
+  const vRect = await ev(`(() => { const r = document.querySelector('#ed-stage video').getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })()`);
+  check(isRed(await pixelUntil(worldToPage(vRect, [150, 900]), isRed)) && isBlue(await pixelUntil(worldToPage(vRect, [150, 150]), isBlue)), "视频壁纸预览画面正确");
+  const seekTo = (t) => ev(`(() => { const r = document.querySelector('#tl-range'); r.value = '${t}'; r.dispatchEvent(new Event('input')); r.dispatchEvent(new Event('change')); return true; })()`);
+  await seekTo(0.5);
+  await new Promise((r) => setTimeout(r, 300));
+  await ev(`document.querySelector('#ed-inspector [data-vp=in]').click()`);
+  await seekTo(1.5);
+  await new Promise((r) => setTimeout(r, 300));
+  await ev(`document.querySelector('#ed-inspector [data-vp=out]').click()`);
+  check((await ev(`document.querySelectorAll('#tl-keys .tl-trim').length`)) === 2, "时间轴标出入点 / 出点");
+  let vr = await ev(VREADY);
+  await ev(`document.querySelector('#ed-inspector [data-vp=apply]').click()`);
+  await waitFor(`${VREADY} > ${vr}`, 120000);
+  const trimmed = await tlMax();
+  check(Math.abs(trimmed - 1) < 0.15 && /已裁剪视频|Trimmed video/.test(await ev(`document.querySelector('#ed-con-body').textContent`)), `应用裁剪：重新编码后时长 ≈ 1s（${trimmed}s）`);
+  vr = await ev(VREADY);
+  await key("z", MOD.meta);
+  await waitFor(`${VREADY} > ${vr}`, 60000);
+  check(Math.abs((await tlMax()) - 2) < 0.15, "撤销裁剪：视频回到 2s");
+  vr = await ev(VREADY);
+  await key("z", MOD.meta | MOD.shift);
+  await waitFor(`${VREADY} > ${vr}`, 60000);
+  check(Math.abs((await tlMax()) - 1) < 0.15, "重做裁剪：又是 1s");
+  const scVp = await h.savedCount();
+  await key("s", MOD.meta);
+  await h.waitSaved(scVp);
+  const idVp = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+  const dirVp = path.join(lib, idVp);
+  const pjVp = JSON.parse(fs.readFileSync(path.join(dirVp, "project.json"), "utf8"));
+  check(pjVp.type === "video" && pjVp.file === "clip.mp4" && fs.existsSync(path.join(dirVp, "preview.jpg")) && fs.statSync(path.join(dirVp, "clip.mp4")).size < clipBytes.length, "视频壁纸工程存盘：project.json(type=video) + 裁剪后的 clip.mp4 + 封面");
+  const rcS = await h.readyCount();
+  await ev(`document.querySelector('#ed-inspector [data-vp=to-scene]').click()`);
+  await h.waitRemount(rcS);
+  check(json(await h.treeNames()) === json(["clip"]) && /320×180/.test(await ev(`document.querySelector('#st-res').textContent`)), "转成场景：新场景以视频层铺底，分辨率取视频本身（320×180）");
+  check((await h.errorLines()).length === 0, "视频层 / 视频工程全程无错误");
+
+  // 场景录制为视频
+  await gotoEditor();
+  await newBlank("#202020");
+  await addImage(stripePath);
+  const crR = await h.canvasRect();
+  const topR = worldToPage(crR, [960 + 150, 540 + 50]);
+  await ev(`document.querySelector('#export-video').click()`);
+  check(await ev(`!document.querySelector('#rec-menu').hidden`), "「录制为视频」弹出录制面板");
+  await ev(`(() => { document.querySelector('#rec-duration').value = '0.5'; document.querySelector('#rec-fps').value = '30'; document.querySelector('#rec-res').value = '1280'; return true; })()`);
+  const dl = await captureDownload(() => ev(`document.querySelector('#rec-start').click()`));
+  const probe = await ev(`(async () => {
+    const m = await import('/editor/video.ts');
+    const b = await (await fetch('data:application/octet-stream;base64,${dl.base64}')).blob();
+    return m.probeVideo(b);
+  })()`, 60000);
+  check(/\.mp4$/.test(dl.name) && probe.width === 1280 && probe.height === 720 && Math.abs(probe.duration - 0.5) < 0.1 && probe.codec === "avc", `录制下载 ${dl.name}：1280×720、0.5s、H.264（${json(probe)}）`);
+  await waitFor(`document.querySelector('#rec-menu').hidden`, 10000);
+  check(isRed(await pixelUntil(topR, isRed)) && (await ev(`Number(document.querySelector('#tl-range').value)`)) < 0.05, "录完画面复原到容器尺寸、回到原时刻");
+  check((await h.errorLines()).length === 0, "录制全程无错误");
+  }
 }

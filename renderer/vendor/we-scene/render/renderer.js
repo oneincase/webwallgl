@@ -3366,6 +3366,8 @@ export function createRenderer(canvas, opts = {}) {
   // 改动前的行为（一律返回当前层自己的 inputFBO），用来判定某处画面异常
   // 是本次改动引入的回归、还是改动前就存在。
   let compositeEnabled = true
+  // [we-scene patch 2026-10-07] 上一帧的相机与视图投影（编辑器 getModelMvp 用；绘制不读）
+  let lastFrameMats = null
   function puppetModelMatrix(layer, cam) {
     const base = layerModelMatrix(layer, cam)
     // 2D：scale(sx, -sy) 网格 y-up → 场景 y-down。透视场景本身 Y-up，不再翻 Y。
@@ -3928,6 +3930,7 @@ export function createRenderer(canvas, opts = {}) {
         break
       }
     }
+    lastFrameMats = { cam, viewProj, viewProjPersp }
 
     // [we-scene patch] 把归一化指针换算成世界像素并写回指针源。
     // 必须在这里做（而非宿主侧）：cam 每帧由 buildCamera 构造，只在帧内可得。
@@ -5476,6 +5479,15 @@ export function createRenderer(canvas, opts = {}) {
     // perspective 图层相机眼点（渲染世界坐标），无透视层返回 null。hit-test 用。
     getPerspectiveEye: function () {
       return perspEye
+    },
+    // [we-scene patch 2026-10-07] 编辑器（W15）：模型层按上一帧相机绘制所用的 MVP
+    // （与 drawPuppetDirect 同一套：viewProj[perspective 层换透视 VP] · puppetModelMatrix），
+    // 网格坐标 → 画布 NDC。还没画过一帧返回 null。
+    getModelMvp: function (layer) {
+      const f = lastFrameMats
+      if (!f || !layer) return null
+      const vp = layer.perspective && f.viewProjPersp ? f.viewProjPersp : f.viewProj
+      return mat4Multiply(vp, puppetModelMatrix(layer, f.cam))
     },
     // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
     dispose: function () {

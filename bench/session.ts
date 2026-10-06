@@ -133,11 +133,6 @@ export function openInNewWindow() {
   window.open(rendererUrl(buildQuery(state.selected)), "_blank");
 }
 
-export function openInEditor(itemId = state.selected?.itemId) {
-  if (!itemId) return;
-  window.open(`${import.meta.env.BASE_URL}editor/?item=${encodeURIComponent(itemId)}`, "_blank");
-}
-
 export function release() {
   if (!state.selected && !state.localFile) return;
   wp()?.release();
@@ -161,7 +156,6 @@ pauseBtn.onclick = togglePause;
 $<HTMLButtonElement>("#reload").onclick = () => mount();
 $<HTMLButtonElement>("#release").onclick = release;
 $<HTMLButtonElement>("#open").onclick = openInNewWindow;
-$<HTMLButtonElement>("#open-editor").onclick = () => openInEditor();
 
 function syncTransport() {
   const hasItem = !!state.selected;
@@ -170,7 +164,6 @@ function syncTransport() {
   $<HTMLButtonElement>("#reload").disabled = !hasItem;
   $<HTMLButtonElement>("#release").disabled = !hasAny;
   $<HTMLButtonElement>("#open").disabled = !hasItem;
-  $<HTMLButtonElement>("#open-editor").disabled = !hasItem;
 }
 
 on("open-file", (file) => void openLocalFile(file));

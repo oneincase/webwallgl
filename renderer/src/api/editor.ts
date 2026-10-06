@@ -8,6 +8,7 @@ export * from "./index";
 export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
 export { buildScenePkg } from "../editor/pkg-export";
+export { mdlMeshMaterials, retargetMdlMaterial } from "../editor/mdl-edit";
 export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 export type {
   ScenePkgFile,
@@ -19,7 +20,10 @@ export type {
   EditorLayer,
   EditorLayerKind,
   EditorCaptureOptions,
+  EditorFrameOptions,
   EditorHitTestOptions,
   EditorLayerProps,
   EditorLayerOutline,
+  EditorModelInfo,
+  EditorAttachmentPoint,
 } from "./types";

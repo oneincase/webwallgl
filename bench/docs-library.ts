@@ -1,4 +1,4 @@
-// 播放库使用说明：测试台怎么用 + webwallgl 库（mount / Source / 实例 API …）的接入文档。
+// 播放库使用说明：预览怎么用 + webwallgl 库（mount / Source / 实例 API …）的接入文档。
 // 结构化双语内容，代码块里的注释也随语言切换。
 
 import pkg from "../package.json";
@@ -29,19 +29,19 @@ export const LIBRARY_DOC: DocSection[] = [
         items: [
           { zh: "零运行时依赖，单文件引入（min ESM 约 1075KB / gzip 约 331KB）", en: "Zero runtime dependencies, single-file delivery (min ESM ~1075KB / gzip ~331KB)" },
           { zh: "可 npm 安装，也可 <script> CDN 引入；一页可开多个互不干扰的实例", en: "Installable via npm or a <script> CDN tag; multiple isolated instances per page" },
-          { zh: "测试台本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API", en: "The bench is the library's first consumer — everything you see here is public API" },
+          { zh: "预览本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API", en: "The bench is the library's first consumer — everything you see here is public API" },
         ],
       },
     ],
   },
   {
     id: "bench",
-    title: { zh: "用测试台预览壁纸", en: "Previewing wallpapers in the bench" },
+    title: { zh: "用预览看壁纸", en: "Previewing wallpapers" },
     blocks: [
       {
         k: "p",
         v: {
-          zh: "测试台就是一个基于本库的壁纸播放器：左边选壁纸，中间看画面，右边调参数，底部看日志和帧率。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
+          zh: "预览就是一个基于本库的壁纸播放器：左边选壁纸，中间看画面，右边调参数，底部看日志和帧率。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
           en: "The bench is a wallpaper player built on this library: pick a wallpaper on the left, watch it in the middle, tune it on the right, and read logs and frame rate at the bottom. Run pnpm dev locally and open http://localhost:1430/.",
         },
       },
@@ -52,10 +52,10 @@ export const LIBRARY_DOC: DocSection[] = [
           { zh: "用途", en: "What it does" },
         ],
         rows: [
-          [{ zh: "壁纸库（左）", en: "Library (left)" }, { zh: "列出壁纸库目录里的条目，可按标题 / itemId 过滤、按 Scene / Web / Video 分类；右键可在编辑器中打开、在 Finder 中显示或删除。主工具条的「选择壁纸库」（⌘⇧O）可切换目录", en: "Lists the items in the library folder; filter by title / itemId and by Scene / Web / Video. Right-click to open in the editor, reveal in Finder or delete. \"Pick library\" on the main toolbar (⌘⇧O) switches folders" }],
+          [{ zh: "壁纸库（左）", en: "Library (left)" }, { zh: "列出壁纸库目录里的条目，可按标题 / itemId 过滤、按 Scene / Web / Video 分类；右键可在 Finder 中显示或删除。主工具条的「选择壁纸库」（⌘⇧O）可切换目录", en: "Lists the items in the library folder; filter by title / itemId and by Scene / Web / Video. Right-click to reveal in Finder or delete. \"Pick library\" on the main toolbar (⌘⇧O) switches folders" }],
           [{ zh: "视口（中）", en: "Viewport (center)" }, { zh: "壁纸画面。视口工具条可切分辨率、适配方式、清晰度、滤镜，并提供指针注入、遮挡模拟、统计浮层三个调试开关。把 .pkg 文件直接拖进视口即可本地预览", en: "The wallpaper itself. Its toolbar switches resolution, fit, clarity and filter, and offers three debug toggles: pointer injection, occlusion simulation and a stats overlay. Drop a .pkg file onto the viewport to preview it locally" }],
           [{ zh: "检视器（右）", en: "Inspector (right)" }, { zh: "「壁纸配置」是作者暴露的用户属性，改动即时生效并写回；「渲染设置」是帧率上限、音量、资源倍率、画质档等全局偏好；「信息」显示预览图与元数据", en: "\"Wallpaper settings\" are the author's user properties — changes apply live and are saved; \"Render settings\" are global preferences such as fps cap, volume, resource scale and quality tiers; \"Info\" shows the preview image and metadata" }],
-          [{ zh: "控制台 / 性能（底）", en: "Console / Performance (bottom)" }, { zh: "控制台汇总测试台日志与渲染器诊断，可按级别和关键字过滤；性能页画出最近 2 分钟的实测帧率曲线", en: "The console merges bench logs with renderer diagnostics, filterable by level and keyword; the performance tab plots the measured frame rate over the last 2 minutes" }],
+          [{ zh: "控制台 / 性能（底）", en: "Console / Performance (bottom)" }, { zh: "控制台汇总预览日志与渲染器诊断，可按级别和关键字过滤；性能页画出最近 2 分钟的实测帧率曲线", en: "The console merges bench logs with renderer diagnostics, filterable by level and keyword; the performance tab plots the measured frame rate over the last 2 minutes" }],
           [{ zh: "主工具条 / 状态栏", en: "Main toolbar / status bar" }, { zh: "工具条居中的是暂停 / 重挂载 / 释放；状态栏显示后端连接、条目数、分辨率、DPR、帧率上限与实测帧率", en: "The toolbar centers pause / remount / release; the status bar shows the backend link, item count, resolution, DPR, fps cap and measured fps" }],
         ],
       },
@@ -524,10 +524,10 @@ export const LIBRARY_DOC: DocSection[] = [
         items: [
           { zh: "黑屏且 onError 报 WEBGL2_UNAVAILABLE：环境没有 WebGL2，库不做软件回退", en: "Black screen with WEBGL2_UNAVAILABLE: no WebGL2 in this environment; there is no software fallback" },
           { zh: "HTTP 404 加载失败：确认 httpSource 指向的目录里真的有 scene.pkg（三种布局会依次尝试，全部失败才报错）；源码工程（project.json 的 file 以 .json 结尾）则要确认该 json 与它引用的 materials/、models/、shaders/ 等文件都在同一目录下", en: "HTTP 404: make sure the httpSource directory really contains a scene.pkg (all three layouts are tried before failing); for source projects (project.json's file ends with .json) make sure that json and the materials/, models/, shaders/ … it references all live in that directory" },
-          { zh: "松散工程渲染结果与打包版不一致：先确认形态判定的走向 —— project.json 的 file 以 .json 结尾就走松散、取不到入口才回退 scene.pkg；测试台/调试页加 `?form=pkg` 或 `?form=loose` 可强制单臂做 A/B（诊断里会打出 scene form: …）；本仓 `node scripts/verify-loose.mjs --headless` 会跑两形态的图层指纹与请求对照", en: "Loose project renders differently from the packed build: check which form was chosen — a project.json whose file ends with .json uses the loose form, and only falls back to scene.pkg when the entry is unreachable; add `?form=pkg` or `?form=loose` to force one arm for an A/B (diagnostics print `scene form: …`); `node scripts/verify-loose.mjs --headless` compares layer fingerprints and requests across both forms" },
+          { zh: "松散工程渲染结果与打包版不一致：先确认形态判定的走向 —— project.json 的 file 以 .json 结尾就走松散、取不到入口才回退 scene.pkg；预览/调试页加 `?form=pkg` 或 `?form=loose` 可强制单臂做 A/B（诊断里会打出 scene form: …）；本仓 `node scripts/verify-loose.mjs --headless` 会跑两形态的图层指纹与请求对照", en: "Loose project renders differently from the packed build: check which form was chosen — a project.json whose file ends with .json uses the loose form, and only falls back to scene.pkg when the entry is unreachable; add `?form=pkg` or `?form=loose` to force one arm for an A/B (diagnostics print `scene form: …`); `node scripts/verify-loose.mjs --headless` compares layer fingerprints and requests across both forms" },
           { zh: "Failed to fetch 且无状态码：自定义协议/WKWebView 对缺失路径的行为，属正常容错路径，看最后一条错误即可", en: "Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error" },
           { zh: "stats.fps 为 0 但画面在动：读数是「真正提交渲染」的帧，标签页被遮挡时浏览器会暂停 rAF，属预期", en: "stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected" },
-          { zh: "stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就开测试台视口工具条的「遮挡模拟」：HUD 实时显示档位、ROI 块数/面积（渲染器回报的精确分解）与图层剔除 c/g（分母 = 参与闸门的图层数），外加 tile 口径的覆盖率对照读数（对标 Lively 的 Grid Detection Overlay）。拖动遮挡窗可观察「ROI 面积 ≈ 可见面积」（吞洞会表现为 ROI 面积远超可见）", en: "stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). Use the bench viewport toolbar's \"Occlusion sim\" to reproduce: the HUD shows the band, ROI rect count/area (the renderer's exact decomposition) and layer culling c/g (denominator = layers passing the gate) live, plus a tile-granularity coverage readout for comparison (mirrors Lively's Grid Detection Overlay). Drag the occluder and watch \"ROI area ≈ visible area\" (hole-swallowing would show up as ROI area far exceeding visibility)" },
+          { zh: "stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就开预览视口工具条的「遮挡模拟」：HUD 实时显示档位、ROI 块数/面积（渲染器回报的精确分解）与图层剔除 c/g（分母 = 参与闸门的图层数），外加 tile 口径的覆盖率对照读数（对标 Lively 的 Grid Detection Overlay）。拖动遮挡窗可观察「ROI 面积 ≈ 可见面积」（吞洞会表现为 ROI 面积远超可见）", en: "stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). Use the bench viewport toolbar's \"Occlusion sim\" to reproduce: the HUD shows the band, ROI rect count/area (the renderer's exact decomposition) and layer culling c/g (denominator = layers passing the gate) live, plus a tile-granularity coverage readout for comparison (mirrors Lively's Grid Detection Overlay). Drag the occluder and watch \"ROI area ≈ visible area\" (hole-swallowing would show up as ROI area far exceeding visibility)" },
           { zh: "有声音但延迟起播：自动播放策略要求用户交互后才允许出声，volume 默认 0 正是为此", en: "Audio starts late: autoplay policy requires user interaction before sound; that's why volume defaults to 0" },
           { zh: "网页壁纸无音频/属性：入口 HTML 必须同源或 CORS 可读，库才能改写注入 WE shim；跨域不可读时会退回裸 iframe（无官方 API）。webSandbox: \"strict\" 不属此列：shim 照常注入、API 齐全，只是控制/音频/媒体走 postMessage 通道", en: "Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs). webSandbox: \"strict\" is not this case — the shim is injected and the full API works (control/audio/media travel over postMessage)" },
           { zh: "网页壁纸相对资源 404：依赖 <base href> 指回原站点目录；依赖 location.href 拼路径的壁纸在 blob 加载下可能异常", en: "Web wallpaper relative assets 404: resources rely on <base href> pointing at the original directory; wallpapers that build URLs from location.href may break under blob loading" },
@@ -562,7 +562,7 @@ export const LIBRARY_DOC: DocSection[] = [
             en: "Engine hardening: parse gates on attacker-controlled fields (a few dozen malformed bytes in a .tex can no longer drag the parser into OOM), a GL resource registry (teardown deterministically returns resource counts to zero), context loss turns from a silent freeze into a visible event, instance finality & generation tokens (destroy no longer resurrects, and multi-instance debug surfaces no longer delete each other), plus one-shot diagnostics on four previously silent failure paths.",
           },
           {
-            zh: "松散目录形态：project.json 的 file 以 .json 结尾即按源码工程装载（materials/、models/、shaders/ 等按名取文件），无需打包 scene.pkg；测试台/调试页可加 ?form=pkg 或 ?form=loose 强制单臂做 A/B。",
+            zh: "松散目录形态：project.json 的 file 以 .json 结尾即按源码工程装载（materials/、models/、shaders/ 等按名取文件），无需打包 scene.pkg；预览/调试页可加 ?form=pkg 或 ?form=loose 强制单臂做 A/B。",
             en: "Loose-directory form: a project.json whose file ends with .json loads as a source project (materials/, models/, shaders/ etc. fetched by name) — no scene.pkg packing needed; the bench/debug pages accept ?form=pkg or ?form=loose to force one arm for an A/B.",
           },
           {

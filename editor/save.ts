@@ -52,6 +52,24 @@ export async function collectProject(
   return out;
 }
 
+/** 视频壁纸工程：project.json（type = video）+ 视频本体 + 封面。WE 的视频壁纸不进 pkg */
+export async function collectVideoProject(doc: EditorDoc, preview: Blob | null): Promise<SaveFile[]> {
+  if (!doc.video) throw new Error("没有可保存的视频");
+  const enc = new TextEncoder();
+  const p: Record<string, unknown> = structuredClone(doc.project ?? {});
+  p.title = typeof p.title === "string" && p.title.trim() ? p.title : doc.title;
+  p.type = "video";
+  p.file = doc.video.path;
+  if (preview) p.preview = PREVIEW_NAME;
+  else delete p.preview;
+  delete p.workshopid;
+  delete p.workshopurl;
+  const out: SaveFile[] = [{ path: doc.video.path, data: doc.video.bytes }];
+  if (preview) out.push({ path: PREVIEW_NAME, data: new Uint8Array(await preview.arrayBuffer()) });
+  out.push({ path: "project.json", data: enc.encode(JSON.stringify(p, null, 2)) });
+  return out;
+}
+
 export const SCENE_PKG_NAME = "scene.pkg";
 const OUTSIDE_PKG = new Set(["project.json", PREVIEW_NAME]);
 
@@ -92,24 +110,68 @@ export function downloadZip(files: SaveFile[], name: string): number {
 
 // ---------- 目标二：写入本机文件夹（File System Access API，Chromium） ----------
 
-type DirHandle = {
+type Writable = { write(data: BufferSource | Blob): Promise<void>; close(): Promise<void> };
+
+export type FileHandle = {
+  kind?: string;
+  name?: string;
+  getFile(): Promise<File>;
+  createWritable(): Promise<Writable>;
+};
+
+export type DirHandle = {
   name: string;
+  kind?: string;
   getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<DirHandle>;
-  getFileHandle(name: string, opts?: { create?: boolean }): Promise<{
-    createWritable(): Promise<{ write(data: BufferSource | Blob): Promise<void>; close(): Promise<void> }>;
-  }>;
+  getFileHandle(name: string, opts?: { create?: boolean }): Promise<FileHandle>;
+  entries(): AsyncIterable<[string, DirHandle | FileHandle]>;
+  removeEntry(name: string, opts?: { recursive?: boolean }): Promise<void>;
 };
 
 export const canPickDirectory = () => typeof (window as { showDirectoryPicker?: unknown }).showDirectoryPicker === "function";
 
 export async function pickDirectory(): Promise<DirHandle | null> {
-  const pick = (window as unknown as { showDirectoryPicker(o: { mode: string }): Promise<DirHandle> }).showDirectoryPicker;
+  const w = window as unknown as { showDirectoryPicker(o: { mode: string }): Promise<DirHandle> };
   try {
-    return await pick({ mode: "readwrite" });
+    return await w.showDirectoryPicker({ mode: "readwrite" });
   } catch (e) {
     if ((e as Error).name === "AbortError") return null;
     throw e;
   }
+}
+
+const WRITE_PROBE = ".webwallgl-write-test";
+
+/** 真写一次再删掉：有的浏览器（如内嵌 Electron）给了目录句柄却不给写权限 */
+export async function probeWritable(dir: DirHandle): Promise<void> {
+  const fh = await dir.getFileHandle(WRITE_PROBE, { create: true });
+  const w = await fh.createWritable();
+  await w.write(new Uint8Array([0x6f, 0x6b]));
+  await w.close();
+  await dir.removeEntry(WRITE_PROBE);
+}
+
+/** 把目录句柄读成打开用的文件表（路径相对项目根） */
+export async function filesFromDirectory(root: DirHandle): Promise<Array<{ path: string; file: File }>> {
+  const out: Array<{ path: string; file: File }> = [];
+  const walk = async (dir: DirHandle, prefix: string) => {
+    for await (const [name, handle] of dir.entries()) {
+      const rel = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === "directory") await walk(handle as DirHandle, rel);
+      else if ("getFile" in handle && handle.getFile) out.push({ path: rel, file: await handle.getFile() });
+    }
+  };
+  await walk(root, "");
+  return out;
+}
+
+/** 删掉项目里不再引用、且曾经由编辑器写出的文件 */
+export async function removeProjectFile(root: DirHandle, rel: string): Promise<void> {
+  const parts = rel.split("/").filter(Boolean);
+  if (!parts.length) return;
+  let dir = root;
+  for (const seg of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(seg);
+  await dir.removeEntry(parts[parts.length - 1]);
 }
 
 export async function writeToDirectory(

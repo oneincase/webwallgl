@@ -21,6 +21,11 @@ export type LayerNode = {
   id: number | string;
   name: string;
   kind: LayerKind;
+  /**
+   * 模型形态：mesh = 对象挂 `model: "*.mdl"`（kind 为 model）；puppet = 图片对象引用的 model json 带 `puppet`
+   * （kind 仍为 image —— puppet 在 WE 里就是图片对象，效果 / 颜色绑定等图片能力照旧可用）
+   */
+  modelForm?: "puppet" | "mesh";
   visible: boolean;
   /** 指向 scene.json 原对象（只读使用） */
   obj: SceneObject;
@@ -37,6 +42,10 @@ export type EditorDoc = {
   form: "pkg" | "loose" | null;
   roots: LayerNode[];
   objectCount: number;
+  /** 视频壁纸工程（type = video）的视频本体；path = project.json 的 file */
+  video?: { path: string; bytes: Uint8Array };
+  /** 带 `puppet` 的 model json 路径 → .mdl 路径（打开后由 model.ts 的 scanPuppets 异步填入） */
+  puppets?: ReadonlyMap<string, string>;
 };
 
 /** `{user, value}` 包装（受用户属性驱动的字段）取作者快照值 */
@@ -65,7 +74,16 @@ export function kindOf(o: SceneObject): LayerKind {
   return "other";
 }
 
-export function buildLayerTree(scene: Record<string, unknown> | null): { roots: LayerNode[]; count: number } {
+export function modelFormOf(o: SceneObject, puppets?: ReadonlyMap<string, string>): "puppet" | "mesh" | undefined {
+  if (typeof o.model === "string") return "mesh";
+  if (typeof o.image === "string" && puppets?.has(o.image)) return "puppet";
+  return undefined;
+}
+
+export function buildLayerTree(
+  scene: Record<string, unknown> | null,
+  puppets?: ReadonlyMap<string, string>,
+): { roots: LayerNode[]; count: number } {
   const objects = Array.isArray(scene?.objects) ? (scene!.objects as unknown[]) : [];
   const nodes: LayerNode[] = [];
   const byId = new Map<number | string, LayerNode>();
@@ -78,6 +96,7 @@ export function buildLayerTree(scene: Record<string, unknown> | null): { roots: 
       name: typeof o.name === "string" ? o.name : "",
       kind: kindOf(o),
       visible: parseVisible(o.visible),
+      modelForm: modelFormOf(o, puppets),
       obj: o,
       children: [],
     };
@@ -144,7 +163,7 @@ function objectsOf(doc: EditorDoc): SceneObject[] | null {
 
 /** 文档对象数组变了之后重建图层树（节点 obj 引用随之换新） */
 export function rebuildTree(doc: EditorDoc): void {
-  const { roots, count } = buildLayerTree(doc.scene);
+  const { roots, count } = buildLayerTree(doc.scene, doc.puppets);
   doc.roots = roots;
   doc.objectCount = count;
 }

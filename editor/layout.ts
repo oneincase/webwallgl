@@ -1,5 +1,5 @@
 /**
- * 编辑器面板布局：左列（壁纸库 / 图层上下可调）、右检视器、底控制台的分隔条，
+ * 编辑器面板布局：左图层、右检视器、底控制台的分隔条，
  * 尺寸记在 localStorage。视口尺寸变化由 main.ts 的 ResizeObserver 接手重排舞台。
  */
 
@@ -13,7 +13,6 @@ const centerColEl = $("#ed-center").parentElement!;
 
 const CENTER_MIN_W = 360;
 const CENTER_MIN_H = 220;
-const LAYERS_MIN_H = 140;
 
 function dockWidth(el: HTMLElement) {
   return el.classList.contains("is-collapsed") ? 0 : el.getBoundingClientRect().width;
@@ -49,21 +48,10 @@ const bottom = makeSplitter($("#ed-split-bottom"), {
   storageKey: "we-editor-layout-bottom",
 });
 
-const library = makeSplitter($("#ed-split-lib"), {
-  axis: "y",
-  panel: $("#ed-library"),
-  side: "before",
-  size: 260,
-  min: 100,
-  max: () => leftColEl.clientHeight - LAYERS_MIN_H,
-  storageKey: "we-editor-layout-library",
-});
-
-export const editorPanels = { left, right, bottom, library };
+export const editorPanels = { left, right, bottom };
 
 export function resetEditorLayout() {
   left.reset();
   right.reset();
   bottom.reset();
-  library.reset();
 }

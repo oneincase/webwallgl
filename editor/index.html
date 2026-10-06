@@ -19,9 +19,9 @@
         <span>WebWallGL</span>
       </div>
       <div class="wb-modes" role="tablist">
-        <a class="wb-mode" id="act-bench" href="../" data-et-title="act.bench" title="返回测试台">
+        <a class="wb-mode" id="act-bench" href="../" data-et-title="act.bench" title="返回预览">
           <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5" /></svg>
-          <span data-i18n="mode.bench">测试台</span>
+          <span data-i18n="mode.bench">预览</span>
         </a>
         <a class="wb-mode is-active" href="./" aria-current="page">
           <svg class="i i-sm" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3L6 13H3v-3z M9 4l3 3" /></svg>
@@ -69,6 +69,8 @@
           </label>
           <button type="button" id="new-blank" data-et="new.blank">空白（纯色背景）</button>
           <button type="button" id="new-image" data-et="new.image">以图片为背景…</button>
+          <button type="button" id="new-video" data-et="new.video">以视频为背景…</button>
+          <button type="button" id="new-video-wp" data-et="new.videoWallpaper">视频壁纸工程…</button>
         </div>
         <button type="button" class="ed-btn" id="tb-open-pkg" data-et-title="tb.openPkgTitle">
           <svg class="i" viewBox="0 0 16 16"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z M2.5 4.8L8 7.8l5.5-3 M8 7.8v6.4" /></svg>
@@ -78,18 +80,37 @@
           <svg class="i" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3.2l1.5 1.5H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" /></svg>
           <span data-et="tb.openDir">打开文件夹</span>
         </button>
-        <button type="button" class="ed-btn" id="tb-save" disabled data-et-title="tb.saveTitle" aria-haspopup="menu">
+        <button type="button" class="ed-btn" id="tb-pack" disabled data-et-title="tb.packTitle" aria-haspopup="menu">
           <svg class="i" viewBox="0 0 16 16"><path d="M3 2.5h8.2l2.3 2.3v8.7H3z M5.5 2.5v3.5h5V2.5 M5 13.5v-4h6v4" /></svg>
-          <span data-et="tb.save">保存</span>
+          <span data-et="tb.pack">导出</span>
         </button>
-        <div id="save-menu" class="ed-menu" role="menu" hidden>
-          <button type="button" role="menuitem" id="save-lib" data-et="save.lib">保存到壁纸库</button>
-          <button type="button" role="menuitem" id="save-dir" data-et="save.dir">保存到文件夹…</button>
-          <button type="button" role="menuitem" id="save-zip" data-et="save.zip">下载 .zip</button>
-          <label class="ed-menu-check" data-et-title="save.pkgTitle" title="打成 WE 原生 scene.pkg（图片贴图转 .tex），官方 Wallpaper Engine 可直接加载">
-            <input type="checkbox" id="save-pkg" />
-            <span data-et="save.pkg">WE 原生格式（scene.pkg）</span>
+        <div id="export-menu" class="ed-menu" role="menu" hidden>
+          <button type="button" role="menuitem" id="export-pkg" data-et="export.pkg">打包导出 scene.pkg</button>
+          <button type="button" role="menuitem" id="export-zip" data-et="export.zip">压缩包导出 .zip</button>
+          <button type="button" role="menuitem" id="export-video" data-et="export.video">录制为视频 .mp4…</button>
+        </div>
+        <div id="rec-menu" class="ed-menu ed-new-menu" role="dialog" hidden>
+          <div class="ed-rec-title" data-et="rec.title">录制为视频</div>
+          <label class="ed-new-row"><span data-et="rec.duration">时长（秒）</span>
+            <input type="number" id="rec-duration" min="0.5" max="600" step="0.5" value="10" />
           </label>
+          <label class="ed-new-row"><span data-et="rec.fps">帧率</span>
+            <select id="rec-fps">
+              <option value="30">30</option>
+              <option value="60">60</option>
+            </select>
+          </label>
+          <label class="ed-new-row"><span data-et="rec.res">分辨率</span>
+            <select id="rec-res">
+              <option value="scene" data-et="rec.resScene">场景分辨率</option>
+              <option value="1920">1080p</option>
+              <option value="1280">720p</option>
+            </select>
+          </label>
+          <progress id="rec-bar" class="ed-rec-bar" max="1" value="0" hidden></progress>
+          <button type="button" id="rec-start" data-et="rec.start">开始录制</button>
+          <button type="button" id="rec-cancel" data-et="rec.cancel">取消</button>
+          <p class="ed-rec-hint" data-et="rec.hint">逐帧渲染后编码（不丢帧，比实时慢）；不含声音</p>
         </div>
         <span class="wb-tb-sep"></span>
         <button type="button" class="ed-icon" id="tb-undo" disabled data-et-title="tb.undo" title="撤销（⌘Z）">
@@ -125,27 +146,8 @@
 
     <!-- ================= 工作台 ================= -->
     <div id="ed-workbench" class="wb-workbench">
-      <!-- 左：壁纸库 + 图层（上下可调） -->
+      <!-- 左：图层 -->
       <div id="ed-left" class="wb-col is-dock">
-        <section id="ed-library" class="wb-panel is-dock">
-          <div class="wb-panel-head">
-            <span class="wb-tab active">
-              <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 2.5h4.5v4.5H2.5z M9 2.5h4.5v4.5H9z M2.5 9h4.5v4.5H2.5z M9 9h4.5v4.5H9z" /></svg>
-              <span data-et="sec.library">壁纸库</span>
-              <span id="ed-lib-count" class="wb-badge"></span>
-            </span>
-          </div>
-          <div class="wb-panel-body">
-            <div class="ed-pane-tools">
-              <div class="wb-search">
-                <svg class="i i-sm" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2l3.3 3.3" /></svg>
-                <input id="ed-filter" type="search" data-et-ph="ph.filter" placeholder="过滤标题 / itemId" />
-              </div>
-            </div>
-            <ul id="ed-lib-list" class="ed-list"></ul>
-          </div>
-        </section>
-        <div class="wb-split" id="ed-split-lib"></div>
         <section id="ed-layers" class="wb-panel is-fill">
           <div class="wb-panel-head">
             <span class="wb-tab active">
@@ -162,6 +164,9 @@
               </button>
               <button type="button" class="ed-icon" id="ly-add-particle" disabled data-et-title="ly.addParticle" title="添加粒子层" aria-haspopup="menu">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M4 3v2 M3 4h2 M9 2.5v3 M7.5 4h3 M5 9v2 M4 10h2 M10.5 9.5v3 M9 11h3 M3 14h.01 M13.5 6h.01 M8 7.5h.01" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="ly-add-video" disabled data-et-title="ly.addVideo" title="添加视频层">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M1.8 4h9v8h-9z M10.8 7l3.4-2v6l-3.4-2" /></svg>
               </button>
               <button type="button" class="ed-icon" id="ly-add-sound" disabled data-et-title="ly.addSound" title="添加声音层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 6v4h2.5l3.5 3V3L5 6z M11 5.5a3.5 3.5 0 0 1 0 5 M12.8 3.5a6 6 0 0 1 0 9" /></svg>
@@ -327,14 +332,17 @@
       <span id="st-layers"></span>
       <span class="wb-status-sep"></span>
       <span id="st-res"></span>
+      <span class="wb-status-sep"></span>
+      <span id="st-save"></span>
       <span class="wb-spacer"></span>
       <span id="st-fps" class="idle">— FPS</span>
     </footer>
 
     <input type="file" id="in-pkg" accept=".pkg,.json" multiple hidden />
-    <input type="file" id="in-dir" webkitdirectory multiple hidden />
     <input type="file" id="in-image" accept="image/*" multiple hidden />
+    <input type="file" id="in-video" accept=".mp4,.m4v,.mov,.webm,.mkv,video/*" multiple hidden />
     <input type="file" id="in-font" accept=".ttf,.otf,font/ttf,font/otf" hidden />
+    <input type="file" id="in-model-tex" accept="image/*" hidden />
     <input type="file" id="in-sound" accept=".mp3,.ogg,.wav,.flac,audio/mpeg,audio/ogg,audio/wav,audio/flac" multiple hidden />
 
     <script type="module" src="/editor/main.ts"></script>

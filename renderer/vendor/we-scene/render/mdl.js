@@ -36,7 +36,7 @@
 // 以下 re-export 维持既有 import 方（main.ts / verify-*.mjs）的路径不变。
 import { parseMDL } from './mdl-parse.js'
 import { linkProgram } from './gl-util.js'
-import { computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments } from './mdl-skin.js'
+import { computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes } from './mdl-skin.js'
 import { IDENTITY } from './mdl-math.js'
 
 
@@ -893,4 +893,4 @@ export function createMDLRenderer(gl) {
   }
 }
 
-export { parseMDL, computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments }
+export { parseMDL, computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes }

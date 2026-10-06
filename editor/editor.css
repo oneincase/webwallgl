@@ -270,6 +270,7 @@
 .ed-kind[data-kind="text"] { color: #89d185; }
 .ed-kind[data-kind="sound"] { color: #f48771; }
 .ed-kind[data-kind="light"] { color: #e2c08d; }
+.ed-kind[data-kind="video"] { color: #f0b429; }
 
 html[data-theme="light"] .ed-kind[data-kind="image"] { color: #0b72b9; }
 html[data-theme="light"] .ed-kind[data-kind="model"] { color: #9b3d97; }
@@ -277,6 +278,7 @@ html[data-theme="light"] .ed-kind[data-kind="particle"] { color: #946b00; }
 html[data-theme="light"] .ed-kind[data-kind="text"] { color: #2f7d32; }
 html[data-theme="light"] .ed-kind[data-kind="sound"] { color: #c4314b; }
 html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
+html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
 
 .ed-node-name {
   overflow: hidden;
@@ -497,6 +499,21 @@ html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
   outline: 1px solid var(--wb-fg);
 }
 
+/* 视频工程入 / 出点：竖线而非菱形 */
+.tl-key.tl-trim {
+  top: 0;
+  width: 2px;
+  height: 14px;
+  background: #f0b429;
+  transform: translateX(-50%);
+}
+
+.ed-vp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 /* 按层动画条：条区与上面的滑轨左右对齐（JS 量出 #tl-track 的位置） */
 #tl-lanes {
   flex: none;
@@ -637,6 +654,11 @@ html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
   font: 11px var(--mono);
 }
 
+/* 动画 / 附着点 / 子网格每条一行 */
+.ed-model-group .ed-kv dd {
+  white-space: pre-line;
+}
+
 .ed-insp-raw {
   max-height: 320px;
   margin: 0;
@@ -738,6 +760,30 @@ fieldset.ed-form:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+input.ed-al-name {
+  width: auto;
+}
+
+.ed-al-solo.on {
+  background: var(--wb-bg-4);
+  color: var(--wb-fg);
+}
+
+.ed-att-btns {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.ed-att-btns .ed-btn {
+  flex: 1;
+}
+
+.ed-al-add {
+  width: 100%;
+  margin-top: 6px;
 }
 
 .ed-fx-params {
@@ -999,6 +1045,30 @@ fieldset.ed-form:disabled {
 .ed-new-menu {
   min-width: 240px;
   gap: 2px;
+}
+
+.ed-rec-title {
+  padding: 6px 10px 2px;
+  color: var(--wb-fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ed-new-row input[type="number"] {
+  width: 72px;
+}
+
+.ed-rec-bar {
+  width: calc(100% - 20px);
+  margin: 4px 10px;
+}
+
+.ed-rec-hint {
+  max-width: 240px;
+  margin: 2px 10px 6px;
+  color: var(--wb-fg-dim);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .ed-new-row {

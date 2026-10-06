@@ -9,9 +9,12 @@ import type {
   EditorLayer,
   EditorLayerKind,
   EditorCaptureOptions,
+  EditorFrameOptions,
   EditorHitTestOptions,
   EditorLayerProps,
   EditorLayerOutline,
+  EditorModelInfo,
+  EditorAttachmentPoint,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -30,9 +33,12 @@ export type {
   EditorLayer,
   EditorLayerKind,
   EditorCaptureOptions,
+  EditorFrameOptions,
   EditorHitTestOptions,
   EditorLayerProps,
   EditorLayerOutline,
+  EditorModelInfo,
+  EditorAttachmentPoint,
 };
 
 /**
@@ -53,6 +59,18 @@ export declare function checkSceneScript(script: string): SceneScriptCheck;
  * project.json / 封面应留在包外，由调用方剔除。
  */
 export declare function buildScenePkg(files: readonly ScenePkgFile[]): ScenePkgResult;
+
+/**
+ * .mdl 各子网格的槽 0 材质 json 路径（非 UTF-8 的串为 null）。
+ * 网格表无法结构化读出（极旧 / 损坏文件）时返回 null。
+ */
+export declare function mdlMeshMaterials(bytes: Uint8Array): Array<string | null> | null;
+
+/**
+ * 把第 meshIndex 个子网格的槽 0 材质改指向 materialPath，返回新 .mdl 字节；
+ * 其余字节（顶点 / 索引 / 骨骼 / 动画）不变。越界或无法结构化读出时返回 null。
+ */
+export declare function retargetMdlMaterial(bytes: Uint8Array, meshIndex: number, materialPath: string): Uint8Array | null;
 
 /**
  * WE 内置字体名（scene.json 里的 font: "systemfont_*"）→ 本机 CSS font-family 栈。

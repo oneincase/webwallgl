@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <title>WebWallGL 测试台</title>
+    <title>WebWallGL 预览</title>
     <meta name="theme-color" content="#0e0f11" />
     <link rel="icon" type="image/png" href="/icons/pwa-192.png" />
     <link rel="stylesheet" href="/shared/workbench/tokens.css" />
@@ -23,7 +23,7 @@
       <div class="wb-modes" role="tablist">
         <a class="wb-mode is-active" href="./" aria-current="page">
           <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5" /></svg>
-          <span data-i18n="mode.bench">测试台</span>
+          <span data-i18n="mode.bench">预览</span>
         </a>
         <a class="wb-mode" id="mode-editor" href="./editor/">
           <svg class="i i-sm" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3L6 13H3v-3z M9 4l3 3" /></svg>
@@ -81,9 +81,6 @@
       <div class="wb-tb-group">
         <button type="button" class="wb-icon-btn" id="open" data-i18n-title="toolbar.open" title="新窗口">
           <svg class="i" viewBox="0 0 16 16"><path d="M9.5 2.5h4v4 M13.5 2.5L8 8 M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3" /></svg>
-        </button>
-        <button type="button" class="wb-icon-btn" id="open-editor" data-i18n-title="ctx.openEditor" title="在编辑器中打开">
-          <svg class="i" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3L6 13H3v-3z M9 4l3 3" /></svg>
         </button>
         <span class="wb-tb-sep"></span>
         <button type="button" class="wb-icon-btn" id="layout-reset" data-i18n-title="menu.resetLayout" title="重置布局">

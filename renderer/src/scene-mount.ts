@@ -8,7 +8,10 @@ import type {
   EditorControls,
   EditorLayer,
   EditorLayerKind,
+  EditorLayerOutline,
   EditorLayerProps,
+  EditorModelInfo,
+  EditorAttachmentPoint,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneDirAssets,
@@ -55,6 +58,7 @@ import {
 } from "../vendor/we-scene/scene/user-props.js";
 import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
 import { decodeTexImageBitmap, resampleRgba } from "./tex-decode";
+import { encodeTexVideo, mp4Size } from "../vendor/we-scene/pkg/tex-write.js";
 
 /**
  * [we-scene patch 2026-09-28] 平行光强度 → 漫反射系数的标定常数。
@@ -2067,7 +2071,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             }
           }
         }
-        const texEntry = await readAsset(`materials/${name}.tex`);
+        let texEntry = await readAsset(`materials/${name}.tex`);
+        // 松散工程的源视频（编辑器视频层存 materials/X.mp4，导出 pkg 时才编成 .tex）：
+        // 就地包成与官方导出器同形的视频 .tex，下面照常解析，视频贴图只有一条装配路径
+        if (!texEntry && !/^(particle|util|gradient|pattern|lut|cookie)\//.test(name)) {
+          const mp4 = await readAsset(`materials/${name}.mp4`);
+          const size = mp4 ? mp4Size(mp4) : null;
+          if (mp4 && size) {
+            texEntry = encodeTexVideo({ bytes: mp4, width: size.width, height: size.height });
+            reportDiag(rt, cfg, `tex '${name}': 包内无 .tex，回退源视频 materials/${name}.mp4（${size.width}x${size.height}）`, "info");
+          }
+        }
         if (!texEntry) {
           // [we-scene patch] **源码工程的贴图源图回退**：WE 编辑器工程（含官方内置
           // defaultprojects）里 `materials/X.png` 是贴图源、`X.tex` 是编译产物，但
@@ -3059,8 +3073,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             texJobs.push(
               loadTex(tn).then((entry) => {
                 if (!entry) return;
-                // 实例/材质保留纹理占用槽 0 时不得回写模型默认贴图（异步 then 晚于绑定）
-                if (si === 0 && !instBoundTex && !pendingInstanceMedia.some((p) => p.layer === layer)) {
+                // 实例/材质保留纹理占用槽 0 时不得回写模型默认贴图（异步 then 晚于绑定）。
+                // [we-scene patch 2026-10-07] 材质保留名**还在等**（媒体源没给封面）时
+                // 槽 0 并没有被占：先用作者内置贴图占位，封面到了由 bindPendingInstanceMedia
+                // 顶替。此前把「登记了迟到绑定」当成「已占用」，占位图永远写不进去：
+                // 普通层空着，puppet 层被判「无贴图」整层跳过（3465215190 的「画」）。
+                const reservedBound = typeof layer.textureName === "string" && layer.textureName.startsWith("$");
+                if (si === 0 && !instUtName && !reservedBound) {
                   layer.textureName = tn;
                   loadedTex++;
                   if (entry.videoCtl) (layer as any).videoCtl = entry.videoCtl;
@@ -3857,7 +3876,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // ---- puppet 骨骼网格图层 ----
       // model json 有 puppet 字段 → 解析 MDL（网格 + 骨架 + MDLA 动画），挂到图层上。
       // 渲染由 renderer 的图层循环调用（按 z 序、可走效果链），不再作为叠加层单独绘制。
-      const mdlItems: { mdl: any; tex: any; layer: any }[] = [];
+      // followName：puppet 层每帧按 layer.textureName 取贴图（迟到的 $mediaThumbnail / 用户图片槽
+      // 换图会改 textureName；装配时抓的 tex 只作回落），与普通图片层的取图口径一致。
+      const mdlItems: { mdl: any; tex: any; layer: any; followName?: boolean }[] = [];
       // [we-scene patch] 骨骼动画帧事件的播放头跟踪（图层 → 动画层序号 → 上帧帧号）。
       const puppetPrevFrames = new Map<any, Map<number, number>>();
       // [we-scene patch] 骨骼平移覆写表（图层 → Map<骨索引, 局部平移>）。
@@ -3894,7 +3915,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             continue;
           }
           layer.puppet = mdlObj;
-          mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
+          // 编辑器只读面（getModelInfo）用：模型来自哪里、各子网格实际加载的贴图
+          (layer as any).modelSrc = {
+            form: "puppet",
+            mdlPath: model.puppet,
+            jsonPath: layer.image,
+            textures: [layer.textureName ?? null],
+          };
+          mdlItems.push({ mdl: mdlObj, tex: texObj, layer, followName: true });
           const an = mdlObj.animations[0];
           reportDiag(rt,
             cfg,
@@ -4028,6 +4056,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // 的黑色大底、3662790108 的太阳系缺件）。第 0 个沿用本层已解析的贴图（就是
           // 该网格的材质贴图），其余逐个按材质 json 解析；某个网格的贴图缺失只让那一个
           // 网格回落到层贴图，不拖垮整层。
+          const meshTexNames: (string | null)[] = [texObj ? texName : null];
           if (mdlObj.meshes && mdlObj.meshes.length > 1) {
             const meshTex: (unknown | null)[] = [texObj];
             // [we-scene patch 2026-10-03] **逐子网格的完整材质**（F35）：多子网格模型里
@@ -4103,6 +4132,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 try {
                   await loadTex(tn0);
                   meshTexPush(meshTex, mi, textures.get(tn0) ?? null, gapDefault);
+                  if (textures.get(tn0)) meshTexNames[mi] = tn0;
                 } catch {
                   meshTexPush(meshTex, mi, null, gapDefault);
                 }
@@ -4116,6 +4146,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             (layer as any).meshBlending = meshBlend;
           }
           layer.puppet = mdlObj;
+          (layer as any).modelSrc = { form: "mesh", mdlPath: layer.model, jsonPath: null, textures: meshTexNames };
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
           reportDiag(rt,
             cfg,
@@ -4147,7 +4178,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           };
           for (const item of mdlItems) mdlRenderer.upload(item.mdl);
           // 注入绘制回调：renderer 在图层循环里按 z 序调用
-          const byLayer = new Map<any, { mdl: any; tex: any; layer: any }>();
+          const byLayer = new Map<any, (typeof mdlItems)[number]>();
           for (const item of mdlItems) byLayer.set(item.layer, item);
           // [we-scene patch 2026-10-03] 几何提供者：材质 shader 路径要从 mdl 层取
           // 交错 VBO/索引（resolveMeshes/resolveMesh），见 renderer 的 drawMeshMaterial
@@ -4241,7 +4272,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   layer.alpha,
                 ],
               },
-              item.tex,
+              (item.followName && layer.textureName && textures.get(layer.textureName)) || item.tex,
             );
           });
         } catch (e) {
@@ -7197,6 +7228,16 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
         return p;
       };
+      // 丢上下文只在出帧时被发现；暂停中没有帧在跑，补画一帧把它交给上面的 ContextLostError 出口
+      c.addEventListener(
+        "webglcontextlost",
+        () => {
+          setTimeout(() => {
+            if (!disposed && (rt.paused || occlPaused(rt))) renderOnce().catch(() => {});
+          }, 0);
+        },
+        { once: true },
+      );
       const currentTime = () => {
         const now = performance.now();
         return sceneTimeAt(now, pausedTotal(now));
@@ -7207,16 +7248,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (l.isSound) return "sound";
         if (l.isLight) return "light";
         if (l.isContainer) return "container";
+        if (l.puppet && l.modelSrc) return "model";
         return l.srcObject?.image || l.srcObject?.model ? "image" : "group";
       };
-      const layerView = (l: any, index: number): EditorLayer => ({
-        id: Number(l.id),
-        name: String(l.name ?? ""),
-        kind: layerKindOf(l),
-        parentId: l.parentId ?? null,
-        visible: l.visible !== false,
-        index,
-      });
+      const layerView = (l: any, index: number): EditorLayer => {
+        const kind = layerKindOf(l);
+        return {
+          id: Number(l.id),
+          name: String(l.name ?? ""),
+          kind,
+          ...(kind === "model" ? { modelForm: l.modelSrc.form } : {}),
+          parentId: l.parentId ?? null,
+          visible: l.visible !== false,
+          index,
+        };
+      };
       // 画布 CSS 像素 ↔ 世界像素（y 向下）的窗口。与渲染相机同源：fitWindow（含 cover
       // 的 peek 对齐）+ 相机 zoom 收缩，与 ROI 逆映射同一套数学（见渲染循环里 roiWorld 的注释）。
       // 透视相机场景（无 orthogonalprojection）不适用，调用方自行判 perspective。
@@ -7233,6 +7279,34 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       };
       const layerById = (id: number): any =>
         (scene.layers as any[]).find((l) => l && !l.destroyed && String(l.id) === String(id));
+      // 模型层的蒙皮网格投到画布 CSS 像素（当前时刻姿势 × 上一帧绘制矩阵），供精确拾取与轮廓。
+      // null = 不是模型层 / 还没画过一帧。
+      const modelScreenMesh = (l: any) => {
+        const m = l?.puppet;
+        if (!m || !l.modelSrc || l.destroyed || typeof renderer.getModelMvp !== "function") return null;
+        const mvp = renderer.getModelMvp(l);
+        if (!mvp) return null;
+        const ev = editorView();
+        const skin = mdl.computeSkinMatrices(m, currentTime(), l.animationLayers, getBoneOverrides(l));
+        const proj = hitTest.projectMeshesToScreen(mdl.skinnedMeshes(m, skin, ev.perspective), mvp, ev.cssW, ev.cssH);
+        const o = hitTest.projectMeshesToScreen(
+          [{ pos: new Float32Array(3), indices: [0, 0, 0], vertexCount: 1, indexCount: 3 }],
+          mvp,
+          ev.cssW,
+          ev.cssH,
+        )[0];
+        const anchor: [number, number] | null = o.ok[0] ? [o.xy[0], o.xy[1]] : null;
+        return { proj, hull: hitTest.screenMeshesHull(proj) as [number, number][] | null, anchor };
+      };
+      const centroidOf = (pts: [number, number][]): [number, number] => {
+        let x = 0;
+        let y = 0;
+        for (const p of pts) {
+          x += p[0];
+          y += p[1];
+        }
+        return [x / pts.length, y / pts.length];
+      };
       const vec3 = (v: unknown, d: number): [number, number, number] => {
         const a = Array.isArray(v) ? v : [];
         return [0, 1, 2].map((i) => (Number.isFinite(Number(a[i])) ? Number(a[i]) : d)) as [number, number, number];
@@ -7317,12 +7391,70 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
         return renderOnce();
       };
-      const seekImpl = (t: number): Promise<void> => {
+      // 动画层热改（W13）：与解析同一份 parseAnimationLayers 映射，整表替换。脚本 / 关键帧
+      // 包装（visible/blend/rate 的 {script}、blend 的 {animation}）的沙箱与曲线是装配期按下标
+      // 挂上的，这里不重装 —— 带包装的层由页面改走整场景重挂。
+      const setAnimationLayersImpl = (id: number, raw: ReadonlyArray<Record<string, unknown>>): Promise<void> => {
+        if (disposed) return Promise.reject(new Error("scene disposed"));
+        const l: any = layerById(id);
+        if (!l) return Promise.reject(new Error(`setAnimationLayers: layer ${id} not found`));
+        if (!l.puppet) return Promise.reject(new Error(`setAnimationLayers: layer ${id} is not a model layer`));
+        const prev: any[] = Array.isArray(l.animationLayers) ? l.animationLayers : [];
+        const next: any[] = scn.parseAnimationLayers(Array.isArray(raw) ? raw : []);
+        // 脚本接管过的播放态（play/pause/setFrame）按下标沿用，片段没换才沿用
+        next.forEach((al, i) => {
+          const p = prev[i];
+          if (!p || p.animation !== al.animation) return;
+          al.playing = p.playing;
+          al.paused = p.paused;
+          al.clock = p.clock;
+        });
+        l.animationLayers = next;
+        puppetPrevFrames.delete(l);
+        return renderOnce();
+      };
+      const seekImpl = (t: number, render = true): Promise<void> => {
         if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
         rebaseClock(t, performance.now());
         animSeekPending = true;
         for (const run of animRuns) run.held = false;
-        return renderOnce();
+        const pairs = rt.videoPairs ?? [];
+        if (!pairs.length) return render ? renderOnce() : Promise.resolve();
+        // 视频贴图跟场景时钟对齐（场景 0 秒 = 视频 0 秒，超长按循环取模）；等帧解出来再画，
+        // 否则暂停时画出的是 seek 前的旧帧
+        const ready = Promise.all(pairs.map((p) => p.seek(t)));
+        return render ? ready.then(() => renderOnce()) : ready.then(() => undefined);
+      };
+      const captureFrameImpl = async (opts: {
+        time?: number;
+        width?: number;
+        height?: number;
+        keepSize?: boolean;
+      }): Promise<HTMLCanvasElement> => {
+        if (opts.time !== undefined) await seekImpl(opts.time, false);
+        if (disposed) throw new Error("scene disposed");
+        const MAX = 8192;
+        const baseW = c.width || 1;
+        const baseH = c.height || 1;
+        let w = opts.width && opts.width > 0 ? opts.width : 0;
+        let h = opts.height && opts.height > 0 ? opts.height : 0;
+        if (w && !h) h = (w * baseH) / baseW;
+        else if (h && !w) w = (h * baseW) / baseH;
+        else if (!w && !h) {
+          w = baseW;
+          h = baseH;
+        }
+        w = Math.max(1, Math.min(MAX, Math.round(w)));
+        h = Math.max(1, Math.min(MAX, Math.round(h)));
+        const resized = w !== baseW || h !== baseH;
+        const shot = await new Promise<HTMLCanvasElement>((resolve, reject) => {
+          if (captureReq) captureReq.reject(new Error("capture superseded"));
+          captureReq = { w, h, armed: false, resolve, reject };
+          renderOnce().catch(reject);
+        });
+        // 暂停中改过 backing store：补画一帧把可见画面复原到容器尺寸
+        if (resized && rt.paused && !disposed && !opts.keepSize) await renderOnce();
+        return shot;
       };
       editorImpl = {
         get time() {
@@ -7336,6 +7468,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const now = performance.now();
           rebaseClock(sceneTimeAt(now, pausedTotal(now)), now);
           clockScale = Number.isFinite(scale) && scale > 0 ? scale : 0;
+          for (const p of rt.videoPairs ?? []) p.setRate(clockScale);
         },
         async step(frames = 1, fps = 60) {
           const n = Math.max(1, Math.floor(frames));
@@ -7344,30 +7477,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // 逐帧推进：有状态模拟（粒子/脚本）每帧吃到真实的 dt，而不是一步跳 n 帧
           for (let i = 0; i < n; i++) await seekImpl(currentTime() + dt);
         },
+        captureFrame: (opts = {}) => captureFrameImpl(opts),
         async capture(opts = {}) {
-          if (opts.time !== undefined) await seekImpl(opts.time);
-          if (disposed) throw new Error("scene disposed");
-          const MAX = 8192;
-          const baseW = c.width || 1;
-          const baseH = c.height || 1;
-          let w = opts.width && opts.width > 0 ? opts.width : 0;
-          let h = opts.height && opts.height > 0 ? opts.height : 0;
-          if (w && !h) h = (w * baseH) / baseW;
-          else if (h && !w) w = (h * baseW) / baseH;
-          else if (!w && !h) {
-            w = baseW;
-            h = baseH;
-          }
-          w = Math.max(1, Math.min(MAX, Math.round(w)));
-          h = Math.max(1, Math.min(MAX, Math.round(h)));
-          const resized = w !== baseW || h !== baseH;
-          const shot = await new Promise<HTMLCanvasElement>((resolve, reject) => {
-            if (captureReq) captureReq.reject(new Error("capture superseded"));
-            captureReq = { w, h, armed: false, resolve, reject };
-            renderOnce().catch(reject);
-          });
-          // 暂停中改过 backing store：补画一帧把可见画面复原到容器尺寸
-          if (resized && rt.paused && !disposed) await renderOnce();
+          const shot = await captureFrameImpl({ time: opts.time, width: opts.width, height: opts.height });
           return await new Promise<Blob>((resolve, reject) =>
             shot.toBlob(
               (b) => (b ? resolve(b) : reject(new Error("capture: toBlob failed"))),
@@ -7386,6 +7498,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             parallaxCtx: renderer.getParallaxOffset ? renderer.getParallaxOffset() : null,
             alignTable: rnd.ALIGN,
             perspEye: renderer.getPerspectiveEye ? renderer.getPerspectiveEye() : null,
+            meshHit: (l: any) => {
+              const g = modelScreenMesh(l);
+              return g ? hitTest.screenMeshesContain(g.proj, x, y, g.hull) : undefined;
+            },
             // 缺省排除看不见的层：visible=false 与 alpha=0（WE 惯用的透明点击区）
             filter: opts.includeHidden
               ? undefined
@@ -7404,12 +7520,82 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           return out;
         },
         getLayerProps: getLayerPropsImpl,
+        getModelInfo(id: number): EditorModelInfo | null {
+          if (disposed) return null;
+          const l: any = layerById(id);
+          const m = l?.puppet;
+          const src = l?.modelSrc;
+          if (!m || !src) return null;
+          const meshes = m.meshes && m.meshes.length ? m.meshes : [m];
+          return {
+            form: src.form,
+            mdlPath: String(src.mdlPath),
+            modelJsonPath: src.jsonPath ?? null,
+            version: String(m.magic ?? ""),
+            vertexCount: Number(m.vertexCount) || 0,
+            bones: (m.bones || []).map((b: any) => ({ name: String(b.name ?? ""), parent: b.parent })),
+            animations: (m.animations || []).map((a: any) => ({
+              id: a.id,
+              name: String(a.name ?? ""),
+              mode: String(a.mode ?? ""),
+              fps: a.fps,
+              frameCount: a.frameCount,
+              duration: a.fps > 0 ? a.frameCount / a.fps : 0,
+              events: (a.events || []).map((e: any) => ({ frame: e.frame, name: String(e.name ?? "") })),
+            })),
+            attachments: (m.attachments || []).map((at: any) => {
+              const bm = mdl.attachmentBind(m, at.name);
+              return {
+                name: String(at.name ?? ""),
+                bone: at.bone,
+                bindOrigin: (bm ? [bm[12], bm[13], bm[14]] : [0, 0, 0]) as [number, number, number],
+              };
+            }),
+            meshes: meshes.map((me: any, i: number) => ({
+              materialPath: me.materialPath ?? null,
+              vertexCount: Number(me.vertexCount) || 0,
+              texture: src.textures[i] ?? null,
+            })),
+          };
+        },
         setLayerProps: setLayerPropsImpl,
-        getLayerOutline(id: number) {
+        setAnimationLayers: setAnimationLayersImpl,
+        getAttachmentPoints(id: number): EditorAttachmentPoint[] | null {
+          if (disposed) return null;
+          const l: any = layerById(id);
+          const m = l?.puppet;
+          if (!m || !l.modelSrc) return null;
+          mdl.computeSkinMatrices(m, currentTime(), l.animationLayers, getBoneOverrides(l));
+          const ev = editorView();
+          const anchor = ev.perspective
+            ? null
+            : hitTest.layerQuadWorld(l, ev.projH, rnd.ALIGN, renderer.getParallaxOffset ? renderer.getParallaxOffset() : null).anchor;
+          return (m.attachments || []).flatMap((at: any) => {
+            const name = String(at.name ?? "");
+            const off = mdl.attachmentEffectiveOffset(l, name);
+            if (!off) return [];
+            let screen: [number, number] | null = null;
+            if (anchor) {
+              const d = mdl.parentMeshToWorldDelta(l, off[0], off[1]);
+              screen = [
+                ((anchor[0] + d[0] - ev.view.offX) / ev.view.viewW) * ev.cssW,
+                ((anchor[1] - d[1] - ev.view.offY) / ev.view.viewH) * ev.cssH,
+              ];
+            }
+            return [{ name, offset: [off[0], off[1]] as [number, number], screen }];
+          });
+        },
+        getLayerOutline(id: number): EditorLayerOutline | null {
           if (disposed) return null;
           const l = layerById(id);
+          if (!l) return null;
           const ev = editorView();
-          if (!l || ev.perspective) return null;
+          const g = modelScreenMesh(l);
+          const hull = g?.hull && g.hull.length >= 3 ? (g.hull as [number, number][]) : null;
+          if (ev.perspective) {
+            if (!hull || !g) return null;
+            return { anchor: g.anchor ?? centroidOf(hull), corners: null, hull };
+          }
           const q = hitTest.layerQuadWorld(
             l,
             ev.projH,
@@ -7420,7 +7606,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             ((p[0] - ev.view.offX) / ev.view.viewW) * ev.cssW,
             ((p[1] - ev.view.offY) / ev.view.viewH) * ev.cssH,
           ];
-          return { anchor: toCss(q.anchor), corners: q.corners ? q.corners.map(toCss) : null };
+          const out: EditorLayerOutline = { anchor: toCss(q.anchor), corners: q.corners ? q.corners.map(toCss) : null };
+          if (hull) out.hull = hull;
+          return out;
         },
         screenDeltaToLocal(id: number, dx: number, dy: number) {
           if (disposed) return null;

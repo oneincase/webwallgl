@@ -720,13 +720,19 @@ export type EditorLayerKind =
   | "sound"
   | "light"
   | "container"
-  | "group";
+  | "group"
+  | "model";
 
 /** 引擎活层的只读快照（W2a）。`id` 即 scene.json 对象 id，可与文档树对应 */
 export type EditorLayer = {
   readonly id: number;
   readonly name: string;
   readonly kind: EditorLayerKind;
+  /**
+   * 模型层的形态（W12）：puppet = 图片对象引用的 model json 带 `puppet`（2D 骨骼网格）；
+   * mesh = 对象直接挂 `model: "*.mdl"`（真 3D）。模型解析成功才有，否则该层按 image / group 归类
+   */
+  readonly modelForm?: "puppet" | "mesh";
   readonly parentId: number | null;
   /** 有效可见性（含祖先与脚本写入） */
   readonly visible: boolean;
@@ -744,6 +750,14 @@ export type EditorCaptureOptions = {
   type?: string;
   /** 有损格式质量 0..1 */
   quality?: number;
+};
+
+export type EditorFrameOptions = Pick<EditorCaptureOptions, "time" | "width" | "height"> & {
+  /**
+   * 出图后不把画布复原到容器尺寸（逐帧录制：连续出图时省掉每帧两次改 backing store）；
+   * 录完 seek 一次即复原
+   */
+  keepSize?: boolean;
 };
 
 /**
@@ -765,6 +779,56 @@ export type EditorLayerOutline = {
   anchor: [number, number];
   /** OBB 四角（左上起顺时针）；零尺寸层 / 透视层为 null */
   corners: Array<[number, number]> | null;
+  /**
+   * 模型层（W15）：当前姿势蒙皮网格在画布上的凸包（CSS 像素，逆时针）。
+   * 透视相机场景里只有模型层有轮廓：corners 为 null、anchor 是网格原点的投影。
+   */
+  hull?: Array<[number, number]>;
+};
+
+/**
+ * 模型层的只读信息（W12），全部取自装配期已解析的 .mdl，不做新解析。
+ * 骨骼 / 动画 / 附着点下标与 .mdl 内顺序一致（`animationlayers[].animation` 对应 animations[].id）。
+ */
+export type EditorModelInfo = {
+  form: "puppet" | "mesh";
+  /** 工程内 .mdl 路径 */
+  mdlPath: string;
+  /** puppet 的 model json 路径（对象的 image 字段）；mesh 为 null */
+  modelJsonPath: string | null;
+  /** MDL 版本（如 "MDLV0023"） */
+  version: string;
+  vertexCount: number;
+  bones: Array<{ name: string; parent: number }>;
+  animations: Array<{
+    id: number;
+    name: string;
+    /** loop / mirror / single */
+    mode: string;
+    fps: number;
+    frameCount: number;
+    /** 片段时长（秒）= frameCount / fps */
+    duration: number;
+    events: Array<{ frame: number; name: string }>;
+  }>;
+  /**
+   * 附着点。bindOrigin = 绑定姿势下附着点在模型网格空间的位置（Y 向上，相对模型层 origin、未乘层缩放 / 旋转），
+   * 与引擎挂件定位（applyAttachmentBindOrigins）同一套矩阵链
+   */
+  attachments: Array<{ name: string; bone: number; bindOrigin: [number, number, number] }>;
+  /** 子网格：材质 json 路径、顶点数、槽 0 贴图（引擎实际加载的；没加载成功为 null） */
+  meshes: Array<{ materialPath: string | null; vertexCount: number; texture: string | null }>;
+};
+
+/**
+ * 模型层附着点此刻的状态（W14）。offset = 挂在这里的层被引擎额外加进局部 origin 的偏移
+ *（模型网格空间、Y 向上、未乘模型层缩放 / 旋转；= 绑定偏移 + 当前姿势相对绑定姿势的跟随增量），
+ * 页面据此做「绑定 / 解绑前后世界位置不变」的换算。screen = 附着点的画布 CSS 像素位置（透视相机场景为 null）
+ */
+export type EditorAttachmentPoint = {
+  name: string;
+  offset: [number, number];
+  screen: [number, number] | null;
 };
 
 export type EditorHitTestOptions = {
@@ -789,18 +853,30 @@ export type EditorControls = {
   step(frames?: number, fps?: number): Promise<void>;
   /** 单帧出图（W3） */
   capture(opts?: EditorCaptureOptions): Promise<Blob>;
+  /** 单帧出图到新 canvas（不编码）；给 time 时只定位不额外画一帧 */
+  captureFrame(opts?: EditorFrameOptions): Promise<HTMLCanvasElement>;
   /** 画布 CSS 像素坐标（相对画布左上角）命中的图层，自上而下（W4） */
   hitTestAt(x: number, y: number, opts?: EditorHitTestOptions): EditorLayer[];
   /** 全部引擎活层，按绘制顺序（W2a） */
   getLayers(): EditorLayer[];
   /** 读图层当前可热改属性；id 不存在返回 null */
   getLayerProps(id: number): EditorLayerProps | null;
+  /** 模型层的只读信息（W12）；不是模型层 / 模型没装上 / id 不存在返回 null */
+  getModelInfo(id: number): EditorModelInfo | null;
   /**
    * 热改图层属性（W2-lite），当帧生效（拾取与轮廓立即同步）。暂停中会补画一帧，
    * Promise 在该帧画完后落地。变换绑了脚本的层，下一帧会被脚本覆盖；
    * 字段上有关键帧动画时，该字段的曲线写回暂停到下一次 seek（编辑器拖拽 / 输入跟手，提交后由页面落关键帧并 seek 复原）。
    */
   setLayerProps(id: number, patch: Partial<EditorLayerProps>): Promise<void>;
+  /**
+   * 热替换模型层的动画层表（W13）：`layers` 即 scene.json 的 `animationlayers` 原样数组，
+   * 与场景解析同一份映射，当帧生效（暂停中补画一帧）。不是模型层 / id 不存在时 reject。
+   * 字段上的 `{script}` / `{animation}` 包装只取快照值，不重装脚本与曲线（这类改动请整场景重挂）。
+   */
+  setAnimationLayers(id: number, layers: ReadonlyArray<Record<string, unknown>>): Promise<void>;
+  /** 模型层附着点在当前姿势下的偏移与屏幕位置（W14）；不是模型层 / 模型没装上 / id 不存在返回 null */
+  getAttachmentPoints(id: number): EditorAttachmentPoint[] | null;
   /** 图层轮廓（选中框用，W5 过渡方案）；透视相机场景 / id 不存在返回 null */
   getLayerOutline(id: number): EditorLayerOutline | null;
   /** 画布 CSS 像素位移 → 该层 origin 的 local 位移（拖拽移动用）；透视相机场景返回 null */

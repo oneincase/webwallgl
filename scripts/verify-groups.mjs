@@ -804,7 +804,9 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   // 渲染端 `!layer.solid && textureName` 才取纹理，solid 恒赢；且异步默认槽回写不得覆盖。
   check(/textureName\s*=\s*instBoundTex;[\s\S]{0,80}solid\s*=\s*false;/.test(msrc),
     "scene-mount 必须把槽 0 的 instance.usertextures 绑到 layer.textureName 并清 solid（否则封面白块）");
-  check(/si === 0 && !instBoundTex/.test(msrc),
+  // 2026-10-07：守卫由 !instBoundTex 收紧为 !instUtName（有实例保留名就不回写，无论是否已就绪；
+  // instBoundTex 非空时 instUtName 必非空），另加 !reservedBound 避让已绑上的材质保留名
+  check(/si === 0 && !instUtName && !reservedBound/.test(msrc),
     "实例绑定占用槽 0 时，材质默认槽的异步回写不得覆盖 textureName");
   let utLayers = 0;
   const utWp = new Set();

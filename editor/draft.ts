@@ -39,7 +39,7 @@ export function makeDraft(
     entry,
     project: doc.project ? clone(doc.project) : null,
     scene: clone(doc.scene),
-    files: files.map((f) => ({ name: f.name, group: f.group, data: f.data.slice() })),
+    files: files.map((f) => ({ name: f.name, group: Array.isArray(f.group) ? [...f.group] : f.group, data: f.data.slice() })),
   };
 }
 
@@ -56,7 +56,8 @@ export function parseDraft(raw: unknown): Draft | null {
   if (!Array.isArray(raw.files)) return null;
   for (const f of raw.files) {
     if (!isObj(f) || typeof f.name !== "string" || !(f.data instanceof Uint8Array)) return null;
-    if (f.group !== undefined && typeof f.group !== "string") return null;
+    const g = f.group;
+    if (g !== undefined && typeof g !== "string" && !(Array.isArray(g) && g.every((x) => typeof x === "string"))) return null;
   }
   return raw as unknown as Draft;
 }

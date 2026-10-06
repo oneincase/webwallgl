@@ -26,11 +26,11 @@
  * 真浏览器部分（--headless，需 Chrome；会自起 vite）：
  *   K. 引擎编辑器控制面：seek / step / 倍速 / capture / hitTestAt / getLayers /
  *      getLayerProps / setLayerProps / getLayerOutline / screenDeltaToLocal
- *   L. 编辑器页端到端：打开、点选、检视器热改、复制 / 重排 / 删除、撤销重做、锁定、
- *      另存到壁纸库并重新打开
- *   Q. 新建端到端：模板新建 → 选图 / 拖入加层 → 撤销重做 → 存库 → 编辑器与测试台渲染页播放
- *   R. 草稿：编辑后刷新 → 横幅 → 恢复（新建 / 库来源）、丢弃、保存后清除
- *   T / U / V. 效果、脚本、用户属性面板端到端（像素判据 + 存库后测试台出帧一致）
+ *   L. 编辑器页端到端：打开项目文件夹、点选、检视器热改、复制 / 重排 / 删除、撤销重做、锁定、
+ *      自动保存到项目文件夹并重新打开
+ *   Q. 新建端到端：模板新建（先选文件夹）→ 选图 / 拖入加层 → 撤销重做 → 自动保存 → 编辑器与预览渲染页播放
+ *   R. 自动保存：刷新没有草稿横幅；再打开同一项目文件夹，图层还在
+ *   T / U / V. 效果、脚本、用户属性面板端到端（像素判据 + 保存后预览出帧一致）
  *
  * 用法：
  *   node scripts/verify-editor.mjs              # 离线（A–J、M–V）
@@ -85,6 +85,7 @@ const sourceAlias = {
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
+        `export { mdlMeshMaterials, retargetMdlMaterial } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
         `export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from ${json(path.join(ROOT, "renderer/src/types.ts"))};`,
       ].join("\n"),
       loader: "ts",
@@ -690,7 +691,8 @@ const localFile = (p, data) => ({ path: p, file: new File([data], p.split("/").p
     localFile("v/project.json", enc.encode(json({ type: "video", file: "a.mp4" }))),
     localFile("v/a.mp4", new Uint8Array(8)),
   ]);
-  check(vid.doc.type === "video" && !vid.assets, "视频壁纸：只预览，无场景资源（保存 / 结构编辑不可用）");
+  check(vid.doc.type === "video" && !vid.assets, "视频壁纸：无场景资源（没有图层可编）");
+  check(vid.doc.video?.path === "a.mp4" && vid.doc.video.bytes.length === 8, "视频壁纸：视频本体进文档（doc.video），可裁剪 / 替换 / 保存");
   let msg = "";
   try {
     await openMod.openLocalFiles([localFile("w/project.json", enc.encode(json({ type: "web", file: "index.html" })))]);
@@ -1360,8 +1362,8 @@ const trustMod = await loadEditorModule("trust");
   const mountSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
   check(/scripts: o\.scripts !== false,/.test(mountSrc), "MountOptions.scripts 透传到装配配置，缺省执行");
   const main = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  check(/scripts: scriptsAllowed,/.test(main) && /scriptsAllowedByDefault\(origin\?\.kind \?\? "local", libState === "ready", SCRIPTS_OVERRIDE\)/.test(main), "编辑器按来源 + 宿主决定每份文档的脚本开关");
-  check(/if \(!opts\.origin\) await libReady;/.test(main), "本地文件等首次读库结束再判（宿主在不在要读库才知道）");
+  check(/scripts: scriptsAllowed,/.test(main) && /scriptsAllowedByDefault\(origin\?\.kind \?\? "local", hostUp, SCRIPTS_OVERRIDE\)/.test(main), "编辑器按来源 + 宿主决定每份文档的脚本开关");
+  check(/await hostProbe;/.test(main) && /hostUp = !!\(await fetchLibrary\(\)\)/.test(main), "打开前等宿主探测结束（宿主在不在要读库才知道）");
   check(/#scripts-allow"\)\.onclick = \(\) => \{\s*scriptsAllowed = true;[\s\S]{0,120}mountCurrent\(true\)/.test(main), "「仍然执行」只放行本文档并原地重挂");
 }
 
@@ -1464,6 +1466,89 @@ const jpegHead = (w, h) => new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0
     { path: "preview.jpg", data: jh },
   ]);
   check(json(pp.files.map((f) => f.path)) === json(["project.json", "preview.jpg", "scene.pkg"]) && json(pp.packed.entries) === json(["materials/editor/bg.tex", "scene.json"]), "packProject：project.json / 封面留在包外，其余进 scene.pkg");
+}
+
+section("X3. 视频：WE 视频 .tex / pkg 导出 mp4 / 视频层 / 视频壁纸工程保存");
+/** 最小 mp4：ftyp + moov/trak/tkhd(v0)，只供读尺寸与判型 */
+function fakeMp4(w, h, tail = 0) {
+  const box = (type, body) => {
+    const b = new Uint8Array(8 + body.length);
+    new DataView(b.buffer).setUint32(0, b.length);
+    b.set(enc.encode(type), 4);
+    b.set(body, 8);
+    return b;
+  };
+  const cat = (...a) => {
+    const o = new Uint8Array(a.reduce((n, x) => n + x.length, 0));
+    let p = 0;
+    for (const x of a) o.set(x, p), (p += x.length);
+    return o;
+  };
+  const tkhd = new Uint8Array(84);
+  const dv = new DataView(tkhd.buffer);
+  dv.setUint32(76, w << 16);
+  dv.setUint32(80, h << 16);
+  const ftyp = box("ftyp", cat(enc.encode("isom"), new Uint8Array(4), enc.encode("isomavc1")));
+  const moov = box("moov", box("trak", box("tkhd", tkhd)));
+  return cat(ftyp, moov, box("mdat", new Uint8Array(tail).map((_, i) => (i * 31) & 255)));
+}
+{
+  const mp4 = fakeMp4(640, 360, 1000);
+  check(texW.isMp4Bytes(mp4) && !texW.isMp4Bytes(new Uint8Array(16)), "isMp4Bytes：认 ftyp 头");
+  check(json(texW.mp4Size(mp4)) === json({ width: 640, height: 360 }) && texW.mp4Size(new Uint8Array(4)) === null, "mp4Size：moov/trak/tkhd 读显示宽高（16.16 定点）");
+  const tex = texW.encodeTexVideo({ bytes: mp4, width: 640, height: 360 });
+  const tv = texR.parseTex(tex);
+  check(tv.isVideo && tv.flags === 34 && tv.format === 0 && tv.containerMagic === "TEXB0003\0" && tv.freeImageFormat === -1 && tv.textureWidth === 640 && tv.height === 360, `encodeTexVideo：flags=32|2、TEXB0003、fif=-1、tex 尺寸 = 视频尺寸（官方视频 tex 形态；flags=${tv.flags}）`);
+  check(tex.length === mp4.length + 87 && same(texR.decodeMip0(tv).video, mp4), "encodeTexVideo：87 字节头 + mp4 原字节，引擎 decodeMip0 取回原视频");
+  let threw = false;
+  try {
+    texW.encodeTexVideo({ bytes: new Uint8Array(32), width: 1, height: 1 });
+  } catch {
+    threw = true;
+  }
+  check(threw, "encodeTexVideo：非 mp4 字节拒绝");
+
+  const wpRoot = path.join(os.homedir(), "Library/Application Support/io.github.oneincase.wallpaperem/wallpapers");
+  let realChecked = 0;
+  for (const id of ["2958411739", "2955378002", "2903412088"]) {
+    const pkgPath = path.join(wpRoot, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    const pk = pkgC.parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    for (const e of pk.entries) {
+      if (!e.name.endsWith(".tex")) continue;
+      const orig = pkgC.getEntry(pk, e.name);
+      const t = texR.parseTex(orig);
+      if (!t.isVideo) continue;
+      const v = texR.decodeMip0(t).video;
+      const re = texW.encodeTexVideo({ bytes: v, width: t.width, height: t.height });
+      check(same(re, orig), `真实视频 tex 逐字节复现：${id}/${e.name}`);
+      realChecked++;
+    }
+  }
+  if (!realChecked) console.log("  · 本机无真实视频壁纸语料，跳过逐字节复现");
+
+  const r = buildScenePkg([
+    { path: "scene.json", data: enc.encode("{}") },
+    { path: "materials/editor/video-clip.mp4", data: mp4 },
+    { path: "materials/editor/video-bad.mp4", data: new Uint8Array(12) },
+  ]);
+  check(json(r.converted) === json(["materials/editor/video-clip.tex"]) && !r.entries.includes("materials/editor/video-clip.mp4"), `buildScenePkg：materials 下 mp4 编成视频 .tex，源 mp4 不进包（${json(r.entries)}）`);
+  const vt = texR.parseTex(pkgC.getEntry(pkgC.parsePkg(r.pkg), "materials/editor/video-clip.tex"));
+  check(vt.isVideo && same(texR.decodeMip0(vt).video, mp4), "buildScenePkg：包内视频 .tex 取回原 mp4");
+
+  const vidMod = await imp("editor/video.ts");
+  check(vidMod.isEditorVideoModel("models/editor/video-a.json") && !vidMod.isEditorVideoModel("models/editor/a.json") && !vidMod.isEditorVideoModel(3), "isEditorVideoModel：只认 models/editor/video-*.json");
+  check(vidMod.isVideoFile({ name: "a.MOV" }) && vidMod.isVideoFile({ name: "x", type: "video/webm" }) && !vidMod.isVideoFile({ name: "a.png", type: "image/png" }), "isVideoFile：按扩展名 / MIME 分流");
+  const files = vidMod.videoLayerFiles("video-clip", { width: 640, height: 360, bytes: mp4 });
+  const mat = JSON.parse(dec.decode(files.find((f) => f.name === "materials/editor/video-clip.json").data));
+  check(json(files.map((f) => f.name)) === json(["models/editor/video-clip.json", "materials/editor/video-clip.json", "materials/editor/video-clip.mp4"]) && mat.passes[0].textures[0] === "editor/video-clip" && mat.passes[0].shader === "genericimage2", "videoLayerFiles：模型 / genericimage2 材质（贴图 editor/slug）/ 源 mp4 三件套");
+
+  const vpMod = await imp("editor/video-project.ts");
+  const vdoc = { title: "Clip", project: { ...vpMod.videoProjectJson("Clip", "clip.mp4"), workshopid: "1" }, video: { path: "clip.mp4", bytes: mp4 } };
+  const out = await saveMod.collectVideoProject(vdoc, new Blob([new Uint8Array([0xff, 0xd8])]));
+  const pj = JSON.parse(dec.decode(out.find((f) => f.path === "project.json").data));
+  check(json(out.map((f) => f.path)) === json(["clip.mp4", "preview.jpg", "project.json"]) && same(out[0].data, mp4), "collectVideoProject：视频原字节 + 封面 + project.json");
+  check(pj.type === "video" && pj.file === "clip.mp4" && pj.preview === "preview.jpg" && pj.title === "Clip" && !("workshopid" in pj), "collectVideoProject：type=video、file 指视频、去掉创意工坊 id");
 }
 
 section("X2. 导出闭环（新建 → 图片层 + 效果 → 打成 scene.pkg 存库 → 重新打开）");
@@ -2247,6 +2332,518 @@ section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 
   }
 }
 
+section("MA. 模型层识别 editor/model.ts + doc.modelFormOf（W12）");
+{
+  const modelMod = await loadEditorModule("model");
+  const { modelTruth, PUPPET_FIXTURES, MESH_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  const scene = {
+    general: {},
+    objects: [
+      { id: 1, name: "人物", image: "models/a.json", origin: "0 0 0" },
+      { id: 2, name: "背景", image: "models/bg.json", origin: "0 0 0" },
+      { id: 3, name: "球", model: "models/ball.mdl", origin: "0 0 0" },
+      { id: 4, name: "手", image: "models/a.json", parent: 1, origin: "0 0 0" },
+      { id: 5, name: "文字", text: { value: "x" }, origin: "0 0 0" },
+    ],
+  };
+  const puppets = new Map([["models/a.json", "models/a_puppet.mdl"]]);
+  check(
+    docMod.modelFormOf(scene.objects[0], puppets) === "puppet" && docMod.modelFormOf(scene.objects[2]) === "mesh" &&
+      docMod.modelFormOf(scene.objects[1], puppets) === undefined && docMod.modelFormOf(scene.objects[0]) === undefined && docMod.modelFormOf(scene.objects[4], puppets) === undefined,
+    "modelFormOf：model 字段 → mesh；图片的 model json 在 puppet 表里 → puppet；其余（含没扫过）不是模型",
+  );
+  const flat = (roots) => roots.flatMap((n) => [n, ...flat(n.children)]);
+  const nodes = flat(docMod.buildLayerTree(scene, puppets).roots);
+  const byId = (id) => nodes.find((n) => String(n.id) === String(id));
+  check(
+    byId(1).kind === "image" && byId(1).modelForm === "puppet" && byId(4).modelForm === "puppet" && byId(3).modelForm === "mesh" && byId(2).modelForm === undefined && byId(5).modelForm === undefined,
+    "建树：puppet 层仍是 kind image（效果 / 脚本 / 用户属性面板照常），只多一个 modelForm；子层同 json 也认",
+  );
+  const d = docMod.makeDoc("m", null, structuredClone(scene), "loose");
+  check(flat(d.roots).every((n) => n.modelForm !== "puppet") && byId(3).kind === "model", "没扫 puppet 时树里没有 puppet 层（扫描是打开后异步补的）；model 字段直接是模型层");
+  d.puppets = puppets;
+  docMod.rebuildTree(d);
+  check(flat(d.roots).filter((n) => n.modelForm === "puppet").length === 2, "doc.puppets 写入后 rebuildTree 标上 modelForm（结构编辑重建树不丢）");
+
+  const files = new Map([
+    ["models/a.json", new TextEncoder().encode('\uFEFF{"material":"m.json","puppet":"models/a_puppet.mdl"}')],
+    ["models/bg.json", new TextEncoder().encode('{"material":"m.json"}')],
+    ["models/bad.json", new TextEncoder().encode("{oops")],
+    ["models/empty.json", new TextEncoder().encode('{"puppet":""}')],
+  ]);
+  const reads = [];
+  const read = async (n) => {
+    reads.push(n);
+    if (n === "models/throw.json") throw new Error("boom");
+    return files.get(n) ?? null;
+  };
+  const sd = docMod.makeDoc("s", null, {
+    objects: [
+      ...scene.objects,
+      { id: 6, image: "models/bad.json" },
+      { id: 7, image: "models/empty.json" },
+      { id: 8, image: "models/missing.json" },
+      { id: 9, image: "models/throw.json" },
+      { id: 10, image: "textures/x.png" },
+    ],
+  }, "loose");
+  const found = await modelMod.scanPuppets(sd, read);
+  check(json([...found]) === json([["models/a.json", "models/a_puppet.mdl"]]), "scanPuppets：带 BOM 的 json 照读；非 puppet / 坏 json / 空 puppet / 缺文件 / 读取抛错都不算、也不抛");
+  check(reads.filter((n) => n === "models/a.json").length === 1 && !reads.includes("textures/x.png") && !reads.includes("models/ball.mdl"), "同一 json 只读一次；非 .json 图片与 model 字段不读");
+  check((await modelMod.scanPuppets({ scene: null }, read)).size === 0, "空文档给空表");
+
+  let corpusOk = 0;
+  const corpusBad = [];
+  for (const id of [...PUPPET_FIXTURES, ...MESH_FIXTURES]) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    const cd = docMod.makeDoc(id, null, structuredClone(t.scene), "loose");
+    const got = await modelMod.scanPuppets(cd, async (n) => t.read(n) ?? null);
+    cd.puppets = got;
+    docMod.rebuildTree(cd);
+    const formed = new Map(flat(cd.roots).filter((n) => n.modelForm).map((n) => [Number(n.id), n.modelForm]));
+    const want = new Map(t.objects.map((o) => [o.id, o.info.form]));
+    if (json([...got].sort()) === json([...t.puppets].sort()) && json([...formed].sort()) === json([...want].sort())) corpusOk++;
+    else corpusBad.push(id);
+  }
+  check(corpusOk >= 5 && corpusBad.length === 0, `语料：${corpusOk} 张夹具壁纸的 puppet 表 / 树上模型层与 parseMDL 参照一致（不符 ${json(corpusBad)}）`);
+
+  const info = {
+    form: "puppet",
+    mdlPath: "models/a_puppet.mdl",
+    modelJsonPath: "models/a.json",
+    version: "MDLV0023",
+    vertexCount: 120,
+    bones: [{ name: "root", parent: -1 }, { name: "arm", parent: 0 }],
+    animations: [{ id: 7, name: "wave", mode: "loop", fps: 30, frameCount: 45, duration: 1.5, events: [] }, { id: 8, name: "", mode: "single", fps: 24, frameCount: 10, duration: 10 / 24, events: [] }],
+    attachments: [{ name: "hand", bone: 1, bindOrigin: [1.23456, -2, 0] }, { name: "tip", bone: 9, bindOrigin: [0, 0, 0] }],
+    meshes: [{ materialPath: "materials/a.json", vertexCount: 120, texture: "a" }, { materialPath: null, vertexCount: 3, texture: null }],
+  };
+  const rows = modelMod.modelInfoRows(info);
+  const row = (k) => rows.find((r) => r[0] === k)?.[1];
+  check(
+    json(rows.map((r) => r[0])) === json(["model.form", "model.mdl", "model.json", "model.version", "model.vertices", "model.bones", "model.animations", "model.attachments", "model.meshes"]),
+    "modelInfoRows：分组行序固定（形态 / mdl / json / 版本 / 顶点 / 骨骼 / 动画 / 附着点 / 子网格）",
+  );
+  check(row("model.animations") === "#7 wave · loop · 1.5s (45f @ 30)\n#8 — · single · 0.417s (10f @ 24)", "动画行：id、名（空名 —）、模式、时长（三位小数）、帧数 @ fps，一条一行");
+  check(row("model.attachments") === "hand → arm (1.235, -2)\ntip → #9 (0, 0)", "附着点行：挂到的骨名（越界给 #序号）+ 绑定原点");
+  check(row("model.meshes") === "0: materials/a.json · 120v · a\n1: — · 3v", "子网格行：材质、顶点数、实际贴图");
+  const meshRows = modelMod.modelInfoRows({ ...info, form: "mesh", modelJsonPath: null, animations: [], attachments: [] });
+  check(!meshRows.some((r) => r[0] === "model.json") && meshRows.find((r) => r[0] === "model.animations")[1] === "—" && meshRows.find((r) => r[0] === "model.attachments")[1] === "—", "真 3D：没有 model json 行；无动画 / 附着点给 —");
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/opts\.after\?\.\(\);\s*void detectPuppets\(\);/.test(mainSrc) && /const found = await scanPuppets\(d, \(name\) => assets\.read\(name\)\);\s*if \(d !== doc \|\| !found\.size\) return;\s*d\.puppets = found;\s*rebuildTree\(d\);/.test(mainSrc), "页面：打开后异步扫 puppet，换了文档作废，扫完写 doc.puppets 并重建树");
+  check(/const info = editor && Number\.isFinite\(id\) \? editor\.getModelInfo\(id\) : null;/.test(mainSrc) && /if \(node\.modelForm\) inspectorEl\.appendChild\(modelGroup\(node\)\);/.test(mainSrc) && /modelInfoRows\(info\)/.test(mainSrc), "检视器「模型」分组：信息只经 getModelInfo，行由 modelInfoRows 排");
+  const pageSrc = fs.readdirSync(path.join(ROOT, "editor")).filter((f) => f.endsWith(".ts") && f !== "i18n.ts").map((f) => fs.readFileSync(path.join(ROOT, "editor", f), "utf8")).join("\n");
+  check(!/\.puppet\b(?!s)/.test(pageSrc.replace(/\b(json|modelJson)\.puppet/g, "")) && !/parseMDL|mdl-parse/.test(pageSrc), "页面不读 layer.puppet、不自己解析 .mdl（只有 scanPuppets 读 model json 的 puppet 字段）");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const mKeys = ["insp.model", "kind.model", "model.notLoaded", "model.form.puppet", "model.form.mesh", ...rows.map((r) => r[0])];
+  const mMissing = mKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(mMissing.length === 0, `模型分组文案中英文都有（缺 ${json(mMissing)}）`);
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/if \(l\.puppet && l\.modelSrc\) return "model";/.test(sm) && /getModelInfo\(id: number\): EditorModelInfo \| null \{/.test(sm), "引擎：只有模型真装上（puppet + modelSrc）才报 kind model；getModelInfo 在控制面上");
+}
+
+section("MC. 附着点绑定 editor/model.ts（W14）");
+{
+  const mm = await loadEditorModule("model");
+  const near = (a, b, eps = 1e-3) => a.every((v, i) => Math.abs(v - b[i]) <= eps);
+  const offs = { "10|head": [30, 40], "10|hand": [-12, 5], "20|tip": [3, -7] };
+  const offOf = (mid, name) => offs[`${mid}|${name}`] ?? null;
+  const mk = () =>
+    docMod.makeDoc("att", null, {
+      objects: [
+        { id: 10, name: "人", image: "models/a.json", origin: "100 200 0", scale: "2 0.5 1", angles: "0 0 0.5" },
+        { id: 1, name: "帽子", origin: "400 300 0", scale: "1 1 1", angles: "0 0 0.2" },
+        { id: 2, name: "帽檐", parent: 1, origin: "10 0 0" },
+        { id: 20, name: "剑", image: "models/b.json", parent: 10, attachment: "hand", origin: "1 2 0", scale: "1 1 1", angles: "0 0 0" },
+        { id: 3, name: "眼睛", parent: 10, origin: "5 6 0", scale: "1 1 1", angles: "0 0 0" },
+        { id: 4, name: "动", origin: { value: "0 0 0", animation: { c0: [], options: { fps: 30, length: 10, mode: "loop" } } } },
+        { id: 30, name: "扁", image: "models/c.json", scale: "0 1 1" },
+      ],
+    }, "loose");
+  const W = (d, id) => mm.attachedWorld(d.scene.objects, d.scene.objects.find((o) => o.id === id), offOf);
+  {
+    const d = mk();
+    const w20 = W(d, 20);
+    const m = W(d, 10);
+    const c = Math.cos(0.5), s = Math.sin(0.5);
+    const lx = (1 - 12) * 2, ly = (2 + 5) * 0.5;
+    check(near(w20.origin, [100 + lx * c - ly * s, 200 + lx * s + ly * c, 0]) && near(m.origin, [100, 200, 0]), "attachedWorld：挂件局部 origin 先加附着点偏移，再乘父缩放 / 旋转（引擎 parentMeshToWorldDelta 同式）");
+  }
+  {
+    const d = mk();
+    const order = json(d.scene.objects.map((o) => o.id));
+    const w1 = W(d, 1), w2 = W(d, 2);
+    check(mm.attachToModel(d, 1, 10, "head", offOf) === "ok", "attachToModel：普通根层挂到模型附着点");
+    const o1 = d.scene.objects.find((o) => o.id === 1);
+    check(o1.parent === 10 && o1.attachment === "head" && near(W(d, 1).origin, w1.origin) && near(W(d, 1).scale, w1.scale) && near(W(d, 1).angles, w1.angles) && near(W(d, 2).origin, w2.origin),
+      "★ 绑定前后世界变换不变（含子层）");
+    check(json(d.scene.objects.map((o) => o.id)) === order, "对象数组顺序不动（绘制层叠不变）");
+    const fl = (r) => r.flatMap((n) => [n, ...fl(n.children)]);
+    check(d.roots.every((n) => n.id !== 1) && fl(d.roots).find((n) => n.id === 10).children.some((c) => c.id === 1), "树重建：帽子成为模型层的子层");
+    check(mm.attachToModel(d, 1, 10, "head", offOf) === "noop", "同模型同附着点再绑 = noop");
+    const before3 = d.scene.objects.find((o) => o.id === 3).scale;
+    const w3 = W(d, 3);
+    check(mm.attachToModel(d, 3, 10, "head", offOf) === "ok" && near(W(d, 3).origin, w3.origin) && d.scene.objects.find((o) => o.id === 3).scale === before3, "已是模型子层：只改 origin，缩放 / 旋转字段原样");
+    const wSword = W(d, 20);
+    check(mm.attachToModel(d, 20, 10, "head", offOf) === "ok" && near(W(d, 20).origin, wSword.origin), "换附着点（hand → head）世界位置不变");
+    const wd = W(d, 1);
+    check(mm.detachFromModel(d, 1, offOf) === "ok" && d.scene.objects.find((o) => o.id === 1).attachment === undefined && d.scene.objects.find((o) => o.id === 1).parent === 10 && near(W(d, 1).origin, wd.origin),
+      "★ 解绑：去掉 attachment、父级仍是模型层，世界位置不变");
+    check(mm.detachFromModel(d, 1, offOf) === "noop", "没挂的层解绑 = noop");
+  }
+  {
+    const d = mk();
+    const snap = json(d.scene.objects);
+    check(mm.attachToModel(d, 10, 20, "tip", offOf) === "cycle" && mm.attachToModel(d, 10, 10, "head", offOf) === "cycle", "挂到自己 / 自己的子孙上 = cycle");
+    check(mm.attachToModel(d, 4, 10, "head", offOf) === "animated", "位置有关键帧 = animated");
+    check(mm.attachToModel(d, 1, 10, "nope", offOf) === "noAttachment" && mm.attachToModel(d, 99, 10, "head", offOf) === "missing", "附着点不存在 / 图层不存在");
+    offs["30|p"] = [1, 1];
+    check(mm.attachToModel(d, 1, 30, "p", offOf) === "degenerate", "模型层缩放有 0 分量 = degenerate");
+    check(json(d.scene.objects) === snap, "全部拒绝路径文档原样");
+  }
+  {
+    const d = mk();
+    const w1 = W(d, 1);
+    check(mm.attachToModel(d, 1, 20, "tip", offOf) === "ok" && near(W(d, 1).origin, w1.origin), "嵌套：挂到「自己也是挂件」的模型上，祖先的附着点偏移一并计入");
+  }
+
+  const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
+  const MDL = await imp("renderer/vendor/we-scene/render/mdl.js");
+  const { modelTruth, PUPPET_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  let compared = 0, attachedN = 0, roundTrip = 0;
+  const bad = [];
+  for (const id of [...PUPPET_FIXTURES, "3791001607", "3790371777", "3226487183"]) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    const projPath = path.join(LIB, id, "project.json");
+    const project = fs.existsSync(projPath) ? JSON.parse(fs.readFileSync(projPath, "utf8")) : {};
+    const scene = parseScene(structuredClone(t.scene), project);
+    for (const l of scene.layers) {
+      if (!l.image) continue;
+      let mj = null;
+      try { mj = JSON.parse(new TextDecoder().decode(t.read(l.image)).replace(/^\uFEFF/, "")); } catch {}
+      const buf = mj?.puppet && t.read(mj.puppet);
+      if (buf) l.puppet = MDL.parseMDL(buf);
+    }
+    MDL.applyAttachmentBindOrigins(scene.layers);
+    const layerOf = new Map(scene.layers.map((l) => [String(l.id), l]));
+    const eOff = (mid, name) => {
+      const l = layerOf.get(String(mid));
+      return l ? MDL.attachmentEffectiveOffset(l, name) : null;
+    };
+    const objs = t.scene.objects;
+    const byId = new Map(objs.map((o) => [String(o.id), o]));
+    const isPlain = (o) => ["origin", "scale", "angles"].every((f) => o[f] === undefined || typeof o[f] === "string");
+    const chainPlain = (o) => {
+      for (let c = o, n = 0; c && n < 64; c = byId.get(String(c.parent)), n++) if (!isPlain(c)) return false;
+      return true;
+    };
+    for (const o of objs) {
+      const l = layerOf.get(String(o.id));
+      if (!l || l.isPostProcess || !chainPlain(o)) continue;
+      const w = mm.attachedWorld(objs, o, eOff);
+      compared++;
+      if (!near(w.origin.slice(0, 2), l.origin.slice(0, 2), 0.05)) bad.push(`${id}#${o.id} 世界 ${w.origin.slice(0, 2).map((v) => v.toFixed(2))} ≠ 引擎 ${l.origin.slice(0, 2).map((v) => v.toFixed(2))}`);
+    }
+    for (const o of objs) {
+      if (!mm.attachmentOf(o) || !chainPlain(o) || !eOff(o.parent, o.attachment)) continue;
+      attachedN++;
+      const dd = docMod.makeDoc(id, null, structuredClone(t.scene), "loose");
+      const me = dd.scene.objects.find((x) => x.id === o.id);
+      const w0 = mm.attachedWorld(dd.scene.objects, me, eOff);
+      const r1 = mm.detachFromModel(dd, o.id, eOff);
+      const w1 = mm.attachedWorld(dd.scene.objects, me, eOff);
+      const r2 = mm.attachToModel(dd, o.id, o.parent, o.attachment, eOff);
+      const back = docMod.localXform(me).origin;
+      if (r1 === "ok" && r2 === "ok" && near(w0.origin, w1.origin, 0.01) && near(back, docMod.localXform(o).origin, 0.01)) roundTrip++;
+      else bad.push(`${id}#${o.id} 往返 ${r1}/${r2}`);
+    }
+  }
+  check(compared > 200 && attachedN >= 20 && bad.length === 0,
+    `语料：${compared} 个图层的 attachedWorld ≡ 引擎 parseScene + applyAttachmentBindOrigins（绑定姿势）；${attachedN} 个挂件「解绑 → 世界不变 → 重绑 → 局部 origin 复原」往返 ${roundTrip} 个（不符 ${json(bad.slice(0, 4))}）`);
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/const attachOffsetOf: AttachOffsetOf = \(mid, name\) =>\s*editor\?\.getAttachmentPoints\(Number\(mid\)\)/.test(mainSrc) && /attachToModel\(d, node\.id, p\.model, p\.name, attachOffsetOf\)/.test(mainSrc) && /detachFromModel\(d, node\.id, attachOffsetOf\)/.test(mainSrc),
+    "页面：绑定 / 解绑的偏移只经引擎 getAttachmentPoints（不自己算蒙皮），走 structEdit");
+  check(/const att = attachGroup\(node\);/.test(mainSrc) && /drawAttachMarkers\(\);\s*\}/.test(mainSrc), "检视器「挂到模型」分组 + 视口附着点十字标记");
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/getAttachmentPoints\(id: number\): EditorAttachmentPoint\[\] \| null \{/.test(sm) && /mdl\.computeSkinMatrices\(m, currentTime\(\), l\.animationLayers, getBoneOverrides\(l\)\);/.test(sm) && /mdl\.attachmentEffectiveOffset\(l, name\)/.test(sm),
+    "引擎：getAttachmentPoints 以当前时刻 / 动画层 / 骨骼覆盖求姿势，偏移与挂件定位同一函数");
+  const skin = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js"), "utf8");
+  check(/const d = attachmentAtlasBind\(parent\) \? \[0, 0\] : parentMeshToWorldDelta\(parent, bx, by\)/.test(skin), "挂件定位与 getAttachmentPoints 共用 attachmentAtlasBind 判定");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keys = [...new Set([...mainSrc.matchAll(/et\("((?:att|insp\.attach|log\.attached|log\.detached)[\w.]*)"/g)].map((m) => m[1]).concat(["att.fail.missing", "att.fail.cycle", "att.fail.animated", "att.fail.degenerate", "att.fail.noAttachment"]))];
+  const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(keys.length >= 9 && missing.length === 0, `挂到模型文案中英文都有（${keys.length} 个键，缺 ${json(missing)}）`);
+}
+
+section("MB. 动画层编辑 editor/model.ts（W13）");
+{
+  const mm = await loadEditorModule("model");
+  const { parseAnimationLayers } = await imp("renderer/vendor/we-scene/scene/parse.js");
+  const { modelTruth, PUPPET_FIXTURES, MESH_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  const mkDoc = () => {
+    const scene = {
+      objects: [
+        { id: 3, name: "人", image: "models/a.json", animationlayers: [{ additive: false, animation: 7, blend: 1, blendin: false, blendout: false, blendtime: 0.5, id: 12, name: "走", rate: 1, visible: true }] },
+        { id: 9, name: "球", model: "models/b.mdl" },
+      ],
+    };
+    return docMod.makeDoc("al", null, scene, "loose");
+  };
+  const d = mkDoc();
+  const o = d.scene.objects[0];
+  const at = mm.addAnimLayer(d, o, 8, "动画 2");
+  check(at === 1 && json(Object.keys(o.animationlayers[1])) === json(Object.keys(o.animationlayers[0])) && o.animationlayers[1].id === 13 && o.animationlayers[1].animation === 8 && o.animationlayers[1].blend === 1 && o.animationlayers[1].rate === 1 && o.animationlayers[1].visible === true && o.animationlayers[1].additive === false && o.animationlayers[1].blendtime === 0.5,
+    "addAnimLayer：字段与键序同 WE 存盘；id = 对象与动画层共用编号空间的最大值 + 1");
+  const ball = d.scene.objects[1];
+  check(mm.addAnimLayer(d, ball, 0, "x") === 0 && ball.animationlayers[0].id === 14 && mm.addAnimLayer(d, ball, 1.5, "y") === null && ball.animationlayers.length === 1, "没有表的层新建表；片段 id 非整数拒绝");
+  const v = mm.getAnimLayers(o);
+  check(v.length === 2 && v[0].name === "走" && v[1].animation === 8 && v[0].id === 12 && json(v[0].wrapped) === "{}", "getAnimLayers：按表序读出，带下标与 id");
+  check(mm.moveAnimLayer(o, 0, 1) && o.animationlayers[0].name === "动画 2" && !mm.moveAnimLayer(o, 1, 1) && !mm.moveAnimLayer(o, 0, -1), "moveAnimLayer：相邻交换；越界不动");
+  check(mm.setAnimLayerField(o, 0, "blend", 0.25) && o.animationlayers[0].blend === 0.25 && !mm.setAnimLayerField(o, 0, "blend", 1.5) && !mm.setAnimLayerField(o, 0, "blend", NaN) && !mm.setAnimLayerField(o, 0, "rate", -1) && mm.setAnimLayerField(o, 0, "rate", 2) && o.animationlayers[0].rate === 2,
+    "setAnimLayerField：blend ∈ [0,1]、rate ≥ 0，越界 / NaN 拒绝");
+  check(!mm.setAnimLayerField(o, 0, "visible", 1) && mm.setAnimLayerField(o, 0, "visible", false) && o.animationlayers[0].visible === false && !mm.setAnimLayerField(o, 0, "animation", "7") && mm.setAnimLayerField(o, 0, "animation", 7) && !mm.setAnimLayerField(o, 5, "name", "x"),
+    "布尔字段只收布尔、片段只收整数、下标越界拒绝");
+  check(mm.animLayersHot(o), "无包装的表可热替换");
+  const solo = mm.soloAnimLayers(o, 0);
+  check(solo[0].visible === true && solo[0].blend === 0.25 && solo[1].blend === 0 && o.animationlayers[0].visible === false && o.animationlayers[1].blend === 1, "soloAnimLayers：目标层强制可见、其余 blend 0，返回副本、文档不动");
+  check(mm.removeAnimLayer(o, 1) && o.animationlayers.length === 1 && mm.removeAnimLayer(o, 0) && o.animationlayers === undefined && !mm.removeAnimLayer(o, 0), "removeAnimLayer：删空后去掉 animationlayers 键（同没有动画层的存盘）");
+
+  const wrapped = {
+    animationlayers: [
+      { animation: 1, name: "a", blend: { script: "export function update(v){return v;}", scriptproperties: { k: 1 }, value: 0.5 }, rate: { user: "speed", value: 1 }, visible: { script: "x", value: true }, additive: false },
+      { animation: 2, name: "b", blend: { animation: { c0: [], options: { fps: 30, length: 10, mode: "loop" } }, value: 1 }, rate: 1, visible: true, additive: false },
+    ],
+  };
+  const wv = mm.getAnimLayers(wrapped);
+  check(json(wv[0].wrapped) === json({ blend: "script", rate: "user", visible: "script" }) && json(wv[1].wrapped) === json({ blend: "animation" }) && wv[0].blend === 0.5 && wv[0].rate === 1, "包装形态识别（script / user / animation），值取 value");
+  check(!mm.animLayersHot(wrapped), "表里有任何包装就不热替换（引擎按下标挂脚本 / 曲线 / 绑定）");
+  const keep = json(wrapped.animationlayers[0].blend.scriptproperties);
+  mm.setAnimLayerField(wrapped, 0, "blend", 0.75);
+  mm.setAnimLayerField(wrapped, 0, "rate", 3);
+  mm.setAnimLayerField(wrapped, 1, "blend", 0.1);
+  check(wrapped.animationlayers[0].blend.value === 0.75 && typeof wrapped.animationlayers[0].blend.script === "string" && json(wrapped.animationlayers[0].blend.scriptproperties) === keep && wrapped.animationlayers[0].rate.user === "speed" && wrapped.animationlayers[0].rate.value === 3 && wrapped.animationlayers[1].blend.value === 0.1 && wrapped.animationlayers[1].blend.animation.options.fps === 30,
+    "包装字段只改 value：脚本 / scriptproperties / 用户属性绑定 / 曲线原样保留");
+
+  let corpusLayers = 0;
+  const corpusBad = [];
+  for (const id of [...PUPPET_FIXTURES, ...MESH_FIXTURES]) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    for (const obj of t.scene.objects ?? []) {
+      if (!Array.isArray(obj.animationlayers)) continue;
+      const got = mm.getAnimLayers(obj);
+      const ref = parseAnimationLayers(obj.animationlayers);
+      corpusLayers += got.length;
+      const same = got.length === ref.length && got.every((g, i) => {
+        const r = ref[i];
+        return g.animation === r.animation && g.name === r.name && g.additive === r.additive && (g.wrapped.blend || g.blend === r.blend) && (g.wrapped.rate || g.rate === r.rate) && (g.wrapped.visible || g.visible === r.visible);
+      });
+      if (!same) corpusBad.push(`${id}#${obj.id}`);
+      const before = json(obj.animationlayers);
+      const back = structuredClone(obj);
+      got.forEach((g) => {
+        for (const f of ["animation", "name", "blend", "rate", "visible", "additive"]) mm.setAnimLayerField(back, g.index, f, g[f]);
+      });
+      if (json(back.animationlayers) !== before) corpusBad.push(`${id}#${obj.id} 回写`);
+    }
+  }
+  check(corpusLayers >= 5 && corpusBad.length === 0, `语料：${corpusLayers} 条动画层 getAnimLayers ≡ 引擎 parseAnimationLayers，原值回写逐字节不变（不符 ${json(corpusBad)}）`);
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/if \(hot && editor && \(hotAlways \|\| cmd\.after === cmd\.before\)\)/.test(mainSrc) && /const hot = !!editor && Number\.isFinite\(id\) && !!editor\.getModelInfo\(id\) && animLayersHot\(node\.obj\);/.test(mainSrc),
+    "页面：动画层提交在无包装且模型已装上时走整表热替换，否则重挂");
+  check(/if \(node\.modelForm\) inspectorEl\.appendChild\(animLayersGroup\(node\)\);/.test(mainSrc) && /editor\s*\.setAnimationLayers\(/.test(mainSrc) && /animSolo = null;\s*const gen = \+\+openGen;/.test(mainSrc) && /if \(animSolo && animSolo\.id !== selectedId\) endAnimSolo\(\);/.test(mainSrc),
+    "检视器「动画层」分组接在模型层上；单独预览在重挂 / 换选中时结束");
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/const next: any\[\] = scn\.parseAnimationLayers\(/.test(sm) && /setAnimationLayers: setAnimationLayersImpl/.test(sm) && /animationLayers: parseAnimationLayers\(o\.animationlayers\),/.test(fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8")),
+    "引擎：setAnimationLayers 与装配共用 parseAnimationLayers（同一份解析）");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keys = [...mainSrc.matchAll(/et\("((?:al|log\.animLayer|insp\.animLayers)[\w.]*)"/g)].map((m) => m[1]);
+  const alKeys = [...new Set([...keys, "al.wrap.script", "al.wrap.user", "al.wrap.animation", "al.visible", "al.additive"])];
+  const alMissing = alKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(alKeys.length >= 15 && alMissing.length === 0, `动画层文案中英文都有（${alKeys.length} 个键，缺 ${json(alMissing)}）`);
+}
+
+section("MD. 蒙皮网格拾取 / 轮廓 hittest.js + mdl-skin.skinnedMeshes（W15）");
+{
+  const HT = await imp("renderer/vendor/we-scene/render/hittest.js");
+  const SK = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const T = (x, y, z = 0) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
+  const mdl1 = {
+    bones: [{}, {}, {}],
+    vertexCount: 3,
+    positions: new Float32Array([1, 2, 7, 5, 5, 5, 0, 0, 3]),
+    boneIdx: new Float32Array([0, 1, 0, 0, 2, 9, 0, 0, 0, 0, 0, 0]),
+    weights: new Float32Array([0.25, 0.75, 0, 0, 0.5, 0.5, 0, 0, 0, 0, 0, 0]),
+    indices: new Uint16Array([0, 1, 2]),
+    indexCount: 3,
+  };
+  const skin = new Float32Array([...T(10, 0), ...T(0, 20), ...T(-4, 4)]);
+  const [s1] = SK.skinnedMeshes(mdl1, skin, false);
+  check(json([...s1.pos]) === json([1 + 2.5, 2 + 15, 0, 1, 9, 0, 0, 0, 0]),
+    "skinnedMeshes：Σw·(skin·p)/Σw（同顶点着色器）；越界骨跳过且不计权；无有效权重留原位；2D 压平 z");
+  const [s1z] = SK.skinnedMeshes(mdl1, skin, true);
+  check(s1z.pos[2] === 7 && s1z.pos[5] === 5 && s1z.pos[8] === 3, "keepZ（透视场景）保留 z");
+  const [s0] = SK.skinnedMeshes(mdl1, null, true);
+  check(json([...s0.pos]) === json([...mdl1.positions]), "skin = null（绑定姿势早退）→ 原始位置");
+  const multi = { bones: [], meshes: [{ ...mdl1 }, { ...mdl1, positions: new Float32Array(9) }], vertexCount: 6 };
+  check(SK.skinnedMeshes(multi, null, false).length === 2 && SK.skinnedMeshes({ ...mdl1, meshes: [mdl1] }, null, false).length === 1,
+    "多子网格逐个出；单子网格走顶层字段（同 mdl.js meshListOf 规则）");
+
+  // 正交：网格 (x,y) → NDC (x/100, y/100) → CSS 200×100
+  const ortho = [0.01, 0, 0, 0, 0, 0.01, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const quad = { pos: new Float32Array([-50, -50, 0, 50, -50, 0, 50, 50, 0, -50, 50, 0, 0, 0, 0]), indices: [0, 1, 2], vertexCount: 5, indexCount: 3 };
+  const [pq] = HT.projectMeshesToScreen([quad], ortho, 200, 100);
+  check(near(pq.xy[0], 50) && near(pq.xy[1], 75) && near(pq.xy[4], 150) && near(pq.xy[5], 25), "projectMeshesToScreen：NDC → CSS（y 翻向下）");
+  const hull = HT.screenMeshesHull([pq]);
+  check(hull.length === 3, `凸包只收被三角形引用的顶点（未引用的 #3/#4 不进，得 ${hull.length} 点）`);
+  check(HT.screenMeshesContain([pq], 140, 40) && !HT.screenMeshesContain([pq], 60, 30) && HT.screenMeshesContain([pq], 150, 25), "三角形内命中、对角那半不命中、顶点上算命中");
+  const square = { pos: new Float32Array([-50, -50, 0, 50, -50, 0, 50, 50, 0, -50, 50, 0, 0, 0, 0]), indices: [0, 1, 2, 0, 2, 3, 4, 4, 4], vertexCount: 5, indexCount: 9 };
+  const [ps] = HT.projectMeshesToScreen([square], ortho, 200, 100);
+  check(HT.screenMeshesHull([ps]).length === 4 && !HT.screenMeshesContain([{ ...ps, indices: [4, 4, 4], indexCount: 3 }], 100, 50),
+    "方形凸包 4 点（内点不进）；零面积三角形不命中任何点");
+  const ring = { pos: new Float32Array([-50, -50, 0, 50, -50, 0, 50, 50, 0, -50, 50, 0, -10, -10, 0, 10, -10, 0, 10, 10, 0]), indices: [0, 1, 4, 1, 5, 4, 1, 2, 5, 2, 6, 5], vertexCount: 7, indexCount: 12 };
+  const [pr] = HT.projectMeshesToScreen([ring], ortho, 200, 100);
+  const prHull = HT.screenMeshesHull([pr]);
+  const inHull = (x, y) => prHull.every((a, i) => { const b = prHull[(i + 1) % prHull.length]; return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]) <= 0; }) ||
+    prHull.every((a, i) => { const b = prHull[(i + 1) % prHull.length]; return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]) >= 0; });
+  check(HT.screenMeshesContain([pr], 140, 50) && inHull(95, 54) && !HT.screenMeshesContain([pr], 95, 54), "凸包内、三角形外（凹处 / 镂空）不命中 —— 逐三角形精判");
+
+  // 透视：相机在原点看 −z，near 1。一个三角形一角在相机身后
+  const f = 1 / Math.tan(Math.PI / 4);
+  const n0 = 1, f0 = 100;
+  const persp = [f, 0, 0, 0, 0, f, 0, 0, 0, 0, (f0 + n0) / (n0 - f0), -1, 0, 0, (2 * f0 * n0) / (n0 - f0), 0];
+  const ground = { pos: new Float32Array([-10, -1, -20, 10, -1, -20, 0, -1, 5]), indices: [0, 1, 2], vertexCount: 3, indexCount: 3 };
+  const [pg] = HT.projectMeshesToScreen([ground], persp, 400, 400);
+  check(pg.ok[0] === 1 && pg.ok[1] === 1 && pg.ok[2] === 0, "相机身后的顶点不进可见集");
+  const gh = HT.screenMeshesHull([pg]);
+  // 近处地面（z ≈ −1.5，屏幕下半部靠中间）：GPU 会画出裁剪后的那部分
+  check(HT.screenMeshesContain([pg], 200, 340) && gh && gh.length >= 3 && Math.max(...gh.map((p) => p[1])) > 340,
+    "跨近裁剪面的三角形按 GPU 裁剪后参与命中与凸包（铺到相机身后的地面近处点得中）");
+  check(!HT.screenMeshesContain([pg], 200, 100), "地平线以上不命中");
+
+  const L = (id, x) => ({ id, origin: [x, 100, 0], size: [100, 100], scale: [1, 1, 1], angles: [0, 0, 0], visible: true });
+  const layers = [L(1, 100), L(2, 150), L(3, 500)];
+  const all = (opts) => HT.hitTestLayersAll(layers, 140, 100, 200, opts).map((l) => l.id).join(",");
+  check(all({}) === "2,1", "不传 meshHit：OBB 结果不变（播放路径）");
+  check(all({ meshHit: (l) => (l.id === 2 ? false : undefined) }) === "1" && all({ meshHit: (l) => (l.id === 3 ? true : undefined) }) === "3,2,1",
+    "meshHit：false 否决 OBB、true 直接命中（网格可伸出图层矩形）、undefined 落回 OBB");
+
+  const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const rj = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  check((sm.match(/meshHit:/g) ?? []).length === 1 && /hitTestAt\(x: number, y: number, opts = \{\}\) \{[\s\S]{0,900}meshHit: \(l: any\) => \{/.test(sm),
+    "引擎：meshHit 只接在编辑器 hitTestAt（脚本光标 / 点击派发的 hit-test 不变）");
+  check(/lastFrameMats = \{ cam, viewProj, viewProjPersp \}/.test(rj) && /getModelMvp: function \(layer\) \{[\s\S]{0,300}mat4Multiply\(vp, puppetModelMatrix\(layer, f\.cam\)\)/.test(rj),
+    "渲染器：getModelMvp = 上一帧 viewProj（perspective 层换透视 VP）· puppetModelMatrix，与 drawPuppetDirect 同一套");
+  check(/mdl\.skinnedMeshes\(m, skin, ev\.perspective\)/.test(sm) && /hull = g\?\.hull && g\.hull\.length >= 3/.test(sm), "getLayerOutline / hitTestAt 共用 modelScreenMesh（同一份投影）");
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/if \(outline\.hull\) strokePoly\(outline\.hull/.test(mainSrc) && /const c = o\?\.hull \?\? o\?\.corners;/.test(mainSrc), "页面：选中 / 多选轮廓优先画网格凸包");
+}
+
+section("ME. 子网格贴图替换 editor/model.ts + api retargetMdlMaterial（W16）");
+{
+  const mm = await loadEditorModule("model");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const { modelTruth, PUPPET_FIXTURES, MESH_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  const img = { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2]), ext: "png" };
+  const mat = { passes: [{ shader: "genericimage4", blending: "translucent", combos: { LIGHTING: 1 }, constantshadervalues: { alpha: 0.5 }, textures: ["chars/a", "masks/m", null] }], extra: 1 };
+  const matSnap = json(mat);
+  const rm = mm.retexturedMaterial(mat, "k");
+  check(json(rm) === json({ ...mat, passes: [{ ...mat.passes[0], textures: ["editor/k", "masks/m", null] }] }) && json(mat) === matSnap,
+    "retexturedMaterial：只换槽 0 为 editor/<slug>，shader / combos / 常量 / 其余槽原样；原材质对象不动");
+  check(json(mm.retexturedMaterial({ passes: [{ shader: "x" }] }, "k").passes[0].textures) === json(["editor/k"]) && mm.retexturedMaterial({ passes: [] }, "k") === null && mm.retexturedMaterial({}, "k") === null,
+    "没有 textures 补一个；没有 pass 拒绝（null）");
+  check(json(mm.parseJsonBytes(enc.encode('\uFEFF{"a":1}'))) === json({ a: 1 }) && mm.parseJsonBytes(enc.encode("[1]")) === null && mm.parseJsonBytes(enc.encode("{x")) === null && mm.parseJsonBytes(null) === null,
+    "parseJsonBytes：容 BOM；数组 / 坏 json / 缺文件都给 null");
+
+  const modelJson = { material: "materials/chars/a.json", puppet: "models/a_puppet.mdl", autosize: true, cropoffset: "1 2", width: 640 };
+  const pr = mm.puppetRetexture(modelJson, mat, "k", img);
+  const prFiles = new Map(pr.files.map((f) => [f.name, f.data]));
+  check(pr.path === "models/editor/k.json" && json([...prFiles.keys()]) === json(["models/editor/k.json", "materials/editor/k.json", "materials/editor/k.png"]),
+    "puppet：三件落在 */editor/<slug>.*，对象改指向新 model json");
+  const prModel = JSON.parse(dec.decode(prFiles.get("models/editor/k.json")));
+  check(json(prModel) === json({ ...modelJson, material: "materials/editor/k.json" }), "model json 副本：puppet / autosize / cropoffset 等原样，只有 material 改指向材质副本");
+  check(JSON.parse(dec.decode(prFiles.get("materials/editor/k.json"))).passes[0].textures[0] === "editor/k" && prFiles.get("materials/editor/k.png") === img.bytes,
+    "材质副本槽 0 = editor/<slug>（引擎缺 .tex 回退同名 png，pkg 导出再转 .tex）；源图原字节");
+  check(mm.puppetRetexture({ material: "m.json" }, mat, "k", img) === null && mm.puppetRetexture(modelJson, { passes: [] }, "k", img) === null, "不是 puppet 的 model json / 材质无 pass 拒绝");
+
+  const slotInfo = { form: "mesh", meshes: [{ materialPath: "materials/a.json", vertexCount: 3, texture: "a" }, { materialPath: "materials/b.json", vertexCount: 3, texture: null }] };
+  check(json(mm.modelTextureSlots(slotInfo)) === json([{ index: 0, materialPath: "materials/a.json", texture: "a" }, { index: 1, materialPath: "materials/b.json", texture: null }]) &&
+    json(mm.modelTextureSlots({ ...slotInfo, form: "puppet" })) === json([{ index: 0, materialPath: null, texture: "a" }]),
+    "modelTextureSlots：mesh 每个子网格一行；puppet 整层一张（材质以 model json 为准，不取 .mdl 头）");
+
+  // 语料：每个模型 .mdl 的每个子网格改指向，parseMDL 读回只有该子网格材质变、几何 / 骨骼 / 动画逐项不变
+  const seen = new Set();
+  let meshesOk = 0;
+  let multiOk = 0;
+  const bad = [];
+  const geo = (m) => (m.meshes && m.meshes.length ? m.meshes : [m]).map((x) => [x.vertexCount, x.indexCount, Buffer.from(x.positions.buffer, x.positions.byteOffset, x.positions.byteLength).toString("base64"), Buffer.from(x.indices.buffer, x.indices.byteOffset, x.indices.byteLength).toString("base64")]);
+  const rig = (m) => json([m.bones.map((b) => [b.name, b.parent]), m.animations.map((a) => [a.id, a.name, a.frameCount]), (m.attachments || []).map((a) => a.name)]);
+  const mats = (m) => (m.meshes && m.meshes.length ? m.meshes : [m]).map((x) => x.materialPath ?? null);
+  for (const id of [...PUPPET_FIXTURES, ...MESH_FIXTURES]) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    for (const o of t.objects) {
+      const key = `${id}:${o.info.mdlPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const bytes = t.read(o.info.mdlPath);
+      const before = P.parseMDL(bytes);
+      const listed = mm.meshMaterialPath(bytes, 0);
+      if (listed !== mats(before)[0]) bad.push(`${key} 读 #0 ${listed}`);
+      const n = mats(before).length;
+      for (let i = 0; i < n; i++) {
+        const r = mm.meshRetexture(bytes, i, mat, "t", img);
+        if (!r) {
+          bad.push(`${key}#${i} null`);
+          continue;
+        }
+        const after = P.parseMDL(r.files[0].data);
+        const want = mats(before).map((p, k) => (k === i ? "materials/editor/t.json" : p));
+        if (r.path !== "models/editor/t.mdl" || json(mats(after)) !== json(want) || json(geo(after)) !== json(geo(before)) || rig(after) !== rig(before)) bad.push(`${key}#${i}`);
+        else meshesOk++;
+      }
+      if (n > 1) multiOk++;
+      if (mm.meshRetexture(bytes, n, mat, "t", img) !== null) bad.push(`${key} 越界未拒`);
+    }
+  }
+  check(meshesOk >= 10 && multiOk >= 1 && bad.length === 0, `语料：${seen.size} 个 .mdl、${meshesOk} 个子网格逐个改指向，parseMDL 读回只有该子网格材质变（多子网格 ${multiOk} 个；越界拒绝；不符 ${json(bad.slice(0, 5))}）`);
+  check(mm.meshRetexture(new Uint8Array([0x4d, 0x44, 0x4c, 0x56, 0x30, 0x30, 0x32, 0x33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0, mat, "t", img) === null && mm.meshMaterialPath(enc.encode("nope"), 0) === null,
+    "网格表读不通 / 不是 MDL：拒绝，不抛");
+
+  // 资源表多拥有者：第二次换图时旧副本带来的材质 / 源图也要随新副本进保存清单
+  const refs = new Set();
+  const ov = assetsMod.overlayAssets("scene.json", null, () => refs);
+  ov.put("materials/editor/a.json", enc.encode("a"), "models/editor/a.mdl");
+  ov.put("models/editor/a.mdl", enc.encode("m"), "models/editor/a.mdl");
+  ov.share("models/editor/a.mdl", "models/editor/b.mdl");
+  ov.share("models/editor/a.mdl", "models/editor/b.mdl");
+  refs.add("models/editor/b.mdl");
+  check(ov.list().includes("materials/editor/a.json") && json(ov.added().find((f) => f.name === "materials/editor/a.json").group) === json(["models/editor/a.mdl", "models/editor/b.mdl"]),
+    "share：新副本成为旧副本名下文件的共同拥有者（重复 share 不重复记）");
+  refs.clear();
+  check(!ov.list().length, "两个拥有者都不被引用时都不进保存清单（撤销后不残留）");
+  const dd = draftMod.makeDraft(docMod.makeDoc("d", null, { objects: [] }, "loose"), { kind: "new" }, "scene.json", ov.added());
+  check(draftMod.parseDraft(structuredClone(dd)) !== null && draftMod.parseDraft({ ...dd, files: [{ name: "x", data: new Uint8Array(1), group: ["a", 3] }] }) === null,
+    "草稿收多拥有者 group（字符串数组），数组里混非字符串仍拒");
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/for \(const f of res\.files\) assets\.put\(f\.name, f\.data, res\.path\);\s*assets\.share\(from, res\.path\);/.test(mainSrc),
+    "页面：新文件分组 = 新副本路径，并继承旧副本名下文件");
+  check(/if \(puppet\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[res\.path, puppet\]\]\);\s*structEdit\(/.test(mainSrc) && /if \(puppet\) n\.obj\.image = res\.path;\s*else n\.obj\.model = res\.path;/.test(mainSrc),
+    "页面：改指向走结构编辑（可撤销、重挂）；puppet 副本先登记进 doc.puppets，重建树仍认得是模型层");
+  check(/const mt = node\.modelForm \? modelTexGroup\(node\) : null;/.test(mainSrc) && /function modelTexGroup\(node: LayerNode\)[\s\S]{0,200}editor\.getModelInfo\(id\)[\s\S]{0,900}modelTextureSlots\(info\)/.test(mainSrc), "检视器：模型层有「子网格贴图」分组，行来自 getModelInfo");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keys = ["insp.modelTex", "mt.note", "mt.replace", "mt.noTexture", "mt.fail.read", "mt.fail.material", "mt.fail.mdl", "log.modelTexReplaced"];
+  const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missing.length === 0, `子网格贴图文案中英文都有（缺 ${json(missing)}）`);
+  check(/id="in-model-tex" accept="image\/\*"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")), "页面有隐藏的图片选择框");
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
@@ -2259,12 +2856,12 @@ section("I. 接线");
   check(/isLocked\(selectedId\)[^\n]*return;/.test(main), "锁定层不能拖拽");
   check(/form\.disabled = isLocked\(id\)/.test(main), "锁定层检视器只读");
   check(/docDriven && current\.assets && doc\?\.scene\s*\?\s*sourceFromDoc/.test(main), "结构编辑后改从文档挂载");
-  check(/await replayLiveEdits\(\)/.test(main) && /editor\.seek\(resumeAt\)/.test(main), "重挂后重放热改、回到原时间点");
+  check(/await replayLiveEdits\(\)/.test(main) && /editor\.seek\(resumeAt > 0 \? resumeAt : editor\.time\)/.test(main), "重挂后重放热改、回到原时间点（停着时也补画一帧，文字层首帧没贴图）");
   for (const key of ['"z"', '"y"', '"s"', '"d"', '"Delete"', '"Backspace"']) {
     check(main.includes(key), `快捷键 ${key} 已绑定`);
   }
-  check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /saveToLibrary\(itemId, files, progress\)/.test(main), "保存走 collectProject → 目标写出");
-  check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
+  check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /writeToDirectory\(dir, changed\)/.test(main) && !/saveToLibrary\(/.test(main), "自动保存走 collectProject 写进项目文件夹，页面不再写壁纸库");
+  check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main), "页面从 create.ts / assets.ts 取模板与资源表");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
   check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)[^;]*referencedParticles\(d\)[^;]*referencedSounds\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体 ∪ 粒子文件 ∪ 音频（写进来的文件随引用进出保存清单）");
   check(/from "\.\/effects"/.test(main) && /function objEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
@@ -2278,7 +2875,7 @@ section("I. 接线");
   check(/from "\.\/userprops"/.test(main) && !/general\.properties\s*=/.test(main), "用户属性面板从 userprops.ts 读写声明 / 绑定（页面不直接改属性表）");
   check(/sourceFromDoc\(current\.source, current\.assets, JSON\.stringify\(doc\.scene\), doc\.project\)/.test(main), "文档挂载连 project 一起以文档为准（声明随重挂进引擎）");
   check(/restoreObjects\(cmd\.after, cmd\.selAfter, cmd\.propsAfter\)/.test(main) && /dir === "undo" \? cmd\.propsBefore : cmd\.propsAfter/.test(main), "结构编辑 / 撤销 / 重做把属性表快照一并换回");
-  check(/if \(hot && editor && cmd\.after === cmd\.before\)/.test(main) && /editor\?\.declareUserProperties\(\{ \[name\]: p \}\)/.test(main), "只改属性表时走热更（declareUserProperties），不重挂");
+  check(/if \(hot && editor && \(hotAlways \|\| cmd\.after === cmd\.before\)\)/.test(main) && /editor\?\.declareUserProperties\(\{ \[name\]: p \}\)/.test(main), "只改属性表时走热更（declareUserProperties），不重挂");
   check(/inp\.addEventListener\("input", \(\) => \{[^}]*previewProp\(p, inp\.value\)/.test(main), "拖滑条中只推引擎预览，change 才入栈");
   check(/objEdit\([^\n]*\n?[^\n]*\n?[^\n]*node\.id,\s*\n\s*\(o\) => \(v \? !!doc && bindProp\(doc, o, f\.field, name, cond\) : unbindProp\(o, f\.field\)\)/.test(main), "绑定 / 解绑走结构编辑（可撤销、整场景重挂）");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
@@ -2298,14 +2895,29 @@ section("I. 接线");
   check(/<div id="tl-lanes" hidden><\/div>/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && ["anim.copy", "anim.paste", "anim.copyNone", "anim.pasteNone", "log.keyCopied", "log.keyPasted", "log.keyPasteBad"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "页面有动画条容器；复制 / 粘贴文案中英文都有");
   check(missingFx.length === 0, `效果名 / 参数名中英文都有（缺 ${json([...new Set(missingFx)])}）`);
   check(/structEdit\([^\n]*placeImages\(d, imgs, false\)\)/.test(main), "添加图片层走结构编辑（可撤销、整场景重挂）");
-  check(/files\.every\(\(f\) => isImageFile\(f\.file\)\)\) void dropImages/.test(main), "拖入全是图片时走图片成层 / 新建");
-  check(/dirty = false;\s*discardDraft\(\);/.test(main), "保存成功后清掉草稿");
-  check(/function markDirty\(\) \{\s*scheduleDraft\(\);/.test(main), "每次编辑都排一次草稿快照");
+  check(/structEdit\([^\n]*placeVideos\(d, vids, false\)\)/.test(main) && /from "\.\/video"/.test(main), "添加视频层走结构编辑（可撤销、整场景重挂），转码 / 判型取 video.ts");
+  check(/files\.every\(\(f\) => isVideoFile\(f\.file\)\)\)/.test(main), "拖入全是视频时走视频成层 / 新建");
+  check(/if \(doc\?\.video\) \{\s*const vs = await mountVideoStage\(stageEl, doc\.video\.bytes/.test(main), "视频壁纸工程挂编辑器自有 <video> 预览（时间轴 / 播放 / 逐帧复用同一套控制面）");
+  check(/edits\.push\(\{ kind: "video", label, before: \{ \.\.\.doc\.video \}, after \}\)/.test(main) && /if \(isVideoCmd\(cmd\)\) \{\n[^\n]*\n\s*setProjectVideo\(dir === "undo" \? cmd\.before : cmd\.after\)/.test(main), "裁剪 / 替换视频入撤销栈，撤销重做整段换回视频字节");
+  check(/readVideos\(\[src\], true, \{ start, end \}\)/.test(main), "应用裁剪按入出点重新编码（保留音轨）");
+  check(/await createNew\(\[\], dir, \[file\], title, res\)/.test(main), "视频壁纸转场景：另选文件夹新建，视频铺底、分辨率取视频本身");
+  check(/if \(doc\?\.video\) return collectVideoProject\(doc, preview\)/.test(main) && /const canSave = \(\) => !!doc\?\.video \|\|/.test(main), "视频壁纸工程也自动保存 / 导出（视频 + 封面 + project.json）");
+  check(/frameAt: \(t\) => ed\.captureFrame\(\{ time: t, width: w, height: h, keepSize: true \}\)/.test(main) && /await seekLogged\(ed\.seek\(t0\)\)/.test(main), "录制视频：逐帧 captureFrame（不编码、保持尺寸），录完回到原时刻");
+  check(/if \(opts\.time !== undefined\) await seekImpl\(opts\.time, false\)/.test(sm) && /captureFrame: \(opts = \{\}\) => captureFrameImpl\(opts\)/.test(sm), "引擎 captureFrame：定位不额外画帧，出图直接给 canvas");
+  check(/return Promise\.all\(pairs\.map\(\(p\) => p\.seek\(t\)\)\)|const ready = Promise\.all\(pairs\.map\(\(p\) => p\.seek\(t\)\)\)/.test(sm) && /for \(const p of rt\.videoPairs \?\? \[\]\) p\.setRate\(clockScale\)/.test(sm), "引擎 seek / 倍速同步视频贴图（等 seeked 再画）");
+  check(/materials\/\$\{name\}\.mp4/.test(sm) && /encodeTexVideo\(/.test(sm), "松散工程 materials/X.mp4 在内存里包成视频 .tex 走同一条路径");
+  const vkeys = ["ly.addVideo", "new.video", "new.videoWallpaper", "kind.video", "vp.title", "vp.applyTrim", "vp.replace", "vp.toScene", "export.video", "rec.title", "rec.start", "log.recorded", "log.trimmed", "log.videoReady"];
+  check(vkeys.every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "视频相关文案中英文都有");
+  const edHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  check(["ly-add-video", "new-video", "new-video-wp", "export-video", "in-video", "rec-menu", "rec-start", "rec-cancel"].every((id) => edHtml.includes(`id="${id}"`)), "页面有视频入口：加视频层 / 新建两种 / 录制面板 / 文件框");
+  check(/files\.every\(\(f\) => isImageFile\(f\.file\)\)\) \{\s*void dropImages\(files\.map\(\(f\) => f\.file\), dir\)/.test(main), "拖入全是图片时走图片成层 / 新建");
+  check(/dirty = false;\s*syncDocTitle\(\);/.test(main) && /function scheduleAutosave\(\)/.test(main), "自动保存成功后清掉脏标记");
+  check(/function markDirty\(\) \{\s*scheduleAutosave\(\);/.test(main), "每次编辑都排一次自动保存");
   const html = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/id="tb-new"(?![^>]*disabled)/.test(html) && /id="ly-add"/.test(html) && /id="in-image" accept="image\/\*"/.test(html) && /id="ed-draft"/.test(html), "页面：新建可用，有添加图片 / 图片选择框 / 草稿横幅");
   check(/const EDITOR_MARK = "\.webwallgl-editor"/.test(HOST_TS) && /exists && !marked/.test(HOST_TS), "宿主：无标记目录拒绝覆盖");
-  check(/const savePkgEl = \$<HTMLInputElement>\("#save-pkg"\);/.test(main) && /if \(savePkgEl\.checked\) \{\s*const \{ files: pkgFiles, packed \} = packProject\(files\);\s*files = pkgFiles;/.test(main), "勾选 WE 原生格式时保存清单先过 packProject，三种目标都写 scene.pkg 形态");
-  check(/id="save-pkg"/.test(html) && /data-et="save\.pkg"/.test(html), "保存菜单有「WE 原生格式（scene.pkg）」勾选");
+  check(/if \(kind === "pkg" && doc\.scene\) \{\s*const \{ files: pkgFiles, packed \} = packProject\(files\);\s*files = pkgFiles;/.test(main), "导出 scene.pkg 时清单先过 packProject，不写进项目文件夹");
+  check(/id="export-pkg"/.test(html) && /id="export-zip"/.test(html) && !/id="save-lib"/.test(html) && !/id="ed-library"/.test(html), "导出菜单是 scene.pkg / zip，没有壁纸库面板和另存到库");
   check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
   const saveTs = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
   check(/import \{ buildScenePkg, type ScenePkgResult \} from "\.\.\/renderer\/src\/api\/editor";/.test(saveTs) && !/writePkg|encodeTex/.test(saveTs), "页面只经库出口 buildScenePkg 打包（不直连 vendor 编码器）");
@@ -2327,7 +2939,7 @@ section("I. 接线");
   const missingPt = [...new Set(ptKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingPt.length === 0, `粒子层文案中英文都有（缺 ${json(missingPt)}）`);
   check(/from "\.\/sound"/.test(main) && /overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);\s*return path;/.test(main) && /structEdit\(et\("log\.soundAdded"[^\n]*\n[^\n]*\n\s*for \(const it of items\) last = addSoundLayer\(d, it\.name, it\.path\)/.test(main), "添加声音层取 sound.ts、音频原字节写进叠加层（分组 = 自身路径）、走结构编辑");
-  check(/else if \(files\.every\(\(f\) => isAudioFile\(f\.file\)\)\) void addSoundFiles\(/.test(main), "拖入全是音频时加声音层");
+  check(/files\.every\(\(f\) => isAudioFile\(f\.file\)\)\) \{\s*void addSoundFiles\(files\.map\(\(f\) => f\.file\)\)/.test(main), "拖入全是音频时加声音层");
   check(/if \(node\.kind === "sound"\) inspectorEl\.appendChild\(soundGroup\(node\)\);/.test(main) && /objEdit\(et\("log\.soundEdited"[^\n]*setSoundField\(o, field, v\)\)/.test(main) && /replaceSoundFile\(o, path\)/.test(main), "声音层检视器有「声音」分组，模式 / 音量 / 开始静音 / 替换音频经 objEdit（可撤销）");
   check(/const au = new Audio\(url\);/.test(main) && /stopPreview\(\);\s*overlay =/.test(main) && /volume: 0,/.test(main), "试听用页面自己的 audio 元素（引擎恒静音挂载），换文档即停");
   check(/id="ly-add-sound"/.test(html) && /id="in-sound" accept="\.mp3,\.ogg,\.wav,\.flac/.test(html) && /lyAddSoundEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加声音层按钮 + 音频选择框，可用性跟随添加图片");
@@ -2337,7 +2949,7 @@ section("I. 接线");
   check(/from "\.\/keyframes"/.test(main) && /const split = splitAnimated\(node\.obj, patch\);[\s\S]{0,200}pendingKeys\.set\([\s\S]{0,80}writeObjProps\(node\.obj, plain\);[\s\S]{0,120}mergeLiveEdit\(liveEdits, id, plain\);/.test(main), "热改：落在动画字段上的改动不写静态值、不进重放账，记为待落关键帧");
   check(/function commit\(cmd: PropsCmd\) \{\s*const keyed = pendingKeys\.get\(String\(cmd\.id\)\);[\s\S]{0,200}keyEdit\(node, keyed\);/.test(main) && /setKey\(o, f, frameAt\(v, t\), keyed\[f\]!\)/.test(main), "提交（检视器 change / 拖拽松手）时，动画字段的改动变成当前帧的关键帧（objEdit，可撤销）");
   check(/if \(canAnimate\(node\)\) inspectorEl\.appendChild\(animGroup\(node\)\);/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
-  check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
+  check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*(?:if \(animSolo[^\n]*\n\s*)?inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
   check(/for \(const run of animRuns\) \{\s*if \(run\.layer === l && \(p as Record<string, unknown>\)\[run\.field\] !== undefined\) run\.held = true;/.test(sm) && /else run\.ctrl\.advance\(clockDt\);\s*if \(run\.held\) continue;/.test(sm) && /animSeekPending = true;\s*for \(const run of animRuns\) run\.held = false;/.test(sm), "引擎：热改动画字段后曲线写回暂停到下一次 seek（拖拽 / 输入跟手）");
   check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(sm) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(sm), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
   check(/m\.addEventListener\("pointerdown", \(e\) => startKeyDrag\(e, m, n, t\)\)/.test(main) && /\(o\) => moveKeyTime\(o, from, to\)/.test(main) && /log\(et\("log\.keyMoveBad"/.test(main), "时间轴关键帧标记可拖动改时刻（objEdit，冲突时提示并复原）");
@@ -2349,7 +2961,8 @@ section("I. 接线");
   check(/if \(e\.shiftKey \|\| e\.metaKey \|\| e\.ctrlKey\) return toggleSelect\(n\.id\);/.test(main) && /if \(e\.shiftKey && hits\.length\) \{\s*toggleSelect\(hits\[0\]\.id\);/.test(main) && /\.some\(\(h\) => isSelected\(h\.id\)\)/.test(main), "多选：树 ⇧/⌘ 点、画面 ⇧ 点加减选；拖任一选中层都能起拖");
   check(/for \(const o of drag\.others\) \{\s*const od = editor\.screenDeltaToLocal\(Number\(o\.id\), mx, my\);/.test(main) && /commitMany\(et\("log\.multiMoved"/.test(main) && /if \(isBatch\(cmd\)\) \{\s*for \(const c of cmd\.cmds\) void applyPatch/.test(main), "多选移动：其余层按同一屏幕位移跟随，一步撤销（批量命令）");
   check(/groupLayers\(d, ids, et\("layer\.groupName"\)\)/.test(main) && /ids\.every\(\(id\) => removeLayer\(d, id\)\)/.test(main) && /alignDeltas\(items\.map\(\(i\) => i\.box\), mode\)/.test(main), "多选删除 / 复制 / 成组 / 对齐分布接线");
-  check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
+  check(/let userPlaying = false;/.test(main) && /if \(!userPlaying\) inst\.pause\(\);/.test(main) && /origin = opts\.origin \?\? null;\s*userPlaying = false;/.test(main), "默认不自动播放：打开文档与重挂都停在当前帧，只有点播放才走时钟");
+  check(/userPlaying = instance\.paused;\s*if \(userPlaying\) instance\.resume\(\);/.test(main) && /function pauseForStepping\(\) \{\s*userPlaying = false;/.test(main), "播放按钮记住用户意图；逐帧 / 拖时间轴会把它清掉");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
   const animKeys = [...main.matchAll(/et\(\s*"((?:anim|insp\.anim|log\.anim|log\.key)[\w.]*)"/g)].map((m) => m[1]).concat(kfMod.ANIM_MODES.map((m) => `anim.mode.${m}`));
@@ -2404,6 +3017,43 @@ section("J. 变异红测");
     const fd = mf.effectById("fade").frag;
     const px = mf.effectById("pixelate").frag;
     check(!/g_FxStart <= g_FxEnd \? m : 1\.0 - m/.test(fd) && !/floor\(v_TexCoord \/ cell\) \+ vec2\(0\.5, 0\.5\)/.test(px), "渐隐不处理倒序 / 像素化取格角时判据变红");
+  }
+  {
+    const dp = path.join(ROOT, "editor/doc.ts");
+    const ds = fs.readFileSync(dp, "utf8");
+    const mutForm = ds.replace('  if (typeof o.image === "string" && puppets?.has(o.image)) return "puppet";\n', "");
+    check(mutForm !== ds, "注入点存在（modelFormOf 的 puppet 分支）");
+    const mm = await loadEditorModule("doc", { [dp]: mutForm });
+    const sc = { objects: [{ id: 1, image: "models/a.json" }] };
+    check(mm.buildLayerTree(sc, new Map([["models/a.json", "a.mdl"]])).roots[0].modelForm !== "puppet", "modelFormOf 不认 puppet 表时「建树标 puppet」判据变红");
+    const mp = path.join(ROOT, "editor/model.ts");
+    const ms = fs.readFileSync(mp, "utf8");
+    const mutEmpty = ms.replace('if (typeof json.puppet === "string" && json.puppet) out.set', 'if (typeof json.puppet === "string") out.set');
+    check(mutEmpty !== ms, "注入点存在（scanPuppets 空 puppet 不算）");
+    const me = await loadEditorModule("model", { [mp]: mutEmpty });
+    const r = await me.scanPuppets({ scene: { objects: [{ id: 1, image: "a.json" }] } }, async () => new TextEncoder().encode('{"puppet":""}'));
+    check(r.size === 1, "scanPuppets 把空 puppet 也算上时「空 puppet 不算」判据变红");
+    const mutWrap = ms.replace('if (isWrapper(cur) && field !== "animation" && field !== "name") cur.value = v;\n  else a[field] = v;', "a[field] = v;");
+    const mutHot = ms.replace('.every((a) => !a || !["blend", "rate", "visible", "additive", "name", "animation"].some((f) => isWrapper(a[f])))', ".every(() => true)");
+    check(mutWrap !== ms && mutHot !== ms, "注入点存在（setAnimLayerField 包装只改 value / animLayersHot 看包装）");
+    const mw = await loadEditorModule("model", { [mp]: mutWrap });
+    const wo = { animationlayers: [{ animation: 1, blend: { script: "s", value: 1 } }] };
+    mw.setAnimLayerField(wo, 0, "blend", 0.5);
+    check(typeof wo.animationlayers[0].blend !== "object", "setAnimLayerField 覆盖包装时「脚本原样保留」判据变红");
+    const mh = await loadEditorModule("model", { [mp]: mutHot });
+    check(mh.animLayersHot({ animationlayers: [{ animation: 1, rate: { user: "u", value: 1 } }] }), "animLayersHot 不看包装时「有包装就重挂」判据变红");
+    const mutSub = ms.replace("  local.origin[0] -= off[0];\n  local.origin[1] -= off[1];\n", "");
+    const mutWorld = ms.replace("const off = name && i > 0 ? offOf(", "const off = false && name && i > 0 ? offOf(");
+    check(mutSub !== ms && mutWorld !== ms, "注入点存在（attachToModel 减偏移 / attachedWorld 计挂件偏移）");
+    const aDoc = () => docMod.makeDoc("a", null, { objects: [{ id: 10, image: "m.json", origin: "0 0 0" }, { id: 1, origin: "50 60 0" }] }, "loose");
+    const aOff = (mid, name) => (mid === 10 && name === "h" ? [20, 30] : null);
+    const ms1 = await loadEditorModule("model", { [mp]: mutSub });
+    const d1 = aDoc();
+    ms1.attachToModel(d1, 1, 10, "h", aOff);
+    check(json(ms1.attachedWorld(d1.scene.objects, d1.scene.objects[1], aOff).origin) !== json([50, 60, 0]), "attachToModel 不减附着点偏移时「绑定前后世界不变」判据变红");
+    const ms2 = await loadEditorModule("model", { [mp]: mutWorld });
+    const d2 = docMod.makeDoc("a", null, { objects: [{ id: 10, image: "m.json", origin: "0 0 0" }, { id: 1, parent: 10, attachment: "h", origin: "0 0 0" }] }, "loose");
+    check(json(ms2.attachedWorld(d2.scene.objects, d2.scene.objects[1], aOff).origin) === json([0, 0, 0]), "attachedWorld 忽略挂件偏移时「≡ 引擎挂件定位」判据变红");
   }
   const docPath = path.join(ROOT, "editor/doc.ts");
   const docSrc = fs.readFileSync(docPath, "utf8");
@@ -2497,7 +3147,7 @@ section("J. 变异红测");
 
   const asPath = path.join(ROOT, "editor/assets.ts");
   const asSrc = fs.readFileSync(asPath, "utf8");
-  const mutAs = asSrc.replace(".filter((f) => !f.group || refs.has(f.group))", ".filter(() => true)");
+  const mutAs = asSrc.replace("return !owners.length || owners.some((g) => refs.has(g));", "return true;");
   check(mutAs !== asSrc, "注入点存在（保存清单按引用过滤）");
   const am = await loadEditorModule("assets", { [asPath]: mutAs });
   const ao = am.overlayAssets("scene.json", null, () => new Set());
@@ -2723,6 +3373,55 @@ section("J. 变异红测");
   const cm2 = await vendorMut("renderer/vendor/we-scene/pkg/container.js", ".sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))\n  for", "\n  for", "writePkg 排序");
   const e2 = [{ name: "b", data: new Uint8Array([1]) }, { name: "a", data: new Uint8Array([2]) }];
   check(!same(cm2.writePkg(e2), cm2.writePkg([...e2].reverse())), "不排序时「产物逐字节确定」判据变红");
+
+  const HTP = "renderer/vendor/we-scene/render/hittest.js";
+  const f0 = 1 / Math.tan(Math.PI / 4);
+  const persp0 = [f0, 0, 0, 0, 0, f0, 0, 0, 0, 0, -101 / 99, -1, 0, 0, -200 / 99, 0];
+  const ground0 = { pos: new Float32Array([-10, -1, -20, 10, -1, -20, 0, -1, 5]), indices: [0, 1, 2], vertexCount: 3, indexCount: 3 };
+  const hm1 = await vendorMut(HTP, "  if (out.length < 3) return null\n  const poly = []", "  if (out.length < 3 || true) return null\n  const poly = []", "跨近裁剪面三角形的裁剪");
+  check(!hm1.screenMeshesContain(hm1.projectMeshesToScreen([ground0], persp0, 400, 400), 200, 340), "整个丢掉跨面三角形时「相机身后的地面近处点得中」判据变红");
+  const hm2 = await vendorMut(HTP, "      if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) continue\n", "", "零面积三角形跳过");
+  const deg = { pos: new Float32Array([0, 0, 0, 50, 0, 0, 0, 50, 0, 0, 0, 0]), indices: [0, 1, 2, 3, 3, 3], vertexCount: 4, indexCount: 6 };
+  check(hm2.screenMeshesContain(hm2.projectMeshesToScreen([deg], [0.01, 0, 0, 0, 0, 0.01, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], 200, 100), 120, 40),
+    "不跳过零面积三角形时「退化三角形不命中」判据变红（任意点都会被它判中）");
+  const hm3 = await vendorMut(HTP, "    if (opts.meshHit) {\n      const r = opts.meshHit(layer)\n      if (r === true) { out.push(layer); continue }\n      if (r === false) continue\n    }\n", "", "meshHit 结论优先于 OBB");
+  const ml = [{ id: 3, origin: [500, 100, 0], size: [100, 100], scale: [1, 1, 1], angles: [0, 0, 0], visible: true }];
+  check(hm3.hitTestLayersAll(ml, 140, 100, 200, { meshHit: () => true }).length === 0, "忽略 meshHit 时「网格伸出矩形也命中」判据变红");
+  const skm = await vendorMut("renderer/vendor/we-scene/render/mdl-skin.js", "        pos[i * 3] = x / total\n        pos[i * 3 + 1] = y / total", "        pos[i * 3] = x\n        pos[i * 3 + 1] = y", "蒙皮按总权重归一");
+  const one = { bones: [{}], vertexCount: 1, positions: new Float32Array([2, 2, 0]), boneIdx: new Float32Array([0, 0, 0, 0]), weights: new Float32Array([0.5, 0, 0, 0]), indices: [0, 0, 0], indexCount: 3 };
+  check(skm.skinnedMeshes(one, new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]), false)[0].pos[0] !== 2, "不除 Σw 时「权重和 ≠ 1 也同顶点着色器」判据变红");
+
+  const mdPath = path.join(ROOT, "editor/model.ts");
+  const mdSrc = fs.readFileSync(mdPath, "utf8");
+  const rtMat = { passes: [{ shader: "s", textures: ["a"] }] };
+  const rtImg = { bytes: new Uint8Array([1]), ext: "png" };
+  const mdMut = async (from, to, tag, file = mdPath) => {
+    const src = file === mdPath ? mdSrc : fs.readFileSync(file, "utf8");
+    const mut = src.replace(from, to);
+    check(mut !== src, `注入点存在（${tag}）`);
+    return loadEditorModule("model", { [file]: mut });
+  };
+  const rt1 = await mdMut("{ ...structuredClone(modelJson), material: editorMaterialOf(slug) }", "structuredClone(modelJson)", "model json 副本改指向材质副本");
+  const rf1 = rt1.puppetRetexture({ material: "m.json", puppet: "p.mdl" }, rtMat, "k", rtImg).files[0].data;
+  check(JSON.parse(dec.decode(rf1)).material === "m.json", "不改 material 时「model json 副本指向材质副本」判据变红（换了图画面不变）");
+  const rt2 = await mdMut("  tex[0] = `editor/${slug}`;\n", "", "材质副本换槽 0");
+  check(rt2.retexturedMaterial(rtMat, "k").passes[0].textures[0] === "a", "不换槽 0 时「材质副本槽 0 = editor/<slug>」判据变红");
+  const mePath = path.join(ROOT, "renderer/src/editor/mdl-edit.ts");
+  const rt3 = await mdMut("  m.materials[0] = materialPath;", "  for (const x of d!.meshes!) x.materials[0] = materialPath;", "只改指定子网格", mePath);
+  const P3 = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const t3 = (await imp("scripts/verify-editor-model.mjs")).modelTruth(LIB, "3477054430");
+  const multi3 = t3?.objects.map((o) => t3.read(o.info.mdlPath)).find((b) => (P3.parseMDL(b).meshes?.length ?? 0) > 1);
+  const after3 = multi3 && P3.parseMDL(rt3.meshRetexture(multi3, 1, rtMat, "t", rtImg).files[0].data);
+  check(!!after3 && after3.meshes[0].materialPath === "materials/editor/t.json", "改全部子网格时「只有该子网格材质变」判据变红");
+  const ovPath = path.join(ROOT, "editor/assets.ts");
+  const ovSrc = fs.readFileSync(ovPath, "utf8");
+  const asMutSrc = ovSrc.replace("if (owners.includes(from) && !owners.includes(to)) f.group = [...owners, to];", "");
+  check(asMutSrc !== ovSrc, "注入点存在（share 记共同拥有者）");
+  const as1 = await loadEditorModule("assets", { [ovPath]: asMutSrc });
+  const ov1 = as1.overlayAssets("scene.json", null, () => new Set(["b"]));
+  ov1.put("x", new Uint8Array(1), "a");
+  ov1.share("a", "b");
+  check(!ov1.list().includes("x"), "share 不生效时「第二次换图后第一次的材质仍进保存清单」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2732,6 +3431,8 @@ if (process.argv.includes("--headless")) {
   const { runEditorHeadless } = await imp("scripts/verify-editor-headless.mjs");
   await host.close();
   await runEditorHeadless({ check, section, tmpRoot, cleanups, LIB });
+  const { runModelHeadless } = await imp("scripts/verify-editor-model.mjs");
+  await runModelHeadless({ check, section, tmpRoot, LIB });
 } else {
   console.log("\n（跳过真浏览器部分：加 --headless 跑，需要 Chrome + 会自起 dev server）");
 }
