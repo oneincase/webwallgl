@@ -867,6 +867,34 @@ export type MdlClip = {
 /** 新建 / 改片段头（W18b）。name 1–64 字符，mode = loop / mirror / single，fps ∈ (0, 240]，frameCount 1–100000 */
 export type MdlClipInit = { name: string; mode: string; fps: number; frameCount: number };
 
+/**
+ * 从零编码 .mdl 的输入（W19，glTF 导入用）。有骨 = 蒙皮 puppet / 蒙皮网格，无骨 = 静态网格。
+ * 顶点烘焙在绑定姿势（骨局部矩阵沿父链累乘）下；boneIdx / weights 每顶点 4 个；
+ * 动画轨道每骨一条、(frameCount + 1) 帧 × 9 分量（平移 / 欧拉角 ZYX 弧度 / 缩放）。
+ */
+export type MdlSpec = {
+  meshes: Array<{
+    material: string;
+    positions: Float32Array;
+    uvs?: Float32Array;
+    normals?: Float32Array;
+    tangents?: Float32Array;
+    boneIdx?: Uint32Array;
+    weights?: Float32Array;
+    indices: Uint32Array;
+  }>;
+  bones?: Array<{ name?: string; parent: number; matrix: Float32Array | number[] }>;
+  animations?: Array<{
+    id?: number;
+    name?: string;
+    mode?: string;
+    fps: number;
+    frameCount: number;
+    tracks: Float32Array[];
+    events?: Array<{ frame: number; name: string }>;
+  }>;
+};
+
 export type EditorHitTestOptions = {
   /** 连 visible=false / alpha=0 的层也算（WE 的隐形点击区）；缺省只认看得见的层 */
   includeHidden?: boolean;

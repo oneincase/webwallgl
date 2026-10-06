@@ -85,7 +85,7 @@ const sourceAlias = {
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
-        `export { mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights, CLIP_MODES, resampleTrack, addMdlClip, removeMdlClip, setMdlClipMeta, setMdlClipEvents } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
+        `export { encodeMdl, mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights, CLIP_MODES, resampleTrack, addMdlClip, removeMdlClip, setMdlClipMeta, setMdlClipEvents } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
         `export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from ${json(path.join(ROOT, "renderer/src/types.ts"))};`,
       ].join("\n"),
       loader: "ts",
@@ -3135,6 +3135,206 @@ section("MG. 动画片段增删 / 元数据 / 帧事件 api addMdlClip…（W18b
   check(missing.length === 0, `片段文案中英文都有（缺 ${json(missing)}）`);
 }
 
+/**
+ * MH ★ 判据（J 段变异复用）：夹具 glb → parseGltf → gltfToModel → encodeMdl → 引擎 parseMDL + computeSkinMatrices，
+ * 每个片段每一帧（loop 末帧与首帧重合，取 0..frameCount−1）的蒙皮顶点 vs 独立参考求值。
+ * 返回最大误差（像素，scale 倍）、帧间中点误差、欧拉角相邻帧最大跳变
+ */
+async function gltfSkinCheck(G, scale = 100) {
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const F = await imp("scripts/lib/gltf-fixture.mjs");
+  const out = { worst: 0, mid: 0, jump: 0, frames: 0, models: [] };
+  for (const [name, fx] of [["skinned", F.skinnedFixture()], ["rigid", F.rigidFixture()]]) {
+    for (const target of ["puppet", "mesh"]) {
+      const m = G.gltfToModel(G.parseGltf(fx.glb), { target, slug: "t", fps: 30, scale });
+      const files = G.gltfImportFiles(m, "t");
+      const mdl = P.parseMDL(files.files.find((f) => f.name.endsWith(".mdl")).data);
+      out.models.push({ name, target, m, mdl, files });
+      fx.src.anims.forEach((a, ai) => {
+        const clip = m.clips[ai];
+        const layer = [{ animation: clip.id, blend: 1, rate: 1, visible: true, additive: false }];
+        const at = (t) => S.skinnedMeshes(mdl, S.computeSkinMatrices(mdl, t, layer), true).flatMap((x) => [...x.pos]);
+        const err = (t) => {
+          const got = at(t);
+          const want = F.refVertices(fx.src, a, t, scale);
+          return want.reduce((mx, v, i) => Math.max(mx, Math.abs(got[i] - v)), 0);
+        };
+        const step = a.channels.some((c) => c.interp === "STEP");
+        for (let f = 0; f < clip.frameCount; f++) {
+          out.worst = Math.max(out.worst, err(f / clip.fps));
+          // STEP 的跳变在稠密采样后变成一帧内的线性过渡，帧间中点本就不该相等
+          if (!step) out.mid = Math.max(out.mid, err((f + 0.5) / clip.fps));
+          out.frames++;
+        }
+        for (const tr of m.spec.animations[ai].tracks) {
+          for (let f = 1; f <= clip.frameCount; f++) for (let k = 3; k < 6; k++) out.jump = Math.max(out.jump, Math.abs(tr[f * 9 + k] - tr[(f - 1) * 9 + k]));
+        }
+      });
+    }
+  }
+  return out;
+}
+
+section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl（W19）");
+{
+  const G = await loadEditorModule("gltf");
+  const F = await imp("scripts/lib/gltf-fixture.mjs");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const MM = await imp("renderer/vendor/we-scene/render/mdl-math.js");
+  const zlib = await import("node:zlib");
+  const sk = await gltfSkinCheck(G);
+  check(sk.frames === 2 * (30 + 60) + 2 * 30 && sk.worst < 1e-3,
+    `★ 夹具（3 骨蒙皮 + 2 片段 / 刚体层级 × puppet / 网格，scale 100）：${sk.frames} 帧蒙皮顶点 vs glTF 参考求值最大误差 ${sk.worst.toExponential(2)} px < 1e-3（绑定 = IBM⁻¹、网格节点变换被忽略、STEP / LINEAR / CUBICSPLINE、经过 ry = 90° 万向节）`);
+  check(sk.mid > 0 && sk.mid < 0.5, `帧间中点（引擎欧拉角线性插值 vs glTF 球面 / 样条插值，不含 STEP 片段）最大误差 ${sk.mid.toFixed(3)} px < 0.5（30 fps 稠密采样）`);
+  check(sk.jump < 0.6, `欧拉角相邻帧最大跳变 ${sk.jump.toFixed(3)} rad（连续解，不在 ±π / 万向节处翻转）`);
+  const ms = sk.models.find((x) => x.name === "skinned" && x.target === "puppet");
+  check(ms.mdl.magic === "MDLV0023" && json(ms.mdl.bones.map((b) => [b.name, b.parent])) === json([["root", -1], ["b1", 0], ["b2", 1]]) &&
+    json(ms.m.clips.map((c) => [c.id, c.name, c.frameCount])) === json([[1, "wave", 30], [2, "twist", 60]]) && ms.mdl.animations.length === 2 && ms.mdl.animations.every((a) => a.mode === "loop" && a.fps === 30 && a.tracks.length === 3),
+    "产物：MDLV0023、骨 = 关节（先序、父在前，名字取节点名）、每个 glTF 动画一个片段（30 fps 稠密、每骨一轨、loop）");
+  const mr = sk.models.find((x) => x.name === "rigid" && x.target === "mesh");
+  check(mr.m.bones === 2 && mr.mdl.meshes?.length === 2 && mr.files.path === "models/editor/t.mdl",
+    "无蒙皮的刚体层级：挂网格的节点（含 matrix 静止姿势）各成一骨、顶点按节点绑定世界矩阵烘焙；网格目标每图元一个子网格");
+  let qWorst = 0;
+  const qs = [F.axisQuat([0, 1, 0], Math.PI / 2), F.axisQuat([0, 1, 0], -Math.PI / 2), F.axisQuat([1, 1, 0], Math.PI), F.axisQuat([0, 0, 1], Math.PI)];
+  for (let i = 0; i < 200; i++) qs.push(F.axisQuat([Math.sin(i * 1.7), Math.cos(i * 2.3), Math.sin(i * 0.9 + 1)], (i * 0.37) % (2 * Math.PI)));
+  qs.forEach((q, qi) => {
+    const e = G.quatToEuler(q, qi % 2 ? [0.3, -0.2, 2.9] : undefined);
+    const a = MM.composeTRS(0, 0, 0, e[0], e[1], e[2], 1, 1, 1);
+    const b = F.trs([0, 0, 0], q);
+    qWorst = Math.max(qWorst, ...b.map((v, k) => Math.abs(v - a[k])));
+  });
+  check(qWorst < 1e-6, `quatToEuler：${qs.length} 个四元数（含 ±90° 万向节、180°）经引擎 composeTRS 复原旋转矩阵最大误差 ${qWorst.toExponential(2)}`);
+  const near2 = G.quatToEuler(F.axisQuat([0, 0, 1], Math.PI - 0.01), [0, 0, 3.2]);
+  check(Math.abs(near2[2] - (Math.PI - 0.01)) < 1e-6 && Math.abs(G.quatToEuler(F.axisQuat([0, 0, 1], -Math.PI + 0.01), [0, 0, Math.PI - 0.01])[2] - (Math.PI + 0.01)) < 1e-6,
+    "quatToEuler 给上一帧时就近 2π 展开（跨 ±π 不跳 2π）");
+
+  // .gltf：外部 .bin / data URI 与 glb 等价
+  const fx = F.skinnedFixture();
+  const glbMdl = G.gltfImportFiles(G.gltfToModel(G.parseGltf(fx.glb), { target: "puppet", slug: "t", scale: 10 }), "t").files.find((f) => f.name.endsWith(".mdl")).data;
+  const ext = structuredClone(fx.json);
+  ext.buffers[0].uri = "sub%20dir/fx.bin";
+  const viaExt = G.parseGltf(enc.encode(JSON.stringify(ext)), (u) => (u === "sub dir/fx.bin" ? fx.bin : null));
+  const uri = structuredClone(fx.json);
+  uri.buffers[0].uri = `data:application/octet-stream;base64,${Buffer.from(fx.bin).toString("base64")}`;
+  const viaUri = G.parseGltf(enc.encode(JSON.stringify(uri)));
+  const mdlOf = (g) => G.gltfImportFiles(G.gltfToModel(g, { target: "puppet", slug: "t", scale: 10 }), "t").files.find((f) => f.name.endsWith(".mdl")).data;
+  check(Buffer.from(mdlOf(viaExt)).equals(Buffer.from(glbMdl)) && Buffer.from(mdlOf(viaUri)).equals(Buffer.from(glbMdl)), ".gltf + 外部 .bin（URI 百分号解码）/ data URI 与 .glb 产出逐字节相同的 .mdl");
+  const errCode = (fn) => {
+    try {
+      fn();
+      return null;
+    } catch (e) {
+      return e instanceof G.GltfError ? e.code : `?${e.message}`;
+    }
+  };
+  const withJson = (patch) => {
+    const j = structuredClone(fx.json);
+    patch(j);
+    return () => G.parseGltf(enc.encode(JSON.stringify(j)), (u) => (u === "fx.bin" ? fx.bin : null));
+  };
+  check(errCode(() => G.parseGltf(enc.encode(JSON.stringify(ext)))) === "buffer", "外部 .bin 找不到 → buffer");
+  check(errCode(() => G.parseGltf(new Uint8Array([1, 2, 3]))) === "format" && errCode(withJson((j) => (j.asset.version = "1.0"))) === "version", "不是 glTF → format；1.0 → version");
+  check(errCode(withJson((j) => ((j.extensionsRequired = ["KHR_draco_mesh_compression"]), (j.buffers[0].uri = "fx.bin")))) === "extension" && errCode(withJson((j) => ((j.extensionsRequired = ["KHR_mesh_quantization"]), (j.buffers[0].uri = "fx.bin")))) === null,
+    "必需扩展 Draco → extension；KHR_mesh_quantization（只是整数顶点）放行");
+  check(errCode(() => G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify({ asset: { version: "2.0" }, nodes: [{}] }))), { target: "mesh", slug: "t" })) === "noMesh", "没有网格 → noMesh");
+  const oob = structuredClone(fx.json);
+  oob.buffers[0].uri = "fx.bin";
+  oob.accessors[oob.meshes[0].primitives[0].attributes.POSITION].count = 99999;
+  check(errCode(() => G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(oob)), () => fx.bin), { target: "mesh", slug: "t" })) === "accessor", "访问器越界 → accessor（不读出界内存）");
+
+  // 访问器：normalized / 稀疏 / 跨距
+  const raw = new Uint8Array(64);
+  const dvr = new DataView(raw.buffer);
+  [0, 128, 255, 64].forEach((v, k) => (raw[k] = v));
+  dvr.setFloat32(8, 1, true), dvr.setFloat32(12, 2, true), dvr.setFloat32(16, 3, true), dvr.setFloat32(20, 4, true);
+  dvr.setUint16(24, 2, true);
+  dvr.setFloat32(28, 9, true);
+  const ag = G.parseGltf(enc.encode(JSON.stringify({
+    asset: { version: "2.0" },
+    buffers: [{ byteLength: 64, uri: `data:;base64,${Buffer.from(raw).toString("base64")}` }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 4 }, { buffer: 0, byteOffset: 8, byteLength: 16, byteStride: 8 }, { buffer: 0, byteOffset: 24, byteLength: 2 }, { buffer: 0, byteOffset: 28, byteLength: 4 }],
+    accessors: [
+      { bufferView: 0, componentType: 5121, normalized: true, count: 4, type: "SCALAR" },
+      { bufferView: 1, componentType: 5126, count: 2, type: "SCALAR" },
+      { componentType: 5126, count: 3, type: "SCALAR", sparse: { count: 1, indices: { bufferView: 2, componentType: 5123 }, values: { bufferView: 3 } } },
+    ],
+  })));
+  check(json([...G.readAccessor(ag, 0).data].map((v) => +v.toFixed(4))) === json([0, 0.502, 1, 0.251]) && json([...G.readAccessor(ag, 1).data]) === json([1, 3]) && json([...G.readAccessor(ag, 2).data]) === json([0, 0, 9]),
+    "readAccessor：u8 normalized 归一、byteStride 跨距、无 bufferView 的稀疏访问器（全零 + 覆盖）");
+  check(json(G.topInfluences([0, 1, 2, 3, 4, 5], [0.1, 0.3, 0.05, 0.25, 0.2, 0.1], 0)) === json({ j: [1, 3, 4, 0], w: [0.3 / 0.85, 0.25 / 0.85, 0.2 / 0.85, 0.1 / 0.85] }) &&
+    json(G.topInfluences([2, 3], [0, 0], 7)) === json({ j: [7, 7, 7, 7], w: [1, 0, 0, 0] }) && json(G.topInfluences([4, 5], [0.5, 0.5], 0).j) === json([4, 5, 4, 4]),
+    "每顶点影响：按权重取前 4 个归一（同权保持原序）、全零挂到兜底骨、不足 4 个补零权重");
+
+  // 告警
+  const wj = structuredClone(fx.json);
+  wj.buffers[0].uri = "fx.bin";
+  wj.meshes[0].primitives.push({ attributes: { POSITION: wj.meshes[0].primitives[0].attributes.POSITION }, mode: 1 });
+  wj.meshes[0].primitives[0].targets = [{ POSITION: wj.meshes[0].primitives[0].attributes.POSITION }];
+  const wm = G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(wj)), () => fx.bin), { target: "mesh", slug: "t", boneBudget: 2 });
+  const codes = wm.warnings.map((w) => w.code);
+  check(["mode", "morph", "boneBudget"].every((c) => codes.includes(c)) && wm.spec.meshes.length === 1, `告警：非三角形图元跳过、形变目标忽略、骨数超预算（${json(codes)}）`);
+
+  // 材质 / 贴图 / 产物文件
+  const pf = ms.files;
+  const mjson = JSON.parse(dec.decode(pf.files.find((f) => f.name === "models/editor/t.json").data));
+  const pmat = JSON.parse(dec.decode(pf.files.find((f) => f.name === "materials/editor/t.json").data));
+  check(pf.path === "models/editor/t.json" && json(mjson) === json({ autosize: true, material: "materials/editor/t.json", puppet: "models/editor/t.mdl" }) &&
+    pmat.passes[0].shader === "genericimage4" && json(pmat.passes[0].textures) === json(["editor/t"]) && Buffer.from(pf.files.find((f) => f.name === "materials/editor/t.png").data).equals(Buffer.from(fx.png)) &&
+    ms.mdl.materialPath === "materials/editor/t.json",
+    "puppet 产物：model json（autosize / material / puppet）+ genericimage4 材质 + 内嵌 png 原字节；.mdl 子网格材质同路径");
+  const mm2 = sk.models.find((x) => x.name === "skinned" && x.target === "mesh").files;
+  const mmat = JSON.parse(dec.decode(mm2.files.find((f) => f.name === "materials/editor/t_0.json").data));
+  check(mm2.path === "models/editor/t.mdl" && !mm2.files.some((f) => f.name.endsWith(".json") && f.name.startsWith("models/")) && mmat.passes[0].shader === "generic4" && mmat.passes[0].cullmode === "nocull",
+    "网格产物：只有 .mdl（对象 model 直接指它）+ 每个 glTF 材质一份 generic4 材质（doubleSided → nocull）");
+  const png = G.solidPng([1, 0, 0, 0.5]);
+  const idat = (() => {
+    let p = 8;
+    const parts = [];
+    while (p < png.length) {
+      const len = Buffer.from(png.subarray(p, p + 4)).readUInt32BE();
+      if (dec.decode(png.subarray(p + 4, p + 8)) === "IDAT") parts.push(png.subarray(p + 8, p + 8 + len));
+      p += 12 + len;
+    }
+    return zlib.inflateSync(Buffer.concat(parts));
+  })();
+  check(idat.length === 4 * 17 && json([...idat.subarray(1, 5)]) === json([255, 0, 0, 128]) && idat[0] === 0, "solidPng：合法 zlib / png（node 能解）、底色系数线性 → sRGB 8 位、alpha 原样");
+  const mr2 = sk.models.find((x) => x.name === "rigid" && x.target === "puppet").files;
+  check(mr2.files.some((f) => f.name === "materials/editor/t.png" && f.data.length > 0), "没有底色贴图时用 solidPng 兜底");
+
+  // 加层
+  const mk = await loadEditorModule("doc");
+  const orthoDoc = mk.makeDoc("t", null, { general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: [{ id: 5, image: "a.json", animationlayers: [{ id: 9, animation: 1 }] }] }, "loose");
+  check(G.defaultTarget(orthoDoc) === "puppet" && G.defaultTarget(mk.makeDoc("t", null, { general: {}, camera: { center: "1 2 3", eye: "1 2 13" }, objects: [] }, "loose")) === "mesh", "正交场景缺省 puppet、透视场景缺省网格");
+  check(near(G.fitPuppetScale(orthoDoc)(Float64Array.of(-1, 0, 0, 1, 3, 0)), Math.min(0.6 * 1920 / 2, 0.6 * 1080 / 3)), "puppet 缺省缩放：包围盒落在画面 60% 内");
+  const id = G.addModelLayer(orthoDoc, ms.m, "models/editor/t.json", "Fox");
+  const o = orthoDoc.scene.objects.at(-1);
+  const b = ms.m.bounds;
+  check(id === 10 && o.image === "models/editor/t.json" && o.name === "Fox" && json(o.origin.split(" ").map(Number)) === json([960 - (b[0] + b[3]) / 2, 540 - (b[1] + b[4]) / 2, 0].map((v) => +v.toFixed(5))) &&
+    o.animationlayers?.length === 1 && o.animationlayers[0].animation === 1 && o.animationlayers[0].name === "wave" && o.animationlayers[0].id === 11,
+    "addModelLayer（puppet）：图片层 id 不撞对象 / 动画层编号、包围盒中心落画面中心、挂一条动画层指向首个片段");
+  const pDoc = mk.makeDoc("t", null, { general: {}, camera: { center: "1 2 3", eye: "1 2 13" }, objects: [] }, "loose");
+  G.addModelLayer(pDoc, mr.m, "models/editor/t.mdl", "Arm");
+  check(pDoc.scene.objects[0].model === "models/editor/t.mdl" && pDoc.scene.objects[0].origin === "1.00000 2.00000 3.00000" && !("image" in pDoc.scene.objects[0]) && near(G.fitMeshScale(pDoc)(Float64Array.of(-1, -1, -1, 1, 1, 1)), 10 / 3 / Math.sqrt(3)),
+    "addModelLayer（网格）：model 指 .mdl、放在相机注视点；缺省缩放 = 相机距离 / 3 / 包围球半径");
+  const tree = mk.buildLayerTree(orthoDoc.scene, new Map([["models/editor/t.json", "models/editor/t.mdl"]]));
+  check(tree.roots.at(-1).modelForm === "puppet" && mk.buildLayerTree(pDoc.scene, new Map()).roots[0].modelForm === "mesh", "导入层在图层树里认作模型层（puppet / mesh），模型面板全部可用");
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/files\.some\(\(f\) => isModelFile\(f\.file\)\) && doc\?\.scene\) \{\s*void importModelFiles/.test(mainSrc) && /lyAddModelEl\.onclick = \(\) => inModelEl\.click\(\);/.test(mainSrc) && /lyAddModelEl\.disabled = lyAddEl\.disabled;/.test(mainSrc),
+    "页面：图层栏「导入模型」按钮 + 拖入 .glb / .gltf（连同 .bin / 贴图）");
+  check(/for \(const x of r\.files\) assets\.put\(x\.name, x\.data, r\.path\);[\s\S]{0,200}target\.puppets = new Map[\s\S]{0,400}structEdit\([\s\S]{0,300}addModelLayer\(d, m, r\.path/.test(mainSrc),
+    "导入：产物进资源表（分组 = 对象引用路径）、puppet 登记到 doc.puppets，加层是一步结构编辑（可撤销）");
+  check(/id="in-model" accept="\.glb,\.gltf,\.bin,\.png,\.jpg,\.jpeg" multiple hidden/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /id="ly-add-model"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")), "页面有导入按钮与多选文件框");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const glSrc = fs.readFileSync(path.join(ROOT, "editor/gltf.ts"), "utf8");
+  const warnCodes = [...new Set([...glSrc.matchAll(/warn\(\{ code: "(\w+)"/g)].map((m) => m[1]))];
+  const failCodes = [...glSrc.matchAll(/new GltfError\("(\w+)"/g)].map((m) => m[1]);
+  const keys = ["ly.addModel", "gl.form.puppet", "gl.form.mesh", "log.modelImported", "gl.fail.noModel", ...new Set(failCodes.map((c) => `gl.fail.${c}`)), ...warnCodes.map((c) => `gl.warn.${c}`)];
+  const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(warnCodes.length >= 10 && missing.length === 0, `导入文案中英文都有，每个告警 / 失败码都有文案（${warnCodes.length} 个告警码，缺 ${json(missing)}）`);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
@@ -3750,6 +3950,25 @@ section("J. 变异红测");
   check(Math.abs(Math.abs(r4[14]) - Math.PI) >= 0.01, "欧拉角不走最短方向时「中点 ≈ ±π」判据变红");
   const clm5 = await boneMut("const id = Math.max(...anims.map((a) => a.id)) + 1;", "const id = anims[0].id;", "新片段 id 不撞");
   check((await clipEditCorpus(clm5, P3, mt4, allFx)).bad.some((b) => b.includes("add 结构")), "新片段 id 撞旧片段时「add 结构」判据变红");
+
+  // W19 glTF 导入
+  const glPath = path.join(ROOT, "editor/gltf.ts");
+  const glSrc = fs.readFileSync(glPath, "utf8");
+  const glMut = async (from, to, tag) => {
+    const mut = glSrc.replace(from, to);
+    check(mut !== glSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("gltf", { [glPath]: mut });
+  };
+  const gm1 = await glMut("const bindOf = (n: number) => bindWorld.get(n) ?? worldOf(n);", "const bindOf = (n: number) => worldOf(n);", "绑定 = IBM⁻¹");
+  check((await gltfSkinCheck(gm1)).worst > 1e-2, "绑定姿势改取节点静止姿势时 ★ 蒙皮误差判据变红");
+  const gm2 = await glMut("const e = quatToEuler(q, prev);", "const e = quatToEuler(q);", "欧拉角连续");
+  check((await gltfSkinCheck(gm2)).jump >= 0.6, "欧拉角不按上一帧取最近解时「相邻帧跳变」判据变红");
+  const gm3 = await glMut("data.set([tr[0] * scale, tr[1] * scale, tr[2] * scale,", "data.set([tr[0], tr[1], tr[2],", "轨道平移乘 scale");
+  check((await gltfSkinCheck(gm3)).worst > 1e-2, "轨道平移不乘 scale 时 ★ 判据变红");
+  const gm4 = await glMut('  if (s.interp === "STEP") return val(k);\n', "", "STEP 插值");
+  check((await gltfSkinCheck(gm4)).worst > 1e-2, "STEP 当 LINEAR 求值时 ★ 判据变红");
+  const gm5 = await glMut("const w = top.map((p) => p[1] / sum);", "const w = top.map((p) => p[1]);", "截断后归一");
+  check(Math.abs(gm5.topInfluences([0, 1, 2, 3, 4, 5], [0.1, 0.3, 0.05, 0.25, 0.2, 0.1], 0).w.reduce((s, v) => s + v, 0) - 1) > 1e-3, "截断后不归一时「前 4 个归一」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

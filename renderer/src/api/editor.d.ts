@@ -20,6 +20,7 @@ import type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlSpec,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -49,6 +50,7 @@ export type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlSpec,
 };
 
 /**
@@ -69,6 +71,9 @@ export declare function checkSceneScript(script: string): SceneScriptCheck;
  * project.json / 封面应留在包外，由调用方剔除。
  */
 export declare function buildScenePkg(files: readonly ScenePkgFile[]): ScenePkgResult;
+
+/** 从零编码 MDLV0023（W19 glTF 导入）；spec 不合法时抛错（消息说明哪一项） */
+export declare function encodeMdl(spec: MdlSpec): Uint8Array;
 
 /**
  * .mdl 各子网格的槽 0 材质 json 路径（非 UTF-8 的串为 null）。

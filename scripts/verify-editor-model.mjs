@@ -184,6 +184,10 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
       await runClipHeadless({ check, section, session, origin, fixtures, LIB });
       return;
     }
+    if (only === "mh2") {
+      await runImportHeadless({ check, section, session, origin, fixtures });
+      return;
+    }
     for (const id of fixtures) {
       const truth = modelTruth(LIB, id);
       await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
@@ -248,6 +252,7 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
     await runRetexHeadless({ check, section, session, origin, fixtures });
     await runBoneHeadless({ check, section, session, origin, fixtures, LIB });
     await runClipHeadless({ check, section, session, origin, fixtures, LIB });
+    await runImportHeadless({ check, section, session, origin, fixtures });
   } finally {
     await session.close();
     await server.close();
@@ -1220,6 +1225,151 @@ async function runClipHeadless({ check, section, session, origin, fixtures, LIB 
   }
   check(tested >= 2 && fpsLive >= 1 && restLive >= 1,
     `至少 2 张夹具做了片段编辑真引擎判据，且 fps×2 / 静止片段至少各有 1 张画面确实变了（判据不空转）（${tested} 张 / 单层 ${single} / fps 有效 ${fpsLive} / 静止有效 ${restLive}）`);
+}
+
+/**
+ * MH2（W19）：glTF 导入的真引擎判据。程序化夹具 glb 在页面里走 editor/gltf.ts 全流程（parseGltf → gltfToModel →
+ * gltfImportFiles → addModelLayer），产物文件 + 改过的 scene.json 以松散形态挂载：
+ *   ① 引擎认成模型层（puppet / mesh）、getModelInfo 骨 / 片段与导入结果一致
+ *   ② ★ puppet：getLayerOutline 的蒙皮凸包包围盒 ≡ glTF 参考求值的顶点经图层原点 + cover 映射（≤ 1 px），两个时刻
+ *   ③ 画面：只留导入层时有像素、片段在动、贴图上半红下半蓝 → 红在上（UV 原点左上、Y 向上同 WE）
+ *   ④ 存库闭环：buildScenePkg → 从包重挂，同一时刻画面 ≡ 松散形态
+ *   ⑤ 透视场景导入成网格：有像素、片段在动
+ */
+async function runImportHeadless({ check, section, session, origin, fixtures }) {
+  section("MH2. glTF 导入（真浏览器）：引擎认层、★ 蒙皮凸包 ≡ glTF 参考、贴图朝向、打包重挂一致、透视场景成网格");
+  const F = await imp("scripts/lib/gltf-fixture.mjs");
+  const fx = F.skinnedFixture();
+  const glb64 = Buffer.from(fx.glb).toString("base64");
+  const jobs = [fixtures.find((id) => PUPPET_FIXTURES.includes(id)), ...fixtures.filter((id) => MESH_FIXTURES.includes(id))].filter(Boolean);
+  let puppetOk = 0;
+  let meshDrawn = 0;
+  for (const id of jobs) {
+    await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
+    await session.waitFor("!!window.__wp", { timeoutMs: 60000 });
+    let r;
+    try {
+      r = await session.evaluate(`(async () => {
+        window.__wp.pause();
+        const api = await import('/renderer/src/api/editor.ts');
+        const C = await import('/renderer/vendor/we-scene/pkg/container.js');
+        const G = await import('/editor/gltf.ts');
+        const D = await import('/editor/doc.ts');
+        const base = api.httpSource('${origin}/media/dev/${id}');
+        const pkg = C.parsePkg(new Uint8Array(await base.scenePkg()));
+        const sceneText = new TextDecoder().decode(C.getEntry(pkg, 'scene.json')).replace(/^\\uFEFF/, '');
+        const doc = D.makeDoc('t', null, JSON.parse(sceneText), 'loose');
+        const glb = Uint8Array.from(atob('${glb64}'), (c) => c.charCodeAt(0));
+        const target = G.defaultTarget(doc);
+        const m = G.gltfToModel(G.parseGltf(glb), { target, slug: 'fx', fps: 30, scale: target === 'puppet' ? G.fitPuppetScale(doc) : G.fitMeshScale(doc) });
+        const files = G.gltfImportFiles(m, 'fx');
+        const newId = G.addModelLayer(doc, m, files.path, 'Fixture');
+        const obj = doc.scene.objects.at(-1);
+        const extra = new Map(files.files.map((f) => [f.name, f.data]));
+        const sceneBytes = new TextEncoder().encode(JSON.stringify(doc.scene));
+        const read = async (n) => (n === 'scene.json' ? sceneBytes : extra.get(n) ?? C.getEntry(pkg, n) ?? null);
+        const host = document.createElement('div');
+        host.style.cssText = 'position:fixed;left:0;top:0;width:960px;height:540px;z-index:9';
+        document.body.appendChild(host);
+        let inst = null, ed = null;
+        const mountWith = async (source) => {
+          if (inst) inst.destroy();
+          host.textContent = '';
+          inst = await api.mount(host, { source, fit: 'cover', renderDpr: 1, volume: 0, autoplay: false, onDiagnostic: (m) => diags.push(String(m)) });
+          ed = api.editorOf(inst);
+          inst.pause();
+          const gen = window.__scene?.general;
+          if (gen) gen.bloom = false;
+        };
+        const diags = [];
+        const loose = { scenePkg: () => base.scenePkg(), sceneDir: async () => ({ entry: 'scene.json', read }), project: base.project ? (s) => base.project(s) : undefined };
+        const grab = async () => {
+          const bm = await createImageBitmap(await ed.capture());
+          const cv = new OffscreenCanvas(bm.width, bm.height);
+          const g = cv.getContext('2d');
+          g.drawImage(bm, 0, 0);
+          return { w: bm.width, h: bm.height, d: g.getImageData(0, 0, bm.width, bm.height).data };
+        };
+        const df = (P, Q, i) => Math.abs(P.d[i] - Q.d[i]) + Math.abs(P.d[i + 1] - Q.d[i + 1]) + Math.abs(P.d[i + 2] - Q.d[i + 2]);
+        const diffN = (P, Q) => { let n = 0; for (let k = 0; k < P.w * P.h; k++) if (df(P, Q, k * 4) > 24) n++; return n; };
+        const at = async (t) => { await ed.seek(t); return grab(); };
+        const isolate = async (show) => {
+          for (const l of ed.getLayers()) await ed.setLayerProps(l.id, { visible: show && l.id === newId });
+          for (const l of window.__scene.layers) for (const e of l.effects || []) e.visible = false;
+        };
+        await mountWith(loose);
+        await mountWith(loose);
+        const layer = ed.getLayers().find((l) => l.id === newId);
+        const info = ed.getModelInfo(newId);
+        await isolate(false);
+        const empty = await at(0.4);
+        await isolate(true);
+        const B = await at(0.8);
+        const hullB = ed.getLayerOutline(newId)?.hull ?? null;
+        const A = await at(0.4);
+        const hullA = ed.getLayerOutline(newId)?.hull ?? null;
+        // 红 / 蓝像素的屏幕质心（只看与空画面不同的像素）
+        let ry = 0, rn = 0, by = 0, bn = 0, drawn = 0;
+        for (let k = 0; k < A.w * A.h; k++) {
+          const i = k * 4;
+          if (df(A, empty, i) <= 24) continue;
+          drawn++;
+          const y = Math.floor(k / A.w);
+          if (A.d[i] > 150 && A.d[i + 2] < 100) { ry += y; rn++; }
+          if (A.d[i + 2] > 150 && A.d[i] < 100) { by += y; bn++; }
+        }
+        const ortho = doc.scene.general?.orthogonalprojection;
+        const out = { id: '${id}', target, newId, kind: layer?.kind, form: layer?.modelForm, bones: info?.bones.map((b) => b.name), clips: info?.animations.map((a) => [a.id, a.name, a.frameCount]),
+          layers: obj.animationlayers, scale: m.scale, origin: obj.origin, W: ortho?.width, H: ortho?.height, cw: A.w, ch: A.h,
+          drawn, moving: diffN(A, B), redY: rn ? ry / rn : null, blueY: bn ? by / bn : null, hullA, hullB,
+          outline: ed.getLayerOutline(newId), diags: diags.filter((m) => /fx|Fixture/.test(m)).slice(0, 5) };
+        // 存库闭环
+        const pfiles = [];
+        for (const e of pkg.entries ?? []) if (e.name !== 'scene.json') pfiles.push({ path: e.name, data: C.getEntry(pkg, e.name) });
+        pfiles.push({ path: 'scene.json', data: sceneBytes });
+        for (const [n, d] of extra) pfiles.push({ path: n, data: d });
+        const built = api.buildScenePkg(pfiles);
+        out.texInPkg = built.converted ?? null;
+        await mountWith(api.bytesSource(built.pkg, base.project ? await base.project() : undefined));
+        await isolate(true);
+        out.pkgInfo = ed.getModelInfo(newId)?.animations.length;
+        out.pkgDiff = diffN(A, await at(0.4));
+        inst.destroy();
+        return out;
+      })()`, { awaitPromise: true, timeoutMs: 600000 });
+    } catch (e) {
+      check(false, `${id}: glTF 导入判据执行失败 ${String(e.message).slice(0, 200)}`);
+      continue;
+    }
+    if (process.env.VEM_DEBUG) console.log(JSON.stringify({ ...r, hullA: r.hullA?.length, hullB: r.hullB?.length, outline: JSON.stringify(r.outline)?.slice(0, 300) }));
+    const want = r.target === "puppet" ? "puppet" : "mesh";
+    check(r.kind === "model" && r.form === want && JSON.stringify(r.bones) === JSON.stringify(["root", "b1", "b2"]) && JSON.stringify(r.clips) === JSON.stringify([[1, "wave", 30], [2, "twist", 60]]) && r.layers?.[0]?.animation === 1,
+      `${id}（${r.target === "puppet" ? "正交" : "透视"}场景）：导入层被引擎认成 ${r.form} 模型层，骨 ${JSON.stringify(r.bones)}、片段 ${JSON.stringify(r.clips)}，动画层指向首个片段`);
+    check(r.pkgInfo === 2 && r.pkgDiff <= 30, `${id}：打包（png → .tex）从包重挂，片段数 ${r.pkgInfo}、同一时刻画面差 ${r.pkgDiff} px`);
+    if (r.target !== "puppet") {
+      // 网格放在 scene.camera 的注视点；有相机实体 / 相机路径 / 脚本相机的场景，活相机不一定看着那里
+      if (r.drawn > 50 && r.moving > 50) meshDrawn++;
+      console.log(`  · ${id}（网格）：只留导入层画出 ${r.drawn} px、0.4s → 0.8s 变 ${r.moving} px、轮廓锚点 ${JSON.stringify(r.outline?.anchor ?? null)}`);
+      continue;
+    }
+    check(r.drawn > 200 && r.moving > 50, `${id}：只留导入层时画出 ${r.drawn} px，片段 0.4s → 0.8s 画面变 ${r.moving} px`);
+    check(r.redY !== null && r.blueY !== null && r.redY < r.blueY, `${id}：贴图上半红下半蓝 → 屏幕上红在上（红质心 y ${r.redY?.toFixed(1)} < 蓝 ${r.blueY?.toFixed(1)}）：UV 原点左上、Y 向上与 WE puppet 同口径`);
+    const [ox, oy] = r.origin.split(" ").map(Number);
+    const s = Math.max(r.cw / r.W, r.ch / r.H);
+    const offX = (r.cw - r.W * s) / 2;
+    const offY = (r.ch - r.H * s) / 2;
+    const box = (pts) => pts.reduce((b, [x, y]) => [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
+    const refBox = (t) => {
+      const v = F.refVertices(fx.src, fx.src.anims[0], t, r.scale);
+      const pts = [];
+      for (let i = 0; i < v.length; i += 3) pts.push([offX + (ox + v[i]) * s, offY + (r.H - (oy + v[i + 1])) * s]);
+      return box(pts);
+    };
+    const errs = [[r.hullA, 0.4], [r.hullB, 0.8]].map(([h, t]) => (h ? Math.max(...box(h).map((v, k) => Math.abs(v - refBox(t)[k]))) : Infinity));
+    check(errs.every((e) => e <= 1), `★ ${id}：引擎蒙皮凸包包围盒 vs glTF 参考求值（图层原点 + cover 映射）0.4s 差 ${errs[0].toFixed(3)} px、0.8s 差 ${errs[1].toFixed(3)} px（≤ 1）`);
+    if (errs.every((e) => e <= 1)) puppetOk++;
+  }
+  check(puppetOk >= 1 && meshDrawn >= 1, `正交场景 ★ 判据过 ${puppetOk} 张、透视场景导入网格画得出且在动 ${meshDrawn} 张（${jobs.join(", ")}）`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

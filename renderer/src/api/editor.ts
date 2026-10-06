@@ -9,6 +9,7 @@ export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
 export { buildScenePkg } from "../editor/pkg-export";
 export {
+  encodeMdl,
   mdlMeshMaterials,
   retargetMdlMaterial,
   mdlClips,
@@ -43,4 +44,5 @@ export type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlSpec,
 } from "./types";

@@ -168,6 +168,9 @@
               <button type="button" class="ed-icon" id="ly-add-video" disabled data-et-title="ly.addVideo" title="添加视频层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M1.8 4h9v8h-9z M10.8 7l3.4-2v6l-3.4-2" /></svg>
               </button>
+              <button type="button" class="ed-icon" id="ly-add-model" disabled data-et-title="ly.addModel" title="导入模型（glTF）">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z M2.5 4.8L8 7.8l5.5-3 M8 7.8v6.4" /></svg>
+              </button>
               <button type="button" class="ed-icon" id="ly-add-sound" disabled data-et-title="ly.addSound" title="添加声音层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 6v4h2.5l3.5 3V3L5 6z M11 5.5a3.5 3.5 0 0 1 0 5 M12.8 3.5a6 6 0 0 1 0 9" /></svg>
               </button>
@@ -340,6 +343,7 @@
 
     <input type="file" id="in-pkg" accept=".pkg,.json" multiple hidden />
     <input type="file" id="in-image" accept="image/*" multiple hidden />
+    <input type="file" id="in-model" accept=".glb,.gltf,.bin,.png,.jpg,.jpeg" multiple hidden />
     <input type="file" id="in-video" accept=".mp4,.m4v,.mov,.webm,.mkv,video/*" multiple hidden />
     <input type="file" id="in-font" accept=".ttf,.otf,font/ttf,font/otf" hidden />
     <input type="file" id="in-model-tex" accept="image/*" hidden />

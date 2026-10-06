@@ -67,6 +67,18 @@ import {
 } from "./effects";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
+  GltfError,
+  addModelLayer,
+  defaultTarget,
+  editorMdlPathOf,
+  fitMeshScale,
+  fitPuppetScale,
+  gltfImportFiles,
+  gltfToModel,
+  isModelFile,
+  parseGltf,
+} from "./gltf";
+import {
   FONT_FILE_RE,
   H_ALIGNS,
   SYSTEM_FONTS,
@@ -2032,6 +2044,10 @@ window.addEventListener("drop", (e) => {
       log(et("log.dropEmpty"), "warn");
       return;
     }
+    if (files.some((f) => isModelFile(f.file)) && doc?.scene) {
+      void importModelFiles(files.map((f) => f.file));
+      return;
+    }
     if (files.every((f) => isImageFile(f.file))) {
       void dropImages(files.map((f) => f.file), dir);
       return;
@@ -2216,6 +2232,57 @@ function dropImages(files: File[], dir: DirHandle | null) {
     return;
   }
   return createNew(files, dir);
+}
+
+// ---------- 导入 glTF 模型（W19） ----------
+
+const inModelEl = $<HTMLInputElement>("#in-model");
+inModelEl.onchange = () => {
+  const files = Array.from(inModelEl.files ?? []);
+  inModelEl.value = "";
+  if (files.length) void importModelFiles(files);
+};
+
+/**
+ * 每个 .glb / .gltf 转成一个模型层：正交场景成 puppet（图片层 + model json），透视场景成网格（model 指 .mdl）；
+ * 同批的其余文件（.bin / 贴图）供 .gltf 的外部 URI 按文件名取。产物写进资源表，加层 + 首个片段的动画层是一步结构编辑
+ */
+async function importModelFiles(files: File[]) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const target = doc;
+  const mains = files.filter(isModelFile);
+  if (!mains.length) {
+    log(et("gl.fail.noModel"), "warn");
+    return;
+  }
+  const side = new Map<string, Uint8Array>();
+  for (const f of files) if (!isModelFile(f)) side.set(f.name, new Uint8Array(await f.arrayBuffer()));
+  for (const f of mains) {
+    const name = f.name.replace(/\.(glb|gltf)$/i, "");
+    try {
+      const g = parseGltf(new Uint8Array(await f.arrayBuffer()), (uri) => side.get(uri) ?? side.get(uri.split("/").pop()!) ?? null);
+      const assets = overlay;
+      if (doc !== target || !assets) return;
+      const form = defaultTarget(target);
+      const listed = new Set(assets.list());
+      const refs = referencedModels(target);
+      const slug = imageSlug(name, (s) => [modelPathOf(s), editorMdlPathOf(s)].some((p) => assets.has(p) || listed.has(p) || refs.has(p)));
+      const m = gltfToModel(g, { target: form, slug, fps: 30, scale: form === "puppet" ? fitPuppetScale(target) : fitMeshScale(target) });
+      const r = gltfImportFiles(m, slug);
+      for (const x of r.files) assets.put(x.name, x.data, r.path);
+      if (form === "puppet") target.puppets = new Map([...(target.puppets ?? []), [r.path, r.mdlPath]]);
+      structEdit(et("log.modelImported", { name, form: et(`gl.form.${form}`), bones: m.bones, vertices: m.vertices, clips: m.clips.map((c) => c.name).join(", ") }), (d) =>
+        addModelLayer(d, m, r.path, layerNameOf(f.name)),
+      );
+      for (const w of m.warnings) log(et(`gl.warn.${w.code}`, { name, detail: w.detail ?? "" }), "warn");
+    } catch (e) {
+      const ge = e instanceof GltfError ? e : null;
+      log(et(`gl.fail.${ge?.code ?? "format"}`, { name: f.name, detail: ge ? ge.detail : (e as Error).message }), "error");
+    }
+  }
 }
 
 // ---------- 视频成层 ----------
@@ -2544,6 +2611,8 @@ lyAddVideoEl.onclick = () => {
   videoPickFor = "layer";
   inVideoEl.click();
 };
+const lyAddModelEl = $<HTMLButtonElement>("#ly-add-model");
+lyAddModelEl.onclick = () => inModelEl.click();
 const lyAddSoundEl = $<HTMLButtonElement>("#ly-add-sound");
 lyAddSoundEl.onclick = () => {
   soundPickFor = null;
@@ -2644,6 +2713,7 @@ function syncLayerTools() {
   lyAddParticleEl.disabled = lyAddEl.disabled;
   lyAddSoundEl.disabled = lyAddEl.disabled;
   lyAddVideoEl.disabled = lyAddEl.disabled;
+  lyAddModelEl.disabled = lyAddEl.disabled;
 }
 
 function renderTree() {

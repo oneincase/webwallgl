@@ -1,7 +1,7 @@
 // .mdl 编辑（EDITOR-PLAN W16 / W18）：一律经 W17 的无损文档读写，只动目标字段，
 // 其余字节（顶点 / 索引 / 骨骼 / 未动的轨道）不变，各段偏移由 writeMdlDoc 重算。
-import { readMdlDoc, writeMdlDoc } from "../../vendor/we-scene/pkg/mdl-write.js";
-import type { MdlBoneDelta, MdlClip, MdlClipInit } from "../api/types";
+import { encodeMDL, readMdlDoc, writeMdlDoc } from "../../vendor/we-scene/pkg/mdl-write.js";
+import type { MdlBoneDelta, MdlClip, MdlClipInit, MdlSpec } from "../api/types";
 
 type Str = string | { raw: Uint8Array };
 type Track = { boneId: number; data: Float32Array };
@@ -40,6 +40,11 @@ const animsOf = (d: MdlDoc): Anim[] | null => {
   const s = d.sections?.find((x) => x.type === "MDLA");
   return s && !s.raw && s.anims ? s.anims : null;
 };
+
+/** 从零编码 MDLV0023（W19）；spec 不合法时抛错（消息说明哪一项） */
+export function encodeMdl(spec: MdlSpec): Uint8Array {
+  return encodeMDL(spec) as Uint8Array;
+}
 
 export function mdlMeshMaterials(bytes: Uint8Array): Array<string | null> | null {
   const d = docOf(bytes);
