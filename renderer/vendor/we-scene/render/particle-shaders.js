@@ -3,7 +3,68 @@
 // 抽成自由函数后 Simulation 与 GPU 装配解耦（ParticleSystem.render 里的
 // this._prog 消费方不变）。
 import { linkProgram } from './gl-util.js'
+
+// 同一 GL 上下文上的粒子系统共用一份程序和静态 quad。实例缓冲仍按系统分开
+// （每个系统往自己的 vbuf 写活粒子）。引用计数归零才删程序。
+const sharedPrograms = new WeakMap()
+
+function makeInstanceBuffers(gl, quadBuf) {
+  const vbuf = gl.createBuffer()
+  const vao = gl.createVertexArray()
+  gl.bindVertexArray(vao)
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0)
+  gl.vertexAttribDivisor(0, 0)
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
+  const S = 72
+  gl.enableVertexAttribArray(1)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, S, 0)
+  gl.vertexAttribDivisor(1, 1)
+  gl.enableVertexAttribArray(2)
+  gl.vertexAttribPointer(2, 2, gl.FLOAT, false, S, 12)
+  gl.vertexAttribDivisor(2, 1)
+  gl.enableVertexAttribArray(3)
+  gl.vertexAttribPointer(3, 4, gl.FLOAT, false, S, 20)
+  gl.vertexAttribDivisor(3, 1)
+  gl.enableVertexAttribArray(4)
+  gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, 36)
+  gl.vertexAttribDivisor(4, 1)
+  gl.enableVertexAttribArray(5)
+  gl.vertexAttribPointer(5, 2, gl.FLOAT, false, S, 48)
+  gl.vertexAttribDivisor(5, 1)
+  gl.enableVertexAttribArray(6)
+  gl.vertexAttribPointer(6, 4, gl.FLOAT, false, S, 56)
+  gl.vertexAttribDivisor(6, 1)
+  gl.bindVertexArray(null)
+  return { vbuf, vao }
+}
+
+export function releaseParticleProgram(gl, built) {
+  const slot = built && built._slot
+  if (!slot) return
+  slot.refs--
+  if (slot.refs > 0) return
+  try {
+    if (slot.prog && slot.prog.prog) gl.deleteProgram(slot.prog.prog)
+    if (slot.quadBuf) gl.deleteBuffer(slot.quadBuf)
+  } catch { /* 上下文可能已丢失 */ }
+  sharedPrograms.delete(gl)
+}
+
 export function buildParticleProgram(gl) {
+  const existing = sharedPrograms.get(gl)
+  if (existing) {
+    existing.refs++
+    const inst = makeInstanceBuffers(gl, existing.quadBuf)
+    return {
+      prog: existing.prog,
+      quadBuf: existing.quadBuf,
+      vbuf: inst.vbuf,
+      vao: inst.vao,
+      _slot: existing,
+    }
+  }
     const vs = `#version 300 es
 // 单位 quad（TRIANGLE_STRIP 4 顶点），按实例的 size/rot 展开为朝屏幕的精灵
 layout(location=0) in vec2 a_corner;      // -0.5..0.5
@@ -148,43 +209,13 @@ void main(){
     // `layout(location=…)` 声明属性位置，再绑反而会覆盖作者/引擎的约定。
     const prog = linkProgram(gl, vs, fs, { attribs: [] })
 
-    // 静态 quad 角点
     const quadBuf = gl.createBuffer()
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5]), gl.STATIC_DRAW)
 
-    const vbuf = gl.createBuffer()
-    const vao = gl.createVertexArray()
-    gl.bindVertexArray(vao)
-    // location 0：quad 角（每顶点）
-    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
-    gl.enableVertexAttribArray(0)
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0)
-    gl.vertexAttribDivisor(0, 0)
-    // location 1..6：实例数据（stride 72 = 18 float，含 rope 的 a_vrange、帧间混合、三轴旋转）
-    gl.bindBuffer(gl.ARRAY_BUFFER, vbuf)
-    const S = 72
-    gl.enableVertexAttribArray(1)
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, S, 0)
-    gl.vertexAttribDivisor(1, 1)
-    gl.enableVertexAttribArray(2)
-    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, S, 12)
-    gl.vertexAttribDivisor(2, 1)
-    gl.enableVertexAttribArray(3)
-    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, S, 20)
-    gl.vertexAttribDivisor(3, 1)
-    gl.enableVertexAttribArray(4)
-    gl.vertexAttribPointer(4, 3, gl.FLOAT, false, S, 36)
-    gl.vertexAttribDivisor(4, 1)
-    gl.enableVertexAttribArray(5)
-    gl.vertexAttribPointer(5, 2, gl.FLOAT, false, S, 48)
-    gl.vertexAttribDivisor(5, 1)
-    gl.enableVertexAttribArray(6)
-    gl.vertexAttribPointer(6, 4, gl.FLOAT, false, S, 56)
-    gl.vertexAttribDivisor(6, 1)
-    gl.bindVertexArray(null)
-
-    return {
+    const slot = {
+      refs: 1,
+      quadBuf,
       prog: {
         prog,
         uniTex: gl.getUniformLocation(prog, 'u_tex'),
@@ -200,8 +231,14 @@ void main(){
         uniFrameCount: gl.getUniformLocation(prog, 'u_frameCount'),
         uniFrames: gl.getUniformLocation(prog, 'u_frames'),
       },
+    }
+    sharedPrograms.set(gl, slot)
+    const inst = makeInstanceBuffers(gl, quadBuf)
+    return {
+      prog: slot.prog,
       quadBuf,
-      vbuf,
-      vao,
+      vbuf: inst.vbuf,
+      vao: inst.vao,
+      _slot: slot,
     }
   }

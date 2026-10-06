@@ -715,9 +715,14 @@ export function rewriteXrayFragScale(fragGlsl) {
  * 两个函数拆开：index 每帧建一次传给 bindConstants 循环复用（每帧每 pass 都要查）。
  * 键冲突（同 shader 声明两个只差大小写的 material 名）取后一个 —— 无此语料，防御即可。
  */
+const matMetaLowerCache = new WeakMap()
 export function indexMatMetaLower(matMeta) {
+  if (!matMeta) return new Map()
+  const hit = matMetaLowerCache.get(matMeta)
+  if (hit) return hit
   const m = new Map()
-  for (const k of Object.keys(matMeta || {})) m.set(k.toLowerCase(), k)
+  for (const k of Object.keys(matMeta)) m.set(k.toLowerCase(), k)
+  matMetaLowerCache.set(matMeta, m)
   return m
 }
 
@@ -1279,7 +1284,7 @@ export function createRenderer(canvas, opts = {}) {
     }
   }
 
-  // 效果 shader 缓存：key = shaderName + '|' + JSON.stringify(combos)
+  // 效果 shader 缓存：key = effectComboKey(shaderName, combos)
   const progCache = new Map()
   const includeCache = new Map()
   const shaderSrcCache = new Map()
@@ -1355,6 +1360,15 @@ export function createRenderer(canvas, opts = {}) {
     const n = Number(s)
     return Number.isFinite(n) ? n : undefined
   }
+  // 效果程序缓存键。插入序拼接，和 JSON.stringify 一样稳定，但不走序列化。
+  function effectComboKey(shaderName, combos) {
+    if (!combos) return shaderName || ''
+    const keys = Object.keys(combos)
+    if (keys.length === 0) return shaderName || ''
+    let s = shaderName || ''
+    for (let i = 0; i < keys.length; i++) s += '\0' + keys[i] + '=' + combos[keys[i]]
+    return s
+  }
   async function getEffectProgram(shaderName, combos, providedTextures) {
     // shader 源与纹理 combo 按名缓存：避免每帧每 pass 重新 fetch/正则
     let src = shaderSrcCache.get(shaderName)
@@ -1394,7 +1408,7 @@ export function createRenderer(canvas, opts = {}) {
         effectiveCombos[tc.combo] = 1
       }
     }
-    const key = shaderName + '|' + JSON.stringify(effectiveCombos)
+    const key = effectComboKey(shaderName, effectiveCombos)
     if (progCache.has(key)) {
       const hit = progCache.get(key)
       // null = 编译失败哨兵：避免每帧每层重试同一坏 shader（2902406982 的
@@ -1643,9 +1657,18 @@ export function createRenderer(canvas, opts = {}) {
   // [we-scene patch] g_Daytime：WE 语义是「一天中的时刻」，取 [0,1)（0=午夜）。
   // 全库 14 处脚本读 engine.timeOfDay，shader 侧的 g_Daytime 同源。
   // 改动前硬编码 0（恒为午夜），依赖它做昼夜变化的场景永远停在夜里。
+  // g_Daytime 的分辨率本来就是整秒。同一秒内复用，避免每个 uniform 都 new Date()。
+  let dayVal = 0
+  let dayUntil = -1
   function daytimeFraction() {
-    const d = new Date()
-    return (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400
+    const now = Date.now()
+    if (now >= dayUntil) {
+      const d = new Date(now)
+      const k = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()
+      dayVal = k / 86400
+      dayUntil = now + (1000 - d.getMilliseconds())
+    }
+    return dayVal
   }
 
   function setVal(uni, name, setter) {
@@ -2540,8 +2563,14 @@ export function createRenderer(canvas, opts = {}) {
 
     let idx = 0
     const anim = layer.textureAnimation
-    let total = 0
-    for (const f of list) total += f.duration > 0 ? f.duration : 1 / 30
+    let durRec = spriteDurCache.get(list)
+    if (!durRec || durRec.n !== list.length) {
+      let sum = 0
+      for (const f of list) sum += f.duration > 0 ? f.duration : 1 / 30
+      durRec = { n: list.length, total: sum }
+      spriteDurCache.set(list, durRec)
+    }
+    const total = durRec.total
     layer.spriteDuration = total
     if (anim && anim.frame !== null && anim.frame !== undefined) {
       // 脚本钉帧：取整并夹到合法区间（语料里有 `setFrame(bool*1)`、
@@ -2590,8 +2619,42 @@ export function createRenderer(canvas, opts = {}) {
     return [f.x / texW, f.y / texH, uX / texW, uY / texH, vX / texW, vY / texH]
   }
 
-  // 图层局部变换（不含投影）：把 [-0.5,0.5] 的 local quad 映射到世界空间
+  const modelMatrixCache = new WeakMap()
+  const spriteDurCache = new WeakMap()
+  // 图层局部变换（不含投影）：把 [-0.5,0.5] 的 local quad 映射到世界空间。
+  // 同一层在一帧里会被合成、光照、puppet 多次取矩阵。输入没变就复用上一份
+  // （调用方只读 m，mat4Translate/Scale 都写出新数组）。
   function layerModelMatrix(layer, cam) {
+    const o = layer.origin || [0, 0, 0]
+    const sc = layer.scale || [1, 1, 1]
+    const ang = layer.angles || [0, 0, 0]
+    const sz = layer.size || [0, 0]
+    const depth = layer.parallaxDepth
+    const anchor = layer.parallaxAnchor
+    const eye = cam && cam.eye
+    const persp = !!(cam && cam.perspective)
+    const sky = !!(persp && layer.isSkybox && eye)
+    const rec = modelMatrixCache.get(layer)
+    if (rec &&
+      rec.ox === o[0] && rec.oy === o[1] && rec.oz === o[2] &&
+      rec.sx === sz[0] && rec.sy === sz[1] &&
+      rec.scx === sc[0] && rec.scy === sc[1] && rec.scz === sc[2] &&
+      rec.ax === ang[0] && rec.ay === ang[1] && rec.az === ang[2] &&
+      rec.align === (layer.alignment || '') &&
+      rec.layerPersp === !!layer.perspective &&
+      rec.camPersp === persp &&
+      rec.projH === (cam ? cam.projH : 0) &&
+      rec.sky === sky &&
+      (!sky || (rec.ex === eye[0] && rec.ey === eye[1] && rec.ez === eye[2])) &&
+      rec.pActive === parallaxCtx.active &&
+      rec.pMx === parallaxCtx.mx && rec.pMy === parallaxCtx.my &&
+      rec.pAmt === parallaxCtx.amount &&
+      rec.pCx === parallaxCtx.cx && rec.pCy === parallaxCtx.cy &&
+      rec.pLx === parallaxCtx.lx && rec.pLy === parallaxCtx.ly &&
+      rec.pMode === parallaxCtx.mode &&
+      rec.d0 === (depth ? depth[0] : 0) && rec.d1 === (depth ? depth[1] : 0) &&
+      rec.anx === (anchor ? anchor[0] : 0) && rec.any === (anchor ? anchor[1] : 0)
+    ) return rec.out
     const w = layer.size[0] * layer.scale[0]
     const h = layer.size[1] * layer.scale[1]
     let m = mat4Identity()
@@ -2646,7 +2709,29 @@ export function createRenderer(canvas, opts = {}) {
     if (a[0] !== 0.5 || a[1] !== 0.5) {
       m = mat4Translate(m, (0.5 - a[0]) * w, (0.5 - a[1]) * h, 0)
     }
-    return { m, w, h }
+    const out = { m, w, h }
+    const next = rec || {}
+    next.ox = o[0]; next.oy = o[1]; next.oz = o[2]
+    next.sx = sz[0]; next.sy = sz[1]
+    next.scx = sc[0]; next.scy = sc[1]; next.scz = sc[2]
+    next.ax = ang[0]; next.ay = ang[1]; next.az = ang[2]
+    next.align = layer.alignment || ''
+    next.layerPersp = !!layer.perspective
+    next.camPersp = persp
+    next.projH = cam ? cam.projH : 0
+    next.sky = sky
+    if (sky) { next.ex = eye[0]; next.ey = eye[1]; next.ez = eye[2] }
+    next.pActive = parallaxCtx.active
+    next.pMx = parallaxCtx.mx; next.pMy = parallaxCtx.my
+    next.pAmt = parallaxCtx.amount
+    next.pCx = parallaxCtx.cx; next.pCy = parallaxCtx.cy
+    next.pLx = parallaxCtx.lx; next.pLy = parallaxCtx.ly
+    next.pMode = parallaxCtx.mode
+    next.d0 = depth ? depth[0] : 0; next.d1 = depth ? depth[1] : 0
+    next.anx = anchor ? anchor[0] : 0; next.any = anchor ? anchor[1] : 0
+    next.out = out
+    if (!rec) modelMatrixCache.set(layer, next)
+    return out
   }
 
   /**
@@ -3051,7 +3136,7 @@ export function createRenderer(canvas, opts = {}) {
     // 的顺序给出规格，缺项回落到层级的 `mm`（单材质模型的旧行为一字不变）。
     const meshSpecs = layer.meshMaterials && layer.meshMaterials.length ? layer.meshMaterials : null
     const specOf = (i) => (meshSpecs && meshSpecs[i]) || mm
-    const keyOf = (spec) => spec.shader + '|' + JSON.stringify(spec.combos || {})
+    const keyOf = (spec) => effectComboKey(spec.shader, spec.combos || {})
     const primaryKey = keyOf(mm)
     // 本帧要用到的全部规格先查缓存：任一还在编译就先让通用程序画这一帧
     // （与旧行为一致：首帧异步编译，下一帧起走材质）。
@@ -4105,6 +4190,19 @@ export function createRenderer(canvas, opts = {}) {
   //    排在引用方后面，所以这趟预渲染放在主循环之前。
   // 用「以源层矩形为视口」的局部相机（同 renderContainerGroup 的 groupCam），
   // 并把 origin 挪到视口中心 —— 源层的世界坐标就此完全不参与，屏外也无所谓。
+  // 合成纹理名 → 对象 id。名字来自 scene 数据，一帧里会反复扫，按字符串记住解析结果。
+  // -1 = 不是合成名（避免下次再跑正则）。对象 id 可以是 0，不能拿 0 当哨兵。
+  const compositeIdCache = new Map()
+  function compositeObjectId(n) {
+    if (typeof n !== 'string') return -1
+    let id = compositeIdCache.get(n)
+    if (id === undefined) {
+      const m = /^_rt_imageLayerComposite_(\d+)_[a-z]$/.exec(n)
+      id = m ? Number(m[1]) : -1
+      compositeIdCache.set(n, id)
+    }
+    return id
+  }
   async function renderCompositeSources(scene, textures, cam, width, height, time) {
     compositeFBOs.clear()
     pendingEmptyCompose.clear()
@@ -4118,10 +4216,8 @@ export function createRenderer(canvas, opts = {}) {
     const selfRefIds = new Set()
     let noteOwner = null
     const noteName = (n) => {
-      if (typeof n !== 'string') return
-      const m = /^_rt_imageLayerComposite_(\d+)_[a-z]$/.exec(n)
-      if (!m) return
-      const oid = Number(m[1])
+      const oid = compositeObjectId(n)
+      if (oid < 0) return
       if (noteOwner !== null && oid === noteOwner) selfRefIds.add(oid)
       let set = wanted.get(oid)
       if (!set) { set = new Set(); wanted.set(oid, set) }
@@ -4184,11 +4280,8 @@ export function createRenderer(canvas, opts = {}) {
         if (l) {
           const scan = (v) => {
             if (typeof v === 'string') {
-              const m = /^_rt_imageLayerComposite_(\d+)_[a-z]$/.exec(v)
-              if (m) {
-                const d = Number(m[1])
-                if (d !== oid && wanted.has(d)) set.add(d)
-              }
+              const d = compositeObjectId(v)
+              if (d >= 0 && d !== oid && wanted.has(d)) set.add(d)
             } else if (Array.isArray(v)) {
               v.forEach(scan)
             }
@@ -4566,8 +4659,11 @@ export function createRenderer(canvas, opts = {}) {
           texObj.lastUploaded = v.currentTime
           // [we-scene patch] 上传尺寸变化时重报（limit 现在跟随渲染目标，改清晰度/
           // 改窗口都会变）。只报一次会让诊断停留在首帧那个值，排错时误导。
-          if (videoTexReportedSize !== uw + 'x' + uh) {
-            videoTexReportedSize = uw + 'x' + uh
+          // 判重记在各自纹理上：多路视频尺寸不同（如 640x338 / 640x360）时，共用一个
+          // 变量会被交替改写，每帧都判成「变了」而刷屏（实测 ~120 条/秒）。
+          videoTexReportedSize = uw + 'x' + uh
+          if (texObj.reportedSize !== videoTexReportedSize) {
+            texObj.reportedSize = videoTexReportedSize
             videoCanvasReported = true
             diag(
               'video tex ready ' + uw + 'x' + uh + ' (src ' + vw + 'x' + vh + ', limit ' + limit +
@@ -5341,7 +5437,7 @@ export function createRenderer(canvas, opts = {}) {
      */
     async prepareMeshMaterial(shader, combos, textures) {
       if (!shader) return false
-      const key = shader + '|' + JSON.stringify(combos || {})
+      const key = effectComboKey(shader, combos || {})
       if (meshMatProgCache.get(key)) return true
       try {
         const e = await getEffectProgram(shader, combos || {}, textures || {})

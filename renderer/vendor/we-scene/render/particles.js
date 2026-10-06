@@ -1,7 +1,7 @@
 // [we-scene patch] 粒子：CPU 模拟 + 实例化 quad（非 gl.POINTS：PointSize 上限、
 // 需旋转、尺寸须随场景缩放）。局部空间模拟 → 图层变换到世界像素（y 向下）。
 import { TAU, rand, randExp, parseVec, parseRandomVec, parseDist, num, audioGate, hash3, vnoise3, fbm3, noiseVec3 } from './particle-util.js'
-import { buildParticleProgram } from './particle-shaders.js'
+import { buildParticleProgram, releaseParticleProgram } from './particle-shaders.js'
 import { audioResponse } from './audio.js'
 import { MAX_SEQUENCE_MUL } from '../pkg/limits.js'
 
@@ -41,6 +41,17 @@ export function setParticleDensityTier(tier) {
 }
 export function getParticleDensityTier() {
   return particleDensityTier
+}
+
+// 噪声倍频随密度档下降。high（默认）原样返回作者写的 oct，画面与改前逐位相同。
+// medium 最多 2、low 固定 1：湍流一次调用是 3 个 fbm × oct 个倍频 × 8 个角点，
+// 这是重粒子场景里 hash3 占一半 CPU 的来源。质量档此前只缩池子和发射率，
+// 活粒子数经常碰不到池上限，中间档几乎不省 CPU。
+export function noiseOctaves(authored) {
+  const n = Math.max(1, authored | 0)
+  if (particleDensityTier === 'low') return 1
+  if (particleDensityTier === 'medium') return Math.min(n, 2)
+  return n
 }
 
 // 「维持池满」型发射器（rate 与 instantaneous 都缺省）的补充上限。这类发射器
@@ -295,6 +306,7 @@ export class ParticleSystem {
     this._vao = null
     this._data = null
     this._sceneTex = null
+    this._nv = [0, 0, 0]
     // [we-scene patch 2026-10-03] 粒子**材质 shader**（F44）：作者在粒子材质里写自己的
     // shader 时（pkg 内 `shaders/<名>.frag|.vert` 成对存在），用它的着色器画粒子，
     // 而不是内置精灵程序 —— WE 就是这么做的，而作者逻辑（例如 shimmering_particles 的
@@ -1493,7 +1505,7 @@ export class ParticleSystem {
       const tvK = tv.audioMode ? audioGate(tv.audioBounds, this._audioLevel || 0) : 1
       const sp = rand(tv.speedMin, tv.speedMax) * speedMul * tvK
       const t = this.simTime * (tv.timeScale || 0)
-      const nv = noiseVec3(p.x * tv.scale + tv.offset, p.y * tv.scale + tv.offset, t + p.seed * (tv.phaseMax || 0), 3)
+      const nv = noiseVec3(p.x * tv.scale + tv.offset, p.y * tv.scale + tv.offset, t + p.seed * (tv.phaseMax || 0), noiseOctaves(3), this._nv)
       p.vx += nv[0] * sp
       p.vy += nv[1] * sp
       p.vz += nv[2] * sp
@@ -1636,7 +1648,8 @@ export class ParticleSystem {
         p.bx * t.scale,
         p.by * t.scale,
         this.simTime * t.scale * ts + p.turbPhase,
-        3
+        noiseOctaves(3),
+        this._nv,
       )
       p.vx += nv[0] * p.turbSpeed * t.mask[0] * dt
       p.vy += nv[1] * p.turbSpeed * t.mask[1] * dt
@@ -1694,7 +1707,7 @@ export class ParticleSystem {
     // remapvalue：噪声重映射到速度/速率
     for (const rm of O.remap) {
       const s = rm.inputScale || 1
-      const nv = noiseVec3(p.bx * 0.01 * s, p.by * 0.01 * s, this.simTime * 0.1, rm.fn === 'fbmnoise' ? 4 : 2)
+      const nv = noiseVec3(p.bx * 0.01 * s, p.by * 0.01 * s, this.simTime * 0.1, noiseOctaves(rm.fn === 'fbmnoise' ? 4 : 2), this._nv)
       if (rm.output === 'velocity') {
         for (let i = 0; i < 3; i++) {
           const t = (nv[i] + 1) / 2
@@ -2523,7 +2536,14 @@ export class ParticleSystem {
           } else {
             gl.bindTexture(gl.TEXTURE_2D, this._sceneTex)
           }
-          gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, dw, dh, 0)
+          // 尺寸没变时用 copyTexSubImage2D：copyTexImage2D 每次都重新分配存储。
+          if (this._sceneW === dw && this._sceneH === dh) {
+            gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, dw, dh)
+          } else {
+            gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, 0, 0, dw, dh, 0)
+            this._sceneW = dw
+            this._sceneH = dh
+          }
         }
         if (prog.uniScene) gl.uniform1i(prog.uniScene, 2)
         if (prog.uniResolution) gl.uniform2f(prog.uniResolution, dw, dh)
@@ -2566,12 +2586,16 @@ export class ParticleSystem {
   }
 
   _buildProgram(gl) {
-    // GPU 装配已抽至 particle-shaders.js；此处只把产物挂到实例上
+    // GPU 装配已抽至 particle-shaders.js；此处只把产物挂到实例上。
+    // 程序与静态 quad 按 GL 上下文共享（同上下文的系统着色器完全相同），
+    // 实例缓冲和 VAO 仍是每个系统一份。
     const built = buildParticleProgram(gl)
+    this._built = built
     this._quadBuf = built.quadBuf
     this._vbuf = built.vbuf
     this._vao = built.vao
     this._prog = built.prog
+    if (!this._nv) this._nv = [0, 0, 0]
   }
 
   // 序列帧 uv 表（vec4[]：xy=offset zw=scale）。
@@ -2623,11 +2647,15 @@ export class ParticleSystem {
     if (!gl) return
     try {
       if (this._vbuf) gl.deleteBuffer(this._vbuf)
-      if (this._quadBuf) gl.deleteBuffer(this._quadBuf)
       if (this._matVbuf) gl.deleteBuffer(this._matVbuf)
       if (this._vao) gl.deleteVertexArray(this._vao)
       if (this._matVao) gl.deleteVertexArray(this._matVao)
-      if (this._prog && this._prog.prog) gl.deleteProgram(this._prog.prog)
+      // 程序和静态 quad 按上下文共享，引用归零才删。没有共享槽时（旧路径）自己删。
+      if (this._built && this._built._slot) releaseParticleProgram(gl, this._built)
+      else {
+        if (this._quadBuf) gl.deleteBuffer(this._quadBuf)
+        if (this._prog && this._prog.prog) gl.deleteProgram(this._prog.prog)
+      }
       if (this._sceneTex) gl.deleteTexture(this._sceneTex)
     } catch (e) {
       /* 上下文可能已丢失 */
@@ -2638,5 +2666,8 @@ export class ParticleSystem {
     this._vao = null
     this._data = null
     this._sceneTex = null
+    this._sceneW = 0
+    this._sceneH = 0
+    this._built = null
   }
 }

@@ -34,6 +34,7 @@ const {
   ropeTrailHistoryCount,
   ropeTrailDuration,
   setParticleDensityTier,
+  noiseOctaves,
 } = await imp("renderer/vendor/we-scene/render/particles.js");
 const ptex = await imp("renderer/vendor/we-scene/render/particle-textures.js");
 const { createTarget, rasterizeSystem, analyzeTarget, particleBasis } = await imp(
@@ -3268,7 +3269,14 @@ function runPrewarmBudget() {
   const low = new ParticleSystem(null, snowModel, { count: 5000 }, layer);
   if (low.maxCount > 3000) errors.push(`low 档池容量应 ≤3000，实得 ${low.maxCount}`);
   if (low._ov.countMul !== 3) errors.push(`low 档 rate count 放大应封顶 3，实得 ${low._ov.countMul}`);
+  if (noiseOctaves(4) !== 1) errors.push(`low 档噪声倍频应为 1，实得 ${noiseOctaves(4)}`);
+  setParticleDensityTier("medium");
+  if (noiseOctaves(4) !== 2) errors.push(`medium 档噪声倍频应封顶 2，实得 ${noiseOctaves(4)}`);
+  if (noiseOctaves(2) !== 2) errors.push(`medium 档不超过作者倍频，实得 ${noiseOctaves(2)}`);
   setParticleDensityTier("high");
+  if (noiseOctaves(4) !== 4 || noiseOctaves(3) !== 3) {
+    errors.push(`high 档噪声倍频必须原样（4→${noiseOctaves(4)}，3→${noiseOctaves(3)}）`);
+  }
 
   // ---- count<1 的调稀语义必须保留（Rain_secondary=0.13，2370927443）----
   const thin = new ParticleSystem(

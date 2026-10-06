@@ -263,13 +263,15 @@ function fbm3(x, y, z, oct) {
   }
   return v / (norm || 1)
 }
-// 返回 -1..1 的三维噪声向量（各分量取不同偏移，互不相关）
-function noiseVec3(x, y, z, oct) {
-  return [
-    fbm3(x, y, z, oct) * 2 - 1,
-    fbm3(x + 31.7, y + 11.3, z + 57.1, oct) * 2 - 1,
-    fbm3(x + 73.9, y + 92.1, z + 13.7, oct) * 2 - 1,
-  ]
+// 返回 -1..1 的三维噪声向量（各分量取不同偏移，互不相关）。
+// `out` 可选：热路径传入复用数组，避免每个粒子每次调用都分配。省略时仍新分配，
+// 返回值的三个分量与旧实现逐位相同。
+function noiseVec3(x, y, z, oct, out) {
+  const o = out || [0, 0, 0]
+  o[0] = fbm3(x, y, z, oct) * 2 - 1
+  o[1] = fbm3(x + 31.7, y + 11.3, z + 57.1, oct) * 2 - 1
+  o[2] = fbm3(x + 73.9, y + 92.1, z + 13.7, oct) * 2 - 1
+  return o
 }
 
 
