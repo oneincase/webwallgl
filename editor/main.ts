@@ -147,13 +147,25 @@ import {
   type PropType,
   type PropView,
 } from "./userprops";
-import { boxOf, sceneFrame, snapMove, snapTargets, type Box, type SnapTargets } from "./snap";
+import {
+  ALIGN_MODES,
+  alignDeltas,
+  boxOf,
+  sceneFrame,
+  snapMove,
+  snapTargets,
+  unionBox,
+  type AlignMode,
+  type Box,
+  type SnapTargets,
+} from "./snap";
 import { scriptsAllowedByDefault, scriptsOverrideFrom } from "./trust";
 import {
   duplicateLayer,
   findNode,
   findPath,
   groupLayer,
+  groupLayers,
   isLockedObj,
   makeDoc,
   moveLayer,
@@ -161,6 +173,7 @@ import {
   removeLayer,
   sceneResolution,
   setLocked,
+  topLevelIds,
   unwrap,
   writeObjProps,
   type EditorDoc,
@@ -182,6 +195,8 @@ import {
 } from "./gizmo";
 import {
   EditHistory,
+  batchCommand,
+  isBatch,
   isNoopEdit,
   isStruct,
   mergeLiveEdit,
@@ -344,6 +359,39 @@ let openGen = 0;
 let selectedId: number | string | null = null;
 const collapsed = new Set<number | string>();
 /** 页面级锁定（不进文档）：锁定层不参与点选、不能拖、检视器只读 */
+/** 多选：selectedId 是主选（检视器 / 手柄跟它走），extraSel 是追加选中的其余层 */
+const extraSel = new Set<string>();
+
+function selectionNodes(): LayerNode[] {
+  if (!doc || selectedId === null) return [];
+  const out: LayerNode[] = [];
+  for (const id of [String(selectedId), ...extraSel]) {
+    const n = findPath(doc.roots, id)?.at(-1);
+    if (n && !out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+const isSelected = (id: number | string) => (selectedId !== null && String(selectedId) === String(id)) || extraSel.has(String(id));
+
+/** ⇧ / ⌘ 点：加入或移出选中集合；移出主选时由下一个顶上 */
+function toggleSelect(id: number | string) {
+  const key = String(id);
+  if (selectedId !== null && String(selectedId) === key) {
+    const next = [...extraSel][0];
+    extraSel.delete(next);
+    selectedId = next === undefined ? null : (findPath(doc?.roots ?? [], next)?.at(-1)?.id ?? null);
+  } else if (extraSel.has(key)) {
+    extraSel.delete(key);
+  } else if (selectedId === null) {
+    selectedId = findPath(doc?.roots ?? [], key)?.at(-1)?.id ?? null;
+  } else {
+    extraSel.add(key);
+  }
+  renderTree();
+  renderInspector();
+}
+
 const isLocked = (id: number | string | null) => {
   if (id === null || !doc) return false;
   const n = findPath(doc.roots, id)?.at(-1);
@@ -489,6 +537,7 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   current = opened;
   doc = opened.doc;
   selectedId = null;
+  extraSel.clear();
   collapsed.clear();
   scriptDrafts.clear();
   docDriven = !!opts.docDriven;
@@ -828,6 +877,10 @@ stageEl.addEventListener("click", (e) => {
   }
   const r = canvas.getBoundingClientRect();
   const hits = editor.hitTestAt(e.clientX - r.left, e.clientY - r.top).filter((h) => !isLocked(h.id));
+  if (e.shiftKey && hits.length) {
+    toggleSelect(hits[0].id);
+    return;
+  }
   lastPick = cyclePick(
     hits.map((h) => h.id),
     lastPick,
@@ -844,6 +897,7 @@ stageEl.addEventListener("click", (e) => {
 });
 
 function selectLayer(id: number | string | null) {
+  extraSel.clear();
   if (id === null || !doc) {
     selectedId = null;
   } else {
@@ -915,6 +969,21 @@ function markDirty() {
   syncDocTitle();
 }
 
+/** 几层一起改：带关键帧的层各自落关键帧，其余合成一步撤销 */
+function commitMany(label: string, cmds: PropsCmd[]) {
+  if (cmds.length <= 1) {
+    if (cmds[0]) commit(cmds[0]);
+    return;
+  }
+  const plain = cmds.filter((c) => !pendingKeys.has(String(c.id)));
+  for (const c of cmds) if (!plain.includes(c)) commit(c);
+  const cmd = batchCommand(label, plain);
+  if (!cmd) return;
+  edits.push(cmd);
+  syncHistoryButtons();
+  log(label);
+}
+
 function commit(cmd: PropsCmd) {
   const keyed = pendingKeys.get(String(cmd.id));
   pendingKeys.delete(String(cmd.id));
@@ -940,6 +1009,7 @@ function restoreObjects(json: string, sel: number | string | null, props?: strin
   docDriven = true;
   scheduleDraft();
   selectedId = sel !== null && findNode(doc.roots, sel) ? sel : null;
+  extraSel.clear();
   renderTree();
   renderInspector();
   renderStatus();
@@ -978,6 +1048,11 @@ function selectedNode(): LayerNode | null {
 function deleteSelected() {
   const n = selectedNode();
   if (!n) return;
+  if (extraSel.size && doc) {
+    const ids = topLevelIds(doc, selectionNodes().map((x) => x.id));
+    structEdit(et("log.multiDeleted", { n: ids.length }), (d) => (ids.every((id) => removeLayer(d, id)) ? null : undefined));
+    return;
+  }
   const parent = n.obj.parent;
   structEdit(et("log.deleted", { name: nodeName(n.id) }), (d) =>
     removeLayer(d, n.id) ? ((parent as number | string | undefined) ?? null) : undefined,
@@ -987,6 +1062,14 @@ function deleteSelected() {
 function duplicateSelected() {
   const n = selectedNode();
   if (!n) return;
+  if (extraSel.size && doc) {
+    const ids = topLevelIds(doc, selectionNodes().map((x) => x.id));
+    structEdit(et("log.multiDuplicated", { n: ids.length }), (d) => {
+      const made = ids.map((id) => duplicateLayer(d, id, et("layer.copySuffix")));
+      return made.every((m) => m !== null) ? made[0]! : undefined;
+    });
+    return;
+  }
   structEdit(et("log.duplicated", { name: nodeName(n.id) }), (d) => duplicateLayer(d, n.id, et("layer.copySuffix")) ?? undefined);
 }
 
@@ -1012,6 +1095,13 @@ function undoRedo(dir: "undo" | "redo") {
   const cmd = edits.take(dir);
   if (!cmd) return;
   syncHistoryButtons();
+  if (isBatch(cmd)) {
+    for (const c of cmd.cmds) void applyPatch(c.id, dir === "undo" ? c.before : c.after);
+    renderTree();
+    renderInspector();
+    log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    return;
+  }
   if (isStruct(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
     restoreObjects(
@@ -1084,6 +1174,7 @@ function drawOverlay() {
   overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
   overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
   if (!editor || selectedId === null) return;
+  if (extraSel.size) drawExtraOutlines();
   const outline = editor.getLayerOutline(Number(selectedId));
   const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
   if (!outline || !canvas) return;
@@ -1154,6 +1245,29 @@ function drawOverlay() {
   overlayCtx.stroke();
 }
 
+function drawExtraOutlines() {
+  const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
+  if (!editor || !canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const sr = stageEl.getBoundingClientRect();
+  const cr = canvas.getBoundingClientRect();
+  overlayCtx.setTransform(dpr, 0, 0, dpr, (cr.left - sr.left) * dpr, (cr.top - sr.top) * dpr);
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0078d4";
+  for (const id of extraSel) {
+    const c = editor.getLayerOutline(Number(id))?.corners;
+    if (!c) continue;
+    overlayCtx.beginPath();
+    c.forEach(([x, y], i) => (i ? overlayCtx.lineTo(x, y) : overlayCtx.moveTo(x, y)));
+    overlayCtx.closePath();
+    overlayCtx.setLineDash([6, 3]);
+    overlayCtx.strokeStyle = accent;
+    overlayCtx.lineWidth = 1.5;
+    overlayCtx.stroke();
+    overlayCtx.setLineDash([]);
+  }
+  overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
 // ---------- 视口拖拽移动选中层 ----------
 
 type DragMode = "move" | "scale" | "rotate";
@@ -1172,13 +1286,19 @@ let drag: {
   /** 移动吸附：起拖时选中层的包围盒与候选线（画面边缘 / 中线、其他可见层的边缘 / 中心） */
   box: Box | null;
   snap: SnapTargets | null;
+  /** 多选移动时跟着走的其余层（已去掉被祖先覆盖的、锁定的） */
+  others: Array<{ id: number | string; props0: EditorLayerProps }>;
 } | null = null;
 let suppressClick = false;
 let snapGuides: { gx: number[]; gy: number[] } | null = null;
 const SNAP_COLOR = "#ff3d9a";
 
-function snapSetup(id: number | string, corners: ReadonlyArray<readonly number[]> | null): { box: Box | null; snap: SnapTargets | null } {
-  const box = corners ? boxOf(corners) : null;
+function snapSetup(
+  ids: ReadonlyArray<number | string>,
+  corners: ReadonlyArray<readonly number[]> | null,
+): { box: Box | null; snap: SnapTargets | null } {
+  const own = ids.map((id) => editor?.getLayerOutline(Number(id))?.corners).map((c) => (c ? boxOf(c) : null));
+  const box = corners && own.every(Boolean) ? unionBox(own as Box[]) : null;
   const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
   const res = sceneResolution(doc?.scene ?? null);
   if (!editor || !box || !canvas || !res) return { box: null, snap: null };
@@ -1186,7 +1306,7 @@ function snapSetup(id: number | string, corners: ReadonlyArray<readonly number[]
   const byId = new Map(layers.map((l) => [l.id, l]));
   const insideSelf = (l: (typeof layers)[number]) => {
     for (let cur: (typeof layers)[number] | undefined = l, n = 0; cur && n < 64; cur = byId.get(cur.parentId ?? NaN), n++) {
-      if (String(cur.id) === String(id)) return true;
+      if (ids.some((id) => String(cur!.id) === String(id))) return true;
     }
     return false;
   };
@@ -1212,7 +1332,7 @@ function canvasPoint(e: PointerEvent | MouseEvent): { x: number; y: number } | n
 
 function overSelected(x: number, y: number): boolean {
   if (!editor || selectedId === null) return false;
-  return editor.hitTestAt(x, y, { includeHidden: true }).some((h) => String(h.id) === String(selectedId));
+  return editor.hitTestAt(x, y, { includeHidden: true }).some((h) => isSelected(h.id));
 }
 
 stageEl.addEventListener("pointerdown", (e) => {
@@ -1223,6 +1343,15 @@ stageEl.addEventListener("pointerdown", (e) => {
   if (!handle && !overSelected(p.x, p.y)) return;
   const props = editor.getLayerProps(Number(selectedId));
   if (!props) return;
+  const dragOthers: Array<{ id: number | string; props0: EditorLayerProps }> = [];
+  if (!handle && doc && extraSel.size) {
+    for (const id of topLevelIds(doc, selectionNodes().map((n) => n.id))) {
+      if (String(id) === String(selectedId) || isLocked(id)) continue;
+      const p0 = editor.getLayerProps(Number(id));
+      if (p0) dragOthers.push({ id, props0: structuredClone(p0) });
+    }
+  }
+  const dragIds = [selectedId, ...dragOthers.map((o) => o.id)];
   drag = {
     mode: handle?.kind ?? "move",
     id: selectedId,
@@ -1233,7 +1362,8 @@ stageEl.addEventListener("pointerdown", (e) => {
     anchor: gizmo?.anchor ?? [p.x, p.y],
     ...layerAxes(gizmo?.corners ?? []),
     moved: false,
-    ...(handle ? { box: null, snap: null } : snapSetup(selectedId, gizmo?.corners ?? null)),
+    ...(handle ? { box: null, snap: null } : snapSetup(dragIds, gizmo?.corners ?? null)),
+    others: handle ? [] : dragOthers,
   };
   stageEl.setPointerCapture(e.pointerId);
 });
@@ -1266,6 +1396,10 @@ stageEl.addEventListener("pointermove", (e) => {
     const d = editor.screenDeltaToLocal(Number(drag.id), mx, my);
     if (!d) return;
     void applyPatch(drag.id, { origin: [p0.origin[0] + d[0], p0.origin[1] + d[1], p0.origin[2]] });
+    for (const o of drag.others) {
+      const od = editor.screenDeltaToLocal(Number(o.id), mx, my);
+      if (od) void applyPatch(o.id, { origin: [o.props0.origin[0] + od[0], o.props0.origin[1] + od[1], o.props0.origin[2]] });
+    }
     return;
   }
   const from: Pt = [drag.x0, drag.y0];
@@ -1285,12 +1419,14 @@ function endDrag(e: PointerEvent) {
   snapGuides = null;
   if (!d.moved || !editor) return;
   suppressClick = true;
-  const after = editor.getLayerProps(Number(d.id));
-  if (after) {
-    const key = DRAG_FIELD[d.mode];
-    commit({ id: d.id, name: nodeName(d.id), before: pickProps(d.props0, [key]), after: pickProps(after, [key]) });
-    renderInspector();
+  const key = DRAG_FIELD[d.mode];
+  const cmds: PropsCmd[] = [];
+  for (const o of [{ id: d.id, props0: d.props0 }, ...d.others]) {
+    const after = editor.getLayerProps(Number(o.id));
+    if (after) cmds.push({ id: o.id, name: nodeName(o.id), before: pickProps(o.props0, [key]), after: pickProps(after, [key]) });
   }
+  commitMany(et("log.multiMoved", { n: cmds.length }), cmds);
+  renderInspector();
 }
 stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
@@ -1581,6 +1717,7 @@ async function createNew(images: File[]) {
       log(et("log.newDoc", { w: res.w, h: res.h }));
       if (!imgs.length || !doc) return;
       selectedId = placeImages(doc, imgs, true) ?? null;
+      extraSel.clear();
       markDirty();
     },
   });
@@ -1824,6 +1961,19 @@ function dropLayer(n: LayerNode, targetId: string, where: PlaceWhere) {
 function groupSelected() {
   const n = selectedNode();
   if (!n) return;
+  if (extraSel.size && doc) {
+    const ids = selectionNodes().map((x) => x.id);
+    let bad: { reason: PlaceResult; at?: number | string } | null = null;
+    structEdit(et("log.multiGrouped", { n: topLevelIds(doc, ids).length }), (d) => {
+      const r = groupLayers(d, ids, et("layer.groupName"));
+      if (r.ok) return r.id;
+      bad = r;
+      return undefined;
+    });
+    const b = bad as { reason: PlaceResult; at?: number | string } | null;
+    if (b && b.reason !== "ok" && b.reason !== "noop") log(et(PLACE_BAD[b.reason], { name: nodeName(b.at ?? n.id) }), "warn");
+    return;
+  }
   structEdit(et("log.grouped", { name: nodeName(n.id) }), (d) => groupLayer(d, n.id, et("layer.groupName")) ?? undefined);
 }
 
@@ -1872,6 +2022,7 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
   row.className = "ed-node";
   row.setAttribute("role", "treeitem");
   if (n.id === selectedId) row.classList.add("selected");
+  else if (extraSel.has(String(n.id))) row.classList.add("selected", "extra-selected");
   if (!n.visible) row.classList.add("hidden-layer");
   row.style.paddingLeft = `${6 + depth * 14}px`;
 
@@ -1929,13 +2080,80 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
   }
   row.dataset.id = String(n.id);
   if (editor && current?.assets && !isLocked(n.id)) row.addEventListener("pointerdown", (e) => startTreeDrag(e, n, row));
-  row.onclick = () => {
+  row.onclick = (e) => {
     if (treeDragged) return;
+    if (e.shiftKey || e.metaKey || e.ctrlKey) return toggleSelect(n.id);
     selectedId = n.id;
+    extraSel.clear();
     renderTree();
     renderInspector();
   };
   return row;
+}
+
+// ---------- 多选：对齐 / 等距分布 ----------
+
+const ALIGN_ICON: Record<AlignMode, string> = {
+  left: "M2.5 2v12 M4.5 4.5h8v2.5h-8z M4.5 9h5v2.5h-5z",
+  hcenter: "M8 2v12 M4 4.5h8v2.5H4z M5.5 9h5v2.5h-5z",
+  right: "M13.5 2v12 M3.5 4.5h8v2.5h-8z M6.5 9h5v2.5h-5z",
+  top: "M2 2.5h12 M4.5 4.5v8h2.5v-8z M9 4.5v5h2.5v-5z",
+  vmiddle: "M2 8h12 M4.5 4v8h2.5V4z M9 5.5v5h2.5v-5z",
+  bottom: "M2 13.5h12 M4.5 3.5v8h2.5v-8z M9 6.5v5h2.5v-5z",
+  hdist: "M2 2v12 M14 2v12 M6.5 5h3v6h-3z",
+  vdist: "M2 2h12 M2 14h12 M5 6.5h6v3H5z",
+};
+
+function multiGroup(): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-multi";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  const nodes = selectionNodes();
+  h.textContent = et("multi.title", { n: nodes.length });
+  group.appendChild(h);
+  const bar = document.createElement("div");
+  bar.className = "ed-align-bar";
+  const movable = doc ? topLevelIds(doc, nodes.map((n) => n.id)).filter((id) => !isLocked(id)) : [];
+  for (const mode of ALIGN_MODES) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ed-icon";
+    b.dataset.align = mode;
+    b.title = et(`align.${mode}`);
+    b.innerHTML = `<svg class="i i-sm" viewBox="0 0 16 16"><path d="${ALIGN_ICON[mode]}" /></svg>`;
+    b.disabled = !editor || movable.length < (mode.endsWith("dist") ? 3 : 2);
+    b.onclick = () => alignSelection(mode);
+    bar.appendChild(b);
+  }
+  group.appendChild(bar);
+  group.appendChild(note(et("multi.hint")));
+  return group;
+}
+
+function alignSelection(mode: AlignMode) {
+  if (!editor || !doc) return;
+  const items: Array<{ id: number | string; box: Box; props0: EditorLayerProps }> = [];
+  for (const id of topLevelIds(doc, selectionNodes().map((n) => n.id))) {
+    if (isLocked(id)) continue;
+    const c = editor.getLayerOutline(Number(id))?.corners;
+    const box = c ? boxOf(c) : null;
+    const props0 = editor.getLayerProps(Number(id));
+    if (box && props0) items.push({ id, box, props0: structuredClone(props0) });
+  }
+  const deltas = alignDeltas(items.map((i) => i.box), mode);
+  const cmds: PropsCmd[] = [];
+  items.forEach((it, i) => {
+    const [dx, dy] = deltas[i];
+    if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return;
+    const d = editor!.screenDeltaToLocal(Number(it.id), dx, dy);
+    if (!d) return;
+    const origin: [number, number, number] = [it.props0.origin[0] + d[0], it.props0.origin[1] + d[1], it.props0.origin[2]];
+    void applyPatch(it.id, { origin });
+    cmds.push({ id: it.id, name: nodeName(it.id), before: { origin: it.props0.origin }, after: { origin } });
+  });
+  commitMany(et("log.aligned", { mode: et(`align.${mode}`), n: items.length }), cmds);
+  renderInspector();
 }
 
 // ---------- 检视器（P0 只读） ----------
@@ -3335,6 +3553,7 @@ function renderInspector() {
     }
     return;
   }
+  if (extraSel.size) inspectorEl.appendChild(multiGroup());
   inspectorEl.appendChild(editGroup(node));
   if (canAnimate(node)) inspectorEl.appendChild(animGroup(node));
   if (node.kind === "text") inspectorEl.appendChild(textGroup(node));

@@ -208,6 +208,17 @@
   color: var(--wb-fg-strong);
 }
 
+.ed-node.extra-selected {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--wb-accent) 55%, transparent);
+}
+
+.ed-align-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px 8px;
+}
+
 .ed-node.is-dragging {
   opacity: 0.5;
 }

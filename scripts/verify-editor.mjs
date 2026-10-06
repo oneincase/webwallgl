@@ -2092,6 +2092,54 @@ section("AE. 视口拖拽吸附 snap.ts");
   check(r.dx === 451, "多个候选取最近的那条（右缘 552 → 551，而不是中心 502 → 500）");
 }
 
+section("AF. 多选：对齐 / 等距分布 / 批量命令 / 多层成组");
+{
+  const S = snapMod;
+  const B = [{ x0: 10, y0: 0, x1: 30, y1: 10 }, { x0: 100, y0: 50, x1: 160, y1: 70 }, { x0: 40, y0: 20, x1: 50, y1: 100 }];
+  const D = (m) => json(S.alignDeltas(B, m));
+  check(D("left") === json([[0, 0], [-90, 0], [-30, 0]]) && D("right") === json([[130, 0], [0, 0], [110, 0]]) && D("hcenter") === json([[65, 0], [-45, 0], [40, 0]]), "左 / 右 / 水平居中：以总包围盒为基准，只动 x");
+  check(D("top") === json([[0, 0], [0, -50], [0, -20]]) && D("bottom") === json([[0, 90], [0, 30], [0, 0]]) && D("vmiddle") === json([[0, 45], [0, -10], [0, -10]]), "顶 / 底 / 垂直居中：只动 y");
+  const hd = S.alignDeltas(B, "hdist");
+  const moved = B.map((b, i) => ({ x0: b.x0 + hd[i][0], x1: b.x1 + hd[i][0] })).sort((a, b) => a.x0 - b.x0);
+  check(json(hd[0]) === json([0, 0]) && json(hd[1]) === json([0, 0]) && Math.abs(moved[1].x0 - moved[0].x1 - (moved[2].x0 - moved[1].x1)) < 1e-9 && hd[2][1] === 0, `水平等距：按中心排序首尾不动，中间那个移到两侧间隙相等（${json(hd)}）`);
+  const vd = S.alignDeltas(B, "vdist");
+  check(vd.every((d) => d[0] === 0) && json(vd[0]) === json([0, 0]), "垂直等距：只动 y，最上面那个不动");
+  check(json(S.alignDeltas(B.slice(0, 2), "hdist")) === json([[0, 0], [0, 0]]) && json(S.alignDeltas(B.slice(0, 1), "left")) === json([[0, 0]]), "分布少于 3 个、对齐少于 2 个：不动");
+  check(json(S.unionBox(B)) === json({ x0: 10, y0: 0, x1: 160, y1: 100 }) && S.unionBox([]) === null, "unionBox");
+
+  const c1 = { id: 1, name: "a", before: { origin: [0, 0, 0] }, after: { origin: [5, 0, 0] } };
+  const c2 = { id: 2, name: "b", before: { origin: [1, 1, 0] }, after: { origin: [6, 1, 0] } };
+  const c0 = { id: 3, name: "c", before: { origin: [1, 1, 0] }, after: { origin: [1, 1, 0] } };
+  const bc = historyMod.batchCommand("移动", [c1, c2, c0]);
+  check(bc.kind === "batch" && bc.cmds.length === 2 && historyMod.isBatch(bc) && !historyMod.isStruct(bc), "批量命令：去掉没变的条目，作为一步撤销");
+  check(historyMod.batchCommand("x", [c1, c0]) === c1 && historyMod.batchCommand("x", [c0]) === null, "只剩一条退回普通属性命令；全没变不入栈");
+
+  const objs = () => [
+    { id: 1, text: "a", origin: "100 100 0" },
+    { id: 2, text: "b", origin: "300 200 0", scale: "2 2 1", angles: "0 0 0.4" },
+    { id: 3, text: "c", parent: 2, origin: "20 10 0" },
+    { id: 4, text: "d", origin: "700 500 0" },
+    { id: 5, text: "e", parent: 4, origin: "-30 40 0", angles: "0 0 -0.2" },
+  ];
+  const mk = (o = objs()) => docMod.makeDoc("t", null, { general: {}, objects: o }, "loose");
+  const W = (o) => new Map(parseMod.parseScene({ general: {}, objects: structuredClone(o) }, { type: "scene" }).layers.map((l) => [l.id, l.origin]));
+  check(json(docMod.topLevelIds(mk(), [3, 2, 5, 1])) === json([1, 2, 5]) && json(docMod.topLevelIds(mk(), [404])) === json([]), "topLevelIds：祖先也被选中的层去掉（子树跟祖先走），按数组顺序");
+  let d = mk();
+  const w0 = W(d.scene.objects);
+  const g = docMod.groupLayers(d, [5, 2, 3], "组");
+  const by = (id) => d.scene.objects.find((o) => o.id === id);
+  check(g.ok && g.id === 6 && by(2).parent === 6 && by(5).parent === 6 && by(3).parent === 2 && json(d.scene.objects.map((o) => o.id)) === json([1, 6, 2, 3, 5, 4]), `多层成组：组在最靠前那层位置，跨父级的层也放进来，子层随父（${json(d.scene.objects.map((o) => o.id))}）`);
+  const w1 = W(d.scene.objects);
+  check([1, 2, 3, 4, 5].every((id) => Math.hypot(w0.get(id)[0] - w1.get(id)[0], w0.get(id)[1] - w1.get(id)[1]) < 1e-3), "★ 引擎 parseScene 对照：成组前后所有层世界位置不变");
+  const an = objs();
+  an[4].origin = { value: "-30 40 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  d = mk(an);
+  const snap = json(d.scene.objects);
+  const bad = docMod.groupLayers(d, [1, 5], "组");
+  check(!bad.ok && bad.reason === "animated" && bad.at === 5 && json(d.scene.objects) === snap, "有一层被拒（位置动画需换父）：整体不做，文档原样（不留半个组）");
+  check(!docMod.groupLayers(mk(), [404], "组").ok, "全不存在：拒绝");
+}
+
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
 {
   const realFetch = globalThis.fetch;
@@ -2223,6 +2271,9 @@ section("I. 接线");
   check(/id="ly-group"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /groupLayer\(d, n\.id, et\("layer\.groupName"\)\)/.test(main), "图层工具条「成组」");
   check(/if \(drag\.box && drag\.snap && !\(e\.metaKey \|\| e\.ctrlKey\)\) \{\s*const r = snapMove\(drag\.box, dx, dy, drag\.snap\);/.test(main) && /screenDeltaToLocal\(Number\(drag\.id\), mx, my\)/.test(main) && /snapTargets\(sceneFrame\(fitEl\.value, r\.width, r\.height, res\.w, res\.h\), others\)/.test(main), "视口移动走吸附（⌘ / Ctrl 关），候选 = 画面框（按当前 fit）+ 其他层");
   check(/if \(!l\.visible \|\| insideSelf\(l\)\) continue;/.test(main) && /handle \? \{ box: null, snap: null \}/.test(main) && /drag = null;\s*snapGuides = null;/.test(main), "吸附只对移动生效；自己与子层、隐藏层不当候选；松手清参考线");
+  check(/if \(e\.shiftKey \|\| e\.metaKey \|\| e\.ctrlKey\) return toggleSelect\(n\.id\);/.test(main) && /if \(e\.shiftKey && hits\.length\) \{\s*toggleSelect\(hits\[0\]\.id\);/.test(main) && /\.some\(\(h\) => isSelected\(h\.id\)\)/.test(main), "多选：树 ⇧/⌘ 点、画面 ⇧ 点加减选；拖任一选中层都能起拖");
+  check(/for \(const o of drag\.others\) \{\s*const od = editor\.screenDeltaToLocal\(Number\(o\.id\), mx, my\);/.test(main) && /commitMany\(et\("log\.multiMoved"/.test(main) && /if \(isBatch\(cmd\)\) \{\s*for \(const c of cmd\.cmds\) void applyPatch/.test(main), "多选移动：其余层按同一屏幕位移跟随，一步撤销（批量命令）");
+  check(/groupLayers\(d, ids, et\("layer\.groupName"\)\)/.test(main) && /ids\.every\(\(id\) => removeLayer\(d, id\)\)/.test(main) && /alignDeltas\(items\.map\(\(i\) => i\.box\), mode\)/.test(main), "多选删除 / 复制 / 成组 / 对齐分布接线");
   check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -2296,6 +2347,18 @@ section("J. 变异红测");
   check(mutSnap2 !== snapSrc, "注入点存在（取最近候选）");
   const snm2 = await loadEditorModule("snap", { [snapPath]: mutSnap2 });
   check(snm2.snapMove({ x0: 0, y0: 0, x1: 100, y1: 10 }, 452, 0, snm2.snapTargets({ x0: 0, y0: 0, x1: 1000, y1: 500 }, [{ x0: 551, y0: 0, x1: 560, y1: 10 }])).dx !== 451, "不取最近时「多个候选取最近」判据变红");
+
+  const mutGrp = docSrc.replace("scene: { ...doc.scene, objects: structuredClone(objs) } };", "scene: doc.scene! } as EditorDoc;");
+  check(mutGrp !== docSrc, "注入点存在（groupLayers 先在副本上做）");
+  const m6 = await loadEditorModule("doc", { [docPath]: mutGrp });
+  const fg = [{ id: 1, text: "a", origin: "1 1 0" }, { id: 2, text: "b", origin: { value: "5 5 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } } }];
+  const dg = m6.makeDoc("x", null, { general: {}, objects: structuredClone(fg) }, "loose");
+  m6.groupLayers(dg, [1, 2], "g");
+  check(dg.scene.objects.length !== 2, "直接改文档时「被拒则不留半个组」判据变红");
+  const mutDist = snapSrc.replace("      out[order[0]] = [0, 0];\n", "      out[order[0]] = [1, 0];\n");
+  check(mutDist !== snapSrc, "注入点存在（分布首个不动）");
+  const snm3 = await loadEditorModule("snap", { [snapPath]: mutDist });
+  check(json(snm3.alignDeltas([{ x0: 10, y0: 0, x1: 30, y1: 10 }, { x0: 100, y0: 50, x1: 160, y1: 70 }, { x0: 40, y0: 20, x1: 50, y1: 100 }], "hdist")[0]) !== json([0, 0]), "首个也挪时「首尾不动」判据变红");
 
   const gizPath = path.join(ROOT, "editor/gizmo.ts");
   const gizSrc = fs.readFileSync(gizPath, "utf8");

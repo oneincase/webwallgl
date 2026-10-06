@@ -19,9 +19,19 @@ export type StructCmd = {
   propsBefore?: string;
   propsAfter?: string;
 };
-export type EditCmd = PropsCmd | StructCmd;
+/** 多选拖动 / 对齐：几层的属性改动作为一步撤销 */
+export type BatchCmd = { kind: "batch"; label: string; cmds: PropsCmd[] };
+export type EditCmd = PropsCmd | StructCmd | BatchCmd;
 
 export const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
+export const isBatch = (c: EditCmd): c is BatchCmd => "kind" in c && c.kind === "batch";
+
+/** 去掉前后一致的条目；剩一条时退回普通属性命令，一条不剩返回 null */
+export function batchCommand(label: string, cmds: readonly PropsCmd[]): EditCmd | null {
+  const live = cmds.filter((c) => !isNoopEdit(c));
+  if (!live.length) return null;
+  return live.length === 1 ? live[0] : { kind: "batch", label, cmds: live };
+}
 
 export const HISTORY_LIMIT = 200;
 

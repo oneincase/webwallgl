@@ -353,6 +353,50 @@ export function groupLayer(doc: EditorDoc, id: number | string, name: string): n
   return gid;
 }
 
+/** 选中集合里去掉「祖先也被选中」的层（整棵子树跟着祖先走），按对象数组顺序 */
+export function topLevelIds(doc: EditorDoc, ids: ReadonlyArray<number | string>): Array<number | string> {
+  const objs = objectsOf(doc);
+  if (!objs) return [];
+  const want = new Set(ids.map(String));
+  const out: Array<number | string> = [];
+  for (const o of objs) {
+    if (o.id === undefined || !want.has(String(o.id))) continue;
+    let covered = false;
+    for (let p = parentOf(objs, o), n = 0; p && n < 64; p = parentOf(objs, p), n++) {
+      if (want.has(String(p.id))) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) out.push(o.id as number | string);
+  }
+  return out;
+}
+
+/**
+ * 多层成组：组建在最靠前那层的位置与父级下，其余层按原绘制顺序放进组（世界变换不变）。
+ * 在副本上做完再整体换入 —— 任何一层被拒（动画 / 零缩放）文档原样。
+ */
+export function groupLayers(
+  doc: EditorDoc,
+  ids: ReadonlyArray<number | string>,
+  name: string,
+): { ok: true; id: number } | { ok: false; reason: PlaceResult; at?: number | string } {
+  const objs = objectsOf(doc);
+  const top = topLevelIds(doc, ids);
+  if (!objs || !top.length) return { ok: false, reason: "missing" };
+  const tmp: EditorDoc = { ...doc, scene: { ...doc.scene, objects: structuredClone(objs) } };
+  const gid = groupLayer(tmp, top[0], name);
+  if (gid === null) return { ok: false, reason: "missing" };
+  for (const id of top.slice(1)) {
+    const r = placeLayer(tmp, id, gid, "inside");
+    if (r !== "ok" && r !== "noop") return { ok: false, reason: r, at: id };
+  }
+  doc.scene!.objects = tmp.scene!.objects;
+  rebuildTree(doc);
+  return { ok: true, id: gid };
+}
+
 /** WE 原生字段 locktransforms：锁定的层不能在视口里拖动 / 改变换 */
 export function isLockedObj(o: SceneObject): boolean {
   const v = unwrap(o.locktransforms);

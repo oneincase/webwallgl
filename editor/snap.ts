@@ -64,3 +64,65 @@ export function snapMove(box: Box, dx: number, dy: number, t: SnapTargets, thr =
   const y = snapAxis(box.y0, box.y1, dy, t.ys, thr);
   return { dx: x.d, dy: y.d, gx: x.guides, gy: y.guides };
 }
+
+export type AlignMode = "left" | "hcenter" | "right" | "top" | "vmiddle" | "bottom" | "hdist" | "vdist";
+export const ALIGN_MODES: readonly AlignMode[] = ["left", "hcenter", "right", "top", "vmiddle", "bottom", "hdist", "vdist"];
+
+/**
+ * 对齐 / 等距分布：返回每个盒子的屏幕位移（与输入同序）。对齐以所有盒子的总包围盒为基准；
+ * 分布按中心排序，首尾不动、中间的让相邻间隙相等（总宽不够时间隙为负，与常见设计工具一致），少于 3 个不动。
+ */
+export function alignDeltas(boxes: readonly Box[], mode: AlignMode): Array<[number, number]> {
+  const zero = boxes.map((): [number, number] => [0, 0]);
+  if (boxes.length < 2) return zero;
+  const x0 = Math.min(...boxes.map((b) => b.x0));
+  const x1 = Math.max(...boxes.map((b) => b.x1));
+  const y0 = Math.min(...boxes.map((b) => b.y0));
+  const y1 = Math.max(...boxes.map((b) => b.y1));
+  switch (mode) {
+    case "left":
+      return boxes.map((b) => [x0 - b.x0, 0]);
+    case "right":
+      return boxes.map((b) => [x1 - b.x1, 0]);
+    case "hcenter":
+      return boxes.map((b) => [(x0 + x1) / 2 - (b.x0 + b.x1) / 2, 0]);
+    case "top":
+      return boxes.map((b) => [0, y0 - b.y0]);
+    case "bottom":
+      return boxes.map((b) => [0, y1 - b.y1]);
+    case "vmiddle":
+      return boxes.map((b) => [0, (y0 + y1) / 2 - (b.y0 + b.y1) / 2]);
+    case "hdist":
+    case "vdist": {
+      if (boxes.length < 3) return zero;
+      const h = mode === "hdist";
+      const lo = (b: Box) => (h ? b.x0 : b.y0);
+      const hi = (b: Box) => (h ? b.x1 : b.y1);
+      const order = boxes.map((b, i) => i).sort((a, b) => lo(boxes[a]) + hi(boxes[a]) - lo(boxes[b]) - hi(boxes[b]));
+      const first = boxes[order[0]];
+      const last = boxes[order[order.length - 1]];
+      const sizes = order.reduce((s, i) => s + hi(boxes[i]) - lo(boxes[i]), 0);
+      const gap = (hi(last) - lo(first) - sizes) / (order.length - 1);
+      const out = zero.slice();
+      let cursor = lo(first);
+      for (const i of order) {
+        const d = cursor - lo(boxes[i]);
+        out[i] = h ? [d, 0] : [0, d];
+        cursor += hi(boxes[i]) - lo(boxes[i]) + gap;
+      }
+      out[order[0]] = [0, 0];
+      out[order[order.length - 1]] = [0, 0];
+      return out;
+    }
+  }
+}
+
+export function unionBox(boxes: readonly Box[]): Box | null {
+  if (!boxes.length) return null;
+  return {
+    x0: Math.min(...boxes.map((b) => b.x0)),
+    y0: Math.min(...boxes.map((b) => b.y0)),
+    x1: Math.max(...boxes.map((b) => b.x1)),
+    y1: Math.max(...boxes.map((b) => b.y1)),
+  };
+}
