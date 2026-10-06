@@ -794,6 +794,24 @@ export type EditorControls = {
   screenDeltaToLocal(id: number, dx: number, dy: number): [number, number] | null;
   /** 本次装配以来的脚本错误，按「图层 + 挂点 + 阶段 + 文案」去重计数（W8） */
   getScriptIssues(): EditorScriptIssue[];
+  /**
+   * 运行时声明用户属性（W9）：未声明的名字按声明补进属性表，绑定链与脚本随即可见并热更；
+   * 已声明的名字只更新值（等价 setProperties）。暂停中会补画一帧，Promise 在该帧画完后落地。
+   */
+  declareUserProperties(decls: Record<string, EditorUserPropertyDecl>): Promise<void>;
+};
+
+/** 用户属性声明（project.json `general.properties` 的条目形状） */
+export type EditorUserPropertyDecl = {
+  type: "slider" | "color" | "bool" | "combo" | "textinput";
+  /** slider = 数字、color = "r g b"（0..1）、bool = 布尔、combo = 选项值、textinput = 文本 */
+  value: PropertyValue;
+  text?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: Array<{ label: string; value: string }>;
+  order?: number;
 };
 
 /**

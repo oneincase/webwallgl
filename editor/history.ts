@@ -15,6 +15,9 @@ export type StructCmd = {
   after: string;
   selBefore: LayerId | null;
   selAfter: LayerId | null;
+  /** project.json `general.properties` 前后快照（只在属性声明 / 值变了时才有） */
+  propsBefore?: string;
+  propsAfter?: string;
 };
 export type EditCmd = PropsCmd | StructCmd;
 
@@ -73,10 +76,28 @@ export function mergeLiveEdit(live: Map<string, Patch>, id: LayerId, patch: Patc
   live.set(key, { ...(live.get(key) ?? {}), ...structuredClone(patch) });
 }
 
-/** 文档对象数组整体换成快照（结构编辑落地 / 撤销 / 重做共用） */
-export function restoreObjects(doc: EditorDoc, json: string) {
+/** 用户属性表的快照（没有时为 "null"） */
+export function propsSnapshot(doc: EditorDoc): string {
+  const general = doc.project?.general as Record<string, unknown> | undefined;
+  return JSON.stringify(general?.properties ?? null);
+}
+
+function restoreProps(doc: EditorDoc, json: string) {
+  const props = JSON.parse(json) as Record<string, unknown> | null;
+  if (!doc.project) {
+    if (!props) return;
+    doc.project = {};
+  }
+  const general = (doc.project.general ??= {}) as Record<string, unknown>;
+  if (props) general.properties = props;
+  else delete general.properties;
+}
+
+/** 文档对象数组（及可选的属性表）整体换成快照（结构编辑落地 / 撤销 / 重做共用） */
+export function restoreObjects(doc: EditorDoc, json: string, props?: string) {
   if (!doc.scene) return;
   doc.scene.objects = JSON.parse(json);
+  if (props !== undefined) restoreProps(doc, props);
   rebuildTree(doc);
 }
 
@@ -92,9 +113,13 @@ export function structCommand(
 ): StructCmd | null {
   if (!doc.scene) return null;
   const before = JSON.stringify(doc.scene.objects ?? []);
+  const propsBefore = propsSnapshot(doc);
   const sel = mutate(doc);
   if (sel === undefined) return null;
   const after = JSON.stringify(doc.scene.objects ?? []);
-  if (after === before) return null;
-  return { kind: "struct", label, before, after, selBefore, selAfter: sel };
+  const propsAfter = propsSnapshot(doc);
+  if (after === before && propsAfter === propsBefore) return null;
+  const cmd: StructCmd = { kind: "struct", label, before, after, selBefore, selAfter: sel };
+  if (propsAfter !== propsBefore) Object.assign(cmd, { propsBefore, propsAfter });
+  return cmd;
 }

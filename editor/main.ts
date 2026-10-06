@@ -54,6 +54,27 @@ import {
 } from "./effects";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
+  PROP_TYPES,
+  bindProp,
+  bindableFor,
+  bindingOf,
+  coerceValue,
+  declareProp,
+  formatComboOptions,
+  isValidPropName,
+  listProps,
+  parseComboOptions,
+  propOf,
+  removeProp,
+  setComboOptions,
+  setPropText,
+  setPropValue,
+  setSliderRange,
+  unbindProp,
+  type PropType,
+  type PropView,
+} from "./userprops";
+import {
   duplicateLayer,
   findNode,
   findPath,
@@ -303,7 +324,7 @@ async function mountCurrent(keepTime = false) {
   try {
     const source =
       docDriven && current.assets && doc?.scene
-        ? sourceFromDoc(current.source, current.assets, JSON.stringify(doc.scene))
+        ? sourceFromDoc(current.source, current.assets, JSON.stringify(doc.scene), doc.project)
         : current.source;
     const inst = await mount(stageEl, {
       source,
@@ -720,9 +741,9 @@ function commit(cmd: PropsCmd) {
 }
 
 /** 文档对象数组整体换成某个快照，然后整场景重挂（结构编辑 / 其撤销重做共用） */
-function restoreObjects(json: string, sel: number | string | null) {
+function restoreObjects(json: string, sel: number | string | null, props?: string) {
   if (!doc?.scene) return;
-  restoreDocObjects(doc, json);
+  restoreDocObjects(doc, json, props);
   // 文档已含全部改动，旧的按层热改账作废（被删的层也不该再重放）
   liveEdits.clear();
   docDriven = true;
@@ -734,8 +755,11 @@ function restoreObjects(json: string, sel: number | string | null) {
   void mountCurrent(true);
 }
 
-/** 一次结构编辑：快照 → 改文档 → 入栈 → 重挂。mutate 返回新的选中 id（undefined = 没改成） */
-function structEdit(label: string, mutate: (d: EditorDoc) => number | string | null | undefined) {
+/**
+ * 一次结构编辑：快照 → 改文档 → 入栈 → 重挂。mutate 返回新的选中 id（undefined = 没改成）。
+ * hot：只动了属性表、对象数组没变时改走热更（引擎已与文档一致，不必重挂）；撤销重做仍重挂。
+ */
+function structEdit(label: string, mutate: (d: EditorDoc) => number | string | null | undefined, hot?: () => void) {
   if (!doc?.scene || !current?.assets) {
     log(et("log.structUnavailable"), "warn");
     return;
@@ -746,7 +770,14 @@ function structEdit(label: string, mutate: (d: EditorDoc) => number | string | n
   syncHistoryButtons();
   markDirty();
   log(label);
-  restoreObjects(cmd.after, cmd.selAfter);
+  if (hot && editor && cmd.after === cmd.before) {
+    docDriven = true;
+    hot();
+    renderInspector();
+    renderStatus();
+    return;
+  }
+  restoreObjects(cmd.after, cmd.selAfter, cmd.propsAfter);
 }
 
 function selectedNode(): LayerNode | null {
@@ -792,7 +823,11 @@ function undoRedo(dir: "undo" | "redo") {
   syncHistoryButtons();
   if (isStruct(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
-    restoreObjects(dir === "undo" ? cmd.before : cmd.after, dir === "undo" ? cmd.selBefore : cmd.selAfter);
+    restoreObjects(
+      dir === "undo" ? cmd.before : cmd.after,
+      dir === "undo" ? cmd.selBefore : cmd.selAfter,
+      dir === "undo" ? cmd.propsBefore : cmd.propsAfter,
+    );
     return;
   }
   void applyPatch(cmd.id, dir === "undo" ? cmd.before : cmd.after);
@@ -1991,6 +2026,250 @@ function scriptsGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 用户属性（W9）：声明 / 改值（热更）/ 删除，图层字段绑定 ----------
+
+/** 属性值改动的预览：只推给引擎，不进文档（拖滑条中） */
+function previewProp(p: PropView, value: unknown) {
+  const v = coerceValue(p, value);
+  if (v === null || !editor) return;
+  void editor.declareUserProperties({ [p.name]: { ...p, value: v } }).catch(() => {});
+}
+
+/** 属性表改动（声明 / 值 / 文案 / 范围 / 选项）：入栈，引擎按新声明热更 */
+function propEdit(label: string, name: string, mutate: (d: EditorDoc) => boolean) {
+  structEdit(
+    label,
+    (d) => (mutate(d) ? selectedId : undefined),
+    () => {
+      const p = propOf(doc, name);
+      if (p) void editor?.declareUserProperties({ [name]: p }).catch(() => {});
+    },
+  );
+}
+
+function propValueControl(p: PropView, editable: boolean): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "ed-fx-param";
+  const commit = (v: unknown) => propEdit(et("log.upValue", { name: p.name }), p.name, (d) => setPropValue(d, p.name, v));
+  if (p.type === "slider") {
+    const inp = document.createElement("input");
+    inp.type = "range";
+    inp.min = String(p.min ?? 0);
+    inp.max = String(p.max ?? 1);
+    inp.step = String(p.step ?? 0.01);
+    inp.value = String(p.value);
+    const out = document.createElement("span");
+    out.className = "ed-val";
+    out.textContent = fmtNum(Number(p.value));
+    inp.addEventListener("input", () => {
+      out.textContent = fmtNum(Number(inp.value));
+      previewProp(p, inp.value);
+    });
+    inp.addEventListener("change", () => commit(inp.value));
+    inp.disabled = !editable;
+    inp.dataset.prop = p.name;
+    box.append(inp, out);
+  } else if (p.type === "color") {
+    const inp = document.createElement("input");
+    inp.type = "color";
+    inp.value = toHex(String(p.value).trim().split(/\s+/).map(Number));
+    inp.addEventListener("input", () => previewProp(p, fromHex(inp.value)));
+    inp.addEventListener("change", () => commit(fromHex(inp.value)));
+    inp.disabled = !editable;
+    inp.dataset.prop = p.name;
+    box.appendChild(inp);
+  } else if (p.type === "bool") {
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.checked = p.value === true;
+    inp.addEventListener("change", () => commit(inp.checked));
+    inp.disabled = !editable;
+    inp.dataset.prop = p.name;
+    box.appendChild(inp);
+  } else if (p.type === "combo") {
+    const sel = document.createElement("select");
+    for (const o of p.options ?? []) {
+      const opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.label;
+      sel.appendChild(opt);
+    }
+    sel.value = String(p.value);
+    sel.addEventListener("change", () => commit(sel.value));
+    sel.disabled = !editable;
+    sel.dataset.prop = p.name;
+    box.appendChild(sel);
+  } else {
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.value = String(p.value ?? "");
+    inp.addEventListener("change", () => commit(inp.value));
+    inp.disabled = !editable;
+    inp.dataset.prop = p.name;
+    box.appendChild(inp);
+  }
+  return box;
+}
+
+function userPropsGroup(): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-props";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.userProps");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!current?.assets;
+  const props = listProps(doc);
+  if (!props.length) group.appendChild(note(et("up.none")));
+  for (const p of props) {
+    const item = document.createElement("div");
+    item.className = "ed-fx-item ed-prop";
+    item.dataset.prop = p.name;
+    const head = document.createElement("div");
+    head.className = "ed-fx-head";
+    const name = document.createElement("span");
+    name.className = "ed-fx-name";
+    name.textContent = `${p.name} · ${et(`up.type.${p.type}`)}`;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ed-icon ed-prop-del";
+    del.textContent = "✕";
+    del.title = et("up.del");
+    del.disabled = !editable;
+    del.onclick = () =>
+      structEdit(et("log.upRemoved", { name: p.name }), (d) => (removeProp(d, p.name) >= 0 ? selectedId : undefined));
+    head.append(name, del);
+    const form = document.createElement("div");
+    form.className = "ed-fx-params";
+    const textLabel = document.createElement("label");
+    textLabel.textContent = et("up.text");
+    const text = document.createElement("input");
+    text.type = "text";
+    text.className = "ed-prop-text";
+    text.value = p.text ?? "";
+    text.disabled = !editable;
+    text.addEventListener("change", () => propEdit(et("log.upMeta", { name: p.name }), p.name, (d) => setPropText(d, p.name, text.value)));
+    const valueLabel = document.createElement("label");
+    valueLabel.textContent = et("up.value");
+    form.append(textLabel, text, valueLabel, propValueControl(p, editable));
+    if (p.type === "slider") {
+      const rl = document.createElement("label");
+      rl.textContent = et("up.range");
+      const range = document.createElement("input");
+      range.type = "text";
+      range.className = "ed-prop-range";
+      range.value = `${p.min ?? 0} ${p.max ?? 1} ${p.step ?? 0.01}`;
+      range.title = et("up.rangeHint");
+      range.disabled = !editable;
+      range.addEventListener("change", () => {
+        const [a, b, c] = range.value.trim().split(/\s+/).map(Number);
+        propEdit(et("log.upMeta", { name: p.name }), p.name, (d) => setSliderRange(d, p.name, a, b, c ?? 0.01));
+      });
+      form.append(rl, range);
+    } else if (p.type === "combo") {
+      const ol = document.createElement("label");
+      ol.textContent = et("up.options");
+      const opts = document.createElement("textarea");
+      opts.className = "ed-prop-options";
+      opts.rows = Math.max(2, (p.options ?? []).length);
+      opts.value = formatComboOptions(p.options);
+      opts.title = et("up.optionsHint");
+      opts.disabled = !editable;
+      opts.addEventListener("change", () =>
+        propEdit(et("log.upMeta", { name: p.name }), p.name, (d) => setComboOptions(d, p.name, parseComboOptions(opts.value))),
+      );
+      form.append(ol, opts);
+    }
+    item.append(head, form);
+    group.appendChild(item);
+  }
+  const add = document.createElement("div");
+  add.className = "ed-prop-add";
+  const nameIn = document.createElement("input");
+  nameIn.type = "text";
+  nameIn.id = "up-name";
+  nameIn.placeholder = et("up.namePh");
+  nameIn.disabled = !editable;
+  const typeSel = document.createElement("select");
+  typeSel.id = "up-type";
+  typeSel.disabled = !editable;
+  for (const t of PROP_TYPES) {
+    const o = document.createElement("option");
+    o.value = t;
+    o.textContent = et(`up.type.${t}`);
+    typeSel.appendChild(o);
+  }
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.id = "up-add";
+  addBtn.className = "ed-btn";
+  addBtn.textContent = et("up.add");
+  const sync = () => (addBtn.disabled = !editable || !isValidPropName(doc, nameIn.value.trim()));
+  nameIn.addEventListener("input", sync);
+  addBtn.onclick = () => {
+    const n = nameIn.value.trim();
+    const t = typeSel.value as PropType;
+    propEdit(et("log.upAdded", { name: n }), n, (d) => !!declareProp(d, n, t));
+  };
+  sync();
+  add.append(nameIn, typeSel, addBtn);
+  group.appendChild(add);
+  return group;
+}
+
+function bindingsGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-bindings";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.bindings");
+  group.appendChild(h);
+  const props = listProps(doc);
+  const editable = !!doc?.scene && !!current?.assets && !isLocked(node.id);
+  if (!props.length) {
+    group.appendChild(note(et("bind.noProps")));
+    return group;
+  }
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  for (const f of bindableFor(node.kind)) {
+    const l = document.createElement("label");
+    l.textContent = f.field;
+    const sel = document.createElement("select");
+    sel.dataset.bind = f.field;
+    sel.disabled = !editable;
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = et("bind.none");
+    sel.appendChild(none);
+    for (const p of props.filter((x) => f.types.includes(x.type))) {
+      const opts = p.type === "combo" ? (p.options ?? []).map((o) => ({ v: `${p.name}=${o.value}`, t: `${p.name} = ${o.label}` })) : [{ v: p.name, t: p.name }];
+      for (const o of opts) {
+        const opt = document.createElement("option");
+        opt.value = o.v;
+        opt.textContent = o.t;
+        sel.appendChild(opt);
+      }
+    }
+    const b = bindingOf(node.obj, f.field);
+    sel.value = b ? (b.condition !== undefined ? `${b.name}=${b.condition}` : b.name) : "";
+    sel.addEventListener("change", () => {
+      const v = sel.value;
+      const i = v.indexOf("=");
+      const name = i < 0 ? v : v.slice(0, i);
+      const cond = i < 0 ? undefined : v.slice(i + 1);
+      objEdit(
+        v ? et("log.bound", { layer: nodeName(node.id), field: f.field, name }) : et("log.unbound", { layer: nodeName(node.id), field: f.field }),
+        node.id,
+        (o) => (v ? !!doc && bindProp(doc, o, f.field, name, cond) : unbindProp(o, f.field)),
+      );
+    });
+    form.append(l, sel);
+  }
+  group.appendChild(form);
+  return group;
+}
+
 function renderInspector() {
   inspectorEl.textContent = "";
   if (!doc) {
@@ -2012,11 +2291,15 @@ function renderInspector() {
         ["f.props", props && typeof props === "object" ? String(Object.keys(props).length) : "0"],
       ]),
     );
-    if (doc.type === "scene") inspectorEl.appendChild(note(et("insp.none")));
+    if (doc.type === "scene") {
+      inspectorEl.appendChild(userPropsGroup());
+      inspectorEl.appendChild(note(et("insp.none")));
+    }
     return;
   }
   inspectorEl.appendChild(editGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
+  inspectorEl.appendChild(bindingsGroup(node));
   inspectorEl.appendChild(scriptsGroup(node));
   const o = node.obj;
   const effects = Array.isArray(o.effects)

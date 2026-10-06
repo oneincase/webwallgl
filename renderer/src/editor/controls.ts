@@ -30,5 +30,6 @@ export function editorOf(instance: SceneInstance): EditorControls | null {
     getLayerOutline: (id) => rt.sceneCtl?.editor?.getLayerOutline(id) ?? null,
     screenDeltaToLocal: (id, dx, dy) => rt.sceneCtl?.editor?.screenDeltaToLocal(id, dx, dy) ?? null,
     getScriptIssues: () => rt.sceneCtl?.editor?.getScriptIssues() ?? [],
+    declareUserProperties: (decls) => cur().declareUserProperties(decls),
   };
 }

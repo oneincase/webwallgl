@@ -10,6 +10,7 @@ export { checkSceneScript } from "../editor/scripts";
 export type {
   EditorControls,
   EditorScriptIssue,
+  EditorUserPropertyDecl,
   SceneScriptCheck,
   EditorLayer,
   EditorLayerKind,

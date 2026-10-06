@@ -19,6 +19,7 @@
  *   N. assets.ts：资源表叠加层（读优先级、保存清单按文档引用过滤）
  *   O. draft.ts：草稿快照深拷贝、结构化克隆往返、不可信输入校验、套用
  *   P. 新建闭环：空白模板 → 图片层 → 删一张 → 存进库 → 重新打开 → 逐字段 / 逐字节一致
+ *   S / U / V. 效果库、脚本预检与挂点、用户属性声明 / 绑定（含引擎接住新声明、属性表撤销快照）
  *   I. 接线文本断言：页面只经抽出的模块做这些事（不允许再长回内联副本）
  *   J. 变异红测：把实现改坏，确认对应判据会变红（防假绿）
  *
@@ -29,10 +30,11 @@
  *      另存到壁纸库并重新打开
  *   Q. 新建端到端：模板新建 → 选图 / 拖入加层 → 撤销重做 → 存库 → 编辑器与测试台渲染页播放
  *   R. 草稿：编辑后刷新 → 横幅 → 恢复（新建 / 库来源）、丢弃、保存后清除
+ *   T / U / V. 效果、脚本、用户属性面板端到端（像素判据 + 存库后测试台出帧一致）
  *
  * 用法：
- *   node scripts/verify-editor.mjs              # 离线（A–J、M–P）
- *   node scripts/verify-editor.mjs --headless   # 追加 K、L、Q、R
+ *   node scripts/verify-editor.mjs              # 离线（A–J、M–V）
+ *   node scripts/verify-editor.mjs --headless   # 追加 K、L、Q、R、T、U、V
  */
 import { build } from "esbuild";
 import fs from "node:fs";
@@ -716,6 +718,13 @@ const localFile = (p, data) => ({ path: p, file: new File([data], p.split("/").p
     threw = true;
   }
   check(threw, "sourceFromDoc：只有松散形态（scenePkg 明确抛错）");
+  const proj = { title: "Doc", general: { properties: { op: { type: "slider", value: 0.3 } } } };
+  const src2 = openMod.sourceFromDoc(base, assets, "{}", proj);
+  proj.general.properties.op.value = 0.9;
+  const got = await src2.project();
+  check(got.title === "Doc" && got.general.properties.op.value === 0.3, "sourceFromDoc：给了文档 project 时以它为准，且是挂载那一刻的快照（之后改文档不串）");
+  got.title = "x";
+  check((await src2.project()).title === "Doc", "sourceFromDoc：每次取都是新副本（引擎就地改不污染）");
   check(openMod.libraryKind({ type: "Video", hasScene: false }) === "video" && openMod.libraryKind({ type: "web", hasScene: false, hasLooseScene: true }) === "scene", "libraryKind：场景包 / 松散场景优先，其余按类型");
 }
 
@@ -1231,6 +1240,89 @@ section("U2. 脚本挂点 editor/scripts.ts");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// V. 用户属性（W9）：声明 / 值 / 绑定（editor/userprops.ts）+ 引擎接住新声明 + 撤销快照
+// ───────────────────────────────────────────────────────────────────────────
+section("V. 用户属性 editor/userprops.ts");
+const upMod = await loadEditorModule("userprops");
+const upEngine = await imp("renderer/vendor/we-scene/scene/user-props.js");
+{
+  const u = upMod;
+  const doc = docMod.makeDoc("x", { type: "scene", title: "x" }, { objects: [{ id: 1, image: "models/a.json", alpha: 0.8 }, { id: 2, text: { value: "hi" } }] }, "loose");
+  check(u.listProps(doc).length === 0 && u.propOf(doc, "a") === null, "空文档：无声明");
+  check(!u.isValidPropName(doc, "1abc") && !u.isValidPropName(doc, "a-b") && !u.isValidPropName(doc, "") && u.isValidPropName(doc, "_op1"), "属性名必须是标识符（脚本里 engine.userProperties.<名字>）");
+  const d1 = u.declareProp(doc, "op", "slider", "透明度");
+  check(d1 && json(doc.project.general.properties.op) === json({ type: "slider", text: "透明度", value: 0.5, min: 0, max: 1, step: 0.01, order: 1 }), "declareProp：写进 project.general.properties，slider 默认 0.5 / [0,1] / 0.01");
+  check(u.declareProp(doc, "op", "bool") === null && !u.isValidPropName(doc, "op"), "重名拒绝");
+  u.declareProp(doc, "mode", "combo");
+  u.declareProp(doc, "tint", "color");
+  u.declareProp(doc, "show", "bool");
+  u.declareProp(doc, "label", "textinput");
+  check(json(u.listProps(doc).map((p) => p.name)) === json(["op", "mode", "tint", "show", "label"]), "listProps：按声明顺序（order 递增）");
+  const noProj = docMod.makeDoc("y", null, { objects: [] }, "loose");
+  check(u.declareProp(noProj, "a", "bool") && noProj.project.general.properties.a.type === "bool", "没有 project.json 的文档也能声明（按需建 general.properties）");
+
+  check(u.setPropValue(doc, "op", 3) && u.propOf(doc, "op").value === 1, "slider 值夹到范围内");
+  check(!u.setPropValue(doc, "op", 1) && !u.setPropValue(doc, "op", "abc"), "值没变 / 非数字：不算修改");
+  check(u.setPropValue(doc, "tint", [1, 0.5, 2]) && u.propOf(doc, "tint").value === "1 0.5 1", "color 写成 \"r g b\"，分量夹到 [0,1]");
+  check(!u.setPropValue(doc, "mode", "7") && u.setPropValue(doc, "mode", 1) && u.propOf(doc, "mode").value === "1", "combo 只接受选项里的值");
+  check(u.setPropValue(doc, "show", "false") && u.propOf(doc, "show").value === false && !u.setPropValue(doc, "label", 5), "bool 规整；textinput 只收字符串");
+  check(u.setSliderRange(doc, "op", 0, 0.5, 0.1) && u.propOf(doc, "op").value === 0.5, "改范围：当前值随之夹回");
+  check(!u.setSliderRange(doc, "op", 1, 0, 0.1) && !u.setSliderRange(doc, "op", 0, 1, 0) && !u.setSliderRange(doc, "mode", 0, 1, 0.1), "非法范围 / 步长 / 非 slider 拒绝");
+  const opts = u.parseComboOptions("a=甲\n b = 乙 \n\nc");
+  check(json(opts) === json([{ value: "a", label: "甲" }, { value: "b", label: "乙" }, { value: "c", label: "c" }]) && u.formatComboOptions(opts) === "a=甲\nb=乙\nc", "combo 选项文本：每行 值=标签，往返一致");
+  check(u.setComboOptions(doc, "mode", opts) && u.propOf(doc, "mode").value === "a", "改选项：当前值不在新选项里时取第一项");
+  check(!u.setComboOptions(doc, "mode", [{ value: "a", label: "" }, { value: "a", label: "" }]) && !u.setComboOptions(doc, "mode", []), "重复值 / 空选项拒绝");
+  check(u.setPropText(doc, "op", "不透明度") && !u.setPropText(doc, "op", "不透明度"), "改显示名");
+
+  const img = doc.scene.objects[0];
+  const txt = doc.scene.objects[1];
+  check(json(u.bindableFor("image").map((f) => f.field)) === json(["visible", "alpha", "brightness", "scale", "color"]) && u.bindableFor("text").some((f) => f.field === "text") && !u.bindableFor("group").some((f) => f.field === "color"), "可绑字段按图层种类给出");
+  check(u.bindProp(doc, img, "alpha", "op") && json(img.alpha) === json({ user: "op", value: 0.8 }), "bindProp：裸值包成 {user, value}，原值成快照");
+  check(!u.bindProp(doc, img, "alpha", "tint") && !u.bindProp(doc, img, "alpha", "nope"), "类型不兼容 / 未声明拒绝");
+  check(!u.bindProp(doc, img, "visible", "mode") && !u.bindProp(doc, img, "visible", "mode", "zz") && u.bindProp(doc, img, "visible", "mode", "b"), "combo 只能带合法 condition 绑 visible");
+  check(json(img.visible) === json({ user: { name: "mode", condition: "b" }, value: true }), "combo 绑定写成 {user:{name,condition}}，快照缺省 true");
+  check(json(u.bindingOf(img, "visible")) === json({ name: "mode", condition: "b" }) && u.bindingOf(img, "alpha").name === "op" && u.bindingOf(img, "scale") === null, "bindingOf 读出两种写法");
+  img.brightness = { script: "export function update(v){return v;}", value: 1.2 };
+  check(u.bindProp(doc, img, "brightness", "op") && img.brightness.script && img.brightness.value === 1.2 && img.brightness.user === "op", "字段上有脚本时绑定与脚本共存");
+  check(u.bindProp(doc, txt, "text", "label") && txt.text.user === "label" && txt.text.value === "hi", "文本层：已有 {value} 包装直接挂 user");
+  check(u.bindProp(doc, img, "scale", "op") && img.scale.value === "1.00000 1.00000 1.00000", "字段缺省时快照取 WE 缺省值");
+  check(u.unbindProp(img, "scale") && img.scale === "1.00000 1.00000 1.00000" && !u.unbindProp(img, "scale"), "unbindProp：只剩快照时解包；没绑定返回 false");
+  const n = u.removeProp(doc, "op");
+  check(n === 2 && img.alpha === 0.8 && json(img.brightness) === json({ script: "export function update(v){return v;}", value: 1.2 }) && !u.propOf(doc, "op"), `removeProp：删声明并解开所有绑定（解开 ${n} 处），脚本保留`);
+  check(u.removeProp(doc, "op") === -1, "删不存在的属性返回 -1");
+
+  // 引擎：新声明随热更进属性表，绑定链看得见
+  const scene = { objects: [{ id: 1, alpha: { user: "fresh", value: 1 } }, { id: 2, visible: { user: { name: "m", condition: "1" }, value: true } }] };
+  const props = {};
+  const live = {};
+  const changed = upEngine.mergeUserPropertyValues(props, live, { fresh: { type: "slider", value: 0.25, min: 0, max: 1 }, m: { type: "combo", value: "1", options: [{ label: "A", value: "0" }, { label: "B", value: "1" }] }, misc: { value: 3 } });
+  check(props.fresh?.type === "slider" && props.fresh.value === 0.25 && props.fresh.max === 1 && live.fresh === 0.25 && changed.fresh === 0.25, "引擎：未声明 + 带合法 type 的 wire 条目补进属性表");
+  check(!("misc" in props) && live.misc === 3, "引擎：不带 type 的未知名字维持旧语义（只给脚本）");
+  upEngine.resolveUserProps(scene.objects, props, 0);
+  check(scene.objects[0].alpha.value === 0.25 && scene.objects[1].visible.value === true, "引擎：新声明的 slider / combo 驱动绑定（resolveUserProps）");
+  upEngine.mergeUserPropertyValues(props, live, { m: { type: "combo", value: "0", options: [{ label: "A", value: "0" }, { label: "B", value: "1" }] } });
+  upEngine.resolveUserProps(scene.objects, props, 0);
+  check(scene.objects[1].visible.value === false && live.m === 0, "引擎：combo 热改 → 条件绑定的显隐跟着变（整数选项收成 number）");
+  const ref = props.fresh;
+  upEngine.mergeUserPropertyValues(props, live, { fresh: { type: "slider", value: 2, min: 0, max: 4 } });
+  check(props.fresh === ref && ref.max === 4 && ref.value === 2, "引擎：已声明条目就地刷新元数据（引用不换）");
+  upEngine.mergeUserPropertyValues(props, live, { fresh: { value: 0.5 } });
+  check(ref.type === "slider" && ref.max === 4 && ref.value === 0.5, "引擎：只带 value 的普通热更不动声明");
+
+  // 撤销快照：只改属性表的结构命令也要出命令并能换回
+  const hd = docMod.makeDoc("h", { type: "scene" }, { objects: [{ id: 1, image: "models/a.json" }] }, "loose");
+  const c1 = historyMod.structCommand(hd, "声明", null, (d) => (u.declareProp(d, "k", "slider") ? null : undefined));
+  check(c1 && c1.before === c1.after && c1.propsBefore === "null" && JSON.parse(c1.propsAfter).k.type === "slider", "structCommand：只改属性表也出命令，带前后属性快照");
+  const c2 = historyMod.structCommand(hd, "绑定", null, (d) => (u.bindProp(d, d.scene.objects[0], "alpha", "k") ? null : undefined));
+  check(c2 && c2.before !== c2.after && c2.propsBefore === undefined, "只改对象数组时不带属性快照");
+  historyMod.restoreObjects(hd, c1.before, c1.propsBefore);
+  check(!u.propOf(hd, "k") && hd.scene.objects[0].alpha === undefined, "撤销：属性表与对象一并换回");
+  historyMod.restoreObjects(hd, c2.after, c1.propsAfter);
+  check(u.propOf(hd, "k")?.value === 0.5 && hd.scene.objects[0].alpha.user === "k", "重做：属性表与对象一并换回");
+  check(historyMod.propsSnapshot(hd) === json(hd.project.general.properties), "propsSnapshot = general.properties 的 JSON");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1258,7 +1350,15 @@ section("I. 接线");
   check(/objEdit\([^\n]*setScript\(o, s\.target, ta\.value\)\)/.test(main), "应用脚本走结构编辑（可撤销、整场景重挂，新脚本当帧生效）");
   check(/editor\?\.getScriptIssues\(\)/.test(main) && /refreshScriptIssues\(\);\s*\}, 500\)/.test(main), "运行期错误从控制面 getScriptIssues 取，定时刷新到对应挂点");
   check(/scriptDrafts\.clear\(\)/.test(main) && /scriptDrafts\.get\(draftKey\) \?\? s\.script/.test(main), "未应用的脚本改动在检视器重绘时保留，换文档清空");
+  check(/from "\.\/userprops"/.test(main) && !/general\.properties\s*=/.test(main), "用户属性面板从 userprops.ts 读写声明 / 绑定（页面不直接改属性表）");
+  check(/sourceFromDoc\(current\.source, current\.assets, JSON\.stringify\(doc\.scene\), doc\.project\)/.test(main), "文档挂载连 project 一起以文档为准（声明随重挂进引擎）");
+  check(/restoreObjects\(cmd\.after, cmd\.selAfter, cmd\.propsAfter\)/.test(main) && /dir === "undo" \? cmd\.propsBefore : cmd\.propsAfter/.test(main), "结构编辑 / 撤销 / 重做把属性表快照一并换回");
+  check(/if \(hot && editor && cmd\.after === cmd\.before\)/.test(main) && /editor\?\.declareUserProperties\(\{ \[name\]: p \}\)/.test(main), "只改属性表时走热更（declareUserProperties），不重挂");
+  check(/inp\.addEventListener\("input", \(\) => \{[^}]*previewProp\(p, inp\.value\)/.test(main), "拖滑条中只推引擎预览，change 才入栈");
+  check(/objEdit\([^\n]*\n?[^\n]*\n?[^\n]*node\.id,\s*\n\s*\(o\) => \(v \? !!doc && bindProp\(doc, o, f\.field, name, cond\) : unbindProp\(o, f\.field\)\)/.test(main), "绑定 / 解绑走结构编辑（可撤销、整场景重挂）");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/declareUserProperties\(decls[^)]*\) \{[^}]*applyLiveProps\(/.test(sm) && /\(\(scene as any\)\.properties \|\|= \{\}\)/.test(sm), "控制面 declareUserProperties 走属性热更链（无属性表的场景也挂一张）");
+  check(/const uS = boundUserName\(src\.scale\);[^\n]*\n[^\n]*setLayerPropsImpl\(layer\.id, \{ scale: scn\.parseVec3\(src\.scale\) \}\)/.test(sm), "scale 绑 slider 热更：写 local 槽并重合成子树");
   check((sm.match(/noteScriptIssue\((layer|null), /g) ?? []).length === 4, "引擎登记四类挂点的脚本错误：对象字段 / 文字 / 效果开关 / general");
   check(/getScriptIssues\(\) \{\s*return \[\.\.\.scriptIssues\.values\(\)\]/.test(sm) && /const scriptIssues = new Map/.test(sm), "控制面 getScriptIssues 读本次装配的登记表（每次装配重建）");
   const i18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -1373,6 +1473,38 @@ section("J. 变异红测");
   const so = { alpha: { user: "op", script: "x", value: 0.5 } };
   smut.removeScript(so, "alpha");
   check(json(so.alpha) !== json({ user: "op", value: 0.5 }), "去脚本时一并丢掉绑定，「绑定保留」判据变红");
+
+  const upPath = path.join(ROOT, "renderer/vendor/we-scene/scene/user-props.js");
+  const upSrc = fs.readFileSync(upPath, "utf8");
+  const mutUp = upSrc.replace("const p = declareFromWire(props, k, entry) || (props[k] && typeof props[k] === 'object' ? props[k] : null)", "const p = props[k] && typeof props[k] === 'object' ? props[k] : null");
+  check(mutUp !== upSrc, "注入点存在（引擎接住 wire 上的新声明）");
+  const upMut = path.join(path.dirname(upPath), `.verify-mut-up-${process.pid}.js`);
+  fs.writeFileSync(upMut, mutUp);
+  cleanups.push(() => fs.rmSync(upMut, { force: true }));
+  const um = await import(pathToFileURL(upMut).href);
+  const mp = {};
+  um.mergeUserPropertyValues(mp, {}, { fresh: { type: "slider", value: 0.25 } });
+  const mo = [{ alpha: { user: "fresh", value: 1 } }];
+  um.resolveUserProps(mo, mp, 0);
+  check(mo[0].alpha.value !== 0.25, "不补声明时「新声明的 slider 驱动绑定」判据变红");
+  fs.rmSync(upMut, { force: true });
+
+  const hiPath = path.join(ROOT, "editor/history.ts");
+  const hiSrc = fs.readFileSync(hiPath, "utf8");
+  const mutHi = hiSrc.replace("if (after === before && propsAfter === propsBefore) return null;", "if (after === before) return null;");
+  check(mutHi !== hiSrc, "注入点存在（只改属性表的结构命令）");
+  const hm = await loadEditorModule("history", { [hiPath]: mutHi });
+  const hd2 = docMod.makeDoc("h", { type: "scene" }, { objects: [] }, "loose");
+  check(hm.structCommand(hd2, "x", null, (d) => (upMod.declareProp(d, "k", "bool") ? null : undefined)) === null, "只比对象数组时「声明属性可撤销」判据变红");
+
+  const uPath = path.join(ROOT, "editor/userprops.ts");
+  const uSrc = fs.readFileSync(uPath, "utf8");
+  const mutU = uSrc.replace("(obj as Obj)[field] = rest.length ? cur : cur.value;", "(obj as Obj)[field] = cur.value;");
+  check(mutU !== uSrc, "注入点存在（解绑时保留脚本包装）");
+  const umod = await loadEditorModule("userprops", { [uPath]: mutU });
+  const uo = { brightness: { user: "op", script: "x", value: 1 } };
+  umod.unbindProp(uo, "brightness");
+  check(json(uo.brightness) !== json({ script: "x", value: 1 }), "解绑时连脚本一起丢掉，「脚本保留」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

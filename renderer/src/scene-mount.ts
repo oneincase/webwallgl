@@ -4,7 +4,16 @@ import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
-import type { EditorControls, EditorLayer, EditorLayerKind, EditorLayerProps, EditorScriptIssue, SceneDirAssets, Source } from "./api/types";
+import type {
+  EditorControls,
+  EditorLayer,
+  EditorLayerKind,
+  EditorLayerProps,
+  EditorScriptIssue,
+  EditorUserPropertyDecl,
+  SceneDirAssets,
+  Source,
+} from "./api/types";
 import { createLoopingVideo } from "./video-loop";
 import { SKIP_3D_MODELS, SKIP_COMPONENTS, SKIP_PARTICLES, SKIP_SCENE_EFFECTS, SKIP_TEXT, TEXT_EM_SCALE } from "./types";
 import type { WallpaperConfig } from "./types";
@@ -6967,7 +6976,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       };
       const applyLiveProps = (wire: Record<string, { value: unknown }>) => {
         if (disposed) return;
-        const properties = (scene as any).properties || {};
+        // 没有属性表的场景也要能接住编辑器新声明的属性（W9），表挂回 scene 上
+        const properties = ((scene as any).properties ||= {});
         const changed = mergeUserPropertyValues(properties, liveUserProps, wire) as Record<string, unknown>;
         if (!Object.keys(changed).length) return;
         // [we-scene patch 3243449890] 用户图片槽（`usertextures` 绑的属性）热更后要
@@ -7012,6 +7022,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (uA && uA in changed) layer.alpha = scn.parseNum(src.alpha, 1);
           const uB = boundUserName(src.brightness);
           if (uB && uB in changed) layer.brightness = scn.parseNum(src.brightness, 1);
+          // scale 绑 slider（标量广播成三分量）：写 local 槽并重合成子树 world，与编辑器拖缩放同一路径
+          const uS = boundUserName(src.scale);
+          if (uS && uS in changed) void setLayerPropsImpl(layer.id, { scale: scn.parseVec3(src.scale) }).catch(() => {});
           // [we-scene patch] 灯光对象的 `radius` 可能就是用户的「亮度」滑条
           // （2890473419 的「光源1亮度」绑在 radius 上）：resolveUserProps 只改了
           // src 上的值，layer.lightRadius 是装配期读出来的副本，不回写就出现
@@ -7420,6 +7433,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         },
         getScriptIssues() {
           return [...scriptIssues.values()].map((x) => ({ ...x }));
+        },
+        declareUserProperties(decls: Record<string, EditorUserPropertyDecl>) {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          applyLiveProps(decls as unknown as Record<string, { value: unknown }>);
+          return renderOnce();
         },
       };
       applyLiveImpl = applyLiveProps;

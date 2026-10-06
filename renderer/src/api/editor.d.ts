@@ -13,12 +13,14 @@ import type {
   EditorLayerProps,
   EditorLayerOutline,
   EditorScriptIssue,
+  EditorUserPropertyDecl,
   SceneScriptCheck,
 } from "./types";
 
 export * from "./webwallgl";
 export type {
   EditorScriptIssue,
+  EditorUserPropertyDecl,
   SceneScriptCheck,
   EditorControls,
   EditorLayer,

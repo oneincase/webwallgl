@@ -90,8 +90,10 @@ async function sceneJsonOf(assets: SceneAssets | null) {
  * 只在「按名取资源」这一处分叉（`readAsset`），语义一一对应。不给 key：每版文档都
  * 不同，进库内缓存只会挤掉别的条目。
  */
-export function sourceFromDoc(base: Source, assets: SceneAssets, sceneJson: string): Source {
+export function sourceFromDoc(base: Source, assets: SceneAssets, sceneJson: string, project?: Record<string, unknown> | null): Source {
   const entryBytes = new TextEncoder().encode(sceneJson);
+  // project.json 也以文档为准（用户属性声明随文档走）；快照一份，挂载期间文档再改不串
+  const projectSnap = project ? structuredClone(project) : null;
   return {
     async scenePkg() {
       throw new Error("文档来源只有松散形态");
@@ -102,7 +104,7 @@ export function sourceFromDoc(base: Source, assets: SceneAssets, sceneJson: stri
         read: (name, signal) => (name === assets.entry ? Promise.resolve(entryBytes) : assets.read(name, signal)),
       };
     },
-    project: base.project ? (signal) => base.project!(signal) : undefined,
+    project: projectSnap ? async () => structuredClone(projectSnap) : base.project ? (signal) => base.project!(signal) : undefined,
   };
 }
 

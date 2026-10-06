@@ -684,6 +684,41 @@
   border: 1px solid var(--widget-border);
 }
 
+.ed-props .ed-fx-params input[type="text"],
+.ed-props .ed-fx-params select,
+.ed-props .ed-fx-params textarea,
+.ed-bindings select,
+.ed-prop-add input,
+.ed-prop-add select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  color: inherit;
+  background: var(--input-bg, transparent);
+  border: 1px solid var(--widget-border);
+  font-size: 11px;
+}
+
+.ed-props .ed-fx-params textarea {
+  height: auto;
+  padding: 2px 4px;
+  resize: vertical;
+  font: 11px/1.45 var(--mono);
+}
+
+.ed-props .ed-fx-param input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.ed-prop-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px auto;
+  gap: 4px;
+  margin-top: 6px;
+}
+
 .ed-hint {
   margin: 6px 0 0;
   color: var(--fg-mute);

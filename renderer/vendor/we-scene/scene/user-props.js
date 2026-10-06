@@ -192,6 +192,25 @@ function boundUserName(v) {
  * 把宿主 wire `{name: {value}}` 就地写进属性表和脚本可见的 live 对象。
  * 返回本次变更的扁平 name→value（combo 已收成 number），供 applyUserProperties(changed)。
  */
+// [we-scene patch] W9：宿主（编辑器）新声明的属性随 wire 带上声明（`{type, value, …}`）。
+// 未声明的名字此前只落到脚本可见的 live 上，绑定链（resolveUserProps 查属性表）
+// 永远看不到它 —— 新建 slider 绑到 alpha 上拖了没反应。带合法 type 的条目就地补进
+// 属性表；不带 type 的未知名字维持旧语义（只给脚本），避免把宿主杂项误当声明。
+const DECLARABLE_TYPES = new Set(['slider', 'color', 'bool', 'combo', 'textinput'])
+const DECL_FIELDS = ['text', 'min', 'max', 'step', 'precision', 'fraction', 'options', 'order', 'condition']
+
+// 已声明的同名条目就地刷新元数据（编辑器改 combo 选项 / slider 范围），引用不换。
+function declareFromWire(props, k, entry) {
+  if (!entry || typeof entry !== 'object' || !DECLARABLE_TYPES.has(entry.type)) return null
+  const cur = props[k] && typeof props[k] === 'object' ? props[k] : null
+  const p = cur || {}
+  p.type = entry.type
+  p.value = entry.value
+  for (const f of DECL_FIELDS) if (f in entry) p[f] = entry[f]
+  if (!cur) props[k] = p
+  return p
+}
+
 function mergeUserPropertyValues(properties, live, wire) {
   /** @type {Record<string, unknown>} */
   const changed = {}
@@ -200,7 +219,7 @@ function mergeUserPropertyValues(properties, live, wire) {
   const dst = live && typeof live === 'object' ? live : {}
   for (const [k, entry] of Object.entries(wire)) {
     const raw = entry && typeof entry === 'object' && 'value' in entry ? entry.value : entry
-    const p = props[k]
+    const p = declareFromWire(props, k, entry) || (props[k] && typeof props[k] === 'object' ? props[k] : null)
     if (p && typeof p === 'object') {
       p.value = raw
       p.userOverridden = true

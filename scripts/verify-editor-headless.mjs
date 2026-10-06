@@ -983,4 +983,124 @@ async function runCreateAndDraft(ctx) {
   const vpU = await ev(`({ w: innerWidth, h: innerHeight })`);
   const bHalf = await pixelAt(worldToPage({ x: 0, y: 0, w: vpU.w, h: vpU.h }, [1110, 590]));
   check(close(bHalf, half, 12), `测试台：脚本照样运行，出帧与编辑器一致（测试台 ${bHalf} / 编辑器 ${half}）`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("V. 用户属性端到端（声明 → 绑定 → 拖值热更 → 撤销 → combo 显隐 → 删除解绑 → 存库 → 测试台）");
+  const BGV = [0x20, 0x20, 0x20];
+  const settle = () => new Promise((r) => setTimeout(r, 400));
+  const ctl = (name) => `.ed-prop[data-prop="${name}"] .ed-fx-param [data-prop="${name}"]`;
+  const upDeclare = async (name, type) => {
+    await ev(`(() => {
+      const n = document.querySelector('#up-name'); n.value = '${name}'; n.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#up-type').value = '${type}';
+      document.querySelector('#up-add').click(); return true; })()`);
+    await waitFor(`!!document.querySelector('.ed-prop[data-prop="${name}"]')`, 10000);
+    await settle();
+  };
+  const upFire = (name, value, type) =>
+    ev(`(() => { const el = document.querySelector('${ctl(name)}'); el.value = '${value}'; el.dispatchEvent(new Event('${type}', { bubbles: true })); return true; })()`);
+  const deselect = async (cr) => {
+    await click(worldToPage(cr, [300, 540]));
+    await waitFor(`!!document.querySelector('.ed-props')`, 10000);
+  };
+  const bindSel = async (field, value) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => { const s = document.querySelector('.ed-bindings select[data-bind="${field}"]'); s.value = '${value}'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await h.waitRemount(r0);
+  };
+  const mix = (a, k) => RED.map((c, i) => Math.round(c * k + BGV[i] * (1 - k)));
+
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  await newBlank("#202020");
+  await addImage(stripePath);
+  const crV = await h.canvasRect();
+  const vTop = worldToPage(crV, [1110, 590]);
+  check(await ev(`!!document.querySelector('.ed-bindings') && /用户属性|user properties/i.test(document.querySelector('.ed-bindings').textContent)`), "图层检视器有「属性绑定」分组，没有属性时提示先去场景级声明");
+  await deselect(crV);
+  check(await ev(`document.querySelector('#up-add').disabled && document.querySelectorAll('#up-type option').length === 5`), "不选图层：出现「用户属性」面板，五种类型，名字为空时「声明」不可点");
+  await ev(`(() => { const n = document.querySelector('#up-name'); n.value = '1bad'; n.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  check(await ev(`document.querySelector('#up-add').disabled`), "非标识符名字：「声明」不可点");
+
+  const rDecl = await h.readyCount();
+  await upDeclare("op", "slider");
+  check((await h.readyCount()) === rDecl && (await h.dirtyTitle()), "声明 slider「op」：热更不重挂，带脏标记");
+  check(await ev(`document.querySelector('${ctl("op")}').value === '0.5' && document.querySelector('.ed-prop[data-prop="op"] .ed-prop-range').value === '0 1 0.01'`), "新属性默认 0.5、范围 0 1 0.01");
+
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('.ed-bindings select[data-bind="alpha"]')`, 10000);
+  check((await ev(`[...document.querySelectorAll('.ed-bindings select')].map((s) => s.dataset.bind)`)).join() === "visible,alpha,brightness,scale,color", "图片层可绑字段：visible / alpha / brightness / scale / color");
+  check((await ev(`[...document.querySelectorAll('.ed-bindings select[data-bind="alpha"] option')].map((o) => o.value)`)).join() === ",op" && (await ev(`[...document.querySelectorAll('.ed-bindings select[data-bind="color"] option')].length`)) === 1, "只列类型兼容的属性（alpha 可选 op，color 无可选）");
+  await bindSel("alpha", "op");
+  const vHalf = await pixelAt(vTop);
+  check(close(vHalf, mix(RED, 0.5), 14), `★ alpha 绑 op(0.5)：图层半透明（期望 ≈${mix(RED, 0.5)}，实得 ${vHalf}）`);
+  check(await ev(`document.querySelector('.ed-bindings select[data-bind="alpha"]').value === 'op'`), "重挂后绑定下拉显示 op");
+
+  await deselect(crV);
+  const rDrag = await h.readyCount();
+  await upFire("op", "0", "input");
+  await settle();
+  const vPrev = await pixelAt(vTop);
+  check(close(vPrev, BGV, 10), `★ 拖滑条到 0（input）：画面实时热更、图层隐去（实得 ${vPrev}）`);
+  await upFire("op", "0", "change");
+  await settle();
+  await upFire("op", "1", "change");
+  await settle();
+  check((await h.readyCount()) === rDrag && isRed(await pixelAt(vTop)), "松手提交（change）：值 0 → 1，全程不重挂、画面跟随");
+  await undoRedo(false);
+  check(close(await pixelAt(vTop), BGV, 10) && (await ev(`document.querySelector('${ctl("op")}').value`)) === "0", "撤销：值回到 0（面板与画面）");
+  await undoRedo(true);
+  check(isRed(await pixelAt(vTop)), "重做：值回到 1");
+
+  await upDeclare("mode", "combo");
+  check((await ev(`[...document.querySelectorAll('${ctl("mode")} option')].map((o) => o.value)`)).join() === "0,1", "combo 默认两个选项 0 / 1");
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('.ed-bindings select[data-bind="visible"]')`, 10000);
+  check((await ev(`[...document.querySelectorAll('.ed-bindings select[data-bind="visible"] option')].map((o) => o.value)`)).join() === ",op,mode=0,mode=1", "visible 可选 slider（0 / 非 0）与 combo 的每个条件");
+  await bindSel("visible", "mode=1");
+  check(close(await pixelAt(vTop), BGV, 10), "visible 绑 mode=1、当前值 0：图层隐藏");
+  await deselect(crV);
+  const rCombo = await h.readyCount();
+  await upFire("mode", "1", "change");
+  await settle();
+  check((await h.readyCount()) === rCombo && isRed(await pixelAt(vTop)), "★ combo 切到 1：图层显示（热更，不重挂）");
+
+  await upFire("op", "0.3", "change");
+  await settle();
+  const v03 = await pixelAt(vTop);
+  check(close(v03, mix(RED, 0.3), 14), `op = 0.3：图层 30% 不透明（实得 ${v03}）`);
+  const rDel = await h.readyCount();
+  await ev(`(() => { document.querySelector('.ed-prop[data-prop="op"] .ed-prop-del').click(); return true; })()`);
+  await h.waitRemount(rDel);
+  check(!(await ev(`!!document.querySelector('.ed-prop[data-prop="op"]')`)) && isRed(await pixelAt(vTop)), "删除 op：alpha 解绑回快照 1，图层全不透明");
+  await undoRedo(false);
+  check(close(await pixelAt(vTop), mix(RED, 0.3), 14) && (await ev(`!!document.querySelector('.ed-prop[data-prop="op"]')`)), "撤销删除：属性与绑定一并回来");
+  await undoRedo(true);
+  const editorV = await pixelAt(vTop);
+  check(isRed(editorV), "重做删除");
+
+  const libBeforeV = new Set(fs.readdirSync(lib));
+  const scV = await h.savedCount();
+  await clickSel("#tb-save");
+  await clickSel("#save-lib");
+  await h.waitSaved(scV);
+  const savedV = fs.readdirSync(lib).filter((n) => !libBeforeV.has(n));
+  const sceneV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "scene.json"), "utf8"));
+  const projV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "project.json"), "utf8"));
+  const stripeV = sceneV.objects.find((o) => o.name === "stripe");
+  check(JSON.stringify(stripeV?.visible?.user) === JSON.stringify({ name: "mode", condition: "1" }) && typeof stripeV.alpha !== "object", `盘上 scene.json：visible 条件绑定保留，alpha 已解绑（${JSON.stringify({ visible: stripeV?.visible, alpha: stripeV?.alpha })}）`);
+  const propsV = projV.general?.properties ?? {};
+  check(propsV.mode?.type === "combo" && propsV.mode.value === "1" && !("op" in propsV), `盘上 project.json：general.properties 有 mode=1、无 op（${JSON.stringify(propsV).slice(0, 90)}）`);
+  const errsV = await h.errorLines();
+  check(errsV.filter((l) => !/alpha' 失败/.test(l)).length === 0, `用户属性流程无错误${errsV.length ? `：${errsV.slice(0, 2).join(" / ")}` : ""}`);
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedV[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpV = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const bV = await pixelAt(worldToPage({ x: 0, y: 0, w: vpV.w, h: vpV.h }, [1110, 590]));
+  check(close(bV, editorV, 12), `测试台：按存盘属性值出帧，与编辑器一致（测试台 ${bV} / 编辑器 ${editorV}）`);
 }
