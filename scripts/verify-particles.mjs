@@ -35,6 +35,9 @@ const {
   ropeTrailDuration,
   setParticleDensityTier,
   noiseOctaves,
+  compileEmitterTiming,
+  emitterBudget,
+  emitterSpent,
 } = await imp("renderer/vendor/we-scene/render/particles.js");
 const ptex = await imp("renderer/vendor/we-scene/render/particle-textures.js");
 const { createTarget, rasterizeSystem, analyzeTarget, particleBasis } = await imp(
@@ -394,6 +397,57 @@ function runSphereEmitterDim() {
     const live = ps.pool.filter(p => p.alive).length;
     if (live === 0) errors.push("3D dir(1,1,1)：稳态 0 颗粒子");
   }
+  return errors;
+}
+
+// ---------- 校验一·补：发射器时序 delay / duration / 周期发射（R3a）----------
+// 语料 360 张：emitter.duration>0 5 张（2989540197 dur=3 rate=1 mc=3 等）、delay 1 张、
+// flags&4 周期发射 1 张（3584071721 thunderbolt / water_droplets_periodic）。此前三者都被忽略、一直发。
+function runEmitterTiming() {
+  const errors = [];
+  const ck = (ok, msg) => { if (!ok) errors.push(msg); };
+  const t0 = compileEmitterTiming({});
+  ck(t0.delay === 0 && t0.duration === 0 && t0.periodic === null && emitterBudget(t0, 0) === Infinity && emitterBudget(t0, 1e6) === Infinity, "缺省：不延迟、不限时、非周期");
+  const td = compileEmitterTiming({ delay: 1, duration: 2 });
+  ck(emitterBudget(td, 0.5) === 0 && emitterBudget(td, 1) === Infinity && emitterBudget(td, 2.9) === Infinity && emitterBudget(td, 3) === 0, "delay=1 duration=2：[1,3) 秒内发");
+  ck(compileEmitterTiming({ duration: 0 }).duration === 0 && emitterBudget(compileEmitterTiming({ duration: 0 }), 999) === Infinity, "duration=0 = 一直发（语料 Bird 等 20+ 处）");
+  ck(compileEmitterTiming({ flags: 2, minperiodicdelay: 1 }).periodic === null, "flags 没有 4 位：不是周期发射");
+  const tp = compileEmitterTiming({ flags: 4, minperiodicduration: 1, maxperiodicduration: 1, minperiodicdelay: 2, maxperiodicdelay: 2, maxtoemitperperiod: 5 });
+  const r0 = () => 0;
+  ck(emitterBudget(tp, 0.5, r0) === 5, "周期：第一个周期内额度 5");
+  emitterSpent(tp, 3);
+  ck(emitterBudget(tp, 0.9, r0) === 2, "发了 3 颗后剩 2");
+  ck(emitterBudget(tp, 1.5, r0) === 0 && emitterBudget(tp, 2.9, r0) === 0, "停顿段 [1,3) 不发");
+  ck(emitterBudget(tp, 3.2, r0) === 5, "下一周期（3s 起）额度重置");
+  const tz = compileEmitterTiming({ flags: 4 });
+  ck(emitterBudget(tz, 5, r0) === Infinity, "周期长度全 0：不死循环、按常发处理");
+
+  const layer = { id: 1, name: "t", origin: [0, 0, 0], scale: [1, 1, 1], visible: true };
+  const run = (em, secs) => {
+    const ps = new ParticleSystem(null, {
+      maxcount: 2000,
+      emitter: [{ name: "boxrandom", distancemax: "10 10 0", rate: 100, ...em }],
+      initializer: [{ name: "lifetimerandom", min: 100, max: 100 }],
+      renderer: [{ name: "sprite" }],
+    }, null, layer);
+    ps.setTexture({ glTex: null, width: 8, height: 8, pixels: ptex.buildBuiltinParticleTexture("particle/beam") });
+    ps.setVisible(true);
+    for (let i = 0; i < Math.round(secs * 30); i++) ps.advance(1 / 30);
+    return ps.pool.filter((p) => p.alive).length;
+  };
+  const free = run({}, 3);
+  const dur = run({ duration: 1 }, 3);
+  ck(free > 280 && Math.abs(dur - 100) <= 3, `★ duration=1：只发第一秒（3s 后存活 ${dur}，不限时 ${free}）`);
+  const del0 = run({ delay: 1 }, 0.9);
+  const del1 = run({ delay: 1 }, 1.5);
+  ck(del0 === 0 && Math.abs(del1 - 50) <= 3, `★ delay=1：1s 前 0 颗（${del0}），1.5s 时约 50 颗（${del1}）`);
+  const per = run({ flags: 4, minperiodicduration: 0.5, maxperiodicduration: 0.5, minperiodicdelay: 0.5, maxperiodicdelay: 0.5, maxtoemitperperiod: 10 }, 2.9);
+  ck(per === 30, `★ 周期发射：0.5s 发 / 0.5s 停、每周期最多 10 颗 → 2.9s 内 3 个周期共 30 颗（实得 ${per}）`);
+  const perNoCap = run({ flags: 4, minperiodicduration: 0.5, maxperiodicduration: 0.5, minperiodicdelay: 0.5, maxperiodicdelay: 0.5 }, 2.9);
+  ck(Math.abs(perNoCap - 150) <= 4, `周期发射不限量：只在发射段按 rate 发（2.9s 内 1.5s 发射段 ≈150，实得 ${perNoCap}）`);
+  const burst = run({ rate: 0, instantaneous: 40, delay: 1 }, 0.5);
+  const burst2 = run({ rate: 0, instantaneous: 40, delay: 1 }, 1.2);
+  ck(burst === 0 && burst2 === 40, `instantaneous 也等 delay：0.5s ${burst} 颗、1.2s ${burst2} 颗`);
   return errors;
 }
 
@@ -4041,6 +4095,13 @@ if (action === "all" || action === "sim" || action === "trail") {
   console.log(`\n【sphererandom 方向维度（2464842912 螺旋回归）】问题 ${sed.length}`);
   sed.forEach((e) => console.log("  ! " + e));
   failed += sed.length;
+}
+
+{
+  const et = runEmitterTiming();
+  console.log(`\n【发射器时序 delay / duration / 周期发射（R3a）】问题 ${et.length}`);
+  et.forEach((e) => console.log("  ! " + e));
+  failed += et.length;
 }
 
 {

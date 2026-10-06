@@ -181,6 +181,63 @@ export function spriteTrailLengthFactor(speed, length, minLength, maxLength) {
   return f
 }
 
+/**
+ * 发射器时序（语料 360 张：duration>0 5 张、delay 1 张、flags&4 周期发射 1 张 3584071721）。
+ * - delay：开始发射前等待的秒数；
+ * - duration：从开始发射起只发这么多秒，0 / 缺省 = 一直发；
+ * - flags & 4 = 周期发射：发 [min,max]periodicduration 秒、停 [min,max]periodicdelay 秒，循环；
+ *   maxtoemitperperiod > 0 时每个周期最多发这么多颗。
+ * 时刻 t 是系统仿真时间（含 starttime 预热）。
+ */
+export function compileEmitterTiming(e) {
+  const n = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d)
+  const periodic = (n(e.flags, 0) & 4) !== 0
+  return {
+    delay: Math.max(0, n(e.delay, 0)),
+    duration: Math.max(0, n(e.duration, 0)),
+    periodic: periodic
+      ? {
+          durMin: Math.max(0, n(e.minperiodicduration, 0)),
+          durMax: Math.max(0, n(e.maxperiodicduration, n(e.minperiodicduration, 0))),
+          gapMin: Math.max(0, n(e.minperiodicdelay, 0)),
+          gapMax: Math.max(0, n(e.maxperiodicdelay, n(e.minperiodicdelay, 0))),
+          max: Math.max(0, Math.floor(n(e.maxtoemitperperiod, 0))),
+          state: null,
+        }
+      : null,
+  }
+}
+
+/**
+ * 发射器在时刻 t 是否处于发射窗口。周期状态挂在 timing.periodic.state 上（随 t 单调推进）。
+ * 返回 0 = 不发；Infinity = 不限量；正数 = 本周期还能发的颗数。
+ */
+export function emitterBudget(timing, t, rnd = Math.random) {
+  if (!timing) return Infinity
+  if (t < timing.delay) return 0
+  if (timing.duration > 0 && t >= timing.delay + timing.duration) return 0
+  const P = timing.periodic
+  if (!P) return Infinity
+  const pick = (a, b) => (b > a ? a + rnd() * (b - a) : a)
+  let s = P.state
+  if (!s) s = P.state = { start: timing.delay, len: pick(P.durMin, P.durMax), gap: pick(P.gapMin, P.gapMax), emitted: 0 }
+  if (!(s.len + s.gap > 0)) return P.max > 0 ? Math.max(0, P.max - s.emitted) : Infinity
+  for (let guard = 0; t >= s.start + s.len + s.gap && guard < 10000; guard++) {
+    s.start += s.len + s.gap
+    s.len = pick(P.durMin, P.durMax)
+    s.gap = pick(P.gapMin, P.gapMax)
+    s.emitted = 0
+  }
+  if (t < s.start || t >= s.start + s.len) return 0
+  return P.max > 0 ? Math.max(0, P.max - s.emitted) : Infinity
+}
+
+/** 记账：本周期已发 n 颗（只对限量的周期发射器有意义） */
+export function emitterSpent(timing, n) {
+  const s = timing && timing.periodic && timing.periodic.state
+  if (s) s.emitted += n
+}
+
 /** 贴图 +Y 对齐速度（投影空间）。零速度不转。 */
 export function spriteTrailRotation(dx, dy) {
   if (!(dx || dy)) return 0
@@ -545,6 +602,7 @@ export class ParticleSystem {
       // 发射器可贴到控制点。缺省 = 0，而 CP0 就是系统原点；
       // CP0 flags=1 锁鼠标时，粒子从光标处生出（鼠标轨迹），不是钉在图层 origin。
       controlPoint: e.controlpoint !== undefined && e.controlpoint !== null ? num(e.controlpoint, 0) : 0,
+      timing: compileEmitterTiming(e),
       _burst: false,
     }))
 
@@ -2022,10 +2080,15 @@ export class ParticleSystem {
     if (this._eventParent) {
       this._stepEventChild(dt)
     } else for (const em of this.emitters) {
+      // delay / duration / 周期发射：窗口外整个发射器不动（含爆发与维持池满）
+      const budget = emitterBudget(em.timing, this.simTime)
+      if (budget <= 0) continue
       // instantaneous：一次性爆发 N 个（烟花/冲击波）
       if (em.instantaneous > 0 && !em._burst) {
         em._burst = true
-        for (let i = 0; i < Math.min(em.instantaneous, this.maxCount); i++) this.spawn(em)
+        const nb = Math.min(em.instantaneous, this.maxCount, budget)
+        for (let i = 0; i < nb; i++) this.spawn(em)
+        emitterSpent(em.timing, nb)
       }
       // 无 rate 的常驻场：维持池满（粒子按 lifetime 自然回收，补充维持总量恒定）。
       // 这类发射器没有 rate 来自然限流，总量完全由 maxcount 决定，而 maxcount 是
@@ -2089,7 +2152,9 @@ export class ParticleSystem {
         em._accum -= n
         // 单帧生成上限：rate 可达 15000/s，掉帧时累积量会瞬间打满池子
         if (n > this.maxCount) n = this.maxCount
+        if (n > budget) n = budget
         for (let i = 0; i < n; i++) this.spawn(em)
+        emitterSpent(em.timing, n)
       }
     }
     const pool = this.pool
