@@ -679,6 +679,9 @@ fieldset.ed-form:disabled {
 .ed-props .ed-fx-params input[type="text"],
 .ed-props .ed-fx-params select,
 .ed-props .ed-fx-params textarea,
+.ed-text .ed-fx-params input[type="number"],
+.ed-text .ed-fx-params select,
+.ed-text .ed-fx-params textarea,
 .ed-bindings select,
 .ed-prop-add input,
 .ed-prop-add select {
@@ -694,6 +697,17 @@ fieldset.ed-form:disabled {
   padding: 2px 4px;
   resize: vertical;
   font: 11px / 1.45 var(--mono);
+}
+
+.ed-text .ed-fx-params textarea {
+  height: auto;
+  padding: 3px 4px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.ed-text .ed-fx-params textarea[readonly] {
+  color: var(--wb-fg-mute);
 }
 
 .ed-prop-add {

@@ -53,3 +53,12 @@ export declare function checkSceneScript(script: string): SceneScriptCheck;
  * project.json / 封面应留在包外，由调用方剔除。
  */
 export declare function buildScenePkg(files: readonly ScenePkgFile[]): ScenePkgResult;
+
+/**
+ * WE 内置字体名（scene.json 里的 font: "systemfont_*"）→ 本机 CSS font-family 栈。
+ * 不在表里的 font 值是工程内字体文件路径（fonts/*.ttf|otf）。
+ */
+export declare const SYSTEM_FONT_FAMILIES: Readonly<Record<string, string>>;
+
+/** 文字对象 pointsize → 场景像素的放大系数：em = pointsize × TEXT_EM_SCALE。 */
+export declare const TEXT_EM_SCALE: number;

@@ -157,6 +157,9 @@
               <button type="button" class="ed-icon" id="ly-add" disabled data-et-title="ly.add" title="添加图片层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M10 3H2.5v10h11V7.5 M12.5 1.5v4 M10.5 3.5h4 M2.5 11l3-3.5 2.5 2.5 1.5-1.5 4 3.5" /></svg>
               </button>
+              <button type="button" class="ed-icon" id="ly-add-text" disabled data-et-title="ly.addText" title="添加文字层" aria-haspopup="menu">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4V2.5h8V4 M7 2.5v10 M5.5 12.5h3 M12.5 9v5 M10 11.5h5" /></svg>
+              </button>
               <button type="button" class="ed-icon" id="ly-up" disabled data-et-title="ly.up" title="前移">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 13V3 M4 7l4-4 4 4" /></svg>
               </button>
@@ -170,6 +173,11 @@
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4h10M6.5 4V3h3v1M4.5 4.5V13a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V4.5M6.8 7v4.5M9.2 7v4.5" /></svg>
               </button>
             </div>
+          </div>
+          <div id="text-menu" class="ed-menu" role="menu" hidden>
+            <button type="button" role="menuitem" data-preset="plain" data-et="text.plain">文字</button>
+            <button type="button" role="menuitem" data-preset="clock" data-et="text.clock">时钟</button>
+            <button type="button" role="menuitem" data-preset="date" data-et="text.date">日期</button>
           </div>
           <div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree"></div>
         </section>
@@ -307,6 +315,7 @@
     <input type="file" id="in-pkg" accept=".pkg,.json" multiple hidden />
     <input type="file" id="in-dir" webkitdirectory multiple hidden />
     <input type="file" id="in-image" accept="image/*" multiple hidden />
+    <input type="file" id="in-font" accept=".ttf,.otf,font/ttf,font/otf" hidden />
 
     <script type="module" src="/editor/main.ts"></script>
   </body>

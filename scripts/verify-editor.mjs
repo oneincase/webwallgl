@@ -85,6 +85,7 @@ const sourceAlias = {
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
+        `export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from ${json(path.join(ROOT, "renderer/src/types.ts"))};`,
       ].join("\n"),
       loader: "ts",
       resolveDir: ROOT,
@@ -1498,6 +1499,137 @@ section("X2. 导出闭环（新建 → 图片层 + 效果 → 打成 scene.pkg �
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Y. 文字层（W11）：editor/text.ts 模板 / 字段读写 / 量盒 / 字体
+// ───────────────────────────────────────────────────────────────────────────
+section("Y. 文字层 editor/text.ts");
+const textMod = await loadEditorModule("text");
+const parseMod = await imp("renderer/vendor/we-scene/scene/parse.js");
+/** 假量具：每字 0.5 em —— 盒尺寸可手算 */
+const fakeMeasure = (t, _font, px) => [...t].length * px * 0.5;
+/** 固定「现在」跑模板脚本：沙箱里的 new Date() 解析到 globalThis.Date */
+function atTime(iso, fn) {
+  const Real = globalThis.Date;
+  const fixed = new Real(iso).getTime();
+  globalThis.Date = class extends Real {
+    constructor(...a) {
+      super(...(a.length ? a : [fixed]));
+    }
+    static now() {
+      return fixed;
+    }
+  };
+  try {
+    return fn();
+  } finally {
+    globalThis.Date = Real;
+  }
+}
+const runTpl = (obj, iso, props) =>
+  atTime(iso, () => wtextMod.evalTextScript(obj.text.script, props ?? obj.text.scriptproperties, { text: obj.text.value }).callUpdate(""));
+{
+  const doc = createMod.newDocument("t", 1920, 1080, [0, 0, 0]);
+  const id = textMod.addTextLayer(doc, "plain", "文字", "Hello", fakeMeasure);
+  const o = doc.scene.objects.find((x) => x.id === id);
+  check(doc.roots.some((n) => n.id === id && n.kind === "text"), "新文字层进图层树，种类 text");
+  check(
+    o.anchor === "none" && o.font === "systemfont_arial" && o.pointsize === 32 && o.horizontalalign === "center" && o.verticalalign === "center" && o.padding === 32 && o.opaquebackground === false && o.maxrows === 1 && o.maxwidth === 500,
+    "新文字层与 WE 编辑器新建的文字对象同形（anchor none / arial 32 / 居中 / padding 32）",
+  );
+  check(o.origin === "960.000 540.000 0.000" && o.text === "Hello", "放在场景中心，内容是裸字符串");
+  check(o.size === "320.000 153.600", `盒 = 最宽行 × 1.2 em（em = 4 × 32；${o.size}）`);
+  const L = parseMod.parseScene(structuredClone(doc.scene), { type: "scene" }).layers.find((l) => l.id === id);
+  check(!!L && L.isText && L.textFont === "systemfont_arial" && L.textPointsize === 32 && L.textAnchor === "none" && L.textPadding === 32 && json(L.size) === json([320, 153.6]), "引擎 parseScene 认得新文字层的字体 / 字号 / 锚点 / 内边距 / 盒");
+
+  check(textMod.setTextValue(o, "Hi\r\nthere!") && o.text === "Hi\nthere!", "改内容：换行规整成 \\n");
+  check(textMod.refitTextBox(o, fakeMeasure) && o.size === "384.000 307.200", `多行重量盒：最宽行 6 字 × 64，2 行 × 153.6（${o.size}）`);
+  check(!textMod.refitTextBox(o, fakeMeasure), "内容没变时重量盒是空操作");
+  check(!textMod.setTextValue(o, "Hi\nthere!"), "同值不算改动");
+
+  const clockId = textMod.addTextLayer(doc, "clock", "时钟", "", fakeMeasure);
+  const clock = doc.scene.objects.find((x) => x.id === clockId);
+  const cs = checkSceneScript(clock.text.script);
+  check(cs.ok && json(cs.entries) === json(["update"]), "时钟模板过预检（入口 update）");
+  check(json(clock.text.scriptproperties) === json({ use24h: true, showSeconds: false }) && typeof clock.text.value === "string", "时钟：{ script, scriptproperties, value } 包装，开关落 scriptproperties");
+  check(runTpl(clock, "2026-10-06T09:05:07") === "09:05", "时钟 24h：09:05");
+  check(runTpl(clock, "2026-10-06T09:05:07", { use24h: false, showSeconds: true }) === "9:05:07 AM", "时钟 12h + 秒：9:05:07 AM");
+  check(runTpl(clock, "2026-10-06T00:30:00", { use24h: false, showSeconds: false }) === "12:30 AM" && runTpl(clock, "2026-10-06T13:00:00", { use24h: false }) === "1:00 PM", "时钟 12h：0 点记 12 AM、13 点记 1 PM");
+  check(runTpl(clock, "2026-10-06T13:04:59", { use24h: { value: true }, showSeconds: { user: "secs", value: true } }) === "13:04:59", "scriptproperties 的 {value} / {user,value} 包装同样生效");
+  check(clock.size === "704.000 153.600", `时钟盒按最宽样例「00:00:00 PM」量（脚本层引擎不扩画布；${clock.size}）`);
+
+  const dateId = textMod.addTextLayer(doc, "date", "日期", "", fakeMeasure);
+  const date = doc.scene.objects.find((x) => x.id === dateId);
+  check(checkSceneScript(date.text.script).ok, "日期模板过预检");
+  check(runTpl(date, "2026-10-06T12:00:00") === "2026-10-06 Tue" && runTpl(date, "2026-01-09T12:00:00", { showWeekday: false }) === "2026-01-09", "日期：YYYY-MM-DD + 周几（可关）");
+
+  check(textMod.presetOf(o) === "plain" && textMod.presetOf(clock) === "clock" && textMod.presetOf(date) === "date", "presetOf 认出普通 / 时钟 / 日期");
+  const foreign = { text: { script: "export function update(v) { return v + '!'; }", value: "x" }, size: "100 50", pointsize: 10 };
+  check(textMod.presetOf(foreign) === null && !textMod.refitTextBox(foreign, fakeMeasure) && foreign.size === "100 50", "外来脚本文字：不知道会输出什么，盒不动");
+  check(textMod.setTextField(foreign, "pointsize", 20) && foreign.size === "200.000 100.000", "外来脚本文字改字号：盒按比例缩放");
+  check(textMod.isScriptedText(clock) && !textMod.isScriptedText(o) && textMod.textValue(clock) === clock.text.value, "isScriptedText / textValue 读包装");
+  check(textMod.setTextValue(clock, "00:00") && clock.text.script === textMod.CLOCK_SCRIPT && clock.text.value === "00:00", "脚本文字改快照：脚本与 scriptproperties 保留");
+
+  const bound = { text: { user: "title", value: "a" } };
+  check(textMod.setTextValue(bound, "b") && json(bound.text) === json({ user: "title", value: "b" }) && textMod.isBoundText(bound), "绑定了用户属性的内容：只改 value，绑定保留");
+
+  const f0 = textMod.getTextFields({ text: "x", padding: "16 16" });
+  check(f0.font === "systemfont_arial" && f0.pointsize === 24 && f0.horizontalalign === "center" && f0.verticalalign === "center" && f0.padding === 16 && f0.opaquebackground === false && json(f0.backgroundcolor) === json([0, 0, 0]), "缺省按引擎口径补齐（字号 24、居中），\"16 16\" 形态 padding 读成 16");
+  const t = { text: "x", pointsize: { user: "ps", value: 30 }, size: "10 10" };
+  check(textMod.setTextField(t, "pointsize", 40) && json(t.pointsize) === json({ user: "ps", value: 40 }), "字号绑定了用户属性：只改 value");
+  check([0, -1, NaN, 2000, "x"].every((v) => !textMod.setTextField(t, "pointsize", v)), "字号非法（0 / 负 / NaN / >1000 / 非数）拒绝");
+  check(textMod.setTextField(t, "horizontalalign", "right") && t.horizontalalign === "right" && !textMod.setTextField(t, "horizontalalign", "middle") && !textMod.setTextField(t, "verticalalign", "left"), "对齐只收 left/center/right、top/center/bottom");
+  check(textMod.setTextField(t, "padding", 8) && t.padding === 8 && !textMod.setTextField(t, "padding", -1), "padding 写数值，负数拒绝");
+  check(textMod.setTextField(t, "opaquebackground", true) && t.opaquebackground === true && !textMod.setTextField(t, "opaquebackground", "yes"), "背景开关只收布尔");
+  check(textMod.setTextField(t, "backgroundcolor", [2, 0.5, -1]) && t.backgroundcolor === "1.000 0.500 0.000" && !textMod.setTextField(t, "backgroundcolor", [1, 2]), "背景色夹到 0..1 写成 \"r g b\"");
+  check(textMod.setTextField(t, "font", "fonts/a.ttf") && t.font === "fonts/a.ttf" && !textMod.setTextField(t, "font", "  ") && !textMod.setTextField(t, "font", "fonts/a.ttf"), "字体：空值拒绝、同值不算改动");
+  check(!textMod.setTextField({ image: "m.json" }, "font", "x"), "非文字对象一律拒绝");
+
+  const fd = docMod.makeDoc("f", { type: "scene" }, {
+    objects: [
+      { id: 1, text: "a", font: "systemfont_consolas" },
+      { id: 2, text: "b", font: "fonts/my.ttf" },
+      { id: 3, text: "c", font: { user: "f", value: "fonts/other.otf" } },
+      { id: 4, image: "m.json", font: "fonts/ignored.ttf" },
+    ],
+  }, "loose");
+  check(json([...textMod.referencedFonts(fd)].sort()) === json(["fonts/my.ttf", "fonts/other.otf"]), "referencedFonts：只收文字层的工程字体（systemfont_* 与非文字对象不算）");
+  check(textMod.fontPathOf("My Font.TTF", () => false) === "fonts/my-font.ttf" && textMod.fontPathOf("思源.otf", () => false) === "fonts/font.otf" && textMod.fontPathOf("a.woff", () => false) === null, "fontPathOf：ASCII slug、全非 ASCII 退 font、只收 ttf / otf");
+  check(textMod.fontPathOf("a.ttf", (p) => p === "fonts/a.ttf") === "fonts/a-2.ttf", "fontPathOf 判重加 -2");
+  check(textMod.SYSTEM_FONTS.includes("systemfont_arial") && textMod.SYSTEM_FONTS.length === 17 && textMod.fontLabel("systemfont_timesnewroman") === "Times New Roman" && textMod.fontLabel("fonts/x.ttf") === "x.ttf", "系统字体表取自引擎（17 个），下拉显示族名 / 文件名");
+}
+
+section("Y2. 文字层闭环（新建 → 文字层 + 导入字体 → 存库 → 重新打开）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("文字测试", 1280, 720, [0, 0, 0]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const ov = assetsMod.overlayAssets("scene.json", empty, () => new Set([...createMod.referencedModels(doc), ...fxMod.referencedEffects(doc), ...textMod.referencedFonts(doc)]));
+    const fontBytes = new Uint8Array([0, 1, 0, 0, 9, 9, 9]);
+    ov.put("fonts/used.ttf", fontBytes, "fonts/used.ttf");
+    ov.put("fonts/unused.ttf", new Uint8Array([1]), "fonts/unused.ttf");
+    const id = textMod.addTextLayer(doc, "plain", "文字", "Hello", fakeMeasure);
+    const o = doc.scene.objects.find((x) => x.id === id);
+    textMod.setTextField(o, "font", "fonts/used.ttf");
+    textMod.addTextLayer(doc, "clock", "时钟", "", fakeMeasure);
+    const files = await saveMod.collectProject(doc, ov, null);
+    const names = files.map((f) => f.path).sort();
+    check(names.includes("fonts/used.ttf") && !names.includes("fonts/unused.ttf"), `保存清单带上被引用的字体、不带没人用的（${json(names)}）`);
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(json(reopened.doc.scene) === json(doc.scene), "重新打开：文字层（含时钟脚本包装）逐字段一致");
+    check(same(await reopened.assets.read("fonts/used.ttf"), fontBytes), "重新打开：字体文件原字节可读（松散形态，引擎按 scene.json 引用预载）");
+    const { packed } = saveMod.packProject(files);
+    check(packed.entries.includes("fonts/used.ttf"), "打成 scene.pkg 时字体原样入包");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1516,7 +1648,7 @@ section("I. 接线");
   check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /saveToLibrary\(itemId, files, progress\)/.test(main), "保存走 collectProject → 目标写出");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
-  check(/const referencedGroups = [^\n]*referencedModels\(d\)[^\n]*referencedEffects\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件（写进来的效果随引用进出保存清单）");
+  check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体（写进来的效果 / 字体随引用进出保存清单）");
   check(/from "\.\/effects"/.test(main) && /function objEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
   check(/overlay\.put\(f\.name, f\.data, effectFileOf\(fxId\)\)/.test(main), "添加效果时把四件写进叠加层，分组 = effect.json 路径");
   check(/inp\.addEventListener\("change", \(\) => commit\(/.test(main), "参数在 change 时提交（拖动中只更新读数，不反复重挂）");
@@ -1558,6 +1690,17 @@ section("I. 接线");
   check(/import \{ buildScenePkg, type ScenePkgResult \} from "\.\.\/renderer\/src\/api\/editor";/.test(saveTs) && !/writePkg|encodeTex/.test(saveTs), "页面只经库出口 buildScenePkg 打包（不直连 vendor 编码器）");
   const devPack = fs.readFileSync(path.join(ROOT, "scripts/dev-pack-pkg.mjs"), "utf8");
   check(/import \{ writePkg \} from "\.\.\/renderer\/vendor\/we-scene\/pkg\/container\.js";/.test(devPack) && !/writeUInt32LE|Buffer\.concat/.test(devPack), "dev-pack-pkg 不再有第二份容器写实现");
+  check(/from "\.\/text"/.test(main) && /structEdit\(et\("log\.textAdded", \{ name \}\), \(d\) => addTextLayer\(d, preset, name, et\("text\.defaultValue"\), measureText\)/.test(main), "添加文字层取 text.ts 模板、走结构编辑（可撤销、整场景重挂）");
+  check(/objEdit\(et\("log\.textEdited"[^\n]*\n\s*if \(!mutate\(o\)\) return false;\s*refitTextBox\(o, measureText\);/.test(main), "文字字段编辑走结构编辑，改完按页面实测宽度回填盒子");
+  check(/await Promise\.all\(fonts\.map\(ensurePageFont\)\);/.test(main) && /SYSTEM_FONT_FAMILIES\[font\.toLowerCase\(\)\]/.test(main), "量字前先把工程字体装进页面；系统字体按引擎同一张映射表量");
+  check(/overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);/.test(main), "导入字体写进叠加层，分组 = 字体路径（没被引用就不进保存清单）");
+  check(/if \(node\.kind === "text"\) inspectorEl\.appendChild\(textGroup\(node\)\);/.test(main) && /content\.readOnly = scripted;/.test(main), "文字层检视器有「文字」分组；脚本生成的内容只读");
+  check(/id="ly-add-text"/.test(html) && /id="text-menu"/.test(html) && ["plain", "clock", "date"].every((p) => html.includes(`data-preset="${p}"`)) && /id="in-font" accept="\.ttf,\.otf/.test(html), "页面：添加文字层按钮 + 文字 / 时钟 / 日期菜单 + 字体选择框");
+  const txKeys = [...main.matchAll(/et\(\s*"((?:tx|text)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addText", "text.plain", "text.clock", "text.date", "tx.align.left", "tx.align.center", "tx.align.right", "tx.align.top", "tx.align.bottom", "log.textAdded", "log.textEdited", "log.fontImported", "log.fontFailed", "insp.text"]);
+  const missingTx = [...new Set(txKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missingTx.length === 0, `文字层文案中英文都有（缺 ${json(missingTx)}）`);
+  const typesTs = fs.readFileSync(path.join(ROOT, "renderer/src/types.ts"), "utf8");
+  check(/export const SYSTEM_FONT_FAMILIES/.test(typesTs) && !/export const SYSTEM_FONT_FAMILIES/.test(sm) && /SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE \} from "\.\/types"/.test(sm), "系统字体映射表只有一份（types.ts），引擎与编辑器共用");
   const pkgJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   check(pkgJson.scripts?.["verify:editor"] === "node scripts/verify-editor.mjs", "package.json 有 verify:editor");
   const all = fs.readFileSync(path.join(ROOT, "scripts/verify-all.mjs"), "utf8");
@@ -1709,6 +1852,27 @@ section("J. 变异红测");
     { path: "materials/old.png", data: stripePng(4, 4, [0, 0, 0], [0, 0, 0]) },
   ]);
   check(pkgC.getEntry(pkgC.parsePkg(mp2.packed.pkg), "materials/old.tex")?.[0] !== 7, "源图覆盖已有 .tex 时「已有 .tex 原样」判据变红");
+
+  const txPath = path.join(ROOT, "editor/text.ts");
+  const txSrc = fs.readFileSync(txPath, "utf8");
+  const mutTx = txSrc.replace('if (isWrapped(cur) && ("value" in cur || "user" in cur || "script" in cur)) {', "if (false) {");
+  check(mutTx !== txSrc, "注入点存在（文字字段写入保留包装）");
+  const txm = await loadEditorModule("text", { [txPath]: mutTx });
+  const tb = { text: { user: "title", value: "a" } };
+  txm.setTextValue(tb, "b");
+  check(json(tb.text) !== json({ user: "title", value: "b" }), "写穿包装时「绑定保留」判据变红");
+  const mutTx2 = txSrc.replace("preset === \"plain\" ? [0] : measureTextBox(TEMPLATES[preset].samples", "preset === \"plain\" || true ? [0] : measureTextBox(TEMPLATES[preset].samples");
+  check(mutTx2 !== txSrc, "注入点存在（模板脚本按最宽样例量盒）");
+  const txm2 = await loadEditorModule("text", { [txPath]: mutTx2 });
+  const td = createMod.newDocument("x", 1920, 1080, [0, 0, 0]);
+  const tcid = txm2.addTextLayer(td, "clock", "c", "", fakeMeasure);
+  check(td.scene.objects.find((x) => x.id === tcid).size !== "704.000 153.600", "时钟只按快照量盒时「按最宽样例」判据变红");
+  const mutTx3 = txSrc.replace("return [Math.max(w, em * 0.5), Math.max(1, lines.length) * em * LINE_FACTOR];", "return [Math.max(w, em * 0.5), em * LINE_FACTOR];");
+  check(mutTx3 !== txSrc, "注入点存在（盒高随行数）");
+  const txm3 = await loadEditorModule("text", { [txPath]: mutTx3 });
+  const tm4 = { text: "a\nb", pointsize: 32 };
+  txm3.refitTextBox(tm4, fakeMeasure);
+  check(tm4.size !== "64.000 307.200", "盒高不乘行数时「多行盒高」判据变红");
 
   let mutSeq = 0;
   const vendorMut = async (rel, from, to, tag) => {

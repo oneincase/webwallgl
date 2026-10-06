@@ -1202,4 +1202,151 @@ async function runCreateAndDraft(ctx) {
   await waitFor(firstFrame, 90000);
   await settle();
   check(close(await pixelAt(worldToPage(await h.canvasRect(), [1110, 590])), xTop, 12), "编辑器重新打开导出的包条目：画面一致");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("Y. 文字层端到端（空白 → 文字 / 时钟层 → 改内容 / 字号 / 颜色 / 导入字体 → 撤销 → 存库 → 测试台出帧一致）");
+  /** 页面矩形内的墨水：亮像素占比 + 亮像素平均色（黑底） */
+  const inkIn = async ([x0, y0], [x1, y1]) => {
+    const clip = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.max(2, Math.abs(x1 - x0)), height: Math.max(2, Math.abs(y1 - y0)), scale: 1 };
+    const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip });
+    return ev(`(async () => {
+      const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
+      const c = new OffscreenCanvas(bmp.width, bmp.height); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0);
+      const d = g.getImageData(0, 0, bmp.width, bmp.height).data; let n = 0; const s = [0, 0, 0];
+      for (let i = 0; i < d.length; i += 4) { if (d[i] + d[i + 1] + d[i + 2] > 200) { n++; s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; } }
+      return { frac: n / (d.length / 4), color: n ? s.map((v) => Math.round(v / n)) : [0, 0, 0] };
+    })()`);
+  };
+  const worldBox = (cr, [cx, cy], [hw, hh]) => [worldToPage(cr, [cx - hw, cy + hh]), worldToPage(cr, [cx + hw, cy - hh])];
+  const rawObj = () => ev(`JSON.parse(document.querySelector('.ed-insp-raw').textContent)`);
+  const textAct = (js) => fxAct(js);
+  const setText = (name, value) =>
+    textAct(`const el = document.querySelector('.ed-text [data-text="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const addTextPreset = async (preset) => {
+    const r0 = await h.readyCount();
+    await clickSel("#ly-add-text");
+    await clickSel(`#text-menu button[data-preset="${preset}"]`);
+    await h.waitRemount(r0);
+  };
+  /** 页面里按引擎同一字体栈量宽度（Arial 系统字体） */
+  const arialWidth = (s, px) => ev(`(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '${px}px Arial, \\'Helvetica Neue\\', sans-serif, sans-serif'; return c.measureText(${JSON.stringify(s)}).width; })()`);
+  const sizeOf = (o) => String(o.size).split(/\s+/).map(Number);
+
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  check(await ev(`document.querySelector('#ly-add-text').disabled`), "未打开场景时「添加文字层」不可用");
+  await newBlank("#000000");
+  check(!(await ev(`document.querySelector('#ly-add-text').disabled`)), "新建后「添加文字层」可用");
+  await clickSel("#ly-add-text");
+  check(await ev(`!document.querySelector('#text-menu').hidden && document.querySelectorAll('#text-menu button[data-preset]').length === 3`), "点开文字菜单：文字 / 时钟 / 日期三项");
+  await clickSel("#ly-add-text");
+  check(await ev(`document.querySelector('#text-menu').hidden`), "再点收起");
+
+  await addTextPreset("plain");
+  const plainName = (await h.treeNames())[0];
+  check((await h.treeNames()).length === 1 && (await h.selectedName()) === plainName && /文字|Text/.test(plainName), `添加文字层：树里一层「${plainName}」并选中`);
+  check(await ev(`!!document.querySelector('.ed-text') && !document.querySelector('.ed-text [data-text="content"]').readOnly`), "检视器有「文字」分组，内容可编辑");
+  check(await ev(`document.querySelector('.ed-text [data-text="font"]').value === 'systemfont_arial' && document.querySelector('.ed-text [data-text="size"]').value === '32'`), "缺省字体 Arial、字号 32");
+
+  await setText("content", "MMM");
+  let o = await rawObj();
+  const wantW = await arialWidth("MMM", 128);
+  check(o.text === "MMM" && Math.abs(sizeOf(o)[0] - wantW) < 0.01 && Math.abs(sizeOf(o)[1] - 153.6) < 0.01, `改内容后盒按页面实测宽度回填（size ${o.size}，Arial 实测 ${wantW.toFixed(3)}）`);
+  await setText("size", "60");
+  o = await rawObj();
+  check(o.pointsize === 60 && Math.abs(sizeOf(o)[1] - 288) < 0.01 && Math.abs(sizeOf(o)[0] - (await arialWidth("MMM", 240))) < 0.01, `改字号 60：盒跟着重量（${o.size}）`);
+  await h.setInputs({ 0: 960, 1: 800 });
+  await settle();
+  const crY = await h.canvasRect();
+  const boxW = sizeOf(o)[0] / 2;
+  let ink = await inkIn(...worldBox(crY, [960, 800], [boxW, 110]));
+  check(ink.frac > 0.12 && ink.color.every((c) => c > 200), `画面真画出白色文字（墨水占比 ${ink.frac.toFixed(3)}，色 ${ink.color}）`);
+  check((await inkIn(...worldBox(crY, [960, 540], [boxW, 110]))).frac < 0.01, "挪到 y=800 后原位置没有残影");
+
+  await ev(`(() => { const c = document.querySelector('#ed-inspector fieldset.ed-form input[type=color]'); c.focus(); c.value = '#ff0000'; c.dispatchEvent(new Event('input', { bubbles: true })); c.dispatchEvent(new Event('change', { bubbles: true })); c.blur(); return true; })()`);
+  await settle();
+  ink = await inkIn(...worldBox(crY, [960, 800], [boxW, 110]));
+  check(ink.frac > 0.12 && ink.color[0] > 200 && ink.color[1] < 60 && ink.color[2] < 60, `颜色改红：文字变红（${ink.color}）`);
+
+  await setText("halign", "right");
+  o = await rawObj();
+  check(o.horizontalalign === "right" && (await ev(`document.querySelector('.ed-text [data-text="halign"]').value`)) === "right", "水平对齐改右：文档与控件一致");
+  await setText("halign", "center");
+
+  const fontPath = "/System/Library/Fonts/Supplemental/Arial Black.ttf";
+  if (fs.existsSync(fontPath)) {
+    const wBefore = sizeOf(await rawObj())[0];
+    const r0 = await h.readyCount();
+    await ev(`(() => { const s = document.querySelector('.ed-text [data-text="font"]'); s.value = ''; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await setFiles("#in-font", [fontPath]);
+    await h.waitRemount(r0);
+    o = await rawObj();
+    check(o.font === "fonts/arial-black.ttf", `导入字体：字体字段指向工程内 fonts/arial-black.ttf（${o.font}）`);
+    check(sizeOf(o)[0] > wBefore * 1.1, `页面装上导入的字体再量盒：Arial Black 更宽（${wBefore.toFixed(1)} → ${sizeOf(o)[0].toFixed(1)}）`);
+    check(await ev(`(() => { const s = document.querySelector('.ed-text [data-text="font"]'); return s.value === 'fonts/arial-black.ttf' && [...s.querySelectorAll('optgroup')].length === 2; })()`), "字体下拉：选中导入的字体，分「系统 / 工程」两组");
+    check(/fonts\/arial-black\.ttf/.test(await ev(`document.querySelector('#ed-con-body').textContent`)), "控制台记一条导入字体");
+  } else {
+    console.log("  （本机没有 Arial Black.ttf，跳过导入字体）");
+  }
+
+  await addTextPreset("clock");
+  const names = await h.treeNames();
+  check(names.length === 2 && /时钟|Clock/.test(names[1]) && (await h.selectedName()) === names[1], `添加时钟层：第二层「${names[1]}」并选中`);
+  check(await ev(`document.querySelector('.ed-text [data-text="content"]').readOnly && !!document.querySelector('.ed-script[data-target="text"]')`), "时钟内容只读，脚本分组里有 text 脚本");
+  await settle();
+  const clockInk = await inkIn(...worldBox(crY, [960, 540], [300, 70]));
+  check(clockInk.frac > 0.05, `时钟在画面中心画出时间（墨水占比 ${clockInk.frac.toFixed(3)}）`);
+  check(await ev(`(() => { const L = document.querySelector('#ed-con-body').textContent; return !/脚本.*错误|script.*error/i.test(L); })()`), "时钟脚本运行无错误");
+
+  let r1 = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(r1);
+  check((await h.treeNames()).length === 1, "撤销添加时钟：回到一层");
+  r1 = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(r1);
+  check((await h.treeNames()).length === 2, "重做：时钟回来");
+
+  const libBeforeY = new Set(fs.readdirSync(lib));
+  const scY = await h.savedCount();
+  await clickSel("#tb-save");
+  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
+  await clickSel("#save-lib");
+  await h.waitSaved(scY);
+  const savedY = fs.readdirSync(lib).filter((n) => !libBeforeY.has(n));
+  check(savedY.length === 1, `另存到壁纸库：新条目 ${savedY[0]}`);
+  const dirY = path.join(lib, savedY[0]);
+  const sceneY = JSON.parse(fs.readFileSync(path.join(dirY, "scene.json"), "utf8"));
+  const [tPlain, tClock] = sceneY.objects;
+  const plainColor = String(tPlain.color).trim().split(/\s+/).map(Number);
+  check(sceneY.objects.length === 2 && tPlain.text === "MMM" && tPlain.pointsize === 60 && close(plainColor, [1, 0, 0], 1e-3), `盘上 scene.json：文字层内容 / 字号 / 颜色（${JSON.stringify({ text: tPlain.text, pointsize: tPlain.pointsize, color: tPlain.color })}）`);
+  check(typeof tClock.text === "object" && /getHours/.test(tClock.text.script) && tClock.text.scriptproperties?.use24h === true, "盘上时钟层：{ script, scriptproperties, value } 原样");
+  if (fs.existsSync(fontPath)) {
+    check(fs.existsSync(path.join(dirY, "fonts/arial-black.ttf")) && Buffer.compare(fs.readFileSync(path.join(dirY, "fonts/arial-black.ttf")), fs.readFileSync(fontPath)) === 0, "盘上字体文件逐字节原样");
+  }
+  const errsY = await h.errorLines();
+  check(errsY.length === 0, `文字层编辑全程无错误${errsY.length ? `：${errsY.slice(0, 2).join(" / ")}` : ""}`);
+
+  await gotoEditor(`?item=${savedY[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
+  await waitFor(firstFrame, 90000);
+  await new Promise((r) => setTimeout(r, 800));
+  const crY2 = await h.canvasRect();
+  const edPlain = await inkIn(...worldBox(crY2, [960, 800], [boxW * 1.4, 110]));
+  check(edPlain.frac > 0.12 && edPlain.color[0] > 200 && edPlain.color[1] < 60, `编辑器重新打开：红字在原位（${edPlain.frac.toFixed(3)} / ${edPlain.color}）`);
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedY[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpY = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const benchY = { x: 0, y: 0, w: vpY.w, h: vpY.h };
+  const bPlain = await inkIn(...worldBox(benchY, [960, 800], [boxW * 1.4, 110]));
+  const bClock = await inkIn(...worldBox(benchY, [960, 540], [300, 70]));
+  check(Math.abs(bPlain.frac - edPlain.frac) < 0.04 && close(bPlain.color, edPlain.color, 25), `★ 测试台文字出帧与编辑器一致（墨水 ${bPlain.frac.toFixed(3)} vs ${edPlain.frac.toFixed(3)}，色 ${bPlain.color} vs ${edPlain.color}）`);
+  check(bClock.frac > 0.05, `★ 测试台时钟层画出时间（墨水占比 ${bClock.frac.toFixed(3)}）`);
+  await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/text-in-bench.jpg") });
+  console.log(`  截图：scripts/.tmp-editor-e2e/text-in-bench.jpg`);
 }

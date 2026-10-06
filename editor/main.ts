@@ -10,6 +10,7 @@
  */
 
 import {
+  SYSTEM_FONT_FAMILIES,
   checkSceneScript,
   editorOf,
   mount,
@@ -56,6 +57,28 @@ import {
   type EffectView,
 } from "./effects";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
+import {
+  FONT_FILE_RE,
+  H_ALIGNS,
+  SYSTEM_FONTS,
+  V_ALIGNS,
+  addTextLayer,
+  fontLabel,
+  fontPathOf,
+  getTextFields,
+  isBoundText,
+  isFontFile,
+  isScriptedText,
+  isSystemFont,
+  referencedFonts,
+  refitTextBox,
+  setTextField,
+  setTextValue,
+  textValue,
+  type TextField,
+  type TextFields,
+  type TextPreset,
+} from "./text";
 import {
   PROP_TYPES,
   bindProp,
@@ -366,7 +389,8 @@ $<HTMLButtonElement>("#scripts-allow").onclick = () => {
 };
 
 /** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 */
-const referencedGroups = (d: EditorDoc | null) => new Set([...referencedModels(d), ...referencedEffects(d)]);
+const referencedGroups = (d: EditorDoc | null) =>
+  new Set([...referencedModels(d), ...referencedEffects(d), ...referencedFonts(d)]);
 
 type OpenOptions = {
   origin?: DraftOrigin | null;
@@ -1483,6 +1507,28 @@ lyAddEl.onclick = () => {
   imagePickFor = "layer";
   inImageEl.click();
 };
+const lyAddTextEl = $<HTMLButtonElement>("#ly-add-text");
+const textMenuEl = $<HTMLElement>("#text-menu");
+lyAddTextEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!textMenuEl.hidden) {
+    textMenuEl.hidden = true;
+    return;
+  }
+  const r = lyAddTextEl.getBoundingClientRect();
+  textMenuEl.style.left = `${r.left}px`;
+  textMenuEl.style.top = `${r.bottom + 2}px`;
+  textMenuEl.hidden = false;
+};
+document.addEventListener("click", (e) => {
+  if (!textMenuEl.hidden && !textMenuEl.contains(e.target as Node)) textMenuEl.hidden = true;
+});
+for (const b of textMenuEl.querySelectorAll<HTMLButtonElement>("button[data-preset]")) {
+  b.onclick = () => {
+    textMenuEl.hidden = true;
+    addText(b.dataset.preset as TextPreset);
+  };
+}
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -1492,6 +1538,7 @@ function syncLayerTools() {
   const off = !selectedNode() || !current?.assets || doc?.type !== "scene";
   for (const b of [lyUpEl, lyDownEl, lyDupEl, lyDelEl]) b.disabled = off;
   lyAddEl.disabled = !overlay || doc?.type !== "scene";
+  lyAddTextEl.disabled = lyAddEl.disabled;
 }
 
 function renderTree() {
@@ -1895,6 +1942,224 @@ function effectsGroup(node: LayerNode): HTMLElement {
     if (add.value) addEffectTo(node, add.value);
   });
   group.appendChild(add);
+  return group;
+}
+
+// ---------- 文字层：新建（普通 / 时钟 / 日期）、内容 / 字体 / 字号 / 对齐 / 背景，全走结构编辑 ----------
+
+/** 页面量字用的 FontFace（与引擎各自注册，族名互不相干）；键 = 路径 + 字节指纹 */
+const pageFonts = new Map<string, Promise<string | null>>();
+/** 工程字体路径 → 已就绪的族名（量字同步读） */
+const pageFontFamily = new Map<string, string>();
+const measureCtx = document.createElement("canvas").getContext("2d")!;
+
+function bytesKey(b: Uint8Array): string {
+  let h = 0x811c9dc5;
+  const step = Math.max(1, b.length >> 10);
+  for (let i = 0; i < b.length; i += step) h = Math.imul(h ^ b[i], 0x01000193);
+  return `${b.length}:${(h >>> 0).toString(36)}`;
+}
+
+/** 工程字体装进页面（量盒用）；读不到 / 坏字体时量字回落 sans-serif */
+async function ensurePageFont(path: string): Promise<void> {
+  if (!path || isSystemFont(path) || !overlay) return;
+  const bytes = await overlay.read(path).catch(() => null);
+  if (!bytes) return;
+  const key = `${path}|${bytesKey(bytes)}`;
+  let p = pageFonts.get(key);
+  if (!p) {
+    p = (async () => {
+      const fam = `wwgl-ed-font-${pageFonts.size}`;
+      try {
+        const ff = new FontFace(fam, bytes.slice().buffer);
+        await ff.load();
+        document.fonts.add(ff);
+        return fam;
+      } catch (e) {
+        log(et("log.fontFailed", { name: path, msg: (e as Error).message }), "warn");
+        return null;
+      }
+    })();
+    pageFonts.set(key, p);
+  }
+  const fam = await p;
+  if (fam) pageFontFamily.set(path, fam);
+  else pageFontFamily.delete(path);
+}
+
+function measureText(text: string, font: string, px: number): number {
+  const sys = SYSTEM_FONT_FAMILIES[font.toLowerCase()];
+  const fam = sys ?? (pageFontFamily.has(font) ? `"${pageFontFamily.get(font)}"` : "");
+  measureCtx.font = `${px}px ${fam ? `${fam}, ` : ""}sans-serif`;
+  return measureCtx.measureText(text).width;
+}
+
+function addText(preset: TextPreset) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const name = et(`text.${preset}`);
+  structEdit(et("log.textAdded", { name }), (d) => addTextLayer(d, preset, name, et("text.defaultValue"), measureText) ?? undefined);
+}
+
+/** 文字字段的一次可撤销编辑：先装好要量的字体，改完按内容回填盒子 */
+async function textEdit(node: LayerNode, field: string, fonts: string[], mutate: (o: LayerNode["obj"]) => boolean) {
+  const target = doc;
+  await Promise.all(fonts.map(ensurePageFont));
+  if (doc !== target) return;
+  objEdit(et("log.textEdited", { layer: nodeName(node.id), field: et(field) }), node.id, (o) => {
+    if (!mutate(o)) return false;
+    refitTextBox(o, measureText);
+    return true;
+  });
+}
+
+/** 字体下拉里列出的工程字体：文档引用的 + 来源 / 叠加层里的 fonts/*.ttf|otf */
+function projectFonts(cur: string): string[] {
+  const out = new Set(referencedFonts(doc));
+  for (const n of overlay?.list() ?? []) if (FONT_FILE_RE.test(n)) out.add(n);
+  for (const f of overlay?.added() ?? []) if (FONT_FILE_RE.test(f.name)) out.add(f.name);
+  if (cur && !isSystemFont(cur)) out.add(cur);
+  return [...out].sort();
+}
+
+const inFontEl = $<HTMLInputElement>("#in-font");
+let fontPickFor: number | string | null = null;
+inFontEl.onchange = async () => {
+  const file = inFontEl.files?.[0];
+  inFontEl.value = "";
+  const id = fontPickFor;
+  fontPickFor = null;
+  const node = doc && id !== null ? findNode(doc.roots, id) : null;
+  if (!file || !node || !overlay || !isFontFile(file)) return;
+  const listed = new Set(overlay.list());
+  const path = fontPathOf(file.name, (p) => overlay!.has(p) || listed.has(p));
+  if (!path) return;
+  overlay.put(path, new Uint8Array(await file.arrayBuffer()), path);
+  log(et("log.fontImported", { path }));
+  await textEdit(node, "tx.font", [path], (o) => setTextField(o, "font", path));
+};
+
+function textGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-text";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.text");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!overlay && !isLocked(node.id);
+  const o = node.obj;
+  const f = getTextFields(o);
+  const scripted = isScriptedText(o);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    el.dataset.text = key.slice(3);
+    if ("disabled" in el) (el as HTMLInputElement).disabled = !editable;
+    form.append(l, el);
+  };
+  const setField = <K extends TextField>(field: K, key: string, v: TextFields[K], fonts: string[] = [f.font]) =>
+    void textEdit(node, key, fonts, (ob) => setTextField(ob, field, v));
+
+  const content = document.createElement("textarea");
+  content.className = "ed-text-content";
+  content.value = textValue(o);
+  content.rows = Math.min(8, Math.max(2, content.value.split("\n").length));
+  content.readOnly = scripted;
+  content.addEventListener("change", () => void textEdit(node, "tx.content", [f.font], (ob) => setTextValue(ob, content.value)));
+  row("tx.content", content);
+
+  const font = document.createElement("select");
+  const optGroup = (label: string, fonts: readonly string[]) => {
+    const g = document.createElement("optgroup");
+    g.label = label;
+    for (const v of fonts) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = fontLabel(v);
+      opt.title = v;
+      g.appendChild(opt);
+    }
+    font.appendChild(g);
+  };
+  optGroup(et("tx.fontsSystem"), SYSTEM_FONTS.includes(f.font) || !isSystemFont(f.font) ? SYSTEM_FONTS : [...SYSTEM_FONTS, f.font]);
+  const proj = projectFonts(f.font);
+  if (proj.length) optGroup(et("tx.fontsProject"), proj);
+  const imp = document.createElement("option");
+  imp.value = "";
+  imp.textContent = et("tx.importFont");
+  font.appendChild(imp);
+  font.value = f.font;
+  font.addEventListener("change", () => {
+    if (!font.value) {
+      font.value = f.font;
+      fontPickFor = node.id;
+      inFontEl.click();
+      return;
+    }
+    setField("font", "tx.font", font.value, [font.value]);
+  });
+  row("tx.font", font);
+
+  const size = document.createElement("input");
+  size.type = "number";
+  size.min = "1";
+  size.max = "1000";
+  size.step = "1";
+  size.value = fmtNum(f.pointsize);
+  size.addEventListener("change", () => setField("pointsize", "tx.size", Number(size.value)));
+  row("tx.size", size);
+
+  const alignSel = (values: readonly string[], cur: string, field: "horizontalalign" | "verticalalign", key: string) => {
+    const sel = document.createElement("select");
+    for (const v of values) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = et(`tx.align.${v}`);
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+    sel.addEventListener("change", () => setField(field, key, sel.value));
+    row(key, sel);
+  };
+  alignSel(H_ALIGNS, f.horizontalalign, "horizontalalign", "tx.halign");
+  alignSel(V_ALIGNS, f.verticalalign, "verticalalign", "tx.valign");
+
+  const pad = document.createElement("input");
+  pad.type = "number";
+  pad.min = "0";
+  pad.step = "1";
+  pad.value = fmtNum(f.padding);
+  pad.addEventListener("change", () => setField("padding", "tx.padding", Number(pad.value)));
+  row("tx.padding", pad);
+
+  const bgBox = document.createElement("div");
+  bgBox.className = "ed-fx-param";
+  const bgOn = document.createElement("input");
+  bgOn.type = "checkbox";
+  bgOn.checked = f.opaquebackground;
+  bgOn.disabled = !editable;
+  bgOn.dataset.text = "bgOn";
+  bgOn.addEventListener("change", () => setField("opaquebackground", "tx.bg", bgOn.checked));
+  const bgColor = document.createElement("input");
+  bgColor.type = "color";
+  bgColor.value = toHex(f.backgroundcolor);
+  bgColor.disabled = !editable;
+  bgColor.dataset.text = "bgColor";
+  bgColor.addEventListener("change", () => setField("backgroundcolor", "tx.bg", fromHex(bgColor.value)));
+  bgBox.append(bgOn, bgColor);
+  row("tx.bg", bgBox);
+
+  group.appendChild(form);
+  if (scripted) group.appendChild(note(et("tx.scripted")));
+  else if (isBoundText(o)) {
+    const u = (o.text as { user?: unknown }).user;
+    const name = u && typeof u === "object" ? (u as { name?: unknown }).name : u;
+    group.appendChild(note(et("tx.bound", { name: String(name ?? "") })));
+  }
   return group;
 }
 
@@ -2311,6 +2576,7 @@ function renderInspector() {
     return;
   }
   inspectorEl.appendChild(editGroup(node));
+  if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
   inspectorEl.appendChild(bindingsGroup(node));
   inspectorEl.appendChild(scriptsGroup(node));

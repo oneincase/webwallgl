@@ -25,6 +25,28 @@ export const SKIP_SCENE_EFFECTS = false;
 // 全局改 k=1.5 / 顶边锚会伤其它已校准壁纸，禁止再全局动这两处。
 export const TEXT_EM_SCALE = 4;
 
+// WE 的 systemfont_* 内置字体 → 本机系统字体栈（WE 桌面端映射 Windows 系统字体，
+// macOS/Linux 上按近似度回退；都带 sans-serif 兜底，不命中也只是字形差异）。
+export const SYSTEM_FONT_FAMILIES: Record<string, string> = {
+  systemfont_segoe: "'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+  systemfont_arial: "Arial, 'Helvetica Neue', sans-serif",
+  systemfont_verdana: "Verdana, Geneva, sans-serif",
+  systemfont_tahoma: "Tahoma, Geneva, sans-serif",
+  systemfont_timesnewroman: "'Times New Roman', Times, serif",
+  systemfont_georgia: "Georgia, 'Times New Roman', serif",
+  systemfont_couriernew: "'Courier New', Courier, monospace",
+  systemfont_trebuchetms: "'Trebuchet MS', 'Helvetica Neue', sans-serif",
+  systemfont_impact: "Impact, 'Arial Black', sans-serif",
+  systemfont_comicsansms: "'Comic Sans MS', 'Comic Sans', cursive",
+  systemfont_sylfaen: "Palatino, 'Times New Roman', serif",
+  systemfont_calibri: "Calibri, Carlito, 'Helvetica Neue', sans-serif",
+  systemfont_cambria: "Cambria, Georgia, serif",
+  systemfont_consolas: "Consolas, 'Courier New', monospace",
+  systemfont_microsoftyahei: "'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif",
+  systemfont_simsun: "SimSun, 'Songti SC', serif",
+  systemfont_simhei: "SimHei, 'Heiti SC', sans-serif",
+};
+
 export type WallpaperFit = "cover" | "contain" | "stretch" | "fill" | "fit";
 
 export type WallpaperConfig = {

@@ -8,6 +8,7 @@ export * from "./index";
 export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
 export { buildScenePkg } from "../editor/pkg-export";
+export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 export type {
   ScenePkgFile,
   ScenePkgResult,
