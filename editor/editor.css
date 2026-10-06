@@ -988,6 +988,20 @@ input.ed-al-name {
   gap: 4px;
 }
 
+.ed-clips .ed-fx-params select,
+.ed-clips .ed-fx-params input[type="number"],
+.ed-clips .ed-fx-params textarea {
+  width: 100%;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.ed-clips .ed-fx-params textarea {
+  padding: 2px 4px;
+  resize: vertical;
+  font: 11px / 1.45 var(--mono);
+}
+
 .ed-bn-vec input {
   flex: 1;
   width: 0;

@@ -180,6 +180,10 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
       await runBoneHeadless({ check, section, session, origin, fixtures, LIB });
       return;
     }
+    if (only === "mg2") {
+      await runClipHeadless({ check, section, session, origin, fixtures, LIB });
+      return;
+    }
     for (const id of fixtures) {
       const truth = modelTruth(LIB, id);
       await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
@@ -243,6 +247,7 @@ export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_
     await runPickHeadless({ check, section, session, origin, fixtures });
     await runRetexHeadless({ check, section, session, origin, fixtures });
     await runBoneHeadless({ check, section, session, origin, fixtures, LIB });
+    await runClipHeadless({ check, section, session, origin, fixtures, LIB });
   } finally {
     await session.close();
     await server.close();
@@ -1030,6 +1035,191 @@ async function runBoneHeadless({ check, section, session, origin, fixtures, LIB 
     );
   }
   check(tested >= 2 && exactN >= 1, `至少 2 张夹具做了骨骼编辑真引擎判据，含 1 个单层 blend 1（写回 ≡ 预览）（${tested} 张 / 单层 ${exactN}）`);
+}
+
+/**
+ * MG2（W18b）：片段编辑的真引擎判据。目标同 MF2（动画层无包装），只留它与祖先可见：
+ *   ① 复制正在播的片段（同帧数）并把动画层指过去 → 任意时刻 ≡ 原画面
+ *   ② 正在播的片段 fps ×2（单层时）→ t 时刻 ≡ 原画面 2t
+ *   ③ 新建静止姿势片段并把动画层指过去（单层非 additive、播的是首片段时）→ 任意时刻 ≡ 原画面 0 时刻
+ *   ④ 删掉末个片段后 getModelInfo 片段数 −1；写帧事件后 getModelInfo 读回；全部改动打包重挂 ≡ 松散形态
+ */
+async function runClipHeadless({ check, section, session, origin, fixtures, LIB }) {
+  section("MG2. 动画片段编辑（真浏览器）：复制 ≡ 原片段、fps×2@t ≡ 原@2t、静止片段 ≡ 0 时刻、删 / 事件读回、打包一致");
+  let tested = 0;
+  let single = 0;
+  let fpsLive = 0;
+  let restLive = 0;
+  for (const id of fixtures) {
+    const targets = hotAnimTargets(modelTruth(LIB, id)?.scene).slice(0, 4);
+    if (!targets.length) continue;
+    await session.pageCdp.send("Page.navigate", { url: `${origin}/renderer/index.html?type=canvas` });
+    await session.waitFor("!!window.__wp", { timeoutMs: 60000 });
+    let r;
+    try {
+      r = await session.evaluate(`(async () => {
+        window.__wp.pause();
+        const api = await import('/renderer/src/api/editor.ts');
+        const C = await import('/renderer/vendor/we-scene/pkg/container.js');
+        const M = await import('/editor/model.ts');
+        const base = api.httpSource('${origin}/media/dev/${id}');
+        const pkg = C.parsePkg(new Uint8Array(await base.scenePkg()));
+        const sceneText = new TextDecoder().decode(C.getEntry(pkg, 'scene.json')).replace(/^\\uFEFF/, '');
+        const extra = new Map();
+        let sceneBytes = new TextEncoder().encode(sceneText);
+        const read = async (n) => (n === 'scene.json' ? sceneBytes : extra.get(n) ?? C.getEntry(pkg, n) ?? null);
+        const host = document.createElement('div');
+        host.style.cssText = 'position:fixed;left:0;top:0;width:960px;height:540px;z-index:9';
+        document.body.appendChild(host);
+        let inst = null, ed = null;
+        const mountWith = async (source) => {
+          if (inst) inst.destroy();
+          host.textContent = '';
+          inst = await api.mount(host, { source, fit: 'cover', renderDpr: 1, volume: 0, autoplay: false });
+          ed = api.editorOf(inst);
+          inst.pause();
+          const gen = window.__scene?.general;
+          if (gen) gen.bloom = false;
+        };
+        const loose = () => ({ scenePkg: () => base.scenePkg(), sceneDir: async () => ({ entry: 'scene.json', read }), project: base.project ? (s) => base.project(s) : undefined });
+        const grab = async () => {
+          const bm = await createImageBitmap(await ed.capture());
+          const cv = new OffscreenCanvas(bm.width, bm.height);
+          const g = cv.getContext('2d');
+          g.drawImage(bm, 0, 0);
+          return { w: bm.width, h: bm.height, d: g.getImageData(0, 0, bm.width, bm.height).data };
+        };
+        const df = (P, Q, i) => Math.abs(P.d[i] - Q.d[i]) + Math.abs(P.d[i + 1] - Q.d[i + 1]) + Math.abs(P.d[i + 2] - Q.d[i + 2]);
+        const diffN = (P, Q) => { let n = 0; for (let k = 0; k < P.w * P.h; k++) if (df(P, Q, k * 4) > 24) n++; return n; };
+        const at = async (t) => { await ed.seek(t); return grab(); };
+        const targets = ${JSON.stringify(targets)};
+        const scene = JSON.parse(sceneText);
+        // 每次都从原 .mdl / 原场景出发改一步，挂上后按目标链隔离出帧
+        const setup = async (tg, mutateMdl, mutateLayers) => {
+          const obj = scene.objects.find((o) => o.id === tg.id);
+          const keep = { image: obj.image, model: obj.model, layers: structuredClone(obj.animationlayers) };
+          extra.clear();
+          let files = null;
+          if (mutateMdl) {
+            const puppet = !!obj.image && !obj.model;
+            const mj = puppet ? M.parseJsonBytes(await read(obj.image)) : null;
+            const bytes = await read(puppet ? String(mj.puppet) : obj.model);
+            const out = mutateMdl(bytes);
+            files = out && M.mdlCopyFiles(mj, out, 'cl');
+            if (!files) return null;
+            for (const f of files.files) extra.set(f.name, f.data);
+            if (puppet) obj.image = files.path; else obj.model = files.path;
+          }
+          if (mutateLayers) mutateLayers(obj.animationlayers);
+          sceneBytes = new TextEncoder().encode(JSON.stringify(scene));
+          obj.image = keep.image; obj.model = keep.model; obj.animationlayers = keep.layers;
+          await mountWith(loose());
+          for (const l of ed.getLayers()) if (!tg.chain.includes(l.id)) await ed.setLayerProps(l.id, { visible: false });
+          for (const l of window.__scene.layers) if (tg.chain.includes(l.id)) for (const e of l.effects || []) e.visible = false;
+          return true;
+        };
+        for (const tg of targets) {
+          if (!(await setup(tg))) continue;
+          const info = ed.getModelInfo(tg.id);
+          if (!info || !info.animations.length) continue;
+          // 页面里第一次挂载与之后的挂载出帧有差（首挂的资源 / 时钟状态），参照帧从第二次挂载起取
+          await at(0.9);
+          await setup(tg);
+          const still = 0;
+          const vis = tg.layers.map((a, i) => ({ a, i })).filter((x) => x.a.visible !== false);
+          const L = vis[0];
+          const clip = L && info.animations.find((c) => c.id === L.a.animation);
+          if (!clip) continue;
+          const singleLayer = vis.length === 1 && (L.a.blend ?? 1) === 1;
+          const T = 0.9;
+          const O = await at(T), O2 = await at(2 * T), O0 = await at(0);
+          const T2 = await at(T * 1.7);
+          if (diffN(O, T2) < 200) continue;
+          // 同一工程原样重挂的底噪（有自身时钟的动画层 seek 不是绝对的，跨挂载可能差一点）
+          await setup(tg);
+          const noise = diffN(O, await at(T)) + diffN(O2, await at(2 * T));
+          const out = { mid: tg.id, name: tg.name, form: info.form, clip: clip.name, clipId: clip.id, isFirst: clip.id === info.animations[0].id, additive: !!L.a.additive, singleLayer, nClips: info.animations.length, moving: diffN(O, T2), still, noise };
+          // ① 复制并指过去
+          let newId = null;
+          if (!(await setup(tg, (b) => { const r = api.addMdlClip(b, { name: 'copy', mode: clip.mode, fps: clip.fps, frameCount: clip.frameCount }, 'copy', clip.id); newId = r?.id ?? null; return r?.bytes ?? null; }, (ls) => { ls[L.i].animation = newId; }))) return { fail: 'copy null', ...out };
+          out.copyN = ed.getModelInfo(tg.id)?.animations.length;
+          out.copyDiff = diffN(O, await at(T)) + diffN(O2, await at(2 * T));
+          // ② fps ×2 ≡ 原工程该层 rate ×2（同一时刻比，其余时间源一致）
+          await setup(tg);
+          await ed.setAnimationLayers(tg.id, tg.layers.map((a, i) => (i === L.i ? { ...a, rate: (typeof a.rate === 'number' ? a.rate : 1) * 2 } : a)));
+          const R2 = await at(T);
+          await setup(tg, (b) => api.setMdlClipMeta(b, clip.id, { fps: clip.fps * 2 }));
+          out.fpsInfo = ed.getModelInfo(tg.id)?.animations.find((c) => c.id === clip.id)?.fps;
+          out.fpsWant = clip.fps * 2;
+          out.fpsDiff = diffN(R2, await at(T));
+          out.fpsMoved = diffN(O, R2);
+          // ③ 静止姿势片段（每帧 = 首片段第 0 帧 = 引擎绑定参考）≡ 原工程该层 blend 0
+          if (out.isFirst) {
+            await setup(tg);
+            await ed.setAnimationLayers(tg.id, tg.layers.map((a, i) => (i === L.i ? { ...a, blend: 0 } : a)));
+            const B0 = await at(T);
+            await setup(tg, (b) => { const r = api.addMdlClip(b, { name: 'rest', mode: 'loop', fps: clip.fps, frameCount: 10 }, 'rest'); newId = r?.id ?? null; return r?.bytes ?? null; }, (ls) => { ls[L.i].animation = newId; });
+            out.restDiff = diffN(B0, await at(T));
+            out.restMoved = diffN(O, B0);
+          }
+          // ④ 删末个片段 / 写事件 / 打包
+          const last = info.animations.at(-1);
+          if (info.animations.length > 1) {
+            await setup(tg, (b) => api.removeMdlClip(b, last.id), (ls) => { for (let i = ls.length - 1; i >= 0; i--) if (ls[i].animation === last.id) ls.splice(i, 1); });
+            out.removedN = ed.getModelInfo(tg.id)?.animations.length;
+          }
+          await setup(tg, (b) => api.setMdlClipEvents(b, clip.id, [{ frame: 1, name: 'hit' }, { frame: 0, name: 'start' }]));
+          out.events = ed.getModelInfo(tg.id)?.animations.find((c) => c.id === clip.id)?.events;
+          out.eventsDiff = diffN(O, await at(T));
+          const E = await at(T);
+          const files = [];
+          for (const e of pkg.entries ?? []) if (e.name !== 'scene.json' && !extra.has(e.name)) files.push({ path: e.name, data: C.getEntry(pkg, e.name) });
+          files.push({ path: 'scene.json', data: sceneBytes });
+          for (const [n, d] of extra) files.push({ path: n, data: d });
+          await mountWith(api.bytesSource(api.buildScenePkg(files).pkg, base.project ? await base.project() : undefined));
+          for (const l of ed.getLayers()) if (!tg.chain.includes(l.id)) await ed.setLayerProps(l.id, { visible: false });
+          for (const l of window.__scene.layers) if (tg.chain.includes(l.id)) for (const e of l.effects || []) e.visible = false;
+          out.pkgDiff = diffN(E, await at(T));
+          out.pkgEvents = ed.getModelInfo(tg.id)?.animations.find((c) => c.id === clip.id)?.events;
+          inst.destroy();
+          return out;
+        }
+        if (inst) inst.destroy();
+        return { skip: 'no animated target' };
+      })()`, { awaitPromise: true, timeoutMs: 600000 });
+    } catch (e) {
+      check(false, `${id}: 片段编辑判据执行失败 ${String(e.message).slice(0, 200)}`);
+      continue;
+    }
+    if (r.skip) {
+      console.log(`  · ${id}: ${r.skip}，跳过`);
+      continue;
+    }
+    if (r.fail) {
+      check(false, `${id} #${r.mid}：${r.fail}`);
+      continue;
+    }
+    if (process.env.VEM_DEBUG) console.log(JSON.stringify(r));
+    tested++;
+    if (r.singleLayer) single++;
+    if (r.fpsMoved > 30) fpsLive++;
+    if (r.restMoved > 30) restLive++;
+    const evWant = JSON.stringify([{ frame: 0, name: "start" }, { frame: 1, name: "hit" }]);
+    const tol = 30 + r.noise;
+    check(
+      r.copyN === r.nClips + 1 && r.copyDiff <= tol && Math.abs(r.fpsInfo - r.fpsWant) < 1e-3 && r.fpsDiff <= tol && (r.restDiff === undefined || r.restDiff <= tol),
+      `${id} #${r.mid} ${r.name}（${r.form}，片段「${r.clip}」${r.singleLayer ? "单层" : "多层"}${r.additive ? " additive" : ""}）：复制并改指向 ≡ 原画面（差 ${r.copyDiff} px，片段 ${r.nClips}→${r.copyN}）` +
+        `；fps×2（引擎读到 ${r.fpsInfo}）≡ 该层 rate×2（差 ${r.fpsDiff} px，对原画面变 ${r.fpsMoved}）` +
+        (r.restDiff !== undefined ? `；静止片段 ≡ 该层 blend 0（差 ${r.restDiff} px，对原画面变 ${r.restMoved}）` : "") +
+        `（原样重挂底噪 ${r.noise}）`,
+    );
+    check(
+      (r.removedN === undefined || r.removedN === r.nClips - 1) && JSON.stringify(r.events) === evWant && JSON.stringify(r.pkgEvents) === evWant && r.eventsDiff <= 30 + r.noise && r.pkgDiff <= 30,
+      `${id}: 删末个片段后片段数 ${r.removedN ?? "（只有 1 个，未测）"}；帧事件读回 ${JSON.stringify(r.events)}、画面不变（差 ${r.eventsDiff}）；打包重挂差 ${r.pkgDiff} px、事件 ${JSON.stringify(r.pkgEvents) === evWant ? "一致" : JSON.stringify(r.pkgEvents)}`,
+    );
+  }
+  check(tested >= 2 && fpsLive >= 1 && restLive >= 1,
+    `至少 2 张夹具做了片段编辑真引擎判据，且 fps×2 / 静止片段至少各有 1 张画面确实变了（判据不空转）（${tested} 张 / 单层 ${single} / fps 有效 ${fpsLive} / 静止有效 ${restLive}）`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

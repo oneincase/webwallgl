@@ -20,7 +20,14 @@ import {
   type EditorLayerProps,
   type Fit,
   type MdlBoneDelta,
+  type MdlClipInit,
   type SceneInstance,
+  CLIP_MODES,
+  addMdlClip,
+  applyBoneDelta,
+  removeMdlClip,
+  setMdlClipEvents,
+  setMdlClipMeta,
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
 import { applyPlatformClasses } from "../shared/workbench/platform";
@@ -226,10 +233,14 @@ import {
   type AnimLayerView,
   BONE_RADII,
   boneDepths,
-  boneEditFiles,
   clipFrameAt,
   defaultClipId,
+  dropAnimLayersOfClip,
+  formatEventsText,
   isZeroDelta,
+  mdlCopyFiles,
+  nextClipName,
+  parseEventsText,
   type BoneEdit,
 } from "./model";
 import {
@@ -3350,43 +3361,205 @@ function boneGroup(node: LayerNode): HTMLElement | null {
   return group;
 }
 
-async function applyBoneEdit(layerId: number | string, e: BoneEdit, boneName: string, clipName: string) {
+/**
+ * 改模型 .mdl 的一次可撤销编辑（W18）：读对象当前的 .mdl → edit → 写时复制（puppet 连 model json 一起）→
+ * 结构编辑改指向（重挂）。mutate 在同一步里顺带改对象（删片段时删掉指向它的动画层）。fail = 文案前缀（bn / cl）
+ */
+async function commitMdlEdit(
+  layerId: number | string,
+  label: string,
+  slugTag: string,
+  fail: "bn" | "cl",
+  edit: (bytes: Uint8Array) => Uint8Array | null,
+  mutate?: (o: LayerNode["obj"]) => void,
+): Promise<boolean> {
   const d = doc;
   const node = d && findNode(d.roots, layerId);
   const assets = overlay;
-  if (!d || !node || !assets || !node.modelForm) return;
+  if (!d || !node || !assets || !node.modelForm) return false;
   const o = node.obj;
-  const fail = (key: string, path: string) => void log(et(key, { path }), "warn");
+  const warn = (key: string, path: string) => (log(et(`${fail}.${key}`, { path }), "warn"), false);
   let modelJson: Record<string, unknown> | null = null;
   let from: string;
   let mdlPath: string;
   if (node.modelForm === "puppet") {
     from = String(o.image);
     modelJson = parseJsonBytes(await assets.read(from));
-    if (!modelJson || typeof modelJson.puppet !== "string") return fail("bn.fail.read", from);
+    if (!modelJson || typeof modelJson.puppet !== "string") return warn("fail.read", from);
     mdlPath = modelJson.puppet;
   } else {
     from = mdlPath = String(o.model);
   }
   const bytes = await assets.read(mdlPath);
-  if (!bytes) return fail("bn.fail.read", mdlPath);
+  if (!bytes) return warn("fail.read", mdlPath);
+  const out = edit(bytes);
   const listed = new Set(assets.list());
-  const slug = imageSlug(`${String(o.name || "model").replace(/\./g, "-")}-pose`, (s) => [modelPathOf(s), editorMdlOf(s)].some((p) => assets.has(p) || listed.has(p)));
-  const r = boneEditFiles(modelJson, bytes, slug, e);
-  if (!r) return fail("bn.fail.mdl", mdlPath);
-  if (d !== doc) return;
+  const slug = imageSlug(`${String(o.name || "model").replace(/\./g, "-")}-${slugTag}`, (s) => [modelPathOf(s), editorMdlOf(s)].some((p) => assets.has(p) || listed.has(p)));
+  const r = out && mdlCopyFiles(modelJson, out, slug);
+  if (!r) return warn("fail.mdl", mdlPath);
+  if (d !== doc) return false;
   for (const f of r.files) assets.put(f.name, f.data, r.path);
   assets.share(from, r.path);
   const puppetMdl = modelJson ? editorMdlOf(slug) : null;
   if (puppetMdl) d.puppets = new Map([...(d.puppets ?? []), [r.path, puppetMdl]]);
-  if (bonePick && same(bonePick.layer, layerId)) bonePick = { ...bonePick, frame: e.frame, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
-  structEdit(et("log.boneEdited", { layer: nodeName(layerId), bone: boneName, clip: clipName, frame: e.frame }), (dd) => {
+  structEdit(label, (dd) => {
     const n = findNode(dd.roots, layerId);
     if (!n) return undefined;
     if (puppetMdl) n.obj.image = r.path;
     else n.obj.model = r.path;
+    mutate?.(n.obj);
     return n.id;
   });
+  return true;
+}
+
+function applyBoneEdit(layerId: number | string, e: BoneEdit, boneName: string, clipName: string) {
+  if (bonePick && same(bonePick.layer, layerId)) bonePick = { ...bonePick, frame: e.frame, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+  return commitMdlEdit(layerId, et("log.boneEdited", { layer: nodeName(layerId), bone: boneName, clip: clipName, frame: e.frame }), "pose", "bn", (bytes) =>
+    applyBoneDelta(bytes, e.animId, e.bone, e.frame, e.delta, e.radius),
+  );
+}
+
+/**
+ * 动画片段（W18b）：每个片段一项（名字 / 模式 / fps / 帧数 / 帧事件，复制 / 删除），底部「新建片段」（静止姿势）。
+ * 每次修改都是写时复制 .mdl + 结构编辑；删片段同一步删掉指向它的动画层
+ */
+function clipsGroup(node: LayerNode): HTMLElement | null {
+  const id = Number(node.id);
+  const info = editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+  if (!info || !info.animations.length) return null;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-fx ed-clips";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.clips");
+  group.appendChild(h);
+  group.appendChild(note(et("cl.note")));
+  const editable = !!overlay && !isLocked(node.id);
+  const clips = info.animations;
+  const layerName = nodeName(node.id);
+  const metaEdit = (c: (typeof clips)[number], field: string, meta: Partial<MdlClipInit>) =>
+    void commitMdlEdit(node.id, et("log.clipEdited", { layer: layerName, clip: c.name || `#${c.id}`, field: et(field) }), "clip", "cl", (b) =>
+      setMdlClipMeta(b, c.id, meta),
+    );
+  clips.forEach((c, ci) => {
+    const label = c.name || `#${c.id}`;
+    const item = document.createElement("div");
+    item.className = "ed-fx-item";
+    item.dataset.clipId = String(c.id);
+    const head = document.createElement("div");
+    head.className = "ed-fx-head";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.className = "ed-fx-name ed-cl-name";
+    name.value = c.name;
+    name.maxLength = 64;
+    name.disabled = !editable;
+    name.addEventListener("change", () => {
+      const v = name.value.trim();
+      if (!v || v === c.name) return void (name.value = c.name);
+      metaEdit(c, "cl.name", { name: v });
+    });
+    const icon = (cls: string, text: string, title: string, onClick: () => void, disabled = false) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `ed-icon ${cls}`;
+      b.textContent = text;
+      b.title = title;
+      b.disabled = !editable || disabled;
+      b.onclick = onClick;
+      return b;
+    };
+    head.append(
+      name,
+      icon("ed-cl-dup", "⧉", et("cl.dup"), () => {
+        const init = { name: nextClipName(clips, `${c.name || "clip"} copy`.slice(0, 64)), mode: c.mode, fps: c.fps, frameCount: c.frameCount };
+        void commitMdlEdit(node.id, et("log.clipAdded", { layer: layerName, clip: init.name }), "clip", "cl", (b) => addMdlClip(b, init, "copy", c.id)?.bytes ?? null);
+      }),
+      icon("ed-cl-del", "✕", ci === 0 ? et("cl.delFirst") : et("fx.del"), () => {
+        void commitMdlEdit(node.id, et("log.clipRemoved", { layer: layerName, clip: label }), "clip", "cl", (b) => removeMdlClip(b, c.id), (o) => {
+          dropAnimLayersOfClip(o, c.id);
+        });
+      }, ci === 0),
+    );
+    item.appendChild(head);
+    const form = document.createElement("div");
+    form.className = "ed-fx-params";
+    const row = (key: string, el: HTMLElement) => {
+      const l = document.createElement("label");
+      l.textContent = et(key);
+      const box = document.createElement("div");
+      box.className = "ed-fx-param";
+      box.appendChild(el);
+      form.append(l, box);
+    };
+    const mode = document.createElement("select");
+    mode.className = "ed-cl-mode";
+    for (const m of CLIP_MODES) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = et(`cl.mode.${m}`);
+      mode.appendChild(o);
+    }
+    if (!(CLIP_MODES as readonly string[]).includes(c.mode)) {
+      const o = document.createElement("option");
+      o.value = c.mode;
+      o.textContent = c.mode;
+      mode.appendChild(o);
+    }
+    mode.value = c.mode;
+    mode.disabled = !editable;
+    mode.addEventListener("change", () => metaEdit(c, "cl.mode", { mode: mode.value }));
+    row("cl.mode", mode);
+    const num = (cls: string, value: number, step: string, min: string, onChange: (v: number) => void) => {
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.className = cls;
+      inp.step = step;
+      inp.min = min;
+      inp.value = fmtNum(value);
+      inp.disabled = !editable;
+      inp.addEventListener("change", () => {
+        const v = Number(inp.value);
+        if (!Number.isFinite(v) || v === value) return void (inp.value = fmtNum(value));
+        onChange(v);
+      });
+      return inp;
+    };
+    row("cl.fps", num("ed-cl-fps", c.fps, "1", "1", (v) => metaEdit(c, "cl.fps", { fps: v })));
+    row("cl.frames", num("ed-cl-frames", c.frameCount, "1", "1", (v) => metaEdit(c, "cl.frames", { frameCount: Math.round(v) })));
+    const ev = document.createElement("textarea");
+    ev.className = "ed-cl-events";
+    ev.rows = Math.min(6, Math.max(2, c.events.length + 1));
+    ev.placeholder = et("cl.eventsHint");
+    ev.value = formatEventsText(c.events);
+    ev.disabled = !editable;
+    ev.addEventListener("change", () => {
+      const list = parseEventsText(ev.value);
+      if (!list) {
+        log(et("cl.fail.events"), "warn");
+        ev.value = formatEventsText(c.events);
+        return;
+      }
+      if (formatEventsText(list) === formatEventsText(c.events)) return;
+      void commitMdlEdit(node.id, et("log.clipEdited", { layer: layerName, clip: label, field: et("cl.events") }), "clip", "cl", (b) => setMdlClipEvents(b, c.id, list));
+    });
+    row("cl.events", ev);
+    item.appendChild(form);
+    group.appendChild(item);
+  });
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "ed-btn ed-cl-add";
+  add.textContent = et("cl.add");
+  add.disabled = !editable;
+  add.onclick = () => {
+    const c0 = clips[0];
+    const init = { name: nextClipName(clips, et("cl.defaultName")), mode: "loop", fps: c0.fps, frameCount: c0.frameCount };
+    void commitMdlEdit(node.id, et("log.clipAdded", { layer: layerName, clip: init.name }), "clip", "cl", (b) => addMdlClip(b, init, "rest", c0.id)?.bytes ?? null);
+  };
+  group.appendChild(add);
+  return group;
 }
 
 const flatNodes = (roots: LayerNode[]): LayerNode[] => roots.flatMap((n) => [n, ...flatNodes(n.children)]);
@@ -4903,6 +5076,8 @@ function renderInspector() {
   if (node.kind === "sound") inspectorEl.appendChild(soundGroup(node));
   if (node.modelForm) inspectorEl.appendChild(modelGroup(node));
   if (node.modelForm) inspectorEl.appendChild(animLayersGroup(node));
+  const cl = node.modelForm ? clipsGroup(node) : null;
+  if (cl) inspectorEl.appendChild(cl);
   const mt = node.modelForm ? modelTexGroup(node) : null;
   if (mt) inspectorEl.appendChild(mt);
   const bn = node.modelForm ? boneGroup(node) : null;

@@ -85,7 +85,7 @@ const sourceAlias = {
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
-        `export { mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
+        `export { mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights, CLIP_MODES, resampleTrack, addMdlClip, removeMdlClip, setMdlClipMeta, setMdlClipEvents } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
         `export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from ${json(path.join(ROOT, "renderer/src/types.ts"))};`,
       ].join("\n"),
       loader: "ts",
@@ -2988,9 +2988,10 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
   check(/const bn = node\.modelForm \? boneGroup\(node\) : null;/.test(mainSrc) && /function boneGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「骨骼」分组，骨骼 / 片段来自 getModelInfo");
   check(/\.setBonePose\(id, pick\.bone, dirty\(\) \? boneDeltaOf\(pick\) : null\)/.test(mainSrc) && /inp\.addEventListener\("input", \(\) => \{[\s\S]{0,160}preview\(\);/.test(mainSrc),
     "输入即推引擎预览（setBonePose，文档不动）");
-  check(/const r = boneEditFiles\(modelJson, bytes, slug, e\);[\s\S]{0,200}for \(const f of r\.files\) assets\.put\(f\.name, f\.data, r\.path\);\s*assets\.share\(from, r\.path\);/.test(mainSrc) &&
-    /if \(puppetMdl\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[r\.path, puppetMdl\]\]\);/.test(mainSrc) && /if \(puppetMdl\) n\.obj\.image = r\.path;\s*else n\.obj\.model = r\.path;/.test(mainSrc),
-    "应用：写时复制 + 继承旧副本文件 + puppet 登记 + 结构编辑改指向（可撤销、重挂）");
+  check(/const r = out && mdlCopyFiles\(modelJson, out, slug\);[\s\S]{0,200}for \(const f of r\.files\) assets\.put\(f\.name, f\.data, r\.path\);\s*assets\.share\(from, r\.path\);/.test(mainSrc) &&
+    /if \(puppetMdl\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[r\.path, puppetMdl\]\]\);/.test(mainSrc) && /if \(puppetMdl\) n\.obj\.image = r\.path;\s*else n\.obj\.model = r\.path;\s*mutate\?\.\(n\.obj\);/.test(mainSrc) &&
+    /function applyBoneEdit\([\s\S]{0,400}commitMdlEdit\([\s\S]{0,200}applyBoneDelta\(bytes, e\.animId, e\.bone, e\.frame, e\.delta, e\.radius\)/.test(mainSrc),
+    "应用：commitMdlEdit 写时复制 + 继承旧副本文件 + puppet 登记 + 结构编辑改指向（可撤销、重挂）");
   check(/function drawBoneMarkers\(\)[\s\S]{0,300}editor\.getBonePoints\(/.test(mainSrc) && /drawAttachMarkers\(\);\s*drawBoneMarkers\(\);/.test(mainSrc), "视口：骨骼关节 / 父子连线来自 getBonePoints");
   check(/if \(bn\) inspectorEl\.appendChild\(bn\);\s*else dropBonePick\(\);/.test(mainSrc) && /if \(!node\) \{\s*dropBonePick\(\);/.test(mainSrc), "离开模型层撤掉骨骼预览");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -2999,6 +3000,139 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
   check(missing.length === 0, `骨骼文案中英文都有（缺 ${json(missing)}）`);
   const skin = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js"), "utf8");
   check(/identityEarlyOut = !hasOverride && !useStaticPose && !editPose/.test(skin) && /const ed = editPose \? editPose\.get\(i\) : undefined/.test(skin), "引擎：预览增量在动画混合之后、脚本覆写之前叠加；有预览时不走恒等早退");
+}
+
+/** MG 语料判据（J 段变异复用）：每个带可编辑动画段的 .mdl 做加 / 复制 / 删 / 改头 / 改事件，parseMDL 读回逐项对账 */
+async function clipEditCorpus(me, P, modelTruth, ids) {
+  const seen = new Set();
+  const bad = [];
+  let ok = 0;
+  let removed = 0;
+  let noMdla = 0;
+  const kf = (tr) => Buffer.from(tr.keyframes.buffer, tr.keyframes.byteOffset, tr.keyframes.byteLength).toString("base64");
+  const clipSig = (a) => json([a.id, a.name, a.mode, a.fps, a.frameCount, a.tracks.map(kf), a.events]);
+  const rig = (m) => json([m.bones.map((b) => [b.name, b.parent]), (m.meshes && m.meshes.length ? m.meshes : [m]).map((x) => [x.vertexCount, x.indexCount]), (m.attachments || []).map((a) => a.name)]);
+  for (const id of ids) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    for (const o of t.objects) {
+      const key = `${id}:${o.info.mdlPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const bytes = t.read(o.info.mdlPath);
+      const before = P.parseMDL(bytes);
+      const clips = me.mdlClips(bytes);
+      if (!before.animations.length) {
+        if (clips && me.addMdlClip(bytes, { name: "x", mode: "loop", fps: 30, frameCount: 10 }) !== null) bad.push(`${key} 无 MDLA 未拒`);
+        else noMdla++;
+        continue;
+      }
+      const errs = [];
+      const src = before.animations[0];
+      // 新建（静止姿势）
+      const init = { name: "新片段", mode: "mirror", fps: 24, frameCount: 12 };
+      const add = me.addMdlClip(bytes, init, "rest");
+      const A = add && P.parseMDL(add.bytes);
+      const na = A?.animations.at(-1);
+      if (!na || A.animations.length !== before.animations.length + 1 || na.id !== Math.max(...before.animations.map((a) => a.id)) + 1 || add.id !== na.id) errs.push("add 结构");
+      else {
+        if (na.name !== init.name || na.mode !== init.mode || Math.abs(na.fps - 24) > 1e-6 || na.frameCount !== 12 || na.tracks.length !== src.tracks.length) errs.push("add 头");
+        if (!na.tracks.every((tr, i) => tr.frameCount === 13 && [...Array(13).keys()].every((f) => [...Array(9).keys()].every((c) => tr.keyframes[f * 9 + c] === src.tracks[i].keyframes[c])))) errs.push("add 静止姿势");
+        if (!before.animations.every((a, i) => clipSig(a) === clipSig(A.animations[i]))) errs.push("add 改了旧片段");
+        if (rig(A) !== rig(before)) errs.push("add 改了网格骨骼");
+        const mc = me.mdlClips(add.bytes);
+        if (!mc || mc.at(-1).id !== na.id || mc.at(-1).frames !== 13) errs.push("add mdlClips");
+      }
+      // 复制（帧数翻倍重采样）
+      const fc2 = src.frameCount * 2;
+      const dup = me.addMdlClip(bytes, { name: "dup", mode: src.mode, fps: src.fps, frameCount: fc2 }, "copy", src.id);
+      const D = dup && P.parseMDL(dup.bytes).animations.at(-1);
+      if (!D || !D.tracks.every((tr, i) => {
+        const s = src.tracks[i];
+        const n = s.frameCount;
+        if (!n) return tr.frameCount === 0 || true;
+        const m = tr.frameCount;
+        return m === fc2 + 1 && [...Array(9).keys()].every((c) => tr.keyframes[c] === s.keyframes[c] && Math.abs(tr.keyframes[(m - 1) * 9 + c] - s.keyframes[(n - 1) * 9 + c]) <= 1e-5 * Math.max(1, Math.abs(s.keyframes[(n - 1) * 9 + c])));
+      })) errs.push("copy 重采样首末帧");
+      const same = me.addMdlClip(bytes, { name: "same", mode: src.mode, fps: src.fps, frameCount: src.frameCount }, "copy", src.id);
+      const S2 = same && P.parseMDL(same.bytes).animations.at(-1);
+      if (!S2 || !S2.tracks.every((tr, i) => src.tracks[i].frameCount !== src.frameCount + 1 || kf(tr) === kf(src.tracks[i]))) errs.push("copy 同帧数应逐字节相同");
+      // 删
+      if (me.removeMdlClip(bytes, src.id) !== null) errs.push("删首个未拒");
+      if (before.animations.length > 1) {
+        const victim = before.animations.at(-1);
+        const R = me.removeMdlClip(bytes, victim.id);
+        const RA = R && P.parseMDL(R).animations;
+        if (!RA || RA.length !== before.animations.length - 1 || RA.some((a) => a.id === victim.id) || !RA.every((a, i) => clipSig(a) === clipSig(before.animations[i]))) errs.push("删");
+        else removed++;
+      }
+      // 改头
+      const M1 = me.setMdlClipMeta(bytes, src.id, { name: "改名", mode: "single", fps: 12 });
+      const MA = M1 && P.parseMDL(M1).animations[0];
+      if (!MA || MA.name !== "改名" || MA.mode !== "single" || Math.abs(MA.fps - 12) > 1e-6 || !MA.tracks.every((tr, i) => kf(tr) === kf(src.tracks[i]))) errs.push("改头");
+      const fc3 = Math.max(1, Math.round(src.frameCount / 2));
+      const M2 = me.setMdlClipMeta(bytes, src.id, { frameCount: fc3 });
+      const MB = M2 && P.parseMDL(M2).animations[0];
+      if (!MB || MB.frameCount !== fc3 || !MB.tracks.every((tr, i) => !src.tracks[i].frameCount || tr.frameCount === fc3 + (src.tracks[i].frameCount - src.frameCount))) errs.push("改帧数重采样");
+      // 事件
+      const evs = [{ frame: 9, name: "b" }, { frame: 2, name: "a" }, { frame: 999999, name: "末" }];
+      const E1 = me.setMdlClipEvents(bytes, src.id, evs);
+      const EA = E1 && P.parseMDL(E1).animations[0];
+      const want = [{ frame: 2, name: "a" }, { frame: Math.min(9, src.frameCount), name: "b" }, { frame: src.frameCount, name: "末" }].sort((x, y) => x.frame - y.frame);
+      if (!EA || json(EA.events) !== json(want) || json(me.mdlClips(E1)[0].events) !== json(want) || !EA.tracks.every((tr, i) => kf(tr) === kf(src.tracks[i]))) errs.push(`事件 ${json(EA?.events)}`);
+      else {
+        const E2 = me.setMdlClipEvents(E1, src.id, []);
+        if (!E2 || P.parseMDL(E2).animations[0].events.length !== 0 || !P.parseMDL(E2).animations.every((a, i) => i === 0 || clipSig(a) === clipSig(before.animations[i]))) errs.push("清空事件");
+      }
+      // 非法
+      for (const badInit of [{ name: "" }, { name: "x".repeat(65) }, { mode: "foo" }, { fps: 0 }, { fps: 300 }, { frameCount: 0 }, { frameCount: 1.5 }]) {
+        if (me.setMdlClipMeta(bytes, src.id, badInit) !== null || me.addMdlClip(bytes, { ...init, ...badInit }) !== null) errs.push(`非法 ${json(badInit)} 未拒`);
+      }
+      if (me.setMdlClipMeta(bytes, -77, { name: "x" }) !== null || me.setMdlClipEvents(bytes, src.id, [{ frame: 1, name: "" }]) !== null || me.addMdlClip(bytes, init, "copy", -77) !== null) errs.push("不存在 / 空事件名未拒");
+      if (errs.length) bad.push(`${key} ${errs.join(",")}`);
+      else ok++;
+    }
+  }
+  return { ok, removed, noMdla, bad, seen: seen.size };
+}
+
+section("MG. 动画片段增删 / 元数据 / 帧事件 api addMdlClip…（W18b）");
+{
+  const mm = await loadEditorModule("model");
+  const me = await loadRendererTs("renderer/src/editor/mdl-edit.ts");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const { modelTruth, PUPPET_FIXTURES, MESH_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  const tr = Float32Array.from([0, 0, 0, 0, 0, 3.0, 1, 1, 1, 10, 0, 0, 0, 0, -3.0, 2, 1, 1]);
+  const r3 = me.resampleTrack(tr, 3);
+  check(r3.length === 27 && r3[0] === 0 && r3[18] === 10 && near(r3[9], 5, 1e-6) && near(r3[15], 1.5, 1e-6) && Math.abs(Math.abs(r3[14]) - Math.PI) < 0.01 && json([...me.resampleTrack(tr, 2)]) === json([...tr]),
+    `resampleTrack：首末帧不变、线性插值、欧拉角跨 ±π 走最短方向（中点 ${r3[14].toFixed(3)} 而非 0）、同帧数原样`);
+  check(json(me.CLIP_MODES) === json(["loop", "mirror", "single"]), "片段模式 loop / mirror / single");
+  const res = await clipEditCorpus(me, P, modelTruth, [...PUPPET_FIXTURES, ...MESH_FIXTURES]);
+  check(res.ok >= 5 && res.removed >= 1 && res.bad.length === 0,
+    `语料：${res.seen} 个 .mdl 中 ${res.ok} 个带动画段的逐项过：新建静止姿势（每帧 = 首片段第 0 帧）/ 复制重采样首末帧不变 / 删（${res.removed} 个；首个拒绝）/ 改名·模式·fps 轨道不变 / 改帧数重采样 / 事件排序钳位读回，旧片段与网格骨骼逐字节不变；非法头拒绝；无动画段的 ${res.noMdla} 个拒绝加段（不符 ${json(res.bad.slice(0, 4))}）`);
+
+  check(json(mm.parseEventsText("12 footstep\n\n 3: 起跳 \n0：落地")) === json([{ frame: 12, name: "footstep" }, { frame: 3, name: "起跳" }, { frame: 0, name: "落地" }]) && mm.parseEventsText("abc") === null && json(mm.parseEventsText("  ")) === json([]),
+    "parseEventsText：一行「帧号 名字」（空白 / 冒号 / 全角冒号分隔）；读不懂整份 null；空 = 清空");
+  check(mm.formatEventsText([{ frame: 3, name: "a b" }, { frame: 7, name: "c" }]) === "3 a b\n7 c" && json(mm.parseEventsText(mm.formatEventsText([{ frame: 3, name: "a b" }]))) === json([{ frame: 3, name: "a b" }]), "formatEventsText 与 parse 往返");
+  check(mm.nextClipName([{ name: "片段" }, { name: "片段 2" }], "片段") === "片段 3" && mm.nextClipName([], "x") === "x", "nextClipName：跳过已占用");
+  const obj = { animationlayers: [{ animation: 5, name: "a" }, { animation: 7 }, { animation: { value: 5 } }, { animation: 9 }] };
+  check(mm.dropAnimLayersOfClip(obj, 5) === 2 && json(obj.animationlayers) === json([{ animation: 7 }, { animation: 9 }]) && mm.dropAnimLayersOfClip(obj, 42) === 0 && mm.dropAnimLayersOfClip({}, 1) === 0,
+    "dropAnimLayersOfClip：删掉指向该片段的动画层（含 {value} 包装），没有就不动");
+  const mj = { material: "m.json", puppet: "models/a_puppet.mdl" };
+  const cf = mm.mdlCopyFiles(mj, new Uint8Array([1, 2]), "c");
+  check(cf.path === "models/editor/c.json" && JSON.parse(dec.decode(cf.files[0].data)).puppet === "models/editor/c.mdl" && cf.files[1].data.length === 2 && mm.mdlCopyFiles(null, new Uint8Array(1), "c").path === "models/editor/c.mdl" && mm.mdlCopyFiles({ material: "m" }, new Uint8Array(1), "c") === null,
+    "mdlCopyFiles：puppet 连 model json 副本（puppet 改指向），mesh 只有 .mdl；不是 puppet 的 json 拒绝");
+
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/const cl = node\.modelForm \? clipsGroup\(node\) : null;/.test(mainSrc) && /function clipsGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「动画片段」分组，片段来自 getModelInfo");
+  check(/removeMdlClip\(b, c\.id\), \(o\) => \{\s*dropAnimLayersOfClip\(o, c\.id\);/.test(mainSrc), "删片段与删指向它的动画层是同一步结构编辑（撤销一起回来）");
+  check(/addMdlClip\(b, init, "copy", c\.id\)/.test(mainSrc) && /addMdlClip\(b, init, "rest", c0\.id\)/.test(mainSrc) && /setMdlClipMeta\(b, c\.id, meta\)/.test(mainSrc) && /setMdlClipEvents\(b, c\.id, list\)/.test(mainSrc),
+    "复制 = copy、新建 = 首片段静止姿势、改头 / 事件都走 commitMdlEdit");
+  check(/ci === 0 \? et\("cl\.delFirst"\) : et\("fx\.del"\)[\s\S]{0,400}\}, ci === 0\)/.test(mainSrc), "首个片段的删除按钮禁用");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keys = ["insp.clips", "cl.note", "cl.name", "cl.mode", "cl.mode.loop", "cl.mode.mirror", "cl.mode.single", "cl.fps", "cl.frames", "cl.events", "cl.eventsHint", "cl.dup", "cl.delFirst", "cl.add", "cl.defaultName", "cl.fail.read", "cl.fail.mdl", "cl.fail.events", "log.clipEdited", "log.clipAdded", "log.clipRemoved"];
+  const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missing.length === 0, `片段文案中英文都有（缺 ${json(missing)}）`);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -3602,6 +3736,20 @@ section("J. 变异红测");
   const pbytes5 = pobj5 && pb5.read(pobj5.info.mdlPath);
   const r5 = pbytes5 && bm5.boneEditFiles({ puppet: "a.mdl" }, pbytes5, "k", { animId: P3.parseMDL(pbytes5).animations[0].id, bone: 0, frame: 0, delta: { r: [0, 0, 1] }, radius: 0 });
   check(!!r5 && JSON.parse(dec.decode(r5.files[0].data)).puppet === "a.mdl", "不改 puppet 指向时「puppet 副本指向 .mdl 副本」判据变红（应用了画面不变）");
+
+  // W18b 片段编辑
+  const allFx = [...pf4, ...mf4];
+  const clm1 = await boneMut("t.data.length >= 9 ? t.data.subarray(0, 9)", "t.data.length >= 18 ? t.data.subarray(9, 18)", "新建片段取首帧");
+  check((await clipEditCorpus(clm1, P3, mt4, allFx)).bad.some((b) => b.includes("add 静止姿势")), "新建片段不取第 0 帧时「静止姿势」判据变红");
+  const clm2 = await boneMut("if (!d || !anims || i <= 0) return null;", "if (!d || !anims || i < 0) return null;", "首个片段不许删");
+  check((await clipEditCorpus(clm2, P3, mt4, allFx)).bad.some((b) => b.includes("删首个未拒")), "放开删首个片段时判据变红");
+  const clm3 = await boneMut("    .sort((x, y) => x.frame - y.frame)\n", "", "事件按帧排序");
+  check((await clipEditCorpus(clm3, P3, mt4, allFx)).bad.some((b) => b.includes("事件")), "事件不排序时「事件读回」判据变红");
+  const clm4 = await boneMut("        if (d > Math.PI) d -= 2 * Math.PI;\n        else if (d < -Math.PI) d += 2 * Math.PI;\n", "", "重采样欧拉角最短方向");
+  const r4 = clm4.resampleTrack(Float32Array.from([0, 0, 0, 0, 0, 3.0, 1, 1, 1, 10, 0, 0, 0, 0, -3.0, 2, 1, 1]), 3);
+  check(Math.abs(Math.abs(r4[14]) - Math.PI) >= 0.01, "欧拉角不走最短方向时「中点 ≈ ±π」判据变红");
+  const clm5 = await boneMut("const id = Math.max(...anims.map((a) => a.id)) + 1;", "const id = anims[0].id;", "新片段 id 不撞");
+  check((await clipEditCorpus(clm5, P3, mt4, allFx)).bad.some((b) => b.includes("add 结构")), "新片段 id 撞旧片段时「add 结构」判据变红");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

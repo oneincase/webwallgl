@@ -860,7 +860,12 @@ export type MdlClip = {
   frameCount: number;
   frames: number;
   tracks: number;
+  /** 帧事件（W18b）；JSON 读不出 frame / name 的条目不列（写回时原样保留不了，见 setMdlClipEvents） */
+  events: Array<{ frame: number; name: string }>;
 };
+
+/** 新建 / 改片段头（W18b）。name 1–64 字符，mode = loop / mirror / single，fps ∈ (0, 240]，frameCount 1–100000 */
+export type MdlClipInit = { name: string; mode: string; fps: number; frameCount: number };
 
 export type EditorHitTestOptions = {
   /** 连 visible=false / alpha=0 的层也算（WE 的隐形点击区）；缺省只认看得见的层 */

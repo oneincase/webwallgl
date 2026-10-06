@@ -19,6 +19,7 @@ import type {
   EditorBonePoint,
   MdlBoneDelta,
   MdlClip,
+  MdlClipInit,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -47,6 +48,7 @@ export type {
   EditorBonePoint,
   MdlBoneDelta,
   MdlClip,
+  MdlClipInit,
 };
 
 /**
@@ -100,6 +102,36 @@ export declare function applyBoneDelta(
   frame: number,
   delta: MdlBoneDelta,
   radius: number,
+): Uint8Array | null;
+
+/** 片段播放模式（W18b） */
+export declare const CLIP_MODES: readonly ["loop", "mirror", "single"];
+
+/** 轨道（每帧 9 个 f32）按归一化时间线性重采样到 m 帧，欧拉角走最短方向 */
+export declare function resampleTrack(data: Float32Array, m: number): Float32Array;
+
+/**
+ * 追加片段（W18b）：pose = "copy" 复制参照片段 source（缺省首个）的轨道并按帧数重采样；"rest" 每帧填参照片段第 0 帧。
+ * 新 id = 现有最大 id + 1。没有可编辑动画段（无 MDLA 的模型不加段）/ 参照不存在 / 头不合法时 null
+ */
+export declare function addMdlClip(
+  bytes: Uint8Array,
+  init: MdlClipInit,
+  pose?: "copy" | "rest",
+  source?: number,
+): { bytes: Uint8Array; id: number } | null;
+
+/** 删片段；首个片段是引擎绑定参考，不许删。不存在 / 首个 / 不可编辑时 null */
+export declare function removeMdlClip(bytes: Uint8Array, id: number): Uint8Array | null;
+
+/** 改片段头；改帧数时轨道重采样、事件帧号钳进新范围，改 fps 时事件时刻重算 */
+export declare function setMdlClipMeta(bytes: Uint8Array, id: number, meta: Partial<MdlClipInit>): Uint8Array | null;
+
+/** 整表替换帧事件（按帧号排序；与原表 frame + name 相同的沿用原 JSON 串） */
+export declare function setMdlClipEvents(
+  bytes: Uint8Array,
+  id: number,
+  events: ReadonlyArray<{ frame: number; name: string }>,
 ): Uint8Array | null;
 
 /**

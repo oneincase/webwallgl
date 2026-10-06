@@ -472,7 +472,12 @@ export type BoneEdit = { animId: number; bone: number; frame: number; delta: Mdl
 export function boneEditFiles(modelJson: Record<string, unknown> | null, mdlBytes: Uint8Array, slug: string, e: BoneEdit): RetextureResult | null {
   if (modelJson && (typeof modelJson.puppet !== "string" || !modelJson.puppet)) return null;
   const mdl = applyBoneDelta(mdlBytes, e.animId, e.bone, e.frame, e.delta, e.radius);
-  if (!mdl) return null;
+  return mdl ? mdlCopyFiles(modelJson, mdl, slug) : null;
+}
+
+/** 改过的 .mdl 落成副本：puppet 另带 model json 副本（只改 puppet 指向），mesh 只有 .mdl；model json 不是 puppet 时 null */
+export function mdlCopyFiles(modelJson: Record<string, unknown> | null, mdl: Uint8Array, slug: string): RetextureResult | null {
+  if (modelJson && (typeof modelJson.puppet !== "string" || !modelJson.puppet)) return null;
   const mdlPath = editorMdlOf(slug);
   if (!modelJson) return { path: mdlPath, files: [{ name: mdlPath, data: mdl }] };
   const path = modelPathOf(slug);
@@ -483,4 +488,38 @@ export function boneEditFiles(modelJson: Record<string, unknown> | null, mdlByte
       { name: mdlPath, data: mdl },
     ],
   };
+}
+
+// ---------- 片段增删 / 元数据 / 帧事件（W18b） ----------
+
+/** 帧事件文本：一行一条「帧号 名字」（帧号与名字之间空白或冒号）；空行跳过；有一行读不懂就整份 null */
+export function parseEventsText(text: string): Array<{ frame: number; name: string }> | null {
+  const out: Array<{ frame: number; name: string }> = [];
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    const m = /^(-?\d+(?:\.\d+)?)\s*[:：\s]\s*(\S.*)$/.exec(s);
+    if (!m) return null;
+    out.push({ frame: Number(m[1]), name: m[2].trim() });
+  }
+  return out;
+}
+
+export const formatEventsText = (events: ReadonlyArray<{ frame: number; name: string }>) => events.map((e) => `${e.frame} ${e.name}`).join("\n");
+
+/** 新片段名：base、base 2、base 3…中第一个没被占用的 */
+export function nextClipName(clips: ReadonlyArray<{ name: string }>, base: string): string {
+  const used = new Set(clips.map((c) => c.name));
+  if (!used.has(base)) return base;
+  for (let i = 2; ; i++) if (!used.has(`${base} ${i}`)) return `${base} ${i}`;
+}
+
+/** 删片段时一并删掉指向它的动画层（不然场景里留下悬空的片段号）；返回删掉的条数 */
+export function dropAnimLayersOfClip(o: SceneObject, clipId: number): number {
+  const list = listOf(o);
+  if (!list) return 0;
+  const keep = list.filter((a) => numOr(plain(a.animation), NaN) !== clipId);
+  const n = list.length - keep.length;
+  if (n) o.animationlayers = keep;
+  return n;
 }
