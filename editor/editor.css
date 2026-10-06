@@ -208,6 +208,24 @@
   color: var(--wb-fg-strong);
 }
 
+.ed-node.is-dragging {
+  opacity: 0.5;
+}
+
+.ed-node.drop-before {
+  box-shadow: inset 0 2px 0 var(--wb-accent);
+}
+
+.ed-node.drop-after {
+  box-shadow: inset 0 -2px 0 var(--wb-accent);
+}
+
+.ed-node.drop-inside {
+  background: var(--wb-accent-soft);
+  outline: 1px dashed var(--wb-accent);
+  outline-offset: -1px;
+}
+
 .ed-node.hidden-layer .ed-node-name {
   opacity: 0.45;
 }

@@ -1973,6 +1973,93 @@ section("AC. 关键帧补完：颜色动画 / 拖动关键帧改时刻");
   check(kfMod.moveKeyTime(m3, 1, 1.5) && m3.origin.animation.c0[1].frame === 18, "按各条动画自己的 fps 换帧（外来 12fps 动画：1.5s = 第 18 帧）");
 }
 
+section("AD. 图层树拖拽改父级 / 成组 / 锁定写入文档");
+{
+  const W = (objs) => new Map(parseMod.parseScene({ general: {}, objects: structuredClone(objs) }, { type: "scene" }).layers.map((l) => [String(l.id), l]));
+  const close = (a, b, eps = 1e-3) => a.every((v, i) => Math.abs(v - b[i]) < eps);
+  const sameWorld = (a, b, ids) => ids.every((id) => close(a.get(id).origin, b.get(id).origin) && close(a.get(id).scale, b.get(id).scale) && close(a.get(id).angles, b.get(id).angles));
+  let ok = true;
+  for (let i = 0; i < 40; i++) {
+    const r = (k) => (Math.sin(i * 12.9898 + k * 78.233) * 43758.5453) % 1;
+    const P = { origin: [r(1) * 900, r(2) * 900, r(3) * 9], scale: [0.2 + Math.abs(r(4)) * 2, 0.2 + Math.abs(r(5)) * 2, 1], angles: [0, 0, r(6) * 6] };
+    const C = { origin: [r(7) * 300, r(8) * 300, r(9)], scale: [0.5 + Math.abs(r(10)), 0.5 + Math.abs(r(11)), 1], angles: [0, 0, r(12) * 3] };
+    const a = docMod.composeXform(P, C);
+    const b = parseMod.composeChildTransform(P, C, true);
+    const back = docMod.relativeXform(P, a);
+    if (!close(a.origin, b.origin) || !close(a.scale, b.scale) || !close(a.angles, b.angles) || !close(back.origin, C.origin) || !close(back.scale, C.scale) || !close(back.angles, C.angles)) ok = false;
+  }
+  check(ok, "composeXform 与引擎 composeChildTransform 逐值一致（40 组随机）；relativeXform 是它的精确逆");
+  check(docMod.relativeXform({ origin: [0, 0, 0], scale: [0, 1, 1], angles: [0, 0, 0] }, { origin: [1, 1, 0], scale: [1, 1, 1], angles: [0, 0, 0] }) === null, "父 scale 有 0：无解返回 null");
+
+  const base = () => [
+    { id: 1, name: "A", text: "a", origin: "100 100 0", scale: "2 2 1", angles: "0 0 0.5" },
+    { id: 2, name: "B", text: "b", parent: 1, origin: { user: "pos", value: "10 20 0" }, angles: "0 0 0.25" },
+    { id: 3, name: "C", text: "c", origin: "500 300 0", scale: "0.5 0.5 1", angles: "0 0 -0.3" },
+    { id: 4, name: "D", text: "d", parent: 3, origin: "40 -10 0" },
+    { id: 5, name: "E", text: "e", origin: "960 540 0" },
+  ];
+  const mk = (objs = base()) => docMod.makeDoc("t", null, { general: {}, objects: objs }, "loose");
+  const ids = (d) => d.scene.objects.map((o) => o.id);
+  const all = ["1", "2", "3", "4", "5"];
+
+  let d = mk();
+  let w0 = W(d.scene.objects);
+  check(docMod.placeLayer(d, 2, 3, "inside") === "ok" && d.scene.objects.find((o) => o.id === 2).parent === 3 && json(ids(d)) === json([1, 3, 4, 2, 5]), `拖进 C：B 成为 C 的最后一个子层（数组顺序 ${json(ids(d))}）`);
+  check(sameWorld(w0, W(d.scene.objects), all), "★ 引擎 parseScene 对照：换父前后所有层世界变换不变（位置 / 缩放 / 旋转）");
+  const b2 = d.scene.objects.find((o) => o.id === 2);
+  check(b2.origin.user === "pos" && typeof b2.origin.value === "string", "用户属性包装保留，只改 value");
+  check(d.roots.find((n) => n.id === 3).children.map((n) => n.id).join() === "4,2", "图层树同步重建");
+  check(docMod.placeLayer(d, 2, 5, "after") === "ok" && !("parent" in d.scene.objects.find((o) => o.id === 2)) && json(ids(d)) === json([1, 3, 4, 5, 2]) && sameWorld(w0, W(d.scene.objects), all), "拖到根层 E 之后：去掉 parent 字段，世界变换仍不变");
+
+  d = mk();
+  const snap = json(d.scene.objects);
+  check(docMod.placeLayer(d, 3, 4, "inside") === "cycle" && docMod.placeLayer(d, 3, 3, "before") === "cycle" && docMod.placeLayer(d, 1, 2, "after") === "cycle" && json(d.scene.objects) === snap, "放进自己 / 自己的子层：拒绝，文档原样");
+  check(docMod.placeLayer(d, 1, 3, "before") === "noop" && docMod.placeLayer(d, 404, 3, "before") === "missing" && json(d.scene.objects) === snap, "原地（A 本来就在 C 之前）不算改动；不存在的层返回 missing");
+  check(docMod.placeLayer(d, 5, 1, "before") === "ok" && json(ids(d)) === json([5, 1, 2, 3, 4]) && d.scene.objects[0].origin === "960 540 0", "同级重排：只换顺序，变换字段一字不动");
+  check(docMod.placeLayer(d, 3, 5, "before") === "ok" && json(ids(d)) === json([3, 4, 5, 1, 2]) && d.scene.objects[1].parent === 3, "整棵子树作为一块搬动，子层 parent 不变");
+
+  const an = base();
+  an[1].origin = { value: "10 20 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  d = mk(an);
+  const snapA = json(d.scene.objects);
+  check(docMod.placeLayer(d, 2, 5, "after") === "animated" && json(d.scene.objects) === snapA, "位置有动画的层换父级：拒绝（关键帧在旧父空间），文档原样");
+  const an2 = base();
+  an2[1].parent = undefined;
+  an2[1].alpha = { value: 1, animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  an2[0].origin = { value: "100 100 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  delete an2[1].parent;
+  d = mk(an2);
+  check(docMod.placeLayer(d, 1, 5, "after") === "ok" && docMod.placeLayer(d, 2, 3, "inside") === "ok", "动画层同级重排可以；只有不透明度动画的层可以换父级");
+
+  const dz = base();
+  dz[2].scale = "0 1 1";
+  d = mk(dz);
+  check(docMod.placeLayer(d, 5, 3, "inside") === "degenerate" && json(ids(d)) === json([1, 2, 3, 4, 5]), "目标父层 scale 有 0：拒绝且不挪");
+  const ds = base().map((o) => ({ ...o, id: String(o.id), parent: o.parent === undefined ? undefined : String(o.parent) }));
+  d = mk(ds);
+  w0 = W(d.scene.objects);
+  check(docMod.placeLayer(d, "5", "1", "inside") === "ok" && d.scene.objects.find((o) => o.id === "5").parent === "1" && sameWorld(w0, W(d.scene.objects), all), "字符串 id 的工程：parent 写成同类型 id，世界不变");
+
+  d = mk();
+  w0 = W(d.scene.objects);
+  const gid = docMod.groupLayer(d, 4, "组");
+  const g = d.scene.objects.find((o) => o.id === gid);
+  check(gid === 6 && g.parent === 3 && d.scene.objects.find((o) => o.id === 4).parent === 6 && json(ids(d)) === json([1, 2, 3, 6, 4, 5]), `成组：新组 #${gid} 插在原位、继承原父级，D 进组`);
+  const w1 = W(d.scene.objects);
+  check(sameWorld(w0, w1, all) && d.roots.find((n) => n.id === 3).children[0].kind === "group", "★ 引擎对照：成组后画面不变；树里显示为「组」");
+  check(docMod.groupLayer(d, 404, "x") === null, "成组：不存在的层返回 null");
+
+  const lo = { id: 9 };
+  check(!docMod.isLockedObj(lo) && docMod.isLockedObj({ locktransforms: true }) && docMod.isLockedObj({ locktransforms: { user: "l", value: true } }) && !docMod.isLockedObj({ locktransforms: false }), "锁定读 WE 原生 locktransforms（含包装）");
+  docMod.setLocked(lo, true);
+  check(lo.locktransforms === true && docMod.isLockedObj(lo) && (docMod.setLocked(lo, false), lo.locktransforms === false), "setLocked 写布尔（与语料 \"locktransforms\": false 同形）");
+
+  d = mk();
+  const cmd = historyMod.structCommand(d, "放进", 2, (dd) => (docMod.placeLayer(dd, 2, 3, "inside") === "ok" ? 2 : undefined));
+  check(!!cmd && JSON.parse(cmd.before).find((o) => o.id === 2).parent === 1 && JSON.parse(cmd.after).find((o) => o.id === 2).parent === 3, "走结构命令：前后快照可撤销");
+  check(historyMod.structCommand(mk(), "x", 2, (dd) => (docMod.placeLayer(dd, 2, 2, "inside") === "ok" ? 2 : undefined)) === null, "拒绝时不产生撤销记录");
+}
+
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
 {
   const realFetch = globalThis.fetch;
@@ -2099,6 +2186,9 @@ section("I. 接线");
   check(/for \(const run of animRuns\) \{\s*if \(run\.layer === l && \(p as Record<string, unknown>\)\[run\.field\] !== undefined\) run\.held = true;/.test(sm) && /else run\.ctrl\.advance\(clockDt\);\s*if \(run\.held\) continue;/.test(sm) && /animSeekPending = true;\s*for \(const run of animRuns\) run\.held = false;/.test(sm), "引擎：热改动画字段后曲线写回暂停到下一次 seek（拖拽 / 输入跟手）");
   check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(sm) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(sm), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
   check(/m\.addEventListener\("pointerdown", \(e\) => startKeyDrag\(e, m, n, t\)\)/.test(main) && /\(o\) => moveKeyTime\(o, from, to\)/.test(main) && /log\(et\("log\.keyMoveBad"/.test(main), "时间轴关键帧标记可拖动改时刻（objEdit，冲突时提示并复原）");
+  check(/row\.addEventListener\("pointerdown", \(e\) => startTreeDrag\(e, n, row\)\)/.test(main) && /\(res = placeLayer\(d, n\.id, target\.id, where\)\) === "ok"/.test(main) && /if \(treeDragged\) return;/.test(main), "图层树行可拖：放下走 placeLayer 结构编辑，拖完不误触点选");
+  check(/isLockedObj\(n\.obj\)/.test(main) && /setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(main) && !/const locked = new Set/.test(main), "锁定状态以文档 locktransforms 为准（页面不再另存一份）");
+  check(/id="ly-group"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /groupLayer\(d, n\.id, et\("layer\.groupName"\)\)/.test(main), "图层工具条「成组」");
   check(/const stayPaused = keepTime && !!instance\?\.paused;/.test(main) && /if \(stayPaused\) inst\.pause\(\);\s*if \(resumeAt > 0\) await editor\.seek\(resumeAt\)/.test(main), "结构编辑重挂保持暂停（停在某一刻打关键帧，画面不会自己跑起来）");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -2135,6 +2225,32 @@ section("J. 变异红测");
   const d2 = m2.makeDoc("x", null, fixtureScene(), "loose");
   m2.duplicateLayer(d2, 2, " copy");
   check(d2.scene.objects.find((o) => o.id === 14)?.parent !== 13, "duplicateLayer 不重映射父指向时判据变红");
+
+  const placeFix = () => [
+    { id: 1, text: "a", origin: "100 100 0", scale: "2 2 1", angles: "0 0 0.5" },
+    { id: 2, text: "b", parent: 1, origin: "10 20 0" },
+    { id: 3, text: "c", origin: "500 300 0", angles: "0 0 -0.3" },
+    { id: 4, text: "d", parent: 3, origin: "40 -10 0" },
+  ];
+  const worldOf = (objs, id) => parseMod.parseScene({ general: {}, objects: structuredClone(objs) }, { type: "scene" }).layers.find((l) => l.id === id).origin;
+  const mutCyc = docSrc.replace('  if (block.some((i) => objs[i] === target)) return "cycle";\n', "");
+  check(mutCyc !== docSrc, "注入点存在（placeLayer 的成环检查）");
+  const m3 = await loadEditorModule("doc", { [docPath]: mutCyc });
+  check(m3.placeLayer(m3.makeDoc("x", null, { general: {}, objects: placeFix() }, "loose"), 3, 4, "inside") !== "cycle", "不查成环时「放进自己的子层被拒」判据变红");
+  const mutRot = docSrc.replace("const cos = Math.cos(-p.angles[2]);\n  const sin = Math.sin(-p.angles[2]);", "const cos = 1;\n  const sin = 0;");
+  check(mutRot !== docSrc, "注入点存在（relativeXform 的反旋转）");
+  const m4 = await loadEditorModule("doc", { [docPath]: mutRot });
+  const d4 = m4.makeDoc("x", null, { general: {}, objects: placeFix() }, "loose");
+  const before4 = worldOf(d4.scene.objects, 2);
+  m4.placeLayer(d4, 2, 3, "inside");
+  const after4 = worldOf(d4.scene.objects, 2);
+  check(Math.hypot(after4[0] - before4[0], after4[1] - before4[1]) > 1, `换父不反旋转时「世界变换不变」判据变红（偏了 ${Math.hypot(after4[0] - before4[0], after4[1] - before4[1]).toFixed(1)}px）`);
+  const mutAn = docSrc.replace('    if (TRANSFORM_FIELDS.some((f) => hasAnimation(self[f]))) return "animated";\n', "");
+  check(mutAn !== docSrc, "注入点存在（placeLayer 的动画拒绝）");
+  const m5 = await loadEditorModule("doc", { [docPath]: mutAn });
+  const fa = placeFix();
+  fa[1].origin = { value: "10 20 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  check(m5.placeLayer(m5.makeDoc("x", null, { general: {}, objects: fa }, "loose"), 2, 3, "inside") !== "animated", "不拒动画层时「换父级被拒」判据变红");
 
   const gizPath = path.join(ROOT, "editor/gizmo.ts");
   const gizSrc = fs.readFileSync(gizPath, "utf8");

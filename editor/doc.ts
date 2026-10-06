@@ -234,6 +234,135 @@ export function moveLayer(doc: EditorDoc, id: number | string, dir: -1 | 1): boo
   return true;
 }
 
+// ---------- 父子关系：拖拽改父级 / 成组（世界变换不变）、锁定 ----------
+
+type V3 = [number, number, number];
+export type Xform = { origin: V3; scale: V3; angles: V3 };
+
+const vec3 = (v: unknown, dflt: V3): V3 => {
+  const raw = unwrap(v);
+  const a = typeof raw === "string" ? raw.trim().split(/\s+/).map(Number) : Array.isArray(raw) ? raw.map(Number) : [];
+  return dflt.map((d, i) => (Number.isFinite(a[i]) ? a[i] : d)) as V3;
+};
+
+export function localXform(o: SceneObject): Xform {
+  return { origin: vec3(o.origin, [0, 0, 0]), scale: vec3(o.scale, [1, 1, 1]), angles: vec3(o.angles, [0, 0, 0]) };
+}
+
+/** 与引擎 parse.js composeChildTransform（父 scale 传播）同式 */
+export function composeXform(p: Xform, c: Xform): Xform {
+  const cos = Math.cos(p.angles[2]);
+  const sin = Math.sin(p.angles[2]);
+  const ox = c.origin[0] * p.scale[0];
+  const oy = c.origin[1] * p.scale[1];
+  return {
+    origin: [p.origin[0] + ox * cos - oy * sin, p.origin[1] + ox * sin + oy * cos, p.origin[2] + c.origin[2]],
+    scale: [p.scale[0] * c.scale[0], p.scale[1] * c.scale[1], p.scale[2] * c.scale[2]],
+    angles: [c.angles[0], c.angles[1], p.angles[2] + c.angles[2]],
+  };
+}
+
+/** composeXform 的逆：已知父世界与子世界求子局部；父 scale 有 0 分量时无解 */
+export function relativeXform(p: Xform, w: Xform): Xform | null {
+  if (p.scale.some((s) => s === 0)) return null;
+  const cos = Math.cos(-p.angles[2]);
+  const sin = Math.sin(-p.angles[2]);
+  const dx = w.origin[0] - p.origin[0];
+  const dy = w.origin[1] - p.origin[1];
+  return {
+    origin: [(dx * cos - dy * sin) / p.scale[0], (dx * sin + dy * cos) / p.scale[1], w.origin[2] - p.origin[2]],
+    scale: [w.scale[0] / p.scale[0], w.scale[1] / p.scale[1], w.scale[2] / p.scale[2]],
+    angles: [w.angles[0], w.angles[1], w.angles[2] - p.angles[2]],
+  };
+}
+
+const IDENTITY: Xform = { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] };
+
+/** 父级指向不存在的对象时 buildLayerTree 把它当根，这里同口径 */
+function parentOf(objs: SceneObject[], o: SceneObject): SceneObject | null {
+  if (o.parent === undefined || o.parent === null) return null;
+  return objs.find((x) => sameId(x.id, o.parent)) ?? null;
+}
+
+/** 静态值（作者快照）合成的世界变换；动画 / 脚本是运行期叠加，不计 */
+export function worldXform(objs: SceneObject[], o: SceneObject | null): Xform {
+  const chain: SceneObject[] = [];
+  for (let cur = o; cur && chain.length < 64 && !chain.includes(cur); cur = parentOf(objs, cur)) chain.unshift(cur);
+  return chain.reduce<Xform>((w, c) => composeXform(w, localXform(c)), IDENTITY);
+}
+
+const TRANSFORM_FIELDS = ["origin", "scale", "angles"] as const;
+
+const hasAnimation = (v: unknown) => !!v && typeof v === "object" && !Array.isArray(v) && "animation" in (v as object);
+
+export type PlaceWhere = "before" | "after" | "inside";
+
+export type PlaceResult = "ok" | "noop" | "cycle" | "animated" | "degenerate" | "missing";
+
+/**
+ * 把 id 的整棵子树挪到 target 之前 / 之后（同级）或里面（成为最后一个子层）。
+ * 对象数组顺序即绘制顺序，「之前」= 数组里更靠前。父级变了时改写局部变换使
+ * 世界变换不变（子层跟着父走，不用动）；位置 / 缩放 / 旋转有动画时关键帧是旧父
+ * 空间的值，换父会整段错位 —— 拒绝。校验全部在改动之前，失败时文档原样。
+ */
+export function placeLayer(doc: EditorDoc, id: number | string, targetId: number | string, where: PlaceWhere): PlaceResult {
+  const objs = objectsOf(doc);
+  if (!objs) return "missing";
+  const self = objs.find((o) => sameId(o.id, id));
+  const target = objs.find((o) => sameId(o.id, targetId));
+  if (!self || !target) return "missing";
+  const block = subtreeIndices(objs, id);
+  if (block.some((i) => objs[i] === target)) return "cycle";
+  const newParent = where === "inside" ? target : parentOf(objs, target);
+  const oldParent = parentOf(objs, self);
+  let local: Xform | null = null;
+  if (newParent !== oldParent) {
+    if (TRANSFORM_FIELDS.some((f) => hasAnimation(self[f]))) return "animated";
+    local = relativeXform(worldXform(objs, newParent), worldXform(objs, self));
+    if (!local) return "degenerate";
+  }
+  const before = objs.slice();
+  const blockObjs = block.map((i) => objs[i]);
+  for (const i of [...block].reverse()) objs.splice(i, 1);
+  const tIdx = subtreeIndices(objs, target.id as number | string);
+  const insertAt = where === "before" ? tIdx[0] : tIdx[tIdx.length - 1] + 1;
+  objs.splice(insertAt, 0, ...blockObjs);
+  if (!local && objs.every((o, i) => o === before[i])) return "noop";
+  if (local) {
+    writeObjProps(self, local);
+    if (newParent) self.parent = newParent.id;
+    else delete self.parent;
+  }
+  rebuildTree(doc);
+  return "ok";
+}
+
+/** 新建空组（单位变换）插在 id 原位，把 id 的子树放进去：世界变换天然不变。返回组 id */
+export function groupLayer(doc: EditorDoc, id: number | string, name: string): number | null {
+  const objs = objectsOf(doc);
+  if (!objs) return null;
+  const self = objs.find((o) => sameId(o.id, id));
+  if (!self) return null;
+  const block = subtreeIndices(objs, id);
+  const gid = nextObjectId(objs);
+  const group: SceneObject = { id: gid, name, origin: "0 0 0", scale: "1 1 1", angles: "0 0 0", visible: true };
+  if (self.parent !== undefined && self.parent !== null && parentOf(objs, self)) group.parent = self.parent;
+  objs.splice(block[0], 0, group);
+  self.parent = gid;
+  rebuildTree(doc);
+  return gid;
+}
+
+/** WE 原生字段 locktransforms：锁定的层不能在视口里拖动 / 改变换 */
+export function isLockedObj(o: SceneObject): boolean {
+  const v = unwrap(o.locktransforms);
+  return v === true || v === 1 || v === "true" || v === "1";
+}
+
+export function setLocked(o: SceneObject, on: boolean): void {
+  o.locktransforms = on;
+}
+
 /** 根到目标节点的路径（含目标）。引擎活层 id 是数值，文档 id 可能是字符串，按字符串比 */
 export function findPath(nodes: LayerNode[], id: number | string): LayerNode[] | null {
   for (const n of nodes) {

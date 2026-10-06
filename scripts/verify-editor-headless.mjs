@@ -508,7 +508,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/reopened.jpg`);
 
-  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, errorLines }, objects, session });
+  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, key, clickSel, MOD, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
 
   await session.close();
   await server.close();
@@ -1702,4 +1702,100 @@ async function runCreateAndDraft(ctx) {
     await new Promise((r) => setTimeout(r, 400));
   }
   check(new Set(xs.map((x) => Math.round(x))).size >= 3 && xs.every((x) => x >= 959 && x <= 1261), `★ 测试台：文字沿关键帧来回移动（x 采样 ${xs.map((x) => x.toFixed(0)).join(" → ")}）`);
+
+  section("AD. 图层树拖拽改父级 / 成组 / 锁定写入文档（成组 → 移动组子层跟随 → 拖进组画面不动 → 拖出 → 成环拒绝 → 撤销 → 锁定 → 存库 → 重开）");
+  const rowAt = (id, f = 0.5) =>
+    ev(`(() => { const n = document.querySelector('#ed-tree .ed-node[data-id="${id}"]'); if (!n) return null; const r = n.getBoundingClientRect(); return [r.left + 60, r.top + r.height * ${f}]; })()`);
+  const depthOf = () => ev(`Object.fromEntries([...document.querySelectorAll('#ed-tree .ed-node')].map((n) => [n.dataset.id, (parseInt(n.style.paddingLeft) - 6) / 14]))`);
+  const treeIds = () => ev(`[...document.querySelectorAll('#ed-tree .ed-node')].map((n) => n.dataset.id)`);
+  const clickRow = async (id) => {
+    await click(await rowAt(id));
+    await settle();
+  };
+  const dragRow = async (id, targetId, f) => {
+    const r0 = await h.readyCount();
+    await drag(await rowAt(id), await rowAt(targetId, f));
+    return r0;
+  };
+  await gotoEditor();
+  await newBlank("#000000");
+  await addTextPreset("plain");
+  await setText("content", "MMM");
+  await setText("size", "60");
+  const id1 = String((await rawObj()).id);
+  await h.setInputs({ 0: 400 });
+  await addTextPreset("plain");
+  await setText("content", "WWW");
+  await setText("size", "60");
+  const id2 = String((await rawObj()).id);
+  await h.setInputs({ 0: 1100 });
+  await settle();
+  const crD = await h.canvasRect();
+  const inkX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]))).frac;
+  check((await inkX(400)) > 0.05 && (await inkX(1100)) > 0.05 && (await ev(`document.querySelectorAll('#ed-tree .ed-node[data-id="${id1}"]').length === 1`)), `两个文字层（#${id1} 在 x=400，#${id2} 在 x=1100），树行带 data-id`);
+
+  let rd = await h.readyCount();
+  await clickSel("#ly-group");
+  await h.waitRemount(rd);
+  const gid = String((await rawObj()).id);
+  let dep = await depthOf();
+  check(gid !== id1 && gid !== id2 && dep[gid] === 0 && dep[id2] === 1 && json(await treeIds()) === json([id1, gid, id2]), `成组：新组 #${gid} 在原位，#${id2} 进组（树 ${json(await treeIds())}）`);
+  check((await inkX(1100)) > 0.05 && (await ev(`document.querySelector('#ed-tree .ed-node[data-id="${gid}"] .ed-kind').dataset.kind`)) === "group", "成组后画面不变；行标「组」");
+  await h.setInputs({ 0: 600 });
+  await settle();
+  check((await inkX(1700)) > 0.05 && (await inkX(1100)) < 0.01, "★ 移动组 x=600：组里的文字跟着到 1700（引擎父子合成生效）");
+
+  rd = await dragRow(id1, gid, 0.5);
+  await h.waitRemount(rd);
+  dep = await depthOf();
+  await clickRow(id1);
+  check(dep[id1] === 1 && json(await treeIds()) === json([gid, id2, id1]) && Math.abs((await h.numInputs())[0] + 200) < 0.5, `★ 把 #${id1} 拖进组：成为最后一个子层，局部 x 改写为 -200（= 400 − 组的 600）`);
+  const whiteX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]), 690)).frac;
+  check((await whiteX(400)) > 0.05 && (await whiteX(1000)) < 0.01, "★ 画面上它仍在 x=400（没有被组平移到 1000；只数白字像素，避开选中描边）");
+
+  rd = await dragRow(id1, gid, 0.1);
+  await h.waitRemount(rd);
+  dep = await depthOf();
+  check(dep[id1] === 0 && json(await treeIds()) === json([id1, gid, id2]) && Math.abs((await h.numInputs())[0] - 400) < 0.5 && (await inkX(400)) > 0.05, "拖到组的上沿：回到根层排在组前，局部 x 回到 400，画面不动");
+
+  rd = await dragRow(gid, id2, 0.5);
+  await settle();
+  check((await h.readyCount()) === rd && json(await treeIds()) === json([id1, gid, id2]) && (await ev(`[...document.querySelectorAll('#ed-con-body > div')].some((d) => /不能把|Cannot put/.test(d.textContent))`)), "把组拖进自己的子层：拒绝（不重挂、树不变、控制台提示）");
+
+  rd = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rd);
+  check((await depthOf())[id1] === 1, "撤销：回到组里");
+  rd = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(rd);
+  check((await depthOf())[id1] === 0, "重做：又拖出来");
+
+  await clickRow(id1);
+  await click(await h.rowButton((await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"] .ed-node-name').textContent`)), ".ed-lock"));
+  await settle();
+  check((await rawObj()).locktransforms === true && (await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)) && (await h.dirtyTitle()), "锁定：写进文档 locktransforms = true，标记未保存");
+  rd = await dragRow(id1, gid, 0.5);
+  await settle();
+  check((await h.readyCount()) === rd && (await depthOf())[id1] === 0, "锁定的层拖不动");
+  const errsAD = await h.errorLines();
+  check(errsAD.length === 0, `图层树编辑全程无错误${errsAD.length ? `：${errsAD.slice(0, 2).join(" / ")}` : ""}`);
+
+  const libBeforeAD = new Set(fs.readdirSync(lib));
+  const scAD = await h.savedCount();
+  await clickSel("#tb-save");
+  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
+  await clickSel("#save-lib");
+  await h.waitSaved(scAD);
+  const savedAD = fs.readdirSync(lib).filter((n) => !libBeforeAD.has(n));
+  const objsAD = JSON.parse(fs.readFileSync(path.join(lib, savedAD[0], "scene.json"), "utf8")).objects;
+  const by = (id) => objsAD.find((o) => String(o.id) === id);
+  check(savedAD.length === 1 && by(id1).locktransforms === true && String(by(id2).parent) === gid && !("parent" in by(id1)) && !by(gid).image && json(objsAD.map((o) => String(o.id))) === json([id1, gid, id2]), `盘上 scene.json：锁定字段、父子关系、组对象、绘制顺序都在（${savedAD[0]}）`);
+
+  await gotoEditor(`?item=${savedAD[0]}`);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 3`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await settle();
+  const crD2 = await h.canvasRect();
+  check((await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)) && (await depthOf())[id2] === 1 && (await inkIn(...worldBox(crD2, [400, 540], [50, 30]))).frac > 0.05 && (await inkIn(...worldBox(crD2, [1700, 540], [50, 30]))).frac > 0.05, "重新打开：锁定状态、组结构、画面都还在");
 }

@@ -152,14 +152,20 @@ import {
   duplicateLayer,
   findNode,
   findPath,
+  groupLayer,
+  isLockedObj,
   makeDoc,
   moveLayer,
+  placeLayer,
   removeLayer,
   sceneResolution,
+  setLocked,
   unwrap,
   writeObjProps,
   type EditorDoc,
   type LayerNode,
+  type PlaceResult,
+  type PlaceWhere,
 } from "./doc";
 import {
   DRAG_THRESHOLD,
@@ -337,8 +343,11 @@ let openGen = 0;
 let selectedId: number | string | null = null;
 const collapsed = new Set<number | string>();
 /** 页面级锁定（不进文档）：锁定层不参与点选、不能拖、检视器只读 */
-const locked = new Set<string>();
-const isLocked = (id: number | string | null) => id !== null && locked.has(String(id));
+const isLocked = (id: number | string | null) => {
+  if (id === null || !doc) return false;
+  const n = findPath(doc.roots, id)?.at(-1);
+  return !!n && isLockedObj(n.obj);
+};
 /**
  * 发生过结构编辑（增删 / 复制 / 重排）后，引擎改从文档挂载（sourceFromDoc）——
  * 原始来源里没有这些改动。纯属性热改不切：热改已写回文档，原始来源 + 重放即等价，
@@ -480,7 +489,6 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   doc = opened.doc;
   selectedId = null;
   collapsed.clear();
-  locked.clear();
   scriptDrafts.clear();
   docDriven = !!opts.docDriven;
   origin = opts.origin ?? null;
@@ -1693,10 +1701,79 @@ lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
 lyDelEl.onclick = () => deleteSelected();
+const lyGroupEl = $<HTMLButtonElement>("#ly-group");
+lyGroupEl.onclick = () => groupSelected();
+
+// ---------- 图层树拖拽：落在行上 1/3 = 之前、下 1/3 = 之后、中间 = 放进去 ----------
+
+let treeDragged = false;
+const DROP_CLASSES = ["drop-before", "drop-after", "drop-inside"];
+
+function startTreeDrag(e: PointerEvent, n: LayerNode, row: HTMLElement) {
+  if (e.button !== 0 || (e.target as HTMLElement).closest("button, .ed-twisty")) return;
+  const x0 = e.clientX;
+  const y0 = e.clientY;
+  let active = false;
+  let drop: { id: string; where: PlaceWhere } | null = null;
+  const clear = () => treeEl.querySelectorAll(".ed-node").forEach((el) => el.classList.remove(...DROP_CLASSES));
+  const move = (ev: PointerEvent) => {
+    if (!active) {
+      if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < DRAG_THRESHOLD) return;
+      active = true;
+      row.classList.add("is-dragging");
+    }
+    clear();
+    drop = null;
+    const el = document.elementFromPoint(ev.clientX, ev.clientY)?.closest<HTMLElement>("#ed-tree .ed-node");
+    if (!el || el === row || !el.dataset.id) return;
+    const r = el.getBoundingClientRect();
+    const f = (ev.clientY - r.top) / r.height;
+    const where: PlaceWhere = f < 0.3 ? "before" : f > 0.7 ? "after" : "inside";
+    drop = { id: el.dataset.id, where };
+    el.classList.add(`drop-${where}`);
+  };
+  const end = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", end);
+    window.removeEventListener("pointercancel", end);
+    row.classList.remove("is-dragging");
+    clear();
+    if (!active) return;
+    treeDragged = true;
+    setTimeout(() => (treeDragged = false));
+    if (drop) dropLayer(n, drop.id, drop.where);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", end);
+  window.addEventListener("pointercancel", end);
+}
+
+const PLACE_BAD: Record<Exclude<PlaceResult, "ok" | "noop">, string> = {
+  cycle: "log.placeCycle",
+  animated: "log.placeAnimated",
+  degenerate: "log.placeDegenerate",
+  missing: "log.placeMissing",
+};
+
+function dropLayer(n: LayerNode, targetId: string, where: PlaceWhere) {
+  const target = doc ? findPath(doc.roots, targetId)?.at(-1) : null;
+  if (!target) return;
+  let res = "noop" as PlaceResult;
+  const label = et(where === "inside" ? "log.placedInside" : "log.placed", { name: nodeName(n.id), target: nodeName(target.id) });
+  if (where === "inside") collapsed.delete(target.id);
+  structEdit(label, (d) => ((res = placeLayer(d, n.id, target.id, where)) === "ok" ? n.id : undefined));
+  if (res !== "ok" && res !== "noop") log(et(PLACE_BAD[res], { name: nodeName(n.id) }), "warn");
+}
+
+function groupSelected() {
+  const n = selectedNode();
+  if (!n) return;
+  structEdit(et("log.grouped", { name: nodeName(n.id) }), (d) => groupLayer(d, n.id, et("layer.groupName")) ?? undefined);
+}
 
 function syncLayerTools() {
   const off = !selectedNode() || !current?.assets || doc?.type !== "scene";
-  for (const b of [lyUpEl, lyDownEl, lyDupEl, lyDelEl]) b.disabled = off;
+  for (const b of [lyUpEl, lyDownEl, lyGroupEl, lyDupEl, lyDelEl]) b.disabled = off;
   lyAddEl.disabled = !overlay || doc?.type !== "scene";
   lyAddTextEl.disabled = lyAddEl.disabled;
   lyAddParticleEl.disabled = lyAddEl.disabled;
@@ -1775,8 +1852,8 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
     lock.innerHTML = isLocked(n.id) ? LOCK_SVG : UNLOCK_SVG;
     lock.onclick = (e) => {
       e.stopPropagation();
-      if (isLocked(n.id)) locked.delete(String(n.id));
-      else locked.add(String(n.id));
+      setLocked(n.obj, !isLocked(n.id));
+      markDirty();
       renderTree();
       if (n.id === selectedId) renderInspector();
     };
@@ -1794,7 +1871,10 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
     actions.append(lock, eye);
     row.appendChild(actions);
   }
+  row.dataset.id = String(n.id);
+  if (editor && current?.assets && !isLocked(n.id)) row.addEventListener("pointerdown", (e) => startTreeDrag(e, n, row));
   row.onclick = () => {
+    if (treeDragged) return;
     selectedId = n.id;
     renderTree();
     renderInspector();
