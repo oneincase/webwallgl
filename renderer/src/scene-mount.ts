@@ -6866,6 +6866,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // 接到调用方：库走 onError，全屏页走降级页 —— 而不是让宿主对着白板干等。
               if (rt.renderer?.contextLost?.()) {
                 const err = new Error("WebGL 上下文丢失：画面已冻结且不再更新，需要重挂载");
+                err.name = "ContextLostError";
                 reportDiag(rt, cfg, `上下文丢失：渲染已停止更新（引擎不重建 GL 资源）`, "error");
                 disposed = true;
                 failEditorWaiters(err);

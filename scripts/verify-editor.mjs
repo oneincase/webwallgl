@@ -2196,6 +2196,22 @@ section("AG. 时间轴按层动画条 / 关键帧复制粘贴 keyframes.ts");
   check(json(kfMod.copyKeysAt(roundTrip, 1)) === json({ origin: [100, 0, 0] }), "复制 → 粘到另一层 → 再复制：值一致");
 }
 
+section("AH. WebGL 上下文丢失自愈 editor/recover.ts（R7 过渡方案）");
+{
+  const rc = await loadEditorModule("recover");
+  const st = [];
+  check(rc.allowRecover(st, 0) && rc.allowRecover(st, 1000) && rc.allowRecover(st, 2000) && !rc.allowRecover(st, 3000) && st.length === 3, "一分钟内最多自动重挂 3 次，第 4 次拒绝（拒绝不记账）");
+  check(rc.allowRecover(st, 60_000) && json(st) === json([1000, 2000, 60_000]), "最早一次滑出 60s 窗口后又允许（过期项原地修剪）");
+  check(!rc.allowRecover([], NaN) && rc.allowRecover([], 5, 1, 10) && !rc.allowRecover([5], 9, 1, 10), "非法时刻拒绝；max / window 可调");
+  const e = new Error("x");
+  e.name = "ContextLostError";
+  check(rc.isContextLost(e) && !rc.isContextLost(new Error("WebGL 上下文丢失")) && !rc.isContextLost({ name: "ContextLostError" }), "只认 name = ContextLostError 的 Error（不靠文案匹配）");
+  const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/const err = new Error\("WebGL 上下文丢失[^"]*"\);\s*err\.name = "ContextLostError";/.test(smSrc), "引擎上下文丢失的 onError 带 name = ContextLostError");
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/onError: \(err\) => \{\s*if \(isContextLost\(err\)\) onContextLost\(gen\);/.test(mainSrc) && /function onContextLost\(gen: number\) \{\s*if \(gen !== openGen\) return;\s*if \(!allowRecover\(recoverStamps, Date\.now\(\)\)\)/.test(mainSrc) && /log\(et\("log\.ctxLostRecover"\), "warn"\);\s*void mountCurrent\(true\);/.test(mainSrc), "编辑器：本代实例丢上下文 → 限频后按当前文档保持时刻重挂；旧一代的错误不理");
+}
+
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
 {
   const realFetch = globalThis.fetch;
@@ -2354,6 +2370,15 @@ section("I. 接线");
 // ───────────────────────────────────────────────────────────────────────────
 section("J. 变异红测");
 {
+  {
+    const rcPath = path.join(ROOT, "editor/recover.ts");
+    const rcSrc = fs.readFileSync(rcPath, "utf8");
+    const mutRc = rcSrc.replace("  if (stamps.length >= max) return false;\n", "");
+    check(mutRc !== rcSrc, "注入点存在（allowRecover 上限）");
+    const mr = await loadEditorModule("recover", { [rcPath]: mutRc });
+    const st = [];
+    check([0, 1, 2, 3].every((t) => mr.allowRecover(st, t)), "去掉上限后「第 4 次拒绝」判据变红（会无限重挂）");
+  }
   {
     const kfPath = path.join(ROOT, "editor/keyframes.ts");
     const kfSrc = fs.readFileSync(kfPath, "utf8");

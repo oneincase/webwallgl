@@ -355,6 +355,10 @@ export type DiagnosticLevel = "info" | "warn" | "error";
 
 export type SceneEvents = {
   ready: (info: SceneInfo) => void;
+  /**
+   * 致命错误。WebGL 上下文丢失时 `err.name === "ContextLostError"`：引擎不重建 GL 资源，
+   * 调用方按需 destroy 后重新 mount（mount 会换新画布）。
+   */
   error: (err: Error) => void;
   diagnostic: (msg: string, level: DiagnosticLevel) => void;
 };

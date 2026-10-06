@@ -130,6 +130,7 @@ import {
   type AnimMode,
   type KeyClip,
 } from "./keyframes";
+import { allowRecover, isContextLost, RECOVER_MAX } from "./recover";
 import {
   PROP_TYPES,
   bindProp,
@@ -432,6 +433,19 @@ function destroyInstance() {
 }
 
 /** keepTime：结构编辑后的重挂接着原时间点看，而不是从 0 秒重新开场 */
+const recoverStamps: number[] = [];
+
+/** 上下文丢失：按当前文档重挂（保持时刻与暂停）；短时间内反复丢就停手，留给用户手动「重新加载」 */
+function onContextLost(gen: number) {
+  if (gen !== openGen) return;
+  if (!allowRecover(recoverStamps, Date.now())) {
+    log(et("log.ctxLostGiveUp", { n: RECOVER_MAX }), "error");
+    return;
+  }
+  log(et("log.ctxLostRecover"), "warn");
+  void mountCurrent(true);
+}
+
 async function mountCurrent(keepTime = false) {
   if (!current) return;
   const gen = ++openGen;
@@ -451,6 +465,9 @@ async function mountCurrent(keepTime = false) {
       volume: 0,
       scripts: scriptsAllowed,
       onDiagnostic: (msg, level) => log(msg, level),
+      onError: (err) => {
+        if (isContextLost(err)) onContextLost(gen);
+      },
     });
     if (gen !== openGen) {
       inst.destroy({ releasePkgCache: true });

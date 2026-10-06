@@ -2097,4 +2097,49 @@ async function runCreateAndDraft(ctx) {
   await settle();
   check((await h.selectedName()) !== null && (await ev(`document.querySelector('#ed-tree .ed-node.selected')?.dataset.id`)) === hA && (await lanes())[0].sel, "点动画条那一行：选中对应图层");
   check((await h.errorLines()).length === 0, "动画条 / 复制粘贴全程无错误");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AI. WebGL 上下文丢失自愈（丢上下文 → 按当前文档重挂、编辑不丢 → 一分钟内第 4 次停手 → 手动重新加载）");
+  await gotoEditor();
+  await newBlank("#000000");
+  await addTextPreset("plain");
+  await setText("content", "MMM");
+  await setText("size", "12");
+  await h.setInputs({ 0: 600, 1: 540 });
+  await settle();
+  const inkC = async () => (await inkIn(...worldBox(await h.canvasRect(), [600, 540], [40, 25]), 690)).frac;
+  const conHas = (re) => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${re}.test(d.textContent)).length`);
+  const loseCtx = () =>
+    ev(`(() => { const c = document.querySelector('#ed-stage canvas[data-webwallgl]'); c.dataset.probe = 'old'; const gl = c.getContext('webgl2'); const x = gl && gl.getExtension('WEBGL_lose_context'); if (!x) return false; x.loseContext(); return true; })()`);
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  const ink0 = await inkC();
+  const names0 = await h.treeNames();
+  check(ink0 > 0.05, `基线：文字在 (600, 540)（墨水 ${ink0.toFixed(3)}）`);
+  let rCtx = await h.readyCount();
+  check(await loseCtx(), "WEBGL_lose_context 可用，主动丢上下文");
+  await h.waitRemount(rCtx);
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await conHas(/上下文丢失，正在按当前文档重建|lost its WebGL context/)) === 1, "控制台记一条「上下文丢失，正在重建」");
+  check(await ev(`(() => { const cs = document.querySelectorAll('#ed-stage canvas[data-webwallgl]'); return cs.length === 1 && cs[0].dataset.probe !== 'old'; })()`), "换了一块新画布（旧的死画布已移除）");
+  const ink1 = await inkC();
+  check(ink1 > 0.05 && json(await h.treeNames()) === json(names0) && (await h.dirtyTitle()), `★ 重挂后画面恢复（墨水 ${ink1.toFixed(3)}），图层与未保存状态都在`);
+  check(Math.abs((await h.numInputs())[0] - 600) < 0.5, "检视器里的编辑值仍在（x = 600）");
+  for (let i = 0; i < 2; i++) {
+    rCtx = await h.readyCount();
+    await loseCtx();
+    await h.waitRemount(rCtx);
+  }
+  check((await conHas(/上下文丢失，正在按当前文档重建|lost its WebGL context/)) === 3, "再丢两次：又自动重建两次（一分钟内共 3 次）");
+  rCtx = await h.readyCount();
+  await loseCtx();
+  await new Promise((r) => setTimeout(r, 1500));
+  check((await h.readyCount()) === rCtx && (await conHas(/停止自动重建|auto-rebuild stopped/)) === 1, "★ 一分钟内第 4 次：停止自动重建（不再重挂、记一条错误）");
+  rCtx = await h.readyCount();
+  await clickSel("#tb-reload");
+  await h.waitRemount(rCtx);
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkC()) > 0.05, "手动「重新加载」：画面回来");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
 }
