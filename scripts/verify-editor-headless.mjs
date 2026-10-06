@@ -1206,14 +1206,14 @@ async function runCreateAndDraft(ctx) {
   // ════════════════════════════════════════════════════════════════════════
   section("Y. 文字层端到端（空白 → 文字 / 时钟层 → 改内容 / 字号 / 颜色 / 导入字体 → 撤销 → 存库 → 测试台出帧一致）");
   /** 页面矩形内的墨水：亮像素占比 + 亮像素平均色（黑底） */
-  const inkIn = async ([x0, y0], [x1, y1]) => {
+  const inkIn = async ([x0, y0], [x1, y1], thr = 200) => {
     const clip = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.max(2, Math.abs(x1 - x0)), height: Math.max(2, Math.abs(y1 - y0)), scale: 1 };
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip });
     return ev(`(async () => {
       const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
       const c = new OffscreenCanvas(bmp.width, bmp.height); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0);
       const d = g.getImageData(0, 0, bmp.width, bmp.height).data; let n = 0; const s = [0, 0, 0];
-      for (let i = 0; i < d.length; i += 4) { if (d[i] + d[i + 1] + d[i + 2] > 200) { n++; s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; } }
+      for (let i = 0; i < d.length; i += 4) { if (d[i] + d[i + 1] + d[i + 2] > ${thr}) { n++; s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; } }
       return { frac: n / (d.length / 4), color: n ? s.map((v) => Math.round(v / n)) : [0, 0, 0] };
     })()`);
   };
@@ -1349,4 +1349,99 @@ async function runCreateAndDraft(ctx) {
   check(bClock.frac > 0.05, `★ 测试台时钟层画出时间（墨水占比 ${bClock.frac.toFixed(3)}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/text-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/text-in-bench.jpg`);
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("Z. 粒子层端到端（空白 → 雪 → 调数量 / 颜色 → 撤销 → 火花 → 存库 → 测试台出帧）");
+  const ptSet = (name, value) =>
+    fxAct(`const el = document.querySelector('.ed-particle [data-particle="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const ptCheck = (name, on) =>
+    fxAct(`const el = document.querySelector('.ed-particle [data-particle="${name}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  const addParticlePreset = async (preset) => {
+    const r0 = await h.readyCount();
+    await clickSel("#ly-add-particle");
+    await clickSel(`#particle-menu button[data-preset="${preset}"]`);
+    await h.waitRemount(r0);
+  };
+  /** 整个画面的墨水（粒子随机，取全屏统计；halo 边缘很软，门槛放低） */
+  const fullInk = async (cr) => {
+    await new Promise((r) => setTimeout(r, 900));
+    return inkIn(...worldBox(cr, [960, 540], [956, 536]), 60);
+  };
+  const whitish = (c) => Math.min(...c) > 40 && Math.max(...c) - Math.min(...c) < 25;
+  const reddish = (c) => c[0] > 80 && c[0] > 2 * c[1] && c[0] > 2 * c[2];
+
+  await gotoEditor();
+  check(await ev(`document.querySelector('#ly-add-particle').disabled`), "未打开场景时「添加粒子层」不可用");
+  await newBlank("#000000");
+  check(!(await ev(`document.querySelector('#ly-add-particle').disabled`)), "新建后「添加粒子层」可用");
+  await clickSel("#ly-add-particle");
+  check(await ev(`!document.querySelector('#particle-menu').hidden && document.querySelectorAll('#particle-menu button[data-preset]').length === 4`), "点开粒子菜单：雪 / 雨 / 火花 / 光点四项");
+  await clickSel("#ly-add-text");
+  check(await ev(`document.querySelector('#particle-menu').hidden && !document.querySelector('#text-menu').hidden`), "点文字按钮：粒子菜单收起、文字菜单打开（同时只开一个）");
+  await clickSel("#ly-add-text");
+
+  await addParticlePreset("snow");
+  const snowName = (await h.treeNames())[0];
+  check((await h.treeNames()).length === 1 && (await h.selectedName()) === snowName && /雪|Snow/.test(snowName), `添加雪：树里一层「${snowName}」并选中`);
+  check(await ev(`document.querySelectorAll('.ed-particle input[type=range][data-particle]').length === 6 && !!document.querySelector('.ed-particle [data-particle="color"]')`), "检视器有「粒子」分组：6 个倍率滑条 + 颜色");
+  check(await ev(`!document.querySelector('.ed-particle [data-particle="colorOn"]').checked && document.querySelector('.ed-particle [data-particle="color"]').disabled`), "缺省不覆盖颜色（颜色框灰掉）");
+  let po = await rawObj();
+  check(po.particle === "particles/editor/snow.json" && po.instanceoverride?.count === 1, "文档：particle 指向 particles/editor/snow.json，倍率初始 1");
+  const crZ = await h.canvasRect();
+  const snowInk = await fullInk(crZ);
+  check(snowInk.frac > 0.002 && whitish(snowInk.color), `画面真画出白色雪花（墨水占比 ${snowInk.frac.toFixed(4)}，色 ${snowInk.color}）`);
+
+  await ptSet("count", "0");
+  po = await rawObj();
+  const noneInk = await fullInk(crZ);
+  check(po.instanceoverride.count === 0 && noneInk.frac < snowInk.frac * 0.2, `数量拖到 0：instanceoverride.count = 0，画面几乎没有雪（${noneInk.frac.toFixed(4)}）`);
+  let rz = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rz);
+  po = await rawObj();
+  const backInk = await fullInk(crZ);
+  check(po.instanceoverride.count === 1 && backInk.frac > snowInk.frac * 0.5, `撤销：数量回到 1，雪回来（${backInk.frac.toFixed(4)}）`);
+
+  await ptSet("size", "3");
+  await ptCheck("colorOn", true);
+  await ptSet("color", "#ff0000");
+  po = await rawObj();
+  check(po.instanceoverride.size === 3 && po.instanceoverride.colorn === "1.000 0.000 0.000", `大小 3 + 颜色覆盖红：instanceoverride ${JSON.stringify(po.instanceoverride)}`);
+  check(await ev(`document.querySelector('.ed-particle [data-particle="colorOn"]').checked && document.querySelector('.ed-particle [data-particle="color"]').value === '#ff0000'`), "检视器重绘后控件与文档一致");
+  const redInk = await fullInk(crZ);
+  check(redInk.frac > snowInk.frac * 1.5 && reddish(redInk.color), `画面：雪花变大变红（墨水 ${redInk.frac.toFixed(4)}，色 ${redInk.color}）`);
+
+  await addParticlePreset("embers");
+  const namesZ = await h.treeNames();
+  check(namesZ.length === 2 && /火花|Embers/.test(namesZ[1]), `添加火花：第二层「${namesZ[1]}」`);
+  const errsZ = await h.errorLines();
+  check(errsZ.length === 0, `粒子层编辑全程无错误${errsZ.length ? `：${errsZ.slice(0, 2).join(" / ")}` : ""}`);
+
+  const libBeforeZ = new Set(fs.readdirSync(lib));
+  const scZ = await h.savedCount();
+  await clickSel("#tb-save");
+  if (await ev(`document.querySelector('#save-pkg').checked`)) await clickSel("#save-pkg");
+  await clickSel("#save-lib");
+  await h.waitSaved(scZ);
+  const savedZ = fs.readdirSync(lib).filter((n) => !libBeforeZ.has(n));
+  check(savedZ.length === 1, `另存到壁纸库：新条目 ${savedZ[0]}`);
+  const dirZ = path.join(lib, savedZ[0]);
+  const sceneZ = JSON.parse(fs.readFileSync(path.join(dirZ, "scene.json"), "utf8"));
+  const [zSnow, zEmbers] = sceneZ.objects;
+  check(sceneZ.objects.length === 2 && zSnow.instanceoverride?.colorn === "1.000 0.000 0.000" && zSnow.instanceoverride?.size === 3 && zEmbers.particle === "particles/editor/embers.json", "盘上 scene.json：雪的调参与火花层");
+  const onDisk = ["particles/editor/snow.json", "materials/editor/particles/snow.json", "particles/editor/embers.json", "materials/editor/particles/embers.json"];
+  check(onDisk.every((f) => fs.existsSync(path.join(dirZ, f))), "盘上两层各自的粒子 / 材质文件都在");
+  check(JSON.parse(fs.readFileSync(path.join(dirZ, "materials/editor/particles/embers.json"), "utf8")).passes[0].textures[0] === "particle/halo" && !fs.existsSync(path.join(dirZ, "materials/particle")), "材质只引用内置名，没有拷贝贴图文件");
+
+  await cdp.send("Page.navigate", {
+    url: `${origin}/renderer/index.html?type=scene&src=${savedZ[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
+  });
+  await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const vpZ = await ev(`({ w: innerWidth, h: innerHeight })`);
+  const benchZ = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 540], [956, 536]), 60);
+  const top = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 800], [956, 270]), 60);
+  check(benchZ.frac > snowInk.frac && top.color[0] > 80 && top.color[0] > top.color[2] + 30, `★ 测试台出帧：红色大雪花 + 火花（墨水 ${benchZ.frac.toFixed(4)}，上半屏色 ${top.color}）`);
+  await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/particles-in-bench.jpg") });
+  console.log(`  截图：scripts/.tmp-editor-e2e/particles-in-bench.jpg`);
 }

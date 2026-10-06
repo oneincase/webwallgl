@@ -160,6 +160,9 @@
               <button type="button" class="ed-icon" id="ly-add-text" disabled data-et-title="ly.addText" title="添加文字层" aria-haspopup="menu">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4V2.5h8V4 M7 2.5v10 M5.5 12.5h3 M12.5 9v5 M10 11.5h5" /></svg>
               </button>
+              <button type="button" class="ed-icon" id="ly-add-particle" disabled data-et-title="ly.addParticle" title="添加粒子层" aria-haspopup="menu">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M4 3v2 M3 4h2 M9 2.5v3 M7.5 4h3 M5 9v2 M4 10h2 M10.5 9.5v3 M9 11h3 M3 14h.01 M13.5 6h.01 M8 7.5h.01" /></svg>
+              </button>
               <button type="button" class="ed-icon" id="ly-up" disabled data-et-title="ly.up" title="前移">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 13V3 M4 7l4-4 4 4" /></svg>
               </button>
@@ -178,6 +181,12 @@
             <button type="button" role="menuitem" data-preset="plain" data-et="text.plain">文字</button>
             <button type="button" role="menuitem" data-preset="clock" data-et="text.clock">时钟</button>
             <button type="button" role="menuitem" data-preset="date" data-et="text.date">日期</button>
+          </div>
+          <div id="particle-menu" class="ed-menu" role="menu" hidden>
+            <button type="button" role="menuitem" data-preset="snow" data-et="pt.snow">雪</button>
+            <button type="button" role="menuitem" data-preset="rain" data-et="pt.rain">雨</button>
+            <button type="button" role="menuitem" data-preset="embers" data-et="pt.embers">火花</button>
+            <button type="button" role="menuitem" data-preset="bokeh" data-et="pt.bokeh">光点</button>
           </div>
           <div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree"></div>
         </section>

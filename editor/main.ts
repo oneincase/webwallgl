@@ -80,6 +80,20 @@ import {
   type TextPreset,
 } from "./text";
 import {
+  PARTICLE_PARAMS,
+  PARTICLE_RANGES,
+  addParticleLayer,
+  getParticleParams,
+  particleLayerFiles,
+  particlePathOf,
+  particleSlug,
+  referencedParticles,
+  setParticleColor,
+  setParticleParam,
+  type ParticleParam,
+  type ParticlePreset,
+} from "./particles";
+import {
   PROP_TYPES,
   bindProp,
   bindableFor,
@@ -388,9 +402,9 @@ $<HTMLButtonElement>("#scripts-allow").onclick = () => {
   void mountCurrent(true);
 };
 
-/** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 */
+/** 资源表的分组引用：图片层的模型 + 图层挂的效果文件 + 工程字体 + 粒子文件 */
 const referencedGroups = (d: EditorDoc | null) =>
-  new Set([...referencedModels(d), ...referencedEffects(d), ...referencedFonts(d)]);
+  new Set([...referencedModels(d), ...referencedEffects(d), ...referencedFonts(d), ...referencedParticles(d)]);
 
 type OpenOptions = {
   origin?: DraftOrigin | null;
@@ -1509,26 +1523,33 @@ lyAddEl.onclick = () => {
 };
 const lyAddTextEl = $<HTMLButtonElement>("#ly-add-text");
 const textMenuEl = $<HTMLElement>("#text-menu");
-lyAddTextEl.onclick = (e) => {
-  e.stopPropagation();
-  if (!textMenuEl.hidden) {
-    textMenuEl.hidden = true;
-    return;
-  }
-  const r = lyAddTextEl.getBoundingClientRect();
-  textMenuEl.style.left = `${r.left}px`;
-  textMenuEl.style.top = `${r.bottom + 2}px`;
-  textMenuEl.hidden = false;
-};
-document.addEventListener("click", (e) => {
-  if (!textMenuEl.hidden && !textMenuEl.contains(e.target as Node)) textMenuEl.hidden = true;
-});
-for (const b of textMenuEl.querySelectorAll<HTMLButtonElement>("button[data-preset]")) {
-  b.onclick = () => {
-    textMenuEl.hidden = true;
-    addText(b.dataset.preset as TextPreset);
+const lyAddParticleEl = $<HTMLButtonElement>("#ly-add-particle");
+const particleMenuEl = $<HTMLElement>("#particle-menu");
+function presetMenu(btn: HTMLButtonElement, menu: HTMLElement, pick: (preset: string) => void) {
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    for (const m of [textMenuEl, particleMenuEl]) if (m !== menu) m.hidden = true;
+    if (!menu.hidden) {
+      menu.hidden = true;
+      return;
+    }
+    const r = btn.getBoundingClientRect();
+    menu.style.left = `${r.left}px`;
+    menu.style.top = `${r.bottom + 2}px`;
+    menu.hidden = false;
   };
+  document.addEventListener("click", (e) => {
+    if (!menu.hidden && !menu.contains(e.target as Node)) menu.hidden = true;
+  });
+  for (const b of menu.querySelectorAll<HTMLButtonElement>("button[data-preset]")) {
+    b.onclick = () => {
+      menu.hidden = true;
+      pick(b.dataset.preset!);
+    };
+  }
 }
+presetMenu(lyAddTextEl, textMenuEl, (p) => addText(p as TextPreset));
+presetMenu(lyAddParticleEl, particleMenuEl, (p) => addParticle(p as ParticlePreset));
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -1539,6 +1560,7 @@ function syncLayerTools() {
   for (const b of [lyUpEl, lyDownEl, lyDupEl, lyDelEl]) b.disabled = off;
   lyAddEl.disabled = !overlay || doc?.type !== "scene";
   lyAddTextEl.disabled = lyAddEl.disabled;
+  lyAddParticleEl.disabled = lyAddEl.disabled;
 }
 
 function renderTree() {
@@ -2163,6 +2185,85 @@ function textGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 粒子层（P4）：模板新建 + instanceoverride 调参 ----------
+
+function addParticle(preset: ParticlePreset) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const name = et(`pt.${preset}`);
+  structEdit(et("log.particleAdded", { name }), (d) => {
+    const refs = referencedParticles(d);
+    const listed = new Set(overlay!.list());
+    const slug = particleSlug(preset, (p) => overlay!.has(p) || refs.has(p) || listed.has(p));
+    for (const f of particleLayerFiles(d, preset, slug)) overlay!.put(f.name, f.data, particlePathOf(slug));
+    return addParticleLayer(d, preset, name, slug) ?? undefined;
+  });
+}
+
+function particleGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-particle";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.particle");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!overlay && !isLocked(node.id);
+  const p = getParticleParams(node.obj);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const edit = (key: string, mutate: (o: LayerNode["obj"]) => boolean) =>
+    objEdit(et("log.particleEdited", { layer: nodeName(node.id), field: et(key) }), node.id, mutate);
+
+  for (const k of PARTICLE_PARAMS) {
+    const r = PARTICLE_RANGES[k];
+    const l = document.createElement("label");
+    l.textContent = et(`pt.${k}`);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    const inp = document.createElement("input");
+    inp.type = "range";
+    inp.min = String(r.min);
+    inp.max = String(r.max);
+    inp.step = String(r.step);
+    inp.value = String(p[k]);
+    inp.disabled = !editable;
+    inp.dataset.particle = k;
+    const val = document.createElement("span");
+    val.className = "ed-val";
+    val.textContent = fmtNum(p[k]);
+    inp.addEventListener("input", () => (val.textContent = fmtNum(Number(inp.value))));
+    inp.addEventListener("change", () => edit(`pt.${k}`, (o) => setParticleParam(o, k as ParticleParam, Number(inp.value))));
+    box.append(inp, val);
+    form.append(l, box);
+  }
+
+  const l = document.createElement("label");
+  l.textContent = et("pt.color");
+  const box = document.createElement("div");
+  box.className = "ed-fx-param";
+  const on = document.createElement("input");
+  on.type = "checkbox";
+  on.checked = !!p.color;
+  on.disabled = !editable;
+  on.dataset.particle = "colorOn";
+  on.title = et("pt.colorOn");
+  const color = document.createElement("input");
+  color.type = "color";
+  color.value = toHex(p.color ?? [1, 1, 1]);
+  color.disabled = !editable || !p.color;
+  color.dataset.particle = "color";
+  on.addEventListener("change", () => edit("pt.color", (o) => setParticleColor(o, on.checked ? fromHex(color.value) : null)));
+  color.addEventListener("change", () => edit("pt.color", (o) => setParticleColor(o, fromHex(color.value))));
+  box.append(on, color);
+  form.append(l, box);
+
+  group.appendChild(form);
+  group.appendChild(note(et("pt.hint")));
+  return group;
+}
+
 // ---------- 脚本（W8）：语法预检 → 应用（结构编辑重挂）→ 运行期错误按挂点回显 ----------
 
 /** 未应用的脚本改动（检视器重绘时不丢），键 = 图层 id | 挂点；换文档即清空 */
@@ -2577,6 +2678,7 @@ function renderInspector() {
   }
   inspectorEl.appendChild(editGroup(node));
   if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
+  if (node.kind === "particle") inspectorEl.appendChild(particleGroup(node));
   if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
   inspectorEl.appendChild(bindingsGroup(node));
   inspectorEl.appendChild(scriptsGroup(node));

@@ -1630,6 +1630,134 @@ section("Y2. 文字层闭环（新建 → 文字层 + 导入字体 → 存库 �
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Z. 粒子层（P4）：editor/particles.ts 模板 / instanceoverride 读写
+// ───────────────────────────────────────────────────────────────────────────
+section("Z. 粒子层 editor/particles.ts");
+const ptMod = await loadEditorModule("particles");
+const psMod = await imp("renderer/vendor/we-scene/render/particles.js");
+const ptexMod = await imp("renderer/vendor/we-scene/render/particle-textures.js");
+/** 引擎 ParticleSystem 不带 GL 真仿真（预热 + secs 秒），返回存活粒子（局部坐标，y 朝上） */
+function simulate(def, override, secs = 1) {
+  const ps = new psMod.ParticleSystem(null, def, override, { origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0], visible: true });
+  for (let t = 0; t < secs; t += 1 / 30) ps.advance(1 / 30);
+  return { ps, alive: ps.pool.filter((p) => p.alive) };
+}
+const inRect = (alive, W, H) => alive.filter((p) => Math.abs(p.x) <= W / 2 && Math.abs(p.y) <= H / 2).length / Math.max(1, alive.length);
+{
+  const doc = createMod.newDocument("p", 1920, 1080, [0, 0, 0]);
+  const ov = assetsMod.overlayAssets("scene.json", { entry: "scene.json", read: async () => null, list: () => [] }, () => ptMod.referencedParticles(doc));
+  const slug = ptMod.particleSlug("snow", (p) => ov.has(p));
+  check(slug === "snow" && ptMod.particleSlug("snow", (p) => p === "particles/editor/snow.json") === "snow-2", "particleSlug：模板名，判重加 -2");
+  const files = ptMod.particleLayerFiles(doc, "snow", slug);
+  check(json(files.map((f) => f.name)) === json(["particles/editor/snow.json", "materials/editor/particles/snow.json"]), "一个粒子层两件：粒子系统 + 材质");
+  const sys = JSON.parse(dec.decode(files[0].data));
+  const mat = JSON.parse(dec.decode(files[1].data));
+  check(sys.material === "materials/editor/particles/snow.json" && sys.maxcount === 500 && sys.starttime === 20 && sys.emitter[0].name === "boxrandom", "粒子系统引用自己的材质，maxcount / starttime 写全");
+  const pass = mat.passes[0];
+  check(pass.shader === "genericparticle" && json(pass.textures) === json(["particle/halo"]) && pass.blending === "translucent", "材质：genericparticle + 内置名 particle/halo（不拷素材）");
+  check(ptexMod.isBuiltinParticleTextureName("particle/halo") && !!ptexMod.buildBuiltinParticleTexture("particle/halo"), "particle/halo 是引擎认得的内置名，没有文件也能程序化生成");
+  const ids1 = [...sys.emitter, ...sys.initializer, ...sys.operator, ...sys.renderer].map((x) => x.id);
+  check(new Set(ids1).size === ids1.length && ids1.every((x) => Number.isInteger(x) && x > 0), "各组件带唯一正整数 id（WE 编辑器的形态）");
+
+  const id = ptMod.addParticleLayer(doc, "snow", "雪", slug);
+  const o = doc.scene.objects.find((x) => x.id === id);
+  check(doc.roots.some((n) => n.id === id && n.kind === "particle"), "新粒子层进图层树，种类 particle");
+  check(o.particle === "particles/editor/snow.json" && o.origin === "960.000 540.000 0.000" && o.visible === true && json(o.instanceoverride) === json({ alpha: 1, count: 1, lifetime: 1, rate: 1, size: 1, speed: 1 }), "放在场景中心，instanceoverride 六个倍率初始 1");
+  check(!ptMod.addParticleLayer(doc, "fog", "x", "fog"), "未知模板拒绝");
+  const L = parseMod.parseScene(structuredClone(doc.scene), { type: "scene" }).layers.find((l) => l.id === id);
+  check(!!L && L.particle === "particles/editor/snow.json" && json(L.origin) === json([960, 540, 0]) && L.instanceoverride?.count === 1, "引擎 parseScene 认得新粒子层（路径 / 位置 / instanceoverride）");
+  check(json([...ptMod.referencedParticles(doc)]) === json(["particles/editor/snow.json"]), "referencedParticles 收粒子层路径");
+
+  for (const [W, H] of [[1920, 1080], [1080, 1920]]) {
+    for (const preset of ptMod.PARTICLE_PRESETS) {
+      const def = ptMod.particleSystemDef(preset, preset, W, H);
+      const { alive } = simulate(def, null, 1);
+      const frac = inRect(alive, W, H);
+      check(alive.length >= 20 && frac >= 0.6, `${preset} @${W}×${H}：引擎仿真预热后有粒子（${alive.length} 颗），${(frac * 100).toFixed(0)}% 落在画面内`);
+    }
+  }
+  const vy = (preset) => {
+    const { alive } = simulate(ptMod.particleSystemDef(preset, preset, 1920, 1080), null, 1);
+    return alive.reduce((s, p) => s + p.vy, 0) / alive.length;
+  };
+  check(vy("snow") < -30 && vy("rain") < -1000 && vy("embers") > 30, "运动方向：雪慢落、雨快落、火花上飘（y 朝上）");
+  const rainDef = ptMod.particleSystemDef("rain", "rain", 1920, 1080);
+  check(rainDef.renderer[0].name === "spritetrail" && psMod.spriteTrailLengthFactor(1700, rainDef.renderer[0].length, 0, rainDef.renderer[0].maxlength) > 10, "雨用 spritetrail：典型速度下拖尾 > 10 倍宽（是雨丝不是圆点）");
+  check(ptMod.particleMaterialDef("embers").passes[0].blending === "additive" && ptMod.particleMaterialDef("bokeh").passes[0].blending === "additive", "火花 / 光点叠加混合");
+
+  const p0 = ptMod.getParticleParams({ particle: "x.json" });
+  check(ptMod.PARTICLE_PARAMS.every((k) => p0[k] === 1) && p0.color === null, "无 instanceoverride：倍率都读成 1、无颜色覆盖");
+  check(ptMod.setParticleParam(o, "count", 0.5) && o.instanceoverride.count === 0.5 && !ptMod.setParticleParam(o, "count", 0.5), "改数量写 instanceoverride.count，同值不算改动");
+  check(ptMod.setParticleParam(o, "count", 0) && ptMod.setParticleParam(o, "rate", 0) && ptMod.setParticleParam(o, "alpha", 0), "count / rate / alpha 可以写 0（不发射 / 定格 / 隐形）");
+  check(["size", "speed", "lifetime"].every((k) => !ptMod.setParticleParam(o, k, 0)), "size / speed / lifetime 不收 0（引擎按 `|| 1` 读，0 会变回 1）");
+  check(!ptMod.setParticleParam(o, "alpha", 1.5) && !ptMod.setParticleParam(o, "count", 6) && !ptMod.setParticleParam(o, "size", NaN) && !ptMod.setParticleParam(o, "brightness", 1), "越界 / NaN / 不认识的键拒绝");
+  check(ptMod.setParticleParam(o, "speed", 1.23456) && o.instanceoverride.speed === 1.235, "写入取 3 位小数");
+  check(!ptMod.setParticleParam({ image: "m.json" }, "count", 1) && !ptMod.setParticleColor({ image: "m.json" }, [1, 0, 0]), "非粒子层一律拒绝");
+  const bare = { particle: "x.json" };
+  check(ptMod.setParticleParam(bare, "size", 2) && json(bare.instanceoverride) === json({ size: 2 }), "没有 instanceoverride 的外来粒子层：按需建一张");
+  const bound = { particle: "x.json", instanceoverride: { size: { user: "sz", value: 1 }, colorn: { user: "c", value: "1 1 1" } } };
+  check(ptMod.setParticleParam(bound, "size", 3) && json(bound.instanceoverride.size) === json({ user: "sz", value: 3 }) && ptMod.getParticleParams(bound).size === 3, "绑定了用户属性的倍率：只改 value，绑定保留");
+  check(ptMod.setParticleColor(bound, [1, 0, 0]) && json(bound.instanceoverride.colorn) === json({ user: "c", value: "1.000 0.000 0.000" }), "绑定了用户属性的颜色：只改 value");
+  check(!ptMod.setParticleColor(bound, null) && !!bound.instanceoverride.colorn, "绑定了用户属性的颜色不能去掉覆盖");
+
+  check(ptMod.setParticleColor(o, [2, 0.5, -1]) && o.instanceoverride.colorn === "1.000 0.500 0.000" && json(ptMod.getParticleParams(o).color) === json([1, 0.5, 0]), "颜色覆盖写 colorn（夹到 0..1）");
+  check(ptMod.setParticleColor(o, null) && !("colorn" in o.instanceoverride) && ptMod.getParticleParams(o).color === null && !ptMod.setParticleColor(o, null), "去掉颜色覆盖：删 colorn，再去一次是空操作");
+  const legacy = { particle: "x.json", instanceoverride: { color: "255 0 0" } };
+  check(json(ptMod.getParticleParams(legacy).color) === json([1, 0, 0]), "旧式 color（0..255）读成 0..1");
+  check(ptMod.setParticleColor(legacy, [0, 1, 0]) && !("color" in legacy.instanceoverride) && legacy.instanceoverride.colorn === "0.000 1.000 0.000", "写 colorn 时去掉裸 color（两者都在时引擎按键序后写的生效）");
+
+  const eng = { particle: "x.json", instanceoverride: {} };
+  for (const [k, v] of [["count", 0.5], ["speed", 2], ["size", 1.5], ["rate", 0.5], ["lifetime", 2], ["alpha", 0.25]]) ptMod.setParticleParam(eng, k, v);
+  ptMod.setParticleColor(eng, [1, 0, 0]);
+  const { ps } = simulate(ptMod.particleSystemDef("snow", "snow", 1920, 1080), eng.instanceoverride, 0);
+  check(ps.maxCount === 250 && ps._ov.speed === 2 && ps._ov.size === 1.5 && ps.timeScale === 0.5 && ps.lifetimeMul === 2 && ps.opacityMul === 0.25 && json(ps._ov.color) === json([1, 0, 0]), "写出的 instanceoverride 引擎按倍率吃进去（池 500 × 0.5、速度 / 大小 / 播放速率 / 寿命 / 不透明度 / 颜色）");
+  const few = simulate(ptMod.particleSystemDef("snow", "snow", 1920, 1080), { count: 0.25 }, 1).alive.length;
+  const many = simulate(ptMod.particleSystemDef("snow", "snow", 1920, 1080), { count: 1 }, 1).alive.length;
+  check(few < many * 0.5, `数量 0.25 时稳态粒子明显变少（${few} vs ${many}）`);
+}
+
+section("Z2. 粒子层闭环（新建 → 雪 + 光点，撤掉一层 → 存库 → 重新打开）");
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetch(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const doc = createMod.newDocument("粒子测试", 1280, 720, [0, 0, 0]);
+    const empty = { entry: "scene.json", read: async () => null, list: () => [] };
+    const ov = assetsMod.overlayAssets("scene.json", empty, () => new Set([...createMod.referencedModels(doc), ...fxMod.referencedEffects(doc), ...textMod.referencedFonts(doc), ...ptMod.referencedParticles(doc)]));
+    const add = (preset) => {
+      const slug = ptMod.particleSlug(preset, (p) => ov.has(p));
+      for (const f of ptMod.particleLayerFiles(doc, preset, slug)) ov.put(f.name, f.data, ptMod.particlePathOf(slug));
+      return ptMod.addParticleLayer(doc, preset, preset, slug);
+    };
+    const snowId = add("snow");
+    const snow2Id = add("snow");
+    add("bokeh");
+    check(doc.scene.objects.find((x) => x.id === snow2Id).particle === "particles/editor/snow-2.json", "同模板第二层 slug 判重（snow-2）");
+    docMod.removeLayer(doc, snow2Id);
+    const o = doc.scene.objects.find((x) => x.id === snowId);
+    ptMod.setParticleParam(o, "count", 2);
+    ptMod.setParticleColor(o, [0.5, 0.8, 1]);
+    const files = await saveMod.collectProject(doc, ov, null);
+    const names = files.map((f) => f.path).sort();
+    const want = ["particles/editor/snow.json", "materials/editor/particles/snow.json", "particles/editor/bokeh.json", "materials/editor/particles/bokeh.json"];
+    check(want.every((n) => names.includes(n)) && !names.some((n) => n.includes("snow-2")), `保存清单带上被引用的粒子两件套、不带删掉那层的（${json(names)}）`);
+    const itemId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(itemId, files);
+    const lib = await openMod.fetchLibrary();
+    const it = lib?.items.find((i) => i.itemId === itemId);
+    const reopened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(json(reopened.doc.scene) === json(doc.scene), "重新打开：粒子层（含 instanceoverride 调参）逐字段一致");
+    const sysBack = JSON.parse(dec.decode(await reopened.assets.read("particles/editor/snow.json")));
+    check(json(sysBack) === json(ptMod.particleSystemDef("snow", "snow", 1280, 720)), "重新打开：粒子系统文件可读，发射区按 1280×720 生成");
+    check(!!(await reopened.assets.read("materials/editor/particles/bokeh.json")), "重新打开：材质文件可读");
+    const { packed } = saveMod.packProject(files);
+    check(want.every((n) => packed.entries.includes(n)), "打成 scene.pkg 时粒子文件原样入包");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // I. 接线文本断言
 // ───────────────────────────────────────────────────────────────────────────
 section("I. 接线");
@@ -1648,7 +1776,7 @@ section("I. 接线");
   check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /saveToLibrary\(itemId, files, progress\)/.test(main), "保存走 collectProject → 目标写出");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main) && /from "\.\/draft"/.test(main), "页面从 create.ts / assets.ts / draft.ts 取模板、资源表与草稿");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
-  check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体（写进来的效果 / 字体随引用进出保存清单）");
+  check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)[^;]*referencedParticles\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体 ∪ 粒子文件（写进来的文件随引用进出保存清单）");
   check(/from "\.\/effects"/.test(main) && /function objEdit\([^\n]*\) \{\s*structEdit\(/.test(main), "效果面板从 effects.ts 取定义，修改走结构编辑（可撤销、整场景重挂）");
   check(/overlay\.put\(f\.name, f\.data, effectFileOf\(fxId\)\)/.test(main), "添加效果时把四件写进叠加层，分组 = effect.json 路径");
   check(/inp\.addEventListener\("change", \(\) => commit\(/.test(main), "参数在 change 时提交（拖动中只更新读数，不反复重挂）");
@@ -1699,6 +1827,14 @@ section("I. 接线");
   const txKeys = [...main.matchAll(/et\(\s*"((?:tx|text)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addText", "text.plain", "text.clock", "text.date", "tx.align.left", "tx.align.center", "tx.align.right", "tx.align.top", "tx.align.bottom", "log.textAdded", "log.textEdited", "log.fontImported", "log.fontFailed", "insp.text"]);
   const missingTx = [...new Set(txKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingTx.length === 0, `文字层文案中英文都有（缺 ${json(missingTx)}）`);
+  check(/from "\.\/particles"/.test(main) && /structEdit\(et\("log\.particleAdded", \{ name \}\), \(d\) => \{[^}]*overlay!\.put\(f\.name, f\.data, particlePathOf\(slug\)\);\s*return addParticleLayer\(d, preset, name, slug\)/.test(main), "添加粒子层取 particles.ts 模板、两件套写进叠加层（分组 = 粒子文件路径）、走结构编辑");
+  check(/if \(node\.kind === "particle"\) inspectorEl\.appendChild\(particleGroup\(node\)\);/.test(main) && /setParticleParam\(o, k as ParticleParam, Number\(inp\.value\)\)/.test(main) && /objEdit\(et\("log\.particleEdited"/.test(main), "粒子层检视器有「粒子」分组，滑条 change 时经 objEdit 写 instanceoverride（可撤销）");
+  check(/id="ly-add-particle"/.test(html) && /id="particle-menu"/.test(html) && ptMod.PARTICLE_PRESETS.every((p) => html.includes(`data-preset="${p}"`)) && /lyAddParticleEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加粒子层按钮 + 雪 / 雨 / 火花 / 光点菜单，可用性跟随添加图片");
+  const ptKeys = [...main.matchAll(/et\(\s*"((?:pt)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addParticle", "log.particleAdded", "log.particleEdited", "insp.particle"], ptMod.PARTICLE_PRESETS.map((p) => `pt.${p}`), ptMod.PARTICLE_PARAMS.map((p) => `pt.${p}`));
+  const missingPt = [...new Set(ptKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missingPt.length === 0, `粒子层文案中英文都有（缺 ${json(missingPt)}）`);
+  const ptSrc = fs.readFileSync(path.join(ROOT, "editor/particles.ts"), "utf8");
+  check(!/local-assets|\.tex"/.test(ptSrc) && /export const PARTICLE_TEXTURE = "particle\/halo";/.test(ptSrc), "粒子模板只引用内置贴图名，不碰 local-assets / 官方素材文件");
   const typesTs = fs.readFileSync(path.join(ROOT, "renderer/src/types.ts"), "utf8");
   check(/export const SYSTEM_FONT_FAMILIES/.test(typesTs) && !/export const SYSTEM_FONT_FAMILIES/.test(sm) && /SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE \} from "\.\/types"/.test(sm), "系统字体映射表只有一份（types.ts），引擎与编辑器共用");
   const pkgJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -1873,6 +2009,27 @@ section("J. 变异红测");
   const tm4 = { text: "a\nb", pointsize: 32 };
   txm3.refitTextBox(tm4, fakeMeasure);
   check(tm4.size !== "64.000 307.200", "盒高不乘行数时「多行盒高」判据变红");
+
+  const ptPath = path.join(ROOT, "editor/particles.ts");
+  const ptSrc = fs.readFileSync(ptPath, "utf8");
+  const ptMut = async (from, to, tag) => {
+    const mut = ptSrc.replace(from, to);
+    check(mut !== ptSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("particles", { [ptPath]: mut });
+  };
+  const pm1 = await ptMut('if (isWrapped(cur) && ("value" in cur || isBinding(cur))) {', "if (false) {", "倍率写入保留包装");
+  const pb = { particle: "x.json", instanceoverride: { size: { user: "sz", value: 1 } } };
+  pm1.setParticleParam(pb, "size", 3);
+  check(json(pb.instanceoverride.size) !== json({ user: "sz", value: 3 }), "写穿包装时「绑定保留」判据变红");
+  const pm2 = await ptMut("if (!Number.isFinite(n) || n < r.min || n > r.max) return false;", "if (!Number.isFinite(n)) return false;", "倍率范围校验");
+  check(pm2.setParticleParam({ particle: "x.json" }, "size", 0), "不校验范围时「size 不收 0」判据变红");
+  const pm3 = await ptMut("origin: vec3(0, H / 2 + 40, 0)", "origin: vec3(0, H * 2, 0)", "雪的发射线在画面顶边");
+  const mAlive = simulate(pm3.particleSystemDef("snow", "snow", 1920, 1080), null, 1).alive;
+  check(!(mAlive.length >= 20 && inRect(mAlive, 1920, 1080) >= 0.6), "发射线放到画面外时「粒子落在画面内」判据变红");
+  const pm4 = await ptMut("if (hadColor) delete ov!.color;", "", "写 colorn 时去掉裸 color");
+  const pl = { particle: "x.json", instanceoverride: { color: "255 0 0" } };
+  pm4.setParticleColor(pl, [0, 1, 0]);
+  check("color" in pl.instanceoverride, "不去裸 color 时「两者都在后写的生效」判据变红");
 
   let mutSeq = 0;
   const vendorMut = async (rel, from, to, tag) => {
