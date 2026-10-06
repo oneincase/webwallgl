@@ -297,3 +297,58 @@ export function keyTimes(obj: SceneObject): number[] {
   }
   return [...out].sort((a, b) => a - b);
 }
+
+/** 时间轴按层动画条：最长那条动画的时长（秒）与播放模式 + 全部关键帧时刻 */
+export function animSummary(obj: SceneObject): { length: number; mode: AnimMode; keys: number[] } | null {
+  let best: AnimView | null = null;
+  for (const f of animatedFields(obj)) {
+    const v = getAnim(obj, f)!;
+    if (!best || v.length / v.fps > best.length / best.fps) best = v;
+  }
+  if (!best) return null;
+  return { length: Math.round((best.length / best.fps) * 1000) / 1000, mode: best.mode, keys: keyTimes(obj) };
+}
+
+/** 关键帧剪贴板：字段 → 画面上的绝对值（relative 动画已加回基准） */
+export type KeyClip = Partial<Record<AnimField, number[]>>;
+
+/** 复制时刻 t 上的关键帧（各动画按自己的 fps / 模式折回到帧）；该时刻一个关键帧都没有返回 null */
+export function copyKeysAt(obj: SceneObject, t: number): KeyClip | null {
+  if (!Number.isFinite(t)) return null;
+  const clip: KeyClip = {};
+  for (const f of animatedFields(obj)) {
+    const v = getAnim(obj, f)!;
+    const k = v.keys.find((kk) => kk.frame === frameAt(v, t));
+    if (!k || !k.value.every(Number.isFinite)) continue;
+    const base = v.relative ? baseValue(obj, f) : null;
+    clip[f] = k.value.map((x, i) => r5(x + (base ? base[i] ?? 0 : 0)));
+  }
+  return Object.keys(clip).length ? clip : null;
+}
+
+/**
+ * 把剪贴板粘到时刻 t：已开动画的字段在该帧打关键帧；没开的先以静态值开动画（时长不够就放长到能容下 t），
+ * 再打关键帧。先在副本上做完、全部合法才写回（结构编辑不回滚）。
+ */
+export function pasteKeysAt(obj: SceneObject, clip: KeyClip, t: number): boolean {
+  const fields = (Object.keys(clip) as AnimField[]).filter((f) => (ANIM_FIELDS as readonly string[]).includes(f));
+  if (!fields.length || !Number.isFinite(t) || t < 0) return false;
+  const tmp = {} as SceneObject;
+  for (const f of fields) {
+    const vals = clip[f]!;
+    if (!Array.isArray(vals) || vals.length !== CHANNELS[f] || !vals.every(Number.isFinite)) return false;
+    if (obj[f] !== undefined) tmp[f] = JSON.parse(JSON.stringify(obj[f]));
+  }
+  let changed = false;
+  for (const f of fields) {
+    if (!isAnimated(tmp, f)) {
+      const frame = Math.round(t * DEFAULT_FPS);
+      if (!enableAnim(tmp, f, baseValue(tmp, f), { length: Math.max(DEFAULT_LENGTH, frame) })) return false;
+      changed = true;
+    }
+    const v = getAnim(tmp, f)!;
+    if (setKey(tmp, f, frameAt(v, t), clip[f]!)) changed = true;
+  }
+  if (changed) for (const f of fields) obj[f] = tmp[f];
+  return changed;
+}

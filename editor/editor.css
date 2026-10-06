@@ -497,6 +497,79 @@ html[data-theme="light"] .ed-kind[data-kind="light"] { color: #9a6a12; }
   outline: 1px solid var(--wb-fg);
 }
 
+/* 按层动画条：条区与上面的滑轨左右对齐（JS 量出 #tl-track 的位置） */
+#tl-lanes {
+  flex: none;
+  max-height: 96px;
+  overflow-y: auto;
+  border-top: 1px solid var(--wb-line-soft);
+}
+
+.tl-lane {
+  position: relative;
+  height: 16px;
+  cursor: pointer;
+}
+
+.tl-lane:hover {
+  background: var(--wb-hover, rgba(255, 255, 255, 0.04));
+}
+
+.tl-lane.selected {
+  background: color-mix(in srgb, var(--wb-accent) 14%, transparent);
+}
+
+.tl-lane-name {
+  position: absolute;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  padding: 0 8px;
+  overflow: hidden;
+  color: var(--wb-fg-mute);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tl-lane-bars {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.tl-lane-bar {
+  position: absolute;
+  top: 5px;
+  left: 0;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--wb-accent) 55%, transparent);
+}
+
+.tl-lane-bar.is-repeat {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--wb-accent) 45%, transparent);
+  box-sizing: border-box;
+}
+
+.tl-lane-key {
+  position: absolute;
+  top: 4px;
+  width: 7px;
+  height: 7px;
+  background: var(--wb-fg);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.ed-anim-clip {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0 2px;
+}
+
 #tl-max {
   min-width: 36px;
   color: var(--wb-fg-mute);

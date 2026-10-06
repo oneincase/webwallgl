@@ -2037,4 +2037,64 @@ async function runCreateAndDraft(ctx) {
   check(isRed(await pixelAt(sRed)), "扫光强度 0：原图");
   await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
   check((await h.errorLines()).length === 0, "效果扩充集全程无错误");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AH. 时间轴按层动画条 / 关键帧复制粘贴（A 层 2s 关键帧 → 复制 → B 层 1s 粘贴 → 画面 → 撤销 → 点动画条选层）");
+  await gotoEditor();
+  await newBlank("#000000");
+  for (const [x, y] of [[400, 300], [400, 800]]) {
+    await addTextPreset("plain");
+    await setText("content", "MMM");
+    await setText("size", "12");
+    await h.setInputs({ 0: x, 1: y });
+  }
+  await settle();
+  const [hA, hB] = await treeIds();
+  const lanes = () => ev(`document.querySelector('#tl-lanes').hidden ? null : [...document.querySelectorAll('#tl-lanes .tl-lane')].map((r) => ({ id: r.dataset.id, keys: [...r.querySelectorAll('.tl-lane-key')].map((k) => Number(k.dataset.t)), repeat: !!r.querySelector('.tl-lane-bar.is-repeat'), sel: r.classList.contains('selected') }))`);
+  check((await lanes()) === null, "没有动画层：动画条区隐藏");
+  await clickRow(hA);
+  if (!(await ev(`document.querySelector('#tb-play .ic-play').hidden === false`))) await clickSel("#tb-play");
+  await seekTo(0);
+  await animOn("origin", true);
+  let ln = await lanes();
+  check(ln?.length === 1 && ln[0].id === hA && json(ln[0].keys) === json([0]) && ln[0].repeat && ln[0].sel, `A 开位置动画：出一行动画条（选中高亮、0s 一枚关键帧、loop 后续周期虚条）${json(ln)}`);
+  const barPct = await ev(`(() => { const b = document.querySelector('#tl-lanes .tl-lane-bar:not(.is-repeat)'); return b.getBoundingClientRect().width / b.parentElement.getBoundingClientRect().width; })()`);
+  check(Math.abs(barPct - 3 / 30) < 0.01, `实条长度 = 动画时长 3s / 时间轴 30s（${barPct.toFixed(3)}）`);
+  await seekTo(2);
+  let rh = await h.readyCount();
+  await h.setInputs({ 0: 1400 });
+  await h.waitRemount(rh);
+  ln = await lanes();
+  check(json(ln?.[0].keys) === json([0, 2]), `2s 落关键帧后动画条上两枚（${json(ln?.[0].keys)}）`);
+  const align = await ev(`(() => { const a = [...document.querySelectorAll('#tl-lanes .tl-lane-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); const b = [...document.querySelectorAll('#tl-keys .tl-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); return Math.abs((a.left + a.width / 2) - (b.left + b.width / 2)); })()`);
+  check(align < 2, `动画条与上方滑轨同一时间刻度：2s 关键帧横向对齐（差 ${align.toFixed(2)}px）`);
+
+  await seekTo(1);
+  check(await ev(`document.querySelector('.ed-anim [data-anim-copy]').disabled && document.querySelector('.ed-anim [data-anim-paste]').disabled`), "1s 没有关键帧：「复制此刻关键帧」不可用；剪贴板空：「粘贴」不可用");
+  await seekTo(2);
+  await clickSel(".ed-anim [data-anim-copy]");
+  await settle();
+  check(await ev(`!document.querySelector('.ed-anim [data-anim-paste]').disabled`), "2s 复制后「粘贴到此刻」可用");
+  await clickRow(hB);
+  await seekTo(1);
+  check(await ev(`!document.querySelector('.ed-anim [data-anim-paste]').disabled && !document.querySelector('.ed-anim [data-anim-on="origin"]').checked`), "切到没有动画的 B 层：粘贴仍可用（剪贴板跨层）");
+  rh = await h.readyCount();
+  await clickSel(".ed-anim [data-anim-paste]");
+  await h.waitRemount(rh);
+  const bo = await rawObj();
+  check(json(keysOf(bo)) === json([[0, 400], [30, 1400]]) && json(keysOf(bo, 1)) === json([[0, 800], [30, 300]]), `★ B 层 1s 粘贴：自动开位置动画，第 0 帧 = 原位置，第 30 帧 = A 在 2s 的值（x ${json(keysOf(bo))} / y ${json(keysOf(bo, 1))}）`);
+  ln = await lanes();
+  check(ln?.length === 2 && json(ln.map((r) => r.id)) === json([hA, hB]) && json(ln[1].keys) === json([0, 1]) && ln[1].sel && !ln[0].sel, "动画条两行（按图层树顺序），B 行选中、关键帧 0s / 1s");
+  const inkH = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkH(1400, 300)) > 0.05 && (await inkH(400, 800)) < 0.01, "★ 画面：1s 时 B 层到了 (1400, 300)，原位置空了");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  rh = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rh);
+  check(!(await rawObj()).origin?.animation && (await lanes())?.length === 1, "撤销粘贴：B 层动画整个撤回，动画条回到一行");
+  await clickSel(`#tl-lanes .tl-lane[data-id="${hA}"]`);
+  await settle();
+  check((await h.selectedName()) !== null && (await ev(`document.querySelector('#ed-tree .ed-node.selected')?.dataset.id`)) === hA && (await lanes())[0].sel, "点动画条那一行：选中对应图层");
+  check((await h.errorLines()).length === 0, "动画条 / 复制粘贴全程无错误");
 }

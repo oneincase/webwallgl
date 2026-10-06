@@ -2153,6 +2153,49 @@ section("AF. 多选：对齐 / 等距分布 / 批量命令 / 多层成组");
   check(!docMod.groupLayers(mk(), [404], "组").ok, "全不存在：拒绝");
 }
 
+section("AG. 时间轴按层动画条 / 关键帧复制粘贴 keyframes.ts");
+{
+  const key = (frame, v) => ({ back: { enabled: true, x: -1, y: 0 }, frame, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: v });
+  const a3 = (frames, vals, opts) => ({ c0: frames.map((f, i) => key(f, vals[i])), c1: frames.map((f) => key(f, 0)), c2: frames.map((f) => key(f, 0)), options: { fps: 30, wraploop: false, ...opts } });
+  check(kfMod.animSummary({ origin: "1 2 3" }) === null, "animSummary：没有动画 → null（不出动画条）");
+  const s = {
+    origin: { value: "0 0 0", animation: a3([0, 30], [0, 100], { length: 60, mode: "loop" }) },
+    alpha: { value: 1, animation: { c0: [key(0, 1), key(45, 0)], options: { fps: 30, length: 120, mode: "single" } } },
+  };
+  check(json(kfMod.animSummary(s)) === json({ length: 4, mode: "single", keys: [0, 1, 1.5] }), "animSummary：取最长那条的时长与模式，关键帧取全部字段并集");
+  const s12 = { scale: { value: "1 1 1", animation: { ...a3([0, 12], [1, 2], { length: 36, mode: "mirror" }), options: { fps: 12, length: 36, mode: "mirror" } } } };
+  check(json(kfMod.animSummary(s12)) === json({ length: 3, mode: "mirror", keys: [0, 1] }), "按各自 fps 换秒（外来 12fps）");
+
+  check(json(kfMod.copyKeysAt(s, 1)) === json({ origin: [100, 0, 0] }) && json(kfMod.copyKeysAt(s, 1.5)) === json({ alpha: [0] }), "copyKeysAt：只拿该时刻有关键帧的字段");
+  check(json(kfMod.copyKeysAt(s, 0)) === json({ origin: [0, 0, 0], alpha: [1] }), "0s 两个字段都有");
+  check(json(kfMod.copyKeysAt(s, 3)) === json({ origin: [100, 0, 0] }), "按模式折回：loop 2s 一周期，3s ≡ 1s");
+  check(kfMod.copyKeysAt(s, 0.5) === null && kfMod.copyKeysAt({ origin: "0 0 0" }, 0) === null && kfMod.copyKeysAt(s, NaN) === null, "该时刻没有关键帧 / 没动画 / 非法时刻 → null");
+  const rel = { origin: { value: "100 50 0", animation: { ...a3([0, 30], [0, 20]), relative: true, options: { fps: 30, length: 60, mode: "loop" } } } };
+  check(json(kfMod.copyKeysAt(rel, 1)) === json({ origin: [120, 50, 0] }), "relative 动画复制出的是画面绝对值（加回基准）");
+
+  const dst = { origin: { value: "0 0 0", animation: a3([0], [5], { length: 90, mode: "loop" }) } };
+  check(kfMod.pasteKeysAt(dst, { origin: [7, 8, 9] }, 2) && json(kfMod.getAnim(dst, "origin").keys.map((k) => [k.frame, ...k.value])) === json([[0, 5, 0, 0], [60, 7, 8, 9]]), "粘到已开动画的字段：在该帧打关键帧");
+  check(near3(animMod.createAnimation(dst.origin.animation).seekTime(2).value(), [7, 8, 9]), "★ 引擎求值：2s 正好是粘贴的值");
+  const plain = { origin: "1 2 3", alpha: 0.5 };
+  check(kfMod.pasteKeysAt(plain, { origin: [10, 20, 30], alpha: [0] }, 1) && kfMod.isAnimated(plain, "origin") && kfMod.isAnimated(plain, "alpha"), "没开动画的字段：粘贴时自动开");
+  check(json(kfMod.getAnim(plain, "origin").keys.map((k) => [k.frame, ...k.value])) === json([[0, 1, 2, 3], [30, 10, 20, 30]]) && plain.origin.value === "1 2 3" && json(kfMod.getAnim(plain, "alpha").keys.map((k) => [k.frame, ...k.value])) === json([[0, 0.5], [30, 0]]), "自动开的动画：第 0 帧 = 原静态值，粘贴时刻 = 剪贴板值");
+  const late = { origin: "0 0 0" };
+  check(kfMod.pasteKeysAt(late, { origin: [1, 1, 1] }, 5) && kfMod.getAnim(late, "origin").length === 150, "粘贴时刻超过缺省时长：动画时长放长到能容下（5s = 150 帧）");
+  const relDst = { origin: { value: "100 0 0", animation: { ...a3([0], [0]), relative: true, options: { fps: 30, length: 60, mode: "loop" } } } };
+  kfMod.pasteKeysAt(relDst, { origin: [130, 5, 0] }, 1);
+  check(near3(animMod.createAnimation(relDst.origin.animation).seekTime(1).applyTo("100 0 0"), [130, 5, 0]), "★ 粘到 relative 动画：引擎叠加基准后 = 剪贴板绝对值");
+  const keep = { origin: "0 0 0", alpha: 1 };
+  const before = json(keep);
+  check(!kfMod.pasteKeysAt(keep, { origin: [1, 1, 1], alpha: [1, 2] }, 1) && json(keep) === before, "剪贴板里有一项维度不对：整体拒绝、一处不改");
+  check(!kfMod.pasteKeysAt(keep, { origin: [1, 1, 1] }, 1e6) && json(keep) === before, "超出时长上限：拒绝、不改");
+  check(!kfMod.pasteKeysAt(keep, {}, 1) && !kfMod.pasteKeysAt(keep, { origin: [1, 1, 1] }, -1) && !kfMod.pasteKeysAt(keep, { visible: [1] }, 1), "空剪贴板 / 负时刻 / 非动画字段：拒绝");
+  const same = { origin: { value: "0 0 0", animation: a3([0, 30], [0, 4], { length: 60, mode: "loop" }) } };
+  check(!kfMod.pasteKeysAt(same, { origin: [4, 0, 0] }, 1), "同帧同值：不算改动（不进撤销栈）");
+  const roundTrip = { origin: "0 0 0" };
+  kfMod.pasteKeysAt(roundTrip, kfMod.copyKeysAt(s, 1), 1);
+  check(json(kfMod.copyKeysAt(roundTrip, 1)) === json({ origin: [100, 0, 0] }), "复制 → 粘到另一层 → 再复制：值一致");
+}
+
 section("AB2. 关键帧闭环（新建 → 文字层位置 + 不透明度动画 → 存库 → 重新打开 → 引擎求值）");
 {
   const realFetch = globalThis.fetch;
@@ -2234,6 +2277,9 @@ section("I. 接线");
       if ((i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length !== 2) missingFx.push(k);
     }
   }
+  check(/function renderKeyMarks\(\) \{\s*tlKeysEl\.textContent = "";\s*renderLanes\(\);/.test(main) && /const sum = canAnimate\(n\) \? animSummary\(n\.obj\) : null;/.test(main) && /row\.addEventListener\("click", \(\) => selectLayer\(node\.id\)\)/.test(main), "按层动画条随关键帧标记一起重画（每次文档 / 选中变化），点行选中该层");
+  check(/objEditOk\(et\("log\.keyPasted"[^\n]*\(o\) => pasteKeysAt\(o, clip, at\)\)/.test(main) && /keyClip = copyKeysAt\(node\.obj, nowTime\(\)\)/.test(main), "粘贴关键帧走结构编辑（可撤销），复制取当前时刻");
+  check(/<div id="tl-lanes" hidden><\/div>/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && ["anim.copy", "anim.paste", "anim.copyNone", "anim.pasteNone", "log.keyCopied", "log.keyPasted", "log.keyPasteBad"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "页面有动画条容器；复制 / 粘贴文案中英文都有");
   check(missingFx.length === 0, `效果名 / 参数名中英文都有（缺 ${json([...new Set(missingFx)])}）`);
   check(/structEdit\([^\n]*placeImages\(d, imgs, false\)\)/.test(main), "添加图片层走结构编辑（可撤销、整场景重挂）");
   check(/files\.every\(\(f\) => isImageFile\(f\.file\)\)\) void dropImages/.test(main), "拖入全是图片时走图片成层 / 新建");
@@ -2308,6 +2354,22 @@ section("I. 接线");
 // ───────────────────────────────────────────────────────────────────────────
 section("J. 变异红测");
 {
+  {
+    const kfPath = path.join(ROOT, "editor/keyframes.ts");
+    const kfSrc = fs.readFileSync(kfPath, "utf8");
+    const mutPaste = kfSrc.replace("    if (!Array.isArray(vals) || vals.length !== CHANNELS[f] || !vals.every(Number.isFinite)) return false;\n", "");
+    check(mutPaste !== kfSrc, "注入点存在（pasteKeysAt 先验后改）");
+    const mp = await loadEditorModule("keyframes", { [kfPath]: mutPaste });
+    const kp = { origin: "0 0 0", alpha: 1 };
+    const kpBefore = json(kp);
+    try { mp.pasteKeysAt(kp, { origin: [1, 1, 1], alpha: [1, 2] }, 1); } catch {}
+    check(json(kp) !== kpBefore || mp.pasteKeysAt({ alpha: 1 }, { alpha: [1, 2] }, 1), "pasteKeysAt 不先验维度时「整体拒绝」判据变红");
+    const mutRel = kfSrc.replace("clip[f] = k.value.map((x, i) => r5(x + (base ? base[i] ?? 0 : 0)));", "clip[f] = k.value.map((x) => r5(x));");
+    check(mutRel !== kfSrc, "注入点存在（copyKeysAt 加回基准）");
+    const mr = await loadEditorModule("keyframes", { [kfPath]: mutRel });
+    const relM = { origin: { value: "100 50 0", animation: { relative: true, c0: [{ back: { enabled: true, x: -1, y: 0 }, frame: 0, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: 0 }], c1: [{ back: { enabled: true, x: -1, y: 0 }, frame: 0, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: 0 }], c2: [{ back: { enabled: true, x: -1, y: 0 }, frame: 0, front: { enabled: true, x: 1, y: 0 }, lockangle: true, locklength: true, value: 0 }], options: { fps: 30, length: 60, mode: "loop" } } } };
+    check(json(mr.copyKeysAt(relM, 0)) !== json({ origin: [100, 50, 0] }), "copyKeysAt 不加回基准时 relative 判据变红");
+  }
   {
     const fxPath = path.join(ROOT, "editor/effects.ts");
     const fxSrc = fs.readFileSync(fxPath, "utf8");

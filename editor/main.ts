@@ -110,7 +110,9 @@ import {
 import {
   ANIM_FIELDS,
   ANIM_MODES,
+  animSummary,
   baseValue,
+  copyKeysAt,
   disableAnim,
   enableAnim,
   frameAt,
@@ -118,6 +120,7 @@ import {
   isAnimated,
   keyTimes,
   moveKeyTime,
+  pasteKeysAt,
   removeKey,
   setAnimOption,
   setKey,
@@ -125,6 +128,7 @@ import {
   splitAnimated,
   type AnimField,
   type AnimMode,
+  type KeyClip,
 } from "./keyframes";
 import {
   PROP_TYPES,
@@ -263,6 +267,8 @@ const tlTimeEl = $<HTMLElement>("#tl-time");
 const tlRangeEl = $<HTMLInputElement>("#tl-range");
 const tlMaxEl = $<HTMLElement>("#tl-max");
 const tlKeysEl = $<HTMLElement>("#tl-keys");
+const tlTrackEl = $<HTMLElement>("#tl-track");
+const tlLanesEl = $<HTMLElement>("#tl-lanes");
 const tlSpeedEl = $<HTMLSelectElement>("#tl-speed");
 const undoEl = $<HTMLButtonElement>("#tb-undo");
 const redoEl = $<HTMLButtonElement>("#tb-redo");
@@ -599,6 +605,7 @@ function setTimelineMax(max: number) {
 /** 时间轴上画选中层的关键帧（首个周期内的时刻）；可编辑时拖动标记改关键帧时刻 */
 function renderKeyMarks() {
   tlKeysEl.textContent = "";
+  renderLanes();
   const n = selectedNode();
   if (!n) return;
   const editable = !!editor && !!doc?.scene && !!current?.assets && !isLocked(n.id);
@@ -616,6 +623,66 @@ function renderKeyMarks() {
     tlKeysEl.appendChild(m);
   }
 }
+
+/** 时间轴下方按层动画条：每个有动画的图层一行（首周期实条 + 循环 / 往返的后续周期虚条 + 关键帧），点行选中该层 */
+function renderLanes() {
+  tlLanesEl.textContent = "";
+  const rows: Array<{ node: LayerNode; sum: NonNullable<ReturnType<typeof animSummary>> }> = [];
+  const walk = (nodes: LayerNode[]) => {
+    for (const n of nodes) {
+      const sum = canAnimate(n) ? animSummary(n.obj) : null;
+      if (sum) rows.push({ node: n, sum });
+      walk(n.children);
+    }
+  };
+  if (doc) walk(doc.roots);
+  tlLanesEl.hidden = rows.length === 0;
+  if (!rows.length) return;
+  const host = tlLanesEl.getBoundingClientRect();
+  const track = tlTrackEl.getBoundingClientRect();
+  const left = Math.max(0, track.left - host.left);
+  const width = track.width > 0 ? track.width : host.width - left;
+  for (const { node, sum } of rows) {
+    const row = document.createElement("div");
+    row.className = "tl-lane";
+    row.dataset.id = String(node.id);
+    if (isSelected(node.id)) row.classList.add("selected");
+    const name = document.createElement("span");
+    name.className = "tl-lane-name";
+    name.textContent = nodeName(node.id);
+    name.style.width = `${left}px`;
+    const bars = document.createElement("div");
+    bars.className = "tl-lane-bars";
+    bars.style.left = `${left + 7}px`;
+    bars.style.width = `${Math.max(0, width - 14)}px`;
+    const pct = (t: number) => `${(Math.min(t, tlMax) / tlMax) * 100}%`;
+    const bar = document.createElement("i");
+    bar.className = "tl-lane-bar";
+    bar.style.width = pct(sum.length);
+    bars.appendChild(bar);
+    if (sum.mode !== "single" && sum.length < tlMax) {
+      const rep = document.createElement("i");
+      rep.className = "tl-lane-bar is-repeat";
+      rep.style.left = pct(sum.length);
+      rep.style.width = `${((tlMax - sum.length) / tlMax) * 100}%`;
+      bars.appendChild(rep);
+    }
+    for (const t of sum.keys) {
+      if (t > tlMax) continue;
+      const k = document.createElement("i");
+      k.className = "tl-lane-key";
+      k.dataset.t = String(t);
+      k.style.left = pct(t);
+      bars.appendChild(k);
+    }
+    row.title = `${nodeName(node.id)} · ${fmtTime(sum.length)} · ${et(`anim.mode.${sum.mode}`)}`;
+    row.append(name, bars);
+    row.addEventListener("click", () => selectLayer(node.id));
+    tlLanesEl.appendChild(row);
+  }
+}
+
+new ResizeObserver(() => renderLanes()).observe(tlTrackEl);
 
 function startKeyDrag(e: PointerEvent, m: HTMLElement, n: LayerNode, from: number) {
   if (e.button !== 0) return;
@@ -2978,6 +3045,8 @@ function liveValue(node: LayerNode, f: AnimField): number[] {
 
 const nowTime = () => editor?.time ?? 0;
 
+let keyClip: KeyClip | null = null;
+
 /** 把改动写成各字段当前帧的关键帧（一次可撤销的结构编辑） */
 function keyEdit(node: LayerNode, keyed: Partial<Record<AnimField, number[]>>) {
   const t = nowTime();
@@ -3136,8 +3205,46 @@ function animGroup(node: LayerNode): HTMLElement {
     }
   }
   group.appendChild(form);
+  group.appendChild(keyClipBar(node, editable, t));
   group.appendChild(note(et("anim.hint")));
   return group;
+}
+
+/** 关键帧复制 / 粘贴：复制当前时刻该层的关键帧，粘到任意可动画图层的当前时刻 */
+function keyClipBar(node: LayerNode, editable: boolean, t: number): HTMLElement {
+  const bar = document.createElement("div");
+  bar.className = "ed-anim-clip";
+  const here = copyKeysAt(node.obj, t);
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "ed-btn";
+  copy.dataset.animCopy = "";
+  copy.textContent = et("anim.copy");
+  copy.title = here ? et("anim.copyTitle", { time: fmtTime(t) }) : et("anim.copyNone");
+  copy.disabled = !here;
+  copy.onclick = () => {
+    keyClip = copyKeysAt(node.obj, nowTime());
+    if (!keyClip) return;
+    log(et("log.keyCopied", { layer: nodeName(node.id), fields: (Object.keys(keyClip) as AnimField[]).map((f) => et(ANIM_LABEL[f])).join(" / ") }));
+    renderInspector();
+  };
+  const paste = document.createElement("button");
+  paste.type = "button";
+  paste.className = "ed-btn";
+  paste.dataset.animPaste = "";
+  paste.textContent = et("anim.paste");
+  paste.title = keyClip ? et("anim.pasteTitle", { time: fmtTime(t) }) : et("anim.pasteNone");
+  paste.disabled = !editable || !keyClip;
+  paste.onclick = () => {
+    const clip = keyClip;
+    if (!clip) return;
+    const at = nowTime();
+    if (!objEditOk(et("log.keyPasted", { layer: nodeName(node.id), time: fmtTime(at) }), node.id, (o) => pasteKeysAt(o, clip, at))) {
+      log(et("log.keyPasteBad", { time: fmtTime(at) }), "warn");
+    }
+  };
+  bar.append(copy, paste);
+  return bar;
 }
 
 // ---------- 脚本（W8）：语法预检 → 应用（结构编辑重挂）→ 运行期错误按挂点回显 ----------
