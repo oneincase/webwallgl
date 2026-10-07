@@ -430,6 +430,10 @@ export function parseMDL(buf) {
     const baseLocal = bones.map((b, i) => {
       // 绑定矩阵分解回 TRS（2D 场景 rx/ry 恒为 0，rz 由第一列的辐角给出）
       const m = b.matrix
+      if (Math.max(Math.abs(m[2]), Math.abs(m[6]), Math.abs(m[8]), Math.abs(m[9])) > 1e-6) {
+        bindTRS9[i] = decomposeTRS3D(m)
+        return Float32Array.from(m)
+      }
       const sx = Math.hypot(m[0], m[1])
       const sy = Math.hypot(m[4], m[5])
       bindTRS9[i] = Float32Array.from([
@@ -819,6 +823,35 @@ function parseAttachments(buf, dv, boneCount, a) {
   return out
 }
 
+// 带出平面旋转的绑定矩阵 → TRS 九分量，与 composeTRS（R = Rz·Ry·Rx、列乘缩放）互逆；
+// 行列式为负时把翻转记在 x 缩放上，万向节奇点处 rz 取 0
+function decomposeTRS3D(m) {
+  let sx = Math.hypot(m[0], m[1], m[2])
+  const sy = Math.hypot(m[4], m[5], m[6])
+  const sz = Math.hypot(m[8], m[9], m[10])
+  const det =
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5])
+  if (det < 0) sx = -sx
+  const ix = sx ? 1 / sx : 0
+  const iy = sy ? 1 / sy : 0
+  const iz = sz ? 1 / sz : 0
+  const r00 = m[0] * ix, r10 = m[1] * ix, r20 = m[2] * ix
+  const r01 = m[4] * iy, r11 = m[5] * iy, r21 = m[6] * iy
+  const r22 = m[10] * iz
+  const sny = Math.max(-1, Math.min(1, -r20))
+  const ry = Math.asin(sny)
+  let rx
+  let rz
+  if (Math.hypot(r21, r22) > 1e-6) {
+    rx = Math.atan2(r21, r22)
+    rz = Math.atan2(r10, r00)
+  } else {
+    rz = 0
+    rx = Math.atan2(sny * r01, r11)
+  }
+  return Float32Array.from([m[12], m[13], m[14], rx, ry, rz, sx || 1, sy || 1, sz || 1])
+}
+
 // MDLS0004：魔数(8) + u8 + u32 nextOff + u32 boneCount，逐骨**可变长**条目。
 //
 // R. **WE 真实记录布局**（参考引擎 MdlParser.cpp::ParseMDLS 逐字段对照，2026-09-28）：
@@ -882,8 +915,14 @@ function parseSkeleton(buf, dv, s) {
       const matrix = new Float32Array(16)
       for (let k = 0; k < 16; k++) matrix[k] = dv.getFloat32(head + 12 + k * 4, true)
       for (let k = 0; k < 16; k++) if (!Number.isFinite(matrix[k])) return null
+      // 2D 行列式之外再认 3×3 行列式：编辑器导入的 glTF 骨可带出平面旋转（绕 X 转 90° 时
+      // XY 子块恰好奇异），只看 2D 会把整副骨架判成不合法、退回固定步进读出垃圾
       const det = matrix[0] * matrix[5] - matrix[4] * matrix[1]
-      if (!(Math.abs(det) > 1e-9)) return null
+      const det3 =
+        matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9]) -
+        matrix[4] * (matrix[1] * matrix[10] - matrix[2] * matrix[9]) +
+        matrix[8] * (matrix[1] * matrix[6] - matrix[2] * matrix[5])
+      if (!(Math.abs(det) > 1e-9) && !(Math.abs(det3) > 1e-9)) return null
       bones.push({ id: dv.getUint32(head, true), name: nm.value, parent, matrix })
       j = readCStr(dv, head + 12 + 64).next
     }

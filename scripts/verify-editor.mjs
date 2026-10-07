@@ -3209,6 +3209,31 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
   check(Math.abs(near2[2] - (Math.PI - 0.01)) < 1e-6 && Math.abs(G.quatToEuler(F.axisQuat([0, 0, 1], -Math.PI + 0.01), [0, 0, Math.PI - 0.01])[2] - (Math.PI + 0.01)) < 1e-6,
     "quatToEuler 给上一帧时就近 2π 展开（跨 ±π 不跳 2π）");
 
+  // Z 向上导出（3ds Max / FBX 转 glTF 常见）：网格节点绕 X 转 −90° + 缩放，XY 子块奇异
+  {
+    const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+    const tri = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 2]);
+    const zj = {
+      asset: { version: "2.0" },
+      buffers: [{ byteLength: tri.byteLength, uri: `data:;base64,${Buffer.from(tri.buffer).toString("base64")}` }],
+      bufferViews: [{ buffer: 0, byteLength: tri.byteLength }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3" }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+      nodes: [{ name: "Pivot", translation: [0, 0.5, 0.25], children: [1] }, { name: "Mesh", rotation: [-Math.SQRT1_2, 0, 0, Math.SQRT1_2], scale: [2.54, 2.54, 2.54], mesh: 0 }],
+      scenes: [{ nodes: [0] }],
+      animations: [{ name: "Take 001", samplers: [], channels: [] }],
+    };
+    const want = [0, 0.5, 0.25, 2.54, 0.5, 0.25, 0, 0.5 + 2 * 2.54, 0.25].map((v) => v * 10);
+    const res = ["puppet", "mesh"].map((target) => {
+      const zm = G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(zj))), { target, slug: "z", scale: 10 });
+      const zmdl = P.parseMDL(G.gltfImportFiles(zm, "z").files.find((f) => f.name.endsWith(".mdl")).data);
+      const got = S.skinnedMeshes(zmdl, S.computeSkinMatrices(zmdl, 0.5, [{ animation: zm.clips[0].id, visible: true }]), true).flatMap((x) => [...x.pos]);
+      return { bones: json(zmdl.bones.map((b) => [b.name, b.parent])), err: want.reduce((mx, v, i) => Math.max(mx, Math.abs((got[i] ?? NaN) - v)), 0), warn: zm.warnings.map((w) => w.code) };
+    });
+    check(res.every((r) => r.bones === json([["Pivot", -1], ["Mesh", 0]]) && r.err < 1e-3 && r.warn.includes("emptyAnim")),
+      `Z 向上模型（节点绕 X 转 −90°、缩放 2.54）：引擎读回骨架 ${res[0].bones}，静止蒙皮顶点 vs glTF 世界坐标 puppet ${res[0].err.toExponential(2)} / 网格 ${res[1].err.toExponential(2)}（空动画告警）`);
+  }
+
   // .gltf：外部 .bin / data URI 与 glb 等价
   const fx = F.skinnedFixture();
   const glbMdl = G.gltfImportFiles(G.gltfToModel(G.parseGltf(fx.glb), { target: "puppet", slug: "t", scale: 10 }), "t").files.find((f) => f.name.endsWith(".mdl")).data;
