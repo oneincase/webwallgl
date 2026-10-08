@@ -21,6 +21,7 @@ import {
   type Fit,
   type MdlBoneDelta,
   type MdlClipInit,
+  type PropertyValue,
   type SceneInstance,
   CLIP_MODES,
   addMdlClip,
@@ -30,9 +31,15 @@ import {
   setMdlClipMeta,
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
+import { DOC_KINDS, renderDocs, type DocKind } from "../bench/docs";
 import { applyPlatformClasses } from "../shared/workbench/platform";
+import { initTabs } from "../shared/workbench/tabs";
+import { libraryKindOf, mountLibraryPanel } from "./ui/library-panel";
+import { mountWallpaperConfig } from "./ui/wallpaper-config";
+import { mountRenderSettings } from "./ui/render-settings";
+import { mountPerfPanel } from "./ui/perf-panel";
 import { bindThemeButton } from "../shared/workbench/theme";
-import { applyEditorStatic, et } from "./i18n";
+import { applyEditorStatic, et, hasText } from "./i18n";
 import { resetEditorLayout } from "./layout";
 import { overlayAssets, type OverlayAssets } from "./assets";
 import {
@@ -51,33 +58,65 @@ import {
   type ImageInput,
 } from "./create";
 import {
-  EFFECTS,
   addEffect,
   effectById,
+  effectCatalog,
   effectFileOf,
   effectFiles,
   effectViews,
+  externalValues,
+  inspectEffectParams,
   moveEffect,
   referencedEffects,
   removeEffect,
   setEffectParam,
   setEffectVisible,
+  type EffectDef,
+  type EffectParam,
   type EffectValue,
   type EffectView,
 } from "./effects";
+import { bootEditor, type EditorApp } from "./app";
+import { blobImporter } from "./plugins/external";
+import { createPluginManager, dirSource, storeSource } from "./plugins/manager";
+import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
+import { textOf } from "./core";
+import { layerKindInfo } from "./layer-kinds";
+import {
+  BUILTIN_INSPECTOR_TABS,
+  DEFAULT_INSPECTOR_TAB,
+  INFO_INSPECTOR_TAB,
+  groupsFor,
+  inspectorGroups,
+  inspectorTabs,
+  puppetGenerators,
+  puppetTools,
+  tabOf,
+  type InspectorGroup,
+  type InspectorTab,
+  type PuppetGenerator,
+  type PuppetTool,
+} from "./inspector";
+import { createSettings } from "./services/settings";
+import { exporterAccepts, exporters, runExportPipeline, type Exporter } from "./export-pipeline";
+import { schemaForm } from "./ui/schema-form";
+import type { DocService } from "./services/types";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
   GltfError,
   addModelLayer,
+  bakePuppetAtlas,
   defaultTarget,
   editorMdlPathOf,
   fitMeshScale,
   fitPuppetScale,
   gltfImportFiles,
   gltfToModel,
-  isModelFile,
-  parseGltf,
+  type Gltf,
+  type GltfTarget,
 } from "./gltf";
+import { isModelMain, loadModelFile, modelExts, modelImporters, modelSideExts, type LoadedModel } from "./model-import";
+import { irToGltf, type ModelIR } from "./model-ir";
 import {
   FONT_FILE_RE,
   H_ALIGNS,
@@ -111,6 +150,7 @@ import {
   referencedParticles,
   setParticleColor,
   setParticleParam,
+  particleTemplates,
   type ParticleParam,
   type ParticlePreset,
 } from "./particles";
@@ -286,8 +326,10 @@ import {
   collectDropped,
   fetchLibrary,
   filesFromInput,
+  openLibraryItem,
   openLocalFiles,
   sourceFromDoc,
+  type LibraryItem,
   type Opened,
   type SceneAssets,
 } from "./open";
@@ -295,13 +337,10 @@ import {
   canPickDirectory,
   collectProject,
   collectVideoProject,
-  downloadZip,
   filesFromDirectory,
-  packProject,
   pickDirectory,
   probeWritable,
   removeProjectFile,
-  slugName,
   writeToDirectory,
   type DirHandle,
   type SaveFile,
@@ -575,7 +614,8 @@ async function mountCurrent(keepTime = false) {
       source,
       fit: fitEl.value as Fit,
       renderDpr: Number(dprEl.value),
-      volume: 0,
+      ...renderSettings.mountOptions(),
+      properties: libItem ? (wallpaperConfig.overrides() as Record<string, PropertyValue>) : undefined,
       scripts: scriptsAllowed,
       onDiagnostic: (msg, level) => log(msg, level),
       onError: (err) => {
@@ -646,7 +686,26 @@ const referencedGroups = (d: EditorDoc | null) =>
     ...referencedFonts(d),
     ...referencedParticles(d),
     ...referencedSounds(d),
+    ...pluginReferenced(d),
   ]);
+/** 插件登记的引用扫描（插件写进覆盖层的文件靠它进保存清单） */
+const refScanners = new Set<(d: EditorDoc) => Iterable<string>>();
+function addReferenceScanner(fn: (d: EditorDoc) => Iterable<string>) {
+  refScanners.add(fn);
+  return () => void refScanners.delete(fn);
+}
+function pluginReferenced(d: EditorDoc | null): string[] {
+  if (!d) return [];
+  const out: string[] = [];
+  for (const fn of refScanners) {
+    try {
+      out.push(...fn(d));
+    } catch (e) {
+      console.warn("[wwgl] reference scanner failed", e);
+    }
+  }
+  return out;
+}
 
 /** dev 宿主是否在（只用来决定外来脚本默认是否执行，不再用来打开壁纸库条目） */
 let hostUp = false;
@@ -664,6 +723,10 @@ type OpenOptions = {
   docDriven?: boolean;
   /** 文档就位、首次挂载之前执行（新建时放背景图、恢复草稿时套用快照） */
   after?: () => void;
+  /** 壁纸库条目：不绑项目文件夹（首次保存时另存为项目），右栏「壁纸配置」跟随它 */
+  library?: LibraryItem;
+  /** 打开后直接播放（库条目即点即看）；缺省停在首帧便于编辑 */
+  play?: boolean;
 };
 
 async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOptions = {}) {
@@ -693,7 +756,10 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   scriptDrafts.clear();
   docDriven = !!opts.docDriven;
   origin = opts.origin ?? null;
-  userPlaying = false;
+  userPlaying = !!opts.play;
+  if (opts.library) releaseProject();
+  libItem = opts.library ?? null;
+  syncLibraryItem();
   scriptsAllowed = scriptsAllowedByDefault(origin?.kind ?? "local", hostUp, SCRIPTS_OVERRIDE);
   scriptsBannerEl.hidden = true;
   resetHistory();
@@ -1027,9 +1093,7 @@ function closeRecMenu() {
   recMenuEl.hidden = true;
 }
 
-$<HTMLButtonElement>("#export-video").onclick = (e) => {
-  e.stopPropagation();
-  closeExportMenu();
+function openRecMenu() {
   if (!doc?.scene || !editor) return;
   recDurEl.value = String(defaultRecordDuration());
   recBarEl.hidden = true;
@@ -1038,7 +1102,7 @@ $<HTMLButtonElement>("#export-video").onclick = (e) => {
   recMenuEl.style.left = `${r.left}px`;
   recMenuEl.style.top = `${r.bottom + 2}px`;
   recMenuEl.hidden = false;
-};
+}
 document.addEventListener("click", (e) => {
   if (!recMenuEl.hidden && !recMenuEl.contains(e.target as Node)) closeRecMenu();
 });
@@ -1102,6 +1166,8 @@ async function recordScene() {
 const packEl = $<HTMLButtonElement>("#tb-pack");
 const exportMenuEl = $<HTMLElement>("#export-menu");
 let projectDir: DirHandle | null = null;
+/** 当前文档来自壁纸库时的条目（不绑项目文件夹）；另存为项目后清空 */
+let libItem: LibraryItem | null = null;
 let saving = false;
 let saveAgain = false;
 let saveTimer = 0;
@@ -1126,6 +1192,33 @@ function adoptProject(dir: DirHandle) {
   saveTimer = 0;
 }
 
+/** 库条目不落盘：解绑上一个文档的项目文件夹，免得自动保存把它写进别的工程 */
+function releaseProject() {
+  projectDir = null;
+  writtenSig.clear();
+  ownedPaths.clear();
+  saveAgain = false;
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+}
+
+/** ⌘S：已有项目文件夹就写回；库条目等没绑文件夹的文档先选文件夹另存为项目 */
+async function saveDocument() {
+  if (projectDir) return flushAutosave();
+  if (!doc) return;
+  if (!canSave()) {
+    log(et("log.cannotSaveKind", { kind: doc.type }), "warn");
+    return;
+  }
+  const dir = await requireProjectDir();
+  if (!dir || !doc) return;
+  adoptProject(dir);
+  libItem = null;
+  syncLibraryItem();
+  log(et("log.savedAsProject", { name: dir.name }));
+  await flushAutosave();
+}
+
 /** 有东西可写：场景文档 + 资源表，或视频壁纸工程 */
 const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets);
 
@@ -1137,12 +1230,46 @@ async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> 
 
 function syncExportButton() {
   packEl.disabled = !canSave();
-  $<HTMLButtonElement>("#export-video").disabled = !doc?.scene || !editor;
+  for (const e of exporters.list()) {
+    const b = exportMenuEl.querySelector<HTMLButtonElement>(`#export-${e.id}`);
+    if (b) b.disabled = !exporterAccepts(e, doc) || (e.enabled ? !e.enabled() : false);
+  }
 }
+
+/** 导出菜单按 exporters 注册表重建：按钮 id = export-<id>，页面里已有的静态按钮原样复用 */
+function renderExportMenu() {
+  const keep = new Set<HTMLElement>();
+  for (const e of exporters.list()) {
+    let b = exportMenuEl.querySelector<HTMLButtonElement>(`#export-${e.id}`);
+    if (!b) {
+      b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "menuitem");
+      b.id = `export-${e.id}`;
+      if (typeof e.title === "string" && hasText(e.title)) b.dataset.et = e.title;
+    }
+    b.textContent = typeof e.title === "string" && hasText(e.title) ? et(e.title) : textOf(e.title, getLang(), e.id);
+    exportMenuEl.appendChild(b);
+    keep.add(b);
+  }
+  for (const b of exportMenuEl.querySelectorAll<HTMLButtonElement>("button")) if (!keep.has(b)) b.remove();
+  syncExportButton();
+}
+
+exportMenuEl.addEventListener("click", (ev) => {
+  const b = (ev.target as HTMLElement).closest<HTMLButtonElement>("button[id^='export-']");
+  const e = b && exporters.get(b.id.slice("export-".length));
+  if (!e || b.disabled) return;
+  ev.stopPropagation();
+  closeExportMenu();
+  void runExport(e.id);
+});
 
 function renderSaveStatus() {
   if (!projectDir || !doc) {
-    stSaveEl.textContent = "";
+    const hint = doc && libItem && canSave();
+    stSaveEl.textContent = hint ? et(dirty ? "st.libDirty" : "st.library") : "";
+    stSaveEl.title = hint ? et("st.saveAsTitle") : "";
     return;
   }
   stSaveEl.textContent = saving ? et("st.saving") : dirty ? et("st.unsaved") : et("st.saved");
@@ -1168,9 +1295,6 @@ packEl.onclick = (e) => {
 document.addEventListener("click", (e) => {
   if (!exportMenuEl.hidden && !exportMenuEl.contains(e.target as Node)) closeExportMenu();
 });
-$<HTMLButtonElement>("#export-pkg").onclick = () => void runExport("pkg");
-$<HTMLButtonElement>("#export-zip").onclick = () => void runExport("zip");
-
 async function capturePreview(): Promise<Blob | null> {
   if (!editor || !doc) return null;
   const res = sceneResolution(doc.scene);
@@ -1244,21 +1368,39 @@ async function flushAutosave() {
   }
 }
 
-async function runExport(kind: "pkg" | "zip") {
+/**
+ * 导出 = 跑一遍导出管线（editor/export-pipeline.ts）：收集 → 钩子 → 校验 → 打包 → WE 兼容回读 → 落地。
+ * 回读出 error 时先问一句再决定是否照样导出；诊断逐条进控制台。
+ */
+async function runExport(id: string) {
   closeExportMenu();
-  if (!doc || !canSave()) return;
+  const exporter = exporters.get(id);
+  if (!doc || !exporter || !exporterAccepts(exporter, doc)) return;
+  if (!exporter.action && !canSave()) return;
+  const target = doc;
   packEl.disabled = true;
   try {
-    const preview = await capturePreview();
-    let files = await collectCurrent(preview);
-    if (!files) return;
-    if (kind === "pkg" && doc.scene) {
-      const { files: pkgFiles, packed } = packProject(files);
-      files = pkgFiles;
-      log(et("log.packedPkg", { n: packed.entries.length, tex: packed.converted.length, mb: (packed.pkg.length / 1e6).toFixed(1) }));
+    const preview = exporter.action ? null : await capturePreview();
+    const run = (force: boolean) =>
+      runExportPipeline(id, target, () => collectCurrent(preview), {
+        force,
+        meta: { plugins: usedPlugins() },
+        onPluginError: (who, e) => reportPluginError(who, e, "export"),
+      });
+    let r = await run(false);
+    for (const d of r.diags) log(`[${d.source}] ${d.message}${d.path ? `（${d.path}）` : ""}`, d.level);
+    if (r.blocked) {
+      const n = r.diags.filter((d) => d.level === "error").length;
+      if (!confirm(et("export.blocked", { n }))) {
+        log(et("log.exportBlocked", { n }), "warn");
+        return;
+      }
+      r = await run(true);
     }
-    const size = downloadZip(files, `${slugName(doc.title)}${kind === "pkg" ? "-pkg" : ""}`);
-    log(et("log.savedZip", { n: files.length, mb: (size / 1e6).toFixed(1) }));
+    const packed = r.meta.packed as { entries: number; converted: number; bytes: number } | undefined;
+    if (packed) log(et("log.packedPkg", { n: packed.entries, tex: packed.converted, mb: (packed.bytes / 1e6).toFixed(1) }));
+    if (typeof r.meta.size === "number") log(et("log.savedZip", { n: r.files.length, mb: (r.meta.size / 1e6).toFixed(1) }));
+    else if (r.message) log(r.message);
   } catch (e) {
     log(et("log.saveFailed", { msg: (e as Error).message }), "error");
   } finally {
@@ -1544,6 +1686,11 @@ redoEl.onclick = () => undoRedo("redo");
 window.addEventListener("keydown", (e) => {
   const tag = (e.target as HTMLElement | null)?.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  // 命令服务优先（插件可登记 / 覆盖快捷键）；内核起来之前走下面的内置链
+  if (app?.commands.handleKey(e)) {
+    e.preventDefault();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
     e.preventDefault();
     undoRedo(e.shiftKey ? "redo" : "undo");
@@ -1952,7 +2099,202 @@ setInterval(() => {
   syncScriptsBanner();
 }, 500);
 
+// ---------- 壁纸库 / 壁纸配置 / 渲染 / 性能 / 使用说明：播放与编辑同一个页面 ----------
+
+const MEDIA_BASE = `${location.origin}/media/dev`;
+const WEB_BASE = `${location.origin}/web/dev`;
+/** 播放侧部件的文案：编辑器词典优先，其余沿用 bench 词典 */
+const pt = (key: string, params?: Record<string, string | number>) => (hasText(key) ? et(key, params) : t(key, params));
+
+function syncPanelTools(panel: HTMLElement, id: string) {
+  for (const el of panel.querySelectorAll<HTMLElement>(":scope > .wb-panel-head > [data-tools]")) el.hidden = el.dataset.tools !== id;
+}
+
+const panelTabs = {
+  left: initTabs($("#ed-layers"), { storageKey: "we-editor-tab-left", onChange: (id) => syncPanelTools($("#ed-layers"), id) }),
+  center: initTabs($("#ed-center"), {
+    storageKey: "we-editor-tab-center",
+    onChange: (id) => {
+      if (id === "viewport") requestAnimationFrame(layoutStage);
+    },
+  }),
+  bottom: initTabs($("#ed-console"), {
+    storageKey: "we-editor-tab-bottom",
+    onChange: (id) => {
+      syncPanelTools($("#ed-console"), id);
+      if (id === "perf") requestAnimationFrame(() => perfPanel.render());
+    },
+  }),
+  right: initTabs($("#ed-right"), { storageKey: "we-editor-tab-right" }),
+};
+
+const renderSettings = mountRenderSettings({
+  fps: $("#fps"),
+  volume: $("#volume"),
+  volumeVal: $("#volume-val"),
+  aa: $("#aa"),
+  pq: $("#pq"),
+  pp: $("#pp"),
+  instance: () => instance,
+});
+
+const perfPanel = mountPerfPanel({
+  summary: $("#perf-summary"),
+  canvas: $("#perf-canvas"),
+  t: pt,
+  stats: () => instance?.stats ?? null,
+  fpsCap: () => renderSettings.fpsCap(),
+  visible: () => panelTabs.bottom.current() === "perf",
+});
+
+const wallpaperConfig = mountWallpaperConfig({
+  body: $("#props-body"),
+  state: $("#props-state"),
+  filter: $("#props-filter"),
+  showAll: $("#props-all"),
+  reset: $("#props-reset"),
+  mediaBase: MEDIA_BASE,
+  t: pt,
+  log,
+  apply: (values) => {
+    // 只有场景能就地热更；网页 / 视频壁纸保存后整体重挂（宿主按覆盖表重新合成 project.json）
+    if (!instance || !editor || doc?.type !== "scene") return false;
+    instance.setProperties(values as Record<string, PropertyValue>);
+    return true;
+  },
+  reload: () => void mountCurrent(true),
+});
+
+/** 新窗口全屏播放（渲染器页），参数口径同桌面宿主 */
+function playerUrl(it: LibraryItem): string {
+  const kind = libraryKindOf(it);
+  const p = new URLSearchParams();
+  p.set("type", kind ?? it.type.toLowerCase());
+  if (kind === "scene") p.set("src", it.itemId);
+  else if (kind === "web") p.set("src", `${WEB_BASE}/${it.itemId}/${it.file ?? "index.html"}`);
+  else if (it.file) p.set("src", `${MEDIA_BASE}/${it.itemId}/${it.file}`);
+  const r = renderSettings.mountOptions();
+  p.set("sceneFps", String(r.fps));
+  p.set("aa", r.quality?.antiAliasing ?? "off");
+  p.set("pq", r.quality?.particles ?? "high");
+  p.set("pp", r.quality?.postProcessing ?? "high");
+  p.set("muted", String(!(r.volume! > 0)));
+  p.set("loop", "true");
+  p.set("mediaBase", MEDIA_BASE);
+  return `${import.meta.env.BASE_URL}renderer/index.html?${p}`;
+}
+
+async function openLibrary(it: LibraryItem) {
+  if (doc && dirty && !projectDir && !confirm(et("lib.discardConfirm", { title: doc.title }))) return;
+  if (!libraryKindOf(it)) {
+    log(et("log.libUnsupported", { title: it.title, type: it.type }), "warn");
+    return;
+  }
+  await openWith(it.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), { origin: { kind: "library" }, library: it, play: true });
+}
+
+const libraryPanel = mountLibraryPanel({
+  list: $("#lib-list"),
+  filter: $("#lib-filter"),
+  typeFilter: $("#type-filter"),
+  path: $("#libpath"),
+  count: $("#lib-count"),
+  refresh: $("#lib-refresh"),
+  pickDir: $("#lib-pick"),
+  mediaBase: MEDIA_BASE,
+  t: pt,
+  log,
+  open: (it) => void openLibrary(it),
+  play: (it) => void window.open(playerUrl(it), "_blank", "noopener"),
+});
+
+/** 当前文档与壁纸库的关联变了：高亮库条目、切换「壁纸配置」、重置帧率曲线 */
+function syncLibraryItem() {
+  libraryPanel.setActive(libItem?.itemId ?? null);
+  wallpaperConfig.setItem(libItem?.itemId ?? null);
+  perfPanel.reset();
+  renderSaveStatus();
+}
+
+// 使用说明：中栏标签；帮助按钮 / 赞赏按钮 / #docs=editor|library 直达
+const DOC_KIND_KEY = "we-editor-docs-kind";
+const asDocKind = (v: string | null | undefined): DocKind | null => (DOC_KINDS.includes(v as DocKind) ? (v as DocKind) : null);
+let docKind: DocKind = asDocKind(localStorage.getItem(DOC_KIND_KEY)) ?? "editor";
+const docsViewEl = $<HTMLElement>("#docs-view");
+const docsSwitchBtns = [...document.querySelectorAll<HTMLButtonElement>("#docs-switch [data-doc]")];
+
+function renderDocsView() {
+  renderDocs($("#docs-body"), docKind, getLang());
+  for (const b of docsSwitchBtns) {
+    const on = b.dataset.doc === docKind;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-checked", String(on));
+  }
+}
+
+function showDocs(kind: DocKind = docKind) {
+  if (kind !== docKind) {
+    docKind = kind;
+    try {
+      localStorage.setItem(DOC_KIND_KEY, kind);
+    } catch {
+      /* 只是不记住 */
+    }
+    renderDocsView();
+    docsViewEl.scrollTop = 0;
+  }
+  panelTabs.center.select("docs");
+}
+
+for (const b of docsSwitchBtns) b.onclick = () => showDocs(asDocKind(b.dataset.doc) ?? docKind);
+$<HTMLButtonElement>("#ed-help").onclick = () => showDocs("editor");
+$<HTMLButtonElement>("#sponsor-btn").onclick = () => {
+  showDocs();
+  $("#sponsor-card").scrollIntoView({ block: "start", behavior: "smooth" });
+};
+
+function docsFromHash() {
+  const m = /^#docs(?:=(\w+))?$/.exec(location.hash);
+  if (m) showDocs(asDocKind(m[1]) ?? docKind);
+}
+window.addEventListener("hashchange", docsFromHash);
+
+onChangeLang(() => {
+  renderDocsView();
+  libraryPanel.render();
+  wallpaperConfig.refresh();
+  perfPanel.render();
+});
+
 // ---------- 打开项目文件夹 / 导入 .pkg ----------
+
+const pickDirDlg = $<HTMLDialogElement>("#pick-dir-dlg");
+
+/**
+ * 文件夹选择器要求「正在处理用户手势」：从文件框 change、拖放、异步链里调用会被拒（SecurityError）。
+ * 被拒时弹确认框，在用户这一次点击里重新调用。
+ */
+async function pickDirectoryWithGesture(): Promise<DirHandle | null> {
+  try {
+    return await pickDirectory();
+  } catch (e) {
+    if ((e as Error).name !== "SecurityError") throw e;
+  }
+  return new Promise<DirHandle | null>((resolve, reject) => {
+    let picking = false;
+    $<HTMLButtonElement>("#pick-dir-ok").onclick = () => {
+      picking = true;
+      const p = pickDirectory();
+      pickDirDlg.close();
+      p.then(resolve, reject);
+    };
+    $<HTMLButtonElement>("#pick-dir-cancel").onclick = () => pickDirDlg.close();
+    pickDirDlg.onclose = () => {
+      if (!picking) resolve(null);
+    };
+    pickDirDlg.showModal();
+  });
+}
 
 async function requireProjectDir(): Promise<DirHandle | null> {
   if (!canPickDirectory()) {
@@ -1961,7 +2303,7 @@ async function requireProjectDir(): Promise<DirHandle | null> {
   }
   let dir: DirHandle | null;
   try {
-    dir = await pickDirectory();
+    dir = await pickDirectoryWithGesture();
   } catch (e) {
     log(et("log.pickFailed", { msg: `${(e as Error).name}: ${(e as Error).message}` }), "error");
     return null;
@@ -2234,43 +2576,71 @@ function dropImages(files: File[], dir: DirHandle | null) {
   return createNew(files, dir);
 }
 
-// ---------- 导入 glTF 模型（W19） ----------
+// ---------- 导入模型（W19：glTF / FBX / OBJ / DAE / STL / PLY / 3DS） ----------
 
 const inModelEl = $<HTMLInputElement>("#in-model");
+/** 模型主文件 = 某个已登记导入器认的扩展名（插件导入器加了新格式，这里自动认） */
+const isModelFile = (f: { name: string }) => isModelMain(f.name);
+/** 文件框 accept 跟着导入器注册表走 */
+function syncModelAccept() {
+  inModelEl.accept = [...modelExts(), ...modelSideExts()].map((x) => `.${x}`).join(",");
+}
+/** 「导入模型」菜单选的形态；null = 按场景相机自动 */
+let modelFormPick: GltfTarget | null = null;
 inModelEl.onchange = () => {
   const files = Array.from(inModelEl.files ?? []);
   inModelEl.value = "";
-  if (files.length) void importModelFiles(files);
+  if (files.length) void importModelFiles(files, modelFormPick);
 };
 
 /**
- * 每个 .glb / .gltf 转成一个模型层：正交场景成 puppet（图片层 + model json），透视场景成网格（model 指 .mdl）；
- * 同批的其余文件（.bin / 贴图）供 .gltf 的外部 URI 按文件名取。产物写进资源表，加层 + 首个片段的动画层是一步结构编辑
+ * 每个模型主文件（.glb / .gltf / .fbx / .obj / .dae / .stl / .ply / .3ds）转成一个模型层：
+ * 形态缺省按场景定（正交 puppet = 图片层 + model json，透视 = 网格，model 指 .mdl），菜单可强制；
+ * 同批的其余文件（.bin / .mtl / 贴图）供主文件按文件名引用（不分大小写、去目录）。产物写进资源表，加层 + 首个片段的动画层是一步结构编辑
  */
-async function importModelFiles(files: File[]) {
+async function importModelFiles(files: File[], forceForm: GltfTarget | null = null, gen: PuppetGenerator | null = null) {
   if (!doc?.scene || !overlay || doc.type !== "scene") {
     log(et("log.structUnavailable"), "warn");
     return;
   }
   const target = doc;
-  const mains = files.filter(isModelFile);
+  // 木偶生成器：每个所选文件各生成一个模型（产物是 ModelIR / glTF，后半段与导入完全相同）
+  const mains = gen ? files : files.filter(isModelFile);
   if (!mains.length) {
     log(et("gl.fail.noModel"), "warn");
     return;
   }
   const side = new Map<string, Uint8Array>();
-  for (const f of files) if (!isModelFile(f)) side.set(f.name, new Uint8Array(await f.arrayBuffer()));
-  for (const f of mains) {
-    const name = f.name.replace(/\.(glb|gltf)$/i, "");
+  for (const f of files) if (!gen && !isModelFile(f)) side.set(f.name.toLowerCase(), new Uint8Array(await f.arrayBuffer()));
+  const generate = async (g: PuppetGenerator, name: string, bytes: Uint8Array): Promise<LoadedModel> => {
+    const out: ModelIR | Gltf = await g.generate({ name, bytes });
+    return "json" in out && "resolve" in out ? { gltf: out, warnings: [] } : { gltf: irToGltf(out as ModelIR), warnings: (out as ModelIR).warnings ?? [] };
+  };
+  const resolve = (uri: string) => {
+    let u = uri;
     try {
-      const g = parseGltf(new Uint8Array(await f.arrayBuffer()), (uri) => side.get(uri) ?? side.get(uri.split("/").pop()!) ?? null);
+      u = decodeURIComponent(uri);
+    } catch {
+      /* 保留原样 */
+    }
+    const base = u.replace(/\\/g, "/").split("/").pop()!.toLowerCase();
+    return side.get(u.toLowerCase()) ?? side.get(base) ?? null;
+  };
+  for (const f of mains) {
+    const name = f.name.replace(/\.[^.]+$/, "");
+    try {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      const loaded = gen ? await generate(gen, f.name, bytes) : await loadModelFile(f.name, bytes, resolve);
+      const g = loaded.gltf;
       const assets = overlay;
       if (doc !== target || !assets) return;
-      const form = defaultTarget(target);
+      const form = forceForm ?? defaultTarget(target);
+      for (const w of loaded.warnings) log(et(`gl.warn.${w.code}`, { name, detail: w.detail ?? "" }), "warn");
       const listed = new Set(assets.list());
       const refs = referencedModels(target);
       const slug = imageSlug(name, (s) => [modelPathOf(s), editorMdlPathOf(s)].some((p) => assets.has(p) || listed.has(p) || refs.has(p)));
       const m = gltfToModel(g, { target: form, slug, fps: 30, scale: form === "puppet" ? fitPuppetScale(target) : fitMeshScale(target) });
+      await bakePuppetAtlas(m);
       const r = gltfImportFiles(m, slug);
       for (const x of r.files) assets.put(x.name, x.data, r.path);
       if (form === "puppet") target.puppets = new Map([...(target.puppets ?? []), [r.path, r.mdlPath]]);
@@ -2581,10 +2951,12 @@ const lyAddTextEl = $<HTMLButtonElement>("#ly-add-text");
 const textMenuEl = $<HTMLElement>("#text-menu");
 const lyAddParticleEl = $<HTMLButtonElement>("#ly-add-particle");
 const particleMenuEl = $<HTMLElement>("#particle-menu");
+const lyAddModelEl = $<HTMLButtonElement>("#ly-add-model");
+const modelMenuEl = $<HTMLElement>("#model-menu");
 function presetMenu(btn: HTMLButtonElement, menu: HTMLElement, pick: (preset: string) => void) {
   btn.onclick = (e) => {
     e.stopPropagation();
-    for (const m of [textMenuEl, particleMenuEl]) if (m !== menu) m.hidden = true;
+    for (const m of [textMenuEl, particleMenuEl, modelMenuEl]) if (m !== menu) m.hidden = true;
     if (!menu.hidden) {
       menu.hidden = true;
       return;
@@ -2597,22 +2969,86 @@ function presetMenu(btn: HTMLButtonElement, menu: HTMLElement, pick: (preset: st
   document.addEventListener("click", (e) => {
     if (!menu.hidden && !menu.contains(e.target as Node)) menu.hidden = true;
   });
-  for (const b of menu.querySelectorAll<HTMLButtonElement>("button[data-preset]")) {
-    b.onclick = () => {
-      menu.hidden = true;
-      pick(b.dataset.preset!);
-    };
-  }
+  // 委托：菜单项会随注册表重建（粒子模板 / 木偶生成器）
+  menu.addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-preset]");
+    if (!b || !menu.contains(b)) return;
+    menu.hidden = true;
+    pick(b.dataset.preset!);
+  });
 }
 presetMenu(lyAddTextEl, textMenuEl, (p) => addText(p as TextPreset));
 presetMenu(lyAddParticleEl, particleMenuEl, (p) => addParticle(p as ParticlePreset));
+
+/** 菜单项与注册表对齐：已有的静态按钮（带 data-et 词条）原样复用，新增的按 title 出文案 */
+function syncMenuItems(menu: HTMLElement, attr: "preset" | "generator", items: ReadonlyArray<{ id: string; label: string; et?: string }>) {
+  const sel = `button[data-${attr}]`;
+  const existing = new Map([...menu.querySelectorAll<HTMLButtonElement>(sel)].map((b) => [b.dataset[attr]!, b]));
+  for (const it of items) {
+    let b = existing.get(it.id);
+    existing.delete(it.id);
+    if (!b) {
+      b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "menuitem");
+      b.dataset[attr] = it.id;
+      if (it.et) b.dataset.et = it.et;
+    }
+    b.textContent = it.label;
+    menu.appendChild(b);
+  }
+  for (const b of existing.values()) b.remove();
+}
+
+function renderParticleMenu() {
+  syncMenuItems(
+    particleMenuEl,
+    "preset",
+    particleTemplates.list().map((t) => {
+      const key = `pt.${t.id}`;
+      return { id: t.id, label: t.title !== undefined ? textOf(t.title, getLang(), t.id) : hasText(key) ? et(key) : t.id, et: t.title === undefined && hasText(key) ? key : undefined };
+    }),
+  );
+}
+
+/** 木偶生成器挂在「导入模型」菜单末尾（按钮 data-generator，与形态预设分开） */
+function renderGeneratorMenu() {
+  syncMenuItems(
+    modelMenuEl,
+    "generator",
+    puppetGenerators.list().map((g) => ({ id: g.id, label: textOf(g.title, getLang(), g.id) })),
+  );
+}
+const inGenEl = document.createElement("input");
+inGenEl.type = "file";
+inGenEl.hidden = true;
+document.body.appendChild(inGenEl);
+let genPick: string | null = null;
+modelMenuEl.addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-generator]");
+  const g = b && puppetGenerators.get(b.dataset.generator!);
+  if (!g) return;
+  modelMenuEl.hidden = true;
+  genPick = g.id;
+  inGenEl.accept = g.accept;
+  inGenEl.multiple = true;
+  inGenEl.click();
+});
+inGenEl.onchange = () => {
+  const files = Array.from(inGenEl.files ?? []);
+  inGenEl.value = "";
+  const g = genPick ? puppetGenerators.get(genPick) : undefined;
+  if (files.length && g) void importModelFiles(files, "puppet", g);
+};
 const lyAddVideoEl = $<HTMLButtonElement>("#ly-add-video");
 lyAddVideoEl.onclick = () => {
   videoPickFor = "layer";
   inVideoEl.click();
 };
-const lyAddModelEl = $<HTMLButtonElement>("#ly-add-model");
-lyAddModelEl.onclick = () => inModelEl.click();
+presetMenu(lyAddModelEl, modelMenuEl, (p) => {
+  modelFormPick = p === "puppet" || p === "mesh" ? p : null;
+  inModelEl.click();
+});
 const lyAddSoundEl = $<HTMLButtonElement>("#ly-add-sound");
 lyAddSoundEl.onclick = () => {
   soundPickFor = null;
@@ -3878,9 +4314,35 @@ function editGroup(node: LayerNode): HTMLElement {
 
 // ---------- 效果（W7 基础集）：增删 / 开关 / 排序 / 参数，全走结构编辑 ----------
 
-const canHaveEffects = (n: LayerNode) => n.kind === "image" || n.kind === "text";
+const canHaveEffects = (n: LayerNode) => layerKindInfo(n.kind)?.canHaveEffects === true;
 
-const fxLabel = (v: Pick<EffectView, "def" | "name">) => (v.def ? et(`fx.${v.def.id}`) : v.name);
+/** 效果名：内置走词典 fx.<id>，插件效果用自带 title */
+const fxTitle = (d: EffectDef) => (d.title !== undefined ? textOf(d.title, getLang(), d.id) : hasText(`fx.${d.id}`) ? et(`fx.${d.id}`) : d.id);
+const fxLabel = (v: Pick<EffectView, "def" | "name">) => (v.def ? fxTitle(v.def) : v.name);
+const fxParamLabel = (p: EffectParam) => (p.label !== undefined ? textOf(p.label, getLang(), p.key) : hasText(`fxp.${p.key}`) ? et(`fxp.${p.key}`) : p.key);
+
+/** 外来效果（不在注册表里的 WE 效果）从 shader 的 uniform 注释还原出的参数表；按文件缓存，读完重画检视器 */
+const externalParams = new Map<string, EffectParam[] | "loading">();
+function externalParamsOf(file: string): EffectParam[] | null {
+  const hit = externalParams.get(file);
+  if (hit === "loading") return null;
+  if (hit) return hit;
+  const assets = overlay;
+  if (!assets) return null;
+  externalParams.set(file, "loading");
+  const dec = new TextDecoder();
+  const target = doc;
+  void inspectEffectParams(file, async (name) => {
+    const b = await assets.read(name).catch(() => null);
+    return b ? dec.decode(b) : null;
+  })
+    .catch(() => [] as EffectParam[])
+    .then((ps) => {
+      externalParams.set(file, ps);
+      if (ps.length && doc === target) renderInspector();
+    });
+  return null;
+}
 
 /** 对一个图层对象做一次可撤销的结构编辑（效果 / 脚本）；mutate 返回 false = 没改成 */
 function objEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean) {
@@ -3900,8 +4362,15 @@ function objEditOk(label: string, id: number | string, mutate: (o: LayerNode["ob
 function addEffectTo(n: LayerNode, fxId: string) {
   const d = effectById(fxId);
   if (!d || !overlay) return;
-  for (const f of effectFiles(d)) overlay.put(f.name, f.data, effectFileOf(fxId));
-  objEdit(et("log.fxAdded", { name: et(`fx.${fxId}`), layer: nodeName(n.id) }), n.id, (o) => addEffect(o, fxId) !== null);
+  let files: ReturnType<typeof effectFiles>;
+  try {
+    files = effectFiles(d);
+  } catch (e) {
+    log(et("log.fxFailed", { name: fxTitle(d), msg: (e as Error).message }), "error");
+    return;
+  }
+  for (const f of files) overlay.put(f.name, f.data, effectFileOf(fxId));
+  objEdit(et("log.fxAdded", { name: fxTitle(d), layer: nodeName(n.id) }), n.id, (o) => addEffect(o, fxId) !== null);
 }
 
 function effectsGroup(node: LayerNode): HTMLElement {
@@ -3947,46 +4416,17 @@ function effectsGroup(node: LayerNode): HTMLElement {
       iconBtn("ed-fx-del", "✕", et("fx.del"), () => objEdit(et("log.fxRemoved", { name: label }), node.id, (o) => removeEffect(o, v.index))),
     );
     item.appendChild(head);
-    if (!v.def) {
+    const params = v.def ? v.def.params : externalParamsOf(v.file);
+    if (!params?.length) {
       item.appendChild(note(et("fx.external")));
     } else {
-      const form = document.createElement("div");
-      form.className = "ed-fx-params";
-      for (const p of v.def.params) {
-        const l = document.createElement("label");
-        l.textContent = et(`fxp.${p.key}`);
-        const val = v.values[p.key];
-        const commit = (next: EffectValue) =>
-          objEdit(et("log.fxParam", { name: label, param: et(`fxp.${p.key}`) }), node.id, (o) => setEffectParam(o, v.index, p.key, next));
-        const box = document.createElement("div");
-        box.className = "ed-fx-param";
-        if (p.type === "color") {
-          const inp = document.createElement("input");
-          inp.type = "color";
-          inp.dataset.param = p.key;
-          inp.value = toHex(val as number[]);
-          inp.disabled = !editable;
-          inp.addEventListener("change", () => commit(fromHex(inp.value)));
-          box.appendChild(inp);
-        } else {
-          const inp = document.createElement("input");
-          inp.type = "range";
-          inp.dataset.param = p.key;
-          inp.min = String(p.min ?? 0);
-          inp.max = String(p.max ?? 1);
-          inp.step = String(p.step ?? 0.01);
-          inp.value = String(val);
-          inp.disabled = !editable;
-          const out = document.createElement("span");
-          out.className = "ed-val";
-          out.textContent = fmtNum(val as number);
-          inp.addEventListener("input", () => (out.textContent = fmtNum(Number(inp.value))));
-          inp.addEventListener("change", () => commit(Number(inp.value)));
-          box.append(inp, out);
-        }
-        form.append(l, box);
-      }
-      item.appendChild(form);
+      const values = v.def ? v.values : externalValues(node.obj, v.index, params);
+      const commit = (key: string, next: EffectValue) => {
+        const p = params.find((x) => x.key === key)!;
+        objEdit(et("log.fxParam", { name: label, param: fxParamLabel(p) }), node.id, (o) => setEffectParam(o, v.index, key, next, v.def ? undefined : params));
+      };
+      item.appendChild(schemaForm({ params, values, label: fxParamLabel, commit, disabled: !editable }));
+      if (!v.def) item.appendChild(note(et("fx.externalTunable")));
     }
     group.appendChild(item);
   }
@@ -3997,11 +4437,23 @@ function effectsGroup(node: LayerNode): HTMLElement {
   first.value = "";
   first.textContent = et("fx.add");
   add.appendChild(first);
-  for (const d of EFFECTS) {
+  const cats = new Map<string, HTMLElement>();
+  for (const d of effectCatalog.list()) {
     const o = document.createElement("option");
     o.value = d.id;
-    o.textContent = et(`fx.${d.id}`);
-    add.appendChild(o);
+    o.textContent = fxTitle(d);
+    let parent: HTMLElement = add;
+    if (d.category) {
+      let g = cats.get(d.category);
+      if (!g) {
+        g = document.createElement("optgroup");
+        (g as HTMLOptGroupElement).label = hasText(`fxcat.${d.category}`) ? et(`fxcat.${d.category}`) : d.category;
+        cats.set(d.category, g);
+        add.appendChild(g);
+      }
+      parent = g;
+    }
+    parent.appendChild(o);
   }
   add.addEventListener("change", () => {
     if (add.value) addEffectTo(node, add.value);
@@ -4757,6 +5209,11 @@ function refreshScriptIssues() {
     if (box.textContent !== text) box.textContent = text;
     box.hidden = !mine.length;
   }
+  // 脚本报错时，即使不在那一页也在标签上亮个点
+  for (const tab of inspectorEl.querySelectorAll<HTMLElement>(".ed-insp-tab")) {
+    const panel = inspectorEl.querySelector(`.ed-insp-panel[data-tab="${tab.dataset.tab}"]`);
+    tab.classList.toggle("has-alert", !!panel?.querySelector(".ed-script-issues:not([hidden])"));
+  }
 }
 
 function scriptsGroup(node: LayerNode): HTMLElement {
@@ -5138,27 +5595,35 @@ function renderInspector() {
     if (doc.video) inspectorEl.appendChild(videoProjectGroup());
     return;
   }
-  if (extraSel.size) inspectorEl.appendChild(multiGroup());
-  inspectorEl.appendChild(editGroup(node));
-  if (canAnimate(node)) inspectorEl.appendChild(animGroup(node));
-  if (node.kind === "text") inspectorEl.appendChild(textGroup(node));
-  if (node.kind === "particle") inspectorEl.appendChild(particleGroup(node));
-  if (node.kind === "sound") inspectorEl.appendChild(soundGroup(node));
-  if (node.modelForm) inspectorEl.appendChild(modelGroup(node));
-  if (node.modelForm) inspectorEl.appendChild(animLayersGroup(node));
-  const cl = node.modelForm ? clipsGroup(node) : null;
-  if (cl) inspectorEl.appendChild(cl);
-  const mt = node.modelForm ? modelTexGroup(node) : null;
-  if (mt) inspectorEl.appendChild(mt);
-  const bn = node.modelForm ? boneGroup(node) : null;
-  if (bn) inspectorEl.appendChild(bn);
-  else dropBonePick();
-  const att = attachGroup(node);
-  if (att) inspectorEl.appendChild(att);
-  if (isVideoNode(node)) inspectorEl.appendChild(videoInfoGroup(node));
-  if (canHaveEffects(node)) inspectorEl.appendChild(effectsGroup(node));
-  inspectorEl.appendChild(bindingsGroup(node));
-  inspectorEl.appendChild(scriptsGroup(node));
+  // 分组来自 inspector / puppet.tools 注册表（内置分组由 builtin-inspector 插件登记，插件分组按 order 插在中间），
+  // 再按 tab 归到各标签页；非当前页只是 hidden，分组照常渲染（骨骼预览等副作用不随切页变化）
+  const panels = new Map<string, HTMLElement>();
+  const panelOf = (tab: string) => {
+    let p = panels.get(tab);
+    if (!p) {
+      p = document.createElement("div");
+      p.className = "ed-insp-panel";
+      p.dataset.tab = tab;
+      p.setAttribute("role", "tabpanel");
+      panels.set(tab, p);
+    }
+    return p;
+  };
+  let bonesShown = false;
+  for (const g of groupsFor(node)) {
+    let el: HTMLElement | null = null;
+    try {
+      el = g.render(node);
+    } catch (e) {
+      reportPluginError(inspectorGroups.ownerOf(g.id) ?? puppetTools.ownerOf(g.id) ?? g.id, e, `inspector/${g.id}`);
+    }
+    if (!el) continue;
+    el.dataset.group = g.id;
+    panelOf(tabOf(g)).appendChild(el);
+    if (g.id === "bones") bonesShown = true;
+  }
+  if (!bonesShown) dropBonePick();
+  const info = panelOf(INFO_INSPECTOR_TAB);
   const o = node.obj;
   const effects = Array.isArray(o.effects)
     ? (o.effects as Array<Record<string, unknown>>)
@@ -5167,7 +5632,7 @@ function renderInspector() {
     : "";
   const source = o.image ?? o.model ?? o.particle ?? (o.text !== undefined ? unwrap(o.text) : undefined);
   const color = colorCss(o.color);
-  inspectorEl.appendChild(
+  info.appendChild(
     kvGroup(node.name || `#${node.id}`, [
       ["f.id", String(node.id)],
       ["f.kind", et(`kind.${node.kind}`)],
@@ -5194,8 +5659,263 @@ function renderInspector() {
       ["f.effects", effects || "—"],
     ]),
   );
-  inspectorEl.appendChild(note(et("insp.readonly")));
-  inspectorEl.appendChild(rawGroup(o));
+  info.appendChild(note(et("insp.readonly")));
+  info.appendChild(rawGroup(o));
+  mountInspectorTabs(panels);
+}
+
+const uiPrefs = createSettings("webwallgl-editor.ui.");
+/** 用户上次选的检视器标签；当前图层没有这一页时临时落到第一页，不覆盖偏好 */
+let inspTab = uiPrefs.get<string>("inspectorTab", DEFAULT_INSPECTOR_TAB);
+
+function inspectorTabDef(id: string): InspectorTab {
+  return inspectorTabs.get(id) ?? { id, order: 9000, title: id };
+}
+
+function mountInspectorTabs(panels: Map<string, HTMLElement>) {
+  const tabs = [...panels.keys()].map(inspectorTabDef).sort((a, b) => a.order - b.order);
+  const active = panels.has(inspTab) ? inspTab : tabs[0].id;
+  const bar = document.createElement("div");
+  bar.className = "ed-insp-tabs";
+  bar.setAttribute("role", "tablist");
+  bar.setAttribute("aria-label", et("sec.inspector"));
+  const buttons: HTMLButtonElement[] = [];
+  const show = (id: string, focus = false) => {
+    for (const b of buttons) {
+      const on = b.dataset.tab === id;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+      if (on && focus) b.focus();
+    }
+    for (const [tab, p] of panels) p.hidden = tab !== id;
+  };
+  for (const t of tabs) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ed-insp-tab";
+    b.dataset.tab = t.id;
+    b.id = `insp-tab-${t.id}`;
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-controls", `insp-panel-${t.id}`);
+    if (typeof t.title === "string" && hasText(t.title)) b.dataset.et = t.title;
+    b.textContent = typeof t.title === "string" && hasText(t.title) ? et(t.title) : textOf(t.title, getLang(), t.id);
+    b.addEventListener("click", () => {
+      inspTab = t.id;
+      uiPrefs.set("inspectorTab", t.id);
+      show(t.id);
+    });
+    buttons.push(b);
+    bar.appendChild(b);
+  }
+  bar.addEventListener("keydown", (e) => {
+    const i = buttons.findIndex((b) => b.classList.contains("active"));
+    const n = buttons.length;
+    const next = e.key === "ArrowRight" ? (i + 1) % n : e.key === "ArrowLeft" ? (i - 1 + n) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    inspTab = buttons[next].dataset.tab!;
+    uiPrefs.set("inspectorTab", inspTab);
+    show(inspTab, true);
+  });
+  inspectorEl.appendChild(bar);
+  for (const t of tabs) {
+    const p = panels.get(t.id)!;
+    p.id = `insp-panel-${t.id}`;
+    p.setAttribute("aria-labelledby", `insp-tab-${t.id}`);
+    inspectorEl.appendChild(p);
+  }
+  show(active);
+}
+
+// ---------- 插件宿主（PLUGIN-ARCHITECTURE §2）：main.ts 的闭包包成服务，内置分组 / 命令 / 导出目标登记成插件 ----------
+
+/** 内置检视器分组（顺序 = 旧版硬编码顺序；占 100 的整数倍，插件分组可插在中间） */
+const BUILTIN_INSPECTOR: InspectorGroup[] = [
+  { id: "multi", order: 100, when: () => extraSel.size > 0, render: () => multiGroup(), tab: "props" },
+  { id: "edit", order: 200, when: () => true, render: editGroup, tab: "props" },
+  { id: "anim", order: 300, when: canAnimate, render: animGroup, tab: "anim" },
+  { id: "text", order: 400, when: (n) => n.kind === "text", render: textGroup, tab: "props" },
+  { id: "particle", order: 500, when: (n) => n.kind === "particle", render: particleGroup, tab: "props" },
+  { id: "sound", order: 600, when: (n) => n.kind === "sound", render: soundGroup, tab: "props" },
+  { id: "attach", order: 1200, when: () => true, render: attachGroup, tab: "props" },
+  { id: "video", order: 1300, when: isVideoNode, render: videoInfoGroup, tab: "props" },
+  { id: "effects", order: 1400, when: canHaveEffects, render: effectsGroup, tab: "fx" },
+  { id: "bindings", order: 1500, when: () => true, render: bindingsGroup, tab: "logic" },
+  { id: "scripts", order: 1600, when: () => true, render: scriptsGroup, tab: "logic" },
+];
+
+/** 模型层专属分组（木偶工具） */
+const BUILTIN_PUPPET_TOOLS: PuppetTool[] = [
+  { id: "model", order: 700, when: () => true, render: modelGroup, tab: "model" },
+  { id: "anim-layers", order: 800, when: () => true, render: animLayersGroup, tab: "anim" },
+  { id: "clips", order: 900, when: () => true, render: clipsGroup, tab: "anim" },
+  { id: "model-tex", order: 1000, when: () => true, render: modelTexGroup, tab: "model" },
+  { id: "bones", order: 1100, when: () => true, render: boneGroup, tab: "model" },
+];
+
+const VIDEO_EXPORTER: Exporter = {
+  id: "video",
+  title: "export.video",
+  order: 40,
+  accepts: "scene",
+  enabled: () => !!editor,
+  action: () => openRecMenu(),
+};
+
+let app: EditorApp | null = null;
+
+function reportPluginError(name: string, e: unknown, where = "callback") {
+  log(et("log.pluginError", { name, where, msg: (e as Error)?.message ?? String(e) }), "error");
+}
+
+/** 工程用到的外部插件（导出时写进 project.json 的 editor.plugins） */
+function usedPlugins(): Array<{ id: string; version?: string }> {
+  const out = new Map<string, { id: string; version?: string }>();
+  for (const s of app?.scopes() ?? []) {
+    const m = s.meta.manifest as { id?: string; version?: string } | undefined;
+    if (s.status === "active" && m?.id) out.set(m.id, m.version ? { id: m.id, version: m.version } : { id: m.id });
+  }
+  return [...out.values()];
+}
+
+const docService: DocService = {
+  current: () => doc,
+  selectedId: () => selectedId,
+  selection: () => selectedNode(),
+  find: (id) => (doc ? findNode(doc.roots, id) : null),
+  select: (id) => selectLayer(id),
+  isLocked: (id) => isLocked(id),
+  editObject(label, id, mutate) {
+    return objEditOk(label, id, mutate);
+  },
+  editStructure(label, mutate) {
+    structEdit(label, (d) => mutate(d) ?? undefined);
+  },
+  refresh() {
+    renderTree();
+    renderInspector();
+  },
+  log: (msg, level) => log(msg, level),
+};
+
+const builtinUiPlugin = {
+  name: "builtin-ui",
+  inject: ["inspector", "inspector.tabs", "puppet.tools", "exporters", "commands"],
+  apply(ctx: import("./core").Context) {
+    for (const t of BUILTIN_INSPECTOR_TABS) ctx.contribute("inspector.tabs", t);
+    for (const g of BUILTIN_INSPECTOR) ctx.contribute("inspector", g);
+    for (const t of BUILTIN_PUPPET_TOOLS) ctx.contribute("puppet.tools", t);
+    ctx.contribute("exporters", VIDEO_EXPORTER);
+    const cmds = ctx.get("commands").registry;
+    const cmd = (c: Parameters<typeof cmds.add>[0]) => ctx.effect(() => cmds.add(c, ctx.name));
+    cmd({ id: "edit.undo", keys: "Mod+Z", run: () => undoRedo("undo") });
+    cmd({ id: "edit.redo", keys: ["Mod+Shift+Z", "Mod+Y"], run: () => undoRedo("redo") });
+    cmd({ id: "file.save", keys: "Mod+S", run: () => void saveDocument() });
+    cmd({ id: "layer.duplicate", keys: "Mod+D", run: () => duplicateSelected() });
+    cmd({ id: "layer.delete", keys: ["Delete", "Backspace"], when: () => selectedId !== null, run: () => deleteSelected() });
+    cmd({ id: "export.run", run: (id) => void runExport(String(id)) });
+  },
+};
+
+async function bootPlugins() {
+  app = await bootEditor(
+    {
+      doc: docService,
+      history: { stack: () => edits, undo: () => undoRedo("undo"), redo: () => undoRedo("redo") },
+      assets: {
+        overlay: () => overlay,
+        put: (name, data, group) => {
+          if (!overlay) return false;
+          overlay.put(name, data, group ?? name);
+          return true;
+        },
+        read: async (name) => (overlay ? overlay.read(name) : null),
+        has: (name) => !!overlay?.has(name),
+        list: () => overlay?.list() ?? [],
+        unique: (p) => {
+          const taken = (x: string) => !!overlay?.has(x) || (overlay?.list() ?? []).includes(x);
+          if (!taken(p)) return p;
+          const dot = p.lastIndexOf(".");
+          const [stem, ext] = dot > p.lastIndexOf("/") ? [p.slice(0, dot), p.slice(dot)] : [p, ""];
+          for (let i = 2; ; i++) if (!taken(`${stem}-${i}${ext}`)) return `${stem}-${i}${ext}`;
+        },
+        addReferenceScanner: (fn) => addReferenceScanner(fn),
+        referenced: (d) => referencedGroups(d),
+      },
+      engine: { controls: () => editor, remount: () => void mountCurrent(true) },
+    },
+    { onError: (s, e, where) => reportPluginError(s.name, e, where) },
+  );
+  app.plugin(builtinUiPlugin);
+  await app.root.kernel.settle();
+  for (const u of app.load.unresolved) log(et("log.pluginError", { name: u.name, where: "inject", msg: u.missing.join(", ") }), "warn");
+  effectCatalog.onChange(() => renderInspector());
+  inspectorGroups.onChange(() => renderInspector());
+  inspectorTabs.onChange(() => renderInspector());
+  puppetTools.onChange(() => renderInspector());
+  particleTemplates.onChange(renderParticleMenu);
+  puppetGenerators.onChange(renderGeneratorMenu);
+  modelImporters.onChange(syncModelAccept);
+  exporters.onChange(renderExportMenu);
+  onChangeLang(() => {
+    renderParticleMenu();
+    renderGeneratorMenu();
+    renderExportMenu();
+  });
+  renderParticleMenu();
+  renderGeneratorMenu();
+  syncModelAccept();
+  renderExportMenu();
+  renderInspector();
+  await startExternalPlugins(app);
+}
+
+/** 外部插件：已安装（IndexedDB）+ 插件目录（dev 宿主在时），目录来源轮询热重载 */
+async function startExternalPlugins(a: EditorApp) {
+  await hostProbe;
+  const sources = [storeSource(a.storage), ...(hostUp ? [dirSource()] : [])];
+  const m = createPluginManager({
+    root: a.root,
+    sources,
+    settings: a.settings,
+    deps: { importModule: blobImporter, settings: a.settings, storage: a.storage },
+  });
+  const text = (v: string | Record<string, string> | undefined, fb: string) => textOf(v, getLang(), fb);
+  const panel = mountPluginPanel({
+    dialog: $<HTMLDialogElement>("#plugins-dlg"),
+    list: $("#plugins-list"),
+    manager: m,
+    t: et,
+    text,
+    log,
+    confirmInstall: (man) => {
+      const { low, high } = permissionSummary(man);
+      const perms = !low.length && !high.length
+        ? et("pl.installNoPerms")
+        : [et("pl.installPerms", { list: [...high, ...low].join(", ") }), high.length ? et("pl.installHigh", { list: high.join(", ") }) : ""].filter(Boolean).join("\n");
+      return confirm(et("pl.installConfirm", { name: text(man.name, man.id), version: man.version, perms }));
+    },
+  });
+  const inPluginEl = $<HTMLInputElement>("#in-plugin");
+  $("#tb-plugins").onclick = () => panel.open();
+  $("#plugins-close").onclick = () => $<HTMLDialogElement>("#plugins-dlg").close();
+  $("#plugins-refresh").onclick = () => void m.refresh().then(panel.render);
+  $("#plugins-install").onclick = () => inPluginEl.click();
+  inPluginEl.onchange = () => {
+    const files = Array.from(inPluginEl.files ?? []);
+    inPluginEl.value = "";
+    if (files.length) void panel.installFiles(files);
+  };
+  const desktop = (window as { webwallglDesktop?: { openPluginsDir?: () => Promise<unknown> } }).webwallglDesktop;
+  const openDirEl = $<HTMLButtonElement>("#plugins-open-dir");
+  if (desktop?.openPluginsDir) {
+    openDirEl.hidden = false;
+    openDirEl.onclick = () => void desktop.openPluginsDir!();
+  }
+  onChangeLang(() => panel.render());
+  await m.refresh();
+  if (hostUp) m.watch();
 }
 
 // ---------- 启动 ----------
@@ -5208,7 +5928,18 @@ renderStatus();
 syncPlayButton();
 syncTimeline();
 requestAnimationFrame(tickTimeline);
+void bootPlugins().catch((e) => log(et("log.pluginError", { name: "kernel", where: "boot", msg: (e as Error).message }), "error"));
+renderDocsView();
+docsFromHash();
 void (async () => {
+  await libraryPanel.load();
   const item = new URL(location.href).searchParams.get("item");
-  if (item) log(et("log.noLibraryEdit", { id: item }), "warn");
+  if (!item) return;
+  const it = libraryPanel.find(item);
+  if (!it) {
+    log(et("log.libItemMissing", { id: item }), "warn");
+    return;
+  }
+  panelTabs.left.select("library");
+  await openLibrary(it);
 })();

@@ -1,0 +1,12 @@
+{
+  "id": "export-lint-strict",
+  "name": { "zh-CN": "严格导出检查", "en": "Strict export lint" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "代码插件示例：给导出管线加一条规则——文件名只许 ASCII 安全字符（创意工坊上传与部分工具会被中文 / 空格绊倒）、单文件超过上限告警、没有封面告警。阈值存在插件私有设置里。",
+    "en": "Code plugin example: adds an export rule — file names must be ASCII-safe (Workshop uploads and some tools trip over spaces / non-ASCII), oversized single files warn, missing preview warns. Thresholds live in the plugin's private settings."
+  },
+  "main": "index.js",
+  "permissions": ["export.rules", "settings"]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "fireflies",
+  "title": { "zh-CN": "萤火虫", "en": "Fireflies" },
+  "blending": "additive",
+  "maxcount": 80,
+  "starttime": 6,
+  "emitter": { "name": "boxrandom", "origin": "0.000 -120.000 0.000", "distancemax": "960.000 420.000 0.000", "rate": 6 },
+  "initializer": [
+    { "name": "lifetimerandom", "min": 4, "max": 9 },
+    { "name": "sizerandom", "min": 6, "max": 18 },
+    { "name": "velocityrandom", "min": "-18 -10 0", "max": "18 22 0" },
+    { "name": "colorrandom", "min": "190 255 110", "max": "250 255 170" },
+    { "name": "alpharandom", "min": 0.5, "max": 1 }
+  ],
+  "operator": [
+    { "name": "movement", "gravity": "0 0 0", "drag": 0.2 },
+    { "name": "oscillateposition", "mask": "1 1 0", "frequencymin": 0.2, "frequencymax": 0.7, "scalemin": 10, "scalemax": 40 },
+    { "name": "alphafade", "fadeintime": 0.25, "fadeouttime": 0.6 }
+  ],
+  "renderer": { "name": "sprite" }
+}

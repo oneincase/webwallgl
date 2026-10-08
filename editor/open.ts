@@ -14,6 +14,7 @@ export type LibraryItem = {
   preview?: string;
   hasScene: boolean;
   hasLooseScene?: boolean;
+  properties?: Record<string, unknown> | null;
 };
 
 /** 场景资源按名读取（包或散装目录同口径）。结构编辑后由它 + 文档拼出挂载用的 Source */

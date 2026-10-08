@@ -29,20 +29,20 @@ export const LIBRARY_DOC: DocSection[] = [
         items: [
           { zh: "零运行时依赖，单文件引入（min ESM 约 1075KB / gzip 约 331KB）", en: "Zero runtime dependencies, single-file delivery (min ESM ~1075KB / gzip ~331KB)" },
           { zh: "可 npm 安装，也可 <script> CDN 引入；一页可开多个互不干扰的实例", en: "Installable via npm or a <script> CDN tag; multiple isolated instances per page" },
-          { zh: "预览本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API", en: "The bench is the library's first consumer — everything you see here is public API" },
+          { zh: "工作台本身就是库的第一个使用者 —— 你在这里看到的能力都是公共 API", en: "The workbench is the library's first consumer — everything you see here is public API" },
         ],
       },
     ],
   },
   {
     id: "bench",
-    title: { zh: "用预览看壁纸", en: "Previewing wallpapers" },
+    title: { zh: "在工作台里看壁纸", en: "Playing wallpapers in the workbench" },
     blocks: [
       {
         k: "p",
         v: {
-          zh: "预览就是一个基于本库的壁纸播放器：左边选壁纸，中间看画面，右边调参数，底部看日志和帧率。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
-          en: "The bench is a wallpaper player built on this library: pick a wallpaper on the left, watch it in the middle, tune it on the right, and read logs and frame rate at the bottom. Run pnpm dev locally and open http://localhost:1430/.",
+          zh: "工作台把播放和编辑放在同一个页面：左边「壁纸库」选壁纸，中间看画面，右边调配置和渲染参数，底部看日志和帧率；同一张壁纸可以直接接着编辑。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
+          en: "The workbench puts playing and editing on one page: pick a wallpaper in the Library tab on the left, watch it in the middle, tune its config and render settings on the right, and read logs and frame rate at the bottom — then keep editing the same wallpaper. Run pnpm dev locally and open http://localhost:1430/.",
         },
       },
       {
@@ -52,18 +52,18 @@ export const LIBRARY_DOC: DocSection[] = [
           { zh: "用途", en: "What it does" },
         ],
         rows: [
-          [{ zh: "壁纸库（左）", en: "Library (left)" }, { zh: "列出壁纸库目录里的条目，可按标题 / itemId 过滤、按 Scene / Web / Video 分类；右键可在 Finder 中显示或删除。主工具条的「选择壁纸库」（⌘⇧O）可切换目录", en: "Lists the items in the library folder; filter by title / itemId and by Scene / Web / Video. Right-click to reveal in Finder or delete. \"Pick library\" on the main toolbar (⌘⇧O) switches folders" }],
-          [{ zh: "视口（中）", en: "Viewport (center)" }, { zh: "壁纸画面。视口工具条可切分辨率、适配方式、清晰度、滤镜，并提供指针注入、遮挡模拟、统计浮层三个调试开关。把 .pkg 文件直接拖进视口即可本地预览", en: "The wallpaper itself. Its toolbar switches resolution, fit, clarity and filter, and offers three debug toggles: pointer injection, occlusion simulation and a stats overlay. Drop a .pkg file onto the viewport to preview it locally" }],
-          [{ zh: "检视器（右）", en: "Inspector (right)" }, { zh: "「壁纸配置」是作者暴露的用户属性，改动即时生效并写回；「渲染设置」是帧率上限、音量、资源倍率、画质档等全局偏好；「信息」显示预览图与元数据", en: "\"Wallpaper settings\" are the author's user properties — changes apply live and are saved; \"Render settings\" are global preferences such as fps cap, volume, resource scale and quality tiers; \"Info\" shows the preview image and metadata" }],
-          [{ zh: "控制台 / 性能（底）", en: "Console / Performance (bottom)" }, { zh: "控制台汇总预览日志与渲染器诊断，可按级别和关键字过滤；性能页画出最近 2 分钟的实测帧率曲线", en: "The console merges bench logs with renderer diagnostics, filterable by level and keyword; the performance tab plots the measured frame rate over the last 2 minutes" }],
-          [{ zh: "主工具条 / 状态栏", en: "Main toolbar / status bar" }, { zh: "工具条居中的是暂停 / 重挂载 / 释放；状态栏显示后端连接、条目数、分辨率、DPR、帧率上限与实测帧率", en: "The toolbar centers pause / remount / release; the status bar shows the backend link, item count, resolution, DPR, fps cap and measured fps" }],
+          [{ zh: "壁纸库（左栏标签）", en: "Library (left tab)" }, { zh: "列出壁纸库目录里的条目，可按标题 / itemId 过滤、按 Scene / Web / Video 分类；右键可新窗口播放、在 Finder 中显示或删除。标签栏右侧的文件夹按钮切换壁纸库目录", en: "Lists the items in the library folder; filter by title / itemId and by Scene / Web / Video. Right-click to play in a new window, reveal in Finder or delete. The folder button beside the tabs switches library folders" }],
+          [{ zh: "视口（中）", en: "Viewport (center)" }, { zh: "壁纸画面。视口工具条切宽高比、适配方式与渲染 DPR；场景壁纸还有时间轴。把 .pkg 文件直接拖进视口即可本地打开", en: "The wallpaper itself. Its toolbar switches aspect ratio, fit and render DPR; scene wallpapers also get a timeline. Drop a .pkg file onto the viewport to open it locally" }],
+          [{ zh: "壁纸配置 / 渲染（右栏标签）", en: "Wallpaper config / Render (right tabs)" }, { zh: "「壁纸配置」是作者暴露的用户属性，改动即时生效并写回本机覆盖表；「渲染」是帧率上限、音量、画质档等全局偏好", en: "\"Wallpaper config\" holds the author's user properties — changes apply live and are saved to this machine's overrides; \"Render\" holds global preferences such as fps cap, volume and quality tiers" }],
+          [{ zh: "控制台 / 性能（底）", en: "Console / Performance (bottom)" }, { zh: "控制台汇总操作日志与渲染器诊断；性能页画出最近 2 分钟的实测帧率曲线", en: "The console merges action logs with renderer diagnostics; the performance tab plots the measured frame rate over the last 2 minutes" }],
+          [{ zh: "主工具条 / 状态栏", en: "Main toolbar / status bar" }, { zh: "工具条居中的是播放 / 暂停与重新加载；状态栏显示当前文档、图层数、分辨率、保存状态与实测帧率", en: "The toolbar centers play / pause and reload; the status bar shows the current document, layer count, resolution, save state and measured fps" }],
         ],
       },
       {
         k: "ul",
         items: [
-          { zh: "面板可拖动分隔条调整尺寸，双击分隔条收起；⌘B / ⌘I / ⌘J（Windows 为 Ctrl）分别切换壁纸库、检视器、控制台，「视图 → 重置布局」恢复默认", en: "Drag the splitters to resize panels and double-click one to collapse; ⌘B / ⌘I / ⌘J (Ctrl on Windows) toggle the library, inspector and console, and View → Reset layout restores the defaults" },
-          { zh: "壁纸库与属性读写依赖本地宿主后端（pnpm dev 自带）；后端不可用时壁纸库显示空态，但「打开 .pkg」与拖入预览仍可用", en: "The library and property storage need the local host backend (bundled with pnpm dev); without it the library shows an empty state, but Open .pkg and drag-and-drop preview still work" },
+          { zh: "面板可拖动分隔条调整尺寸，双击分隔条收起；工具条最右的「重置布局」恢复默认", en: "Drag the splitters to resize panels and double-click one to collapse; \"Reset layout\" at the right end of the toolbar restores the defaults" },
+          { zh: "壁纸库与属性读写依赖本地宿主后端（pnpm dev 自带）；后端不可用时壁纸库显示空态，但「打开 .pkg」与拖入仍可用", en: "The library and property storage need the local host backend (bundled with pnpm dev); without it the library shows an empty state, but Open .pkg and drag-and-drop still work" },
         ],
       },
     ],
@@ -527,7 +527,7 @@ export const LIBRARY_DOC: DocSection[] = [
           { zh: "松散工程渲染结果与打包版不一致：先确认形态判定的走向 —— project.json 的 file 以 .json 结尾就走松散、取不到入口才回退 scene.pkg；预览/调试页加 `?form=pkg` 或 `?form=loose` 可强制单臂做 A/B（诊断里会打出 scene form: …）；本仓 `node scripts/verify-loose.mjs --headless` 会跑两形态的图层指纹与请求对照", en: "Loose project renders differently from the packed build: check which form was chosen — a project.json whose file ends with .json uses the loose form, and only falls back to scene.pkg when the entry is unreachable; add `?form=pkg` or `?form=loose` to force one arm for an A/B (diagnostics print `scene form: …`); `node scripts/verify-loose.mjs --headless` compares layer fingerprints and requests across both forms" },
           { zh: "Failed to fetch 且无状态码：自定义协议/WKWebView 对缺失路径的行为，属正常容错路径，看最后一条错误即可", en: "Failed to fetch with no status: custom-protocol/WKWebView behavior for missing paths — by design; just read the final error" },
           { zh: "stats.fps 为 0 但画面在动：读数是「真正提交渲染」的帧，标签页被遮挡时浏览器会暂停 rAF，属预期", en: "stats.fps is 0 while the picture moves: the meter counts committed frames only; browsers suspend rAF for occluded tabs — expected" },
-          { zh: "stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就开预览视口工具条的「遮挡模拟」：HUD 实时显示档位、ROI 块数/面积（渲染器回报的精确分解）与图层剔除 c/g（分母 = 参与闸门的图层数），外加 tile 口径的覆盖率对照读数（对标 Lively 的 Grid Detection Overlay）。拖动遮挡窗可观察「ROI 面积 ≈ 可见面积」（吞洞会表现为 ROI 面积远超可见）", en: "stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). Use the bench viewport toolbar's \"Occlusion sim\" to reproduce: the HUD shows the band, ROI rect count/area (the renderer's exact decomposition) and layer culling c/g (denominator = layers passing the gate) live, plus a tile-granularity coverage readout for comparison (mirrors Lively's Grid Detection Overlay). Drag the occluder and watch \"ROI area ≈ visible area\" (hole-swallowing would show up as ROI area far exceeding visibility)" },
+          { zh: "stats 报 occluded/throttled：遮挡分档在起作用（宿主推过 setOcclusion）。occluded=true 是遮挡暂停（画面停在最后一帧，撤载荷自动恢复，不需要 resume()）；throttled=true 是遮挡降帧（帧率上限被压低）。要复现/排查就在自己的页面里对实例调 setOcclusion() 推几组矩形，再读 stats 与渲染器诊断里的档位、ROI 块数/面积", en: "stats reports occluded/throttled: the occlusion banding is at work (the host pushed setOcclusion). occluded=true means occlusion-paused (frame frozen on the last output; removing the occluders resumes automatically, no resume() needed); throttled=true means occlusion-throttled (fps cap lowered). To reproduce, call setOcclusion() on the instance from your own page with a few rectangles, then read stats and the renderer diagnostics for the band and ROI rect count/area" },
           { zh: "有声音但延迟起播：自动播放策略要求用户交互后才允许出声，volume 默认 0 正是为此", en: "Audio starts late: autoplay policy requires user interaction before sound; that's why volume defaults to 0" },
           { zh: "网页壁纸无音频/属性：入口 HTML 必须同源或 CORS 可读，库才能改写注入 WE shim；跨域不可读时会退回裸 iframe（无官方 API）。webSandbox: \"strict\" 不属此列：shim 照常注入、API 齐全，只是控制/音频/媒体走 postMessage 通道", en: "Web wallpaper has no audio/properties: the entry HTML must be same-origin or CORS-readable so the library can inject the WE shim; unreadable cross-origin falls back to a bare iframe (no official APIs). webSandbox: \"strict\" is not this case — the shim is injected and the full API works (control/audio/media travel over postMessage)" },
           { zh: "网页壁纸相对资源 404：依赖 <base href> 指回原站点目录；依赖 location.href 拼路径的壁纸在 blob 加载下可能异常", en: "Web wallpaper relative assets 404: resources rely on <base href> pointing at the original directory; wallpapers that build URLs from location.href may break under blob loading" },

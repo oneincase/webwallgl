@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/shared/workbench/tokens.css" />
     <link rel="stylesheet" href="/shared/workbench/shell.css" />
     <link rel="stylesheet" href="/editor/editor.css" />
+    <link rel="stylesheet" href="/editor/preview.css" />
   </head>
   <body class="wb-app ed">
     <!-- ================= 标题栏 ================= -->
@@ -18,22 +19,15 @@
         </span>
         <span>WebWallGL</span>
       </div>
-      <div class="wb-modes" role="tablist">
-        <a class="wb-mode" id="act-bench" href="../" data-et-title="act.bench" title="返回预览">
-          <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5" /></svg>
-          <span data-i18n="mode.bench">预览</span>
-        </a>
-        <a class="wb-mode is-active" href="./" aria-current="page">
-          <svg class="i i-sm" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3L6 13H3v-3z M9 4l3 3" /></svg>
-          <span data-i18n="act.editor">编辑器</span>
-        </a>
-      </div>
       <div class="wb-title-center"><strong data-et="app.title">WebWallGL 编辑器</strong><span id="ed-doc-title"></span></div>
       <span class="wb-spacer"></span>
       <div class="wb-title-right">
-        <a class="wb-icon-btn" id="ed-help" href="../#docs=editor" target="_blank" rel="noopener" data-i18n-title="docs.editor" title="编辑器使用说明">
+        <button type="button" class="wb-icon-btn sponsor-btn" id="sponsor-btn" data-i18n-title="sponsor.title" title="赞赏作者">
+          <svg class="i i-fill" viewBox="0 0 16 16"><path d="M8 14.2S1.6 10.4 1.6 5.9C1.6 3.6 3.4 2 5.4 2c1 0 2 .5 2.6 1.3C8.6 2.5 9.6 2 10.6 2c2 0 3.8 1.6 3.8 3.9 0 4.5-6.4 8.3-6.4 8.3z" /></svg>
+        </button>
+        <button type="button" class="wb-icon-btn" id="ed-help" data-i18n-title="act.docs" title="使用说明">
           <svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8" /><path d="M6.3 6.4a1.8 1.8 0 1 1 2.4 1.7c-.5.2-.7.6-.7 1.1v.4 M8 11.3v.2" /></svg>
-        </a>
+        </button>
         <button type="button" class="wb-icon-btn" id="theme-toggle" title="主题：跟随系统">
           <svg class="i ic ic-auto" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" /><path style="fill: currentColor; stroke: none" d="M8 2.4a5.6 5.6 0 0 0 0 11.2z" /></svg>
           <svg class="i ic ic-dark" viewBox="0 0 16 16" hidden><path d="M13.5 9.6A5.6 5.6 0 1 1 6.4 2.5a4.6 4.6 0 0 0 7.1 7.1z" /></svg>
@@ -137,6 +131,9 @@
           <svg class="i" viewBox="0 0 16 16"><path d="M2.5 3h11v10h-11z M2.5 10.5l3-3 2.5 2.5 2-2 3 3 M10.5 5.8h.01" /></svg>
           <span data-et="tb.export">导出 PNG</span>
         </button>
+        <button type="button" class="ed-icon" id="tb-plugins" data-et-title="pl.title" title="插件" aria-haspopup="dialog">
+          <svg class="i" viewBox="0 0 16 16"><path d="M6 2.5h4v2.2a1.3 1.3 0 1 0 2.6 0V2.5h0.9v4h-2.2a1.3 1.3 0 1 0 0 2.6h2.2v4.4H2.5V9.1h2.2a1.3 1.3 0 1 0 0-2.6H2.5v-4z" /></svg>
+        </button>
         <span class="wb-tb-sep"></span>
         <button type="button" class="wb-icon-btn" id="layout-reset" data-i18n-title="menu.resetLayout" title="重置布局">
           <svg class="i" viewBox="0 0 16 16"><path d="M2.5 3h11v10h-11z M6 3v10 M6 9.5h7.5" /></svg>
@@ -146,16 +143,31 @@
 
     <!-- ================= 工作台 ================= -->
     <div id="ed-workbench" class="wb-workbench">
-      <!-- 左：图层 -->
+      <!-- 左：图层 / 壁纸库 -->
       <div id="ed-left" class="wb-col is-dock">
         <section id="ed-layers" class="wb-panel is-fill">
           <div class="wb-panel-head">
-            <span class="wb-tab active">
+            <button type="button" class="wb-tab" data-tab="layers">
               <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 2L1.8 5.2 8 8.4l6.2-3.2z M1.8 8L8 11.2 14.2 8 M1.8 10.8L8 14l6.2-3.2" /></svg>
               <span data-et="sec.layers">图层</span>
               <span id="ed-layer-count" class="wb-badge"></span>
-            </span>
-            <div class="wb-panel-tools ed-layer-tools">
+            </button>
+            <button type="button" class="wb-tab" data-tab="library">
+              <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 2.5h4.5v4.5H2.5z M9 2.5h4.5v4.5H9z M2.5 9h4.5v4.5H2.5z M9 9h4.5v4.5H9z" /></svg>
+              <span data-et="sec.library">壁纸库</span>
+              <span id="lib-count" class="wb-badge" hidden></span>
+            </button>
+            <div class="wb-panel-tools ed-lib-tools" data-tools="library">
+              <button type="button" class="ed-icon" id="lib-pick" data-i18n-title="sidebar.pickLib" title="选择壁纸库文件夹">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3.2l1.5 1.5H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="lib-refresh" data-i18n-title="lib.refresh" title="刷新壁纸库">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6 M13 2.5v3h-3" /></svg>
+              </button>
+            </div>
+          </div>
+          <div class="wb-panel-body" data-pane="layers">
+            <div class="wb-subbar ed-layer-tools" role="toolbar">
               <button type="button" class="ed-icon" id="ly-add" disabled data-et-title="ly.add" title="添加图片层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M10 3H2.5v10h11V7.5 M12.5 1.5v4 M10.5 3.5h4 M2.5 11l3-3.5 2.5 2.5 1.5-1.5 4 3.5" /></svg>
               </button>
@@ -168,7 +180,7 @@
               <button type="button" class="ed-icon" id="ly-add-video" disabled data-et-title="ly.addVideo" title="添加视频层">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M1.8 4h9v8h-9z M10.8 7l3.4-2v6l-3.4-2" /></svg>
               </button>
-              <button type="button" class="ed-icon" id="ly-add-model" disabled data-et-title="ly.addModel" title="导入模型（glTF）">
+              <button type="button" class="ed-icon" id="ly-add-model" disabled data-et-title="ly.addModel" title="导入模型" aria-haspopup="menu">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z M2.5 4.8L8 7.8l5.5-3 M8 7.8v6.4" /></svg>
               </button>
               <button type="button" class="ed-icon" id="ly-add-sound" disabled data-et-title="ly.addSound" title="添加声音层">
@@ -190,7 +202,6 @@
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4h10M6.5 4V3h3v1M4.5 4.5V13a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V4.5M6.8 7v4.5M9.2 7v4.5" /></svg>
               </button>
             </div>
-          </div>
           <div id="text-menu" class="ed-menu" role="menu" hidden>
             <button type="button" role="menuitem" data-preset="plain" data-et="text.plain">文字</button>
             <button type="button" role="menuitem" data-preset="clock" data-et="text.clock">时钟</button>
@@ -202,7 +213,28 @@
             <button type="button" role="menuitem" data-preset="embers" data-et="pt.embers">火花</button>
             <button type="button" role="menuitem" data-preset="bokeh" data-et="pt.bokeh">光点</button>
           </div>
+          <div id="model-menu" class="ed-menu" role="menu" hidden>
+            <button type="button" role="menuitem" data-preset="auto" data-et="md.auto">自动（正交场景 puppet，透视场景 3D 网格）</button>
+            <button type="button" role="menuitem" data-preset="puppet" data-et="md.puppet">导入为 puppet（2D 骨骼动画层）</button>
+            <button type="button" role="menuitem" data-preset="mesh" data-et="md.mesh">导入为 3D 网格</button>
+          </div>
           <div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree"></div>
+          </div>
+          <div class="wb-panel-body" data-pane="library">
+            <div class="lib-tools">
+              <p id="libpath" class="lib-path wb-selectable" title=""></p>
+              <div class="wb-search">
+                <svg class="i i-sm" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2l3.3 3.3" /></svg>
+                <input id="lib-filter" type="search" placeholder="过滤标题 / itemId" data-i18n-ph="ph.filter" />
+              </div>
+              <div id="type-filter" class="seg" role="radiogroup" aria-label="壁纸类型">
+                <button type="button" class="seg-btn active" data-type="scene" role="radio" aria-checked="true">Scene</button>
+                <button type="button" class="seg-btn" data-type="web" role="radio" aria-checked="false">Web</button>
+                <button type="button" class="seg-btn" data-type="video" role="radio" aria-checked="false">Video</button>
+              </div>
+            </div>
+            <ul id="lib-list" class="lib-list" role="listbox"></ul>
+          </div>
         </section>
       </div>
       <div class="wb-split" id="ed-split-left"></div>
@@ -211,11 +243,16 @@
       <div class="wb-col">
         <section id="ed-center" class="wb-panel is-fill">
           <div class="wb-panel-head">
-            <span class="wb-tab active">
+            <button type="button" class="wb-tab" data-tab="viewport">
               <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5" /></svg>
               <span data-i18n="tab.viewport">视口</span>
-            </span>
+            </button>
+            <button type="button" class="wb-tab" data-tab="docs">
+              <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 3h4A1.5 1.5 0 0 1 8 4.5V13a1.2 1.2 0 0 0-1.2-1.2H2.5z M13.5 3h-4A1.5 1.5 0 0 0 8 4.5V13a1.2 1.2 0 0 1 1.2-1.2h4.3z" /></svg>
+              <span data-i18n="act.docs">使用说明</span>
+            </button>
           </div>
+          <div class="wb-panel-body" data-pane="viewport">
           <div class="wb-subbar" id="ed-viewbar">
             <label class="wb-labeled"><span data-et="tb.aspect">宽高比</span>
               <select id="tb-aspect">
@@ -291,38 +328,152 @@
             </label>
           </div>
           <div id="tl-lanes" hidden></div>
+          </div>
+
+          <section id="docs-view" class="wb-panel-body is-scroll" data-pane="docs">
+            <div id="docs-switch" class="seg" role="radiogroup">
+              <button type="button" class="seg-btn" data-doc="editor" role="radio" data-i18n="docs.editorShort">编辑器</button>
+              <button type="button" class="seg-btn" data-doc="library" role="radio" data-i18n="docs.libraryShort">播放库</button>
+            </div>
+            <div id="docs-body"></div>
+            <div id="sponsor-card">
+              <strong data-i18n="sponsor.title">赞赏作者</strong>
+              <p data-i18n="sponsor.text">如果这个渲染核心帮到了你的项目，欢迎请作者喝杯咖啡。扫描二维码即可赞赏，金额随意。</p>
+              <div class="sponsor-qr-container">
+                <figure class="sponsor-qr-item">
+                  <img class="sponsor-qr" src="/imgs/wechat.png" alt="微信支付赞赏码" />
+                  <figcaption data-i18n="sponsor.wechat">微信支付</figcaption>
+                </figure>
+                <figure class="sponsor-qr-item">
+                  <img class="sponsor-qr" src="/imgs/alipay.png" alt="支付宝赞赏码" />
+                  <figcaption data-i18n="sponsor.alipay">支付宝</figcaption>
+                </figure>
+              </div>
+            </div>
+          </section>
         </section>
 
         <div class="wb-split" id="ed-split-bottom"></div>
 
         <section id="ed-console" class="wb-panel is-dock">
           <div class="wb-panel-head">
-            <span class="wb-tab active">
+            <button type="button" class="wb-tab" data-tab="console">
               <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v10H2z M4.5 6l2 2-2 2 M8 10.5h3.5" /></svg>
               <span data-et="sec.console">控制台</span>
               <span id="ed-con-count" class="wb-badge"></span>
-            </span>
-            <div class="wb-panel-tools">
+            </button>
+            <button type="button" class="wb-tab" data-tab="perf">
+              <svg class="i i-sm" viewBox="0 0 16 16"><path d="M1.5 8.5h3l2-5 3 9 2-4h3" /></svg>
+              <span data-i18n="panel.perf">性能</span>
+            </button>
+            <div class="wb-panel-tools" data-tools="console">
               <button type="button" class="wb-icon-btn is-sm" id="ed-con-clear" data-et-title="con.clear" title="清空">
                 <svg class="i i-sm" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5" /><path d="M4.2 11.8l7.6-7.6" /></svg>
               </button>
             </div>
           </div>
-          <pre id="ed-con-body"></pre>
+          <div class="wb-panel-body" data-pane="console">
+            <pre id="ed-con-body"></pre>
+          </div>
+          <div class="wb-panel-body" data-pane="perf">
+            <div id="perf-summary" class="perf-summary"></div>
+            <div class="perf-chart"><canvas id="perf-canvas"></canvas></div>
+          </div>
         </section>
       </div>
 
       <div class="wb-split" id="ed-split-right"></div>
 
-      <!-- 右：检视器 -->
+      <!-- 右：检视器 / 壁纸配置 / 渲染 -->
       <section id="ed-right" class="wb-panel is-dock">
         <div class="wb-panel-head">
-          <span class="wb-tab active">
+          <button type="button" class="wb-tab" data-tab="inspector">
             <svg class="i i-sm" viewBox="0 0 16 16"><path d="M4 2.5v3 M4 8.5v5 M8 2.5v7 M8 12.5v1 M12 2.5v1 M12 6.5v7" /><circle cx="4" cy="7" r="1.5" /><circle cx="8" cy="11" r="1.5" /><circle cx="12" cy="5" r="1.5" /></svg>
             <span data-et="sec.inspector">检视器</span>
-          </span>
+          </button>
+          <button type="button" class="wb-tab" data-tab="config">
+            <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 4h7 M12.5 4h1 M2.5 8h2 M7.5 8h6 M2.5 12h5 M10.5 12h3" /><circle cx="11" cy="4" r="1.5" /><circle cx="6" cy="8" r="1.5" /><circle cx="9" cy="12" r="1.5" /></svg>
+            <span data-i18n="props.title">壁纸配置</span>
+          </button>
+          <button type="button" class="wb-tab" data-tab="render">
+            <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5 M5 8.5l2-2.5 1.5 1.5L11 5" /></svg>
+            <span data-et="sec.render">渲染</span>
+          </button>
         </div>
-        <div id="ed-inspector" class="wb-panel-body is-scroll"></div>
+        <div id="ed-inspector" class="wb-panel-body is-scroll" data-pane="inspector"></div>
+
+        <!-- 壁纸配置：壁纸库条目的用户属性覆盖（对标 WE 属性窗口） -->
+        <div id="props" class="wb-panel-body" data-pane="config">
+          <div class="props-head">
+            <span id="props-state"></span>
+            <button type="button" class="wb-btn is-filled" id="props-reset" data-i18n="props.reset" disabled>恢复默认</button>
+          </div>
+          <div class="props-row">
+            <div class="wb-search">
+              <svg class="i i-sm" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2l3.3 3.3" /></svg>
+              <input id="props-filter" type="search" placeholder="过滤属性名 / 文案" data-i18n-ph="ph.propsFilter" />
+            </div>
+            <label class="check"><input id="props-all" type="checkbox" /> <span data-i18n="props.showHidden">显示条件隐藏项</span></label>
+          </div>
+          <div id="props-body" class="wb-selectable"></div>
+        </div>
+
+        <!-- 渲染：全局偏好，所有文档共用 -->
+        <div class="wb-panel-body is-scroll" data-pane="render">
+          <details class="wb-section" open>
+            <summary data-i18n="render.secFrame">帧率与音频</summary>
+            <div class="wb-section-body">
+              <label class="wb-field">
+                <span class="wb-field-label" data-i18n="render.fps">帧率上限</span>
+                <select id="fps">
+                  <option value="15">15</option>
+                  <option value="30">30</option>
+                  <option value="60" selected>60</option>
+                </select>
+              </label>
+              <label class="wb-field">
+                <span class="wb-field-label" data-i18n="toolbar.volume">音量</span>
+                <span class="wb-field-ctl">
+                  <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
+                  <span id="volume-val" class="wb-field-val">0%</span>
+                </span>
+              </label>
+            </div>
+          </details>
+          <details class="wb-section" open>
+            <summary data-i18n="render.secQuality">画质</summary>
+            <div class="wb-section-body">
+              <label class="wb-field" data-i18n-title="toolbar.aaTip" title="抗锯齿">
+                <span class="wb-field-label" data-i18n="toolbar.aa">抗锯齿</span>
+                <select id="aa">
+                  <option value="off" selected data-i18n="quality.off">关</option>
+                  <option value="fxaa">FXAA</option>
+                  <option value="msaa2">MSAA 2x</option>
+                  <option value="msaa4">MSAA 4x</option>
+                </select>
+              </label>
+              <label class="wb-field" data-i18n-title="toolbar.pqTip" title="粒子质量">
+                <span class="wb-field-label" data-i18n="toolbar.pq">粒子</span>
+                <select id="pq">
+                  <option value="high" selected data-i18n="quality.high">高</option>
+                  <option value="medium" data-i18n="quality.medium">中</option>
+                  <option value="low" data-i18n="quality.low">低</option>
+                  <option value="off" data-i18n="quality.off">关</option>
+                </select>
+              </label>
+              <label class="wb-field" data-i18n-title="toolbar.ppTip" title="后处理">
+                <span class="wb-field-label" data-i18n="toolbar.pp">后处理</span>
+                <select id="pp">
+                  <option value="high" selected data-i18n="quality.high">高</option>
+                  <option value="medium" data-i18n="quality.medium">中</option>
+                  <option value="low" data-i18n="quality.low">低</option>
+                  <option value="off" data-i18n="quality.off">关</option>
+                </select>
+              </label>
+              <p class="wb-hint" data-et="render.hint">全局设置，所有文档共用；改动即时生效，不影响导出的工程。</p>
+            </div>
+          </details>
+        </div>
       </section>
     </div>
 
@@ -341,9 +492,31 @@
       <span id="st-fps" class="idle">— FPS</span>
     </footer>
 
+    <dialog id="pick-dir-dlg" class="ed-dialog">
+      <div class="ed-dialog-title" data-et="pick.title">选择项目文件夹</div>
+      <p class="ed-dialog-body" data-et="pick.body">接下来要选一个文件夹存放工程文件（建议新建一个空文件夹）。</p>
+      <div class="ed-dialog-actions">
+        <button type="button" class="ed-btn" id="pick-dir-cancel" data-et="pick.cancel">取消</button>
+        <button type="button" class="ed-btn is-primary" id="pick-dir-ok" data-et="pick.ok">选择文件夹…</button>
+      </div>
+    </dialog>
+
+    <dialog id="plugins-dlg" class="ed-dialog ed-plugins">
+      <div class="ed-dialog-title" data-et="pl.title">插件</div>
+      <p class="ed-dialog-body" data-et="pl.body">插件可以添加效果、粒子模板、shader 片段、导入格式、导出目标和检视器面板。代码插件只能使用它在清单里申请、且你已授予的能力。</p>
+      <div id="plugins-list" class="ed-plugins-list"></div>
+      <div class="ed-dialog-actions">
+        <button type="button" class="ed-btn" id="plugins-open-dir" data-et="pl.openDir" hidden>打开插件目录</button>
+        <button type="button" class="ed-btn" id="plugins-refresh" data-et="pl.refresh">重新扫描</button>
+        <button type="button" class="ed-btn" id="plugins-install" data-et="pl.install">安装插件文件夹…</button>
+        <button type="button" class="ed-btn is-primary" id="plugins-close" data-et="pl.close">完成</button>
+      </div>
+    </dialog>
+
+    <input type="file" id="in-plugin" webkitdirectory multiple hidden />
     <input type="file" id="in-pkg" accept=".pkg,.json" multiple hidden />
     <input type="file" id="in-image" accept="image/*" multiple hidden />
-    <input type="file" id="in-model" accept=".glb,.gltf,.bin,.png,.jpg,.jpeg" multiple hidden />
+    <input type="file" id="in-model" accept=".glb,.gltf,.fbx,.obj,.dae,.stl,.ply,.3ds,.bin,.mtl,.png,.jpg,.jpeg,.tga,.bmp" multiple hidden />
     <input type="file" id="in-video" accept=".mp4,.m4v,.mov,.webm,.mkv,video/*" multiple hidden />
     <input type="file" id="in-font" accept=".ttf,.otf,font/ttf,font/otf" hidden />
     <input type="file" id="in-model-tex" accept="image/*" hidden />

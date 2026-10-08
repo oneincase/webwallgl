@@ -24,6 +24,8 @@ import { ROOT, imp } from "./lib/verify-kit.mjs";
 const FIXTURE = process.env.WE_EDITOR_ITEM || "beach";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const near = (a, b, eps) => Math.abs(a - b) <= eps;
+/** 页内片段：元素在检视器未选中的标签页里就先点开那一页（hidden 的输入框 focus 不上） */
+const REVEAL = `const reveal = (el) => { const p = el?.closest('.ed-insp-panel[hidden]'); if (p) document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').click(); return el; };`;
 
 export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB }) {
   const src = path.join(LIB, FIXTURE);
@@ -114,6 +116,9 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await sleep(60);
   };
   const clickSel = async (sel) => {
+    // 目标在检视器未选中的标签页里：先像用户一样点开那一页
+    const tab = await ev(`(() => { const p = document.querySelector(${JSON.stringify(sel)})?.closest('.ed-insp-panel[hidden]'); if (!p) return null; const r = document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
+    if (tab) await click(tab);
     const r = await ev(`(() => { const r = document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
     await click(r);
   };
@@ -146,9 +151,10 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   /** 检视器数值框：focus（记 before）→ 改值 → input（热改）→ change（入栈） */
   const setInputs = (values) =>
     ev(`(() => {
+      ${REVEAL}
       const ins = [...document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')];
       const v = ${JSON.stringify(values)};
-      ins[0].focus();
+      reveal(ins[0]).focus();
       for (const [i, x] of Object.entries(v)) { ins[i].value = String(x); ins[i].dispatchEvent(new Event('input', { bubbles: true })); }
       for (const i of Object.keys(v)) ins[i].dispatchEvent(new Event('change', { bubbles: true }));
       ins[0].blur();
@@ -816,7 +822,7 @@ async function runCreateAndDraft(ctx) {
   const tTop = worldToPage(crT, [1110, 590]);
   const tBot = worldToPage(crT, [1110, 490]);
   const tOut = worldToPage(crT, [300, 540]);
-  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 14`), "选中图片层：检视器有「效果」分组，下拉列出 13 个内置效果");
+  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 15`), "选中图片层：检视器有「效果」分组，下拉列出 14 个内置效果");
   check((await fxNames()).length === 0, "初始无效果");
 
   await fxAdd("tint");
@@ -1269,7 +1275,7 @@ async function runCreateAndDraft(ctx) {
   check(ink.frac > 0.12 && ink.color.every((c) => c > 200), `画面真画出白色文字（墨水占比 ${ink.frac.toFixed(3)}，色 ${ink.color}）`);
   check((await inkIn(...worldBox(crY, [960, 540], [boxW, 110]))).frac < 0.01, "挪到 y=800 后原位置没有残影");
 
-  await ev(`(() => { const c = document.querySelector('#ed-inspector fieldset.ed-form input[type=color]'); c.focus(); c.value = '#ff0000'; c.dispatchEvent(new Event('input', { bubbles: true })); c.dispatchEvent(new Event('change', { bubbles: true })); c.blur(); return true; })()`);
+  await ev(`(() => { ${REVEAL} const c = reveal(document.querySelector('#ed-inspector fieldset.ed-form input[type=color]')); c.focus(); c.value = '#ff0000'; c.dispatchEvent(new Event('input', { bubbles: true })); c.dispatchEvent(new Event('change', { bubbles: true })); c.blur(); return true; })()`);
   await settle();
   ink = await inkIn(...worldBox(crY, [960, 800], [boxW, 110]));
   check(ink.frac > 0.12 && ink.color[0] > 200 && ink.color[1] < 60 && ink.color[2] < 60, `颜色改红：文字变红（${ink.color}）`);
@@ -1572,8 +1578,14 @@ async function runCreateAndDraft(ctx) {
   let inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
   check(inkR.frac > 0.1 && inkL.frac < 0.02, `画面：2s 时文字在 x=1260（右框墨水 ${inkR.frac.toFixed(3)}，原位左半 ${inkL.frac.toFixed(3)}）`);
 
+  const inspTabs = () => ev(`(() => { const tabs = [...document.querySelectorAll('#ed-inspector .ed-insp-tab')]; return { ids: tabs.map((b) => b.dataset.tab), active: tabs.filter((b) => b.getAttribute('aria-selected') === 'true').map((b) => b.dataset.tab), shown: [...document.querySelectorAll('#ed-inspector .ed-insp-panel')].filter((p) => !p.hidden).map((p) => p.dataset.tab), animIn: document.querySelector('.ed-anim')?.closest('.ed-insp-panel')?.dataset.tab, fxIn: document.querySelector('.ed-fx')?.closest('.ed-insp-panel')?.dataset.tab }; })()`);
+  await clickSel('.ed-insp-tab[data-tab="props"]');
+  let tb = await inspTabs();
+  check(json(tb.ids) === json(["props", "anim", "fx", "logic", "info"]) && json(tb.active) === json(["props"]) && json(tb.shown) === json(["props"]) && tb.animIn === "anim", `文字层检视器分标签：属性 / 动画 / 效果 / 逻辑 / 信息，只显示当前页（${json(tb)}）`);
   await clickSel('.ed-anim-keys[data-field="origin"] button[data-frame="0"]');
   await settle();
+  tb = await inspTabs();
+  check(json(tb.active) === json(["anim"]) && json(tb.shown) === json(["anim"]), `点「动画」页里的关键帧：切到动画页（${json(tb)}）`);
   inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
   check(Math.abs((await h.numInputs())[0] - 960) < 0.5 && inkL.frac > 0.1, `点关键帧「0.00s」：跳回 0s，文字回到 x=960（墨水 ${inkL.frac.toFixed(3)}）`);
 
@@ -1600,7 +1612,7 @@ async function runCreateAndDraft(ctx) {
 
   section("AC. 关键帧补完（暂停时改动画字段画面跟手 → 时间轴拖关键帧改时刻 / 冲突拒绝 → 颜色动画）");
   await seekTo(1);
-  await ev(`(() => { const el = document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')[0]; el.focus(); el.value = '1500'; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await ev(`(() => { ${REVEAL} const el = reveal(document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')[0]); el.focus(); el.value = '1500'; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
   await settle();
   inkR = await inkIn(...worldBox(crA, [1500, 540], [abW, 110]));
   inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
@@ -1637,7 +1649,7 @@ async function runCreateAndDraft(ctx) {
   await animOn("color", true);
   await seekTo(2);
   ra = await h.readyCount();
-  await ev(`(() => { const el = document.querySelector('#ed-inspector fieldset.ed-form input[type=color]'); el.focus(); el.value = '#ff0000'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); el.blur(); return true; })()`);
+  await ev(`(() => { ${REVEAL} const el = reveal(document.querySelector('#ed-inspector fieldset.ed-form input[type=color]')); el.focus(); el.value = '#ff0000'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); el.blur(); return true; })()`);
   await h.waitRemount(ra);
   ao = await rawObj();
   check(ao.color?.animation?.c0?.length === 2 && ao.color.animation.c1.at(-1).frame === 60 && ao.color.animation.c1.at(-1).value === 0, `颜色开动画、2s 处改红：自动落第 60 帧颜色关键帧（${json(ao.color?.animation?.c1?.map((k) => [k.frame, k.value]))}）`);
@@ -1886,16 +1898,18 @@ async function runCreateAndDraft(ctx) {
     return ev(`(async () => {
       const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
       const c = new OffscreenCanvas(bmp.width, bmp.height); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0);
-      const d = g.getImageData(0, 0, bmp.width, bmp.height).data; const n = d.length / 4; let white = 0, red = 0, blue = 0, lit = 0, edges = 0;
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i], gg = d[i + 1], b = d[i + 2];
-        if (r + gg + b > 690) white++;
-        if (r > 120 && gg < 90 && b < 90) red++;
-        if (b > 120 && r < 90 && gg < 90) blue++;
-        if (r + gg + b > 90) lit++;
-        if (i % (bmp.width * 4) !== 0 && Math.abs(r + gg + b - d[i - 4] - d[i - 3] - d[i - 2]) > 300) edges++;
-      }
-      return { white: white / n, red: red / n, blue: blue / n, lit: lit / n, edges };
+    const d = g.getImageData(0, 0, bmp.width, bmp.height).data; const n = d.length / 4; let white = 0, red = 0, blue = 0, lit = 0, edges = 0, cool = 0, warm = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      if (r + gg + b > 690) white++;
+      if (r > 120 && gg < 90 && b < 90) red++;
+      if (b > 120 && r < 90 && gg < 90) blue++;
+      if (r + gg + b > 90) lit++;
+      if (b > 110 && b > r + 30 && b >= gg) cool++;
+      if (r > 110 && r > b + 30 && r > gg) warm++;
+      if (i % (bmp.width * 4) !== 0 && Math.abs(r + gg + b - d[i - 4] - d[i - 3] - d[i - 2]) > 300) edges++;
+    }
+    return { white: white / n, red: red / n, blue: blue / n, lit: lit / n, edges, cool: cool / n, warm: warm / n };
     })()`);
   };
   await gotoEditor();
@@ -1946,6 +1960,28 @@ async function runCreateAndDraft(ctx) {
   await fxBtn(0, "ed-fx-del");
   await settle();
   check(Math.abs((await fxStats(...(await gBox()))).white - base.white) < base.white * 0.1, "删掉效果：回到基线");
+
+  // 磁流体：效果作用域是图层 quad（文字层 ≈ 文字外框），24px 小字会把流体缩成
+  // 一小团、边缘光被 AA 稀释 —— 先放大字号给流体足够的屏上面积再判。
+  await setText("size", "400");
+  await settle();
+  const fxMid = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [560, 330]));
+  const flBase = await fxStats(...(await fxMid()));
+  await fxAdd("cuiliuti");
+  await settle();
+  // 编辑器页默认暂停：g_Time 不走流体就不动（shine 块同一前置），先起播再判动画。
+  if (!(await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`))) await clickSel("#tb-play");
+  const fl = await fxStats(...(await fxMid()));
+  check(fl.cool > 0.0004 && fl.warm > 0.0004, `★ 磁流体：左蓝右橙边缘光出现（冷 ${fl.cool.toFixed(4)} / 暖 ${fl.warm.toFixed(4)}）`);
+  check(fl.white < flBase.white * 0.9, `磁流体黑色本体盖住白字（白 ${fl.white.toFixed(3)} < ${flBase.white.toFixed(3)}）`);
+  const flA = await fxStats(...(await fxMid()));
+  await new Promise((r) => setTimeout(r, 800));
+  const flB = await fxStats(...(await fxMid()));
+  check(flA.edges !== flB.edges || Math.abs(flA.lit - flB.lit) > 0.0004, `磁流体在动（edges ${flA.edges}→${flB.edges} / lit ${flA.lit.toFixed(4)}→${flB.lit.toFixed(4)}）`);
+  await fxBtn(0, "ed-fx-del");
+  await settle();
+  const flEnd = await fxStats(...(await fxMid()));
+  check(Math.abs(flEnd.white - flBase.white) < flBase.white * 0.15, "删掉磁流体：回到大字基线");
 
   await gotoEditor();
   await newBlank("#000000");

@@ -1528,11 +1528,6 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // [we-scene patch 2026-09-20] 资源分辨率倍率（清晰度 → 贴图缩放）与内存台账。
       // 只有「贴在设备像素上的足迹」需要那么多像素；多出来的部分纯属常驻内存。
       const resOff = resourcesOff();
-      let currentTexName = "";
-      // 当前贴图是否「一律不缩」（帧表图集 / 本来就小）：跳过必须**绝对** ——
-      // 只把档位倍率设成 1 不够，S4 的图层足迹仍会把它压下去（1444077782 的序列帧图集
-      // 就是这么被缩掉、下方贴图出白块的）。
-      let currentTexNoScale = false;
       const resScaleBase = resourceScaleFor(rt, cfg);
       const resScaleNormal = resourceScaleForNormal(rt, cfg);
       const MIN_RES_EDGE = 32;
@@ -1609,17 +1604,20 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
        * [S4] 目标最长边 = min(档位上限, 图层足迹)。
        * `?resources=native` 时严格 no-op（返回原生，供 A/B 对照）。
        */
-      const texTargetLong = (R: number, parsedTex: any): number => {
+      // texName / noScale 必须是参数，不能是 loadTexInner 外面的共享变量。
+      // 贴图是 Promise.all 并行装的，共享槽会在 await（解码/烘焙）期间被另一张贴图
+      // 盖掉：razer_bedroom 的 3840×2160 墙被写成 hue-bulb 的足迹 325 → 上传 325×183。
+      const texTargetLong = (R: number, parsedTex: any, texName: string, noScale: boolean): number => {
         const native = texNativeLong(parsedTex);
-        if (resOff || currentTexNoScale) return native;
+        if (resOff || noScale) return native;
         const cap = targetLong(native, R);
-        const need = texFootprint.get(currentTexName) || 0;
+        const need = texFootprint.get(texName) || 0;
         return footprintTarget(cap, native, need);
       };
-      const pickMipLevel = (parsedTex: any, target: number, R: number): number => {
+      const pickMipLevel = (parsedTex: any, target: number, R: number, texName: string, noScale: boolean): number => {
         // `?resources=native` 必须是严格的 no-op（A/B 对照用）。高清档 R=1 不再是 no-op：
         // 它的 policy 上限是原生，但**图层足迹**仍可以把尺寸压下来（S4 的主要收益）。
-        if (resOff || currentTexNoScale) return 0
+        if (resOff || noScale) return 0
         const image = parsedTex?.images?.[0];
         if (!image) return 0;
         const im0 = image[0];
@@ -1641,7 +1639,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         // 真正的图层足迹。
         // 下限优先用**该贴图的图层足迹**（S4）；没有足迹信息（粒子/效果/util/未知几何）时
         // 退回全局「屏幕最长边」，至少不会小于屏幕。
-        const fp = texFootprint.get(currentTexName) || 0;
+        const fp = texFootprint.get(texName) || 0;
         const needFloor = fp > 0 ? Math.round(fp) : Math.max(64, Math.round(screenLongEdge()));
         return pickMipLevelPure(sizes, target, needFloor);
       };
@@ -2057,8 +2055,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
       };
       const loadTexInner = async (name: string): Promise<any | null> => {
-        currentTexName = name;
-        currentTexNoScale = false;
+        // 本张贴图自己的「一律不缩」。必须是局部变量：和 texTargetLong 的 texName
+        // 一样，并行装载时写到外层共享槽会被别的贴图覆盖（见 texTargetLong 注释）。
+        let noScale = false;
         if (textures.has(name)) return textures.get(name);
         // [we-scene patch] 属性槽（预设壁纸的 `customimage*` 等）：槽名是一个**用户
         // 属性名**，其现值是壁纸目录下的相对路径（`files/xxx.gif`）。先按这条通路
@@ -2398,14 +2397,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const pngNative = Math.max(Number(m.width || 0), Number(m.height || 0)) || 1;
           const pngSkip =
             !!parsedTex?.frames?.list?.length || isSmallTexture(Number(m.width || 0), Number(m.height || 0));
-          currentTexNoScale = pngSkip;
-          const pngTarget = pngSkip ? pngNative : texTargetLong(normalizedResScale(name), parsedTex) || pngNative;
+          noScale = pngSkip;
+          const pngTarget = pngSkip ? pngNative : texTargetLong(normalizedResScale(name), parsedTex, name, noScale) || pngNative;
           const pngScale = Math.min(1, pngTarget / pngNative);
           // [we-scene patch 2026-09-25] 烘焙命中路径：缓存里是**预缩放后的最终位图**
           // （已含 EXIF 方向回滚），所以命中时不再走 decodeTexImageBitmap 的解码/回滚，
-          // 只做一次 createImageBitmap。产物按**档位上限**尺寸烘（足迹只会更小），
-          // 因此命中后若与本纹理想要的尺寸不同，再做一次廉价的二次缩放 ——
-          // 这样 entry.width/height 与现状路径逐位相同，纯贴图尺寸的语义不漂。
+          // 只做一次 createImageBitmap。缓存键只有档位、没有足迹：比本次目标更大时
+          // 可以缩小；更小则不能放大（小窗先烘、或并行装载串错足迹，放大仍糊），
+          // 当未命中按原图重解并覆盖缓存。
           const bakeKey = bakeCache
             ? bakeCacheKey({
                 wallKey: source.key ?? `${cfg.mediaBase}/${cfg.src}`,
@@ -2421,23 +2420,30 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             srcBytes: ((m.png ?? m.image) as Uint8Array)?.length ?? 0,
           });
           const cachedBlob = bakeKey && bakeDecision.bake ? await bakeCache!.get(bakeKey) : null;
-          let bmp: ImageBitmap;
+          const wantW = Math.max(1, Math.round(Number(m.width || 0) * pngScale));
+          const wantH = Math.max(1, Math.round(Number(m.height || 0) * pngScale));
+          let bmp: ImageBitmap | undefined;
           if (cachedBlob) {
-            bakeStats.hits++;
             let got = await createImageBitmap(cachedBlob, { premultiplyAlpha: "none" });
-            const wantW = Math.max(1, Math.round(Number(m.width || 0) * pngScale));
-            const wantH = Math.max(1, Math.round(Number(m.height || 0) * pngScale));
-            if (got.width !== wantW || got.height !== wantH) {
-              const small = await createImageBitmap(got, {
-                resizeWidth: wantW,
-                resizeHeight: wantH,
-                resizeQuality: "high",
-              });
+            // 缓存键只含档位、不含足迹。比本次目标更小的产物放大回去仍然糊
+            // （小窗先烘，或并行装载曾经把目标串成邻层足迹）。当未命中，按原图重解。
+            if (got.width < wantW || got.height < wantH) {
               got.close?.();
-              got = small;
+            } else {
+              bakeStats.hits++;
+              if (got.width !== wantW || got.height !== wantH) {
+                const small = await createImageBitmap(got, {
+                  resizeWidth: wantW,
+                  resizeHeight: wantH,
+                  resizeQuality: "high",
+                });
+                got.close?.();
+                got = small;
+              }
+              bmp = got;
             }
-            bmp = got;
-          } else {
+          }
+          if (!bmp) {
             if (bakeKey && bakeDecision.bake) bakeStats.misses++;
             bmp = await decodeTexImageBitmap(
               blob,
@@ -2488,10 +2494,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const rawSkip =
             !!parsedTex?.frames?.list?.length ||
             isSmallTexture(Number(rawPix?.width || 0), Number(rawPix?.height || 0));
-          currentTexNoScale = rawSkip;
+          noScale = rawSkip;
           const R = rawSkip ? 1 : normalizedResScale(name);
-          const target = texTargetLong(R, parsedTex);
-          const baseLevel = pickMipLevel(parsedTex, target, R);
+          const target = texTargetLong(R, parsedTex, name, noScale);
+          const baseLevel = pickMipLevel(parsedTex, target, R, name, noScale);
           // [we-scene patch 2026-09-20] **压缩纹理直传**：DXT1/3/5、BC7、ETC1/2 在 `.tex`
           // 里就是压缩块（DXT5/BC 1B/px、DXT1 0.5B/px），过去一律解成 RGBA 上传 = 4~8 倍显存。
           // 条件：扩展可用（ETC1/2 是 WebGL2 核心）、非 LUT、未被 resOff/native 关掉。
@@ -2742,7 +2748,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           level: entry.mipLevel ?? 0,
           native: texNativeLong(parsedTex),
           need: Math.round(texFootprint.get(name) || 0),
-          target: texTargetLong(entry.resourceScale, parsedTex),
+          target: texTargetLong(entry.resourceScale, parsedTex, name, noScale),
         });
         textures.set(name, entry);
         // [临时诊断] 定位 843532366 黑屏：贴图装载的运行时状态
@@ -4220,8 +4226,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               {
                 time: o.time,
                 animLayers: layer.animationLayers,
-                // [we-scene patch 2026-09-28] 「被收拢的零件盖住 → 同步压扁」补偿规则：
-                // 按壁纸白名单生效（见 render/mdl.js 的 COLLAPSED_PART_CULL_WORKSHOPS）
+                // [we-scene patch 2026-10-07] 眼睑盖住眼球时同步压扁。不再按壁纸 ID 开关，
+                // 收口在 collapsedPartSquash（眼组网格 vs 全身网格的尺寸）。
                 syncCoveredParts: (mdl as any).shouldSyncCoveredParts?.(cfg.src) ?? false,
                 // [we-scene patch] 脚本层的骨骼平移覆写（thisLayer.setBoneTransform）。
                 // 骨骼拖拽壁纸的 puppet 动画数为 0，蒙皮完全由脚本驱动，
@@ -7283,6 +7289,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         (scene.layers as any[]).find((l) => l && !l.destroyed && String(l.id) === String(id));
       // 模型层的蒙皮网格投到画布 CSS 像素（当前时刻姿势 × 上一帧绘制矩阵），供精确拾取与轮廓。
       // null = 不是模型层 / 还没画过一帧。
+      // 选中框每帧、悬停每次指针移动都要这份几何；百万顶点的导入模型现算一次几百毫秒。
+      // 键 = 画布尺寸 + 透视 + MVP + 蒙皮矩阵内容：姿势和视图都没变（含静止模型播放中）就复用。
+      const screenMeshCache = new WeakMap<object, { mdl: unknown; key: Float64Array; val: any }>();
       const modelScreenMesh = (l: any) => {
         const m = l?.puppet;
         if (!m || !l.modelSrc || l.destroyed || typeof renderer.getModelMvp !== "function") return null;
@@ -7290,6 +7299,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (!mvp) return null;
         const ev = editorView();
         const skin = mdl.computeSkinMatrices(m, currentTime(), l.animationLayers, getBoneOverrides(l));
+        const key = new Float64Array(3 + 16 + (skin ? skin.length : 0));
+        key[0] = ev.cssW;
+        key[1] = ev.cssH;
+        key[2] = ev.perspective ? 1 : 0;
+        key.set(mvp, 3);
+        if (skin) key.set(skin, 19);
+        const hit = screenMeshCache.get(l);
+        if (hit && hit.mdl === m && hit.key.length === key.length && hit.key.every((v, i) => v === key[i])) return hit.val;
         const proj = hitTest.projectMeshesToScreen(mdl.skinnedMeshes(m, skin, ev.perspective), mvp, ev.cssW, ev.cssH);
         const o = hitTest.projectMeshesToScreen(
           [{ pos: new Float32Array(3), indices: [0, 0, 0], vertexCount: 1, indexCount: 3 }],
@@ -7298,7 +7315,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           ev.cssH,
         )[0];
         const anchor: [number, number] | null = o.ok[0] ? [o.xy[0], o.xy[1]] : null;
-        return { proj, hull: hitTest.screenMeshesHull(proj) as [number, number][] | null, anchor };
+        const val = { proj, hull: hitTest.screenMeshesHull(proj) as [number, number][] | null, anchor };
+        screenMeshCache.set(l, { mdl: m, key, val });
+        return val;
       };
       const centroidOf = (pts: [number, number][]): [number, number] => {
         let x = 0;

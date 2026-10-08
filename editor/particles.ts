@@ -8,23 +8,52 @@
 // 调参只改对象的 instanceoverride（倍率 + colorn），不碰粒子文件 —— 对外来壁纸的粒子层同样适用。
 // 字段可能被 `{ user, value }` / `{ script, value }` 包装，写入时只改 value。
 
-import { nextObjectId, rebuildTree, unwrap, type EditorDoc, type SceneObject } from "./doc";
+//
+// 插件化（PLUGIN-ARCHITECTURE §3.3）：模板进 particleTemplates 注册表（内置 4 个由 builtin-particles
+// 插件登记，同时作 fallback）；组件（emitter / initializer / operator / renderer）进
+// particleComponents 注册表，**只登记 WE 引擎认识的名字**（对照 render/particles.js 实际解析的
+// case），插件模板里出现白名单外的组件名会被拒绝 —— 不让插件造出 WE 不认的粒子文件。
 
-export type ParticlePreset = "snow" | "rain" | "embers" | "bokeh";
+import { nextObjectId, rebuildTree, unwrap, type EditorDoc, type SceneObject } from "./doc";
+import { createRegistry } from "./core/registry";
+import type { Schema } from "./core/schema";
+
+export type ParticlePreset = string;
 export const PARTICLE_PRESETS: readonly ParticlePreset[] = ["snow", "rain", "embers", "bokeh"];
 
 const f3 = (v: number) => (Math.round(v * 1000) / 1000).toFixed(3);
 const vec3 = (a: number, b: number, c: number) => `${f3(a)} ${f3(b)} ${f3(c)}`;
 
-type Op = Record<string, unknown> & { name: string };
+export type ParticleOp = Record<string, unknown> & { name: string };
+type Op = ParticleOp;
 type Template = {
-  blending: "additive" | "translucent";
+  blending: "additive" | "translucent" | "normal";
   maxcount: number;
   starttime: number;
-  emitter: (W: number, H: number) => Op;
+  /** W × H = 场景尺寸（粒子空间原点在场景中心，y 朝上） */
+  emitter: Op | ((W: number, H: number) => Op);
   initializer: Op[] | ((W: number, H: number) => Op[]);
-  operator: Op[];
+  operator: Op[] | ((W: number, H: number) => Op[]);
   renderer: Op;
+};
+
+export type ParticleTemplate = Template & {
+  id: string;
+  title?: string | Record<string, string>;
+  /** 粒子贴图：WE 内置名（particle/halo 等）或工程内路径 */
+  texture?: string;
+  /** 插件附带的贴图文件（写进工程，group = 粒子文件路径） */
+  files?: Array<{ name: string; data: Uint8Array }>;
+};
+
+export type ParticleComponentKind = "emitter" | "initializer" | "operator" | "renderer";
+
+export type ParticleComponent = {
+  /** WE 组件名（scene 粒子 JSON 的 name 字段） */
+  id: string;
+  kind: ParticleComponentKind;
+  /** 面板「添加组件」用的参数描述 */
+  params?: Schema;
 };
 
 // 粒子空间 y 朝上，原点 = 图层 origin（场景中心）
@@ -111,6 +140,91 @@ const TEMPLATES: Record<ParticlePreset, Template> = {
 
 export const PARTICLE_TEXTURE = "particle/halo";
 
+export const BUILTIN_PARTICLE_TEMPLATES: ParticleTemplate[] = PARTICLE_PRESETS.map((id) => ({ id, ...TEMPLATES[id] }));
+
+/** 引擎认识的粒子组件（render/particles.js 的解析分支）；verify-editor 用源码比对守住它 */
+const ENGINE_COMPONENTS: Record<ParticleComponentKind, readonly string[]> = {
+  emitter: ["boxrandom", "sphererandom"],
+  initializer: [
+    "lifetimerandom",
+    "sizerandom",
+    "colorrandom",
+    "alpharandom",
+    "velocityrandom",
+    "rotationrandom",
+    "angularvelocityrandom",
+    "mapsequencearoundcontrolpoint",
+    "mapsequencebetweencontrolpoints",
+  ],
+  operator: [
+    "movement",
+    "angularmovement",
+    "alphafade",
+    "alphachange",
+    "sizechange",
+    "colorchange",
+    "turbulence",
+    "oscillatealpha",
+    "oscillatesize",
+    "oscillateposition",
+    "controlpointattract",
+    "vortex",
+    "remapvalue",
+    "capvelocity",
+    "positionoffsetrandom",
+    "collisionquad",
+    "collisionplane",
+    "reducemovementnearcontrolpoint",
+    "maintaindistancebetweencontrolpoints",
+  ],
+  renderer: ["sprite", "spritetrail", "rope", "ropetrail"],
+};
+
+export const BUILTIN_PARTICLE_COMPONENTS: ParticleComponent[] = (Object.keys(ENGINE_COMPONENTS) as ParticleComponentKind[]).flatMap((kind) =>
+  ENGINE_COMPONENTS[kind].map((id) => ({ id, kind })),
+);
+
+const componentKey = (c: Pick<ParticleComponent, "id" | "kind">) => `${c.kind}:${c.id}`;
+
+/**
+ * 组件注册表：键 = kind:name。插件只能给已知组件补参数描述（覆盖同键），不能凭空加新名字 ——
+ * 新名字 WE 不认，粒子文件写出去就是坏的。
+ */
+export const particleComponents = createRegistry<ParticleComponent>("particleComponents", {
+  idOf: componentKey,
+  validate: (c) => {
+    if (!ENGINE_COMPONENTS[c.kind]?.includes(c.id)) throw new Error(`WE 引擎不认识的粒子组件：${c.kind} ${c.id}`);
+  },
+});
+particleComponents.setFallback(BUILTIN_PARTICLE_COMPONENTS);
+
+export const isKnownComponent = (kind: ParticleComponentKind, name: string) => !!particleComponents.get(componentKey({ kind, id: name }));
+
+/** 模板里不被引擎认识的组件（空 = 合法） */
+export function unknownComponents(t: Template, W = 1920, H = 1080): string[] {
+  const bad: string[] = [];
+  const at = <T>(v: T | ((W: number, H: number) => T)) => (typeof v === "function" ? (v as (W: number, H: number) => T)(W, H) : v);
+  const chk = (kind: ParticleComponentKind, ops: Op[]) => {
+    for (const o of ops) if (!isKnownComponent(kind, o?.name)) bad.push(`${kind}:${String(o?.name)}`);
+  };
+  chk("emitter", [at(t.emitter)]);
+  chk("initializer", at(t.initializer));
+  chk("operator", at(t.operator));
+  chk("renderer", [t.renderer]);
+  return bad;
+}
+
+export const particleTemplates = createRegistry<ParticleTemplate>("particleTemplates", {
+  validate: (t) => {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(t.id)) throw new Error(`粒子模板 id 只能是小写字母数字和 -：${t.id}`);
+    const bad = unknownComponents(t);
+    if (bad.length) throw new Error(`粒子模板 ${t.id} 含 WE 引擎不认识的组件：${bad.join(", ")}`);
+  },
+});
+particleTemplates.setFallback(BUILTIN_PARTICLE_TEMPLATES);
+
+export const particleTemplateById = (id: string) => particleTemplates.get(id) ?? null;
+
 export const particlePathOf = (slug: string) => `particles/editor/${slug}.json`;
 export const particleMaterialOf = (slug: string) => `materials/editor/particles/${slug}.json`;
 
@@ -122,31 +236,35 @@ export function particleSlug(preset: ParticlePreset, taken: (path: string) => bo
 
 /** 模板的粒子系统定义（W × H = 场景尺寸，决定发射区） */
 export function particleSystemDef(preset: ParticlePreset, slug: string, W: number, H: number): Record<string, unknown> {
-  const t = TEMPLATES[preset];
+  const t = particleTemplateById(preset);
+  if (!t) throw new Error(`未知粒子模板：${preset}`);
   let id = 1;
   const withId = (o: Op) => ({ id: id++, ...o });
+  const at = <T>(v: T | ((W: number, H: number) => T)) => (typeof v === "function" ? (v as (W: number, H: number) => T)(W, H) : v);
   return {
-    emitter: [withId(t.emitter(W, H))],
+    emitter: [withId(at(t.emitter))],
     flags: 0,
-    initializer: (typeof t.initializer === "function" ? t.initializer(W, H) : t.initializer).map(withId),
+    initializer: at(t.initializer).map(withId),
     material: particleMaterialOf(slug),
     maxcount: t.maxcount,
-    operator: t.operator.map(withId),
+    operator: at(t.operator).map(withId),
     renderer: [withId(t.renderer)],
     starttime: t.starttime,
   };
 }
 
 export function particleMaterialDef(preset: ParticlePreset): Record<string, unknown> {
+  const t = particleTemplateById(preset);
+  if (!t) throw new Error(`未知粒子模板：${preset}`);
   return {
     passes: [
       {
-        blending: TEMPLATES[preset].blending,
+        blending: t.blending,
         cullmode: "nocull",
         depthtest: "disabled",
         depthwrite: "disabled",
         shader: "genericparticle",
-        textures: [PARTICLE_TEXTURE],
+        textures: [t.texture ?? PARTICLE_TEXTURE],
       },
     ],
   };
@@ -166,13 +284,14 @@ export function particleLayerFiles(doc: EditorDoc, preset: ParticlePreset, slug:
   return [
     { name: particlePathOf(slug), data: enc.encode(JSON.stringify(particleSystemDef(preset, slug, W, H), null, 2)) },
     { name: particleMaterialOf(slug), data: enc.encode(JSON.stringify(particleMaterialDef(preset), null, 2)) },
+    ...(particleTemplateById(preset)?.files ?? []),
   ];
 }
 
 /** 新粒子层追加到对象数组末尾（绘制在最上），放在场景中心。返回新 id */
 export function addParticleLayer(doc: EditorDoc, preset: ParticlePreset, name: string, slug: string): number | null {
   const scene = doc.scene;
-  if (!scene || !PARTICLE_PRESETS.includes(preset)) return null;
+  if (!scene || !particleTemplateById(preset)) return null;
   if (!Array.isArray(scene.objects)) scene.objects = [];
   const objs = scene.objects as SceneObject[];
   const [W, H] = sceneSize(doc);

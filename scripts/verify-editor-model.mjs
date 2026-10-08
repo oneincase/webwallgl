@@ -1347,7 +1347,7 @@ async function runImportHeadless({ check, section, session, origin, fixtures }) 
       `${id}（${r.target === "puppet" ? "正交" : "透视"}场景）：导入层被引擎认成 ${r.form} 模型层，骨 ${JSON.stringify(r.bones)}、片段 ${JSON.stringify(r.clips)}，动画层指向首个片段`);
     check(r.pkgInfo === 2 && r.pkgDiff <= 30, `${id}：打包（png → .tex）从包重挂，片段数 ${r.pkgInfo}、同一时刻画面差 ${r.pkgDiff} px`);
     if (r.target !== "puppet") {
-      // 网格放在 scene.camera 的注视点；有相机实体 / 相机路径 / 脚本相机的场景，活相机不一定看着那里
+      // 网格按相机实体 / scene.camera 摆在视线中心；相机路径 / 脚本相机的场景，活相机不一定看着那里
       if (r.drawn > 50 && r.moving > 50) meshDrawn++;
       console.log(`  · ${id}（网格）：只留导入层画出 ${r.drawn} px、0.4s → 0.8s 变 ${r.moving} px、轮廓锚点 ${JSON.stringify(r.outline?.anchor ?? null)}`);
       continue;

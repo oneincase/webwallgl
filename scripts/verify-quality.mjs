@@ -125,8 +125,9 @@ const particlesSrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render
 const mountSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
 const mainSrc = fs.readFileSync(join(ROOT, "renderer/src/main.ts"), "utf8");
 const apiMountSrc = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
-const benchSrc = fs.readFileSync(join(ROOT, "bench/render-settings.ts"), "utf8");
-const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
+const benchSrc = fs.readFileSync(join(ROOT, "editor/ui/render-settings.ts"), "utf8");
+const editorMainSrc = fs.readFileSync(join(ROOT, "editor/main.ts"), "utf8");
+const indexSrc = fs.readFileSync(join(ROOT, "editor/index.html"), "utf8");
 
 // 2a) renderer.js：AA/MSAA/后处理门控
 {
@@ -200,8 +201,11 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   // 脱离 import 单独执行 —— 不能在这里调 normalizeQuality。
   check(/quality: o\.quality/.test(apiMountSrc), "公共 API resolveMountConfig 带 quality");
   check(/setQuality\(patch: QualityOptions\)/.test(apiMountSrc), "SceneInstance.setQuality 存在");
-  check(/p\.set\("aa", aaEl\.value\)/.test(benchSrc) && /p\.set\("pq", pqEl\.value\)/.test(benchSrc) && /p\.set\("pp", ppEl\.value\)/.test(benchSrc),
-    "测试台 buildQuery 带 aa/pq/pp");
+  check(/quality: quality\(\)/.test(benchSrc) && /antiAliasing: o\.aa\.value/.test(benchSrc) && /particles: o\.pq\.value/.test(benchSrc) && /postProcessing: o\.pp\.value/.test(benchSrc) &&
+    /\.\.\.renderSettings\.mountOptions\(\)/.test(editorMainSrc),
+    "工作台挂载带上 aa/pq/pp（MountOptions.quality）");
+  check(/setQuality\(\{ antiAliasing:/.test(benchSrc) && /setQuality\(\{ particles:/.test(benchSrc) && /setQuality\(\{ postProcessing:/.test(benchSrc),
+    "工作台改档位即时热更（setQuality，不重挂）");
   check(/createAdaptiveVideoScale/.test(mountSrc) && /adaptiveVideo/.test(mountSrc),
     "scene-mount 接了视频纹理倍率下坡（守门第二段）");
   check(/videoUploadStats\?\.\(\)/.test(mountSrc), "下坡前先确认这个场景确实在传视频");
@@ -209,8 +213,8 @@ const indexSrc = fs.readFileSync(join(ROOT, "index.html"), "utf8");
   check(/videoTexScale: o\.videoTexScale/.test(apiMountSrc), "resolveMountConfig 透传 videoTexScale");
   check(/normalizeVideoTexScale/.test(mountSrc) && /videoPinned/.test(mountSrc),
     "宿主显式倍率优先于自动下坡（videoPinned 闸门）");
-  check(/webwallgl-quality/.test(benchSrc), "测试台质量设置 localStorage 持久化");
-  check(/id="aa"/.test(indexSrc) && /id="pq"/.test(indexSrc) && /id="pp"/.test(indexSrc), "测试台渲染设置有三个档位下拉");
+  check(/webwallgl-quality/.test(benchSrc), "工作台质量设置 localStorage 持久化");
+  check(/id="aa"/.test(indexSrc) && /id="pq"/.test(indexSrc) && /id="pp"/.test(indexSrc), "工作台渲染设置有三个档位下拉");
 }
 
 // ---------- 3) 变异红测（在内存里改坏源码，确认对应断言变红）----------

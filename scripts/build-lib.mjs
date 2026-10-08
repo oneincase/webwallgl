@@ -6,7 +6,7 @@
  * 报 "config must export or return an object"），而三包共用 dist/lib 且**只允许第一包
  * 清空目录**（后两包追加，否则互删）—— 用 JS API 顺序调用最直接，也免去 shell 里
  * 串三条 vite 命令。每个配置必须 configFile:false，否则会自动加载 vite.config.ts
- * （站点构建配置）把 bench/main 全卷进来。
+ * （站点构建配置）把 editor/main 全卷进来。
  *
  * 三个 bundle 各自内联全部依赖（不共享 chunk）：根出口保持与单入口时代同构
  * （桌面 App 的 file: 依赖零风险），子路径可单独 CDN 直引；代价是 npm 包多两份

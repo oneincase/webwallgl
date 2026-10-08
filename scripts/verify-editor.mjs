@@ -85,6 +85,7 @@ const sourceAlias = {
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
+        `export { checkWeCompat } from ${json(path.join(ROOT, "renderer/src/editor/compat.ts"))};`,
         `export { encodeMdl, mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights, CLIP_MODES, resampleTrack, addMdlClip, removeMdlClip, setMdlClipMeta, setMdlClipEvents } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
         `export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from ${json(path.join(ROOT, "renderer/src/types.ts"))};`,
       ].join("\n"),
@@ -1025,7 +1026,12 @@ const uniformNotes = (frag) => {
 {
   const f = fxMod;
   check(json(f.EFFECTS.map((e) => e.id).slice(0, 7)) === json(["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse"]), "基础集 7 个：颜色叠加 / 色彩调整 / 暗角 / 模糊 / 波浪 / 滚动 / 呼吸");
-  check(json(f.EFFECTS.map((e) => e.id).slice(7)) === json(["outline", "glow", "chroma", "pixelate", "shine", "fade"]), "扩充集 6 个：描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩");
+  check(json(f.EFFECTS.map((e) => e.id).slice(7, 13)) === json(["outline", "glow", "chroma", "pixelate", "shine", "fade"]), "扩充集 6 个：描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩");
+  {
+    const cl = f.effectById("cuiliuti").frag;
+    check(!!f.effectById("cuiliuti") && /smin\(|numBlobs 120|int\(g_FxBlobs\)/.test(cl), "追加：磁流体（cuiliuti）—— smin 软融合、球数滑杆上限 120 与循环封顶一致");
+    check(/g_TexelSize\.y \/ g_TexelSize\.x/.test(cl), "磁流体按渲染目标宽高比修正 uv.x（方形层满幅、宽层流体不变形）");
+  }
   check(f.EFFECTS.filter((e) => /g_Texture0Resolution\b/.test(e.frag)).every((e) => /uniform vec4 g_Texture0Resolution;/.test(e.frag)) && ["outline", "glow", "pixelate"].every((id) => /g_Texture0Resolution\.xy/.test(f.effectById(id).frag)), "按像素取样的效果（描边 / 发光 / 像素化 / 模糊）都声明并使用源贴图尺寸");
   {
     const ol = f.effectById("outline").frag;
@@ -2433,7 +2439,7 @@ section("MA. 模型层识别 editor/model.ts + doc.modelFormOf（W12）");
 
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
   check(/opts\.after\?\.\(\);\s*void detectPuppets\(\);/.test(mainSrc) && /const found = await scanPuppets\(d, \(name\) => assets\.read\(name\)\);\s*if \(d !== doc \|\| !found\.size\) return;\s*d\.puppets = found;\s*rebuildTree\(d\);/.test(mainSrc), "页面：打开后异步扫 puppet，换了文档作废，扫完写 doc.puppets 并重建树");
-  check(/const info = editor && Number\.isFinite\(id\) \? editor\.getModelInfo\(id\) : null;/.test(mainSrc) && /if \(node\.modelForm\) inspectorEl\.appendChild\(modelGroup\(node\)\);/.test(mainSrc) && /modelInfoRows\(info\)/.test(mainSrc), "检视器「模型」分组：信息只经 getModelInfo，行由 modelInfoRows 排");
+  check(/const info = editor && Number\.isFinite\(id\) \? editor\.getModelInfo\(id\) : null;/.test(mainSrc) && /\{ id: "model", order: 700, when: \(\) => true, render: modelGroup(?:, tab: "model")? \}/.test(mainSrc) && /modelInfoRows\(info\)/.test(mainSrc), "检视器「模型」分组：信息只经 getModelInfo，行由 modelInfoRows 排");
   const pageSrc = fs.readdirSync(path.join(ROOT, "editor")).filter((f) => f.endsWith(".ts") && f !== "i18n.ts").map((f) => fs.readFileSync(path.join(ROOT, "editor", f), "utf8")).join("\n");
   check(!/\.puppet\b(?!s)/.test(pageSrc.replace(/\b(json|modelJson)\.puppet/g, "")) && !/parseMDL|mdl-parse/.test(pageSrc), "页面不读 layer.puppet、不自己解析 .mdl（只有 scanPuppets 读 model json 的 puppet 字段）");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -2567,7 +2573,7 @@ section("MC. 附着点绑定 editor/model.ts（W14）");
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
   check(/const attachOffsetOf: AttachOffsetOf = \(mid, name\) =>\s*editor\?\.getAttachmentPoints\(Number\(mid\)\)/.test(mainSrc) && /attachToModel\(d, node\.id, p\.model, p\.name, attachOffsetOf\)/.test(mainSrc) && /detachFromModel\(d, node\.id, attachOffsetOf\)/.test(mainSrc),
     "页面：绑定 / 解绑的偏移只经引擎 getAttachmentPoints（不自己算蒙皮），走 structEdit");
-  check(/const att = attachGroup\(node\);/.test(mainSrc) && /drawAttachMarkers\(\);\s*(drawBoneMarkers\(\);\s*)?\}/.test(mainSrc), "检视器「挂到模型」分组 + 视口附着点十字标记");
+  check(/\{ id: "attach", order: 1200, when: \(\) => true, render: attachGroup(?:, tab: "props")? \}/.test(mainSrc) && /drawAttachMarkers\(\);\s*(drawBoneMarkers\(\);\s*)?\}/.test(mainSrc), "检视器「挂到模型」分组 + 视口附着点十字标记");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/getAttachmentPoints\(id: number\): EditorAttachmentPoint\[\] \| null \{/.test(sm) && /mdl\.computeSkinMatrices\(m, currentTime\(\), l\.animationLayers, getBoneOverrides\(l\)\);/.test(sm) && /mdl\.attachmentEffectiveOffset\(l, name\)/.test(sm),
     "引擎：getAttachmentPoints 以当前时刻 / 动画层 / 骨骼覆盖求姿势，偏移与挂件定位同一函数");
@@ -2656,7 +2662,7 @@ section("MB. 动画层编辑 editor/model.ts（W13）");
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
   check(/if \(hot && editor && \(hotAlways \|\| cmd\.after === cmd\.before\)\)/.test(mainSrc) && /const hot = !!editor && Number\.isFinite\(id\) && !!editor\.getModelInfo\(id\) && animLayersHot\(node\.obj\);/.test(mainSrc),
     "页面：动画层提交在无包装且模型已装上时走整表热替换，否则重挂");
-  check(/if \(node\.modelForm\) inspectorEl\.appendChild\(animLayersGroup\(node\)\);/.test(mainSrc) && /editor\s*\.setAnimationLayers\(/.test(mainSrc) && /animSolo = null;\s*const gen = \+\+openGen;/.test(mainSrc) && /if \(animSolo && animSolo\.id !== selectedId\) endAnimSolo\(\);/.test(mainSrc),
+  check(/\{ id: "anim-layers", order: 800, when: \(\) => true, render: animLayersGroup(?:, tab: "anim")? \}/.test(mainSrc) && /editor\s*\.setAnimationLayers\(/.test(mainSrc) && /animSolo = null;\s*const gen = \+\+openGen;/.test(mainSrc) && /if \(animSolo && animSolo\.id !== selectedId\) endAnimSolo\(\);/.test(mainSrc),
     "检视器「动画层」分组接在模型层上；单独预览在重挂 / 换选中时结束");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/const next: any\[\] = scn\.parseAnimationLayers\(/.test(sm) && /setAnimationLayers: setAnimationLayersImpl/.test(sm) && /animationLayers: parseAnimationLayers\(o\.animationlayers\),/.test(fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8")),
@@ -2725,6 +2731,65 @@ section("MD. 蒙皮网格拾取 / 轮廓 hittest.js + mdl-skin.skinnedMeshes（W
   check(HT.screenMeshesContain([pg], 200, 340) && gh && gh.length >= 3 && Math.max(...gh.map((p) => p[1])) > 340,
     "跨近裁剪面的三角形按 GPU 裁剪后参与命中与凸包（铺到相机身后的地面近处点得中）");
   check(!HT.screenMeshesContain([pg], 200, 100), "地平线以上不命中");
+
+  // 大网格（导入的高模）：命中走屏幕网格索引、凸包先八边形剔点；判定须与逐个扫描 / 全量凸包完全相同
+  {
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+    const T = 20000;
+    const pos = new Float32Array(T * 9);
+    for (let t = 0; t < T; t++) {
+      const cx = (rnd() - 0.5) * 30, cy = (rnd() - 0.5) * 30, cz = -2 - rnd() * 40;
+      for (let k = 0; k < 3; k++) {
+        pos[t * 9 + k * 3] = cx + (rnd() - 0.5) * 3;
+        pos[t * 9 + k * 3 + 1] = cy + (rnd() - 0.5) * 3;
+        pos[t * 9 + k * 3 + 2] = t % 97 === 0 ? (k === 0 ? 3 : cz) : cz + (rnd() - 0.5) * 3;
+      }
+    }
+    const big = { pos, indices: Uint32Array.from({ length: T * 3 }, (_, i) => i), vertexCount: T * 3, indexCount: T * 3 };
+    const [pb] = HT.projectMeshesToScreen([big], persp, 400, 400);
+    const chunks = [];
+    for (let s = 0; s < T * 3; s += 9000) chunks.push({ ...pb, indices: pb.indices.subarray(s, s + 9000), indexCount: Math.min(9000, T * 3 - s) });
+    const bh = HT.screenMeshesHull([pb]);
+    let diff = 0, hits = 0;
+    for (let i = 0; i < 3000; i++) {
+      const x = rnd() * 440 - 20, y = rnd() * 440 - 20;
+      const a = HT.screenMeshesContain([pb], x, y, bh);
+      const b = HT.screenMeshesContain(chunks, x, y, bh);
+      if (a !== b) diff++;
+      if (a) hits++;
+    }
+    const naive = (() => {
+      const pts = [];
+      for (let i = 0; i < pb.ok.length; i++) if (pb.ok[i]) pts.push([pb.xy[i * 2], pb.xy[i * 2 + 1]]);
+      for (let t = 0; t < T; t++) {
+        const [i0, i1, i2] = [t * 3, t * 3 + 1, t * 3 + 2];
+        if (pb.ok[i0] && pb.ok[i1] && pb.ok[i2]) continue;
+        const d = [i0, i1, i2].map((i) => pb.clip[i * 4 + 2] + pb.clip[i * 4 + 3] >= 0);
+        if (!d.some(Boolean)) continue;
+        const C = pb.clip;
+        const vs = [i0, i1, i2];
+        for (let k = 0; k < 3; k++) {
+          const a = vs[k], b = vs[(k + 1) % 3];
+          const da = C[a * 4 + 2] + C[a * 4 + 3], db = C[b * 4 + 2] + C[b * 4 + 3];
+          if ((da >= 0) !== (db >= 0)) {
+            const s = da / (da - db);
+            const X = C[a * 4] + s * (C[b * 4] - C[a * 4]), Y = C[a * 4 + 1] + s * (C[b * 4 + 1] - C[a * 4 + 1]), W = C[a * 4 + 3] + s * (C[b * 4 + 3] - C[a * 4 + 3]);
+            if (W > 1e-9) pts.push([((X / W + 1) / 2) * 400, ((1 - Y / W) / 2) * 400]);
+          }
+        }
+      }
+      pts.sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+      const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+      const lo = [], up = [];
+      for (const p of pts) { while (lo.length >= 2 && cr(lo.at(-2), lo.at(-1), p) <= 0) lo.pop(); lo.push(p); }
+      for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up.at(-2), up.at(-1), p) <= 0) up.pop(); up.push(p); }
+      return lo.slice(0, -1).concat(up.slice(0, -1));
+    })();
+    const key = (h) => json(h.map((p) => p.map((v) => v.toFixed(6))).sort());
+    check(diff === 0 && hits > 100 && hits < 2900 && pb.ok.some((v) => !v) && key(bh) === key(naive),
+      `大网格（${T} 个三角形，含跨近裁剪面）：网格索引命中 ≡ 逐个扫描（3000 点不一致 ${diff}，命中 ${hits}）、八边形剔点后的凸包 ≡ 全量凸包（${bh.length} / ${naive.length} 点）`);
+  }
 
   const L = (id, x) => ({ id, origin: [x, 100, 0], size: [100, 100], scale: [1, 1, 1], angles: [0, 0, 0], visible: true });
   const layers = [L(1, 100), L(2, 150), L(3, 500)];
@@ -2836,7 +2901,7 @@ section("ME. 子网格贴图替换 editor/model.ts + api retargetMdlMaterial（W
     "页面：新文件分组 = 新副本路径，并继承旧副本名下文件");
   check(/if \(puppet\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[res\.path, puppet\]\]\);\s*structEdit\(/.test(mainSrc) && /if \(puppet\) n\.obj\.image = res\.path;\s*else n\.obj\.model = res\.path;/.test(mainSrc),
     "页面：改指向走结构编辑（可撤销、重挂）；puppet 副本先登记进 doc.puppets，重建树仍认得是模型层");
-  check(/const mt = node\.modelForm \? modelTexGroup\(node\) : null;/.test(mainSrc) && /function modelTexGroup\(node: LayerNode\)[\s\S]{0,200}editor\.getModelInfo\(id\)[\s\S]{0,900}modelTextureSlots\(info\)/.test(mainSrc), "检视器：模型层有「子网格贴图」分组，行来自 getModelInfo");
+  check(/\{ id: "model-tex", order: 1000, when: \(\) => true, render: modelTexGroup(?:, tab: "model")? \}/.test(mainSrc) && /function modelTexGroup\(node: LayerNode\)[\s\S]{0,200}editor\.getModelInfo\(id\)[\s\S]{0,900}modelTextureSlots\(info\)/.test(mainSrc), "检视器：模型层有「子网格贴图」分组，行来自 getModelInfo");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const keys = ["insp.modelTex", "mt.note", "mt.replace", "mt.noTexture", "mt.fail.read", "mt.fail.material", "mt.fail.mdl", "log.modelTexReplaced"];
   const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
@@ -2985,7 +3050,7 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
     "不是 puppet 的 model json / 片段不存在 / 不是 MDL：拒绝，不抛");
 
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  check(/const bn = node\.modelForm \? boneGroup\(node\) : null;/.test(mainSrc) && /function boneGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「骨骼」分组，骨骼 / 片段来自 getModelInfo");
+  check(/\{ id: "bones", order: 1100, when: \(\) => true, render: boneGroup(?:, tab: "model")? \}/.test(mainSrc) && /function boneGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「骨骼」分组，骨骼 / 片段来自 getModelInfo");
   check(/\.setBonePose\(id, pick\.bone, dirty\(\) \? boneDeltaOf\(pick\) : null\)/.test(mainSrc) && /inp\.addEventListener\("input", \(\) => \{[\s\S]{0,160}preview\(\);/.test(mainSrc),
     "输入即推引擎预览（setBonePose，文档不动）");
   check(/const r = out && mdlCopyFiles\(modelJson, out, slug\);[\s\S]{0,200}for \(const f of r\.files\) assets\.put\(f\.name, f\.data, r\.path\);\s*assets\.share\(from, r\.path\);/.test(mainSrc) &&
@@ -2993,7 +3058,7 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
     /function applyBoneEdit\([\s\S]{0,400}commitMdlEdit\([\s\S]{0,200}applyBoneDelta\(bytes, e\.animId, e\.bone, e\.frame, e\.delta, e\.radius\)/.test(mainSrc),
     "应用：commitMdlEdit 写时复制 + 继承旧副本文件 + puppet 登记 + 结构编辑改指向（可撤销、重挂）");
   check(/function drawBoneMarkers\(\)[\s\S]{0,300}editor\.getBonePoints\(/.test(mainSrc) && /drawAttachMarkers\(\);\s*drawBoneMarkers\(\);/.test(mainSrc), "视口：骨骼关节 / 父子连线来自 getBonePoints");
-  check(/if \(bn\) inspectorEl\.appendChild\(bn\);\s*else dropBonePick\(\);/.test(mainSrc) && /if \(!node\) \{\s*dropBonePick\(\);/.test(mainSrc), "离开模型层撤掉骨骼预览");
+  check(/if \(g\.id === "bones"\) bonesShown = true;\s*\}\s*if \(!bonesShown\) dropBonePick\(\);/.test(mainSrc) && /if \(!node\) \{\s*dropBonePick\(\);/.test(mainSrc), "离开模型层撤掉骨骼预览");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const keys = ["insp.bones", "bn.note", "bn.noClips", "bn.clip", "bn.bone", "bn.frame", "bn.frameNow", "bn.t", "bn.r", "bn.s", "bn.radius", "bn.radius.one", "bn.radius.n", "bn.radius.all", "bn.apply", "bn.reset", "bn.fail.read", "bn.fail.mdl", "log.boneEdited"];
   const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
@@ -3124,7 +3189,7 @@ section("MG. 动画片段增删 / 元数据 / 帧事件 api addMdlClip…（W18b
     "mdlCopyFiles：puppet 连 model json 副本（puppet 改指向），mesh 只有 .mdl；不是 puppet 的 json 拒绝");
 
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  check(/const cl = node\.modelForm \? clipsGroup\(node\) : null;/.test(mainSrc) && /function clipsGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「动画片段」分组，片段来自 getModelInfo");
+  check(/\{ id: "clips", order: 900, when: \(\) => true, render: clipsGroup(?:, tab: "anim")? \}/.test(mainSrc) && /function clipsGroup\(node: LayerNode\)[\s\S]{0,300}editor\.getModelInfo\(id\)/.test(mainSrc), "检视器：模型层有「动画片段」分组，片段来自 getModelInfo");
   check(/removeMdlClip\(b, c\.id\), \(o\) => \{\s*dropAnimLayersOfClip\(o, c\.id\);/.test(mainSrc), "删片段与删指向它的动画层是同一步结构编辑（撤销一起回来）");
   check(/addMdlClip\(b, init, "copy", c\.id\)/.test(mainSrc) && /addMdlClip\(b, init, "rest", c0\.id\)/.test(mainSrc) && /setMdlClipMeta\(b, c\.id, meta\)/.test(mainSrc) && /setMdlClipEvents\(b, c\.id, list\)/.test(mainSrc),
     "复制 = copy、新建 = 首片段静止姿势、改头 / 事件都走 commitMdlEdit");
@@ -3338,26 +3403,228 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
   check(id === 10 && o.image === "models/editor/t.json" && o.name === "Fox" && json(o.origin.split(" ").map(Number)) === json([960 - (b[0] + b[3]) / 2, 540 - (b[1] + b[4]) / 2, 0].map((v) => +v.toFixed(5))) &&
     o.animationlayers?.length === 1 && o.animationlayers[0].animation === 1 && o.animationlayers[0].name === "wave" && o.animationlayers[0].id === 11,
     "addModelLayer（puppet）：图片层 id 不撞对象 / 动画层编号、包围盒中心落画面中心、挂一条动画层指向首个片段");
+  // 网格层包围盒中心的世界坐标（层变换 = T·Ry，与渲染器 layerModelMatrix 同口径）
+  const meshCenter = (obj, bb) => {
+    const [ox, oy, oz] = obj.origin.split(" ").map(Number);
+    const yaw = Number(obj.angles.split(" ")[1]);
+    const cx = (bb[0] + bb[3]) / 2, cy = (bb[1] + bb[4]) / 2, cz = (bb[2] + bb[5]) / 2;
+    return [ox + Math.cos(yaw) * cx + Math.sin(yaw) * cz, oy + cy, oz - Math.sin(yaw) * cx + Math.cos(yaw) * cz];
+  };
+  const near3 = (a, e) => a.every((v, i) => Math.abs(v - e[i]) < 1e-3);
   const pDoc = mk.makeDoc("t", null, { general: {}, camera: { center: "1 2 3", eye: "1 2 13" }, objects: [] }, "loose");
+  const pScale = G.fitMeshScale(pDoc)(Float64Array.of(-1, -1, -1, 1, 1, 1));
   G.addModelLayer(pDoc, mr.m, "models/editor/t.mdl", "Arm");
-  check(pDoc.scene.objects[0].model === "models/editor/t.mdl" && pDoc.scene.objects[0].origin === "1.00000 2.00000 3.00000" && !("image" in pDoc.scene.objects[0]) && near(G.fitMeshScale(pDoc)(Float64Array.of(-1, -1, -1, 1, 1, 1)), 10 / 3 / Math.sqrt(3)),
-    "addModelLayer（网格）：model 指 .mdl、放在相机注视点；缺省缩放 = 相机距离 / 3 / 包围球半径");
+  check(pDoc.scene.objects[0].model === "models/editor/t.mdl" && near3(meshCenter(pDoc.scene.objects[0], mr.m.bounds), [1, 2, 3]) && pDoc.scene.objects[0].angles === "0.00000 0.00000 0.00000" && !("image" in pDoc.scene.objects[0]) &&
+    near(pScale, (0.6 * 10 * Math.tan((25 * Math.PI) / 180)) / Math.sqrt(3)),
+    "addModelLayer（网格，无相机实体）：model 指 .mdl、包围盒中心落在 scene.camera 注视点；缺省缩放 = 包围球直径占画面高 60%");
+  const camDoc = mk.makeDoc("t", null, {
+    general: { fov: 50 },
+    camera: { center: "100 0 0", eye: "100 0 10" },
+    objects: [
+      { id: 1, camera: "c", origin: "0 0 5", angles: "0 90 0", fov: { user: "f", value: 40 } },
+      { id: 2, camera: "c", origin: "50 50 50", visible: false },
+      { id: 3, model: "models/a.mdl", origin: "-10 0 5" },
+      { id: 4, model: "models/b.mdl", origin: "10 0 5" },
+    ],
+  }, "loose");
+  const cv = G.meshView(camDoc);
+  const cScale = G.fitMeshScale(camDoc)(Float64Array.of(-1, -1, -1, 1, 1, 1));
+  G.addModelLayer(camDoc, mr.m, "models/editor/t.mdl", "Arm");
+  const co = camDoc.scene.objects.at(-1);
+  check(near3(cv.eye, [0, 0, 5]) && near3(cv.fwd, [-1, 0, 0]) && cv.fov === 40 && near(cv.dist, 8) &&
+    near3(meshCenter(co, mr.m.bounds), [-8, 0, 5]) && near(Number(co.angles.split(" ")[1]), Math.PI / 2, 1e-5) &&
+    near(cScale, (0.6 * 8 * Math.tan((20 * Math.PI) / 180)) / Math.sqrt(3)),
+    "addModelLayer（网格，有相机实体）：取最后一个可见相机实体的眼 / 朝向 / fov，摆在视线前方最近模型再往前 20%，包围盒中心对准视线、正面朝相机");
   const tree = mk.buildLayerTree(orthoDoc.scene, new Map([["models/editor/t.json", "models/editor/t.mdl"]]));
   check(tree.roots.at(-1).modelForm === "puppet" && mk.buildLayerTree(pDoc.scene, new Map()).roots[0].modelForm === "mesh", "导入层在图层树里认作模型层（puppet / mesh），模型面板全部可用");
 
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  check(/files\.some\(\(f\) => isModelFile\(f\.file\)\) && doc\?\.scene\) \{\s*void importModelFiles/.test(mainSrc) && /lyAddModelEl\.onclick = \(\) => inModelEl\.click\(\);/.test(mainSrc) && /lyAddModelEl\.disabled = lyAddEl\.disabled;/.test(mainSrc),
-    "页面：图层栏「导入模型」按钮 + 拖入 .glb / .gltf（连同 .bin / 贴图）");
+  check(/files\.some\(\(f\) => isModelFile\(f\.file\)\) && doc\?\.scene\) \{\s*void importModelFiles\(files\.map\(\(f\) => f\.file\)\);/.test(mainSrc) &&
+    /presetMenu\(lyAddModelEl, modelMenuEl, \(p\) => \{\s*modelFormPick = p === "puppet" \|\| p === "mesh" \? p : null;\s*inModelEl\.click\(\);/.test(mainSrc) &&
+    /void importModelFiles\(files, modelFormPick\)/.test(mainSrc) && /const form = forceForm \?\? defaultTarget\(target\);/.test(mainSrc) && /lyAddModelEl\.disabled = lyAddEl\.disabled;/.test(mainSrc),
+    "页面：图层栏「导入模型」下拉（自动 / puppet / 3D 网格，选完再开文件框）+ 拖入模型文件（自动形态）");
   check(/for \(const x of r\.files\) assets\.put\(x\.name, x\.data, r\.path\);[\s\S]{0,200}target\.puppets = new Map[\s\S]{0,400}structEdit\([\s\S]{0,300}addModelLayer\(d, m, r\.path/.test(mainSrc),
     "导入：产物进资源表（分组 = 对象引用路径）、puppet 登记到 doc.puppets，加层是一步结构编辑（可撤销）");
-  check(/id="in-model" accept="\.glb,\.gltf,\.bin,\.png,\.jpg,\.jpeg" multiple hidden/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /id="ly-add-model"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")), "页面有导入按钮与多选文件框");
+  const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  check(/id="in-model" accept="\.glb,\.gltf,\.fbx,\.obj,\.dae,\.stl,\.ply,\.3ds,\.bin,\.mtl,\.png,\.jpg,\.jpeg,\.tga,\.bmp" multiple hidden/.test(htmlSrc) && /id="ly-add-model"[^>]*aria-haspopup="menu"/.test(htmlSrc) &&
+    json([...(htmlSrc.match(/<div id="model-menu"[\s\S]*?<\/div>/)?.[0] ?? "").matchAll(/data-preset="(\w+)" data-et="(md\.\w+)"/g)].map((m) => [m[1], m[2]])) === json([["auto", "md.auto"], ["puppet", "md.puppet"], ["mesh", "md.mesh"]]),
+    "页面有导入按钮（带下拉菜单：自动 / puppet / 3D 网格）与多选文件框（各模型格式 + .bin / .mtl / 贴图）");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
-  const glSrc = fs.readFileSync(path.join(ROOT, "editor/gltf.ts"), "utf8");
-  const warnCodes = [...new Set([...glSrc.matchAll(/warn\(\{ code: "(\w+)"/g)].map((m) => m[1]))];
+  const glSrc = ["gltf", "model-ir", "model-import", "fmt-obj", "fmt-stl", "fmt-3ds", "fmt-dae", "fmt-fbx"].map((n) => fs.readFileSync(path.join(ROOT, `editor/${n}.ts`), "utf8")).join("\n");
+  const warnCodes = [...new Set([...glSrc.matchAll(/(?:warn\(\{ code: |warnings\.push\(\{ code: |warn\()"(\w+)"/g)].map((m) => m[1]))];
   const failCodes = [...glSrc.matchAll(/new GltfError\("(\w+)"/g)].map((m) => m[1]);
-  const keys = ["ly.addModel", "gl.form.puppet", "gl.form.mesh", "log.modelImported", "gl.fail.noModel", ...new Set(failCodes.map((c) => `gl.fail.${c}`)), ...warnCodes.map((c) => `gl.warn.${c}`)];
+  const keys = ["ly.addModel", "md.auto", "md.puppet", "md.mesh", "gl.form.puppet", "gl.form.mesh", "log.modelImported", "gl.fail.noModel", ...new Set(failCodes.map((c) => `gl.fail.${c}`)), ...warnCodes.map((c) => `gl.warn.${c}`)];
   const missing = keys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
-  check(warnCodes.length >= 10 && missing.length === 0, `导入文案中英文都有，每个告警 / 失败码都有文案（${warnCodes.length} 个告警码，缺 ${json(missing)}）`);
+  check(warnCodes.length >= 20 && missing.length === 0, `导入文案中英文都有，glTF 与各格式解析器的每个告警 / 失败码都有文案（${warnCodes.length} 个告警码，缺 ${json(missing)}）`);
+}
+
+section("MI. 多格式模型导入 editor/model-import.ts（FBX / OBJ / DAE / STL / PLY / 3DS → 内存 glTF → gltfToModel）");
+{
+  const MI = await loadEditorModule("model-import");
+  const G = await loadEditorModule("gltf");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  // 夹具：scripts/fixtures/gen-models.sh（Blender 5.2 + assimp）由同一个场景导出——Z 向上 3 骨蒙皮圆柱 + 30 帧动画 + 上红下蓝贴图
+  const FX = path.join(ROOT, "scripts/fixtures/models");
+  const sideOf = (n) => {
+    const p = path.join(FX, String(n).replace(/\\/g, "/").split("/").pop());
+    return fs.existsSync(p) ? new Uint8Array(fs.readFileSync(p)) : null;
+  };
+  /** 文件 → 引擎（parseMDL + computeSkinMatrices）求值的各时刻顶点、(位置, uv) 五元组 */
+  const run = async (file, target, times) => {
+    const { gltf, warnings } = await MI.loadModelFile(file, new Uint8Array(fs.readFileSync(path.join(FX, file))), sideOf);
+    const m = G.gltfToModel(gltf, { target, slug: "t", fps: 30, scale: 1 });
+    const files = G.gltfImportFiles(m, "t");
+    const mdl = P.parseMDL(files.files.find((f) => f.name.endsWith(".mdl")).data);
+    const layer = [{ animation: m.clips[0].id, blend: 1, rate: 1, visible: true, additive: false }];
+    const at = times.map((t) => S.skinnedMeshes(mdl, S.computeSkinMatrices(mdl, t, layer), true).flatMap((x) => [...x.pos]));
+    const uv = (mdl.meshes ?? [mdl]).flatMap((x) => [...(x.uvs ?? [])]);
+    const puv = [];
+    for (let i = 0; i < at[0].length / 3; i++) puv.push(at[0][i * 3], at[0][i * 3 + 1], at[0][i * 3 + 2], uv[i * 2], uv[i * 2 + 1]);
+    const png = files.files.find((f) => /\.png$/.test(f.name))?.data ?? null;
+    return { m, at, puv, png, warnings: [...warnings, ...m.warnings].map((w) => w.code) };
+  };
+  // 顶点切分方式各格式不同，按点集比较（双向最近点最大距离）
+  const haus = (a, b) => {
+    let worst = 0;
+    for (const [x, y] of [[a, b], [b, a]]) {
+      for (let i = 0; i < x.length; i += 3) {
+        let best = Infinity;
+        for (let j = 0; j < y.length; j += 3) best = Math.min(best, Math.hypot(x[i] - y[j], x[i + 1] - y[j + 1], x[i + 2] - y[j + 2]));
+        worst = Math.max(worst, best);
+      }
+    }
+    return worst;
+  };
+  const uvErr = (a, b) => {
+    let worst = 0;
+    for (let i = 0; i < a.length; i += 5) {
+      let best = Infinity;
+      for (let j = 0; j < b.length; j += 5) {
+        if (Math.hypot(a[i] - b[j], a[i + 1] - b[j + 1], a[i + 2] - b[j + 2]) < 1e-4) best = Math.min(best, Math.hypot(a[i + 3] - b[j + 3], a[i + 4] - b[j + 4]));
+      }
+      worst = Math.max(worst, best);
+    }
+    return worst;
+  };
+  const times = [0, 0.2, 0.5, 0.8];
+  const ref = await run("rig.glb", "mesh", times);
+  check(ref.m.clips.length === 1 && ref.m.clips[0].frameCount === 30 && ref.m.bones === 4, `参考 glb：4 骨、1 个 30 帧片段（${json(ref.m.clips.map((c) => [c.name, c.frameCount]))}）`);
+  const rows = [];
+  let bad = [];
+  // [文件, 有动画, 有 UV, 有贴图]：PLY 有 UV 但格式里没有材质，STL 两者都没有
+  for (const [file, animated, hasUv, hasTex] of [["rig.fbx", true, true, true], ["rig-ascii.fbx", true, true, true], ["rig.dae", false, true, true], ["rig.obj", false, true, true], ["rig.3ds", false, true, true], ["rig.ply", false, true, false], ["rig-ascii.ply", false, true, false], ["rig.stl", false, false, false], ["rig-ascii.stl", false, false, false]]) {
+    for (const target of ["mesh", "puppet"]) {
+      const r = await run(file, target, animated ? times : [0]);
+      const pos = Math.max(...r.at.map((v, i) => haus(v, ref.at[i])));
+      const uv = hasUv ? uvErr(r.puv, ref.puv) : 0;
+      const bnd = Math.max(...[...r.m.bounds].map((v, k) => Math.abs(v - ref.m.bounds[k])));
+      const tex = hasTex ? r.png && Buffer.from(r.png).equals(Buffer.from(ref.png)) : true;
+      rows.push(`${file}/${target} ${pos.toExponential(1)}`);
+      if (!(pos < 1e-5 && uv < 1e-5 && bnd < 1e-5 && tex && r.warnings.length === 0)) bad.push({ file, target, pos, uv, bnd, tex, warn: r.warnings });
+      if (animated && target === "mesh" && !(r.m.clips.length === 1 && r.m.clips[0].frameCount === 30)) bad.push({ file, clips: r.m.clips });
+    }
+  }
+  check(bad.length === 0,
+    `★ 9 个夹具 × puppet / 网格：引擎求值顶点 vs glb 参考（FBX 二进制 / ASCII 在 t = ${times.join(" / ")} s 含动画，其余静止）点集误差 < 1e-5、(位置, uv) 配对 < 1e-5（UV 朝向）、绑定包围盒一致、贴图字节一致、无告警（${rows.length} 组；不符 ${json(bad.slice(0, 3))}）`);
+
+  // DAE：Z 向上 + 单位 + polylist 四边形 + 节点 rotate 动画（LINEAR / BEZIER）+ instance_node
+  const dae = (interp, tangents = "") => `<?xml version="1.0"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset><unit name="centimeter" meter="0.01"/><up_axis>Z_UP</up_axis></asset>
+  <library_geometries><geometry id="g"><mesh>
+    <source id="p"><float_array id="pa" count="12">0 0 0 100 0 0 100 100 0 0 100 0</float_array><technique_common><accessor source="#pa" count="4" stride="3"/></technique_common></source>
+    <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+    <polylist count="1"><input semantic="VERTEX" source="#v" offset="0"/><vcount>4</vcount><p>0 1 2 3</p></polylist>
+  </mesh></geometry></library_geometries>
+  <library_nodes><node id="lib"><translate>0 0 100</translate><instance_geometry url="#g"/></node></library_nodes>
+  <library_visual_scenes><visual_scene id="s">
+    <node id="Arm" name="Arm"><translate sid="t">100 0 0</translate><rotate sid="rz">0 0 1 0</rotate><instance_geometry url="#g"/><instance_node url="#lib"/></node>
+  </visual_scene></library_visual_scenes>
+  <library_animations><animation id="a">
+    <source id="in"><float_array id="ina" count="2">0 1</float_array><technique_common><accessor source="#ina" count="2"/></technique_common></source>
+    <source id="out"><float_array id="outa" count="2">0 90</float_array><technique_common><accessor source="#outa" count="2"/></technique_common></source>
+    <source id="ip"><Name_array id="ipa" count="2">${interp} ${interp}</Name_array><technique_common><accessor source="#ipa" count="2"/></technique_common></source>
+    ${tangents}
+    <sampler id="sm"><input semantic="INPUT" source="#in"/><input semantic="OUTPUT" source="#out"/><input semantic="INTERPOLATION" source="#ip"/>${tangents ? '<input semantic="IN_TANGENT" source="#it"/><input semantic="OUT_TANGENT" source="#ot"/>' : ""}</sampler>
+    <channel source="#sm" target="Arm/rz.ANGLE"/>
+  </animation></library_animations>
+  <scene><instance_visual_scene url="#s"/></scene>
+</COLLADA>`;
+  // 期望：Z 向上世界里 Arm = T(1,0,0)·Rz(θ)，lib 子节点再 +Z 1；转 Y 向上 (x, y, z) → (x, z, −y)
+  const want = (deg) => {
+    const c = Math.cos((deg * Math.PI) / 180), s = Math.sin((deg * Math.PI) / 180);
+    const out = [];
+    for (const dz of [0, 1]) for (const [x, y] of [[0, 0], [1, 0], [1, 1], [0, 1]]) out.push(1 + c * x - s * y, dz, -(s * x + c * y));
+    return out;
+  };
+  const daeAt = async (src, ts) => {
+    const { gltf, warnings } = await MI.loadModelFile("a.dae", enc.encode(src));
+    const m = G.gltfToModel(gltf, { target: "mesh", slug: "d", fps: 30, scale: 1 });
+    const mdl = P.parseMDL(G.gltfImportFiles(m, "d").files.find((f) => f.name.endsWith(".mdl")).data);
+    const layer = [{ animation: m.clips[0].id, blend: 1, rate: 1, visible: true, additive: false }];
+    return { m, warnings, at: ts.map((t) => S.skinnedMeshes(mdl, S.computeSkinMatrices(mdl, t, layer), true).flatMap((x) => [...x.pos])) };
+  };
+  const lin = await daeAt(dae("LINEAR"), [0, 0.5, 29 / 30]);
+  const linErr = Math.max(haus(lin.at[0], want(0)), haus(lin.at[1], want(45)), haus(lin.at[2], want(87)));
+  check(lin.m.clips[0].frameCount === 30 && linErr < 1e-4 && lin.warnings.length === 0,
+    `DAE：Z_UP + 厘米单位 + polylist 四边形扇形三角化 + instance_node + rotate.ANGLE 线性动画：t = 0 / 0.5 / 0.967 s 顶点 vs 手算误差 ${linErr.toExponential(2)}`);
+  // 贝塞尔：控制点在 1/3、2/3 处 = 线性；水平切线 = 缓入缓出（t = 0.25 时角度 = 90·(3s²−2s³)，s 由时间方程解出 = 0.25）
+  const tan = (a, b) => `<source id="it"><float_array id="ita" count="4">${a}</float_array><technique_common><accessor source="#ita" count="2" stride="2"/></technique_common></source><source id="ot"><float_array id="ota" count="4">${b}</float_array><technique_common><accessor source="#ota" count="2" stride="2"/></technique_common></source>`;
+  const bl = await daeAt(dae("BEZIER", tan("0 0 0.6666667 60", "0.3333333 30 1 90")), [0.25]);
+  const be = await daeAt(dae("BEZIER", tan("0 0 0.6666667 90", "0.3333333 0 1 90")), [0.25]);
+  const easeDeg = 90 * (3 * 0.25 ** 2 - 2 * 0.25 ** 3);
+  // 引擎在 30 fps 帧间线性插值，曲线段中点有 ~1e-3 的弦差
+  check(haus(bl.at[0], want(22.5)) < 1e-4 && haus(be.at[0], want(easeDeg)) < 3e-3 && haus(be.at[0], want(22.5)) > 0.05,
+    `DAE BEZIER：线性切线 t = 0.25 → 22.5°、水平切线缓入缓出 → ${easeDeg.toFixed(2)}°（误差 ${haus(be.at[0], want(easeDeg)).toExponential(1)}）`);
+
+  // OBJ：负下标、四边形、缺 mtl / 贴图告警而不失败
+  const obj = await MI.loadModelFile("q.obj", enc.encode("mtllib nope.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 1\nusemtl M\nf -4/1 -3/1 -2/2 -1/2\nl 1 2\n"));
+  const om = G.gltfToModel(obj.gltf, { target: "mesh", slug: "o", scale: 1 });
+  check(om.vertices === 4 && obj.warnings.map((w) => w.code).sort().join() === "lines,missingFile", `OBJ：负下标 + 四边形 → 4 顶点；缺 .mtl 只告警（${json(obj.warnings)}）`);
+
+  // puppet 多材质：拼成图集，纯色材质的 UV 落各自格中心，不再只留一个材质
+  const twoMtl = enc.encode("newmtl R\nKd 1 0 0\nnewmtl B\nKd 0 0 1\n");
+  const two = await MI.loadModelFile("two.obj", enc.encode("mtllib two.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 2 0 0\nv 3 0 0\nv 2 1 0\nusemtl R\nf 1 2 3\nusemtl B\nf 4 5 6\n"), (u) => (u === "two.mtl" ? twoMtl : null));
+  const tm = G.gltfToModel(two.gltf, { target: "puppet", slug: "two", scale: 1 });
+  const tuv = [...tm.spec.meshes[0].uvs];
+  const tex = tm.files.find((f) => f.name === "materials/editor/two.png")?.data;
+  const pngWH = tex && [Buffer.from(tex.subarray(16, 20)).readUInt32BE(), Buffer.from(tex.subarray(20, 24)).readUInt32BE()];
+  check(tm.spec.meshes.length === 1 && tm.atlas?.cols === 2 && tm.atlas.rows === 1 && tm.atlas.cells.length === 2 &&
+    json(tuv.slice(0, 6)) === json([0.25, 0.5, 0.25, 0.5, 0.25, 0.5]) && json(tuv.slice(6)) === json([0.75, 0.5, 0.75, 0.5, 0.75, 0.5]) &&
+    json(pngWH) === json([16, 8]) && !tm.warnings.length,
+    `puppet 多材质 → 2×1 图集（${json(pngWH)} px）、两个三角形 UV 各落自己格中心（${json(tuv)}）`);
+
+  // FBX 6 及更早：明确报版本
+  let ferr = null;
+  try {
+    await MI.loadModelFile("old.fbx", enc.encode("; FBX 6.1.0 project file\nFBXHeaderExtension:  {\n\tFBXVersion: 6100\n}\n"));
+  } catch (e) {
+    ferr = e;
+  }
+  check(ferr?.code === "version" && /FBX 6\.1/.test(ferr.detail), `FBX 6.x 报 version（${ferr?.code} ${ferr?.detail}）`);
+  let uerr = null;
+  try {
+    await MI.loadModelFile("x.abc", new Uint8Array(4));
+  } catch (e) {
+    uerr = e;
+  }
+  check(uerr?.code === "format" && G.isModelFile({ name: "A.FBX" }) && G.isModelFile({ name: "b.3ds" }) && !G.isModelFile({ name: "c.mtl" }) && !G.isModelFile({ name: "d.bin" }),
+    "未知扩展名报 format；主文件识别不分大小写，.mtl / .bin 算旁路文件");
+
+  // TGA / BMP 贴图 → PNG
+  const IR = await loadEditorModule("model-ir");
+  const tga = new Uint8Array(18 + 2 * 2 * 3);
+  tga.set([0, 0, 2], 0);
+  tga.set([2, 0, 2, 0, 24, 0], 12);
+  tga.set([0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0], 18);
+  const pngOut = IR.normalizeImage(tga);
+  const dv = new DataView(pngOut.buffer, pngOut.byteOffset);
+  const idat = pngOut.subarray(41, 41 + dv.getUint32(33));
+  const raw = zlib.inflateSync(Buffer.from(idat));
+  // 左下原点 → 首行是文件里的第二行（蓝），每行前一个滤波字节
+  check(pngOut[1] === 0x50 && dv.getUint32(16) === 2 && dv.getUint32(20) === 2 && json([...raw.subarray(1, 5)]) === json([0, 0, 255, 255]) && json([...raw.subarray(10, 14)]) === json([255, 0, 0, 255]),
+    "TGA（24 位、左下原点）→ PNG：尺寸对、行序翻正、BGR → RGBA");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -3369,6 +3636,9 @@ section("I. 接线");
   check(/from "\.\/gizmo"/.test(main) && /from "\.\/history"/.test(main), "页面从 gizmo.ts / history.ts 取手柄几何与记账（单测覆盖的就是页面在用的）");
   check(!/function gizmoOf|function handleAt|Math\.atan2|undoStack\s*[:=]|function findPath/.test(main), "页面里没有长回手柄 / 旋转 / 撤销栈 / 树查找的内联副本");
   check(/hitTestAt\([^)]*\)\.filter\(\(h\) => !isLocked\(h\.id\)\)/.test(main), "画面点选过滤锁定层");
+  check(/dir = await pickDirectoryWithGesture\(\);/.test(main) && !/await pickDirectory\(\);\s*\}\s*catch \(e\) \{\s*log\(et\("log\.pickFailed"/.test(main) &&
+    /name !== "SecurityError"\) throw e;[\s\S]{0,300}#pick-dir-ok"\)\.onclick = \(\) => \{[\s\S]{0,60}const p = pickDirectory\(\);/.test(main) && /id="pick-dir-dlg"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")),
+    "选文件夹没有用户手势（文件框 change / 拖放之后）被拒时，弹确认框在那次点击里同步重新调用选择器");
   check(/isLocked\(selectedId\)[^\n]*return;/.test(main), "锁定层不能拖拽");
   check(/form\.disabled = isLocked\(id\)/.test(main), "锁定层检视器只读");
   check(/docDriven && current\.assets && doc\?\.scene\s*\?\s*sourceFromDoc/.test(main), "结构编辑后改从文档挂载");
@@ -3432,9 +3702,71 @@ section("I. 接线");
   const html = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/id="tb-new"(?![^>]*disabled)/.test(html) && /id="ly-add"/.test(html) && /id="in-image" accept="image\/\*"/.test(html) && /id="ed-draft"/.test(html), "页面：新建可用，有添加图片 / 图片选择框 / 草稿横幅");
   check(/const EDITOR_MARK = "\.webwallgl-editor"/.test(HOST_TS) && /exists && !marked/.test(HOST_TS), "宿主：无标记目录拒绝覆盖");
-  check(/if \(kind === "pkg" && doc\.scene\) \{\s*const \{ files: pkgFiles, packed \} = packProject\(files\);\s*files = pkgFiles;/.test(main), "导出 scene.pkg 时清单先过 packProject，不写进项目文件夹");
-  check(/id="export-pkg"/.test(html) && /id="export-zip"/.test(html) && !/id="save-lib"/.test(html) && !/id="ed-library"/.test(html), "导出菜单是 scene.pkg / zip，没有壁纸库面板和另存到库");
+  {
+    const pipe = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
+    check(/runExportPipeline\(id, target, /.test(main) && !/packProject/.test(main) && /id: "pkg",[\s\S]{0,400}pack: \(ctx\) => \{\s*if \(!ctx\.doc\.scene\) return ctx\.files;\s*const \{ files, packed \} = packProject\(ctx\.files\);/.test(pipe), "导出 scene.pkg 走导出管线：pkg 导出器的 pack 段过 packProject，不写进项目文件夹");
+  }
+  check(/id="export-pkg"/.test(html) && /id="export-zip"/.test(html) && !/id="save-lib"/.test(html), "导出菜单是 scene.pkg / zip，没有另存到库");
+  {
+    // 播放与编辑同页：没有模式切换，预览能力都是面板标签
+    const tabsOf = (id) => {
+      const at = html.indexOf(`id="${id}"`);
+      const head = at < 0 ? "" : html.slice(at, html.indexOf("data-pane=", at));
+      return [...head.matchAll(/data-tab="(\w+)"/g)].map((m) => m[1]);
+    };
+    check(!/wb-modes|id="act-bench"|href="\.\.\/"/.test(html) && /<button type="button" class="wb-icon-btn" id="ed-help"/.test(html), "工作台没有「预览 / 编辑器」模式切换，帮助按钮在页内打开使用说明");
+    check(json(tabsOf("ed-layers")) === json(["layers", "library"]) && json(tabsOf("ed-center")) === json(["viewport", "docs"]) &&
+      json(tabsOf("ed-console")) === json(["console", "perf"]) && json(tabsOf("ed-right")) === json(["inspector", "config", "render"]),
+      `面板标签：左 图层|壁纸库，中 视口|使用说明，底 控制台|性能，右 检视器|壁纸配置|渲染（${json([tabsOf("ed-layers"), tabsOf("ed-center"), tabsOf("ed-console"), tabsOf("ed-right")])}）`);
+    check(["lib-list", "lib-filter", "type-filter", "lib-refresh", "lib-pick", "docs-body", "sponsor-card", "perf-canvas", "props-body", "props-reset", "fps", "volume", "aa", "pq", "pp"].every((id) => html.includes(`id="${id}"`)) &&
+      /href="\/editor\/preview\.css"/.test(html), "页面装上了壁纸库 / 使用说明 / 性能 / 壁纸配置 / 渲染设置的控件与样式");
+    check(/initTabs\(\$\("#ed-layers"\)/.test(main) && /initTabs\(\$\("#ed-center"\)/.test(main) && /initTabs\(\$\("#ed-console"\)/.test(main) && /initTabs\(\$\("#ed-right"\)/.test(main),
+      "四个面板都按标签切换");
+    check(/openWith\(it\.title, \(\) => openLibraryItem\(it, MEDIA_BASE, WEB_BASE\), \{ origin: \{ kind: "library" \}, library: it, play: true \}\)/.test(main) &&
+      /if \(opts\.library\) releaseProject\(\);/.test(main) && /libItem = opts\.library \?\? null;/.test(main),
+      "壁纸库条目直接在编辑器里打开并播放；先解绑上一个项目文件夹（不会把它自动保存进别的工程）");
+    check(/cmd\(\{ id: "file\.save", keys: "Mod\+S", run: \(\) => void saveDocument\(\) \}\)/.test(main) &&
+      /async function saveDocument\(\) \{\s*if \(projectDir\) return flushAutosave\(\);[\s\S]{0,300}const dir = await requireProjectDir\(\);[\s\S]{0,80}adoptProject\(dir\);/.test(main),
+      "⌘S：有项目文件夹就写回，库条目先选文件夹另存为项目");
+    check(/\.\.\.renderSettings\.mountOptions\(\),/.test(main) && /properties: libItem \? \(wallpaperConfig\.overrides\(\)/.test(main),
+      "挂载带上渲染设置（帧率 / 音量 / 画质）与库条目的属性覆盖值");
+    check(/instance\.setProperties\(values as Record<string, PropertyValue>\)/.test(main) && /reload: \(\) => void mountCurrent\(true\)/.test(main),
+      "壁纸配置：场景就地热更，网页 / 视频保存后重挂");
+    check(/const item = new URL\(location\.href\)\.searchParams\.get\("item"\);[\s\S]{0,300}await openLibrary\(it\);/.test(main) && /#docs\(\?:=\(\\w\+\)\)\?\$/.test(main),
+      "?item= 直接打开库条目，#docs=editor|library 直达使用说明");
+    const root = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+    check(/location\.replace\("\.\/editor\/" \+ location\.search \+ location\.hash\)/.test(root) && !/bench\/main\.ts/.test(root), "根入口转到工作台（带上 query / hash）");
+    const gone = ["main", "session", "bridge", "library", "viewport", "perf", "props-panel", "render-settings", "info-panel", "statusbar", "store", "console", "layout"].filter((n) => fs.existsSync(path.join(ROOT, `bench/${n}.ts`)));
+    check(gone.length === 0 && !fs.existsSync(path.join(ROOT, "bench/bench.css")), `旧预览页模块已删除（残留 ${json(gone)}）`);
+    const keys = ["sec.render", "render.hint", "lib.props", "lib.open", "lib.play", "lib.discardConfirm", "log.libUnsupported", "log.libItemMissing", "log.cannotSaveKind", "log.savedAsProject", "st.library", "st.libDirty", "st.saveAsTitle", "props.noLibraryItem"];
+    const miss = keys.filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+    check(miss.length === 0, `工作台新增文案中英文都有（缺 ${json(miss)}）`);
+  }
   check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
+  // 插件宿主（PLUGIN-ARCHITECTURE §2 / §5）：页面只按注册表渲染，内置能力也登记成插件
+  check(/void bootPlugins\(\)\.catch\(/.test(main) && /app = await bootEditor\(/.test(main) && /app\.plugin\(builtinUiPlugin\)/.test(main), "启动时起插件内核，内置检视器分组 / 命令 / 录视频导出目标经 builtin-ui 插件登记");
+  check(/for \(const g of groupsFor\(node\)\)/.test(main) && !/inspectorEl\.appendChild\(\w+Group\(node\)\)/.test(main), "检视器分组全部来自注册表（不再硬编码 appendChild）");
+  {
+    const inspTs = fs.readFileSync(path.join(ROOT, "editor/inspector.ts"), "utf8");
+    const tabOfGroup = (id) => main.match(new RegExp(`\\{ id: "${id}", order: \\d+, [^\\n]*?, tab: "([\\w-]+)" \\}`))?.[1];
+    const want = { multi: "props", edit: "props", text: "props", particle: "props", sound: "props", attach: "props", video: "props", anim: "anim", "anim-layers": "anim", clips: "anim", model: "model", "model-tex": "model", bones: "model", effects: "fx", bindings: "logic", scripts: "logic" };
+    const wrong = Object.entries(want).filter(([g, tab]) => tabOfGroup(g) !== tab).map(([g]) => g);
+    check(wrong.length === 0, `检视器按功能分标签：属性 / 动画 / 模型 / 效果 / 逻辑（归错 ${json(wrong)}）`);
+    check(/panelOf\(tabOf\(g\)\)\.appendChild\(el\)/.test(main) && /const info = panelOf\(INFO_INSPECTOR_TAB\);/.test(main) && /info\.appendChild\(rawGroup\(o\)\)/.test(main) && /mountInspectorTabs\(panels\);/.test(main), "分组按 tab 进各自面板；字段一览 + 原始 JSON 归「信息」页");
+    check(/const tabs = \[\.\.\.panels\.keys\(\)\]/.test(main) && /const active = panels\.has\(inspTab\) \? inspTab : tabs\[0\]\.id;/.test(main) && /uiPrefs\.set\("inspectorTab", t\.id\)/.test(main), "只显示有分组的标签；记住上次的标签，当前图层没有那一页时落到第一页");
+    check(/setAttribute\("role", "tablist"\)/.test(main) && /setAttribute\("role", "tab"\)/.test(main) && /setAttribute\("role", "tabpanel"\)/.test(main) && /e\.key === "ArrowRight"/.test(main), "标签条有 tablist / tab / tabpanel 语义，方向键切页");
+    check(/return g\.tab && inspectorTabs\.get\(g\.tab\) \? g\.tab : DEFAULT_INSPECTOR_TAB;/.test(inspTs) && /inspectorTabs\.setFallback\(BUILTIN_INSPECTOR_TABS\)/.test(inspTs) && /"inspector\.tabs": inspectorTabs/.test(fs.readFileSync(path.join(ROOT, "editor/plugins/builtin/index.ts"), "utf8")), "标签也是贡献点（inspector.tabs）；未登记的标签退回「属性」页");
+    const tabKeys = ["props", "anim", "model", "fx", "logic", "info"].map((t) => `insp.tab.${t}`);
+    check(tabKeys.every((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length === 2), "检视器标签文案中英文都有");
+  }
+  check(/if \(app\?\.commands\.handleKey\(e\)\) \{\s*e\.preventDefault\(\);\s*return;/.test(main), "快捷键先过命令服务（插件可登记 / 覆盖），内核未起时走内置链");
+  check(/meta: \{ plugins: usedPlugins\(\) \}/.test(main) && /onPluginError: \(who, e\) => reportPluginError\(who, e, "export"\)/.test(main), "导出把用到的外部插件写进 project.json，钩子 / 规则出错按插件上报");
+  check(/exporters\.onChange\(renderExportMenu\)/.test(main) && /particleTemplates\.onChange\(renderParticleMenu\)/.test(main) && /puppetGenerators\.onChange\(renderGeneratorMenu\)/.test(main) && /modelImporters\.onChange\(syncModelAccept\)/.test(main), "注册表变化即重绘导出菜单 / 粒子菜单 / 生成器菜单 / 模型文件框 accept");
+  check(/storeSource\(a\.storage\), \.\.\.\(hostUp \? \[dirSource\(\)\] : \[\]\)/.test(main) && /if \(hostUp\) m\.watch\(\);/.test(main), "外部插件：已安装（IndexedDB）+ dev 宿主插件目录，目录来源热重载");
+  check(/id="tb-plugins"/.test(html) && /id="plugins-dlg"/.test(html) && /id="in-plugin" webkitdirectory/.test(html), "页面：插件按钮 + 管理面板 + 安装文件夹选择框");
+  const plKeys = [...new Set([...fs.readFileSync(path.join(ROOT, "editor/ui/plugin-panel.ts"), "utf8").matchAll(/t\(\s*"((?:pl|log)\.[\w.]+)"/g)].map((m) => m[1]).concat(["pl.title", "pl.body", "pl.openDir", "pl.refresh", "pl.install", "pl.close", "pl.installConfirm", "pl.installNoPerms", "pl.installPerms", "pl.installHigh", "log.pluginError"], ["store", "dir", "memory"].map((s) => `pl.src.${s}`), ["active", "loading", "pending", "failed", "invalid", "disabled", "disposed"].map((s) => `pl.status.${s}`)))];
+  const missingPl = plKeys.filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missingPl.length === 0, `插件面板文案中英文都有（缺 ${json(missingPl)}）`);
   const saveTs = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
   check(/import \{ buildScenePkg, type ScenePkgResult \} from "\.\.\/renderer\/src\/api\/editor";/.test(saveTs) && !/writePkg|encodeTex/.test(saveTs), "页面只经库出口 buildScenePkg 打包（不直连 vendor 编码器）");
   const devPack = fs.readFileSync(path.join(ROOT, "scripts/dev-pack-pkg.mjs"), "utf8");
@@ -3443,28 +3775,28 @@ section("I. 接线");
   check(/objEdit\(et\("log\.textEdited"[^\n]*\n\s*if \(!mutate\(o\)\) return false;\s*refitTextBox\(o, measureText\);/.test(main), "文字字段编辑走结构编辑，改完按页面实测宽度回填盒子");
   check(/await Promise\.all\(fonts\.map\(ensurePageFont\)\);/.test(main) && /SYSTEM_FONT_FAMILIES\[font\.toLowerCase\(\)\]/.test(main), "量字前先把工程字体装进页面；系统字体按引擎同一张映射表量");
   check(/overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);/.test(main), "导入字体写进叠加层，分组 = 字体路径（没被引用就不进保存清单）");
-  check(/if \(node\.kind === "text"\) inspectorEl\.appendChild\(textGroup\(node\)\);/.test(main) && /content\.readOnly = scripted;/.test(main), "文字层检视器有「文字」分组；脚本生成的内容只读");
+  check(/\{ id: "text", order: 400, when: \(n\) => n\.kind === "text", render: textGroup(?:, tab: "props")? \}/.test(main) && /content\.readOnly = scripted;/.test(main), "文字层检视器有「文字」分组；脚本生成的内容只读");
   check(/id="ly-add-text"/.test(html) && /id="text-menu"/.test(html) && ["plain", "clock", "date"].every((p) => html.includes(`data-preset="${p}"`)) && /id="in-font" accept="\.ttf,\.otf/.test(html), "页面：添加文字层按钮 + 文字 / 时钟 / 日期菜单 + 字体选择框");
   const txKeys = [...main.matchAll(/et\(\s*"((?:tx|text)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addText", "text.plain", "text.clock", "text.date", "tx.align.left", "tx.align.center", "tx.align.right", "tx.align.top", "tx.align.bottom", "log.textAdded", "log.textEdited", "log.fontImported", "log.fontFailed", "insp.text"]);
   const missingTx = [...new Set(txKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingTx.length === 0, `文字层文案中英文都有（缺 ${json(missingTx)}）`);
   check(/from "\.\/particles"/.test(main) && /structEdit\(et\("log\.particleAdded", \{ name \}\), \(d\) => \{[^}]*overlay!\.put\(f\.name, f\.data, particlePathOf\(slug\)\);\s*return addParticleLayer\(d, preset, name, slug\)/.test(main), "添加粒子层取 particles.ts 模板、两件套写进叠加层（分组 = 粒子文件路径）、走结构编辑");
-  check(/if \(node\.kind === "particle"\) inspectorEl\.appendChild\(particleGroup\(node\)\);/.test(main) && /setParticleParam\(o, k as ParticleParam, Number\(inp\.value\)\)/.test(main) && /objEdit\(et\("log\.particleEdited"/.test(main), "粒子层检视器有「粒子」分组，滑条 change 时经 objEdit 写 instanceoverride（可撤销）");
+  check(/\{ id: "particle", order: 500, when: \(n\) => n\.kind === "particle", render: particleGroup(?:, tab: "props")? \}/.test(main) && /setParticleParam\(o, k as ParticleParam, Number\(inp\.value\)\)/.test(main) && /objEdit\(et\("log\.particleEdited"/.test(main), "粒子层检视器有「粒子」分组，滑条 change 时经 objEdit 写 instanceoverride（可撤销）");
   check(/id="ly-add-particle"/.test(html) && /id="particle-menu"/.test(html) && ptMod.PARTICLE_PRESETS.every((p) => html.includes(`data-preset="${p}"`)) && /lyAddParticleEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加粒子层按钮 + 雪 / 雨 / 火花 / 光点菜单，可用性跟随添加图片");
   const ptKeys = [...main.matchAll(/et\(\s*"((?:pt)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addParticle", "log.particleAdded", "log.particleEdited", "insp.particle"], ptMod.PARTICLE_PRESETS.map((p) => `pt.${p}`), ptMod.PARTICLE_PARAMS.map((p) => `pt.${p}`));
   const missingPt = [...new Set(ptKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingPt.length === 0, `粒子层文案中英文都有（缺 ${json(missingPt)}）`);
   check(/from "\.\/sound"/.test(main) && /overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);\s*return path;/.test(main) && /structEdit\(et\("log\.soundAdded"[^\n]*\n[^\n]*\n\s*for \(const it of items\) last = addSoundLayer\(d, it\.name, it\.path\)/.test(main), "添加声音层取 sound.ts、音频原字节写进叠加层（分组 = 自身路径）、走结构编辑");
   check(/files\.every\(\(f\) => isAudioFile\(f\.file\)\)\) \{\s*void addSoundFiles\(files\.map\(\(f\) => f\.file\)\)/.test(main), "拖入全是音频时加声音层");
-  check(/if \(node\.kind === "sound"\) inspectorEl\.appendChild\(soundGroup\(node\)\);/.test(main) && /objEdit\(et\("log\.soundEdited"[^\n]*setSoundField\(o, field, v\)\)/.test(main) && /replaceSoundFile\(o, path\)/.test(main), "声音层检视器有「声音」分组，模式 / 音量 / 开始静音 / 替换音频经 objEdit（可撤销）");
-  check(/const au = new Audio\(url\);/.test(main) && /stopPreview\(\);\s*overlay =/.test(main) && /volume: 0,/.test(main), "试听用页面自己的 audio 元素（引擎恒静音挂载），换文档即停");
+  check(/\{ id: "sound", order: 600, when: \(n\) => n\.kind === "sound", render: soundGroup(?:, tab: "props")? \}/.test(main) && /objEdit\(et\("log\.soundEdited"[^\n]*setSoundField\(o, field, v\)\)/.test(main) && /replaceSoundFile\(o, path\)/.test(main), "声音层检视器有「声音」分组，模式 / 音量 / 开始静音 / 替换音频经 objEdit（可撤销）");
+  check(/const au = new Audio\(url\);/.test(main) && /stopPreview\(\);\s*overlay =/.test(main) && /\.\.\.renderSettings\.mountOptions\(\),/.test(main) && /value="0" \/>\s*<span id="volume-val"/.test(html), "试听用页面自己的 audio 元素，换文档即停；引擎音量跟「渲染」面板（默认 0 静音）");
   check(/id="ly-add-sound"/.test(html) && /id="in-sound" accept="\.mp3,\.ogg,\.wav,\.flac/.test(html) && /lyAddSoundEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加声音层按钮 + 音频选择框，可用性跟随添加图片");
   const sndKeys = [...main.matchAll(/et\(\s*"((?:snd)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addSound", "log.soundAdded", "log.soundEdited", "log.soundMissing", "log.soundFailed", "insp.sound"], sndMod.PLAYBACK_MODES.map((m) => `snd.mode.${m}`));
   const missingSnd = [...new Set(sndKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingSnd.length === 0, `声音层文案中英文都有（缺 ${json(missingSnd)}）`);
   check(/from "\.\/keyframes"/.test(main) && /const split = splitAnimated\(node\.obj, patch\);[\s\S]{0,200}pendingKeys\.set\([\s\S]{0,80}writeObjProps\(node\.obj, plain\);[\s\S]{0,120}mergeLiveEdit\(liveEdits, id, plain\);/.test(main), "热改：落在动画字段上的改动不写静态值、不进重放账，记为待落关键帧");
   check(/function commit\(cmd: PropsCmd\) \{\s*const keyed = pendingKeys\.get\(String\(cmd\.id\)\);[\s\S]{0,200}keyEdit\(node, keyed\);/.test(main) && /setKey\(o, f, frameAt\(v, t\), keyed\[f\]!\)/.test(main), "提交（检视器 change / 拖拽松手）时，动画字段的改动变成当前帧的关键帧（objEdit，可撤销）");
-  check(/if \(canAnimate\(node\)\) inspectorEl\.appendChild\(animGroup\(node\)\);/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
+  check(/\{ id: "anim", order: 300, when: canAnimate, render: animGroup(?:, tab: "anim")? \}/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
   check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*(?:if \(animSolo[^\n]*\n\s*)?inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
   check(/for \(const run of animRuns\) \{\s*if \(run\.layer === l && \(p as Record<string, unknown>\)\[run\.field\] !== undefined\) run\.held = true;/.test(sm) && /else run\.ctrl\.advance\(clockDt\);\s*if \(run\.held\) continue;/.test(sm) && /animSeekPending = true;\s*for \(const run of animRuns\) run\.held = false;/.test(sm), "引擎：热改动画字段后曲线写回暂停到下一次 seek（拖拽 / 输入跟手）");
   check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(sm) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(sm), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
@@ -3477,7 +3809,7 @@ section("I. 接线");
   check(/if \(e\.shiftKey \|\| e\.metaKey \|\| e\.ctrlKey\) return toggleSelect\(n\.id\);/.test(main) && /if \(e\.shiftKey && hits\.length\) \{\s*toggleSelect\(hits\[0\]\.id\);/.test(main) && /\.some\(\(h\) => isSelected\(h\.id\)\)/.test(main), "多选：树 ⇧/⌘ 点、画面 ⇧ 点加减选；拖任一选中层都能起拖");
   check(/for \(const o of drag\.others\) \{\s*const od = editor\.screenDeltaToLocal\(Number\(o\.id\), mx, my\);/.test(main) && /commitMany\(et\("log\.multiMoved"/.test(main) && /if \(isBatch\(cmd\)\) \{\s*for \(const c of cmd\.cmds\) void applyPatch/.test(main), "多选移动：其余层按同一屏幕位移跟随，一步撤销（批量命令）");
   check(/groupLayers\(d, ids, et\("layer\.groupName"\)\)/.test(main) && /ids\.every\(\(id\) => removeLayer\(d, id\)\)/.test(main) && /alignDeltas\(items\.map\(\(i\) => i\.box\), mode\)/.test(main), "多选删除 / 复制 / 成组 / 对齐分布接线");
-  check(/let userPlaying = false;/.test(main) && /if \(!userPlaying\) inst\.pause\(\);/.test(main) && /origin = opts\.origin \?\? null;\s*userPlaying = false;/.test(main), "默认不自动播放：打开文档与重挂都停在当前帧，只有点播放才走时钟");
+  check(/let userPlaying = false;/.test(main) && /if \(!userPlaying\) inst\.pause\(\);/.test(main) && /origin = opts\.origin \?\? null;\s*userPlaying = !!opts\.play;/.test(main) && (main.match(/play: true/g) ?? []).length === 1, "默认不自动播放：打开文档与重挂都停在当前帧，只有点播放才走时钟（唯一例外：壁纸库条目即点即播）");
   check(/userPlaying = instance\.paused;\s*if \(userPlaying\) instance\.resume\(\);/.test(main) && /function pauseForStepping\(\) \{\s*userPlaying = false;/.test(main), "播放按钮记住用户意图；逐帧 / 拖时间轴会把它清掉");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -3896,7 +4228,7 @@ section("J. 变异红测");
   const ground0 = { pos: new Float32Array([-10, -1, -20, 10, -1, -20, 0, -1, 5]), indices: [0, 1, 2], vertexCount: 3, indexCount: 3 };
   const hm1 = await vendorMut(HTP, "  if (out.length < 3) return null\n  const poly = []", "  if (out.length < 3 || true) return null\n  const poly = []", "跨近裁剪面三角形的裁剪");
   check(!hm1.screenMeshesContain(hm1.projectMeshesToScreen([ground0], persp0, 400, 400), 200, 340), "整个丢掉跨面三角形时「相机身后的地面近处点得中」判据变红");
-  const hm2 = await vendorMut(HTP, "      if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) continue\n", "", "零面积三角形跳过");
+  const hm2 = await vendorMut(HTP, "  if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) return false\n", "", "零面积三角形跳过");
   const deg = { pos: new Float32Array([0, 0, 0, 50, 0, 0, 0, 50, 0, 0, 0, 0]), indices: [0, 1, 2, 3, 3, 3], vertexCount: 4, indexCount: 6 };
   check(hm2.screenMeshesContain(hm2.projectMeshesToScreen([deg], [0.01, 0, 0, 0, 0, 0.01, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], 200, 100), 120, 40),
     "不跳过零面积三角形时「退化三角形不命中」判据变红（任意点都会被它判中）");

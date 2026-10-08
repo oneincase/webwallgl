@@ -61,6 +61,8 @@ const STABLE = [
   // MDL 顶点着色器 uniform 契约：每个 uniform 每条绘制路径都要赋值（否则走 GL 默认值 (0,0)，
   // 曾把除白名单两张外的全部 puppet 塌到原点 —— 见 verify-mdl-uniforms 头注）
   "verify-mdl-uniforms",
+  // 眨眼补偿不再按壁纸 ID：眼组网格必须把眼球压到 k=0，全身/头发/躯干块必须一个都不压
+  "verify-blink",
   // 真 3D 模型之间的层间深度契约（F49）：假 GL 驱动真渲染器，断言「两次模型绘制之间不得清
   // 深度」（清了 = 后画的模型无条件盖住先画的：3477054430 城市盖住猫）、天空盒只测不写、
   // 2D puppet 不碰深度、宿主 isSkybox 接线、帧首清深度前先开写掩码
@@ -96,6 +98,13 @@ const STABLE = [
   // 的单测 + 「打开 → 编辑 → 存进库 → 重新打开」闭环 + 变异红测。
   // 真浏览器端到端不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-editor.mjs --headless`
   "verify-editor",
+  // 编辑器插件内核（editor/core）：inject 等待 / 依赖消失回 pending / 服务栈回落 / 逆序撤销 /
+  // 出错隔离与预算 / 权限白名单 / profile 诊断 / 注册表栈 + 变异红测
+  "verify-plugin-kernel",
+  // 导出管线 + WE 兼容性回读（散装 / scene.pkg 两形态零 error、坏产物逐类报错、真实库零误报）
+  "verify-we-export",
+  // 外部插件：清单 / 数据贡献原子登记 / 代码插件权限门控 / 来源优先与热重载 / 插件目录端点 / 示例插件 + 变异红测
+  "verify-plugins",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */

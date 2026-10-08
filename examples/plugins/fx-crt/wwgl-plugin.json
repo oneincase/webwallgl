@@ -1,0 +1,14 @@
+{
+  "id": "fx-crt",
+  "name": { "zh-CN": "CRT 显像管效果", "en": "CRT monitor effect" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "纯数据插件示例：一个效果描述 + 一个 shader 片段。屏幕弯曲、扫描线、暗角，参数面板由参数表自动生成。",
+    "en": "Data-only example: one effect descriptor plus one shader snippet. Screen curvature, scanlines and vignette; the inspector is generated from the parameter table."
+  },
+  "contributes": {
+    "effects": ["effects/crt.json"],
+    "shaders": ["glsl/crt.glsl"]
+  }
+}

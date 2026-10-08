@@ -506,6 +506,19 @@ export function attachmentBind(mdl, name) {
 }
 
 /**
+ * MDAT 附着点相对所属骨骼的 z 旋转（弧度）。
+ * 不要用 attachmentBind 的世界角代替：那一份还卷进了骨骼绑定姿势的朝向。
+ */
+function attachmentLocalZ(mdl, name) {
+  if (!mdl || !mdl.attachments || typeof name !== 'string') return 0
+  for (const at of mdl.attachments) {
+    if (at.name !== name || !at.matrix) continue
+    return Math.atan2(at.matrix[1], at.matrix[0])
+  }
+  return 0
+}
+
+/**
  * 网格 UV 是否与层矩形坐标 1:1（MDLV0019 puppet-warp：顶点画在贴图图集布局上）。
  * 无动画时绑定姿势 = 图集散开，MDAT 附着点也是图集坐标，不能当世界偏移。
  */
@@ -645,6 +658,22 @@ export function applyAttachmentBindOrigins(layers) {
     for (const c of desc) {
       c.origin[0] += d[0]
       c.origin[1] += d[1]
+    }
+    // [we-scene patch 3810943704] MDAT 附着点相对骨骼还有 z 旋转（弧度，与
+    // scene.json angles 同口径）。此前只取了矩阵平移，眼睛图层角（+12.6°/
+    // +19.3°）没有被附着点角（−16.0°/−19.5°）抵消，贴图里已经画斜的眼睛
+    // 又被拧过去。全库扫描：MDAT 局部 |z| > 1° 的附着点只有这张壁纸。
+    // 加的是附着点**局部**矩阵的 z，不是骨骼绑定世界角——3441873795 的鱼骨
+    // 绑定世界角 −165°，但 MDAT 局部角是 0，气泡不该跟着翻。
+    // 图集散开位与上面的平移一样压成 0（那份旋转也是散开姿势的一部分）。
+    const az = attachmentAtlasBind(parent) ? 0 : attachmentLocalZ(parent.puppet, name)
+    if (Math.abs(az) > 1e-5 && Array.isArray(layer.angles)) {
+      layer.angles[2] += az
+      for (const c of desc) {
+        if (Array.isArray(c.angles)) c.angles[2] += az
+      }
+      // 只标在挂件层自己身上：recompose 时子孙通过父链继承，再标会加两次。
+      layer.attachBindAngle = az
     }
     // 挂件整棵子树的视差深度必须与附着目标（puppet 层）一致：挂件的一切屏幕
     // 行为跟着骨骼走，视差深度也属于骨骼所在的层。parse 的视差继承只覆盖

@@ -19,7 +19,7 @@ import { LIB, ROOT, imp, createChecker, dec } from "./lib/verify-kit.mjs";
 
 const { check, fail, errors } = createChecker({ echo: true });
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
-const { parseScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
+const { parseScene, recomposeWorld } = await imp("renderer/vendor/we-scene/scene/parse.js");
 const {
   parseMDL,
   attachmentBind,
@@ -713,6 +713,55 @@ function neckOf(parent, attName) {
     } else {
       console.log("   （跳过带动画模型的反向断言：库内找不到）");
     }
+  }
+}
+
+// ---------- 3810943704 眼睛：MDAT 附着点局部 z 旋转必须进 world angles ----------
+// 贴图里的眼睛已经是斜的。图层角 +12.6°/+19.3° 是写来抵消附着点 −16°/−19.5° 的，
+// 只加平移会让眼睛再被拧过去。判据是壁纸源数据，不是把 apply 的公式再算一遍：
+// 可见眼的 world z 必须离开 local z 超过 0.2rad，并且等于 local + MDAT 局部 z。
+// recompose 再跑两遍必须停在同一个角（attachBindAngle 漏加会回到纯 local）。
+{
+  const wp = loadWallpaper(3810943704);
+  if (!wp) {
+    skipMissing("3810943704");
+  } else {
+    attachPuppets(wp.scene, wp.parsed);
+    const byId = new Map(wp.scene.layers.map((l) => [l.id, l]));
+    const eyes = wp.scene.layers.filter((l) => l.visible && (l.name === "eyejade2" || l.name === "eyejade3") && l.attachment);
+    check(eyes.length === 2, `可见眼睛应是 eyejade2 + eyejade3 两层（实得 ${eyes.length}）`);
+    const localZ = new Map(eyes.map((l) => [l.id, l.localAngles[2]]));
+    applyAttachmentBindOrigins(wp.scene.layers);
+    for (const eye of eyes) {
+      const parent = byId.get(eye.parentId);
+      const at = parent && parent.puppet && parent.puppet.attachments &&
+        parent.puppet.attachments.find((a) => a.name === eye.attachment);
+      check(!!at, `${eye.name}#${eye.id} 找不到附着点 ${eye.attachment}`);
+      if (!at) continue;
+      const az = Math.atan2(at.matrix[1], at.matrix[0]);
+      const expect = localZ.get(eye.id) + az;
+      check(Math.abs(az) > 0.2, `${eye.name} 附着点局部 z 应明显非零（${az.toFixed(4)} rad）`);
+      check(Math.abs(eye.angles[2] - localZ.get(eye.id)) > 0.2,
+        `${eye.name} 的 world z 必须离开 local（现 ${eye.angles[2].toFixed(4)}，local ${localZ.get(eye.id).toFixed(4)}）——忘加附着点旋转时这条红`);
+      check(Math.abs(eye.angles[2] - expect) < 1e-4,
+        `${eye.name}#${eye.id} world z ${eye.angles[2].toFixed(5)} 应等于 local+MDAT ${expect.toFixed(5)}`);
+    }
+    const butterfly = wp.scene.layers.find((l) => l.attachment === "butterfly" && l.visible);
+    if (butterfly) {
+      const bz = butterfly.angles[2];
+      check(Math.abs(bz - butterfly.localAngles[2]) < 1e-4,
+        `butterfly 附着点 z≈0，world 角不该被改（Δ ${(bz - butterfly.localAngles[2]).toFixed(5)}）`);
+    }
+    recomposeWorld(wp.scene.layers, new Set(eyes.map((l) => l.id)));
+    recomposeWorld(wp.scene.layers, new Set(eyes.map((l) => l.id)));
+    for (const eye of eyes) {
+      const parent = byId.get(eye.parentId);
+      const at = parent.puppet.attachments.find((a) => a.name === eye.attachment);
+      const expect = localZ.get(eye.id) + Math.atan2(at.matrix[1], at.matrix[0]);
+      check(Math.abs(eye.angles[2] - expect) < 1e-4,
+        `recompose 两遍后 ${eye.name} 的 z 被冲掉了（${eye.angles[2].toFixed(5)}，期望 ${expect.toFixed(5)}）`);
+    }
+    console.log("   3810943704 眼睛角度：附着点局部 z 已进入 world，recompose 不冲掉");
   }
 }
 

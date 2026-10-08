@@ -8,6 +8,7 @@ export * from "./index";
 export { editorOf } from "../editor/controls";
 export { checkSceneScript } from "../editor/scripts";
 export { buildScenePkg } from "../editor/pkg-export";
+export { checkWeCompat } from "../editor/compat";
 export {
   encodeMdl,
   mdlMeshMaterials,
@@ -26,6 +27,8 @@ export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 export type {
   ScenePkgFile,
   ScenePkgResult,
+  WeCompatIssue,
+  WeCompatReport,
   EditorControls,
   EditorScriptIssue,
   EditorUserPropertyDecl,

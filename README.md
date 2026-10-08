@@ -47,7 +47,7 @@ pnpm add webwallgl   # 或 npm i webwallgl
 
 **使用说明**
 
-完整文档在预览里：运行 `pnpm install && pnpm dev`，打开 <http://localhost:1430/>，进入「使用说明」标签页，可以在「播放库」（库 API、预览）和「编辑器」两份说明之间切换。编辑器地址是 <http://localhost:1430/editor/>。
+完整文档在工作台里：运行 `pnpm install && pnpm dev`，打开 <http://localhost:1430/>（会转到 <http://localhost:1430/editor/>），点标题栏的「?」或中栏的「使用说明」标签，可以在「播放库」（库 API、壁纸播放）和「编辑器」两份说明之间切换。播放与编辑在同一个页面：左栏「壁纸库」点条目即播放，并可直接编辑。
 
 **版权与合规**
 
@@ -98,7 +98,7 @@ Or skip the bundler and use a CDN:
 
 **Documentation**
 
-The full guide lives in the bench: run `pnpm install && pnpm dev`, open <http://localhost:1430/> and go to the "User guide" tab, where you can switch between the "Player library" guide (library API and the bench) and the "Editor" guide. The editor itself is at <http://localhost:1430/editor/>.
+The full guide lives in the workbench: run `pnpm install && pnpm dev`, open <http://localhost:1430/> (it redirects to <http://localhost:1430/editor/>), then click "?" in the title bar or the "User guide" tab in the center panel to switch between the "Player library" guide (library API and playback) and the "Editor" guide. Playing and editing share one page: click an item in the Library tab to play it and edit it right away.
 
 **License and compliance**
 

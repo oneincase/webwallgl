@@ -361,11 +361,17 @@ function clippedTriangle(me, i0, i1, i2) {
   return poly
 }
 
-/** 投影网格的凸包（Andrew 单调链，屏幕 y 向下）。只收被三角形引用的顶点（跨近裁剪面的取裁剪后的点）。 */
+/**
+ * 投影网格的凸包（Andrew 单调链，屏幕 y 向下）。只收被三角形引用的顶点（跨近裁剪面的取裁剪后的点）。
+ * 百万级顶点（导入的高模）先按八方向极值围成的凸八边形剔掉严格在内的点（Akl–Toussaint，结果不变），
+ * 只给幸存点建数组再排序 —— 否则每个顶点一个小数组 + 全量排序要上百毫秒，选中框每帧都调它。
+ */
 export function screenMeshesHull(proj) {
-  const pts = []
+  const extra = []
+  const used = []
+  let total = 0
   for (const me of proj) {
-    const used = new Uint8Array(me.ok.length)
+    const u = new Uint8Array(me.ok.length)
     const idx = me.indices
     for (let k = 0; k + 2 < me.indexCount; k += 3) {
       const i0 = idx[k]
@@ -374,15 +380,75 @@ export function screenMeshesHull(proj) {
       const all = me.ok[i0] && me.ok[i1] && me.ok[i2]
       if (!all && (me.ok[i0] || me.ok[i1] || me.ok[i2] || crossesNear(me, i0, i1, i2))) {
         const poly = clippedTriangle(me, i0, i1, i2)
-        if (poly) for (const q of poly) pts.push(q)
+        if (poly) for (const q of poly) extra.push(q)
         continue
       }
       if (!all) continue
-      for (const i of [i0, i1, i2]) {
-        if (!used[i]) { used[i] = 1; pts.push([me.xy[i * 2], me.xy[i * 2 + 1]]) }
+      u[i0] = 1
+      u[i1] = 1
+      u[i2] = 1
+    }
+    used.push(u)
+    for (let i = 0; i < u.length; i++) total += u[i]
+  }
+  const pts = []
+  if (total > 4096) {
+    // 八方向极值：x、y、x+y、x−y 各取最小 / 最大的那个点；它们的凸包当筛子
+    const lo = new Float64Array(4).fill(Infinity)
+    const hi = new Float64Array(4).fill(-Infinity)
+    const loP = new Float64Array(8)
+    const hiP = new Float64Array(8)
+    const visit = (x, y) => {
+      for (let d = 0; d < 4; d++) {
+        const v = d === 0 ? x : d === 1 ? y : d === 2 ? x + y : x - y
+        if (v < lo[d]) { lo[d] = v; loP[d * 2] = x; loP[d * 2 + 1] = y }
+        if (v > hi[d]) { hi[d] = v; hiP[d * 2] = x; hiP[d * 2 + 1] = y }
       }
     }
+    proj.forEach((me, j) => {
+      const u = used[j]
+      for (let i = 0; i < u.length; i++) if (u[i]) visit(me.xy[i * 2], me.xy[i * 2 + 1])
+    })
+    for (const q of extra) visit(q[0], q[1])
+    const oct = monotoneHull([0, 1, 2, 3].flatMap((d) => [[loP[d * 2], loP[d * 2 + 1]], [hiP[d * 2], hiP[d * 2 + 1]]]))
+    const inside = oct.length >= 3 ? (x, y) => strictlyInsideConvex(oct, x, y) : () => false
+    proj.forEach((me, j) => {
+      const u = used[j]
+      for (let i = 0; i < u.length; i++) {
+        if (!u[i]) continue
+        const x = me.xy[i * 2]
+        const y = me.xy[i * 2 + 1]
+        if (!inside(x, y)) pts.push([x, y])
+      }
+    })
+    for (const q of extra) if (!inside(q[0], q[1])) pts.push(q)
+    for (const q of oct) pts.push(q)
+  } else {
+    proj.forEach((me, j) => {
+      const u = used[j]
+      for (let i = 0; i < u.length; i++) if (u[i]) pts.push([me.xy[i * 2], me.xy[i * 2 + 1]])
+    })
+    for (const q of extra) pts.push(q)
   }
+  return monotoneHull(pts)
+}
+
+/** 严格在凸多边形（逆时针或顺时针皆可）内部，边上不算 */
+function strictlyInsideConvex(poly, x, y) {
+  let sign = 0
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i]
+    const b = poly[(i + 1) % poly.length]
+    const c = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+    if (c === 0) return false
+    const s = c > 0 ? 1 : -1
+    if (sign === 0) sign = s
+    else if (s !== sign) return false
+  }
+  return true
+}
+
+function monotoneHull(pts) {
   if (pts.length < 3) return pts.length ? pts : null
   pts.sort((a, b) => a[0] - b[0] || a[1] - b[1])
   const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
@@ -443,33 +509,110 @@ export function screenMeshesContain(proj, x, y, hull) {
   const h = hull === undefined ? screenMeshesHull(proj) : hull
   if (!h || h.length < 3 || !pointInConvex(h, x, y)) return false
   for (const me of proj) {
-    const xy = me.xy
-    const ok = me.ok
-    const idx = me.indices
-    for (let k = 0; k + 2 < me.indexCount; k += 3) {
-      const i0 = idx[k]
-      const i1 = idx[k + 1]
-      const i2 = idx[k + 2]
-      if (!ok[i0] || !ok[i1] || !ok[i2]) {
-        if (!(ok[i0] || ok[i1] || ok[i2] || crossesNear(me, i0, i1, i2))) continue
-        const poly = clippedTriangle(me, i0, i1, i2)
-        if (poly && polyArea2(poly) !== 0 && pointInConvex(poly, x, y)) return true
-        continue
+    if (me.indexCount > GRID_MIN_INDICES) {
+      const g = me._grid || (me._grid = buildTriGrid(me))
+      if (x >= g.x0 && y >= g.y0 && x <= g.x0 + g.cw * GRID_N && y <= g.y0 + g.ch * GRID_N) {
+        const cx = Math.min(GRID_N - 1, Math.floor((x - g.x0) / g.cw))
+        const cy = Math.min(GRID_N - 1, Math.floor((y - g.y0) / g.ch))
+        const c = cy * GRID_N + cx
+        for (let j = g.start[c]; j < g.start[c + 1]; j++) if (triangleContains(me, g.tris[j] * 3, x, y)) return true
       }
-      const ax = xy[i0 * 2]
-      const ay = xy[i0 * 2 + 1]
-      const bx = xy[i1 * 2]
-      const by = xy[i1 * 2 + 1]
-      const cx = xy[i2 * 2]
-      const cy = xy[i2 * 2 + 1]
-      if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) continue
-      const d1 = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
-      const d2 = (cx - bx) * (y - by) - (cy - by) * (x - bx)
-      const d3 = (ax - cx) * (y - cy) - (ay - cy) * (x - cx)
-      const neg = d1 < 0 || d2 < 0 || d3 < 0
-      const pos = d1 > 0 || d2 > 0 || d3 > 0
-      if (!(neg && pos)) return true
+      for (let j = 0; j < g.partial.length; j++) if (triangleContains(me, g.partial[j] * 3, x, y)) return true
+      continue
     }
+    for (let k = 0; k + 2 < me.indexCount; k += 3) if (triangleContains(me, k, x, y)) return true
   }
   return false
+}
+
+const GRID_MIN_INDICES = 30000
+const GRID_N = 64
+
+function triangleContains(me, k, x, y) {
+  const xy = me.xy
+  const ok = me.ok
+  const idx = me.indices
+  const i0 = idx[k]
+  const i1 = idx[k + 1]
+  const i2 = idx[k + 2]
+  if (!ok[i0] || !ok[i1] || !ok[i2]) {
+    if (!(ok[i0] || ok[i1] || ok[i2] || crossesNear(me, i0, i1, i2))) return false
+    const poly = clippedTriangle(me, i0, i1, i2)
+    return !!(poly && polyArea2(poly) !== 0 && pointInConvex(poly, x, y))
+  }
+  const ax = xy[i0 * 2]
+  const ay = xy[i0 * 2 + 1]
+  const bx = xy[i1 * 2]
+  const by = xy[i1 * 2 + 1]
+  const cx = xy[i2 * 2]
+  const cy = xy[i2 * 2 + 1]
+  if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) === 0) return false
+  const d1 = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+  const d2 = (cx - bx) * (y - by) - (cy - by) * (x - bx)
+  const d3 = (ax - cx) * (y - cy) - (ay - cy) * (x - cx)
+  const neg = d1 < 0 || d2 < 0 || d3 < 0
+  const pos = d1 > 0 || d2 > 0 || d3 > 0
+  return !(neg && pos)
+}
+
+/**
+ * 大网格的命中加速：完全在近裁剪面内的三角形按屏幕包围盒登记进 GRID_N² 格（CSR 存储），
+ * 跨面 / 部分可见的进 partial 线性表。查询只测所在格 + partial，判定与逐个扫描相同。
+ */
+function buildTriGrid(me) {
+  const xy = me.xy
+  const ok = me.ok
+  const idx = me.indices
+  const triCount = Math.floor(me.indexCount / 3)
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (let i = 0; i < ok.length; i++) {
+    if (!ok[i]) continue
+    const x = xy[i * 2]
+    const y = xy[i * 2 + 1]
+    if (x < x0) x0 = x
+    if (x > x1) x1 = x
+    if (y < y0) y0 = y
+    if (y > y1) y1 = y
+  }
+  const partial = []
+  if (!(x1 >= x0 && y1 >= y0)) {
+    for (let t = 0; t < triCount; t++) partial.push(t)
+    return { x0: 0, y0: 0, cw: 0, ch: 0, start: new Uint32Array(GRID_N * GRID_N + 1), tris: new Uint32Array(0), partial }
+  }
+  const cw = Math.max((x1 - x0) / GRID_N, 1e-9)
+  const ch = Math.max((y1 - y0) / GRID_N, 1e-9)
+  const cell = (v, v0, s) => Math.min(GRID_N - 1, Math.max(0, Math.floor((v - v0) / s)))
+  const range = new Int32Array(triCount * 4)
+  const count = new Uint32Array(GRID_N * GRID_N + 1)
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idx[t * 3]
+    const i1 = idx[t * 3 + 1]
+    const i2 = idx[t * 3 + 2]
+    if (!ok[i0] || !ok[i1] || !ok[i2]) {
+      range[t * 4] = -1
+      if (ok[i0] || ok[i1] || ok[i2] || crossesNear(me, i0, i1, i2)) partial.push(t)
+      continue
+    }
+    const ax = xy[i0 * 2], ay = xy[i0 * 2 + 1], bx = xy[i1 * 2], by = xy[i1 * 2 + 1], qx = xy[i2 * 2], qy = xy[i2 * 2 + 1]
+    const cx0 = cell(Math.min(ax, bx, qx), x0, cw)
+    const cx1 = cell(Math.max(ax, bx, qx), x0, cw)
+    const cy0 = cell(Math.min(ay, by, qy), y0, ch)
+    const cy1 = cell(Math.max(ay, by, qy), y0, ch)
+    range[t * 4] = cx0
+    range[t * 4 + 1] = cx1
+    range[t * 4 + 2] = cy0
+    range[t * 4 + 3] = cy1
+    for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) count[cy * GRID_N + cx + 1]++
+  }
+  for (let c = 0; c < GRID_N * GRID_N; c++) count[c + 1] += count[c]
+  const start = count
+  const fill = start.slice(0, GRID_N * GRID_N)
+  const tris = new Uint32Array(start[GRID_N * GRID_N])
+  for (let t = 0; t < triCount; t++) {
+    if (range[t * 4] < 0) continue
+    for (let cy = range[t * 4 + 2]; cy <= range[t * 4 + 3]; cy++) {
+      for (let cx = range[t * 4]; cx <= range[t * 4 + 1]; cx++) tris[fill[cy * GRID_N + cx]++] = t
+    }
+  }
+  return { x0, y0, cw, ch, start, tris, partial }
 }

@@ -21,6 +21,8 @@
  *   POST /api/editor/save-begin?item=      编辑器另存：新建（或清空编辑器自建的）库内松散工程目录
  *   POST /api/editor/save-file?item=&path= 编辑器另存：写入一个文件（body 为原始字节）
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
+ *   GET /api/plugins                       编辑器外部插件目录清单（host/plugin-dirs.ts）
+ *   GET /api/plugins/file?dir=&path=       读插件目录里的一个文件
  *   GET /api/props?item=                   壁纸自定义属性定义（含本地化文案与当前值）
  *   POST /api/props?item=                  保存属性覆盖值（body 为 name→wire 值）
  *   POST /api/props-file?item=&name=       上传 file/scenetexture 所选文件，拷入壁纸 we-props/
@@ -42,6 +44,7 @@ import { extname, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { Connect, Plugin, ViteDevServer } from "vite";
 import { describe, overrideProps, readOverrides, writeOverrides } from "./we-props";
+import { listPluginDirs, readPluginFile } from "./plugin-dirs";
 import { injectWebShim, isHtmlPath } from "./we-web-html.mjs";
 import {
   SCENE_PKG_PATHS,
@@ -744,6 +747,24 @@ export function wallpaperHost(): Plugin {
           res.end(
             "audio capture unavailable in test bench (no ScreenCaptureKit); liveSystem uses media-bridge via /api/system/stream",
           );
+          return;
+        }
+
+        // --- 编辑器外部插件目录（只读；热重载靠页面轮询版本戳）---
+        if (path === "/api/plugins") {
+          sendJson(res, 200, await listPluginDirs());
+          return;
+        }
+        if (path === "/api/plugins/file") {
+          const data = await readPluginFile(url.searchParams.get("dir") ?? "", url.searchParams.get("path") ?? "");
+          if (!data) {
+            sendJson(res, 404, { error: "插件文件不存在" });
+            return;
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/octet-stream");
+          res.setHeader("Cache-Control", "no-store");
+          res.end(data);
           return;
         }
 

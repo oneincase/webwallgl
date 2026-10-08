@@ -1,0 +1,12 @@
+{
+  "id": "import-ply-pointcloud",
+  "name": { "zh-CN": "PLY 点云导入", "en": "PLY point cloud import" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "代码插件示例：给 .ply 再登记一个导入器，用内容嗅探只接「没有面的 PLY」（点云），每个点展开成一个小方片；有面的 PLY 仍走内置导入器。",
+    "en": "Code plugin example: registers a second .ply importer that sniffs for face-less PLY (point clouds) and expands each point into a small quad; PLY files with faces still use the built-in importer."
+  },
+  "main": "index.js",
+  "permissions": ["importers"]
+}

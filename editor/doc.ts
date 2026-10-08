@@ -2,6 +2,7 @@
 // P2 起热改（W2-lite）同时写回这里，保存链路（P3）只序列化文档。
 
 import type { EditorLayerProps } from "../renderer/src/api/editor";
+import { matchLayerKind } from "./layer-kinds";
 
 export type SceneObject = Record<string, unknown>;
 
@@ -14,7 +15,9 @@ export type LayerKind =
   | "light"
   | "camera"
   | "group"
-  | "other";
+  | "other"
+  // 插件登记的图层类型（layer-kinds.ts）
+  | (string & {});
 
 export type LayerNode = {
   /** scene.json 里的 id；缺失时用数组下标兜底（与 scene/parse.js 同口径） */
@@ -64,6 +67,8 @@ function parseVisible(v: unknown): boolean {
 }
 
 export function kindOf(o: SceneObject): LayerKind {
+  const ext = matchLayerKind(o);
+  if (ext) return ext;
   if (typeof o.particle === "string") return "particle";
   if (o.text !== undefined && o.text !== null) return "text";
   if (typeof o.model === "string") return "model";

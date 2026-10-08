@@ -191,27 +191,14 @@ void main() {
   if (u_fogOn > 0.5) fragColor = applySceneFog(fragColor);
 }`
 
-// [we-scene patch 2026-09-28] 这条补偿规则**按壁纸白名单生效**：全库扫描（324 张 /
-// 158 个带部件表的 puppet）显示它会命中 13 张，其中 3226487183 会在 8/24 帧里隐藏
-// 9 个脸部零件（与作者素材无关的误伤）。先只对**已与作者素材逐帧核对过**的
-// 3629379075 生效；后续每核对一张往这里加一个 id。与 math.js 的
-// MIRAGE_PARALLAX_WALLPAPERS 同一套做法（场景装配时把 workshopId 传进来）。
-// [维护者拍板 2026-09-28] **保持白名单**：试过把门控换成纯形状/行为命中
-//（深压 rmin<0.8 + 命中件高度≥最高件 60% + 命中数≤3），真眼组能全部通过，
-// 但仍有 6 处误伤（3461168300/3479521040「人物」、3521337568「Lucy」、3629379075「嘴巴」…），
-// 再收口需要「被盖件面积占比 + 覆盖件宽高比」两条且要重跑全库——性价比不高，就停在白名单。
-// 新增一张的流程：① 作者素材（preview.gif / 工坊图）确认闭眼无眼球
-// ② 离线跑 collapsedPartSquash 看命中件是不是「眼球」③ 实机合成帧眼区虹膜像素应降到个位数。
-export const COLLAPSED_PART_CULL_WORKSHOPS = Object.freeze([
-  '3629379075', // 若叶睦 眨眼：与作者 preview.gif / 工坊宣传图逐帧核对过
-  '3655429099', // 同一类型（双眼同步闭）：用户核对；两只眼的眼睑压缩幅度不同，靠阈值统一
-])
-
-/** 该壁纸是否启用「被收拢的零件盖住 → 同步压扁」这条补偿规则（见 collapsedPartSquash） */
-export function shouldSyncCoveredParts(workshopId) {
-  // 名单门控（外层，维护者拍板）＋下面 collapsedPartSquash 内部的形状判据（内层）。
-  const id = workshopId == null ? '' : String(workshopId)
-  return id !== '' && COLLAPSED_PART_CULL_WORKSHOPS.includes(id)
+// [we-scene patch 2026-10-07] 不再按壁纸 ID 开门。2026-09-28 的白名单只有两张，
+// 新眼组闭眼时眼球仍露在外面。全库 201 个带部件的 puppet 按「每根骨骼缩放幅度最低的一帧」
+// 重采样后，分水岭是网格静止长边：眼组图层最大 767（13眼组），全身/头发最小 1017（花火）。
+// 900 落在这道空隙里。全身网格只留下静止长边 ≤110 且同帧不超过 3 个的命中
+// （Lucy 62、蕾塞 79 是眼球；151px 的躯干块和花火脸上那一串都进不来）。
+/** 是否跑「被收拢的零件盖住 → 同步压扁」。收口在 collapsedPartSquash 里，不看壁纸 ID。 */
+export function shouldSyncCoveredParts(_workshopId) {
+  return true
 }
 
 
@@ -249,8 +236,31 @@ function hasDeepPartCollapse(mdl, animLayers) {
         const a = mdl.animations.find((x) => x.id === L.animation)
         return a ? a.duration : 0
       }))
-      for (let si = 0; si < 16 && !mdl._deepCollapse; si++) {
-        computeSkinMatrices(mdl, (maxDur * si) / 16, layers)
+      // 均匀 16 点会漏掉短眨眼：3808922316 的闭眼只有第 82–88 帧（0.2 秒），
+      // 10 秒片段上 16 个点全部落在窗外，深压被记成 false，之后整段动画都不再补偿。
+      // 每根骨骼再补它自己 |sx|/|sy| 最低的那一帧（眼睑经常压的是本地 X）。
+      const times = new Set()
+      for (let si = 0; si < 16; si++) times.add((maxDur * si) / 16)
+      for (const L of layers) {
+        const a = mdl.animations.find((x) => x.id === L.animation)
+        if (!a || !a.tracks) continue
+        const fps = a.fps > 0 ? a.fps : 30
+        for (const tr of a.tracks) {
+          const kf = tr.keyframes
+          if (!kf) continue
+          const n = tr.frameCount || kf.length / 9
+          let best = 1
+          let bestF = 0
+          for (let f = 0; f < n; f++) {
+            const mag = Math.min(Math.abs(kf[f * 9 + 7]), Math.abs(kf[f * 9 + 8]))
+            if (mag < best) { best = mag; bestF = f }
+          }
+          if (best < 0.85) times.add(bestF / fps)
+        }
+      }
+      for (const t of times) {
+        if (mdl._deepCollapse) break
+        computeSkinMatrices(mdl, t, layers)
         const skin = mdl._skin
         for (const part of parts) {
           const restH = part.y1 - part.y0
@@ -292,6 +302,26 @@ const PART_RIGID_RATIO = 0.9
 const PART_ENCLOSE_Y = 0.9
 const PART_ENCLOSE_X = 0.6
 const PART_AREA_CAP = 6
+// 见文件上方 2026-10-07 注释。改这两个数之前先跑 verify-blink：
+// 眼组必须收到 k=0，花火/头发/躯干块必须一个零件都不压。
+const PART_SQUASH_MESH = 900
+const PART_SQUASH_BODY = 110
+
+function meshSpan(mdl) {
+  if (mdl._meshSpan) return mdl._meshSpan
+  let x0 = Infinity
+  let x1 = -Infinity
+  let y0 = Infinity
+  let y1 = -Infinity
+  for (const p of mdl.parts) {
+    if (p.x0 < x0) x0 = p.x0
+    if (p.x1 > x1) x1 = p.x1
+    if (p.y0 < y0) y0 = p.y0
+    if (p.y1 > y1) y1 = p.y1
+  }
+  mdl._meshSpan = { long: Math.max(x1 - x0, y1 - y0) }
+  return mdl._meshSpan
+}
 
 /**
  * [we-scene patch 2026-09-28] 「被收拢的零件盖住」的零件，本帧竖直压扁多少（对齐 mdl.parts，
@@ -320,7 +350,8 @@ const PART_AREA_CAP = 6
  *   4. k < 0.25 直接**不画**（用户实测：完全闭眼时压扁的残留仍会露出来，要求压到一定程度就隐藏；
  *      回弹时 k 升过 0.25 又会自动出现，同一条判据双向适用）。
  * 恒等帧（静止、纯位移/旋转）在骨头缩放预筛处直接返回，零额外成本。
- * **按壁纸白名单生效**，见 COLLAPSED_PART_CULL_WORKSHOPS。
+ * 不按壁纸 ID 开关：眼组网格（静止长边 ≤ PART_SQUASH_MESH）全部刚性命中都跟着压；
+ * 更大的网格只压静止长边 ≤ PART_SQUASH_BODY 且同帧不超过 3 个的命中。
 
  */
 export function collapsedPartSquash(mdl, skin, animLayers) {
@@ -424,14 +455,26 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
     }
     if (k < 1) hits.push({ r, k, px, py })
   }
-  // 配对表（CASEBOOK）给出的两条收敛条件：只保留「高度 ≥ 最高命中件 60%」的件，
-  // 且**同网格命中的刚性件不超过 3 个**。前者剔掉睫毛/高光这类小件（3629379075 里
-  // h31/h37 会被丢掉、只剩两颗眼球 h107/h104），后者挡掉 Lucy(37)/人物(8)/头(20)
-  // 这类「躯干零件自己也会深压」的模型——它们光是命中数就远超 3。
+  // 高度 ≥ 最高命中件 60%：剔掉睫毛/高光这类小件（3629379075 里 h31/h37 丢掉，
+  // 只剩两颗眼球 h107/h104）。「同帧不超过 3 个」只用于全身网格，眼组不能用它收口。
   if (!hits.length) return null
-  const tallest = Math.max(...hits.map((h) => parts[h.r].y1 - parts[h.r].y0))
-  const kept = hits.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
-  if (kept.length > 3) return null
+  const span = meshSpan(mdl)
+  // 先按网格尺度收口，再做「高度 ≥ 最高命中 60%」。
+  // 顺序不能反：全身网格上若先拿最高的躯干件当 100%，79px 的眼球会被 60% 滤掉。
+  let pool = hits
+  if (span.long > PART_SQUASH_MESH) {
+    pool = hits.filter((h) => {
+      const p = parts[h.r]
+      return Math.max(p.x1 - p.x0, p.y1 - p.y0) <= PART_SQUASH_BODY
+    })
+  }
+  if (!pool.length) return null
+  const tallest = Math.max(...pool.map((h) => parts[h.r].y1 - parts[h.r].y0))
+  const kept = pool.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
+  if (!kept.length) return null
+  // 个数看滤完高度之后的：Lucy 一帧能配上四五件，60% 之后剩 3 颗眼球。
+  // 花火滤完仍是 4~11 件、头发 11 件以上，整帧放弃，不要挑最高的三件（那不是眼球）。
+  if (span.long > PART_SQUASH_MESH && kept.length > 3) return null
   const out = new Float32Array(parts.length * 3)
   for (let i = 0; i < parts.length; i++) out[i * 3] = 1
   for (const h of kept) {
@@ -868,7 +911,9 @@ export function createMDLRenderer(gl) {
         const idxType = mesh.indexType === 'u32' ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
         const parts = gi === 0 ? mdl.parts : null
         const squash = parts && opts.syncCoveredParts ? collapsedPartSquash(mdl, skin, opts.animLayers) : null
-        if (squash || (parts && opts.syncCoveredParts)) {
+        // 只有这一帧真要压扁才拆成按零件画。squash 为 null 时整网格一次画完，
+        // 和改门控之前的非白名单路径一样——不能因为「允许检测」就每帧拆 draw。
+        if (squash) {
           const bytes = idxType === gl.UNSIGNED_INT ? 4 : 2
           for (let i = 0; i < parts.length; i++) {
             const k = squash ? squash[i * 3] : 1

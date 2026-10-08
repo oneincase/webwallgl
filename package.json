@@ -16,6 +16,7 @@
   "description": "WebWallGL —— 浏览器端 WE 场景壁纸渲染库（npm / CDN）与独立预览",
   "scripts": {
     "dev": "vite",
+    "desktop": "node scripts/desktop.mjs",
     "build": "tsc --noEmit && vite build",
     "build:lib": "node scripts/build-lib.mjs && tsc -p tsconfig.lib-types.json && node scripts/assemble-lib.mjs",
     "gen:icons": "node scripts/gen-icons.mjs",
@@ -52,6 +53,10 @@
     "verify:editor:model": "node scripts/verify-editor-model.mjs",
     "verify:cover-fallback": "node scripts/verify-cover-fallback.mjs",
     "verify:mdl-write": "node scripts/verify-mdl-write.mjs",
+    "verify:plugin-kernel": "node scripts/verify-plugin-kernel.mjs",
+    "verify:we-export": "node scripts/verify-we-export.mjs",
+    "verify:plugins": "node scripts/verify-plugins.mjs",
+    "build:plugin-sdk": "node scripts/build-plugin-sdk.mjs",
     "verify:mdl-write:gpu": "node scripts/verify-mdl-write.mjs --headless",
     "verify": "node scripts/verify-all.mjs",
     "verify:all": "node scripts/verify-all.mjs --all",
@@ -62,6 +67,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
+    "electron": "^44.5.1",
     "esbuild": "^0.28.2",
     "typescript": "^5.8.2",
     "vite": "^6.4.3"

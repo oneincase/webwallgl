@@ -26,12 +26,16 @@ import type {
   SceneScriptCheck,
   ScenePkgFile,
   ScenePkgResult,
+  WeCompatIssue,
+  WeCompatReport,
 } from "./types";
 
 export * from "./webwallgl";
 export type {
   ScenePkgFile,
   ScenePkgResult,
+  WeCompatIssue,
+  WeCompatReport,
   EditorScriptIssue,
   EditorUserPropertyDecl,
   SceneScriptCheck,
@@ -71,6 +75,13 @@ export declare function checkSceneScript(script: string): SceneScriptCheck;
  * project.json / 封面应留在包外，由调用方剔除。
  */
 export declare function buildScenePkg(files: readonly ScenePkgFile[]): ScenePkgResult;
+
+/**
+ * WE 兼容性回读：用引擎自己的解析器（parsePkg / parseScene / resolveEffectChain）把导出产物
+ * 再读一遍，逐项检查 project.json、入口场景、各对象引用的文件、效果链与 shader 的 uniform 注释。
+ * files 可以是散装清单，也可以含 scene.pkg（包内条目一并可查）。
+ */
+export declare function checkWeCompat(files: readonly ScenePkgFile[]): Promise<WeCompatReport>;
 
 /** 从零编码 MDLV0023（W19 glTF 导入）；spec 不合法时抛错（消息说明哪一项） */
 export declare function encodeMdl(spec: MdlSpec): Uint8Array;

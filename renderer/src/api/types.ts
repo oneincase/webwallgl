@@ -1008,6 +1008,30 @@ export type SceneScriptCheck = {
 /** buildScenePkg 的输入条目：包内相对路径 + 字节 */
 export type ScenePkgFile = { path: string; data: Uint8Array };
 
+/** checkWeCompat 的一条诊断：error = WE 加载会坏；warn = 能加载但依赖 WE 内置 / 有隐患；info = 说明 */
+export type WeCompatIssue = {
+  level: "error" | "warn" | "info";
+  /** 稳定的规则码（missing-file / bad-json / effect-chain / …），判据与界面按它分组 */
+  code: string;
+  message: string;
+  /** 涉及的工程内路径 */
+  path?: string;
+};
+
+/** checkWeCompat 产物 */
+export type WeCompatReport = {
+  ok: boolean;
+  /** pkg = 有 scene.pkg（读包内条目）；loose = 散装 */
+  form: "pkg" | "loose";
+  type: string;
+  entry: string | null;
+  issues: WeCompatIssue[];
+  /** 场景解析出的图层数（parseScene 回读成功时） */
+  layers: number;
+  /** 效果链解析过的效果条目数 */
+  effects: number;
+};
+
 /** buildScenePkg 产物 */
 export type ScenePkgResult = {
   /** PKGV0012 容器字节 */

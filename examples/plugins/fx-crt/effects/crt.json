@@ -1,0 +1,13 @@
+{
+  "id": "crt",
+  "title": { "zh-CN": "CRT 显像管", "en": "CRT monitor" },
+  "category": "stylize",
+  "params": [
+    { "key": "curvature", "type": "float", "default": 0.12, "min": 0, "max": 0.5, "step": 0.01, "label": { "zh-CN": "弯曲", "en": "Curvature" } },
+    { "key": "scanlines", "type": "float", "default": 0.35, "min": 0, "max": 1, "step": 0.01, "label": { "zh-CN": "扫描线强度", "en": "Scanlines" } },
+    { "key": "lines", "type": "float", "default": 480, "min": 120, "max": 1080, "step": 1, "label": { "zh-CN": "扫描线数", "en": "Line count" } },
+    { "key": "vignette", "type": "float", "default": 0.4, "min": 0, "max": 1, "step": 0.01, "label": { "zh-CN": "暗角", "en": "Vignette" } }
+  ],
+  "declarations": "#include \"wwgl/fx-crt/crt\"\n",
+  "body": "effects/crt.body.glsl"
+}

@@ -239,7 +239,7 @@ export function composeTRSQ(t: V3, q: Quat, s: V3): M4 {
 }
 
 /** 无剪切的仿射矩阵拆回 T / R(四元数) / S；行列式为负时把翻转记在 x 缩放上 */
-function decompose(m: ArrayLike<number>): { t: V3; r: Quat; s: V3 } {
+export function decompose(m: ArrayLike<number>): { t: V3; r: Quat; s: V3 } {
   let sx = Math.hypot(m[0], m[1], m[2]);
   const sy = Math.hypot(m[4], m[5], m[6]);
   const sz = Math.hypot(m[8], m[9], m[10]);
@@ -411,6 +411,18 @@ export type GltfModel = {
   bones: number;
   vertices: number;
   warnings: GltfWarning[];
+  /** puppet 多材质：各材质拼成 cols×rows 的图集（files 里先放纯色版，bakePuppetAtlas 再画进真贴图） */
+  atlas?: PuppetAtlas;
+};
+
+export type PuppetAtlas = {
+  cols: number;
+  rows: number;
+  /** 贴图格四边留白（归一化到格宽），UV 缩进这么多，防采样渗到邻格 */
+  pad: number;
+  cells: Array<{ factor: number[]; tex: { bytes: Uint8Array; ext: "png" | "jpg" } | null }>;
+  /** 图集在 files 里的文件名 */
+  file: string;
 };
 
 type Prim = {
@@ -777,30 +789,63 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
   const files: GltfModel["files"] = [];
   const meshes: MdlSpec["meshes"] = [];
   const toF32 = (a: Float64Array | null, k = 1) => (a ? Float32Array.from(a, (v) => v * k) : undefined);
+  let atlas: PuppetAtlas | undefined;
   if (opts.target === "puppet") {
     const material = `materials/editor/${opts.slug}.json`;
     const looks = prims.map((p) => materialLook(g, p.material, warn));
-    const look = looks.find((l) => l.tex) ?? looks[0];
-    if (new Set(looks.map((l) => l.src ?? JSON.stringify(l.factor))).size > 1) warn({ code: "puppetMaterials" });
+    const lookKey = (l: (typeof looks)[number]) => (l.tex ? `t${l.src}|${JSON.stringify(l.factor)}` : `c${JSON.stringify(l.factor)}`);
+    const cellOf = new Map<string, number>();
+    const cellLooks: typeof looks = [];
+    for (const l of looks) {
+      const k = lookKey(l);
+      if (!cellOf.has(k)) cellOf.set(k, cellLooks.push(l) - 1);
+    }
+    if (cellLooks.length > 1) {
+      const cols = Math.ceil(Math.sqrt(cellLooks.length));
+      atlas = {
+        cols,
+        rows: Math.ceil(cellLooks.length / cols),
+        pad: 1 / 128,
+        cells: cellLooks.map((l) => ({ factor: l.factor, tex: l.tex })),
+        file: `materials/editor/${opts.slug}.png`,
+      };
+    }
+    const look = cellLooks[0];
     let total = 0;
     for (const p of prims) total += p.positions.length / 3;
     const positions = new Float32Array(total * 3);
     const uvs = new Float32Array(total * 2);
     const boneIdx = new Uint32Array(total * 4);
     const weights = new Float32Array(total * 4);
-    const idx: number[] = [];
+    let idxTotal = 0;
+    for (const p of prims) idxTotal += p.indices.length;
+    const indices = new Uint32Array(idxTotal);
     let base = 0;
-    for (const p of prims) {
+    let io = 0;
+    prims.forEach((p, pi) => {
       const n = p.positions.length / 3;
       for (let i = 0; i < n * 3; i++) positions[base * 3 + i] = p.positions[i] * scale;
-      if (p.uvs) uvs.set(p.uvs, base * 2);
+      if (atlas) {
+        const c = cellOf.get(lookKey(looks[pi]))!;
+        const col = c % atlas.cols;
+        const row = Math.floor(c / atlas.cols);
+        const textured = !!atlas.cells[c].tex;
+        const span = 1 - 2 * atlas.pad;
+        const wrap = (v: number) => (v >= 0 && v <= 1 ? v : v - Math.floor(v));
+        for (let i = 0; i < n; i++) {
+          const u = textured && p.uvs ? atlas.pad + wrap(p.uvs[i * 2]) * span : 0.5;
+          const v = textured && p.uvs ? atlas.pad + wrap(p.uvs[i * 2 + 1]) * span : 0.5;
+          uvs[(base + i) * 2] = (col + u) / atlas.cols;
+          uvs[(base + i) * 2 + 1] = (row + v) / atlas.rows;
+        }
+      } else if (p.uvs) uvs.set(p.uvs, base * 2);
       boneIdx.set(p.boneIdx, base * 4);
       weights.set(p.weights, base * 4);
-      for (const x of p.indices) idx.push(x + base);
+      for (let k = 0; k < p.indices.length; k++) indices[io++] = p.indices[k] + base;
       base += n;
-    }
-    meshes.push({ material, positions, uvs, boneIdx, weights, indices: Uint32Array.from(idx) });
-    const tex = look.tex ?? { bytes: solidPng(look.factor), ext: "png" as const };
+    });
+    meshes.push({ material, positions, uvs, boneIdx, weights, indices });
+    const tex = atlas ? { bytes: atlasPng(atlas, 8), ext: "png" as const } : (look.tex ?? { bytes: solidPng(look.factor), ext: "png" as const });
     files.push(
       {
         name: material,
@@ -863,7 +908,73 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
     bones: bones.length,
     vertices: meshes.reduce((s, m) => s + m.positions.length / 3, 0),
     warnings,
+    atlas,
   };
+}
+
+/** 纯色版图集：每格 cell×cell 像素填该材质底色（贴图格也先填底色，bakePuppetAtlas 再画进真贴图） */
+export function atlasPng(a: PuppetAtlas, cell: number): Uint8Array {
+  const W = a.cols * cell;
+  const H = a.rows * cell;
+  const px = new Uint8Array(W * H * 4);
+  a.cells.forEach((c, i) => {
+    const f = c.factor;
+    const rgba = [toSrgb8(f[0] ?? 1), toSrgb8(f[1] ?? 1), toSrgb8(f[2] ?? 1), Math.round(255 * Math.min(1, Math.max(0, f[3] ?? 1)))];
+    const x0 = (i % a.cols) * cell;
+    const y0 = Math.floor(i / a.cols) * cell;
+    for (let y = 0; y < cell; y++) for (let x = 0; x < cell; x++) px.set(rgba, ((y0 + y) * W + x0 + x) * 4);
+  });
+  return encodePng(W, H, px);
+}
+
+/**
+ * 浏览器里把真贴图画进 puppet 图集（替换 files 里的纯色版）。贴图格整格先拉伸铺一遍
+ * （留白区 = 边缘延伸，防渗色），再按 pad 缩进画正图；底色系数不是白色时乘上去。
+ * 没有图集 / 不是浏览器环境时原样返回。
+ */
+export async function bakePuppetAtlas(m: GltfModel, maxSize = 4096): Promise<void> {
+  const a = m.atlas;
+  if (!a || typeof OffscreenCanvas === "undefined" || typeof createImageBitmap === "undefined" || !a.cells.some((c) => c.tex)) return;
+  const bitmaps = await Promise.all(
+    a.cells.map((c) => (c.tex ? createImageBitmap(new Blob([c.tex.bytes as BlobPart], { type: c.tex.ext === "png" ? "image/png" : "image/jpeg" })).catch(() => null) : null)),
+  );
+  const biggest = Math.max(64, ...bitmaps.map((b) => (b ? Math.max(b.width, b.height) : 0)));
+  const cell = Math.max(8, Math.min(biggest, Math.floor(maxSize / Math.max(a.cols, a.rows))));
+  const cv = new OffscreenCanvas(a.cols * cell, a.rows * cell);
+  const g = cv.getContext("2d");
+  if (!g) return;
+  const css = (f: number[]) => `rgba(${toSrgb8(f[0] ?? 1)},${toSrgb8(f[1] ?? 1)},${toSrgb8(f[2] ?? 1)},${Math.min(1, Math.max(0, f[3] ?? 1))})`;
+  a.cells.forEach((c, i) => {
+    const x = (i % a.cols) * cell;
+    const y = Math.floor(i / a.cols) * cell;
+    const bm = bitmaps[i];
+    if (!bm) {
+      g.fillStyle = css(c.factor);
+      g.fillRect(x, y, cell, cell);
+      return;
+    }
+    let src: CanvasImageSource = bm;
+    if (c.factor.slice(0, 3).some((v) => v !== 1)) {
+      const t = new OffscreenCanvas(bm.width, bm.height);
+      const tg = t.getContext("2d")!;
+      tg.drawImage(bm, 0, 0);
+      tg.globalCompositeOperation = "multiply";
+      tg.fillStyle = css([c.factor[0], c.factor[1], c.factor[2], 1]);
+      tg.fillRect(0, 0, bm.width, bm.height);
+      tg.globalCompositeOperation = "destination-in";
+      tg.drawImage(bm, 0, 0);
+      src = t;
+    }
+    const p = a.pad * cell;
+    g.drawImage(src, x, y, cell, cell);
+    g.clearRect(x + p, y + p, cell - 2 * p, cell - 2 * p);
+    g.drawImage(src, x + p, y + p, cell - 2 * p, cell - 2 * p);
+  });
+  for (const b of bitmaps) b?.close();
+  const blob = await cv.convertToBlob({ type: "image/png" });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const f = m.files.find((x) => x.name === a.file);
+  if (f) f.data = bytes;
 }
 
 const jsonBytes = (v: unknown) => enc.encode(JSON.stringify(v, null, 2));
@@ -894,18 +1005,36 @@ const toSrgb8 = (v: number) => {
 /** baseColorFactor（线性）→ 4×4 RGBA png（sRGB） */
 export function solidPng(factor: ArrayLike<number>, size = 4): Uint8Array {
   const rgba = [toSrgb8(factor[0] ?? 1), toSrgb8(factor[1] ?? 1), toSrgb8(factor[2] ?? 1), Math.round(255 * Math.min(1, Math.max(0, factor[3] ?? 1)))];
-  const raw = new Uint8Array(size * (1 + size * 4));
-  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) raw.set(rgba, y * (1 + size * 4) + 1 + x * 4);
+  const px = new Uint8Array(size * size * 4);
+  for (let i = 0; i < size * size; i++) px.set(rgba, i * 4);
+  return encodePng(size, size, px);
+}
+
+/** RGBA8 像素（行优先、自上而下）→ png（无压缩 deflate 块，每块 ≤ 65535 字节） */
+export function encodePng(width: number, height: number, rgba: Uint8Array): Uint8Array {
+  const row = 1 + width * 4;
+  const raw = new Uint8Array(height * row);
+  for (let y = 0; y < height; y++) raw.set(rgba.subarray(y * width * 4, (y + 1) * width * 4), y * row + 1);
   let a = 1;
   let b = 0;
-  for (const v of raw) {
-    a = (a + v) % 65521;
-    b = (b + a) % 65521;
+  for (let i = 0; i < raw.length; i++) {
+    a += raw[i];
+    if (a >= 65521) a -= 65521;
+    b += a;
+    if (b >= 65521) b -= 65521;
   }
-  const z = new Uint8Array(2 + 5 + raw.length + 4);
-  z.set([0x78, 0x01, 1, raw.length & 0xff, raw.length >> 8, ~raw.length & 0xff, (~raw.length >> 8) & 0xff]);
-  z.set(raw, 7);
-  new DataView(z.buffer).setUint32(7 + raw.length, ((b << 16) | a) >>> 0);
+  const blocks = Math.max(1, Math.ceil(raw.length / 65535));
+  const z = new Uint8Array(2 + blocks * 5 + raw.length + 4);
+  z.set([0x78, 0x01]);
+  let o = 2;
+  for (let k = 0; k < blocks; k++) {
+    const part = raw.subarray(k * 65535, Math.min(raw.length, (k + 1) * 65535));
+    const n = part.length;
+    z.set([k === blocks - 1 ? 1 : 0, n & 0xff, n >> 8, ~n & 0xff, (~n >> 8) & 0xff], o);
+    z.set(part, o + 5);
+    o += 5 + n;
+  }
+  new DataView(z.buffer).setUint32(o, ((b << 16) | a) >>> 0);
   const chunk = (type: string, body: Uint8Array) => {
     const out = new Uint8Array(12 + body.length);
     const dv = new DataView(out.buffer);
@@ -917,13 +1046,13 @@ export function solidPng(factor: ArrayLike<number>, size = 4): Uint8Array {
   };
   const ihdr = new Uint8Array(13);
   const hv = new DataView(ihdr.buffer);
-  hv.setUint32(0, size);
-  hv.setUint32(4, size);
+  hv.setUint32(0, width);
+  hv.setUint32(4, height);
   ihdr.set([8, 6, 0, 0, 0], 8);
   const parts = [Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a), chunk("IHDR", ihdr), chunk("IDAT", z), chunk("IEND", new Uint8Array(0))];
   const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
-  let o = 0;
-  for (const p of parts) out.set(p, o), (o += p.length);
+  let w = 0;
+  for (const p of parts) out.set(p, w), (w += p.length);
   return out;
 }
 
@@ -982,27 +1111,82 @@ export function fitPuppetScale(doc: EditorDoc): (b: Float64Array) => number {
   };
 }
 
+/** 场景属性值：裸值或 `{ value, user/script… }` 包装 */
+const propValue = (v: unknown): unknown => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>).value : v);
+
 const parseVec = (v: unknown): V3 | null => {
-  const p = String(v ?? "").trim().split(/\s+/).map(Number);
+  const p = String(propValue(v) ?? "").trim().split(/\s+/).map(Number);
   return p.length >= 3 && p.every(Number.isFinite) ? [p[0], p[1], p[2]] : null;
 };
 
-/** 网格缺省缩放：包围球半径 ≈ 相机到注视点距离的 1/3（没有相机时按 1） */
+export type MeshView = { eye: V3; fwd: V3; fov: number; dist: number };
+
+/**
+ * 网格导入的取景：相机按渲染器 buildCamera 的规则选 —— 最后一个可见的相机实体
+ * （origin 为眼、angles 按角度转 -Z 朝向），没有实体时用顶层 scene.camera。
+ * dist = 摆放深度：视线前方最近的已有模型层再往前 20%（不和主体穿插），
+ * 没有模型层时取 scene.camera 眼到注视点的距离。
+ */
+export function meshView(doc: EditorDoc): MeshView {
+  const scene = doc.scene ?? {};
+  const general = (scene.general ?? {}) as Record<string, unknown>;
+  const objs = (Array.isArray(scene.objects) ? scene.objects : []) as SceneObject[];
+  const cams = objs.filter((o) => typeof o.camera === "string" && o.camera !== "");
+  const visible = (o: SceneObject) => {
+    const v = propValue(o.visible);
+    return v !== false;
+  };
+  const ent = cams.filter(visible).pop() ?? cams[0];
+  const top = scene.camera as Record<string, unknown> | undefined;
+  const topEye = parseVec(top?.eye);
+  const topCenter = parseVec(top?.center);
+  let eye: V3;
+  let fwd: V3;
+  let fov = Number(propValue(general.fov)) || 50;
+  if (ent) {
+    eye = parseVec(ent.origin) ?? [0, 0, 0];
+    const a = parseVec(ent.angles) ?? [0, 0, 0];
+    const yaw = (a[1] * Math.PI) / 180;
+    const pitch = (a[0] * Math.PI) / 180;
+    const z0 = -Math.cos(yaw);
+    fwd = [-Math.sin(yaw), -z0 * Math.sin(pitch), z0 * Math.cos(pitch)];
+    fov = Number(propValue(ent.fov)) || fov;
+  } else {
+    eye = topEye ?? [0, 0, 0];
+    const c = topCenter ?? [eye[0], eye[1], eye[2] - 1];
+    const d = Math.hypot(c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]) || 1;
+    fwd = [(c[0] - eye[0]) / d, (c[1] - eye[1]) / d, (c[2] - eye[2]) / d];
+  }
+  const near = Math.max(Number(general.nearz) || 0.01, 1e-4);
+  let nearest = Infinity;
+  for (const o of objs) {
+    if (typeof o.model !== "string" || o.parent != null) continue;
+    const p = parseVec(o.origin);
+    if (!p) continue;
+    const v: V3 = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+    const depth = v[0] * fwd[0] + v[1] * fwd[1] + v[2] * fwd[2];
+    const off = Math.hypot(v[0] - depth * fwd[0], v[1] - depth * fwd[1], v[2] - depth * fwd[2]);
+    if (depth > near * 10 && off < depth && depth < nearest) nearest = depth;
+  }
+  const topDist = topEye && topCenter ? Math.hypot(topCenter[0] - topEye[0], topCenter[1] - topEye[1], topCenter[2] - topEye[2]) : 0;
+  const dist = Number.isFinite(nearest) ? nearest * 0.8 : topDist > 0 ? topDist : 2;
+  return { eye, fwd, fov, dist };
+}
+
+/** 网格缺省缩放：包围球直径 ≈ 摆放深度处画面高度的 60% */
 export function fitMeshScale(doc: EditorDoc): (b: Float64Array) => number {
-  const cam = doc.scene?.camera as Record<string, unknown> | undefined;
-  const eye = parseVec(cam?.eye);
-  const center = parseVec(cam?.center);
-  const dist = eye && center ? Math.hypot(eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]) : 0;
+  const v = meshView(doc);
+  const halfH = v.dist * Math.tan((v.fov * Math.PI) / 360);
   return (b) => {
     const r = Math.hypot(b[3] - b[0], b[4] - b[1], b[5] - b[2]) / 2;
-    return dist > 0 && r > 0 ? dist / 3 / r : 1;
+    return halfH > 0 && r > 0 ? (0.6 * halfH) / r : 1;
   };
 }
 
 /**
  * 场景末尾加导入的模型层并挂一条动画层指向首个片段；返回新 id。
  * puppet：图片层放在画面中心（层原点 = 网格原点，按包围盒中心对齐），size = 关于原点对称的包围盒；
- * mesh：放在相机注视点。
+ * mesh：包围盒中心落在活相机视线上（meshView 的摆放深度），绕 Y 转到正面朝相机。
  */
 export function addModelLayer(doc: EditorDoc, m: GltfModel, path: string, name: string): number | null {
   const scene = doc.scene;
@@ -1022,8 +1206,16 @@ export function addModelLayer(doc: EditorDoc, m: GltfModel, path: string, name: 
     const sh = Math.ceil(2 * Math.max(Math.abs(b[1]), Math.abs(b[4])));
     o = { angles: vec3(0, 0, 0), id, image: path, name, origin: vec3(W / 2 - cx, H / 2 - cy, 0), scale: vec3(1, 1, 1), size: `${sw.toFixed(5)} ${sh.toFixed(5)}` };
   } else {
-    const c = parseVec((scene.camera as Record<string, unknown> | undefined)?.center) ?? [0, 0, 0];
-    o = { angles: vec3(0, 0, 0), id, model: path, name, origin: vec3(c[0], c[1], c[2]), scale: vec3(1, 1, 1) };
+    const v = meshView(doc);
+    const p: V3 = [v.eye[0] + v.fwd[0] * v.dist, v.eye[1] + v.fwd[1] * v.dist, v.eye[2] + v.fwd[2] * v.dist];
+    const yaw = Math.hypot(v.fwd[0], v.fwd[2]) > 1e-6 ? Math.atan2(-v.fwd[0], -v.fwd[2]) : 0;
+    const cs = Math.cos(yaw);
+    const sn = Math.sin(yaw);
+    const cx = (b[0] + b[3]) / 2;
+    const cy = (b[1] + b[4]) / 2;
+    const cz = (b[2] + b[5]) / 2;
+    const org: V3 = [p[0] - (cs * cx + sn * cz), p[1] - cy, p[2] - (-sn * cx + cs * cz)];
+    o = { angles: vec3(0, yaw, 0), id, model: path, name, origin: vec3(org[0], org[1], org[2]), scale: vec3(1, 1, 1) };
   }
   objs.push(o);
   if (m.clips.length) addAnimLayer(doc, o, m.clips[0].id, m.clips[0].name);
@@ -1031,5 +1223,5 @@ export function addModelLayer(doc: EditorDoc, m: GltfModel, path: string, name: 
   return id;
 }
 
-export const MODEL_FILE_RE = /\.(glb|gltf)$/i;
+export const MODEL_FILE_RE = /\.(glb|gltf|fbx|obj|dae|stl|ply|3ds)$/i;
 export const isModelFile = (f: { name: string }) => MODEL_FILE_RE.test(f.name);

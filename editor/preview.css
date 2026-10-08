@@ -1,0 +1,529 @@
+/* 播放侧能力（壁纸库 / 使用说明 / 性能 / 壁纸配置）的样式 */
+
+.sponsor-btn:hover {
+  color: #e5566b;
+}
+/* ---------- 左：壁纸库 ---------- */
+
+.lib-tools {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+.lib-path {
+  margin: 0;
+  color: var(--wb-fg-mute);
+  font: var(--wb-font-xs) / 1.4 var(--mono);
+  word-break: break-all;
+}
+
+.lib-path:empty {
+  display: none;
+}
+
+#type-filter .seg-btn {
+  font-family: var(--mono);
+}
+
+.lib-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.lib-list > li[data-id] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--wb-radius-sm);
+  cursor: pointer;
+}
+
+.lib-list > li[data-id]:hover {
+  background: var(--wb-bg-3);
+}
+
+.lib-list > li.active {
+  background: var(--wb-accent-soft);
+  box-shadow: inset 2px 0 0 var(--wb-accent);
+  color: var(--wb-fg-strong);
+}
+
+.lib-list .thumb {
+  flex: none;
+  width: 56px;
+  height: 32px;
+  overflow: hidden;
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-viewport);
+}
+
+.lib-list .thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.lib-list .meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.lib-list .title,
+.lib-list .sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lib-list .sub {
+  color: var(--wb-fg-mute);
+  font: var(--wb-font-xs) / 1.5 var(--mono);
+  user-select: text;
+}
+
+.lib-list > li.active .sub {
+  color: var(--wb-fg-dim);
+}
+
+.lib-empty {
+  cursor: default;
+}
+
+
+/* ---------- 中：使用说明 ---------- */
+
+#docs-view {
+  background: var(--wb-bg-1);
+}
+
+#docs-switch {
+  position: sticky;
+  top: 12px;
+  z-index: 2;
+  flex: none;
+  align-self: center;
+  margin-top: 16px;
+  box-shadow: var(--wb-shadow-pop);
+}
+
+#docs-switch .seg-btn {
+  height: 24px;
+  padding: 0 16px;
+  white-space: nowrap;
+}
+
+#docs-body {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 20px 36px 0;
+  color: var(--wb-fg);
+  font-size: 13px;
+  line-height: 1.65;
+  user-select: text;
+}
+
+#docs-body h2 {
+  margin: 28px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--wb-line);
+  color: var(--wb-fg-strong);
+  font-size: 18px;
+}
+
+#docs-body h2:first-child {
+  margin-top: 0;
+}
+
+#docs-body p {
+  margin: 8px 0;
+}
+
+#docs-body ul {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+
+#docs-body li {
+  margin: 4px 0;
+}
+
+#docs-body a {
+  color: var(--link);
+}
+
+.doc-code {
+  margin: 10px 0;
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  /* 两个主题都用深底，代码块文字固定浅色保证对比度 */
+  background: #0b0c0e;
+  color: #d4d4d4;
+  font: 12px / 1.55 var(--mono);
+  white-space: pre;
+}
+
+.doc-table {
+  width: 100%;
+  margin: 10px 0;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.doc-table th,
+.doc-table td {
+  padding: 6px 10px;
+  border: 1px solid var(--wb-line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.doc-table th {
+  background: var(--wb-bg-2);
+  color: var(--wb-fg-strong);
+}
+
+.doc-table td code {
+  color: var(--link);
+  font: 11px var(--mono);
+}
+
+#sponsor-card {
+  width: calc(100% - 72px);
+  max-width: 788px;
+  margin: 36px auto 48px;
+  padding: 18px 20px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+}
+
+#sponsor-card strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #e5566b;
+  font-size: 14px;
+}
+
+#sponsor-card p {
+  margin: 0 0 12px;
+  color: var(--wb-fg-dim);
+}
+
+.sponsor-qr-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.sponsor-qr-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.sponsor-qr {
+  display: block;
+  width: 200px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: #fff;
+}
+
+.sponsor-qr-item figcaption {
+  color: var(--wb-fg-mute);
+  font-size: 12px;
+  text-align: center;
+}
+
+
+/* ---------- 底部：性能 ---------- */
+
+.perf-summary {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+.perf-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 48px;
+}
+
+.perf-cell strong {
+  color: var(--wb-fg-strong);
+  font: 600 16px / 1.2 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.perf-cell.low strong {
+  color: var(--wb-warn);
+}
+
+.perf-cell span {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-xs);
+}
+
+.perf-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+}
+
+.perf-chart {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  margin: 6px 8px 8px;
+}
+
+.perf-chart canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- 右：壁纸配置（对标 WE 属性窗口） ---------- */
+
+.props-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+#props-state {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#props-state.is-err {
+  color: var(--wb-danger);
+}
+
+.props-row {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+#props-body {
+  flex: 1;
+  min-height: 0;
+  padding-bottom: 20px;
+  overflow-y: auto;
+}
+
+.prop {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--wb-line-soft);
+}
+
+.prop:hover {
+  background: color-mix(in srgb, var(--wb-bg-3) 40%, transparent);
+}
+
+.prop-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.prop-head-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.prop-name {
+  display: block;
+  line-height: 1.35;
+  white-space: pre-line;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.prop.overridden .prop-name {
+  color: var(--wb-accent);
+}
+
+.prop.overridden {
+  box-shadow: inset 2px 0 0 var(--wb-accent);
+}
+
+.prop-key {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--wb-fg-mute);
+  font: 10px / 1.4 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prop-head .wb-switch {
+  margin-top: 1px;
+}
+
+.prop-ctl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.prop-ctl input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.prop-ctl input[type="text"],
+.prop-ctl select {
+  flex: 1;
+  min-width: 0;
+}
+
+.prop-ctl input[type="color"] {
+  width: 36px;
+  height: var(--wb-ctl-h);
+  padding: 1px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-input);
+  cursor: pointer;
+}
+
+.prop-ctl .prop-key {
+  flex: 1;
+  min-width: 0;
+  margin-top: 0;
+}
+
+.prop-num {
+  flex: none !important;
+  width: 64px;
+  text-align: right;
+}
+
+.prop-group > .prop-group-summary {
+  height: auto;
+  min-height: 30px;
+  padding: 6px 10px;
+  white-space: pre-line;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.prop-group-body {
+  padding-bottom: 4px;
+}
+
+.prop-text {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--wb-line-soft);
+  color: var(--wb-fg-dim);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.prop-text-cap {
+  text-align: center;
+  white-space: pre-line;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.prop-media {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.prop-media a {
+  display: block;
+  max-width: 100%;
+}
+
+.prop-media img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--wb-radius-sm);
+}
+
+.prop-head .prop-media {
+  align-items: flex-start;
+  margin: 0 0 4px;
+}
+
+.prop-file {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.prop-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--wb-fg-dim);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prop-pick {
+  flex: none;
+}
+
+.prop-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.prop-cond {
+  opacity: 0.5;
+}
+

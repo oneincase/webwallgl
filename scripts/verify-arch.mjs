@@ -97,6 +97,44 @@ if (fs.existsSync(EDITOR_DIR)) {
     const probe = PROBES.exec(src);
     check(!probe, `${rel}：编辑器页不得使用调试探针 ${probe?.[1]}（缺能力请在 api/editor 补公开 API）`);
   }
+
+  // 插件分层（docs/PLUGIN-ARCHITECTURE.md §7）
+  const specsOf = (src) => [...src.matchAll(/(?:^|\n)\s*(import|export)\s+(type\s+)?[^'"]*?from\s+['"]([^'"]+)['"]/g)].map((m) => ({ spec: m[3], typeOnly: !!m[2] }));
+  const relTo = (from, spec) => path.relative(ROOT, path.resolve(path.dirname(from), spec)).split(path.sep).join("/");
+  // 内核零依赖：editor/core 只准 import 自己
+  for (const f of listFiles(path.join(EDITOR_DIR, "core"), ".ts")) {
+    for (const { spec } of specsOf(fs.readFileSync(f, "utf8"))) {
+      check(spec.startsWith("./"), `${path.relative(ROOT, f)}：插件内核不得 import 内核外模块 —— "${spec}"`);
+    }
+  }
+  // 插件 / 服务 / SDK / UI 部件不得反向依赖页面装配（main.ts）
+  for (const sub of ["plugins", "services", "sdk", "ui"]) {
+    for (const f of listFiles(path.join(EDITOR_DIR, sub), ".ts")) {
+      for (const { spec } of specsOf(fs.readFileSync(f, "utf8"))) {
+        if (!spec.startsWith(".")) continue;
+        check(!/^editor\/main(\.ts)?$/.test(relTo(f, spec)), `${path.relative(ROOT, f)}：插件层不得 import editor/main.ts —— "${spec}"`);
+      }
+    }
+  }
+  // SDK 只转出类型（运行时只有恒等函数），外部插件打包时才不会把编辑器真源带进去
+  for (const f of listFiles(path.join(EDITOR_DIR, "sdk"), ".ts")) {
+    for (const { spec, typeOnly } of specsOf(fs.readFileSync(f, "utf8"))) {
+      check(typeOnly, `${path.relative(ROOT, f)}：SDK 只准 import type / export type —— "${spec}"`);
+    }
+  }
+}
+
+// 示例插件只从 editor/sdk 取东西（与 build-plugin-sdk 的构建守卫同一条线）
+const EXAMPLES_DIR = path.join(ROOT, "examples/plugins");
+if (fs.existsSync(EXAMPLES_DIR)) {
+  for (const f of listFiles(EXAMPLES_DIR, ".ts")) {
+    const src = fs.readFileSync(f, "utf8");
+    for (const m of src.matchAll(/(?:^|\n)\s*(?:import|export)\s+[^'"]*?from\s+['"]([^'"]+)['"]/g)) {
+      const rel = path.relative(ROOT, path.resolve(path.dirname(f), m[1])).split(path.sep).join("/");
+      const ok = !m[1].startsWith(".") ? false : rel.startsWith("examples/") || /^editor\/sdk(\/index(\.ts)?)?$/.test(rel);
+      check(ok, `${path.relative(ROOT, f)}：示例插件只准 import editor/sdk 或自己目录里的文件 —— "${m[1]}"`);
+    }
+  }
 }
 
 // ---------- 3. 全部引擎模块 Node 可加载 ----------

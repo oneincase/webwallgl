@@ -32,15 +32,15 @@ function cleanSiteOutput(): Plugin {
   };
 }
 
-// 三入口：/ 测试台，/renderer/index.html 渲染器页（与主项目 WallpaperEM 同路径同 query 协议），
-// /editor/ 编辑器页（docs/EDITOR-PLAN.md §3A）
+// 入口：/editor/ 工作台（壁纸库播放 + 编辑同一页，docs/EDITOR-PLAN.md §3A），
+// /renderer/index.html 渲染器页（与主项目 WallpaperEM 同路径同 query 协议），/ 只是跳到 /editor/ 的旧入口
 export default defineConfig({
   plugins: [wallpaperHost(), cleanSiteOutput()],
   clearScreen: false,
   server: {
     port: 1430,
     strictPort: true,
-    open: true,
+    open: "/editor/",
     host: true,
   },
   build: {
@@ -49,7 +49,7 @@ export default defineConfig({
     emptyOutDir: false,
     rollupOptions: {
       input: {
-        bench: here("index.html"),
+        index: here("index.html"),
         renderer: here("renderer/index.html"),
         editor: here("editor/index.html"),
       },

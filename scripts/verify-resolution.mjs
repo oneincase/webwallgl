@@ -315,7 +315,7 @@ function env(dpr, w, h) {
     check(rs.isSmallTexture(1024, 512) === false, "1024×512 的 DXT/R8（上传 2MB）不算小图 —— 压缩/R8 直传要覆盖到它");
     check(rs.isSmallTexture(0, 0) === true, "尺寸未知 → 当小图处理（保守）");
     const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
-    check(/parsedTex\?\.[\s\S]{0,40}frames\?\.list\?\.length/.test(smSrc) && /currentTexNoScale/.test(smSrc),
+    check(/parsedTex\?\.[\s\S]{0,40}frames\?\.list\?\.length/.test(smSrc) && /noScale = pngSkip/.test(smSrc) && /noScale = rawSkip/.test(smSrc),
       "带帧表的图集必须**绝对**跳过（含 S4 足迹），不能只把倍率设成 1");
   }
     check(rs.resourcesOff("") === false, "默认不关闭");
@@ -326,7 +326,15 @@ function env(dpr, w, h) {
   check(/resourceScaleFor\(rt, cfg\)/.test(smSrc), "scene-mount 读基础资源倍率");
   check(/texResScale\(name, resScaleBase, resScaleNormal\)/.test(smSrc), "scene-mount 按白名单取每张贴图倍率");
   check(/decodeMipLevel\(parsedTex, baseLevel\)/.test(smSrc), "scene-mount 用 decodeMipLevel 取 mip 级");
-  check(/if \(resOff \|\| currentTexNoScale\) return 0/.test(smSrc), "?resources=native 必须严格 no-op（不再用 R>=1 判定）");
+  check(/if \(resOff \|\| noScale\) return 0/.test(smSrc), "?resources=native 必须严格 no-op（不再用 R>=1 判定）");
+  // [2026-10-07] razer_bedroom：并行 loadTex 共享 currentTexName，4K 墙被写成
+  // 邻层 hue-bulb 的足迹（325）→ 上传 325×183，整张壁纸糊成一块。
+  check(!/currentTexName|currentTexNoScale/.test(smSrc), "目标尺寸不得用共享 currentTexName（并行装载会串到别的层的足迹）");
+  check(/let noScale = false;/.test(smSrc), "noScale 必须是每张贴图自己的局部变量");
+  check(/texTargetLong\(normalizedResScale\(name\), parsedTex, name, noScale\)/.test(smSrc), "PNG/JPEG 解码目标必须用本张贴图名查足迹");
+  check(/texTargetLong\(R, parsedTex, name, noScale\)/.test(smSrc), "原始格式目标必须用本张贴图名查足迹");
+  check(/pickMipLevel\(parsedTex, target, R, name, noScale\)/.test(smSrc), "mip 级挑选必须用本张贴图名");
+  check(/got\.width < wantW \|\| got\.height < wantH/.test(smSrc), "烘焙缓存比本次目标更小必须当未命中（禁止放大旧降采样）");
   // 压缩 / R8 直传（2026-09-20）：接线 + 回退开关 + 不覆盖 entry
   check(/makeCompressedTextureMip\(gl, cLevels, cInfo.internalFormat\)/.test(smSrc), "DXT/BC 走 compressedTexImage2D 直传");
   check(/makeR8TextureMip/.test(smSrc), "R8 走 GL_R8 直传");

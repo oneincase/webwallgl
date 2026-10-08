@@ -631,6 +631,7 @@ export function parseScene(sceneJson, project) {
       parentId: o.parent !== undefined && o.parent !== null ? o.parent : null,
       // [we-scene patch] puppet 附着点名。WE 语义：`attachment: "头"` + `parent: <puppet id>`
       // = 该层 origin 相对 MDAT 附着点，并跟随那根骨（见 mdl-skin.js applyAttachmentBindOrigins）。
+      // 附着点局部 z 旋转同样要进 world angles（3810943704 眼睛）。
       // 名字必须原样留下：全库有 "左头发1"/"左头发2" 这种只差末位数字的，前缀匹配会挂错骨。
       // 解析阶段还没有 MDL，这里只保留字段；绑定姿势偏移在 puppet 装好之后再加。
       attachment: typeof o.attachment === 'string' && o.attachment !== '' ? o.attachment : null,
@@ -1024,11 +1025,13 @@ export function recomposeWorld(layers, dirty) {
       )
     }
     // 挂件绑定姿势偏移：world 合成之后再叠，逐帧的骨骼增量由 followAttachments 叠。
+    // attachBindAngle 是 MDAT 附着点的局部 z 旋转，同样只能加在挂件层自己身上。
     const d = l.attachBindDelta
     if (d) {
       w.origin[0] += d[0]
       w.origin[1] += d[1]
     }
+    if (l.attachBindAngle) w.angles[2] += l.attachBindAngle
     l.origin[0] = w.origin[0]
     l.origin[1] = w.origin[1]
     l.origin[2] = w.origin[2]

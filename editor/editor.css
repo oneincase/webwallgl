@@ -159,16 +159,12 @@
   line-height: 1.5;
 }
 
+/* 图层工具条在「图层」标签内：面板收窄时换行，不把按钮挤出可视区 */
 .ed-layer-tools {
-  flex: none;
+  flex-wrap: wrap;
   gap: 1px;
-}
-
-.wb-panel-head:has(.ed-layer-tools) .wb-tab {
-  min-width: 0;
-  padding: 0 6px;
-  overflow: hidden;
-  white-space: nowrap;
+  padding: 3px 4px;
+  overflow: visible;
 }
 
 .ed-layer-tools .ed-icon {
@@ -625,6 +621,68 @@ html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
 
 .ed-insp-group {
   margin: 4px 0 12px;
+}
+
+/* 检视器标签条：吸顶，长面板滚动时仍可切页 */
+.ed-insp-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 0 -12px 4px;
+  padding: 6px 12px 0;
+  border-bottom: 1px solid var(--wb-line);
+  background: var(--wb-bg-1);
+  user-select: none;
+}
+
+.ed-insp-tab {
+  position: relative;
+  margin-bottom: -1px;
+  padding: 4px 10px 5px;
+  border: 1px solid transparent;
+  border-radius: var(--wb-radius-sm) var(--wb-radius-sm) 0 0;
+  background: none;
+  color: var(--wb-fg-dim);
+  font: inherit;
+  font-size: var(--wb-font-sm);
+  cursor: pointer;
+}
+
+.ed-insp-tab:hover {
+  color: var(--wb-fg);
+  background: var(--wb-hover);
+}
+
+.ed-insp-tab.active {
+  border-color: var(--wb-line);
+  border-bottom-color: var(--wb-bg-1);
+  background: var(--wb-bg-1);
+  color: var(--wb-fg-strong);
+  font-weight: 600;
+}
+
+.ed-insp-tab:focus-visible {
+  outline: 1px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+
+.ed-insp-tab.has-alert::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wb-danger);
+}
+
+.ed-insp-panel[hidden] {
+  display: none;
 }
 
 .ed-insp-title {
@@ -1125,6 +1183,139 @@ input.ed-al-name {
   border: 1px solid var(--wb-line);
   border-radius: var(--wb-radius-sm);
   background: var(--wb-input);
+}
+
+.ed-dialog {
+  width: min(380px, calc(100vw - 48px));
+  padding: 16px;
+  border: 1px solid var(--wb-line-strong);
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+  color: var(--wb-fg);
+  box-shadow: var(--wb-shadow-pop);
+}
+
+.ed-dialog::backdrop {
+  background: rgb(0 0 0 / 0.45);
+}
+
+.ed-dialog-title {
+  color: var(--wb-fg-strong);
+  font-size: var(--wb-font-lg);
+  font-weight: 600;
+}
+
+.ed-dialog-body {
+  margin: 8px 0 16px;
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font);
+  line-height: 1.5;
+}
+
+.ed-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---------- 插件管理 ---------- */
+
+.ed-dialog.ed-plugins {
+  width: min(640px, calc(100vw - 48px));
+}
+
+.ed-plugins-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(56vh, 520px);
+  margin-bottom: 14px;
+  overflow: auto;
+}
+
+.ed-plugins-empty {
+  padding: 18px 0;
+  color: var(--wb-fg-dim);
+  text-align: center;
+}
+
+.ed-plugin {
+  padding: 8px 10px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-bg-1);
+}
+
+.ed-plugin[data-status="failed"],
+.ed-plugin[data-status="invalid"] {
+  border-color: rgb(220 80 80 / 0.5);
+}
+
+.ed-plugin-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ed-plugin-name {
+  color: var(--wb-fg-strong);
+  font-weight: 600;
+}
+
+.ed-plugin-ver,
+.ed-plugin-src {
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-status {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--wb-bg-3);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-status.is-ok {
+  color: #7fd28a;
+}
+
+.ed-plugin-status.is-warn,
+.ed-plugin-status.is-busy {
+  color: #e6c069;
+}
+
+.ed-plugin-status.is-err {
+  color: #f08080;
+}
+
+.ed-plugin-status.is-off {
+  color: var(--wb-fg-dim);
+}
+
+.ed-plugin-acts {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.ed-btn.ed-btn-sm {
+  height: 22px;
+  padding: 0 8px;
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-desc,
+.ed-plugin-meta {
+  margin-top: 4px;
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-err {
+  margin-top: 4px;
+  color: #f08080;
+  font-size: var(--wb-font-sm);
+  white-space: pre-wrap;
 }
 
 /* ---------- 状态栏 ---------- */

@@ -1,0 +1,13 @@
+{
+  "id": "particle-fireflies",
+  "name": { "zh-CN": "萤火虫粒子", "en": "Fireflies particles" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "纯数据插件示例：一个粒子模板（只用 WE 引擎认识的组件，白名单外的组件会被拒绝）。",
+    "en": "Data-only example: one particle template (only components the WE engine understands; anything else is rejected)."
+  },
+  "contributes": {
+    "particles": ["particles/fireflies.json"]
+  }
+}
