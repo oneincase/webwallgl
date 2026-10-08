@@ -306,6 +306,10 @@ const PART_AREA_CAP = 6
 // 眼组必须收到 k=0，花火/头发/躯干块必须一个零件都不压。
 const PART_SQUASH_MESH = 900
 const PART_SQUASH_BODY = 110
+// 全身网格上「大件也跟着收」的唯一破例：收拢件自己被压到这个比例以下（真闭眼）。
+// 3078285611/3264246690 的躯干/头板假阳性都是 cr=0.96~0.98（几乎没收）配上的，靠这条挡住；
+// 3671936032 的眼白 cr=0.075（艾玛 f24）、0.26→0.011（希罗 f60）才能放行虹膜跟着收。
+const PART_SQUASH_BODY_DEEP = 0.2
 
 function meshSpan(mdl) {
   if (mdl._meshSpan) return mdl._meshSpan
@@ -406,11 +410,17 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
     b[4] = restH > 1e-3 ? (b[3] - b[2]) / restH : 1
   }
 
+  // 网格尺度提前取：大网格（long > PART_SQUASH_MESH，即整个人物）里的「大件」走下面
+  // 眼睛专属的硬条件；小网格（眼组，≤900px）里的零件沿用老的中心/相交判据。
+  const span = meshSpan(mdl)
+  const bigMesh = span.long > PART_SQUASH_MESH
   const hits = []
   for (let r = 0; r < parts.length; r++) {
     const rb = box[r]
     if (rb[4] < PART_RIGID_RATIO) continue
     const rArea = Math.max(1e-6, (rb[1] - rb[0]) * (rb[3] - rb[2]))
+    const rp = parts[r]
+    const rLong = Math.max(rp.x1 - rp.x0, rp.y1 - rp.y0)
     let k = 1
     let px = 0
     let py = 0
@@ -421,38 +431,63 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
       const h = cb[3] - cb[2]
       const w = cb[1] - cb[0]
       if (!(h > 1e-6) || !(w > 1e-6)) continue
-      if (rArea > PART_AREA_CAP * Math.max(1e-6, w * h)) continue
-      // 判据用「收拢件的**中心**落在刚性件盒内」+ 面积上限。
-      // 不用「竖直 90%/横向 60% 包含」的原因：同一台壁纸的左右眼**原画形状可以不同**
-      // （3655429099 是 wink 角色，两眼素材不对称），包含判据只对一只眼成立 →
-      // 实测「一只眼收、另一只不收」。这里放宽后由白名单兜住误伤面（全库扫描见 CASEBOOK）。
-      const cx = (cb[0] + cb[1]) / 2
-      const cy = (cb[2] + cb[3]) / 2
-      if (cx < rb[0] || cx > rb[1] || cy < rb[2] || cy > rb[3]) continue
-      // **能盖住**：被盖件的当前宽度必须小于收拢件的**静止**宽度 —— 「眼睑/皮肤（宽）盖住眼球（窄）」。
-      // 这条是相对判据（两个零件互相比较），绝对判据全试过并且都失败（见 CASEBOOK）：
-      //   静止更高：3655429099 眼球(70/67) 比眼睑(80) 矮 → 两颗眼都不命中（旧版的 bug）
-      //   静止面积更小：3629379075 眼睑 139×67 比眼球 91×107 还小 → 只剩一只眼
-      //   静止盒被包含：3655429099 右眼当前盒比眼睑高 33%，包含关系不成立 → 只剩左眼
-      // 而宽度关系两台都成立：眼球 82/54 < 眼睑 140/84；3629379075 眼球 91/90 < 眼睑 139。
-      // 关键是它同时**排除睫毛带**（3655429099 的 157 比眼睑 140 更宽）——那条是闭眼时
-      // 该留下的深色睑线，旧版被当成「被盖件」藏掉，就是用户看到的左眼异常。
-      const cRestW = parts[c].x1 - parts[c].x0
-      if (!((rb[1] - rb[0]) < cRestW)) continue
-      // **本来就盖在它上面**：静止姿势下收拢件的盒子必须与被盖件的盒子相交。
-      // 「眼睑盖眼球」是解剖关系，静止时眼睑就在眼球上方；而 3671936032（人物）里
-      // 眼白与睫毛在静止姿势下**毫无重叠**，只是闭眼时眼白被压成一条横线，那条线
-      // 恰好扫过睫毛的中心 —— 中心判据对「被压成一条线的零件」是退化的：13px 高的
-      // 细条照样能包含任何跨越它的中心点。实测该壁纸两处眨眼（艾玛 f24、希罗 f60）
-      // 命中的全是睫毛（静止重叠 0%），压到 k=0 后被绘制侧 `k < 0.25` 整块删掉，
-      // 而**闭眼时该留下的深色睑线正是这几条睫毛**（绘制顺序 index 升序，睫毛在虹膜之上，
-      // 作者就是靠它们盖住虹膜）→ 用户看到的「眨眼只有睫毛动、眼睛不闭」。
-      // 语料侧这条判据不动任何原有命中：静止重叠 3655429099 87~100%、3629379075 15~65%、
-      // 3808922316 54~95%、3521337568 37~83%、3791967416 9~64%、3264246690 53~60%。
-      const rp = parts[r]
-      const cp = parts[c]
-      if (!(Math.min(cp.x1, rp.x1) > Math.max(cp.x0, rp.x0) &&
-            Math.min(cp.y1, rp.y1) > Math.max(cp.y0, rp.y0))) continue
+      // 面积上限的分母用**展开后**的面积：深压时收拢件的当前盒只剩一条线（3671936032 的
+      // 眼白 168×13），拿它当分母会把「本来就盖在上面的大件」（同一张的虹膜 444×217）全判掉。
+      const eh = h / Math.max(cb[4], 1e-3)
+      if (rArea > PART_AREA_CAP * Math.max(1e-6, w * eh)) continue
+      // 收口分两类。**大件** = 静止长边 > PART_SQUASH_BODY(110) 的零件（眼球/虹膜/躯干），
+      // 只有在整张人物网格（long > PART_SQUASH_MESH）里才另走硬条件；眼组小网格沿用老判据。
+      if (bigMesh && rLong > PART_SQUASH_BODY) {
+        // 眼睛这一处是**反过来的**：闭眼时收掉的是眼白（168×171 的小件），要跟着收的却是
+        // 横跨双眼的虹膜 444×217 与高光 432×166（3671936032，用户实测「眼球一直是最大状态、
+        // 睫毛往下运动时也没有被遮罩」）。虹膜比眼白宽、静止时与眼白不在同一块 UV 岛、当前盒
+        // 也错开，老判据一条都过不了。改用四条硬条件（缺一个就会把身体块当眼球，实测
+        // 3078285611 的 232×761 / 323×389 / 156×150 会分别被第三/第四/第二+第四条挡住）：
+        //   ① 两个零件**同属一颗骨**（bone.parent 相同）：艾玛的眼白/眼球/高光都是 bone 31 的
+        //      子骨、希罗的是 bone 61 的子骨 —— 这才是「同一只眼的零件」；
+        //   ② 收拢件**真的收完了**（cb[4] < PART_SQUASH_BODY_DEEP = 0.2；绘制侧 k<0.25 本来
+        //      就不画了）：身体块的假阳性 cr 都在 0.26~0.98；
+        //   ③ 两者**尺度相近**（静止两轴尺寸比 ≤ 4）：虹膜对眼白 2.6/1.3，而 232×761 对
+        //      186×179 在高度上是 4.3 倍；
+        //   ④ 被盖的大件比收拢件**本身大**（静止面积 ≥ 2 倍）：虹膜对眼白 3.4 倍，而
+        //      3078285611 里尺寸几乎一样的一对（156×150 对 151×137，1.1 倍）不是「盖住」。
+        if (!(cb[4] < PART_SQUASH_BODY_DEEP)) continue
+        const ownBone = mdl.bones[rp.bone]
+        const colBone = mdl.bones[parts[c].bone]
+        if (!(ownBone && colBone && ownBone.parent === colBone.parent)) continue
+        const rw0 = Math.max(1e-3, rp.x1 - rp.x0)
+        const rh0 = Math.max(1e-3, rp.y1 - rp.y0)
+        const cw0 = Math.max(1e-3, parts[c].x1 - parts[c].x0)
+        const ch0 = Math.max(1e-3, parts[c].y1 - parts[c].y0)
+        if (!(Math.max(rw0 / cw0, cw0 / rw0) <= 4 && Math.max(rh0 / ch0, ch0 / rh0) <= 4)) continue
+        if (!(rArea > 2 * cw0 * ch0)) continue
+      } else {
+        // 老判据（2026-10-07）：收拢件**当前中心**落在刚性件盒内 + 被盖件更窄 +（2026-10-09）
+        // 静止姿势下两盒**相交**。
+        // 不用「竖直 90%/横向 60% 包含」的原因：同一台壁纸的左右眼**原画形状可以不同**
+        // （3655429099 是 wink 角色，两眼素材不对称），包含判据只对一只眼成立 →
+        // 实测「一只眼收、另一只不收」。
+        // 相交那条是 2026-10-09 补的：中心判据对「被压成一条线的零件」是退化的 —— 13px 高的
+        // 细条照样包含任何跨越它的中心点，于是眼白塌成一条线时就"盖住"了静止姿势下毫无重叠的
+        // 睫毛（3671936032 艾玛 f24 / 希罗 f60），把闭眼时必须留下的深色睑线整块删掉
+        //（绘制侧 k<0.25 不画）→ 用户看到的「眨眼只有睫毛动、眼睛不闭」。
+        // 语料侧这条判据不动任何原有命中：静止重叠 3655429099 87~100%、3629379075 15~65%、
+        // 3808922316 54~95%、3521337568 37~83%、3791967416 9~64%、3264246690 53~60%。
+        const cx = (cb[0] + cb[1]) / 2
+        const cy = (cb[2] + cb[3]) / 2
+        if (cx < rb[0] || cx > rb[1] || cy < rb[2] || cy > rb[3]) continue
+        // **能盖住**：被盖件的当前宽度必须小于收拢件的**静止**宽度 —— 「眼睑/皮肤（宽）盖住
+        // 眼球（窄）」。这条是相对判据（两个零件互相比较），绝对判据全试过并且都失败：
+        //   静止更高：3655429099 眼球(70/67) 比眼睑(80) 矮 → 两颗眼都不命中（旧版的 bug）
+        //   静止面积更小：3629379075 眼睑 139×67 比眼球 91×107 还小 → 只剩一只眼
+        //   静止盒被包含：3655429099 右眼当前盒比眼睑高 33%，包含关系不成立 → 只剩左眼
+        // 而宽度关系两台都成立：眼球 82/54 < 眼睑 140/84；3629379075 眼球 91/90 < 眼睑 139。
+        const cRestW = parts[c].x1 - parts[c].x0
+        if (!((rb[1] - rb[0]) < cRestW)) continue
+        const cp = parts[c]
+        if (!(Math.min(cp.x1, rp.x1) > Math.max(cp.x0, rp.x0) &&
+              Math.min(cp.y1, rp.y1) > Math.max(cp.y0, rp.y0))) continue
+      }
       // 同步压扁：k = clamp(5r − 4, 0, 1)，即眼睑压到 80% 起跟随、压到 80% 以下就收完。
       // 为什么阈值取 0.8 而不是更小：同一台壁纸**两只眼的眼睑压缩程度并不相同**——
       // 3655429099 实测 r=0.66 与 r=0.74（两声道的录制幅度不同），任何落在两者之间的阈值
@@ -472,19 +507,11 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
   // 高度 ≥ 最高命中件 60%：剔掉睫毛/高光这类小件（3629379075 里 h31/h37 丢掉，
   // 只剩两颗眼球 h107/h104）。「同帧不超过 3 个」只用于全身网格，眼组不能用它收口。
   if (!hits.length) return null
-  const span = meshSpan(mdl)
-  // 先按网格尺度收口，再做「高度 ≥ 最高命中 60%」。
-  // 顺序不能反：全身网格上若先拿最高的躯干件当 100%，79px 的眼球会被 60% 滤掉。
-  let pool = hits
-  if (span.long > PART_SQUASH_MESH) {
-    pool = hits.filter((h) => {
-      const p = parts[h.r]
-      return Math.max(p.x1 - p.x0, p.y1 - p.y0) <= PART_SQUASH_BODY
-    })
-  }
-  if (!pool.length) return null
-  const tallest = Math.max(...pool.map((h) => parts[h.r].y1 - parts[h.r].y0))
-  const kept = pool.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
+  // 候选循环已经按网格尺度分好类（全身网格的大件走眼睛专属硬条件），这里只做高度收口。
+  // 先收口再取「高度 ≥ 最高命中 60%」的顺序不能反：全身网格上若先拿最高的躯干件当 100%，
+  // 79px 的眼球会被 60% 滤掉。
+  const tallest = Math.max(...hits.map((h) => parts[h.r].y1 - parts[h.r].y0))
+  const kept = hits.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
   if (!kept.length) return null
   // 个数看滤完高度之后的：Lucy 一帧能配上四五件，60% 之后剩 3 颗眼球。
   // 花火滤完仍是 4~11 件、头发 11 件以上，整帧放弃，不要挑最高的三件（那不是眼球）。
