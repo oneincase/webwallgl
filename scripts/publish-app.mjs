@@ -40,7 +40,14 @@ try {
 } catch {
   /* 404 = 未占用 */
 }
-if (published) throw new Error(`${pkg.name}@${pkg.version} 已发布过 —— 先升版本再发布`);
+if (published) {
+  // CI：首个版本只能本机手发（npm 只允许给已存在的包登记可信发布），之后打同版本标签时这里会撞上，跳过即可
+  if (ci) {
+    console.log(`${pkg.name}@${pkg.version} 已在 npm 上，跳过`);
+    process.exit(0);
+  }
+  throw new Error(`${pkg.name}@${pkg.version} 已发布过 —— 先升版本再发布`);
+}
 
 if (!dryRun && !ci) {
   try {
