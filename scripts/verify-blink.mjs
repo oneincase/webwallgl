@@ -8,9 +8,11 @@
  *     3808922316 眼睛（闭眼只有 0.2 秒，均匀 16 点全部落在窗外）
  *   必须一个零件都不压：3226487183 花火、3351179520 头发、
  *     3078285611 / 3264246690 上静止长边 >120 的零件
+ *   必须保留深色睑线（睫毛带一个都不许压）：3671936032 人物
  *
  * 改坏会红：把 PART_SQUASH_BODY 放到 800，躯干块就会被压，长边断言转红；
- * 把 PART_SQUASH_MESH 放到 0，小眼睛走全身分支被「>3」扔掉，k=0 断言转红。
+ * 把 PART_SQUASH_MESH 放到 0，小眼睛走全身分支被「>3」扔掉，k=0 断言转红；
+ * 删掉 collapsedPartSquash 里的「静止盒子相交」判据，3671936032 的睫毛会被压到 k=0 转红。
  */
 import fs from "node:fs";
 import { join } from "node:path";
@@ -27,6 +29,8 @@ check(/const PART_SQUASH_BODY = 110/.test(mdlSrc), "全身网格上的被盖件�
 check(/span\.long > PART_SQUASH_MESH && kept\.length > 3/.test(mdlSrc), "全身网格滤完高度后仍超过 3 个必须整帧放弃");
 check(/if \(squash\) \{/.test(mdlSrc) && !/if \(squash \|\|/.test(mdlSrc),
   "只有这一帧真要压扁才按零件画；squash 为 null 时走整网格一次画完");
+check(/Math\.min\(cp\.y1, rp\.y1\) > Math\.max\(cp\.y0, rp\.y0\)/.test(mdlSrc),
+  "配对必须先要求「静止姿势下收拢件盖着被盖件」，否则被压成一条线的零件会靠中心点扫中无关零件");
 
 function loadScene(id) {
   const dir = join(LIB, id);
@@ -155,6 +159,24 @@ function need(id, layer) {
     if (i >= 0) {
       const k = minK(mdl).out[i];
       check(k === 0, `3521337568 Lucy 的 62×49 零件应压到 k=0，实际 ${k}`);
+    }
+  }
+}
+{
+  // 3671936032「人物」：一张 puppet 里塞了两个角色（艾玛=骨头 29~47、希罗=49~71），
+  // 闭眼靠**睫毛带**（静止 58×40 / 64×38 / 78×46 / 63×53 / 73×77）盖住虹膜——
+  // 绘制顺序按 part 索引升序，睫毛在虹膜之上。眼白（168×171 / 150×140）在眨眼时被压成
+  // 一条 13px 高的细线，旧版的「中心落在盒内」判据对细线是退化的：线扫过谁谁就算被盖住，
+  // 于是睫毛被压到 k=0，绘制侧 `k < 0.25` 把它们整块删掉 → 用户看到的
+  //「人物眨眼只有睫毛动、眼睛不闭」。这些零件在静止姿势下与眼白毫无重叠，一个都不许被压。
+  const mdl = need("3671936032", "人物");
+  if (mdl) {
+    const lashes = [[58, 40], [64, 38], [78, 46], [63, 53], [73, 77]];
+    const { out } = minK(mdl);
+    for (const [w, h] of lashes) {
+      const i = partOf(mdl, w, h);
+      check(i >= 0, `3671936032 应有约 ${w}×${h} 的睫毛零件`);
+      if (i >= 0) check(out[i] === 1, `3671936032 的 ${w}×${h} 睫毛是闭眼时的深色睑线，不得被压（实际 k=${out[i].toFixed(2)}）`);
     }
   }
 }
