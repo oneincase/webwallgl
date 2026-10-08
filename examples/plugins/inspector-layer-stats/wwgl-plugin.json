@@ -1,0 +1,15 @@
+{
+  "id": "inspector-layer-stats",
+  "name": { "zh-CN": "图层统计", "en": "Layer stats" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "代码插件示例：给检视器加一个「统计」标签，列出选中图层的子图层数、效果、绑定了用户属性 / 挂了脚本 / 做了关键帧的字段数，以及它引用的文件。只读，不改文档。",
+    "en": "Code plugin example: adds a \"Stats\" tab to the inspector listing the selected layer's descendants, effects, how many fields are bound to user properties / scripted / keyframed, and the files it references. Read-only — never touches the document."
+  },
+  "main": "index.js",
+  "contributes": {
+    "i18n": { "zh-CN": "i18n/zh-CN.json", "en": "i18n/en.json" }
+  },
+  "permissions": ["inspector", "inspector.tabs", "i18n"]
+}

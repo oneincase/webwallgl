@@ -3741,6 +3741,18 @@ section("I. 接线");
     const keys = ["sec.render", "render.hint", "lib.props", "lib.open", "lib.play", "lib.discardConfirm", "log.libUnsupported", "log.libItemMissing", "log.cannotSaveKind", "log.savedAsProject", "st.library", "st.libDirty", "st.saveAsTitle", "props.noLibraryItem"];
     const miss = keys.filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
     check(miss.length === 0, `工作台新增文案中英文都有（缺 ${json(miss)}）`);
+    const docsTs = fs.readFileSync(path.join(ROOT, "bench/docs.ts"), "utf8");
+    const plDocs = fs.readFileSync(path.join(ROOT, "bench/docs-plugins.ts"), "utf8");
+    const plIds = [...plDocs.matchAll(/id: "(pl-\w+)"/g)].map((m) => m[1]);
+    check(/DOC_KINDS: DocKind\[\] = \["library", "editor", "plugins"\]/.test(docsTs) && /plugins: PLUGINS_DOC/.test(docsTs) &&
+      /data-doc="plugins"[^>]*data-i18n="docs\.pluginsShort"/.test(html) && json(plIds) === json(["pl-intro", "pl-manage", "pl-perms", "pl-examples", "pl-data", "pl-code"]),
+      `使用说明有独立的「插件」一份：是什么 / 安装管理 / 权限 / 示例 / 写数据插件 / 写代码插件（${json(plIds)}）`);
+    check(/id="plugins-docs" data-et="pl\.docs"/.test(html) && /\$\("#plugins-docs"\)\.onclick = \(\) => \{[\s\S]{0,120}showDocs\("plugins"\);/.test(main) &&
+      (i18n.match(/"pl\.docs":/g) ?? []).length === 2, "插件管理弹窗的「插件说明」直达插件使用说明");
+    check(/<div class="wb-tb-group" id="ed-plugin-tools" hidden><\/div>/.test(html) && /ui\.mount\("toolbar", pluginToolsEl\)/.test(main) && /pluginToolsEl\.hidden = !ui\.items\("toolbar"\)\.length/.test(main),
+      "插件的 toolbar 槽位挂在主工具条上（没有贡献时隐藏，切语言重建）");
+    const exDirs = fs.readdirSync(path.join(ROOT, "examples/plugins")).filter((d) => !d.startsWith("."));
+    check(exDirs.every((d) => plDocs.includes(`same("${d}")`)), `插件说明列出了 examples/plugins 下的全部示例（${json(exDirs)}）`);
   }
   check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
   // 插件宿主（PLUGIN-ARCHITECTURE §2 / §5）：页面只按注册表渲染，内置能力也登记成插件

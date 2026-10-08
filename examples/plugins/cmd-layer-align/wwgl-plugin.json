@@ -1,0 +1,15 @@
+{
+  "id": "cmd-layer-align",
+  "name": { "zh-CN": "图层对齐命令", "en": "Layer align commands" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "代码插件示例：注册两条带快捷键的命令（⇧⌘K 把选中图层移到画面中心，⇧⌘U 把缩放 / 旋转归位），并在主工具条放两个按钮。改动经 doc.editObject 提交，可以撤销。需要 doc 权限（高风险：能改文档）。",
+    "en": "Code plugin example: registers two commands with shortcuts (⇧⌘K centers the selected layer, ⇧⌘U resets its scale / rotation) and adds two buttons to the main toolbar. Edits go through doc.editObject, so they can be undone. Needs the doc permission (high risk: it can modify the document)."
+  },
+  "main": "index.js",
+  "contributes": {
+    "i18n": { "zh-CN": "i18n/zh-CN.json", "en": "i18n/en.json" }
+  },
+  "permissions": ["commands", "ui", "doc", "i18n"]
+}

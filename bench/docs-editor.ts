@@ -20,6 +20,7 @@ export const EDITOR_DOC: DocSection[] = [
         items: [
           { zh: "入口：根地址会转到工作台；本地开发地址为 http://localhost:1430/editor/，?item=<itemId> 直接打开库里的某个壁纸", en: "Entry: the root URL redirects to the workbench; the local dev URL is http://localhost:1430/editor/, and ?item=<itemId> opens that library wallpaper directly" },
           { zh: "可编辑的只有场景（Scene）壁纸；网页与视频壁纸可以播放、调「壁纸配置」，但不能另存为项目", en: "Only scene wallpapers are editable; web and video wallpapers can be played and configured, but not saved as projects" },
+          { zh: "编辑器的功能都由插件提供，你也可以装外部插件添加效果、粒子、导入格式、导出目标等——见顶部切换到「插件」的说明", en: "Every editor feature is provided by a plugin, and you can install external plugins to add effects, particles, import formats, export targets and more — see the \"Plugins\" guide via the switch at the top" },
           { zh: "快捷键里的 ⌘ 在 Windows / Linux 上对应 Ctrl", en: "⌘ in shortcuts means Ctrl on Windows / Linux" },
         ],
       },
@@ -92,6 +93,7 @@ export const EDITOR_DOC: DocSection[] = [
         k: "ul",
         items: [
           { zh: "图层树：眼睛图标切换可见性，锁形图标锁定（锁定后不参与点选与拖动，也不能编辑）", en: "Layer tree: the eye icon toggles visibility; the lock icon locks a layer (locked layers can't be picked, dragged or edited)" },
+          { zh: "改名：双击图层名或选中后按 F2 就地改名（回车确认、Esc 取消），也可以在检视器「属性」页的「名称」里改；可撤销，场景脚本里按名字取图层也随之生效", en: "Rename: double-click a layer name or select it and press F2 to rename in place (Enter confirms, Esc cancels), or edit \"Name\" on the inspector's Properties tab; it's undoable, and scene scripts that look layers up by name follow the new name" },
           { zh: "图层工具（图层标签下的工具行）：添加图片 / 文字（文字、时钟、日期）/ 粒子（雪、雨、火花、光点）/ 视频 / 声音层，导入模型，前移 / 后移一层，成组，复制（⌘D），删除（Delete）", en: "Layer tools (the toolbar row under the Layers tab): add image / text (text, clock, date) / particle (snow, rain, embers, bokeh) / video / sound layers, import a model, move up / down, group, duplicate (⌘D), delete (Delete)" },
           { zh: "拖入文件：图片、视频（mp4 / mov / webm，不是 H.264 的自动转码）、音频（mp3 / ogg / wav / flac）直接拖进画面即可新建对应图层", en: "Drop files: images, videos (mp4 / mov / webm; non-H.264 is transcoded automatically) and audio (mp3 / ogg / wav / flac) dropped onto the viewport become layers" },
           { zh: "导入模型：支持 .glb / .gltf / .fbx / .obj / .dae / .stl / .ply / .3ds，外部 .bin / .mtl / 贴图一起选上；带骨骼的转成可动画的 puppet，否则转成网格", en: "Import model: .glb / .gltf / .fbx / .obj / .dae / .stl / .ply / .3ds — select external .bin / .mtl / textures together; rigged models become animatable puppets, others become meshes" },
@@ -199,13 +201,11 @@ export const EDITOR_DOC: DocSection[] = [
         },
       },
       {
-        k: "ul",
-        items: [
-          { zh: "安装：点「安装插件文件夹…」选一个含 wwgl-plugin.json 的文件夹，或把插件放进 ~/.webwallgl/plugins 后点「重新扫描」", en: "Install: click \"Install plugin folder…\" and pick a folder containing wwgl-plugin.json, or put the plugin in ~/.webwallgl/plugins and click \"Rescan\"" },
-          { zh: "权限：安装前会列出插件申请的能力；代码插件只能使用清单里申请且你已授予的能力，能改文档或工程文件的能力会单独提示", en: "Permissions: the capabilities a plugin requests are listed before install; code plugins can only use what they declare and you grant, and capabilities that can modify documents or project files are flagged" },
-          { zh: "管理：每个插件可启用 / 停用、重载、卸载；出错信息写进控制台", en: "Manage: enable / disable, reload or uninstall each plugin; errors are written to the console" },
-          { zh: "示例插件在仓库的 examples/plugins 目录（CRT 效果、萤火虫粒子、PLY 点云导入、严格导出检查）", en: "Example plugins live in examples/plugins in the repository (CRT effect, firefly particles, PLY point-cloud import, strict export lint)" },
-        ],
+        k: "p",
+        v: {
+          zh: "安装、权限、示例，以及怎么自己写数据插件 / 代码插件，见本页顶部切换到「插件」的完整说明（插件管理弹窗里的「插件说明」也会直达）。",
+          en: "For installing, permissions, examples and writing your own data / code plugins, switch to \"Plugins\" at the top of this page for the full guide (\"Plugin guide\" in the plugin manager goes there too).",
+        },
       },
     ],
   },
@@ -225,6 +225,7 @@ export const EDITOR_DOC: DocSection[] = [
           [{ zh: "⇧⌘Z / ⌘Y", en: "⇧⌘Z / ⌘Y" }, { zh: "重做", en: "Redo" }],
           [{ zh: "⌘S", en: "⌘S" }, { zh: "立刻保存到项目文件夹；从壁纸库打开的壁纸则另存为项目", en: "Save to the project folder now; for a wallpaper opened from the library, save it as a project" }],
           [{ zh: "⌘D", en: "⌘D" }, { zh: "复制选中图层", en: "Duplicate the selected layer" }],
+          [{ zh: "F2", en: "F2" }, { zh: "改名选中图层", en: "Rename the selected layer" }],
           [{ zh: "Delete / Backspace", en: "Delete / Backspace" }, { zh: "删除选中图层", en: "Delete the selected layer" }],
           [{ zh: "Alt + 点击", en: "Alt + click" }, { zh: "逐层切换选中", en: "Cycle selection through stacked layers" }],
           [{ zh: "⌘Enter", en: "⌘Enter" }, { zh: "应用正在编辑的脚本", en: "Apply the script being edited" }],

@@ -1,0 +1,13 @@
+{
+  "layerAlign.center": "居中",
+  "layerAlign.centerTitle": "把选中图层移到画面中心（⇧⌘K）",
+  "layerAlign.reset": "归位",
+  "layerAlign.resetTitle": "把选中图层的缩放 / 旋转归位（⇧⌘U）",
+  "layerAlign.centered": "「{name}」移到画面中心",
+  "layerAlign.resetDone": "「{name}」缩放 / 旋转归位",
+  "layerAlign.unchanged": "「{name}」已经在目标位置，没有改动",
+  "layerAlign.noSelection": "先在图层树或画面里选中一个图层",
+  "layerAlign.locked": "「{name}」已锁定，先解锁再操作",
+  "layerAlign.hasParent": "「{name}」挂在父图层下，坐标相对父层，居中只对顶层图层生效",
+  "layerAlign.noOrtho": "这个场景没有正交投影尺寸（可能是透视相机），无法计算画面中心"
+}

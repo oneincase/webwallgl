@@ -2,8 +2,9 @@
 //
 // 来源：
 //   store —— 浏览器里「安装」的插件，整包存 IndexedDB（StorageService，键 pkg:<id>）；
-//   dir   —— 插件目录（~/.webwallgl/plugins 等），经 dev 宿主 /api/plugins 读；桌面壳页面同样由它供给。
-// 同 id 两处都有时目录版优先（开发中的插件盖过已安装的旧版）。
+//   dir   —— 插件目录（~/.webwallgl/plugins 等），经 dev 宿主 /api/plugins 读；桌面壳页面同样由它供给；
+//   bundled —— 随应用打包的示例插件（examples/plugins），开箱即装，可停用不可卸载。
+// 同 id 多处都有时：目录 > 已安装 > 内置（开发中的插件盖过已安装的旧版，用户装的版本盖过自带示例）。
 // 目录来源带版本戳（目录内最新 mtime），watch() 轮询到戳变化就整包热重载。
 // 启用状态记在设置里（plugins.enabled.<id>，缺省启用）；停用 = 卸载 Scope，贡献随之全部撤回。
 
@@ -95,14 +96,16 @@ export function createPluginManager(o: ManagerOptions): PluginManager {
 
   const tag = (s: PluginSource, key: string) => `${s.kind}:${key}`;
 
-  /** 每个 id 的生效包：目录来源优先 */
+  const RANK: Record<PluginPackage["source"], number> = { dir: 3, store: 2, memory: 1, bundled: 0 };
+
+  /** 每个 id 的生效包：目录 > 已安装 > 内置 */
   function winners(): Map<string, Known> {
     const out = new Map<string, Known>();
     for (const k of known.values()) {
       if (!k.pkg) continue;
       const id = k.pkg.manifest.id;
       const cur = out.get(id);
-      if (!cur || (cur.source.kind !== "dir" && k.source.kind === "dir")) out.set(id, k);
+      if (!cur || RANK[k.source.kind] > RANK[cur.source.kind]) out.set(id, k);
     }
     return out;
   }
@@ -292,6 +295,39 @@ export function storeSource(storage: StorageService): PluginSource {
     },
     async remove(key) {
       await storage.delete(KEY + key);
+    },
+  };
+}
+
+/**
+ * 随应用打包的插件：文件表 key = "<任意前缀>/<插件目录>/<包内路径>"，值按需取文本。
+ * 「插件目录」由 root 之后的第一段决定；src/ 等开发文件应在传入前就排除。
+ */
+export function bundledSource(files: Record<string, () => Promise<string>>, root: string): PluginSource {
+  const enc = new TextEncoder();
+  const byDir = new Map<string, Array<[string, () => Promise<string>]>>();
+  const prefix = root.endsWith("/") ? root : `${root}/`;
+  for (const [p, get] of Object.entries(files)) {
+    if (!p.startsWith(prefix)) continue;
+    const rest = p.slice(prefix.length);
+    const i = rest.indexOf("/");
+    if (i <= 0) continue;
+    const dir = rest.slice(0, i);
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir)!.push([rest.slice(i + 1), get]);
+  }
+  return {
+    kind: "bundled",
+    async scan() {
+      return [...byDir.keys()].map((key) => ({ key, stamp: "bundled" }));
+    },
+    async load(key) {
+      const list = byDir.get(key);
+      if (!list) throw new Error(`内置插件 ${key} 不存在`);
+      const entries = await Promise.all(list.map(async ([path, get]) => ({ path, data: enc.encode(await get()) })));
+      const pkg = packageFromFiles(entries, "bundled");
+      pkg.dir = key;
+      return pkg;
     },
   };
 }

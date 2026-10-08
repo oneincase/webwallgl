@@ -1,9 +1,10 @@
 // 使用说明的数据模型与渲染器（工作台中栏「使用说明」标签页）。
-// 内容分两份：docs-library.ts（播放库）与 docs-editor.ts（编辑器），改文案只动对应文件。
+// 内容分三份：docs-library.ts（播放库）、docs-editor.ts（编辑器）与 docs-plugins.ts（插件），改文案只动对应文件。
 
 import type { Lang } from "./i18n";
 import { LIBRARY_DOC } from "./docs-library";
 import { EDITOR_DOC } from "./docs-editor";
+import { PLUGINS_DOC } from "./docs-plugins";
 
 export type Bi = { zh: string; en: string };
 export type DocBlock =
@@ -15,10 +16,10 @@ export type DocBlock =
 
 export type DocSection = { id: string; title: Bi; blocks: DocBlock[] };
 
-export type DocKind = "library" | "editor";
-export const DOC_KINDS: DocKind[] = ["library", "editor"];
+export type DocKind = "library" | "editor" | "plugins";
+export const DOC_KINDS: DocKind[] = ["library", "editor", "plugins"];
 
-const DOCS: Record<DocKind, DocSection[]> = { library: LIBRARY_DOC, editor: EDITOR_DOC };
+const DOCS: Record<DocKind, DocSection[]> = { library: LIBRARY_DOC, editor: EDITOR_DOC, plugins: PLUGINS_DOC };
 
 /** 把文档渲染进容器；语言切换时重新渲染 */
 export function renderDocs(body: HTMLElement, kind: DocKind, lang: Lang) {

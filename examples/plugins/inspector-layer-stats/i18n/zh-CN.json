@@ -1,0 +1,11 @@
+{
+  "layerStats.title": "图层统计",
+  "layerStats.kind": "类型",
+  "layerStats.descendants": "子图层（含嵌套）",
+  "layerStats.effects": "效果",
+  "layerStats.bound": "绑定用户属性的字段",
+  "layerStats.scripted": "挂了脚本的字段",
+  "layerStats.animated": "关键帧动画字段",
+  "layerStats.files": "引用的文件",
+  "layerStats.none": "无"
+}

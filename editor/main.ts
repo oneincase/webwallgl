@@ -78,7 +78,7 @@ import {
 } from "./effects";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
-import { createPluginManager, dirSource, storeSource } from "./plugins/manager";
+import { bundledSource, createPluginManager, dirSource, storeSource } from "./plugins/manager";
 import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
 import { textOf } from "./core";
 import { layerKindInfo } from "./layer-kinds";
@@ -1638,6 +1638,63 @@ function moveSelected(dir: -1 | 1) {
   );
 }
 
+/** 改图层名：可撤销；走结构编辑重挂，场景脚本里按名字取图层（getLayer）随之生效。返回是否改成 */
+function renameLayer(id: number | string, raw: string): boolean {
+  const n = doc ? findNode(doc.roots, id) : null;
+  if (!n) return false;
+  const name = raw.trim();
+  if (name === n.name) return false;
+  if (!name) {
+    log(et("log.renameEmpty"), "warn");
+    return false;
+  }
+  if (isLocked(id)) {
+    log(et("log.renameLocked", { name: nodeName(id) }), "warn");
+    return false;
+  }
+  return objEditOk(et("log.renamed", { from: nodeName(id), to: name }), id, (o) => {
+    o.name = name;
+    return true;
+  });
+}
+
+const canRename = (id: number | string) => !!editor && !!current?.assets && doc?.type === "scene" && !isLocked(id);
+
+/** 图层树里就地改名；行不在树上（父级折叠等）时改去聚焦检视器的名称框 */
+function beginRename(id: number | string) {
+  if (!canRename(id)) return;
+  const row = treeEl.querySelector<HTMLElement>(`.ed-node[data-id="${CSS.escape(String(id))}"]`);
+  const label = row?.querySelector<HTMLElement>(".ed-node-name");
+  if (!row || !label) {
+    const inp = inspectorEl.querySelector<HTMLInputElement>("input[data-field='name']");
+    inp?.focus();
+    inp?.select();
+    return;
+  }
+  const n = doc ? findNode(doc.roots, id) : null;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "ed-node-rename";
+  input.value = n?.name ?? "";
+  input.setAttribute("aria-label", et("f.name"));
+  let settled = false;
+  const finish = (save: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (!(save && renameLayer(id, input.value))) renderTree();
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+  for (const ev of ["click", "dblclick", "pointerdown"]) input.addEventListener(ev, (e) => e.stopPropagation());
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
 /** 一次完整的编辑（检视器 change / 眼睛开关）：读 before → 改 → 入栈 */
 function edit(id: number | string, patch: Patch) {
   const cur = editor?.getLayerProps(Number(id));
@@ -2216,7 +2273,7 @@ function syncLibraryItem() {
   renderSaveStatus();
 }
 
-// 使用说明：中栏标签；帮助按钮 / 赞赏按钮 / #docs=editor|library 直达
+// 使用说明：中栏标签；帮助按钮 / 赞赏按钮 / 插件弹窗 / #docs=editor|plugins|library 直达
 const DOC_KIND_KEY = "we-editor-docs-kind";
 const asDocKind = (v: string | null | undefined): DocKind | null => (DOC_KINDS.includes(v as DocKind) ? (v as DocKind) : null);
 let docKind: DocKind = asDocKind(localStorage.getItem(DOC_KIND_KEY)) ?? "editor";
@@ -3067,7 +3124,7 @@ let treeDragged = false;
 const DROP_CLASSES = ["drop-before", "drop-after", "drop-inside"];
 
 function startTreeDrag(e: PointerEvent, n: LayerNode, row: HTMLElement) {
-  if (e.button !== 0 || (e.target as HTMLElement).closest("button, .ed-twisty")) return;
+  if (e.button !== 0 || (e.target as HTMLElement).closest("button, input, .ed-twisty")) return;
   const x0 = e.clientX;
   const y0 = e.clientY;
   let active = false;
@@ -3212,6 +3269,13 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
   const name = document.createElement("span");
   name.className = "ed-node-name";
   name.textContent = n.name || `#${n.id}`;
+  if (canRename(n.id)) {
+    name.title = et("layer.renameHint");
+    name.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      beginRename(n.id);
+    });
+  }
   const id = document.createElement("span");
   id.className = "ed-node-id";
   id.textContent = n.name ? `#${n.id}` : "";
@@ -4231,6 +4295,25 @@ function editGroup(node: LayerNode): HTMLElement {
     l.textContent = et(key);
     form.appendChild(l);
   };
+  label("f.name");
+  const nameInp = document.createElement("input");
+  nameInp.type = "text";
+  nameInp.className = "span3";
+  nameInp.dataset.field = "name";
+  nameInp.value = node.name;
+  nameInp.placeholder = `#${id}`;
+  nameInp.disabled = !canRename(id);
+  nameInp.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") nameInp.blur();
+    else if (e.key === "Escape") {
+      nameInp.value = node.name;
+      nameInp.blur();
+    }
+  });
+  nameInp.addEventListener("change", () => {
+    if (!renameLayer(id, nameInp.value)) nameInp.value = node.name;
+  });
+  form.appendChild(nameInp);
   const vecRow = (key: string, field: "origin" | "scale" | "angles", scale = 1, step = "1") => {
     label(key);
     const inputs: HTMLInputElement[] = [];
@@ -5813,6 +5896,7 @@ const builtinUiPlugin = {
     cmd({ id: "edit.redo", keys: ["Mod+Shift+Z", "Mod+Y"], run: () => undoRedo("redo") });
     cmd({ id: "file.save", keys: "Mod+S", run: () => void saveDocument() });
     cmd({ id: "layer.duplicate", keys: "Mod+D", run: () => duplicateSelected() });
+    cmd({ id: "layer.rename", keys: "F2", when: () => selectedId !== null, run: (name) => (typeof name === "string" ? renameLayer(selectedId!, name) : beginRename(selectedId!)) });
     cmd({ id: "layer.delete", keys: ["Delete", "Backspace"], when: () => selectedId !== null, run: () => deleteSelected() });
     cmd({ id: "export.run", run: (id) => void runExport(String(id)) });
   },
@@ -5848,6 +5932,16 @@ async function bootPlugins() {
     { onError: (s, e, where) => reportPluginError(s.name, e, where) },
   );
   app.plugin(builtinUiPlugin);
+  const ui = app.ui;
+  const pluginToolsEl = $<HTMLElement>("#ed-plugin-tools");
+  const syncPluginTools = () => (pluginToolsEl.hidden = !ui.items("toolbar").length);
+  let unmountTools = ui.mount("toolbar", pluginToolsEl);
+  ui.onChange("toolbar", syncPluginTools);
+  onChangeLang(() => {
+    unmountTools();
+    unmountTools = ui.mount("toolbar", pluginToolsEl);
+  });
+  syncPluginTools();
   await app.root.kernel.settle();
   for (const u of app.load.unresolved) log(et("log.pluginError", { name: u.name, where: "inject", msg: u.missing.join(", ") }), "warn");
   effectCatalog.onChange(() => renderInspector());
@@ -5871,10 +5965,12 @@ async function bootPlugins() {
   await startExternalPlugins(app);
 }
 
-/** 外部插件：已安装（IndexedDB）+ 插件目录（dev 宿主在时），目录来源轮询热重载 */
+const EXAMPLE_PLUGIN_FILES = import.meta.glob<string>(["../examples/plugins/*/**", "!../examples/plugins/*/src/**"], { query: "?raw", import: "default" });
+
+/** 外部插件：内置示例 + 已安装（IndexedDB）+ 插件目录（dev 宿主在时），目录来源轮询热重载 */
 async function startExternalPlugins(a: EditorApp) {
   await hostProbe;
-  const sources = [storeSource(a.storage), ...(hostUp ? [dirSource()] : [])];
+  const sources = [bundledSource(EXAMPLE_PLUGIN_FILES, "../examples/plugins"), storeSource(a.storage), ...(hostUp ? [dirSource()] : [])];
   const m = createPluginManager({
     root: a.root,
     sources,
@@ -5900,6 +5996,10 @@ async function startExternalPlugins(a: EditorApp) {
   const inPluginEl = $<HTMLInputElement>("#in-plugin");
   $("#tb-plugins").onclick = () => panel.open();
   $("#plugins-close").onclick = () => $<HTMLDialogElement>("#plugins-dlg").close();
+  $("#plugins-docs").onclick = () => {
+    $<HTMLDialogElement>("#plugins-dlg").close();
+    showDocs("plugins");
+  };
   $("#plugins-refresh").onclick = () => void m.refresh().then(panel.render);
   $("#plugins-install").onclick = () => inPluginEl.click();
   inPluginEl.onchange = () => {

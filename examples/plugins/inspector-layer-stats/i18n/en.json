@@ -1,0 +1,11 @@
+{
+  "layerStats.title": "Layer stats",
+  "layerStats.kind": "Kind",
+  "layerStats.descendants": "Descendants",
+  "layerStats.effects": "Effects",
+  "layerStats.bound": "Fields bound to user properties",
+  "layerStats.scripted": "Scripted fields",
+  "layerStats.animated": "Keyframed fields",
+  "layerStats.files": "Referenced files",
+  "layerStats.none": "None"
+}

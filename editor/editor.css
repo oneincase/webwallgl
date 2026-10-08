@@ -281,6 +281,19 @@ html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
   text-overflow: ellipsis;
 }
 
+.ed-node-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  font: inherit;
+  color: var(--wb-fg);
+  background: var(--wb-input);
+  border: 1px solid var(--wb-accent);
+  border-radius: 3px;
+  outline: none;
+}
+
 .ed-node-id {
   color: var(--wb-fg-mute);
   font: 10px var(--mono);

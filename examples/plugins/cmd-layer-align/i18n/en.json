@@ -1,0 +1,13 @@
+{
+  "layerAlign.center": "Center",
+  "layerAlign.centerTitle": "Move the selected layer to the center of the scene (⇧⌘K)",
+  "layerAlign.reset": "Reset",
+  "layerAlign.resetTitle": "Reset the selected layer's scale / rotation (⇧⌘U)",
+  "layerAlign.centered": "Moved “{name}” to the center",
+  "layerAlign.resetDone": "Reset scale / rotation of “{name}”",
+  "layerAlign.unchanged": "“{name}” is already there; nothing changed",
+  "layerAlign.noSelection": "Select a layer in the tree or on the canvas first",
+  "layerAlign.locked": "“{name}” is locked; unlock it first",
+  "layerAlign.hasParent": "“{name}” has a parent layer, so its position is relative to it; centering only applies to top-level layers",
+  "layerAlign.noOrtho": "This scene has no orthographic size (perhaps a perspective camera), so its center can't be computed"
+}

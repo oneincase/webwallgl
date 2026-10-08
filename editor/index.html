@@ -126,6 +126,7 @@
       </div>
 
       <span class="wb-spacer"></span>
+      <div class="wb-tb-group" id="ed-plugin-tools" hidden></div>
       <div class="wb-tb-group">
         <button type="button" class="ed-btn" id="tb-export" disabled data-et-title="tb.exportTitle">
           <svg class="i" viewBox="0 0 16 16"><path d="M2.5 3h11v10h-11z M2.5 10.5l3-3 2.5 2.5 2-2 3 3 M10.5 5.8h.01" /></svg>
@@ -333,6 +334,7 @@
           <section id="docs-view" class="wb-panel-body is-scroll" data-pane="docs">
             <div id="docs-switch" class="seg" role="radiogroup">
               <button type="button" class="seg-btn" data-doc="editor" role="radio" data-i18n="docs.editorShort">编辑器</button>
+              <button type="button" class="seg-btn" data-doc="plugins" role="radio" data-i18n="docs.pluginsShort">插件</button>
               <button type="button" class="seg-btn" data-doc="library" role="radio" data-i18n="docs.libraryShort">播放库</button>
             </div>
             <div id="docs-body"></div>
@@ -506,6 +508,7 @@
       <p class="ed-dialog-body" data-et="pl.body">插件可以添加效果、粒子模板、shader 片段、导入格式、导出目标和检视器面板。代码插件只能使用它在清单里申请、且你已授予的能力。</p>
       <div id="plugins-list" class="ed-plugins-list"></div>
       <div class="ed-dialog-actions">
+        <button type="button" class="ed-btn" id="plugins-docs" data-et="pl.docs">插件说明</button>
         <button type="button" class="ed-btn" id="plugins-open-dir" data-et="pl.openDir" hidden>打开插件目录</button>
         <button type="button" class="ed-btn" id="plugins-refresh" data-et="pl.refresh">重新扫描</button>
         <button type="button" class="ed-btn" id="plugins-install" data-et="pl.install">安装插件文件夹…</button>

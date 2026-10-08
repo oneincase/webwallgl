@@ -3,6 +3,7 @@
 // 测试台的 setLang 会用它自己的词典刷一遍所有 data-i18n，查不到的键会被刷成键名本身。
 
 import { getLang, onChangeLang } from "../bench/i18n";
+import { baseLang } from "./core/schema";
 
 const DICT: Record<"zh" | "en", Record<string, string>> = {
   zh: {
@@ -217,6 +218,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.refresh": "重新扫描",
     "pl.install": "安装插件文件夹…",
     "pl.close": "完成",
+    "pl.docs": "插件说明",
     "pl.enable": "启用",
     "pl.disable": "停用",
     "pl.reload": "重载",
@@ -228,6 +230,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.installHigh": "⚠ 其中 {list} 能修改文档或工程文件，只安装你信任的插件。",
     "pl.src.store": "已安装",
     "pl.src.dir": "插件目录",
+    "pl.src.bundled": "内置示例",
     "pl.src.memory": "临时",
     "pl.status.active": "运行中",
     "pl.status.loading": "加载中",
@@ -440,6 +443,10 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "log.placeMissing": "找不到图层 {name}",
     "log.deleted": "已删除：{name}",
     "log.duplicated": "已复制：{name}",
+    "log.renamed": "已改名：{from} → {to}",
+    "log.renameEmpty": "图层名称不能为空",
+    "log.renameLocked": "{name} 已锁定，先解锁再改名",
+    "layer.renameHint": "双击或按 F2 改名",
     "log.movedUp": "已前移：{name}",
     "log.movedDown": "已后移：{name}",
     "log.structUnavailable": "当前来源不支持结构编辑（非场景壁纸或取不到场景资源）",
@@ -833,6 +840,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.refresh": "Rescan",
     "pl.install": "Install plugin folder…",
     "pl.close": "Done",
+    "pl.docs": "Plugin guide",
     "pl.enable": "Enable",
     "pl.disable": "Disable",
     "pl.reload": "Reload",
@@ -844,6 +852,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.installHigh": "⚠ {list} can modify the document or project files. Only install plugins you trust.",
     "pl.src.store": "Installed",
     "pl.src.dir": "Plugin folder",
+    "pl.src.bundled": "Bundled example",
     "pl.src.memory": "Temporary",
     "pl.status.active": "Running",
     "pl.status.loading": "Loading",
@@ -1056,6 +1065,10 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "log.placeMissing": "Layer {name} not found",
     "log.deleted": "Deleted: {name}",
     "log.duplicated": "Duplicated: {name}",
+    "log.renamed": "Renamed: {from} → {to}",
+    "log.renameEmpty": "Layer name can't be empty",
+    "log.renameLocked": "{name} is locked — unlock it before renaming",
+    "layer.renameHint": "Double-click or press F2 to rename",
     "log.movedUp": "Moved back: {name}",
     "log.movedDown": "Moved forward: {name}",
     "log.structUnavailable": "This source does not support structural edits (not a scene wallpaper, or scene assets are unavailable)",
@@ -1243,7 +1256,7 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
 const EXTRA: Array<{ lang: string; dict: Record<string, string> }> = [];
 
 export function extendDict(lang: string, dict: Record<string, string>): () => void {
-  const layer = { lang, dict };
+  const layer = { lang: baseLang(lang), dict };
   EXTRA.unshift(layer);
   return () => {
     const i = EXTRA.indexOf(layer);

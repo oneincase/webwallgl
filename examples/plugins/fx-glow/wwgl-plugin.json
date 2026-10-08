@@ -1,0 +1,14 @@
+{
+  "id": "fx-glow",
+  "name": { "zh-CN": "柔光辉光", "en": "Soft glow" },
+  "version": "1.0.0",
+  "engine": "^1.0",
+  "description": {
+    "zh-CN": "数据插件示例：多 pass + FBO 效果。提取高光 → 半分辨率模糊 → 叠回原图；参数分属不同 pass，效果分类名由插件词条提供。",
+    "en": "Data plugin example: a multi-pass effect with FBOs. Extract highlights → blur at half resolution → add back onto the original; parameters belong to different passes, and the effect category name comes from the plugin's strings."
+  },
+  "contributes": {
+    "effects": ["effects/glow.json"],
+    "i18n": { "zh-CN": "i18n/zh-CN.json", "en": "i18n/en.json" }
+  }
+}

@@ -102,11 +102,19 @@ export function resolveConfig(schema: Schema, raw: unknown): Record<string, unkn
 
 export const configOf = (schema: Schema) => (raw: unknown) => resolveConfig(schema, raw);
 
-/** 本地化取文案：{ zh, en } 表按语言取，缺了回落另一种 / key */
+/** 语言码只比主语言：zh-CN / zh-Hans / zh_CN 都算 zh */
+export const baseLang = (lang: string) => lang.split(/[-_]/)[0].toLowerCase();
+
+/** 本地化取文案：{ zh, en } 表按语言取（插件清单常写 zh-CN，按主语言匹配），缺了回落 en / zh / 第一项 */
 export function textOf(v: string | Record<string, string> | undefined, lang: string, fallback: string): string {
   if (!v) return fallback;
   if (typeof v === "string") return v;
-  return v[lang] ?? v.en ?? v.zh ?? Object.values(v)[0] ?? fallback;
+  const pick = (l: string) => {
+    if (v[l] !== undefined) return v[l];
+    const k = Object.keys(v).find((x) => baseLang(x) === baseLang(l));
+    return k === undefined ? undefined : v[k];
+  };
+  return pick(lang) ?? pick("en") ?? pick("zh") ?? Object.values(v)[0] ?? fallback;
 }
 
 const FIELD_TYPES: readonly FieldType[] = ["float", "int", "bool", "color", "vec2", "vec3", "vec4", "enum", "string", "texture"];

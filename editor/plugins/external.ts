@@ -73,8 +73,8 @@ export const GRANTABLE: Record<string, "low" | "high"> = {
 export type PluginPackage = {
   manifest: PluginManifest;
   files: Map<string, Uint8Array>;
-  /** 来源：store = 浏览器里安装（IndexedDB）；dir = 插件目录（dev 宿主 / 桌面壳）；memory = 测试 / 临时 */
-  source: "store" | "dir" | "memory";
+  /** 来源：store = 浏览器里安装（IndexedDB）；dir = 插件目录（dev 宿主 / 桌面壳）；bundled = 随应用自带的示例；memory = 测试 / 临时 */
+  source: "store" | "dir" | "bundled" | "memory";
   /** 来源侧的版本戳（目录 mtime 等），变了就热重载 */
   stamp?: string;
   /** 目录来源的目录名 */

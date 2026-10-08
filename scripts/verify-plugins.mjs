@@ -8,7 +8,7 @@
  *      坏粒子模板（WE 不认的组件）整包失败且之前登记的效果一并撤回；
  *   C. 代码插件：授权内服务可用；inject 未授权服务 → pending 并报 missing；ctx.get 未授权服务 → failed；
  *      apply 抛错 → failed 带错误文本；私有设置 / 存储按插件 id 隔离；
- *   D. 来源：目录来源盖过同 id 的已安装版；版本戳变化热重载（watch 轮询）；卸载；
+ *   D. 来源：目录 > 已安装 > 内置示例的优先级与回落；内置示例缺省启用、可停用不可卸载；版本戳变化热重载（watch 轮询）；卸载；
  *   E. dev 宿主插件目录：清单列举、版本戳、越界 / 点文件拒绝；
  *   F. 示例插件（examples/plugins/*）全部能装上且 active；木偶生成器产物经 irToGltf → gltfToModel 往返；
  *   G. 变异红测：把权限门控 / 启用判断 / 整包原子性改坏，确认对应判据变红。
@@ -25,6 +25,7 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "verify-plugins-"));
 process.on("exit", () => fs.rmSync(tmpRoot, { recursive: true, force: true }));
 const json = (v) => JSON.stringify(v);
 const enc = new TextEncoder();
+const dec = new TextDecoder();
 
 const ENTRY = `
 export * as app from "./editor/app.ts";
@@ -41,6 +42,7 @@ export * as modelIr from "./editor/model-ir.ts";
 export * as gltf from "./editor/gltf.ts";
 export * as modelImport from "./editor/model-import.ts";
 export * as pipeline from "./editor/export-pipeline.ts";
+export * as core from "./editor/core/index.ts";
 `;
 
 async function bundle(entry, platform, overrides = {}) {
@@ -116,12 +118,12 @@ const stubHost = () => ({
   engine: { controls: () => null, remount() {} },
 });
 
-async function bootWith(M, sources) {
+async function bootWith(M, sources, host = {}) {
   const kv = new Map();
   const settings = M.settings.createSettings("t.", { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v), removeItem: (k) => kv.delete(k) });
   const storage = M.settings.memoryStorage();
   const errors = [];
-  const a = await M.app.bootEditor({ ...stubHost(), settings, storage }, { onError: (s, e, w) => errors.push(`${s.name}/${w}: ${e?.message ?? e}`) });
+  const a = await M.app.bootEditor({ ...stubHost(), ...host, settings, storage }, { onError: (s, e, w) => errors.push(`${s.name}/${w}: ${e?.message ?? e}`) });
   const srcs = sources.map((s) => ({ ...s, load: (k) => s.load(k, M) }));
   const m = M.mgr.createPluginManager({ root: a.root, sources: srcs, settings, deps: { importModule: dataImporter, settings, storage } });
   return { a, m, settings, storage, errors, kv };
@@ -276,6 +278,27 @@ async function suite(M) {
     check(m.list().find((e) => e.id === "dup")?.status === "active" && m.list().length === 1 && t() === "store", `目录版移走：回落到已安装版（${t()}）`);
     m.dispose();
   }
+  {
+    const files = (v) => ({
+      "../ex/dup/wwgl-plugin.json": async () => manifest({ id: "dup", contributes: { i18n: { en: "en.json" } } }),
+      "../ex/dup/en.json": async () => json({ "dup.v": v }),
+      "../ex/solo/wwgl-plugin.json": async () => manifest({ id: "solo" }),
+      "../other/x/wwgl-plugin.json": async () => manifest({ id: "stray" }),
+    });
+    const store = new Map([["dup", { stamp: "1", files: { "wwgl-plugin.json": manifest({ id: "dup", contributes: { i18n: { en: "en.json" } } }), "en.json": json({ "dup.v": "store" }) } }]]);
+    const { m, settings } = await bootWith(M, [M.mgr.bundledSource(files("bundled"), "../ex"), memSource("store", store)]);
+    await m.refresh();
+    const t = () => M.i18n.et("dup.v");
+    const solo = m.list().find((e) => e.id === "solo");
+    check(solo?.source === "bundled" && solo.status === "active" && solo.enabled && !solo.removable && !m.list().some((e) => e.id === "stray"),
+      `内置示例：缺省启用、不可卸载，只收 root 下的目录（${solo?.status}）`);
+    check(t() === "store" && m.list().find((e) => e.id === "dup" && e.source === "bundled")?.status === "disabled", `同 id：已安装版盖过内置示例（${t()}）`);
+    await m.uninstall("dup");
+    check(t() === "bundled" && m.list().find((e) => e.id === "dup")?.source === "bundled", `卸载已安装版：回落到内置示例（${t()}）`);
+    await m.setEnabled("solo", false);
+    check(m.list().find((e) => e.id === "solo")?.status === "disabled" && settings.get("plugins.enabled.solo", true) === false, "内置示例可停用");
+    m.dispose();
+  }
   return res;
 }
 
@@ -317,19 +340,87 @@ async function examplesSuite(M) {
   check(dirs.length >= 4, `examples/plugins 至少 4 个示例（${dirs.join(", ")}）`);
   const walk = (d, base = d) =>
     fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name), base) : [{ path: path.relative(base, path.join(d, e.name)).split(path.sep).join("/"), data: new Uint8Array(fs.readFileSync(path.join(d, e.name))) }]));
-  const map = new Map(dirs.map((d) => [d, { stamp: "1", raw: walk(path.join(exRoot, d)) }]));
-  const src = {
-    kind: "dir",
-    async scan() {
-      return [...map.keys()].map((key) => ({ key, stamp: "1" }));
+  // 与 editor/main.ts 的 import.meta.glob 同形：键 = "../examples/plugins/<目录>/<路径>"，排除 src/
+  const globbed = {};
+  for (const d of dirs) {
+    for (const f of walk(path.join(exRoot, d))) {
+      if (f.path.startsWith("src/")) continue;
+      globbed[`../examples/plugins/${d}/${f.path}`] = async () => dec.decode(f.data);
+    }
+  }
+  const src = M.mgr.bundledSource(globbed, "../examples/plugins");
+  // cmd-layer-align 要真改文档：给一个最小的 doc 服务（1920×1080 正交场景 + 一个选中的图层）
+  const layerObj = { id: 7, name: "logo", origin: { value: "100.000 200.000 3.000", user: "pos" }, scale: "2.000 2.000 1.000", angles: "0.000 0.000 45.000" };
+  const sceneDoc = { title: "t", type: "scene", scene: { general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: [layerObj] }, roots: [] };
+  const edits = [];
+  const logs = [];
+  const docHost = {
+    ...stubHost().doc,
+    current: () => sceneDoc,
+    selection: () => ({ id: 7, name: "logo", kind: "image", visible: true, obj: layerObj, children: [] }),
+    editObject: (label, id, mutate) => {
+      const ok = mutate(layerObj);
+      if (ok) edits.push(label);
+      return ok;
     },
-    async load(key, MM) {
-      return MM.ext.packageFromFiles(map.get(key).raw, "dir");
-    },
+    log: (msg, level = "info") => logs.push(`${level}:${msg}`),
   };
-  const { m } = await bootWith(M, [src]);
+  const { a, m } = await bootWith(M, [src], { doc: docHost });
   await m.refresh();
   for (const e of m.list()) check(e.status === "active", `示例 ${e.key}：active（${e.status}${e.error ? ` ${e.error}` : ""}${e.missing.length ? ` 缺 ${e.missing}` : ""}）`);
+  check(dirs.length >= 7 && ["fx-glow", "inspector-layer-stats", "cmd-layer-align"].every((d) => dirs.includes(d)), `新增示例都在（${dirs.join(", ")}）`);
+  check(M.core.textOf({ "zh-CN": "中文", en: "English" }, "zh", "x") === "中文" && M.core.textOf({ "zh-CN": "中文", en: "English" }, "en", "x") === "English",
+    "清单里的 zh-CN 文案在中文界面按主语言匹配（不再回退成英文）");
+
+  // fx-glow：三个 pass、两个 FBO，参数按 pass 分到各自的 uniform 与常量里
+  const glow = M.fx.effectCatalog.get("softglow");
+  const gFiles = glow ? M.fx.effectFiles(glow) : [];
+  const gText = (re) => new TextDecoder().decode(gFiles.find((f) => re.test(f.name))?.data ?? new Uint8Array());
+  const gEffect = JSON.parse(gText(/effect\.json$/) || "{}");
+  check(gEffect.passes?.length === 3 && json(gEffect.fbos?.map((f) => f.name)) === json(["glow_bright", "glow_blur"]) &&
+    gEffect.passes[0].target === "glow_bright" && gEffect.passes[1].target === "glow_blur" && !gEffect.passes[2].target &&
+    json(gEffect.passes[1].bind) === json([{ name: "glow_bright", index: 0 }]) && json(gEffect.passes[2].bind) === json([{ name: "glow_blur", index: 1 }]),
+    `fx-glow：effect.json 有 3 个 pass、2 个 FBO，target / bind 串成「提亮 → 模糊 → 叠加」（${json(gEffect.passes)}）`);
+  const p0 = gText(/wwgl_fx_glow_softglow\.frag$/);
+  const p2 = gText(/wwgl_fx_glow_softglow_p2\.frag$/);
+  check(/g_FxThreshold/.test(p0) && !/g_FxIntensity/.test(p0) && /uniform sampler2D g_Texture1;/.test(p2) && /uniform float g_FxIntensity;/.test(p2) && /uniform vec3 g_FxTint;/.test(p2),
+    "fx-glow：阈值只进第 1 个 pass，强度 / 光色只进最后一个 pass，叠加 pass 声明了第二张输入");
+  const glowObj = {};
+  M.fx.addEffect(glowObj, "softglow");
+  const consts = glowObj.effects?.[0]?.passes?.map((p) => Object.keys(p.constantshadervalues));
+  check(json(consts) === json([["threshold"], ["radius"], ["intensity", "tint"]]), `fx-glow：加到图层后每个 pass 的常量各归各位（${json(consts)}）`);
+  check(M.i18n.hasText("fxcat.light"), "fx-glow：插件词条提供了效果分类名 fxcat.light");
+
+  // inspector-layer-stats：新标签 + 分组；统计函数数得对
+  const statsGroup = M.inspector.inspectorGroups.get("layer-stats");
+  check(!!M.inspector.inspectorTabs.get("stats") && statsGroup?.tab === "stats" && M.inspector.tabOf(statsGroup) === "stats", "inspector-layer-stats：登记「统计」标签，分组落在这个标签里");
+  const LS = await import(pathToFileURL(path.join(exRoot, "inspector-layer-stats/index.js")).href);
+  const st = LS.layerStats(
+    {
+      image: "models/logo.json",
+      alpha: { value: 1, user: "opacity" },
+      origin: { value: "0 0 0", script: "export function update(v) { return v; }" },
+      scale: { value: "1 1 1", animation: { c0: [] } },
+      effects: [{ name: "blur", file: "effects/wwgl_blur/effect.json", passes: [{ constantshadervalues: { radius: { value: 2, user: "r" } } }] }],
+    },
+    [{ children: [{ children: [] }] }],
+  );
+  check(st.descendants === 2 && st.bound === 2 && st.scripted === 1 && st.animated === 1 && json(st.effects) === json(["blur"]) &&
+    json(st.files) === json(["effects/wwgl_blur/effect.json", "models/logo.json"]),
+    `inspector-layer-stats：子图层 / 绑定 / 脚本 / 关键帧 / 效果 / 引用文件计数正确（${json(st)}）`);
+
+  // cmd-layer-align：两条带快捷键的命令 + 两个工具条按钮；执行后经 doc.editObject 改文档（包装字段只改 value）
+  const center = a.commands.registry.get("layerAlign.center");
+  check(center?.keys === "Mod+Shift+K" && a.commands.registry.get("layerAlign.reset")?.keys === "Mod+Shift+U" &&
+    json(a.ui.items("toolbar").map((x) => x.id)) === json(["layer-align-center", "layer-align-reset"]),
+    "cmd-layer-align：登记 ⇧⌘K / ⇧⌘U 两条命令和两个工具条按钮");
+  check(a.commands.handleKey({ key: "K", metaKey: true, shiftKey: true, ctrlKey: false, altKey: false }) &&
+    layerObj.origin.value === "960.000 540.000 3.000" && layerObj.origin.user === "pos",
+    `cmd-layer-align：⇧⌘K 把图层移到画面中心，z 不动、属性绑定保留（${json(layerObj.origin)}）`);
+  a.commands.exec("layerAlign.reset");
+  check(layerObj.scale === "1.000 1.000 1.000" && layerObj.angles === "0.000 0.000 0.000" && edits.length === 2, `cmd-layer-align：归位命令重置缩放 / 旋转，每条命令一次可撤销编辑（${json(edits)}）`);
+  a.commands.exec("layerAlign.center");
+  check(edits.length === 2 && logs.some((l) => /^info:/.test(l)), `cmd-layer-align：已经居中时不产生空编辑，只在控制台说明（${json(logs)}）`);
 
   // fx-crt：body + declarations 由 defineEffect 补头部与参数 uniform，插件片段内联
   const crt = M.fx.effectCatalog.get("crt");
@@ -352,6 +443,15 @@ async function examplesSuite(M) {
   check(json(diags.map((d) => `${d.level}:${d.code}`)) === json(["error:unsafe-name", "warn:no-preview"]), `export-lint-strict：不安全文件名 error、缺封面 warn（${json(diags)}）`);
   m.dispose();
   check(!M.pipeline.exportRules.get("lint-strict") && !M.fx.effectCatalog.get("crt") && M.modelImport.importerFor("c.ply", cloud)?.id === "ply", "示例全部卸载后贡献撤回（点云 PLY 回落到内置导入器）");
+  const left = Object.entries({
+    effect: !!M.fx.effectCatalog.get("softglow"),
+    tab: !!M.inspector.inspectorTabs.get("stats"),
+    group: !!M.inspector.inspectorGroups.get("layer-stats"),
+    command: !!a.commands.registry.get("layerAlign.center"),
+    toolbar: a.ui.items("toolbar").length > 0,
+    i18n: M.i18n.hasText("fxcat.light"),
+  }).filter(([, v]) => v).map(([k]) => k);
+  check(!left.length, `新示例卸载后效果 / 标签 / 分组 / 命令 / 工具条按钮 / 词条全部撤回（残留 ${json(left)}）`);
 
   // 构建：示例 index.js 与 src 重建一致；运行时 import 编辑器真源被拒
   const B = await import(pathToFileURL(path.join(ROOT, "scripts/build-plugin-sdk.mjs")).href);
@@ -419,7 +519,8 @@ const mutants = [
   { name: "去掉代码插件白名单", file: EXT, from: "{ allow: grantedOf(m), meta", to: "{ allow: null, meta", expect: /未授权服务/ },
   { name: "启用开关失效", file: MGR, from: "o.settings.get<boolean>(enabledKey(id), true) !== false", to: "true", expect: /停用/ },
   { name: "未知 contributes 不报错", file: EXT, from: "if (!known.has(k)) errors.push", to: "if (false) errors.push", expect: /坏清单/ },
-  { name: "目录来源不再优先", file: MGR, from: `(cur.source.kind !== "dir" && k.source.kind === "dir")`, to: "false", expect: /目录版/ },
+  { name: "目录来源不再优先", file: MGR, from: "RANK[k.source.kind] > RANK[cur.source.kind]", to: "false", expect: /目录版/ },
+  { name: "内置示例盖过已安装版", file: MGR, from: "dir: 3, store: 2, memory: 1, bundled: 0", to: "dir: 3, store: 2, memory: 1, bundled: 9", expect: /内置/ },
 ];
 let killed = 0;
 console.log("\nG 变异红测");

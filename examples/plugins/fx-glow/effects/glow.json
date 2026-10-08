@@ -1,0 +1,29 @@
+{
+  "id": "softglow",
+  "title": { "zh-CN": "柔光辉光", "en": "Soft glow" },
+  "category": "light",
+  "params": [
+    { "key": "threshold", "type": "float", "default": 0.6, "min": 0, "max": 1, "step": 0.01, "pass": 0, "label": { "zh-CN": "高光阈值", "en": "Threshold" } },
+    { "key": "radius", "type": "float", "default": 2, "min": 0, "max": 6, "step": 0.1, "pass": 1, "label": { "zh-CN": "扩散半径", "en": "Radius" } },
+    { "key": "intensity", "type": "float", "default": 1.2, "min": 0, "max": 4, "step": 0.05, "pass": 2, "label": { "zh-CN": "强度", "en": "Intensity" } },
+    { "key": "tint", "type": "color", "default": [1, 0.92, 0.8], "pass": 2, "label": { "zh-CN": "光色", "en": "Tint" } }
+  ],
+  "fbos": [
+    { "name": "glow_bright", "scale": 2 },
+    { "name": "glow_blur", "scale": 2 }
+  ],
+  "passes": [
+    { "target": "glow_bright", "body": "effects/bright.body.glsl" },
+    {
+      "target": "glow_blur",
+      "bind": [{ "name": "glow_bright", "index": 0 }],
+      "declarations": "uniform vec4 g_Texture0Resolution;\n",
+      "body": "effects/blur.body.glsl"
+    },
+    {
+      "bind": [{ "name": "glow_blur", "index": 1 }],
+      "declarations": "uniform sampler2D g_Texture1; // {\"hidden\":true}\n",
+      "body": "effects/combine.body.glsl"
+    }
+  ]
+}
