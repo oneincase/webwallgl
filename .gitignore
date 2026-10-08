@@ -7,6 +7,9 @@
 # Node / 前端
 node_modules/
 dist/
+# 应用组装目录（scripts/build-app.mjs）与桌面安装包（electron-builder）
+app/
+release/
 *.local
 *.log
 *.tsbuildinfo

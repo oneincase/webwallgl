@@ -42,3 +42,31 @@ jobs:
       - run: node scripts/publish-npm.mjs --ci
         env:
           npm_config_provenance: true # npmjs 上带「已验证来源」标记
+
+  # 桌面应用包 webwallgl-app（npx webwallgl-app）。与库包分开 job：它失败不影响库包发布。
+  # 可信发布需在 npmjs 的 webwallgl-app 包设置里同样登记本仓库 + publish.yml；
+  # npm 只允许给已存在的包登记，所以首个版本要先在本机 `pnpm run publish:app` 手动发一次。
+  publish-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org/
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - name: 标签与 package.json 版本一致性
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if [ "$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 package.json 版本 $v 不一致"
+            exit 1
+          fi
+      - run: pnpm run build
+      - run: node scripts/build-app.mjs --npm
+      - run: node scripts/publish-app.mjs --ci
+        env:
+          npm_config_provenance: true

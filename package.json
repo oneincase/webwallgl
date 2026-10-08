@@ -18,6 +18,10 @@
     "dev": "vite",
     "desktop": "node scripts/desktop.mjs",
     "build": "tsc --noEmit && vite build",
+    "build:app": "npm run build && node scripts/build-app.mjs",
+    "start:app": "node app/cli.mjs",
+    "dist:desktop": "npm run build:app && electron-builder",
+    "publish:app": "npm run build && node scripts/build-app.mjs --npm && node scripts/publish-app.mjs",
     "build:lib": "node scripts/build-lib.mjs && tsc -p tsconfig.lib-types.json && node scripts/assemble-lib.mjs",
     "gen:icons": "node scripts/gen-icons.mjs",
     "publish:npm": "npm run build:lib && node scripts/publish-npm.mjs",
@@ -68,6 +72,7 @@
   "devDependencies": {
     "@types/node": "^26.4.0",
     "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "typescript": "^5.8.2",
     "vite": "^6.4.3"

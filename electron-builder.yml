@@ -1,0 +1,54 @@
+# 桌面安装包：输入是 scripts/build-app.mjs 组装的 app/（pnpm run build:app），产物在 release/。
+# CI 见 .github/workflows/desktop.yml；本机打当前平台：pnpm run dist:desktop
+appId: io.github.oneincase.webwallgl
+productName: WebWallGL
+copyright: Copyright © oneincase
+directories:
+  app: app
+  output: release
+# electron 版本取自根 package.json 的 devDependencies
+files:
+  - "**/*"
+  - "!cli.mjs"
+asar: true
+artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+icon: public/icons/pwa-512.png
+publish: null
+
+mac:
+  category: public.app-category.graphics-design
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  # 不签名 / 不公证：用户首次打开需右键「打开」（或 xattr -dr com.apple.quarantine）。
+  # 有 Apple 开发者证书后删掉这行，CI 配 CSC_LINK / CSC_KEY_PASSWORD 即自动签名
+  identity: null
+  hardenedRuntime: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: "${productName}-${version}-win-${arch}-setup.${ext}"
+
+portable:
+  artifactName: "${productName}-${version}-win-${arch}-portable.${ext}"
+
+linux:
+  category: Graphics
+  maintainer: "oneincase <462534624@qq.com>"
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+    - target: tar.gz
+      arch: [x64]

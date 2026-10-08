@@ -10,7 +10,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SHIM_PATH = join(here, "..", "renderer", "src", "web-shim.js");
+// 打包后的应用（scripts/build-app.mjs）里 shim 拷在服务器旁边，经 WWGL_WEB_SHIM 指定
+const shimPath = () => process.env.WWGL_WEB_SHIM || join(here, "..", "renderer", "src", "web-shim.js");
 const SHIM_ATTR = "data-we-shim-src";
 const SHIM_MARK = 'data-we-shim="1"';
 
@@ -18,7 +19,7 @@ let cachedShim = null;
 
 export function loadWebShimSource() {
   // 每次读盘：shim 热改后 /web/ HTML 立刻生效（缓存曾导致 2905017768 黑屏修了仍黑）
-  cachedShim = readFileSync(SHIM_PATH, "utf8");
+  cachedShim = readFileSync(shimPath(), "utf8");
   return cachedShim;
 }
 

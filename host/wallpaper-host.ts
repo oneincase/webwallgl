@@ -42,7 +42,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import type { Connect, Plugin, ViteDevServer } from "vite";
+import type { Connect, Plugin, PreviewServer, ViteDevServer } from "vite";
 import { describe, overrideProps, readOverrides, writeOverrides } from "./we-props";
 import { listPluginDirs, readPluginFile } from "./plugin-dirs";
 import { injectWebShim, isHtmlPath } from "./we-web-html.mjs";
@@ -559,7 +559,21 @@ async function scanLibrary(dir: string) {
   return { dir, items };
 }
 
-export function wallpaperHost(): Plugin {
+export type FolderPicker = (defaultDir: string, prompt: string) => Promise<string | null>;
+
+export type HostOptions = {
+  logger?: { info(msg: string): void };
+  /** 系统选文件夹；缺省 macOS 走 osascript，其他平台视为不支持（前端回退手输）。Electron 壳注入 dialog 版。 */
+  pickFolder?: FolderPicker;
+};
+
+type HostHandler = (req: Connect.IncomingMessage, res: any, next: () => void) => Promise<void>;
+
+/** 宿主端点的 connect 风格处理器：Vite dev / preview 与独立生产服务器（server/serve.ts）共用 */
+export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
+  const logger = opts.logger ?? { info: (msg: string) => console.log(msg) };
+  const pickFolder: FolderPicker | null =
+    opts.pickFolder ?? (process.platform === "darwin" ? pickFolderNative : null);
   let lib = libraryDir();
   /** 已连接的测试台 SSE 客户端（用于把 /diag 上报回显到页面日志区） */
   const diagClients = new Set<any>();
@@ -576,578 +590,584 @@ export function wallpaperHost(): Plugin {
       }
     }
   });
-  return {
-    name: "we-scene-renderer:wallpaper-host",
-    configureServer(server: ViteDevServer) {
-      server.config.logger.info(`[host] 壁纸库目录：${lib}`);
-      void startLiveSystemService().then(({ backend }) => {
-        if (backend === "media-bridge") {
-          server.config.logger.info(
-            `[host] 系统实况：media-bridge（系统级 Now Playing + 系统输出频谱）`,
-          );
-        } else {
-          server.config.logger.info(
-            `[host] 系统实况：未找到 media-bridge（构建 ../media-bridge 或设 MEDIA_BRIDGE_BIN）；端点返回空快照`,
-          );
+  logger.info(`[host] 壁纸库目录：${lib}`);
+  void startLiveSystemService().then(({ backend }) => {
+    if (backend === "media-bridge") {
+      logger.info(`[host] 系统实况：media-bridge（系统级 Now Playing + 系统输出频谱）`);
+    } else {
+      logger.info(
+        `[host] 系统实况：未找到 media-bridge（构建 ../media-bridge 或设 MEDIA_BRIDGE_BIN）；端点返回空快照`,
+      );
+    }
+  });
+
+  return async (req, res, next) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const path = decodeURIComponent(url.pathname);
+
+    // --- 渲染器诊断上报（对齐 content_server.rs 的 /diag）---
+    // lvl= 是**发送端声明**的级别（issue #13）：渲染器把级别随请求一起发出来，
+    // 宿主/嵌入方不必再对文案做关键字匹配。老渲染器没有这一位，退回不带级别的旧行为。
+    if (path === "/diag") {
+      const msg = url.searchParams.get("msg") ?? "";
+      const raw = url.searchParams.get("lvl") ?? "";
+      const level = raw === "error" || raw === "warn" || raw === "info" ? raw : undefined;
+      const color = level === "error" ? "\x1b[31m" : level === "warn" ? "\x1b[33m" : "\x1b[36m";
+      logger.info(`${color}[renderer diag${level ? ` ${level}` : ""}]\x1b[0m ${msg}`);
+      const line = `data: ${JSON.stringify({ t: Date.now(), msg, ...(level ? { level } : {}) })}\n\n`;
+      for (const c of diagClients) {
+        try {
+          c.write(line);
+        } catch {
+          diagClients.delete(c);
         }
+      }
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "image/gif");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(PIXEL);
+      return;
+    }
+
+    // --- 测试台专用：诊断日志实时流 ---
+    if (path === "/api/diag-stream") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Connection", "keep-alive");
+      res.write(": connected\n\n");
+      diagClients.add(res);
+      req.on("close", () => diagClients.delete(res));
+      return;
+    }
+
+    // --- 系统实况：专辑封面（二进制；不进 SSE）---
+    if (path === "/api/system/artwork") {
+      await startLiveSystemService();
+      const art = getCachedArtwork();
+      if (!art) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("no artwork");
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("Content-Type", art.mime);
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.end(art.data);
+      return;
+    }
+
+    // --- 系统实况：正在播放（读 Node 缓存；首次可强制刷新）---
+    if (path === "/api/system/media") {
+      const fresh = url.searchParams.get("fresh") === "1";
+      const media = fresh ? await readNowPlaying() : (await startLiveSystemService(), getCachedMedia());
+      sendJson(res, 200, {
+        ...media,
+        backend: getLiveBackend(),
+        audioState: getAudioStatus(),
       });
+      return;
+    }
 
-      server.middlewares.use(async (req, res, next) => {
-        const url = new URL(req.url ?? "/", "http://127.0.0.1");
-        const path = decodeURIComponent(url.pathname);
+    // --- 系统实况：前台窗口 ---
+    if (path === "/api/system/window") {
+      const fresh = url.searchParams.get("fresh") === "1";
+      const win = fresh ? await readFrontWindow() : (await startLiveSystemService(), getCachedWindow());
+      sendJson(res, 200, win);
+      return;
+    }
 
-        // --- 渲染器诊断上报（对齐 content_server.rs 的 /diag）---
-        // lvl= 是**发送端声明**的级别（issue #13）：渲染器把级别随请求一起发出来，
-        // 宿主/嵌入方不必再对文案做关键字匹配。老渲染器没有这一位，退回不带级别的旧行为。
-        if (path === "/diag") {
-          const msg = url.searchParams.get("msg") ?? "";
-          const raw = url.searchParams.get("lvl") ?? "";
-          const level = raw === "error" || raw === "warn" || raw === "info" ? raw : undefined;
-          const color = level === "error" ? "\x1b[31m" : level === "warn" ? "\x1b[33m" : "\x1b[36m";
-          server.config.logger.info(`${color}[renderer diag${level ? ` ${level}` : ""}]\x1b[0m ${msg}`);
-          const line = `data: ${JSON.stringify({ t: Date.now(), msg, ...(level ? { level } : {}) })}\n\n`;
-          for (const c of diagClients) {
-            try {
-              c.write(line);
-            } catch {
-              diagClients.delete(c);
-            }
-          }
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "image/gif");
-          res.setHeader("Cache-Control", "no-store");
-          res.end(PIXEL);
-          return;
-        }
+    // --- 系统实况：媒体控制（壁纸 engine.media.*）---
+    if (path === "/api/system/media-control") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      let body: { action?: unknown } = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        sendJson(res, 400, { error: "body 需为 JSON" });
+        return;
+      }
+      const action = String(body.action || "") as MediaControl;
+      const allowed: MediaControl[] = [
+        "skipNext",
+        "skipPrevious",
+        "play",
+        "pause",
+        "playPause",
+      ];
+      if (!allowed.includes(action)) {
+        sendJson(res, 400, { error: `未知 action：${action}` });
+        return;
+      }
+      const media = await controlNowPlaying(action);
+      sendJson(res, 200, media);
+      return;
+    }
 
-        // --- 测试台专用：诊断日志实时流 ---
-        if (path === "/api/diag-stream") {
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "text/event-stream");
-          res.setHeader("Cache-Control", "no-store");
-          res.setHeader("Connection", "keep-alive");
-          res.write(": connected\n\n");
-          diagClients.add(res);
-          req.on("close", () => diagClients.delete(res));
-          return;
-        }
-
-        // --- 系统实况：专辑封面（二进制；不进 SSE）---
-        if (path === "/api/system/artwork") {
-          await startLiveSystemService();
-          const art = getCachedArtwork();
-          if (!art) {
-            res.statusCode = 404;
-            res.setHeader("Content-Type", "text/plain; charset=utf-8");
-            res.end("no artwork");
-            return;
-          }
-          res.statusCode = 200;
-          res.setHeader("Content-Type", art.mime);
-          res.setHeader("Cache-Control", "no-store");
-          res.setHeader("Access-Control-Allow-Origin", "*");
-          res.end(art.data);
-          return;
-        }
-
-        // --- 系统实况：正在播放（读 Node 缓存；首次可强制刷新）---
-        if (path === "/api/system/media") {
-          const fresh = url.searchParams.get("fresh") === "1";
-          const media = fresh ? await readNowPlaying() : (await startLiveSystemService(), getCachedMedia());
-          sendJson(res, 200, {
-            ...media,
+    // --- 系统实况：媒体 + 窗口 SSE（媒体/窗口 ~2Hz；频谱随 media-bridge 帧率）---
+    if (path === "/api/system/stream") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.write(": connected\n\n");
+      await startLiveSystemService();
+      streamClients.add(res);
+      const push = () => {
+        try {
+          const payload = {
+            media: getCachedMedia(),
+            window: getCachedWindow(),
             backend: getLiveBackend(),
             audioState: getAudioStatus(),
-          });
-          return;
-        }
-
-        // --- 系统实况：前台窗口 ---
-        if (path === "/api/system/window") {
-          const fresh = url.searchParams.get("fresh") === "1";
-          const win = fresh ? await readFrontWindow() : (await startLiveSystemService(), getCachedWindow());
-          sendJson(res, 200, win);
-          return;
-        }
-
-        // --- 系统实况：媒体控制（壁纸 engine.media.*）---
-        if (path === "/api/system/media-control") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          let body: { action?: unknown } = {};
-          try {
-            body = JSON.parse((await readBody(req)) || "{}");
-          } catch {
-            sendJson(res, 400, { error: "body 需为 JSON" });
-            return;
-          }
-          const action = String(body.action || "") as MediaControl;
-          const allowed: MediaControl[] = [
-            "skipNext",
-            "skipPrevious",
-            "play",
-            "pause",
-            "playPause",
-          ];
-          if (!allowed.includes(action)) {
-            sendJson(res, 400, { error: `未知 action：${action}` });
-            return;
-          }
-          const media = await controlNowPlaying(action);
-          sendJson(res, 200, media);
-          return;
-        }
-
-        // --- 系统实况：媒体 + 窗口 SSE（媒体/窗口 ~2Hz；频谱随 media-bridge 帧率）---
-        if (path === "/api/system/stream") {
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "text/event-stream");
-          res.setHeader("Cache-Control", "no-store");
-          res.setHeader("Connection", "keep-alive");
-          res.setHeader("Access-Control-Allow-Origin", "*");
-          res.write(": connected\n\n");
-          await startLiveSystemService();
-          streamClients.add(res);
-          const push = () => {
-            try {
-              const payload = {
-                media: getCachedMedia(),
-                window: getCachedWindow(),
-                backend: getLiveBackend(),
-                audioState: getAudioStatus(),
-              };
-              res.write(`data: ${JSON.stringify(payload)}\n\n`);
-            } catch {
-              /* 单轮失败不掐连接 */
-            }
           };
-          push();
-          const timer = setInterval(push, 500);
-          req.on("close", () => {
-            clearInterval(timer);
-            streamClients.delete(res);
-          });
-          return;
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        } catch {
+          /* 单轮失败不掐连接 */
         }
-
-        // --- 对齐 WallpaperEM：系统音频 SSE（测试台无 SCK；真实频谱走 /api/system/stream）---
-        if (path.startsWith("/audio-stream/")) {
-          const tok = path.slice("/audio-stream/".length).split("/")[0];
-          if (tok !== DEV_TOKEN) {
-            res.statusCode = 403;
-            res.setHeader("Content-Type", "text/plain; charset=utf-8");
-            res.end("forbidden");
-            return;
-          }
-          res.statusCode = 503;
-          res.setHeader("Content-Type", "text/plain; charset=utf-8");
-          res.setHeader("Cache-Control", "no-store");
-          res.end(
-            "audio capture unavailable in test bench (no ScreenCaptureKit); liveSystem uses media-bridge via /api/system/stream",
-          );
-          return;
-        }
-
-        // --- 编辑器外部插件目录（只读；热重载靠页面轮询版本戳）---
-        if (path === "/api/plugins") {
-          sendJson(res, 200, await listPluginDirs());
-          return;
-        }
-        if (path === "/api/plugins/file") {
-          const data = await readPluginFile(url.searchParams.get("dir") ?? "", url.searchParams.get("path") ?? "");
-          if (!data) {
-            sendJson(res, 404, { error: "插件文件不存在" });
-            return;
-          }
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "application/octet-stream");
-          res.setHeader("Cache-Control", "no-store");
-          res.end(data);
-          return;
-        }
-
-        // --- 测试台专用：壁纸库清单 ---
-        if (path === "/api/library") {
-          const data = await scanLibrary(lib);
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
-          res.setHeader("Cache-Control", "no-store");
-          res.end(JSON.stringify(data));
-          return;
-        }
-
-        // --- 测试台专用：运行时切换壁纸库目录（不改 Vite / WE_LIBRARY）---
-        if (path === "/api/library-dir") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          let body: { dir?: unknown; pick?: unknown } = {};
-          try {
-            body = JSON.parse((await readBody(req)) || "{}");
-          } catch {
-            sendJson(res, 400, { error: "body 需为 JSON" });
-            return;
-          }
-          let next = typeof body.dir === "string" ? body.dir.trim() : "";
-          if (body.pick) {
-            if (process.platform !== "darwin") {
-              sendJson(res, 200, { dir: lib, cancelled: true, unsupported: true });
-              return;
-            }
-            const picked = await pickFolderNative(lib);
-            if (!picked) {
-              sendJson(res, 200, { dir: lib, cancelled: true });
-              return;
-            }
-            next = picked;
-          }
-          if (!next) {
-            sendJson(res, 400, { error: "缺少 dir" });
-            return;
-          }
-          const resolved = await asDirectory(next);
-          if (!resolved) {
-            sendJson(res, 400, { error: `不是有效目录：${next}` });
-            return;
-          }
-          lib = resolved;
-          server.config.logger.info(`[host] 壁纸库目录改为：${lib}`);
-          sendJson(res, 200, { dir: lib, ok: true });
-          return;
-        }
-
-        // --- 编辑器页保存（EDITOR-PLAN §3A.4）：写成库内松散工程 ---
-        // 只准新建、或覆盖带 EDITOR_MARK 的目录（编辑器自己建的）；作者原始条目一律 409，
-        // 页面侧总是「另存为新条目」。begin 清空旧产物（上次保存删掉的资源不能残留），
-        // file 逐个写（避免一次性上传几百 MB 的请求体）。
-        if (path === "/api/editor/save-begin" || path === "/api/editor/save-file") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          const itemId = url.searchParams.get("item") ?? "";
-          if (!/^[A-Za-z0-9_-]{1,80}$/.test(itemId)) {
-            sendJson(res, 400, { error: "非法 itemId" });
-            return;
-          }
-          const dir = safeJoin(lib, itemId);
-          if (!dir) {
-            sendJson(res, 403, { error: "路径非法" });
-            return;
-          }
-          const exists = !!(await asDirectory(dir));
-          const marked = exists && !!(await statFile(join(dir, EDITOR_MARK)));
-          if (exists && !marked) {
-            sendJson(res, 409, { error: `目标不是编辑器创建的目录，拒绝覆盖：${itemId}` });
-            return;
-          }
-          try {
-            if (path === "/api/editor/save-begin") {
-              if (exists) await fs.rm(dir, { recursive: true, force: true });
-              await fs.mkdir(dir, { recursive: true });
-              await fs.writeFile(join(dir, EDITOR_MARK), `${new Date().toISOString()}\n`);
-              server.config.logger.info(`[host] 编辑器保存：${itemId}`);
-              sendJson(res, 200, { ok: true, itemId, dir });
-              return;
-            }
-            if (!exists) {
-              sendJson(res, 409, { error: "先调 save-begin" });
-              return;
-            }
-            const rel = url.searchParams.get("path") ?? "";
-            const target = rel && rel !== EDITOR_MARK ? safeJoin(dir, rel) : null;
-            if (!target || target === dir) {
-              sendJson(res, 400, { error: `非法文件路径：${rel}` });
-              return;
-            }
-            const body = await readRawBody(req, 1024 * 1024 * 1024);
-            await fs.mkdir(resolve(target, ".."), { recursive: true });
-            await fs.writeFile(target, body);
-            sendJson(res, 200, { ok: true, bytes: body.length });
-          } catch (e) {
-            sendJson(res, 500, { error: (e as Error).message });
-          }
-          return;
-        }
-
-        // --- 测试台专用：在文件管理器中打开壁纸目录 ---
-        if (path === "/api/reveal") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          let body: { itemId?: unknown } = {};
-          try {
-            body = JSON.parse((await readBody(req)) || "{}");
-          } catch {
-            sendJson(res, 400, { error: "body 需为 JSON" });
-            return;
-          }
-          const itemId = typeof body.itemId === "string" ? body.itemId.trim() : "";
-          if (!itemId || /[\\/]/.test(itemId) || itemId.includes("..")) {
-            sendJson(res, 400, { error: "非法 itemId" });
-            return;
-          }
-          const target = safeJoin(lib, itemId);
-          if (!target) {
-            sendJson(res, 403, { error: "路径非法" });
-            return;
-          }
-          const resolved = await asDirectory(target);
-          if (!resolved) {
-            sendJson(res, 404, { error: `壁纸目录不存在：${itemId}` });
-            return;
-          }
-          try {
-            await revealFolder(resolved);
-            sendJson(res, 200, { ok: true, dir: resolved });
-          } catch (e) {
-            sendJson(res, 500, { error: (e as Error).message });
-          }
-          return;
-        }
-
-        // --- 测试台专用：删除壁纸（优先移入废纸篓）---
-        if (path === "/api/delete") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          let body: { itemId?: unknown } = {};
-          try {
-            body = JSON.parse((await readBody(req)) || "{}");
-          } catch {
-            sendJson(res, 400, { error: "body 需为 JSON" });
-            return;
-          }
-          const itemId = typeof body.itemId === "string" ? body.itemId.trim() : "";
-          if (!itemId || /[\\/]/.test(itemId) || itemId.includes("..")) {
-            sendJson(res, 400, { error: "非法 itemId" });
-            return;
-          }
-          const target = safeJoin(lib, itemId);
-          if (!target) {
-            sendJson(res, 403, { error: "路径非法" });
-            return;
-          }
-          const resolved = await asDirectory(target);
-          if (!resolved) {
-            sendJson(res, 404, { error: `壁纸目录不存在：${itemId}` });
-            return;
-          }
-          try {
-            await deleteFolder(resolved);
-            server.config.logger.info(`[host] 已删除壁纸：${itemId}（${resolved}）`);
-            sendJson(res, 200, { ok: true });
-          } catch (e) {
-            sendJson(res, 500, { error: (e as Error).message });
-          }
-          return;
-        }
-
-        // --- 测试台专用：壁纸自定义属性（GET 读定义 / POST 存覆盖值）---
-        // 对齐主项目的 library_item_props / library_set_item_props 命令。
-        if (path === "/api/props") {
-          const itemId = url.searchParams.get("item") ?? "";
-          if (!itemId) {
-            sendJson(res, 400, { error: "缺少 item 参数" });
-            return;
-          }
-          if (req.method === "POST") {
-            try {
-              const parsed = JSON.parse((await readBody(req)) || "{}");
-              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-                sendJson(res, 400, { error: "body 需为 name→值 的对象" });
-                return;
-              }
-              await writeOverrides(itemId, parsed);
-              sendJson(res, 200, { ok: true, count: Object.keys(parsed).length });
-            } catch (e) {
-              sendJson(res, 400, { error: (e as Error).message });
-            }
-            return;
-          }
-          sendJson(res, 200, { itemId, props: await describe(lib, itemId) });
-          return;
-        }
-
-        // --- file/scenetexture：浏览器选中的文件拷入壁纸 we-props/，返回相对壁纸根的路径 ---
-        // 对齐主项目 library_set_item_prop_file（那边走 tauri dialog + 同目录拷贝）。
-        if (path === "/api/props-file") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          const itemId = url.searchParams.get("item") ?? "";
-          const propName = url.searchParams.get("name") ?? "";
-          if (!itemId || !propName) {
-            sendJson(res, 400, { error: "缺少 item 或 name" });
-            return;
-          }
-          const defs = await describe(lib, itemId);
-          const def = defs.find((d) => d.name === propName);
-          if (!def || (def.ptype !== "file" && def.ptype !== "scenetexture")) {
-            sendJson(res, 400, { error: "不是文件类型属性" });
-            return;
-          }
-          const itemBase = safeJoin(lib, itemId);
-          if (!itemBase) {
-            sendJson(res, 400, { error: "非法 item" });
-            return;
-          }
-          try {
-            const rawName =
-              typeof req.headers["x-filename"] === "string" ? req.headers["x-filename"] : "file";
-            const destName = destPropFileName(propName, rawName);
-            const destDir = join(itemBase, "we-props");
-            await fs.mkdir(destDir, { recursive: true });
-            const dest = safeJoin(destDir, destName);
-            if (!dest) {
-              sendJson(res, 400, { error: "非法文件名" });
-              return;
-            }
-            const buf = await readRawBody(req, 64 * 1024 * 1024);
-            if (buf.length === 0) {
-              sendJson(res, 400, { error: "空文件" });
-              return;
-            }
-            await fs.writeFile(dest, buf);
-            sendJson(res, 200, { value: `we-props/${destName}` });
-          } catch (e) {
-            sendJson(res, 400, { error: (e as Error).message });
-          }
-          return;
-        }
-
-        // --- directory：系统选文件夹，存绝对路径（与 WE / 主项目语义一致，不拷贝）---
-        if (path === "/api/props-dir") {
-          if (req.method !== "POST") {
-            sendJson(res, 405, { error: "需要 POST" });
-            return;
-          }
-          if (process.platform !== "darwin") {
-            sendJson(res, 200, { cancelled: true, unsupported: true });
-            return;
-          }
-          const picked = await pickFolderNative(homedir(), "选择目录");
-          if (!picked) {
-            sendJson(res, 200, { cancelled: true });
-            return;
-          }
-          sendJson(res, 200, { value: picked });
-          return;
-        }
-
-        // --- 本机引擎内置素材（贴图 / 法线）：/api/local-assets/... ---
-        // WE 的内置贴图（materials/util/*、materials/particle/**）不在壁纸 pkg 里，
-        // 只有官方安装目录才有。本地想按原版观感测试时把它们拷到 `local-assets/<id>/`
-        // （.gitignore 忽略、永不入库，见 docs/COMPLIANCE.md），这个端点只把它喂给渲染器；
-        // 目录不存在时返回 `{ok:false}`，渲染器整条路径静默跳过、回落到程序化复刻
-        // （system-textures.js / particle-textures.js）。
-        if (path === "/api/local-assets" || path.startsWith("/api/local-assets/")) {
-          const providers = localAssetProviders();
-          if (path === "/api/local-assets") {
-            const roots: Array<{ id: string; dir: string }> = [];
-            for (const p of providers) {
-              try {
-                const st = await fs.stat(join(p.dir, "materials"));
-                if (!st.isDirectory()) continue;
-              } catch {
-                continue;
-              }
-              roots.push({ id: p.id, dir: p.dir });
-            }
-            sendJson(res, 200, { ok: roots.length > 0, roots });
-            return;
-          }
-          const segs = path
-            .replace(/^\/api\/local-assets\//, "")
-            .split("/")
-            .filter(Boolean)
-            .map(decodeURIComponent);
-          const id = segs.shift() ?? "";
-          const provider = providers.find((p) => p.id === id);
-          if (!provider) {
-            sendJson(res, 404, { error: `未知素材源：${id}` });
-            return;
-          }
-          const rel = segs.join("/");
-          // 引擎素材名清单：把 materials/**/*.tex 的相对路径去掉扩展名当「引擎名」
-          // （`materials/util/noise.tex` → `util/noise`，与 shader/材质引用同名）。
-          // 扫盘结果按目录 mtime 缓存 60s，避免每次挂载都重扫 586 个文件。
-          if (rel === "materials/index.json") {
-            sendJson(res, 200, { names: await listLocalAssetNames(provider.dir) });
-            return;
-          }
-          const file = rel ? safeJoin(provider.dir, rel) : null;
-          if (!file) {
-            sendJson(res, 400, { error: "路径非法" });
-            return;
-          }
-          const st = await statFile(file);
-          if (!st || !st.isFile()) {
-            sendJson(res, 404, { error: `素材不存在：${rel}` });
-            return;
-          }
-          // sendFile 自带 MIME / ETag / Range，并等到流结束才返回（见其注释）
-          await sendFile(req, res, file);
-          return;
-        }
-
-        // --- 壁纸包资源：/media/{token}/{itemId}/{path...}（/web 同源同盘）---
-        const seg = path.replace(/^\/+/, "").split("/");
-        if (seg[0] === "media" || seg[0] === "web") {
-          if (seg[1] !== DEV_TOKEN) {
-            res.statusCode = 401;
-            res.end("Unauthorized");
-            return;
-          }
-          const itemId = seg[2];
-          if (!itemId) {
-            res.statusCode = 404;
-            res.end("Not Found");
-            return;
-          }
-          const itemBase = safeJoin(lib, itemId);
-          if (!itemBase) {
-            res.statusCode = 403;
-            res.end("Forbidden");
-            return;
-          }
-          const rel = seg.slice(3).join("/");
-          let target = safeJoin(itemBase, rel);
-          if (!target) {
-            res.statusCode = 403;
-            res.end("Forbidden");
-            return;
-          }
-          // 目录 → index.html（网页壁纸站点根，对齐原生侧行为）
-          try {
-            if ((await fs.stat(target)).isDirectory()) target = join(target, "index.html");
-          } catch {
-            /* 不存在则交给 sendFile 回 404 */
-          }
-          // project.json 响应合并用户属性覆盖值，使渲染器读到当前生效配置
-          const isProject = rel === "project.json";
-          // 网页壁纸 HTML：注入 WE shim（与原生 content_server 对齐）。
-          // 必须在同源 URL 上注入，不能靠渲染器 blob——Spine/WebGL 在 origin null 下贴图跨域失败。
-          const htmlInject =
-            (seg[0] === "web" || seg[0] === "media") && isHtmlPath(target)
-              ? async (raw: Buffer) =>
-                  Buffer.from(injectWebShim(raw.toString("utf8")), "utf8")
-              : undefined;
-          const transform = isProject
-            ? (raw: Buffer) => mergeProjectOverrides(raw, itemId)
-            : htmlInject;
-          await sendFile(req, res, target, transform);
-          return;
-        }
-
-        next();
+      };
+      push();
+      const timer = setInterval(push, 500);
+      req.on("close", () => {
+        clearInterval(timer);
+        streamClients.delete(res);
       });
-    },
+      return;
+    }
+
+    // --- 对齐 WallpaperEM：系统音频 SSE（测试台无 SCK；真实频谱走 /api/system/stream）---
+    if (path.startsWith("/audio-stream/")) {
+      const tok = path.slice("/audio-stream/".length).split("/")[0];
+      if (tok !== DEV_TOKEN) {
+        res.statusCode = 403;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("forbidden");
+        return;
+      }
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(
+        "audio capture unavailable in test bench (no ScreenCaptureKit); liveSystem uses media-bridge via /api/system/stream",
+      );
+      return;
+    }
+
+    // --- 编辑器外部插件目录（只读；热重载靠页面轮询版本戳）---
+    if (path === "/api/plugins") {
+      sendJson(res, 200, await listPluginDirs());
+      return;
+    }
+    if (path === "/api/plugins/file") {
+      const data = await readPluginFile(url.searchParams.get("dir") ?? "", url.searchParams.get("path") ?? "");
+      if (!data) {
+        sendJson(res, 404, { error: "插件文件不存在" });
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(data);
+      return;
+    }
+
+    // --- 测试台专用：壁纸库清单 ---
+    if (path === "/api/library") {
+      const data = await scanLibrary(lib);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(JSON.stringify(data));
+      return;
+    }
+
+    // --- 测试台专用：运行时切换壁纸库目录（不改 Vite / WE_LIBRARY）---
+    if (path === "/api/library-dir") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      let body: { dir?: unknown; pick?: unknown } = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        sendJson(res, 400, { error: "body 需为 JSON" });
+        return;
+      }
+      let next = typeof body.dir === "string" ? body.dir.trim() : "";
+      if (body.pick) {
+        if (!pickFolder) {
+          sendJson(res, 200, { dir: lib, cancelled: true, unsupported: true });
+          return;
+        }
+        const picked = await pickFolder(lib, "选择壁纸库文件夹");
+        if (!picked) {
+          sendJson(res, 200, { dir: lib, cancelled: true });
+          return;
+        }
+        next = picked;
+      }
+      if (!next) {
+        sendJson(res, 400, { error: "缺少 dir" });
+        return;
+      }
+      const resolved = await asDirectory(next);
+      if (!resolved) {
+        sendJson(res, 400, { error: `不是有效目录：${next}` });
+        return;
+      }
+      lib = resolved;
+      logger.info(`[host] 壁纸库目录改为：${lib}`);
+      sendJson(res, 200, { dir: lib, ok: true });
+      return;
+    }
+
+    // --- 编辑器页保存（EDITOR-PLAN §3A.4）：写成库内松散工程 ---
+    // 只准新建、或覆盖带 EDITOR_MARK 的目录（编辑器自己建的）；作者原始条目一律 409，
+    // 页面侧总是「另存为新条目」。begin 清空旧产物（上次保存删掉的资源不能残留），
+    // file 逐个写（避免一次性上传几百 MB 的请求体）。
+    if (path === "/api/editor/save-begin" || path === "/api/editor/save-file") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      const itemId = url.searchParams.get("item") ?? "";
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(itemId)) {
+        sendJson(res, 400, { error: "非法 itemId" });
+        return;
+      }
+      const dir = safeJoin(lib, itemId);
+      if (!dir) {
+        sendJson(res, 403, { error: "路径非法" });
+        return;
+      }
+      const exists = !!(await asDirectory(dir));
+      const marked = exists && !!(await statFile(join(dir, EDITOR_MARK)));
+      if (exists && !marked) {
+        sendJson(res, 409, { error: `目标不是编辑器创建的目录，拒绝覆盖：${itemId}` });
+        return;
+      }
+      try {
+        if (path === "/api/editor/save-begin") {
+          if (exists) await fs.rm(dir, { recursive: true, force: true });
+          await fs.mkdir(dir, { recursive: true });
+          await fs.writeFile(join(dir, EDITOR_MARK), `${new Date().toISOString()}\n`);
+          logger.info(`[host] 编辑器保存：${itemId}`);
+          sendJson(res, 200, { ok: true, itemId, dir });
+          return;
+        }
+        if (!exists) {
+          sendJson(res, 409, { error: "先调 save-begin" });
+          return;
+        }
+        const rel = url.searchParams.get("path") ?? "";
+        const target = rel && rel !== EDITOR_MARK ? safeJoin(dir, rel) : null;
+        if (!target || target === dir) {
+          sendJson(res, 400, { error: `非法文件路径：${rel}` });
+          return;
+        }
+        const body = await readRawBody(req, 1024 * 1024 * 1024);
+        await fs.mkdir(resolve(target, ".."), { recursive: true });
+        await fs.writeFile(target, body);
+        sendJson(res, 200, { ok: true, bytes: body.length });
+      } catch (e) {
+        sendJson(res, 500, { error: (e as Error).message });
+      }
+      return;
+    }
+
+    // --- 测试台专用：在文件管理器中打开壁纸目录 ---
+    if (path === "/api/reveal") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      let body: { itemId?: unknown } = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        sendJson(res, 400, { error: "body 需为 JSON" });
+        return;
+      }
+      const itemId = typeof body.itemId === "string" ? body.itemId.trim() : "";
+      if (!itemId || /[\\/]/.test(itemId) || itemId.includes("..")) {
+        sendJson(res, 400, { error: "非法 itemId" });
+        return;
+      }
+      const target = safeJoin(lib, itemId);
+      if (!target) {
+        sendJson(res, 403, { error: "路径非法" });
+        return;
+      }
+      const resolved = await asDirectory(target);
+      if (!resolved) {
+        sendJson(res, 404, { error: `壁纸目录不存在：${itemId}` });
+        return;
+      }
+      try {
+        await revealFolder(resolved);
+        sendJson(res, 200, { ok: true, dir: resolved });
+      } catch (e) {
+        sendJson(res, 500, { error: (e as Error).message });
+      }
+      return;
+    }
+
+    // --- 测试台专用：删除壁纸（优先移入废纸篓）---
+    if (path === "/api/delete") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      let body: { itemId?: unknown } = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        sendJson(res, 400, { error: "body 需为 JSON" });
+        return;
+      }
+      const itemId = typeof body.itemId === "string" ? body.itemId.trim() : "";
+      if (!itemId || /[\\/]/.test(itemId) || itemId.includes("..")) {
+        sendJson(res, 400, { error: "非法 itemId" });
+        return;
+      }
+      const target = safeJoin(lib, itemId);
+      if (!target) {
+        sendJson(res, 403, { error: "路径非法" });
+        return;
+      }
+      const resolved = await asDirectory(target);
+      if (!resolved) {
+        sendJson(res, 404, { error: `壁纸目录不存在：${itemId}` });
+        return;
+      }
+      try {
+        await deleteFolder(resolved);
+        logger.info(`[host] 已删除壁纸：${itemId}（${resolved}）`);
+        sendJson(res, 200, { ok: true });
+      } catch (e) {
+        sendJson(res, 500, { error: (e as Error).message });
+      }
+      return;
+    }
+
+    // --- 测试台专用：壁纸自定义属性（GET 读定义 / POST 存覆盖值）---
+    // 对齐主项目的 library_item_props / library_set_item_props 命令。
+    if (path === "/api/props") {
+      const itemId = url.searchParams.get("item") ?? "";
+      if (!itemId) {
+        sendJson(res, 400, { error: "缺少 item 参数" });
+        return;
+      }
+      if (req.method === "POST") {
+        try {
+          const parsed = JSON.parse((await readBody(req)) || "{}");
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "body 需为 name→值 的对象" });
+            return;
+          }
+          await writeOverrides(itemId, parsed);
+          sendJson(res, 200, { ok: true, count: Object.keys(parsed).length });
+        } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+        }
+        return;
+      }
+      sendJson(res, 200, { itemId, props: await describe(lib, itemId) });
+      return;
+    }
+
+    // --- file/scenetexture：浏览器选中的文件拷入壁纸 we-props/，返回相对壁纸根的路径 ---
+    // 对齐主项目 library_set_item_prop_file（那边走 tauri dialog + 同目录拷贝）。
+    if (path === "/api/props-file") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      const itemId = url.searchParams.get("item") ?? "";
+      const propName = url.searchParams.get("name") ?? "";
+      if (!itemId || !propName) {
+        sendJson(res, 400, { error: "缺少 item 或 name" });
+        return;
+      }
+      const defs = await describe(lib, itemId);
+      const def = defs.find((d) => d.name === propName);
+      if (!def || (def.ptype !== "file" && def.ptype !== "scenetexture")) {
+        sendJson(res, 400, { error: "不是文件类型属性" });
+        return;
+      }
+      const itemBase = safeJoin(lib, itemId);
+      if (!itemBase) {
+        sendJson(res, 400, { error: "非法 item" });
+        return;
+      }
+      try {
+        const rawName =
+          typeof req.headers["x-filename"] === "string" ? req.headers["x-filename"] : "file";
+        const destName = destPropFileName(propName, rawName);
+        const destDir = join(itemBase, "we-props");
+        await fs.mkdir(destDir, { recursive: true });
+        const dest = safeJoin(destDir, destName);
+        if (!dest) {
+          sendJson(res, 400, { error: "非法文件名" });
+          return;
+        }
+        const buf = await readRawBody(req, 64 * 1024 * 1024);
+        if (buf.length === 0) {
+          sendJson(res, 400, { error: "空文件" });
+          return;
+        }
+        await fs.writeFile(dest, buf);
+        sendJson(res, 200, { value: `we-props/${destName}` });
+      } catch (e) {
+        sendJson(res, 400, { error: (e as Error).message });
+      }
+      return;
+    }
+
+    // --- directory：系统选文件夹，存绝对路径（与 WE / 主项目语义一致，不拷贝）---
+    if (path === "/api/props-dir") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "需要 POST" });
+        return;
+      }
+      if (!pickFolder) {
+        sendJson(res, 200, { cancelled: true, unsupported: true });
+        return;
+      }
+      const picked = await pickFolder(homedir(), "选择目录");
+      if (!picked) {
+        sendJson(res, 200, { cancelled: true });
+        return;
+      }
+      sendJson(res, 200, { value: picked });
+      return;
+    }
+
+    // --- 本机引擎内置素材（贴图 / 法线）：/api/local-assets/... ---
+    // WE 的内置贴图（materials/util/*、materials/particle/**）不在壁纸 pkg 里，
+    // 只有官方安装目录才有。本地想按原版观感测试时把它们拷到 `local-assets/<id>/`
+    // （.gitignore 忽略、永不入库，见 docs/COMPLIANCE.md），这个端点只把它喂给渲染器；
+    // 目录不存在时返回 `{ok:false}`，渲染器整条路径静默跳过、回落到程序化复刻
+    // （system-textures.js / particle-textures.js）。
+    if (path === "/api/local-assets" || path.startsWith("/api/local-assets/")) {
+      const providers = localAssetProviders();
+      if (path === "/api/local-assets") {
+        const roots: Array<{ id: string; dir: string }> = [];
+        for (const p of providers) {
+          try {
+            const st = await fs.stat(join(p.dir, "materials"));
+            if (!st.isDirectory()) continue;
+          } catch {
+            continue;
+          }
+          roots.push({ id: p.id, dir: p.dir });
+        }
+        sendJson(res, 200, { ok: roots.length > 0, roots });
+        return;
+      }
+      const segs = path
+        .replace(/^\/api\/local-assets\//, "")
+        .split("/")
+        .filter(Boolean)
+        .map(decodeURIComponent);
+      const id = segs.shift() ?? "";
+      const provider = providers.find((p) => p.id === id);
+      if (!provider) {
+        sendJson(res, 404, { error: `未知素材源：${id}` });
+        return;
+      }
+      const rel = segs.join("/");
+      // 引擎素材名清单：把 materials/**/*.tex 的相对路径去掉扩展名当「引擎名」
+      // （`materials/util/noise.tex` → `util/noise`，与 shader/材质引用同名）。
+      // 扫盘结果按目录 mtime 缓存 60s，避免每次挂载都重扫 586 个文件。
+      if (rel === "materials/index.json") {
+        sendJson(res, 200, { names: await listLocalAssetNames(provider.dir) });
+        return;
+      }
+      const file = rel ? safeJoin(provider.dir, rel) : null;
+      if (!file) {
+        sendJson(res, 400, { error: "路径非法" });
+        return;
+      }
+      const st = await statFile(file);
+      if (!st || !st.isFile()) {
+        sendJson(res, 404, { error: `素材不存在：${rel}` });
+        return;
+      }
+      // sendFile 自带 MIME / ETag / Range，并等到流结束才返回（见其注释）
+      await sendFile(req, res, file);
+      return;
+    }
+
+    // --- 壁纸包资源：/media/{token}/{itemId}/{path...}（/web 同源同盘）---
+    const seg = path.replace(/^\/+/, "").split("/");
+    if (seg[0] === "media" || seg[0] === "web") {
+      if (seg[1] !== DEV_TOKEN) {
+        res.statusCode = 401;
+        res.end("Unauthorized");
+        return;
+      }
+      const itemId = seg[2];
+      if (!itemId) {
+        res.statusCode = 404;
+        res.end("Not Found");
+        return;
+      }
+      const itemBase = safeJoin(lib, itemId);
+      if (!itemBase) {
+        res.statusCode = 403;
+        res.end("Forbidden");
+        return;
+      }
+      const rel = seg.slice(3).join("/");
+      let target = safeJoin(itemBase, rel);
+      if (!target) {
+        res.statusCode = 403;
+        res.end("Forbidden");
+        return;
+      }
+      // 目录 → index.html（网页壁纸站点根，对齐原生侧行为）
+      try {
+        if ((await fs.stat(target)).isDirectory()) target = join(target, "index.html");
+      } catch {
+        /* 不存在则交给 sendFile 回 404 */
+      }
+      // project.json 响应合并用户属性覆盖值，使渲染器读到当前生效配置
+      const isProject = rel === "project.json";
+      // 网页壁纸 HTML：注入 WE shim（与原生 content_server 对齐）。
+      // 必须在同源 URL 上注入，不能靠渲染器 blob——Spine/WebGL 在 origin null 下贴图跨域失败。
+      const htmlInject =
+        (seg[0] === "web" || seg[0] === "media") && isHtmlPath(target)
+          ? async (raw: Buffer) =>
+              Buffer.from(injectWebShim(raw.toString("utf8")), "utf8")
+          : undefined;
+      const transform = isProject
+        ? (raw: Buffer) => mergeProjectOverrides(raw, itemId)
+        : htmlInject;
+      await sendFile(req, res, target, transform);
+      return;
+    }
+
+    next();
+  };
+}
+
+export function wallpaperHost(): Plugin {
+  let handler: HostHandler | null = null;
+  const use = (server: ViteDevServer | PreviewServer) => {
+    handler ??= createHostMiddleware({ logger: server.config.logger });
+    server.middlewares.use(handler);
+  };
+  return {
+    name: "we-scene-renderer:wallpaper-host",
+    configureServer: use,
+    configurePreviewServer: use,
   };
 }

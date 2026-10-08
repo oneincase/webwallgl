@@ -21,8 +21,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-/** 覆盖值存放目录（仓库根 .we-props/，已 gitignore） */
-const OVERRIDES_DIR = resolve(here, "..", ".we-props");
+/** 覆盖值存放目录（仓库根 .we-props/，已 gitignore）；打包后的应用用 WWGL_PROPS_DIR 指到用户目录 */
+const overridesDir = () =>
+  process.env.WWGL_PROPS_DIR ? resolve(process.env.WWGL_PROPS_DIR) : resolve(here, "..", ".we-props");
 
 /** UI 编辑用的属性定义（字段与主项目 `WebPropDef` 一致，camelCase 上报） */
 export type WebPropDef = {
@@ -121,7 +122,7 @@ function wireValue(ptype: string, def: Json): unknown | undefined {
 function overridesFile(itemId: string): string {
   // itemId 来自 URL：只允许工坊 id 形态的字符，避免拼出目录穿越路径
   const safe = itemId.replace(/[^A-Za-z0-9_.-]/g, "_");
-  return join(OVERRIDES_DIR, `${safe}.json`);
+  return join(overridesDir(), `${safe}.json`);
 }
 
 /** 读取用户覆盖值（name → wire 值） */
@@ -145,7 +146,7 @@ export async function writeOverrides(
     await fs.rm(file, { force: true });
     return;
   }
-  await fs.mkdir(OVERRIDES_DIR, { recursive: true });
+  await fs.mkdir(overridesDir(), { recursive: true });
   await fs.writeFile(file, `${JSON.stringify(values, null, 2)}\n`, "utf8");
 }
 
