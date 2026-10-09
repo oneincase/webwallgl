@@ -248,6 +248,14 @@ import {
 } from "./snap";
 import { scriptsAllowedByDefault, scriptsOverrideFrom, type ContentKind } from "./trust";
 import {
+  addContainerLayer,
+  hasPassthrough,
+  isContainerObject,
+  isFullscreenPostObject,
+  setPassthrough,
+  solidRenders,
+} from "./container";
+import {
   duplicateLayer,
   findNode,
   findPath,
@@ -3768,6 +3776,11 @@ lyAddSoundEl.onclick = () => {
   soundPickFor = null;
   inSoundEl.click();
 };
+// 容器层 / 全屏后期层：预置参数的结构编辑（可撤销），新层进树后由检视器改旗标
+const lyAddContainerEl = $<HTMLButtonElement>("#ly-add-container");
+lyAddContainerEl.onclick = () => addContainer();
+const lyAddPostEl = $<HTMLButtonElement>("#ly-add-post");
+lyAddPostEl.onclick = () => addContainer("post");
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -3862,6 +3875,8 @@ function syncLayerTools() {
   lyAddTextEl.disabled = lyAddEl.disabled;
   lyAddParticleEl.disabled = lyAddEl.disabled;
   lyAddSoundEl.disabled = lyAddEl.disabled;
+  lyAddContainerEl.disabled = lyAddEl.disabled;
+  lyAddPostEl.disabled = lyAddEl.disabled;
   lyAddVideoEl.disabled = lyAddEl.disabled;
   lyAddModelEl.disabled = lyAddEl.disabled;
 }
@@ -5292,6 +5307,80 @@ function commitInlineParam(
 }
 
 /**
+ * 容器 / 全屏后期层的「容器」分组（M5 A12）：passthrough 开关、实心旗标、后期旗标。
+ *
+ * 三个旗标都写在对象自己身上，全部经 objEdit → 结构编辑（可撤销、整场景重挂）：
+ *   · 直通   → config.passthrough（**不是**顶层字段；引擎也从 o.config.passthrough 读）
+ *   · 实心   → 顶层 solid（引擎判定见 editor/container.ts 的 solidRenders）
+ *   · 全屏后期 → 只读指示（image 前缀 projectlayer / fullscreenlayer 就是资源引用本身，
+ *                改前缀等于换资源，不在检视器里改）
+ *
+ * 未知字段与未知 config 键一律不动：结构编辑记的是整份对象数组的 JSON 快照，
+ * 这里只碰上面这三个键，其余键（含 config 里我们不认识的键）原样留在对象里。
+ */
+function containerGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-container";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.container");
+  group.appendChild(h);
+  const editable = !!doc?.scene && !!overlay && !isLocked(node.id);
+  const o = node.obj;
+  const layer = nodeName(node.id);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+
+  const checkbox = (field: string, key: string, checked: boolean, onChange: (on: boolean) => void) => {
+    const label = document.createElement("label");
+    label.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.checked = checked;
+    inp.disabled = !editable;
+    inp.dataset.container = field;
+    inp.addEventListener("change", () => onChange(inp.checked));
+    box.appendChild(inp);
+    form.append(label, box);
+    return inp;
+  };
+
+  const isCtr = isContainerObject(o);
+  const isPost = isFullscreenPostObject(o);
+
+  if (isCtr || isPost) {
+    checkbox("passthrough", "ctr.passthrough", hasPassthrough(o), (on) =>
+      objEdit(et(on ? "log.passthroughOn" : "log.passthroughOff", { layer }), node.id, (ob) => {
+        if (on === hasPassthrough(ob)) return false;
+        setPassthrough(ob, on);
+        return true;
+      }),
+    );
+  }
+  if (isCtr) {
+    checkbox("solid", "ctr.solid", !!o.solid, (on) =>
+      objEdit(et(on ? "log.solidOn" : "log.solidOff", { layer }), node.id, (ob) => {
+        if (!!ob.solid === on) return false;
+        if (on) ob.solid = true;
+        else delete ob.solid;
+        return true;
+      }),
+    );
+    group.appendChild(note(et(solidRenders(o) ? "ctr.solidYes" : "ctr.solidNo")));
+  }
+  if (isPost) {
+    // 只读指示：全屏后期层就是 image 前缀，改前缀等于换掉资源引用，不在检视器里改
+    const post = checkbox("post", "ctr.fullscreen", true, () => {});
+    post.disabled = true;
+    group.appendChild(note(et("ctr.postNote")));
+  }
+  group.appendChild(form);
+  return group;
+}
+
+/**
  * `fx` 分组末尾的「作品自带效果」分区：列出 `obj.effects[i].passes[j]`，
  * 把 effect.json 参数表（uniform 注释）渲染成可编辑表单。
  *
@@ -5433,6 +5522,33 @@ function addText(preset: TextPreset) {
   }
   const name = et(`text.${preset}`);
   structEdit(et("log.textAdded", { name }), (d) => addTextLayer(d, preset, name, et("text.defaultValue"), measureText) ?? undefined);
+}
+
+/**
+ * 添加容器层 / 全屏后期层（M5 A12）：走结构编辑（可撤销、整场景重挂）。
+ * 尺寸跟着画布走 —— 容器默认盖满画布（子层坐标照旧是绝对坐标），后期层由引擎按
+ * general.orthogonalprojection 覆盖，这里写的 origin/scale 只是工程里的可读初值。
+ */
+function addContainer(kind: "container" | "post" = "container") {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const res = sceneResolution(doc.scene) ?? { w: 1920, h: 1080 };
+  const name = et(`ctr.${kind}`);
+  structEdit(et("log.containerAdded", { name }), (d) => {
+    const r = sceneResolution(d.scene) ?? res;
+    return (
+      addContainerLayer(d, {
+        kind,
+        name,
+        origin: `${Math.round(r.w / 2)} ${Math.round(r.h / 2)} 0`,
+        scale: `${Math.round(r.w)} ${Math.round(r.h)} 1`,
+        // 空容器 + 效果要能读到已经渲染好的背板，直通默认开（引擎 layerWantsPreserveBackdrop 之外的第二重保险）
+        passthrough: true,
+      }) ?? undefined
+    );
+  });
 }
 
 /** 文字字段的一次可撤销编辑：先装好要量的字体，改完按内容回填盒子 */
@@ -6684,7 +6800,16 @@ const BUILTIN_INSPECTOR: InspectorGroup[] = [
   { id: "text", order: 400, when: (n) => n.kind === "text", render: textGroup, tab: "props" },
   { id: "particle", order: 500, when: (n) => n.kind === "particle", render: particleGroup, tab: "props" },
   { id: "sound", order: 600, when: (n) => n.kind === "sound", render: soundGroup, tab: "props" },
+  // 容器 / 全屏后期：三种旗标（直通 / 实心 / 后期）。实心层虽不是容器，也在这里给旗标
+  // （引擎的 solid 判定还认 solidlayer，见 container.ts 的 solidRenders）
   { id: "attach", order: 1200, when: () => true, render: attachGroup, tab: "props" },
+  {
+    id: "container",
+    order: 1250,
+    when: (n) => n.kind === "container" || n.kind === "fullscreen-post" || !!n.obj.solid,
+    render: containerGroup,
+    tab: "props",
+  },
   { id: "video", order: 1300, when: isVideoNode, render: videoInfoGroup, tab: "props" },
   { id: "effects", order: 1400, when: canHaveEffects, render: effectsGroup, tab: "fx" },
   { id: "bindings", order: 1500, when: () => true, render: bindingsGroup, tab: "logic" },

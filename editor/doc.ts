@@ -2,6 +2,7 @@
 // P2 起热改（W2-lite）同时写回这里，保存链路（P3）只序列化文档。
 
 import type { EditorLayerProps } from "../renderer/src/api/editor";
+import { isContainerObject, isFullscreenPostObject } from "./container";
 import { matchLayerKind } from "./layer-kinds";
 
 export type SceneObject = Record<string, unknown>;
@@ -16,6 +17,9 @@ export type LayerKind =
   | "camera"
   | "group"
   | "other"
+  // 容器 / 全屏后期（editor/container.ts 的判定，image 前缀决定）
+  | "container"
+  | "fullscreen-post"
   // 插件登记的图层类型（layer-kinds.ts）
   | (string & {});
 
@@ -72,6 +76,9 @@ export function kindOf(o: SceneObject): LayerKind {
   if (typeof o.particle === "string") return "particle";
   if (o.text !== undefined && o.text !== null) return "text";
   if (typeof o.model === "string") return "model";
+  // 容器 / 全屏后期也是 image 对象，必须在 image 分支之前判（判定与引擎 parse.js 同口径）
+  if (isContainerObject(o)) return "container";
+  if (isFullscreenPostObject(o)) return "fullscreen-post";
   if (typeof o.image === "string") return "image";
   if (Array.isArray(o.sound) && o.sound.length) return "sound";
   if (typeof o.light === "string" && o.light) return "light";
