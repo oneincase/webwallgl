@@ -2391,6 +2391,136 @@ function runShim(extras, opts) {
     "裸 iframe 的心跳 rAF 必须登记释放（否则拆了壁纸还在跑）");
 }
 
+// ---------- 9. 网页壁纸工程相对资源解析（M13：宿主 /api/editor/web-manifest|web-resolve）----------
+// 网页壁纸工程（type:"web"）的入口 html 与 js/css/图片靠**相对路径**互相引用，而编辑器
+// 页只有 File/blob 没有目录概念。宿主必须把「工程内相对路径」翻成同源的 /web/... URL
+// 并给出资源清单，且任何非法/缺失路径都要明确报错 —— 静默落空在保存路径上等于丢文件。
+// 判据分两半：纯函数真跑（路径规范化 / URL 编码 / 入口挑选 / 清单遍历），
+// 加 host/wallpaper-host.ts 的端点形状断言（端点存在、复用共用模块、错误文案在）。
+{
+  const webProjectPath = path.join(ROOT, "host/we-web-project.mjs");
+  check(fs.existsSync(webProjectPath), "host/we-web-project.mjs 必须存在（宿主与验证脚本共用的网页工程判据）");
+  const webProjectSrc = fs.readFileSync(webProjectPath, "utf8");
+  const wp = await import(pathToFileURL(webProjectPath).href);
+
+  // --- 路径规范化：`..` 一律拒（不做「夹回目录内」的宽容处理）---
+  check(wp.normalizeWebRelPath("js/app.js") === "js/app.js", "相对路径原样保留");
+  check(wp.normalizeWebRelPath("\\js\\app.js") === "js/app.js", "反斜杠归一为斜杠（Windows 作者写的 project）");
+  check(wp.normalizeWebRelPath("./a/./b") === "a/b", "`.` 段丢弃");
+  check(wp.normalizeWebRelPath("/a/b/") === "a/b", "首尾斜杠丢弃");
+  check(wp.normalizeWebRelPath("a/../b") === null, "含 `..` 的路径必须判非法（越界不静默纠正）");
+  check(wp.normalizeWebRelPath("../evil") === null, "以 `..` 开头的路径必须判非法");
+  check(wp.normalizeWebRelPath("") === null && wp.normalizeWebRelPath("/") === null, "空路径判非法");
+  check(wp.normalizeWebRelPath("a\u0000b") === null, "含 NUL 的路径判非法");
+  check(wp.normalizeWebRelPath(3) === null, "非字符串判非法");
+
+  // --- URL 编码：必须逐段 encode（库里真有空格/中文名）---
+  check(
+    wp.encodeWebPath("css/深 色/style.css") === `css/${encodeURIComponent("深 色")}/style.css`,
+    "URL 必须逐段 encodeURIComponent（中文/空格路径否则取不到文件）",
+  );
+  check(
+    !wp.encodeWebPath("css/深 色/style.css").includes("%2F") && wp.encodeWebPath("a/b").includes("/"),
+    "URL 编码不得把分隔符 `/` 也编掉",
+  );
+
+  // --- 相对路径 → 可取 URL ---
+  check(
+    wp.webAssetUrl("1589757429", "dvd.html") === "/web/dev/1589757429/dvd.html",
+    "入口 html 解析为同源 /web/{token}/{itemId}/{path}（1589757429 声明的是 dvd.html）",
+  );
+  check(
+    wp.webAssetUrl("new 1", "index.html") === null && wp.webAssetUrl("../x", "index.html") === null,
+    "itemId / 相对路径非法时不拼 URL（返回 null 让调用方报错）",
+  );
+  check(
+    /\/web\/\$\{encodeURIComponent\(token\)\}\/\$\{itemId\}/.test(webProjectSrc),
+    "URL 必须按传入的 token 拼接（host 传 DEV_TOKEN，与 /web 端点的鉴权一致）",
+  );
+
+  // --- 入口挑选：声明优先但必须真在盘上 ---
+  const names = ["index.html", "js/app.js", "preview.gif"];
+  check(wp.pickWebEntry({ declared: "dvd.html", names: [...names, "dvd.html"] }) === "dvd.html",
+    "project.json 声明的入口优先（且真的在盘上）");
+  check(wp.pickWebEntry({ declared: "missing.html", names }) === "index.html",
+    "声明指向不存在的文件时退回真实入口（扫库侧对声明不校验存在性）");
+  check(wp.pickWebEntry({ declared: "js/app.js", names }) === "index.html",
+    "声明不是 html 时按内容退回入口");
+  check(wp.pickWebEntry({ declared: "", names: ["web/index.html"] }) === "web/index.html",
+    "无 index.html 时认 web/index.html（原生 WEB_ENTRY_PATHS 第二项）");
+  check(wp.pickWebEntry({ declared: "", names: ["Index.HTML"] }) === "Index.HTML",
+    "入口匹配大小写折叠（Windows 作者写的 Index.HTML）");
+  check(wp.pickWebEntry({ declared: "", names: ["js/app.js"] }) === null,
+    "找不到入口返回 null（端点据此给明确 404，不是猜一个 index.html）");
+
+  // --- 清单遍历：跳过宿主标记、排序、超限报截断 ---
+  const osMod = await import("node:os");
+  const tmp = await fs.promises.mkdtemp(path.join(osMod.tmpdir(), "we-web-proj-"));
+  try {
+    const mk = async (rel, data = "x") => {
+      await fs.promises.mkdir(path.join(tmp, path.dirname(rel)), { recursive: true });
+      await fs.promises.writeFile(path.join(tmp, rel), data);
+    };
+    await mk("index.html", "<html></html>");
+    await mk("js/app.js");
+    await mk("css/深 色/style.css");
+    await mk(".webwallgl-editor", "2024-01-01");
+    await mk(".DS_Store");
+    await mk("deep/a/b/c/d.js");
+    const listed = await wp.listWebProjectFiles(tmp);
+    check(listed.files.includes("index.html") && listed.files.includes("js/app.js"), "清单必须列出工程内文件");
+    check(listed.files.includes("css/深 色/style.css"), "清单必须包含中文/空格路径（原样相对路径）");
+    check(!listed.files.some((f) => f.startsWith(".") || f.includes("/.")),
+      "清单必须跳过 `.` 开头的项（编辑器标记 .webwallgl-editor / .DS_Store 不是工程资源）");
+    check(listed.files.includes("deep/a/b/c/d.js"), "清单必须递归子目录");
+    check(JSON.stringify(listed.files) === JSON.stringify([...listed.files].sort()),
+      "清单必须排序（`打开 → 保存 → 重开` 逐项可比）");
+    check(listed.truncated === false, "文件数在上限内时不得报截断");
+    const capped = await wp.listWebProjectFiles(tmp, { maxFiles: 2 });
+    check(capped.truncated === true && capped.files.length === 2, "超过文件上限必须报 truncated（端点据此 413，不静默少列）");
+    const shallow = await wp.listWebProjectFiles(tmp, { maxDepth: 1 });
+    check(shallow.truncated === true, "超过深度上限必须报 truncated");
+    check(/WEB_MANIFEST_MAX_FILES/.test(webProjectSrc) && /WEB_MANIFEST_MAX_DEPTH/.test(webProjectSrc),
+      "上限必须是具名常量（端点报错文案要引用同一个数）");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+
+  // --- 宿主端点形状 ---
+  const hostSrc = fs.readFileSync(path.join(ROOT, "host/wallpaper-host.ts"), "utf8");
+  check(
+    /\/api\/editor\/web-manifest/.test(hostSrc) && /\/api\/editor\/web-resolve/.test(hostSrc),
+    "wallpaper-host 必须提供网页工程清单 / 相对资源解析端点（web-manifest / web-resolve）",
+  );
+  check(/from "\.\/we-web-project\.mjs"/.test(hostSrc),
+    "端点必须复用 host/we-web-project.mjs 的判据（不得另写一份路径/清单规则）");
+  check(
+    /listWebProjectFiles\(itemBase\)/.test(hostSrc) && /pickWebEntry\(/.test(hostSrc) && /webAssetUrl\(itemId, rel, \{ token: DEV_TOKEN \}\)/.test(hostSrc),
+    "端点必须用共用模块列清单 / 挑入口 / 拼 URL（token 取 DEV_TOKEN）",
+  );
+  check(
+    /classifyItemDir/.test(hostSrc) && /classifyWallpaper/.test(hostSrc) && /itemType !== "web"/.test(hostSrc),
+    "端点必须按共用类型判据只服务 type:\"web\" 的条目（不当成任意文件读取口）",
+  );
+  check(
+    /safeJoin\(itemBase, rel\)/.test(hostSrc) && /statFile\(target\)/.test(hostSrc),
+    "相对资源必须先 safeJoin 再 statFile（目录穿越与缺失都要拦下）",
+  );
+  for (const msg of [
+    "需要 GET",
+    "非法 itemId",
+    "壁纸库中没有这个条目",
+    "目标不是网页壁纸工程",
+    "网页壁纸工程找不到入口 html",
+    "清单不完整",
+    "非法相对路径",
+    "相对资源不存在",
+    "相对资源是目录",
+  ]) {
+    check(hostSrc.includes(msg), `端点必须保留明确报错文案「${msg}」（不得静默失败）`);
+  }
+}
+
 if (errors.length) {
   console.error(`verify-web: ${errors.length} 项失败`);
   for (const e of errors) console.error("  ✗", e);

@@ -20,6 +20,8 @@
  *   POST /api/delete                       删除壁纸目录，优先移入系统废纸篓（body `{itemId}`）
  *   POST /api/editor/save-begin?item=      编辑器另存：新建（或清空编辑器自建的）库内松散工程目录
  *   POST /api/editor/save-file?item=&path= 编辑器另存：写入一个文件（body 为原始字节）
+ *   GET /api/editor/web-manifest?item=     网页壁纸工程（type:"web"）入口与资源清单
+ *   GET /api/editor/web-resolve?item=&path= 工程内相对路径 → 可取的 /web/... URL
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
  *   GET /api/plugins                       编辑器外部插件目录清单（host/plugin-dirs.ts）
  *   GET /api/plugins/file?dir=&path=       读插件目录里的一个文件
@@ -54,6 +56,13 @@ import {
   pickEntryFile,
   pickPreviewFile,
 } from "./we-library-scan.mjs";
+import {
+  WEB_MANIFEST_MAX_FILES,
+  listWebProjectFiles,
+  normalizeWebRelPath,
+  pickWebEntry,
+  webAssetUrl,
+} from "./we-web-project.mjs";
 import {
   controlNowPlaying,
   getAudioStatus,
@@ -559,6 +568,48 @@ async function scanLibrary(dir: string) {
   return { dir, items };
 }
 
+/**
+ * 单个条目的类型（判据与 `scanLibrary` 同一份 `we-library-scan.mjs` 纯函数）。
+ *
+ * 网页壁纸的相对资源端点只服务 `type:"web"` 的条目，但不能为此扫全库：
+ * 编辑器保存一个工程会逐个资源调一次 resolve，全库扫（420 条目 × 若干 stat）
+ * 会白烧几千次 stat。这里只探这一个目录，探法与扫库逐条一致。
+ */
+async function classifyItemDir(base: string, project: any): Promise<string> {
+  let dirNames: string[] = [];
+  try {
+    dirNames = await fs.readdir(base);
+  } catch {
+    /* 读不到目录名：按无内容推断 */
+  }
+  const probe = async (rel: string) => !!(await statFile(join(base, rel)));
+  let hasScene = false;
+  for (const rel of SCENE_PKG_PATHS) {
+    if (await probe(rel)) {
+      hasScene = true;
+      break;
+    }
+  }
+  const hasLooseScene = isLooseSceneProject({ declared: project?.file, names: dirNames });
+  let hasWebEntry = false;
+  for (const rel of WEB_ENTRY_PATHS) {
+    if (await probe(rel)) {
+      hasWebEntry = true;
+      break;
+    }
+  }
+  return classifyWallpaper({ declared: project?.type, hasScene, hasLooseScene, hasWebEntry, names: dirNames });
+}
+
+/** 条目目录里的 project.json（读不到或不是 JSON 返回 null） */
+async function readItemProject(base: string): Promise<any> {
+  try {
+    return JSON.parse(await fs.readFile(join(base, "project.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 export type FolderPicker = (defaultDir: string, prompt: string) => Promise<string | null>;
 
 export type HostOptions = {
@@ -881,6 +932,84 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
       } catch (e) {
         sendJson(res, 500, { error: (e as Error).message });
       }
+      return;
+    }
+
+    // --- 网页壁纸工程相对资源解析（EDITOR-COMPLETION-PLAN §6 决策 6 / M13）---
+    // 网页壁纸工程（project.type=web）的入口 html 与它引用的 js/css/图片都在同一条目
+    // 目录里、靠相对路径互相引用，而编辑器页拿到的是 File/blob，没有目录概念：
+    // 此前 `editor/open.ts` 只能整条拒开并提示「相对资源无法从 blob 地址解析」。
+    // 这两个端点把「工程内相对路径」翻成 /web/{token}/{itemId}/{path...}（同源、由下面
+    // 的 /web 处理器原样吐文件、html 仍注入 WE shim），并给出资源清单供编辑器保存时
+    // 逐文件读回。任何非法/缺失路径都给**明确 JSON 报错**，绝不静默落空 —— 静默失败
+    // 在保存路径上会变成「少存文件」。
+    if (path === "/api/editor/web-manifest" || path === "/api/editor/web-resolve") {
+      if (req.method !== "GET") {
+        sendJson(res, 405, { error: "需要 GET" });
+        return;
+      }
+      const itemId = url.searchParams.get("item") ?? "";
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(itemId)) {
+        sendJson(res, 400, { error: "非法 itemId" });
+        return;
+      }
+      const itemBase = safeJoin(lib, itemId);
+      if (!itemBase || !(await asDirectory(itemBase))) {
+        sendJson(res, 404, { error: `壁纸库中没有这个条目：${itemId}` });
+        return;
+      }
+      // 只服务网页壁纸工程：类型判据与 /api/library 同一份（we-library-scan 纯函数），
+      // 免得这个端点变成「任意条目任意文件」的读取口。
+      const project = await readItemProject(itemBase);
+      const itemType = await classifyItemDir(itemBase, project);
+      if (itemType !== "web") {
+        sendJson(res, 409, { error: `目标不是网页壁纸工程：${itemId}（类型 ${itemType}）` });
+        return;
+      }
+      const manifest = await listWebProjectFiles(itemBase);
+      if (manifest.truncated) {
+        sendJson(res, 413, {
+          error: `网页壁纸工程文件过多，清单不完整（上限 ${WEB_MANIFEST_MAX_FILES}）：${itemId}`,
+        });
+        return;
+      }
+      const entry = pickWebEntry({ declared: project?.file, names: manifest.files });
+      if (!entry) {
+        sendJson(res, 404, { error: `网页壁纸工程找不到入口 html：${itemId}` });
+        return;
+      }
+      if (path === "/api/editor/web-manifest") {
+        sendJson(res, 200, {
+          ok: true,
+          itemId,
+          entry,
+          files: manifest.files,
+          count: manifest.files.length,
+          dir: itemBase,
+        });
+        return;
+      }
+      const rawRel = url.searchParams.get("path") ?? "";
+      const rel = normalizeWebRelPath(rawRel);
+      if (!rel) {
+        sendJson(res, 400, { error: `非法相对路径：${rawRel}` });
+        return;
+      }
+      const target = safeJoin(itemBase, rel);
+      if (!target) {
+        sendJson(res, 403, { error: `相对路径越界：${rel}` });
+        return;
+      }
+      if (!(await statFile(target))) {
+        // 分不清「不存在」与「是目录」的报错等于没说：目录给 400，缺失给 404
+        if (await asDirectory(target)) {
+          sendJson(res, 400, { error: `相对资源是目录：${rel}` });
+          return;
+        }
+        sendJson(res, 404, { error: `相对资源不存在：${rel}` });
+        return;
+      }
+      sendJson(res, 200, { ok: true, itemId, path: rel, url: webAssetUrl(itemId, rel, { token: DEV_TOKEN }) });
       return;
     }
 
