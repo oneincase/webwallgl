@@ -6401,6 +6401,31 @@ async function bootPlugins() {
     unmountTools = ui.mount("toolbar", pluginToolsEl);
   });
   syncPluginTools();
+  // ── 插件槽位接线（M10/D1）──
+  // 除主工具条外的槽位：每个槽位一个宿主容器（editor/index.html），沿用同一条纪律——
+  // 没有贡献就隐藏、切语言时重建（item.render 里可能用了 t()）。
+  const pluginSlotHosts: Array<[string, string]> = [
+    ["menu.export", "#ed-plugin-export"],
+    ["menu.add", "#ed-plugin-add"],
+    ["panel.right", "#ed-plugin-right"],
+    ["inspector.project", "#ed-plugin-project"],
+    ["statusbar", "#ed-plugin-status"],
+    ["viewport.overlay", "#ed-plugin-overlay"],
+  ];
+  const unmountPluginSlots: Array<() => void> = [];
+  const mountPluginSlots = () => {
+    for (const [slot, sel] of pluginSlotHosts) {
+      const host = $<HTMLElement>(sel);
+      const sync = () => (host.hidden = !ui.items(slot).length);
+      unmountPluginSlots.push(ui.mount(slot, host), ui.onChange(slot, sync));
+      sync();
+    }
+  };
+  mountPluginSlots();
+  onChangeLang(() => {
+    for (const off of unmountPluginSlots.splice(0)) off();
+    mountPluginSlots();
+  });
   await app.root.kernel.settle();
   for (const u of app.load.unresolved) log(et("log.pluginError", { name: u.name, where: "inject", msg: u.missing.join(", ") }), "warn");
   effectCatalog.onChange(() => renderInspector());
