@@ -1,5 +1,5 @@
 // 图层类型注册表（PLUGIN-ARCHITECTURE §3.5）：doc.ts 的 kindOf 先问插件登记的类型，
-// 都不认再走内置判定。内置 8 种由 builtin-layer-kinds 插件登记描述（能否挂效果 / 能否做关键帧 /
+// 都不认再走内置判定。内置 11 种由 builtin-layer-kinds 插件登记描述（能否挂效果 / 能否做关键帧 /
 // 新建入口），判定逻辑仍在 kindOf 里（builtin: true 的项不参与 match，避免两份判定分叉）。
 //
 // 插件图层类型只是「scene.json 里某种对象形状」的识别 + 编辑入口，对象本身必须是 WE 认识的
@@ -33,6 +33,13 @@ export const layerKinds = createRegistry<LayerKindDef>("layerKinds", {
 
 export const BUILTIN_LAYER_KINDS: LayerKindDef[] = [
   { kind: "image", builtin: true, canHaveEffects: true, canAnimate: true },
+  // 容器层（M5 A12）：image = "models/util/composelayer"，效果作用在整棵子树上 ——
+  // 引擎侧 renderContainerGroup 把子层画进组 FBO 再跑效果链，空容器读已渲染的背板
+  // （layerWantsPreserveBackdrop），所以容器和图片层一样能挂效果。
+  { kind: "container", builtin: true, canHaveEffects: true, canAnimate: true },
+  // 全屏后期层（M5 A12）：image = "models/util/projectlayer" / "fullscreenlayer"，
+  // 引擎按 general.orthogonalprojection 铺满整幅画布，效果跑在整幅画面上。
+  { kind: "fullscreen-post", builtin: true, canHaveEffects: true, canAnimate: true },
   { kind: "text", builtin: true, canHaveEffects: true, canAnimate: true },
   { kind: "particle", builtin: true, canAnimate: true },
   { kind: "model", builtin: true, canAnimate: true },
