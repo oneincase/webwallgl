@@ -63,9 +63,14 @@ export interface EngineService {
 
 export type CommandDef = {
   id: string;
+  /** 命令面板里的标题：i18n 词条名，或 { zh, en } 双语；缺省按 `cmd.<id>` 找词条、再退回 id 字面量 */
   title?: string | Record<string, string>;
+  /** 命令面板里的分类：同上；缺省归到「其它」 */
+  category?: string | Record<string, string>;
   /** 快捷键：「Mod+Shift+K」形式，Mod = ⌘ / Ctrl；数组 = 多个等价键 */
   keys?: string | readonly string[];
+  /** 面板里列出但不可直接执行：这条命令需要参数（例如导出目标 id），只能由别的入口调用 */
+  needsArg?: boolean;
   when?: () => boolean;
   run: (...args: unknown[]) => unknown;
 };

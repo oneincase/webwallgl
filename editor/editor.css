@@ -1713,3 +1713,125 @@ input.ed-al-name {
 #st-fps.idle {
   color: var(--wb-fg-mute);
 }
+
+/* ---------- 命令面板 + 动态快捷键总览（M9 / C4） ---------- */
+
+.ed-dialog.ed-palette {
+  width: min(620px, calc(100vw - 48px));
+}
+
+.ed-palette-top {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ed-palette-top .ed-dialog-title {
+  flex: 1;
+}
+
+.ed-palette-close {
+  padding: 1px 7px;
+}
+
+.ed-palette-input {
+  width: 100%;
+  margin: 10px 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--wb-line-strong);
+  border-radius: var(--wb-radius);
+  background: var(--wb-input);
+  color: var(--wb-fg-strong);
+  font: inherit;
+}
+
+.ed-palette-list,
+.ed-palette-shortcuts {
+  max-height: min(52vh, 420px);
+  overflow: auto;
+}
+
+.ed-palette-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--wb-radius);
+  background: none;
+  color: var(--wb-fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ed-palette-row.on {
+  border-color: var(--wb-line-strong);
+  background: var(--wb-bg-1);
+}
+
+.ed-palette-row.is-off {
+  opacity: 0.5;
+}
+
+.ed-palette-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-palette-id {
+  color: var(--wb-fg-mute);
+  font: 11px var(--mono);
+}
+
+.ed-palette-cat {
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-palette-kbd,
+.ed-palette-key-row kbd {
+  min-width: 46px;
+  padding: 1px 5px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-bg-1);
+  color: var(--wb-fg-dim);
+  font: 11px var(--mono);
+  text-align: center;
+}
+
+.ed-palette-group {
+  margin: 10px 0 4px;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+  text-transform: uppercase;
+}
+
+.ed-palette-key-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 8px;
+}
+
+.ed-palette-key-row kbd {
+  flex: none;
+  min-width: 74px;
+}
+
+.ed-palette-empty {
+  padding: 14px 8px;
+  color: var(--wb-fg-mute);
+  text-align: center;
+}
+
+.ed-palette-foot {
+  margin-top: 10px;
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+}
+

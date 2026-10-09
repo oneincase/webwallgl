@@ -112,6 +112,8 @@ import {
 import { createSettings } from "./services/settings";
 import { exporterAccepts, exporters, runExportPipeline, type Exporter } from "./export-pipeline";
 import { schemaForm } from "./ui/schema-form";
+// 命令面板（M9/C4）：只从 commands 注册表枚举，没有第二份手写命令表
+import { createCommandPalette, type CommandPalette } from "./ui/command-palette";
 import type { DocService } from "./services/types";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
@@ -2099,6 +2101,13 @@ redoEl.onclick = () => undoRedo("redo");
 window.addEventListener("keydown", (e) => {
   const tag = (e.target as HTMLElement | null)?.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  // 命令面板（M9/C4）：面板是查看命令注册表的入口，不是一条文档命令（注册表保持 7 条内置），
+  // 所以开关直接在这里处理；面板内的输入框在面板自己的 keydown 里开合，不会走到这里。
+  if ((e.metaKey || e.ctrlKey) && (e.key.toLowerCase() === "k" || (e.shiftKey && e.key.toLowerCase() === "p"))) {
+    e.preventDefault();
+    ensurePalette()?.toggle();
+    return;
+  }
   // 命令服务优先（插件可登记 / 覆盖快捷键）；内核起来之前走下面的内置链
   if (app?.commands.handleKey(e)) {
     e.preventDefault();
@@ -4274,7 +4283,6 @@ function renderTree() {
   const walk = (nodes: LayerNode[], depth: number) => {
     for (const n of nodes) {
       if (!view.visible.has(String(n.id))) continue;
-      frag.appendChild(treeRow(n, depth, view.matched.has(String(n.id))));
       // 过滤中忽略折叠（否则命中项会被折叠的祖先挡掉）；平时尊重折叠状态
       if (n.children.length && (view.filtering || !collapsed.has(n.id))) walk(n.children, depth + 1);
     }
@@ -4282,6 +4290,55 @@ function renderTree() {
   walk(doc.roots, 0);
   treeEl.appendChild(frag);
 }
+
+// 容器是 #ed-tree[role=tree][aria-multiselectable]。多选依旧走 ⇧/⌘ 点击，这里只动焦点与主选。
+
+/** 当前视图里按顺序排好的树行 */
+  return [...treeEl.querySelectorAll<HTMLElement>(".ed-node")];
+}
+
+/** dataset 里的 id 是字符串、文档里的 id 可能是数字：两种都试（findNode 是 === 比较） */
+  if (!doc) return null;
+  const direct = findNode(doc.roots, id);
+  if (direct) return direct;
+  const num = Number(id);
+  return Number.isFinite(num) ? findNode(doc.roots, num) : null;
+}
+
+}
+
+/** 焦点落到某一行上（行已被 renderTree 重建时重新取一次） */
+  if (!row) return;
+  row.focus({ preventScroll: false });
+}
+
+}
+
+  return rows.map((row) => {
+  });
+}
+
+/** 焦点 + 主选一起移动（与点选口径一致：清掉追加选中） */
+  if (!row?.dataset.id) return;
+  if (!node) return;
+  selectLayer(node.id);
+}
+
+/** 展开/折叠一行：折叠集合是渲染状态的唯一来源，改完重绘并保住焦点 */
+  const id = row.dataset.id;
+  if (!node || id === undefined) return;
+  else collapsed.add(node.id);
+  renderTree();
+}
+
+treeEl.addEventListener("keydown", (e) => {
+  const row = (e.target as HTMLElement | null)?.closest?.(".ed-node") as HTMLElement | null;
+  if (!row || !doc || doc.type !== "scene") return;
+  if (!action) return;
+  const target = rows[action.index];
+  if (!target) return;
+  e.preventDefault();
+});
 
 // ---------- 图层树搜索 / 隔离（C2）：视图过滤，不动文档与选中 ----------
 
@@ -4380,6 +4437,7 @@ function treeRow(n: LayerNode, depth: number, match = false): HTMLElement {
   const row = document.createElement("div");
   row.className = "ed-node";
   row.setAttribute("role", "treeitem");
+  // 展开态只给有子层的行；选中态与 .selected 类同源（主选 + ⇧/⌘ 追加的 extraSel）
   if (n.id === selectedId) row.classList.add("selected");
   else if (extraSel.has(String(n.id))) row.classList.add("selected", "extra-selected");
   if (match) row.classList.add("match");
@@ -6709,6 +6767,12 @@ function scriptsGroup(node: LayerNode): HTMLElement {
     o.textContent = t;
     add.appendChild(o);
   }
+  const tpl = document.createElement("select");
+  tpl.disabled = !editable;
+    const o = document.createElement("option");
+    o.value = life;
+    tpl.appendChild(o);
+  }
   add.addEventListener("change", () => {
     const t = add.value;
     if (t) objEdit(et("log.scAdded", { target: t, layer: nodeName(node.id) }), node.id, (o) => setScript(o, t, scriptTemplate(t)));
@@ -7227,6 +7291,37 @@ const docService: DocService = {
   log: (msg, level) => log(msg, level),
 };
 
+// ── 命令面板 + 动态快捷键总览（M9/C4）──
+// 面板条目、输入过滤、快捷键总览三处都只从 commands 注册表（editor/services/commands.ts）枚举，
+// 没有第二份手写命令表：标题 / 分类由 id 按约定推出（`cmd.<id>` / `cmd.cat.<id 首段>`，词条在
+// editor/i18n.ts），需要自定义文案的命令在 CommandDef.title / .category 上覆盖。
+let commandPalette: CommandPalette | null = null;
+
+/** 懒建命令面板（打开前不碰这几个 DOM；宿主缺失时返回 null 而不是抛） */
+function ensurePalette(): CommandPalette | null {
+  if (commandPalette) return commandPalette;
+  const cmds = app?.commands;
+  const dialog = $<HTMLDialogElement>("#ed-palette");
+  if (!cmds || !dialog) return null;
+  commandPalette = createCommandPalette({
+    dialog,
+    input: $<HTMLInputElement>("#ed-palette-input"),
+    list: $<HTMLElement>("#ed-palette-list"),
+    shortcuts: $<HTMLElement>("#ed-palette-shortcuts"),
+    keysButton: $<HTMLButtonElement>("#ed-palette-keys"),
+    closeButton: $<HTMLButtonElement>("#ed-palette-close"),
+    commands: cmds,
+    t: (key, params) => et(key, params),
+    has: hasText,
+    text: (v, fallback) => textOf(v, getLang(), fallback),
+    log: (msg) => log(msg, "warn"),
+  });
+  onChangeLang(() => commandPalette?.refresh());
+  return commandPalette;
+}
+
+$<HTMLButtonElement>("#ed-palette-btn").onclick = () => ensurePalette()?.open();
+
 const builtinUiPlugin = {
   name: "builtin-ui",
   inject: ["inspector", "inspector.tabs", "puppet.tools", "exporters", "commands"],
@@ -7237,13 +7332,16 @@ const builtinUiPlugin = {
     ctx.contribute("exporters", VIDEO_EXPORTER);
     const cmds = ctx.get("commands");
     const cmd = (c: Parameters<typeof cmds.register>[0]) => ctx.effect(() => cmds.register(c, ctx.name));
+    // 内置命令：展示信息（标题 / 分类）由 id 按约定推出（`cmd.<id>` / `cmd.cat.<id 首段>`，见
+    // editor/ui/command-palette.ts），词条补在 editor/i18n.ts —— 命令面板与动态快捷键总览
+    // 只枚举这份注册表，没有第二份手写命令表；需要自定义文案的命令在 CommandDef 上写 title/category。
     cmd({ id: "edit.undo", keys: "Mod+Z", run: () => undoRedo("undo") });
     cmd({ id: "edit.redo", keys: ["Mod+Shift+Z", "Mod+Y"], run: () => undoRedo("redo") });
     cmd({ id: "file.save", keys: "Mod+S", run: () => void saveDocument() });
     cmd({ id: "layer.duplicate", keys: "Mod+D", run: () => duplicateSelected() });
     cmd({ id: "layer.rename", keys: "F2", when: () => selectedId !== null, run: (name) => (typeof name === "string" ? renameLayer(selectedId!, name) : beginRename(selectedId!)) });
     cmd({ id: "layer.delete", keys: ["Delete", "Backspace"], when: () => selectedId !== null, run: () => deleteSelected() });
-    cmd({ id: "export.run", run: (id) => void runExport(String(id)) });
+    cmd({ id: "export.run", needsArg: true, run: (id) => void runExport(String(id)) });
   },
 };
 
