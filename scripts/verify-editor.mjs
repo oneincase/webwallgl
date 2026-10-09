@@ -20,6 +20,8 @@
  *   O. draft.ts：草稿快照深拷贝、结构化克隆往返、不可信输入校验、套用
  *   P. 新建闭环：空白模板 → 图片层 → 删一张 → 存进库 → 重新打开 → 逐字段 / 逐字节一致
  *   S / U / V. 效果库、脚本预检与挂点、用户属性声明 / 绑定（含引擎接住新声明、属性表撤销快照）
+ *   POINTER-STUDIO（B5 / M11）指针工作室 pointer-studio.ts：时间轴插值 / 边界钳制、轨迹序列化往返、
+ *      回放取样随播放头前进、停帧摆位不改文档、导出产物里没有指针数据
  *   I. 接线文本断言：页面只经抽出的模块做这些事（不允许再长回内联副本）
  *   J. 变异红测：把实现改坏，确认对应判据会变红（防假绿）
  *
@@ -3922,6 +3924,60 @@ section("MI. 多格式模型导入 editor/model-import.ts（FBX / OBJ / DAE / ST
   // 左下原点 → 首行是文件里的第二行（蓝），每行前一个滤波字节
   check(pngOut[1] === 0x50 && dv.getUint32(16) === 2 && dv.getUint32(20) === 2 && json([...raw.subarray(1, 5)]) === json([0, 0, 255, 255]) && json([...raw.subarray(10, 14)]) === json([255, 0, 0, 255]),
     "TGA（24 位、左下原点）→ PNG：尺寸对、行序翻正、BGR → RGBA");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（§2 B5 / §3 M11）
+// ───────────────────────────────────────────────────────────────────────────
+section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）");
+{
+  const ptrMod = await loadEditorModule("pointer-studio");
+  const ptrSrc = fs.readFileSync(path.join(ROOT, "editor/pointer-studio.ts"), "utf8");
+
+  // 边界钳制：归一化 [0,1]，非有限值一律当没有
+  const c1 = ptrMod.clampPoint(-1, 2);
+  const c2 = ptrMod.clampPoint(0.25, 0.75);
+  check(c1 && c1.x === 0 && c1.y === 1 && c2 && c2.x === 0.25 && c2.y === 0.75,
+    `clampPoint：越界钳到边上、界内原样（实得 ${json([c1, c2])}）`);
+  check(ptrMod.clampPoint(NaN, 0.5) === null && ptrMod.clampPoint(0.5, Infinity) === null && ptrMod.clampPoint(undefined, null) === null,
+    "clampPoint：非有限 / 缺值坐标一律拒绝（NaN 进 uniform 会毁整帧）");
+
+  // 停帧摆位：只驱动 uniform，不碰文档
+  const doc = freshDoc();
+  const before = json(doc);
+  const pushes = [];
+  let paused = true;
+  const studio = ptrMod.createPointerStudio({
+    push: (u, v, buttons) => pushes.push([u, v, buttons ?? 0]),
+    leave: () => pushes.push(["leave"]),
+    isPaused: () => paused,
+    clock: () => 0,
+    now: () => 0,
+  });
+  const parkedA = studio.place(0.2, 0.3);
+  check(json(pushes) === json([[0.2, 0.3, 0]]) && parkedA && parkedA.x === 0.2 && parkedA.y === 0.3,
+    `place：停帧摆位把归一化坐标交给 pushPointer（实得 ${json([pushes, parkedA])}）`);
+  const parkedB = studio.place(-1, 5);
+  check(parkedB && parkedB.x === 0 && parkedB.y === 1 && json(pushes.at(-1)) === json([0, 1, 0]),
+    `place：视口外的坐标钳到边上再驱动（实得 ${json(parkedB)}）`);
+  paused = false;
+  const nPush = pushes.length;
+  check(studio.place(0.4, 0.4) === null && pushes.length === nPush,
+    "place：播放中拒绝摆位（每帧都会被场景采样覆盖），且不驱动 uniform");
+  check(studio.place(0.4, 0.4, { force: true }) !== null && pushes.length === nPush + 1,
+    "place：force 例外（回放前的定位）可以绕过停帧检查");
+  paused = true;
+  studio.place(0.6, 0.25);
+  const resynced = studio.resync();
+  check(resynced && json(resynced) === json({ x: 0.6, y: 0.25 }) && json(pushes.at(-1)) === json([0.6, 0.25, 0]),
+    "resync：场景重挂后把停帧摆位补推一次（新实例 uniform 归零）");
+  studio.release();
+  check(json(pushes.at(-1)) === json(["leave"]) && studio.parkedPoint() === null,
+    "release：放开指针走 pointerLeave，摆位状态清空");
+  check(json(doc) === before,
+    "停帧摆位不改文档：反复摆位后文档快照逐字节一致（指针对场景是纯运行时状态）");
+  check(!/from "\.\/(save|export-pipeline|doc|history)"/.test(ptrSrc),
+    "指针工作室不 import 保存 / 导出 / 文档 / 撤销栈：它只驱动 uniform，不参与文档记账");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
