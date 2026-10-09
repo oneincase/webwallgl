@@ -38,6 +38,7 @@ import { load, save } from "../shared/workbench/storage";
 import { libraryKindOf, mountLibraryPanel } from "./ui/library-panel";
 import { mountWallpaperConfig } from "./ui/wallpaper-config";
 import { mountRenderSettings } from "./ui/render-settings";
+import { mountSceneSettings } from "./scene-settings";
 import { createElementAudioSource, type ElementAudioSource } from "./audio-live";
 import { mountPerfPanel } from "./ui/perf-panel";
 import { bindThemeButton } from "../shared/workbench/theme";
@@ -251,8 +252,10 @@ import {
 import { scriptsAllowedByDefault, scriptsOverrideFrom, type ContentKind } from "./trust";
 import {
   duplicateLayer,
+  ensureSceneGeneral,
   findNode,
   findPath,
+  generalSnapshot,
   groupLayer,
   groupLayers,
   isLockedObj,
@@ -261,10 +264,12 @@ import {
   placeLayer,
   rebuildTree,
   removeLayer,
+  restoreGeneral,
   sceneResolution,
   setLocked,
   topLevelIds,
   unwrap,
+  writeGeneralField,
   writeObjProps,
   type EditorDoc,
   type LayerNode,
@@ -343,6 +348,7 @@ import {
   batchCommand,
   isBatch,
   isNoopEdit,
+  isSceneCmd,
   isStruct,
   isTitleCmd,
   isVideoCmd,
@@ -1429,6 +1435,92 @@ renderOptsEl.onclick = (e) => {
 document.addEventListener("click", (e) => {
   if (!renderMenuEl.hidden && !renderMenuEl.contains(e.target as Node)) closeRenderMenu();
 });
+
+// ---------- 场景设置（计划 A4）：scene.json 的 general 段 ----------
+//
+// 和上面的「渲染选项」是两回事：那是本机 UI 偏好（localStorage、不进工程），
+// 这里是这份壁纸自己的参数 —— 写进 doc.scene.general、进撤销栈、跟着文档保存。
+// 面板本体在 editor/scene-settings.ts，这里只管记账、重挂与菜单开合。
+
+const sceneOptsEl = $<HTMLButtonElement>("#tb-scene-opts");
+const sceneMenuEl = $<HTMLElement>("#scene-menu");
+
+/** general 段快照（"null" = 这份文档本来没有 general 键） */
+function sceneSnap(): string {
+  return generalSnapshot(doc?.scene ?? null);
+}
+
+/** 把 general 段换回快照并重挂：撤销 / 重做共用（与结构编辑同一条路，改完必须整场景重挂才生效） */
+function applySceneSnap(json: string) {
+  if (!doc?.scene) return;
+  restoreGeneral(doc.scene, json);
+  docDriven = true;
+  markDirty();
+  renderInspector();
+  void mountCurrent(true);
+  sceneSettings.refresh();
+}
+
+/**
+ * 改一个场景设置字段：改一次进一次撤销栈（范式同工程改名 TitleCmd —— 结构命令的快照装不下 general）。
+ * 值没变（点一下没动 / 改回原值）不入栈；改完置 docDriven 再重挂，引擎拿到的才是文档里的 general。
+ */
+function sceneEdit(label: string, key: string, value: unknown): boolean {
+  if (!doc?.scene) {
+    log(et("log.sceneNoDoc"), "warn");
+    return false;
+  }
+  const before = sceneSnap();
+  writeGeneralField(ensureSceneGeneral(doc.scene), key, value);
+  const after = sceneSnap();
+  if (after === before) return false;
+  edits.push({ kind: "scene", label, before, after });
+  syncHistoryButtons();
+  docDriven = true;
+  markDirty();
+  log(label);
+  void mountCurrent(true);
+  return true;
+}
+
+const sceneSettings = mountSceneSettings({
+  root: $<HTMLElement>("#scene-menu-body"),
+  scene: () => doc?.scene ?? null,
+  edit: sceneEdit,
+  bad: (msg) => log(msg, "warn"),
+});
+onChangeLang(() => sceneSettings.refresh());
+
+function closeSceneMenu() {
+  sceneMenuEl.hidden = true;
+}
+
+sceneOptsEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!sceneMenuEl.hidden) {
+    closeSceneMenu();
+    return;
+  }
+  closeExportMenu();
+  closeRenderMenu();
+  sceneSettings.refresh();
+  const r = sceneOptsEl.getBoundingClientRect();
+  sceneMenuEl.style.left = `${r.left}px`;
+  sceneMenuEl.style.top = `${r.bottom + 2}px`;
+  sceneMenuEl.hidden = false;
+  // 工具条在视口下方，往下放不下就翻到按钮上方；左侧越界也夹回窗口内（同渲染选项菜单）
+  const box = sceneMenuEl.getBoundingClientRect();
+  if (r.bottom + 2 + box.height > window.innerHeight - 6) {
+    sceneMenuEl.style.top = `${Math.max(6, r.top - box.height - 2)}px`;
+  }
+  if (r.left + box.width > window.innerWidth - 6) {
+    sceneMenuEl.style.left = `${Math.max(6, window.innerWidth - box.width - 6)}px`;
+  }
+};
+document.addEventListener("click", (e) => {
+  if (!sceneMenuEl.hidden && !sceneMenuEl.contains(e.target as Node)) closeSceneMenu();
+});
+
 async function capturePreview(): Promise<Blob | null> {
   if (!editor || !doc) return null;
   const res = sceneResolution(doc.scene);
@@ -1987,6 +2079,11 @@ function undoRedo(dir: "undo" | "redo") {
   if (isTitleCmd(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
     applyTitleSnap(dir === "undo" ? cmd.before : cmd.after);
+    return;
+  }
+  if (isSceneCmd(cmd)) {
+    log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    applySceneSnap(dir === "undo" ? cmd.before : cmd.after);
     return;
   }
   void applyPatch(cmd.id, dir === "undo" ? cmd.before : cmd.after);
