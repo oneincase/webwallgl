@@ -35,6 +35,11 @@ export type {
   SceneScriptCheck,
   EditorLayer,
   EditorLayerKind,
+  // M12（W2b / W5）：增量装配 + GL overlay 通道的公开类型
+  EditorLayerAddSpec,
+  EditorHotAddCheck,
+  EditorOverlayMode,
+  EditorOverlayStats,
   EditorCaptureOptions,
   EditorFrameOptions,
   EditorHitTestOptions,

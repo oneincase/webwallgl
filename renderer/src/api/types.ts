@@ -962,6 +962,72 @@ export type EditorControls = {
    * 已声明的名字只更新值（等价 setProperties）。暂停中会补画一帧，Promise 在该帧画完后落地。
    */
   declareUserProperties(decls: Record<string, EditorUserPropertyDecl>): Promise<void>;
+  /**
+   * 叠加层渲染通道（M12 / W5）。`"2d"`（缺省）= 页面侧 #ed-overlay 2D canvas 描边，
+   * 引擎不出手；`"gl"` = 引擎在自己的 GL 上下文里画选中框 / 手柄；`"off"` = 都不画。
+   * GL 通道不可用（上下文丢失 / 程序链接失败）时 `getOverlayStats().glOk` 为 false，
+   * 页面 2D 回退路径照旧 —— 两者是叠加，不是二选一。
+   */
+  setOverlayMode(mode: EditorOverlayMode): Promise<EditorOverlayMode>;
+  getOverlayMode(): EditorOverlayMode;
+  /** 当前选中层（null = 不画）。GL 通道每帧按它取轮廓。 */
+  setOverlayTarget(id: number | string | null): Promise<void>;
+  /** 叠加层统计：mode / target / 本帧线段数 / 累计出帧数 / GL 是否可用 */
+  getOverlayStats(): EditorOverlayStats;
+  /**
+   * 增量装配（M12 / W2b，热增）：不重建整个场景就能加一个图层。
+   * 判定为不可热增时 `ok: false` 并给出 `reason`（异步装配 / 两阶段 init /
+   * 容器变换未定案），页面据此走整场景重挂兜底。
+   */
+  canHotAddLayer(spec: EditorLayerAddSpec): EditorHotAddCheck;
+  /** 热增一个图层（`duplicateOf` 复制既有层，或 `obj` 给原始 scene.json 对象），
+   *  返回新层的 EditorLayer；不可热增时 reject（原因与 canHotAddLayer 同文案）。 */
+  addLayer(spec: EditorLayerAddSpec): Promise<EditorLayer>;
+  /** 热删一个图层（含其子树）：从 scene.layers 摘除并同步所有装配期登记表。 */
+  removeLayer(id: number | string): Promise<void>;
+  /** 热重排：toIndex 为**插入位**（先摘后插语义，数组下标 = 绘制序，末尾最上）。 */
+  reorderLayer(id: number | string, toIndex: number): Promise<void>;
+  /**
+   * 单脚本沙箱热替换（M12 / W8）：新源码在与装配期**逐字相同**的 env 里重新求值，
+   * 换掉的只是槽位背后那一代沙箱（init + applyUserProperties 立刻重跑，熔断计数重置）。
+   * 编译失败时 reject 且旧沙箱保持不变；空字符串 = 摘掉该挂点。
+   * `target` 与 `editor/scripts.ts` 的挂点词汇一致：`text` / 对象字段名 / `effects[i].visible`。
+   */
+  setLayerScript(id: number | string, target: string, code: string): Promise<void>;
+};
+
+/** 叠加层模式（M12 / W5）：页面 2D 描边 / 引擎 GL pass / 都不画 */
+export type EditorOverlayMode = "off" | "2d" | "gl";
+
+/** 叠加层统计（M12 / W5） */
+export type EditorOverlayStats = {
+  mode: EditorOverlayMode;
+  /** 当前选中层 id（null = 无目标） */
+  target: number | string | null;
+  /** 本帧提交的线段数（0 = 这一帧没画：无目标 / 不可见 / GL 不可用） */
+  segments: number;
+  /** 累计真正出帧次数（用于判据断言「GL 通道真的在画」） */
+  draws: number;
+  /** GL pass 是否可用（false 时页面必须留在 2D 回退路径） */
+  glOk: boolean;
+  /** glOk=false 的原因（`no-gl` / `link-failed: …`）；glOk=true 时为空串 */
+  reason: string;
+};
+
+/** 热增图层的请求（M12 / W2b）：`duplicateOf` 与 `obj` 二选一 */
+export type EditorLayerAddSpec = {
+  /** 复制既有层（贴图必然已驻留，是热增里唯一不需要异步的形态） */
+  duplicateOf?: number | string;
+  /** 原始 scene.json 对象（与库内 scene.json 的 `objects[i]` 同形） */
+  obj?: Record<string, unknown>;
+  /** 插入下标（数组下标 = 绘制序，末尾最上）；缺省 = 追加到最上 */
+  toIndex?: number;
+};
+
+/** 热增可行性（M12 / W2b）：ok=false 时 reason 说明为什么必须走整场景重挂 */
+export type EditorHotAddCheck = {
+  ok: boolean;
+  reason: string;
 };
 
 /** 用户属性声明（project.json `general.properties` 的条目形状） */

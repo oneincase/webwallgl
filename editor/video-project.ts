@@ -110,6 +110,19 @@ export async function mountVideoStage(stage: HTMLElement, bytes: Uint8Array, fit
     getScriptIssues: () => [],
     getSkippedScripts: () => 0,
     declareUserProperties: async () => {},
+    // M12：视频项目没有场景图层 / GL 通道，这些入口一律给「无」语义（不是抛错）——
+    // 编辑器页对视频工程复用同一套控制面，抛错会在面板刷新路径上炸成红条。
+    setOverlayMode: async () => "off" as const,
+    getOverlayMode: () => "off" as const,
+    setOverlayTarget: async () => {},
+    getOverlayStats: () => ({ mode: "off" as const, target: null, segments: 0, draws: 0, glOk: false, reason: "video-project" }),
+    canHotAddLayer: () => ({ ok: false, reason: "视频工程没有场景图层" }),
+    addLayer: async () => {
+      throw new Error("视频工程没有场景图层");
+    },
+    removeLayer: async () => {},
+    reorderLayer: async () => {},
+    setLayerScript: async () => {},
   };
   const base = {
     get canvas() {

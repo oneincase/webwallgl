@@ -642,6 +642,50 @@ for (const name of REQUIRED_WP) {
   );
 }
 
+// ---------- M12 / B1 B2 B3：增量装配 + overlay 通道（引擎写测） ----------
+// 为什么值得一条结构断言：M12 新增的两个纯模块（数组手术 / overlay 几何）是**离线
+// 判据的唯一驱动面** —— 它们一旦 import 了引擎 vendor 或 DOM，verify-editor 的
+// 离线段就再也跑不起来（会连带把 1154 项里的一大片判据拖成「必须在浏览器里跑」）。
+// 同时确认公开面确实挂在 api/editor.ts 上：页面侧只准 import renderer/src/api/*.
+{
+  const { pathToFileURL: toUrl } = await import("node:url");
+  const pureMods = [
+    ["renderer/src/editor/layer-order.ts", ["insertLayerAt", "detachLayer", "moveLayerTo", "shiftLayer", "collectSubtreeIds", "layerIndexOf"]],
+    ["renderer/src/editor/overlay.ts", ["normalizeOverlayMode", "overlaySegments", "outlineSegments", "gizmoSegments", "segmentCount"]],
+  ];
+  for (const [rel, need] of pureMods) {
+    const abs = path.join(ROOT, rel);
+    let mod = null;
+    try {
+      mod = await import(toUrl(abs).href);
+    } catch (e) {
+      check(false, `M12 纯模块必须能被 Node 直接加载（离线判据的驱动面）：${rel} —— ${String(e && e.message)}`);
+      continue;
+    }
+    for (const name of need) check(typeof mod[name] === "function", `M12 ${rel} 必须导出 ${name}`);
+    const src = fs.readFileSync(abs, "utf8");
+    check(
+      !/from\s+"[^"]*we-scene/.test(src) && !/\b(window|document)\s*\./.test(src),
+      `M12 ${rel} 必须是纯模块（不得 import 引擎 vendor、不得碰 window/document）`,
+    );
+  }
+  // overlay-gl 允许用 WebGL 类型，但**不得在模块顶层**求值 DOM / 建上下文
+  const glSrc = fs.readFileSync(path.join(ROOT, "renderer/src/editor/overlay-gl.ts"), "utf8");
+  check(
+    !/^\s*(?:const|let|var)\s+\w+\s*=\s*(?:window|document)\b/m.test(glSrc),
+    "M12 overlay-gl.ts 不得在顶层求值 window/document（GL 上下文只能由 createOverlayPass 收进来）",
+  );
+  // 公开面：四个新类型 + 九个新成员必须出现在编辑器包出口
+  const editorApi = fs.readFileSync(path.join(ROOT, "renderer/src/api/editor.ts"), "utf8");
+  for (const t of ["EditorOverlayMode", "EditorOverlayStats", "EditorLayerAddSpec", "EditorHotAddCheck"]) {
+    check(editorApi.includes(t), `M12 新类型 ${t} 必须从 renderer/src/api/editor.ts 出口导出（页面不许 import 深层实现）`);
+  }
+  const sceneMountSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  for (const m of ["setOverlayMode", "getOverlayStats", "canHotAddLayer", "addLayer", "removeLayer", "reorderLayer", "setLayerScript"]) {
+    check(sceneMountSrc.includes(m), `M12 引擎控制面必须实现 ${m}（装配核心 renderer/src/scene-mount.ts）`);
+  }
+}
+
 // ---------- 汇总 ----------
 if (errors.length) {
   console.error(`verify-arch：${errors.length} 处边界破坏`);
