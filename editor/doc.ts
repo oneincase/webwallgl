@@ -63,6 +63,21 @@ export function unwrap(v: unknown): unknown {
   return v;
 }
 
+/**
+ * 字段是不是「受绑定驱动的包装」。引擎本版本**不要求 value**：
+ * `renderer/vendor/we-scene/scene/parse.js:532-546` 认 `typeof v.script === "string" && v.script`，
+ * `parse.js:583-598` 认 `v.animation.options`。所以带 script / animation 但没有 value 快照的字段
+ * 也算包装 —— 否则编辑一次就把整块换成裸值，把作者的脚本 / 曲线删掉（审计 L2）。
+ */
+export function isFieldWrapper(v: unknown): v is Record<string, unknown> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  if ("value" in o) return true;
+  if (typeof o.script === "string" && o.script) return true;
+  const anim = o.animation;
+  return !!anim && typeof anim === "object" && !Array.isArray(anim) && "options" in (anim as object);
+}
+
 function parseVisible(v: unknown): boolean {
   const raw = unwrap(v);
   if (raw === undefined || raw === null) return true;
@@ -150,7 +165,7 @@ const vecStr = (v: readonly number[]) => v.map(num).join(" ");
 export function writeObjProps(obj: SceneObject, patch: Partial<EditorLayerProps>): void {
   const put = (key: string, value: unknown) => {
     const cur = obj[key];
-    if (cur && typeof cur === "object" && !Array.isArray(cur) && "value" in (cur as object)) {
+    if (isFieldWrapper(cur)) {
       (cur as { value: unknown }).value = value;
     } else {
       obj[key] = value;

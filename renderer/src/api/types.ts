@@ -1029,7 +1029,9 @@ export type EditorControls = {
   addLayer(spec: EditorLayerAddSpec): Promise<EditorLayer>;
   /** 热删一个图层（含其子树）：从 scene.layers 摘除并同步所有装配期登记表。 */
   removeLayer(id: number | string): Promise<void>;
-  /** 热重排：toIndex 为**插入位**（先摘后插语义，数组下标 = 绘制序，末尾最上）。 */
+  /** 热重排：toIndex 为**目标下标**（搬完之后这一层在 scene.layers 里的位置，
+   *  与 `EditorLayer.index` 同一口径，越界夹到端点；数组下标 = 绘制序，末尾最上）。
+   *  目标即原位 = 空操作 resolve；只有图层不存在 / 下标非有限数才 reject。 */
   reorderLayer(id: number | string, toIndex: number): Promise<void>;
   /**
    * 单脚本沙箱热替换（M12 / W8）：新源码在与装配期**逐字相同**的 env 里重新求值，

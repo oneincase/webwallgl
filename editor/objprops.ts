@@ -16,7 +16,7 @@
 //
 // 类型只对 read 档下断言；unread 档一律 `raw`（JSON 文本框，原样进原样出）。
 
-import type { SceneObject } from "./doc";
+import { isFieldWrapper, type SceneObject } from "./doc";
 
 export type ObjFieldType = "bool" | "number" | "int" | "vec2" | "enum" | "json" | "raw";
 
@@ -81,9 +81,13 @@ export const objFieldOf = (key: string): ObjFieldSpec | undefined =>
 /** i18n 键：字段语义说明（zh / en 各一条，键恰好出现两次由 verify-editor 守） */
 export const objFieldNoteKey = (key: string): string => `objp.n.${key.toLowerCase()}`;
 
-/** `{user|script|animation, value}` 包装（受用户属性 / 脚本 / 曲线驱动的字段） */
+/**
+ * `{user|script|animation, value}` 包装（受用户属性 / 脚本 / 曲线驱动的字段）。
+ * 判据与 doc.ts 的 {@link isFieldWrapper} 同一份：引擎不要求 value（`parse.js:532-546` 只要
+ * 非空 script、`parse.js:583-598` 只要 `animation.options`），所以「无 value 的绑定」也得算包装。
+ */
 export function isObjWrapper(v: unknown): v is Record<string, unknown> {
-  return !!v && typeof v === "object" && !Array.isArray(v) && "value" in (v as object);
+  return isFieldWrapper(v);
 }
 
 /** 包装取快照值；裸值原样返回 */

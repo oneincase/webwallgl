@@ -24,6 +24,7 @@ import { createOverlayPass, type OverlayPass } from "./editor/overlay-gl";
 // M12 / W8：脚本挂点热替换的转发句柄与 swap 语义（纯逻辑，离线可驱动）。
 import {
   createScriptSlot,
+  upsertRun,
   type EditorScriptSlot,
   type ScriptSlotHost,
 } from "./editor/script-slot";
@@ -969,8 +970,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         target: string,
         build: (code: string) => any,
         activate: (sb: any, first: boolean) => void,
-      ): EditorScriptSlot =>
-        createScriptSlot({ layer, target, build, activate, host: scriptsOff ? slotHostNoCount : scriptSlotHost });
+      ): EditorScriptSlot => {
+        const slot = createScriptSlot({ layer, target, build, activate, host: scriptsOff ? slotHostNoCount : scriptSlotHost });
+        // 登记槽位：这张表是 setLayerScript 能按「图层 + 挂点」找到挂点、
+        // 以及拆层时把旧句柄转成停用态的唯一来源。漏登记 = 热替换 API 恒 reject
+        // + 拆层后旧沙箱继续每帧跑（三个调用点都在这里统一登记，不靠调用方自觉）。
+        editorScriptSlots.push(slot);
+        return slot;
+      };
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
@@ -1226,7 +1233,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           list = [];
           animEventSinks.set(layer, list);
         }
-        list.push(sink);
+        // 热替换重跑登记：同一沙箱的同一挂点只留一条，否则 animationEvent
+        // 会被派发两次（转发型脚本会把同一次事件当两次处理）。
+        upsertRun(
+          list,
+          (s: any) => s?.sandbox === sink.sandbox && s?.kind === sink.kind && s?.field === sink.field,
+          sink,
+        );
       };
       // 调试出口：音频状态 / 强制静音（音频响应 A/B 对比验证用）
       (window as unknown as Record<string, unknown>).__audioStats = () => ({
@@ -5378,7 +5391,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (!sandbox || typeof sandbox.callCursor !== "function") return;
         if (!sandbox.hasCursorHook) return;
         const list = cursorHooks.get(layer);
-        if (list) list.push(sandbox);
+        // 热替换会重跑登记：同一稳定句柄只留一条（否则一次鼠标移动被派发两次）。
+        if (list) upsertRun(list, (s: any) => s === sandbox, sandbox);
         else cursorHooks.set(layer, [sandbox]);
       };
       // 文字层的 cursor* 回调（3786330502 的悬停交互挂在文字层上）
@@ -5935,7 +5949,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               let animRun: any = null;
               if (sandbox.hasUpdate) {
                 animRun = { effect, sandbox, last: ivRet };
-                effectVisibleRuns.push(animRun);
+                // 热替换重跑 activate：按效果身份替换旧条目，否则同一效果每帧求值两遍。
+                upsertRun(effectVisibleRuns, (r: any) => r?.effect === effect, animRun);
               }
               // [we-scene patch] animationEvent 进图层级广播表（官方事件消费口；
               // 转发脚本常无 update，必须独立于 hasUpdate 登记——3163060610 的
@@ -6067,21 +6082,27 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // 只有真的导出了 update 的脚本才进逐帧字段求值队列。
                 // 纯 cursor 交互脚本（拖拽类）没有 update，进队列只会每帧白跑一次。
                 if (sandbox.hasUpdate) {
-                  objectScriptRuns.push({
-                    layer,
-                    field,
-                    // 变换字段逐帧也在 local 槽上收发（与 init 同一空间）。
-                    slot: initSlot,
-                    kind: field === "visible"
-                      ? "bool"
-                      : ["alpha", "brightness", "maxwidth", "pointsize", "volume", "intensity", "exponent"].includes(field)
-                        ? "scalar"
-                        : "vec3",
-                    sandbox,
-                    // visible 字段的逐帧反馈种子（init 未折叠返回值，同
-                    // effectVisibleRuns；淡出计时器脚本挂在图层 visible 上时靠它）。
-                    last: field === "visible" ? ir : undefined,
-                  });
+                  // 热替换重跑 activate：同一「图层 + 字段」只留最新一条，
+                  // 否则该字段的 update 每帧被调用两次（脚本内部累计量双倍推进）。
+                  upsertRun(
+                    objectScriptRuns,
+                    (r: any) => r?.layer === layer && r?.field === field,
+                    {
+                      layer,
+                      field,
+                      // 变换字段逐帧也在 local 槽上收发（与 init 同一空间）。
+                      slot: initSlot,
+                      kind: field === "visible"
+                        ? "bool"
+                        : ["alpha", "brightness", "maxwidth", "pointsize", "volume", "intensity", "exponent"].includes(field)
+                          ? "scalar"
+                          : "vec3",
+                      sandbox,
+                      // visible 字段的逐帧反馈种子（init 未折叠返回值，同
+                      // effectVisibleRuns；淡出计时器脚本挂在图层 visible 上时靠它）。
+                      last: field === "visible" ? ir : undefined,
+                    },
+                  );
                 }
                 // [we-scene patch] animationEvent 进图层级广播表（独立于 hasUpdate：
                 // 无 update 的转发脚本同样是官方事件消费方）。
@@ -6409,10 +6430,19 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       let overlaySegCount = 0;
       let overlayDraws = 0;
       const drawGlOverlay = (): void => {
+        // 契约：segments 是「本帧提交的线段数（0 = 这一帧没画）」。所以每个提前
+        // 返回的分支都必须把它清零，否则无 GL / pass 链接失败时会一直上报上一帧
+        // 的数字（页面拿它判断「这一帧画了几条线」，会以为还在画）。
         const gl = renderer.gl;
-        if (!gl) return;
+        if (!gl) {
+          overlaySegCount = 0;
+          return;
+        }
         if (!overlayPass) overlayPass = createOverlayPass(gl);
-        if (!overlayPass.ok) return;
+        if (!overlayPass.ok) {
+          overlaySegCount = 0;
+          return;
+        }
         const id = overlayTargetId;
         const outline = id === null || id === undefined ? null : editorImpl?.getLayerOutline(id as number) ?? null;
         const seg = buildOverlaySegments(outline, { gizmo: overlayGizmo });
@@ -7742,7 +7772,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (disposed) return Promise.reject(new Error("scene disposed"));
         const hit = particleSystems.filter((p) => (p as { particlePath?: string }).particlePath === path);
         if (!hit.length) return Promise.reject(new Error(`setParticleModel: no particle system for ${path}`));
-        for (const p of hit) p.applyModel?.(model);
+        // applyModel 内部直接读 model 的字段（controlpoint 非数组之类会同步抛）。
+        // 公开契约是 Promise<void>，所以这里必须把同步异常转成 reject ——
+        // 否则调用方的 .catch() 接不住，异常会顺着事件回调冒到全局。
+        try {
+          for (const p of hit) p.applyModel?.(model);
+        } catch (e) {
+          return Promise.reject(new Error(`setParticleModel: ${(e as Error)?.message ?? String(e)}`));
+        }
         return renderOnce();
       };
       const seekImpl = (t: number, render = true): Promise<void> => {
@@ -7874,10 +7911,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       /** 图层拆除：把被删子树从所有装配期登记表里摘干净。
        *  漏一处就是「看不见的层还在每帧跑脚本 / 还在接收媒体回调」。 */
       const teardownLayer = (ids: Set<unknown>, effects: Set<unknown>): void => {
-        // ① 脚本槽位：先把句柄背后换成停用（DISABLED），再摘登记
+        // ① 脚本槽位：先把句柄背后换成停用（DISABLED），再摘登记。
+        //    同时记下被删层的稳定句柄 —— 它们散落在 propSandboxes / mediaHooks /
+        //    resizeHooks 里（登记表持有的是同一个物理句柄），step ⑧ 统一摘除，
+        //    否则拆层后这些句柄还留在逐帧回填与媒体广播表里（只会白跑，但会一直涨）。
+        const deadSandboxes = new Set<any>();
         for (let i = editorScriptSlots.length - 1; i >= 0; i--) {
           const s = editorScriptSlots[i];
           if (ids.has(s.layer?.id)) {
+            deadSandboxes.add(s.sandbox);
             s.current = null;
             editorScriptSlots.splice(i, 1);
           }
@@ -7903,10 +7945,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           }
           particleSystemsByLayer.delete(id as number);
         }
-        // ⑥ 脚本错误面板：被删层的条目一起消失（否则面板上留着幽灵报错）
+        // ⑥ 脚本错误面板：被删层的条目一起消失（否则面板上留着幽灵报错）。
+        //    键前缀是 `noteScriptIssue` 写的 `${layerId}|…`，非数字 id 的层写成
+        //    字面量 `null` —— 这类层在 ids 里存的也是 null，所以按同值比对，
+        //    不能像以前那样把 `null|` 前缀整类跳过（那样这些层的报错永不清）。
         for (const k of [...scriptIssues.keys()]) {
           const lid = k.split("|")[0];
-          if (lid !== "null" && ids.has(Number(lid))) scriptIssues.delete(k);
+          if (ids.has(lid === "null" ? null : Number(lid))) scriptIssues.delete(k);
         }
         // ⑦ 装配块内部的登记表（文字挂件 / 跨层文本表）
         for (const hook of layerTeardownHooks) {
@@ -7914,6 +7959,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             hook(ids, effects);
           } catch { /* 单条清理失败不阻断删除 */ }
         }
+        // ⑧ 被删层的稳定句柄从「按沙箱而非按图层」的登记表里摘掉；帧事件广播表按图层摘
+        if (deadSandboxes.size) {
+          for (let i = propSandboxes.length - 1; i >= 0; i--) if (deadSandboxes.has(propSandboxes[i])) propSandboxes.splice(i, 1);
+          for (let i = mediaHooks.length - 1; i >= 0; i--) if (deadSandboxes.has(mediaHooks[i])) mediaHooks.splice(i, 1);
+          for (const sb of deadSandboxes) resizeHooks.delete(sb);
+        }
+        for (const k of [...animEventSinks.keys()]) if (ids.has((k as any)?.id)) animEventSinks.delete(k);
       };
       editorImpl = {
         get time() {
@@ -8245,9 +8297,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (disposed) return Promise.reject(new Error("scene disposed"));
           // 绘制顺序 = scene.layers 数组顺序（渲染器逐层遍历），所以重排只需移动
           // 数组元素：变换、可见性、脚本注册一概不动，顺序即生效。
-          // toIndex 是**目标下标**（搬完之后的 EditorLayer.index），越界夹到端点。
-          const at = moveLayerToIndex(scene.layers as any[], id, toIndex);
-          if (at === null) return Promise.reject(new Error(`图层不存在或下标非法: ${id} → ${toIndex}`));
+          // toIndex 是**目标下标**（搬完之后的 EditorLayer.index，与 api/types.ts 同口径），
+          // 越界夹到端点。先分开校验「层不存在 / 下标非法」与「目标即原位」：
+          // 后者的 moveLayerToIndex 也返回 null，但那是空操作、不是失败。
+          const layers = scene.layers as any[];
+          if (layerIndexOf(layers, id) < 0) return Promise.reject(new Error(`图层不存在: ${id}`));
+          if (!Number.isFinite(toIndex)) return Promise.reject(new Error(`下标非法: ${id} → ${toIndex}`));
+          if (moveLayerToIndex(layers, id, toIndex) === null) return Promise.resolve();
           return renderOnce();
         },
         // ---- M12 / W8：单脚本沙箱热替换（B3）----

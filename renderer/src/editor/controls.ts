@@ -62,9 +62,12 @@ export function editorOf(instance: SceneInstance): EditorControls | null {
   };
 }
 
-/** number|string|null → number（非法输入回 null，交由引擎按「无目标」处理） */
+/** number|string|null → number（非法输入回 null，交由引擎按「无目标」处理）。
+ *  空串 / 纯空白必须先判掉：`Number("")` 与 `Number("   ")` 都是 0，
+ *  会被当成「id = 0 的图层」而不是「没有目标」。 */
 function numOrNull(id: number | string | null): number | null {
   if (id === null || id === undefined) return null;
+  if (typeof id === "string" && id.trim() === "") return null;
   const n = Number(id);
   return Number.isFinite(n) ? n : null;
 }

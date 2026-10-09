@@ -34,6 +34,8 @@ export async function collectProject(
   assets: SceneAssets,
   preview: Blob | null,
   onProgress?: (done: number, total: number) => void,
+  /** 仍然挂在资源表里、但这一轮读不到字节的名字：调用方别把已写出的同名文件删掉（审计 M2） */
+  unreadable?: Set<string>,
 ): Promise<SaveFile[]> {
   if (!doc.scene) throw new Error("没有可保存的场景文档");
   const enc = new TextEncoder();
@@ -44,6 +46,7 @@ export async function collectProject(
   for (const name of names) {
     const bytes = await assets.read(name);
     if (bytes) out.push({ path: name, data: bytes });
+    else unreadable?.add(name);
     onProgress?.(++done, names.length);
   }
   out.push({ path: assets.entry, data: enc.encode(JSON.stringify(doc.scene, null, 2)) });
