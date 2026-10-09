@@ -32,13 +32,30 @@ export type TitleCmd = { kind: "title"; label: string; before: TitleSnap; after:
  * 结构命令的快照只覆盖 objects 与 project 属性表，装不下 general，所以它和 TitleCmd 一样单列一种。
  */
 export type SceneCmd = { kind: "scene"; label: string; before: string; after: string };
-export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd | TitleCmd | SceneCmd;
+/** 不在文档里的资源文件（粒子 JSON）整体换字节：与视频本体同款理由 —— 结构命令的快照只覆盖 objects */
+export type FileSnap = { path: string; bytes: Uint8Array };
+export type FileCmd = { kind: "file"; label: string; before: FileSnap; after: FileSnap };
+export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd | TitleCmd | SceneCmd | FileCmd;
 
 export const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
 export const isBatch = (c: EditCmd): c is BatchCmd => "kind" in c && c.kind === "batch";
 export const isVideoCmd = (c: EditCmd): c is VideoCmd => "kind" in c && c.kind === "video";
 export const isTitleCmd = (c: EditCmd): c is TitleCmd => "kind" in c && c.kind === "title";
 export const isSceneCmd = (c: EditCmd): c is SceneCmd => "kind" in c && c.kind === "scene";
+export const isFileCmd = (c: EditCmd): c is FileCmd => "kind" in c && c.kind === "file";
+
+const sameBytes = (a: Uint8Array, b: Uint8Array) => {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+/** 粒子文件的一次编辑；换的不是同一个文件或字节没变时返回 null（调用方不入栈） */
+export function fileCommand(label: string, before: FileSnap, after: FileSnap): FileCmd | null {
+  if (before.path === after.path && sameBytes(before.bytes, after.bytes)) return null;
+  return { kind: "file", label, before, after };
+}
 
 /** 去掉前后一致的条目；剩一条时退回普通属性命令，一条不剩返回 null */
 export function batchCommand(label: string, cmds: readonly PropsCmd[]): EditCmd | null {

@@ -985,6 +985,54 @@ export class ParticleSystem {
     this._compile()
   }
 
+  /**
+   * [we-scene patch] 编辑器热更粒子文件（M2）：把新的模型**按引用**交给引擎，
+   * 之后就地改这份对象的值即当帧生效（与 instanceoverride 的用法一致）。
+   *
+   * 为什么不像 setOverrideValue 那样每次都走 reapplyOverride()：`_applyOverride()`
+   * 结尾无条件 `this.pool = []` 再重建整个池 —— 屏幕上所有粒子瞬间清零，
+   * 调一次滑条闪一次。只有 `maxcount` 变了才必须付这个代价（池容量得重算）；
+   * 其余参数走 `_compile()`：它只重读 `this.model`，不动池，当帧生效。
+   *
+   * 返回应用后的池容量（调用方可用它判断这次是不是重建过池）。
+   */
+  applyModel(model) {
+    const prevMax = num(this.model && this.model.maxcount, 100)
+    const nextMax = num(model && model.maxcount, 100)
+    this.model = model
+    this._applyModelSettings()
+    if (nextMax !== prevMax) this.reapplyOverride()
+    this._compile()
+    return this.maxCount
+  }
+
+  /**
+   * 重读模型里那些「只在构造时算一次」的顶层设置（flags / sequencemultiplier /
+   * animationmode / controlpoint / starttime）。口径与构造函数逐条一致 ——
+   * 改这边要同步那边，反之亦然。
+   *
+   * 这些量每帧被读（worldSpace 见 advance、controlPoints 见 _cpPos、startTime 见
+   * 预热），不重读的话编辑器改完要重挂整个场景才看得见。
+   */
+  _applyModelSettings() {
+    const model = this.model || {}
+    this.frameBlend = (num(model.flags, 0) & 2) === 0
+    this.worldSpace = (num(model.flags, 0) & 1) !== 0
+    this.sequenceMul = Math.max(1, Math.min(MAX_SEQUENCE_MUL, Math.round(num(model.sequencemultiplier, 1))))
+    this.animationMode = model.animationmode || null
+    // 有真实帧矩形（贴图 TEXS）时帧数由它决定，与 setTexture 同口径
+    this.frameCount = this.texFrames ? this.texFrames.length : this.sequenceMul * this.sequenceMul
+    this.controlPoints = (model.controlpoint || []).filter(Boolean).map((cp) => ({
+      id: num(cp.id, 0),
+      lockToPointer: !!cp.locktopointer || (num(cp.flags, 0) & 1) !== 0,
+      offset: parseVec(cp.offset),
+      x: 0,
+      y: 0,
+      z: 0,
+    }))
+    this.startTime = Math.max(0, Math.min(30, num(model.starttime, 0)))
+  }
+
   setMaterial(mat) {
     this.material = mat
     const pass = mat && mat.passes && mat.passes[0]

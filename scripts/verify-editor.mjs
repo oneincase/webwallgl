@@ -7543,6 +7543,363 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组件原样保留 editor/particle-params.ts（M2 A3）");
+{
+  const ptp = await loadEditorModule("particle-params");
+  const ptpPath = path.join(ROOT, "editor/particle-params.ts");
+  const ptpSrc = fs.readFileSync(ptpPath, "utf8");
+  const psPath = path.join(ROOT, "renderer/vendor/we-scene/render/particles.js");
+  const psSrc = fs.readFileSync(psPath, "utf8");
+  const psLive = await imp("renderer/vendor/we-scene/render/particles.js");
+
+  // 夹具与语料同形（vecN 是空格分隔字符串、controlpoint 每项带 id/flags/offset/angles），
+  // 并**故意**混入未知顶层键 / 未知组件 / 引擎未生效组件 / 引擎不认识名字的组件 ——
+  // 它们都必须在面板上被点名、只读列出、逐字节保留。
+  const pvFile = () =>
+    JSON.parse(
+      json({
+        maxcount: 500,
+        starttime: 20,
+        sequencemultiplier: 2,
+        material: "materials/editor/particles/x.json",
+        flags: 1,
+        FutureTop: 7,
+        emitter: [
+          {
+            id: 1,
+            name: "boxrandom",
+            origin: "0 0 0",
+            directions: "1 1 1",
+            distancemin: "0 0 0",
+            distancemax: "100 100 0",
+            rate: 10,
+            speedmin: 1,
+            speedmax: 2,
+            audioprocessingbounds: "0.8 1.0",
+            FutureEmitter: 3,
+          },
+        ],
+        initializer: [
+          { id: 2, name: "lifetimerandom", min: 1, max: 5, exponent: 1 },
+          { id: 3, name: "turbulentvelocityrandom", scale: 0.1, forward: "1 0 0" },
+          { id: 4, name: "FutureThing", foo: 1 },
+          { id: 5, name: "positionoffsetrandom", distance: 5 },
+        ],
+        operator: [
+          { id: 6, name: "movement", gravity: "0 15 0", drag: 1.5 },
+          { id: 7, name: "reducemovementnearcontrolpoint", controlpoint: 0, distanceinner: 10, distanceouter: 20, reductioninner: 500 },
+          { id: 8, name: "maintaindistancetocontrolpoint", variablestrength: 1 },
+        ],
+        renderer: [{ id: 9, name: "spritetrail", length: 0.1, maxlength: 5, minlength: "0.02", orientation: "screen", flags: 2 }],
+        controlpoint: [{ id: 0, flags: 0, offset: "1 2 3", angles: "0 0 90", locktopointer: true, parentcontrolpoint: -1 }],
+      }),
+    );
+
+  const pvLayer = () => ({ origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0], visible: true });
+  const pvModel = () => ({
+    maxcount: 200,
+    starttime: 0,
+    emitter: [{ name: "boxrandom", origin: "0 0 0", directions: "1 1 1", distancemin: "0 0 0", distancemax: "100 100 0", rate: 30, speedmin: 10, speedmax: 20 }],
+    initializer: [{ name: "lifetimerandom", min: 1, max: 2 }],
+    operator: [{ name: "movement", gravity: "0 15 0", drag: 1.5 }],
+    renderer: [{ name: "sprite" }],
+    controlpoint: [],
+  });
+
+  /**
+   * PARTICLE-V2 判据体：返回失败清单（空 = 全绿）。变异红测复用它 ——
+   * 「判据把错实现咬红」才是判据成立的证明。f = particle-params 模块，psMod = 引擎粒子模块。
+   */
+  const particleV2Corpus = (f, psMod) => {
+    const bad = [];
+    const is = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+
+    // ---- 1. 组件识别与状态：ok / 引擎未生效（unsupported）/ 不认识（unknown）----
+    const file = pvFile();
+    const comps = f.particleComponents(file).map((c) => `${c.group}:${c.name}:${c.status}`);
+    is(
+      json(comps) ===
+        json([
+          "emitter:boxrandom:ok",
+          "initializer:lifetimerandom:ok",
+          "initializer:turbulentvelocityrandom:unsupported",
+          "initializer:FutureThing:unknown",
+          "initializer:positionoffsetrandom:unknown",
+          "operator:movement:ok",
+          "operator:reducemovementnearcontrolpoint:ok",
+          "operator:maintaindistancetocontrolpoint:unknown",
+          "renderer:spritetrail:ok",
+          "controlpoint::ok",
+        ]),
+      "五族组件与状态（emitter/initializer/operator/renderer/controlpoint）",
+    );
+    const issues = f.particleIssues(file);
+    is(
+      issues.some((i) => i.kind === "unsupported" && i.name === "turbulentvelocityrandom" && i.group === "initializer"),
+      "诊断标注：turbulentvelocityrandom 标为「引擎未生效」（面板据此出提示文案）",
+    );
+    is(
+      json(issues.filter((i) => i.kind === "unknown").map((i) => i.name)) === json(["FutureThing", "positionoffsetrandom", "maintaindistancetocontrolpoint"]),
+      "未知组件逐个点名（含带下标定位）",
+    );
+
+    // ---- 2. 视图只列文件里真有的字段（缺失字段不出控件 → 天然不新增键）----
+    const emitterView = f.particleComponentViews(file).find((c) => c.group === "emitter");
+    is(
+      json(emitterView.views.map((v) => v.key)) ===
+        json([
+          "emitter[0].origin",
+          "emitter[0].directions",
+          "emitter[0].distancemin",
+          "emitter[0].distancemax",
+          "emitter[0].rate",
+          "emitter[0].speedmin",
+          "emitter[0].speedmax",
+          "emitter[0].audioprocessingbounds",
+        ]),
+      "只列文件里真有的字段（夹具 emitter 没有 flags / delay → 不出控件）",
+    );
+    is(json(emitterView.extraKeys) === json(["FutureEmitter"]), "组件里字段表之外的键进 extraKeys（只读列出）");
+    is(json(f.particleTopExtraKeys(file)) === json(["FutureTop"]), "顶层未声明键只读列出（emitter 等组名不算）");
+    const topKeys = f.particleTopViews(file).map((v) => v.key).sort();
+    is(
+      json(topKeys) === json(["particle.flags", "particle.material", "particle.maxcount", "particle.sequencemultiplier", "particle.starttime"].sort()),
+      "顶层字段视图列出 maxcount / starttime / sequencemultiplier / material / flags",
+    );
+
+    // ---- 3. 读写往返：算子 / 初始化器 / 渲染器 ----
+    is(f.setParticleField(file, "operator[0].drag", 2.5) === true && file.operator[0].drag === 2.5, "算子标量参数写回（movement.drag）");
+    is(f.setParticleField(file, "initializer[0].max", 9) === true && file.initializer[0].max === 9, "初始化器参数写回（lifetimerandom.max）");
+    is(f.setParticleField(file, "renderer[0].maxlength", 3.5) === true && file.renderer[0].maxlength === 3.5, "渲染器参数写回（spritetrail.maxlength）");
+    is(f.setParticleField(file, "operator[0].drag", 2.5) === false, "值没变返回 false（调用方据此不重写文件、不入撤销栈）");
+
+    // ---- 4. 逐字节：改一个值只动那一处，未知键/未知组件原样 ----
+    const snap = json(file);
+    is(f.setParticleField(file, "operator[0].drag", 7) === true, "改第二处值");
+    const restored = JSON.parse(json(file));
+    restored.operator[0].drag = 2.5;
+    is(json(restored) === snap, "逐字节：把那一处改回原值后整串完全相同（只有它变了）");
+    is(file.emitter[0].FutureEmitter === 3 && file.FutureTop === 7, "未知键（组件内 / 顶层）逐字节不动");
+    is(file.initializer[1].scale === 0.1 && file.initializer[1].forward === "1 0 0" && file.initializer[2].foo === 1, "引擎未生效组件与未知组件的字段原样保留");
+    is(file.operator[2].variablestrength === 1, "引擎不认识名字的组件原样保留");
+
+    // ---- 5. maxcount / starttime 钳位（与引擎同口径）----
+    is(f.setParticleField(file, "particle.maxcount", 99999) === true && file.maxcount === 20000, "maxcount 上钳到 20000");
+    is(f.setParticleField(file, "particle.maxcount", -5) === true && file.maxcount === 1, "maxcount 下钳到 1");
+    is(f.setParticleField(file, "particle.starttime", 99) === true && file.starttime === 30, "starttime 上钳到 30");
+    is(f.setParticleField(file, "particle.starttime", -1) === true && file.starttime === 0, "starttime 下钳到 0");
+    is(f.setParticleField(file, "particle.maxcount", "abc") === false, "非数字拒绝（不动文档）");
+
+    // ---- 6. vec 按原件形态回写；键名大小写不敏感命中原名 ----
+    is(f.setParticleField(file, "operator[0].gravity", [0, 5, 0]) === true && file.operator[0].gravity === "0 5 0", "vec3 写回保持语料的空格分隔字符串形态");
+    is(f.setParticleField(file, "operator[0].gravity", [0, 5, 0]) === false, "vec 数值没变返回 false（不规范化作者的写法）");
+    const arrBox = { emitter: [{ id: 1, name: "boxrandom", directions: [1, 1, 1] }] };
+    is(
+      f.setParticleField(arrBox, "emitter[0].directions", [0, 1, 0]) === true && json(arrBox.emitter[0].directions) === json([0, 1, 0]),
+      "原件是数组就写数组（按原件形态回写）",
+    );
+    const ciBox = { MaxCount: 500, emitter: [{ id: 1, name: "boxrandom", Rate: 10 }] };
+    is(
+      f.setParticleField(ciBox, "particle.maxcount", 300) === true && ciBox.MaxCount === 300 && !("maxcount" in ciBox),
+      "键名大小写不敏感命中原名写回（不新增小写键）",
+    );
+    is(f.setParticleField(ciBox, "emitter[0].rate", 20) === true && ciBox.emitter[0].Rate === 20, "组件字段同样按作者原名写回");
+    const wrapBox = { maxcount: { user: "p", value: 400 }, emitter: [{ id: 1, name: "boxrandom", rate: { script: "s", scriptproperties: "q", value: 10 } }] };
+    is(
+      f.setParticleField(wrapBox, "particle.maxcount", 250) === true && json(wrapBox.maxcount) === json({ user: "p", value: 250 }),
+      "{user,value} 包装只改 value",
+    );
+    is(
+      f.setParticleField(wrapBox, "emitter[0].rate", 3) === true && json(wrapBox.emitter[0].rate) === json({ script: "s", scriptproperties: "q", value: 3 }),
+      "绑定字段的包装只改 value（script / scriptproperties 原样）",
+    );
+
+    // ---- 7. controlpoint 族 ----
+    const cpBox = { controlpoint: [{ id: 0, flags: 0, offset: "1 2 3", angles: "0 0 90", locktopointer: true, parentcontrolpoint: -1 }] };
+    is(
+      json(f.particleComponentViews(cpBox).find((c) => c.group === "controlpoint").views.map((v) => v.key)) ===
+        json(["controlpoint[0].flags", "controlpoint[0].offset", "controlpoint[0].angles", "controlpoint[0].locktopointer", "controlpoint[0].parentcontrolpoint"]),
+      "controlpoint 族字段齐全（id 不列，offset/angles 是 vec3）",
+    );
+    is(f.setParticleField(cpBox, "controlpoint[0].offset", [4, 5, 6]) === true && cpBox.controlpoint[0].offset === "4 5 6", "controlpoint.offset 写回（vec3 字符串）");
+    is(f.setParticleField(cpBox, "controlpoint[0].locktopointer", false) === true && cpBox.controlpoint[0].locktopointer === false, "controlpoint.locktopointer 写回（布尔）");
+    is(f.setParticleField(cpBox, "controlpoint[0].parentcontrolpoint", 3) === true && cpBox.controlpoint[0].parentcontrolpoint === 3, "controlpoint.parentcontrolpoint 写回（整数）");
+
+    // ---- 8. 拒绝路径：认不出 / 越界 / 引擎未生效 / 未知组件，统统不动文档 ----
+    const fresh = pvFile();
+    const freshSnap = json(fresh);
+    is(f.setParticleField(fresh, "particle.nope", 1) === false, "顶层未声明的键拒绝");
+    is(f.setParticleField(fresh, "initializer[1].scale", 9) === false, "引擎未生效的组件拒绝写（只标注不修）");
+    is(f.setParticleField(fresh, "initializer[2].foo", 9) === false, "未知组件拒绝写");
+    is(f.setParticleField(fresh, "operator[2].variablestrength", 9) === false, "引擎不认识名字的组件拒绝写");
+    is(
+      f.setParticleField(fresh, "operator[9].drag", 9) === false && f.setParticleField(fresh, "bogus[0].x", 1) === false && f.setParticleField(fresh, "operator[0].nodrag", 1) === false,
+      "越界下标 / 非法族名 / 未声明字段一律拒绝",
+    );
+    is(json(fresh) === freshSnap, "拒绝路径逐字节不动文档");
+
+    // ---- 9. 序列化往返与解析失败 ----
+    const text = new TextDecoder().decode(f.serializeParticleFile(fresh));
+    is(json(f.parseParticleFile(text)) === json(fresh), "序列化 → 解析往返字段与值不丢不改名");
+    is(f.parseParticleFile("{") === null && f.parseParticleFile("[1]") === null, "非法 JSON / 非对象返回 null（面板显示读不出）");
+
+    // ---- 10. 表单描述符：数值走 range，枚举/文本面板自己搓 ----
+    const pvViews = f.particleFieldViews(pvFile());
+    const lenP = f.particleFormParam(pvViews.find((v) => v.key === "renderer[0].length"));
+    is(!!lenP && lenP.type === "float" && lenP.min === 0 && lenP.max === 1 && lenP.step === 0.001, "数值字段转成 schema-form 描述符（带 min/max/step）");
+    const oriView = pvViews.find((v) => v.key === "renderer[0].orientation");
+    is(f.particleFormParam(oriView) === null && f.particleTextValue(oriView) === "screen", "枚举字段不给 range 控件（面板搓 select），文本取值原样");
+
+    // ---- 11. 引擎热更：applyModel 只重读 model，不动池 ----
+    const layer = pvLayer();
+    const m0 = pvModel();
+    const ps = new psMod.ParticleSystem(null, m0, null, layer);
+    is(ps.maxCount === 200 && ps.pool.length === 200, "引擎初始池容量按 maxcount（200）");
+    const poolRef = ps.pool;
+    const m1 = { ...m0, operator: [{ name: "movement", gravity: "0 5 0", drag: 2 }] };
+    ps.applyModel(m1);
+    is(ps.model === m1, "applyModel 按引用持有新模型（面板改的就是引擎手上那份）");
+    is(ps.pool === poolRef, "maxcount 没变时不重建池（屏上粒子不清零、不闪）");
+    is(!!ps.ops.movement && ps.ops.movement.gravity[1] === 5 && ps.ops.movement.drag === 2, "算子参数当帧生效（_compile 只重读 model）");
+    const m2 = { ...m1, starttime: 12, flags: 3, sequencemultiplier: 3, animationmode: "sequence", controlpoint: [{ id: 7, offset: "5 6 7", flags: 1 }] };
+    ps.applyModel(m2);
+    is(
+      ps.startTime === 12 && ps.worldSpace === true && ps.frameBlend === false && ps.sequenceMul === 3 && ps.animationMode === "sequence",
+      "顶层设置（starttime / flags / sequencemultiplier / animationmode）热更后立即重读",
+    );
+    is(
+      ps.controlPoints.length === 1 && ps.controlPoints[0].id === 7 && ps.controlPoints[0].lockToPointer === true && json(ps.controlPoints[0].offset) === json([5, 6, 7]),
+      "controlpoint 族热更后立即重读（id / flags → lockToPointer / offset）",
+    );
+    const m3 = { ...m2, maxcount: 137 };
+    ps.applyModel(m3);
+    is(ps.maxCount === 137 && ps.pool.length === 137, "maxcount 变了才重建池（容量跟着变）");
+
+    return bad;
+  };
+
+  const pvBad = particleV2Corpus(ptp, psLive);
+  check(pvBad.length === 0, `粒子 v2：分组参数读写 / 未知组件原样保留 / 钳位 / controlpoint 族 / 引擎热更全部成立（${pvBad.join(" / ") || "ok"}）`);
+
+  // ---- 引擎侧实现：路径定位 + 只在 maxcount 变时重建池 ----
+  check(
+    /applyModel\(model\) \{[\s\S]{0,400}?this\._applyModelSettings\(\)[\s\S]{0,400}?if \(nextMax !== prevMax\) this\.reapplyOverride\(\)[\s\S]{0,200}?this\._compile\(\)/.test(psSrc),
+    "引擎 applyModel：重读顶层设置 → 只有 maxcount 变才重建池 → 再 _compile",
+  );
+  check(
+    /_applyModelSettings\(\) \{/.test(psSrc) && /this\.startTime = Math\.max\(0, Math\.min\(30, num\(model\.starttime, 0\)\)\)/.test(psSrc),
+    "_applyModelSettings 覆盖 starttime 钳位（与构造函数同口径）",
+  );
+  const smSrc2 = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(
+    /\(ps as \{ particlePath\?: string \}\)\.particlePath = particlePath;/.test(smSrc2),
+    "引擎侧给每个粒子系统记文件路径（一个文件可挂多层，不能按 layer id 定位）",
+  );
+  check(
+    /const setParticleModelImpl = \(\s*path: string,\s*model: Record<string, unknown>\): Promise<void> =>/.test(smSrc2) &&
+      /const hit = particleSystems\.filter\(\(p\) => \(p as \{ particlePath\?: string \}\)\.particlePath === path\);/.test(smSrc2) &&
+      /if \(!hit\.length\) return Promise\.reject\(new Error\(`setParticleModel: no particle system for \$\{path\}`\)\);/.test(smSrc2) &&
+      /return renderOnce\(\);/.test(smSrc2.slice(smSrc2.indexOf("const setParticleModelImpl"))),
+    "setParticleModel：按文件路径命中全部系统 → 没命中 reject → 补画一帧",
+  );
+  check(/setParticleModel: setParticleModelImpl,/.test(smSrc2), "热更 API 挂进 editorImpl");
+  check(/setParticleModel\(path, model\)/.test(fs.readFileSync(path.join(ROOT, "renderer/src/editor/controls.ts"), "utf8")), "经 editorOf 转发（页面只走公共出口）");
+  check(/setParticleModel\(path: string, model: Record<string, unknown>\): Promise<void>;/.test(fs.readFileSync(path.join(ROOT, "renderer/src/api/types.ts"), "utf8")), "EditorControls 声明了 setParticleModel（分层契约）");
+
+  // ---- 页面接线：分区、热更、字节级撤销、既有 6 个倍率没被改掉 ----
+  const mainSrc2 = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(
+    /group\.appendChild\(particleFileSection\(node, editable\)\);/.test(mainSrc2) && /function particleFileSection\(node: LayerNode, editable: boolean\): HTMLElement/.test(mainSrc2),
+    "检视器粒子分区接上（既有 6 个倍率 + 颜色那条路径没被改掉）",
+  );
+  check(
+    /void editor\?\.setParticleModel\(path, parsed\)\.catch\(\(\) => \{\}\);/.test(mainSrc2) && /overlay\?\.put\(path, bytes, path\);/.test(mainSrc2),
+    "面板提交后：落盘（group = 文件自身路径，在 referencedParticles 里）+ 同一份对象交给引擎热更",
+  );
+  check(
+    /const cmd = fileCommand\(et\("pt\.fileEdited", \{ layer: nodeName\(node\.id\), field: ptFieldLabel\(view\) \}\), \{ path, bytes: enc\.encode\(before\) \}, \{ path, bytes \}\);/.test(mainSrc2),
+    "粒子文件改动按「文件 + 字节」记一步撤销（文件不在 doc 里，结构快照装不下）",
+  );
+  check(/if \(isFileCmd\(cmd\)\) \{[\s\S]{0,400}?applyParticleBytes\(snap\.path, snap\.bytes\);/.test(mainSrc2), "撤销 / 重做走同一个 applyParticleBytes（字节回写 + 热更）");
+  check(/det\.className = "ed-inline-pass";/.test(mainSrc2) && /\.ed-inline-pass\b/.test(fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8")), "粒子分区复用作品自带效果的折叠样式（不新增 CSS / HTML）");
+
+  // ---- i18n：中英各一次（含「引擎未生效」诊断文案）----
+  {
+    const i18nSrc2 = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const pvKeys = [
+      "pt.fileTitle",
+      "pt.fileHint",
+      "pt.fileLoading",
+      "pt.fileMissing",
+      "pt.fileEmpty",
+      "pt.fileTop",
+      "pt.fileUnknownTop",
+      "pt.fileUnknownKeys",
+      "pt.fileEdited",
+      "pt.statusUnsupported",
+      "pt.statusUnknown",
+      "pt.statusNoPanel",
+      "pt.unsupportedHint",
+      "ptg.emitter",
+      "ptg.initializer",
+      "ptg.operator",
+      "ptg.renderer",
+      "ptg.controlpoint",
+      "ptf.maxcount",
+      "ptf.starttime",
+      "ptp.origin",
+      "ptp.drag",
+    ];
+    const missingPv = pvKeys.filter((k) => (i18nSrc2.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+    check(missingPv.length === 0, `粒子 v2 文案中英文都有（缺 ${json(missingPv)}）`);
+    check(/引擎未生效/.test(i18nSrc2) && /Not effective in the engine/.test(i18nSrc2), "「引擎未生效」诊断文案中英双写");
+    check(/turbulentvelocityrandom/.test(i18nSrc2), "诊断文案点名 turbulentvelocityrandom（面板上看得见是哪个组件）");
+  }
+
+  // ---- 变异红测：判据咬得住吗 ----
+  {
+    const pvMut = async (from, to, tag) => {
+      const mut = ptpSrc.replace(from, to);
+      check(mut !== ptpSrc, `注入点存在（${tag}）`);
+      return loadEditorModule("particle-params", { [ptpPath]: mut });
+    };
+    const m1 = await pvMut("for (const k of Object.keys(box)) if (k.toLowerCase() === want) return k;", "for (const k of Object.keys(box)) if (k === key) return k;", "键名大小写不敏感");
+    check(/大小写不敏感/.test(particleV2Corpus(m1, psLive).join(" / ")), "改成大小写敏感时「命中原名写回」判据变红");
+    const m2 = await pvMut("      if (field.clamp) {", "      if (false) {", "maxcount / starttime 钳位");
+    check(/钳到/.test(particleV2Corpus(m2, psLive).join(" / ")), "去掉钳位时「maxcount / starttime 钳位」判据变红");
+    const m3 = await pvMut('  if (isObj(cur) && ("value" in cur || isBinding(cur))) {', "  if (false) {", "包装只改 value");
+    check(/包装只改 value/.test(particleV2Corpus(m3, psLive).join(" / ")), "无视 {user,value} 包装时「只改 value」判据变红");
+    const m4 = await pvMut("    if (!realKeyOf(box, field.key)) continue; // 只列文件里真有的字段（不新增键）", "    // 变异：不再只列真有的字段", "只列文件里真有的字段");
+    check(/只列文件里真有的字段/.test(particleV2Corpus(m4, psLive).join(" / ")), "视图不再只列真有的字段时「缺失字段不出控件」判据变红");
+    const m5 = await pvMut('      return use.map(fmt).join(" ");', "      return use;", "vec 按原件形态回写");
+    check(/空格分隔字符串/.test(particleV2Corpus(m5, psLive).join(" / ")), "vec 不再回写成字符串形态时「与语料同形」判据变红");
+    const m6 = await pvMut('  if (spec?.engineUnsupported) return "unsupported";', '  if (spec?.engineUnsupported) return "ok";', "引擎未生效的诊断标注");
+    check(/诊断标注|五族组件与状态/.test(particleV2Corpus(m6, psLive).join(" / ")), "抹掉「引擎未生效」状态时诊断标注判据变红");
+    // 引擎侧：applyModel 每次都重建池 → 「不闪」判据红
+    const psMut = psSrc.replace("    if (nextMax !== prevMax) this.reapplyOverride()", "    this.reapplyOverride()");
+    check(psMut !== psSrc, "注入点存在（applyModel 只在 maxcount 变时重建池）");
+    const psBundled = await build({
+      entryPoints: [psPath],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+      plugins: [{ name: "particle-model-mut", setup: (b) => b.onLoad({ filter: /render[\\/]particles\.js$/ }, () => ({ contents: psMut, loader: "js" })) }],
+    });
+    const tmpPs = path.join(tmpRoot, `particles-mut-${Math.random().toString(36).slice(2)}.mjs`);
+    fs.writeFileSync(tmpPs, psBundled.outputFiles[0].text);
+    const psMutMod = await import(pathToFileURL(tmpPs).href);
+    check(/不清零/.test(particleV2Corpus(ptp, psMutMod).join(" / ")), "applyModel 每次都重建池时「maxcount 没变不重建池」判据变红");
+  }
+
+  console.log("  （headless：打开粒子图层 → 改 operator[0].drag → 粒子文件字节变 + 出帧变；见本段头注）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {

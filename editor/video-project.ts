@@ -104,6 +104,8 @@ export async function mountVideoStage(stage: HTMLElement, bytes: Uint8Array, fit
     setAnimationLayers: async () => {},
     // 视频预览没有 scene.json 效果链：热更入口存在但不做事（与 setLayerProps 同款空操作）
     setEffectConstants: async () => {},
+    // 视频预览没有粒子系统：热更入口存在但不做事（与上面同款空操作）
+    setParticleModel: async () => {},
     getAttachmentPoints: () => null,
     setBonePose: async () => {},
     getBonePoints: () => null,
