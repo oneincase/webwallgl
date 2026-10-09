@@ -7,6 +7,10 @@
 
 import { createRegistry } from "./core/registry";
 import type { EditorDoc, SceneObject } from "./doc";
+// M4 A6：light / camera 的构造器。注意这里与 doc.ts 构成一个**良性的模块环**
+// （doc → layer-kinds → objlayers → doc）：跨模块引用全部出现在函数体 / 箭头函数体里，
+// 模块顶层只建数组与箭头，没有任何顶层取值，所以 ESM 与 esbuild 的打包顺序都安全。
+import { addCameraLayer, addLightLayer } from "./objlayers";
 
 export type LayerKindDef = {
   kind: string;
@@ -37,12 +41,29 @@ export const BUILTIN_LAYER_KINDS: LayerKindDef[] = [
   { kind: "particle", builtin: true, canAnimate: true },
   { kind: "model", builtin: true, canAnimate: true },
   { kind: "sound", builtin: true },
-  { kind: "light", builtin: true, canAnimate: true },
-  { kind: "camera", builtin: true },
+  // M4 A6：「添加图层」入口。此前九项内建都只声明能力、`create` 从未被写也从未被读。
+  { kind: "light", builtin: true, canAnimate: true, create: (doc) => addLightLayer(doc, "lpoint", "Light") },
+  { kind: "camera", builtin: true, create: (doc) => addCameraLayer(doc, "Camera") },
   { kind: "group", builtin: true, canAnimate: true },
   { kind: "other", builtin: true },
 ];
 layerKinds.setFallback(BUILTIN_LAYER_KINDS);
+
+/**
+ * 「添加图层」的唯一生产入口（M4 A6）：按种类调用它登记的 `create`。
+ * 没有 create 的种类 / 未知种类返回 null（调用方据此把按钮或菜单项判为不可用）。
+ */
+export function createLayerOfKind(kind: string, doc: EditorDoc): number | string | null {
+  const def = layerKinds.get(kind);
+  if (!def || typeof def.create !== "function") return null;
+  return def.create(doc) ?? null;
+}
+
+/** 哪些种类可以新建（工具条据此决定按钮是否可用） */
+export const canCreateLayerOfKind = (kind: string): boolean => {
+  const def = layerKinds.get(kind);
+  return !!def && typeof def.create === "function";
+};
 
 /** 插件类型的识别（内置类型返回 null，交给 kindOf） */
 export function matchLayerKind(o: SceneObject): string | null {
