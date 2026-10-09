@@ -4923,7 +4923,7 @@ function commitInlineCombo(
   layerId: string | number,
   view: { effect: number; pass: number; effectName: string },
   key: string,
-  next: number,
+  next: number | null,
 ): void {
   structEdit(
     et("log.fxCombo", { name: view.effectName, param: key }),
@@ -5416,6 +5416,16 @@ function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
         const txt = document.createElement("span");
         txt.textContent = `${k}=${String(val)}`;
         wrap.append(cb, txt);
+        if (editable && Object.prototype.hasOwnProperty.call(v.combos, k)) {
+          // 已经有工程覆盖：给一个「复位」，删掉覆盖即回到材质声明的默认档
+          const reset = document.createElement("button");
+          reset.type = "button";
+          reset.className = "ed-btn ed-inline-combo-reset";
+          reset.dataset.comboReset = k;
+          reset.textContent = et("fx.libComboReset");
+          reset.onclick = () => commitInlineCombo(node.id, v, k, null);
+          wrap.appendChild(reset);
+        }
         row.appendChild(wrap);
       }
       body.appendChild(row);
