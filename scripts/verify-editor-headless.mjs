@@ -2819,4 +2819,146 @@ async function runCreateAndDraft(ctx) {
   check(!("camerashake" in genK) && !("camerashakeamplitude" in genK), `撤销到底：这次写进去的两个键都从盘上 scene.json 里收回了（现存 ${json(Object.keys(genK))}）`);
   check(json(genK.orthogonalprojection) === json({ width: 1920, height: 1080 }), "★ 撤销到底也没碰 orthogonalprojection（分辨率还在）");
   check((await h.errorLines()).length === 0, "场景设置全程无错误");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AM. M9 命令面板 / 无障碍 / 脚本事件模板");
+  // 段内自带按键派发：共享的 KEYS 里没有 k / 方向键，这里不动它
+  const amSend = async (k, code, vk, modifiers = 0) => {
+    await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
+    await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers });
+    await settle();
+  };
+  const AMK = {
+    k: ["k", "KeyK", 75],
+    Escape: ["Escape", "Escape", 27],
+    Enter: ["Enter", "Enter", 13],
+    ArrowUp: ["ArrowUp", "ArrowUp", 38],
+    ArrowDown: ["ArrowDown", "ArrowDown", 40],
+    ArrowLeft: ["ArrowLeft", "ArrowLeft", 37],
+    ArrowRight: ["ArrowRight", "ArrowRight", 39],
+    Home: ["Home", "Home", 36],
+    End: ["End", "End", 35],
+  };
+  const amPress = (k, modifiers = 0) => amSend(...AMK[k], modifiers);
+  const amOpen = () => ev(`!!document.querySelector('#ed-palette')?.open`);
+  const amRows = () =>
+    ev(`[...document.querySelectorAll('#ed-palette-list .ed-palette-row')].map((r) => ({ id: r.dataset.command, name: (r.querySelector('.ed-palette-name') || {}).textContent || '', on: r.getAttribute('aria-selected') === 'true' }))`);
+  const amType = async (q) => {
+    await ev(`(() => { const i = document.querySelector('#ed-palette-input'); i.value = ${JSON.stringify(q)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+    await settle();
+  };
+  const amAria = (id, attr) => ev(`(document.querySelector('#ed-tree .ed-node[data-id="${id}"]') || {}).getAttribute ? document.querySelector('#ed-tree .ed-node[data-id="${id}"]').getAttribute('${attr}') : null`);
+  const amActive = () => ev(`(document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null) || null`);
+  const amFocusRow = (id) => ev(`(() => { const n = document.querySelector('#ed-tree .ed-node[data-id="${id}"]'); if (!n) return false; n.focus(); return document.activeElement === n; })()`);
+
+  await gotoEditor();
+  await newBlank("#000000");
+  await addTextPreset("plain");
+  await setText("content", "PAL");
+  await setText("size", "60");
+  const amA = String((await rawObj()).id);
+  await addTextPreset("plain");
+  await setText("content", "TREE");
+  await setText("size", "60");
+  const amB = String((await rawObj()).id);
+  const amBefore = (await treeIds()).length;
+
+  // ── C4：⌘K 打开 → 枚举注册表 → 过滤 / ↑↓ / Enter 执行 layer.duplicate / 动态快捷键总览 ──
+  await ev(`document.activeElement && document.activeElement.blur()`);
+  await amPress("k", MOD.meta);
+  await waitFor(`!!document.querySelector('#ed-palette')?.open`, 30000);
+  const amAll = await amRows();
+  const amIds = amAll.map((r) => r.id);
+  check(amIds.length >= 7 && amIds.includes("edit.undo") && amIds.includes("layer.duplicate"), `⌘K 打开命令面板，条目来自命令注册表（${json(amIds)}）`);
+  check(amAll[0].id === "edit.undo" && amAll.filter((r) => r.on).length === 1 && amAll[0].on, "面板按注册顺序列出，只有一行处于选中态");
+  check(amAll.every((r) => r.name && r.name !== r.id), `标题是本地化文案而不是裸 id（首条「${amAll[0].name}」）`);
+  check((await ev(`document.querySelector('#ed-palette-input').getAttribute('aria-activedescendant')`)) === "ed-palette-opt-edit-undo", "输入框的 aria-activedescendant 指向当前选项");
+  await amPress("ArrowDown");
+  const amDown = await amRows();
+  check(amDown[1].on && !amDown[0].on, "↓ 移动选择（aria-selected 跟着走）");
+  await amPress("ArrowUp");
+  check((await amRows())[0].on, "↑ 移回上一行");
+  await amType("复制");
+  const amHit = await amRows();
+  check(amHit.length === 1 && amHit[0].id === "layer.duplicate", `输入过滤后只剩 layer.duplicate（${json(amHit.map((r) => r.id))}）`);
+  await amType("zzz");
+  check(await ev(`!!document.querySelector('#ed-palette-list .ed-palette-empty')`), "无命中时给空提示（不是空列表）");
+  await amPress("Enter");
+  check(await amOpen(), "无命中时 Enter 不执行、面板不崩（仍开着）");
+  await amType("复制");
+  await amPress("Enter");
+  await waitFor(`!document.querySelector('#ed-palette')?.open`, 15000);
+  const amAfter = (await treeIds()).length;
+  check(amAfter === amBefore + 1, `★ Enter 执行注册表里的 layer.duplicate：图层 ${amBefore} → ${amAfter}`);
+  await amPress("k", MOD.meta);
+  await waitFor(`!!document.querySelector('#ed-palette')?.open`, 15000);
+  check(await amOpen(), "⌘K 再按一次打开面板");
+  await amPress("k", MOD.meta);
+  await waitFor(`!document.querySelector('#ed-palette')?.open`, 15000);
+  check(!(await amOpen()), "面板开着时 ⌘K 收起（开关语义）");
+  await amPress("k", MOD.meta);
+  await waitFor(`!!document.querySelector('#ed-palette')?.open`, 15000);
+  check(await ev(`!!document.querySelector('#ed-palette-shortcuts')?.hidden`), "默认给命令列表（快捷键总览是切换出来的）");
+  await clickSel("#ed-palette-keys");
+  await settle();
+  const amKeys = await ev(`[...document.querySelectorAll('#ed-palette-shortcuts .ed-palette-key-row')].map((r) => r.textContent.replace(/\\s+/g, ' ').trim())`);
+  check(amKeys.length >= 6 && amKeys.some((t) => t.includes("⌘Z")) && amKeys.some((t) => t.includes("⇧⌘Z")), `快捷键总览由注册表生成（${amKeys.length} 行，键是平台写法：${json(amKeys.slice(0, 3))}）`);
+  check(amKeys.every((t) => !t.includes("export.run")), "没有快捷键的命令不进总览");
+  await amPress("Escape");
+  await waitFor(`!document.querySelector('#ed-palette')?.open`, 15000);
+  check(!(await amOpen()), "Esc 关闭面板（面板内焦点在输入框，窗口级 ⌘K 分支不会重复触发）");
+
+  // ── C5：树无障碍（treeitem / roving tabindex / ↑↓ Home End / ←→ 折叠展开 / ⇧ 多选仍在） ──
+  const amOrder = await treeIds();
+  check((await ev(`document.querySelectorAll('#ed-tree [role="treeitem"]').length`)) === amOrder.length && amOrder.length >= 3, `树行都是 treeitem（${amOrder.length} 行）`);
+  await clickRow(amOrder[1]);
+  await settle();
+  check((await amAria(amOrder[1], "aria-selected")) === "true" && (await amAria(amOrder[0], "aria-selected")) === "false", "点选：aria-selected 跟着选择走（其它行是 false）");
+  check((await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.tabIndex === 0).length`)) === 1, "roving tabindex：全树只有一个 tabindex=0 的行");
+  check(await amFocusRow(amOrder[0]), "tabindex=0 的那行可以拿到键盘焦点");
+  await amPress("ArrowDown");
+  check((await amActive()) === amOrder[1] && (await amAria(amOrder[1], "aria-selected")) === "true", "↓ 焦点下移并同步选择");
+  await amPress("End");
+  const amLast = amOrder[amOrder.length - 1];
+  check((await amActive()) === amLast && (await amAria(amLast, "aria-selected")) === "true", "End 到末行并同步选择");
+  await amPress("Home");
+  check((await amActive()) === amOrder[0] && (await amAria(amOrder[0], "aria-selected")) === "true", "Home 回首行并同步选择");
+  await click(await rowAt(amOrder[1]), MOD.shift);
+  await settle();
+  const amMulti = await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.getAttribute('aria-selected') === 'true').map((n) => n.dataset.id)`);
+  check(amMulti.length === 2 && amMulti.includes(amOrder[0]) && amMulti.includes(amOrder[1]), `⇧ 多选没被无障碍改动吃掉：两行同时 aria-selected（${json(amMulti)}）`);
+  await clickSel("#ly-group");
+  await settle();
+  await waitFor(`!!document.querySelector('#ed-tree .ed-node[aria-expanded]')`, 15000);
+  const amGroup = await ev(`(document.querySelector('#ed-tree .ed-node[aria-expanded]') || {}).dataset?.id || null`);
+  check(!!amGroup && (await amAria(amGroup, "aria-level")) === "1" && (await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.getAttribute('aria-level') === '2').length`)) === 2, "成组后：组是 aria-level=1，两个子层是 aria-level=2");
+  await amFocusRow(amGroup);
+  await amPress("ArrowLeft");
+  check((await amAria(amGroup, "aria-expanded")) === "false" && (await amActive()) === amGroup, "← 折叠组（aria-expanded=false，焦点留在组上）");
+  await amPress("ArrowRight");
+  check((await amAria(amGroup, "aria-expanded")) === "true", "→ 展开组（aria-expanded=true）");
+  await amPress("ArrowRight");
+  const amChild = await ev(`(document.querySelector('#ed-tree .ed-node[aria-level="2"]') || {}).dataset?.id || null`);
+  check(!!amChild && (await amActive()) === amChild && (await amAria(amChild, "aria-selected")) === "true", "→ 在展开的组上进第一个子行并同步选择");
+  await amPress("ArrowLeft");
+  check((await amActive()) === amGroup, "← 从子行回到组行");
+  check(await ev(`document.activeElement.closest('#ed-tree') !== null`), "焦点始终留在图层树里（没有跑到别的面板）");
+
+  // ── B8：脚本事件模板（面板入口 → 8 类 → 生成的脚本一次预检通过） ──
+  await clickRow(amB);
+  await settle();
+  const amTpls = await ev(`[...document.querySelectorAll('#script-template option')].map((o) => [o.value, o.textContent])`);
+  check(json(amTpls.map((o) => o[0])) === json(["update", "init", "applyUserProperties", "cursor", "media", "resizeScreen", "animationEvent", "destroy"]), `脚本面板给出 8 类生命周期模板（${json(amTpls.map((o) => o[0]))}）`);
+  check(amTpls.length === 8 && !amTpls[0][1].startsWith("sc.") && amTpls[0][1].includes("update"), `模板下拉是本地化文案（首项「${amTpls[0][1]}」）`);
+  await ev(`(() => { const s = document.querySelector('#script-template'); s.value = 'cursor'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await ev(`(() => { const s = document.querySelector('#script-add'); s.value = 'text'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await waitFor(`!!document.querySelector('.ed-script-src')`, 15000);
+  await settle();
+  const amSrc = await ev(`document.querySelector('.ed-script-src').value`);
+  check(/export function update\(value\)/.test(amSrc) && /export function cursorClick\(e\) \{\}/.test(amSrc) && /export function cursorMove\(e\) \{\}/.test(amSrc), "cursor 模板生成的脚本 = 6 个 cursor* 钩子 + 字段主回调 update");
+  check(/cursorClick/.test(amSrc) && !/mediaLyricsChanged/.test(amSrc) && !/animationEvent/.test(amSrc), "只放选中的那一类生命周期（没有把 8 类全塞进去）");
+  await waitFor(`/语法正确|Syntax OK/.test((document.querySelector('.ed-script-status') || {}).textContent || '')`, 15000);
+  const amStatus = await ev(`(document.querySelector('.ed-script-status') || {}).textContent || ''`);
+  check(/cursorMove/.test(amStatus), `预检状态栏列出引擎认到的入口（「${amStatus}」）`);
+  check((await h.errorLines()).length === 0, "M9 命令面板 / 无障碍 / 脚本模板全程无错误");
 }

@@ -25,6 +25,9 @@
         <button type="button" class="wb-icon-btn sponsor-btn" id="sponsor-btn" data-i18n-title="sponsor.title" title="赞赏作者">
           <svg class="i i-fill" viewBox="0 0 16 16"><path d="M8 14.2S1.6 10.4 1.6 5.9C1.6 3.6 3.4 2 5.4 2c1 0 2 .5 2.6 1.3C8.6 2.5 9.6 2 10.6 2c2 0 3.8 1.6 3.8 3.9 0 4.5-6.4 8.3-6.4 8.3z" /></svg>
         </button>
+        <button type="button" class="wb-icon-btn" id="ed-palette-btn" data-et-title="pal.tip" title="命令面板">
+          <svg class="i" viewBox="0 0 16 16"><rect x="2.4" y="3.4" width="11.2" height="9.2" rx="1.6" /><path d="M5 6.6h6M5 9.4h3.6" /></svg>
+        </button>
         <button type="button" class="wb-icon-btn" id="ed-help" data-i18n-title="act.docs" title="使用说明">
           <svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8" /><path d="M6.3 6.4a1.8 1.8 0 1 1 2.4 1.7c-.5.2-.7.6-.7 1.1v.4 M8 11.3v.2" /></svg>
         </button>
@@ -344,7 +347,7 @@
             <button type="button" role="menuitem" data-preset="puppet" data-et="md.puppet">导入为 puppet（2D 骨骼动画层）</button>
             <button type="button" role="menuitem" data-preset="mesh" data-et="md.mesh">导入为 3D 网格</button>
           </div>
-          <div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree"></div>
+          <div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree" aria-multiselectable="true"></div>
           </div>
           <div class="wb-panel-body" data-pane="library">
             <div class="lib-tools">
@@ -607,6 +610,19 @@
         <button type="button" class="ed-btn" id="plugins-install" data-et="pl.install">安装插件文件夹…</button>
         <button type="button" class="ed-btn is-primary" id="plugins-close" data-et="pl.close">完成</button>
       </div>
+    </dialog>
+
+    <!-- 命令面板 + 动态快捷键总览（M9 / C4）：命令只从 commands.registry 枚举，这里不写第二份清单 -->
+    <dialog id="ed-palette" class="ed-dialog ed-palette" aria-labelledby="ed-palette-title">
+      <div class="ed-palette-top">
+        <div class="ed-dialog-title" id="ed-palette-title" data-et="pal.title">命令面板</div>
+        <button type="button" class="ed-btn ed-palette-keys-btn" id="ed-palette-keys" aria-pressed="false" data-et-title="pal.keysTip"><span data-et="pal.keys">快捷键总览</span></button>
+        <button type="button" class="ed-btn ed-palette-close" id="ed-palette-close" data-et-title="pal.close" aria-label="关闭">✕</button>
+      </div>
+      <input type="text" id="ed-palette-input" class="ed-palette-input" role="combobox" aria-expanded="true" aria-controls="ed-palette-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" data-et-ph="pal.ph" />
+      <div id="ed-palette-list" class="ed-palette-list" role="listbox" aria-labelledby="ed-palette-title"></div>
+      <div id="ed-palette-shortcuts" class="ed-palette-shortcuts" hidden></div>
+      <div class="ed-palette-foot" data-et="pal.hint">↑↓ 选择 · Enter 执行 · Esc 关闭</div>
     </dialog>
 
     <input type="file" id="in-plugin" webkitdirectory multiple hidden />
