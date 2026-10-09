@@ -308,8 +308,9 @@ const PART_SQUASH_MESH = 900
 const PART_SQUASH_BODY = 110
 // 全身网格上「大件也跟着收」的唯一破例：收拢件自己被压到这个比例以下（真闭眼）。
 // 3078285611/3264246690 的躯干/头板假阳性都是 cr=0.96~0.98（几乎没收）配上的，靠这条挡住；
-// 3671936032 的眼白 cr=0.075（艾玛 f24）、0.26→0.011（希罗 f60）才能放行虹膜跟着收。
-const PART_SQUASH_BODY_DEEP = 0.2
+// 3671936032 的眼白 cr=0.075（艾玛 f24）、0.26（希罗 f60，侧脸只压到四分之一）要能放行。
+// 取 0.4 是为了容下希罗那 0.26；放到 0.9 会把 3078285611 静止长边 236 的零件压到 0.07（判据转红）。
+const PART_SQUASH_BODY_DEEP = 0.4
 
 function meshSpan(mdl) {
   if (mdl._meshSpan) return mdl._meshSpan
@@ -460,7 +461,17 @@ export function collapsedPartSquash(mdl, skin, animLayers) {
         const cw0 = Math.max(1e-3, parts[c].x1 - parts[c].x0)
         const ch0 = Math.max(1e-3, parts[c].y1 - parts[c].y0)
         if (!(Math.max(rw0 / cw0, cw0 / rw0) <= 4 && Math.max(rh0 / ch0, ch0 / rh0) <= 4)) continue
-        if (!(rArea > 2 * cw0 * ch0)) continue
+        // ④ 收拢件**此刻真的压在它身上**：当前姿势下两盒的交叠面积至少占较小者的 1/5。
+        //    这条取代了早先的「被盖件静止面积 ≥2 倍」—— 那条会把**比眼白小的眼球**挡在门外
+        //    （3671936032 希罗：眼球 49×153=7497 < 眼白 150×140=21000，面积比 0.36，
+        //    可它正是闭眼时该被盖住的那件，用户实测「眼球一直是最大状态、睫毛往下也没遮罩」）。
+        //    用「当前交叠」分辨真假：希罗眼球×眼白 交叠 2571（占较小者 34%）、艾玛虹膜×眼白
+        //    6804（61%），而 3078285611 的假配 #29(156×150) × #23(151×137, cr=0.002) 交叠 **0**
+        //    —— 已经塌成一条线的 #23（当前盒 151×0.22、X 在 329~480）压根没压到 #29（X 521~682）。
+        const ix = Math.min(cb[1], rb[1]) - Math.max(cb[0], rb[0])
+        const iy = Math.min(cb[3], rb[3]) - Math.max(cb[2], rb[2])
+        if (!(ix > 0 && iy > 0)) continue
+        if (ix * iy < 0.2 * Math.min(rArea, w * h)) continue
       } else {
         // 老判据（2026-10-07）：收拢件**当前中心**落在刚性件盒内 + 被盖件更窄 +（2026-10-09）
         // 静止姿势下两盒**相交**。
