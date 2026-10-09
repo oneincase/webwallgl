@@ -307,6 +307,7 @@
               </button>
               <!-- 插件槽位 menu.add：图层 / 内容的「添加」扩展位（插件贡献的添加按钮与内置添加按钮并排，没有贡献时隐藏） -->
               <div class="ed-plugin-group" id="ed-plugin-add" role="group" hidden></div>
+              <span class="wb-sep" aria-hidden="true"></span>
               <button type="button" class="ed-icon" id="ly-up" disabled data-et-title="ly.up" title="前移">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M8 13V3 M4 7l4-4 4 4" /></svg>
               </button>
@@ -322,7 +323,8 @@
               <button type="button" class="ed-icon" id="ly-dup" disabled data-et-title="ly.dup" title="复制">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M5.5 5.5h8v8h-8z M10.5 5.5V2.5h-8v8h3" /></svg>
               </button>
-              <button type="button" class="ed-icon" id="ly-del" disabled data-et-title="ly.del" title="删除">
+              <span class="wb-sep" aria-hidden="true"></span>
+              <button type="button" class="ed-icon ed-icon-danger" id="ly-del" disabled data-et-title="ly.del" title="删除">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4h10M6.5 4V3h3v1M4.5 4.5V13a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V4.5M6.8 7v4.5M9.2 7v4.5" /></svg>
               </button>
             </div>
@@ -421,6 +423,10 @@
               <svg class="i" viewBox="0 0 16 16" style="width: 40px; height: 40px; stroke-width: 0.8; opacity: 0.5"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z M2.5 4.8L8 7.8l5.5-3 M8 7.8v6.4" /></svg>
               <div class="ed-empty-title" data-et="empty.title">把壁纸拖到这里</div>
               <div class="ed-empty-hint" data-et="empty.hint"></div>
+              <div class="ed-empty-actions">
+                <button type="button" class="ed-btn" id="empty-library" data-et="empty.library">打开壁纸库</button>
+                <button type="button" class="ed-btn is-primary" id="empty-new" data-et="empty.new">新建项目</button>
+              </div>
             </div>
             <div id="ed-drop" hidden></div>
             <div id="ed-draft" role="status" hidden>
@@ -466,7 +472,13 @@
               </select>
             </label>
           </div>
-          <div id="tl-lanes" hidden></div>
+          <!-- 时间轴 dopesheet：拉手可拖高度；刻度尺 + 按层/按属性的动画条，播放头竖线贯穿全高 -->
+          <div id="tl-dock">
+            <div id="tl-grip" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="拖动调整时间轴高度" title="拖动调整时间轴高度"></div>
+            <div id="tl-ruler" aria-hidden="true"></div>
+            <div id="tl-playhead" aria-hidden="true"></div>
+            <div id="tl-lanes" hidden></div>
+          </div>
           </div>
 
           <section id="docs-view" class="wb-panel-body is-scroll" data-pane="docs">

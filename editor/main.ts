@@ -239,6 +239,7 @@ import {
   isAnimated,
   keyTimes,
   moveKeyTime,
+  moveKeyTimeIn,
   pasteKeysAt,
   removeKey,
   setAnimOption,
@@ -500,6 +501,10 @@ const tlMaxEl = $<HTMLElement>("#tl-max");
 const tlKeysEl = $<HTMLElement>("#tl-keys");
 const tlTrackEl = $<HTMLElement>("#tl-track");
 const tlLanesEl = $<HTMLElement>("#tl-lanes");
+const tlDockEl = $<HTMLElement>("#tl-dock");
+const tlRulerEl = $<HTMLElement>("#tl-ruler");
+const tlPlayheadEl = $<HTMLElement>("#tl-playhead");
+const tlGripEl = $<HTMLElement>("#tl-grip");
 const tlSpeedEl = $<HTMLSelectElement>("#tl-speed");
 const undoEl = $<HTMLButtonElement>("#tb-undo");
 const redoEl = $<HTMLButtonElement>("#tb-redo");
@@ -959,9 +964,19 @@ playEl.onclick = () => {
 // ---------- 时间轴（W1 可控时钟） ----------
 
 const TL_WINDOW = 30;
+/** 时间轴刻度 / 动画条 / 播放头共用的横向坐标（renderLanes 时量一次） */
+let tlBox = { left: 0, width: 0 };
 let tlMax = TL_WINDOW;
 let scrubbing = false;
 const FRAME = 1 / 60;
+
+/**
+ * 时间轴上选中的关键帧（编辑目标）：图层 + 字段（null = 该层全部字段，即层行的「时刻」）+ 时刻（秒）。
+ * 选中状态只是为了拖动 / 删除 / 微调时有明确对象，不写进文档。
+ */
+let tlSel: { layerId: string; field: AnimField | null; t: number } | null = null;
+/** 拖动关键帧时播放头跟着手指走（对齐画面用）；null = 用引擎当前时间 */
+let tlGhostT: number | null = null;
 
 function fmtTime(s: number): string {
   return `${s.toFixed(2)}s`;
@@ -1003,17 +1018,115 @@ function renderKeyMarks() {
     m.dataset.t = String(t);
     m.title = `${fmtTime(t)}${editable ? ` · ${et("anim.dragMark")}` : ""}`;
     m.style.left = `${(t / tlMax) * 100}%`;
-    if (editable) {
-      m.classList.add("is-draggable");
-      m.addEventListener("pointerdown", (e) => startKeyDrag(e, m, n, t));
-    }
+    bindKeyMark(m, n, null, t, tlKeysEl, editable);
     tlKeysEl.appendChild(m);
+  }
+}
+
+/** 刻度尺 / 动画条 / 播放头共用的横向坐标系（与 #tl-keys 的 inset 0 7px 一致） */
+function tlTrackBox(): { left: number; width: number } {
+  // 基准取 #tl-dock（它总在布局里）；#tl-lanes 在没有动画层时是 hidden 的，量不到几何
+  const host = tlDockEl.getBoundingClientRect();
+  const track = tlTrackEl.getBoundingClientRect();
+  const left = Math.max(0, track.left - host.left);
+  const width = track.width > 0 ? track.width : Math.max(0, host.width - left);
+  return { left, width };
+}
+
+/** 时间轴刻度尺：秒刻度按窗口自适应（≤12s 每秒、≤60s 每 5s、更宽每 15s） */
+function renderRuler(box: { left: number; width: number }, on: boolean) {
+  tlRulerEl.textContent = "";
+  tlRulerEl.hidden = !on;
+  if (!on) return;
+  const ticks = document.createElement("div");
+  ticks.id = "tl-ruler-ticks";
+  // 与 #tl-keys / 播放头同一坐标系：#tl-keys 的 CSS inset 是 0 7px（滑条两端各留半个滑块）
+  ticks.style.left = `${box.left + 7}px`;
+  ticks.style.width = `${Math.max(0, box.width - 14)}px`;
+  const step = tlMax <= 12 ? 1 : tlMax <= 60 ? 5 : 15;
+  for (let t = 0; t <= tlMax + 1e-6; t += step) {
+    const pct = `${(Math.min(t, tlMax) / tlMax) * 100}%`;
+    const tick = document.createElement("i");
+    tick.className = `tl-tick${t === 0 ? " major" : ""}`;
+    tick.style.left = pct;
+    const lab = document.createElement("span");
+    lab.className = "tl-tick-label";
+    lab.textContent = `${Math.round(t)}s`;
+    lab.style.left = pct;
+    ticks.append(tick, lab);
+  }
+  tlRulerEl.appendChild(ticks);
+}
+
+/** 播放头竖线：横跨刻度尺与全部动画条，位置与 #tl-keys 的滑块中心一致 */
+function renderPlayhead(box: { left: number; width: number }, on: boolean) {
+  tlPlayheadEl.hidden = !on;
+  if (!on) return;
+  tlBox = box;
+  paintPlayhead();
+}
+
+/** 每帧只改一次 left，不再量布局（tickTimeline 会高频调用） */
+function paintPlayhead() {
+  const inner = Math.max(0, tlBox.width - 14);
+  // 拖动关键帧时跟着手指走（tlGhostT），否则跟引擎时间
+  const src = tlGhostT ?? (editor ? editor.time : 0);
+  const t = Math.min(tlMax, Math.max(0, src));
+  tlPlayheadEl.style.left = `${tlBox.left + 7 + (t / tlMax) * inner}px`;
+}
+
+/** 选中层的「按属性分行」：每个开了动画的字段一行，一眼看出是哪条曲线在动 */
+function appendPropertyRows(node: LayerNode, left: number, width: number) {
+  const editable = !!editor && !!doc?.scene && !!current?.assets && !isLocked(node.id);
+  for (const f of ANIM_FIELDS) {
+    const view = getAnim(node.obj, f);
+    if (!view) continue;
+    const len = Math.round((view.length / view.fps) * 1000) / 1000;
+    const row = document.createElement("div");
+    // 注意：子行**不叫** .tl-lane —— 判据里的 `#tl-lanes .tl-lane` 指的是「每层一行」
+    row.className = "tl-subrow";
+    row.dataset.field = f;
+    const name = document.createElement("span");
+    name.className = "tl-lane-name";
+    name.textContent = et(ANIM_LABEL[f]);
+    name.style.width = `${left}px`;
+    const bars = document.createElement("div");
+    bars.className = "tl-lane-bars";
+    bars.style.left = `${left + 7}px`;
+    bars.style.width = `${Math.max(0, width - 14)}px`;
+    const pct = (t: number) => `${(Math.min(t, tlMax) / tlMax) * 100}%`;
+    const bar = document.createElement("i");
+    bar.className = "tl-lane-bar";
+    bar.style.width = pct(len);
+    bars.appendChild(bar);
+    if (view.mode !== "single" && len < tlMax) {
+      const rep = document.createElement("i");
+      rep.className = "tl-lane-bar is-repeat";
+      rep.style.left = pct(len);
+      rep.style.width = `${((tlMax - len) / tlMax) * 100}%`;
+      bars.appendChild(rep);
+    }
+    for (const k of view.keys) {
+      const t = Math.round((k.frame / view.fps) * 1000) / 1000;
+      if (t > tlMax) continue;
+      const mark = document.createElement("i");
+      mark.className = "tl-lane-key";
+      mark.dataset.t = String(t);
+      mark.title = `${fmtTime(t)} · ${et(ANIM_LABEL[f])}`;
+      mark.style.left = pct(t);
+      bindKeyMark(mark, node, f, t, bars, editable);
+      bars.appendChild(mark);
+    }
+    row.title = `${et(ANIM_LABEL[f])} · ${fmtTime(len)} · ${et(`anim.mode.${view.mode}`)}`;
+    row.append(name, bars);
+    tlLanesEl.appendChild(row);
   }
 }
 
 /** 时间轴下方按层动画条：每个有动画的图层一行（首周期实条 + 循环 / 往返的后续周期虚条 + 关键帧），点行选中该层 */
 function renderLanes() {
   tlLanesEl.textContent = "";
+  tlDockEl.querySelector("#tl-empty")?.remove();
   const rows: Array<{ node: LayerNode; sum: NonNullable<ReturnType<typeof animSummary>> }> = [];
   const walk = (nodes: LayerNode[]) => {
     for (const n of nodes) {
@@ -1023,12 +1136,29 @@ function renderLanes() {
     }
   };
   if (doc) walk(doc.roots);
+  const on = !!doc && !!editor;
+  tlDockEl.hidden = !on;
+  // 没有动画层时整条轨道区收起：留下「标尺 + 一句说明」，不占一整块空白（也别把说明塞进隐藏的 #tl-lanes 里）
+  tlDockEl.classList.toggle("is-empty", rows.length === 0);
   tlLanesEl.hidden = rows.length === 0;
-  if (!rows.length) return;
-  const host = tlLanesEl.getBoundingClientRect();
-  const track = tlTrackEl.getBoundingClientRect();
-  const left = Math.max(0, track.left - host.left);
-  const width = track.width > 0 ? track.width : host.width - left;
+  if (!on) {
+    renderRuler({ left: 0, width: 0 }, false);
+    renderPlayhead({ left: 0, width: 0 }, false);
+    renderSelBar();
+    return;
+  }
+  const box = tlTrackBox();
+  renderRuler(box, true);
+  renderPlayhead(box, true);
+  if (!rows.length) {
+    const hint = document.createElement("div");
+    hint.id = "tl-empty";
+    hint.textContent = et("tl.noLanes");
+    tlDockEl.appendChild(hint);
+    renderSelBar();
+    return;
+  }
+  const { left, width } = box;
   for (const { node, sum } of rows) {
     const row = document.createElement("div");
     row.className = "tl-lane";
@@ -1059,32 +1189,245 @@ function renderLanes() {
       const k = document.createElement("i");
       k.className = "tl-lane-key";
       k.dataset.t = String(t);
+      k.title = `${fmtTime(t)} · ${et("tl.allFields")}`;
       k.style.left = pct(t);
+      bindKeyMark(k, node, null, t, bars, !!editor && !!doc?.scene && !!current?.assets && !isLocked(node.id));
       bars.appendChild(k);
     }
     row.title = `${nodeName(node.id)} · ${fmtTime(sum.length)} · ${et(`anim.mode.${sum.mode}`)}`;
     row.append(name, bars);
     row.addEventListener("click", () => selectLayer(node.id));
     tlLanesEl.appendChild(row);
+    if (isSelected(node.id)) appendPropertyRows(node, left, width);
   }
+  renderSelBar();
 }
 
 new ResizeObserver(() => renderLanes()).observe(tlTrackEl);
 
-function startKeyDrag(e: PointerEvent, m: HTMLElement, n: LayerNode, from: number) {
+// 时间轴高度：拖动拉手调整（本次会话内记住），双击回到默认
+const TL_DOCK_H = 168;
+const TL_DOCK_MIN = 96;
+const TL_DOCK_MAX = 420;
+let tlDockH = TL_DOCK_H;
+
+function setTlDockH(h: number) {
+  tlDockH = Math.round(Math.max(TL_DOCK_MIN, Math.min(TL_DOCK_MAX, h)));
+  tlDockEl.style.setProperty("--tl-dock-h", `${tlDockH}px`);
+  renderLanes();
+}
+
+tlGripEl.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  // 没有动画层时这条轨道是收起的（is-empty），拖高度没有意义
+  if (tlDockEl.classList.contains("is-empty")) return;
+  e.preventDefault();
+  tlGripEl.setPointerCapture(e.pointerId);
+  const from = tlDockEl.getBoundingClientRect().bottom;
+  const base = tlDockH;
+  const move = (ev: PointerEvent) => setTlDockH(base + (from - ev.clientY));
+  const end = () => {
+    tlGripEl.removeEventListener("pointermove", move);
+    tlGripEl.removeEventListener("pointerup", end);
+    tlGripEl.removeEventListener("pointercancel", end);
+  };
+  tlGripEl.addEventListener("pointermove", move);
+  tlGripEl.addEventListener("pointerup", end);
+  tlGripEl.addEventListener("pointercancel", end);
+});
+
+tlGripEl.addEventListener("dblclick", () => setTlDockH(TL_DOCK_H));
+
+tlGripEl.addEventListener("keydown", (e) => {
+  const step = e.shiftKey ? 40 : 12;
+  if (e.key === "ArrowUp") setTlDockH(tlDockH + step);
+  else if (e.key === "ArrowDown") setTlDockH(tlDockH - step);
+  else return;
+  e.preventDefault();
+});
+
+/**
+ * 关键帧时刻吸附：播放头 → 整秒 → 帧。
+ * 顺序不能按「谁近取谁」：帧网格永远在 ±½帧（1/60s）内，整秒就永远抢不到，
+ * 所以特殊目标（播放头 / 整秒）只要落进容差就直接吸附，否则退回帧网格。
+ */
+function snapKeyTime(t: number, fps: number): { t: number; snap: "sec" | "playhead" | null } {
+  const TOL = 0.12;
+  const ph = editor ? editor.time : 0;
+  if (Math.abs(t - ph) <= TOL) return { t: ph, snap: "playhead" };
+  const sec = Math.round(t);
+  if (Math.abs(t - sec) <= TOL) return { t: sec, snap: "sec" };
+  return { t: Math.round(t * fps) / fps, snap: null };
+}
+
+/** 拖动吸附的颗粒度用这条动画自己的 fps（文档默认 30） */
+function fpsAt(n: LayerNode, field: AnimField | null): number {
+  for (const f of field ? [field] : ANIM_FIELDS) {
+    const view = getAnim(n.obj, f);
+    if (view) return view.fps || 30;
+  }
+  return 30;
+}
+
+function setTlSel(layerId: number | string, field: AnimField | null, t: number, rerender = true) {
+  tlSel = { layerId: String(layerId), field, t };
+  if (rerender) renderKeyMarks();
+  else for (const el of tlDockEl.querySelectorAll(".tl-key.is-selected, .tl-lane-key.is-selected")) el.classList.remove("is-selected");
+  renderSelBar();
+}
+
+function clearTlSel() {
+  if (!tlSel) return;
+  tlSel = null;
+  for (const el of tlDockEl.querySelectorAll(".tl-key.is-selected, .tl-lane-key.is-selected")) el.classList.remove("is-selected");
+  renderSelBar();
+}
+
+/** 选中关键帧的操作条（面板内固定一行，不遮动画条）：字段 + 时刻 / 平滑切换 / 删除 */
+function ensureSelBar(): HTMLElement {
+  const found = tlDockEl.querySelector<HTMLElement>("#tl-selbar");
+  if (found) return found;
+  const bar = document.createElement("div");
+  bar.id = "tl-selbar";
+  bar.hidden = true;
+  const label = document.createElement("span");
+  label.className = "tl-sel-label";
+  const smooth = document.createElement("button");
+  smooth.type = "button";
+  smooth.className = "tl-sel-btn";
+  smooth.dataset.act = "smooth";
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "tl-sel-btn is-danger";
+  del.dataset.act = "delete";
+  const hint = document.createElement("span");
+  hint.className = "tl-sel-hint";
+  hint.textContent = et("tl.keyHint");
+  bar.append(label, smooth, del, hint);
+  bar.addEventListener("click", (e) => {
+    const act = (e.target as HTMLElement).dataset?.act;
+    if (act === "smooth") toggleSelSmooth();
+    else if (act === "delete") deleteSelKey();
+  });
+  tlDockEl.appendChild(bar);
+  return bar;
+}
+
+/** 选中的关键帧还有效吗？（图层还在、字段还开着、那一帧还真的有关键帧） */
+function selKeyView(): { node: LayerNode; field: AnimField | null; view: ReturnType<typeof getAnim>; smooth: boolean } | null {
+  if (!tlSel || !doc) return null;
+  // 图层 id 可能是数字也可能是字符串（dataset 里永远是字符串）→ 用既有的双查
+  const node = treeNodeOf(tlSel.layerId);
+  if (!node) return null;
+  if (!tlSel.field) return { node, field: null, view: null, smooth: false };
+  const view = getAnim(node.obj, tlSel.field);
+  if (!view) return null;
+  const frame = Math.round(tlSel.t * view.fps);
+  if (!view.keys.some((x) => Number(x.frame) === frame)) return null;
+  // setSmooth 是整条动画两侧手柄的开关，所以这里显示的也是整条动画的平滑态
+  return { node, field: tlSel.field, view, smooth: view.smooth };
+}
+
+function renderSelBar() {
+  const bar = ensureSelBar();
+  const s = selKeyView();
+  if (!s || !tlSel) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const fieldTxt = s.field ? et(ANIM_LABEL[s.field]) : et("tl.allFields");
+  bar.querySelector(".tl-sel-label")!.textContent = `${nodeName(s.node.id)} · ${fieldTxt} · ${fmtTime(tlSel.t)}`;
+  const smooth = bar.querySelector<HTMLButtonElement>('[data-act="smooth"]')!;
+  smooth.hidden = !s.field;
+  smooth.textContent = et(s.smooth ? "tl.keyLinear" : "tl.keySmooth");
+  smooth.title = et("tl.keySmoothTip");
+  bar.querySelector<HTMLButtonElement>('[data-act="delete"]')!.textContent = et("tl.keyDelete");
+}
+
+function toggleSelSmooth() {
+  const s = selKeyView();
+  if (!s || !s.field || !tlSel) return;
+  const next = !s.smooth;
+  const label = et(next ? "log.keySmoothOn" : "log.keySmoothOff", { layer: nodeName(s.node.id), field: et(ANIM_LABEL[s.field]) });
+  const ok = objEditOk(label, s.node.id, (o) => setSmooth(o, s.field as AnimField, next));
+  if (!ok) log(et("log.keyMoveBad", { to: fmtTime(tlSel.t) }), "warn");
+  renderKeyMarks();
+  renderSelBar();
+}
+
+function deleteSelKey() {
+  const s = selKeyView();
+  if (!s || !tlSel) return;
+  const at = tlSel.t;
+  const ok = objEditOk(et("log.keyDeleted", { layer: nodeName(s.node.id), at: fmtTime(at) }), s.node.id, (o) => {
+    let hit = false;
+    for (const f of ANIM_FIELDS) {
+      if (s.field && f !== s.field) continue;
+      const view = getAnim(o, f);
+      if (!view) continue;
+      const frame = Math.round(at * view.fps);
+      if (!view.keys.some((k) => Number(k.frame) === frame)) continue;
+      if (removeKey(o, f, frame)) hit = true;
+    }
+    return hit;
+  });
+  if (ok) {
+    tlSel = null;
+    renderKeyMarks();
+  } else {
+    log(et("log.keyDelBad", { at: fmtTime(at) }), "warn");
+  }
+  renderSelBar();
+}
+
+/** ←/→ 微调选中关键帧（帧为单位；层行 = 该层该时刻的全部动画一起挪） */
+function nudgeSelKey(frames: number) {
+  const s = selKeyView();
+  if (!s || !tlSel) return;
+  const from = tlSel.t;
+  const fps = fpsAt(s.node, s.field);
+  const to = Math.max(0, Math.round((from + frames / fps) * 1000) / 1000);
+  if (Math.abs(to - from) < 1e-6) return;
+  const ok = objEditOk(
+    et("log.keyNudged", { layer: nodeName(s.node.id), from: fmtTime(from), to: fmtTime(to) }),
+    s.node.id,
+    (o) => (s.field ? moveKeyTimeIn(o, s.field, from, to) : moveKeyTime(o, from, to)),
+  );
+  if (ok) tlSel = { ...tlSel, t: to };
+  else log(et("log.keyMoveBad", { to: fmtTime(to) }), "warn");
+  renderKeyMarks();
+  renderSelBar();
+}
+
+/** 拖动关键帧：box 取标记所在容器（整层标记用 #tl-keys，属性行标记用它的 .tl-lane-bars） */
+function startKeyDrag(
+  e: PointerEvent,
+  m: HTMLElement,
+  n: LayerNode,
+  from: number,
+  field: AnimField | null = null,
+  host: HTMLElement = tlKeysEl,
+) {
   if (e.button !== 0) return;
   e.preventDefault();
   e.stopPropagation();
   m.setPointerCapture(e.pointerId);
   m.classList.add("is-dragging");
   scrubbing = true;
-  const box = tlKeysEl.getBoundingClientRect();
-  const snap = (t: number) => Math.round(t * 30) / 30;
+  const box = host.getBoundingClientRect();
+  const fps = fpsAt(n, field);
   let to = from;
   const move = (ev: PointerEvent) => {
-    to = snap(Math.max(0, Math.min(tlMax, ((ev.clientX - box.left) / box.width) * tlMax)));
+    const raw = Math.max(0, Math.min(tlMax, ((ev.clientX - box.left) / box.width) * tlMax));
+    const s = snapKeyTime(raw, fps);
+    to = s.t;
     m.style.left = `${(to / tlMax) * 100}%`;
     tlTimeEl.textContent = fmtTime(to);
+    // 播放头跟着手指走：判断「要不要这一帧」得看画面
+    tlGhostT = to;
+    paintPlayhead();
+    tlPlayheadEl.classList.toggle("is-snap", !!s.snap);
   };
   const end = () => {
     m.removeEventListener("pointermove", move);
@@ -1092,20 +1435,51 @@ function startKeyDrag(e: PointerEvent, m: HTMLElement, n: LayerNode, from: numbe
     m.removeEventListener("pointercancel", end);
     m.classList.remove("is-dragging");
     scrubbing = false;
-    if (Math.abs(to - from) < 1e-3) return renderKeyMarks();
+    tlGhostT = null;
+    tlPlayheadEl.classList.remove("is-snap");
+    paintPlayhead();
+    // 落回原帧（含只点了一下没拖）：不写文档，只当作选中。
+    // 这里**不能**重画标记 —— 重画会把这个节点换掉，双击就再也到不了 dblclick。
+    if (Math.round(to * fps) === Math.round(from * fps)) {
+      renderSelBar();
+      return;
+    }
     const ok = objEditOk(
       et("log.keyMoved", { layer: nodeName(n.id), from: fmtTime(from), to: fmtTime(to) }),
       n.id,
-      (o) => moveKeyTime(o, from, to),
+      (o) => (field ? moveKeyTimeIn(o, field, from, to) : moveKeyTime(o, from, to)),
     );
     if (!ok) {
       log(et("log.keyMoveBad", { to: fmtTime(to) }), "warn");
       renderKeyMarks();
+      return;
     }
+    tlSel = { layerId: String(n.id), field, t: to };
+    renderKeyMarks();
+    renderSelBar();
   };
   m.addEventListener("pointermove", move);
   m.addEventListener("pointerup", end);
   m.addEventListener("pointercancel", end);
+}
+
+/** 时间轴上的关键帧标记：可选中、可拖、双击切平滑/线性（editable = 有文档且该层没锁） */
+function bindKeyMark(mark: HTMLElement, n: LayerNode, field: AnimField | null, t: number, host: HTMLElement, editable: boolean) {
+  if (field) mark.dataset.field = field;
+  if (tlSel && tlSel.layerId === String(n.id) && tlSel.field === field && Math.abs(tlSel.t - t) < 1e-6) mark.classList.add("is-selected");
+  if (!editable) return;
+  mark.classList.add("is-draggable");
+  mark.addEventListener("pointerdown", (ev) => {
+    // 先记选中态但**不要整块重绘**：重绘会把正在拖的这个标记换掉，指针捕获就断了
+    setTlSel(n.id, field, t, false);
+    mark.classList.add("is-selected");
+    startKeyDrag(ev, mark, n, t, field, host);
+  });
+  mark.addEventListener("click", (ev) => ev.stopPropagation());
+  mark.addEventListener("dblclick", (ev) => {
+    ev.stopPropagation();
+    if (field) toggleSelSmooth();
+  });
 }
 
 function resetTimelineRange() {
@@ -1133,6 +1507,7 @@ function tickTimeline() {
   if (t > tlMax) setTimelineMax(Math.ceil(t / TL_WINDOW) * TL_WINDOW);
   tlRangeEl.value = String(t);
   tlTimeEl.textContent = fmtTime(t);
+  if (!tlPlayheadEl.hidden) paintPlayhead();
 }
 
 function pauseForStepping() {
@@ -1179,6 +1554,65 @@ tlNextEl.onclick = () => {
   afterSeek(editor.step(1, 60));
 };
 tlSpeedEl.onchange = () => editor?.setTimeScale(Number(tlSpeedEl.value));
+
+// ---------- 刻度尺定位 + 关键帧编辑（S5） ----------
+
+/** 刻度尺上按下 / 拖动 = 定位当前时刻（与滑条、播放头同一坐标系） */
+function rulerTimeAt(clientX: number): number {
+  const box = tlTrackBox();
+  const inner = Math.max(1, box.width - 14);
+  const x = clientX - tlDockEl.getBoundingClientRect().left - box.left - 7;
+  return Math.max(0, Math.min(tlMax, (x / inner) * tlMax));
+}
+
+tlRulerEl.addEventListener("pointerdown", (e) => {
+  if (!editor || e.button !== 0) return;
+  e.preventDefault();
+  tlRulerEl.setPointerCapture(e.pointerId);
+  scrubbing = true;
+  let last = editor.time;
+  const seek = (ev: PointerEvent) => {
+    last = rulerTimeAt(ev.clientX);
+    tlTimeEl.textContent = fmtTime(last);
+    void seekLogged(editor!.seek(last));
+  };
+  seek(e);
+  const move = (ev: PointerEvent) => seek(ev);
+  const end = () => {
+    tlRulerEl.removeEventListener("pointermove", move);
+    tlRulerEl.removeEventListener("pointerup", end);
+    tlRulerEl.removeEventListener("pointercancel", end);
+    scrubbing = false;
+    void seekLogged(editor!.seek(last)).then(() => {
+      const n = selectedNode();
+      if (n && ANIM_FIELDS.some((f) => isAnimated(n.obj, f))) renderInspector();
+    });
+  };
+  tlRulerEl.addEventListener("pointermove", move);
+  tlRulerEl.addEventListener("pointerup", end);
+  tlRulerEl.addEventListener("pointercancel", end);
+});
+
+// 选中关键帧后的键盘操作：Delete/Backspace 删除、←/→ ±1 帧（⇧ ±10）、Esc 取消选中。
+// 必须注册在「Delete 删图层」那个全局监听（editor/main.ts 后段的 window keydown）之前，
+// 并用捕获阶段 + stopImmediatePropagation 抢下，否则删关键帧会把整个图层一起删掉。
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (!tlSel || !editor) return;
+    const t = e.target as HTMLElement | null;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (e.key === "Delete" || e.key === "Backspace") deleteSelKey();
+    else if (e.key === "ArrowLeft" || e.key === "ArrowRight") nudgeSelKey((e.key === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 10 : 1));
+    else if (e.key === "Escape") {
+      clearTlSel();
+      renderKeyMarks();
+    } else return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  },
+  true,
+);
 
 // ---------- 导出 PNG（W3） ----------
 
@@ -1895,6 +2329,8 @@ stageEl.addEventListener("click", (e) => {
 });
 
 function selectLayer(id: number | string | null) {
+  // 关键帧选中属于某一个图层：换层就取消，免得 Delete 误删上一层的（已拖过的）关键帧
+  if (tlSel && String(tlSel.layerId) !== String(id)) clearTlSel();
   extraSel.clear();
   if (id === null || !doc) {
     selectedId = null;
@@ -1911,6 +2347,7 @@ function selectLayer(id: number | string | null) {
 
 /** 主选 + 追加集合一次性落定（框选 / 全选用）：主选拿列表第一个，其余进 extraSel */
 function selectMany(primary: number | string | null, extra: ReadonlyArray<number | string>) {
+  if (tlSel && String(tlSel.layerId) !== String(primary)) clearTlSel();
   extraSel.clear();
   selectedId = null;
   if (primary !== null && doc) selectedId = findPath(doc.roots, primary)?.at(-1)?.id ?? null;
@@ -3247,6 +3684,8 @@ async function openLibrary(it: LibraryItem) {
     return;
   }
   await openWith(it.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), { origin: { kind: "library" }, library: it, play: true });
+  // 打开作品后左栏落回图层树：接下来要做的是编辑，不是继续挑壁纸
+  panelTabs.left.select("layers");
 }
 
 const libraryPanel = mountLibraryPanel({
@@ -3868,6 +4307,10 @@ $<HTMLButtonElement>("#new-image").onclick = () => {
   imagePickFor = "template";
   inImageEl.click();
 };
+
+// 空态的两个出口：打开壁纸库 / 新建项目
+$<HTMLButtonElement>("#empty-library").onclick = () => panelTabs.left.select("library");
+$<HTMLButtonElement>("#empty-new").onclick = () => newEl.click();
 inImageEl.onchange = () => {
   const files = Array.from(inImageEl.files ?? []);
   inImageEl.value = "";
@@ -8287,11 +8730,15 @@ function mountInspectorTabs(panels: Map<string, HTMLElement>) {
 const isLockedNode = (id: number | string) => isLocked(id);
 /** objp.<key> 的说明文案：唯一真源是 objprops.ts 的规格表，i18n 键由 objFieldNoteKey 派生 */
 const objFieldTip = (key: string) => et(objFieldNoteKey(key));
-/** 侧栏一行的字段标签：字段名 + 语义说明（tooltip），引擎不读的加角标 */
+/** 侧栏一行的字段中文名（objp.l.<小写键>）；没配词条时退回引擎键名，绝不显示空白 */
+const objFieldLabelKey = (key: string) => `objp.l.${key.toLowerCase()}`;
+const objFieldLabelText = (key: string) => (hasText(objFieldLabelKey(key)) ? et(objFieldLabelKey(key)) : key);
+/** 侧栏一行的字段标签：中文名 + 引擎原键（tooltip 里带上语义说明），引擎不读的加角标 */
 function objFieldLabel(spec: ObjFieldSpec): HTMLElement {
   const lab = document.createElement("label");
-  lab.textContent = spec.key;
-  lab.title = objFieldTip(spec.key);
+  lab.textContent = objFieldLabelText(spec.key);
+  lab.dataset.fieldKey = spec.key;
+  lab.title = `${spec.key} — ${objFieldTip(spec.key)}`;
   if (spec.engine === "unread") {
     const tag = document.createElement("span");
     tag.className = "ed-tag ed-tag-dim";
@@ -8307,16 +8754,27 @@ function objFieldLabel(spec: ObjFieldSpec): HTMLElement {
  * 所有写回都走 objEdit → setObjField，于是天然满足：命中原名大小写、不新增歧义键、
  * 只碰这一个字段、`{user|script|animation, value}` 包装只改 .value。
  */
+/** 十六项引擎原始字段默认收起（本次会话内记住展开状态） */
+let objPropsOpen = false;
+
 function objPropsGroup(node: LayerNode): HTMLElement {
   const group = document.createElement("div");
   group.className = "ed-insp-group ed-objprops";
-  const h = document.createElement("div");
-  h.className = "ed-insp-title";
-  h.textContent = et("objp.title");
-  group.appendChild(h);
-  group.appendChild(note(et("objp.hint")));
+  // 折叠壳：十六项引擎原始字段默认收起（展开状态在本次会话内记住）
+  const det = document.createElement("details");
+  det.className = "ed-insp-fold";
+  det.open = objPropsOpen;
+  const sum = document.createElement("summary");
+  sum.className = "ed-insp-fold-head";
+  sum.textContent = et("objp.title");
+  det.appendChild(sum);
+  det.appendChild(note(et("objp.hint")));
+  det.addEventListener("toggle", () => {
+    objPropsOpen = det.open;
+  });
+  group.appendChild(det);
   if (!doc?.scene || doc.type !== "scene") {
-    group.appendChild(note(et("insp.notLive")));
+    det.appendChild(note(et("insp.notLive")));
     return group;
   }
   const id = node.id;
@@ -8454,7 +8912,7 @@ function objPropsGroup(node: LayerNode): HTMLElement {
         numberRow(st.spec, st);
     }
   }
-  group.appendChild(form);
+  det.appendChild(form);
   return group;
 }
 
@@ -8914,7 +9372,7 @@ void (async () => {
     log(et("log.libItemMissing", { id: item }), "warn");
     return;
   }
-  panelTabs.left.select("library");
+  panelTabs.left.select("layers");
   await openLibrary(it);
 })();
 // 内置浏览器里刷新 / 重开后，提示上次的工程还在（有 ?item= 时按库条目走，不提示）

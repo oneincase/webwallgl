@@ -236,6 +236,27 @@ export function moveKeyTime(obj: SceneObject, fromT: number, toT: number): boole
   return plan.length > 0;
 }
 
+/**
+ * 把某一条字段动画上 fromT 的关键帧挪到 toT（时间轴「按属性分行」里拖动单个 ◆）。
+ * 与 moveKeyTime 的区别：只动这一个字段，不牵连同层其它动画的同一时刻。
+ * 该时刻本就没有关键帧、或目标帧已被占用 → 拒绝、一处不改（结构编辑不回滚，必须先验后改）。
+ */
+export function moveKeyTimeIn(obj: SceneObject, field: AnimField, fromT: number, toT: number): boolean {
+  const a = animOf(obj, field);
+  const view = getAnim(obj, field);
+  if (!a || !view || !Number.isFinite(fromT) || !Number.isFinite(toT)) return false;
+  const from = Math.round(fromT * view.fps);
+  if (!view.keys.some((k) => k.frame === from)) return false;
+  const to = Math.max(0, Math.min(view.length, Math.round(toT * view.fps)));
+  if (to === from) return false;
+  if (view.keys.some((k) => k.frame === to)) return false;
+  for (const c of channelsOf(a)) {
+    for (const k of c) if (Number(k.frame) === from) k.frame = to;
+    c.sort((x, y) => Number(x.frame) - Number(y.frame));
+  }
+  return true;
+}
+
 /** 时长（帧）不能短于最后一个关键帧；模式三选一 */
 export function setAnimOption(obj: SceneObject, field: AnimField, opt: "length" | "mode", value: number | string): boolean {
   const a = animOf(obj, field);

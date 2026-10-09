@@ -88,9 +88,9 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
     kind = k;
     save(TYPE_KEY, k);
     syncTypeButtons();
-    render();
+    render(true);
   };
-  o.filter.oninput = () => render();
+  o.filter.oninput = () => render(true);
   o.refresh.onclick = () => void loadLibrary();
   o.pickDir.onclick = () => void pickDir();
 
@@ -112,7 +112,7 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
       o.log(o.t("err.backend", { msg: (e as Error).message }), "warn");
     }
     o.pickDir.disabled = backend === "down";
-    render();
+    render(true);
   }
 
   async function pickDir() {
@@ -156,7 +156,25 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
     }
   }
 
-  function render() {
+  // 列表虚拟化：363 条全量建 DOM 会有 2000+ 节点、滚动掉帧。这里只渲染视窗内的行，
+  // 上下各用一个等高占位 <li> 撑住滚动条（行高固定：缩略图 32 + 上下 padding 4+4）。
+  const ROW_H = 40;
+  const OVERSCAN = 6;
+  let renderQueued = false;
+
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      render();
+    });
+  }
+
+  o.list.addEventListener("scroll", scheduleRender);
+
+  function render(resetScroll = false) {
+    if (resetScroll) o.list.scrollTop = 0;
     const kw = o.filter.value.trim().toLowerCase();
     o.list.textContent = "";
     if (backend === "down") {
@@ -174,11 +192,25 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
       o.count.hidden = true;
       return;
     }
-    let shown = 0;
-    for (const it of items) {
-      if (libraryKindOf(it) !== kind) continue;
-      if (kw && !`${it.title} ${it.itemId}`.toLowerCase().includes(kw)) continue;
-      shown++;
+    const match = items.filter((it) => {
+      if (libraryKindOf(it) !== kind) return false;
+      if (kw && !`${it.title} ${it.itemId}`.toLowerCase().includes(kw)) return false;
+      return true;
+    });
+    o.count.hidden = match.length === 0;
+    o.count.textContent = String(match.length);
+    const viewH = o.list.clientHeight || 400;
+    const start = Math.max(0, Math.floor(o.list.scrollTop / ROW_H) - OVERSCAN);
+    const end = Math.min(match.length, Math.ceil((o.list.scrollTop + viewH) / ROW_H) + OVERSCAN);
+    const pad = (h: number) => {
+      const li = document.createElement("li");
+      li.className = "lib-pad";
+      li.setAttribute("aria-hidden", "true");
+      li.style.height = `${h}px`;
+      return li;
+    };
+    if (start > 0) o.list.appendChild(pad(start * ROW_H));
+    for (const it of match.slice(start, end)) {
       const li = document.createElement("li");
       li.dataset.id = it.itemId;
       li.tabIndex = 0;
@@ -226,8 +258,7 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
       };
       o.list.appendChild(li);
     }
-    o.count.hidden = shown === 0;
-    o.count.textContent = String(shown);
+    if (end < match.length) o.list.appendChild(pad((match.length - end) * ROW_H));
   }
 
   syncTypeButtons();

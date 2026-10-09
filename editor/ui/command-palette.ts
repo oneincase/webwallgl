@@ -262,16 +262,15 @@ export function createCommandPalette(o: CommandPaletteOptions): CommandPalette {
       const name = document.createElement("span");
       name.className = "ed-palette-name";
       name.textContent = it.title;
-      const id = document.createElement("span");
-      id.className = "ed-palette-id";
-      id.textContent = it.id;
       const cat = document.createElement("span");
       cat.className = "ed-palette-cat";
       cat.textContent = it.category;
       const kbd = document.createElement("kbd");
       kbd.className = "ed-palette-kbd";
       kbd.textContent = it.keyLabel || (it.needsArg ? o.t("pal.needArg") : "");
-      row.append(name, id, cat, kbd);
+      // 内部命令 id 不进默认视图（使用者不需要看到 edit.undo），只在 hover 提示与 data-command 里保留
+      row.title = it.id;
+      row.append(name, cat, kbd);
       row.addEventListener("click", () => runItem(it));
       o.list.appendChild(row);
     });

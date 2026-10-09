@@ -15,6 +15,8 @@ export type SplitterOptions = {
   side: "before" | "after";
   size: number;
   min: number;
+  /** 首次进入（localStorage 无记录）时的默认收起状态；reset() 也回到这里 */
+  collapsed?: boolean;
   /** 上限；函数形式按容器实时尺寸算（给中央区留够空间） */
   max: number | (() => number);
   storageKey?: string;
@@ -23,7 +25,8 @@ export type SplitterOptions = {
 
 export type Splitter = {
   isCollapsed(): boolean;
-  setCollapsed(collapsed: boolean): void;
+  /** persist=false 用于「窄窗自适应」这类临时收起，不覆盖用户存下来的布局 */
+  setCollapsed(collapsed: boolean, persist?: boolean): void;
   toggle(): void;
   reset(): void;
 };
@@ -38,7 +41,7 @@ export function makeSplitter(handle: HTMLElement, opts: SplitterOptions): Splitt
 
   const persisted = opts.storageKey ? loadJson<Persisted>(opts.storageKey) : null;
   let size = typeof persisted?.size === "number" ? persisted.size : opts.size;
-  let collapsed = persisted?.collapsed === true;
+  let collapsed = persisted ? persisted.collapsed === true : opts.collapsed === true;
 
   const maxSize = () => Math.max(min, typeof opts.max === "function" ? opts.max() : opts.max);
   const clamp = (v: number) => Math.min(maxSize(), Math.max(min, v));
@@ -55,11 +58,11 @@ export function makeSplitter(handle: HTMLElement, opts: SplitterOptions): Splitt
     opts.onChange?.();
   }
 
-  function setCollapsed(next: boolean) {
+  function setCollapsed(next: boolean, persistIt = true) {
     if (collapsed === next) return;
     collapsed = next;
     apply();
-    persist();
+    if (persistIt) persist();
   }
 
   let drag: { start: number; startSize: number; moved: boolean; wasCollapsed: boolean } | null = null;
@@ -127,7 +130,7 @@ export function makeSplitter(handle: HTMLElement, opts: SplitterOptions): Splitt
     toggle: () => setCollapsed(!collapsed),
     reset() {
       size = opts.size;
-      collapsed = false;
+      collapsed = opts.collapsed === true;
       apply();
       persist();
     },

@@ -47,6 +47,14 @@
   cursor: pointer;
 }
 
+/* 虚拟化占位行：只负责撑高度，不参与命中与可访问性树 */
+.lib-list > li.lib-pad {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  pointer-events: none;
+}
+
 .lib-list > li[data-id]:hover {
   background: var(--wb-bg-3);
 }
@@ -129,7 +137,7 @@
   margin: 0 auto;
   padding: 20px 36px 0;
   color: var(--wb-fg);
-  font-size: 13px;
+  font-size: var(--wb-font-md);
   line-height: 1.65;
   user-select: text;
 }
@@ -172,7 +180,7 @@
   /* 两个主题都用深底，代码块文字固定浅色保证对比度 */
   background: #0b0c0e;
   color: #d4d4d4;
-  font: 12px / 1.55 var(--mono);
+  font: var(--wb-font) / 1.55 var(--mono);
   white-space: pre;
 }
 
@@ -180,7 +188,7 @@
   width: 100%;
   margin: 10px 0;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--wb-font);
 }
 
 .doc-table th,
@@ -198,7 +206,7 @@
 
 .doc-table td code {
   color: var(--link);
-  font: 11px var(--mono);
+  font: var(--wb-font-xs) var(--mono);
 }
 
 #sponsor-card {
@@ -215,7 +223,7 @@
   display: block;
   margin-bottom: 6px;
   color: #e5566b;
-  font-size: 14px;
+  font-size: var(--wb-font-lg);
 }
 
 #sponsor-card p {
@@ -246,7 +254,7 @@
 
 .sponsor-qr-item figcaption {
   color: var(--wb-fg-mute);
-  font-size: 12px;
+  font-size: var(--wb-font);
   text-align: center;
 }
 
@@ -390,7 +398,7 @@
   margin-top: 2px;
   overflow: hidden;
   color: var(--wb-fg-mute);
-  font: 10px / 1.4 var(--mono);
+  font: var(--wb-font-xs) / 1.4 var(--mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -456,7 +464,7 @@
   padding: 8px 10px;
   border-bottom: 1px solid var(--wb-line-soft);
   color: var(--wb-fg-dim);
-  font-size: 12px;
+  font-size: var(--wb-font);
   line-height: 1.4;
 }
 
@@ -506,7 +514,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--wb-fg-dim);
-  font-size: 12px;
+  font-size: var(--wb-font);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
