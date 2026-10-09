@@ -158,6 +158,37 @@
           <button type="button" id="rec-cancel" data-et="rec.cancel">取消</button>
           <p class="ed-rec-hint" data-et="rec.hint">逐帧渲染后编码（不丢帧，比实时慢）；不含声音</p>
         </div>
+        <!-- 指针工作室：按钮在视口工具条，弹出内容在这里（.ed-menu 是 fixed，按按钮位置摆） -->
+        <div id="pointer-menu" class="ed-menu ed-pointer-menu" role="dialog" hidden>
+          <div class="ed-rec-title" data-et="ptr.title">指针</div>
+          <div class="ed-pointer-row">
+            <label class="wb-labeled">X
+              <input type="number" id="ptr-x" min="0" max="1" step="0.001" value="0.5" />
+            </label>
+            <label class="wb-labeled">Y
+              <input type="number" id="ptr-y" min="0" max="1" step="0.001" value="0.5" />
+            </label>
+          </div>
+          <div class="ed-pointer-row">
+            <button type="button" id="ptr-park" data-et="ptr.park">摆位</button>
+            <button type="button" id="ptr-center" data-et="ptr.center">居中</button>
+          </div>
+          <div class="ed-pointer-row">
+            <input type="text" id="ptr-name" maxlength="40" data-et-ph="ptr.namePh" placeholder="轨迹名称" />
+            <button type="button" id="ptr-rec" data-et="ptr.rec">录制</button>
+          </div>
+          <div class="ed-pointer-row">
+            <span class="ed-pointer-label" data-et="ptr.tracksTitle">已录轨迹</span>
+            <select id="ptr-tracks"></select>
+          </div>
+          <div class="ed-pointer-row">
+            <button type="button" id="ptr-play" data-et="ptr.play">回放</button>
+            <button type="button" id="ptr-del" data-et="ptr.del">删除</button>
+          </div>
+          <p class="ed-rec-hint" id="ptr-state" data-et="ptr.parkedNone">指针未摆位</p>
+          <!-- 导出边界（计划 §6 决策 3）：scene.json 没有指针字段，导出器不改行为 -->
+          <p class="ed-rec-hint ed-pointer-note" data-et="ptr.exportNote">scene.json 没有指针字段：轨迹只在本机预览，离线导出不带指针数据</p>
+        </div>
         <span class="wb-tb-sep"></span>
         <button type="button" class="ed-icon" id="tb-undo" disabled data-et-title="tb.undo" title="撤销（⌘Z）">
           <svg class="i" viewBox="0 0 16 16"><path d="M5.5 4.5H10a3.5 3.5 0 0 1 0 7H5.5 M7.5 2L5 4.5 7.5 7" /></svg>
@@ -333,6 +364,7 @@
               </select>
             </label>
             <button type="button" class="ed-btn" id="tb-render-opts" aria-haspopup="dialog" data-et-title="render.optsTip"><span data-et="render.opts">渲染选项</span></button>
+            <button type="button" class="ed-btn" id="tb-pointer" aria-haspopup="dialog" data-et-title="ptr.tip"><span data-et="ptr.title">指针</span></button>
           </div>
 
           <div id="ed-viewport">

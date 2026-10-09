@@ -20,6 +20,9 @@
  *   O. draft.ts：草稿快照深拷贝、结构化克隆往返、不可信输入校验、套用
  *   P. 新建闭环：空白模板 → 图片层 → 删一张 → 存进库 → 重新打开 → 逐字段 / 逐字节一致
  *   S / U / V. 效果库、脚本预检与挂点、用户属性声明 / 绑定（含引擎接住新声明、属性表撤销快照）
+ *   POINTER-STUDIO（B5 / M11）指针工作室 pointer-studio.ts：时间轴插值 / 边界钳制、轨迹序列化往返
+ *      与 localStorage 兜底、录制打点、回放取样随播放头前进、停帧摆位不改文档、
+ *      导出产物里没有指针字段（scene.json 无指针字段，计划 §6 决策 3）+ 接线 / i18n 键各一次
  *   I. 接线文本断言：页面只经抽出的模块做这些事（不允许再长回内联副本）
  *   J. 变异红测：把实现改坏，确认对应判据会变红（防假绿）
  *
@@ -3922,6 +3925,341 @@ section("MI. 多格式模型导入 editor/model-import.ts（FBX / OBJ / DAE / ST
   // 左下原点 → 首行是文件里的第二行（蓝），每行前一个滤波字节
   check(pngOut[1] === 0x50 && dv.getUint32(16) === 2 && dv.getUint32(20) === 2 && json([...raw.subarray(1, 5)]) === json([0, 0, 255, 255]) && json([...raw.subarray(10, 14)]) === json([255, 0, 0, 255]),
     "TGA（24 位、左下原点）→ PNG：尺寸对、行序翻正、BGR → RGBA");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（§2 B5 / §3 M11）
+// ───────────────────────────────────────────────────────────────────────────
+section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）");
+{
+  const ptrMod = await loadEditorModule("pointer-studio");
+  const ptrSrc = fs.readFileSync(path.join(ROOT, "editor/pointer-studio.ts"), "utf8");
+
+  // 边界钳制：归一化 [0,1]，非有限值一律当没有
+  const c1 = ptrMod.clampPoint(-1, 2);
+  const c2 = ptrMod.clampPoint(0.25, 0.75);
+  check(c1 && c1.x === 0 && c1.y === 1 && c2 && c2.x === 0.25 && c2.y === 0.75,
+    `clampPoint：越界钳到边上、界内原样（实得 ${json([c1, c2])}）`);
+  check(ptrMod.clampPoint(NaN, 0.5) === null && ptrMod.clampPoint(0.5, Infinity) === null && ptrMod.clampPoint(undefined, null) === null,
+    "clampPoint：非有限 / 缺值坐标一律拒绝（NaN 进 uniform 会毁整帧）");
+  check(ptrMod.clampPoint(null, 0.5) === null && ptrMod.clampPoint("", 0.5) === null && ptrMod.clampPoint("abc", 0.5) === null,
+    'clampPoint：数值框清空 / 空串 / 非数字串也算「没有」（Number("") 是 0，那是假坐标）');
+
+  // 停帧摆位：只驱动 uniform，不碰文档
+  const doc = freshDoc();
+  const before = json(doc);
+  const pushes = [];
+  let paused = true;
+  const studio = ptrMod.createPointerStudio({
+    push: (u, v, buttons) => pushes.push([u, v, buttons ?? 0]),
+    leave: () => pushes.push(["leave"]),
+    isPaused: () => paused,
+    clock: () => 0,
+    now: () => 0,
+  });
+  const parkedA = studio.place(0.2, 0.3);
+  check(json(pushes) === json([[0.2, 0.3, 0]]) && parkedA && parkedA.x === 0.2 && parkedA.y === 0.3,
+    `place：停帧摆位把归一化坐标交给 pushPointer（实得 ${json([pushes, parkedA])}）`);
+  const parkedB = studio.place(-1, 5);
+  check(parkedB && parkedB.x === 0 && parkedB.y === 1 && json(pushes.at(-1)) === json([0, 1, 0]),
+    `place：视口外的坐标钳到边上再驱动（实得 ${json(parkedB)}）`);
+  paused = false;
+  const nPush = pushes.length;
+  check(studio.place(0.4, 0.4) === null && pushes.length === nPush,
+    "place：播放中拒绝摆位（每帧都会被场景采样覆盖），且不驱动 uniform");
+  check(studio.place(0.4, 0.4, { force: true }) !== null && pushes.length === nPush + 1,
+    "place：force 例外（回放前的定位）可以绕过停帧检查");
+  paused = true;
+  studio.place(0.6, 0.25);
+  const resynced = studio.resync();
+  check(resynced && json(resynced) === json({ x: 0.6, y: 0.25 }) && json(pushes.at(-1)) === json([0.6, 0.25, 0]),
+    "resync：场景重挂后把停帧摆位补推一次（新实例 uniform 归零）");
+  studio.release();
+  check(json(pushes.at(-1)) === json(["leave"]) && studio.parkedPoint() === null,
+    "release：放开指针走 pointerLeave，摆位状态清空");
+  // 轨迹片段：洗点 / 序列化往返 / 存储兜底
+  const dirty = ptrMod.normalizePoints([
+    { t: 120, x: 0.4, y: 0.4 },
+    { t: 0, x: -1, y: 0.5 },
+    { t: 60, x: NaN, y: 0.2 },
+    { t: 60, x: 0.2, y: 0.2 },
+    { t: "not-a-time", x: 0.1, y: 0.1 },
+    { t: 60, x: 0.3, y: 0.3 },
+    { t: null, x: 0.9, y: 0.9 },
+    null,
+  ]);
+  check(json(dirty) === json([{ t: 0, x: 0, y: 0.5 }, { t: 60, x: 0.3, y: 0.3 }, { t: 120, x: 0.4, y: 0.4 }]),
+    `normalizePoints：丢非有限 / 钳制 / 同毫秒留最后 / 升序 / t 归零（实得 ${json(dirty)}）`);
+  check(json(ptrMod.normalizePoints([])) === "[]" && ptrMod.trackDuration([]) === 0,
+    "normalizePoints：空输入 → 空轨迹（没采到点不算错）");
+
+  const made = ptrMod.makeTrack("  描边  ", [{ t: 0, x: 0.1, y: 0.1 }, { t: 500, x: 1.5, y: -0.5 }]);
+  check(made && made.v === 1 && made.name === "描边" && made.duration === 500
+    && json(made.points) === json([{ t: 0, x: 0.1, y: 0.1 }, { t: 500, x: 1, y: 0 }]),
+  `makeTrack：名字 trim、duration = 末点、点洗过（实得 ${json(made)}）`);
+  const single = ptrMod.makeTrack("单点", [{ t: 0, x: 0.5, y: 0.5 }]);
+  check(single && single.duration === 0 && single.points.length === 1,
+    "makeTrack：单点轨迹合法（停帧摆一下也能存成一条）");
+  check(ptrMod.makeTrack("空", []) === null && ptrMod.makeTrack("空", [{ t: 0, x: NaN, y: 0 }]) === null,
+    "makeTrack：空点集 / 全非有限点 → null，不落库");
+
+  const many = Array.from({ length: ptrMod.MAX_TRACK_POINTS + 5 }, (_, i) => ({ t: i, x: 0.5, y: 0.5 }));
+  const thinned = ptrMod.makeTrack("长", many);
+  check(thinned.points.length === ptrMod.MAX_TRACK_POINTS
+    && thinned.points[0].t === 0
+    && thinned.points.at(-1).t === ptrMod.MAX_TRACK_POINTS + 4,
+  `makeTrack：超上限按需抽稀到 ${ptrMod.MAX_TRACK_POINTS} 点且首尾保留（实得 ${thinned.points.length} 点，末点 t=${thinned.points.at(-1).t}）`);
+
+  check(json(ptrMod.parseTrack(ptrMod.serializeTrack(made))) === json(made),
+    "parseTrack(serializeTrack(track))：深等价，轨迹能原样搬走再读回");
+  check(JSON.parse(ptrMod.serializeTrack(made)).v === ptrMod.POINTER_STUDIO_VERSION
+    && JSON.parse(ptrMod.serializeTrack(made)).name === "描边",
+  "serializeTrack：带上版本号与名字（存下来的东西要能自己说清是什么）");
+  const wrong = ptrMod.parseTrack(JSON.stringify({ v: 1, name: "x", duration: 999999, points: [{ t: 100, x: 0.2, y: 0.2 }, { t: 900, x: 0.6, y: 0.6 }] }));
+  check(wrong && wrong.duration === 800 && wrong.points[0].t === 0,
+    `parseTrack：duration 由点集重算、t 归零（不信外部字段，实得 ${json(wrong)}）`);
+  const badRaws = [
+    "{", "null", "123",
+    JSON.stringify({ v: 2, name: "x", points: [{ t: 0, x: 0, y: 0 }] }),
+    JSON.stringify({ v: 1, name: "", points: [{ t: 0, x: 0, y: 0 }] }),
+    JSON.stringify({ v: 1, name: "x", points: [] }),
+    JSON.stringify({ v: 1, name: "x", points: [{ t: 0, x: null, y: 0 }] }),
+    JSON.stringify({ v: 1, name: "x", points: "no" }),
+  ];
+  check(badRaws.every((raw) => ptrMod.parseTrack(raw) === null),
+    `parseTrack：坏 JSON / 版本不符 / 空名 / 空点集 / 点非有限 / points 非数组 一律当没有（${badRaws.length} 例）`);
+
+  const mem = () => {
+    const map = new Map();
+    return {
+      map,
+      getItem: (k) => (map.has(k) ? map.get(k) : null),
+      setItem: (k, v) => void map.set(k, String(v)),
+      removeItem: (k) => void map.delete(k),
+    };
+  };
+  const mem2 = mem();
+  check(ptrMod.storeTracks(mem2, [made, single]) === true && json(ptrMod.loadTracks(mem2)) === json([made, single]),
+    `storeTracks / loadTracks：localStorage 兜底往返一致（键 ${ptrMod.POINTER_TRACKS_KEY}）`);
+  check(ptrMod.storeTracks(null, [made]) === false && ptrMod.loadTracks(null).length === 0,
+    "storeTracks / loadTracks：没有 storage 时读写都退化成空，不炸页面");
+  const boom = { getItem: () => { throw new Error("denied"); }, setItem: () => { throw new Error("quota"); }, removeItem: () => {} };
+  check(ptrMod.loadTracks(boom).length === 0 && ptrMod.storeTracks(boom, [made]) === false,
+    "storage 抛异常（隐私模式 / 配额满）：读空写 false，不抛给调用方");
+  check(ptrMod.parseTracks(`{"v":1,"tracks":[null,"x",${ptrMod.serializeTrack(made)}]}`).length === 1
+    && ptrMod.parseTracks("").length === 0 && ptrMod.parseTracks("[]").length === 0,
+  "parseTracks：坏的一条丢掉、其它照读（手改过 localStorage 也要能起来）");
+
+  // 录制：时间戳来自录制时钟，采完成一条命名轨迹
+  const logs = [];
+  const recPushes = [];
+  let clockMs = 0;
+  const recStudio = ptrMod.createPointerStudio({
+    push: (u, v, buttons) => recPushes.push([u, v, buttons ?? 0]),
+    leave: () => {},
+    isPaused: () => false,
+    clock: () => clockMs,
+    now: () => clockMs,
+    log: (msg) => logs.push(msg),
+    t: (key, params) => (params ? `${key} ${json(params)}` : key),
+    storage: mem2,
+  });
+  check(recStudio.recording() === false && recStudio.recordingPoints() === 0 && recStudio.list().length === 2,
+    "createPointerStudio：一上来不在录制态，轨迹从存储兜底里恢复");
+  check(recStudio.startRecord(" 疾走 ") === true && recStudio.recording() === true && recStudio.startRecord("再来") === false,
+    "startRecord：进入录制态（重复调用返回 false，不重开一段）");
+  clockMs = 40;
+  recStudio.record(0.1, 0.2);
+  clockMs = 120;
+  recStudio.record(1.4, -0.2);
+  clockMs = 260;
+  recStudio.record(NaN, 0.5);
+  check(recStudio.recordingPoints() === 2,
+    `record：只收有限坐标（实得 ${recStudio.recordingPoints()} 点；NaN 那个被丢）`);
+  const recTrack = recStudio.stopRecord();
+  check(recTrack && recTrack.name === "疾走"
+    && json(recTrack.points) === json([{ t: 0, x: 0.1, y: 0.2 }, { t: 80, x: 1, y: 0 }])
+    && recTrack.duration === 80,
+  `record / stopRecord：时间戳相对录制起点、坐标钳制（实得 ${json(recTrack)}）`);
+  check(recStudio.list().length === 3 && recStudio.activeName() === "疾走" && json(recStudio.activeTrack()) === json(recTrack),
+    "stopRecord：新轨迹进列表并自动选中");
+  check(ptrMod.loadTracks(mem2).length === 3,
+    "stopRecord：同时写进 localStorage 兜底（内存是真源，存储只是兜底）");
+  check(logs.some((m) => m.startsWith("log.ptrRecorded")),
+    `stopRecord：记录一条可读日志（实得 ${json(logs.at(-1))}）`);
+
+  recStudio.startRecord("疾走");
+  clockMs = 300;
+  recStudio.record(0.5, 0.5);
+  clockMs = 340;
+  recStudio.record(0.6, 0.6);
+  const recTrack2 = recStudio.stopRecord();
+  check(recTrack2 && recTrack2.name === "疾走 2",
+    `重名轨迹自动加序号（名称是选择器的键，重名会指不清；实得 ${recTrack2 && recTrack2.name}）`);
+  recStudio.startRecord();
+  clockMs = 400;
+  recStudio.record(0.5, 0.5);
+  const nTracks = recStudio.list().length;
+  const autoTrack = recStudio.stopRecord();
+  check(autoTrack && autoTrack.name.startsWith("ptr.defaultName") && recStudio.list().length === nTracks + 1,
+    `stopRecord：没填名字就用默认名（走 i18n 的 ptr.defaultName；实得 ${autoTrack && autoTrack.name}）`);
+  recStudio.startRecord("空的");
+  const beforeEmpty = recStudio.list().length;
+  check(recStudio.stopRecord() === null && recStudio.list().length === beforeEmpty
+    && logs.some((m) => m.startsWith("log.ptrNoPoints")),
+  "stopRecord：一个点都没采到 → 不落库并提示（log.ptrNoPoints）");
+  recStudio.startRecord("丢掉");
+  recStudio.record(0.5, 0.5);
+  recStudio.cancelRecord();
+  check(recStudio.recording() === false && recStudio.list().length === beforeEmpty
+    && !recStudio.list().some((t) => t.name === "丢掉"),
+  "cancelRecord：直接丢掉这段录制，不落库（半截轨迹不该污染列表）");
+  const delName = recStudio.activeName();
+  check(recStudio.remove(delName) === true && recStudio.list().length === beforeEmpty - 1 && recStudio.activeName() !== delName
+    && ptrMod.loadTracks(mem2).length === beforeEmpty - 1,
+  "remove：删轨迹同时更新存储并换选中项");
+  check(recStudio.remove("没这条") === false && recStudio.list().length === beforeEmpty - 1,
+    "remove：删不存在的名字返回 false，不动列表");
+
+  // 时间轴插值：回放的取样口径
+  const line = [{ t: 0, x: 0, y: 0 }, { t: 1000, x: 1, y: 0.5 }];
+  check(json(ptrMod.sampleTrack(line, -50)) === json({ t: 0, x: 0, y: 0 })
+    && json(ptrMod.sampleTrack(line, 5000)) === json({ t: 1000, x: 1, y: 0.5 }),
+  "sampleTrack：早于首点钉首点、晚于末点钉末点（不外推）");
+  const mid = ptrMod.sampleTrack(line, 250);
+  check(mid && mid.x === 0.25 && mid.y === 0.125 && mid.t === 250,
+    `sampleTrack：两点之间线性插值（实得 ${json(mid)}）`);
+  check(ptrMod.sampleTrack([], 100) === null && ptrMod.sampleTrack(line, NaN) === null,
+    "sampleTrack：空轨迹 / 非有限时刻 → null");
+  check(json(ptrMod.sampleTrack([{ t: 500, x: 0.4, y: 0.6 }], 0)) === json({ t: 500, x: 0.4, y: 0.6 }),
+    "sampleTrack：单点轨迹任何时刻都钉在那一点");
+
+  // 回放：跟着时间轴播放头走，超长折回
+  let clockMs2 = 0;
+  const repPushes = [];
+  const repLogs = [];
+  const repStudio = ptrMod.createPointerStudio({
+    push: (u, v, buttons) => repPushes.push([u, v, buttons ?? 0]),
+    leave: () => {},
+    isPaused: () => true,
+    clock: () => clockMs2,
+    now: () => clockMs2,
+    log: (msg) => repLogs.push(msg),
+    t: (key) => key,
+    storage: null,
+  });
+  check(repStudio.replaying() === false && repStudio.tick() === null && repStudio.startReplay() === false,
+    "回放：一条轨迹都没有时启动失败，tick 不驱动 uniform");
+  repStudio.startRecord("圈");
+  clockMs2 = 0;
+  repStudio.record(0, 0);
+  clockMs2 = 1000;
+  repStudio.record(1, 0.5);
+  repStudio.stopRecord();
+  clockMs2 = 0;
+  check(repStudio.startReplay("圈") === true && repStudio.replaying() === true
+    && json(repPushes.at(-1)) === json([0, 0, 0]),
+  "startReplay：开局先按当前播放头摆一次");
+  clockMs2 = 250;
+  repStudio.tick();
+  check(json(repPushes.at(-1)) === json([0.25, 0.125, 0]),
+    `tick：按播放头在轨迹上取样驱动 uniform（实得 ${json(repPushes.at(-1))}）`);
+  clockMs2 = 1250;
+  repStudio.tick();
+  check(json(repPushes.at(-1)) === json([0.25, 0.125, 0]),
+    "tick：播放头超过轨迹长度就折回（场景在循环，轨迹跟着循环）");
+  clockMs2 = 0;
+  repStudio.tick();
+  check(json(repStudio.replayAt()) === json({ t: 0, x: 0, y: 0 }) && repStudio.replayName() === "圈",
+    "replayAt / replayName：回放光标停在取样点上，供菜单显示");
+  check(repLogs.includes("log.ptrReplay"), "startReplay：记录一条可读日志（log.ptrReplay）");
+  check(repStudio.stopReplay() === true && repStudio.replaying() === false
+    && repStudio.tick() === null && repStudio.stopReplay() === false,
+  "stopReplay：停下来后 tick 不再驱动 uniform（重复调用返回 false）");
+  repStudio.startReplay("圈");
+  clockMs2 = 500;
+  repStudio.tick();
+  const resyncRep = repStudio.resync();
+  check(repStudio.replaying() === true && resyncRep && resyncRep.x === 0.5 && resyncRep.y === 0.25,
+    `resync：回放中重挂按回放取样补推（优先于停帧摆位，实得 ${json(resyncRep)}）`);
+  clockMs2 = 0;
+  repStudio.tick();
+  check(repStudio.startRecord("截") === true && repStudio.replaying() === false,
+    "startRecord：录制与回放抢同一根指针，开录先停回放");
+  repStudio.cancelRecord();
+  check(repStudio.startRecord("截") === true, "startRecord：取消后可重开一段");
+  clockMs2 = 0;
+  repStudio.record(0.2, 0.2);
+  clockMs2 = 500;
+  repStudio.record(0.8, 0.8);
+  repStudio.stopRecord();
+  repStudio.startReplay("截");
+  check(repStudio.place(0.3, 0.3) !== null && repStudio.replaying() === false,
+    "place：手动摆位优先于回放（摆了就停回放，否则下一帧又被轨迹盖掉）");
+  repStudio.startReplay("截");
+  check(repStudio.remove("截") === true && repStudio.replaying() === false
+    && repLogs.includes("log.ptrReplayStop"),
+  "remove：删掉正在回放的那条轨迹会先停回放");
+  check(repLogs.filter((m) => m === "log.ptrReplayStop").length >= 2,
+    "stopReplay：每次停下都记一条日志（log.ptrReplayStop）");
+
+  check(json(doc) === before,
+    "停帧摆位不改文档：反复摆位后文档快照逐字节一致（指针对场景是纯运行时状态）");
+  check(!/from "\.\/(save|export-pipeline|doc|history)"/.test(ptrSrc),
+    "指针工作室不 import 保存 / 导出 / 文档 / 撤销栈：它只驱动 uniform，不参与文档记账");
+
+  // 导出边界：scene.json 没有指针字段（计划 §6 决策 3）→ 离线导出产物里不含任何指针数据
+  check(ptrMod.findPointerFields({ a: 1, cursor: { x: 1 } }).length === 0
+    && json(ptrMod.findPointerFields({ a: { PointerPosition: 1 }, b: [{ pointerButtons: 2 }] })) === json(["a.PointerPosition", "b[0].pointerButtons"]),
+  "findPointerFields：扫出键名沾 pointer 的字段路径（含嵌套 / 数组），干净的产物返回空");
+  const expDoc = freshDoc();
+  const expFiles = await saveMod.collectProject(expDoc, memAssets("scene.json", {}), null);
+  const expTexts = expFiles.map((f) => [f.path, dec.decode(f.data)]);
+  const expJsonEntries = expTexts.filter(([p]) => /\.json$/i.test(p));
+  const expHits = expJsonEntries.flatMap(([p, text]) => {
+    try {
+      return ptrMod.findPointerFields(JSON.parse(text)).map((field) => `${p}:${field}`);
+    } catch {
+      return [`${p}:<不是 JSON>`];
+    }
+  });
+  check(expHits.length === 0 && expJsonEntries.length >= 2,
+    `导出产物里没有指针字段：扫了 ${expJsonEntries.length} 个 json（scene.json / project.json），命中 ${json(expHits)}`);
+  check(expTexts.every(([, text]) => !text.includes(ptrMod.POINTER_TRACKS_KEY) && !/pointer/i.test(text)),
+    "导出产物文本里既没有轨迹存储键、也没有 pointer 字样（指针只在内存 / localStorage 兜底里）");
+  check(!expFiles.some((f) => /pointer/i.test(f.path)),
+    "导出清单里没有指针相关条目（轨迹不进 zip、不进保存清单）");
+  const saveSrc = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
+  const pipeSrc = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
+  check(!/pointer/i.test(saveSrc) && !/pointer/i.test(pipeSrc),
+    "导出器不改行为：save.ts / export-pipeline.ts 里一个字都没动（指针工作室没接进去）");
+
+  // i18n：新键必须 zh + en 各一次（verify 的「键恰好出现 2 次」断言）
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const pageSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keySrc = `${ptrSrc}\n${mainSrc}\n${pageSrc}`;
+  const ptrKeys = [...new Set([...keySrc.matchAll(/"((?:ptr\.|log\.ptr)[A-Za-z.]+)"/g)].map((m) => m[1]))];
+  const keyHits = ptrKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(ptrKeys.length >= 24 && keyHits.length === 0,
+    `指针工作室的 ${ptrKeys.length} 个文案键在 editor/i18n.ts 里 zh / en 各恰好一次（不齐的：${json(keyHits)}）`);
+  check(ptrKeys.includes("ptr.exportNote") && /data-et="ptr\.exportNote"/.test(pageSrc),
+    "导出边界提示有对应文案键 ptr.exportNote（菜单里那行说明走 i18n，不是硬编码）");
+
+  // 接线：main.ts / index.html / editor.css
+  check(/from "\.\/pointer-studio"/.test(mainSrc) && mainSrc.includes("createPointerStudio({")
+    && mainSrc.includes("instance?.pushPointer(") && mainSrc.includes("instance?.pointerLeave("),
+  "main.ts：指针工作室接到引擎的 pushPointer / pointerLeave 上（没有新造通道）");
+  check(mainSrc.includes("pointerStudio.resync()") && mainSrc.includes("pointerStudio.tick()")
+    && mainSrc.includes("pointerStudio.startReplay(") && mainSrc.includes("pointerStudio.stopRecord()"),
+  "main.ts：重挂后 resync、时间轴 tick、菜单的回放 / 录制都接上了");
+  check(pageSrc.includes('id="tb-pointer"') && pageSrc.includes('id="pointer-menu"')
+    && pageSrc.includes('id="ptr-tracks"') && pageSrc.includes('id="ptr-play"') && pageSrc.includes('id="ptr-del"')
+    && pageSrc.includes('data-et="ptr.exportNote"'),
+  "index.html：视口工具条按钮 + 菜单（摆位 / 录制 / 回放 / 删除 + 导出边界提示）都在");
+  check(cssSrc.includes(".ed-pointer-menu") && cssSrc.includes(".ed-pointer-row") && cssSrc.includes(".ed-pointer-note"),
+    "editor.css：指针工作室菜单的样式都在（沿用 .ed-menu 的 fixed 定位）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

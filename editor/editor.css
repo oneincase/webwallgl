@@ -1267,6 +1267,67 @@ input.ed-al-name {
   line-height: 1.4;
 }
 
+/* ---------- 指针工作室菜单（视口工具条「指针」） ---------- */
+
+.ed-pointer-menu {
+  width: 236px;
+  gap: 2px;
+  padding: 6px 8px 8px;
+}
+
+.ed-pointer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px;
+}
+
+.ed-pointer-row > .wb-labeled {
+  flex: 1;
+  justify-content: space-between;
+}
+
+.ed-pointer-row input[type="number"] {
+  width: 72px;
+}
+
+.ed-pointer-label {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-pointer-row > select {
+  flex: 1;
+  min-width: 0;
+}
+
+.ed-pointer-menu > .ed-pointer-row > button {
+  flex: 1;
+  height: 24px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-bg-1);
+  color: var(--wb-fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ed-pointer-menu > .ed-pointer-row > button:hover {
+  border-color: var(--wb-accent);
+}
+
+.ed-pointer-menu > .ed-rec-hint {
+  max-width: none;
+  margin: 4px 2px 2px;
+}
+
+/* 导出边界提示：比状态行更淡，说明「轨迹不进导出」 */
+.ed-pointer-menu > .ed-pointer-note {
+  color: var(--wb-fg-mute);
+  line-height: 1.45;
+  margin-top: 6px;
+}
+
 .ed-new-row {
   display: flex;
   align-items: center;
