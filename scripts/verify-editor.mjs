@@ -8287,14 +8287,29 @@ section("M9. 命令面板与无障碍（PALETTE）");
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {
+  // 真机阶段容错（用户 m05052「加容错」）：某一阶段抛出的异常（页面 / CDP 失效、等条件超时）
+  // 只记一条 ✗，不再带走整轮 —— 另一阶段照跑，末尾照常汇总计数与退出码。
+  const phase = async (label, run) => {
+    try {
+      await run();
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      console.log(`\n  — 真机阶段中断：${label} —— ${msg}`);
+      check(false, `真机阶段中断：${label} —— ${msg}（该阶段余下步骤跳过，后续阶段继续跑）`);
+    }
+  };
   const { runEditorHeadless } = await imp("scripts/verify-editor-headless.mjs");
   await host.close();
-  await runEditorHeadless({ check, section, tmpRoot, cleanups, LIB });
+  await phase("编辑器真机段（K / L / Q…AN）", () => runEditorHeadless({ check, section, tmpRoot, cleanups, LIB }));
   const { runModelHeadless } = await imp("scripts/verify-editor-model.mjs");
-  await runModelHeadless({ check, section, tmpRoot, LIB });
+  await phase("模型层真机段（MA2…MD2）", () => runModelHeadless({ check, section, tmpRoot, LIB }));
 } else {
   console.log("\n（跳过真浏览器部分：加 --headless 跑，需要 Chrome + 会自起 dev server）");
 }
+
+// 自证：真机两阶段都有阶段级容错（防回归；离线跑也检查这一条）
+const selfSrc = fs.readFileSync(new URL(import.meta.url), "utf8");
+check((selfSrc.match(/await phase\(/g) || []).length >= 2 && /真机阶段中断：\$\{label\}/.test(selfSrc), "真机两阶段各有一层容错（单阶段崩溃只记一条 ✗，另一阶段照跑）");
 
 console.log("");
 if (failed > 0) {

@@ -30,35 +30,35 @@ const REVEAL = `const reveal = (el) => { const p = el?.closest('.ed-insp-panel[h
 const BUILTIN_PRESETS = ["snow", "rain", "embers", "bokeh"];
 
 export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB }) {
-  const src = path.join(LIB, FIXTURE);
+  var src = path.join(LIB, FIXTURE);
   if (!fs.existsSync(path.join(src, "scene.json")) || !fs.existsSync(path.join(src, "scene.pkg"))) {
     check(false, `夹具 ${FIXTURE} 需要同时有 scene.json 与 scene.pkg（WE_EDITOR_ITEM 可换）`);
     return;
   }
   // 临时库：<fixture> = 完整目录（松散形态优先）；<fixture>-pkg = 只留包（走 pkg 形态）
-  const lib = path.join(tmpRoot, "lib-headless");
+  var lib = path.join(tmpRoot, "lib-headless");
   fs.cpSync(src, path.join(lib, FIXTURE), { recursive: true });
-  const pkgItem = `${FIXTURE}-pkg`;
+  var pkgItem = `${FIXTURE}-pkg`;
   fs.mkdirSync(path.join(lib, pkgItem), { recursive: true });
   for (const f of ["project.json", "scene.pkg"]) fs.copyFileSync(path.join(src, f), path.join(lib, pkgItem, f));
-  const sceneJson = JSON.parse(fs.readFileSync(path.join(src, "scene.json"), "utf8"));
-  const objects = sceneJson.objects;
+  var sceneJson = JSON.parse(fs.readFileSync(path.join(src, "scene.json"), "utf8"));
+  var objects = sceneJson.objects;
 
-  const prevLib = process.env.WE_LIBRARY;
+  var prevLib = process.env.WE_LIBRARY;
   process.env.WE_LIBRARY = lib;
   cleanups.push(() => {
     if (prevLib === undefined) delete process.env.WE_LIBRARY;
     else process.env.WE_LIBRARY = prevLib;
   });
-  const port = await new Promise((res) => {
+  var port = await new Promise((res) => {
     const s = net.createServer();
     s.listen(0, "127.0.0.1", () => {
       const p = s.address().port;
       s.close(() => res(p));
     });
   });
-  const { createServer } = await import("vite");
-  const server = await createServer({
+  var { createServer } = await import("vite");
+  var server = await createServer({
     root: ROOT,
     configFile: path.join(ROOT, "vite.config.ts"),
     server: { port, host: "127.0.0.1", strictPort: true, open: false },
@@ -66,17 +66,17 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   });
   await server.listen();
   cleanups.push(() => server.close());
-  const origin = `http://127.0.0.1:${port}`;
+  var origin = `http://127.0.0.1:${port}`;
 
-  const { launchHeadless, instrument } = await imp("scripts/headless-gpu.mjs");
-  const session = await launchHeadless({ url: "about:blank", task: "verify-editor", width: 1440, height: 900 });
+  var { launchHeadless, instrument } = await imp("scripts/headless-gpu.mjs");
+  var session = await launchHeadless({ url: "about:blank", task: "verify-editor", width: 1440, height: 900 });
   cleanups.push(() => session.close());
   instrument(session, { width: 1440, height: 900 });
-  const cdp = session.pageCdp;
+  var cdp = session.pageCdp;
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
     source: fs.readFileSync(path.join(ROOT, "scripts/e2e-dir-picker.js"), "utf8"),
   });
-  const walkRel = (dir, base, out = []) => {
+  var walkRel = (dir, base, out = []) => {
     for (const name of fs.readdirSync(dir)) {
       if (name.startsWith(".")) continue;
       const abs = path.join(dir, name);
@@ -85,21 +85,21 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     }
     return out;
   };
-  const beachFiles = walkRel(path.join(lib, FIXTURE), path.join(lib, FIXTURE));
-  const ev = (expr, timeoutMs = 60000) => session.evaluate(expr, { awaitPromise: true, timeoutMs });
-  const waitFor = (expr, timeoutMs = 60000) => session.waitFor(expr, { timeoutMs });
+  var beachFiles = walkRel(path.join(lib, FIXTURE), path.join(lib, FIXTURE));
+  var ev = (expr, timeoutMs = 60000) => session.evaluate(expr, { awaitPromise: true, timeoutMs });
+  var waitFor = (expr, timeoutMs = 60000) => session.waitFor(expr, { timeoutMs });
 
   // ---- 真输入（CDP Input：产生可信的 pointer / mouse / key 事件，含指针捕获） ----
-  const MOD = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
-  const mouse = (type, x, y, { buttons = 0, modifiers = 0 } = {}) =>
+  var MOD = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
+  var mouse = (type, x, y, { buttons = 0, modifiers = 0 } = {}) =>
     cdp.send("Input.dispatchMouseEvent", { type, x, y, button: type === "mouseMoved" && !buttons ? "none" : "left", buttons, clickCount: 1, modifiers });
-  const click = async ([x, y], modifiers = 0) => {
+  var click = async ([x, y], modifiers = 0) => {
     await mouse("mouseMoved", x, y, { modifiers });
     await mouse("mousePressed", x, y, { buttons: 1, modifiers });
     await mouse("mouseReleased", x, y, { modifiers });
     await sleep(60);
   };
-  const drag = async ([x0, y0], [x1, y1], modifiers = 0, steps = 10) => {
+  var drag = async ([x0, y0], [x1, y1], modifiers = 0, steps = 10) => {
     await mouse("mouseMoved", x0, y0, { modifiers });
     await sleep(50);
     await mouse("mousePressed", x0, y0, { buttons: 1, modifiers });
@@ -110,14 +110,14 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await mouse("mouseReleased", x1, y1, { modifiers });
     await sleep(120);
   };
-  const KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"], a: [65, "KeyA"], c: [67, "KeyC"], v: [86, "KeyV"], x: [88, "KeyX"] };
-  const key = async (k, modifiers = 0) => {
+  var KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"], a: [65, "KeyA"], c: [67, "KeyC"], v: [86, "KeyV"], x: [88, "KeyX"] };
+  var key = async (k, modifiers = 0) => {
     const [vk, code] = KEYS[k];
     await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
     await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers });
     await sleep(60);
   };
-  const clickSel = async (sel) => {
+  var clickSel = async (sel) => {
     // 目标在检视器未选中的标签页里：先像用户一样点开那一页
     const tab = await ev(`(() => { const p = document.querySelector(${JSON.stringify(sel)})?.closest('.ed-insp-panel[hidden]'); if (!p) return null; const r = document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
     if (tab) await click(tab);
@@ -131,13 +131,13 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
 
   // ---- 项目保存位置：默认浏览器存储，真目录必须显式选 ----
   /** 「打开项目」对话框 →「打开本地文件夹…」：只有明确选本机文件夹才走真目录（e2e 假选择器） */
-  const openLocal = async () => {
+  var openLocal = async () => {
     await clickSel("#tb-open-dir");
     await waitFor(`!!document.querySelector('#vdir-dlg')?.open`, 30000);
     await clickSel("#vdir-local");
   };
   /** 等盘上文件出现（真目录由 e2e 假目录异步镜像到 lib/） */
-  const waitFileOnDisk = async (p, ms = 15000) => {
+  var waitFileOnDisk = async (p, ms = 15000) => {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) {
       if (fs.existsSync(p)) return true;
@@ -146,7 +146,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     return fs.existsSync(p);
   };
   /** 浏览器存储里的工程整份落到本机文件夹（状态栏 / 工程卡那颗按钮）；已经是真目录就直接返回 */
-  const saveToLocal = async () => {
+  var saveToLocal = async () => {
     if (!(await ev(`!!localStorage.getItem('webwallgl-vdir-last')`))) return null;
     await clickSel("#st-save");
     await waitFor(`!localStorage.getItem('webwallgl-vdir-last')`, 30000);
@@ -157,7 +157,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   };
 
   /** 清掉编辑器自己的 IndexedDB（草稿 + 虚拟工程）与「上次打开」，让 e2e 从干净状态开始 */
-  const clearLocalStore = () =>
+  var clearLocalStore = () =>
     ev(`(async () => {
       for (const n of ['webwallgl-editor', 'webwallgl-vdir']) {
         await new Promise((ok) => { const r = indexedDB.deleteDatabase(n); r.onsuccess = r.onerror = r.onblocked = () => ok(true); });
@@ -167,32 +167,32 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     })()`);
 
   // ---- 编辑器页 DOM 状态 ----
-  const READY = "/首帧就绪|First frame ready/";
-  const SAVED = "/保存用时|Save took/";
-  const savedCount = () => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${SAVED}.test(d.textContent)).length`);
-  const waitSaved = async (before) => {
+  var READY = "/首帧就绪|First frame ready/";
+  var SAVED = "/保存用时|Save took/";
+  var savedCount = () => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${SAVED}.test(d.textContent)).length`);
+  var waitSaved = async (before) => {
     await waitFor(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${SAVED}.test(d.textContent)).length > ${before}`, 120000);
     await sleep(200);
   };
-  const readyCount = () => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${READY}.test(d.textContent)).length`);
-  const errorLines = () => ev(`[...document.querySelectorAll('#ed-con-body > div.error')].map((d) => d.textContent)`);
-  const treeNames = () => ev(`[...document.querySelectorAll('#ed-tree .ed-node .ed-node-name')].map((n) => n.textContent)`);
-  const selectedName = () => ev(`document.querySelector('#ed-tree .ed-node.selected .ed-node-name')?.textContent ?? null`);
-  const numInputs = () => ev(`[...document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')].map((i) => Number(i.value))`);
-  const dirtyTitle = () => ev(`document.querySelector('#ed-doc-title').textContent.startsWith('● ')`);
-  const canvasRect = () => ev(`(() => { const r = document.querySelector('#ed-stage canvas:not(#ed-overlay)').getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+  var readyCount = () => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${READY}.test(d.textContent)).length`);
+  var errorLines = () => ev(`[...document.querySelectorAll('#ed-con-body > div.error')].map((d) => d.textContent)`);
+  var treeNames = () => ev(`[...document.querySelectorAll('#ed-tree .ed-node .ed-node-name')].map((n) => n.textContent)`);
+  var selectedName = () => ev(`document.querySelector('#ed-tree .ed-node.selected .ed-node-name')?.textContent ?? null`);
+  var numInputs = () => ev(`[...document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')].map((i) => Number(i.value))`);
+  var dirtyTitle = () => ev(`document.querySelector('#ed-doc-title').textContent.startsWith('● ')`);
+  var canvasRect = () => ev(`(() => { const r = document.querySelector('#ed-stage canvas:not(#ed-overlay)').getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
   /** 等一次整场景重挂完成（结构编辑 / 撤销重做 / 重新加载） */
-  const waitRemount = async (before) => {
+  var waitRemount = async (before) => {
     await waitFor(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${READY}.test(d.textContent)).length > ${before}`);
     await waitFor(`!document.querySelector('#tb-export').disabled`);
     await sleep(150);
   };
-  const rowCenter = (name) =>
+  var rowCenter = (name) =>
     ev(`(() => { const n = [...document.querySelectorAll('#ed-tree .ed-node')].find((r) => r.querySelector('.ed-node-name').textContent === ${JSON.stringify(name)}); if (!n) return null; const r = n.getBoundingClientRect(); return [r.left + 40, r.top + r.height / 2]; })()`);
-  const rowButton = (name, cls) =>
+  var rowButton = (name, cls) =>
     ev(`(() => { const n = [...document.querySelectorAll('#ed-tree .ed-node')].find((r) => r.querySelector('.ed-node-name').textContent === ${JSON.stringify(name)}); const b = n?.querySelector(${JSON.stringify(cls)}); if (!b) return null; const r = b.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
   /** 检视器数值框：focus（记 before）→ 改值 → input（热改）→ change（入栈） */
-  const setInputs = (values) =>
+  var setInputs = (values) =>
     ev(`(() => {
       ${REVEAL}
       const ins = [...document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')];
@@ -204,7 +204,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
       return true;
     })()`);
   /** 拦截页面的 <a download>.click()：返回 { name, base64 } */
-  const captureDownload = async (trigger) => {
+  var captureDownload = async (trigger) => {
     await ev(`(() => {
       window.__dl = null;
       const orig = HTMLAnchorElement.prototype.click;
@@ -228,7 +228,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   // ════════════════════════════════════════════════════════════════════════
   // 打开编辑器页（松散形态）
   // ════════════════════════════════════════════════════════════════════════
-  const editorReady = `(document.querySelector('#ed-empty .ed-empty-hint')?.textContent || '').length > 8`;
+  var editorReady = `(document.querySelector('#ed-empty .ed-empty-hint')?.textContent || '').length > 8`;
   await cdp.send("Page.navigate", { url: `${origin}/editor/index.html` });
   await waitFor(editorReady, 90000);
   await ev(`(() => { window.__e2eMode = 'seed'; window.__e2eSeed = ${JSON.stringify({ base: `${origin}/media/dev/${FIXTURE}/`, paths: beachFiles })}; return true; })()`);
@@ -237,13 +237,13 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
   await waitFor(`${READY}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await sleep(500);
-  const cr = await canvasRect();
+  var cr = await canvasRect();
 
   // ════════════════════════════════════════════════════════════════════════
   // K. 引擎编辑器控制面（同页旁挂 pkg 形态实例，尺寸与编辑器画布一致）
   // ════════════════════════════════════════════════════════════════════════
   section(`K. 引擎编辑器控制面（${pkgItem}，pkg 形态，${Math.round(cr.w)}×${Math.round(cr.h)}）`);
-  const k = await ev(`(async () => {
+  var k = await ev(`(async () => {
     const api = await import('/renderer/src/api/editor.ts');
     const host = document.createElement('div');
     host.style.cssText = 'position:fixed;left:-6000px;top:0;width:${cr.w}px;height:${cr.h}px';
@@ -326,14 +326,14 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   check(k.jpg.type === "image/jpeg" && k.jpg.dims.join("x") === "640x360", "capture：指定 jpeg 与尺寸");
   check(k.full.join("x") === "1920x1080", "capture：可出超过画布的场景原生分辨率");
   check(near(k.tCapture, 1, 1e-3), "capture({time})：先 seek 再出图");
-  const top = k.top;
-  const topObj = objects.find((o) => o.id === top);
-  const vec = (s) => String(s).trim().split(/\s+/).map(Number);
-  const [ox, oy] = vec(topObj.origin);
-  const [sx] = vec(topObj.scale);
+  var top = k.top;
+  var topObj = objects.find((o) => o.id === top);
+  var vec = (s) => String(s).trim().split(/\s+/).map(Number);
+  var [ox, oy] = vec(topObj.origin);
+  var [sx] = vec(topObj.scale);
   check(near(k.props[top].origin[0], ox, 1e-3) && near(k.props[top].origin[1], oy, 1e-3) && near(k.props[top].scale[0], sx, 1e-3), "getLayerProps：变换与 scene.json 一致");
-  const cssPerWorld = cr.w / 1920;
-  const anchorTop = k.outline[top].anchor;
+  var cssPerWorld = cr.w / 1920;
+  var anchorTop = k.outline[top].anchor;
   check(near(anchorTop[0], ox * cssPerWorld, 1.5) && near(anchorTop[1], (1080 - oy) * cssPerWorld, 1.5), `getLayerOutline：锚点 = 世界坐标按 cover 换算到画布 CSS（${anchorTop.map((v) => v.toFixed(1))}）`);
   check(k.missing.props === null && k.missing.outline === null && /not found/.test(k.setErr), "不存在的图层：读返回 null、写拒绝");
   check(k.hitAnchor[0] === top, `hitTestAt：锚点处最上层命中（${JSON.stringify(k.hitAnchor)}）`);
@@ -368,7 +368,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   // 变化」，分辨力交给正 / 增量对照。AB_BAND 取 3 = 实测噪声底的 4 倍。
   // ════════════════════════════════════════════════════════════════════════
   section(`M12. 引擎写测：增量装配 / GL overlay 出帧 A/B（${pkgItem}）`);
-  const m12 = await ev(
+  var m12 = await ev(
     `(async () => {
     const api = await import('/renderer/src/api/editor.ts');
     const host = document.createElement('div');
@@ -473,7 +473,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     180000,
   );
 
-  const AB_BAND = 3;
+  var AB_BAND = 3;
   check(m12.diffRepeat < AB_BAND, `M12/A-B 负对照：同一暂停帧号连出两张 = 夹具噪声底（逐像素差 ${m12.diffRepeat.toFixed(2)} < ${AB_BAND}）`);
   check(m12.diffHide > 10, `M12/A-B 正对照：隐藏最上层画面真的变（逐像素差 ${m12.diffHide.toFixed(1)}）`);
   check(m12.diffShowBack < AB_BAND, `M12/A-B 复原对照：显示回来落回噪声带（差 ${m12.diffShowBack.toFixed(2)}）`);
@@ -554,8 +554,8 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   section(`L. 编辑器页端到端（${FIXTURE}，松散形态）`);
   check(JSON.stringify(await treeNames()) === JSON.stringify(objects.map((o) => o.name)), "图层树与 scene.json 一致");
   check(/松散|loose/i.test(await ev(`document.querySelector('#st-form').textContent`)), "状态栏显示松散形态");
-  const topName = topObj.name;
-  const toPage = ([x, y]) => [cr.x + x, cr.y + y];
+  var topName = topObj.name;
+  var toPage = ([x, y]) => [cr.x + x, cr.y + y];
 
   // 树选中 + 检视器热改（把顶层挪到画布中心、缩到 0.3，手柄全部落在画面内）
   await click(await rowCenter(topName));
@@ -563,13 +563,13 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   check(!(await dirtyTitle()), "未编辑时标题无脏标记");
   await setInputs({ 0: 960, 1: 540, 3: 0.3, 4: 0.3 });
   await sleep(200);
-  let v = await numInputs();
+  var v = await numInputs();
   check(v[0] === 960 && v[1] === 540 && v[3] === 0.3, "检视器数值框热改");
   check(await dirtyTitle(), "编辑后标题出现脏标记");
   check(!(await ev(`document.querySelector('#tb-undo').disabled`)), "编辑后撤销可用");
 
   // 手柄几何：旁挂实例同尺寸、同 fit，同样的属性 → 同样的轮廓
-  const geo = await ev(`(async () => {
+  var geo = await ev(`(async () => {
     const api = window.__verifyK.api;
     const host = document.createElement('div');
     host.style.cssText = 'position:fixed;left:-6000px;top:0;width:${cr.w}px;height:${cr.h}px';
@@ -581,12 +581,12 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     window.__verifyK = { api, inst, ed, host };
     return o;
   })()`, 120000);
-  const c = geo.corners;
-  const anchor = geo.anchor;
-  const mid = [(c[0][0] + c[1][0]) / 2, (c[0][1] + c[1][1]) / 2];
-  const ctr = [c.reduce((s, p) => s + p[0], 0) / 4, c.reduce((s, p) => s + p[1], 0) / 4];
-  const len = Math.hypot(mid[0] - ctr[0], mid[1] - ctr[1]) || 1;
-  const rotHandle = [mid[0] + ((mid[0] - ctr[0]) / len) * 22, mid[1] + ((mid[1] - ctr[1]) / len) * 22];
+  var c = geo.corners;
+  var anchor = geo.anchor;
+  var mid = [(c[0][0] + c[1][0]) / 2, (c[0][1] + c[1][1]) / 2];
+  var ctr = [c.reduce((s, p) => s + p[0], 0) / 4, c.reduce((s, p) => s + p[1], 0) / 4];
+  var len = Math.hypot(mid[0] - ctr[0], mid[1] - ctr[1]) || 1;
+  var rotHandle = [mid[0] + ((mid[0] - ctr[0]) / len) * 22, mid[1] + ((mid[1] - ctr[1]) / len) * 22];
 
   // 悬停光标
   await mouse("mouseMoved", ...toPage(rotHandle));
@@ -597,7 +597,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   check((await ev(`document.querySelector('#ed-stage').dataset.cursor`)) === "scale", "悬停角点：光标切到缩放");
 
   // 旋转柄：绕锚点顺时针拖 90°
-  const r0 = [rotHandle[0] - anchor[0], rotHandle[1] - anchor[1]];
+  var r0 = [rotHandle[0] - anchor[0], rotHandle[1] - anchor[1]];
   await drag(toPage(rotHandle), toPage([anchor[0] - r0[1], anchor[1] + r0[0]]));
   v = await numInputs();
   check(near(v[8], -90, 1.5), `旋转柄顺时针拖 90° → 角度 ${v[8]}°`);
@@ -613,26 +613,26 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await sleep(150);
 
   // 角点缩放：右下角外拖到锚点距离的两倍（Shift 等比）
-  const to2 = [anchor[0] + (c[2][0] - anchor[0]) * 2, anchor[1] + (c[2][1] - anchor[1]) * 2];
+  var to2 = [anchor[0] + (c[2][0] - anchor[0]) * 2, anchor[1] + (c[2][1] - anchor[1]) * 2];
   await drag(toPage(c[2]), toPage(to2), MOD.shift);
   v = await numInputs();
   check(near(v[3], 0.6, 0.02) && near(v[4], 0.6, 0.02), `角点 Shift 外拖一倍 → 缩放 ${v[3]} / ${v[4]}`);
 
   // 平移：从层内部拖 (+60, +30) CSS 像素
-  const before = await numInputs();
-  const inside = [anchor[0] + 5, anchor[1] + 5];
+  var before = await numInputs();
+  var inside = [anchor[0] + 5, anchor[1] + 5];
   await drag(toPage(inside), toPage([inside[0] + 60, inside[1] + 30]));
   v = await numInputs();
   check(near(v[0] - before[0], 60 / cssPerWorld, 2) && near(v[1] - before[1], -30 / cssPerWorld, 2), `平移拖拽 → origin Δ(${(v[0] - before[0]).toFixed(1)}, ${(v[1] - before[1]).toFixed(1)})`);
-  const movedAnchor = [anchor[0] + 60, anchor[1] + 30];
+  var movedAnchor = [anchor[0] + 60, anchor[1] + 30];
 
   // 画面点选 + Alt 轮换
   await click(toPage([cr.w - 3, 3]));
-  const picked1 = await selectedName();
+  var picked1 = await selectedName();
   await click(toPage(movedAnchor));
   check((await selectedName()) === topName, "点画面选中最上层");
   await click(toPage(movedAnchor), MOD.alt);
-  const altPicked = await selectedName();
+  var altPicked = await selectedName();
   check(altPicked !== topName && altPicked !== null, `Alt+点击同一位置轮换到下一层（${altPicked}）`);
   check(picked1 !== topName, "点别处不会误选到被移走的层");
 
@@ -640,7 +640,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await click(await rowCenter(topName));
   await click(await rowButton(topName, ".ed-lock"));
   check(await ev(`document.querySelector('#ed-inspector fieldset.ed-form').disabled`), "锁定后检视器只读");
-  const lockedBefore = await numInputs();
+  var lockedBefore = await numInputs();
   await drag(toPage(movedAnchor), toPage([movedAnchor[0] + 80, movedAnchor[1]]));
   await click(await rowCenter(topName));
   check(JSON.stringify(await numInputs()) === JSON.stringify(lockedBefore), "锁定层拖不动");
@@ -650,18 +650,18 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await click(await rowButton(topName, ".ed-lock"));
   check(!(await ev(`document.querySelector('#ed-inspector fieldset.ed-form').disabled`)), "解锁后恢复可编辑");
 
-  const hiddenTools = await ev(`[...document.querySelectorAll('.ed-layer-tools button')].filter((b) => { const r = b.getBoundingClientRect(); const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return !(hit === b || b.contains(hit)); }).map((b) => b.id)`);
+  var hiddenTools = await ev(`[...document.querySelectorAll('.ed-layer-tools button')].filter((b) => { const r = b.getBoundingClientRect(); const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return !(hit === b || b.contains(hit)); }).map((b) => b.id)`);
   check(hiddenTools.length === 0, `图层工具条按钮都在可视区内、点得到${hiddenTools.length ? `（被挤掉：${hiddenTools.join(", ")}）` : ""}`);
 
   // 结构编辑：复制 / 重排 / 删除 + 撤销重做（整场景重挂）
-  const n0 = objects.length;
-  let rc = await readyCount();
+  var n0 = objects.length;
+  var rc = await readyCount();
   await clickSel("#ly-dup");
   await waitRemount(rc);
-  let names = await treeNames();
+  var names = await treeNames();
   check(names.length === n0 + 1 && names.some((n) => n.startsWith(topName) && n !== topName), `复制图层：树多一行（${names.at(-1)}）`);
   check(new RegExp(`${n0 + 1}`).test(await ev(`document.querySelector('#st-layers').textContent`)), "复制后引擎重挂出的图层数 +1");
-  const copyName = await selectedName();
+  var copyName = await selectedName();
   check(copyName !== topName && copyName.startsWith(topName), "复制后选中副本");
   rc = await readyCount();
   await clickSel("#ly-up");
@@ -694,50 +694,50 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   check(near(v[3], 0.6, 0.02) && near(v[0] - before[0], 60 / cssPerWorld, 2), "结构编辑重挂后，先前的属性热改仍在（文档驱动）");
 
   // 逐帧
-  const t0 = await ev(`parseFloat(document.querySelector('#tl-time').textContent)`);
+  var t0 = await ev(`parseFloat(document.querySelector('#tl-time').textContent)`);
   await clickSel("#tl-next");
   await sleep(200);
-  const t1 = await ev(`parseFloat(document.querySelector('#tl-time').textContent)`);
+  var t1 = await ev(`parseFloat(document.querySelector('#tl-time').textContent)`);
   check(await ev(`!document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`), "逐帧时自动暂停");
   check(t1 > t0 || near(t1, t0 + 1 / 60, 0.02), `下一帧推进时钟（${t0} → ${t1}）`);
 
   // 导出 PNG（场景原生分辨率）
-  const png = await captureDownload(() => clickSel("#tb-export"));
-  const pngBuf = Buffer.from(png.base64, "base64");
+  var png = await captureDownload(() => clickSel("#tb-export"));
+  var pngBuf = Buffer.from(png.base64, "base64");
   check(/\.png$/.test(png.name) && pngBuf.readUInt32BE(16) === 1920 && pngBuf.readUInt32BE(20) === 1080, `导出 PNG：1920×1080（${png.name}）`);
 
   // 下载 zip
-  const zipDl = await captureDownload(async () => {
+  var zipDl = await captureDownload(async () => {
     await clickSel("#tb-pack");
     await clickSel("#export-zip");
   });
-  const zipPath = path.join(tmpRoot, "e2e.zip");
+  var zipPath = path.join(tmpRoot, "e2e.zip");
   fs.writeFileSync(zipPath, Buffer.from(zipDl.base64, "base64"));
-  const ut = spawnSync("unzip", ["-t", zipPath], { encoding: "utf8" });
-  const ul = spawnSync("unzip", ["-Z1", zipPath], { encoding: "utf8" });
-  const zipNames = (ul.stdout || "").trim().split("\n");
+  var ut = spawnSync("unzip", ["-t", zipPath], { encoding: "utf8" });
+  var ul = spawnSync("unzip", ["-Z1", zipPath], { encoding: "utf8" });
+  var zipNames = (ul.stdout || "").trim().split("\n");
   check(ut.status === 0, "下载的 zip 通过 unzip -t");
   check(["scene.json", "project.json", "preview.jpg"].every((n) => zipNames.includes(n)) && zipNames.some((n) => n.startsWith("materials/")), `zip 内含入口 / 工程 / 封面 / 资源（${zipNames.length} 个）`);
   await waitFor(`!document.querySelector('#tb-pack').disabled`);
 
   // 自动保存进项目文件夹（⌘S 立刻再写一次）
-  let sc = await savedCount();
+  var sc = await savedCount();
   await key("s", MOD.meta);
   await waitSaved(sc);
-  const savedId = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
-  const saved = [savedId];
+  var savedId = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+  var saved = [savedId];
   check(typeof savedId === "string" && /^editor-/.test(savedId), `项目文件夹（${savedId}）`);
-  const itemDir = path.join(lib, saved[0]);
-  const sScene = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
-  const sProject = JSON.parse(fs.readFileSync(path.join(itemDir, "project.json"), "utf8"));
+  var itemDir = path.join(lib, saved[0]);
+  var sScene = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
+  var sProject = JSON.parse(fs.readFileSync(path.join(itemDir, "project.json"), "utf8"));
   check(fs.existsSync(path.join(itemDir, ".webwallgl-editor")), "条目带编辑器标记");
   check(sScene.objects.length === n0 + 1, "盘上 scene.json 含副本层");
-  const sTop = sScene.objects.find((o) => o.name === topName);
-  const [sx1, , ] = vec(typeof sTop.scale === "object" ? sTop.scale.value : sTop.scale);
-  const [ox1] = vec(typeof sTop.origin === "object" ? sTop.origin.value : sTop.origin);
+  var sTop = sScene.objects.find((o) => o.name === topName);
+  var [sx1, , ] = vec(typeof sTop.scale === "object" ? sTop.scale.value : sTop.scale);
+  var [ox1] = vec(typeof sTop.origin === "object" ? sTop.origin.value : sTop.origin);
   check(near(sx1, 0.6, 0.02) && near(ox1, before[0] + 60 / cssPerWorld, 2), "盘上 scene.json 含拖拽 / 缩放结果");
   check(sProject.type === "scene" && sProject.file === "scene.json" && sProject.preview === "preview.jpg", "project.json 指向文档与新封面");
-  const jpg = fs.readFileSync(path.join(itemDir, "preview.jpg"));
+  var jpg = fs.readFileSync(path.join(itemDir, "preview.jpg"));
   check(jpg[0] === 0xff && jpg[1] === 0xd8 && jpg.length > 2000, `封面是有效 JPEG（${(jpg.length / 1024).toFixed(0)} KB）`);
   check(!(await dirtyTitle()) && /已保存|Saved/.test(await ev(`document.querySelector('#st-save').textContent`)), "保存后脏标记清除，状态栏显示已保存");
 
@@ -749,11 +749,11 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   sc = await savedCount();
   await key("s", MOD.meta);
   await waitSaved(sc);
-  const afterCmdS = fs.readdirSync(lib).filter((n) => /^editor-/.test(n));
-  const sScene2 = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
+  var afterCmdS = fs.readdirSync(lib).filter((n) => /^editor-/.test(n));
+  var sScene2 = JSON.parse(fs.readFileSync(path.join(itemDir, "scene.json"), "utf8"));
   check(afterCmdS.includes(saved[0]) && (await ev(`sessionStorage.getItem('wwgl-e2e-project')`)) === saved[0] && sScene2.objects.length === n0, "⌘S 覆盖同一项目文件夹（不新建）");
 
-  const errs1 = await errorLines();
+  var errs1 = await errorLines();
   check(errs1.length === 0, `编辑全程控制台无错误${errs1.length ? `：${errs1.slice(0, 2).join(" / ")}` : ""}`);
 
   // 重新打开保存产物
@@ -767,7 +767,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await click(await rowCenter(topName));
   v = await numInputs();
   check(near(v[3], 0.6, 0.02) && near(v[0], ox1, 0.01), "重新打开：引擎读到保存的变换");
-  const errs2 = await errorLines();
+  var errs2 = await errorLines();
   check(errs2.length === 0, `重新打开无错误${errs2.length ? `：${errs2.slice(0, 2).join(" / ")}` : ""}`);
 
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
@@ -781,13 +781,13 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
 
 /** 上半 top、下半 bottom 的 RGB PNG（无依赖编码：IHDR + 单块 IDAT + IEND） */
 export function stripePng(w, h, top, bottom) {
-  const stride = w * 3 + 1;
-  const raw = Buffer.alloc(stride * h);
+  var stride = w * 3 + 1;
+  var raw = Buffer.alloc(stride * h);
   for (let y = 0; y < h; y++) {
     const c = y < h / 2 ? top : bottom;
     for (let x = 0; x < w; x++) raw.set(c, y * stride + 1 + x * 3);
   }
-  const chunk = (type, data) => {
+  var chunk = (type, data) => {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(data.length);
     const td = Buffer.concat([Buffer.from(type, "latin1"), data]);
@@ -795,7 +795,7 @@ export function stripePng(w, h, top, bottom) {
     crc.writeUInt32BE(zlib.crc32(td));
     return Buffer.concat([len, td, crc]);
   };
-  const ihdr = Buffer.alloc(13);
+  var ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8;
@@ -813,22 +813,51 @@ export function stripePng(w, h, top, bottom) {
  * 不读编辑器页任何内部状态。
  */
 async function runCreateAndDraft(ctx) {
-  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, openLocal, saveToLocal, waitFileOnDisk, clearLocalStore, helpers: h, objects } = ctx;
-  const RED = [220, 30, 30];
-  const BLUE = [30, 30, 220];
-  const BG = "#336699";
-  const BG_RGB = [0x33, 0x66, 0x99];
-  const stripePath = path.join(tmpRoot, "stripe.png");
+  // ---- 真机容错（本机 headless 有环境级抖动：页面/CDP 偶发卡死；一条断言的等待失败不该带走整轮）----
+  // 每段独立 try/catch：一段中断只记一条 ✗，后面的段照跑。只有「探针也打不通」连续两次才判页面失效、剩余段快速跳过
+  //（普通「等条件超时」时页面往往还活着 —— 用探针区分，避免把一条判据失败误判成页面失效而跳过几十段）。
+  const HL_TRANSPORT = /连接已关闭|Not attached to an active page|Target closed|Session closed|ECONNREFUSED|Chrome 沙箱|Cdp/;
+  const hlState = { aborts: [], dead: false, streak: 0, skipped: 0 };
+  /** 页面还活着吗：一次 5s 的 evaluate 探针。 */
+  async function hlAlive() {
+    try {
+      await ctx.ev("1 + 1", 5000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async function hlAbort(tag, name, err) {
+    const msg = err && err.message ? err.message : String(err);
+    hlState.aborts.push({ tag, name, msg });
+    check(false, `真机段中断：${name} —— ${msg}（该段余下步骤跳过，后续段继续跑）`);
+    hlState.streak = (await hlAlive()) ? 0 : hlState.streak + 1;
+    if (hlState.streak >= 2 && !hlState.dead) {
+      hlState.dead = true;
+      console.log(`  — 页面已连续 ${hlState.streak} 段无响应（最近：${name}${HL_TRANSPORT.test(msg) ? `；传输级：${msg}` : ""}），剩余段快速跳过`);
+    }
+  }
+  function hlSkip(tag, name) {
+    if (hlState.skipped++ === 0) check(false, `页面 / 传输已失效，后续真机段未执行（首个：${name}）`);
+    else console.log(`  — 跳过（页面 / 传输已失效）：${name}`);
+  }
+
+  var { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, openLocal, saveToLocal, waitFileOnDisk, clearLocalStore, helpers: h, objects } = ctx;
+  var RED = [220, 30, 30];
+  var BLUE = [30, 30, 220];
+  var BG = "#336699";
+  var BG_RGB = [0x33, 0x66, 0x99];
+  var stripePath = path.join(tmpRoot, "stripe.png");
   fs.writeFileSync(stripePath, stripePng(400, 200, RED, BLUE));
 
   await cdp.send("Page.setInterceptFileChooserDialog", { enabled: true });
-  const setFiles = async (sel, files) => {
+  var setFiles = async (sel, files) => {
     const { root } = await cdp.send("DOM.getDocument", { depth: 0 });
     const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: sel });
     await cdp.send("DOM.setFileInputFiles", { nodeId, files });
   };
   /** 页面坐标处 4×4 平均色（真实合成结果，经 CDP 截图） */
-  const pixelAt = async ([x, y]) => {
+  var pixelAt = async ([x, y]) => {
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip: { x: x - 2, y: y - 2, width: 4, height: 4, scale: 1 } });
     return ev(`(async () => {
       const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
@@ -838,18 +867,18 @@ async function runCreateAndDraft(ctx) {
       return s.map((v) => Math.round(v / (d.length / 4)));
     })()`);
   };
-  const close = (a, b, eps) => a.every((v, i) => Math.abs(v - b[i]) <= eps);
-  const isRed = (c) => c[0] > 170 && c[1] < 80 && c[2] < 80;
-  const isBlue = (c) => c[2] > 170 && c[0] < 80 && c[1] < 80;
-  const isGreen = (c) => c[1] > 170 && c[0] < 80 && c[2] < 80;
-  const bannerShown = () => ev(`!document.querySelector('#ed-draft').hidden`);
-  const EDITOR = `${origin}/editor/index.html`;
-  const gotoEditor = async (query = "") => {
+  var close = (a, b, eps) => a.every((v, i) => Math.abs(v - b[i]) <= eps);
+  var isRed = (c) => c[0] > 170 && c[1] < 80 && c[2] < 80;
+  var isBlue = (c) => c[2] > 170 && c[0] < 80 && c[1] < 80;
+  var isGreen = (c) => c[1] > 170 && c[0] < 80 && c[2] < 80;
+  var bannerShown = () => ev(`!document.querySelector('#ed-draft').hidden`);
+  var EDITOR = `${origin}/editor/index.html`;
+  var gotoEditor = async (query = "") => {
     await cdp.send("Page.navigate", { url: `${EDITOR}${query}` });
     await waitFor(`(document.querySelector('#ed-empty .ed-empty-hint')?.textContent || '').length > 8`, 90000);
   };
   /** 再打开某个已经自动保存过的项目文件夹（不靠 ?item=） */
-  const reopen = async (id, query = "") => {
+  var reopen = async (id, query = "") => {
     await gotoEditor(query);
     await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(id)}; return true; })()`);
     await openLocal();
@@ -859,7 +888,7 @@ async function runCreateAndDraft(ctx) {
    * 新建工程默认落在浏览器存储里，所以先「存到本机文件夹…」绑到真目录（这一段要断言盘上文件）；
    * 已经绑在真目录上时这一步是空操作。
    */
-  const saveLoose = async () => {
+  var saveLoose = async () => {
     await saveToLocal();
     const sc = await h.savedCount();
     await key("s", MOD.meta);
@@ -875,18 +904,18 @@ async function runCreateAndDraft(ctx) {
     return id;
   };
   /** 编辑器画布上世界坐标（y 朝上）→ 页面坐标；场景 16:9 与舞台同比例 */
-  const worldToPage = (cr, [wx, wy], W = 1920, H = 1080) => {
+  var worldToPage = (cr, [wx, wy], W = 1920, H = 1080) => {
     const k = Math.max(cr.w / W, cr.h / H);
     return [cr.x + cr.w / 2 + (wx - W / 2) * k, cr.y + cr.h / 2 - (wy - H / 2) * k];
   };
-  const newBlank = async (color) => {
+  var newBlank = async (color) => {
     await clickSel("#tb-new");
     await ev(`(() => { document.querySelector('#new-res').value = '1920x1080'; document.querySelector('#new-color').value = '${color}'; return true; })()`);
     const rc = await h.readyCount();
     await clickSel("#new-blank");
     await h.waitRemount(rc);
   };
-  const addImage = async (file) => {
+  var addImage = async (file) => {
     const rc = await h.readyCount();
     await clickSel("#ly-add");
     await setFiles("#in-image", [file]);
@@ -895,6 +924,7 @@ async function runCreateAndDraft(ctx) {
 
   // ════════════════════════════════════════════════════════════════════════
   section("Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）");
+  if (hlState.dead) hlSkip("Q", "Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）"); else try {
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
   await clearLocalStore();
@@ -907,11 +937,11 @@ async function runCreateAndDraft(ctx) {
   check(await ev(`document.querySelector('#new-menu').hidden`), "再点一次收起菜单");
 
   await newBlank(BG);
-  const cr = await h.canvasRect();
+  var cr = await h.canvasRect();
   check((await h.treeNames()).length === 0 && /0/.test(await ev(`document.querySelector('#st-layers').textContent`)), "空白模板：图层树为空、引擎 0 层");
   check(/1920×1080/.test(await ev(`document.querySelector('#st-res').textContent`)) && /松散|loose/i.test(await ev(`document.querySelector('#st-form').textContent`)), "状态栏：1920×1080、松散形态");
   check(/未命名|Untitled/.test(await ev(`document.querySelector('#ed-doc-title').textContent`)) && !(await h.dirtyTitle()), "标题 = 未命名壁纸，新建即干净（无脏标记）");
-  const bg0 = await pixelAt(worldToPage(cr, [960, 540]));
+  var bg0 = await pixelAt(worldToPage(cr, [960, 540]));
   check(close(bg0, BG_RGB, 10), `画面 = 所选背景色（期望 ${BG_RGB}，实得 ${bg0}）`);
   check(!(await ev(`document.querySelector('#ly-add').disabled`)) && !(await ev(`document.querySelector('#tb-pack').disabled`)), "新建后「添加图片」「导出」可用");
 
@@ -920,21 +950,21 @@ async function runCreateAndDraft(ctx) {
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && (await h.selectedName()) === "stripe", "选图后树里多一层「stripe」并选中");
   // addImage 里的 waitRemount 可能已跨过 AUTOSAVE_MS=400ms（机器忙时），此时脏标记已被自动保存清掉；
   // 两者都是「编辑已生效」的合法终态，故二者取一。
-  const dirtyAfterImage = await h.dirtyTitle();
-  const savedAfterImage = /已保存|Saved/.test(await ev(`document.querySelector('#st-save').textContent`));
+  var dirtyAfterImage = await h.dirtyTitle();
+  var savedAfterImage = /已保存|Saved/.test(await ev(`document.querySelector('#st-save').textContent`));
   check(dirtyAfterImage || savedAfterImage, `加图后出现脏标记（或 400ms 内已自动保存落盘：dirty=${dirtyAfterImage} saved=${savedAfterImage}）`);
-  let v = await h.numInputs();
+  var v = await h.numInputs();
   check(v[0] === 960 && v[1] === 540 && v[3] === 1, `新图层在场景中心、原尺寸（origin ${v[0]},${v[1]} scale ${v[3]}）`);
-  const topPt = worldToPage(cr, [960 + 150, 540 + 50]);
-  const botPt = worldToPage(cr, [960 + 150, 540 - 50]);
-  const outPt = worldToPage(cr, [200, 200]);
-  let cTop = await pixelAt(topPt);
-  let cBot = await pixelAt(botPt);
+  var topPt = worldToPage(cr, [960 + 150, 540 + 50]);
+  var botPt = worldToPage(cr, [960 + 150, 540 - 50]);
+  var outPt = worldToPage(cr, [200, 200]);
+  var cTop = await pixelAt(topPt);
+  var cBot = await pixelAt(botPt);
   check(isRed(cTop) && isBlue(cBot), `引擎真画出图片且不上下颠倒（上 ${cTop} / 下 ${cBot}）`);
   check(close(await pixelAt(outPt), BG_RGB, 10), "图片外仍是背景色");
 
   // 撤销 / 重做加层
-  let rc = await h.readyCount();
+  var rc = await h.readyCount();
   await key("z", MOD.meta);
   await h.waitRemount(rc);
   check((await h.treeNames()).length === 0 && close(await pixelAt(topPt), BG_RGB, 10), "撤销添加：图层与画面都回到空白");
@@ -955,21 +985,21 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(rc);
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe", "green"]), "拖入图片 → 追加为最上层");
   // 避开锚点十字（新层自动选中，叠加层在锚点画准星）
-  const cMid = await pixelAt(worldToPage(cr, [1000, 500]));
+  var cMid = await pixelAt(worldToPage(cr, [1000, 500]));
   cTop = await pixelAt(topPt);
   check(isGreen(cMid) && isRed(cTop), `新层盖在上面，旧层未被遮住的部分照常显示（中 ${cMid} / 旁 ${cTop}）`);
 
-  const saved = [await saveLoose()];
-  const dir = path.join(lib, saved[0]);
-  const scene = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+  var saved = [await saveLoose()];
+  var dir = path.join(lib, saved[0]);
+  var scene = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
   check(scene.general.clearcolor === "0.200 0.400 0.600" && scene.objects.length === 2, "盘上 scene.json：背景色 + 两个图片层");
-  const need = ["models/editor/stripe.json", "materials/editor/stripe.json", "materials/editor/stripe.png", "models/editor/green.json", "materials/editor/green.json", "materials/editor/green.png", "preview.jpg", "project.json"];
+  var need = ["models/editor/stripe.json", "materials/editor/stripe.json", "materials/editor/stripe.png", "models/editor/green.json", "materials/editor/green.json", "materials/editor/green.png", "preview.jpg", "project.json"];
   check(need.every((f) => fs.existsSync(path.join(dir, f))), "盘上资源齐全（两组模型 / 材质 / 源图 + 封面 + 工程）");
   check(Buffer.compare(fs.readFileSync(path.join(dir, "materials/editor/stripe.png")), fs.readFileSync(stripePath)) === 0, "png 源图逐字节原样保存");
-  const g = fs.readFileSync(path.join(dir, "materials/editor/green.png"));
+  var g = fs.readFileSync(path.join(dir, "materials/editor/green.png"));
   check(g.readUInt32BE(0) === 0x89504e47 && g.readUInt32BE(16) === 200, "webp 转成 png 保存（200×200）");
   check(!fs.readdirSync(path.join(dir, "materials/editor")).some((n) => n.endsWith(".webp")), "不留引擎读不了的 webp");
-  const errsQ = await h.errorLines();
+  var errsQ = await h.errorLines();
   check(errsQ.length === 0, `新建全程控制台无错误${errsQ.length ? `：${errsQ.slice(0, 2).join(" / ")}` : ""}`);
 
   // 编辑器重新打开
@@ -977,7 +1007,7 @@ async function runCreateAndDraft(ctx) {
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(`${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await new Promise((r) => setTimeout(r, 400));
-  const cr2 = await h.canvasRect();
+  var cr2 = await h.canvasRect();
   check(isRed(await pixelAt(worldToPage(cr2, [1110, 590]))) && isGreen(await pixelAt(worldToPage(cr2, [960, 540]))), "编辑器重新打开：画面与保存前一致");
 
   // 测试台渲染页播放（与资源管理器同一条加载链）
@@ -986,14 +1016,14 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vp = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const benchRect = { x: 0, y: 0, w: vp.w, h: vp.h };
-  const layerNames = await ev(`window.__sceneLayers.map((l) => l.name)`);
+  var vp = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var benchRect = { x: 0, y: 0, w: vp.w, h: vp.h };
+  var layerNames = await ev(`window.__sceneLayers.map((l) => l.name)`);
   check(JSON.stringify(layerNames) === JSON.stringify(["stripe", "green"]), "测试台渲染页：两层都装配出来");
-  const bTop = await pixelAt(worldToPage(benchRect, [1110, 590]));
-  const bBot = await pixelAt(worldToPage(benchRect, [1110, 490]));
-  const bMid = await pixelAt(worldToPage(benchRect, [960, 540]));
-  const bOut = await pixelAt(worldToPage(benchRect, [300, 540]));
+  var bTop = await pixelAt(worldToPage(benchRect, [1110, 590]));
+  var bBot = await pixelAt(worldToPage(benchRect, [1110, 490]));
+  var bMid = await pixelAt(worldToPage(benchRect, [960, 540]));
+  var bOut = await pixelAt(worldToPage(benchRect, [300, 540]));
   check(isRed(bTop) && isBlue(bBot) && isGreen(bMid), `测试台渲染页：图片内容与位置正确（上 ${bTop} / 下 ${bBot} / 中 ${bMid}）`);
   check(close(bOut, BG_RGB, 10), `测试台渲染页：背景色正确（${bOut}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/new-in-bench.jpg") });
@@ -1002,21 +1032,23 @@ async function runCreateAndDraft(ctx) {
   // 「以图片为背景」模板：铺满（cover），新建即带内容
   await gotoEditor();
   await clickSel("#tb-new");
-  const rcBg = await h.readyCount();
+  var rcBg = await h.readyCount();
   await clickSel("#new-image");
   await setFiles("#in-image", [stripePath]);
   await h.waitRemount(rcBg);
   check(await ev(`document.querySelector('#new-menu').hidden`), "选完图片后模板菜单自动收起");
-  const crBg = await h.canvasRect();
-  const bgUp = await pixelAt(worldToPage(crBg, [150, 900]));
-  const bgDown = await pixelAt(worldToPage(crBg, [150, 150]));
+  var crBg = await h.canvasRect();
+  var bgUp = await pixelAt(worldToPage(crBg, [150, 900]));
+  var bgDown = await pixelAt(worldToPage(crBg, [150, 150]));
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && (await h.dirtyTitle()), "图片背景模板：一层背景图、带脏标记（有内容可丢）");
   check(isRed(bgUp) && isBlue(bgDown), `图片背景铺满整个场景（左上 ${bgUp} / 左下 ${bgDown}）`);
   // 这个临时工程默认也落在浏览器存储里：清干净，免得下面刷新时弹出「上次的工程」恢复横幅
   await clearLocalStore();
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("Q", "Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）", err); }
   section("R. 项目自动保存（刷新不靠草稿；再打开文件夹图层还在）");
+  if (hlState.dead) hlSkip("R", "R. 项目自动保存（刷新不靠草稿；再打开文件夹图层还在）"); else try {
   await gotoEditor();
   check(!(await bannerShown()), "打开编辑器没有草稿横幅");
   {
@@ -1030,7 +1062,7 @@ async function runCreateAndDraft(ctx) {
   }
   await newBlank("#202020");
   await addImage(stripePath);
-  const idR = await saveLoose();
+  var idR = await saveLoose();
   check(!(await h.dirtyTitle()) && !(await bannerShown()), "写入文件夹后脏标记清除，仍然没有草稿横幅");
   await gotoEditor();
   await new Promise((r) => setTimeout(r, 400));
@@ -1038,24 +1070,26 @@ async function runCreateAndDraft(ctx) {
   await reopen(idR);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
-  const cr3 = await h.canvasRect();
+  var cr3 = await h.canvasRect();
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && !(await h.dirtyTitle()), "再打开项目文件夹：图层还在，已是保存态");
   check(isRed(await pixelAt(worldToPage(cr3, [1110, 590]))) && close(await pixelAt(worldToPage(cr3, [200, 200])), [0x20, 0x20, 0x20], 10), "再打开后画面一致（图片与背景色都在文件夹里）");
   await click(await h.rowCenter("stripe"));
   await h.setInputs({ 0: 777, 1: 333 });
-  const idR2 = await saveLoose();
+  var idR2 = await saveLoose();
   check(idR2 === idR, "继续编辑仍写回同一文件夹");
   await reopen(idR);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
   await click(await h.rowCenter("stripe"));
-  const vR = await h.numInputs();
+  var vR = await h.numInputs();
   check(near(vR[0], 777, 1e-6) && near(vR[1], 333, 1e-6), `再打开读到刚保存的变换（origin ${vR[0]},${vR[1]}）`);
-  const errsR = await h.errorLines();
+  var errsR = await h.errorLines();
   check(errsR.length === 0, `自动保存流程无错误${errsR.length ? `：${errsR.slice(0, 2).join(" / ")}` : ""}`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("R", "R. 项目自动保存（刷新不靠草稿；再打开文件夹图层还在）", err); }
   section("R2. 新建默认落浏览器存储（真目录只在明确选本机文件夹时才用）");
+  if (hlState.dead) hlSkip("R2", "R2. 新建默认落浏览器存储（真目录只在明确选本机文件夹时才用）"); else try {
   await gotoEditor();
   await newBlank("#123456");
   check(
@@ -1071,13 +1105,13 @@ async function runCreateAndDraft(ctx) {
     await key("s", MOD.meta);
     await h.waitSaved(sc);
   }
-  const vdirId = await ev(`localStorage.getItem('webwallgl-vdir-last')`);
+  var vdirId = await ev(`localStorage.getItem('webwallgl-vdir-last')`);
   check(typeof vdirId === "string" && /^vdir-/.test(vdirId), `⌘S 直接写进浏览器存储（${vdirId}）`);
   check(!fs.existsSync(path.join(lib, String(vdirId))), "没有落进任何本机文件夹（真目录必须显式选）");
   check(!(await bannerShown()), "正在编辑时没有恢复横幅");
   await gotoEditor();
   await waitFor(`!document.querySelector('#ed-draft').hidden`, 30000);
-  const bannerText = await ev(`document.querySelector('#ed-draft-text').textContent`);
+  var bannerText = await ev(`document.querySelector('#ed-draft-text').textContent`);
   check(/未命名|Untitled/.test(bannerText), `刷新后给出「上次的工程…还在」恢复横幅（${bannerText}）`);
   await clickSel("#draft-restore");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
@@ -1087,7 +1121,7 @@ async function runCreateAndDraft(ctx) {
     await ev(`/浏览器存储/.test(document.querySelector('#st-save').title)`),
     "恢复后仍然绑定浏览器存储（没有悄悄改成真目录）",
   );
-  const idLocal = await saveToLocal();
+  var idLocal = await saveToLocal();
   check(
     typeof idLocal === "string" && idLocal !== vdirId && fs.existsSync(path.join(lib, idLocal, "scene.json")),
     `「存到本机文件夹…」把整份另存为真目录（${idLocal}）`,
@@ -1097,18 +1131,20 @@ async function runCreateAndDraft(ctx) {
   check(!(await bannerShown()), "存到本机文件夹后刷新不再提示浏览器存储里的旧工程");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("R2", "R2. 新建默认落浏览器存储（真目录只在明确选本机文件夹时才用）", err); }
   section("T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）");
-  const fxNames = () => ev(`[...document.querySelectorAll('.ed-fx-item')].map((e) => e.dataset.fxId)`);
-  const fxAct = async (js) => {
+  if (hlState.dead) hlSkip("T", "T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）"); else try {
+  var fxNames = () => ev(`[...document.querySelectorAll('.ed-fx-item')].map((e) => e.dataset.fxId)`);
+  var fxAct = async (js) => {
     const r0 = await h.readyCount();
     await ev(`(() => { ${js}; return true; })()`);
     await h.waitRemount(r0);
   };
-  const fxAdd = (id) => fxAct(`const s = document.querySelector('#fx-add'); s.value = '${id}'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const fxSet = (i, param, value) =>
+  var fxAdd = (id) => fxAct(`const s = document.querySelector('#fx-add'); s.value = '${id}'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  var fxSet = (i, param, value) =>
     fxAct(`const el = document.querySelector('.ed-fx-item[data-fx-index="${i}"] input[data-param="${param}"]'); el.value = '${value}'; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const fxBtn = (i, cls) => fxAct(`document.querySelector('.ed-fx-item[data-fx-index="${i}"] .${cls}').click()`);
-  const undoRedo = async (shift) => {
+  var fxBtn = (i, cls) => fxAct(`document.querySelector('.ed-fx-item[data-fx-index="${i}"] .${cls}').click()`);
+  var undoRedo = async (shift) => {
     const r0 = await h.readyCount();
     await key("z", shift ? MOD.meta | MOD.shift : MOD.meta);
     await h.waitRemount(r0);
@@ -1119,14 +1155,14 @@ async function runCreateAndDraft(ctx) {
   await gotoEditor();
   await newBlank("#000000");
   await addImage(stripePath);
-  const crT = await h.canvasRect();
-  const tTop = worldToPage(crT, [1110, 590]);
-  const tBot = worldToPage(crT, [1110, 490]);
-  const tOut = worldToPage(crT, [300, 540]);
+  var crT = await h.canvasRect();
+  var tTop = worldToPage(crT, [1110, 590]);
+  var tBot = worldToPage(crT, [1110, 490]);
+  var tOut = worldToPage(crT, [300, 540]);
   // 选项数 = 1 个占位 + effectCatalog.list()（内置 14 个 + examples/plugins 贡献的 fx-crt / fx-glow）
   // ⇒ 断言「内置 14 个一个不少」，不锁死总数，插件多寡不影响这条。
-  const fxOpts = await ev(`[...document.querySelectorAll('#fx-add option')].map((o) => o.value)`);
-  const BUILTIN_FX = ["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse", "outline", "glow", "chroma", "pixelate", "shine", "fade", "audiobars"];
+  var fxOpts = await ev(`[...document.querySelectorAll('#fx-add option')].map((o) => o.value)`);
+  var BUILTIN_FX = ["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse", "outline", "glow", "chroma", "pixelate", "shine", "fade", "audiobars"];
   check(
     (await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled`)) &&
       fxOpts[0] === "" &&
@@ -1137,32 +1173,32 @@ async function runCreateAndDraft(ctx) {
 
   await fxAdd("tint");
   check(JSON.stringify(await fxNames()) === JSON.stringify(["tint"]) && (await h.selectedName()) === "stripe", "添加「颜色叠加」：列表一项，选中仍是该层");
-  const tint0 = await pixelAt(tTop);
-  const tintWant = RED.map((c, i) => Math.round(c * 0.5 + [255, 115, 51][i] * 0.5));
+  var tint0 = await pixelAt(tTop);
+  var tintWant = RED.map((c, i) => Math.round(c * 0.5 + [255, 115, 51][i] * 0.5));
   check(close(tint0, tintWant, 6), `缺省橙色 50% 叠在红色上（期望 ${tintWant}，实得 ${tint0}）`);
   await fxSet(0, "color", "#00ff00");
   await fxSet(0, "amount", "1");
-  const g1 = await pixelAt(tTop);
-  const g2 = await pixelAt(tBot);
+  var g1 = await pixelAt(tTop);
+  var g2 = await pixelAt(tBot);
   check(isGreen(g1) && isGreen(g2), `改成绿色、强度 1：上下两半都变绿（上 ${g1} / 下 ${g2}）`);
   check(await ev(`document.querySelector('.ed-fx-item[data-fx-index="0"] input[data-param="amount"]').value === '1' && document.querySelector('.ed-fx-item[data-fx-index="0"] input[data-param="color"]').value === '#00ff00'`), "重挂后面板显示改后的参数");
 
   await fxAdd("adjust");
   await fxSet(1, "brightness", "-0.5");
   check(JSON.stringify(await fxNames()) === JSON.stringify(["tint", "adjust"]), "第二个效果「色彩调整」排在后面");
-  const dim = await pixelAt(tTop);
+  var dim = await pixelAt(tTop);
   check(dim[0] < 30 && dim[2] < 30 && dim[1] > 100 && dim[1] < 160, `效果链串联：先绿再压暗一半（实得 ${dim}）`);
   check(close(await pixelAt(tOut), [0, 0, 0], 8), "效果只作用在图层上，背景不受影响");
 
   await fxBtn(1, "ed-fx-up");
   check(JSON.stringify(await fxNames()) === JSON.stringify(["adjust", "tint"]), "上移：顺序对调");
-  const swapped = await pixelAt(tTop);
+  var swapped = await pixelAt(tTop);
   check(isGreen(swapped) && swapped[1] > 200, `先压暗再整色替换成绿 → 纯绿（实得 ${swapped}），顺序真的影响出帧`);
   await undoRedo(false);
   check(JSON.stringify(await fxNames()) === JSON.stringify(["tint", "adjust"]) && close(await pixelAt(tTop), dim, 12), "撤销上移：顺序与画面复原");
 
   await fxBtn(1, "ed-fx-eye");
-  const off = await pixelAt(tTop);
+  var off = await pixelAt(tTop);
   check(await ev(`document.querySelector('.ed-fx-item[data-fx-index="1"]').classList.contains('hidden-layer')`) && isGreen(off) && off[1] > 200, `停用「色彩调整」：画面回到亮绿（${off}）`);
   await undoRedo(false);
   check(close(await pixelAt(tTop), dim, 12), "撤销停用：压暗回来");
@@ -1171,19 +1207,19 @@ async function runCreateAndDraft(ctx) {
   check((await fxNames()).length === 1 && isGreen(await pixelAt(tTop)), "移除第二个效果");
   await undoRedo(false);
   check((await fxNames()).length === 2 && close(await pixelAt(tTop), dim, 12), "撤销移除：效果与参数一并回来");
-  const editorTop = await pixelAt(tTop);
-  const editorBot = await pixelAt(tBot);
+  var editorTop = await pixelAt(tTop);
+  var editorBot = await pixelAt(tBot);
 
-  const savedT = [await saveLoose()];
-  const dirT = path.join(lib, savedT[0]);
-  const sceneT = JSON.parse(fs.readFileSync(path.join(dirT, "scene.json"), "utf8"));
-  const effs = sceneT.objects[0]?.effects ?? [];
+  var savedT = [await saveLoose()];
+  var dirT = path.join(lib, savedT[0]);
+  var sceneT = JSON.parse(fs.readFileSync(path.join(dirT, "scene.json"), "utf8"));
+  var effs = sceneT.objects[0]?.effects ?? [];
   check(effs.length === 2 && effs[0].file === "effects/wwgl_tint/effect.json" && effs[1].file === "effects/wwgl_adjust/effect.json", "盘上 scene.json：图层带两条效果，顺序正确");
   check(effs[0].passes[0].constantshadervalues.color === "0 1 0" && effs[0].passes[0].constantshadervalues.amount === 1 && effs[1].passes[0].constantshadervalues.brightness === -0.5, "盘上参数：颜色 \"0 1 0\"、强度 1、亮度 -0.5");
-  const fxFiles = ["tint", "adjust"].flatMap((id) => [`effects/wwgl_${id}/effect.json`, `materials/effects/wwgl_${id}.json`, `shaders/effects/wwgl_${id}.frag`, `shaders/effects/wwgl_${id}.vert`]);
+  var fxFiles = ["tint", "adjust"].flatMap((id) => [`effects/wwgl_${id}/effect.json`, `materials/effects/wwgl_${id}.json`, `shaders/effects/wwgl_${id}.frag`, `shaders/effects/wwgl_${id}.vert`]);
   check(fxFiles.every((f) => fs.existsSync(path.join(dirT, f))), "盘上效果文件齐全（两个效果各四件，产物自包含）");
   check(!fs.existsSync(path.join(dirT, "effects")) || fs.readdirSync(path.join(dirT, "effects")).length === 2, "没用到的效果不进产物");
-  const errsT = await h.errorLines();
+  var errsT = await h.errorLines();
   check(errsT.length === 0, `效果编辑全程控制台无错误${errsT.length ? `：${errsT.slice(0, 2).join(" / ")}` : ""}`);
 
   await reopen(savedT[0]);
@@ -1198,43 +1234,45 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpT = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const benchT = { x: 0, y: 0, w: vpT.w, h: vpT.h };
-  const bTopT = await pixelAt(worldToPage(benchT, [1110, 590]));
-  const bBotT = await pixelAt(worldToPage(benchT, [1110, 490]));
-  const bOutT = await pixelAt(worldToPage(benchT, [300, 540]));
+  var vpT = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var benchT = { x: 0, y: 0, w: vpT.w, h: vpT.h };
+  var bTopT = await pixelAt(worldToPage(benchT, [1110, 590]));
+  var bBotT = await pixelAt(worldToPage(benchT, [1110, 490]));
+  var bOutT = await pixelAt(worldToPage(benchT, [300, 540]));
   check(close(bTopT, editorTop, 12) && close(bBotT, editorBot, 12), `★ 测试台出帧与编辑器预览一致（测试台 ${bTopT} / ${bBotT}，编辑器 ${editorTop} / ${editorBot}）`);
   check(close(bOutT, [0, 0, 0], 8), "测试台：背景不受效果影响");
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/effects-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/effects-in-bench.jpg`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("T", "T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）", err); }
   section("U. 脚本面板端到端（预检 → 应用 → 运行期错误回显 → 撤销 → 存库 → 测试台）");
-  const scSel = (target) => `.ed-script[data-target="${target}"]`;
-  const scType = async (target, src) => {
+  if (hlState.dead) hlSkip("U", "U. 脚本面板端到端（预检 → 应用 → 运行期错误回显 → 撤销 → 存库 → 测试台）"); else try {
+  var scSel = (target) => `.ed-script[data-target="${target}"]`;
+  var scType = async (target, src) => {
     await ev(`(() => { const ta = document.querySelector('${scSel(target)} .ed-script-src'); ta.value = ${JSON.stringify(src)}; ta.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
     await new Promise((r) => setTimeout(r, 300));
   };
-  const scStatus = (target) => ev(`(() => { const s = document.querySelector('${scSel(target)} .ed-script-status'); return { cls: s.className, text: s.textContent }; })()`);
-  const scApply = async (target) => {
+  var scStatus = (target) => ev(`(() => { const s = document.querySelector('${scSel(target)} .ed-script-status'); return { cls: s.className, text: s.textContent }; })()`);
+  var scApply = async (target) => {
     const r0 = await h.readyCount();
     await ev(`(() => { document.querySelector('${scSel(target)} .ed-script-apply').click(); return true; })()`);
     await h.waitRemount(r0);
   };
-  const BGU = [0x20, 0x20, 0x20];
+  var BGU = [0x20, 0x20, 0x20];
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
   await gotoEditor();
   await newBlank("#202020");
   await addImage(stripePath);
-  const crU = await h.canvasRect();
-  const uTop = worldToPage(crU, [1110, 590]);
+  var crU = await h.canvasRect();
+  var uTop = worldToPage(crU, [1110, 590]);
   check(await ev(`!!document.querySelector('.ed-scripts') && document.querySelectorAll('.ed-script').length === 0 && !document.querySelector('#script-add').disabled`), "检视器有「脚本」分组，图片层初始无脚本、可添加");
   check((await ev(`[...document.querySelectorAll('#script-add option')].map((o) => o.value).filter(Boolean)`)).join() === "origin,scale,angles,visible,alpha,color,brightness", "图片层可加脚本的字段列表");
 
   await fxAct(`const s = document.querySelector('#script-add'); s.value = 'alpha'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
   check(await ev(`!!document.querySelector('${scSel("alpha")}') && /export function update\\(value\\)/.test(document.querySelector('${scSel("alpha")} .ed-script-src').value)`), "添加 alpha 脚本：出现编辑框，内容为 update(value) 模板");
-  let st = await scStatus("alpha");
+  var st = await scStatus("alpha");
   check(/ok/.test(st.cls) && /update/.test(st.text) && (await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), `模板预检通过、未改动时「应用」不可点（${st.text}）`);
   check(isRed(await pixelAt(uTop)), "模板原样返回 value：画面不变");
 
@@ -1256,7 +1294,7 @@ async function runCreateAndDraft(ctx) {
   await scType("alpha", "export function update(value) {\n\tconst o = null;\n\treturn o.x;\n}\n");
   await scApply("alpha");
   await waitFor(`!document.querySelector('${scSel("alpha")} .ed-script-issues').hidden`, 10000);
-  const issueText = await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').textContent`);
+  var issueText = await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').textContent`);
   check(/\[update\]/.test(issueText) && /第 3 行|line 3/.test(issueText) && /×\d+/.test(issueText), `运行期错误回显在该挂点下：阶段 / 源码行 / 次数（${issueText.split("\n")[0]}）`);
   check(isRed(await pixelAt(uTop)), "脚本出错时字段保持快照值（图层照常显示）");
   check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("alpha' 失败"), "诊断流（控制台）同时有文案");
@@ -1280,16 +1318,16 @@ async function runCreateAndDraft(ctx) {
   await waitFor(`!!document.querySelector('${scSel("alpha")}')`, 10000);
   check(/return 0\.5;/.test(await ev(`document.querySelector('${scSel("alpha")} .ed-script-src').value`)) && !(await ev(`document.querySelector('${scSel("alpha")} .ed-script-apply').disabled`)), "未应用的改动：切换选中再回来仍在，「应用」可点");
   await scApply("alpha");
-  const half = await pixelAt(uTop);
-  const halfWant = RED.map((c, i) => Math.round(c * 0.5 + BGU[i] * 0.5));
+  var half = await pixelAt(uTop);
+  var halfWant = RED.map((c, i) => Math.round(c * 0.5 + BGU[i] * 0.5));
   check(close(half, halfWant, 14), `return 0.5：半透明叠在背景上（期望 ≈${halfWant}，实得 ${half}）`);
   check(await ev(`document.querySelector('${scSel("alpha")} .ed-script-issues').hidden`), "重挂后旧错误清空（登记表随装配重建）");
 
-  const savedU = [await saveLoose()];
-  const sceneU = JSON.parse(fs.readFileSync(path.join(lib, savedU[0], "scene.json"), "utf8"));
-  const alphaU = sceneU.objects.find((o) => o.name === "stripe")?.alpha;
+  var savedU = [await saveLoose()];
+  var sceneU = JSON.parse(fs.readFileSync(path.join(lib, savedU[0], "scene.json"), "utf8"));
+  var alphaU = sceneU.objects.find((o) => o.name === "stripe")?.alpha;
   check(alphaU && /return 0\.5;/.test(alphaU.script) && alphaU.value === 1, `盘上 scene.json：alpha 包装为 {script, value: 1}（${JSON.stringify(alphaU)?.slice(0, 60)}）`);
-  const errsU = (await h.errorLines()).filter((l) => !/alpha' 失败/.test(l));
+  var errsU = (await h.errorLines()).filter((l) => !/alpha' 失败/.test(l));
   check(errsU.length === 0, `脚本流程除故意制造的错误外无错误${errsU.length ? `：${errsU.slice(0, 2).join(" / ")}` : ""}`);
 
   await cdp.send("Page.navigate", {
@@ -1297,16 +1335,18 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpU = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const bHalf = await pixelAt(worldToPage({ x: 0, y: 0, w: vpU.w, h: vpU.h }, [1110, 590]));
+  var vpU = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var bHalf = await pixelAt(worldToPage({ x: 0, y: 0, w: vpU.w, h: vpU.h }, [1110, 590]));
   check(close(bHalf, half, 12), `测试台：脚本照样运行，出帧与编辑器一致（测试台 ${bHalf} / 编辑器 ${half}）`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("U", "U. 脚本面板端到端（预检 → 应用 → 运行期错误回显 → 撤销 → 存库 → 测试台）", err); }
   section("V. 用户属性端到端（声明 → 绑定 → 拖值热更 → 撤销 → combo 显隐 → 删除解绑 → 存库 → 测试台）");
-  const BGV = [0x20, 0x20, 0x20];
-  const settle = () => new Promise((r) => setTimeout(r, 400));
-  const ctl = (name) => `.ed-prop[data-prop="${name}"] .ed-fx-param [data-prop="${name}"]`;
-  const upDeclare = async (name, type) => {
+  if (hlState.dead) hlSkip("V", "V. 用户属性端到端（声明 → 绑定 → 拖值热更 → 撤销 → combo 显隐 → 删除解绑 → 存库 → 测试台）"); else try {
+  var BGV = [0x20, 0x20, 0x20];
+  var settle = () => new Promise((r) => setTimeout(r, 400));
+  var ctl = (name) => `.ed-prop[data-prop="${name}"] .ed-fx-param [data-prop="${name}"]`;
+  var upDeclare = async (name, type) => {
     await ev(`(() => {
       const n = document.querySelector('#up-name'); n.value = '${name}'; n.dispatchEvent(new Event('input', { bubbles: true }));
       document.querySelector('#up-type').value = '${type}';
@@ -1314,33 +1354,33 @@ async function runCreateAndDraft(ctx) {
     await waitFor(`!!document.querySelector('.ed-prop[data-prop="${name}"]')`, 10000);
     await settle();
   };
-  const upFire = (name, value, type) =>
+  var upFire = (name, value, type) =>
     ev(`(() => { const el = document.querySelector('${ctl(name)}'); el.value = '${value}'; el.dispatchEvent(new Event('${type}', { bubbles: true })); return true; })()`);
-  const deselect = async (cr) => {
+  var deselect = async (cr) => {
     await click(worldToPage(cr, [300, 540]));
     await waitFor(`!!document.querySelector('.ed-props')`, 10000);
   };
-  const bindSel = async (field, value) => {
+  var bindSel = async (field, value) => {
     const r0 = await h.readyCount();
     await ev(`(() => { const s = document.querySelector('.ed-bindings select[data-bind="${field}"]'); s.value = '${value}'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
     await h.waitRemount(r0);
   };
-  const mix = (a, k) => RED.map((c, i) => Math.round(c * k + BGV[i] * (1 - k)));
+  var mix = (a, k) => RED.map((c, i) => Math.round(c * k + BGV[i] * (1 - k)));
 
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
   await gotoEditor();
   await newBlank("#202020");
   await addImage(stripePath);
-  const crV = await h.canvasRect();
-  const vTop = worldToPage(crV, [1110, 590]);
+  var crV = await h.canvasRect();
+  var vTop = worldToPage(crV, [1110, 590]);
   check(await ev(`!!document.querySelector('.ed-bindings') && /用户属性|user properties/i.test(document.querySelector('.ed-bindings').textContent)`), "图层检视器有「属性绑定」分组，没有属性时提示先去场景级声明");
   await deselect(crV);
   check(await ev(`document.querySelector('#up-add').disabled && document.querySelectorAll('#up-type option').length === 5`), "不选图层：出现「用户属性」面板，五种类型，名字为空时「声明」不可点");
   await ev(`(() => { const n = document.querySelector('#up-name'); n.value = '1bad'; n.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
   check(await ev(`document.querySelector('#up-add').disabled`), "非标识符名字：「声明」不可点");
 
-  const rDecl = await h.readyCount();
+  var rDecl = await h.readyCount();
   await upDeclare("op", "slider");
   check((await h.readyCount()) === rDecl && (await h.dirtyTitle()), "声明 slider「op」：热更不重挂，带脏标记");
   check(await ev(`document.querySelector('${ctl("op")}').value === '0.5' && document.querySelector('.ed-prop[data-prop="op"] .ed-prop-range').value === '0 1 0.01'`), "新属性默认 0.5、范围 0 1 0.01");
@@ -1350,15 +1390,15 @@ async function runCreateAndDraft(ctx) {
   check((await ev(`[...document.querySelectorAll('.ed-bindings select')].map((s) => s.dataset.bind)`)).join() === "visible,alpha,brightness,scale,color", "图片层可绑字段：visible / alpha / brightness / scale / color");
   check((await ev(`[...document.querySelectorAll('.ed-bindings select[data-bind="alpha"] option')].map((o) => o.value)`)).join() === ",op" && (await ev(`[...document.querySelectorAll('.ed-bindings select[data-bind="color"] option')].length`)) === 1, "只列类型兼容的属性（alpha 可选 op，color 无可选）");
   await bindSel("alpha", "op");
-  const vHalf = await pixelAt(vTop);
+  var vHalf = await pixelAt(vTop);
   check(close(vHalf, mix(RED, 0.5), 14), `★ alpha 绑 op(0.5)：图层半透明（期望 ≈${mix(RED, 0.5)}，实得 ${vHalf}）`);
   check(await ev(`document.querySelector('.ed-bindings select[data-bind="alpha"]').value === 'op'`), "重挂后绑定下拉显示 op");
 
   await deselect(crV);
-  const rDrag = await h.readyCount();
+  var rDrag = await h.readyCount();
   await upFire("op", "0", "input");
   await settle();
-  const vPrev = await pixelAt(vTop);
+  var vPrev = await pixelAt(vTop);
   check(close(vPrev, BGV, 10), `★ 拖滑条到 0（input）：画面实时热更、图层隐去（实得 ${vPrev}）`);
   await upFire("op", "0", "change");
   await settle();
@@ -1378,33 +1418,33 @@ async function runCreateAndDraft(ctx) {
   await bindSel("visible", "mode=1");
   check(close(await pixelAt(vTop), BGV, 10), "visible 绑 mode=1、当前值 0：图层隐藏");
   await deselect(crV);
-  const rCombo = await h.readyCount();
+  var rCombo = await h.readyCount();
   await upFire("mode", "1", "change");
   await settle();
   check((await h.readyCount()) === rCombo && isRed(await pixelAt(vTop)), "★ combo 切到 1：图层显示（热更，不重挂）");
 
   await upFire("op", "0.3", "change");
   await settle();
-  const v03 = await pixelAt(vTop);
+  var v03 = await pixelAt(vTop);
   check(close(v03, mix(RED, 0.3), 14), `op = 0.3：图层 30% 不透明（实得 ${v03}）`);
-  const rDel = await h.readyCount();
+  var rDel = await h.readyCount();
   await ev(`(() => { document.querySelector('.ed-prop[data-prop="op"] .ed-prop-del').click(); return true; })()`);
   await h.waitRemount(rDel);
   check(!(await ev(`!!document.querySelector('.ed-prop[data-prop="op"]')`)) && isRed(await pixelAt(vTop)), "删除 op：alpha 解绑回快照 1，图层全不透明");
   await undoRedo(false);
   check(close(await pixelAt(vTop), mix(RED, 0.3), 14) && (await ev(`!!document.querySelector('.ed-prop[data-prop="op"]')`)), "撤销删除：属性与绑定一并回来");
   await undoRedo(true);
-  const editorV = await pixelAt(vTop);
+  var editorV = await pixelAt(vTop);
   check(isRed(editorV), "重做删除");
 
-  const savedV = [await saveLoose()];
-  const sceneV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "scene.json"), "utf8"));
-  const projV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "project.json"), "utf8"));
-  const stripeV = sceneV.objects.find((o) => o.name === "stripe");
+  var savedV = [await saveLoose()];
+  var sceneV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "scene.json"), "utf8"));
+  var projV = JSON.parse(fs.readFileSync(path.join(lib, savedV[0], "project.json"), "utf8"));
+  var stripeV = sceneV.objects.find((o) => o.name === "stripe");
   check(JSON.stringify(stripeV?.visible?.user) === JSON.stringify({ name: "mode", condition: "1" }) && typeof stripeV.alpha !== "object", `盘上 scene.json：visible 条件绑定保留，alpha 已解绑（${JSON.stringify({ visible: stripeV?.visible, alpha: stripeV?.alpha })}）`);
-  const propsV = projV.general?.properties ?? {};
+  var propsV = projV.general?.properties ?? {};
   check(propsV.mode?.type === "combo" && propsV.mode.value === "1" && !("op" in propsV), `盘上 project.json：general.properties 有 mode=1、无 op（${JSON.stringify(propsV).slice(0, 90)}）`);
-  const errsV = await h.errorLines();
+  var errsV = await h.errorLines();
   check(errsV.filter((l) => !/alpha' 失败/.test(l)).length === 0, `用户属性流程无错误${errsV.length ? `：${errsV.slice(0, 2).join(" / ")}` : ""}`);
 
   await cdp.send("Page.navigate", {
@@ -1412,33 +1452,35 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpV = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const bV = await pixelAt(worldToPage({ x: 0, y: 0, w: vpV.w, h: vpV.h }, [1110, 590]));
+  var vpV = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var bV = await pixelAt(worldToPage({ x: 0, y: 0, w: vpV.w, h: vpV.h }, [1110, 590]));
   check(close(bV, editorV, 12), `测试台：按存盘属性值出帧，与编辑器一致（测试台 ${bV} / 编辑器 ${editorV}）`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("V", "V. 用户属性端到端（声明 → 绑定 → 拖值热更 → 撤销 → combo 显隐 → 删除解绑 → 存库 → 测试台）", err); }
   section("W. 外来脚本拦截（W10 过渡：在线版默认不执行，逐文档放行）");
-  const firstFrame = `${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`;
-  const bannerOn = () => ev(`!document.querySelector('#ed-scripts-off').hidden`);
+  if (hlState.dead) hlSkip("W", "W. 外来脚本拦截（W10 过渡：在线版默认不执行，逐文档放行）"); else try {
+  var firstFrame = `${"/首帧就绪|First frame ready/"}.test(document.querySelector('#ed-con-body').textContent)`;
+  var bannerOn = () => ev(`!document.querySelector('#ed-scripts-off').hidden`);
   // U 段存进库的条目：stripe 的 alpha 脚本 `return 0.5`
   await reopen(savedU[0], "?scripts=off");
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(firstFrame, 90000);
   await settle();
-  const crW = await h.canvasRect();
-  const wTop = worldToPage(crW, [1110, 590]);
-  const blocked = await pixelAt(wTop);
+  var crW = await h.canvasRect();
+  var wTop = worldToPage(crW, [1110, 590]);
+  var blocked = await pixelAt(wTop);
   check(isRed(blocked), `?scripts=off 打开带脚本的库条目：脚本不执行，alpha 停在快照 1（实得 ${blocked}）`);
   // 拦截提示与诊断流是在首帧之后异步补上的：等一会儿再断言（超时就按当时的实际值报红）
   await waitFor(`!document.querySelector('#ed-scripts-off').hidden && /1/.test(document.querySelector('#ed-scripts-off-text').textContent)`, 8000).catch(() => {});
   check((await bannerOn()) && /1/.test(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)), `视口底部提示「已拦截 1 段脚本」并给「仍然执行」（实得「${(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)).trim()}」，提示${(await bannerOn()) ? "在" : "不在"}）`);
   await waitFor(`document.querySelector('#ed-con-body').textContent.includes('scripts disabled: skipped 1')`, 8000).catch(() => {});
   check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("scripts disabled: skipped 1"), `诊断流记一条拦截计数（实得 ${JSON.stringify((await ev(`document.querySelector('#ed-con-body').textContent`)).split("\n").filter((l) => /script/i.test(l)).slice(-2).join(" | "))}）`);
-  const rAllow = await h.readyCount();
+  var rAllow = await h.readyCount();
   await clickSel("#scripts-allow");
   await h.waitRemount(rAllow);
   await settle();
-  const allowed = await pixelAt(wTop);
+  var allowed = await pixelAt(wTop);
   check(close(allowed, half, 14) && !(await bannerOn()), `「仍然执行」：原地重挂，脚本生效（半透明 ${allowed}），提示收起`);
 
   await reopen(savedU[0]);
@@ -1456,13 +1498,15 @@ async function runCreateAndDraft(ctx) {
   await scType("alpha", "export function update(value) {\n\treturn 0;\n}\n");
   await scApply("alpha");
   await settle();
-  const crW2 = await h.canvasRect();
+  var crW2 = await h.canvasRect();
   check(close(await pixelAt(worldToPage(crW2, [1110, 590])), BGV, 10) && !(await bannerOn()), "安全模式下新建的工程：用户自己写的脚本照常执行");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("W", "W. 外来脚本拦截（W10 过渡：在线版默认不执行，逐文档放行）", err); }
   section("X. 导出 WE 原生 scene.pkg（空白 → 图片层 + 效果 → 勾选原生格式存库 → 测试台 / 重新打开出帧一致）");
-  const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
-  const { parseTex, decodeMip0 } = await imp("renderer/vendor/we-scene/pkg/texture.js");
+  if (hlState.dead) hlSkip("X", "X. 导出 WE 原生 scene.pkg（空白 → 图片层 + 效果 → 勾选原生格式存库 → 测试台 / 重新打开出帧一致）"); else try {
+  var { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
+  var { parseTex, decodeMip0 } = await imp("renderer/vendor/we-scene/pkg/texture.js");
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
   await gotoEditor();
@@ -1470,40 +1514,40 @@ async function runCreateAndDraft(ctx) {
   await addImage(stripePath);
   await fxAdd("tint");
   await settle();
-  const crX = await h.canvasRect();
-  const xTop = await pixelAt(worldToPage(crX, [1110, 590]));
-  const xBot = await pixelAt(worldToPage(crX, [1110, 490]));
+  var crX = await h.canvasRect();
+  var xTop = await pixelAt(worldToPage(crX, [1110, 590]));
+  var xBot = await pixelAt(worldToPage(crX, [1110, 490]));
   check(close(xTop, tintWant, 6), `编辑器：红色图层叠上缺省橙色 50%（期望 ${tintWant}，实得 ${xTop}）`);
 
-  const idX = await saveLoose();
-  const dirLoose = path.join(lib, idX);
+  var idX = await saveLoose();
+  var dirLoose = path.join(lib, idX);
   check(fs.existsSync(path.join(dirLoose, "scene.json")) && fs.existsSync(path.join(dirLoose, "materials/editor/stripe.png")) && !fs.existsSync(path.join(dirLoose, "scene.pkg")), "项目文件夹保持松散文件，不含 scene.pkg");
-  const pkgDl = await captureDownload(async () => {
+  var pkgDl = await captureDownload(async () => {
     await clickSel("#tb-pack");
     await clickSel("#export-pkg");
   });
   check(/-pkg\.zip$/.test(pkgDl.name), `打包导出是 zip 下载（${pkgDl.name}）`);
-  const pkgZip = path.join(tmpRoot, "e2e-pkg.zip");
+  var pkgZip = path.join(tmpRoot, "e2e-pkg.zip");
   fs.writeFileSync(pkgZip, Buffer.from(pkgDl.base64, "base64"));
-  const pkgOut = path.join(tmpRoot, "e2e-pkg-out");
+  var pkgOut = path.join(tmpRoot, "e2e-pkg-out");
   fs.rmSync(pkgOut, { recursive: true, force: true });
   fs.mkdirSync(pkgOut, { recursive: true });
-  const uzX = spawnSync("unzip", ["-o", pkgZip, "-d", pkgOut], { encoding: "utf8" });
+  var uzX = spawnSync("unzip", ["-o", pkgZip, "-d", pkgOut], { encoding: "utf8" });
   check(uzX.status === 0, "打包 zip 能解开");
-  const filesX = fs.readdirSync(pkgOut).filter((n) => !n.startsWith(".")).sort();
+  var filesX = fs.readdirSync(pkgOut).filter((n) => !n.startsWith(".")).sort();
   check(JSON.stringify(filesX) === JSON.stringify(["preview.jpg", "project.json", "scene.pkg"]), `压缩包内 = project.json + scene.pkg + 封面，无散装资源（${JSON.stringify(filesX)}）`);
-  const projX = JSON.parse(fs.readFileSync(path.join(pkgOut, "project.json"), "utf8"));
+  var projX = JSON.parse(fs.readFileSync(path.join(pkgOut, "project.json"), "utf8"));
   check(projX.file === "scene.json" && projX.type === "scene", "project.json：file 指包内 scene.json");
-  const pkX = parsePkg(new Uint8Array(fs.readFileSync(path.join(pkgOut, "scene.pkg"))));
-  const namesX = pkX.entries.map((e) => e.name);
+  var pkX = parsePkg(new Uint8Array(fs.readFileSync(path.join(pkgOut, "scene.pkg"))));
+  var namesX = pkX.entries.map((e) => e.name);
   check(namesX.includes("scene.json") && namesX.includes("materials/editor/stripe.tex") && !namesX.some((n) => /\.(png|jpe?g)$/i.test(n)) && namesX.includes("shaders/effects/wwgl_tint.frag"), `包内：入口 + .tex 贴图 + 效果四件，无源图（${namesX.length} 项）`);
-  const texX = decodeMip0(parseTex(getEntry(pkX, "materials/editor/stripe.tex")));
+  var texX = decodeMip0(parseTex(getEntry(pkX, "materials/editor/stripe.tex")));
   check(texX.png && Buffer.compare(Buffer.from(texX.png), fs.readFileSync(stripePath)) === 0 && texX.width === 400 && texX.height === 200, ".tex 内嵌的就是拖进来的 PNG 原字节（400×200，零重编码）");
   check(/已打包 scene\.pkg|Packed scene\.pkg/.test(await ev(`document.querySelector('#ed-con-body').textContent`)), "控制台记一条打包摘要");
-  const errsX = await h.errorLines();
+  var errsX = await h.errorLines();
   check(errsX.length === 0, `导出全程无错误${errsX.length ? `：${errsX.slice(0, 2).join(" / ")}` : ""}`);
 
-  const playId = "editor-e2e-pkgplay";
+  var playId = "editor-e2e-pkgplay";
   fs.rmSync(path.join(lib, playId), { recursive: true, force: true });
   fs.cpSync(pkgOut, path.join(lib, playId), { recursive: true });
   await cdp.send("Page.navigate", {
@@ -1511,10 +1555,10 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 1`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpX = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const benchX = { x: 0, y: 0, w: vpX.w, h: vpX.h };
-  const bTopX = await pixelAt(worldToPage(benchX, [1110, 590]));
-  const bBotX = await pixelAt(worldToPage(benchX, [1110, 490]));
+  var vpX = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var benchX = { x: 0, y: 0, w: vpX.w, h: vpX.h };
+  var bTopX = await pixelAt(worldToPage(benchX, [1110, 590]));
+  var bBotX = await pixelAt(worldToPage(benchX, [1110, 490]));
   check(close(bTopX, xTop, 12) && close(bBotX, xBot, 12), `★ 测试台按 scene.pkg 出帧，与编辑器一致（测试台 ${bTopX} / ${bBotX}，编辑器 ${xTop} / ${xBot}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/pkg-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/pkg-in-bench.jpg`);
@@ -1528,9 +1572,11 @@ async function runCreateAndDraft(ctx) {
   check(close(await pixelAt(worldToPage(await h.canvasRect(), [1110, 590])), xTop, 12), "编辑器重新打开导出的包条目：画面一致");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("X", "X. 导出 WE 原生 scene.pkg（空白 → 图片层 + 效果 → 勾选原生格式存库 → 测试台 / 重新打开出帧一致）", err); }
   section("Y. 文字层端到端（空白 → 文字 / 时钟层 → 改内容 / 字号 / 颜色 / 导入字体 → 撤销 → 存库 → 测试台出帧一致）");
+  if (hlState.dead) hlSkip("Y", "Y. 文字层端到端（空白 → 文字 / 时钟层 → 改内容 / 字号 / 颜色 / 导入字体 → 撤销 → 存库 → 测试台出帧一致）"); else try {
   /** 页面矩形内的墨水：亮像素占比 + 亮像素平均色（黑底） */
-  const inkIn = async ([x0, y0], [x1, y1], thr = 200) => {
+  var inkIn = async ([x0, y0], [x1, y1], thr = 200) => {
     const clip = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.max(2, Math.abs(x1 - x0)), height: Math.max(2, Math.abs(y1 - y0)), scale: 1 };
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip });
     return ev(`(async () => {
@@ -1541,20 +1587,20 @@ async function runCreateAndDraft(ctx) {
       return { frac: n / (d.length / 4), color: n ? s.map((v) => Math.round(v / n)) : [0, 0, 0] };
     })()`);
   };
-  const worldBox = (cr, [cx, cy], [hw, hh]) => [worldToPage(cr, [cx - hw, cy + hh]), worldToPage(cr, [cx + hw, cy - hh])];
-  const rawObj = () => ev(`JSON.parse(document.querySelector('.ed-insp-raw').textContent)`);
-  const textAct = (js) => fxAct(js);
-  const setText = (name, value) =>
+  var worldBox = (cr, [cx, cy], [hw, hh]) => [worldToPage(cr, [cx - hw, cy + hh]), worldToPage(cr, [cx + hw, cy - hh])];
+  var rawObj = () => ev(`JSON.parse(document.querySelector('.ed-insp-raw').textContent)`);
+  var textAct = (js) => fxAct(js);
+  var setText = (name, value) =>
     textAct(`const el = document.querySelector('.ed-text [data-text="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const addTextPreset = async (preset) => {
+  var addTextPreset = async (preset) => {
     const r0 = await h.readyCount();
     await clickSel("#ly-add-text");
     await clickSel(`#text-menu button[data-preset="${preset}"]`);
     await h.waitRemount(r0);
   };
   /** 页面里按引擎同一字体栈量宽度（Arial 系统字体） */
-  const arialWidth = (s, px) => ev(`(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '${px}px Arial, \\'Helvetica Neue\\', sans-serif, sans-serif'; return c.measureText(${JSON.stringify(s)}).width; })()`);
-  const sizeOf = (o) => String(o.size).split(/\s+/).map(Number);
+  var arialWidth = (s, px) => ev(`(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '${px}px Arial, \\'Helvetica Neue\\', sans-serif, sans-serif'; return c.measureText(${JSON.stringify(s)}).width; })()`);
+  var sizeOf = (o) => String(o.size).split(/\s+/).map(Number);
 
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
@@ -1568,23 +1614,23 @@ async function runCreateAndDraft(ctx) {
   check(await ev(`document.querySelector('#text-menu').hidden`), "再点收起");
 
   await addTextPreset("plain");
-  const plainName = (await h.treeNames())[0];
+  var plainName = (await h.treeNames())[0];
   check((await h.treeNames()).length === 1 && (await h.selectedName()) === plainName && /文字|Text/.test(plainName), `添加文字层：树里一层「${plainName}」并选中`);
   check(await ev(`!!document.querySelector('.ed-text') && !document.querySelector('.ed-text [data-text="content"]').readOnly`), "检视器有「文字」分组，内容可编辑");
   check(await ev(`document.querySelector('.ed-text [data-text="font"]').value === 'systemfont_arial' && document.querySelector('.ed-text [data-text="size"]').value === '32'`), "缺省字体 Arial、字号 32");
 
   await setText("content", "MMM");
-  let o = await rawObj();
-  const wantW = await arialWidth("MMM", 128);
+  var o = await rawObj();
+  var wantW = await arialWidth("MMM", 128);
   check(o.text === "MMM" && Math.abs(sizeOf(o)[0] - wantW) < 0.01 && Math.abs(sizeOf(o)[1] - 153.6) < 0.01, `改内容后盒按页面实测宽度回填（size ${o.size}，Arial 实测 ${wantW.toFixed(3)}）`);
   await setText("size", "60");
   o = await rawObj();
   check(o.pointsize === 60 && Math.abs(sizeOf(o)[1] - 288) < 0.01 && Math.abs(sizeOf(o)[0] - (await arialWidth("MMM", 240))) < 0.01, `改字号 60：盒跟着重量（${o.size}）`);
   await h.setInputs({ 0: 960, 1: 800 });
   await settle();
-  const crY = await h.canvasRect();
-  const boxW = sizeOf(o)[0] / 2;
-  let ink = await inkIn(...worldBox(crY, [960, 800], [boxW, 110]));
+  var crY = await h.canvasRect();
+  var boxW = sizeOf(o)[0] / 2;
+  var ink = await inkIn(...worldBox(crY, [960, 800], [boxW, 110]));
   check(ink.frac > 0.12 && ink.color.every((c) => c > 200), `画面真画出白色文字（墨水占比 ${ink.frac.toFixed(3)}，色 ${ink.color}）`);
   check((await inkIn(...worldBox(crY, [960, 540], [boxW, 110]))).frac < 0.01, "挪到 y=800 后原位置没有残影");
 
@@ -1598,7 +1644,7 @@ async function runCreateAndDraft(ctx) {
   check(o.horizontalalign === "right" && (await ev(`document.querySelector('.ed-text [data-text="halign"]').value`)) === "right", "水平对齐改右：文档与控件一致");
   await setText("halign", "center");
 
-  const fontPath = "/System/Library/Fonts/Supplemental/Arial Black.ttf";
+  var fontPath = "/System/Library/Fonts/Supplemental/Arial Black.ttf";
   if (fs.existsSync(fontPath)) {
     const wBefore = sizeOf(await rawObj())[0];
     const r0 = await h.readyCount();
@@ -1615,15 +1661,15 @@ async function runCreateAndDraft(ctx) {
   }
 
   await addTextPreset("clock");
-  const names = await h.treeNames();
+  var names = await h.treeNames();
   check(names.length === 2 && /时钟|Clock/.test(names[1]) && (await h.selectedName()) === names[1], `添加时钟层：第二层「${names[1]}」并选中`);
   check(await ev(`document.querySelector('.ed-text [data-text="content"]').readOnly && !!document.querySelector('.ed-script[data-target="text"]')`), "时钟内容只读，脚本分组里有 text 脚本");
   await settle();
-  const clockInk = await inkIn(...worldBox(crY, [960, 540], [300, 70]));
+  var clockInk = await inkIn(...worldBox(crY, [960, 540], [300, 70]));
   check(clockInk.frac > 0.05, `时钟在画面中心画出时间（墨水占比 ${clockInk.frac.toFixed(3)}）`);
   check(await ev(`(() => { const L = document.querySelector('#ed-con-body').textContent; return !/脚本.*错误|script.*error/i.test(L); })()`), "时钟脚本运行无错误");
 
-  let r1 = await h.readyCount();
+  var r1 = await h.readyCount();
   await key("z", MOD.meta);
   await h.waitRemount(r1);
   check((await h.treeNames()).length === 1, "撤销添加时钟：回到一层");
@@ -1632,25 +1678,25 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(r1);
   check((await h.treeNames()).length === 2, "重做：时钟回来");
 
-  const savedY = [await saveLoose()];
-  const dirY = path.join(lib, savedY[0]);
-  const sceneY = JSON.parse(fs.readFileSync(path.join(dirY, "scene.json"), "utf8"));
-  const [tPlain, tClock] = sceneY.objects;
-  const plainColor = String(tPlain.color).trim().split(/\s+/).map(Number);
+  var savedY = [await saveLoose()];
+  var dirY = path.join(lib, savedY[0]);
+  var sceneY = JSON.parse(fs.readFileSync(path.join(dirY, "scene.json"), "utf8"));
+  var [tPlain, tClock] = sceneY.objects;
+  var plainColor = String(tPlain.color).trim().split(/\s+/).map(Number);
   check(sceneY.objects.length === 2 && tPlain.text === "MMM" && tPlain.pointsize === 60 && close(plainColor, [1, 0, 0], 1e-3), `盘上 scene.json：文字层内容 / 字号 / 颜色（${JSON.stringify({ text: tPlain.text, pointsize: tPlain.pointsize, color: tPlain.color })}）`);
   check(typeof tClock.text === "object" && /getHours/.test(tClock.text.script) && tClock.text.scriptproperties?.use24h === true, "盘上时钟层：{ script, scriptproperties, value } 原样");
   if (fs.existsSync(fontPath)) {
     check(fs.existsSync(path.join(dirY, "fonts/arial-black.ttf")) && Buffer.compare(fs.readFileSync(path.join(dirY, "fonts/arial-black.ttf")), fs.readFileSync(fontPath)) === 0, "盘上字体文件逐字节原样");
   }
-  const errsY = await h.errorLines();
+  var errsY = await h.errorLines();
   check(errsY.length === 0, `文字层编辑全程无错误${errsY.length ? `：${errsY.slice(0, 2).join(" / ")}` : ""}`);
 
   await reopen(savedY[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
   await waitFor(firstFrame, 90000);
   await new Promise((r) => setTimeout(r, 800));
-  const crY2 = await h.canvasRect();
-  const edPlain = await inkIn(...worldBox(crY2, [960, 800], [boxW * 1.4, 110]));
+  var crY2 = await h.canvasRect();
+  var edPlain = await inkIn(...worldBox(crY2, [960, 800], [boxW * 1.4, 110]));
   check(edPlain.frac > 0.12 && edPlain.color[0] > 200 && edPlain.color[1] < 60, `编辑器重新打开：红字在原位（${edPlain.frac.toFixed(3)} / ${edPlain.color}）`);
 
   await cdp.send("Page.navigate", {
@@ -1658,34 +1704,36 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpY = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const benchY = { x: 0, y: 0, w: vpY.w, h: vpY.h };
-  const bPlain = await inkIn(...worldBox(benchY, [960, 800], [boxW * 1.4, 110]));
-  const bClock = await inkIn(...worldBox(benchY, [960, 540], [300, 70]));
+  var vpY = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var benchY = { x: 0, y: 0, w: vpY.w, h: vpY.h };
+  var bPlain = await inkIn(...worldBox(benchY, [960, 800], [boxW * 1.4, 110]));
+  var bClock = await inkIn(...worldBox(benchY, [960, 540], [300, 70]));
   check(Math.abs(bPlain.frac - edPlain.frac) < 0.04 && close(bPlain.color, edPlain.color, 25), `★ 测试台文字出帧与编辑器一致（墨水 ${bPlain.frac.toFixed(3)} vs ${edPlain.frac.toFixed(3)}，色 ${bPlain.color} vs ${edPlain.color}）`);
   check(bClock.frac > 0.05, `★ 测试台时钟层画出时间（墨水占比 ${bClock.frac.toFixed(3)}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/text-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/text-in-bench.jpg`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("Y", "Y. 文字层端到端（空白 → 文字 / 时钟层 → 改内容 / 字号 / 颜色 / 导入字体 → 撤销 → 存库 → 测试台出帧一致）", err); }
   section("Z. 粒子层端到端（空白 → 雪 → 调数量 / 颜色 → 撤销 → 火花 → 存库 → 测试台出帧）");
-  const ptSet = (name, value) =>
+  if (hlState.dead) hlSkip("Z", "Z. 粒子层端到端（空白 → 雪 → 调数量 / 颜色 → 撤销 → 火花 → 存库 → 测试台出帧）"); else try {
+  var ptSet = (name, value) =>
     fxAct(`const el = document.querySelector('.ed-particle [data-particle="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const ptCheck = (name, on) =>
+  var ptCheck = (name, on) =>
     fxAct(`const el = document.querySelector('.ed-particle [data-particle="${name}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const addParticlePreset = async (preset) => {
+  var addParticlePreset = async (preset) => {
     const r0 = await h.readyCount();
     await clickSel("#ly-add-particle");
     await clickSel(`#particle-menu button[data-preset="${preset}"]`);
     await h.waitRemount(r0);
   };
   /** 整个画面的墨水（粒子随机，取全屏统计；halo 边缘很软，门槛放低） */
-  const fullInk = async (cr) => {
+  var fullInk = async (cr) => {
     await new Promise((r) => setTimeout(r, 900));
     return inkIn(...worldBox(cr, [960, 540], [956, 536]), 60);
   };
-  const whitish = (c) => Math.min(...c) > 40 && Math.max(...c) - Math.min(...c) < 25;
-  const reddish = (c) => c[0] > 80 && c[0] > 2 * c[1] && c[0] > 2 * c[2];
+  var whitish = (c) => Math.min(...c) > 40 && Math.max(...c) - Math.min(...c) < 25;
+  var reddish = (c) => c[0] > 80 && c[0] > 2 * c[1] && c[0] > 2 * c[2];
 
   await gotoEditor();
   check(await ev(`document.querySelector('#ly-add-particle').disabled`), "未打开场景时「添加粒子层」不可用");
@@ -1693,7 +1741,7 @@ async function runCreateAndDraft(ctx) {
   check(!(await ev(`document.querySelector('#ly-add-particle').disabled`)), "新建后「添加粒子层」可用");
   await clickSel("#ly-add-particle");
   // examples/plugins/particle-fireflies 会多贡献一个预设 ⇒ 断言四个内置预设都在，不锁死总数。
-  const presetVals = await ev(`[...document.querySelectorAll('#particle-menu button[data-preset]')].map((b) => b.dataset.preset)`);
+  var presetVals = await ev(`[...document.querySelectorAll('#particle-menu button[data-preset]')].map((b) => b.dataset.preset)`);
   check(
     (await ev(`!document.querySelector('#particle-menu').hidden`)) && BUILTIN_PRESETS.every((p) => presetVals.includes(p)),
     `点开粒子菜单：雪 / 雨 / 火花 / 光点四项（实得 ${presetVals.length} 项：${presetVals.join(",")}）`,
@@ -1703,25 +1751,25 @@ async function runCreateAndDraft(ctx) {
   await clickSel("#ly-add-text");
 
   await addParticlePreset("snow");
-  const snowName = (await h.treeNames())[0];
+  var snowName = (await h.treeNames())[0];
   check((await h.treeNames()).length === 1 && (await h.selectedName()) === snowName && /雪|Snow/.test(snowName), `添加雪：树里一层「${snowName}」并选中`);
   check(await ev(`document.querySelectorAll('.ed-particle input[type=range][data-particle]').length === 6 && !!document.querySelector('.ed-particle [data-particle="color"]')`), "检视器有「粒子」分组：6 个倍率滑条 + 颜色");
   check(await ev(`!document.querySelector('.ed-particle [data-particle="colorOn"]').checked && document.querySelector('.ed-particle [data-particle="color"]').disabled`), "缺省不覆盖颜色（颜色框灰掉）");
-  let po = await rawObj();
+  var po = await rawObj();
   check(po.particle === "particles/editor/snow.json" && po.instanceoverride?.count === 1, "文档：particle 指向 particles/editor/snow.json，倍率初始 1");
-  const crZ = await h.canvasRect();
-  const snowInk = await fullInk(crZ);
+  var crZ = await h.canvasRect();
+  var snowInk = await fullInk(crZ);
   check(snowInk.frac > 0.002 && whitish(snowInk.color), `画面真画出白色雪花（墨水占比 ${snowInk.frac.toFixed(4)}，色 ${snowInk.color}）`);
 
   await ptSet("count", "0");
   po = await rawObj();
-  const noneInk = await fullInk(crZ);
+  var noneInk = await fullInk(crZ);
   check(po.instanceoverride.count === 0 && noneInk.frac < snowInk.frac * 0.2, `数量拖到 0：instanceoverride.count = 0，画面几乎没有雪（${noneInk.frac.toFixed(4)}）`);
-  let rz = await h.readyCount();
+  var rz = await h.readyCount();
   await key("z", MOD.meta);
   await h.waitRemount(rz);
   po = await rawObj();
-  const backInk = await fullInk(crZ);
+  var backInk = await fullInk(crZ);
   check(po.instanceoverride.count === 1 && backInk.frac > snowInk.frac * 0.5, `撤销：数量回到 1，雪回来（${backInk.frac.toFixed(4)}）`);
 
   await ptSet("size", "3");
@@ -1730,21 +1778,21 @@ async function runCreateAndDraft(ctx) {
   po = await rawObj();
   check(po.instanceoverride.size === 3 && po.instanceoverride.colorn === "1.000 0.000 0.000", `大小 3 + 颜色覆盖红：instanceoverride ${JSON.stringify(po.instanceoverride)}`);
   check(await ev(`document.querySelector('.ed-particle [data-particle="colorOn"]').checked && document.querySelector('.ed-particle [data-particle="color"]').value === '#ff0000'`), "检视器重绘后控件与文档一致");
-  const redInk = await fullInk(crZ);
+  var redInk = await fullInk(crZ);
   check(redInk.frac > snowInk.frac * 1.5 && reddish(redInk.color), `画面：雪花变大变红（墨水 ${redInk.frac.toFixed(4)}，色 ${redInk.color}）`);
 
   await addParticlePreset("embers");
-  const namesZ = await h.treeNames();
+  var namesZ = await h.treeNames();
   check(namesZ.length === 2 && /火花|Embers/.test(namesZ[1]), `添加火花：第二层「${namesZ[1]}」`);
-  const errsZ = await h.errorLines();
+  var errsZ = await h.errorLines();
   check(errsZ.length === 0, `粒子层编辑全程无错误${errsZ.length ? `：${errsZ.slice(0, 2).join(" / ")}` : ""}`);
 
-  const savedZ = [await saveLoose()];
-  const dirZ = path.join(lib, savedZ[0]);
-  const sceneZ = JSON.parse(fs.readFileSync(path.join(dirZ, "scene.json"), "utf8"));
-  const [zSnow, zEmbers] = sceneZ.objects;
+  var savedZ = [await saveLoose()];
+  var dirZ = path.join(lib, savedZ[0]);
+  var sceneZ = JSON.parse(fs.readFileSync(path.join(dirZ, "scene.json"), "utf8"));
+  var [zSnow, zEmbers] = sceneZ.objects;
   check(sceneZ.objects.length === 2 && zSnow.instanceoverride?.colorn === "1.000 0.000 0.000" && zSnow.instanceoverride?.size === 3 && zEmbers.particle === "particles/editor/embers.json", "盘上 scene.json：雪的调参与火花层");
-  const onDisk = ["particles/editor/snow.json", "materials/editor/particles/snow.json", "particles/editor/embers.json", "materials/editor/particles/embers.json"];
+  var onDisk = ["particles/editor/snow.json", "materials/editor/particles/snow.json", "particles/editor/embers.json", "materials/editor/particles/embers.json"];
   check(onDisk.every((f) => fs.existsSync(path.join(dirZ, f))), "盘上两层各自的粒子 / 材质文件都在");
   check(JSON.parse(fs.readFileSync(path.join(dirZ, "materials/editor/particles/embers.json"), "utf8")).passes[0].textures[0] === "particle/halo" && !fs.existsSync(path.join(dirZ, "materials/particle")), "材质只引用内置名，没有拷贝贴图文件");
 
@@ -1753,15 +1801,17 @@ async function runCreateAndDraft(ctx) {
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.length === 2`, 90000);
   await new Promise((r) => setTimeout(r, 1500));
-  const vpZ = await ev(`({ w: innerWidth, h: innerHeight })`);
-  const benchZ = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 540], [956, 536]), 60);
-  const top = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 800], [956, 270]), 60);
+  var vpZ = await ev(`({ w: innerWidth, h: innerHeight })`);
+  var benchZ = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 540], [956, 536]), 60);
+  var top = await inkIn(...worldBox({ x: 0, y: 0, w: vpZ.w, h: vpZ.h }, [960, 800], [956, 270]), 60);
   check(benchZ.frac > snowInk.frac && top.color[0] > 80 && top.color[0] > top.color[2] + 30, `★ 测试台出帧：红色大雪花 + 火花（墨水 ${benchZ.frac.toFixed(4)}，上半屏色 ${top.color}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/particles-in-bench.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/particles-in-bench.jpg`);
 
+  } catch (err) { await hlAbort("Z", "Z. 粒子层端到端（空白 → 雪 → 调数量 / 颜色 → 撤销 → 火花 → 存库 → 测试台出帧）", err); }
   section("AA. 声音层端到端（空白 → 导入 WAV → 试听 → 音量 / 模式 / 开始静音 → 撤销 → 替换 → 存库 → 测试台装上音频）");
-  const wavBytes = (sec, freq, rate = 8000) => {
+  if (hlState.dead) hlSkip("AA", "AA. 声音层端到端（空白 → 导入 WAV → 试听 → 音量 / 模式 / 开始静音 → 撤销 → 替换 → 存库 → 测试台装上音频）"); else try {
+  var wavBytes = (sec, freq, rate = 8000) => {
     const n = Math.round(sec * rate);
     const b = Buffer.alloc(44 + n * 2);
     b.write("RIFF", 0); b.writeUInt32LE(36 + n * 2, 4); b.write("WAVE", 8); b.write("fmt ", 12);
@@ -1770,28 +1820,28 @@ async function runCreateAndDraft(ctx) {
     for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 8000), 44 + i * 2);
     return b;
   };
-  const rainWav = path.join(tmpRoot, "rain.wav");
-  const birdWav = path.join(tmpRoot, "bird.wav");
+  var rainWav = path.join(tmpRoot, "rain.wav");
+  var birdWav = path.join(tmpRoot, "bird.wav");
   fs.writeFileSync(rainWav, wavBytes(1.5, 330));
   fs.writeFileSync(birdWav, wavBytes(0.8, 880));
-  const sndSet = (name, value) =>
+  var sndSet = (name, value) =>
     fxAct(`const el = document.querySelector('.ed-sound [data-sound="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const sndCheck = (name, on) =>
+  var sndCheck = (name, on) =>
     fxAct(`const el = document.querySelector('.ed-sound [data-sound="${name}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const playing = () => ev(`document.querySelector('.ed-sound [data-sound="preview"]')?.dataset.playing`);
+  var playing = () => ev(`document.querySelector('.ed-sound [data-sound="preview"]')?.dataset.playing`);
 
   await gotoEditor();
   check(await ev(`document.querySelector('#ly-add-sound').disabled`), "未打开场景时「添加声音层」不可用");
   await newBlank("#000000");
   check(!(await ev(`document.querySelector('#ly-add-sound').disabled`)), "新建后「添加声音层」可用");
-  let rs = await h.readyCount();
+  var rs = await h.readyCount();
   await clickSel("#ly-add-sound");
   await setFiles("#in-sound", [rainWav]);
   await h.waitRemount(rs);
   check((await h.treeNames()).length === 1 && (await h.selectedName()) === "rain", `导入 rain.wav：树里一层「${await h.selectedName()}」并选中`);
   check(await ev(`!!document.querySelector('.ed-sound') && document.querySelector('.ed-sound [data-sound="playbackmode"]').value === 'loop' && document.querySelector('.ed-sound [data-sound="volume"]').value === '1' && !document.querySelector('.ed-sound [data-sound="startsilent"]').checked && document.querySelector('.ed-snd-file').textContent === 'rain.wav'`), "检视器有「声音」分组：文件名、循环、音量 1、不静音开始");
   check(await ev(`!!document.querySelector('.ed-bindings')`), "声音层也有「属性绑定」分组（音量可绑用户滑条，离线单测覆盖绑定本身）");
-  let so = await rawObj();
+  var so = await rawObj();
   check(so.sound?.[0] === "sounds/rain.wav" && so.playbackmode === "loop" && so.volume === 1 && so.startsilent === false, `文档：${JSON.stringify({ sound: so.sound, playbackmode: so.playbackmode, volume: so.volume })}`);
 
   await clickSel('.ed-sound [data-sound="preview"]');
@@ -1824,15 +1874,15 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(rs);
   so = await rawObj();
   check((await h.treeNames()).length === 1 && so.sound?.[0] === "sounds/bird.wav" && so.volume === 0.5, `替换音频：仍一层，sound → ${so.sound?.[0]}，音量保留`);
-  const errsAA = await h.errorLines();
+  var errsAA = await h.errorLines();
   check(errsAA.length === 0, `声音层编辑全程无错误${errsAA.length ? `：${errsAA.slice(0, 2).join(" / ")}` : ""}`);
 
-  const savedAA = [await saveLoose()];
-  const dirAA = path.join(lib, savedAA[0]);
-  const sceneAA = JSON.parse(fs.readFileSync(path.join(dirAA, "scene.json"), "utf8"));
-  const sAA = sceneAA.objects[0];
+  var savedAA = [await saveLoose()];
+  var dirAA = path.join(lib, savedAA[0]);
+  var sceneAA = JSON.parse(fs.readFileSync(path.join(dirAA, "scene.json"), "utf8"));
+  var sAA = sceneAA.objects[0];
   check(sceneAA.objects.length === 1 && sAA.sound?.[0] === "sounds/bird.wav" && sAA.volume === 0.5 && sAA.playbackmode === "loop" && sAA.startsilent === true, "盘上 scene.json：声音层字段齐全");
-  const birdOnDisk = path.join(dirAA, "sounds/bird.wav");
+  var birdOnDisk = path.join(dirAA, "sounds/bird.wav");
   check(fs.existsSync(birdOnDisk) && Buffer.compare(fs.readFileSync(birdOnDisk), fs.readFileSync(birdWav)) === 0, "盘上 sounds/bird.wav 与导入的原文件逐字节相同");
   check(!fs.existsSync(path.join(dirAA, "sounds/rain.wav")), "被替换掉的 rain.wav 不再引用，不写盘");
 
@@ -1840,10 +1890,10 @@ async function runCreateAndDraft(ctx) {
     url: `${origin}/renderer/index.html?type=scene&src=${savedAA[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.some((l) => l.soundCtl)`, 90000);
-  const benchAA = await ev(`(() => { const l = window.__sceneLayers.find((x) => x.soundCtl); return { vol: l.soundCtl.getVolume(), playing: l.soundCtl.isPlaying(), mode: l.soundprops?.playbackmode, silent: !!l.soundprops?.startsilent }; })()`);
+  var benchAA = await ev(`(() => { const l = window.__sceneLayers.find((x) => x.soundCtl); return { vol: l.soundCtl.getVolume(), playing: l.soundCtl.isPlaying(), mode: l.soundprops?.playbackmode, silent: !!l.soundprops?.startsilent }; })()`);
   check(Math.abs(benchAA.vol - 0.5) < 1e-6 && benchAA.mode === "loop" && benchAA.silent && !benchAA.playing, `★ 测试台装上声音层：音量 ${benchAA.vol}、模式 ${benchAA.mode}、开始静音 → 未自动播放`);
   await click([20, 20]);
-  const auAA = await ev(`(async () => {
+  var auAA = await ev(`(async () => {
     const orig = HTMLMediaElement.prototype.play;
     let el = null, res = null;
     HTMLMediaElement.prototype.play = function () { el = this; const p = orig.call(this); p.then(() => (res = 'ok'), (e) => (res = e.name)); return p; };
@@ -1854,26 +1904,28 @@ async function runCreateAndDraft(ctx) {
   })()`);
   check(auAA.res === "ok" && auAA.playing && auAA.rs >= 2 && Math.abs(auAA.dur - 0.8) < 0.05 && auAA.loop, `★ 脚本侧 play() 后真的在播：解码出 ${auAA.dur?.toFixed(2)}s（bird.wav），循环 ${auAA.loop}，结果 ${auAA.res}`);
 
+  } catch (err) { await hlAbort("AA", "AA. 声音层端到端（空白 → 导入 WAV → 试听 → 音量 / 模式 / 开始静音 → 撤销 → 替换 → 存库 → 测试台装上音频）", err); }
   section("AB. 关键帧动画端到端（文字层 → 开位置动画 → 2s 处改 x 自动落关键帧 → 跳关键帧 → 1s 处拖拽 → 撤销 → 删帧 / 模式 / 时长 / 插值 → 存库 → 测试台在动）");
-  const animOn = (f, on) =>
+  if (hlState.dead) hlSkip("AB", "AB. 关键帧动画端到端（文字层 → 开位置动画 → 2s 处改 x 自动落关键帧 → 跳关键帧 → 1s 处拖拽 → 撤销 → 删帧 / 模式 / 时长 / 插值 → 存库 → 测试台在动）"); else try {
+  var animOn = (f, on) =>
     fxAct(`const el = document.querySelector('.ed-anim [data-anim-on="${f}"]'); el.checked = ${on}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const animSet = (attr, f, value) =>
+  var animSet = (attr, f, value) =>
     fxAct(`const el = document.querySelector('.ed-anim [data-anim-${attr}="${f}"]'); ${typeof value === "boolean" ? `el.checked = ${value}` : `el.value = ${JSON.stringify(value)}`}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  const seekTo = async (t) => {
+  var seekTo = async (t) => {
     await ev(`(() => { const r = document.querySelector('#tl-range'); r.value = '${t}'; r.dispatchEvent(new Event('input', { bubbles: true })); r.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
     await settle();
   };
-  const json = JSON.stringify;
-  const keysOf = (o, c = 0) => o.origin.animation[`c${c}`].map((k) => [k.frame, Math.round(k.value * 100) / 100]);
+  var json = JSON.stringify;
+  var keysOf = (o, c = 0) => o.origin.animation[`c${c}`].map((k) => [k.frame, Math.round(k.value * 100) / 100]);
 
   await gotoEditor();
   await newBlank("#000000");
   await addTextPreset("plain");
   await setText("content", "MMM");
   await setText("size", "60");
-  let ao = await rawObj();
-  const abW = sizeOf(ao)[0] / 2;
-  const origin0 = ao.origin;
+  var ao = await rawObj();
+  var abW = sizeOf(ao)[0] / 2;
+  var origin0 = ao.origin;
   // 开关集合就是 editor/keyframes.ts 的 ANIM_FIELDS（M4 起 brightness 也是可关键帧字段，共六个）
   check(await ev(`(() => { const on = [...document.querySelectorAll('.ed-anim [data-anim-on]')]; return on.length === 6 && on.map((c) => c.dataset.animOn).join() === 'origin,scale,angles,alpha,color,brightness' && on.every((c) => !c.checked); })()`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色 / 亮度六个开关，缺省全关");
   if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
@@ -1885,21 +1937,21 @@ async function runCreateAndDraft(ctx) {
   check(await ev(`!!document.querySelector('.ed-anim [data-anim-key="origin"]') && document.querySelectorAll('.ed-anim-keys[data-field="origin"] .ed-anim-key').length === 1`), "出现「◆ 关键帧」按钮与关键帧列表");
 
   await seekTo(2);
-  let ra = await h.readyCount();
+  var ra = await h.readyCount();
   await h.setInputs({ 0: 1260 });
   await h.waitRemount(ra);
   ao = await rawObj();
   check(json(keysOf(ao)) === json([[0, 960], [60, 1260]]) && ao.origin.value === origin0, `★ 2s 处改 x = 1260：自动落第 60 帧关键帧，静态值不动（${json(keysOf(ao))}）`);
   check(Math.abs((await h.numInputs())[0] - 1260) < 0.5 && (await ev(`document.querySelector('#tl-time').textContent`)) === "2.00s", "重挂后仍停在 2s，检视器显示该时刻的值");
   check((await ev(`document.querySelectorAll('#tl-keys .tl-key').length`)) === 2, "时间轴上两枚关键帧标记");
-  const crA = await h.canvasRect();
-  let inkR = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
-  let inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
+  var crA = await h.canvasRect();
+  var inkR = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
+  var inkL = await inkIn(...worldBox(crA, [830, 540], [110, 110]));
   check(inkR.frac > 0.1 && inkL.frac < 0.02, `画面：2s 时文字在 x=1260（右框墨水 ${inkR.frac.toFixed(3)}，原位左半 ${inkL.frac.toFixed(3)}）`);
 
-  const inspTabs = () => ev(`(() => { const tabs = [...document.querySelectorAll('#ed-inspector .ed-insp-tab')]; return { ids: tabs.map((b) => b.dataset.tab), active: tabs.filter((b) => b.getAttribute('aria-selected') === 'true').map((b) => b.dataset.tab), shown: [...document.querySelectorAll('#ed-inspector .ed-insp-panel')].filter((p) => !p.hidden).map((p) => p.dataset.tab), animIn: document.querySelector('.ed-anim')?.closest('.ed-insp-panel')?.dataset.tab, fxIn: document.querySelector('.ed-fx')?.closest('.ed-insp-panel')?.dataset.tab }; })()`);
+  var inspTabs = () => ev(`(() => { const tabs = [...document.querySelectorAll('#ed-inspector .ed-insp-tab')]; return { ids: tabs.map((b) => b.dataset.tab), active: tabs.filter((b) => b.getAttribute('aria-selected') === 'true').map((b) => b.dataset.tab), shown: [...document.querySelectorAll('#ed-inspector .ed-insp-panel')].filter((p) => !p.hidden).map((p) => p.dataset.tab), animIn: document.querySelector('.ed-anim')?.closest('.ed-insp-panel')?.dataset.tab, fxIn: document.querySelector('.ed-fx')?.closest('.ed-insp-panel')?.dataset.tab }; })()`);
   await clickSel('.ed-insp-tab[data-tab="props"]');
-  let tb = await inspTabs();
+  var tb = await inspTabs();
   // examples/plugins/inspector-layer-stats 会贡献一个 "stats" 标签 ⇒ 只锁内置五个都在，额外标签放行。
   check(
     json(tb.active) === json(["props"]) &&
@@ -1916,14 +1968,14 @@ async function runCreateAndDraft(ctx) {
   check(Math.abs((await h.numInputs())[0] - 960) < 0.5 && inkL.frac > 0.1, `点关键帧「0.00s」：跳回 0s，文字回到 x=960（墨水 ${inkL.frac.toFixed(3)}）`);
 
   await seekTo(1);
-  const mid = await h.numInputs();
+  var mid = await h.numInputs();
   check(Math.abs(mid[0] - 1110) < 1, `★ 往回 / 往前拖时间轴都按绝对时间定位：1s 时 x = ${mid[0]}（平滑插值的段中点 1110）`);
   ra = await h.readyCount();
-  const from = worldToPage(crA, [1110, 540]);
+  var from = worldToPage(crA, [1110, 540]);
   await drag(from, [from[0], from[1] - 60]);
   await h.waitRemount(ra);
   ao = await rawObj();
-  const y30 = ao.origin.animation.c1.find((k) => k.frame === 30)?.value;
+  var y30 = ao.origin.animation.c1.find((k) => k.frame === 30)?.value;
   check(json(keysOf(ao).map((k) => k[0])) === json([0, 30, 60]) && y30 > 560 && Math.abs(ao.origin.animation.c0[1].value - 1110) < 1, `★ 1s 处拖拽：落第 30 帧关键帧（x ${ao.origin.animation.c0[1].value}，y ${y30}）`);
   ra = await h.readyCount();
   await key("z", MOD.meta);
@@ -1936,7 +1988,9 @@ async function runCreateAndDraft(ctx) {
   await fxAct(`document.querySelector('.ed-anim-keys[data-field="origin"] [data-key-del="30"]').click()`);
   check(json(keysOf(await rawObj()).map((k) => k[0])) === json([0, 60]), "× 删掉第 30 帧");
 
+  } catch (err) { await hlAbort("AB", "AB. 关键帧动画端到端（文字层 → 开位置动画 → 2s 处改 x 自动落关键帧 → 跳关键帧 → 1s 处拖拽 → 撤销 → 删帧 / 模式 / 时长 / 插值 → 存库 → 测试台在动）", err); }
   section("AC. 关键帧补完（暂停时改动画字段画面跟手 → 时间轴拖关键帧改时刻 / 冲突拒绝 → 颜色动画）");
+  if (hlState.dead) hlSkip("AC", "AC. 关键帧补完（暂停时改动画字段画面跟手 → 时间轴拖关键帧改时刻 / 冲突拒绝 → 颜色动画）"); else try {
   await seekTo(1);
   await ev(`(() => { ${REVEAL} const el = reveal(document.querySelectorAll('#ed-inspector fieldset.ed-form input[type=number]')[0]); el.focus(); el.value = '1500'; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
   await settle();
@@ -1948,19 +2002,19 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(ra);
   check(json(keysOf(await rawObj())) === json([[0, 960], [30, 1500], [60, 1260]]), "提交后落第 30 帧关键帧 x = 1500");
 
-  const markAt = (t) =>
+  var markAt = (t) =>
     ev(`(() => { const box = document.querySelector('#tl-keys').getBoundingClientRect(); const m = [...document.querySelectorAll('#tl-keys .tl-key')].find((e) => Math.abs(Number(e.dataset.t) - ${t}) < 1e-3); if (!m) return null; const r = m.getBoundingClientRect(); return { y: r.top + r.height / 2, x: r.left + r.width / 2, left: box.left, width: box.width, max: Number(document.querySelector('#tl-range').max), drag: m.classList.contains('is-draggable') }; })()`);
-  const m1 = await markAt(1);
+  var m1 = await markAt(1);
   check(!!m1 && m1.drag, "时间轴关键帧标记可拖（is-draggable）");
-  const xOf = (mk, t) => mk.left + (t / mk.max) * mk.width;
+  var xOf = (mk, t) => mk.left + (t / mk.max) * mk.width;
   ra = await h.readyCount();
   await drag([m1.x, m1.y], [xOf(m1, 1.5), m1.y]);
   await h.waitRemount(ra);
-  let fr = (await rawObj()).origin.animation.c0.map((k) => k.frame);
+  var fr = (await rawObj()).origin.animation.c0.map((k) => k.frame);
   check(fr.length === 3 && fr[0] === 0 && fr[2] === 60 && Math.abs(fr[1] - 45) <= 1 && (await rawObj()).origin.animation.c0[1].value === 1500, `★ 把 1s 的关键帧拖到 1.5s：帧号 ${json(fr)}，值不变`);
-  const tMid = fr[1] / 30;
-  const m2 = await markAt(tMid);
-  const rb = await h.readyCount();
+  var tMid = fr[1] / 30;
+  var m2 = await markAt(tMid);
+  var rb = await h.readyCount();
   await drag([m2.x, m2.y], [xOf(m2, 2), m2.y]);
   await settle();
   check((await h.readyCount()) === rb && json((await rawObj()).origin.animation.c0.map((k) => k.frame)) === json(fr) && (await ev(`document.querySelectorAll('#tl-keys .tl-key').length`)) === 3, "拖到已有关键帧的 2s：拒绝（不重挂、帧号不变、标记复原）");
@@ -1979,12 +2033,12 @@ async function runCreateAndDraft(ctx) {
   await h.waitRemount(ra);
   ao = await rawObj();
   check(ao.color?.animation?.c0?.length === 2 && ao.color.animation.c1.at(-1).frame === 60 && ao.color.animation.c1.at(-1).value === 0, `颜色开动画、2s 处改红：自动落第 60 帧颜色关键帧（${json(ao.color?.animation?.c1?.map((k) => [k.frame, k.value]))}）`);
-  const inkRed = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
+  var inkRed = await inkIn(...worldBox(crA, [1260, 540], [abW, 110]));
   await seekTo(0);
-  const inkWhite = await inkIn(...worldBox(crA, [960, 540], [abW, 110]));
+  var inkWhite = await inkIn(...worldBox(crA, [960, 540], [abW, 110]));
   check(inkRed.color[0] > 180 && inkRed.color[1] < 80 && inkWhite.color.every((v) => v > 200), `★ 画面：2s 文字红 ${json(inkRed.color)}，0s 白 ${json(inkWhite.color)}（文字层颜色曲线真的写到绘制色）`);
   await seekTo(1);
-  const inkPink = await inkIn(...worldBox(crA, [1110, 540], [abW, 110]), 120);
+  var inkPink = await inkIn(...worldBox(crA, [1110, 540], [abW, 110]), 120);
   check(inkPink.color[0] > 180 && inkPink.color[1] > 60 && inkPink.color[1] < 200, `1s 颜色在白与红之间（${json(inkPink.color)}）`);
 
   await animSet("mode", "origin", "mirror");
@@ -1992,15 +2046,15 @@ async function runCreateAndDraft(ctx) {
   await animSet("smooth", "origin", false);
   ao = await rawObj();
   check(ao.origin.animation.options.mode === "mirror" && ao.origin.animation.options.length === 120 && ao.origin.animation.c0.every((k) => !k.front.enabled && !k.back.enabled), `模式往返 / 时长 4s（120 帧）/ 线性：${json(ao.origin.animation.options)}`);
-  const lenBefore = (await h.readyCount());
+  var lenBefore = (await h.readyCount());
   await ev(`(() => { const el = document.querySelector('.ed-anim [data-anim-length="origin"]'); el.value = '1'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
   await settle();
   check((await h.readyCount()) === lenBefore && (await ev(`document.querySelector('.ed-anim [data-anim-length="origin"]').value`)) === "4" && (await rawObj()).origin.animation.options.length === 120, "时长短于最后关键帧（2s）：拒绝并复原输入框");
-  const errsAB = (await h.errorLines()).filter((l) => !/时长不能短于|shorter than the last/.test(l));
+  var errsAB = (await h.errorLines()).filter((l) => !/时长不能短于|shorter than the last/.test(l));
   check(errsAB.length === 0, `关键帧编辑全程无错误${errsAB.length ? `：${errsAB.slice(0, 2).join(" / ")}` : ""}`);
 
-  const savedAB = [await saveLoose()];
-  const oAB = JSON.parse(fs.readFileSync(path.join(lib, savedAB[0], "scene.json"), "utf8")).objects[0];
+  var savedAB = [await saveLoose()];
+  var oAB = JSON.parse(fs.readFileSync(path.join(lib, savedAB[0], "scene.json"), "utf8")).objects[0];
   check(json(oAB.origin.animation.options) === json({ fps: 30, length: 120, mode: "mirror", wraploop: false }) && json(keysOf(oAB)) === json([[0, 960], [60, 1260]]), "盘上 scene.json：WE 原生动画格式、关键帧齐全");
   check(oAB.color?.animation?.c0?.length === 2 && typeof oAB.color.value === "string", "盘上 scene.json：颜色动画也按 WE 格式落盘");
 
@@ -2008,23 +2062,25 @@ async function runCreateAndDraft(ctx) {
     url: `${origin}/renderer/index.html?type=scene&src=${savedAB[0]}&mediaBase=${origin}/media/dev&fit=cover&renderDpr=1&muted=true&loop=true`,
   });
   await waitFor(`window.__wp && window.__sceneLayers && window.__sceneLayers.some((l) => l.animationsByField?.origin)`, 90000);
-  const xs = [];
+  var xs = [];
   for (let i = 0; i < 4; i++) {
     xs.push(await ev(`window.__sceneLayers.find((l) => l.animationsByField?.origin).localOrigin[0]`));
     await new Promise((r) => setTimeout(r, 400));
   }
   check(new Set(xs.map((x) => Math.round(x))).size >= 3 && xs.every((x) => x >= 959 && x <= 1261), `★ 测试台：文字沿关键帧来回移动（x 采样 ${xs.map((x) => x.toFixed(0)).join(" → ")}）`);
 
+  } catch (err) { await hlAbort("AC", "AC. 关键帧补完（暂停时改动画字段画面跟手 → 时间轴拖关键帧改时刻 / 冲突拒绝 → 颜色动画）", err); }
   section("AD. 图层树拖拽改父级 / 成组 / 锁定写入文档（成组 → 移动组子层跟随 → 拖进组画面不动 → 拖出 → 成环拒绝 → 撤销 → 锁定 → 存库 → 重开）");
-  const rowAt = (id, f = 0.5) =>
+  if (hlState.dead) hlSkip("AD", "AD. 图层树拖拽改父级 / 成组 / 锁定写入文档（成组 → 移动组子层跟随 → 拖进组画面不动 → 拖出 → 成环拒绝 → 撤销 → 锁定 → 存库 → 重开）"); else try {
+  var rowAt = (id, f = 0.5) =>
     ev(`(() => { const n = document.querySelector('#ed-tree .ed-node[data-id="${id}"]'); if (!n) return null; const r = n.getBoundingClientRect(); return [r.left + 60, r.top + r.height * ${f}]; })()`);
-  const depthOf = () => ev(`Object.fromEntries([...document.querySelectorAll('#ed-tree .ed-node')].map((n) => [n.dataset.id, (parseInt(n.style.paddingLeft) - 6) / 14]))`);
-  const treeIds = () => ev(`[...document.querySelectorAll('#ed-tree .ed-node')].map((n) => n.dataset.id)`);
-  const clickRow = async (id) => {
+  var depthOf = () => ev(`Object.fromEntries([...document.querySelectorAll('#ed-tree .ed-node')].map((n) => [n.dataset.id, (parseInt(n.style.paddingLeft) - 6) / 14]))`);
+  var treeIds = () => ev(`[...document.querySelectorAll('#ed-tree .ed-node')].map((n) => n.dataset.id)`);
+  var clickRow = async (id) => {
     await click(await rowAt(id));
     await settle();
   };
-  const dragRow = async (id, targetId, f) => {
+  var dragRow = async (id, targetId, f) => {
     const r0 = await h.readyCount();
     await drag(await rowAt(id), await rowAt(targetId, f));
     return r0;
@@ -2034,23 +2090,23 @@ async function runCreateAndDraft(ctx) {
   await addTextPreset("plain");
   await setText("content", "MMM");
   await setText("size", "60");
-  const id1 = String((await rawObj()).id);
+  var id1 = String((await rawObj()).id);
   await h.setInputs({ 0: 400 });
   await addTextPreset("plain");
   await setText("content", "WWW");
   await setText("size", "60");
-  const id2 = String((await rawObj()).id);
+  var id2 = String((await rawObj()).id);
   await h.setInputs({ 0: 1100 });
   await settle();
-  const crD = await h.canvasRect();
-  const inkX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]))).frac;
+  var crD = await h.canvasRect();
+  var inkX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]))).frac;
   check((await inkX(400)) > 0.05 && (await inkX(1100)) > 0.05 && (await ev(`document.querySelectorAll('#ed-tree .ed-node[data-id="${id1}"]').length === 1`)), `两个文字层（#${id1} 在 x=400，#${id2} 在 x=1100），树行带 data-id`);
 
-  let rd = await h.readyCount();
+  var rd = await h.readyCount();
   await clickSel("#ly-group");
   await h.waitRemount(rd);
-  const gid = String((await rawObj()).id);
-  let dep = await depthOf();
+  var gid = String((await rawObj()).id);
+  var dep = await depthOf();
   check(gid !== id1 && gid !== id2 && dep[gid] === 0 && dep[id2] === 1 && json(await treeIds()) === json([id1, gid, id2]), `成组：新组 #${gid} 在原位，#${id2} 进组（树 ${json(await treeIds())}）`);
   check((await inkX(1100)) > 0.05 && (await ev(`document.querySelector('#ed-tree .ed-node[data-id="${gid}"] .ed-kind').dataset.kind`)) === "group", "成组后画面不变；行标「组」");
   await h.setInputs({ 0: 600 });
@@ -2062,7 +2118,7 @@ async function runCreateAndDraft(ctx) {
   dep = await depthOf();
   await clickRow(id1);
   check(dep[id1] === 1 && json(await treeIds()) === json([gid, id2, id1]) && Math.abs((await h.numInputs())[0] + 200) < 0.5, `★ 把 #${id1} 拖进组：成为最后一个子层，局部 x 改写为 -200（= 400 − 组的 600）`);
-  const whiteX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]), 690)).frac;
+  var whiteX = async (x) => (await inkIn(...worldBox(crD, [x, 540], [50, 30]), 690)).frac;
   check((await whiteX(400)) > 0.05 && (await whiteX(1000)) < 0.01, "★ 画面上它仍在 x=400（没有被组平移到 1000；只数白字像素，避开选中描边）");
 
   rd = await dragRow(id1, gid, 0.1);
@@ -2090,25 +2146,27 @@ async function runCreateAndDraft(ctx) {
   rd = await dragRow(id1, gid, 0.5);
   await settle();
   check((await h.readyCount()) === rd && (await depthOf())[id1] === 0, "锁定的层拖不动");
-  const errsAD = await h.errorLines();
+  var errsAD = await h.errorLines();
   check(errsAD.length === 0, `图层树编辑全程无错误${errsAD.length ? `：${errsAD.slice(0, 2).join(" / ")}` : ""}`);
 
-  const savedAD = [await saveLoose()];
-  const objsAD = JSON.parse(fs.readFileSync(path.join(lib, savedAD[0], "scene.json"), "utf8")).objects;
-  const by = (id) => objsAD.find((o) => String(o.id) === id);
+  var savedAD = [await saveLoose()];
+  var objsAD = JSON.parse(fs.readFileSync(path.join(lib, savedAD[0], "scene.json"), "utf8")).objects;
+  var by = (id) => objsAD.find((o) => String(o.id) === id);
   check(savedAD.length === 1 && by(id1).locktransforms === true && String(by(id2).parent) === gid && !("parent" in by(id1)) && !by(gid).image && json(objsAD.map((o) => String(o.id))) === json([id1, gid, id2]), `盘上 scene.json：锁定字段、父子关系、组对象、绘制顺序都在（${savedAD[0]}）`);
 
   await reopen(savedAD[0]);
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 3`, 90000);
   await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   await settle();
-  const crD2 = await h.canvasRect();
+  var crD2 = await h.canvasRect();
   check((await ev(`document.querySelector('#ed-tree .ed-node[data-id="${id1}"]').classList.contains('locked-layer')`)) && (await depthOf())[id2] === 1 && (await inkIn(...worldBox(crD2, [400, 540], [50, 30]))).frac > 0.05 && (await inkIn(...worldBox(crD2, [1700, 540], [50, 30]))).frac > 0.05, "重新打开：锁定状态、组结构、画面都还在");
 
+  } catch (err) { await hlAbort("AD", "AD. 图层树拖拽改父级 / 成组 / 锁定写入文档（成组 → 移动组子层跟随 → 拖进组画面不动 → 拖出 → 成环拒绝 → 撤销 → 锁定 → 存库 → 重开）", err); }
   section("AE. 视口拖拽吸附（贴画面竖中线 + 粉色参考线 → 松手消失 → ⌘ 关吸附 → 贴另一层中心）");
-  const guidePx = () =>
+  if (hlState.dead) hlSkip("AE", "AE. 视口拖拽吸附（贴画面竖中线 + 粉色参考线 → 松手消失 → ⌘ 关吸附 → 贴另一层中心）"); else try {
+  var guidePx = () =>
     ev(`(() => { const c = document.querySelector('#ed-overlay'); const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 40 && d[i] > d[i + 1] + 60 && d[i + 2] > d[i + 1] + 30) n++; return n; })()`);
-  const holdDrag = async ([x0, y0], [x1, y1], modifiers = 0) => {
+  var holdDrag = async ([x0, y0], [x1, y1], modifiers = 0) => {
     await mouse("mouseMoved", x0, y0, { modifiers });
     await mouse("mousePressed", x0, y0, { buttons: 1, modifiers });
     for (let i = 1; i <= 10; i++) {
@@ -2128,15 +2186,15 @@ async function runCreateAndDraft(ctx) {
   await setText("size", "60");
   await h.setInputs({ 0: 600, 1: 700 });
   await settle();
-  const crE = await h.canvasRect();
-  let release = await holdDrag(worldToPage(crE, [600, 700]), worldToPage(crE, [963, 700]));
-  const gDuring = await guidePx();
+  var crE = await h.canvasRect();
+  var release = await holdDrag(worldToPage(crE, [600, 700]), worldToPage(crE, [963, 700]));
+  var gDuring = await guidePx();
   await release();
-  let pos = await h.numInputs();
+  var pos = await h.numInputs();
   check(Math.abs(pos[0] - 960) < 0.05 && Math.abs(pos[1] - 700) < 0.5, `★ 拖到离画面竖中线 3 个单位处松手：吸到 x = ${pos[0]}（y ${pos[1]} 不动）`);
   check(gDuring > 200 && (await guidePx()) === 0, `拖动中画出粉色参考线（${gDuring} 像素），松手后消失`);
   release = await holdDrag(worldToPage(crE, [960, 700]), worldToPage(crE, [970, 700]), MOD.meta);
-  const gMeta = await guidePx();
+  var gMeta = await guidePx();
   await release();
   pos = await h.numInputs();
   check(Math.abs(pos[0] - 970) < 1 && gMeta === 0, `按住 ⌘ 拖 10 个单位（无 ⌘ 时会被吸回中线）：不吸附、无参考线（x = ${pos[0].toFixed(2)}）`);
@@ -2153,7 +2211,9 @@ async function runCreateAndDraft(ctx) {
   check(Math.abs(pos[0] - 1400) < 0.05, `★ 拖到另一层中心附近：吸到它的中心线 x = ${pos[0]}`);
   check((await h.errorLines()).length === 0, "吸附拖拽全程无错误");
 
+  } catch (err) { await hlAbort("AE", "AE. 视口拖拽吸附（贴画面竖中线 + 粉色参考线 → 松手消失 → ⌘ 关吸附 → 贴另一层中心）", err); }
   section("AF. 多选（⇧ 点加选 → 左对齐 → 一步撤销 → 水平等距 → 一起拖动 → 多层成组 → 一起删除 → 画面 ⇧ 点）");
+  if (hlState.dead) hlSkip("AF", "AF. 多选（⇧ 点加选 → 左对齐 → 一步撤销 → 水平等距 → 一起拖动 → 多层成组 → 一起删除 → 画面 ⇧ 点）"); else try {
   await gotoEditor();
   await newBlank("#000000");
   for (const [x, y] of [[300, 250], [900, 800], [1600, 540]]) {
@@ -2163,9 +2223,9 @@ async function runCreateAndDraft(ctx) {
     await h.setInputs({ 0: x, 1: y });
   }
   await settle();
-  const crF = await h.canvasRect();
-  const inkF = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
-  const [f1, f2, f3] = await treeIds();
+  var crF = await h.canvasRect();
+  var inkF = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
+  var [f1, f2, f3] = await treeIds();
   await clickRow(f1);
   await click(await rowAt(f2), MOD.shift);
   await click(await rowAt(f3), MOD.meta);
@@ -2182,19 +2242,19 @@ async function runCreateAndDraft(ctx) {
   check((await inkF(950, 800)) > 0.05 && (await inkF(800, 800)) < 0.01 && (await inkF(300, 250)) > 0.05 && (await inkF(1600, 540)) > 0.05, "★ 水平等距：首尾不动，中间那层移到 x=950");
   await key("z", MOD.meta);
   await settle();
-  const crF2 = await h.canvasRect();
-  const fromF = worldToPage(crF2, [300, 250]);
-  const kF = crF2.w / 1920;
+  var crF2 = await h.canvasRect();
+  var fromF = worldToPage(crF2, [300, 250]);
+  var kF = crF2.w / 1920;
   await drag(fromF, [fromF[0] + 200 * kF, fromF[1]]);
   await settle();
   check((await inkF(500, 250)) > 0.05 && (await inkF(1100, 800)) > 0.05 && (await inkF(1800, 540)) > 0.05 && (await inkF(750, 800)) < 0.01, "★ 拖主选层右移 200：另外两层跟着移");
   await key("z", MOD.meta);
   await settle();
   check((await inkF(300, 250)) > 0.05 && (await inkF(900, 800)) > 0.05 && (await inkF(1600, 540)) > 0.05 && (await inkF(1800, 540)) < 0.01, "撤销一次：三层一起回去");
-  let rf = await h.readyCount();
+  var rf = await h.readyCount();
   await clickSel("#ly-group");
   await h.waitRemount(rf);
-  const depF = await depthOf();
+  var depF = await depthOf();
   check(json(await treeIds()).length > 0 && (await treeIds()).length === 4 && [f1, f2, f3].every((id) => depF[id] === 1) && (await inkF(900, 800)) > 0.05 && (await inkF(1600, 540)) > 0.05, "多层成组：三层进同一个新组，画面不变");
   rf = await h.readyCount();
   await key("z", MOD.meta);
@@ -2216,9 +2276,11 @@ async function runCreateAndDraft(ctx) {
   check((await h.errorLines()).length === 0, "多选全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AF", "AF. 多选（⇧ 点加选 → 左对齐 → 一步撤销 → 水平等距 → 一起拖动 → 多层成组 → 一起删除 → 画面 ⇧ 点）", err); }
   section("AG. 效果扩充集出帧（描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩）");
+  if (hlState.dead) hlSkip("AG", "AG. 效果扩充集出帧（描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩）"); else try {
   /** 页面矩形内各类像素占比（黑底；选中框画布已隐藏） */
-  const fxStats = async ([x0, y0], [x1, y1]) => {
+  var fxStats = async ([x0, y0], [x1, y1]) => {
     const clip = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.max(2, Math.abs(x1 - x0)), height: Math.max(2, Math.abs(y1 - y0)), scale: 1 };
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip });
     return ev(`(async () => {
@@ -2246,19 +2308,19 @@ async function runCreateAndDraft(ctx) {
   await setText("size", "24");
   await h.setInputs({ 0: 960, 1: 540 });
   await settle();
-  const gBox = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [450, 200]));
-  const base = await fxStats(...(await gBox()));
+  var gBox = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [450, 200]));
+  var base = await fxStats(...(await gBox()));
   check(base.white > 0.01 && base.red === 0 && base.blue === 0, `基线：白字黑底，无红无蓝（白 ${base.white.toFixed(3)}）`);
 
   await fxAdd("outline");
   await fxSet(0, "color", "#ff0000");
   await fxSet(0, "width", "4");
   await settle();
-  const ol = await fxStats(...(await gBox()));
+  var ol = await fxStats(...(await gBox()));
   check(ol.red > 0.005 && ol.white > base.white * 0.6, `★ 描边：字形外出现红边、白字仍在（红 ${ol.red.toFixed(3)} / 白 ${ol.white.toFixed(3)}）`);
   await fxSet(0, "width", "0");
   await settle();
-  const ol0 = await fxStats(...(await gBox()));
+  var ol0 = await fxStats(...(await gBox()));
   check(ol0.red < ol.red * 0.2, `描边宽 0：红边消失（红 ${ol0.red.toFixed(3)}）`);
   await fxBtn(0, "ed-fx-del");
 
@@ -2267,7 +2329,7 @@ async function runCreateAndDraft(ctx) {
   await fxSet(0, "radius", "5");
   await fxSet(0, "strength", "3");
   await settle();
-  const gw = await fxStats(...(await gBox()));
+  var gw = await fxStats(...(await gBox()));
   check(gw.red > 0.005 && gw.white > base.white * 0.6, `★ 外发光：字周围红色光晕、白字不被盖住（红 ${gw.red.toFixed(3)}）`);
   await fxSet(0, "strength", "0");
   await settle();
@@ -2277,11 +2339,11 @@ async function runCreateAndDraft(ctx) {
   await fxAdd("chroma");
   await fxSet(0, "amount", "0.02");
   await settle();
-  const ch = await fxStats(...(await gBox()));
+  var ch = await fxStats(...(await gBox()));
   check(ch.red > 0.002 && ch.blue > 0.002, `★ 色差：一侧红边一侧蓝边（红 ${ch.red.toFixed(3)} / 蓝 ${ch.blue.toFixed(3)}）`);
   await fxSet(0, "amount", "0");
   await settle();
-  const ch0 = await fxStats(...(await gBox()));
+  var ch0 = await fxStats(...(await gBox()));
   check(ch0.red < 0.0005 && ch0.blue < 0.0005, "色差 0：红蓝边消失");
   await fxBtn(0, "ed-fx-del");
   await settle();
@@ -2291,22 +2353,22 @@ async function runCreateAndDraft(ctx) {
   // 一小团、边缘光被 AA 稀释 —— 先放大字号给流体足够的屏上面积再判。
   await setText("size", "400");
   await settle();
-  const fxMid = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [560, 330]));
-  const flBase = await fxStats(...(await fxMid()));
+  var fxMid = () => h.canvasRect().then((cr) => worldBox(cr, [960, 540], [560, 330]));
+  var flBase = await fxStats(...(await fxMid()));
   await fxAdd("cuiliuti");
   await settle();
   // 编辑器页默认暂停：g_Time 不走流体就不动（shine 块同一前置），先起播再判动画。
   if (!(await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`))) await clickSel("#tb-play");
-  const fl = await fxStats(...(await fxMid()));
+  var fl = await fxStats(...(await fxMid()));
   check(fl.cool > 0.0004 && fl.warm > 0.0004, `★ 磁流体：左蓝右橙边缘光出现（冷 ${fl.cool.toFixed(4)} / 暖 ${fl.warm.toFixed(4)}）`);
   check(fl.white < flBase.white * 0.9, `磁流体黑色本体盖住白字（白 ${fl.white.toFixed(3)} < ${flBase.white.toFixed(3)}）`);
-  const flA = await fxStats(...(await fxMid()));
+  var flA = await fxStats(...(await fxMid()));
   await new Promise((r) => setTimeout(r, 800));
-  const flB = await fxStats(...(await fxMid()));
+  var flB = await fxStats(...(await fxMid()));
   check(flA.edges !== flB.edges || Math.abs(flA.lit - flB.lit) > 0.0004, `磁流体在动（edges ${flA.edges}→${flB.edges} / lit ${flA.lit.toFixed(4)}→${flB.lit.toFixed(4)}）`);
   await fxBtn(0, "ed-fx-del");
   await settle();
-  const flEnd = await fxStats(...(await fxMid()));
+  var flEnd = await fxStats(...(await fxMid()));
   check(Math.abs(flEnd.white - flBase.white) < flBase.white * 0.15, "删掉磁流体：回到大字基线");
 
   await gotoEditor();
@@ -2314,20 +2376,20 @@ async function runCreateAndDraft(ctx) {
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   await addImage(stripePath);
   await settle();
-  const crS = await h.canvasRect();
-  const sRed = worldToPage(crS, [1110, 590]);
-  const sBlue = worldToPage(crS, [1110, 490]);
-  const nearTop = worldToPage(crS, [1110, 560]);
-  const nearBot = worldToPage(crS, [1110, 520]);
-  const sideL = worldToPage(crS, [790, 590]);
-  const sideR = worldToPage(crS, [1130, 590]);
+  var crS = await h.canvasRect();
+  var sRed = worldToPage(crS, [1110, 590]);
+  var sBlue = worldToPage(crS, [1110, 490]);
+  var nearTop = worldToPage(crS, [1110, 560]);
+  var nearBot = worldToPage(crS, [1110, 520]);
+  var sideL = worldToPage(crS, [790, 590]);
+  var sideR = worldToPage(crS, [1130, 590]);
   check(isRed(await pixelAt(nearTop)) && isBlue(await pixelAt(nearBot)), "条纹图基线：分界线两侧 20 单位一红一蓝");
 
   await fxAdd("pixelate");
   await fxSet(0, "size", "64");
   await settle();
-  const pT = await pixelAt(nearTop);
-  const pB = await pixelAt(nearBot);
+  var pT = await pixelAt(nearTop);
+  var pB = await pixelAt(nearBot);
   check(close(pT, pB, 10) && (isRed(pT) || isBlue(pT)), `★ 像素化 64：分界线所在的 64px 格整体同色（上 ${pT} / 下 ${pB}）`);
   check(isRed(await pixelAt(sRed)) && isBlue(await pixelAt(sBlue)), "远离分界的格子颜色不变");
   await fxSet(0, "size", "1");
@@ -2339,14 +2401,14 @@ async function runCreateAndDraft(ctx) {
   await fxSet(0, "start", "0");
   await fxSet(0, "end", "1");
   await settle();
-  const fdL = await pixelAt(sideL);
-  const fdR = await pixelAt(sideR);
+  var fdL = await pixelAt(sideL);
+  var fdR = await pixelAt(sideR);
   check(fdL[0] < 40 && isRed(fdR), `★ 渐隐遮罩 0→1：左缘透明（露黑底 ${fdL}）、右缘不透明（${fdR}）`);
   await fxSet(0, "start", "1");
   await fxSet(0, "end", "0");
   await settle();
-  const fdL2 = await pixelAt(sideL);
-  const fdR2 = await pixelAt(sideR);
+  var fdL2 = await pixelAt(sideL);
+  var fdR2 = await pixelAt(sideR);
   check(isRed(fdL2) && fdR2[0] < 40, `起点 > 终点：方向反过来（左 ${fdL2} / 右 ${fdR2}）`);
   await fxBtn(0, "ed-fx-del");
 
@@ -2356,7 +2418,7 @@ async function runCreateAndDraft(ctx) {
   await fxSet(0, "width", "0.3");
   await fxSet(0, "strength", "2");
   if (!(await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`))) await clickSel("#tb-play");
-  const greens = [];
+  var greens = [];
   for (let i = 0; i < 12; i++) {
     greens.push((await pixelAt(worldToPage(await h.canvasRect(), [960, 590])))[1]);
     await new Promise((r) => setTimeout(r, 110));
@@ -2370,7 +2432,9 @@ async function runCreateAndDraft(ctx) {
   check((await h.errorLines()).length === 0, "效果扩充集全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AG", "AG. 效果扩充集出帧（描边 / 外发光 / 色差 / 像素化 / 扫光 / 渐隐遮罩）", err); }
   section("AH. 时间轴按层动画条 / 关键帧复制粘贴（A 层 2s 关键帧 → 复制 → B 层 1s 粘贴 → 画面 → 撤销 → 点动画条选层）");
+  if (hlState.dead) hlSkip("AH", "AH. 时间轴按层动画条 / 关键帧复制粘贴（A 层 2s 关键帧 → 复制 → B 层 1s 粘贴 → 画面 → 撤销 → 点动画条选层）"); else try {
   await gotoEditor();
   await newBlank("#000000");
   for (const [x, y] of [[400, 300], [400, 800]]) {
@@ -2380,24 +2444,24 @@ async function runCreateAndDraft(ctx) {
     await h.setInputs({ 0: x, 1: y });
   }
   await settle();
-  const [hA, hB] = await treeIds();
-  const lanes = () => ev(`document.querySelector('#tl-lanes').hidden ? null : [...document.querySelectorAll('#tl-lanes .tl-lane')].map((r) => ({ id: r.dataset.id, keys: [...r.querySelectorAll('.tl-lane-key')].map((k) => Number(k.dataset.t)), repeat: !!r.querySelector('.tl-lane-bar.is-repeat'), sel: r.classList.contains('selected') }))`);
+  var [hA, hB] = await treeIds();
+  var lanes = () => ev(`document.querySelector('#tl-lanes').hidden ? null : [...document.querySelectorAll('#tl-lanes .tl-lane')].map((r) => ({ id: r.dataset.id, keys: [...r.querySelectorAll('.tl-lane-key')].map((k) => Number(k.dataset.t)), repeat: !!r.querySelector('.tl-lane-bar.is-repeat'), sel: r.classList.contains('selected') }))`);
   check((await lanes()) === null, "没有动画层：动画条区隐藏");
   await clickRow(hA);
   if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
   await seekTo(0);
   await animOn("origin", true);
-  let ln = await lanes();
+  var ln = await lanes();
   check(ln?.length === 1 && ln[0].id === hA && json(ln[0].keys) === json([0]) && ln[0].repeat && ln[0].sel, `A 开位置动画：出一行动画条（选中高亮、0s 一枚关键帧、loop 后续周期虚条）${json(ln)}`);
-  const barPct = await ev(`(() => { const b = document.querySelector('#tl-lanes .tl-lane-bar:not(.is-repeat)'); return b.getBoundingClientRect().width / b.parentElement.getBoundingClientRect().width; })()`);
+  var barPct = await ev(`(() => { const b = document.querySelector('#tl-lanes .tl-lane-bar:not(.is-repeat)'); return b.getBoundingClientRect().width / b.parentElement.getBoundingClientRect().width; })()`);
   check(Math.abs(barPct - 3 / 30) < 0.01, `实条长度 = 动画时长 3s / 时间轴 30s（${barPct.toFixed(3)}）`);
   await seekTo(2);
-  let rh = await h.readyCount();
+  var rh = await h.readyCount();
   await h.setInputs({ 0: 1400 });
   await h.waitRemount(rh);
   ln = await lanes();
   check(json(ln?.[0].keys) === json([0, 2]), `2s 落关键帧后动画条上两枚（${json(ln?.[0].keys)}）`);
-  const align = await ev(`(() => { const a = [...document.querySelectorAll('#tl-lanes .tl-lane-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); const b = [...document.querySelectorAll('#tl-keys .tl-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); return Math.abs((a.left + a.width / 2) - (b.left + b.width / 2)); })()`);
+  var align = await ev(`(() => { const a = [...document.querySelectorAll('#tl-lanes .tl-lane-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); const b = [...document.querySelectorAll('#tl-keys .tl-key')].find((k) => k.dataset.t === '2').getBoundingClientRect(); return Math.abs((a.left + a.width / 2) - (b.left + b.width / 2)); })()`);
   check(align < 2, `动画条与上方滑轨同一时间刻度：2s 关键帧横向对齐（差 ${align.toFixed(2)}px）`);
 
   await seekTo(1);
@@ -2412,11 +2476,11 @@ async function runCreateAndDraft(ctx) {
   rh = await h.readyCount();
   await clickSel(".ed-anim [data-anim-paste]");
   await h.waitRemount(rh);
-  const bo = await rawObj();
+  var bo = await rawObj();
   check(json(keysOf(bo)) === json([[0, 400], [30, 1400]]) && json(keysOf(bo, 1)) === json([[0, 800], [30, 300]]), `★ B 层 1s 粘贴：自动开位置动画，第 0 帧 = 原位置，第 30 帧 = A 在 2s 的值（x ${json(keysOf(bo))} / y ${json(keysOf(bo, 1))}）`);
   ln = await lanes();
   check(ln?.length === 2 && json(ln.map((r) => r.id)) === json([hA, hB]) && json(ln[1].keys) === json([0, 1]) && ln[1].sel && !ln[0].sel, "动画条两行（按图层树顺序），B 行选中、关键帧 0s / 1s");
-  const inkH = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
+  var inkH = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   check((await inkH(1400, 300)) > 0.05 && (await inkH(400, 800)) < 0.01, "★ 画面：1s 时 B 层到了 (1400, 300)，原位置空了");
   await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
@@ -2430,7 +2494,9 @@ async function runCreateAndDraft(ctx) {
   check((await h.errorLines()).length === 0, "动画条 / 复制粘贴全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AH", "AH. 时间轴按层动画条 / 关键帧复制粘贴（A 层 2s 关键帧 → 复制 → B 层 1s 粘贴 → 画面 → 撤销 → 点动画条选层）", err); }
   section("AL. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）");
+  if (hlState.dead) hlSkip("AL", "AL. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）"); else try {
   await gotoEditor();
   await newBlank("#000000");
   for (const [x, y] of [[220, 200], [650, 200], [1600, 800]]) {
@@ -2440,9 +2506,9 @@ async function runCreateAndDraft(ctx) {
     await h.setInputs({ 0: x, 1: y });
   }
   await settle();
-  const [q1, q2, q3] = await treeIds();
-  const crAj = await h.canvasRect();
-  const inkAj = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
+  var [q1, q2, q3] = await treeIds();
+  var crAj = await h.canvasRect();
+  var inkAj = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
   // 空画布起拖：从 (1200, 800) 拉到 (300, 100)，矩形罩住左上两层、放过右下那层。
   // 叠加层先隐藏：虚线矩形与选中框会压在命中测试区上，量的是框选结果不是像素
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
@@ -2463,7 +2529,7 @@ async function runCreateAndDraft(ctx) {
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   check((await inkAj(650, 200)) > 0.05 && (await inkAj(220, 200)) > 0.05 && (await inkAj(1600, 800)) > 0.05, "撤销一次：批改整体回退（框选走的是同一条批量命令）");
   await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
-  let rm = await h.readyCount();
+  var rm = await h.readyCount();
   await clickSel("#ly-group");
   await h.waitRemount(rm);
   check((await treeIds()).length === 4 && (await depthOf())[q1] === 1 && (await depthOf())[q2] === 1, "框选出的两层成组");
@@ -2475,7 +2541,7 @@ async function runCreateAndDraft(ctx) {
     (await ev(`document.querySelector('#ly-ungroup').disabled`)) === true,
     "选中没有子层的叶子层时「取消成组」禁用（不会静默什么都不做）",
   );
-  const grpAj = Object.entries(await depthOf()).find(([id, d]) => d === 0 && id !== q3)?.[0];
+  var grpAj = Object.entries(await depthOf()).find(([id, d]) => d === 0 && id !== q3)?.[0];
   check(typeof grpAj === "string" && (await treeIds()).length === 4, "成组后树里能认出唯一的新组（depth 0 且非第三层）");
   await clickRow(grpAj);
   check(
@@ -2500,9 +2566,9 @@ async function runCreateAndDraft(ctx) {
   await clickRow(q3);
   // ★ 真机可达性：左栏默认 280px，面板头（两个标签页 + 三个树工具）曾装不下，
   // 工具被推到自己栏的框外、被中栏面板盖住 —— 真机点下去命中的是中栏的标签页。
-  const hittable = async (sel) =>
+  var hittable = async (sel) =>
     ev(`(() => { const b = document.querySelector(${JSON.stringify(sel)}); const r = b.getBoundingClientRect(); const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return !!t && (t === b || b.contains(t)); })()`);
-  const toolsHit = [];
+  var toolsHit = [];
   for (const sel of ["#tree-collapse", "#tree-expand", "#tree-isolate"]) toolsHit.push(await hittable(sel));
   check(toolsHit.every(Boolean), `★ 面板头的树工具真的能点到（命中测试落在按钮自己身上：折叠 / 展开 / 隔离 = ${json(toolsHit)}）`);
   await clickSel("#tree-isolate");
@@ -2524,9 +2590,9 @@ async function runCreateAndDraft(ctx) {
   check((await treeIds()).length === 3, "展开全部：三行恢复");
 
   // 锁定入撤销栈：锁定后拖不动，撤销后又能拖
-  const lockBtn = (id) => `#ed-tree .ed-node[data-id="${id}"] .ed-lock`;
+  var lockBtn = (id) => `#ed-tree .ed-node[data-id="${id}"] .ed-lock`;
   await clickRow(q1);
-  const crL = await h.canvasRect();
+  var crL = await h.canvasRect();
   await clickSel(lockBtn(q1));
   await settle();
   check(await ev(`document.querySelector('#ed-tree .ed-node[data-id="${q1}"]').classList.contains('locked-layer')`), "锁定按钮：行进入 locked-layer 态");
@@ -2547,19 +2613,19 @@ async function runCreateAndDraft(ctx) {
   await settle();
 
   // 图层剪贴板：⌘C / ⌘V 复制黏贴，⌘X 剪切；跨文档粘贴
-  const originOf = async () => {
+  var originOf = async () => {
     const v = await h.numInputs();
     return `${v[0]}, ${v[1]}`;
   };
   await clickRow(q1);
-  const baseOrigin = await originOf();
-  const rowsBeforeAj = (await treeIds()).length;
+  var baseOrigin = await originOf();
+  var rowsBeforeAj = (await treeIds()).length;
   await key("c", MOD.meta);
   await settle();
   await key("v", MOD.meta);
   await settle();
-  const rowsAfterAj = (await treeIds()).length;
-  const pastedOrigin = await originOf();
+  var rowsAfterAj = (await treeIds()).length;
+  var pastedOrigin = await originOf();
   // 两个条件分开写进文案：合在一条 `&&` 里时失败信息分不清是哪半挂了
   check(
     rowsAfterAj === rowsBeforeAj + 1 && pastedOrigin !== baseOrigin,
@@ -2586,11 +2652,11 @@ async function runCreateAndDraft(ctx) {
   await settle();
   await key("v", MOD.meta);
   await settle();
-  const rows1Aj = (await treeIds()).length;
-  const crossOrigin = await originOf();
+  var rows1Aj = (await treeIds()).length;
+  var crossOrigin = await originOf();
   await key("v", MOD.meta);
   await settle();
-  const rows2Aj = (await treeIds()).length;
+  var rows2Aj = (await treeIds()).length;
   check(rows1Aj === 1 && rows2Aj === 2 && rows2Aj === rows1Aj + 1, `★ 跨文档粘贴：空文档里贴出 1 层，再粘一次变 2 层（id 重新分配、不覆盖，第二层落点 ${json(crossOrigin)} 偏移）`);
   rm = await h.readyCount();
   await key("z", MOD.meta);
@@ -2603,7 +2669,9 @@ async function runCreateAndDraft(ctx) {
   check((await h.errorLines()).length === 0, "M7 交互补齐全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AL", "AL. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）", err); }
   section("AI. WebGL 上下文丢失自愈（丢上下文 → 按当前文档重挂、编辑不丢 → 一分钟内第 4 次停手 → 手动重新加载）");
+  if (hlState.dead) hlSkip("AI", "AI. WebGL 上下文丢失自愈（丢上下文 → 按当前文档重挂、编辑不丢 → 一分钟内第 4 次停手 → 手动重新加载）"); else try {
   await gotoEditor();
   await newBlank("#000000");
   await addTextPreset("plain");
@@ -2611,22 +2679,22 @@ async function runCreateAndDraft(ctx) {
   await setText("size", "12");
   await h.setInputs({ 0: 600, 1: 540 });
   await settle();
-  const inkC = async () => (await inkIn(...worldBox(await h.canvasRect(), [600, 540], [40, 25]), 690)).frac;
-  const conHas = (re) => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${re}.test(d.textContent)).length`);
-  const loseCtx = () =>
+  var inkC = async () => (await inkIn(...worldBox(await h.canvasRect(), [600, 540], [40, 25]), 690)).frac;
+  var conHas = (re) => ev(`[...document.querySelectorAll('#ed-con-body > div')].filter((d) => ${re}.test(d.textContent)).length`);
+  var loseCtx = () =>
     ev(`(() => { const c = document.querySelector('#ed-stage canvas[data-webwallgl]'); c.dataset.probe = 'old'; const gl = c.getContext('webgl2'); const x = gl && gl.getExtension('WEBGL_lose_context'); if (!x) return false; x.loseContext(); return true; })()`);
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
-  const ink0 = await inkC();
-  const names0 = await h.treeNames();
+  var ink0 = await inkC();
+  var names0 = await h.treeNames();
   check(ink0 > 0.05, `基线：文字在 (600, 540)（墨水 ${ink0.toFixed(3)}）`);
-  let rCtx = await h.readyCount();
+  var rCtx = await h.readyCount();
   check(await loseCtx(), "WEBGL_lose_context 可用，主动丢上下文");
   await h.waitRemount(rCtx);
   await settle();
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   check((await conHas(/上下文丢失，正在按当前文档重建|lost its WebGL context/)) === 1, "控制台记一条「上下文丢失，正在重建」");
   check(await ev(`(() => { const cs = document.querySelectorAll('#ed-stage canvas[data-webwallgl]'); return cs.length === 1 && cs[0].dataset.probe !== 'old'; })()`), "换了一块新画布（旧的死画布已移除）");
-  const ink1 = await inkC();
+  var ink1 = await inkC();
   check(ink1 > 0.05 && json(await h.treeNames()) === json(names0), `★ 重挂后画面恢复（墨水 ${ink1.toFixed(3)}），图层还在`);
   check(Math.abs((await h.numInputs())[0] - 600) < 0.5, "检视器里的编辑值仍在（x = 600）");
   for (let i = 0; i < 2; i++) {
@@ -2648,7 +2716,9 @@ async function runCreateAndDraft(ctx) {
   await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AI", "AI. WebGL 上下文丢失自愈（丢上下文 → 按当前文档重挂、编辑不丢 → 一分钟内第 4 次停手 → 手动重新加载）", err); }
   section("AJ. 视频（页面现录测试视频 → 以视频为背景 → 存盘 → 测试台 → 视频壁纸工程裁剪 / 撤销 / 存盘 / 转场景 → 场景录制为视频）");
+  if (hlState.dead) hlSkip("AJ", "AJ. 视频（页面现录测试视频 → 以视频为背景 → 存盘 → 测试台 → 视频壁纸工程裁剪 / 撤销 / 存盘 / 转场景 → 场景录制为视频）"); else try {
   await runVideoSection();
   async function runVideoSection() {
   await gotoEditor();
@@ -2781,17 +2851,19 @@ async function runCreateAndDraft(ctx) {
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AJ", "AJ. 视频（页面现录测试视频 → 以视频为背景 → 存盘 → 测试台 → 视频壁纸工程裁剪 / 撤销 / 存盘 / 转场景 → 场景录制为视频）", err); }
   section("AK. 场景设置端到端（改 camerashake → 出帧变化）");
+  if (hlState.dead) hlSkip("AK", "AK. 场景设置端到端（改 camerashake → 出帧变化）"); else try {
   await gotoEditor();
   await newBlank("#101010");
   await addImage(stripePath);
   await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
   // 编辑器页默认暂停：g_Time 不走，抖动偏移就恒定，出帧看不出变化 —— 先起播再比画面
   if (!(await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`))) await clickSel("#tb-play");
-  const crK = await h.canvasRect();
-  const scnClip = { x: Math.round(crK.x), y: Math.round(crK.y), width: Math.round(crK.w), height: Math.round(crK.h), scale: 1 };
+  var crK = await h.canvasRect();
+  var scnClip = { x: Math.round(crK.x), y: Math.round(crK.y), width: Math.round(crK.w), height: Math.round(crK.h), scale: 1 };
   /** 画面指纹：画布区域缩到 64×36 灰度。比的是「画面动没动」，不是某个像素的值 */
-  const scnFp = async () => {
+  var scnFp = async () => {
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip: scnClip });
     return ev(`(async () => {
       const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
@@ -2801,9 +2873,9 @@ async function runCreateAndDraft(ctx) {
       return out;
     })()`);
   };
-  const scnGap = (a, b) => a.reduce((s, v, i) => s + Math.abs(v - b[i]), 0) / a.length;
+  var scnGap = (a, b) => a.reduce((s, v, i) => s + Math.abs(v - b[i]), 0) / a.length;
   /** 连采 n 张取与首张的最大差：静止画面 ≈ 0，抖动画面取到摆幅 */
-  const scnSwing = async (n, ms) => {
+  var scnSwing = async (n, ms) => {
     const fps = [];
     for (let i = 0; i < n; i++) {
       if (i) await new Promise((r) => setTimeout(r, ms));
@@ -2813,7 +2885,7 @@ async function runCreateAndDraft(ctx) {
     for (let i = 1; i < fps.length; i++) mx = Math.max(mx, scnGap(fps[0], fps[i]));
     return { mx, first: fps[0] };
   };
-  const scnSet = async (key, value) => {
+  var scnSet = async (key, value) => {
     const rc = await h.readyCount();
     await ev(`(() => {
       const el = document.querySelector('#scene-menu-body [data-scene-key="${key}"] input');
@@ -2825,12 +2897,12 @@ async function runCreateAndDraft(ctx) {
     await h.waitRemount(rc);
   };
   /** 视口工具条 overflow-x:auto：先把按钮滚进可见区，再按真实坐标点它（否则点到别的地方） */
-  const scnClickOpts = async () => {
+  var scnClickOpts = async () => {
     await ev(`(() => { document.querySelector('#tb-scene-opts').scrollIntoView({ block: 'nearest', inline: 'nearest' }); return true; })()`);
     await clickSel("#tb-scene-opts");
   };
   /** 一步撤销（本段自带，不依赖后面才定义的 undoRedo）：等重挂，避免读到半截状态 */
-  const scnUndo = async () => {
+  var scnUndo = async () => {
     const rc = await h.readyCount();
     await key("z", MOD.meta);
     await h.waitRemount(rc);
@@ -2845,7 +2917,7 @@ async function runCreateAndDraft(ctx) {
   await scnClickOpts();
   check(await ev(`document.querySelector('#scene-menu').hidden`), "再点一次收起（与渲染选项一致）");
 
-  const baseK = await scnSwing(4, 120);
+  var baseK = await scnSwing(4, 120);
   check(baseK.mx < 0.6, `未开抖动：静止画面连采 4 张几乎不变（最大差 ${baseK.mx.toFixed(3)}）`);
 
   await scnClickOpts();
@@ -2853,7 +2925,7 @@ async function runCreateAndDraft(ctx) {
   await scnSet("camerashake", true);
   check(await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashake"] .wb-field-val').textContent)`) === "已设", "开一次抖动：文档里真写下了这个键（面板标「已设」）");
   await scnClickOpts();
-  const shakeK = await scnSwing(8, 90);
+  var shakeK = await scnSwing(8, 90);
   check(shakeK.mx > baseK.mx * 3 && shakeK.mx > 1, `★ 改 camerashake：出帧开始晃（最大差 ${shakeK.mx.toFixed(3)}，静止时 ${baseK.mx.toFixed(3)}）`);
   await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/scene-shake.jpg") });
   console.log("  截图：scripts/.tmp-editor-e2e/scene-shake.jpg");
@@ -2864,26 +2936,28 @@ async function runCreateAndDraft(ctx) {
   await scnClickOpts();
   check(await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashake"] .wb-field-val').textContent)`) === "未设置" && (await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashakeamplitude"] .wb-field-val').textContent)`)) === "已设", "撤销一步只收回最后一笔（抖动关了，先写的幅度还在）");
   await scnClickOpts();
-  const undoneK = await scnSwing(4, 120);
+  var undoneK = await scnSwing(4, 120);
   check(undoneK.mx < 0.6 && scnGap(undoneK.first, baseK.first) < 1.2, `撤销后画面回到静止基线（连采最大差 ${undoneK.mx.toFixed(3)}，与基线差 ${scnGap(undoneK.first, baseK.first).toFixed(3)}）`);
 
   await ev(`document.activeElement && document.activeElement.blur()`);
   await scnUndo();
-  const idK = await saveLoose();
-  const genK = JSON.parse(fs.readFileSync(path.join(lib, idK, "scene.json"), "utf8")).general;
+  var idK = await saveLoose();
+  var genK = JSON.parse(fs.readFileSync(path.join(lib, idK, "scene.json"), "utf8")).general;
   check(!("camerashake" in genK) && !("camerashakeamplitude" in genK), `撤销到底：这次写进去的两个键都从盘上 scene.json 里收回了（现存 ${json(Object.keys(genK))}）`);
   check(json(genK.orthogonalprojection) === json({ width: 1920, height: 1080 }), "★ 撤销到底也没碰 orthogonalprojection（分辨率还在）");
   check((await h.errorLines()).length === 0, "场景设置全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
+  } catch (err) { await hlAbort("AK", "AK. 场景设置端到端（改 camerashake → 出帧变化）", err); }
   section("AM. M9 命令面板 / 无障碍 / 脚本事件模板");
+  if (hlState.dead) hlSkip("AM", "AM. M9 命令面板 / 无障碍 / 脚本事件模板"); else try {
   // 段内自带按键派发：共享的 KEYS 里没有 k / 方向键，这里不动它
-  const amSend = async (k, code, vk, modifiers = 0) => {
+  var amSend = async (k, code, vk, modifiers = 0) => {
     await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
     await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers });
     await settle();
   };
-  const AMK = {
+  var AMK = {
     k: ["k", "KeyK", 75],
     Escape: ["Escape", "Escape", 27],
     Enter: ["Enter", "Enter", 13],
@@ -2894,47 +2968,47 @@ async function runCreateAndDraft(ctx) {
     Home: ["Home", "Home", 36],
     End: ["End", "End", 35],
   };
-  const amPress = (k, modifiers = 0) => amSend(...AMK[k], modifiers);
-  const amOpen = () => ev(`!!document.querySelector('#ed-palette')?.open`);
-  const amRows = () =>
+  var amPress = (k, modifiers = 0) => amSend(...AMK[k], modifiers);
+  var amOpen = () => ev(`!!document.querySelector('#ed-palette')?.open`);
+  var amRows = () =>
     ev(`[...document.querySelectorAll('#ed-palette-list .ed-palette-row')].map((r) => ({ id: r.dataset.command, name: (r.querySelector('.ed-palette-name') || {}).textContent || '', on: r.getAttribute('aria-selected') === 'true' }))`);
-  const amType = async (q) => {
+  var amType = async (q) => {
     await ev(`(() => { const i = document.querySelector('#ed-palette-input'); i.value = ${JSON.stringify(q)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
     await settle();
   };
-  const amAria = (id, attr) => ev(`(document.querySelector('#ed-tree .ed-node[data-id="${id}"]') || {}).getAttribute ? document.querySelector('#ed-tree .ed-node[data-id="${id}"]').getAttribute('${attr}') : null`);
-  const amActive = () => ev(`(document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null) || null`);
-  const amFocusRow = (id) => ev(`(() => { const n = document.querySelector('#ed-tree .ed-node[data-id="${id}"]'); if (!n) return false; n.focus(); return document.activeElement === n; })()`);
+  var amAria = (id, attr) => ev(`(document.querySelector('#ed-tree .ed-node[data-id="${id}"]') || {}).getAttribute ? document.querySelector('#ed-tree .ed-node[data-id="${id}"]').getAttribute('${attr}') : null`);
+  var amActive = () => ev(`(document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null) || null`);
+  var amFocusRow = (id) => ev(`(() => { const n = document.querySelector('#ed-tree .ed-node[data-id="${id}"]'); if (!n) return false; n.focus(); return document.activeElement === n; })()`);
 
   await gotoEditor();
   await newBlank("#000000");
   await addTextPreset("plain");
   await setText("content", "PAL");
   await setText("size", "60");
-  const amA = String((await rawObj()).id);
+  var amA = String((await rawObj()).id);
   await addTextPreset("plain");
   await setText("content", "TREE");
   await setText("size", "60");
-  const amB = String((await rawObj()).id);
-  const amBefore = (await treeIds()).length;
+  var amB = String((await rawObj()).id);
+  var amBefore = (await treeIds()).length;
 
   // ── C4：⌘K 打开 → 枚举注册表 → 过滤 / ↑↓ / Enter 执行 layer.duplicate / 动态快捷键总览 ──
   await ev(`document.activeElement && document.activeElement.blur()`);
   await amPress("k", MOD.meta);
   await waitFor(`!!document.querySelector('#ed-palette')?.open`, 30000);
-  const amAll = await amRows();
-  const amIds = amAll.map((r) => r.id);
+  var amAll = await amRows();
+  var amIds = amAll.map((r) => r.id);
   check(amIds.length >= 7 && amIds.includes("edit.undo") && amIds.includes("layer.duplicate"), `⌘K 打开命令面板，条目来自命令注册表（${json(amIds)}）`);
   check(amAll[0].id === "edit.undo" && amAll.filter((r) => r.on).length === 1 && amAll[0].on, "面板按注册顺序列出，只有一行处于选中态");
   check(amAll.every((r) => r.name && r.name !== r.id), `标题是本地化文案而不是裸 id（首条「${amAll[0].name}」）`);
   check((await ev(`document.querySelector('#ed-palette-input').getAttribute('aria-activedescendant')`)) === "ed-palette-opt-edit-undo", "输入框的 aria-activedescendant 指向当前选项");
   await amPress("ArrowDown");
-  const amDown = await amRows();
+  var amDown = await amRows();
   check(amDown[1].on && !amDown[0].on, "↓ 移动选择（aria-selected 跟着走）");
   await amPress("ArrowUp");
   check((await amRows())[0].on, "↑ 移回上一行");
   await amType("复制");
-  const amHit = await amRows();
+  var amHit = await amRows();
   check(amHit.length === 1 && amHit[0].id === "layer.duplicate", `输入过滤后只剩 layer.duplicate（${json(amHit.map((r) => r.id))}）`);
   await amType("zzz");
   check(await ev(`!!document.querySelector('#ed-palette-list .ed-palette-empty')`), "无命中时给空提示（不是空列表）");
@@ -2943,7 +3017,7 @@ async function runCreateAndDraft(ctx) {
   await amType("复制");
   await amPress("Enter");
   await waitFor(`!document.querySelector('#ed-palette')?.open`, 15000);
-  const amAfter = (await treeIds()).length;
+  var amAfter = (await treeIds()).length;
   check(amAfter === amBefore + 1, `★ Enter 执行注册表里的 layer.duplicate：图层 ${amBefore} → ${amAfter}`);
   await amPress("k", MOD.meta);
   await waitFor(`!!document.querySelector('#ed-palette')?.open`, 15000);
@@ -2956,7 +3030,7 @@ async function runCreateAndDraft(ctx) {
   check(await ev(`!!document.querySelector('#ed-palette-shortcuts')?.hidden`), "默认给命令列表（快捷键总览是切换出来的）");
   await clickSel("#ed-palette-keys");
   await settle();
-  const amKeys = await ev(`[...document.querySelectorAll('#ed-palette-shortcuts .ed-palette-key-row')].map((r) => r.textContent.replace(/\\s+/g, ' ').trim())`);
+  var amKeys = await ev(`[...document.querySelectorAll('#ed-palette-shortcuts .ed-palette-key-row')].map((r) => r.textContent.replace(/\\s+/g, ' ').trim())`);
   check(amKeys.length >= 6 && amKeys.some((t) => t.includes("⌘Z")) && amKeys.some((t) => t.includes("⇧⌘Z")), `快捷键总览由注册表生成（${amKeys.length} 行，键是平台写法：${json(amKeys.slice(0, 3))}）`);
   check(amKeys.every((t) => !t.includes("export.run")), "没有快捷键的命令不进总览");
   await amPress("Escape");
@@ -2964,7 +3038,7 @@ async function runCreateAndDraft(ctx) {
   check(!(await amOpen()), "Esc 关闭面板（面板内焦点在输入框，窗口级 ⌘K 分支不会重复触发）");
 
   // ── C5：树无障碍（treeitem / roving tabindex / ↑↓ Home End / ←→ 折叠展开 / ⇧ 多选仍在） ──
-  const amOrder = await treeIds();
+  var amOrder = await treeIds();
   check((await ev(`document.querySelectorAll('#ed-tree [role="treeitem"]').length`)) === amOrder.length && amOrder.length >= 3, `树行都是 treeitem（${amOrder.length} 行）`);
   await clickRow(amOrder[1]);
   await settle();
@@ -2974,18 +3048,18 @@ async function runCreateAndDraft(ctx) {
   await amPress("ArrowDown");
   check((await amActive()) === amOrder[1] && (await amAria(amOrder[1], "aria-selected")) === "true", "↓ 焦点下移并同步选择");
   await amPress("End");
-  const amLast = amOrder[amOrder.length - 1];
+  var amLast = amOrder[amOrder.length - 1];
   check((await amActive()) === amLast && (await amAria(amLast, "aria-selected")) === "true", "End 到末行并同步选择");
   await amPress("Home");
   check((await amActive()) === amOrder[0] && (await amAria(amOrder[0], "aria-selected")) === "true", "Home 回首行并同步选择");
   await click(await rowAt(amOrder[1]), MOD.shift);
   await settle();
-  const amMulti = await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.getAttribute('aria-selected') === 'true').map((n) => n.dataset.id)`);
+  var amMulti = await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.getAttribute('aria-selected') === 'true').map((n) => n.dataset.id)`);
   check(amMulti.length === 2 && amMulti.includes(amOrder[0]) && amMulti.includes(amOrder[1]), `⇧ 多选没被无障碍改动吃掉：两行同时 aria-selected（${json(amMulti)}）`);
   await clickSel("#ly-group");
   await settle();
   await waitFor(`!!document.querySelector('#ed-tree .ed-node[aria-expanded]')`, 15000);
-  const amGroup = await ev(`(document.querySelector('#ed-tree .ed-node[aria-expanded]') || {}).dataset?.id || null`);
+  var amGroup = await ev(`(document.querySelector('#ed-tree .ed-node[aria-expanded]') || {}).dataset?.id || null`);
   check(!!amGroup && (await amAria(amGroup, "aria-level")) === "1" && (await ev(`[...document.querySelectorAll('#ed-tree .ed-node')].filter((n) => n.getAttribute('aria-level') === '2').length`)) === 2, "成组后：组是 aria-level=1，两个子层是 aria-level=2");
   await amFocusRow(amGroup);
   await amPress("ArrowLeft");
@@ -2993,7 +3067,7 @@ async function runCreateAndDraft(ctx) {
   await amPress("ArrowRight");
   check((await amAria(amGroup, "aria-expanded")) === "true", "→ 展开组（aria-expanded=true）");
   await amPress("ArrowRight");
-  const amChild = await ev(`(document.querySelector('#ed-tree .ed-node[aria-level="2"]') || {}).dataset?.id || null`);
+  var amChild = await ev(`(document.querySelector('#ed-tree .ed-node[aria-level="2"]') || {}).dataset?.id || null`);
   check(!!amChild && (await amActive()) === amChild && (await amAria(amChild, "aria-selected")) === "true", "→ 在展开的组上进第一个子行并同步选择");
   await amPress("ArrowLeft");
   check((await amActive()) === amGroup, "← 从子行回到组行");
@@ -3002,28 +3076,30 @@ async function runCreateAndDraft(ctx) {
   // ── B8：脚本事件模板（面板入口 → 8 类 → 生成的脚本一次预检通过） ──
   await clickRow(amB);
   await settle();
-  const amTpls = await ev(`[...document.querySelectorAll('#script-template option')].map((o) => [o.value, o.textContent])`);
+  var amTpls = await ev(`[...document.querySelectorAll('#script-template option')].map((o) => [o.value, o.textContent])`);
   check(json(amTpls.map((o) => o[0])) === json(["update", "init", "applyUserProperties", "cursor", "media", "resizeScreen", "animationEvent", "destroy"]), `脚本面板给出 8 类生命周期模板（${json(amTpls.map((o) => o[0]))}）`);
   check(amTpls.length === 8 && !amTpls[0][1].startsWith("sc.") && amTpls[0][1].includes("update"), `模板下拉是本地化文案（首项「${amTpls[0][1]}」）`);
   await ev(`(() => { const s = document.querySelector('#script-template'); s.value = 'cursor'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
   await ev(`(() => { const s = document.querySelector('#script-add'); s.value = 'text'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
   await waitFor(`!!document.querySelector('.ed-script-src')`, 15000);
   await settle();
-  const amSrc = await ev(`document.querySelector('.ed-script-src').value`);
+  var amSrc = await ev(`document.querySelector('.ed-script-src').value`);
   check(/export function update\(value\)/.test(amSrc) && /export function cursorClick\(e\) \{\}/.test(amSrc) && /export function cursorMove\(e\) \{\}/.test(amSrc), "cursor 模板生成的脚本 = 6 个 cursor* 钩子 + 字段主回调 update");
   check(/cursorClick/.test(amSrc) && !/mediaLyricsChanged/.test(amSrc) && !/animationEvent/.test(amSrc), "只放选中的那一类生命周期（没有把 8 类全塞进去）");
   await waitFor(`/语法正确|Syntax OK/.test((document.querySelector('.ed-script-status') || {}).textContent || '')`, 15000);
-  const amStatus = await ev(`(document.querySelector('.ed-script-status') || {}).textContent || ''`);
+  var amStatus = await ev(`(document.querySelector('.ed-script-status') || {}).textContent || ''`);
   check(/cursorMove/.test(amStatus), `预检状态栏列出引擎认到的入口（「${amStatus}」）`);
   check((await h.errorLines()).length === 0, "M9 命令面板 / 无障碍 / 脚本模板全程无错误");
 
   // ── M10 D1 回归：槽位里的插件贡献不许被宿主重绘清扫 ──
   // 背景：`renderExportMenu()` 原先用后代查询清扫 `button`，会把 `#ed-plugin-export`
   // 里的插件贡献一并删掉（注册表还在、贡献没了），而且切语言 / 新增导出器时反复复现。
+  } catch (err) { await hlAbort("AM", "AM. M9 命令面板 / 无障碍 / 脚本事件模板", err); }
   section("AN. M10 插件槽位：导出菜单重绘不清扫插件项");
+  if (hlState.dead) hlSkip("AN", "AN. M10 插件槽位：导出菜单重绘不清扫插件项"); else try {
   await gotoEditor();
   await newBlank("#000000");
-  const anInject = () =>
+  var anInject = () =>
     ev(`(() => {
       const host = document.querySelector('#ed-plugin-export');
       if (!host) return 'no-slot';
@@ -3033,7 +3109,7 @@ async function runCreateAndDraft(ctx) {
       return 'an-plugin-item';
     })()`);
   check((await anInject()) === "an-plugin-item", "AN 插件导出槽位存在（#ed-plugin-export 可挂条目）");
-  const anLang = async (v) => {
+  var anLang = async (v) => {
     await ev(`(() => { const s = document.querySelector('#lang'); s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
     await settle();
   };
@@ -3048,11 +3124,16 @@ async function runCreateAndDraft(ctx) {
     "★ AN 连续两次重绘都不动插件项（贡献不会静默消失）",
   );
   // 反向：宿主自己的导出项仍按注册表重建（收窄清扫范围没有把自愈弄丢）
-  const anDel = await ev(`(() => { const b = document.querySelector('#export-zip'); if (!b) return false; b.remove(); return true; })()`);
+  var anDel = await ev(`(() => { const b = document.querySelector('#export-zip'); if (!b) return false; b.remove(); return true; })()`);
   await anLang("en");
   check(
     anDel === true && (await ev(`!!document.querySelector('#export-zip')`)) === true,
     "AN 删掉宿主自己的导出项后重绘会补回来（清扫范围收窄不影响自愈）",
   );
   check((await h.errorLines()).length === 0, "M10 插件槽位重绘 / 语言切换全程无错误");
+  } catch (err) { await hlAbort("AN", "AN. M10 插件槽位：导出菜单重绘不清扫插件项", err); }
+  if (hlState.aborts.length || hlState.skipped) {
+    console.log(`\n真机段小结：中断 ${hlState.aborts.length} 段、跳过 ${hlState.skipped} 段`);
+    for (const a of hlState.aborts) console.log(`  ✗ ${a.name} —— ${a.msg}`);
+  }
 }
