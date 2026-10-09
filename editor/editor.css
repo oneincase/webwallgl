@@ -1240,6 +1240,16 @@ input.ed-al-name {
   width: 72px;
 }
 
+.ed-pointer-label {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-pointer-row > select {
+  flex: 1;
+  min-width: 0;
+}
+
 .ed-pointer-menu > .ed-pointer-row > button {
   flex: 1;
   height: 24px;

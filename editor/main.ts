@@ -1010,6 +1010,8 @@ function syncTimeline() {
 function tickTimeline() {
   requestAnimationFrame(tickTimeline);
   drawOverlay();
+  // 指针回放跟着播放头走：取样成功（= 正在回放）才刷状态栏那行字
+  if (pointerStudio.tick()) syncPointerState();
   if (!editor || scrubbing) return;
   const t = editor.time;
   // 场景壁纸没有时长概念（循环播放），滑条窗口按 30s 一档向后扩
@@ -2330,6 +2332,9 @@ const ptrParkEl = $<HTMLButtonElement>("#ptr-park");
 const ptrCenterEl = $<HTMLButtonElement>("#ptr-center");
 const ptrNameEl = $<HTMLInputElement>("#ptr-name");
 const ptrRecEl = $<HTMLButtonElement>("#ptr-rec");
+const ptrTracksEl = $<HTMLSelectElement>("#ptr-tracks");
+const ptrPlayEl = $<HTMLButtonElement>("#ptr-play");
+const ptrDelEl = $<HTMLButtonElement>("#ptr-del");
 const ptrStateEl = $<HTMLElement>("#ptr-state");
 
 /** localStorage 只作兜底：隐私模式下取用会抛，拿不到就当没有 */
@@ -2374,15 +2379,54 @@ function syncPointerCapture() {
   overlayEl.style.cursor = ptrParking ? "crosshair" : "";
 }
 
-function syncPointerState() {
-  if (pointerStudio.recording()) {
-    ptrStateEl.textContent = et("ptr.recording", { n: pointerStudio.recordingPoints() });
+/** 轨迹下拉：列表变了才重建（每帧刷新会把用户正在看的项顶掉） */
+function syncPointerTracks() {
+  const tracks = pointerStudio.list();
+  if (!tracks.length) {
+    ptrTracksEl.disabled = true;
+    if (ptrTracksEl.dataset.names !== "empty") {
+      ptrTracksEl.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = et("ptr.empty");
+      ptrTracksEl.append(opt);
+      ptrTracksEl.dataset.names = "empty";
+    }
     return;
   }
-  const p = pointerStudio.parkedPoint();
-  ptrStateEl.textContent = p
-    ? et("ptr.parkedAt", { x: p.x.toFixed(3), y: p.y.toFixed(3) })
-    : et("ptr.parkedNone");
+  ptrTracksEl.disabled = false;
+  const names = tracks.map((t) => t.name).join("\n");
+  if (ptrTracksEl.dataset.names !== names) {
+    ptrTracksEl.innerHTML = "";
+    for (const t of tracks) {
+      const opt = document.createElement("option");
+      opt.value = t.name;
+      opt.textContent = `${t.name} · ${(t.duration / 1000).toFixed(2)}s`;
+      ptrTracksEl.append(opt);
+    }
+    ptrTracksEl.dataset.names = names;
+  }
+  const active = pointerStudio.activeName();
+  if (active && ptrTracksEl.value !== active) ptrTracksEl.value = active;
+}
+
+const setText = (el: HTMLElement, text: string) => {
+  if (el.textContent !== text) el.textContent = text;
+};
+
+function syncPointerState() {
+  if (pointerStudio.recording()) {
+    setText(ptrStateEl, et("ptr.recording", { n: pointerStudio.recordingPoints() }));
+  } else if (pointerStudio.replaying()) {
+    const at = pointerStudio.replayAt();
+    setText(ptrStateEl, et("ptr.replayAt", { name: pointerStudio.replayName() ?? "", t: ((at ? at.t : 0) / 1000).toFixed(2) }));
+  } else {
+    const p = pointerStudio.parkedPoint();
+    setText(ptrStateEl, p ? et("ptr.parkedAt", { x: p.x.toFixed(3), y: p.y.toFixed(3) }) : et("ptr.parkedNone"));
+  }
+  setText(ptrRecEl, et(pointerStudio.recording() ? "ptr.recStop" : "ptr.rec"));
+  setText(ptrPlayEl, et(pointerStudio.replaying() ? "ptr.playStop" : "ptr.play"));
+  syncPointerTracks();
 }
 
 function setPointerParking(on: boolean) {
@@ -2460,11 +2504,25 @@ function togglePointerRecord() {
     pointerStudio.startRecord(ptrNameEl.value);
     log(et("log.ptrRecordStart"));
   }
-  ptrRecEl.textContent = et(pointerStudio.recording() ? "ptr.recStop" : "ptr.rec");
   syncPointerCapture();
   syncPointerState();
 }
 ptrRecEl.onclick = () => togglePointerRecord();
+
+// 回放：按时间轴播放头取样驱动 uniform（停帧下拖时间轴也能看指针走到哪）
+ptrPlayEl.onclick = () => {
+  if (pointerStudio.replaying()) pointerStudio.stopReplay();
+  else if (!pointerStudio.startReplay(ptrTracksEl.value)) log(et("ptr.empty"), "warn");
+  syncPointerState();
+};
+ptrDelEl.onclick = () => {
+  if (!pointerStudio.remove(ptrTracksEl.value)) return;
+  syncPointerState();
+};
+ptrTracksEl.onchange = () => {
+  pointerStudio.select(ptrTracksEl.value);
+  syncPointerState();
+};
 
 function closePtrMenu() {
   if (pointerStudio.recording()) togglePointerRecord();

@@ -4120,6 +4120,88 @@ section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）"
   check(recStudio.remove("没这条") === false && recStudio.list().length === beforeEmpty - 1,
     "remove：删不存在的名字返回 false，不动列表");
 
+  // 时间轴插值：回放的取样口径
+  const line = [{ t: 0, x: 0, y: 0 }, { t: 1000, x: 1, y: 0.5 }];
+  check(json(ptrMod.sampleTrack(line, -50)) === json({ t: 0, x: 0, y: 0 })
+    && json(ptrMod.sampleTrack(line, 5000)) === json({ t: 1000, x: 1, y: 0.5 }),
+  "sampleTrack：早于首点钉首点、晚于末点钉末点（不外推）");
+  const mid = ptrMod.sampleTrack(line, 250);
+  check(mid && mid.x === 0.25 && mid.y === 0.125 && mid.t === 250,
+    `sampleTrack：两点之间线性插值（实得 ${json(mid)}）`);
+  check(ptrMod.sampleTrack([], 100) === null && ptrMod.sampleTrack(line, NaN) === null,
+    "sampleTrack：空轨迹 / 非有限时刻 → null");
+  check(json(ptrMod.sampleTrack([{ t: 500, x: 0.4, y: 0.6 }], 0)) === json({ t: 500, x: 0.4, y: 0.6 }),
+    "sampleTrack：单点轨迹任何时刻都钉在那一点");
+
+  // 回放：跟着时间轴播放头走，超长折回
+  let clockMs2 = 0;
+  const repPushes = [];
+  const repLogs = [];
+  const repStudio = ptrMod.createPointerStudio({
+    push: (u, v, buttons) => repPushes.push([u, v, buttons ?? 0]),
+    leave: () => {},
+    isPaused: () => true,
+    clock: () => clockMs2,
+    now: () => clockMs2,
+    log: (msg) => repLogs.push(msg),
+    t: (key) => key,
+    storage: null,
+  });
+  check(repStudio.replaying() === false && repStudio.tick() === null && repStudio.startReplay() === false,
+    "回放：一条轨迹都没有时启动失败，tick 不驱动 uniform");
+  repStudio.startRecord("圈");
+  clockMs2 = 0;
+  repStudio.record(0, 0);
+  clockMs2 = 1000;
+  repStudio.record(1, 0.5);
+  repStudio.stopRecord();
+  clockMs2 = 0;
+  check(repStudio.startReplay("圈") === true && repStudio.replaying() === true
+    && json(repPushes.at(-1)) === json([0, 0, 0]),
+  "startReplay：开局先按当前播放头摆一次");
+  clockMs2 = 250;
+  repStudio.tick();
+  check(json(repPushes.at(-1)) === json([0.25, 0.125, 0]),
+    `tick：按播放头在轨迹上取样驱动 uniform（实得 ${json(repPushes.at(-1))}）`);
+  clockMs2 = 1250;
+  repStudio.tick();
+  check(json(repPushes.at(-1)) === json([0.25, 0.125, 0]),
+    "tick：播放头超过轨迹长度就折回（场景在循环，轨迹跟着循环）");
+  clockMs2 = 0;
+  repStudio.tick();
+  check(json(repStudio.replayAt()) === json({ t: 0, x: 0, y: 0 }) && repStudio.replayName() === "圈",
+    "replayAt / replayName：回放光标停在取样点上，供菜单显示");
+  check(repLogs.includes("log.ptrReplay"), "startReplay：记录一条可读日志（log.ptrReplay）");
+  check(repStudio.stopReplay() === true && repStudio.replaying() === false
+    && repStudio.tick() === null && repStudio.stopReplay() === false,
+  "stopReplay：停下来后 tick 不再驱动 uniform（重复调用返回 false）");
+  repStudio.startReplay("圈");
+  clockMs2 = 500;
+  repStudio.tick();
+  const resyncRep = repStudio.resync();
+  check(repStudio.replaying() === true && resyncRep && resyncRep.x === 0.5 && resyncRep.y === 0.25,
+    `resync：回放中重挂按回放取样补推（优先于停帧摆位，实得 ${json(resyncRep)}）`);
+  clockMs2 = 0;
+  repStudio.tick();
+  check(repStudio.startRecord("截") === true && repStudio.replaying() === false,
+    "startRecord：录制与回放抢同一根指针，开录先停回放");
+  repStudio.cancelRecord();
+  check(repStudio.startRecord("截") === true, "startRecord：取消后可重开一段");
+  clockMs2 = 0;
+  repStudio.record(0.2, 0.2);
+  clockMs2 = 500;
+  repStudio.record(0.8, 0.8);
+  repStudio.stopRecord();
+  repStudio.startReplay("截");
+  check(repStudio.place(0.3, 0.3) !== null && repStudio.replaying() === false,
+    "place：手动摆位优先于回放（摆了就停回放，否则下一帧又被轨迹盖掉）");
+  repStudio.startReplay("截");
+  check(repStudio.remove("截") === true && repStudio.replaying() === false
+    && repLogs.includes("log.ptrReplayStop"),
+  "remove：删掉正在回放的那条轨迹会先停回放");
+  check(repLogs.filter((m) => m === "log.ptrReplayStop").length >= 2,
+    "stopReplay：每次停下都记一条日志（log.ptrReplayStop）");
+
   check(json(doc) === before,
     "停帧摆位不改文档：反复摆位后文档快照逐字节一致（指针对场景是纯运行时状态）");
   check(!/from "\.\/(save|export-pipeline|doc|history)"/.test(ptrSrc),

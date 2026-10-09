@@ -87,6 +87,31 @@ export function normalizePoints(points: ReadonlyArray<unknown>): PointerPoint[] 
 export const trackDuration = (points: ReadonlyArray<PointerPoint>): number =>
   points.length ? points[points.length - 1].t : 0;
 
+/**
+ * 按时间轴取样：二分找到 t 落在哪两点之间再线性插值。
+ * 回放要的是「任意时刻都能问出指针在哪」，所以早于首点钉首点、晚于末点钉末点（不外推），空轨迹 null。
+ */
+export function sampleTrack(points: ReadonlyArray<PointerPoint>, tMs: unknown): PointerPoint | null {
+  const t = num(tMs);
+  if (!points.length || !Number.isFinite(t)) return null;
+  const first = points[0];
+  const last = points[points.length - 1];
+  if (t <= first.t) return { ...first };
+  if (t >= last.t) return { ...last };
+  let lo = 0;
+  let hi = points.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (points[mid].t <= t) lo = mid;
+    else hi = mid;
+  }
+  const a = points[lo];
+  const b = points[hi];
+  const span = b.t - a.t;
+  const k = span > 0 ? (t - a.t) / span : 0;
+  return { t: r5(t), x: r5(a.x + (b.x - a.x) * k), y: r5(a.y + (b.y - a.y) * k) };
+}
+
 /** 点数超上限时等距抽稀（首尾必留）：localStorage 兜底不能塞爆 */
 function decimate(points: PointerPoint[], max: number): PointerPoint[] {
   if (points.length <= max) return points;
@@ -212,6 +237,7 @@ export function createPointerStudio(deps: PointerStudioDeps) {
   /**
    * 摆位：把指针放到指定归一化坐标并驱动引擎。
    * 未暂停时拒绝（force 例外）——播放中场景每帧都会把 uniform 采样走，摆了也看不见。
+   * 手动摆位优先于回放：摆了就停回放，否则下一帧又会被轨迹覆盖。
    */
   function place(x: unknown, y: unknown, opts: { force?: boolean; buttons?: number } = {}) {
     if (!opts.force && !deps.isPaused()) {
@@ -220,6 +246,7 @@ export function createPointerStudio(deps: PointerStudioDeps) {
     }
     const p = clampPoint(x, y);
     if (!p) return null;
+    if (replay) stopReplay();
     parked = p;
     return pushAt(p, opts.buttons ?? 0);
   }
@@ -233,7 +260,7 @@ export function createPointerStudio(deps: PointerStudioDeps) {
 
   /** 场景重挂（改 DPR / 结构编辑 / 换分辨率）后补推一次：新实例的 uniform 是 0 */
   function resync() {
-    const p = parked ?? lastPos;
+    const p = replay ? replaySample() : parked ?? lastPos;
     if (!p) return null;
     return pushAt(p);
   }
@@ -262,6 +289,8 @@ export function createPointerStudio(deps: PointerStudioDeps) {
   /** 开始录：时间戳从 deps.now() 起算，采到的点是相对起点的毫秒数 */
   function startRecord(name = ""): boolean {
     if (rec) return false;
+    // 一根指针不能同时被回放和录制驱动
+    if (replay) stopReplay();
     rec = { startedAt: deps.now(), points: [] };
     recName = typeof name === "string" ? name.trim() : "";
     return true;
@@ -302,10 +331,67 @@ export function createPointerStudio(deps: PointerStudioDeps) {
     recName = "";
   }
 
+  // ---------- 轨迹回放 ----------
+
+  /** 正在回放的轨迹名；null = 没在回放 */
+  let replay: { name: string } | null = null;
+  /** 最近一次回放取到的采样点（UI 显示播放到哪儿） */
+  let replayPos: PointerPoint | null = null;
+
+  /**
+   * 回放时间 = 播放头折回轨迹长度。场景在循环，轨迹也跟着循环：
+   * 播放头拖到哪儿，指针就在轨迹的对应位置，停帧下拖时间轴也一样成立。
+   */
+  function replayTime(track: PointerTrack): number {
+    const dur = track.duration;
+    if (!(dur > 0)) return 0;
+    const t = deps.clock() % dur;
+    return t < 0 ? t + dur : t;
+  }
+
+  function replaySample(): PointerPoint | null {
+    const track = tracks.find((t) => t.name === replay?.name);
+    return track ? sampleTrack(track.points, replayTime(track)) : null;
+  }
+
+  /** 开始回放：立刻按当前播放头摆一次，之后交给 tick() */
+  function startReplay(name?: unknown): boolean {
+    if (typeof name === "string" && name) select(name);
+    const track = tracks.find((t) => t.name === activeName);
+    if (!track) return false;
+    // 录制与回放抢同一根指针，正在录就先收工（已采的点照常存成一条轨迹）
+    if (rec) stopRecord();
+    replay = { name: track.name };
+    const p = replaySample();
+    if (p) pushAt(p);
+    say("log.ptrReplay", { name: track.name, dur: (track.duration / 1000).toFixed(2) });
+    return true;
+  }
+
+  function stopReplay(): boolean {
+    if (!replay) return false;
+    const name = replay.name;
+    replay = null;
+    replayPos = null;
+    say("log.ptrReplayStop", { name });
+    return true;
+  }
+
+  /** 每帧调用（时间轴 tick）：回放中按播放头取样并驱动 uniform */
+  function tick(): PointerPoint | null {
+    if (!replay) return null;
+    const p = replaySample();
+    replayPos = p;
+    if (p) pushAt(p);
+    return p;
+  }
+
   function select(name: unknown): string | null {
     const n = String(name ?? "");
     if (tracks.some((t) => t.name === n)) activeName = n;
     else if (!tracks.some((t) => t.name === activeName)) activeName = tracks.length ? tracks[0].name : null;
+    // 回放跟着选中项走：换一条轨迹接着放，不用先停再开
+    if (replay && activeName) replay.name = activeName;
     return activeName;
   }
 
@@ -317,6 +403,8 @@ export function createPointerStudio(deps: PointerStudioDeps) {
     const target = typeof name === "string" && name ? name : activeName;
     const gone = tracks.find((t) => t.name === target);
     if (!gone) return false;
+    // 删的正是回放中那条：先停回放，别继续驱动一根没有轨迹的指针
+    if (replay && replay.name === gone.name) stopReplay();
     tracks = tracks.filter((t) => t !== gone);
     activeName = tracks.length ? tracks[0].name : null;
     persist();
@@ -347,6 +435,13 @@ export function createPointerStudio(deps: PointerStudioDeps) {
       return t ? cloneTrack(t) : null;
     },
     remove,
+    // 轨迹回放
+    startReplay,
+    stopReplay,
+    replaying: () => !!replay,
+    replayName: () => (replay ? replay.name : null),
+    replayAt: () => (replayPos ? { ...replayPos } : null),
+    tick,
   };
 }
 
