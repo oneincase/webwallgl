@@ -569,18 +569,53 @@ export const effectDirOf = (d: Pick<EffectDef, "id" | "prefix">) => `${d.prefix 
 
 export const effectFileOf = (id: string) => `effects/${effectDirOf(effectById(id) ?? { id })}/effect.json`;
 
-/** scene.json 里的效果文件路径 → 已登记效果 id（不是本库 / 插件的效果返回 null） */
-export function effectIdOf(file: unknown): string | null {
+/** scene.json 的效果路径 → 目录名（合法路径才有；`effects/<dir>/effect.json` 的 dir） */
+export function effectDirNameOf(file: unknown): string | null {
   if (typeof file !== "string") return null;
   const m = /^effects\/([a-z0-9_]+)\/effect\.json$/.exec(file);
-  if (!m) return null;
-  const dir = m[1];
+  return m ? m[1] : null;
+}
+
+/**
+ * 目录名 → **已登记**效果 id（内置 / 插件）。`wwgl_` 前缀是编辑器自建命名空间，
+ * 必须能在注册表里按目录名往返校验；其他目录名（WE 官方 / 库内效果）不算登记。
+ */
+export function registeredEffectOf(dir: string): string | null {
   if (dir.startsWith(EFFECT_PREFIX)) {
     const d = effectById(dir.slice(EFFECT_PREFIX.length));
     if (d && effectDirOf(d) === dir) return d.id;
   }
   for (const d of [...effectCatalog.list(), ...EFFECTS]) if (effectDirOf(d) === dir) return d.id;
   return null;
+}
+
+/**
+ * 文件路径 → 已登记效果定义。**目录名必须与登记目录完全一致**：
+ * 库内 `effects/tint/effect.json` 不是内置 `effects/wwgl_tint/effect.json`，
+ * 否则库内同名目录会套上内置参数表（M6 效果库接入的撞名守门）。
+ */
+export function registeredEffectOfFile(file: unknown): EffectDef | null {
+  const dir = effectDirNameOf(file);
+  if (dir === null) return null;
+  const id = registeredEffectOf(dir);
+  return id === null ? null : effectById(id);
+}
+
+/**
+ * scene.json 里的效果文件路径 → 效果 id。
+ *
+ * - 已登记效果（内置 / 插件）：目录名 → 登记 id（`effects/wwgl_blur/effect.json` → `"blur"`）；
+ * - **库内 / WE 官方效果**（M6）：没有登记，目录名本身就是 id
+ *   （`effects/tint/effect.json` → `"tint"`，`effects/godrays/effect.json` → `"godrays"`）；
+ * - 未登记的 `wwgl_` 前缀目录（插件被禁用 / 效果已删）与非法路径：null。
+ *
+ * 参数面板据此把库内效果路由到 M1 的「按 shader uniform 注释还原参数表」那条路
+ * （见 editor/main.ts 的 externalParamsOf）。
+ */
+export function effectIdOf(file: unknown): string | null {
+  const dir = effectDirNameOf(file);
+  if (dir === null) return null;
+  return registeredEffectOf(dir) ?? (dir.startsWith(EFFECT_PREFIX) ? null : dir);
 }
 
 /** 写进工程前的 shader 源码加工：编辑器片段 include 内联展开（WE 自己的 include 不动） */
@@ -688,7 +723,19 @@ type EffectEntry = {
   file: string;
   name?: string;
   visible?: unknown;
-  passes?: Array<{ constantshadervalues?: Record<string, unknown> }>;
+  passes?: Array<InlinePassEntry>;
+};
+
+/**
+ * 追加一条**引用库内效果**时，每个 pass 要写进 scene.json 的初始内容。
+ * 参数值与 `combos` 都内联在 scene.json 里（effect.json / 材质里没有作者的当前值）。
+ */
+export type EffectPassSeed = {
+  /** 已编码的 wire 值（`encodeValue` 的产物：标量数字 / 颜色 "r g b" 字符串） */
+  constantshadervalues?: Record<string, unknown>;
+  /** 编译期分支：材质 json 声明的默认（库内效果作者选的那一档） */
+  combos?: PassCombos;
+  textures?: unknown[];
 };
 
 const effectsOf = (obj: SceneObject): EffectEntry[] | null => (Array.isArray(obj.effects) ? (obj.effects as EffectEntry[]) : null);
@@ -703,6 +750,34 @@ export function addEffect(obj: SceneObject, id: string): number | null {
   const perPass: Array<Record<string, number | string>> = Array.from({ length: passCount }, () => ({}));
   for (const p of d.params) perPass[Math.min(p.pass ?? 0, passCount - 1)][p.key] = encodeValue(p, p.default as EffectValue);
   list.push({ file: effectFileOf(id), name: id, visible: true, passes: perPass.map((constants) => ({ constantshadervalues: constants })) });
+  return list.length - 1;
+}
+
+/**
+ * 往对象的 `effects[]` 末尾追加一条**引用库内 / WE 官方效果**的条目，返回序号。
+ *
+ * M6 合规边界（计划 §6 决策 5 = (a)）：这里**只写 scene.json 里的引用**，
+ * 不复制 `effect.json` / 材质 / 贴图进工程、不写回库。代价：引用库内效果的工程
+ * 换机打开会缺效果。参数值与 `combos` 内联进 scene.json（引擎只用这两样）。
+ */
+export function addEffectRef(obj: SceneObject, file: string, name: string, passes: readonly EffectPassSeed[]): number | null {
+  if (effectDirNameOf(file) === null) return null;
+  if (!Array.isArray(passes) || !passes.length) return null;
+  if (!Array.isArray(obj.effects)) obj.effects = [];
+  const list = obj.effects as EffectEntry[];
+  const entry: EffectEntry = {
+    file,
+    name: name || (file.split("/").slice(-2, -1)[0] ?? file),
+    visible: true,
+    passes: passes.map((p) => {
+      const out: InlinePassEntry = {};
+      if (p.constantshadervalues) out.constantshadervalues = { ...p.constantshadervalues };
+      if (p.combos && Object.keys(p.combos).length) out.combos = { ...p.combos };
+      if (p.textures?.length) out.textures = [...p.textures];
+      return out;
+    }),
+  };
+  list.push(entry);
   return list.length - 1;
 }
 
@@ -740,8 +815,9 @@ export function isEffectVisible(entry: { visible?: unknown }): boolean {
 /** 改一个参数。字段若是 `{user, value}` / `{script, value}` 包装，只改快照值 */
 export function setEffectParam(obj: SceneObject, index: number, key: string, value: EffectValue, params?: readonly EffectParam[]): boolean {
   const e = effectsOf(obj)?.[index];
-  const id = effectIdOf(e?.file);
-  const p = (params ?? (id ? effectById(id)!.params : undefined))?.find((x) => x.key === key);
+  // 只认**已登记**效果的参数表：库内同名目录（effects/tint）不算内置 tint（否则会照内置表写库内效果）
+  const decl = params ?? registeredEffectOfFile(e?.file)?.params;
+  const p = decl?.find((x) => x.key === key);
   if (!e || !p) return false;
   if (!Array.isArray(e.passes) || !e.passes.length) e.passes = [{}];
   while (e.passes.length <= (p.pass ?? 0)) e.passes.push({});
@@ -773,8 +849,7 @@ function readValues(e: EffectEntry, params: readonly EffectParam[]): Record<stri
 
 export function effectViews(obj: SceneObject): EffectView[] {
   return (effectsOf(obj) ?? []).map((e, index) => {
-    const id = effectIdOf(e.file);
-    const d = id ? effectById(id) : null;
+    const d = registeredEffectOfFile(e.file);
     return {
       index,
       file: e.file,
@@ -875,7 +950,12 @@ export async function inspectEffectPasses(file: string, read: ReadText): Promise
         for (const p of parseShaderParams(src, i)) if (!params.some((q) => q.key.toLowerCase() === p.key.toLowerCase())) params.push(p);
       }
     }
-    out.push({ pass: i, shader: typeof shader === "string" ? shader : null, params });
+    out.push({
+      pass: i,
+      shader: typeof shader === "string" ? shader : null,
+      params,
+      combos: combosOfMaterialJson(mat),
+    });
   }
   return out;
 }
@@ -898,6 +978,8 @@ export type InlinePassParams = {
   /** 材质里声明的 shader（诊断用） */
   shader: string | null;
   params: EffectParam[];
+  /** 材质 json 的 `passes[0].combos`：该 pass 声明的编译期分支默认档（M6） */
+  combos: PassCombos;
 };
 
 /** 内联效果的一个 pass 在某个对象上呈现出来的样子（面板按它折叠） */
@@ -916,11 +998,17 @@ export type InlinePassView = {
   keys: string[];
   /** 该 pass 声明的贴图槽（本编辑器不改，原样保留） */
   textures: readonly string[];
+  /** scene.json 里该 pass 的 `combos`（作者覆盖）；没有则为空表 */
+  combos: PassCombos;
+  /** 材质 json 声明的 combos 默认（库内效果 / 工程材质解析所得）；读不到则为空表 */
+  combosDeclared: PassCombos;
 };
 
 type InlinePassEntry = {
   constantshadervalues?: Record<string, unknown>;
   textures?: unknown;
+  /** 编译期分支：scene.json 里作者对材质 `combos` 的覆盖（M6 读 / 显示 / 往返） */
+  combos?: unknown;
 };
 
 const passesOf = (e: EffectEntry | undefined): InlinePassEntry[] | null => (Array.isArray(e?.passes) ? (e!.passes as InlinePassEntry[]) : null);
@@ -952,7 +1040,11 @@ export function inlineParamValues(pass: InlinePassEntry | undefined, params: rea
  * `params` 按 `effectFiles` 的键（effect.json 路径）取；缺失时该 pass 仍会列出，
  * 但 `params` 为空 —— 面板这时只读展示已有常量键，绝不新建 / 删除任何东西。
  */
-export function inlinePassViews(obj: SceneObject, params: ReadonlyMap<string, readonly EffectParam[]>): InlinePassView[] {
+export function inlinePassViews(
+  obj: SceneObject,
+  params: ReadonlyMap<string, readonly EffectParam[]>,
+  combos?: ReadonlyMap<string, readonly PassCombos[]>,
+): InlinePassView[] {
   const out: InlinePassView[] = [];
   const list = effectsOf(obj) ?? [];
   for (let i = 0; i < list.length; i++) {
@@ -974,10 +1066,94 @@ export function inlinePassViews(obj: SceneObject, params: ReadonlyMap<string, re
         values: inlineParamValues(pass, decl),
         keys: csv && typeof csv === "object" ? Object.keys(csv) : [],
         textures: Array.isArray(pass?.textures) ? (pass!.textures as string[]) : [],
+        combos: passCombosOnPass(pass),
+        combosDeclared: { ...(combos?.get(file)?.[j] ?? {}) },
       });
     }
   }
   return out;
+}
+
+// ---------- pass 级 `combos`：读 / 显示 / 往返（M6 A11）----------
+//
+// WE 的编译期分支：材质 json 的 `passes[i].combos` 是默认档，scene.json 的
+// `effects[i].passes[j].combos` 覆盖它 —— 引擎口径见
+// `renderer/vendor/we-scene/render/renderer.js` 的
+// `const combos = { ...(mp.combos || {}), ...((ov && ov.combos) || {}) }`
+// （`mp` = 材质 passes[i]，`ov` = scene.json 的 effect passes[j]）。
+// 编辑器此前生成的材质 json **不写 combos**，所以内置效果切不了编译期分支；
+// 库内效果带 combos，选中时把默认档内联进工程，之后能按档切换并逐字节往返。
+
+/** 一条 pass 的编译期分支表：combo 名 → 档位（WE 语料里都是数字） */
+export type PassCombos = Record<string, number | string>;
+
+/** 读一条效果 pass 在 scene.json 里的 combos（作者覆盖）；没有 / 不是对象 → 空表 */
+export function passCombosOnPass(pass: InlinePassEntry | undefined): PassCombos {
+  const c = pass?.combos;
+  return c && typeof c === "object" && !Array.isArray(c) ? { ...(c as PassCombos) } : {};
+}
+
+/** 读 `obj.effects[effect].passes[pass].combos` */
+export function passCombos(obj: SceneObject, effect: number, pass: number): PassCombos {
+  return passCombosOnPass(passesOf(effectsOf(obj)?.[effect])?.[pass]);
+}
+
+/** 引擎口径的合并结果：声明 ← 覆盖（后者赢），用于显示「实际生效的档」 */
+export function mergedCombos(declared?: PassCombos | null, override?: PassCombos | null): PassCombos {
+  return { ...(declared ?? {}), ...(override ?? {}) };
+}
+
+/** 从材质 json 文本/对象里读 `passes[i].combos`（库内效果声明的默认档） */
+export function combosOfMaterialJson(mat: unknown, pass = 0): PassCombos {
+  const ps = mat && typeof mat === "object" ? (mat as { passes?: unknown }).passes : null;
+  if (!Array.isArray(ps)) return {};
+  return passCombosOnPass(ps[pass] as InlinePassEntry | undefined);
+}
+
+/** combo 名大小写不敏感命中原名（WE 的 combo 名来自 shader 宏，大小写敏感，先精确再忽略大小写） */
+function comboKeyOf(c: PassCombos, key: string): string | null {
+  if (Object.prototype.hasOwnProperty.call(c, key)) return key;
+  const want = key.toLowerCase();
+  for (const k of Object.keys(c)) if (k.toLowerCase() === want) return k;
+  return null;
+}
+
+/**
+ * 改一条效果 pass 的 combos（把「能开关的编译期分支」写进工程），返回是否改成。
+ *
+ * 与 `setInlineParam` 同规矩：命中已有键就用**原名**写回（不新增、不改名）；
+ * `{user|script, value}` 包装只改 `.value`；键不存在时新建这一条 combo。
+ */
+export function setPassCombo(obj: SceneObject, effect: number, pass: number, key: string, value: number | string): boolean {
+  if (!key) return false;
+  const e = effectsOf(obj)?.[effect];
+  const ps = passesOf(e);
+  if (!e || !ps || pass < 0 || pass >= ps.length) return false;
+  const target = ps[pass];
+  if (!target || typeof target !== "object") return false;
+  const cur0 = target.combos;
+  if (cur0 !== undefined && (cur0 === null || typeof cur0 !== "object" || Array.isArray(cur0))) return false;
+  const c = (target.combos ??= {}) as PassCombos;
+  const real = comboKeyOf(c, key) ?? key;
+  const cur = c[real];
+  if (cur && typeof cur === "object" && "value" in (cur as object)) (cur as { value: unknown }).value = value;
+  else c[real] = value;
+  return true;
+}
+
+/** 删掉一条 combo 覆盖（回到材质声明的默认档）；删空后去掉 `combos` 字段，与没覆盖过一致 */
+export function clearPassCombo(obj: SceneObject, effect: number, pass: number, key: string): boolean {
+  const e = effectsOf(obj)?.[effect];
+  const ps = passesOf(e);
+  if (!e || !ps || pass < 0 || pass >= ps.length) return false;
+  const target = ps[pass];
+  const c = target?.combos;
+  if (!target || !c || typeof c !== "object" || Array.isArray(c)) return false;
+  const real = comboKeyOf(c as PassCombos, key);
+  if (real === null) return false;
+  delete (c as PassCombos)[real];
+  if (!Object.keys(c as PassCombos).length) delete target.combos;
+  return true;
 }
 
 /**

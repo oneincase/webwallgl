@@ -63,8 +63,12 @@ import {
 } from "./create";
 import {
   addEffect,
+  addEffectRef,
+  clearPassCombo,
+  combosOfMaterialJson,
   effectById,
   effectCatalog,
+  effectDirNameOf,
   effectFileOf,
   effectFiles,
   effectNote,
@@ -75,17 +79,22 @@ import {
   inlinePassViews,
   inspectEffectPasses,
   inspectEffectParams,
+  mergedCombos,
   moveEffect,
+  passCombos,
   referencedEffects,
   removeEffect,
   setEffectParam,
   setInlineParam,
   setEffectVisible,
+  setPassCombo,
   type EffectDef,
   type EffectParam,
+  type EffectPassSeed,
   type EffectValue,
   type EffectView,
   type InlinePassParams,
+  type PassCombos,
 } from "./effects";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
@@ -5538,6 +5547,255 @@ const fxTitle = (d: EffectDef) => (d.title !== undefined ? textOf(d.title, getLa
 const fxLabel = (v: Pick<EffectView, "def" | "name">) => (v.def ? fxTitle(v.def) : v.name);
 const fxParamLabel = (p: EffectParam) => (p.label !== undefined ? textOf(p.label, getLang(), p.key) : hasText(`fxp.${p.key}`) ? et(`fxp.${p.key}`) : p.key);
 
+// ---------- 效果库浏览器（M6 A11）：宿主**只读**枚举本机壁纸库的效果目录 ----------
+//
+// 合规边界（计划 §6 决策 5 = (a)）：库内效果文件**留在库里**，工程只写
+// `objects[i].effects[]` 里的一条引用（`file: "effects/<目录名>/effect.json"`）；
+// 参数值与 `combos` 内联进 scene.json。**不复制** effect.json / 材质 / 贴图进工程，
+// 也不写回库。已知代价：引用库内效果的工程换机打开会缺效果（界面里明说）。
+// 打包进 `scene.pkg` 的效果宿主不解包，只在统计里报数。
+
+/** 宿主 `GET /api/fx-library` 的返回形状（见 host/wallpaper-host.ts 的 scanEffectLibrary） */
+type FxLibraryEffect = {
+  id: string;
+  dir: string;
+  file: string;
+  itemId: string;
+  items: string[];
+  meta: {
+    name?: string | null;
+    group?: string | null;
+    description?: string | null;
+    preview?: string | null;
+    editable?: unknown;
+    fbos?: unknown[];
+  };
+  passes: Array<{
+    index: number;
+    material: string | null;
+    target: string | null;
+    bind: unknown[];
+    shader: string | null;
+    combos: PassCombos | null;
+    textures: unknown[];
+    uniforms: string[];
+  }>;
+  files: Record<string, string>;
+  missing: string[];
+  notes: string[];
+};
+type FxLibraryReport = {
+  dir: string;
+  readOnly: boolean;
+  copy: boolean;
+  note: string;
+  effects: FxLibraryEffect[];
+  errors: string[];
+  stats: { items: number; effectDirs: number; packagedSkipped: number; files: number };
+};
+
+/** null = 还没问过；"loading"/"error" 是过程态；对象是宿主给的枚举结果 */
+let fxLibrary: FxLibraryReport | "loading" | "error" | null = null;
+let fxLibraryError = "";
+/** 库内文件相对路径 → 文本（只读缓存，供 M1 参数面板解析 uniform 注释）；**不进叠加层** */
+const fxLibraryFiles = new Map<string, string>();
+/** 浏览器里展开的效果目录名（会话状态，不落盘） */
+const fxLibraryOpen = new Set<string>();
+
+/** 按需拉一次枚举（结果常驻；失败给出明确报错，不静默） */
+function loadFxLibrary(): void {
+  if (fxLibrary !== null) return;
+  fxLibrary = "loading";
+  const target = doc;
+  void fetch("/api/fx-library")
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((data: FxLibraryReport) => {
+      fxLibrary = data;
+      for (const e of data.effects ?? []) {
+        for (const [name, text] of Object.entries(e.files ?? {})) if (!fxLibraryFiles.has(name)) fxLibraryFiles.set(name, text);
+      }
+    })
+    .catch((e: unknown) => {
+      fxLibrary = "error";
+      fxLibraryError = e instanceof Error ? e.message : String(e);
+    })
+    .then(() => {
+      if (doc === target) renderInspector();
+    });
+}
+
+/**
+ * 把库内效果加进当前图层：只写 scene.json 的引用（`addEffectRef`），参数取 shader
+ * 注释声明的缺省值，`combos` 取材质声明的默认档 —— 全程不碰 `overlay`。
+ */
+function addLibraryEffectTo(n: LayerNode, e: FxLibraryEffect): void {
+  const ps = inlinePassesOf(e.file);
+  const passCount = Math.max(1, e.passes.length);
+  const seeds: EffectPassSeed[] = Array.from({ length: passCount }, (_, i) => {
+    const decl = ps?.[i];
+    const values: Record<string, unknown> = {};
+    for (const p of decl?.params ?? []) values[p.key] = encodeValue(p, p.default as EffectValue);
+    const combos = mergedCombos(e.passes[i]?.combos ?? decl?.combos, null);
+    return { constantshadervalues: values, combos };
+  });
+  const label = e.meta.name ?? e.dir;
+  const ok = objEditOk(et("log.fxLibAdded", { name: label, layer: nodeName(n.id) }), n.id, (o) => addEffectRef(o, e.file, e.dir, seeds) !== null);
+  if (!ok) log(et("log.fxFailed", { name: label, msg: et("fx.libBadFile") }), "error");
+}
+
+/** 提交一条 pass 的 combos（编译期分支）：文档侧就地改值进撤销栈，引擎侧复用热更通道补画一帧 */
+function commitInlineCombo(
+  layerId: string | number,
+  view: { effect: number; pass: number; effectName: string },
+  key: string,
+  next: number | null,
+): void {
+  structEdit(
+    et("log.fxCombo", { name: view.effectName, param: key }),
+    (d) => {
+      const n = findNode(d.roots, layerId);
+      if (!n) return undefined;
+      const ok = next === null ? clearPassCombo(n.obj, view.effect, view.pass, key) : setPassCombo(n.obj, view.effect, view.pass, key, next);
+      return ok ? n.id : undefined;
+    },
+    undefined,
+    true,
+  );
+}
+
+/**
+ * `fx` 分组里的「效果库（本机壁纸库）」分区：枚举 + 只读预览（参数 / 贴图槽 / combos）+ 写引用。
+ * 来源标注：`data-fx-source` = `project`（当前工程已有这个效果文件）或 `library`（只在库里）。
+ */
+function fxLibrarySection(node: LayerNode, editable: boolean): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "ed-fx-lib";
+  box.dataset.fxLib = String(node.id);
+  const title = document.createElement("div");
+  title.className = "ed-insp-title ed-fx-lib-title";
+  title.textContent = et("fx.libTitle");
+  box.appendChild(title);
+  box.appendChild(note(et("fx.libHint")));
+  loadFxLibrary();
+  if (fxLibrary === null || fxLibrary === "loading") {
+    box.appendChild(note(et("fx.libLoading")));
+    return box;
+  }
+  if (fxLibrary === "error") {
+    box.appendChild(note(et("fx.libError", { msg: fxLibraryError })));
+    return box;
+  }
+  const list = fxLibrary.effects ?? [];
+  // 枚举失败（库目录不存在 / effect.json 坏掉）时明确报错；部分坏掉时既报错也列出好的那些
+  if (fxLibrary.errors?.length) box.appendChild(note(et("fx.libError", { msg: fxLibrary.errors.join("；") })));
+  if (!list.length) {
+    box.appendChild(note(et("fx.libEmpty", { dir: fxLibrary.dir })));
+    return box;
+  }
+  const inProject = referencedEffects(doc);
+  const stats = document.createElement("div");
+  stats.className = "ed-note ed-fx-lib-stats";
+  stats.dataset.fxLibStats = String(list.length);
+  stats.textContent =
+    et("fx.libStats", { n: String(list.length), items: String(fxLibrary.stats?.items ?? 0) }) +
+    (fxLibrary.stats?.packagedSkipped ? ` ${et("fx.libPackaged", { n: String(fxLibrary.stats.packagedSkipped) })}` : "");
+  box.appendChild(stats);
+  for (const e of list) {
+    const det = document.createElement("details");
+    det.className = "ed-fx-lib-item";
+    det.dataset.fxLibDir = e.dir;
+    det.dataset.fxSource = inProject.has(e.file) ? "project" : "library";
+    det.open = fxLibraryOpen.has(e.dir);
+    det.addEventListener("toggle", () => {
+      if (det.open) fxLibraryOpen.add(e.dir);
+      else fxLibraryOpen.delete(e.dir);
+    });
+    const sum = document.createElement("summary");
+    sum.className = "ed-fx-lib-head";
+    const nm = document.createElement("span");
+    nm.className = "ed-fx-lib-name";
+    nm.textContent = `${e.meta.name ?? e.dir}（${e.items.join(" / ")}）`;
+    nm.title = e.file;
+    const badge = document.createElement("span");
+    badge.className = "ed-fx-lib-badge";
+    badge.dataset.fxLibBadge = inProject.has(e.file) ? "project" : "library";
+    badge.textContent = inProject.has(e.file) ? et("fx.libInProject") : et("fx.libLibraryOnly");
+    sum.append(nm, badge);
+    det.appendChild(sum);
+    const body = document.createElement("div");
+    body.className = "ed-fx-lib-body";
+    if (e.meta.description) {
+      const d = document.createElement("div");
+      d.className = "ed-note ed-fx-lib-desc";
+      d.textContent = String(e.meta.description).split("\n")[0];
+      body.appendChild(d);
+    }
+    // 只读预览：pass → shader / 编译期分支 / 贴图槽；参数表由 M1 的 inspect 路径解析后列出
+    loadExternalParams(e.file);
+    const decl = inlinePassesOf(e.file);
+    const perPass = Math.max(1, e.passes.length);
+    for (let i = 0; i < perPass; i++) {
+      const p = e.passes[i];
+      const row = document.createElement("div");
+      row.className = "ed-fx-lib-pass";
+      row.dataset.fxLibPass = String(i);
+      const head = document.createElement("div");
+      head.className = "ed-fx-lib-pass-head";
+      head.textContent = `${et("fx.inlinePass")} ${i}：${p?.shader ?? "—"}`;
+      row.appendChild(head);
+      const declared = { ...(p?.combos ?? decl?.[i]?.combos ?? {}) };
+      if (Object.keys(declared).length) {
+        const cb = document.createElement("div");
+        cb.className = "ed-fx-lib-combos";
+        cb.dataset.fxLibCombos = String(i);
+        cb.textContent = `${et("fx.libCombos")}：${comboSummary(declared)}`;
+        row.appendChild(cb);
+      }
+      const params = decl?.[i]?.params ?? [];
+      if (params.length) {
+        const pl = document.createElement("div");
+        pl.className = "ed-fx-lib-params";
+        pl.textContent = `${et("fx.libParams")}：${params.map((q) => `${q.key}=${JSON.stringify(q.default)}`).join("、")}`;
+        row.appendChild(pl);
+      } else {
+        row.appendChild(note(decl ? et("fx.inlineNoParams") : et("fx.inlineLoading")));
+      }
+      if (p?.textures?.length) {
+        const tx = document.createElement("div");
+        tx.className = "ed-fx-lib-textures";
+        tx.textContent = `${et("fx.inlineTextures")}：${p.textures.filter((t) => typeof t === "string" && t).join("、") || "—"}`;
+        row.appendChild(tx);
+      }
+      body.appendChild(row);
+    }
+    if (e.missing?.length) {
+      const m = document.createElement("div");
+      m.className = "ed-note ed-fx-lib-missing";
+      m.textContent = `${et("fx.libMissing")}：${e.missing.join("、")}`;
+      body.appendChild(m);
+    }
+    for (const nt of e.notes ?? []) body.appendChild(note(nt));
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "ed-btn ed-fx-lib-add";
+    add.dataset.fxLibAdd = e.dir;
+    add.textContent = et("fx.libAdd");
+    add.disabled = !editable;
+    add.onclick = () => addLibraryEffectTo(node, e);
+    body.appendChild(add);
+    det.appendChild(body);
+    box.appendChild(det);
+  }
+  return box;
+}
+
+/** combos 显示成 `KEY=档 （默认 档）` 一行 */
+function comboSummary(declared: PassCombos): string {
+  return Object.entries(declared)
+    .map(([k, v]) => `${k}=${String(v)}`)
+    .join("、");
+}
+
 /** 外来效果（不在注册表里的 WE 效果）从 shader 的 uniform 注释还原出的参数表；按文件缓存，读完重画检视器 */
 const externalParams = new Map<string, EffectParam[] | "loading">();
 /**
@@ -5559,11 +5817,17 @@ const inlinePassesOf = (file: string): InlinePassParams[] | null => {
 function loadExternalParams(file: string): void {
   if (externalPasses.has(file)) return;
   const assets = overlay;
-  if (!assets) return;
+  // 库内效果（M6）：文件在壁纸库里，用宿主只读枚举时一并带回的文本；
+  // 叠加层里没有它、也**绝不**往叠加层写（写进去 = 把库文件复制进工程）。
+  const fromLib = fxLibraryFiles.has(file);
+  if (!assets && !fromLib) return;
   externalPasses.set(file, "loading");
   const dec = new TextDecoder();
   const target = doc;
   void inspectEffectPasses(file, async (name) => {
+    const lib = fxLibraryFiles.get(name);
+    if (lib !== undefined) return lib;
+    if (!assets) return null;
     const b = await assets.read(name).catch(() => null);
     return b ? dec.decode(b) : null;
   })
@@ -5634,6 +5898,8 @@ function effectsGroup(node: LayerNode): HTMLElement {
     item.className = "ed-fx-item";
     item.dataset.fxIndex = String(v.index);
     item.dataset.fxId = v.def?.id ?? "";
+    // 来源标注：工程里已有的效果条目（区别于「只在库内」的效果浏览器条目，见 fxLibrarySection）
+    item.dataset.fxSource = "project";
     if (!v.visible) item.classList.add("hidden-layer");
     const head = document.createElement("div");
     head.className = "ed-fx-head";
@@ -5715,6 +5981,7 @@ function effectsGroup(node: LayerNode): HTMLElement {
     if (add.value) addEffectTo(node, add.value);
   });
   group.appendChild(add);
+  group.appendChild(fxLibrarySection(node, editable));
   group.appendChild(inlineFxSection(node, editable));
   return group;
 }
@@ -5782,11 +6049,17 @@ function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
   if (!files.length) return box;
   for (const f of files) loadExternalParams(f);
   const decls = new Map<string, readonly EffectParam[]>();
+  // combos 的**声明档**：材质 json 的 `passes[i].combos`（库内效果作者选的档）；
+  // 面板显示「实际生效 = 声明 ← scene.json 覆盖」，并让能开关的档写进工程。
+  const comboDecls = new Map<string, readonly PassCombos[]>();
   for (const f of files) {
     const ps = inlinePassesOf(f);
-    if (ps) decls.set(f, ps.flatMap((x) => x.params));
+    if (ps) {
+      decls.set(f, ps.flatMap((x) => x.params));
+      comboDecls.set(f, ps.map((x) => x.combos ?? {}));
+    }
   }
-  const views = inlinePassViews(node.obj, decls);
+  const views = inlinePassViews(node.obj, decls, comboDecls);
   if (!views.length) return box;
   if (!decls.size) {
     box.appendChild(note(et("fx.inlineLoading")));
@@ -5841,6 +6114,46 @@ function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
       tx.className = "ed-inline-textures";
       tx.textContent = `${et("fx.inlineTextures")}：${v.textures.filter((t) => typeof t === "string" && t).join("、") || "—"}`;
       body.appendChild(tx);
+    }
+    // pass 级 combos（编译期分支）：能开关的档写成 0/1 复选框，进工程并往返保留
+    const comboKeys = [...new Set([...Object.keys(v.combosDeclared), ...Object.keys(v.combos)])].sort();
+    if (comboKeys.length) {
+      const row = document.createElement("div");
+      row.className = "ed-inline-combos";
+      row.dataset.fxInlineCombos = String(v.pass);
+      row.title = et("fx.libComboHint");
+      const lbl = document.createElement("span");
+      lbl.className = "ed-inline-combos-label";
+      lbl.textContent = `${et("fx.libCombos")}：`;
+      row.appendChild(lbl);
+      const merged = mergedCombos(v.combosDeclared, v.combos);
+      for (const k of comboKeys) {
+        const val = merged[k];
+        const wrap = document.createElement("label");
+        wrap.className = "ed-inline-combo";
+        wrap.dataset.comboKey = k;
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = val !== 0 && val !== "0";
+        cb.disabled = !editable;
+        cb.title = et("fx.libComboHint");
+        cb.onchange = () => commitInlineCombo(node.id, v, k, cb.checked ? 1 : 0);
+        const txt = document.createElement("span");
+        txt.textContent = `${k}=${String(val)}`;
+        wrap.append(cb, txt);
+        if (editable && Object.prototype.hasOwnProperty.call(v.combos, k)) {
+          // 已经有工程覆盖：给一个「复位」，删掉覆盖即回到材质声明的默认档
+          const reset = document.createElement("button");
+          reset.type = "button";
+          reset.className = "ed-btn ed-inline-combo-reset";
+          reset.dataset.comboReset = k;
+          reset.textContent = et("fx.libComboReset");
+          reset.onclick = () => commitInlineCombo(node.id, v, k, null);
+          wrap.appendChild(reset);
+        }
+        row.appendChild(wrap);
+      }
+      body.appendChild(row);
     }
     det.appendChild(body);
     box.appendChild(det);
