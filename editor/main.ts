@@ -164,6 +164,19 @@ import {
   type ParticlePreset,
 } from "./particles";
 import {
+  parseParticleFile,
+  particleComponentViews,
+  particleFormParam,
+  particleFormValue,
+  particleTextValue,
+  particleTopExtraKeys,
+  particleTopViews,
+  serializeParticleFile,
+  setParticleField,
+  type ParticleBox,
+  type ParticleFieldView,
+} from "./particle-params";
+import {
   PLAYBACK_MODES,
   addSoundLayer,
   getSoundFields,
@@ -319,7 +332,9 @@ import {
 import {
   EditHistory,
   batchCommand,
+  fileCommand,
   isBatch,
+  isFileCmd,
   isNoopEdit,
   isStruct,
   isTitleCmd,
@@ -1900,6 +1915,15 @@ function undoRedo(dir: "undo" | "redo") {
   if (isVideoCmd(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
     setProjectVideo(dir === "undo" ? cmd.before : cmd.after);
+    return;
+  }
+  if (isFileCmd(cmd)) {
+    log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    const snap = dir === "undo" ? cmd.before : cmd.after;
+    applyParticleBytes(snap.path, snap.bytes);
+    markDirty();
+    renderInspector();
+    renderStatus();
     return;
   }
   if (isBatch(cmd)) {
@@ -4855,6 +4879,230 @@ function externalParamsOf(file: string): EffectParam[] | null {
   return externalParamsOfCached(file);
 }
 
+// ---------- 粒子文件（M2）：直接读写 particles/**.json ----------
+//
+// 与上面效果常量的热更同款理由：引擎在挂载时自己 JSON.parse 了一份粒子模型
+// （scene-mount 的 `const model = JSON.parse(readText(modelEntry))`），改文档结构到不了它，
+// 所以这里把**同一份对象**交给引擎（`editor.setParticleModel`），之后就地改值即当帧生效。
+// 粒子文件不在 doc 里，撤销按「文件 + 字节」记账（与视频本体同款，见 history 的 fileCommand）。
+
+/** 粒子文件路径 → 已解析的模型（null = 读不出来 / 不是对象） */
+const particleFiles = new Map<string, ParticleBox | null>();
+/** 粒子文件路径 → 上次落盘的原文（撤销快照的 before 用它，保证字节口径一致） */
+const particleFileText = new Map<string, string>();
+/** 正在读的粒子文件（避免同一帧里反复发起读取） */
+const particlePending = new Set<string>();
+/** 折叠面板的展开态（键 = 分区标识） */
+const particleOpen = new Set<string>();
+
+/** 图层对象引用的粒子文件路径 */
+function particlePathIn(obj: LayerNode["obj"]): string | null {
+  const p = (obj as { particle?: unknown }).particle;
+  return typeof p === "string" && p ? p : null;
+}
+
+/** 按需读一次粒子文件（读完重画检视器；期间换了文档就丢弃结果） */
+function loadParticleFile(path: string): void {
+  if (particleFiles.has(path) || particlePending.has(path)) return;
+  const assets = overlay;
+  if (!assets) return;
+  particlePending.add(path);
+  const dec = new TextDecoder();
+  const target = doc;
+  void assets
+    .read(path)
+    .catch(() => null)
+    .then((b) => {
+      particlePending.delete(path);
+      if (!b) {
+        particleFiles.set(path, null);
+      } else {
+        const text = dec.decode(b);
+        particleFileText.set(path, text);
+        particleFiles.set(path, parseParticleFile(text));
+      }
+      if (doc === target) renderInspector();
+    });
+}
+
+/** 把一份粒子文件字节装回 overlay、刷新内存缓存，并热更引擎（提交 / 撤销 / 重做共用） */
+function applyParticleBytes(path: string, bytes: Uint8Array): void {
+  overlay?.put(path, bytes, path);
+  const text = new TextDecoder().decode(bytes);
+  particleFileText.set(path, text);
+  const parsed = parseParticleFile(text);
+  particleFiles.set(path, parsed);
+  // 交给引擎的必须是「我们之后还会就地改的那一份」，否则下一次滑条改的是另一份对象
+  if (parsed) void editor?.setParticleModel(path, parsed).catch(() => {});
+}
+
+/** 粒子字段标签：字段表带的 label 优先，其次 ptp.<字段>，最后用作者原本的字段名 */
+const ptFieldLabel = (v: ParticleFieldView) =>
+  v.field.label !== undefined ? et(v.field.label) : hasText(`ptp.${v.field.key}`) ? et(`ptp.${v.field.key}`) : v.field.key;
+
+/** 改粒子文件里的一个字段：落盘 + 热更 + 一步撤销（认不出的键 / 值没变时什么都不做） */
+function commitParticleField(node: LayerNode, path: string, view: ParticleFieldView, value: EffectValue | string): void {
+  const file = particleFiles.get(path);
+  const before = particleFileText.get(path);
+  if (!file || before === undefined) return;
+  if (!setParticleField(file, view.key, value)) return;
+  const bytes = serializeParticleFile(file);
+  const after = new TextDecoder().decode(bytes);
+  if (after === before) return;
+  const enc = new TextEncoder();
+  const cmd = fileCommand(et("pt.fileEdited", { layer: nodeName(node.id), field: ptFieldLabel(view) }), { path, bytes: enc.encode(before) }, { path, bytes });
+  if (cmd) edits.push(cmd);
+  markDirty();
+  applyParticleBytes(path, bytes);
+  renderInspector();
+  renderStatus();
+}
+
+/** 折叠面板（复用作品自带效果那套 .ed-inline-pass 样式，不新增 CSS） */
+function particleDetails(title: string, key: string): { el: HTMLDetailsElement; body: HTMLElement } {
+  const det = document.createElement("details");
+  det.className = "ed-inline-pass";
+  det.open = particleOpen.has(key);
+  const sum = document.createElement("summary");
+  sum.className = "ed-inline-pass-head";
+  sum.textContent = title;
+  det.appendChild(sum);
+  const body = document.createElement("div");
+  body.className = "ed-inline-pass-body";
+  det.appendChild(body);
+  det.addEventListener("toggle", () => {
+    if (det.open) particleOpen.add(key);
+    else particleOpen.delete(key);
+  });
+  return { el: det, body };
+}
+
+/** 只读列出未识别的键（原样保留，不给控件） */
+function particleUnknownLine(label: string, keys: readonly string[]): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "ed-inline-unknown";
+  el.textContent = `${label}：${keys.join("、")}`;
+  return el;
+}
+
+/** 一组粒子字段的表单：数值 / 向量 / 布尔走 schema-form，枚举与文本自己搓控件 */
+function particleFieldForm(
+  views: readonly ParticleFieldView[],
+  editable: boolean,
+  commit: (v: ParticleFieldView, value: EffectValue | string) => void,
+): HTMLElement {
+  const simple = views.filter((v) => v.field.type !== "enum" && v.field.type !== "string");
+  const byKey = new Map(views.map((v) => [v.key, v]));
+  const params: EffectParam[] = [];
+  const values: Record<string, EffectValue | undefined> = {};
+  for (const v of simple) {
+    const p = particleFormParam(v);
+    if (!p) continue;
+    params.push(p);
+    values[v.key] = particleFormValue(v);
+  }
+  const form = schemaForm({
+    params,
+    values,
+    label: (p) => {
+      const v = byKey.get(p.key);
+      return v ? ptFieldLabel(v) : p.key;
+    },
+    disabled: !editable,
+    commit: (k, next) => {
+      const v = byKey.get(k);
+      if (v) commit(v, next);
+    },
+  });
+  for (const v of views) {
+    if (v.field.type !== "enum" && v.field.type !== "string") continue;
+    const row = document.createElement("label");
+    row.className = "ed-fx-param";
+    row.dataset.ptField = v.key;
+    const name = document.createElement("span");
+    name.textContent = ptFieldLabel(v);
+    row.appendChild(name);
+    if (v.field.type === "enum") {
+      const sel = document.createElement("select");
+      sel.className = "ed-val";
+      for (const opt of v.field.options ?? []) {
+        const o = document.createElement("option");
+        o.value = opt;
+        o.textContent = opt === "" ? "—" : opt;
+        sel.appendChild(o);
+      }
+      sel.value = particleTextValue(v);
+      sel.disabled = !editable;
+      sel.addEventListener("change", () => commit(v, sel.value));
+      row.appendChild(sel);
+    } else {
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "ed-val";
+      inp.value = particleTextValue(v);
+      inp.disabled = !editable;
+      inp.addEventListener("change", () => commit(v, inp.value));
+      row.appendChild(inp);
+    }
+    form.appendChild(row);
+  }
+  return form;
+}
+
+/** 粒子文件的参数分区：文件级字段 + 五族组件 + 未识别键（只读） */
+function particleFileSection(node: LayerNode, editable: boolean): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "ed-inline-fx";
+  box.dataset.particleFile = String(node.id);
+  const head = document.createElement("div");
+  head.className = "ed-insp-title";
+  head.textContent = et("pt.fileTitle");
+  box.appendChild(head);
+
+  const path = particlePathIn(node.obj);
+  if (!path) {
+    box.appendChild(note(et("pt.fileMissing")));
+    return box;
+  }
+  loadParticleFile(path);
+  const file = particleFiles.get(path);
+  if (file === undefined) {
+    box.appendChild(note(et("pt.fileLoading")));
+    return box;
+  }
+  if (file === null) {
+    box.appendChild(note(et("pt.fileMissing")));
+    return box;
+  }
+  box.appendChild(note(et("pt.fileHint")));
+  const commit = (v: ParticleFieldView, value: EffectValue | string) => commitParticleField(node, path, v, value);
+
+  const top = particleTopViews(file);
+  const comps = particleComponentViews(file);
+  if (!top.length && !comps.length) {
+    box.appendChild(note(et("pt.fileEmpty")));
+    return box;
+  }
+  if (top.length) {
+    const det = particleDetails(et("pt.fileTop"), `${path}#top`);
+    det.body.appendChild(particleFieldForm(top, editable, commit));
+    box.appendChild(det.el);
+  }
+  for (const c of comps) {
+    const groupLabel = hasText(`ptg.${c.group}`) ? et(`ptg.${c.group}`) : c.group;
+    const det = particleDetails(`${groupLabel} · ${c.name || et("ptg.controlpoint")}`, `${path}#${c.group}[${c.index}]`);
+    if (c.status === "unsupported") det.body.appendChild(note(`${et("pt.statusUnsupported")} —— ${et("pt.unsupportedHint")}`));
+    else if (c.status === "unknown") det.body.appendChild(note(et("pt.statusUnknown")));
+    else if (c.status === "noPanel") det.body.appendChild(note(et("pt.statusNoPanel")));
+    if (c.views.length) det.body.appendChild(particleFieldForm(c.views, editable && c.status === "ok", commit));
+    if (c.extraKeys.length) det.body.appendChild(particleUnknownLine(et("pt.fileUnknownKeys"), c.extraKeys));
+    box.appendChild(det.el);
+  }
+  const topExtra = particleTopExtraKeys(file);
+  if (topExtra.length) box.appendChild(particleUnknownLine(et("pt.fileUnknownTop"), topExtra));
+  return box;
+}
+
 /** 对一个图层对象做一次可撤销的结构编辑（效果 / 脚本）；mutate 返回 false = 没改成 */
 function objEdit(label: string, id: number | string, mutate: (o: LayerNode["obj"]) => boolean) {
   structEdit(label, (d) => {
@@ -5416,6 +5664,7 @@ function particleGroup(node: LayerNode): HTMLElement {
   form.append(l, box);
 
   group.appendChild(form);
+  group.appendChild(particleFileSection(node, editable));
   group.appendChild(note(et("pt.hint")));
   return group;
 }
