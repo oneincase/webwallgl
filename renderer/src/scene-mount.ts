@@ -4,13 +4,40 @@ import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
+// M12（EDITOR-COMPLETION-PLAN §2 B1 / B2）：增量装配的数组手术与 overlay 几何 / GL pass。
+// 这三份都是纯函数或自管 GL 状态的独立模块，scene-mount 只做接线。
+import {
+  collectSubtreeIds,
+  detachLayer,
+  insertLayerAt,
+  layerIdOrder,
+  layerIndexOf,
+  moveLayerToIndex,
+} from "./editor/layer-order";
+import {
+  normalizeOverlayMode,
+  overlaySegments as buildOverlaySegments,
+  segmentCount,
+  type OverlayMode,
+} from "./editor/overlay";
+import { createOverlayPass, type OverlayPass } from "./editor/overlay-gl";
+// M12 / W8：脚本挂点热替换的转发句柄与 swap 语义（纯逻辑，离线可驱动）。
+import {
+  createScriptSlot,
+  type EditorScriptSlot,
+  type ScriptSlotHost,
+} from "./editor/script-slot";
 import type {
   EditorControls,
+  EditorHotAddCheck,
   EditorLayer,
+  EditorLayerAddSpec,
   EditorLayerKind,
   EditorLayerOutline,
   EditorLayerProps,
   EditorModelInfo,
+  EditorOverlayMode,
+  EditorOverlayStats,
   EditorAttachmentPoint,
   EditorBonePoint,
   EditorBonePose,
@@ -614,7 +641,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             : "pkg 中没有 scene.json（不是场景壁纸？）",
         );
       }
-      const scene = scn.parseScene(JSON.parse(readText(sceneEntry)), project);
+      // M12 / W2b：原始 scene.json 留一份。增量装配（addLayer）需要按同一个
+      // project 重新解析**单个对象**，只有 parseScene 那份规范化后的 layers 是不够的
+      //（它已经丢掉了原始包装 / 用户名 / 脚本原文）。注意这是**只读**引用，
+      // 任何路径都不得就地改它 —— 否则整场景重挂与热路径会走出两份不同的语义。
+      const sceneJsonRaw = JSON.parse(readText(sceneEntry)) as Record<string, unknown>;
+      const scene = scn.parseScene(sceneJsonRaw, project);
       /**
        * 本场景加载过的**材质文档**（materials/*.json），用于解析其中的用户属性绑定。
        *
@@ -857,6 +889,26 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         hook(info);
       }
       const propSandboxes: any[] = [];
+      // M12 / W8 单脚本沙箱热替换（EDITOR-COMPLETION-PLAN §2 B3）。
+      //
+      // 现状：改脚本只能整场景重挂（第③档）。热替换要同时满足两条硬约束：
+      //   ① **沙箱安全边界不变** —— 新源码必须跑在与装配期逐字相同的 env 里
+      //      （同一份受限全局、同一批注入 API、同一 storage / shared）；
+      //   ② **5 错上限语义不变** —— 熔断计数属于「这一代求值结果」，换源码就重置，
+      //      但宿主读到的 disabled 必须跟着新沙箱走。
+      //
+      // 做法：每个挂点登记一个槽位，槽位持有一个**稳定的转发句柄**
+      //（run 条目 / propSandboxes / 指针回调表 / 媒体与 resize 钩子都指着它），
+      // 热替换只换句柄背后那一代求值结果。于是那些登记表一个都不用改 —— 这正是
+      // 不重建场景就能换脚本的关键，也让「换源码后所有回调仍指向同一个物理对象」
+      // 与「熔断状态跟着新沙箱」同时成立。
+      // M12 / B1：图层拆除钩子。装配期有些登记表（文字挂件、跨层文本表）在**装配块
+      // 内部**声明，引擎控制面在块外够不着 —— 这里留一个 6 空格作用域的登记表，
+      // 由块内部把自己的清理逻辑注册进来。热删层时逐个调用。
+      const layerTeardownHooks: Array<(ids: Set<unknown>, effects: Set<unknown>) => void> = [];
+      // M12 / W8：可热替换的脚本挂点登记表。句柄与 swap 语义在 editor/script-slot.ts
+      // （纯逻辑、可离线驱动）：这里只提供宿主侧的三件事 —— 首次登记、撤旧报错、计跳过。
+      const editorScriptSlots: EditorScriptSlot[] = [];
       // 编辑器脚本面板（W8）：脚本错误按「图层 + 挂点」结构化登记（诊断流文案照旧），
       // 每次装配从空开始 —— 编辑器改脚本后重挂即拿到新脚本的错误。
       const scriptIssues = new Map<string, EditorScriptIssue>();
@@ -896,6 +948,24 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       };
       const evalObjectScript: typeof wtext.evalObjectScript = scriptsOff ? skipScript : wtext.evalObjectScript;
       const evalTextScript: typeof wtext.evalTextScript = scriptsOff ? skipScript : wtext.evalTextScript;
+      const scriptSlotHost: ScriptSlotHost = {
+        register: (sb) => propSandboxes.push(sb),
+        clearIssues: (layerId, target) => {
+          const prefix = `${layerId}|${target}|`;
+          for (const k of [...scriptIssues.keys()]) if (k.startsWith(prefix)) scriptIssues.delete(k);
+        },
+        countSkipped: () => {
+          skippedScripts++;
+        },
+      };
+      /** M12 / W8：登记一个可热替换的脚本挂点（换源码只重建这一代的求值结果，
+       *  已登记的引用仍指向同一物理句柄；语义与失败口径见 editor/script-slot.ts）。 */
+      const makeScriptSlot = (
+        layer: any,
+        target: string,
+        build: (code: string) => any,
+        activate: (sb: any, first: boolean) => void,
+      ): EditorScriptSlot => createScriptSlot({ layer, target, build, activate, host: scriptSlotHost });
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
@@ -4691,6 +4761,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 纯逻辑（脚本沙箱求值 / 盒内排版 / 绘制）在 vendor we-scene render/text.js，
       // 可被 scripts/verify-text.mjs 在 node 里对全库脚本离线校验。
         const textWidgets: any[] = [];
+        // M12 / B1：热删层时把文字挂件与跨层文本表摘掉，否则**已销毁的层还会被画**
+        //（文字挂件循环只认 item.layer，不看 scene.layers 是否还包含它）。
+        layerTeardownHooks.push((ids) => {
+          for (let i = textWidgets.length - 1; i >= 0; i--) {
+            if (ids.has(textWidgets[i]?.layer?.id)) textWidgets.splice(i, 1);
+          }
+          for (const k of [...textLayerText.keys()]) {
+            const alive = (scene.layers as any[]).some((l) => l && !l.destroyed && String(l.name ?? "") === k);
+            if (!alive) textLayerText.delete(k);
+          }
+        });
         // 文字脚本的 init/applyUserProperties 延后队列（框架脚本装在 shared 上的
         // helper 要等对象脚本顶层跑完才存在——时钟1 的 registerListener）。
         const deferredTextInits: Array<{ sandbox: any; layer: any }> = [];
@@ -4815,7 +4896,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               quality,
             };
             if (layer.textScript) {
-              item.sandbox = evalTextScript(layer.textScript, layer.textScriptProps, {
+              // M12 / W8：env 收成工厂函数，热替换时按同一份 env 重新求值
+              //（安全边界的唯一来源；每次调用新建一份 env，闭包状态不跨代泄漏）。
+              const textEnv = () => ({
                 // [we-scene patch] layer：text/pointsize/font 写穿到真图层
                 //（与对象字段脚本同源，见 text.js evalTextScript 写穿段）
                 layer,
@@ -4852,22 +4935,38 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   reportDiag(rt, cfg, `text script '${layer.name}' 失败: ${String((e as Error).message || e).slice(0, 120)}`, "warn");
                 },
               });
-              if (item.sandbox) {
-                propSandboxes.push(item.sandbox);
-                // [we-scene patch] 文字脚本的 init/applyUserProperties **延后到对象脚本
-                // 装配完之后**：框架脚本（3163060610 基础脚本.visible，对象脚本）在顶层
-                // 往 shared 上装 eventDispatcher/CAniClass，文字脚本的 init 里
-                // `shared.eventDispatcher.registerListener(...)`（时钟1）——
-                // 先跑文字 init 时框架还没装，连环 TypeError。
-                deferredTextInits.push({ sandbox: item.sandbox, layer });
-                // [we-scene patch] 歌名/歌手文字层就靠媒体回调拿数据：
-                // `export function mediaPropertiesChanged(e){ mediaData = e.title }`
-                // 是全库 44 处文字脚本的标准形态。不登记就永远显示作者的占位文本。
-                if (item.sandbox.hasMediaHook) registerMediaHook(item.sandbox);
-                registerResizeHook(item.sandbox);
-                // [we-scene patch] 文字脚本的 animationEvent 同样进图层级广播表。
-                if (item.sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox: item.sandbox, kind: "text" });
-              }
+              // M12 / W8：登记为可热替换槽位。首次装配仍走 deferredTextInits
+              //（见下），热替换则立刻在同一份 env 里重跑 init + applyUserProperties。
+              const slot = makeScriptSlot(
+                layer,
+                "text",
+                (code) => evalTextScript(code, layer.textScriptProps, textEnv()),
+                (sandbox, first) => {
+                  item.sandbox = sandbox;
+                  if (first) {
+                    // [we-scene patch] 文字脚本的 init/applyUserProperties **延后到对象脚本
+                    // 装配完之后**：框架脚本（3163060610 基础脚本.visible，对象脚本）在顶层
+                    // 往 shared 上装 eventDispatcher/CAniClass，文字脚本的 init 里
+                    // `shared.eventDispatcher.registerListener(...)`（时钟1）——
+                    // 先跑文字 init 时框架还没装，连环 TypeError。
+                    deferredTextInits.push({ sandbox, layer });
+                  } else {
+                    // 热替换路径：脚本面板改的是**运行期**，对象脚本早就装好了，
+                    // 直接按 WE 语义补跑 init + 全量用户属性（装配期的两阶段末端）。
+                    const tir = sandbox.init(layer.text ?? "");
+                    if (typeof tir === "string") layer.text = tir;
+                    sandbox.applyUserProperties(liveUserProps);
+                  }
+                  // [we-scene patch] 歌名/歌手文字层就靠媒体回调拿数据：
+                  // `export function mediaPropertiesChanged(e){ mediaData = e.title }`
+                  // 是全库 44 处文字脚本的标准形态。不登记就永远显示作者的占位文本。
+                  if (sandbox.hasMediaHook) registerMediaHook(sandbox);
+                  registerResizeHook(sandbox);
+                  // [we-scene patch] 文字脚本的 animationEvent 同样进图层级广播表。
+                  if (sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox, kind: "text" });
+                },
+              );
+              slot.swap(layer.textScript);
             }
             // 静态文本预置进跨层表（脚本层每帧更新自己的条目）
             textLayerText.set(layer.name || "", String(layer.text ?? ""));
@@ -5789,7 +5888,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const vs = effect.visibleScript as { script: string; scriptproperties: any } | null;
             if (!vs) continue;
             try {
-              const sandbox = evalObjectScript(vs.script, vs.scriptproperties, {
+              // M12 / W8：env 收成工厂函数（热替换时按同一份 env 重新求值）。
+              const makeEnv = () => ({
                 canvasSize: { width: objProjW, height: objProjH },
                 timeOfDay: timeOfDayValue,
                 userProperties: objUserProps,
@@ -5808,9 +5908,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   reportDiag(rt, cfg, `effect visible script '${layer.name}#${ei}' 失败: ${String((e as Error).message || e).slice(0, 80)}`, "warn");
                 },
               });
-              if (!sandbox) continue;
-              propSandboxes.push(sandbox);
-              deferredObjectInits.push(() => {
+              // M12 / W8：首次装配走 deferredObjectInits（两阶段末端统一跑
+              // init + applyUserProperties），热替换立刻跑同一条激活路径。
+              const activateEffectVisible = (sandbox: any) => {
               // WE 语义：init(value) 收到字段的**当前值**（visible 字段 = 布尔），
               // 返回值成为新初值 —— 淡出脚本静音加载时 `return 0` 应把效果藏掉，
               // 此前返回值被丢弃、效果恒显。number 按 WE 折叠（≠0 = 可见）。
@@ -5831,7 +5931,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // 转发脚本常无 update，必须独立于 hasUpdate 登记——3163060610 的
               // 调度框架就是这种形态）。
               if (sandbox.hasAnimEventHook) registerAnimEventSink(layer, { sandbox, kind: "effectVisible", effect, run: animRun });
-              });
+              };
+              const slot = makeScriptSlot(
+                layer,
+                `effects[${ei}].visible`,
+                (code) => evalObjectScript(code, vs.scriptproperties, makeEnv()),
+                (sandbox, first) => {
+                  if (first) deferredObjectInits.push(() => activateEffectVisible(sandbox));
+                  else activateEffectVisible(sandbox);
+                },
+              );
+              slot.swap(vs.script);
             } catch (e) {
               console.warn(`效果开关脚本 ${layer.name}#${ei} 求值失败: ${(e as Error).message}`);
             }
@@ -5840,7 +5950,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (!scripts) continue;
           for (const [field, def] of Object.entries(scripts)) {
             try {
-              const sandbox = evalObjectScript(def.script, def.scriptproperties, {
+              // M12 / W8：env 收成工厂函数（热替换时按同一份 env 重新求值）。
+              const makeEnv = () => ({
                 canvasSize: { width: objProjW, height: objProjH },
                 screenResolution: { x: c.clientWidth || window.innerWidth || 1, y: c.clientHeight || window.innerHeight || 1 },
                 // 初值同 timeOfDayValue；帧循环每秒回填，昼夜脚本不再冻结。
@@ -5879,12 +5990,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   );
                 },
               });
-              if (sandbox) {
-                propSandboxes.push(sandbox);
+              // M12 / W8：激活路径抽成具名函数 —— 首次塞进两阶段队列，
+              // 热替换直接调用（body 与装配期逐字相同，安全边界不变）。
+              const activateObjectScript = (sandbox: any) => {
                 // 官方两阶段：全部对象脚本顶层先求值，再按序 init。2932157836 的
                 // 「Media Background 1」(#15) 在 init/applyUserProperties 里调
                 // shared.mCheckMediaLock()，它由「Music Cover」(#20) 的顶层挂上。
-                deferredObjectInits.push(() => {
                 // WE 语义：init(value) 收到字段的**当前值**。向量字段（scale/origin/
                 // angles）在 WE 里是带 .x/.y/.z 的对象，本仓图层用数组存储——
                 // 这里包成同形对象；标量/布尔字段原样传。
@@ -5972,8 +6083,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                     slot: initSlot,
                   });
                 }
-                });
-              }
+              };
+              const slot = makeScriptSlot(
+                layer,
+                field,
+                (code) => evalObjectScript(code, def.scriptproperties, makeEnv()),
+                (sandbox, first) => {
+                  if (first) deferredObjectInits.push(() => activateObjectScript(sandbox));
+                  else activateObjectScript(sandbox);
+                },
+              );
+              slot.swap(def.script);
             } catch (e) {
               console.warn(`对象脚本 ${layer.name}.${field} 求值失败: ${(e as Error).message}`);
             }
@@ -6260,6 +6380,37 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 作者的 `mix(cur, target, speed * frametime)` 在 dt 过大时会越过目标来回荡。
       // 0.05 = 20fps，与粒子时钟的 50ms 封顶同口径。
       const MAX_SCRIPT_FRAME_DT = 0.05;
+      // ---- M12 / B2：真 GL overlay pass（W5）----
+      // 现状：编辑器选中框 / 变换手柄画在**页面侧** #ed-overlay（2D canvas）。这里在
+      // 引擎自己的 GL 上下文里再加一条通道，让选中框可以走引擎渲染。**默认仍是
+      // "2d"**，页面行为逐位不变，只有显式 setOverlayMode("gl") 才启用；GL 与 2D
+      // 不是二选一，是叠加（GL 失败也照样回退）。
+      // 三条时序约束：
+      //   ① 必须在 renderer.render(...).then 里、出图（capture）之**后** ——
+      //      capture 走 ctx2d.drawImage(c)，overlay 若画在它之前会被烤进编辑器出图；
+      //   ② 必须在同一 GL 上下文且当帧内完成（画布是 preserveDrawingBuffer，
+      //      浏览器在本轮 rAF 回调 + 微任务排空之后才合成）；
+      //   ③ pass 创建失败（no-gl / 链接失败）只让 ok=false、draw 恒返回 0，
+      //      页面 2D 回退路径照旧。
+      let overlayMode: OverlayMode = "2d";
+      let overlayTargetId: number | string | null = null;
+      let overlayGizmo = true;
+      let overlayPass: OverlayPass | null = null;
+      let overlaySegCount = 0;
+      let overlayDraws = 0;
+      const drawGlOverlay = (): void => {
+        const gl = renderer.gl;
+        if (!gl) return;
+        if (!overlayPass) overlayPass = createOverlayPass(gl);
+        if (!overlayPass.ok) return;
+        const id = overlayTargetId;
+        const outline = id === null || id === undefined ? null : editorImpl?.getLayerOutline(id as number) ?? null;
+        const seg = buildOverlaySegments(outline, { gizmo: overlayGizmo });
+        overlaySegCount = segmentCount(seg);
+        if (!overlaySegCount) return;
+        overlayDraws++;
+        overlayPass.draw(seg, { width: c.clientWidth || c.width, height: c.clientHeight || c.height });
+      };
       // 循环体。**不要直接把它交给 requestAnimationFrame** —— 外面必须套
       // renderLoop 守卫壳（见其定义处注释：回调里抛错会让 rAF 链断死）。
       // forced = 编辑器单帧（暂停中 seek/step/capture）：越过暂停与帧率门画一帧，
@@ -6960,6 +7111,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   req.reject(e instanceof Error ? e : new Error(String(e)));
                 }
               }
+              // M12 / B2：GL overlay pass。必须在出图之后（否则被烤进编辑器出图）、
+              // 在首帧回调之前（首帧的语义是「画面已就绪」，overlay 不该拖后它）。
+              if (overlayMode === "gl" && overlayTargetId !== null && overlayTargetId !== undefined) {
+                drawGlOverlay();
+              }
               // 库化桥接：首帧**画完之后**才 resolve mount() 的 Promise（一次性）。
               // 必须在 render().then 里，不能放在调用之前：那样 Promise 会早一帧
               // 落地，调用方拿到实例时画布还是空的 —— autoplay:false 紧接着
@@ -7364,7 +7520,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         applyCameraZoom(view, cameraZoomOf(scene));
         return { view, cssW, cssH, projH, perspective: !!isPerspectiveScene(scene) };
       };
-      const layerById = (id: number): any =>
+      // M12：id 放宽到 number|string —— 文档侧 id 可能是字符串（`String` 比对，
+      // 与 hotTestAt / 页面传参口径一致）。
+      const layerById = (id: number | string): any =>
         (scene.layers as any[]).find((l) => l && !l.destroyed && String(l.id) === String(id));
       // 模型层的蒙皮网格投到画布 CSS 像素（当前时刻姿势 × 上一帧绘制矩阵），供精确拾取与轮廓。
       // null = 不是模型层 / 还没画过一帧。
@@ -7603,6 +7761,133 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (resized && rt.paused && !disposed && !opts.keepSize) await renderOnce();
         return shot;
       };
+      // ---- M12 / B1：增量装配（W2b 热增删重排）----
+      // 与「文档改 → 整场景重挂」的区别：这里**不重建整个场景**，只对 scene.layers
+      // 做数组手术 + 同步装配期登记表。绘制顺序就是 scene.layers 数组顺序（渲染器逐层
+      // 遍历），所以重排只是数组移动、不需要重算任何东西；增删则必须同时维护注册表，
+      // 否则会出现「层没了但脚本还在写 / 层还在但句柄没了」两类静默错误。
+      /** 引擎侧分配运行期 id：取现存最大值 + 1。
+       *  装配期的 `nextLayerId` 在装配块内部，控制面够不着 —— 这里自己算，
+       *  保证不与任何现存 id（含已销毁墓碑）撞车。 */
+      const allocLayerId = (): number => {
+        let max = 0;
+        for (const l of scene.layers as any[]) if (l && typeof l.id === "number" && l.id > max) max = l.id;
+        return max + 1;
+      };
+      /** 找同 image 的已驻留贴图（createSceneLayer 的既有判据，逐字同源）。 */
+      const residentTextureFor = (imagePath: string): string | null => {
+        for (const l of scene.layers as any[]) {
+          if (l && !l.destroyed && l.image === imagePath && l.textureName) return String(l.textureName);
+        }
+        return null;
+      };
+      /** 复制既有层：与 createSceneLayer 的克隆路径同源（贴图必然已驻留，
+       *  所以复制是热增里唯一**不需要异步**的形态，也是编辑器的主用例）。 */
+      const cloneLayerForHotAdd = (src: any): any => {
+        const clone: any = {
+          ...src,
+          id: allocLayerId(),
+          origin: Array.isArray(src.origin) ? src.origin.slice() : [0, 0, 0],
+          scale: Array.isArray(src.scale) ? src.scale.slice() : [1, 1, 1],
+          angles: Array.isArray(src.angles) ? src.angles.slice() : [0, 0, 0],
+          size: Array.isArray(src.size) ? src.size.slice() : src.size,
+          color: Array.isArray(src.color) ? src.color.slice() : src.color,
+          childIds: null,
+          hasChildren: false,
+          destroyed: false,
+          // 模板层的脚本**不克隆**：脚本沙箱是装配期按对象注册的，克隆出来的
+          // 新层没有对应槽位，保留 objectScripts 只会让「重挂后脚本又跑了」
+          // 这种不一致出现（与 createSceneLayer 口径一致）。
+          animations: {},
+          animationList: [],
+          objectScripts: null,
+          runtimeCreated: true,
+        };
+        delete clone.textureAnimation;
+        delete clone.videoTextureApi;
+        delete clone.soundCtl;
+        delete clone.videoCtl;
+        if (Array.isArray(clone.effects)) {
+          clone.effects = clone.effects.map((e: any) => ({
+            ...e,
+            passes: Array.isArray(e?.passes) ? e.passes.map((p: any) => ({ ...p })) : e?.passes,
+          }));
+        }
+        return clone;
+      };
+      /** 热增可行性判定：返回拒绝理由（null = 可以热增）。
+       *  拒绝的都是**异步装配 / 两阶段 init / 容器变换未定案**三类，走整场景重挂即可。 */
+      const hotAddReject = (spec: any): string | null => {
+        if (!spec || typeof spec !== "object") return "spec 不是对象";
+        if (spec.duplicateOf !== undefined && spec.duplicateOf !== null) {
+          const src: any = layerById(spec.duplicateOf);
+          if (!src) return `复制源不存在: ${spec.duplicateOf}`;
+          if (src.isText) return "文字层带离屏画布与字体表，热增会漏装配（走整场景重挂）";
+          if (src.particle) return "粒子系统装配是异步的，热增会漏装配（走整场景重挂）";
+          if (src.puppet || src.modelSrc) return "模型装配是异步的，热增会漏装配（走整场景重挂）";
+          if (src.parentId !== null && src.parentId !== undefined) return "带父级的图层要等容器变换语义定案（M5），热增暂不支持";
+          if (src.objectScripts) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";
+          if (Array.isArray(src.effects) && src.effects.some((e: any) => e?.visibleScript)) {
+            return "带效果开关脚本的图层需要重新求值，热增暂不支持（走整场景重挂）";
+          }
+          return null;
+        }
+        const obj: any = spec.obj;
+        if (!obj || typeof obj !== "object") return "缺少 duplicateOf 或 obj";
+        if (obj.parent !== undefined && obj.parent !== null) return "带父级的图层要等容器变换语义定案（M5），热增暂不支持";
+        if (obj.particle) return "粒子系统装配是异步的，热增暂不支持（走整场景重挂）";
+        if (obj.model) return "模型装配是异步的，热增暂不支持（走整场景重挂）";
+        if (obj.text !== undefined && obj.text !== null) return "文字层装配要重建离屏画布与字体表，热增暂不支持（走整场景重挂）";
+        if (obj.image && !residentTextureFor(String(obj.image))) {
+          return `贴图未驻留，热增拿不到 textureName（走整场景重挂）: ${obj.image}`;
+        }
+        if (obj.objectScripts) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";
+        return null;
+      };
+      /** 图层拆除：把被删子树从所有装配期登记表里摘干净。
+       *  漏一处就是「看不见的层还在每帧跑脚本 / 还在接收媒体回调」。 */
+      const teardownLayer = (ids: Set<unknown>, effects: Set<unknown>): void => {
+        // ① 脚本槽位：先把句柄背后换成停用（DISABLED），再摘登记
+        for (let i = editorScriptSlots.length - 1; i >= 0; i--) {
+          const s = editorScriptSlots[i];
+          if (ids.has(s.layer?.id)) {
+            s.current = null;
+            editorScriptSlots.splice(i, 1);
+          }
+        }
+        // ② 逐帧求值队列：按 layer 身份摘
+        for (const arr of [objectScriptRuns, overrideScriptRuns, animLayerScriptRuns, animLayerFieldRuns, generalScriptRuns] as any[][]) {
+          for (let i = arr.length - 1; i >= 0; i--) if (ids.has(arr[i]?.layer?.id)) arr.splice(i, 1);
+        }
+        // ③ 效果开关队列：条目只记 effect，按被删层的 effect 身份摘
+        for (let i = effectVisibleRuns.length - 1; i >= 0; i--) {
+          if (effects.has((effectVisibleRuns[i] as any)?.effect)) (effectVisibleRuns as any[]).splice(i, 1);
+        }
+        // ④ 指针回调表（以 layer 为 key）
+        for (const k of [...cursorHooks.keys()]) if (ids.has((k as any)?.id)) cursorHooks.delete(k);
+        // ⑤ 粒子系统
+        for (const id of ids) {
+          const list = particleSystemsByLayer.get(id as number);
+          if (!list) continue;
+          for (const ps of list) {
+            try {
+              ps?.setVisible?.(false);
+            } catch { /* 已销毁的粒子系统 */ }
+          }
+          particleSystemsByLayer.delete(id as number);
+        }
+        // ⑥ 脚本错误面板：被删层的条目一起消失（否则面板上留着幽灵报错）
+        for (const k of [...scriptIssues.keys()]) {
+          const lid = k.split("|")[0];
+          if (lid !== "null" && ids.has(Number(lid))) scriptIssues.delete(k);
+        }
+        // ⑦ 装配块内部的登记表（文字挂件 / 跨层文本表）
+        for (const hook of layerTeardownHooks) {
+          try {
+            hook(ids, effects);
+          } catch { /* 单条清理失败不阻断删除 */ }
+        }
+      };
       editorImpl = {
         get time() {
           return currentTime();
@@ -7831,6 +8116,132 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         declareUserProperties(decls: Record<string, EditorUserPropertyDecl>) {
           if (disposed) return Promise.reject(new Error("scene disposed"));
           applyLiveProps(decls as unknown as Record<string, { value: unknown }>);
+          return renderOnce();
+        },
+        // ---- M12 / B2：真 GL overlay pass（W5）----
+        setOverlayMode(mode: EditorOverlayMode): Promise<EditorOverlayMode> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          overlayMode = normalizeOverlayMode(mode, overlayMode);
+          if (overlayMode !== "gl" && overlayPass) {
+            // 关掉时释放 GL 资源（再打开会重建），避免空占一个 program
+            try {
+              overlayPass.dispose();
+            } catch { /* 上下文已丢 */ }
+            overlayPass = null;
+            overlaySegCount = 0;
+          }
+          return renderOnce().then(() => overlayMode);
+        },
+        getOverlayMode(): EditorOverlayMode {
+          return overlayMode;
+        },
+        setOverlayTarget(id: number | string | null): Promise<void> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          overlayTargetId = id === null || id === undefined ? null : id;
+          if (overlayTargetId === null) overlaySegCount = 0;
+          return renderOnce();
+        },
+        getOverlayStats(): EditorOverlayStats {
+          return {
+            mode: overlayMode,
+            target: overlayTargetId,
+            segments: overlaySegCount,
+            draws: overlayDraws,
+            glOk: overlayPass ? overlayPass.ok : false,
+            reason: overlayPass ? overlayPass.reason : "",
+          };
+        },
+        // ---- M12 / B1：增量装配（W2b 热增删重排）----
+        canHotAddLayer(spec: EditorLayerAddSpec): EditorHotAddCheck {
+          const reason = hotAddReject(spec);
+          return { ok: reason === null, reason: reason === null ? "" : reason };
+        },
+        addLayer(spec: EditorLayerAddSpec): Promise<EditorLayer> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          const reason = hotAddReject(spec);
+          if (reason) return Promise.reject(new Error(reason));
+          let layer: any;
+          try {
+            if (spec.duplicateOf !== undefined && spec.duplicateOf !== null) {
+              const src: any = layerById(spec.duplicateOf);
+              if (!src) return Promise.reject(new Error(`复制源不存在: ${spec.duplicateOf}`));
+              layer = cloneLayerForHotAdd(src);
+            } else {
+              // 与装配期**同一个** parseScene 解析单个对象：用户属性解引用、单分量
+              // 广播、角度/颜色换算等规范化语义逐字一致，不另写一份解析。
+              const parsed: any = scn.parseScene({ ...(sceneJsonRaw as any), objects: [spec.obj] }, project);
+              layer = parsed && Array.isArray(parsed.layers) ? parsed.layers[0] : null;
+              if (!layer) return Promise.reject(new Error("parseScene 未产出图层"));
+              layer.id = allocLayerId();
+              layer.destroyed = false;
+              layer.runtimeCreated = true;
+              if (layer.image) {
+                const tn = residentTextureFor(String(layer.image));
+                if (!tn) return Promise.reject(new Error(`贴图未驻留，热增拿不到 textureName（走整场景重挂）: ${layer.image}`));
+                layer.textureName = tn;
+              }
+            }
+          } catch (e) {
+            return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+          }
+          insertLayerAt(scene.layers as any[], layer, spec.toIndex === undefined ? (scene.layers as any[]).length : spec.toIndex);
+          // 新层自己没有子层（带父级的已在上面被拒），dirty 集合就是它自己；
+          // 可见性仍整体重算（防御：万一落在不可见父级下）。
+          scn.recomputeLayerVisibility(scene.layers as any[]);
+          scn.recomposeWorld(scene.layers as any[], new Set<unknown>([layer.id]));
+          const index = layerIndexOf(scene.layers as any[], layer.id);
+          return renderOnce().then(() => layerView(layer, index));
+        },
+        removeLayer(id: number | string): Promise<void> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          const l: any = layerById(id);
+          if (!l) return Promise.reject(new Error(`图层不存在: ${id}`));
+          const ids = new Set<unknown>(collectSubtreeIds(scene.layers as any[], l.id));
+          // effect 身份必须在**摘除之前**收集（摘完就从 scene.layers 里找不到了）
+          const effects = new Set<unknown>();
+          for (const x of scene.layers as any[]) {
+            if (!x || !ids.has(x.id) || !Array.isArray(x.effects)) continue;
+            for (const e of x.effects) effects.add(e);
+          }
+          for (const sid of ids) {
+            const r = detachLayer(scene.layers as any[], sid);
+            if (!r) continue;
+            r.layer.destroyed = true;
+            r.layer.visibleSelf = false;
+          }
+          teardownLayer(ids, effects);
+          scn.recomputeLayerVisibility(scene.layers as any[]);
+          return renderOnce();
+        },
+        reorderLayer(id: number | string, toIndex: number): Promise<void> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          // 绘制顺序 = scene.layers 数组顺序（渲染器逐层遍历），所以重排只需移动
+          // 数组元素：变换、可见性、脚本注册一概不动，顺序即生效。
+          // toIndex 是**目标下标**（搬完之后的 EditorLayer.index），越界夹到端点。
+          const at = moveLayerToIndex(scene.layers as any[], id, toIndex);
+          if (at === null) return Promise.reject(new Error(`图层不存在或下标非法: ${id} → ${toIndex}`));
+          return renderOnce();
+        },
+        // ---- M12 / W8：单脚本沙箱热替换（B3）----
+        setLayerScript(id: number | string, target: string, code: string): Promise<void> {
+          if (disposed) return Promise.reject(new Error("scene disposed"));
+          const l: any = layerById(id);
+          if (!l) return Promise.reject(new Error(`图层不存在: ${id}`));
+          const slot = editorScriptSlots.find((s) => s.layer === l && s.target === target);
+          if (!slot) return Promise.reject(new Error(`挂点不存在或不可热替换: ${target}`));
+          const text = typeof code === "string" ? code : "";
+          if (!text.trim()) {
+            // 空源码 = 摘掉脚本挂点：停用句柄并清掉该挂点留下的错误条目，
+            // 字段停在最后一代写的值（与「脚本被删掉」的 WE 语义一致）。
+            slot.current = null;
+            slot.code = "";
+            const prefix = `${l.id}|${target}|`;
+            for (const k of [...scriptIssues.keys()]) if (k.startsWith(prefix)) scriptIssues.delete(k);
+            return renderOnce();
+          }
+          if (!slot.swap(text)) {
+            return Promise.reject(new Error(`脚本编译失败，旧沙箱保持不变: ${target}`));
+          }
           return renderOnce();
         },
       };

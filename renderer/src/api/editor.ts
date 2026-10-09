@@ -24,6 +24,19 @@ export {
   setMdlClipEvents,
 } from "../editor/mdl-edit";
 export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
+// M12（B7）：相机路径（`scripts/camera_paths_*.json`）的只读体检 + clip 队列 / queuemode 读写。
+// 页面侧只准 import 本出口，不许直接碰 renderer/src/editor/ 下的实现。
+export {
+  normalizeQueueMode,
+  kindOfCameraPathDoc,
+  describeCameraPath,
+  sampleCameraPath,
+  resolveCameraFovZoom,
+  readQueueMode,
+  writeQueueMode,
+  moveCameraPathClip,
+  removeCameraPathClip,
+} from "../editor/camera-path";
 export type {
   ScenePkgFile,
   ScenePkgResult,
@@ -35,6 +48,18 @@ export type {
   SceneScriptCheck,
   EditorLayer,
   EditorLayerKind,
+  // M12（W2b / W5）：增量装配 + GL overlay 通道的公开类型
+  EditorLayerAddSpec,
+  EditorHotAddCheck,
+  EditorOverlayMode,
+  EditorOverlayStats,
+  // M12（B7）：相机路径的公开类型
+  CameraQueueMode,
+  CameraPathKind,
+  CameraPathClipInfo,
+  CameraPathReport,
+  CameraPathPose,
+  CameraFovZoom,
   EditorCaptureOptions,
   EditorFrameOptions,
   EditorHitTestOptions,

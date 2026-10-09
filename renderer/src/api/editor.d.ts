@@ -8,6 +8,16 @@ import type {
   EditorControls,
   EditorLayer,
   EditorLayerKind,
+  EditorLayerAddSpec,
+  EditorHotAddCheck,
+  EditorOverlayMode,
+  EditorOverlayStats,
+  CameraQueueMode,
+  CameraPathKind,
+  CameraPathClipInfo,
+  CameraPathReport,
+  CameraPathPose,
+  CameraFovZoom,
   EditorCaptureOptions,
   EditorFrameOptions,
   EditorHitTestOptions,
@@ -42,6 +52,16 @@ export type {
   EditorControls,
   EditorLayer,
   EditorLayerKind,
+  EditorLayerAddSpec,
+  EditorHotAddCheck,
+  EditorOverlayMode,
+  EditorOverlayStats,
+  CameraQueueMode,
+  CameraPathKind,
+  CameraPathClipInfo,
+  CameraPathReport,
+  CameraPathPose,
+  CameraFovZoom,
   EditorCaptureOptions,
   EditorFrameOptions,
   EditorHitTestOptions,
@@ -158,3 +178,59 @@ export declare const SYSTEM_FONT_FAMILIES: Readonly<Record<string, string>>;
 
 /** 文字对象 pointsize → 场景像素的放大系数：em = pointsize × TEXT_EM_SCALE。 */
 export declare const TEXT_EM_SCALE: number;
+
+/**
+ * 相机路径（M12 / B7）—— 队列模式：只认这两个字面量，其余（含 undefined）落到默认值。
+ * 引擎把 `queuemode !== "random"` 一律当顺序，所以归一化不改变运行时行为。
+ */
+export declare function normalizeQueueMode(v: unknown, dflt?: CameraQueueMode): CameraQueueMode;
+
+/**
+ * 判定路径文档形态：`"object"` 对象级（`{paths:[{options, eye:{c0…}}]}`，挂相机对象的 `path`）、
+ * `"scene"` 场景级（`{paths:[{duration, transforms:[{eye,timestamp}]}]}`，挂 `scene.camera.paths`）。
+ * 空文档返回 `"unknown"`（两种格式都解释得通，不给假结论）。
+ */
+export declare function kindOfCameraPathDoc(doc: unknown): CameraPathKind;
+
+/**
+ * 逐段体检：形态 / 段数 / 总时长 / 队列模式 / 每段通道，外加 `issues`
+ * （空路径、零时长段、没有 eye或center、fov 与 zoom 都缺、一段都没解析出来）。
+ * 段解析与 tick 都转发引擎 `render/camera-path.js`，不另起一套时钟。
+ */
+export declare function describeCameraPath(doc: unknown, queueMode?: unknown): CameraPathReport;
+
+/**
+ * 顺序驱动队列（`times` 必须递增）并在这些时刻采样位姿。对象级走引擎状态机 tick、
+ * 场景级走纯函数 tick；没有可用段时返回空数组。
+ */
+export declare function sampleCameraPath(
+  doc: unknown,
+  queueMode: unknown,
+  times: readonly number[],
+  basePose?: { eye?: unknown; center?: unknown; up?: unknown; fov?: unknown; zoom?: unknown },
+): CameraPathPose[];
+
+/** 透视用 `fov`、正交用 `zoom`；缺失回落 fov 50 / zoom 1（与引擎 base 一致） */
+export declare function resolveCameraFovZoom(
+  pose: { fov?: unknown; zoom?: unknown } | null | undefined,
+  perspective: boolean,
+): CameraFovZoom;
+
+/** 读场景对象上的 `queuemode`，缺失或非法回落 `"sequential"`（= 引擎缺省） */
+export declare function readQueueMode(obj: Record<string, unknown> | null | undefined): CameraQueueMode;
+
+/**
+ * 写场景对象上的 `queuemode`；写回 `baseline`（缺省 `"sequential"`）时删键而不是写冗余值。
+ * 返回是否真的改动了文档。
+ */
+export declare function writeQueueMode(
+  obj: Record<string, unknown> | null | undefined,
+  mode: CameraQueueMode,
+  baseline?: CameraQueueMode,
+): boolean;
+
+/** 队列重排（`doc.paths` 内就地 splice）；下标非法或原地不动返回 false */
+export declare function moveCameraPathClip(doc: unknown, from: number, to: number): boolean;
+
+/** 队列删段（`doc.paths` 内就地 splice）；下标非法返回 false */
+export declare function removeCameraPathClip(doc: unknown, index: number): boolean;
