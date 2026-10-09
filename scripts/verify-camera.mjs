@@ -730,6 +730,218 @@ if (fs.existsSync(LIB)) {
   for (const e of sErr) errors.push(e);
 }
 
+// ---------- [M12/B7] 相机路径：编辑器侧读写面 + 全库语料体检（2026-11 补）----------
+//
+// 上面第 6 段验的是**引擎时钟**（TickQueue 语义 / 曲线 / 随机抽段）；这一段验 M12 新增的
+// **编辑器侧读写面** `renderer/src/editor/camera-path.ts`（经 `renderer/src/api/editor.ts`
+// 出口暴露给页面）：形态判定、逐段体检、queuemode 读改写、clip 重排 / 删除，以及这些
+// 能力在**全库真实语料**上的结论。
+//
+// 为什么值得单独一段：对象级与场景级是两种文件格式，喂错解析器**不抛错**、只静默拿到
+// 0 段（相机一动不动）—— 全库 48 个带 path 的相机对象里绝大多数正是空路径，界面必须能
+// 把「这条路径放不出运镜」讲清楚，而不是显示一个空列表。
+{
+  const cpEdit = await imp("renderer/src/editor/camera-path.ts");
+  const eErr = [];
+  const want = [
+    "normalizeQueueMode",
+    "kindOfCameraPathDoc",
+    "describeCameraPath",
+    "sampleCameraPath",
+    "resolveCameraFovZoom",
+    "readQueueMode",
+    "writeQueueMode",
+    "moveCameraPathClip",
+    "removeCameraPathClip",
+  ];
+  for (const n of want) if (typeof cpEdit[n] !== "function") eErr.push(`M12/B7 编辑器读写面缺导出 ${n}`);
+
+  if (eErr.length) {
+    for (const e of eErr) errors.push(e);
+  } else {
+    const {
+      normalizeQueueMode,
+      kindOfCameraPathDoc,
+      describeCameraPath,
+      sampleCameraPath,
+      resolveCameraFovZoom,
+      readQueueMode,
+      writeQueueMode,
+      moveCameraPathClip,
+      removeCameraPathClip,
+    } = cpEdit;
+
+    // 1) queuemode 归一必须**跟着引擎的逐字比较**：引擎是 `queuemode === 'random'`，
+    //    其余一律顺序；归一化若"宽容"（认 Random / 大小写不敏感）就成了第二套语义。
+    if (normalizeQueueMode("random") !== "random") eErr.push("M12/B7 normalizeQueueMode 不认 random");
+    if (normalizeQueueMode("sequential") !== "sequential") eErr.push("M12/B7 normalizeQueueMode 不认 sequential");
+    if (normalizeQueueMode("Random") !== "sequential") eErr.push("M12/B7 normalizeQueueMode 对大小写宽容（引擎是逐字比较，必须一致）");
+    if (normalizeQueueMode(1) !== "sequential") eErr.push("M12/B7 normalizeQueueMode 对非字符串宽容");
+    if (normalizeQueueMode(undefined, "random") !== "random") eErr.push("M12/B7 normalizeQueueMode 缺省值未生效");
+
+    // 2) 形态判定
+    const objDoc = {
+      paths: [{ id: 7, name: "A", options: { fps: 10, length: 10, mode: "single" }, eye: { c0: [], c1: [], c2: [] } }],
+    };
+    const sceneDoc = { paths: [{ duration: 4, name: "S", transforms: [{ timestamp: 0, eye: "0 0 0", center: "0 0 -1" }] }] };
+    if (kindOfCameraPathDoc(objDoc) !== "object") eErr.push(`M12/B7 对象级路径被认成 ${kindOfCameraPathDoc(objDoc)}`);
+    if (kindOfCameraPathDoc(sceneDoc) !== "scene") eErr.push(`M12/B7 场景级路径被认成 ${kindOfCameraPathDoc(sceneDoc)}`);
+    if (kindOfCameraPathDoc([{ duration: 1, transforms: [] }]) !== "scene") eErr.push("M12/B7 数组形态的场景级路径未识别");
+    if (kindOfCameraPathDoc({ paths: [] }) !== "unknown") eErr.push("M12/B7 空路径不该给出确定形态（两种格式都解释得通）");
+    if (kindOfCameraPathDoc({}) !== "unknown") eErr.push("M12/B7 没有 paths 的文档应认不出形态");
+    if (kindOfCameraPathDoc(null) !== "unknown") eErr.push("M12/B7 null 文档应认不出形态");
+
+    // 3) 逐段体检：两段（第二段既无 fov/zoom，也是零时长）
+    const kfi = (frame, value) => ({ frame, value, front: { enabled: false, x: 1, y: 0 }, back: { enabled: false, x: 1, y: 0 } });
+    const chan3 = (vals, frames) => ({ c0: vals.map((v, i) => kfi(frames[i], v)), c1: vals.map((_, i) => kfi(frames[i], 0)), c2: vals.map((_, i) => kfi(frames[i], 0)) });
+    const two = {
+      paths: [
+        { id: 1, name: "A", options: { fps: 10, length: 10, mode: "single" }, eye: chan3([0, 10], [0, 10]), fov: [kfi(0, 50), kfi(10, 90)] },
+        { id: 2, name: "B", options: { fps: 10, length: 0, mode: "single" }, eye: chan3([0, -10], [0, 10]) },
+      ],
+    };
+    const rep = describeCameraPath(two, "sequential");
+    if (rep.kind !== "object") eErr.push(`M12/B7 体检报告形态应为 object，实得 ${rep.kind}`);
+    if (rep.clipCount !== 2) eErr.push(`M12/B7 体检报告段数应为 2，实得 ${rep.clipCount}`);
+    if (Math.abs(rep.clips[0].duration - 1) > 1e-9) eErr.push(`M12/B7 第 0 段时长应为 length/fps=1s，实得 ${rep.clips[0].duration}`);
+    if (!rep.clips[0].channels.includes("eye") || !rep.clips[0].channels.includes("fov")) eErr.push(`M12/B7 第 0 段通道应为 eye/fov，实得 ${rep.clips[0].channels}`);
+    if (!rep.issues.some((x) => /时长为 0/.test(x))) eErr.push("M12/B7 零时长段必须进 issues（队列会静默跳过它）");
+    if (!rep.issues.some((x) => /既没有 fov 也没有 zoom/.test(x))) eErr.push("M12/B7 没有 fov/zoom 的段必须进 issues（透视与正交都没参数可驱动）");
+    if (Math.abs(rep.totalDuration - 1) > 1e-9) eErr.push(`M12/B7 总时长应为 1s（第二段零时长），实得 ${rep.totalDuration}`);
+
+    // 4) 空路径 / 认不出的文档：段数 0 且必须给出可显示的理由
+    const emptyRep = describeCameraPath({ paths: [] });
+    if (emptyRep.clipCount !== 0 || !emptyRep.issues.some((x) => /空的/.test(x))) eErr.push("M12/B7 空路径应报 0 段并给出「空的」理由");
+    if (describeCameraPath({}).clipCount !== 0 || describeCameraPath({}).issues.length === 0) eErr.push("M12/B7 认不出的文档应报 0 段并给出理由");
+    if (describeCameraPath(null).issues.length === 0) eErr.push("M12/B7 null 文档应给出理由");
+
+    // 5) 采样：顺序队列真的换段、曲线真的插值；random 打桩后恒选最后一段
+    const base = { eye: [0, 0, 0], center: [0, 0, -1], up: [0, 1, 0], fov: 50, zoom: 1 };
+    const seqS = sampleCameraPath(two, "sequential", [0, 0.5, 1.0, 1.5], base);
+    if (seqS.length !== 4) eErr.push(`M12/B7 采样应回 4 个位姿，实得 ${seqS.length}`);
+    if (seqS.length === 4) {
+      if (seqS[0].clipIndex !== 0) eErr.push(`M12/B7 首个采样应在第 0 段，实得 ${seqS[0].clipIndex}`);
+      if (Math.abs(seqS[1].eye[0] - 5) > 1e-3) eErr.push(`M12/B7 段内应线性推进（0.5s ⇒ eye.x=5），实得 ${seqS[1].eye[0]}`);
+      if (Math.abs(seqS[1].fov - 70) > 1) eErr.push(`M12/B7 fov 通道未透传（0.5s ⇒ ≈70），实得 ${seqS[1].fov}`);
+      if (seqS[2].clipIndex !== 1) eErr.push(`M12/B7 段末应换到第 1 段，实得 ${seqS[2].clipIndex}`);
+      if (seqS[3].clipIndex !== 0) eErr.push(`M12/B7 末段之后应环绕回第 0 段，实得 ${seqS[3].clipIndex}`);
+    }
+    const rnd0 = Math.random;
+    Math.random = () => 0.9;
+    const rndS = sampleCameraPath(two, "random", [0], base);
+    Math.random = rnd0;
+    if (rndS.length !== 1 || rndS[0].clipIndex !== 1) eErr.push(`M12/B7 random 队列没走引擎的随机抽段（桩 0.9 应选段 1，实得 ${rndS[0] && rndS[0].clipIndex}）`);
+    if (sampleCameraPath({ paths: [] }, "sequential", [0, 1], base).length !== 0) eErr.push("M12/B7 空路径采样应回空数组");
+    // 场景级：纯函数 tick，同一 t 的位姿唯一
+    const sp2 = [{ duration: 4, name: "S", transforms: [{ timestamp: 0, eye: "0 0 0", center: "0 0 -1", up: "0 1 0" }, { timestamp: 4, eye: "4 0 0", center: "0 0 -1", up: "0 1 0" }] }];
+    const spS = sampleCameraPath(sp2, "sequential", [0, 2, 4]);
+    if (spS.length !== 3 || Math.abs(spS[1].eye[0] - 2) > 1e-6) eErr.push(`M12/B7 场景级段内插值应线性（t=2s ⇒ eye.x=2），实得 ${spS[1] && spS[1].eye[0]}`);
+    if (spS.length === 3 && Math.abs(spS[2].eye[0]) > 1e-6) eErr.push(`M12/B7 场景级播完应回第 0 段首帧（t=4s ⇒ eye.x=0），实得 ${spS[2].eye[0]}`);
+    if (spS.length === 3 && spS[2].clipIndex !== 0) eErr.push(`M12/B7 场景级应报出回绕后的段号 0，实得 ${spS[2].clipIndex}`);
+
+    // 6) 透视用 fov、正交用 zoom（引擎把两者都求出来就是为了这个分支）
+    const persp = resolveCameraFovZoom({ fov: 70, zoom: 1.5 }, true);
+    const ortho = resolveCameraFovZoom({ fov: 70, zoom: 1.5 }, false);
+    if (persp.use !== "fov" || persp.value !== 70 || persp.other !== 1.5) eErr.push(`M12/B7 透视应吃 fov=70（另一个通道 1.5），实得 ${JSON.stringify(persp)}`);
+    if (ortho.use !== "zoom" || ortho.value !== 1.5 || ortho.other !== 70) eErr.push(`M12/B7 正交应吃 zoom=1.5（另一个通道 70），实得 ${JSON.stringify(ortho)}`);
+    const fallback = resolveCameraFovZoom(null, true);
+    if (fallback.value !== 50 || fallback.other !== 1) eErr.push(`M12/B7 位姿缺失应回落引擎缺省 fov50/zoom1，实得 ${JSON.stringify(fallback)}`);
+
+    // 7) queuemode 读写：写回默认值必须删键（别在 scene.json 里留冗余）
+    if (readQueueMode({ queuemode: "random" }) !== "random") eErr.push("M12/B7 readQueueMode 读不到 random");
+    if (readQueueMode({}) !== "sequential" || readQueueMode(null) !== "sequential") eErr.push("M12/B7 readQueueMode 缺省应为 sequential");
+    const q1 = {};
+    if (writeQueueMode(q1, "sequential") !== false || "queuemode" in q1) eErr.push("M12/B7 已经是顺序时写回应无改动、且不得新增 queuemode 键");
+    if (writeQueueMode(q1, "random") !== true || q1.queuemode !== "random") eErr.push("M12/B7 写 random 未落到文档");
+    if (writeQueueMode(q1, "random") !== false) eErr.push("M12/B7 值未变化时应报「无改动」");
+    if (writeQueueMode(q1, "sequential") !== true || "queuemode" in q1) eErr.push("M12/B7 写回默认值时应删键而不是留一个 sequential");
+    if (readQueueMode(q1) !== "sequential") eErr.push("M12/B7 删键后读出来仍应是 sequential");
+
+    // 8) 队列重排 / 删段：就地改 doc.paths（编辑器保存的就是这份文档）
+    const doc3 = { paths: ["A", "B", "C"] };
+    const listRef = doc3.paths;
+    if (moveCameraPathClip(doc3, 0, 2) !== true || doc3.paths.join("") !== "BCA") eErr.push(`M12/B7 重排未生效：${doc3.paths.join("")}`);
+    if (doc3.paths !== listRef) eErr.push("M12/B7 重排必须就地改数组（换数组会让文档持有点拿到旧引用）");
+    if (moveCameraPathClip(doc3, 1, 1) !== false) eErr.push("M12/B7 原地重排应报「无改动」");
+    if (moveCameraPathClip(doc3, 9, 0) !== false) eErr.push("M12/B7 越界重排应被拒");
+    if (removeCameraPathClip(doc3, 0) !== true || doc3.paths.join("") !== "CA") eErr.push(`M12/B7 删段未生效：${doc3.paths.join("")}`);
+    if (removeCameraPathClip(doc3, 5) !== false) eErr.push("M12/B7 越界删段应被拒");
+
+    // 9) 全库语料体检
+    let items = 0;
+    let pathObjs = 0;
+    let qmObjs = 0;
+    let emptyDocs = 0;
+    let claimedEmpty = 0;
+    let solidDocs = 0;
+    let solidClips = 0;
+    let unknownSolid = 0;
+    const qmHist = {};
+    const solid = [];
+    for (const d of fs.readdirSync(LIB)) {
+      const pkgPath2 = join(LIB, d, "scene.pkg");
+      if (!fs.existsSync(pkgPath2)) continue;
+      let pkg2 = null;
+      let j2 = null;
+      try {
+        pkg2 = parsePkg(new Uint8Array(fs.readFileSync(pkgPath2)));
+        const e = getEntry(pkg2, "scene.json");
+        if (e) j2 = JSON.parse(dec.decode(e));
+      } catch {
+        continue;
+      }
+      if (!j2) continue;
+      items++;
+      for (const o of j2.objects || []) {
+        if (typeof o.path !== "string" || !o.path) continue;
+        pathObjs++;
+        if (o.queuemode !== undefined) {
+          qmObjs++;
+          qmHist[String(o.queuemode)] = (qmHist[String(o.queuemode)] || 0) + 1;
+        }
+        const e = getEntry(pkg2, o.path);
+        let pdoc = null;
+        if (e) {
+          try {
+            pdoc = JSON.parse(dec.decode(e));
+          } catch {
+            pdoc = null;
+          }
+        }
+        const r2 = describeCameraPath(pdoc === null ? {} : pdoc, o.queuemode);
+        if (r2.clipCount === 0) {
+          emptyDocs++;
+          if (!r2.issues.length) claimedEmpty++;
+          if (sampleCameraPath(pdoc === null ? {} : pdoc, o.queuemode, [0, 1, 2], base).length !== 0) {
+            eErr.push(`M12/B7 ${d}/${o.path} 报 0 段却采样出了位姿`);
+          }
+        } else {
+          solidDocs++;
+          solidClips += r2.clipCount;
+          if (r2.kind === "unknown") unknownSolid++;
+          if (solid.length < 4) solid.push(`${d}/${o.path} ${r2.clipCount}段/${r2.kind}`);
+        }
+      }
+    }
+    if (items > 0) {
+      if (claimedEmpty) eErr.push(`M12/B7 ${claimedEmpty} 条空路径没有给出理由（面板会显示一个空列表）`);
+      if (unknownSolid) eErr.push(`M12/B7 ${unknownSolid} 条非空路径形态认不出来`);
+      if (pathObjs < 48) eErr.push(`M12/B7 带 path 的相机对象实测 ${pathObjs}（< 48，语料回归）`);
+      for (const k of Object.keys(qmHist)) {
+        if (k !== "random" && k !== "sequential") eErr.push(`M12/B7 queuemode 出现第三种取值 "${k}"（引擎只认这两档）`);
+      }
+      console.log(
+        `  M12/B7 相机路径语料：${items} 个场景 / ${pathObjs} 个对象带 path / queuemode ${qmObjs} 处 ${JSON.stringify(qmHist)}；` +
+          `非空 ${solidDocs} 条（共 ${solidClips} 段：${solid.join(" | ")}），空 ${emptyDocs} 条`,
+      );
+    } else {
+      console.log("  （跳过 M12/B7 相机路径语料：本机壁纸库没有 scene.pkg）");
+    }
+
+    for (const e of eErr) errors.push(e);
+  }
+}
+
 if (errors.length) {
   console.error(`verify-camera: ${errors.length} 处失败`);
   for (const e of errors) console.error("  - " + e);

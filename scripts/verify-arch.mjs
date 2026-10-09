@@ -684,6 +684,44 @@ for (const name of REQUIRED_WP) {
   for (const m of ["setOverlayMode", "getOverlayStats", "canHotAddLayer", "addLayer", "removeLayer", "reorderLayer", "setLayerScript"]) {
     check(sceneMountSrc.includes(m), `M12 引擎控制面必须实现 ${m}（装配核心 renderer/src/scene-mount.ts）`);
   }
+
+  // B7（相机路径）：新增的编辑器侧读写面同样必须离线可加载、不碰 DOM；并且**必须复用引擎
+  // 那份已对齐 SceneCameraPath::TickQueue 的时钟**，自建第二套 tick / 选段会让「面板里看到的
+  // 运镜」和「运行时播出来的运镜」悄悄分叉。公开面落在 api/editor.ts 上（与 api/types.ts 同批改，
+  // 对应计划 §4 交汇纪律 2）。
+  {
+    const rel = "renderer/src/editor/camera-path.ts";
+    const abs = path.join(ROOT, rel);
+    let mod = null;
+    try {
+      mod = await import(toUrl(abs).href);
+    } catch (e) {
+      check(false, `M12/B7 读写面必须能被 Node 直接加载（离线判据的驱动面）：${rel} —— ${String(e && e.message)}`);
+    }
+    if (mod) {
+      const need = [
+        "normalizeQueueMode",
+        "kindOfCameraPathDoc",
+        "describeCameraPath",
+        "sampleCameraPath",
+        "resolveCameraFovZoom",
+        "readQueueMode",
+        "writeQueueMode",
+        "moveCameraPathClip",
+        "removeCameraPathClip",
+      ];
+      for (const name of need) check(typeof mod[name] === "function", `M12/B7 ${rel} 必须导出 ${name}`);
+      const src = fs.readFileSync(abs, "utf8");
+      check(!/\b(window|document)\s*\./.test(src), `M12/B7 ${rel} 不得碰 window/document（离线判据与引擎侧都要能直接跑）`);
+      check(
+        /from\s+"\.\.\/\.\.\/vendor\/we-scene\/render\/camera-path\.js"/.test(src),
+        `M12/B7 ${rel} 必须复用引擎 render/camera-path.js 的时钟（不得自建第二套 tick / 选段）`,
+      );
+    }
+    for (const n of ["CameraQueueMode", "CameraPathKind", "CameraPathClipInfo", "CameraPathReport", "CameraPathPose", "CameraFovZoom"]) {
+      check(editorApi.includes(n), `M12/B7 新类型 ${n} 必须从 renderer/src/api/editor.ts 出口导出（页面不许 import 深层实现）`);
+    }
+  }
 }
 
 // ---------- 汇总 ----------

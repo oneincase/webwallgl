@@ -1030,6 +1030,67 @@ export type EditorHotAddCheck = {
   reason: string;
 };
 
+/** 相机路径的队列模式（M12 / B7）：对应场景对象上的 `queuemode` 字段 */
+export type CameraQueueMode = "random" | "sequential";
+
+/**
+ * 相机路径文档的两种形态（M12 / B7）。喂错解析器**不会抛错**，只会静默拿到 0 段
+ * （相机一动不动）——所以形态判定要显式做，不能靠 `paths.length` 推断：
+ *   · `"object"` 对象级：`{paths:[{options:{fps,length,mode}, eye:{c0…}}]}`，挂相机对象的 `path`；
+ *   · `"scene"`  场景级：`{paths:[{duration, transforms:[{eye,center,up,timestamp}]}]}`，挂 `scene.camera.paths`。
+ */
+export type CameraPathKind = "object" | "scene" | "unknown";
+
+/** 相机路径里的一段 clip（M12 / B7）：字段取自引擎 `createCameraPath` 归一化后的结果 */
+export type CameraPathClipInfo = {
+  /** 文档内下标（queuemode 队列就是按它走） */
+  index: number;
+  id: unknown;
+  name: string;
+  /** 通道归一化后的帧率（缺省 30）与长度（帧）；duration = length / fps 秒 */
+  fps: number;
+  length: number;
+  duration: number;
+  mode: string;
+  cameramode: string;
+  /** 本段实际带了的通道名（eye / center / up / fov / zoom） */
+  channels: string[];
+};
+
+/** 相机路径的只读体检报告（M12 / B7）：`issues` 非空说明这条路径放不出运镜 */
+export type CameraPathReport = {
+  kind: CameraPathKind;
+  clipCount: number;
+  /** 各段 duration 之和（秒）；对象级路径没有整圈周期，这里只作参考 */
+  totalDuration: number;
+  queueMode: CameraQueueMode;
+  clips: CameraPathClipInfo[];
+  issues: string[];
+};
+
+/** 某一时刻的相机位姿（M12 / B7）：fov 与 zoom 都求出来，交宿主按透视 / 正交选 */
+export type CameraPathPose = {
+  clipIndex: number;
+  clipId: unknown;
+  clipName: string;
+  frame: number;
+  eye: [number, number, number];
+  center: [number, number, number];
+  up: [number, number, number];
+  fov: number;
+  zoom: number;
+};
+
+/** 透视 / 正交各自该吃哪个通道（M12 / B7）：透视用 fov、正交用 zoom */
+export type CameraFovZoom = {
+  /** 该用哪个通道 */
+  use: "fov" | "zoom";
+  /** 被选中的值 */
+  value: number;
+  /** 另一个通道的值（透视为 zoom、正交为 fov），编辑面板要一起显示 */
+  other: number;
+};
+
 /** 用户属性声明（project.json `general.properties` 的条目形状） */
 export type EditorUserPropertyDecl = {
   type: "slider" | "color" | "bool" | "combo" | "textinput";
