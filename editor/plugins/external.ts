@@ -1,8 +1,9 @@
 // 外部插件（PLUGIN-ARCHITECTURE §5）：清单 → 数据贡献 + 代码插件，挂到内核上。
 //
 // 一个插件包 = 一个目录（或等价的文件表），根上有 wwgl-plugin.json：
-//   { id, name, version, engine, main?, contributes?: { effects, particles, shaders, i18n }, permissions? }
-// · 数据贡献（不跑任何代码）：效果描述 JSON（frag / vert 指向包内文件）、粒子模板 JSON、shader 片段、词条；
+//   { id, name, version, engine, main?, contributes?: { effects, particles, "particles.components", shaders, i18n }, permissions? }
+// · 数据贡献（不跑任何代码）：效果描述 JSON（frag / vert 指向包内文件）、粒子模板 JSON、
+//   粒子组件 JSON（WE 组件名 + 参数描述，校验走 particles.components 注册表）、shader 片段、词条；
 //   全部经注册表的 validate（粒子组件白名单、效果 id / 多 pass 约束……），不合法整包拒绝。
 // · 代码插件（main）：单文件 ESM，默认导出一个 Plugin；以 Blob URL import()，挂成外层的子插件，
 //   allow = 清单 permissions ∩ GRANTABLE —— 没授权的服务 ctx.get 拿不到、inject 也永远等不到（pending）。
@@ -10,7 +11,7 @@
 
 import type { Context, PluginObject } from "../core";
 import { defineEffect, type EffectDef, type EffectFbo, type EffectParam, type EffectPass } from "../effects";
-import type { ParticleTemplate } from "../particles";
+import type { ParticleComponent, ParticleTemplate } from "../particles";
 import type { ShaderSnippet } from "../shader-lib";
 import type { SettingsService, StorageService } from "../services/types";
 
@@ -35,6 +36,8 @@ export type PluginManifest = {
     effects?: string[];
     /** 粒子模板 JSON 的包内路径 */
     particles?: string[];
+    /** 粒子组件（WE 组件名 + 参数描述）JSON 的包内路径；与 particles（模板）是两个注册表 */
+    "particles.components"?: string[];
     /** shader 片段文件；include 名 = wwgl/<插件 id>/<文件名去扩展名> */
     shaders?: string[];
     /** 语言 → 词条 JSON 的包内路径 */
@@ -138,13 +141,13 @@ export function parseManifest(raw: unknown): { manifest: PluginManifest | null; 
     if (!c || typeof c !== "object" || Array.isArray(c)) errors.push("contributes 必须是对象");
     else {
       const cc = c as Record<string, unknown>;
-      for (const k of ["effects", "particles", "shaders"] as const) {
+      for (const k of ["effects", "particles", "particles.components", "shaders"] as const) {
         if (cc[k] !== undefined && !isPathList(cc[k])) errors.push(`contributes.${k} 必须是路径数组`);
       }
       if (cc.i18n !== undefined && (!cc.i18n || typeof cc.i18n !== "object" || !Object.values(cc.i18n).every((x) => typeof x === "string"))) {
         errors.push("contributes.i18n 必须是 { 语言: 路径 }");
       }
-      const known = new Set(["effects", "particles", "shaders", "i18n"]);
+      const known = new Set(["effects", "particles", "particles.components", "shaders", "i18n"]);
       for (const k of Object.keys(cc)) if (!known.has(k)) errors.push(`未知的 contributes.${k}`);
     }
   }
@@ -184,6 +187,7 @@ export function packageFromFiles(entries: Iterable<{ path: string; data: Uint8Ar
 export type DataContributions = {
   effects: EffectDef[];
   particles: ParticleTemplate[];
+  components: ParticleComponent[];
   shaders: ShaderSnippet[];
   i18n: Record<string, Record<string, string>>;
 };
@@ -219,7 +223,7 @@ export function dataContributions(pkg: PluginPackage): DataContributions {
       return null;
     }
   };
-  const out: DataContributions = { effects: [], particles: [], shaders: [], i18n: {} };
+  const out: DataContributions = { effects: [], particles: [], components: [], shaders: [], i18n: {} };
   const c = m.contributes ?? {};
 
   for (const p of c.effects ?? []) {
@@ -279,6 +283,16 @@ export function dataContributions(pkg: PluginPackage): DataContributions {
     }
     const { files: _f, ...rest } = j;
     out.particles.push({ ...(rest as unknown as ParticleTemplate), ...(tFiles.length ? { files: tFiles } : {}) });
+  }
+
+  for (const p of c["particles.components"] ?? []) {
+    const j = json(p, "粒子组件");
+    if (!j) continue;
+    const kind = j.kind;
+    if (typeof j.id !== "string" || !j.id) errs.push(`粒子组件 ${p}：缺 id`);
+    else if (kind !== "emitter" && kind !== "initializer" && kind !== "operator" && kind !== "renderer") {
+      errs.push(`粒子组件 ${p}：kind 必须是 emitter / initializer / operator / renderer`);
+    } else out.components.push({ id: j.id, kind, params: Array.isArray(j.params) ? (j.params as ParticleComponent["params"]) : undefined });
   }
 
   for (const p of c.shaders ?? []) {
@@ -345,6 +359,7 @@ export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginOb
   const need = new Set<string>();
   if (c.effects?.length) need.add("effects");
   if (c.particles?.length) need.add("particles.templates");
+  if (c["particles.components"]?.length) need.add("particles.components");
   if (c.shaders?.length) need.add("shaders");
   if (c.i18n && Object.keys(c.i18n).length) need.add("i18n");
   return {
@@ -355,6 +370,8 @@ export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginOb
       // 片段先于效果（效果写盘时要展开 include）
       for (const s of data.shaders) ctx.contribute("shaders", s);
       for (const e of data.effects) ctx.contribute("effects", e);
+      // 组件先于模板（模板里的算子要能对上已登记的组件）
+      for (const k of data.components) ctx.contribute("particles.components", k);
       for (const t of data.particles) ctx.contribute("particles.templates", t);
       for (const [lang, dict] of Object.entries(data.i18n)) {
         const i18n = ctx.get("i18n");
