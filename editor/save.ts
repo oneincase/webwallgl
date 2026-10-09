@@ -52,6 +52,65 @@ export async function collectProject(
   return out;
 }
 
+/**
+ * 写出的网页工程描述（`type:"web"` 打开 → 保存**不改型**）。
+ *
+ * 与场景工程的两处关键差别：
+ * - `type` 不写死：作者怎么写就怎么写（"Web" / "web"），声明缺失时才补 "web"，
+ *   **绝不写 scene** —— 否则存一次就把网页壁纸变成场景工程了；
+ * - `preview` 不删也不换：网页工程的封面是作者自己的 preview.gif / preview.jpg，
+ *   编辑器不产出新封面（capturePreview 要场景实例，web 没有），删掉就等于丢封面。
+ */
+function webProjectJson(doc: EditorDoc, entry: string, hasPreview: boolean): Record<string, unknown> {
+  const p: Record<string, unknown> = structuredClone(doc.project ?? {});
+  p.title = typeof p.title === "string" && p.title.trim() ? p.title : doc.title;
+  const declaredType = typeof p.type === "string" ? p.type.trim() : "";
+  p.type = declaredType || "web";
+  p.file = entry;
+  if (hasPreview) p.preview = PREVIEW_NAME;
+  // 另存出来的是一份新工程，不再是创意工坊那一项
+  delete p.workshopid;
+  delete p.workshopurl;
+  return p;
+}
+
+/**
+ * 网页工程：project.json + 入口 html（**原样字节**）+ 其余资源原样。
+ *
+ * 与场景工程的关键差别在入口那一步：scene 的入口是文档序列化出来的 json，而 web 的
+ * 入口是作者写的 html —— 必须原样写回（把 html 塞进 JSON.stringify 会当场写坏工程）。
+ * 另一个差别是资源读不到时的态度：场景工程跳过缺失资源，网页工程的清单就是工程本体，
+ * 少写一个文件等于工程坏了，所以这里直接抛错。
+ */
+export async function collectWebProject(
+  doc: EditorDoc,
+  assets: SceneAssets,
+  preview: Blob | null,
+  onProgress?: (done: number, total: number) => void,
+): Promise<SaveFile[]> {
+  const enc = new TextEncoder();
+  const skip = new Set(["project.json", PREVIEW_NAME, assets.entry.toLowerCase()]);
+  const names = assets.list().filter((n) => !skip.has(n.toLowerCase()));
+  const out: SaveFile[] = [];
+  let done = 0;
+  for (const name of names) {
+    const bytes = await assets.read(name);
+    if (!bytes) throw new Error(`网页壁纸工程资源读取失败：${name}`);
+    out.push({ path: name, data: bytes });
+    onProgress?.(++done, names.length + 1);
+  }
+  const entryBytes = await assets.read(assets.entry);
+  if (!entryBytes) throw new Error(`网页壁纸工程入口读取失败：${assets.entry}`);
+  out.push({ path: assets.entry, data: entryBytes });
+  onProgress?.(++done, names.length + 1);
+  if (preview) out.push({ path: PREVIEW_NAME, data: new Uint8Array(await preview.arrayBuffer()) });
+  out.push({
+    path: "project.json",
+    data: enc.encode(JSON.stringify(webProjectJson(doc, assets.entry, !!preview), null, 2)),
+  });
+  return out;
+}
+
 /** 视频壁纸工程：project.json（type = video）+ 视频本体 + 封面。WE 的视频壁纸不进 pkg */
 export async function collectVideoProject(doc: EditorDoc, preview: Blob | null): Promise<SaveFile[]> {
   if (!doc.video) throw new Error("没有可保存的视频");

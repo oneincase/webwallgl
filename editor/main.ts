@@ -349,6 +349,7 @@ import {
   canPickDirectory,
   collectProject,
   collectVideoProject,
+  collectWebProject,
   filesFromDirectory,
   pickDirectory,
   probeWritable,
@@ -1262,8 +1263,11 @@ async function saveDocument() {
   await flushAutosave();
 }
 
-/** 有东西可写：场景文档 + 资源表，或视频壁纸工程 */
-const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets);
+/**
+ * 有东西可写：场景文档 + 资源表，或视频壁纸工程，或网页壁纸工程的资源表
+ * （网页工程没有场景文档 —— 工程本体就是那堆站点文件，保存时原样搬）
+ */
+const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets) || (doc?.type === "web" && !!current?.assets);
 
 /**
  * 把当前工程整份写进用户选的本机文件夹，之后的自动保存改到那里。
@@ -1286,6 +1290,7 @@ async function saveProjectToLocalDir() {
 
 async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> {
   if (doc?.video) return collectVideoProject(doc, preview);
+  if (doc?.type === "web" && current?.assets) return collectWebProject(doc, current.assets, preview);
   if (doc?.scene && current?.assets) return collectProject(doc, current.assets, preview);
   return null;
 }
@@ -3867,6 +3872,12 @@ function renderTree() {
   layerCountEl.textContent = "";
   if (!doc) {
     treeEl.appendChild(note(et("layers.none")));
+    return;
+  }
+  if (doc.type === "web") {
+    // 网页壁纸工程没有图层树：工程本体是入口 html + 那堆站点文件，这里报个文件数
+    const n = current?.assets ? current.assets.list().length + 1 : 0;
+    treeEl.appendChild(note(n ? et("layers.webProject", { n }) : et("layers.notScene", { type: doc.type })));
     return;
   }
   if (doc.type !== "scene") {

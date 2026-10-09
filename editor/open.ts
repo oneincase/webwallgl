@@ -51,6 +51,12 @@ export type LocalFile = { path: string; file: File };
 /** 与 scene/parse.js 的入口候选同序；project.file 声明的 json 优先 */
 const SCENE_JSON_CANDIDATES = ["scene.json", "gifscene.json", "scenes/scene.json", "scenes/gifscene.json"];
 const PKG_CANDIDATES = ["scene.pkg", "scenes/scene.pkg", "gifscene.pkg"];
+/**
+ * 网页壁纸工程的入口候选。与宿主判据同序（`host/we-library-scan.mjs` 的
+ * WEB_ENTRY_PATHS、原生 `library.rs::infer_type` 都只认这两个位置）；页面不 import
+ * host 下的 node 侧模块，所以这张表在这里另写一份，改动时两处一起改。
+ */
+const WEB_ENTRY_CANDIDATES = ["index.html", "web/index.html"];
 const MEDIA_TYPES = new Set(["video", "gif", "image"]);
 
 const decoder = new TextDecoder();
@@ -69,6 +75,13 @@ function declaredFile(project: Record<string, unknown> | null): string {
 
 function projectType(project: Record<string, unknown> | null): string {
   return typeof project?.type === "string" ? project.type.toLowerCase() : "";
+}
+
+/** 本地目录里的网页工程入口：声明的 html（须真在文件表里）优先，其次 index.html / web/index.html */
+function webLocalEntry(declared: string, lookup: (name: string) => File | undefined): string | null {
+  if (/\.html?$/i.test(declared) && lookup(declared)) return declared;
+  for (const rel of WEB_ENTRY_CANDIDATES) if (lookup(rel)) return rel;
+  return null;
 }
 
 function pkgAssets(bytes: ArrayBuffer, project: Record<string, unknown> | null): SceneAssets | null {
@@ -128,12 +141,114 @@ export function libraryKind(it: LibraryItem): string {
   return it.hasScene || it.hasLooseScene ? "scene" : it.type.toLowerCase();
 }
 
+// ---------- 网页壁纸工程（type:"web"）的相对资源 ----------
+// 网页工程就是一棵静态站点：入口 html 用相对路径引用 js/css/图片。页面拿到的是 File
+// 或 blob，没有目录概念，相对路径无从解析 —— 所以由宿主（GET /api/editor/web-manifest
+// 与 /api/editor/web-resolve）给出清单、并把相对路径翻成同源的 /web/{token}/{itemId}/
+// {path}（见 host/we-web-project.mjs）。这里只负责取用 + 把失败说清楚。
+
+/** 宿主给出的网页工程资源清单（`GET /api/editor/web-manifest`） */
+export type WebManifest = {
+  itemId: string;
+  /** 入口 html 的相对路径（声明的 file 优先，其次 index.html / web/index.html） */
+  entry: string;
+  /** 工程内全部资源文件的相对路径（已排序；宿主元数据如 .webwallgl-editor 不在内） */
+  files: string[];
+};
+
+/** 宿主返回的错误体；拿不到就用 HTTP 状态兜底，绝不静默当成空清单 */
+function hostErrorMessage(data: { error?: unknown } | null, status: number, what: string): string {
+  return typeof data?.error === "string" && data.error ? data.error : `${what}（HTTP ${status}）`;
+}
+
+export async function fetchWebManifest(itemId: string, signal?: AbortSignal): Promise<WebManifest> {
+  const res = await fetch(`/api/editor/web-manifest?item=${encodeURIComponent(itemId)}`, {
+    signal,
+    headers: { accept: "application/json" },
+  });
+  const data = (await res.json().catch(() => null)) as (Partial<WebManifest> & { ok?: boolean; error?: string }) | null;
+  if (!res.ok || !data?.ok) throw new Error(hostErrorMessage(data, res.status, `读取网页壁纸工程清单失败：${itemId}`));
+  if (typeof data.entry !== "string" || !data.entry || !Array.isArray(data.files)) {
+    throw new Error(`网页壁纸工程清单不完整：${itemId}`);
+  }
+  return { itemId: data.itemId ?? itemId, entry: data.entry, files: data.files.map(String) };
+}
+
+export async function resolveWebAssetUrl(
+  itemId: string,
+  rel: string,
+  opts: { signal?: AbortSignal; raw?: boolean } = {},
+): Promise<string> {
+  const res = await fetch(
+    `/api/editor/web-resolve?item=${encodeURIComponent(itemId)}&path=${encodeURIComponent(rel)}${opts.raw ? "&raw=1" : ""}`,
+    { signal: opts.signal, headers: { accept: "application/json" } },
+  );
+  const data = (await res.json().catch(() => null)) as { ok?: boolean; url?: string; error?: string } | null;
+  if (!res.ok || !data?.ok || !data.url) {
+    throw new Error(hostErrorMessage(data, res.status, `解析网页壁纸工程资源失败：${rel}`));
+  }
+  return data.url;
+}
+
+/**
+ * 网页工程的资源读取器：`read` 先解析出同源 URL 再取字节。
+ *
+ * 两个要点：
+ * - 解析一律带 `raw: true`（URL 上是 `?we-raw=1`）：`/web` 默认会给 html 注入 WE shim、
+ *   给 project.json 合并用户属性覆盖值 —— 那是**预览**要的形态。保存读的必须是作者写的
+ *   原字节，否则每存一次都把 shim 与覆盖值烤进工程文件。
+ * - 与场景资源的宽松约定（取不到返回 null）**故意不同**：相对路径解析不了 = 工程或宿主
+ *   出了问题，返回 null 会让保存悄悄少写文件（网页工程没有「入口 json 写文档」这一步，
+ *   每个文件都得原样搬），所以一律抛错并把宿主给的明确原因带上。
+ */
+export function webProjectAssets(
+  manifest: WebManifest,
+  resolveUrl: (rel: string, signal?: AbortSignal) => Promise<string> = (rel, signal) =>
+    resolveWebAssetUrl(manifest.itemId, rel, { signal, raw: true }),
+): SceneAssets {
+  return {
+    entry: manifest.entry,
+    async read(name, signal) {
+      const url = await resolveUrl(name, signal);
+      const res = await fetch(url, { signal });
+      if (!res.ok) throw new Error(`网页壁纸工程资源读取失败：${name}（HTTP ${res.status}）`);
+      return new Uint8Array(await res.arrayBuffer());
+    },
+    list: () => manifest.files.filter((p) => p !== manifest.entry),
+  };
+}
+
+/**
+ * 「打开不改型」：库扫出的类型是 web，文档也必须按 web 归档。
+ *
+ * 条目没有 project.json（或没声明 type）时 `makeDoc` 会按缺省 scene 归档，保存时
+ * 就会把类型写成 scene —— 打开即改型。补一个 type 让文档与库的判定一致；有声明时
+ * 原样保留作者的写法（"Web" 之类），不改动 project 的其它字段。
+ */
+function ensureWebType(doc: EditorDoc): EditorDoc {
+  if (doc.type !== "web") {
+    doc.project = { ...(doc.project ?? {}), type: "web" };
+    doc.type = "web";
+  }
+  return doc;
+}
+
 export async function openLibraryItem(it: LibraryItem, mediaBase: string, webBase: string): Promise<Opened> {
   const kind = libraryKind(it);
   if (kind === "web") {
     const hs = httpSource(`${webBase}/${it.itemId}`);
     const project = (await hs.project?.()) as Record<string, unknown> | null;
-    return { doc: makeDoc(it.title, project, null, null), source: hs };
+    // 清单 + 相对路径解析：入口 html 与它引用的 js/css/图片都能按需取到
+    const manifest = await fetchWebManifest(it.itemId);
+    const assets = webProjectAssets(manifest);
+    // 入口 URL 也走宿主解析（声明的 file 优先、且必须真在盘上）：httpSource 自带的
+    // webEntry 只按 project.file 拼、不校验存在性，声明写错时会 404 白屏。
+    // 预览用**注入形态**（默认，不加 raw）：网页壁纸靠同源注入的 WE shim 才跑得起来。
+    const source: Source = {
+      ...hs,
+      webEntry: async (signal) => ({ url: await resolveWebAssetUrl(it.itemId, manifest.entry, { signal }) }),
+    };
+    return { doc: ensureWebType(makeDoc(it.title, project, null, null)), source, assets };
   }
   const hs = httpSource(`${mediaBase}/${it.itemId}`);
   const project = (await hs.project?.()) as Record<string, unknown> | null;
@@ -190,7 +305,9 @@ export async function openLocalFiles(input: LocalFile[]): Promise<Opened> {
   const projectFile = lookup("project.json");
   const project = projectFile ? parseJsonBytes(await projectFile.arrayBuffer()) : null;
   const declared = declaredFile(project);
-  const type = projectType(project);
+  // 没声明 type 但 `file` 指向 html 的目录按 web 归类：与原生 infer_type 的
+  // 「index.html → web」同口径，否则这种工程整条打不开
+  const type = projectType(project) || (/\.html?$/i.test(declared) ? "web" : "");
   const title = typeof project?.title === "string" && project.title.trim() ? project.title.trim() : fallbackTitle;
 
   if (MEDIA_TYPES.has(type) && declared && lookup(declared)) {
@@ -201,7 +318,42 @@ export async function openLocalFiles(input: LocalFile[]): Promise<Opened> {
     return { doc, source: mediaSource(file) };
   }
   if (type === "web") {
-    throw new Error("本地网页壁纸目录暂不支持在编辑器里打开（相对资源无法从 blob 地址解析），请从壁纸库打开");
+    // 本地目录里的网页工程：文件清单来自拖进来的 File（**一个都不能丢**），另存 /
+    // 存到本机文件夹都能用。预览不行 —— 入口 html 只有 blob: 地址、相对引用全断，
+    // 于是 webEntry 明确抛错（页面显示成挂载失败原因），不给个空 URL 白屏。
+    const entry = webLocalEntry(declared, lookup);
+    if (!entry) throw new Error("本地网页壁纸目录找不到入口 html（index.html / web/index.html）");
+    const cache = new Map<string, Uint8Array>();
+    const assets: SceneAssets = {
+      entry,
+      async read(name: string) {
+        const hit = cache.get(name);
+        if (hit) return hit;
+        const f = lookup(name);
+        if (!f) return null;
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        cache.set(name, bytes);
+        return bytes;
+      },
+      // 隐藏项（.DS_Store / 编辑器标记）不是工程资源；入口单独原样写回
+      list: () =>
+        files.map((f) => f.path).filter((p) => p !== entry && !p.split("/").some((seg) => seg.startsWith("."))),
+    };
+    const source: Source = {
+      key: `local-web:${title}:${Date.now()}`,
+      async scenePkg() {
+        throw new Error("网页工程没有 scene.pkg");
+      },
+      async project() {
+        return project;
+      },
+      async webEntry() {
+        throw new Error(
+          "本地网页壁纸目录的相对资源无法解析（blob 地址没有目录语义），预览不可用；另存 / 存到本机文件夹后从壁纸库打开即可预览",
+        );
+      },
+    };
+    return { doc: ensureWebType(makeDoc(title, project, null, null)), source, assets };
   }
 
   const pkgFile =
