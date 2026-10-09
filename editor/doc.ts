@@ -458,3 +458,67 @@ export function sceneResolution(scene: Record<string, unknown> | null): { w: num
   const h = Number(ortho?.height);
   return w > 0 && h > 0 ? { w, h } : null;
 }
+
+// ---------- 场景设置：scene.json 的 general 段 ----------
+//
+// 「场景设置」是壁纸自己的参数：写进这个工程的 scene.json、进撤销栈、跟着文档走。
+// 别把它和 editor/ui/render-settings.ts 的「渲染选项」混一起 —— 那是本机 UI 偏好
+// （帧率 / 画质 / 音量），存 localStorage、所有文档共用、不进工程文件。
+//
+// 两条底线：
+//   1. 只动被点名的那一个键，其它键（面板不认识的未知键、orthogonalprojection、camerapreview…）一字不改；
+//   2. 带脚本 / 动画包装的字段（`{script, value, scriptproperties}` / `{animation, value}`）只改 .value，
+//      包装本身必须原样留着 —— 见 renderer/vendor/we-scene/scene/parse.js 的 generalScripts / generalAnimations。
+
+/** general 段视图；缺省 / 类型不对时给空对象（只读语义，写路径走 ensureSceneGeneral） */
+export function sceneGeneral(scene: Record<string, unknown> | null): Record<string, unknown> {
+  const g = scene?.general;
+  return g && typeof g === "object" && !Array.isArray(g) ? (g as Record<string, unknown>) : {};
+}
+
+/** 写入口：没有 general 就建一个空对象；已有的一字不动 */
+export function ensureSceneGeneral(scene: Record<string, unknown>): Record<string, unknown> {
+  const cur = scene.general;
+  if (cur && typeof cur === "object" && !Array.isArray(cur)) return cur as Record<string, unknown>;
+  const g: Record<string, unknown> = {};
+  scene.general = g;
+  return g;
+}
+
+/**
+ * 字段是否被脚本 / 动画包着。判据对齐 parse.js 的抽取条件：
+ * script 是「非空字符串」，animation 是「带 options 的对象」—— 其余形态当普通值。
+ */
+function isGeneralWrap(raw: unknown): raw is Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const box = raw as Record<string, unknown>;
+  if (typeof box.script === "string" && box.script) return true;
+  const anim = box.animation;
+  return !!anim && typeof anim === "object" && !!(anim as Record<string, unknown>).options;
+}
+
+/** 读一个 general 字段：被包装的取 .value（面板要的是作者当初设的那个值） */
+export function readGeneralField(general: Record<string, unknown>, key: string): unknown {
+  const raw = general[key];
+  return isGeneralWrap(raw) ? raw.value : raw;
+}
+
+/** 写一个 general 字段：包装只改 .value（script / scriptproperties / animation 原样），其余键不动 */
+export function writeGeneralField(general: Record<string, unknown>, key: string, value: unknown): void {
+  const raw = general[key];
+  if (isGeneralWrap(raw)) raw.value = value;
+  else general[key] = value;
+}
+
+/** general 段整体快照（记账用）；"null" = 这份文档本来就没有 general 键 */
+export function generalSnapshot(scene: Record<string, unknown> | null): string {
+  return JSON.stringify(scene && "general" in scene ? scene.general : null);
+}
+
+/** 把 general 段换回快照（撤销 / 重做）：快照为空则删掉 general 键，不留空壳 */
+export function restoreGeneral(scene: Record<string, unknown> | null, json: string): void {
+  if (!scene) return;
+  const g = JSON.parse(json) as Record<string, unknown> | null;
+  if (g && typeof g === "object" && !Array.isArray(g)) scene.general = g;
+  else delete scene.general;
+}

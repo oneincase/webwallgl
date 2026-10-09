@@ -4649,6 +4649,161 @@ section("J. 变异红测");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// SCENE-SET. 场景设置（计划 A4 / M3）：scene.json 的 general 段读写与记账
+// 真浏览器侧另有 AK 段「改 camerashake → 出帧变化」，见 scripts/verify-editor-headless.mjs。
+// ───────────────────────────────────────────────────────────────────────────
+section("SCENE-SET. 场景设置面板（general 读写 / 保留未知键与非默认值 / 撤销记账）");
+{
+  const scn = await loadEditorModule("scene-settings");
+  /**
+   * 一份贴近真工程的 general：既有非默认值，也有必须原样留着的未知键
+   * （norecompile 这种别的工具写进去的）和脚本 / 动画包装。
+   */
+  const scnScene = () => ({
+    general: {
+      ambientcolor: "0.30000 0.30000 0.30000",
+      bloom: false,
+      bloomhdriterations: 8,
+      camerapreview: true,
+      camerashake: false,
+      clearcolor: "0.70000 0.70000 0.70000",
+      norecompile: true,
+      orthogonalprojection: { width: 343, height: 193 },
+      zoom: { script: "return 3;", scriptproperties: null, value: 1 },
+      bloomstrength: { animation: { options: { fps: 30 } }, value: 2 },
+    },
+    objects: [],
+  });
+  const scnField = (k) => scn.sceneField(k);
+  const scnRow = (scene, k) => scn.sceneRows(scene).find((r) => r.field.key === k);
+
+  // ---- 字段表：计划 §1.3 点名的键都要能编，且不越界碰别的键 ----
+  const scnPlan = ["ambientcolor", "clearcolor", "skylightcolor", "clearenabled", "camerafade",
+    "cameraparallax", "cameraparallaxamount", "cameraparallaxdelay", "cameraparallaxmouseinfluence",
+    "camerashake", "camerashakeamplitude", "camerashakeroughness", "camerashakespeed",
+    "zoom", "fov", "nearz", "farz", "perspectiveoverridefov",
+    "bloom", "bloomstrength", "bloomthreshold", "bloomtint", "hdr",
+    "bloomhdrstrength", "bloomhdrthreshold", "bloomhdriterations", "bloomhdrscatter", "bloomhdrfeather"];
+  const scnTable = new Set(scn.SCENE_FIELDS.map((f) => f.key));
+  const scnLack = scnPlan.filter((k) => !scnTable.has(k));
+  check(scnLack.length === 0, `计划 §1.3 点名的 general 键都在字段表里（缺 ${json(scnLack)}）`);
+  check(!scnTable.has("orthogonalprojection") && !scnTable.has("norecompile"), "字段表不含 orthogonalprojection / norecompile：面板不碰分辨率与别的工具写的键");
+  check(scn.SCENE_FIELDS.filter((f) => f.group === "parallax").length === 4 && scn.SCENE_GROUPS.length === 5, "鼠标视差单独成组（开关 + 幅度 / 延迟 / 鼠标影响），共 5 组");
+  check(scn.SCENE_FIELDS.every((f) => scnField(f.key) === f) && scn.SCENE_FIELDS.every((f) => f.group && "def" in f), "字段表按键可取回，每条都带分组与默认值（面板显示「未设置」用）");
+
+  // ---- 输入解析 / 回显：WE 的 general 写法（颜色是空格分隔的 3 分量小数）----
+  check(scn.parseSceneValue(scnField("clearcolor"), "0.1 0.2 0.3") === "0.10000 0.20000 0.30000", "颜色输入 → WE 写法（空格分隔、五位小数）");
+  check(scn.parseSceneValue(scnField("clearcolor"), "0.1,0.2,0.3") === "0.10000 0.20000 0.30000", "颜色也认逗号分隔（作者手抄来的写法）");
+  check(scn.parseSceneValue(scnField("clearcolor"), "0.1 0.2") === null && scn.parseSceneValue(scnField("clearcolor"), "a b c") === null, "颜色分量数不对 / 非数字 → 不提交");
+  check(scn.parseSceneValue(scnField("fov"), "50") === 50 && scn.parseSceneValue(scnField("fov"), "") === null && scn.parseSceneValue(scnField("fov"), "abc") === null, "数值：认数字，空串与非数字不提交");
+  check(scn.parseSceneValue(scnField("bloomhdriterations"), "8.4") === 8, "整数族四舍五入（迭代次数不能是小数）");
+  check(scn.parseSceneValue(scnField("fov"), "0") === null && scn.parseSceneValue(scnField("camerashakeroughness"), "5") === null, "越界（低于下限 / 高于上限）不提交：不写出引擎夹不回来的值");
+  check(scn.formatSceneValue(scnField("clearcolor"), "0.7 0.7 0.7") === "0.70000 0.70000 0.70000", "颜色回显统一成 WE 写法");
+  check(scn.formatSceneValue(scnField("camerashake"), true) === "true" && scn.formatSceneValue(scnField("zoom"), 2) === "2", "回显：布尔与数值按作者看得懂的形式打印");
+
+  // ---- 读写模型：只动点名那一个键 ----
+  const scnA = scnScene();
+  const scnG = docMod.sceneGeneral(scnA);
+  const scnKeys0 = Object.keys(scnG).sort();
+  docMod.writeGeneralField(scnG, "fov", 60);
+  docMod.writeGeneralField(scnG, "clearcolor", scn.parseSceneValue(scnField("clearcolor"), "0.1 0.2 0.3"));
+  check(docMod.readGeneralField(scnG, "fov") === 60 && scnG.clearcolor === "0.10000 0.20000 0.30000", "general 写入后读回一致（fov 60 / clearcolor 新值）");
+  check(scnG.norecompile === true && scnG.camerapreview === true, "写入只动点名那一个键：未知键 norecompile / camerapreview 原样留着");
+  check(scnG.bloom === false && scnG.bloomhdriterations === 8 && scnG.ambientcolor === "0.30000 0.30000 0.30000", "别的既有非默认值不被顺手清掉");
+  check(json(Object.keys(scnG).sort()) === json([...scnKeys0, "fov"].sort()), "键集合只多出被写的那一个（没有重建 general）");
+  docMod.writeGeneralField(scnG, "zoom", 2);
+  check(scnG.zoom.script === "return 3;" && scnG.zoom.scriptproperties === null && scnG.zoom.value === 2, "脚本包装只改 .value：script / scriptproperties 原样留着");
+  check(docMod.readGeneralField(scnG, "zoom") === 2, "读包装字段拿到的是作者当初设的值（.value），不是整个盒子");
+  docMod.writeGeneralField(scnG, "bloomstrength", 5);
+  check(scnG.bloomstrength.animation.options.fps === 30 && scnG.bloomstrength.value === 5, "动画包装同样只改 .value：animation 原样留着");
+  check(json(scnG.orthogonalprojection) === json({ width: 343, height: 193 }), "orthogonalprojection 一字不动（分辨率不归这个面板管）");
+  const scn3d = { general: { orthogonalprojection: null, fov: 50 }, objects: [] };
+  docMod.writeGeneralField(docMod.sceneGeneral(scn3d), "fov", 60);
+  check(scn3d.general.orthogonalprojection === null && "orthogonalprojection" in scn3d.general, "3D 透视场景的 orthogonalprojection:null 不被补成空对象（补了会被当正交 → 全黑）");
+
+  // ---- 面板读视图 ----
+  check(scnRow(scnA, "zoom").present === true && scnRow(scnA, "zoom").wrapped === true && scnRow(scnA, "zoom").value === 2, "面板看到包装字段：已设 + 标出「脚本 / 动画」");
+  check(scnRow(scnA, "skylightcolor").present === false && scnRow(scnA, "skylightcolor").value === undefined, "文档里没有的键不会被面板补出来（present=false）");
+  check(scn.sceneRows({ general: {} }).length === scn.SCENE_FIELDS.length, "面板行数 = 字段表条数（缺省文档也有完整面板）");
+
+  // ---- 快照 / 还原：撤销栈里存的是整段 general ----
+  const scnSnapA = docMod.generalSnapshot(scnA);
+  const scnFresh = { general: { fov: 1 }, objects: [] };
+  docMod.restoreGeneral(scnFresh, scnSnapA);
+  check(json(scnFresh.general) === json(scnA.general), "generalSnapshot / restoreGeneral 整段往返一致（含未知键与包装）");
+  const scnNoGen = { objects: [] };
+  check(docMod.generalSnapshot(scnNoGen) === "null" && Object.keys(docMod.sceneGeneral(scnNoGen)).length === 0, "本来就没有 general 的文档：快照记 null、读视图给空对象");
+  docMod.restoreGeneral(scnNoGen, "null");
+  check(!("general" in scnNoGen), "撤销回「本来就没有 general」时不留下空壳");
+  check(Object.keys(docMod.sceneGeneral(null)).length === 0 && docMod.generalSnapshot(null) === "null", "没有文档（null）时读路径不抛错");
+  const scnMade = {};
+  const scnMadeG = docMod.ensureSceneGeneral(scnMade);
+  scnMadeG.fov = 50;
+  check(scnMade.general && scnMade.general.fov === 50, "ensureSceneGeneral 在没有 general 时建一个并返回可写对象");
+
+  // ---- 记账：一次编辑一笔 SceneCmd，撤销 / 重做整段换回 ----
+  const scnHist = new historyMod.EditHistory();
+  const scnBefore = docMod.generalSnapshot(scnA);
+  docMod.writeGeneralField(docMod.sceneGeneral(scnA), "camerashake", true);
+  docMod.writeGeneralField(docMod.sceneGeneral(scnA), "camerashakeamplitude", 3);
+  const scnAfter = docMod.generalSnapshot(scnA);
+  scnHist.push({ kind: "scene", label: "场景设置：相机抖动 = true", before: scnBefore, after: scnAfter });
+  const scnCmd = scnHist.take("undo");
+  check(!!scnCmd && historyMod.isSceneCmd(scnCmd) && !historyMod.isStruct(scnCmd) && !historyMod.isTitleCmd(scnCmd) && !historyMod.isBatch(scnCmd), "场景设置是独立的一种命令（isSceneCmd 真，不会误走结构 / 改名 / 批量分支）");
+  docMod.restoreGeneral(scnA, scnCmd.before);
+  check(scnA.general.camerashake === false && scnA.general.camerashakeamplitude === undefined, "撤销回到改前的 general（这次新加的键一起收回）");
+  docMod.restoreGeneral(scnA, scnCmd.after);
+  check(scnA.general.camerashake === true && scnA.general.camerashakeamplitude === 3, "重做把整段 general 换回来");
+  check(scnHist.undoStack.length === 0 && scnHist.redoStack.length === 1, "取出的命令进另一侧栈（undo 后还能 redo）");
+  check(docMod.generalSnapshot(scnA) === scnAfter, "重做后文档快照与入栈时的 after 逐字节一致");
+
+  // ---- 页面接线：面板本体、菜单、撤销方向、切语言 ----
+  const scnMain = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const scnHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  check(/import \{ mountSceneSettings \} from "\.\/scene-settings";/.test(scnMain), "外接面板与单测是同一份代码（页面 import 的就是 scene-settings.ts）");
+  check(/id="tb-scene-opts"/.test(scnHtml) && /id="scene-menu-body"/.test(scnHtml), "视口工具条有「场景设置」按钮，弹出层有装面板的容器");
+  check(/id="render-menu" class="ed-menu ed-render-menu"/.test(scnHtml) && /id="scene-menu" class="ed-menu ed-render-menu" role="dialog" hidden/.test(scnHtml), "两个菜单并存且样式一致：全局「渲染选项」与「场景设置」分开两份，都默认收起");
+  check(/function sceneEdit\(label: string, key: string, value: unknown\): boolean \{[\s\S]{0,600}edits\.push\(\{ kind: "scene", label, before, after \}\)[\s\S]{0,300}docDriven = true;[\s\S]{0,200}markDirty\(\);[\s\S]{0,200}void mountCurrent\(true\);/.test(scnMain), "改一次场景设置：一笔撤销栈 + 置 docDriven 后整场景重挂（引擎才拿到新 general）");
+  check(/if \(after === before\) return false;/.test(scnMain), "值没变（点一下没动 / 改回原值）不入栈");
+  check(/if \(isSceneCmd\(cmd\)\) \{\s*log\(et\(dir === "undo" \? "log\.undo" : "log\.redo", \{ name: cmd\.label \}\)\);\s*applySceneSnap\(dir === "undo" \? cmd\.before : cmd\.after\);/.test(scnMain), "撤销 / 重做按键方向换回 general 快照");
+  check(/edit: sceneEdit,/.test(scnMain) && /onChangeLang\(\(\) => sceneSettings\.refresh\(\)\);/.test(scnMain), "面板接进页面：编辑走 sceneEdit，切语言后重画");
+  check(/closeExportMenu\(\);\s*closeRenderMenu\(\);\s*sceneSettings\.refresh\(\);/.test(scnMain), "开场景设置时收起别的菜单，并重画成当前文档的样子");
+
+  // ---- i18n：中英文各一条（bench 切语言后同一份面板）----
+  const scnI18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const scnKeys = ["scn.title", "scn.opts", "scn.optsTip", "scn.hint", "scn.keep", "scn.noDoc", "scn.def", "scn.set", "scn.wrapped", "log.sceneSet", "log.sceneBad", "log.sceneNoDoc",
+    ...scn.SCENE_GROUPS.map((g) => `scn.sec.${g}`), ...scn.SCENE_FIELDS.map((f) => `scn.f.${f.key}`)];
+  const scnMiss = scnKeys.filter((k) => (scnI18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(scnMiss.length === 0, `场景设置文案中英文各一条（缺 / 重 ${json(scnMiss)}）`);
+  check(/"scn\.title": "场景设置"/.test(scnI18n) && /"scn\.title": "Scene settings"/.test(scnI18n), "中英文都真翻译了（不是同一串占位）");
+  check(/"scn\.hint": "[^"]*scene\.json/.test(scnI18n), "面板自带说明：这些参数写进工程的 scene.json（与全局渲染选项分清）");
+  check(/id="scene-menu"[\s\S]{0,700}data-et="scn\.hint"/.test(scnHtml), "说明就在面板里（用户不必去看文档才知道写到哪）");
+
+  // ---- 变异红测：把保键 / 拆包装的底线各破一次，上面的判据必须变红 ----
+  const scnDocPath = path.join(ROOT, "editor/doc.ts");
+  const scnDocSrc = fs.readFileSync(scnDocPath, "utf8");
+  const scnMut = async (from, to, tag) => {
+    const mut = scnDocSrc.replace(from, to);
+    check(mut !== scnDocSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("doc", { [scnDocPath]: mut });
+  };
+  const scnWriteAnchor = "  const raw = general[key];\n  if (isGeneralWrap(raw)) raw.value = value;\n  else general[key] = value;";
+  const scnMutDrop = await scnMut(scnWriteAnchor, "  for (const k of Object.keys(general)) delete general[k];\n  general[key] = value;", "写入时重建 general");
+  const scnDropG = scnMutDrop.sceneGeneral(scnScene());
+  scnMutDrop.writeGeneralField(scnDropG, "fov", 60);
+  check(!("norecompile" in scnDropG) && !("orthogonalprojection" in scnDropG) && !("camerapreview" in scnDropG), "写入时重建 general 的话「未知键 / 正交投影 / camerapreview 原样留着」判据变红");
+  const scnMutRead = await scnMut("  return isGeneralWrap(raw) ? raw.value : raw;", "  return raw;", "读时不拆脚本 / 动画包装");
+  const scnReadG = scnMutRead.sceneGeneral(scnScene());
+  check(typeof scnMutRead.readGeneralField(scnReadG, "zoom") === "object", "读 general 不拆包装的话「面板看到作者设的值」判据变红");
+  const scnMutClobber = await scnMut("  if (isGeneralWrap(raw)) raw.value = value;\n  else general[key] = value;", "  general[key] = value;", "写入时不认包装");
+  const scnClobberG = scnMutClobber.sceneGeneral(scnScene());
+  scnMutClobber.writeGeneralField(scnClobberG, "zoom", 2);
+  check(scnClobberG.zoom === 2 && typeof scnClobberG.zoom !== "object", "写入盖掉包装的话「脚本 / 动画包装只改 .value」判据变红");
+  const scnHeadSrc = fs.readFileSync(path.join(ROOT, "scripts/verify-editor-headless.mjs"), "utf8");
+  check(/section\("AK\. 场景设置端到端（改 camerashake → 出帧变化）"\)/.test(scnHeadSrc), "真浏览器侧有「改 camerashake → 出帧变化」用例（--headless 跑）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {

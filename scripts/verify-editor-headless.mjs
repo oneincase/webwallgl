@@ -2393,4 +2393,86 @@ async function runCreateAndDraft(ctx) {
   check(isRed(await pixelUntil(topR, isRed)) && (await ev(`Number(document.querySelector('#tl-range').value)`)) < 0.05, "录完画面复原到容器尺寸、回到原时刻");
   check((await h.errorLines()).length === 0, "录制全程无错误");
   }
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AK. 场景设置端到端（改 camerashake → 出帧变化）");
+  await gotoEditor();
+  await newBlank("#101010");
+  await addImage(stripePath);
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  const crK = await h.canvasRect();
+  const scnClip = { x: Math.round(crK.x), y: Math.round(crK.y), width: Math.round(crK.w), height: Math.round(crK.h), scale: 1 };
+  /** 画面指纹：画布区域缩到 64×36 灰度。比的是「画面动没动」，不是某个像素的值 */
+  const scnFp = async () => {
+    const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip: scnClip });
+    return ev(`(async () => {
+      const bmp = await createImageBitmap(await (await fetch('data:image/png;base64,${data}')).blob());
+      const c = new OffscreenCanvas(64, 36); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0, 64, 36);
+      const d = g.getImageData(0, 0, 64, 36).data; const out = [];
+      for (let i = 0; i < d.length; i += 4) out.push((d[i] * 3 + d[i + 1] * 6 + d[i + 2]) / 10);
+      return out;
+    })()`);
+  };
+  const scnGap = (a, b) => a.reduce((s, v, i) => s + Math.abs(v - b[i]), 0) / a.length;
+  /** 连采 n 张取与首张的最大差：静止画面 ≈ 0，抖动画面取到摆幅 */
+  const scnSwing = async (n, ms) => {
+    const fps = [];
+    for (let i = 0; i < n; i++) {
+      if (i) await new Promise((r) => setTimeout(r, ms));
+      fps.push(await scnFp());
+    }
+    let mx = 0;
+    for (let i = 1; i < fps.length; i++) mx = Math.max(mx, scnGap(fps[0], fps[i]));
+    return { mx, first: fps[0] };
+  };
+  const scnSet = async (key, value) => {
+    const rc = await h.readyCount();
+    await ev(`(() => {
+      const el = document.querySelector('#scene-menu-body [data-scene-key="${key}"] input');
+      if (el.type === 'checkbox') el.checked = ${JSON.stringify(value)};
+      else el.value = ${JSON.stringify(String(value))};
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    await h.waitRemount(rc);
+  };
+
+  await clickSel("#tb-scene-opts");
+  check(await ev(`!document.querySelector('#scene-menu').hidden`), "工具条「场景设置」弹出面板（复用渲染菜单的样式）");
+  check((await ev(`document.querySelectorAll('#scene-menu-body [data-scene-key]').length`)) === 29 && (await ev(`document.querySelectorAll('#scene-menu-body .ed-menu-title').length`)) === 5, "面板 29 个字段 / 5 个分组（清屏 · 相机 · 抖动 · 视差 · 泛光）");
+  check(await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashake"] .wb-field-val').textContent)`) === "未设置", "新建工程没写过 camerashake：面板标「未设置」（默认值只显示，不进文档）");
+  check(await ev(`document.querySelector('#render-menu').hidden && !document.querySelector('#render-menu').contains(document.querySelector('#scene-menu'))`), "「场景设置」和全局「渲染选项」是两个独立菜单（不是同一个面板）");
+  check(await ev(`/scene\\.json/.test(document.querySelector('#scene-menu').textContent)`), "面板里写明这些参数写进工程的 scene.json");
+  await clickSel("#tb-scene-opts");
+  check(await ev(`document.querySelector('#scene-menu').hidden`), "再点一次收起（与渲染选项一致）");
+
+  const baseK = await scnSwing(4, 120);
+  check(baseK.mx < 0.6, `未开抖动：静止画面连采 4 张几乎不变（最大差 ${baseK.mx.toFixed(3)}）`);
+
+  await clickSel("#tb-scene-opts");
+  await scnSet("camerashakeamplitude", 5);
+  await scnSet("camerashake", true);
+  check(await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashake"] .wb-field-val').textContent)`) === "已设", "开一次抖动：文档里真写下了这个键（面板标「已设」）");
+  await clickSel("#tb-scene-opts");
+  const shakeK = await scnSwing(8, 90);
+  check(shakeK.mx > baseK.mx * 3 && shakeK.mx > 1, `★ 改 camerashake：出帧开始晃（最大差 ${shakeK.mx.toFixed(3)}，静止时 ${baseK.mx.toFixed(3)}）`);
+  await ctx.session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/scene-shake.jpg") });
+  console.log("  截图：scripts/.tmp-editor-e2e/scene-shake.jpg");
+
+  // 撤销：一次编辑一笔栈 —— 先收回 camerashake 这一笔，幅度那笔还在
+  await ev(`document.activeElement && document.activeElement.blur()`);
+  await undoRedo(false);
+  await clickSel("#tb-scene-opts");
+  check(await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashake"] .wb-field-val').textContent)`) === "未设置" && (await ev(`(document.querySelector('#scene-menu-body [data-scene-key="camerashakeamplitude"] .wb-field-val').textContent)`)) === "已设", "撤销一步只收回最后一笔（抖动关了，先写的幅度还在）");
+  await clickSel("#tb-scene-opts");
+  const undoneK = await scnSwing(4, 120);
+  check(undoneK.mx < 0.6 && scnGap(undoneK.first, baseK.first) < 1.2, `撤销后画面回到静止基线（连采最大差 ${undoneK.mx.toFixed(3)}，与基线差 ${scnGap(undoneK.first, baseK.first).toFixed(3)}）`);
+
+  await ev(`document.activeElement && document.activeElement.blur()`);
+  await undoRedo(false);
+  const idK = await saveLoose();
+  const genK = JSON.parse(fs.readFileSync(path.join(lib, idK, "scene.json"), "utf8")).general;
+  check(!("camerashake" in genK) && !("camerashakeamplitude" in genK), `撤销到底：这次写进去的两个键都从盘上 scene.json 里收回了（现存 ${json(Object.keys(genK))}）`);
+  check(json(genK.orthogonalprojection) === json({ width: 1920, height: 1080 }), "★ 撤销到底也没碰 orthogonalprojection（分辨率还在）");
+  check((await h.errorLines()).length === 0, "场景设置全程无错误");
 }
