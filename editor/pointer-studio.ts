@@ -183,6 +183,28 @@ export function loadTracks(storage?: StorageLike | null): PointerTrack[] {
   }
 }
 
+/**
+ * 【导出边界】计划 §6 决策 3：`scene.json`（以及 `project.json`）没有指针字段，
+ * 指针只是编辑器里的运行时状态 —— 所以离线导出明确「不带指针数据」，导出器保持原行为不变。
+ * 轨迹只活在内存 + localStorage 兜底里，不进保存清单、不进 zip。
+ *
+ * 这个扫描器就是这条边界的守卫：递归列出键名沾 `pointer` 的字段路径，
+ * 判据拿它扫导出产物的 scene.json / project.json，一旦将来有人往 schema 里塞指针字段就变红。
+ * 不返回递归爆栈的可能：导出产物是 JSON，深度限制 8 层足够。
+ */
+export function findPointerFields(value: unknown, path = "", depth = 0): string[] {
+  if (depth > 8 || !value) return [];
+  if (Array.isArray(value)) return value.flatMap((v, i) => findPointerFields(v, `${path}[${i}]`, depth + 1));
+  if (!isObj(value)) return [];
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(value)) {
+    const p = path ? `${path}.${k}` : k;
+    if (/pointer/i.test(k)) out.push(p);
+    out.push(...findPointerFields(v, p, depth + 1));
+  }
+  return out;
+}
+
 /** 写回兜底存储；配额满 / 隐私模式都只返回 false，不掉链子 */
 export function storeTracks(storage: StorageLike | null | undefined, tracks: ReadonlyArray<PointerTrack>): boolean {
   if (!storage) return false;

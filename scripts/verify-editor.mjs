@@ -20,8 +20,9 @@
  *   O. draft.ts：草稿快照深拷贝、结构化克隆往返、不可信输入校验、套用
  *   P. 新建闭环：空白模板 → 图片层 → 删一张 → 存进库 → 重新打开 → 逐字段 / 逐字节一致
  *   S / U / V. 效果库、脚本预检与挂点、用户属性声明 / 绑定（含引擎接住新声明、属性表撤销快照）
- *   POINTER-STUDIO（B5 / M11）指针工作室 pointer-studio.ts：时间轴插值 / 边界钳制、轨迹序列化往返、
- *      回放取样随播放头前进、停帧摆位不改文档、导出产物里没有指针数据
+ *   POINTER-STUDIO（B5 / M11）指针工作室 pointer-studio.ts：时间轴插值 / 边界钳制、轨迹序列化往返
+ *      与 localStorage 兜底、录制打点、回放取样随播放头前进、停帧摆位不改文档、
+ *      导出产物里没有指针字段（scene.json 无指针字段，计划 §6 决策 3）+ 接线 / i18n 键各一次
  *   I. 接线文本断言：页面只经抽出的模块做这些事（不允许再长回内联副本）
  *   J. 变异红测：把实现改坏，确认对应判据会变红（防假绿）
  *
@@ -4206,6 +4207,59 @@ section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）"
     "停帧摆位不改文档：反复摆位后文档快照逐字节一致（指针对场景是纯运行时状态）");
   check(!/from "\.\/(save|export-pipeline|doc|history)"/.test(ptrSrc),
     "指针工作室不 import 保存 / 导出 / 文档 / 撤销栈：它只驱动 uniform，不参与文档记账");
+
+  // 导出边界：scene.json 没有指针字段（计划 §6 决策 3）→ 离线导出产物里不含任何指针数据
+  check(ptrMod.findPointerFields({ a: 1, cursor: { x: 1 } }).length === 0
+    && json(ptrMod.findPointerFields({ a: { PointerPosition: 1 }, b: [{ pointerButtons: 2 }] })) === json(["a.PointerPosition", "b[0].pointerButtons"]),
+  "findPointerFields：扫出键名沾 pointer 的字段路径（含嵌套 / 数组），干净的产物返回空");
+  const expDoc = freshDoc();
+  const expFiles = await saveMod.collectProject(expDoc, memAssets("scene.json", {}), null);
+  const expTexts = expFiles.map((f) => [f.path, dec.decode(f.data)]);
+  const expJsonEntries = expTexts.filter(([p]) => /\.json$/i.test(p));
+  const expHits = expJsonEntries.flatMap(([p, text]) => {
+    try {
+      return ptrMod.findPointerFields(JSON.parse(text)).map((field) => `${p}:${field}`);
+    } catch {
+      return [`${p}:<不是 JSON>`];
+    }
+  });
+  check(expHits.length === 0 && expJsonEntries.length >= 2,
+    `导出产物里没有指针字段：扫了 ${expJsonEntries.length} 个 json（scene.json / project.json），命中 ${json(expHits)}`);
+  check(expTexts.every(([, text]) => !text.includes(ptrMod.POINTER_TRACKS_KEY) && !/pointer/i.test(text)),
+    "导出产物文本里既没有轨迹存储键、也没有 pointer 字样（指针只在内存 / localStorage 兜底里）");
+  check(!expFiles.some((f) => /pointer/i.test(f.path)),
+    "导出清单里没有指针相关条目（轨迹不进 zip、不进保存清单）");
+  const saveSrc = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
+  const pipeSrc = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
+  check(!/pointer/i.test(saveSrc) && !/pointer/i.test(pipeSrc),
+    "导出器不改行为：save.ts / export-pipeline.ts 里一个字都没动（指针工作室没接进去）");
+
+  // i18n：新键必须 zh + en 各一次（verify 的「键恰好出现 2 次」断言）
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const pageSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keySrc = `${ptrSrc}\n${mainSrc}\n${pageSrc}`;
+  const ptrKeys = [...new Set([...keySrc.matchAll(/"((?:ptr\.|log\.ptr)[A-Za-z.]+)"/g)].map((m) => m[1]))];
+  const keyHits = ptrKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(ptrKeys.length >= 24 && keyHits.length === 0,
+    `指针工作室的 ${ptrKeys.length} 个文案键在 editor/i18n.ts 里 zh / en 各恰好一次（不齐的：${json(keyHits)}）`);
+  check(ptrKeys.includes("ptr.exportNote") && /data-et="ptr\.exportNote"/.test(pageSrc),
+    "导出边界提示有对应文案键 ptr.exportNote（菜单里那行说明走 i18n，不是硬编码）");
+
+  // 接线：main.ts / index.html / editor.css
+  check(/from "\.\/pointer-studio"/.test(mainSrc) && mainSrc.includes("createPointerStudio({")
+    && mainSrc.includes("instance?.pushPointer(") && mainSrc.includes("instance?.pointerLeave("),
+  "main.ts：指针工作室接到引擎的 pushPointer / pointerLeave 上（没有新造通道）");
+  check(mainSrc.includes("pointerStudio.resync()") && mainSrc.includes("pointerStudio.tick()")
+    && mainSrc.includes("pointerStudio.startReplay(") && mainSrc.includes("pointerStudio.stopRecord()"),
+  "main.ts：重挂后 resync、时间轴 tick、菜单的回放 / 录制都接上了");
+  check(pageSrc.includes('id="tb-pointer"') && pageSrc.includes('id="pointer-menu"')
+    && pageSrc.includes('id="ptr-tracks"') && pageSrc.includes('id="ptr-play"') && pageSrc.includes('id="ptr-del"')
+    && pageSrc.includes('data-et="ptr.exportNote"'),
+  "index.html：视口工具条按钮 + 菜单（摆位 / 录制 / 回放 / 删除 + 导出边界提示）都在");
+  check(cssSrc.includes(".ed-pointer-menu") && cssSrc.includes(".ed-pointer-row") && cssSrc.includes(".ed-pointer-note"),
+    "editor.css：指针工作室菜单的样式都在（沿用 .ed-menu 的 fixed 定位）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

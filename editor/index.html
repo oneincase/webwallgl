@@ -186,6 +186,8 @@
             <button type="button" id="ptr-del" data-et="ptr.del">删除</button>
           </div>
           <p class="ed-rec-hint" id="ptr-state" data-et="ptr.parkedNone">指针未摆位</p>
+          <!-- 导出边界（计划 §6 决策 3）：scene.json 没有指针字段，导出器不改行为 -->
+          <p class="ed-rec-hint ed-pointer-note" data-et="ptr.exportNote">scene.json 没有指针字段：轨迹只在本机预览，离线导出不带指针数据</p>
         </div>
         <span class="wb-tb-sep"></span>
         <button type="button" class="ed-icon" id="tb-undo" disabled data-et-title="tb.undo" title="撤销（⌘Z）">

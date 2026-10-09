@@ -1270,6 +1270,13 @@ input.ed-al-name {
   margin: 4px 2px 2px;
 }
 
+/* 导出边界提示：比状态行更淡，说明「轨迹不进导出」 */
+.ed-pointer-menu > .ed-pointer-note {
+  color: var(--wb-fg-mute);
+  line-height: 1.45;
+  margin-top: 6px;
+}
+
 .ed-new-row {
   display: flex;
   align-items: center;
