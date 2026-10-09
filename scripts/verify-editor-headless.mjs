@@ -432,9 +432,17 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await ed.reorderLayer(idBottom, 0);
     out.orderReorderBack = ed.getLayers().map((l) => l.id);
     out.frameReorderBack = diff(f0, await pix());
-    let reorderErr = '';
-    try { await ed.reorderLayer(idTop, n0); } catch (e) { reorderErr = e.message; }
-    out.reorderErr = reorderErr;
+    // 契约（renderer/src/api/types.ts reorderLayer）：toIndex = 目标下标、越界夹到端点；
+    // 目标即原位 = 空操作 **resolve**（不报失败），只有「层不存在」「下标非有限数」才 reject。
+    const orderBeforeNoop = ed.getLayers().map((l) => l.id).join(',');
+    let noopErr = '';
+    try { await ed.reorderLayer(idTop, n0); } catch (e) { noopErr = e.message; }
+    out.noopErr = noopErr;
+    out.orderBeforeNoop = orderBeforeNoop;
+    out.orderAfterNoop = ed.getLayers().map((l) => l.id).join(',');
+    let badIndexErr = '';
+    try { await ed.reorderLayer(idTop, NaN); } catch (e) { badIndexErr = e.message; }
+    out.badIndexErr = badIndexErr;
     let missingErr = '';
     try { await ed.removeLayer(99999); } catch (e) { missingErr = e.message; }
     out.missingErr = missingErr;
@@ -506,7 +514,10 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     m12.orderReorderBack.join(",") === m12.orderAfterAdd.slice(0, m12.n0).join(",") && m12.frameReorderBack < AB_BAND,
     `M12/B1 出帧 A/B：热重排反向做完顺序与画面都复原（差 ${m12.frameReorderBack.toFixed(2)}）`,
   );
-  check(/下标非法/.test(m12.reorderErr) && /不存在/.test(m12.missingErr), "M12/B1 不存在 / 空操作的层操作被拒绝（不产生无谓重绘）");
+  check(
+    m12.noopErr === '' && m12.orderAfterNoop === m12.orderBeforeNoop && /下标非法/.test(m12.badIndexErr) && /不存在/.test(m12.missingErr),
+    `M12/B1 同位重排 = 空操作（resolve 且顺序不变）；非有限下标 / 不存在的层被拒绝（${m12.badIndexErr} / ${m12.missingErr}）`,
+  );
   check(
     /挂点不存在或不可热替换/.test(m12.scriptErr),
     "M12/B3 边界：装配期没有脚本的挂点热替换被显式拒绝（给新挂点加脚本仍走整场景重挂）",
@@ -854,7 +865,13 @@ async function runCreateAndDraft(ctx) {
     await key("s", MOD.meta);
     await h.waitSaved(sc);
     const id = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
-    check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(path.join(lib, id, "scene.json")), `项目写入文件夹（${id}）`);
+    // 写入是「浏览器 → 宿主」的 HTTP 往返，落盘可能有几毫秒延迟：与 saveToLocal 一样轮询等，
+    // 失败时把目录内容打进消息，便于区分「真的没写」与「写晚了 / 写了别的名字」。
+    const scenePath = path.join(lib, String(id), "scene.json");
+    await waitFileOnDisk(scenePath);
+    const dirPath = path.join(lib, String(id));
+    const listed = fs.existsSync(dirPath) ? fs.readdirSync(dirPath).sort().join(",") || "(空)" : "(目录不存在)";
+    check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(scenePath), `项目写入文件夹（${id}；盘上：${listed}）`);
     return id;
   };
   /** 编辑器画布上世界坐标（y 朝上）→ 页面坐标；场景 16:9 与舞台同比例 */
@@ -2999,4 +3016,43 @@ async function runCreateAndDraft(ctx) {
   const amStatus = await ev(`(document.querySelector('.ed-script-status') || {}).textContent || ''`);
   check(/cursorMove/.test(amStatus), `预检状态栏列出引擎认到的入口（「${amStatus}」）`);
   check((await h.errorLines()).length === 0, "M9 命令面板 / 无障碍 / 脚本模板全程无错误");
+
+  // ── M10 D1 回归：槽位里的插件贡献不许被宿主重绘清扫 ──
+  // 背景：`renderExportMenu()` 原先用后代查询清扫 `button`，会把 `#ed-plugin-export`
+  // 里的插件贡献一并删掉（注册表还在、贡献没了），而且切语言 / 新增导出器时反复复现。
+  section("AN. M10 插件槽位：导出菜单重绘不清扫插件项");
+  await gotoEditor();
+  await newBlank("#000000");
+  const anInject = () =>
+    ev(`(() => {
+      const host = document.querySelector('#ed-plugin-export');
+      if (!host) return 'no-slot';
+      let b = host.querySelector('#an-plugin-item');
+      if (!b) { b = document.createElement('button'); b.type = 'button'; b.id = 'an-plugin-item'; host.appendChild(b); }
+      host.hidden = false;
+      return 'an-plugin-item';
+    })()`);
+  check((await anInject()) === "an-plugin-item", "AN 插件导出槽位存在（#ed-plugin-export 可挂条目）");
+  const anLang = async (v) => {
+    await ev(`(() => { const s = document.querySelector('#lang'); s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    await settle();
+  };
+  await anLang("en");
+  check(
+    (await ev(`!!document.querySelector('#ed-plugin-export #an-plugin-item')`)) === true,
+    "★ AN 切语言重绘导出菜单后插件贡献仍在（宿主只清扫 `:scope > button`）",
+  );
+  await anLang("zh");
+  check(
+    (await ev(`!!document.querySelector('#ed-plugin-export #an-plugin-item')`)) === true,
+    "★ AN 连续两次重绘都不动插件项（贡献不会静默消失）",
+  );
+  // 反向：宿主自己的导出项仍按注册表重建（收窄清扫范围没有把自愈弄丢）
+  const anDel = await ev(`(() => { const b = document.querySelector('#export-zip'); if (!b) return false; b.remove(); return true; })()`);
+  await anLang("en");
+  check(
+    anDel === true && (await ev(`!!document.querySelector('#export-zip')`)) === true,
+    "AN 删掉宿主自己的导出项后重绘会补回来（清扫范围收窄不影响自愈）",
+  );
+  check((await h.errorLines()).length === 0, "M10 插件槽位重绘 / 语言切换全程无错误");
 }

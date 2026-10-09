@@ -122,6 +122,8 @@ async function loadEditorModule(name, overrides = {}) {
     logLevel: "silent",
   });
   const tmp = path.join(tmpRoot, `${name}-${Math.random().toString(36).slice(2)}.mjs`);
+  // 带子目录的模块名（如 plugins/log）要先有目录，否则 writeFileSync 直接 ENOENT
+  fs.mkdirSync(path.dirname(tmp), { recursive: true });
   fs.writeFileSync(tmp, out.outputFiles[0].text);
   return import(pathToFileURL(tmp).href);
 }
@@ -255,6 +257,18 @@ section("A. 文档模型 doc.ts");
   const untouched = { origin: "1 2 3" };
   docMod.writeObjProps(untouched, { alpha: 0.5 });
   check(untouched.origin === "1 2 3", "patch 没给的字段不动");
+  // 引擎不要求包装里有 value（parse.js:532-546 只要非空 script、:583-598 只要 animation.options）：
+  // 这种「无 value 的绑定」也得只补 .value，不能整块换成裸值把脚本删掉（审计 L2）
+  const scriptOnly = { id: 9, angles: { script: "return 1;" } };
+  docMod.writeObjProps(scriptOnly, { angles: [1, 2, 3] });
+  check(scriptOnly.angles.script === "return 1;" && scriptOnly.angles.value === "1 2 3",
+    "无 value 的 {script} 绑定：只补 .value，脚本原样保留");
+  const animOnly = { id: 10, origin: { animation: { options: { loop: 1 } }, value: "0 0 0" } };
+  docMod.writeObjProps(animOnly, { origin: [4, 5, 6] });
+  check(animOnly.origin.animation.options.loop === 1 && animOnly.origin.value === "4 5 6", "动画包装同样只改 .value");
+  const bare = { id: 11, origin: "0 0 0", alpha: 1 };
+  docMod.writeObjProps(bare, { origin: [7, 8, 9] });
+  check(bare.origin === "7 8 9", "裸值字段照旧直接覆盖（包装判据放宽不影响它）");
 }
 {
   // 删除
@@ -546,6 +560,12 @@ function memAssets(entry, files) {
   check(json(JSON.parse(dec.decode(byPath["scene.json"]))) === json(doc.scene), "入口 json = 当前文档（含全部编辑）");
   check(dec.decode(byPath["scene.json"]).includes('\n  "general"'), "入口 json 带缩进（便于 diff / 手改）");
   check(json(progress) === json(["1/2", "2/2"]), `进度回调按资源逐个报（实得 ${json(progress)}）`);
+  // 审计 M2：本轮读不到字节、但仍挂在资源表里的名字要回报给调用方 ——
+  // 页面拿它当「别删这个已写出文件」的免删名单，否则源暂时取不到时用户文件夹里的资源会无声消失
+  const unreadable = new Set();
+  const files2 = await saveMod.collectProject(doc, assets, preview, undefined, unreadable);
+  check(json([...unreadable]) === json(["models/gone.json"]), `collectProject 回报读不到的资源名（实得 ${json([...unreadable])}）`);
+  check(json(files2.map((f) => f.path)) === json(Object.keys(byPath)) && !unreadable.has("materials/a.tex"), "回报读不到的名字不改变清单本身");
   check(!files.some((f) => /^project\.json$/i.test(f.path) && f.data.length === 5), "旧 project.json / 封面（大小写不敏感）不从资源里带出");
   const pj = JSON.parse(dec.decode(byPath["project.json"]));
   check(pj.type === "scene" && pj.file === "scene.json" && pj.preview === "preview.jpg", "project.json：类型 scene、入口指向文档、封面换成编辑器出图");
@@ -4464,7 +4484,19 @@ section("I. 接线");
   for (const key of ['"z"', '"y"', '"s"', '"d"', '"Delete"', '"Backspace"']) {
     check(main.includes(key), `快捷键 ${key} 已绑定`);
   }
-  check(/collectProject\(doc, current\.assets, preview\)/.test(main) && /writeToDirectory\(dir, changed\)/.test(main) && !/saveToLibrary\(/.test(main), "自动保存走 collectProject 写进项目文件夹，页面不再写壁纸库");
+  check(/collectProject\(doc, current\.assets, preview, undefined, unreadable\)/.test(main) && /writeToDirectory\(dir, changed\)/.test(main) && !/saveToLibrary\(/.test(main), "自动保存走 collectProject 写进项目文件夹，页面不再写壁纸库");
+  // 审计 M2：读不到的资源留在磁盘上
+  check(main.includes("const unreadable = new Set<string>();") && main.includes("if (unreadable.has(p)) continue;"),
+    "这一轮读不到字节、但仍被引用的资源不删已写出文件（审计 M2）");
+  // 审计 M1：写盘失败不能清草稿（两份调用点都要先看返回值）
+  check((main.match(/if \(await flushAutosave\(\)\) clearOwnDraftSlot\(prevSlot\);/g) || []).length === 2,
+    "另存为 / 存到本机文件夹：只有真的写出去了才清草稿（审计 M1）");
+  check(main.includes("async function flushAutosave(): Promise<boolean>"),
+    "flushAutosave 回报成败（调用方不再无从区分）");
+  // 审计 H1：没有目录 / 库条目的会话文档，草稿槽带每文档标识，两个未命名文档不共用槽
+  check(main.includes("const sessionSlotKeys = new WeakMap<EditorDoc, string>();")
+    && main.includes("sessionKey: !vdirId && !localName && !libraryItemId && doc ? sessionSlotKey(doc) : null"),
+    "会话文档的草稿槽带每文档标识（审计 H1：不再互相覆盖 / 误清快照）");
   check(/from "\.\/create"/.test(main) && /from "\.\/assets"/.test(main), "页面从 create.ts / assets.ts 取模板与资源表");
   check(/overlayAssets\(opened\.assets\.entry, opened\.assets, \(\) => referencedGroups\(doc\)\)/.test(main), "打开即套资源表叠加层，保存清单按文档引用过滤");
   check(/const referencedGroups = [^;]*referencedModels\(d\)[^;]*referencedEffects\(d\)[^;]*referencedFonts\(d\)[^;]*referencedParticles\(d\)[^;]*referencedSounds\(d\)/.test(main), "引用集合 = 图片层模型 ∪ 效果文件 ∪ 工程字体 ∪ 粒子文件 ∪ 音频（写进来的文件随引用进出保存清单）");
@@ -4555,7 +4587,7 @@ section("I. 接线");
       /if \(opts\.library\) releaseProject\(\);/.test(main) && /libItem = opts\.library \?\? null;/.test(main),
       "壁纸库条目直接在编辑器里打开并播放；先解绑上一个项目文件夹（不会把它自动保存进别的工程）");
     check(/cmd\(\{ id: "file\.save", keys: "Mod\+S", run: \(\) => void saveDocument\(\) \}\)/.test(main) &&
-      /async function saveDocument\(\) \{\s*if \(projectDir\) return flushAutosave\(\);[\s\S]{0,300}const dir = await requireProjectDir\(\);[\s\S]{0,80}adoptProject\(dir\);/.test(main),
+      /async function saveDocument\(\) \{\s*if \(projectDir\) \{\s*await flushAutosave\(\);\s*return;\s*\}[\s\S]{0,300}const dir = await requireProjectDir\(\);[\s\S]{0,80}adoptProject\(dir\);/.test(main),
       "⌘S：有项目文件夹就写回，库条目先选文件夹另存为项目");
     check(/\.\.\.renderSettings\.mountOptions\(\),/.test(main) && /properties: libItem \? \(wallpaperConfig\.overrides\(\)/.test(main),
       "挂载带上渲染设置（帧率 / 音量 / 画质）与库条目的属性覆盖值");
@@ -5739,6 +5771,51 @@ section("M10. 插件面补完（D1–D6）");
   const plKeys = ["pl.permsTitle", "pl.permHigh", "pl.logs", "pl.logsEmpty", "pl.logsClear", "pl.c.components"];
   const missKeys = plKeys.filter((k) => (i18n10.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missKeys.length === 0, `D6：面板新文案中英文都恰好一条（缺 ${json(missKeys)}）`);
+
+  // D6 行为判据（不只断言源码字符串）：直接驱动纯模块（editor/plugins/log.ts 不碰 DOM）
+  {
+    const logMod = await loadEditorModule("plugins/log");
+    check(typeof logMod.createPluginLog === "function", "D6 行为：插件日志模块可离线加载并建实例");
+    const L = logMod.createPluginLog(3);
+    L.push("a", "info", "1");
+    L.push("a", "warn", "2");
+    L.push("b", "error", "3");
+    L.push("a", "info", "4");
+    const all = L.list();
+    check(
+      all.length === 3 && all[0].text === "2" && all[2].text === "4",
+      `D6 行为：环形缓冲超上限丢最老的（limit=3，实得 ${json(all.map((x) => x.text))}）`,
+    );
+    const snap = L.list();
+    snap.push({ plugin: "x", level: "info", text: "外部改动", at: 0 });
+    check(L.list().length === 3, "D6 行为：list() 返回副本，外部改动不回写内部缓冲");
+    L.clear("a");
+    check(
+      L.list("a").length === 0 && L.list("b").length === 1 && L.list().length === 1,
+      "D6 行为：clear(plugin) 只清该插件（clear() 才是全清）",
+    );
+    const defaults = logMod.createPluginLog();
+    for (let i = 0; i < 250; i++) defaults.push("p", "info", `m${i}`);
+    check(
+      defaults.list().length === 200 && defaults.list()[0].text === "m50" && defaults.list()[199].text === "m249",
+      "D6 行为：默认上限 200（push 250 条后首条 = 第 51 条，末条 = 最后一条）",
+    );
+    const L2 = logMod.createPluginLog();
+    let calls = 0;
+    const off = L2.onChange(() => {
+      calls++;
+    });
+    L2.push("p", "info", "x");
+    L2.push("p", "warn", "y");
+    L2.push("p", "error", "z");
+    check(calls === 0, "D6 行为：回调是微任务合批的（同一次同步循环里还没触发）");
+    await new Promise((r) => setTimeout(r, 0));
+    check(calls === 1, `D6 行为：一次错误风暴只重绘一次（3 条 push 合成 1 次回调，实得 ${calls}）`);
+    off();
+    L2.push("p", "info", "after-off");
+    await new Promise((r) => setTimeout(r, 0));
+    check(calls === 1, "D6 行为：onChange 返回的 Disposer 真的退订");
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -6457,6 +6534,14 @@ section("OBJ-PASSTHRU. 对象属性直通层 editor/objprops.ts（M4 A5）");
     is(f.isObjWrapper(w.ALIGNMENT) === true && f.objFieldRaw(w.ALIGNMENT) === "left", "包装能识别、快照值能取出");
     is(f.setObjField(w, "alignment", "right") === true && json(w.ALIGNMENT) === json({ user: "align", value: "right" }), "包装只改 value，user 绑定原样保留");
     is(f.setObjField(w, "alignment", "right") === false, "包装值没变时返回 false");
+    // 引擎侧不要求包装里有 value：`{script}` / `{animation:{options}}` 也算绑定（审计 L2）
+    const wScript = { id: 12, ALIGNMENT: { script: "return 'x';" } };
+    is(f.isObjWrapper(wScript.ALIGNMENT) === true && f.isObjWrapper({ animation: { options: {} } }) === true
+      && f.isObjWrapper({}) === false && f.isObjWrapper({ script: "" }) === false
+      && f.isObjWrapper({ animation: {} }) === false && f.isObjWrapper("left") === false && f.isObjWrapper([1]) === false,
+      "无 value 的绑定也算包装：非空 script / animation.options 命中，空对象 / 空 script 不命中（审计 L2）");
+    is(f.setObjField(wScript, "alignment", "right") === true && json(wScript.ALIGNMENT) === json({ script: "return 'x';", value: "right" }),
+      "无 value 的 {script} 绑定：只补 .value，脚本原样保留（不再整块换成裸值）");
 
     // ---- 7. 取值口径（scene.json 里 bool 也常写成 0/1/"1"）----
     is(f.objFieldValue({ SOLID: "1" }, "solid") === true && f.objFieldValue({ solid: 0 }, "solid") === false, "取值把 \"1\"/1 当真、0 当假");
@@ -7258,6 +7343,39 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       threw = true;
     }
     check(!threw, "M12/B3 停用态下宿主每帧的 engine 回填 / 属性套用都不炸");
+
+    // 停用（等价于 setLayerScript 传空串 ⇒ current = null）之后再挂新脚本：
+    // `first` 又会是 true，但稳定句柄**不许**第二次进登记表 ——
+    // 否则 propSandboxes 里同一沙箱被逐帧回填 / 属性热更跑两遍。
+    check(held.disabled === true && slot.swap(src(3)) === true, "M12/B3 停用之后可以重新挂上脚本");
+    check(
+      registered.length === 1,
+      "★ M12/B3 重新挂脚本不再登记第二次（登记按稳定句柄一次性完成；实测 registered=" + registered.length + "）",
+    );
+    check(held.disabled === false && held.callUpdate(0) === 3, "M12/B3 重新挂上的是新一代实现（旧引用仍指向它）");
+  }
+
+  {
+    // ── B3 补：热替换登记去重的纯函数（同一挂点只留最新一条） ──
+    const list = [{ k: "a", v: 1 }, { k: "b", v: 2 }];
+    check(
+      slotMod.upsertRun(list, (x) => x.k === "a", { k: "a", v: 3 }) === true,
+      "M12/B3 upsertRun：命中旧挂点时替换并返回 true（热替换）",
+    );
+    check(
+      list.length === 2 && list[1].k === "a" && list[1].v === 3 && list[0].k === "b",
+      "M12/B3 upsertRun：旧条目摘掉、新条目落在队列末尾，其它条目顺序不变",
+    );
+    check(
+      slotMod.upsertRun(list, (x) => x.k === "zz", { k: "c", v: 4 }) === false && list.length === 3,
+      "M12/B3 upsertRun：没有旧挂点时返回 false（首次登记）",
+    );
+    const dup = [{ k: "a", v: 1 }, { k: "a", v: 2 }, { k: "b", v: 5 }];
+    slotMod.upsertRun(dup, (x) => x.k === "a", { k: "a", v: 9 });
+    check(
+      dup.length === 2 && dup[0].k === "b" && dup[1].v === 9,
+      "M12/B3 upsertRun：已经重复的登记也能收敛成一条（倒序摘除不留半份）",
+    );
   }
 
   // ── 接线断言：引擎侧必须真用这些纯模块（不允许长回内联副本） ──
@@ -7292,6 +7410,28 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
     check(
       smSrc.includes("const slotHostNoCount: ScriptSlotHost = { ...scriptSlotHost, countSkipped: () => {} };"),
       "★ 关脚本时槽位不再重复计一次拦截（skipScript 已计；否则同一段脚本提示成「2 段脚本」）",
+    );
+    check(
+      /const makeScriptSlot = \([\s\S]*?editorScriptSlots\.push\(slot\);[\s\S]*?return slot;/.test(smSrc) &&
+        smSrc.includes("editorScriptSlots.find((s) => s.layer === l && s.target === target)"),
+      "★ M12/B3 接线：槽位在 makeScriptSlot 里统一登记 —— 三个挂点都进 editorScriptSlots，setLayerScript 才找得到（否则整条 API 恒 reject）",
+    );
+    check(
+      /upsertRun\(\s*effectVisibleRuns,/.test(smSrc) &&
+        /upsertRun\(\s*objectScriptRuns,/.test(smSrc) &&
+        /upsertRun\(\s*list,/.test(smSrc) &&
+        smSrc.includes("upsertRun(list, (s: any) => s === sandbox, sandbox)"),
+      "★ M12/B3 接线：逐帧效果开关队列 / 对象字段队列 / animationEvent 广播表 / 指针回调表都走 upsertRun 去重（热替换不再让同一脚本跑两遍）",
+    );
+    check(
+      smSrc.includes("const deadSandboxes = new Set<any>();") &&
+        /for \(let i = propSandboxes\.length - 1; i >= 0; i--\) if \(deadSandboxes\.has\(propSandboxes\[i\]\)\)/.test(smSrc) &&
+        /for \(const k of \[\.\.\.animEventSinks\.keys\(\)\]\) if \(ids\.has\(\(k as any\)\?\.id\)\) animEventSinks\.delete\(k\);/.test(smSrc),
+      "★ M12/B3 接线：拆层时把被删层的稳定句柄从 propSandboxes / mediaHooks / resizeHooks 摘掉，并按图层清 animationEvent 广播表",
+    );
+    check(
+      /if \(ids\.has\(lid === "null" \? null : Number\(lid\)\)\) scriptIssues\.delete\(k\);/.test(smSrc),
+      "★ M12/B3 接线：非数字 id 的层（键前缀 null|）热删后结构化报错也一起清（以前整类跳过，面板上留幽灵报错）",
     );
     check(
       !/\bnew Function\b|\beval\s*\(/.test(slotSrc),
@@ -7375,6 +7515,16 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
     && draftMod.draftSlotFor({ vdirId: "vdir-a", libraryItemId: "beach" }) === "vdir:vdir-a"
     && draftMod.draftSlotFor({}) === draftMod.DRAFT_SLOT_SESSION,
     "槽名按工程标识算：虚拟工程 > 库条目 > 本地目录名；都没有就是会话槽（刷新后仍是同一槽）");
+  // 审计 H1：会话文档（既没目录也没库条目）的槽必须带**每文档**标识，否则两个未命名文档
+  // 共用常量槽 `session`：后一个的自动保存覆盖前一个的快照，另存为成功时还会把前一个的清掉
+  check(draftMod.draftSlotFor({ sessionKey: "s1" }) === `${draftMod.DRAFT_SLOT_SESSION}:s1`
+    && draftMod.draftSlotFor({ sessionKey: "s1" }) === draftMod.draftSlotFor({ sessionKey: "s1" })
+    && draftMod.draftSlotFor({ sessionKey: "s2" }) !== draftMod.draftSlotFor({ sessionKey: "s1" })
+    && draftMod.draftSlotFor({ sessionKey: "" }) === draftMod.DRAFT_SLOT_SESSION
+    && draftMod.draftSlotFor({ vdirId: "vdir-a", sessionKey: "s1" }) === "vdir:vdir-a"
+    && draftMod.draftSlotFor({ libraryItemId: "beach", sessionKey: "s1" }) === "library:beach"
+    && draftMod.draftSlotFor({ localName: "My Wall", sessionKey: "s1" }) === "local:My Wall",
+    "会话槽带每文档标识：两个未命名文档不共用槽，工程标识仍优先（审计 H1）");
   await store.save(snap, "vdir:vdir-demo-1");
   const loaded = await store.load("vdir:vdir-demo-1");
   check(loaded !== null && json(loaded) === json(snap), "存进存储再取回：与写入时的快照一致（重开编辑器后逐字段还原）");
@@ -7385,6 +7535,17 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
   check(json((await store.list()).map((i) => i.slot)) === json(["library:beach", "vdir:vdir-demo-1"]), "list()：按时间降序，最新的排在前面");
   await store.clear("library:beach");
   check((await store.load("library:beach")) === null && (await store.load("vdir:vdir-demo-1")) !== null, "clear 只清自己那槽");
+  // 审计 H1：两个会话文档的快照在同一后端上并存，互不覆盖（旧口径共用 `session` 槽会互相踩）
+  const sesA = draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [], 500);
+  const sesB = draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [], 600);
+  const sesKeyA = draftMod.draftSlotFor({ sessionKey: "d-a" });
+  const sesKeyB = draftMod.draftSlotFor({ sessionKey: "d-b" });
+  await store.save(sesA, sesKeyA);
+  await store.save(sesB, sesKeyB);
+  check((await store.load(sesKeyA))?.savedAt === 500 && (await store.load(sesKeyB))?.savedAt === 600,
+    "两个未命名文档的快照并存：后一个不再覆盖前一个（审计 H1）");
+  await store.clear(sesKeyA);
+  await store.clear(sesKeyB);
 
   // ---- 容量上限：槽数 / 总字节，淘汰最旧的，最新一条永远保留 ----
   const slotSnap = (now) => draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [], now);

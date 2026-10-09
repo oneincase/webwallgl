@@ -164,6 +164,12 @@ export type DraftSource = {
   vdirId?: string | null;
   libraryItemId?: string | null;
   localName?: string | null;
+  /**
+   * 既没有工程目录也没有库条目时（新建 / 会话文档）的**文档标识**：调用方给每个文档一个，
+   * 槽名会带上它。没有它的话两个未命名文档共用常量槽 `session`：后一个的自动保存会覆盖前一个
+   * 的快照，其中一个还会在另存为成功时被当成「自己写过的槽」清掉（审计 H1）。
+   */
+  sessionKey?: string | null;
 };
 
 /** 工程标识 → 草稿槽名（稳定的字符串，刷新后仍是同一个槽） */
@@ -171,7 +177,8 @@ export function draftSlotFor(src: DraftSource): string {
   if (src.vdirId) return `${DRAFT_SLOT_VIRTUAL}${src.vdirId}`;
   if (src.libraryItemId) return `${DRAFT_SLOT_LIBRARY}${src.libraryItemId}`;
   if (src.localName) return `${DRAFT_SLOT_LOCAL}${slugName(src.localName)}`;
-  return DRAFT_SLOT_SESSION;
+  const key = src.sessionKey ? slugName(src.sessionKey) : "";
+  return key ? `${DRAFT_SLOT_SESSION}:${key}` : DRAFT_SLOT_SESSION;
 }
 
 /** 节流：距上次快照不足 throttleMs 就不写；非有限时间戳一律不写 */

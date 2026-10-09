@@ -64,6 +64,29 @@ export function disabledSandbox(): Record<string, unknown> {
   return d;
 }
 
+/**
+ * 登记表去重（热替换专用）：同一挂点（`match` 命中的旧条目）只保留最新一条。
+ *
+ * 为什么必须去重：`swap` 每次都重跑 `activate`，而 `activate` 会往逐帧求值队列 /
+ * 回调广播表里登记。若这里是 `push`，热替换后同一沙箱会出现**两份**条目 ——
+ * 同一字段的 update 每帧跑两遍（脚本内部累计的时间/相位双倍推进），
+ * `animationEvent` 也会被派发两次。旧代码只有一次装配，所以这个坑只在
+ * 换源码时才显形。
+ *
+ * @returns 是否替换掉了旧条目（true = 本次是热替换，false = 首次登记）
+ */
+export function upsertRun<T>(list: T[], match: (item: T) => boolean, entry: T): boolean {
+  let replaced = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (match(list[i])) {
+      list.splice(i, 1);
+      replaced = true;
+    }
+  }
+  list.push(entry);
+  return replaced;
+}
+
 /** 转发句柄：属性读写与调用一律透到最新一代；函数调用每次都重新取，
  *  这样「热替换后旧引用还能调到新实现」不需要任何登记表配合。 */
 export function forwardSandbox(get: () => any): any {
@@ -118,6 +141,10 @@ export function createScriptSlot(opts: {
   host: ScriptSlotHost;
 }): EditorScriptSlot {
   const { layer, target, build, activate, host } = opts;
+  /** 稳定句柄只往宿主登记表里放一次：用 `!slot.current` 当登记条件时，
+   *  「清空源码（current = null）→ 再挂新脚本」会把同一句柄 push 第二次，
+   *  逐帧时钟回填与属性热更就对同一沙箱跑两遍。 */
+  let registered = false;
   const slot: EditorScriptSlot = {
     layer,
     target,
@@ -134,7 +161,10 @@ export function createScriptSlot(opts: {
       const first = !slot.current;
       slot.current = fresh;
       slot.code = code;
-      if (first) host.register(slot.sandbox);
+      if (!registered) {
+        registered = true;
+        host.register(slot.sandbox);
+      }
       // 旧一代的错误先撤掉：换源码后「5 错上限」重新起算，
       // 脚本面板上残留的上一版报错必须一起消失（否则用户改对了还红着）。
       host.clearIssues(typeof layer?.id === "number" ? layer.id : null, target);

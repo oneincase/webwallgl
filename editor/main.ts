@@ -1762,6 +1762,23 @@ const draftStore = vdirDraftStore();
 let draftWrittenAt = 0;
 /** 本次会话自己写过的槽；只有它才允许被自动清掉（上一次会话留下的快照不碰，可能只有那一份） */
 let lastDraftSlot: string | null = null;
+/**
+ * 会话文档（没有工程目录也没有库条目）的槽后缀：每个文档一个随机标识。
+ * 槽名带上它，两个未命名文档才不会共用 `session` 槽互相覆盖 / 误清快照（审计 H1）。
+ * 用时间戳 + 随机而不是自增计数器：刷新后计数器从头开始，新一轮会话的第一个文档
+ * 会和上一轮留在 `session:1` 的快照撞名。
+ */
+const sessionSlotKeys = new WeakMap<EditorDoc, string>();
+
+function sessionSlotKey(d: EditorDoc): string {
+  let k = sessionSlotKeys.get(d);
+  if (!k) {
+    k = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    sessionSlotKeys.set(d, k);
+  }
+  return k;
+}
+
 /** 启动时发现、等用户点「恢复」的快照 */
 let pendingDraft: { slot: string; draft: Draft } | null = null;
 /** 工程文件夹可写性：null = 还没探测，false = 不可写（自动保存退到草稿槽，见 autosaveTargetFor） */
@@ -1823,7 +1840,10 @@ function probeDirWritable(dir: DirHandle) {
 
 /** ⌘S：已有项目文件夹就写回；库条目等没绑文件夹的文档先选文件夹另存为项目 */
 async function saveDocument() {
-  if (projectDir) return flushAutosave();
+  if (projectDir) {
+    await flushAutosave();
+    return;
+  }
   if (!doc) return;
   if (!canSave()) {
     log(et("log.cannotSaveKind", { kind: doc.type }), "warn");
@@ -1837,8 +1857,8 @@ async function saveDocument() {
   libItem = null;
   syncLibraryItem();
   log(et("log.savedAsProject", { name: dir.name }));
-  await flushAutosave();
-  clearOwnDraftSlot(prevSlot);
+  // 只有真的写进文件夹才清：写盘失败（磁盘满 / 权限被撤 / IDB 配额）时这份草稿是唯一副本
+  if (await flushAutosave()) clearOwnDraftSlot(prevSlot);
 }
 
 /**
@@ -1847,13 +1867,16 @@ async function saveDocument() {
  */
 const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets) || (doc?.type === "web" && !!current?.assets);
 
-/** 当前文档的草稿槽：虚拟工程按 id、库条目按 itemId、本地文件夹按名字，都没有就是会话槽 */
+/** 当前文档的草稿槽：虚拟工程按 id、库条目按 itemId、本地文件夹按名字，都没有就是带文档标识的会话槽 */
 function currentDraftSlot(): string {
   const vdirId = projectDir ? virtualIdOf(projectDir) : null;
+  const localName = projectDir && !vdirId ? projectDir.name : null;
+  const libraryItemId = libItem?.itemId ?? null;
   return draftSlotFor({
     vdirId,
-    libraryItemId: libItem?.itemId ?? null,
-    localName: projectDir && !vdirId ? projectDir.name : null,
+    libraryItemId,
+    localName,
+    sessionKey: !vdirId && !localName && !libraryItemId && doc ? sessionSlotKey(doc) : null,
   });
 }
 
@@ -1912,14 +1935,14 @@ async function saveProjectToLocalDir() {
   libItem = null;
   syncLibraryItem();
   log(et("log.savedToDir", { name: dir.name }));
-  await flushAutosave();
-  clearOwnDraftSlot(prevSlot);
+  // 同上：写盘失败时草稿留着
+  if (await flushAutosave()) clearOwnDraftSlot(prevSlot);
 }
 
-async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> {
+async function collectCurrent(preview: Blob | null, unreadable?: Set<string>): Promise<SaveFile[] | null> {
   if (doc?.video) return collectVideoProject(doc, preview);
   if (doc?.type === "web" && current?.assets) return collectWebProject(doc, current.assets, preview);
-  if (doc?.scene && current?.assets) return collectProject(doc, current.assets, preview);
+  if (doc?.scene && current?.assets) return collectProject(doc, current.assets, preview, undefined, unreadable);
   return null;
 }
 
@@ -1947,12 +1970,20 @@ function renderExportMenu() {
     exportMenuEl.appendChild(b);
     keep.add(b);
   }
-  for (const b of exportMenuEl.querySelectorAll<HTMLButtonElement>("button")) if (!keep.has(b)) b.remove();
+  // 只清扫**自家直接子按钮**（`:scope >`）：插件贡献的 menu.export 项在 `#ed-plugin-export` 里，
+  // 后代查询会把它们一并删掉（槽位注册表仍在，贡献却没了，且切语言/新增导出器时会复现）
+  for (const b of exportMenuEl.querySelectorAll<HTMLButtonElement>(":scope > button")) if (!keep.has(b)) b.remove();
   syncExportButton();
 }
 
 exportMenuEl.addEventListener("click", (ev) => {
-  const b = (ev.target as HTMLElement).closest<HTMLButtonElement>("button[id^='export-']");
+  const target = ev.target as HTMLElement;
+  // 插件贡献的菜单项：动作由插件自己的监听处理，宿主只补「点完关菜单」
+  if (target.closest("#ed-plugin-export")) {
+    closeExportMenu();
+    return;
+  }
+  const b = target.closest<HTMLButtonElement>("button[id^='export-']");
   const e = b && exporters.get(b.id.slice("export-".length));
   if (!e || b.disabled) return;
   ev.stopPropagation();
@@ -2193,31 +2224,36 @@ async function syncVirtualDirName(dir: DirHandle) {
   }
 }
 
-/** 把当前文档写成项目文件夹里的松散文件。⌘S 与编辑防抖都走这里。 */
-async function flushAutosave() {
+/** 把当前文档写成项目文件夹里的松散文件。⌘S 与编辑防抖都走这里。返回是否真的写出去了 */
+async function flushAutosave(): Promise<boolean> {
   clearTimeout(saveTimer);
   saveTimer = 0;
-  if (!projectDir || !canSave()) return;
+  if (!projectDir || !canSave()) return false;
   if (saving) {
     saveAgain = true;
-    return;
+    return false;
   }
   const dir = projectDir;
   const snap = doc;
   saving = true;
   renderSaveStatus();
   const t0 = performance.now();
+  let ok = false;
   try {
     const preview = await capturePreview();
-    if (dir !== projectDir || doc !== snap) return;
-    const files = await collectCurrent(preview);
-    if (!files) return;
+    if (dir !== projectDir || doc !== snap) return ok;
+    const unreadable = new Set<string>();
+    const files = await collectCurrent(preview, unreadable);
+    if (!files) return ok;
     const changed = files.filter((f) => fileSig(f.data) !== writtenSig.get(f.path));
     if (changed.length) await writeToDirectory(dir, changed);
     for (const f of changed) writtenSig.set(f.path, fileSig(f.data));
     const keep = new Set(files.map((f) => f.path));
     for (const p of [...ownedPaths]) {
       if (keep.has(p)) continue;
+      // 这一轮还挂在资源表里、只是读不到字节的文件不删：源暂时取不到（缓存缺 / owner 组
+      // 不再被引用）时删掉，就是用户工程文件夹里的资源无声消失（审计 M2）
+      if (unreadable.has(p)) continue;
       await removeProjectFile(dir, p);
       ownedPaths.delete(p);
       writtenSig.delete(p);
@@ -2231,6 +2267,7 @@ async function flushAutosave() {
       await syncVirtualDirName(dir);
       // 内容已经落到文件夹里，这个文档的草稿副本就没有意义了
       clearOwnDraftSlot();
+      ok = true;
     }
   } catch (e) {
     log(et("log.saveFailed", { msg: (e as Error).message }), "error");
@@ -2242,6 +2279,7 @@ async function flushAutosave() {
       scheduleAutosave();
     }
   }
+  return ok;
 }
 
 /** 立刻落盘（页面隐藏 / 卸载前）：有可写文件夹写文件夹，否则按草稿槽来（草稿不吃节流） */
