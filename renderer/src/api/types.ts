@@ -772,6 +772,14 @@ export type EditorLayerProps = {
   visible: boolean;
   alpha: number;
   color: [number, number, number];
+  /**
+   * 亮度乘子（M4 A7）。引擎本来就消费它：parse.js 的 `parseNum(o.brightness, 1)`，
+   * 渲染时逐通道 `color[i] * brightness * …`，且 `objectAnimations` 白名单里含
+   * `brightness`（关键帧逐帧求值）。此前只是没进这个类型 ⇒ 无法热改、无法从检视器
+   * 打关键帧（docs/EDITOR-PLAN.md 的 P4 行「亮度不在 EditorLayerProps 里，本轮未做」
+   * 指的就是这件事，M4 打通）。
+   */
+  brightness: number;
 };
 
 /** 图层在画布上的轮廓（CSS 像素，相对画布左上角） */

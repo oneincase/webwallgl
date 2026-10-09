@@ -828,6 +828,26 @@ fieldset.ed-form:disabled {
   color: var(--wb-fg-mute);
 }
 
+/* M4 A5：对象属性分组的字段名比通用表单长（disablepropagation / backgroundbrightness 等），
+   单独放宽标签列，并在标签尾部放「引擎本版本不读」的小角标 */
+.ed-form.ed-objprops-form {
+  grid-template-columns: 108px repeat(3, minmax(0, 1fr));
+}
+
+.ed-tag {
+  margin-left: 4px;
+  padding: 0 4px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius-sm);
+  font-size: 10px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.ed-tag-dim {
+  opacity: 0.7;
+}
+
 .ed-form input[type="number"] {
   width: 100%;
   min-width: 0;

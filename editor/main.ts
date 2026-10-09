@@ -102,7 +102,27 @@ import { createPluginLog } from "./plugins/log";
 import { bundledSource, createPluginManager, dirSource, storeSource } from "./plugins/manager";
 import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
 import { textOf } from "./core";
-import { layerKindInfo } from "./layer-kinds";
+import { canCreateLayerOfKind, createLayerOfKind, layerKindInfo } from "./layer-kinds";
+// M4 A5：对象属性直通层（十六个对象级字段的读写 + 规格表驱动表单）
+import {
+  OBJ_FIELDS,
+  objFieldNoteKey,
+  objFieldStates,
+  objFieldText,
+  setObjField,
+  setObjFieldText,
+  type ObjFieldSpec,
+} from "./objprops";
+// M4 A6：light / camera 的字段读写（构造器由 layer-kinds 的 create 入口调）
+import {
+  LIGHT_TYPES,
+  getCameraFields,
+  getLightFields,
+  setCameraField,
+  setLightField,
+  type CameraField,
+  type LightField,
+} from "./objlayers";
 import {
   BUILTIN_INSPECTOR_TABS,
   DEFAULT_INSPECTOR_TAB,
@@ -4121,6 +4141,11 @@ const lyAddContainerEl = $<HTMLButtonElement>("#ly-add-container");
 lyAddContainerEl.onclick = () => addContainer();
 const lyAddPostEl = $<HTMLButtonElement>("#ly-add-post");
 lyAddPostEl.onclick = () => addContainer("post");
+// M4 A6：light / camera 直接建层（无模板菜单），走 addKindLayer → LayerKindDef.create
+const lyAddLightEl = $<HTMLButtonElement>("#ly-add-light");
+lyAddLightEl.onclick = () => addKindLayer("light");
+const lyAddCameraEl = $<HTMLButtonElement>("#ly-add-camera");
+lyAddCameraEl.onclick = () => addKindLayer("camera");
 lyUpEl.onclick = () => moveSelected(-1);
 lyDownEl.onclick = () => moveSelected(1);
 lyDupEl.onclick = () => duplicateSelected();
@@ -4266,6 +4291,9 @@ function syncLayerTools() {
   treeExpandEl.disabled = treeOff;
   treeIsolateEl.disabled = treeOff || !selectionNodes().length;
   treeIsolateEl.classList.toggle("is-on", isolateIds.size > 0);
+  // M4 A6：按钮可用性也由注册表的能力位决定 —— 没有 create 的种类按钮就是灰的
+  lyAddLightEl.disabled = lyAddEl.disabled || !canCreateLayerOfKind("light");
+  lyAddCameraEl.disabled = lyAddEl.disabled || !canCreateLayerOfKind("camera");
 }
 
 function renderTree() {
@@ -6333,6 +6361,24 @@ function addContainer(kind: "container" | "post" = "container") {
       }) ?? undefined
     );
   });
+
+}
+
+/**
+ * M4 A6：light / camera 图层的新建入口。
+ * 唯一路径是 layer-kinds.ts 的 `createLayerOfKind` —— 也就是 `LayerKindDef.create`
+ * 这个字段的生产消费点；工具条按钮因此让「create 被消费」成为可断言的事实，
+ * 而不是另写一份构造逻辑（verify-editor 的 LIGHT-CAM 段用去掉 create 的变异源码做红测）。
+ */
+function addKindLayer(kind: "light" | "camera") {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const name = et(kind === "camera" ? "layer.defaultCamera" : "layer.defaultLight");
+  const label = et(kind === "camera" ? "log.addedCamera" : "log.addedLight", { name });
+  structEdit(label, (d) => createLayerOfKind(kind, d, { name }) ?? undefined);
+
 }
 
 /** 文字字段的一次可撤销编辑：先装好要量的字体，改完按内容回填盒子 */
@@ -6788,13 +6834,14 @@ function soundGroup(node: LayerNode): HTMLElement {
 // ---------- 关键帧动画：字段开 / 关动画、当前帧打关键帧、改动自动落关键帧、时长 / 模式 / 插值 ----------
 
 const canAnimate = (n: LayerNode) => n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model";
-const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color" };
+const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color", brightness: "f.brightness" };
 
 /** 画面上的当前值（动画字段 = 曲线在当前时刻的值）；没有引擎时退回静态值 */
 function liveValue(node: LayerNode, f: AnimField): number[] {
   const p = editor?.getLayerProps(Number(node.id));
   if (!p) return baseValue(node.obj, f);
-  return f === "alpha" ? [p.alpha] : [...p[f]];
+  // 1 通道字段（alpha / brightness）在 EditorLayerProps 上是裸数字，不能展开
+  return f === "alpha" ? [p.alpha] : f === "brightness" ? [p.brightness] : [...p[f]];
 }
 
 const nowTime = () => editor?.time ?? 0;
@@ -7574,14 +7621,326 @@ function mountInspectorTabs(panels: Map<string, HTMLElement>) {
   show(active);
 }
 
+// ---------- M4 A5/A6：对象属性直通层 与 light / camera 分组 ----------
+
+const isLockedNode = (id: number | string) => isLocked(id);
+/** objp.<key> 的说明文案：唯一真源是 objprops.ts 的规格表，i18n 键由 objFieldNoteKey 派生 */
+const objFieldTip = (key: string) => et(objFieldNoteKey(key));
+/** 侧栏一行的字段标签：字段名 + 语义说明（tooltip），引擎不读的加角标 */
+function objFieldLabel(spec: ObjFieldSpec): HTMLElement {
+  const lab = document.createElement("label");
+  lab.textContent = spec.key;
+  lab.title = objFieldTip(spec.key);
+  if (spec.engine === "unread") {
+    const tag = document.createElement("span");
+    tag.className = "ed-tag ed-tag-dim";
+    tag.textContent = et("objp.engineUnread");
+    tag.title = objFieldTip(spec.key);
+    lab.appendChild(tag);
+  }
+  return lab;
+}
+
+/**
+ * 「对象属性」分组（M4 A5）：由 editor/objprops.ts 的十六项规格表驱动。
+ * 所有写回都走 objEdit → setObjField，于是天然满足：命中原名大小写、不新增歧义键、
+ * 只碰这一个字段、`{user|script|animation, value}` 包装只改 .value。
+ */
+function objPropsGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-objprops";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("objp.title");
+  group.appendChild(h);
+  group.appendChild(note(et("objp.hint")));
+  if (!doc?.scene || doc.type !== "scene") {
+    group.appendChild(note(et("insp.notLive")));
+    return group;
+  }
+  const id = node.id;
+  const form = document.createElement("fieldset");
+  form.className = "ed-form ed-objprops-form";
+  form.disabled = isLockedNode(id);
+  const edit = (spec: ObjFieldSpec, mutate: (o: LayerNode["obj"]) => boolean) =>
+    objEditOk(et("objp.edit", { field: spec.key }), id, mutate);
+  const num = (v: number | null, step: string): HTMLInputElement => {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.step = String(step);
+    if (v === null) inp.placeholder = et("objp.unset");
+    else inp.value = String(v);
+    return inp;
+  };
+  const numberRow = (spec: ObjFieldSpec, st: ReturnType<typeof objFieldStates>[number]) => {
+    const v = typeof st.value === "number" ? st.value : null;
+    const inp = num(v, String(spec.step ?? (spec.type === "int" ? 1 : 0.01)));
+    inp.dataset.field = spec.key;
+    if (spec.min !== undefined) inp.min = String(spec.min);
+    if (spec.max !== undefined) inp.max = String(spec.max);
+    inp.addEventListener("change", () => {
+      const t = inp.value.trim();
+      if (t === "" || !edit(spec, (o) => setObjField(o, spec.key, Number(t)))) inp.value = v === null ? "" : String(v);
+    });
+    form.append(objFieldLabel(spec), inp);
+  };
+  const vec2Row = (spec: ObjFieldSpec, st: ReturnType<typeof objFieldStates>[number]) => {
+    const cur = Array.isArray(st.value) ? (st.value as number[]) : null;
+    const box = document.createElement("div");
+    box.className = "span3";
+    box.dataset.field = spec.key;
+    const ins: HTMLInputElement[] = [];
+    for (let i = 0; i < 2; i++) {
+      const inp = num(cur ? cur[i] : null, String(spec.step ?? 1));
+      inp.title = ["x", "y"][i];
+      inp.addEventListener("change", () => {
+        const vals = ins.map((x) => Number(x.value || 0));
+        if (!vals.every(Number.isFinite) || !edit(spec, (o) => setObjField(o, spec.key, vals))) {
+          for (let k = 0; k < 2; k++) ins[k].value = cur ? String(cur[k]) : "";
+        }
+      });
+      ins.push(inp);
+      box.appendChild(inp);
+    }
+    form.append(objFieldLabel(spec), box);
+  };
+  const boolRow = (spec: ObjFieldSpec, st: ReturnType<typeof objFieldStates>[number]) => {
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.checked = st.value === true;
+    inp.dataset.field = spec.key;
+    inp.addEventListener("change", () => {
+      if (!edit(spec, (o) => setObjField(o, spec.key, inp.checked))) inp.checked = st.value === true;
+    });
+    form.append(objFieldLabel(spec), inp);
+  };
+  const enumRow = (spec: ObjFieldSpec, st: ReturnType<typeof objFieldStates>[number]) => {
+    const sel = document.createElement("select");
+    sel.dataset.field = spec.key;
+    const opts = ["", ...(spec.options ?? [])];
+    const cur = typeof st.value === "string" ? st.value : "";
+    if (cur && !opts.includes(cur)) opts.push(cur);
+    for (const o of opts) {
+      const op = document.createElement("option");
+      op.value = o;
+      op.textContent = o === "" ? et("objp.unset") : o;
+      sel.appendChild(op);
+    }
+    sel.value = cur;
+    sel.addEventListener("change", () => {
+      if (sel.value === "") return;
+      if (!edit(spec, (o) => setObjField(o, spec.key, sel.value))) sel.value = cur;
+    });
+    form.append(objFieldLabel(spec), sel);
+  };
+  const textRow = (spec: ObjFieldSpec, st: ReturnType<typeof objFieldStates>[number]) => {
+    const ta = document.createElement("textarea");
+    ta.className = "span3";
+    ta.rows = spec.type === "json" ? 4 : 1;
+    ta.dataset.field = spec.key;
+    const cur = objFieldText(spec, st.value);
+    ta.value = cur;
+    if (st.value === undefined) ta.placeholder = et("objp.unset");
+    ta.addEventListener("change", () => {
+      if (!edit(spec, (o) => setObjFieldText(o, spec.key, ta.value))) {
+        log(et("objp.rawBad", { field: spec.key }), "warn");
+        ta.value = cur;
+      }
+    });
+    form.append(objFieldLabel(spec), ta);
+  };
+
+  for (const st of objFieldStates(node.obj)) {
+    if (st.wrapped) {
+      const lab = objFieldLabel(st.spec);
+      lab.dataset.wrapped = "1";
+      lab.title = `${objFieldTip(st.spec.key)} — ${et("objp.wrapped")}`;
+      form.appendChild(lab);
+      switch (st.spec.type) {
+        case "bool":
+          boolRow(st.spec, st);
+          break;
+        case "enum":
+          enumRow(st.spec, st);
+          break;
+        case "json":
+        case "raw":
+          textRow(st.spec, st);
+          break;
+        case "vec2":
+          vec2Row(st.spec, st);
+          break;
+        default:
+          numberRow(st.spec, st);
+      }
+      continue;
+    }
+    switch (st.spec.type) {
+      case "bool":
+        boolRow(st.spec, st);
+        break;
+      case "enum":
+        enumRow(st.spec, st);
+        break;
+      case "json":
+      case "raw":
+        textRow(st.spec, st);
+        break;
+      case "vec2":
+        vec2Row(st.spec, st);
+        break;
+      default:
+        numberRow(st.spec, st);
+    }
+  }
+  group.appendChild(form);
+  return group;
+}
+
+/** light 分组（M4 A6）：类型串 / 通道 / 强度 / 半径 / 衰减指数 / 颜色 */
+function lightGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-light";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.light");
+  group.appendChild(h);
+  const f = getLightFields(node.obj);
+  if (!f) {
+    group.appendChild(note(et("light.bad")));
+    return group;
+  }
+  // 通道是**派生**事实，不是可编辑字段：^l 前缀走 V1 通道、按 lightconfig 限槽；
+  // 无前缀走 4 槽老通道，两条衰减公式不同 ⇒ 这里只读，改通道请改类型串。
+  const lane = document.createElement("p");
+  lane.className = "ed-note";
+  lane.textContent = f.lane === "v1" ? et("light.lane.v1") : et("light.lane.legacy");
+  group.appendChild(lane);
+  const form = document.createElement("fieldset");
+  form.className = "ed-form";
+  form.disabled = isLockedNode(node.id);
+  const id = node.id;
+  const edit = (label: string, mutate: (o: LayerNode["obj"]) => boolean) =>
+    objEditOk(et("objp.edit", { field: et(label) }), id, mutate);
+  const reset = (inp: HTMLInputElement, v: number) => {
+    inp.value = String(v);
+  };
+
+  const lab1 = document.createElement("label");
+  lab1.textContent = et("light.type");
+  lab1.title = et("light.typeTip");
+  const sel = document.createElement("select");
+  const types = [...LIGHT_TYPES];
+  if (!types.includes(f.light as (typeof LIGHT_TYPES)[number])) types.push(f.light as (typeof LIGHT_TYPES)[number]);
+  for (const t of types) {
+    const op = document.createElement("option");
+    op.value = t;
+    op.textContent = t;
+    sel.appendChild(op);
+  }
+  sel.value = f.light;
+  sel.addEventListener("change", () => {
+    if (!edit("light.type", (o) => setLightField(o, "light", sel.value))) sel.value = f.light;
+  });
+  form.append(lab1, sel);
+
+  const numRow = (key: LightField & ("intensity" | "radius" | "exponent"), label: string, step: string, tip?: string) => {
+    const lab = document.createElement("label");
+    lab.textContent = et(label);
+    if (tip) lab.title = tip;
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.step = step;
+    inp.value = String(f[key]);
+    inp.addEventListener("change", () => {
+      const n = Number(inp.value);
+      if (!Number.isFinite(n) || !edit(label, (o) => setLightField(o, key, n))) reset(inp, f[key]);
+    });
+    form.append(lab, inp);
+  };
+  numRow("intensity", "light.intensity", "0.05");
+  numRow("radius", "light.radius", "10");
+  numRow("exponent", "light.exponent", "0.1", et("light.exponentTip"));
+
+  const labC = document.createElement("label");
+  labC.textContent = et("light.color");
+  const box = document.createElement("div");
+  box.className = "span3";
+  const ins: HTMLInputElement[] = [];
+  for (let i = 0; i < 3; i++) {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.step = "0.05";
+    inp.min = "0";
+    inp.value = String(f.color[i]);
+    inp.title = ["r", "g", "b"][i];
+    inp.addEventListener("change", () => {
+      const v = ins.map((x) => Number(x.value || 0));
+      if (!v.every(Number.isFinite) || !edit("light.color", (o) => setLightField(o, "color", v))) {
+        for (let k = 0; k < 3; k++) ins[k].value = String(f.color[k]);
+      }
+    });
+    ins.push(inp);
+    box.appendChild(inp);
+  }
+  form.append(labC, box);
+  group.appendChild(form);
+  return group;
+}
+
+/** camera 分组（M4 A6）：相机对象本体（fov / zoom）。相机路径运镜属 M12，这里不做 */
+function cameraGroup(node: LayerNode): HTMLElement {
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-camera";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.camera");
+  group.appendChild(h);
+  const f = getCameraFields(node.obj);
+  if (!f) {
+    group.appendChild(note(et("camera.bad")));
+    return group;
+  }
+  group.appendChild(note(et("camera.hint")));
+  const form = document.createElement("fieldset");
+  form.className = "ed-form";
+  form.disabled = isLockedNode(node.id);
+  const id = node.id;
+  const edit = (label: string, mutate: (o: LayerNode["obj"]) => boolean) =>
+    objEditOk(et("objp.edit", { field: et(label) }), id, mutate);
+  const row = (field: CameraField & ("fov" | "zoom"), label: string, step: string, tip: string) => {
+    const lab = document.createElement("label");
+    lab.textContent = et(label);
+    lab.title = tip;
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.step = step;
+    inp.value = String(f[field]);
+    inp.addEventListener("change", () => {
+      const n = Number(inp.value);
+      if (!Number.isFinite(n) || !edit(label, (o) => setCameraField(o, field, n))) inp.value = String(f[field]);
+    });
+    form.append(lab, inp);
+  };
+  row("fov", "camera.fov", "1", et("camera.fovTip"));
+  row("zoom", "camera.zoom", "0.05", et("camera.zoomTip"));
+  group.appendChild(form);
+  return group;
+}
+
 // ---------- 插件宿主（PLUGIN-ARCHITECTURE §2）：main.ts 的闭包包成服务，内置分组 / 命令 / 导出目标登记成插件 ----------
 
 /** 内置检视器分组（顺序 = 旧版硬编码顺序；占 100 的整数倍，插件分组可插在中间） */
 const BUILTIN_INSPECTOR: InspectorGroup[] = [
   { id: "multi", order: 100, when: () => extraSel.size > 0, render: () => multiGroup(), tab: "props" },
   { id: "edit", order: 200, when: () => true, render: editGroup, tab: "props" },
+  // M4 A5：对象属性直通层（十六个对象级字段）
+  { id: "objprops", order: 250, when: () => true, render: objPropsGroup, tab: "props" },
   { id: "anim", order: 300, when: canAnimate, render: animGroup, tab: "anim" },
   { id: "text", order: 400, when: (n) => n.kind === "text", render: textGroup, tab: "props" },
+  // M4 A6：light / camera
+  { id: "light", order: 450, when: (n) => n.kind === "light", render: lightGroup, tab: "props" },
+  { id: "camera", order: 460, when: (n) => n.kind === "camera", render: cameraGroup, tab: "props" },
   { id: "particle", order: 500, when: (n) => n.kind === "particle", render: particleGroup, tab: "props" },
   { id: "sound", order: 600, when: (n) => n.kind === "sound", render: soundGroup, tab: "props" },
   // 容器 / 全屏后期：三种旗标（直通 / 实心 / 后期）。实心层虽不是容器，也在这里给旗标
