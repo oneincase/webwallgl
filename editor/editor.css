@@ -484,6 +484,7 @@ html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
 }
 
 #ed-draft,
+#ed-draft-recover,
 #ed-scripts-off {
   position: absolute;
   top: 10px;
@@ -508,7 +509,13 @@ html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
   border-color: var(--wb-warn);
 }
 
+/* 未保存编辑的草稿横幅：与「重开上次的目录」横幅同时在时下沉一行（两条语义不同，见计划 §2 C3） */
+#ed-draft:not([hidden]) + #ed-draft-recover {
+  top: 46px;
+}
+
 #ed-draft-text,
+#ed-draft-recover-text,
 #ed-scripts-off-text {
   overflow: hidden;
   text-overflow: ellipsis;
