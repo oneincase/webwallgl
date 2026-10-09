@@ -851,22 +851,158 @@ const parseJsonLoose = (s: string | null): Record<string, unknown> | null => {
   }
 };
 
-/** 外来效果的参数表：effect.json → 每个 pass 的材质 → shader .frag/.vert 的 uniform 注释 */
-export async function inspectEffectParams(file: string, read: ReadText): Promise<EffectParam[]> {
+/**
+ * 按 pass 还原外来效果的参数表：`effect.json` 的 passes[i].material → 材质 JSON 的
+ * passes[0].shader → `shaders/<shader>.frag/.vert` 的 uniform 注释。
+ *
+ * 与 `inspectEffectParams` 的差别只有形状：这里**保留 pass 下标**（含没有可调参数的
+ * pass），因为面板要按 effect/pass 折叠，而且写回必须落到 scene.json 里**同一个下标**
+ * 的 `constantshadervalues` 上（一条效果可以有多个 pass，各自材质不同）。
+ */
+export async function inspectEffectPasses(file: string, read: ReadText): Promise<InlinePassParams[]> {
   const ej = parseJsonLoose(await read(file));
   const passes = Array.isArray(ej?.passes) ? (ej!.passes as Array<Record<string, unknown>>) : [];
-  const out: EffectParam[] = [];
+  const out: InlinePassParams[] = [];
   for (let i = 0; i < passes.length; i++) {
     const mat = typeof passes[i]?.material === "string" ? parseJsonLoose(await read(passes[i].material as string)) : null;
     const shader = (mat?.passes as Array<Record<string, unknown>> | undefined)?.[0]?.shader;
-    if (typeof shader !== "string") continue;
-    for (const ext of ["frag", "vert"]) {
-      const src = await read(`shaders/${shader}.${ext}`);
-      if (!src) continue;
-      for (const p of parseShaderParams(src, i)) if (!out.some((q) => q.key.toLowerCase() === p.key.toLowerCase() && (q.pass ?? 0) === i)) out.push(p);
+    const params: EffectParam[] = [];
+    if (typeof shader === "string") {
+      for (const ext of ["frag", "vert"]) {
+        const src = await read(`shaders/${shader}.${ext}`);
+        if (!src) continue;
+        // 同一 pass 内大小写去重（引擎按大小写不敏感匹配常量名，见 issue#3）
+        for (const p of parseShaderParams(src, i)) if (!params.some((q) => q.key.toLowerCase() === p.key.toLowerCase())) params.push(p);
+      }
+    }
+    out.push({ pass: i, shader: typeof shader === "string" ? shader : null, params });
+  }
+  return out;
+}
+
+/** 外来效果的参数表（跨 pass 拉平）：effect.json → 每个 pass 的材质 → shader 的 uniform 注释 */
+export async function inspectEffectParams(file: string, read: ReadText): Promise<EffectParam[]> {
+  const out: EffectParam[] = [];
+  for (const ps of await inspectEffectPasses(file, read)) {
+    for (const p of ps.params) if (!out.some((q) => q.key.toLowerCase() === p.key.toLowerCase() && (q.pass ?? 0) === ps.pass)) out.push(p);
+  }
+  return out;
+}
+
+// ---------- 作品自带（内联）效果：按 effect / pass 发现参数 + 写回 ----------
+
+/** 一个 effect.json pass 解析出的参数（没有可调参数时 params 为空，仍然保留条目） */
+export type InlinePassParams = {
+  /** 在 effect.json `passes[]` 里的下标，写回时的 pass 下标就是它 */
+  pass: number;
+  /** 材质里声明的 shader（诊断用） */
+  shader: string | null;
+  params: EffectParam[];
+};
+
+/** 内联效果的一个 pass 在某个对象上呈现出来的样子（面板按它折叠） */
+export type InlinePassView = {
+  /** 在对象的 `effects[]` 里的下标 */
+  effect: number;
+  /** 在 `effects[].passes[]` 里的下标（= effect.json 的 pass 下标） */
+  pass: number;
+  file: string;
+  effectName: string;
+  shader: string | null;
+  params: readonly EffectParam[];
+  /** 按参数名取到的当前值（大小写不敏感），未知常量不在此表 */
+  values: Record<string, EffectValue>;
+  /** `constantshadervalues` 的全部键（含本库认不出的），用于只读展示未知键 */
+  keys: string[];
+  /** 该 pass 声明的贴图槽（本编辑器不改，原样保留） */
+  textures: readonly string[];
+};
+
+type InlinePassEntry = {
+  constantshadervalues?: Record<string, unknown>;
+  textures?: unknown;
+};
+
+const passesOf = (e: EffectEntry | undefined): InlinePassEntry[] | null => (Array.isArray(e?.passes) ? (e!.passes as InlinePassEntry[]) : null);
+
+const effectFileOfEntry = (e: EffectEntry) => (typeof e.file === "string" ? e.file : "");
+
+/** 按大小写不敏感取常量键在 pass 上的原名（引擎的物性名匹配就是大小写不敏感的） */
+export function constantKeyOf(pass: InlinePassEntry | undefined, key: string): string | null {
+  const csv = pass?.constantshadervalues;
+  if (!csv || typeof csv !== "object") return null;
+  const want = key.toLowerCase();
+  for (const k of Object.keys(csv)) if (k.toLowerCase() === want) return k;
+  return null;
+}
+
+/** 认出的参数名 → 当前值；认不出的常量既不报错也不丢（键保留在 constantshadervalues 里） */
+export function inlineParamValues(pass: InlinePassEntry | undefined, params: readonly EffectParam[]): Record<string, EffectValue> {
+  const csv = pass?.constantshadervalues;
+  const values: Record<string, EffectValue> = {};
+  for (const p of params) {
+    const k = constantKeyOf(pass, p.key);
+    values[p.key] = decodeValue(p, k && csv ? csv[k] : undefined);
+  }
+  return values;
+}
+
+/**
+ * 作品自带效果的 pass 视图：`obj.effects[i].passes[j]` × `effect.json` 的参数表。
+ * `params` 按 `effectFiles` 的键（effect.json 路径）取；缺失时该 pass 仍会列出，
+ * 但 `params` 为空 —— 面板这时只读展示已有常量键，绝不新建 / 删除任何东西。
+ */
+export function inlinePassViews(obj: SceneObject, params: ReadonlyMap<string, readonly EffectParam[]>): InlinePassView[] {
+  const out: InlinePassView[] = [];
+  const list = effectsOf(obj) ?? [];
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i];
+    const file = effectFileOfEntry(e);
+    if (!file) continue;
+    const ps = passesOf(e) ?? [];
+    for (let j = 0; j < ps.length; j++) {
+      const pass = ps[j];
+      const decl = (params.get(file) ?? []).filter((p) => (p.pass ?? 0) === j);
+      const csv = pass?.constantshadervalues;
+      out.push({
+        effect: i,
+        pass: j,
+        file,
+        effectName: typeof e.name === "string" && e.name ? e.name : (file.split("/").slice(-2, -1)[0] ?? file),
+        shader: null,
+        params: decl,
+        values: inlineParamValues(pass, decl),
+        keys: csv && typeof csv === "object" ? Object.keys(csv) : [],
+        textures: Array.isArray(pass?.textures) ? (pass!.textures as string[]) : [],
+      });
     }
   }
   return out;
+}
+
+/**
+ * 改一个作品自带效果的参数值，返回是否改成。
+ *
+ * 三条硬规矩（M1 判据守着）：
+ *   1. **只改值**：键按大小写不敏感命中已有键后用它的原名写回，不新增、不改名；
+ *   2. `{user|script|animation, value}` 包装只改 `.value`，绑定与脚本原样保留；
+ *   3. 其余键（含本库认不出的）与同 pass 的 `textures` 逐字节不动。
+ */
+export function setInlineParam(obj: SceneObject, effect: number, pass: number, key: string, value: EffectValue, params?: readonly EffectParam[]): boolean {
+  const e = effectsOf(obj)?.[effect];
+  const ps = passesOf(e);
+  if (!e || !ps || pass < 0 || pass >= ps.length) return false;
+  const p = params?.find((x) => x.key.toLowerCase() === key.toLowerCase());
+  if (!p) return false;
+  const target = ps[pass];
+  if (!target || typeof target !== "object") return false;
+  const csv = (target.constantshadervalues ??= {});
+  const real = constantKeyOf(target, p.key) ?? p.key;
+  const enc = encodeValue(p, value);
+  const cur = csv[real];
+  if (cur && typeof cur === "object" && !Array.isArray(cur) && "value" in cur) (cur as { value: unknown }).value = enc;
+  else csv[real] = enc;
+  return true;
 }
 
 /** 文档当前引用的效果文件（资源表据此决定写进来的效果三件套是否进保存清单） */

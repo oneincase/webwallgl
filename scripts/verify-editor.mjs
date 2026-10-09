@@ -4649,6 +4649,303 @@ section("J. 变异红测");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// FX-INLINE. 作品自带（内联）效果参数：发现 → 写回逐字节 → 未知键保留（M1 A1/A2）
+//
+// 纯函数部分（下面全部）：无浏览器可跑 —— 夹具是内存里的 effect.json / 材质 / shader 三件套。
+//
+// headless 用例（需真浏览器，加 --headless 才跑；本机 13 个工程里没有 `Bar Count` 的现成夹具，
+// 所以真浏览器那股只注明、不在本文件跑）：打开夹具工程 → 检视器「作品自带效果」展开 →
+// 改 `Bar Count` → `scene.json` 里那一处常量值变、其余逐字节不变，且**出帧像素随之变**
+// （引擎每帧现读同一份 `constantshadervalues`，见 scene-mount 与 renderer.js 的常量绑定段，
+// 下面两条判据正是这个前提的守卫）。
+// ───────────────────────────────────────────────────────────────────────────
+section("FX-INLINE. 作品自带效果参数 editor/effects.ts（M1 A1/A2）");
+{
+  const fxi = await loadEditorModule("effects");
+  const fxPath = path.join(ROOT, "editor/effects.ts");
+  const fxSrc = fs.readFileSync(fxPath, "utf8");
+
+  // 两段式夹具，与 WE 工程同形（本机实测）：effect.json 的 passes[i].material
+  // → 材质 JSON 的 passes[0].shader → shaders/<shader>.frag|.vert 的 uniform 注释
+  const FXF = "effects/other/bars/effect.json";
+  const fxFiles = {
+    [FXF]: json({
+      version: 1,
+      name: "bars",
+      passes: [{ material: "materials/effects/bars.json" }, { material: "materials/effects/bars2.json" }],
+    }),
+    "materials/effects/bars.json": json({ passes: [{ shader: "effects/bars" }] }),
+    "materials/effects/bars2.json": json({ passes: [{ shader: "effects/bars2" }] }),
+    "shaders/effects/bars.frag": [
+      'uniform float g_BarCount; // {"material":"Bar Count","label":"ui_editor_properties_bar_count","default":16,"range":[1,64]}',
+      'uniform float g_Strength; // {"material":"Strength","default":0.3,"range":[0,1]}',
+      'uniform vec3 g_BarColor; // {"material":"Bar Color","default":"1 0 0","type":"color"}',
+      "void main() {}",
+    ].join("\n"),
+    "shaders/effects/bars.vert": 'uniform vec2 g_Scale; // {"material":"scale","default":"1 1","range":[0.01,10]}',
+    "shaders/effects/bars2.frag": 'uniform float g_Opacity; // {"material":"ui_editor_properties_opacity","default":1,"range":[0,1]}',
+  };
+  const fxRead = async (name) => fxFiles[name] ?? null;
+
+  // 夹具对象：常量键的大小写与 shader 声明**故意不同**（引擎匹配是大小写不敏感的），
+  // 且混入未知键、`{user,value}` 包装、pass 上的未知字段、textures —— 它们都必须原样留着。
+  // `bar count` 的值 20 与注释缺省 16 故意不等，这样「大小写不敏感取值」判据才咬得住。
+  const fxObj = () => ({
+    id: 7,
+    image: "models/x.json",
+    effects: [
+      {
+        file: FXF,
+        id: 67,
+        name: "bars",
+        visible: true,
+        passes: [
+          {
+            id: 68,
+            constantshadervalues: { "bar count": 20, Strength: { user: "fxstrength", value: 0.3 }, mystery: 0.5, "Bar Color": "1 0 0" },
+            textures: ["$mediaThumbnail", "custom/tex.png"],
+          },
+          { id: 69, constantshadervalues: { ui_editor_properties_opacity: 0.8 } },
+        ],
+      },
+    ],
+  });
+
+  /**
+   * FX-INLINE 判据体：返回失败清单（空 = 全绿）。变异红测复用它 ——
+   * 「判据把错实现咬红」才是判据成立的证明。
+   */
+  const fxInlineCorpus = async (f) => {
+    const bad = [];
+    const is = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+
+    // ---- 1. 参数发现：注释 → 表单模型（default / range / 类型 / 中文名 / pass 归属）----
+    const passes = await f.inspectEffectPasses(FXF, fxRead);
+    is(passes.length === 2, "pass 条数（每个 material pass 一条，含无可调参数的）");
+    const p0 = passes[0]?.params ?? [];
+    const keys = p0.map((p) => p.key);
+    is(json(keys) === json(["Bar Count", "Strength", "Bar Color", "scale"]), "参数键：先 frag 后 vert，material 即键名");
+    const bc = p0.find((p) => p.key === "Bar Count");
+    is(bc?.type === "float" && bc?.default === 16 && bc?.min === 1 && bc?.max === 64, "range → min/max/step，default 取注释");
+    is(bc?.label === "Bar Count", "label 以 ui_ 开头时回落成键名（WE 的本地化占位）");
+    const col = p0.find((p) => p.key === "Bar Color");
+    is(col?.type === "color" && json(col?.default) === json([1, 0, 0]), "vec3 + type:color → color，缺省 \"1 0 0\" → 三分量");
+    const sc = p0.find((p) => p.key === "scale");
+    is(sc?.type === "vec2" && json(sc?.default) === json([1, 1]) && sc?.min === 0.01 && sc?.max === 10, "vec2 字符串缺省 → 分量数组；.vert 里的 uniform 一样收");
+    is(p0.every((p) => p.pass === 0) && passes[1]?.params?.every((p) => p.pass === 1), "每个参数带自己的 pass 下标（写回要落回同一个下标）");
+    is(passes[1]?.params?.[0]?.key === "ui_editor_properties_opacity" && passes[1].params[0].pass === 1, "第二个 pass 的参数单独成表");
+
+    // ---- 2. 视图：按 effect / pass 折叠，取值大小写不敏感，未知键只读列出 ----
+    const decls = new Map([[FXF, p0]]);
+    const o = fxObj();
+    const views = f.inlinePassViews(o, decls);
+    is(views.length === 2 && views[0].effect === 0 && views[0].pass === 0 && views[1].pass === 1, "视图按 effect / pass 展开");
+    is(views[0].values["Bar Count"] === 20, "取值大小写不敏感（文档写 bar count、声明写 Bar Count）");
+    is(views[0].values.Strength === 0.3 && json(views[0].values["Bar Color"]) === json([1, 0, 0]), "{user,value} 包装与颜色都能解码出当前值");
+    is(json(views[0].keys) === json(["bar count", "Strength", "mystery", "Bar Color"]), "keys 列出该 pass 全部常量键（含认不出的）");
+    is(views[0].values.mystery === undefined, "认不出的常量不进表单模型（没有声明就没有控件）");
+    is(json(views[0].textures) === json(["$mediaThumbnail", "custom/tex.png"]), "textures 原样带出（本编辑器不改纹理槽）");
+
+    // ---- 3. 写回逐字节：改一个值只动那一处 ----
+    const before = json(o);
+    is(f.setInlineParam(o, 0, 0, "Bar Count", 32, p0) === true, "写回命中已有键 → true");
+    const csv0 = o.effects[0].passes[0].constantshadervalues;
+    is(csv0["bar count"] === 32, "值写到**作者原本的键名**上（大小写不敏感命中，不改名）");
+    is(json(Object.keys(csv0)) === json(["bar count", "Strength", "mystery", "Bar Color"]), "不新增键（认不出的键也没被挤掉）");
+    const restored = JSON.parse(json(o));
+    restored.effects[0].passes[0].constantshadervalues["bar count"] = 20;
+    is(json(restored) === before, "逐字节：把那一处改回原值后整串完全相同（只有它变了）");
+    is(o.effects[0].passes[0].id === 68 && json(o.effects[0].passes[1]) === json({ id: 69, constantshadervalues: { ui_editor_properties_opacity: 0.8 } }), "pass 上的未知字段与原样字段、另一个 pass 都没动");
+    is(json(o.effects[0].passes[0].textures) === json(["$mediaThumbnail", "custom/tex.png"]), "写回后 textures 逐字节不动");
+    is(csv0.mystery === 0.5, "认不出的常量（mystery）逐字节不动");
+
+    // ---- 4. A2 前提：必须**就地**改那份对象，不能换成新对象 ----
+    //     引擎按引用持有 scene.json 的 constantshadervalues（下面 parseScene 那条与这里配对）
+    const csvRef = o.effects[0].passes[0].constantshadervalues;
+    f.setInlineParam(o, 0, 0, "Bar Count", 24, p0);
+    is(o.effects[0].passes[0].constantshadervalues === csvRef, "就地改同一份 constantshadervalues（换对象就热更不到引擎手上那份）");
+
+    // ---- 5. {user|script|animation, value} 包装只改 .value ----
+    is(
+      f.setInlineParam(o, 0, 0, "Strength", 0.9, p0) === true && json(o.effects[0].passes[0].constantshadervalues.Strength) === json({ user: "fxstrength", value: 0.9 }),
+      "{user,value} 包装只改 value，绑定原样保留",
+    );
+
+    // ---- 6. 值编码与 WE 同形（颜色 = "r g b" 字符串）----
+    is(
+      f.setInlineParam(o, 0, 0, "Bar Color", [0, 1, 0], p0) === true && o.effects[0].passes[0].constantshadervalues["Bar Color"] === "0 1 0",
+      "颜色按 \"r g b\" 编码（与引擎解码一致）",
+    );
+
+    // ---- 7. 写回落到声明的那个 pass 上 ----
+    is(
+      f.setInlineParam(o, 0, 1, "ui_editor_properties_opacity", 0.5, passes[1].params) === true && o.effects[0].passes[1].constantshadervalues.ui_editor_properties_opacity === 0.5,
+      "pass 下标落到声明的同一个 pass（不串到 pass 0）",
+    );
+
+    // ---- 8. 拒绝路径：认不出的键 / 越界 / 畸形结构，统统不动文档 ----
+    is(f.setInlineParam(o, 0, 0, "nope", 1, p0) === false, "effect.json 里没声明的键拒绝（不新建）");
+    is(f.setInlineParam(o, 0, 9, "Bar Count", 1, p0) === false, "pass 下标越界拒绝");
+    is(f.setInlineParam(o, 9, 0, "Bar Count", 1, p0) === false, "effect 下标越界拒绝");
+    is(f.inlinePassViews({ effects: [{ file: "effects/x/effect.json" }] }, decls).length === 0, "没有 passes 的效果条目不出视图（也不报错）");
+    const weird = { effects: [{ file: "effects/x/effect.json", passes: [null, 3, "x"] }] };
+    const weirdBefore = json(weird);
+    is(f.setInlineParam(weird, 0, 0, "Bar Count", 1, p0) === false && json(weird) === weirdBefore, "非对象 pass 拒绝写回且逐字节不动");
+    const fresh = { effects: [{ file: FXF, passes: [{}] }] };
+    is(
+      f.setInlineParam(fresh, 0, 0, "Bar Count", 32, p0) === true && json(fresh.effects[0].passes[0].constantshadervalues) === json({ "Bar Count": 32 }),
+      "pass 没有 constantshadervalues 时新建，键用注释里的 material 名（引擎大小写不敏感能认）",
+    );
+
+    return bad;
+  };
+
+  const fxBad = await fxInlineCorpus(fxi);
+  check(fxBad.length === 0, `作品自带效果：参数发现 / 写回逐字节 / 未知键保留全部成立（${fxBad.join(" / ") || "ok"}）`);
+
+  // ---- 引擎侧：A2 的两条前提 ----
+  {
+    const raw = {
+      camera: { center: "960 540", eye: "960 540 1000", up: "0 1 0", fov: 50 },
+      general: { orthographic: true, zoom: 1, clearcolor: "0 0 0" },
+      objects: [
+        {
+          id: 7,
+          image: "models/x.json",
+          origin: "960 540 0",
+          size: "400 300",
+          scale: "1 1 1",
+          angles: "0 0 0",
+          alpha: 1,
+          effects: [
+            {
+              file: FXF,
+              id: 67,
+              name: "bars",
+              visible: true,
+              passes: [{ id: 68, constantshadervalues: { "bar count": 20 }, textures: ["$mediaThumbnail"] }],
+            },
+          ],
+        },
+      ],
+    };
+    const L = parseMod.parseScene(raw, { type: "scene" }).layers?.[0];
+    check(
+      !!L?.effects?.[0]?.passes?.[0] && L.effects[0].passes[0].constantshadervalues === raw.objects[0].effects[0].passes[0].constantshadervalues,
+      "引擎按**引用**持有 scene.json 的 constantshadervalues（A2 就地改值即当帧生效的前提）",
+    );
+    const rndSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    check(
+      /const constMerged = \{ \.\.\.\(mp\.constants \|\| \{\}\), \.\.\.\(\(ov && ov\.constantshadervalues\) \|\| \{\}\) \}/.test(rndSrc),
+      "渲染器每帧现读 ov.constantshadervalues（同一份对象 → 下一帧出帧就变）",
+    );
+    const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    check(
+      /const setEffectConstantsImpl = \(\s*id: number,\s*effect: number,\s*pass: number,/.test(smSrc) &&
+        /const found = Object\.keys\(csv\)\.find\(\(k\) => k\.toLowerCase\(\) === key\.toLowerCase\(\)\);\s*if \(found === undefined\) continue;/.test(smSrc) &&
+        /const entry = all\.filter\(\(e\) => !e\?\.layerMaterial\)\[effect\];/.test(smSrc) &&
+        /return renderOnce\(\);/.test(smSrc.slice(smSrc.indexOf("const setEffectConstantsImpl"))),
+      "引擎热更实现：查层 → 按文档下标跳过合成条目 → 大小写不敏感命中（不新增键）→ 补画一帧",
+    );
+    check(/setEffectConstants: setEffectConstantsImpl,/.test(smSrc) && /setEffectConstants\(id, effect, pass, values\)/.test(fs.readFileSync(path.join(ROOT, "renderer/src/editor/controls.ts"), "utf8")), "热更 API 挂进 editorImpl 并经 editorOf 转发（页面只走公共出口）");
+    const typesSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/types.ts"), "utf8");
+    check(/setEffectConstants\(\s*id: number,\s*effect: number,\s*pass: number,/.test(typesSrc), "EditorControls 声明了 setEffectConstants（分层契约）");
+  }
+
+  // ---- 页面接线：内联参数提交走热更通道（hotAlways），并调引擎 setEffectConstants ----
+  {
+    const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+    check(
+      /function commitInlineParam\([\s\S]{0,1400}?void editor\?\.setEffectConstants\(Number\(layerId\), view\.effect, view\.pass, \{ \[param\.key\]: raw \}\)\.catch\(\(\) => \{\}\);\s*\},\s*true,\s*\);/.test(mainSrc),
+      "面板接线：内联参数提交 = structEdit(..., hot, true)（对象数组变了也走热路径）+ 引擎 setEffectConstants",
+    );
+    check(
+      /group\.appendChild\(inlineFxSection\(node, editable\)\);/.test(mainSrc) &&
+        /const params = v\.def \? v\.def\.params : externalParamsOf\(v\.file\)/.test(mainSrc) &&
+        /function inlineFxSection\(node: LayerNode, editable: boolean\): HTMLElement/.test(mainSrc),
+      "fx 分组末尾接上「作品自带效果」分区，内置效果那条路径没被改掉（旧判据仍在）",
+    );
+    const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const fxInlineKeys = ["fx.inlineTitle", "fx.inlineHint", "fx.inlinePass", "fx.inlineLoading", "fx.inlineNoParams", "fx.inlineUnknown", "fx.inlineTextures"];
+    const missingFxInline = fxInlineKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+    check(missingFxInline.length === 0, `作品自带效果文案中英文都有（缺 ${json(missingFxInline)}）`);
+    const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+    check(/\.ed-inline-pass\b/.test(cssSrc) && /\.ed-inline-unknown\b/.test(cssSrc) && /\.ed-inline-textures\b/.test(cssSrc), "折叠面板样式在 editor.css");
+  }
+
+  // ---- 变异红测：判据咬得住吗 ----
+  {
+    const fxMut = async (from, to, tag) => {
+      const mut = fxSrc.replace(from, to);
+      check(mut !== fxSrc, `注入点存在（${tag}）`);
+      return loadEditorModule("effects", { [fxPath]: mut });
+    };
+    // 写回不认原名、直接按声明键写：多出一个键，逐字节判据与「不新增键」一起红
+    const fm1 = await fxMut("const real = constantKeyOf(target, p.key) ?? p.key;", "const real = p.key;", "写回用原名");
+    const fm1bad = (await fxInlineCorpus(fm1)).join(" / ");
+    check(/新增键|逐字节/.test(fm1bad), "不按原名写回时「不新增键 / 逐字节」判据变红");
+    // 大小写敏感匹配：取值与写回都落空
+    const fm2 = await fxMut("for (const k of Object.keys(csv)) if (k.toLowerCase() === want) return k;", "for (const k of Object.keys(csv)) if (k === key) return k;", "常量键大小写不敏感");
+    const fm2bad = (await fxInlineCorpus(fm2)).join(" / ");
+    check(/大小写不敏感/.test(fm2bad), "常量键改成大小写敏感时「取值大小写不敏感」判据变红");
+    // 无视 {user,value} 包装：绑定被抹掉
+    const fm3 = await fxMut(
+      '  if (cur && typeof cur === "object" && !Array.isArray(cur) && "value" in cur) (cur as { value: unknown }).value = enc;\n  else csv[real] = enc;',
+      "  csv[real] = enc;",
+      "包装只改 value",
+    );
+    const fm3bad = (await fxInlineCorpus(fm3)).join(" / ");
+    check(/包装只改 value/.test(fm3bad), "无视 {user,value} 包装时「只改 value」判据变红");
+    // pass 下标丢失：参数表全部记成 pass 0
+    const fm4 = await fxMut("for (const p of parseShaderParams(src, i))", "for (const p of parseShaderParams(src, 0))", "参数带 pass 下标");
+    const fm4bad = (await fxInlineCorpus(fm4)).join(" / ");
+    check(/pass 下标/.test(fm4bad), "丢掉 pass 下标时「每个参数带自己的 pass 下标」判据变红");
+    // 写回时重建常量对象（浅拷贝也行）：内容一样，但引擎手上那份就断了
+    const fm5 = await fxMut(
+      "  const csv = (target.constantshadervalues ??= {});",
+      "  const csv = (target.constantshadervalues = { ...(target.constantshadervalues ?? {}) });",
+      "写回就地改",
+    );
+    const fm5bad = (await fxInlineCorpus(fm5)).join(" / ");
+    check(/就地改同一份/.test(fm5bad), "写回时重建常量对象（非就地）时「就地改同一份」判据变红");
+    // 引擎侧：parseScene 改成深拷贝 constantshadervalues → A2 前提判据红
+    const parsePath = path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js");
+    const parseSrc = fs.readFileSync(parsePath, "utf8");
+    const parseMut = parseSrc.replace("constantshadervalues: p.constantshadervalues || {},", "constantshadervalues: { ...(p.constantshadervalues || {}) },");
+    check(parseMut !== parseSrc, "注入点存在（parse.js 常量对象按引用）");
+    const rawRef = {
+      camera: { center: "960 540", eye: "960 540 1000", up: "0 1 0", fov: 50 },
+      general: { orthographic: true, zoom: 1, clearcolor: "0 0 0" },
+      objects: [{ id: 7, image: "models/x.json", origin: "960 540 0", size: "400 300", scale: "1 1 1", angles: "0 0 0", alpha: 1, effects: [{ file: FXF, passes: [{ constantshadervalues: { "bar count": 20 } }] }] }],
+    };
+    // 用 esbuild 打包（相对 import 照原目录解析），只把 parse.js 换成变异源码
+    const parseBundled = await build({
+      entryPoints: [parsePath],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+      plugins: [{ name: "fxinline-mut", setup: (b) => b.onLoad({ filter: /scene[\\/]parse\.js$/ }, () => ({ contents: parseMut, loader: "js" })) }],
+    });
+    const tmpParse = path.join(tmpRoot, `parse-mut-${Math.random().toString(36).slice(2)}.mjs`);
+    fs.writeFileSync(tmpParse, parseBundled.outputFiles[0].text);
+    const parseMutMod = await import(pathToFileURL(tmpParse).href);
+    const rawCopy = structuredClone(rawRef);
+    const Lm = parseMutMod.parseScene(rawCopy, { type: "scene" }).layers?.[0];
+    check(
+      Lm?.effects?.[0]?.passes?.[0]?.constantshadervalues !== rawCopy.objects[0].effects[0].passes[0].constantshadervalues,
+      "parseScene 深拷贝 constantshadervalues 时「按引用持有」判据变红",
+    );
+  }
+
+  console.log("  （headless：打开夹具 → 改 Bar Count → scene.json 值与出帧都变；见本段头注）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {

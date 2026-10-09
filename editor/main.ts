@@ -66,17 +66,23 @@ import {
   effectFiles,
   effectNote,
   effectViews,
+  encodeValue,
   externalValues,
+  constantKeyOf,
+  inlinePassViews,
+  inspectEffectPasses,
   inspectEffectParams,
   moveEffect,
   referencedEffects,
   removeEffect,
   setEffectParam,
+  setInlineParam,
   setEffectVisible,
   type EffectDef,
   type EffectParam,
   type EffectValue,
   type EffectView,
+  type InlinePassParams,
 } from "./effects";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
@@ -4809,25 +4815,44 @@ const fxParamLabel = (p: EffectParam) => (p.label !== undefined ? textOf(p.label
 
 /** 外来效果（不在注册表里的 WE 效果）从 shader 的 uniform 注释还原出的参数表；按文件缓存，读完重画检视器 */
 const externalParams = new Map<string, EffectParam[] | "loading">();
-function externalParamsOf(file: string): EffectParam[] | null {
+/**
+ * 同一份解析结果的**按 pass 形状**（作品自带效果的折叠面板要用）。
+ * 只解析一次：两个缓存由同一次 `inspectEffectPasses` 填。
+ */
+const externalPasses = new Map<string, InlinePassParams[] | "loading">();
+/** effect.json 路径 → 参数表（loading / 空数组都是「已问过」） */
+const externalParamsOfCached = (file: string): EffectParam[] | null => {
   const hit = externalParams.get(file);
-  if (hit === "loading") return null;
-  if (hit) return hit;
+  return hit === "loading" || hit === undefined ? null : hit;
+};
+/** 作品自带效果：effect.json 路径 → 每个 pass 的参数表（未读完时 null，读完重画检视器） */
+const inlinePassesOf = (file: string): InlinePassParams[] | null => {
+  const hit = externalPasses.get(file);
+  return hit === "loading" || hit === undefined ? null : hit;
+};
+/** 按需读一次 effect.json（材质 → shader 注释），结果同时喂给两条展示路径 */
+function loadExternalParams(file: string): void {
+  if (externalPasses.has(file)) return;
   const assets = overlay;
-  if (!assets) return null;
-  externalParams.set(file, "loading");
+  if (!assets) return;
+  externalPasses.set(file, "loading");
   const dec = new TextDecoder();
   const target = doc;
-  void inspectEffectParams(file, async (name) => {
+  void inspectEffectPasses(file, async (name) => {
     const b = await assets.read(name).catch(() => null);
     return b ? dec.decode(b) : null;
   })
-    .catch(() => [] as EffectParam[])
+    .catch(() => [] as InlinePassParams[])
     .then((ps) => {
-      externalParams.set(file, ps);
-      if (ps.length && doc === target) renderInspector();
+      externalPasses.set(file, ps);
+      externalParams.set(file, ps.flatMap((x) => x.params));
+      if (doc === target) renderInspector();
     });
-  return null;
+}
+/** 兼容旧调用点：内置效果不在这里，外来效果读完前返回 null（面板显示「读取中」） */
+function externalParamsOf(file: string): EffectParam[] | null {
+  loadExternalParams(file);
+  return externalParamsOfCached(file);
 }
 
 /** 对一个图层对象做一次可撤销的结构编辑（效果 / 脚本）；mutate 返回 false = 没改成 */
@@ -4965,7 +4990,137 @@ function effectsGroup(node: LayerNode): HTMLElement {
     if (add.value) addEffectTo(node, add.value);
   });
   group.appendChild(add);
+  group.appendChild(inlineFxSection(node, editable));
   return group;
+}
+
+// ---------- 作品自带效果（M1 A1/A2）：按 effect / pass 折叠的内联参数编辑 ----------
+
+/**
+ * 折叠面板的展开状态。检视器每次重画都会重建 DOM，不记下来就会「改一个值面板自己收起来」。
+ * 键 = 图层 id + effect 下标 + pass 下标；不落盘（与选中态同类，属会话状态）。
+ */
+const inlineFxOpen = new Set<string>();
+const inlineFxKey = (id: number | string, effect: number, pass: number) => `${id}:${effect}:${pass}`;
+
+/**
+ * 提交一个作品自带效果参数：文档侧就地改值（进撤销栈），引擎侧走**热更**。
+ *
+ * `hotAlways = true` 是关键：`structEdit` 只在 `cmd.after === cmd.before` 时才默认走热路径，
+ * 而这里改的是 `objects` 数组内的值，序列化必然变 —— 不传 `hotAlways` 就会掉进
+ * `restoreObjects` 的整场景重挂（数秒）。引擎侧只需要改那份 `constantshadervalues`：
+ * 它是以**引用**进到绘制侧的（见 `renderer/vendor/we-scene/render/renderer.js` 的常量绑定段
+ * 与 `setEffectConstantsImpl` 的注释），每帧现读，改完补画一帧即可。
+ */
+function commitInlineParam(
+  layerId: string | number,
+  view: { effect: number; pass: number; file: string; effectName: string; params: readonly EffectParam[] },
+  param: EffectParam,
+  next: EffectValue,
+): void {
+  const logLabel = et("log.fxParam", { name: view.effectName, param: fxParamLabel(param) });
+  // 文档与引擎用同一份编码值（`setInlineParam` 内部也走 `encodeValue`，这里复用同一函数保证一致）
+  const raw = encodeValue(param, next) as unknown;
+  structEdit(
+    logLabel,
+    (d) => {
+      const n = findNode(d.roots, layerId);
+      if (!n) return undefined;
+      return setInlineParam(n.obj, view.effect, view.pass, param.key, next, view.params) ? n.id : undefined;
+    },
+    () => {
+      // 引擎侧改的通常就是文档里那份常量对象（同一引用），这里再写一次是为了补画一帧，
+      // 顺带对「挂载时做过拷贝」的实现保持正确。
+      void editor?.setEffectConstants(Number(layerId), view.effect, view.pass, { [param.key]: raw }).catch(() => {});
+    },
+    true,
+  );
+}
+
+/**
+ * `fx` 分组末尾的「作品自带效果」分区：列出 `obj.effects[i].passes[j]`，
+ * 把 effect.json 参数表（uniform 注释）渲染成可编辑表单。
+ *
+ * 数据源与写回都在 `editor/effects.ts`（`inlinePassViews` / `setInlineParam`），
+ * 这里只负责 DOM 与提交时机：`change` 提交（拖动中不反复写），值走 A2 的热更通道。
+ */
+function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "ed-inline-fx";
+  box.dataset.fxInline = String(node.id);
+  const title = document.createElement("div");
+  title.className = "ed-insp-title ed-inline-fx-title";
+  title.textContent = et("fx.inlineTitle");
+  box.appendChild(title);
+
+  const files: string[] = [...new Set(effectViews(node.obj).map((v) => v.file).filter(Boolean))];
+  if (!files.length) return box;
+  for (const f of files) loadExternalParams(f);
+  const decls = new Map<string, readonly EffectParam[]>();
+  for (const f of files) {
+    const ps = inlinePassesOf(f);
+    if (ps) decls.set(f, ps.flatMap((x) => x.params));
+  }
+  const views = inlinePassViews(node.obj, decls);
+  if (!views.length) return box;
+  if (!decls.size) {
+    box.appendChild(note(et("fx.inlineLoading")));
+    return box;
+  }
+  box.appendChild(note(et("fx.inlineHint")));
+  for (const v of views) {
+    const key = inlineFxKey(node.id, v.effect, v.pass);
+    const det = document.createElement("details");
+    det.className = "ed-inline-pass";
+    det.dataset.fxInlineEffect = String(v.effect);
+    det.dataset.fxInlinePass = String(v.pass);
+    det.open = inlineFxOpen.has(key);
+    det.addEventListener("toggle", () => {
+      if (det.open) inlineFxOpen.add(key);
+      else inlineFxOpen.delete(key);
+    });
+    const sum = document.createElement("summary");
+    sum.className = "ed-inline-pass-head";
+    sum.textContent = `${v.effectName} · ${et("fx.inlinePass")} ${v.pass}`;
+    sum.title = v.file;
+    det.appendChild(sum);
+    const body = document.createElement("div");
+    body.className = "ed-inline-pass-body";
+    if (v.params.length) {
+      body.appendChild(
+        schemaForm({
+          params: v.params,
+          values: v.values,
+          label: fxParamLabel,
+          disabled: !editable,
+          commit: (k, next) => {
+            const p = v.params.find((x) => x.key === k)!;
+            commitInlineParam(node.id, v, p, next);
+          },
+        }),
+      );
+    } else {
+      body.appendChild(note(et("fx.inlineNoParams")));
+    }
+    // 已有常量键里本库认不出的（作者手写 / 别的效果留下的）：只读列出，绝不删
+    const known = new Set(v.params.map((p) => p.key.toLowerCase()));
+    const unknown = v.keys.filter((k) => !known.has(k.toLowerCase()));
+    if (unknown.length) {
+      const ro = document.createElement("div");
+      ro.className = "ed-inline-unknown";
+      ro.textContent = `${et("fx.inlineUnknown")}：${unknown.join("、")}`;
+      body.appendChild(ro);
+    }
+    if (v.textures.length) {
+      const tx = document.createElement("div");
+      tx.className = "ed-inline-textures";
+      tx.textContent = `${et("fx.inlineTextures")}：${v.textures.filter((t) => typeof t === "string" && t).join("、") || "—"}`;
+      body.appendChild(tx);
+    }
+    det.appendChild(body);
+    box.appendChild(det);
+  }
+  return box;
 }
 
 // ---------- 文字层：新建（普通 / 时钟 / 日期）、内容 / 字体 / 字号 / 对齐 / 背景，全走结构编辑 ----------

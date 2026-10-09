@@ -939,6 +939,28 @@ export type EditorControls = {
    * 字段上的 `{script}` / `{animation}` 包装只取快照值，不重装脚本与曲线（这类改动请整场景重挂）。
    */
   setAnimationLayers(id: number, layers: ReadonlyArray<Record<string, unknown>>): Promise<void>;
+  /**
+   * 作品自带效果的常量热更（M1 A2）：把 `values` 里的常量写进该层 `effects[effect].passes[pass]`
+   * 的 `constantshadervalues`，当帧生效（暂停中补画一帧）。
+   *
+   * 为什么就地改值就够：引擎的效果条目**按引用**持有 scene.json 的那份 `constantshadervalues`
+   * （effects-parse 的 `constantshadervalues: p.constantshadervalues || {}`，而 parse.js 逐 pass
+   * 保留同一份对象），渲染器每帧 `constMerged = {...mp.constants, ...ov.constantshadervalues}`
+   * 现读 —— 不需要重建效果链，也没有别的失效机制要碰。
+   *
+   * 键按**大小写不敏感**命中已有键（引擎的物性名匹配就是大小写不敏感的，见 renderer 的
+   * indexMatMetaLower）：命中原名写回，不新增键；值若是 `{script|user|animation, value}` 包装
+   * 只改 `.value`（绑定原样保留）。`values` 里有、pass 上没有的键被忽略。
+   *
+   * 只改**参数值**：不增删 pass、不换 material、不动 `bind` / `target` / `textures`。
+   * 层不存在 / 该层没有这条 effect / pass 下标越界时 reject。
+   */
+  setEffectConstants(
+    id: number,
+    effect: number,
+    pass: number,
+    values: Readonly<Record<string, unknown>>,
+  ): Promise<void>;
   /** 模型层附着点在当前姿势下的偏移与屏幕位置（W14）；不是模型层 / 模型没装上 / id 不存在返回 null */
   getAttachmentPoints(id: number): EditorAttachmentPoint[] | null;
   /**

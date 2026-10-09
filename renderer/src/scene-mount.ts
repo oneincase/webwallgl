@@ -7513,6 +7513,48 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         puppetPrevFrames.delete(l);
         return renderOnce();
       };
+      /**
+       * 作品自带效果的常量热更（M1 A2）。
+       *
+       * 为什么只要这一步：`parse.js` 逐 pass 建对象时 `constantshadervalues: p.constantshadervalues || {}`
+       * 存的是 scene.json 那份**同一个对象**（对象引用，不是深拷贝），而渲染器每帧
+       * `constMerged = {...mp.constants, ...((ov && ov.constantshadervalues) || {})}` 现读
+       * （renderer.js 的绑定段）—— 就地改值当帧就变，不需要重建效果链、也没有别的失效机制。
+       *
+       * 键按大小写不敏感命中已有键（引擎物性名匹配就是大小写不敏感的，见 renderer 的
+       * indexMatMetaLower）：命中原名写回、**不新增键**，于是作者的未知键与 `{script,value}`
+       * 包装都不动；认不出的键忽略。只改参数值，不碰 textures / bind / target。
+       */
+      const setEffectConstantsImpl = (
+        id: number,
+        effect: number,
+        pass: number,
+        values: Readonly<Record<string, unknown>>,
+      ): Promise<void> => {
+        if (disposed) return Promise.reject(new Error("scene disposed"));
+        const l: any = layerById(id);
+        if (!l) return Promise.reject(new Error(`setEffectConstants: layer ${id} not found`));
+        const all: any[] = Array.isArray(l.effects) ? l.effects : [];
+        // 合成条目（图层自身材质挂进来的 `_layerMaterial`）没有 file，且总被 unshift 到队首；
+        // 文档下标只数**有文件**的那些，避免合成条目把下标整体推偏一位。
+        const entry = all.filter((e) => !e?.layerMaterial)[effect];
+        if (!entry) return Promise.reject(new Error(`setEffectConstants: layer ${id} has no effect ${effect}`));
+        const ps = Array.isArray(entry.passes) ? entry.passes : [];
+        const target = ps[pass];
+        if (!target) return Promise.reject(new Error(`setEffectConstants: effect ${effect} has no pass ${pass}`));
+        const csv: Record<string, unknown> = (target.constantshadervalues ??= {});
+        for (const [key, value] of Object.entries(values ?? {})) {
+          const found = Object.keys(csv).find((k) => k.toLowerCase() === key.toLowerCase());
+          if (found === undefined) continue;
+          const cur = csv[found];
+          if (cur && typeof cur === "object" && !Array.isArray(cur) && "value" in (cur as object)) {
+            (cur as { value: unknown }).value = value;
+          } else {
+            csv[found] = value;
+          }
+        }
+        return renderOnce();
+      };
       const seekImpl = (t: number, render = true): Promise<void> => {
         if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
         rebaseClock(t, performance.now());
@@ -7661,6 +7703,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         },
         setLayerProps: setLayerPropsImpl,
         setAnimationLayers: setAnimationLayersImpl,
+        setEffectConstants: setEffectConstantsImpl,
         getAttachmentPoints(id: number): EditorAttachmentPoint[] | null {
           if (disposed) return null;
           const l: any = layerById(id);
