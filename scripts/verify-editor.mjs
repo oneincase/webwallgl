@@ -4964,6 +4964,9 @@ section("FX-INLINE. 作品自带效果参数 editor/effects.ts（M1 A1/A2）");
 //   且工程文件夹里**没有** effects/<库目录>/** 任何文件（库内文件仍在库里）。
 // ───────────────────────────────────────────────────────────────────────────
 section("FX-LIB. 效果库接入 editor/effects.ts + host/wallpaper-host.ts（M6 A11）");
+// headless 待补（本沙箱 Chrome 沙箱起不来）：在一个**从未打开过**的工程里点「加库内效果」→
+// 真浏览器里核对 scene.json 多出库内引用、参数 / combos 内联、且工程目录里没有多出任何库内文件。
+// 离线部分已覆盖同一条链路的纯逻辑与真宿主（见本段「未复制任何库内效果文件」「库内效果目录一字未动」）。
 const fxLibMod = await loadEditorModule("effects");
 {
   const { createHash } = await import("node:crypto");
