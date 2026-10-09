@@ -137,6 +137,13 @@
           </label>
           <p class="wb-hint" data-et="render.hint">全局设置，所有文档共用；改动即时生效，不影响导出的工程。</p>
         </div>
+        <!-- 场景设置：写进这个工程的 scene.json（general 段），可撤销；与上面的全局「渲染选项」不是一回事 -->
+        <div id="scene-menu" class="ed-menu ed-render-menu" role="dialog" hidden>
+          <div class="ed-menu-title" data-et="scn.title">场景设置</div>
+          <p class="wb-hint" data-et="scn.hint">这些是壁纸自己的参数：写进本工程的 scene.json，改一次进一次撤销栈。不是上面那份「渲染选项」的本机偏好。</p>
+          <div id="scene-menu-body"></div>
+          <p class="wb-hint" data-et="scn.keep">面板只写下面列出的键；文档里的未知键、orthogonalprojection、camerapreview 与脚本 / 动画包装保持原样。</p>
+        </div>
         <div id="rec-menu" class="ed-menu ed-new-menu" role="dialog" hidden>
           <div class="ed-rec-title" data-et="rec.title">录制为视频</div>
           <label class="ed-new-row"><span data-et="rec.duration">时长（秒）</span>
@@ -388,6 +395,7 @@
             </label>
             <button type="button" class="ed-btn" id="tb-render-opts" aria-haspopup="dialog" data-et-title="render.optsTip"><span data-et="render.opts">渲染选项</span></button>
             <button type="button" class="ed-btn" id="tb-pointer" aria-haspopup="dialog" data-et-title="ptr.tip"><span data-et="ptr.title">指针</span></button>
+            <button type="button" class="ed-btn" id="tb-scene-opts" aria-haspopup="dialog" data-et-title="scn.optsTip"><span data-et="scn.opts">场景设置</span></button>
           </div>
 
           <div id="ed-viewport">

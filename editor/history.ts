@@ -27,12 +27,18 @@ export type VideoCmd = { kind: "video"; label: string; before: VideoClip; after:
 /** 文档级改名（工程名）：doc.title 与 project.json 的 title 一起记账 —— 结构命令的快照只覆盖 objects，装不下它 */
 export type TitleSnap = { title: string; projectTitle: string | null };
 export type TitleCmd = { kind: "title"; label: string; before: TitleSnap; after: TitleSnap };
-export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd | TitleCmd;
+/**
+ * 场景设置（scene.json 的 general 段）：before / after 是整段 general 的 JSON 快照。
+ * 结构命令的快照只覆盖 objects 与 project 属性表，装不下 general，所以它和 TitleCmd 一样单列一种。
+ */
+export type SceneCmd = { kind: "scene"; label: string; before: string; after: string };
+export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd | TitleCmd | SceneCmd;
 
 export const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
 export const isBatch = (c: EditCmd): c is BatchCmd => "kind" in c && c.kind === "batch";
 export const isVideoCmd = (c: EditCmd): c is VideoCmd => "kind" in c && c.kind === "video";
 export const isTitleCmd = (c: EditCmd): c is TitleCmd => "kind" in c && c.kind === "title";
+export const isSceneCmd = (c: EditCmd): c is SceneCmd => "kind" in c && c.kind === "scene";
 
 /** 去掉前后一致的条目；剩一条时退回普通属性命令，一条不剩返回 null */
 export function batchCommand(label: string, cmds: readonly PropsCmd[]): EditCmd | null {
