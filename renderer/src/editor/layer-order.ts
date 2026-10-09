@@ -81,6 +81,19 @@ export function shiftLayer(layers: OrderedLayer[], id: unknown, delta: number): 
   return moveLayerTo(layers, id, target > from ? target + 1 : target);
 }
 
+/** 重排到**目标下标**（= 搬完之后这一层在数组里的位置，与 `EditorLayer.index` 同一口径）。
+ *  与 `moveLayerTo` 的区别：那个收的是「插入位」（先摘后插的落点），同一个目标位置在
+ *  两个口径下差 1 —— 页面的「上移一层」与 `reorderLayer(id, toIndex)` 用的都是下标口径，
+ *  所以对外 API 一律走这里，避免调用方自己 +1 / -1。
+ *  越界夹到 [0, length-1]；目标就是原位时返回 null（空操作，调用方不必出帧）。 */
+export function moveLayerToIndex(layers: OrderedLayer[], id: unknown, toIndex: number): number | null {
+  const from = layerIndexOf(layers, id);
+  if (from < 0 || !Number.isFinite(toIndex)) return null;
+  const target = Math.max(0, Math.min(Math.trunc(toIndex), layers.length - 1));
+  if (target === from) return null;
+  return moveLayerTo(layers, id, target > from ? target + 1 : target);
+}
+
 /** 父链向下收整棵子树（含自身）。childIds 来自 parse.js 的聚合表：
  *  只认数组形状，脏数据（null / 非数组）当没有子层。 */
 export function collectSubtreeIds<T extends OrderedLayer & { childIds?: unknown }>(

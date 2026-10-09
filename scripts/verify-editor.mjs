@@ -4711,6 +4711,23 @@ section("J. 变异红测");
     );
   }
   {
+    // reorderLayer 对外收的是**目标下标**（同一个数在 moveLayerTo 那个「插入位」口径下差 1，
+    // 页面的「上移 / 下移一层」也按下标算，所以这两个口径必须都在判据里钉住）。
+    const a = L(1, 2, 3, 4);
+    check(lo.moveLayerToIndex(a, 1, 2) === 2 && order(a) === "2,3,1,4", "M12/B1 moveLayerToIndex 往下搬到目标下标（不是插入位）");
+    check(lo.moveLayerToIndex(a, 1, 0) === 0 && order(a) === "1,2,3,4", "M12/B1 moveLayerToIndex 往上搬回原位");
+    check(lo.moveLayerToIndex(a, 4, 3) === null && order(a) === "1,2,3,4", "M12/B1 目标下标 = 现状时空操作返回 null（不产生无谓出帧）");
+    check(
+      lo.moveLayerToIndex(a, 1, 4) === 3 && order(a) === "2,3,4,1" && lo.moveLayerToIndex(a, 1, 99) === null,
+      "M12/B1 目标下标越界夹到末位（= length 这一档就是「搬到最上」；已经在末位才是空操作）",
+    );
+    check(lo.moveLayerToIndex(a, 42, 0) === null && lo.moveLayerToIndex(a, 1, NaN) === null, "M12/B1 moveLayerToIndex 找不到 / 非数字下标一律拒绝");
+    check(
+      JSON.stringify(lo.layerIdOrder(a)) === JSON.stringify(["2", "3", "4", "1"]),
+      "M12/B1 目标下标口径下的最终绘制序（末位 = 最后画 = 最上）",
+    );
+  }
+  {
     // 环 + 未知 id：删层收子树绝不能死循环，也不能误伤别的层
     const a = [
       { id: 1, childIds: [2, 3] },

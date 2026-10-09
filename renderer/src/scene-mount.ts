@@ -12,7 +12,7 @@ import {
   insertLayerAt,
   layerIdOrder,
   layerIndexOf,
-  moveLayerTo,
+  moveLayerToIndex,
 } from "./editor/layer-order";
 import {
   normalizeOverlayMode,
@@ -8169,7 +8169,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           if (disposed) return Promise.reject(new Error("scene disposed"));
           // 绘制顺序 = scene.layers 数组顺序（渲染器逐层遍历），所以重排只需移动
           // 数组元素：变换、可见性、脚本注册一概不动，顺序即生效。
-          const at = moveLayerTo(scene.layers as any[], id, toIndex);
+          // toIndex 是**目标下标**（搬完之后的 EditorLayer.index），越界夹到端点。
+          const at = moveLayerToIndex(scene.layers as any[], id, toIndex);
           if (at === null) return Promise.reject(new Error(`图层不存在或下标非法: ${id} → ${toIndex}`));
           return renderOnce();
         },

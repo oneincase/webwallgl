@@ -650,7 +650,7 @@ for (const name of REQUIRED_WP) {
 {
   const { pathToFileURL: toUrl } = await import("node:url");
   const pureMods = [
-    ["renderer/src/editor/layer-order.ts", ["insertLayerAt", "detachLayer", "moveLayerTo", "shiftLayer", "collectSubtreeIds", "layerIndexOf"]],
+    ["renderer/src/editor/layer-order.ts", ["insertLayerAt", "detachLayer", "moveLayerTo", "moveLayerToIndex", "shiftLayer", "collectSubtreeIds", "layerIndexOf"]],
     ["renderer/src/editor/overlay.ts", ["normalizeOverlayMode", "overlaySegments", "outlineSegments", "gizmoSegments", "segmentCount"]],
   ];
   for (const [rel, need] of pureMods) {
