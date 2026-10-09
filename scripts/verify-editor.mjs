@@ -4669,7 +4669,161 @@ section("I. 接线");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// J. 变异红测
+// CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）
+//
+// 语料命中（358 个可解析 scene.json / 14888 个对象）：容器 836 对象 / 150 张壁纸、
+// 全屏后期 229 / 104、`config.passthrough` 287 / 43 —— 编辑器此前 0 个入口。
+//
+// 离线判据：容器对象生成形状、子层世界坐标合并（纯函数 composeXform，与引擎
+// parse.js 的 composeChildTransform 同式）、passthrough 往返、未知子层 / 未知 config 键
+// 逐字节保留、页面接线（按钮 + 中英文案各恰好一条）、`editor/` 下没有偷看引擎运行态的探针。
+//
+// headless 用例（需真浏览器，本沙箱 Chrome 起不来 —— 见文末「失败点」）：
+// 建容器 → 挂效果 → 出帧像素变；容器自身变换作用于子层（画面整体位移）。
+// ───────────────────────────────────────────────────────────────────────────
+section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
+{
+  const ctr = await loadEditorModule("container");
+  const docMod = await loadEditorModule("doc");
+  const kinds = await loadEditorModule("layer-kinds");
+  const ctrSrc = fs.readFileSync(path.join(ROOT, "editor/container.ts"), "utf8");
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const ctrHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const ctrI18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+
+  // —— 判定口径与引擎同字面量 ——
+  const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  check(parseSrc.includes("isContainer: typeof o.image") && parseSrc.includes("'models/util/composelayer'"), "引擎侧容器判定仍在 parse.js 的 isContainer（前缀 composelayer）");
+  check(ctr.CONTAINER_IMAGE === "models/util/composelayer", "编辑器容器前缀与引擎同一字面量 models/util/composelayer");
+  check(json(ctr.FULLSCREEN_POST_IMAGES) === json(["models/util/projectlayer", "models/util/fullscreenlayer"]), "全屏后期前缀 = projectlayer / fullscreenlayer（与 parse.js isPost 两个前缀一致）");
+  check(ctr.isContainerObject({ image: "models/util/composelayer.pkg" }) === true && ctr.isContainerObject({ image: "images/bg.jpg" }) === false, "容器判定只认 composelayer 前缀（普通图片不算）");
+  check(ctr.isFullscreenPostObject({ image: "models/util/fullscreenlayer" }) === true && ctr.isFullscreenPostObject({ image: "models/util/composelayer" }) === false, "全屏后期判定只认 projectlayer / fullscreenlayer");
+  check(ctr.hasPassthrough({ config: { passthrough: true } }) === true && ctr.hasPassthrough({ passthrough: true }) === false, "passthrough 只从 config 里读（顶层同名字段不算）");
+
+  // solid 判定与 parse.js 的 IIFE 同式：solidlayer 前缀不看旗标、composelayer 一律 false
+  check(ctr.solidRenders({ image: "models/util/solidlayer" }) === true && ctr.solidRenders({ image: "models/util/solidlayer", solid: false }) === true, "solidlayer 前缀即实心（没有 solid 旗标也算）");
+  check(ctr.solidRenders({ image: "models/util/composelayer", solid: true }) === false, "容器即使残留 solid: true 也不是实心层（17 个语料对象的坑）");
+  check(ctr.solidRenders({ particle: "particles/snow" }) === false && ctr.solidRenders({ image: "images/x.jpg" }) === false && ctr.solidRenders({ image: "images/x.jpg", solid: true }) === false, "粒子 / 松散图片不是实心层");
+  check(ctr.solidRenders({ solid: true }) === true && ctr.solidRenders({ solid: true, image: "models/util/imagelayer" }) === true, "没有 image / 内置 util 前缀 + solid 旗标 = 实心");
+
+  // —— 容器对象生成形状 ——
+  const mkScene = (objs) => ({ general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: objs });
+  const ctrDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  const ctrId = ctr.addContainerLayer(ctrDoc, { name: "容器", origin: "960 540 0", scale: "1920 1080 1", passthrough: true });
+  const ctrObj = ctrDoc.scene.objects[0];
+  check(ctrId !== null && ctrObj.id === ctrId, "addContainerLayer 返回的 id 就是新对象的 id");
+  check(ctrObj.image === "models/util/composelayer", "新容器写出 image = models/util/composelayer（引擎认得的对象）");
+  check(ctrObj.config && ctrObj.config.passthrough === true && ctrObj.passthrough === undefined, "passthrough 写在 config.passthrough，顶层不留同名字段");
+  check(json(Object.keys(ctrObj).sort()) === json(["angles", "config", "id", "image", "name", "origin", "scale", "visible"]), `新容器的键集固定（${json(Object.keys(ctrObj).sort())}）`);
+  check(JSON.stringify(ctrObj) === json({ angles: "0 0 0", config: { passthrough: true }, id: ctrId, image: "models/util/composelayer", name: "容器", origin: "960 540 0", scale: "1920 1080 1", visible: true }), `新容器的 JSON 逐字节等于期望（键序与工程口径一致：${json(ctrObj)}）`);
+  check(docMod.kindOf(ctrObj) === "container", "kindOf 把容器识别成 container（不是 image），检视器才给得出容器分组");
+  check(kinds.layerKindInfo("container")?.canHaveEffects === true, "容器类型登记 canHaveEffects（效果作用在整棵子树上）");
+  check(docMod.kindOf({ image: "models/util/projectlayer" }) === "fullscreen-post" && kinds.layerKindInfo("fullscreen-post")?.canHaveEffects === true, "全屏后期层单独一种类型且能挂效果");
+  check(docMod.kindOf({ image: "models/util/solidlayer" }) === "image" && docMod.kindOf({ image: "images/bg.jpg" }) === "image", "solidlayer / 普通图片仍是 image（判定没被容器分支吃掉）");
+
+  const postDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  ctr.addContainerLayer(postDoc, { kind: "post", name: "后期" });
+  check(postDoc.scene.objects[0].image === "models/util/projectlayer", "kind: \"post\" 写 projectlayer（全屏后期，引擎按画布覆盖尺寸）");
+  check(postDoc.scene.objects[0].config === undefined, "后期层默认不写 config（只写真正要的键）");
+
+  const solidDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  ctr.addContainerLayer(solidDoc, { solid: true });
+  check(solidDoc.scene.objects[0].config === undefined && solidDoc.scene.objects[0].solid === true, "solid 旗标是顶层字段，不会被塞进 config");
+
+  // —— 子层世界坐标合并（纯函数；与引擎 parse.js composeChildTransform 同式）——
+  const composeId = docMod.composeXform({ origin: [100, 200, 0], scale: [2, 3, 1], angles: [0, 0, Math.PI / 2] }, { origin: [10, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] });
+  check(near(composeId.origin[0], 100) && near(composeId.origin[1], 220) && near(composeId.origin[2], 0), `容器旋转后子层世界原点按父角度转（${json(composeId.origin)}，Y 轴朝下 → 10 局部单位落在 +y）`);
+  check(near(composeId.scale[0], 2) && near(composeId.scale[1], 3) && near(composeId.scale[2], 1), "父层 scale 传给子层（composeXform 与引擎一样恒传播）");
+  check(near(composeId.angles[2], Math.PI / 2) && near(composeId.angles[0], 0) && near(composeId.angles[1], 0), "2D 只累加 z 角度，x / y 角度取子层自己的");
+  const nestedId = docMod.composeXform({ origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, Math.PI] }, composeId);
+  check(near(nestedId.origin[0], -100) && near(nestedId.origin[1], -220) && near(nestedId.angles[2], (3 * Math.PI) / 2), `二层容器逐级合并（旋转 180° 后子层落在父的另一侧：${json(nestedId.origin)}，角度 ${nestedId.angles[2].toFixed(4)}）`);
+  const identityId = docMod.composeXform({ origin: [0, 0, 0], scale: [1, 1, 1], angles: [0, 0, 0] }, { origin: [7, 8, 9], scale: [1, 2, 3], angles: [0, 0, 0] });
+  check(json(identityId.origin) === json([7, 8, 9]) && json(identityId.scale) === json([1, 2, 3]), "单位父层不改子层（世界 = 局部）");
+
+  // 文档层：容器 → 子层，worldXform 与 composeXform 同结果
+  const treeDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  const treeCtr = ctr.addContainerLayer(treeDoc, { name: "容器", origin: "960 540 0", scale: "2 2 1" });
+  ctr.addContainerLayer(treeDoc, { name: "子层" });
+  const childObj = treeDoc.scene.objects.find((o) => o.id !== treeCtr);
+  childObj.parent = treeCtr;
+  childObj.origin = "10 0 0";
+  childObj.scale = "1 1 1";
+  childObj.angles = "0 0 0";
+  docMod.rebuildTree(treeDoc);
+  const childNode = docMod.findNode(treeDoc.roots, childObj.id);
+  const worldOf = docMod.worldXform(treeDoc.scene.objects, childNode.obj);
+  check(childNode.children.length === 0 && treeDoc.roots.some((n) => n.id === treeCtr && n.children.some((c) => c.id === childObj.id)), "容器 → 子层的父子关系进了图层树");
+  check(worldOf && worldOf.origin[0] === 980 && worldOf.origin[1] === 540 && worldOf.scale[0] === 2, `容器自身变换作用在子层上（子层世界原点 ${json(worldOf?.origin)}，scale ${json(worldOf?.scale)}）`);
+  const viaCompose = docMod.composeXform(docMod.worldXform(treeDoc.scene.objects, docMod.findNode(treeDoc.roots, treeCtr).obj), docMod.localXform(childObj));
+  check(near(viaCompose.origin[0], worldOf.origin[0]) && near(viaCompose.origin[1], worldOf.origin[1]) && near(viaCompose.scale[0], worldOf.scale[0]), "worldXform 走链的结果与 composeXform 逐级合成一致（两处不得分叉）");
+
+  // —— 旗标往返：写回 → 再 parse → 逐字节一致 ——
+  const rtDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  const rtId = ctr.addContainerLayer(rtDoc, { name: "容器" });
+  docMod.findNode(rtDoc.roots, rtId);
+  const rtObj = rtDoc.scene.objects.find((o) => o.id === rtId);
+  ctr.setPassthrough(rtObj, true);
+  check(rtObj.config.passthrough === true, "setPassthrough(true) 写 config.passthrough");
+  const saved = JSON.stringify(rtDoc.scene);
+  const reparsed = JSON.parse(saved);
+  const rtObj2 = reparsed.objects.find((o) => o.id === rtId);
+  check(ctr.hasPassthrough(rtObj2) === true, "存盘再 parse 后 passthrough 仍在（引擎解析得到同一个旗标）");
+  check(JSON.stringify(reparsed) === saved, "写回后 JSON.parse + stringify 与期望逐字节一致");
+  ctr.setPassthrough(rtObj2, false);
+  check(rtObj2.config && !("passthrough" in rtObj2.config), "setPassthrough(false) 删键（不留 false 残渣）");
+  check(ctr.hasPassthrough(rtObj2) === false, "关掉后 hasPassthrough 为 false");
+
+  // —— 未知字段 / 未知 config 键逐字节保留 ——
+  const keep = { id: 42, image: "models/util/composelayer", name: "旧容器", origin: "1 2 3", scale: "1 1 1", angles: "0 0 0", visible: true, solid: false, config: { passthrough: true, alpha: 0.5, "we.unknown": { deep: [1, 2, 3] } }, weCustom: { nested: true }, unknownTop: "保我" };
+  const keepJson = JSON.stringify(keep);
+  const keepDoc = { type: "scene", scene: mkScene([JSON.parse(keepJson)]), roots: [], project: null };
+  docMod.rebuildTree(keepDoc);
+  const keepObj = keepDoc.scene.objects[0];
+  ctr.setPassthrough(keepObj, false);
+  check(keepObj.config.alpha === 0.5 && json(keepObj.config["we.unknown"]) === json({ deep: [1, 2, 3] }), "改 passthrough 不动 config 里我们不认识的键");
+  check(keepObj.weCustom.nested === true && keepObj.unknownTop === "保我" && keepObj.solid === false, "对象上的未知字段逐字节保留（含 solid: false 这种显式假值）");
+  check(JSON.stringify(keepObj.config) === json({ alpha: 0.5, "we.unknown": { deep: [1, 2, 3] } }), `删键后 config 的 JSON 只剩认识之外的键（${json(keepObj.config)}）`);
+
+  const unkChild = { id: 7, parent: 42, image: "models/util/composelayer", name: "未知子层", keepMe: [1, 2], config: { mystery: "x" } };
+  const unkDoc = { type: "scene", scene: mkScene([JSON.parse(keepJson), unkChild]), roots: [], project: null };
+  docMod.rebuildTree(unkDoc);
+  const unkJson = JSON.stringify(unkDoc.scene.objects[1]);
+  const unkNode = docMod.findNode(unkDoc.roots, 42);
+  check(unkNode.children.length === 1 && unkNode.children[0].id === 7, "容器下的未知子层挂进了树");
+  check(unkNode.children[0].kind === "container" || docMod.kindOf(unkChild) === "container", "未知子层自身也是容器时照样识别");
+  const unkParentWorld = docMod.worldXform(unkDoc.scene.objects, docMod.findNode(unkDoc.roots, 42).obj);
+  docMod.composeXform(unkParentWorld, docMod.localXform(unkChild));
+  check(JSON.stringify(unkDoc.scene.objects[1]) === unkJson, "只读合成不改对象（未知子层逐字节不变）");
+  const rewriteObj = JSON.parse(unkJson);
+  ctr.setPassthrough(rewriteObj, true);
+  check(rewriteObj.keepMe[1] === 2 && rewriteObj.config.mystery === "x" && rewriteObj.config.passthrough === true, "写旗标后未知子层仍保留 keepMe / config.mystery");
+  const expectObj = JSON.parse(unkJson);
+  expectObj.config.passthrough = true;
+  check(JSON.stringify(rewriteObj) === JSON.stringify(expectObj), "只多出 passthrough 一个键，其余逐字节不动（含 config 里原本的键序）");
+
+  // —— 页面接线（按钮 / 文案 / 结构编辑）——
+  check(ctrHtml.includes('id="ly-add-container"') && ctrHtml.includes('id="ly-add-post"'), "图层工具条有「加容器层」「加全屏后期层」两个按钮");
+  check(/lyAddContainerEl\.disabled = lyAddEl\.disabled;/.test(mainSrc) && /lyAddPostEl\.disabled = lyAddEl\.disabled;/.test(mainSrc), "两个新按钮的可用性跟随添加图片层");
+  check(/from "\.\/container"/.test(mainSrc) && /structEdit\(et\("log\.containerAdded", \{ name \}\)/.test(mainSrc) && /addContainerLayer\(d, \{/.test(mainSrc), "加层走 structEdit + container.ts 的对象生成（可撤销、整场景重挂）");
+  const ctrGroup = mainSrc.match(/id: "container",[\s\S]{0,200}?render: containerGroup,[\s\S]{0,40}?tab: "props"/);
+  check(!!ctrGroup && ctrGroup[0].includes('order: 1250,') && ctrGroup[0].includes('n.kind === "container" || n.kind === "fullscreen-post" || !!n.obj.solid'), "检视器「容器」分组：容器 / 全屏后期 / 实心层都出旗标");
+  check(/setPassthrough\(ob, on\)/.test(mainSrc) && /objEdit\(et\(on \? "log\.passthroughOn"/.test(mainSrc) && /delete ob\.solid;/.test(mainSrc), "旗标改动走 objEdit（可撤销）");
+  const ctrKeys = ["ly.addContainer", "ly.addPost", "ctr.container", "ctr.post", "insp.container", "ctr.passthrough", "ctr.solid", "ctr.fullscreen", "ctr.solidYes", "ctr.solidNo", "ctr.postNote", "log.containerAdded", "log.passthroughOn", "log.passthroughOff", "log.solidOn", "log.solidOff"];
+  const duplicate = ctrKeys.filter((k) => (ctrI18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(duplicate.length === 0, `容器相关文案中英文各恰好一条（${json(ctrKeys.length)} 条，缺 / 多 ${json(duplicate)}）`);
+  check(/et\(on \? "log\.solidOn" : "log\.solidOff"/.test(mainSrc) || /"log\.solidOn"/.test(mainSrc), "实心旗标的两种文案都在页面上用到");
+
+  // —— 探针 / 分层 ——
+  const editorFiles = fs.readdirSync(path.join(ROOT, "editor")).filter((f) => f.endsWith(".ts"));
+  const probes = editorFiles.filter((f) => /__wp|__sceneLayers/.test(fs.readFileSync(path.join(ROOT, "editor", f), "utf8")));
+  check(probes.length === 0, `editor/ 下没有偷看引擎运行态的 __wp / __sceneLayers 探针（${json(probes)}）`);
+  check(/from "\.\.\/renderer\/src\/api\/editor"/.test(fs.readFileSync(path.join(ROOT, "editor/doc.ts"), "utf8")) && !/from "\.\.\/renderer\/src\/scene-mount"/.test(mainSrc) && !/from "\.\.\/renderer\/vendor/.test(ctrSrc), "只从 api/editor 出口取引擎能力，不直连 scene-mount / vendor");
+
+  // 与引擎同一份前缀表：解析器改了前缀而编辑器没跟，这条要红
+  const engineCtr = /'models\/util\/composelayer'/.test(parseSrc);
+  check(engineCtr && ctr.CONTAINER_IMAGE === "models/util/composelayer", "引擎与编辑器的容器前缀是同一条字面量（改一边这条即红）");
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 section("J. 变异红测");
 {
