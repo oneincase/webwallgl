@@ -210,6 +210,17 @@
               <span data-et="sec.library">壁纸库</span>
               <span id="lib-count" class="wb-badge" hidden></span>
             </button>
+            <div class="wb-panel-tools ed-tree-tools" data-tools="layers">
+              <button type="button" class="ed-icon" id="tree-collapse" data-i18n-title="tree.collapseAll" title="折叠全部">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M4 6l4-4 4 4 M4 10l4 4 4-4" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="tree-expand" data-i18n-title="tree.expandAll" title="展开全部">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M4 5.5l4 4 4-4 M4 10.5l4 4 4-4" /></svg>
+              </button>
+              <button type="button" class="ed-icon" id="tree-isolate" data-i18n-title="tree.isolate" title="隔离选中层">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 8s2.2-4 6-4 6 4 6 4-2.2 4-6 4-6-4-6-4z M8 6.4A1.6 1.6 0 1 0 8 9.6a1.6 1.6 0 0 0 0-3.2" /></svg>
+              </button>
+            </div>
             <div class="wb-panel-tools ed-lib-tools" data-tools="library">
               <button type="button" class="ed-icon" id="lib-pick" data-i18n-title="sidebar.pickLib" title="选择壁纸库文件夹">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3.2l1.5 1.5H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" /></svg>
@@ -248,12 +259,20 @@
               <button type="button" class="ed-icon" id="ly-group" disabled data-et-title="ly.group" title="成组">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 4V2h2 M12 2h2v2 M14 12v2h-2 M4 14H2v-2 M5 5h6v6H5z" /></svg>
               </button>
+              <button type="button" class="ed-icon" id="ly-ungroup" disabled data-et-title="ly.ungroup" title="取消成组">
+                <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 4V2h2 M4 14H2v-2 M14 12v2h-2 M5 5h6v6H5z M8 2.5v3 M6.5 4h3 M8 10.5v3 M6.5 12h3" /></svg>
+              </button>
               <button type="button" class="ed-icon" id="ly-dup" disabled data-et-title="ly.dup" title="复制">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M5.5 5.5h8v8h-8z M10.5 5.5V2.5h-8v8h3" /></svg>
               </button>
               <button type="button" class="ed-icon" id="ly-del" disabled data-et-title="ly.del" title="删除">
                 <svg class="i i-sm" viewBox="0 0 16 16"><path d="M3 4h10M6.5 4V3h3v1M4.5 4.5V13a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V4.5M6.8 7v4.5M9.2 7v4.5" /></svg>
               </button>
+            </div>
+            <div class="wb-search" id="ed-tree-search">
+              <svg class="i i-sm" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2l3.3 3.3" /></svg>
+              <input id="ed-filter" type="search" placeholder="过滤图层名 / id" data-i18n-ph="ph.treeFilter" />
+              <button type="button" class="ed-icon" id="ed-filter-clear" data-i18n-title="tree.clearSearch" title="清空搜索" hidden>✕</button>
             </div>
           <div id="text-menu" class="ed-menu" role="menu" hidden>
             <button type="button" role="menuitem" data-preset="plain" data-et="text.plain">文字</button>

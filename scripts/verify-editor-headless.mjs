@@ -110,7 +110,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await mouse("mouseReleased", x1, y1, { modifiers });
     await sleep(120);
   };
-  const KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"] };
+  const KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"], a: [65, "KeyA"], c: [67, "KeyC"], v: [86, "KeyV"], x: [88, "KeyX"] };
   const key = async (k, modifiers = 0) => {
     const [vk, code] = KEYS[k];
     await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
@@ -2215,6 +2215,149 @@ async function runCreateAndDraft(ctx) {
   await settle();
   check((await h.selectedName()) !== null && (await ev(`document.querySelector('#ed-tree .ed-node.selected')?.dataset.id`)) === hA && (await lanes())[0].sel, "点动画条那一行：选中对应图层");
   check((await h.errorLines()).length === 0, "动画条 / 复制粘贴全程无错误");
+
+  // ════════════════════════════════════════════════════════════════════════
+  section("AJ. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）");
+  await gotoEditor();
+  await newBlank("#000000");
+  for (const [x, y] of [[220, 200], [650, 200], [1600, 800]]) {
+    await addTextPreset("plain");
+    await setText("content", "MMM");
+    await setText("size", "12");
+    await h.setInputs({ 0: x, 1: y });
+  }
+  await settle();
+  const [q1, q2, q3] = await treeIds();
+  const crAj = await h.canvasRect();
+  const inkAj = async (x, y) => (await inkIn(...worldBox(await h.canvasRect(), [x, y], [40, 25]), 690)).frac;
+  // 空画布起拖：从 (1200, 800) 拉到 (300, 100)，矩形罩住左上两层、放过右下那层。
+  // 叠加层先隐藏：虚线矩形与选中框会压在命中测试区上，量的是框选结果不是像素
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  await drag(worldToPage(crAj, [1200, 800]), worldToPage(crAj, [300, 100]), 0, 12);
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  check(
+    json(await ev(`[...document.querySelectorAll('#ed-tree .ed-node.selected')].map((n) => n.dataset.id).sort()`)) === json([q1, q2].sort()),
+    "★ 拖空白处框选：相交的两层进选区，矩形外的第三层不动",
+  );
+  await clickSel('.ed-align-bar [data-align="left"]');
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkAj(220, 200)) > 0.05 && (await inkAj(220, 200)) > 0.05 && (await inkAj(650, 200)) < 0.01 && (await inkAj(1600, 800)) > 0.05, "★ 框选后批改：左对齐把第二层移到第一层的左缘，矩形外的层不受影响");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  await key("z", MOD.meta);
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkAj(650, 200)) > 0.05 && (await inkAj(220, 200)) > 0.05 && (await inkAj(1600, 800)) > 0.05, "撤销一次：批改整体回退（框选走的是同一条批量命令）");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  let rm = await h.readyCount();
+  await clickSel("#ly-group");
+  await h.waitRemount(rm);
+  check((await treeIds()).length === 4 && (await depthOf())[q1] === 1 && (await depthOf())[q2] === 1, "框选出的两层成组");
+  await clickSel(`#ed-tree .ed-node[data-id="${q1}"] .ed-kind`);
+  await settle();
+  rm = await h.readyCount();
+  await clickSel("#ly-ungroup");
+  await h.waitRemount(rm);
+  check((await treeIds()).length === 3 && (await treeIds())[0] === q1 && (await treeIds())[1] === q2, "★ 取消成组：组消失，两个子层按原顺序顶回顶层");
+  check((await inkAj(220, 200)) > 0.05 && (await inkAj(650, 200)) > 0.05, "取消成组后画面不变（子层补偿了组的变换）");
+
+  // 树搜索 / 隔离 / 折叠全部
+  await ev(
+    `(() => { const el = document.querySelector('#ed-filter'); el.value = '${q2}'; el.dispatchEvent(new Event('input', { bubbles: true })); })()`,
+  );
+  await settle();
+  check(json(await treeIds()) === json([q2]) && (await ev(`document.querySelectorAll('#ed-tree .ed-node.match').length`)) === 1, "★ 树搜索：按 id 过滤只剩命中行，命中行带 .match 高亮");
+  await clickSel("#ed-filter-clear");
+  await settle();
+  check((await treeIds()).length === 3 && (await ev(`document.querySelector('#ed-filter').value`)) === "", "清空搜索：过滤撤销，三行都在");
+  await clickRow(q3);
+  await clickSel("#tree-isolate");
+  await settle();
+  check(json(await treeIds()) === json([q3]) && (await ev(`document.querySelector('#tree-isolate').classList.contains('is-on')`)), "★ 隔离：只留选中层这一支，按钮进入开启态");
+  await clickSel("#tree-isolate");
+  await settle();
+  check((await treeIds()).length === 3 && !(await ev(`document.querySelector('#tree-isolate').classList.contains('is-on')`)), "再点隔离：恢复整棵树");
+  await clickSel("#tree-collapse");
+  await settle();
+  check((await ev(`document.querySelectorAll('#ed-tree .ed-twisty').length`)) === 0, "折叠全部：没有可折叠的组时树仍是平的（不报错）");
+  await clickSel("#tree-expand");
+  await settle();
+  check((await treeIds()).length === 3, "展开全部：三行恢复");
+
+  // 锁定入撤销栈：锁定后拖不动，撤销后又能拖
+  const lockBtn = (id) => `#ed-tree .ed-node[data-id="${id}"] .ed-lock`;
+  await clickRow(q1);
+  const crL = await h.canvasRect();
+  await clickSel(lockBtn(q1));
+  await settle();
+  check(await ev(`document.querySelector('#ed-tree .ed-node[data-id="${q1}"]').classList.contains('locked-layer')`), "锁定按钮：行进入 locked-layer 态");
+  await drag(worldToPage(crL, [220, 200]), worldToPage(crL, [520, 200]));
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkAj(220, 200)) > 0.05 && (await inkAj(520, 200)) < 0.01, "锁定层拖不动（写入文档的 locktransforms）");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  await key("z", MOD.meta);
+  await settle();
+  check(await ev(`!document.querySelector('#ed-tree .ed-node[data-id="${q1}"]').classList.contains('locked-layer')`), "★ 撤销一次：锁定被撤掉（锁定切换进了撤销栈）");
+  await drag(worldToPage(crL, [220, 200]), worldToPage(crL, [520, 200]));
+  await settle();
+  await ev(`document.querySelector('#ed-overlay').style.visibility = 'hidden'`);
+  check((await inkAj(520, 200)) > 0.05 && (await inkAj(220, 200)) < 0.01, "解锁后又能拖（撤销真的恢复了可拖状态）");
+  await ev(`document.querySelector('#ed-overlay').style.visibility = ''`);
+  await key("z", MOD.meta);
+  await settle();
+
+  // 图层剪贴板：⌘C / ⌘V 复制黏贴，⌘X 剪切；跨文档粘贴
+  const originOf = async () => {
+    const v = await numInputs();
+    return `${v[0]}, ${v[1]}`;
+  };
+  await clickRow(q1);
+  const baseOrigin = await originOf();
+  const rowsBeforeAj = (await treeIds()).length;
+  await key("c", MOD.meta);
+  await settle();
+  await key("v", MOD.meta);
+  await settle();
+  const rowsAfterAj = (await treeIds()).length;
+  check(rowsAfterAj === rowsBeforeAj + 1 && (await originOf()) !== baseOrigin, `⌘C + ⌘V：树里多一层并选中它，落点带粘贴偏移（${json(baseOrigin)} → ${json(await originOf())}）`);
+  rm = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rm);
+  check((await treeIds()).length === rowsBeforeAj, "撤销粘贴：新层撤回（粘贴走 structEdit，一步撤销）");
+  await key("x", MOD.meta);
+  await settle();
+  check((await treeIds()).length === rowsBeforeAj - 1, "⌘X 剪切：原层被删（剪切 = 复制 + 删除，删除自己进撤销栈）");
+  rm = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rm);
+  check((await treeIds()).length === rowsBeforeAj, "撤销剪切：原层回来");
+  // 跨文档：先在本文档复制，换一个空文档再粘。内存剪贴板的载荷 id 与目标文档必然同名，
+  // 粘贴必须重新编号——粘贴两次得到两行就是「没有覆盖已有层」的行为证据
+  await clickRow(q2);
+  await key("c", MOD.meta);
+  await settle();
+  await gotoEditor();
+  await newBlank("#000000");
+  await settle();
+  await key("v", MOD.meta);
+  await settle();
+  const rows1Aj = (await treeIds()).length;
+  const crossOrigin = await originOf();
+  await key("v", MOD.meta);
+  await settle();
+  const rows2Aj = (await treeIds()).length;
+  check(rows1Aj === 1 && rows2Aj === 2 && rows2Aj === rows1Aj + 1, `★ 跨文档粘贴：空文档里贴出 1 层，再粘一次变 2 层（id 重新分配、不覆盖，第二层落点 ${json(crossOrigin)} 偏移）`);
+  rm = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rm);
+  check((await treeIds()).length === 1, "撤销一次：回到只贴了一层的状态");
+  rm = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(rm);
+  check((await treeIds()).length === 0, "再撤销：空文档回到空");
+  check((await h.errorLines()).length === 0, "M7 交互补齐全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
   section("AI. WebGL 上下文丢失自愈（丢上下文 → 按当前文档重挂、编辑不丢 → 一分钟内第 4 次停手 → 手动重新加载）");

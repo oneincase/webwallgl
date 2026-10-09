@@ -4122,7 +4122,7 @@ section("I. 接线");
   check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(sm) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(sm), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
   check(/m\.addEventListener\("pointerdown", \(e\) => startKeyDrag\(e, m, n, t\)\)/.test(main) && /\(o\) => moveKeyTime\(o, from, to\)/.test(main) && /log\(et\("log\.keyMoveBad"/.test(main), "时间轴关键帧标记可拖动改时刻（objEdit，冲突时提示并复原）");
   check(/row\.addEventListener\("pointerdown", \(e\) => startTreeDrag\(e, n, row\)\)/.test(main) && /\(res = placeLayer\(d, n\.id, target\.id, where\)\) === "ok"/.test(main) && /if \(treeDragged\) return;/.test(main), "图层树行可拖：放下走 placeLayer 结构编辑，拖完不误触点选");
-  check(/isLockedObj\(n\.obj\)/.test(main) && /setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(main) && !/const locked = new Set/.test(main), "锁定状态以文档 locktransforms 为准（页面不再另存一份）");
+  check(/isLockedObj\(o\) === on/.test(main) && /setLocked\(o, on\);/.test(main) && /setLockedEdit\(n, !isLocked\(n\.id\)\);/.test(main) && !/const locked = new Set/.test(main) && !/setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(main), "锁定状态以文档 locktransforms 为准（页面不再另存一份），且切换走 objEdit 进撤销栈（A9）");
   check(/id="ly-group"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /groupLayer\(d, n\.id, et\("layer\.groupName"\)\)/.test(main), "图层工具条「成组」");
   check(/if \(drag\.box && drag\.snap && !\(e\.metaKey \|\| e\.ctrlKey\)\) \{\s*const r = snapMove\(drag\.box, dx, dy, drag\.snap\);/.test(main) && /screenDeltaToLocal\(Number\(drag\.id\), mx, my\)/.test(main) && /snapTargets\(sceneFrame\(fitEl\.value, r\.width, r\.height, res\.w, res\.h\), others\)/.test(main), "视口移动走吸附（⌘ / Ctrl 关），候选 = 画面框（按当前 fit）+ 其他层");
   check(/if \(!l\.visible \|\| insideSelf\(l\)\) continue;/.test(main) && /handle \? \{ box: null, snap: null \}/.test(main) && /drag = null;\s*snapGuides = null;/.test(main), "吸附只对移动生效；自己与子层、隐藏层不当候选；松手清参考线");
@@ -4646,6 +4646,204 @@ section("J. 变异红测");
   check((await gltfSkinCheck(gm4)).worst > 1e-2, "STEP 当 LINEAR 求值时 ★ 判据变红");
   const gm5 = await glMut("const w = top.map((p) => p[1] / sum);", "const w = top.map((p) => p[1]);", "截断后归一");
   check(Math.abs(gm5.topInfluences([0, 1, 2, 3, 4, 5], [0.1, 0.3, 0.05, 0.25, 0.2, 0.1], 0).w.reduce((s, v) => s + v, 0) - 1) > 1e-3, "截断后不归一时「前 4 个归一」判据变红");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// M7. 交互补齐：框选 / 全选 / 取消成组（C1）、树搜索·隔离（C2）、锁定入栈（A9）、图层剪贴板（A10）
+// ───────────────────────────────────────────────────────────────────────────
+const marqueeMod = await loadEditorModule("marquee");
+const treeQueryMod = await loadEditorModule("tree-query");
+const clipboardMod = await loadEditorModule("clipboard");
+const mainSrcText = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+
+section("SELECT-2. 框选命中 / 选择集合合并 / 取消成组（C1）");
+{
+  const M = marqueeMod;
+  const rect = M.rectOf(30, 30, 10, 10);
+  check(json(rect) === json({ x0: 10, y0: 10, x1: 30, y1: 30 }), "rectOf 把任意方向的拖拽规范化成 x0<=x1 / y0<=y1");
+  check(M.boxHasPoint({ x0: 0, y0: 0, x1: 10, y1: 10 }, 10, 10) && !M.boxHasPoint({ x0: 0, y0: 0, x1: 10, y1: 10 }, 10.5, 0), "boxHasPoint 含边界");
+  check(M.boxIntersects(rect, { x0: 30, y0: 30, x1: 50, y1: 50 }) && !M.boxIntersects(rect, { x0: 31, y0: 0, x1: 40, y1: 40 }), "boxIntersects：边贴边算相交，隔开不算");
+  const layers = [
+    { id: 1, visible: true, box: { x0: 0, y0: 0, x1: 50, y1: 50 } },
+    { id: 2, visible: true, box: { x0: 100, y0: 100, x1: 120, y1: 120 } },
+    { id: 3, visible: false, box: { x0: 0, y0: 0, x1: 50, y1: 50 } },
+    { id: 4, visible: true, box: null },
+  ];
+  check(json(M.marqueeHits(layers, rect)) === json([1]), "★ 框选命中：只收相交的可见层，隐藏层与量不到包围盒的层跳过");
+  check(M.boxFromCorners(null) === null && json(M.boxFromCorners([[3, 4], [-1, 9]])) === json({ x0: -1, y0: 4, x1: 3, y1: 9 }), "boxFromCorners：空轮廓 null，否则取外接矩形");
+  check(json(M.marqueeSelect([1, 2], [2, 3], true)) === json([1, 3]), "★ ⇧ 追加框选：命中的已选层被剔除（再框一次取消），其余并入");
+  check(json(M.marqueeSelect([1, 2], [3], false)) === json([3]) && json(M.marqueeSelect([1], [], false)) === json([]), "普通框选直接替换选区，框空即清空");
+
+  // 取消成组：子层世界变换不变 + 组位置让给子层
+  const mkScene = (objects, type = "scene") =>
+    docMod.makeDoc("t", null, { general: {}, objects: typeof objects === "function" ? objects() : objects }, type);
+  const ungroupObjs = () => [
+    { id: 1, text: "a", origin: "100 100 0" },
+    { id: 2, text: "g", origin: "50 20 0", scale: "2 2 1", angles: "0 0 0.3" },
+    { id: 3, text: "b", parent: 2, origin: "10 5 0" },
+    { id: 4, text: "c", parent: 2, origin: "-20 7 0", angles: "0 0 -0.1" },
+    { id: 5, text: "d", origin: "700 500 0" },
+  ];
+  const worldOf = (o) =>
+    new Map(
+      parseMod
+        .parseScene({ general: {}, objects: structuredClone(o) }, { type: "scene" })
+        .layers.map((l) => [l.id, [l.origin[0], l.origin[1]]]),
+    );
+  let ud = mkScene(ungroupObjs);
+  const wu0 = worldOf(ungroupObjs());
+  const ur = docMod.ungroup(ud, 2);
+  const wu1 = worldOf(ud.scene.objects);
+  check(ur === "ok" && !ud.scene.objects.some((o) => o.id === 2), "ungroup 删掉组对象本身");
+  check([1, 3, 4, 5].every((id) => Math.hypot(wu0.get(id)[0] - wu1.get(id)[0], wu0.get(id)[1] - wu1.get(id)[1]) < 1e-3), "★ 引擎 parseScene 对照：取消成组前后所有层世界位置不变（子层补偿了组的变换；写回按 6 位有效数字，容差 1e-3）");
+  check(json(ud.scene.objects.map((o) => o.id)) === json([1, 3, 4, 5]) && ud.scene.objects.every((o) => o.parent === undefined), "子层按原顺序顶到组的位置（数组顺序即绘制顺序），父级清空");
+  const ue = mkScene(ungroupObjs);
+  const ueBefore = JSON.stringify(ue.scene.objects);
+  check(docMod.ungroup(ue, 1) === "noop" && docMod.ungroup(ue, 404) === "missing" && JSON.stringify(ue.scene.objects) === ueBefore, "没有子层的层 / 不存在的 id：noop / missing，文档原样");
+  const uan = ungroupObjs();
+  uan[1].origin = { value: "50 20 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  const ua = mkScene(uan);
+  const uaBefore = JSON.stringify(ua.scene.objects);
+  check(docMod.ungroup(ua, 2) === "animated" && JSON.stringify(ua.scene.objects) === uaBefore, "组自身带变换动画时拒绝取消成组（静态化会丢动画），文档原样");
+  const ub = mkScene(ungroupObjs);
+  const ubBefore = JSON.stringify(ub.scene.objects);
+  const ubAll = docMod.ungroupAll(ub, [1, 2]);
+  check(
+    ubAll.ok === true && json(ubAll.ids) === json([2]) && json(ub.scene.objects.map((o) => o.id)) === json([1, 3, 4, 5]),
+    json(ubAll),
+  );
+  const uanAll = ungroupObjs();
+  uanAll[1].origin = { value: "50 20 0", animation: { c0: [], options: { fps: 30, length: 90, mode: "loop" } } };
+  const ub2 = mkScene(uanAll);
+  const ub2Before = JSON.stringify(ub2.scene.objects);
+  const ub2All = docMod.ungroupAll(ub2, [2, 1]);
+  check(ub2All.ok === false && ub2All.reason === "animated" && ub2All.at === 2 && JSON.stringify(ub2.scene.objects) === ub2Before, "★ 批量取消成组：任一层拆不了就整批不动（先把非组层 1 过滤掉，再撞上动画组 2）");
+
+  // 接线：命令行 / 工具条 / 树行按钮
+  check(/app\?\.commands\.handleKey\(e\)/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "a"\) \{\s*e\.preventDefault\(\);\s*selectAllLayers\(\);/.test(mainSrcText) && /function selectAllLayers\(\)/.test(mainSrcText) && /selectMany\(ids\[0\], ids\.slice\(1\)\)/.test(mainSrcText), "⌘/Ctrl+A 全选：走 selectMany（主选 + 追加选区），命令服务没接住才轮到内建链");
+  check(/function selectAllLayers\(\)[\s\S]{0,600}?!isLocked\(n\.id\)/.test(mainSrcText), "全选跳过锁定层（锁定层不能拖动 / 变换，进选区只会造成误操作）");
+  check(/if \(marquee \|\| !editor \|\| !doc \|\| doc\.type !== "scene" \|\| e\.button !== 0 \|\| e\.altKey\) return;/.test(mainSrcText) && /if \(handleAt\(gizmo, p\.x, p\.y\) \|\| overSelected\(p\.x, p\.y\)\) return;/.test(mainSrcText) && /if \(editor\.hitTestAt\(p\.x, p\.y\)\.some\(/.test(mainSrcText) && /!isLocked\(h\.id\)\)\) return;/.test(mainSrcText), "框选只在空画布起拖：手柄 / 已选层交给拖拽，点在别的层上是点选");
+  check(/stageEl\.addEventListener\("pointerdown", \(e\) => \{\s*if \(marquee/.test(mainSrcText) && /const m = marquee;\s*marquee = null;\s*if \(!m\.moved\) return;\s*suppressClick = true;/.test(mainSrcText) && /marqueeHits\(marqueeLayers, r\)/.test(mainSrcText) && /marqueeSelect\(/.test(mainSrcText), "松手才结算：没超过阈值当点击（不吞掉点选），结算走 marqueeHits + marqueeSelect");
+  check(/if \(marquee\) drawMarquee\(\);/.test(mainSrcText) && /overlayCtx\.setTransform\(dpr, 0, 0, dpr, \(cr\.left - sr\.left\) \* dpr, \(cr\.top - sr\.top\) \* dpr\);\s*if \(marquee\) drawMarquee\(\);/.test(mainSrcText), "框选矩形画在选中框叠加层上（与手柄同一套坐标变换）");
+  check(/id="ly-ungroup"/.test(htmlSrc) && /lyUngroupEl\.onclick = \(\) => ungroupSelected\(\);/.test(mainSrcText) && /lyUngroupEl\.disabled = off \|\| !ungroupable\(\);/.test(mainSrcText) && /function ungroupable\(\)/.test(mainSrcText), "工具条「取消成组」：没有可拆的组时禁用");
+  check(/ungroupAll\(d, ids\)/.test(mainSrcText) && /PLACE_BAD\[b\.reason\]/.test(mainSrcText), "取消成组走 ungroupAll，失败按 PlaceResult 提示（与拖放 / 成组同一套文案）");
+}
+
+section("TREE-2. 树搜索 / 过滤 / 隔离 / 折叠全部（C2）");
+{
+  const T = treeQueryMod;
+  const entries = [
+    { id: 1, parent: null, name: "背景" },
+    { id: 2, parent: 1, name: "Cloud A" },
+    { id: 3, parent: 2, name: "cloud B" },
+    { id: 4, parent: null, name: "前景" },
+    { id: 5, parent: 4, name: "叶子" },
+  ];
+  check(T.treePattern("  CL  ") === "cl" && T.treePattern("   ") === "", "搜索串归一：去空白 + 转小写；空串 = 不过滤");
+  check(T.treeMatches(entries[1], "cloud") && !T.treeMatches(entries[0], "cloud") && T.treeMatches(entries[2], "3") && !T.treeMatches(entries[0], ""), "命中判定：层名或 id 包含搜索串（大小写不敏感），空串不命中任何层");
+  const hit = T.treeSearchHits(entries, "cloud");
+  check(json([...hit].sort()) === json(["2", "3"]), "搜索命中集：名字里带 cloud 的两层");
+  const sv = T.treeVisible(entries, hit);
+  check(json([...sv.visible].sort()) === json(["1", "2", "3"]) && json([...sv.matched].sort()) === json(["2", "3"]), "★ 过滤视图：命中层 + 其全部祖先可见（否则命中的后代会被折叠的祖先挡掉），祖先不算命中态");
+  check(json([...T.treeSubtree(entries, [2]).keys()].sort()) === json(["2", "3"]) && json([...T.treeSubtree(entries, [4, 5]).keys()].sort()) === json(["4", "5"]), "子树闭包：含自身与全部后代");
+  const iv = T.treeIsolateView(entries, [2]);
+  check(json([...iv.visible].sort()) === json(["1", "2", "3"]) && !iv.visible.has("4") && !iv.visible.has("5"), "★ 隔离视图：只留目标层、它的子树与祖先，兄弟分支整体消失");
+  check(json([...T.treeExpanded(new Set([1, 2, 4]), entries, 3)].map(String).sort()) === json(["4"]), "treeExpanded 展开某个 id 的祖先链（隔离时选中层要能看见）");
+
+  check(/id="ed-tree-search"/.test(htmlSrc) && /id="ed-filter"/.test(htmlSrc) && /data-i18n-ph="ph\.treeFilter"/.test(htmlSrc) && /filterEl\.addEventListener\("input", \(\) => setTreeQuery\(filterEl\.value\)\)/.test(mainSrcText) && /function setTreeQuery\(q: string\)/.test(mainSrcText), "树搜索框接线：输入即过滤（不动文档与选中）");
+  check(/id="ed-filter-clear"/.test(htmlSrc) && /filterClearEl\.hidden = !q;/.test(mainSrcText) && /filterClearEl\.onclick = \(\) => \{/.test(mainSrcText) && /if \(e\.key !== "Escape"\) return;/.test(mainSrcText), "清空按钮：有搜索串才显示，点 ✕ 或按 Esc 都能清空");
+  check(/id="tree-collapse"/.test(htmlSrc) && /id="tree-expand"/.test(htmlSrc) && /data-tools="layers"/.test(htmlSrc) && /treeCollapseEl\.onclick = \(\) => setAllCollapsed\(true\);/.test(mainSrcText) && /treeExpandEl\.onclick = \(\) => setAllCollapsed\(false\);/.test(mainSrcText) && /function setAllCollapsed\(all: boolean\)/.test(mainSrcText), "展开 / 折叠全部：整棵树一次性处理，按钮挂在图层面板自己的工具条上");
+  check(/id="tree-isolate"/.test(htmlSrc) && /treeIsolateEl\.onclick = \(\) => toggleIsolate\(\);/.test(mainSrcText) && /function toggleIsolate\(\)/.test(mainSrcText) && /treeIsolateEl\.classList\.toggle\("is-on", isolateIds\.size > 0\)/.test(mainSrcText), "图层 isolate：按钮有开关态，再点一次恢复");
+  check(/const isolateIds = new Set<string>\(\);/.test(mainSrcText) && /if \(isolateIds\.size\) \{\s*const v = treeIsolateView\(entries, \[\.\.\.isolateIds\]\);/.test(mainSrcText) && /syncPanelTools\(\$\("#ed-layers"\), panelTabs\.left\.current\(\)\);/.test(mainSrcText), "隔离状态是页面级视图状态（不进文档）；面板工具条补一次初始同步，避免错档显示");
+  check(/if \(!view\.visible\.size && view\.filtering\) \{\s*treeEl\.appendChild\(note\(et\("tree\.searchNone"\)\)\);/.test(mainSrcText) && /et\("tree\.count", \{ n: view\.visible\.size, total: doc\.objectCount \}\)/.test(mainSrcText) && /if \(match\) row\.classList\.add\("match"\);/.test(mainSrcText), "计数改成「可见 / 总数」，无匹配时给提示，命中行加 .match 高亮");
+  check(/\(view\.filtering \|\| !collapsed\.has\(n\.id\)\)/.test(mainSrcText) && /\.ed-node\.match \.ed-node-name \{/.test(cssSrc), "过滤中忽略折叠状态（否则命中项看不见）；命中高亮有配套样式");
+  check(/function renderTree\(\) \{\s*syncLayerTools\(\);/.test(mainSrcText) && /if \(!doc\) \{\s*treeEl\.appendChild\(note\(et\("layers\.none"\)\)\);/.test(mainSrcText), "树渲染原有分支（无文档 / 非场景）保持不动");
+}
+
+section("LOCK-2. 锁定切换入撤销栈（A9）");
+{
+  check(/function setLockedEdit\(node: LayerNode, on: boolean\)/.test(mainSrcText) && /const verb = et\(on \? "log\.locked" : "log\.unlocked", \{ name: nodeName\(node\.id\) \}\);/.test(mainSrcText), "锁定切换先取好文案（锁定 / 解锁），再走编辑原语");
+  check(/if \(isLockedObj\(o\) === on\) return false;\s*setLocked\(o, on\);\s*return true;/.test(mainSrcText), "★ mutate 幂等：期望值在点击时固定，撤销 / 重做带着快照重跑也不会翻回去");
+  check(/objEdit\(verb, node\.id, \(o\) => \{/.test(mainSrcText) && /setLockedEdit\(n, !isLocked\(n\.id\)\);/.test(mainSrcText), "改用 objEdit：锁定进撤销栈（历史上唯一的直接改文档写操作补齐）");
+  check(/isLockedObj\(o\) === on/.test(mainSrcText) && !/setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(mainSrcText), "树行锁定按钮不再绕开 history 直接写文档");
+  check(/objEdit\(verb, node\.id/.test(mainSrcText) && /log\.locked/.test(i18nSrc) && /log\.unlocked/.test(i18nSrc), "锁定 / 解锁都有日志文案（zh + en）");
+}
+
+section("CLIPBOARD. 图层剪贴板序列化 / 跨文档粘贴（A10）");
+{
+  const C = clipboardMod;
+  const mkScene = (objects, type = "scene") =>
+    docMod.makeDoc("t", null, { general: {}, objects: typeof objects === "function" ? objects() : objects }, type);
+  const srcObjs = () => [
+    { id: 1, text: "a", origin: "0 0 0" },
+    { id: 2, text: "g", origin: "50 20 0", scale: "2 2 1" },
+    { id: 3, text: "b", parent: 2, origin: "10 5 0" },
+    { id: 4, text: "c", parent: 3, origin: "1 1 0" },
+    { id: 5, text: "d", origin: "700 500 0" },
+  ];
+  const clip = C.serializeLayerClip(srcObjs(), [2]);
+  check(clip && clip.format === C.LAYER_CLIP_FORMAT && clip.version === C.LAYER_CLIP_VERSION && clip.objs.length === 3, "序列化：选中组 → 含自身与整棵子树（3 条）");
+  check(json(clip.objs.map((e) => e.id)) === json(["2", "3", "4"]) && clip.objs[0].parent === null && clip.objs[1].parent === "2" && clip.objs[2].parent === "3", "载荷里父子关系按 id 字符串保留，顶层父级记 null");
+  check(C.serializeLayerClip(srcObjs(), []) === null && C.serializeLayerClip(srcObjs(), [999]) === null, "没有可复制对象时返回 null（不产生空载荷）");
+  const round = C.parseLayerClip(JSON.parse(C.stringifyLayerClip(clip)));
+  check(round && round.objs.length === 3 && C.parseLayerClip("not json") === null && C.parseLayerClip({ format: "other" }) === null && C.parseLayerClip(null) === null, "★ 往返解析：JSON 字符串能还原；脏数据 / 别的格式一律 null（localStorage 里的旧载荷不会写坏文档）");
+  check(C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 99, objs: [] }) === null && C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "x", parent: null }] }) === null, "格式对但版本不对、条目缺字段：一律丢弃");
+
+  // 跨文档粘贴：目标文档 id 与来源相同，粘贴后必须全部重编号且不冲突
+  const destObjs = () => [
+    { id: 1, text: "x", origin: "0 0 0" },
+    { id: 2, text: "y", origin: "10 10 0" },
+    { id: 7, text: "z", origin: "20 20 0" },
+  ];
+  const dest = mkScene(destObjs);
+  const added = C.pasteLayerClip(dest, clip, [0, 0]);
+  const byId = (o, id) => o.find((x) => String(x.id) === String(id));
+  const destAfter = dest.scene.objects;
+  check(json(added) === json([8, 9, 10]) && json(destAfter.map((o) => o.id)) === json([1, 2, 7, 8, 9, 10]), "★ 粘贴重新分配 id：从目标文档现有最大 id + 1 起（7 → 8,9,10），不与已有对象冲突");
+  check(byId(destAfter, 9).parent === 8 && byId(destAfter, 10).parent === 9 && byId(destAfter, 8).parent === undefined, "★ 父子关系按重编号后的新 id 接上，顶层不写 parent");
+  const destW = new Map(
+    parseMod
+      .parseScene({ general: {}, objects: structuredClone(destAfter) }, { type: "scene" })
+      .layers.map((l) => [l.id, [l.origin[0], l.origin[1]]]),
+  );
+  check(byId(destAfter, 8).scale === "2 2 1" && byId(destAfter, 9).origin === "10 5 0" && byId(destAfter, 10).origin === "1 1 0", "粘贴保留各自的局部变换（相对新父级仍是原值），整棵子树相对关系不变");
+  check(destW.has(8) && destW.has(9) && destW.has(10), "★ 引擎 parseScene 能接住粘贴结果（重编号后仍是一棵合法树）");
+  const dest3 = mkScene(destObjs);
+  const added3 = C.pasteLayerClip(dest3, clip, [16, -16]);
+  check(json(added3) === json([8, 9, 10]) && dest3.scene.objects.length === 6, "带偏移粘贴：id 分配与不带偏移一致");
+  const dest4 = mkScene(destObjs);
+  const before4 = JSON.stringify(dest4.scene.objects);
+  const badParent = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: "404", obj: { text: "p" } }] });
+  check(json(C.pasteLayerClip(dest4, badParent, [0, 0])) === json([]) && JSON.stringify(dest4.scene.objects) === before4, "★ 父级在目标和载荷里都不存在：整条不粘，文档原样不动");
+  const dup = C.parseLayerClip({
+    format: C.LAYER_CLIP_FORMAT,
+    version: 1,
+    objs: [
+      { id: "1", parent: null, obj: { text: "p" } },
+      { id: "1", parent: null, obj: { text: "q" } },
+    ],
+  });
+  const dest5 = mkScene(destObjs);
+  const before5 = JSON.stringify(dest5.scene.objects);
+  check(json(C.pasteLayerClip(dest5, dup, [0, 0])) === json([]) && JSON.stringify(dest5.scene.objects) === before5, "载荷内 id 自身重复：拒绝，文档原样");
+  const collide = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: null, obj: { text: "p" } }] });
+  const dest6 = mkScene(destObjs);
+  const added6 = C.pasteLayerClip(dest6, collide, [0, 0]);
+  check(json(added6) === json([8]) && dest6.scene.objects.length === 4 && byId(dest6.scene.objects, 1).text === "x", "载荷 id 与目标文档已有 id 同名：不是错误（id 是文档局部的），照常重新编号");
+  const empty = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{}] });
+  check(empty === null, "条目缺 obj / id 字段：解析就丢掉");
+  const noScene = docMod.makeDoc("v", { type: "video" }, null, "video");
+  check(noScene.type === "video" && json(C.pasteLayerClip(noScene, clip, [0, 0])) === json([]), "目标不是场景文档：不粘");
+
+  check(/import \{ load, save \} from "\.\.\/shared\/workbench\/storage";/.test(mainSrcText) && /save\(LAYER_CLIP_KEY, stringifyLayerClip\(clip\)\)/.test(mainSrcText) && /const raw = load\(LAYER_CLIP_KEY\);/.test(mainSrcText), "剪贴板：内存优先 + localStorage 兜底（跨标签页 / 刷新后仍能粘贴）");
+  check(/function readClipboard\(\): LayerClip \| null \{\s*if \(layerClip\) return layerClip;/.test(mainSrcText) && /layerClip = raw \? parseLayerClip\(raw\) : null;/.test(mainSrcText), "读：先内存，miss 才读 localStorage，且一律过 parseLayerClip 校验");
+  check(/\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "c"\) \{\s*if \(!copySelected\(\)\) return;/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "x"\) \{\s*if \(!cutSelected\(\)\) return;/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "v"\) \{\s*if \(!pasteClipboard\(\)\) return;/.test(mainSrcText), "⌘/Ctrl+C / X / V 接内建链（命令服务没接住才轮到，与关键帧剪贴板按钮不冲突）");
+  check(/function copySelected\(\): boolean \{[\s\S]{0,900}?serializeLayerClip\(/.test(mainSrcText) && /function cutSelected\(\): boolean \{\s*if \(!copySelected\(\)\) return false;\s*const n = selectionNodes\(\)\.length;\s*deleteSelected\(\);/.test(mainSrcText), "复制走序列化；剪切 = 复制 + deleteSelected（删除自己进撤销栈）");
+  check(/structEdit\(et\("log\.layerPasted", \{ n: clip\.objs\.length \}\), \(d\) => \{[\s\S]{0,300}?pasteLayerClip\(d, clip, \[PASTE_OFFSET, -PASTE_OFFSET\]\)/.test(mainSrcText) && /selectMany\(added\[0\], added\.slice\(1\)\);/.test(mainSrcText), "粘贴走 structEdit（一步撤销），粘完选中新层（全部进追加选区）");
+  check(/const PASTE_OFFSET = 16;/.test(mainSrcText) && /function clipboardSource\(\)/.test(mainSrcText), "粘贴偏移常量 + 复制来源校验（必须是有编辑器的场景文档）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
