@@ -6344,8 +6344,8 @@ const builtinUiPlugin = {
     for (const g of BUILTIN_INSPECTOR) ctx.contribute("inspector", g);
     for (const t of BUILTIN_PUPPET_TOOLS) ctx.contribute("puppet.tools", t);
     ctx.contribute("exporters", VIDEO_EXPORTER);
-    const cmds = ctx.get("commands").registry;
-    const cmd = (c: Parameters<typeof cmds.add>[0]) => ctx.effect(() => cmds.add(c, ctx.name));
+    const cmds = ctx.get("commands");
+    const cmd = (c: Parameters<typeof cmds.register>[0]) => ctx.effect(() => cmds.register(c, ctx.name));
     cmd({ id: "edit.undo", keys: "Mod+Z", run: () => undoRedo("undo") });
     cmd({ id: "edit.redo", keys: ["Mod+Shift+Z", "Mod+Y"], run: () => undoRedo("redo") });
     cmd({ id: "file.save", keys: "Mod+S", run: () => void saveDocument() });
@@ -6383,9 +6383,14 @@ async function bootPlugins() {
       },
       engine: { controls: () => editor, remount: () => void mountCurrent(true) },
     },
-    { onError: (s, e, where) => reportPluginError(s.name, e, where) },
+    {
+      // 内置 UI 插件（检视器分组 / 木偶工具 / 视频导出 / 快捷键命令）也走 catalog + profile：
+      // 与其它内置插件同一条装配路径，profile 里可按名字 disable 或替换实现
+      catalog: { "builtin-ui": builtinUiPlugin },
+      profile: { plugins: [{ name: "builtin-ui" }] },
+      onError: (s, e, where) => reportPluginError(s.name, e, where),
+    },
   );
-  app.plugin(builtinUiPlugin);
   const ui = app.ui;
   const pluginToolsEl = $<HTMLElement>("#ed-plugin-tools");
   const syncPluginTools = () => (pluginToolsEl.hidden = !ui.items("toolbar").length);

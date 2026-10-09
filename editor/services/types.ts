@@ -72,6 +72,8 @@ export type CommandDef = {
 
 export interface CommandService {
   readonly registry: Registry<CommandDef>;
+  /** 注册一条命令（内置与插件走同一条路）；返回撤销函数，owner 用于查归属与随插件卸载撤回 */
+  register(def: CommandDef, owner?: string): Disposer;
   exec(id: string, ...args: unknown[]): unknown;
   /** 键盘事件 → 命中的命令执行（返回是否已处理） */
   handleKey(e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">): boolean;
