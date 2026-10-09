@@ -433,6 +433,19 @@ import {
   virtualIdOf,
   type VdirRecord,
 } from "./vdir";
+import {
+  DRAFT_THROTTLE_MS,
+  applyDraft,
+  autosaveTargetFor,
+  draftSlotFor,
+  makeDraft,
+  snapshotDue,
+  vdirDraftStore,
+  type AutosaveTarget,
+  type Draft,
+  type DraftOrigin,
+  type DraftSlotInfo,
+} from "./draft";
 import { mountVideoStage, videoProjectJson } from "./video-project";
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -483,6 +496,11 @@ const draftBannerEl = $<HTMLElement>("#ed-draft");
 const draftTextEl = $<HTMLElement>("#ed-draft-text");
 const draftRestoreEl = $<HTMLButtonElement>("#draft-restore");
 const draftDiscardEl = $<HTMLButtonElement>("#draft-discard");
+// 未保存编辑的草稿横幅（#ed-draft-recover）：与上面那条「重开目录」语义分开（计划 §2 C3）
+const draftRecoverEl = $<HTMLElement>("#ed-draft-recover");
+const draftRecoverTextEl = $<HTMLElement>("#ed-draft-recover-text");
+const draftRecoverRestoreEl = $<HTMLButtonElement>("#draft-recover-restore");
+const draftRecoverDiscardEl = $<HTMLButtonElement>("#draft-recover-discard");
 // 内置工程列表
 const vdirDlgEl = $<HTMLDialogElement>("#vdir-dlg");
 const vdirListEl = $<HTMLElement>("#vdir-list");
@@ -628,7 +646,7 @@ const SCRIPTS_OVERRIDE = scriptsOverrideFrom(location.search);
 let scriptsAllowed = true;
 /** 当前文档的资源表（原始来源 + 页面新增素材）；非场景 / 取不到场景资源时为 null */
 let overlay: OverlayAssets | null = null;
-/** 草稿来源；null = 本地文件 / 目录（刷新后 File 句柄失效，不做草稿） */
+/** 打开来源；null = 还没打开文档。草稿的来源另见 {@link draftOriginFor}（本地文件句柄失效也能从快照恢复） */
 let origin: { kind: ContentKind } | null = null;
 
 function destroyInstance() {
@@ -1283,6 +1301,18 @@ let saving = false;
 let saveAgain = false;
 let saveTimer = 0;
 const AUTOSAVE_MS = 400;
+/** 未保存编辑的快照（计划 §2 C3）：与虚拟工程共用同一存储域，槽按工程标识分 */
+const draftStore = vdirDraftStore();
+/** 上次快照时间（{@link DRAFT_THROTTLE_MS} 节流）；0 = 本次会话还没存过 */
+let draftWrittenAt = 0;
+/** 本次会话自己写过的槽；只有它才允许被自动清掉（上一次会话留下的快照不碰，可能只有那一份） */
+let lastDraftSlot: string | null = null;
+/** 启动时发现、等用户点「恢复」的快照 */
+let pendingDraft: { slot: string; draft: Draft } | null = null;
+/** 工程文件夹可写性：null = 还没探测，false = 不可写（自动保存退到草稿槽，见 autosaveTargetFor） */
+let dirWritable: boolean | null = null;
+/** 已经为哪个文档提示过「没有可保存内容」，同一次打开只提示一次 */
+let warnedNoSaveFor: EditorDoc | null = null;
 /** 已写出内容的签名，没变的文件跳过 */
 const writtenSig = new Map<string, string>();
 /** 本次会话写出过的路径；不再引用时从项目文件夹删掉 */
@@ -1303,16 +1333,37 @@ function adoptProject(dir: DirHandle) {
   saveAgain = false;
   clearTimeout(saveTimer);
   saveTimer = 0;
+  probeDirWritable(dir);
 }
 
 /** 库条目不落盘：解绑上一个文档的项目文件夹，免得自动保存把它写进别的工程 */
 function releaseProject() {
   projectDir = null;
+  dirWritable = null;
   writtenSig.clear();
   ownedPaths.clear();
   saveAgain = false;
   clearTimeout(saveTimer);
   saveTimer = 0;
+}
+
+/**
+ * 探一次工程文件夹能不能写（计划 §2 C6「不可写就不写并明确提示」）。
+ * 刚挂上的工程先按可写算，探到不可写才退到草稿槽 —— 只提示一次，不每 400ms 撞同一堵墙。
+ */
+function probeDirWritable(dir: DirHandle) {
+  dirWritable = null;
+  void probeWritable(dir).then(
+    () => {
+      if (projectDir === dir) dirWritable = true;
+    },
+    (e: unknown) => {
+      if (projectDir !== dir) return;
+      dirWritable = false;
+      log(et("log.dirNotWritable", { name: dir.name, msg: (e as Error).name || (e as Error).message }), "warn");
+      scheduleAutosave();
+    },
+  );
 }
 
 /** ⌘S：已有项目文件夹就写回；库条目等没绑文件夹的文档先选文件夹另存为项目 */
@@ -1323,6 +1374,8 @@ async function saveDocument() {
     log(et("log.cannotSaveKind", { kind: doc.type }), "warn");
     return;
   }
+  // 另存为项目后文件夹就是权威副本，原来那条草稿（库条目 / 会话）不再需要
+  const prevSlot = currentDraftSlot();
   const dir = await requireProjectDir();
   if (!dir || !doc) return;
   adoptProject(dir);
@@ -1330,6 +1383,7 @@ async function saveDocument() {
   syncLibraryItem();
   log(et("log.savedAsProject", { name: dir.name }));
   await flushAutosave();
+  clearOwnDraftSlot(prevSlot);
 }
 
 /**
@@ -1337,6 +1391,53 @@ async function saveDocument() {
  * （网页工程没有场景文档 —— 工程本体就是那堆站点文件，保存时原样搬）
  */
 const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets) || (doc?.type === "web" && !!current?.assets);
+
+/** 当前文档的草稿槽：虚拟工程按 id、库条目按 itemId、本地文件夹按名字，都没有就是会话槽 */
+function currentDraftSlot(): string {
+  const vdirId = projectDir ? virtualIdOf(projectDir) : null;
+  return draftSlotFor({
+    vdirId,
+    libraryItemId: libItem?.itemId ?? null,
+    localName: projectDir && !vdirId ? projectDir.name : null,
+  });
+}
+
+/** 自动保存该往哪写：文件夹 / 草稿槽 / 不写（计划 §2 C6；判定本身在 editor/draft.ts） */
+const autosaveTarget = (): AutosaveTarget =>
+  autosaveTargetFor({
+    savable: canSave(),
+    hasDir: !!projectDir && dirWritable !== false,
+    // 快照只装得下场景文档（视频 / 网页的原始文件不在快照里），装不下就别假装存了
+    draftable: !!doc?.scene,
+    slot: currentDraftSlot(),
+  });
+
+/** 草稿的来源：决定重开时按哪条路把原始资源找回来 */
+function draftOriginFor(): DraftOrigin {
+  const vdirId = projectDir ? virtualIdOf(projectDir) : null;
+  if (vdirId) return { kind: "virtual", id: vdirId };
+  if (libItem) return { kind: "library", itemId: libItem.itemId };
+  if (projectDir) return { kind: "local", name: projectDir.name };
+  return { kind: "new" };
+}
+
+/** 没有可保存内容时明确提示一次（不写，也不静默） */
+function warnNoAutosaveTarget() {
+  if (!doc || warnedNoSaveFor === doc) return;
+  warnedNoSaveFor = doc;
+  log(et("log.cannotSaveKind", { kind: doc.type }), "warn");
+}
+
+/**
+ * 内容已经落到工程文件夹后，把本次会话写过的草稿副本清掉。
+ * 只清 {@link lastDraftSlot} —— 上一次会话留下的快照不动：同名的两个文件夹会撞同一个槽，
+ * 那份快照可能是它唯一的副本（要清让用户自己点横幅上的「丢弃」）。
+ */
+function clearOwnDraftSlot(slot: string = currentDraftSlot()) {
+  if (!slot || lastDraftSlot !== slot) return;
+  lastDraftSlot = null;
+  void draftStore.clear(slot).catch((e: unknown) => log(et("log.draftFailed", { msg: (e as Error).message }), "warn"));
+}
 
 /**
  * 把当前工程整份写进用户选的本机文件夹，之后的自动保存改到那里。
@@ -1350,11 +1451,14 @@ async function saveProjectToLocalDir() {
   }
   const dir = await requireLocalDir();
   if (!dir) return;
+  // 落到本机文件夹后，虚拟工程 / 库条目那条草稿就作废了
+  const prevSlot = currentDraftSlot();
   adoptProject(dir);
   libItem = null;
   syncLibraryItem();
   log(et("log.savedToDir", { name: dir.name }));
   await flushAutosave();
+  clearOwnDraftSlot(prevSlot);
 }
 
 async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> {
@@ -1571,16 +1675,54 @@ async function capturePreview(): Promise<Blob | null> {
   }
 }
 
+/**
+ * 编辑防抖（400ms）后的自动保存。目标是算出来的，不是「有文件夹才存」：
+ * 有可写工程文件夹就写文件夹，没有就写草稿槽（计划 §2 C6 放宽），
+ * 连内容都没有才不写 —— 此时明确提示一次。
+ */
 function scheduleAutosave() {
-  if (!projectDir || !canSave()) return;
+  const target = autosaveTarget();
+  if (target === "none") {
+    warnNoAutosaveTarget();
+    return;
+  }
   clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
     if (mounting) {
       scheduleAutosave();
       return;
     }
-    void flushAutosave();
+    if (target === "draft") void flushDraftSnapshot();
+    else void flushAutosave();
   }, AUTOSAVE_MS);
+}
+
+/**
+ * 未保存编辑的快照（计划 §2 C3）：写进与虚拟工程同一存储域的草稿槽。
+ * 除编辑防抖外再按 DRAFT_THROTTLE_MS 节流，拖拽长按时不做无谓的整份序列化。
+ */
+async function flushDraftSnapshot(force = false) {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  const snap = doc;
+  if (!snap || !canSave()) return;
+  const now = Date.now();
+  if (!force && !snapshotDue(draftWrittenAt, now)) {
+    // 节流窗口内还有编辑：等窗口过了再写一次（不丢最后一次改动）
+    saveTimer = window.setTimeout(() => void flushDraftSnapshot(), draftWrittenAt + DRAFT_THROTTLE_MS - now);
+    return;
+  }
+  const slot = currentDraftSlot();
+  if (!slot) return;
+  const d = makeDraft(snap, draftOriginFor(), overlay?.entry ?? "scene.json", overlay?.added() ?? [], now);
+  if (!d) return;
+  draftWrittenAt = now;
+  try {
+    await draftStore.save(d, slot);
+    lastDraftSlot = slot;
+  } catch (e) {
+    log(et("log.draftFailed", { msg: (e as Error).message }), "warn");
+  }
 }
 
 /**
@@ -1632,6 +1774,8 @@ async function flushAutosave() {
       log(et("log.autosaved", { name: dir.name }));
       log(et("log.saveTook", { s: ((performance.now() - t0) / 1000).toFixed(1) }));
       await syncVirtualDirName(dir);
+      // 内容已经落到文件夹里，这个文档的草稿副本就没有意义了
+      clearOwnDraftSlot();
     }
   } catch (e) {
     log(et("log.saveFailed", { msg: (e as Error).message }), "error");
@@ -1643,6 +1787,12 @@ async function flushAutosave() {
       scheduleAutosave();
     }
   }
+}
+
+/** 立刻落盘（页面隐藏 / 卸载前）：有可写文件夹写文件夹，否则按草稿槽来（草稿不吃节流） */
+function flushPendingSave() {
+  if (autosaveTarget() === "draft") void flushDraftSnapshot(true);
+  else void flushAutosave();
 }
 
 /**
@@ -3400,6 +3550,146 @@ async function resumeVirtualProject(rec: VdirRecord) {
   }
 }
 
+// ---------- 未保存编辑的找回（计划 §2 C3） ----------
+
+/** 关掉未保存草稿横幅 */
+function hideDraftRecover() {
+  draftRecoverEl.hidden = true;
+  pendingDraft = null;
+}
+
+/**
+ * 把快照套回当前文档：草稿 → 重开 → 逐字段一致（判据见 scripts/verify-editor.mjs 的 DRAFT-2）。
+ * 调用点都在 openWith 的 after 里（首次挂载之前），所以这里不再自己 mount。
+ */
+function applyDraftSnapshot(d: Draft) {
+  const target = doc;
+  if (!target) return;
+  applyDraft(target, d);
+  // 快照里的叠加层文件：第一个用 put，其余 share 到同一组（和旧的还原路径口径一致）
+  const groups = new Map<string, string>();
+  for (const f of d.files) {
+    const g = Array.isArray(f.group) ? f.group[0] : f.group;
+    if (!g) {
+      overlay?.put(f.name, f.data);
+      continue;
+    }
+    const owner = groups.get(g);
+    if (!owner) {
+      overlay?.put(f.name, f.data, g);
+      groups.set(g, f.name);
+    } else overlay?.share(owner, f.name);
+  }
+  docDriven = true;
+  markDirty();
+  log(et("log.draftRestored", { title: d.title }));
+}
+
+/**
+ * 启动时查草稿：最新的那槽能用就用它；带 ?item=<库条目> 时只认这一条的草稿。
+ * 与「重开上次的目录」那条横幅互不顶替（同一个内置工程也可能有未保存编辑，两条都提示，
+ * 尺寸见 editor.css：同时出现时上下排开），所以这里不看另一条横幅的 DOM 状态。
+ */
+async function checkDraftRecovery() {
+  let slots: DraftSlotInfo[] = [];
+  try {
+    slots = await draftStore.list();
+  } catch (e) {
+    log(et("log.draftFailed", { msg: (e as Error).message }), "warn");
+    return;
+  }
+  if (!slots.length) return;
+  const item = new URL(location.href).searchParams.get("item");
+  for (const info of slots) {
+    const d = await draftStore.load(info.slot);
+    if (!d) continue;
+    if (item && (d.origin.kind !== "library" || d.origin.itemId !== item)) continue;
+    pendingDraft = { slot: info.slot, draft: d };
+    draftRecoverTextEl.textContent = et("draft.unsavedFound", {
+      title: d.title,
+      time: new Date(d.savedAt).toLocaleString(),
+    });
+    draftRecoverEl.hidden = false;
+    return;
+  }
+}
+
+/** 点「恢复」：按来源把原始资源重开回来，再把快照套上去 */
+async function restoreDraft(pending: { slot: string; draft: Draft }) {
+  hideDraftRecover();
+  const d = pending.draft;
+  const from = d.origin;
+  const apply = () => applyDraftSnapshot(d);
+  if (from.kind === "library") {
+    const id = from.itemId;
+    const fetched = await fetchLibrary().catch(() => null);
+    const it = libraryPanel.find(id) ?? fetched?.items.find((x) => x.itemId === id);
+    if (!it) {
+      log(et("log.draftMissing", { id }), "error");
+      return;
+    }
+    await openWith(d.title, () => openLibraryItem(it, MEDIA_BASE, WEB_BASE), {
+      origin: { kind: "library" },
+      library: it,
+      after: apply,
+    });
+    return;
+  }
+  if (from.kind === "virtual") {
+    const dir = await openVirtualProject(from.id).catch(() => null);
+    if (!dir) {
+      log(et("log.vdirMissing", { name: d.title }), "warn");
+      return;
+    }
+    const files = await filesFromDirectory(dir).catch(() => []);
+    adoptProject(dir);
+    // 目录还在就按目录重开；目录空了（存储被清过）快照就是唯一副本，按它重建，
+    // adopt 回原目录后自动保存会把这份工程重新写回去。
+    await openWith(
+      d.title,
+      async () => (files.length ? openLocalFiles(files) : newOpened(d.title, d.project ?? newProject(d.title), d.scene)),
+      { origin: { kind: "local" }, docDriven: !files.length, after: apply },
+    );
+    log(et("log.vdirResumed", { name: dir.name }));
+    return;
+  }
+  // 会话内 / 本地文件夹：来源文件已经不可及（句柄失效），按快照在内存里重建；
+  // origin 照旧，脚本放行策略不因为「恢复草稿」被放宽
+  releaseProject();
+  await openWith(d.title, async () => newOpened(d.title, d.project ?? newProject(d.title), d.scene), {
+    origin: { kind: from.kind === "local" ? "local" : "new" },
+    docDriven: true,
+    after: apply,
+  });
+  // 重建后这个文档没有文件夹 / 库条目了，槽会从 local: / 原来那槽挪到会话槽：
+  // 先把快照落到新槽、再清旧槽（顺序反了会有一次「清完还没写」的窗口），
+  // 否则旧槽留着下次启动还会再冒出来一条。
+  const nowSlot = currentDraftSlot();
+  if (nowSlot !== pending.slot) {
+    try {
+      await draftStore.save(d, nowSlot);
+      draftWrittenAt = Date.now();
+      lastDraftSlot = nowSlot;
+      await draftStore.clear(pending.slot);
+    } catch (e) {
+      log(et("log.draftFailed", { msg: (e as Error).message }), "warn");
+    }
+  }
+}
+
+draftRecoverRestoreEl.onclick = () => {
+  const p = pendingDraft;
+  hideDraftRecover();
+  if (p) void restoreDraft(p);
+};
+draftRecoverDiscardEl.onclick = () => {
+  const p = pendingDraft;
+  hideDraftRecover();
+  if (!p) return;
+  if (lastDraftSlot === p.slot) lastDraftSlot = null;
+  void draftStore.clear(p.slot).catch((e: unknown) => log(et("log.draftFailed", { msg: (e as Error).message }), "warn"));
+};
+
 // 「打开 .pkg」已收进「打开」对话框（见 pickVirtualProject），这里不再有独立的工具条按钮
 $<HTMLButtonElement>("#tb-open-dir").onclick = () =>
   void (async () => {
@@ -3492,7 +3782,7 @@ window.addEventListener("drop", (e) => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") void flushAutosave();
+  if (document.visibilityState === "hidden") flushPendingSave();
 });
 
 // ---------- 新建（模板）/ 图片成层 ----------
@@ -8224,3 +8514,5 @@ void (async () => {
 })();
 // 内置浏览器里刷新 / 重开后，提示上次的工程还在（有 ?item= 时按库条目走，不提示）
 void checkVirtualResume();
+// 再看有没有未保存编辑的快照（计划 §2 C3）：两条横幅各有各的 DOM 与文案，互不顶替
+void checkDraftRecovery();
