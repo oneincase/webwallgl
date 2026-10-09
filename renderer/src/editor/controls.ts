@@ -39,5 +39,37 @@ export function editorOf(instance: SceneInstance): EditorControls | null {
     getScriptIssues: () => rt.sceneCtl?.editor?.getScriptIssues() ?? [],
     getSkippedScripts: () => rt.sceneCtl?.editor?.getSkippedScripts() ?? 0,
     declareUserProperties: (decls) => cur().declareUserProperties(decls),
+    // M12：以下都转发到**当前装配代**（不缓存旧代）。id 为 number|string，引擎内部
+    // 按数字 id 查表，这里统一转数字（取不到有效数字就当 null = 无目标）。
+    setOverlayMode: (mode) => cur().setOverlayMode(mode),
+    getOverlayMode: () => rt.sceneCtl?.editor?.getOverlayMode() ?? "2d",
+    setOverlayTarget: (id) => cur().setOverlayTarget(numOrNull(id)),
+    getOverlayStats: () =>
+      rt.sceneCtl?.editor?.getOverlayStats() ?? {
+        mode: "2d",
+        target: null,
+        segments: 0,
+        draws: 0,
+        glOk: false,
+        reason: "no-editor",
+      },
+    canHotAddLayer: (spec) => rt.sceneCtl?.editor?.canHotAddLayer(spec) ?? { ok: false, reason: "no-editor" },
+    addLayer: (spec) => cur().addLayer(spec),
+    removeLayer: (id) => cur().removeLayer(asEngineId(id)),
+    reorderLayer: (id, toIndex) => cur().reorderLayer(asEngineId(id), toIndex),
+    setLayerScript: (id, target, code) => cur().setLayerScript(asEngineId(id), target, code),
   };
+}
+
+/** number|string|null → number（非法输入回 null，交由引擎按「无目标」处理） */
+function numOrNull(id: number | string | null): number | null {
+  if (id === null || id === undefined) return null;
+  const n = Number(id);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 需要数字 id 的入口统一走这里：能转数字就转，否则原样传（引擎按 String 比对） */
+function asEngineId(id: number | string): number | string {
+  const n = numOrNull(id);
+  return n === null ? id : n;
 }
