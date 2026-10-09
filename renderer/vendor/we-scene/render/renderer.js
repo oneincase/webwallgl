@@ -3189,7 +3189,11 @@ export function createRenderer(canvas, opts = {}) {
     // 天空盒兜底：材质没声明 depthtest/depthwrite 时（ricepod 的 skybox.json 声明了，
     // 但工件里存在不声明的），天空盒一律不写深度 —— 它包着相机，写深度会把全场拒掉。
     const isSkybox = !!layer.isSkybox
-    const useDepth = !!(cam && cam.perspective)
+    // [we-scene patch 2026-10-08] 2D 场景里的**真 3D 网格**层（材质显式声明 depthtest:"enabled"，
+    // 宿主标成 layer.depthMesh）也要深度测试：理由见 drawPuppetDirect 的 keepZ 注释。
+    // 判据是「显式 enabled」而不是 F40 的 `!== "disabled"` —— 2D 场景里未声明深度的层很多，
+    // 放宽会让它们按无意义的建模残留 z 重排层间遮挡。天空盒照旧排除。
+    const useDepth = !!(cam && cam.perspective) || (!!layer.depthMesh && !isSkybox)
     let curProgKey = null
     let curEntry = null
     const bindForSpec = (spec, ent) => {
@@ -3420,7 +3424,14 @@ export function createRenderer(canvas, opts = {}) {
       // （3737267090 人物 z∈[111,435]），放过去会按深度被别的层挡住；而透视场景里的
       // 真 3D 网格（三体的天空盒/恒星/地球）必须保留 z，否则球体被压平在相机平面上
       // 退化成一条边（天空盒只剩一条细缝、整屏近黑）。
-      keepZ: !!(cam && cam.perspective),
+      //
+      // [we-scene patch 2026-10-08] **材质显式声明 depthtest:"enabled" 的层例外**：它们不是
+      // 2D 精灵，而是**为 2D 场景准备的真 3D 网格**（宿主解析材质后标 layer.depthMesh，见
+      // scene-mount 的 puppet / model 两条装配分支）。这类网格的局部坐标已经按像素量好摆好，
+      // z 就是真实的模型厚度、不是建模残留；把 z 压平后深度测试整个不参与，自遮挡退化成
+      // 「按三角形顺序画」：导入的 OBJ 会看到头套盖住脸、手臂/黑上衣/鞋被自己朝后的那半边
+      // 糊掉（用户报的「渲染出来和原型有差距」就是这个）。天空盒仍然排除（见上面的兜底）。
+      keepZ: !!(cam && cam.perspective) || (!!layer.depthMesh && !layer.isSkybox),
       // [we-scene patch 2026-10-05] 世界眼点（场景距离雾按到它的距离算；只有透视场景有意义）
       eye: cam && cam.perspective && cam.eye ? cam.eye : null,
       // [we-scene patch 2026-10-04] 天空盒：帧内深度共享后（F49），它的近侧壳会把

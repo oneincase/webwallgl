@@ -74,6 +74,39 @@ import { encodeTexVideo, mp4Size } from "../vendor/we-scene/pkg/tex-write.js";
  */
 const SCENE_LIGHT_K = 0.4;
 
+/**
+ * [we-scene patch 2026-10-09] 编辑器导入的 3D 网格在**无灯场景**里的默认主光。
+ *
+ * 为什么需要：模型里有一类特征**只有形体、没有独立反照率** —— 二次元手办的鼻子/嘴
+ * 是和皮肤同色的几何折面，卡通角色的腮/衣褶同理。纯反照率（u_lightOn=0 → mul≡1）
+ * 下这些特征完全不显形，用户看到的正是「人物的鼻子和嘴巴没渲染出来」。WE 自家的
+ * 3D 素材靠场景里的 `light:ldirectional` 对象照亮，而 2D 壁纸**可以一个灯都没有**
+ * （实测 3444535389 有 0 个 light 图层），导入的模型就退化成平涂贴纸。
+ *
+ * 数值口径：与作者素材标定出的 look 同族（受光面 ≈ 反照率 ×1.2、背光面 = ambientcolor），
+ * 但**不用场景 ambientcolor** —— 它常常是 0.3（本机 348 张 2D 壁纸多为 0.3），直接当
+ * 环境项会把模型整体压暗 70%（3737267090「整体太黑」就是这条）。这里取
+ * base 0.68 / add 0.52、光向从**左上前方**来：正对相机的脸 ≈ 1.08×（与无光照时基本同亮），
+ * 背光面 ≈ 0.68×，于是明暗差刚好把鼻梁/唇缝这类细折面画出来，又不改变整体观感。
+ * dir 是**指向光源**的方向（着色器算 max(dot(n, u_lightDir), 0)），x 右 + / y 上 + /
+ * z 向观察者 +（2D 场景 z 越大越靠前，模型正面法线 ≈ +z）。
+ *
+ * 生效范围：只对「材质显式声明 defaultlight」或「资产位于编辑器命名空间
+ * models|materials/editor/」的层生效，且**场景没有任何平行光**时才回落 —— 既有壁纸
+ * （385 个 puppet 材质 + 216 个 model 材质，无一落在 editor/ 命名空间）逐像素不变。
+ */
+const DEFAULT_MESH_LIGHT: {
+  dir: [number, number, number];
+  base: [number, number, number];
+  add: [number, number, number];
+} = { dir: [-0.4, 0.5, 0.77], base: [0.68, 0.68, 0.68], add: [0.52, 0.52, 0.52] };
+
+/** 编辑器自己的资产命名空间：`editor/gltf.ts` 的导入产物都写在 models|materials/editor/ 下。 */
+function isEditorAssetPath(p: unknown): boolean {
+  const s = typeof p === "string" ? p.replace(/\\/g, "/").toLowerCase() : "";
+  return s.startsWith("models/editor/") || s.startsWith("materials/editor/");
+}
+
 // 字体族缓存：FontFace 以 family 名注册进 document.fonts，跨重挂复用避免同名重复注册。
 // refs = 正在使用的挂载数：clear 时逐键减一，归零才从 document.fonts 释放——
 // 带内嵌字体的壁纸各存几十 KB~几 MB，只增不清会在多壁纸轮播场景无界累积。
@@ -3916,6 +3949,27 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const mdlEntry = await readAsset(model.puppet);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
+          // [we-scene patch 2026-10-08] puppet 层此前**完全不读材质**，2D 场景里就一律
+          // keepZ=0（z 压平 + 不测深度）—— 编辑器导入的 3D 网格（puppet 形态）自遮挡因此
+          // 退化成三角形顺序。这里补上材质解析：只有材质**显式**写 depthtest:"enabled"
+          // （editor/gltf.ts 给导入的 3D 模型就是这么写的）才标 layer.depthMesh 放行深度；
+          // WE 自家 2D 精灵的 puppet 材质写的是 disabled 或不写（实测本机 357 张壁纸里
+          // 385 个 puppet 材质无一声明 enabled），所以既有壁纸行为不变。
+          if (mdlObj.materialPath) {
+            const pmatEntry = await readAsset(mdlObj.materialPath);
+            const ppass0 = pmatEntry ? readMaterialDoc(pmatEntry)?.passes?.[0] : undefined;
+            if (String(ppass0?.depthtest ?? "").toLowerCase() === "enabled") (layer as any).depthMesh = true;
+            // [we-scene patch 2026-10-09] 无灯场景的默认主光（见 DEFAULT_MESH_LIGHT）：
+            // 材质显式声明 defaultlight，或资产落在编辑器命名空间（既有导入产物也认，
+            // 免得已导入的模型要重新导入一次才生效）。
+            if (
+              ppass0?.defaultlight === true ||
+              isEditorAssetPath(model.puppet) ||
+              isEditorAssetPath(mdlObj.materialPath)
+            ) {
+              (layer as any).defaultMeshLight = true;
+            }
+          }
           // 贴图：与普通图层同一条材质链，已在上面的循环里 loadTex 过
           const texObj = layer.textureName ? textures.get(layer.textureName) : null;
           if (!texObj) {
@@ -3974,6 +4028,23 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
               firstBlending = typeof pass0?.blending === "string" ? pass0.blending : null;
+              // [we-scene patch 2026-10-08] **显式声明 depthtest:"enabled" 的模型层在 2D 场景里
+              // 也要深度测试**（renderer 的 keepZ / useDepth 读这个标记）。2D 场景的投影是
+              // ortho(-10000,10000)，模型层的局部 z（像素）照常参与深度、不会被近远平面裁掉；
+              // 不标的话 2D 场景一律 keepZ=0 —— z 压平 + 不测深度，真 3D 网格的自遮挡退化成
+              // 三角形顺序（导入的 OBJ 头套盖住脸、手臂/鞋被自己背面糊掉）。
+              // 判据用**显式 enabled**，不是 F40 的 `!== "disabled"`：2D 场景里没声明深度的层
+              // 很多（WE 自家的 2D 模型层/精灵），放宽会让它们按建模残留 z 重排层间遮挡。
+              if (String(pass0?.depthtest ?? "").toLowerCase() === "enabled") (layer as any).depthMesh = true;
+              // [we-scene patch 2026-10-09] 无灯场景的默认主光（见 DEFAULT_MESH_LIGHT），
+              // 判据口径与 puppet 分支一致。
+              if (
+                pass0?.defaultlight === true ||
+                isEditorAssetPath((layer as any).model) ||
+                isEditorAssetPath(mdlObj.materialPath)
+              ) {
+                (layer as any).defaultMeshLight = true;
+              }
               const tex = pass0?.textures?.[0];
               if (typeof tex === "string" && tex) texName = tex;
               // [we-scene patch] 真 3D 网格材质的 LIGHTING combo（3509243656
@@ -4219,7 +4290,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const item = byLayer.get(layer);
             if (!item) return;
             // 着色器光照是否接管了这一层（见 sceneLight 的构造与 color 的注释）
-            const shaderLit = !!(o.sceneLight && layersHaveNormals(layer));
+            // [we-scene patch 2026-10-09] 默认主光（DEFAULT_MESH_LIGHT）也算「接管」：
+            // 编辑器导入的材质不写 combos.LIGHTING（o.ambient 本来就是 [1,1,1]），
+            // 这里显式排除双乘，免得以后给导入材质加 LIGHTING 时背光面被压成 0.68×0.94。
+            const defaultLight = (layer as any).defaultMeshLight ? DEFAULT_MESH_LIGHT : null;
+            const layerLight = sceneLight ?? defaultLight;
+            const shaderLit = !!(o.sceneLight || defaultLight) && layersHaveNormals(layer);
             mdlRenderer.draw(
               mvp,
               item.mdl,
@@ -4248,7 +4324,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 meshBlending: (layer as any).meshBlending || null,
                 skybox: !!layer.isSkybox,
                 // [we-scene patch 2026-09-28] 场景光照 + 法线矩阵（只在网格带法线时生效）。
-                sceneLight: sceneLight && layersHaveNormals(layer) ? sceneLight : null,
+                // [we-scene patch 2026-10-09] layerLight = 场景灯 ?? 编辑器导入网格的默认主光
+                // （见 DEFAULT_MESH_LIGHT）；无灯 2D 壁纸里的导入模型靠它才有 N·L 明暗，
+                // 鼻子/嘴/衣褶这类"只有形体、没有反照率"的特征才画得出来。
+                sceneLight: layerLight && layersHaveNormals(layer) ? layerLight : null,
                 normalMat: (() => {
                   const m = o.model;
                   if (!m || m.length !== 16) return null;

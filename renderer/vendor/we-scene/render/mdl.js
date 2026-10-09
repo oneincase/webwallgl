@@ -719,6 +719,9 @@ export function createMDLRenderer(gl) {
   const legacyMeshOf = (mdl) => {
     let m = legacyCache.get(mdl)
     if (m) return m
+    // meshes.length === 1 时 meshListOf 返回 null（走这条伪网格）—— 这时文档级数组
+    // 与唯一那条网格记录是同一份几何，字段可能只写了其中一边。
+    const singleSub = mdl.meshes && mdl.meshes.length === 1 ? mdl.meshes[0] : null
     m = {
       positions: mdl.positions,
       uvs: mdl.uvs,
@@ -727,9 +730,15 @@ export function createMDLRenderer(gl) {
       // [we-scene patch 2026-10-03] 法线/切线也要透传（F22）：单网格 3D 模型
       // （retro/ricepod… 的网格层）走这条伪网格，材质 shader 的 a_Normal/a_Tangent4
       // 只能从这里拿；缺字段时与改动前一致（两处都是 null → 布局不变）。
-      normals: mdl.normals || null,
-      tangents: mdl.tangents || null,
-      uv2: mdl.uv2 || null,
+      // [we-scene patch 2026-10-09] **只有一个子网格时也认网格记录里的数组**：
+      // 编辑器导入的单网格模型（`models/editor/*.mdl`）文档级 `normals` 是 null，
+      // 法线只在 `meshes[0]` 上 —— 于是导入的单网格模型**在真机上从来没有法线**：
+      // 逐网格 `u_lightOn` 恒为 0（手办的鼻子/嘴、卡通角色的腮与衣褶这类"只有形体、
+      // 没有独立反照率"的特征完全不显形），材质路径的 a_Normal/a_Tangent4 也拿不到。
+      // 判据见 verify-mdl-depth 的 F52 节（含变异注入）。
+      normals: mdl.normals || singleSub?.normals || null,
+      tangents: mdl.tangents || singleSub?.tangents || null,
+      uv2: mdl.uv2 || singleSub?.uv2 || null,
       vertexCount: mdl.vertexCount,
       indices: mdl.indices,
       indexCount: mdl.indexCount,

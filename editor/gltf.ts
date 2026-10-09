@@ -817,6 +817,13 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
     const uvs = new Float32Array(total * 2);
     const boneIdx = new Uint32Array(total * 4);
     const weights = new Float32Array(total * 4);
+    // [2026-10-08 修复] **法线必须带过去**：渲染端只在网格有法线时才把场景平行光/环境光接到
+    // 这一层（`scene-mount` 的 layersHaveNormals → sceneLight，`mdl.js` 的 lightOn）。此前
+    // puppet 分支丢掉法线，2D 场景里导入的 3D 模型永远是无光照的平涂色块，和原型（有体积
+    // 明暗）差距明显。只要有一个图元没法线就整体不写 —— 单网格里半有半无会让着色器读到
+    // 未初始化的属性（渲染侧的 meshMatAttrUnavailable 也是同一顾虑）。
+    const hasNormals = prims.every((p) => !!p.normals);
+    const normals = hasNormals ? new Float32Array(total * 3) : null;
     let idxTotal = 0;
     for (const p of prims) idxTotal += p.indices.length;
     const indices = new Uint32Array(idxTotal);
@@ -825,6 +832,8 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
     prims.forEach((p, pi) => {
       const n = p.positions.length / 3;
       for (let i = 0; i < n * 3; i++) positions[base * 3 + i] = p.positions[i] * scale;
+      // 法线只搬方向：scale 是等比缩放，法线不受影响
+      if (normals && p.normals) for (let i = 0; i < n * 3; i++) normals[base * 3 + i] = p.normals[i];
       if (atlas) {
         const c = cellOf.get(lookKey(looks[pi]))!;
         const col = c % atlas.cols;
@@ -844,13 +853,17 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
       for (let k = 0; k < p.indices.length; k++) indices[io++] = p.indices[k] + base;
       base += n;
     });
-    meshes.push({ material, positions, uvs, boneIdx, weights, indices });
+    meshes.push({ material, positions, uvs, normals: normals ?? undefined, boneIdx, weights, indices });
     const tex = atlas ? { bytes: atlasPng(atlas, 8), ext: "png" as const } : (look.tex ?? { bytes: solidPng(look.factor), ext: "png" as const });
     files.push(
       {
         name: material,
         data: jsonBytes({
-          passes: [{ blending: "translucent", cullmode: "nocull", depthtest: "disabled", depthwrite: "disabled", shader: "genericimage4", textures: [`editor/${opts.slug}`] }],
+          // [we-scene patch 2026-10-09] defaultlight：这是编辑器导入的 3D 网格，场景里
+          // 没有平行光时宿主回落一盏默认主光（见 renderer/src/scene-mount.ts 的
+          // DEFAULT_MESH_LIGHT）。没有它，只有形体、没有独立反照率的特征（手办的鼻/嘴、
+          // 卡通角色的腮与衣褶）在 2D 壁纸里完全不显形 —— 用户报「鼻子和嘴巴没渲染出来」。
+          passes: [{ defaultlight: true, blending: "translucent", cullmode: "nocull", depthtest: "enabled", depthwrite: "enabled", shader: "genericimage4", textures: [`editor/${opts.slug}`] }],
         }),
       },
       { name: `materials/editor/${opts.slug}.${tex.ext}`, data: tex.bytes },
@@ -873,6 +886,9 @@ export function gltfToModel(g: Gltf, opts: GltfImportOptions): GltfModel {
             data: jsonBytes({
               passes: [
                 {
+                  // [we-scene patch 2026-10-09] defaultlight：无灯场景回落默认主光
+                  // （见 renderer/src/scene-mount.ts 的 DEFAULT_MESH_LIGHT）。
+                  defaultlight: true,
                   blending: look.blend ? "translucent" : "normal",
                   cullmode: look.doubleSided ? "nocull" : "normal",
                   depthtest: "enabled",
@@ -1092,10 +1108,15 @@ function nextId(objs: SceneObject[]): number {
   return max + 1;
 }
 
+/** 场景是不是 2D 正交场景（`general.orthogonalprojection` 是对象）：坐标空间是「图层局部像素、y 朝上」 */
+export function isOrthoDoc(doc: EditorDoc): boolean {
+  const ortho = (doc.scene?.general as Record<string, unknown> | undefined)?.orthogonalprojection;
+  return !!ortho && typeof ortho === "object";
+}
+
 /** 正交场景（有 orthogonalprojection）缺省导入成 puppet，透视场景导入成网格 */
 export function defaultTarget(doc: EditorDoc): GltfTarget {
-  const ortho = (doc.scene?.general as Record<string, unknown> | undefined)?.orthogonalprojection;
-  return ortho && typeof ortho === "object" ? "puppet" : "mesh";
+  return isOrthoDoc(doc) ? "puppet" : "mesh";
 }
 
 /** puppet 缺省缩放：模型绑定姿势包围盒落在场景画面 60% 内 */
@@ -1186,7 +1207,8 @@ export function fitMeshScale(doc: EditorDoc): (b: Float64Array) => number {
 /**
  * 场景末尾加导入的模型层并挂一条动画层指向首个片段；返回新 id。
  * puppet：图片层放在画面中心（层原点 = 网格原点，按包围盒中心对齐），size = 关于原点对称的包围盒；
- * mesh：包围盒中心落在活相机视线上（meshView 的摆放深度），绕 Y 转到正面朝相机。
+ * mesh：2D 正交场景同样按像素口径摆到画面中心（几何已由 fitPuppetScale 化成像素），
+ *       透视场景才用「包围盒中心落在活相机视线上（meshView 的摆放深度）、绕 Y 转到正面朝相机」。
  */
 export function addModelLayer(doc: EditorDoc, m: GltfModel, path: string, name: string): number | null {
   const scene = doc.scene;
@@ -1195,16 +1217,26 @@ export function addModelLayer(doc: EditorDoc, m: GltfModel, path: string, name: 
   const objs = scene.objects as SceneObject[];
   const id = nextId(objs);
   const b = m.bounds;
+  const ortho = (scene.general as Record<string, unknown> | undefined)?.orthogonalprojection as Record<string, unknown> | undefined;
+  const W = Number(ortho?.width) || 1920;
+  const H = Number(ortho?.height) || 1080;
   let o: SceneObject;
   if (m.target === "puppet") {
-    const ortho = (scene.general as Record<string, unknown> | undefined)?.orthogonalprojection as Record<string, unknown> | undefined;
-    const W = Number(ortho?.width) || 1920;
-    const H = Number(ortho?.height) || 1080;
     const cx = (b[0] + b[3]) / 2;
     const cy = (b[1] + b[4]) / 2;
     const sw = Math.ceil(2 * Math.max(Math.abs(b[0]), Math.abs(b[3])));
     const sh = Math.ceil(2 * Math.max(Math.abs(b[1]), Math.abs(b[4])));
     o = { angles: vec3(0, 0, 0), id, image: path, name, origin: vec3(W / 2 - cx, H / 2 - cy, 0), scale: vec3(1, 1, 1), size: `${sw.toFixed(5)} ${sh.toFixed(5)}` };
+  } else if (isOrthoDoc(doc)) {
+    // [2026-10-08 修复] **2D 正交场景里的 3D 网格必须按 2D 口径摆放**：场景投影是
+    // ortho(-10000,10000) 的**像素**空间（1920×1080 量级），而 meshView/fitMeshScale 给的是
+    // 相机世界单位（几个单位、约等于几像素），于是导入的模型小到看不见 —— 用户在 2D 壁纸里
+    // 选「3D 网格」形态导入后画面毫无变化就是这个。口径与 puppet 分支、也与 WE 官方 2D 场景里
+    // 的 model 层（Cube origin 是像素、几何按模型单位+大 scale）一致：几何已按像素量好，
+    // origin 把包围盒中心摆到画面中心，scale 保持 1。
+    const cx = (b[0] + b[3]) / 2;
+    const cy = (b[1] + b[4]) / 2;
+    o = { angles: vec3(0, 0, 0), id, model: path, name, origin: vec3(W / 2 - cx, H / 2 - cy, 0), scale: vec3(1, 1, 1) };
   } else {
     const v = meshView(doc);
     const p: V3 = [v.eye[0] + v.fwd[0] * v.dist, v.eye[1] + v.fwd[1] * v.dist, v.eye[2] + v.fwd[2] * v.dist];

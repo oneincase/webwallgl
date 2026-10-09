@@ -20,9 +20,13 @@
  *   5. 2D puppet（keepZ:false）不碰深度状态（层间按 z 序 + 混合合成，别被深度裁掉）；
  *   6. 接线：宿主把 `layer.isSkybox` 传进绘制 opts（少了它第 4 条形同虚设）；
  *   7. 帧首仍有统一的 `clear(COLOR|DEPTH)` 且**先开写掩码再清**（共享深度缓冲的干净起点）。
+ *   8. **2D 场景里的真 3D 网格**（F51）：材质显式写 `depthtest:"enabled"` 的层（编辑器导入的
+ *      OBJ/模型，宿主标 `layer.depthMesh`）在非透视场景也保留 z 并开深度 —— 否则 z 被压平、
+ *      深度不参与，自遮挡退化成三角形顺序（用户报的「导入后和原型有差距」）。
  *
  * 改坏的形态与转红项：把 clear 加回 keepZ 分支 → ① 红；删掉 enable(DEPTH_TEST) → ② 红；
- * `depthMask(!opts.skybox)` 改成 `depthMask(true)` → ④ 红；去掉宿主的 skybox 接线 → ⑥ 红。
+ * `depthMask(!opts.skybox)` 改成 `depthMask(true)` → ④ 红；去掉宿主的 skybox 接线 → ⑥ 红；
+ * 去掉 keepZ / useDepth 的 depthMesh 分支、或把宿主的「显式 enabled」判据放宽成 F40 口径 → ⑧ 红。
  */
 import fs from "node:fs";
 import { join } from "node:path";
@@ -343,6 +347,77 @@ const names = (calls) => calls.map((c) => c.name);
   check(/\[s,\s*e - s \|\| 1e-4,\s*ds,\s*de - ds\]/.test(hostSrc), "雾参数换算应为 (start, end-start, startDensity, endDensity-startDensity)");
   const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   check(/eye:\s*cam && cam\.perspective && cam\.eye \? cam\.eye : null/.test(rsrc), "renderer 没把透视相机眼点传进 puppetDrawFn opts");
+}
+
+// ───────────────── ⑪ 2D 场景里的真 3D 网格：材质显式声明 depthtest 才放行深度（F51） ─────────────────
+//
+// 用户报「导入 OBJ 渲染出来和原型有差距」：2D 正交壁纸里导入的模型走 puppet 形态，而 2D 场景
+// 一律 keepZ=false / useDepth=false —— z 被压平、深度测试整个不参与，自遮挡退化成「按三角形
+// 顺序画」：头套盖住脸和头发、手臂 / 黑上衣 / 鞋被自己朝后的那半边糊掉（实测截图对比原型差得
+// 很远）。修法是**按材质声明**：材质里显式写 depthtest:"enabled" 的层（编辑器导入的模型就是
+// 这么写的，puppet / mesh 两形态都写）在 2D 场景也开深度；WE 自家 2D 精灵的 puppet 材质写的是
+// disabled 或不写（实测本机 357 张壁纸、385 个 puppet 材质无一声明 enabled），既有壁纸不变。
+// 判据必须是「显式 enabled」，不是 F40 的 `!== "disabled"`：2D 场景里不声明深度的层很多，
+// 放宽会让它们按无意义的建模残留 z 重排层间遮挡。
+{
+  const rsrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  // 去注释再断言（把新分支注释掉是本仓排查时的常见手法），并检查原文（注释里也有同样的表达式）
+  const rc = rsrc.replace(/\/\/[^\n]*/g, "");
+  check(/keepZ:\s*!!\(cam && cam\.perspective\) \|\| \(!!layer\.depthMesh && !layer\.isSkybox\)/.test(rc),
+    "drawPuppetDirect 的 keepZ 没带上 depthMesh：2D 场景里声明了 depthtest 的 3D 网格又被压平 ⇒ 自遮挡按三角形顺序（F51）");
+  check(/const useDepth = !!\(cam && cam\.perspective\) \|\| \(!!layer\.depthMesh && !isSkybox\)/.test(rc),
+    "材质路径的 useDepth 没带上 depthMesh：2D 场景里声明了 depthtest 的自定义着色器 3D 网格没有深度（F51）");
+  check(/layer\.depthMesh && !layer\.isSkybox/.test(rc) && /!!layer\.depthMesh && !isSkybox/.test(rc),
+    "天空盒兜底没跟上新分支：天空盒包着相机，放它写深度会把全场拒掉（F49 的老问题）");
+
+  const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const rule = /String\((?:pass0|ppass0)\?\.depthtest \?\? ""\)\.toLowerCase\(\) === "enabled"\) \(layer as any\)\.depthMesh = true;/g;
+  const hits = [...hostSrc.matchAll(rule)];
+  check(hits.length === 2, `宿主标 layer.depthMesh 的装配分支不是 2 处（实测 ${hits.length}：puppet / model 各要一处）`);
+  check(/const pmatEntry = await readAsset\(mdlObj\.materialPath\);/.test(hostSrc) && /const pass0 = material\?\.passes\?\.\[0\]/.test(hostSrc),
+    "puppet 分支没读材质 json（puppet 层此前完全不看材质 ⇒ 拿不到 depthtest 声明）");
+  check(!/depthtest !== "disabled"[\s\S]{0,80}depthMesh/.test(hostSrc) && !/depthMesh[\s\S]{0,80}depthtest !== "disabled"/.test(hostSrc),
+    "宿主给 depthMesh 用了 F40 的 `!== \"disabled\"` 口径：2D 场景里未声明深度的层会被一起放行（按建模残留 z 重排遮挡）");
+
+  // 变异：去掉 renderer 侧的分支、把宿主判据放宽 —— 对应的判据必须变红（新判据不是空断言）
+  check(rc.replace(" || (!!layer.depthMesh && !layer.isSkybox)", "") !== rc, "注入点存在（keepZ 的 depthMesh 分支）");
+  check(hostSrc.replace(rule, "(layer as any).depthMesh = true;") !== hostSrc, "注入点存在（宿主 depthMesh 的显式 enabled 判据）");
+}
+
+// ───────────────── ⑫ 单子网格模型的法线：也要认 meshes[0]（F52） ─────────────────
+//
+// 编辑器导入的 puppet 形态把全部图元并成一个网格（`models/editor/*.mdl`）——它的文档级
+// `normals` 是 null，法线只写在唯一那条网格记录上。而 meshListOf 只在 meshes.length > 1 时
+// 才走子网格列表，于是模型落到 legacyMeshOf 的伪网格上，**两条路都拿不到法线**：逐网格
+// u_lightOn 恒为 0 ⇒ 只有形体、没有独立反照率的特征（手办的鼻子/嘴、卡通角色的腮与衣褶）
+// 完全不显形（用户报「人物的鼻子和嘴巴没渲染出来」），材质路径的 a_Normal/a_Tangent4 也拿不到。
+// 判据是**行为**：同一份几何，法线放在 meshes[0] 与放在文档级都必须点亮 u_lightOn。
+{
+  const lightOn = (log) =>
+    log.filter((c) => c.name === "uniform1f" && c.args[0]?.name === "u_lightOn").map((c) => c.args[1]);
+  const LIGHT = { dir: [0, 1, 0], base: [0.5, 0.5, 0.5], add: [0.5, 0.5, 0.5] };
+  const NRM = new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]);
+  const drawWith = (doc) => {
+    const gl = makeMockGL();
+    const r = createMDLRenderer(gl);
+    gl.__log.length = 0;
+    r.draw(MVP, doc, { keepZ: true, sceneLight: LIGHT }, null);
+    return lightOn(gl.__log).at(-1);
+  };
+  const subOnly = fakeMDL();
+  subOnly.meshes = [{ ...fakeMesh(), normals: NRM }];
+  check(drawWith(subOnly) === 1,
+    "单子网格模型的法线只在 meshes[0] 上时没被认（u_lightOn=0）：只有形体的特征完全不显形（F52）");
+  const docLevel = fakeMDL();
+  docLevel.normals = NRM;
+  check(drawWith(docLevel) === 1, "文档级法线（WE 自家单网格素材）没点亮 u_lightOn（F52 回归）");
+  check(drawWith(fakeMDL()) === 0, "没有任何法线时不该点亮 u_lightOn（会拿常量 (0,0,1) 当法线做光照）");
+
+  const mjs = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8");
+  check(/const singleSub = mdl\.meshes && mdl\.meshes\.length === 1/.test(mjs) &&
+    /normals:\s*mdl\.normals \|\| singleSub\?\.normals \|\| null/.test(mjs),
+    "缺少 meshes[0] 法线回落（F52 实现）");
+  check(mjs.replace(" || singleSub?.normals || null", " || null") !== mjs, "注入点存在（单子网格法线回落）");
 }
 
 console.log(

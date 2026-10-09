@@ -112,6 +112,7 @@ import {
   fitPuppetScale,
   gltfImportFiles,
   gltfToModel,
+  isOrthoDoc,
   type Gltf,
   type GltfTarget,
 } from "./gltf";
@@ -2696,7 +2697,11 @@ async function importModelFiles(files: File[], forceForm: GltfTarget | null = nu
       const listed = new Set(assets.list());
       const refs = referencedModels(target);
       const slug = imageSlug(name, (s) => [modelPathOf(s), editorMdlPathOf(s)].some((p) => assets.has(p) || listed.has(p) || refs.has(p)));
-      const m = gltfToModel(g, { target: form, slug, fps: 30, scale: form === "puppet" ? fitPuppetScale(target) : fitMeshScale(target) });
+      // [2026-10-08 修复] 2D 正交场景里**两种形态都按像素量几何**：场景投影是 ortho 的像素空间，
+      // fitMeshScale 给的是相机世界单位（≈几像素），mesh 形态会小到看不见（addModelLayer 里
+      // 对应地也走 2D 摆放口径）。
+      const pixelUnits = form === "puppet" || isOrthoDoc(target);
+      const m = gltfToModel(g, { target: form, slug, fps: 30, scale: pixelUnits ? fitPuppetScale(target) : fitMeshScale(target) });
       await bakePuppetAtlas(m);
       const r = gltfImportFiles(m, slug);
       for (const x of r.files) assets.put(x.name, x.data, r.path);

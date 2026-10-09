@@ -3373,10 +3373,35 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
     pmat.passes[0].shader === "genericimage4" && json(pmat.passes[0].textures) === json(["editor/t"]) && Buffer.from(pf.files.find((f) => f.name === "materials/editor/t.png").data).equals(Buffer.from(fx.png)) &&
     ms.mdl.materialPath === "materials/editor/t.json",
     "puppet 产物：model json（autosize / material / puppet）+ genericimage4 材质 + 内嵌 png 原字节；.mdl 子网格材质同路径");
+  check(pmat.passes[0].depthtest === "enabled" && pmat.passes[0].depthwrite === "enabled" && pmat.passes[0].blending === "translucent" && pmat.passes[0].cullmode === "nocull",
+    "puppet 材质声明 depthtest/depthwrite enabled：真 3D 网格在 2D 场景里也参与深度（宿主按这个字段标 layer.depthMesh），仍是 alpha 混合 + nocull");
   const mm2 = sk.models.find((x) => x.name === "skinned" && x.target === "mesh").files;
   const mmat = JSON.parse(dec.decode(mm2.files.find((f) => f.name === "materials/editor/t_0.json").data));
   check(mm2.path === "models/editor/t.mdl" && !mm2.files.some((f) => f.name.endsWith(".json") && f.name.startsWith("models/")) && mmat.passes[0].shader === "generic4" && mmat.passes[0].cullmode === "nocull",
     "网格产物：只有 .mdl（对象 model 直接指它）+ 每个 glTF 材质一份 generic4 材质（doubleSided → nocull）");
+  // [we-scene patch 2026-10-09] 默认主光（F52）：无灯 2D 场景里导入的网格靠它才有 N·L 明暗——
+  // 鼻子/嘴/衣褶这类「只有形体、没有独立反照率」的特征在纯反照率下完全不显形（用户报
+  // 「人物的鼻子和嘴巴没渲染出来」）。puppet / mesh 两形态的材质都要声明 defaultlight。
+  check(pmat.passes[0].defaultlight === true && mmat.passes[0].defaultlight === true,
+    "导入产物（puppet / mesh 两形态）的材质没有声明 defaultlight：无灯 2D 壁纸里的模型只能是平涂贴纸");
+  {
+    const hostSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const mdlSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8");
+    check(/const DEFAULT_MESH_LIGHT/.test(hostSrc) && /function isEditorAssetPath/.test(hostSrc),
+      "scene-mount 缺默认主光常量 / 编辑器命名空间判定（无灯 2D 壁纸里的导入模型不会补光）");
+    const flagHits = [...hostSrc.matchAll(/\(layer as any\)\.defaultMeshLight = true;/g)];
+    check(flagHits.length === 2, `宿主标 layer.defaultMeshLight 的装配分支不是 2 处（实测 ${flagHits.length}：puppet / model 各一处）`);
+    check(/sceneLight:\s*layerLight && layersHaveNormals\(layer\) \? layerLight : null/.test(hostSrc),
+      "setPuppetRenderer 回调没转发 layerLight：默认主光在实机上不生效（渲染侧收到 undefined）");
+    check(/const layerLight = sceneLight \?\? defaultLight;/.test(hostSrc),
+      "layerLight 没表达「场景灯优先、默认主光回落」（有灯的壁纸会被默认主光盖掉）");
+    check(/normals:\s*mdl\.normals \|\| singleSub\?\.normals \|\| null/.test(mdlSrc) &&
+      /const singleSub = mdl\.meshes && mdl\.meshes\.length === 1/.test(mdlSrc),
+      "mdl.js 的 legacyMeshOf 没认单子网格记录里的法线：导入的单网格模型在真机上 u_lightOn 恒为 0");
+    check(mdlSrc.replace(" || singleSub?.normals || null", " || null") !== mdlSrc &&
+      hostSrc.replace(flagHits[0] ? flagHits[0][0] : "", "") !== hostSrc,
+      "注入点存在（单子网格法线回落 + 宿主默认主光标记）");
+  }
   const png = G.solidPng([1, 0, 0, 0.5]);
   const idat = (() => {
     let p = 8;
@@ -3435,6 +3460,68 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
     near3(meshCenter(co, mr.m.bounds), [-8, 0, 5]) && near(Number(co.angles.split(" ")[1]), Math.PI / 2, 1e-5) &&
     near(cScale, (0.6 * 8 * Math.tan((20 * Math.PI) / 180)) / Math.sqrt(3)),
     "addModelLayer（网格，有相机实体）：取最后一个可见相机实体的眼 / 朝向 / fov，摆在视线前方最近模型再往前 20%，包围盒中心对准视线、正面朝相机");
+  // 2D 正交场景里的 3D 网格：几何必须按像素量、摆画面中心 —— 此前一律按相机世界单位摆
+  // （几十像素级），用户在 2D 壁纸里选「3D 网格」导入后画面毫无变化。
+  const oMeshDoc = mk.makeDoc("t", null, { general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: [] }, "loose");
+  G.addModelLayer(oMeshDoc, mr.m, "models/editor/t.mdl", "Arm");
+  const om = oMeshDoc.scene.objects.at(-1);
+  const oWant = [960 - (mr.m.bounds[0] + mr.m.bounds[3]) / 2, 540 - (mr.m.bounds[1] + mr.m.bounds[4]) / 2, 0];
+  check(om.model === "models/editor/t.mdl" && om.angles === "0.00000 0.00000 0.00000" && json(om.scale.split(" ").map(Number)) === json([1, 1, 1]) &&
+    json(om.origin.split(" ").map(Number)) === json(oWant.map((v) => +v.toFixed(5))),
+    "addModelLayer（网格 + 2D 正交场景）：model 指 .mdl、包围盒中心摆画面中心、不绕 Y 转、scale 保持 1（与 WE 官方 2D 场景里的 model 层同口径）");
+  check(G.isOrthoDoc(orthoDoc) === true && G.isOrthoDoc(pDoc) === false, "isOrthoDoc：有 orthogonalprojection 才是 2D 正交场景（导入形态与摆放口径的唯一判据）");
+
+  // puppet 形态必须把法线带进网格：渲染端只在网格有法线时才把场景平行光接到这一层
+  // （scene-mount 的 layersHaveNormals → sceneLight，mdl.js 的 u_lightOn）。以前 puppet
+  // 分支丢法线 ⇒ 2D 场景里导入的 3D 模型永远是无光照的平涂色块（与原型差距明显）。
+  const njOf = () => {
+    const nb = new ArrayBuffer(78);
+    new Float32Array(nb, 0, 18).set([0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 1, 0, 0, 1]);
+    new Uint16Array(nb, 72, 3).set([0, 1, 2]);
+    return {
+      asset: { version: "2.0" },
+      buffers: [{ byteLength: nb.byteLength, uri: `data:;base64,${Buffer.from(nb).toString("base64")}` }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }, { buffer: 0, byteOffset: 36, byteLength: 36 }, { buffer: 0, byteOffset: 72, byteLength: 6 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3" }, { bufferView: 1, componentType: 5126, count: 3, type: "VEC3" }, { bufferView: 2, componentType: 5123, count: 3, type: "SCALAR" }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1 }, indices: 2 }] }],
+      nodes: [{ name: "m", mesh: 0 }],
+      scenes: [{ nodes: [0] }],
+    };
+  };
+  {
+    const nj = njOf();
+    const withN = G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(nj))), { target: "puppet", slug: "n", scale: 10 });
+    const bare = structuredClone(nj);
+    bare.meshes[0].primitives[0].attributes = { POSITION: 0 };
+    const noN = G.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(bare))), { target: "puppet", slug: "n", scale: 10 });
+    const nn = withN.spec.meshes[0].normals;
+    check(nn instanceof Float32Array && nn.length === withN.spec.meshes[0].positions.length && json([...nn.slice(0, 3)]) === json([0, 0, 1]) &&
+      json([...withN.spec.meshes[0].positions.slice(0, 3)]) === json([0, 0, 0]) && noN.spec.meshes[0].normals === undefined && noN.spec.meshes[0].positions.length === 9,
+      "puppet 网格随位置一起搬法线（渲染端据此接通场景平行光）；任一图元没法线就整体不写，不留半有半无的属性");
+  }
+
+  // 变异：把新判据逐个改坏，对应的判据必须变红
+  {
+    const gp = path.join(ROOT, "editor/gltf.ts");
+    const gs = fs.readFileSync(gp, "utf8");
+    const mutDepth = gs.replace('depthtest: "enabled", depthwrite: "enabled", shader: "genericimage4"', 'depthtest: "disabled", depthwrite: "disabled", shader: "genericimage4"');
+    check(mutDepth !== gs, "注入点存在（puppet 材质的 depthtest/depthwrite 声明）");
+    const MG = await loadEditorModule("gltf", { [gp]: mutDepth });
+    const gm = JSON.parse(dec.decode(MG.gltfToModel(G.parseGltf(fx.glb), { target: "puppet", slug: "t", scale: 10 }).files.find((f) => f.name === "materials/editor/t.json").data));
+    check(gm.passes[0].depthtest === "disabled", "puppet 材质不声明 depthtest 时「2D 场景里的 3D 网格也参与深度」判据变红");
+    const mutNrm = gs.replace("const hasNormals = prims.every((p) => !!p.normals);", "const hasNormals = false;");
+    check(mutNrm !== gs, "注入点存在（puppet 分支的 hasNormals 判据）");
+    const MN = await loadEditorModule("gltf", { [gp]: mutNrm });
+    const nm = MN.gltfToModel(G.parseGltf(enc.encode(JSON.stringify(njOf()))), { target: "puppet", slug: "n", scale: 10 }).spec.meshes[0];
+    check(nm.normals === undefined && nm.positions.length === 9, "puppet 分支不看法线时「法线随位置一起搬」判据变红");
+    const mutOrtho = gs.replace("} else if (isOrthoDoc(doc)) {", "} else if (false && isOrthoDoc(doc)) {");
+    check(mutOrtho !== gs, "注入点存在（addModelLayer 的 2D 正交摆放分支）");
+    const MO = await loadEditorModule("gltf", { [gp]: mutOrtho });
+    const moDoc = mk.makeDoc("t", null, { general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: [] }, "loose");
+    MO.addModelLayer(moDoc, mr.m, "models/editor/t.mdl", "Arm");
+    check(json(moDoc.scene.objects.at(-1).origin.split(" ").map(Number)) !== json(oWant.map((v) => +v.toFixed(5))),
+      "网格 + 2D 正交场景走相机世界单位摆放时「包围盒中心摆画面中心」判据变红");
+  }
   const tree = mk.buildLayerTree(orthoDoc.scene, new Map([["models/editor/t.json", "models/editor/t.mdl"]]));
   check(tree.roots.at(-1).modelForm === "puppet" && mk.buildLayerTree(pDoc.scene, new Map()).roots[0].modelForm === "mesh", "导入层在图层树里认作模型层（puppet / mesh），模型面板全部可用");
 
@@ -3445,6 +3532,11 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
     "页面：图层栏「导入模型」下拉（自动 / puppet / 3D 网格，选完再开文件框）+ 拖入模型文件（自动形态）");
   check(/for \(const x of r\.files\) assets\.put\(x\.name, x\.data, r\.path\);[\s\S]{0,200}target\.puppets = new Map[\s\S]{0,400}structEdit\([\s\S]{0,300}addModelLayer\(d, m, r\.path/.test(mainSrc),
     "导入：产物进资源表（分组 = 对象引用路径）、puppet 登记到 doc.puppets，加层是一步结构编辑（可撤销）");
+  check(/const pixelUnits = form === "puppet" \|\| isOrthoDoc\(target\);/.test(mainSrc) && /scale: pixelUnits \? fitPuppetScale\(target\) : fitMeshScale\(target\)/.test(mainSrc),
+    "导入：2D 正交场景里两种形态都按像素量几何（fitMeshScale 给的是相机世界单位，mesh 形态会小到看不见）");
+  const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const dmHits = [...smSrc.matchAll(/String\((?:pass0|ppass0)\?\.depthtest \?\? ""\)\.toLowerCase\(\) === "enabled"\) \(layer as any\)\.depthMesh = true;/g)];
+  check(dmHits.length === 2, `宿主只有 ${dmHits.length} 处把「材质显式声明 depthtest」翻成 layer.depthMesh（puppet / model 两条装配分支各要一处；判据必须是显式 enabled，不是 F40 的 !== "disabled"）`);
   const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/id="in-model" accept="\.glb,\.gltf,\.fbx,\.obj,\.dae,\.stl,\.ply,\.3ds,\.bin,\.mtl,\.png,\.jpg,\.jpeg,\.tga,\.bmp" multiple hidden/.test(htmlSrc) && /id="ly-add-model"[^>]*aria-haspopup="menu"/.test(htmlSrc) &&
     json([...(htmlSrc.match(/<div id="model-menu"[\s\S]*?<\/div>/)?.[0] ?? "").matchAll(/data-preset="(\w+)" data-et="(md\.\w+)"/g)].map((m) => [m[1], m[2]])) === json([["auto", "md.auto"], ["puppet", "md.puppet"], ["mesh", "md.mesh"]]),
