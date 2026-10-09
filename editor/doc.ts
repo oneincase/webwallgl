@@ -421,6 +421,73 @@ export function groupLayers(
   return { ok: true, id: gid };
 }
 
+/**
+ * 取消成组：把组里直接子层的局部变换改写成相对组父级的值（世界变换不变），
+ * 再删掉组对象 —— 子层按原顺序排进组的原位置（数组顺序即绘制顺序）。
+ * 组本身有动画（变换字段关键帧）时拒绝：静态化会丢动画，而子层补偿也救不回来。
+ * 校验全部在改动之前，失败时文档原样。
+ */
+export function ungroup(doc: EditorDoc, id: number | string): PlaceResult {
+  const objs = objectsOf(doc);
+  if (!objs) return "missing";
+  const self = objs.find((o) => sameId(o.id, id));
+  if (!self) return "missing";
+  const block = subtreeIndices(objs, id);
+  if (!block.length) return "missing";
+  const kids = objs.filter((o) => sameId(o.parent, id));
+  if (!kids.length) return "noop";
+  // 只拒绝「组自身」的变换动画：子层各自的关键帧在换父级后依然相对自己，不丢
+  if (TRANSFORM_FIELDS.some((f) => hasAnimation(self[f]))) return "animated";
+  const parent = parentOf(objs, self);
+  const pw = worldXform(objs, parent);
+  // 先全部校验再落地：任一子层算不出相对变换就整批不动（文档原样）
+  const plans: Array<{ k: SceneObject; local: ReturnType<typeof relativeXform> }> = [];
+  for (const k of kids) {
+    const local = relativeXform(pw, worldXform(objs, k));
+    if (!local) return "degenerate";
+    plans.push({ k, local });
+  }
+  for (const { k, local } of plans) {
+    writeObjProps(k, local!);
+    if (parent) k.parent = parent.id;
+    else delete k.parent;
+  }
+  // 删掉的只是组自身：直接子层已挂到组的父级上，后代仍跟着各自的父级
+  for (const i of [...block].sort((a, b) => b - a)) {
+    if (sameId(objs[i]?.id, id)) objs.splice(i, 1);
+  }
+  rebuildTree(doc);
+  return "ok";
+}
+
+/**
+ * 批量取消成组（选中集合口径）：先整批校验再动手 —— 任一层不能拆就整批返回，
+ * 文档原样（与 groupLayers 的「全成或全不成」一致）。返回实际拆掉的组 id。
+ */
+export function ungroupAll(
+  doc: EditorDoc,
+  ids: ReadonlyArray<number | string>,
+): { ok: true; ids: Array<number | string> } | { ok: false; reason: PlaceResult; at?: number | string } {
+  const objs = objectsOf(doc);
+  if (!objs) return { ok: false, reason: "missing" };
+  const groups: Array<number | string> = [];
+  for (const id of ids) {
+    const o = objs.find((x) => sameId(x.id, id));
+    if (!o) return { ok: false, reason: "missing", at: id };
+    if (!objs.some((x) => sameId(x.parent, id))) continue; // 没有子层 = 不是组
+    if (TRANSFORM_FIELDS.some((f) => hasAnimation(o[f]))) return { ok: false, reason: "animated", at: id };
+    const up = parentOf(objs, o);
+    if (up && localXform(up).scale.some((s) => s === 0)) return { ok: false, reason: "degenerate", at: id };
+    groups.push(id);
+  }
+  if (!groups.length) return { ok: false, reason: "noop" };
+  for (const id of groups) {
+    const r = ungroup(doc, id);
+    if (r !== "ok") return { ok: false, reason: r, at: id };
+  }
+  return { ok: true, ids: groups };
+}
+
 /** WE 原生字段 locktransforms：锁定的层不能在视口里拖动 / 改变换 */
 export function isLockedObj(o: SceneObject): boolean {
   const v = unwrap(o.locktransforms);

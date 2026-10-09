@@ -253,6 +253,17 @@
   font-style: italic;
 }
 
+/* 树搜索命中高亮（C2） */
+.ed-node.match .ed-node-name {
+  color: var(--accent, #c58b2a);
+  font-weight: 600;
+}
+
+.ed-tree-tools .ed-icon.is-on {
+  background: var(--accent, #c58b2a);
+  color: var(--accent-fg, #1b1b1b);
+}
+
 .ed-twisty {
   flex: none;
   width: 16px;
