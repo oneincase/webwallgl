@@ -5931,6 +5931,247 @@ section("SCENE-SET. 场景设置面板（general 读写 / 保留未知键与非�
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// DRAFT-2. 未保存文档找回（计划 §2 C3）+ 自动保存前提（§2 C6）：快照往返、分槽、
+//          容量淘汰、坏快照容错、与 vdir 键不冲突、恢复交互接线、中英文各一条
+// ───────────────────────────────────────────────────────────────────────────
+section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自动保存目标）");
+{
+  const vdirMod = await loadEditorModule("vdir");
+  const recMod = await loadEditorModule("recover");
+  const drPath = path.join(ROOT, "editor/draft.ts");
+  const drSrc = fs.readFileSync(drPath, "utf8");
+  const drMain = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const drHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const drCss = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+  const drI18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+
+  // ---- 快照往返：编码 → 解码，逐字段一致（重开编辑器后 JSON.parse+stringify 一致）----
+  const dDoc = freshDoc();
+  const dFiles = [
+    { name: "materials/editor/k.png", group: "models/editor/k.json", data: new Uint8Array([1, 2, 3, 250]) },
+    { name: "scene.json", data: new Uint8Array([0, 127, 255]) },
+  ];
+  const snap = draftMod.makeDraft(dDoc, { kind: "virtual", id: "vdir-demo-1" }, "scene.json", dFiles, 777);
+  const wire = draftMod.encodeDraft(snap);
+  const back = draftMod.decodeDraft(wire);
+  check(back !== null && json(back) === json(snap), "快照往返：encode → decode 与原件逐字段一致（标题 / 来源 / 场景 / 文件表）");
+  check(back.files[0].data instanceof Uint8Array && Buffer.compare(Buffer.from(back.files[0].data), Buffer.from([1, 2, 3, 250])) === 0,
+    "文件字节仍是 Uint8Array，且逐字节一致（base64 往返不变形）");
+  check(back.files[0].group === "models/editor/k.json" && back.files[1].group === undefined,
+    "文件分组（group）也照样带回来，没有的键不会被写成 null");
+  const bigBytes = new Uint8Array(70000);
+  for (let i = 0; i < bigBytes.length; i++) bigBytes[i] = (i * 31) % 251;
+  const bigSnap = draftMod.makeDraft(dDoc, { kind: "local", name: "我的壁纸" }, "scene.json", [{ name: "big.bin", data: bigBytes }], 1);
+  const bigBack = draftMod.decodeDraft(draftMod.encodeDraft(bigSnap));
+  check(bigBack !== null && Buffer.compare(Buffer.from(bigBack.files[0].data), Buffer.from(bigBytes)) === 0,
+    "超过 btoa 分块阈值（0x8000）的字节也完整往返");
+
+  // ---- 存进存储再取回：同一后端上分槽互不覆盖 ----
+  const be = vdirMod.memoryVdirBackend();
+  const store = draftMod.vdirDraftStore(be);
+  check(draftMod.DRAFT_ID === "__draft__" && !/^vdir-/.test(draftMod.DRAFT_ID), "草稿用保留 id（不是 vdir 的工程 id 形状）");
+  check(draftMod.draftSlotFor({ vdirId: "vdir-a" }) === "vdir:vdir-a"
+    && draftMod.draftSlotFor({ libraryItemId: "beach" }) === "library:beach"
+    && draftMod.draftSlotFor({ localName: "My Wall" }) === "local:My Wall"
+    && draftMod.draftSlotFor({ vdirId: "vdir-a", libraryItemId: "beach" }) === "vdir:vdir-a"
+    && draftMod.draftSlotFor({}) === draftMod.DRAFT_SLOT_SESSION,
+    "槽名按工程标识算：虚拟工程 > 库条目 > 本地目录名；都没有就是会话槽（刷新后仍是同一槽）");
+  await store.save(snap, "vdir:vdir-demo-1");
+  const loaded = await store.load("vdir:vdir-demo-1");
+  check(loaded !== null && json(loaded) === json(snap), "存进存储再取回：与写入时的快照一致（重开编辑器后逐字段还原）");
+  const other = draftMod.makeDraft(freshDoc(), { kind: "library", itemId: "beach" }, "scene.json", [], 888);
+  await store.save(other, "library:beach");
+  check((await store.load("vdir:vdir-demo-1")).origin.id === "vdir-demo-1" && (await store.load("library:beach")).origin.itemId === "beach",
+    "分槽隔离：两个工程各读回自己那一份，互不覆盖");
+  check(json((await store.list()).map((i) => i.slot)) === json(["library:beach", "vdir:vdir-demo-1"]), "list()：按时间降序，最新的排在前面");
+  await store.clear("library:beach");
+  check((await store.load("library:beach")) === null && (await store.load("vdir:vdir-demo-1")) !== null, "clear 只清自己那槽");
+
+  // ---- 容量上限：槽数 / 总字节，淘汰最旧的，最新一条永远保留 ----
+  const slotSnap = (now) => draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [], now);
+  const be2 = vdirMod.memoryVdirBackend();
+  const store2 = draftMod.vdirDraftStore(be2, 2, draftMod.DRAFT_MAX_BYTES);
+  await store2.save(slotSnap(100), "s1");
+  await store2.save(slotSnap(200), "s2");
+  await store2.save(slotSnap(300), "s3");
+  check(json((await store2.list()).map((i) => i.slot)) === json(["s3", "s2"]),
+    `容量上限（槽数 2）：最旧的一槽被淘汰，最新的保留（实得 ${json((await store2.list()).map((i) => i.slot))}）`);
+  const be3 = vdirMod.memoryVdirBackend();
+  const store3 = draftMod.vdirDraftStore(be3, 8, 8000);
+  await store3.save(draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [{ name: "huge.bin", data: new Uint8Array(12000) }], 1), "huge");
+  await store3.save(slotSnap(2), "small");
+  const kept3 = (await store3.list()).map((i) => i.slot);
+  check(json(kept3) === json(["small"]) && (await store3.load("huge")) === null,
+    `容量上限（总字节 8KB）：只有两槽也按字节淘汰最旧的（实得 ${json(kept3)}）`);
+  const be4 = vdirMod.memoryVdirBackend();
+  const store4 = draftMod.vdirDraftStore(be4, 8, draftMod.DRAFT_MAX_BYTES);
+  await store4.save(draftMod.makeDraft(freshDoc(), { kind: "new" }, "scene.json", [{ name: "huge.bin", data: new Uint8Array(12000) }], 1), "huge");
+  await store4.save(slotSnap(2), "small");
+  check(json((await store4.list()).map((i) => i.slot)) === json(["small", "huge"]), "同一对快照在默认上限下两条都留着（上面那条是字节上限在起作用，不是写法问题）");
+  const be5 = vdirMod.memoryVdirBackend();
+  const store5 = draftMod.vdirDraftStore(be5, 1, 1);
+  await store5.save(slotSnap(5), "only");
+  check((await store5.load("only")) !== null, "上限压到最紧（1 槽 / 1 字节）也不会把刚存的那条淘汰掉（否则等于没存）");
+
+  // ---- 坏快照容错：读出 null 且不抛 ----
+  await be.write(draftMod.DRAFT_ID, "bad-json", new Blob(["not json"], { type: "application/json" }));
+  await be.write(draftMod.DRAFT_ID, "trunc", new Blob([wire.slice(0, 40)], { type: "application/json" }));
+  await be.write(draftMod.DRAFT_ID, "bad-b64", new Blob([json({ ...JSON.parse(wire), files: [{ name: "x", data: "@@@" }] })], { type: "application/json" }));
+  const badReads = [];
+  for (const s of ["bad-json", "trunc", "bad-b64", "nope"]) badReads.push(await store.load(s));
+  check(badReads.every((v) => v === null), "坏快照（非 JSON / 截断 / base64 非法 / 根本没这槽）读出 null，不抛");
+  const badList = await store.list();
+  check(badList.some((i) => i.slot === "bad-json" && i.savedAt === 0) && badList.some((i) => i.slot === "vdir:vdir-demo-1"),
+    "list()：坏快照当 savedAt=0 列出，不炸整张表（其余槽照旧可读）");
+  check(draftMod.decodeDraft("") === null && draftMod.decodeDraft("{}") === null && draftMod.decodeDraft('{"v":1}') === null
+    && draftMod.decodeDraft(json({ ...JSON.parse(wire), files: "x" })) === null
+    && draftMod.decodeDraft(json({ ...JSON.parse(wire), scene: null })) === null,
+    "decodeDraft：空串 / 形状不对 / files 不是数组 / 没有场景一律 null（库里的东西不可信）");
+  check(draftMod.parseDraft({ ...snap, origin: { kind: "virtual" } }) === null && draftMod.parseDraft({ ...snap, origin: { kind: "local" } }) === null
+    && draftMod.parseDraft({ ...snap, origin: { kind: "virtual", id: "vdir-x" } }) !== null,
+    "parseDraft：新增的两种来源也必须带 id / name，缺了照样拒（旧版本的坏数据进不来）");
+
+  // ---- 与 vdir 键不冲突：同一个后端上，草稿槽与工程文件互相看不见 ----
+  const beV = vdirMod.memoryVdirBackend();
+  const dirV = await vdirMod.createVirtualProject("演示工程", beV, 1000);
+  const vdirId = vdirMod.virtualIdOf(dirV);
+  const storeV = draftMod.vdirDraftStore(beV);
+  await storeV.save(snap, draftMod.draftSlotFor({ vdirId }));
+  check((await beV.listMeta()).length === 1 && (await vdirMod.listVirtualProjects(beV)).length === 1 && (await vdirMod.listVirtualProjects(beV))[0].id === vdirId,
+    "草稿不写 vdir 的工程 meta：虚拟工程列表里不会多出一条假工程");
+  check(vdirId !== draftMod.DRAFT_ID && json(await beV.keys(draftMod.DRAFT_ID)) === json([`vdir:${vdirId}`]),
+    "草稿只落在保留 id 的文件键空间里，和工程 id 的键空间不重叠");
+  await beV.write(vdirId, "scene.json", new Blob(["{}"], { type: "application/json" }));
+  check((await storeV.load("session")) === null && (await storeV.load(`vdir:${vdirId}`)) !== null
+    && json(await beV.keys(vdirId)) === json(["scene.json"]),
+    "同一个后端上：草稿读不到工程文件，工程目录里也不会冒出草稿槽");
+  const beDefault = vdirMod.memoryVdirBackend();
+  vdirMod.setVdirBackend(beDefault);
+  const storeDefault = draftMod.vdirDraftStore();
+  await storeDefault.save(snap, "session");
+  check((await storeDefault.load("session")) !== null, "vdirDraftStore() 默认取的就是 vdir 那一个后端（同一存储域，不是第二套 IndexedDB）");
+  vdirMod.setVdirBackend(null);
+
+  // ---- 节流与上限边界 ----
+  check(draftMod.DRAFT_THROTTLE_MS === 1500 && draftMod.snapshotDue(0, 1499) === false && draftMod.snapshotDue(0, 1500) === true,
+    "快照节流：1500ms 窗口的边界（400ms 编辑防抖之外再压一道，长按拖拽不反复序列化整份）");
+  check(draftMod.snapshotDue(NaN, 1500) === true && draftMod.snapshotDue(0, NaN) === false, "时间戳不合法：没存过就写，时间读不出来就不写");
+  check(recMod.RECOVER_MAX === 3, "RECOVER_MAX 仍是 3（草稿找回不另起一套上限）");
+  check(recMod.allowRecover([], 1000) === true && recMod.allowRecover([1000, 1000], 1000) === true && recMod.allowRecover([1000, 1000, 1000], 1000) === false,
+    "RECOVER_MAX 边界：第 3 次之后拒绝");
+  const recStamps = [];
+  check(recMod.allowRecover(recStamps, 0) === true && recStamps.length === 1, "允许的那次会记账（下一次才算数）");
+  check(recMod.allowRecover([0, 0, 0], 61_000) === true, "60s 窗口外的旧记录不算数（卡死重开后又可以恢复）");
+
+  // ---- 自动保存目标（§2 C6）：放宽到「本地文件夹 / 库来源也自动保存」 ----
+  check(draftMod.autosaveTargetFor({ savable: true, hasDir: true, draftable: true, slot: null }) === "dir"
+    && draftMod.autosaveTargetFor({ savable: true, hasDir: false, draftable: true, slot: "library:beach" }) === "draft"
+    && draftMod.autosaveTargetFor({ savable: true, hasDir: false, draftable: true, slot: "session" }) === "draft"
+    && draftMod.autosaveTargetFor({ savable: true, hasDir: false, draftable: false, slot: "session" }) === "none"
+    && draftMod.autosaveTargetFor({ savable: false, hasDir: true, draftable: true, slot: "session" }) === "none"
+    && draftMod.autosaveTargetFor({ savable: true, hasDir: false, draftable: true, slot: null }) === "none",
+    "自动保存目标：可写文件夹 → 文件夹；库来源 / 目录不可写 → 草稿槽；快照装不下的文档（视频 / 网页）与真没内容的一律不写（页面必须提示）");
+
+  // ---- 页面接线：一份 draft.ts + 两条横幅 + 分流落盘 ----
+  check(/import \{[\s\S]{0,400}\} from "\.\/draft";/.test(drMain) && /const draftStore = vdirDraftStore\(\);/.test(drMain),
+    "页面接的就是 draft.ts 那一份（顶层就绑上 vdir 后端）");
+  check(!/idbDraftStore/.test(drSrc), "旧单槽 IndexedDB 装配没有留成半死代码（要么接上要么清掉）");
+  const drTargetAt = drMain.indexOf("const autosaveTarget = ");
+  const drTargetFn = drMain.slice(drTargetAt, drTargetAt + 600);
+  check(drTargetAt > 0 && /autosaveTargetFor\(\{/.test(drTargetFn) && /savable: canSave\(\)/.test(drTargetFn)
+    && /hasDir: !!projectDir && dirWritable !== false/.test(drTargetFn) && /draftable: !!doc\?\.scene/.test(drTargetFn)
+    && /slot: currentDraftSlot\(\)/.test(drTargetFn),
+    "自动保存目标按「有没有内容 / 文件夹可不可写 / 快照装不装得下 / 草稿槽」算出来");
+  const drSched = drMain.slice(drMain.indexOf("function scheduleAutosave()"), drMain.indexOf("async function flushDraftSnapshot"));
+  check(!/if \(!projectDir/.test(drSched) && /const target = autosaveTarget\(\);/.test(drSched) && /if \(target === "none"\) \{/.test(drSched),
+    "scheduleAutosave 先算目标、不再因为「没有项目文件夹」直接放弃（C6 的放宽就在这）");
+  check(/if \(target === "draft"\) void flushDraftSnapshot\(\);/.test(drMain) && /else void flushAutosave\(\);/.test(drMain),
+    "两条路各有各的落点：文件夹走 flushAutosave，草稿走 flushDraftSnapshot");
+  check(/async function flushDraftSnapshot\(force = false\)/.test(drMain) && /draftStore\.save\(d, slot\)/.test(drMain)
+    && /makeDraft\(snap, draftOriginFor\(\), overlay\?\.entry \?\? "scene\.json", overlay\?\.added\(\) \?\? \[\]/.test(drMain),
+    "快照写的就是当前文档（标题 / 工程 / 场景 / 入口 / 叠加层文件）");
+  check(/warnNoAutosaveTarget\(\)/.test(drMain) && /if \(!doc \|\| warnedNoSaveFor === doc\) return;/.test(drMain)
+    && /log\(et\("log\.cannotSaveKind"/.test(drMain),
+    "不写的时候明确提示一次，不静默（同一次打开只提示一次）");
+  check(/probeWritable\(dir\)\.then\(/.test(drMain) && /dirWritable = false;/.test(drMain) && /log\.dirNotWritable/.test(drMain),
+    "文件夹不可写：探一次（只探一次，不每 400ms 撞墙）→ 退到草稿槽 + 明确报出目录名与原因");
+  check(/function flushPendingSave\(\)/.test(drMain) && /visibilitychange[\s\S]{0,160}flushPendingSave\(\)/.test(drMain),
+    "页面隐藏前按同一个目标分流落盘（切后台 / 关标签页不丢未保存编辑）");
+  check(/function flushDraftSnapshot\(force = false\)/.test(drMain) && /void flushDraftSnapshot\(true\)/.test(drMain),
+    "隐藏时不受节流限制，立刻把最后一次编辑写进快照");
+  check(/async function restoreDraft\(pending: \{ slot: string; draft: Draft \}\)/.test(drMain) && /applyDraft\(target, d\)/.test(drMain)
+    && /rebuildTree|applyDraftSnapshot\(d\)/.test(drMain),
+    "恢复：把快照套回文档（标题 / 工程 / 场景写回并重建图层树，判据就是上面那条往返一致）");
+  check(/newOpened\(d\.title, d\.project \?\? newProject\(d\.title\), d\.scene\)/.test(drMain) && /docDriven: true/.test(drMain),
+    "没有原始来源可重开（会话内 / 本地文件夹句柄失效）时按快照在内存里重建，不静默丢");
+  check(/function clearOwnDraftSlot\(slot: string = currentDraftSlot\(\)\) \{\s*\n\s*if \(!slot \|\| lastDraftSlot !== slot\) return;/.test(drMain)
+    && /clearOwnDraftSlot\(prevSlot\);/.test(drMain) && /clearOwnDraftSlot\(\);/.test(drMain) && /lastDraftSlot = slot;/.test(drMain),
+    "内容落到文件夹后清草稿副本，但只清本次会话自己写过的槽（上一次会话留下的快照不碰，可能只有那一份）");
+  check(/const nowSlot = currentDraftSlot\(\);\s*\n\s*if \(nowSlot !== pending\.slot\) \{\s*\n\s*try \{\s*\n\s*await draftStore\.save\(d, nowSlot\);\s*\n\s*draftWrittenAt = Date\.now\(\);\s*\n\s*lastDraftSlot = nowSlot;\s*\n\s*await draftStore\.clear\(pending\.slot\);/.test(drMain),
+    "重建后槽会挪（local: → 会话槽）：先落新槽再清旧槽，不留一条每次都冒出来的旧快照");
+  check(/if \(from\.kind === "library"\)[\s\S]{0,500}openLibraryItem\(it, MEDIA_BASE, WEB_BASE\)/.test(drMain)
+    && /if \(from\.kind === "virtual"\)[\s\S]{0,500}openVirtualProject\(from\.id\)/.test(drMain),
+    "库条目 / 虚拟工程各自重开原始资源，再把快照套上去（增量快照，不靠一份全量拷贝）");
+  check(/log\(et\("log\.draftMissing", \{ id \}\), "error"\)/.test(drMain) && /log\(et\("log\.vdirMissing", \{ name: d\.title \}\), "warn"\)/.test(drMain),
+    "来源已经不在（库条目被删 / 目录没了）明确报错，不静默丢弃");
+  check(/overlay\?\.put\(f\.name, f\.data, g\);/.test(drMain) && /overlay\?\.share\(owner, f\.name\)/.test(drMain),
+    "快照里的叠加层文件按组还原（第一个 put，同组其余 share）");
+  check(/checkDraftRecovery\(\)/.test(drMain) && /await draftStore\.list\(\)/.test(drMain) && /pendingDraft = \{ slot: info\.slot, draft: d \}/.test(drMain),
+    "启动时查一遍快照，只提示、不自动打开");
+  check(/if \(item && \(d\.origin\.kind !== "library" \|\| d\.origin\.itemId !== item\)\) continue;/.test(drMain),
+    "带 ?item=<库条目> 时只认这一条的草稿（不会拿别的工程的快照往它身上套）");
+  const drRecoverAt = drMain.indexOf("async function checkDraftRecovery");
+  const drRecoverBody = drMain.slice(drRecoverAt, drMain.indexOf("async function restoreDraft"));
+  check(drRecoverAt > 0 && !/draftBannerEl/.test(drRecoverBody)
+    && /void checkVirtualResume\(\);\s*\n\s*\/\/[^\n]*\n\s*void checkDraftRecovery\(\);/.test(drMain),
+    "启动时两条横幅互不顶替：同一个内置工程有未保存编辑也照样提示，不看另一条横幅的时序 / DOM（两条同时在就上下排开）");
+  const drVirtualAt = drMain.indexOf('if (from.kind === "virtual")');
+  const drVirtualBody = drMain.slice(drVirtualAt, drMain.indexOf("// 会话内"));
+  check(drVirtualAt > 0 && /openVirtualProject\(from\.id\)/.test(drVirtualBody) && /filesFromDirectory\(dir\)/.test(drVirtualBody)
+    && /adoptProject\(dir\)/.test(drVirtualBody) && /files\.length \? openLocalFiles\(files\)/.test(drVirtualBody)
+    && /newOpened\(d\.title, d\.project \?\? newProject\(d\.title\), d\.scene\)/.test(drVirtualBody),
+    "虚拟工程草稿：目录还在就按目录重开，目录空了（存储被清过）就按快照重建并 adopt 回该目录（不静默丢）");
+  check(/draftRecoverRestoreEl\.onclick/.test(drMain) && /draftRecoverDiscardEl\.onclick/.test(drMain)
+    && /draftRestoreEl\.onclick = \(\) => \{[\s\S]{0,200}resumeVirtualProject/.test(drMain),
+    "两条横幅各绑各的处理函数：一条重开目录，一条恢复未保存编辑（语义不混）");
+
+  // ---- 横幅 DOM / 样式 / i18n：与既存 #ed-draft 可区分 ----
+  check(/id="ed-draft-recover" role="status" hidden/.test(drHtml) && drHtml.indexOf('id="ed-draft-recover"') > drHtml.indexOf('id="ed-draft"'),
+    "未保存编辑横幅是独立一条，排在「重开上次目录」横幅之后");
+  check(/id="draft-recover-restore"/.test(drHtml) && /id="draft-recover-discard"/.test(drHtml)
+    && /id="ed-draft-recover"[\s\S]{0,300}data-et="draft\.restore"[\s\S]{0,200}data-et="draft\.discard"/.test(drHtml),
+    "新横幅有自己的按钮 id，文案复用既有的「恢复 / 丢弃」两条");
+  check(/#ed-draft-recover,/.test(drCss) && /#ed-draft:not\(\[hidden\]\) \+ #ed-draft-recover \{/.test(drCss),
+    "新横幅沿用同一套横幅样式；两条同时在时下沉一行，不叠在一起");
+  check(/const draftRecoverTextEl = \$[^(]*\("#ed-draft-recover-text"\)/.test(drMain) && /et\("draft\.unsavedFound", \{/.test(drMain),
+    "横幅文案走 i18n，不是硬编码");
+  check(/et\("vdir\.found", \{ name: rec\.name/.test(drMain) && /et\("draft\.unsavedFound"/.test(drMain),
+    "两条横幅的文案指向不同的事：一条说「发现上次的工程」，一条说「发现未保存的编辑」");
+  check((drI18n.match(/"draft\.unsavedFound":/g) ?? []).length === 2, "draft.unsavedFound 中英文各恰好一条");
+  check(drI18n.includes('"draft.unsavedFound": "发现未保存的编辑「{title}」（{time}）"')
+    && drI18n.includes('"draft.unsavedFound": "Unsaved edits found: \\"{title}\\" ({time})"'),
+    "中英文都真翻译了（不是同一串占位）");
+
+  // ---- 变异红测：把上面三条底线各破一次，判据必须变红 ----
+  const drMut = async (from, to, tag) => {
+    const mut = drSrc.replace(from, to);
+    check(mut !== drSrc, `注入点存在（${tag}）`);
+    return loadEditorModule("draft", { [drPath]: mut });
+  };
+  const mutTarget = await drMut('  return state.draftable && state.slot ? "draft" : "none";', '  return "none";', "草稿槽不再兜底");
+  check(mutTarget.autosaveTargetFor({ savable: true, hasDir: false, draftable: true, slot: "library:beach" }) === "none",
+    "去掉草稿槽兜底的话，「库来源 / 不可写目录也自动保存」的判据变红");
+  const mutEvict = await drMut("if (kept > 0 && (kept >= maxSlots || bytes + i.bytes > maxBytes))", "if (kept >= 0 && (kept >= maxSlots || bytes + i.bytes > maxBytes))", "淘汰时不留最新一条");
+  const beM = vdirMod.memoryVdirBackend();
+  const storeM = mutEvict.vdirDraftStore(beM, 1, 1);
+  await storeM.save(slotSnap(9), "only");
+  check((await storeM.load("only")) === null, "淘汰时不排除最新一条的话，「刚存的那条不会被自己淘汰」的判据变红");
+  const mutLoose = await drMut('  } else if (o.kind === "local") {\n    if (!nonEmpty(o.name)) return null;', '  } else if (o.kind === "local") {\n    // 不校验 name', "本地来源不校验 name");
+  check(mutLoose.parseDraft({ ...snap, origin: { kind: "local" } }) !== null,
+    "本地来源漏校验 name 的话，「坏快照一律拒」的判据变红");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {
