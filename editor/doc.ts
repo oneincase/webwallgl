@@ -162,6 +162,9 @@ export function writeObjProps(obj: SceneObject, patch: Partial<EditorLayerProps>
   if (patch.visible !== undefined) put("visible", patch.visible);
   if (patch.alpha !== undefined) put("alpha", Math.round(patch.alpha * 1e5) / 1e5);
   if (patch.color) put("color", vecStr(patch.color));
+  // M4 A7：亮度。与上面几个字段同一口径（规范键写回、包装只改 .value）；引擎本来就
+  // 消费它（parse.js 的 parseNum(o.brightness, 1) + objectAnimations 白名单含 brightness）。
+  if (patch.brightness !== undefined) put("brightness", Math.round(patch.brightness * 1e5) / 1e5);
 }
 
 // ---------- 结构编辑（增删 / 复制 / 重排）：只改文档，引擎侧整场景重挂 ----------
