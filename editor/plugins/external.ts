@@ -334,7 +334,19 @@ export type ExternalPluginHost = {
   storage: StorageService | null;
 };
 
-export const grantedOf = (m: PluginManifest) => (m.permissions ?? []).filter((p) => p in GRANTABLE);
+/** 逐项权限开关的设置键（D6）：缺省视为开启，只有显式写成 false 才算关闭 */
+export const permKey = (id: string, permission: string) => `plugins.perm.${id}.${permission}`;
+
+/** 已按插件逐项关闭的权限集合（管理面板的开关写这里；只读，未见过的默认开启） */
+export function deniedPermissions(settings: SettingsService | undefined, id: string): ReadonlySet<string> {
+  const out = new Set<string>();
+  if (!settings) return out;
+  for (const p of Object.keys(GRANTABLE)) if (settings.get<boolean>(permKey(id, p), true) === false) out.add(p);
+  return out;
+}
+
+/** 授予集合 = 清单声明的权限 ∩ GRANTABLE − 逐项关掉的；第二个参数缺省 = 不关任何项（行为与旧版一致） */
+export const grantedOf = (m: PluginManifest, denied?: ReadonlySet<string>) => (m.permissions ?? []).filter((p) => p in GRANTABLE && !denied?.has(p));
 
 function scopedStorage(s: StorageService, ns: string): StorageService {
   return {
@@ -356,6 +368,8 @@ export type ExternalDeps = {
 export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginObject {
   const m = pkg.manifest;
   const c = m.contributes ?? {};
+  // 逐项权限开关在挂载时结算一次；面板改开关后会 reload → 用新白名单重挂
+  const denied = deniedPermissions(deps.settings, m.id);
   const need = new Set<string>();
   if (c.effects?.length) need.add("effects");
   if (c.particles?.length) need.add("particles.templates");
@@ -399,8 +413,8 @@ export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginOb
         settings: deps.settings?.scope(`plugin.${m.id}`) ?? null,
         storage: deps.storage ? scopedStorage(deps.storage, `plugin.${m.id}.`) : null,
       };
-      // 白名单只放清单声明且可授予的服务；子插件 inject 了未授权服务 → 永远 pending（管理面板显示缺权限）
-      ctx.plugin(entry as PluginObject, host, { allow: grantedOf(m), meta: { manifest: m, code: true } });
+      // 白名单只放清单声明、可授予、且没被逐项关掉的服务；子插件 inject 了未授权服务 → 永远 pending（管理面板显示缺权限）
+      ctx.plugin(entry as PluginObject, host, { allow: grantedOf(m, denied), meta: { manifest: m, code: true } });
     },
   };
 }

@@ -10,7 +10,7 @@
 
 import type { Context, Disposer, PluginObject, Scope, ScopeStatus } from "../core";
 import type { SettingsService, StorageService } from "../services/types";
-import { externalPlugin, grantedOf, packageFromFiles, type ExternalDeps, type PluginManifest, type PluginPackage } from "./external";
+import { deniedPermissions, externalPlugin, grantedOf, packageFromFiles, type ExternalDeps, type PluginManifest, type PluginPackage } from "./external";
 
 export type PluginSource = {
   kind: PluginPackage["source"];
@@ -194,7 +194,8 @@ export function createPluginManager(o: ManagerOptions): PluginManager {
       status: !m ? "invalid" : !w ? "disabled" : !enabled || !s ? "disabled" : (worst?.status ?? "pending"),
       error: k.error ?? (err ? ((err as Error)?.message ?? String(err)) : null),
       missing: worst?.status === "pending" ? worst.missing : [],
-      granted: m ? grantedOf(m) : [],
+      // 授予集合要扣掉面板里逐项关掉的权限（D6）；未设置过的项照旧视为开启
+      granted: m ? grantedOf(m, deniedPermissions(o.settings, id)) : [],
       removable: !!k.source.remove,
     };
   }

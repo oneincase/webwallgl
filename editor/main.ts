@@ -80,6 +80,7 @@ import {
 } from "./effects";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
+import { createPluginLog } from "./plugins/log";
 import { bundledSource, createPluginManager, dirSource, storeSource } from "./plugins/manager";
 import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
 import { textOf } from "./core";
@@ -6302,8 +6303,19 @@ const VIDEO_EXPORTER: Exporter = {
 
 let app: EditorApp | null = null;
 
-function reportPluginError(name: string, e: unknown, where = "callback") {
-  log(et("log.pluginError", { name, where, msg: (e as Error)?.message ?? String(e) }), "error");
+/** 插件运行日志（管理面板的「插件日志」区读它；与 console 无关，纯内存环形缓冲） */
+const pluginLog = createPluginLog();
+
+function reportPluginError(name: string, e: unknown, where = "callback", pluginId = name) {
+  const msg = (e as Error)?.message ?? String(e);
+  pluginLog.push(pluginId, "error", `${where}: ${msg}`);
+  log(et("log.pluginError", { name, where, msg }), "error");
+}
+
+/** 日志记账用的插件 id：外部插件的代码子插件挂载时带了清单 meta，没有就退回 Scope 名 */
+function manifestIdOf(s: { name: string; meta: Record<string, unknown> }): string {
+  const m = s.meta.manifest as { id?: string } | undefined;
+  return typeof m?.id === "string" ? m.id : s.name;
 }
 
 /** 工程用到的外部插件（导出时写进 project.json 的 editor.plugins） */
@@ -6388,7 +6400,7 @@ async function bootPlugins() {
       // 与其它内置插件同一条装配路径，profile 里可按名字 disable 或替换实现
       catalog: { "builtin-ui": builtinUiPlugin },
       profile: { plugins: [{ name: "builtin-ui" }] },
-      onError: (s, e, where) => reportPluginError(s.name, e, where),
+      onError: (s, e, where) => reportPluginError(s.name, e, where, manifestIdOf(s)),
     },
   );
   const ui = app.ui;
@@ -6466,6 +6478,8 @@ async function startExternalPlugins(a: EditorApp) {
     dialog: $<HTMLDialogElement>("#plugins-dlg"),
     list: $("#plugins-list"),
     manager: m,
+    settings: a.settings,
+    logs: pluginLog,
     t: et,
     text,
     log,
@@ -6476,6 +6490,11 @@ async function startExternalPlugins(a: EditorApp) {
         : [et("pl.installPerms", { list: [...high, ...low].join(", ") }), high.length ? et("pl.installHigh", { list: high.join(", ") }) : ""].filter(Boolean).join("\n");
       return confirm(et("pl.installConfirm", { name: text(man.name, man.id), version: man.version, perms }));
     },
+  });
+  // 插件出错/装完/权限开关都往日志里记，面板开着时立刻刷新那一行
+  pluginLog.onChange(() => {
+    const dlg = $<HTMLDialogElement>("#plugins-dlg");
+    if (dlg.open) panel.render();
   });
   const inPluginEl = $<HTMLInputElement>("#in-plugin");
   $("#tb-plugins").onclick = () => panel.open();

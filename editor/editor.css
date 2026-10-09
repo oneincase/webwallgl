@@ -1511,6 +1511,67 @@ input.ed-al-name {
   white-space: pre-wrap;
 }
 
+/* ---------- 插件面板：逐项权限开关 / 日志（M10/D6） ---------- */
+
+.ed-plugin-perms {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 6px;
+}
+
+.ed-plugin-perms-title {
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-perm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-perm-name {
+  font-family: var(--mono);
+}
+
+.ed-plugin-perm-name.is-high {
+  color: #e6c069;
+}
+
+.ed-plugin-logs {
+  margin-top: 6px;
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-logs > summary {
+  cursor: pointer;
+  color: var(--wb-fg-dim);
+}
+
+.ed-plugin-log {
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.ed-plugin-log.is-warn {
+  color: #e6c069;
+}
+
+.ed-plugin-log.is-error {
+  color: #f08080;
+}
+
+.ed-plugin-log.is-empty {
+  color: var(--wb-fg-mute);
+  font-family: inherit;
+}
+
 /* ---------- 状态栏 ---------- */
 
 #st-doc {
