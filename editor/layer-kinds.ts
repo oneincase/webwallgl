@@ -5,7 +5,7 @@
 // 插件图层类型只是「scene.json 里某种对象形状」的识别 + 编辑入口，对象本身必须是 WE 认识的
 // 形状（image / particle / sound / model / light …），WE 不认识的字段 WE 会忽略。
 
-import { createRegistry } from "./core/registry";
+import { createRegistry } from "./core";
 import type { EditorDoc, SceneObject } from "./doc";
 
 export type LayerKindDef = {

@@ -7,7 +7,7 @@
 // 木偶工具 = 模型层专属的分组（骨骼 / 片段 / 附着点 / 换贴图……）；
 // 木偶生成器 = 「从别的东西造一个 puppet」（如一张图 → 带骨骼的摆动网格），产物走模型导入的后半段。
 
-import { createRegistry } from "./core/registry";
+import { createRegistry } from "./core";
 import type { LayerNode } from "./doc";
 import type { Gltf } from "./gltf";
 import type { ModelIR } from "./model-ir";

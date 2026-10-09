@@ -8,7 +8,7 @@
 // 最后一道闸是 we-compat 规则：用引擎自己的解析器把产物再读一遍（renderer/src/editor/compat.ts）。
 
 import { checkWeCompat, type WeCompatIssue } from "../renderer/src/api/editor";
-import { createRegistry, type Registry } from "./core/registry";
+import { createRegistry, type Registry } from "./core";
 import type { EditorDoc } from "./doc";
 import { downloadZip, packProject, pickDirectory, slugName, writeToDirectory, type SaveFile } from "./save";
 

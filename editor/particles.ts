@@ -15,8 +15,8 @@
 // case），插件模板里出现白名单外的组件名会被拒绝 —— 不让插件造出 WE 不认的粒子文件。
 
 import { nextObjectId, rebuildTree, unwrap, type EditorDoc, type SceneObject } from "./doc";
-import { createRegistry } from "./core/registry";
-import type { Schema } from "./core/schema";
+import { createRegistry } from "./core";
+import type { Schema } from "./core";
 
 export type ParticlePreset = string;
 export const PARTICLE_PRESETS: readonly ParticlePreset[] = ["snow", "rain", "embers", "bokeh"];

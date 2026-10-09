@@ -3,7 +3,7 @@
 // 测试台的 setLang 会用它自己的词典刷一遍所有 data-i18n，查不到的键会被刷成键名本身。
 
 import { getLang, onChangeLang } from "../bench/i18n";
-import { baseLang } from "./core/schema";
+import { baseLang } from "./core";
 
 const DICT: Record<"zh" | "en", Record<string, string>> = {
   zh: {
@@ -303,10 +303,16 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.status.disposed": "已卸载",
     "pl.c.effects": "{n} 个效果",
     "pl.c.particles": "{n} 个粒子模板",
+    "pl.c.components": "{n} 个粒子组件",
     "pl.c.shaders": "{n} 个 shader 片段",
     "pl.c.i18n": "词条",
     "pl.c.code": "代码",
     "pl.perms": "权限：{list}",
+    "pl.permsTitle": "逐项权限：",
+    "pl.permHigh": "高风险权限：可读写文档 / 工程文件，关掉后插件只能贡献数据",
+    "pl.logs": "插件日志",
+    "pl.logsEmpty": "暂无日志",
+    "pl.logsClear": "清空",
     "pl.missing": "等不到这些服务（清单里没申请权限，或提供者没启用）：{list}",
     "save.pkg": "WE 原生格式（scene.pkg）",
     "save.pkgTitle": "打成 WE 原生 scene.pkg（图片贴图转 .tex），官方 Wallpaper Engine 可直接加载",
@@ -998,10 +1004,16 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "pl.status.disposed": "Unloaded",
     "pl.c.effects": "{n} effect(s)",
     "pl.c.particles": "{n} particle template(s)",
+    "pl.c.components": "{n} particle component(s)",
     "pl.c.shaders": "{n} shader snippet(s)",
     "pl.c.i18n": "strings",
     "pl.c.code": "code",
     "pl.perms": "Permissions: {list}",
+    "pl.permsTitle": "Per-permission:",
+    "pl.permHigh": "High risk: can read/write the document and project files; off means data-only contribution",
+    "pl.logs": "Plugin log",
+    "pl.logsEmpty": "No entries yet",
+    "pl.logsClear": "Clear",
     "pl.missing": "Waiting for services (not requested in the manifest, or no provider enabled): {list}",
     "save.pkg": "WE native format (scene.pkg)",
     "save.pkgTitle": "Pack into a WE-native scene.pkg (image textures become .tex) that the official Wallpaper Engine loads directly",

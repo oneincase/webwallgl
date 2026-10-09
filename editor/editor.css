@@ -396,6 +396,48 @@ html[data-theme="light"] .ed-kind[data-kind="video"] { color: #b7791f; }
   pointer-events: none;
 }
 
+/* ── 插件槽位容器（M10/D1）────────────────────────────────
+   宿主 main.ts 统一按「槽位没有贡献就 hidden」管理可见性，所以这里的布局规则不要设 display，
+   只调整方向；隐藏始终交给 .ed-plugin-group[hidden] / 属性选择器。 */
+.ed-plugin-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ed-plugin-group[hidden] {
+  display: none;
+}
+
+/* 菜单类槽位：插件项竖排，跟内置菜单项一致 */
+#ed-plugin-export {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+
+/* 右栏槽位：竖排、撑满，作为面板区块堆叠 */
+#ed-plugin-right,
+#ed-plugin-project {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+/* viewport.overlay：在画布叠层（#ed-overlay，z-index 1）之上；容器不吃事件，子元素可交互 */
+#ed-plugin-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+#ed-plugin-overlay > * {
+  pointer-events: auto;
+}
+
 /* 视口底色两个主题都是深色，空态文字固定浅色 */
 #ed-empty {
   position: absolute;
@@ -1579,6 +1621,67 @@ input.ed-al-name {
   color: #f08080;
   font-size: var(--wb-font-sm);
   white-space: pre-wrap;
+}
+
+/* ---------- 插件面板：逐项权限开关 / 日志（M10/D6） ---------- */
+
+.ed-plugin-perms {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 6px;
+}
+
+.ed-plugin-perms-title {
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-perm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-perm-name {
+  font-family: var(--mono);
+}
+
+.ed-plugin-perm-name.is-high {
+  color: #e6c069;
+}
+
+.ed-plugin-logs {
+  margin-top: 6px;
+  font-size: var(--wb-font-sm);
+}
+
+.ed-plugin-logs > summary {
+  cursor: pointer;
+  color: var(--wb-fg-dim);
+}
+
+.ed-plugin-log {
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.ed-plugin-log.is-warn {
+  color: #e6c069;
+}
+
+.ed-plugin-log.is-error {
+  color: #f08080;
+}
+
+.ed-plugin-log.is-empty {
+  color: var(--wb-fg-mute);
+  font-family: inherit;
 }
 
 /* ---------- 状态栏 ---------- */

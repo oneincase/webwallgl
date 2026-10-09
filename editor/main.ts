@@ -87,6 +87,7 @@ import {
 } from "./effects";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
+import { createPluginLog } from "./plugins/log";
 import { bundledSource, createPluginManager, dirSource, storeSource } from "./plugins/manager";
 import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
 import { textOf } from "./core";
@@ -6711,8 +6712,19 @@ const VIDEO_EXPORTER: Exporter = {
 
 let app: EditorApp | null = null;
 
-function reportPluginError(name: string, e: unknown, where = "callback") {
-  log(et("log.pluginError", { name, where, msg: (e as Error)?.message ?? String(e) }), "error");
+/** 插件运行日志（管理面板的「插件日志」区读它；与 console 无关，纯内存环形缓冲） */
+const pluginLog = createPluginLog();
+
+function reportPluginError(name: string, e: unknown, where = "callback", pluginId = name) {
+  const msg = (e as Error)?.message ?? String(e);
+  pluginLog.push(pluginId, "error", `${where}: ${msg}`);
+  log(et("log.pluginError", { name, where, msg }), "error");
+}
+
+/** 日志记账用的插件 id：外部插件的代码子插件挂载时带了清单 meta，没有就退回 Scope 名 */
+function manifestIdOf(s: { name: string; meta: Record<string, unknown> }): string {
+  const m = s.meta.manifest as { id?: string } | undefined;
+  return typeof m?.id === "string" ? m.id : s.name;
 }
 
 /** 工程用到的外部插件（导出时写进 project.json 的 editor.plugins） */
@@ -6753,8 +6765,8 @@ const builtinUiPlugin = {
     for (const g of BUILTIN_INSPECTOR) ctx.contribute("inspector", g);
     for (const t of BUILTIN_PUPPET_TOOLS) ctx.contribute("puppet.tools", t);
     ctx.contribute("exporters", VIDEO_EXPORTER);
-    const cmds = ctx.get("commands").registry;
-    const cmd = (c: Parameters<typeof cmds.add>[0]) => ctx.effect(() => cmds.add(c, ctx.name));
+    const cmds = ctx.get("commands");
+    const cmd = (c: Parameters<typeof cmds.register>[0]) => ctx.effect(() => cmds.register(c, ctx.name));
     cmd({ id: "edit.undo", keys: "Mod+Z", run: () => undoRedo("undo") });
     cmd({ id: "edit.redo", keys: ["Mod+Shift+Z", "Mod+Y"], run: () => undoRedo("redo") });
     cmd({ id: "file.save", keys: "Mod+S", run: () => void saveDocument() });
@@ -6792,9 +6804,14 @@ async function bootPlugins() {
       },
       engine: { controls: () => editor, remount: () => void mountCurrent(true) },
     },
-    { onError: (s, e, where) => reportPluginError(s.name, e, where) },
+    {
+      // 内置 UI 插件（检视器分组 / 木偶工具 / 视频导出 / 快捷键命令）也走 catalog + profile：
+      // 与其它内置插件同一条装配路径，profile 里可按名字 disable 或替换实现
+      catalog: { "builtin-ui": builtinUiPlugin },
+      profile: { plugins: [{ name: "builtin-ui" }] },
+      onError: (s, e, where) => reportPluginError(s.name, e, where, manifestIdOf(s)),
+    },
   );
-  app.plugin(builtinUiPlugin);
   const ui = app.ui;
   const pluginToolsEl = $<HTMLElement>("#ed-plugin-tools");
   const syncPluginTools = () => (pluginToolsEl.hidden = !ui.items("toolbar").length);
@@ -6805,6 +6822,31 @@ async function bootPlugins() {
     unmountTools = ui.mount("toolbar", pluginToolsEl);
   });
   syncPluginTools();
+  // ── 插件槽位接线（M10/D1）──
+  // 除主工具条外的槽位：每个槽位一个宿主容器（editor/index.html），沿用同一条纪律——
+  // 没有贡献就隐藏、切语言时重建（item.render 里可能用了 t()）。
+  const pluginSlotHosts: Array<[string, string]> = [
+    ["menu.export", "#ed-plugin-export"],
+    ["menu.add", "#ed-plugin-add"],
+    ["panel.right", "#ed-plugin-right"],
+    ["inspector.project", "#ed-plugin-project"],
+    ["statusbar", "#ed-plugin-status"],
+    ["viewport.overlay", "#ed-plugin-overlay"],
+  ];
+  const unmountPluginSlots: Array<() => void> = [];
+  const mountPluginSlots = () => {
+    for (const [slot, sel] of pluginSlotHosts) {
+      const host = $<HTMLElement>(sel);
+      const sync = () => (host.hidden = !ui.items(slot).length);
+      unmountPluginSlots.push(ui.mount(slot, host), ui.onChange(slot, sync));
+      sync();
+    }
+  };
+  mountPluginSlots();
+  onChangeLang(() => {
+    for (const off of unmountPluginSlots.splice(0)) off();
+    mountPluginSlots();
+  });
   await app.root.kernel.settle();
   for (const u of app.load.unresolved) log(et("log.pluginError", { name: u.name, where: "inject", msg: u.missing.join(", ") }), "warn");
   effectCatalog.onChange(() => renderInspector());
@@ -6845,6 +6887,8 @@ async function startExternalPlugins(a: EditorApp) {
     dialog: $<HTMLDialogElement>("#plugins-dlg"),
     list: $("#plugins-list"),
     manager: m,
+    settings: a.settings,
+    logs: pluginLog,
     t: et,
     text,
     log,
@@ -6855,6 +6899,11 @@ async function startExternalPlugins(a: EditorApp) {
         : [et("pl.installPerms", { list: [...high, ...low].join(", ") }), high.length ? et("pl.installHigh", { list: high.join(", ") }) : ""].filter(Boolean).join("\n");
       return confirm(et("pl.installConfirm", { name: text(man.name, man.id), version: man.version, perms }));
     },
+  });
+  // 插件出错/装完/权限开关都往日志里记，面板开着时立刻刷新那一行
+  pluginLog.onChange(() => {
+    const dlg = $<HTMLDialogElement>("#plugins-dlg");
+    if (dlg.open) panel.render();
   });
   const inPluginEl = $<HTMLInputElement>("#in-plugin");
   $("#tb-plugins").onclick = () => panel.open();

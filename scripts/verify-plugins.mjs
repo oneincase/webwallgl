@@ -11,6 +11,8 @@
  *   D. 来源：目录 > 已安装 > 内置示例的优先级与回落；内置示例缺省启用、可停用不可卸载；版本戳变化热重载（watch 轮询）；卸载；
  *   E. dev 宿主插件目录：清单列举、版本戳、越界 / 点文件拒绝；
  *   F. 示例插件（examples/plugins/*）全部能装上且 active；木偶生成器产物经 irToGltf → gltfToModel 往返；
+ *   H. M10：七个 UI 槽位都能被贡献且 mount 时真的渲染进宿主（含变化重绘与卸载清理）；
+ *      particles.components 数据入口（路径数组校验 / 组件白名单 / 参数 DSL / 停用回落内置）；逐项权限开关结算 allow；
  *   G. 变异红测：把权限门控 / 启用判断 / 整包原子性改坏，确认对应判据变红。
  */
 import { build } from "esbuild";
@@ -132,7 +134,13 @@ async function bootWith(M, sources, host = {}) {
 const DATA_PLUGIN = {
   "wwgl-plugin.json": manifest({
     id: "fx-test",
-    contributes: { effects: ["fx/glow.json"], shaders: ["glsl/wave.glsl"], particles: ["pt/dust.json"], i18n: { "zh-CN": "i18n/zh.json", en: "i18n/en.json" } },
+    contributes: {
+      effects: ["fx/glow.json"],
+      shaders: ["glsl/wave.glsl"],
+      particles: ["pt/dust.json"],
+      "particles.components": ["pt/component.json"],
+      i18n: { "zh-CN": "i18n/zh.json", en: "i18n/en.json" },
+    },
   }),
   "fx/glow.json": json({
     id: "plug_glow",
@@ -154,6 +162,11 @@ const DATA_PLUGIN = {
     operator: [{ name: "movement" }],
     renderer: { name: "sprite" },
   }),
+  "pt/component.json": json({
+    id: "lifetimerandom",
+    kind: "initializer",
+    params: [{ key: "min", type: "float", default: 1, min: 0 }, { key: "max", type: "float", default: 2, min: 0 }],
+  }),
   "i18n/zh.json": json({ "plug.hello": "你好插件" }),
   "i18n/en.json": json({ "plug.hello": "Hello plugin" }),
 };
@@ -171,6 +184,10 @@ async function suite(M) {
   check(bad.manifest === null && bad.errors.length >= 7, `坏清单逐项报错（${bad.errors.length} 项）`);
   const unk = ext.parseManifest({ id: "a-b", name: "x", version: "1.2.3", engine: "^1.0", contributes: { themes: [] } });
   check(unk.manifest === null && /contributes\.themes/.test(unk.errors.join()), "坏清单：未知 contributes 键拒绝（拼错的贡献点不能静默忽略）");
+  const compMf = ext.parseManifest({ id: "a-b", name: "x", version: "1.2.3", engine: "^1.0", contributes: { "particles.components": ["pt/c.json"] } });
+  check(json(compMf.manifest?.contributes?.["particles.components"]) === json(["pt/c.json"]), "清单接受 contributes.particles.components 路径数组");
+  const badComp = ext.parseManifest({ id: "a-b", name: "x", version: "1.2.3", engine: "^1.0", contributes: { "particles.components": "pt/c.json" } });
+  check(badComp.manifest === null && /contributes\.particles\.components 必须是路径数组/.test(badComp.errors.join()), "contributes.particles.components 写成字符串被拒");
   check(ext.normPath("../a") === null && ext.normPath("/a") === null && ext.normPath("a//b") === null && ext.normPath("./a\\b") === "a/b", "包内路径：拒绝 .. / 绝对路径 / 空段，反斜杠转正斜杠");
   {
     const pkg = ext.packageFromFiles(files({ "my-plugin/wwgl-plugin.json": manifest({ id: "nested" }), "my-plugin/a.txt": "x", "../evil": "y" }));
@@ -200,14 +217,18 @@ async function suite(M) {
     check(/sin\(uv\.x \* 10\.0\)/.test(fragText) && !/#include "wwgl\//.test(fragText), "写盘时插件 shader 片段 include 已内联展开");
     check(M.shaderLib.shaderSnippets.get("wwgl/fx-test/wave"), "shader 片段 include 名 = wwgl/<插件 id>/<文件名>");
     check(M.pt.particleTemplates.get("plug-dust")?.maxcount === 100, "粒子模板登记");
+    const comp = M.pt.particleComponents.get("initializer:lifetimerandom");
+    check(comp?.params?.length === 2 && M.pt.particleComponents.ownerOf("initializer:lifetimerandom") === "ext:fx-test",
+      `粒子组件登记：清单里的组件 JSON 进了 particles.components，归属记在插件上（${comp?.params?.length} 个参数）`);
     check(M.i18n.hasText("plug.hello"), "插件词条登记");
     check(a.scopes().some((s) => s.meta?.manifest?.id === "fx-test" && s.status === "active"), "Scope 元数据带清单（导出时写进 project.json 的 editor.plugins）");
 
     await m.setEnabled("fx-test", false);
     check(!M.fx.effectCatalog.get("plug_glow") && !M.pt.particleTemplates.get("plug-dust") && !M.shaderLib.shaderSnippets.get("wwgl/fx-test/wave") && !M.i18n.hasText("plug.hello"), "停用：效果 / 粒子 / 片段 / 词条全部撤回");
+    check(M.pt.particleComponents.get("initializer:lifetimerandom")?.params === undefined, "停用：插件粒子组件撤回，回落到内置同名组件（内置项没有参数描述）");
     check(m.list().find((x) => x.id === "fx-test")?.status === "disabled", "停用状态可见");
     await m.setEnabled("fx-test", true);
-    check(M.fx.effectCatalog.get("plug_glow") && M.pt.particleTemplates.get("plug-dust"), "重新启用：贡献复原");
+    check(M.fx.effectCatalog.get("plug_glow") && M.pt.particleTemplates.get("plug-dust") && M.pt.particleComponents.get("initializer:lifetimerandom")?.params?.length === 2, "重新启用：贡献复原（含粒子组件）");
     await m.uninstall("fx-test");
     check(!store.has("fx-test") && !M.fx.effectCatalog.get("plug_glow") && !m.list().length, "卸载：来源删除、贡献撤回");
     m.dispose();
@@ -220,6 +241,33 @@ async function suite(M) {
     const e = m.list()[0];
     check(e?.status === "failed" && /teleport/.test(e.error ?? ""), `坏粒子模板（WE 不认的组件）整包失败并报出组件名（${e?.status}）`);
     check(!M.fx.effectCatalog.get("plug_glow") && !M.shaderLib.shaderSnippets.get("wwgl/fx-test/wave"), "整包原子：失败前已登记的效果 / 片段一并撤回");
+    m.dispose();
+  }
+  {
+    // 组件 id 要过 WE 引擎组件白名单（与内置组件同一条 validate），不认识 → 整包失败且不留痕
+    const badId = { ...DATA_PLUGIN, "pt/component.json": json({ id: "teleport", kind: "initializer" }) };
+    const { m } = await bootWith(M, [memSource("store", new Map([["fx-test", { stamp: "1", files: badId }]]))]);
+    await m.refresh();
+    const e = m.list()[0];
+    check(e?.status === "failed" && /WE 引擎不认识的粒子组件/.test(e.error ?? ""), `坏粒子组件（引擎不认的组件名）整包失败（${e?.status} ${e?.error ?? ""}）`);
+    check(!M.fx.effectCatalog.get("plug_glow") && M.pt.particleComponents.ownerOf("initializer:teleport") === undefined, "整包原子：坏组件连累前面已登记的效果也撤回");
+    m.dispose();
+  }
+  {
+    // kind 只能是四类组件之一，写错在清单解析阶段就整包拒掉
+    const badKind = { ...DATA_PLUGIN, "pt/component.json": json({ id: "lifetimerandom", kind: "teleport" }) };
+    const { m } = await bootWith(M, [memSource("store", new Map([["fx-test", { stamp: "1", files: badKind }]]))]);
+    await m.refresh();
+    check(m.list()[0]?.status === "failed" && /kind 必须是/.test(m.list()[0].error ?? ""), `坏粒子组件（kind 不在四类里）整包失败并说明（${m.list()[0]?.error ?? ""}）`);
+    check(!M.pt.particleComponents.get("initializer:lifetimerandom")?.params, "坏 kind 时没有任何组件被登记");
+    m.dispose();
+  }
+  {
+    // 参数描述复用参数 DSL 的逐项校验（key / type）
+    const badParams = { ...DATA_PLUGIN, "pt/component.json": json({ id: "lifetimerandom", kind: "initializer", params: [{ key: "min", type: "nope" }] }) };
+    const { m } = await bootWith(M, [memSource("store", new Map([["fx-test", { stamp: "1", files: badParams }]]))]);
+    await m.refresh();
+    check(m.list()[0]?.status === "failed" && /params\[0\]\.type 非法/.test(m.list()[0].error ?? ""), `坏粒子组件（参数类型不在 DSL 里）整包失败并指出字段（${m.list()[0]?.error ?? ""}）`);
     m.dispose();
   }
   {
@@ -500,6 +548,92 @@ async function examplesSuite(M) {
   return res;
 }
 
+// ── H. M10：七个 UI 槽位都有贡献者且真的被消费 / 逐项权限开关 ──
+
+/** 七个槽位名（与 editor/services/types.ts 的 SlotName 一致；新增槽位必须同时有宿主与消费方） */
+const M10_SLOTS = ["toolbar", "menu.export", "menu.add", "panel.right", "inspector.project", "statusbar", "viewport.overlay"];
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+/** 假槽位宿主：ui.ts 只用到 querySelectorAll / appendChild 和子节点的 remove */
+function fakeSlotHost() {
+  const all = [];
+  const live = () => all.filter((k) => !k.removed);
+  return {
+    hidden: true,
+    all,
+    get kids() {
+      return live();
+    },
+    querySelectorAll: () => live(),
+    appendChild: (el) => {
+      all.push(el);
+      return el;
+    },
+  };
+}
+const fakeSlotNode = () => ({ dataset: {}, removed: false, remove() { this.removed = true; } });
+
+async function m10Suite(M) {
+  const res = [];
+  const check = (ok, msg) => res.push({ ok: !!ok, msg });
+  const renders = [];
+  globalThis.__m10renders = renders;
+  globalThis.__m10node = fakeSlotNode;
+
+  const slotsCode = `export default { name: "m10-slots", inject: ["ui"], apply(ctx) {
+  const ui = ctx.get("ui");
+  for (const slot of ${JSON.stringify(M10_SLOTS)}) ctx.effect(() => ui.add(slot, { id: "m10-" + slot, order: 1, render() { globalThis.__m10renders.push(slot); return globalThis.__m10node(); } }));
+} };`;
+  const slotsPkg = { "wwgl-plugin.json": manifest({ id: "m10-slots", main: "index.js", permissions: ["ui"] }), "index.js": slotsCode };
+  const { m, a } = await bootWith(M, [memSource("store", new Map([["m10-slots", { stamp: "1", files: slotsPkg }]]))]);
+  await m.refresh();
+  const counts = M10_SLOTS.map((s) => `${s}=${a.ui.items(s).length}`);
+  check(M10_SLOTS.every((s) => a.ui.items(s).length === 1), `插件往七个槽位各贡献一项，items() 都能看到（${counts.join(" ")}）`);
+
+  const host = fakeSlotHost();
+  const off = a.ui.mount("statusbar", host);
+  const overlayHost = fakeSlotHost();
+  const offOverlay = a.ui.mount("viewport.overlay", overlayHost);
+  check(host.kids.length === 1 && host.kids[0].dataset.slotItem === "m10-statusbar" && renders.includes("statusbar"),
+    `挂槽位时真的消费贡献项：render 被调用并把 DOM 写进宿主（渲染过 ${json(renders)}）`);
+  check(overlayHost.kids.length === 1 && overlayHost.kids[0].dataset.slotItem === "m10-viewport.overlay", "viewport.overlay 槽位同样被消费（叠层节点进宿主）");
+
+  // 贡献变化 → 宿主重绘（合批到微任务）
+  const offExtra = a.ui.add("statusbar", { id: "m10-extra", order: 0, render: () => fakeSlotNode() });
+  await tick();
+  check(host.kids.length === 2, `槽位贡献变化后宿主重绘（2 项，实际 ${host.kids.length}）`);
+  offExtra();
+  await tick();
+  check(host.kids.length === 1, "撤下贡献项后宿主重绘回 1 项");
+
+  off();
+  offOverlay();
+  check(host.kids.length === 0 && overlayHost.kids.length === 0, "卸载槽位：渲染进宿主的贡献项被清掉");
+  m.dispose();
+  check(M10_SLOTS.every((s) => a.ui.items(s).length === 0), "插件卸载：七个槽位的贡献全部撤回");
+
+  // 逐项权限开关：settings 写 false → 挂载时结算的 allow 里就少了这一项
+  const permPkg = {
+    "wwgl-plugin.json": manifest({ id: "m10-perm", main: "index.js", permissions: ["inspector", "ui"] }),
+    "index.js": `export default { name: "m10-perm", inject: ["inspector", "ui"], apply(ctx) { ctx.get("ui").add("toolbar", { id: "m10-perm-btn", render: () => null }); } };`,
+  };
+  const { m: m2, settings } = await bootWith(M, [memSource("store", new Map([["m10-perm", { stamp: "1", files: permPkg }]]))]);
+  await m2.refresh();
+  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]), `逐项权限默认全开：granted = ${json(m2.list()[0]?.granted)}`);
+  settings.set(M.ext.permKey("m10-perm", "inspector"), false);
+  await m2.reload("m10-perm");
+  const e2 = m2.list()[0];
+  check(e2?.status === "pending" && json(e2.granted) === json(["ui"]) && json(e2.missing) === json(["inspector"]),
+    `逐项关掉 inspector → 白名单里只剩 ui，子插件 pending（${e2?.status} granted=${json(e2?.granted)} missing=${json(e2?.missing)}）`);
+  settings.set(M.ext.permKey("m10-perm", "inspector"), true);
+  await m2.reload("m10-perm");
+  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]), "逐项打开 → 重新 active（白名单在挂载时重新结算）");
+  check(json(M.ext.grantedOf({ permissions: ["inspector", "ui", "nope"] }, new Set(["ui"]))) === json(["inspector"]), "grantedOf(m, denied)：granted = 清单 ∩ GRANTABLE − 逐项关掉的");
+  check(json(M.ext.grantedOf({ permissions: ["inspector", "ui"] })) === json(["inspector", "ui"]), "grantedOf 第二参缺省时行为与旧版逐位一致（不关任何项）");
+  m2.dispose();
+  return res;
+}
+
 function report(title, res) {
   console.log(`\n${title}`);
   for (const r of res) console.log(`  ${r.ok ? "✓" : "✗"} ${r.msg}`);
@@ -510,13 +644,15 @@ const M = await load();
 let fails = report("A–D 外部插件", await suite(M));
 fails += report("E dev 宿主插件目录", await hostSuite());
 fails += report("F 示例插件 / 木偶生成器", await examplesSuite(M));
+fails += report("H M10 槽位消费 / 粒子组件数据入口 / 逐项权限开关", await m10Suite(M));
 
 // ── G. 变异红测 ──
 const src = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
 const EXT = path.join(ROOT, "editor/plugins/external.ts");
 const MGR = path.join(ROOT, "editor/plugins/manager.ts");
 const mutants = [
-  { name: "去掉代码插件白名单", file: EXT, from: "{ allow: grantedOf(m), meta", to: "{ allow: null, meta", expect: /未授权服务/ },
+  { name: "去掉代码插件白名单", file: EXT, from: "{ allow: grantedOf(m, denied), meta", to: "{ allow: null, meta", expect: /未授权服务/ },
+  { name: "逐项权限开关失效", file: EXT, from: "!denied?.has(p)", to: "true", expect: /逐项关掉/ },
   { name: "启用开关失效", file: MGR, from: "o.settings.get<boolean>(enabledKey(id), true) !== false", to: "true", expect: /停用/ },
   { name: "未知 contributes 不报错", file: EXT, from: "if (!known.has(k)) errors.push", to: "if (false) errors.push", expect: /坏清单/ },
   { name: "目录来源不再优先", file: MGR, from: "RANK[k.source.kind] > RANK[cur.source.kind]", to: "false", expect: /目录版/ },
@@ -532,7 +668,8 @@ for (const mu of mutants) {
     continue;
   }
   const MM = await load({ [mu.file]: orig.replace(mu.from, mu.to) });
-  const r = await suite(MM);
+  // A–D 与 H 一起重跑：M10 新判据（槽位消费 / 逐项权限开关）也要能被变异杀掉
+  const r = [...(await suite(MM)), ...(await m10Suite(MM))];
   const red = r.filter((x) => !x.ok && mu.expect.test(x.msg));
   if (red.length) killed++;
   else fails++;
