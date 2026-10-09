@@ -121,6 +121,10 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     // 目标在检视器未选中的标签页里：先像用户一样点开那一页
     const tab = await ev(`(() => { const p = document.querySelector(${JSON.stringify(sel)})?.closest('.ed-insp-panel[hidden]'); if (!p) return null; const r = document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
     if (tab) await click(tab);
+    // 目标在滚动容器（检视器 / 图层树）的视口之外时，真鼠标点不到（elementFromPoint 是 null）：
+    // 先像用户一样滚到可见处。block:"nearest" 对已经完整可见的元素不动滚动位置。
+    await ev(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); return true; })()`);
+    await sleep(80);
     const r = await ev(`(() => { const r = document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
     await click(r);
   };
@@ -1408,8 +1412,11 @@ async function runCreateAndDraft(ctx) {
   const wTop = worldToPage(crW, [1110, 590]);
   const blocked = await pixelAt(wTop);
   check(isRed(blocked), `?scripts=off 打开带脚本的库条目：脚本不执行，alpha 停在快照 1（实得 ${blocked}）`);
-  check((await bannerOn()) && /1/.test(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)), "视口底部提示「已拦截 1 段脚本」并给「仍然执行」");
-  check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("scripts disabled: skipped 1"), "诊断流记一条拦截计数");
+  // 拦截提示与诊断流是在首帧之后异步补上的：等一会儿再断言（超时就按当时的实际值报红）
+  await waitFor(`!document.querySelector('#ed-scripts-off').hidden && /1/.test(document.querySelector('#ed-scripts-off-text').textContent)`, 8000).catch(() => {});
+  check((await bannerOn()) && /1/.test(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)), `视口底部提示「已拦截 1 段脚本」并给「仍然执行」（实得「${(await ev(`document.querySelector('#ed-scripts-off-text').textContent`)).trim()}」，提示${(await bannerOn()) ? "在" : "不在"}）`);
+  await waitFor(`document.querySelector('#ed-con-body').textContent.includes('scripts disabled: skipped 1')`, 8000).catch(() => {});
+  check((await ev(`document.querySelector('#ed-con-body').textContent`)).includes("scripts disabled: skipped 1"), `诊断流记一条拦截计数（实得 ${JSON.stringify((await ev(`document.querySelector('#ed-con-body').textContent`)).split("\n").filter((l) => /script/i.test(l)).slice(-2).join(" | "))}）`);
   const rAllow = await h.readyCount();
   await clickSel("#scripts-allow");
   await h.waitRemount(rAllow);
@@ -1850,7 +1857,8 @@ async function runCreateAndDraft(ctx) {
   let ao = await rawObj();
   const abW = sizeOf(ao)[0] / 2;
   const origin0 = ao.origin;
-  check(await ev(`document.querySelectorAll('.ed-anim [data-anim-on]').length === 5 && [...document.querySelectorAll('.ed-anim [data-anim-on]')].every((c) => !c.checked)`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色五个开关，缺省全关");
+  // 开关集合就是 editor/keyframes.ts 的 ANIM_FIELDS（M4 起 brightness 也是可关键帧字段，共六个）
+  check(await ev(`(() => { const on = [...document.querySelectorAll('.ed-anim [data-anim-on]')]; return on.length === 6 && on.map((c) => c.dataset.animOn).join() === 'origin,scale,angles,alpha,color,brightness' && on.every((c) => !c.checked); })()`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色 / 亮度六个开关，缺省全关");
   if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
   await seekTo(0);
 

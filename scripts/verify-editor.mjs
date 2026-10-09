@@ -7285,9 +7285,13 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       "M12/B3 setLayerScript 按「图层 + 挂点」找槽位并只换这一代求值结果（不重挂场景）",
     );
     check(
-      /createScriptSlot\s*\(\s*\{\s*layer,\s*target,\s*build,\s*activate,\s*host:\s*scriptSlotHost\s*\}\s*\)/.test(smSrc) &&
+      smSrc.includes("createScriptSlot({ layer, target, build, activate, host: scriptsOff ? slotHostNoCount : scriptSlotHost })") &&
         smSrc.includes("register: (sb) => propSandboxes.push(sb)"),
       "M12/B3 接线：宿主只提供登记 / 撤报错 / 计跳过三件事，沙箱仍在引擎侧求值",
+    );
+    check(
+      smSrc.includes("const slotHostNoCount: ScriptSlotHost = { ...scriptSlotHost, countSkipped: () => {} };"),
+      "★ 关脚本时槽位不再重复计一次拦截（skipScript 已计；否则同一段脚本提示成「2 段脚本」）",
     );
     check(
       !/\bnew Function\b|\beval\s*\(/.test(slotSrc),

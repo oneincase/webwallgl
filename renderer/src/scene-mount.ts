@@ -958,6 +958,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           skippedScripts++;
         },
       };
+      /** W10 过渡 × W8 热替换：关脚本时槽位的 build 走的就是 skipScript（拦截计数已经在
+       *  那里加过一次），槽位在 !fresh 时再计一次会把同一段脚本数成两段 —— 提示会写成
+       *  「已拦截这张壁纸自带的 2 段脚本」。这里只管计数口径，热替换语义不变。 */
+      const slotHostNoCount: ScriptSlotHost = { ...scriptSlotHost, countSkipped: () => {} };
       /** M12 / W8：登记一个可热替换的脚本挂点（换源码只重建这一代的求值结果，
        *  已登记的引用仍指向同一物理句柄；语义与失败口径见 editor/script-slot.ts）。 */
       const makeScriptSlot = (
@@ -965,7 +969,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         target: string,
         build: (code: string) => any,
         activate: (sb: any, first: boolean) => void,
-      ): EditorScriptSlot => createScriptSlot({ layer, target, build, activate, host: scriptSlotHost });
+      ): EditorScriptSlot =>
+        createScriptSlot({ layer, target, build, activate, host: scriptsOff ? slotHostNoCount : scriptSlotHost });
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
