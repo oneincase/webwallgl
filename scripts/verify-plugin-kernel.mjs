@@ -6,6 +6,8 @@
  *   inject 等待 / 依赖消失回 pending 且副作用全撤 / 服务恢复自动重 apply /
  *   同名服务栈（覆盖与回落）/ 卸载逆序撤销 / 重载幂等 / 监听出错隔离与错误预算 /
  *   权限白名单（含继承）/ profile 合并、缺服务与依赖环诊断 / 注册表栈与合批 / schema 规整。
+ * M10/D3 追加：editor/services/commands.ts 的 register 路径（命令的唯一注册入口，
+ *   内置与插件同 API：owner 归属、同 id 叠栈与回落、校验、键盘派发与 list() 枚举一致）。
  * 每组判据配变异红测：把内核改坏，确认对应判据变红（防自证）。
  */
 import { build } from "esbuild";
@@ -239,10 +241,72 @@ async function suite(K) {
   return res;
 }
 
+/** M10/D3：命令注册 API —— 打 editor/services/commands.ts（内部会带上 core 一起打） */
+async function loadCommands(overrides = {}) {
+  const plugins = [];
+  if (Object.keys(overrides).length) {
+    plugins.push({
+      name: "mutate",
+      setup(b) {
+        b.onLoad({ filter: /\.ts$/ }, (a) => (overrides[a.path] !== undefined ? { contents: overrides[a.path], loader: "ts" } : undefined));
+      },
+    });
+  }
+  const out = await build({
+    entryPoints: [path.join(ROOT, "editor/services/commands.ts")],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    plugins,
+    logLevel: "silent",
+  });
+  const tmp = path.join(tmpRoot, `cmd-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(tmp, out.outputFiles[0].text);
+  return import(pathToFileURL(tmp).href);
+}
+
+/** D3 判据：register 是命令的唯一注册入口，键盘派发与 list() 枚举都看同一份 registry */
+async function cmdSuite(C) {
+  const res = [];
+  const check = (ok, msg) => res.push({ ok: !!ok, msg });
+  const s = C.createCommandService();
+  const ids = () => s.registry.list().map((c) => c.id).join(",");
+  const off = s.register({ id: "edit.test", keys: "Mod+Shift+P", run: (a) => `ran:${String(a)}` }, "builtin-ui");
+  check(s.registry.has("edit.test") && s.registry.ownerOf("edit.test") === "builtin-ui",
+    "register：命令进 registry，owner 记成注册方（内置也走同一条路）");
+  check(s.exec("edit.test", 1) === "ran:1", "register 后的命令能被 exec 派发");
+  check(s.handleKey({ key: "P", metaKey: true, ctrlKey: false, shiftKey: true, altKey: false }) === true,
+    "register 后的命令能被键盘派发（派发仍走同一份 registry 枚举）");
+  const off2 = s.register({ id: "edit.test", keys: "Mod+Shift+P", run: () => "override" }, "ext:demo");
+  check(s.registry.ownerOf("edit.test") === "ext:demo" && s.exec("edit.test") === "override" && ids() === "edit.test",
+    `同 id 后注册优先：栈顶那条生效，list() 仍只有一条（插件覆盖内置；枚举 ${ids()}）`);
+  off2();
+  check(s.registry.ownerOf("edit.test") === "builtin-ui" && s.exec("edit.test") === "ran:undefined" && ids() === "edit.test",
+    "撤下后注册的那条 → 回落到先注册的内置版（行为与 registry.add 逐位一致）");
+  let threw = "";
+  try { s.exec("nope"); } catch (e) { threw = e.message; }
+  check(threw === "未知命令：nope", `未知命令抛错（${threw}）`);
+  threw = "";
+  try { s.register({ id: "", run: () => 0 }); } catch (e) { threw = e.message; }
+  check(threw === "命令必须有非空 id", `register 校验：空 id 抛错（${threw}）`);
+  threw = "";
+  try { s.register({ id: "x.y" }); } catch (e) { threw = e.message; }
+  check(threw === "命令 x.y 缺少 run", `register 校验：缺 run 抛错（${threw}）`);
+  const offW = s.register({ id: "edit.when", when: () => false, run: () => "no" });
+  check(s.exec("edit.when") === undefined && s.handleKey({ key: "Q", metaKey: false, ctrlKey: false, shiftKey: false, altKey: false }) === false,
+    "when 为假 → exec 返回 undefined、键盘不吞事件（行为未变）");
+  offW();
+  off();
+  check(!s.registry.has("edit.test") && ids() === "", "register 返回的 Disposer 只撤自己那条");
+  return res;
+}
 let failed = 0;
 console.log("verify-plugin-kernel");
 const real = await suite(await loadCore());
-for (const r of real) {
+const realCmd = await cmdSuite(await loadCommands());
+for (const r of [...real, ...realCmd]) {
   console[r.ok ? "log" : "error"](`  ${r.ok ? "✓" : "✗"} ${r.msg}`);
   if (!r.ok) failed++;
 }
@@ -278,5 +342,32 @@ for (const [label, file, src, from, to] of mutants) {
   if (!red) failed++;
 }
 
-console.log(`\n${failed ? "✗" : "✓"} verify-plugin-kernel：${real.length - real.filter((r) => !r.ok).length}/${real.length} 判据通过，${failed} 项失败`);
+// ── D3 变异红测：命令注册 API ──
+const cmdPath = path.join(ROOT, "editor/services/commands.ts");
+const cmdSrc = fs.readFileSync(cmdPath, "utf8");
+const cmdMutants = [
+  ["register 不校验 run", cmdPath, cmdSrc, "if (typeof def.run !== \"function\") throw new Error(`命令 ${def.id} 缺少 run`);", ""],
+  ["register 丢掉 owner", cmdPath, cmdSrc, "return registry.add(def, owner);", "return registry.add(def);"],
+  ["register 不再进注册表", cmdPath, cmdSrc, "return registry.add(def, owner);", "void def; return () => {};"],
+];
+for (const [label, file, src, from, to] of cmdMutants) {
+  if (!src.includes(from)) {
+    console.error(`  ✗ ${label}：注入点不存在（命令服务改过？同步更新本脚本）`);
+    failed++;
+    continue;
+  }
+  let res;
+  try {
+    res = await cmdSuite(await loadCommands({ [file]: src.replace(from, to) }));
+  } catch {
+    res = [{ ok: false }];
+  }
+  const red = res.filter((r) => !r.ok).length;
+  console[red ? "log" : "error"](`  ${red ? "✓" : "✗"} ${label} → ${red} 条判据变红`);
+  if (!red) failed++;
+}
+
+const total = real.length + realCmd.length;
+const bad = [...real, ...realCmd].filter((r) => !r.ok).length;
+console.log(`\n${failed ? "✗" : "✓"} verify-plugin-kernel：${total - bad}/${total} 判据通过，${failed} 项失败`);
 process.exit(failed ? 1 : 0);

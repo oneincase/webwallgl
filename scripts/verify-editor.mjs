@@ -4064,7 +4064,8 @@ section("I. 接线");
   }
   check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18n.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
   // 插件宿主（PLUGIN-ARCHITECTURE §2 / §5）：页面只按注册表渲染，内置能力也登记成插件
-  check(/void bootPlugins\(\)\.catch\(/.test(main) && /app = await bootEditor\(/.test(main) && /app\.plugin\(builtinUiPlugin\)/.test(main), "启动时起插件内核，内置检视器分组 / 命令 / 录视频导出目标经 builtin-ui 插件登记");
+  check(/void bootPlugins\(\)\.catch\(/.test(main) && /app = await bootEditor\(/.test(main) && /catalog: \{ "builtin-ui": builtinUiPlugin \}/.test(main) && /profile: \{ plugins: \[\{ name: "builtin-ui" \}\] \}/.test(main),
+    "启动时起插件内核，内置检视器分组 / 命令 / 录视频导出目标经 builtin-ui 插件登记（与其它内置插件同一条 catalog + profile 装配路径，profile 里可按名字停用）");
   check(/for \(const g of groupsFor\(node\)\)/.test(main) && !/inspectorEl\.appendChild\(\w+Group\(node\)\)/.test(main), "检视器分组全部来自注册表（不再硬编码 appendChild）");
   {
     const inspTs = fs.readFileSync(path.join(ROOT, "editor/inspector.ts"), "utf8");
@@ -4646,6 +4647,126 @@ section("J. 变异红测");
   check((await gltfSkinCheck(gm4)).worst > 1e-2, "STEP 当 LINEAR 求值时 ★ 判据变红");
   const gm5 = await glMut("const w = top.map((p) => p[1] / sum);", "const w = top.map((p) => p[1]);", "截断后归一");
   check(Math.abs(gm5.topInfluences([0, 1, 2, 3, 4, 5], [0.1, 0.3, 0.05, 0.25, 0.2, 0.1], 0).w.reduce((s, v) => s + v, 0) - 1) > 1e-3, "截断后不归一时「前 4 个归一」判据变红");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// M10. 插件面补完（D1 空槽位 / D2 particles.components / D3 命令注册 API /
+//      D4 catalog 装配 / D5 core barrel / D6 逐项权限开关 + 插件日志）
+// ───────────────────────────────────────────────────────────────────────────
+section("M10. 插件面补完（D1–D6）");
+{
+  const readEd = (p) => fs.readFileSync(path.join(ROOT, "editor", p), "utf8");
+  const main = readEd("main.ts");
+  const html10 = readEd("index.html");
+  const css10 = readEd("editor.css");
+  const i18n10 = readEd("i18n.ts");
+  const ext10 = readEd("plugins/external.ts");
+  const panel10 = readEd("ui/plugin-panel.ts");
+  const cmds10 = readEd("services/commands.ts");
+  const types10 = readEd("services/types.ts");
+  const log10 = readEd("plugins/log.ts");
+  const core10 = readEd("core/index.ts");
+
+  // ── D3：命令注册只有 register 一条路（内置与插件同 API，键盘派发与 list() 枚举同一份 registry）──
+  check(/register\(def: CommandDef, owner\?: string\): Disposer;/.test(types10) && /const register = \(def: CommandDef, owner\?: string\): Disposer =>/.test(cmds10) && /return registry\.add\(def, owner\);/.test(cmds10),
+    "D3：命令服务暴露 register(def, owner)，返回撤销函数、owner 记归属（registry 只剩只读枚举）");
+  check(/命令必须有非空 id/.test(cmds10) && /缺少 run/.test(cmds10), "D3：register 当场校验空 id / 缺 run（插件写坏命令不会被静默登记）");
+  check(/const cmd = \(c: Parameters<typeof cmds\.register>\[0\]\) => ctx\.effect\(\(\) => cmds\.register\(c, ctx\.name\)\);/.test(main) && (main.match(/cmd\(\{/g) ?? []).length === 7 && !/cmds\.add\(/.test(main),
+    `D3：内置 7 条命令改走同一 register（实得 ${(main.match(/cmd\(\{/g) ?? []).length} 条，页面不再直接 registry.add）`);
+  const builtinCmdIds = ["edit.undo", "edit.redo", "file.save", "layer.duplicate", "layer.rename", "layer.delete", "export.run"];
+  const missCmd = builtinCmdIds.filter((id) => !main.includes(`id: "${id}"`));
+  check(missCmd.length === 0, `D3：内置命令 id 逐位未变（缺 ${json(missCmd)}）`);
+
+  // ── D1：七个槽位都有宿主元素、语义位置正确、且真的被 mount 消费 ──
+  const slotHosts = [
+    ["menu.export", "ed-plugin-export", 'id="export-menu"'],
+    ["menu.add", "ed-plugin-add", 'class="wb-subbar ed-layer-tools"'],
+    ["panel.right", "ed-plugin-right", 'id="ed-right"'],
+    ["inspector.project", "ed-plugin-project", 'id="ed-right"'],
+    ["statusbar", "ed-plugin-status", 'id="statusbar"'],
+    ["viewport.overlay", "ed-plugin-overlay", 'id="ed-viewport"'],
+  ];
+  // 容器内部片段（按标签配对扫描），用来断言宿主确实在语义位置里而不是页面随便一处
+  const innerOf = (sel) => {
+    const at = html10.indexOf(sel);
+    if (at < 0) return "";
+    const open = html10.lastIndexOf("<", at);
+    const tag = /^<([a-zA-Z]+)/.exec(html10.slice(open))?.[1] ?? "div";
+    const re = new RegExp(`<${tag}\\b|</${tag}>`, "g");
+    let i = html10.indexOf(">", at) + 1;
+    let depth = 1;
+    re.lastIndex = i;
+    let m;
+    while ((m = re.exec(html10))) {
+      if (m[0].startsWith("</")) {
+        depth--;
+        if (!depth) return html10.slice(i, m.index);
+      } else depth++;
+    }
+    return "";
+  };
+  const badHosts = slotHosts.filter(([slot, id, region]) => {
+    const tag = new RegExp(`<div[^>]*id="${id}"[^>]*>`).exec(html10)?.[0] ?? "";
+    return !tag.includes("ed-plugin-group") ||
+      !new RegExp(`\\["${slot.replace(/\./g, "\\.")}", "#${id}"\\]`).test(main) ||
+      !innerOf(region).includes(`id="${id}"`);
+  });
+  check(badHosts.length === 0, `D1：六个空槽位各有宿主元素 + 挂载表项 + 位置正确（缺 ${json(badHosts.map((x) => x[0]))}）`);
+  check(/const unmountPluginSlots: Array<\(\) => void> = \[\];/.test(main) && /unmountPluginSlots\.push\(ui\.mount\(slot, host\), ui\.onChange\(slot, sync\)\)/.test(main) && /const sync = \(\) => \(host\.hidden = !ui\.items\(slot\)\.length\)/.test(main) && /for \(const off of unmountPluginSlots\.splice\(0\)\) off\(\);\n    mountPluginSlots\(\);/.test(main),
+    "D1：六个槽位逐个 mount 到宿主（没有贡献时隐藏），切语言先撤旧 mount 再重挂");
+  check(/<div class="wb-tb-group" id="ed-plugin-tools" hidden><\/div>/.test(html10) && /ui\.mount\("toolbar", pluginToolsEl\)/.test(main) && /pluginToolsEl\.hidden = !ui\.items\("toolbar"\)\.length/.test(main),
+    "D1：toolbar 槽位接线保持原样（范例贡献者仍走它）");
+  check(/\.ed-plugin-group \{/.test(css10) && /\.ed-plugin-group\[hidden\] \{/.test(css10) && /#ed-plugin-overlay > \* \{/.test(css10),
+    "D1：槽位容器样式横排、hidden 优先、叠层不吃鼠标事件（容器本身 pointer-events: none）");
+
+  // ── D2：particles.components 外部数据入口 ──
+  check(/"particles\.components"\?: string\[\];/.test(ext10) && /for \(const k of \["effects", "particles", "particles\.components", "shaders"\] as const\)/.test(ext10) && /new Set\(\["effects", "particles", "particles\.components", "shaders", "i18n"\]\)/.test(ext10),
+    "D2：清单白名单加 particles.components（路径数组校验与别的数据键同一条路，拼错的键仍会报错）");
+  check(/components: \[\]/.test(ext10) && /out\.components\.push\(\{ id: j\.id, kind, params \}\)/.test(ext10) && /parseSchema\(j\.params, `粒子组件 \$\{p\}\.params`\)/.test(ext10) && /ctx\.contribute\("particles\.components", k\)/.test(ext10),
+    "D2：组件 JSON → ParticleComponent（kind 四选一 + 参数描述走 parseSchema）→ 注册进 particles.components");
+  check(/if \(c\["particles\.components"\]\?\.length\) need\.add\("particles\.components"\);/.test(ext10),
+    "D2：声明了组件才 inject particles.components（数据贡献仍由可信外层 ctx 注册、不需要 permissions）");
+
+  // ── D4 / D5：死装配处置与内核入口统一 ──
+  const builtinIdx = readEd("plugins/builtin/index.ts");
+  const appTs = readEd("app.ts");
+  check(/plugins: Object\.keys\(BUILTIN_CATALOG\)\.map\(\(name\) => \(\{ name \}\)\)/.test(builtinIdx) && /mergeProfiles\(BUILTIN_PROFILE, opts\.profile\)/.test(appTs) && /\.\.\.BUILTIN_CATALOG, \.\.\.opts\.catalog/.test(appTs) && !/app\.plugin\(/.test(main),
+    "D4：内置 catalog/profile 装配改成真消费（bootEditor 默认带 8 个内置插件；页面不再有第二条 app.plugin 装配路）");
+  const regBlock = /export const REGISTRIES = \{([\s\S]*?)\n\} as const satisfies/.exec(builtinIdx)?.[1] ?? "";
+  const regKeys = [...regBlock.matchAll(/^\s{2}("[^"]+"|[A-Za-z_$][\w$]*)/gm)].map((m) => m[1].replace(/"/g, ""));
+  check(regKeys.length === 13 && /provides: Object\.keys\(REGISTRIES\)/.test(builtinIdx) && regKeys.includes("particles.components"),
+    `D4：13 个数据服务名由 registries 插件一并提供（实得 ${regKeys.length} 个：${regKeys.join(" / ")}）`);
+  const strayCore = [];
+  const walkEd = (dir) => {
+    for (const e of fs.readdirSync(path.join(ROOT, "editor", dir), { withFileTypes: true })) {
+      const rel = dir ? `${dir}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name !== "core") walkEd(rel);
+      } else if (e.name.endsWith(".ts") && rel !== "services/types.ts" && /from "\.\.?\/core\/(context|registry|schema|loader)"/.test(readEd(rel))) {
+        strayCore.push(rel);
+      }
+    }
+  };
+  walkEd("");
+  check(strayCore.length === 0, `D5：editor/ 内一律从 barrel 引内核（唯一例外 services/types.ts 的模块增强；越界 ${json(strayCore)}）`);
+  check(/export \* from "\.\/context"/.test(core10) && /export \* from "\.\/registry"/.test(core10) && /export \* from "\.\/schema"/.test(core10) && /export \* from "\.\/loader"/.test(core10) && /模块增强/.test(types10),
+    "D5：core barrel 四个子模块全转出，模块增强处注明必须指向真正的 ../core/context 模块");
+
+  // ── D6：逐项权限开关 + 插件日志（权限语义与 ERROR_BUDGET 不变）──
+  check(/export const permKey = \(id: string, permission: string\)/.test(ext10) && /export function deniedPermissions\(/.test(ext10) && /grantedOf = \(m: PluginManifest, denied\?: ReadonlySet<string>\)/.test(ext10) && /grantedOf\(m, denied\)/.test(ext10),
+    "D6：逐项权限开关落成设置键 plugins.perm.<id>.<perm>，挂载时结算成白名单（只有显式 false 才算关）");
+  check(/const ERROR_BUDGET = 5/.test(readEd("core/context.ts")), "D6：连续 5 错自动停用（ERROR_BUDGET = 5）行为未变");
+  check(/createPluginLog/.test(log10) && /queueMicrotask/.test(log10) && /items\.splice\(0, items\.length - limit\)/.test(log10),
+    "D6：插件日志是内存环形缓冲 + 微任务合批（不碰 DOM，面板自己订阅）");
+  check(/function renderPermissions\(/.test(panel10) && /cb\.dataset\.perm = p;/.test(panel10) && /o\.settings\.set\(permKey\(entry\.id, p\), cb\.checked\)/.test(panel10) && /o\.manager\.reload\(entry\.id\)/.test(panel10),
+    "D6：面板每个清单权限一个开关，改完 reload 用新白名单重挂（不就地改已生效的白名单）");
+  check(/function renderLogs\(/.test(panel10) && /"logs-clear"/.test(panel10) && /logs\?: PluginLog;/.test(panel10) && /function logEntriesOf\(/.test(panel10),
+    "D6：面板能看插件日志（按插件合并 ext:<id> 与清单 id、可清空、有 error 时默认展开）");
+  check(/logs: pluginLog,/.test(main) && /settings: a\.settings,/.test(main) && /pluginLog\.onChange\(/.test(main) && /manifestIdOf/.test(main),
+    "D6：main.ts 把同一份 settings / 日志底座交给面板，面板开着时日志一变就重绘");
+  const plKeys = ["pl.permsTitle", "pl.permHigh", "pl.logs", "pl.logsEmpty", "pl.logsClear", "pl.c.components"];
+  const missKeys = plKeys.filter((k) => (i18n10.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(missKeys.length === 0, `D6：面板新文案中英文都恰好一条（缺 ${json(missKeys)}）`);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
