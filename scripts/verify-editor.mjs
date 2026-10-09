@@ -5457,6 +5457,448 @@ section("FX-INLINE. 作品自带效果参数 editor/effects.ts（M1 A1/A2）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// OBJ-PASSTHRU. 对象属性直通层：十六个对象级字段的往返 / 未知字段原样（M4 A5）
+//
+// 纯函数部分（下面全部）：无浏览器可跑 —— 夹具是内存里的 scene.json 对象。
+//
+// headless 用例（需真浏览器，加 --headless 才跑）：选中 light 层 → 检视器「灯光」分组
+// 改 intensity → 引擎当帧出帧随之变。本沙箱 Chrome 起不来（沙箱初始化 / Runtime.evaluate
+// 超时），这一段只注明，不在本文件跑。
+// ───────────────────────────────────────────────────────────────────────────
+section("OBJ-PASSTHRU. 对象属性直通层 editor/objprops.ts（M4 A5）");
+{
+  const op = await loadEditorModule("objprops");
+  const opPath = path.join(ROOT, "editor/objprops.ts");
+  const opSrc = fs.readFileSync(opPath, "utf8");
+
+  /** 计划 §1.2 的十六项命中表，顺序与规格表一致 */
+  const OBJ16 = [
+    "castshadow",
+    "disablepropagation",
+    "parallaxDepth",
+    "solid",
+    "anchor",
+    "colorBlendMode",
+    "alignment",
+    "perspective",
+    "instanceoverride",
+    "copybackground",
+    "backgroundbrightness",
+    "spacing",
+    "depthtest",
+    "clampuvs",
+    "blockalign",
+    "ledsource",
+  ];
+
+  /**
+   * OBJ-PASSTHRU 判据体：返回失败清单（空 = 全绿）。变异红测复用它。
+   */
+  const objPassthruCorpus = (f) => {
+    const bad = [];
+    const is = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+
+    // ---- 1. 规格表：十六项 / 键序 / 引擎档位 ----
+    is(json(f.OBJ_FIELD_KEYS) === json(OBJ16), "十六个对象级字段齐、键序与计划 §1.2 命中表一致");
+    is(f.OBJ_FIELDS.length === 16, "规格表恰好十六项");
+    const read = f.OBJ_FIELDS.filter((s) => s.engine === "read").map((s) => s.key);
+    const unread = f.OBJ_FIELDS.filter((s) => s.engine === "unread").map((s) => s.key);
+    is(json(read) === json(OBJ16.slice(0, 12)), "引擎本版本真读的十二项成组");
+    is(json(unread) === json(["depthtest", "clampuvs", "blockalign", "ledsource"]), "四个零命中字段单独成组（UI 打「引擎不读」角标）");
+    is(json(f.ALIGN_VALUES) === json(["center", "centre", "left", "right", "top", "bottom", "topleft", "topright", "bottomleft", "bottomright"]), "ALIGN 枚举与引擎 renderer-glsl.js 同表");
+    is(json(f.ANCHOR_VALUES) === json(["none", ...f.ALIGN_VALUES]), "anchor 比 ALIGN 多一个 none（parse.js 的 textAnchor）");
+    is(f.objFieldOf("colorblendmode")?.key === "colorBlendMode" && f.objFieldOf("SPACING")?.key === "spacing", "按字段名查规格大小写不敏感");
+    is(f.objFieldOf("nope") === undefined, "未列出的字段没有规格（UI 不出控件、写回拒绝）");
+
+    // ---- 2. 文案键派生：每个字段一条 objp.n.<小写键> ----
+    const noteKeys = f.OBJ_FIELDS.map((s) => f.objFieldNoteKey(s.key));
+    is(new Set(noteKeys).size === 16 && noteKeys.every((k) => k.startsWith("objp.n.")), "每个字段派生一条 objp.n.<小写键> 文案键");
+    is(f.objFieldNoteKey("parallaxDepth") === "objp.n.parallaxdepth", "派生键统一转小写");
+
+    // ---- 3. 写回命中原名、不新增键（大小写不敏感）----
+    const o = { id: 7, CastShadow: false, mystery: { a: 1 }, effects: [1] };
+    is(f.setObjField(o, "castshadow", true) === true, "写回命中已有键 → true");
+    is(o.CastShadow === true && !("castshadow" in o), "写到**作者原本的键名**上（大小写不敏感命中，不新增歧义键）");
+    is(json(Object.keys(o)) === json(["id", "CastShadow", "mystery", "effects"]), "键集合逐字不变（未知键没被挤掉）");
+    is(f.setObjField(o, "castshadow", true) === false, "同值再写返回 false（幂等，不出空撤销）");
+    is(
+      f.setObjField(o, "CASTSHADOW", false) === true && "CASTSHADOW" in o === false && o.CastShadow === false && json(Object.keys(o)) === json(["id", "CastShadow", "mystery", "effects"]),
+      "换个大小写再写仍命中同一个键、仍不新增键",
+    );
+    is(o.mystery.a === 1 && json(o.effects) === json([1]), "别的字段逐字节不动");
+
+    // ---- 4. 列表内但对象上没有的字段：按规范键新建一次 ----
+    const fresh = { id: 11 };
+    is(f.setObjField(fresh, "solid", true) === true && json(Object.keys(fresh)) === json(["id", "solid"]), "列表内缺字段时按规范键新建一次");
+    is(f.setObjField(fresh, "Solid", false) === true && json(Object.keys(fresh)) === json(["id", "solid"]) && fresh.solid === false, "之后换大小写写回仍命中同一个键，不再新增");
+
+    // ---- 5. 未列出的字段拒绝 ----
+    const g = { id: 1 };
+    const gBefore = json(g);
+    is(f.setObjField(g, "nope", 1) === false && json(g) === gBefore, "未列出的字段拒绝写回且对象逐字节不动");
+    is(f.objFieldValue(g, "solid") === undefined && f.fieldKeyOf(g, "solid") === null, "对象上没有该字段时取值为 undefined（UI 显示「未设置」）");
+
+    // ---- 6. {user|script|animation, value} 包装只改 .value ----
+    const w = { id: 2, ALIGNMENT: { user: "align", value: "left" } };
+    is(f.isObjWrapper(w.ALIGNMENT) === true && f.objFieldRaw(w.ALIGNMENT) === "left", "包装能识别、快照值能取出");
+    is(f.setObjField(w, "alignment", "right") === true && json(w.ALIGNMENT) === json({ user: "align", value: "right" }), "包装只改 value，user 绑定原样保留");
+    is(f.setObjField(w, "alignment", "right") === false, "包装值没变时返回 false");
+
+    // ---- 7. 取值口径（scene.json 里 bool 也常写成 0/1/"1"）----
+    is(f.objFieldValue({ SOLID: "1" }, "solid") === true && f.objFieldValue({ solid: 0 }, "solid") === false, "取值把 \"1\"/1 当真、0 当假");
+    is(f.objFieldTruthy("0") === false && f.objFieldTruthy("false") === false && f.objFieldTruthy("") === false, "假值串（\"0\" / \"false\" / 空）判假");
+    is(f.objFieldTruthy({ value: 0 }) === false && f.objFieldTruthy({ value: 1 }) === true, "包装里的 0/1 也按数字判");
+
+    // ---- 8. 编码 / 解码：vec2 一律 \"x y\" 字符串 ----
+    const v = { id: 3 };
+    is(f.setObjField(v, "spacing", [1.5, -2]) === true && v.spacing === "1.5 -2", "vec2 编成 \"x y\" 字符串（parse.js 的 parseVec2 对数组会得 [0,0]）");
+    is(json(f.parseObjVec2("3 4")) === json([3, 4]) && json(f.parseObjVec2([5, 6])) === json([5, 6]), "vec2 解码兼容字符串与数组两种语料形态");
+    is(json(f.parseObjVec2({ value: "7 8" })) === json([7, 8]), "vec2 解码拆 {value} 包装");
+    const v2 = { id: 4 };
+    is(f.setObjField(v2, "colorBlendMode", 6.4) === true && v2.colorBlendMode === 6, "int 字段取整");
+    is(f.encodeObjField(f.objFieldOf("backgroundbrightness"), 0.333333333) === 0.33333, "number 字段按 5 位小数编码");
+    is(f.encodeObjField(f.objFieldOf("anchor"), "none") === "none", "anchor 的 none 原样保留（不在 ALIGN 表里但 parse.js 认）");
+    is(f.encodeObjField(f.objFieldOf("perspective"), "false") === true && f.encodeObjField(f.objFieldOf("perspective"), 0) === false, "bool 字段真值口径");
+    is(f.decodeObjField(f.objFieldOf("spacing"), "1 -1") instanceof Array, "vec2 字段解码出分量数组（控件是两格输入）");
+
+    // ---- 9. instanceoverride 是**表**：合并不删键 ----
+    const io = { id: 5, instanceoverride: { count: { script: "x", value: 2 }, alpha: 1, keepme: 5 } };
+    is(f.setObjField(io, "instanceoverride", { count: 8, beta: 3 }) === true, "表字段写回成功");
+    is(
+      json(io.instanceoverride) === json({ count: { script: "x", value: 8 }, alpha: 1, keepme: 5, beta: 3 }),
+      "逐键写同名键、包装只改 value、没提到的键保留（不整表替换）",
+    );
+    is(f.mergeObjFieldTable(io, "instanceoverride", { gamma: 1 }) === true && io.instanceoverride.gamma === 1, "表合并可重复调用");
+    is(f.mergeObjFieldTable(io, "instanceoverride", { count: 8 }) === false, "表内没有变化时返回 false");
+
+    // ---- 10. raw 透传：不猜类型 ----
+    const r = { id: 6 };
+    is(f.setObjFieldText(r, "blockalign", '"left"') === true && r.blockalign === "left", "raw 字段按 JSON 收（带引号的字符串）");
+    is(f.setObjFieldText(r, "clampuvs", "true") === true && r.clampuvs === true, "raw 字段按 JSON 收（布尔）");
+    is(f.setObjFieldText(r, "ledsource", "left") === true && r.ledsource === "left", "裸字符串也收下（不包成 \"\\\"left\\\"\"）");
+    is(f.objFieldText(f.objFieldOf("ledsource"), "left") === "left" && f.objFieldText(f.objFieldOf("ledsource"), true) === "true", "文本框显示与写入口径对称");
+    const rb = json(r);
+    is(f.setObjFieldText(r, "instanceoverride", "{oops") === false && json(r) === rb, "json 字段的坏输入拒绝且逐字节不动");
+    is(f.setObjFieldText(r, "nope", "1") === false, "未列出的字段拒绝文本框写回");
+    is(f.setObjFieldText(r, "ledsource", "   ") === false, "空文本框拒绝（不当成空字符串写进去）");
+
+    // ---- 11. 全等比较，不做模糊匹配 ----
+    is(f.fieldKeyOf({ parallaxDepthOwn: "9 9" }, "parallaxDepth") === null, "parallaxDepth 不命中 parallaxDepthOwn（引擎另有此字段、语义不同）");
+    const po = { id: 8, parallaxDepthOwn: "9 9" };
+    is(f.setObjField(po, "parallaxDepth", [1, 2]) === true && po.parallaxDepthOwn === "9 9" && po.parallaxDepth === "1 2", "写 parallaxDepth 不动 parallaxDepthOwn");
+    is(f.presentFieldKeys(po).length === 1 && f.presentFieldKeys(po)[0] === "parallaxDepth", "presentFieldKeys 列出对象上真实存在的本层字段（保留原名）");
+
+    // ---- 12. 十六项都能出状态（检视器由它驱动）----
+    const st = f.objFieldStates({ id: 9 });
+    is(st.length === 16 && st.every((s) => s.spec && s.value === undefined && s.wrapped === false), "空对象也出十六行状态（值为 undefined = 未设置）");
+    const stw = f.objFieldStates({ id: 10, solid: { user: "u", value: true } });
+    is(stw.find((s) => s.spec.key === "solid")?.wrapped === true, "带包装的值在状态里被标记（UI 提示只改 value）");
+    const stk = f.objFieldStates({ id: 12, PARALLAXDEPTH: "1 2" });
+    is(stk.find((s) => s.spec.key === "parallaxDepth")?.key === "PARALLAXDEPTH", "状态里带回作者的原键名（写回要用它）");
+
+    return bad;
+  };
+
+  const noteKeys = op.OBJ_FIELDS.map((s) => op.objFieldNoteKey(s.key));
+
+  const opBad = objPassthruCorpus(op);
+  check(opBad.length === 0, `对象属性直通层：十六项往返 / 未知字段原样 / 不新增键 / 包装只改 value 全部成立（${opBad.join(" / ") || "ok"}）`);
+
+  // ---- 引擎侧对照：十六项里哪些真的被 parse.js 读（口径来源，别把「透传」说成「生效」）----
+  {
+    const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+    const engineHits = [
+      ["textCastshadow: parseBool(o.castshadow", "castshadow → 文字层投影"],
+      ["disablePropagation: o.disablepropagation === true", "disablepropagation → 组级截断视差传播"],
+      ["parallaxDepth: o.parallaxDepth !== undefined ? parseVec2(o.parallaxDepth) : null,", "parallaxDepth → parseVec2"],
+      ["colorBlendMode: o.colorBlendMode || 0", "colorBlendMode → 整数枚举"],
+      ["textBackgroundbrightness: parseNum(o.backgroundbrightness, 1)", "backgroundbrightness → 文字层盒底色"],
+      ["textSpacing: o.spacing ? parseVec2(o.spacing) : [0, 0]", "spacing → 文字字距"],
+      ["textAnchor: o.anchor === 'none' ? 'none'", "anchor → 文字层盒锚点（含 none）"],
+      ["perspective: o.perspective === true ? true : undefined", "perspective → 严格 true"],
+      ["copybackground: !!o.copybackground", "copybackground → 取身后画面"],
+    ];
+    const missHits = engineHits.filter(([lit]) => !parseSrc.includes(lit)).map(([, name]) => name);
+    check(missHits.length === 0, `十二项「引擎真读」的字段在 parse.js 里逐条对得上（${missHits.join(" / ") || "ok"}）`);
+    const unreadHits = ["depthtest", "clampuvs", "blockalign", "ledsource"].filter((k) => new RegExp(`o\\.${k}\\b`).test(parseSrc));
+    check(unreadHits.length === 0, `四个 unread 字段在 parse.js 里确实没有对象级读取（被读到的：${json(unreadHits)}）`);
+  }
+
+  // ---- 检视器接线：分组注册 + 由规格表驱动 ----
+  {
+    const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+    check(
+      /import \{[^}]*objFieldStates[^}]*\} from "\.\/objprops";/.test(mainSrc) &&
+        /function objPropsGroup\(node: LayerNode\): HTMLElement/.test(mainSrc) &&
+        /objFieldStates\(node\.obj\)/.test(mainSrc) &&
+        /\{ id: "objprops", order: 250, when: \(\) => true, render: objPropsGroup, tab: "props" \}/.test(mainSrc),
+      "「对象属性」分组注册进 BUILTIN_INSPECTOR（order 250 / props 页），行由 objFieldStates 驱动",
+    );
+    check(
+      /objEditOk\(et\("objp\.edit", \{ field: spec\.key \}\), id, mutate\)/.test(mainSrc) && /setObjField\(o, spec\.key, /.test(mainSrc),
+      "写回走 objEditOk → setObjField（可撤销，且只碰这一个字段）",
+    );
+    check(/objFieldNoteKey\(key\)/.test(mainSrc) && /const objFieldTip = \(key: string\) => et\(objFieldNoteKey\(key\)\)/.test(mainSrc), "字段语义说明由规格表派生（文案与实现同一处真源）");
+    const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const objpKeys = ["objp.title", "objp.hint", "objp.unset", "objp.edit", "objp.rawBad", "objp.wrapped", "objp.engineUnread", ...noteKeys];
+    const missingObjp = objpKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+    check(missingObjp.length === 0, `对象属性文案中英文都有、每个键恰好出现 2 次（缺 ${json(missingObjp)}）`);
+    const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+    check(/\.ed-form\.ed-objprops-form\b/.test(cssSrc) && /\.ed-tag-dim\b/.test(cssSrc), "对象属性分组的标签列与「引擎不读」角标样式在 editor.css");
+  }
+
+  // ---- 变异红测：判据咬得住吗 ----
+  {
+    const opMut = async (from, to, tag) => {
+      const mut = opSrc.replace(from, to);
+      check(mut !== opSrc, `注入点存在（${tag}）`);
+      return loadEditorModule("objprops", { [opPath]: mut });
+    };
+    const badOf = async (m) => (await objPassthruCorpus(m)).join(" / ");
+
+    const om1 = await opMut("for (const k of Object.keys(obj)) if (k.toLowerCase() === want) return k;", "for (const k of Object.keys(obj)) if (k === want) return k;", "字段键大小写不敏感");
+    const om1bad = await badOf(om1);
+    check(/原本的键名|大小写/.test(om1bad), "字段键改成大小写敏感时「命中原名 / 不新增键」判据变红");
+
+    const om2 = await opMut("for (const k of Object.keys(obj)) if (k.toLowerCase() === want) return k;", "for (const k of Object.keys(obj)) if (k.toLowerCase().startsWith(want)) return k;", "全等比较");
+    const om2bad = await badOf(om2);
+    check(/parallaxDepthOwn/.test(om2bad), "改成前缀模糊匹配时「parallaxDepth 不咬 parallaxDepthOwn」判据变红");
+
+    const om3 = await opMut(
+      "  if (isObjWrapper(cur)) {\n    if (sameValue(cur.value, next)) return false;\n    cur.value = next;\n    return true;\n  }\n",
+      "",
+      "包装只改 value",
+    );
+    const om3bad = await badOf(om3);
+    check(/包装只改 value/.test(om3bad), "无视 {user,value} 包装时「只改 value」判据变红");
+
+    const om4 = await opMut("      return `${round5(x)} ${round5(y)}`;", "      return [x, y];", "vec2 编成字符串");
+    const om4bad = await badOf(om4);
+    check(/vec2 编成/.test(om4bad), "vec2 写成数组时「\\\"x y\\\" 字符串」判据变红（parse.js 会读成 [0,0]）");
+
+    const om5 = await opMut("    return mergeObjFieldTable(obj, spec.key, input as Record<string, unknown>);\n", "", "表字段合并");
+    const om5bad = await badOf(om5);
+    check(/没提到的键保留|不整表替换/.test(om5bad), "表字段改成整表替换时「合并不删键」判据变红");
+
+    const om6 = await opMut(
+      "  if (spec.type === \"raw\") {\n    let parsed: unknown = t;\n    try {\n      parsed = JSON.parse(t);\n    } catch {\n      /* 不是 JSON：按裸字符串透传 */\n    }\n    return setObjField(obj, spec.key, parsed);\n  }\n",
+      "",
+      "raw 宽容解析",
+    );
+    const om6bad = await badOf(om6);
+    check(/裸字符串也收下/.test(om6bad), "raw 改成严格 JSON 时「裸字符串也收下」判据变红");
+  }
+
+  console.log("  （headless：选中 light 层 → 检视器「灯光」分组改 intensity → 出帧随之变；见本段头注）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// LIGHT-CAM. light / camera 图层入口：LayerKindDef.create 被生产消费（M4 A6）
+//
+// 纯函数部分（下面全部）：无浏览器可跑 —— 夹具是内存里的空 scene 文档。
+//
+// headless 用例（需真浏览器，加 --headless 才跑）：点工具条「添加灯光层」→ 图层树出现
+// light 层 → 检视器改 intensity / radius → 引擎 g_Lights* 当帧更新。本沙箱 Chrome 起不来，
+// 这一段只注明。
+// ───────────────────────────────────────────────────────────────────────────
+section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayers.ts（M4 A6）");
+{
+  const lk = await loadEditorModule("layer-kinds");
+  const ol = await loadEditorModule("objlayers");
+  const lkPath = path.join(ROOT, "editor/layer-kinds.ts");
+  const lkSrc = fs.readFileSync(lkPath, "utf8");
+  const olPath = path.join(ROOT, "editor/objlayers.ts");
+  const olSrc = fs.readFileSync(olPath, "utf8");
+
+  /** 与 makeDoc 同形的空场景文档（rebuildTree 只需要 scene.objects） */
+  const mkDoc = () => ({ type: "scene", title: "t", scene: { camera: {}, general: {}, objects: [] }, roots: [], objectCount: 0 });
+
+  const lightCamCorpus = (f, mod) => {
+    const bad = [];
+    const is = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    const objsOf = (d) => d.scene.objects;
+
+    // ---- 1. 能力位：只有登记了 create 的种类能新建 ----
+    is(f.canCreateLayerOfKind("light") === true && f.canCreateLayerOfKind("camera") === true, "light / camera 可新建（九项内建此前一个 create 都没有）");
+    is(f.canCreateLayerOfKind("image") === false && f.canCreateLayerOfKind("group") === false, "没登记 create 的内建种类仍不可新建（按钮据此置灰）");
+    is(f.canCreateLayerOfKind("nope") === false, "未知种类不可新建");
+
+    // ---- 2. 经 create 建 light 层：形状 + 引擎缺省值 ----
+    const d1 = mkDoc();
+    const id1 = f.createLayerOfKind("light", d1, { name: "灯光" });
+    is(id1 === 1 && objsOf(d1).length === 1, "createLayerOfKind(\"light\") 建出唯一一层并返回新 id");
+    const L = objsOf(d1)[0];
+    is(L.light === "lpoint" && L.name === "灯光" && L.visible === true, "默认灯类型 lpoint、名字用调用方给的（已本地化的）名字");
+    is(L.intensity === 1 && L.radius === 1000 && L.exponent === 2, "强度 / 半径 / 衰减指数取 parse.js 的缺省值（1 / 1000 / 2）");
+    is(L.color === "1 1 1" && L.origin === "0 0 0" && L.scale === "1 1 1" && L.alpha === 1, "基础字段齐全且与语料同形（颜色是 \\\"r g b\\\" 串）");
+    is(d1.roots.length === 1 && d1.roots[0].kind === "light" && d1.objectCount === 1, "rebuildTree 生效：图层树认得出这是 light（doc.kindOf 的 light 分支）");
+    is(mod.getLightFields(L)?.type === "point" && mod.getLightFields(L)?.lane === "v1", "引擎口径：lpoint 的衰减类型是 point、通道是 V1");
+
+    // ---- 3. 经 create 建 camera 层 ----
+    const d2 = mkDoc();
+    const id2 = f.createLayerOfKind("camera", d2, { name: "相机" });
+    is(id2 === 1 && objsOf(d2).length === 1, "createLayerOfKind(\"camera\") 建出唯一一层");
+    const C = objsOf(d2)[0];
+    is(C.camera === "default" && C.fov === 50 && C.zoom === 1, "相机对象写 camera:\\\"default\\\" + fov 50 + zoom 1（语料同形）");
+    is(d2.roots[0].kind === "camera", "图层树认得出这是 camera（不是顶层视口快照 scene.camera）");
+    is(d2.scene.camera && json(d2.scene.camera) === json({}), "顶层 scene.camera 没被碰（那只是编辑器视口快照，运行时不用）");
+
+    // ---- 4. 没 create 的种类 / 未知种类：返回 null 且不动文档 ----
+    const d3 = mkDoc();
+    is(f.createLayerOfKind("image", d3) === null && objsOf(d3).length === 0, "没 create 的种类返回 null 且不建层");
+    is(f.createLayerOfKind("nope", d3) === null && objsOf(d3).length === 0, "未知种类返回 null 且不建层");
+
+    // ---- 5. 同文档里再建一层：id 递增 ----
+    const d4 = mkDoc();
+    f.createLayerOfKind("light", d4, { name: "a" });
+    const id4 = f.createLayerOfKind("camera", d4, { name: "b" });
+    is(id4 === 2 && objsOf(d4).length === 2, "后续新建按现有最大 id 递增（nextObjectId）");
+
+    // ---- 6. 灯字段读写：通道身份保留、衰减公式不被归一化 ----
+    is(mod.lightLaneOf("lspot") === "v1" && mod.lightLaneOf("point") === "legacy" && mod.lightLaneOf("weird") === "legacy", "通道判定：^l 前缀走 V1，其余（含未知串）走老通道");
+    is(mod.lightTypeOf("lspot") === "spot" && mod.lightTypeOf("ldirectional") === "directional" && mod.lightTypeOf("ltube") === "point", "衰减类型：只有 spot / directional 保留，ltube 归 point");
+    const lg = { light: "lpoint", intensity: 1, radius: 1000, exponent: 2, color: "1 1 1" };
+    is(mod.setLightField(lg, "light", "lspot") === true && lg.light === "lspot", "改灯类型串写回原文（不归一化）");
+    is(mod.getLightFields(lg)?.lane === "v1" && mod.getLightFields(lg)?.type === "spot", "改完类型后通道 / 衰减类型随之更新");
+    is(mod.setLightField(lg, "intensity", 3) === true && lg.intensity === 3, "改强度");
+    is(mod.setLightField(lg, "radius", -1) === false && lg.radius === 1000, "负半径拒绝");
+    is(mod.setLightField(lg, "color", [1, 0.5, 0]) === true && lg.color === "1 0.5 0", "颜色编成 \\\"r g b\\\" 串");
+    is(mod.setLightField(lg, "light", "point") === true && mod.getLightFields(lg)?.lane === "legacy", "切回老通道串（两条衰减公式不同，编辑器不替作者决定）");
+    is(mod.setLightField({}, "intensity", 1) === false, "非灯对象拒绝写灯字段");
+
+    // ---- 7. 灯字段的包装只改 .value ----
+    const lw = { light: "lpoint", intensity: { script: "s", value: 1 } };
+    is(mod.setLightField(lw, "intensity", 2) === true && json(lw.intensity) === json({ script: "s", value: 2 }), "强度带 {script,value} 包装时只改 value");
+    is(mod.setLightField(lw, "intensity", 2) === false, "包装值没变时返回 false");
+
+    // ---- 8. 相机字段读写：fov 0 = 交回引擎缺省 ----
+    const cg = { camera: "default", fov: 50, zoom: 1 };
+    is(mod.setCameraField(cg, "fov", 0) === true && cg.fov === 0, "fov 允许写 0（引擎按 general.fov 或 50 兜底）");
+    is(mod.setCameraField(cg, "fov", 200) === false && mod.setCameraField(cg, "fov", -1) === false, "fov ≥ 180 或负值拒绝");
+    is(mod.setCameraField(cg, "zoom", 0) === false && mod.setCameraField(cg, "zoom", 2) === true && cg.zoom === 2, "zoom 必须 > 0");
+    is(mod.setCameraField({ light: "lpoint" }, "fov", 50) === false, "非相机对象拒绝写相机字段");
+    is(mod.getCameraFields(cg)?.fov === 0 && mod.getCameraFields(cg)?.zoom === 2, "读回当前相机字段");
+
+    return bad;
+  };
+
+  const lcBad = lightCamCorpus(lk, ol);
+  check(lcBad.length === 0, `light / camera 图层：建层形状 / 引擎缺省 / 通道身份 / 字段读写全部成立（${lcBad.join(" / ") || "ok"}）`);
+
+  // ---- ★ LayerKindDef.create 是唯一构造路径（去掉 create 就不该再能建层）----
+  {
+    const mut = lkSrc.replace(
+      '{ kind: "light", builtin: true, canAnimate: true, create: (doc, opts) => addLightLayer(doc, "lpoint", opts?.name ?? "Light") },',
+      '{ kind: "light", builtin: true, canAnimate: true },',
+    );
+    check(mut !== lkSrc, "注入点存在（去掉 light 的 create）");
+    const mutMod = await loadEditorModule("layer-kinds", { [lkPath]: mut });
+    const dm = mkDoc();
+    check(
+      mutMod.canCreateLayerOfKind("light") === false && mutMod.createLayerOfKind("light", dm, { name: "x" }) === null && dm.scene.objects.length === 0,
+      "★ 把 light 的 create 去掉后入口就不再建层（证明消费的是 LayerKindDef.create，不是另写一份构造逻辑）",
+    );
+    check(lkSrc.includes('create: (doc, opts) => addLightLayer(doc, "lpoint", opts?.name ?? "Light")') && lkSrc.includes("create: (doc, opts) => addCameraLayer(doc, opts?.name ?? \"Camera\")"), "两种 create 都接到 objlayers 的构造器上（不复制一份字段表）");
+    check(/return def\.create\(doc, opts\) \?\? null;/.test(lkSrc), "createLayerOfKind 只经注册表的 create 转发");
+    const ckBody = lkSrc.slice(lkSrc.indexOf("export function createLayerOfKind"));
+    check(
+      /def\.create\(/.test(ckBody.slice(0, 400)) && !/addLightLayer|addCameraLayer/.test(ckBody.slice(0, 400)),
+      "createLayerOfKind 体内没有旁路构造（不直接调 objlayers 的构造器）",
+    );
+  }
+
+  // ---- 检视器 / 工具条接线 ----
+  {
+    const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+    check(
+      /const lyAddLightEl = \$\<HTMLButtonElement\>\("#ly-add-light"\);\nlyAddLightEl\.onclick = \(\) => addKindLayer\("light"\);/.test(mainSrc) &&
+        /const lyAddCameraEl = \$\<HTMLButtonElement\>\("#ly-add-camera"\);\nlyAddCameraEl\.onclick = \(\) => addKindLayer\("camera"\);/.test(mainSrc),
+      "工具条按钮接上创建路径（#ly-add-light / #ly-add-camera → addKindLayer）",
+    );
+    check(
+      /function addKindLayer\(kind: "light" \| "camera"\)[\s\S]{0,600}?structEdit\(label, \(d\) => createLayerOfKind\(kind, d, \{ name \}\) \?\? undefined\);/.test(mainSrc),
+      "addKindLayer 走 structEdit + createLayerOfKind（可撤销、可存库，与文字 / 粒子层同一条结构编辑链）",
+    );
+    check(
+      /lyAddLightEl\.disabled = lyAddEl\.disabled \|\| !canCreateLayerOfKind\("light"\);/.test(mainSrc) && /lyAddCameraEl\.disabled = lyAddEl\.disabled \|\| !canCreateLayerOfKind\("camera"\);/.test(mainSrc),
+      "按钮可用性由注册表的能力位决定（没有 create 就是灰的）",
+    );
+    check(
+      /<button[^>]*id="ly-add-light"[^>]*data-et-title="ly\.addLight"/.test(htmlSrc) && /<button[^>]*id="ly-add-camera"[^>]*data-et-title="ly\.addCamera"/.test(htmlSrc),
+      "页面工具条有两个按钮，标题走 i18n 的 data-et-title",
+    );
+    check(
+      /\{ id: "light", order: 450, when: \(n\) => n\.kind === "light", render: lightGroup, tab: "props" \}/.test(mainSrc) &&
+        /\{ id: "camera", order: 460, when: \(n\) => n\.kind === "camera", render: cameraGroup, tab: "props" \}/.test(mainSrc),
+      "light / camera 检视器分组注册进 BUILTIN_INSPECTOR（order 450 / 460）",
+    );
+    check(
+      /getLightFields\(node\.obj\)/.test(mainSrc) && /setLightField\(o, /.test(mainSrc) && /getCameraFields\(node\.obj\)/.test(mainSrc) && /setCameraField\(o, /.test(mainSrc),
+      "两个分组用 objlayers 的字段读写（检视器里没有第二份字段表）",
+    );
+    check(/light\.lane\.v1/.test(mainSrc) && /light\.lane\.legacy/.test(mainSrc), "通道（V1 / 老通道）在 UI 上如实标注");
+    check(/light\.exponentTip/.test(mainSrc) && /camera\.fovTip/.test(mainSrc), "「只有 V1 吃 exponent」「fov 0 = 引擎缺省」这类语义差异写在文案里");
+    const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const lcKeys = [
+      "ly.addLight",
+      "ly.addCamera",
+      "layer.defaultLight",
+      "layer.defaultCamera",
+      "log.addedLight",
+      "log.addedCamera",
+      "insp.light",
+      "insp.camera",
+      "light.type",
+      "light.typeTip",
+      "light.intensity",
+      "light.radius",
+      "light.exponent",
+      "light.exponentTip",
+      "light.color",
+      "light.lane.v1",
+      "light.lane.legacy",
+      "light.bad",
+      "camera.fov",
+      "camera.fovTip",
+      "camera.zoom",
+      "camera.zoomTip",
+      "camera.hint",
+      "camera.bad",
+    ];
+    const missingLc = lcKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+    check(missingLc.length === 0, `light / camera 文案中英文都有、每个键恰好出现 2 次（缺 ${json(missingLc)}）`);
+    check(/light\.typeTip[\s\S]{0,200}?V1/.test(i18nSrc) && /lightconfig/.test(i18nSrc), "灯类型说明写明「^l 前缀走 V1 通道、按 lightconfig 限槽、两条衰减公式不同」");
+    check(/objp\.n\.parallaxdepth": "[^"]*组级/.test(i18nSrc) && /objp\.n\.solid": "[^"]*Solid/.test(i18nSrc), "parallaxDepth 的「只对组/父级生效」与 solid 的「鼠标事件只对 Solid 生效」写在文案里");
+  }
+
+  // ---- 引擎侧对照：灯 / 相机的解析分支确实在（口径来源）----
+  {
+    const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+    const engineHits = [
+      ["isLight: typeof o.light === 'string' && o.light !== ''", "isLight"],
+      ["String(o.light || '').replace(/^l/, '')", "lightType 去掉 ^l 前缀"],
+      ["lightLane: typeof o.light === 'string' && /^l/.test(o.light) ? 'v1' : 'legacy',", "lightLane 通道判定"],
+      ["lightRadius: parseNum(", "radius 缺省 1000"],
+      ["intensity: parseNum(", "intensity"],
+      ["exponent: parseNum(", "exponent"],
+      ["isCamera: typeof o.camera === 'string' && o.camera !== ''", "isCamera"],
+      ["cameraFov: parseNum(", "cameraFov"],
+    ];
+    const missHits = engineHits.filter(([lit]) => !parseSrc.includes(lit)).map(([, name]) => name);
+    check(missHits.length === 0, `灯 / 相机的引擎解析分支逐条对得上（${missHits.join(" / ") || "ok"}）`);
+    const mathSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/math.js"), "utf8");
+    check(/rc\.fov > 0 \? rc\.fov : numField\(general\.fov, 50\)/.test(mathSrc), "引擎相机缺省：fov ≤ 0 时用 general.fov 或 50（与 camera.fovTip 一致）");
+  }
+
+  console.log("  （headless：点「添加灯光层」→ 图层树出现 light → 改 intensity 出帧变；见本段头注）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {
