@@ -284,12 +284,26 @@ export function objFieldState(obj: SceneObject | null | undefined, spec: ObjFiel
 export const objFieldStates = (obj: SceneObject | null | undefined): ObjFieldState[] =>
   OBJ_FIELDS.map((f) => objFieldState(obj, f));
 
-/** 文本框（json / raw）提交：JSON.parse 后写回；坏 JSON 返回 false 让页面报错并回滚 */
+/**
+ * 文本框（json / raw）提交：
+ * - `json`（instanceoverride）严格 JSON，坏输入返回 false 让页面报错并回滚；
+ * - `raw`（引擎不读的透传字段）先试 JSON，失败就当**裸字符串**收下 —— 这些字段类型未知，
+ *   逼作者写引号反而会把 `left` 变成 `"\"left\""`，违背「原样透传」。
+ */
 export function setObjFieldText(obj: SceneObject, key: string, text: string): boolean {
   const spec = objFieldOf(key);
   if (!spec || (spec.type !== "json" && spec.type !== "raw")) return false;
   const t = text.trim();
   if (t === "") return false;
+  if (spec.type === "raw") {
+    let parsed: unknown = t;
+    try {
+      parsed = JSON.parse(t);
+    } catch {
+      /* 不是 JSON：按裸字符串透传 */
+    }
+    return setObjField(obj, spec.key, parsed);
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(t);
@@ -297,4 +311,11 @@ export function setObjFieldText(obj: SceneObject, key: string, text: string): bo
     return false;
   }
   return setObjField(obj, spec.key, parsed);
+}
+
+/** 文本框里的显示文本：json 缩进排版，raw 的字符串不加引号（与 setObjFieldText 的宽容口径对称） */
+export function objFieldText(spec: ObjFieldSpec, v: unknown): string {
+  if (v === undefined) return "";
+  if (spec.type === "raw") return typeof v === "string" ? v : JSON.stringify(v);
+  return JSON.stringify(v, null, 1);
 }

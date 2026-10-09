@@ -22,8 +22,11 @@ export type LayerKindDef = {
   title?: string | Record<string, string>;
   canHaveEffects?: boolean;
   canAnimate?: boolean;
-  /** 「添加图层」菜单入口：往文档里加一个该类型对象，返回新 id */
-  create?: (doc: EditorDoc) => number | string | null;
+  /**
+   * 「添加图层」菜单入口：往文档里加一个该类型对象，返回新 id。
+   * `opts.name` 是调用方给的（已本地化的）图层名，缺省时用类型自带的英文名。
+   */
+  create?: (doc: EditorDoc, opts?: { name?: string }) => number | string | null;
 };
 
 export const layerKinds = createRegistry<LayerKindDef>("layerKinds", {
@@ -42,8 +45,8 @@ export const BUILTIN_LAYER_KINDS: LayerKindDef[] = [
   { kind: "model", builtin: true, canAnimate: true },
   { kind: "sound", builtin: true },
   // M4 A6：「添加图层」入口。此前九项内建都只声明能力、`create` 从未被写也从未被读。
-  { kind: "light", builtin: true, canAnimate: true, create: (doc) => addLightLayer(doc, "lpoint", "Light") },
-  { kind: "camera", builtin: true, create: (doc) => addCameraLayer(doc, "Camera") },
+  { kind: "light", builtin: true, canAnimate: true, create: (doc, opts) => addLightLayer(doc, "lpoint", opts?.name ?? "Light") },
+  { kind: "camera", builtin: true, create: (doc, opts) => addCameraLayer(doc, opts?.name ?? "Camera") },
   { kind: "group", builtin: true, canAnimate: true },
   { kind: "other", builtin: true },
 ];
@@ -53,10 +56,10 @@ layerKinds.setFallback(BUILTIN_LAYER_KINDS);
  * 「添加图层」的唯一生产入口（M4 A6）：按种类调用它登记的 `create`。
  * 没有 create 的种类 / 未知种类返回 null（调用方据此把按钮或菜单项判为不可用）。
  */
-export function createLayerOfKind(kind: string, doc: EditorDoc): number | string | null {
+export function createLayerOfKind(kind: string, doc: EditorDoc, opts?: { name?: string }): number | string | null {
   const def = layerKinds.get(kind);
   if (!def || typeof def.create !== "function") return null;
-  return def.create(doc) ?? null;
+  return def.create(doc, opts) ?? null;
 }
 
 /** 哪些种类可以新建（工具条据此决定按钮是否可用） */
