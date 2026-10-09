@@ -2532,6 +2532,138 @@ function runShim(extras, opts) {
   }
 }
 
+
+// ---------- 10. M6：宿主只读效果库枚举端点 GET /api/fx-library（合规：只读、不复制）----------
+{
+  const hostPath = path.join(ROOT, "host/wallpaper-host.ts");
+  const hostTs = fs.readFileSync(hostPath, "utf8");
+  check(
+    /if \(path === "\/api\/fx-library"\)/.test(hostTs) && /只读端点，需要 GET/.test(hostTs),
+    "宿主 /api/fx-library 只收 GET，写方法一律 405（不提供写入 / 复制语义）",
+  );
+  check(/GET \/api\/fx-library/.test(hostTs), "端点清单注释里登记了 /api/fx-library");
+  const scanAt = hostTs.indexOf("async function scanEffectLibrary");
+  const scanEnd = hostTs.indexOf("export type FolderPicker");
+  const scanRegion = scanAt >= 0 && scanEnd > scanAt ? hostTs.slice(scanAt, scanEnd) : "";
+  check(scanRegion.length > 0, "wallpaper-host.ts 必须有 scanEffectLibrary（效果目录枚举实现）");
+  check(!/writeFile|mkdir|copyFile|unlink|rename|appendFile/.test(scanRegion), "枚举实现只做 readdir / readFile：没有写入 / 建目录 / 复制调用");
+  check(/readOnly: true as const/.test(scanRegion) && /copy: false as const/.test(scanRegion), "响应显式声明 readOnly: true / copy: false");
+
+  const esbuild = await import("esbuild");
+  const http = await import("node:http");
+  const os = await import("node:os");
+  const fxLib = fs.mkdtempSync(path.join(os.tmpdir(), "verify-web-fxlib-"));
+  const w = (rel, text) => {
+    fs.mkdirSync(path.dirname(path.join(fxLib, rel)), { recursive: true });
+    fs.writeFileSync(path.join(fxLib, rel), text);
+  };
+  w("item-a/effects/scroll/effect.json", JSON.stringify({ version: 1, name: "scroll", group: "enhance", passes: [{ material: "materials/effects/scroll.json" }] }));
+  w("item-a/materials/effects/scroll.json", JSON.stringify({ passes: [{ shader: "effects/scroll", combos: { DIRECTION: 1 } }] }));
+  w("item-a/shaders/effects/scroll.frag", 'uniform float g_FxSpeed; // {"material":"speed","default":1,"range":[0,4]}\n');
+  w("item-b/effects/scroll/effect.json", JSON.stringify({ version: 1, name: "scroll-b", passes: [] }));
+  w("item-c/scene.pkg", "PK\u0003\u0004x");
+  w("item-d/effects/junk/effect.json", "{oops");
+
+  const out = await esbuild.build({
+    entryPoints: [hostPath],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "node",
+    target: "node20",
+    packages: "external",
+    logLevel: "silent",
+    plugins: [
+      {
+        name: "host-stubs",
+        setup(b) {
+          b.onResolve({ filter: /\/system-live$/ }, () => ({ path: "system-live-stub", namespace: "stub" }));
+          b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
+            contents: `
+              export const onAudioFrame = () => () => {};
+              export const startLiveSystemService = async () => ({ backend: "none" });
+              export const getAudioStatus = () => "off";
+              export const getCachedArtwork = () => null;
+              export const getCachedMedia = () => ({});
+              export const getCachedWindow = () => ({});
+              export const getLiveBackend = () => "none";
+              export const readNowPlaying = async () => ({});
+              export const readFrontWindow = async () => ({});
+              export const controlNowPlaying = async () => {};
+            `,
+            loader: "js",
+          }));
+        },
+      },
+    ],
+  });
+  const tmpHost = path.join(os.tmpdir(), `verify-web-host-${process.pid}.mjs`);
+  fs.writeFileSync(tmpHost, out.outputFiles[0].text);
+  const mod = await import(pathToFileURL(tmpHost).href);
+
+  /** 起一个绑到指定库目录的宿主：中间件创建时才把库目录定死（`let lib = libraryDir()`），
+   *  WE_LIBRARY 必须留到 configureServer 之后还原，否则会写进用户真正的壁纸库。 */
+  const startFxHost = async (libDir) => {
+    const prev = process.env.WE_LIBRARY;
+    process.env.WE_LIBRARY = libDir;
+    const plugin = mod.wallpaperHost();
+    const handlers = [];
+    plugin.configureServer({
+      config: { logger: { info() {}, warn() {}, error() {} } },
+      middlewares: { use: (fn) => handlers.push(fn) },
+    });
+    if (prev === undefined) delete process.env.WE_LIBRARY;
+    else process.env.WE_LIBRARY = prev;
+    const server = http.createServer((req, res) => {
+      let i = 0;
+      const next = () => {
+        const h = handlers[i++];
+        if (!h) {
+          res.statusCode = 404;
+          res.end("not found");
+          return;
+        }
+        Promise.resolve(h(req, res, next)).catch((e) => {
+          res.statusCode = 500;
+          res.end(String(e));
+        });
+      };
+      next();
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return { base: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+  };
+
+  const host = await startFxHost(fxLib);
+  const missHost = await startFxHost(path.join(fxLib, "no-such-dir"));
+  try {
+    const res = await fetch(`${host.base}/api/fx-library`);
+    const data = await res.json();
+    check(res.status === 200 && data.readOnly === true && data.copy === false, "端点返回只读标记（readOnly: true / copy: false）");
+    check(
+      JSON.stringify(data.effects.map((e) => e.dir)) === JSON.stringify(["scroll"]),
+      `目录名去重（坏 json 不列入，实得 ${JSON.stringify(data.effects.map((e) => e.dir))}）`,
+    );
+    const sc = data.effects[0];
+    check(JSON.stringify(sc.items) === JSON.stringify(["item-a", "item-b"]), "同名目录跨条目去重并记录全部来源条目");
+    check(sc.passes[0].shader === "effects/scroll" && sc.passes[0].combos?.DIRECTION === 1, "pass → 材质 → shader / combos 一并返回");
+    check(Object.keys(sc.files).length === 3 && sc.missing.length === 0, `effect.json + 材质 + shader 文本随枚举带回（实得 ${JSON.stringify(Object.keys(sc.files))}）`);
+    check(data.stats.items === 4 && data.stats.effectDirs === 1 && data.stats.packagedSkipped === 1, `stats 计数（实得 ${JSON.stringify(data.stats)}）`);
+    check(data.errors.length === 1 && /解析失败/.test(data.errors[0]), `坏 effect.json 明确报错（实得 ${JSON.stringify(data.errors)}）`);
+    const post = await fetch(`${host.base}/api/fx-library`, { method: "POST", body: "{}" });
+    check(post.status === 405, "端点只读：POST 被拒（405）");
+    const put = await fetch(`${host.base}/api/fx-library`, { method: "PUT", body: "{}" });
+    check(put.status === 405, "端点只读：PUT 被拒（405）");
+    const miss = await (await fetch(`${missHost.base}/api/fx-library`)).json();
+    check(miss.errors.length === 1 && /壁纸库目录不存在/.test(miss.errors[0]) && miss.effects.length === 0, `库目录不存在 → errors 明确报错（实得 ${JSON.stringify(miss.errors)}）`);
+  } finally {
+    await host.close();
+    await missHost.close();
+    fs.rmSync(fxLib, { recursive: true, force: true });
+    fs.rmSync(tmpHost, { force: true });
+  }
+}
+
 if (errors.length) {
   console.error(`verify-web: ${errors.length} 项失败`);
   for (const e of errors) console.error("  ✗", e);
