@@ -16,6 +16,9 @@
  *   GET /api/library                       扫描壁纸库，列出可测试条目（类型/入口/封面判据见
  *                                          we-library-scan.mjs，与原生 library.rs、perf-bench 共用一份）
  *   POST /api/library-dir                  运行时改壁纸库目录（body `{dir}` 或 `{pick:true}` 调系统选文件夹）
+ *   GET /api/fx-library                    **只读**枚举库内效果目录（`effects/<目录名>/effect.json`，
+ *                                          带 effect.json 元数据、pass/material 清单、combos 与依赖文件文本）。
+ *                                          库内文件留在库里不复制、不写回；工程只写引用（计划 §6 决策 5 = (a)）
  *   POST /api/reveal                       用系统文件管理器打开指定壁纸目录（body `{itemId}`）
  *   POST /api/delete                       删除壁纸目录，优先移入系统废纸篓（body `{itemId}`）
  *   POST /api/editor/save-begin?item=      编辑器另存：新建（或清空编辑器自建的）库内松散工程目录
@@ -559,6 +562,186 @@ async function scanLibrary(dir: string) {
   return { dir, items };
 }
 
+/** 单个效果文件读入上限：超出只记路径不读内容（避免一个坏文件把响应撑爆） */
+const FX_LIB_MAX_FILE = 512 * 1024;
+/** 一个效果最多带回多少依赖文件（防病态 dependencies 全量拉取） */
+const FX_LIB_MAX_FILES = 64;
+
+/** 宽松解析：库内 JSON 允许尾逗号（与 renderer 侧 parseJsonTolerant 同口径，只做最小兜底） */
+function parseJsonLooseText(text: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return JSON.parse(text.replace(/,(\s*[}\]])/g, "$1"));
+  }
+}
+
+/**
+ * 只读枚举壁纸库里的效果目录（`<条目>/effects/<目录名>/effect.json`）。
+ *
+ * 合规边界（计划 §6 决策 5 = (a)）：
+ * - **只读**：本函数只做 readdir / readFile，不写库、不建目录、不复制；
+ * - 库内效果文件**留在库里**，编辑器只往工程 scene.json 写引用（`effects/<目录名>/effect.json`），
+ *   代价是换机打开会缺效果；
+ * - 打包条目（`scene.pkg` 内的效果）**不解包**，只在 stats 里计数并报告。
+ */
+async function scanEffectLibrary(dir: string) {
+  const errors: string[] = [];
+  let itemNames: string[] = [];
+  try {
+    itemNames = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return {
+      dir,
+      readOnly: true as const,
+      copy: false as const,
+      note: "只读枚举：库内效果文件留在库里，工程只写引用；换机打开会缺效果。打包进 scene.pkg 的效果不解包。",
+      effects: [],
+      errors: [`壁纸库目录不存在：${dir}`],
+      stats: { items: 0, effectDirs: 0, packagedSkipped: 0, files: 0 },
+    };
+  }
+
+  /** 目录名 → 效果（同一目录名只保留第一个条目，其余记进 items） */
+  const byDir = new Map<string, { id: string; dir: string; file: string; itemId: string; items: string[]; meta: any; passes: any[]; files: Record<string, string>; missing: string[]; notes: string[] }>();
+  let packagedSkipped = 0;
+
+  for (const itemId of itemNames) {
+    const base = join(dir, itemId);
+    let dirNames: string[] = [];
+    try {
+      const fxRoot = join(base, "effects");
+      const entries = await fs.readdir(fxRoot, { withFileTypes: true });
+      dirNames = entries.filter((d) => d.isDirectory() && !d.name.startsWith(".")).map((d) => d.name).sort();
+    } catch {
+      dirNames = [];
+    }
+    if (!dirNames.length) {
+      // 没有松散 effects/ 目录：可能是被 scene.pkg 打包的效果，计数上报（不解包，合规 + 代价）
+      if ((await statFile(join(base, "scene.pkg"))) || (await statFile(join(base, "scenes", "scene.pkg")))) packagedSkipped++;
+      continue;
+    }
+    for (const fxDir of dirNames) {
+      const rel = `effects/${fxDir}/effect.json`;
+      let text: string;
+      try {
+        text = await fs.readFile(join(base, rel), "utf8");
+      } catch {
+        continue; // 目录里没有 effect.json：不是效果目录
+      }
+      const known = byDir.get(fxDir);
+      if (known) {
+        if (!known.items.includes(itemId)) known.items.push(itemId);
+        continue; // 去重：同目录名只保留第一个条目的内容（items 记录全部来源）
+      }
+      const rec = { id: fxDir, dir: fxDir, file: rel, itemId, items: [itemId], meta: null as any, passes: [] as any[], files: {} as Record<string, string>, missing: [] as string[], notes: [] as string[] };
+      byDir.set(fxDir, rec);
+      let doc: any;
+      try {
+        doc = parseJsonLooseText(text);
+      } catch (e) {
+        // 坏 json 不列进效果（列了等于让页面往工程里写一条读不出来的引用），只在 errors 里报错
+        byDir.delete(fxDir);
+        errors.push(`${itemId}/${rel}：effect.json 解析失败（${e instanceof Error ? e.message : String(e)}）`);
+        continue;
+      }
+      rec.files[rel] = text;
+      rec.meta = {
+        name: doc?.name ?? null,
+        group: doc?.group ?? null,
+        version: doc?.version ?? null,
+        description: doc?.description ?? null,
+        preview: doc?.preview ?? null,
+        editable: doc?.editable ?? null,
+        replacementkey: doc?.replacementkey ?? null,
+        fbos: Array.isArray(doc?.fbos) ? doc.fbos.map((f: any) => f?.name ?? f) : [],
+      };
+      // pass 清单：material / target / bind / combos / 贴图槽（库内材质声明）
+      const rawPasses: any[] = Array.isArray(doc?.passes) ? doc.passes : [];
+      rec.passes = rawPasses.map((p: any, i: number) => ({
+        index: i,
+        material: typeof p?.material === "string" ? p.material : null,
+        target: typeof p?.target === "string" ? p.target : null,
+        bind: Array.isArray(p?.bind) ? p.bind : [],
+        shader: null as string | null,
+        combos: null as Record<string, number | string> | null,
+        textures: [] as any[],
+        uniforms: [] as any[],
+      }));
+      // 依赖清单：effect.json 的 dependencies + 每个 pass 的 material 及其 shader
+      const wanted = new Set<string>();
+      if (Array.isArray(doc?.dependencies)) for (const d of doc.dependencies) if (typeof d === "string") wanted.add(d);
+      for (const p of rec.passes) if (p.material) wanted.add(p.material);
+      for (const rel2 of [...wanted]) {
+        if (Object.keys(rec.files).length >= FX_LIB_MAX_FILES) {
+          rec.notes.push(`依赖文件超过 ${FX_LIB_MAX_FILES} 个，其余未读`);
+          break;
+        }
+        let body: string;
+        try {
+          body = await fs.readFile(join(base, rel2), "utf8");
+        } catch {
+          rec.missing.push(rel2);
+          continue;
+        }
+        if (body.length > FX_LIB_MAX_FILE) {
+          rec.notes.push(`${rel2} 超过 ${FX_LIB_MAX_FILE} 字节，未随枚举返回`);
+          continue;
+        }
+        rec.files[rel2] = body;
+      }
+      // pass → 材质 → shader：把材质里声明的 combos / usershadervalues / 贴图槽提出来
+      for (const p of rec.passes) {
+        const matText = p.material ? rec.files[p.material] : null;
+        if (!matText) {
+          if (p.material && rec.missing.includes(p.material)) rec.notes.push(`材质缺失：${p.material}`);
+          continue;
+        }
+        let mat: any;
+        try {
+          mat = parseJsonLooseText(matText);
+        } catch {
+          rec.notes.push(`材质解析失败：${p.material}`);
+          continue;
+        }
+        const mp = Array.isArray(mat?.passes) ? mat.passes[0] : null;
+        if (!mp) continue;
+        p.shader = typeof mp.shader === "string" ? mp.shader : null;
+        p.combos = mp.combos && typeof mp.combos === "object" ? { ...mp.combos } : null;
+        if (Array.isArray(mp.textures)) p.textures = mp.textures;
+        if (mp.usershadervalues && typeof mp.usershadervalues === "object") p.uniforms = Object.keys(mp.usershadervalues);
+        if (!p.shader) continue;
+        // frag 是必需件（缺了记 missing），.vert 可选（frag-only 效果很常见）
+        for (const ext of ["frag", "vert"]) {
+          const srel = `shaders/${p.shader}.${ext}`;
+          if (rec.files[srel]) continue;
+          try {
+            const src = await fs.readFile(join(base, srel), "utf8");
+            if (src.length <= FX_LIB_MAX_FILE) rec.files[srel] = src;
+            else rec.notes.push(`${srel} 超过 ${FX_LIB_MAX_FILE} 字节，未随枚举返回`);
+          } catch {
+            if (ext === "frag") rec.missing.push(srel);
+          }
+        }
+      }
+    }
+  }
+
+  const effects = [...byDir.values()].sort((a, b) => a.dir.localeCompare(b.dir));
+  return {
+    dir,
+    readOnly: true as const,
+    copy: false as const,
+    note: "只读枚举：库内效果文件留在库里，工程只写引用；换机打开会缺效果。打包进 scene.pkg 的效果不解包。",
+    effects,
+    errors,
+    stats: { items: itemNames.length, effectDirs: effects.length, packagedSkipped, files: effects.reduce((n, e) => n + Object.keys(e.files).length, 0) },
+  };
+}
+
 export type FolderPicker = (defaultDir: string, prompt: string) => Promise<string | null>;
 
 export type HostOptions = {
@@ -786,6 +969,18 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.setHeader("Cache-Control", "no-store");
       res.end(JSON.stringify(data));
+      return;
+    }
+
+    // --- 测试台专用：**只读**枚举库内效果目录（计划 §6 决策 5 = (a)）---
+    // 只接受 GET：不接受写入/复制语义（POST 一律 405），也不写库、不建目录。
+    if (path === "/api/fx-library") {
+      if (req.method !== "GET") {
+        sendJson(res, 405, { error: "只读端点，需要 GET" });
+        return;
+      }
+      const data = await scanEffectLibrary(lib);
+      sendJson(res, 200, data);
       return;
     }
 

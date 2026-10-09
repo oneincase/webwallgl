@@ -1104,7 +1104,17 @@ const uniformNotes = (frag) => {
   check(mj.passes?.[0]?.shader === "effects/wwgl_tint" && mj.passes[0].depthtest === "disabled", "材质：shader = effects/wwgl_tint（引擎补 shaders/ 与 .frag/.vert）");
   check(dec.decode(files[2].data) === tint.frag && /g_ModelViewProjectionMatrix/.test(dec.decode(files[3].data)), "frag 即定义里的源码；vert 是通用全层顶点着色器");
   check(f.effectFileOf("blur") === "effects/wwgl_blur/effect.json" && f.effectIdOf("effects/wwgl_blur/effect.json") === "blur", "effectFileOf / effectIdOf 互逆");
-  check(f.effectIdOf("effects/waterripple/effect.json") === null && f.effectIdOf("effects/wwgl_nope/effect.json") === null && f.effectIdOf(3) === null, "官方效果 / 未知 id / 非字符串 → null（面板只读展示）");
+  // M6 改契约：库内 / WE 官方目录名一律还原成目录名本身（不再是 null），
+  // 未登记的 `wwgl_` 前缀（插件被禁用 / 效果已删）与非法路径仍然 null。
+  check(
+    f.effectIdOf("effects/waterripple/effect.json") === "waterripple" &&
+      f.effectIdOf("effects/godrays/effect.json") === "godrays" &&
+      f.effectIdOf("effects/wwgl_nope/effect.json") === null &&
+      f.effectIdOf("effects/Tint/effect.json") === null &&
+      f.effectIdOf("effects/tint/effect.js") === null &&
+      f.effectIdOf(3) === null,
+    "库内 / 官方目录名 → 目录名本身（M6）；未登记 wwgl_ 前缀 / 非法路径 / 非字符串 → null",
+  );
 
   const amount = tint.params[1];
   const color = tint.params[0];
@@ -4943,6 +4953,255 @@ section("FX-INLINE. 作品自带效果参数 editor/effects.ts（M1 A1/A2）");
   }
 
   console.log("  （headless：打开夹具 → 改 Bar Count → scene.json 值与出帧都变；见本段头注）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FX-LIB. M6（计划 A11）：宿主只读效果库枚举 + 编辑器只写引用 + pass 级 combos
+//
+// headless 用例（未跑，只注明）：「在一个从未打开过的工程里加库内效果」——
+//   打开空工程 → 效果浏览器列出库内目录 → 展开预览（参数 / 贴图槽 / combos 只读）
+//   → 点「添加引用」→ 保存 → 重开工程仍是同一条引用、参数面板可调、combos 往返一致，
+//   且工程文件夹里**没有** effects/<库目录>/** 任何文件（库内文件仍在库里）。
+// ───────────────────────────────────────────────────────────────────────────
+section("FX-LIB. 效果库接入 editor/effects.ts + host/wallpaper-host.ts（M6 A11）");
+const fxLibMod = await loadEditorModule("effects");
+{
+  const { createHash } = await import("node:crypto");
+  /** 目录内容指纹：断言「库内文件一字未动」（不写回库、不复制） */
+  const dirDigest = (root) => {
+    const out = [];
+    const walk = (rel) => {
+      const abs = rel ? path.join(root, rel) : root;
+      for (const e of fs.readdirSync(abs, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(r);
+        else out.push(`${r}:${createHash("sha1").update(fs.readFileSync(path.join(root, r))).digest("hex")}`);
+      }
+    };
+    walk("");
+    return out.join("\n");
+  };
+
+  // ---- (1) 目录名 → 效果 id 还原（M6 契约：库内 / 官方目录名还原成目录名）----
+  check(
+    fxLibMod.effectIdOf("effects/godrays/effect.json") === "godrays" && fxLibMod.effectIdOf("effects/waterripple/effect.json") === "waterripple",
+    "库内 / WE 官方目录名 → 目录名本身（不再是 null）",
+  );
+  check(
+    fxLibMod.effectIdOf("effects/wwgl_tint/effect.json") === "tint" && fxLibMod.effectDirNameOf("effects/wwgl_tint/effect.json") === "wwgl_tint",
+    "已登记 wwgl_ 前缀目录仍还原成内置 id，且能取回目录名",
+  );
+  check(
+    fxLibMod.effectIdOf("effects/wwgl_nope/effect.json") === null && fxLibMod.effectIdOf("effects/Tint/effect.json") === null && fxLibMod.effectIdOf("effects/tint/effect.json") === "tint",
+    "未登记 wwgl_ 前缀 / 大小写不符 → null；库内 tint 就是目录名 tint",
+  );
+  // 撞名守门：库内 effects/tint 与内置内置 id `tint`（登记目录 wwgl_tint）**不共参数表**
+  const collide = { id: 1, effects: [{ file: "effects/tint/effect.json", passes: [{ constantshadervalues: { amount: 0.5 } }] }] };
+  check(fxLibMod.effectViews(collide)[0]?.def === null, "库内 effects/tint 认不出内置参数表（目录名必须等于登记目录 wwgl_tint）");
+  check(fxLibMod.setEffectParam(collide, 0, "amount", 0.2) === false, "库内 effects/tint 的参数不走内置参数表（不改动、返回 false）");
+  check(fxLibMod.effectViews({ effects: [{ file: "effects/wwgl_tint/effect.json", passes: [{}] }] })[0]?.def?.id === "tint", "内置目录 wwgl_tint 才套参数表（撞名守门反向）");
+
+  // ---- (2) 宿主只读枚举端点：夹具库 ----
+  // 两个条目共用一个效果目录名（去重）、一个打包条目（不解包）、一个缺材质的、一个坏 json 的
+  const fxLib = path.join(tmpRoot, "fxlib");
+  const gdRel = "effects/godrays/effect.json";
+  const fxWrite = (rel, text) => {
+    fs.mkdirSync(path.dirname(path.join(fxLib, rel)), { recursive: true });
+    fs.writeFileSync(path.join(fxLib, rel), text);
+  };
+  fxWrite("lib-item-a/project.json", json({ type: "scene", file: "scene.json" }));
+  fxWrite("lib-item-a/scene.json", json(fixtureScene()));
+  fxWrite(
+    "lib-item-a/" + gdRel,
+    json({
+      version: 1,
+      name: "godrays",
+      group: "enhance",
+      description: "光轴",
+      preview: "preview/project.json",
+      replacementkey: "godrays",
+      fbos: [{ name: "godrays_half" }],
+      dependencies: [
+        "materials/effects/godrays_downsample.json",
+        "materials/effects/godrays_combine.json",
+        "shaders/effects/godrays_downsample.frag",
+        "shaders/effects/godrays_combine.frag",
+      ],
+      passes: [
+        { material: "materials/effects/godrays_downsample.json", target: "godrays_half" },
+        { material: "materials/effects/godrays_combine.json", bind: [{ name: "godrays_half", index: 0 }] },
+      ],
+    }),
+  );
+  fxWrite("lib-item-a/materials/effects/godrays_downsample.json", json({ passes: [{ shader: "effects/godrays_downsample", blending: "additive", combos: { PRE: 1 } }] }));
+  fxWrite(
+    "lib-item-a/materials/effects/godrays_combine.json",
+    json({ passes: [{ shader: "effects/godrays_combine", combos: { VERTICAL: 0 }, textures: ["$mediaThumbnail"] }] }),
+  );
+  fxWrite("lib-item-a/shaders/effects/godrays_downsample.frag", 'uniform float g_FxThreshold; // {"material":"threshold","default":0.5,"range":[0,1]}\n');
+  fxWrite("lib-item-a/shaders/effects/godrays_combine.frag", 'uniform float g_FxAmount; // {"material":"amount","default":1,"range":[0,2]}\n');
+  // 与内置 id 撞名的库内目录（真机上 razer_vortex / razer_bedroom 就有 effects/tint）
+  fxWrite("lib-item-a/effects/tint/effect.json", json({ version: 1, name: "tint", group: "colorize", passes: [{ material: "materials/effects/lib_tint.json" }] }));
+  fxWrite("lib-item-a/materials/effects/lib_tint.json", json({ passes: [{ shader: "effects/lib_tint" }] }));
+  fxWrite("lib-item-a/shaders/effects/lib_tint.frag", 'uniform float g_FxMix; // {"material":"mix","default":1,"range":[0,1]}\n');
+  // 依赖缺失：照旧列出该效果，missing 里点名
+  fxWrite("lib-item-a/effects/broken/effect.json", json({ version: 1, passes: [{ material: "materials/effects/nope.json" }] }));
+  // 坏 json：不列进效果，只在 errors 里报错
+  fxWrite("lib-item-a/effects/junk/effect.json", "{oops");
+  // 同名目录的第二个条目（内容不同，去重时只保留第一个）
+  fxWrite("lib-item-b/effects/godrays/effect.json", json({ version: 1, name: "godrays-b", passes: [{ material: "materials/effects/godrays_combine.json" }] }));
+  // 打包条目：效果在 scene.pkg 里 → 只计数、不解包
+  fxWrite("packed-only/project.json", json({ type: "scene", file: "scene.pkg" }));
+  fxWrite("packed-only/scene.pkg", "PK\u0003\u0004dummy");
+
+  const fxHost = await startHost(fxLib);
+  cleanups.push(() => fxHost.close());
+  const fxBeforeA = dirDigest(path.join(fxLib, "lib-item-a"));
+  const fxBeforeP = dirDigest(path.join(fxLib, "packed-only"));
+  const libRes = await fetch(`${fxHost.base}/api/fx-library`);
+  const lib = await libRes.json();
+  check(libRes.status === 200 && lib.readOnly === true && lib.copy === false && /只读枚举/.test(lib.note ?? ""), `端点声明只读（readOnly/copy/note 都在，实得 ${json({ readOnly: lib.readOnly, copy: lib.copy })}）`);
+  check(json(lib.effects.map((e) => e.dir)) === json(["broken", "godrays", "tint"]), `目录去重枚举（坏 json 不列入，实得 ${json(lib.effects.map((e) => e.dir))}）`);
+  const gd = lib.effects.find((e) => e.dir === "godrays");
+  check(json(gd.items) === json(["lib-item-a", "lib-item-b"]) && gd.itemId === "lib-item-a", `同名目录跨条目去重、来源条目都记下（实得 ${json(gd.items)}）`);
+  check(gd.meta.name === "godrays" && gd.meta.group === "enhance" && gd.meta.replacementkey === "godrays" && gd.meta.description === "光轴" && json(gd.meta.fbos) === json(["godrays_half"]), "effect.json 元数据随枚举返回");
+  check(
+    gd.passes.length === 2 && gd.passes[0].material === "materials/effects/godrays_downsample.json" && gd.passes[0].target === "godrays_half" && json(gd.passes[1].bind) === json([{ name: "godrays_half", index: 0 }]),
+    "pass 清单：material / target / bind 原样带出",
+  );
+  check(
+    gd.passes[0].shader === "effects/godrays_downsample" && gd.passes[0].combos?.PRE === 1 && gd.passes[1].combos?.VERTICAL === 0 && json(gd.passes[1].textures) === json(["$mediaThumbnail"]),
+    "材质声明的 shader / combos / 贴图槽一并返回（贴图槽只读展示）",
+  );
+  check(
+    gd.files[gdRel].includes("godrays_half") && gd.files["materials/effects/godrays_combine.json"].includes("VERTICAL") && gd.files["shaders/effects/godrays_combine.frag"].includes("g_FxAmount"),
+    "枚举带上依赖文件文本（面板只读预览不用再伸手进库）",
+  );
+  check(Object.keys(gd.files).length === 5 && gd.missing.length === 0 && gd.notes.length === 0, `依赖齐全：files 5 个 / missing 空 / notes 空（实得 ${json({ files: Object.keys(gd.files), missing: gd.missing, notes: gd.notes })}）`);
+  const brokenFx = lib.effects.find((e) => e.dir === "broken");
+  check(json(brokenFx.missing) === json(["materials/effects/nope.json"]) && brokenFx.notes.some((n) => /材质缺失/.test(n)), `依赖缺失点名到 missing 并留 note（实得 ${json(brokenFx.missing)}）`);
+  check(lib.errors.length === 1 && /effect\.json 解析失败/.test(lib.errors[0]), `坏 json 明确报错（实得 ${json(lib.errors)}）`);
+  check(lib.stats.items === 3 && lib.stats.effectDirs === 3 && lib.stats.packagedSkipped === 1 && lib.stats.files === 9, `stats：${json(lib.stats)}`);
+  const writeRes = await fetch(`${fxHost.base}/api/fx-library`, { method: "POST", body: "{}" });
+  check(writeRes.status === 405 && (await writeRes.json()).error === "只读端点，需要 GET", "端点只读：POST 被拒 405（不提供任何写入 / 复制语义）");
+  // 库目录不存在 → 明确报错（不是静默空列表）
+  const fxHost2 = await startHost(path.join(tmpRoot, "no-such-fxlib"));
+  cleanups.push(() => fxHost2.close());
+  const missLib = await (await fetch(`${fxHost2.base}/api/fx-library`)).json();
+  check(missLib.errors.length === 1 && /壁纸库目录不存在/.test(missLib.errors[0]) && missLib.effects.length === 0 && missLib.stats.files === 0, `库目录不存在 → errors 明确报错（实得 ${json(missLib.errors)}）`);
+
+  // ---- (3) 往工程写引用（只写引用、不复制文件）+ combos 往返 ----
+  const libDecls = await fxLibMod.inspectEffectPasses(gd.file, async (name) => gd.files[name] ?? null);
+  check(
+    libDecls.length === 2 && libDecls[0].params.map((p) => p.key).includes("threshold") && libDecls[0].combos.PRE === 1 && libDecls[1].combos.VERTICAL === 0,
+    `用枚举带回的文本就能读出库内效果的参数表与 combos（实得 ${json(libDecls.map((p) => [p.params.map((q) => q.key), p.combos]))}）`,
+  );
+  const seeds = libDecls.map((ps, i) => ({
+    constantshadervalues: Object.fromEntries(ps.params.map((p) => [p.key, fxLibMod.encodeValue(p, p.default)])),
+    combos: { ...(gd.passes[i]?.combos ?? {}), ...(i === 1 ? { VERTICAL: 1 } : {}) },
+  }));
+  const doc = freshDoc();
+  const fxObj = doc.scene.objects.find((o) => o.id === 1);
+  const fxIndex = fxLibMod.addEffectRef(fxObj, gd.file, gd.dir, seeds);
+  check(fxIndex === 0, `加效果：写进对象的 effects[] 并返回下标（实得 ${fxIndex}）`);
+  check(
+    json(fxObj.effects[0]) ===
+      json({
+        file: gdRel,
+        name: "godrays",
+        visible: true,
+        passes: [
+          { constantshadervalues: { threshold: 0.5 }, combos: { PRE: 1 } },
+          { constantshadervalues: { amount: 1 }, combos: { VERTICAL: 1 } },
+        ],
+      }),
+    `scene.json 结构正确：file / name / visible / passes[].constantshadervalues + combos（实得 ${json(fxObj.effects[0])}）`,
+  );
+  const declaredMap = new Map([[gd.file, libDecls.map((p) => p.combos)]]);
+  const paramMap = new Map([[gd.file, libDecls.flatMap((p) => p.params)]]);
+  const views = fxLibMod.inlinePassViews(fxObj, paramMap, declaredMap);
+  const view1 = views.find((v) => v.pass === 1);
+  check(
+    view1 && json(view1.combosDeclared) === json({ VERTICAL: 0 }) && json(view1.combos) === json({ VERTICAL: 1 }) && view1.params.some((p) => p.key === "amount"),
+    `面板同时看到「材质声明档」与「工程覆盖档」，参数表可用（实得 ${json({ declared: view1?.combosDeclared, override: view1?.combos })}）`,
+  );
+  check(
+    json(fxLibMod.mergedCombos(view1.combosDeclared, view1.combos)) === json({ VERTICAL: 1 }) &&
+      json(fxLibMod.mergedCombos(fxLibMod.combosOfMaterialJson(JSON.parse(gd.files["materials/effects/godrays_combine.json"])), { VERTICAL: 0 })) === json({ VERTICAL: 0 }),
+    "mergedCombos：工程覆盖盖过材质声明（与引擎 `{...mp.combos, ...ov.combos}` 同序）",
+  );
+  check(fxLibMod.setPassCombo(fxObj, 0, 1, "VERTICAL", 0) === true && json(fxLibMod.passCombos(fxObj, 0, 1)) === json({ VERTICAL: 0 }), "combos 写：命中已有键就地改值（不新增键）");
+  check(fxLibMod.clearPassCombo(fxObj, 0, 1, "VERTICAL") === true && json(fxLibMod.passCombos(fxObj, 0, 1)) === json({}), "combos 清：删掉工程覆盖即回到库内默认（材质声明不动）");
+  check(fxLibMod.setPassCombo(fxObj, 0, 1, "VERTICAL", 1) === true && fxLibMod.setPassCombo(fxObj, 0, 1, "BLUR", 2) === true, "combos 写：库内没声明过的键也能写（引擎按程序缓存键编译新变体）");
+  fxLibMod.clearPassCombo(fxObj, 0, 1, "BLUR");
+  check(json(fxObj.effects[0].passes[1].combos) === json({ VERTICAL: 1 }), `回到待保存状态：combos = {VERTICAL:1}（实得 ${json(fxObj.effects[0].passes[1].combos)}）`);
+
+  // 真保存路径：collectProject（编辑器实际用的收集器）→ 宿主 save-* 写盘 → 重新打开
+  const realFetchLib = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetchLib(String(url).startsWith("/") ? `${fxHost.base}${url}` : url, init);
+  try {
+    const files = await saveMod.collectProject(doc, memAssets("scene.json", { "scene.json": enc.encode("{}") }), null);
+    const paths = files.map((f) => f.path);
+    check(
+      paths.length === 2 && paths.includes("scene.json") && paths.includes("project.json"),
+      `保存清单只有工程自己的文件（实得 ${json(paths)}）`,
+    );
+    check(!paths.some((p) => /^effects\//i.test(p) || /godrays|lib_tint/.test(p)), "**未复制任何库内效果文件**：保存清单里没有 effects/<库目录>/** 也没有 godrays / lib_tint");
+    const savedScene = JSON.parse(dec.decode(files.find((f) => f.path === "scene.json").data));
+    const savedFx = savedScene.objects.find((o) => o.id === 1).effects[0];
+    check(
+      savedFx.file === gdRel && !/wwgl_/.test(savedFx.file) && json(savedFx) === json(fxObj.effects[0]),
+      "工程 scene.json 里写的是库内相对引用 effects/<目录名>/effect.json：参数与 combos 内联、原样序列化",
+    );
+    const savedId = saveMod.newLibraryItemId(doc.title);
+    await saveMod.saveToLibrary(savedId, files);
+    const savedFiles = fs.readdirSync(path.join(fxLib, savedId), { recursive: true }).filter((n) => !fs.statSync(path.join(fxLib, savedId, n)).isDirectory());
+    check(!savedFiles.some((n) => /godrays|lib_tint|effect\.json/i.test(n)), `工程条目盘上也没有库内效果文件（实得 ${json(savedFiles)}）`);
+    const reopenedObj = JSON.parse(fs.readFileSync(path.join(fxLib, savedId, "scene.json"), "utf8")).objects.find((o) => o.id === 1);
+    const reopenedFx = fxLibMod.effectViews(reopenedObj)[0];
+    check(json(reopenedObj.effects[0]) === json(fxObj.effects[0]), "重开（真写盘 + 重读）：引用 / 参数 / combos 逐字段一致，往返不丢");
+    check(reopenedFx?.file === gdRel && reopenedFx?.name === "godrays" && reopenedFx?.def === null, "重开：仍是库内效果条目（按目录名还原成库内 id，查不到内置参数表）");
+    check(json(fxLibMod.passCombos(reopenedObj, 0, 1)) === json({ VERTICAL: 1 }) && json(fxLibMod.passCombos(reopenedObj, 0, 0)) === json({ PRE: 1 }), "重开：pass 级 combos 仍可读（保存 / 重开不丢、结构未改）");
+    const againViews = fxLibMod.inlinePassViews(reopenedObj, paramMap, declaredMap);
+    check(againViews.find((v) => v.pass === 1)?.params.some((p) => p.key === "amount"), "重开：参数面板仍能按库内 shader 读出参数（不依赖工程里有 effect.json）");
+  } finally {
+    globalThis.fetch = realFetchLib;
+  }
+
+  // ---- (4) 合规 + 陷阱守门（源码级）----
+  check(/if \(path === "\/api\/fx-library"\)/.test(HOST_TS) && /只读端点，需要 GET/.test(HOST_TS), "宿主端点 /api/fx-library 只收 GET（写方法一律 405）");
+  const scanRegion = HOST_TS.slice(HOST_TS.indexOf("async function scanEffectLibrary"), HOST_TS.indexOf("export type FolderPicker"));
+  check(scanRegion.length > 0 && !/writeFile|mkdir|copyFile|unlink|rename|appendFile/.test(scanRegion), "枚举实现只做 readdir / readFile：没有写入 / 建目录 / 复制调用");
+  const mainText = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  // 只看效果浏览器那一段（到 addEffectTo 为止）：内置效果的既有实现本来就会 overlay.put 自己的四件文件，不算复制库文件
+  const libRegion = mainText.slice(mainText.indexOf("效果库浏览器（M6"), mainText.indexOf("function addEffectTo"));
+  check(libRegion.length > 0 && /addEffectRef\(/.test(libRegion), "编辑器效果浏览器区：只调 addEffectRef 往工程写引用");
+  check(!/overlay\.put|effectFiles\(/.test(libRegion), "**未复制库内文件**：效果浏览器区没有 overlay.put / effectFiles（不生成、不铺开库内效果文件）");
+  check(
+    /dataset\.fxLibDir/.test(libRegion) && /dataset\.fxLibAdd/.test(libRegion) && /dataset\.fxSource/.test(libRegion) && /dataset\.fxLibStats/.test(libRegion),
+    "效果浏览器带条目 / 添加按钮 / 来源标注钩子（工程内 / 仅库内）",
+  );
+  check(/fxLibraryFiles/.test(libRegion) && !/localStorage|indexedDB/.test(libRegion), "库内文件文本只缓存在内存（不落盘到工程）");
+  check(dirDigest(path.join(fxLib, "lib-item-a")) === fxBeforeA, "库内效果目录一字未动（枚举 / 加效果 / 保存都没写回库）");
+  check(dirDigest(path.join(fxLib, "packed-only")) === fxBeforeP, "打包条目也未被动过（不解包、不改写、不复制出效果文件）");
+
+  // ---- (5) layerMaterial 下标坑守门（M1 发现的引擎行为，M6 加效果必须绕开）----
+  const fxParse = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
+  const layer = { effects: [{ file: gdRel, name: "godrays", passes: [{ constantshadervalues: { threshold: 1 }, combos: { PRE: 1 } }] }] };
+  const attached = fxParse.attachLayerMaterialEffect(layer, { shader: "effects/author_starfield", constantshadervalues: { u: 1 }, combos: { STARS: 1 } });
+  check(
+    attached === true && layer.effects.length === 2 && layer.effects[0].layerMaterial === true && layer.effects[0].file === "" && layer.effects[1].file === gdRel,
+    "引擎把图层自身材质合成条目 unshift 到队首（引擎侧下标整体偏一位）",
+  );
+  check(layer.effects.filter((e) => !e?.layerMaterial)[0].file === gdRel, "按 `filter((e) => !e?.layerMaterial)[i]` 定位才拿到文档下标对应的那条");
+  const docEntry = layer.effects.filter((e) => !e?.layerMaterial)[0];
+  check(
+    json(fxLibMod.passCombos(layer, 0, 0)) === json({ STARS: 1 }) && json(fxLibMod.passCombosOnPass(docEntry.passes[0])) === json({ PRE: 1 }),
+    "合成条目自己也在引擎下标 0 上（还带自己的 combos）：按下标直取会读错条目，必须 filter 后再取文档下标",
+  );
+  const layer2 = { effects: [] };
+  check(fxParse.attachLayerMaterialEffect(layer2, { shader: "sprite", constantshadervalues: {} }) === false && layer2.effects.length === 0, "内置 albedo shader（sprite / generic / genericimage*）不合成 layerMaterial 条目（不会偏位）");
+  check(!!fxLibMod.effectDirNameOf(gdRel) && fxLibMod.effectIdOf(gdRel) === "godrays", "文档 effects[].file 用同一套目录名还原（写引用 / 读引用同源）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

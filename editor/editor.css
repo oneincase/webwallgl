@@ -939,6 +939,96 @@ input.ed-al-name {
   margin: 2px 0;
 }
 
+/* ---- pass 级 combos（M6）：编译期分支的显示与开关 ---- */
+.ed-inline-combos,
+.ed-fx-lib-combos {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--wb-fg-mute);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ed-inline-combo {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+/* ---- 效果库浏览器（M6）：只读枚举本机壁纸库的效果目录 ---- */
+.ed-fx-lib {
+  margin-top: 8px;
+  border-top: 1px solid var(--wb-line);
+  padding-top: 6px;
+}
+
+.ed-fx-lib-title {
+  font-size: 11px;
+  color: var(--wb-fg-mute);
+  margin-bottom: 4px;
+}
+
+.ed-fx-lib-item {
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-bg-2);
+  margin-bottom: 4px;
+}
+
+.ed-fx-lib-head {
+  cursor: pointer;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--wb-fg-dim);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.ed-fx-lib-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-fx-lib-badge {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--wb-fg-mute);
+}
+
+.ed-fx-lib-item[data-fx-source="project"] .ed-fx-lib-badge {
+  color: var(--wb-accent, #4aa3ff);
+}
+
+.ed-fx-lib-body {
+  padding: 2px 6px 6px;
+}
+
+.ed-fx-lib-pass,
+.ed-fx-lib-params,
+.ed-fx-lib-textures,
+.ed-fx-lib-missing {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--wb-fg-mute);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.ed-fx-lib-pass-head {
+  font-size: 11px;
+  color: var(--wb-fg-dim);
+}
+
+.ed-fx-lib-add {
+  margin-top: 6px;
+}
+
 .ed-script {
   margin: 0 0 8px;
 }
