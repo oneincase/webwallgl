@@ -119,9 +119,130 @@ function defaultValueOf(target: string): unknown {
   }
 }
 
-/** 新脚本模板：WE 官方的 update(value) 形态，返回值即字段新值 */
-export function scriptTemplate(target: string): string {
+/**
+ * 脚本生命周期模板（B8 / M9）。
+ * 入口名字面量依据引擎：`renderer/vendor/we-scene/render/text.js` 的 `SCRIPT_ENTRY_NAMES`
+ * （`update` / `init` / `applyUserProperties` / 6 个 `cursor*` / `MEDIA_CALLBACKS` 6 个 /
+ * `animationEvent` / `resizeScreen`）。派发口径同文件：`init(value)` 的返回值是字段新初值、
+ * `applyUserProperties(props)` 挂载时以全量属性先调一次、`callCursor(name, event)` 传单个事件、
+ * `callMedia(name, event)` 传 toScriptMediaEvent(event)、`animationEvent(event, value)` 两个参数、
+ * `resizeScreen(size)` 单个 Vec2。
+ * `destroy` **不在** `SCRIPT_ENTRY_NAMES` 里（引擎只有 `thisScene.destroyLayer` 的墓碑机制），
+ * 所以它的模板额外保留字段主回调，免得整份脚本被「无可用入口」的闸门丢掉。
+ */
+export type ScriptLifecycle =
+  | "update"
+  | "init"
+  | "applyUserProperties"
+  | "cursor"
+  | "media"
+  | "resizeScreen"
+  | "animationEvent"
+  | "destroy";
+
+/** 面板下拉里的模板顺序：先字段主回调，再按引擎派发顺序，destroy 排最后（引擎不派发） */
+export const SCRIPT_LIFECYCLES: readonly ScriptLifecycle[] = [
+  "update",
+  "init",
+  "applyUserProperties",
+  "cursor",
+  "media",
+  "resizeScreen",
+  "animationEvent",
+  "destroy",
+];
+
+function fieldType(target: string): string {
   const vec = target === "origin" || target === "scale" || target === "angles" || target === "color";
-  const type = target === "text" ? "String" : target === "visible" ? "Boolean" : vec ? "Vec3" : "Number";
-  return `'use strict';\n\n/**\n * ${target}\n * @param {${type}} value\n */\nexport function update(value) {\n\treturn value;\n}\n`;
+  return target === "text" ? "String" : target === "visible" ? "Boolean" : vec ? "Vec3" : "Number";
+}
+
+/** 字段主回调：参数是字段当前值，返回值即新值（undefined = 保持不变） */
+function fieldUpdate(target: string): string {
+  return [
+    "/**",
+    ` * ${target}`,
+    ` * @param {${fieldType(target)}} value 字段当前值`,
+    " * @returns 字段新值；返回 undefined 表示保持不变",
+    " */",
+    "export function update(value) {",
+    "\treturn value;",
+    "}",
+  ].join("\n");
+}
+
+/** 除 update 之外的生命周期钩子（每个模板都会再带上一段字段主回调） */
+function lifecycleHook(kind: Exclude<ScriptLifecycle, "update">): string {
+  switch (kind) {
+    case "init":
+      return [
+        "/**",
+        " * 挂载时调用一次；返回值是该字段的新初值（不返回则保持 scene.json 里的值）。",
+        " */",
+        "export function init(value) {",
+        "\treturn value;",
+        "}",
+      ].join("\n");
+    case "applyUserProperties":
+      return [
+        "/**",
+        " * 用户属性变化；挂载时会先用全量属性调一次。props 形如 { 属性名: 值 }。",
+        " */",
+        "export function applyUserProperties(props) {",
+        "\t// 例：thisLayer.text = props.标题",
+        "}",
+      ].join("\n");
+    case "cursor":
+      return [
+        "// 指针事件：引擎按事件名逐个派发（hittest / cursor-dispatch），只留用得上的那几个即可。",
+        "export function cursorClick(e) {}",
+        "export function cursorEnter(e) {}",
+        "export function cursorLeave(e) {}",
+        "export function cursorDown(e) {}",
+        "export function cursorUp(e) {}",
+        "export function cursorMove(e) {}",
+      ].join("\n");
+    case "media":
+      return [
+        "// 媒体回调：宿主只在媒体快照变化时派发（不是每帧），e 形如 { title, artist, ... }。",
+        "export function mediaPropertiesChanged(e) {}",
+        "export function mediaThumbnailChanged(e) {}",
+        "export function mediaPlaybackChanged(e) {}",
+        "export function mediaTimelineChanged(e) {}",
+        "export function mediaStatusChanged(e) {}",
+        "export function mediaLyricsChanged(e) {}",
+      ].join("\n");
+    case "resizeScreen":
+      return [
+        "/**",
+        " * 画布尺寸变化（含首帧）；size 是 Vec2，读 size.x / size.y。",
+        " */",
+        "export function resizeScreen(size) {}",
+      ].join("\n");
+    case "animationEvent":
+      return [
+        "/**",
+        " * 动画帧事件：该图层任一动画出事件时广播；value 是本字段当前值，返回值可覆盖它。",
+        " */",
+        "export function animationEvent(event, value) {",
+        "\treturn value;",
+        "}",
+      ].join("\n");
+    case "destroy":
+      return [
+        "// destroy 不是引擎派发的入口（SCRIPT_ENTRY_NAMES 里没有它）。这里只留一个清理位，",
+        "// 并按官方惯例保留字段主回调：没有可用入口、又不读 engine 时钟的脚本会被整份丢弃。",
+        "export function destroy() {}",
+      ].join("\n");
+  }
+}
+
+/**
+ * 新脚本模板。lifecycle 缺省 `"update"`（WE 官方的 update(value) 形态，返回值即字段新值）；
+ * 其余模板 = 所选生命周期钩子 + 字段主回调。
+ */
+export function scriptTemplate(target: string, lifecycle: ScriptLifecycle = "update"): string {
+  const head = "'use strict';\n\n";
+  if (lifecycle === "update") return `${head}${fieldUpdate(target)}\n`;
+  return `${head}${lifecycleHook(lifecycle)}\n\n${fieldUpdate(target)}\n`;
 }

@@ -117,7 +117,7 @@ import { createCommandPalette, type CommandPalette } from "./ui/command-palette"
 // 图层树键盘导航语义（M9/C5）：纯函数，main.ts 只把动作落到 DOM
 import { firstFocusable, treeNav, type TreeNavRow } from "./tree-nav";
 import type { DocService } from "./services/types";
-import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
+import { SCRIPT_LIFECYCLES, addableTargets, removeScript, scriptSlots, scriptTemplate, setScript, type ScriptLifecycle } from "./scripts";
 import {
   GltfError,
   addModelLayer,
@@ -6816,17 +6816,26 @@ function scriptsGroup(node: LayerNode): HTMLElement {
     o.textContent = t;
     add.appendChild(o);
   }
+  // 生命周期模板下拉（B8）：入口名与派发口径见 editor/scripts.ts 的 SCRIPT_LIFECYCLES
   const tpl = document.createElement("select");
+  tpl.id = "script-template";
+  tpl.className = "ed-script-template";
+  tpl.title = et("sc.tplTip");
   tpl.disabled = !editable;
+  for (const life of SCRIPT_LIFECYCLES) {
     const o = document.createElement("option");
     o.value = life;
+    o.textContent = et(`sc.tpl.${life}`);
     tpl.appendChild(o);
   }
   add.addEventListener("change", () => {
     const t = add.value;
-    if (t) objEdit(et("log.scAdded", { target: t, layer: nodeName(node.id) }), node.id, (o) => setScript(o, t, scriptTemplate(t)));
+    if (t) objEdit(et("log.scAdded", { target: t, layer: nodeName(node.id) }), node.id, (o) => setScript(o, t, scriptTemplate(t, tpl.value as ScriptLifecycle)));
   });
-  group.appendChild(add);
+  const addRow = document.createElement("div");
+  addRow.className = "ed-script-add";
+  addRow.append(tpl, add);
+  group.appendChild(addRow);
   queueMicrotask(refreshScriptIssues);
   return group;
 }

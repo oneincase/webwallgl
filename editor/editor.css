@@ -1842,3 +1842,20 @@ input.ed-al-name {
   outline-offset: -2px;
 }
 
+/* ---------- 脚本生命周期模板下拉（M9 / B8） ---------- */
+
+.ed-script-add {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.ed-script-add #script-template {
+  flex: none;
+  max-width: 46%;
+}
+
+.ed-script-add #script-add {
+  flex: 1;
+  min-width: 0;
+}
