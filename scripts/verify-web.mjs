@@ -2434,6 +2434,11 @@ function runShim(extras, opts) {
     "itemId / 相对路径非法时不拼 URL（返回 null 让调用方报错）",
   );
   check(
+    wp.webAssetUrl("1589757429", "dvd.html", { raw: true }) === "/web/dev/1589757429/dvd.html?we-raw=1" &&
+      wp.webAssetUrl("1589757429", "dvd.html") === "/web/dev/1589757429/dvd.html",
+    "raw 模式下 URL 必须带 ?we-raw=1（元字节直出，不注 shim、不合并属性覆盖值）",
+  );
+  check(
     /\/web\/\$\{encodeURIComponent\(token\)\}\/\$\{itemId\}/.test(webProjectSrc),
     "URL 必须按传入的 token 拼接（host 传 DEV_TOKEN，与 /web 端点的鉴权一致）",
   );
@@ -2495,8 +2500,14 @@ function runShim(extras, opts) {
   check(/from "\.\/we-web-project\.mjs"/.test(hostSrc),
     "端点必须复用 host/we-web-project.mjs 的判据（不得另写一份路径/清单规则）");
   check(
-    /listWebProjectFiles\(itemBase\)/.test(hostSrc) && /pickWebEntry\(/.test(hostSrc) && /webAssetUrl\(itemId, rel, \{ token: DEV_TOKEN \}\)/.test(hostSrc),
-    "端点必须用共用模块列清单 / 挑入口 / 拼 URL（token 取 DEV_TOKEN）",
+    /listWebProjectFiles\(itemBase\)/.test(hostSrc) && /pickWebEntry\(/.test(hostSrc) &&
+      /webAssetUrl\(itemId, rel, \{ token: DEV_TOKEN, raw \}\)/.test(hostSrc) && /const raw = url\.searchParams\.get\("raw"\) === "1"/.test(hostSrc),
+    "端点必须用共用模块列清单 / 挑入口 / 拼 URL（token 取 DEV_TOKEN，raw=1 透传）",
+  );
+  check(
+    /const rawWanted = url\.searchParams\.get\("we-raw"\) === "1"/.test(hostSrc) &&
+      /const transform = rawWanted\s*\n?\s*\? undefined/.test(hostSrc),
+    "/web 端点必须认 ?we-raw=1 并跳过 shim 注入与属性覆盖合并（否则编辑器会把注入结果写回作者文件）",
   );
   check(
     /classifyItemDir/.test(hostSrc) && /classifyWallpaper/.test(hostSrc) && /itemType !== "web"/.test(hostSrc),

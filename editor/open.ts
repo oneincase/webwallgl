@@ -174,10 +174,14 @@ export async function fetchWebManifest(itemId: string, signal?: AbortSignal): Pr
   return { itemId: data.itemId ?? itemId, entry: data.entry, files: data.files.map(String) };
 }
 
-export async function resolveWebAssetUrl(itemId: string, rel: string, signal?: AbortSignal): Promise<string> {
+export async function resolveWebAssetUrl(
+  itemId: string,
+  rel: string,
+  opts: { signal?: AbortSignal; raw?: boolean } = {},
+): Promise<string> {
   const res = await fetch(
-    `/api/editor/web-resolve?item=${encodeURIComponent(itemId)}&path=${encodeURIComponent(rel)}`,
-    { signal, headers: { accept: "application/json" } },
+    `/api/editor/web-resolve?item=${encodeURIComponent(itemId)}&path=${encodeURIComponent(rel)}${opts.raw ? "&raw=1" : ""}`,
+    { signal: opts.signal, headers: { accept: "application/json" } },
   );
   const data = (await res.json().catch(() => null)) as { ok?: boolean; url?: string; error?: string } | null;
   if (!res.ok || !data?.ok || !data.url) {
@@ -189,14 +193,18 @@ export async function resolveWebAssetUrl(itemId: string, rel: string, signal?: A
 /**
  * 网页工程的资源读取器：`read` 先解析出同源 URL 再取字节。
  *
- * 与场景资源的宽松约定（取不到返回 null）**故意不同**：相对路径解析不了 = 工程或宿主
- * 出了问题。这里返回 null 会让保存悄悄少写文件（Web 工程没有「入口 json 写文档」这一步，
- * 每个文件都得原样搬），所以一律抛错并把宿主给的明确原因带上。
+ * 两个要点：
+ * - 解析一律带 `raw: true`（URL 上是 `?we-raw=1`）：`/web` 默认会给 html 注入 WE shim、
+ *   给 project.json 合并用户属性覆盖值 —— 那是**预览**要的形态。保存读的必须是作者写的
+ *   原字节，否则每存一次都把 shim 与覆盖值烤进工程文件。
+ * - 与场景资源的宽松约定（取不到返回 null）**故意不同**：相对路径解析不了 = 工程或宿主
+ *   出了问题，返回 null 会让保存悄悄少写文件（网页工程没有「入口 json 写文档」这一步，
+ *   每个文件都得原样搬），所以一律抛错并把宿主给的明确原因带上。
  */
 export function webProjectAssets(
   manifest: WebManifest,
   resolveUrl: (rel: string, signal?: AbortSignal) => Promise<string> = (rel, signal) =>
-    resolveWebAssetUrl(manifest.itemId, rel, signal),
+    resolveWebAssetUrl(manifest.itemId, rel, { signal, raw: true }),
 ): SceneAssets {
   return {
     entry: manifest.entry,
@@ -235,9 +243,10 @@ export async function openLibraryItem(it: LibraryItem, mediaBase: string, webBas
     const assets = webProjectAssets(manifest);
     // 入口 URL 也走宿主解析（声明的 file 优先、且必须真在盘上）：httpSource 自带的
     // webEntry 只按 project.file 拼、不校验存在性，声明写错时会 404 白屏。
+    // 预览用**注入形态**（默认，不加 raw）：网页壁纸靠同源注入的 WE shim 才跑得起来。
     const source: Source = {
       ...hs,
-      webEntry: async (signal) => ({ url: await resolveWebAssetUrl(it.itemId, manifest.entry, signal) }),
+      webEntry: async (signal) => ({ url: await resolveWebAssetUrl(it.itemId, manifest.entry, { signal }) }),
     };
     return { doc: ensureWebType(makeDoc(it.title, project, null, null)), source, assets };
   }

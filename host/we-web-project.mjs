@@ -60,16 +60,20 @@ export function encodeWebPath(rel) {
 
 /**
  * 工程内相对路径 → 浏览器可取的 URL（同源，走 /web 端点）。
+ *
+ * `raw: true` 加 `?we-raw=1`：`/web` 端点默认会往 html 里注入 WE shim（预览要用），
+ * 还会给 project.json 合并用户属性覆盖值 —— 这两件事都是**渲染**需要、保存不需要的。
+ * 编辑器读元字节另存时必须走 raw，否则每存一次就把 shim 与用户覆盖值烤进作者的文件。
  * @param {string} itemId
  * @param {string} rel
- * @param {{ token?: string }} [opts]
+ * @param {{ token?: string, raw?: boolean }} [opts]
  * @returns {string | null} 如 `/web/dev/1589757429/dvd.html`；itemId/路径非法返回 null
  */
 export function webAssetUrl(itemId, rel, opts = {}) {
   const token = opts.token ?? "dev";
   const norm = normalizeWebRelPath(rel);
   if (!ITEM_ID_RE.test(String(itemId ?? "")) || !norm) return null;
-  return `/web/${encodeURIComponent(token)}/${itemId}/${encodeWebPath(norm)}`;
+  return `/web/${encodeURIComponent(token)}/${itemId}/${encodeWebPath(norm)}${opts.raw ? "?we-raw=1" : ""}`;
 }
 
 /**

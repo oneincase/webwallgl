@@ -695,12 +695,30 @@ const localFile = (p, data) => ({ path: p, file: new File([data], p.split("/").p
   check(vid.doc.type === "video" && !vid.assets, "视频壁纸：无场景资源（没有图层可编）");
   check(vid.doc.video?.path === "a.mp4" && vid.doc.video.bytes.length === 8, "视频壁纸：视频本体进文档（doc.video），可裁剪 / 替换 / 保存");
   let msg = "";
+  const webLocal = await openMod.openLocalFiles([
+    localFile("w/project.json", enc.encode(json({ type: "web", title: "Web Proj", file: "index.html" }))),
+    localFile("w/index.html", enc.encode('<html><body><script src="js/app.js"></script></body></html>')),
+    localFile("w/js/app.js", enc.encode("console.log(1)")),
+  ]);
+  check(webLocal.doc.type === "web" && webLocal.doc.scene == null, "本地网页壁纸目录：打开不改型（type 仍 web，无场景文档）");
+  check(
+    webLocal.assets.entry === "index.html" && json(webLocal.assets.list()) === json(["project.json", "js/app.js"]),
+    `本地网页壁纸目录：文件清单原样保留（${json(webLocal.assets.list())}）`,
+  );
+  check((await webLocal.assets.read("js/app.js"))?.length === 14, "本地网页壁纸目录：资源按名读到原字节");
   try {
-    await openMod.openLocalFiles([localFile("w/project.json", enc.encode(json({ type: "web", file: "index.html" })))]);
+    await webLocal.source.webEntry();
   } catch (e) {
     msg = e.message;
   }
-  check(/网页壁纸/.test(msg), "本地网页壁纸目录明确报不支持");
+  check(/相对资源无法解析/.test(msg), `本地网页壁纸目录：预览时明确报相对资源无法解析（${msg}）`);
+  msg = "";
+  try {
+    await openMod.openLocalFiles([localFile("w2/project.json", enc.encode(json({ type: "web", file: "index.html" })))]);
+  } catch (e) {
+    msg = e.message;
+  }
+  check(/找不到入口 html/.test(msg), `本地网页壁纸目录：没有入口 html 时明确报错（${msg}）`);
   msg = "";
   try {
     await openMod.openLocalFiles([localFile("x/readme.txt", enc.encode("hi"))]);
@@ -747,7 +765,12 @@ const HOST_TS = fs.readFileSync(path.join(ROOT, "host/wallpaper-host.ts"), "utf8
 /** 起一个只挂宿主中间件的 HTTP 服务器；返回 base 与 close */
 async function startHost(libDir, srcText) {
   const prev = process.env.WE_LIBRARY;
+  const prevShim = process.env.WWGL_WEB_SHIM;
   process.env.WE_LIBRARY = libDir;
+  // /web/*.html 会注入 WE shim，注入器按**自己模块所在目录**找 renderer/src/web-shim.js；
+  // 这里跑的是 esbuild 打到系统临时目录的 bundle，按相对路径必然找不到 → 取 HTML 资源 500。
+  // 打包后的应用也是用这个环境变量指回 shim（scripts/build-app.mjs），测试台照做。
+  process.env.WWGL_WEB_SHIM = path.join(ROOT, "renderer", "src", "web-shim.js");
   const mod = await loadHostModule(srcText);
   const plugin = mod.wallpaperHost();
   // configureServer 里才建中间件，而中间件在创建时把壁纸库目录定死（let lib = libraryDir()）：
@@ -774,7 +797,14 @@ async function startHost(libDir, srcText) {
     next();
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  return { base: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+  return {
+    base: `http://127.0.0.1:${server.address().port}`,
+    close: () => {
+      if (prevShim === undefined) delete process.env.WWGL_WEB_SHIM;
+      else process.env.WWGL_WEB_SHIM = prevShim;
+      return new Promise((r) => server.close(r));
+    },
+  };
 }
 
 const hostLib = path.join(tmpRoot, "lib");
@@ -855,6 +885,149 @@ section("H. 保存闭环");
     check(!after.objects.some((o) => o.id === newId) && !fs.existsSync(path.join(hostLib, itemId, "preview.jpg")), "同一条目再存即覆盖（旧封面等残留被清掉）");
   } finally {
     globalThis.fetch = realFetch;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WEB-PROJ. 网页壁纸工程（type:"web"）：打开与保存不改型 + 相对资源解析
+// ───────────────────────────────────────────────────────────────────────────
+section('WEB-PROJ. 网页壁纸工程（type:"web"）打开与保存不改型');
+{
+  // 夹具：一个真实的网页工程 —— 入口 html + 子目录资源 + 带空格/中文的路径。
+  // 另外埋两个点开头的文件（.DS_Store 与编辑器标记）：它们不是工程资源，不能进清单。
+  const webItemSrc = path.join(hostLib, "web-item");
+  const webEntryHtml =
+    '<!doctype html>\n<html><head><link rel="stylesheet" href="css/深 色/style.css"></head>\n<body><script src="js/app.js"></script></body></html>\n';
+  const webAppJs = "window.__webFixture = 1;\n";
+  const webCss = "body { background: #123; }\n";
+  fs.mkdirSync(path.join(webItemSrc, "js"), { recursive: true });
+  fs.mkdirSync(path.join(webItemSrc, "css/深 色"), { recursive: true });
+  fs.writeFileSync(
+    path.join(webItemSrc, "project.json"),
+    json({ type: "Web", title: "Web Fixture", file: "index.html", preview: "preview.gif", general: { properties: { speed: 1 } } }),
+  );
+  fs.writeFileSync(path.join(webItemSrc, "index.html"), webEntryHtml);
+  fs.writeFileSync(path.join(webItemSrc, "js/app.js"), webAppJs);
+  fs.writeFileSync(path.join(webItemSrc, "css/深 色/style.css"), webCss);
+  fs.writeFileSync(path.join(webItemSrc, "preview.gif"), new Uint8Array([0x47, 0x49, 0x46]));
+  fs.writeFileSync(path.join(webItemSrc, ".DS_Store"), new Uint8Array([0]));
+
+  const getJson = async (p) => {
+    const r = await fetch(`${host.base}${p}`);
+    return { status: r.status, body: await r.json().catch(() => null) };
+  };
+
+  // 1) 宿主清单端点：入口 + 全部资源
+  const mf = await getJson("/api/editor/web-manifest?item=web-item");
+  check(mf.status === 200 && mf.body?.ok === true, "web-manifest：网页工程返回 200");
+  check(mf.body.entry === "index.html", `web-manifest：入口取声明的 file（${mf.body?.entry}）`);
+  check(
+    json(mf.body.files) === json(["css/深 色/style.css", "index.html", "js/app.js", "preview.gif", "project.json"]),
+    `web-manifest：清单 = 工程内全部文件（含中文/空格路径，实得 ${json(mf.body.files)}）`,
+  );
+  check(mf.body.count === mf.body.files.length, "web-manifest：count 与清单长度一致");
+  check(!mf.body.files.some((f) => f.split("/").some((seg) => seg.startsWith("."))), "web-manifest：点开头的文件（.DS_Store / 编辑器标记）不进清单");
+
+  // 2) 相对资源解析端点：相对路径 → 可取的 /web/... URL
+  const rs = await getJson(`/api/editor/web-resolve?item=web-item&path=${encodeURIComponent("css/深 色/style.css")}`);
+  check(
+    rs.status === 200 && rs.body?.url === "/web/dev/web-item/css/%E6%B7%B1%20%E8%89%B2/style.css",
+    `web-resolve：中文 / 空格逐段编码（${rs.body?.url}）`,
+  );
+  const got = await fetch(`${host.base}${rs.body.url}`);
+  check(got.status === 200 && (await got.text()) === webCss, "web-resolve：解析出的 URL 真能取到该资源（字节与盘上一致）");
+  const rsEntry = await getJson("/api/editor/web-resolve?item=web-item&path=index.html");
+  check(rsEntry.body?.url === "/web/dev/web-item/index.html", `web-resolve：入口 html 也能解析（${rsEntry.body?.url}）`);
+  // raw=1 与默认形态的差别：默认是**渲染形态**（注入 WE shim / 合并属性覆盖值），
+  // raw 是**作者原字节**。编辑器另存必须读 raw，否则每存一次就把注入结果写回工程文件。
+  const rsRaw = await getJson("/api/editor/web-resolve?item=web-item&path=index.html&raw=1");
+  check(rsRaw.body?.url === "/web/dev/web-item/index.html?we-raw=1", `web-resolve：raw=1 返回元字节 URL（${rsRaw.body?.url}）`);
+  const previewHtml = await (await fetch(`${host.base}${rsEntry.body.url}`)).text();
+  const rawHtml = await (await fetch(`${host.base}${rsRaw.body.url}`)).text();
+  check(
+    previewHtml.includes("data-we-shim") && previewHtml.length > rawHtml.length,
+    "web-resolve：默认 URL 是渲染形态（注入 WE shim —— 网页壁纸靠同源 shim 才跑得起来）",
+  );
+  check(rawHtml === webEntryHtml, "web-resolve：raw URL 是作者写的原字节（未被 shim 注入）");
+  const rawProject = await (await fetch(`${host.base}/web/dev/web-item/project.json?we-raw=1`)).text();
+  check(!rawProject.includes("userOverridden"), "web-resolve：raw 读 project.json 不合并用户属性覆盖值（不把覆盖值烤回作者文件）");
+
+  // 3) 错误路径：一律明确的 JSON 文案，不静默失败
+  const miss = await getJson("/api/editor/web-resolve?item=web-item&path=nope.js");
+  check(miss.status === 404 && /相对资源不存在/.test(miss.body?.error ?? ""), `web-resolve：不存在的相对路径 404 + 明确文案（${miss.body?.error}）`);
+  const escape = await getJson(`/api/editor/web-resolve?item=web-item&path=${encodeURIComponent("../project.json")}`);
+  check(escape.status === 400 && /非法相对路径/.test(escape.body?.error ?? ""), `web-resolve：\`..\` 越界被拒（${escape.body?.error}）`);
+  const dir = await getJson("/api/editor/web-resolve?item=web-item&path=js");
+  check(dir.status === 400 && /相对资源是目录/.test(dir.body?.error ?? ""), `web-resolve：指向目录被拒（${dir.body?.error}）`);
+  const notWeb = await getJson("/api/editor/web-manifest?item=author-item");
+  check(notWeb.status === 409 && /目标不是网页壁纸工程/.test(notWeb.body?.error ?? ""), `web-manifest：非网页条目 409 + 明确文案（${notWeb.body?.error}）`);
+  check((await getJson("/api/editor/web-manifest?item=../evil")).status === 400, "web-manifest：非法 itemId 被拒（400）");
+  check((await getJson("/api/editor/web-manifest?item=web-missing")).status === 404, "web-manifest：条目不存在 404");
+  check((await fetch(`${host.base}/api/editor/web-manifest?item=web-item`, { method: "POST" })).status === 405, "web-manifest：只收 GET（405）");
+
+  // 4) 编辑器侧：打开不改型 → 保存不改型 → 重开逐字段一致
+  const realFetchWeb = globalThis.fetch;
+  globalThis.fetch = (url, init) => realFetchWeb(String(url).startsWith("/") ? `${host.base}${url}` : url, init);
+  try {
+    const lib = await openMod.fetchLibrary();
+    const it = lib.items.find((i) => i.itemId === "web-item");
+    check(!!it && openMod.libraryKind(it) === "web" && it.type === "web", `库把网页工程列为 web（type=${it?.type}）`);
+    check(it?.file === "index.html" && it?.preview === "preview.gif", "库条目保留声明的入口与作者自带封面");
+
+    const opened = await openMod.openLibraryItem(it, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(opened.doc.type === "web" && opened.doc.scene === null, "打开网页工程：文档 type = web（不改型），无场景文档");
+    check(opened.doc.project?.type === "Web", "打开网页工程：project 原样保留作者的 type 写法（Web）");
+    check(opened.assets.entry === "index.html", "打开网页工程：资源读取器入口 = 清单入口");
+    check(
+      json(opened.assets.list()) === json(["css/深 色/style.css", "js/app.js", "preview.gif", "project.json"]),
+      `打开网页工程：文件清单一个不丢（${json(opened.assets.list())}）`,
+    );
+    check(dec.decode(await opened.assets.read("js/app.js")) === webAppJs, "打开网页工程：相对路径取到原字节");
+    check(dec.decode(await opened.assets.read("css/深 色/style.css")) === webCss, "打开网页工程：中文 / 空格路径的资源也能取到");
+    check(dec.decode(await opened.assets.read("index.html")) === webEntryHtml, "打开网页工程：入口 html 读到作者原字节（raw，未被 shim 注入）");
+    const entryUrl = (await opened.source.webEntry())?.url;
+    check(entryUrl === "/web/dev/web-item/index.html", `打开网页工程：入口 URL 走宿主解析（${entryUrl}）`);
+    check(!String(entryUrl).includes("we-raw"), "打开网页工程：预览入口 URL 是注入形态（raw 只给另存读字节用）");
+    let msg = "";
+    try {
+      await opened.assets.read("nope.js");
+    } catch (e) {
+      msg = e.message;
+    }
+    check(/相对资源不存在/.test(msg), `打开网页工程：读不到的相对资源明确报错，不静默返回空（${msg}）`);
+
+    const files = await saveMod.collectWebProject(opened.doc, opened.assets, null);
+    const byPath = new Map(files.map((f) => [f.path, f]));
+    check(files.length === 5 && byPath.has("project.json"), `保存网页工程：清单 = 全部资源 + project.json（${files.length} 个）`);
+    check(dec.decode(byPath.get("index.html")?.data) === webEntryHtml, "保存网页工程：入口 html 原样写回字节");
+    check(byPath.get("index.html").data[0] === 0x3c, "保存网页工程：入口首字节是 `<`（html），不是被 JSON 序列化的 `{`");
+    const pj = JSON.parse(dec.decode(byPath.get("project.json").data));
+    check(pj.type === "Web", `保存网页工程：project.json 的 type 仍是作者写的 Web（不强制 scene，实得 ${pj.type}）`);
+    check(pj.file === "index.html" && pj.title === "Web Fixture", "保存网页工程：入口声明与标题保留");
+    check(pj.preview === "preview.gif", "保存网页工程：作者自带封面引用保留（编辑器不为 web 出图，也不删）");
+    check(pj.general?.properties?.speed === 1, "保存网页工程：project.json 的其余字段原样保留");
+
+    // 存进壁纸库再列一次：库仍把它认成 web（保存不改型的宿主侧证据）
+    const itemId = saveMod.newLibraryItemId("Web Fixture");
+    await saveMod.saveToLibrary(itemId, files);
+    const disk = fs
+      .readdirSync(path.join(hostLib, itemId), { recursive: true })
+      .filter((n) => !fs.statSync(path.join(hostLib, itemId, n)).isDirectory());
+    check(disk.length === files.length + 1, `落盘：保存清单 + 编辑器标记（${disk.length} 个）`);
+    check(fs.readFileSync(path.join(hostLib, itemId, "index.html"), "utf8") === webEntryHtml, "落盘：入口 html 逐字节一致");
+
+    const lib2 = await openMod.fetchLibrary();
+    const it2 = lib2.items.find((i) => i.itemId === itemId);
+    check(!!it2 && openMod.libraryKind(it2) === "web", `库把保存产物仍列为 web（type=${it2?.type}）`);
+    const reopened = await openMod.openLibraryItem(it2, `${host.base}/media/dev`, `${host.base}/web/dev`);
+    check(reopened.doc.type === "web" && reopened.doc.type === opened.doc.type, "重开：type 不变（web）");
+    check(json(reopened.doc.project) === json(opened.doc.project), "重开：project.json 逐字段一致");
+    check(json(reopened.assets.list()) === json(opened.assets.list()), "重开：文件清单一致");
+    check(dec.decode(await reopened.assets.read("index.html")) === webEntryHtml, "重开：入口 html 字节一致");
+    check(dec.decode(await reopened.assets.read("css/深 色/style.css")) === webCss, "重开：中文 / 空格路径资源字节一致");
+    check((await reopened.source.webEntry())?.url === `/web/dev/${itemId}/index.html`, "重开：入口 URL 指向新条目");
+  } finally {
+    globalThis.fetch = realFetchWeb;
   }
 }
 

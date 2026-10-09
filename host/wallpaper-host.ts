@@ -21,7 +21,7 @@
  *   POST /api/editor/save-begin?item=      编辑器另存：新建（或清空编辑器自建的）库内松散工程目录
  *   POST /api/editor/save-file?item=&path= 编辑器另存：写入一个文件（body 为原始字节）
  *   GET /api/editor/web-manifest?item=     网页壁纸工程（type:"web"）入口与资源清单
- *   GET /api/editor/web-resolve?item=&path= 工程内相对路径 → 可取的 /web/... URL
+ *   GET /api/editor/web-resolve?item=&path=[&raw=1] 工程内相对路径 → 可取的 /web/... URL（raw=1 要元字节）
  *   GET /api/diag-stream                   把 /diag 上报实时广播给测试台页面（SSE）
  *   GET /api/plugins                       编辑器外部插件目录清单（host/plugin-dirs.ts）
  *   GET /api/plugins/file?dir=&path=       读插件目录里的一个文件
@@ -1009,7 +1009,10 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
         sendJson(res, 404, { error: `相对资源不存在：${rel}` });
         return;
       }
-      sendJson(res, 200, { ok: true, itemId, path: rel, url: webAssetUrl(itemId, rel, { token: DEV_TOKEN }) });
+      // raw=1：给「要读元字节另存」的调用方（编辑器）用 —— /web 端点默认会注入 WE shim
+      // 并合并属性覆盖值，那是渲染要的形态；保存必须拿到作者写的原文件
+      const raw = url.searchParams.get("raw") === "1";
+      sendJson(res, 200, { ok: true, itemId, path: rel, url: webAssetUrl(itemId, rel, { token: DEV_TOKEN, raw }) });
       return;
     }
 
@@ -1279,9 +1282,14 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
           ? async (raw: Buffer) =>
               Buffer.from(injectWebShim(raw.toString("utf8")), "utf8")
           : undefined;
-      const transform = isProject
-        ? (raw: Buffer) => mergeProjectOverrides(raw, itemId)
-        : htmlInject;
+      // ?we-raw=1：元字节直出（不注 shim、不合并覆盖值）。编辑器另存必须走这条 ——
+      // 走注入形态会把 shim 与用户覆盖值写回作者的文件，存一次脏一次。
+      const rawWanted = url.searchParams.get("we-raw") === "1";
+      const transform = rawWanted
+        ? undefined
+        : isProject
+          ? (raw: Buffer) => mergeProjectOverrides(raw, itemId)
+          : htmlInject;
       await sendFile(req, res, target, transform);
       return;
     }
