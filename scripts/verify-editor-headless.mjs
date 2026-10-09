@@ -346,6 +346,194 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // M12. 引擎写测（真浏览器）：增量装配 / GL overlay 的「出帧 A/B」
+  //
+  // A/B 口径：同一夹具、同一暂停帧号（pause + seek 2.5 + 两个 rAF），
+  // 只差**一个**引擎操作；每次都走同一个 ed.capture({width:160,height:90})，
+  // 再按逐像素三通道绝对差均值比。四组对照：
+  //   - 负对照：同一状态连出两张 → 差 = 这个夹具的**帧间噪声底**；
+  //   - 正对照：隐藏最上层 → 必须显著高于噪声底（画面确实由引擎操作决定）；
+  //   - 复原对照：热增删 / 热重排做完反向操作 → 必须落回噪声带；
+  //   - 增量对照：单步操作（热增挪位 / 热重排）必须高出噪声带。
+  // GL overlay 的 A/B 是「切换后端不影响编辑器出图」（overlay 画在 capture 之后）。
+  //
+  // 为什么不判「逐位 0」：夹具 beach 的 palms / clouds 是**模型动画层**，引擎的模型 /
+  // 关键帧推进吃渲染循环的实时 dt，`pause()` + `seek()` 只冻住场景时钟、冻不住它，
+  // 于是同一状态连出两张本身就有 ~0.75 的逐像素差（K 段对同一现象用的口径是
+  // `diffBack < 2`）。所以 M12 的 A/B 判据统一落在噪声带内 = 「没有可归因于本次操作的
+  // 变化」，分辨力交给正 / 增量对照。AB_BAND 取 3 = 实测噪声底的 4 倍。
+  // ════════════════════════════════════════════════════════════════════════
+  section(`M12. 引擎写测：增量装配 / GL overlay 出帧 A/B（${pkgItem}）`);
+  const m12 = await ev(
+    `(async () => {
+    const api = await import('/renderer/src/api/editor.ts');
+    const host = document.createElement('div');
+    host.style.cssText = 'position:fixed;left:-6000px;top:0;width:${cr.w}px;height:${cr.h}px';
+    document.body.appendChild(host);
+    const inst = await api.mount(host, { source: api.httpSource('${origin}/media/dev/${pkgItem}'), fit: 'cover', renderDpr: 1, volume: 0 });
+    const ed = api.editorOf(inst);
+    const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const pix = async () => {
+      const b = await ed.capture({ width: 160, height: 90 });
+      const bmp = await createImageBitmap(b);
+      const c = new OffscreenCanvas(160, 90); const g = c.getContext('2d'); g.drawImage(bmp, 0, 0);
+      return Array.from(g.getImageData(0, 0, 160, 90).data);
+    };
+    const diff = (a, b) => { let s = 0; for (let i = 0; i < a.length; i += 4) s += Math.abs(a[i] - b[i]) + Math.abs(a[i+1] - b[i+1]) + Math.abs(a[i+2] - b[i+2]); return s / (a.length / 4 * 3); };
+    const out = {};
+    inst.pause();
+    await ed.seek(2.5);
+    await raf();
+    const layers0 = ed.getLayers();
+    const n0 = layers0.length;
+    const idTop = layers0[n0 - 1].id;
+    const idBottom = layers0[0].id;
+    out.n0 = n0; out.idTop = idTop; out.idBottom = idBottom;
+    const f0 = await pix();
+    out.diffRepeat = diff(f0, await pix());
+    out.outlineTop = ed.getLayerOutline(idTop) || { anchor: [0, 0], corners: null };
+    out.anchorTop = out.outlineTop.anchor;
+    await ed.setLayerProps(idTop, { visible: false });
+    out.diffHide = diff(f0, await pix());
+    await ed.setLayerProps(idTop, { visible: true });
+    out.diffShowBack = diff(f0, await pix());
+    // ---- B1 热增：复制最上层（不重建场景）----
+    out.hotCheck = ed.canHotAddLayer({ duplicateOf: idTop });
+    const added = await ed.addLayer({ duplicateOf: idTop });
+    out.added = { id: added.id, name: added.name, kind: added.kind, index: added.index };
+    out.src = { id: idTop, name: layers0[n0 - 1].name, kind: layers0[n0 - 1].kind };
+    out.nAfterAdd = ed.getLayers().length;
+    out.orderAfterAdd = ed.getLayers().map((l) => l.id);
+    out.outlineDup = ed.getLayerOutline(added.id);
+    out.hitAfterAdd = ed.hitTestAt(out.anchorTop[0], out.anchorTop[1]).map((h) => h.id);
+    out.frameAfterAdd = diff(f0, await pix());
+    // 复制层与源层同位同纹：只改 alpha 是「同色叠同色」，画面可能逐位不变。
+    // 改成把它挪走 + 缩小，合成结果必然可用作「新层确实参与了这一帧」的证据。
+    await ed.setLayerProps(added.id, { origin: [480, 270, 0], scale: [0.3, 0.3, 1] });
+    out.frameAfterAddMove = diff(f0, await pix());
+    await ed.removeLayer(added.id);
+    out.nAfterRemove = ed.getLayers().length;
+    out.frameAfterRemove = diff(f0, await pix());
+    out.propsAfterRemove = ed.getLayerProps(added.id);
+    out.hitAfterRemove = ed.hitTestAt(out.anchorTop[0], out.anchorTop[1]).map((h) => h.id);
+    // 新层插到底（toIndex=0）
+    const addedBottom = await ed.addLayer({ duplicateOf: idTop, toIndex: 0 });
+    out.orderAfterAddBottom = ed.getLayers()[0].id === addedBottom.id;
+    await ed.removeLayer(addedBottom.id);
+    out.frameAfterRemoveBottom = diff(f0, await pix());
+    // ---- B1 热重排：底 → 顶，再搬回来 ----
+    await ed.reorderLayer(idBottom, n0 - 1);
+    out.orderAfterReorder = ed.getLayers().map((l) => l.id);
+    out.frameAfterReorder = diff(f0, await pix());
+    await ed.reorderLayer(idBottom, 0);
+    out.orderReorderBack = ed.getLayers().map((l) => l.id);
+    out.frameReorderBack = diff(f0, await pix());
+    let reorderErr = '';
+    try { await ed.reorderLayer(idTop, n0); } catch (e) { reorderErr = e.message; }
+    out.reorderErr = reorderErr;
+    let missingErr = '';
+    try { await ed.removeLayer(99999); } catch (e) { missingErr = e.message; }
+    out.missingErr = missingErr;
+    // ---- B3 边界：装配期没有脚本的挂点不能凭空热增（这一步仍走整场景重挂）----
+    let scriptErr = '';
+    try { await ed.setLayerScript(idTop, 'origin', 'export function update(v) { return v; }'); } catch (e) { scriptErr = e.message; }
+    out.scriptErr = scriptErr;
+    // ---- B2 overlay：默认 2d，显式切 gl ----
+    out.modeDefault = ed.getOverlayMode();
+    out.statsDefault = ed.getOverlayStats();
+    out.modeGl = await ed.setOverlayMode('gl');
+    await ed.setOverlayTarget(idTop);
+    await raf(); await raf();
+    out.statsGl = ed.getOverlayStats();
+    out.frameGl = diff(f0, await pix());
+    out.drawsBeforeNull = ed.getOverlayStats().draws;
+    await ed.setOverlayTarget(null);
+    await raf();
+    out.statsNoTarget = ed.getOverlayStats();
+    out.modeBack = await ed.setOverlayMode('2d');
+    out.statsBack = ed.getOverlayStats();
+    out.frameAfter2d = diff(f0, await pix());
+    out.layersEnd = ed.getLayers().length;
+    inst.destroy({ releasePkgCache: true });
+    host.remove();
+    return out;
+  })()`,
+    180000,
+  );
+
+  const AB_BAND = 3;
+  check(m12.diffRepeat < AB_BAND, `M12/A-B 负对照：同一暂停帧号连出两张 = 夹具噪声底（逐像素差 ${m12.diffRepeat.toFixed(2)} < ${AB_BAND}）`);
+  check(m12.diffHide > 10, `M12/A-B 正对照：隐藏最上层画面真的变（逐像素差 ${m12.diffHide.toFixed(1)}）`);
+  check(m12.diffShowBack < AB_BAND, `M12/A-B 复原对照：显示回来落回噪声带（差 ${m12.diffShowBack.toFixed(2)}）`);
+  check(m12.hotCheck.ok === true && m12.hotCheck.reason === "", `M12/B1 canHotAddLayer：复制一个普通图片层可热增（${m12.hotCheck.reason || "ok"}）`);
+  check(
+    m12.nAfterAdd === m12.n0 + 1 && m12.orderAfterAdd[m12.n0] === m12.added.id,
+    `M12/B1 addLayer(duplicateOf)：不重建场景就多一层，且落在末尾（${m12.nAfterAdd} 层）`,
+  );
+  check(
+    m12.added.name === m12.src.name && m12.added.kind === m12.src.kind && m12.added.id !== m12.src.id,
+    `M12/B1 addLayer：新层是源层的副本但换了 id（${m12.src.name} #${m12.src.id} → #${m12.added.id}）`,
+  );
+  check(
+    m12.hitAfterAdd.includes(m12.added.id) &&
+      !!m12.outlineDup &&
+      near(m12.outlineDup ? m12.outlineDup.anchor[0] : NaN, m12.anchorTop[0], 1) &&
+      near(m12.outlineDup ? m12.outlineDup.anchor[1] : NaN, m12.anchorTop[1], 1),
+    `M12/B1 热增的层真的进了渲染与拾取集合（锚点 ${(m12.outlineDup ? m12.outlineDup.anchor : []).map((v) => v.toFixed(1))}）`,
+  );
+  check(
+    m12.frameAfterAddMove > 1,
+    `M12/B1 热增层参与合成：把它挪到左上角缩小后画面跟着变（逐像素差 ${m12.frameAfterAddMove.toFixed(1)}）`,
+  );
+  check(
+    m12.nAfterRemove === m12.n0 && m12.propsAfterRemove === null && !m12.hitAfterRemove.includes(m12.added.id),
+    "M12/B1 removeLayer：层从活层表、拾取集合里整体消失",
+  );
+  check(
+    m12.frameAfterRemove < AB_BAND && m12.frameAfterRemoveBottom < AB_BAND,
+    `M12/B1 出帧 A/B：热增删反向做完落回原帧噪声带（末位删差 ${m12.frameAfterRemove.toFixed(2)}，底位删差 ${m12.frameAfterRemoveBottom.toFixed(2)}）`,
+  );
+  check(m12.orderAfterAddBottom === true, "M12/B1 addLayer(toIndex:0)：插到数组首位 = 最先画");
+  check(
+    m12.orderAfterReorder[m12.n0 - 1] === m12.idBottom && m12.orderAfterReorder[0] !== m12.idBottom,
+    `M12/B1 reorderLayer：底层搬到末位 = 绘制序最上（${m12.orderAfterReorder.join(",")}，画面差 ${m12.frameAfterReorder.toFixed(1)}）`,
+  );
+  check(
+    m12.orderReorderBack.join(",") === m12.orderAfterAdd.slice(0, m12.n0).join(",") && m12.frameReorderBack < AB_BAND,
+    `M12/B1 出帧 A/B：热重排反向做完顺序与画面都复原（差 ${m12.frameReorderBack.toFixed(2)}）`,
+  );
+  check(/下标非法/.test(m12.reorderErr) && /不存在/.test(m12.missingErr), "M12/B1 不存在 / 空操作的层操作被拒绝（不产生无谓重绘）");
+  check(
+    /挂点不存在或不可热替换/.test(m12.scriptErr),
+    "M12/B3 边界：装配期没有脚本的挂点热替换被显式拒绝（给新挂点加脚本仍走整场景重挂）",
+  );
+  check(
+    m12.modeDefault === "2d" && m12.statsDefault.glOk === false && m12.statsDefault.draws === 0,
+    `M12/B2 缺省后端是 2d（页面现有行为不变）：${m12.modeDefault} / glOk=${m12.statsDefault.glOk}`,
+  );
+  check(
+    m12.modeGl === "gl" && m12.statsGl.mode === "gl" && m12.statsGl.glOk === true && m12.statsGl.target === m12.idTop,
+    `M12/B2 setOverlayMode("gl") 后 GL pass 真的建起来了（reason=${JSON.stringify(m12.statsGl.reason)}）`,
+  );
+  check(
+    m12.statsGl.segments > 0 && m12.statsGl.draws >= 1,
+    `M12/B2 GL overlay 在出帧时提交线段（每出一帧交一次）：segments=${m12.statsGl.segments} draws=${m12.statsGl.draws}`,
+  );
+  check(
+    m12.frameGl < AB_BAND,
+    `M12/B2 出帧 A/B：切到 GL 后端不影响编辑器出图（overlay 画在 capture 之后，差 ${m12.frameGl.toFixed(2)}）`,
+  );
+  check(
+    m12.statsNoTarget.segments === 0 && m12.statsNoTarget.draws === m12.drawsBeforeNull,
+    "M12/B2 取消选中后不再提交线段（没有目标就不画）",
+  );
+  check(
+    m12.modeBack === "2d" && m12.statsBack.mode === "2d" && m12.statsBack.glOk === false && m12.frameAfter2d < AB_BAND,
+    `M12/B2 切回 2d 时 GL pass 被释放，画面仍落回噪声带（差 ${m12.frameAfter2d.toFixed(2)}，回退路径可用）`,
+  );
+  check(m12.layersEnd === m12.n0, "M12/B1 整段 A/B 结束后图层数与开局一致（没有留下热增层）");
+
+  // ════════════════════════════════════════════════════════════════════════
   // L. 编辑器页端到端
   // ════════════════════════════════════════════════════════════════════════
   section(`L. 编辑器页端到端（${FIXTURE}，松散形态）`);
