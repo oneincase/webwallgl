@@ -1,6 +1,6 @@
 // 关键帧动画：图层字段的 `{ value, animation: { c0..cN, options, relative } }`（WE 原生格式，
 // 引擎 render/animation.js 求值）。语料 350 张场景壁纸实测：
-// - 变换三件套与 color 3 通道（angles 为弧度），alpha 1 通道；
+// - 变换三件套与 color 3 通道（angles 为弧度），alpha / brightness 1 通道；
 // - options 最常见 `{ fps: 30, length, mode, wraploop: false }`，mode = loop / single / mirror；
 // - 关键帧恒为 6 字段 `{ back, frame, front, lockangle, locklength, value }`，frame 为整数；
 //   front {enabled:true,x:1,y:0} + back {enabled:true,x:-1,y:0} = 平滑（缓入缓出），enabled:false = 线性。
@@ -9,9 +9,9 @@
 import { unwrap, type SceneObject } from "./doc";
 import type { EditorLayerProps } from "../renderer/src/api/editor";
 
-export const ANIM_FIELDS = ["origin", "scale", "angles", "alpha", "color"] as const;
+export const ANIM_FIELDS = ["origin", "scale", "angles", "alpha", "color", "brightness"] as const;
 export type AnimField = (typeof ANIM_FIELDS)[number];
-export const CHANNELS: Record<AnimField, number> = { origin: 3, scale: 3, angles: 3, alpha: 1, color: 3 };
+export const CHANNELS: Record<AnimField, number> = { origin: 3, scale: 3, angles: 3, alpha: 1, color: 3, brightness: 1 };
 
 export const ANIM_MODES = ["loop", "mirror", "single"] as const;
 export type AnimMode = (typeof ANIM_MODES)[number];
@@ -61,7 +61,7 @@ function channelsOf(a: Anim): Key[][] {
 export function baseValue(obj: SceneObject, field: AnimField): number[] {
   const raw = unwrap(obj[field]);
   const n = CHANNELS[field];
-  const dflt = field === "scale" || field === "alpha" || field === "color" ? 1 : 0;
+  const dflt = field === "scale" || field === "alpha" || field === "color" || field === "brightness" ? 1 : 0;
   const arr =
     typeof raw === "string"
       ? raw.trim().split(/\s+/).map(Number)
@@ -149,7 +149,7 @@ export function enableAnim(obj: SceneObject, field: AnimField, cur: readonly num
 }
 
 function defaultRaw(field: AnimField): unknown {
-  return field === "alpha" ? 1 : field === "scale" || field === "color" ? "1 1 1" : "0 0 0";
+  return field === "alpha" || field === "brightness" ? 1 : field === "scale" || field === "color" ? "1 1 1" : "0 0 0";
 }
 
 const validLength = (n: number) => Number.isInteger(n) && n >= 1 && n <= MAX_LENGTH;
@@ -164,7 +164,7 @@ export function disableAnim(obj: SceneObject, field: AnimField, keep?: readonly 
   const w = raw as Wrapped;
   delete w.animation;
   if (keep && keep.length === CHANNELS[field] && keep.every(Number.isFinite)) {
-    w.value = field === "alpha" ? r5(keep[0]) : keep.map((v) => String(r5(v))).join(" ");
+    w.value = field === "alpha" || field === "brightness" ? r5(keep[0]) : keep.map((v) => String(r5(v))).join(" ");
   }
   if (Object.keys(w).length === 1 && "value" in w) obj[field] = w.value;
   return true;

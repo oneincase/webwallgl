@@ -7429,7 +7429,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       const getLayerPropsImpl = (id: number): EditorLayerProps | null => {
         const l = layerById(id);
         if (!l) return null;
-        // generic4 材质常量烘进了 color/alpha（applyBuiltinMatTint）：对外给对象自身的值
+        // generic4 材质常量烘进了 color/alpha/brightness（applyBuiltinMatTint）：对外给对象自身的值
         const base = l.matTint && l.tintBase ? l.tintBase : l;
         return {
           origin: vec3(l.localOrigin ?? l.origin, 0),
@@ -7438,6 +7438,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           visible: l.visibleSelf !== false,
           alpha: Number.isFinite(Number(base.alpha)) ? Number(base.alpha) : 1,
           color: vec3(base.color, 1),
+          // M4 A7：亮度乘子。引擎缺省 1（parse.js 的 parseNum(o.brightness, 1)）。
+          brightness: Number.isFinite(Number(base.brightness)) ? Number(base.brightness) : 1,
         };
       };
       const setLayerPropsImpl = (id: number, patch: Partial<EditorLayerProps>): Promise<void> => {
@@ -7479,7 +7481,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             for (const ps of particleSystemsByLayer.get(layer.id) ?? []) ps.setVisible(!!layer.visible);
           }
         }
-        if (p.alpha !== undefined || p.color) {
+        if (p.alpha !== undefined || p.color || p.brightness !== undefined) {
           const tinted = l.matTint && l.tintBase;
           const base = tinted ? l.tintBase : l;
           if (p.alpha !== undefined && Number.isFinite(p.alpha)) base.alpha = p.alpha;
@@ -7487,6 +7489,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             base.color = vec3(p.color, 1);
             if (l.isText && !tinted) l.textColor = base.color;
           }
+          // M4 A7：亮度热改。渲染侧逐通道读 layer.brightness（color[i] * brightness * …），
+          // 所以写进 base 就够了；烘过材质常量的层由 applyBuiltinMatTint 重新乘一次。
+          if (p.brightness !== undefined && Number.isFinite(p.brightness)) base.brightness = p.brightness;
           if (tinted) applyBuiltinMatTint(l);
         }
         return renderOnce();

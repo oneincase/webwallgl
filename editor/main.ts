@@ -5888,13 +5888,14 @@ function soundGroup(node: LayerNode): HTMLElement {
 // ---------- 关键帧动画：字段开 / 关动画、当前帧打关键帧、改动自动落关键帧、时长 / 模式 / 插值 ----------
 
 const canAnimate = (n: LayerNode) => n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model";
-const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color" };
+const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color", brightness: "f.brightness" };
 
 /** 画面上的当前值（动画字段 = 曲线在当前时刻的值）；没有引擎时退回静态值 */
 function liveValue(node: LayerNode, f: AnimField): number[] {
   const p = editor?.getLayerProps(Number(node.id));
   if (!p) return baseValue(node.obj, f);
-  return f === "alpha" ? [p.alpha] : [...p[f]];
+  // 1 通道字段（alpha / brightness）在 EditorLayerProps 上是裸数字，不能展开
+  return f === "alpha" ? [p.alpha] : f === "brightness" ? [p.brightness] : [...p[f]];
 }
 
 const nowTime = () => editor?.time ?? 0;
