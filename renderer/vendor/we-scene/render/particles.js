@@ -985,6 +985,26 @@ export class ParticleSystem {
     this._compile()
   }
 
+  /**
+   * [we-scene patch] 编辑器热更粒子文件（M2）：把新的模型**按引用**交给引擎，
+   * 之后就地改这份对象的值即当帧生效（与 instanceoverride 的用法一致）。
+   *
+   * 为什么不像 setOverrideValue 那样每次都走 reapplyOverride()：`_applyOverride()`
+   * 结尾无条件 `this.pool = []` 再重建整个池 —— 屏幕上所有粒子瞬间清零，
+   * 调一次滑条闪一次。只有 `maxcount` 变了才必须付这个代价（池容量得重算）；
+   * 其余参数走 `_compile()`：它只重读 `this.model`，不动池，当帧生效。
+   *
+   * 返回应用后的池容量（调用方可用它判断这次是不是重建过池）。
+   */
+  applyModel(model) {
+    const prevMax = num(this.model && this.model.maxcount, 100)
+    const nextMax = num(model && model.maxcount, 100)
+    this.model = model
+    if (nextMax !== prevMax) this.reapplyOverride()
+    this._compile()
+    return this.maxCount
+  }
+
   setMaterial(mat) {
     this.material = mat
     const pass = mat && mat.passes && mat.passes[0]

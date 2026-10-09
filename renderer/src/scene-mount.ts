@@ -3528,6 +3528,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
         ps.setVisible(!!layer.visible);
         particleSystems.push(ps);
+        // 记下这个系统吃的是哪一个粒子文件：编辑器热更按**文件路径**定位（M2）。
+        // 不能按图层 id 定位 —— particleSystemsByLayer 把顶层系统与全部 eventfollow/
+        // eventspawn 子发射器混在同一个 layer.id 下，而且一个粒子文件常被多层共用
+        // （库内 1847 个对象引用 1047 个去重文件），按层找会漏改或改错。
+        (ps as { particlePath?: string }).particlePath = particlePath;
         // 按图层 id 分组：子发射器继承父 layer.id，同一场景层共享 z 序位置
         const lid = layer.id;
         if (lid !== undefined) {
@@ -7555,6 +7560,23 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
         return renderOnce();
       };
+      /**
+       * 编辑器热更粒子文件（M2）：按**文件路径**找到吃过这个文件的全部粒子系统，
+       * 把同一份 model 对象按引用交给它们，然后补画一帧。
+       *
+       * 为什么按路径、而不是改文档结构走 structEdit：引擎侧持有的是自己 `JSON.parse`
+       * 出来的副本（buildParticleSystem 的 `const model = JSON.parse(readText(modelEntry))`），
+       * 改文档到不了引擎那份；重挂该层又是整场景重建（秒级）。
+       * 为什么交给同一份对象：ParticleSystem 按引用读 `this.model`，就地改值后
+       * `applyModel()` 只重编译、不动池（当帧生效不闪），只有 maxcount 变了才重建池。
+       */
+      const setParticleModelImpl = (path: string, model: Record<string, unknown>): Promise<void> => {
+        if (disposed) return Promise.reject(new Error("scene disposed"));
+        const hit = particleSystems.filter((p) => (p as { particlePath?: string }).particlePath === path);
+        if (!hit.length) return Promise.reject(new Error(`setParticleModel: no particle system for ${path}`));
+        for (const p of hit) p.applyModel?.(model);
+        return renderOnce();
+      };
       const seekImpl = (t: number, render = true): Promise<void> => {
         if (!Number.isFinite(t)) return Promise.reject(new Error(`seek: invalid time ${t}`));
         rebaseClock(t, performance.now());
@@ -7704,6 +7726,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         setLayerProps: setLayerPropsImpl,
         setAnimationLayers: setAnimationLayersImpl,
         setEffectConstants: setEffectConstantsImpl,
+        setParticleModel: setParticleModelImpl,
         getAttachmentPoints(id: number): EditorAttachmentPoint[] | null {
           if (disposed) return null;
           const l: any = layerById(id);

@@ -961,6 +961,20 @@ export type EditorControls = {
     pass: number,
     values: Readonly<Record<string, unknown>>,
   ): Promise<void>;
+  /**
+   * 粒子文件热更（M2）：把粒子文件 `path` 的模型交给场景里所有吃过这个文件的粒子系统，
+   * 然后补画一帧。
+   *
+   * 为什么按**文件路径**定位而不是图层 id：一个粒子文件常被多层共用（库内 1847 个对象引用
+   * 1047 个去重文件），且图层 id 那组里还混着 eventfollow / eventspawn 子发射器。
+   * 为什么交「同一份对象」而不是重新序列化：引擎在挂载时自己 `JSON.parse` 过一份副本
+   * （scene-mount 的 `const model = JSON.parse(readText(modelEntry))`），改文档结构到不了它；
+   * 这里把调用方手上那份对象按引用装进去，此后就地改值即当帧生效。
+   *
+   * 只有 `maxcount` 变了才会重建粒子池（屏幕上粒子清零重来）；其余参数只重编译。
+   * 路径不是当前场景里任何粒子系统的来源时 reject。
+   */
+  setParticleModel(path: string, model: Record<string, unknown>): Promise<void>;
   /** 模型层附着点在当前姿势下的偏移与屏幕位置（W14）；不是模型层 / 模型没装上 / id 不存在返回 null */
   getAttachmentPoints(id: number): EditorAttachmentPoint[] | null;
   /**
