@@ -2217,7 +2217,7 @@ async function runCreateAndDraft(ctx) {
   check((await h.errorLines()).length === 0, "动画条 / 复制粘贴全程无错误");
 
   // ════════════════════════════════════════════════════════════════════════
-  section("AJ. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）");
+  section("AL. M7 交互补齐（框选 → 批改 → 撤销 → 取消成组 → 树搜索 / 隔离 → 图层剪贴板跨文档）");
   await gotoEditor();
   await newBlank("#000000");
   for (const [x, y] of [[220, 200], [650, 200], [1600, 800]]) {
