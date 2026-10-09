@@ -34,6 +34,7 @@ import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
 import { DOC_KINDS, renderDocs, type DocKind } from "../bench/docs";
 import { applyPlatformClasses } from "../shared/workbench/platform";
 import { initTabs } from "../shared/workbench/tabs";
+import { load, save } from "../shared/workbench/storage";
 import { libraryKindOf, mountLibraryPanel } from "./ui/library-panel";
 import { mountWallpaperConfig } from "./ui/wallpaper-config";
 import { mountRenderSettings } from "./ui/render-settings";
@@ -269,7 +270,26 @@ import {
   type LayerNode,
   type PlaceResult,
   type PlaceWhere,
+  type SceneObject,
+  ungroup,
+  ungroupAll,
 } from "./doc";
+import {
+  LAYER_CLIP_KEY,
+  parseLayerClip,
+  pasteLayerClip,
+  serializeLayerClip,
+  stringifyLayerClip,
+  type LayerClip,
+} from "./clipboard";
+import {
+  treeIsolateView,
+  treePattern,
+  treeSearchHits,
+  treeVisible,
+  type TreeEntry,
+} from "./tree-query";
+import { boxFromCorners, marqueeHits, marqueeSelect, rectOf, type MarqueeLayer } from "./marquee";
 import {
   addAnimLayer,
   animLayersHot,
@@ -377,6 +397,12 @@ const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as
 const docTitleEl = $<HTMLElement>("#ed-doc-title");
 const treeEl = $<HTMLElement>("#ed-tree");
 const layerCountEl = $<HTMLElement>("#ed-layer-count");
+// 树搜索 / 折叠全部 / 隔离（C2）：放在顶部，renderTree 可能在本文件靠前处就被调用
+const filterEl = $<HTMLInputElement>("#ed-filter");
+const filterClearEl = $<HTMLButtonElement>("#ed-filter-clear");
+const treeCollapseEl = $<HTMLButtonElement>("#tree-collapse");
+const treeExpandEl = $<HTMLButtonElement>("#tree-expand");
+const treeIsolateEl = $<HTMLButtonElement>("#tree-isolate");
 const inspectorEl = $<HTMLElement>("#ed-inspector");
 const viewportEl = $<HTMLElement>("#ed-viewport");
 const stageEl = $<HTMLElement>("#ed-stage");
@@ -510,7 +536,6 @@ let trimOut: number | null = null;
 let openGen = 0;
 let selectedId: number | string | null = null;
 const collapsed = new Set<number | string>();
-/** 页面级锁定（不进文档）：锁定层不参与点选、不能拖、检视器只读 */
 /** 多选：selectedId 是主选（检视器 / 手柄跟它走），extraSel 是追加选中的其余层 */
 const extraSel = new Set<string>();
 
@@ -1584,6 +1609,36 @@ function selectLayer(id: number | string | null) {
   treeEl.querySelector(".ed-node.selected")?.scrollIntoView({ block: "nearest" });
 }
 
+/** 主选 + 追加集合一次性落定（框选 / 全选用）：主选拿列表第一个，其余进 extraSel */
+function selectMany(primary: number | string | null, extra: ReadonlyArray<number | string>) {
+  extraSel.clear();
+  selectedId = null;
+  if (primary !== null && doc) selectedId = findPath(doc.roots, primary)?.at(-1)?.id ?? null;
+  for (const id of extra) {
+    if (String(id) === String(selectedId) || extraSel.has(String(id))) continue;
+    if (doc && findPath(doc.roots, id)) extraSel.add(String(id));
+  }
+  renderTree();
+  renderInspector();
+  treeEl.querySelector(".ed-node.selected")?.scrollIntoView({ block: "nearest" });
+}
+
+/** 全选（⌘A）：只选当前可见层，锁定的层不入选（与点选口径一致） */
+function selectAllLayers() {
+  if (!doc || doc.type !== "scene") return;
+  const ids: Array<number | string> = [];
+  const walk = (nodes: LayerNode[]) => {
+    for (const n of nodes) {
+      if (n.visible && !isLocked(n.id)) ids.push(n.id);
+      if (!collapsed.has(n.id)) walk(n.children);
+    }
+  };
+  walk(doc.roots);
+  if (!ids.length) return;
+  selectMany(ids[0], ids.slice(1));
+  log(et("log.selectAll", { n: ids.length }));
+}
+
 // ---------- 编辑：热改 + 写回文档 + 撤销重做（W2-lite） ----------
 
 const edits = new EditHistory();
@@ -1964,6 +2019,18 @@ window.addEventListener("keydown", (e) => {
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d") {
     e.preventDefault();
     duplicateSelected();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+    e.preventDefault();
+    selectAllLayers();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c") {
+    if (!copySelected()) return;
+    e.preventDefault();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "x") {
+    if (!cutSelected()) return;
+    e.preventDefault();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") {
+    if (!pasteClipboard()) return;
+    e.preventDefault();
   } else if ((e.key === "Delete" || e.key === "Backspace") && selectedId !== null) {
     e.preventDefault();
     deleteSelected();
@@ -1999,13 +2066,17 @@ function drawOverlay() {
   }
   overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
   overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
+  const cr = canvas?.getBoundingClientRect() ?? null;
+  if (!cr) return;
+  const sr = stageEl.getBoundingClientRect();
+  overlayCtx.setTransform(dpr, 0, 0, dpr, (cr.left - sr.left) * dpr, (cr.top - sr.top) * dpr);
+  if (marquee) drawMarquee();
+  overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
   if (!editor || selectedId === null) return;
   if (extraSel.size) drawExtraOutlines();
   const outline = editor.getLayerOutline(Number(selectedId));
-  const canvas = stageEl.querySelector<HTMLCanvasElement>("canvas:not(#ed-overlay)");
-  if (!outline || !canvas) return;
-  const sr = stageEl.getBoundingClientRect();
-  const cr = canvas.getBoundingClientRect();
+  if (!outline) return;
   overlayCtx.setTransform(dpr, 0, 0, dpr, (cr.left - sr.left) * dpr, (cr.top - sr.top) * dpr);
   const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0078d4";
   const lockedSel = isLocked(selectedId);
@@ -2569,6 +2640,166 @@ document.addEventListener("click", (e) => {
   if (!ptrMenuEl.hidden && !ptrMenuEl.contains(e.target as Node)) closePtrMenu();
 });
 
+// ---------- 框选（C1）：拖空白处拉矩形，松手把相交的层并进选区 ----------
+
+/** 起拖时的层包围盒快照（画布 CSS 像素）：拖拽期间手柄不变，不必每帧重量 */
+let marqueeLayers: MarqueeLayer[] = [];
+let marquee: {
+  pointerId: number;
+  /** 起拖点 / 当前点，画布 CSS 像素 */
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+  /** ⇧ / ⌘ 起拖 = 追加选（再框已选层即剔除） */
+  add: boolean;
+  moved: boolean;
+} | null = null;
+const MARQUEE_THRESHOLD = 3;
+
+/** 量一遍当前层的包围盒；模型层取凸包的外接矩形 */
+function marqueeSnapshot(): MarqueeLayer[] {
+  if (!editor) return [];
+  return editor.getLayers().map((l) => {
+    const o = editor!.getLayerOutline(Number(l.id));
+    const c = o?.hull ?? o?.corners;
+    return { id: l.id, visible: l.visible, box: boxFromCorners(c) };
+  });
+}
+
+function marqueeRect(): Box | null {
+  return marquee ? rectOf(marquee.ax, marquee.ay, marquee.bx, marquee.by) : null;
+}
+
+/** 叠加层里画框选矩形（drawOverlay 每帧调） */
+function drawMarquee() {
+  const r = marqueeRect();
+  if (!marquee || !marquee.moved || !r) return;
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0078d4";
+  overlayCtx.setLineDash([4, 3]);
+  overlayCtx.fillStyle = "rgba(0, 120, 212, 0.12)";
+  overlayCtx.fillRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+  overlayCtx.strokeStyle = accent;
+  overlayCtx.lineWidth = 1;
+  overlayCtx.strokeRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+  overlayCtx.setLineDash([]);
+}
+
+stageEl.addEventListener("pointerdown", (e) => {
+  if (marquee || !editor || !doc || doc.type !== "scene" || e.button !== 0 || e.altKey) return;
+  const p = canvasPoint(e);
+  if (!p) return;
+  // 命中手柄 / 已选中层的交给上面的拖拽；点在别的层上是点选，也不框选
+  if (handleAt(gizmo, p.x, p.y) || overSelected(p.x, p.y)) return;
+  if (editor.hitTestAt(p.x, p.y).some((h) => !isLocked(h.id))) return;
+  marqueeLayers = marqueeSnapshot();
+  marquee = { pointerId: e.pointerId, ax: p.x, ay: p.y, bx: p.x, by: p.y, add: e.shiftKey || e.metaKey || e.ctrlKey, moved: false };
+  stageEl.setPointerCapture(e.pointerId);
+});
+
+stageEl.addEventListener("pointermove", (e) => {
+  if (!marquee || e.pointerId !== marquee.pointerId) return;
+  const p = canvasPoint(e);
+  if (!p) return;
+  marquee.bx = p.x;
+  marquee.by = p.y;
+  if (!marquee.moved && Math.hypot(marquee.bx - marquee.ax, marquee.by - marquee.ay) >= MARQUEE_THRESHOLD) marquee.moved = true;
+});
+
+stageEl.addEventListener("pointerup", (e) => {
+  if (!marquee || e.pointerId !== marquee.pointerId) return;
+  const m = marquee;
+  marquee = null;
+  if (!m.moved) return;
+  suppressClick = true;
+  const r = rectOf(m.ax, m.ay, m.bx, m.by);
+  const hits = marqueeHits(marqueeLayers, r);
+  const ids = marqueeSelect(
+    selectionNodes().map((n) => n.id),
+    hits,
+    m.add,
+  );
+  if (!ids.length) {
+    selectMany(null, []);
+    log(et("log.marqueeNone"));
+    return;
+  }
+  selectMany(ids[0], ids.slice(1));
+  log(et("log.marqueePick", { n: ids.length, hit: hits.length }));
+});
+
+stageEl.addEventListener("pointercancel", (e) => {
+  if (marquee && e.pointerId === marquee.pointerId) marquee = null;
+});
+
+// ---------- 图层剪贴板（A10）：⌘C / ⌘X / ⌘V，跨文档靠内存 + localStorage ----------
+
+/** 粘贴偏移（画布局部单位）：错开一点，免得贴在同一处看不出来 */
+const PASTE_OFFSET = 16;
+/** 页内剪贴板；跨页 / 刷新后由 localStorage 兜底恢复 */
+let layerClip: LayerClip | null = null;
+
+function clipboardSource(): { objs: SceneObject[]; nodes: LayerNode[] } | null {
+  if (!doc || doc.type !== "scene" || !editor) return null;
+  const objs = doc.scene?.objects;
+  if (!Array.isArray(objs)) return null;
+  const nodes = selectionNodes();
+  if (!nodes.length) return null;
+  return { objs: objs as SceneObject[], nodes };
+}
+
+function writeClipboard(clip: LayerClip) {
+  layerClip = clip;
+  save(LAYER_CLIP_KEY, stringifyLayerClip(clip));
+}
+
+function readClipboard(): LayerClip | null {
+  if (layerClip) return layerClip;
+  const raw = load(LAYER_CLIP_KEY);
+  layerClip = raw ? parseLayerClip(raw) : null;
+  return layerClip;
+}
+
+/** 复制选中的整棵子树；返回是否吃掉了这次按键 */
+function copySelected(): boolean {
+  const src = clipboardSource();
+  if (!src) return false;
+  const clip = serializeLayerClip(
+    src.objs,
+    src.nodes.map((n) => n.id),
+  );
+  if (!clip) return false;
+  writeClipboard(clip);
+  const n = src.nodes.length;
+  log(et("log.layerCopied", { n, name: nodeName(src.nodes[0].id) }));
+  return true;
+}
+
+/** 剪切 = 复制 + 删掉（删除本身进撤销栈） */
+function cutSelected(): boolean {
+  if (!copySelected()) return false;
+  const n = selectionNodes().length;
+  deleteSelected();
+  log(et("log.layerCut", { n }));
+  return true;
+}
+
+/** 粘贴：重新分配 id，父级尽量指回原层级；落进撤销栈 */
+function pasteClipboard(): boolean {
+  const clip = readClipboard();
+  if (!clip || !doc || doc.type !== "scene") return false;
+  let added: number[] = [];
+  // structEdit 的 mutate 返回值只用来决定粘贴后选谁；返回 [] 表示没改成功
+  structEdit(et("log.layerPasted", { n: clip.objs.length }), (d) => {
+    added = pasteLayerClip(d, clip, [PASTE_OFFSET, -PASTE_OFFSET]);
+    // 返回值只用于「粘贴后主选谁」；多选由下面的 selectMany 补齐
+    return added.length ? added[0] : undefined;
+  });
+  if (!added.length) return false;
+  selectMany(added[0], added.slice(1));
+  return true;
+}
+
 // ---------- 状态栏 ----------
 
 function renderStatus() {
@@ -2626,6 +2857,8 @@ const panelTabs = {
   }),
   right: initTabs($("#ed-right"), { storageKey: "we-editor-tab-right" }),
 };
+// initTabs 的首次 select 不触发 onChange，这里补一次，面板工具条才不会错档显示
+syncPanelTools($("#ed-layers"), panelTabs.left.current());
 
 const renderSettings = mountRenderSettings({
   fps: $("#fps"),
@@ -3775,6 +4008,23 @@ lyDupEl.onclick = () => duplicateSelected();
 lyDelEl.onclick = () => deleteSelected();
 const lyGroupEl = $<HTMLButtonElement>("#ly-group");
 lyGroupEl.onclick = () => groupSelected();
+const lyUngroupEl = $<HTMLButtonElement>("#ly-ungroup");
+lyUngroupEl.onclick = () => ungroupSelected();
+// 树搜索 / 折叠全部 / 隔离（C2）的事件绑定（元素引用在文件顶部）
+filterEl.addEventListener("input", () => setTreeQuery(filterEl.value));
+filterEl.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  filterEl.value = "";
+  setTreeQuery("");
+});
+filterClearEl.onclick = () => {
+  filterEl.value = "";
+  setTreeQuery("");
+  filterEl.focus();
+};
+treeCollapseEl.onclick = () => setAllCollapsed(true);
+treeExpandEl.onclick = () => setAllCollapsed(false);
+treeIsolateEl.onclick = () => toggleIsolate();
 
 // ---------- 图层树拖拽：落在行上 1/3 = 之前、下 1/3 = 之后、中间 = 放进去 ----------
 
@@ -3856,15 +4106,45 @@ function groupSelected() {
   structEdit(et("log.grouped", { name: nodeName(n.id) }), (d) => groupLayer(d, n.id, et("layer.groupName")) ?? undefined);
 }
 
+/** 选中的层里有没有「带子层的组」——取消成组按钮的可用条件 */
+function ungroupable(): boolean {
+  if (!doc || doc.type !== "scene") return false;
+  return selectionNodes().some((n) => n.children.length > 0 && !isLocked(n.id));
+}
+
+function ungroupSelected() {
+  const nodes = selectionNodes();
+  if (!nodes.length || !doc) return;
+  const ids = nodes.map((n) => n.id);
+  let bad: { reason: Exclude<PlaceResult, "ok" | "noop">; at?: number | string } | null = null;
+  structEdit(et("log.multiUngrouped", { n: ids.length }), (d) => {
+    const r = ungroupAll(d, ids);
+    if (r.ok) return r.ids[0] ?? undefined;
+    if (r.reason !== "ok" && r.reason !== "noop") bad = { reason: r.reason, at: r.at };
+    return undefined;
+  });
+  if (bad) {
+    const b: { reason: Exclude<PlaceResult, "ok" | "noop">; at?: number | string } = bad;
+    log(et(PLACE_BAD[b.reason], { name: nodeName(b.at ?? ids[0]) }), "warn");
+  }
+}
+
 function syncLayerTools() {
   const off = !selectedNode() || !current?.assets || doc?.type !== "scene";
-  for (const b of [lyUpEl, lyDownEl, lyGroupEl, lyDupEl, lyDelEl]) b.disabled = off;
+  for (const b of [lyUpEl, lyDownEl, lyGroupEl, lyUngroupEl, lyDupEl, lyDelEl]) b.disabled = off;
+  lyUngroupEl.disabled = off || !ungroupable();
   lyAddEl.disabled = !overlay || doc?.type !== "scene";
   lyAddTextEl.disabled = lyAddEl.disabled;
   lyAddParticleEl.disabled = lyAddEl.disabled;
   lyAddSoundEl.disabled = lyAddEl.disabled;
   lyAddVideoEl.disabled = lyAddEl.disabled;
   lyAddModelEl.disabled = lyAddEl.disabled;
+  // 树工具：折叠/展开只在场景可用；隔离只在有选中层时可用
+  const treeOff = !doc || doc.type !== "scene";
+  treeCollapseEl.disabled = treeOff;
+  treeExpandEl.disabled = treeOff;
+  treeIsolateEl.disabled = treeOff || !selectionNodes().length;
+  treeIsolateEl.classList.toggle("is-on", isolateIds.size > 0);
 }
 
 function renderTree() {
@@ -3886,15 +4166,110 @@ function renderTree() {
     return;
   }
   layerCountEl.textContent = et("layers.count", { n: doc.objectCount });
+  const entries = treeEntries();
+  const view = treeView(entries);
+  if (view.stats) layerCountEl.textContent = et("tree.count", { n: view.visible.size, total: doc.objectCount });
+  if (!view.visible.size && view.filtering) {
+    treeEl.appendChild(note(et("tree.searchNone")));
+    return;
+  }
   const frag = document.createDocumentFragment();
   const walk = (nodes: LayerNode[], depth: number) => {
     for (const n of nodes) {
-      frag.appendChild(treeRow(n, depth));
-      if (n.children.length && !collapsed.has(n.id)) walk(n.children, depth + 1);
+      if (!view.visible.has(String(n.id))) continue;
+      frag.appendChild(treeRow(n, depth, view.matched.has(String(n.id))));
+      // 过滤中忽略折叠（否则命中项会被折叠的祖先挡掉）；平时尊重折叠状态
+      if (n.children.length && (view.filtering || !collapsed.has(n.id))) walk(n.children, depth + 1);
     }
   };
   walk(doc.roots, 0);
   treeEl.appendChild(frag);
+}
+
+// ---------- 图层树搜索 / 隔离（C2）：视图过滤，不动文档与选中 ----------
+
+let treeQuery = "";
+const isolateIds = new Set<string>();
+
+/** 把当前文档摊平成 tree-query 的条目表（id / parent / name） */
+function treeEntries(): TreeEntry[] {
+  const out: TreeEntry[] = [];
+  const walk = (nodes: LayerNode[], parent: number | string | null) => {
+    for (const n of nodes) {
+      out.push({ id: n.id, parent, name: n.name || `#${n.id}` });
+      walk(n.children, n.id);
+    }
+  };
+  if (doc) walk(doc.roots, null);
+  return out;
+}
+
+/** 计算本次渲染的可见 / 命中集合；搜索与隔离二选一（隔离优先） */
+function treeView(entries: TreeEntry[]): { visible: Set<string>; matched: Set<string>; stats: boolean; filtering: boolean } {
+  if (isolateIds.size) {
+    const v = treeIsolateView(entries, [...isolateIds]);
+    return { visible: v.visible, matched: v.matched, stats: true, filtering: true };
+  }
+  if (treePattern(treeQuery)) {
+    const hits = treeSearchHits(entries, treeQuery);
+    const v = treeVisible(entries, hits);
+    return { visible: v.visible, matched: v.matched, stats: true, filtering: true };
+  }
+  return { visible: new Set(entries.map((e) => String(e.id))), matched: new Set(), stats: false, filtering: false };
+}
+
+function setTreeQuery(q: string) {
+  treeQuery = q;
+  filterClearEl.hidden = !q;
+  renderTree();
+}
+
+/** 隔离：只显示选中层及其子树；再点一次取消。选中层链上的折叠一并展开，免得看不见 */
+function toggleIsolate() {
+  if (isolateIds.size) {
+    isolateIds.clear();
+  } else {
+    const nodes = selectionNodes();
+    if (!nodes.length) return;
+    for (const n of nodes) {
+      isolateIds.add(String(n.id));
+      for (const p of findPath(doc?.roots ?? [], n.id)?.slice(0, -1) ?? []) collapsed.delete(p.id);
+    }
+  }
+  syncLayerTools();
+  renderTree();
+}
+
+/** 展开 / 折叠全部（整棵树，与当前过滤无关） */
+function setAllCollapsed(all: boolean) {
+  if (!doc) return;
+  const walk = (nodes: LayerNode[]) => {
+    for (const n of nodes) {
+      if (!n.children.length) continue;
+      if (all) collapsed.add(n.id);
+      else collapsed.delete(n.id);
+      walk(n.children);
+    }
+  };
+  walk(doc.roots);
+  renderTree();
+}
+
+// ---------- 锁定 / 解锁（A9）：写进文档的 locktransforms，并进撤销栈 ----------
+
+/**
+ * 反转锁定状态。期望值在点击时就固定下来（on = !当前），mutate 里不再重新开关：
+ * 撤销 / 重做会带着快照重跑一次 mutate，这里必须幂等，否则第二次就翻回去了。
+ */
+function setLockedEdit(node: LayerNode, on: boolean) {
+  const verb = et(on ? "log.locked" : "log.unlocked", { name: nodeName(node.id) });
+  objEdit(verb, node.id, (o) => {
+    if (isLockedObj(o) === on) return false;
+    setLocked(o, on);
+    return true;
+  });
+  renderTree();
+  if (node.id === selectedId) renderInspector();
 }
 
 function note(text: string): HTMLElement {
@@ -3904,12 +4279,13 @@ function note(text: string): HTMLElement {
   return p;
 }
 
-function treeRow(n: LayerNode, depth: number): HTMLElement {
+function treeRow(n: LayerNode, depth: number, match = false): HTMLElement {
   const row = document.createElement("div");
   row.className = "ed-node";
   row.setAttribute("role", "treeitem");
   if (n.id === selectedId) row.classList.add("selected");
   else if (extraSel.has(String(n.id))) row.classList.add("selected", "extra-selected");
+  if (match) row.classList.add("match");
   if (!n.visible) row.classList.add("hidden-layer");
   row.style.paddingLeft = `${6 + depth * 14}px`;
 
@@ -3955,10 +4331,7 @@ function treeRow(n: LayerNode, depth: number): HTMLElement {
     lock.innerHTML = isLocked(n.id) ? LOCK_SVG : UNLOCK_SVG;
     lock.onclick = (e) => {
       e.stopPropagation();
-      setLocked(n.obj, !isLocked(n.id));
-      markDirty();
-      renderTree();
-      if (n.id === selectedId) renderInspector();
+      setLockedEdit(n, !isLocked(n.id));
     };
     const eye = document.createElement("button");
     eye.type = "button";
