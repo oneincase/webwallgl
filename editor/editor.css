@@ -1835,3 +1835,10 @@ input.ed-al-name {
   font-size: var(--wb-font-sm);
 }
 
+/* ---------- 图层树无障碍焦点（M9 / C5） ---------- */
+
+.ed-tree .ed-node:focus-visible {
+  outline: 2px solid var(--wb-accent, #4c8dff);
+  outline-offset: -2px;
+}
+

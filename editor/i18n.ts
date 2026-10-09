@@ -787,6 +787,10 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "tree.isolate": "隔离选中层（只显示它与子树，再点一次恢复）",
     "tree.count": "{n} / {total} 个对象",
     "tree.searchNone": "没有匹配的图层",
+    // M9：图层树无障碍（C5）。树容器是 role=tree，行是 role=treeitem，↑↓/Home/End/←→ 走 roving tabindex
+    "tree.aria": "图层树（↑↓ 移动 · ←→ 折叠展开 · Enter 选中）",
+    "tree.expand": "展开",
+    "tree.collapse": "折叠",
     "log.marqueePick": "框选：命中 {hit} 层，选中 {n} 层",
     "log.marqueeNone": "框选：没有命中图层",
     "log.selectAll": "已全选 {n} 个图层",
@@ -1578,6 +1582,10 @@ const DICT: Record<"zh" | "en", Record<string, string>> = {
     "tree.isolate": "Isolate selection (show only it and its subtree; click again to restore)",
     "tree.count": "{n} / {total} objects",
     "tree.searchNone": "No matching layers",
+    // M9: layer tree a11y (C5). Container is role=tree, rows are role=treeitem, ↑↓/Home/End/←→ use a roving tabindex
+    "tree.aria": "Layer tree (↑↓ move · ←→ collapse/expand · Enter select)",
+    "tree.expand": "Expand",
+    "tree.collapse": "Collapse",
     "log.marqueePick": "Marquee: hit {hit} layers, selected {n}",
     "log.marqueeNone": "Marquee: nothing hit",
     "log.selectAll": "Selected all {n} layers",

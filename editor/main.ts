@@ -114,6 +114,8 @@ import { exporterAccepts, exporters, runExportPipeline, type Exporter } from "./
 import { schemaForm } from "./ui/schema-form";
 // 命令面板（M9/C4）：只从 commands 注册表枚举，没有第二份手写命令表
 import { createCommandPalette, type CommandPalette } from "./ui/command-palette";
+// 图层树键盘导航语义（M9/C5）：纯函数，main.ts 只把动作落到 DOM
+import { firstFocusable, treeNav, type TreeNavRow } from "./tree-nav";
 import type { DocService } from "./services/types";
 import { addableTargets, removeScript, scriptSlots, scriptTemplate, setScript } from "./scripts";
 import {
@@ -546,6 +548,8 @@ let selectedId: number | string | null = null;
 const collapsed = new Set<number | string>();
 /** 多选：selectedId 是主选（检视器 / 手柄跟它走），extraSel 是追加选中的其余层 */
 const extraSel = new Set<string>();
+/** 图层树的无障碍焦点行（C5）：roving tabindex —— 只有这一行 tabindex=0，方向键在行间移动它 */
+let treeFocusId: string | null = null;
 
 function selectionNodes(): LayerNode[] {
   if (!doc || selectedId === null) return [];
@@ -4255,20 +4259,24 @@ function syncLayerTools() {
 
 function renderTree() {
   syncLayerTools();
+  treeEl.setAttribute("aria-label", et("tree.aria"));
   treeEl.textContent = "";
   layerCountEl.textContent = "";
   if (!doc) {
     treeEl.appendChild(note(et("layers.none")));
+    syncTreeFocus();
     return;
   }
   if (doc.type === "web") {
     // 网页壁纸工程没有图层树：工程本体是入口 html + 那堆站点文件，这里报个文件数
     const n = current?.assets ? current.assets.list().length + 1 : 0;
     treeEl.appendChild(note(n ? et("layers.webProject", { n }) : et("layers.notScene", { type: doc.type })));
+    syncTreeFocus();
     return;
   }
   if (doc.type !== "scene") {
     treeEl.appendChild(note(doc.video ? et("vp.layers") : et("layers.notScene", { type: doc.type })));
+    syncTreeFocus();
     return;
   }
   layerCountEl.textContent = et("layers.count", { n: doc.objectCount });
@@ -4277,6 +4285,7 @@ function renderTree() {
   if (view.stats) layerCountEl.textContent = et("tree.count", { n: view.visible.size, total: doc.objectCount });
   if (!view.visible.size && view.filtering) {
     treeEl.appendChild(note(et("tree.searchNone")));
+    syncTreeFocus();
     return;
   }
   const frag = document.createDocumentFragment();
@@ -4284,20 +4293,27 @@ function renderTree() {
     for (const n of nodes) {
       if (!view.visible.has(String(n.id))) continue;
       // 过滤中忽略折叠（否则命中项会被折叠的祖先挡掉）；平时尊重折叠状态
-      if (n.children.length && (view.filtering || !collapsed.has(n.id))) walk(n.children, depth + 1);
+      const expanded = !n.children.length || (view.filtering || !collapsed.has(n.id));
+      frag.appendChild(treeRow(n, depth, view.matched.has(String(n.id)), expanded));
+      if (n.children.length && expanded) walk(n.children, depth + 1);
     }
   };
   walk(doc.roots, 0);
   treeEl.appendChild(frag);
+  syncTreeFocus();
 }
 
+// ---------- 图层树无障碍（C5 / M9）：roving tabindex + 方向键导航 ----------
+// 行本身仍是平铺的 div[role=treeitem]（层级靠 aria-level 表达，与 paddingLeft 的视觉缩进一致），
 // 容器是 #ed-tree[role=tree][aria-multiselectable]。多选依旧走 ⇧/⌘ 点击，这里只动焦点与主选。
 
 /** 当前视图里按顺序排好的树行 */
+function treeRows(): HTMLElement[] {
   return [...treeEl.querySelectorAll<HTMLElement>(".ed-node")];
 }
 
 /** dataset 里的 id 是字符串、文档里的 id 可能是数字：两种都试（findNode 是 === 比较） */
+function treeNodeOf(id: string): LayerNode | null {
   if (!doc) return null;
   const direct = findNode(doc.roots, id);
   if (direct) return direct;
@@ -4305,39 +4321,68 @@ function renderTree() {
   return Number.isFinite(num) ? findNode(doc.roots, num) : null;
 }
 
+/** roving tabindex：焦点行 tabindex=0、其余 -1；焦点行不在视图里就退回第一行（空树给 null） */
+function syncTreeFocus() {
+  const rows = treeRows();
+  treeFocusId = firstFocusable(treeNavRows(rows), treeFocusId);
+  for (const row of rows) row.tabIndex = row.dataset.id === treeFocusId ? 0 : -1;
 }
 
 /** 焦点落到某一行上（行已被 renderTree 重建时重新取一次） */
+function focusTreeRow(id: string) {
+  const row = treeRows().find((r) => r.dataset.id === id);
   if (!row) return;
+  treeFocusId = id;
+  for (const r of treeRows()) r.tabIndex = r.dataset.id === id ? 0 : -1;
   row.focus({ preventScroll: false });
 }
 
+/** 行的层级（aria-level 从 1 起，与深度 +1 对应） */
+function treeLevel(row: HTMLElement): number {
+  return Number(row.getAttribute("aria-level") ?? "1");
 }
 
+/** DOM 行 → 纯函数的视图：与行上的 aria-* 同源（有 aria-expanded 就是有子层） */
+function treeNavRows(rows: HTMLElement[] = treeRows()): TreeNavRow[] {
   return rows.map((row) => {
+    const expanded = row.getAttribute("aria-expanded");
+    return { id: row.dataset.id ?? "", level: treeLevel(row), hasChildren: expanded !== null, expanded: expanded === "true" };
   });
 }
 
 /** 焦点 + 主选一起移动（与点选口径一致：清掉追加选中） */
+function moveTreeFocus(row: HTMLElement | undefined) {
   if (!row?.dataset.id) return;
+  const node = treeNodeOf(row.dataset.id);
   if (!node) return;
   selectLayer(node.id);
+  focusTreeRow(row.dataset.id);
 }
 
 /** 展开/折叠一行：折叠集合是渲染状态的唯一来源，改完重绘并保住焦点 */
+function setTreeExpanded(row: HTMLElement, expanded: boolean) {
   const id = row.dataset.id;
+  const node = id === undefined ? null : treeNodeOf(id);
   if (!node || id === undefined) return;
+  if (expanded) collapsed.delete(node.id);
   else collapsed.add(node.id);
   renderTree();
+  focusTreeRow(id);
 }
 
+// 方向键的语义全在 editor/tree-nav.ts（纯函数，离线判据直接喂 fixture），这里只把动作落到 DOM。
 treeEl.addEventListener("keydown", (e) => {
   const row = (e.target as HTMLElement | null)?.closest?.(".ed-node") as HTMLElement | null;
   if (!row || !doc || doc.type !== "scene") return;
+  const rows = treeRows();
+  const action = treeNav(treeNavRows(rows), rows.indexOf(row), e.key);
   if (!action) return;
   const target = rows[action.index];
   if (!target) return;
   e.preventDefault();
+  if (action.kind === "expand") return void setTreeExpanded(target, true);
+  if (action.kind === "collapse") return void setTreeExpanded(target, false);
+  moveTreeFocus(target);
 });
 
 // ---------- 图层树搜索 / 隔离（C2）：视图过滤，不动文档与选中 ----------
@@ -4433,11 +4478,15 @@ function note(text: string): HTMLElement {
   return p;
 }
 
-function treeRow(n: LayerNode, depth: number, match = false): HTMLElement {
+function treeRow(n: LayerNode, depth: number, match = false, expanded = !collapsed.has(n.id)): HTMLElement {
   const row = document.createElement("div");
   row.className = "ed-node";
   row.setAttribute("role", "treeitem");
+  // 无障碍状态（C5）：层级用 aria-level 表达（行是平铺的兄弟节点，靠它告诉读屏器缩进关系），
   // 展开态只给有子层的行；选中态与 .selected 类同源（主选 + ⇧/⌘ 追加的 extraSel）
+  row.setAttribute("aria-level", String(depth + 1));
+  row.setAttribute("aria-selected", String(n.id === selectedId || extraSel.has(String(n.id))));
+  if (n.children.length) row.setAttribute("aria-expanded", String(expanded));
   if (n.id === selectedId) row.classList.add("selected");
   else if (extraSel.has(String(n.id))) row.classList.add("selected", "extra-selected");
   if (match) row.classList.add("match");
