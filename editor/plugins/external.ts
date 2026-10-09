@@ -3,13 +3,13 @@
 // 一个插件包 = 一个目录（或等价的文件表），根上有 wwgl-plugin.json：
 //   { id, name, version, engine, main?, contributes?: { effects, particles, "particles.components", shaders, i18n }, permissions? }
 // · 数据贡献（不跑任何代码）：效果描述 JSON（frag / vert 指向包内文件）、粒子模板 JSON、
-//   粒子组件 JSON（WE 组件名 + 参数描述，校验走 particles.components 注册表）、shader 片段、词条；
+//   粒子组件 JSON（WE 组件名走 particles.components 注册表白名单，参数描述走参数 DSL）、shader 片段、词条；
 //   全部经注册表的 validate（粒子组件白名单、效果 id / 多 pass 约束……），不合法整包拒绝。
 // · 代码插件（main）：单文件 ESM，默认导出一个 Plugin；以 Blob URL import()，挂成外层的子插件，
 //   allow = 清单 permissions ∩ GRANTABLE —— 没授权的服务 ctx.get 拿不到、inject 也永远等不到（pending）。
 // 本模块不碰 DOM：import 方式由调用方注入（浏览器 Blob URL / Node data: URL），Node 里可直接测。
 
-import type { Context, PluginObject } from "../core";
+import { parseSchema, type Context, type PluginObject } from "../core";
 import { defineEffect, type EffectDef, type EffectFbo, type EffectParam, type EffectPass } from "../effects";
 import type { ParticleComponent, ParticleTemplate } from "../particles";
 import type { ShaderSnippet } from "../shader-lib";
@@ -292,7 +292,17 @@ export function dataContributions(pkg: PluginPackage): DataContributions {
     if (typeof j.id !== "string" || !j.id) errs.push(`粒子组件 ${p}：缺 id`);
     else if (kind !== "emitter" && kind !== "initializer" && kind !== "operator" && kind !== "renderer") {
       errs.push(`粒子组件 ${p}：kind 必须是 emitter / initializer / operator / renderer`);
-    } else out.components.push({ id: j.id, kind, params: Array.isArray(j.params) ? (j.params as ParticleComponent["params"]) : undefined });
+    } else {
+      // 参数描述复用参数 DSL（与效果 / 插件配置同一份校验），坏了整包拒绝
+      let params: ParticleComponent["params"];
+      try {
+        params = j.params === undefined ? undefined : parseSchema(j.params, `粒子组件 ${p}.params`);
+      } catch (e) {
+        errs.push((e as Error).message);
+        continue;
+      }
+      out.components.push({ id: j.id, kind, params });
+    }
   }
 
   for (const p of c.shaders ?? []) {
