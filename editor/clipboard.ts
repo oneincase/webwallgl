@@ -140,13 +140,39 @@ export function pasteLayerClip(doc: EditorDoc, clip: LayerClip, offset: readonly
   return added;
 }
 
-/** 粘贴偏移：只动静态 origin（动画层关键帧在旧坐标上，静默错位不如不动） */
+/**
+ * 粘贴偏移：只动静态 origin。
+ * - 库内工程（别人做的 WE 壁纸）里 origin 是 `"x y z"` 字符串，只认数组会让偏移**静默失效**
+ *   （真机上粘贴一层，落点与源层完全重合）——两种形态都要按原形态写回；
+ * - `{user|script, value}` 包装只改 `.value`（作者快照），绑定本身保留；
+ * - 带 `animation` 的（关键帧仍在旧坐标上）宁可不偏移，也不静默错位或吞掉关键帧。
+ */
 function shiftOrigin(o: SceneObject, offset: readonly [number, number]): void {
   const raw = o.origin;
-  const v = raw && typeof raw === "object" && !Array.isArray(raw) && "value" in (raw as object) ? (raw as { value: unknown }).value : raw;
+  const wrap = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+  if (wrap && "animation" in wrap) return;
+  const v = wrap && "value" in wrap ? wrap.value : raw;
+  const put = (next: unknown) => {
+    if (wrap) wrap.value = next;
+    else o.origin = next;
+  };
+  if (typeof v === "string") {
+    // 保留原书写样式：没动的分量原样搬过去，动过的按它自己的小数位重排
+    const parts = v.trim().split(/\s+/);
+    const nums = parts.map(Number);
+    if (parts.length < 2 || !Number.isFinite(nums[0]) || !Number.isFinite(nums[1])) return;
+    const like = (x: number, t: string) => {
+      const dot = t.indexOf(".");
+      return dot < 0 ? String(Math.round(x * 1e5) / 1e5) : x.toFixed(Math.min(6, t.length - dot - 1));
+    };
+    nums[0] += offset[0];
+    nums[1] += offset[1];
+    put(parts.map((t, i) => (i === 0 ? like(nums[0], t) : i === 1 ? like(nums[1], t) : t)).join(" "));
+    return;
+  }
   if (!Array.isArray(v) || v.length < 2) return;
   const out = v.map((x) => Number(x) || 0);
   out[0] += offset[0];
   out[1] += offset[1];
-  o.origin = out;
+  put(out);
 }

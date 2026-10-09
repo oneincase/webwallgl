@@ -5907,6 +5907,30 @@ section("CLIPBOARD. 图层剪贴板序列化 / 跨文档粘贴（A10）");
   const dest3 = mkScene(destObjs);
   const added3 = C.pasteLayerClip(dest3, clip, [16, -16]);
   check(json(added3) === json([8, 9, 10]) && dest3.scene.objects.length === 6, "带偏移粘贴：id 分配与不带偏移一致");
+  // 真机回归（AL 段实测发现）：库内工程 origin 是字符串，旧实现只认数组 ⇒ 偏移静默失效，
+  // 粘贴出来的一层和源层完全重合。这里把两种形态 + 两种包装都钉成判据。
+  const originOfObj = (o, id) => byId(o, id).origin;
+  check(
+    originOfObj(dest3.scene.objects, 8) === "66 4 0" && originOfObj(dest3.scene.objects, 9) === "26 -11 0" && originOfObj(dest3.scene.objects, 10) === "17 -15 0",
+    "★ 偏移真的写进字符串 origin：\"50 20 0\" → \"66 4 0\"（子树各自偏移，第三分量与书写位数原样保留）",
+  );
+  const arrClip = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: null, obj: { text: "arr", origin: [10, 20, 0] } }] });
+  const destArr = mkScene([{ id: 1, text: "base", origin: "0 0 0" }]);
+  C.pasteLayerClip(destArr, arrClip, [16, -16]);
+  check(json(originOfObj(destArr.scene.objects, 2)) === json([26, 4, 0]), "编辑器自建层的数组 origin 照偏移写回（保持数组形态，不被字符串化）");
+  const animObj = { text: "anim", origin: { value: "10 20 0", animation: { "0": "10 20 0", "30": "30 20 0" } } };
+  const animClip = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: null, obj: animObj }] });
+  const destAnim = mkScene([{ id: 1, text: "base", origin: "0 0 0" }]);
+  C.pasteLayerClip(destAnim, animClip, [16, -16]);
+  check(json(originOfObj(destAnim.scene.objects, 2)) === json(animObj.origin), "★ 带 animation 的 origin 一律不动（关键帧仍指向旧坐标：宁可重合，也不静默错位或吞掉关键帧）");
+  const userClip = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: null, obj: { text: "u", origin: { user: "u_x", value: "5 5 0" } } }] });
+  const destUser = mkScene([{ id: 1, text: "base", origin: "0 0 0" }]);
+  C.pasteLayerClip(destUser, userClip, [16, -16]);
+  check(originOfObj(destUser.scene.objects, 2).user === "u_x" && originOfObj(destUser.scene.objects, 2).value === "21 -11 0", "★ {user, value} 包装：只动 .value，绑定键原样保留");
+  const zeroClip = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: null, obj: { text: "z", origin: "0.000 0.000 0.000" } }] });
+  const destZero = mkScene([{ id: 1, text: "base", origin: "0 0 0" }]);
+  C.pasteLayerClip(destZero, zeroClip, [16, -16]);
+  check(originOfObj(destZero.scene.objects, 2) === "16.000 -16.000 0.000", "小数位按原写法重排（\"0.000\" 风格不被压成 \"16 -16 0\"）");
   const dest4 = mkScene(destObjs);
   const before4 = JSON.stringify(dest4.scene.objects);
   const badParent = C.parseLayerClip({ format: C.LAYER_CLIP_FORMAT, version: 1, objs: [{ id: "1", parent: "404", obj: { text: "p" } }] });

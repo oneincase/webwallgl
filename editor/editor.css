@@ -1976,3 +1976,20 @@ input.ed-al-name {
   flex: 1;
   min-width: 0;
 }
+
+/* ---------- 左栏面板头：工具条必须留在栏内（M7 / C2 真机可达性修复） ----------
+   左栏默认 280px（editor/layout.ts 的 splitter size，最小 200），而面板头里两个标签页
+   加「折叠全部 / 展开全部 / 隔离」三个工具要 ~328px。不收缩的话工具被推到 #ed-layers
+   的框外，先被 .wb-panel 的 overflow:hidden 裁掉、再被中栏面板盖住 —— 真机点不到
+  （点下去命中的是中栏的标签页）。让标签页可收缩（文字本来就带省略号）、工具条不缩。 */
+#ed-left .wb-panel-head {
+  min-width: 0;
+}
+
+#ed-left .wb-tab {
+  min-width: 0;
+}
+
+#ed-left .wb-panel-tools {
+  flex: none;
+}

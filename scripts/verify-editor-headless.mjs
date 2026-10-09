@@ -2442,8 +2442,21 @@ async function runCreateAndDraft(ctx) {
   await clickSel("#ly-group");
   await h.waitRemount(rm);
   check((await treeIds()).length === 4 && (await depthOf())[q1] === 1 && (await depthOf())[q2] === 1, "框选出的两层成组");
-  await clickSel(`#ed-tree .ed-node[data-id="${q1}"] .ed-kind`);
-  await settle();
+  // 取消成组要求选中「带子层的组」：先把按钮的可用口径钉成判据（选中叶子层时必须禁用），
+  // 再选中组本身（树里 depth 0 且不是第三层的那一行）才点。原先直接点 q1 会让按钮停在
+  // 禁用态、点击什么也不做，随后 waitRemount 干等 60s —— 那是本段自己的用例写错，不是产品缺陷。
+  await clickRow(q1);
+  check(
+    (await ev(`document.querySelector('#ly-ungroup').disabled`)) === true,
+    "选中没有子层的叶子层时「取消成组」禁用（不会静默什么都不做）",
+  );
+  const grpAj = Object.entries(await depthOf()).find(([id, d]) => d === 0 && id !== q3)?.[0];
+  check(typeof grpAj === "string" && (await treeIds()).length === 4, "成组后树里能认出唯一的新组（depth 0 且非第三层）");
+  await clickRow(grpAj);
+  check(
+    (await ev(`document.querySelector('#ly-ungroup').disabled`)) === false,
+    "选中带子层的组时「取消成组」可用",
+  );
   rm = await h.readyCount();
   await clickSel("#ly-ungroup");
   await h.waitRemount(rm);
@@ -2460,6 +2473,13 @@ async function runCreateAndDraft(ctx) {
   await settle();
   check((await treeIds()).length === 3 && (await ev(`document.querySelector('#ed-filter').value`)) === "", "清空搜索：过滤撤销，三行都在");
   await clickRow(q3);
+  // ★ 真机可达性：左栏默认 280px，面板头（两个标签页 + 三个树工具）曾装不下，
+  // 工具被推到自己栏的框外、被中栏面板盖住 —— 真机点下去命中的是中栏的标签页。
+  const hittable = async (sel) =>
+    ev(`(() => { const b = document.querySelector(${JSON.stringify(sel)}); const r = b.getBoundingClientRect(); const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return !!t && (t === b || b.contains(t)); })()`);
+  const toolsHit = [];
+  for (const sel of ["#tree-collapse", "#tree-expand", "#tree-isolate"]) toolsHit.push(await hittable(sel));
+  check(toolsHit.every(Boolean), `★ 面板头的树工具真的能点到（命中测试落在按钮自己身上：折叠 / 展开 / 隔离 = ${json(toolsHit)}）`);
   await clickSel("#tree-isolate");
   await settle();
   check(json(await treeIds()) === json([q3]) && (await ev(`document.querySelector('#tree-isolate').classList.contains('is-on')`)), "★ 隔离：只留选中层这一支，按钮进入开启态");
@@ -2468,7 +2488,12 @@ async function runCreateAndDraft(ctx) {
   check((await treeIds()).length === 3 && !(await ev(`document.querySelector('#tree-isolate').classList.contains('is-on')`)), "再点隔离：恢复整棵树");
   await clickSel("#tree-collapse");
   await settle();
-  check((await ev(`document.querySelectorAll('#ed-tree .ed-twisty').length`)) === 0, "折叠全部：没有可折叠的组时树仍是平的（不报错）");
+  // 每行都有一个 .ed-twisty 占位符（没有子层时是空 span），所以口径是「没有一行带展开箭头」
+  check(
+    (await treeIds()).length === 3 &&
+      (await ev(`[...document.querySelectorAll('#ed-tree .ed-twisty')].filter((t) => (t.textContent || '').trim() !== '').length`)) === 0,
+    "折叠全部：没有可折叠的组时树仍是平的（每行只有占位符，没有展开箭头）",
+  );
   await clickSel("#tree-expand");
   await settle();
   check((await treeIds()).length === 3, "展开全部：三行恢复");
@@ -2498,7 +2523,7 @@ async function runCreateAndDraft(ctx) {
 
   // 图层剪贴板：⌘C / ⌘V 复制黏贴，⌘X 剪切；跨文档粘贴
   const originOf = async () => {
-    const v = await numInputs();
+    const v = await h.numInputs();
     return `${v[0]}, ${v[1]}`;
   };
   await clickRow(q1);
@@ -2509,7 +2534,12 @@ async function runCreateAndDraft(ctx) {
   await key("v", MOD.meta);
   await settle();
   const rowsAfterAj = (await treeIds()).length;
-  check(rowsAfterAj === rowsBeforeAj + 1 && (await originOf()) !== baseOrigin, `⌘C + ⌘V：树里多一层并选中它，落点带粘贴偏移（${json(baseOrigin)} → ${json(await originOf())}）`);
+  const pastedOrigin = await originOf();
+  // 两个条件分开写进文案：合在一条 `&&` 里时失败信息分不清是哪半挂了
+  check(
+    rowsAfterAj === rowsBeforeAj + 1 && pastedOrigin !== baseOrigin,
+    `⌘C + ⌘V：树里多一层并选中它，落点带粘贴偏移（行 ${rowsBeforeAj} → ${rowsAfterAj}，原点 ${json(baseOrigin)} → ${json(pastedOrigin)}）`,
+  );
   rm = await h.readyCount();
   await key("z", MOD.meta);
   await h.waitRemount(rm);
