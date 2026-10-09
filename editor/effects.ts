@@ -17,7 +17,7 @@
 // constantshadervalues 按参数的 pass 序号落到对应 pass 上。
 
 import type { EditorDoc, SceneObject } from "./doc";
-import { createRegistry } from "./core/registry";
+import { createRegistry } from "./core";
 import { expandShader } from "./shader-lib";
 
 export type EffectParamType = "float" | "int" | "bool" | "color" | "vec2" | "vec3" | "vec4";

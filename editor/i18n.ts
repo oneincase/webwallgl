@@ -3,7 +3,7 @@
 // 测试台的 setLang 会用它自己的词典刷一遍所有 data-i18n，查不到的键会被刷成键名本身。
 
 import { getLang, onChangeLang } from "../bench/i18n";
-import { baseLang } from "./core/schema";
+import { baseLang } from "./core";
 
 const DICT: Record<"zh" | "en", Record<string, string>> = {
   zh: {

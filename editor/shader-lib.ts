@@ -3,7 +3,7 @@
 // include，WE 不需要任何额外文件。WE 自己的 include（common.h 等）原样保留，交给引擎。
 // 片段之间可以互相 include（按依赖先后展开，同一片段只展开一次，环依赖报错）。
 
-import { createRegistry } from "./core/registry";
+import { createRegistry } from "./core";
 
 export type ShaderSnippet = {
   /** include 名，形如 wwgl/noise（不带引号） */

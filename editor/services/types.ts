@@ -126,6 +126,7 @@ export interface StorageService {
   keys(prefix?: string): Promise<string[]>;
 }
 
+// 模块增强必须指向真正声明 Services 的模块（不能用 "../core" barrel，增强对 barrel 不生效）
 declare module "../core/context" {
   interface Services {
     doc: DocService;

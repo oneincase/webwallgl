@@ -11,7 +11,7 @@ import { parseObj } from "./fmt-obj";
 import { parsePly, parseStl } from "./fmt-stl";
 import { GltfError, parseGltf, type Gltf, type GltfWarning } from "./gltf";
 import { irToGltf, type ModelIR } from "./model-ir";
-import { createRegistry } from "./core/registry";
+import { createRegistry } from "./core";
 
 export type ModelImporter = {
   id: string;
