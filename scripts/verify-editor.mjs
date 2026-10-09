@@ -7900,6 +7900,201 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// M9. 命令面板 + 动态快捷键总览（C4）/ 图层树无障碍（C5）/ 脚本事件模板（B8）
+// ───────────────────────────────────────────────────────────────────────────
+section("M9. 命令面板与无障碍（PALETTE）");
+{
+  const palRead = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
+  const palMainSrc = palRead("editor/main.ts");
+  const palHtmlSrc = palRead("editor/index.html");
+  const palCssSrc = palRead("editor/editor.css");
+  const palPanelSrc = palRead("editor/ui/command-palette.ts");
+  const palNavSrc = palRead("editor/tree-nav.ts");
+  const palI18nSrc = palRead("editor/i18n.ts");
+  const palHeadSrc = palRead("scripts/verify-editor-headless.mjs");
+  const palEngineSrc = palRead("renderer/vendor/we-scene/render/text.js");
+  // loadEditorModule 把打包结果写进 tmpRoot/<name>.mjs：带子目录的名字要先建目录
+  fs.mkdirSync(path.join(tmpRoot, "ui"), { recursive: true });
+  fs.mkdirSync(path.join(tmpRoot, "services"), { recursive: true });
+  const palPanel = await loadEditorModule("ui/command-palette");
+  const palNav = await loadEditorModule("tree-nav");
+  const palScripts = await loadEditorModule("scripts");
+  const { createCommandService } = await loadEditorModule("services/commands");
+  const palCheck = (await imp("renderer/src/editor/scripts.ts")).checkSceneScript;
+
+  // 词典两个语言段的键集合（4 空格缩进的 "key":）
+  const palSplit = palI18nSrc.split(/\n  en: \{/, 2);
+  const palDict = (text) =>
+    new Map([...text.matchAll(/^    "([^"]+)":\s*"((?:[^"\\]|\\.)*)",?$/gm)].map((m) => [m[1], m[2]]));
+  const palZh = palDict(palSplit[0]);
+  const palEn = palDict(palSplit[1]);
+  const palHasBoth = (k) => palZh.has(k) && palEn.has(k);
+  const palDeps = { t: (k) => palZh.get(k) ?? k, has: palHasBoth, text: (v, fb) => (v && typeof v === "object" ? v.zh ?? v.en ?? fb : fb) };
+
+  // ── C4：命令面板只枚举注册表（main.ts 的 7 条 cmd({...}) 是唯一那份命令表） ──
+  const palIds = ["edit.undo", "edit.redo", "file.save", "layer.duplicate", "layer.rename", "layer.delete", "export.run"];
+  const palBodies = [...palMainSrc.matchAll(/cmd\(\{([^\n]*)\}\);/g)].map((m) => m[1]);
+  const palIdsFromSrc = palBodies.map((b) => /id: "([^"]+)"/.exec(b)?.[1] ?? "");
+  check(json(palIdsFromSrc) === json(palIds), `内置命令仍是 main.ts 里 7 条内联 cmd({...}) 注册（实得 ${json(palIdsFromSrc)}）`);
+  const palDefs = palBodies.map((b) => {
+    const km = /keys: (\[[^\]]*\]|"[^"]*")/.exec(b);
+    return { id: /id: "([^"]+)"/.exec(b)[1], keys: km ? JSON.parse(km[1]) : undefined, needsArg: /needsArg: true/.test(b), run: () => {} };
+  });
+  const palSvc = createCommandService();
+  for (const d of palDefs) palSvc.register(d, "builtin-ui");
+  const palList = palSvc.registry.list();
+  check(json(palList.map((d) => d.id)) === json(palIds), "注册表枚举顺序 = main.ts 注册顺序（面板唯一的枚举源）");
+  const palItems = palPanel.paletteItems(palList, palDeps);
+  check(json(palItems.map((i) => i.id)) === json(palList.map((d) => d.id)), "命令面板条目 id 序列 = registry.list() 的 id 序列（没有第二份手写表）");
+  check(!/BUILTIN_COMMANDS|"edit\.undo"|"layer\.duplicate"/.test(palPanelSrc), "面板模块源码里没有任何内置命令 id（第二份命令表已删除）");
+  check(palPanel.orphanCommands(palList, { has: palHasBoth }).length === 0, "7 条内置命令都有 cmd.<id> 标题词条与 cmd.cat.<首段> 分类词条（注册表 ↔ 词条表一一对应，无孤儿）");
+  const palWordKeys = [...new Set([...palI18nSrc.matchAll(/"cmd\.(?!cat\.)([A-Za-z0-9_.]+)":/g)].map((m) => `cmd.${m[1]}`))];
+  check(json(palWordKeys.slice().sort()) === json(palIds.map((id) => `cmd.${id}`).sort()), `词典里也没有孤儿命令词条（实得 ${json(palWordKeys)}）`);
+
+  const palBy = Object.fromEntries(palItems.map((i) => [i.id, i]));
+  const palBadTitle = palItems.filter((i) => i.title !== palZh.get(`cmd.${i.id}`) || i.title === i.id).map((i) => i.id);
+  check(palBadTitle.length === 0, `每条命令的标题都解析到 cmd.<id> 词条（没有退回裸 id）（失败 ${json(palBadTitle)}）`);
+  const palBadCat = palItems.filter((i) => i.category !== palZh.get(`cmd.cat.${i.id.split(".")[0]}`)).map((i) => i.id);
+  check(palBadCat.length === 0, `分类按 cmd.cat.<id 首段> 推出（${json(palItems.map((i) => [i.id, i.category]))}）`);
+  check(palItems.every((i) => i.category !== palZh.get(palPanel.OTHER_CATEGORY_KEY)), "7 条内置命令都落在自己的分类（没有落到「其它」）");
+  check(palPanel.commandTitle({ id: "z", title: { zh: "直写中文", en: "Literally" } }, palDeps) === "直写中文" && palPanel.commandTitle({ id: "z", title: "pal.title" }, palDeps) === palZh.get("pal.title"), "title 支持双语对象与词条名两种显式覆盖（缺省才按 id 约定）");
+
+  check(palPanel.keyChordLabel("Mod+Shift+Z") === "⇧⌘Z" && palPanel.keyChordLabel("F2") === "F2" && palPanel.keyChordLabel("Delete") === "Delete" && palPanel.keysLabel(["Mod+Z"], "Ctrl") === "CtrlZ", `快捷键弦渲染成平台写法（Mod+Shift+Z → ${palPanel.keyChordLabel("Mod+Shift+Z")}）`);
+  check(palPanel.keysLabel(["Mod+Shift+Z", "Mod+Y"]) === "⇧⌘Z / ⌘Y" && palPanel.keysLabel([]) === "", "多条等价快捷键用 / 连接；无键命令给空串");
+  check(palBy["edit.redo"].keyLabel === "⇧⌘Z / ⌘Y" && palBy["layer.duplicate"].keyLabel === "⌘D" && palBy["layer.rename"].keyLabel === "F2" && palBy["layer.delete"].keyLabel === "Delete / Backspace", `面板展示的快捷键来自 CommandDef.keys（${json(palItems.map((i) => [i.id, i.keyLabel]))}）`);
+  check(palBy["export.run"].keys.length === 0 && palBy["export.run"].needsArg === true, "export.run 无快捷键且标记 needsArg（面板里列出但不可直接执行）");
+
+  const palFilter = (q) => palPanel.filterItems(palItems, q).map((i) => i.id);
+  check(json(palFilter("复制")) === json(["layer.duplicate"]) && json(palFilter("编辑")) === json(["edit.undo", "edit.redo"]), "过滤：中文标题与分类词都能命中");
+  check(json(palFilter("mod+d")) === json(["layer.duplicate"]) && json(palFilter("⌘d")) === json(["layer.duplicate"]), "过滤：快捷键（Mod+D / ⌘D）命中");
+  check(json(palFilter("layer dup")) === json(["layer.duplicate"]) && palFilter("").length === 7 && palFilter("zzz").length === 0, "过滤：空格分词跨字段匹配、空串给全表、无命中给空");
+  check(palPanel.moveSelection(0, 1, 7) === 1 && palPanel.moveSelection(6, 1, 7) === 0 && palPanel.moveSelection(0, -1, 7) === 6, "↑↓ 环绕移动选择");
+  check(palPanel.moveSelection(-1, 1, 7) === 0 && palPanel.moveSelection(-1, -1, 7) === 6 && palPanel.moveSelection(0, 1, 0) === -1, "没有选中时向下取首条 / 向上取末条；空表给 -1");
+
+  // 动态快捷键总览：分类分组 + 只列有键的命令，全部由 CommandDef 生成
+  const palGroups = palPanel.shortcutGroups(palItems);
+  const palGroupRows = palGroups.reduce((n, g) => n + g.rows.length, 0);
+  check(palGroups.length === 3 && palGroupRows === 6, `快捷键总览按分类分组、只列有键的命令（${palGroups.length} 组 / ${palGroupRows} 行，export.run 无键被排除）`);
+  check(palGroups[0].rows[0].id === "edit.undo" && palGroups[0].rows[0].keys === "⌘Z" && palGroups[0].rows[0].title === palZh.get("cmd.edit.undo"), "总览首行 = ⌘Z 撤销（顺序与注册表一致）");
+  check(json(palGroups.map((g) => g.category)) === json(palItems.filter((i) => i.keys.length).map((i) => i.category).filter((c, i, a) => a.indexOf(c) === i)), "分组顺序 = 分类在注册表里首次出现的顺序（同分类归一组，无键命令不建组）");
+  check(palPanel.shortcutGroups([]).length === 0 && palPanel.filterItems([], "x").length === 0, "空表边界：总览与过滤都返回空");
+  check(!/<kbd>/.test(palHtmlSrc) && /<div id="ed-palette-shortcuts"[^>]*><\/div>/.test(palHtmlSrc) && /shortcutGroups\(/.test(palPanelSrc) && /createElement\("kbd"\)/.test(palPanelSrc), "总览容器在 HTML 里是空的，行由注册表在运行时生成（不是第二份手写清单）");
+  check(!/ed-keys/.test(palHtmlSrc), "编辑器 UI 里没有静态快捷键清单（写死那份在 bench 文档页、不在编辑器内，故未动）");
+
+  // 面板的键盘与无障碍契约
+  check(/role="combobox"/.test(palHtmlSrc) && /aria-controls="ed-palette-list"/.test(palHtmlSrc) && /id="ed-palette-list" class="ed-palette-list" role="listbox"/.test(palHtmlSrc), "面板输入框是 combobox、列表是 listbox（aria-activedescendant 指向选项）");
+  check(/setAttribute\("role", "option"\)/.test(palPanelSrc) && /setAttribute\("aria-selected"/.test(palPanelSrc) && /setAttribute\("aria-activedescendant"/.test(palPanelSrc), "选项带 role=option / aria-selected，输入框的 aria-activedescendant 跟随当前项");
+  check(/o\.commands\.exec\(id\);[\s\S]{0,200}?catch/.test(palPanelSrc) && /pal\.runFailed/.test(palPanelSrc), "执行走 registry.exec 且包在 try/catch 里（未知命令只提示不抛）");
+  check(/o\.dialog\.showModal\(\)/.test(palPanelSrc) && /e\.key === "Escape"/.test(palPanelSrc) && /moveSelection\(active, e\.key === "ArrowDown" \? 1 : -1/.test(palPanelSrc) && /if \(!keysOpen && cur\) runItem\(cur\);/.test(palPanelSrc), "面板键盘：Esc 关闭 / ↑↓ 选择 / Enter 执行当前项；打开走 showModal");
+  check(/id="ed-palette-btn"/.test(palHtmlSrc) && /#ed-palette-btn"\)\.onclick = \(\) => ensurePalette\(\)\?\.open\(\)/.test(palMainSrc), "标题栏按钮点开命令面板");
+  check(/\(e\.key\.toLowerCase\(\) === "k"[\s\S]{0,160}?ensurePalette\(\)\?\.toggle\(\)/.test(palMainSrc) && /onChangeLang\(\(\) => commandPalette\?\.refresh\(\)\)/.test(palMainSrc), "⌘K / Ctrl+K 在窗口 keydown 直接开合面板；切语言后重新枚举注册表");
+  const palSynth = palPanel.paletteItem({ id: "x.y", when: () => false, run: () => {} }, palDeps);
+  const palThrows = palPanel.paletteItem({ id: "x.z", when: () => { throw new Error("boom"); }, run: () => {} }, palDeps);
+  check(palSynth.enabled === false && palThrows.enabled === false, "when() 为假或抛错都按「不可用」列出（面板不被插件拖崩）");
+  check(palSynth.title === "x.y" && palSynth.category === palZh.get(palPanel.OTHER_CATEGORY_KEY), "没写 title/category 的命令退回裸 id 与「其它」分类（orphanCommands 正是查这个）");
+
+  // ── C5：图层树无障碍（roving tabindex + 方向键导航） ──
+  check(/<div id="ed-tree" class="wb-panel-body is-scroll ed-tree" role="tree" aria-multiselectable="true">/.test(palHtmlSrc), "图层树容器 role=tree + aria-multiselectable（多选语义保留）");
+  check(/treeEl\.setAttribute\("aria-label", et\("tree\.aria"\)\)/.test(palMainSrc), "树的无障碍名字跟着界面语言走（renderTree 里设 aria-label）");
+  check(/row\.setAttribute\("aria-level", String\(depth \+ 1\)\)/.test(palMainSrc) && /row\.setAttribute\("aria-selected", String\(n\.id === selectedId \|\| extraSel\.has\(String\(n\.id\)\)\)\)/.test(palMainSrc), "treeitem 带 aria-level / aria-selected（选择态与多选集合同源）");
+  check(/if \(n\.children\.length\) row\.setAttribute\("aria-expanded", String\(expanded\)\)/.test(palMainSrc) && /const expanded = !n\.children\.length \|\| \(view\.filtering \|\| !collapsed\.has\(n\.id\)\)/.test(palMainSrc), "有子层的行才带 aria-expanded；展开态 = 过滤中忽略折叠（既有口径不变）");
+  check(/row\.tabIndex = row\.dataset\.id === treeFocusId \? 0 : -1/.test(palMainSrc) && /treeFocusId = firstFocusable\(treeNavRows\(rows\), treeFocusId\)/.test(palMainSrc), "roving tabindex：全树只有焦点行 tabindex=0，焦点行不在视图里时退回第一行");
+  check(/const action = treeNav\(treeNavRows\(rows\), rows\.indexOf\(row\), e\.key\)/.test(palMainSrc) && /if \(!action\) return;/.test(palMainSrc) && /if \(action\.kind === "expand"\) return void setTreeExpanded\(target, true\)/.test(palMainSrc) && /if \(action\.kind === "collapse"\) return void setTreeExpanded\(target, false\)/.test(palMainSrc), "树键盘语义交给 tree-nav.ts；无处可去时不 preventDefault；←→ 改折叠集合后重绘");
+  check(/e\.shiftKey \|\| e\.metaKey \|\| e\.ctrlKey/.test(palMainSrc) && /startTreeDrag\(/.test(palMainSrc) && !/document\./.test(palNavSrc), "既有交互未被吃掉：⇧/⌘ 多选与拖拽改父级仍在；tree-nav.ts 是不碰 DOM 的纯函数");
+  check(/\.ed-tree \.ed-node:focus-visible \{/.test(palCssSrc) && /outline: 2px solid var\(--wb-accent/.test(palCssSrc), "树行有可见焦点样式（键盘导航看得见焦点）");
+
+  // tree-nav.ts 是纯函数：直接喂 fixture 断言键盘语义
+  const palNavRows = [
+    { id: "a", level: 1, hasChildren: true, expanded: true },
+    { id: "a1", level: 2, hasChildren: false, expanded: false },
+    { id: "b", level: 1, hasChildren: true, expanded: false },
+    { id: "c", level: 1, hasChildren: false, expanded: false },
+  ];
+  const palDeep = [
+    { id: "d", level: 1, hasChildren: true, expanded: true },
+    { id: "d1", level: 2, hasChildren: true, expanded: true },
+    { id: "d2", level: 3, hasChildren: false, expanded: false },
+  ];
+  const palNav1 = (i, k) => palNav.treeNav(palNavRows, i, k);
+  check(json(palNav1(0, "ArrowDown")) === json({ kind: "focus", index: 1 }) && json(palNav1(3, "ArrowDown")) === json(null), "↓ 移动焦点到下一行，末行不再动");
+  check(json(palNav1(3, "ArrowUp")) === json({ kind: "focus", index: 2 }) && json(palNav1(0, "ArrowUp")) === json(null), "↑ 移动焦点到上一行，首行不再动");
+  check(json(palNav1(3, "Home")) === json({ kind: "focus", index: 0 }) && json(palNav1(0, "End")) === json({ kind: "focus", index: 3 }) && json(palNav1(0, "Home")) === json(null), "Home / End 到首尾，已在首/尾则不动");
+  check(json(palNav1(2, "Enter")) === json({ kind: "focus", index: 2 }) && json(palNav1(1, " ")) === json({ kind: "focus", index: 1 }), "Enter / 空格确认当前行（返回同一行，由调用方同步选择）");
+  check(json(palNav1(0, "ArrowRight")) === json({ kind: "focus", index: 1 }) && json(palNav1(2, "ArrowRight")) === json({ kind: "expand", index: 2 }), "→ 已展开的分支进第一个子行；未展开的分支先展开");
+  check(json(palNav1(1, "ArrowRight")) === json(null) && json(palNav1(3, "ArrowRight")) === json(null), "→ 在叶子上无处可去（不 preventDefault）");
+  check(json(palNav1(0, "ArrowLeft")) === json({ kind: "collapse", index: 0 }) && json(palNav1(1, "ArrowLeft")) === json({ kind: "focus", index: 0 }) && json(palNav1(2, "ArrowLeft")) === json(null), "← 展开的分支折叠；子行回到父行；根行不再往上");
+  check(json(palNav.treeNav(palDeep, 2, "ArrowLeft")) === json({ kind: "focus", index: 1 }) && json(palNav.treeNav(palDeep, 1, "ArrowLeft")) === json({ kind: "collapse", index: 1 }), "← 在深层叶子回到最近的父行（跳过中间层）");
+  check(json(palNav1(-1, "ArrowDown")) === json(null) && json(palNav1(4, "ArrowDown")) === json(null) && json(palNav1(0, "PageDown")) === json(null) && json(palNav1(0, "a")) === json(null), "越界索引 / 不认的键一律 null");
+  check(palNav.firstFocusable(palNavRows, "b") === "b" && palNav.firstFocusable(palNavRows, "zzz") === "a" && palNav.firstFocusable(palNavRows, null) === "a" && palNav.firstFocusable([], "a") === null, "firstFocusable：焦点行还在就用它，否则退回第一行，空树 null");
+
+  // ── B8：脚本事件模板（8 类生命周期，逐个对上引擎事件名） ──
+  const palLives = ["update", "init", "applyUserProperties", "cursor", "media", "resizeScreen", "animationEvent", "destroy"];
+  check(json([...palScripts.SCRIPT_LIFECYCLES]) === json(palLives), `脚本模板 8 类生命周期齐全且顺序固定（实得 ${json([...palScripts.SCRIPT_LIFECYCLES])}）`);
+  const palTpl = (life) => palScripts.scriptTemplate("text", life);
+  const palBadCompile = palLives.filter((life) => {
+    const r = palCheck(palTpl(life));
+    return !r.ok || r.noEntry;
+  });
+  check(palBadCompile.length === 0, `8 类模板都能编过且都有可派发入口（noEntry = 引擎会整份丢弃脚本）（失败 ${json(palBadCompile)}）`);
+  check(palLives.filter((life) => !palTpl(life).startsWith("'use strict';")).length === 0, "模板以 'use strict'; 开头（沙箱约定）");
+  check(new Set(palLives.map((life) => palTpl(life))).size === 8, "8 类模板两两不同（不是同一份模板换个注释）");
+  const palEntries = (life) => palCheck(palTpl(life)).entries;
+  check(json(palEntries("update")) === json(["update"]), "update（缺省）模板只声明 update 一个入口");
+  const palBadEntries = palLives.filter((life) => {
+    const es = palEntries(life);
+    if (!es.includes("update")) return true;
+    if (life === "destroy") return es.length !== 1;
+    return !es.includes(life === "cursor" ? "cursorClick" : life === "media" ? "mediaLyricsChanged" : life);
+  });
+  check(palBadEntries.length === 0, `每类模板都带上该类入口 + 字段主回调 update（destroy 只有 update）（失败 ${json(palBadEntries)}）`);
+  check(palEntries("cursor").length === 7 && palEntries("media").length === 7, `cursor / media 模板各 6 个回调 + update（实得 ${palEntries("cursor").length} / ${palEntries("media").length}）`);
+  check(/export function destroy\(\)/.test(palTpl("destroy")) && !palEntries("destroy").includes("destroy"), "destroy 保留清理位，但引擎名单里没有它（不会被当成派发入口）");
+
+  // 引擎口径：名单直接从 renderer 源码抽，模板里的入口名必须逐个来自它
+  const palEngineList = (() => {
+    const list = /SCRIPT_ENTRY_NAMES = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(palEngineSrc)?.[1] ?? "";
+    const media = /const MEDIA_CALLBACKS = \[([\s\S]*?)\]/.exec(palEngineSrc)?.[1] ?? "";
+    const lits = (s) => [...s.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]);
+    return [...lits(list), ...lits(media)];
+  })();
+  const palEngineSet = new Set(palEngineList);
+  check(palEngineList.length === 17 && palEngineList[0] === "update" && palEngineSet.has("resizeScreen") && palEngineSet.has("mediaLyricsChanged"), `引擎名单取自 we-scene/render/text.js 的 SCRIPT_ENTRY_NAMES + MEDIA_CALLBACKS（${palEngineList.length} 个）`);
+  const palExported = [...new Set(palLives.flatMap((life) => [...palTpl(life).matchAll(/export function (\w+)\(/g)].map((m) => m[1])))];
+  check(palExported.filter((n) => !palEngineSet.has(n) && n !== "destroy").length === 0, `模板里的入口名逐个来自引擎名单（destroy 是显式的非派发清理位）（生造 ${json(palExported.filter((n) => !palEngineSet.has(n) && n !== "destroy"))}）`);
+  check(json(palExported.slice().sort()) === json([...palEngineSet, "destroy"].sort()), `模板导出名集合 = 引擎 17 个 + destroy（实得 ${palExported.length} 个）`);
+  const palCursorTpl = [...palTpl("cursor").matchAll(/export function (\w+)\(/g)].map((m) => m[1]).filter((n) => n.startsWith("cursor")).sort();
+  const palMediaTpl = [...palTpl("media").matchAll(/export function (\w+)\(/g)].map((m) => m[1]).filter((n) => n.startsWith("media")).sort();
+  check(json(palCursorTpl) === json(palEngineList.filter((n) => n.startsWith("cursor")).sort()), `cursor 模板逐个对上引擎的 cursor* 事件名（${json(palCursorTpl)}）`);
+  check(json(palMediaTpl) === json(palEngineList.filter((n) => n.startsWith("media")).sort()), `media 模板逐个对上引擎的 MEDIA_CALLBACKS（${json(palMediaTpl)}）`);
+  const palCommentLeak = palLives.filter((life) => {
+    const tpl = palTpl(life);
+    return (tpl.match(/\bfunction\s+\w+\s*\(/g) ?? []).length !== (tpl.match(/export function \w+\(/g) ?? []).length;
+  });
+  check(palCommentLeak.length === 0, `模板注释里没出现 function <入口名>(（否则 checkSceneScript 会误判入口）（失败 ${json(palCommentLeak)}）`);
+
+  const palType = (target) => /@param \{(\w+)\} value/.exec(palScripts.scriptTemplate(target))?.[1];
+  check(palType("text") === "String" && palType("visible") === "Boolean" && palType("origin") === "Vec3" && palType("scale") === "Vec3" && palType("angles") === "Vec3" && palType("color") === "Vec3" && palType("opacity") === "Number", `模板 JSDoc 的字段类型按挂点给出（text→${palType("text")} / origin→${palType("origin")} / opacity→${palType("opacity")}）`);
+  const palLegacyBad = ["text", ...palScripts.OBJECT_SCRIPT_FIELDS].filter((t) => json(palCheck(palScripts.scriptTemplate(t)).entries) !== json(["update"]));
+  check(palLegacyBad.length === 0, `单参数 scriptTemplate(target) 仍只产出 update 入口（向后兼容既有判据）（失败 ${json(palLegacyBad)}）`);
+  check(/tpl\.id = "script-template"/.test(palMainSrc) && /for \(const life of SCRIPT_LIFECYCLES\)/.test(palMainSrc) && /o\.textContent = et\(`sc\.tpl\.\$\{life\}`\)/.test(palMainSrc), "脚本面板有生命周期选择入口，选项文案走 sc.tpl.<life> 词条");
+  check(/scriptTemplate\(t, tpl\.value as ScriptLifecycle\)/.test(palMainSrc) && /add\.id = "script-add"/.test(palMainSrc), "新建脚本按选中模板生成；既有 #script-add 入口仍在（headless 判据依赖它）");
+
+  const palNeedI18n = [
+    "pal.title", "pal.tip", "pal.keys", "pal.keysTip", "pal.close", "pal.ph", "pal.hint", "pal.empty",
+    "pal.needArg", "pal.needArgHint", "pal.unavailable", "pal.runFailed",
+    "tree.aria", "tree.expand", "tree.collapse", "sc.tpl", "sc.tplTip",
+    "cmd.cat.edit", "cmd.cat.file", "cmd.cat.layer", "cmd.cat.export", "cmd.cat.other",
+    ...palIds.map((id) => `cmd.${id}`),
+    ...palLives.map((life) => `sc.tpl.${life}`),
+  ];
+  const palMissI18n = palNeedI18n.filter((k) => !palHasBoth(k));
+  check(palMissI18n.length === 0, `M9 新增文案 i18n 中英成对（缺 ${json(palMissI18n)}）`);
+  check(palZh.size === palEn.size && [...palZh.keys()].every((k) => palEn.has(k)), `词典 zh / en 键集合仍然对齐（zh ${palZh.size} / en ${palEn.size}）`);
+  check(palZh.get("pal.hint") !== palEn.get("pal.hint") && palZh.get("tree.aria") !== palEn.get("tree.aria"), "面板提示与树的无障碍名字确实分了中英两版");
+  check(/section\("AM\. M9 命令面板 \/ 无障碍 \/ 脚本事件模板"\)/.test(palHeadSrc), "真浏览器侧有「M9 命令面板 / 无障碍 / 脚本事件模板」用例（--headless 跑）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {
