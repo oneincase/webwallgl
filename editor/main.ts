@@ -2328,6 +2328,8 @@ const ptrXEl = $<HTMLInputElement>("#ptr-x");
 const ptrYEl = $<HTMLInputElement>("#ptr-y");
 const ptrParkEl = $<HTMLButtonElement>("#ptr-park");
 const ptrCenterEl = $<HTMLButtonElement>("#ptr-center");
+const ptrNameEl = $<HTMLInputElement>("#ptr-name");
+const ptrRecEl = $<HTMLButtonElement>("#ptr-rec");
 const ptrStateEl = $<HTMLElement>("#ptr-state");
 
 /** localStorage 只作兜底：隐私模式下取用会抛，拿不到就当没有 */
@@ -2363,7 +2365,20 @@ const pointerStudio = createPointerStudio({
 /** 摆位模式：叠加层临时接管鼠标（pointer-events:auto），与既有的图层拖拽互斥 */
 let ptrParking = false;
 
+/** 叠加层要不要接管鼠标：摆位或录制中；接管期间 engine 自己的鼠标通道收不到事件，由这边主动驱动 */
+const pointerCaptureOn = () => ptrParking || pointerStudio.recording();
+
+function syncPointerCapture() {
+  const on = pointerCaptureOn();
+  overlayEl.style.pointerEvents = on ? "auto" : "none";
+  overlayEl.style.cursor = ptrParking ? "crosshair" : "";
+}
+
 function syncPointerState() {
+  if (pointerStudio.recording()) {
+    ptrStateEl.textContent = et("ptr.recording", { n: pointerStudio.recordingPoints() });
+    return;
+  }
   const p = pointerStudio.parkedPoint();
   ptrStateEl.textContent = p
     ? et("ptr.parkedAt", { x: p.x.toFixed(3), y: p.y.toFixed(3) })
@@ -2372,8 +2387,7 @@ function syncPointerState() {
 
 function setPointerParking(on: boolean) {
   ptrParking = on;
-  overlayEl.style.pointerEvents = on ? "auto" : "none";
-  overlayEl.style.cursor = on ? "crosshair" : "";
+  syncPointerCapture();
   ptrParkEl.textContent = et(on ? "ptr.parkEnd" : "ptr.park");
   syncPointerState();
 }
@@ -2394,16 +2408,19 @@ function pointerDragTo(e: PointerEvent) {
   if (!uv) return null;
   ptrXEl.value = uv.u.toFixed(3);
   ptrYEl.value = uv.v.toFixed(3);
+  // 录制中除了驱动 uniform（接管期间引擎自己收不到鼠标），还采一个带时间戳的点
+  if (pointerStudio.recording()) pointerStudio.record(uv.u, uv.v);
   const p = pointerStudio.place(uv.u, uv.v, { force: true, buttons: e.buttons });
   syncPointerState();
   return p;
 }
 
 overlayEl.addEventListener("pointerdown", (e) => {
-  if (!ptrParking) return;
+  if (!pointerCaptureOn()) return;
   e.stopPropagation();
   e.preventDefault();
-  if (userPlaying) {
+  // 录制中允许在播放态描轨迹（时间戳来自录制时钟）；摆位仍然要求停帧
+  if (ptrParking && userPlaying) {
     log(et("log.ptrNeedPause"), "warn");
     return;
   }
@@ -2411,12 +2428,12 @@ overlayEl.addEventListener("pointerdown", (e) => {
   pointerDragTo(e);
 });
 overlayEl.addEventListener("pointermove", (e) => {
-  if (!ptrParking || !overlayEl.hasPointerCapture(e.pointerId)) return;
+  if (!pointerCaptureOn() || !overlayEl.hasPointerCapture(e.pointerId)) return;
   e.stopPropagation();
   pointerDragTo(e);
 });
 const pointerDragEnd = (e: PointerEvent) => {
-  if (!ptrParking || !overlayEl.hasPointerCapture(e.pointerId)) return;
+  if (!pointerCaptureOn() || !overlayEl.hasPointerCapture(e.pointerId)) return;
   e.stopPropagation();
   overlayEl.releasePointerCapture(e.pointerId);
 };
@@ -2432,7 +2449,25 @@ ptrCenterEl.onclick = () => {
 ptrXEl.oninput = () => parkFromInputs();
 ptrYEl.oninput = () => parkFromInputs();
 
+/** 录制开关：开 = 叠加层接管鼠标开始采点，关 = 成一条命名轨迹（内存 + localStorage 兜底） */
+function togglePointerRecord() {
+  if (!instance) return;
+  if (pointerStudio.recording()) {
+    const track = pointerStudio.stopRecord();
+    if (track) ptrNameEl.value = "";
+  } else {
+    if (ptrParking) setPointerParking(false);
+    pointerStudio.startRecord(ptrNameEl.value);
+    log(et("log.ptrRecordStart"));
+  }
+  ptrRecEl.textContent = et(pointerStudio.recording() ? "ptr.recStop" : "ptr.rec");
+  syncPointerCapture();
+  syncPointerState();
+}
+ptrRecEl.onclick = () => togglePointerRecord();
+
 function closePtrMenu() {
+  if (pointerStudio.recording()) togglePointerRecord();
   ptrMenuEl.hidden = true;
   if (ptrParking) setPointerParking(false);
 }

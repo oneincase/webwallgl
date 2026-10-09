@@ -9,6 +9,10 @@
  * 一切驱动都经 deps.push（生产代码里就是 `instance.pushPointer`）：纯预览态，
  * 不写文档、不进撤销栈。播放中（时钟在走）的摆位会被场景每帧采样覆盖，所以 place 默认拒绝。
  *
+ * 轨迹是**编辑器本机资产**：命名后存在内存里，localStorage（键 POINTER_TRACKS_KEY）只作兜底，
+ * 不进工程文件、不进保存清单。序列化形状 {v,name,duration,points:[{t,x,y}]} 是自洽的，
+ * 反序列化严格校验（坏数据当没有），可以整条搬走 / 手工塞回去。
+ *
  * 【导出边界】`scene.json` 没有指针字段（计划 §6 决策 3）：指针位置只活在引擎运行时 uniform
  * 与这里的内存 / localStorage 轨迹里。离线导出（scene.pkg / zip / 视频）**明确不带指针数据**，
  * 导出器不因为这个模块改行为。判据段 POINTER-STUDIO 断言导出产物里没有指针字段。
@@ -34,6 +38,9 @@ export type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
+/** 宽容取数：缺值、null、空串（数值框清空 / JSON 里写 null）都算「没有」，别让 Number() 把它们变成 0 */
+const num = (v: unknown): number => (v == null || v === "" ? NaN : Number(v));
+
 /** 5 位小数（和关键帧同口径），-0 归零：序列化往返才稳定 */
 export function r5(v: number): number {
   const r = Math.round(v * 1e5) / 1e5;
@@ -43,12 +50,123 @@ export function r5(v: number): number {
 /**
  * 边界钳制：指针坐标是归一化的 [0,1]，非有限值一律当没有（`NaN` 进了 uniform 会毁掉整帧）。
  * 拖到视口外面（letterbox 区域）会得到 <0 或 >1，钳到边上而不是丢弃。
+ * 空字符串 / null（数值框清空、JSON 里写成 null）也当没有：`Number("")` 是 0，那是假坐标。
  */
 export function clampPoint(x: unknown, y: unknown): { x: number; y: number } | null {
-  const nx = Number(x);
-  const ny = Number(y);
+  const nx = num(x);
+  const ny = num(y);
   if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
   return { x: r5(nx < 0 ? 0 : nx > 1 ? 1 : nx), y: r5(ny < 0 ? 0 : ny > 1 ? 1 : ny) };
+}
+
+/**
+ * 把任意来源的点序列洗成可回放的形状：丢非有限值、钳制、t 取整、按 t 升序、
+ * 同一毫秒只留最后一个（一帧里可能来好几个事件）、再把 t 归零到首个采样点。
+ */
+export function normalizePoints(points: ReadonlyArray<unknown>): PointerPoint[] {
+  const out: PointerPoint[] = [];
+  for (const raw of points) {
+    if (!isObj(raw)) continue;
+    const c = clampPoint(raw.x, raw.y);
+    const t = num(raw.t);
+    if (!c || !Number.isFinite(t)) continue;
+    out.push({ t: Math.max(0, Math.round(t)), x: c.x, y: c.y });
+  }
+  out.sort((a, b) => a.t - b.t);
+  const dedup: PointerPoint[] = [];
+  for (const p of out) {
+    const last = dedup[dedup.length - 1];
+    if (last && last.t === p.t) dedup[dedup.length - 1] = p;
+    else dedup.push(p);
+  }
+  const t0 = dedup.length ? dedup[0].t : 0;
+  return dedup.map((p) => ({ t: p.t - t0, x: p.x, y: p.y }));
+}
+
+/** 轨迹时长 = 末点时间（毫秒）；空轨迹 0 */
+export const trackDuration = (points: ReadonlyArray<PointerPoint>): number =>
+  points.length ? points[points.length - 1].t : 0;
+
+/** 点数超上限时等距抽稀（首尾必留）：localStorage 兜底不能塞爆 */
+function decimate(points: PointerPoint[], max: number): PointerPoint[] {
+  if (points.length <= max) return points;
+  const step = (points.length - 1) / (max - 1);
+  const out: PointerPoint[] = [];
+  for (let i = 0; i < max; i++) out.push(points[Math.min(points.length - 1, Math.round(i * step))]);
+  return out;
+}
+
+/** 攒一条轨迹：空点集 → null；duration 由点集重算，不信调用方传进来的 */
+export function makeTrack(name: unknown, points: ReadonlyArray<unknown>): PointerTrack | null {
+  const pts = decimate(normalizePoints(points), MAX_TRACK_POINTS);
+  if (!pts.length) return null;
+  const label = typeof name === "string" && name.trim() ? name.trim() : "pointer";
+  return { v: POINTER_STUDIO_VERSION, name: label, duration: trackDuration(pts), points: pts };
+}
+
+export function serializeTrack(track: PointerTrack): string {
+  return JSON.stringify({ v: POINTER_STUDIO_VERSION, name: track.name, duration: track.duration, points: track.points });
+}
+
+/** 严格解析：不可信输入一律当没有（草案 / localStorage 都可能被手改） */
+export function parseTrack(raw: unknown): PointerTrack | null {
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!isObj(obj) || obj.v !== POINTER_STUDIO_VERSION) return null;
+  if (typeof obj.name !== "string" || !obj.name.trim() || !Array.isArray(obj.points)) return null;
+  const pts = decimate(normalizePoints(obj.points), MAX_TRACK_POINTS);
+  if (!pts.length) return null;
+  return { v: POINTER_STUDIO_VERSION, name: obj.name, duration: trackDuration(pts), points: pts };
+}
+
+export function serializeTracks(tracks: ReadonlyArray<PointerTrack>): string {
+  return JSON.stringify({ v: POINTER_STUDIO_VERSION, tracks });
+}
+
+/** 逐条解析，坏的丢一条不影响其它（用户手改过 localStorage 也要能起来） */
+export function parseTracks(raw: unknown): PointerTrack[] {
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    if (!raw.trim()) return [];
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!isObj(obj) || obj.v !== POINTER_STUDIO_VERSION || !Array.isArray(obj.tracks)) return [];
+  const out: PointerTrack[] = [];
+  for (const one of obj.tracks) {
+    const track = parseTrack(one);
+    if (track) out.push(track);
+  }
+  return out;
+}
+
+export function loadTracks(storage?: StorageLike | null): PointerTrack[] {
+  if (!storage) return [];
+  try {
+    return parseTracks(storage.getItem(POINTER_TRACKS_KEY));
+  } catch {
+    return [];
+  }
+}
+
+/** 写回兜底存储；配额满 / 隐私模式都只返回 false，不掉链子 */
+export function storeTracks(storage: StorageLike | null | undefined, tracks: ReadonlyArray<PointerTrack>): boolean {
+  if (!storage) return false;
+  try {
+    storage.setItem(POINTER_TRACKS_KEY, serializeTracks(tracks));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export type PointerStudioDeps = {
@@ -76,6 +194,14 @@ export function createPointerStudio(deps: PointerStudioDeps) {
   let parked: { x: number; y: number } | null = null;
   /** 最近一次驱动出去的坐标：重挂后补推用 */
   let lastPos: { x: number; y: number } | null = null;
+  /** 已命名轨迹（内存真源；storage 只是兜底） */
+  let tracks: PointerTrack[] = loadTracks(deps.storage);
+  /** 选择器选中的轨迹名 */
+  let activeName: string | null = tracks.length ? tracks[0].name : null;
+  /** 录制会话：起点时钟 + 已采点 */
+  let rec: { startedAt: number; points: PointerPoint[] } | null = null;
+  /** 录制前在名字框里填的名字（空则用默认名） */
+  let recName = "";
 
   function pushAt(p: { x: number; y: number }, buttons = 0) {
     lastPos = { ...p };
@@ -112,12 +238,115 @@ export function createPointerStudio(deps: PointerStudioDeps) {
     return pushAt(p);
   }
 
+  // ---------- 轨迹录制 ----------
+
+  function persist() {
+    storeTracks(deps.storage, tracks);
+  }
+
+  /** 名字是选择器的键（按名选中 / 按名删除），重名会指不清，所以撞了就加序号 */
+  function uniqueName(name: string): string {
+    if (!tracks.some((t) => t.name === name)) return name;
+    let n = 2;
+    while (tracks.some((t) => t.name === `${name} ${n}`)) n++;
+    return `${name} ${n}`;
+  }
+
+  function defaultName(): string {
+    let n = tracks.length + 1;
+    const make = (i: number) => deps.t?.("ptr.defaultName", { n: i }) ?? `pointer ${i}`;
+    while (tracks.some((t) => t.name === make(n))) n++;
+    return make(n);
+  }
+
+  /** 开始录：时间戳从 deps.now() 起算，采到的点是相对起点的毫秒数 */
+  function startRecord(name = ""): boolean {
+    if (rec) return false;
+    rec = { startedAt: deps.now(), points: [] };
+    recName = typeof name === "string" ? name.trim() : "";
+    return true;
+  }
+
+  /** 采一个点（录制中才收）；返回落库的那一点 */
+  function record(x: unknown, y: unknown): PointerPoint | null {
+    if (!rec) return null;
+    const c = clampPoint(x, y);
+    if (!c) return null;
+    if (rec.points.length >= MAX_TRACK_POINTS) return null;
+    const p: PointerPoint = { t: Math.max(0, Math.round(deps.now() - rec.startedAt)), x: c.x, y: c.y };
+    rec.points.push(p);
+    return { ...p };
+  }
+
+  /** 收工：成一条命名轨迹并落到内存 + localStorage 兜底；没采到点就什么也不做 */
+  function stopRecord(): PointerTrack | null {
+    const r = rec;
+    const wanted = recName;
+    rec = null;
+    recName = "";
+    if (!r) return null;
+    const track = makeTrack(uniqueName(wanted || defaultName()), r.points);
+    if (!track) {
+      say("log.ptrNoPoints", undefined, "warn");
+      return null;
+    }
+    tracks = [...tracks, track];
+    activeName = track.name;
+    persist();
+    say("log.ptrRecorded", { name: track.name, n: track.points.length, dur: (track.duration / 1000).toFixed(2) });
+    return track;
+  }
+
+  function cancelRecord() {
+    rec = null;
+    recName = "";
+  }
+
+  function select(name: unknown): string | null {
+    const n = String(name ?? "");
+    if (tracks.some((t) => t.name === n)) activeName = n;
+    else if (!tracks.some((t) => t.name === activeName)) activeName = tracks.length ? tracks[0].name : null;
+    return activeName;
+  }
+
+  function activeTrack(): PointerTrack | null {
+    return tracks.find((t) => t.name === activeName) ?? null;
+  }
+
+  function remove(name?: unknown): boolean {
+    const target = typeof name === "string" && name ? name : activeName;
+    const gone = tracks.find((t) => t.name === target);
+    if (!gone) return false;
+    tracks = tracks.filter((t) => t !== gone);
+    activeName = tracks.length ? tracks[0].name : null;
+    persist();
+    say("log.ptrRemoved", { name: gone.name });
+    return true;
+  }
+
+  const cloneTrack = (t: PointerTrack): PointerTrack => structuredClone(t);
+
   return {
     place,
     release,
     resync,
     parkedPoint: () => (parked ? { ...parked } : null),
     lastSample: () => (lastPos ? { ...lastPos } : null),
+    // 轨迹录制
+    startRecord,
+    record,
+    stopRecord,
+    cancelRecord,
+    recording: () => !!rec,
+    recordingPoints: () => (rec ? rec.points.length : 0),
+    list: () => tracks.map(cloneTrack),
+    select,
+    activeName: () => activeName,
+    activeTrack: () => {
+      const t = activeTrack();
+      return t ? cloneTrack(t) : null;
+    },
+    remove,
   };
 }
 
