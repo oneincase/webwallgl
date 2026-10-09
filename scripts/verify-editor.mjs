@@ -4649,6 +4649,505 @@ section("J. 变异红测");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// M12. 引擎写测：增量装配（B1 / W2b）、GL overlay 通道（B2 / W5）、
+//      单脚本沙箱热替换（B3 / W8）—— 全部离线可跑，不需要浏览器。
+//
+// 这三项的引擎落点都在 renderer/src/scene-mount.ts 那个大 async 闭包里，
+// 离线拿不到；所以把可判的语义拆成纯模块（layer-order / overlay / overlay-gl /
+// script-slot），这里用真模块真跑 + 接线文本断言两层盖住：
+//   - 纯模块：数组手术后数组逐位是什么、线段几何逐位是什么、转发句柄的熔断语义；
+//   - 接线：scene-mount 必须真的用它们（不允许长回内联副本）。
+// 出帧 A/B 属真浏览器判据，在 verify-editor-headless.mjs 的 M12 段。
+// ───────────────────────────────────────────────────────────────────────────
+{
+  section("M12. 引擎写测：增量装配 / GL overlay 通道 / 单脚本沙箱热替换");
+
+  // ── B1 / W2b：图层数组手术（数组顺序即绘制顺序，末尾在最上层） ──
+  const lo = await imp("renderer/src/editor/layer-order.ts");
+  const L = (...ids) => ids.map((id) => ({ id, name: `L${id}` }));
+  const order = (a) => lo.layerIdOrder(a).join(",");
+
+  {
+    const a = L(1, 2, 3);
+    check(
+      lo.insertLayerAt(a, { id: 9 }, 1) === 1 && order(a) === "1,9,2,3",
+      "M12/B1 insertLayerAt 中间插入：返回落点下标，数组序就是绘制序",
+    );
+    lo.insertLayerAt(a, { id: 8 }, 0);
+    check(order(a) === "8,1,9,2,3", "M12/B1 插入位 0 = 最先画（最底）");
+    lo.insertLayerAt(a, { id: 7 }, 99);
+    check(order(a) === "8,1,9,2,3,7", "M12/B1 越界插入位夹到末尾（最后画 = 最上）");
+    check(
+      lo.clampInsertIndex(a, -5) === 0 && lo.clampInsertIndex(a, 99) === a.length,
+      "M12/B1 clampInsertIndex 一律夹到 [0, length]（不拒绝，页面不用自己算边界）",
+    );
+  }
+  {
+    const a = L(1, 2, 3);
+    const d = lo.detachLayer(a, 2);
+    check(
+      !!d && d.index === 1 && d.layer.id === 2 && order(a) === "1,3",
+      "M12/B1 detachLayer 摘除并回报原下标（幂等撤销要用它）",
+    );
+    check(lo.detachLayer(a, 99) === null, "M12/B1 detachLayer 找不到返回 null");
+    const tomb = [...L(4, 5), { id: 5, destroyed: true }];
+    check(lo.layerIndexOf(tomb, 5) === 1, "M12/B1 id 撞上墓碑层时命中活跃层（destroyed 不算数）");
+    check(lo.layerIdOrder(tomb).join(",") === "4,5", "M12/B1 墓碑层不进结构快照");
+    check(lo.layerIndexOf(tomb, 6) === -1, "M12/B1 不存在的 id 返回 -1");
+  }
+  {
+    const a = L(1, 2, 3, 4);
+    check(lo.moveLayerTo(a, 4, 0) === 0 && order(a) === "4,1,2,3", "M12/B1 moveLayerTo 往下搬：先摘后插");
+    check(lo.moveLayerTo(a, 4, 2) === 1 && order(a) === "1,4,2,3", "M12/B1 moveLayerTo 往上搬");
+    check(
+      lo.moveLayerTo(a, 4, 1) === null && order(a) === "1,4,2,3",
+      "M12/B1 目标位与现状等价时空操作返回 null（画面零变化，可跳过出帧）",
+    );
+    check(lo.moveLayerTo(a, 42, 0) === null, "M12/B1 moveLayerTo 找不到返回 null");
+    check(lo.shiftLayer(a, 1, +1) === 1 && order(a) === "4,1,2,3", "M12/B1 shiftLayer +1 = 在数组里往后挪一位（画得更靠上）");
+    check(
+      lo.shiftLayer(a, 4, -1) === null && lo.shiftLayer(a, 4, +1) === 1,
+      "M12/B1 shiftLayer 到底返回 null，到顶仍有位",
+    );
+  }
+  {
+    // 环 + 未知 id：删层收子树绝不能死循环，也不能误伤别的层
+    const a = [
+      { id: 1, childIds: [2, 3] },
+      { id: 2, childIds: [4] },
+      { id: 3, childIds: null },
+      { id: 4, childIds: [2] },
+      { id: 5, childIds: [1] },
+    ];
+    const sub = lo.collectSubtreeIds(a, 1).map(String);
+    check(
+      sub[0] === "1" && sub.length === 4 && new Set(sub).size === 4,
+      "M12/B1 collectSubtreeIds 收整棵子树 + 去重（childIds 成环不死循环）",
+    );
+    check(lo.collectSubtreeIds(a, 3).join(",") === "3", "M12/B1 叶子层子树只含自身");
+    check(lo.collectSubtreeIds(a, 99).join(",") === "99", "M12/B1 未知 id 的子树只有它自己（不误伤）");
+    check(!lo.collectSubtreeIds(a, 1).map(String).includes("5"), "M12/B1 子树只沿 childIds 向下，不扫旁支");
+  }
+
+  // ── B2 / W5：overlay 几何（2D 回退与 GL pass 吃同一份线段） ──
+  const ov = await imp("renderer/src/editor/overlay.ts");
+  {
+    check(
+      ov.normalizeOverlayMode("off") === "off" &&
+        ov.normalizeOverlayMode("2d") === "2d" &&
+        ov.normalizeOverlayMode("gl") === "gl",
+      "M12/B2 normalizeOverlayMode 认三个后端值",
+    );
+    check(
+      ov.normalizeOverlayMode("webgl") === "2d" && ov.normalizeOverlayMode(undefined) === "2d",
+      "M12/B2 非法 / 缺省一律回落 2d（页面现有行为不变）",
+    );
+    check(ov.normalizeOverlayMode(null, "off") === "off", "M12/B2 缺省值可覆盖（视频工程用 off）");
+  }
+  {
+    const corners = [
+      [0, 0],
+      [10, 0],
+      [10, 10],
+      [0, 10],
+    ];
+    const quad = ov.outlineSegments({ corners });
+    check(ov.segmentCount(quad) === 4 && quad.length === 16, "M12/B2 四边形闭合折线 → 4 条 GL_LINES");
+    check(
+      quad[0] === 0 && quad[1] === 0 && quad[2] === 10 && quad[3] === 0,
+      "M12/B2 线段顺序 = 折线顺序，坐标原样透传（CSS 像素、y 向下，翻转留给 GLSL）",
+    );
+    const last = quad.length - 4;
+    check(
+      quad[last] === 0 && quad[last + 1] === 10 && quad[last + 2] === 0 && quad[last + 3] === 0,
+      "M12/B2 末段回到起点（闭合）",
+    );
+    const hull = [
+      [1, 1],
+      [9, 1],
+      [9, 9],
+    ];
+    const byHull = ov.outlineSegments({ corners, hull });
+    check(ov.segmentCount(byHull) === 3 && byHull[0] === 1 && byHull[1] === 1, "M12/B2 hull 优先于 corners（透视场景口径）");
+    check(
+      ov.segmentCount(ov.outlineSegments(null)) === 0 && ov.segmentCount(ov.outlineSegments({ corners: null })) === 0,
+      "M12/B2 无轮廓 → 空数组（引擎不画，页面照旧）",
+    );
+    check(
+      ov.segmentCount(ov.outlineSegments({ corners, hull: [[Number.NaN, 1]] })) === 4,
+      "M12/B2 脏点过滤后仍能用 corners（hull 非法不吞掉轮廓）",
+    );
+  }
+  {
+    const g = ov.gizmoSegments([100, 50], 6);
+    check(ov.segmentCount(g) === 18, "M12/B2 手柄 = 4 个角柄（各 4 段）+ 中心十字（2 段）");
+    const b = ov.segmentsBounds(g);
+    check(
+      !!b && b.minX <= 100 - 18 && b.maxX >= 100 + 18 && b.minY <= 50 - 18 && b.maxY >= 50 + 18,
+      "M12/B2 手柄落在锚点周围（十字臂 3*size、角柄偏 2*size）",
+    );
+    check(ov.segmentCount(ov.gizmoSegments([1, 2], 0)) === 0, "M12/B2 size<=0 不画手柄");
+    check(ov.segmentCount(ov.gizmoSegments(null, 6)) === 0, "M12/B2 无锚点不画手柄");
+    check(ov.segmentsBounds(new Float32Array(0)) === null, "M12/B2 空线段没有包围盒");
+  }
+  {
+    const outline = {
+      anchor: [5, 6],
+      corners: [
+        [0, 0],
+        [10, 0],
+        [10, 10],
+        [0, 10],
+      ],
+    };
+    const only = ov.overlaySegments(outline, { gizmo: false });
+    const both = ov.overlaySegments(outline, { gizmo: true, gizmoSize: 6 });
+    const wantOnly = ov.outlineSegments(outline);
+    check(
+      only.length === wantOnly.length && only.every((v, i) => v === wantOnly[i]),
+      "M12/B2 gizmo:false 时输出与轮廓逐位一致（2D 回退口径）",
+    );
+    check(
+      both.length === only.length + ov.gizmoSegments([5, 6], 6).length,
+      "M12/B2 gizmo:true 时是「轮廓 + 手柄」的拼接",
+    );
+    check(
+      only.every((v, i) => both[i] === v),
+      "M12/B2 拼接把轮廓放在前缀且逐位不变（A/B 差分只落在手柄那一段）",
+    );
+    check(
+      ov.segmentCount(ov.overlaySegments(null, { gizmo: true })) === 0 &&
+        ov.segmentCount(ov.overlaySegments({ anchor: [1, 1] })) === 0,
+      "M12/B2 只有锚点没有轮廓时 gizmo:false 不画（与页面 select 高亮口径一致）",
+    );
+    check(
+      ov.segmentCount(ov.overlaySegments({ anchor: [1, 1] }, { gizmo: true })) === 18,
+      "M12/B2 轮廓被裁掉但锚点还在时手柄仍画（子层被父级裁掉也要能拖）",
+    );
+  }
+
+  // ── B2：真 GL pass（记账用的假 GL：只记调用，不真开上下文） ──
+  const glmod = await imp("renderer/src/editor/overlay-gl.ts");
+  {
+    const failPass = glmod.createOverlayPass(null);
+    check(!failPass.ok && failPass.reason === "no-gl", "M12/B2 没有 GL 上下文时 pass.ok=false、reason=no-gl");
+    check(
+      failPass.draw(new Float32Array([0, 0, 1, 1]), { width: 10, height: 10 }) === 0 && failPass.frames === 0,
+      "M12/B2 pass 不可用时 draw 恒返回 0（调用方走 2D 回退，不抛错）",
+    );
+    failPass.dispose();
+
+    const MAINPROG = { kind: "main-program" };
+    const MAINBUF = { kind: "main-buffer" };
+    const C = {
+      VERTEX_SHADER: 1,
+      FRAGMENT_SHADER: 2,
+      COMPILE_STATUS: 3,
+      LINK_STATUS: 4,
+      CURRENT_PROGRAM: 10,
+      ARRAY_BUFFER_BINDING: 11,
+      DEPTH_TEST: 20,
+      BLEND: 21,
+      SCISSOR_TEST: 22,
+      CULL_FACE: 23,
+      FRAMEBUFFER: 30,
+      ARRAY_BUFFER: 31,
+      DYNAMIC_DRAW: 32,
+      FLOAT: 33,
+      LINES: 34,
+    };
+    const nameOf = (k) => Object.keys(C).find((n) => C[n] === k);
+    const st = {
+      compiled: 0,
+      linked: 0,
+      program: MAINPROG,
+      buffer: MAINBUF,
+      enabled: new Set(["DEPTH_TEST", "BLEND", "CULL_FACE"]),
+      viewports: [],
+      bufferDatas: [],
+      uniforms: {},
+      attribPointer: null,
+      draws: [],
+      deleted: { shader: 0, buffer: 0, program: 0 },
+    };
+    const gl = { ...C, drawingBufferWidth: 1280, drawingBufferHeight: 720 };
+    gl.createShader = () => ({ kind: "shader" });
+    gl.shaderSource = () => {};
+    gl.compileShader = () => {
+      st.compiled++;
+    };
+    gl.getShaderParameter = () => true;
+    gl.getShaderInfoLog = () => "";
+    gl.deleteShader = () => {
+      st.deleted.shader++;
+    };
+    gl.createProgram = () => ({ kind: "program" });
+    gl.attachShader = () => {};
+    gl.linkProgram = () => {
+      st.linked++;
+    };
+    gl.getProgramParameter = () => true;
+    gl.getProgramInfoLog = () => "";
+    gl.getAttribLocation = () => 0;
+    gl.getUniformLocation = () => ({ kind: "uniform" });
+    gl.createBuffer = () => ({ kind: "buffer" });
+    gl.deleteBuffer = () => {
+      st.deleted.buffer++;
+    };
+    gl.deleteProgram = () => {
+      st.deleted.program++;
+    };
+    gl.getParameter = (k) => (k === C.CURRENT_PROGRAM ? st.program : st.buffer);
+    gl.isEnabled = (k) => st.enabled.has(nameOf(k));
+    gl.bindFramebuffer = () => {};
+    gl.viewport = (x, y, w, h) => st.viewports.push([x, y, w, h]);
+    gl.disable = (k) => st.enabled.delete(nameOf(k));
+    gl.enable = (k) => st.enabled.add(nameOf(k));
+    gl.useProgram = (p) => {
+      st.program = p;
+    };
+    gl.bindBuffer = (_t, b) => {
+      st.buffer = b;
+    };
+    gl.bufferData = (_t, data) => st.bufferDatas.push(data);
+    gl.enableVertexAttribArray = () => {};
+    gl.vertexAttribPointer = (...a) => {
+      st.attribPointer = a;
+    };
+    gl.uniform2f = (_l, a, b) => {
+      st.uniforms.uViewport = [a, b];
+    };
+    gl.uniform1f = (_l, a) => {
+      st.uniforms.uDepth = a;
+    };
+    gl.uniform4f = (_l, ...c) => {
+      st.uniforms.uColor = c;
+    };
+    gl.drawArrays = (mode, first, count) => st.draws.push({ mode, first, count });
+
+    const pass = glmod.createOverlayPass(gl);
+    check(pass.ok && pass.reason === "" && pass.frames === 0, "M12/B2 假 GL 下 pass 建立成功（着色器编译 + 链接一次）");
+    check(st.compiled === 2 && st.linked === 1, "M12/B2 顶点 / 片元着色器各编一次、程序链一次（不每次 draw 重建）");
+
+    check(
+      pass.draw(new Float32Array(0), { width: 320, height: 180 }) === 0 &&
+        pass.draw(new Float32Array([1, 2]), { width: 320, height: 180 }) === 0 &&
+        pass.draw(new Float32Array([0, 0, 1, 1]), { width: 0, height: 0 }) === 0 &&
+        st.draws.length === 0 &&
+        pass.frames === 0,
+      "M12/B2 空线段 / 退化 viewport 一律不 draw（不影响主渲染那一帧）",
+    );
+
+    const seg = new Float32Array([0, 0, 10, 0, 10, 0, 10, 10, 10, 10, 0, 10, 0, 10, 0, 0]);
+    const n = pass.draw(seg, { width: 320, height: 180 });
+    check(n === 4 && pass.frames === 1, "M12/B2 draw 返回实际提交的线段数，frames 自增");
+    check(
+      st.draws.length === 1 && st.draws[0].mode === C.LINES && st.draws[0].first === 0 && st.draws[0].count === 8,
+      "M12/B2 一次 drawArrays(LINES, 0, 顶点数) 交完（顶点数 = 浮点长度/2）",
+    );
+    check(
+      st.viewports.length === 1 && st.viewports[0][2] === 1280 && st.viewports[0][3] === 720,
+      "M12/B2 viewport 用 drawingBuffer 的设备像素口径（DPR 仍在它身上）",
+    );
+    check(
+      !!st.uniforms.uViewport && st.uniforms.uViewport[0] === 320 && st.uniforms.uViewport[1] === 180,
+      "M12/B2 线段坐标按 CSS 像素交给 shader 换算（几何口径与 2D canvas 一致）",
+    );
+    check(
+      st.uniforms.uDepth === 0 && Array.isArray(st.uniforms.uColor) && st.uniforms.uColor.length === 4,
+      "M12/B2 深度与颜色走 uniform（默认 z=0、琥珀色）",
+    );
+    check(
+      st.program === MAINPROG && st.buffer === MAINBUF,
+      "M12/B2 画完把主渲染的 program / ARRAY_BUFFER 绑定原样放回",
+    );
+    check(
+      st.enabled.has("DEPTH_TEST") &&
+        st.enabled.has("BLEND") &&
+        st.enabled.has("CULL_FACE") &&
+        !st.enabled.has("SCISSOR_TEST"),
+      "M12/B2 画完把 DEPTH_TEST / BLEND / CULL_FACE 还原（overlay 自己关的开关不留到下一帧）",
+    );
+    check(
+      !!st.attribPointer && st.attribPointer[1] === 2 && st.attribPointer[2] === C.FLOAT && st.attribPointer[5] === 0,
+      "M12/B2 顶点属性 2 分量 float、stride/offset 为 0",
+    );
+
+    pass.draw(seg, { width: 320, height: 180 });
+    check(st.compiled === 2 && st.linked === 1 && pass.frames === 2, "M12/B2 第二次 draw 不重新编译着色器（每帧成本只有一次 drawArrays）");
+
+    pass.dispose();
+    check(
+      st.deleted.shader === 2 && st.deleted.buffer === 1 && st.deleted.program === 1,
+      "M12/B2 dispose 释放两个 shader / 一个 buffer / 一个 program",
+    );
+    const before = st.draws.length;
+    check(pass.draw(seg, { width: 320, height: 180 }) === 0 && st.draws.length === before, "M12/B2 dispose 之后 draw 成为空操作（切回 2D 不抛错）");
+    pass.dispose();
+    check(st.deleted.shader === 2, "M12/B2 重复 dispose 幂等");
+  }
+
+  // ── B3 / W8：单脚本沙箱热替换（转发句柄 + 熔断状态跟着新沙箱） ──
+  const slotMod = await imp("renderer/src/editor/script-slot.ts");
+  const wtextMod = await imp("renderer/vendor/we-scene/render/text.js");
+  {
+    // 负对照：Object.assign 式的「热替换」为什么不行 —— 沙箱内部对
+    // sandbox.disabled 的写入落在**新沙箱自己**身上，宿主读的旧句柄永远是 false。
+    const a = wtextMod.evalObjectScript("export function update(v) { throw new Error('boom') }", {}, {});
+    const naive = Object.assign({}, a);
+    for (let i = 0; i < 3; i++) naive.callUpdate(1);
+    check(
+      !!a && a.disabled === true && naive.disabled === false,
+      "M12/B3 负对照：Object.assign 式热替换让宿主读到的 disabled 恒为 false（5 错熔断失效）—— 所以必须用转发句柄",
+    );
+  }
+  {
+    const registered = [];
+    const activated = [];
+    const cleared = [];
+    let skipped = 0;
+    const src = (mark) => `export function update(value) { return ${mark}; }`;
+    const slot = slotMod.createScriptSlot({
+      layer: { id: 7, name: "L7" },
+      target: "origin",
+      build: (code) => wtextMod.evalObjectScript(code, {}, {}),
+      activate: (sb, first) => activated.push({ sb, first }),
+      host: {
+        register: (sb) => registered.push(sb),
+        clearIssues: (id, t) => cleared.push(`${id}|${t}`),
+        countSkipped: () => {
+          skipped++;
+        },
+      },
+    });
+    check(!!slot.sandbox && slot.current === null, "M12/B3 挂点建好就先有稳定句柄（未换源码时指向停用态）");
+    check(slot.sandbox.disabled === true, "M12/B3 未求值过的句柄读到停用态（登记表持有它也不会误跑）");
+
+    check(slot.swap(src(1)) === true, "M12/B3 首次换源码成功");
+    const held = slot.sandbox; // 装配期登记进各队列的那一份引用
+    check(
+      registered.length === 1 && registered[0] === held && activated.length === 1 && activated[0].first === true,
+      "M12/B3 首次：先登记句柄再激活，且激活拿到的就是那份稳定句柄",
+    );
+    check(cleared.join(";") === "7|origin", "M12/B3 换源码时按「图层|挂点」撤掉上一代结构化报错");
+    check(held.disabled === false && held.hasUpdate === true && held.callUpdate(0) === 1, "M12/B3 换源码后句柄立刻指向新一代求值结果");
+
+    check(slot.swap("export function update(v) { throw new Error('boom') }") === true, "M12/B3 换成每帧抛错的脚本");
+    for (let i = 0; i < 3; i++) held.callUpdate(1);
+    check(held.disabled === true && held.errCount >= 3, "M12/B3 5 错上限语义：逐帧抛错累计后熔断，且宿主持有的旧引用**当场读到** disabled=true");
+
+    check(slot.swap(src(2)) === true, "M12/B3 熔断后再热替换一次");
+    check(
+      held.disabled === false && held.errCount === 0,
+      "M12/B3 换源码后熔断状态跟着新沙箱重新起算（旧引用读到的也是新状态）",
+    );
+    check(
+      held.callUpdate(0) === 2 && held.hasUpdate === true,
+      "M12/B3 旧引用调到的是**新实现**（函数每次调用重新解析，登记表一个都不用改）",
+    );
+    check(
+      registered.length === 1 && activated.length === 3 && activated[2].first === false,
+      "M12/B3 只有首次登记（identity 不变），后续替换只走激活且 first=false",
+    );
+    check(cleared.length === 3, "M12/B3 每次成功替换都清一次该挂点的旧报错");
+
+    const goodRef = held.callUpdate(0);
+    check(slot.swap("export function update(v) {") === false, "M12/B3 编不过的源码 swap 返回 false");
+    check(slot.current !== null && held.callUpdate(0) === goodRef, "M12/B3 编不过时旧沙箱保持不动（字段仍按上一版求值）");
+    check(slot.swap("const x = 1;") === false, "M12/B3 没有可派发 export 的源码同样拒绝");
+    check(skipped === 2, "M12/B3 拒绝的挂点按装配期同一口径计入 skippedScripts");
+    check(activated.length === 3, "M12/B3 拒绝时不激活、不登记（登记表不变）");
+    check(
+      slot.swap("") === false && skipped === 2,
+      "M12/B3 空串走引擎的 skipped 口径（纯空白由 setLayerScript 归一成「摘挂点」，不到这一层）",
+    );
+
+    // 停用：拆层时把 current 置空，已登记的引用必须整体转为 no-op 而不是抛错
+    slot.current = null;
+    check(
+      held.disabled === true &&
+        held.callUpdate(1) === undefined &&
+        held.callCursor(1, 2) === undefined &&
+        held.callMedia("x", {}) === undefined &&
+        held.callResize() === undefined,
+      "M12/B3 拆层后 same 句柄转停用态：所有回调 no-op、不抛 TypeError",
+    );
+    let threw = false;
+    try {
+      held.engine.runtime = 1;
+      held.applyUserProperties({});
+    } catch {
+      threw = true;
+    }
+    check(!threw, "M12/B3 停用态下宿主每帧的 engine 回填 / 属性套用都不炸");
+  }
+
+  // ── 接线断言：引擎侧必须真用这些纯模块（不允许长回内联副本） ──
+  {
+    const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const slotSrc = fs.readFileSync(path.join(ROOT, "renderer/src/editor/script-slot.ts"), "utf8");
+    check(
+      smSrc.includes("from \"./editor/layer-order\"") &&
+        smSrc.includes("from \"./editor/overlay\"") &&
+        smSrc.includes("from \"./editor/overlay-gl\"") &&
+        smSrc.includes("from \"./editor/script-slot\""),
+      "M12 接线：scene-mount 从四个纯模块取实现（结构手术 / 几何 / GL pass / 脚本挂点）",
+    );
+    check(
+      /const slot = makeScriptSlot\(\s*layer,\s*"text",/.test(smSrc) &&
+        /const slot = makeScriptSlot\(\s*layer,\s*`effects\[\$\{ei\}\]\.visible`,/.test(smSrc) &&
+        /const slot = makeScriptSlot\(\s*layer,\s*field,/.test(smSrc) &&
+        smSrc.includes("setLayerScript(id: number | string, target: string, code: string)"),
+      "M12/B3 接线：文字 / effects[i].visible / 对象字段三类挂点都走同一套热替换挂点，并有 setLayerScript 出口",
+    );
+    check(
+      smSrc.includes("const slot = editorScriptSlots.find((s) => s.layer === l && s.target === target)") &&
+        smSrc.includes("slot.swap(text)") &&
+        smSrc.includes("slot.current = null;"),
+      "M12/B3 setLayerScript 按「图层 + 挂点」找槽位并只换这一代求值结果（不重挂场景）",
+    );
+    check(
+      /createScriptSlot\s*\(\s*\{\s*layer,\s*target,\s*build,\s*activate,\s*host:\s*scriptSlotHost\s*\}\s*\)/.test(smSrc) &&
+        smSrc.includes("register: (sb) => propSandboxes.push(sb)"),
+      "M12/B3 接线：宿主只提供登记 / 撤报错 / 计跳过三件事，沙箱仍在引擎侧求值",
+    );
+    check(
+      !/\bnew Function\b|\beval\s*\(/.test(slotSrc),
+      "M12/B3 安全边界：script-slot 不自己求值（transform / 形参表 / 严格模式仍由引擎沙箱唯一提供）",
+    );
+    check(
+      smSrc.includes("const textEnv = () => (") &&
+        smSrc.includes("const makeEnv = () => (") &&
+        smSrc.includes("const activateObjectScript = (sandbox: any) =>") &&
+        smSrc.includes("const activateEffectVisible = (sandbox: any) =>"),
+      "M12/B3 接线：三处挂点都是「同一份 env 工厂 + 具名激活函数」，与首次装配共用一条路径",
+    );
+    check(
+      smSrc.includes("const sceneJsonRaw = JSON.parse(readText(sceneEntry)) as Record<string, unknown>") &&
+        smSrc.includes("scn.parseScene(sceneJsonRaw, project)"),
+      "M12/B1 接线：单对象重解析复用装配期读到的 scene.json 原文",
+    );
+    check(
+      smSrc.includes("addLayer(spec: EditorLayerAddSpec): Promise<EditorLayer>") &&
+        smSrc.includes("removeLayer(id: number | string): Promise<void>") &&
+        smSrc.includes("reorderLayer(id: number | string, toIndex: number): Promise<void>") &&
+        smSrc.includes("canHotAddLayer(spec: EditorLayerAddSpec): EditorHotAddCheck") &&
+        smSrc.includes("setOverlayMode(mode: EditorOverlayMode): Promise<EditorOverlayMode>") &&
+        smSrc.includes("getOverlayStats(): EditorOverlayStats") &&
+        smSrc.includes("setOverlayTarget(id: number | string | null)"),
+      "M12 接线：EditorControls 面暴露增量装配与 overlay 后端切换",
+    );
+    const editorSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/editor.ts"), "utf8");
+    check(
+      ["EditorLayerAddSpec", "EditorHotAddCheck", "EditorOverlayMode", "EditorOverlayStats"].every((n) =>
+        editorSrc.includes(n),
+      ),
+      "M12 出口：四个新公开类型都从 renderer/src/api/editor 出去（页面不许 import 深层实现）",
+    );
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {

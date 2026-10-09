@@ -21,6 +21,12 @@ import {
   type OverlayMode,
 } from "./editor/overlay";
 import { createOverlayPass, type OverlayPass } from "./editor/overlay-gl";
+// M12 / W8：脚本挂点热替换的转发句柄与 swap 语义（纯逻辑，离线可驱动）。
+import {
+  createScriptSlot,
+  type EditorScriptSlot,
+  type ScriptSlotHost,
+} from "./editor/script-slot";
 import type {
   EditorControls,
   EditorHotAddCheck,
@@ -896,85 +902,13 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 热替换只换句柄背后那一代求值结果。于是那些登记表一个都不用改 —— 这正是
       // 不重建场景就能换脚本的关键，也让「换源码后所有回调仍指向同一个物理对象」
       // 与「熔断状态跟着新沙箱」同时成立。
-      type EditorScriptSlot = {
-        layer: any;
-        target: string;
-        /** 当前源码（仅在成功替换后更新） */
-        code: string;
-        /** 这一代求值结果；null = 已停用（字段停在快照值） */
-        current: any;
-        /** 稳定转发句柄（identity 不变，永远指向 current） */
-        sandbox: any;
-        /** 用新源码重新求值；失败返回 false 且保持旧沙箱不动 */
-        swap: (code: string) => boolean;
-      };
-      const editorScriptSlots: EditorScriptSlot[] = [];
       // M12 / B1：图层拆除钩子。装配期有些登记表（文字挂件、跨层文本表）在**装配块
       // 内部**声明，引擎控制面在块外够不着 —— 这里留一个 6 空格作用域的登记表，
       // 由块内部把自己的清理逻辑注册进来。热删层时逐个调用。
       const layerTeardownHooks: Array<(ids: Set<unknown>, effects: Set<unknown>) => void> = [];
-      // 停用态：所有登记表都可能持有句柄并按 `.disabled` 提前 continue。
-      // 这里给全回调一个 no-op 兜底，避免「已停用但仍被调用」抛 TypeError。
-      const DISABLED_SANDBOX: Record<string, unknown> = {
-        disabled: true,
-        hasUpdate: false,
-        hasCursorHook: false,
-        hasMediaHook: false,
-        hasResizeHook: false,
-        hasApplyHook: false,
-        hasAnimEventHook: false,
-        errCount: 0,
-        engine: { frametime: 0, runtime: 0, screenResolution: { x: 0, y: 0 }, timeOfDay: 0 },
-        thisLayer: {},
-      };
-      for (const fn of [
-        "init",
-        "applyUserProperties",
-        "callUpdate",
-        "callCursor",
-        "callMedia",
-        "callResize",
-        "callAnimEvent",
-      ]) {
-        DISABLED_SANDBOX[fn] = () => undefined;
-      }
-      /** 转发句柄：属性读写与调用一律透到最新一代；函数调用每次都重新取，
-       *  这样「热替换后旧引用还能调到新实现」不需要任何登记表配合。 */
-      const forwardSandbox = (get: () => any): any =>
-        new Proxy(
-          {},
-          {
-            get: (_t, k) => {
-              const cur = get();
-              if (!cur) return undefined;
-              const v = cur[k];
-              if (typeof v !== "function") return v;
-              return (...args: unknown[]) => {
-                const now = get();
-                if (!now || typeof now[k] !== "function") return undefined;
-                return now[k](...args);
-              };
-            },
-            set: (_t, k, v) => {
-              const cur = get();
-              if (cur) cur[k] = v;
-              return true;
-            },
-            has: (_t, k) => {
-              const cur = get();
-              return !!cur && k in cur;
-            },
-            ownKeys: () => {
-              const cur = get();
-              return cur ? Reflect.ownKeys(cur) : [];
-            },
-            getOwnPropertyDescriptor: (_t, k) => {
-              const cur = get();
-              const d = cur ? Object.getOwnPropertyDescriptor(cur, k) : undefined;
-              return d ? { ...d, configurable: true } : undefined;
-            },
-          },
-        );
+      // M12 / W8：可热替换的脚本挂点登记表。句柄与 swap 语义在 editor/script-slot.ts
+      // （纯逻辑、可离线驱动）：这里只提供宿主侧的三件事 —— 首次登记、撤旧报错、计跳过。
+      const editorScriptSlots: EditorScriptSlot[] = [];
       // 编辑器脚本面板（W8）：脚本错误按「图层 + 挂点」结构化登记（诊断流文案照旧），
       // 每次装配从空开始 —— 编辑器改脚本后重挂即拿到新脚本的错误。
       const scriptIssues = new Map<string, EditorScriptIssue>();
@@ -1014,48 +948,24 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       };
       const evalObjectScript: typeof wtext.evalObjectScript = scriptsOff ? skipScript : wtext.evalObjectScript;
       const evalTextScript: typeof wtext.evalTextScript = scriptsOff ? skipScript : wtext.evalTextScript;
-      /**
-       * M12 / W8：登记一个可热替换的脚本挂点。
-       *
-       * @param build    用**同一份 env** 重新求值的闭包（安全边界的唯一来源）
-       * @param activate 首次装配与热替换共用的「init + 回调登记 + 进求值队列」，
-       *                 带 first 标志：首次要把 init 体推迟到两阶段末端，热替换立刻跑
-       */
+      const scriptSlotHost: ScriptSlotHost = {
+        register: (sb) => propSandboxes.push(sb),
+        clearIssues: (layerId, target) => {
+          const prefix = `${layerId}|${target}|`;
+          for (const k of [...scriptIssues.keys()]) if (k.startsWith(prefix)) scriptIssues.delete(k);
+        },
+        countSkipped: () => {
+          skippedScripts++;
+        },
+      };
+      /** M12 / W8：登记一个可热替换的脚本挂点（换源码只重建这一代的求值结果，
+       *  已登记的引用仍指向同一物理句柄；语义与失败口径见 editor/script-slot.ts）。 */
       const makeScriptSlot = (
         layer: any,
         target: string,
         build: (code: string) => any,
         activate: (sb: any, first: boolean) => void,
-      ): EditorScriptSlot => {
-        const slot: EditorScriptSlot = {
-          layer,
-          target,
-          code: "",
-          current: null,
-          sandbox: null,
-          swap(code: string) {
-            const fresh = build(code);
-            if (!fresh) {
-              // 与装配期同一口径：编不过 / 无 export 就走 skippedScripts 计数
-              if (typeof code === "string" && code) skippedScripts++;
-              return false;
-            }
-            const first = !slot.current;
-            slot.current = fresh;
-            slot.code = code;
-            if (first) propSandboxes.push(slot.sandbox);
-            // 旧一代的错误先撤掉：换源码后「5 错上限」重新起算，
-            // 脚本面板上残留的上一版报错必须一起消失（否则用户改对了还红着）。
-            const prefix = `${typeof layer?.id === "number" ? layer.id : null}|${target}|`;
-            for (const k of [...scriptIssues.keys()]) if (k.startsWith(prefix)) scriptIssues.delete(k);
-            activate(slot.sandbox, first);
-            return true;
-          },
-        };
-        slot.sandbox = forwardSandbox(() => slot.current || DISABLED_SANDBOX);
-        editorScriptSlots.push(slot);
-        return slot;
-      };
+      ): EditorScriptSlot => createScriptSlot({ layer, target, build, activate, host: scriptSlotHost });
       // component 对象（真·内置组件，本机库 0 个）暂不渲染；文字对象走完整渲染路径
       if (SKIP_COMPONENTS) {
         scene.layers = scene.layers.filter((l: any) => {
