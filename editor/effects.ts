@@ -57,6 +57,10 @@ export type EffectDef = {
   prefix?: string;
   title?: string | Record<string, string>;
   category?: string;
+  /** 原作者署名（改写 / 移植自他人作品的效果必填）；检视器显示「作者：<author>」 */
+  author?: string | Record<string, string>;
+  /** 作者与出处说明（版权声明）；面板里跟在署名行后面整段显示 */
+  note?: string | Record<string, string>;
   /** 多 pass：给出时按它生成全部 pass（passes[0].frag 应与 frag 相同） */
   passes?: readonly EffectPass[];
   fbos?: readonly EffectFbo[];
@@ -130,7 +134,10 @@ export function defineEffect(spec: EffectSpec): EffectDef {
 }
 
 // ── 磁流体（cuiliuti）─────────────────────────────────────────────────────
-// 重写自 0ran/HopeMafei 分享的 WE 自定义 shader：raymarching 一团 smin 软融合的
+// 原作作者：Hope麻匪（HopeMafei）—— Wallpaper Engine 社区创作者，分享的 WE 自定义
+// shader「磁流体」（0ran 收录）。版权与出处见本效果的 author / note 字段（面板署名行
+// 与写进工程的 effect.json 描述同源）。
+// 本仓重写：raymarching 一团 smin 软融合的
 // 小球成黑色铁磁流体，菲涅尔边缘光 + 双高光 + 左右渐变。helper 函数（map/March/AO…）
 // 要引用 uniform，而 def() 的 extra 段排在 uniform 声明之前放不下，所以这条不走
 // def()：uniform 声明仍由 uniforms() 从参数表生成（shader 与面板同源），函数体
@@ -475,8 +482,16 @@ export const EFFECTS: readonly EffectDef[] = [
   ),
   {
     id: "cuiliuti",
+    author: "Hope麻匪（HopeMafei）",
+    // 署名说明：写进面板（检视器）与工程里的 effect.json description，两处同源
+    note: {
+      zh: "原作者：Hope麻匪（HopeMafei）。Wallpaper Engine 社区创作者，公开分享的「磁流体」自定义 shader（0ran 收录）。本仓按原 shader 重写为 WebWallGL 效果并补齐滑杆 + 中英文文案：相同参数下观感与原作一致。",
+      en: "Original author: Hope麻匪 (HopeMafei), a Wallpaper Engine community creator who publicly shared the \"Ferrofluid\" custom shader (collected by 0ran). Reimplemented here as a WebWallGL effect with sliders and zh / en labels: it looks the same as the original for the same settings.",
+    },
     params: CUILIUTI_PARAMS,
     frag: `// WebWallGL 编辑器内置效果：cuiliuti（磁流体）
+// 原作作者：Hope麻匪（HopeMafei）—— WE 社区创作者，公开分享的「磁流体」自定义 shader
+// 版权与出处：见 effect.json 的备注 / 本仓 README「效果署名与致谢」
 ${HEAD}uniform float g_Time;
 uniform vec2 g_TexelSize;
 ${uniforms(CUILIUTI_PARAMS)}
@@ -525,8 +540,22 @@ export function effectIdOf(file: unknown): string | null {
 /** 写进工程前的 shader 源码加工：编辑器片段 include 内联展开（WE 自己的 include 不动） */
 const shaderTransform = (src: string) => expandShader(src);
 
+/** 署名说明取当前语言：单字符串直用，双语表按主语言挑（缺了回落 en / zh / 第一项） */
+export function effectNote(nd: EffectDef, lang = "zh"): string {
+  const v = nd.note;
+  if (!v) return "";
+  if (typeof v === "string") return v;
+  const base = (l: string) => l.split(/[-_]/)[0].toLowerCase();
+  const pick = (l: string) => {
+    if (v[l] !== undefined) return v[l];
+    const k = Object.keys(v).find((x) => base(x) === base(l));
+    return k === undefined ? undefined : v[k];
+  };
+  return pick(lang) ?? pick("en") ?? pick("zh") ?? Object.values(v)[0] ?? "";
+}
+
 /** 一个效果写进工程的文件：effect.json + 每个 pass 的材质 / frag / vert */
-export function effectFiles(d: EffectDef): Array<{ name: string; data: Uint8Array }> {
+export function effectFiles(d: EffectDef, lang = "zh"): Array<{ name: string; data: Uint8Array }> {
   const enc = new TextEncoder();
   const dir = effectDirOf(d);
   const passes: EffectPass[] = d.passes?.length ? [...d.passes] : [{ frag: d.frag, vert: d.vert }];
@@ -544,6 +573,12 @@ export function effectFiles(d: EffectDef): Array<{ name: string; data: Uint8Arra
     }),
   };
   if (d.fbos?.length) effect.fbos = d.fbos.map((f) => ({ name: f.name, scale: f.scale ?? 1, format: f.format ?? "rgba8888" }));
+  // 有署名说明的效果（改写 / 移植自他人作品的）把说明写进 description：工程自包含地带着版权与出处
+  const note = effectNote(d, lang);
+  if (note) {
+    const author = typeof d.author === "string" ? d.author : "";
+    effect.description = author ? `${note}\n作者 / Author：${author}` : note;
+  }
   effect.dependencies = names.flatMap((n, i) => [materials[i], `shaders/effects/${n}.frag`, `shaders/effects/${n}.vert`]);
   const out = [{ name: `effects/${dir}/effect.json`, data: enc.encode(JSON.stringify(effect, null, 2)) }];
   passes.forEach((p, i) => {

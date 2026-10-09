@@ -10,6 +10,9 @@ dist/
 # 应用组装目录（scripts/build-app.mjs）与桌面安装包（electron-builder）
 app/
 release/
+# 打包时下载的第三方二进制（scripts/fetch-media-bridge.mjs，落在仓库根的 vendor/）
+# 注意：必须锚定根目录——写成 vendor/ 会连 renderer/vendor/（WE 官方运行时源码）一起忽略
+/vendor/
 *.local
 *.log
 *.tsbuildinfo

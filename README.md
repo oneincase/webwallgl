@@ -117,6 +117,14 @@ pnpm add webwallgl   # 或 npm i webwallgl
 
 库代码采用 MIT 许可。Wallpaper Engine 创意工坊素材（scene.pkg、贴图、音视频）的版权归各自作者：请只使用你自己拥有或已获授权的素材，不要把他人作品打包进你的产品或在公网分发。
 
+**效果署名与致谢**
+
+| 效果 | 原作者 | 说明 |
+| --- | --- | --- |
+| 磁流体（`cuiliuti`） | Hope麻匪（HopeMafei） | Wallpaper Engine 社区创作者，公开分享的「磁流体」自定义 shader（0ran 收录） |
+
+磁流体内置效果按其原 shader 重写为 WebWallGL 效果，补齐滑杆与中英文文案；相同参数下观感与原作一致。出处与署名同时写在效果面板（选中效果后显示「作者：…」）、写进工程的 `effects/wwgl_cuiliuti/effect.json` 的 `description`，以及内置效果源码注释里。
+
 ---
 
 ## English
@@ -231,6 +239,14 @@ Build from source: `pnpm run build:app` assembles `app/`, and `pnpm run dist:des
 **License and compliance**
 
 The library code is MIT-licensed. Wallpaper Engine workshop assets (scene.pkg, textures, audio and video) belong to their respective authors: only use assets you own or are licensed to use, and don't bundle other people's work into your product or redistribute it publicly.
+
+**Effect credits**
+
+| Effect | Original author | Notes |
+| --- | --- | --- |
+| Ferrofluid (`cuiliuti`) | Hope麻匪 (HopeMafei) | Wallpaper Engine community creator; the "Ferrofluid" custom shader they shared publicly (collected by 0ran) |
+
+The built-in Ferrofluid effect is a reimplementation of that shader as a WebWallGL effect, with sliders and zh / en labels added; it looks the same as the original for the same settings. The credit also appears in the effect panel ("By …" once the effect is selected), in the `description` of the `effects/wwgl_cuiliuti/effect.json` written into your project, and in the built-in effect's own source comments.
 
 ---
 

@@ -11,6 +11,11 @@ files:
   - "**/*"
   - "!cli.mjs"
 asar: true
+# media-bridge（系统正在播放 + 音频频谱）：scripts/fetch-media-bridge.mjs 按平台下载到 vendor/，
+# 这里按目标架构放进 Resources/media-bridge/（asar 外，才能执行），Electron 主进程启动时经 MEDIA_BRIDGE_BIN 交给宿主
+extraResources:
+  - from: vendor/media-bridge/${os}-${arch}
+    to: media-bridge
 artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
 icon: public/icons/pwa-512.png
 publish: null
@@ -26,6 +31,9 @@ mac:
   # 有 Apple 开发者证书后删掉这行，CI 配 CSC_LINK / CSC_KEY_PASSWORD 即自动签名
   identity: null
   hardenedRuntime: false
+  # media-bridge 用 CoreAudio Process Tap 采系统输出，系统按「负责进程」（本应用）的 Info.plist 弹授权说明
+  extendInfo:
+    NSAudioCaptureUsageDescription: WebWallGL 采集系统正在播放的声音，用来驱动壁纸的音频可视化（不录制麦克风）。
 
 win:
   target:

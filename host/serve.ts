@@ -26,6 +26,7 @@ export type ServeOptions = {
   webShimPath?: string;
   /** 壁纸属性覆盖值目录（缺省仓库根 .we-props/） */
   propsDir?: string;
+  bridgeMissingHint?: string;
 };
 
 export type RunningServer = { server: Server; port: number; origin: string; close(): Promise<void> };
@@ -136,7 +137,7 @@ export async function startServer(opts: ServeOptions): Promise<RunningServer> {
   const logger = opts.logger ?? { info: (msg: string) => console.log(msg) };
   if (opts.webShimPath) process.env.WWGL_WEB_SHIM = resolve(opts.webShimPath);
   if (opts.propsDir) process.env.WWGL_PROPS_DIR = resolve(opts.propsDir);
-  const handler = createHostMiddleware({ logger, pickFolder: opts.pickFolder });
+  const handler = createHostMiddleware({ logger, pickFolder: opts.pickFolder, bridgeMissingHint: opts.bridgeMissingHint });
 
   const server = createServer((req, res) => {
     const fallthrough = () => {

@@ -8,9 +8,9 @@
  *     64 段 0-255 对数频谱（事件：spectrum，按订阅间隔推送）
  *   - 反向控制：play / pause / next / previous …（能力位 + 回执）
  *
- * 二进制解析顺序：MEDIA_BRIDGE_BIN 环境变量 → 仓库同级 ../media-bridge/target/release/
- * → PATH 上的 media-bridge。都找不到时 backend="none"，HTTP 端点照常应答（空快照），
- * 前端回落模拟源。
+ * 二进制解析顺序：MEDIA_BRIDGE_BIN 环境变量 → 自动安装位置 ~/.webwallgl/bin → 仓库同级
+ * ../media-bridge/target/release/ → PATH 上的 media-bridge。都找不到时 backend="none"，
+ * HTTP 端点照常应答（空快照），前端回落模拟源。打包应用会自动下载（app-entry.ts）或内置（桌面安装包）。
  *
  * 前台窗口 media-bridge 不管，仍走 AppleScript 轮询（System Events）。
  *
@@ -21,6 +21,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
+import { installedMediaBridgePath } from "./media-bridge-release.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -171,13 +172,18 @@ function recordAudioSourceState(state: string) {
   }
 }
 
-/** 解析 media-bridge 二进制：env 覆盖 → 仓库同级构建产物 → PATH。结果（含失败）缓存。 */
+/**
+ * 解析 media-bridge 二进制：env 覆盖（桌面安装包内置的经 Electron 主进程设到这里）→ 自动安装位置
+ * （~/.webwallgl/bin，见 media-bridge-release.mjs）→ 仓库同级构建产物 → PATH。结果（含失败）缓存。
+ */
 async function resolveBridgeBin(): Promise<string | null> {
   if (bridgeBinResolved) return bridgeBin;
   bridgeBinResolved = true;
+  if (process.env.WWGL_NO_MEDIA_BRIDGE === "1") return null;
   const override = process.env.MEDIA_BRIDGE_BIN?.trim();
   const candidates: string[] = [];
   if (override) candidates.push(override);
+  candidates.push(installedMediaBridgePath());
   // vite dev server 的 cwd 是仓库根；同级 checkout 是本机的常规布局
   candidates.push(resolve(process.cwd(), "../media-bridge/target/release/media-bridge"));
   candidates.push(resolve(process.cwd(), "media-bridge/target/release/media-bridge"));
@@ -507,6 +513,20 @@ export async function startLiveSystemService(): Promise<{ backend: LiveService["
   }
 
   return { backend: service.backend };
+}
+
+/**
+ * 运行中换上（新装好的）media-bridge：自动下载在服务起来之后才完成，此前解析结果已缓存为「没有」。
+ * 已经连上一个 media-bridge 时不动它。
+ */
+export async function useBridgeBinary(bin: string): Promise<{ backend: LiveService["backend"] }> {
+  process.env.MEDIA_BRIDGE_BIN = bin;
+  if (bridgeProc) return { backend: service.backend };
+  bridgeBinResolved = false;
+  bridgeBin = null;
+  bridgeRespawns = 0;
+  service.started = false;
+  return startLiveSystemService();
 }
 
 /** 读缓存（同步）；未 start 时返回空 */

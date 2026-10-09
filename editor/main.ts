@@ -63,6 +63,7 @@ import {
   effectCatalog,
   effectFileOf,
   effectFiles,
+  effectNote,
   effectViews,
   externalValues,
   inspectEffectParams,
@@ -4452,7 +4453,7 @@ function addEffectTo(n: LayerNode, fxId: string) {
   if (!d || !overlay) return;
   let files: ReturnType<typeof effectFiles>;
   try {
-    files = effectFiles(d);
+    files = effectFiles(d, getLang());
   } catch (e) {
     log(et("log.fxFailed", { name: fxTitle(d), msg: (e as Error).message }), "error");
     return;
@@ -4515,6 +4516,26 @@ function effectsGroup(node: LayerNode): HTMLElement {
       };
       item.appendChild(schemaForm({ params, values, label: fxParamLabel, commit, disabled: !editable }));
       if (!v.def) item.appendChild(note(et("fx.externalTunable")));
+    }
+    // 署名行：改写 / 移植自他人作品的效果（如 cuiliuti）显示「作者：…」+ 出处说明
+    if (v.def?.author || v.def?.note) {
+      const credit = document.createElement("div");
+      credit.className = "ed-fx-credit";
+      credit.dataset.fxCredit = v.def.id;
+      if (v.def.author) {
+        const by = document.createElement("p");
+        by.className = "ed-note ed-fx-author";
+        by.textContent = `${et("fx.author")}${textOf(v.def.author, getLang(), "")}`;
+        credit.appendChild(by);
+      }
+      const nd = effectNote(v.def, getLang());
+      if (nd) {
+        const p = document.createElement("p");
+        p.className = "ed-note";
+        p.textContent = nd;
+        credit.appendChild(p);
+      }
+      item.appendChild(credit);
     }
     group.appendChild(item);
   }

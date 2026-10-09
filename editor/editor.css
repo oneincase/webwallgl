@@ -159,6 +159,18 @@
   line-height: 1.5;
 }
 
+/* 效果署名（原作者 / 出处说明）：与参数表单分隔，标题行用正文色突出 */
+.ed-fx-credit {
+  border-top: 1px solid var(--wb-line);
+  padding-top: 2px;
+}
+
+.ed-fx-credit .ed-fx-author {
+  color: var(--wb-fg);
+  font-weight: 600;
+  padding-bottom: 0;
+}
+
 /* 图层工具条在「图层」标签内：面板收窄时换行，不把按钮挤出可视区 */
 .ed-layer-tools {
   flex-wrap: wrap;

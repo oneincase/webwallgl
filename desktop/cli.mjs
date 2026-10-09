@@ -22,6 +22,7 @@ const HELP = `WebWallGL ${pkg.version} —— Wallpaper Engine 壁纸播放器�
   --host <addr>      监听地址（缺省 127.0.0.1；局域网访问用 0.0.0.0，仅 --web）
   --library <dir>    壁纸库目录（等同环境变量 WE_LIBRARY）
   --no-open          --web 时不自动打开浏览器
+  --no-media-bridge  不下载、不启用 media-bridge（系统正在播放 / 音频频谱）
   -v, --version      打印版本
   -h, --help         打印本帮助
 `;
@@ -42,6 +43,9 @@ function parseArgs(argv) {
         break;
       case "--no-open":
         o.open = false;
+        break;
+      case "--no-media-bridge":
+        process.env.WWGL_NO_MEDIA_BRIDGE = "1";
         break;
       case "--port":
         o.port = Number(val());

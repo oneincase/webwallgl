@@ -750,10 +750,13 @@ async function startHost(libDir, srcText) {
   process.env.WE_LIBRARY = libDir;
   const mod = await loadHostModule(srcText);
   const plugin = mod.wallpaperHost();
-  if (prev === undefined) delete process.env.WE_LIBRARY;
-  else process.env.WE_LIBRARY = prev;
+  // configureServer 里才建中间件，而中间件在创建时把壁纸库目录定死（let lib = libraryDir()）：
+  // WE_LIBRARY 必须留到 configureServer 之后才能还原，否则这套测试会把 fixture
+  // （author-item / fresh）写进用户真正的壁纸库目录
   const handlers = [];
   plugin.configureServer({ config: { logger: { info() {}, warn() {}, error() {} } }, middlewares: { use: (fn) => handlers.push(fn) } });
+  if (prev === undefined) delete process.env.WE_LIBRARY;
+  else process.env.WE_LIBRARY = prev;
   const server = http.createServer((req, res) => {
     let i = 0;
     const next = () => {
@@ -1031,6 +1034,22 @@ const uniformNotes = (frag) => {
     const cl = f.effectById("cuiliuti").frag;
     check(!!f.effectById("cuiliuti") && /smin\(|numBlobs 120|int\(g_FxBlobs\)/.test(cl), "追加：磁流体（cuiliuti）—— smin 软融合、球数滑杆上限 120 与循环封顶一致");
     check(/g_TexelSize\.y \/ g_TexelSize\.x/.test(cl), "磁流体按渲染目标宽高比修正 uv.x（方形层满幅、宽层流体不变形）");
+  }
+  {
+    const cu = f.effectById("cuiliuti");
+    check(cu.author === "Hope麻匪（HopeMafei）", "磁流体的原作者署名写在 EffectDef.author 上（检出：Hope麻匪 / HopeMafei）");
+    check(/Hope麻匪/.test(f.effectNote(cu, "zh")) && /HopeMafei/.test(f.effectNote(cu, "en")) && /0ran/.test(f.effectNote(cu, "en")), "署名说明中英双语：原作者 Hope麻匪 / HopeMafei 与出处（0ran 收录）都在文案里");
+    check(f.effectNote(cu, "zh-CN") === f.effectNote(cu, "zh") && f.effectNote(cu, "en-US") === f.effectNote(cu, "en"), "effectNote 按主语言取名（zh-CN / en-US 与 zh / en 同文案）");
+    const fxFiles = f.effectFiles(cu, "zh");
+    const ej = JSON.parse(dec.decode(fxFiles.find((x) => x.name.endsWith("effect.json")).data));
+    check(/Hope麻匪/.test(ej.description ?? "") && /HopeMafei/.test(ej.description ?? ""), "写进工程的 effect.json 带着署名说明（作者与出处随工程自包含）");
+    const en = JSON.parse(dec.decode(f.effectFiles(cu, "en").find((x) => x.name.endsWith("effect.json")).data));
+    check(/Original author/.test(en.description ?? "") && /HopeMafei/.test(en.description ?? ""), "英文界面下 effect.json 写英文署名；author 与 note 同源");
+    const plain = { id: "noteplain", params: [], frag: "void main(){}", author: "A", note: "N" };
+    check(
+      JSON.parse(dec.decode(f.effectFiles(plain, "zh").find((x) => x.name.endsWith("effect.json")).data)).description === "N\n作者 / Author：A",
+      "单字符串 note 直用；description 末尾补 Author 行（无 note 的效果不写 description——verify 下面 tint 那条守着）",
+    );
   }
   check(f.EFFECTS.filter((e) => /g_Texture0Resolution\b/.test(e.frag)).every((e) => /uniform vec4 g_Texture0Resolution;/.test(e.frag)) && ["outline", "glow", "pixelate"].every((id) => /g_Texture0Resolution\.xy/.test(f.effectById(id).frag)), "按像素取样的效果（描边 / 发光 / 像素化 / 模糊）都声明并使用源贴图尺寸");
   {

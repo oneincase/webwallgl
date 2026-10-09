@@ -51,6 +51,8 @@ jobs:
             exit 1
           fi
       - run: pnpm run build:app
+      - name: 下载 media-bridge（随安装包内置）
+        run: node scripts/fetch-media-bridge.mjs --platform ${{ matrix.platform }}
       - name: electron-builder
         run: pnpm exec electron-builder --${{ matrix.platform }} --publish never
         env:

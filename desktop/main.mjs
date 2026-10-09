@@ -61,7 +61,16 @@ async function pickFolder(defaultDir, prompt) {
   return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
 }
 
+/** 桌面安装包内置的 media-bridge（electron-builder extraResources → Resources/media-bridge/） */
+function bundledMediaBridge() {
+  if (!app.isPackaged) return null;
+  const bin = join(process.resourcesPath, "media-bridge", process.platform === "win32" ? "media-bridge.exe" : "media-bridge");
+  return existsSync(bin) ? bin : null;
+}
+
 async function startProdServer() {
+  const bundled = bundledMediaBridge();
+  if (bundled && !process.env.MEDIA_BRIDGE_BIN) process.env.MEDIA_BRIDGE_BIN = bundled;
   const { startApp, DEFAULT_PORT } = await import(pathToFileURL(join(HERE, "server.mjs")).href);
   const want = Number(argValue("port") || process.env.WWGL_PORT) || DEFAULT_PORT;
   prodServer = await startApp({ port: want, pickFolder });

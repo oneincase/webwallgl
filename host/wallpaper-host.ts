@@ -565,6 +565,8 @@ export type HostOptions = {
   logger?: { info(msg: string): void };
   /** 系统选文件夹；缺省 macOS 走 osascript，其他平台视为不支持（前端回退手输）。Electron 壳注入 dialog 版。 */
   pickFolder?: FolderPicker;
+  /** 启动时没找到 media-bridge 的提示（缺省是面向仓库开发的构建指引；打包应用换成自动安装的进度说明） */
+  bridgeMissingHint?: string;
 };
 
 type HostHandler = (req: Connect.IncomingMessage, res: any, next: () => void) => Promise<void>;
@@ -596,7 +598,7 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
       logger.info(`[host] 系统实况：media-bridge（系统级 Now Playing + 系统输出频谱）`);
     } else {
       logger.info(
-        `[host] 系统实况：未找到 media-bridge（构建 ../media-bridge 或设 MEDIA_BRIDGE_BIN）；端点返回空快照`,
+        `[host] 系统实况：${opts.bridgeMissingHint ?? "未找到 media-bridge（构建 ../media-bridge 或设 MEDIA_BRIDGE_BIN）；端点返回空快照"}`,
       );
     }
   });
