@@ -301,6 +301,41 @@ void main() {
 	gl_FragColor = vec4(col, g_FxAlpha * edgeAlpha);
 }`;
 
+/** 音频频谱条的参数与着色器：柱子从中线向上下长（不依赖 v_TexCoord 的上下方向） */
+const AUDIOBARS_PARAMS: EffectParam[] = [
+  { key: "color", type: "color", default: [0.36, 0.78, 1] },
+  { key: "amount", type: "float", default: 1, min: 0, max: 1, step: 0.01 },
+  { key: "scale", type: "float", default: 1.4, min: 0, max: 4, step: 0.05 },
+  { key: "width", type: "float", default: 0.72, min: 0.05, max: 1, step: 0.01 },
+  { key: "softness", type: "float", default: 0.3, min: 0, max: 1, step: 0.01 },
+  { key: "mirror", type: "float", default: 1, min: 0, max: 1, step: 1 },
+];
+
+// WE 内置 uniform 名（renderer 按名绑定；官方 pulse / shake / Simple Audio Bars 用的同一组）。
+// 只声明 32 段一组：柱子按 32 段画，粒子 / 文字脚本另有自己的入口。
+const AUDIOBARS_DECL = `uniform float g_AudioSpectrum32Left[32];
+uniform float g_AudioSpectrum32Right[32];
+`;
+
+const AUDIOBARS_BODY = `	vec4 base = texSample2D(g_Texture0, v_TexCoord);
+	vec3 c = base.rgb;
+	float cell = 1.0 / 32.0;
+	float x = g_FxMirror > 0.5 ? abs(v_TexCoord.x * 2.0 - 1.0) : v_TexCoord.x;
+	float d = abs(v_TexCoord.y - 0.5) * 2.0;
+	float w = max(g_FxWidth * cell * 0.5, 0.001);
+	for (int i = 0; i < 32; ++i) {
+		float band = clamp((g_AudioSpectrum32Left[i] + g_AudioSpectrum32Right[i]) * 0.5 * g_FxScale, 0.0, 1.0);
+		if (band > 0.0) {
+			float bx = abs(x - (float(i) + 0.5) * cell);
+			float barH = band * 0.5;
+			float barX = 1.0 - smoothstep(w - g_FxSoftness * w, w, bx);
+			float barY = 1.0 - smoothstep(barH - g_FxSoftness * 0.5, barH, d);
+			c = mix(c, g_FxColor, clamp(barX * barY * g_FxAmount, 0.0, 1.0));
+		}
+	}
+	gl_FragColor = vec4(c, base.a);
+`;
+
 export const EFFECTS: readonly EffectDef[] = [
   def(
     "tint",
@@ -498,6 +533,17 @@ ${uniforms(CUILIUTI_PARAMS)}
 
 ${CUILIUTI_SRC}
 `,
+  },
+  // ── 音频频谱条（audiobars）───────────────────────────────────────────────
+  // 音频反应图层的现成做法：引擎每帧把系统音频 / BGM 的频谱喂给 g_AudioSpectrum* uniform
+  // （renderer 按名绑定，WE 官方 pulse / shake 用的是同一组名字），这里把它画成 32 根
+  // 从中线向上下长的柱子。挂在铺满画面的图层上就是一条完整频谱条；编辑器里想看到它动，
+  // 渲染面板把音量拉起来、或开「系统音频」/点「试听」（editor/audio-live.ts 两条源）。
+  // 追加在 EFFECTS 末尾：verify-editor 断言前 13 个 id 的顺序（基础集 / 扩充集）。
+  // 名字与参数文案走 i18n 的 fx.audiobars / fxp.*（内置效果一律如此，不写 title）。
+  {
+    ...def("audiobars", AUDIOBARS_PARAMS, AUDIOBARS_BODY, AUDIOBARS_DECL),
+    category: "audio",
   },
 ];
 

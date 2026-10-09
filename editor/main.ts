@@ -37,6 +37,7 @@ import { initTabs } from "../shared/workbench/tabs";
 import { libraryKindOf, mountLibraryPanel } from "./ui/library-panel";
 import { mountWallpaperConfig } from "./ui/wallpaper-config";
 import { mountRenderSettings } from "./ui/render-settings";
+import { createElementAudioSource, type ElementAudioSource } from "./audio-live";
 import { mountPerfPanel } from "./ui/perf-panel";
 import { bindThemeButton } from "../shared/workbench/theme";
 import { applyEditorStatic, et, hasText } from "./i18n";
@@ -315,7 +316,9 @@ import {
   isBatch,
   isNoopEdit,
   isStruct,
+  isTitleCmd,
   isVideoCmd,
+  type TitleSnap,
   type VideoClip,
   mergeLiveEdit,
   pickProps,
@@ -347,6 +350,17 @@ import {
   type DirHandle,
   type SaveFile,
 } from "./save";
+import {
+  createVirtualProject,
+  deleteVirtualProject,
+  lastVirtualProjectId,
+  listVirtualProjects,
+  openVirtualProject,
+  renameVirtualDir,
+  setLastVirtualProjectId,
+  virtualIdOf,
+  type VdirRecord,
+} from "./vdir";
 import { mountVideoStage, videoProjectJson } from "./video-project";
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -386,6 +400,18 @@ const stLayersEl = $<HTMLElement>("#st-layers");
 const stResEl = $<HTMLElement>("#st-res");
 const stSaveEl = $<HTMLElement>("#st-save");
 const stFpsEl = $<HTMLElement>("#st-fps");
+// 恢复横幅（#ed-draft）：内置浏览器里刷新 / 重开后找回上次的虚拟工程
+const draftBannerEl = $<HTMLElement>("#ed-draft");
+const draftTextEl = $<HTMLElement>("#ed-draft-text");
+const draftRestoreEl = $<HTMLButtonElement>("#draft-restore");
+const draftDiscardEl = $<HTMLButtonElement>("#draft-discard");
+// 内置工程列表
+const vdirDlgEl = $<HTMLDialogElement>("#vdir-dlg");
+const vdirListEl = $<HTMLElement>("#vdir-list");
+const vdirNewEl = $<HTMLButtonElement>("#vdir-new");
+const vdirLocalEl = $<HTMLButtonElement>("#vdir-local");
+const vdirPkgEl = $<HTMLButtonElement>("#vdir-pkg");
+const vdirCancelEl = $<HTMLButtonElement>("#vdir-cancel");
 
 // ---------- 控制台 ----------
 
@@ -1167,6 +1193,8 @@ async function recordScene() {
 
 const packEl = $<HTMLButtonElement>("#tb-pack");
 const exportMenuEl = $<HTMLElement>("#export-menu");
+const renderOptsEl = $<HTMLButtonElement>("#tb-render-opts");
+const renderMenuEl = $<HTMLElement>("#render-menu");
 let projectDir: DirHandle | null = null;
 /** 当前文档来自壁纸库时的条目（不绑项目文件夹）；另存为项目后清空 */
 let libItem: LibraryItem | null = null;
@@ -1187,6 +1215,8 @@ function fileSig(data: Uint8Array): string {
 
 function adoptProject(dir: DirHandle) {
   projectDir = dir;
+  // 内置浏览器工程记一笔：刷新 / 重开后靠它找回（真目录会置空，免得恢复横幅指向陈旧的虚拟工程）
+  setLastVirtualProjectId(virtualIdOf(dir));
   writtenSig.clear();
   ownedPaths.clear();
   saveAgain = false;
@@ -1223,6 +1253,25 @@ async function saveDocument() {
 
 /** 有东西可写：场景文档 + 资源表，或视频壁纸工程 */
 const canSave = () => !!doc?.video || (!!doc?.scene && !!current?.assets);
+
+/**
+ * 把当前工程整份写进用户选的本机文件夹，之后的自动保存改到那里。
+ * 工程卡上的「存到本机文件夹…」：浏览器存储里的工程这样就能拿到松散文件。
+ */
+async function saveProjectToLocalDir() {
+  if (!doc || !projectDir) return;
+  if (!canSave()) {
+    log(et("log.cannotSaveKind", { kind: doc.type }), "warn");
+    return;
+  }
+  const dir = await requireLocalDir();
+  if (!dir) return;
+  adoptProject(dir);
+  libItem = null;
+  syncLibraryItem();
+  log(et("log.savedToDir", { name: dir.name }));
+  await flushAutosave();
+}
 
 async function collectCurrent(preview: Blob | null): Promise<SaveFile[] | null> {
   if (doc?.video) return collectVideoProject(doc, preview);
@@ -1272,11 +1321,23 @@ function renderSaveStatus() {
     const hint = doc && libItem && canSave();
     stSaveEl.textContent = hint ? et(dirty ? "st.libDirty" : "st.library") : "";
     stSaveEl.title = hint ? et("st.saveAsTitle") : "";
+    stSaveEl.classList.remove("is-clickable");
     return;
   }
   stSaveEl.textContent = saving ? et("st.saving") : dirty ? et("st.unsaved") : et("st.saved");
-  stSaveEl.title = projectDir.name;
+  // 浏览器存储里的工程：状态栏这一格点一下就能整份落到本机文件夹（和工程卡上那颗按钮同一条路）
+  const toLocal = !!virtualIdOf(projectDir) && canPickDirectory();
+  stSaveEl.title = virtualIdOf(projectDir)
+    ? toLocal
+      ? et("st.saveLocalTip", { name: projectDir.name })
+      : et("vdir.saveHint", { name: projectDir.name })
+    : projectDir.name;
+  stSaveEl.classList.toggle("is-clickable", toLocal);
 }
+
+stSaveEl.addEventListener("click", () => {
+  if (projectDir && virtualIdOf(projectDir) && canPickDirectory()) void saveProjectToLocalDir();
+});
 
 function closeExportMenu() {
   exportMenuEl.hidden = true;
@@ -1296,6 +1357,35 @@ packEl.onclick = (e) => {
 };
 document.addEventListener("click", (e) => {
   if (!exportMenuEl.hidden && !exportMenuEl.contains(e.target as Node)) closeExportMenu();
+});
+
+// 「渲染选项」菜单（在视口工具条渲染 DPR 之后）：内容就是原来右侧「渲染」标签的两组全局偏好
+function closeRenderMenu() {
+  renderMenuEl.hidden = true;
+}
+
+renderOptsEl.onclick = (e) => {
+  e.stopPropagation();
+  if (!renderMenuEl.hidden) {
+    closeRenderMenu();
+    return;
+  }
+  closeExportMenu();
+  const r = renderOptsEl.getBoundingClientRect();
+  renderMenuEl.style.left = `${r.left}px`;
+  renderMenuEl.style.top = `${r.bottom + 2}px`;
+  renderMenuEl.hidden = false;
+  // 工具条在视口下方，往下放不下就翻到按钮上方；左侧越界也夹回窗口内
+  const box = renderMenuEl.getBoundingClientRect();
+  if (r.bottom + 2 + box.height > window.innerHeight - 6) {
+    renderMenuEl.style.top = `${Math.max(6, r.top - box.height - 2)}px`;
+  }
+  if (r.left + box.width > window.innerWidth - 6) {
+    renderMenuEl.style.left = `${Math.max(6, window.innerWidth - box.width - 6)}px`;
+  }
+};
+document.addEventListener("click", (e) => {
+  if (!renderMenuEl.hidden && !renderMenuEl.contains(e.target as Node)) closeRenderMenu();
 });
 async function capturePreview(): Promise<Blob | null> {
   if (!editor || !doc) return null;
@@ -1320,6 +1410,19 @@ function scheduleAutosave() {
     }
     void flushAutosave();
   }, AUTOSAVE_MS);
+}
+
+/**
+ * 内置工程改名后把浏览器存储里的记录名与句柄名一起对齐（真目录不动）。
+ * 只在保存成功后调用：名字来源是 doc.title，autosave 已经把它写进 project.json。
+ */
+async function syncVirtualDirName(dir: DirHandle) {
+  if (!virtualIdOf(dir) || !doc || dir.name === doc.title) return;
+  try {
+    await renameVirtualDir(dir, doc.title);
+  } catch (e) {
+    log(et("log.vdirFailed", { msg: (e as Error).message }), "warn");
+  }
 }
 
 /** 把当前文档写成项目文件夹里的松散文件。⌘S 与编辑防抖都走这里。 */
@@ -1357,6 +1460,7 @@ async function flushAutosave() {
       syncDocTitle();
       log(et("log.autosaved", { name: dir.name }));
       log(et("log.saveTook", { s: ((performance.now() - t0) / 1000).toFixed(1) }));
+      await syncVirtualDirName(dir);
     }
   } catch (e) {
     log(et("log.saveFailed", { msg: (e as Error).message }), "error");
@@ -1490,7 +1594,7 @@ function syncHistoryButtons() {
 
 function syncDocTitle() {
   docTitleEl.textContent = doc ? `${dirty ? "● " : ""}${doc.title}` : "";
-  docTitleEl.title = dirty ? et("st.dirty") : "";
+  docTitleEl.title = doc ? [dirty ? et("st.dirty") : "", et("proj.renameHint")].filter(Boolean).join(" · ") : "";
 }
 
 function nodeName(id: number | string): string {
@@ -1697,6 +1801,82 @@ function beginRename(id: number | string) {
   input.select();
 }
 
+// ---------- 工程名：标题栏就地改名 + 检视器工程卡入口 ----------
+
+/** 工程名快照：doc.title（显示名）与 project.json 里的 title（落盘 / 库条目的真正来源） */
+function titleSnap(): TitleSnap {
+  const p = doc?.project as { title?: unknown } | undefined;
+  return { title: doc?.title ?? "", projectTitle: typeof p?.title === "string" ? p.title : null };
+}
+
+/** 写回工程名：project.json 的 title 一改，保存与壁纸库条目名才会跟着变 */
+function applyTitleSnap(s: TitleSnap) {
+  if (!doc) return;
+  doc.title = s.title;
+  const p = doc.project as Record<string, unknown> | undefined;
+  if (p) {
+    if (s.projectTitle === null) delete p.title;
+    else p.title = s.projectTitle;
+  }
+  syncDocTitle();
+  renderSaveStatus();
+  renderInspector();
+  markDirty();
+}
+
+/** 改工程名：可撤销（结构命令的快照只装 objects，所以工程名单独一种命令） */
+function renameProject(raw: string): boolean {
+  if (!doc) return false;
+  const name = raw.trim();
+  if (!name) {
+    log(et("log.renameProjectEmpty"), "warn");
+    return false;
+  }
+  if (name === doc.title) return false;
+  const from = doc.title;
+  const before = titleSnap();
+  applyTitleSnap({ title: name, projectTitle: name });
+  const after = titleSnap();
+  edits.push({ kind: "title", label: et("log.renamedProject", { from, to: name }), before, after });
+  syncHistoryButtons();
+  log(et("log.renamedProject", { from, to: name }));
+  // 壁纸库条目的名字由宿主扫盘 project.json 得出，没有改名端点：改名后要另存为项目才落盘
+  if (libItem && !projectDir) log(et("log.renameProjectLib"), "warn");
+  return true;
+}
+
+/** 标题栏就地改名：双击标题（或检视器工程卡按钮）触发 */
+function beginRenameProject() {
+  if (!doc) return;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "ed-doc-rename";
+  input.value = doc.title;
+  input.setAttribute("aria-label", et("proj.rename"));
+  let settled = false;
+  const finish = (save: boolean) => {
+    if (settled) return;
+    settled = true;
+    const v = input.value;
+    input.remove();
+    syncDocTitle();
+    if (save) renameProject(v);
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+  for (const ev of ["click", "dblclick", "pointerdown"]) input.addEventListener(ev, (e) => e.stopPropagation());
+  docTitleEl.textContent = "";
+  docTitleEl.appendChild(input);
+  input.focus();
+  input.select();
+}
+
+docTitleEl.addEventListener("dblclick", () => beginRenameProject());
+
 /** 一次完整的编辑（检视器 change / 眼睛开关）：读 before → 改 → 入栈 */
 function edit(id: number | string, patch: Patch) {
   const cur = editor?.getLayerProps(Number(id));
@@ -1730,6 +1910,11 @@ function undoRedo(dir: "undo" | "redo") {
       dir === "undo" ? cmd.selBefore : cmd.selAfter,
       dir === "undo" ? cmd.propsBefore : cmd.propsAfter,
     );
+    return;
+  }
+  if (isTitleCmd(cmd)) {
+    log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    applyTitleSnap(dir === "undo" ? cmd.before : cmd.after);
     return;
   }
   void applyPatch(cmd.id, dir === "undo" ? cmd.before : cmd.after);
@@ -2194,6 +2379,9 @@ const renderSettings = mountRenderSettings({
   aa: $("#aa"),
   pq: $("#pq"),
   pp: $("#pp"),
+  sysAudio: $("#audio-sys"),
+  audioStatus: $("#audio-state"),
+  audioMeter: $("#audio-meter"),
   instance: () => instance,
 });
 
@@ -2355,11 +2543,14 @@ async function pickDirectoryWithGesture(): Promise<DirHandle | null> {
   });
 }
 
-async function requireProjectDir(): Promise<DirHandle | null> {
-  if (!canPickDirectory()) {
-    log(et("log.needDir"), "error");
-    return null;
-  }
+/** 新建工程还是打开已有工程：只有内置浏览器分这两种（文件夹选择器不分） */
+type DirPurpose = "new" | "open";
+
+/**
+ * 真实文件夹：**只有用户明确选择才走这条路**（「打开项目」对话框里的「打开本地文件夹…」、
+ * 工程卡里的「存到本机文件夹…」）。探测可写后返回，之后写盘链路与虚拟目录完全一样。
+ */
+async function requireLocalDir(): Promise<DirHandle | null> {
   let dir: DirHandle | null;
   try {
     dir = await pickDirectoryWithGesture();
@@ -2381,10 +2572,216 @@ async function requireProjectDir(): Promise<DirHandle | null> {
   return dir;
 }
 
-$<HTMLButtonElement>("#tb-open-pkg").onclick = () => inPkgEl.click();
+/**
+ * 拿一个项目目录：**默认走浏览器存储里的工程**（新建也一样，不弹文件夹选择器），
+ * 之后的改动自动保存进 IndexedDB。真实目录只由 requireLocalDir 那条显式选择提供。
+ */
+async function requireProjectDir(purpose: DirPurpose = "new"): Promise<DirHandle | null> {
+  return virtualProjectDir(purpose);
+}
+
+/**
+ * 浏览器存储里的项目目录。#vdir-dlg 列出这台机器上存过的工程；
+ * 「新建空白工程」= 直接开一个新的虚拟工程。写盘链路一行不用改 —— 虚拟目录实现的就是 DirHandle。
+ * 「打开本地文件夹…」是对话框里唯一的真实目录口子，那条路返回的句柄没有 vdirId，直接放行。
+ */
+async function virtualProjectDir(purpose: DirPurpose): Promise<DirHandle | null> {
+  let dir: DirHandle | null = null;
+  try {
+    dir = purpose === "open" ? await pickVirtualProject() : await createVirtualProject(et("new.untitled"));
+  } catch (e) {
+    log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+    return null;
+  }
+  if (!dir) return null;
+  const vid = virtualIdOf(dir);
+  if (!vid) {
+    // 用户在本机文件夹里打开 / 新建（requireLocalDir 已经探测过可写）
+    log(et("log.projectDir", { name: dir.name }));
+    return dir;
+  }
+  try {
+    await probeWritable(dir);
+  } catch (e) {
+    log(et("log.dirNotWritable", { name: dir.name, msg: `${(e as Error).name}: ${(e as Error).message}` }), "error");
+    return null;
+  }
+  setLastVirtualProjectId(vid);
+  log(purpose === "open" ? et("log.vdirOpen", { name: dir.name }) : et("log.vdirNew", { name: dir.name }));
+  return dir;
+}
+
+/** 工程列表对话框：点一行打开，右侧删除；新建 = 新建空白工程；只有明确点「打开本地文件夹…」才用真实目录 */
+function pickVirtualProject(): Promise<DirHandle | null> {
+  return new Promise<DirHandle | null>((resolve) => {
+    let settled = false;
+    const done = (dir: DirHandle | null) => {
+      if (settled) return;
+      settled = true;
+      vdirNewEl.onclick = null;
+      vdirLocalEl.onclick = null;
+      vdirCancelEl.onclick = null;
+      vdirDlgEl.onclose = null;
+      resolve(dir);
+    };
+    const render = async () => {
+      vdirListEl.textContent = "";
+      let rows: VdirRecord[] = [];
+      try {
+        rows = await listVirtualProjects();
+      } catch (e) {
+        log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+      }
+      if (!rows.length) {
+        vdirListEl.appendChild(note(et("vdir.empty")));
+        return;
+      }
+      for (const rec of rows) {
+        const row = document.createElement("div");
+        row.className = "ed-vdir-row";
+        const open = document.createElement("button");
+        open.type = "button";
+        open.className = "ed-vdir-open";
+        const name = document.createElement("span");
+        name.className = "ed-vdir-name";
+        name.textContent = rec.name;
+        const time = document.createElement("span");
+        time.className = "ed-vdir-time";
+        time.textContent = new Date(rec.updatedAt).toLocaleString();
+        open.append(name, time);
+        open.addEventListener("click", () => {
+          void (async () => {
+            const dir = await openVirtualProject(rec.id).catch((e) => {
+              log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+              return null;
+            });
+            if (!dir) {
+              log(et("log.vdirMissing", { name: rec.name }), "warn");
+              return;
+            }
+            vdirDlgEl.close();
+            done(dir);
+          })();
+        });
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "ed-btn";
+        del.textContent = et("vdir.del");
+        del.addEventListener("click", () => {
+          void (async () => {
+            if (projectDir && virtualIdOf(projectDir) === rec.id) {
+              log(et("vdir.delBusy", { name: rec.name }), "warn");
+              return;
+            }
+            if (!confirm(et("vdir.delConfirm", { name: rec.name }))) return;
+            try {
+              await deleteVirtualProject(rec.id);
+            } catch (e) {
+              log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+              return;
+            }
+            log(et("log.vdirDeleted", { name: rec.name }));
+            await render();
+          })();
+        });
+        row.append(open, del);
+        vdirListEl.appendChild(row);
+      }
+    };
+    vdirNewEl.onclick = () => {
+      void (async () => {
+        const dir = await createVirtualProject(et("new.untitled")).catch((e) => {
+          log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+          return null;
+        });
+        if (!dir) return;
+        vdirDlgEl.close();
+        done(dir);
+      })();
+    };
+    vdirLocalEl.hidden = !canPickDirectory();
+    vdirLocalEl.onclick = () => {
+      void (async () => {
+        const dir = await requireLocalDir();
+        // 取消选择就留在对话框里，用户可以接着挑浏览器存储里的工程
+        if (!dir) return;
+        vdirDlgEl.close();
+        done(dir);
+      })();
+    };
+    // 「打开 .pkg」也收进这个对话框：它自带新建流程（自己找项目目录），这里只负责把文件选择器叫起来
+    vdirPkgEl.onclick = () => {
+      vdirDlgEl.close();
+      inPkgEl.click();
+    };
+    vdirCancelEl.onclick = () => vdirDlgEl.close();
+    vdirDlgEl.onclose = () => done(null);
+    void render();
+    vdirDlgEl.showModal();
+  });
+}
+
+/**
+ * 刷新 / 重开后找回浏览器存储里的工程（不是 ?item=<库条目>）。
+ * 复用现成的草稿横幅 DOM（#ed-draft），不自动打开 —— 由用户点一下。
+ */
+async function checkVirtualResume() {
+  if (new URL(location.href).searchParams.get("item")) return;
+  const id = lastVirtualProjectId();
+  if (!id) return;
+  let recs: VdirRecord[] = [];
+  try {
+    recs = await listVirtualProjects();
+  } catch (e) {
+    log(et("log.vdirFailed", { msg: (e as Error).message }), "warn");
+    return;
+  }
+  const rec = recs.find((r) => r.id === id);
+  if (!rec) {
+    setLastVirtualProjectId(null);
+    return;
+  }
+  draftTextEl.textContent = et("vdir.found", { name: rec.name, time: new Date(rec.updatedAt).toLocaleString() });
+  draftRestoreEl.onclick = () => {
+    draftBannerEl.hidden = true;
+    void resumeVirtualProject(rec);
+  };
+  draftDiscardEl.onclick = () => {
+    draftBannerEl.hidden = true;
+  };
+  draftBannerEl.hidden = false;
+}
+
+/** 打开一个内置工程接着编辑（空工程按新建流程初始化），之后的改动自动保存回浏览器存储 */
+async function resumeVirtualProject(rec: VdirRecord) {
+  const dir = await openVirtualProject(rec.id).catch((e) => {
+    log(et("log.vdirFailed", { msg: (e as Error).message }), "error");
+    return null;
+  });
+  if (!dir) {
+    log(et("log.vdirMissing", { name: rec.name }), "warn");
+    return;
+  }
+  setLastVirtualProjectId(rec.id);
+  try {
+    const files = await filesFromDirectory(dir);
+    if (!files.some((f) => !/(^|\/)(\.[^/]*|Thumbs\.db|desktop\.ini)$/i.test(f.path))) {
+      await createNew([], dir);
+      log(et("log.vdirResumed", { name: dir.name }));
+      return;
+    }
+    adoptProject(dir);
+    await openWith(dir.name, () => openLocalFiles(files), { origin: { kind: "local" } });
+    log(et("log.vdirResumed", { name: dir.name }));
+  } catch (e) {
+    log(et("log.openFailed", { msg: (e as Error).message }), "error");
+  }
+}
+
+// 「打开 .pkg」已收进「打开」对话框（见 pickVirtualProject），这里不再有独立的工具条按钮
 $<HTMLButtonElement>("#tb-open-dir").onclick = () =>
   void (async () => {
-    const dir = await requireProjectDir();
+    const dir = await requireProjectDir("open");
     if (!dir) return;
     try {
       const files = await filesFromDirectory(dir);
@@ -4921,13 +5318,22 @@ async function replaceSound(id: number | string, file: File) {
   objEdit(et("log.soundEdited", { layer: nodeName(id), field: et("snd.file") }), id, (o) => replaceSoundFile(o, path));
 }
 
-/** 试听：页面自己的 audio 元素（引擎在编辑器里恒静音挂载） */
+/**
+ * 试听：页面自己的 audio 元素。
+ * 引擎在编辑器里按音量滑杆挂载（默认 0 = 静音），试听这条不走引擎的声音层；但会给元素
+ * 挂一个 AnalyserNode 当引擎的音频源 —— 于是「试听时频谱条跟着动」，
+ * 不用开系统音频也能在编辑器里看音频反应层。
+ */
 let preview: { path: string; au: HTMLAudioElement; url: string } | null = null;
+let previewAudio: ElementAudioSource | null = null;
 function stopPreview() {
   if (!preview) return;
   preview.au.pause();
   URL.revokeObjectURL(preview.url);
   preview = null;
+  previewAudio?.dispose();
+  previewAudio = null;
+  renderSettings.setPreviewAudio(null);
 }
 
 async function togglePreview(path: string, volume: number, loop: boolean, btn: HTMLButtonElement) {
@@ -4949,6 +5355,9 @@ async function togglePreview(path: string, volume: number, loop: boolean, btn: H
   au.loop = loop;
   const p = { path, au, url };
   preview = p;
+  previewAudio?.dispose();
+  previewAudio = createElementAudioSource(au);
+  renderSettings.setPreviewAudio(previewAudio);
   au.onended = () => {
     if (preview !== p) return;
     stopPreview();
@@ -5687,16 +6096,35 @@ function renderInspector() {
     const p = doc.project;
     const res = sceneResolution(doc.scene);
     const props = (p?.general as Record<string, unknown> | undefined)?.properties;
-    inspectorEl.appendChild(
-      kvGroup(et("insp.project"), [
-        ["f.title", typeof p?.title === "string" ? p.title : doc.title],
-        ["f.type", doc.type],
-        ["f.file", p?.file],
-        ["f.form", doc.form ? et(`form.${doc.form}`) : "—"],
-        ["f.resolution", res ? `${res.w} × ${res.h}` : "—"],
-        ["f.props", props && typeof props === "object" ? String(Object.keys(props).length) : "0"],
-      ]),
-    );
+    const card = kvGroup(et("insp.project"), [
+      ["f.title", typeof p?.title === "string" ? p.title : doc.title],
+      ["f.type", doc.type],
+      ["f.file", p?.file],
+      ["f.form", doc.form ? et(`form.${doc.form}`) : "—"],
+      ["f.resolution", res ? `${res.w} × ${res.h}` : "—"],
+      ["f.props", props && typeof props === "object" ? String(Object.keys(props).length) : "0"],
+    ]);
+    // 工程名可改：壁纸库条目名的来源是 project.json 的 title，所以按钮改的是它
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.id = "proj-rename";
+    renameBtn.className = "ed-btn";
+    renameBtn.dataset.et = "proj.rename";
+    renameBtn.textContent = et("proj.rename");
+    renameBtn.addEventListener("click", () => beginRenameProject());
+    card.appendChild(renameBtn);
+    // 浏览器存储里的工程可以整份落到本机文件夹（此后自动保存跟着走）；已经绑真目录就不显示
+    if (projectDir && virtualIdOf(projectDir) && canPickDirectory()) {
+      const localBtn = document.createElement("button");
+      localBtn.type = "button";
+      localBtn.id = "proj-save-local";
+      localBtn.className = "ed-btn";
+      localBtn.dataset.et = "proj.saveLocal";
+      localBtn.textContent = et("proj.saveLocal");
+      localBtn.addEventListener("click", () => void saveProjectToLocalDir());
+      card.appendChild(localBtn);
+    }
+    inspectorEl.appendChild(card);
     if (doc.type === "scene") {
       inspectorEl.appendChild(userPropsGroup());
       inspectorEl.appendChild(note(et("insp.none")));
@@ -6069,3 +6497,5 @@ void (async () => {
   panelTabs.left.select("library");
   await openLibrary(it);
 })();
+// 内置浏览器里刷新 / 重开后，提示上次的工程还在（有 ?item= 时按库条目走，不提示）
+void checkVirtualResume();

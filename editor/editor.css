@@ -1174,6 +1174,31 @@ input.ed-al-name {
   font-weight: 600;
 }
 
+/* 视口工具条的「渲染选项」菜单：把原右侧「渲染」标签的两组全局偏好收进来 */
+.ed-render-menu {
+  width: 268px;
+  gap: 2px;
+  padding: 6px 8px 8px;
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+}
+
+.ed-render-menu .ed-menu-title {
+  padding: 4px 2px 2px;
+  color: var(--wb-fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ed-render-menu .wb-field {
+  grid-template-columns: minmax(64px, 34%) minmax(0, 1fr);
+  padding: 0 2px;
+}
+
+.ed-render-menu > .wb-hint {
+  margin: 6px 2px 0;
+}
+
 .ed-new-row input[type="number"] {
   width: 72px;
 }
@@ -1220,6 +1245,106 @@ input.ed-al-name {
   box-shadow: var(--wb-shadow-pop);
 }
 
+/* 内置浏览器工程选择：宽一点，列表可滚 */
+.ed-dialog.ed-vdir {
+  width: min(520px, calc(100vw - 48px));
+}
+
+.ed-vdir-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(46vh, 360px);
+  margin: 10px 0 4px;
+  overflow: auto;
+}
+
+.ed-vdir-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--wb-line);
+  border-radius: var(--wb-radius);
+  background: var(--wb-bg-1);
+}
+
+.ed-vdir-row .ed-vdir-open {
+  display: flex;
+  flex: 1;
+  gap: 10px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--wb-fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ed-vdir-row .ed-vdir-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ed-vdir-row .ed-vdir-time {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-sm);
+}
+
+/* 标题栏改名：就地输入框与提示 */
+#ed-doc-title:not(:empty) {
+  cursor: text;
+}
+
+/* 音频电平条：16 根柱子，--lvl 由 editor/audio-live.ts 每帧写（0-100） */
+.wb-audio-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 22px;
+  margin: 2px 0 4px;
+  padding: 2px 3px;
+  border-radius: 3px;
+  background: rgba(127, 127, 127, 0.14);
+}
+
+.wb-audio-meter > i {
+  flex: 1;
+  height: 100%;
+  min-height: 1px;
+  border-radius: 1px;
+  background: linear-gradient(to top, currentColor var(--lvl, 0%), rgba(127, 127, 127, 0.25) var(--lvl, 0%));
+  opacity: 0.9;
+}
+
+#ed-doc-title .ed-doc-rename {
+  width: 14ch;
+  min-width: 8ch;
+  max-width: 34ch;
+  padding: 1px 4px;
+  border: 1px solid var(--wb-line-strong);
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-bg-1);
+  color: var(--wb-fg-strong);
+  font: inherit;
+}
+
+/* 浏览器存储里的工程：状态栏这一格可以点，整份存到本机文件夹 */
+#st-save.is-clickable {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+#st-save.is-clickable:hover {
+  color: var(--wb-fg-strong);
+}
+
 .ed-dialog::backdrop {
   background: rgb(0 0 0 / 0.45);
 }
@@ -1240,6 +1365,7 @@ input.ed-al-name {
 .ed-dialog-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
 }
 

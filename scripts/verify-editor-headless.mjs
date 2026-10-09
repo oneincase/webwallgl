@@ -26,6 +26,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const near = (a, b, eps) => Math.abs(a - b) <= eps;
 /** 页内片段：元素在检视器未选中的标签页里就先点开那一页（hidden 的输入框 focus 不上） */
 const REVEAL = `const reveal = (el) => { const p = el?.closest('.ed-insp-panel[hidden]'); if (p) document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').click(); return el; };`;
+/** 内置粒子预设（editor/particles.ts PARTICLE_PRESETS）；插件还能再贡献，故只断言这四个都在。 */
+const BUILTIN_PRESETS = ["snow", "rain", "embers", "bokeh"];
 
 export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB }) {
   const src = path.join(LIB, FIXTURE);
@@ -123,6 +125,43 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await click(r);
   };
 
+  // ---- 项目保存位置：默认浏览器存储，真目录必须显式选 ----
+  /** 「打开项目」对话框 →「打开本地文件夹…」：只有明确选本机文件夹才走真目录（e2e 假选择器） */
+  const openLocal = async () => {
+    await clickSel("#tb-open-dir");
+    await waitFor(`!!document.querySelector('#vdir-dlg')?.open`, 30000);
+    await clickSel("#vdir-local");
+  };
+  /** 等盘上文件出现（真目录由 e2e 假目录异步镜像到 lib/） */
+  const waitFileOnDisk = async (p, ms = 15000) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (fs.existsSync(p)) return true;
+      await sleep(120);
+    }
+    return fs.existsSync(p);
+  };
+  /** 浏览器存储里的工程整份落到本机文件夹（状态栏 / 工程卡那颗按钮）；已经是真目录就直接返回 */
+  const saveToLocal = async () => {
+    if (!(await ev(`!!localStorage.getItem('webwallgl-vdir-last')`))) return null;
+    await clickSel("#st-save");
+    await waitFor(`!localStorage.getItem('webwallgl-vdir-last')`, 30000);
+    const id = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+    await waitFileOnDisk(path.join(lib, String(id), "project.json"));
+    check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(path.join(lib, id, "project.json")), `「存到本机文件夹…」：浏览器存储里的工程整份落到真目录（${id}）`);
+    return id;
+  };
+
+  /** 清掉编辑器自己的 IndexedDB（草稿 + 虚拟工程）与「上次打开」，让 e2e 从干净状态开始 */
+  const clearLocalStore = () =>
+    ev(`(async () => {
+      for (const n of ['webwallgl-editor', 'webwallgl-vdir']) {
+        await new Promise((ok) => { const r = indexedDB.deleteDatabase(n); r.onsuccess = r.onerror = r.onblocked = () => ok(true); });
+      }
+      try { localStorage.removeItem('webwallgl-vdir-last'); } catch (e) { /* 无痕 */ }
+      return true;
+    })()`);
+
   // ---- 编辑器页 DOM 状态 ----
   const READY = "/首帧就绪|First frame ready/";
   const SAVED = "/保存用时|Save took/";
@@ -189,7 +228,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await cdp.send("Page.navigate", { url: `${origin}/editor/index.html` });
   await waitFor(editorReady, 90000);
   await ev(`(() => { window.__e2eMode = 'seed'; window.__e2eSeed = ${JSON.stringify({ base: `${origin}/media/dev/${FIXTURE}/`, paths: beachFiles })}; return true; })()`);
-  await clickSel("#tb-open-dir");
+  await openLocal();
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${objects.length}`, 90000);
   await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
   await waitFor(`${READY}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
@@ -518,7 +557,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await cdp.send("Page.navigate", { url: `${origin}/editor/index.html` });
   await waitFor(editorReady, 90000);
   await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(saved[0])}; return true; })()`);
-  await clickSel("#tb-open-dir");
+  await openLocal();
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${n0}`, 90000);
   await waitFor(`${READY}.test(document.querySelector('#ed-con-body').textContent)`, 90000);
   check(JSON.stringify(await treeNames()) === JSON.stringify(sScene2.objects.map((o) => o.name)), "重新打开：图层树与盘上 scene.json 一致");
@@ -531,7 +570,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await session.screenshot({ out: path.join(ROOT, "scripts/.tmp-editor-e2e/reopened.jpg") });
   console.log(`  截图：scripts/.tmp-editor-e2e/reopened.jpg`);
 
-  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
+  await runCreateAndDraft({ check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, openLocal, saveToLocal, waitFileOnDisk, clearLocalStore, helpers: { readyCount, waitRemount, savedCount, waitSaved, treeNames, selectedName, numInputs, setInputs, dirtyTitle, canvasRect, rowCenter, rowButton, errorLines }, objects, session });
 
   await session.close();
   await server.close();
@@ -571,7 +610,7 @@ export function stripePng(w, h, top, bottom) {
  * 不读编辑器页任何内部状态。
  */
 async function runCreateAndDraft(ctx) {
-  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, helpers: h, objects } = ctx;
+  const { check, section, tmpRoot, lib, origin, cdp, ev, waitFor, click, drag, mouse, key, clickSel, MOD, captureDownload, openLocal, saveToLocal, waitFileOnDisk, clearLocalStore, helpers: h, objects } = ctx;
   const RED = [220, 30, 30];
   const BLUE = [30, 30, 220];
   const BG = "#336699";
@@ -610,10 +649,15 @@ async function runCreateAndDraft(ctx) {
   const reopen = async (id, query = "") => {
     await gotoEditor(query);
     await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(id)}; return true; })()`);
-    await clickSel("#tb-open-dir");
+    await openLocal();
   };
-  /** ⌘S 立刻写入当前项目文件夹，返回条目 id */
+  /**
+   * ⌘S 落盘，返回条目 id。
+   * 新建工程默认落在浏览器存储里，所以先「存到本机文件夹…」绑到真目录（这一段要断言盘上文件）；
+   * 已经绑在真目录上时这一步是空操作。
+   */
   const saveLoose = async () => {
+    await saveToLocal();
     const sc = await h.savedCount();
     await key("s", MOD.meta);
     await h.waitSaved(sc);
@@ -644,6 +688,7 @@ async function runCreateAndDraft(ctx) {
   section("Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）");
   await gotoEditor();
   await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await clearLocalStore();
   await gotoEditor();
   check(!(await ev(`document.querySelector('#tb-new').disabled`)), "「新建」按钮可用");
   await clickSel("#tb-new");
@@ -664,7 +709,11 @@ async function runCreateAndDraft(ctx) {
   // 选图加层：400×200，上红下蓝，放在中心、不缩放
   await addImage(stripePath);
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && (await h.selectedName()) === "stripe", "选图后树里多一层「stripe」并选中");
-  check(await h.dirtyTitle(), "加图后出现脏标记");
+  // addImage 里的 waitRemount 可能已跨过 AUTOSAVE_MS=400ms（机器忙时），此时脏标记已被自动保存清掉；
+  // 两者都是「编辑已生效」的合法终态，故二者取一。
+  const dirtyAfterImage = await h.dirtyTitle();
+  const savedAfterImage = /已保存|Saved/.test(await ev(`document.querySelector('#st-save').textContent`));
+  check(dirtyAfterImage || savedAfterImage, `加图后出现脏标记（或 400ms 内已自动保存落盘：dirty=${dirtyAfterImage} saved=${savedAfterImage}）`);
   let v = await h.numInputs();
   check(v[0] === 960 && v[1] === 540 && v[3] === 1, `新图层在场景中心、原尺寸（origin ${v[0]},${v[1]} scale ${v[3]}）`);
   const topPt = worldToPage(cr, [960 + 150, 540 + 50]);
@@ -754,7 +803,8 @@ async function runCreateAndDraft(ctx) {
   const bgDown = await pixelAt(worldToPage(crBg, [150, 150]));
   check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]) && (await h.dirtyTitle()), "图片背景模板：一层背景图、带脏标记（有内容可丢）");
   check(isRed(bgUp) && isBlue(bgDown), `图片背景铺满整个场景（左上 ${bgUp} / 左下 ${bgDown}）`);
-  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  // 这个临时工程默认也落在浏览器存储里：清干净，免得下面刷新时弹出「上次的工程」恢复横幅
+  await clearLocalStore();
 
   // ════════════════════════════════════════════════════════════════════════
   section("R. 项目自动保存（刷新不靠草稿；再打开文件夹图层还在）");
@@ -762,7 +812,7 @@ async function runCreateAndDraft(ctx) {
   check(!(await bannerShown()), "打开编辑器没有草稿横幅");
   {
     const rcE = await h.readyCount();
-    await clickSel("#tb-open-dir");
+    await openLocal();
     await h.waitRemount(rcE);
     check((await h.treeNames()).length === 0 && /1920×1080/.test(await ev(`document.querySelector('#st-res').textContent`)), "「打开项目」选空文件夹：在里面新建空白项目");
     const idE = await saveLoose();
@@ -796,6 +846,48 @@ async function runCreateAndDraft(ctx) {
   check(errsR.length === 0, `自动保存流程无错误${errsR.length ? `：${errsR.slice(0, 2).join(" / ")}` : ""}`);
 
   // ════════════════════════════════════════════════════════════════════════
+  section("R2. 新建默认落浏览器存储（真目录只在明确选本机文件夹时才用）");
+  await gotoEditor();
+  await newBlank("#123456");
+  check(
+    await ev(
+      `document.querySelector('#st-save').classList.contains('is-clickable') && /浏览器存储/.test(document.querySelector('#st-save').title)`,
+    ),
+    "新建后状态栏写「浏览器存储 · 自动保存」，并提示点它可存到本机文件夹",
+  );
+  check(await ev(`document.querySelector('#proj-save-local') !== null`), "工程卡给出「存到本机文件夹…」按钮");
+  await addImage(stripePath);
+  {
+    const sc = await h.savedCount();
+    await key("s", MOD.meta);
+    await h.waitSaved(sc);
+  }
+  const vdirId = await ev(`localStorage.getItem('webwallgl-vdir-last')`);
+  check(typeof vdirId === "string" && /^vdir-/.test(vdirId), `⌘S 直接写进浏览器存储（${vdirId}）`);
+  check(!fs.existsSync(path.join(lib, String(vdirId))), "没有落进任何本机文件夹（真目录必须显式选）");
+  check(!(await bannerShown()), "正在编辑时没有恢复横幅");
+  await gotoEditor();
+  await waitFor(`!document.querySelector('#ed-draft').hidden`, 30000);
+  const bannerText = await ev(`document.querySelector('#ed-draft-text').textContent`);
+  check(/未命名|Untitled/.test(bannerText), `刷新后给出「上次的工程…还在」恢复横幅（${bannerText}）`);
+  await clickSel("#draft-restore");
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`!document.querySelector('#tb-export').disabled`, 90000);
+  check(JSON.stringify(await h.treeNames()) === JSON.stringify(["stripe"]), "点「恢复」后图层还在（浏览器存储里的工程刷新能找回）");
+  check(
+    await ev(`/浏览器存储/.test(document.querySelector('#st-save').title)`),
+    "恢复后仍然绑定浏览器存储（没有悄悄改成真目录）",
+  );
+  const idLocal = await saveToLocal();
+  check(
+    typeof idLocal === "string" && idLocal !== vdirId && fs.existsSync(path.join(lib, idLocal, "scene.json")),
+    `「存到本机文件夹…」把整份另存为真目录（${idLocal}）`,
+  );
+  await gotoEditor();
+  await new Promise((r) => setTimeout(r, 600));
+  check(!(await bannerShown()), "存到本机文件夹后刷新不再提示浏览器存储里的旧工程");
+
+  // ════════════════════════════════════════════════════════════════════════
   section("T. 效果库端到端（空白 → 图片层 + 2 个内置效果 → 存库 → 测试台出帧一致）");
   const fxNames = () => ev(`[...document.querySelectorAll('.ed-fx-item')].map((e) => e.dataset.fxId)`);
   const fxAct = async (js) => {
@@ -822,7 +914,16 @@ async function runCreateAndDraft(ctx) {
   const tTop = worldToPage(crT, [1110, 590]);
   const tBot = worldToPage(crT, [1110, 490]);
   const tOut = worldToPage(crT, [300, 540]);
-  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled && document.querySelectorAll('#fx-add option').length === 15`), "选中图片层：检视器有「效果」分组，下拉列出 14 个内置效果");
+  // 选项数 = 1 个占位 + effectCatalog.list()（内置 14 个 + examples/plugins 贡献的 fx-crt / fx-glow）
+  // ⇒ 断言「内置 14 个一个不少」，不锁死总数，插件多寡不影响这条。
+  const fxOpts = await ev(`[...document.querySelectorAll('#fx-add option')].map((o) => o.value)`);
+  const BUILTIN_FX = ["tint", "adjust", "vignette", "blur", "wave", "scroll", "pulse", "outline", "glow", "chroma", "pixelate", "shine", "fade", "audiobars"];
+  check(
+    (await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled`)) &&
+      fxOpts[0] === "" &&
+      BUILTIN_FX.every((id) => fxOpts.includes(id)),
+    `选中图片层：检视器有「效果」分组，下拉列出全部 14 个内置效果（实得 ${fxOpts.length} 项：${fxOpts.join(",")}）`,
+  );
   check((await fxNames()).length === 0, "初始无效果");
 
   await fxAdd("tint");
@@ -1208,7 +1309,7 @@ async function runCreateAndDraft(ctx) {
 
   await gotoEditor();
   await ev(`(() => { window.__e2eMode = 'seed'; window.__e2eSeed = ${JSON.stringify({ base: `${origin}/media/dev/${playId}/`, paths: ["preview.jpg", "project.json", "scene.pkg"] })}; return true; })()`);
-  await clickSel("#tb-open-dir");
+  await openLocal();
   await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
   await waitFor(firstFrame, 90000);
   await settle();
@@ -1379,7 +1480,12 @@ async function runCreateAndDraft(ctx) {
   await newBlank("#000000");
   check(!(await ev(`document.querySelector('#ly-add-particle').disabled`)), "新建后「添加粒子层」可用");
   await clickSel("#ly-add-particle");
-  check(await ev(`!document.querySelector('#particle-menu').hidden && document.querySelectorAll('#particle-menu button[data-preset]').length === 4`), "点开粒子菜单：雪 / 雨 / 火花 / 光点四项");
+  // examples/plugins/particle-fireflies 会多贡献一个预设 ⇒ 断言四个内置预设都在，不锁死总数。
+  const presetVals = await ev(`[...document.querySelectorAll('#particle-menu button[data-preset]')].map((b) => b.dataset.preset)`);
+  check(
+    (await ev(`!document.querySelector('#particle-menu').hidden`)) && BUILTIN_PRESETS.every((p) => presetVals.includes(p)),
+    `点开粒子菜单：雪 / 雨 / 火花 / 光点四项（实得 ${presetVals.length} 项：${presetVals.join(",")}）`,
+  );
   await clickSel("#ly-add-text");
   check(await ev(`document.querySelector('#particle-menu').hidden && !document.querySelector('#text-menu').hidden`), "点文字按钮：粒子菜单收起、文字菜单打开（同时只开一个）");
   await clickSel("#ly-add-text");
@@ -1581,7 +1687,14 @@ async function runCreateAndDraft(ctx) {
   const inspTabs = () => ev(`(() => { const tabs = [...document.querySelectorAll('#ed-inspector .ed-insp-tab')]; return { ids: tabs.map((b) => b.dataset.tab), active: tabs.filter((b) => b.getAttribute('aria-selected') === 'true').map((b) => b.dataset.tab), shown: [...document.querySelectorAll('#ed-inspector .ed-insp-panel')].filter((p) => !p.hidden).map((p) => p.dataset.tab), animIn: document.querySelector('.ed-anim')?.closest('.ed-insp-panel')?.dataset.tab, fxIn: document.querySelector('.ed-fx')?.closest('.ed-insp-panel')?.dataset.tab }; })()`);
   await clickSel('.ed-insp-tab[data-tab="props"]');
   let tb = await inspTabs();
-  check(json(tb.ids) === json(["props", "anim", "fx", "logic", "info"]) && json(tb.active) === json(["props"]) && json(tb.shown) === json(["props"]) && tb.animIn === "anim", `文字层检视器分标签：属性 / 动画 / 效果 / 逻辑 / 信息，只显示当前页（${json(tb)}）`);
+  // examples/plugins/inspector-layer-stats 会贡献一个 "stats" 标签 ⇒ 只锁内置五个都在，额外标签放行。
+  check(
+    json(tb.active) === json(["props"]) &&
+      json(tb.shown) === json(["props"]) &&
+      tb.animIn === "anim" &&
+      ["props", "anim", "fx", "logic", "info"].every((t) => tb.ids.includes(t)),
+    `文字层检视器分标签：属性 / 动画 / 效果 / 逻辑 / 信息，只显示当前页（${json(tb)}）`,
+  );
   await clickSel('.ed-anim-keys[data-field="origin"] button[data-frame="0"]');
   await settle();
   tb = await inspTabs();
@@ -2244,11 +2357,14 @@ async function runCreateAndDraft(ctx) {
   await key("z", MOD.meta | MOD.shift);
   await waitFor(`${VREADY} > ${vr}`, 60000);
   check(Math.abs((await tlMax()) - 1) < 0.15, "重做裁剪：又是 1s");
+  // 视频壁纸工程也默认建在浏览器存储里：先整份落到本机文件夹，再看盘上产物
+  await saveToLocal();
   const scVp = await h.savedCount();
   await key("s", MOD.meta);
   await h.waitSaved(scVp);
   const idVp = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
   const dirVp = path.join(lib, idVp);
+  await waitFileOnDisk(path.join(dirVp, "project.json"));
   const pjVp = JSON.parse(fs.readFileSync(path.join(dirVp, "project.json"), "utf8"));
   check(pjVp.type === "video" && pjVp.file === "clip.mp4" && fs.existsSync(path.join(dirVp, "preview.jpg")) && fs.statSync(path.join(dirVp, "clip.mp4")).size < clipBytes.length, "视频壁纸工程存盘：project.json(type=video) + 裁剪后的 clip.mp4 + 封面");
   const rcS = await h.readyCount();

@@ -24,11 +24,15 @@ export type BatchCmd = { kind: "batch"; label: string; cmds: PropsCmd[] };
 /** 视频壁纸工程换视频本体（裁剪 / 替换）：前后两份字节整体记账 */
 export type VideoClip = { path: string; bytes: Uint8Array };
 export type VideoCmd = { kind: "video"; label: string; before: VideoClip; after: VideoClip };
-export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd;
+/** 文档级改名（工程名）：doc.title 与 project.json 的 title 一起记账 —— 结构命令的快照只覆盖 objects，装不下它 */
+export type TitleSnap = { title: string; projectTitle: string | null };
+export type TitleCmd = { kind: "title"; label: string; before: TitleSnap; after: TitleSnap };
+export type EditCmd = PropsCmd | StructCmd | BatchCmd | VideoCmd | TitleCmd;
 
 export const isStruct = (c: EditCmd): c is StructCmd => "kind" in c && c.kind === "struct";
 export const isBatch = (c: EditCmd): c is BatchCmd => "kind" in c && c.kind === "batch";
 export const isVideoCmd = (c: EditCmd): c is VideoCmd => "kind" in c && c.kind === "video";
+export const isTitleCmd = (c: EditCmd): c is TitleCmd => "kind" in c && c.kind === "title";
 
 /** 去掉前后一致的条目；剩一条时退回普通属性命令，一条不剩返回 null */
 export function batchCommand(label: string, cmds: readonly PropsCmd[]): EditCmd | null {

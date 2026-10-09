@@ -1984,6 +1984,192 @@ section("AA2. 声音层闭环（新建 → 导入两段音频、撤掉一层 →
   }
 }
 
+section("AA3. 编辑器音频源 editor/audio-live.ts（系统音频 / 试听 → 引擎频谱）");
+{
+  const al = await loadEditorModule("audio-live");
+  const frame = new Array(64).fill(0);
+  frame[0] = 255;
+  frame[1] = 128;
+  frame[63] = 51;
+  const fb = al.bandsFromFrame(frame);
+  check(
+    fb.left.length === 64 && fb.right.length === 64 && fb.left[0] === 1 && near(fb.left[1], 128 / 255, 1e-6) && near(fb.left[63], 0.2, 1e-6) && json([...fb.left]) === json([...fb.right]),
+    "系统音频帧（64 段 0-255）→ 引擎要的 0..1 快照，左右同值",
+  );
+  check(al.bandsFromFrame(null) === null && al.bandsFromFrame([]) === null, "连不上 media-bridge（没有频段）时不产快照，交回引擎内置源");
+  const bad = al.bandsFromFrame([Number.NaN, -5, 999, "x"]);
+  check([...bad.left].every((v) => v >= 0 && v <= 1) && [...bad.right].every((v) => v >= 0 && v <= 1), "越界 / NaN / 非数字的频段被夹到 0..1");
+  const sil = al.silentBands();
+  check(
+    sil.left.length === 64 && sil.right.length === 64 && sil.left.every((v) => v === 0) && sil.right.every((v) => v === 0),
+    "静默快照显式喂全零（GL uniform 数组不清会留上一帧）",
+  );
+  const sys = al.createSystemAudioSource();
+  check(
+    sys.status() === "off" && sys.live() === false && sys.snapshot().left.every((v) => v === 0) && sys.snapshot().right.every((v) => v === 0),
+    "系统音频源没开听时状态 off、快照全零（不抛错，宿主没装 media-bridge 也照常挂载）",
+  );
+  sys.start();
+  sys.start(); // 幂等：重复开会话不叠加连接
+  sys.stop();
+  check(sys.status() === "off" && sys.live() === false, "开 / 关系统音频幂等，关掉后状态回到 off");
+  const freq = new Uint8Array(1024);
+  freq[5] = 255;
+  const bf = al.bandsFromFreq(freq);
+  check(
+    bf.left.length === 64 && [...bf.left].filter((v) => v > 0).length === 1 && Math.max(...bf.left) === 1,
+    "FFT 幅度谱按对数分桶（与 bgm-analyser 同公式），单个峰只落一段",
+  );
+  const lv = al.meterLevels(bf, 16);
+  check(lv.length === 16 && lv.filter((v) => v > 0).length === 1 && Math.max(...lv) === 1, "面板电平条 16 段，每 4 段取最大");
+  check(typeof al.mountAudioMeter === "function" && typeof al.createElementAudioSource === "function", "导出电平条与试听分析源");
+  const alSrc = fs.readFileSync(path.join(ROOT, "editor/audio-live.ts"), "utf8");
+  check(
+    /node\.connect\(analyser\)[\s\S]{0,200}analyser\.connect\(ctx\.destination\)/.test(alSrc) && !/ctx\.state === "running"/.test(alSrc),
+    "试听分析源：采集后接回输出（不会把试听掐哑），且不等 AudioContext 跑起来才建图",
+  );
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const rsSrc = fs.readFileSync(path.join(ROOT, "editor/ui/render-settings.ts"), "utf8");
+  check(
+    /createElementAudioSource\(au\)/.test(mainSrc) && /setPreviewAudio\(previewAudio\)/.test(mainSrc) && /previewAudio\?\.dispose\(\);\s*previewAudio = null;\s*renderSettings\.setPreviewAudio\(null\)/.test(mainSrc),
+    "试听元素接成引擎音频源（试听时频谱条跟着动），停止 / 播完时清掉",
+  );
+  check(
+    /sysAudio: \$\("#audio-sys"\)/.test(mainSrc) && /audioMeter: \$\("#audio-meter"\)/.test(mainSrc) && /audioStatus: \$\("#audio-state"\)/.test(mainSrc),
+    "渲染面板的开关 / 状态 / 电平条接进 renderSettings",
+  );
+  check(
+    /id="audio-sys"/.test(htmlSrc) && /id="audio-state"/.test(htmlSrc) && /id="audio-meter"/.test(htmlSrc) && /id="volume" type="range"/.test(htmlSrc),
+    "页面：音量（出声）之外另给「系统音频」开关 + 状态 + 电平条",
+  );
+  check(
+    /if \(src\) opts\.audio = src;/.test(rsSrc) && /o\.instance\(\)\?\.setAudio\(src\)/.test(rsSrc) && /activeSrc\(\)/.test(rsSrc),
+    "只在真开着音频源时才带 audio 键（键存在 = 接管整条音频模拟），换源走 setAudio 热更",
+  );
+  const fxSrc = fs.readFileSync(path.join(ROOT, "editor/effects.ts"), "utf8");
+  check(
+    /id: "audiobars"|def\("audiobars"/.test(fxSrc) && /g_AudioSpectrum32Left\[32\]/.test(fxSrc) && /g_AudioSpectrum32Right\[32\]/.test(fxSrc),
+    "内置效果 audiobars（音频频谱条）：声明 WE 的 g_AudioSpectrum32* 直接吃引擎频谱",
+  );
+}
+
+
+section("AA4. 内置浏览器虚拟工程 editor/vdir.ts（DirHandle 兼容 + 刷新找回）");
+{
+  const vd = await loadEditorModule("vdir");
+  const be = vd.memoryVdirBackend();
+  const dir = await vd.createVirtualProject("Wall 1", be, 1000);
+  check(vd.virtualIdOf(dir) === dir.vdirId && dir.name === "Wall 1" && dir.kind === "directory", "新建虚拟工程：拿到一个 DirHandle（name / kind / vdirId 齐全）");
+  check(vd.virtualIdOf({ name: "real", getDirectoryHandle() {} }) === null, "真目录（没有 vdirId）不被当虚拟工程");
+  check((await vd.openVirtualProject("vdir-不存在", be)) === null, "打开不存在的虚拟工程返回 null，不抛错");
+  const td = new TextEncoder();
+  await saveMod.writeToDirectory(dir, [
+    { path: "scene.json", data: td.encode('{"objects":[]}') },
+    { path: "project.json", data: td.encode('{"title":"Wall 1"}') },
+    { path: "assets/a.png", data: new Uint8Array([1, 2, 3]) },
+  ]);
+  const files = await saveMod.filesFromDirectory(dir);
+  const bytesOf = async (f) => new Uint8Array(await f.file.arrayBuffer());
+  check(
+    files.length === 3 && json(files.map((f) => f.path).sort()) === json(["assets/a.png", "project.json", "scene.json"]) && same(await bytesOf(files.find((f) => f.path === "assets/a.png")), new Uint8Array([1, 2, 3])),
+    "save.ts 那条写盘链路（writeToDirectory / filesFromDirectory）原样跑在虚拟目录上，二进制逐字节一致",
+  );
+  await saveMod.probeWritable(dir);
+  check(!(await saveMod.filesFromDirectory(dir)).some((f) => f.path === ".webwallgl-write-test"), "可写探测（写一个再删掉）在虚拟目录上也干净收尾");
+  let nonEmpty = null;
+  try {
+    await dir.removeEntry("assets");
+  } catch (e) {
+    nonEmpty = e;
+  }
+  check(nonEmpty?.name === "InvalidModificationError", "目录非空时不带 recursive 删不掉（与 File System Access 同语义）");
+  await saveMod.removeProjectFile(dir, "assets/a.png");
+  check(!(await saveMod.filesFromDirectory(dir)).some((f) => f.path === "assets/a.png"), "removeProjectFile 删得掉（自动保存清理不再引用的资源）");
+  let notFound = null;
+  try {
+    await dir.getFileHandle("nope.txt");
+  } catch (e) {
+    notFound = e;
+  }
+  check(notFound?.name === "NotFoundError" && (await dir.getFileHandle("nope.txt", { create: true }))?.name === "nope.txt", "getFileHandle 默认不建文件（NotFoundError），带 create 才建");
+  const recs = await vd.listVirtualProjects(be);
+  check(recs.length === 1 && recs[0].id === dir.vdirId && recs[0].name === "Wall 1" && typeof recs[0].updatedAt === "number", "工程列表：一条记录（名字 / 更新时间），供对话框与恢复横幅用");
+  await vd.renameVirtualDir(dir, "Wall 2", be);
+  const recs2 = await vd.listVirtualProjects(be);
+  check(dir.name === "Wall 2" && recs2[0].name === "Wall 2", "工程改名：句柄名与浏览器存储里的记录一起对齐");
+  const again = await vd.openVirtualProject(dir.vdirId, be);
+  check(
+    json((await saveMod.filesFromDirectory(again)).map((f) => f.path).sort()) === json(["nope.txt", "project.json", "scene.json"]),
+    "刷新 / 重开：按 id 重新拿到句柄，文件都还在（恢复横幅点一下就能接着编辑）",
+  );
+  vd.setLastVirtualProjectId(dir.vdirId);
+  check(vd.lastVirtualProjectId() === null, "没有 localStorage 的环境（Node）里记「上次工程」不抛错，只是记不住");
+  await vd.deleteVirtualProject(dir.vdirId, be);
+  check((await vd.listVirtualProjects(be)).length === 0 && (await vd.openVirtualProject(dir.vdirId, be)) === null, "删除虚拟工程：列表清空、按 id 再也打不开");
+  const mainSrc2 = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(
+    /async function requireProjectDir\(purpose: DirPurpose = "new"\): Promise<DirHandle \| null> \{\s*return virtualProjectDir\(purpose\);/.test(mainSrc2) &&
+      /async function requireLocalDir\(\): Promise<DirHandle \| null>/.test(mainSrc2) &&
+      /await probeWritable\(dir\)/.test(mainSrc2) &&
+      /requireProjectDir\("open"\)/.test(mainSrc2),
+    "新建默认落浏览器存储（requireProjectDir 只转发 virtualProjectDir）；真实目录只由 requireLocalDir 这条显式选择提供",
+  );
+  check(
+    /void checkVirtualResume\(\);/.test(mainSrc2) &&
+      /async function checkVirtualResume\(\) \{\s*if \(new URL\(location\.href\)\.searchParams\.get\("item"\)\) return;/.test(mainSrc2) &&
+      /async function resumeVirtualProject\(rec: VdirRecord\)/.test(mainSrc2) &&
+      !/async function checkVirtualResume\(\) \{\s*if \(canPickDirectory\(\)\) return;/.test(mainSrc2),
+    "启动时按上次工程提示恢复：新建已默认虚拟，所以任何浏览器都跑（?item= 打开库条目时不打扰）",
+  );
+  const histSrc = fs.readFileSync(path.join(ROOT, "editor/history.ts"), "utf8");
+  check(/isTitleCmd/.test(histSrc) && /kind: "title"/.test(histSrc) && /TitleSnap/.test(histSrc), "工程名改动进撤销栈（结构命令的快照只装 objects，装不下 title）");
+  check(
+    /function renameProject\(raw: string\)/.test(mainSrc2) && /function beginRenameProject\(\)/.test(mainSrc2) && /docTitleEl\.addEventListener\("dblclick"/.test(mainSrc2) && /renameBtn\.id = "proj-rename"/.test(mainSrc2),
+    "改工程名：标题栏双击就地改 / 检视器工程卡按钮，两条入口同一个函数",
+  );
+  const htmlSrc2 = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  check(
+    /id="vdir-dlg"/.test(htmlSrc2) && /id="vdir-list"/.test(htmlSrc2) && /id="vdir-new"/.test(htmlSrc2) && /id="vdir-cancel"/.test(htmlSrc2) && /id="vdir-local"/.test(htmlSrc2) && /id="vdir-pkg"/.test(htmlSrc2) && !/id="tb-open-pkg"/.test(htmlSrc2) && /id="ed-doc-title"/.test(htmlSrc2),
+    "页面：工程列表对话框（含「打开本地文件夹…」和「打开 .pkg」）+ 可改的标题栏；工具条不再单放 .pkg 按钮",
+  );
+  check(
+    /const vdirPkgEl = \$<HTMLButtonElement>\("#vdir-pkg"\);/.test(mainSrc2) &&
+      /vdirPkgEl\.onclick = \(\) => \{\s*vdirDlgEl\.close\(\);\s*inPkgEl\.click\(\);\s*\};/.test(mainSrc2) &&
+      !/tb-open-pkg/.test(mainSrc2),
+    "「打开 .pkg」并进「打开」对话框：按钮只负责叫起文件选择器，导入流程仍自带新建（工具条旧按钮与旧接线已删）",
+  );
+  check(
+    /vdirLocalEl\.hidden = !canPickDirectory\(\)/.test(mainSrc2) &&
+      /vdirLocalEl\.onclick = \(\) => \{\s*void \(async \(\) => \{\s*const dir = await requireLocalDir\(\);/.test(mainSrc2) &&
+      /async function saveProjectToLocalDir\(\)/.test(mainSrc2) &&
+      /localBtn\.id = "proj-save-local"/.test(mainSrc2) &&
+      /virtualIdOf\(projectDir\) && canPickDirectory\(\)/.test(mainSrc2) &&
+      /addEventListener\("click", \(\) => void saveProjectToLocalDir\(\)\)/.test(mainSrc2) &&
+      /stSaveEl\.classList\.toggle\("is-clickable", toLocal\)/.test(mainSrc2),
+    "真实目录三个显式入口：对话框「打开本地文件夹…」（无文件夹权限时隐藏）、工程卡与状态栏的「存到本机文件夹…」（虚拟工程整份落盘）",
+  );
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const twice = (k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}"`, "g")) ?? []).length === 2;
+  check(
+    ["vdir.title", "vdir.local", "vdir.found", "vdir.delConfirm", "vdir.saveHint", "proj.rename", "proj.renameHint", "proj.saveLocal", "st.saveLocalTip", "log.vdirNew", "log.vdirResumed", "log.savedToDir", "log.renamedProject", "log.renameProjectLib", "audio.sys", "audio.live", "audio.previewing", "fx.audiobars", "fxp.mirror"].every(twice),
+    "新增文案中英文都齐（每个键在 i18n.ts 里恰好各出现一次 zh / en）",
+  );
+  check(
+    /"tb\.openDir": "打开"/.test(i18nSrc) && /"tb\.openDir": "Open"/.test(i18nSrc) && twice("tb.openPkg"),
+    "工具条按钮文案：「打开项目」→「打开」（中英文），.pkg 文案留给对话框按钮",
+  );
+  // Node / 无 IndexedDB 环境：默认后端必须退化而不是抛错（否则内置浏览器里「新建项目」整条断掉）
+  vd.setVdirBackend(null);
+  const defRecs = await vd.listVirtualProjects();
+  const defDir = await vd.createVirtualProject("临时", undefined, 2000);
+  check(
+    Array.isArray(defRecs) && defRecs.length === 0 && !!defDir && defDir.kind === "directory" && vd.virtualIdOf(defDir) !== null,
+    `无 IndexedDB 时默认后端退化为会话内内存后端：列表不抛错、仍能新建（typeof indexedDB = ${typeof globalThis.indexedDB}）`,
+  );
+  vd.setVdirBackend(null);
+}
+
 section("AB. 关键帧动画 editor/keyframes.ts + 引擎 seekTime");
 const kfMod = await loadEditorModule("keyframes");
 const snapMod = await loadEditorModule("snap");
@@ -3827,10 +4013,21 @@ section("I. 接线");
     };
     check(!/wb-modes|id="act-bench"|href="\.\.\/"/.test(html) && /<button type="button" class="wb-icon-btn" id="ed-help"/.test(html), "工作台没有「预览 / 编辑器」模式切换，帮助按钮在页内打开使用说明");
     check(json(tabsOf("ed-layers")) === json(["layers", "library"]) && json(tabsOf("ed-center")) === json(["viewport", "docs"]) &&
-      json(tabsOf("ed-console")) === json(["console", "perf"]) && json(tabsOf("ed-right")) === json(["inspector", "config", "render"]),
-      `面板标签：左 图层|壁纸库，中 视口|使用说明，底 控制台|性能，右 检视器|壁纸配置|渲染（${json([tabsOf("ed-layers"), tabsOf("ed-center"), tabsOf("ed-console"), tabsOf("ed-right")])}）`);
+      json(tabsOf("ed-console")) === json(["console", "perf"]) && json(tabsOf("ed-right")) === json(["inspector", "config"]),
+      `面板标签：左 图层|壁纸库，中 视口|使用说明，底 控制台|性能，右 检视器|壁纸配置（${json([tabsOf("ed-layers"), tabsOf("ed-center"), tabsOf("ed-console"), tabsOf("ed-right")])}）`);
     check(["lib-list", "lib-filter", "type-filter", "lib-refresh", "lib-pick", "docs-body", "sponsor-card", "perf-canvas", "props-body", "props-reset", "fps", "volume", "aa", "pq", "pp"].every((id) => html.includes(`id="${id}"`)) &&
       /href="\/editor\/preview\.css"/.test(html), "页面装上了壁纸库 / 使用说明 / 性能 / 壁纸配置 / 渲染设置的控件与样式");
+    // 渲染选项从右侧标签搬进视口工具条的弹出菜单：控件 id 一个不少，标签和面板都不再存在
+    const edCss = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+    check(/id="tb-render-opts"/.test(html) && /id="render-menu"/.test(html) && /id="tb-dpr"/.test(html) &&
+      html.indexOf('id="tb-dpr"') < html.indexOf('id="tb-render-opts"') &&
+      !/data-tab="render"/.test(html) && !/data-pane="render"/.test(html) &&
+      /\.ed-render-menu/.test(edCss) &&
+      /const renderOptsEl = \$<HTMLButtonElement>\("#tb-render-opts"\)/.test(main) && /const renderMenuEl = \$<HTMLElement>\("#render-menu"\)/.test(main) &&
+      /function closeRenderMenu\(\)/.test(main) && /renderOptsEl\.onclick = \(e\) => \{\s*e\.stopPropagation\(\);/.test(main) &&
+      /renderMenuEl\.hidden = false;/.test(main),
+      "「渲染选项」菜单挂在视口工具条渲染 DPR 之后：控件 id 不变（fps/volume/aa/pq/pp），右侧不再有「渲染」标签与面板，弹出按导出菜单那套定位");
+    check(/"render\.opts": "渲染选项"/.test(i18n) && /"render\.opts": "Render options"/.test(i18n), "「渲染选项」按钮中英文文案齐");
     check(/initTabs\(\$\("#ed-layers"\)/.test(main) && /initTabs\(\$\("#ed-center"\)/.test(main) && /initTabs\(\$\("#ed-console"\)/.test(main) && /initTabs\(\$\("#ed-right"\)/.test(main),
       "四个面板都按标签切换");
     check(/openWith\(it\.title, \(\) => openLibraryItem\(it, MEDIA_BASE, WEB_BASE\), \{ origin: \{ kind: "library" \}, library: it, play: true \}\)/.test(main) &&

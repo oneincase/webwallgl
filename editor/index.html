@@ -66,13 +66,9 @@
           <button type="button" id="new-video" data-et="new.video">以视频为背景…</button>
           <button type="button" id="new-video-wp" data-et="new.videoWallpaper">视频壁纸工程…</button>
         </div>
-        <button type="button" class="ed-btn" id="tb-open-pkg" data-et-title="tb.openPkgTitle">
-          <svg class="i" viewBox="0 0 16 16"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z M2.5 4.8L8 7.8l5.5-3 M8 7.8v6.4" /></svg>
-          <span data-et="tb.openPkg">打开 .pkg</span>
-        </button>
         <button type="button" class="ed-btn" id="tb-open-dir" data-et-title="tb.openDirTitle">
           <svg class="i" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3.2l1.5 1.5H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" /></svg>
-          <span data-et="tb.openDir">打开文件夹</span>
+          <span data-et="tb.openDir">打开</span>
         </button>
         <button type="button" class="ed-btn" id="tb-pack" disabled data-et-title="tb.packTitle" aria-haspopup="menu">
           <svg class="i" viewBox="0 0 16 16"><path d="M3 2.5h8.2l2.3 2.3v8.7H3z M5.5 2.5v3.5h5V2.5 M5 13.5v-4h6v4" /></svg>
@@ -82,6 +78,62 @@
           <button type="button" role="menuitem" id="export-pkg" data-et="export.pkg">打包导出 scene.pkg</button>
           <button type="button" role="menuitem" id="export-zip" data-et="export.zip">压缩包导出 .zip</button>
           <button type="button" role="menuitem" id="export-video" data-et="export.video">录制为视频 .mp4…</button>
+        </div>
+        <!-- 渲染选项：全局偏好，所有文档共用（按钮在视口工具条的渲染 DPR 之后，这里只放弹出内容） -->
+        <div id="render-menu" class="ed-menu ed-render-menu" role="dialog" hidden>
+          <div class="ed-menu-title" data-i18n="render.secFrame">帧率与音频</div>
+          <label class="wb-field">
+            <span class="wb-field-label" data-i18n="render.fps">帧率上限</span>
+            <select id="fps">
+              <option value="15">15</option>
+              <option value="30">30</option>
+              <option value="60" selected>60</option>
+            </select>
+          </label>
+          <label class="wb-field" data-et-title="audio.volumeTip" title="大于 0 才会出声（声音层 / 视频音轨）">
+            <span class="wb-field-label" data-i18n="toolbar.volume">音量</span>
+            <span class="wb-field-ctl">
+              <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
+              <span id="volume-val" class="wb-field-val">0%</span>
+            </span>
+          </label>
+          <label class="wb-field" data-et-title="audio.sysTip" title="把系统播放的声音频谱喂给引擎，音频反应层才会在编辑器里动">
+            <span class="wb-field-label" data-et="audio.sys">系统音频</span>
+            <span class="wb-field-ctl">
+              <input id="audio-sys" type="checkbox" />
+              <span id="audio-state" class="wb-field-val" data-et="audio.off">关</span>
+            </span>
+          </label>
+          <div id="audio-meter" class="wb-audio-meter" data-et-title="audio.meterTip" title="编辑器音频电平（试听 / 系统音频）"></div>
+          <div class="ed-menu-title" data-i18n="render.secQuality">画质</div>
+          <label class="wb-field" data-i18n-title="toolbar.aaTip" title="抗锯齿">
+            <span class="wb-field-label" data-i18n="toolbar.aa">抗锯齿</span>
+            <select id="aa">
+              <option value="off" selected data-i18n="quality.off">关</option>
+              <option value="fxaa">FXAA</option>
+              <option value="msaa2">MSAA 2x</option>
+              <option value="msaa4">MSAA 4x</option>
+            </select>
+          </label>
+          <label class="wb-field" data-i18n-title="toolbar.pqTip" title="粒子质量">
+            <span class="wb-field-label" data-i18n="toolbar.pq">粒子</span>
+            <select id="pq">
+              <option value="high" selected data-i18n="quality.high">高</option>
+              <option value="medium" data-i18n="quality.medium">中</option>
+              <option value="low" data-i18n="quality.low">低</option>
+              <option value="off" data-i18n="quality.off">关</option>
+            </select>
+          </label>
+          <label class="wb-field" data-i18n-title="toolbar.ppTip" title="后处理">
+            <span class="wb-field-label" data-i18n="toolbar.pp">后处理</span>
+            <select id="pp">
+              <option value="high" selected data-i18n="quality.high">高</option>
+              <option value="medium" data-i18n="quality.medium">中</option>
+              <option value="low" data-i18n="quality.low">低</option>
+              <option value="off" data-i18n="quality.off">关</option>
+            </select>
+          </label>
+          <p class="wb-hint" data-et="render.hint">全局设置，所有文档共用；改动即时生效，不影响导出的工程。</p>
         </div>
         <div id="rec-menu" class="ed-menu ed-new-menu" role="dialog" hidden>
           <div class="ed-rec-title" data-et="rec.title">录制为视频</div>
@@ -280,6 +332,7 @@
                 <option value="2">2</option>
               </select>
             </label>
+            <button type="button" class="ed-btn" id="tb-render-opts" aria-haspopup="dialog" data-et-title="render.optsTip"><span data-et="render.opts">渲染选项</span></button>
           </div>
 
           <div id="ed-viewport">
@@ -386,7 +439,7 @@
 
       <div class="wb-split" id="ed-split-right"></div>
 
-      <!-- 右：检视器 / 壁纸配置 / 渲染 -->
+      <!-- 右：检视器 / 壁纸配置（渲染选项已移到视口工具条的「渲染选项」菜单） -->
       <section id="ed-right" class="wb-panel is-dock">
         <div class="wb-panel-head">
           <button type="button" class="wb-tab" data-tab="inspector">
@@ -396,10 +449,6 @@
           <button type="button" class="wb-tab" data-tab="config">
             <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2.5 4h7 M12.5 4h1 M2.5 8h2 M7.5 8h6 M2.5 12h5 M10.5 12h3" /><circle cx="11" cy="4" r="1.5" /><circle cx="6" cy="8" r="1.5" /><circle cx="9" cy="12" r="1.5" /></svg>
             <span data-i18n="props.title">壁纸配置</span>
-          </button>
-          <button type="button" class="wb-tab" data-tab="render">
-            <svg class="i i-sm" viewBox="0 0 16 16"><path d="M2 3h12v8H2z M5.5 13.5h5 M8 11v2.5 M5 8.5l2-2.5 1.5 1.5L11 5" /></svg>
-            <span data-et="sec.render">渲染</span>
           </button>
         </div>
         <div id="ed-inspector" class="wb-panel-body is-scroll" data-pane="inspector"></div>
@@ -418,63 +467,6 @@
             <label class="check"><input id="props-all" type="checkbox" /> <span data-i18n="props.showHidden">显示条件隐藏项</span></label>
           </div>
           <div id="props-body" class="wb-selectable"></div>
-        </div>
-
-        <!-- 渲染：全局偏好，所有文档共用 -->
-        <div class="wb-panel-body is-scroll" data-pane="render">
-          <details class="wb-section" open>
-            <summary data-i18n="render.secFrame">帧率与音频</summary>
-            <div class="wb-section-body">
-              <label class="wb-field">
-                <span class="wb-field-label" data-i18n="render.fps">帧率上限</span>
-                <select id="fps">
-                  <option value="15">15</option>
-                  <option value="30">30</option>
-                  <option value="60" selected>60</option>
-                </select>
-              </label>
-              <label class="wb-field">
-                <span class="wb-field-label" data-i18n="toolbar.volume">音量</span>
-                <span class="wb-field-ctl">
-                  <input id="volume" type="range" min="0" max="1" step="0.05" value="0" />
-                  <span id="volume-val" class="wb-field-val">0%</span>
-                </span>
-              </label>
-            </div>
-          </details>
-          <details class="wb-section" open>
-            <summary data-i18n="render.secQuality">画质</summary>
-            <div class="wb-section-body">
-              <label class="wb-field" data-i18n-title="toolbar.aaTip" title="抗锯齿">
-                <span class="wb-field-label" data-i18n="toolbar.aa">抗锯齿</span>
-                <select id="aa">
-                  <option value="off" selected data-i18n="quality.off">关</option>
-                  <option value="fxaa">FXAA</option>
-                  <option value="msaa2">MSAA 2x</option>
-                  <option value="msaa4">MSAA 4x</option>
-                </select>
-              </label>
-              <label class="wb-field" data-i18n-title="toolbar.pqTip" title="粒子质量">
-                <span class="wb-field-label" data-i18n="toolbar.pq">粒子</span>
-                <select id="pq">
-                  <option value="high" selected data-i18n="quality.high">高</option>
-                  <option value="medium" data-i18n="quality.medium">中</option>
-                  <option value="low" data-i18n="quality.low">低</option>
-                  <option value="off" data-i18n="quality.off">关</option>
-                </select>
-              </label>
-              <label class="wb-field" data-i18n-title="toolbar.ppTip" title="后处理">
-                <span class="wb-field-label" data-i18n="toolbar.pp">后处理</span>
-                <select id="pp">
-                  <option value="high" selected data-i18n="quality.high">高</option>
-                  <option value="medium" data-i18n="quality.medium">中</option>
-                  <option value="low" data-i18n="quality.low">低</option>
-                  <option value="off" data-i18n="quality.off">关</option>
-                </select>
-              </label>
-              <p class="wb-hint" data-et="render.hint">全局设置，所有文档共用；改动即时生效，不影响导出的工程。</p>
-            </div>
-          </details>
         </div>
       </section>
     </div>
@@ -500,6 +492,18 @@
       <div class="ed-dialog-actions">
         <button type="button" class="ed-btn" id="pick-dir-cancel" data-et="pick.cancel">取消</button>
         <button type="button" class="ed-btn is-primary" id="pick-dir-ok" data-et="pick.ok">选择文件夹…</button>
+      </div>
+    </dialog>
+
+    <dialog id="vdir-dlg" class="ed-dialog ed-vdir">
+      <div class="ed-dialog-title" data-et="vdir.title">打开项目</div>
+      <p class="ed-dialog-body" data-et="vdir.body"></p>
+      <div id="vdir-list" class="ed-vdir-list"></div>
+      <div class="ed-dialog-actions">
+        <button type="button" class="ed-btn" id="vdir-pkg" data-et-title="tb.openPkgTitle"><span data-et="tb.openPkg">打开 .pkg</span></button>
+        <button type="button" class="ed-btn" id="vdir-local" data-et="vdir.local">打开本地文件夹…</button>
+        <button type="button" class="ed-btn" id="vdir-cancel" data-et="vdir.cancel">取消</button>
+        <button type="button" class="ed-btn is-primary" id="vdir-new" data-et="vdir.new">新建空白工程</button>
       </div>
     </dialog>
 
