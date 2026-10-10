@@ -58,6 +58,11 @@ const STABLE = [
   "verify-mdl-sections",
   // .mdl 编码器（W17）：语料逐字节往返、文档与 parseMDL 同源、从零编码 MDLV0023 的语义往返
   "verify-mdl-write",
+  // 全库 .mdl 语料回归（PUPPET-WARP-FULL-PLAN P0）：643 个文件（scene.pkg 617 + 松散 26）
+  // 结构解析率 100%（整份 / 任一段退成 raw 都算失败）、逐字节往返、骨骼 head0 与矩阵尾 meta
+  // 读写同源、版本 / 段 / 部件 / 附着点 / 尾部零填充分类摘要。修 `Reader.f32s` 的 Buffer 别名
+  // bug 前 44% 的真实模型在这里退成 raw、编辑静默 no-op —— 本项就是那个 bug 的回归闸门
+  "verify-mdl-corpus",
   // MDL 顶点着色器 uniform 契约：每个 uniform 每条绘制路径都要赋值（否则走 GL 默认值 (0,0)，
   // 曾把除白名单两张外的全部 puppet 塌到原点 —— 见 verify-mdl-uniforms 头注）
   "verify-mdl-uniforms",

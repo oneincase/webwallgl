@@ -563,6 +563,11 @@ export function parseMDL(buf) {
     // skin_count 条材质全部读掉，不能从 mat.next 起（那会多吃一条）。
     meshes,
     bones,
+    // [we-scene patch 2026-10-14 P0] 每骨的 `{ head0, meta }` 并排数组（与 bones 同序）：
+    // head0 = MDLS 记录头（旧代码把它丢进 `id` 字段），meta = 矩阵尾的 JSON cstr（骨骼约束 /
+    // 混规则在 .mdl 里的疑似落点）。语义未定，但解析侧不能再丢 —— 见
+    // docs/PUPPET-WARP-FULL-PLAN.md §3 与 renderer/src/editor/mdl-edit.ts 的 mdlBoneMeta。
+    boneMeta: skel.boneMeta ?? [],
     // MDLS 尾部的静态装配姿势（无 MDLA 的模型才有）：TRS 九分量 + 原始局部矩阵
     staticPoseTRS: staticTRS,
     staticPoseLocal: staticPose ? staticPose.local : null,
@@ -883,9 +888,9 @@ function decomposeTRS3D(m) {
 // 窗口内用「id 有界 + parent 合法 + len 恰 64 + 矩阵正交有限」合取定位，矩阵尾若紧跟
 // '{' 才跳 JSON）。重扫必须拿全所有骨且全合法才采用，否则回退固定解析，绝不返回残缺骨架。
 function parseSkeleton(buf, dv, s) {
-  if (s < 0) return { bones: [], sectionStart: -1, recordsEnd: -1, nextOff: -1, permutation: null }
+  if (s < 0) return { bones: [], boneMeta: [], sectionStart: -1, recordsEnd: -1, nextOff: -1, permutation: null }
   const boneCount = dv.getUint32(s + 13, true)
-  if (boneCount <= 0 || boneCount > 1024) return { bones: [], sectionStart: s, recordsEnd: -1, nextOff: -1, permutation: null }
+  if (boneCount <= 0 || boneCount > 1024) return { bones: [], boneMeta: [], sectionStart: s, recordsEnd: -1, nextOff: -1, permutation: null }
 
   const orthMatrix = (m) =>
     Number.isFinite(m[12]) && Number.isFinite(m[13]) && Number.isFinite(m[14]) &&
@@ -904,6 +909,7 @@ function parseSkeleton(buf, dv, s) {
   })()
   const parseReference = () => {
     const bones = []
+    const boneMeta = []
     let j = s + 17
     for (let b = 0; b < boneCount; b++) {
       const nm = readCStr(dv, j)
@@ -923,34 +929,45 @@ function parseSkeleton(buf, dv, s) {
         matrix[4] * (matrix[1] * matrix[10] - matrix[2] * matrix[9]) +
         matrix[8] * (matrix[1] * matrix[6] - matrix[2] * matrix[5])
       if (!(Math.abs(det) > 1e-9) && !(Math.abs(det3) > 1e-9)) return null
+      // [we-scene patch 2026-10-14 P0] head 处的 i32 是**仿真类型**（旧代码把它命名成 id 并
+      // 就此丢弃）；矩阵尾的 JSON cstr 是骨骼 meta（骨骼约束 / 混规则在 .mdl 里的疑似落点，
+      // 见 docs/PUPPET-WARP-FULL-PLAN.md §3）。两者此前解析侧完全不导出，写侧却原样保留 ——
+      // P0 起并排导出，不进 bones（避免改动既有骨对象形状、影响下游逐字段比较）。
+      const meta = readCStr(dv, head + 12 + 64)
       bones.push({ id: dv.getUint32(head, true), name: nm.value, parent, matrix })
-      j = readCStr(dv, head + 12 + 64).next
+      boneMeta.push({ head0: dv.getInt32(head, true), meta: meta.value })
+      j = meta.next
     }
     if (sectionEnd > 0 && j > sectionEnd) return null
-    return { bones, end: j }
+    return { bones, boneMeta, end: j }
   }
 
   // ---- 布局 A：固定 id@1 parent@5 matrix@13（64B），name cstr@77 ----
   const parseFixed = () => {
     const bones = []
+    const boneMeta = []
     let j = s + 17
     let ok = true
     for (let b = 0; b < boneCount; b++) {
-      if (j + 77 > dv.byteLength) return { bones, ok: false, end: -1 }
+      if (j + 77 > dv.byteLength) return { bones, boneMeta, ok: false, end: -1 }
       const id = dv.getUint32(j + 1, true)
       const parent = dv.getInt32(j + 5, true)
       const matrix = new Float32Array(16)
       for (let k = 0; k < 16; k++) matrix[k] = dv.getFloat32(j + 13 + k * 4, true)
-      const meta = readCStr(dv, j + 77)
+      const nm = readCStr(dv, j + 77)
       if (!(parent === -1 || (parent >= 0 && parent < boneCount)) || !orthMatrix(matrix)) ok = false
       bones.push({ id, name: '', parent: parent >= 0 && parent < boneCount ? parent : -1, matrix })
-      j = meta.next
+      // 布局 A 的固定记录不区分「仿真类型 / 记录头」，也没有可确认的 meta JSON（历史兜底路径）：
+      // 只把 head0 按 id 位导出，meta 恒 null，不猜。
+      boneMeta.push({ head0: id, meta: null })
+      j = nm.next
     }
-    return { bones, ok, end: j }
+    return { bones, boneMeta, ok, end: j }
   }
 
-  const section = (bones, recordsEnd) => ({
+  const section = (bones, recordsEnd, boneMeta = []) => ({
     bones,
+    boneMeta,
     sectionStart: s,
     recordsEnd,
     nextOff: dv.getUint32(s + 9, true),
@@ -958,10 +975,10 @@ function parseSkeleton(buf, dv, s) {
   })
 
   const reference = parseReference()
-  if (reference) return section(reference.bones, reference.end)
+  if (reference) return section(reference.bones, reference.end, reference.boneMeta)
 
   const fixed = parseFixed()
-  if (fixed.ok) return section(fixed.bones, fixed.end)
+  if (fixed.ok) return section(fixed.bones, fixed.end, fixed.boneMeta)
 
 
   // ---- 布局 B/C：name cstr + 12B 头 + 64B 矩阵 (+ JSON cstr)，顺序重解析 ----
@@ -987,6 +1004,7 @@ function parseSkeleton(buf, dv, s) {
   }
 
   const bones = []
+  const boneMeta = []
   let j = s + 17
   let ok = true
   for (let b = 0; b < boneCount; b++) {
@@ -1009,15 +1027,19 @@ function parseSkeleton(buf, dv, s) {
     const matrixEnd = rec.head + 12 + 64
     // 布局 C：矩阵尾紧跟变长 JSON 元数据 cstr，跳过它再到下一条；
     // 布局 B：矩阵尾即下一记录的 name cstr 起点。
-    j = matrixEnd < dv.byteLength && buf[matrixEnd] === 0x7b /* '{' */
-      ? readCStr(dv, matrixEnd).next
-      : matrixEnd
+    const hasMeta = matrixEnd < dv.byteLength && buf[matrixEnd] === 0x7b /* '{' */
+    const mrec = hasMeta ? readCStr(dv, matrixEnd) : null
+    bones.push({ id: rec.id, name, parent: rec.parent, matrix: rec.matrix })
+    // [we-scene patch 2026-10-14 P0] 布局 B/C 的 head 字段与 `id` 同位（sim_type 语义见
+    // parseReference 的 patch 注），meta 就是上面为跳过而读的那段 JSON —— 一并并排导出。
+    boneMeta.push({ head0: rec.id, meta: mrec ? mrec.value : null })
+    j = mrec ? mrec.next : matrixEnd
   }
 
   const rescanned = ok && bones.length === boneCount &&
     bones.every((x) => x.parent === -1 || (x.parent >= 0 && x.parent < boneCount)) &&
     bones.every((x) => orthMatrix(x.matrix))
-  return rescanned ? section(bones, j) : section(fixed.bones, fixed.end)
+  return rescanned ? section(bones, j, boneMeta) : section(fixed.bones, fixed.end, fixed.boneMeta)
 }
 
 // MDLS 尾部的**静态姿势表**（只对无 MDLA 的模型有意义）

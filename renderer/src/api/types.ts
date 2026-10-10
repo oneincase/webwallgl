@@ -879,7 +879,11 @@ export type MdlClipInit = { name: string; mode: string; fps: number; frameCount:
  * 从零编码 .mdl 的输入（W19，glTF 导入用）。有骨 = 蒙皮 puppet / 蒙皮网格，无骨 = 静态网格。
  * 顶点烘焙在绑定姿势（骨局部矩阵沿父链累乘）下；boneIdx / weights 每顶点 4 个；
  * 动画轨道每骨一条、(frameCount + 1) 帧 × 9 分量（平移 / 欧拉角 ZYX 弧度 / 缩放）。
+ * parts（limb 表）与 attachments（MDAT 附着点）底层 encodeMDL 早已支持，此前只是本类型没暴露。
  */
+/** 部件 / limb 表的一项：索引区间（首尾相接铺满索引表），offset = 绘制序偏移（引擎不消费） */
+export type MdlPart = { id: number; offset: number; start: number; size: number };
+
 export type MdlSpec = {
   meshes: Array<{
     material: string;
@@ -890,6 +894,8 @@ export type MdlSpec = {
     boneIdx?: Uint32Array;
     weights?: Float32Array;
     indices: Uint32Array;
+    /** 子网格的 limb 表（parts 段）：区间需首尾相接铺满 indices；缺省不写（maskCount = 0） */
+    parts?: MdlPart[];
   }>;
   bones?: Array<{ name?: string; parent: number; matrix: Float32Array | number[] }>;
   animations?: Array<{
@@ -901,6 +907,8 @@ export type MdlSpec = {
     tracks: Float32Array[];
     events?: Array<{ frame: number; name: string }>;
   }>;
+  /** MDAT 附着点：bone = 骨骼下标，matrix = 16 个局部矩阵分量（与 MDAT 落盘同序） */
+  attachments?: Array<{ name: string; bone: number; matrix: Float32Array | number[] }>;
 };
 
 export type EditorHitTestOptions = {

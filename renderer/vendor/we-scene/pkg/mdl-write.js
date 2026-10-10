@@ -96,8 +96,11 @@ class Writer {
 
 class Reader {
   constructor(buf) {
-    this.buf = buf
-    this.dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+    // Node Buffer 的 slice() 是「视图」语义（subarray），不是拷贝：`.buffer` 会是整块池/文件
+    // ArrayBuffer（长度常非 4 的倍数）⇒ f32s/raw 直接抛 RangeError。
+    // 统一收敛成真正的 Uint8Array 视图，让后续 slice() 恢复拷贝语义。
+    this.buf = buf.constructor === Uint8Array ? buf : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+    this.dv = new DataView(this.buf.buffer, this.buf.byteOffset, this.buf.byteLength)
   }
   need(p, n) {
     if (p < 0 || p + n > this.buf.length) throw new RangeError('越界')
@@ -122,10 +125,12 @@ class Reader {
     this.need(p, 4)
     return this.dv.getFloat32(p, true)
   }
-  /** 按位拷出 n 个 float32 */
+  /** 按位拷出 n 个 float32；显式走 subarray→set，对齐与来源类型（Buffer/Uint8Array/子视图）无关 */
   f32s(p, n) {
     this.need(p, n * 4)
-    return new Float32Array(this.buf.slice(p, p + n * 4).buffer)
+    const out = new Float32Array(n)
+    new Uint8Array(out.buffer, out.byteOffset, n * 4).set(this.buf.subarray(p, p + n * 4))
+    return out
   }
   slice(p, end) {
     this.need(p, end - p)
@@ -423,7 +428,7 @@ export function readMdlDoc(buf) {
   } catch {
     walked = null
   }
-  if (!walked) return { ...head, raw: buf.slice() }
+  if (!walked) return { ...head, raw: r.slice(0, r.buf.length) }
   return { ...head, meshes: walked.meshes, ...readSections(r, walked.end) }
 }
 
@@ -634,7 +639,11 @@ function aabbOf(pos) {
  * 写「零向量 + 骨局部矩阵」：mdl-parse 的 parseStaticPose 对单骨模型会把它当静态姿势读，
  * 等于绑定姿势 → 蒙皮恒等，不会把新模型拼歪。排列表恒等、绘制序按 100 递增（语料同形）。
  */
-function mdlsTail(bones) {
+// [we-scene patch 2026-10-08] 导出给编辑器（P2 骨架重写要用它重建 N 相关的静态装配姿势尾表）。
+// 注意：真实语料里 402 个 MDLS 只有 254 个 tail 长度**恰好** 14+84N，148 个是空 tail，
+// 而有静态姿势的那 106 个长度**大于** 14+84N（另有余表）—— 所以改骨数时保留旧 tail 是**错的**
+// （末尾 1+4N / 76N / 64N 三张表都按 N 定长），调用方要么重建要么丢弃，见 mdl-edit 的 setMdlSkeleton。
+export function mdlsTail(bones) {
   const n = bones.length
   const out = new Uint8Array(14 + 84 * n)
   const dv = new DataView(out.buffer)
@@ -725,7 +734,9 @@ export function createMdlDoc(spec) {
       type: 'MDLS',
       version: '0004',
       b8: 0,
-      bones: bones.map((b) => ({ name: b.name ?? '', head0: 1, parent: b.parent, matrix: Float32Array.from(b.matrix), meta: '' })),
+      // [we-scene patch 2026-10-08] P2：head0 / meta 透传（meta 承载 pw 骨架仿真参数，
+      // 原来恒写 1 / ''，任何「从 spec 重建」的路径都会把骨 meta 悄悄丢掉）。
+      bones: bones.map((b) => ({ name: b.name ?? '', head0: b.head0 ?? 1, parent: b.parent, matrix: Float32Array.from(b.matrix), meta: b.meta ?? '' })),
       tail: mdlsTail(bones),
     })
   }

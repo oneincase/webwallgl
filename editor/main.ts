@@ -21,14 +21,27 @@ import {
   type Fit,
   type MdlBoneDelta,
   type MdlClipInit,
+  type MdlPart,
   type PropertyValue,
   type SceneInstance,
   CLIP_MODES,
   addMdlClip,
   applyBoneDelta,
+  clearMdlClips,
   removeMdlClip,
   setMdlClipEvents,
   setMdlClipMeta,
+  mdlBoneCount,
+  mdlBones,
+  mdlMeshIndices,
+  mdlMeshInfo,
+  mdlMeshPositions,
+  mdlSkin,
+  setMdlBoneIdx,
+  setMdlParts,
+  setMdlSkeleton,
+  setMdlTopology,
+  setMdlWeights,
 } from "../renderer/src/api/editor";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
 import { DOC_KINDS, renderDocs, type DocKind } from "../bench/docs";
@@ -36,6 +49,7 @@ import { applyPlatformClasses } from "../shared/workbench/platform";
 import { initTabs } from "../shared/workbench/tabs";
 import { load, save } from "../shared/workbench/storage";
 import { libraryKindOf, mountLibraryPanel } from "./ui/library-panel";
+import { confirmDialog } from "./ui/confirm";
 import { mountWallpaperConfig } from "./ui/wallpaper-config";
 import { mountRenderSettings } from "./ui/render-settings";
 import { mountSceneSettings } from "./scene-settings";
@@ -103,6 +117,135 @@ import { bundledSource, createPluginManager, dirSource, storeSource } from "./pl
 import { mountPluginPanel, permissionSummary } from "./ui/plugin-panel";
 import { textOf } from "./core";
 import { canCreateLayerOfKind, createLayerOfKind, layerKindInfo } from "./layer-kinds";
+// 操控变形（Puppet Warp）：钉子 → 骨 + IDW 权重、网格 / .mdl 骨架 / 烘焙纯数学都在 ./warp 里（离线可测）
+import {
+  MAX_PINS,
+  MESH_BASE,
+  MESH_MAX,
+  MESH_MIN,
+  POWER_MAX,
+  POWER_MIN,
+  WARP_CLIP_ID,
+  WARP_CLIP_NAME,
+  WARP_FPS,
+  WARP_FRAMES,
+  addPin,
+  boneOfPin,
+  buildMesh,
+  buildRig,
+  buildSkin,
+  defaultLayout,
+  displace,
+  gridFor,
+  layoutOf,
+  nearestPin,
+  pinLocal,
+  pinOfBone,
+  remapPoses,
+  removePin,
+  resamplePositions,
+  warpFiles,
+  withLegacyGrid,
+  withGrid,
+  withPower,
+  type PinDeltas,
+  type WarpLayout,
+  type WarpMesh,
+  type WarpPoses,
+  type WarpSize,
+} from "./warp";
+import {
+  COLS_MAX,
+  COLS_MIN,
+  PADDING_MAX,
+  PADDING_MIN,
+  SUBDIV_MAX,
+  SUBDIV_MIN,
+  addSlice,
+  axesOf,
+  buildGeometry,
+  clearTopology,
+  defaultGeometry,
+  flipCell,
+  geometryOf,
+  gridOf,
+  hasTopology,
+  partsOf,
+  puppetSub,
+  setOffset,
+  vertexUvOf,
+  withColsRows,
+  withLocked,
+  withPadding,
+  withPartOrder,
+  withSubdivision,
+  withSlices,
+  type GeometrySpec,
+} from "./geometry";
+import {
+  LIMB_PALETTE,
+  MAX_LIMBS,
+  QUALITY_MAX,
+  QUALITY_MIN,
+  SMOOTHING_MAX,
+  autoLimbs,
+  backgroundMaskOf,
+  brushStroke,
+  defaultSheetSpec,
+  groupIndicesByLimb,
+  limbLabelMap,
+  limbsMeta,
+  maskBBox,
+  maskCount,
+  parseLimbsMeta,
+  polygonMask,
+  recalculate,
+  triangleLimb,
+  viewPixels,
+  type LimbMask,
+  type LimbsMeta,
+  type PaintMode,
+  type SheetImage,
+  type SheetSpec,
+  type SheetView,
+} from "./limbs";
+import {
+  BONE_NAME_MAX,
+  addBone,
+  bonePoints,
+  boneSpecs,
+  defaultBonesFor,
+  defaultSkeleton,
+  nearestBone,
+  remapIndex,
+  removeBone,
+  renameBone,
+  setBoneParent,
+  skeletonOf,
+  withSkeleton,
+  type SkeletonSpec,
+} from "./skeleton";
+import {
+  BRUSH_RADIUS,
+  BRUSH_RADIUS_MAX,
+  BRUSH_RADIUS_MIN,
+  BRUSH_STRENGTH,
+  adjacencyOf,
+  blendIslandBoundary,
+  dominantBoneOf,
+  drawOrderRank,
+  islandsOf,
+  moveLimbFront,
+  reorderPartRange,
+  nearestBoneSkin,
+  paintVertices,
+  remapSkin,
+  smoothSkin,
+  uniformSkin,
+  weightsOf,
+  withWeights,
+  type WeightSkin,
+} from "./weights";
 // M4 A5：对象属性直通层（十六个对象级字段的读写 + 规格表驱动表单）
 import {
   OBJ_FIELDS,
@@ -724,6 +867,17 @@ let bonePick: {
   r: BoneVec;
   s: BoneVec;
 } | null = null;
+/**
+ * 操控变形（Puppet Warp）会话：引擎里只有 setBonePose 预览，换选中层 / 重挂即失效
+ * （没记录进 .mdl 的钉子位移随之丢弃，和骨骼面板的未提交增量一个口径）
+ */
+let warpSession: WarpSession | null = null;
+/** 模型 json 路径 → 钉子布局（null = 不是操控变形木偶）；异步读一次即缓存 */
+const warpLayoutCache = new Map<string, WarpLayout | null>();
+const warpLoadingPaths = new Set<string>();
+/** 路径 → 读取失败重试次数（读失败不能当结论缓存，见 warpLayoutOf） */
+const warpLayoutTries = new Map<string, number>();
+const WARP_LAYOUT_TRIES = 3;
 /** 只有用户点了播放才走时钟；打开文档、重挂都停在当前帧 */
 let userPlaying = false;
 
@@ -733,6 +887,11 @@ async function mountCurrent(keepTime = false) {
   animSolo = null;
   const gen = ++openGen;
   if (bonePick) bonePick = { ...bonePick, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+  // 重挂换实例：操控变形的会话与布局缓存一律作废（钉骨属于旧实例）
+  warpSession = null;
+  warpLayoutCache.clear();
+  warpLoadingPaths.clear();
+  warpLayoutTries.clear();
   const resumeAt = keepTime ? editor?.time ?? 0 : 0;
   destroyInstance();
   syncPlayButton();
@@ -2311,7 +2470,12 @@ async function runExport(id: string) {
     for (const d of r.diags) log(`[${d.source}] ${d.message}${d.path ? `（${d.path}）` : ""}`, d.level);
     if (r.blocked) {
       const n = r.diags.filter((d) => d.level === "error").length;
-      if (!confirm(et("export.blocked", { n }))) {
+      const yes = await confirmDialog({
+        title: et("dlg.exportTitle"),
+        body: et("export.blocked", { n }),
+        ok: et("dlg.exportOk"),
+      });
+      if (!yes) {
         log(et("log.exportBlocked", { n }), "warn");
         return;
       }
@@ -2369,6 +2533,8 @@ stageEl.addEventListener("click", (e) => {
 function selectLayer(id: number | string | null) {
   // 关键帧选中属于某一个图层：换层就取消，免得 Delete 误删上一层的（已拖过的）关键帧
   if (tlSel && String(tlSel.layerId) !== String(id)) clearTlSel();
+  // 操控变形预览也只属于一个图层（引擎里的 setBonePose 不进文档）：换层就退出
+  if (warpSession && String(warpSession.layer) !== String(id)) warpExit();
   extraSel.clear();
   if (id === null || !doc) {
     selectedId = null;
@@ -2386,6 +2552,7 @@ function selectLayer(id: number | string | null) {
 /** 主选 + 追加集合一次性落定（框选 / 全选用）：主选拿列表第一个，其余进 extraSel */
 function selectMany(primary: number | string | null, extra: ReadonlyArray<number | string>) {
   if (tlSel && String(tlSel.layerId) !== String(primary)) clearTlSel();
+  if (warpSession && String(warpSession.layer) !== String(primary)) warpExit();
   extraSel.clear();
   selectedId = null;
   if (primary !== null && doc) selectedId = findPath(doc.roots, primary)?.at(-1)?.id ?? null;
@@ -2941,7 +3108,14 @@ function drawOverlay() {
   overlayCtx.lineTo(ax, ay + 6);
   overlayCtx.stroke();
   drawAttachMarkers();
-  drawBoneMarkers();
+  // 操控变形开着就画钉子（钉子就是钉骨 i+1）：骨骼面板的圆点会让位，免得两套标记重叠
+  if (warpSession) {
+    drawWarpPins();
+    // P1：几何线框 / 角色表视图叠在钉子之上（指针事件优先给几何与角色表，见文件末尾的监听）
+    if (geomMode) drawGeomOverlay(warpSession);
+    // P2：骨架 / 权重叠加层（骨点与父子连线、顶点按主骨着色、笔刷圈）
+    if (skelMode) drawSkelOverlay(warpSession);
+  } else drawBoneMarkers();
 }
 
 /** 骨骼面板展开时（W18）：关节点 + 父子连线，选中的骨高亮 */
@@ -3103,9 +3277,13 @@ function overSelected(x: number, y: number): boolean {
 }
 
 stageEl.addEventListener("pointerdown", (e) => {
+  // P1：几何 / 角色表模式下指针事件归它们（切片 / 拓扑 / 顶点偏移 / 涂抹），别把层一起拖走
+  if (geomModal()) return;
   if (!editor || selectedId === null || isLocked(selectedId) || e.button !== 0 || e.altKey) return;
   const p = canvasPoint(e);
   if (!p) return;
+  // 操控变形：钉子比手柄优先（钉子常常就压在手柄 / 角点附近）
+  if (warpGrab(e, p.x, p.y)) return;
   const handle = handleAt(gizmo, p.x, p.y);
   if (!handle && !overSelected(p.x, p.y)) return;
   const props = editor.getLayerProps(Number(selectedId));
@@ -3138,6 +3316,7 @@ stageEl.addEventListener("pointerdown", (e) => {
 stageEl.addEventListener("pointermove", (e) => {
   const p = canvasPoint(e);
   if (!p) return;
+  if (warpDragMove(e, p.x, p.y)) return;
   if (!drag || e.pointerId !== drag.pointerId || !editor) {
     if (e.buttons) return;
     const h = !isLocked(selectedId) ? handleAt(gizmo, p.x, p.y) : null;
@@ -3197,6 +3376,9 @@ function endDrag(e: PointerEvent) {
 }
 stageEl.addEventListener("pointerup", endDrag);
 stageEl.addEventListener("pointercancel", endDrag);
+// 操控变形的钉子拖动是另一条通道（不进 drag / 不进 undo）：引擎预览 + 悬停高亮
+stageEl.addEventListener("pointerup", warpDrop);
+stageEl.addEventListener("pointercancel", warpDrop);
 
 // ---------- 指针工作室（B5 / M11：停帧摆位 → 轨迹录制 → 回放） ----------
 // 引擎指针通道（pointer.js → pushPointer）本来就在；这里补的是「编辑器主动驱动」。
@@ -3483,6 +3665,8 @@ function drawMarquee() {
 
 stageEl.addEventListener("pointerdown", (e) => {
   if (marquee || !editor || !doc || doc.type !== "scene" || e.button !== 0 || e.altKey) return;
+  // P1：几何 / 角色表模式下不框选（点在图上是要涂抹 / 切片 / 翻格子）
+  if (geomModal()) return;
   const p = canvasPoint(e);
   if (!p) return;
   // 命中手柄 / 已选中层的交给上面的拖拽；点在别的层上是点选，也不框选
@@ -3716,7 +3900,15 @@ function playerUrl(it: LibraryItem): string {
 }
 
 async function openLibrary(it: LibraryItem) {
-  if (doc && dirty && !projectDir && !confirm(et("lib.discardConfirm", { title: doc.title }))) return;
+  if (doc && dirty && !projectDir) {
+    const yes = await confirmDialog({
+      title: et("dlg.discardTitle"),
+      body: et("lib.discardConfirm", { title: doc.title }),
+      ok: et("dlg.discardOk"),
+      danger: true,
+    });
+    if (!yes) return;
+  }
   if (!libraryKindOf(it)) {
     log(et("log.libUnsupported", { title: it.title, type: it.type }), "warn");
     return;
@@ -3779,11 +3971,14 @@ function showDocs(kind: DocKind = docKind) {
   panelTabs.center.select("docs");
 }
 
+/** 仓库地址（标题栏 GitHub 图标）：与 package.json 的 repository 保持一致 */
+const GH_URL = "https://github.com/oneincase/webwallgl";
+
 for (const b of docsSwitchBtns) b.onclick = () => showDocs(asDocKind(b.dataset.doc) ?? docKind);
 $<HTMLButtonElement>("#ed-help").onclick = () => showDocs("editor");
-$<HTMLButtonElement>("#sponsor-btn").onclick = () => {
-  showDocs();
-  $("#sponsor-card").scrollIntoView({ block: "start", behavior: "smooth" });
+$<HTMLButtonElement>("#gh-btn").onclick = () => {
+  // 标题栏右上角的 GitHub 图标：新窗口打开仓库（noopener：别把本页交给对方脚本）
+  window.open(GH_URL, "_blank", "noopener");
 };
 
 function docsFromHash() {
@@ -3959,7 +4154,13 @@ function pickVirtualProject(): Promise<DirHandle | null> {
               log(et("vdir.delBusy", { name: rec.name }), "warn");
               return;
             }
-            if (!confirm(et("vdir.delConfirm", { name: rec.name }))) return;
+            const yes = await confirmDialog({
+              title: et("dlg.vdirDelTitle"),
+              body: et("vdir.delConfirm", { name: rec.name }),
+              ok: et("dlg.vdirDelOk"),
+              danger: true,
+            });
+            if (!yes) return;
             try {
               await deleteVirtualProject(rec.id);
             } catch (e) {
@@ -4313,17 +4514,22 @@ function closeNewMenu() {
   newMenuEl.hidden = true;
 }
 
+/** 打开「新建」菜单（锚在工具条按钮下方）；重复调用只重新摆位，不切换（空态按钮要用） */
+function openNewMenu() {
+  closeExportMenu();
+  const r = newEl.getBoundingClientRect();
+  newMenuEl.style.left = `${r.left}px`;
+  newMenuEl.style.top = `${r.bottom + 2}px`;
+  newMenuEl.hidden = false;
+}
+
 newEl.onclick = (e) => {
   e.stopPropagation();
   if (!newMenuEl.hidden) {
     closeNewMenu();
     return;
   }
-  closeExportMenu();
-  const r = newEl.getBoundingClientRect();
-  newMenuEl.style.left = `${r.left}px`;
-  newMenuEl.style.top = `${r.bottom + 2}px`;
-  newMenuEl.hidden = false;
+  openNewMenu();
 };
 document.addEventListener("click", (e) => {
   if (!newMenuEl.hidden && !newMenuEl.contains(e.target as Node)) closeNewMenu();
@@ -4347,8 +4553,15 @@ $<HTMLButtonElement>("#new-image").onclick = () => {
 };
 
 // 空态的两个出口：打开壁纸库 / 新建项目
+// [2026-11 修复] 这里必须 stopPropagation + openNewMenu：原来写的是 `() => newEl.click()`，
+// 合成 click 被 newEl 自己的 stopPropagation 挡住没问题，但**用户这次真实点击**还会继续冒泡到
+// 下面的 document 监听（「点到菜单外就关」），而 #empty-new 显然不在 #new-menu 里 ——
+// 菜单刚打开就被关上，用户看到的就是「点新建项目没反应」。空态按钮是「打开」语义，不做开/关切换。
 $<HTMLButtonElement>("#empty-library").onclick = () => panelTabs.left.select("library");
-$<HTMLButtonElement>("#empty-new").onclick = () => newEl.click();
+$<HTMLButtonElement>("#empty-new").onclick = (e) => {
+  e.stopPropagation();
+  openNewMenu();
+};
 inImageEl.onchange = () => {
   const files = Array.from(inImageEl.files ?? []);
   inImageEl.value = "";
@@ -6021,15 +6234,16 @@ function boneGroup(node: LayerNode): HTMLElement | null {
 
 /**
  * 改模型 .mdl 的一次可撤销编辑（W18）：读对象当前的 .mdl → edit → 写时复制（puppet 连 model json 一起）→
- * 结构编辑改指向（重挂）。mutate 在同一步里顺带改对象（删片段时删掉指向它的动画层）。fail = 文案前缀（bn / cl）
+ * 结构编辑改指向（重挂）。mutate 在同一步里顺带改对象（删片段时删掉指向它的动画层）。fail = 文案前缀（bn / cl / wp）
  */
 async function commitMdlEdit(
   layerId: number | string,
   label: string,
   slugTag: string,
-  fail: "bn" | "cl",
+  fail: "bn" | "cl" | "wp",
   edit: (bytes: Uint8Array) => Uint8Array | null,
   mutate?: (o: LayerNode["obj"]) => void,
+  jsonEdit?: (json: Record<string, unknown>) => void,
 ): Promise<boolean> {
   const d = doc;
   const node = d && findNode(d.roots, layerId);
@@ -6048,6 +6262,8 @@ async function commitMdlEdit(
   } else {
     from = mdlPath = String(o.model);
   }
+  // P2：jsonEdit 在拷副本之前改原对象（mdlCopyFiles 内部 structuredClone）⇒ P2 状态跟着新 json 落盘
+  if (modelJson && jsonEdit) jsonEdit(modelJson);
   const bytes = await assets.read(mdlPath);
   if (!bytes) return warn("fail.read", mdlPath);
   const out = edit(bytes);
@@ -6077,6 +6293,2548 @@ function applyBoneEdit(layerId: number | string, e: BoneEdit, boneName: string, 
     applyBoneDelta(bytes, e.animId, e.bone, e.frame, e.delta, e.radius),
   );
 }
+
+// ---------- 操控变形（Puppet Warp，伪 Live2D） ----------
+// 图片层 → 木偶：按图片像素尺寸建规则三角网格，每个钉子一根纯平移骨，顶点权重是钉子的反距离权重
+// （每顶点取前 4 根，与引擎蒙皮上限同口径）。拖钉子走引擎 setBonePose 实时预览（不进文档）；
+// 「记录关键帧」把增量按钉写进 .mdl 片段轨道（一次可撤销的写时复制）；「烘焙形变」把形变吃进顶点、
+// 骨架不动（改网格密度时按偏移场重采样）。几何 / 权重 / 编码全在 editor/warp.ts（纯函数、离线可测）。
+
+/** 钉子命中半径 / 标记半径（CSS px） */
+const WARP_TOL = 11;
+const WARP_DOT = 3.5;
+const WARP_DOT_ON = 6;
+/** 网格密度选项（长边格数） */
+const WARP_GRIDS = [16, 24, 32, 48];
+/** 采样片段姿势时小于这个（模型 px）的偏差当作噪声，不当关键帧 */
+const WARP_POSE_EPS = 0.5;
+
+type WarpSession = {
+  layer: number | string;
+  modelPath: string;
+  layout: WarpLayout;
+  size: WarpSize;
+  /** 当前网格几何（烘焙过就是吃过形变的顶点） */
+  mesh: WarpMesh;
+  /** 未记录的钉子位移（模型像素） */
+  deltas: Map<number, [number, number]>;
+  drag: { pin: number; pointerId: number; x0: number; y0: number; base: [number, number]; moved: boolean } | null;
+  /** P1 几何（细分 / 切片 / Padding / Lock / Edit Topology）；null = 还没生成过，网格就是默认密度网格 */
+  geometry: GeometrySpec | null;
+  /** P1 角色表参数与命名（逐像素掩码只活在会话里，不落盘） */
+  limbs: LimbsMeta | null;
+  /** P1 角色表会话（原图像素 + limb 掩码）；面板打开时才建 */
+  sheet: SheetState | null;
+  /** 部件表（limb 分割或几何分行产生）；跟着 .mdl 一起写 */
+  parts: MdlPart[] | null;
+  partsFrom: "sheet" | "geometry" | null;
+  /** P2 骨架（骨名 / 父级 / 位置；null = 还是 P0 的钉子骨） */
+  skeleton: SkeletonSpec | null;
+  /** P2 4 槽权重（每顶点 4 槽；顶点来自 .mdl，json 只记 locked） */
+  skin: WeightSkin | null;
+  skelVerts: Float32Array | null;
+  skelIndices: Uint32Array | null;
+  skelVertexCount: number;
+  /** .mdl 里当前的骨数（写权重前用它校验骨号对得上） */
+  skelBoneCount: number;
+  skelParts: MdlPart[] | null;
+  wtLocked: boolean;
+};
+
+/** P1 角色表会话：贴图像素 + 参数 + limb 掩码（掩码不落盘，重开工程按参数重算） */
+type SheetState = {
+  texture: string;
+  image: SheetImage;
+  spec: SheetSpec;
+  limbs: LimbMask[];
+  background: Uint8Array;
+  view: SheetView;
+  paint: PaintMode;
+  /** Mask 开关：画笔 / 多边形改的是当前 limb 的掩码（否则改的是背景掩码） */
+  maskEdit: boolean;
+  active: number;
+  radius: number;
+  stroke: { erase: boolean; last: [number, number] } | null;
+  polygon: Array<[number, number]>;
+  /** 叠加层缓存版本号：掩码 / 视图变了就自增 */
+  rev: number;
+};
+
+/** 几何 / 角色表面板开关（跟着操控变形会话走；"geometry" = 网格与拓扑，"sheet" = Character Sheet） */
+let geomMode: "geometry" | "sheet" | null = null;
+/** 下一次点画面加哪条切片（"x" = 竖切，"y" = 横切；null = 没待命） */
+let geomArm: "x" | "y" | null = null;
+/** Edit Topology 待命：点画面翻转所在格的三角剖分 */
+let geomTopo = false;
+/** 顶点偏移拖动（Edit Topology：Alt + 拖最近顶点，松手落盘） */
+let geomVertex: { vertex: number; pointerId: number; x0: number; y0: number; dx: number; dy: number } | null = null;
+
+/** 悬停高亮的钉子（-1 = 没有） */
+let warpHover = -1;
+
+/** 会话对应的层节点；换选中层 / 层没了就当没开会话 */
+function warpTarget(): { node: LayerNode; session: WarpSession } | null {
+  if (!warpSession || !doc || String(warpSession.layer) !== String(selectedId)) return null;
+  const node = findNode(doc.roots, warpSession.layer);
+  return node ? { node, session: warpSession } : null;
+}
+
+function warpModelInfo(id: number) {
+  return editor && Number.isFinite(id) ? editor.getModelInfo(id) : null;
+}
+
+/** 模型 json 的钉子布局：命中缓存同步返回；没读过就异步读一次（读完补一次检视器 / 叠加层） */
+function warpLayoutOf(modelPath: string): WarpLayout | null {
+  const hit = warpLayoutCache.get(modelPath);
+  if (hit !== undefined) return hit;
+  const assets = overlay;
+  if (assets && modelPath && !warpLoadingPaths.has(modelPath)) {
+    const tries = warpLayoutTries.get(modelPath) ?? 0;
+    warpLoadingPaths.add(modelPath);
+    // 读到了就是定论（json 里没有布局 = 普通图片层，缓存 null 不再重读）；
+    // 读失败只是打开文档 / 换资产目录时的瞬时状态，**不能**当结论缓存下来——否则重开工程后
+    // 操控变形分组会因为一次读失败而永久消失（挂载会清空缓存，但之后没人再重挂）。
+    const settle = (lay: WarpLayout | null, retry: boolean) => {
+      warpLoadingPaths.delete(modelPath);
+      if (lay) {
+        warpLayoutTries.delete(modelPath);
+        warpLayoutCache.set(modelPath, lay);
+        renderInspector();
+        drawOverlay();
+        return;
+      }
+      warpLayoutTries.set(modelPath, tries + 1);
+      if (retry && tries + 1 < WARP_LAYOUT_TRIES) {
+        window.setTimeout(() => {
+          renderInspector();
+          drawOverlay();
+        }, 250);
+        return;
+      }
+      warpLayoutCache.set(modelPath, null);
+    };
+    void assets
+      .read(modelPath)
+      .then((bytes) => {
+        let lay: WarpLayout | null = null;
+        if (bytes) lay = layoutOf(parseJsonBytes(bytes));
+        settle(lay, !bytes);
+      })
+      .catch(() => settle(null, true));
+  }
+  return null;
+}
+
+/** 图片尺寸（模型 json 的 width / height，退回图层 size 字段）；建网格 / 重采样都要 */
+function warpSizeOf(node: LayerNode, json: Record<string, unknown> | null): WarpSize | null {
+  const w = Number(json?.width) || 0;
+  const h = Number(json?.height) || 0;
+  if (w > 0 && h > 0) return { width: w, height: h };
+  const raw = typeof node.obj.size === "string" ? node.obj.size.trim().split(/\s+/) : [];
+  const sw = Number(raw[0]);
+  const sh = Number(raw[1]);
+  return sw > 0 && sh > 0 ? { width: sw, height: sh } : null;
+}
+
+/** 源材质 json（把图片层那张材质的合成方式带到新木偶上：贴图路径原样沿用） */
+async function warpSourceMaterial(modelJson: Record<string, unknown> | null): Promise<Record<string, unknown> | null> {
+  const path = modelJson && typeof modelJson.material === "string" ? modelJson.material : "";
+  return path && overlay ? parseJsonBytes(await overlay.read(path)) : null;
+}
+
+/** 新 slug：三件套（模型 json / .mdl / 材质 json）都不撞 */
+function warpSlug(name: unknown, tag: string): string {
+  const assets = overlay!;
+  const listed = new Set(assets.list());
+  return imageSlug(`${String(name || "image").replace(/\./g, "-")}-${tag}`, (s) =>
+    [modelPathOf(s), editorMdlOf(s), editorMaterialOf(s)].some((p) => assets.has(p) || listed.has(p)),
+  );
+}
+
+/** 每个钉子的绑定姿势屏幕位置：轮廓中心 + 局部坐标沿轮廓两轴投影（采样动画位移的参照） */
+function warpBindScreen(session: WarpSession): Array<[number, number] | null> {
+  const corners = editor?.getLayerOutline(Number(session.layer))?.corners;
+  if (!corners || corners.length !== 4) return session.layout.pins.map(() => null);
+  const c: [number, number] = [
+    corners.reduce((s, p) => s + p[0], 0) / 4,
+    corners.reduce((s, p) => s + p[1], 0) / 4,
+  ];
+  return session.layout.pins.map((p) => {
+    const local = pinLocal(p, session.size);
+    const shift = warpScreenShift(session, [local[0], local[1]]);
+    return [c[0] + shift[0], c[1] + shift[1]];
+  });
+}
+
+/**
+ * 按帧采样片段里**已经记录**的姿势：页面读不出 .mdl 的轨道（也不许自己解析），只能把播放头
+ * 逐帧走一遍，用 getBonePoints 量每根钉骨相对绑定姿势偏了多少（和拖动同一套坐标换算）。
+ * 采样期间先撤掉预览位移（预览要进顶点、不进轨道），采完把播放头与预览原样放回去。
+ * 返回的 poses 交给 buildRig 写进新 .mdl ⇒ 加钉子 / 删钉子 / 改衰减 / 改密度 / 烘焙都不丢关键帧。
+ */
+async function warpSamplePoses(session: WarpSession): Promise<WarpPoses> {
+  if (!editor) return [];
+  const node = doc && findNode(doc.roots, session.layer);
+  const info = node ? warpModelInfo(Number(session.layer)) : null;
+  const clip = info?.animations.find((c) => c.id === WARP_CLIP_ID) ?? info?.animations[0];
+  if (!node || !clip || clip.frames < 2) return [];
+  const rate = getAnimLayers(node.obj).find((l) => l.animation === clip.id)?.rate ?? 1;
+  const id = Number(session.layer);
+  const bind = warpBindScreen(session);
+  const preview = new Map(session.deltas);
+  const t0 = editor.time;
+  const last = Math.min(WARP_FRAMES, clip.frames - 1);
+  const poses: (PinDeltas | null)[] = [];
+  try {
+    warpClearPoses(session);
+    for (let f = 0; f <= last; f++) {
+      await editor.seek(f / (WARP_FPS * (rate || 1)));
+      const pts = editor.getBonePoints(id);
+      const frame = new Map<number, readonly [number, number]>();
+      for (let i = 0; i < session.layout.pins.length; i++) {
+        const s = pts?.[i + 1]?.screen;
+        const b = bind[i];
+        if (!s || !b) continue;
+        const d = warpDeltaOf(session, s[0] - b[0], s[1] - b[1]);
+        // 亚像素噪声不算关键帧：真拖过是几十像素
+        if (Math.abs(d[0]) < WARP_POSE_EPS && Math.abs(d[1]) < WARP_POSE_EPS) continue;
+        frame.set(i, d);
+      }
+      poses.push(frame.size ? frame : null);
+    }
+  } catch {
+    // 采样失败就退化成「重建一份没有关键帧的片段」，别让写盘整个失败
+  } finally {
+    await editor.seek(t0).catch(() => {});
+    for (const [pin, v] of preview) warpSetDelta(session, pin, [v[0], v[1]]);
+  }
+  return poses;
+}
+
+/** 写一份新的 .mdl 三件套并改指向（一步可撤销）；未记录的位移随之清掉（和骨骼面板「应用」同口径） */
+async function warpWrite(
+  session: WarpSession,
+  layout: WarpLayout,
+  mesh: WarpMesh,
+  label: string,
+  opts?: { geometry?: GeometrySpec | null; parts?: MdlPart[] | null; partsFrom?: "sheet" | "geometry" | null },
+): Promise<boolean> {
+  const d = doc;
+  const assets = overlay;
+  if (!d || !assets) return false;
+  const node = findNode(d.roots, session.layer);
+  const srcJson = parseJsonBytes(await assets.read(session.modelPath));
+  if (!node || !srcJson) {
+    log(et("wp.fail.read", { path: session.modelPath }), "warn");
+    return false;
+  }
+  if (d !== doc) return false;
+  const slug = warpSlug(node.obj.name, "warp");
+  const modelPath = modelPathOf(slug);
+  const poses = remapPoses(await warpSamplePoses(session), session.layout, layout);
+  if (d !== doc) return false;
+  // P1：几何（细分 / 切片 / Padding / 拓扑）与部件表照旧进 .mdl；创作态进 puppetWarp 容器
+  const geometry = opts && "geometry" in opts ? (opts.geometry ?? null) : session.geometry;
+  const parts = opts && "parts" in opts ? (opts.parts ?? null) : session.parts;
+  const partsFrom = opts && "partsFrom" in opts ? (opts.partsFrom ?? null) : session.partsFrom;
+  const files = warpFiles(
+    buildRig(layout, session.size, editorMaterialOf(slug), undefined, poses, { mesh, parts }),
+    slug,
+    await warpSourceMaterial(srcJson),
+    { geometry, limbs: session.limbs },
+  );
+  if (d !== doc) return false;
+  warpClearPoses(session);
+  session.deltas.clear();
+  for (const f of files) assets.put(f.name, f.data, modelPath);
+  assets.share(session.modelPath, modelPath);
+  warpLayoutCache.set(modelPath, layout);
+  structEdit(label, (dd) => {
+    const n = findNode(dd.roots, session.layer);
+    if (!n) return undefined;
+    n.obj.image = modelPath;
+    n.obj.size = `${session.size.width} ${session.size.height}`;
+    dd.puppets = new Map([...(dd.puppets ?? []), [modelPath, editorMdlOf(slug)]]);
+    return n.id;
+  });
+  if (d === doc) {
+    session.modelPath = modelPath;
+    session.layout = layout;
+    session.mesh = mesh;
+    session.geometry = geometry;
+    session.parts = parts;
+    session.partsFrom = partsFrom;
+  }
+  await warpResumeAfterWrite(session.layer, modelPath, layout, session.size, mesh);
+  renderInspector();
+  drawOverlay();
+  return true;
+}
+
+/**
+ * 结构编辑（写回 .mdl / 记录关键帧）一定会重挂：引擎换了实例，操控变形会话随之作废。
+ * 写完等新实例把新模型装上去，再自动回到操控变形 —— 否则「加钉子 / 改衰减 / 记一帧」每次都把用户踢出模式。
+ */
+async function warpResumeAfterWrite(layer: number | string, modelPath: string, layout: WarpLayout, size: WarpSize, mesh?: WarpMesh): Promise<void> {
+  const d = doc;
+  for (let i = 0; i < 120; i++) {
+    const node = d && findNode(d.roots, layer);
+    const path = node ? String((node.obj as { image?: unknown }).image ?? "") : "";
+    let mounted = false;
+    try {
+      mounted = !!editor?.getModelInfo(Number(layer));
+    } catch {
+      mounted = false;
+    }
+    if (d === doc && path === modelPath && mounted) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  // 中途换了工程 / 换选中别的层就别再自动进入
+  if (d !== doc || selectedId === null || String(selectedId) !== String(layer)) return;
+  if (warpSession) return;
+  await warpEnter(layer, { modelPath, layout, size, mesh });
+}
+
+/** 布局变了：网格几何照旧（烘焙过的顶点要留着），只按新钉子重算权重；密度变了才重采样顶点 */
+function warpMeshFor(session: WarpSession, layout: WarpLayout): WarpMesh {
+  if (layout.cols === session.mesh.cols && layout.rows === session.mesh.rows) return session.mesh;
+  const base = buildMesh(layout, session.size);
+  return { ...base, positions: resamplePositions(session.mesh, layout.cols, layout.rows, session.size) };
+}
+
+/** 图片层 → 操控变形木偶：三件套落盘 + 改指向，origin / scale / 角度 / 尺寸照旧 ⇒ 画面逐像素不变 */
+async function warpPromote(node: LayerNode): Promise<boolean> {
+  const d = doc;
+  const assets = overlay;
+  const srcModel = String(node.obj.image ?? "");
+  if (!d || !assets || !editor || node.kind !== "image" || node.modelForm || !srcModel) return false;
+  const srcJson = parseJsonBytes(await assets.read(srcModel));
+  const size = warpSizeOf(node, srcJson);
+  if (!size) {
+    log(et("wp.fail.size", { path: srcModel }), "warn");
+    return false;
+  }
+  if (d !== doc) return false;
+  const slug = warpSlug(node.obj.name, "warp");
+  const layout = defaultLayout(size);
+  const modelPath = modelPathOf(slug);
+  const files = warpFiles(buildRig(layout, size, editorMaterialOf(slug)), slug, await warpSourceMaterial(srcJson));
+  if (d !== doc) return false;
+  for (const f of files) assets.put(f.name, f.data, modelPath);
+  assets.share(srcModel, modelPath);
+  warpLayoutCache.set(modelPath, layout);
+  structEdit(et("log.warpPromoted", { layer: nodeName(node.id) }), (dd) => {
+    const n = findNode(dd.roots, node.id);
+    if (!n) return undefined;
+    n.obj.image = modelPath;
+    n.obj.size = `${size.width} ${size.height}`;
+    dd.puppets = new Map([...(dd.puppets ?? []), [modelPath, editorMdlOf(slug)]]);
+    addAnimLayer(dd, n.obj, WARP_CLIP_ID, WARP_CLIP_NAME);
+    return n.id;
+  });
+  // 结构编辑换了实例：编辑器此刻正在重挂（editor 已经销毁），必须等新实例把新模型装上再进模式
+  await warpResumeAfterWrite(node.id, modelPath, layout, size);
+  return true;
+}
+
+/** 进入操控变形：读回布局与图片尺寸，建会话（引擎里只有 setBonePose 预览） */
+async function warpEnter(layer: number | string, known?: { modelPath: string; layout: WarpLayout; size: WarpSize; mesh?: WarpMesh }): Promise<boolean> {
+  const d = doc;
+  const assets = overlay;
+  if (!d || !assets || !editor) return false;
+  const node = findNode(d.roots, layer);
+  if (!node || node.modelForm !== "puppet") return false;
+  const modelPath = known?.modelPath ?? String(node.obj.image ?? "");
+  const json = parseJsonBytes(await assets.read(modelPath));
+  const layout = known?.layout ?? layoutOf(json);
+  const size = known?.size ?? warpSizeOf(node, json);
+  warpLayoutCache.set(modelPath, layout);
+  if (!layout || !size) {
+    log(et(layout ? "wp.fail.size" : "wp.fail.layout", { path: modelPath }), "warn");
+    return false;
+  }
+  if (d !== doc) return false;
+  warpExit();
+  // P1：几何 / 角色表参数从 puppetWarp 容器读回（老工程没有这两块，退回默认）
+  const geometry = geometryOf(json);
+  const limbs = parseLimbsMeta(puppetSub(json, "limbs"));
+  // 顶点可能已经被烘焙过（形变吃进顶点）：密度对得上就沿用会话里的那份，否则按几何（有的话）或规则网格重建
+  const fromGeometry = geometry ? buildGeometry(geometry, size) : null;
+  // 复用会话里的网格要比**几何的有效密度**（cols×subdivision）——v1 的 warp.cols/rows 只有基础格数
+  const wantCols = fromGeometry ? fromGeometry.cols : layout.cols;
+  const wantRows = fromGeometry ? fromGeometry.rows : layout.rows;
+  const mesh =
+    known?.mesh && known.mesh.cols === wantCols && known.mesh.rows === wantRows
+      ? known.mesh
+      : (fromGeometry ?? buildMesh(layout, size));
+  const parts = geometry ? partsOf(geometry, mesh) : null;
+  warpSession = {
+    layer: node.id,
+    modelPath,
+    layout,
+    size,
+    mesh,
+    deltas: new Map(),
+    drag: null,
+    geometry,
+    limbs,
+    sheet: null,
+    parts,
+    // 工程 json 里有角色表分割（limbs）但 .mdl 里没有部件表时，标记分割来自角色表：
+    // 下一次几何重建会把按行分部件的三角划分换掉，据此给「部件已失效」的提示
+    partsFrom: parts ? "geometry" : limbs ? "sheet" : null,
+    skeleton: skeletonOf(json),
+    skin: null,
+    skelVerts: null,
+    skelIndices: null,
+    skelVertexCount: 0,
+    skelBoneCount: 0,
+    skelParts: null,
+    wtLocked: weightsOf(json)?.locked ?? false,
+  };
+  log(et("log.warpStarted", { layer: nodeName(node.id), pins: layout.pins.length }));
+  renderInspector();
+  drawOverlay();
+  return true;
+}
+
+/** 退出操控变形：撤掉引擎里的预览（未记录的位移丢弃） */
+function warpExit() {
+  const s = warpSession;
+  warpSession = null;
+  warpHover = -1;
+  geomMode = null;
+  geomArm = null;
+  geomTopo = false;
+  geomVertex = null;
+  skelMode = null;
+  skelArm = false;
+  skelParentArm = false;
+  skelSel = -1;
+  skelPaintBone = -1;
+  skelStroke = null;
+  skelDepth = false;
+  skelAdjCache = null;
+  if (!s) return;
+  warpClearPoses(s);
+  renderInspector();
+  drawOverlay();
+}
+
+function warpClearPoses(session: WarpSession) {
+  if (!editor) return;
+  for (let i = 0; i < session.layout.pins.length; i++) void editor.setBonePose(Number(session.layer), boneOfPin(i), null).catch(() => {});
+}
+
+function warpResetPreview(session: WarpSession) {
+  warpClearPoses(session);
+  session.deltas.clear();
+  renderInspector();
+  drawOverlay();
+}
+
+function warpSetDelta(session: WarpSession, pin: number, delta: [number, number]) {
+  const zero = delta[0] === 0 && delta[1] === 0;
+  if (zero) session.deltas.delete(pin);
+  else session.deltas.set(pin, delta);
+  void editor?.setBonePose(Number(session.layer), boneOfPin(pin), zero ? null : { t: [delta[0], delta[1], 0] }).catch(() => {});
+}
+
+/** 片段帧号（与骨骼面板同口径：动画层 rate × 当前时刻 → clipFrameAt） */
+function warpFrameOf(node: LayerNode, info: NonNullable<ReturnType<typeof warpModelInfo>>): number {
+  const clip = info.animations.find((c) => c.id === WARP_CLIP_ID) ?? info.animations[0];
+  if (!clip || !editor) return 0;
+  const rate = getAnimLayers(node.obj).find((l) => l.animation === clip.id)?.rate ?? 1;
+  return Math.max(0, Math.min(clip.frames - 1, clipFrameAt(clip, editor.time * rate)));
+}
+
+/** 把未记录的钉子位移写进 .mdl 轨道（只改当前帧；半径 0 = 不向两侧淡出） */
+async function warpRecord(session: WarpSession): Promise<boolean> {
+  const node = doc && findNode(doc.roots, session.layer);
+  const info = node ? warpModelInfo(Number(node.id)) : null;
+  const moved = [...session.deltas.entries()].filter(([, v]) => v[0] !== 0 || v[1] !== 0);
+  if (!node || !info || !moved.length) {
+    log(et("wp.noDelta"), "warn");
+    return false;
+  }
+  const frame = warpFrameOf(node, info);
+  const ok = await commitMdlEdit(
+    session.layer,
+    et("log.warpRecorded", { layer: nodeName(session.layer), n: moved.length, frame }),
+    "warp",
+    "wp",
+    (bytes) => {
+      let out: Uint8Array | null = bytes;
+      for (const [pin, v] of moved) {
+        if (!out) return null;
+        out = applyBoneDelta(out, WARP_CLIP_ID, boneOfPin(pin), frame, { t: [v[0], v[1], 0] }, 0);
+      }
+      return out;
+    },
+  );
+  if (!ok) return false;
+  session.deltas.clear();
+  const after = doc && findNode(doc.roots, session.layer);
+  if (after) session.modelPath = String(after.obj.image ?? session.modelPath);
+  warpLayoutCache.set(session.modelPath, session.layout);
+  await warpResumeAfterWrite(session.layer, session.modelPath, session.layout, session.size);
+  renderInspector();
+  drawOverlay();
+  return true;
+}
+
+/** 烘焙形变：把预览位移吃进顶点（骨架不动，钉子还在网格原位） */
+async function warpBake(session: WarpSession): Promise<boolean> {
+  const moved = new Map([...session.deltas.entries()].filter(([, v]) => v[0] !== 0 || v[1] !== 0));
+  if (!moved.size) {
+    log(et("wp.noDelta"), "warn");
+    return false;
+  }
+  const positions = displace(session.mesh, buildSkin(session.mesh, session.layout, session.size), moved);
+  return warpWrite(session, session.layout, { ...session.mesh, positions }, et("log.warpBaked", { layer: nodeName(session.layer) }));
+}
+
+/** 加一根钉子：挑离现有钉子最远的候选点（5×5 候选里最空的） */
+function warpAddPin(session: WarpSession) {
+  if (session.layout.pins.length >= MAX_PINS) {
+    log(et("wp.fail.maxPins", { n: MAX_PINS }), "warn");
+    return;
+  }
+  let best: [number, number] = [0.5, 0.5];
+  let far = -1;
+  for (let j = 0; j <= 4; j++) {
+    for (let i = 0; i <= 4; i++) {
+      const c: [number, number] = [i / 4, j / 4];
+      const near = session.layout.pins.reduce((m, p) => Math.min(m, Math.hypot(p[0] - c[0], p[1] - c[1])), Infinity);
+      if (near > far) {
+        far = near;
+        best = c;
+      }
+    }
+  }
+  const layout = addPin(session.layout, best);
+  if (layout) void warpWrite(session, layout, warpMeshFor(session, layout), et("log.warpRebuilt", { layer: nodeName(session.layer) }));
+}
+
+function warpRemovePin(session: WarpSession, index: number) {
+  const layout = removePin(session.layout, index);
+  if (layout) void warpWrite(session, layout, warpMeshFor(session, layout), et("log.warpRebuilt", { layer: nodeName(session.layer) }));
+}
+
+function warpSetPower(session: WarpSession, power: number) {
+  const layout = withPower(session.layout, power);
+  void warpWrite(session, layout, warpMeshFor(session, layout), et("log.warpRebuilt", { layer: nodeName(session.layer) }));
+}
+
+/** 网格密度（长边格数）→ 按长宽比换算 cols / rows，写回新网格（顶点按偏移场重采样） */
+function warpSetGrid(session: WarpSession, base: number) {
+  const g = gridFor(session.size);
+  const k = base / MESH_BASE;
+  const cols = Math.max(MESH_MIN, Math.min(MESH_MAX, Math.round(g.cols * k)));
+  const rows = Math.max(MESH_MIN, Math.min(MESH_MAX, Math.round(g.rows * k)));
+  // 几何已生成：密度改的是几何的 cols / rows（细分 / Padding / 拓扑都保留），不是规则网格
+  if (session.geometry) {
+    void geomWriteSession(session, withColsRows(session.geometry, cols, rows), et("log.warpRebuilt", { layer: nodeName(session.layer) }));
+    return;
+  }
+  const layout = withGrid(session.layout, cols, rows);
+  void warpWrite(session, layout, warpMeshFor(session, layout), et("log.warpRebuilt", { layer: nodeName(session.layer) }));
+}
+
+function warpGridBase(layout: WarpLayout): number {
+  const long = Math.max(layout.cols, layout.rows);
+  return WARP_GRIDS.reduce((best, g) => (Math.abs(g - long) < Math.abs(best - long) ? g : best), WARP_GRIDS[0]);
+}
+
+/** 屏幕命中钉子：跳过骨 0（根骨不是钉子），返回钉子下标，-1 = 没命中 */
+function warpHitAt(layer: number | string, x: number, y: number): number {
+  if (!editor) return -1;
+  const pts = editor.getBonePoints(Number(layer));
+  if (!pts?.length) return -1;
+  return nearestPin(pts.slice(1).map((p) => p.screen), x, y, WARP_TOL);
+}
+
+/**
+ * 屏幕位移 → 模型位移。用图层轮廓（OBB）的两条屏幕单位轴投影：轮廓已经把图层自身的
+ * 旋转 / 缩放 / 视口缩放算进去了，所以这里除以「每模型单位多少屏幕像素」即可，不用再自己反解变换。
+ * 注意 ay 是层局部**向下**的方向（c0 左上 → c3 左下），而模型空间 Y 向上 ⇒ y 分量要取负。
+ */
+function warpDeltaOf(session: WarpSession, dx: number, dy: number): [number, number] {
+  const corners = editor?.getLayerOutline(Number(session.layer))?.corners;
+  if (!corners || corners.length !== 4) return [dx, -dy];
+  const { ax, ay } = layerAxes(corners);
+  const kx = Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]) / session.size.width || 1;
+  const ky = Math.hypot(corners[3][0] - corners[0][0], corners[3][1] - corners[0][1]) / session.size.height || 1;
+  return [(dx * ax[0] + dy * ax[1]) / kx, -(dx * ay[0] + dy * ay[1]) / ky];
+}
+
+/** 模型位移 → 屏幕位移（warpDeltaOf 的逆）：给位移中的钉子画「原位 → 现在」的引线 */
+function warpScreenShift(session: WarpSession, model: [number, number]): [number, number] {
+  const corners = editor?.getLayerOutline(Number(session.layer))?.corners;
+  if (!corners || corners.length !== 4) return [model[0], -model[1]];
+  const { ax, ay } = layerAxes(corners);
+  const kx = Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]) / session.size.width || 1;
+  const ky = Math.hypot(corners[3][0] - corners[0][0], corners[3][1] - corners[0][1]) / session.size.height || 1;
+  return [model[0] * kx * ax[0] - model[1] * ky * ay[0], model[0] * kx * ax[1] - model[1] * ky * ay[1]];
+}
+
+/** pointerdown：命中钉子就开始拖（返回 true = 这一下归操控变形管，不进手柄 / 框选） */
+function warpGrab(e: PointerEvent, x: number, y: number): boolean {
+  const t = warpTarget();
+  if (!t) return false;
+  const pin = warpHitAt(t.session.layer, x, y);
+  if (pin < 0) return false;
+  t.session.drag = { pin, pointerId: e.pointerId, x0: x, y0: y, base: [...(t.session.deltas.get(pin) ?? [0, 0])], moved: false };
+  warpHover = pin;
+  stageEl.setPointerCapture(e.pointerId);
+  drawOverlay();
+  return true;
+}
+
+/** pointermove：拖动中更新预览；没在拖就只更新悬停高亮 */
+function warpDragMove(e: PointerEvent, x: number, y: number): boolean {
+  // P2：骨架 / 权重模式是模态，钉子不许跟着指针走（pointermove 监听里没有 geomModal 守卫）
+  if (geomModal()) return false;
+  const t = warpTarget();
+  if (!t) return false;
+  const d = t.session.drag;
+  if (!d) {
+    const pin = warpHitAt(t.session.layer, x, y);
+    if (pin !== warpHover) {
+      warpHover = pin;
+      stageEl.dataset.cursor = pin >= 0 ? "move" : "";
+      drawOverlay();
+    }
+    return false;
+  }
+  if (e.pointerId !== d.pointerId) return true;
+  d.moved = true;
+  const [mx, my] = warpDeltaOf(t.session, x - d.x0, y - d.y0);
+  warpSetDelta(t.session, d.pin, [d.base[0] + mx, d.base[1] + my]);
+  drawOverlay();
+  return true;
+}
+
+/** pointerup / cancel：结束拖动（位移留着，等「记录关键帧」写进 .mdl） */
+function warpDrop(e: PointerEvent) {
+  const t = warpTarget();
+  const d = t?.session.drag;
+  if (!t || !d || e.pointerId !== d.pointerId) return;
+  t.session.drag = null;
+  // 真拖过钉子：这一次指针抬起不算「点选」——否则松手落在空处会把选中层换掉（会话跟着退出，
+  // 预览的形变当场回退）。钉子拖动不进 undo，记录关键帧才入栈。
+  if (d.moved) suppressClick = true;
+  renderInspector();
+  drawOverlay();
+}
+
+/** 操控变形标记：钉子（骨 i+1）+ 位移引线 + 拖动 / 悬停高亮 */
+function drawWarpPins() {
+  const t = warpTarget();
+  if (!t || !editor) return;
+  const pts = editor.getBonePoints(Number(t.session.layer));
+  if (!pts?.length) return;
+  overlayCtx.lineWidth = 1.5;
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i];
+    if (!p.screen) continue;
+    const pin = pinOfBone(i);
+    const delta = t.session.deltas.get(pin);
+    const on = t.session.drag?.pin === pin || warpHover === pin;
+    if (delta && (delta[0] || delta[1])) {
+      const [sx, sy] = warpScreenShift(t.session, delta);
+      overlayCtx.setLineDash([3, 3]);
+      overlayCtx.strokeStyle = "rgba(0,0,0,0.55)";
+      overlayCtx.beginPath();
+      overlayCtx.moveTo(p.screen[0] - sx, p.screen[1] - sy);
+      overlayCtx.lineTo(p.screen[0], p.screen[1]);
+      overlayCtx.stroke();
+      overlayCtx.setLineDash([]);
+    }
+    overlayCtx.beginPath();
+    overlayCtx.arc(p.screen[0], p.screen[1], on ? WARP_DOT_ON : WARP_DOT, 0, Math.PI * 2);
+    overlayCtx.fillStyle = on ? SNAP_COLOR : delta && (delta[0] || delta[1]) ? "#ffb347" : "#ffd166";
+    overlayCtx.fill();
+    overlayCtx.strokeStyle = "rgba(0,0,0,0.65)";
+    overlayCtx.stroke();
+  }
+}
+
+/** 操控变形分组：普通 inspectorGroups（普通图片层也能拿到）→ 转木偶 / 进入 / 钉子与写回 */
+function warpGroup(node: LayerNode): HTMLElement | null {
+  const t = warpTarget();
+  const open = !!t && String(t.node.id) === String(node.id);
+  const isImage = node.kind === "image" && !node.modelForm;
+  if (!isImage && !open && node.modelForm !== "puppet") return null;
+  if (!isImage && !open && !warpLayoutOf(String(node.obj.image ?? ""))) return null;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-warp";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.warp");
+  group.appendChild(h);
+  const editable = !!overlay && !isLocked(node.id);
+  const action = (cls: string, key: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.dataset.et = key;
+    b.textContent = et(key);
+    b.disabled = disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  if (isImage) {
+    group.appendChild(note(et("wp.intro")));
+    group.appendChild(action("ed-warp-make", "wp.promote", () => void warpPromote(node), !editable));
+    return group;
+  }
+  if (!open) {
+    group.appendChild(note(et("wp.ready")));
+    group.appendChild(action("ed-warp-open", "wp.open", () => void warpEnter(node.id), !editable));
+    return group;
+  }
+  const session = t!.session;
+  const info = warpModelInfo(Number(node.id));
+  const frame = info ? warpFrameOf(node, info) : 0;
+  const moved = [...session.deltas.values()].filter((v) => v[0] !== 0 || v[1] !== 0).length;
+  group.appendChild(note(et("wp.note", { n: session.layout.pins.length, max: MAX_PINS, frame, moved })));
+  const list = document.createElement("div");
+  list.className = "ed-warp-pins";
+  session.layout.pins.forEach((_p, i) => {
+    const item = document.createElement("div");
+    item.className = "ed-fx-item";
+    const label = document.createElement("span");
+    label.className = "ed-fx-name";
+    label.textContent = et("wp.pinN", { n: i + 1 });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ed-icon ed-warp-del";
+    del.dataset.pin = String(i);
+    del.textContent = "\u2715";
+    del.title = et("wp.delPin");
+    del.disabled = !editable || session.layout.pins.length <= 1;
+    del.onclick = () => warpRemovePin(session, i);
+    item.append(label, del);
+    list.appendChild(item);
+  });
+  group.appendChild(list);
+  group.appendChild(action("ed-warp-add", "wp.addPin", () => warpAddPin(session), !editable || session.layout.pins.length >= MAX_PINS));
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.appendChild(el);
+    form.append(l, box);
+  };
+  const power = document.createElement("input");
+  power.type = "range";
+  power.className = "ed-warp-power";
+  power.min = String(POWER_MIN);
+  power.max = String(POWER_MAX);
+  power.step = "1";
+  power.value = String(session.layout.power);
+  power.disabled = !editable;
+  power.addEventListener("change", () => warpSetPower(session, Number(power.value)));
+  row("wp.power", power);
+  const grid = document.createElement("select");
+  grid.className = "ed-warp-grid";
+  for (const g of WARP_GRIDS) {
+    const o = document.createElement("option");
+    o.value = String(g);
+    o.textContent = `${g}`;
+    grid.appendChild(o);
+  }
+  grid.value = String(warpGridBase(session.layout));
+  grid.disabled = !editable;
+  grid.addEventListener("change", () => warpSetGrid(session, Number(grid.value)));
+  row("wp.grid", grid);
+  group.appendChild(form);
+  const actions = document.createElement("div");
+  actions.className = "ed-insp-actions";
+  actions.append(
+    action("ed-warp-record", "wp.record", () => void warpRecord(session), !editable || !moved),
+    action("ed-warp-reset", "wp.reset", () => warpResetPreview(session), !moved),
+    action("ed-warp-bake", "wp.bake", () => void warpBake(session), !editable || !moved),
+    action("ed-warp-exit", "wp.close", () => warpExit()),
+  );
+  group.appendChild(actions);
+  return group;
+}
+
+// ---------- P1：几何（Geometry）与角色表（Character Sheet） ----------
+// 方案 docs/PUPPET-WARP-FULL-PLAN.md §5 P1：几何决定网格本身（格数 / 细分 / 切片 / Padding /
+// Lock geometry / Edit Topology），角色表决定部件表（limb 掩码 → 三角形归属 → .mdl parts 绘制序）。
+// 两份创作态写进 model json 的 `puppetWarp`（geometry / limbs），逐像素掩码不落盘（按参数可重算）；
+// 写盘一律走 warpWrite（写时复制 + 结构编辑 + 自动回到操控变形）⇒ 一步可撤销、原有元素零位移。
+
+/** 几何 / 角色表分组只在「操控变形会话开着，且选中的就是那只木偶」时出现 */
+function warpPanelOpen(node: LayerNode): boolean {
+  const t = warpTarget();
+  return !!t && String(t.node.id) === String(node.id);
+}
+
+/** 网格超过这个顶点数就不画线框（几万顶点画上去只会糊成一片） */
+const GEOM_DRAW_MAX = 4096;
+
+/** 当前会话：几何 / 角色表只作用于操控变形会话里的那只木偶 */
+function geomTarget(): { node: LayerNode; session: WarpSession } | null {
+  return warpTarget();
+}
+
+/**
+ * 几何 / 角色表模式是**模态**的：指针事件全归它们（切片待命 / 拓扑翻转 / Alt 顶点偏移 / 涂抹），
+ * 通用监听里的手柄、框选与钉子先让路（见文件末尾注册的 P1 指针监听）。
+ */
+function geomModal(): boolean {
+  return (!!geomMode && !!geomTarget()) || skelModal();
+}
+
+/** 贴图像素 → 画布坐标的仿射（a,b,c,d,e,f 与 ctx.transform 同序；由层轮廓四角推出，旋转 / 缩放都吃） */
+function layerAffine(session: WarpSession): [number, number, number, number, number, number] | null {
+  const corners = editor?.getLayerOutline(Number(session.layer))?.corners;
+  if (!corners || corners.length !== 4) return null;
+  const { ax, ay } = layerAxes(corners);
+  const w = session.size.width;
+  const h = session.size.height;
+  const kx = Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]) / w || 1;
+  const ky = Math.hypot(corners[3][0] - corners[0][0], corners[3][1] - corners[0][1]) / h || 1;
+  const cx = corners.reduce((s, p) => s + p[0], 0) / 4;
+  const cy = corners.reduce((s, p) => s + p[1], 0) / 4;
+  const a = kx * ax[0];
+  const b = kx * ax[1];
+  const c = ky * ay[0];
+  const d = ky * ay[1];
+  return [a, b, c, d, cx - (a * w) / 2 - (c * h) / 2, cy - (b * w) / 2 - (d * h) / 2];
+}
+
+/** 画布点 → 贴图像素（左上原点）；点不在层内返回 null */
+function layerPixelAt(session: WarpSession, x: number, y: number): [number, number] | null {
+  const m = layerAffine(session);
+  if (!m) return null;
+  const [a, b, c, d, e, f] = m;
+  const det = a * d - b * c;
+  if (!det) return null;
+  const dx = x - e;
+  const dy = y - f;
+  const px = (d * dx - c * dy) / det;
+  const py = (-b * dx + a * dy) / det;
+  if (px < 0 || py < 0 || px > session.size.width || py > session.size.height) return null;
+  return [px, py];
+}
+
+/** 模型像素（中心原点、Y 向上）→ 贴图像素（左上原点、Y 向下） */
+function imageOfModel(session: WarpSession, mx: number, my: number): [number, number] {
+  return [mx + session.size.width / 2, session.size.height / 2 - my];
+}
+
+/** 会话里当前的几何（还没生成过就用现有网格密度当默认，保证「一进面板不动画面」） */
+function geomOfSession(session: WarpSession): GeometrySpec {
+  return session.geometry ?? defaultGeometry(session.size, session.layout.cols, session.layout.rows);
+}
+
+/**
+ * 写回几何：网格来自 buildGeometry，layout 的 cols / rows 跟着有效格数走（钉子按归一化坐标不动）。
+ * 部件表按几何的 partOrder 重算；之前是 limb 分割出来的部件会失效（索引映射变了），给一条提示。
+ */
+async function geomWriteSession(session: WarpSession, geometry: GeometrySpec, label: string): Promise<boolean> {
+  const mesh = buildGeometry(geometry, session.size);
+  const parts = partsOf(geometry, mesh);
+  const fromSheet = session.partsFrom === "sheet";
+  // 写盘会经 warpResumeAfterWrite → warpEnter → warpExit 重建会话，而 warpExit 会清掉几何模式状态，
+  // 于是「加切片 / 翻格子 / 显示网格」每写一次就掉出模式（面板要重点一次按钮）。这里记下来写完后恢复。
+  const mode = geomMode;
+  const arm = geomArm;
+  const topo = geomTopo;
+  const ok = await warpWrite(session, withLegacyGrid(session.layout, geometry), mesh, label, {
+    geometry,
+    parts,
+    partsFrom: parts ? "geometry" : null,
+  });
+  if (ok && fromSheet) log(et("geo.partsDropped", { n: session.limbs?.count ?? 0 }), "warn");
+  // 不能恢复 "sheet"：重挂后 session.sheet 是 null，恢复它会让几何模式没叠加层却仍然吃掉全部指针事件
+  if (ok && warpSession && warpSession.modelPath === session.modelPath) {
+    if (mode === "geometry" || arm || topo) {
+      geomMode = "geometry";
+      geomArm = arm;
+      geomTopo = topo;
+      geomVertex = null;
+      renderInspector();
+      drawOverlay();
+    }
+  }
+  return ok;
+}
+
+/** 几何编辑的统一入口：取会话里当前的几何 → 纯函数变换 → 落盘 */
+function geomEdit(fn: (g: GeometrySpec) => GeometrySpec, label: string) {
+  const t = geomTarget();
+  if (!t) return;
+  void geomWriteSession(t.session, fn(geomOfSession(t.session)), label);
+}
+
+function geomLayerName(session: WarpSession): string {
+  return doc ? nodeName(session.layer) : "";
+}
+
+/** 贴图字节 → 逐像素（角色表的分割都在像素上做） */
+async function decodeSheetImage(bytes: Uint8Array, type: string): Promise<SheetImage | null> {
+  try {
+    const bitmap = await createImageBitmap(new Blob([bytes.slice()], { type }));
+    const w = bitmap.width;
+    const h = bitmap.height;
+    const cv = new OffscreenCanvas(w, h);
+    const cx = cv.getContext("2d");
+    if (!cx) {
+      bitmap.close();
+      return null;
+    }
+    cx.drawImage(bitmap, 0, 0);
+    const data = cx.getImageData(0, 0, w, h).data;
+    bitmap.close();
+    return { width: w, height: h, data };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * WE 材质里的贴图名 → 叠加层里的真实资产路径。材质 json 的 `passes[].textures[]` 写的是
+ * **WE 命名**（`editor/foo`，相对 `materials/` 根、可省扩展名），而 `read()` 只认工程里的
+ * 真路径（`materials/editor/foo.png`）——两者对不上就会「读原图失败：editor/foo」。
+ * 依次试：原名 / 补图片扩展名 / 加 `materials/` 前缀 / 按文件基名在 `list()` 里找。
+ */
+async function resolveTexturePath(assets: OverlayAssets, name: string): Promise<string | null> {
+  const exts = ["png", "jpg", "jpeg", "webp"];
+  const hasExt = /\.[a-z0-9]{2,4}$/i.test(name);
+  const cands: string[] = [];
+  const push = (p: string) => {
+    if (p && !cands.includes(p)) cands.push(p);
+  };
+  push(name);
+  if (!hasExt) for (const e of exts) push(`${name}.${e}`);
+  if (!name.startsWith("materials/")) {
+    push(`materials/${name}`);
+    if (!hasExt) for (const e of exts) push(`materials/${name}.${e}`);
+  }
+  const stem = (p: string) => p.replace(/^.*\//, "").replace(/\.[a-z0-9]{2,4}$/i, "");
+  const want = stem(name);
+  if (want) for (const p of assets.list()) if (stem(p) === want) push(p);
+  for (const c of cands) {
+    const bytes = await assets.read(c);
+    if (bytes && bytes.length) return c;
+  }
+  return null;
+}
+
+/** 读原图（木偶那张贴图）建角色表会话；已经有会话就复用参数与手工标记 */
+async function sheetLoad(session: WarpSession): Promise<boolean> {
+  const assets = overlay;
+  if (!assets || !editor) return false;
+  const info = editor.getModelInfo(Number(session.layer));
+  if (!info) return false;
+  const slots = modelTextureSlots(info);
+  const named = slots.find((s) => s.texture)?.texture ?? null;
+  if (!named) {
+    log(et("sheet.fail.tex"), "warn");
+    return false;
+  }
+  const texture = await resolveTexturePath(assets, named);
+  if (!texture) {
+    log(et("sheet.fail.read", { path: named }), "warn");
+    return false;
+  }
+  const bytes = await assets.read(texture);
+  if (!bytes) {
+    log(et("sheet.fail.read", { path: named }), "warn");
+    return false;
+  }
+  const image = await decodeSheetImage(bytes, /\.jpe?g$/i.test(texture) ? "image/jpeg" : "image/png");
+  if (!image) {
+    log(et("sheet.fail.decode", { path: texture }), "warn");
+    return false;
+  }
+  const prev = session.sheet;
+  const spec = prev?.spec ?? defaultSheetSpec(image);
+  session.sheet = {
+    texture,
+    image,
+    spec,
+    limbs: prev?.limbs ?? [],
+    background: prev?.background ?? backgroundMaskOf(image, spec),
+    view: prev?.view ?? "foreground",
+    paint: prev?.paint ?? "brush",
+    maskEdit: prev?.maskEdit ?? false,
+    active: prev?.active ?? 0,
+    radius: prev?.radius ?? 6,
+    stroke: null,
+    polygon: [],
+    rev: (prev?.rev ?? 0) + 1,
+  };
+  log(et("log.sheetLoaded", { path: texture, w: image.width, h: image.height }));
+  return true;
+}
+
+/** 自动抠图（Auto Recalculate）：背景色关键字 → 连通域 → limb */
+function sheetAuto(session: WarpSession) {
+  const sheet = session.sheet;
+  if (!sheet) return;
+  const limbs = autoLimbs(sheet.image, sheet.spec);
+  sheet.limbs = limbs;
+  sheet.background = backgroundMaskOf(sheet.image, sheet.spec);
+  sheet.active = 0;
+  sheet.rev++;
+  session.limbs = limbsMeta(sheet.spec, limbs);
+  log(et("log.sheetAuto", { layer: geomLayerName(session), n: limbs.length }));
+  renderInspector();
+  drawOverlay();
+}
+
+/** 重算（Recalculate）：按 limb 均色重新归类；手工标记过的会话受 spec.manual 保护 */
+function sheetRecalc(session: WarpSession) {
+  const sheet = session.sheet;
+  if (!sheet || !sheet.limbs.length) return;
+  sheet.limbs = recalculate(sheet.image, sheet.spec, sheet.limbs);
+  sheet.background = backgroundMaskOf(sheet.image, sheet.spec);
+  sheet.rev++;
+  session.limbs = limbsMeta(sheet.spec, sheet.limbs);
+  renderInspector();
+  drawOverlay();
+}
+
+/** limb 包围盒跟着掩码走（写盘只存参数，但会话里 View / 抠图要用 bbox） */
+function sheetFixBBox(sheet: SheetState, limb: LimbMask): LimbMask {
+  const bb = maskBBox(limb.mask, sheet.image.width, sheet.image.height);
+  return bb ? { ...limb, x0: bb[0], y0: bb[1], x1: bb[2], y1: bb[3] } : limb;
+}
+
+function sheetAddLimb(session: WarpSession) {
+  const sheet = session.sheet;
+  if (!sheet) return;
+  if (sheet.limbs.length >= MAX_LIMBS) {
+    log(et("sheet.fail.max", { n: MAX_LIMBS }), "warn");
+    return;
+  }
+  const id = sheet.limbs.reduce((m, l) => Math.max(m, l.id + 1), 0);
+  const limbs = [
+    ...sheet.limbs,
+    { id, name: `${et("sheet.limb")} ${sheet.limbs.length + 1}`, mask: new Uint8Array(sheet.image.width * sheet.image.height), x0: 0, y0: 0, x1: sheet.image.width, y1: sheet.image.height },
+  ];
+  sheet.limbs = limbs;
+  sheet.active = limbs.length - 1;
+  sheet.rev++;
+  session.limbs = limbsMeta(sheet.spec, limbs);
+  renderInspector();
+  drawOverlay();
+}
+
+function sheetRemoveLimb(session: WarpSession) {
+  const sheet = session.sheet;
+  if (!sheet || sheet.limbs.length <= 1) return;
+  sheet.limbs = sheet.limbs.filter((_, i) => i !== sheet.active);
+  sheet.active = Math.max(0, Math.min(sheet.active, sheet.limbs.length - 1));
+  sheet.rev++;
+  session.limbs = limbsMeta(sheet.spec, sheet.limbs);
+  renderInspector();
+  drawOverlay();
+}
+
+/** 部件绘制序上 / 下移一格（写进 `puppetWarp.geometry.partOrder`，应用部件时就是 parts 的 offset） */
+function sheetMovePart(session: WarpSession, dir: -1 | 1) {
+  const sheet = session.sheet;
+  if (!sheet) return;
+  const n = sheet.limbs.length;
+  if (n < 2) return;
+  const order = sheet.limbs.map((_, i) => i);
+  const at = sheet.active;
+  const to = at + dir;
+  if (to < 0 || to >= n) return;
+  const rank = order;
+  const tmp = rank[at];
+  rank[at] = rank[to];
+  rank[to] = tmp;
+  sheet.active = to;
+  const base = geomOfSession(session);
+  const geometry = withPartOrder({ ...base, partOrder: order.length === base.partOrder.length ? base.partOrder : order }, rank);
+  session.geometry = geometry;
+  renderInspector();
+  drawOverlay();
+}
+
+/** 把 limb 分割写进 .mdl 部件表（三角形按重心查 limb → 重排索引 → parts 绘制序） */
+async function sheetApply(session: WarpSession): Promise<boolean> {
+  const sheet = session.sheet;
+  if (!sheet) return false;
+  if (!sheet.limbs.length) {
+    log(et("sheet.noLimbs"), "warn");
+    return false;
+  }
+  const mesh = session.mesh;
+  const labels = limbLabelMap(sheet.limbs, sheet.image);
+  const tri = triangleLimb(mesh.indices, mesh.uvs, labels, sheet.image);
+  const order = session.geometry?.partOrder ?? null;
+  const { indices, parts } = groupIndicesByLimb(
+    mesh.indices,
+    tri,
+    sheet.limbs,
+    order && order.length === sheet.limbs.length ? order : undefined,
+  );
+  const ok = await warpWrite(
+    session,
+    session.layout,
+    { ...mesh, indices },
+    et("log.sheetApplied", { layer: geomLayerName(session), n: parts.length }),
+    { parts, partsFrom: "sheet" },
+  );
+  if (ok) session.limbs = limbsMeta(sheet.spec, sheet.limbs);
+  return ok;
+}
+
+/** 画笔 / 多边形落哪张掩码：Mask 开关开 = 当前 limb，关 = 背景（Mark Background） */
+function sheetPaintMask(sheet: SheetState): { mask: Uint8Array; set: (m: Uint8Array) => void } {
+  const limb = sheet.limbs[sheet.active];
+  if (sheet.maskEdit && limb) return { mask: limb.mask, set: (m) => (limb.mask = m) };
+  return { mask: sheet.background, set: (m) => (sheet.background = m) };
+}
+
+function sheetStroke(sheet: SheetState, points: Array<{ x: number; y: number }>, op: "add" | "remove") {
+  if (!points.length) return;
+  const target = sheetPaintMask(sheet);
+  target.set(brushStroke(target.mask, sheet.image.width, sheet.image.height, points, sheet.radius, op));
+  const limb = sheet.limbs[sheet.active];
+  if (limb) sheet.limbs[sheet.active] = sheetFixBBox(sheet, limb);
+  sheet.rev++;
+}
+
+function sheetClosePolygon(sheet: SheetState, op: "add" | "remove") {
+  if (sheet.polygon.length < 3) {
+    sheet.polygon = [];
+    return;
+  }
+  const target = sheetPaintMask(sheet);
+  const pts = sheet.polygon.map(([x, y]) => ({ x, y }));
+  target.set(polygonMask(target.mask, sheet.image.width, sheet.image.height, pts, op));
+  const limb = sheet.limbs[sheet.active];
+  if (limb) sheet.limbs[sheet.active] = sheetFixBBox(sheet, limb);
+  sheet.polygon = [];
+  sheet.rev++;
+}
+
+/** 角色表 / 几何叠加层缓存（只在内容变了以后重画一次像素） */
+let sheetViewCache: { key: string; canvas: HTMLCanvasElement } | null = null;
+
+/** 几何 / 角色表叠加层：都在「贴图像素」空间里画（仿射把贴图坐标铺到画布上，旋转缩放自动跟着） */
+function drawGeomOverlay(session: WarpSession) {
+  if (!geomMode) return;
+  const m = layerAffine(session);
+  if (!m) return;
+  const w = session.size.width;
+  const h = session.size.height;
+  const base = overlayCtx.getTransform();
+  overlayCtx.save();
+  overlayCtx.setTransform(base.multiply(new DOMMatrix([m[0], m[1], m[2], m[3], m[4], m[5]])));
+  const unit = 1 / (Math.hypot(m[0], m[1]) || 1);
+  if (geomMode === "geometry") {
+    const mesh = session.mesh;
+    const verts = mesh.positions.length / 3;
+    if (verts && verts <= GEOM_DRAW_MAX) {
+      const cols = mesh.cols + 1;
+      const at = (v: number) => imageOfModel(session, mesh.positions[v * 3], mesh.positions[v * 3 + 1]);
+      overlayCtx.beginPath();
+      for (let j = 0; j <= mesh.rows; j++) {
+        for (let i = 0; i < mesh.cols; i++) {
+          const a = at(j * cols + i);
+          const b = at(j * cols + i + 1);
+          overlayCtx.moveTo(a[0], a[1]);
+          overlayCtx.lineTo(b[0], b[1]);
+        }
+      }
+      for (let i = 0; i <= mesh.cols; i++) {
+        for (let j = 0; j < mesh.rows; j++) {
+          const a = at(j * cols + i);
+          const b = at((j + 1) * cols + i);
+          overlayCtx.moveTo(a[0], a[1]);
+          overlayCtx.lineTo(b[0], b[1]);
+        }
+      }
+      overlayCtx.lineWidth = unit;
+      overlayCtx.strokeStyle = "rgba(0,0,0,0.35)";
+      overlayCtx.stroke();
+    }
+    const g = session.geometry;
+    if (g && (g.sliceX.length || g.sliceY.length)) {
+      // 黄色只画「手动加的切片」：基础网格（含细分）已经在上面用暗线画过，全画黄会分不清哪刀是自己切的
+      overlayCtx.beginPath();
+      for (const t of g.sliceX) {
+        overlayCtx.moveTo(t * w, 0);
+        overlayCtx.lineTo(t * w, h);
+      }
+      for (const t of g.sliceY) {
+        overlayCtx.moveTo(0, t * h);
+        overlayCtx.lineTo(w, t * h);
+      }
+      overlayCtx.lineWidth = unit;
+      overlayCtx.strokeStyle = "rgba(255,209,102,0.9)";
+      overlayCtx.stroke();
+    }
+    if (g && hasTopology(g)) {
+      overlayCtx.fillStyle = "rgba(255,209,102,0.95)";
+      overlayCtx.font = `${Math.round(11 * unit)}px sans-serif`;
+      overlayCtx.fillText(et("geo.topoOn"), unit * 4, unit * 12);
+    }
+    return;
+  }
+  const sheet = session.sheet;
+  if (!sheet) return;
+  const key = `${sheet.view}|${sheet.limbs.length}|${sheet.active}|${sheet.maskEdit ? 1 : 0}|${sheet.rev}`;
+  if (!sheetViewCache || sheetViewCache.key !== key) {
+    const px = viewPixels(sheet.image, sheet.limbs, sheet.background, sheet.view);
+    const cv = sheetViewCache?.canvas ?? document.createElement("canvas");
+    cv.width = sheet.image.width;
+    cv.height = sheet.image.height;
+    const cx = cv.getContext("2d");
+    if (cx) cx.putImageData(new ImageData(px, sheet.image.width, sheet.image.height), 0, 0);
+    sheetViewCache = { key, canvas: cv };
+  }
+  if (sheetViewCache) {
+    overlayCtx.globalAlpha = 0.85;
+    overlayCtx.drawImage(sheetViewCache.canvas, 0, 0);
+    overlayCtx.globalAlpha = 1;
+  }
+  if (sheet.polygon.length) {
+    overlayCtx.beginPath();
+    sheet.polygon.forEach(([x, y], i) => (i ? overlayCtx.lineTo(x, y) : overlayCtx.moveTo(x, y)));
+    overlayCtx.lineWidth = unit;
+    overlayCtx.strokeStyle = "rgba(255,209,102,0.95)";
+    overlayCtx.stroke();
+  }
+  overlayCtx.fillStyle = "rgba(255,255,255,0.9)";
+  overlayCtx.font = `${Math.round(11 * unit)}px sans-serif`;
+  overlayCtx.fillText(et("sheet.hintClick"), unit * 4, unit * 12);
+}
+
+/** P1 指针：切片待命 / Edit Topology 翻转与顶点偏移 / 角色表涂抹（都优先于手柄与钉子） */
+function geomPointerDown(e: PointerEvent): boolean {
+  const t = geomTarget();
+  if (!t || !geomMode || e.button !== 0) return false;
+  const p = canvasPoint(e);
+  if (!p) return false;
+  const at = layerPixelAt(t.session, p.x, p.y);
+  if (!at) return false;
+  const session = t.session;
+  const [px, py] = at;
+  if (geomMode === "geometry") {
+    const g = geomOfSession(session);
+    if (geomArm) {
+      const axis = geomArm;
+      const v = axis === "x" ? px / session.size.width : py / session.size.height;
+      geomArm = null;
+      geomEdit((cur) => addSlice(cur, axis, v), et("log.geomSlice", { layer: geomLayerName(session), axis }));
+      suppressClick = true;
+      return true;
+    }
+    if (geomTopo) {
+      const axes = axesOf(g);
+      const i = axes.xs.findIndex((x, k) => k < axes.xs.length - 1 && px / session.size.width >= x && px / session.size.width < axes.xs[k + 1]);
+      const j = axes.ys.findIndex((y, k) => k < axes.ys.length - 1 && py / session.size.height >= y && py / session.size.height < axes.ys[k + 1]);
+      if (i >= 0 && j >= 0) {
+        const cell = j * (axes.xs.length - 1) + i;
+        geomEdit((cur) => flipCell(cur, cell), et("log.geomFlip", { layer: geomLayerName(session), cell }));
+        suppressClick = true;
+        return true;
+      }
+    }
+    if (e.altKey) {
+      // Alt：抓最近的顶点拖偏移（松手落盘）
+      const mesh = session.mesh;
+      let best = -1;
+      let bestD = Infinity;
+      for (let v = 0; v < mesh.positions.length / 3; v++) {
+        const q = imageOfModel(session, mesh.positions[v * 3], mesh.positions[v * 3 + 1]);
+        const d = Math.hypot(q[0] - px, q[1] - py);
+        if (d < bestD) {
+          bestD = d;
+          best = v;
+        }
+      }
+      if (best >= 0 && bestD <= 16) {
+        geomVertex = { vertex: best, pointerId: e.pointerId, x0: p.x, y0: p.y, dx: 0, dy: 0 };
+        stageEl.setPointerCapture(e.pointerId);
+        suppressClick = true;
+        return true;
+      }
+    }
+    return false;
+  }
+  const sheet = session.sheet;
+  if (!sheet) return false;
+  if (sheet.paint === "polygon") {
+    sheet.polygon.push([px, py]);
+    if (e.detail > 1) sheetClosePolygon(sheet, e.altKey ? "remove" : "add");
+    suppressClick = true;
+    drawOverlay();
+    return true;
+  }
+  sheet.stroke = { erase: e.altKey, last: [px, py] };
+  sheetStroke(sheet, [{ x: px, y: py }], e.altKey ? "remove" : "add");
+  stageEl.setPointerCapture(e.pointerId);
+  suppressClick = true;
+  drawOverlay();
+  return true;
+}
+
+/** P1 指针拖动：顶点偏移累计 / 画笔续笔；返回 true = 这一下归几何与角色表管 */
+function geomPointerMove(e: PointerEvent): boolean {
+  const t = geomTarget();
+  if (!t || !geomMode) return false;
+  const session = t.session;
+  if (geomVertex && e.pointerId === geomVertex.pointerId) {
+    const p = canvasPoint(e);
+    if (!p) return true;
+    const d = warpDeltaOf(session, p.x - geomVertex.x0, p.y - geomVertex.y0);
+    geomVertex.dx = d[0];
+    geomVertex.dy = d[1];
+    return true;
+  }
+  const sheet = session.sheet;
+  if (!sheet?.stroke || sheet.paint !== "brush") return false;
+  const p = canvasPoint(e);
+  if (!p) return true;
+  const at = layerPixelAt(session, p.x, p.y);
+  if (!at) return true;
+  sheetStroke(sheet, [{ x: sheet.stroke.last[0], y: sheet.stroke.last[1] }, { x: at[0], y: at[1] }], sheet.stroke.erase ? "remove" : "add");
+  sheet.stroke.last = [at[0], at[1]];
+  drawOverlay();
+  return true;
+}
+
+/** P1 指针抬起：顶点偏移落盘 / 结束这一笔 */
+function geomPointerUp(e: PointerEvent) {
+  const t = geomTarget();
+  if (!t) return;
+  const session = t.session;
+  if (geomVertex && e.pointerId === geomVertex.pointerId) {
+    const v = geomVertex;
+    geomVertex = null;
+    if (Math.abs(v.dx) > 0.01 || Math.abs(v.dy) > 0.01) {
+      const g = geomOfSession(session);
+      const uv = vertexUvOf(g, v.vertex);
+      geomEdit(
+        (cur) => setOffset(cur, v.vertex, v.dx / session.size.width, v.dy / session.size.height),
+        et("log.geomOffset", { layer: geomLayerName(session), vertex: v.vertex, u: uv ? uv[0].toFixed(3) : "—" }),
+      );
+    }
+    return;
+  }
+  if (session.sheet?.stroke && e.pointerId === e.pointerId) {
+    session.sheet.stroke = null;
+    session.limbs = limbsMeta(session.sheet.spec, session.sheet.limbs);
+    renderInspector();
+    drawOverlay();
+  }
+}
+
+/** P1 几何分组：网格生成 / 细分 / 切片 / Padding / Lock geometry / Edit Topology */
+function geometryGroup(node: LayerNode): HTMLElement | null {
+  const t = warpTarget();
+  if (!t || String(t.node.id) !== String(node.id)) return null;
+  const session = t.session;
+  const g = geomOfSession(session);
+  const grid = gridOf(g);
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-geom";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.geometry");
+  group.appendChild(h);
+  const editable = !!overlay && !isLocked(node.id);
+  const action = (cls: string, key: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.dataset.et = key;
+    b.textContent = et(key);
+    b.disabled = disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  const label = geomLayerName(session);
+  const verts = session.mesh.positions.length / 3;
+  group.appendChild(note(et("geo.note", { cols: grid.cols, rows: grid.rows, verts, pad: session.geometry?.padding ?? 0 })));
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.appendChild(el);
+    form.append(l, box);
+  };
+  const logGrid = () => et("log.geomGrid", { layer: label, cols: g.cols, rows: g.rows, sub: g.subdivision, pad: session.geometry?.padding ?? 0 });
+  const range = (cls: string, key: string, value: number, min: number, max: number, step: number, onSet: (n: number) => void) => {
+    const el = document.createElement("input");
+    el.type = "range";
+    el.className = cls;
+    el.min = String(min);
+    el.max = String(max);
+    el.step = String(step);
+    el.value = String(value);
+    el.disabled = !editable;
+    el.addEventListener("change", () => onSet(Number(el.value)));
+    row(key, el);
+    return el;
+  };
+  range("ed-geom-cols", "geo.cols", g.cols, COLS_MIN, COLS_MAX, 1, (n) => geomEdit((x) => withColsRows(x, n, x.rows), logGrid()));
+  range("ed-geom-rows", "geo.rows", g.rows, COLS_MIN, COLS_MAX, 1, (n) => geomEdit((x) => withColsRows(x, x.cols, n), logGrid()));
+  range("ed-geom-sub", "geo.sub", g.subdivision, SUBDIV_MIN, SUBDIV_MAX, 1, (n) => geomEdit((x) => withSubdivision(x, n), logGrid()));
+  range("ed-geom-pad", "geo.pad", session.geometry?.padding ?? 0, PADDING_MIN, PADDING_MAX, 1, (n) => geomEdit((x) => withPadding(x, n), logGrid()));
+  const lock = document.createElement("input");
+  lock.type = "checkbox";
+  lock.className = "ed-geom-lock";
+  lock.checked = !!g.locked;
+  lock.disabled = !editable;
+  lock.addEventListener("change", () => geomEdit((x) => withLocked(x, lock.checked), logGrid()));
+  row("geo.lock", lock);
+  group.appendChild(form);
+  group.appendChild(note(et("geo.slices", { x: g.sliceX.length, y: g.sliceY.length })));
+  const actions = document.createElement("div");
+  actions.className = "ed-insp-actions";
+  const sliceX = action("ed-geom-slice-x", "geo.sliceX", () => {
+    geomArm = "x";
+    geomMode = "geometry";
+    renderInspector();
+    drawOverlay();
+  }, !editable);
+  const sliceY = action("ed-geom-slice-y", "geo.sliceY", () => {
+    geomArm = "y";
+    geomMode = "geometry";
+    renderInspector();
+    drawOverlay();
+  }, !editable);
+  // 待命态可见：切了按钮之后要在视口里点位置，没有提示会以为没反应
+  if (geomArm === "x") sliceX.classList.add("is-arm");
+  if (geomArm === "y") sliceY.classList.add("is-arm");
+  actions.append(
+    action("ed-geom-create", session.geometry ? "geo.reset" : "geo.create", () =>
+      geomEdit(() => defaultGeometry(session.size, session.mesh.cols, session.mesh.rows), et("log.geomGrid", { layer: label, cols: session.mesh.cols, rows: session.mesh.rows, sub: 1, pad: 0 })),
+    !editable),
+    action("ed-geom-reset-topo", "geo.resetTopo", () => geomEdit((x) => clearTopology(x), et("log.geomTopoReset", { layer: label })), !editable),
+    sliceX,
+    sliceY,
+    action("ed-geom-clear-slices", "geo.clearSlices", () => geomEdit((x) => withSlices(withSlices(x, "x", []), "y", []), et("log.geomGrid", { layer: label, cols: g.cols, rows: g.rows, sub: g.subdivision, pad: session.geometry?.padding ?? 0 })), !editable),
+    action("ed-geom-topo", geomTopo ? "geo.topoOn" : "geo.topo", () => {
+      geomTopo = !geomTopo;
+      if (geomTopo) geomMode = "geometry";
+      renderInspector();
+      drawOverlay();
+    }, !editable),
+    action("ed-geom-view", geomMode === "geometry" ? "geo.viewOn" : "geo.view", () => {
+      geomMode = geomMode === "geometry" ? null : "geometry";
+      renderInspector();
+      drawOverlay();
+    }),
+  );
+  group.appendChild(actions);
+  return group;
+}
+
+/** P1 角色表分组：读原图 / 自动抠图 / limb 列表（颜色 = 部件色）/ 画笔·多边形 / 应用部件 */
+function sheetGroup(node: LayerNode): HTMLElement | null {
+  const t = warpTarget();
+  if (!t || String(t.node.id) !== String(node.id)) return null;
+  const session = t.session;
+  const group = document.createElement("div");
+  group.className = "ed-insp-group ed-sheet";
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et("insp.sheet");
+  group.appendChild(h);
+  const editable = !!overlay && !isLocked(node.id);
+  const action = (cls: string, key: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.dataset.et = key;
+    b.textContent = et(key);
+    b.disabled = disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  if (!session.sheet) {
+    group.appendChild(note(et("sheet.intro")));
+    group.appendChild(action("ed-sheet-load", "sheet.load", () => {
+      void sheetLoad(session).then((ok) => {
+        if (!ok) return;
+        geomMode = "sheet";
+        sheetViewCache = null;
+        renderInspector();
+        drawOverlay();
+      });
+    }, !editable));
+    return group;
+  }
+  const sheet = session.sheet;
+  group.appendChild(note(et("sheet.note", { w: sheet.image.width, h: sheet.image.height, n: sheet.limbs.length })));
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.appendChild(el);
+    form.append(l, box);
+  };
+  const specSet = (patch: Partial<SheetSpec>) => {
+    sheet.spec = { ...sheet.spec, ...patch };
+    sheet.background = backgroundMaskOf(sheet.image, sheet.spec);
+    sheet.rev++;
+    session.limbs = limbsMeta(sheet.spec, sheet.limbs);
+    renderInspector();
+    drawOverlay();
+  };
+  const range = (cls: string, key: string, value: number, min: number, max: number, step: number, onSet: (n: number) => void) => {
+    const el = document.createElement("input");
+    el.type = "range";
+    el.className = cls;
+    el.min = String(min);
+    el.max = String(max);
+    el.step = String(step);
+    el.value = String(value);
+    el.disabled = !editable;
+    el.addEventListener("change", () => onSet(Number(el.value)));
+    row(key, el);
+    return el;
+  };
+  range("ed-sheet-quality", "sheet.quality", sheet.spec.quality, QUALITY_MIN, QUALITY_MAX, 1, (n) => specSet({ quality: n }));
+  range("ed-sheet-smooth", "sheet.smooth", sheet.spec.smoothing, 0, SMOOTHING_MAX, 1, (n) => specSet({ smoothing: n }));
+  range("ed-sheet-threshold", "sheet.threshold", sheet.spec.threshold, 0, 255, 1, (n) => specSet({ threshold: n }));
+  range("ed-sheet-feather", "sheet.feather", sheet.spec.feather, 0, 4, 1, (n) => specSet({ feather: n }));
+  const view = document.createElement("select");
+  view.className = "ed-sheet-viewsel";
+  for (const v of ["foreground", "background"] as SheetView[]) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = et(v === "foreground" ? "sheet.viewFore" : "sheet.viewBack");
+    view.appendChild(o);
+  }
+  view.value = sheet.view;
+  view.disabled = !editable;
+  view.addEventListener("change", () => {
+    sheet.view = view.value as SheetView;
+    sheet.rev++;
+    renderInspector();
+    drawOverlay();
+  });
+  row("sheet.view", view);
+  const paint = document.createElement("select");
+  paint.className = "ed-sheet-paint";
+  for (const p of ["brush", "polygon"] as PaintMode[]) {
+    const o = document.createElement("option");
+    o.value = p;
+    o.textContent = et(p === "brush" ? "sheet.paintBrush" : "sheet.paintPolygon");
+    paint.appendChild(o);
+  }
+  paint.value = sheet.paint;
+  paint.disabled = !editable;
+  paint.addEventListener("change", () => {
+    sheet.paint = paint.value as PaintMode;
+    sheet.polygon = [];
+    sheet.stroke = null;
+    renderInspector();
+    drawOverlay();
+  });
+  row("sheet.paint", paint);
+  range("ed-sheet-radius", "sheet.radius", sheet.radius, 1, 40, 1, (n) => {
+    sheet.radius = n;
+    renderInspector();
+  });
+  const mask = document.createElement("input");
+  mask.type = "checkbox";
+  mask.className = "ed-sheet-mask";
+  mask.checked = sheet.maskEdit;
+  mask.disabled = !editable;
+  mask.addEventListener("change", () => {
+    sheet.maskEdit = mask.checked;
+    sheet.rev++;
+    renderInspector();
+    drawOverlay();
+  });
+  row("sheet.mask", mask);
+  group.appendChild(form);
+  const list = document.createElement("div");
+  list.className = "ed-sheet-limbs";
+  sheet.limbs.forEach((limb, i) => {
+    const item = document.createElement("div");
+    item.className = `ed-fx-item ed-sheet-limb${i === sheet.active ? " is-on" : ""}`;
+    item.dataset.limb = String(i);
+    const sw = document.createElement("span");
+    sw.className = "ed-sheet-sw";
+    const c = LIMB_PALETTE[i % LIMB_PALETTE.length];
+    sw.style.background = `rgb(${c[0]},${c[1]},${c[2]})`;
+    const nm = document.createElement("span");
+    nm.className = "ed-fx-name";
+    nm.textContent = `${limb.name} · ${maskCount(limb.mask)}`;
+    item.append(sw, nm);
+    item.onclick = () => {
+      sheet.active = i;
+      sheet.rev++;
+      renderInspector();
+      drawOverlay();
+    };
+    list.appendChild(item);
+  });
+  group.appendChild(list);
+  const actions = document.createElement("div");
+  actions.className = "ed-insp-actions";
+  actions.append(
+    action("ed-sheet-auto", "sheet.auto", () => sheetAuto(session), !editable),
+    action("ed-sheet-recalc", "sheet.recalc", () => sheetRecalc(session), !editable || !sheet.limbs.length),
+    action("ed-sheet-add", "sheet.add", () => sheetAddLimb(session), !editable),
+    action("ed-sheet-del", "sheet.del", () => sheetRemoveLimb(session), !editable || sheet.limbs.length <= 1),
+    action("ed-sheet-up", "sheet.up", () => sheetMovePart(session, -1), !editable || sheet.active <= 0),
+    action("ed-sheet-down", "sheet.down", () => sheetMovePart(session, 1), !editable || sheet.active >= sheet.limbs.length - 1),
+    action("ed-sheet-apply", "sheet.apply", () => void sheetApply(session), !editable || !sheet.limbs.length),
+    action("ed-sheet-load", "sheet.reload", () => {
+      void sheetLoad(session).then((ok) => {
+        if (!ok) return;
+        geomMode = "sheet";
+        sheetViewCache = null;
+        renderInspector();
+        drawOverlay();
+      });
+    }, !editable),
+    action("ed-sheet-view", geomMode === "sheet" ? "sheet.viewOn" : "sheet.viewBtn", () => {
+      geomMode = geomMode === "sheet" ? null : "sheet";
+      sheetViewCache = null;
+      renderInspector();
+      drawOverlay();
+    }),
+  );
+  group.appendChild(actions);
+  return group;
+}
+
+/** P1 指针挂点：注册在这些通用监听之前 ⇒ 几何 / 角色表消费掉的事件不再落到手柄、框选与钉子 */
+stageEl.addEventListener("pointerdown", (e) => {
+  if (!geomPointerDown(e)) return;
+  e.stopImmediatePropagation();
+  e.preventDefault();
+});
+stageEl.addEventListener("pointermove", (e) => {
+  if (!geomPointerMove(e)) return;
+  e.stopImmediatePropagation();
+});
+const geomBusy = () => !!geomVertex || !!geomTarget()?.session.sheet?.stroke;
+stageEl.addEventListener("pointerup", (e) => {
+  if (!geomBusy()) return;
+  geomPointerUp(e);
+  e.stopImmediatePropagation();
+});
+stageEl.addEventListener("pointercancel", (e) => {
+  if (!geomBusy()) return;
+  geomPointerUp(e);
+  e.stopImmediatePropagation();
+});
+
+// ---------- 骨架与权重（P2：官方 Weights 菜单） ----------
+//
+// WE 的 Weights 窗口 = 骨列表（Add Bone / Delete / Rename / 改父子）+ Paint Weights +
+// Weight islands + 4 影响上限。这里按同一套顺序做：打点建骨 → 命名 / 父子 → 自动权重 →
+// 涂抹 / 平滑 / 孤岛混合 → 应用。顶点权重本体写进 .mdl 的 4 槽蒙皮；json 只记
+// `puppetWarp.skeleton`（骨名 / 父级 / 位置）与 `puppetWarp.weights`（locked），与 P0 / P1 同口径。
+
+/** 骨 meta 的 pw 键（P4 的仿真 / IK 读它）；P2 只负责如实写下来 */
+const SKEL_PHYS = { stiffness: 0.5, damping: 0.2 };
+/** 顶点权重之和小于这个值当「没涂」（引擎会把这些顶点当无效蒙皮，面板要提醒） */
+const SKEL_UNPAINTED = 1e-4;
+/** 权重叠加层最多画多少个顶点（大网格抽样画，别把帧率拖垮） */
+const SKEL_DRAW_MAX = 6000;
+
+/** .mdl 的顶点 / 索引 / 蒙皮槽 / 部件表：P2 的权重都挂在这份顶点上 */
+type SkelModel = {
+  positions: Float32Array;
+  indices: Uint32Array;
+  vertexCount: number;
+  boneCount: number;
+  parts: MdlPart[] | null;
+  skin: WeightSkin | null;
+};
+
+/** 骨架（"skeleton"）/ 权重（"weights"）模式：和 P1 的几何 / 角色表一样是模态 */
+let skelMode: "skeleton" | "weights" | null = null;
+/** 「打点建骨」待命 */
+let skelArm = false;
+/** 「设为父级」待命：下一下点的骨挂到当前选中骨下 */
+let skelParentArm = false;
+/** 选中骨 */
+let skelSel = -1;
+/** 涂抹目标骨（-1 = 跟选中骨） */
+let skelPaintBone = -1;
+let skelBrush = BRUSH_RADIUS;
+let skelStrength = BRUSH_STRENGTH;
+/** 转动预览的角度（度） */
+let skelPoseDeg = 0;
+/** 涂抹中的指针（模型空间上一点 + 是否擦除 + 起笔前的权重快照） */
+let skelStroke: { pointerId: number; erase: boolean; last: [number, number]; base: Float32Array | null } | null = null;
+/** 叠加层按部件绘制序着色 */
+let skelDepth = false;
+let skelPhysics = { ...SKEL_PHYS };
+/** 邻接表缓存（平滑 / 孤岛用）：键 = 模型路径 + 顶点数 */
+let skelAdjCache: { key: string; adj: { start: Uint32Array; list: Uint32Array } } | null = null;
+/** 正在读 .mdl 的模型（防重入） */
+const skelLoading = new Set<string>();
+
+function skelTarget(): { node: LayerNode; session: WarpSession } | null {
+  return warpTarget();
+}
+
+/** 骨架 / 权重模式同样模态：通用监听（手柄 / 框选 / 钉子）靠 geomModal 让路 */
+function skelModal(): boolean {
+  return !!skelMode && !!warpTarget();
+}
+
+function skelLayerName(session: WarpSession): string {
+  return doc ? nodeName(session.layer) : "";
+}
+
+/** 画布点 → 模型坐标（中心原点、Y 向上，与 geometry / limbs 同一套换算） */
+function skelModelAt(session: WarpSession, x: number, y: number): [number, number] | null {
+  const p = layerPixelAt(session, x, y);
+  return p ? [p[0] - session.size.width / 2, session.size.height / 2 - p[1]] : null;
+}
+
+/** 读 .mdl 的顶点 / 索引 / 蒙皮槽 / 部件表（P2 的权重都挂在这份顶点上） */
+async function skelModelOf(session: WarpSession): Promise<SkelModel | null> {
+  const assets = overlay;
+  if (!assets) return null;
+  const json = parseJsonBytes(await assets.read(session.modelPath));
+  const mdlPath = json && typeof json.puppet === "string" ? json.puppet : "";
+  if (!mdlPath) return null;
+  const bytes = await assets.read(mdlPath);
+  if (!bytes) return null;
+  const info = mdlMeshInfo(bytes, 0);
+  const positions = mdlMeshPositions(bytes, 0);
+  const indices = mdlMeshIndices(bytes, 0);
+  const vc = info ? info.vertexCount : 0;
+  if (!info || !positions || !indices || !vc) return null;
+  const slots = mdlSkin(bytes, 0);
+  return {
+    positions,
+    indices,
+    vertexCount: vc,
+    boneCount: mdlBoneCount(bytes) ?? 0,
+    parts: info.parts,
+    skin: slots && slots.weights.length === vc * 4 ? { joints: slots.joints, weights: slots.weights, vertexCount: vc } : null,
+  };
+}
+
+/**
+ * 会话里的顶点 / 权重：第一次用到时读一次 .mdl。权重优先用盘上那份 —— 只有骨数与自建骨架
+ * 对得上才算数（骨数变了，盘上的骨号是旧骨架的，必须按新骨重算自动权重）。
+ */
+async function skelEnsure(session: WarpSession): Promise<boolean> {
+  if (session.skelVerts) return true;
+  if (skelLoading.has(session.modelPath)) return false;
+  skelLoading.add(session.modelPath);
+  try {
+    const m = await skelModelOf(session);
+    if (!m || warpSession !== session) return false;
+    session.skelVerts = m.positions;
+    session.skelIndices = m.indices;
+    session.skelVertexCount = m.vertexCount;
+    session.skelBoneCount = m.boneCount;
+    session.skelParts = m.parts;
+    const points = session.skeleton ? bonePoints(session.skeleton) : [];
+    const usable = points.length > 0 && m.skin !== null && m.boneCount === points.length;
+    session.skin = usable && m.skin ? m.skin : points.length ? nearestBoneSkin(m.positions, points) : null;
+    return true;
+  } finally {
+    skelLoading.delete(session.modelPath);
+  }
+}
+
+/** 邻接表（平滑 / 孤岛；随模型与顶点数缓存） */
+function skelAdjOf(session: WarpSession): { start: Uint32Array; list: Uint32Array } | null {
+  if (!session.skelIndices) return null;
+  const key = `${session.modelPath}|${session.skelVertexCount}`;
+  if (!skelAdjCache || skelAdjCache.key !== key) skelAdjCache = { key, adj: adjacencyOf(session.skelIndices, session.skelVertexCount) };
+  return skelAdjCache.adj;
+}
+
+/** 还没涂的顶点数 */
+function skelUnpainted(skin: WeightSkin): number {
+  let n = 0;
+  for (let v = 0; v < skin.vertexCount; v++) {
+    let sum = 0;
+    for (let k = 0; k < 4; k++) sum += skin.weights[v * 4 + k];
+    if (!(sum > SKEL_UNPAINTED)) n++;
+  }
+  return n;
+}
+
+/** 两份权重里数值不同的顶点数（涂抹的改动量） */
+function skelWeightDiff(a: Float32Array, b: Float32Array): number {
+  let n = 0;
+  const vc = Math.floor(Math.min(a.length, b.length) / 4);
+  for (let v = 0; v < vc; v++) {
+    for (let k = 0; k < 4; k++) {
+      if (Math.abs(a[v * 4 + k] - b[v * 4 + k]) > 1e-6) {
+        n++;
+        break;
+      }
+    }
+  }
+  return n;
+}
+
+/** 每顶点的部件绘制序名次（0 = 最前；-1 = 没落在任何部件里） */
+function skelPartRanks(session: WarpSession): Int32Array | null {
+  const parts = session.skelParts;
+  const idx = session.skelIndices;
+  if (!parts || !idx) return null;
+  const out = new Int32Array(session.skelVertexCount).fill(-1);
+  parts.forEach((p, i) => {
+    const rank = drawOrderRank(parts, i);
+    for (let k = p.start; k < p.start + p.size; k++) {
+      const v = idx[k];
+      if (v >= 0 && v < out.length) out[v] = rank;
+    }
+  });
+  return out;
+}
+
+/** 骨号 / 绘制序 → 颜色（复用角色表的调色板；相邻骨颜色不同就够用） */
+function skelBoneColor(bone: number): [number, number, number] {
+  const n = LIMB_PALETTE.length;
+  return LIMB_PALETTE[((bone % n) + n) % n] ?? [160, 160, 160];
+}
+
+/**
+ * `withSkeleton` / `withWeights` 都是**纯函数**（返回新对象，不改入参），而 commitMdlEdit 的 jsonEdit
+ * 契约是「就地改这份 json」⇒ 必须把新对象的内容折叠回原对象，否则新 json 里留不下骨架 / 权重状态
+ * （P2 真机段实测踩到：写盘成功但重挂后 json 里没有 puppetWarp.skeleton，面板当没骨架）。
+ */
+function jsonAssign(target: Record<string, unknown>, next: Record<string, unknown>): void {
+  for (const k of Object.keys(target)) if (!(k in next)) delete target[k];
+  Object.assign(target, next);
+}
+
+/** 两份 4×4 局部矩阵是否同一个（骨表有没有变，决定盘上片段要不要作废） */
+function sameMatrix16(a: Float32Array | undefined, b: Float32Array | undefined): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (!(Math.abs(a[i] - b[i]) < 1e-4)) return false;
+  return true;
+}
+
+/**
+ * 写回当前骨 / 权重：走 commitMdlEdit（copy-on-write 出新副本，改指向，进撤销栈），jsonEdit
+ * 顺手把 P2 状态写进新 json。写完重挂 → 恢复 P2 模式与选中骨（重挂会清掉会话里的 P2 状态）。
+ */
+async function skelCommit(
+  session: WarpSession,
+  label: string,
+  slugTag: string,
+  edit: (bytes: Uint8Array) => Uint8Array | null,
+  jsonEdit?: (json: Record<string, unknown>) => void,
+): Promise<boolean> {
+  const mode = skelMode;
+  const sel = skelSel;
+  const paint = skelPaintBone;
+  const depth = skelDepth;
+  const ok = await commitMdlEdit(session.layer, label, slugTag, "wp", edit, undefined, jsonEdit);
+  if (!ok) return false;
+  const node = doc ? findNode(doc.roots, session.layer) : null;
+  const modelPath = node ? String(node.obj.image ?? "") : "";
+  if (!modelPath) return false;
+  session.modelPath = modelPath;
+  await warpResumeAfterWrite(session.layer, modelPath, session.layout, session.size, session.mesh);
+  if (warpSession && warpSession.modelPath === modelPath) {
+    const n = warpSession.skeleton ? warpSession.skeleton.bones.length : 0;
+    const clampIdx = (i: number) => (n ? Math.max(0, Math.min(n - 1, i)) : -1);
+    skelSel = n ? clampIdx(sel) : -1;
+    skelPaintBone = n && paint >= 0 ? clampIdx(paint) : skelSel;
+    skelMode = n ? mode : null;
+    skelDepth = depth;
+    renderInspector();
+    drawOverlay();
+  }
+  return true;
+}
+
+/**
+ * 应用骨架：写 MDLS 骨记录（含 meta.pw）+ 按新骨重算一份 4 槽权重 —— 骨表一换，顶点上原来的
+ * 骨号就失效了，同一次编辑里补齐才不会有「指向不存在骨」的中间态。
+ * 骨表变了还要把盘上片段整批作废：轨道按写入时的骨号打点（P0 的钉子骨烘焙就是一批常量帧），
+ * 骨表一换这些帧就成了「按错骨号施加的姿势」，绑定姿势下画面会被推歪。
+ * 注意**不能**用 removeMdlClip 来删：它有「首个片段不许删」（引擎绑定参考）的保护，P0 木偶
+ * 恰好只有一个片段（index 0）⇒ 它会返回 null，旧片段原样留下（P2 真机量到 195px 的就是这个）。
+ */
+async function skelApplySkeleton(session: WarpSession): Promise<boolean> {
+  const sk = session.skeleton;
+  if (!sk || !sk.bones.length) {
+    log(et("skel.noBones"), "warn");
+    return false;
+  }
+  const label = skelLayerName(session);
+  const bones = boneSpecs(sk).map((b) => ({ ...b, meta: JSON.stringify({ pw: { ...skelPhysics } }) }));
+  const points = bonePoints(sk);
+  return skelCommit(
+    session,
+    et("log.skel.apply", { layer: label, bones: bones.length }),
+    "skel",
+    (bytes) => {
+      const prev = mdlBones(bytes);
+      const out = setMdlSkeleton(bytes, bones);
+      if (!out) return null;
+      const vc = mdlMeshInfo(out, 0)?.vertexCount ?? 0;
+      const pos = vc ? mdlMeshPositions(out, 0) : null;
+      let next = out;
+      if (pos) {
+        const fresh = nearestBoneSkin(pos, points);
+        const w = setMdlWeights(next, 0, fresh.weights);
+        if (w) next = setMdlBoneIdx(w, 0, fresh.joints) ?? w;
+      }
+      if (!prev || prev.length !== bones.length || prev.some((b, i) => b.name !== bones[i].name || b.parent !== bones[i].parent || !sameMatrix16(b.matrix, bones[i].matrix))) {
+        log(et("log.skel.dropped", { layer: label }), "warn");
+        next = clearMdlClips(next) ?? next;
+      }
+      return next;
+    },
+    (json) => jsonAssign(json, withSkeleton(json, sk)),
+  );
+}
+
+/** 应用权重：只写 4 槽权重与骨号（骨架沿用盘上那份，骨数必须对得上） */
+async function skelApplyWeights(session: WarpSession): Promise<boolean> {
+  const skin = session.skin;
+  const bones = session.skeleton ? session.skeleton.bones.length : 0;
+  if (!skin || !session.skelVertexCount) {
+    log(et("wt.needSkel"), "warn");
+    return false;
+  }
+  if (session.skelBoneCount && bones && session.skelBoneCount !== bones) {
+    log(et("wt.needApply"), "warn");
+    return false;
+  }
+  const locked = session.wtLocked;
+  return skelCommit(
+    session,
+    et("log.wt.apply", { layer: skelLayerName(session), n: skin.vertexCount, bones }),
+    "wt",
+    (bytes) => {
+      const w = setMdlWeights(bytes, 0, skin.weights);
+      if (!w) return null;
+      return setMdlBoneIdx(w, 0, skin.joints);
+    },
+    (json) => jsonAssign(json, withWeights(json, { locked })),
+  );
+}
+
+/** 清空骨架：回落钉子骨（重写一份 P0 的钉子模型，json 里的 skeleton 随之消失） */
+async function skelClearSkeleton(session: WarpSession): Promise<boolean> {
+  skelMode = null;
+  skelArm = false;
+  skelParentArm = false;
+  skelSel = -1;
+  skelPaintBone = -1;
+  skelStroke = null;
+  session.skeleton = null;
+  const ok = await warpWrite(session, session.layout, session.mesh, et("log.skel.clear", { layer: skelLayerName(session) }));
+  renderInspector();
+  drawOverlay();
+  return ok;
+}
+
+/** Move Limb to Front：把部件的绘制序抬到最前（写 .mdl 的部件表；本机一次绘制看不懂前后） */
+async function skelMoveFront(session: WarpSession, index: number): Promise<boolean> {
+  const parts = session.skelParts;
+  if (!parts || !parts[index]) {
+    log(et("wt.noParts"), "warn");
+    return false;
+  }
+  const next = moveLimbFront(parts, index);
+  if (!next) return false;
+  const label = et("log.wt.front", { layer: skelLayerName(session), id: parts[index].id, offset: next[index].offset });
+  // 两半一起写：offset 抬高（WE 的 draw_order_offset）+ 索引区间整段搬到表尾（部件顺序 = 绘制顺序）
+  return skelCommit(session, label, "front", (bytes) => {
+    const idx = mdlMeshIndices(bytes, 0);
+    const moved = idx ? reorderPartRange(idx, next, index) : null;
+    if (!moved) return setMdlParts(bytes, 0, next);
+    return setMdlTopology(bytes, 0, moved.indices, moved.parts);
+  });
+}
+
+/** 转动预览：只动引擎里的局部姿势（_editPose），不写盘；权重面板靠它边涂边看效果 */
+function skelPosePreview(session: WarpSession, bone: number, deg: number): void {
+  if (!editor || bone < 0) return;
+  const rad = (deg * Math.PI) / 180;
+  void editor.setBonePose(Number(session.layer), bone, { r: [0, 0, rad] }).catch(() => {});
+  drawOverlay();
+}
+
+/** 重置姿势：所有骨回到绑定姿势 */
+function skelPoseReset(session: WarpSession): void {
+  if (!editor) return;
+  const n = session.skeleton ? session.skeleton.bones.length : 0;
+  for (let i = 0; i < n; i++) void editor.setBonePose(Number(session.layer), i, null).catch(() => {});
+  drawOverlay();
+}
+
+/** 权重模式的涂抹（一次 = 一个笔刷落点） */
+function skelPaintAt(session: WarpSession, at: [number, number], erase: boolean): void {
+  const skin = session.skin;
+  if (!skin || !session.skelVerts) return;
+  const bone = skelPaintBone >= 0 ? skelPaintBone : skelSel;
+  if (bone < 0) return;
+  paintVertices(skin, session.skelVerts, at, skelBrush, bone, skelStrength, erase ? "remove" : "add");
+}
+
+/** 涂抹沿指针路径补点（两次 pointermove 之间隔很远也不留缝） */
+function skelPaintStroke(session: WarpSession, from: [number, number], to: [number, number], erase: boolean): void {
+  const d = Math.hypot(to[0] - from[0], to[1] - from[1]);
+  const steps = Math.max(1, Math.ceil(d / Math.max(1, skelBrush * 0.4)));
+  for (let i = 1; i <= steps; i++) {
+    skelPaintAt(session, [from[0] + ((to[0] - from[0]) * i) / steps, from[1] + ((to[1] - from[1]) * i) / steps], erase);
+  }
+}
+
+/** P2 指针：骨架模式点选 / 打点建骨 / 设父级，权重模式涂抹（都优先于手柄与钉子） */
+function skelPointerDown(e: PointerEvent): boolean {
+  const hit = skelPointerDownAt(e);
+  // 骨架 / 权重模式里点击只服务建模：吞掉随后的 click，别让层选择被改掉（会关掉操控变形面板）
+  if (hit) suppressClick = true;
+  return hit;
+}
+
+function skelPointerDownAt(e: PointerEvent): boolean {
+  const t = skelTarget();
+  if (!t || !skelMode || e.button !== 0) return false;
+  const p = canvasPoint(e);
+  const session = t.session;
+  const m = p ? skelModelAt(session, p.x, p.y) : null;
+  if (!m) return false;
+  if (skelMode === "weights") {
+    if (!session.skeleton || !session.skin) return false;
+    if (skelPaintBone < 0 && skelSel < 0) return false;
+    skelStroke = { pointerId: e.pointerId, erase: e.altKey, last: m, base: session.skin.weights.slice() };
+    stageEl.setPointerCapture(e.pointerId);
+    skelPaintAt(session, m, e.altKey);
+    drawOverlay();
+    return true;
+  }
+  const sk = session.skeleton ?? defaultSkeleton();
+  if (skelParentArm) {
+    const hit = nearestBone(sk, m[0], m[1]);
+    if (hit !== null && hit !== skelSel) {
+      const parent = skelSel;
+      const r = setBoneParent(sk, hit, parent);
+      if (r) {
+        const name = r.skeleton.bones[remapIndex(r.map, hit)]?.name ?? "";
+        const parentName = parent >= 0 && sk.bones[parent] ? sk.bones[parent].name : "";
+        log(et("log.skel.parent", { layer: skelLayerName(session), name, parent: parentName }));
+        session.skeleton = r.skeleton;
+        skelSel = remapIndex(r.map, hit);
+      }
+    }
+    skelParentArm = false;
+    renderInspector();
+    drawOverlay();
+    return true;
+  }
+  if (skelArm || !session.skeleton) {
+    const r = addBone(sk, m[0], m[1], skelArm && skelSel >= 0 ? skelSel : undefined);
+    if (r) {
+      session.skeleton = r.skeleton;
+      skelSel = r.index;
+      skelPaintBone = r.index;
+      const b = r.skeleton.bones[r.index];
+      const parentName = b.parent >= 0 && r.skeleton.bones[b.parent] ? r.skeleton.bones[b.parent].name : "-";
+      log(et("log.skel.arm", { layer: skelLayerName(session), name: b.name, parent: parentName }));
+    }
+    renderInspector();
+    drawOverlay();
+    return true;
+  }
+  const hit = nearestBone(sk, m[0], m[1]);
+  if (hit !== null) {
+    skelSel = hit;
+    if (skelPaintBone < 0) skelPaintBone = hit;
+  }
+  renderInspector();
+  drawOverlay();
+  return true;
+}
+
+function skelPointerMove(e: PointerEvent): boolean {
+  const t = skelTarget();
+  const stroke = skelStroke;
+  if (!t || !skelMode || !stroke || e.pointerId !== stroke.pointerId) return false;
+  const p = canvasPoint(e);
+  const m = p ? skelModelAt(t.session, p.x, p.y) : null;
+  if (m) {
+    skelPaintStroke(t.session, stroke.last, m, stroke.erase);
+    stroke.last = m;
+    drawOverlay();
+  }
+  return true;
+}
+
+function skelPointerUp(e: PointerEvent): boolean {
+  const stroke = skelStroke;
+  if (!stroke || e.pointerId !== stroke.pointerId) return false;
+  const t = skelTarget();
+  skelStroke = null;
+  const session = t?.session;
+  const skin = session?.skin;
+  if (session && skin && stroke.base) {
+    const n = skelWeightDiff(stroke.base, skin.weights);
+    if (n > 0) {
+      const bone = skelPaintBone >= 0 ? skelPaintBone : skelSel;
+      const name = session.skeleton && session.skeleton.bones[bone] ? session.skeleton.bones[bone].name : String(bone);
+      log(et("log.wt.paint", { layer: skelLayerName(session), name, n }));
+    }
+  }
+  renderInspector();
+  drawOverlay();
+  return true;
+}
+
+/** P2 叠加层：骨点 / 父子连线 + 权重模式下的顶点着色（主骨色，或绘制序着色）+ 笔刷圈 */
+function drawSkelOverlay(session: WarpSession) {
+  if (!skelMode) return;
+  const m = layerAffine(session);
+  if (!m) return;
+  const base = overlayCtx.getTransform();
+  overlayCtx.save();
+  overlayCtx.setTransform(base.multiply(new DOMMatrix([m[0], m[1], m[2], m[3], m[4], m[5]])));
+  const unit = 1 / (Math.hypot(m[0], m[1]) || 1);
+  const skin = session.skin;
+  if (skelMode === "weights" && skin && session.skelVerts) {
+    const vc = session.skelVertexCount;
+    const step = vc > SKEL_DRAW_MAX ? Math.ceil(vc / SKEL_DRAW_MAX) : 1;
+    const ranks = skelDepth ? skelPartRanks(session) : null;
+    for (let v = 0; v < vc; v += step) {
+      const c = ranks ? skelBoneColor(ranks[v]) : skelBoneColor(dominantBoneOf(skin, v));
+      const p = imageOfModel(session, session.skelVerts[v * 3], session.skelVerts[v * 3 + 1]);
+      overlayCtx.fillStyle = `rgba(${c[0]}, ${c[1]}, ${c[2]}, 0.5)`;
+      overlayCtx.beginPath();
+      overlayCtx.arc(p[0], p[1], 2 * unit, 0, Math.PI * 2);
+      overlayCtx.fill();
+    }
+  }
+  const sk = session.skeleton;
+  if (sk) {
+    overlayCtx.lineWidth = 1.5 * unit;
+    for (let i = 0; i < sk.bones.length; i++) {
+      const b = sk.bones[i];
+      const pb = b.parent >= 0 ? sk.bones[b.parent] : null;
+      const p = imageOfModel(session, b.x, b.y);
+      if (pb) {
+        const q = imageOfModel(session, pb.x, pb.y);
+        overlayCtx.strokeStyle = i === skelSel ? "rgba(255,209,102,0.95)" : "rgba(120,200,255,0.8)";
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(q[0], q[1]);
+        overlayCtx.lineTo(p[0], p[1]);
+        overlayCtx.stroke();
+      }
+      overlayCtx.beginPath();
+      overlayCtx.arc(p[0], p[1], (i === skelSel ? 5 : 3.5) * unit, 0, Math.PI * 2);
+      overlayCtx.fillStyle = i === skelSel ? "rgba(255,209,102,0.95)" : "rgba(120,200,255,0.9)";
+      overlayCtx.fill();
+      overlayCtx.strokeStyle = "rgba(0,0,0,0.55)";
+      overlayCtx.stroke();
+    }
+  }
+  if (skelMode === "weights" && skelStroke) {
+    const p = imageOfModel(session, skelStroke.last[0], skelStroke.last[1]);
+    overlayCtx.beginPath();
+    overlayCtx.arc(p[0], p[1], skelBrush * unit, 0, Math.PI * 2);
+    overlayCtx.lineWidth = unit;
+    overlayCtx.strokeStyle = skelStroke.erase ? "rgba(255,120,120,0.95)" : "rgba(255,255,255,0.95)";
+    overlayCtx.stroke();
+  }
+  const hint = skelParentArm ? "skel.parent" : skelArm ? "skel.hintArm" : "";
+  if (hint) {
+    overlayCtx.fillStyle = "rgba(255,209,102,0.95)";
+    overlayCtx.font = `${Math.round(11 * unit)}px sans-serif`;
+    overlayCtx.fillText(et(hint), 6 * unit, 14 * unit);
+  }
+  overlayCtx.restore();
+}
+
+/** P2 面板用的公共小件：按钮 / 参数行 / 滑杆（与 P1 各分组同一套写法） */
+function skelPanel(titleKey: string, cls: string): { group: HTMLElement; actions: HTMLElement } {
+  const group = document.createElement("div");
+  group.className = `ed-insp-group ${cls}`;
+  const h = document.createElement("div");
+  h.className = "ed-insp-title";
+  h.textContent = et(titleKey);
+  const actions = document.createElement("div");
+  actions.className = "ed-insp-actions";
+  group.appendChild(h);
+  return { group, actions };
+}
+
+/** 骨架面板（P2）：打点建骨 / 骨列表 / 命名 / 父子 / 删除 / 物理参数 / 应用 */
+function skeletonGroup(node: LayerNode): HTMLElement | null {
+  const t = warpTarget();
+  if (!t || String(t.node.id) !== String(node.id)) return null;
+  const session = t.session;
+  if (!session.skelVerts && !skelLoading.has(session.modelPath)) {
+    void skelEnsure(session).then((ok) => {
+      if (ok) {
+        renderInspector();
+        drawOverlay();
+      }
+    });
+  }
+  const editable = !!overlay && !isLocked(node.id);
+  const { group, actions } = skelPanel("insp.skeleton", "ed-skel");
+  const action = (cls: string, key: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.dataset.et = key;
+    b.textContent = et(key);
+    b.disabled = disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  const bones = session.skeleton ? session.skeleton.bones : [];
+  group.appendChild(note(et("skel.note", { bones: bones.length, verts: session.skelVertexCount })));
+  group.appendChild(note(bones.length ? et("skel.rootNote") : et("skel.noBones")));
+  if (bones.length) {
+    group.appendChild(note(et("skel.list")));
+    const list = document.createElement("div");
+    list.className = "ed-skel-list";
+    bones.forEach((b, i) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `ed-btn ed-skel-bone${i === skelSel ? " is-sel" : ""}`;
+      btn.textContent = `${i + 1}. ${b.name}`;
+      btn.title = b.parent >= 0 && bones[b.parent] ? `${et("skel.parent")}: ${bones[b.parent].name}` : et("skel.rootNote");
+      btn.onclick = () => {
+        skelSel = i;
+        if (skelPaintBone < 0) skelPaintBone = i;
+        renderInspector();
+        drawOverlay();
+      };
+      list.appendChild(btn);
+    });
+    group.appendChild(list);
+  }
+  if (skelSel >= 0 && bones[skelSel]) {
+    group.appendChild(note(et("skel.boneSel", { name: bones[skelSel].name })));
+    const form = document.createElement("div");
+    form.className = "ed-fx-params";
+    const row = (key: string, el: HTMLElement) => {
+      const l = document.createElement("label");
+      l.textContent = et(key);
+      const box = document.createElement("div");
+      box.className = "ed-fx-param";
+      box.appendChild(el);
+      form.append(l, box);
+    };
+    const range = (cls: string, key: string, value: number, min: number, max: number, step: number, onSet: (n: number) => void) => {
+      const el = document.createElement("input");
+      el.type = "range";
+      el.className = cls;
+      el.min = String(min);
+      el.max = String(max);
+      el.step = String(step);
+      el.value = String(value);
+      el.disabled = !editable;
+      el.addEventListener("change", () => onSet(Number(el.value)));
+      row(key, el);
+      return el;
+    };
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "ed-skel-name";
+    input.maxLength = BONE_NAME_MAX;
+    input.value = bones[skelSel].name;
+    input.disabled = !editable;
+    input.addEventListener("change", () => {
+      const sk = session.skeleton;
+      if (!sk) return;
+      const from = sk.bones[skelSel] ? sk.bones[skelSel].name : "";
+      const next = renameBone(sk, skelSel, input.value);
+      if (!next) return;
+      session.skeleton = next;
+      log(et("log.skel.rename", { layer: skelLayerName(session), from, to: next.bones[skelSel].name }));
+      renderInspector();
+    });
+    row("skel.rename", input);
+    range("ed-skel-stiff", "skel.stiffness", skelPhysics.stiffness, 0, 1, 0.05, (n) => (skelPhysics.stiffness = n));
+    range("ed-skel-damp", "skel.damping", skelPhysics.damping, 0, 1, 0.05, (n) => (skelPhysics.damping = n));
+    group.appendChild(form);
+  }
+  group.appendChild(note(et("skel.physicsNote")));
+  const armBtn = action(`ed-skel-arm${skelArm ? " is-arm" : ""}`, skelArm ? "skel.armOn" : "skel.arm", () => {
+    skelMode = "skeleton";
+    skelArm = !skelArm;
+    skelParentArm = false;
+    renderInspector();
+    drawOverlay();
+  }, !editable);
+  const parentBtn = action(`ed-skel-parent${skelParentArm ? " is-arm" : ""}`, "skel.parent", () => {
+    if (skelSel < 0) {
+      log(et("skel.needBone"), "warn");
+      return;
+    }
+    skelMode = "skeleton";
+    skelParentArm = !skelParentArm;
+    skelArm = false;
+    renderInspector();
+    drawOverlay();
+  }, !editable || skelSel < 0);
+  actions.append(
+    action("ed-skel-new", "skel.create", () => {
+      session.skeleton = defaultBonesFor(session.size);
+      skelSel = 0;
+      skelPaintBone = 0;
+      skelMode = "skeleton";
+      log(et("log.skel.create", { layer: skelLayerName(session), bones: session.skeleton.bones.length }));
+      renderInspector();
+      drawOverlay();
+    }, !editable),
+    action(`ed-skel-view${skelMode === "skeleton" ? " is-arm" : ""}`, skelMode === "skeleton" ? "skel.viewOn" : "skel.view", () => {
+      skelMode = skelMode === "skeleton" ? null : "skeleton";
+      skelArm = false;
+      skelParentArm = false;
+      renderInspector();
+      drawOverlay();
+    }, !editable),
+    armBtn,
+    parentBtn,
+    action("ed-skel-del", "skel.delete", () => {
+      const sk = session.skeleton;
+      if (!sk || skelSel < 0) {
+        log(et("skel.needBone"), "warn");
+        return;
+      }
+      const gone = sk.bones[skelSel];
+      const kids = sk.bones.filter((b) => b.parent === skelSel).length;
+      const r = removeBone(sk, skelSel);
+      if (!r) return;
+      session.skeleton = r.skeleton;
+      if (session.skin) session.skin = remapSkin(session.skin, r.map, 0);
+      log(et("log.skel.delete", { layer: skelLayerName(session), name: gone.name, n: kids }));
+      skelSel = r.skeleton.bones.length ? Math.min(skelSel, r.skeleton.bones.length - 1) : -1;
+      skelPaintBone = skelSel;
+      renderInspector();
+      drawOverlay();
+    }, !editable || skelSel < 0),
+    action("ed-skel-apply", "skel.apply", () => void skelApplySkeleton(session), !editable || !bones.length),
+    action("ed-skel-clear", "skel.clear", () => void skelClearSkeleton(session), !editable || !bones.length),
+  );
+  group.appendChild(actions);
+  return group;
+}
+
+/** 权重面板（P2）：自动权重 / 涂抹 / 平滑 / 孤岛混合 / 绘制序 / 转动预览 / 应用 */
+function weightsGroup(node: LayerNode): HTMLElement | null {
+  const t = warpTarget();
+  if (!t || String(t.node.id) !== String(node.id)) return null;
+  const session = t.session;
+  if (!session.skelVerts && !skelLoading.has(session.modelPath)) {
+    void skelEnsure(session).then((ok) => {
+      if (ok) {
+        renderInspector();
+        drawOverlay();
+      }
+    });
+  }
+  const editable = !!overlay && !isLocked(node.id);
+  const { group, actions } = skelPanel("insp.weights", "ed-wt");
+  const action = (cls: string, key: string, onClick: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `ed-btn ${cls}`;
+    b.dataset.et = key;
+    b.textContent = et(key);
+    b.disabled = disabled;
+    b.onclick = onClick;
+    return b;
+  };
+  const sk = session.skeleton;
+  const bones = sk ? sk.bones.length : 0;
+  if (!bones || !sk) {
+    group.appendChild(note(et("wt.needSkel")));
+    actions.appendChild(
+      action("ed-wt-newskel", "skel.create", () => {
+        session.skeleton = defaultBonesFor(session.size);
+        skelSel = 0;
+        skelPaintBone = 0;
+        skelMode = "skeleton";
+        log(et("log.skel.create", { layer: skelLayerName(session), bones: session.skeleton.bones.length }));
+        renderInspector();
+        drawOverlay();
+      }, !editable),
+    );
+    group.appendChild(actions);
+    return group;
+  }
+  let skin = session.skin;
+  if (!skin && session.skelVerts) {
+    // 建了骨架但还没涂过（或刚换过骨架）：先按最近骨给一份可用的自动权重，面板立刻能涂
+    skin = nearestBoneSkin(session.skelVerts, bonePoints(sk));
+    session.skin = skin;
+  }
+  const adj = skelAdjOf(session);
+  const islands = skin && adj ? islandsOf(skin, adj) : null;
+  const target = skelPaintBone >= 0 && skelPaintBone < bones ? skelPaintBone : Math.max(0, Math.min(bones - 1, skelSel < 0 ? 0 : skelSel));
+  group.appendChild(note(et("wt.note", { islands: islands ? islands.count : 0, unpainted: skin ? skelUnpainted(skin) : 0 })));
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  const row = (key: string, el: HTMLElement) => {
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.appendChild(el);
+    form.append(l, box);
+  };
+  const range = (cls: string, key: string, value: number, min: number, max: number, step: number, onSet: (n: number) => void) => {
+    const el = document.createElement("input");
+    el.type = "range";
+    el.className = cls;
+    el.min = String(min);
+    el.max = String(max);
+    el.step = String(step);
+    el.value = String(value);
+    el.disabled = !editable;
+    el.addEventListener("change", () => onSet(Number(el.value)));
+    row(key, el);
+    return el;
+  };
+  const pick = document.createElement("select");
+  pick.className = "ed-wt-target";
+  sk.bones.forEach((b, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = `${i + 1}. ${b.name}`;
+    pick.appendChild(o);
+  });
+  pick.value = String(target);
+  pick.disabled = !editable;
+  pick.addEventListener("change", () => {
+    skelPaintBone = Number(pick.value);
+    skelSel = Number(pick.value);
+    renderInspector();
+    drawOverlay();
+  });
+  row("wt.target", pick);
+  range("ed-wt-radius", "wt.radius", skelBrush, BRUSH_RADIUS_MIN, BRUSH_RADIUS_MAX, 1, (n) => {
+    skelBrush = n;
+    drawOverlay();
+  });
+  range("ed-wt-strength", "wt.strength", skelStrength, 0.05, 1, 0.05, (n) => (skelStrength = n));
+  range("ed-wt-pose", "wt.pose", skelPoseDeg, -180, 180, 5, (n) => {
+    skelPoseDeg = n;
+    skelPosePreview(session, target, n);
+  });
+  group.appendChild(form);
+  if (skelDepth) group.appendChild(note(et("wt.depthNote")));
+  actions.append(
+    action("ed-wt-auto", "wt.auto", () => {
+      if (!session.skelVerts) return;
+      session.skin = nearestBoneSkin(session.skelVerts, bonePoints(sk));
+      log(et("log.wt.auto", { layer: skelLayerName(session), n: session.skin.vertexCount }));
+      renderInspector();
+      drawOverlay();
+    }, !editable || !session.skelVerts),
+    action(`ed-wt-paint${skelMode === "weights" ? " is-arm" : ""}`, skelMode === "weights" ? "wt.paintOn" : "wt.paint", () => {
+      if (skelMode === "weights") {
+        skelMode = null;
+        skelStroke = null;
+      } else {
+        skelMode = "weights";
+        skelPaintBone = target;
+        skelSel = target;
+      }
+      renderInspector();
+      drawOverlay();
+    }, !editable || !skin),
+    action("ed-wt-clear", "wt.clear", () => {
+      if (!session.skin) return;
+      session.skin = uniformSkin(session.skin.vertexCount, target);
+      log(et("log.wt.clear", { layer: skelLayerName(session) }));
+      renderInspector();
+      drawOverlay();
+    }, !editable || !skin),
+    action("ed-wt-smooth", "wt.smooth", () => {
+      if (!session.skin || !adj) return;
+      const n = smoothSkin(session.skin, adj, 1);
+      log(et("log.wt.smooth", { layer: skelLayerName(session), n }));
+      renderInspector();
+      drawOverlay();
+    }, !editable || !skin || !adj),
+    action("ed-wt-blend", "wt.blend", () => {
+      if (!session.skin || !adj || !islands) return;
+      const n = blendIslandBoundary(session.skin, adj, islands, 1);
+      log(et("log.wt.blend", { layer: skelLayerName(session), n }));
+      renderInspector();
+      drawOverlay();
+    }, !editable || !skin || !adj),
+    action(`ed-wt-depth${skelDepth ? " is-arm" : ""}`, "wt.depth", () => {
+      skelDepth = !skelDepth;
+      renderInspector();
+      drawOverlay();
+    }),
+    action("ed-wt-poserest", "wt.poseReset", () => {
+      skelPoseDeg = 0;
+      skelPoseReset(session);
+      renderInspector();
+    }, !editable),
+    action("ed-wt-apply", "wt.apply", () => void skelApplyWeights(session), !editable || !skin),
+  );
+  group.appendChild(actions);
+  const parts = session.skelParts;
+  if (parts && parts.length) {
+    const sel = document.createElement("select");
+    sel.className = "ed-wt-part";
+    parts.forEach((p, i) => {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = `#${p.id} · ${drawOrderRank(parts, i)}`;
+      sel.appendChild(o);
+    });
+    const front = action("ed-wt-front", "wt.front", () => void skelMoveFront(session, Number(sel.value)), !editable);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.append(sel, front);
+    group.appendChild(box);
+  } else {
+    group.appendChild(note(et("wt.noParts")));
+  }
+  return group;
+}
+
+/** P2 指针挂点：注册在通用监听之后（P1 之后），骨架 / 权重是最后一个模态 */
+stageEl.addEventListener("pointerdown", (e) => {
+  if (!skelPointerDown(e)) return;
+  e.stopImmediatePropagation();
+  e.preventDefault();
+});
+stageEl.addEventListener("pointermove", (e) => {
+  if (!skelPointerMove(e)) return;
+  e.stopImmediatePropagation();
+});
+stageEl.addEventListener("pointerup", (e) => {
+  if (!skelPointerUp(e)) return;
+  e.stopImmediatePropagation();
+});
+stageEl.addEventListener("pointercancel", (e) => {
+  if (!skelPointerUp(e)) return;
+  e.stopImmediatePropagation();
+});
+
 
 /**
  * 动画片段（W18b）：每个片段一项（名字 / 模式 / fps / 帧数 / 帧事件，复制 / 删除），底部「新建片段」（静止姿势）。
@@ -9100,6 +11858,24 @@ const BUILTIN_INSPECTOR: InspectorGroup[] = [
   { id: "camera", order: 460, when: (n) => n.kind === "camera", render: cameraGroup, tab: "props" },
   { id: "particle", order: 500, when: (n) => n.kind === "particle", render: particleGroup, tab: "props" },
   { id: "sound", order: 600, when: (n) => n.kind === "sound", render: soundGroup, tab: "props" },
+  // 操控变形（伪 Live2D）：普通图片层就能转木偶，所以是普通分组而不是木偶工具
+  // （木偶工具只在 node.modelForm 存在时才出现，图片层拿不到）
+  {
+    id: "warp",
+    order: 1150,
+    when: (n) =>
+      (n.kind === "image" && !n.modelForm) ||
+      (n.modelForm === "puppet" && warpLayoutOf(String(n.obj.image ?? "")) !== null),
+    render: warpGroup,
+    tab: "model",
+  },
+  // P1 几何与角色表：几何（格数 / 细分 / 切片 / Padding / Lock / Edit Topology）与
+  // 角色表（limb 部件表 → parts 绘制序）；都挂在操控变形会话上，所以同 tab = model
+  { id: "geometry", order: 1160, when: warpPanelOpen, render: geometryGroup, tab: "model" },
+  { id: "sheet", order: 1170, when: warpPanelOpen, render: sheetGroup, tab: "model" },
+  // P2 骨架与权重：WE 的 Weights 窗口（骨列表 / 打点建骨 / 涂抹权重 / 4 影响上限）
+  { id: "skeleton", order: 1180, when: warpPanelOpen, render: skeletonGroup, tab: "model" },
+  { id: "weights", order: 1190, when: warpPanelOpen, render: weightsGroup, tab: "model" },
   // 容器 / 全屏后期：三种旗标（直通 / 实心 / 后期）。实心层虽不是容器，也在这里给旗标
   // （引擎的 solid 判定还认 solidlayer，见 container.ts 的 solidRenders）
   { id: "attach", order: 1200, when: () => true, render: attachGroup, tab: "props" },
@@ -9350,12 +12126,17 @@ async function startExternalPlugins(a: EditorApp) {
     t: et,
     text,
     log,
-    confirmInstall: (man) => {
+    confirmInstall: async (man) => {
       const { low, high } = permissionSummary(man);
       const perms = !low.length && !high.length
         ? et("pl.installNoPerms")
-        : [et("pl.installPerms", { list: [...high, ...low].join(", ") }), high.length ? et("pl.installHigh", { list: high.join(", ") }) : ""].filter(Boolean).join("\n");
-      return confirm(et("pl.installConfirm", { name: text(man.name, man.id), version: man.version, perms }));
+        : et("pl.installPerms", { list: [...high, ...low].join(", ") });
+      return confirmDialog({
+        title: et("dlg.installTitle"),
+        body: `${text(man.name, man.id)} v${man.version}\n${perms}`,
+        note: high.length ? et("pl.installHigh", { list: high.join(", ") }) : undefined,
+        ok: et("dlg.installOk"),
+      });
     },
   });
   // 插件出错/装完/权限开关都往日志里记，面板开着时立刻刷新那一行

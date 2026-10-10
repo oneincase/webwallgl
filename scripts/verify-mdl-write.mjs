@@ -91,6 +91,13 @@ for (const { id, name, buf } of corpusMdl()) {
       mdls.bones.every((b, i) => b.parent === m.bones[i].parent && sameNums(b.matrix, m.bones[i].matrix) && W.mdlText(b.name) === m.bones[i].name);
     if (!ok) semBad++;
     check(ok, `${tag}: 文档骨骼与 parseMDL 不一致`);
+    // [P0] head0（MDLS 记录头，旧代码命名成 id）与 meta（矩阵尾 JSON cstr）也必须同源：
+    // 这两个字段此前解析侧全丢、写侧原样保留，P0 起并排导出为 parseMDL().boneMeta。
+    const bm = m.boneMeta || [];
+    const metaOk = bm.length === mdls.bones.length && mdls.bones.every((b, i) =>
+      b.head0 === bm[i].head0 && W.mdlText(b.meta ?? "") === (bm[i].meta ?? ""));
+    if (!metaOk) semBad++;
+    check(metaOk, `${tag}: 骨骼 head0 / meta 文档与 parseMDL 不一致`);
   }
   const mdla = doc.sections.find((s) => s.type === "MDLA" && !s.raw);
   if (mdla) {
@@ -316,6 +323,43 @@ console.log("D. 编辑往返");
   check(after.bones[1].matrix[12] === Math.fround(before.bones[1].matrix[12] + 5), "改绑定矩阵：读侧看到 +5");
   check(sameNums(after.positions, before.positions) && after.animations[0].tracks[0].keyframes.every((v, i) => v === before.animations[0].tracks[0].keyframes[i]), "未改动的顶点与轨道逐值不变");
   console.log(`  样本：${src ? src.tag : "合成模型"}`);
+}
+
+// ═══ D2 ═══════════════════════════════════════════════════════════════════
+console.log("D2. Reader 缓冲类型 / 对齐（P0：f32s 的 Buffer 别名 bug）");
+{
+  const raw = W.encodeMDL(synthSpec());
+  const plain = Uint8Array.from(raw);
+  // 背书缓冲长度**故意不是 4 的倍数**、内容又从非零 byteOffset 开始。
+  // 旧实现 `new Float32Array(this.buf.slice(p, p + n * 4).buffer)`：Node Buffer 的 slice 是**视图**
+  // 语义，`.buffer` 拿到整块背书 ArrayBuffer（长度非 4 倍数时 new Float32Array 抛 RangeError），
+  // 且 byteOffset 被完全忽略 ⇒ readMeshes 的 `aabb = r.f32s(p, 6)` 抛错被 readMdlDoc 吞掉、
+  // 整份退成 raw，44% 的真实模型编辑静默 no-op（修后 raw 0 / 617 条全结构化）。
+  const pad = raw.length % 4 === 3 ? 6 : 5;
+  const ab = new ArrayBuffer(raw.length + pad);
+  const asBuffer = Buffer.from(ab, 2, raw.length);
+  asBuffer.set(raw);
+  const asView = new Uint8Array(ab, 2, raw.length);
+  check(ab.byteLength % 4 !== 0, `夹具：背书缓冲长度 ${ab.byteLength} 不是 4 的倍数`);
+  let oldThrew = false;
+  try { new Float32Array(asBuffer.slice(0, 16).buffer); } catch { oldThrew = true; }
+  check(oldThrew, "夹具：旧取值方式确会抛 RangeError（Buffer.slice → 非 4 倍数背书缓冲）");
+  const ref = P.parseMDL(plain);
+  for (const [label, input] of [["Buffer 视图", asBuffer], ["Uint8Array 子视图", asView]]) {
+    let doc = null;
+    let err = "";
+    try { doc = W.readMdlDoc(input); } catch (e) { err = String((e && e.message) || e); }
+    check(!!doc && !doc.raw && doc.sections.length > 0, `${label}：readMdlDoc 走结构路径而非整份 raw${err && "（" + err + "）"}`);
+    if (doc && !doc.raw) check(sameBytes(W.writeMdlDoc(doc), plain), `${label}：结构化往返逐字节一致`);
+    let m = null;
+    try { m = P.parseMDL(input); } catch (e) { err = String((e && e.message) || e); }
+    const ok = !!m && m.bones.length === ref.bones.length &&
+      m.bones.every((b, i) => b.name === ref.bones[i].name && b.parent === ref.bones[i].parent && sameNums(b.matrix, ref.bones[i].matrix)) &&
+      sameNums(m.positions, ref.positions) && sameNums(m.uvs, ref.uvs) &&
+      m.animations.length === ref.animations.length &&
+      m.animations.every((a, i) => sameNums(a.tracks[0].keyframes, ref.animations[i].tracks[0].keyframes));
+    check(ok, `${label}：parseMDL 逐值等于偏移 0 的副本${err && "（" + err + "）"}`);
+  }
 }
 
 // ═══ E ════════════════════════════════════════════════════════════════════

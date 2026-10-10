@@ -2984,7 +2984,7 @@ section("MC. 附着点绑定 editor/model.ts（W14）");
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
   check(/const attachOffsetOf: AttachOffsetOf = \(mid, name\) =>\s*editor\?\.getAttachmentPoints\(Number\(mid\)\)/.test(mainSrc) && /attachToModel\(d, node\.id, p\.model, p\.name, attachOffsetOf\)/.test(mainSrc) && /detachFromModel\(d, node\.id, attachOffsetOf\)/.test(mainSrc),
     "页面：绑定 / 解绑的偏移只经引擎 getAttachmentPoints（不自己算蒙皮），走 structEdit");
-  check(/\{ id: "attach", order: 1200, when: \(\) => true, render: attachGroup(?:, tab: "props")? \}/.test(mainSrc) && /drawAttachMarkers\(\);\s*(drawBoneMarkers\(\);\s*)?\}/.test(mainSrc), "检视器「挂到模型」分组 + 视口附着点十字标记");
+  check(/\{ id: "attach", order: 1200, when: \(\) => true, render: attachGroup(?:, tab: "props")? \}/.test(mainSrc) && /drawAttachMarkers\(\);[\s\S]{0,200}?if \(warpSession\) \{[\s\S]{0,240}?drawWarpPins\(\);[\s\S]{0,240}?\} else drawBoneMarkers\(\);/.test(mainSrc), "检视器「挂到模型」分组 + 视口附着点十字标记（操控变形时钉标记接管骨标记）");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/getAttachmentPoints\(id: number\): EditorAttachmentPoint\[\] \| null \{/.test(sm) && /mdl\.computeSkinMatrices\(m, currentTime\(\), l\.animationLayers, getBoneOverrides\(l\)\);/.test(sm) && /mdl\.attachmentEffectiveOffset\(l, name\)/.test(sm),
     "引擎：getAttachmentPoints 以当前时刻 / 动画层 / 骨骼覆盖求姿势，偏移与挂件定位同一函数");
@@ -3468,7 +3468,7 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
     /if \(puppetMdl\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[r\.path, puppetMdl\]\]\);/.test(mainSrc) && /if \(puppetMdl\) n\.obj\.image = r\.path;\s*else n\.obj\.model = r\.path;\s*mutate\?\.\(n\.obj\);/.test(mainSrc) &&
     /function applyBoneEdit\([\s\S]{0,400}commitMdlEdit\([\s\S]{0,200}applyBoneDelta\(bytes, e\.animId, e\.bone, e\.frame, e\.delta, e\.radius\)/.test(mainSrc),
     "应用：commitMdlEdit 写时复制 + 继承旧副本文件 + puppet 登记 + 结构编辑改指向（可撤销、重挂）");
-  check(/function drawBoneMarkers\(\)[\s\S]{0,300}editor\.getBonePoints\(/.test(mainSrc) && /drawAttachMarkers\(\);\s*drawBoneMarkers\(\);/.test(mainSrc), "视口：骨骼关节 / 父子连线来自 getBonePoints");
+  check(/function drawBoneMarkers\(\)[\s\S]{0,300}editor\.getBonePoints\(/.test(mainSrc) && /drawAttachMarkers\(\);[\s\S]{0,200}?if \(warpSession\) \{[\s\S]{0,240}?drawWarpPins\(\);[\s\S]{0,240}?\} else drawBoneMarkers\(\);/.test(mainSrc), "视口：骨骼关节 / 父子连线来自 getBonePoints（操控变形模式下改画钉子）");
   check(/if \(g\.id === "bones"\) bonesShown = true;\s*\}\s*if \(!bonesShown\) dropBonePick\(\);/.test(mainSrc) && /if \(!node\) \{\s*dropBonePick\(\);/.test(mainSrc), "离开模型层撤掉骨骼预览");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const keys = ["insp.bones", "bn.note", "bn.noClips", "bn.clip", "bn.bone", "bn.frame", "bn.frameNow", "bn.t", "bn.r", "bn.s", "bn.radius", "bn.radius.one", "bn.radius.n", "bn.radius.all", "bn.apply", "bn.reset", "bn.fail.read", "bn.fail.mdl", "log.boneEdited"];
@@ -3500,6 +3500,7 @@ async function clipEditCorpus(me, P, modelTruth, ids) {
       const clips = me.mdlClips(bytes);
       if (!before.animations.length) {
         if (clips && me.addMdlClip(bytes, { name: "x", mode: "loop", fps: 30, frameCount: 10 }) !== null) bad.push(`${key} 无 MDLA 未拒`);
+        else if (me.clearMdlClips(bytes) !== null) bad.push(`${key} 无片段却清空成功`);
         else noMdla++;
         continue;
       }
@@ -3535,6 +3536,11 @@ async function clipEditCorpus(me, P, modelTruth, ids) {
       if (!S2 || !S2.tracks.every((tr, i) => src.tracks[i].frameCount !== src.frameCount + 1 || kf(tr) === kf(src.tracks[i]))) errs.push("copy 同帧数应逐字节相同");
       // 删
       if (me.removeMdlClip(bytes, src.id) !== null) errs.push("删首个未拒");
+      // 清空全部片段（P2 骨架应用：骨表一换，旧轨道的骨号整批失效；首个不许删，只能整批清）
+      const CL = me.clearMdlClips(bytes);
+      const CLM = CL && P.parseMDL(CL);
+      if (!CLM || !CLM.animations || CLM.animations.length !== 0) errs.push(`clear 未清空（读到 ${CLM?.animations ? CLM.animations.length : "null"} 个片段）`);
+      else if (rig(CLM) !== rig(before)) errs.push("clear 改了网格骨骼");
       if (before.animations.length > 1) {
         const victim = before.animations.at(-1);
         const R = me.removeMdlClip(bytes, victim.id);
@@ -3570,6 +3576,78 @@ async function clipEditCorpus(me, P, modelTruth, ids) {
     }
   }
   return { ok, removed, noMdla, bad, seen: seen.size };
+}
+
+section("MF3. MDLS 记录头 head0 / 骨骼 meta 读写 mdlBoneMeta / setMdlBoneMeta（P0）");
+{
+  const me = await loadRendererTs("renderer/src/editor/mdl-edit.ts");
+  const W = await imp("renderer/vendor/we-scene/pkg/mdl-write.js");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const { modelTruth, PUPPET_FIXTURES } = await imp("scripts/verify-editor-model.mjs");
+  const sameBytes = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+  const sameNums = (a, b) => !!a && !!b && a.length === b.length && Array.prototype.every.call(a, (x, i) => Object.is(x, b[i]) || x === b[i]);
+  check(me.mdlBoneCount(enc.encode("nope")) === null && me.mdlBoneMeta(enc.encode("nope"), 0) === null && me.setMdlBoneMeta(enc.encode("nope"), 0, { head0: 1 }) === null,
+    "非 MDL：三个 API 都返回 null，不抛");
+  // 合成 MDLV0023（2 骨）：head0 由 createMdlDoc 写 1、meta 写空 cstr
+  const synth = W.encodeMDL({
+    meshes: [{
+      material: "materials/editor/s.json",
+      positions: Float32Array.of(0, 0, 0, 1, 0, 0, 0, 1, 0),
+      uvs: Float32Array.of(0, 0, 1, 0, 0, 1),
+      boneIdx: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      weights: Float32Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0),
+      indices: [0, 1, 2],
+    }],
+    bones: [
+      { name: "root", parent: -1, matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] },
+      { name: "arm", parent: 0, matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 0, 0, 1] },
+    ],
+  });
+  check(me.mdlBoneCount(synth) === 2 && me.mdlBoneMeta(synth, 0)?.parent === -1 && me.mdlBoneMeta(synth, 0)?.head0 === 1 && me.mdlBoneMeta(synth, 0)?.meta === "",
+    "合成：骨数 / head0 / parent / 空 meta 读出");
+  const META = '{"tm":100.0,"tp":"20.48 -197.43 0"}';
+  const m1 = me.setMdlBoneMeta(synth, 0, { meta: META });
+  const p1 = P.parseMDL(m1);
+  check(p1.boneMeta[0].meta === META && me.mdlBoneMeta(m1, 0).meta === META && p1.boneMeta[1].meta === "" && sameNums(p1.bones[1].matrix, P.parseMDL(synth).bones[1].matrix),
+    "写 meta：解析侧 / 文档侧同源，其余骨的 meta 与矩阵不动");
+  check(sameBytes(me.setMdlBoneMeta(m1, 0, { meta: META }), m1), "同值写入：逐字节不变（不白改文件）");
+  const h = me.setMdlBoneMeta(synth, 1, { head0: 7 });
+  check(P.parseMDL(h).boneMeta[1].head0 === 7 && P.parseMDL(h).bones[1].parent === 0 && P.parseMDL(h).boneMeta[0].head0 === 1, "写 head0：读侧看到 7，父链与相邻骨不动");
+  const cleared = me.setMdlBoneMeta(m1, 0, { meta: "" });
+  check(P.parseMDL(cleared).boneMeta[0].meta === "" && sameBytes(cleared, synth), "清空 meta：回到与原文件逐字节相同");
+  check(me.setMdlBoneMeta(synth, 5, { head0: 1 }) === null && me.setMdlBoneMeta(synth, -1, { head0: 1 }) === null &&
+    me.setMdlBoneMeta(synth, 0, { head0: 1.5 }) === null && me.setMdlBoneMeta(synth, 0, { meta: "nope" }) === null &&
+    me.setMdlBoneMeta(synth, 0, { meta: '{"a":1}\u0000x' }) === null && me.setMdlBoneMeta(synth, 0, {}) !== null,
+    "越界骨号 / 非整数 head0 / 非法 JSON / 含 NUL 的 meta 拒绝；空 patch 视为无改");
+  // 语料：head0 / meta 与解析侧逐骨一致，改 meta 后其余段逐字节不变
+  let seen = 0;
+  const bad = [];
+  for (const id of PUPPET_FIXTURES) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    for (const o of t.objects) {
+      const bytes = t.read(o.info.mdlPath);
+      const m = P.parseMDL(bytes);
+      if (!m.bones.length) continue;
+      seen++;
+      const key = `${id}:${o.info.mdlPath}`;
+      if (me.mdlBoneCount(bytes) !== m.bones.length) { bad.push(`${key} 骨数`); continue; }
+      for (let i = 0; i < m.bones.length; i++) {
+        const bm = me.mdlBoneMeta(bytes, i);
+        if (!bm || bm.head0 !== m.boneMeta[i].head0 || bm.parent !== m.bones[i].parent || bm.meta !== m.boneMeta[i].meta) { bad.push(`${key} 骨${i}`); break; }
+      }
+      const edited = me.setMdlBoneMeta(bytes, 0, { meta: '{"lamax":180.0}' });
+      const pm = edited && P.parseMDL(edited);
+      if (!pm || pm.boneMeta[0].meta !== '{"lamax":180.0}') { bad.push(`${key} 写`); continue; }
+      const before = P.parseMDL(bytes);
+      if (!sameBytes(W.writeMdlDoc(W.readMdlDoc(edited)), edited)) bad.push(`${key} 往返`);
+      if (!sameNums(pm.positions, before.positions) || pm.bones.length !== before.bones.length ||
+        !pm.bones.every((b, i) => sameNums(b.matrix, before.bones[i].matrix)) ||
+        pm.animations.length !== before.animations.length ||
+        !pm.animations.every((a, i) => sameNums(a.tracks[0].keyframes, before.animations[i].tracks[0].keyframes))) bad.push(`${key} 其余段`);
+    }
+  }
+  check(seen >= 3 && bad.length === 0, `语料：${seen} 个带动画的木偶逐骨 head0 / meta 与解析侧一致、改 meta 后顶点 / 骨骼矩阵 / 轨道逐值不变（不符 ${json(bad.slice(0, 4))}）`);
 }
 
 section("MG. 动画片段增删 / 元数据 / 帧事件 api addMdlClip…（W18b）");
@@ -3806,6 +3884,11 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
       "setPuppetRenderer 回调没转发 layerLight：默认主光在实机上不生效（渲染侧收到 undefined）");
     check(/const layerLight = sceneLight \?\? defaultLight;/.test(hostSrc),
       "layerLight 没表达「场景灯优先、默认主光回落」（有灯的壁纸会被默认主光盖掉）");
+    // [we-scene patch 2026-10-12] 显式 defaultlight:false 的退出（操控变形的平贴 2D 木偶）：
+    // 两条装配分支（puppet / model）都要认，否则编辑器命名空间那条判据会继续补光。
+    const dlHits = [...hostSrc.matchAll(/dl\d? !== false && \(isEditorAssetPath/g)];
+    check(dlHits.length === 2 && /dl\d? === true \|\|/.test(hostSrc),
+      `默认主光的两条分支没认 defaultlight:false 的退出（实测 ${dlHits.length} 处：puppet / model 各一处）`);
     check(/normals:\s*mdl\.normals \|\| singleSub\?\.normals \|\| null/.test(mdlSrc) &&
       /const singleSub = mdl\.meshes && mdl\.meshes\.length === 1/.test(mdlSrc),
       "mdl.js 的 legacyMeshOf 没认单子网格记录里的法线：导入的单网格模型在真机上 u_lightOn 恒为 0");
@@ -4551,6 +4634,21 @@ section("I. 接线");
   check(/function markDirty\(\) \{\s*scheduleAutosave\(\);/.test(main), "每次编辑都排一次自动保存");
   const html = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/id="tb-new"(?![^>]*disabled)/.test(html) && /id="ly-add"/.test(html) && /id="in-image" accept="image\/\*"/.test(html) && /id="ed-draft"/.test(html), "页面：新建可用，有添加图片 / 图片选择框 / 草稿横幅");
+  // 空态「新建项目」按钮：曾经写的是 `() => newEl.click()`。合成 click 被 newEl 自己的 stopPropagation
+  // 挡住没问题，但用户这次**真实点击**还会继续冒泡到 document 上「点到菜单外就关」的监听（#empty-new 不在
+  // #new-menu 里）—— 菜单刚打开就被关上，表现就是「点新建项目没反应」。
+  check(/<button type="button" class="ed-btn is-primary" id="empty-new" data-et="empty\.new">/.test(html),
+    "页面：空态里有「新建项目」按钮（#empty-new）");
+  check(/\$\<HTMLButtonElement>\("#empty-new"\)\.onclick = \(e\) => \{\s*e\.stopPropagation\(\);\s*openNewMenu\(\);\s*\};/.test(main) &&
+    /function openNewMenu\(\) \{\s*closeExportMenu\(\);/.test(main),
+    "空态「新建项目」先 stopPropagation 再 openNewMenu：document 的「点菜单外就关」不会再吞掉刚打开的模板菜单（「点新建项目没反应」的成因）");
+  {
+    const uiFiles = ["editor/ui/library-panel.ts", "editor/ui/plugin-panel.ts"].map((f) => fs.readFileSync(path.join(ROOT, f), "utf8"));
+    const confirmSrc = fs.readFileSync(path.join(ROOT, "editor/ui/confirm.ts"), "utf8");
+    check(!/window\.confirm\s*\(/.test(main) && uiFiles.every((src) => !/window\.confirm\s*\(/.test(src)) &&
+      /export function confirmDialog\(/.test(confirmSrc) && uiFiles.every((src) => /confirmDialog/.test(src)) && /confirmDialog/.test(main),
+      "确认框一律走页内 confirmDialog：主页面 / 壁纸库删除 / 插件卸载都没有 window.confirm（原生弹窗在深色界面像外来户，自动化里还会被静默吞掉）");
+  }
   check(/const EDITOR_MARK = "\.webwallgl-editor"/.test(HOST_TS) && /exists && !marked/.test(HOST_TS), "宿主：无标记目录拒绝覆盖");
   {
     const pipe = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
@@ -5328,6 +5426,8 @@ section("J. 变异红测");
   check((await clipEditCorpus(clm1, P3, mt4, allFx)).bad.some((b) => b.includes("add 静止姿势")), "新建片段不取第 0 帧时「静止姿势」判据变红");
   const clm2 = await boneMut("if (!d || !anims || i <= 0) return null;", "if (!d || !anims || i < 0) return null;", "首个片段不许删");
   check((await clipEditCorpus(clm2, P3, mt4, allFx)).bad.some((b) => b.includes("删首个未拒")), "放开删首个片段时判据变红");
+  const clm6 = await boneMut("  anims.splice(0, anims.length);\n", "", "清空全部片段");
+  check((await clipEditCorpus(clm6, P3, mt4, allFx)).bad.some((b) => b.includes("clear 未清空")), "清空片段不生效时「clear 未清空」判据变红");
   const clm3 = await boneMut("    .sort((x, y) => x.frame - y.frame)\n", "", "事件按帧排序");
   check((await clipEditCorpus(clm3, P3, mt4, allFx)).bad.some((b) => b.includes("事件")), "事件不排序时「事件读回」判据变红");
   const clm4 = await boneMut("        if (d > Math.PI) d -= 2 * Math.PI;\n        else if (d < -Math.PI) d += 2 * Math.PI;\n", "", "重采样欧拉角最短方向");
@@ -8281,6 +8381,1214 @@ section("M9. 命令面板与无障碍（PALETTE）");
   check(palZh.size === palEn.size && [...palZh.keys()].every((k) => palEn.has(k)), `词典 zh / en 键集合仍然对齐（zh ${palZh.size} / en ${palEn.size}）`);
   check(palZh.get("pal.hint") !== palEn.get("pal.hint") && palZh.get("tree.aria") !== palEn.get("tree.aria"), "面板提示与树的无障碍名字确实分了中英两版");
   check(/section\("AM\. M9 命令面板 \/ 无障碍 \/ 脚本事件模板"\)/.test(palHeadSrc), "真浏览器侧有「M9 命令面板 / 无障碍 / 脚本事件模板」用例（--headless 跑）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WARP. 操控变形（伪 Live2D）editor/warp.ts
+// ───────────────────────────────────────────────────────────────────────────
+section("WARP. 操控变形 editor/warp.ts（钉子网格 / IDW 权重 / .mdl 骨架 / 烘焙 / 布局往返）");
+{
+  const wp = await loadEditorModule("warp");
+  const mp = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const size = { width: 200, height: 100 };
+  const approx = (a, b, eps = 1e-5) => Math.abs(a - b) <= eps;
+  const maxDiff = (a, b) => {
+    let m = 0;
+    for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+    return m;
+  };
+  const srcMat = {
+    passes: [
+      {
+        blending: "translucent",
+        cullmode: "nocull",
+        depthtest: "disabled",
+        depthwrite: "disabled",
+        shader: "genericimage2",
+        textures: ["editor/srcimg"],
+      },
+    ],
+  };
+
+  // ── 坐标约定：原点在图片中心、Y 向上；v 从上到下（与图片、UV 同口径） ──
+  check(json(wp.pinLocal([0.5, 0.5], size)) === json([0, 0]), "钉子坐标：归一化中心 = 原点");
+  check(
+    json(wp.pinLocal([0, 0], size)) === json([-100, 50]) && json(wp.pinLocal([1, 1], size)) === json([100, -50]),
+    "钉子坐标：左上 = (−W/2, +H/2)、右下 = (+W/2, −H/2)（Y 向上、v 向下）",
+  );
+  const back = wp.pinNorm(30, -12, size);
+  check(
+    approx(back[0], 0.65) && approx(back[1], 0.62) && approx(wp.pinLocal(back, size)[0], 30) && approx(wp.pinLocal(back, size)[1], -12),
+    "pinNorm 与 pinLocal 互逆",
+  );
+  check(json(wp.clampPin([-0.4, 1.7])) === json([0, 1]), "clampPin 把新加的钉子夹进图内");
+
+  // ── 网格密度按长宽比 ──
+  const g16 = wp.gridFor({ width: 1920, height: 1080 });
+  const gPort = wp.gridFor({ width: 1080, height: 1920 });
+  const gWide = wp.gridFor({ width: 10000, height: 10 });
+  const gSmall = wp.gridFor({ width: 8, height: 4 });
+  check(g16.cols === 32 && g16.rows === 18, `网格密度：16:9 → ${g16.cols}×${g16.rows}（长边 ${wp.MESH_BASE} 格）`);
+  check(gPort.cols === 18 && gPort.rows === 32, `竖图转过来 → ${gPort.cols}×${gPort.rows}`);
+  check(json(wp.gridFor({ width: 100, height: 100 })) === json({ cols: 32, rows: 32 }), "方图 32×32");
+  check(
+    gWide.cols === 32 && gWide.rows === wp.MESH_MIN && gSmall.cols === 32 && gSmall.rows === 16,
+    `极端长条按长宽比缩到下限 ${wp.MESH_MIN}（${gWide.cols}×${gWide.rows}）；网格密度只跟长宽比有关、与像素多少无关（8×4 也是 32×16）`,
+  );
+
+  // ── 默认布局 ──
+  const lay = wp.defaultLayout(size);
+  check(
+    lay.pins.length === 9 && json(lay.pins[0]) === json([0, 0]) && json(lay.pins[4]) === json([0.5, 0.5]) && json(lay.pins[8]) === json([1, 1]),
+    "默认 3×3 钉子：行优先从左上起，中心正好在图片中心",
+  );
+  check(lay.cols === 32 && lay.rows === 16 && lay.power === wp.DEFAULT_POWER, `默认 200×100 网格 32×16、衰减 ${wp.DEFAULT_POWER}（实得 ${lay.cols}×${lay.rows}/${lay.power}）`);
+
+  // ── 网格几何 / UV / 绕序 ──
+  const mesh = wp.buildMesh(lay, size);
+  const vcount = (lay.cols + 1) * (lay.rows + 1);
+  const at = (i, j) => j * (lay.cols + 1) + i;
+  check(
+    mesh.positions.length / 3 === vcount && mesh.uvs.length / 2 === vcount && mesh.indices.length === lay.cols * lay.rows * 6,
+    `网格顶点 ${vcount} 个、三角形 ${lay.cols * lay.rows * 2} 个（${lay.cols}×${lay.rows} 格）`,
+  );
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let v = 0; v < vcount; v++) {
+    minX = Math.min(minX, mesh.positions[v * 3]);
+    maxX = Math.max(maxX, mesh.positions[v * 3]);
+    minY = Math.min(minY, mesh.positions[v * 3 + 1]);
+    maxY = Math.max(maxY, mesh.positions[v * 3 + 1]);
+  }
+  check(
+    approx(minX, -100) && approx(maxX, 100) && approx(minY, -50) && approx(maxY, 50),
+    "网格几何跨度 = 图片尺寸且以原点为中心（图层 origin / scale 不变就能逐像素对上原图）",
+  );
+  const uvAt = (i, j) => json([...mesh.uvs.slice(at(i, j) * 2, at(i, j) * 2 + 2)].map((v) => Math.round(v * 1e6) / 1e6));
+  check(
+    uvAt(0, 0) === json([0, 1]) && uvAt(0, lay.rows) === json([0, 0]) && uvAt(lay.cols, lay.rows) === json([1, 0]) && uvAt(lay.cols, 0) === json([1, 1]),
+    "UV：左下 (0,1) / 左上 (0,0) / 右上 (1,0) / 右下 (1,1)（UV 原点在左上，v 向下）",
+  );
+  const triZ = (k) => {
+    const a = mesh.indices[k * 3] * 3;
+    const b = mesh.indices[k * 3 + 1] * 3;
+    const c = mesh.indices[k * 3 + 2] * 3;
+    return (
+      (mesh.positions[b] - mesh.positions[a]) * (mesh.positions[c + 1] - mesh.positions[a + 1]) -
+      (mesh.positions[b + 1] - mesh.positions[a + 1]) * (mesh.positions[c] - mesh.positions[a])
+    );
+  };
+  check(
+    [...mesh.indices].every((i) => i >= 0 && i < vcount) && triZ(0) > 0 && triZ(lay.cols * lay.rows * 2 - 1) > 0,
+    "索引都在范围内、两个三角形绕序正面朝 +Z（与「图片 → 摆动木偶」生成器一致）",
+  );
+
+  // ── IDW 权重 ──
+  const pins = lay.pins.map((p) => wp.pinLocal(p, size));
+  const mid = wp.influenceAt(0, 0, pins, 4, 1e-3);
+  check(
+    mid.joint[0] === 4 && mid.weight[0] > 0.999 && approx(mid.weight.reduce((a, b) => a + b, 0), 1, 1e-6),
+    `IDW：正中顶点恰在中心钉子上 ⇒ 该骨权重 1（${Math.round(mid.weight[0] * 1e5) / 1e5}），权重和归一`,
+  );
+  const edge = wp.influenceAt(0, 50, pins, 4, 1e-3);
+  check(edge.joint[0] === 1 && edge.weight[0] > 0.999, "IDW：钉子所在顶点由该钉子独占（上边中点钉）");
+  const soft = wp.influenceAt(30, 0, pins, 1, 1e-3);
+  const hard = wp.influenceAt(30, 0, pins, 8, 1e-3);
+  check(
+    hard.weight[0] > soft.weight[0] && hard.weight[3] < soft.weight[3] && soft.weight[0] > soft.weight[3],
+    `衰减指数：越大越局部（最近骨权重 ${Math.round(soft.weight[0] * 1e4) / 1e4} → ${Math.round(hard.weight[0] * 1e4) / 1e4}，第 4 根反向）`,
+  );
+  check(
+    hard.weight.every((w) => w > 0) && approx(hard.weight.reduce((a, b) => a + b, 0), 1, 1e-6) && hard.joint.filter((j) => j >= 0 && j < pins.length).length === 4,
+    "每顶点只取权重最大的 4 根骨（引擎蒙皮上限）且归一",
+  );
+  const deg = wp.influenceAt(NaN, 0, pins, 4, 1e-3);
+  check(
+    deg.weight.every((w) => Number.isFinite(w) && w > 0) && approx(deg.weight.reduce((a, b) => a + b, 0), 1, 1e-6),
+    "退化输入（NaN 坐标）回落到等权，绝不产出 NaN / 塌陷到原点",
+  );
+
+  // ── 蒙皮 ──
+  const skin = wp.buildSkin(mesh, lay, size);
+  const sums = [];
+  for (let v = 0; v < vcount; v++) sums.push([...skin.weights.slice(v * 4, v * 4 + 4)].reduce((a, b) => a + b, 0));
+  check(sums.every((s) => approx(s, 1, 1e-5)), "每顶点 4 个权重归一（LBS 位移 = Σ w·Δ 的前提）");
+  check(
+    [...skin.joints].every((b) => b >= 1 && b <= lay.pins.length),
+    "骨号 = 钉子下标 + 1，且都指向真实存在的钉骨（骨 0 是根、不参与形变）",
+  );
+  const corner = (i, j) => ({ bone: skin.joints[at(i, j) * 4], w: skin.weights[at(i, j) * 4] });
+  check(
+    corner(0, 0).bone === 7 && corner(0, lay.rows).bone === 1 && corner(lay.cols, 0).bone === 9 && corner(lay.cols, lay.rows).bone === 3,
+    "四个角顶点各自归到对应的角钉子（bone = 钉子 + 1）",
+  );
+  check(
+    [corner(0, 0), corner(0, lay.rows), corner(lay.cols, 0), corner(lay.cols, lay.rows)].every((c) => c.w > 0.999),
+    "角钉子对所在角顶点权重为 1（拖角不会被别的钉子扯住）",
+  );
+
+  // ── 位移 ──
+  check(maxDiff(wp.displace(mesh, skin, new Map()), mesh.positions) === 0, "零位移：顶点逐位不变（刚转成木偶时画面不动）");
+  const d1 = new Map([[0, [10, -6]]]);
+  const d2 = new Map([[4, [-3, 2]]]);
+  const dBoth = new Map([
+    [0, [10, -6]],
+    [4, [-3, 2]],
+  ]);
+  const v0 = at(0, lay.rows);
+  const vMid = at(lay.cols / 2, lay.rows / 2);
+  const moved1 = wp.displace(mesh, skin, d1);
+  const movedBoth = wp.displace(mesh, skin, dBoth);
+  check(
+    approx(moved1[v0 * 3] - mesh.positions[v0 * 3], 10) && approx(moved1[v0 * 3 + 1] - mesh.positions[v0 * 3 + 1], -6),
+    "拖角钉子：角顶点位移 = 该钉子位移（钉骨纯平移 ⇒ 权重 1 处逐位跟随）",
+  );
+  check(
+    approx(movedBoth[vMid * 3] - mesh.positions[vMid * 3], -3, 1e-3) && approx(movedBoth[vMid * 3 + 1] - mesh.positions[vMid * 3 + 1], 2, 1e-3),
+    "中心钉子只把中心顶点带走（2D 网格是插值不是硬切块）",
+  );
+  const m1 = wp.displace(mesh, skin, d1);
+  const m2 = wp.displace(mesh, skin, d2);
+  let sup = 0;
+  for (let v = 0; v < vcount; v++) {
+    sup = Math.max(
+      sup,
+      Math.abs(movedBoth[v * 3] - (m1[v * 3] + m2[v * 3] - mesh.positions[v * 3])),
+      Math.abs(movedBoth[v * 3 + 1] - (m1[v * 3 + 1] + m2[v * 3 + 1] - mesh.positions[v * 3 + 1])),
+    );
+  }
+  check(sup < 1e-4, `多钉子叠加 = 各自位移之和（最大偏差 ${sup.toExponential(1)}，记录关键帧时逐钉子叠增量正是靠这条）`);
+
+  // ── 骨架 / 片段 ──
+  const materialPath = "materials/editor/wt.json";
+  const rig = wp.buildRig(lay, size, materialPath);
+  const spec = rig.spec;
+  const ident = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const transOnly = (m, x, y) => ident.every((v, i) => Math.abs(m[i] - (i === 12 ? x : i === 13 ? y : v)) < 1e-6);
+  check(
+    spec.bones.length === 10 && spec.bones[0].parent === -1 && spec.bones.slice(1).every((b) => b.parent === 0),
+    "骨架：骨 0 是根（parent −1），9 根钉骨都挂在根上（钉子之间互不牵连）",
+  );
+  check(spec.bones[1].name === "pin1" && spec.bones[9].name === "pin9", "钉骨命名 pin1…pinN（骨骼面板 / 钉子列表里好认）");
+  check(transOnly(spec.bones[1].matrix, -100, 50) && transOnly(spec.bones[5].matrix, 0, 0) && transOnly(spec.bones[9].matrix, 100, -50), "钉骨局部矩阵 = 钉子位置的纯平移（绑定姿势下骨就落在钉子上）");
+  const clip = spec.animations[0];
+  // 轨道 9 分量 = 平移(3) + 欧拉角(3) + 缩放(3)（mdl-skin.js sampleTrackTRS 的口径）。
+  // 常量帧必须是**绑定姿势**：全零会被引擎当成 scale=0 的姿势，整只木偶塌到骨原点。
+  const bindFrames = (i) => {
+    const m = spec.bones[i].matrix;
+    const want = [m[12], m[13], m[14], 0, 0, 0, 1, 1, 1];
+    const t = spec.animations[0].tracks[i];
+    for (let k = 0; k < t.length; k++) if (Math.abs(t[k] - want[k % 9]) > 1e-6) return false;
+    return true;
+  };
+  check(
+    clip.id === wp.WARP_CLIP_ID && clip.name === wp.WARP_CLIP_NAME && clip.fps === wp.WARP_FPS && clip.frameCount === wp.WARP_FRAMES &&
+      clip.tracks.length === 10 &&
+      clip.tracks.every((t) => t.length === 9 * (wp.WARP_FRAMES + 1)) &&
+      clip.tracks.every((_, i) => bindFrames(i)) &&
+      clip.tracks[1][6] === 1 && clip.tracks[1][7] === 1 && clip.tracks[1][8] === 1,
+    `warp 片段：每骨一条 9×${wp.WARP_FRAMES + 1} 轨道，常量帧 = 绑定姿势（平移 + 欧拉 0 + 缩放 1；不是全零，全零会把骨塌到原点）`,
+  );
+  check(
+    spec.meshes[0].material === materialPath &&
+      spec.meshes[0].boneIdx === rig.skin.joints &&
+      spec.meshes[0].weights === rig.skin.weights &&
+      maxDiff(rig.skin.joints, skin.joints) === 0 &&
+      maxDiff(rig.skin.weights, skin.weights) === 0,
+    "网格挂上材质路径与蒙皮数据（rig 自带的蒙皮与单独算的一致）",
+  );
+
+  // ── 三件套 + 真 WE 解析器回读 ──
+  const files = wp.warpFiles(rig, "wt", srcMat);
+  check(
+    json(files.map((f) => f.name)) === json(["models/editor/wt.mdl", "materials/editor/wt.json", "models/editor/wt.json"]),
+    "产物三件套：.mdl / 材质 json / 模型 json（沿用 models|materials/editor/<slug> 既有口径）",
+  );
+  const mdl = mp.parseMDL(files[0].data);
+  check(
+    mdl.bones.length === 10 && mdl.bones[0].parent === -1 && mdl.bones[0].name === "root" && mdl.bones[1].name === "pin1" && mdl.bones[9].name === "pin9" && mdl.materialPath === materialPath,
+    `真 WE 解析器认这份 .mdl：${mdl.bones.length} 根骨 + 材质路径接上（不是自造格式）`,
+  );
+  check(
+    mdl.animations.length === 1 && mdl.animations[0].id === 1 && mdl.animations[0].name === "warp" && mdl.animations[0].tracks.length === 10 && mdl.animations[0].tracks[0].frameCount === wp.WARP_FRAMES + 1,
+    "片段回读：id / 名字 / 每骨一轨 / 31 帧（30 帧 + 末帧）",
+  );
+  check(
+    mdl.vertexCount === vcount && maxDiff(mdl.positions, rig.mesh.positions) < 1e-4 && maxDiff(mdl.uvs, rig.mesh.uvs) < 1e-6,
+    `顶点与 UV 逐位往返（${mdl.vertexCount} 个，位置最大偏差 ${maxDiff(mdl.positions, rig.mesh.positions).toExponential(1)}）`,
+  );
+  const backSum = (() => {
+    let worst = 0;
+    for (let v = 0; v < vcount; v++) worst = Math.max(worst, Math.abs([...mdl.weights.slice(v * 4, v * 4 + 4)].reduce((a, b) => a + b, 0) - 1));
+    return worst;
+  })();
+  check(
+    [...mdl.boneIdx].every((b) => b >= 1 && b <= 9) && backSum < 2 / 255,
+    `蒙皮回读：骨号仍在 1..9、权重仍归一（最差 ${backSum.toExponential(1)}，量化误差内）`,
+  );
+  const modelJson = JSON.parse(dec.decode(files[2].data));
+  check(
+    json(Object.keys(modelJson).sort()) === json(["autosize", "height", "material", "puppet", "puppetWarp", "warp", "width"]) &&
+      modelJson.width === 200 &&
+      modelJson.height === 100 &&
+      modelJson.autosize === true &&
+      modelJson.puppet === "models/editor/wt.mdl" &&
+      modelJson.material === materialPath,
+    "模型 json：图片尺寸 + autosize + puppet / material 指向（引擎据此定图层大小，与原图一致）",
+  );
+  check(
+    json(modelJson.warp) === json(wp.metaOf(lay)) && json(modelJson.puppetWarp.warp) === json(wp.metaOf(lay)),
+    "布局既写进 v2 的 puppetWarp.warp，也留一份 v1 顶层 warp 镜像（老工程读得到）",
+  );
+  check(
+    json(wp.metaOf(wp.layoutOf(modelJson))) === json(wp.metaOf(lay)) &&
+      json(wp.metaOf(wp.layoutOf({ [wp.WARP_KEY]: wp.metaOf(lay) }))) === json(wp.metaOf(lay)) &&
+      wp.layoutOf({ material: "x" }) === null,
+    "layoutOf 优先读 puppetWarp.warp，缺了回落到顶层 warp；都没有返回 null",
+  );
+  const mat = JSON.parse(dec.decode(files[1].data));
+  check(
+    mat.passes[0].shader === "genericimage4" && json(mat.passes[0].textures) === json(["editor/srcimg"]) && mat.passes[0].depthtest === "disabled" && mat.passes[0].cullmode === "nocull",
+    "材质：贴图路径与合成方式沿用源图（贴图文件不必复制，share 把归属带过去），shader 换 puppet 口径 genericimage4",
+  );
+  // 显式 defaultlight:false = 不吃宿主给 models|materials/editor/ 回落的那盏默认主光：
+  // 平贴 2D 木偶必须逐像素等于源图（真机会亮 0.68+0.52·0.769 ≈ 1.08 倍）。
+  check(
+    mat.passes[0].defaultlight === false && wp.warpMaterial(srcMat).passes[0].defaultlight === false,
+    "材质显式关掉默认主光（defaultlight:false）：平贴 2D 木偶与源图逐像素一致，与导入 3D 网格的 defaultlight:true 相反",
+  );
+  const matNull = wp.warpMaterial(null);
+  check(
+    matNull.passes[0].shader === "genericimage4" && matNull.passes[0].depthtest === "disabled" && matNull.passes[0].defaultlight === false && matNull.passes.length === 1,
+    "源材质缺失时退回「图片层口径」的材质（2D 图别切出深度，也不吃默认主光）",
+  );
+  check(wp.warpMaterial(srcMat) !== srcMat && srcMat.passes[0].shader === "genericimage2", "warpMaterial 不动源材质（纯函数，撤销重做靠这个）");
+
+  // ── 布局校验 / 往返 ──
+  const meta = wp.metaOf(lay);
+  check(json(wp.metaOf(wp.parseMeta(meta))) === json(meta), "布局序列化往返一致（小数点后 5 位）");
+  const base = { pins: [[0.5, 0.5]], cols: 4, rows: 4, power: 4 };
+  const okMeta = (o) => wp.parseMeta(o) !== null;
+  check(
+    okMeta(base) &&
+      okMeta({ ...base, pins: new Array(24).fill([0.5, 0.5]) }) &&
+      okMeta({ ...base, pins: [[3, -3]] }) &&
+      okMeta({ ...base, cols: 2, rows: 48, power: 1 }) &&
+      okMeta({ ...base, power: 8 }),
+    "合法边界都收：1 / 24 根钉子、cols 2..48、power 1..8、钉子可以在图外（烘焙后钉子会跑出去）",
+  );
+  const badMetas = [
+    null,
+    undefined,
+    7,
+    "warp",
+    [],
+    {},
+    { pins: [] },
+    { ...base, pins: [[0.5, 0.5], "x"] },
+    { ...base, pins: [[NaN, 0.5]] },
+    { ...base, pins: [[0.5, 0.5], [9, 0]] },
+    { ...base, pins: new Array(25).fill([0.5, 0.5]) },
+    { ...base, cols: 1 },
+    { ...base, cols: 2.5 },
+    { ...base, rows: 49 },
+    { ...base, power: 0 },
+    { ...base, power: 9 },
+  ];
+  const passedBad = badMetas.filter(okMeta);
+  check(passedBad.length === 0, `坏数据一律拒绝（返回 null、不抛）：非对象 / 空钉子表 / 非数 / 超范围 / 密度衰减越界（放过 ${json(passedBad)}）`);
+
+  // ── 布局编辑（纯函数，撤销栈里的快照靠这个） ──
+  const movedPin = wp.movePin(lay, 4, [0.2, 0.8]);
+  check(json(movedPin.pins[4]) === json([0.2, 0.8]) && json(lay.pins[4]) === json([0.5, 0.5]) && movedPin.cols === lay.cols, "movePin 返回新布局，旧布局逐字段不动");
+  const added = wp.addPin(lay, [0.3, 0.3]);
+  check(added && added.pins.length === 10 && json(added.pins[9]) === json([0.3, 0.3]) && lay.pins.length === 9, "addPin 追加钉子（旧布局不动）");
+  const full = new Array(24).fill([0.5, 0.5]).reduce((acc, p) => wp.addPin(acc, p), { ...lay, pins: [] });
+  check(full && full.pins.length === wp.MAX_PINS && wp.addPin(full, [0.1, 0.1]) === null, `钉子数封顶 ${wp.MAX_PINS}（到顶返回 null，UI 据此禁用）`);
+  check(wp.removePin(added, 0).pins.length === 9 && wp.removePin({ ...lay, pins: [[0.5, 0.5]] }, 0) === null && wp.removePin(lay, 99) === null, "removePin 删钉子；只剩一根 / 下标越界时拒绝");
+  check(wp.withGrid(lay, 99, 1).cols === wp.MESH_MAX && wp.withGrid(lay, 99, 1).rows === wp.MESH_MIN && wp.withPower(lay, 99).power === wp.POWER_MAX && wp.withPower(lay, -1).power === wp.POWER_MIN, "网格密度 / 衰减都按上下限钳制");
+
+  // ── 逐帧姿势 poses：重建 .mdl 时把已记录的关键帧原样搬进新文件（加钉 / 删钉 / 改衰减 / 改密度 / 烘焙都不丢） ──
+  const poses = Array.from({ length: wp.WARP_FRAMES + 1 }, () => null);
+  poses[0] = new Map([[0, [10, -6]]]);
+  poses[2] = new Map([
+    [4, [-3, 2]],
+    [8, [1, 1]],
+  ]);
+  const posed = wp.buildRig(lay, size, materialPath, undefined, poses);
+  const pt = posed.spec.animations[0].tracks;
+  check(
+    approx(pt[1][0], -100 + 10) && approx(pt[1][1], 50 - 6) && approx(pt[1][9], -100) && approx(pt[1][10], 50),
+    "poses：记录过的那帧 = 绑定姿势 + 位移，没记录的帧仍是绑定姿势（第 0 帧叠上、第 1 帧照旧）",
+  );
+  check(
+    approx(pt[5][18], 0 - 3) && approx(pt[5][19], 0 + 2) && approx(pt[9][18], 100 + 1) && approx(pt[9][19], -50 + 1),
+    "poses：多钉子多帧各自独立（骨 i+1 = 钉 i，位移叠在各自绑定姿势上）",
+  );
+  check(pt[1][3] === 0 && pt[1][6] === 1 && pt[1][8] === 1 && pt[1][2] === 0, "poses 只动平移分量，欧拉 / 缩放照旧");
+  const posedBaked = wp.bakeRig(posed, new Map([[0, [5, 5]]]), poses);
+  check(
+    posedBaked !== null &&
+      approx(posedBaked.spec.animations[0].tracks[1][0], -100 + 10) &&
+      maxDiff(posedBaked.mesh.positions, wp.displace(posed.mesh, posed.skin, new Map([[0, [5, 5]]]))) === 0,
+    "bakeRig 带上 poses：顶点吃掉预览位移、同时把已记录的关键帧原样带走",
+  );
+
+  // ── 姿势搬运（remapPoses）：姿势跟着钉子的**位置**走，不跟着序号走 ──
+  {
+    const p9 = Array.from({ length: wp.WARP_FRAMES + 1 }, () => null);
+    p9[0] = new Map([
+      [2, [30, 0]],
+      [4, [0, -40]],
+    ]);
+    const grow = wp.addPin(lay, [0.3, 0.3]);
+    const keepAdd = wp.remapPoses(p9, lay, grow);
+    check(
+      keepAdd[0]?.get(2)?.[0] === 30 && keepAdd[0]?.get(4)?.[1] === -40 && keepAdd[0]?.get(9) === undefined && keepAdd[1] === null &&
+        wp.remapPoses(p9, lay, wp.withPower(lay, 6)) === p9,
+      "remapPoses 加钉：老钉子的姿势按位置配对（序号不变）、新加的钉没有姿势，没记录的帧照旧为空；布局没动（只改衰减 / 密度）时原样返回",
+    );
+    const cut = wp.removePin(lay, 1);
+    const keepDel = wp.remapPoses(p9, lay, cut);
+    check(
+      keepDel[0]?.size === 2 && keepDel[0]?.get(1)?.[0] === 30 && keepDel[0]?.get(3)?.[1] === -40 && !keepDel[0]?.has(2),
+      "remapPoses 删钉：后面的钉子序号左移，姿势跟着自己的位置走（不会把别人的位移套上去、被删钉的姿势丢掉）",
+    );
+  }
+
+  // ── 命中 ──
+  const pts = [
+    [10, 10],
+    null,
+    [80, 10],
+    [10, 80],
+  ];
+  check(wp.nearestPin(pts, 12, 13, 6) === 0 && wp.nearestPin(pts, 75, 12, 6) === 2 && wp.nearestPin(pts, 200, 200, 6) === -1, "命中：容差内取最近钉子，超出返回 −1");
+  check(wp.nearestPin(pts, 10, 78, 6) === 3 && wp.nearestPin(pts, 80, 12, 1) === -1, "钉子在自己位置上命中；容差收紧时不误吸");
+  check(wp.nearestPin([[50, 50], null], 4, 4, 120) === 0 && wp.nearestPin([null, null], 0, 0, 99) === -1, "相机背后的钉子（screen = null）不参与命中");
+
+  // ── 烘焙：形变进绑定姿势，增量归零 ──
+  check(wp.bakeRig(rig, new Map()) === null, "没有位移时烘焙返回 null（不该白造一份副本）");
+  const baked = wp.bakeRig(rig, dBoth);
+  const want = wp.displace(mesh, skin, dBoth);
+  check(maxDiff(baked.mesh.positions, want) === 0, "烘焙：顶点逐位 = 形变后的位置（绑定姿势吃掉形变）");
+  check(
+    json(wp.metaOf(baked.layout)) === json(wp.metaOf(rig.layout)) && json(rig.layout.pins[4]) === json([0.5, 0.5]),
+    "烘焙：骨架（钉子位置）不动 —— 形变只记在顶点里，钉子留在网格原位（重建网格时才按偏移场重放）",
+  );
+  const bakedFiles = wp.warpFiles(baked, "wt2", srcMat);
+  const bakedMdl = mp.parseMDL(bakedFiles[0].data);
+  check(
+    maxDiff(bakedMdl.positions, want) < 1e-4 &&
+      bakedMdl.animations[0].tracks.every((t) => [6, 7, 8].every((i) => t.keyframes[i] === 1)) &&
+      bakedMdl.animations[0].tracks.every((t, i) => {
+        const p = i ? wp.pinLocal(baked.layout.pins[i - 1], size) : [0, 0];
+        return Math.abs(t.keyframes[0] - p[0]) < 1e-3 && Math.abs(t.keyframes[1] - p[1]) < 1e-3;
+      }),
+    "烘焙后的 .mdl：顶点 = 形变位置、常量帧 = 骨架绑定姿势（缩放 1、平移 = 钉子位置）⇒ 零增量渲染出来就是刚才看到的样子（画面不变）",
+  );
+  check(
+    json(JSON.parse(dec.decode(bakedFiles[2].data)).warp) === json(wp.metaOf(baked.layout)) &&
+      approx(wp.pinLocal(wp.layoutOf(JSON.parse(dec.decode(bakedFiles[2].data))).pins[0], size)[0], -100, 1e-4),
+    "烘焙后的模型 json 里布局照旧写回（重开工程接着调）",
+  );
+  // ── 重建网格：烘焙进顶点的形变要跟着搬到新密度上（否则改一次密度就抹平）──
+  const plain = wp.resamplePositions(mesh, 8, 4, size);
+  check(
+    plain.every((v, k) => v === wp.buildMesh(wp.withGrid(lay, 8, 4), size).positions[k]),
+    "重采样：没形变时逐位等于新规则网格（无条件重采样也安全）",
+  );
+  const fine = wp.resamplePositions(baked.mesh, 64, 32, size);
+  let fineErr = 0;
+  for (let j = 0; j <= 16; j++) {
+    for (let i = 0; i <= 32; i++) {
+      const k = j * 2 * 65 + i * 2; // 加密网格里的对应节点
+      const k2 = j * 33 + i; // 原网格节点
+      fineErr = Math.max(fineErr, Math.hypot(fine[k * 3] - baked.mesh.positions[k2 * 3], fine[k * 3 + 1] - baked.mesh.positions[k2 * 3 + 1]));
+    }
+  }
+  const tl = 32 * 65; // 加密网格的左上角（顶点 0 是左下角，两个位移钉都没挨着它）
+  const tlCanonX = (0 / 64 - 0.5) * size.width; // 加密网格自己的规则位置
+  check(
+    fineErr < 1e-4 && Math.abs(fine[tl * 3] - tlCanonX) > 1,
+    `重采样：2 倍加密时与原网格节点逐点重合（最大偏差 ${fineErr.toExponential(1)}），形变确实搬过去了（不在规则网格上）`,
+  );
+
+  // ── 接线（main.ts 真用这套实现，不许内联副本；文案中英成对）──
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(
+    /from "\.\/warp"/.test(mainSrc) && /buildRig\(/.test(mainSrc) && /warpFiles\(/.test(mainSrc) && /nearestPin\(/.test(mainSrc) && /defaultLayout\(/.test(mainSrc),
+    "main.ts 从 ./warp 取几何 / 权重 / 编码实现",
+  );
+  check(
+    !/function (buildRig|buildMesh|buildSkin|warpFiles|nearestPin|defaultLayout|resamplePositions|specOf)\(/.test(mainSrc) &&
+      !/bones\.map\(\(p, i\) => \(\{ name: `pin/.test(mainSrc),
+    "main.ts 里没有内联副本（骨架 / 权重 / 编码只有 warp.ts 一份）",
+  );
+  check(
+    /id: "warp",\s*\n\s*order: 1150,[\s\S]{0,320}render: warpGroup,\s*\n\s*tab: "model",/.test(mainSrc) &&
+      /const BUILTIN_INSPECTOR: InspectorGroup\[\] = \[[\s\S]*?id: "warp"[\s\S]*?\];/.test(mainSrc),
+    "操控变形登记成普通 inspectorGroups 分组（order 1150 / tab model）：普通图片层也拿得到",
+  );
+  check(
+    /node\.kind === "image" && !node\.modelForm/.test(mainSrc) && /action\("ed-warp-make", "wp\.promote", \(\) => void warpPromote\(node\)/.test(mainSrc) && /addAnimLayer\(dd, n\.obj, WARP_CLIP_ID, WARP_CLIP_NAME\)/.test(mainSrc),
+    "转木偶只认普通图片层，并在同一步挂上 warp 动画层（片段 id 1）",
+  );
+  check(
+    /assets\.share\(srcModel, modelPath\)/.test(mainSrc) && /assets\.share\(session\.modelPath, modelPath\)/.test(mainSrc),
+    "promote / 重建都经 assets.share 复用源贴图（新模型不再是孤儿，保存清单能带上贴图）",
+  );
+  check(
+    /setBonePose\(Number\(session\.layer\), boneOfPin\(pin\)/.test(mainSrc) && /applyBoneDelta\(out, WARP_CLIP_ID, boneOfPin\(pin\), frame/.test(mainSrc),
+    "拖钉子走 setBonePose 实时预览；「记录关键帧」才走 applyBoneDelta 写 .mdl 轨道",
+  );
+  check(
+    /warpWrite\(session, layout, warpMeshFor\(session, layout\)/.test(mainSrc) && /resamplePositions\(session\.mesh, layout\.cols, layout\.rows/.test(mainSrc),
+    "加 / 删钉子、改衰减与密度都重建骨架，且密度变化按偏移场重采样（烘焙过的形变不丢）",
+  );
+  check(
+    /function warpDeltaOf\(/.test(mainSrc) && /layerAxes\(corners\)/.test(mainSrc) && /getLayerOutline\(Number\(session\.layer\)\)/.test(mainSrc),
+    "屏幕位移 → 模型位移走图层轮廓的两条屏幕轴（旋转 / 缩放 / 视口缩放都算在内）",
+  );
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const wpKeys = [...new Set([...i18nSrc.matchAll(/"(wp\.[A-Za-z0-9_.]+)":/g)].map((m) => m[1]))];
+  const once = (k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length;
+  check(
+    wpKeys.length >= 20 && wpKeys.every((k) => once(k) === 2),
+    `操控变形文案中英成对（${wpKeys.length} 个键：${json(wpKeys.filter((k) => once(k) !== 2))} 不成对）`,
+  );
+  const warpLogs = ["log.warpPromoted", "log.warpStarted", "log.warpRecorded", "log.warpRebuilt", "log.warpBaked", "insp.warp"];
+  check(
+    warpLogs.every((k) => once(k) === 2 && mainSrc.includes(`"${k}"`)),
+    "操控变形的日志 / 面板文案中英成对，且 main.ts 真的引用（没有写死的字面量）",
+  );
+  check(
+    /\.ed-warp\b/.test(fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8")),
+    "操控变形面板有样式（.ed-warp）",
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// P1. 几何与素材：editor/geometry.ts（网格 / 细分 / 切片 / Padding / Lock geometry /
+//     Edit Topology）+ editor/limbs.ts（Character Sheet 抠图 / limb 分割 / 部件表）
+// ───────────────────────────────────────────────────────────────────────────
+section("GEOM. 几何与素材 editor/geometry.ts + editor/limbs.ts（P1）");
+{
+  const G = await loadEditorModule("geometry");
+  const L = await loadEditorModule("limbs");
+  const me = await loadRendererTs("renderer/src/editor/mdl-edit.ts");
+  const W = await imp("renderer/vendor/we-scene/pkg/mdl-write.js");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const SIZE = { width: 64, height: 48 };
+  const near = (a, b, eps = 1e-3) => Math.abs(a - b) <= eps;
+  const sorted = (a) => Array.from(a).sort((x, y) => x - y);
+
+  // ── 网格生成：默认 2×2、UV / 法线 / 对角线 ──
+  const g0 = G.defaultGeometry(SIZE, 2, 2);
+  const m0 = G.buildGeometry(g0, SIZE);
+  check(G.vertexCountOf(g0) === 9 && m0.indices.length === 24 && m0.positions.length === 27, "默认 2×2 网格：9 顶点 / 24 索引");
+  const bbox = (pos) => {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < pos.length; i += 3) {
+      x0 = Math.min(x0, pos[i]);
+      y0 = Math.min(y0, pos[i + 1]);
+      x1 = Math.max(x1, pos[i]);
+      y1 = Math.max(y1, pos[i + 1]);
+    }
+    return [x0, y0, x1, y1];
+  };
+  check(json(bbox(m0.positions)) === json([-32, -24, 32, 24]), "无 padding 时网格恰好铺满图片（左下 = (−W/2, −H/2)、右上 = (+W/2, +H/2)）");
+  check(
+    json(Array.from(m0.indices.slice(0, 6))) === json([0, 1, 4, 0, 4, 3]) &&
+      Array.from({ length: 9 }, (_, i) => m0.normals[i * 3 + 2]).every((z) => z === 1),
+    "默认对角线 a-d（(a,b,d)+(a,d,c)，与 warp.ts 的 meshGeometry 同绕序）、法线 +z",
+  );
+  let uvMin = 1;
+  let uvMax = 0;
+  for (let i = 0; i < 18; i++) {
+    uvMin = Math.min(uvMin, m0.uvs[i]);
+    uvMax = Math.max(uvMax, m0.uvs[i]);
+  }
+  check(uvMin === 0 && uvMax === 1, "无 padding 时 UV 正好落在 [0,1]（u 从左、v 从上，与图片同口径）");
+
+  // ── Padding：只把网格轮廓往外扩（模型尺寸与贴图都不动），绝不写 cropoffset ──
+  const gp = G.withPadding(g0, 8);
+  const mp = G.buildGeometry(gp, SIZE);
+  check(mp.positions[0] === -40 && mp.positions[1] === -32 && mp.positions[6] === 40, "Padding 8：四边各外扩 8px，图片尺寸不变");
+  check(near(mp.uvs[0], -8 / 64) && near(mp.uvs[1], 1 + 8 / 48), "Padding 的 UV 被拉到 [0,1] 之外（贴图靠 clamp 重复边缘）");
+  const srcJson = { autosize: true, width: 64, height: 48, cropoffset: "683.5 354.0", puppetWarp: { warp: { v: 1, cols: 2 } } };
+  const withG = G.withGeometry(srcJson, gp);
+  check(
+    withG.cropoffset === "683.5 354.0" && withG.puppetWarp.warp.cols === 2 && json(G.geometryMeta(G.geometryOf(withG))) === json(G.geometryMeta(gp)),
+    "几何写回工程 json：cropoffset 与既有 puppetWarp.warp 原样保留（cropoffset 方向未定，padding 不碰它）",
+  );
+  check(
+    G.geometryOf(G.withGeometry(withG, null)) === null && !!G.withGeometry(withG, null).puppetWarp.warp,
+    "清掉 geometry 不动其余创作态（容器与子键按需保留 / 删除）",
+  );
+
+  // ── 细分 / 切片 ──
+  const gs = G.withSubdivision(G.defaultGeometry(SIZE, 2, 2), 3);
+  const gsg = G.gridOf(gs);
+  check(
+    gsg.cols === 6 && gsg.rows === 6 && G.vertexCountOf(gs) === 49 && G.buildGeometry(gs, SIZE).indices.length === 216,
+    "Subdivision 3：每格再切 3×3（6×6 格 / 49 顶点 / 216 索引）",
+  );
+  const gl = G.addSlice(G.defaultGeometry(SIZE, 2, 2), "x", 0.25);
+  check(
+    G.gridOf(gl).cols === 3 && json(G.withSlices(gl, "x", [0.75, 0.25, 0.25, 0, 1]).sliceX) === json([0.25, 0.75]),
+    "切片：切开所在一列，排序去重并剔除 0 / 1 / 重复值",
+  );
+
+  // ── Edit Topology：翻转 + 顶点偏移 + 复位 ──
+  const mf = G.buildGeometry(G.flipCell(g0, 0), SIZE);
+  check(
+    json(Array.from(mf.indices.slice(0, 6))) === json([0, 1, 3, 1, 4, 3]) &&
+      json(Array.from(mf.indices.slice(6))) === json(Array.from(m0.indices.slice(6))),
+    "Edit Topology 翻转：只改被点格的对角线（(a,b,c)+(b,d,c)），其余格不动",
+  );
+  const gv = G.setOffset(g0, 0, 0.1, -0.2);
+  const mv = G.buildGeometry(gv, SIZE);
+  check(
+    near(mv.positions[0], -32 + 6.4) && near(mv.positions[1], -24 - 9.6) && G.hasTopology(gv) && !G.hasTopology(G.clearTopology(gv)),
+    "Edit Topology 顶点偏移按归一化量叠加；clearTopology 回到规则网格",
+  );
+  let rich = G.withPadding(G.withSubdivision(G.addSlice(G.addSlice(G.defaultGeometry(SIZE, 4, 4), "x", 0.3), "y", 0.7), 2), 5);
+  rich = G.withPartOrder(G.withLocked(G.setOffset(G.flipCell(rich, 7), 3, 0.05, -0.05), true), [2, 0, 1]);
+  check(
+    json(G.geometryMeta(G.parseGeometry(G.geometryMeta(rich)))) === json(G.geometryMeta(rich)),
+    "几何 json 往返稳定（细分 / 切片 / padding / Lock geometry / 翻转 / 偏移 / 部件序全字段）",
+  );
+
+  // ── 部件表：区间首尾相接、恰好铺满索引表 ──
+  const g3 = G.withPartOrder(G.defaultGeometry(SIZE, 3, 6), [2, 0, 1]);
+  const m3 = G.buildGeometry(g3, SIZE);
+  const parts3 = G.partsOf(g3, m3);
+  let cursor = 0;
+  let tiled = !!parts3 && parts3.length === 3;
+  for (const p of parts3 ?? []) {
+    if (p.start !== cursor) tiled = false;
+    cursor += p.size;
+  }
+  check(
+    tiled && cursor === m3.indices.length && json(parts3.map((p) => p.offset)) === json([2, 0, 1]),
+    "部件表：按行切 limb，区间首尾相接且恰好铺满索引表，绘制序写进 offset",
+  );
+  check(G.partsOf(g0, m0) === null, "没加 limb 时不写部件表（extra 保持 6 字节）");
+
+  // ── Character Sheet：合成角色表 → 抠图 / limb 分割 ──
+  const SW = 64;
+  const SH = 48;
+  const BGC = [51, 102, 153];
+  const A = { x0: 4, y0: 4, x1: 20, y1: 44, c: [200, 30, 30] };
+  const B = { x0: 40, y0: 10, x1: 60, y1: 38, c: [30, 200, 60] };
+  const areaA = (A.x1 - A.x0) * (A.y1 - A.y0);
+  const areaB = (B.x1 - B.x0) * (B.y1 - B.y0);
+  const sheet = (() => {
+    const data = new Uint8ClampedArray(SW * SH * 4);
+    for (let y = 0; y < SH; y++) {
+      for (let x = 0; x < SW; x++) {
+        const p = (y * SW + x) * 4;
+        const inA = x >= A.x0 && x < A.x1 && y >= A.y0 && y < A.y1;
+        const inB = x >= B.x0 && x < B.x1 && y >= B.y0 && y < B.y1;
+        const c = inA ? A.c : inB ? B.c : BGC;
+        data[p] = c[0];
+        data[p + 1] = c[1];
+        data[p + 2] = c[2];
+        data[p + 3] = 255;
+      }
+    }
+    return { width: SW, height: SH, data };
+  })();
+  const rect = (x0, y0, x1, y1) => {
+    const m = new Uint8Array(SW * SH);
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) m[y * SW + x] = 1;
+    return m;
+  };
+  const spec = { ...L.defaultSheetSpec(sheet), feather: 0, smoothing: 0 };
+  check(json(L.dominantBorderColor(sheet)) === json(BGC), "角色表背景色：从边框主色自动识别");
+  const bgMask = L.backgroundMaskOf(sheet, spec);
+  check(L.maskCount(bgMask) === SW * SH - areaA - areaB, "背景掩码：只圈住背景色像素（两块前景整块留下）");
+  const limbs = L.autoLimbs(sheet, spec, ["arm", "leg"]);
+  check(limbs.length === 2 && json(limbs.map((l) => l.name)) === json(["arm", "leg"]), "Auto Recalculate：连通域切成 2 个 limb，命名按传入表");
+  check(json(sorted(limbs.map((l) => L.maskCount(l.mask)))) === json(sorted([areaA, areaB])), "limb 掩码面积 = 色块面积（Quality 阈值不误杀）");
+  check(
+    json(limbs.map((l) => [l.x0, l.y0, l.x1, l.y1]).sort((a, b) => a[0] - b[0])) === json([[A.x0, A.y0, A.x1, A.y1], [B.x0, B.y0, B.x1, B.y1]]),
+    "limb 包围盒 = 色块包围盒",
+  );
+  let bleed = 0;
+  for (const l of limbs) for (let i = 0; i < bgMask.length; i++) if (bgMask[i] && l.mask[i]) bleed++;
+  check(L.limbsDisjoint(limbs, SW, SH) && bleed === 0, "前景 / 背景互斥：limb 之间、limb 与背景都不重叠");
+
+  // ── View → Foreground / Background（像素可判） ──
+  const px = (buf, x, y) => json(Array.from(buf.slice((y * SW + x) * 4, (y * SW + x) * 4 + 4)));
+  const fgView = L.viewPixels(sheet, limbs, bgMask, "foreground");
+  check(
+    px(fgView, A.x0 + 2, A.y0 + 2) === json([255, 96, 96, 255]) && px(fgView, B.x0 + 2, B.y0 + 2) === json([96, 220, 96, 255]) && px(fgView, 0, 0) === json([0, 0, 0, 0]),
+    "View → Foreground：每个 limb 一色、背景透明（一个像素只有一个 limb）",
+  );
+  const bgView = L.viewPixels(sheet, limbs, bgMask, "background");
+  check(px(bgView, 0, 0) === json([255, 255, 255, 255]) && px(bgView, A.x0 + 2, A.y0 + 2) === json([0, 0, 0, 0]), "View → Background：背景白色不透明、limb 透明");
+
+  // ── 抠图：紧致裁剪 + alpha ──
+  const cut = L.extractLimb(sheet, limbs[0], spec);
+  check(
+    cut.width === limbs[0].x1 - limbs[0].x0 &&
+      cut.height === limbs[0].y1 - limbs[0].y0 &&
+      cut.data[3] === 255 &&
+      json(Array.from(cut.data.slice(0, 3))) === json(limbs[0].name === "arm" ? A.c : B.c),
+    "抠图：紧致裁剪 + 掩码 alpha=255 + 原色像素",
+  );
+
+  // ── 手工标注：Paint Brush Mode / Polygon Mode / Mark / Smoothing ──
+  const brush = L.brushStroke(new Uint8Array(SW * SH), SW, SH, [{ x: 10, y: 10 }], 2);
+  check(brush[10 * SW + 10] === 1 && brush[20 * SW + 20] === 0, "Paint Brush Mode：半径内命中、半径外不碰");
+  check(L.maskCount(L.brushStroke(brush, SW, SH, [{ x: 10, y: 10 }], 2, "remove")) === 0, "Mark Background / 擦除：remove 清掉画笔区域");
+  const poly = L.polygonMask(new Uint8Array(SW * SH), SW, SH, [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 0, y: 20 }]);
+  check(poly[1 * SW + 1] === 1 && poly[18 * SW + 18] === 0, "Polygon Mode：偶奇规则填充（内部命中、外部不碰）");
+  check(json(Array.from(L.markRect(new Uint8Array(SW * SH), SW, SH, 2, 2, 5, 5).slice(2 * SW + 2, 2 * SW + 6))) === json([1, 1, 1, 1]), "Mark Foreground 框选：矩形内整块置位");
+  const dot = new Uint8Array(SW * SH);
+  dot[5 * SW + 5] = 1;
+  check(L.maskCount(L.smoothMask(dot, SW, SH, 1)) === 0, "Smoothing：闭运算 + 开运算吃掉孤立噪点");
+
+  // ── Recalculate：manual 保护 / 非 manual 重算 ──
+  const kept = L.recalculate(sheet, { ...spec, manual: true }, limbs);
+  check(kept.every((l, i) => L.maskCount(l.mask) === L.maskCount(limbs[i].mask)), "spec.manual：Recalculate 不覆盖手工掩码");
+  const rec = L.recalculate(sheet, spec, limbs);
+  check(rec.length === 2 && L.limbsDisjoint(rec, SW, SH), "Recalculate：按 limb 平均色重新归类，仍是互斥两个 limb");
+  check(
+    json(L.parseLimbsMeta(JSON.parse(JSON.stringify(L.limbsMeta(spec, limbs))))) === json(L.limbsMeta(spec, limbs)),
+    "limb 参数（Quality / Smoothing / 背景色 / 羽化 / 手工标记 / 命名）json 往返稳定",
+  );
+
+  // ── 三角形归属 → 部件表：索引只是重排，不丢不重 ──
+  const gmesh = G.buildGeometry(G.defaultGeometry(SIZE, 6, 6), SIZE);
+  const labels = L.limbLabelMap(
+    [
+      { id: 0, name: "left", mask: rect(0, 0, 32, 48), x0: 0, y0: 0, x1: 32, y1: 48 },
+      { id: 1, name: "right", mask: rect(32, 0, 64, 48), x0: 32, y0: 0, x1: 64, y1: 48 },
+    ],
+    sheet,
+  );
+  const tri = L.triangleLimb(gmesh.indices, gmesh.uvs, labels, sheet);
+  const grouped = L.groupIndicesByLimb(gmesh.indices, tri, [{ id: 0, name: "left" }, { id: 1, name: "right" }], [1, 0]);
+  check(json(sorted(grouped.indices)) === json(sorted(gmesh.indices)), "三角形归属：按 limb 重排后索引仍是原索引的一个排列（不丢不重）");
+  let cursor2 = 0;
+  let tiled2 = grouped.parts.length === 2;
+  for (const p of grouped.parts) {
+    if (p.start !== cursor2) tiled2 = false;
+    cursor2 += p.size;
+  }
+  check(tiled2 && cursor2 === gmesh.indices.length && json(grouped.parts.map((p) => p.id)) === json([1, 0]), "部件表：绘制序 [1,0] → 两个部件区间首尾相接铺满索引表");
+
+  // ── 写回 .mdl：网格 + 部件 + 拓扑（与 P1 写侧 API 打通） ──
+  const mkSpec = (mesh, indices, parts) => ({
+    meshes: [
+      {
+        material: "materials/editor/geom.json",
+        positions: mesh.positions,
+        uvs: mesh.uvs,
+        boneIdx: new Uint32Array((mesh.positions.length / 3) * 4),
+        weights: Float32Array.from({ length: (mesh.positions.length / 3) * 4 }, (_, i) => (i % 4 === 0 ? 1 : 0)),
+        indices,
+        parts,
+      },
+    ],
+    bones: [{ name: "root", parent: -1, matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }],
+  });
+  const bytes = W.encodeMDL(mkSpec(gmesh, grouped.indices, grouped.parts));
+  const back = P.parseMDL(bytes).meshes[0];
+  check(
+    back.vertexCount === gmesh.positions.length / 3 && back.indexCount === grouped.indices.length && back.indexType === "u16",
+    "写回 .mdl：顶点 / 索引数与几何网格一致（≤65535 顶点走 u16）",
+  );
+  check(
+    json(back.parts.map((p) => [p.id, p.offset, p.start, p.size])) === json(grouped.parts.map((p) => [p.id, p.offset, p.start, p.size])),
+    "写回 .mdl：部件表逐项一致（id / offset / start / size）",
+  );
+  check(
+    back.positions.every((v, i) => v === gmesh.positions[i]) && back.uvs.every((v, i) => v === gmesh.uvs[i]) && Array.from(back.indices).join() === Array.from(grouped.indices).join(),
+    "写回 .mdl：顶点位置 / UV / 索引逐值一致",
+  );
+  const same = me.setMdlTopology(bytes, 0, grouped.indices, grouped.parts);
+  check(!!same && same.length === bytes.length && same.every((x, i) => x === bytes[i]), "setMdlTopology 同值重写：逐字节不变");
+  const reordered = me.setMdlParts(
+    bytes,
+    0,
+    grouped.parts.map((p, i) => ({ ...p, offset: i })),
+  );
+  check(
+    !!reordered && P.parseMDL(reordered).meshes[0].parts.map((p) => p.offset).join() === "0,1",
+    "setMdlParts：只改绘制序，parseMDL 读回新 offset",
+  );
+  // 大网格（>65535 顶点）→ 索引宽度 4，几何 / 部件仍然铺满
+  const gw = G.withPartOrder(G.withSubdivision(G.defaultGeometry(SIZE, 64, 16), 8), [1, 0]);
+  const gwide = G.buildGeometry(gw, SIZE);
+  const wides = G.partsOf(gw, gwide);
+  const vcount = gwide.positions.length / 3;
+  check(vcount > 65535 && wides.length === 2, `大网格：64×16 格再细分 8× → ${vcount} 顶点（跨过 u16 上限）`);
+  const wideBytes = W.encodeMDL(mkSpec(gwide, gwide.indices, wides));
+  const wideBack = P.parseMDL(wideBytes).meshes[0];
+  let cursor3 = 0;
+  let tiled3 = true;
+  for (const p of wideBack.parts) {
+    if (p.start !== cursor3) tiled3 = false;
+    cursor3 += p.size;
+  }
+  check(
+    wideBack.indexType === "u32" && wideBack.vertexCount === vcount && tiled3 && cursor3 === wideBack.indexCount,
+    "大网格：索引宽度自动变 4，部件表仍铺满索引表",
+  );
+
+  // ── warp.ts × geometry：网格 / 部件 / 创作态一起落盘 ──
+  const wp = await loadEditorModule("warp");
+  const gp2 = G.withPadding(G.withPartOrder(G.defaultGeometry(SIZE, 6, 6), [1, 0]), 4);
+  const gmesh2 = G.buildGeometry(gp2, SIZE);
+  const parts2 = G.partsOf(gp2, gmesh2);
+  const lay = { pins: [[0.5, 0.5], [0.25, 0.5]], cols: gmesh2.cols, rows: gmesh2.rows, power: 4 };
+  const rig2 = wp.buildRig(lay, SIZE, "materials/editor/geomw.json", undefined, undefined, { mesh: gmesh2, parts: parts2 });
+  check(
+    rig2.mesh.positions.length === gmesh2.positions.length &&
+      Array.from(rig2.spec.meshes[0].indices).join() === Array.from(gmesh2.indices).join() &&
+      json(rig2.spec.meshes[0].parts) === json(parts2),
+    "buildRig 吃 Geometry 网格：细分 / 拓扑 / Padding 后的顶点与索引原样进 .mdl，部件表一起带上",
+  );
+  const rigFiles = wp.warpFiles(rig2, "geomwt", null, { geometry: gp2, limbs: { v: 1, count: 2 } });
+  const rigMj = JSON.parse(dec.decode(rigFiles[2].data));
+  check(
+    json(G.geometryMeta(G.geometryOf(rigMj))) === json(G.geometryMeta(gp2)) &&
+      rigMj.puppetWarp.limbs.count === 2 &&
+      json(rigMj.puppetWarp.warp) === json(wp.metaOf(lay)) &&
+      json(rigMj.warp) === json(wp.metaOf(lay)),
+    "工程 json：几何 / limb 参数 / 布局都进 puppetWarp 容器（顶层 warp 仍是 v1 镜像）",
+  );
+  const rigBack = P.parseMDL(rigFiles[0].data).meshes[0];
+  check(
+    rigBack.vertexCount === gmesh2.positions.length / 3 &&
+      json(rigBack.parts.map((p) => p.id)) === json([0, 1]) &&
+      json(rigBack.parts.map((p) => p.offset)) === json([1, 0]) &&
+      Math.min(...Array.from({ length: rigBack.vertexCount }, (_, i) => rigBack.positions[i * 3])) === -36,
+    "落盘 .mdl：Padding 后的网格轮廓（−36 = −W/2 − 4）与部件顺序都能被真解析器读回",
+  );
+  // v1 钉子布局的 schema 上限（MESH_MAX=48）与 P1 的细分密度必须解耦：
+  // 细分 / 切片后有效格数可以到 64×8，只要有一次把这种数写进 warp.cols，parseMeta 就会拒收**整份布局**
+  // （钉子全丢、重开后「操控变形」分组消失）。withLegacyGrid 就是写盘前的夹具。
+  const legacySame = wp.withLegacyGrid(lay, gp2);
+  check(legacySame.cols === gp2.cols && legacySame.rows === gp2.rows, "withLegacyGrid：基础格数在 schema 内时照写 v1 布局");
+  const legacyNone = wp.withLegacyGrid(lay, null);
+  check(legacyNone === lay, "withLegacyGrid：没有几何（老工程 / 纯钉子）时原样返回同一个布局对象");
+  const sub2 = G.withSubdivision(G.defaultGeometry(SIZE, 32, 16), 2);
+  check(
+    G.gridOf(sub2).cols === 64 && wp.withLegacyGrid(lay, sub2).cols === 32,
+    "withLegacyGrid：细分 2 的 64 格只由 geometry（gridOf）表达，v1 布局只记基础 32 格",
+  );
+  const huge = wp.withLegacyGrid(lay, G.withColsRows(G.defaultGeometry(SIZE, 2, 2), G.COLS_MAX, G.COLS_MAX));
+  check(
+    huge.cols === wp.MESH_MAX && huge.rows === wp.MESH_MAX &&
+      wp.parseMeta(wp.metaOf(huge)) !== null &&
+      wp.layoutOf({ puppetWarp: { warp: wp.metaOf(huge) } })?.cols === wp.MESH_MAX &&
+      wp.layoutOf({ warp: wp.metaOf(huge) })?.rows === wp.MESH_MAX,
+    "withLegacyGrid：几何格数超过 48 时夹到 MESH_MAX，写出的布局 parseMeta 与 layoutOf（v2 容器 / v1 镜像）都读得回",
+  );
+
+  // ── 接线：main.ts 真用这两套实现（不许内联副本），P1 文案中英成对且都被引用 ──
+  const p1Main = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const p1I18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const p1Pair = (k) => (p1I18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length;
+  const p1Keys = [...new Set([...p1I18n.matchAll(/"(geo|log\.geo|sheet|log\.sheet)\.[A-Za-z0-9_.]+":/g)].map((m) => m[0].slice(1, -2)))];
+  check(
+    p1Keys.length >= 50 && p1Keys.every((k) => p1Pair(k) === 2),
+    `几何 / 角色表文案中英成对（${p1Keys.length} 个键：${json(p1Keys.filter((k) => p1Pair(k) !== 2))} 不成对）`,
+  );
+  const p1Used = [...new Set([...p1Main.matchAll(/et\(\s*"((?:geo|sheet|log\.geo|log\.sheet)\.[A-Za-z0-9_.]+)"/g)].map((m) => m[1]))];
+  const p1Missing = p1Used.filter((k) => p1Pair(k) !== 2);
+  check(
+    p1Used.length >= 10 && p1Missing.length === 0,
+    `main.ts 用到的几何 / 角色表文案全在 i18n 里（用了 ${p1Used.length} 个，缺 ${json(p1Missing)}）`,
+  );
+  check(
+    /from "\.\/geometry"/.test(p1Main) && /from "\.\/limbs"/.test(p1Main) && /buildGeometry\(/.test(p1Main) && /partsOf\(/.test(p1Main) &&
+      /autoLimbs\(/.test(p1Main) && /groupIndicesByLimb\(/.test(p1Main) && !/function (buildGeometry|axesOf|autoLimbs|connectedComponents|featherAlpha)\(/.test(p1Main),
+    "main.ts 从 ./geometry 与 ./limbs 取实现，几何 / 抠图算法只有模块里一份（没有内联副本）",
+  );
+  check(
+    /\.ed-geom\b/.test(fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8")) &&
+      /\.ed-sheet\b/.test(fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8")),
+    "几何 / 角色表面板有样式（.ed-geom / .ed-sheet）",
+  );
+}
+
+section("SKEL. 骨架与权重 editor/skeleton.ts + editor/weights.ts（P2）");
+{
+  const SK = await loadEditorModule("skeleton");
+  const WT = await loadEditorModule("weights");
+  const me = await loadRendererTs("renderer/src/editor/mdl-edit.ts");
+  const W = await imp("renderer/vendor/we-scene/pkg/mdl-write.js");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const MS = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const SKEL_SIZE = { width: 64, height: 48 };
+  const near = (a, b, eps = 1e-4) => Math.abs(a - b) <= eps;
+  const sum4 = (w, v) => { let s = 0; for (let k = 0; k < 4; k++) s += w[v * 4 + k]; return s; };
+
+  // ── 骨架：打点建骨 / 自动连上一根 / 多根骨 / 命名 ──
+  let sk = SK.defaultSkeleton();
+  check(sk.bones.length === 0 && SK.parentsOk(sk), "defaultSkeleton：空骨架且不变式成立");
+  const a1 = SK.addBone(sk, 0, -10);
+  check(a1 && a1.index === 0 && a1.skeleton.bones[0].parent === -1, "第一根骨没有父级（根骨）");
+  const a2 = SK.addBone(a1.skeleton, -20, 10);
+  check(a2 && a2.skeleton.bones[1].parent === 0, "第二根骨自动连到上一根（parent = 0）");
+  const a3 = SK.addBone(a2.skeleton, 20, 10, 0, "arm R");
+  check(a3 && a3.skeleton.bones[2].parent === 0 && a3.skeleton.bones[2].name === "arm R", "指定 parent 时连到那根，且能起名");
+  sk = a3.skeleton;
+  check(sk.bones.length === 3 && SK.parentsOk(sk), "三根骨，父链合法");
+  check(SK.addBone(sk, 0, 0, 5) === null, "parent 越界（≥ 骨数）时拒绝");
+  check(SK.addBone(sk, NaN, 0) === null, "坐标非有限数时拒绝");
+  check(SK.boneDepthOf(sk, 2) === 1 && json(SK.boneChain(sk, 2)) === json([0, 2]), "boneChain / boneDepthOf 认父链");
+  check(json(SK.boneSubtree(sk, 0)) === json([0, 1, 2]) && json(SK.boneSubtree(sk, 1)) === json([1]), "boneSubtree 含自身与后代");
+  const renamed = SK.renameBone(sk, 1, "leg L");
+  check(renamed && renamed.bones[1].name === "leg L" && sk.bones[1].name === "bone 2", "renameBone 返回新对象、不改原骨架");
+  check(SK.renameBone(sk, 9, "x") === null, "renameBone 越界拒绝");
+  check(SK.uniqueBoneName(sk) === "bone" && SK.uniqueBoneName(renamed) === "bone", "uniqueBoneName：名字没被占就用 base");
+  const two = SK.addBone(renamed, 5, 5);
+  check(two && two.skeleton.bones[3].name === "bone 4", "默认命名按骨号编号（bone 4）且不重名");
+  const named = SK.renameBone(two.skeleton, 3, "arm R");
+  check(named && named.bones[3].name === "arm R 2", "重名时自动加序号（arm R 2）");
+  const moved = SK.moveBone(named, 3, 7.25, -3.5);
+  check(moved && moved.bones[3].x === 7.25 && moved.bones[3].y === -3.5, "moveBone 挪点");
+  check(SK.moveBone(named, 0, Infinity, 0) === null, "moveBone 非法坐标拒绝");
+
+  // ── 命中 / 框选 ──
+  check(SK.nearestBone(named, 20.5, 10) === 2, "nearestBone：取最近的一根");
+  check(SK.nearestBone(named, 100, 100, 5) === null, "nearestBone：超出容差返回 null");
+  const tie = SK.addBone(SK.addBone(SK.defaultSkeleton(), 0, 0).skeleton, 10, 0);
+  check(tie && SK.nearestBone(tie.skeleton, 5, 0, 6) === 0, "nearestBone：等距时取下标小的（根骨优先）");
+  check(json(SK.bonesInRect(named, -25, -20, 25, 12)) === json([0, 1, 2, 3]) && json(SK.bonesInRect(named, 100, 100, 200, 200)) === json([]), "bonesInRect 框选（含上下边界；空框返回空表）");
+
+  // ── 删骨 / 改父级：子树不丢、父级下标永远更小、给出搬运表 ──
+  const rm = SK.removeBone(sk, 0);
+  check(rm && rm.skeleton.bones.length === 2 && rm.skeleton.bones.every((b) => b.parent === -1), "删根骨：子骨降级为根骨（子树不丢）");
+  check(rm && json(rm.map) === json([0, 0, 1]), "removeBone：被删的骨映射到父级（根 ⇒ 新根 0）");
+  const rm2 = SK.removeBone(sk, 1);
+  check(rm2 && json(rm2.map) === json([0, 0, 1]) && rm2.skeleton.bones[1].parent === 0, "删中间骨：子骨改挂到它的父级，父级下标搬移正确");
+  check(SK.parentsOk(rm2.skeleton), "删骨后不变式仍成立");
+  const cyc = SK.defaultSkeleton();
+  const c1 = SK.addBone(cyc, 0, 0).skeleton;
+  const c2 = SK.addBone(c1, 5, 5).skeleton;
+  const c3 = SK.addBone(c2, 10, 10).skeleton;
+  check(SK.setBoneParent(c3, 0, 2) === null, "改父级成环（把根挂到自己的后代下）拒绝");
+  check(SK.setBoneParent(c3, 1, 1) === null, "自环拒绝");
+  check(SK.setBoneParent(c3, 1, -1) !== null && SK.setBoneParent(c3, 1, -1).skeleton.bones[1].parent === -1, "改成根骨（parent = -1）允许");
+  const re = SK.setBoneParent(c3, 2, 1);
+  check(re && re.skeleton.bones[2].parent === 1 && SK.parentsOk(re.skeleton), "改父级到更小的下标：无需重排");
+  const late = SK.topoSort([{ name: "a", parent: 1, x: 0, y: 0 }, { name: "b", parent: -1, x: 0, y: 0 }]);
+  check(SK.parentsOk(late.skeleton) && late.skeleton.bones[1].name === "a" && json(late.map) === json([1, 0]), "topoSort：父级在后时重排到前面并给出搬运表");
+  const ring = SK.topoSort([{ name: "a", parent: 1, x: 0, y: 0 }, { name: "b", parent: 0, x: 0, y: 0 }]);
+  check(SK.parentsOk(ring.skeleton) && ring.skeleton.bones.length === 2 && ring.skeleton.bones[0].parent === -1, "topoSort：成环的坏数据断链成合法父链（不丢骨）");
+
+  // ── 绑定姿势矩阵：纯平移、父级相对、根骨绝对 ──
+  const mroot = SK.boneMatrixOf(sk, 0);
+  const mchild = SK.boneMatrixOf(sk, 1);
+  check(mroot.length === 16 && mroot[12] === 0 && mroot[13] === -10 && mroot[14] === 0 && mroot[0] === 1 && mroot[5] === 1, "根骨矩阵 = 自身点平移");
+  check(near(mchild[12], -20 - 0) && near(mchild[13], 10 - -10), "子骨矩阵 = 相对父级的差（模型空间、y 向上）");
+  const specs = SK.boneSpecs(sk);
+  check(specs.length === 3 && specs.every((b) => b.matrix.length === 16) && specs[1].parent === 0, "boneSpecs：顺序 = 骨号、矩阵 16 分量");
+
+  // ── json 往返：skeleton 落 puppetWarp.skeleton，空骨架删键 ──
+  const meta = SK.skeletonMeta(sk);
+  check(meta.v === 1 && json(meta.bones.map((b) => b.parent)) === json([-1, 0, 0]) && !("matrix" in meta.bones[0]), "skeletonMeta：只存名字 / 父级 / 坐标（矩阵由坐标推出）");
+  const round = SK.parseSkeleton(meta);
+  check(round && SK.skeletonsEqual(round, sk), "parseSkeleton ∘ skeletonMeta = 原骨架");
+  check(SK.parseSkeleton({ bones: [] }) === null && SK.parseSkeleton(null) === null, "空骨架 / 坏数据解析成 null");
+  const cleaned = SK.cleanSkeleton({
+    bones: [
+      { name: "", parent: -1, x: 1, y: 2 },
+      { name: "b", parent: 0, x: NaN, y: 2 },
+      { name: "c", parent: 7, x: 3, y: 3 },
+      { name: "d", parent: 0.5, x: 4, y: 4 },
+      { name: "e", parent: 2, x: 5, y: 5 },
+    ],
+  });
+  check(cleaned.bones.length === 4 && cleaned.bones[0].name === SK.DEFAULT_BONE_NAME, "cleanSkeleton：非有限坐标丢弃、空名字回落默认名");
+  check(SK.parentsOk(cleaned) && cleaned.bones.some((b) => b.parent === -1), "cleanSkeleton：坏父级（越界 / 小数）重排成合法父链");
+  const json0 = { puppetWarp: { warp: { v: 1, pins: [[0.5, 0.5]] }, geometry: { v: 1, cols: 2, rows: 2 } } };
+  const json1 = SK.withSkeleton(json0, sk);
+  check(json(json1.puppetWarp.skeleton.bones.map((b) => b.name)) === json(["bone 1", "bone 2", "arm R"]), "withSkeleton：写进 puppetWarp.skeleton");
+  check(json(json1.puppetWarp.warp) === json(json0.puppetWarp.warp) && json(json1.puppetWarp.geometry) === json(json0.puppetWarp.geometry), "withSkeleton 不碰同级子键（warp / geometry）");
+  check(SK.skeletonOf(json1).bones.length === 3 && SK.withSkeleton(json1, null).puppetWarp.skeleton === undefined, "skeletonOf 读回；空骨架 = 删键（回落 P0 钉子骨）");
+  check(SK.withSkeleton({ width: 1 }, null).puppetWarp === undefined, "没有 puppetWarp 容器时删键不产生空容器");
+  const def6 = SK.defaultBonesFor(SKEL_SIZE);
+  check(def6.bones.length === 6 && SK.parentsOk(def6) && new Set(def6.bones.map((b) => b.name)).size === 6, "defaultBonesFor：6 根骨、父链合法、名字不重");
+  check(def6.bones[0].y === -SKEL_SIZE.height * 0.25, "defaultBonesFor：根骨在腰部（−H/4）");
+
+  // ── 蒙皮不变量 ──
+  const gmesh = { cols: 2, rows: 2 };
+  const V = 9;
+  const positions = new Float32Array([
+    -32, -24, 0, 0, -24, 0, 32, -24, 0,
+    -32, 0, 0, 0, 0, 0, 32, 0, 0,
+    -32, 24, 0, 0, 24, 0, 32, 24, 0,
+  ]);
+  const indices = new Uint32Array([0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4, 3, 4, 7, 3, 7, 6, 4, 5, 8, 4, 8, 7]);
+  const u = WT.uniformSkin(V, 0);
+  check(WT.skinValid(u, 1) && sum4(u.weights, 4) === 1 && u.joints[4 * 4] === 0, "uniformSkin：全给一根骨、权重 1、合法");
+  check(WT.skinBadVertex(u, 1) === -1 && WT.skinBadVertex(u, 2) === -1, "skinBadVertex：合法 skin 返回 -1（骨数上限不卡）");
+  const bonePts = [[0, -24], [-32, 24], [32, 24]];
+  const nearSkin = WT.nearestBoneSkin(positions, bonePts);
+  check(WT.skinValid(nearSkin, 3), "nearestBoneSkin：每顶点归最近骨，结果合法");
+  check(nearSkin.joints[6 * 4] === 1 && nearSkin.joints[8 * 4] === 2 && nearSkin.joints[0 * 4] === 0, "nearestBoneSkin：左上 → 骨 1、右上 → 骨 2、左下 → 根骨 0");
+  const bad = WT.cloneSkin(u);
+  bad.weights[0] = NaN;
+  check(WT.skinBadVertex(bad, 1) === 0, "skinBadVertex：NaN 权重被抓");
+  const bad2 = WT.cloneSkin(u);
+  bad2.weights.fill(0);
+  check(WT.skinBadVertex(bad2, 1) === 0, "skinBadVertex：全零权重被抓");
+  const bad3 = WT.uniformSkin(V, 0);
+  bad3.joints[1] = 9;
+  check(WT.skinBadVertex(bad3, 2) === 0, "skinBadVertex：骨号越界被抓");
+  const bad4 = WT.uniformSkin(V, 0);
+  bad4.weights[0] = -0.5;
+  check(WT.skinBadVertex(bad4, 1) === 0, "skinBadVertex：负权重被抓");
+
+  // ── 笔刷：4 槽内再分配、软边衰减、Σ 恒 1 ──
+  const paint = WT.cloneSkin(u);
+  const touched = WT.paintVertices(paint, positions, [-32, 24], 20, 1, 1, "add");
+  check(touched >= 1 && WT.skinValid(paint, 2), "笔刷：涂到的顶点数 > 0 且结果合法");
+  check(near(sum4(paint.weights, 6), 1) && paint.weights[6 * 4 + 1] > 0.9, "笔刷：中心顶点几乎全给新骨（软边衰减）");
+  check(paint.weights[0 * 4 + 0] === 1 && paint.weights[0 * 4 + 1] === 0, "笔刷：半径外的顶点不动");
+  WT.paintVertices(paint, positions, [-32, 24], 20, 2, 0.5, "add"); // 同一顶点再涂第二根骨（才有可让出的份额）
+  const before = paint.weights[6 * 4 + 1];
+  WT.paintVertices(paint, positions, [-32, 24], 20, 1, 0.25, "remove");
+  check(before < 0.6 && near(paint.weights[6 * 4 + 1], before - 0.25) && WT.skinValid(paint, 3), "笔刷 remove：权重按强度让给同顶点的其它骨（Σ 恒 1）");
+  const only = WT.cloneSkin(u);
+  WT.paintVertices(only, positions, [32, 24], 20, 2, 1, "add");
+  check(only.joints[8 * 4 + 1] === 2 && near(only.weights[8 * 4 + 1], 1), "笔刷：涂第二根骨时挤掉最小槽（4 影响上限）");
+  check(json(WT.skinSlotsOf(only, 8).map(([j]) => j)).includes(2) === true, "skinSlotsOf：按权重降序给出 4 槽");
+  check(WT.dominantBoneOf(only, 8) === 2 && WT.dominantBoneOf(only, 0) === 0, "dominantBoneOf：取权重最大的槽");
+  const setHalf = WT.cloneSkin(u);
+  WT.assignWeight(setHalf, 0, 1, 0.75);
+  check(near(setHalf.weights[0], 0.25) && near(setHalf.weights[1], 0.75) && sum4(setHalf.weights, 0) === 1, "assignWeight：按值设权重，其余槽按比例分剩下的");
+  const giveAll = WT.cloneSkin(u);
+  WT.assignWeight(giveAll, 0, 1, 1);
+  check(giveAll.weights[0] === 0 && near(giveAll.weights[1], 1), "assignWeight：给新骨 1 时旧槽清零");
+  const strip = WT.cloneSkin(u);
+  WT.assignWeight(strip, 0, 0, 0);
+  check(near(strip.weights[0], 1) && WT.skinValid(strip, 1), "assignWeight：把唯一骨的权重清 0 时回落满权重（不会出全零顶点）");
+
+  // ── 邻接 / 平滑 / 孤岛 ──
+  const adj = WT.adjacencyOf(indices, V);
+  const deg = (v) => adj.start[v + 1] - adj.start[v];
+  check(deg(4) === 6 && deg(0) === 3 && deg(1) === 4 && adj.list.length === 2 * 16, "adjacencyOf：角 3 度、中心 8 度、边数 = 16 条（3+3 条网格线 ×2 段 + 4 条对角线）");
+  let sym = true;
+  for (let v = 0; v < V; v++) for (let p = adj.start[v]; p < adj.start[v + 1]; p++) {
+    const n = adj.list[p];
+    let found = false;
+    for (let q = adj.start[n]; q < adj.start[n + 1]; q++) if (adj.list[q] === v) found = true;
+    if (!found) sym = false;
+  }
+  check(sym, "adjacencyOf：邻接对称");
+  const wOfJoint = (s, v, bone) => {
+    let w = 0;
+    for (let k = 0; k < 4; k++) if (s.joints[v * 4 + k] === bone) w += s.weights[v * 4 + k];
+    return w;
+  };
+  const maxJump = (s, bone) => {
+    let m = 0;
+    for (let v = 0; v < V; v++) for (let p = adj.start[v]; p < adj.start[v + 1]; p++) m = Math.max(m, Math.abs(wOfJoint(s, v, bone) - wOfJoint(s, adj.list[p], bone)));
+    return m;
+  };
+  const split = WT.cloneSkin(u);
+  for (let v = 0; v < V; v++) WT.assignWeight(split, v, positions[v * 3] <= 0 ? 1 : 2, 1);
+  const smooth = WT.cloneSkin(split);
+  const sTouched = WT.smoothSkin(smooth, adj, 4);
+  check(sTouched > 0 && WT.skinValid(smooth, 3), "smoothSkin：有改动且结果合法");
+  check(maxJump(split, 1) > 0.9 && maxJump(smooth, 1) < maxJump(split, 1), `smoothSkin：把断层抹开（最大跨边权重差 ${maxJump(split, 1)} → ${maxJump(smooth, 1).toFixed(3)}）`);
+  check(near(sum4(smooth.weights, 4), 1) && smooth.weights.every((w) => Number.isFinite(w)), "smoothSkin：每个顶点 Σ = 1 且不产生 NaN");
+  const isl = WT.islandsOf(split, adj);
+  check(isl.count === 2 && isl.island[0] === isl.island[3] && isl.island[0] !== isl.island[2], "islandsOf：按主骨 + 拓扑连通分块（左右两块）");
+  const bound = WT.islandBoundary(isl, adj);
+  check(bound[1] === 1 && bound[4] === 1 && bound[0] === 0, "islandBoundary：只有跨孤岛相邻的顶点算边界");
+  const blended = WT.cloneSkin(split);
+  WT.blendIslandBoundary(blended, adj, isl, 6);
+  check(
+    WT.skinValid(blended, 3) && wOfJoint(blended, 1, 2) > 0.05 && near(wOfJoint(blended, 5, 1), 0) === false,
+    `blendIslandBoundary：边界顶点拿到对面骨的权重（顶点 1 的对面骨权重 ${wOfJoint(blended, 1, 2).toFixed(3)}）`,
+  );
+  check(near(wOfJoint(blended, 0, 1), 1) && near(wOfJoint(blended, 3, 1), 1), "blendIslandBoundary：孤岛内部的顶点不动");
+  const totals = WT.boneTotals(split, 3);
+  check(near(totals[0], 0) && totals[1] + totals[2] === V, "boneTotals：每骨权重合计");
+  const mask = WT.boneVertexMask(split, 1, 0.5);
+  check(mask[0] === 1 && mask[2] === 0 && mask.reduce((s, x) => s + x, 0) === 6, "boneVertexMask：逐骨遮罩（阈值 0.5）");
+
+  // ── 骨号重排后的搬运（合并重复槽） ──
+  const dup = WT.cloneSkin(u);
+  dup.joints[0] = 0; dup.weights[0] = 0.4;
+  dup.joints[1] = 1; dup.weights[1] = 0.6;
+  const merged = WT.remapSkin(dup, [0, 0]);
+  check(WT.skinValid(merged, 1) && near(merged.weights[0], 1) && merged.joints[0] === 0, "remapSkin：两根骨并成一根时权重相加并归一");
+  const gone = WT.remapSkin(dup, [0, -1]);
+  check(WT.skinValid(gone, 1) && near(gone.weights[0], 1) && near(gone.weights[1], 0), "remapSkin：被删的骨（map = −1）不带权重，剩下的骨归一（1 / 0）");
+  const allGone = WT.remapSkin(dup, [-1, -1], 0);
+  check(WT.skinValid(allGone, 1) && near(allGone.weights[0], 1), "remapSkin：映射全失效时回落 fallback 满权重");
+  check(WT.remapSkin(dup, [0, 0]).joints.length === dup.joints.length, "remapSkin：形状不变（每顶点 4 槽）");
+
+  // ── 部件表：Move Limb to Front / 铺满自检 / offset 归一 ──
+  const parts3 = [
+    { id: 0, offset: 0, start: 0, size: 6 },
+    { id: 1, offset: 1, start: 6, size: 6 },
+    { id: 2, offset: 2, start: 12, size: 6 },
+  ];
+  const front = WT.moveLimbFront(parts3, 2);
+  check(
+    front && front[2].offset > front[0].offset && front[2].offset === Math.max(...parts3.map((p) => p.offset)) + WT.DRAW_ORDER_STEP &&
+      front.map((p) => p.start).join() === parts3.map((p) => p.start).join(),
+    "moveLimbFront：只抬被点部件的绘制序（+100），数组仍是 start 升序（meshExtra 强校验）",
+  );
+  check(WT.drawOrderRank(front, 2) === 0 && WT.drawOrderRank(front, 1) === 1 && WT.drawOrderRank(front, 0) === 2, "drawOrderRank：0 = 最前（面板前后着色）");
+  check(json(WT.normalizeDrawOrder(front).map((p) => p.offset)) === json([200, 100, 0]), "normalizeDrawOrder：按相对顺序归一到 0 / 100 / 200");
+  check(WT.partsOk(front, 18) && WT.partsOk(parts3, 18) && !WT.partsOk(parts3, 19) && !WT.partsOk([], 18), "partsOk：首尾相接铺满才通过（与数组顺序无关）");
+  check(WT.moveLimbFront(parts3, 5) === null && WT.drawOrderRank(parts3, -1) === -1, "moveLimbFront / drawOrderRank 越界拒绝");
+  // 盘上另一半：索引区间整段搬到表尾（部件顺序 = 绘制顺序），三角形集合不变、仍首尾铺满
+  const idx18 = Array.from({ length: 18 }, (_, i) => i);
+  const reFront = WT.reorderPartRange(idx18, parts3, 0);
+  const triKey = (a) => { const t = []; for (let i = 0; i + 2 < a.length; i += 3) t.push([a[i], a[i + 1], a[i + 2]].sort((x, y) => x - y).join("_")); return t.sort().join("|"); };
+  check(
+    !!reFront && reFront.parts.map((p) => p.id).join() === "1,2,0" && reFront.parts.map((p) => p.start).join() === "0,6,12" &&
+      reFront.parts[2].offset === parts3[0].offset && reFront.parts[2].size === parts3[0].size &&
+      json(Array.from(reFront.indices)) === json([...idx18.slice(6), ...idx18.slice(0, 6)]) &&
+      triKey(reFront.indices) === triKey(idx18) && WT.partsOk(reFront.parts, 18),
+    "reorderPartRange：被点部件的索引区间整段搬到表尾（start 重算、id/offset/size 带过、三角形集合不变）",
+  );
+  const reLast = WT.reorderPartRange(idx18, parts3, 2);
+  check(
+    !!reLast && json(Array.from(reLast.indices)) === json(idx18) && reLast.parts.map((p) => p.id).join() === "0,1,2",
+    "reorderPartRange：把已经在最后的部件搬到最前 = 无操作（索引顺序不变）",
+  );
+  check(WT.reorderPartRange(idx18, parts3, 5) === null && WT.reorderPartRange(idx18, parts3, -1) === null && WT.reorderPartRange(idx18.slice(0, 17), parts3, 0) === null, "reorderPartRange：越界 / 索引表与部件表对不上就拒绝");
+
+  // ── json：权重只有 UI 状态（顶点权重本体在 .mdl） ──
+  const jw = WT.withWeights({ puppetWarp: { geometry: { v: 1, cols: 2, rows: 2 } } }, { locked: true });
+  check(jw.puppetWarp.weights.v === 1 && jw.puppetWarp.weights.locked === true && json(jw.puppetWarp.geometry) === json({ v: 1, cols: 2, rows: 2 }), "withWeights：只写 {v, locked}，不碰同级子键");
+  check(WT.weightsOf(jw).locked === true && WT.weightsOf({}) === null && WT.withWeights(jw, null).puppetWarp.weights === undefined, "weightsOf / withWeights(null) 删键");
+
+  // ── 与写侧 API 合流：骨架 + 权重 → .mdl → 引擎读回 ──
+  const uvs = new Float32Array(V * 2);
+  const normals = new Float32Array(V * 3);
+  for (let v = 0; v < V; v++) {
+    uvs[v * 2] = (positions[v * 3] + 32) / 64;
+    uvs[v * 2 + 1] = 1 - (positions[v * 3 + 1] + 24) / 48;
+    normals[v * 3 + 2] = 1;
+  }
+  const skModel = SK.cleanSkeleton({
+    bones: [
+      { name: "root", parent: -1, x: 0, y: -24 },
+      { name: "left", parent: 0, x: -32, y: 24 },
+      { name: "right", parent: 0, x: 32, y: 24 },
+    ],
+  });
+  let paintSkin = WT.nearestBoneSkin(positions, SK.bonePoints(skModel));
+  paintSkin.joints[2 * 4] = 1; // 右下角改涂左骨，制造一块可检出的偏差
+  const mdlSpec = {
+    width: 64, height: 48, material: "materials/editor/skel.json", puppet: true,
+    meshes: [{ material: "materials/editor/skel.json", positions, uvs, normals, indices, boneIdx: paintSkin.joints, weights: paintSkin.weights }],
+    bones: SK.boneSpecs(skModel),
+    animations: [],
+  };
+  const mdlBytes = W.encodeMDL(mdlSpec);
+  const readBones = me.mdlBones(mdlBytes);
+  check(readBones && json(readBones.map((b) => b.name)) === json(["root", "left", "right"]) && json(readBones.map((b) => b.parent)) === json([-1, 0, 0]), "合流：骨架经 encodeMdl 写进 MDLS 后名字 / 父级读得回");
+  check(readBones && near(readBones[1].matrix[12], -32) && near(readBones[1].matrix[13], 48), "合流：子骨矩阵 = 相对父级的平移（−32, 24 − (−24) = 48）");
+  const readSkin = me.mdlSkin(mdlBytes, 0);
+  check(readSkin && readSkin.boneCount === 3 && readSkin.joints[8] === 1 && near(readSkin.weights[0], 1), "合流：mdlSkin 读回骨号 / 权重（含手改的槽）");
+  check(readSkin && WT.skinBadVertex({ joints: readSkin.joints, weights: readSkin.weights, vertexCount: V }, 3) === -1, "合流：读回的蒙皮满足 4 槽不变量");
+  const sameBytes = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+  const sameW = me.setMdlWeights(mdlBytes, 0, readSkin.weights);
+  check(sameBytes(sameW, mdlBytes), "合流：同值 setMdlWeights 逐字节不变");
+  check(sameBytes(me.setMdlBoneIdx(mdlBytes, 0, readSkin.joints), mdlBytes), "合流：同值 setMdlBoneIdx 逐字节不变");
+  check(sameBytes(me.setMdlSkeleton(mdlBytes, SK.boneSpecs(skModel)), mdlBytes), "合流：同值 setMdlSkeleton 逐字节不变（尾表原样保留）");
+  const grown = me.setMdlSkeleton(mdlBytes, [...SK.boneSpecs(skModel), { name: "tip", parent: 2, matrix: SK.boneMatrixOf(SK.addBone(skModel, 40, 30, 2).skeleton, 3) }]);
+  const grownBones = grown && me.mdlBones(grown);
+  check(grownBones && grownBones.length === 4 && grownBones[3].name === "tip" && P.parseMDL(grown).bones.length === 4, "合流：加一根骨写盘后 parseMDL / mdlBones 都读到 4 根");
+  check(me.setMdlBoneNames(mdlBytes, ["a", "b"]) === null && me.mdlBones(me.setMdlBoneNames(mdlBytes, ["a", "b", "c"]))[0].name === "a", "合流：改名声数不一致拒绝，数量一致时改名生效");
+  check(me.setMdlWeights(mdlBytes, 0, new Float32Array(V * 4)) === null && me.setMdlBoneIdx(mdlBytes, 0, Uint32Array.from(paintSkin.joints, (j) => j + 9)) === null, "合流：全零权重 / 越界骨号写盘被拒");
+
+  // ── 抹平：涂出来的权重真的能带动顶点（离线复算蒙皮矩阵） ──
+  const bendBones = [
+    { name: "root", parent: -1, matrix: SK.boneMatrixOf({ bones: [{ name: "root", parent: -1, x: 0, y: 0 }] }, 0) },
+    { name: "arm", parent: 0, matrix: Float32Array.of(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 32, 0, 0, 1) },
+  ];
+  const bendTracks = bendBones.map((b, i) => {
+    const track = new Float32Array(9 * 3);
+    for (let f = 0; f < 3; f++) {
+      const o = f * 9;
+      track[o] = b.matrix[12];
+      track[o + 1] = b.matrix[13];
+      track[o + 6] = 1;
+      track[o + 7] = 1;
+      track[o + 8] = 1;
+      if (i === 1 && f === 1) track[o + 5] = Math.PI / 2; // 第 1 帧绕 z 转 90°
+    }
+    return track;
+  });
+  const bendSkin = WT.uniformSkin(V, 1);
+  for (let v = 0; v < V; v++) if (positions[v * 3] < 0) WT.assignWeight(bendSkin, v, 0, 1);
+  const bendSpec = {
+    width: 64, height: 48, material: "materials/editor/bend.json", puppet: true,
+    meshes: [{ material: "materials/editor/bend.json", positions, uvs, normals, indices, boneIdx: bendSkin.joints, weights: bendSkin.weights }],
+    bones: bendBones,
+    animations: [{ id: 1, name: "bend", mode: "loop", fps: 30, frameCount: 2, tracks: bendTracks }],
+  };
+  const bendMdl = P.parseMDL(W.encodeMDL(bendSpec));
+  const bendLayer = [{ animation: 1, visible: true, blend: 1, rate: 1, additive: false }];
+  // computeSkinMatrices 返回的是 mdl._skin 这**同一个** Float32Array（每帧原地重写），
+  // 两次调用必须各自拷一份，否则第二个时刻的结果会把第一个覆盖（曾把「第 0 帧不动」判成 56.6px）。
+  const mats0 = Float32Array.from(MS.computeSkinMatrices(bendMdl, 0, bendLayer));
+  const mats1 = Float32Array.from(MS.computeSkinMatrices(bendMdl, 1 / 30, bendLayer));
+  const applySkin = (mats, v) => {
+    let x = 0, y = 0;
+    for (let k = 0; k < 4; k++) {
+      const w = bendSkin.weights[v * 4 + k];
+      if (w <= 0) continue;
+      const b = bendSkin.joints[v * 4 + k] * 16;
+      x += w * (mats[b] * positions[v * 3] + mats[b + 4] * positions[v * 3 + 1] + mats[b + 12]);
+      y += w * (mats[b + 1] * positions[v * 3] + mats[b + 5] * positions[v * 3 + 1] + mats[b + 13]);
+    }
+    return [x, y];
+  };
+  let rest0 = 0, moved1 = 0;
+  for (let v = 0; v < V; v++) {
+    const [x0, y0] = applySkin(mats0, v);
+    rest0 = Math.max(rest0, Math.hypot(x0 - positions[v * 3], y0 - positions[v * 3 + 1]));
+  }
+  const rightTop = 2, rightBottom = 5, leftTop = 0;
+  const [rx0, ry0] = applySkin(mats1, rightTop);
+  const [rx1, ry1] = applySkin(mats1, leftTop);
+  moved1 = Math.hypot(rx0 - positions[rightTop * 3], ry0 - positions[rightTop * 3 + 1]);
+  const still1 = Math.hypot(rx1 - positions[leftTop * 3], ry1 - positions[leftTop * 3 + 1]);
+  check(rest0 < 1e-4, "蒙皮复算：第 0 帧 = 绑定姿势 ⇒ 顶点不动");
+  check(moved1 > 20 && still1 < 1e-4, `蒙皮复算：涂给臂骨的顶点随 90° 转动搬走（${moved1.toFixed(1)}px），未涂的仍不动`);
+  check(WT.skinValid(bendSkin, 2), "蒙皮复算用的 skin 满足不变量（4 槽 / Σ = 1 / 无全零）");
+
+  // ── 接线：main.ts 真用模块实现，P2 文案中英成对 ──
+  const p2Main = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const p2I18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const p2Pair = (k) => (p2I18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length;
+  const p2Keys = [...new Set([...p2I18n.matchAll(/"(skel|log\.skel|wt|log\.wt)\.[A-Za-z0-9_.]+":/g)].map((m) => m[0].slice(1, -2)))];
+  check(p2Keys.length >= 30 && p2Keys.every((k) => p2Pair(k) === 2), `骨架 / 权重文案中英成对（${p2Keys.length} 个键：${json(p2Keys.filter((k) => p2Pair(k) !== 2))} 不成对）`);
+  const p2Used = [...new Set([...p2Main.matchAll(/et\(\s*"((?:skel|log\.skel|wt|log\.wt)\.[A-Za-z0-9_.]+)"/g)].map((m) => m[1]))];
+  check(p2Used.length >= 10 && p2Used.every((k) => p2Pair(k) === 2), `main.ts 用到的骨架 / 权重文案全在 i18n 里（用了 ${p2Used.length} 个，缺 ${json(p2Used.filter((k) => p2Pair(k) !== 2))}）`);
+  check(
+    /from "\.\/skeleton"/.test(p2Main) && /from "\.\/weights"/.test(p2Main) && /nearestBoneSkin\(/.test(p2Main) && /paintVertices\(/.test(p2Main) &&
+      /moveLimbFront\(/.test(p2Main) && /reorderPartRange\(/.test(p2Main) && /setMdlTopology\(/.test(p2Main) && /setMdlWeights\(/.test(p2Main) &&
+      /clearMdlClips\(/.test(p2Main) && !/removeMdlClip\(next, WARP_CLIP_ID\)/.test(p2Main) && !/function (topoSort|nearestBoneSkin|paintVertices|islandsOf)\(/.test(p2Main),
+    "main.ts 从 ./skeleton 与 ./weights 取实现，算法只有模块里一份（没有内联副本；移到最前两半都写；骨表变了整批清片段）",
+  );
+  const p2Css = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+  check(/\.ed-skel\b/.test(p2Css) && /\.ed-wt\b/.test(p2Css), "骨架 / 权重面板有样式（.ed-skel / .ed-wt）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

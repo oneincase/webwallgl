@@ -5,6 +5,7 @@
 import { openMenu } from "../../shared/workbench/menu";
 import { load, save } from "../../shared/workbench/storage";
 import type { LibraryItem } from "../open";
+import { confirmDialog } from "./confirm";
 
 export type LibraryKind = "scene" | "web" | "video";
 
@@ -146,7 +147,13 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
   }
 
   async function remove(it: LibraryItem) {
-    if (!window.confirm(o.t("confirm.delete", { title: it.title, id: it.itemId }))) return;
+    const yes = await confirmDialog({
+      title: o.t("dlg.deleteTitle"),
+      body: o.t("confirm.delete", { title: it.title, id: it.itemId }),
+      ok: o.t("dlg.deleteOk"),
+      danger: true,
+    });
+    if (!yes) return;
     try {
       await postJson("/api/delete", { itemId: it.itemId });
       o.log(o.t("ok.delete", { id: it.itemId }));
@@ -174,7 +181,9 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
   o.list.addEventListener("scroll", scheduleRender);
 
   function render(resetScroll = false) {
-    if (resetScroll) o.list.scrollTop = 0;
+    // 滚动位置必须在清空 DOM **之前**读出来：清空会让滚动高度归零，
+    // 浏览器顺手把 scrollTop 钳到 0，之后再读就永远是 0（列表会一直跳回顶部）。
+    const top = resetScroll ? 0 : o.list.scrollTop;
     const kw = o.filter.value.trim().toLowerCase();
     o.list.textContent = "";
     if (backend === "down") {
@@ -200,8 +209,8 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
     o.count.hidden = match.length === 0;
     o.count.textContent = String(match.length);
     const viewH = o.list.clientHeight || 400;
-    const start = Math.max(0, Math.floor(o.list.scrollTop / ROW_H) - OVERSCAN);
-    const end = Math.min(match.length, Math.ceil((o.list.scrollTop + viewH) / ROW_H) + OVERSCAN);
+    const start = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
+    const end = Math.min(match.length, Math.ceil((top + viewH) / ROW_H) + OVERSCAN);
     const pad = (h: number) => {
       const li = document.createElement("li");
       li.className = "lib-pad";
@@ -259,6 +268,8 @@ export function mountLibraryPanel(o: LibraryPanelOptions): LibraryPanel {
       o.list.appendChild(li);
     }
     if (end < match.length) o.list.appendChild(pad((match.length - end) * ROW_H));
+    // 重建后把位置放回去：上下占位行已经撑出原来的高度，赋值不会被打回。
+    if (o.list.scrollTop !== top) o.list.scrollTop = top;
   }
 
   syncTypeButtons();

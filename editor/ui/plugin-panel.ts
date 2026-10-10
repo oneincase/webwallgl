@@ -6,6 +6,7 @@ import { deniedPermissions, GRANTABLE, packageFromFiles, permKey, type PluginMan
 import type { PluginEntry, PluginManager } from "../plugins/manager";
 import type { PluginLog, PluginLogEntry } from "../plugins/log";
 import type { SettingsService } from "../services/types";
+import { confirmDialog } from "./confirm";
 
 export type PluginPanelOptions = {
   dialog: HTMLDialogElement;
@@ -19,7 +20,7 @@ export type PluginPanelOptions = {
   text: (v: string | Record<string, string> | undefined, fallback: string) => string;
   log: (msg: string, level?: "info" | "warn" | "error") => void;
   /** 安装前确认（列出申请的权限）；false = 取消 */
-  confirmInstall?: (m: PluginManifest) => boolean;
+  confirmInstall?: (m: PluginManifest) => boolean | Promise<boolean>;
 };
 
 const STATUS_CLASS: Record<string, string> = {
@@ -142,7 +143,16 @@ export function renderPluginRows(o: PluginPanelOptions, entries: PluginEntry[], 
       rm.type = "button";
       rm.dataset.act = "uninstall";
       rm.onclick = () => {
-        if (confirm(t("pl.uninstallConfirm", { name: e.manifest ? text(e.manifest.name, e.id) : e.id }))) void manager.uninstall(e.id);
+        void (async () => {
+          const name = e.manifest ? text(e.manifest.name, e.id) : e.id;
+          const yes = await confirmDialog({
+            title: t("dlg.uninstallTitle"),
+            body: t("dlg.uninstallBody", { name }),
+            ok: t("dlg.uninstallOk"),
+            danger: true,
+          });
+          if (yes) void manager.uninstall(e.id);
+        })();
       };
       acts.appendChild(rm);
     }
@@ -194,7 +204,7 @@ export function mountPluginPanel(o: PluginPanelOptions): { open(): void; render(
       );
       try {
         const pkg = packageFromFiles(entries);
-        if (o.confirmInstall && !o.confirmInstall(pkg.manifest)) return;
+        if (o.confirmInstall && !(await o.confirmInstall(pkg.manifest))) return;
         const m = await o.manager.install(entries);
         o.log(o.t("log.pluginInstalled", { name: o.text(m.name, m.id), version: m.version }));
         o.logs?.push(m.id, "info", o.t("log.pluginInstalled", { name: o.text(m.name, m.id), version: m.version }));

@@ -30,6 +30,7 @@ import type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlPart,
   MdlSpec,
   EditorScriptIssue,
   EditorUserPropertyDecl,
@@ -74,6 +75,7 @@ export type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlPart,
   MdlSpec,
 };
 
@@ -160,6 +162,9 @@ export declare function addMdlClip(
 /** 删片段；首个片段是引擎绑定参考，不许删。不存在 / 首个 / 不可编辑时 null */
 export declare function removeMdlClip(bytes: Uint8Array, id: number): Uint8Array | null;
 
+/** 清空全部片段（骨表一换，旧轨道的骨号整批失效）；没有片段时 null */
+export declare function clearMdlClips(bytes: Uint8Array): Uint8Array | null;
+
 /** 改片段头；改帧数时轨道重采样、事件帧号钳进新范围，改 fps 时事件时刻重算 */
 export declare function setMdlClipMeta(bytes: Uint8Array, id: number, meta: Partial<MdlClipInit>): Uint8Array | null;
 
@@ -169,6 +174,111 @@ export declare function setMdlClipEvents(
   id: number,
   events: ReadonlyArray<{ frame: number; name: string }>,
 ): Uint8Array | null;
+
+/** MDLS 段的骨数（无 MDLS 段 / 网格表不可结构化读出时 null）—— P0 */
+export declare function mdlBoneCount(bytes: Uint8Array): number | null;
+
+/**
+ * 第 boneIndex 根骨的记录头 `head0`（旧代码把它命名成 id）与矩阵尾的 JSON meta（骨骼约束 / 混规则
+ * 在 .mdl 里的疑似落点，语义未定）。越界 / 不可编辑时 null；无 meta 的骨 `meta` 为 null —— P0
+ */
+export declare function mdlBoneMeta(
+  bytes: Uint8Array,
+  boneIndex: number,
+): { head0: number | null; parent: number; meta: string | null } | null;
+
+/**
+ * 改第 boneIndex 根骨的 `head0` / `meta`（meta 必须是合法 JSON 串，`""` 表示清空），
+ * 返回新 .mdl 字节；同值时逐字节不变，其余字节不动。越界 / 非整数 head0 / 非法 JSON 时 null —— P0
+ */
+export declare function setMdlBoneMeta(
+  bytes: Uint8Array,
+  boneIndex: number,
+  patch: { head0?: number; meta?: string },
+): Uint8Array | null;
+
+/** 子网格数（网格表不可结构化读出时 null）—— P1 */
+export declare function mdlMeshCount(bytes: Uint8Array): number | null;
+
+/** 子网格摘要：顶点 / 索引规模、顶点字段 stride、蒙版数、部件表 —— P1 */
+export declare function mdlMeshInfo(
+  bytes: Uint8Array,
+  meshIndex: number,
+): { vertexCount: number; stride: number; indexCount: number; indexWide: boolean; maskCount: number; parts: MdlPart[] | null } | null;
+
+/** 子网格顶点位置（每顶点 xyz，模型空间）；越界 / 不可编辑时 null —— P1 */
+export declare function mdlMeshPositions(bytes: Uint8Array, meshIndex: number): Float32Array | null;
+
+/** 子网格索引表（u32 展开，宽度按顶点数判定）；越界 / 不可编辑时 null —— P1 */
+export declare function mdlMeshIndices(bytes: Uint8Array, meshIndex: number): Uint32Array | null;
+
+/**
+ * 写部件表（limb 表）：区间须首尾相接铺满索引表，`null` / `[]` = 去掉部件表。
+ * 带蒙版的网格默认拒绝（显式 opts.allowMasked 才按原字节保留蒙版）；v<21 / 越界 / 区间不合法时 null —— P1
+ */
+export declare function setMdlParts(
+  bytes: Uint8Array,
+  meshIndex: number,
+  parts: MdlPart[] | null,
+  opts?: { allowMasked?: boolean },
+): Uint8Array | null;
+
+/** 写顶点位置（每顶点 xyz，长度 = 顶点数 ×3）；ver>=17 时同步重算 AABB —— P1 */
+export declare function setMdlPositions(bytes: Uint8Array, meshIndex: number, positions: ArrayLike<number>): Uint8Array | null;
+
+/** 只写顶点 z（透视挤出的深度），其余分量 / 索引 / 部件不动；ver>=17 时同步重算 AABB —— P1 */
+export declare function setMdlVertexZ(bytes: Uint8Array, meshIndex: number, z: ArrayLike<number>): Uint8Array | null;
+
+/**
+ * 写拓扑（索引表 = 三角形列表）。`parts` 缺省时老部件表能铺满新索引表就沿用，否则拒绝；
+ * `parts = null` 显式去掉部件表；带蒙版的网格拒绝 —— P1
+ */
+export declare function setMdlTopology(
+  bytes: Uint8Array,
+  meshIndex: number,
+  indices: ArrayLike<number>,
+  parts?: MdlPart[] | null,
+): Uint8Array | null;
+
+/** MDLS 一条骨记录（命名 / head0 / 父级 / 16 分量局部矩阵 / meta JSON 文本）—— P2 */
+export type MdlBoneInfo = { name: string; head0: number; parent: number; matrix: Float32Array; meta: string };
+
+/** 要写进 MDLS 的骨：matrix 省缺 = 单位矩阵 —— P2 */
+export type MdlBoneSpec = {
+  name?: string;
+  parent: number;
+  matrix?: ArrayLike<number>;
+  head0?: number;
+  meta?: string;
+};
+
+/** 读骨骼表（顺序 = 引擎骨号）；无 MDLS 或整份退成 raw 时 null —— P2 */
+export declare function mdlBones(bytes: Uint8Array): MdlBoneInfo[] | null;
+
+/** 只改骨名（数量须一致）：父级 / 矩阵 / head0 / meta / 尾表原样保留 —— P2 */
+export declare function setMdlBoneNames(bytes: Uint8Array, names: ReadonlyArray<string>): Uint8Array | null;
+
+/**
+ * 重写整张骨骼表（骨数可变；parent 须 -1 或更靠前的骨，矩阵 16 分量且有限）。
+ * 尾表 = 按骨数定长的静态装配姿势：骨数不变默认原样保留，骨数变了默认丢弃（tail 可强制）—— P2
+ */
+export declare function setMdlSkeleton(
+  bytes: Uint8Array,
+  bones: ReadonlyArray<MdlBoneSpec>,
+  opts?: { tail?: "auto" | "keep" | "drop" },
+): Uint8Array | null;
+
+/** 蒙皮槽：每顶点 4 个骨号 + 4 个权重（非蒙皮 / 不可编辑时 null）—— P2 */
+export declare function mdlSkin(
+  bytes: Uint8Array,
+  meshIndex: number,
+): { joints: Uint32Array; weights: Float32Array; boneCount: number | null } | null;
+
+/** 写 4 槽权重（长度 = 顶点数 ×4，有限非负、每顶点 Σ>0）；骨号不动 —— P2 */
+export declare function setMdlWeights(bytes: Uint8Array, meshIndex: number, weights: ArrayLike<number>): Uint8Array | null;
+
+/** 写 4 槽骨号（长度 = 顶点数 ×4，整数且落在 [0, 骨数) 内）—— P2 */
+export declare function setMdlBoneIdx(bytes: Uint8Array, meshIndex: number, joints: ArrayLike<number>): Uint8Array | null;
 
 /**
  * WE 内置字体名（scene.json 里的 font: "systemfont_*"）→ 本机 CSS font-family 栈。

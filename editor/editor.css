@@ -1588,6 +1588,181 @@ input.ed-al-name {
   font-size: var(--wb-font-xs);
 }
 
+/* 操控变形（Puppet Warp）：钉子列表 + 衰减滑杆 + 动作行 */
+.ed-warp-pins {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.ed-warp-pins .ed-fx-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 1px 4px;
+}
+
+.ed-warp .ed-fx-params input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.ed-warp .ed-fx-params select {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-warp-add {
+  width: 100%;
+  margin: 4px 0 2px;
+}
+
+.ed-warp .ed-insp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* P1：几何（Geometry）与角色表（Character Sheet）分组 */
+.ed-geom .ed-fx-params input[type="range"],
+.ed-sheet .ed-fx-params input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.ed-geom .ed-fx-params select,
+.ed-sheet .ed-fx-params select {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-geom .ed-fx-params input[type="checkbox"],
+.ed-sheet .ed-fx-params input[type="checkbox"] {
+  margin: 0;
+}
+
+.ed-geom .ed-insp-actions,
+.ed-sheet .ed-insp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* 切片按钮的待命态：点了之后要在视口里点位置，必须看得出来 */
+.ed-geom .ed-geom-slice-x.is-arm,
+.ed-geom .ed-geom-slice-y.is-arm {
+  outline: 2px solid #ffd166;
+  outline-offset: -2px;
+}
+
+/* P2：骨架（Skeleton）与权重（Weights）分组 —— 与 P1 的 ed-geom / ed-sheet 同一套量 */
+.ed-skel .ed-fx-params input[type="range"],
+.ed-wt .ed-fx-params input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.ed-skel .ed-fx-params input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-skel .ed-fx-params select,
+.ed-wt .ed-fx-params select,
+.ed-wt .ed-fx-param select {
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-skel .ed-insp-actions,
+.ed-wt .ed-insp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* 骨列表：一行一根骨，选中行高亮（与视口里的骨点同色系） */
+.ed-skel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+.ed-skel-list .ed-skel-bone {
+  text-align: left;
+}
+
+.ed-skel-list .ed-skel-bone.is-sel {
+  outline: 2px solid #ffd166;
+  outline-offset: -2px;
+}
+
+/* 待命态（打点建骨 / 设父级 / 涂抹 / 深度序）：点了之后要在视口里操作，必须看得出来 */
+.ed-skel .ed-skel-arm.is-arm,
+.ed-skel .ed-skel-parent.is-arm,
+.ed-wt .ed-wt-paint.is-arm,
+.ed-wt .ed-wt-depth.is-arm {
+  outline: 2px solid #ffd166;
+  outline-offset: -2px;
+}
+
+/* 部件绘制序：选择器 + 「移到最前」一行 */
+.ed-wt .ed-wt-part {
+  flex: 1;
+  min-width: 0;
+}
+
+/* limb 列表：左侧色块 = 该部件的色（部件色与视口叠加层一致），选中行高亮 */
+.ed-sheet-limbs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.ed-sheet-limbs .ed-sheet-limb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px;
+  cursor: pointer;
+}
+
+.ed-sheet-sw {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--wb-border, #555);
+  border-radius: 2px;
+}
+
+.ed-sheet-limb.is-on {
+  background: var(--wb-sel, rgba(255, 209, 102, 0.18));
+  outline: 1px solid var(--wb-sel-border, rgba(255, 209, 102, 0.6));
+}
+
 .ed-bones .ed-bn-frame {
   flex: 1;
   min-width: 0;
@@ -1954,6 +2129,149 @@ input.ed-al-name {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+/* ---------- 确认框（替代 window.confirm） ---------- */
+/* 全屏的 <dialog> 只当「居中容器 + 点外面取消」，卡片才是视觉主体；
+   必须显式写 :not([open]) 的 display:none —— 否则 flex 会盖掉浏览器默认的隐藏规则。 */
+.ed-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  max-height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--wb-fg);
+  overflow: hidden;
+}
+
+.ed-confirm:not([open]) {
+  display: none;
+}
+
+.ed-confirm::backdrop {
+  background: rgb(0 0 0 / 0.45);
+  backdrop-filter: blur(2px);
+}
+
+.ed-confirm-card {
+  width: min(420px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  padding: 18px 18px 14px;
+  overflow: auto;
+  border: 1px solid var(--wb-line-strong);
+  border-radius: var(--wb-radius-lg);
+  background: var(--wb-bg-2);
+  box-shadow: var(--wb-shadow-pop);
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* 进场：@starting-style 让首次绘制从「淡 + 微缩」开始，无需 JS 加类；
+   不支持的浏览器直接看到终态，不会卡在动画首帧。 */
+@starting-style {
+  .ed-confirm[open] .ed-confirm-card {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ed-confirm-card {
+    transition: none;
+  }
+}
+
+.ed-confirm-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.ed-confirm-badge {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--wb-accent) 16%, transparent);
+  color: var(--wb-accent);
+}
+
+.ed-confirm-card.is-danger .ed-confirm-badge {
+  background: color-mix(in srgb, var(--wb-danger) 16%, transparent);
+  color: var(--wb-danger);
+}
+
+.ed-confirm-text {
+  min-width: 0;
+}
+
+.ed-confirm-title {
+  margin: 0;
+  color: var(--wb-fg-strong);
+  font-size: var(--wb-font-md);
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.ed-confirm-body {
+  margin: 6px 0 0;
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font);
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.ed-confirm-note {
+  margin: 10px 0 0;
+  padding: 7px 9px;
+  border-radius: var(--wb-radius-sm);
+  background: color-mix(in srgb, var(--wb-warn) 12%, transparent);
+  color: var(--wb-fg);
+  font-size: var(--wb-font-xs);
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.ed-confirm-note:empty {
+  display: none;
+}
+
+.ed-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.ed-confirm-actions .ed-btn {
+  min-width: 76px;
+  height: var(--wb-ctl-h-lg, 28px);
+}
+
+.ed-confirm-actions .ed-btn.is-danger {
+  background: var(--wb-danger);
+  color: var(--wb-bg-0);
+}
+
+.ed-confirm-actions .ed-btn.is-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--wb-danger) 86%, var(--wb-fg-strong));
+}
+
+.ed-confirm-actions .ed-btn:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 2px;
 }
 
 /* ---------- 插件管理 ---------- */

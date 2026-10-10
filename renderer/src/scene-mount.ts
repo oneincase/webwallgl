@@ -4055,10 +4055,14 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             // [we-scene patch 2026-10-09] 无灯场景的默认主光（见 DEFAULT_MESH_LIGHT）：
             // 材质显式声明 defaultlight，或资产落在编辑器命名空间（既有导入产物也认，
             // 免得已导入的模型要重新导入一次才生效）。
+            // [we-scene patch 2026-10-12] 显式 `defaultlight: false` 是**退出**：操控变形
+            // （editor/warp.ts）把一张图片层转成 puppet 木偶，它是平的 2D 贴图，必须逐像素
+            // 等于源图；WE 本身没有默认主光这回事（材质不开 LIGHTING 就是纯 albedo），
+            // 只有编辑器命名空间这条判据会让它平白亮 1.08 倍（0.68 + 0.52·0.769）。
+            const dl = ppass0?.defaultlight;
             if (
-              ppass0?.defaultlight === true ||
-              isEditorAssetPath(model.puppet) ||
-              isEditorAssetPath(mdlObj.materialPath)
+              dl === true ||
+              (dl !== false && (isEditorAssetPath(model.puppet) || isEditorAssetPath(mdlObj.materialPath)))
             ) {
               (layer as any).defaultMeshLight = true;
             }
@@ -4130,11 +4134,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               // 很多（WE 自家的 2D 模型层/精灵），放宽会让它们按建模残留 z 重排层间遮挡。
               if (String(pass0?.depthtest ?? "").toLowerCase() === "enabled") (layer as any).depthMesh = true;
               // [we-scene patch 2026-10-09] 无灯场景的默认主光（见 DEFAULT_MESH_LIGHT），
-              // 判据口径与 puppet 分支一致。
+              // 判据口径与 puppet 分支一致；显式 `defaultlight: false` 同样是退出
+              // （平贴 2D 木偶，见 puppet 分支的注释）。
+              const dl0 = pass0?.defaultlight;
               if (
-                pass0?.defaultlight === true ||
-                isEditorAssetPath((layer as any).model) ||
-                isEditorAssetPath(mdlObj.materialPath)
+                dl0 === true ||
+                (dl0 !== false && (isEditorAssetPath((layer as any).model) || isEditorAssetPath(mdlObj.materialPath)))
               ) {
                 (layer as any).defaultMeshLight = true;
               }

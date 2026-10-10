@@ -14,15 +14,35 @@ export {
   mdlMeshMaterials,
   retargetMdlMaterial,
   mdlClips,
+  mdlBoneCount,
+  mdlBoneMeta,
+  setMdlBoneMeta,
+  mdlMeshCount,
+  mdlMeshInfo,
+  mdlMeshPositions,
+  mdlMeshIndices,
+  setMdlParts,
+  setMdlPositions,
+  setMdlVertexZ,
+  setMdlTopology,
+  mdlBones,
+  setMdlBoneNames,
+  setMdlSkeleton,
+  mdlSkin,
+  setMdlWeights,
+  setMdlBoneIdx,
   applyBoneDelta,
   boneDeltaWeights,
   CLIP_MODES,
   resampleTrack,
   addMdlClip,
   removeMdlClip,
+  clearMdlClips,
   setMdlClipMeta,
   setMdlClipEvents,
 } from "../editor/mdl-edit";
+// P2：骨架与权重的写侧类型（与上面那组函数同源，直接来自 mdl-edit）
+export type { MdlBoneInfo, MdlBoneSpec } from "../editor/mdl-edit";
 export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 // M12（B7）：相机路径（`scripts/camera_paths_*.json`）的只读体检 + clip 队列 / queuemode 读写。
 // 页面侧只准 import 本出口，不许直接碰 renderer/src/editor/ 下的实现。
@@ -72,5 +92,6 @@ export type {
   MdlBoneDelta,
   MdlClip,
   MdlClipInit,
+  MdlPart,
   MdlSpec,
 } from "./types";

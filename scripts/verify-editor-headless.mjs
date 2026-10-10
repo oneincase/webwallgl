@@ -779,14 +779,9 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await server.close();
 }
 
-/** 上半 top、下半 bottom 的 RGB PNG（无依赖编码：IHDR + 单块 IDAT + IEND） */
-export function stripePng(w, h, top, bottom) {
-  var stride = w * 3 + 1;
-  var raw = Buffer.alloc(stride * h);
-  for (let y = 0; y < h; y++) {
-    const c = y < h / 2 ? top : bottom;
-    for (let x = 0; x < w; x++) raw.set(c, y * stride + 1 + x * 3);
-  }
+/** RGB 行缓冲 → PNG（无依赖编码：IHDR + 单块 IDAT + IEND） */
+/** RGB 行缓冲 → PNG（无依赖编码：IHDR + 单块 IDAT + IEND）。AQ 段的「外圈纯色 + 内部棋盘格」夹具用它现编 */
+function rgbPng(w, h, raw) {
   var chunk = (type, data) => {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(data.length);
@@ -806,6 +801,17 @@ export function stripePng(w, h, top, bottom) {
     chunk("IDAT", zlib.deflateSync(raw)),
     chunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+/** 上半 top、下半 bottom 的 RGB PNG */
+export function stripePng(w, h, top, bottom) {
+  var stride = w * 3 + 1;
+  var raw = Buffer.alloc(stride * h);
+  for (let y = 0; y < h; y++) {
+    const c = y < h / 2 ? top : bottom;
+    for (let x = 0; x < w; x++) raw.set(c, y * stride + 1 + x * 3);
+  }
+  return rgbPng(w, h, raw);
 }
 
 /**
@@ -922,7 +928,6 @@ async function runCreateAndDraft(ctx) {
     await h.waitRemount(rc);
   };
 
-  // ════════════════════════════════════════════════════════════════════════
   section("Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）");
   if (hlState.dead) hlSkip("Q", "Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）"); else try {
   await gotoEditor();
@@ -930,6 +935,14 @@ async function runCreateAndDraft(ctx) {
   await clearLocalStore();
   await gotoEditor();
   check(!(await ev(`document.querySelector('#tb-new').disabled`)), "「新建」按钮可用");
+  // 中间空态的「新建项目」按钮（用户报过「点了没反应」）：真实点击会冒泡到 document 上「点到菜单外就关」的
+  // 监听，而 #empty-new 不在 #new-menu 里 —— 修法是先 stopPropagation 再 openNewMenu。这里用真点击锁住它。
+  var emptyBtn = await ev(`(() => { const b = document.querySelector('#empty-new'); return !!b && b.offsetParent !== null; })()`);
+  check(emptyBtn, "没有项目时中间是空态，「新建项目」按钮可见");
+  await clickSel("#empty-new");
+  check(await ev(`!document.querySelector('#new-menu').hidden`), "点空态「新建项目」真的弹出模板菜单（不再被 document 的关闭监听当场关掉）");
+  await ev(`document.body.click()`);
+  check(await ev(`document.querySelector('#new-menu').hidden`), "点菜单外面照旧收起（菜单自己的关闭语义没被改坏）");
   await clickSel("#tb-new");
   check(await ev(`!document.querySelector('#new-menu').hidden`), "点「新建」弹出模板菜单");
   check((await ev(`[...document.querySelectorAll('#new-res option')].map((o) => o.value)`)).join() === "1920x1080,2560x1440,3840x2160,1080x1920", "分辨率预设齐全");
@@ -3132,6 +3145,955 @@ async function runCreateAndDraft(ctx) {
   );
   check((await h.errorLines()).length === 0, "M10 插件槽位重绘 / 语言切换全程无错误");
   } catch (err) { await hlAbort("AN", "AN. M10 插件槽位：导出菜单重绘不清扫插件项", err); }
+
+/**
+ * AO. 操控变形（Puppet Warp，伪 Live2D）：图片层 → 转木偶 → 拖钉子形变 → 记录关键帧 → 烘焙 →
+ * 存库重开。判据全是 CDP 截图的真实像素 + 盘上 .mdl（用引擎自己的 mdl-parse 读回来）。
+ */
+async function warpE2E() {
+  section("AO. 操控变形端到端（图片层 → 转木偶 → 拖钉子 → 记录关键帧 → 烘焙 → 存库重开）");
+  if (hlState.dead) hlSkip("AO", "AO. 操控变形端到端（图片层 → 转木偶 → 拖钉子 → 记录关键帧 → 烘焙 → 存库重开）"); else try {
+  var parseMDL = (await imp("renderer/vendor/we-scene/render/mdl-parse.js")).parseMDL;
+  var aoPins = () => ev(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length`);
+  var aoDisabled = async (cls) => {
+    const r = await ev(`(() => { const b = document.querySelector('${cls}'); return b ? b.disabled : 'MISSING'; })()`);
+    if (r === "MISSING") throw new Error(`AO 探针：页面里没有 ${cls}（面板没到该状态）`);
+    return r;
+  };
+  /** 播放头回到 0：记录关键帧落在第 0 帧（重挂保持时刻，画面判据才确定） */
+  var aoSeek = (t) =>
+    ev(`(() => { const r = document.querySelector('#tl-range'); r.value = '${t}'; r.dispatchEvent(new Event('input', { bubbles: true })); r.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  /** 盘上「stripe」层的模型 json（+ 目录 / 场景对象） */
+  var aoDisk = (id) => {
+    const dir = path.join(lib, id);
+    const sc = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+    const obj = (sc.objects ?? []).find((o) => o.name === "stripe") ?? (sc.objects ?? [])[0];
+    return { dir, sc, obj, json: obj ? JSON.parse(fs.readFileSync(path.join(dir, String(obj.image)), "utf8")) : null };
+  };
+  /** 绑定姿势：模型 json 的 warp 布局 + 图片尺寸 ⇒ 钉 i（骨 i+1）的局部平移（原点在图片中心、Y 向上） */
+  var aoBindOf = (json, bone) => {
+    const p = json.warp.pins[bone - 1];
+    return [(p[0] - 0.5) * json.width, (0.5 - p[1]) * json.height];
+  };
+  /** 画布缩放：世界单位 → 屏幕 CSS 像素（编辑器按长边适配） */
+  var aoScale = (cr) => Math.max(cr.w / 1920, cr.h / 1080);
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  await addImage(stripePath);
+  var aoCr = await h.canvasRect();
+  // 400×200 的图居中（origin 960,540 / scale 1）⇒ 世界 760..1160 × 440..640，上半红下半蓝
+  var aoIn = worldToPage(aoCr, [960, 590]);
+  var aoLow = worldToPage(aoCr, [960, 490]);
+  var aoFar = worldToPage(aoCr, [300, 500]);
+  var aoLeft = worldToPage(aoCr, [700, 600]); // 左边缘外 60px
+  var aoLeftLow = worldToPage(aoCr, [700, 480]);
+  var aoRight = worldToPage(aoCr, [1210, 450]); // 右边缘外 50px
+  var cIn = await pixelAt(aoIn);
+  var cLow = await pixelAt(aoLow);
+  var cFar = await pixelAt(aoFar);
+  check(isRed(cIn) && isBlue(cLow) && close(cFar, BG_RGB, 10), `底图：上红下蓝、外面背景色（${cIn} / ${cLow} / ${cFar}）`);
+  check((await ev(`!!document.querySelector('.ed-warp .ed-warp-make')`)) === true, "普通图片层的检视器里就有「操控变形」分组（不用先收过 modelForm）");
+  check(close(await pixelAt(aoLeft), BG_RGB, 10) && close(await pixelAt(aoRight), BG_RGB, 10), "左右边缘外都还是背景色（形变判据的起点）");
+
+  // ── 转木偶：三件套落盘 + 改指向（origin / scale / 角度 / 尺寸照旧 ⇒ 画面逐像素不变） ──
+  var aoRc = await h.readyCount();
+  await clickSel(".ed-warp-make");
+  await h.waitRemount(aoRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 40000);
+  aoCr = await h.canvasRect();
+  var cIn2 = await pixelAt(aoIn);
+  var cLow2 = await pixelAt(aoLow);
+  var cFar2 = await pixelAt(aoFar);
+  check(close(cIn2, cIn, 8) && close(cLow2, cLow, 8) && close(cFar2, cFar, 8), `转木偶后画面逐像素不变（上 ${cIn}→${cIn2} / 下 ${cLow}→${cLow2} / 外 ${cFar}→${cFar2}）`);
+  check((await aoPins()) === 9, "默认 3×3 = 9 根钉子，转换后自动进入操控变形");
+  check(/操控变形|Puppet Warp/.test(await ev(`document.querySelector('.ed-warp .ed-insp-title').textContent`)), "分组标题本地化");
+  check((await aoDisabled(".ed-warp-record")) === true && (await aoDisabled(".ed-warp-bake")) === true, "还没拖过钉子：记录关键帧 / 烘焙都点不动");
+
+  // ── 撤销 / 重做转换：图层形态来回切，分组跟着切 ──
+  aoRc = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(aoRc);
+  check((await ev(`!!document.querySelector('.ed-warp .ed-warp-make')`)) === true && (await aoPins()) === 0 && close(await pixelAt(aoIn), cIn, 8),
+    "撤销转换：层回到普通图片（分组回到「转为木偶」、钉子清空），画面照旧");
+  aoRc = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(aoRc);
+  await waitFor(`!!document.querySelector('.ed-warp .ed-warp-open')`, 40000);
+  check((await ev(`!!document.querySelector('.ed-warp .ed-warp-open')`)) === true, "重做转换：层又是操控变形木偶（重挂后停在「进入操控变形」）");
+  await clickSel(".ed-warp-open");
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 40000);
+  check((await aoPins()) === 9, "点「进入操控变形」：9 根钉子回来");
+
+  // ── 网格密度：重建骨架（顶点按偏移场重采样，形变 / 画面都不该跳） ──
+  aoRc = await h.readyCount();
+  await ev(`(() => { const s = document.querySelector('#ed-inspector .ed-warp-grid'); s.value = '24'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await h.waitRemount(aoRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 40000);
+  check((await ev(`document.querySelector('#ed-inspector .ed-warp-grid').value`)) === "24" && (await aoPins()) === 9, "改网格密度：重建骨架后密度写回、仍停在操控变形");
+  aoCr = await h.canvasRect();
+  check(close(await pixelAt(aoIn), cIn, 10) && close(await pixelAt(aoLow), cLow, 10), "重建网格后画面仍逐像素不变（顶点只是重采样）");
+
+  // ── 拖左上角钉子：把图往左拉出去（IDW：近处跟着走，远处不动） ──
+  var aoPin0 = worldToPage(aoCr, [760, 640]);
+  await drag(aoPin0, [aoPin0[0] - 70, aoPin0[1]]);
+  var cLeft = await pixelAt(aoLeft);
+  check(isRed(cLeft), `拖左上角钉子向左：图片被拉过去盖住那块（${cLeft}）`);
+  check(isBlue(await pixelAt(aoLow)) && close(await pixelAt(aoFar), BG_RGB, 10) && close(await pixelAt(aoLeftLow), BG_RGB, 10),
+    "同一时刻：图内下半 / 远处 / 左下都不动（钉子只带近处，衰减是局部的）");
+  check((await aoDisabled(".ed-warp-record")) === false, "拖过钉子后「记录关键帧」可点");
+
+  // ── 记录关键帧：写进 .mdl 轨道 → 重挂后自动回到操控变形，画面仍是形变后的样子 ──
+  await aoSeek(0);
+  await waitFor(`document.querySelector('#tl-time').textContent === '0.00s'`, 20000);
+  aoRc = await h.readyCount();
+  await clickSel(".ed-warp-record");
+  await h.waitRemount(aoRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
+  check(close(await pixelAt(aoLeft), cLeft, 20), "记录关键帧后画面照旧（姿势进了 .mdl 轨道，不是只在内存里）");
+  check((await aoDisabled(".ed-warp-record")) === true, "记录后未记录的位移清零（要再拖一次才可再记）");
+
+  // ── 盘上产物：模型 json 的 warp 布局 / .mdl 骨架与轨道 / 源图归属 ──
+  var aoId1 = await saveLoose();
+  var aoD1 = aoDisk(aoId1);
+  check(
+    aoD1.json?.warp?.v === 1 && aoD1.json.warp.pins.length === 9 && aoD1.json.warp.cols === 24 && aoD1.json.warp.rows === 12 && aoD1.json.warp.power === 4,
+    `盘上模型 json 记着钉子布局（${JSON.stringify(aoD1.json?.warp)}）`,
+  );
+  check(typeof aoD1.json.puppet === "string" && fs.existsSync(path.join(aoD1.dir, aoD1.json.puppet)), "模型 json 指向 .mdl（puppet 三件套齐全）");
+  check(Buffer.compare(fs.readFileSync(path.join(aoD1.dir, "materials/editor/stripe.png")), fs.readFileSync(stripePath)) === 0,
+    "源图仍是逐字节原图（换了指向后靠 assets.share 跟着新木偶留下，没成孤儿）");
+  var aoM1 = parseMDL(new Uint8Array(fs.readFileSync(path.join(aoD1.dir, aoD1.json.puppet))));
+  check(aoM1.bones.length === 10 && aoM1.bones[0].parent === -1 && aoM1.bones.slice(1).every((b) => b.parent === 0),
+    `骨架 = 根骨 + 9 根钉骨（${aoM1.bones.length} 根，钉骨都挂在根骨下）`);
+  var aoAn1 = aoM1.animations[0];
+  // 轨道是**绝对骨局部 TRS**：没拖过的帧 / 骨都等于绑定姿势（不是 0），所以要拿绑定姿势当基线
+  var aoB1 = aoBindOf(aoD1.json, 1);
+  var aoB9 = aoBindOf(aoD1.json, 9);
+  var aoFrames = [];
+  for (let f = 0; f <= aoAn1.frameCount; f++) {
+    const o = f * 9;
+    if (Math.abs(aoAn1.tracks[1].keyframes[o] - aoB1[0]) > 1 || Math.abs(aoAn1.tracks[1].keyframes[o + 1] - aoB1[1]) > 1) aoFrames.push(f);
+  }
+  check(aoAn1.name === "warp" && aoAn1.fps === 30 && aoAn1.frameCount === 30 && aoAn1.tracks.length === 10,
+    `片段「${aoAn1.name}」：fps ${aoAn1.fps} / ${aoAn1.frameCount + 1} 帧 / 每根骨一条轨道`);
+  // loop 片段记账时会保持首末一致：记录落在播放头那帧，收尾帧跟着写成同一个值，其它帧一律不动
+  check(
+    aoFrames.includes(0) &&
+      aoFrames.every((f) => f === 0 || f === aoAn1.frameCount) &&
+      Math.abs(aoAn1.tracks[1].keyframes[aoAn1.frameCount * 9] - aoAn1.tracks[1].keyframes[0]) < 1e-4 &&
+      Math.abs(aoAn1.tracks[1].keyframes[9] - aoB1[0]) < 1e-4,
+    `记录只落在播放头那帧（第 ${aoFrames.join(",")} 帧，位移 ${(aoAn1.tracks[1].keyframes[0] - aoB1[0]).toFixed(1)},${(aoAn1.tracks[1].keyframes[1] - aoB1[1]).toFixed(1)} px；收尾帧按 loop 保持首末一致，中间帧不动）`,
+  );
+  var aoK1 = aoScale(aoCr);
+  check(
+    Math.abs(aoAn1.tracks[1].keyframes[0] - aoB1[0] + 70 / aoK1) < 8 && Math.abs(aoAn1.tracks[1].keyframes[1] - aoB1[1]) < 1,
+    `记录的位移 = 屏幕拖了 70px ÷ 画布缩放 ${aoK1.toFixed(3)}（${(aoAn1.tracks[1].keyframes[0] - aoB1[0]).toFixed(1)} px，只有 x 分量）`,
+  );
+  check(close([aoAn1.tracks[9].keyframes[0], aoAn1.tracks[9].keyframes[1]], aoB9, 1e-3), "没拖过的钉骨轨道仍是绑定姿势（不写无关位移）");
+
+  // ── 烘焙：把当前预览位移吃进顶点，画面不跳、轨道不动 ──
+  var aoPin8 = worldToPage(aoCr, [1160, 440]);
+  await drag(aoPin8, [aoPin8[0] + 70, aoPin8[1]]);
+  var cRight = await pixelAt(aoRight);
+  check(isBlue(cRight), `拖右下角钉子向右：图片被拉出去（${cRight}）`);
+  aoRc = await h.readyCount();
+  await clickSel(".ed-warp-bake");
+  await h.waitRemount(aoRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
+  check(close(await pixelAt(aoRight), cRight, 20), "烘焙后画面不跳（形变从预览换成顶点，看到的还是同一个形状）");
+  check((await aoDisabled(".ed-warp-record")) === true, "烘焙后没有未记录的位移");
+  check(close(await pixelAt(aoLeft), cLeft, 40), "先前记录的那一帧也还在（烘焙只吃预览位移，不动轨道）");
+  var aoId2 = await saveLoose();
+  var aoD2 = aoDisk(aoId2);
+  check(!!aoD2.json && String(aoD2.obj.image) !== String(aoD1.obj.image), `烘焙写了新的模型副本（${aoD2.obj.image}）`);
+  var aoM2 = parseMDL(new Uint8Array(fs.readFileSync(path.join(aoD2.dir, aoD2.json.puppet))));
+  check(aoM2.bounds.maxX > aoM1.bounds.maxX + 10, `顶点真被拉出去了（maxX ${aoM1.bounds.maxX.toFixed(1)} → ${aoM2.bounds.maxX.toFixed(1)}）`);
+  var aoB9b = aoBindOf(aoD2.json, 9);
+  var aoB1b = aoBindOf(aoD2.json, 1);
+  check(close([aoM2.animations[0].tracks[9].keyframes[0], aoM2.animations[0].tracks[9].keyframes[1]], aoB9b, 1e-3),
+    "烘焙不写轨道：第 9 根钉骨仍是绑定姿势（位移全在顶点里）");
+  var aoKeep = [aoM2.animations[0].tracks[1].keyframes[0] - aoB1b[0], aoM2.animations[0].tracks[1].keyframes[1] - aoB1b[1]];
+  check(
+    aoKeep[0] > -180 && aoKeep[0] < -160 && Math.abs(aoKeep[1]) < 1,
+    `烘焙重建 .mdl 时把已记录的关键帧原样带走（第 0 帧位移 ${aoKeep[0].toFixed(1)},${aoKeep[1].toFixed(1)} px）`,
+  );
+  check(aoD2.json.warp?.pins.length === 9 && aoD2.json.warp.cols === 24, "烘焙后的模型 json 照旧带着钉子布局（接着调）");
+  check(Buffer.compare(fs.readFileSync(path.join(aoD2.dir, "materials/editor/stripe.png")), fs.readFileSync(stripePath)) === 0, "新副本也把源图带在名下");
+
+  // ── 存库重开：形变与钉子布局都要回来，而且还能接着编辑 ──
+  await reopen(aoId2);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('.ed-warp .ed-warp-open')`, 40000);
+  aoCr = await h.canvasRect();
+  var cRight3 = await pixelAt(aoRight);
+  var cLeft3 = await pixelAt(aoLeft);
+  check(isBlue(cRight3) && isRed(cLeft3), `重开后烘焙过的形变还在（右 ${cRight3} / 左 ${cLeft3}）`);
+  check((await ev(`!!document.querySelector('.ed-warp .ed-warp-open')`)) === true, "重开后仍是操控变形木偶（warp 布局从模型 json 读回来）");
+  await clickSel(".ed-warp-open");
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 40000);
+  check((await aoPins()) === 9, "重开后能再次进入操控变形，9 根钉子都在");
+  var aoPin8b = worldToPage(aoCr, [1160, 440]);
+  await drag(aoPin8b, [aoPin8b[0] + 40, aoPin8b[1]]);
+  check((await aoDisabled(".ed-warp-record")) === false, "重开后拖钉子照常预览 / 记录（还能接着调）");
+
+  // ── 竖直向下拖钉子：屏幕向下 = 模型 −Y（横向拖测不出 y 轴符号） ──
+  var aoPin6 = worldToPage(aoCr, [760, 440]); // 左下角钉子（pin 6：u=0, v=1）
+  var aoK3 = aoScale(aoCr);
+  await drag(aoPin6, [aoPin6[0], aoPin6[1] + 40]);
+  aoRc = await h.readyCount();
+  await clickSel(".ed-warp-record");
+  await h.waitRemount(aoRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
+  var aoId3 = await saveLoose();
+  var aoD3 = aoDisk(aoId3);
+  var aoM3 = parseMDL(new Uint8Array(fs.readFileSync(path.join(aoD3.dir, aoD3.json.puppet))));
+  var aoB7 = aoBindOf(aoD3.json, 7);
+  var aoDx7 = aoM3.animations[0].tracks[7].keyframes[0] - aoB7[0];
+  var aoDy7 = aoM3.animations[0].tracks[7].keyframes[1] - aoB7[1];
+  check(
+    aoDy7 < -20 && Math.abs(aoDx7) < 8 && Math.abs(aoDy7 + 40 / aoK3) < 12,
+    `竖直拖钉子：屏幕向下 40px = 模型 −Y（Δ ${aoDx7.toFixed(1)},${aoDy7.toFixed(1)}，期望 ≈ 0,−${(40 / aoK3).toFixed(1)}）`,
+  );
+  check(
+    Math.abs(aoD3.json.width - 400) < 1e-6 && Math.abs(aoD3.json.height - 200) < 1e-6,
+    "烘焙过的模型 json 仍记着图片尺寸（绑定姿势基线的来源）",
+  );
+
+  var aoErrs = await h.errorLines();
+  check(aoErrs.length === 0, `操控变形全程控制台无错误${aoErrs.length ? `：${aoErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AO", "AO. 操控变形端到端（图片层 → 转木偶 → 拖钉子 → 记录关键帧 → 烘焙 → 存库重开）", err); }
+}
+
+await warpE2E();
+
+/**
+ * AP. 几何与角色表（P1）：网格生成 / 细分 / Padding / 切片 / 拓扑 / Lock / 自动抠图 / 涂抹 / 应用部件 / 重开。
+ * 判据 = CDP 截图的真实像素（叠加层线框、角色表视图）+ 盘上 .mdl（引擎自己的 mdl-parse 读回）。
+ */
+async function geomE2E() {
+  var apName = "AP. 几何与角色表（P1：网格 → 细分 → Padding → 切片 → 拓扑 → 抠图 → 应用部件 → 重开）";
+  section(apName);
+  if (hlState.dead) hlSkip("AP", apName); else try {
+  var parseMDL = (await imp("renderer/vendor/we-scene/render/mdl-parse.js")).parseMDL;
+  /** 盘上「stripe」层的模型 json（+ 目录 / 场景对象），与 AO 段同法 */
+  var apDisk = (id) => {
+    const dir = path.join(lib, id);
+    const sc = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+    const obj = (sc.objects ?? []).find((o) => o.name === "stripe") ?? (sc.objects ?? [])[0];
+    return { dir, sc, obj, json: obj ? JSON.parse(fs.readFileSync(path.join(dir, String(obj.image)), "utf8")) : null };
+  };
+  var apMdl = (d) => parseMDL(new Uint8Array(fs.readFileSync(path.join(d.dir, d.json.puppet))));
+  var apEl = (sel) => `document.querySelector('#ed-inspector ${sel}')`;
+  var apHas = async (sel) => (await ev(`!!document.querySelector('${sel}')`)) === true;
+  var apVal = (sel) => ev(`(() => { const el = ${apEl(sel)}; return el ? String(el.value) : null; })()`);
+  var apSet = (sel, v) => ev(`(() => { const el = ${apEl(sel)}; if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var apToggle = (sel, on) => ev(`(() => { const el = ${apEl(sel)}; if (!el) return false; el.checked = ${on ? "true" : "false"}; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var apPick = (sel, v) => ev(`(() => { const el = ${apEl(sel)}; if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var apDiff = (a, b) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+  /** #ed-overlay 叠加层画布上该页面坐标附近 n×n 里 alpha 最大的像素（1px 细线用 4×4 合成均值会被稀释掉；格内判据用 n=1） */
+  var apOverlay = (pt, n = 5) => ev(`(() => {
+    const cv = document.querySelector('#ed-overlay');
+    const r = cv.getBoundingClientRect();
+    const k = cv.width / r.width;
+    const x = Math.round((${pt[0]} - r.left) * k);
+    const y = Math.round((${pt[1]} - r.top) * k);
+    const h = ${n} >> 1;
+    const d = cv.getContext('2d').getImageData(x - h, y - h, ${n}, ${n}).data;
+    let best = [0, 0, 0, 0];
+    for (let i = 0; i < d.length; i += 4) if (d[i + 3] > best[3]) best = [d[i], d[i + 1], d[i + 2], d[i + 3]];
+    return best;
+  })()`);
+  var apPins = () => waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
+  /** 第一块 limb 的掩码像素数（行文本是「名字 · 像素数」） */
+  var apLimbPx = () => ev(`(() => { const el = document.querySelectorAll('.ed-sheet-limbs .ed-fx-name')[0]; if (!el) return -1; return Number(String(el.textContent).split('·').pop().trim()); })()`);
+  /** 当前选中（`.is-on`）那块 limb 的掩码像素数 */
+  var apActivePx = () => ev(`(() => { const el = document.querySelector('.ed-sheet-limbs .ed-sheet-limb.is-on .ed-fx-name'); if (!el) return -1; return Number(String(el.textContent).split('·').pop().trim()); })()`);
+  /** 检视器改一个值 → 等写盘重挂（warpEnter 会按新几何重建会话） */
+  var apEdit = async (sel, v) => {
+    const rc = await h.readyCount();
+    if (!(await apSet(sel, v))) throw new Error(`AP 探针：检视器里没有 ${sel}`);
+    await h.waitRemount(rc);
+    await apPins();
+    return h.canvasRect();
+  };
+  var apToggleEdit = async (sel, on) => {
+    const rc = await h.readyCount();
+    if (!(await apToggle(sel, on))) throw new Error(`AP 探针：检视器里没有 ${sel}`);
+    await h.waitRemount(rc);
+    await apPins();
+    return h.canvasRect();
+  };
+  /** 画布上点一下（切片待命 / 翻格子）→ 等写盘重挂 */
+  var apStageWrite = async (pt) => {
+    const rc = await h.readyCount();
+    await click(pt);
+    await h.waitRemount(rc);
+    await apPins();
+    return h.canvasRect();
+  };
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  await addImage(stripePath);
+  var apRc = await h.readyCount();
+  await clickSel(".ed-warp-make");
+  await h.waitRemount(apRc);
+  await apPins();
+  var apCr = await h.canvasRect();
+
+  // ── 面板与默认密度：400×200 的图，默认基础网格 = 长边 32 格（12.5px 格） ──
+  check((await apHas(".ed-geom .ed-geom-view")) && (await apHas(".ed-sheet .ed-sheet-load")), "转木偶后几何 / 角色表两个分组都出现（P1）");
+  check(/几何|Geometry/.test(await ev(`document.querySelector('.ed-geom .ed-insp-title').textContent`)), "几何分组标题本地化");
+  check(/角色表|Character Sheet/.test(await ev(`document.querySelector('.ed-sheet .ed-insp-title').textContent`)), "角色表分组标题本地化");
+  var apCols0 = await apVal(".ed-geom-cols");
+  var apRows0 = await apVal(".ed-geom-rows");
+  check(apCols0 === "32" && apRows0 === "16", `默认基础网格 = 长边 32 格（${apCols0}×${apRows0}）`);
+
+  // ── 显示网格：叠加层画布上网格线是暗线；黄色只留给手动切片（细线按叠加层 alpha 判，4×4 合成均值太稀） ──
+  var apNode = worldToPage(apCr, [960, 590]); // 12.5px 格的交点（格子边界，且离最近的钉子 50px）
+  var apCell = worldToPage(apCr, [966.25, 596.25]); // 格内（离最近的线 6.25 世界 px）
+  var apCut = worldToPage(apCr, [840, 596.25]); // 之后要切的那一刀的位置（20%），y 取格内、避开暗线
+  check((await apOverlay(apNode))[3] === 0, "还没开「显示网格」：叠加层上没有线");
+  var apCrV0 = apCr;
+  await clickSel(".ed-geom-view");
+  await waitFor(`document.querySelector('#ed-inspector .ed-geom-view').dataset.et === 'geo.viewOn'`, 20000);
+  var apCrV1 = await h.canvasRect();
+  check(apCrV0.x === apCrV1.x && apCrV0.y === apCrV1.y && apCrV0.w === apCrV1.w && apCrV0.h === apCrV1.h,
+    `开「显示网格」不动画布布局（${JSON.stringify(apCrV0)} → ${JSON.stringify(apCrV1)}）`);
+  var oLine = await apOverlay(apNode);
+  check(oLine[3] > 30 && oLine[0] < 60 && oLine[1] < 60, `开「显示网格」：网格线是暗线（叠加层像素 ${oLine}）`);
+  var oCell = await apOverlay(apCell, 1);
+  check(oCell[3] < 30, `开「显示网格」：格内不画线（格心叠加层像素 ${oCell}）`);
+  // n=1：32×16 的格子在页面上只有 5.1 CSS px、格心离最近的线才 2.55 px，n=5 的窗口会罩到暗线
+  var oNoSlice = await apOverlay(apCut, 1);
+  check(oNoSlice[3] === 0, `基础网格的切线（32×16 格共 45 条）不画黄线，只有手动切片才黄（切点像素 ${oNoSlice}）`);
+
+  // ── 细分 2：32×16 → 64×32 格（65×33 顶点 / 64×32×6 索引） ──
+  apCr = await apEdit(".ed-geom-sub", 2);
+  check((await apVal(".ed-geom-cols")) === "32" && (await apVal(".ed-geom-sub")) === "2", "细分写回面板：基础格数不变、每格再切 2");
+  var apIdA = await saveLoose();
+  var dA = apDisk(apIdA);
+  var mA = apMdl(dA);
+  check(mA.vertexCount === 2145 && mA.indexCount === 64 * 32 * 6, `细分 2 进了 .mdl：${mA.vertexCount} 顶点 / ${mA.indexCount} 索引（期望 2145 / ${64 * 32 * 6}）`);
+  check(
+    dA.json?.puppetWarp?.geometry?.subdivision === 2 &&
+      dA.json.puppetWarp.geometry.cols === 32 && dA.json.puppetWarp.geometry.rows === 16 &&
+      dA.json.puppetWarp.warp.v === 1 && dA.json.puppetWarp.warp.cols <= 48 && dA.json.puppetWarp.warp.rows <= 48,
+    `盘上记着细分与基础密度（sub ${dA.json?.puppetWarp?.geometry?.subdivision} / 基础 ${dA.json?.puppetWarp?.geometry?.cols}×${dA.json?.puppetWarp?.geometry?.rows}；v1 钉子布局 cols ${dA.json?.puppetWarp?.warp?.cols}×${dA.json?.puppetWarp?.warp?.rows} 留在 48 以内，细分后的 64×32 只由 geometry 表达）`,
+  );
+
+  // ── Padding 40：网格轮廓四边外扩 40px、UV 出界；模型尺寸与 cropoffset 都不动 ──
+  apCr = await apEdit(".ed-geom-pad", 40);
+  var dB = apDisk(await saveLoose());
+  var mB = apMdl(dB);
+  check(
+    Math.abs(mB.bounds.minX + 240) < 1.5 && Math.abs(mB.bounds.maxX - 240) < 1.5 && Math.abs(mB.bounds.minY + 140) < 1.5 && Math.abs(mB.bounds.maxY - 140) < 1.5,
+    `Padding 40：网格外扩到 x ${mB.bounds.minX.toFixed(1)}..${mB.bounds.maxX.toFixed(1)} / y ${mB.bounds.minY.toFixed(1)}..${mB.bounds.maxY.toFixed(1)}（期望 ±240 / ±140）`,
+  );
+  var apU0 = 1;
+  var apU1 = 0;
+  for (let i = 0; i < mB.uvs.length; i += 2) {
+    if (mB.uvs[i] < apU0) apU0 = mB.uvs[i];
+    if (mB.uvs[i] > apU1) apU1 = mB.uvs[i];
+  }
+  check(apU0 < -0.05 && apU1 > 1.05, `Padding 把 UV 拉到图外（${apU0.toFixed(3)}..${apU1.toFixed(3)}，出界靠 clamp 重复边缘）`);
+  check(dB.json.width === 400 && dB.json.height === 200 && !("cropoffset" in dB.json), "Padding 只动网格：模型 width / height 不变、不新增 cropoffset（cropoffset 语义未定，P1 不碰）");
+
+  // ── 切片：点「加纵向切片」（按钮亮起待命）再点画布 20% 处 ──
+  await clickSel(".ed-geom-slice-x");
+  check((await ev(`document.querySelector('#ed-inspector .ed-geom-slice-x').classList.contains('is-arm')`)) === true, "「加纵向切片」进入待命态（按钮高亮）");
+  apCr = await apStageWrite(worldToPage(apCr, [840, 590])); // 图内 x=80 → 20%
+  var dC = apDisk(await saveLoose());
+  var mC = apMdl(dC);
+  var apSl = dC.json?.puppetWarp?.geometry?.sliceX ?? [];
+  check(apSl.length === 1 && Math.abs(apSl[0] - 0.2) < 0.01, `切在 20% 处：盘上 geometry.sliceX = ${JSON.stringify(apSl)}`);
+  check(mC.vertexCount > mA.vertexCount, `切片给基础网格多切了一刀（顶点 ${mA.vertexCount} → ${mC.vertexCount}）`);
+  // 几何组里有两个 note：上面是网格摘要，下面是切片计数
+  check(/纵向 1 条|1 vertical/.test(await ev(`document.querySelectorAll('#ed-inspector .ed-geom .ed-note')[1].textContent`)), "面板切片计数 = 1（基础网格的细分不算切片）");
+  check((await ev(`document.querySelector('#ed-inspector .ed-geom-slice-x').classList.contains('is-arm')`)) === false, "落刀后解除待命态（不会一直吃掉下一次点击）");
+  apCut = worldToPage(apCr, [840, 590]); // 重挂后面布框可能变，重新算页面坐标（切在竖直线上，可能压在暗线之上）
+  var oSlice = await apOverlay(apCut);
+  check(oSlice[3] > 80 && oSlice[0] > 120 && oSlice[0] > oSlice[2] + 60 && oSlice[1] > oSlice[2],
+    `切片线画在 20% 处（叠加层像素 ${oSlice}，黄色；暗线是 0,0,0,67 不会误判）`);
+
+  // ── Edit Topology：点一格翻对角线 ──
+  await clickSel(".ed-geom-topo");
+  check((await ev(`document.querySelector('#ed-inspector .ed-geom-topo').dataset.et`)) === "geo.topoOn", "「编辑拓扑」进入翻转态");
+  apCr = await apStageWrite(worldToPage(apCr, [966.25, 596.25]));
+  var dD = apDisk(await saveLoose());
+  var apFlips = dD.json?.puppetWarp?.geometry?.topology?.flips ?? [];
+  check(apFlips.length === 1, `点一格：盘上 topology.flips = ${JSON.stringify(apFlips)}`);
+  await clickSel(".ed-geom-topo");
+
+  // ── Lock geometry ──
+  apCr = await apToggleEdit(".ed-geom-lock", true);
+  var dE = apDisk(await saveLoose());
+  check(dE.json?.puppetWarp?.geometry?.locked === true, "Lock geometry 落盘（puppetWarp.geometry.locked = true）");
+
+  // ── 角色表：载入原图 → 自动抠图 ──
+  check((await ev(`!!document.querySelector('#ed-inspector .ed-sheet-load') && document.querySelector('#ed-inspector .ed-sheet-load').disabled === false`)) === true,
+    "角色表：载入按钮可用（层没被锁）");
+  var apTexRow = await ev(`(() => { const g = [...document.querySelectorAll('#ed-inspector .ed-insp-group')].find((d) => /贴图|Texture/.test(d.querySelector('.ed-insp-title')?.textContent || '')); return g ? g.innerText.replace(/\\n/g, ' / ') : '(没有贴图分组)'; })()`);
+  await clickSel(".ed-sheet-load");
+  var apSheetOk = await waitFor(`!!document.querySelector('.ed-sheet .ed-sheet-auto')`, 30000).then(() => true, () => false);
+  if (!apSheetOk) {
+    var apLogTail = await ev(`[...document.querySelectorAll('#ed-con-body > div')].slice(-5).map((d) => d.textContent).join(' ⏎ ')`);
+    var apErrsNow = await h.errorLines();
+    check(false, `角色表载入没成：贴图槽「${apTexRow}」/ 日志「${apLogTail}」/ 页面错误 ${JSON.stringify(apErrsNow)}`);
+  }
+  var apThr = Number(await apVal(".ed-sheet-threshold"));
+  check((await apHas("#ed-inspector .ed-sheet-threshold")) && Number.isFinite(apThr) && apThr >= 0 && apThr <= 255, `角色表载入原图 400×200（阈值 ${apThr} / 质量 ${await apVal(".ed-sheet-quality")}）`);
+  check((await ev(`document.querySelectorAll('.ed-sheet-limbs .ed-fx-item').length`)) === 0, "还没抠图：limb 列表是空的");
+  await clickSel(".ed-sheet-auto");
+  await waitFor(`document.querySelectorAll('.ed-sheet-limbs .ed-fx-item').length >= 1`, 30000);
+  var apNLimb = await ev(`document.querySelectorAll('.ed-sheet-limbs .ed-fx-item').length`);
+  var apSw = String(await ev(`getComputedStyle(document.querySelector('.ed-sheet-sw')).backgroundColor`));
+  var AP_PALETTE = ["rgb(255, 96, 96)", "rgb(96, 220, 96)", "rgb(96, 160, 255)", "rgb(255, 208, 64)", "rgb(224, 96, 255)", "rgb(64, 232, 224)", "rgb(255, 152, 48)", "rgb(160, 160, 160)"];
+  var AP_RGB = [[255, 96, 96], [96, 220, 96], [96, 160, 255], [255, 208, 64], [224, 96, 255], [64, 232, 224], [255, 152, 48], [160, 160, 160]];
+  /** 叠加层是 globalAlpha 0.85 画的 ⇒ 期望像素 = 0.85×调色板色 + 0.15×底图色 */
+  var apTint = (base) => AP_RGB.map((c) => c.map((v, i) => 0.85 * v + 0.15 * base[i]));
+  var apNear = (px, list) => list.some((c) => c.every((v, i) => Math.abs(px[i] - v) <= 14));
+  check(apNLimb >= 1 && AP_PALETTE.includes(apSw), `自动抠图：${apNLimb} 块 limb，色块取调色板色（${apSw}）`);
+  check((await ev(`!!document.querySelector('.ed-sheet .ed-sheet-apply')`)) === true, "抠图后「应用部件」「上移 / 下移」都出现");
+
+  // ── View：前景视图把 limb 涂成调色板色（红 / 蓝两半至少一半变色；取样点避开中间的分界线） ──
+  var apRed = worldToPage(apCr, [940, 590]);
+  var apBlue = worldToPage(apCr, [980, 490]);
+  // 载入原图成功后编辑器自己就进了角色表视图（`.ed-sheet-load` 里 `geomMode = "sheet"`）⇒ 先关掉取「覆盖前」像素，再开回来
+  var apViewEt = await ev(`document.querySelector('#ed-inspector .ed-sheet-view').dataset.et`);
+  check(apViewEt === "sheet.viewOn", `载入原图后自动进入角色表视图（按钮态 ${apViewEt}）`);
+  await clickSel(".ed-sheet-view");
+  await waitFor(`document.querySelector('#ed-inspector .ed-sheet-view').dataset.et === 'sheet.viewBtn'`, 20000);
+  var vR0 = await pixelAt(apRed);
+  var vB0 = await pixelAt(apBlue);
+  await clickSel(".ed-sheet-view");
+  await waitFor(`document.querySelector('#ed-inspector .ed-sheet-view').dataset.et === 'sheet.viewOn'`, 20000);
+  var vR1 = await pixelAt(apRed);
+  var vB1 = await pixelAt(apBlue);
+  var apRedOn = apDiff(vR0, vR1) > 30;
+  var apBlueOn = apDiff(vB0, vB1) > 30;
+  // 这张 fixture 上「红」是边框主色 ⇒ 被当成背景，「蓝」那半才是 limb ⇒ 恰好一半（前景那半）叠上调色板色。
+  // 判据按「哪半盖住了」而不是写死蓝半：哪一半被当背景由 dominantBorderColor 的量化桶决定
+  var apTintHit = (a, b) => apDiff(a, b) > 30 && apNear(b, apTint(a));
+  check(apTintHit(vR0, vR1) !== apTintHit(vB0, vB1),
+    `开角色表视图：恰好前景那半叠上调色板色（红半 ${vR0}→${vR1} / 蓝半 ${vB0}→${vB1}）`);
+
+  // ── 画笔涂 limb（Mask 开）：新加一块空 limb（`.ed-sheet-add` 自动选中它）⇒ 涂哪里都会让它像素数变多 ──
+  var apPaint = [940, 590];
+  await clickSel(".ed-sheet-add");
+  await apToggle(".ed-sheet-mask", true);
+  var apPx0 = await apActivePx();
+  await drag(worldToPage(apCr, [apPaint[0] - 30, apPaint[1]]), worldToPage(apCr, [apPaint[0] + 30, apPaint[1]]));
+  var apPx1 = await apActivePx();
+  check(apPx0 === 0 && apPx1 > 100, `画笔涂 limb（Mask 开）：新空 limb 的掩码像素 ${apPx0} → ${apPx1}`);
+
+  // ── 画笔标背景（Mask 关）+ 背景视图：那一块被涂成白色（Mark Background；叠加层是 85% 不透明度） ──
+  await apToggle(".ed-sheet-mask", false);
+  await apPick(".ed-sheet-viewsel", "background");
+  await drag(worldToPage(apCr, [apPaint[0] - 30, apPaint[1]]), worldToPage(apCr, [apPaint[0] + 30, apPaint[1]]));
+  var apBg = await pixelAt(worldToPage(apCr, apPaint));
+  check(apBg[0] > 200 && apBg[1] > 150 && apBg[2] > 180, `Mask 关 + 背景视图：涂过的那块是背景白（像素 ${apBg}）`);
+
+  // ── 应用部件：三角形按 limb 重排进 .mdl，画面不变 ──
+  await apPick(".ed-sheet-viewsel", "foreground");
+  await clickSel(".ed-sheet-view"); // 关掉角色表叠加层，之后按真实渲染比像素
+  var apRealR = await pixelAt(apRed);
+  var apRealB = await pixelAt(apBlue);
+  // 应用前的那份盘上索引（不能用更早读到的 mC：中途还翻过格子，翻转会改变每个顶点出现的次数）
+  var mPre = apMdl(apDisk(await saveLoose()));
+  var apIdxBefore = Array.from(mPre.indices);
+  var apRcApply = await h.readyCount();
+  await clickSel(".ed-sheet-apply");
+  await h.waitRemount(apRcApply);
+  await apPins();
+  apCr = await h.canvasRect();
+  check(apDiff(await pixelAt(apRed), apRealR) <= 8 && apDiff(await pixelAt(apBlue), apRealB) <= 8, "应用部件后画面逐像素不变（只重排三角形）");
+  var dF = apDisk(await saveLoose());
+  var mF = apMdl(dF);
+  check(mF.indexCount === mPre.indexCount, `应用部件不增删索引（${mPre.indexCount} → ${mF.indexCount}）`);
+  /** 三角形集合（每个三角形的三个下标排序后归一，再整体排序）——重排不该改变它 */
+  var apTris = (idx) => {
+    const t = [];
+    for (let i = 0; i + 2 < idx.length; i += 3) t.push([idx[i], idx[i + 1], idx[i + 2]].sort((a, b) => a - b).join("_"));
+    return t.sort().join("|");
+  };
+  check(apTris(Array.from(mF.indices)) === apTris(apIdxBefore), "应用部件只重排三角形（三角形集合逐项相同）");
+  var apParts = mF.parts ?? [];
+  var apCovered = apParts.reduce((s, p) => s + p.size, 0);
+  check(
+    apParts.length >= 1 && apCovered === mF.indexCount && apParts[0].start === 0 && apParts.every((p, i) => i === 0 || p.start === apParts[i - 1].start + apParts[i - 1].size),
+    `盘上部件表首尾相接且恰好铺满索引表（${apParts.length} 块：${apParts.map((p) => `${p.id}@${p.start}+${p.size}`).join(" ")}）`,
+  );
+  check(dF.json?.puppetWarp?.limbs?.count >= 1, `盘上模型 json 记着角色表分割（limbs.count = ${dF.json?.puppetWarp?.limbs?.count}）`);
+  check(Buffer.compare(fs.readFileSync(path.join(dF.dir, "materials/editor/stripe.png")), fs.readFileSync(stripePath)) === 0, "源图仍是逐字节原图（几何与部件都没动贴图）");
+
+  // ── 存库重开：几何创作态（Padding / 细分 / 切片 / 拓扑 / 锁）全读回来 ──
+  await reopen(apIdA);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length >= 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await click(await h.rowCenter("stripe"));
+  var apOpen = await waitFor(`!!document.querySelector('.ed-warp .ed-warp-open')`, 40000).then(() => true, () => false);
+  if (!apOpen) {
+    var apTree = await h.treeNames();
+    var apGroups = await ev(`[...document.querySelectorAll('#ed-inspector .ed-insp-group .ed-insp-title')].map((d) => d.textContent).join(' | ')`);
+    var apSelName = await h.selectedName();
+    var apImg = apDisk(apIdA);
+    const keys = apImg.json ? Object.keys(apImg.json).join(",") : "(没有模型 json)";
+    check(false, `重开后找不到「进入操控变形」：树 [${apTree}] 选中「${apSelName}」/ 分组 [${apGroups}] / obj.image ${apImg.obj?.image} / json 键 [${keys}] / 页面错误 [${(await h.errorLines()).join(" ; ")}]`);
+  }
+  await clickSel(".ed-warp-open");
+  await apPins();
+  apCr = await h.canvasRect();
+  check((await apVal(".ed-geom-pad")) === "40" && (await apVal(".ed-geom-sub")) === "2" && (await apVal(".ed-geom-cols")) === "32",
+    `重开：Padding ${await apVal(".ed-geom-pad")} / 细分 ${await apVal(".ed-geom-sub")} / 基础格数 ${await apVal(".ed-geom-cols")} 读回来`);
+  check((await ev(`document.querySelector('#ed-inspector .ed-geom-lock').checked`)) === true, "重开：Lock geometry 读回来");
+  var apDiskR = apDisk(apIdA);
+  check(
+    (apDiskR.json?.puppetWarp?.geometry?.sliceX ?? []).length === 1 && (apDiskR.json?.puppetWarp?.geometry?.topology?.flips ?? []).length === 1,
+    "重开：切片线与翻转格子都还在盘上（geometry.sliceX / topology.flips 非空）",
+  );
+
+  var apErrs = await h.errorLines();
+  check(apErrs.length === 0, `几何与角色表全程控制台无错误${apErrs.length ? `：${apErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AP", apName, err); }
+}
+
+await geomE2E();
+
+/**
+ * AQ. 骨架与权重（P2）：新建骨架 → 打点建骨 / 命名 / 父子 → 应用（MDLS + 每顶点 4 槽权重）→
+ * 涂抹 / 平滑 / 孤岛混合 → 转动预览 → 绘制序 → 存库重开。
+ * 判据 = 盘上 .mdl（引擎自己的 mdl-parse 读回骨名 / meta / 蒙皮槽）+ CDP 截图的真实像素。
+ */
+async function skelE2E() {
+  var aqName = "AQ. 骨架与权重（P2：骨架 → 打点建骨 → 应用 → 涂抹 → 平滑 / 孤岛 → 绘制序 → 重开）";
+  section(aqName);
+  if (hlState.dead) hlSkip("AQ", aqName); else try {
+  var parseMDL = (await imp("renderer/vendor/we-scene/render/mdl-parse.js")).parseMDL;
+  /** 盘上「stripe」层的模型 json（+ 目录 / 场景对象），与 AO / AP 段同法 */
+  var aqDisk = (id) => {
+    const dir = path.join(lib, id);
+    const sc = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+    const obj = (sc.objects ?? []).find((o) => o.name === "stripe") ?? (sc.objects ?? [])[0];
+    return { dir, sc, obj, json: obj ? JSON.parse(fs.readFileSync(path.join(dir, String(obj.image)), "utf8")) : null };
+  };
+  var aqMdl = (d) => parseMDL(new Uint8Array(fs.readFileSync(path.join(d.dir, d.json.puppet))));
+  var aqEl = (sel) => `document.querySelector('#ed-inspector ${sel}')`;
+  var aqHas = async (sel) => (await ev(`!!document.querySelector('${sel}')`)) === true;
+  var aqVal = (sel) => ev(`(() => { const el = ${aqEl(sel)}; return el ? String(el.value) : null; })()`);
+  var aqSet = (sel, v) => ev(`(() => { const el = ${aqEl(sel)}; if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var aqToggle = (sel, on) => ev(`(() => { const el = ${aqEl(sel)}; if (!el) return false; el.checked = ${on ? "true" : "false"}; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var aqPick = (sel, v) => ev(`(() => { const el = ${aqEl(sel)}; if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  var aqDiff = (a, b) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+  var aqNth = (sel, i, evt = "click") => ev(`(() => { const el = document.querySelectorAll('${sel}')[${i}]; if (!el) return false; el.${evt}(); return true; })()`);
+  /** 某个分组里的 note 文本数组（骨架 / 权重面板用 note 报数） */
+  var aqNotes = (cls) => ev(`[...document.querySelectorAll('#ed-inspector .${cls} .ed-note')].map((d) => d.textContent)`);
+  var aqLogTail = (n = 4) => ev(`[...document.querySelectorAll('#ed-con-body > div')].slice(-${n}).map((d) => d.textContent).join(' ⏎ ')`);
+  /** #ed-overlay 叠加层上该页面坐标附近 n×n 里 alpha 最大的像素（与 AP 段同一套判法） */
+  var aqOverlay = (pt, n = 5) => ev(`(() => {
+    const cv = document.querySelector('#ed-overlay');
+    const r = cv.getBoundingClientRect();
+    const k = cv.width / r.width;
+    const x = Math.round((${pt[0]} - r.left) * k);
+    const y = Math.round((${pt[1]} - r.top) * k);
+    const h = ${n} >> 1;
+    const d = cv.getContext('2d').getImageData(x - h, y - h, ${n}, ${n}).data;
+    let best = [0, 0, 0, 0];
+    for (let i = 0; i < d.length; i += 4) if (d[i + 3] > best[3]) best = [d[i], d[i + 1], d[i + 2], d[i + 3]];
+    return best;
+  })()`);
+  /** 叠加层上按颜色找骨点（蓝 = 未选中骨；黄 = 选中骨 / 钉子，都是同一块画布上的页坐标范围） */
+  var aqScanBones = () => ev(`(() => {
+    const cv = document.querySelector('#ed-overlay');
+    const r = cv.getBoundingClientRect();
+    const k = cv.width / r.width;
+    const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+    const acc = { blue: 0, yellow: 0, bx0: 1e9, by0: 1e9, bx1: -1e9, by1: -1e9, yx0: 1e9, yy0: 1e9, yx1: -1e9, yy1: -1e9 };
+    for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) {
+      const i = (y * cv.width + x) * 4;
+      if (d[i + 3] < 120) continue;
+      const R = d[i], G = d[i + 1], B = d[i + 2];
+      const px = x / k + r.left, py = y / k + r.top;
+      if (B > 150 && B > R + 40 && G > 120) {
+        acc.blue++;
+        if (px < acc.bx0) acc.bx0 = px; if (px > acc.bx1) acc.bx1 = px;
+        if (py < acc.by0) acc.by0 = py; if (py > acc.by1) acc.by1 = py;
+      } else if (R > 180 && G > 150 && B < 150 && R > B + 60) {
+        acc.yellow++;
+        if (px < acc.yx0) acc.yx0 = px; if (px > acc.yx1) acc.yx1 = px;
+        if (py < acc.yy0) acc.yy0 = py; if (py > acc.yy1) acc.yy1 = py;
+      }
+    }
+    return acc;
+  })()`);
+  var aqPins = () => waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
+  /** 面板按钮点了才算数：元素不在就记一条 ✗，别让 clickSel 抛异常把整段判据打断 */
+  var aqClick = async (sel, what) => {
+    if (!(await aqHas(sel))) {
+      check(false, `${what}：面板里没有 ${sel}`);
+      return false;
+    }
+    await clickSel(sel);
+    return true;
+  };
+
+  /** 写盘 → 等重挂 → 钉子回来（P2 的每一次写都换一份新 slug 的 .mdl） */
+  var aqApply = async (sel) => {
+    const rc = await h.readyCount();
+    if (!(await aqHas(sel))) {
+      check(false, `写回按钮不存在：${sel}`);
+      return h.canvasRect();
+    }
+    await clickSel(sel);
+    await h.waitRemount(rc);
+    await aqPins();
+    return h.canvasRect();
+  };
+  /** 三角形成员集合（每三个下标排序后归一，再整体排序）——重排绘制序不该改变它 */
+  var aqTris = (idx) => {
+    const t = [];
+    for (let i = 0; i + 2 < idx.length; i += 3) t.push([idx[i], idx[i + 1], idx[i + 2]].sort((a, b) => a - b).join("_"));
+    return t.sort().join("|");
+  };
+  /** 权重不变量：4 槽、每顶点 Σ>0、骨号都落在 [0, bones) */
+  var aqSkinOk = (m) => {
+    const vc = m.vertexCount;
+    let zero = 0;
+    let bad = 0;
+    for (let v = 0; v < vc; v++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) {
+        const w = m.weights[v * 4 + k];
+        if (!Number.isFinite(w) || w < 0) bad++;
+        sum += w;
+        if (m.boneIdx[v * 4 + k] >= m.bones.length) bad++;
+      }
+      if (sum <= 1e-4) zero++;
+    }
+    return { zero, bad };
+  };
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  // 夹具：外圈 16px 实心蓝边（自动抠图需要一块与边框相连的纯色背景）+ 内部**大块非周期**图案
+  //（骨架 / 权重的像素判据要看「网格动没动」：纯色图内部形变在像素上不可见，AQ 初版「转动预览 0px」
+  // 就是被纯色图骗的；细棋盘格也不可靠 —— 周期 4px 的格子对几十像素的旋转会「同色对上」，又把真形变量成 0；
+  // 整张纯棋盘格还会让 autoLimbs 找不到背景 ⇒ 一条 limb 都出不来、整段超时。故用「纯色边框 + 大块十字带 + 圆盘」）。
+  // 文件名仍叫 stripe.png ⇒ 层名与 aqDisk 不用改。
+  var aqPatternDir = path.join(tmpRoot, "aq-pattern");
+  fs.mkdirSync(aqPatternDir, { recursive: true });
+  var aqPatternPath = path.join(aqPatternDir, "stripe.png");
+  var aqPW = 400;
+  var aqPH = 200;
+  var aqPM = 16;
+  var aqPStride = aqPW * 3 + 1;
+  var aqPRaw = Buffer.alloc(aqPStride * aqPH);
+  for (let y = 0; y < aqPH; y++) {
+    for (let x = 0; x < aqPW; x++) {
+      const inside = x >= aqPM && x < aqPW - aqPM && y >= aqPM && y < aqPH - aqPM;
+      const bandV = x >= 150 && x < 190;
+      const bandH = y >= 78 && y < 112;
+      const disc = (x - 318) * (x - 318) + (y - 62) * (y - 62) < 1156; // r = 34
+      const c = !inside
+        ? [40, 60, 220]
+        : bandV || bandH
+          ? [220, 40, 40]
+          : disc
+            ? [30, 30, 30]
+            : [235, 235, 235];
+      aqPRaw.set(c, y * aqPStride + 1 + x * 3);
+    }
+  }
+  fs.writeFileSync(aqPatternPath, rgbPng(aqPW, aqPH, aqPRaw));
+  await addImage(aqPatternPath);
+  var aqRc = await h.readyCount();
+  await clickSel(".ed-warp-make");
+  await h.waitRemount(aqRc);
+  await aqPins();
+  var aqCr = await h.canvasRect();
+
+  // ── 先跑一遍角色表：部件表只有它（或带 partOrder 的几何重建）能产出，绘制序要用 ──
+  await clickSel(".ed-sheet-load");
+  await waitFor(`!!document.querySelector('.ed-sheet .ed-sheet-auto')`, 30000);
+  await clickSel(".ed-sheet-auto");
+  await waitFor(`document.querySelectorAll('.ed-sheet-limbs .ed-fx-item').length >= 1`, 30000);
+  await clickSel(".ed-sheet-add");
+  await aqToggle(".ed-sheet-mask", true);
+  await drag(worldToPage(aqCr, [910, 590]), worldToPage(aqCr, [970, 590]));
+  await aqToggle(".ed-sheet-mask", false);
+  var aqRcSheet = await h.readyCount();
+  await clickSel(".ed-sheet-apply");
+  await h.waitRemount(aqRcSheet);
+  await aqPins();
+  aqCr = await h.canvasRect();
+  // 应用部件后 P1 会回到「几何」视图（写盘后 geomWriteSession 恢复 geomMode）⇒ 关掉它，让 P2 独占指针
+  var aqGeomEt = await ev(`(() => { const el = document.querySelector('#ed-inspector .ed-geom-view'); return el ? el.dataset.et : null; })()`);
+  if (aqGeomEt === "geo.viewOn") {
+    await clickSel(".ed-geom-view");
+    await waitFor(`document.querySelector('#ed-inspector .ed-geom-view').dataset.et === 'geo.view'`, 20000);
+  }
+  var aqBase = aqDisk(await saveLoose());
+  var aqM0 = aqMdl(aqBase);
+  check((aqM0.parts ?? []).length >= 2, `角色表已给出部件表（${(aqM0.parts ?? []).length} 块），绘制序才有东西可排`);
+
+  // ── 两个分组：骨架 / 权重 ──
+  check((await aqHas(".ed-skel .ed-skel-new")) && (await aqHas(".ed-wt .ed-wt-newskel")), "转木偶后骨架 / 权重两个分组都出现（P2）");
+  check(/骨架|Skeleton/.test(await ev(`document.querySelector('.ed-skel .ed-insp-title').textContent`)), "骨架分组标题本地化");
+  check(/权重|Weights/.test(await ev(`document.querySelector('.ed-wt .ed-insp-title').textContent`)), "权重分组标题本地化");
+  var aqNotes0 = await aqNotes("ed-skel");
+  check(/还没有骨|No bones yet/.test(aqNotes0[1] ?? ""), `还没有骨架时如实提示（${aqNotes0[1]}）`);
+  var aqVerts = Number(((aqNotes0[0] ?? "").match(/\d+/g) ?? [])[1] ?? NaN);
+  check(aqVerts === aqM0.vertexCount, `骨架摘要里的顶点数与盘上一致（面板 ${aqVerts} / .mdl ${aqM0.vertexCount}）`);
+  check(/先建骨架再涂权重|Create a skeleton before painting/i.test((await aqNotes("ed-wt"))[0] ?? ""), "权重分组在没骨架时给出去处提示");
+
+  // ── 新建骨架：默认 6 根（root / spine / 双臂 / 双腿），自动进骨架模式 ──
+  if (await aqClick(".ed-skel-new", "新建骨架")) {
+    await waitFor(`document.querySelectorAll('#ed-inspector .ed-skel-list .ed-skel-bone').length === 6`, 20000);
+  }
+  check((await ev(`document.querySelector('#ed-inspector .ed-skel-view').dataset.et`)) === "skel.viewOn", "「新建骨架」顺手进入骨架模式");
+  var aqN1 = await aqNotes("ed-skel");
+  check(/6 根|6 bones/.test(aqN1[0] ?? ""), `默认骨架 6 根（${aqN1[0]}）`);
+  check(/根骨|root/i.test(aqN1[1] ?? ""), "有骨架后提示第 1 根是根骨 / 怎么改父级");
+  check(/骨骼列表|Bones/i.test(aqN1[2] ?? "") && (await ev(`document.querySelectorAll('#ed-inspector .ed-skel-bone')[0].textContent`)) === "1. root", `骨列表按序号列出（第 1 根是 root；注记「${aqN1[2]}」）`);
+  // 骨点画在默认骨架的位置上（模型 → 图像：图像中心 = 世界 960,590；root (0,-50) / arm L (-80,60)）
+  var aqArmPt = worldToPage(aqCr, [880, 530]);
+  var aqORoot = await aqOverlay(worldToPage(aqCr, [960, 640]));
+  var aqBones = await aqScanBones();
+  check(aqORoot[3] > 120 && aqORoot[0] > 150 && aqORoot[0] > aqORoot[2], `骨架叠加层在根骨位置画出选中骨（黄的，像素 ${aqORoot}）`);
+  check(aqBones.blue >= 20 && aqBones.bx1 - aqBones.bx0 > 20 && aqBones.by1 - aqBones.by0 > 15, `骨架叠加层画出多根未选中骨点（蓝像素 ${aqBones.blue}，页范围 ${Math.round(aqBones.bx0)},${Math.round(aqBones.by0)}–${Math.round(aqBones.bx1)},${Math.round(aqBones.by1)}；arm L 预测 ${aqArmPt.map((v) => Math.round(v))}）`);
+
+  // ── 选中 + 改名 ──
+  await aqNth("#ed-inspector .ed-skel-bone", 1);
+  await waitFor(`(document.querySelector('#ed-inspector .ed-skel-name') || {}).value === 'spine'`, 20000);
+  await aqSet(".ed-skel-name", "spine");
+  check((await aqVal(".ed-skel-name")) === "spine" && /^2\. spine$/.test(await ev(`document.querySelectorAll('#ed-inspector .ed-skel-bone')[1].textContent`)), "改名写回骨列表（第 2 根 → spine）");
+  check(/改名|renamed/i.test(await aqLogTail(2)), "改名写日志");
+
+  // ── 打点建骨：待命后点画布两次（先选中 spine ⇒ 新骨挂到 spine 下），画面与层选择都不许被动 ──
+  var aqRcBones = await h.readyCount();
+  if (await aqClick(".ed-skel-arm", "打点建骨")) {
+    check((await ev(`document.querySelector('#ed-inspector .ed-skel-arm').classList.contains('is-arm')`)) === true, "「打点建骨」进入待命态（按钮高亮）");
+    await click(worldToPage(aqCr, [900, 620])); // 模型 (-60,-30)
+    await click(worldToPage(aqCr, [860, 590])); // 模型 (-100,0)
+    await waitFor(`document.querySelectorAll('#ed-inspector .ed-skel-list .ed-skel-bone').length === 8`, 20000);
+  }
+  var aqNewTitle = await ev(`document.querySelectorAll('#ed-inspector .ed-skel-bone')[6].title`);
+  check(/spine/.test(aqNewTitle ?? ""), `打点建骨连到选中骨下（第 7 根的父级：${aqNewTitle}）`);
+  check((await h.selectedName()) === "stripe", "画布上打点建骨不改层选择（骨架模式吞掉了这一次 click）");
+  check((await h.readyCount()) === aqRcBones, "打点建骨不重挂场景（点击没被手柄 / 钉子抢走）");
+
+  // ── 应用骨架：写 MDLS（骨名 + 父子 + pw 参数）并顺手重算 4 槽权重 ──
+  // 采样点铺在模型四角与上下边（远离骨点 / 钉子 / 父子连线），并且**隐藏 #ed-overlay 再截图**：
+  // 这条判的是「网格本身有没有动」。写盘后钉子手柄会从 3×3 网格跳到骨位置，叠加层混进来量不准
+  //（初版就是这么量出 128px 的假差）。
+  var aqSkinPix = [[800, 515], [1120, 515], [800, 665], [1120, 665], [960, 520], [960, 660]];
+  /** 藏 / 显叠加层：inline 之外再挂一张 `!important` 样式表（只藏 inline 时实测仍有假差，见 AQ 正对照） */
+  var aqHideOverlay = (hide) => ev(`(() => {
+    let st = document.getElementById('aq-hide-overlay');
+    if (${hide} && !st) {
+      st = document.createElement('style');
+      st.id = 'aq-hide-overlay';
+      st.textContent = '#ed-overlay{visibility:hidden !important}';
+      document.head.appendChild(st);
+    }
+    if (!${hide} && st) st.remove();
+    const el = document.querySelector('#ed-overlay');
+    if (el) el.style.visibility = ${hide} ? 'hidden' : '';
+    return true;
+  })()`);
+  var aqMeshPix = async (pts) => {
+    await aqHideOverlay(true);
+    const out = [];
+    for (const p of pts) out.push(await pixelAt(worldToPage(aqCr, p)));
+    await aqHideOverlay(false);
+    return out;
+  };
+  // 正对照：根骨那里本来画着骨点（选中黄 / 未选蓝），藏起来后像素必须变 —— 否则量的是叠加层不是网格。
+  var aqRootPt = worldToPage(aqCr, [960, 640]);
+  var aqRootShow = await pixelAt(aqRootPt);
+  var aqRootHide = (await aqMeshPix([[960, 640]]))[0];
+  check(aqDiff(aqRootShow, aqRootHide) >= 20, `量网格前把叠加层藏起来（根骨 ${aqRootShow.join("/")} → ${aqRootHide.join("/")}）`);
+  // ── 临时诊断（定位「应用骨架动了画面」）：盘上模型前后对比 + 沿横线扫色 ──
+  var aqAabbOf = (m) => {
+    const p = m.positions;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let i = 0; i + 2 < p.length; i += 3) {
+      if (p[i] < x0) x0 = p[i];
+      if (p[i] > x1) x1 = p[i];
+      if (p[i + 1] < y0) y0 = p[i + 1];
+      if (p[i + 1] > y1) y1 = p[i + 1];
+    }
+    return `${Math.round(x0)},${Math.round(y0)}..${Math.round(x1)},${Math.round(y1)}`;
+  };
+  var aqMdlNote = (m, d) =>
+    `${m.bones.length} 骨[${m.bones.map((b) => b.name).join(",")}] / ${m.vertexCount} 顶点 / AABB ${aqAabbOf(m)} / ` +
+    `obj ${d.obj?.width ?? "?"}×${d.obj?.height ?? "?"} ${d.obj?.origin ?? "?"} scale ${d.obj?.scale ?? "?"} / ` +
+    `静态姿势 ${m.staticPoseAt ?? "?"} / 片段 ${(m.animations ?? []).length}`;
+  var aqLinePts = [];
+  for (let x = 720; x <= 1200; x += 20) aqLinePts.push([x, 560]);
+  for (let x = 720; x <= 1200; x += 20) aqLinePts.push([x, 660]);
+  var aqLine = async (pts) => {
+    const cs = await aqMeshPix(pts);
+    return cs.map((c) => (c[0] > 200 && c[1] > 200 ? "W" : c[0] > 150 && c[1] < 120 ? "R" : c[2] > 150 && c[0] < 120 ? "B" : c[0] < 90 && c[2] > 90 && c[2] < 210 ? "g" : ".")).join("");
+  };
+  var aqDPre = aqDisk(await saveLoose());
+  var aqMPre = aqMdl(aqDPre);
+  var aqPreLine = await aqLine(aqLinePts);
+  console.log(`  · 应用前：${aqMdlNote(aqMPre, aqDPre)}；画面 ${aqPreLine}`);
+  var aqCrBefore = aqCr;
+  var aqPixBefore = await aqMeshPix(aqSkinPix);
+  aqCr = await aqApply(".ed-skel-apply");
+  var aqId = await saveLoose();
+  var aqD1 = aqDisk(aqId);
+  var aqM1 = aqMdl(aqD1);
+  check(aqM1.bones.length === 8, `8 根骨写进 MDLS（${aqM1.bones.map((b) => b.name).join(" ")}）`);
+  check(/spine/.test(aqM1.bones.map((b) => b.name).join(",")) && aqM1.bones[1].parent === 0, `骨名与父子关系都落了盘（spine 的父级 = ${aqM1.bones[1].parent}）`);
+  var aqMetaOk = 0;
+  for (const bm of aqM1.boneMeta) {
+    const meta = JSON.parse(bm.meta || "{}");
+    if (meta.pw && meta.pw.stiffness === 0.5 && meta.pw.damping === 0.2) aqMetaOk++;
+  }
+  check(aqMetaOk === 8, `物理参数写进每根骨 meta 的 pw 键（${aqMetaOk}/8：stiffness 0.5 / damping 0.2）`);
+  var aqInv1 = aqSkinOk(aqM1);
+  check(aqInv1.bad === 0 && aqInv1.zero === 0, `应用骨架顺手给出每顶点 4 槽权重（异常 ${aqInv1.bad} / 全零 ${aqInv1.zero}）`);
+  check(aqD1.json?.puppetWarp?.skeleton?.bones?.length === 8 && aqD1.json.puppetWarp.skeleton.bones.some((b) => b.name === "spine"), "模型 json 记着骨架（puppetWarp.skeleton.bones）");
+  // 骨表 10 → 8：旧 MDLA 轨道的骨号整批失效（removeMdlClip 有「首个不许删」的保护，杀不掉单片段木偶的片段）
+  check((aqM1.animations ?? []).length === 0, `骨表换了就把盘上片段整批作废（片段 ${(aqM1.animations ?? []).length}）`);
+  var aqPixAfter = await aqMeshPix(aqSkinPix);
+  var aqMaxSkin = Math.max(...aqSkinPix.map((_, i) => aqDiff(aqPixBefore[i], aqPixAfter[i])));
+  var aqCrMoved = Math.abs(aqCrBefore.left - aqCr.left) > 0.5 || Math.abs(aqCrBefore.top - aqCr.top) > 0.5 ||
+    Math.abs(aqCrBefore.width - aqCr.width) > 0.5 || Math.abs(aqCrBefore.height - aqCr.height) > 0.5;
+  var aqPostLine = await aqLine(aqLinePts);
+  console.log(`  · 应用后：${aqMdlNote(aqM1, aqD1)}；画面 ${aqPostLine}`);
+  // 再应用一次（幂等）：写盘 → 重挂的噪声地板；顺带确认「骨表没变就不动盘上片段」这条分支不误伤画面
+  aqCr = await aqApply(".ed-skel-apply");
+  var aqPixAgain = await aqMeshPix(aqSkinPix);
+  var aqMaxAgain = Math.max(...aqSkinPix.map((_, i) => aqDiff(aqPixAfter[i], aqPixAgain[i])));
+  check(aqMaxAgain <= 8, `再应用一次骨架画面也不动（重挂→重挂 最大像素差 ${aqMaxAgain}）`);
+  aqD1 = aqDisk(await saveLoose());
+  aqM1 = aqMdl(aqD1);
+  check(aqMaxSkin <= 8, `应用骨架不动画面（隐藏叠加层后最大像素差 ${aqMaxSkin}；画布矩形${aqCrMoved ? `变了 ${Math.round(aqCrBefore.left)},${Math.round(aqCrBefore.top)} ${Math.round(aqCrBefore.width)}×${Math.round(aqCrBefore.height)} → ${Math.round(aqCr.left)},${Math.round(aqCr.top)} ${Math.round(aqCr.width)}×${Math.round(aqCr.height)}` : "没变"}；采样 ${aqPixBefore.map((c, i) => `${c.join("/")}→${aqPixAfter[i].join("/")}`).join(" ")}）`);
+
+
+  // ── 权重面板：8 根目标骨 / 全部有 4 槽权重 / 孤岛数 ──
+  var aqTargets = await ev(`document.querySelectorAll('#ed-inspector .ed-wt-target option').length`);
+  check(aqTargets === 8, `权重面板按盘上骨架列出目标骨（${aqTargets} 项）`);
+  var aqNote1 = (await aqNotes("ed-wt"))[0] ?? "";
+  check(/未涂 0|0 unweighted/.test(aqNote1), `应用骨架后每个顶点都有权重（${aqNote1}）`);
+  check((await aqHas(".ed-wt .ed-wt-part")) && (await aqHas(".ed-wt .ed-wt-front")), "权重面板列出部件表与「移到最前」（部件表已落盘）");
+
+  // ── 涂抹权重：目标骨 2 + 沿一条线拖笔 → 日志 + 落盘后骨号真的多出来 ──
+  if (await aqClick(".ed-wt-paint", "开始涂权重")) {
+    await waitFor(`document.querySelector('#ed-inspector .ed-wt-paint').dataset.et === 'wt.paintOn'`, 20000);
+  }
+  await aqPick(".ed-wt-target", "2");
+  var aqSlots2Before = Array.from(aqM1.boneIdx).filter((v) => v === 2).length;
+  await drag(worldToPage(aqCr, [900, 590]), worldToPage(aqCr, [1030, 590]));
+  var aqPaintLog = await aqLogTail(2);
+  check(/涂抹骨|Painted bone/i.test(aqPaintLog), `涂抹写出日志（${aqPaintLog.slice(0, 90)}）`);
+  await aqClick(".ed-wt-smooth", "平滑全部权重");
+  check(/平滑|Smoothed/i.test(await aqLogTail(2)), "「平滑全部权重」写出日志");
+  await aqClick(".ed-wt-blend", "孤岛混合");
+  check(/孤岛|island/i.test(await aqLogTail(2)), "「孤岛混合」写出日志");
+  aqCr = await aqApply(".ed-wt-apply");
+  var aqD2 = aqDisk(await saveLoose());
+  var aqM2 = aqMdl(aqD2);
+  var aqSlots2After = Array.from(aqM2.boneIdx).filter((v) => v === 2).length;
+  check(aqSlots2After > aqSlots2Before, `涂抹进了 .mdl：骨号 2 的蒙皮槽 ${aqSlots2Before} → ${aqSlots2After}（笔刷把目标骨挤进 4 槽）`);
+  var aqInv2 = aqSkinOk(aqM2);
+  check(aqInv2.bad === 0 && aqInv2.zero === 0, `涂抹 + 平滑 + 孤岛混合后权重仍合法（异常 ${aqInv2.bad} / 全零 ${aqInv2.zero}）`);
+  check(aqD2.json?.puppetWarp?.weights !== undefined, "模型 json 记着权重状态（puppetWarp.weights）");
+
+  // ── 转动预览：只动引擎姿势不写盘；重置姿势回到绑定姿势 ──
+  // 同样隐藏叠加层量网格（夹具内部是大块非周期图案 ⇒ 形变一定改像素）。
+  // 目标骨选**根骨**：转根骨会带动整条父链（每个顶点的骨都挂在它下面），采样点不必正好落在某个 island 里。
+  await aqPick(".ed-wt-target", "0");
+  var aqPose = [];
+  for (let px = 800; px <= 1120; px += 80) for (let py = 520; py <= 660; py += 70) aqPose.push([px, py]);
+  var aqPose0 = await aqMeshPix(aqPose);
+  var aqPoseSet = await aqSet(".ed-wt-pose", 120);
+  check(aqPoseSet === true, "权重面板有「转动预览」滑杆（.ed-wt-pose）");
+  var aqPose1 = await aqMeshPix(aqPose);
+  var aqPoseMax = Math.max(...aqPose.map((_, i) => aqDiff(aqPose0[i], aqPose1[i])));
+  check(aqPoseMax > 25, `转动预览当场把画面转起来（最大像素差 ${aqPoseMax}，不写盘；${aqPose.map((p, i) => `${p.join(",")} ${aqPose0[i].join("/")}→${aqPose1[i].join("/")}`).join(" ")}）`);
+  await aqClick(".ed-wt-poserest", "重置姿势");
+  var aqPose2 = await aqMeshPix(aqPose);
+  var aqPoseBack = Math.max(...aqPose.map((_, i) => aqDiff(aqPose0[i], aqPose2[i])));
+  check(aqPoseBack <= 8, `重置姿势回到绑定姿势（最大像素差 ${aqPoseBack}）`);
+
+  // ── 显示深度序：叠加层按部件绘制序着色（面板同时如实说明本机看不出前后） ──
+  await aqClick(".ed-wt-depth", "显示深度序");
+  check((await ev(`document.querySelector('#ed-inspector .ed-wt-depth').classList.contains('is-arm')`)) === true, "「显示深度序」进入待命态");
+  check(/WE 侧生效|effective on the WE side/i.test((await aqNotes("ed-wt")).join(" ")), "面板如实标注深度序只在 WE 侧生效");
+  await aqClick(".ed-wt-depth", "关掉显示深度序");
+
+  // ── 移到最前：索引表按新绘制序重排（索引顺序变、三角形集合与部件表不变） ──
+  var aqPartsN = await ev(`document.querySelectorAll('#ed-inspector .ed-wt-part option').length`);
+  check(aqPartsN >= 2, `部件选择列出全部部件（${aqPartsN} 块）`);
+  var aqIdxBefore2 = Array.from(aqM2.indices);
+  var aqFrontId = aqM2.parts[0].id;
+  await aqPick(".ed-wt-part", "0"); // 第 0 块 => 整段搬到索引表末尾（已经在最后的部件搬了 = 无操作）
+  aqCr = await aqApply(".ed-wt-front");
+  var aqD3 = aqDisk(await saveLoose());
+  var aqM3 = aqMdl(aqD3);
+  var aqIdxAfter2 = Array.from(aqM3.indices);
+  var aqMoved = aqIdxBefore2.some((v, i) => v !== aqIdxAfter2[i]);
+  var aqPartsAfter2 = aqM3.parts ?? [];
+  var aqTail = aqPartsAfter2[aqPartsAfter2.length - 1];
+  // 引擎解析器给的部件只有 id / start / size，**没有 offset**（draw_order_offset 只有写侧知道），
+  // 所以这里只判「末块就是被点那块」；offset 抬高由离线 SKEL 段用 MdlPart 本体单测。
+  check(
+    aqMoved && aqM3.indexCount === aqM2.indexCount && aqTris(aqIdxAfter2) === aqTris(aqIdxBefore2) &&
+      aqTail && aqTail.id === aqFrontId,
+    `「移到最前」把该部件的索引区间整段搬到表尾（索引顺序变了=${aqMoved} / 索引数 ${aqM2.indexCount}→${aqM3.indexCount} / 三角形集合不变 / 末块 #${aqTail ? aqTail.id : "?"} 就是 #${aqFrontId}）`,
+  );
+  var aqParts3 = aqM3.parts ?? [];
+  check(
+    aqParts3.length >= 2 && aqParts3.reduce((s, p) => s + p.size, 0) === aqM3.indexCount && aqParts3[0].start === 0 &&
+      aqParts3.every((p, i) => i === 0 || p.start === aqParts3[i - 1].start + aqParts3[i - 1].size),
+    `重排后部件表仍首尾相接铺满索引表（${aqParts3.map((p) => `${p.id}@${p.start}+${p.size}`).join(" ")}）`,
+  );
+
+  // ── 存库重开：骨架与权重都读回来 ──
+  await reopen(aqId);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length >= 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await click(await h.rowCenter("stripe"));
+  var aqOpen = await waitFor(`!!document.querySelector('.ed-warp .ed-warp-open')`, 40000).then(() => true, () => false);
+  if (!aqOpen) {
+    check(false, `重开后找不到「进入操控变形」：树 [${await h.treeNames()}] / 页面错误 [${(await h.errorLines()).join(" ; ")}]`);
+  }
+  await clickSel(".ed-warp-open");
+  await aqPins();
+  var aqNotesR = await aqNotes("ed-skel");
+  check(/8 根|8 bones/.test(aqNotesR[0] ?? ""), `重开：8 根骨读回来（${aqNotesR[0]}）`);
+  check(/2\. spine/.test((await ev(`[...document.querySelectorAll('#ed-inspector .ed-skel-bone')].map((b) => b.textContent).join(" | ")`)) ?? ""), "重开：骨名读回来（第 2 根还是 spine）");
+  check((await ev(`document.querySelectorAll('#ed-inspector .ed-wt-target option').length`)) === 8, "重开：权重面板认出盘上 8 骨（骨数对得上，盘上权重可直接用）");
+  var aqDR = aqDisk(aqId);
+  check(
+    aqDR.json?.puppetWarp?.skeleton?.bones?.length === 8 && aqDR.json?.puppetWarp?.weights !== undefined,
+    "重开：盘上骨架与权重状态都还在（skeleton.bones / weights）",
+  );
+  var aqMR = aqMdl(aqDR);
+  var aqSlotsR = Array.from(aqMR.boneIdx).filter((v) => v === 2).length;
+  check(aqSlotsR === aqSlots2After, `重开：涂抹过的权重没变（骨号 2 的蒙皮槽 ${aqSlotsR}）`);
+
+  var aqErrs = await h.errorLines();
+  check(aqErrs.length === 0, `骨架与权重全程控制台无错误${aqErrs.length ? `：${aqErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AQ", aqName, err); }
+}
+
+await skelE2E();
+
   if (hlState.aborts.length || hlState.skipped) {
     console.log(`\n真机段小结：中断 ${hlState.aborts.length} 段、跳过 ${hlState.skipped} 段`);
     for (const a of hlState.aborts) console.log(`  ✗ ${a.name} —— ${a.msg}`);
