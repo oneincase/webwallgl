@@ -443,11 +443,15 @@ import {
 import { scriptsAllowedByDefault, scriptsOverrideFrom, type ContentKind } from "./trust";
 import {
   addContainerLayer,
+  addTransparentLayer,
   hasPassthrough,
   isContainerObject,
   isFullscreenPostObject,
+  layerSizeOf,
+  setLayerSize,
   setPassthrough,
   solidRenders,
+  TRANSPARENT_LAYER_MAX,
 } from "./container";
 import {
   duplicateLayer,
@@ -5163,6 +5167,51 @@ const lyAddContainerEl = $<HTMLButtonElement>("#ly-add-container");
 lyAddContainerEl.onclick = () => addContainer();
 const lyAddPostEl = $<HTMLButtonElement>("#ly-add-post");
 lyAddPostEl.onclick = () => addContainer("post");
+// 透明层（M5 补 A12b）：自定义尺寸的空效果画布 —— 尺寸在加层时就问，别让用户先加一个看不见的层再去找尺寸
+const lyAddAlphaEl = $<HTMLButtonElement>("#ly-add-alpha");
+lyAddAlphaEl.onclick = () => openAlphaDialog();
+
+// 透明层尺寸对话框（M5 补 A12b）：加完是个看不见的层，所以尺寸必须在加层前问清楚。
+// 非法尺寸（空 / 0 / NaN）直接禁用「添加」，不让 NaN 流进 scene.json；窗口级快捷键在
+// INPUT 上会提前 return（main.ts:2960），所以数字框里敲键、回车都不会误触编辑器命令。
+const alphaDlgEl = $<HTMLDialogElement>("#alpha-dlg");
+const alphaWEl = $<HTMLInputElement>("#alpha-w");
+const alphaHEl = $<HTMLInputElement>("#alpha-h");
+const alphaOkEl = $<HTMLButtonElement>("#alpha-ok");
+const alphaSize = (): { w: number; h: number } | null => {
+  const w = Math.round(Number(alphaWEl.value));
+  const h = Math.round(Number(alphaHEl.value));
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) return null;
+  return { w: Math.min(w, TRANSPARENT_LAYER_MAX), h: Math.min(h, TRANSPARENT_LAYER_MAX) };
+};
+const syncAlphaOk = () => {
+  alphaOkEl.disabled = !alphaSize();
+};
+for (const el of [alphaWEl, alphaHEl]) el.addEventListener("input", syncAlphaOk);
+const alphaCanvasSize = () => sceneResolution(doc?.scene ?? null) ?? { w: 1920, h: 1080 };
+$("#alpha-canvas").onclick = () => {
+  const r = alphaCanvasSize();
+  alphaWEl.value = String(Math.round(r.w));
+  alphaHEl.value = String(Math.round(r.h));
+  syncAlphaOk();
+};
+$("#alpha-cancel").onclick = () => alphaDlgEl.close();
+alphaOkEl.onclick = () => {
+  const s = alphaSize();
+  if (!s) return;
+  alphaDlgEl.close();
+  addTransparent(s.w, s.h);
+};
+// 点对话框外面 = 取消（与 ui/confirm.ts 同一口径：只有 target 正好是 dialog 才算外面）
+alphaDlgEl.addEventListener("click", (e) => {
+  if (e.target === alphaDlgEl) alphaDlgEl.close();
+});
+// 回车 = 添加（Esc 由 <dialog> 自己的 cancel 关掉，不用重写快捷键）
+alphaDlgEl.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.isComposing) return;
+  e.preventDefault();
+  if (!alphaOkEl.disabled) alphaOkEl.click();
+});
 // M4 A6：light / camera 直接建层（无模板菜单），走 addKindLayer → LayerKindDef.create
 const lyAddLightEl = $<HTMLButtonElement>("#ly-add-light");
 lyAddLightEl.onclick = () => addKindLayer("light");
@@ -5305,6 +5354,7 @@ function syncLayerTools() {
   lyAddSoundEl.disabled = lyAddEl.disabled;
   lyAddContainerEl.disabled = lyAddEl.disabled;
   lyAddPostEl.disabled = lyAddEl.disabled;
+  lyAddAlphaEl.disabled = lyAddEl.disabled;
   lyAddVideoEl.disabled = lyAddEl.disabled;
   lyAddModelEl.disabled = lyAddEl.disabled;
   // 树工具：折叠/展开只在场景可用；隔离只在有选中层时可用
@@ -9997,6 +10047,47 @@ function containerGroup(node: LayerNode): HTMLElement {
   const isCtr = isContainerObject(o);
   const isPost = isFullscreenPostObject(o);
 
+  if (isCtr) {
+    // 效果画布尺寸（M5 补 A12b）：透明层自己不画东西，看得见的就是这块 W×H ——
+    // 生成之后还得能改回来（删掉重建会连效果链一起丢），所以给两个数字框。
+    // 空白输入框 = 对象上没有 size（引擎按 0 0 处理，画不出东西），填上即可修好历史对象。
+    const sizeLabel = document.createElement("label");
+    sizeLabel.textContent = et("insp.size");
+    const sizeBox = document.createElement("div");
+    sizeBox.className = "ed-fx-param";
+    const cur = layerSizeOf(o);
+    const sizeInput = (field: string, value: number | null) => {
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.min = "1";
+      inp.max = String(TRANSPARENT_LAYER_MAX);
+      inp.step = "1";
+      inp.placeholder = "0";
+      if (value !== null) inp.value = String(value);
+      inp.disabled = !editable;
+      inp.dataset.container = field;
+      inp.addEventListener("change", () => commitSize());
+      sizeBox.appendChild(inp);
+      return inp;
+    };
+    const wInp = sizeInput("size-w", cur ? cur[0] : null);
+    const x = document.createElement("span");
+    x.className = "ed-dim-x";
+    x.textContent = "×";
+    sizeBox.appendChild(x);
+    const hInp = sizeInput("size-h", cur ? cur[1] : null);
+    const commitSize = () => {
+      const w = Number(wInp.value);
+      const hh = Number(hInp.value);
+      if (!Number.isFinite(w) || !Number.isFinite(hh) || w < 1 || hh < 1) return;
+      const nw = Math.min(TRANSPARENT_LAYER_MAX, Math.round(w));
+      const nh = Math.min(TRANSPARENT_LAYER_MAX, Math.round(hh));
+      objEdit(et("log.sizeChanged", { layer, w: nw, h: nh }), node.id, (ob) => setLayerSize(ob, nw, nh));
+    };
+    form.append(sizeLabel, sizeBox);
+    group.appendChild(note(et("insp.sizeNote")));
+  }
+
   if (isCtr || isPost) {
     checkbox("passthrough", "ctr.passthrough", hasPassthrough(o), (on) =>
       objEdit(et(on ? "log.passthroughOn" : "log.passthroughOff", { layer }), node.id, (ob) => {
@@ -10219,8 +10310,13 @@ function addText(preset: TextPreset) {
 
 /**
  * 添加容器层 / 全屏后期层（M5 A12）：走结构编辑（可撤销、整场景重挂）。
- * 尺寸跟着画布走 —— 容器默认盖满画布（子层坐标照旧是绝对坐标），后期层由引擎按
- * general.orthogonalprojection 覆盖，这里写的 origin/scale 只是工程里的可读初值。
+ * 尺寸跟着画布走，但**写的是 `size` 而不是拿 `scale` 顶**（M5 补 A12b 修正）：
+ *   · 容器 quad 的世界尺寸 = `size × scale`（renderer.js 的 layerModelMatrix），写
+ *     `size: "W H"` + `scale: "1 1 1"` 与 WE 工程里那些内联容器同形；
+ *   · 更要紧的是**两块 FBO 都只认 size**：子层合成图 `renderContainerGroup` 用
+ *     `container.size` 开 FBO（此前 no-size ⇒ 1×1，挂在容器上的效果作用在 1 像素上），
+ *     容器自己的效果画布也用 `layer.size`（renderer.js 的 contentW/H）。
+ * 后期层由引擎按 general.orthogonalprojection 覆盖尺寸，这里的值只是工程里的可读初值。
  */
 function addContainer(kind: "container" | "post" = "container") {
   if (!doc?.scene || !overlay || doc.type !== "scene") {
@@ -10236,13 +10332,56 @@ function addContainer(kind: "container" | "post" = "container") {
         kind,
         name,
         origin: `${Math.round(r.w / 2)} ${Math.round(r.h / 2)} 0`,
-        scale: `${Math.round(r.w)} ${Math.round(r.h)} 1`,
+        size: `${Math.round(r.w)} ${Math.round(r.h)}`,
+        scale: "1 1 1",
         // 空容器 + 效果要能读到已经渲染好的背板，直通默认开（引擎 layerWantsPreserveBackdrop 之外的第二重保险）
         passthrough: true,
       }) ?? undefined
     );
   });
 
+}
+
+/**
+ * 透明层（M5 补 A12b）：自定义尺寸的空效果画布。
+ *
+ * 它的价值全在「尺寸」上：块本身透明（引擎 srcTex = transparentTex，没有任何纹理），
+ * 所以加完在画面上是看不见的，必须接着挂效果 —— 也正因为看不见，尺寸只能在加层前问。
+ * 默认值取当前画布尺寸（全屏效果画布是常见用法），对话框里的「取画布大小」用来回到全屏。
+ */
+function openAlphaDialog() {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const r = alphaCanvasSize();
+  alphaWEl.value = String(Math.round(r.w));
+  alphaHEl.value = String(Math.round(r.h));
+  syncAlphaOk();
+  if (alphaDlgEl.open) return; // 防御：showModal 在已打开的 dialog 上会抛 InvalidStateError
+  alphaDlgEl.showModal();
+  alphaWEl.focus();
+  alphaWEl.select();
+}
+
+/** 真正加层：走结构编辑（可撤销、整场景重挂），返回值即新层 id ⇒ 加完即选中，接着就能挂效果 */
+function addTransparent(width: number, height: number) {
+  if (!doc?.scene || !overlay || doc.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  const name = et("alpha.defaultName");
+  structEdit(et("log.alphaAdded", { name, w: width, h: height }), (d) => {
+    const r = sceneResolution(d.scene) ?? { w: 1920, h: 1080 };
+    return (
+      addTransparentLayer(d, {
+        name,
+        width,
+        height,
+        origin: `${Math.round(r.w / 2)} ${Math.round(r.h / 2)} 0`,
+      }) ?? undefined
+    );
+  });
 }
 
 /**

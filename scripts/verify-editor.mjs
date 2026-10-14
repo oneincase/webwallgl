@@ -4969,6 +4969,15 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
   check(parseSrc.includes("isContainer: typeof o.image") && parseSrc.includes("'models/util/composelayer'"), "引擎侧容器判定仍在 parse.js 的 isContainer（前缀 composelayer）");
   check(ctr.CONTAINER_IMAGE === "models/util/composelayer", "编辑器容器前缀与引擎同一字面量 models/util/composelayer");
   check(json(ctr.FULLSCREEN_POST_IMAGES) === json(["models/util/projectlayer", "models/util/fullscreenlayer"]), "全屏后期前缀 = projectlayer / fullscreenlayer（与 parse.js isPost 两个前缀一致）");
+  // 写盘字面量必须带 .json：引擎的内置模型表是**整串查表**（scene-mount.ts 的
+  // `eff.BUILTIN_MODELS[layer.image]`），少一个后缀 → 查表落空 + readAsset 找不到
+  // （工程里没有 models/util/*）⇒ 装配 `continue` ⇒ 效果链一次也不解析。
+  // 老编辑器（M5 A12）写的正是无后缀前缀，加容器层 / 全屏后期层因此是死层。
+  const engineEff = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
+  check(ctr.CONTAINER_MODEL === "models/util/composelayer.json" && ctr.POST_MODEL === "models/util/projectlayer.json", `写盘字面量带 .json（${ctr.CONTAINER_MODEL} / ${ctr.POST_MODEL}）`);
+  check(!!engineEff.BUILTIN_MODELS[ctr.CONTAINER_MODEL] && !!engineEff.BUILTIN_MODELS[ctr.POST_MODEL], "编辑器写出的 image 在引擎 BUILTIN_MODELS 里查得到（差一个 .json 这条即红）");
+  check(!!engineEff.BUILTIN_MODELS[ctr.CONTAINER_IMAGE] && !!engineEff.BUILTIN_MODELS[ctr.FULLSCREEN_POST_IMAGES[0]], "无后缀别名仍注册（已存盘的老工程 scene.json 不用迁移也能渲染）");
+  check(engineEff.BUILTIN_MODELS[ctr.CONTAINER_IMAGE] === engineEff.BUILTIN_MODELS[ctr.CONTAINER_MODEL], "别名与正式键指向同一个内置模型（不是第二份定义）");
   check(ctr.isContainerObject({ image: "models/util/composelayer.pkg" }) === true && ctr.isContainerObject({ image: "images/bg.jpg" }) === false, "容器判定只认 composelayer 前缀（普通图片不算）");
   check(ctr.isFullscreenPostObject({ image: "models/util/fullscreenlayer" }) === true && ctr.isFullscreenPostObject({ image: "models/util/composelayer" }) === false, "全屏后期判定只认 projectlayer / fullscreenlayer");
   check(ctr.hasPassthrough({ config: { passthrough: true } }) === true && ctr.hasPassthrough({ passthrough: true }) === false, "passthrough 只从 config 里读（顶层同名字段不算）");
@@ -4985,10 +4994,27 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
   const ctrId = ctr.addContainerLayer(ctrDoc, { name: "容器", origin: "960 540 0", scale: "1920 1080 1", passthrough: true });
   const ctrObj = ctrDoc.scene.objects[0];
   check(ctrId !== null && ctrObj.id === ctrId, "addContainerLayer 返回的 id 就是新对象的 id");
-  check(ctrObj.image === "models/util/composelayer", "新容器写出 image = models/util/composelayer（引擎认得的对象）");
+  check(ctrObj.image === "models/util/composelayer.json", "新容器写出 image = models/util/composelayer.json（引擎 BUILTIN_MODELS 的键）");
   check(ctrObj.config && ctrObj.config.passthrough === true && ctrObj.passthrough === undefined, "passthrough 写在 config.passthrough，顶层不留同名字段");
   check(json(Object.keys(ctrObj).sort()) === json(["angles", "config", "id", "image", "name", "origin", "scale", "visible"]), `新容器的键集固定（${json(Object.keys(ctrObj).sort())}）`);
-  check(JSON.stringify(ctrObj) === json({ angles: "0 0 0", config: { passthrough: true }, id: ctrId, image: "models/util/composelayer", name: "容器", origin: "960 540 0", scale: "1920 1080 1", visible: true }), `新容器的 JSON 逐字节等于期望（键序与工程口径一致：${json(ctrObj)}）`);
+  check(JSON.stringify(ctrObj) === json({ angles: "0 0 0", config: { passthrough: true }, id: ctrId, image: "models/util/composelayer.json", name: "容器", origin: "960 540 0", scale: "1920 1080 1", visible: true }), `新容器的 JSON 逐字节等于期望（键序与工程口径一致：${json(ctrObj)}）`);
+  // —— size / copybackground：两块 FBO 都只认 size（M5 补 A12b） ——
+  const ctrEngineRsrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+  const sizeDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  ctr.addContainerLayer(sizeDoc, { name: "容器", origin: "960 540 0", size: "1920 1080", scale: "1 1 1" });
+  const sizeObj = sizeDoc.scene.objects[0];
+  check(sizeObj.size === "1920 1080" && json(Object.keys(sizeObj).sort()) === json(["angles", "id", "image", "name", "origin", "scale", "size", "visible"]), `size 写在字母序里 scale 之后（${json(Object.keys(sizeObj))}）`);
+  check(ctrEngineRsrc.includes("Math.abs(container.size[0])") && ctrEngineRsrc.includes("Math.abs(container.size[1])"), "子层合成图 FBO 用 container.size（容器不写 size ⇒ 1×1，挂在容器上的效果落在 1 像素上）");
+  check(/contentW = layer\.size\[0\]/.test(ctrEngineRsrc) && /contentH = layer\.size\[1\]/.test(ctrEngineRsrc), "容器自己的效果画布用 layer.size（同一份 size 决定两块 FBO）");
+  check(/const w = layer\.size\[0\] \* layer\.scale\[0\]/.test(ctrEngineRsrc), "quad 世界尺寸 = size × scale（写 size + scale 1 与 WE 内联容器同形）");
+  const ctrMain = /function addContainer\(kind: "container" \| "post" = "container"\)[\s\S]{0,700}?size: `\$\{Math\.round\(r\.w\)\} \$\{Math\.round\(r\.h\)\}`,[\s\S]{0,120}?scale: "1 1 1",/.test(mainSrc);
+  check(ctrMain, "「添加容器层」写 size = 画布 + scale 1 1 1（不再拿 scale 顶尺寸：那样 group FBO / 效果 FBO 都是 0 尺寸）");
+  const cbDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  ctr.addContainerLayer(cbDoc, { name: "容器", copybackground: false });
+  check(cbDoc.scene.objects[0].copybackground === false && json(Object.keys(cbDoc.scene.objects[0])) === json(["angles", "copybackground", "id", "image", "name", "origin", "scale", "visible"]), "copybackground 只显式写 false（字母序在 config 之后、id 之前）");
+  const cbTrue = { type: "scene", scene: mkScene([]), roots: [], project: null };
+  ctr.addContainerLayer(cbTrue, { name: "容器", copybackground: true });
+  check(!("copybackground" in cbTrue.scene.objects[0]), "copybackground: true 不写键（口径：关掉就删键，与 passthrough 一致）");
   check(docMod.kindOf(ctrObj) === "container", "kindOf 把容器识别成 container（不是 image），检视器才给得出容器分组");
   check(kinds.layerKindInfo("container")?.canHaveEffects === true, "容器类型登记 canHaveEffects（效果作用在整棵子树上）");
   check(docMod.kindOf({ image: "models/util/projectlayer" }) === "fullscreen-post" && kinds.layerKindInfo("fullscreen-post")?.canHaveEffects === true, "全屏后期层单独一种类型且能挂效果");
@@ -4996,7 +5022,7 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
 
   const postDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
   ctr.addContainerLayer(postDoc, { kind: "post", name: "后期" });
-  check(postDoc.scene.objects[0].image === "models/util/projectlayer", "kind: \"post\" 写 projectlayer（全屏后期，引擎按画布覆盖尺寸）");
+  check(postDoc.scene.objects[0].image === "models/util/projectlayer.json", "kind: \"post\" 写 projectlayer.json（全屏后期，引擎按画布覆盖尺寸）");
   check(postDoc.scene.objects[0].config === undefined, "后期层默认不写 config（只写真正要的键）");
 
   const solidDoc = { type: "scene", scene: mkScene([]), roots: [], project: null };
@@ -5095,6 +5121,150 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
   // 与引擎同一份前缀表：解析器改了前缀而编辑器没跟，这条要红
   const engineCtr = /'models\/util\/composelayer'/.test(parseSrc);
   check(engineCtr && ctr.CONTAINER_IMAGE === "models/util/composelayer", "引擎与编辑器的容器前缀是同一条字面量（改一边这条即红）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+section("ALPHA. 透明层：自定义尺寸的空效果画布 editor/container.ts + main.ts（M5 补 A12b）");
+{
+  const ctr = await loadEditorModule("container");
+  const docMod = await loadEditorModule("doc");
+  const kinds = await loadEditorModule("layer-kinds");
+  const ctrSrc = fs.readFileSync(path.join(ROOT, "editor/container.ts"), "utf8");
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
+  const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  const renderSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+
+  // —— 写进对象的每一格字段都必须有引擎侧读点（引擎改了哪条，这条就红）——
+  check(parseSrc.includes("let layerSize = parseVec2(o.size || '0 0')"), "size 是引擎的层尺寸读取点（parse.js layerSize）");
+  check(renderSrc.includes("contentW = layer.size[0]") && renderSrc.includes("contentH = layer.size[1]"), "没有自带贴图的空内容层，效果链 FBO 尺寸取自 layer.size（renderer.js contentW/H 分支）");
+  check(/layer\.solid \? whiteTex : transparentTex/.test(renderSrc) && renderSrc.includes("new Uint8Array([0, 0, 0, 0]), 1, 1"), "solid=false 且没绑贴图 ⇒ 源图是 1×1 全透明：透明层「自己不画东西」的引擎依据");
+  check(renderSrc.includes("if (layer.copybackgroundExplicit && layer.copybackground === false) return false"), "显式 copybackground:false 才让空容器不拷背板（透明层与直通层的唯一分界）");
+  check(parseSrc.includes("copybackgroundExplicit: o.copybackground !== undefined && o.copybackground !== null"), "parse.js 把「显式 false」与「键不存在」分开记（键不存在仍会回读背板）");
+  check(renderSrc.includes("if (!layer || !layer.isContainer || layer.hasChildren) return false"), "回读背板只对「无子层的空容器」成立（透明层拖进子层后语义自动变成普通容器）");
+
+  // —— 对象形状：键集 / 键序 / 逐字节 ——
+  const mkScene = (objs) => ({ general: { orthogonalprojection: { width: 1920, height: 1080 } }, objects: objs });
+  const mkDoc = () => ({ type: "scene", scene: mkScene([]), roots: [], project: null });
+  const alphaDoc = mkDoc();
+  const alphaId = ctr.addTransparentLayer(alphaDoc, { name: "透明层", width: 600, height: 400, origin: "960 540 0" });
+  const alphaObj = alphaDoc.scene.objects[0];
+  check(alphaId !== null && alphaObj.id === alphaId, "addTransparentLayer 返回的 id 就是新对象的 id（structEdit 拿它当选中项）");
+  check(alphaObj.image === ctr.CONTAINER_MODEL && alphaObj.image === "models/util/composelayer.json", "透明层用引擎认得的容器对象 models/util/composelayer.json（BUILTIN_MODELS 的键，不是编辑器编的新前缀）");
+  // 「透明层到底会不会被装配」的硬判据：装配循环 `if (!layer.image) continue` → 查内置模型表
+  // → 落空且 readAsset 找不到（新工程里没有 models/util/*）就 `continue`，这层没有材质、
+  // 效果链一次也不解析 —— 加出来的层看着在树里、画面上什么都没有。
+  const effMod = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
+  check(!!effMod.BUILTIN_MODELS[alphaObj.image], "透明层的 image 是 BUILTIN_MODELS 的键：装配循环不会 `continue`（挂上去的效果链才解析）");
+  check(alphaObj.size === "600 400", `对话框给的尺寸写进 size 字段（${json(alphaObj.size)}）`);
+  check(alphaObj.copybackground === false, "显式写 copybackground:false（不写就等于回读背板，层就不透明了）");
+  check(alphaObj.config === undefined && alphaObj.passthrough === undefined, "不写 config.passthrough：直通=把画面当源图，与「空画布」是两种语义");
+  check(alphaObj.scale === "1 1 1" && alphaObj.angles === "0 0 0" && alphaObj.visible === true, "变换初值是单位值（尺寸只由 size 决定，不用 scale 撑）");
+  check(json(Object.keys(alphaObj).sort()) === json(["angles", "copybackground", "id", "image", "name", "origin", "scale", "size", "visible"]), `透明层的键集固定（${json(Object.keys(alphaObj).sort())}）`);
+  check(JSON.stringify(alphaObj) === json({ angles: "0 0 0", copybackground: false, id: alphaId, image: "models/util/composelayer.json", name: "透明层", origin: "960 540 0", scale: "1 1 1", size: "600 400", visible: true }), `透明层的 JSON 逐字节等于期望（键序与工程口径一致：${json(alphaObj)}）`);
+  check(docMod.kindOf(alphaObj) === "container" && kinds.layerKindInfo("container")?.canHaveEffects === true, "透明层在图层树 / 检视器里按容器走（canHaveEffects），加完就能挂效果");
+  check(docMod.findNode(alphaDoc.roots, alphaId) !== null, "透明层进了图层树（rebuildTree 已跑）");
+
+  // —— 尺寸夹取：NaN / 0 / 负数 / 小数 / 超限都不许进工程 ——
+  const sizeOf = (w, h) => {
+    const d = mkDoc();
+    ctr.addTransparentLayer(d, { width: w, height: h });
+    return d.scene.objects[0].size;
+  };
+  check(sizeOf(600.4, 399.6) === "600 400", "小数尺寸四舍五入");
+  check(sizeOf(0, -5) === "1 1" && sizeOf(NaN, undefined) === "1 1", "0 / 负数 / NaN ⇒ 夹到 1（工程里不出现 0 尺寸或 NaN）");
+  check(sizeOf(99999, 20000) === `${ctr.TRANSPARENT_LAYER_MAX} ${ctr.TRANSPARENT_LAYER_MAX}`, `超限尺寸夹到 ${ctr.TRANSPARENT_LAYER_MAX}（与 index.html 的 max 属性同口径）`);
+  check(ctr.TRANSPARENT_LAYER_MAX === 16384, "尺寸上限是 16384");
+
+  // —— 存盘 → 再 parse → 逐字节一致（透明层能安全走一圈 scene.json）——
+  const saved = JSON.stringify(alphaDoc.scene);
+  const reparsed = JSON.parse(saved);
+  const rtObj = reparsed.objects.find((o) => o.id === alphaId);
+  check(rtObj.copybackground === false && rtObj.size === "600 400" && JSON.stringify(reparsed) === saved, "写盘再解析后 size / copybackground 仍在，整份 scene.json 逐字节不变");
+
+  // —— 页面接线：按钮 / 对话框 / 结构编辑 / 非法值拦截 / 文案 ——
+  check(htmlSrc.includes('id="ly-add-alpha"') && htmlSrc.includes('data-et-title="ly.addAlpha"'), "图层工具条有「添加透明层」按钮（带词条）");
+  const alphaMax = [...htmlSrc.matchAll(/id="alpha-[wh]"[^>]*max="(\d+)"/g)].map((m) => Number(m[1]));
+  check(alphaMax.length === 2 && alphaMax.every((v) => v === ctr.TRANSPARENT_LAYER_MAX), `对话框两个数字框的 max 与 TRANSPARENT_LAYER_MAX 同口径（${json(alphaMax)}）`);
+  check(htmlSrc.includes('id="alpha-dlg"') && ["alpha-w", "alpha-h", "alpha-canvas", "alpha-ok", "alpha-cancel"].every((id) => htmlSrc.includes(`id="${id}"`)), "尺寸对话框有宽 / 高输入 + 取画布大小 + 添加 / 取消");
+  check(/lyAddAlphaEl\.disabled = lyAddEl\.disabled;/.test(mainSrc), "按钮可用性跟随添加图片层（没有场景 / 叠加层时是灰的）");
+  check(/lyAddAlphaEl\.onclick = \(\) => openAlphaDialog\(\);/.test(mainSrc), "按钮打开尺寸对话框（先问尺寸，再加层）");
+  check(/alphaOkEl\.disabled = !alphaSize\(\);/.test(mainSrc) && /if \(!Number\.isFinite\(w\) \|\| !Number\.isFinite\(h\) \|\| w < 1 \|\| h < 1\) return null;/.test(mainSrc), "尺寸非法（空 / 0 / NaN）时「添加」直接禁用，NaN 进不了 scene.json");
+  check(/if \(!s\) return;[\s\S]{0,60}?addTransparent\(s\.w, s\.h\);/.test(mainSrc), "「添加」把校验过的尺寸交给 addTransparent");
+  check(/structEdit\(et\("log\.alphaAdded", \{ name, w: width, h: height \}\)/.test(mainSrc) && /addTransparentLayer\(d, \{/.test(mainSrc), "加层走 structEdit + container.ts 的对象生成（可撤销、整场景重挂、加完选中）");
+  check(/alphaDlgEl\.addEventListener\("keydown"/.test(mainSrc) && /alphaWEl\.select\(\)/.test(mainSrc), "回车 = 添加、打开即聚焦宽输入框");
+  check(/if \(e\.target === alphaDlgEl\) alphaDlgEl\.close\(\);/.test(mainSrc), "点对话框外面 = 取消（与 ui/confirm.ts 同一口径）");
+  check(/alphaWEl\.value = String\(Math\.round\(r\.w\)\)/.test(mainSrc) && /sceneResolution\(doc\?\.scene \?\? null\)/.test(mainSrc), "对话框默认值 = 当前画布尺寸（「取画布大小」用同一个来源）");
+  check(cssSrc.includes(".ed-alpha-form"), "尺寸对话框有样式（.ed-alpha-form）");
+
+  // —— 生成之后还能改尺寸：读 / 写与 objprops.writeField 同一套铁律 ——
+  // 透明层在画面上是隐形的，看得见的只有这块 W×H；尺寸定错了必须能改，
+  // 删掉重建会把整条效果链一起丢，所以检视器里得有两个数字框。
+  check(json(ctr.layerSizeOf({ size: "600 400" })) === json([600, 400]) && json(ctr.layerSizeOf({ size: "  600   400 " })) === json([600, 400]), "layerSizeOf 读工程口径的 `W H`（多余空白不在意）");
+  check(ctr.layerSizeOf({}) === null && ctr.layerSizeOf({ size: "0 0" }) === null && ctr.layerSizeOf({ size: "abc" }) === null && ctr.layerSizeOf(null) === null, "没有 size / 0 0 / 非数字 ⇒ null（引擎那种「没写 = 0 0」的退化态要能和正常尺寸分开）");
+  check(json(ctr.layerSizeOf({ size: { user: "x", value: "300 200" } })) === json([300, 200]), "包装（user/script/animation）读快照值，与 objprops 的读取口径同一份");
+  const sizeA = { Size: "640 360" };
+  check(ctr.setLayerSize(sizeA, 800, 300) === true && sizeA.Size === "800 300" && !("size" in sizeA), "写入回到**原来的键名**（`Size` 保持 `Size`，不新增第二个键 —— 大小写不敏感是 objprops 的铁律）");
+  const sizeB = {};
+  check(ctr.setLayerSize(sizeB, 100, 50) === true && sizeB.size === "100 50", "对象上本来没有 size ⇒ 按引擎认的规范名新增（历史容器对象也能这样补上尺寸）");
+  const sizeC = { size: { user: 1, value: "10 20" } };
+  check(ctr.setLayerSize(sizeC, 30, 40) === true && sizeC.size.value === "30 40" && sizeC.size.user === 1, "包装只改 value，不动 user / script / animation 绑定");
+  const sizeD = { size: "600 400" };
+  check(ctr.setLayerSize(sizeD, 600, 400) === false && ctr.setLayerSize(sizeC, 30, 40) === false, "值没变时返回 false（调用方据此不记一次撤销，检视器里点一下不会凭空多一档历史）");
+  const sizeE = {};
+  ctr.setLayerSize(sizeE, 600.4, 399.6);
+  const sizeRounded = sizeE.size;
+  ctr.setLayerSize(sizeE, 0, -5);
+  const sizeClamped = sizeE.size;
+  ctr.setLayerSize(sizeE, 99999, 20000);
+  check(sizeRounded === "600 400" && sizeClamped === "1 1" && sizeE.size === `${ctr.TRANSPARENT_LAYER_MAX} ${ctr.TRANSPARENT_LAYER_MAX}`, "写入前同样取整 / 夹到 1..TRANSPARENT_LAYER_MAX（与对话框同一个 layerPx）");
+
+  // —— 检视器接线：容器组里的「效果画布尺寸」行 ——
+  check(/sizeInput\("size-w", cur \? cur\[0\] : null\)/.test(mainSrc) && /sizeInput\("size-h", cur \? cur\[1\] : null\)/.test(mainSrc), "容器检视器有宽 / 高两个数字框（初值取对象上的 size，没有就留空）");
+  check(/objEdit\(et\("log\.sizeChanged", \{ layer, w: nw, h: nh \}\), node\.id, \(ob\) => setLayerSize\(ob, nw, nh\)\)/.test(mainSrc), "改尺寸走 objEdit + container.ts 的 setLayerSize（可撤销、值没变不记账）");
+  check(/if \(!Number\.isFinite\(w\) \|\| !Number\.isFinite\(hh\) \|\| w < 1 \|\| hh < 1\) return;/.test(mainSrc), "非法的框值（空 / 0 / NaN）直接不提交，不把 0 尺寸写进工程");
+  check(/inp\.dataset\.container = field;[\s\S]{0,90}?addEventListener\("change", \(\) => commitSize\(\)\)/.test(mainSrc), "两个数字框带 data-container 钩子并监听 change（端到端用例靠它找到控件）");
+  check(mainSrc.includes("layerSizeOf") && mainSrc.includes("setLayerSize("), "检视器用的是 container.ts 导出的读写函数（没有第二套尺寸口径）");
+  check(cssSrc.includes(".ed-dim-x"), "尺寸行有样式（两个框中间的 × 号）");
+
+  const alphaKeys = ["ly.addAlpha", "alpha.title", "alpha.hint", "alpha.w", "alpha.h", "alpha.canvas", "alpha.add", "alpha.cancel", "alpha.defaultName", "log.alphaAdded", "insp.size", "insp.sizeNote", "log.sizeChanged"];
+  const dup = alphaKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
+  check(dup.length === 0, `透明层文案中英文各恰好一条（${alphaKeys.length} 条，缺 / 多 ${json(dup)}）`);
+  const dlgAt = htmlSrc.indexOf('id="alpha-dlg"');
+  const dlgHtml = htmlSrc.slice(dlgAt, htmlSrc.indexOf("</dialog>", dlgAt));
+  const etAttrs = [...dlgHtml.matchAll(/data-et="([^"]+)"/g)].map((m) => m[1]);
+  const missingEt = etAttrs.filter((k) => !new RegExp(`"${k.replace(/\./g, "\\.")}":`).test(i18nSrc));
+  check(etAttrs.length >= 6 && missingEt.length === 0, `对话框里每个 data-et 都有词条（${etAttrs.length} 个，缺 ${json(missingEt)}）`);
+  check(alphaKeys.every((k) => mainSrc.includes(`"${k}"`) || htmlSrc.includes(`data-et="${k}"`) || htmlSrc.includes(`data-et-title="${k}"`)), "透明层文案键都在页面 / 脚本里真的用到（没有只登记不用的空词条）");
+
+  // —— 变异红测：改坏实现，上面的形状判据必须变红 ——
+  const ctrPath = path.join(ROOT, "editor/container.ts");
+  const noCopyBg = ctrSrc.replace("copybackground: false,", "");
+  check(noCopyBg !== ctrSrc, "变异点存在（container.ts 里有 copybackground: false,）");
+  const mCtr1 = await loadEditorModule("container", { [ctrPath]: noCopyBg });
+  const mDoc1 = mkDoc();
+  mCtr1.addTransparentLayer(mDoc1, { width: 100, height: 50 });
+  check(mDoc1.scene.objects[0].copybackground === undefined && JSON.stringify(mDoc1.scene.objects[0]) !== JSON.stringify({ ...alphaObj, id: mDoc1.scene.objects[0].id, name: undefined, origin: "0 0 0", size: "100 50" }), "去掉 copybackground:false ⇒ 对象不再是透明层（形状断言确实靠那一行才绿）");
+  const noSize = ctrSrc.replace('size: `${width} ${height}`,', "");
+  check(noSize !== ctrSrc, "变异点存在（container.ts 里有 size: `${width} ${height}`,）");
+  const mCtr2 = await loadEditorModule("container", { [ctrPath]: noSize });
+  const mDoc2 = mkDoc();
+  mCtr2.addTransparentLayer(mDoc2, { width: 320, height: 240 });
+  check(mDoc2.scene.objects[0].size === undefined, "去掉 size 写入 ⇒ 层退化成引擎的 0×0 空 quad（尺寸断言确实靠那一行才绿）");
+  const noWrapper = ctrSrc.replace("if (isObjWrapper(cur)) {", "if (false) {");
+  check(noWrapper !== ctrSrc, "变异点存在（setLayerSize 里有 isObjWrapper 分支）");
+  const mCtr3 = await loadEditorModule("container", { [ctrPath]: noWrapper });
+  const wBound = { size: { user: 1, value: "10 20" } };
+  mCtr3.setLayerSize(wBound, 30, 40);
+  check(!(wBound.size && wBound.size.value === "30 40" && wBound.size.user === 1), "去掉包装分支 ⇒ 写入把 user 绑定整块换成裸字符串（包装断言确实靠那一行才绿）");
+  const looseKey = ctrSrc.replace('const k = fieldKeyOf(o, "size");\n  if (!k) {', 'const k = "size";\n  if (false) {');
+  check(looseKey !== ctrSrc, "变异点存在（setLayerSize 里有 fieldKeyOf 分支）");
+  const mCtr4 = await loadEditorModule("container", { [ctrPath]: looseKey });
+  const sCase = { Size: "640 360" };
+  mCtr4.setLayerSize(sCase, 800, 300);
+  check(!(sCase.Size === "800 300" && !("size" in sCase)), "按固定小写键写 ⇒ 对象上多出一个 `size`、原 `Size` 不更新（真实键名断言确实靠 fieldKeyOf 才绿）");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

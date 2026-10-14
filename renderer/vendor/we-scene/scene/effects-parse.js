@@ -278,6 +278,25 @@ export const BUILTIN_MODELS = {
   'models/util/projectlayer.json': { material: 'materials/util/solidlayer.json' },
 }
 
+// [we-scene patch] 内置模型表的**无后缀别名**：`models/util/composelayer`（少 `.json`）。
+//
+// 工坊语料 838/838 个 composelayer 对象都带 `.json`，但**本编辑器在 M5 A12 起的容器 /
+// 全屏后期层写的是不带后缀的前缀**（editor/container.ts 的 CONTAINER_IMAGE），于是
+// `BUILTIN_MODELS[layer.image]` 整串查表落空、`readAsset` 在工程里也找不到
+// models/util/* ⇒ scene-mount 的装配循环 `continue` ⇒ 那层没有材质、挂在它上面的
+// 效果链一次也不解析（加容器层 / 加全屏后期层加出来的层在预览里是死的）。
+//
+// 编辑器侧已改成写出带 `.json` 的字面量；这里再补一份别名，让**已经存过盘的工程**
+// （scene.json 里留着老写法）不用迁移也能正常渲染。别名与正式键指向同一个内置模型。
+for (const [path, model] of Object.entries({
+  'models/util/solidlayer': 'models/util/solidlayer.json',
+  'models/util/composelayer': 'models/util/composelayer.json',
+  'models/util/fullscreenlayer': 'models/util/fullscreenlayer.json',
+  'models/util/projectlayer': 'models/util/projectlayer.json',
+})) {
+  BUILTIN_MODELS[path] = BUILTIN_MODELS[model]
+}
+
 // genericimage* / sprite / flat 是 WE 内置反照率直通，本仓库用 copy pass 画
 // textures[0] 即可。作者写在 pkg 里的图层材质 shader（flowimage、工坊 tint）
 // 必须挂进效果链，否则只剩一张静图 —— 833227004「会动的星云」完全不动。

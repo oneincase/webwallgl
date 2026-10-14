@@ -2179,6 +2179,19 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     "usePassthrough 必须并上 isPostProcess（后期层内容 = 画布回读）");
   check(/fullscreenlayer\.json/.test(esrc) && /projectlayer\.json/.test(esrc),
     "BUILTIN_MODELS 必须注册 fullscreenlayer/projectlayer（否则装配 continue，效果不解析）");
+  // 整串查表（scene-mount：eff.BUILTIN_MODELS[layer.image]）：编辑器 M5 A12 起写的是
+  // 不带 .json 的前缀，装配循环因此 continue，加出来的容器 / 透明层 / 后期层全是死层。
+  // 编辑器侧已改成写带 .json 的字面量，这里要求表里同时留无后缀别名 —— 已存盘的老工程
+  // （scene.json 里是老写法）不用迁移也能渲染。
+  {
+    const effMod = await imp("renderer/vendor/we-scene/scene/effects-parse.js");
+    const M = effMod.BUILTIN_MODELS;
+    check(!!M["models/util/composelayer"] && M["models/util/composelayer"] === M["models/util/composelayer.json"],
+      "composelayer 无后缀别名与正式键指向同一个内置模型");
+    check(["fullscreenlayer", "projectlayer", "solidlayer"].every((n) => !!M[`models/util/${n}`] && M[`models/util/${n}`] === M[`models/util/${n}.json`]),
+      "四个内置模型都接受无后缀写法（老编辑器 scene.json 与新语料都能装配）");
+    check(M["models/editor/x.json"] === undefined, "别名表不放行任意路径（models/util/* 四个概念之外的键不凭空出现）");
+  }
   check(/orthogonalprojection/.test(psrc) && /gw \/ 2/.test(psrc),
     "parse 必须把后期层矩形拉成正交投影（不能用编辑器预览框）");
 

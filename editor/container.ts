@@ -16,11 +16,26 @@
 
 import type { EditorDoc, SceneObject } from "./doc";
 import { nextObjectId, rebuildTree } from "./doc";
+import { fieldKeyOf, isObjWrapper, objFieldRaw } from "./objprops";
 
-/** 容器层 image 前缀（与 parse.js 的 isContainer 同一字面量） */
+/** 容器层 image 前缀（与 parse.js 的 isContainer 同一字面量；判定用，不带 .json 才能同时认新旧两种写法） */
 export const CONTAINER_IMAGE = "models/util/composelayer";
 /** 全屏后期层 image 前缀（与 parse.js 的 isPost 同一字面量） */
 export const FULLSCREEN_POST_IMAGES = ["models/util/projectlayer", "models/util/fullscreenlayer"];
+
+/**
+ * **新对象写出的 image：带 `.json`**（判定用前缀，写盘用这两个）。
+ *
+ * 引擎的内置模型表是整串查表（scene-mount.ts 的 `eff.BUILTIN_MODELS[layer.image]`），
+ * 表里只有 `models/util/{solidlayer,composelayer,fullscreenlayer,projectlayer}.json`
+ * 四个键 —— 少一个后缀就是查表落空 + `readAsset` 也找不到（工程里没有 models/util/*）
+ * ⇒ 装配循环 `continue`，这层没有材质、挂上去的效果链**根本不解析**。
+ * 本机 364 个语料包里 838 个 composelayer 对象全部带 `.json`；
+ * verify-groups.mjs 的 K 段对 fullscreenlayer 记过同一条坑。
+ */
+export const CONTAINER_MODEL = `${CONTAINER_IMAGE}.json`;
+/** 全屏后期层写盘用的 image（BUILTIN_MODELS 的键，见上） */
+export const POST_MODEL = `${FULLSCREEN_POST_IMAGES[0]}.json`;
 
 const hasPrefix = (v: unknown, prefix: string) => typeof v === "string" && v.indexOf(prefix) === 0;
 
@@ -83,10 +98,23 @@ export type ContainerCreateOpts = {
   origin?: string;
   scale?: string;
   angles?: string;
+  /**
+   * 图层尺寸 `"W H"`（像素）。容器 / 透明层的**效果画布**就是这个尺寸
+   * （renderer.js 的 contentW/H：没有自己的贴图时取 layer.size），
+   * 不写就是引擎的 `0 0` —— 那是一个零尺寸 quad，效果 FBO 也随之退化成空。
+   */
+  size?: string;
   /** 引擎侧实心：该层参与拾取 / 遮挡 */
   solid?: boolean;
   /** 直通：效果只作用在画布背板，不吞掉已经画好的画面 */
   passthrough?: boolean;
+  /**
+   * 只允许显式 `false`：写 `copybackground: false` = 「**不要**取身后的画面」。
+   * 引擎认的是「键在不在」（parse.js 的 copybackgroundExplicit + renderer.js 的
+   * layerWantsComposeBackdrop）：空容器默认会把背板拷进层 FBO，**只有显式 false**
+   * 才是一块透明画布。true 不写（与本文件其它旗标「关掉就删键」的口径一致）。
+   */
+  copybackground?: boolean;
 };
 
 /**
@@ -104,11 +132,13 @@ export function addContainerLayer(doc: EditorDoc, opts: ContainerCreateOpts = {}
   const post = opts.kind === "post";
   const o: SceneObject = { angles: opts.angles ?? "0 0 0" };
   if (opts.passthrough) o.config = {};
+  if (opts.copybackground === false) o.copybackground = false;
   o.id = id;
-  o.image = post ? FULLSCREEN_POST_IMAGES[0] : CONTAINER_IMAGE;
+  o.image = post ? POST_MODEL : CONTAINER_MODEL;
   o.name = opts.name ?? CONTAINER_IMAGE;
   o.origin = opts.origin ?? "0 0 0";
   o.scale = opts.scale ?? "1 1 1";
+  if (opts.size) o.size = opts.size;
   o.visible = true;
   if (opts.solid) o.solid = true;
   // config 在字母序里排在 id 之前（与 text.ts 的 addTextLayer 同一口径）；键序固定才好逐字节比对
@@ -116,4 +146,97 @@ export function addContainerLayer(doc: EditorDoc, opts: ContainerCreateOpts = {}
   objs.push(o);
   rebuildTree(doc);
   return id;
+}
+
+export type TransparentLayerCreateOpts = {
+  /** 图层名（树里显示；调用方给本地化名字） */
+  name?: string;
+  /** 画布宽（像素；取整、夹到 1..TRANSPARENT_LAYER_MAX） */
+  width: number;
+  /** 画布高（像素；取整、夹到 1..TRANSPARENT_LAYER_MAX） */
+  height: number;
+  /** 层自身变换；不传就是 0 0 0 / 0 0 0 */
+  origin?: string;
+  angles?: string;
+};
+
+/** 透明层尺寸上限（像素）。与 index.html 里两个数字框的 max 属性同一口径。 */
+export const TRANSPARENT_LAYER_MAX = 16384;
+
+/** 尺寸落到 scene.json 前的取整与夹取（NaN / 负数 / 0 一律兜到 1，别把 NaN 写进工程） */
+const layerPx = (v: number): number =>
+  Number.isFinite(v) ? Math.min(TRANSPARENT_LAYER_MAX, Math.max(1, Math.round(v))) : 1;
+
+/**
+ * 「透明层」= 自定义尺寸的**空效果画布**（M5 补 A12b）。
+ *
+ * 为什么是这一组字段（每一格都有引擎侧的读点，不是编辑器编的新词）：
+ *   · `image: models/util/composelayer.json` —— 引擎唯一的「层内容画布」对象（parse.js 的
+ *     isContainer）。它有自己的一块 FBO，挂在这层上的效果链就画在这块 FBO 上
+ *     （后缀 `.json` 不能省：BUILTIN_MODELS 是整串查表，见 CONTAINER_MODEL 的注释）；
+ *   · `size: "W H"` —— 这块 FBO 的尺寸（renderer.js 的 contentW/H：没有自己的贴图时
+ *     取 `layer.size`）。不写就是 `0 0`，即一块零尺寸 quad，效果无处落笔；
+ *   · `copybackground: false` —— **显式**声明不拷背板。空容器默认
+ *     （layerWantsComposeBackdrop）会把身后的画面拷进层 FBO 再套效果；显式 false 之后
+ *     源图是 1×1 全透明（renderer.js 的 transparentTex），于是「什么都没有、但效果能画」；
+ *   · 不带 `config.passthrough` —— 直通会把画面本身当源图，那是另一种语义（见 addContainerLayer）。
+ *
+ * 于是「透明层 + 效果」= 一块用户指定尺寸的透明背板 + 落在它上面的效果链，
+ * 与 WE 工程里 3351179520 的 393 / 103 号对象同形，导出给 WE 也是同一份 scene.json。
+ */
+export function addTransparentLayer(doc: EditorDoc, opts: TransparentLayerCreateOpts): number | string | null {
+  const width = layerPx(opts.width);
+  const height = layerPx(opts.height);
+  return addContainerLayer(doc, {
+    name: opts.name,
+    origin: opts.origin,
+    angles: opts.angles,
+    size: `${width} ${height}`,
+    copybackground: false,
+  });
+}
+
+/**
+ * 读图层尺寸 `"W H"`（像素）。没有 size、或值不是两个正数时返回 null ——
+ * 引擎的口径是 `parseVec2(o.size || '0 0')`：**不写就是 0 0**，一块零尺寸 quad。
+ * 包装（{user|script|animation, value}）读快照值，与 objprops 的读取口径同一份。
+ */
+export function layerSizeOf(o: SceneObject | null | undefined): [number, number] | null {
+  const k = fieldKeyOf(o, "size");
+  if (!o || !k) return null;
+  const raw = objFieldRaw(o[k]);
+  if (typeof raw !== "string") return null;
+  const parts = raw.trim().split(/\s+/);
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  return [Math.round(w), Math.round(h)];
+}
+
+/**
+ * 写图层尺寸（`size` 不在 objprops.OBJ_FIELDS 里 —— 它不是 WE 的通用对象字段，
+ * 而是「层内容画布」这一族对象才有意义的尺寸，所以写入口跟生成口放在一起）。
+ *
+ * 三条铁律与 objprops.writeField 同一份，别在这里发明第二套口径：
+ *   · 大小写不敏感地回到**原来的键名**（`Size` 保持 `Size`，不新增第二个键）；
+ *   · 对象上本来没有这个键时按引擎认的规范名 `size` 新增；
+ *   · 包装只改 `.value`，不动 user / script / animation 绑定本身。
+ * 返回是否真的改了（false = 值没变，调用方据此不记一次撤销）。
+ */
+export function setLayerSize(o: SceneObject, width: number, height: number): boolean {
+  const next = `${layerPx(width)} ${layerPx(height)}`;
+  const k = fieldKeyOf(o, "size");
+  if (!k) {
+    o.size = next;
+    return true;
+  }
+  const cur = o[k];
+  if (isObjWrapper(cur)) {
+    if (objFieldRaw(cur) === next) return false;
+    cur.value = next;
+    return true;
+  }
+  if (cur === next) return false;
+  o[k] = next;
+  return true;
 }

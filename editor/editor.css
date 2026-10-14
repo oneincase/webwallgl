@@ -2616,3 +2616,44 @@ input.ed-al-name {
 #ed-left .wb-panel-tools {
   flex: none;
 }
+
+/* ---------- 透明层尺寸对话框（M5 补 A12b） ----------
+   透明层是「自定义尺寸的空效果画布」：尺寸在加层时就要问清楚（加完是个看不见的层，
+   不给尺寸入口的话用户只能去猜为什么它没出现在画面上）。宽 / 高两个数字框 + 一个
+   「取画布大小」快捷键；非法值直接禁用「添加」，不让 NaN 流进 scene.json。 */
+.ed-alpha-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+  margin: 0 0 12px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-alpha-form label {
+  color: var(--wb-fg-mute);
+}
+
+.ed-alpha-form input[type="number"] {
+  width: 76px;
+  height: 22px;
+  padding: 0 4px;
+  font: var(--wb-font-xs) var(--mono);
+}
+
+.ed-alpha-form #alpha-canvas {
+  margin-left: auto;
+}
+
+/* 检视器里的「效果画布尺寸」：两个数字框中间一个 × 号（M5 补 A12b） */
+.ed-container .ed-fx-param input[type="number"] {
+  width: 68px;
+  height: 22px;
+  padding: 0 4px;
+  font: var(--wb-font-xs) var(--mono);
+}
+
+.ed-container .ed-dim-x {
+  color: var(--wb-fg-mute);
+  font-size: var(--wb-font-xs);
+}

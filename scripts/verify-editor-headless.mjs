@@ -928,6 +928,11 @@ async function runCreateAndDraft(ctx) {
     await h.waitRemount(rc);
   };
 
+  // 调试闸门：WE_E2E_FROM=AP 时只从 AP 段开始跑（前面各段走「已跳过」；页面没坏，是闸门 —— 改 AP 判据时省一次十几分钟全量）
+  if (process.env.WE_E2E_FROM) {
+    hlState.dead = true;
+    console.log(`  · 调试闸门 WE_E2E_FROM=${process.env.WE_E2E_FROM}：从该段开始跑，之前的真机段按跳过处理`);
+  }
   section("Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）");
   if (hlState.dead) hlSkip("Q", "Q. 新建端到端（模板 → 图片层 → 自动保存 → 编辑器与预览播放）"); else try {
   await gotoEditor();
@@ -4155,6 +4160,189 @@ async function skelE2E() {
   } catch (err) { await hlAbort("AQ", aqName, err); }
 }
 
+/**
+ * AP. 透明层（M5 补 A12b）：自定义尺寸的空效果画布 —— 加 600×400 透明层 → 挂「颜色叠加」→
+ * 效果只在该矩形内出帧、矩形外背景不动 → 撤销 / 重做 → 用检视器改成 800×300（宽了 / 矮了各一个探针）
+ * → 存库重开出帧一致（改后的尺寸也在盘上生效）。
+ * 判据 = 盘上 scene.json 的 image / size / copybackground 三件套 + CDP 截图的真实像素：
+ * 尺寸真的当效果画布用（不是 0×0 死层、也不是整屏），copybackground:false 让输入保持透明。
+ * 像素判据一律先藏掉 #ed-overlay：选中态的覆盖层画在正片之上，会把整片读数染蓝（见 CASEBOOK）。
+ */
+async function alphaE2E() {
+  var apName = "AP. 透明层端到端（自定义尺寸空效果画布 → 挂效果只在该矩形内出帧 → 存库重开）";
+  section(apName);
+  if (hlState.dead && process.env.WE_E2E_FROM !== "AP") hlSkip("AP", apName); else try {
+  var apDisk = (id) => {
+    const dir = path.join(lib, id);
+    const sc = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+    return { dir, sc, objs: sc.objects ?? [] };
+  };
+  /** 对话框里敲尺寸（用户是敲数字；这里按 input 事件热更「添加」按钮的可用态） */
+  var apSize = (w, hh) =>
+    ev(`(() => {
+      const W = document.querySelector('#alpha-w'), H = document.querySelector('#alpha-h');
+      W.value = '${w}'; W.dispatchEvent(new Event('input', { bubbles: true }));
+      H.value = '${hh}'; H.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
+  /** 走完整交互：点工具栏「透明层」→ 对话框 → 填尺寸 → 添加 → 等重挂；返回对话框打开时的默认尺寸 */
+  var apAdd = async (w, hh) => {
+    const rc = await h.readyCount();
+    await clickSel("#ly-add-alpha");
+    await waitFor(`!!document.querySelector('#alpha-dlg')?.open`, 20000);
+    const def = await ev(`[document.querySelector('#alpha-w').value, document.querySelector('#alpha-h').value]`);
+    await apSize(w, hh);
+    await clickSel("#alpha-ok");
+    await h.waitRemount(rc);
+    return def;
+  };
+  var apFx = async (js) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => { ${js}; return true; })()`);
+    await h.waitRemount(r0);
+  };
+  var apAddFx = (id) => apFx(`const s = document.querySelector('#fx-add'); s.value = '${id}'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  var apSetFx = (i, param, value) =>
+    apFx(`const el = document.querySelector('.ed-fx-item[data-fx-index="${i}"] input[data-param="${param}"]'); el.value = '${value}'; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  /** 引擎装配出来的透明层状态：像素读数的解释依据（solid / textureName / 效果 pass 数 / FBO 数 / 合成是否 additive） */
+  var apDump = async (tag) => {
+    const st = await ev(`(() => {
+      const s = window.__scene;
+      if (!s) return 'no __scene';
+      const l = (s.layers || []).filter((x) => /composelayer/.test(String(x.image || '')));
+      return JSON.stringify({ tag: '${tag}', n: l.length, layers: l.map((x) => ({
+        id: x.id, img: x.image, solid: !!x.solid, tex: x.textureName || null, size: x.size, scale: x.scale,
+        kids: (x.childIds || []).length, pt: !!x.passthrough, cb: x.copybackground, cbx: !!x.copybackgroundExplicit,
+        cam: x.containerAlphaMeaningful === undefined ? 'undef' : !!x.containerAlphaMeaningful,
+        eff: (x.effects || []).map((e) => ({ id: e.id, vis: e.visible, mat: (e.materialPasses || []).length, fbo: (e.fbos || []).length })),
+      })) });
+    })()`);
+    console.log(`  · AP 状态[${tag}] ${st}`);
+  };
+  var apFxItems = async () =>
+    ev(`JSON.stringify([...document.querySelectorAll('.ed-fx-item')].map((e) => ({
+      id: e.dataset.fxId, idx: e.dataset.fxIndex,
+      params: [...e.querySelectorAll('input,[select]')].map((i) => [i.dataset.param || i.type, i.value]),
+    })))`);
+  /** 检视器「效果画布尺寸」两个数字框：先揭出所在面板（隐藏面板里的控件照样能派事件，
+   *  但先按工程口径露出来，跟 setInputs / clickSel 一个路子），再各派一次 change。 */
+  var apResize = async (w, hh) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => {
+      const reveal = (el) => { const p = el?.closest('.ed-insp-panel[hidden]'); if (p) document.querySelector('.ed-insp-tab[data-tab="' + p.dataset.tab + '"]').click(); return el; };
+      const set = (sel, v) => { const el = reveal(document.querySelector(sel)); el.value = String(v); el.dispatchEvent(new Event('change', { bubbles: true })); };
+      set('.ed-container input[data-container="size-w"]', ${w});
+      set('.ed-container input[data-container="size-h"]', ${hh});
+      return true;
+    })()`);
+    await h.waitRemount(r0);
+  };
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  var apDef = await apAdd(600, 400);
+  check(apDef[0] === "1920" && apDef[1] === "1080", `透明层对话框默认尺寸 = 场景分辨率（实得 ${apDef.join("×")}）`);
+  var apTree = await h.treeNames();
+  check(apTree.some((n) => /透明层|Transparent/.test(n)) && /透明层|Transparent/.test(await h.selectedName()), `加完即选中「透明层」（直接就能挂效果）（树 ${JSON.stringify(apTree)}，选中 ${JSON.stringify(await h.selectedName())}）`);
+  check(await ev(`!!document.querySelector('.ed-fx') && !document.querySelector('#fx-add').disabled`), "选中透明层：检视器有「效果」分组（容器类可挂效果）");
+  await apDump("加完未挂效果");
+
+  // ── 盘上三件套：image 带 .json（引擎 BUILTIN_MODELS 是整串查表）、size、copybackground:false ──
+  var apId = await saveLoose();
+  var apD = apDisk(apId);
+  var apObj = apD.objs.find((o) => /composelayer/.test(String(o.image || "")));
+  check(!!apObj, `盘上有 composelayer 对象（实得 ${JSON.stringify(apD.objs.map((o) => o.image))}）`);
+  check(
+    apObj?.image === "models/util/composelayer.json" && apObj?.size === "600 400" && apObj?.copybackground === false,
+    `盘上三件套：image=${apObj?.image} size=${apObj?.size} copybackground=${apObj?.copybackground}`,
+  );
+  check(apObj?.config === undefined, "不写 config.passthrough（直通会把背板当输入，就不是透明画布了）");
+
+  // ── 像素：层尺寸就是效果画布 —— 矩形内出帧、矩形外背景不动 ──
+  // 选中态的覆盖层（#ed-overlay）画在正片之上，会把读到的颜色整片染蓝；AK/T 两段也是先藏掉它再读像素。
+  await ev("document.querySelector('#ed-overlay').style.visibility = 'hidden'");
+  var apCr = await h.canvasRect();
+  var apIn = worldToPage(apCr, [960, 540]); // 层中心（600×400 居中 ⇒ 世界 660..1260 × 340..740）
+  var apEdge = worldToPage(apCr, [1250, 540]); // 右边缘内 10px
+  var apOut = worldToPage(apCr, [1285, 540]); // 右边缘外 25px
+  var apNoFxIn = await pixelAt(apIn);
+  var apNoFxOut = await pixelAt(apOut);
+  check(close(apNoFxIn, BG_RGB, 10) && close(apNoFxOut, BG_RGB, 10), `还没挂效果：透明层自己不画东西（层内 ${apNoFxIn} / 层外 ${apNoFxOut} vs 背景 ${BG_RGB}）`);
+  await apAddFx("tint"); // 颜色叠加：缺省橙色 50%
+  await apDump("挂 tint 后");
+  var apFxList = await apFxItems();
+  console.log(`  · AP 状态[效果面板] ${apFxList}`);
+  var apHot = await pixelAt(apIn);
+  var apHotEdge = await pixelAt(apEdge);
+  var apOutAfter = await pixelAt(apOut);
+  check(!close(apHot, BG_RGB, 12), `挂「颜色叠加」后层中心出帧（背景 ${BG_RGB} → ${apHot}）`);
+  check(!close(apHotEdge, BG_RGB, 12), `右边缘内 10px 也在画布上（${apHotEdge}）`);
+  check(close(apOutAfter, BG_RGB, 12), `右边缘外 25px 仍是背景色（画布尺寸 = 层尺寸，不是整屏）（${apOutAfter}）`);
+  await apSetFx(0, "color", "#00ff00");
+  await apSetFx(0, "amount", "1");
+  await apDump("改绿后");
+  console.log(`  · AP 状态[效果面板·改绿] ${await apFxItems()}`);
+  var apGreen = await pixelAt(apIn);
+  check(apGreen[1] > apGreen[0] && apGreen[1] > apGreen[2], `改绿色 / 强度 1：出帧跟着变（${apGreen}）`);
+
+  // ── 撤销 / 重做：参数改动一步一档（结构编辑与参数改写入的是同一条历史） ──
+  // 颜色与强度是两次写入 ⇒ 一次 ⌘Z 只退掉「强度 1」，颜色仍是绿（更淡的绿），层本身不动。
+  var apRc = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(apRc);
+  var apAfterUndo = await pixelAt(apIn);
+  check(
+    (await h.treeNames()).some((n) => /透明层|Transparent/.test(n)) && apAfterUndo[1] > apAfterUndo[0] && apAfterUndo[1] > apAfterUndo[2] && apAfterUndo[1] < apGreen[1] - 8,
+    `⌘Z 退掉最后一步「强度」：层还在，绿色变淡（${apAfterUndo} vs ${apGreen}）`,
+  );
+  var apRc2 = await h.readyCount();
+  await key("z", MOD.meta | MOD.shift);
+  await h.waitRemount(apRc2);
+  var apRedo = await pixelAt(apIn);
+  check(close(apRedo, apGreen, 16), `⌘⇧Z 重做：出帧回到改后的绿色（${apRedo} vs ${apGreen}）`);
+
+  // ── 生成之后还能改尺寸：检视器「效果画布尺寸」两个数字框 ──
+  // 透明层在画面上是隐形的，看得见的只有这块 W×H；改宽 ⇒ 原来在矩形外的点进画布，
+  // 改矮 ⇒ 原来在矩形内的点出画布。两个方向各一个探针，避免「只是重挂了一次」也能过。
+  var apWide = worldToPage(apCr, [1290, 540]); // 600 宽（..1260）之外、800 宽（..1360）之内
+  var apShort = worldToPage(apCr, [960, 720]); // 400 高（..740）之内、300 高（..690）之外
+  var apBeforeWide = await pixelAt(apWide);
+  var apBeforeShort = await pixelAt(apShort);
+  check(close(apBeforeWide, BG_RGB, 12) && !close(apBeforeShort, BG_RGB, 12), `改尺寸前：右外侧是背景、下侧还在画布上（${apBeforeWide} / ${apBeforeShort}）`);
+  await apResize(800, 300);
+  var apAfterWide = await pixelAt(apWide);
+  var apAfterShort = await pixelAt(apShort);
+  var apAfterIn = await pixelAt(apIn);
+  check(!close(apAfterWide, BG_RGB, 12), `加宽到 800：原外侧的点进了画布（${apBeforeWide} → ${apAfterWide}）`);
+  check(close(apAfterShort, BG_RGB, 12), `改矮到 300：原下侧的点出了画布（${apBeforeShort} → ${apAfterShort}）`);
+  check(close(apAfterIn, apGreen, 16), `中心仍在画布内：尺寸编辑没有打断效果链（${apAfterIn} vs ${apGreen}）`);
+  var apId3 = await saveLoose();
+  var apObj3 = apDisk(apId3).objs.find((o) => /composelayer/.test(String(o.image || "")));
+  check(apObj3?.size === "800 300", `改后的尺寸写进 scene.json（size=${apObj3?.size}）`);
+
+  // ── 存库重开：透明层 + 效果读回来，出帧一致 ──
+  var apId2 = await saveLoose();
+  await reopen(apId2);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length >= 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  var apCr2 = await h.canvasRect();
+  var apTree2 = await h.treeNames();
+  await apDump("重开后");
+  check(apTree2.some((n) => /透明层|Transparent/.test(n)), `重开：透明层在树里（树 ${JSON.stringify(apTree2)}）`);
+  var apReopened = await pixelAt(worldToPage(apCr2, [960, 540]));
+  check(close(apReopened, apGreen, 16), `重开出帧一致（${apReopened} vs ${apGreen}）`);
+  // 改过的尺寸也一起读回来：重开后右外侧那个点仍在画布上（800 宽），不是重挂回 600
+  var apReopenWide = await pixelAt(worldToPage(apCr2, [1290, 540]));
+  check(!close(apReopenWide, BG_RGB, 12), `重开：改后的 800×300 画布在盘上生效（右外侧 ${apReopenWide}）`);
+  await ev("document.querySelector('#ed-overlay').style.visibility = ''");
+  var apErrs = await h.errorLines();
+  check(apErrs.length === 0, `透明层全程控制台无错误${apErrs.length ? `：${apErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AP", apName, err); }
+}
+
+await alphaE2E();
 await skelE2E();
 
   if (hlState.aborts.length || hlState.skipped) {
