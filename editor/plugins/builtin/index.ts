@@ -13,6 +13,7 @@ import { BUILTIN_LAYER_KINDS, layerKinds } from "../../layer-kinds";
 import { inspectorGroups, inspectorTabs, puppetGenerators, puppetTools } from "../../inspector";
 import { BUILTIN_EXPORTERS, BUILTIN_EXPORT_HOOKS, BUILTIN_EXPORT_RULES, exportHooks, exportRules, exporters } from "../../export-pipeline";
 import { SWAY_GENERATOR } from "./puppet-sway";
+import { CURSOR_RIPPLE } from "./cursor-ripple";
 import type { Registry } from "../../core";
 
 /** 服务名 → 注册表（模块级单例：纯函数模块直接读同一份） */
@@ -55,6 +56,7 @@ export const builtinShaders = contributeAll("builtin-shaders", "shaders", BUILTI
 export const builtinImporters = contributeAll("builtin-importers", "importers", BUILTIN_IMPORTERS);
 export const builtinLayerKinds = contributeAll("builtin-layer-kinds", "layerKinds", BUILTIN_LAYER_KINDS);
 export const puppetSway = contributeAll("puppet-sway", "puppet.generators", [SWAY_GENERATOR]);
+export const cursorRipple = contributeAll("cursor-ripple", "effects", [CURSOR_RIPPLE]);
 
 export const builtinParticles: PluginObject = {
   name: "builtin-particles",
@@ -85,6 +87,7 @@ export const BUILTIN_CATALOG: Catalog = {
   "builtin-layer-kinds": builtinLayerKinds,
   "builtin-export": builtinExport,
   "puppet-sway": puppetSway,
+  "cursor-ripple": cursorRipple,
 };
 
 export const BUILTIN_PROFILE: Profile = {

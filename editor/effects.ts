@@ -75,9 +75,15 @@ export type EffectPass = {
   target?: string;
   bind?: Array<{ name: string; index: number }>;
   blending?: string;
+  /** 材质 alphawriting：写进 FBO 的 alpha 通道存的是数据（不是透明度）时要开 */
+  alphaWriting?: boolean;
 };
 
-export type EffectFbo = { name: string; scale?: number; format?: string };
+/**
+ * scale = 相对层 FBO 的除数；fit = 长边像素上限（力场类效果固定在小分辨率上跑）；
+ * unique = 每层一份（跨帧保留历史的缓冲，多层同挂时不串）
+ */
+export type EffectFbo = { name: string; scale?: number; fit?: number; unique?: boolean; format?: string };
 
 export type EffectDef = {
   id: string;
@@ -436,7 +442,15 @@ export function effectFiles(d: EffectDef, lang = "zh"): Array<{ name: string; da
       return e;
     }),
   };
-  if (d.fbos?.length) effect.fbos = d.fbos.map((f) => ({ name: f.name, scale: f.scale ?? 1, format: f.format ?? "rgba8888" }));
+  if (d.fbos?.length) {
+    effect.fbos = d.fbos.map((f) => ({
+      name: f.name,
+      scale: f.scale ?? 1,
+      ...(f.fit ? { fit: f.fit } : {}),
+      ...(f.unique ? { unique: true } : {}),
+      format: f.format ?? "rgba8888",
+    }));
+  }
   // 有署名说明的效果（改写 / 移植自他人作品的）把说明写进 description：工程自包含地带着版权与出处
   const note = effectNote(d, lang);
   if (note) {
@@ -448,7 +462,16 @@ export function effectFiles(d: EffectDef, lang = "zh"): Array<{ name: string; da
   passes.forEach((p, i) => {
     const shader = `effects/${names[i]}`;
     const mat = {
-      passes: [{ shader, blending: p.blending ?? "normal", cullmode: "nocull", depthtest: "disabled", depthwrite: "disabled" }],
+      passes: [
+        {
+          shader,
+          blending: p.blending ?? "normal",
+          cullmode: "nocull",
+          depthtest: "disabled",
+          depthwrite: "disabled",
+          ...(p.alphaWriting ? { alphawriting: "enabled" } : {}),
+        },
+      ],
     };
     out.push({ name: materials[i], data: enc.encode(JSON.stringify(mat, null, 2)) });
     out.push({ name: `shaders/${shader}.frag`, data: enc.encode(shaderTransform(p.frag)) });

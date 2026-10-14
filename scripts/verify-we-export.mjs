@@ -32,6 +32,7 @@ export * as pt from "./editor/particles.ts";
 export * as save from "./editor/save.ts";
 export * as assets from "./editor/assets.ts";
 export * as shaderLib from "./editor/shader-lib.ts";
+export * as ripple from "./editor/plugins/builtin/cursor-ripple.ts";
 export { checkWeCompat } from "./renderer/src/editor/compat.ts";
 `;
 
@@ -138,13 +139,16 @@ async function makeProject(M) {
     fbos: [{ name: "_rt_HalfCompoBuffer1", scale: 2, format: "rgba8888" }],
   });
   const off = fx.effectCatalog.add(multi, "test");
-  for (const def of [fx.effectById("tint"), multi]) for (const x of fx.effectFiles(def)) ov.put(x.name, x.data, fx.effectFileOf(def.id));
+  const offRipple = fx.effectCatalog.add(M.ripple.CURSOR_RIPPLE, "test");
+  for (const def of [fx.effectById("tint"), multi, M.ripple.CURSOR_RIPPLE]) for (const x of fx.effectFiles(def)) ov.put(x.name, x.data, fx.effectFileOf(def.id));
   fx.addEffect(obj, "tint");
   fx.addEffect(obj, "glowtest");
+  fx.addEffect(obj, "cursorripple");
   for (const x of pt.particleLayerFiles(doc, "snow", "snow")) ov.put(x.name, x.data, pt.particlePathOf("snow"));
   pt.addParticleLayer(doc, "snow", "雪", "snow");
   const loose = await save.collectProject(doc, ov, new Blob([new Uint8Array([0xff, 0xd8, 0xff])]));
   off();
+  offRipple();
   return { doc, loose };
 }
 
@@ -164,7 +168,19 @@ async function suite(M) {
   {
     const r = await checkWeCompat(loose);
     check(r.ok && r.form === "loose" && r.type === "scene" && r.entry === "scene.json", `散装产物回读零 error（${json(errs(r).map((i) => i.message))}）`);
-    check(r.layers === 2 && r.effects === 2, `引擎解析出 2 层、效果链 2 条（实得 ${r.layers} / ${r.effects}）`);
+    check(r.layers === 2 && r.effects === 3, `引擎解析出 2 层、效果链 3 条（实得 ${r.layers} / ${r.effects}）`);
+    const rippleFx = readJson(loose, "effects/wwgl_cursorripple/effect.json");
+    check(
+      json(rippleFx.fbos.map((f) => [f.fit, f.unique])) === json([[512, true], [512, true]]) &&
+        json(rippleFx.passes.map((p) => p.target ?? null)) === json(["_rt_wwglRippleA", "_rt_wwglRippleB", null]) &&
+        json(rippleFx.passes[2].bind.map((b) => b.name)) === json(["_rt_wwglRippleB", "previous"]),
+      "光标水波：两张 512 长边、每层独立的力场缓冲乒乓，末 pass 读力场 + previous",
+    );
+    check(
+      ["wwgl_cursorripple", "wwgl_cursorripple_p1"].every((n) => readJson(loose, `materials/effects/${n}.json`).passes[0].alphawriting === "enabled") &&
+        readJson(loose, "materials/effects/wwgl_cursorripple_p2.json").passes[0].alphawriting === undefined,
+      "光标水波：写力场的两个 pass 开 alphawriting（alpha 存 -y 通道），合成 pass 不开",
+    );
     const glowFrag = loose.find((f) => /shaders\/effects\/wwgl_glowtest\.frag$/.test(f.path));
     check(glowFrag && !dec.decode(glowFrag.data).includes("#include") && dec.decode(glowFrag.data).includes("float wwglNoise("), "#include \"wwgl/…\" 已内联，产物里没有编辑器私有指令");
     check(loose.some((f) => /wwgl_glowtest_p1\.frag$/.test(f.path)), "多 pass 效果第二个 pass 有独立 shader 文件");
