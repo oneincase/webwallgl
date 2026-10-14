@@ -105,6 +105,39 @@ export type EffectDef = {
 
 export const EFFECT_PREFIX = "wwgl_";
 
+/**
+ * 效果分类（下拉分组）的**展示顺序**：颜色 / 模糊 / 变形 / 风格化 / 动态 / 转场 / 模拟 / 音频 / 互动。
+ *
+ * 分类名一律走 i18n 的 `fxcat.<category>`（中英各一条），内置效果必须显式归到表里的一类。
+ * 插件可以自带分类：它的词条贡献 `fxcat.<category>` 起名（见 examples/plugins/fx-glow 的
+ * `fxcat.light`），这类分类不在表内，按注册顺序排在内置分类后面。
+ */
+export const EFFECT_CATEGORIES: readonly string[] = ["color", "blur", "distort", "stylize", "motion", "transition", "simulation", "audio", "interactive"];
+
+/** 没写 category 的效果（插件可省）在下拉里落的兜底分组；内置效果不得用它 */
+export const EFFECT_CATEGORY_OTHER = "other";
+
+/**
+ * 效果按分类分组：返回 `[分类 key, 该类效果[]]`，次序 = EFFECT_CATEGORIES（颜色 / 模糊 / 变形 /
+ * 风格化 / 动态 / 转场 / 模拟 / 音频 / 互动），插件自带的分类排在内置分类之后（按首次出现顺序），
+ * 没写 category 的落 EFFECT_CATEGORY_OTHER 并排在最后。组内保持入参顺序。
+ */
+export function groupEffectsByCategory(list: readonly EffectDef[]): Array<[string, EffectDef[]]> {
+  const rank = (c: string) => {
+    if (c === EFFECT_CATEGORY_OTHER) return Number.MAX_SAFE_INTEGER;
+    const i = EFFECT_CATEGORIES.indexOf(c);
+    return i < 0 ? EFFECT_CATEGORIES.length : i;
+  };
+  const groups = new Map<string, EffectDef[]>();
+  for (const d of list) {
+    const key = d.category ?? EFFECT_CATEGORY_OTHER;
+    const g = groups.get(key);
+    if (g) g.push(d);
+    else groups.set(key, [d]);
+  }
+  // Map 保持插入顺序 + sort 稳定 ⇒ 同次序的插件分类 / 兜底分类保持首次出现顺序
+  return [...groups.entries()].sort((a, b) => rank(a[0]) - rank(b[0]));
+}
 
 const fmt = (v: number) => String(Math.round(v * 1e4) / 1e4);
 const defaultLiteral = (p: EffectParam) =>
@@ -125,8 +158,12 @@ export function uniforms(params: readonly EffectParam[]): string {
 
 export const uniformName = (key: string) => `g_Fx${key[0].toUpperCase()}${key.slice(1)}`;
 
-function def(id: string, params: EffectParam[], body: string, extra = ""): EffectDef {
-  return { id, params, frag: `// WebWallGL 编辑器内置效果：${id}\n${HEAD_RAW}${extra}${uniforms(params)}\n\nvoid main() {\n${body}\n}\n` };
+/**
+ * 内置效果的构造：category 必填（只能是 EFFECT_CATEGORIES 里的一类，编译期逼着新效果分类），
+ * extra = uniform / sampler 等声明段。
+ */
+function def(id: string, params: EffectParam[], body: string, category: string, extra = ""): EffectDef {
+  return { id, category, params, frag: `// WebWallGL 编辑器内置效果：${id}\n${HEAD_RAW}${extra}${uniforms(params)}\n\nvoid main() {\n${body}\n}\n` };
 }
 
 /** 插件写效果的便捷构造：只给 main 体（body）或整段源码（frag / passes），头部与 uniform 自动生成 */
@@ -192,6 +229,18 @@ const AUDIOBARS_PARAMS: EffectParam[] = [
 // 只声明 32 段一组：柱子按 32 段画，粒子 / 文字脚本另有自己的入口。
 
 
+// ── 内置效果表 ─────────────────────────────────────────────────────────────
+// 分类（第 4 个实参，见 EFFECT_CATEGORIES）：
+//   颜色 color       颜色叠加 / 色彩调整 / 暗角
+//   模糊 blur        模糊
+//   变形 distort     波浪 / 滚动 / 色差
+//   风格化 stylize   描边 / 外发光 / 像素化 / 扫光
+//   动态 motion      呼吸
+//   转场 transition  渐隐遮罩
+//   模拟 simulation  磁流体
+//   音频 audio       音频频谱条
+//   互动 interactive 光标水波（builtin 插件 cursor-ripple 贡献，见 editor/plugins/builtin/）
+// 数组顺序被 verify-editor 锁着（前 13 个 = 基础集 7 + 扩充集 6），追加新效果只能排在末尾。
 export const EFFECTS: readonly EffectDef[] = [
   def(
     "tint",
@@ -200,6 +249,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "amount", type: "float", default: 0.5, min: 0, max: 1, step: 0.01 },
     ],
     nl(TINT_BODY),
+    "color",
   ),
   def(
     "adjust",
@@ -209,6 +259,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "saturation", type: "float", default: 1, min: 0, max: 3, step: 0.01 },
     ],
     nl(ADJUST_BODY),
+    "color",
   ),
   def(
     "vignette",
@@ -218,11 +269,13 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "softness", type: "float", default: 0.45, min: 0.01, max: 1, step: 0.01 },
     ],
     nl(VIGNETTE_BODY),
+    "color",
   ),
   def(
     "blur",
     [{ key: "radius", type: "float", default: 2, min: 0, max: 8, step: 0.1 }],
     nl(BLUR_BODY),
+    "blur",
     RESOLUTION_DECL,
   ),
   def(
@@ -233,6 +286,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "speed", type: "float", default: 1, min: 0, max: 10, step: 0.05 },
     ],
     nl(WAVE_BODY),
+    "distort",
     TIME_DECL,
   ),
   def(
@@ -242,6 +296,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "speedy", type: "float", default: 0, min: -2, max: 2, step: 0.01 },
     ],
     nl(SCROLL_BODY),
+    "distort",
     TIME_DECL,
   ),
   def(
@@ -251,6 +306,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "amount", type: "float", default: 0.5, min: 0, max: 1, step: 0.01 },
     ],
     nl(PULSE_BODY),
+    "motion",
     TIME_DECL,
   ),
   def(
@@ -260,6 +316,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "width", type: "float", default: 3, min: 0, max: 16, step: 0.5 },
     ],
     nl(OUTLINE_BODY),
+    "stylize",
     RESOLUTION_DECL,
   ),
   def(
@@ -270,6 +327,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "strength", type: "float", default: 1.5, min: 0, max: 4, step: 0.05 },
     ],
     nl(GLOW_BODY),
+    "stylize",
     RESOLUTION_DECL,
   ),
   def(
@@ -279,11 +337,13 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "angle", type: "float", default: 0, min: 0, max: 6.2832, step: 0.01 },
     ],
     nl(CHROMA_BODY),
+    "distort",
   ),
   def(
     "pixelate",
     [{ key: "size", type: "float", default: 8, min: 1, max: 64, step: 1 }],
     nl(PIXELATE_BODY),
+    "stylize",
     RESOLUTION_DECL,
   ),
   def(
@@ -296,6 +356,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "strength", type: "float", default: 0.8, min: 0, max: 2, step: 0.01 },
     ],
     nl(SHINE_BODY),
+    "stylize",
     TIME_DECL,
   ),
   def(
@@ -306,9 +367,11 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "end", type: "float", default: 0.8, min: -0.5, max: 1.5, step: 0.01 },
     ],
     nl(FADE_BODY),
+    "transition",
   ),
   {
     id: "cuiliuti",
+    category: "simulation",
     author: "Hope麻匪（HopeMafei）",
     // 署名说明：写进面板（检视器）与工程里的 effect.json description，两处同源
     note: {
@@ -330,10 +393,7 @@ ${nl(CUILIUTI_SRC_RAW)}
   // 渲染面板把音量拉起来、或开「系统音频」/点「试听」（editor/audio-live.ts 两条源）。
   // 追加在 EFFECTS 末尾：verify-editor 断言前 13 个 id 的顺序（基础集 / 扩充集）。
   // 名字与参数文案走 i18n 的 fx.audiobars / fxp.*（内置效果一律如此，不写 title）。
-  {
-    ...def("audiobars", AUDIOBARS_PARAMS, nl(AUDIOBARS_BODY_RAW), AUDIOBARS_DECL_RAW),
-    category: "audio",
-  },
+  def("audiobars", AUDIOBARS_PARAMS, nl(AUDIOBARS_BODY_RAW), "audio", AUDIOBARS_DECL_RAW),
 ];
 
 /**

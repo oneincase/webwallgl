@@ -1183,6 +1183,20 @@ async function runCreateAndDraft(ctx) {
     `选中图片层：检视器有「效果」分组，下拉列出全部 14 个内置效果（实得 ${fxOpts.length} 项：${fxOpts.join(",")}）`,
   );
   check((await fxNames()).length === 0, "初始无效果");
+  // 下拉不是一长条平铺：每个效果都落进自己那一类的 optgroup，且组序 = 分类表的固定次序
+  // （颜色 < 模糊 < 变形 < 风格化 < 动态 < 转场 < 模拟 < 音频 < 互动）。占位项留在 select 直属。
+  // 只按「已断言存在」的 7 个内置效果比组序，插件多寡 / 分类不走 i18n 都不影响这条。
+  var fxGroupOrder = await ev(`(() => {
+    var opts = [...document.querySelectorAll('#fx-add option')];
+    var groups = [...document.querySelectorAll('#fx-add optgroup')];
+    var at = (id) => { var o = opts.find((x) => x.value === id); return o ? groups.indexOf(o.parentElement) : -1; };
+    return ['tint', 'blur', 'wave', 'outline', 'pulse', 'fade', 'audiobars'].map(at);
+  })()`);
+  check(
+    (await ev(`[...document.querySelectorAll('#fx-add option')].slice(1).every((o) => o.parentElement.tagName === 'OPTGROUP')`)) &&
+      fxGroupOrder.every((g, i) => g >= 0 && (i === 0 || fxGroupOrder[i - 1] < g)),
+    `效果按分类分组且组序固定：颜色 < 模糊 < 变形 < 风格化 < 动态 < 转场 < 音频（组序 ${JSON.stringify(fxGroupOrder)}）`,
+  );
 
   await fxAdd("tint");
   check(JSON.stringify(await fxNames()) === JSON.stringify(["tint"]) && (await h.selectedName()) === "stripe", "添加「颜色叠加」：列表一项，选中仍是该层");

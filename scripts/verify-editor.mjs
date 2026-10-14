@@ -1289,6 +1289,49 @@ const uniformNotes = (frag) => {
     check(/fract\(g_Time \* g_FxSpeed\)/.test(f.effectById("shine").frag), "扫光按 g_Time 循环");
   }
   check(new Set(f.EFFECTS.map((e) => e.id)).size === f.EFFECTS.length && f.EFFECTS.every((e) => /^[a-z0-9]+$/.test(e.id)), "id 唯一且只含小写字母数字（effectIdOf 的正则能认回）");
+  {
+    // 效果分类整理：15 个内置效果（EFFECTS）+ builtin 插件贡献的光标水波，每个都归一到一个分类。
+    // 分类表顺序 = 下拉分组顺序；分类名走 i18n 的 fxcat.<category>（中英各一条）。
+    const cr = (await loadEditorModule("plugins/builtin/cursor-ripple")).CURSOR_RIPPLE;
+    const all = [...f.EFFECTS, cr];
+    const wantCats = {
+      color: ["tint", "adjust", "vignette"],
+      blur: ["blur"],
+      distort: ["wave", "scroll", "chroma"],
+      stylize: ["outline", "glow", "pixelate", "shine"],
+      motion: ["pulse"],
+      transition: ["fade"],
+      simulation: ["cuiliuti"],
+      audio: ["audiobars"],
+      interactive: ["cursorripple"],
+    };
+    check(json(f.EFFECT_CATEGORIES) === json(Object.keys(wantCats)), `分类表顺序锁定：颜色 / 模糊 / 变形 / 风格化 / 动态 / 转场 / 模拟 / 音频 / 互动（${json(f.EFFECT_CATEGORIES)}）`);
+    const gotCats = Object.fromEntries(f.EFFECT_CATEGORIES.map((c) => [c, all.filter((e) => e.category === c).map((e) => e.id)]));
+    check(json(gotCats) === json(wantCats), `16 个效果逐个归到分好的类里（${json(gotCats)}）`);
+    check(all.length === 16 && all.every((e) => f.EFFECT_CATEGORIES.includes(e.category)), `分类无遗漏无越界（未分类：${json(all.filter((e) => !f.EFFECT_CATEGORIES.includes(e.category)).map((e) => e.id))}）`);
+    check(f.EFFECT_CATEGORY_OTHER === "other" && !f.EFFECT_CATEGORIES.includes("other"), "「其它」只作兜底分组（插件可省 category），不属于内置分类表");
+    // 下拉就是这么排的：main.ts 的 optgroup 循环直接吃 groupEffectsByCategory(list()) 的结果，
+    // 所以这里对纯函数下断言就等于锁住「下拉选项顺序 = 分类顺序 + 组内注册顺序」。
+    const fxLight = { ...cr, id: "fxlight", category: "light" };
+    const fxOther = { ...cr, id: "fxother", category: undefined };
+    const grouped = f.groupEffectsByCategory([...all, fxLight, fxOther]);
+    check(
+      json(grouped.map(([c]) => c)) === json([...f.EFFECT_CATEGORIES, "light", f.EFFECT_CATEGORY_OTHER]),
+      `分组次序：内置分类 → 插件分类 → 兜底分类（${json(grouped.map(([c]) => c))}）`,
+    );
+    check(
+      json(grouped.map(([, list]) => list.map((e) => e.id))) === json([...Object.values(wantCats), ["fxlight"], ["fxother"]]),
+      "分类只按类重排、组内保持注册顺序（顺序编号靠 tie 稳定，不打乱插件效果相对次序）",
+    );
+    check(
+      json(f.groupEffectsByCategory([...all, fxLight, { ...cr, id: "fxaaa", category: "aaa" }]).map(([c]) => c)) ===
+        json([...f.EFFECT_CATEGORIES, "light", "aaa"]),
+      "插件分类之间按首次出现顺序，不按字母重排",
+    );
+    const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const noName = [...f.EFFECT_CATEGORIES, f.EFFECT_CATEGORY_OTHER].filter((c) => (i18nSrc.match(new RegExp(`"fxcat\\.${c}":`, "g")) ?? []).length !== 2);
+    check(noName.length === 0, `每个分类名中英各一条 fxcat.<category>（缺：${json(noName)}）`);
+  }
   let annotOk = true;
   const annotBad = [];
   for (const e of f.EFFECTS) {

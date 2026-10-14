@@ -90,6 +90,7 @@ import {
   encodeValue,
   externalValues,
   constantKeyOf,
+  groupEffectsByCategory,
   inlinePassViews,
   inspectEffectPasses,
   inspectEffectParams,
@@ -9886,23 +9887,19 @@ function effectsGroup(node: LayerNode): HTMLElement {
   first.value = "";
   first.textContent = et("fx.add");
   add.appendChild(first);
-  const cats = new Map<string, HTMLElement>();
-  for (const d of effectCatalog.list()) {
-    const o = document.createElement("option");
-    o.value = d.id;
-    o.textContent = fxTitle(d);
-    let parent: HTMLElement = add;
-    if (d.category) {
-      let g = cats.get(d.category);
-      if (!g) {
-        g = document.createElement("optgroup");
-        (g as HTMLOptGroupElement).label = hasText(`fxcat.${d.category}`) ? et(`fxcat.${d.category}`) : d.category;
-        cats.set(d.category, g);
-        add.appendChild(g);
-      }
-      parent = g;
+  // 分组顺序：`groupEffectsByCategory` 定死内置分类次序（颜色 / 模糊 / 变形 / 风格化 / 动态 /
+  // 转场 / 模拟 / 音频 / 互动），插件自带分类（靠插件词条 fxcat.<category> 起名，如 fx-glow 的
+  // fxcat.light）排在内置分类之后、按注册顺序；没写 category 的落兜底分类。
+  for (const [key, items] of groupEffectsByCategory(effectCatalog.list())) {
+    const g = document.createElement("optgroup");
+    g.label = hasText(`fxcat.${key}`) ? et(`fxcat.${key}`) : key;
+    for (const d of items) {
+      const o = document.createElement("option");
+      o.value = d.id;
+      o.textContent = fxTitle(d);
+      g.appendChild(o);
     }
-    parent.appendChild(o);
+    add.appendChild(g);
   }
   add.addEventListener("change", () => {
     if (add.value) addEffectTo(node, add.value);
