@@ -771,6 +771,65 @@ if (fs.existsSync(LIB)) {
       removeCameraPathClip,
     } = cpEdit;
 
+    // [低-8] 「缺失」与「合法 0」的分离口径（`camera-path.ts` 的 `num()`）。写成参数化
+    // 函数（吃任意一个模块命名空间）是为了让第 10 节的变异红测复用同一批判据 —— 判据
+    // 只有一份，被改坏的副本必须让**同一批**断言变红。
+    //
+    // 语义依据：引擎**故意**用 `null` 表示「这一段没有 fov/zoom 通道」
+    // （`render/camera-path.js:242-243` 只把 `Number(k.fov) > 0` 记成数值，`:268-269`
+    // 两端都是 null 时插值保持 null）。而 `Number(null) === 0`、`Number("") === 0`、
+    // `Number(false) === 0`、`Number([]) === 0` 全是有限数 ⇒ 任何用 `Number(v)` + isFinite
+    // 的写法都会把「没有通道」塌成合法的 0（面板显示 fov=0、采样读出 0）。
+    const fovZoomFails = (m) => {
+      const bad = [];
+      const want = (pose, v, o, why) => {
+        const r = m.resolveCameraFovZoom(pose, true);
+        if (r.value !== v || r.other !== o) bad.push(`M12/B7 [低-8] ${why}应回落 ${v}/${o}，实得 ${JSON.stringify(r)}`);
+      };
+      want({ fov: null, zoom: null }, 50, 1, "引擎的「无通道」null");
+      want({ fov: 0, zoom: 0 }, 0, 0, "作者写的合法 0（不能被当成缺失）");
+      want({ fov: "0", zoom: "0" }, 0, 0, "字符串形式的合法 0（不能被当成缺失）");
+      want({ fov: "72", zoom: "1.5" }, 72, 1.5, "字符串通道值");
+      want({ fov: "", zoom: "" }, 50, 1, "空串");
+      want({ fov: "  ", zoom: "  " }, 50, 1, "纯空白串");
+      want({ fov: false, zoom: false }, 50, 1, "布尔 false");
+      want({ fov: [], zoom: [] }, 50, 1, "数组");
+      want({ fov: NaN, zoom: Infinity }, 50, 1, "NaN / Infinity");
+      // 场景级采样同病：transform 里**没有 fov/zoom 键**时，采样出来的必须还是引擎缺省
+      const noFov = [
+        {
+          duration: 2,
+          name: "S",
+          transforms: [
+            { timestamp: 0, eye: "0 0 0", center: "0 0 -1", up: "0 1 0" },
+            { timestamp: 2, eye: "2 0 0", center: "0 0 -1", up: "0 1 0" },
+          ],
+        },
+      ];
+      for (const p of m.sampleCameraPath(noFov, "sequential", [0, 1, 2])) {
+        if (p.fov !== 50 || p.zoom !== 1) {
+          bad.push(`M12/B7 [低-8] 场景级没有 fov/zoom 键时应采样出缺省 50/1，实得 ${p.fov}/${p.zoom}`);
+          break;
+        }
+      }
+      // 对照：显式 fov 关键帧必须透传真值（证明判据不是把所有值都拉回缺省）
+      const withFov = [
+        {
+          duration: 4,
+          name: "F",
+          transforms: [
+            { timestamp: 0, eye: "0 0 0", center: "0 0 -1", up: "0 1 0", fov: 70 },
+            { timestamp: 4, eye: "4 0 0", center: "0 0 -1", up: "0 1 0", fov: 60 },
+          ],
+        },
+      ];
+      const s2 = m.sampleCameraPath(withFov, "sequential", [0, 2]);
+      if (s2.length !== 2 || s2[0].fov !== 70 || Math.abs(s2[1].fov - 65) > 1e-6) {
+        bad.push(`M12/B7 [低-8] 显式 fov 关键帧应透传真值（t=0 ⇒ 70、t=2 ⇒ 65），实得 ${s2.map((p) => p.fov).join("/")}`);
+      }
+      return bad;
+    };
+
     // 1) queuemode 归一必须**跟着引擎的逐字比较**：引擎是 `queuemode === 'random'`，
     //    其余一律顺序；归一化若"宽容"（认 Random / 大小写不敏感）就成了第二套语义。
     if (normalizeQueueMode("random") !== "random") eErr.push("M12/B7 normalizeQueueMode 不认 random");
@@ -846,6 +905,10 @@ if (fs.existsSync(LIB)) {
     if (ortho.use !== "zoom" || ortho.value !== 1.5 || ortho.other !== 70) eErr.push(`M12/B7 正交应吃 zoom=1.5（另一个通道 70），实得 ${JSON.stringify(ortho)}`);
     const fallback = resolveCameraFovZoom(null, true);
     if (fallback.value !== 50 || fallback.other !== 1) eErr.push(`M12/B7 位姿缺失应回落引擎缺省 fov50/zoom1，实得 ${JSON.stringify(fallback)}`);
+
+    // 6b) [低-8] 「缺失」不得被塌成合法的 0：null / 空串 / 空白串 / false / [] / NaN 都是
+    //     「这一段没有该通道」⇒ 回落引擎缺省；作者写 0 时必须原样读出（两向都断）。
+    for (const f of fovZoomFails(cpEdit)) eErr.push(f);
 
     // 7) queuemode 读写：写回默认值必须删键（别在 scene.json 里留冗余）
     if (readQueueMode({ queuemode: "random" }) !== "random") eErr.push("M12/B7 readQueueMode 读不到 random");
@@ -926,6 +989,10 @@ if (fs.existsSync(LIB)) {
     if (items > 0) {
       if (claimedEmpty) eErr.push(`M12/B7 ${claimedEmpty} 条空路径没有给出理由（面板会显示一个空列表）`);
       if (unknownSolid) eErr.push(`M12/B7 ${unknownSolid} 条非空路径形态认不出来`);
+      // 阈值 48 是**下限**不是预期值：2026-10-15 本机实测 360 个场景 / **49** 个对象带
+      // path（queuemode 49 处 {random:47, sequential:2}，非空仅 1 条
+      // 3281559867/scripts/camera_paths_1129.json 9 段/object）。卡片调研时写 48，
+      // 是同一库的早一次快照 ⇒ 别按 48 去「修正」语料，也别把阈值抬到 49。
       if (pathObjs < 48) eErr.push(`M12/B7 带 path 的相机对象实测 ${pathObjs}（< 48，语料回归）`);
       for (const k of Object.keys(qmHist)) {
         if (k !== "random" && k !== "sequential") eErr.push(`M12/B7 queuemode 出现第三种取值 "${k}"（引擎只认这两档）`);
@@ -936,6 +1003,69 @@ if (fs.existsSync(LIB)) {
       );
     } else {
       console.log("  （跳过 M12/B7 相机路径语料：本机壁纸库没有 scene.pkg）");
+    }
+
+    // 10) [低-8] 变异红测：把 `num()` 改坏 ⇒ 6b 的判据必须变红。改坏只发生在**内存里**
+    //     （esbuild 打内存源码到临时文件再 import），磁盘上的 `camera-path.ts` 全程不动 ——
+    //     跑完断言 sha256 与跑前逐字节一致。锤子必须**唯一命中**（多行/单行都要数），
+    //     否则变异会打到别处、红测变成假绿（task-8 踩过这个坑）。
+    {
+      const { createHash } = await import("node:crypto");
+      const { tmpdir } = await import("node:os");
+      const { pathToFileURL } = await import("node:url");
+      const { build } = await import("esbuild");
+      const srcPath = join(ROOT, "renderer/src/editor/camera-path.ts");
+      const sha = () => createHash("sha256").update(fs.readFileSync(srcPath)).digest("hex");
+      const shaBefore = sha();
+      const MUT = [
+        [
+          "num 退回 Number()+isFinite 老写法",
+          `  if (typeof v === "number") return Number.isFinite(v) ? v : dflt;\n` +
+            `  if (typeof v === "string" && v.trim() !== "") {\n` +
+            `    const n = Number(v);\n` +
+            `    return Number.isFinite(n) ? n : dflt;\n` +
+            `  }\n` +
+            `  return dflt;`,
+          `  const n = Number(v);\n  return Number.isFinite(n) ? n : dflt;`,
+        ],
+        [
+          "number 分支拒 0",
+          `if (typeof v === "number") return Number.isFinite(v) ? v : dflt;`,
+          `if (typeof v === "number") return Number.isFinite(v) && v !== 0 ? v : dflt;`,
+        ],
+        [
+          "字符串分支去掉 trim 判空",
+          `if (typeof v === "string" && v.trim() !== "") {`,
+          `if (typeof v === "string") {`,
+        ],
+      ];
+      let mutNo = 0;
+      for (const [name, from, to] of MUT) {
+        const src = fs.readFileSync(srcPath, "utf8");
+        const hits = src.split(from).length - 1;
+        if (hits !== 1) {
+          eErr.push(`M12/B7 [低-8] 变异锤「${name}」命中 ${hits} 次（要求恰好 1 次）：锤子与源码脱节`);
+          continue;
+        }
+        const out = await build({
+          stdin: { contents: src.split(from).join(to), resolveDir: join(ROOT, "renderer/src/editor"), loader: "ts" },
+          bundle: true,
+          format: "esm",
+          platform: "neutral",
+          write: false,
+        });
+        const tmp = join(tmpdir(), `verify-camera-mut-${process.pid}-${++mutNo}.mjs`);
+        fs.writeFileSync(tmp, out.outputFiles[0].text);
+        let fails = [];
+        try {
+          fails = fovZoomFails(await import(pathToFileURL(tmp).href));
+        } finally {
+          fs.rmSync(tmp, { force: true });
+        }
+        if (!fails.length) eErr.push(`M12/B7 [低-8] 变异红测「${name}」没变红：判据抓不到这个回归`);
+        else console.log(`  M12/B7 [低-8] 变异「${name}」→ 变红 ${fails.length} 条（例：${fails[0]}）`);
+      }
+      if (sha() !== shaBefore) eErr.push("M12/B7 [低-8] 变异红测在磁盘上留下了改动（camera-path.ts sha256 前后不一致）");
     }
 
     for (const e of eErr) errors.push(e);

@@ -86,9 +86,19 @@ const vec3 = (v: unknown, dflt: [number, number, number]): [number, number, numb
   }
   return [...dflt];
 };
+// 「缺失」与「合法的 0」必须分开：引擎**故意**用 `null` 表示「这一段没有 fov/zoom 通道」
+// ——`render/camera-path.js:242-243` 把 `Number(k.fov) > 0` 之外的键记成 null，`:268-269`
+// 两端都是 null 时插值结果仍是 null。而 `Number(null) === 0`、`Number("") === 0`、
+// `Number(false) === 0`、`Number([]) === 0` 全是有限数 ⇒ 旧写法会把「没有通道」塌成
+// 合法的 0（面板把缺省 fov 50 / zoom 1 显示成 0，采样也读出 0）。只接受「真的是数字」
+// 与「非空、可解析成有限数的字符串」（含 0 / "0"），其余一律回落 dflt。
 const num = (v: unknown, dflt: number): number => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : dflt;
+  if (typeof v === "number") return Number.isFinite(v) ? v : dflt;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : dflt;
+  }
+  return dflt;
 };
 
 const CHANNELS = ["eye", "center", "up", "fov", "zoom"] as const;

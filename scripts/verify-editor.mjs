@@ -7552,6 +7552,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
 
     const MAINPROG = { kind: "main-program" };
     const MAINBUF = { kind: "main-buffer" };
+    const MAINFBO = { kind: "main-fbo" };
     const C = {
       VERTEX_SHADER: 1,
       FRAGMENT_SHADER: 2,
@@ -7559,6 +7560,8 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       LINK_STATUS: 4,
       CURRENT_PROGRAM: 10,
       ARRAY_BUFFER_BINDING: 11,
+      FRAMEBUFFER_BINDING: 12,
+      VIEWPORT: 13,
       DEPTH_TEST: 20,
       BLEND: 21,
       SCISSOR_TEST: 22,
@@ -7575,8 +7578,15 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       linked: 0,
       program: MAINPROG,
       buffer: MAINBUF,
+      fbo: MAINFBO,
+      viewportParam: [3, 4, 800, 600],
       enabled: new Set(["DEPTH_TEST", "BLEND", "CULL_FACE"]),
       viewports: [],
+      viewportCalls: [],
+      viewportRestores: [],
+      fboBinds: [],
+      attribEnables: 0,
+      attribDisables: [],
       bufferDatas: [],
       uniforms: {},
       attribPointer: null,
@@ -7610,10 +7620,24 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
     gl.deleteProgram = () => {
       st.deleted.program++;
     };
-    gl.getParameter = (k) => (k === C.CURRENT_PROGRAM ? st.program : st.buffer);
+    gl.getParameter = (k) => {
+      if (k === C.CURRENT_PROGRAM) return st.program;
+      if (k === C.ARRAY_BUFFER_BINDING) return st.buffer;
+      if (k === C.FRAMEBUFFER_BINDING) return st.fbo;
+      if (k === C.VIEWPORT) return st.viewportParam;
+      return st.buffer;
+    };
     gl.isEnabled = (k) => st.enabled.has(nameOf(k));
-    gl.bindFramebuffer = () => {};
-    gl.viewport = (x, y, w, h) => st.viewports.push([x, y, w, h]);
+    gl.bindFramebuffer = (_t, f) => {
+      st.fboBinds.push(f);
+    };
+    // 写回「进前读到的值」的那次调用算还原，记到 viewportRestores；
+    // 其余（overlay 自己按设备像素设的那次）记到 viewports —— 既有断言的 `length === 1` 因此仍然成立。
+    gl.viewport = (x, y, w, h) => {
+      st.viewportCalls.push([x, y, w, h]);
+      const vp = st.viewportParam;
+      (x === vp[0] && y === vp[1] && w === vp[2] && h === vp[3] ? st.viewportRestores : st.viewports).push([x, y, w, h]);
+    };
     gl.disable = (k) => st.enabled.delete(nameOf(k));
     gl.enable = (k) => st.enabled.add(nameOf(k));
     gl.useProgram = (p) => {
@@ -7623,7 +7647,12 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       st.buffer = b;
     };
     gl.bufferData = (_t, data) => st.bufferDatas.push(data);
-    gl.enableVertexAttribArray = () => {};
+    gl.enableVertexAttribArray = () => {
+      st.attribEnables++;
+    };
+    gl.disableVertexAttribArray = (i) => {
+      st.attribDisables.push(i);
+    };
     gl.vertexAttribPointer = (...a) => {
       st.attribPointer = a;
     };
@@ -7698,6 +7727,241 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
     check(pass.draw(seg, { width: 320, height: 180 }) === 0 && st.draws.length === before, "M12/B2 dispose 之后 draw 成为空操作（切回 2D 不抛错）");
     pass.dispose();
     check(st.deleted.shader === 2, "M12/B2 重复 dispose 幂等");
+  }
+
+  // ── B2（task-23）：失败路径不留 GL 垃圾 + FBO / viewport / 顶点属性原样还原 ──
+  //   WebGL 对象不会被 GC 回收，只能显式 delete；失败返回的 pass.dispose 又是对外的 no-op，
+  //   所以「创建了几个就删了几个」只能由创建过程自己保证（dropCreated / failCreated）。
+  {
+    const FK = {
+      VERTEX_SHADER: 1,
+      FRAGMENT_SHADER: 2,
+      COMPILE_STATUS: 3,
+      LINK_STATUS: 4,
+      CURRENT_PROGRAM: 10,
+      ARRAY_BUFFER_BINDING: 11,
+      FRAMEBUFFER_BINDING: 12,
+      VIEWPORT: 13,
+      DEPTH_TEST: 20,
+      BLEND: 21,
+      SCISSOR_TEST: 22,
+      CULL_FACE: 23,
+      FRAMEBUFFER: 30,
+      ARRAY_BUFFER: 31,
+      DYNAMIC_DRAW: 32,
+      FLOAT: 33,
+      LINES: 34,
+    };
+    const nameOf = (k) => Object.keys(FK).find((n) => FK[n] === k);
+    const mkFakeGl = (mode = {}) => {
+      const made = { shader: 0, program: 0, buffer: 0 };
+      const deleted = { shader: 0, program: 0, buffer: 0 };
+      const rec = {
+        made,
+        deleted,
+        enabled: new Set(["DEPTH_TEST", "BLEND", "CULL_FACE"]),
+        fbo: { kind: "main-fbo" },
+        viewportParam: [3, 4, 800, 600],
+        viewportCalls: [],
+        viewportRestores: [],
+        viewports: [],
+        fboBinds: [],
+        attribEnables: 0,
+        attribDisables: [],
+        pointer: null,
+        usedPrograms: [],
+        boundBuffers: [],
+        draws: [],
+      };
+      const gl = { ...FK, drawingBufferWidth: 1280, drawingBufferHeight: 720 };
+      gl.createShader = (type) => {
+        if (mode.failShaderCreate) return null;
+        made.shader++;
+        return { kind: "shader", type };
+      };
+      gl.shaderSource = () => {};
+      gl.compileShader = () => {};
+      gl.getShaderParameter = (sh) => !(mode.failFragCompile && sh && sh.type === FK.FRAGMENT_SHADER);
+      gl.getShaderInfoLog = () => "frag-boom";
+      gl.deleteShader = () => {
+        deleted.shader++;
+      };
+      gl.createProgram = () => {
+        if (mode.failProgramCreate) return null;
+        made.program++;
+        return { kind: "program" };
+      };
+      gl.attachShader = () => {};
+      gl.linkProgram = () => {};
+      gl.getProgramParameter = (_p, k) => !(mode.failLink && k === FK.LINK_STATUS);
+      gl.getProgramInfoLog = () => "link-boom";
+      gl.getAttribLocation = () => (mode.failAttrib ? -1 : 0);
+      gl.getUniformLocation = () => ({ kind: "uniform" });
+      gl.createBuffer = () => {
+        made.buffer++;
+        return { kind: "buffer" };
+      };
+      gl.deleteProgram = () => {
+        deleted.program++;
+      };
+      gl.deleteBuffer = () => {
+        deleted.buffer++;
+      };
+      gl.getParameter = (k) => {
+        if (k === FK.CURRENT_PROGRAM) return mode.mainProgram ?? null;
+        if (k === FK.ARRAY_BUFFER_BINDING) return mode.mainBuffer ?? null;
+        if (k === FK.FRAMEBUFFER_BINDING) return rec.fbo;
+        if (k === FK.VIEWPORT) return rec.viewportParam;
+        return null;
+      };
+      gl.isEnabled = (k) => rec.enabled.has(nameOf(k));
+      gl.bindFramebuffer = (_t, f) => {
+        rec.fboBinds.push(f);
+      };
+      gl.viewport = (x, y, w, h) => {
+        rec.viewportCalls.push([x, y, w, h]);
+        const vp = rec.viewportParam;
+        (x === vp[0] && y === vp[1] && w === vp[2] && h === vp[3] ? rec.viewportRestores : rec.viewports).push([x, y, w, h]);
+      };
+      gl.disable = (k) => rec.enabled.delete(nameOf(k));
+      gl.enable = (k) => rec.enabled.add(nameOf(k));
+      gl.useProgram = (pr) => {
+        rec.usedPrograms.push(pr);
+      };
+      gl.bindBuffer = (_t, b) => {
+        rec.boundBuffers.push(b);
+      };
+      gl.bufferData = () => {};
+      gl.enableVertexAttribArray = () => {
+        rec.attribEnables++;
+      };
+      gl.disableVertexAttribArray = (i) => {
+        rec.attribDisables.push(i);
+      };
+      gl.vertexAttribPointer = (...a) => {
+        rec.pointer = a;
+      };
+      gl.uniform2f = () => {};
+      gl.uniform1f = () => {};
+      gl.uniform4f = () => {};
+      gl.drawArrays = () => {
+        if (mode.throwDraw) throw new Error("draw-boom");
+        rec.draws.push(1);
+      };
+      return { gl, rec };
+    };
+
+    const SEG = new Float32Array([0, 0, 10, 0, 10, 0, 10, 10]);
+    // ① 三条失败路径（+ createShader / createProgram 返回 null 两族）：建了几个就删了几个
+    const failCases = [
+      { what: "片元着色器编不过", mode: { failFragCompile: true }, built: [2, 0, 0], reason: /frag-boom/ },
+      { what: "createShader 返回 null", mode: { failShaderCreate: true }, built: [0, 1, 0], reason: /program-create-failed/ },
+      { what: "createProgram 返回 null", mode: { failProgramCreate: true }, built: [2, 0, 0], reason: /program-create-failed/ },
+      { what: "link 失败", mode: { failLink: true }, built: [2, 1, 0], reason: /^link-failed: link-boom/ },
+      { what: "attrib 缺失", mode: { failAttrib: true }, built: [2, 1, 1], reason: /attrib-or-buffer-missing/ },
+    ];
+    for (const c of failCases) {
+      const { gl, rec } = mkFakeGl(c.mode);
+      const p = glmod.createOverlayPass(gl);
+      const d = rec.deleted;
+      const m = rec.made;
+      check(
+        !p.ok &&
+          c.reason.test(p.reason) &&
+          m.shader === c.built[0] &&
+          m.program === c.built[1] &&
+          m.buffer === c.built[2] &&
+          m.shader === d.shader &&
+          m.program === d.program &&
+          m.buffer === d.buffer,
+        `M12/B2（task-23）${c.what}：建了 shader ${m.shader} / program ${m.program} / buffer ${m.buffer}，就地全删（删 ${d.shader}/${d.program}/${d.buffer}，不给 GC 留垃圾）`,
+      );
+      check(
+        p.draw(SEG, { width: 320, height: 180 }) === 0 && p.frames === 0 && rec.viewportCalls.length === 0 && rec.fboBinds.length === 0,
+        `M12/B2（task-23）${c.what}：失败 pass 的 draw 恒返回 0 且不碰任何 GL 状态`,
+      );
+      p.dispose();
+      p.dispose();
+      check(
+        d.shader === m.shader && d.program === m.program && d.buffer === m.buffer,
+        `M12/B2（task-23）${c.what}：失败对象的 dispose 仍是对外 no-op（重复调用不改删除计数，回收靠创建过程自己）`,
+      );
+    }
+
+    // ② 三处状态：进前存、finally 里原样放回；正常路径可见行为逐位不变
+    {
+      const MAINPROG2 = { kind: "main-program-2" };
+      const MAINBUF2 = { kind: "main-buffer-2" };
+      const { gl, rec } = mkFakeGl({ mainProgram: MAINPROG2, mainBuffer: MAINBUF2 });
+      const p = glmod.createOverlayPass(gl);
+      const n = p.draw(SEG, { width: 320, height: 180 });
+      check(
+        n === 2 && p.frames === 1 && rec.draws.length === 1 && rec.attribEnables === 1 && rec.pointer && rec.pointer[1] === 2 && rec.pointer[2] === FK.FLOAT && rec.pointer[5] === 0,
+        "M12/B2（task-23）修复后正常路径可见行为不变：线段数 2 / frames 1 / 一次 drawArrays / 顶点属性 2 分量 float stride 0",
+      );
+      check(
+        rec.viewports.length === 1 && rec.viewports[0][2] === 1280 && rec.viewports[0][3] === 720,
+        "M12/B2（task-23）overlay 自己仍按 drawingBuffer 设备像素口径设 viewport",
+      );
+      check(
+        rec.viewportCalls.length === 2 && rec.viewportRestores.length === 1 && rec.viewportRestores[0].join(",") === rec.viewportParam.join(","),
+        "M12/B2（task-23）画完把 VIEWPORT 写回进前读到的值（主渲染下一帧不会拿到 overlay 的视口）",
+      );
+      check(
+        rec.fboBinds.length === 2 && rec.fboBinds[0] === null && rec.fboBinds[1] === rec.fbo,
+        "M12/B2（task-23）画完把 FRAMEBUFFER_BINDING 写回进前的绑定（主渲染留在绑定上的 FBO 不被改掉）",
+      );
+      check(
+        rec.attribDisables.length === 1 && rec.attribDisables[0] === 0,
+        "M12/B2（task-23）本次 enable 的 locPos 在 finally 里 disable（不留多出来的 enabled attrib 给下一帧）",
+      );
+      check(
+        rec.usedPrograms[rec.usedPrograms.length - 1] === MAINPROG2 && rec.boundBuffers[rec.boundBuffers.length - 1] === MAINBUF2,
+        "M12/B2（task-23）program / ARRAY_BUFFER 绑定同样放回（既有断言之外再看一次末次调用）",
+      );
+      check(
+        rec.enabled.has("DEPTH_TEST") && rec.enabled.has("BLEND") && rec.enabled.has("CULL_FACE") && !rec.enabled.has("SCISSOR_TEST"),
+        "M12/B2（task-23）四个开关放回后与进前一致",
+      );
+      // 短路路径：一个状态调用都不发（用增量判定，不依赖上面那次成功 draw 的绝对值）
+      const callsBefore = rec.viewportCalls.length + rec.fboBinds.length + rec.attribEnables + rec.draws.length;
+      p.draw(new Float32Array(0), { width: 320, height: 180 });
+      p.draw(SEG, { width: 0, height: 0 });
+      p.draw(SEG, { width: 320, height: 0 });
+      check(
+        rec.viewportCalls.length + rec.fboBinds.length + rec.attribEnables + rec.draws.length === callsBefore,
+        "M12/B2（task-23）空数组 / 退化 viewport 早退：一次状态调用都不发（不碰主渲染）",
+      );
+      p.dispose();
+      const before = rec.viewportCalls.length + rec.fboBinds.length + rec.usedPrograms.length;
+      p.draw(SEG, { width: 320, height: 180 });
+      check(
+        rec.viewportCalls.length + rec.fboBinds.length + rec.usedPrograms.length === before,
+        "M12/B2（task-23）dispose 之后 draw 不碰任何 GL 状态（与既有「空操作」断言互为补充）",
+      );
+    }
+
+    // ③ drawArrays 抛错：状态仍被 finally 还原，异常照旧向上抛
+    {
+      const { gl, rec } = mkFakeGl({ throwDraw: true });
+      const p = glmod.createOverlayPass(gl);
+      let msg = "";
+      try {
+        p.draw(SEG, { width: 320, height: 180 });
+      } catch (e) {
+        msg = String((e && e.message) || e);
+      }
+      check(msg === "draw-boom", "M12/B2（task-23）drawArrays 抛错时异常向上抛（overlay 不吞主渲染链上的错）");
+      check(
+        rec.fboBinds.length === 2 && rec.fboBinds[1] === rec.fbo && rec.viewportRestores.length === 1 && rec.attribDisables.length === 1,
+        "M12/B2（task-23）drawArrays 抛错时 FBO / viewport / enabled 属性仍被还原（finally 兜底）",
+      );
+      check(
+        rec.enabled.has("DEPTH_TEST") && rec.enabled.has("BLEND") && rec.enabled.has("CULL_FACE") && !rec.enabled.has("SCISSOR_TEST") && p.frames === 0,
+        "M12/B2（task-23）抛错那一帧不计入 frames、开关也放回（frames 只数成功的 draw）",
+      );
+      p.dispose();
+    }
   }
 
   // ── B3 / W8：单脚本沙箱热替换（转发句柄 + 熔断状态跟着新沙箱） ──

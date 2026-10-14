@@ -5391,9 +5391,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           for (const it of textWidgets) {
             const layer = it.layer;
             let content = String(layer.text ?? "");
-            if (it.sandbox && it.sandbox.hasUpdate) {
+            // [we-scene patch] 时钟回填必须**按沙箱**，不能嵌在下面的 hasUpdate 分支里
+            // （与对象侧 `for (const sb of propSandboxes)` 同口径，见下方对象脚本处
+            // 注释）。「引擎层」文字脚本（无 export、只在顶层往 shared 上装读
+            // engine.runtime 的 helper，如 3786330502 的 createAnimation/updateAnimation）
+            // 没有 update ⇒ 嵌在 hasUpdate 内则它的 runtime 恒 0 ⇒ helper 里
+            // `engine.runtime - stateChangeTime >= delay` 恒不成立 ⇒ 点绿色箭头后
+            // shared.ck 翻了却一动不动，且面板不报任何错。engine 的这些字段是只读
+            // 环境量（runtime/timeOfDay），对不使用时钟的沙箱写入无副作用 —— 对象侧
+            // 早已这样做了整整一族。
+            if (it.sandbox) {
               it.sandbox.engine.runtime = t;
               it.sandbox.engine.timeOfDay = timeOfDayValue;
+            }
+            // callUpdate 的调用条件仍严格按 hasUpdate（回填位置改动不得多调一次 update）
+            if (it.sandbox && it.sandbox.hasUpdate) {
               const r = it.sandbox.callUpdate(content);
               if (r !== null && r !== undefined) content = String(r);
               else if (it.sandbox.thisLayer.text) content = String(it.sandbox.thisLayer.text);

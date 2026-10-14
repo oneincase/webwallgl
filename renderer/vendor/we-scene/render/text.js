@@ -997,10 +997,22 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 形如 `"use strict";export var ...`），故按「前导符 + export + 声明关键字」全局匹配，
   // 前导符保留。import 按完整语法剥（import 'x' / import * as X from 'x'）。
   const body = scriptToFunctionBody(script)
+  // [we-scene patch] 「引擎层」脚本判据：无 export、只在顶层往 shared 上装 helper，
+  // 而 helper 里读 engine.runtime/frametime（3786330502 的 createAnimation/
+  // updateAnimation 就是这种形态）。正则与对象侧（evalObjectScript 的
+  // `usesEngineClock`）**逐字相同**，两侧要一起对读。该族必须同时出现在下面两处：
+  //   ① 快速短路（否则 body===script 且无 update/resizeScreen 的这类脚本在这里就被丢，
+  //      后面的闸门根本收不到它）；
+  //   ② 闸门族（否则即使过了短路，也会在建沙箱那一步被整个丢弃）。
+  // 光有这两处还不算修好：宿主 scene-mount.ts 的 updateTexts 必须**按沙箱**回填
+  // engine.runtime（此前嵌在 hasUpdate 分支内 ⇒ 这类脚本 runtime 恒 0 ⇒ helper 里
+  // `engine.runtime - stateChangeTime >= delay` 恒不成立 ⇒ 画面不动，且无任何报错）。
+  const usesEngineClock = /\bengine\s*\.\s*(runtime|frametime)\b/.test(body)
   // 快速短路：scriptToFunctionBody 未剥掉任何 export（body===script）时，只有
   // 含 update 的才可能是有效脚本——但 resizeScreen 纯钩子脚本（无 update，
   // 3396722575 自适应缩放模板）也要放行，否则下面的第五闸门族永远收不到它。
-  if (body === script && script.indexOf('update') < 0 && script.indexOf('resizeScreen') < 0) return null
+  // usesEngineClock 同理放行（引擎层脚本，见上）。
+  if (body === script && script.indexOf('update') < 0 && script.indexOf('resizeScreen') < 0 && !usesEngineClock) return null
 
   // scriptProperties：scene 值优先，createScriptProperties 的 add* 只补缺省。
   // 声明链在模块体执行时立刻跑完并 finish()，返回的就是这个对象 —— update() 闭包
@@ -1277,15 +1289,12 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 真调 init：装配期 deferredTextInits 末端与热替换路径都会调，返回值是字符串就写回
   // layer.text（scene-mount.ts 两处）。闸门丢弃则这两条路径永远等不到沙箱。
   const hasInitHook = !!(fns && typeof fns.init === 'function')
-  // [we-scene patch] 对象侧还认一族 `usesEngineClock`（读 engine.runtime/frametime 的
-  // 无 export helper），文字侧**刻意不放行**：这里放行只会得到静默错值 —— ①无 export
-  // 且不含 update/resizeScreen 的脚本在更前面的快速短路就被丢；②宿主只对 hasUpdate 的
-  // 文字沙箱回填时钟（scene-mount.ts 的 `it.sandbox.engine.runtime = t` 写在
-  // `if (sandbox && sandbox.hasUpdate)` 分支内）⇒ 放行后 engine.runtime 恒 0，
-  // helper 里的 `engine.runtime - t0 >= delay` 永不成立，表现为「点击后 shared 翻了
-  // 但图层一动不动」。半修比不修更坏（不修至少不假装成功）。真修要改宿主回填那一处，
-  // 属本文件之外，已记为声明缺口 HOOK_GAP（见 scripts/verify-sandbox-params.mjs）。
-  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !hasAnimEventHook && !hasResizeHook && !hasInitHook)) return null
+  // [we-scene patch] 第八闸门族：usesEngineClock（引擎层脚本，见上面快速短路处的定义）。
+  // 位置与对象侧闸门**逐字相同**（夹在 apply 与 anim 之间），方便两侧对读。
+  // 这一族曾是声明缺口（HOOK_GAP）——task-20 时刻意不放行，因为只修闸门不修宿主回填
+  // 等于静默错值；本轮把宿主 scene-mount.ts 的 updateTexts 改成**按沙箱回填**
+  // （遍历 textWidgets 而非按 hasUpdate 筛），三处同批修齐才具备放行条件。
+  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !usesEngineClock && !hasAnimEventHook && !hasResizeHook && !hasInitHook)) return null
   // [we-scene patch] update 的首帧 value 语义按脚本形态区分：
   //  - 写回式（打字机模板）：update 把入参 value 当作**累积中的当前文本读入**
   //    （addLastChar(value) / handleBlinker(value) / queuedWord===value），返回值
