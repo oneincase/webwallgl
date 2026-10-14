@@ -61,6 +61,9 @@ export {
   moveCameraPathClip,
   removeCameraPathClip,
 } from "../editor/camera-path";
+// W16 地基：`.tex` 贴图缩略图 / 尺寸（纯数据层，Node 离线可跑；面板接线在 editor/main.ts）。
+// 内嵌 PNG/JPEG 与视频贴图返回 null，调用方走 decodeTexImageBitmap 的 Blob 路径。
+export { texPreviewPixels, texImageSize } from "../tex-preview";
 export type {
   ScenePkgFile,
   ScenePkgResult,

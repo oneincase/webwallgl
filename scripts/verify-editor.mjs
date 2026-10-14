@@ -11276,9 +11276,13 @@ section("MODEL-UI. 模型线 UI 接线：新建片段自动挂层 / 片段拖拽
       sizeWin.includes("originalTexSize(node, s.index)") && sizeWin.includes('et("mt.origSize"') && sizeWin.includes('et("mt.origNone"'),
       "④W16 每个槽显示原图尺寸（读不到显示「未知」，不猜）",
     );
+    // task-27 ② 改口径：贴图名 → 文件改走纯函数 texFileOf（阶梯：materials/<名>.tex → .png/.jpg/.jpeg
+    // 源图回落），因为实测旧口径（p===name || p.startsWith(name+'.')）在本机 571 个材质槽里**只命中
+    // 5 个** —— `.tex` 一律解不出，「原图尺寸」几乎恒显示未知。这里守「不退回旧口径」；阶梯的正反两面
+    //（含 tga/dds 不猜、_rt_*/util/* 排除）由 task-27 ① 段的纯判据真跑。
     is(
-      main.includes("const file = assets.list().find((p) => p === name || p.startsWith(`${name}.`));"),
-      "④原图路径靠 overlay 资源表同名解析（材质里只有贴图名，扩展名不猜）",
+      main.includes("texFileOf(name, assets.list())") && !main.includes("p.startsWith(`${name}.`)"),
+      "④原图路径靠 overlay 资源表同名解析（材质里只有贴图名，扩展名不猜；task-27 起走 texFileOf 阶梯）",
     );
     const onchangeWin = win("inModelTexEl.onchange", 1300);
     is(
@@ -12073,6 +12077,288 @@ section("task-13 ①. 片段事件时间轴拖拽（editor/main.ts 纯逻辑真�
   check(fs.readFileSync(mainPath13, "utf8") === main13, "变异全程未落盘：main.ts 与判据读到的逐字一致（sha256 等价）");
   const { createHash } = await import("node:crypto");
   console.log(`  · task-13 ① main.ts sha256=${createHash("sha256").update(fs.readFileSync(mainPath13)).digest("hex").slice(0, 16)}…`);
+}
+
+// ─────────────── task-27 ①：W16 贴图缩略图 + `.tex` 原图尺寸 ───────────────
+section("task-27 ①. W16 贴图缩略图 + `.tex` 原图尺寸（editor/main.ts 纯逻辑真跑 + 真实语料 + 接线守门 + 变异红测）");
+{
+  const mainPath27 = path.join(ROOT, "editor/main.ts");
+  const cssPath27 = path.join(ROOT, "editor/editor.css");
+  const main27 = fs.readFileSync(mainPath27, "utf8");
+  const i18n27 = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const css27 = fs.readFileSync(cssPath27, "utf8");
+  const S27_A = "// ↓ task-27 ①：W16 贴图缩略图 / 尺寸的纯逻辑";
+  const S27_B = "// ↑ task-27 ①：W16 贴图缩略图 / 尺寸的纯逻辑结束";
+  const pure27 = (src) => {
+    const a = src.indexOf(S27_A);
+    const b = src.indexOf(S27_B, a + 1);
+    return a < 0 || b < 0 ? null : src.slice(a, b);
+  };
+  /** 去注释再扫接线（注释里写到的调用不算接线；task-17 踩过这个坑） */
+  const strip27 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // 判据自己的依赖注入：切片里**刻意不写 import**（源码的相对路径 import 搬进 tmpRoot 会断链）。
+  // 注入的是**真源码**：tex-preview.ts = 泳道 A 的产物（真解码），api/core.ts = 引擎 public 面。
+  // 注入名单必须与 main.ts 真实 import 一致，wireBad 里有一条判据守着这个契约。
+  const INJ27 = [
+    `import { texPreviewPixels, texImageSize } from ${JSON.stringify(path.join(ROOT, "renderer/src/tex-preview.ts"))};`,
+    `import { FIF, decodeMipLevel, parseTex } from ${JSON.stringify(path.join(ROOT, "renderer/src/api/core.ts"))};`,
+  ].join("\n");
+  let seq27 = 0;
+  const loadPure27 = async (slice) => {
+    const p = path.join(tmpRoot, `tex-pure-${seq27++}.ts`);
+    fs.writeFileSync(p, `${INJ27}\n${slice}`);
+    const r = await build({
+      entryPoints: [p],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const mjs = p.replace(/\.ts$/, ".mjs");
+    fs.writeFileSync(mjs, r.outputFiles[0].text);
+    return import(pathToFileURL(mjs).href);
+  };
+  // 真实语料（仓库自带 fixture）：两张固定样本 + 全量扫。
+  // 注：阶梯键空间是引擎的 `materials/<名>.tex`（相对 assets 根），与 local-assets 的物理路径
+  //（effects/…/materials/x.tex）**不是同一命名空间** —— 所以语料只用于字节级断言，
+  // 贴图名→文件的阶梯用合成名单（含对抗样本）测。
+  const SAMPLE_RGBA = "local-assets/effects/blend/preview/materials/effectpreview.tex"; // ARGB8888，TEXI 256×256
+  const SAMPLE_EMB = "local-assets/materials/lut/80s_post-apocalyptic_action.tex"; // 内嵌 PNG，TEXI 32×32
+  const listTex = () => {
+    const out = [];
+    const dir = path.join(ROOT, "local-assets");
+    const walk = (d) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (p.endsWith(".tex")) out.push(p);
+      }
+    };
+    if (fs.existsSync(dir)) walk(dir);
+    return out;
+  };
+  let corpusInfo = "";
+  const pureBad27 = (M) => {
+    const bad = [];
+    const j = (v) => JSON.stringify(v);
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    if (
+      !M ||
+      typeof M.texFileOf !== "function" ||
+      typeof M.texThumbRoute !== "function" ||
+      typeof M.texSizeBranch !== "function" ||
+      typeof M.texDeclaredSize !== "function" ||
+      typeof M.texThumbRgba !== "function" ||
+      typeof M.texEmbeddedImage !== "function"
+    ) {
+      return ["task-27 切片里的纯逻辑符号不全（源码形状变了？）"];
+    }
+    // ① 贴图名 → 文件：引擎读点 materials/<名>.tex（scene-mount.ts:2218）、源码工程源图回落（:2239）；
+    //    扩展名只在 assets.list() 实有名单里找（**不猜** tga/dds）；运行时目标与 util/* 不是文件。
+    need(M.texFileOf("effectpreview", ["materials/effectpreview.tex"]) === "materials/effectpreview.tex", "①裸贴图名没命中 materials/<名>.tex（引擎读点口径）");
+    need(
+      ["materials/effectpreview.tex"].find((p) => p === "effectpreview" || p.startsWith("effectpreview.")) === undefined,
+      "①对照口径写错了：旧口径（p===name||p.startsWith(name+'.')）在真实名单上本应一条都不命中",
+    );
+    need(M.texFileOf("a", ["materials/a.png", "materials/a.tex"]) === "materials/a.tex", "①同名 .tex 与源图并存时没先取 .tex（引擎先读编译产物）");
+    need(M.texFileOf("a", ["materials/a.png"]) === "materials/a.png", "①只有源图 png 时没回落（scene-mount.ts:2239）");
+    need(M.texFileOf("materials/x.tex", ["materials/x.tex"]) === "materials/x.tex", "①名单里已有全路径时没直用");
+    need(M.texFileOf("a", ["materials/a.tga"]) === null, "①贴图名→文件猜了扩展名（tga 不该被当成贴图）");
+    need(M.texFileOf("a", ["materials/a.dds"]) === null, "①贴图名→文件猜了扩展名（dds 不该被当成贴图）");
+    need(M.texFileOf("_rt_imageLayerComposite_1", ["materials/_rt_imageLayerComposite_1.tex"]) === null, "①运行时渲染目标 _rt_* 不该当文件");
+    need(M.texFileOf("util/noise", ["materials/util/noise.tex"]) === null, "①util/* 着色器工具贴图不该当文件");
+    need(M.texFileOf("", ["materials/a.tex"]) === null && M.texFileOf("   ", ["materials/a.tex"]) === null, "①空贴图名没返回 null");
+    // ② 缩略图解码路线判定
+    need(M.texThumbRoute("materials/a.tex", new Uint8Array([1])) === "tex", "②`.tex` 不在缩略图路线上");
+    need(M.texThumbRoute("materials/a.png", new Uint8Array([1])) === "image", "②png 没走普通图路线");
+    need(M.texThumbRoute("materials/a.jpg", new Uint8Array([1])) === "image", "②jpg 没走普通图路线");
+    need(M.texThumbRoute("materials/a.tga", new Uint8Array([1])) === "none", "②tga 不该被判成可解码");
+    need(M.texThumbRoute(null, new Uint8Array([1])) === "none", "②无文件没判 none");
+    need(M.texThumbRoute("materials/a.png", null) === "none" && M.texThumbRoute("materials/a.png", new Uint8Array(0)) === "none", "②无字节/空字节没判 none");
+    // ③ 「原图尺寸」分派：`.tex`（含内嵌 PNG/JPEG 的）走 TEXI 声明尺寸，png/jpg 才交浏览器
+    need(M.texSizeBranch("materials/a.png", new Uint8Array([1])) === "bitmap", "③png 没交浏览器解码");
+    need(M.texSizeBranch("materials/a.tga", new Uint8Array([1])) === null, "③tga 没返回「未知」");
+    need(M.texSizeBranch(null, null) === null, "③无文件没返回「未知」");
+    // ④ 真实语料固定样本
+    const bRgba = fs.readFileSync(path.join(ROOT, SAMPLE_RGBA));
+    const bEmb = fs.readFileSync(path.join(ROOT, SAMPLE_EMB));
+    need(bRgba.length > 0 && bEmb.length > 0, "④固定样本读不到（local-assets fixture 变了？）");
+    need(j(M.texDeclaredSize(bRgba)) === "[256,256]", `④真实 .tex 的 TEXI 声明尺寸不对（got ${j(M.texDeclaredSize(bRgba))}）`);
+    need(j(M.texSizeBranch(SAMPLE_RGBA, bRgba)) === "[256,256]", `④真实 .tex 未走声明尺寸（got ${j(M.texSizeBranch(SAMPLE_RGBA, bRgba))}，"bitmap" 表示退化成浏览器解码）`);
+    const px = M.texThumbRgba(bRgba);
+    need(
+      !!px && px.width === 32 && px.height === 32 && px.rgba.length === 32 * 32 * 4,
+      `④真实 .tex 缩略图的尺寸/长度不对（got ${px ? `${px.width}x${px.height}/${px.rgba.length}` : "null"}）`,
+    );
+    need(!!px && px.rgba.some((v) => v !== 0), "④真实 .tex 缩略图解出全零像素（假绿：R8/RG88 单双通道最容易这样）");
+    need(M.texEmbeddedImage(bRgba) === null, "④纯 RGBA 的 .tex 被当成内嵌图了");
+    need(j(M.texDeclaredSize(bEmb)) === "[32,32]", `④内嵌图 .tex 的 TEXI 声明尺寸不对（got ${j(M.texDeclaredSize(bEmb))}）`);
+    need(j(M.texSizeBranch(SAMPLE_EMB, bEmb)) === "[32,32]", "④内嵌图 .tex 的尺寸没走声明尺寸（texImageSize 对内嵌图照常工作）");
+    need(M.texThumbRgba(bEmb) === null, "④内嵌图 .tex 不该有 CPU 直出像素（应回落内嵌图路径）");
+    const emb = M.texEmbeddedImage(bEmb);
+    need(!!emb && emb.mime === "image/png", `④内嵌 PNG 没解出来（got ${emb ? emb.mime : "null"}）`);
+    need(!!emb && emb.data[0] === 0x89 && emb.data[1] === 0x50 && emb.data[2] === 0x4e && emb.data[3] === 0x47, "④内嵌 PNG 的字节流不是 PNG 签名");
+    // ⑤ 全量语料：只断言不变量 + 基线地板（素材增长不会误红，但假绿一定红）
+    const texFiles = listTex();
+    need(texFiles.length >= 311, `⑤local-assets 里只扫到 ${texFiles.length} 张 .tex（基线 311）`);
+    let declared = 0;
+    let rgba = 0;
+    let nul = 0;
+    let zero = 0;
+    let embedded = 0;
+    const zeroList = [];
+    const odd = [];
+    for (const f of texFiles) {
+      const b = fs.readFileSync(f);
+      if (M.texDeclaredSize(b)) declared++;
+      const p2 = M.texThumbRgba(b);
+      if (p2) {
+        rgba++;
+        if (!p2.rgba.some((v) => v !== 0)) {
+          zero++;
+          if (zeroList.length < 3) zeroList.push(path.relative(ROOT, f));
+        }
+        continue;
+      }
+      nul++;
+      if (M.texEmbeddedImage(b)) embedded++;
+      else if (odd.length < 3) odd.push(path.relative(ROOT, f));
+    }
+    need(declared === texFiles.length, `⑤有 .tex 读不出 TEXI 声明尺寸（${declared}/${texFiles.length}）`);
+    need(rgba + nul === texFiles.length, "⑤缩略图路线计数不自洽");
+    need(rgba >= 276, `⑤CPU 直出缩略图的 .tex 少于基线 276（got ${rgba}）`);
+    need(nul >= 35, `⑤内嵌图 .tex 少于基线 35（got ${nul}）`);
+    need(zero === 0, `⑤有 .tex 解出全零像素（假绿，${zero} 张：${zeroList.join("、")}）`);
+    need(embedded === nul, `⑤解不出像素的 .tex 里有不是内嵌 PNG/JPEG 的（${embedded}/${nul}${odd.length ? "，例：" + odd.join("、") : ""}）`);
+    corpusInfo = `${texFiles.length} 张 .tex：CPU 直出 ${rgba}（全零 ${zero}）、内嵌 PNG/JPEG ${embedded}、声明尺寸 ${declared}/${texFiles.length}`;
+    return bad;
+  };
+  const wireBad27 = (src, i18n, css) => {
+    const bad = [];
+    const s = strip27(src);
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    // 缩略图真的接进了槽行（不是只定义了函数）
+    need(/void fillTexThumb\(thumb, node, s\.index\);/.test(s), "槽行没启动缩略图（fillTexThumb 没被调用）");
+    need(/box\.append\(thumb, name, sizeTag, b\);/.test(s), "缩略图没进槽行（box.append 丢了 thumb）");
+    need(/thumb\.className = "ed-mt-thumb";/.test(s), "缩略图 class 不是 ed-mt-thumb（CSS/无头定位会断）");
+    need(/const TEX_THUMB_MAX = 32;/.test(s) && /thumb\.width = TEX_THUMB_MAX;/.test(s), "缩略图尺寸不是 32×32 常量");
+    // 三条解码路都在
+    need(/const route = texThumbRoute\(file, bytes\);/.test(s), "缩略图没走 texThumbRoute（路线判定脱管）");
+    need(/const px = texThumbRgba\(bytes\);/.test(s), "`.tex` 没走 CPU 直出像素");
+    need(/const emb = texEmbeddedImage\(bytes\);/.test(s), "内嵌 PNG/JPEG 的 .tex 没回落内嵌图路径");
+    need(/drawTexBitmap\(ctx, cv, emb\.data, emb\.mime\)/.test(s), "内嵌图没交给 drawTexBitmap 解码");
+    need(/drawTexBitmap\(ctx, cv, bytes, ext === "png" \? "image\/png" : "image\/jpeg"\)/.test(s), "png/jpg 没走普通图解码");
+    need(/if \(ok\) \{\s*cv\.classList\.add\("on"\);/.test(s), "缩略图不是「解出来才亮」（无条件加 .on 会画空白）");
+    // 「解不出就不画」：fillTexThumb 体内不许有任何占位绘制
+    const fa = s.indexOf("async function fillTexThumb(");
+    const fb = s.indexOf("async function drawTexBitmap(", fa + 1);
+    if (fa < 0 || fb < 0) bad.push("fillTexThumb/drawTexBitmap 定义缺失");
+    else {
+      const body = s.slice(fa, fb);
+      need(!/fillRect|fillStyle/.test(body), "fillTexThumb 里画了占位方块（解不出就该什么都不画）");
+    }
+    // `.tex` 尺寸分支真的接进了 originalTexSize
+    need(/const br = texSizeBranch\(file, b\);/.test(s), "`.tex` 尺寸分支没接进 originalTexSize（走纯分派）");
+    need(/if \(br !== "bitmap"\) return br;/.test(s), "originalTexSize 没按分派表返回声明尺寸");
+    need(/texFileOf\(name, assets\.list\(\)\)/.test(s), "贴图名→文件没走 texFileOf + assets.list()（又回去猜扩展名了）");
+    // 依赖契约：判据的注入名单必须与 main.ts 真实 import 一致
+    need(
+      /texImageSize,\s*\n\s*texPreviewPixels,\s*\n\} from "\.\.\/renderer\/src\/api\/editor";/.test(src),
+      "main.ts 没从 api/editor 成对 import texImageSize / texPreviewPixels（判据注入契约会漂）",
+    );
+    need(
+      /import \{ FIF, decodeMipLevel, parseTex \} from "\.\.\/renderer\/src\/api\/core";/.test(src),
+      "main.ts 没从 api/core import FIF / decodeMipLevel / parseTex（内嵌图路径会断）",
+    );
+    // 本轮要写进文档的结论必须在源码里留着（引擎读点 + 5/304 实测）
+    need(/scene-mount\.ts:2218/.test(src) && /只命中 5 个/.test(src) && /304 个/.test(src), "贴图名→文件的实测结论（引擎读点 2218/2239 + 旧口径 5 个 / 阶梯 304 个）被删了");
+    // i18n 与 CSS
+    const nKey = i18n.split('"mt.thumbTitle":').length - 1;
+    if (nKey !== 2) bad.push(`i18n 键 mt.thumbTitle 需 zh/en 各恰好一条（got ${nKey}）`);
+    const cssA = css.indexOf("/* ---- task-27 ①：W16 贴图缩略图");
+    const cssB = css.indexOf("/* ---- task-13 ①", cssA + 1);
+    const region = cssA < 0 || cssB < 0 ? "" : css.slice(cssA, cssB);
+    if (!region) bad.push("editor.css 里没有 task-27 ① 的缩略图样式区");
+    else {
+      need(/\.ed-mt-thumb \{[\s\S]*?display: none;/.test(region), "缩略图基态不是 display:none（解不出会占位）");
+      need(/\.ed-mt-thumb\.on \{[\s\S]*?display: block;/.test(region), "缩略图 .on 态不是 display:block");
+      need(!/^\s*--[\w-]+\s*:/m.test(region), "新增样式里自造了 CSS 变量（要求沿用既有体系）");
+    }
+    return bad;
+  };
+  const pBase27 = pure27(main27);
+  const pBad27 = pBase27 ? pureBad27(await loadPure27(pBase27)) : ["纯逻辑切片缺失"];
+  check(pBad27.length === 0, `task-27 ① 缩略图/尺寸纯逻辑真跑全绿（${pBad27.length} 处失败${pBad27.length ? "：" + pBad27.slice(0, 3).join("；") : ""}）`);
+  if (corpusInfo) console.log(`  · task-27 ① 语料：${corpusInfo}`);
+  const wBad27 = wireBad27(main27, i18n27, css27);
+  check(wBad27.length === 0, `task-27 ① 接线/i18n/CSS/依赖契约全绿（${wBad27.length} 处失败${wBad27.length ? "：" + wBad27.slice(0, 3).join("；") : ""}）`);
+  // 变异红测：改坏 → 必红 → 由目标判据咬红。全程只改内存字符串，磁盘文件一个字节都不动。
+  const muts27 = [
+    {
+      pure: true,
+      name: "`.tex` 不再走缩略图解码路线（内嵌图/像素路线一起失效）",
+      from: '  if (ext === "tex") return "tex";',
+      to: '  if (ext === "tex") return "none";',
+      expect: /\.tex/,
+    },
+    {
+      pure: true,
+      name: "`.tex` 尺寸分支被删（退化成浏览器解码 ⇒ 面板永远「未知」）",
+      from: '  if (route === "tex") return texDeclaredSize(bytes);',
+      to: '  if (route === "tex") return "bitmap";',
+      expect: /未走声明尺寸/,
+    },
+    {
+      pure: true,
+      name: "缩略图返回全零像素（假绿）",
+      from: "  return texPreviewPixels(bytes, TEX_THUMB_MAX);",
+      to: "  return { width: TEX_THUMB_MAX, height: TEX_THUMB_MAX, rgba: new Uint8Array(TEX_THUMB_MAX * TEX_THUMB_MAX * 4) };",
+      expect: /全零像素/,
+    },
+    {
+      pure: true,
+      name: "贴图名→文件退回旧口径（猜扩展名）",
+      from: '  for (const ext of ["tex", "png", "jpg", "jpeg"] as const) {\n    const p = `materials/${n}.${ext}`;\n    if (have.has(p)) return p;\n  }\n  return null;',
+      to: "  const hit = list.find((p) => p === n || p.startsWith(`${n}.`));\n  return hit ?? null;",
+      expect: /裸贴图名没命中|扩展名/,
+    },
+    {
+      pure: true,
+      name: "内嵌 PNG 不再解（内嵌图 .tex 缩略图全丢）",
+      from: '    if (d && "png" in d && d.png) return { data: d.png as Uint8Array, mime: "image/png" };',
+      to: "    if (d && false) return null;",
+      expect: /内嵌 PNG 没解出来/,
+    },
+    {
+      name: "缩略图没进槽行（创建了但不用）",
+      from: "    box.append(thumb, name, sizeTag, b);",
+      to: "    box.append(name, sizeTag, b);",
+      expect: /没进槽行/,
+    },
+    {
+      name: "缩略图无条件点亮（解不出也画空白）",
+      from: '  if (ok) {\n    cv.classList.add("on");',
+      to: '  {\n    cv.classList.add("on");',
+      expect: /解出来才亮/,
+    },
+  ];
+  for (const m of muts27) {
+    const after = main27.replace(m.from, m.to);
+    check(after !== main27, `变异「${m.name}」确实改动了源码`);
+    if (after === main27) continue;
+    const bad2 = m.pure ? pureBad27(await loadPure27(pure27(after))) : wireBad27(after, i18n27, css27);
+    check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+    if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+  }
+  check(fs.readFileSync(mainPath27, "utf8") === main27, "变异全程未落盘：main.ts 与判据读到的逐字一致（sha256 等价）");
+  const { createHash } = await import("node:crypto");
+  console.log(`  · task-27 ① main.ts sha256=${createHash("sha256").update(fs.readFileSync(mainPath27)).digest("hex").slice(0, 16)}…`);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

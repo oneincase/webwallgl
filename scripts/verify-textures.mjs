@@ -13,6 +13,7 @@
  */
 import { build } from "esbuild";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
@@ -1600,6 +1601,347 @@ async function texLimits() {
 
 await builtinPatterns();
 await texLimits();
+
+// ---------- [7] 编辑器贴图缩略图 / 尺寸（W16 地基，renderer/src/tex-preview.ts） ----------
+// 交付面：tex-preview.ts 的 texPreviewPixels(bytes, max) / texImageSize(bytes)，经
+// renderer/src/api/editor.ts + editor.d.ts 公开（verify-arch 的双向契约判据管配对）。
+//
+// 判据为什么这样咬：
+//   ·「解出了 w*h*4」是全零像素也能骗过的假绿 —— 语料里 R8 / RG88 是单 / 双通道格式，
+//     所以每张都咬「非零像素 > 0」，并按格式分桶统计覆盖。
+//   ·挑级语义必须与引擎逐字节对齐：长边 ≤ max 的**最大画布**（下标 k 最小者）必须
+//     零重采样返回，且像素逐字节等于 decodeMipLevel(tex, k).rgba；没有任何一级够小时，
+//     才从第 0 级重采样到长边 = max（尺寸按 round 复算）。
+//   ·内嵌 PNG/JPEG（freeImageFormat ≠ -1，载荷只有 {image, fif}）没有 rgba ⇒ 必须返回
+//     null，调用方走 decodeTexImageBitmap 的 Blob 路径；texImageSize 对它们照常工作。
+//   ·本模块契约是「Node 离线、不碰 DOM」：运行期断言 document / window 都不存在。
+const TEX_PREVIEW_LIMIT = 64; // 与 tex-preview.ts 的缺省一致
+
+function texPreviewCorpusDir() {
+  return process.env.WE_LOCAL_ASSETS || join(ROOT, "local-assets");
+}
+
+function walkTexFiles(dir, out = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walkTexFiles(p, out);
+    else if (e.name.toLowerCase().endsWith(".tex")) out.push(p);
+  }
+  return out;
+}
+
+const texPreviewRel = (p) => p.slice(ROOT.length + 1);
+
+// 打包被测模块。mutations 为空 ⇒ 直接从磁盘入口打包；否则在内存里改源码后经 stdin 打包
+// （真实文件一字不动）。锚点必须**唯一命中**：String.replace 只换第一处，锚点重复会把
+// 变异悄悄打到别处、判据却全绿（task-8 踩过）。
+async function loadTexPreview(mutations = []) {
+  if (mutations.length === 0) {
+    const out = await build({
+      entryPoints: [join(ROOT, "renderer/src/tex-preview.ts")],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+    });
+    const tmp = join(ROOT, "scripts", `.tmp-texpreview-${process.pid}.mjs`);
+    fs.writeFileSync(tmp, out.outputFiles[0].text);
+    try {
+      return await import(pathToFileURL(tmp).href);
+    } finally {
+      fs.unlinkSync(tmp);
+    }
+  }
+  let src = fs.readFileSync(join(ROOT, "renderer/src/tex-preview.ts"), "utf8");
+  for (const [from, to] of mutations) {
+    const hits = src.split(from).length - 1;
+    if (hits !== 1) throw new Error(`变异锚点必须唯一命中（命中 ${hits} 次）：${JSON.stringify(from.slice(0, 64))}`);
+    src = src.replace(from, to);
+  }
+  const out = await build({
+    stdin: { contents: src, resolveDir: join(ROOT, "renderer/src"), loader: "ts" },
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+  });
+  const tmp = join(ROOT, "scripts", `.tmp-texpreview-mut-${process.pid}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(tmp, out.outputFiles[0].text);
+  try {
+    return await import(pathToFileURL(tmp).href);
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+}
+
+const texNonZero = (u8) => {
+  let c = 0;
+  for (let i = 0; i + 3 < u8.length; i += 4) if (u8[i] | u8[i + 1] | u8[i + 2] | u8[i + 3]) c++;
+  return c;
+};
+
+// 合成一段 64×64 的 raw RGBA（TEXV0005/TEXB0003、freeImageFormat = -1），不依赖本机素材。
+function syntheticRgba(w = 64, h = 64) {
+  const payload = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      payload[i] = (x * 4) & 0xff;
+      payload[i + 1] = (y * 4) & 0xff;
+      payload[i + 2] = 128;
+      payload[i + 3] = 255;
+    }
+  }
+  const buf = buildTexV5({ mw: w, mh: h, compression: 0, uncompressedSize: w * h * 4, compressedSize: w * h * 4, payload });
+  buf.writeUInt32LE(w, 34); // TEXI 声明尺寸（buildTexV5 固定写 4×4；这里必须与 mip 画布一致）
+  buf.writeUInt32LE(h, 38);
+  buf.writeInt32LE(-1, 59); // TEXB0003 的 freeImageFormat（body 偏移 13 ⇒ 绝对 46+13）
+  return new Uint8Array(buf);
+}
+
+// quiet=true 时只把失败计入 failed 计数器（由调用方快照/回滚），不打印。
+async function texPreviewChecks(mod, opts = {}) {
+  const quiet = opts.quiet === true;
+  let local = 0;
+  const chk = (ok, msg) => {
+    if (quiet) {
+      if (!ok) local++;
+    } else {
+      check(ok, msg);
+    }
+  };
+  const { parseTex } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+  const { decodeMipLevel } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/tex-codecs.js")).href);
+
+  // (1) 契约面 + 仓库约定
+  const apiSrc = fs.readFileSync(join(ROOT, "renderer/src/api/editor.ts"), "utf8");
+  chk(
+    /export \{ texPreviewPixels, texImageSize \} from "\.\.\/tex-preview";/.test(apiSrc),
+    "api/editor.ts 必须导出 texPreviewPixels / texImageSize（W16 地基的公开面）",
+  );
+  const dtsSrc = fs.readFileSync(join(ROOT, "renderer/src/api/editor.d.ts"), "utf8");
+  chk(
+    /export declare function texPreviewPixels\(/.test(dtsSrc) && /export declare function texImageSize\(/.test(dtsSrc),
+    "api/editor.d.ts 必须成对声明两条（否则 verify-arch 的双向契约判据红）",
+  );
+  const tpSrc = fs.readFileSync(join(ROOT, "renderer/src/tex-preview.ts"), "utf8");
+  chk(!/\bas any\b/.test(tpSrc), "tex-preview.ts 不得使用 as any（仓库约定）");
+  chk(
+    typeof document === "undefined" && typeof window === "undefined",
+    "判据运行在无 DOM 环境；缩略图仍须能解出（本模块契约：Node 离线可跑）",
+  );
+
+  // (2) 合成语料：raw RGBA 与「非 RGBA 载荷」两条路，不依赖本机素材
+  const syn = syntheticRgba(64, 64);
+  const synTex = parseTex(syn);
+  chk(synTex.freeImageFormat === -1, `合成容器必须落在 raw 像素分支（freeImageFormat=${synTex.freeImageFormat}）`);
+  const d0 = decodeMipLevel(synTex, 0);
+  const p64 = mod.texPreviewPixels(syn, 64);
+  chk(
+    p64 !== null &&
+      p64.width === 64 &&
+      p64.height === 64 &&
+      Buffer.compare(Buffer.from(p64.rgba), Buffer.from(d0.rgba)) === 0,
+    "合成 64×64：长边已 ≤ max ⇒ 零重采样、逐字节等于引擎第 0 级",
+  );
+  chk(p64 !== null && texNonZero(p64.rgba) > 0, "合成 64×64：像素不得全零");
+  // 合成「POT 填充」形态：TEXI 声明 20×20（真实内容），mip 画布 64×64（带填充），
+  // 同头 textureWidth 仍是 buildTexV5 的 4。texImageSize 必须报**声明尺寸**，
+  // 既不是画布也不是 textureWidth；缩略图走引擎解码（引擎按声明内容矩形裁掉填充）。
+  const synPad = syntheticRgba(64, 64);
+  const synPadView = Buffer.from(synPad.buffer, synPad.byteOffset, synPad.byteLength);
+  synPadView.writeUInt32LE(20, 34);
+  synPadView.writeUInt32LE(20, 38);
+  const padSize = mod.texImageSize(synPad);
+  chk(
+    padSize !== null && padSize.width === 20 && padSize.height === 20,
+    `texImageSize 必须报 TEXI 声明尺寸（合成填充样本 20×20；实得 ${padSize ? padSize.width + "×" + padSize.height : "null"}）—— 不得报 mip 画布 64×64 或 textureWidth 4`,
+  );
+  const padLevel0 = decodeMipLevel(parseTex(synPad), 0);
+  const padPreview = mod.texPreviewPixels(synPad, 64);
+  chk(
+    padPreview !== null &&
+      padPreview.width === padLevel0.width &&
+      padPreview.height === padLevel0.height &&
+      Buffer.compare(Buffer.from(padPreview.rgba), Buffer.from(padLevel0.rgba)) === 0,
+    `填充样本的缩略图必须与引擎解码逐字节一致（按声明内容裁掉填充；实得 ${padPreview ? padPreview.width + "×" + padPreview.height : "null"}，引擎 ${padLevel0.width}×${padLevel0.height}）`,
+  );
+  const p8 = mod.texPreviewPixels(syn, 8);
+  chk(
+    p8 !== null && p8.width === 8 && p8.height === 8 && p8.rgba.length === 8 * 8 * 4 && texNonZero(p8.rgba) > 0,
+    `合成 64×64 取 max=8 ⇒ 重采样到 8×8 且非全零（实得 ${p8 ? p8.width + "×" + p8.height + " len=" + p8.rgba.length : "null"}）`,
+  );
+  const p1 = mod.texPreviewPixels(syn, 1);
+  chk(p1 !== null && p1.width === 1 && p1.height === 1 && texNonZero(p1.rgba) > 0, "合成 64×64 取 max=1 ⇒ 1×1 且非全零");
+  for (const badMax of [0, -3, NaN, "abc", undefined]) {
+    const p = mod.texPreviewPixels(syn, badMax);
+    const ok = p !== null && Math.max(p.width, p.height) <= 64 && p.rgba.length === p.width * p.height * 4;
+    chk(ok, `max=${String(badMax)} 必须夹取 / 回落缺省 64（实得 ${p ? p.width + "×" + p.height : "null"}）`);
+  }
+  // 非 RGBA 载荷（freeImageFormat = 0 ⇒ decodeMipLevel 只给 {image, fif}）：必须 null
+  const synFree = new Uint8Array(buildTexV5({ mw: 4, mh: 4, compression: 0, uncompressedSize: 64, compressedSize: 64, payload: Buffer.alloc(64, 3) }));
+  const freeMip = decodeMipLevel(parseTex(synFree), 0);
+  chk(
+    !("rgba" in freeMip) && mod.texPreviewPixels(synFree, 64) === null,
+    "内嵌 PNG/JPEG 形态（无 rgba 载荷）必须返回 null，交由调用方走 Blob 路径",
+  );
+  chk(
+    mod.texImageSize(synFree) !== null,
+    "内嵌 PNG/JPEG 形态的 texImageSize 不受影响（TEXI 声明尺寸与像素格式无关）",
+  );
+
+  // (3) 畸形输入：两个 API 都必须 null 且不抛
+  const malformed = [
+    ["空 buffer", new Uint8Array(0)],
+    ["非 .tex 魔数", new TextEncoder().encode("not a tex file".padEnd(96, "x"))],
+    ["截断的合法文件", syn.slice(0, 40)],
+  ];
+  for (const [name, buf] of malformed) {
+    let threw = null;
+    let r = null;
+    let s = null;
+    try {
+      r = mod.texPreviewPixels(buf, 64);
+      s = mod.texImageSize(buf);
+    } catch (e) {
+      threw = String((e && e.message) || e);
+    }
+    chk(threw === null && r === null && s === null, `${name}：texPreviewPixels / texImageSize 都必须返回 null 且不抛（threw=${threw}）`);
+  }
+
+  // (4) 真语料（本机装了原版素材时）：逐张咬非全零 / 不超 max / 挑级逐字节
+  const dir = texPreviewCorpusDir();
+  if (!fs.existsSync(dir)) {
+    if (!quiet) console.log(`  （跳过本机 .tex 语料：没有 ${dir}）`);
+  } else {
+    const files = walkTexFiles(dir).sort();
+    const buckets = new Map();
+    const viol = [];
+    const sizeBad = [];
+    let rgbaTotal = 0;
+    let exact = 0;
+    let resampled = 0;
+    let freeTotal = 0;
+    let freeNull = 0;
+    for (const f of files) {
+      const bytes = new Uint8Array(fs.readFileSync(f));
+      let tex;
+      try {
+        tex = parseTex(bytes);
+      } catch (e) {
+        viol.push(`解析失败 ${texPreviewRel(f)}`);
+        continue;
+      }
+      const key = tex.formatName + (tex.freeImageFormat !== -1 ? "/fif" + tex.freeImageFormat : "");
+      buckets.set(key, (buckets.get(key) || 0) + 1);
+      const sz = mod.texImageSize(bytes);
+      if (!sz || sz.width !== tex.width || sz.height !== tex.height) {
+        sizeBad.push(`${texPreviewRel(f)} 得 ${sz ? sz.width + "×" + sz.height : "null"}，声明 ${tex.width}×${tex.height}`);
+      }
+      if (tex.freeImageFormat !== -1 || tex.isVideo) {
+        freeTotal++;
+        if (mod.texPreviewPixels(bytes, TEX_PREVIEW_LIMIT) === null) freeNull++;
+        else viol.push(`内嵌 PNG/JPEG 必须 null：${texPreviewRel(f)}`);
+        continue;
+      }
+      rgbaTotal++;
+      let want = null;
+      for (let k = 0; k < tex.images[0].length; k++) {
+        const d = decodeMipLevel(tex, k);
+        if (Math.max(d.width, d.height) <= TEX_PREVIEW_LIMIT) {
+          want = d;
+          break;
+        }
+      }
+      const p = mod.texPreviewPixels(bytes, TEX_PREVIEW_LIMIT);
+      if (!p) {
+        viol.push(`返回 null ${texPreviewRel(f)}`);
+        continue;
+      }
+      if (p.rgba.length !== p.width * p.height * 4) viol.push(`rgba 长度错 ${texPreviewRel(f)}`);
+      if (Math.max(p.width, p.height) > TEX_PREVIEW_LIMIT) viol.push(`超过 max=${TEX_PREVIEW_LIMIT}：${texPreviewRel(f)} ${p.width}×${p.height}`);
+      if (texNonZero(p.rgba) === 0) viol.push(`全零像素 ${texPreviewRel(f)}`);
+      if (want) {
+        const same =
+          p.width === want.width &&
+          p.height === want.height &&
+          Buffer.compare(Buffer.from(p.rgba), Buffer.from(want.rgba)) === 0;
+        if (same) exact++;
+        else viol.push(`挑级不符 ${texPreviewRel(f)}：得 ${p.width}×${p.height}，期望 ${want.width}×${want.height}`);
+      } else {
+        resampled++;
+        const l0 = decodeMipLevel(tex, 0);
+        const long = Math.max(l0.width, l0.height);
+        const wantW = Math.max(1, Math.round(l0.width * (TEX_PREVIEW_LIMIT / long)));
+        const wantH = Math.max(1, Math.round(l0.height * (TEX_PREVIEW_LIMIT / long)));
+        if (p.width !== wantW || p.height !== wantH)
+          viol.push(`重采样尺寸错 ${texPreviewRel(f)}：得 ${p.width}×${p.height}，期望 ${wantW}×${wantH}`);
+      }
+    }
+    const coverage = ["ARGB8888", "R8", "RG88", "DXT5"].filter((k) => (buckets.get(k) || 0) > 0);
+    const dist = [...buckets].map(([k, v]) => `${k}=${v}`).join(" ");
+    chk(files.length >= 200, `本机 .tex 语料规模（${files.length} 张 ≥ 200；分布 ${dist}）`);
+    chk(coverage.length === 4, `语料必须覆盖四种 RGBA 格式（实得 ${coverage.join("/") || "无"}）`);
+    chk(
+      viol.length === 0,
+      `rgba 语料 ${rgbaTotal} 张全部非空 / 不超 max / 非全零 / 挑级逐字节对齐（零重采样 ${exact} + 重采样 ${resampled}）：${viol.slice(0, 3).join("；") || "无违例"}`,
+    );
+    chk(freeNull === freeTotal, `内嵌 PNG/JPEG ${freeTotal} 张必须一律返回 null（实得 null ${freeNull}）`);
+    chk(
+      sizeBad.length === 0,
+      `texImageSize 必须全部等于 TEXI 声明尺寸（不得报 POT 画布尺寸）：${sizeBad.slice(0, 2).join("；") || "全部一致"}`,
+    );
+  }
+
+  if (quiet) failed += local;
+  return local;
+}
+
+async function texPreview() {
+  console.log("\n[7] 编辑器贴图缩略图 / 尺寸（tex-preview.ts，W16 地基）");
+  const mod = await loadTexPreview();
+  await texPreviewChecks(mod);
+}
+
+// 变异红测：改坏 ⇒ 判据必红；全程只在内存里改源码，真实文件 sha256 前后一致。
+async function texPreviewMutations() {
+  console.log("\n[8] 变异红测：tex-preview.ts 改坏 ⇒ 判据必须变红");
+  const srcPath = join(ROOT, "renderer/src/tex-preview.ts");
+  const sha = () => createHash("sha256").update(fs.readFileSync(srcPath)).digest("hex");
+  const before = sha();
+  const hasCorpus = fs.existsSync(texPreviewCorpusDir());
+  const cases = [
+    ["M1 忽略 mip 挑级（永远从第 0 级重采样）", [["if (Math.max(d.width, d.height) <= limit) {", "if (false) {"]], true],
+    ["M2 非 RGBA 载荷也当缩略图返回", [["if (!rgba) return null; // 内嵌 PNG/JPEG：见上面的「走哪条路」", "if (false) return null;"]], false],
+    ["M3 重采样目标不缩放", [["Math.max(1, Math.round(src.width * scale)),\n      Math.max(1, Math.round(src.height * scale)),", "src.width,\n      src.height,"]], false],
+    ["M4 texImageSize 报 TEXI 画布尺寸", [["const w = Number(tex.width);", "const w = Number(tex.textureWidth);"]], false],
+  ];
+  for (const [name, mutations, needsCorpus] of cases) {
+    if (needsCorpus && !hasCorpus) {
+      console.log(`  （跳过「${name}」：没有 ${texPreviewCorpusDir()}，变异在这台机器上不可观测）`);
+      continue;
+    }
+    let added = 0;
+    let err = "";
+    try {
+      const mod = await loadTexPreview(mutations);
+      const snapshot = failed;
+      await texPreviewChecks(mod, { quiet: true });
+      added = failed - snapshot;
+      failed = snapshot;
+    } catch (e) {
+      err = String((e && e.message) || e);
+    }
+    check(added > 0 && err === "", `${name} ⇒ 至少 1 条判据变红（实得 ${added} 条${err ? "；变异执行失败：" + err : ""}）`);
+  }
+  const after = sha();
+  check(after === before, `变异只发生在内存里：真实文件 sha256 前后一致（${before.slice(0, 12)}…）`);
+}
+
+await texPreview();
+await texPreviewMutations();
 
 console.log(failed === 0 ? "\nverify-textures: 全部通过 ✓" : `\nverify-textures: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

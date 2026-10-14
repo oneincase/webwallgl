@@ -368,3 +368,23 @@ export declare function moveCameraPathClip(doc: unknown, from: number, to: numbe
 
 /** 队列删段（`doc.paths` 内就地 splice）；下标非法返回 false */
 export declare function removeCameraPathClip(doc: unknown, index: number): boolean;
+
+/**
+ * `.tex` 贴图缩略图（W16 地基，纯数据层）：挑一个长边 ≤ `max`（缺省 64，夹取到
+ * `[1, 1024]`）的 mip 级，必要时从该级 CPU 重采样；返回 `{ width, height, rgba }`，
+ * `rgba` 长 `width * height * 4`。
+ *
+ * 内嵌 PNG/JPEG 的贴图（`freeImageFormat` 非 UNKNOWN）与视频贴图返回 null —— 它们没有
+ * RGBA 载荷，调用方改走 `decodeTexImageBitmap` 的 Blob 路径。坏字节 / 截断 / 非 .tex
+ * 一律返回 null，不抛。
+ */
+export declare function texPreviewPixels(
+  bytes: Uint8Array,
+  max?: number,
+): { width: number; height: number; rgba: Uint8Array } | null;
+
+/**
+ * 只读 TEXI 头部声明的贴图尺寸（内容尺寸，不是带 POT 填充的 mip 画布尺寸），不解像素。
+ * 解析失败返回 null，不抛。
+ */
+export declare function texImageSize(bytes: Uint8Array): { width: number; height: number } | null;

@@ -1273,6 +1273,23 @@ input.ed-al-name {
   gap: 6px;
 }
 
+/* ---- task-27 ①：W16 贴图缩略图（32×32；解不出像素的贴图不占位） ---- */
+.ed-mt-thumb {
+  display: none;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--wb-line);
+  border-radius: 3px;
+  /* 深底是必需的：`.tex` 里大量全透明区域，没有底色看不出图边界在哪 */
+  background: var(--wb-viewport);
+  image-rendering: pixelated;
+}
+
+.ed-mt-thumb.on {
+  display: block;
+}
+
 /* ---- task-13 ①：片段事件时间轴（帧 → 位置线性；标记可拖、点空白新增） ---- */
 .ed-cl-track {
   grid-column: 1 / -1;

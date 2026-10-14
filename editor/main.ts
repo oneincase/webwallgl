@@ -45,7 +45,12 @@ import {
   setMdlSkeleton,
   setMdlTopology,
   setMdlWeights,
+  texImageSize,
+  texPreviewPixels,
 } from "../renderer/src/api/editor";
+// W16 缩略图：`.tex` 内嵌 PNG/JPEG 的原始图字节靠引擎的 `decodeMipLevel` 透出（api/core 是
+// 编辑器页唯一允许的第二条 public 面，见 verify-arch.mjs:82）；`FIF` 用来把内嵌格式映射成 MIME。
+import { FIF, decodeMipLevel, parseTex } from "../renderer/src/api/core";
 import { getLang, onChangeLang, setLang, t, type Lang } from "../bench/i18n";
 import { DOC_KINDS, renderDocs, type DocKind } from "../bench/docs";
 import { applyPlatformClasses } from "../shared/workbench/platform";
@@ -6322,6 +6327,14 @@ function modelTexGroup(node: LayerNode): HTMLElement | null {
     const name = document.createElement("span");
     name.className = "ed-mt-name";
     name.textContent = s.texture ?? et("mt.noTexture");
+    // task-27 ①（W16 保留项「贴图缩略图」）：32×32 画布，解出来才亮（`.on`）。解不出保持
+    // 隐藏 —— 旧口径「只显示贴图名」是**正确**的回落，不是待修的空白。
+    const thumb = document.createElement("canvas");
+    thumb.className = "ed-mt-thumb";
+    thumb.width = TEX_THUMB_MAX;
+    thumb.height = TEX_THUMB_MAX;
+    thumb.title = et("mt.thumbTitle");
+    void fillTexThumb(thumb, node, s.index);
     const b = document.createElement("button");
     b.type = "button";
     b.className = "ed-btn ed-mt-replace";
@@ -6343,7 +6356,7 @@ function modelTexGroup(node: LayerNode): HTMLElement | null {
       modelTexOrig.set(key, dims);
       sizeTag.textContent = dims ? et("mt.origSize", { w: dims[0], h: dims[1] }) : et("mt.origNone");
     });
-    box.append(name, sizeTag, b);
+    box.append(thumb, name, sizeTag, b);
     form.append(l, box);
   }
   group.appendChild(form);
@@ -6373,15 +6386,97 @@ inModelTexEl.onchange = async () => {
   await replaceModelTexture(pick.layer, pick.mesh, img);
 };
 
+// ↓ task-27 ①：W16 贴图缩略图 / 尺寸的纯逻辑（离线判据真跑这一段；DOM 接线在 modelTexGroup / fillTexThumb）
+/** 缩略图长边（像素）：面板画布 32×32；`.tex` 挑 mip 级与重采样都按它走。 */
+const TEX_THUMB_MAX = 32;
 /**
- * task-12 ④：读某槽当前贴图的真实像素尺寸（「原图尺寸」）。路径解析与 replaceModelTexture 同源
- * （editor/main.ts:6132）：puppet → model json 的 material；mesh → meshMaterialPath；材质里
- * passes[0].textures[0] 是贴图名，真实文件由 overlay 资源表里同名前缀（`name.`）决定，**不猜扩展名**。
- * 读不到（无资源表 / 名字解析不出 / 不是 png|jpg）返回 null —— 调用方显示「原图尺寸未知」。
+ * 贴图名 → 真实文件。**引擎读点** `renderer/src/scene-mount.ts:2218`
+ * （`readAsset(`materials/${name}.tex`)`）与 `:2239` 的源码工程源图回落
+ * （`materials/${name}.png|jpg|jpeg`，官方工程里 `.png` 是源图、`.tex` 是编译产物、编译产物可能缺席）。
+ *
+ * 两条实测事实（本机 364 个可解析的 scene.pkg / 571 个 `materials/models/**` 材质槽）：
+ *   1. 材质里 `passes[0].textures[0]` 写的是**相对 `materials/` 的贴图名、不带扩展名**，
+ *      不是 `assets.list()` 里的完整路径 —— 旧口径 `p === name || p.startsWith(name + ".")`
+ *      **只命中 5 个**（task-12 ④「原图尺寸」几乎恒显示「未知」的真正原因）；
+ *   2. 按这条阶梯命中 **304 个**；其余 267 个**不是文件**：256 个 `util/white` 这类着色器工具贴图
+ *      + 11 个 `_rt_imageLayerComposite_*` 运行时渲染目标 —— 这两类返回 null 才是对的。
+ *
+ * 扩展名**不猜**：只在 `assets.list()` 的实有名单里找（`util/*` 着色器工具贴图与 `_rt_*`
+ * 运行时目标同样不是文件，见 `scene-mount.ts:1655` 对这两类前缀的排除）。
  */
-async function originalTexSize(node: LayerNode, mesh: number): Promise<[number, number] | null> {
+export function texFileOf(name: string, list: readonly string[]): string | null {
+  const n = String(name ?? "").trim();
+  if (!n || n.startsWith("_rt_") || n.startsWith("util/")) return null;
+  const have = new Set(list);
+  if (have.has(n)) return n; // 材质里已经写全路径（编辑器换图后的形态之一）
+  for (const ext of ["tex", "png", "jpg", "jpeg"] as const) {
+    const p = `materials/${n}.${ext}`;
+    if (have.has(p)) return p;
+  }
+  return null;
+}
+
+/** 贴图缩略图的解码路线：`tex` = 先 CPU 直出像素、内嵌 PNG/JPEG 再回落内嵌图；`image` = 普通图。 */
+export type TexThumbRoute = "none" | "tex" | "image";
+
+/** 文件 + 字节 → 走哪条解码路（纯判定，不解码；`none` = 不画，保持「只显示贴图名」）。 */
+export function texThumbRoute(file: string | null, bytes: Uint8Array | null | undefined): TexThumbRoute {
+  if (!file || !bytes || bytes.length === 0) return "none";
+  const ext = file.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "tex") return "tex";
+  return ext === "png" || ext === "jpg" || ext === "jpeg" ? "image" : "none";
+}
+
+/** `.tex` 的**声明尺寸**（TEXI 内容尺寸，已排除 POT 填充）——「原图尺寸」的 `.tex` 分支。 */
+export function texDeclaredSize(bytes: Uint8Array | null | undefined): [number, number] | null {
+  if (!bytes || bytes.length === 0) return null;
+  const s = texImageSize(bytes);
+  return s ? [s.width, s.height] : null;
+}
+
+/**
+ * task-27 ②：`originalTexSize` 的**分派表**（纯函数）。`tex` → TEXI 声明尺寸（内嵌 PNG/JPEG 的
+ * `.tex` 也照样有 TEXI，本机 311 张一张不缺）；`image` → `"bitmap"` 表示交浏览器解码；
+ * 其余（`_rt_*`、`util/*`、tga/dds、坏字节、无文件）→ null（面板显示「原图尺寸未知」）。
+ * 判据真跑这一段：**`.tex` 分支一旦被删/被改**，`.tex` 就会退化成 `"bitmap"`，尺寸判据当场变红。
+ */
+export function texSizeBranch(file: string | null, bytes: Uint8Array | null | undefined): [number, number] | null | "bitmap" {
+  const route = texThumbRoute(file, bytes);
+  if (route === "none") return null;
+  if (route === "tex") return texDeclaredSize(bytes);
+  return "bitmap";
+}
+
+/** `.tex` 缩略图像素（CPU 直出）；null = 内嵌 PNG/JPEG 或视频贴图，交给 `texEmbeddedImage`。 */
+export function texThumbRgba(bytes: Uint8Array): { width: number; height: number; rgba: Uint8Array } | null {
+  return texPreviewPixels(bytes, TEX_THUMB_MAX);
+}
+
+/**
+ * `.tex` 内嵌图的原始字节 + MIME（引擎 `decodeMipLevel` 同源，`tex-codecs.js:26` 的 FIF）：
+ * PNG（fif=13）与 JPEG（fif=2）给浏览器解；GIF/WEBP/视频不抓（缩略图不值得，返回 null 不撒谎）。
+ */
+export function texEmbeddedImage(bytes: Uint8Array): { data: Uint8Array; mime: string } | null {
+  try {
+    const tex = parseTex(bytes);
+    if (tex.isVideo) return null;
+    const d = decodeMipLevel(tex, 0);
+    if (d && "png" in d && d.png) return { data: d.png as Uint8Array, mime: "image/png" };
+    if (d && "image" in d && d.image && d.fif === FIF.JPEG) return { data: d.image as Uint8Array, mime: "image/jpeg" };
+    return null;
+  } catch {
+    return null;
+  }
+}
+// ↑ task-27 ①：W16 贴图缩略图 / 尺寸的纯逻辑结束
+
+/**
+ * 某槽当前贴图在材质里的名字（`passes[0].textures[0]`）。路径解析与 replaceModelTexture 同源
+ * （editor/main.ts:6132）：puppet → model json 的 `material`；mesh → `meshMaterialPath`。
+ */
+async function modelTexName(node: LayerNode, mesh: number): Promise<string> {
   const assets = overlay;
-  if (!assets) return null;
+  if (!assets) return "";
   const o = node.obj;
   let matPath = "";
   if (node.modelForm === "puppet") {
@@ -6391,20 +6486,37 @@ async function originalTexSize(node: LayerNode, mesh: number): Promise<[number, 
     const bytes = await assets.read(String(o.model));
     matPath = bytes ? meshMaterialPath(bytes, mesh) ?? "" : "";
   }
-  if (!matPath) return null;
+  if (!matPath) return "";
   const material = parseJsonBytes(await assets.read(matPath));
   const passes = material?.passes;
   const p0 = Array.isArray(passes) && passes[0] && typeof passes[0] === "object" ? (passes[0] as Record<string, unknown>) : null;
   const tex = p0 && Array.isArray(p0.textures) ? (p0.textures as unknown[]) : [];
-  const name = typeof tex[0] === "string" ? tex[0] : "";
-  if (!name) return null;
-  const file = assets.list().find((p) => p === name || p.startsWith(`${name}.`));
-  if (!file) return null;
-  const ext = file.split(".").pop()?.toLowerCase() ?? "";
-  const type = ext === "png" ? "image/png" : ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "";
-  if (!type) return null;
-  const b = await assets.read(file);
+  return typeof tex[0] === "string" ? tex[0] : "";
+}
+
+/** 某槽当前贴图的真实文件（`texFileOf` + `assets.list()`）；null = 解析不出 / 不是文件。 */
+async function modelTexFile(node: LayerNode, mesh: number): Promise<string | null> {
+  const assets = overlay;
+  if (!assets) return null;
+  const name = await modelTexName(node, mesh);
+  return name ? texFileOf(name, assets.list()) : null;
+}
+
+/**
+ * task-12 ④ + task-27 ②：读某槽当前贴图的真实像素尺寸（「原图尺寸」）。`.tex` 走 `texDeclaredSize`
+ * （TEXI 声明尺寸，不解像素、不吃 POT 填充）；png/jpg 走 `createImageBitmap`（原路径不动）。
+ * 读不到（无资源表 / 名字解析不出 / 坏字节）返回 null —— 调用方显示「原图尺寸未知」。
+ */
+async function originalTexSize(node: LayerNode, mesh: number): Promise<[number, number] | null> {
+  const assets = overlay;
+  if (!assets) return null;
+  const file = await modelTexFile(node, mesh);
+  const b = file ? await assets.read(file) : null;
+  // 分派走纯函数 texSizeBranch（`.tex` → 声明尺寸；png/jpg → "bitmap" 交浏览器解）；判据真跑它
+  const br = texSizeBranch(file, b);
+  if (br !== "bitmap") return br;
   if (!b) return null;
+  const type = (file ?? "").split(".").pop()?.toLowerCase() === "png" ? "image/png" : "image/jpeg";
   try {
     const bmp = await createImageBitmap(new Blob([b.slice()], { type }));
     const dims: [number, number] = [bmp.width, bmp.height];
@@ -6412,6 +6524,64 @@ async function originalTexSize(node: LayerNode, mesh: number): Promise<[number, 
     return dims;
   } catch {
     return null;
+  }
+}
+
+/**
+ * task-27 ①（DOM 端）：把某槽的贴图画进 32×32 画布。三条路都从引擎读点出发（见 `texFileOf` 注释）：
+ * `.tex` 先 CPU 直出像素（`texPreviewPixels`，本机 311 张里 276 张走得通）；走不通的是内嵌
+ * PNG/JPEG（35 张，`texEmbeddedImage` 取内嵌图原始字节交给浏览器解）；`.png/.jpg/.jpeg` 直接解。
+ * 解不出（`_rt_*` 运行时目标、`util/*`、视频贴图、坏字节）就**保持隐藏**，不画占位方块 ——
+ * 与 `originalTexSize` 同源同判：解不出就是解不出，不撒谎。
+ */
+async function fillTexThumb(cv: HTMLCanvasElement, node: LayerNode, mesh: number): Promise<void> {
+  const assets = overlay;
+  if (!assets) return;
+  const file = await modelTexFile(node, mesh);
+  const bytes = file ? await assets.read(file) : null;
+  const route = texThumbRoute(file, bytes);
+  if (route === "none" || !bytes) return;
+  const ctx = cv.getContext("2d");
+  if (!ctx) return;
+  let ok = false;
+  if (route === "tex") {
+    const px = texThumbRgba(bytes);
+    if (px) {
+      // CPU 直出：1:1 像素、不重采样（`.tex` 源图多为 32×32，缩放只会糊）
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(px.rgba), px.width, px.height), (cv.width - px.width) >> 1, (cv.height - px.height) >> 1);
+      ok = true;
+    } else {
+      const emb = texEmbeddedImage(bytes);
+      if (emb) ok = await drawTexBitmap(ctx, cv, emb.data, emb.mime);
+    }
+  } else {
+    const ext = (file ?? "").split(".").pop()?.toLowerCase() ?? "";
+    ok = await drawTexBitmap(ctx, cv, bytes, ext === "png" ? "image/png" : "image/jpeg");
+  }
+  if (ok) {
+    cv.classList.add("on");
+    // 悬停显示**实有文件**（`texFileOf` 选中的那一个）—— 名字→文件的映射是本轮的事实，可直接被看到
+    cv.title = `${et("mt.thumbTitle")} · ${file ?? ""}`;
+  }
+}
+
+/** Blob/字节 → ImageBitmap → 等比 contain 居中画进画布；解码失败返回 false（调用方保持隐藏）。 */
+async function drawTexBitmap(ctx: CanvasRenderingContext2D, cv: HTMLCanvasElement, data: Uint8Array | Blob, mime: string): Promise<boolean> {
+  try {
+    const blob = data instanceof Blob ? data : new Blob([data.slice()], { type: mime });
+    const bmp = await createImageBitmap(blob);
+    const k = Math.min(cv.width / bmp.width, cv.height / bmp.height);
+    const dw = Math.max(1, Math.round(bmp.width * k));
+    const dh = Math.max(1, Math.round(bmp.height * k));
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(bmp, Math.round((cv.width - dw) / 2), Math.round((cv.height - dh) / 2), dw, dh);
+    bmp.close?.();
+    return true;
+  } catch {
+    return false;
   }
 }
 
