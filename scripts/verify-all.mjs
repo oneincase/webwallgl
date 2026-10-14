@@ -133,6 +133,14 @@ const STABLE = [
   // 注释（压缩器看不见字符串内容）、`?raw` 注入第三方页面的 web-shim（14 KB JSDoc）、
   // 以及压缩版默认 ascii 把中文转义成 `\uXXXX`（看着像漏剥的注释）。三条路径都锁在构建期。
   "verify-bundle-hygiene",
+  // 编辑器「实例化」图层的**贴图槽**契约（`instance.textures`，2026-10-14）：真跑 scene-mount.ts
+  // 的合并切片（按索引覆盖 / `util/` 白贴图与 `_rt_` 跳过 / 缺位不补 / 不就地改写）+ 变异红测
+  // + 撤 `layer.solid` 的接线锁（渲染端 solid 恒赢，只写 textureName 等于没写）+ 全库语料复核
+  // （119 层/21 张的真名贴图必须都在包内，224 层纯 `util/` 一个都不许被覆盖）。
+  // 3815761795 画桥整屏发白就是这条：实例层材质 `materials/util/solidlayer_instance_4.json`
+  // 不随包发布（运行时合成），装配回退内置 solidlayer 的空槽 ⇒ 只剩 `whiteTex × color[1,1,1]`，
+  // 3840×2160 两层把下面 0–50 层全盖住。
+  "verify-instance-textures",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */
