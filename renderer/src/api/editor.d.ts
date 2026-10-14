@@ -175,6 +175,15 @@ export declare function setMdlClipEvents(
   events: ReadonlyArray<{ frame: number; name: string }>,
 ): Uint8Array | null;
 
+/**
+ * 调换片段顺序（from 位置 → to 位置，整条记录连同 id 一起搬）。场景 `animationlayers` 按片段
+ * **id** 找片段（render/mdl-skin.js:174），全库 137 个多片段模型的 id 都不是「位置 + 1」，所以搬
+ * 记录不会动到层绑定；但 `animations[0]` 是「场景没给层表」时的回退（mdl-skin.js:315-326，全库
+ * 30 个实例在用），因此 0 号位两侧的移动一律拒绝。MDLA 记录流靠启发式定界，写回后自带重读自检，
+ * 读不回来时返回 null —— W18b
+ */
+export declare function moveMdlClip(bytes: Uint8Array, from: number, to: number): Uint8Array | null;
+
 /** MDLS 段的骨数（无 MDLS 段 / 网格表不可结构化读出时 null）—— P0 */
 export declare function mdlBoneCount(bytes: Uint8Array): number | null;
 
@@ -267,6 +276,21 @@ export declare function setMdlSkeleton(
   bones: ReadonlyArray<MdlBoneSpec>,
   opts?: { tail?: "auto" | "keep" | "drop" },
 ): Uint8Array | null;
+
+/**
+ * 读第 boneIndex 根骨的**静态装配姿势**局部矩阵（MDLS 尾表，引擎 `mdl.staticPoseTRS[i]` 的原始
+ * 16 分量）。只在「模型一条动画轨道都没有且尾表能解析出姿势」时有值 —— 这正是引擎
+ * `useStaticPose` 的判据（render/mdl-skin.js:310-311）；其余情况（有动画 / 无尾表姿势 / 越界）
+ * 一律 null，因为引擎不读那张表 —— W18a
+ */
+export declare function mdlRestPose(bytes: Uint8Array, boneIndex: number): Float32Array | null;
+
+/**
+ * 写第 boneIndex 根骨的静态装配姿势局部矩阵（矩阵 16 分量且有限）。这是无动画模型摆姿势的
+ * **唯一**可见杠杆：改 MDLS 骨记录的局部矩阵会同时改 `bindTRS` 与 `invBindWorld`，两者同源时
+ * 蒙皮恒为单位变换，改了看不见。尾表长度不变，目标骨之外逐字节原样 —— W18a
+ */
+export declare function setMdlRestPose(bytes: Uint8Array, boneIndex: number, matrix: ArrayLike<number>): Uint8Array | null;
 
 /** 蒙皮槽：每顶点 4 个骨号 + 4 个权重（非蒙皮 / 不可编辑时 null）—— P2 */
 export declare function mdlSkin(

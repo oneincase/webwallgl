@@ -7,13 +7,19 @@
  * runModelHeadless：自起 vite（WE_LIBRARY 指向临时库）+ 真 GPU Chrome，挂夹具壁纸，
  *   引擎 getLayers 的模型层 / getModelInfo 逐项对照 modelTruth（W12 判据）。
  *
- * 用法：node scripts/verify-editor-model.mjs        # 只跑真浏览器段（也会被 verify-editor --headless 调用）
+ * 用法：
+ *   node scripts/verify-editor-model.mjs            # 默认 = 离线段（RESID，纯 Node，**不启动 Chrome**）
+ *   node scripts/verify-editor-model.mjs --headless # 追加真浏览器段（自起 vite + 真 GPU Chrome）
+ *   VEM_ONLY=resid node scripts/verify-editor-model.mjs   # 只跑离线段（CI 友好）
+ *   VEM_ONLY=md2 node scripts/verify-editor-model.mjs     # 老用法：只跑真机子段（仍需 Chrome）
+ * 稳定集（scripts/verify-all.mjs）用无参 spawn 执行本文件 ⇒ 覆盖的是离线判据；真机轮归 Lead。
  */
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { ROOT, LIB as DEFAULT_LIB, imp } from "./lib/verify-kit.mjs";
 
 /** puppet：有动画 / 有附着点 / 16 个模型 14 个附着点 / 含 MDLV0019 / MDLV0016 */
@@ -34,6 +40,19 @@ const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
 const C = await imp("renderer/vendor/we-scene/pkg/container.js");
 const dec = new TextDecoder();
 const readJson = (bytes) => JSON.parse(dec.decode(bytes).replace(/^\uFEFF/, ""));
+
+/* ── 运行模式（task-11）────────────────────────────────────────────────────────
+ * 默认调用（无 env、无 --headless）= **离线**：只跑 RESID 段（纯 Node；不起 vite、不启动 Chrome）。
+ * 真浏览器段必须显式触发：`--headless`、`VEM_ONLY=browser`，或沿用历史用法 VEM_ONLY=md2/me2/…
+ * （老用法零回归）。`verify-editor --headless` 是 **import runModelHeadless 直接调用**，不走本文件
+ * 的 CLI 分支，所以它照旧拿得到真机段。
+ * RESID-0 系列判据咬住这条契约（含零成本子进程探针 VEM_MODE_PROBE）。
+ */
+const BROWSER_MODE =
+  process.argv.includes("--headless") || process.env.VEM_ONLY === "browser" || (!!process.env.VEM_ONLY && process.env.VEM_ONLY !== "resid");
+const RUN_MODE = BROWSER_MODE ? "browser" : "offline";
+/** 真机段是否被启动过：离线路径必须恒为 false（RESID-0 咬这一条） */
+let BROWSER_STARTED = false;
 
 /** null = 夹具缺失（本机没有这张壁纸） */
 export function modelTruth(lib, id) {
@@ -133,6 +152,7 @@ export function sameModelInfo(got, want) {
 }
 
 export async function runModelHeadless({ check, section, tmpRoot, LIB = DEFAULT_LIB }) {
+  BROWSER_STARTED = true;
   section("MA2. 模型层识别（真浏览器）：getLayers 的模型层 / getModelInfo ≡ parseMDL 直读");
   const pick = (process.env.VEM_FIXTURES || "").split(",").filter(Boolean);
   const fixtures = [...PUPPET_FIXTURES, ...MESH_FIXTURES]
@@ -1372,15 +1392,677 @@ async function runImportHeadless({ check, section, session, origin, fixtures }) 
   check(puppetOk >= 1 && meshDrawn >= 1, `正交场景 ★ 判据过 ${puppetOk} 张、透视场景导入网格画得出且在动 ${meshDrawn} 张（${jobs.join(", ")}）`);
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+/* ══════════════════════════════════════════════════════════════════════════════
+ * B6 残余（task-8）离线段：尾表姿势（W18a）/ 片段排序（W18b）/ 换图尺寸（W16）
+ *
+ * 用法：`VEM_ONLY=resid node scripts/verify-editor-model.mjs`
+ * 纯 Node，不需要 vite/Chrome。这里用 esbuild 就地打包 mdl-edit.ts（相对导入按源文件目录
+ * 解析）而不是原生 import，是为了拿到变异能力：把每条判据对应的实现分支改坏，判据必须变红。
+ *
+ * 判据口径全部读自引擎源码（引擎一改，下面 RESID-4c/4d 会先红）：
+ *   useStaticPose    renderer/vendor/we-scene/render/mdl-skin.js:310-311
+ *   恒等早退          renderer/vendor/we-scene/render/mdl-skin.js:326
+ *                    （无动画 + 尾表解析不出姿势 ⇒ 蒙皮 ≡ 单位矩阵 ⇒ 直接改 MDLS 局部矩阵看不见）
+ *   层表按 id 找片段  renderer/vendor/we-scene/render/mdl-skin.js:174
+ *   0 号位回退        renderer/vendor/we-scene/render/mdl-skin.js:315-326 与 :225
+ *   autosize 定尺寸   renderer/src/scene-mount.ts:3258-3277
+ * ══════════════════════════════════════════════════════════════════════════════ */
+const RESID_ME = "renderer/src/editor/mdl-edit.ts";
+const POSE_BYTES = 64;
+
+/** esbuild 就地打包（相对导入按源文件目录解析 → 自包含），mutate = [[源串, 替换串], …] */
+async function loadEditorModule(rel, mutate) {
+  let src = fs.readFileSync(path.join(ROOT, rel), "utf8");
+  for (const [from, to, want] of mutate || []) {
+    const hits = src.split(from).length - 1;
+    if (hits !== (want ?? 1)) throw new Error(`变异锚点命中 ${hits} 处（期望 ${want ?? 1}）：${from}`);
+    src = src.replace(from, to);
+  }
+  const { build } = await import("esbuild");
+  const out = await build({
+    stdin: {
+      contents: src,
+      resolveDir: path.dirname(path.join(ROOT, rel)),
+      sourcefile: path.join(ROOT, rel),
+      loader: "ts",
+    },
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    write: false,
+    logLevel: "silent",
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vem-resid-"));
+  const file = path.join(dir, "mod.mjs");
+  fs.writeFileSync(file, out.outputFiles[0].text);
+  return import(pathToFileURL(file).href);
+}
+
+const RESID_MODEL = "editor/model.ts";
+
+/**
+ * 打包 editor/model.ts（W18b① 的数据层就在这儿）。它 import 的是 renderer 的**出口**
+ * `../renderer/src/api/editor`，整条出口会拉进 web.ts / overlay-gl.ts 等浏览器模块
+ * （实测 Node 侧 import 会 `window is not defined`），所以把这条出口替成真正的实现模块
+ * `renderer/src/editor/mdl-edit.ts`（同一批函数，Node 可加载）—— 只换解析、不换被测代码。
+ */
+async function loadModelModule(mutate) {
+  let src = fs.readFileSync(path.join(ROOT, RESID_MODEL), "utf8");
+  for (const [from, to, want] of mutate || []) {
+    const hits = src.split(from).length - 1;
+    if (hits !== (want ?? 1)) throw new Error(`变异锚点命中 ${hits} 处（期望 ${want ?? 1}）：${from}`);
+    src = src.replace(from, to);
+  }
+  const { build } = await import("esbuild");
+  const MDL_EDIT = path.join(ROOT, RESID_ME);
+  const stubApi = {
+    name: "stub-api-editor",
+    setup(b) {
+      b.onResolve({ filter: /(?:^|\/)renderer\/src\/api\/editor$/ }, () => ({ path: "api-editor", namespace: "stub" }));
+      b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
+        contents: `export * from ${JSON.stringify(MDL_EDIT)};`,
+        loader: "js",
+        resolveDir: ROOT,
+      }));
+    },
+  };
+  const out = await build({
+    stdin: {
+      contents: src,
+      resolveDir: path.dirname(path.join(ROOT, RESID_MODEL)),
+      sourcefile: path.join(ROOT, RESID_MODEL),
+      loader: "ts",
+    },
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    external: ["node:*"],
+    write: false,
+    logLevel: "silent",
+    plugins: [stubApi],
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vem-resid-model-"));
+  const file = path.join(dir, "mod.mjs");
+  fs.writeFileSync(file, out.outputFiles[0].text);
+  return import(pathToFileURL(file).href);
+}
+
+/** 引擎级姿势指纹：算完立刻摘出来（computeSkinMatrices 复用 mdl._skin 缓存，不能留引用） */
+function skinHash(mdl, time, layers) {
+  const m = S.computeSkinMatrices(mdl, time, layers, null);
+  if (!m) return "null";
+  return hashBytes(new Uint8Array(m.buffer, m.byteOffset, m.byteLength));
+}
+
+const W = await imp("renderer/vendor/we-scene/pkg/mdl-write.js");
+
+function hashBytes(b) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < b.length; i++) {
+    h ^= b[i];
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h;
+}
+const trackHash = (t) =>
+  `${t.frameCount}#${hashBytes(new Uint8Array(t.keyframes.buffer, t.keyframes.byteOffset, t.keyframes.byteLength))}`;
+/** 每片段的 id/帧数/逐轨关键帧摘要 —— 用来证明「搬记录时片段数据没被改写」 */
+const sigById = (m) =>
+  new Map(
+    (m.animations || []).map((a) => [a.id, `${a.frameCount}:${(a.tracks || []).map(trackHash).join(",")}`]),
+  );
+const sameArr = (a, b) => {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+const bytesEqual = (a, b) => {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+let residCache = null;
+/** 语料扫描（只扫一次，变异跑复用） */
+function residScan(LIB) {
+  if (residCache) return residCache;
+  const s = {
+    poseNoAnim: [], // 无动画 + 引擎能解析出尾表姿势 → 改尾表看得见（唯一可见杠杆）
+    animatedWithPose: [], // 有动画 + 尾表能解析 → 引擎不读尾表
+    noAnimNoPose: [], // 无动画 + 尾表解析不出 → 引擎恒等早退，改局部矩阵是空操作
+    noMesh: [], // 非蒙皮网格
+    multiClip: [], // ≥3 片段（片段排序判据的夹具）
+    puppetTotal: 0,
+    puppetAuto: 0,
+    puppetDeclaredWH: 0,
+    idIsPos1: 0,
+    dupIds: 0,
+    animatedObjects: 0,
+    fallbackObjs: 0,
+    noLayerObjs: 0,
+    allOffObjs: 0,
+    layerSample: null, // 有动画 + 有可见层表 → W18b① 的正常路径夹具（真 scene 对象 + 真 .mdl 字节）
+    noLayerSample: null, // 有动画 + 没层表 → W18b① 必须拒绝挂层的夹具
+  };
+  for (const id of fs.readdirSync(LIB).sort()) {
+    const pkgPath = path.join(LIB, id, "scene.pkg");
+    if (!fs.existsSync(pkgPath)) continue;
+    let pkg;
+    try {
+      pkg = C.parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    } catch {
+      continue;
+    }
+    const entries = pkg.entries || [];
+    const entryBytes = (name) => {
+      try {
+        return C.getEntry(pkg, name);
+      } catch {
+        return null;
+      }
+    };
+    const jsonOf = (name) => {
+      const b = name && entryBytes(name);
+      if (!b) return null;
+      try {
+        return readJson(b);
+      } catch {
+        return null;
+      }
+    };
+    const mdlByPath = new Map();
+    for (const e of entries) {
+      if (!/\.json$/i.test(e.name)) continue;
+      const j = jsonOf(e.name);
+      if (!j) continue;
+      if (typeof j.puppet === "string") {
+        s.puppetTotal++;
+        if (j.autosize === true) s.puppetAuto++;
+        if (j.width || j.height) s.puppetDeclaredWH++;
+      }
+    }
+    for (const e of entries) {
+      if (!/\.mdl$/i.test(e.name)) continue;
+      const bytes = entryBytes(e.name);
+      if (!bytes) continue;
+      let m;
+      try {
+        m = P.parseMDL(bytes);
+      } catch {
+        continue;
+      }
+      mdlByPath.set(e.name, m);
+      if (!(m.bones || []).length) {
+        if (s.noMesh.length < 2) s.noMesh.push({ id, name: e.name, bytes });
+        continue;
+      }
+      const bones = m.bones.length;
+      const animated = (m.animations || []).length > 0;
+      const hasPose = !!(m.staticPoseLocal && m.staticPoseLocal.length === bones);
+      if (!animated) {
+        const rec = { id, name: e.name, bytes, m, bones, tailLen: 0 };
+        if (hasPose) {
+          const doc = W.readMdlDoc(bytes);
+          const sec = doc && doc.sections.find((x) => x.type === "MDLS");
+          rec.tailLen = sec && sec.tail ? sec.tail.length : 0;
+          s.poseNoAnim.push(rec);
+        } else s.noAnimNoPose.push(rec);
+      } else {
+        if (hasPose && s.animatedWithPose.length < 4) s.animatedWithPose.push({ id, name: e.name, bytes, m, bones });
+        const ids = (m.animations || []).map((a) => a.id);
+        if (ids.some((v, k) => v === k + 1)) s.idIsPos1++;
+        if (new Set(ids).size !== ids.length) s.dupIds++;
+        if (ids.length >= 3) s.multiClip.push({ id, name: e.name, bytes, m, bones, ids });
+      }
+    }
+    const scene = jsonOf("scene.json");
+    if (!scene) continue;
+    for (const o of scene.objects || []) {
+      const p = o.model || o.image;
+      if (typeof p !== "string" || !p) continue;
+      const mj = jsonOf(p);
+      if (!mj || typeof mj.puppet !== "string") continue;
+      const mdl = mdlByPath.get(mj.puppet);
+      if (!mdl || !(mdl.animations || []).length) continue;
+      s.animatedObjects++;
+      const layers = Array.isArray(o.animationlayers) ? o.animationlayers : null;
+      if (!layers || !layers.length) {
+        s.noLayerObjs++;
+        s.fallbackObjs++;
+        if (!s.noLayerSample) {
+          const bytes = entryBytes(mj.puppet);
+          if (bytes) {
+            s.noLayerSample = {
+              id,
+              mdlPath: mj.puppet,
+              bytes,
+              sceneObjects: JSON.parse(JSON.stringify(scene.objects)),
+              oIndex: scene.objects.indexOf(o),
+            };
+          }
+        }
+        continue;
+      }
+      const on = layers.filter((l) => !(l.visible === false || l.visible === 0));
+      if (!on.length) {
+        s.allOffObjs++;
+        s.fallbackObjs++;
+      } else if (!s.layerSample) {
+        const bytes = entryBytes(mj.puppet);
+        if (bytes) {
+          s.layerSample = {
+            id,
+            mdlPath: mj.puppet,
+            bytes,
+            layers: JSON.parse(JSON.stringify(layers)),
+            layerCount: layers.length,
+            sceneObjects: JSON.parse(JSON.stringify(scene.objects)),
+            oIndex: scene.objects.indexOf(o),
+          };
+        }
+      }
+    }
+  }
+  residCache = s;
+  return s;
+}
+
+async function residBattery(ME, MODEL, LIB, check) {
+  const s = residScan(LIB);
+
+  /* ── RESID-0 运行模式（task-11）：默认路径必须离线、不启动 Chrome ────────────
+   * 判据要点：把 CLI 契约做成可证伪的 —— 子进程探针 VEM_MODE_PROBE=1 只打印 mode 立即退出，
+   * 于是「谁把默认改成真机段」会立刻让 RESID-0b 变红（默认必须 mode=offline），
+   * 而 --headless / VEM_ONLY=md2 这些真机入口照旧 mode=browser。
+   */
+  const modeProbe = (env = {}, args = []) => {
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...args], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: { ...process.env, VEM_MODE_PROBE: "1", ...env },
+    });
+    return (r.stdout || "").trim().split("\n").pop() || `exit=${r.status}`;
+  };
+  check(
+    RUN_MODE === "offline" && !BROWSER_STARTED,
+    `RESID-0a 运行模式 mode=${RUN_MODE}，真机段未启动（BROWSER_STARTED=${BROWSER_STARTED}，argv 无 --headless）`,
+  );
+  check(modeProbe() === "mode=offline", "RESID-0b CLI 契约：无 env / 无 --headless ⇒ mode=offline（verify-all 用无参 spawn）");
+  check(modeProbe({}, ["--headless"]) === "mode=browser", "RESID-0c CLI 契约：--headless ⇒ mode=browser（真机轮，Lead 用）");
+  check(modeProbe({ VEM_ONLY: "resid" }) === "mode=offline", "RESID-0d CLI 契约：VEM_ONLY=resid ⇒ mode=offline（可单独跑）");
+  check(modeProbe({ VEM_ONLY: "md2" }) === "mode=browser", "RESID-0e CLI 契约：既有 VEM_ONLY=md2 ⇒ mode=browser（老用法零回归）");
+  /* ── RESID-1 定位口径：与引擎 parseStaticPose 逐条一致 ───────────────────── */
+  check(s.poseNoAnim.length >= 5, `RESID-1a 语料：无动画 + 引擎能解析出尾表姿势的模型 ${s.poseNoAnim.length} 个（≥5）`);
+  let poseOk = 0;
+  let longTail = 0;
+  let firstBad = "";
+  for (const rec of s.poseNoAnim) {
+    if (rec.tailLen > 14 + 84 * rec.bones) longTail++;
+    let all = true;
+    for (let i = 0; i < rec.bones; i++) {
+      if (!sameArr(ME.mdlRestPose(rec.bytes, i), rec.m.staticPoseLocal[i])) {
+        all = false;
+        firstBad = firstBad || `${rec.id}/${rec.name}#${i}`;
+        break;
+      }
+    }
+    if (all) poseOk++;
+  }
+  check(
+    poseOk === s.poseNoAnim.length,
+    `RESID-1b mdlRestPose 与引擎 staticPoseLocal 逐分量一致：${poseOk}/${s.poseNoAnim.length}${firstBad ? `（首个不符 ${firstBad}）` : ""}`,
+  );
+  check(longTail >= 1, `RESID-1c 其中尾表长于 14+84N 的 ${longTail} 个 ⇒ 必须用引擎同款定位，硬算 14+84N 会错`);
+  check(
+    s.animatedWithPose.every((r) => ME.mdlRestPose(r.bytes, 0) === null),
+    `RESID-1d 有动画轨道的模型（引擎不读尾表姿势）mdlRestPose 一律 null：${s.animatedWithPose.length} 个`,
+  );
+  check(
+    s.noAnimNoPose.every((r) => ME.mdlRestPose(r.bytes, 0) === null),
+    `RESID-1e 无动画但尾表解析不出姿势的模型 mdlRestPose 一律 null：${s.noAnimNoPose.length} 个`,
+  );
+
+  /* ── RESID-2 写侧：64 字节、回读、逆写回、拒绝零副作用 ─────────────────── */
+  const fx =
+    s.poseNoAnim.find((r) => r.bones >= 2 && r.tailLen > 14 + 84 * r.bones) ||
+    s.poseNoAnim.find((r) => r.bones >= 2) ||
+    s.poseNoAnim[0];
+  if (!fx) {
+    check(false, "RESID-2 没有可用的「无动画姿势」夹具");
+    return;
+  }
+  const before = fx.bytes;
+  const p0 = ME.mdlRestPose(before, 0);
+  const p1 = ME.mdlRestPose(before, 1);
+  const next = Float32Array.from(p1);
+  next[12] += 123.5;
+  next[13] -= 7.25;
+  const diffSpan = (a, b) => {
+    let n = 0;
+    let min = -1;
+    let max = -1;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === b[i]) continue;
+      n++;
+      if (min < 0) min = i;
+      max = i;
+    }
+    return { n, min, max };
+  };
+  const out = ME.setMdlRestPose(before, 1, next);
+  check(!!out && out.length === before.length, `RESID-2a setMdlRestPose 成功且长度不变（${before.length} 字节，${fx.id}/${fx.name}）`);
+  if (out) {
+    const sp = diffSpan(before, out);
+    // 只有被写入的分量会变（改平移 → 8 字节），但它们必须全部落在同一张 64 字节矩阵窗口内
+    check(
+      sp.n > 0 && sp.n <= POSE_BYTES && sp.max - sp.min < POSE_BYTES,
+      `RESID-2b 差异全部落在同一张 ${POSE_BYTES} 字节矩阵窗口内（${sp.n} 字节，跨度 ${sp.max - sp.min + 1}）`,
+    );
+    check(
+      sameArr(ME.mdlRestPose(out, 1), next) && sameArr(ME.mdlRestPose(out, 0), p0),
+      "RESID-2c 回读：目标骨 = 写入值、邻骨逐分量原样",
+    );
+    const back = ME.setMdlRestPose(out, 1, p1);
+    check(bytesEqual(back, before), "RESID-2d 逆写回旧矩阵 → 逐字节等于原文件");
+    const bonesSame = JSON.stringify(ME.mdlBones(before)) === JSON.stringify(ME.mdlBones(out));
+    const clipsSame = JSON.stringify([...sigById(P.parseMDL(before))]) === JSON.stringify([...sigById(P.parseMDL(out))]);
+    check(bonesSame && clipsSame, "RESID-2e 骨表（名称/父级）与全部片段（id/帧数/逐轨关键帧）逐项不变");
+    // 骨号 → 窗口一一对应：写 0 号骨与写 1 号骨的差异窗口互不重叠、且 0 在前
+    const z = Float32Array.from(p0);
+    z[12] += 5;
+    const out0 = ME.setMdlRestPose(before, 0, z);
+    const sp0 = out0 ? diffSpan(before, out0) : null;
+    check(
+      !!sp0 && sp0.n > 0 && sp0.max < sp.min,
+      `RESID-2g 写 0 号骨的窗口在写 1 号骨之前、互不重叠（0 号跨度 ${sp0 ? `${sp0.max - sp0.min + 1}` : "?"} 字节）`,
+    );
+  }
+  const rej = (label, fn, bytes) => {
+    const snap = bytes.slice();
+    let r = null;
+    let threw = false;
+    try {
+      r = fn();
+    } catch {
+      threw = true;
+    }
+    check(!threw && r === null && bytesEqual(snap, bytes), `RESID-2f ${label} → null 且零副作用（${bytes.length} 字节逐字节未变）`);
+  };
+  if (s.animatedWithPose.length) {
+    const r = s.animatedWithPose[0];
+    rej("有动画模型", () => ME.setMdlRestPose(r.bytes, 0, p0), r.bytes);
+  }
+  if (s.noAnimNoPose.length) {
+    const r = s.noAnimNoPose[0];
+    rej("尾表无姿势", () => ME.setMdlRestPose(r.bytes, 0, p0), r.bytes);
+  }
+  rej("骨号越界", () => ME.setMdlRestPose(before, fx.bones, p0), before);
+  rej("骨号非整数", () => ME.setMdlRestPose(before, 0.5, p0), before);
+  rej("矩阵长度 15", () => ME.setMdlRestPose(before, 0, p0.slice(0, 15)), before);
+  const nanM = Float32Array.from(p0);
+  nanM.fill(NaN);
+  rej("矩阵含 NaN", () => ME.setMdlRestPose(before, 0, nanM), before);
+  const infM = Float32Array.from(p0);
+  infM[3] = Infinity;
+  rej("矩阵含 Infinity", () => ME.setMdlRestPose(before, 0, infM), before);
+  if (s.noMesh.length) rej("非蒙皮网格", () => ME.setMdlRestPose(s.noMesh[0].bytes, 0, p0), s.noMesh[0].bytes);
+
+  /* ── RESID-3 片段排序：id 绑定不动、顺序可预期、跨 0 号位拒绝 ───────────── */
+  check(s.multiClip.length >= 20, `RESID-3a 语料：≥3 片段的模型 ${s.multiClip.length} 个（≥20）`);
+  check(
+    s.idIsPos1 === 0 && s.dupIds === 0,
+    `RESID-3b 片段 id 与「位置+1」无关（命中 ${s.idIsPos1} 个）、无重复 id（${s.dupIds} 个）⇒ 场景层按 id 绑定不随记录顺序变`,
+  );
+  let moveOk = 0;
+  let moveBad = "";
+  for (const rec of s.multiClip) {
+    const want = rec.ids.slice();
+    const [mv] = want.splice(1, 1);
+    want.splice(2, 0, mv);
+    let om = null;
+    const o2 = ME.moveMdlClip(rec.bytes, 1, 2);
+    try {
+      om = o2 && P.parseMDL(o2);
+    } catch {
+      om = null;
+    }
+    if (!om) {
+      moveBad = moveBad || `${rec.id}/${rec.name} 返回 null 或重读失败`;
+      continue;
+    }
+    const got = (om.animations || []).map((a) => a.id);
+    const inSig = sigById(rec.m);
+    const outSig = sigById(om);
+    const dataSame =
+      inSig.size === outSig.size && [...inSig].every(([k, v]) => outSig.get(k) === v);
+    if (got.join(",") !== want.join(",") || !dataSame) {
+      moveBad = moveBad || `${rec.id}/${rec.name} 顺序[${got}]≠[${want}] 数据同=${dataSame}`;
+      continue;
+    }
+    moveOk++;
+  }
+  check(
+    moveOk === s.multiClip.length,
+    `RESID-3c 1→2 换位：顺序按预期且每个片段逐轨数据不变 ${moveOk}/${s.multiClip.length}${moveBad ? `（首个不符 ${moveBad}）` : ""}`,
+  );
+  const any = s.multiClip[0];
+  const rej2 = (label, fn) => {
+    const snap = any.bytes.slice();
+    let r = null;
+    let threw = false;
+    try {
+      r = fn();
+    } catch {
+      threw = true;
+    }
+    check(!threw && r === null && bytesEqual(snap, any.bytes), `RESID-3d ${label} → null 且零副作用`);
+  };
+  rej2("跨 0 号位（0→1）", () => ME.moveMdlClip(any.bytes, 0, 1));
+  rej2("跨 0 号位（1→0）", () => ME.moveMdlClip(any.bytes, 1, 0));
+  rej2("to 越界", () => ME.moveMdlClip(any.bytes, 1, 99));
+  rej2("from === to", () => ME.moveMdlClip(any.bytes, 1, 1));
+  rej2("非整数", () => ME.moveMdlClip(any.bytes, 1, 1.5));
+  if (s.poseNoAnim.length) rej2("无片段模型", () => ME.moveMdlClip(s.poseNoAnim[0].bytes, 0, 1));
+
+  /* ── RESID-4 换图尺寸（W16）与 0 号位回退的语料事实 + 引擎读点 ───────────── */
+  check(
+    s.puppetTotal > 100 && s.puppetAuto === s.puppetTotal,
+    `RESID-4a 语料：puppet model json ${s.puppetTotal} 个里 ${s.puppetAuto} 个 autosize:true`,
+  );
+  check(
+    s.puppetDeclaredWH === 0,
+    `RESID-4b 其中声明 width/height 的 ${s.puppetDeclaredWH} 个 ⇒ 换图后图层世界尺寸只可能来自新贴图的单帧尺寸（src/scene-mount.ts:3258-3277）`,
+  );
+  const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(
+    smSrc.includes("(model as any)?.autosize &&") && smSrc.includes("layer.size = [w, h];"),
+    "RESID-4c 引擎读点仍在：autosize 闸门（层尺寸含 0 时 layer.size = 贴图单帧尺寸）",
+  );
+  const skinSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js"), "utf8");
+  check(
+    skinSrc.includes("find((x) => x.id === l.animation)") && skinSrc.includes("useStaticPose"),
+    "RESID-4d 引擎读点仍在：层表按 id 找片段 + useStaticPose 以「无动画 + 尾表可解析」为条件",
+  );
+  check(
+    s.fallbackObjs >= 1,
+    `RESID-4e 语料：${s.animatedObjects} 个有动画的模型对象里 ${s.fallbackObjs} 个吃 animations[0] 回退（无层表 ${s.noLayerObjs} + 层全关 ${s.allOffObjs}）⇒ 0 号位片段不许被移走`,
+  );
+
+  /* ── RESID-5 W18b①：加片段 + 挂首个动画层（数据层 + 引擎级零变化） ───────── */
+  const L = s.layerSample;
+  if (!L) {
+    check(false, "RESID-5 语料里找不到「有动画 + 有可见层表」的对象夹具");
+  } else {
+    const clipsBefore = ME.mdlClips(L.bytes);
+    const doc = { scene: { objects: L.sceneObjects } };
+    const o = doc.scene.objects[L.oIndex];
+    const res = MODEL.addClipWithLayer(doc, o, L.bytes, { name: "editor-new", frameCount: 2, fps: 30, mode: "loop" }, "rest");
+    check(!!res && !!clipsBefore, `RESID-5a addClipWithLayer 跑通（${L.id} ${L.mdlPath}，原有 ${clipsBefore ? clipsBefore.length : "?"} 片段 / ${L.layerCount} 层）`);
+    if (res) {
+      const maxId = Math.max(...clipsBefore.map((c) => c.id));
+      const after = ME.mdlClips(res.bytes);
+      check(
+        after.length === clipsBefore.length + 1 && after[after.length - 1].id === res.id && res.id === maxId + 1,
+        `RESID-5b 新片段追加在末位、id = 原最大 id + 1（${maxId} → ${res.id}）`,
+      );
+      const layers = o.animationlayers;
+      const added = layers[layers.length - 1];
+      check(
+        layers.length === L.layerCount + 1 &&
+          res.layerIndex === layers.length - 1 &&
+          added.animation === res.id &&
+          added.id === res.layerId &&
+          added.visible === false &&
+          added.blend === 1,
+        `RESID-5c 新层挂在末位且 visible:false / blend 1 / animation 指向新片段 ${res.id}`,
+      );
+      check(
+        JSON.stringify(layers.slice(0, L.layerCount)) === JSON.stringify(L.layers),
+        "RESID-5d 原有动画层逐字段未被改动",
+      );
+      /* 引擎级：新层看不见 ⇒ 姿势与改动前逐分量一致（这是「新片段自动挂层不改变画面」的硬证据） */
+      const mb = P.parseMDL(L.bytes);
+      const ma = P.parseMDL(res.bytes);
+      const anim0 = (mb.animations || [])[0];
+      const times = [0, 1, Math.max(1, Math.floor((anim0 ? anim0.frameCount : 8) / 2)), Math.max(1, (anim0 ? anim0.frameCount : 8) - 1)];
+      const sameTimes = times.filter((t) => skinHash(mb, t, L.layers) === skinHash(ma, t, layers));
+      check(
+        sameTimes.length === times.length,
+        `RESID-5e 引擎：原层表生效的时刻上，新层 visible:false ⇒ 蒙皮矩阵与改动前逐字节一致（${sameTimes.length}/${times.length} 个时刻）`,
+      );
+      /* 反面：把新层点亮必须真的改变姿势（否则说明层没接上片段 / 片段没轨道 = 死代码） */
+      const shown = layers.map((l, i) => (i === layers.length - 1 ? { ...l, visible: true } : l));
+      const changed = times.filter((t) => skinHash(ma, t, shown) !== skinHash(ma, t, layers));
+      check(
+        changed.length > 0,
+        `RESID-5f 把新层改成 visible:true ⇒ 姿势确实变（${changed.length}/${times.length} 个时刻）⇒ 新层真接在新片段上`,
+      );
+      check(
+        !(clipsBefore.some((c) => c.id === res.id)) && ME.mdlClips(res.bytes)[clipsBefore.length - 1].id === clipsBefore[clipsBefore.length - 1].id,
+        "RESID-5g 新 id 不与原有片段撞号、原片段顺序未动",
+      );
+    }
+  }
+  const N = s.noLayerSample;
+  if (!N) {
+    check(false, "RESID-5 语料里找不到「有动画 + 无层表」的对象夹具");
+  } else {
+    const doc2 = { scene: { objects: N.sceneObjects } };
+    const o2 = doc2.scene.objects[N.oIndex];
+    const r2 = MODEL.addClipWithLayer(doc2, o2, N.bytes, { name: "editor-new", frameCount: 2, fps: 30, mode: "loop" }, "rest");
+    check(
+      !!r2 && r2.layerSkip === "no-layer-table" && r2.layerIndex === null && r2.layerId === null,
+      `RESID-5h 没有层表的对象（${N.id} ${N.mdlPath}）不挂层：只加片段 + 回告原因`,
+    );
+    check(
+      !Object.prototype.hasOwnProperty.call(o2, "animationlayers") || !o2.animationlayers.length,
+      "RESID-5i 拒绝路径零副作用：对象没有多出 animationlayers（挂上就会砍掉引擎的 animations[0] 回退）",
+    );
+  }
+}
+
+/** 变异红测：每条判据对应的实现分支改坏 → 至少一条 RESID 判据必须变红 */
+const RESID_MUTATIONS = [
+  { name: "定位：去掉退化扫描（只信 14+84N 布局）", pairs: [["const scanEnd = Math.min(32, tail.length - pose);", "const scanEnd = 0;"]] },
+  {
+    name: "写侧：忽略骨号、永远写第一根骨",
+    pairs: [
+      [
+        "  hit.sec.tail = Uint8Array.from(hit.sec.tail!);\n  const dv = dvOf(hit.sec.tail);\n  const at = hit.start + boneIndex * POSE_MATRIX_BYTES;",
+        "  hit.sec.tail = Uint8Array.from(hit.sec.tail!);\n  const dv = dvOf(hit.sec.tail);\n  const at = hit.start;",
+      ],
+    ],
+  },
+  { name: "闸门：有动画也当姿势可见", pairs: [["if (anims && (anims.raw || (anims.anims?.length ?? 0) > 0)) return null;", "if (false && anims) return null;"]] },
+  { name: "闸门：不校验矩阵（NaN/长度 15 也写）", pairs: [["  if (!Number.isInteger(boneIndex) || boneIndex < 0 || boneIndex >= hit.count) return null;\n  if (!boneMatrixOk(matrix)) return null;", "  if (!Number.isInteger(boneIndex) || boneIndex < 0 || boneIndex >= hit.count) return null;\n  if (!Array.isArray(matrix) && !(matrix instanceof Float32Array)) return null;"]] },
+  { name: "闸门：允许搬走 0 号位片段", pairs: [["if (from === 0 || to === 0) return null;", "if (false) return null;"]] },
+  { name: "排序：落位偏一位", pairs: [["anims.splice(to, 0, moved);", "anims.splice(Math.max(0, to - 1), 0, moved);"]] },
+  {
+    file: RESID_MODEL,
+    name: "W18b①：新层默认可见（挂上就改画面）",
+    pairs: [['setAnimLayerField(o, index, "visible", false);', 'setAnimLayerField(o, index, "visible", true);']],
+  },
+  {
+    file: RESID_MODEL,
+    name: "W18b①：没有层表也硬挂（砍掉引擎 animations[0] 回退）",
+    pairs: [
+      [
+        '  if (!list || !list.length)\n    return { bytes: added.bytes, id: added.id, layerIndex: null, layerId: null, layerSkip: "no-layer-table" };',
+        "  if (false)\n    return { bytes: added.bytes, id: added.id, layerIndex: null, layerId: null, layerSkip: \"no-layer-table\" };",
+      ],
+    ],
+  },
+  {
+    file: RESID_MODEL,
+    name: "W18b①：新层指向隔壁片段（id 接错）",
+    pairs: [["addAnimLayer(doc, o, added.id, layerName || init.name)", "addAnimLayer(doc, o, added.id - 1, layerName || init.name)"]],
+  },
+];
+
+export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
+  section("B6 残余（task-8）离线段：尾表姿势 / 片段排序 / 换图尺寸");
+  let failed = 0;
+  const c = (ok, msg) => {
+    if (!ok) failed++;
+    check(ok, msg);
+  };
+  const ME = await loadEditorModule(RESID_ME);
+  const MODEL = await loadModelModule();
+  await residBattery(ME, MODEL, LIB, c);
+
+  section(`变异红测（${RESID_MUTATIONS.length} 条：判据把实现改坏必须抓住）`);
+  let red = 0;
+  const green = [];
+  for (const mut of RESID_MUTATIONS) {
+    let hits = 0;
+    try {
+      const onModel = mut.file === RESID_MODEL;
+      const MM = onModel ? ME : await loadEditorModule(RESID_ME, mut.pairs);
+      const MUT = onModel ? await loadModelModule(mut.pairs) : MODEL;
+      await residBattery(MM, MUT, LIB, (ok) => {
+        if (!ok) hits++;
+      });
+    } catch (e) {
+      hits = hits || 1; // 改坏后直接抛异常也算判据抓住
+      void e;
+    }
+    if (hits > 0) {
+      red++;
+      c(true, `M${red} ${mut.name} → 判据变红（${hits} 条）`);
+    } else {
+      green.push(mut.name);
+      c(false, `M? ${mut.name} → 判据全绿（这条判据没有覆盖该分支）`);
+    }
+  }
+  return failed;
+}
+
+// process.argv[1] 可能不存在（`node -e` / 纯 import 当库用）⇒ 先判空，避免 pathToFileURL(undefined) 抛错。
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // 模式探针：给 RESID-0b..0e 一条零成本、可证伪的 CLI 契约检查（不跑判据、不碰 Chrome）
+  if (process.env.VEM_MODE_PROBE) {
+    console.log(`mode=${RUN_MODE}`);
+    process.exit(0);
+  }
   let failed = 0;
   const check = (ok, msg) => {
     if (!ok) failed++;
     (ok ? console.log : console.error)(`  ${ok ? "✓" : "✗"} ${msg}`);
   };
+  if (RUN_MODE === "offline") {
+    console.log("  mode=offline：离线段（RESID，纯 Node）");
+    console.log("  真浏览器段由 --headless / verify-editor --headless 触发；本默认路径不启动 Chrome。");
+  } else {
+    console.log("  mode=browser：真浏览器段（自起 vite + 真 GPU Chrome）");
+  }
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "verify-editor-model-"));
   try {
-    await runModelHeadless({ check, section: (t) => console.log(`\n${t}`), tmpRoot });
+    if (RUN_MODE === "offline") {
+      failed += await runResidOffline({ check, section: (t) => console.log(`\n${t}`), LIB: DEFAULT_LIB });
+    } else {
+      await runModelHeadless({ check, section: (t) => console.log(`\n${t}`), tmpRoot });
+    }
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

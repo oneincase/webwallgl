@@ -19,6 +19,7 @@ import net from "node:net";
 import path from "node:path";
 import zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { ROOT, imp } from "./lib/verify-kit.mjs";
 
 const FIXTURE = process.env.WE_EDITOR_ITEM || "beach";
@@ -812,6 +813,92 @@ export function stripePng(w, h, top, bottom) {
     for (let x = 0; x < w; x++) raw.set(c, y * stride + 1 + x * 3);
   }
   return rgbPng(w, h, raw);
+}
+
+/**
+ * AR 段的静态接线守卫（纯函数，不做任何 IO，可离线单独跑）：真机断言的前提是
+ * 「结构编辑只有一条重挂路径」—— `editor/main.ts` 的 `structEdit` 先把 effect.json 字节写进
+ * 叠加层、再 `restoreObjects` → `mountCurrent(true)` 让引擎重读 pass 链；撤销分支必须
+ * **先**把文件字节换回叠加层、**再** `restoreObjects`。谁把重挂删掉 / 换成
+ * `setEffectConstants` 热更，AR 段第一步就红，而不是等到像素断言才失败。
+ *
+ * 与 `scripts/verify-editor.mjs` 的 FX-STRUCT 段（wireBad）同源：同一件事在两处各咬一遍，
+ * 是为了让「真机段失败」与「离线段失败」指向同一条接线。
+ */
+export function fxStructWireBad(mainSrc, structSrc) {
+  const bad = [];
+  const is = (c, m) => {
+    if (!c) bad.push(m);
+  };
+  const at = (n, from = 0) => mainSrc.indexOf(n, from);
+  const st = at("function structEdit(");
+  const put = at("overlay.put(f.path, f.after, f.path)", st);
+  const ro = at("restoreObjects(cmd.after", st);
+  is(st > 0 && put > st && ro > put, "接线：structEdit 先把 effect.json 字节落叠加层、再 restoreObjects 重挂（重挂才会重读 pass 链）");
+  const br = at("if (isStruct(cmd))");
+  const jr = at("fxFileJournal.get(cmd)");
+  is(br > 0 && jr > br && at("restoreObjects(", jr) > jr, "接线：撤销分支先换回文件字节、再 restoreObjects（顺序反了 = 文档与引擎不同步）");
+  const commit = mainSrc.slice(at("function commitFxStruct("), at("function fxStructControls("));
+  is(at("function commitFxStruct(") > 0 && !/setEffectConstants/.test(commit), "接线：结构编辑不走 setEffectConstants 热更（那条只写常量值；pass 数/序/material/target/bind 都是挂载时解析的）");
+  is(at("{ path: plan.file, before: enc.encode(cur), after: enc.encode(plan.text) }") > 0, "接线：文件字节与文档快照进同一条 StructCmd（一次 ⌘Z 只回一半就是这里漏了）");
+  is(
+    at("isStructEditable(f, projectFiles)") > 0 && at("fxStructControls(node, v, structText, editable)") > 0 && at("fxStructLocked = file") > 0,
+    "接线：库引用效果只留禁用原因、不生成结构控件（COMPLIANCE：素材库不改）",
+  );
+  for (const fn of ["planPassAdd", "planPassRemove", "planPassMove", "planMaterial", "planTarget", "planBind", "applyDocSync", "isStructEditable", "serializeEffectDoc"]) {
+    // 纯函数模块里既有 `export function f(` 也有 `export const f = (`（序列化那条是箭头函数）
+    is(
+      structSrc.includes(`export function ${fn}(`) || new RegExp(`export const ${fn}\\s*[=:]`).test(structSrc),
+      `editor/effects-struct.ts 导出 ${fn}()`,
+    );
+  }
+  return bad;
+}
+
+/**
+ * AR 段的「等待纪律」守卫（纯函数，不做 IO，可离线单独跑）：AR 里两类控件都是**异步补画**的 ——
+ * 结构控件等 `loadFxText` 读到 effect.json 原文（main.ts inlineFxSection 尾），参数行等
+ * `externalPasses` 那套按文件的解析缓存（effect.json → 每个 pass 的材质 → shader 的 uniform 注释，
+ * main.ts loadExternalParams；结构编辑落地时 `structEdit` 会 `forgetFxFile` 作废它再重读）。
+ * ⇒ 任何一次 `querySelector` 都必须走**有界等待**，赌一次取到就是真机偶发中断。
+ *
+ * 真机终轮（/tmp/hl-final2.log）正是在这里红的：`arSetParam` 直接查 pass 1 的
+ * `input[data-param="color"]`，null 就抛「找不到 pass 1 的参数 color」；pass 0 之所以过，
+ * 是它早前已被读过、缓存热着。谁把等待去掉，AR 第一步（本守卫）就红，而不是跑到第 17 条才神秘中断。
+ */
+export function arHarnessBad(src) {
+  const bad = [];
+  const is = (c, m) => {
+    if (!c) bad.push(m);
+  };
+  // 全部只看 AR 段函数体：本守卫自己的字符串里也有同样的标记（不锚定就会拿守卫自身当被测代码）。
+  // 段函数声明在列 0，守卫里的同名字面量都是缩进的字符串 ⇒ 用行首匹配定位真身。
+  const A = src.search(/^async function fxStructE2E\(\)/m);
+  const at = (n, from) => src.indexOf(n, from === undefined ? A : from);
+  const seg = (from, to) => {
+    const a = at(from);
+    const b = at(to, a);
+    return a > A && b > a ? src.slice(a, b) : "";
+  };
+  is(A > 0, "AR 段函数 fxStructE2E() 存在");
+  is(at("var arWaitSel = async (sel, what, ms = 30000)") > A, "AR：有界等待器 arWaitSel 存在");
+  const waiter = seg("var arWaitSel = async (sel, what, ms = 30000)", "var arWaitParam = (pass, param");
+  is(/throw new Error\(/.test(waiter) && /DOM 现场/.test(waiter), "AR：等待超时的报错要带 DOM 现场（不然真机中断只剩一句 null）");
+  is(/await arWaitParam\(pass, param\)/.test(seg("var arSetParam = async (pass, param, value)", "var arSetMat = async (pass, value)")), "AR：arSetParam 先有界等参数行再写值（终验中断点）");
+  is(/await arWaitSel\(/.test(seg("var arSetMat = async (pass, value)", "var arSetTarget = async (pass, value)")), "AR：arSetMat 先等 material 选择器");
+  is(/await arWaitSel\(/.test(seg("var arSetTarget = async (pass, value)", "var arMatVal = async (pass)")), "AR：arSetTarget 先等 target 输入框");
+  is(/await arWaitSel\(/.test(seg("var arMatVal = async (pass)", "var arDisabled = async (pass, action)")), "AR：arMatVal 先等 material 选择器");
+  is(/await arWaitSel\(/.test(seg("var arBtn = async (pass, action)", "var arSetParam = async (pass, param, value)")), "AR：结构按钮点击前先等按钮出现");
+  is(at('arWaitParam(1, "color")') > A, "AR：有「结构改动后新 pass 的参数表单最终出现」的正向断言");
+  is(at('"no_such_param"') > A, "AR：等待器有判别力（不存在的参数等 1.5s 必须超时 = 负控）");
+  // ── 15. FX-CACHE 的确定性复现（库文本遮蔽工程新字节）也要守：等库列表真的读回来、有确定性前提断言、
+  // 正向断言在 —— 不然这条复现被一次静默删减就变成空跑（「库里有旧字节」这个条件没建立起来也不会有红）。
+  const fx15 = seg("// ── 15. FX-CACHE", "var arErrs = await h.errorLines();");
+  is(fx15.length > 0, "AR：FX-CACHE 的 A→B 确定性复现段存在");
+  is(/await arWaitSel\("\[data-fx-lib-stats\]"/.test(fx15), "AR：FX-CACHE 复现要等「效果库」读完库列表（fxLibraryFiles 已填）再动结构");
+  is(/arXLibOwners\.length === 1/.test(fx15), "AR：FX-CACHE 复现有确定性前提断言（库目录里只有 A 一个条目带那个路径）");
+  is(/await arBtn\(0, "add"\)/.test(fx15) && /await arWaitParam\(1, AR_X_P2\)/.test(fx15), "AR：FX-CACHE 的 A→B 正向断言：加 pass 后第 2 条 pass 的参数格必须补上");
+  return bad;
 }
 
 /**
@@ -4343,8 +4430,443 @@ async function alphaE2E() {
   } catch (err) { await hlAbort("AP", apName, err); }
 }
 
+/**
+ * AR. 效果结构编辑端到端（M1 A1 扩展）：加 / 删 / 上下移 pass、换 material、改 target·bind。
+ *
+ * 三层判据：
+ *   ① 盘上产物成对：`effect.json` 的 `passes[]` 与 scene.json 的 `obj.effects[i].passes[]` 必须
+ *      **同时**变 —— 引擎按 effect.json 的 passes 顺序建 materialPasses（effects-parse.js:163），
+ *      执行时又用同一个下标 pi 去取 scene.json 的覆盖（renderer.js:5007）⇒ 只改一边 = 参数静默错位；
+ *   ② 出帧：pass 顺序与各自常量真的作用在像素上（CDP 截图），改完仍在出图、非黑非白、控制台无错误；
+ *   ③ 撤销：⌘Z 后盘上 effect.json **逐字节**复原（文件字节与文档快照记在同一条 StructCmd 上）。
+ * 守门：非编辑器自造的引用效果（非 `wwgl_` 前缀 / 不在工程资源表）只给禁用原因，不生成结构控件
+ *（COMPLIANCE：素材库文件不改）。
+ *
+ * 像素判据先藏 `#ed-overlay`（选中态覆盖层会染色，见 AP 段注释）。
+ * 闸门：`WE_E2E_FROM=AR` 时只从本段起跑（同一时刻只允许一个真机 run）。
+ */
+async function fxStructE2E() {
+  var arName = "AR. 效果结构编辑端到端（加/删/移 pass → effect.json 与 scene.json 覆盖同步 → 出帧变化 → ⌘Z 字节复原 → 引用效果守门）";
+  section(arName);
+  if (hlState.dead && process.env.WE_E2E_FROM !== "AR") hlSkip("AR", arName); else try {
+  var arWire = fxStructWireBad(
+    fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8"),
+    fs.readFileSync(path.join(ROOT, "editor/effects-struct.ts"), "utf8"),
+  );
+  check(arWire.length === 0, `接线守卫：结构编辑只有一条重挂路径 + 文件字节与文档快照同一条命令（${arWire.length} 处失败${arWire.length ? "：" + arWire.slice(0, 2).join(" / ") : ""}）`);
+  // 本段自己也要守纪律：所有结构/参数控件都是有界等待（终验那轮就是 arSetParam 直接 querySelector 断的）
+  var arHarness = arHarnessBad(fs.readFileSync(fileURLToPath(import.meta.url), "utf8"));
+  check(arHarness.length === 0, `AR 等待纪律守卫：结构/参数控件一律有界等待、超时带 DOM 现场（${arHarness.length} 处失败${arHarness.length ? "：" + arHarness.slice(0, 2).join(" / ") : ""}）`);
+
+  var AR_FX = "effects/wwgl_tint/effect.json";
+  var AR_MAT_TINT = "materials/effects/wwgl_tint.json";
+  var AR_MAT_ADJ = "materials/effects/wwgl_adjust.json";
+  var AR_NOTMINE = "effects/notmine_tint/effect.json";
+  var arDir = (id) => path.join(lib, String(id));
+  var arReadJson = (id, rel) => JSON.parse(fs.readFileSync(path.join(arDir(id), rel), "utf8"));
+  var arBytes = (id, rel) => fs.readFileSync(path.join(arDir(id), rel));
+  var arFx = (id) => arReadJson(id, AR_FX);
+  /** 盘上 scene.json 里这条效果文件的覆盖数组（引擎按位置取的那一份） */
+  var arOv = (id) => {
+    const sc = arReadJson(id, "scene.json");
+    for (const o of Array.isArray(sc.objects) ? sc.objects : []) {
+      for (const e of Array.isArray(o?.effects) ? o.effects : []) if (e && e.file === AR_FX) return Array.isArray(e.passes) ? e.passes : [];
+    }
+    return [];
+  };
+  var arColors = (id) => arOv(id).map((p) => p?.constantshadervalues?.color ?? null);
+  var arPassSel = (pass) => `.ed-inline-pass[data-fx-inline-effect="0"][data-fx-inline-pass="${pass}"]`;
+  /** 结构编辑：点一下控件 → 等整场景重挂（pass 结构不是热更能表达的东西） */
+  var arAct = async (js) => {
+    const r0 = await h.readyCount();
+    await ev(`(() => { ${js}; return true; })()`);
+    await h.waitRemount(r0);
+  };
+  /**
+   * 有界等待一个选择器出现，返回等了多久（ms）；超时抛错并带 **DOM 现场**。
+   * 为什么必须等：结构控件要等 `loadFxText` 读到 effect.json 原文，参数行要等 `externalPasses`
+   * 那套异步解析缓存（结构编辑落地时 `structEdit` → `forgetFxFile` 把它们全作废、重读）。
+   * 终验那轮 AR 就是在这里中断的（arSetParam 直接 querySelector，null 就抛）。
+   */
+  var arWaitSel = async (sel, what, ms = 30000) => {
+    const t0 = Date.now();
+    try {
+      await waitFor(`!!document.querySelector(${JSON.stringify(sel)})`, ms);
+    } catch {
+      const dump = await ev(`(() => {
+        const passes = [...document.querySelectorAll('.ed-inline-pass')].map((d) =>
+          (d.dataset.fxInlineEffect ?? '?') + ':' + (d.dataset.fxInlinePass ?? '?') +
+          '[params:' + d.querySelectorAll('input[data-param]').length + ',struct:' + d.querySelectorAll('[data-fx-struct-action]').length + ']');
+        const insp = document.querySelector('#ed-insp');
+        return { passes, locked: document.querySelectorAll('[data-fx-struct-locked]').length, insp: insp ? insp.textContent.replace(/\\s+/g, ' ').slice(0, 160) : null };
+      })()`).catch(() => null);
+      throw new Error(`等了 ${ms}ms 仍没有「${what}」(${sel}) —— DOM 现场：${JSON.stringify(dump)}`);
+    }
+    return Date.now() - t0;
+  };
+  /** 参数行（schemaForm 画的 `input[data-param]`）：结构改动后它会晚一拍出现 */
+  var arWaitParam = (pass, param, ms = 30000) => arWaitSel(`${arPassSel(pass)} input[data-param="${param}"]`, `pass ${pass} 的参数行 ${param}`, ms);
+  var arAddFx = async (id) => {
+    await arWaitSel("#fx-add", "效果下拉 #fx-add");
+    return arAct(`const s = document.querySelector('#fx-add'); s.value = '${id}'; s.dispatchEvent(new Event('change', { bubbles: true }))`);
+  };
+  var arBtn = async (pass, action) => {
+    await arWaitSel(`${arPassSel(pass)} [data-fx-struct-action="${action}"]`, `pass ${pass} 的结构按钮 ${action}`);
+    return arAct(`document.querySelector('${arPassSel(pass)} [data-fx-struct-action="${action}"]').click()`);
+  };
+  var arSetParam = async (pass, param, value) => {
+    const ms = await arWaitParam(pass, param);
+    if (ms > 100) console.log(`  · AR：pass ${pass} 的参数行 ${param} 在结构改动后 ${ms}ms 才补上（面板异步重画）`);
+    await ev(`(() => {
+      const el = document.querySelector('${arPassSel(pass)} input[data-param="${param}"]');
+      el.value = '${value}';
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    return ms;
+  };
+  var arSetMat = async (pass, value) => {
+    await arWaitSel(`${arPassSel(pass)} [data-fx-struct-material="${pass}"]`, `pass ${pass} 的 material 选择器`);
+    return arAct(`const el = document.querySelector('${arPassSel(pass)} [data-fx-struct-material="${pass}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  };
+  var arSetTarget = async (pass, value) => {
+    await arWaitSel(`${arPassSel(pass)} [data-fx-struct-target="${pass}"]`, `pass ${pass} 的 target 输入框`);
+    return arAct(`const el = document.querySelector('${arPassSel(pass)} [data-fx-struct-target="${pass}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
+  };
+  var arMatVal = async (pass) => {
+    await arWaitSel(`${arPassSel(pass)} [data-fx-struct-material="${pass}"]`, `pass ${pass} 的 material 选择器`);
+    return ev(`document.querySelector('${arPassSel(pass)} [data-fx-struct-material="${pass}"]')?.value ?? null`);
+  };
+  var arDisabled = async (pass, action) => {
+    await arWaitSel(`${arPassSel(pass)} [data-fx-struct-action="${action}"]`, `pass ${pass} 的结构按钮 ${action}`);
+    return ev(`document.querySelector('${arPassSel(pass)} [data-fx-struct-action="${action}"]').disabled`);
+  };
+  /** 结构控件是「读到 effect.json 原文之后」才画的（main.ts inlineFxSection 尾）⇒ 每步都要等它出现 */
+  var arWaitRow = (pass) => arWaitSel(`${arPassSel(pass)} [data-fx-struct-action="add"]`, `pass ${pass} 的结构控件行`, 60000);
+  var arUndo = async (shift) => {
+    const r0 = await h.readyCount();
+    await key("z", shift ? MOD.meta | MOD.shift : MOD.meta);
+    await h.waitRemount(r0);
+  };
+  /** 轮询等像素到位：热更（值）与重挂（结构）两条路的落帧时机不同，一条判据别赌一次截图 */
+  var arPixel = async (pt, want, eps) => {
+    let px = await pixelAt(pt);
+    for (let i = 0; i < 40 && !close(px, want, eps); i++) {
+      await sleep(150);
+      px = await pixelAt(pt);
+    }
+    return px;
+  };
+  var arHideOverlay = () => ev(`(() => { const o = document.querySelector('#ed-overlay'); if (o) o.style.visibility = 'hidden'; return true; })()`);
+
+  // ── 0. 夹具：新工程 → 图片层（上红下蓝）→ 基线像素 ──
+  await gotoEditor();
+  await ev(`new Promise((ok) => { const r = indexedDB.deleteDatabase('webwallgl-editor'); r.onsuccess = r.onerror = r.onblocked = () => ok(true); })`);
+  await gotoEditor();
+  await newBlank("#000000");
+  await addImage(stripePath);
+  await arHideOverlay();
+  var arCr = await h.canvasRect();
+  var arTop = worldToPage(arCr, [1110, 590]);
+  var arBot = worldToPage(arCr, [1110, 490]);
+  check(isRed(await pixelAt(arTop)) && isBlue(await pixelAt(arBot)), "基线：图片层上红下蓝原样出帧（截图探针就位）");
+
+  // ── 1. 挂 tint → pass 级表单把 pass 0 设成纯绿（值走热更，结构不动）──
+  await arAddFx("tint");
+  await arWaitRow(0);
+  check((await ev(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="0"]').length`)) === 1, "刚挂上：面板按 effect.json 列出 1 个 pass");
+  check((await arMatVal(0)) === AR_MAT_TINT, `结构控件列出当前 material（${await arMatVal(0)}）`);
+  await arSetParam(0, "color", "#00ff00");
+  await arSetParam(0, "amount", "1");
+  var arId = await saveLoose();
+  check(close(await arPixel(arTop, [0, 255, 0], 40), [0, 255, 0], 40) && isGreen(await pixelAt(arBot)), "pass 级表单改值：上下两半都变绿（值只热更，不需要重挂）");
+  check(arFx(arId).passes.length === 1, "盘上 effect.json 一个 pass");
+  check(JSON.stringify(arColors(arId)) === JSON.stringify(["0 1 0"]), `盘上 scene.json 覆盖跟着（${JSON.stringify(arColors(arId))}）`);
+  check(
+    fs.existsSync(path.join(arDir(arId), AR_MAT_TINT)) && fs.existsSync(path.join(arDir(arId), "shaders/effects/wwgl_tint.frag")) && fs.existsSync(path.join(arDir(arId), "shaders/effects/wwgl_tint.vert")),
+    "内置效果四件套落在工程目录（effect.json + 材质 + frag/vert）",
+  );
+
+  // ── 2. 加 pass：effect.json 与 scene.json 覆盖必须同时 +1，而且不新增文件 ──
+  await arBtn(0, "add");
+  // 结构改动的 UI 契约：新 pass 的参数行由 schemaForm 画，而它依赖 `externalPasses` 那套按文件的
+  // 异步解析缓存（结构落地时被 forgetFxFile 作废、重读）⇒ **会晚一拍**出现，但有界。
+  var arFormMs = await arWaitParam(1, "color");
+  await arWaitRow(1);
+  var arId2 = await saveLoose();
+  // 加完 pass 的基线：两条 pass 逐字节相同（共用材质），所以「上下移」换位不该动这个文件
+  var arFxAfterAdd0 = arBytes(arId, AR_FX);
+  check(String(arId2) === String(arId), "加 pass 不改工程目录（还是同一个 id）");
+  check(
+    (await ev(`document.querySelectorAll('${arPassSel(1)} input[data-param]').length`)) === 2,
+    `结构改动后新 pass 的参数表单最终出现（pass 1 的 color+amount 两格，实测等待 ${arFormMs}ms —— 面板异步重画是本功能的 UI 契约）`,
+  );
+  // 负控：等待器必须有判别力 —— 不存在的参数等 1.5s 必须超时（否则「等待」退化成橡皮图章）
+  var arNegTimedOut = false;
+  try {
+    await arWaitParam(1, "no_such_param", 1500);
+  } catch {
+    arNegTimedOut = true;
+  }
+  check(arNegTimedOut, "参数行等待器有判别力：不存在的参数等 1.5s 必须超时（不是「等到了就放行」）");
+  var arFxTwo = arFx(arId);
+  check(arFxTwo.passes.length === 2 && JSON.stringify(arFxTwo.passes[0]) === JSON.stringify(arFxTwo.passes[1]) && arFxTwo.passes[1].material === AR_MAT_TINT,
+    `加 pass = 源 pass 的完整拷贝，共用同一份材质（${arFxTwo.passes.length} 条）`);
+  check(
+    JSON.stringify(arOv(arId)) === JSON.stringify([
+      { constantshadervalues: { color: "0 1 0", amount: 1 } },
+      { constantshadervalues: { color: "0 1 0", amount: 1 } },
+    ]),
+    `scene.json 覆盖同步 +1 且同形（${JSON.stringify(arOv(arId))}）`,
+  );
+  check(
+    fs.readdirSync(path.join(arDir(arId), "effects")).length === 1 &&
+      fs.readdirSync(path.join(arDir(arId), "materials/effects")).length === 1 &&
+      fs.readdirSync(path.join(arDir(arId), "shaders/effects")).length === 2,
+    "工程里没有多出文件（effects 1 个目录 / materials 1 份 / shaders frag+vert，pass 共用材质）",
+  );
+  check(
+    (await arDisabled(0, "up")) === true && (await arDisabled(1, "down")) === true && (await arDisabled(0, "del")) === false && (await arDisabled(1, "del")) === false,
+    "pass 序控件边界：第一个不能上移、最后一个不能下移、两个都能删",
+  );
+
+  // ── 3. 覆盖跟着 pass 走（真机像素证据）：pass 1 的覆盖改蓝 → 出帧变蓝 ──
+  await arSetParam(1, "color", "#0000ff");
+  check(close(await arPixel(arTop, [0, 0, 255], 40), [0, 0, 255], 40), "pass 1 的覆盖生效（两个 pass 串联，最后一个说了算）");
+  await saveLoose();
+  check(JSON.stringify(arColors(arId)) === JSON.stringify(["0 1 0", "0 0 1"]), `盘上两条覆盖不同（${JSON.stringify(arColors(arId))}）`);
+
+  // ── 4. 上下移：effect.json 的 pass 序与 scene.json 的覆盖必须一起换位 ──
+  await arBtn(0, "down");
+  await arWaitRow(1);
+  await saveLoose();
+  check(JSON.stringify(arColors(arId)) === JSON.stringify(["0 0 1", "0 1 0"]), `移 pass：覆盖跟着换位（${JSON.stringify(arColors(arId))}）`);
+  check(close(await arPixel(arTop, [0, 255, 0], 40), [0, 255, 0], 40), "移 pass 后出帧按新顺序（绿 ⇒ 覆盖真的跟着 pass 走了，只换 pass 不换覆盖还是蓝）");
+  check(Buffer.compare(arBytes(arId, AR_FX), arFxAfterAdd0) === 0, "两个 pass 完全相同时换位不写坏文件（effect.json 字节不变，见证在 scene.json 的覆盖上）");
+
+  // ── 5. 撤销移 pass：盘上覆盖与出帧一起回退（一条动作 = 一步撤销）──
+  await arUndo(false);
+  await saveLoose();
+  check(JSON.stringify(arColors(arId)) === JSON.stringify(["0 1 0", "0 0 1"]), `⌘Z 回退移 pass：覆盖换回原位（${JSON.stringify(arColors(arId))}）`);
+  check(close(await arPixel(arTop, [0, 0, 255], 40), [0, 0, 255], 40), "⌘Z 后出帧回到蓝（撤销真的重挂了，不是只改面板）");
+
+  // ── 6. pass 链的数据流：pass 1 半透 ⇒ 它读到的是 pass 0 的输出（绿）──
+  // tint 的 shader 是 `c.rgb = mix(c.rgb, g_FxColor, g_FxAmount)`（editor/shaders/effects/tint.body.glsl）
+  // ⇒ 半透时输出里带着**输入**的颜色，于是「下游读的是谁」能从像素上读出来。
+  await arSetParam(1, "amount", "0.5");
+  var arChainPx = await arPixel(arTop, [0, 128, 128], 40);
+  check(arChainPx[0] < 60, `两个 pass 串联：pass 1 读到 pass 0 的绿再半透混蓝 ⇒ 红通道接近 0（${arChainPx}）`);
+
+  // ── 7. 改 target：pass 0 画进 FBO；带 target 的 pass 不推进乒乓（renderer.js:5314-5320
+  //      只在 `!mp.target` 时 curInput = outFBO）⇒ 下游退回层原图（红）。不补 bind 就断链。──
+  await arSetTarget(0, "fb_rt");
+  await saveLoose();
+  var arFxT = arFx(arId);
+  check(arFxT.passes[0].target === "fb_rt" && Array.isArray(arFxT.fbos) && arFxT.fbos.some((f) => f.name === "fb_rt"),
+    `改 target：写进 passes[0].target 并自动补 fbos 声明（${JSON.stringify(arFxT.fbos)}）`);
+  var arNoBindPx = await arPixel(arTop, [110, 15, 142], 40);
+  check(arNoBindPx[0] > 60, `target 真的改了数据流：pass 0 画进 FBO 后下游退回层原图（红回来了 ${arNoBindPx}，未改前 ${arChainPx}）`);
+
+  // ── 8. 改 bind：把 pass 1 的槽 0 绑回 pass 0 写的 FBO（resolveTextureName 查 effectFBOs）──
+  await arBtn(1, "addbind");
+  await saveLoose();
+  var arBind1 = arFx(arId).passes[1].bind;
+  check(Array.isArray(arBind1) && arBind1.length === 1 && arBind1[0].index === 0 && arBind1[0].name === "fb_rt",
+    `加 bind：槽 0 绑到已声明的 FBO（${JSON.stringify(arBind1)}）`);
+  var arBindPx = await arPixel(arTop, arChainPx, 24);
+  check(arBindPx[0] < 60 && Math.abs(arBindPx[1] - arChainPx[1]) < 40,
+    `bind 真的把 FBO 接上了（按槽覆盖 renderer.js:5201-5203）：红又回到 0、颜色与没断链时一致（${arBindPx} vs ${arChainPx}）`);
+
+  // ── 9. 删 bind：一条「只改文件」的编辑也必须能一步撤销（文件字节与文档快照同一条命令）──
+  await arBtn(1, "del:0");
+  await saveLoose();
+  check(!("bind" in (arFx(arId).passes[1] ?? {})), "删 bind：删空即删键（不留空数组）");
+  check((await arPixel(arTop, [110, 15, 142], 40))[0] > 60, "删掉 bind：链又断回层原图（红回来了）");
+  await arUndo(false);
+  await saveLoose();
+  check(JSON.stringify(arFx(arId).passes[1].bind) === JSON.stringify([{ name: "fb_rt", index: 0 }]), "⌘Z：只改文件的 bind 编辑也一步回滚");
+  check((await arPixel(arTop, arChainPx, 24))[0] < 60, "⌘Z 后链又通了（撤销不只在文件上，画面跟着回）");
+  await arUndo(true);
+  await saveLoose();
+  check(!("bind" in (arFx(arId).passes[1] ?? {})), "⌘⇧Z：重做又删掉 bind");
+
+  // ── 10. 清 target：删键（自动补的 fbos 声明不回收 —— 声明只多不少，引擎照建 FBO）──
+  await arSetTarget(0, "");
+  await saveLoose();
+  check(!("target" in (arFx(arId).passes[0] ?? {})), "清 target：pass 上不留 target 键");
+  check((await arPixel(arTop, arChainPx, 24))[0] < 60, "清掉 target：链条回到乒乓（下游又读到 pass 0 的绿）");
+
+  // ── 11. 换 material：只改 effect.json、不动 scene.json；出帧真的换（半透混色 → 纯绿）──
+  // 先挂第二个效果（adjust，缺省参数是恒等）：它的材质 wwgl_adjust.json 才进工程资源表，
+  // 于是 tint 的 pass 1 能切到它（引擎每个 pass 各自读自己的 material：effects-parse.js:220）。
+  await arAddFx("adjust");
+  await arWaitRow(1);
+  await saveLoose();
+  check(close(await arPixel(arTop, arChainPx, 24), arChainPx, 24), "第二个效果（adjust）缺省参数是恒等：出帧不变");
+  check(fs.existsSync(path.join(arDir(arId), AR_MAT_ADJ)), "adjust 的材质落进工程（换 material 的候选只来自工程资源表）");
+  var arFxBeforeMat = arBytes(arId, AR_FX);
+  var arOvBeforeMat = JSON.stringify(arOv(arId));
+  await arSetMat(1, AR_MAT_ADJ);
+  await saveLoose();
+  var arFxMat = arFx(arId);
+  check(arFxMat.passes[0].material === AR_MAT_TINT && arFxMat.passes[1].material === AR_MAT_ADJ,
+    `换 material 只动那一条（${arFxMat.passes.map((p) => p.material).join(" / ")}）`);
+  check(JSON.stringify(arOv(arId)) === arOvBeforeMat, "换 material 不动 scene.json 覆盖（材质换了，那份常量还在原位）");
+  var arMatPx = await arPixel(arTop, [0, 255, 0], 40);
+  check(isGreen(arMatPx), `换 material 出帧真的换了材质：pass 1 的半透混色没了（${arChainPx} → ${arMatPx}，恒等 adjust）= 终验那条「换材质出帧变化」的真机证据`);
+  await arUndo(false);
+  await saveLoose();
+  check(Buffer.compare(arBytes(arId, AR_FX), arFxBeforeMat) === 0, `⌘Z：effect.json 逐字节复原（${arFxBeforeMat.length} 字节）`);
+  check((await arPixel(arTop, arChainPx, 24))[0] < 60, "⌘Z 后画面回到混色（文件与出帧一起回）");
+  await arUndo(true);
+  await saveLoose();
+  check(arFx(arId).passes[1].material === AR_MAT_ADJ && isGreen(await arPixel(arTop, [0, 255, 0], 40)), "⌘⇧Z：重做又切到 adjust 材质，画面回到纯绿");
+
+  // ── 12. 删 pass：effect.json 与覆盖一起 −1；出帧回到原图（幸存的是恒等 adjust）──
+  var arFxBeforeDel = arBytes(arId, AR_FX);
+  await arBtn(0, "del");
+  await arWaitRow(0);
+  await saveLoose();
+  var arFxDel = arFx(arId);
+  check(arFxDel.passes.length === 1 && arFxDel.passes[0].material === AR_MAT_ADJ, `删 pass：只剩幸存的那条（${arFxDel.passes.length}）`);
+  check(JSON.stringify(arColors(arId)) === JSON.stringify(["0 0 1"]), `scene.json 覆盖同步 −1，留下的正是原来挂在该 pass 上的那份（${JSON.stringify(arColors(arId))}）`);
+  check(close(await arPixel(arTop, RED, 24), RED, 24) && close(await arPixel(arBot, BLUE, 24), BLUE, 24), "删掉 tint 那条 pass 后出帧回到原图（恒等 adjust 不吃那个颜色常量）");
+  await arUndo(false);
+  await saveLoose();
+  check(Buffer.compare(arBytes(arId, AR_FX), arFxBeforeDel) === 0 && arOv(arId).length === 2, "⌘Z：删 pass 一步回滚（文件字节逐字节复原 + 覆盖回到两条）");
+
+  // ── 13. 保存 → 重开：结构从盘上读回来（不是内存里的面板状态）──
+  await reopen(arId);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await arHideOverlay();
+  await click(await h.rowCenter("stripe"));
+  await arWaitRow(0);
+  await arWaitRow(1);
+  check((await ev(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="0"]').length`)) === 2, "重开后面板按盘上结构列出 2 个 pass（结构编辑真的落盘了）");
+  check((await arMatVal(1)) === AR_MAT_ADJ, "重开后 pass 1 的 material 仍是换过的 adjust（不是内存残留）");
+  check(close(await arPixel(arTop, [0, 255, 0], 40), [0, 255, 0], 40), "重开后出帧一致（pass 0 绿 + 恒等 adjust）");
+  var arErrs1 = await h.errorLines();
+  check(arErrs1.length === 0, `结构编辑全程控制台无错误${arErrs1.length ? `：${arErrs1.slice(0, 2).join(" / ")}` : ""}`);
+
+  // ── 14. 守门：非编辑器自造的引用效果只给禁用原因，不生成结构控件（COMPLIANCE 素材库不改）──
+  // 沿用同一个工程：把 scene.json 的 effects[0].file 改成一个**没有 wwgl_ 前缀、且不在工程资源表**
+  // 的路径（= 「库引用效果」的形态），然后重开。这里刻意**不在工程目录里放那个文件**：真实场景里引用
+  // 效果的 effect.json 永远躺在素材库里、不在工程目录；而工程目录里本来就不该出现它（见下面 a/b 两条断言）。
+  // 常量值仍可调（材质/着色器共用），只有结构编辑被拦下（main.ts 的 isStructEditable：`wwgl_` 前缀 ∧ 文件在工程资源表）。
+  await gotoEditor(); // 先离开页面（空态）再改盘：此刻不会有一个持有旧文档的编辑器把我的补丁覆盖回去
+  var arSceneLib = arReadJson(arId, "scene.json");
+  arSceneLib.objects[0].effects[0].file = AR_NOTMINE;
+  fs.writeFileSync(path.join(arDir(arId), "scene.json"), JSON.stringify(arSceneLib, null, 2));
+  await ev(`(() => { window.__e2eMode = 'open'; window.__e2eOpen = ${JSON.stringify(arId)}; return true; })()`);
+  await openLocal();
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await click(await h.rowCenter("stripe"));
+  await waitFor(`!!document.querySelector('.ed-inline-pass[data-fx-inline-effect="0"]')`, 60000);
+  await waitFor(`!!document.querySelector('[data-fx-struct-locked="${AR_NOTMINE}"]')`, 60000);
+  // 「画完」的证据：该效果的 pass 行全部就位 —— 只有渲染完成后，「没有结构控件」才是判别力证据，而不是「还没画」
+  await waitFor(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="0"]').length === 2`, 60000);
+  var arLockedTxt = await ev(`document.querySelector('[data-fx-struct-locked="${AR_NOTMINE}"]').textContent`);
+  check(typeof arLockedTxt === "string" && arLockedTxt.length > 4 && !/^fx\./.test(arLockedTxt), `引用效果给的是原因文案、不是裸键（「${arLockedTxt}」）`);
+  check(
+    (await ev(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="0"] [data-fx-struct-action], .ed-inline-pass[data-fx-inline-effect="0"] [data-fx-struct-material], .ed-inline-pass[data-fx-inline-effect="0"] [data-fx-struct-target], .ed-inline-pass[data-fx-inline-effect="0"] [data-fx-struct-binds]').length`)) === 0,
+    "非工程效果（非 wwgl_ 前缀 / 不在工程资源表）不生成任何结构控件",
+  );
+  // 非空洞证据：被守门的那个引用效果**在面板里确实渲染出来了**（行还在、原因注在、pass 行齐全），
+  // 否则「结构控件 0 个」可能退化成「这行根本没画」的空断言。
+  check(
+    (await ev(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="0"]').length`)) === 2,
+    "非空洞：被守门的引用效果照旧在面板里列出 2 个 pass 行（不是整行没渲染）",
+  );
+  // 正对照：同一个面板、同一次渲染里，工程内效果（effects[1] = wwgl_adjust）照旧有结构控件
+  // ⇒ 守门是按文件分流的，不是「整块没画出来」造成的假绿。
+  await arWaitSel('.ed-inline-pass[data-fx-inline-effect="1"] [data-fx-struct-action="add"]', "工程内效果的结构控件（正对照）");
+  check(
+    (await ev(`document.querySelectorAll('.ed-inline-pass[data-fx-inline-effect="1"] [data-fx-struct-action]').length`)) > 0,
+    "正对照：同一面板里工程内效果照旧有结构控件（守门按文件分流，不是整块没画）",
+  );
+  // 只读（有产品含义的两条）：保存到文件夹之后看**写出来的工程目录**——
+  //   a. `effects/` 里只有编辑器自己的 `wwgl_*` 目录，引用效果的文件从未被物化进工程（COMPLIANCE：素材库不改、也不搬进来）
+  //   b. scene.json 里那个引用**仍在**（引用是数据、不是文件；守门只禁改它，不是把它丢掉）
+  var arSavedBefore = await h.savedCount();
+  await key("s", MOD.meta);
+  await h.waitSaved(arSavedBefore);
+  var arFxDirs = fs.readdirSync(path.join(arDir(arId), "effects")).sort();
+  check(
+    arFxDirs.length > 0 && arFxDirs.every((n) => n.startsWith("wwgl_")) && !arFxDirs.includes("notmine_tint"),
+    `写出的工程目录里 effects/ 只有编辑器自造的 wwgl_* 目录（${arFxDirs.join(", ")}）—— 引用效果的文件没被物化进工程`,
+  );
+  check(
+    arReadJson(arId, "scene.json").objects[0].effects[0].file === AR_NOTMINE,
+    `scene.json 里那个引用仍在（引用是数据、不是文件）：${AR_NOTMINE}`,
+  );
+
+  // ── 15. FX-CACHE：解析缓存按「工程内相对路径」做键 ⇒ 库里的旧文本会顶掉工程自己的新字节 ──
+  // 终验轮那条 AR 中断（`0:1[params:0]`：新 pass 的参数格永远不出现）的确定性复现。宿主把「本机壁纸库」
+  // 按同一个「工程内相对路径」做键（host/wallpaper-host.ts scanEffectLibrary：`库/<条目目录>/effects/<效果目录>/effect.json`），
+  // 而**保存过的工程目录本身就是库条目** ⇒ 编辑器一旦读到库文本，就把它当回落喂给 effect.json 的读回调；
+  // 库优先时，A 工程那份「1 个 pass」的旧副本会一直遮蔽 B 盘上「2 个 pass」的新字节 —— 而 forgetFxFile()
+  // 只作废按文件的解析缓存、作废不掉库文本 ⇒ 不自愈，一直等到 30s 超时。
+  // 用 vignette：整份真机套件里只有本条步骤会造出 `effects/wwgl_vignette/effect.json`（下面有前提断言守着）,
+  // 所以「库文本是哪一份」是确定的，不是碰巧排序。
+  var AR_X = "vignette";
+  var AR_X_FX = `effects/wwgl_${AR_X}/effect.json`;
+  var AR_X_P2 = "radius"; // vignette 的第 2 个参数：加 pass 之后必须补上的那一格
+  await newBlank("#000000");
+  await addImage(stripePath);
+  await arAddFx(AR_X);
+  await arWaitRow(0);
+  var arXId = await saveLoose();
+  await waitFileOnDisk(path.join(arDir(arXId), AR_X_FX));
+  check(arReadJson(arXId, AR_X_FX).passes.length === 1, `A 工程（${arXId}）盘上的 ${AR_X_FX} 是 1 个 pass —— 这就是之后会被当成「库文本」的旧字节`);
+  // 确定性前提：整份套件里只有 A 这一个条目带这个路径 ⇒ 库枚举给这个键的文本必然是 A 的 1-pass 旧字节。
+  // （多一个条目就变成「看排序碰运气」，这条断言宁可先红，也不要一条不知道自己测什么的复现。）
+  var arXLibOwners = fs.readdirSync(lib).filter((n) => fs.existsSync(path.join(lib, n, AR_X_FX))).sort();
+  check(
+    arXLibOwners.length === 1 && arXLibOwners[0] === arXId,
+    `确定性前提：库目录里带 ${AR_X_FX} 的条目只有 A 一个（${arXLibOwners.join(", ") || "无"}）`,
+  );
+  // 页载即扫库：重开 A（整页重载 ⇒ fxLibrary 归零），检视器一画「效果库」分区就 fetch 一次，
+  // 这次枚举会把 A 自己那份 1-pass 旧字节读进 fxLibraryFiles。等面板真的列出库列表再动结构。
+  await reopen(arXId);
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 90000);
+  await waitFor(`/首帧就绪|First frame ready/.test(document.querySelector('#ed-con-body').textContent)`, 90000);
+  await arHideOverlay();
+  await click(await h.rowCenter("stripe"));
+  await arWaitRow(0);
+  await arWaitSel("[data-fx-lib-stats]", "「效果库」分区读完库列表（loadFxLibrary 的 fetch 回来了）");
+  var arXLibCount = await ev(`Number(document.querySelector('[data-fx-lib-stats]')?.dataset.fxLibStats ?? 0)`);
+  check(arXLibCount >= 1, `库枚举真的带回了条目（${arXLibCount} 个）—— 这是「库文本已经进了 fxLibraryFiles」的证据`);
+  // A → B：同一个工程目录里把 pass 加到 2 条。加了 pass 之后面板必须按**工程自己的新字节**重画，
+  // 第 2 条 pass 的参数格必须出现；库优先时（修复前）这里会一直等到超时 —— 就是终验轮那条中断。
+  await arBtn(0, "add");
+  var arXMs = await arWaitParam(1, AR_X_P2);
+  await arWaitRow(1);
+  await saveLoose();
+  check(arReadJson(arXId, AR_X_FX).passes.length === 2, `加 pass 后盘上的 ${AR_X_FX} 是 2 个 pass（B 的新字节）`);
+  check(
+    (await ev(`document.querySelectorAll('${arPassSel(1)} input[data-param]').length`)) === 3,
+    `A→B：库里有 A 的同路径 1-pass 旧字节，面板照样按 B 自己的字节补上 pass 1 的三个参数格（实测等待 ${arXMs}ms）`,
+  );
+  // 负控：同一套等待器在这里必须有判别力（不是「等到了就放行」）
+  var arXNeg = false;
+  try {
+    await arWaitParam(1, "no_such_param", 1500);
+  } catch {
+    arXNeg = true;
+  }
+  check(arXNeg, "A→B 的参数行等待器有判别力：不存在的参数等 1.5s 必须超时");
+
+  await arHideOverlay();
+  var arErrs = await h.errorLines();
+  check(arErrs.length === 0, `AR 全程控制台无错误${arErrs.length ? `：${arErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AR", arName, err); }
+}
+
 await alphaE2E();
 await skelE2E();
+await fxStructE2E();
 
   if (hlState.aborts.length || hlState.skipped) {
     console.log(`\n真机段小结：中断 ${hlState.aborts.length} 段、跳过 ${hlState.skipped} 段`);

@@ -1343,6 +1343,64 @@ input.ed-al-name {
   white-space: nowrap;
 }
 
+/* ---- 效果结构编辑（M1 A1 扩展）：pass 增删移 / 换 material / 改 bind·target ---- */
+.ed-inline-struct-title {
+  margin-top: 8px;
+  font-size: var(--wb-font-xs);
+  color: var(--wb-fg-mute);
+}
+
+.ed-inline-struct {
+  margin-top: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--wb-line);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ed-inline-struct-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ed-inline-struct-btn {
+  font-size: var(--wb-font-xs);
+  padding: 1px 6px;
+}
+
+.ed-inline-struct-mat,
+.ed-inline-struct-target,
+.ed-inline-struct-bind {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-inline-struct-select,
+.ed-inline-struct-input,
+.ed-inline-struct-slot {
+  min-width: 0;
+  flex: 1 1 auto;
+  font-size: var(--wb-font-xs);
+}
+
+.ed-inline-struct-slot {
+  flex: 0 0 56px;
+}
+
+.ed-inline-struct-binds-head {
+  font-size: var(--wb-font-xs);
+  color: var(--wb-fg-mute);
+}
+
+.ed-inline-struct-locked {
+  font-size: var(--wb-font-xs);
+  color: var(--wb-fg-mute);
+}
+
 /* ---- 效果库浏览器（M6）：只读枚举本机壁纸库的效果目录 ---- */
 .ed-fx-lib {
   margin-top: 8px;

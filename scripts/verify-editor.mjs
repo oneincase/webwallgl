@@ -10238,7 +10238,11 @@ section("A13. 字段补全：文字布局 / 声音播放 / 关键帧 visible·vo
   {
     // 上限单一真源：两个数字行共用一个 numRow，上限在体内按字段取 text.ts 的导出（不写字面量）。
     // 1000 在 main.ts 别处是毫秒换算（如 `(view.length / view.fps) * 1000`），所以否定断言只在 numRow 体内做。
-    const nrSrc = mainA13.slice(mainA13.indexOf("const numRow = "), mainA13.indexOf('numRow("maxwidth"'));
+    // 健壮化（task-12）：切片锚点从「first occurrence」改成「以真实调用行为基准、向前找最近的声明」，
+    // 这样以后在 main.ts 更靠前的地方再出现同名局部变量也不会把切片拉长（锚点缺失时切片为空 ⇒ 判据响亮转红）。
+    const nrRowAt = mainA13.indexOf('numRow("maxwidth"');
+    const nrAt = nrRowAt < 0 ? -1 : mainA13.lastIndexOf("const numRow = ", nrRowAt);
+    const nrSrc = nrAt < 0 ? "" : mainA13.slice(nrAt, nrRowAt);
     check(
       /String\(MAX_TEXT_WIDTH\)/.test(nrSrc) &&
         /String\(MAX_TEXT_ROWS\)/.test(nrSrc) &&
@@ -10252,8 +10256,14 @@ section("A13. 字段补全：文字布局 / 声音播放 / 关键帧 visible·vo
   {
     // 字号 / 内边距的上限：校验与输入框此前各写一份字面量，收成 text.ts 的单一真源。
     // 否定断言仍只在各自那一行的切片内做（main.ts 别处有毫秒换算常量与其它数字）。
-    const sizeSrc = mainA13.slice(mainA13.indexOf("const size = document.createElement"), mainA13.indexOf('row("tx.size", size)'));
-    const padSrc = mainA13.slice(mainA13.indexOf("const pad = document.createElement"), mainA13.indexOf('row("tx.padding", pad)'));
+    // 健壮化（task-12）：声明必须紧邻对应的 row(...) 调用之前，且 size 行连 createElement("input") 一起锚定；
+    // 只取「forward from first occurrence」会在别人更早插入同名变量时误切（task-12 的 ed-mt-size 就中过一枪）。
+    const sizeRowAt = mainA13.indexOf('row("tx.size", size)');
+    const sizeAt = sizeRowAt < 0 ? -1 : mainA13.lastIndexOf('const size = document.createElement("input")', sizeRowAt);
+    const sizeSrc = sizeAt < 0 ? "" : mainA13.slice(sizeAt, sizeRowAt);
+    const padRowAt = mainA13.indexOf('row("tx.padding", pad)');
+    const padAt = padRowAt < 0 ? -1 : mainA13.lastIndexOf("const pad = document.createElement", padRowAt);
+    const padSrc = padAt < 0 ? "" : mainA13.slice(padAt, padRowAt);
     check(
       /size\.max = String\(MAX_TEXT_SIZE\)/.test(sizeSrc) &&
         !/1000/.test(sizeSrc) &&
@@ -10402,6 +10412,941 @@ section("KIND-I18N. 图层种类名成对（树徽标 / 检视器「类型」行
     kindMutated !== i18nKindSrc && kindMutMissing.includes("container"),
     "变异红测：删掉 kind.container 的一条词条后判据变红（界面上会显示裸键）",
   );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FX-STRUCT. 效果结构编辑（M1 A1 扩展）：加/删/上下移 pass、换 material、改 bind·target
+//
+// 真源：editor/effects-struct.ts（六种 plan + doc 侧位置同步）+ editor/main.ts 的接线。
+// 判三件事：
+//   ① 六种 plan 的产物形态 + doc 侧位置同步 —— effect.json 与 scene.json 必须成对改，
+//      否则第 j 个覆盖会落到另一个 pass 上（renderer.js:5007 同一个 pi 取 mp 与 ov）；
+//   ② 叠加层往返：字节写进 overlay → 读回结构/键序不变 → 当成磁盘内容重开结构仍在；
+//   ③ main.ts 接线：结构编辑只走 structEdit → restoreObjects 一条重挂、字节先落再重挂、
+//      库引用效果禁控件（COMPLIANCE 素材库不改）、失败原因键中英各一条（不出现裸键）。
+// 末尾 5 条变异红测证明上面每条都能被错实现咬红（先红后绿）。
+// ───────────────────────────────────────────────────────────────────────────
+section("FX-STRUCT. 效果结构编辑 editor/effects-struct.ts + main.ts 接线（M1 A1 扩展）");
+{
+  const structPath = path.join(ROOT, "editor/effects-struct.ts");
+  const mainPath = path.join(ROOT, "editor/main.ts");
+  const i18nPath = path.join(ROOT, "editor/i18n.ts");
+  const texts0 = {
+    struct: fs.readFileSync(structPath, "utf8"),
+    main: fs.readFileSync(mainPath, "utf8"),
+    i18n: fs.readFileSync(i18nPath, "utf8"),
+  };
+
+  const F = "effects/wwgl_t/effect.json";
+  const shaderMat = json({ passes: [{ shader: "effects/wwgl_t", blending: "normal" }] });
+  const onePass = () => json({ version: 1, name: "wwgl_t", passes: [{ material: "materials/effects/wwgl_t.json" }] });
+  const twoPass = () =>
+    json({
+      version: 1,
+      name: "wwgl_t",
+      fbos: [{ name: "_rt_A", scale: 1, format: "rgba8888" }],
+      passes: [
+        { material: "materials/effects/wwgl_t.json", target: "_rt_A" },
+        { material: "materials/effects/wwgl_t.json" },
+      ],
+    });
+  const mats = { "materials/effects/wwgl_t.json": shaderMat, "materials/editor/lib.json": shaderMat };
+  const io = { read: (n) => mats[n] ?? null, projectFiles: new Set([F, "materials/effects/wwgl_t.json", "materials/editor/lib.json"]) };
+
+  /** 接线文本断言（纯文本 → 也能被变异咬红） */
+  const wireBad = (src) => {
+    const bad = [];
+    const is = (c, m) => {
+      if (!c) bad.push(m);
+    };
+    const at = (n, from = 0) => src.indexOf(n, from);
+    is(at("files?: readonly FxFileSnap[]") > 0, "接线：structEdit 接受 files（文件字节与文档快照记同一条命令）");
+    const st = at("function structEdit(");
+    const put = at("overlay.put(f.path, f.after, f.path)", st);
+    const ro = at("restoreObjects(cmd.after", st);
+    is(st > 0 && put > st && ro > put, "接线：structEdit 内先写叠加层字节、再 restoreObjects 重挂（重挂从资源表读 effect.json）");
+    const br = at("if (isStruct(cmd))");
+    const jr = at("fxFileJournal.get(cmd)");
+    is(br > 0 && jr > br && at("restoreObjects(", jr) > jr, "接线：撤销分支先换回文件字节、再 restoreObjects");
+    is(at("function commitFxStruct(") > 0 && at("{ path: plan.file, before: enc.encode(cur), after: enc.encode(plan.text) }") > 0,
+      "接线：commitFxStruct 把文件字节交给 structEdit（不另开一条 FileCmd = 不会变成两步撤销）");
+    is(at("isStructEditable(f, projectFiles)") > 0 && at("fxStructControls(node, v, structText, editable)") > 0 && at("fxStructLocked = file") > 0,
+      "接线：面板有准入判断 + 结构控件 + 库引用禁用注");
+    const commit = src.slice(at("function commitFxStruct("), at("function fxStructControls("));
+    is(commit.length > 0 && !/setEffectConstants/.test(commit), "接线：结构编辑不走 setEffectConstants 热更（那条只写常量值）");
+    return bad;
+  };
+
+  /** 失败原因键 / UI 键 → i18n 里恰好两条（zh + en） */
+  const keyBad = (text, keys) => keys.filter((k) => text.split(`"${k}":`).length - 1 !== 2);
+
+  /** 判据体：返回失败清单（空 = 全绿）；变异红测复用它 */
+  const corpus = async (S, texts) => {
+    const bad = [];
+    const is = (c, m) => {
+      if (!c) bad.push(m);
+    };
+    const txt = (r) => (r.ok ? r.value.text : "");
+    const docOf = (r) => S.parseEffectDoc(txt(r));
+
+    // ---- ① 六种 plan ----
+    const add = S.planPassAdd(F, onePass(), 0);
+    const ad = docOf(add);
+    const aps = S.passesOf(ad) ?? [];
+    is(add.ok && aps.length === 2 && add.value.doc?.kind === "insert" && add.value.doc.at === 1, "加 pass：两份 + doc 同步 insert@1");
+    is(add.ok && json(aps[0]) === json(aps[1]), "加 pass：拷贝源 pass（材质路径共用，不新增 / 不删文件）");
+    is(add.ok && add.value.text === S.serializeEffectDoc(ad) && add.value.text.includes('\n  "passes"'), "落盘口径 = 2 空格 stringify（与 effects.ts 写 effect.json 一致）");
+    is(S.planPassRemove(F, onePass(), 0).reason === "fx.structLastPass", "最后一个 pass 不给删（删空 = 整条链不出图）");
+    const rm = S.planPassRemove(F, twoPass(), 0);
+    is(rm.ok && json(S.passesOf(docOf(rm)) ?? []) === json([{ material: "materials/effects/wwgl_t.json" }]), "删 pass：少一条 + 同步 remove@0");
+    const up = S.planPassMove(F, twoPass(), 0, -1);
+    is(!up.ok && up.reason === "fx.structNoChange", "上下移到边界 = 没有变化（不进撤销栈）");
+    const mv = S.planPassMove(F, twoPass(), 0, 1);
+    const mps = S.passesOf(docOf(mv)) ?? [];
+    is(mv.ok && mps[0]?.target === undefined && mps[1]?.target === "_rt_A" && mv.value.doc?.from === 0 && mv.value.doc?.to === 1,
+      "移 pass：执行序换位 + 同步 move{0→1}");
+    is(S.planMaterial(F, onePass(), 0, "../x.json", io).reason === "fx.structBadMaterial" && S.planMaterial(F, onePass(), 0, "materials/nope.json", io).reason === "fx.structBadMaterial",
+      "换 material：越界 / 不在工程资源表被拒（不改素材库）");
+    is(S.planMaterial(F, onePass(), 0, "materials/bare.json", { read: () => json({ passes: [{}] }), projectFiles: new Set(["materials/bare.json"]) }).reason === "fx.structBadMaterial",
+      "换 material：材质没有 passes[0].shader 被拒（引擎会静默跳过该 pass）");
+    const good = S.planMaterial(F, onePass(), 0, "materials/editor/lib.json", io);
+    is(good.ok && good.value.doc === null && S.passesOf(docOf(good))?.[0]?.material === "materials/editor/lib.json", "换 material：只改 passes[i].material（doc 侧无需同步）");
+    is(S.planMaterial(F, onePass(), 0, "materials/effects/wwgl_t.json", io).reason === "fx.structNoChange", "换 material：值没变被拒");
+    const tgt = S.planTarget(F, onePass(), 0, "_rt_New");
+    is(tgt.ok && tgt.value.fbo === "_rt_New" && S.fboNamesOf(docOf(tgt)).includes("_rt_New"), "改 target：未声明的 FBO 自动补 fbos（否则引擎静默回落 curInput）");
+    is(S.planTarget(F, onePass(), 0, "bad name").reason === "fx.structBadTarget", "改 target：非法 FBO 名被拒");
+    is(!("target" in (S.passesOf(docOf(S.planTarget(F, twoPass(), 0, "")))[0] ?? {})), "清空 target：删键（回落当前主 FBO）");
+    const b1 = S.planBind(F, onePass(), 0, -1, { name: "previous", index: 1 });
+    is(b1.ok && S.bindsOf(S.passesOf(docOf(b1))?.[0]).length === 1, "加 bind：追加一条（名 + 数字槽）");
+    is(S.planBind(F, txt(b1), 0, -1, { name: "previous", index: 1 }).reason === "fx.structBindDup", "同槽重复 bind 被拒（引擎后写覆盖先写）");
+    is(S.planBind(F, onePass(), 0, -1, { name: "有中文", index: 0 }).reason === "fx.structBadBind", "非法 bind 名 / 槽被拒");
+    is(!("bind" in (S.passesOf(docOf(S.planBind(F, txt(b1), 0, 0, null)))[0] ?? {})), "删 bind：删空即删键");
+
+    // ---- ② doc 侧位置同步（scene.json 的 effects[].passes[] 是按位置覆盖）----
+    const obj = () => ({ id: 1, effects: [{ file: F, passes: [{ constantshadervalues: { a: 1 } }, { constantshadervalues: { b: 2 } }] }] });
+    const o1 = obj();
+    is(
+      S.applyDocSync(o1, F, { kind: "insert", at: 1 }) === 1 &&
+        json(o1.effects[0].passes) === json([{ constantshadervalues: { a: 1 } }, { constantshadervalues: { a: 1 } }, { constantshadervalues: { b: 2 } }]),
+      "加 pass：scene.json 覆盖在 at 处插入同形拷贝",
+    );
+    const o2 = obj();
+    S.applyDocSync(o2, F, { kind: "remove", at: 0 });
+    is(json(o2.effects[0].passes) === json([{ constantshadervalues: { b: 2 } }]), "删 pass：覆盖同步删同下标");
+    const o3 = obj();
+    S.applyDocSync(o3, F, { kind: "move", from: 0, to: 1 });
+    is(json(o3.effects[0].passes) === json([{ constantshadervalues: { b: 2 } }, { constantshadervalues: { a: 1 } }]), "移 pass：覆盖跟着换位（否则参数静默错位）");
+    const o4 = { id: 4, effects: [{ file: F }] };
+    is(S.applyDocSync(o4, F, { kind: "insert", at: 0 }) === 0 && o4.effects[0].passes === undefined, "作者没写覆盖时不动文档（凭空造数组会写脏字段）");
+
+    // ---- ③ 准入：只允许工程内 wwgl_ 效果（COMPLIANCE：素材库不改）----
+    is(S.isStructEditable(F, new Set([F])) === true, "工程内 wwgl_ 效果可结构编辑");
+    is(S.isStructEditable(F, new Set()) === false, "库引用效果（文件不在工程资源表）不给结构编辑");
+    is(S.isStructEditable("effects/tint/effect.json", new Set(["effects/tint/effect.json"])) === false, "非编辑器自造的效果不给结构编辑");
+
+    // ---- ④ 叠加层往返 + 保存 → 重开 ----
+    const files0 = { [F]: onePass(), "materials/effects/wwgl_t.json": shaderMat };
+    const src0 = {
+      entry: "scene.json",
+      read: async (n) => (files0[n] !== undefined ? enc.encode(files0[n]) : null),
+      list: () => Object.keys(files0),
+    };
+    const ov = assetsMod.overlayAssets("scene.json", src0, () => new Set([F, "materials/effects/wwgl_t.json"]));
+    const plan = S.planPassAdd(F, onePass(), 0);
+    ov.put(F, enc.encode(txt(plan)), F);
+    const back = dec.decode(await ov.read(F));
+    is(back === txt(plan) && json(Object.keys(S.parseEffectDoc(back))) === json(Object.keys(S.parseEffectDoc(onePass()))), "叠加层里 effect.json 结构与键序稳定");
+    is(ov.list().includes(F), "写过的文件进工程资源表");
+    const saved = {};
+    for (const n of ov.list()) {
+      const b = await ov.read(n);
+      if (b) saved[n] = dec.decode(b);
+    }
+    const reopened = assetsMod.overlayAssets("scene.json", {
+      entry: "scene.json",
+      read: async (n) => (saved[n] !== undefined ? enc.encode(saved[n]) : null),
+      list: () => Object.keys(saved),
+    });
+    is(S.passesOf(S.parseEffectDoc(dec.decode(await reopened.read(F))))?.length === 2, "保存 → 重开：结构编辑的结果仍在（2 个 pass）");
+
+    // ---- ⑤ 失败原因键 / UI 键中英各一条（界面与日志里不出现裸键）----
+    const used = [...new Set(((texts.struct + texts.main).match(/"(?:fx\.struct[A-Za-z]+|log\.fx(?:Pass|Material|Target|Bind)[A-Za-z]+)"/g) || []).map((s) => s.slice(1, -1)))];
+    is(used.length >= 25, `接线用到的结构编辑键都被判据看到（got ${used.length}）`);
+    is(keyBad(texts.i18n, used).length === 0, `i18n 键中英各一条（缺 / 多：${keyBad(texts.i18n, used).join(", ") || "无"}）`);
+
+    // ---- ⑥ main.ts 接线 ----
+    for (const m of wireBad(texts.main)) bad.push(m);
+    return bad;
+  };
+
+  const base = await loadEditorModule("effects-struct");
+  const bad = await corpus(base, texts0);
+  check(bad.length === 0, `FX-STRUCT 判据体全绿（${bad.length} 处失败${bad.length ? "：" + bad.slice(0, 2).join(" / ") : ""}）`);
+  check((await loadEditorModule("effects-struct")).planPassAdd !== undefined, "FX-STRUCT 模块可装载（esbuild 现打包 editor/effects-struct.ts）");
+
+  // ---- 变异红测：把实现改坏 → 判据必须红（先红后绿）----
+  const mutations = [
+    {
+      which: "struct",
+      name: "applyDocSync 的 move 不换位",
+      from: "const [moved] = ov.splice(sync.from, 1);\n      ov.splice(sync.to, 0, moved);",
+      to: "const [moved] = ov.splice(sync.from, 1);\n      ov.splice(sync.from, 0, moved);",
+    },
+    {
+      which: "struct",
+      name: "isStructEditable 去掉「在工程资源表里」的检查",
+      from: "return projectFiles.has(file);",
+      to: "return true;",
+    },
+    { which: "struct", name: "planTarget 不自动补 fbos 声明", from: "if (!fboNamesOf(doc).includes(name)) {", to: "if (false) {" },
+    {
+      which: "struct",
+      name: "planMaterial 不检查材质有没有 shader",
+      from: "if (!shader) return no(\"fx.structBadMaterial\");",
+      to: "if (false) return no(\"fx.structBadMaterial\");",
+    },
+    { which: "main", name: "撤销分支不去查这条命令改过的文件", from: "fxFileJournal.get(cmd)", to: "fxFileJournal.get(cmd.label)" },
+    { which: "i18n", name: "删掉一条英文词条", from: '    "fx.structBadTarget": "FBO name must be a non-empty identifier",\n', to: "" },
+  ];
+  for (const m of mutations) {
+    const mutated = texts0[m.which].replace(m.from, m.to);
+    check(mutated !== texts0[m.which], `变异「${m.name}」确实改动了源码（防变异没生效造成假红）`);
+    const texts = { ...texts0, [m.which]: mutated };
+    const mod = m.which === "struct" ? await loadEditorModule("effects-struct", { [structPath]: mutated }) : base;
+    const bad2 = await corpus(mod, texts);
+    check(bad2.length > 0, `变异「${m.name}」被咬红：${bad2[0] ?? "（没红！）"}`);
+  }
+}
+
+section("TEXT-SCRIPT. 文字脚本属性面板 editor/text-script-props.ts + main.ts 接线（task-7）");
+{
+  const propsPath = path.join(ROOT, "editor/text-script-props.ts");
+  const mainPath = path.join(ROOT, "editor/main.ts");
+  const i18nPath = path.join(ROOT, "editor/i18n.ts");
+  const texts0 = {
+    props: fs.readFileSync(propsPath, "utf8"),
+    main: fs.readFileSync(mainPath, "utf8"),
+    i18n: fs.readFileSync(i18nPath, "utf8"),
+  };
+
+  // 脚本声明 5 种 add*（官方 declarer 全集，见 local-assets/scripts/jsclasses/baseclasses.js:1423-1454）
+  const SCRIPT = [
+    "var p = createScriptProperties();",
+    "p.addSlider({ name: 'speed', value: 2, min: 0, max: 10 });",
+    "p.addCheckbox({ name: 'on', value: true });",
+    "p.addText({ name: 'note', value: 'hi' });",
+    "p.addCombo({ name: 'mode', options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] });",
+    "p.addColor({ name: 'tint', value: '1 1 1' });",
+    "export function update(v) { return v; }",
+  ].join("\n");
+
+  /** 夹具：作者按自己的（大写）拼写写了 SPEED —— 引擎 text.js:994 的 `def.name in spValues` 严格大小写，键名不许被折叠改写 */
+  const sceneObj = () => ({
+    text: {
+      value: "hi",
+      script: SCRIPT,
+      scriptproperties: { SPEED: 3, on: true, note: "y", mode: "b", tint: "0.5 0.5 0.5" },
+    },
+  });
+  const readScript = (ob) => ob.text.script;
+
+  /** i18n 键必须恰好两条（zh + en） */
+  const keyBad = (text, keys) => keys.filter((k) => text.split(`"${k}":`).length - 1 !== 2);
+
+  /**
+   * 颜色写入那一小段源码（main.ts 的 fmtNum + spPropColorTokens + spPropRgb + spColorWrite）
+   * 现打包**真跑**：面板本体碰 DOM 装不进 Node，但这几个是纯函数，而「有损写回」正发生在
+   * spColorWrite —— 只靠 grep 的话 task-10 的「第 4 分量接回」可能只是文本巧合。
+   */
+  const loadColorHelpers = async (mainSrc) => {
+    const cut = (a, b) => {
+      const i = mainSrc.indexOf(a);
+      const j = mainSrc.indexOf(b, i + 1);
+      return i >= 0 && j > i ? mainSrc.slice(i, j) : "";
+    };
+    const fmt = (mainSrc.match(/const fmtNum = \(v: number\) => [^\n]*\n/) || [""])[0];
+    const p = path.join(tmpRoot, `tscolor-${Math.random().toString(36).slice(2)}.ts`);
+    fs.writeFileSync(
+      p,
+      [fmt, cut("function spPropColorTokens", "const spAsBool"), "export { spPropColorTokens, spPropRgb, spColorWrite };"].join("\n"),
+    );
+    const out = await build({
+      entryPoints: [p],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const mjs = p.replace(/\.ts$/, ".mjs");
+    fs.writeFileSync(mjs, out.outputFiles[0].text);
+    return import(pathToFileURL(mjs).href);
+  };
+
+  /** 接线判据（纯文本 → 变异也能咬红） */
+  const wireBad = (src) => {
+    const bad = [];
+    const is = (c, m) => {
+      if (!c) bad.push(m);
+    };
+    const at = (n, from = 0) => src.indexOf(n, from);
+    const impSrc = (src.match(/import\s*\{[\s\S]*?\}\s*from\s*"\.\/text-script-props";/) || [""])[0];
+    is(
+      ["addableTextScriptProps", "declaredTextScriptProps", "removeTextScriptProp", "setTextScriptProp", "textScriptPropRows"].every(
+        (n) => new RegExp(`\\b${n}\\b`).test(impSrc),
+      ),
+      "接线：main.ts 从数据层 import 全部入口（界面不是第二份实现）",
+    );
+    const fn = at("function textScriptSection(node: LayerNode, editable: boolean)");
+    is(fn > 0, "接线：面板函数 textScriptSection(node, editable) 存在");
+    const call = at("const scriptSec = textScriptSection(node, editable);");
+    is(call > fn && at("group.appendChild(form);") < call, "接线：面板挂在文字层检视器（文字表单之后），走同一条 inspector 路径");
+    is(
+      at("textScriptPropRows(o, textScriptOf)") > fn && at("addableTextScriptProps(o, textScriptOf)") > fn,
+      "接线：行 / 可添加键都来自数据层（界面只做控件与撤销记账）",
+    );
+    const panel = src.slice(fn, at("function textGroup("));
+    is(
+      /void textEdit\(node, key, \[font\], \(ob\) => setTextScriptProp\(ob, key, v\)\)/.test(panel),
+      "接线：改值走 textEdit（text 通道）→ 一条动作 = 一步撤销（同 A13 numRow）",
+    );
+    is(
+      /objEdit\(et\("log\.scriptPropAdded"/.test(panel) && /objEdit\(et\("log\.scriptPropRemoved"/.test(panel),
+      "接线：添加 / 删除各一条 objEdit（不在面板里直接改字节）",
+    );
+    is(/cell\.dataset\.kind = r\.kind;/.test(panel), "接线：DOM 标出控件类型（判据 / 样式都能分流）");
+    is(
+      /inp\.type = "checkbox"/.test(panel) &&
+        /inp\.type = "number"/.test(panel) &&
+        /inp\.type = "color"/.test(panel) &&
+        /document\.createElement\("select"\)/.test(panel) &&
+        /inp\.type = "text"/.test(panel),
+      "接线：bool / number / color / combo / string 各按类型给控件",
+    );
+    is(
+      /spPropRgb\(r\.value\)/.test(panel) && /inp\.disabled = true;/.test(panel),
+      "接线：颜色值不是引擎认得的 3 / 4 个分量 → 只读（不把作者原值改写成 hex）",
+    );
+    is(
+      /spColorWrite\(tokens \?\? \[\], \[cr, cg, cb\]\)/.test(panel) && /\.\.\.tokens\.slice\(3\)\]/.test(src),
+      "接线：颜色写回走 spColorWrite，第 4 个分量逐字接回（task-10，不丢作者数据）",
+    );
+    is(/inp\.readOnly = true;/.test(panel), "接线：kind unknown 只读展示（不猜形状写回）");
+    is(/el\.disabled = el\.disabled \|\| !editable;/.test(panel), "接线：不可编辑时控件一并禁用（一个门全封）");
+    is(
+      /spTag\("tx\.scriptprop\.declared"/.test(panel) &&
+        /spTag\("tx\.scriptprop\.undeclared"/.test(panel) &&
+        /spTag\("tx\.scriptprop\.wrapped"\)/.test(panel),
+      "接线：标注「脚本有默认值 / 引擎会读但脚本未声明 / 绑定用户属性」三种状态",
+    );
+    is(/edit\(r\.key,/.test(panel) && /setTextScriptProp\(ob, key, v\)/.test(panel), "接线：写入用作者原键名 r.key（大小写折叠只发生在数据层）");
+    return bad;
+  };
+
+  /** 判据体：返回失败清单（空 = 全绿）；变异红测复用它 */
+  const corpus = async (S, texts) => {
+    const bad = [];
+    const is = (c, m) => {
+      if (!c) bad.push(m);
+    };
+
+    // ---- ① 行 = 文档里真有的键：作者原拼写 + 文档序 + 声明决定的类型 ----
+    const o1 = sceneObj();
+    const rows = S.textScriptPropRows(o1, readScript);
+    is(json(rows.map((r) => r.key)) === json(["SPEED", "on", "note", "mode", "tint"]), `行按作者原拼写与文档序（got ${rows.map((r) => r.key).join(",")}）`);
+    is(json(rows.map((r) => r.kind)) === json(["number", "bool", "string", "combo", "color"]), `kind 由脚本声明决定（got ${rows.map((r) => r.kind).join(",")}）`);
+    is(rows.every((r) => r.declared) && rows[0]?.hasDefault === true, "SPEED ↔ addSlider('speed') 大小写不敏感命中声明；声明带默认值");
+    is(json(rows[3]?.options?.map((o) => o.value)) === json(["a", "b"]), "combo 行带声明里的选项表（面板据此给下拉，不猜枚举）");
+
+    // ---- ② 写入命中原键，绝不新建小写重复键（text.js:994 严格 `in`）----
+    const o2 = sceneObj();
+    is(
+      S.setTextScriptProp(o2, "speed", 7) === true &&
+        json(Object.keys(o2.text.scriptproperties)) === json(["SPEED", "on", "note", "mode", "tint"]) &&
+        o2.text.scriptproperties.SPEED === 7,
+      "写 speed → 命中作者的 SPEED（不新建小写重复键：引擎按严格 `in` 绑定）",
+    );
+    is(S.setTextScriptProp(o2, "speed", 7) === false, "值没变 → false（不记空撤销步）");
+    is(S.setTextScriptProp(o2, "SPEED", 8) === true && o2.text.scriptproperties.SPEED === 8, "换大小写再写同一条键仍然同一条");
+
+    // ---- ③ 包装只改 .value，作者其它键原样（text.js:808 / 901-925）----
+    const o3 = sceneObj();
+    o3.text.scriptproperties.tint = { user: "tintuser", value: "0.5 0.5 0.5", extra: 1 };
+    is(
+      S.setTextScriptProp(o3, "tint", "1 0 0") === true &&
+        o3.text.scriptproperties.tint.user === "tintuser" &&
+        o3.text.scriptproperties.tint.extra === 1 &&
+        o3.text.scriptproperties.tint.value === "1 0 0",
+      "包装值只改 .value，user 绑定与作者其它键原样保留",
+    );
+    is(S.setTextScriptProp(o3, "tint", S.readTextScriptProp(o3, "tint")) === false, "set(k, read(k)) 恒为 no-op（面板重复提交不产生空撤销步）");
+    const r3 = S.textScriptPropRows(o3, readScript).find((r) => r.key === "tint");
+    is(r3.wrapped === true && r3.value === "1 0 0", "行标出 wrapped，且 value 是引擎可见值（不是包装对象）");
+
+    // ---- ④ 删 / 加：不谎报、不删作者数据（规则④）----
+    const o4 = sceneObj();
+    is(S.removeTextScriptProp(o4, "ghost") === false && Object.keys(o4.text.scriptproperties).length === 5, "删不存在的键 → false 且一个键都不少");
+    is(S.removeTextScriptProp(o4, "nOtE") === true && !("note" in o4.text.scriptproperties) && Object.keys(o4.text.scriptproperties).length === 4, "删 note（换大小写）只删作者那一条键");
+    const addable = S.addableTextScriptProps(o4, readScript);
+    is(json(addable) === json(["note"]), `可加键 = 声明过但作者没写的（got ${addable.join(",")}）`);
+    is(S.setTextScriptProp(o4, addable[0], "") === true && o4.text.scriptproperties.note === "", "按声明的键名新建（新建用声明拼写，供引擎精确绑定）");
+
+    // ---- ⑤ 未声明键：引擎照读（parse.js:493 遍历整表），界面标「未声明」而不改写 ----
+    const o5 = sceneObj();
+    o5.text.scriptproperties.legacy = 1;
+    const r5 = S.textScriptPropRows(o5, readScript).find((r) => r.key === "legacy");
+    is(r5.declared === false && r5.hasDefault === false && r5.kind === "number", "作者手写但脚本没声明的键：declared=false（界面标注「引擎会读但脚本未声明」），kind 按值判");
+    is(S.addableTextScriptProps({ text: { value: "x", scriptproperties: { a: 1 } } }, () => null).length === 0, "没有脚本 → 没有可添加键（不凭空造键名）");
+
+    // ---- ⑥ main.ts 接线 + i18n 成对 ----
+    for (const m of wireBad(texts.main)) bad.push(m);
+    const used = [...new Set((texts.main.match(/"(?:tx\.scriptprops|tx\.scriptprop[A-Za-z.]*|log\.scriptProp(?:Added|Removed))"/g) || []).map((s) => s.slice(1, -1)))];
+    is(used.length >= 12, `接线用到的脚本属性键都被判据看到（got ${used.length}）`);
+    is(keyBad(texts.i18n, used).length === 0, `i18n 键中英各一条（缺 / 多：${keyBad(texts.i18n, used).join(", ") || "无"}）`);
+
+    // ---- ⑦ color 写回：第 4 分量逐字保留 / 2 分量不给控件接管（task-10，真跑切片）----
+    const C = await loadColorHelpers(texts.main);
+    const t4 = C.spPropColorTokens("0.2 0.4 0.8 0.500");
+    is(json(t4) === json(["0.2", "0.4", "0.8", "0.500"]), `分量 token 原样取出（got ${json(t4)}）`);
+    is(
+      C.spColorWrite(t4, [1, 0, 0]) === "1 0 0 0.500",
+      `hex 改红后第 4 分量逐字保留、原小数位不被格式化（got ${C.spColorWrite(t4, [1, 0, 0])}）`,
+    );
+    is(
+      C.spColorWrite(C.spPropColorTokens("0.2,0.4,0.8,0.5"), [0.5, 0.25, 0]) === "0.5 0.25 0 0.5",
+      "逗号分隔的作者值也认（引擎两者都收），写回统一空格、保留分量照抄",
+    );
+    is(
+      C.spPropRgb("0.2 0.4") === null && C.spPropRgb("0.2 0.4 0.8") !== null && C.spPropRgb("1 2 3 4 5") === null && C.spPropRgb("x y z") === null,
+      "2 分量 / 超 4 分量 / 非数 → 不给控件接管（2 分量的语义归脚本，编辑器不猜）",
+    );
+    return bad;
+  };
+
+  const base = await loadEditorModule("text-script-props");
+  const bad = await corpus(base, texts0);
+  check(bad.length === 0, `TEXT-SCRIPT 判据体全绿（${bad.length} 处失败${bad.length ? "：" + bad.slice(0, 2).join(" / ") : ""}）`);
+  check((await loadEditorModule("text-script-props")).textScriptPropRows !== undefined, "TEXT-SCRIPT 模块可装载（esbuild 现打包 editor/text-script-props.ts）");
+
+  // ---- 变异红测：把实现 / 接线改坏 → 判据必须红（先红后绿）----
+  const mutations = [
+    {
+      which: "main",
+      name: "检视器不再按 editable 禁用控件",
+      from: "    el.disabled = el.disabled || !editable;\n",
+      to: "",
+    },
+    {
+      which: "main",
+      name: "改值绕开 textEdit（不再是一步撤销）",
+      from: "void textEdit(node, key, [font], (ob) => setTextScriptProp(ob, key, v));",
+      to: 'void objEdit(et("tx.scriptprop.hint"), node.id, (ob) => setTextScriptProp(ob, key, v));',
+    },
+    {
+      which: "main",
+      name: "去掉「引擎会读但脚本未声明」标注",
+      from: '    else if (!r.declared) cell.appendChild(spTag("tx.scriptprop.undeclared", et("tx.scriptprop.hint")));\n',
+      to: "",
+    },
+    { which: "i18n", name: "删掉一条中文词条", from: '    "tx.scriptprop.undeclared": "引擎会读但脚本未声明",\n', to: "" },
+    {
+      which: "props",
+      name: "键名匹配改成大小写敏感（新建重复键）",
+      from: "  const want = key.toLowerCase();",
+      to: "  const want = key;",
+    },
+    {
+      which: "main",
+      name: "颜色写回丢掉尾部非 RGB 分量",
+      from: "...tokens.slice(3)].join(\" \");",
+      to: "].join(\" \");",
+      // 必须由**真跑切片**的那条咬红（只被文本接线判据咬红还不够 —— 那可能只是字符串巧合）
+      expect: /第 4 分量逐字保留/,
+    },
+  ];
+  for (const m of mutations) {
+    const mutated = texts0[m.which].replace(m.from, m.to);
+    check(mutated !== texts0[m.which], `变异「${m.name}」确实改动了源码（防变异没生效造成假红）`);
+    const texts = { ...texts0, [m.which]: mutated };
+    const mod = m.which === "props" ? await loadEditorModule("text-script-props", { [propsPath]: mutated }) : base;
+    const bad2 = await corpus(mod, texts);
+    check(bad2.length > 0, `变异「${m.name}」被咬红：${bad2[0] ?? "（没红！）"}`);
+    if (m.expect) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红（${m.expect}）`);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+section("MODEL-UI. 模型线 UI 接线：新建片段自动挂层 / 片段拖拽 / 静止姿势 / W16 原图尺寸（task-12）");
+{
+  const mainPath = path.join(ROOT, "editor/main.ts");
+  const i18nPath = path.join(ROOT, "editor/i18n.ts");
+  const mdlEditSrc = fs.readFileSync(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"), "utf8");
+  const texts0 = { main: fs.readFileSync(mainPath, "utf8"), i18n: fs.readFileSync(i18nPath, "utf8") };
+
+  /**
+   * 真跑切片：main.ts 里 task-12 的三个纯 helper 与**真实数据层** mdlRestPose 一起打成临时模块再跑
+   * （不在脚本里抄第二份口径）。锚点取 clipDragAllowed..commitMdlEdit 之间那段连续区块；
+   * 锚点缺失 ⇒ 响亮抛错（不许静默跳过，否则判据会假装绿）。
+   */
+  const loadModelHelpers = async (mainSrc) => {
+    const i = mainSrc.indexOf("export function clipDragAllowed");
+    const j = mainSrc.indexOf("async function commitMdlEdit(");
+    if (i < 0 || j <= i) throw new Error("main.ts 找不到 clipDragAllowed..commitMdlEdit 区间（锚点变了，本判据要同步改）");
+    const body = mainSrc.slice(i, j).replace(/^export /gm, "");
+    const ENTRY = [
+      'import { mdlRestPose } from "./renderer/src/editor/mdl-edit";',
+      body,
+      "export { clipDragAllowed, restPoseWritable, texSizeDiffers };",
+    ].join("\n");
+    const out = await build({
+      stdin: { contents: ENTRY, resolveDir: ROOT, loader: "ts" },
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const p = path.join(tmpRoot, `model-ui-${Math.random().toString(36).slice(2)}.mjs`);
+    fs.writeFileSync(p, out.outputFiles[0].text);
+    return import(pathToFileURL(p).href);
+  };
+
+  // 真实模型字节（素材库 scene.pkg 里的 .mdl）：UI 的禁用口径必须由真数据层在真字节上背书
+  const realMdls = [];
+  if (fs.existsSync(LIB)) {
+    for (const it of fs.readdirSync(LIB)) {
+      if (realMdls.length >= 24) break;
+      const pp = path.join(LIB, it, "scene.pkg");
+      if (!fs.existsSync(pp)) continue;
+      try {
+        const pk = pkgC.parsePkg(fs.readFileSync(pp));
+        const nm = pk.entries.map((e) => e.name).find((n) => /\.mdl$/i.test(n));
+        if (!nm) continue;
+        const b = pkgC.getEntry(pk, nm);
+        if (b && b.length) realMdls.push({ item: it, name: nm, bytes: b });
+      } catch {
+        /* 解析不了的包跳过 */
+      }
+    }
+  }
+
+  const corpus = async (mod, texts) => {
+    const bad = [];
+    const is = (c, m) => {
+      if (!c) bad.push(m);
+    };
+    const main = texts.main;
+    const i18n = texts.i18n;
+    const win = (anchor, span) => {
+      const i = main.indexOf(anchor);
+      return i < 0 ? "" : main.slice(i, i + span);
+    };
+    const once = (s) => main.split(s).length - 1;
+
+    // ── 数据层读点（task-8 冻结）：UI 只是接线，口径必须与数据层同源 ──
+    is(
+      /export function moveMdlClip\(bytes: Uint8Array, from: number, to: number\): Uint8Array \| null/.test(mdlEditSrc),
+      "读点：renderer/src/editor/mdl-edit.ts:333 moveMdlClip 签名未变",
+    );
+    is(
+      /if \(from === 0 \|\| to === 0\) return null;/.test(mdlEditSrc),
+      "读点：moveMdlClip 拒绝跨 0 号位（0 号是引擎的姿势参考）",
+    );
+    is(
+      /export function mdlRestPose\(bytes: Uint8Array, boneIndex: number\): Float32Array \| null/.test(mdlEditSrc) &&
+        /export function setMdlRestPose\(bytes: Uint8Array, boneIndex: number, matrix: ArrayLike<number>\): Uint8Array \| null/.test(mdlEditSrc),
+      "读点：mdl-edit.ts:917 mdlRestPose / :931 setMdlRestPose 签名未变",
+    );
+
+    // ── ① 新建片段自动挂动画层（一步撤销）──
+    const addWin = win("ed-btn ed-cl-add", 3000);
+    is(addWin.includes('addMdlClip(b, init, "rest", c0.id)'), "①新建片段仍走数据层 addMdlClip（不自己拼 .mdl）");
+    is(addWin.includes("addedClipId = r?.id ?? null"), "①新片段 id 从 edit() 闭包交给 mutate()（commitMdlEdit 的 edit 先于 mutate）");
+    is(
+      addWin.includes("getAnimLayers(o).length") && addWin.includes("addAnimLayer(doc, o, addedClipId, init.name)"),
+      "①新建片段挂动画层（editor/model.ts:135 addAnimLayer；层表判定同 addClipWithLayer）",
+    );
+    is(addWin.includes('setAnimLayerField(o, idx, "visible", false)'), "①挂上的层 visible:false（=「未启用」，不会覆盖片段姿势）");
+    is(addWin.includes('et("cl.noLayerTable"'), "①没有动画层表时给原因文案（不许静默）");
+    is((addWin.match(/commitMdlEdit\(/g) || []).length === 1, "①片段 + 动画层是同一步（一处 commitMdlEdit = 一步撤销）");
+
+    // ── ①b 未启用标注 + 一键启用 ──
+    const offWin = win('"ed-tag ed-tag-dim ed-al-off"', 1500);
+    is(offWin.includes('et("al.off")') && offWin.includes("offTag.hidden = v.visible"), "①新建挂上的层显式标注「未启用」（v.visible 驱动）");
+    is(
+      offWin.includes('setAnimLayerField(o, v.index, "visible", true)') && offWin.includes('et("al.enable")'),
+      "①一键启用真写 visible=true（同一步撤销），代价写进 title",
+    );
+
+    // ── ② 片段拖拽排序 ──
+    const dragWin = win("item.draggable", 2400);
+    is(
+      dragWin.includes('"dragstart"') && dragWin.includes('"dragover"') && dragWin.includes('"drop"'),
+      "②片段行可拖拽（dragstart / dragover / drop 三件套齐全）",
+    );
+    is(dragWin.includes("clipDragAllowed(clips.length, from, ci)"), "②落点判定复用 clipDragAllowed（与数据层 moveMdlClip 同口径）");
+    is(dragWin.includes("moveMdlClip(b, from, ci)"), "②落点真调数据层 moveMdlClip（一步撤销）");
+    is(dragWin.includes('et(ci === 0 ? "cl.moveFirst" : "cl.moveSingle")'), "②跨 0 号位 / 无效拖动先给原因再不动文档（不许静默）");
+    is(
+      main.includes('if (clips.length < 3) group.appendChild(note(et("cl.moveSingle")));'),
+      "②2 个片段的模型在分组里挂出「都无法移动」的原因（数据层只允许 ≥3 片段时移动）",
+    );
+    is(once("moveMdlClip(b, from, ci)") === 1, "②只有一处 moveMdlClip 调用（没有第二份拖拽实现）");
+
+    // ── ③ 设为静止姿势 ──
+    const restWin = win("ed-btn ed-bn-rest", 2200);
+    is(restWin.includes("restPoseWritable(b, pick.bone)"), "③可用性由数据层 mdlRestPose 预检（返回 null ⇒ 禁用 + 原因）");
+    is(
+      restWin.includes("mdlRestPose(b, pick.bone)") && restWin.includes("setMdlRestPose(b, pick.bone, m)"),
+      "③写静止姿势走 setMdlRestPose（先用 mdlRestPose 读回再写）",
+    );
+    is(restWin.includes('et("bn.restOff")') && restWin.includes("rest.disabled = true"), "③静止姿势默认禁用 + 原因文案（探测失败也不静默）");
+    is((restWin.match(/commitMdlEdit\(/g) || []).length === 1, "③静止姿势是一步撤销（一处 commitMdlEdit）");
+
+    // ── ④ W16 原图尺寸（只是文案，不改采样）──
+    const sizeWin = win('"ed-mt-size"', 1600);
+    is(
+      sizeWin.includes("originalTexSize(node, s.index)") && sizeWin.includes('et("mt.origSize"') && sizeWin.includes('et("mt.origNone"'),
+      "④W16 每个槽显示原图尺寸（读不到显示「未知」，不猜）",
+    );
+    is(
+      main.includes("const file = assets.list().find((p) => p === name || p.startsWith(`${name}.`));"),
+      "④原图路径靠 overlay 资源表同名解析（材质里只有贴图名，扩展名不猜）",
+    );
+    const onchangeWin = win("inModelTexEl.onchange", 1300);
+    is(
+      onchangeWin.includes("texSizeDiffers(orig, img.width, img.height)") && onchangeWin.includes('et("mt.sizeDiffers"'),
+      "④W16 新图与原图尺寸不同时给提示文案",
+    );
+    is(
+      onchangeWin.includes("await replaceModelTexture(pick.layer, pick.mesh, img)"),
+      "④W16 尺寸不同只提示，换图照旧（不拦、不改采样代码 —— 需求写的就是「只是文案」）",
+    );
+    // 文案必须写引擎真实后果（readpoint renderer/src/scene-mount.ts:3259-3277：autosize && layer.size 有 0 分量
+    // ⇒ 用模型单帧尺寸改写 layer.size），不能写「材质 UV 拉伸」这种没在引擎里发生的说法。
+    const zhSize = (i18n.match(/"mt\.sizeDiffers": "([^"]*)"/) || [])[1] ?? "";
+    is(
+      zhSize.includes("autosize") && zhSize.includes("世界尺寸") && zhSize.includes("同尺寸同布局"),
+      "④W16 提示文案写的是引擎真实后果（autosize + 世界尺寸没写死 ⇒ 按新图单帧尺寸；要保原尺寸用同尺寸同布局图）",
+    );
+    // ①的 layerSkip 文案要写出「为什么不能挂」的引擎后果（render/mdl-skin.js:293 / :314 的 animations[0] 回退）
+    const zhNoLayer = (i18n.match(/"cl\.noLayerTable": "([^"]*)"/) || [])[1] ?? "";
+    is(
+      zhNoLayer.includes("动画层表") && zhNoLayer.includes("第 0 条动画"),
+      "①没有动画层表时给的是「已只加片段 + 挂层会顶掉引擎默认第 0 条动画」的后果，不是空泛失败文案",
+    );
+
+    // ── ⑤ 本轮明确没做的部分：片段事件仍然只有文本编辑 ──
+    is(main.includes("(b) => setMdlClipEvents(b, c.id, list)"), "⑤片段事件仍走数据层 setMdlClipEvents（文本编辑路径不回退）");
+    is(main.includes('row("cl.events", ev);'), "⑤片段事件行仍是文本输入（时间轴拖拽本轮没做）");
+    is(!/ed-cl-timeline|ed-events-timeline/.test(main), "⑤没有偷偷塞第二个事件编辑表面（假时间轴会让判据以为做了）");
+
+    // ── ⑥ i18n：每个新键 zh/en 各恰好一条 ──
+    const keyRe = /"(?:al\.(?:off|enable)|bn\.rest(?:Pose|Off|Probing)|cl\.(?:drag|moveFirst|moveSingle|noLayerTable)|log\.(?:boneRestPose|clipMoved)|mt\.(?:origSize|origNone|origProbing|sizeDiffers))"/g;
+    const keys = [...new Set((main.match(keyRe) || []).map((s) => s.slice(1, -1)))];
+    is(keys.length >= 15, `⑥本轮新增 UI 文案键都被判据看到（got ${keys.length}，期望 ≥15）`);
+    const badKeys = keys.filter((k) => i18n.split(`"${k}":`).length - 1 !== 2);
+    is(badKeys.length === 0, `⑥i18n 每条 zh/en 各恰好一条（缺/重：${badKeys.join(", ") || "无"}）`);
+
+    // ── ⑦ A13 切片锚点不撞名（task-12 的 ed-mt-size 曾把 A13 判据切歪）──
+    is(
+      once("const size = document.createElement") === 1 && once("const pad = document.createElement") === 1,
+      "A13 切片锚点不撞名：main.ts 里 `const size / const pad = document.createElement` 各只有 1 处（再插同名局部变量会先在这里红）",
+    );
+
+    // ── ⑧ 真跑切片：三条口径与数据层同源 ──
+    is(
+      mod.clipDragAllowed(2, 1, 0) === false && mod.clipDragAllowed(2, 0, 1) === false,
+      "②拖拽口径（真跑切片）：2 个片段时任何移动都不合法",
+    );
+    is(
+      mod.clipDragAllowed(3, 0, 1) === false && mod.clipDragAllowed(3, 1, 0) === false && mod.clipDragAllowed(3, 1, 1) === false,
+      "②拖拽口径（真跑切片）：0 号位不可作来源、不可作落点、原地不动都拒绝",
+    );
+    is(
+      mod.clipDragAllowed(3, 1, 2) === true && mod.clipDragAllowed(3, 2, 1) === true,
+      "②拖拽口径（真跑切片）：≥3 片段时 1↔2 是合法移动",
+    );
+    is(
+      mod.restPoseWritable(new Uint8Array([1, 2, 3, 4]), 0) === false && mod.restPoseWritable(null, 0) === false,
+      "③静止姿势（真跑切片）：字节读不成结构 / 没有字节 ⇒ 不可写",
+    );
+    is(
+      mod.texSizeDiffers(null, 8, 8) === false &&
+        mod.texSizeDiffers([4, 4], 4, 4) === false &&
+        mod.texSizeDiffers([4, 4], 8, 4) === true &&
+        mod.texSizeDiffers([4, 4], 4, 8) === true,
+      "④尺寸比较（真跑切片）：未知不算不同；宽或高任一不同就算不同",
+    );
+
+    // ── ⑨ 真实模型：数据层同源（真跑真字节）──
+    if (realMdls.length) {
+      const { moveMdlClip, mdlRestPose } = await imp("renderer/src/editor/mdl-edit.ts");
+      const sample = realMdls.slice(0, 20);
+      let zeroOk = 0;
+      let restSame = 0;
+      let restNull = 0;
+      for (const m of sample) {
+        if (moveMdlClip(m.bytes, 0, 1) === null && moveMdlClip(m.bytes, 1, 0) === null) zeroOk++;
+        const r = mdlRestPose(m.bytes, 0);
+        if (mod.restPoseWritable(m.bytes, 0) === (r !== null)) restSame++;
+        if (r === null) restNull++;
+      }
+      is(zeroOk === sample.length, `②数据层同源（真跑 ${sample.length} 个真实 .mdl）：0 号位移动一律被数据层拒绝（${zeroOk}/${sample.length}）`);
+      is(
+        restSame === sample.length,
+        `③数据层同源（真跑 ${sample.length} 个真实 .mdl）：restPoseWritable 与 mdlRestPose 完全一致（可写 ${sample.length - restNull} / 不可写 ${restNull}）`,
+      );
+    } else {
+      is(true, "（素材库不可用：真实模型交叉验证跳过，源码与真跑切片判据照跑）");
+    }
+    return bad;
+  };
+
+  let base = null;
+  try {
+    base = await loadModelHelpers(texts0.main);
+  } catch (e) {
+    check(false, `MODEL-UI 真跑切片装载失败（锚点/打包问题）：${String(e && e.message).slice(0, 200)}`);
+  }
+  if (base) {
+    check(
+      base.clipDragAllowed !== undefined && base.restPoseWritable !== undefined && base.texSizeDiffers !== undefined,
+      "MODEL-UI 三个纯 helper 可装载（真跑切片入口）",
+    );
+    const bad0 = await corpus(base, texts0);
+    for (const m of bad0) console.error(`    · ${m}`);
+    check(bad0.length === 0, `MODEL-UI 判据体全绿（${bad0.length} 处失败）`);
+  }
+
+  // 每个「做了」的项至少一条变异红测；三条真跑切片的变异必须由切片判据自己咬红（不是靠源码正则）
+  const mutations = [
+    {
+      which: "main",
+      name: "槽尺寸变量改名回 size（撞 A13 切片锚点）",
+      from: 'const sizeTag = document.createElement("span");',
+      to: 'const size = document.createElement("span");',
+      expect: /A13 切片锚点不撞名/,
+    },
+    {
+      which: "main",
+      name: "新建片段不再挂动画层（只留 visible 设置）",
+      from: '      if (idx !== null) setAnimLayerField(o, idx, "visible", false);\n',
+      to: "",
+      expect: /①挂上的层 visible:false/,
+    },
+    {
+      which: "main",
+      name: "未启用标注去掉文案",
+      from: '    offTag.textContent = et("al.off");\n',
+      to: "",
+      expect: /①新建挂上的层显式标注「未启用」/,
+    },
+    {
+      which: "main",
+      name: "2 片段模型不再给「都无法移动」的原因",
+      from: '  if (clips.length < 3) group.appendChild(note(et("cl.moveSingle")));\n',
+      to: "",
+      expect: /②2 个片段的模型在分组里挂出/,
+    },
+    {
+      which: "main",
+      name: "静止姿势绕开数据层预检（恒可用）",
+      from: "    const ok = restPoseWritable(b, pick.bone);\n",
+      to: "    const ok = true;\n",
+      expect: /③可用性由数据层 mdlRestPose 预检/,
+    },
+    {
+      which: "main",
+      name: "W16 尺寸不同不再提示",
+      from: "  if (texSizeDiffers(orig, img.width, img.height)) {\n",
+      to: "  if (false) {\n",
+      expect: /④W16 新图与原图尺寸不同时给提示文案/,
+    },
+    {
+      which: "main",
+      name: "片段事件绕开数据层 setMdlClipEvents",
+      from: "(b) => setMdlClipEvents(b, c.id, list)",
+      to: "(b) => b",
+      expect: /⑤片段事件仍走数据层 setMdlClipEvents/,
+    },
+    {
+      which: "main",
+      name: "偷偷塞一个假的时间轴 class（假装做了事件拖拽）",
+      from: '    row("cl.events", ev);\n',
+      to: '    row("cl.events", ev);\n    item.classList.add("ed-cl-timeline");\n',
+      expect: /⑤没有偷偷塞第二个事件编辑表面/,
+    },
+    {
+      which: "main",
+      name: "拖拽口径改成允许 0 号位（真跑切片）",
+      from: "  return clipCount >= 3 && from > 0 && to > 0 && from !== to && from < clipCount && to < clipCount;",
+      to: "  return clipCount >= 3 && from >= 0 && to >= 0 && from !== to && from < clipCount && to < clipCount;",
+      expect: /②拖拽口径（真跑切片）/,
+    },
+    {
+      which: "main",
+      name: "静止姿势不再真读结构（真跑切片）",
+      from: "  return !!bytes && mdlRestPose(bytes, bone) !== null;",
+      to: "  return !!bytes;",
+      expect: /③静止姿势（真跑切片）/,
+    },
+    {
+      which: "main",
+      name: "尺寸比较改成「宽高都不同才算不同」（真跑切片）",
+      from: "  return !!orig && (orig[0] !== w || orig[1] !== h);",
+      to: "  return !!orig && (orig[0] !== w && orig[1] !== h);",
+      expect: /④尺寸比较（真跑切片）/,
+    },
+    {
+      which: "i18n",
+      name: "删一条中文词条（al.enable）",
+      from: '    "al.enable": "启用该动画层（会顶掉该片段当前覆盖的骨骼姿势）",\n',
+      to: "",
+      expect: /⑥i18n 每条 zh\/en 各恰好一条/,
+      rebuild: false,
+    },
+  ];
+  for (const m of mutations) {
+    const before = texts0[m.which];
+    const after = before.replace(m.from, m.to);
+    check(after !== before, `变异「${m.name}」确实改动了源码（${m.which}）`);
+    if (after === before) continue;
+    const texts = { ...texts0, [m.which]: after };
+    let bad2 = [];
+    try {
+      const mod2 = m.rebuild === false ? base : await loadModelHelpers(texts.main);
+      bad2 = await corpus(mod2, texts);
+    } catch (e) {
+      check(false, `变异「${m.name}」求值失败：${String(e && e.message).slice(0, 140)}`);
+      continue;
+    }
+    check(bad2.length > 0, `变异「${m.name}」被咬红：${bad2[0] ?? "（没红！）"}`);
+    if (m.expect) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红`);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FX-CACHE. 换工程整体作废「按工程内相对路径做键」的解析缓存（+ 工程字节优先、库文本回落）
+// ───────────────────────────────────────────────────────────────────────────
+/** 从 `start` 标记处切到函数体结束（同级下一个列 0 的 `}`）；找不到返回 null */
+function srcFnSlice(src, start) {
+  const i = src.indexOf(start);
+  if (i < 0) return null;
+  const end = src.indexOf("\n}", i);
+  return end < 0 ? null : src.slice(i, end);
+}
+/**
+ * 判据：**换工程**（`openWith` 里换 overlay/doc 那处）必须整体作废「按工程内相对路径做键、从
+ * 叠加层字节派生」的缓存，而且**只**在那个唯一边界清 —— 渲染路径里清会让参数表 / 结构控件
+ * 每帧回到「读取中」而闪烁。同时：读效果文件时**工程自己的字节优先**、库文本只作回落（宿主把
+ * 本机壁纸库按同一个「工程内相对路径」做键：`effects/<dir>/effect.json` ⇒ 库优先时库里的旧文本
+ * 会顶掉工程自己的新字节，真机终轮 AR 段 `0:1[params:0]` 就是这么来的）。
+ * 返回失败清单（空数组 = 通过）。真机回归见 AR 段第 15 步（确定性 A→B）。
+ */
+function fxCacheWireBad(src) {
+  const bad = [];
+  const openWith = srcFnSlice(src, "async function openWith(");
+  const helper = srcFnSlice(src, "function forgetDerivedOverlayCaches(");
+  const load = srcFnSlice(src, "function loadExternalParams(file: string): void");
+  if (!openWith || !helper || !load) {
+    return ["锚点失效：切不出 openWith / forgetDerivedOverlayCaches / loadExternalParams 的函数切片（改名了？）"];
+  }
+  const call = `forgetDerivedOverlayCaches${"();"}`;
+  const ov = openWith.indexOf("overlay =");
+  const at = openWith.indexOf(call);
+  if (ov < 0) bad.push("openWith 里找不到 overlay = 赋值（切换边界锚点失效）");
+  if (at < 0) bad.push("工程切换边界（openWith）没有作废派生缓存");
+  else if (ov >= 0 && at < ov) bad.push("作废派生缓存排在 overlay = 之前（作废的是还没换掉的旧叠加层）");
+  const times = src.split(call).length - 1;
+  if (times !== 1) bad.push(`${call} 出现 ${times} 次：只允许工程切换边界那一处（渲染路径里清会让面板每帧闪「读取中」）`);
+  for (const m of ["externalParams.clear()", "externalPasses.clear()", "fxTexts.clear()", "particleFileText.clear()"]) {
+    if (!helper.includes(m)) bad.push(`作废时漏了 ${m}`);
+  }
+  for (const m of ["fxTextWait.clear()", "particleFiles.clear()", "particlePending.clear()"]) {
+    if (!helper.includes(m)) bad.push(`作废时漏了等待态 / 终态 ${m}`);
+  }
+  if (!helper.includes("derivedCacheGen++")) bad.push("作废没换代次：正在读的那次会把上一个工程的字节写进新工程缓存");
+  if (!load.includes("if (externalPasses.has(file)) return;")) {
+    bad.push("loadExternalParams 的 early-return 没了（缓存等于被禁掉，面板每帧重读）");
+  }
+  const cbFrom = load.indexOf("inspectEffectPasses(file, async (name)");
+  const cbTo = load.indexOf(".catch(() => [] as InlinePassParams[])");
+  const cb = cbFrom >= 0 && cbTo > cbFrom ? load.slice(cbFrom, cbTo) : "";
+  const own = cb.indexOf("assets.read(name)");
+  const lib = cb.indexOf("fxLibraryFiles.get(name)");
+  if (own < 0 || lib < 0) bad.push("读回调里找不到 assets.read(name) / fxLibraryFiles.get(name)（回落链断了）");
+  else if (own > lib) bad.push("读回调先看库文本、后看工程字节：库内同路径会顶掉工程自己的新字节");
+  if (!load.includes("if (gen !== derivedCacheGen) return;")) {
+    bad.push("loadExternalParams 没做代次校验：换工程时正在读的那次会把旧工程的字节写进新缓存");
+  }
+  return bad;
+}
+
+section("FX-CACHE. 换工程作废按路径做键的解析缓存（+ 工程字节优先、库文本回落）");
+{
+  const fxBase = mainSrcText;
+  const fxBad0 = fxCacheWireBad(fxBase);
+  check(
+    fxBad0.length === 0,
+    `接线守卫：换工程的唯一边界整体作废派生缓存 + 读效果文件时工程字节优先${
+      fxBad0.length ? `（${fxBad0.length} 处失败：${fxBad0.slice(0, 3).join(" / ")}）` : ""
+    }`,
+  );
+  // 变异红测：每一条都必须被上面这套判据咬住（真机回归在 AR 段第 15 步）
+  const fxCacheMutations = [
+    {
+      name: "漏清一只受管的解析缓存（externalParams）",
+      apply: (s) => s.replace("  externalParams.clear();\n", ""),
+      expect: /漏了 externalParams\.clear\(\)/,
+    },
+    {
+      name: "把清空挪进渲染路径（openWith 里删掉、renderInspector 里加一处）",
+      apply: (s) =>
+        s
+          .replace(`  ${"forgetDerivedOverlayCaches"}();\n`, "")
+          .replace("function renderInspector() {\n", "function renderInspector() {\n  forgetDerivedOverlayCaches();\n"),
+      expect: /工程切换边界（openWith）没有作废派生缓存/,
+    },
+    {
+      name: "保留切换边界那处、又在渲染路径里清一次（面板每帧闪「读取中」）",
+      apply: (s) => s.replace("function renderInspector() {\n", "function renderInspector() {\n  forgetDerivedOverlayCaches();\n"),
+      expect: /只允许工程切换边界那一处/,
+    },
+    {
+      name: "读回调改回「库文本优先」（真机终轮 AR 中断的真因）",
+      apply: (s) =>
+        s.replace(
+          "    if (assets) {\n      const b = await assets.read(name).catch(() => null);\n      if (b) return dec.decode(b);\n    }\n    const lib = fxLibraryFiles.get(name);\n    return lib !== undefined ? lib : null;",
+          "    const lib = fxLibraryFiles.get(name);\n    if (lib !== undefined) return lib;\n    if (!assets) return null;\n    const b = await assets.read(name).catch(() => null);\n    return b ? dec.decode(b) : null;",
+        ),
+      expect: /库内同路径/,
+    },
+    {
+      name: "删掉 loadExternalParams 的 early-return",
+      apply: (s) => s.replace("  if (externalPasses.has(file)) return;\n", ""),
+      expect: /early-return 没了/,
+    },
+    {
+      name: "删掉换工程后「晚回来的那次」的代次校验",
+      apply: (s) =>
+        s.replace(
+          "      // 读的是**上一个工程**的字节（这中间换过叠加层）：丢弃，别把旧工程写进新工程的缓存\n      if (gen !== derivedCacheGen) return;\n",
+          "",
+        ),
+      expect: /没做代次校验/,
+    },
+  ];
+  for (const m of fxCacheMutations) {
+    const after = m.apply(fxBase);
+    check(after !== fxBase, `变异「${m.name}」确实改动了源码`);
+    if (after === fxBase) continue;
+    const bad2 = fxCacheWireBad(after);
+    check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+    if (m.expect) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0] ?? "（没红！）"}`);
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

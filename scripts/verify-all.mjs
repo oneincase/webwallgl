@@ -123,6 +123,10 @@ const STABLE = [
   // 的单测 + 「打开 → 编辑 → 存进库 → 重新打开」闭环 + 变异红测。
   // 真浏览器端到端不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-editor.mjs --headless`
   "verify-editor",
+  // 编辑器模型面（EDITOR-PLAN §3B / COMPLETION-PLAN B6 残余）：Node 侧语料参照 + task-8 离线段
+  // （尾表姿势定位 / 片段排序 / 换图尺寸 / 加片段挂动画层；47 条判据含运行模式契约 + 9 条变异红测）。
+  // 默认即离线（不启 Chrome）；真浏览器段要 `node scripts/verify-editor-model.mjs --headless`
+  "verify-editor-model",
   // 编辑器插件内核（editor/core）：inject 等待 / 依赖消失回 pending / 服务栈回落 / 逆序撤销 /
   // 出错隔离与预算 / 权限白名单 / profile 诊断 / 注册表栈 + 变异红测
   "verify-plugin-kernel",
@@ -146,6 +150,9 @@ const STABLE = [
   // 不随包发布（运行时合成），装配回退内置 solidlayer 的空槽 ⇒ 只剩 `whiteTex × color[1,1,1]`，
   // 3840×2160 两层把下面 0–50 层全盖住。
   "verify-instance-textures",
+  // 文字层 scriptProperties（`text.scriptproperties`）数据层：读点 parse.js:493，消费 render/text.js:808/820；
+  // 锁「大小写不敏感命中原键 / 包装只改 .value / 值没变返回 false / 不删作者数据」四条铁律 + 声明解析。
+  "verify-text-script",
 ];
 
 /** 已知浮动，默认不进稳定集（3148125112 的加法过曝随帧浮动 8.8%–11.3%） */

@@ -315,6 +315,39 @@ export function setMdlClipEvents(bytes: Uint8Array, id: number, events: Readonly
 }
 
 /**
+ * 调换片段顺序：把 from 位置的片段移到 to 位置，**整条记录连同 id / 轨道 / 事件一起搬**。
+ *
+ * 引擎读点（W18b「片段排序」的判据全在这里）：
+ * - `render/mdl-skin.js:174` `const a = mdl.animations.find((x) => x.id === l.animation)` —— 场景的
+ *   `animationlayers[].animation` 存的是片段 **id**，不是位置。全库 137 个多片段模型里 id 没有一个
+ *   等于「位置 + 1」、也没有重复 id ⇒ 只要 id 跟着记录走，排序**不会**改 `animationlayers` 的绑定。
+ * - 但 `render/mdl-skin.js:315-326`（场景没给层表时姿势取 `animations[0]`）与
+ *   `computeBoneAlphas:225`（同一条回退）读的是**位置**：全库 946 个「有动画的 puppet 对象」里
+ *   25 个没有 animationlayers、5 个层全关，共 30 个实例吃这条回退。所以 **0 号位片段不许被移走**
+ *   （与 `removeMdlClip` 拒绝删首个片段同一套理由）—— 拒绝而不是静默改掉它们的表现。
+ * - MDLA 的记录流**不是自定界的**：`pkg/mdl-write.js:315-326` 靠 `looksLikeAnimHeader` 扫描找下一条
+ *   记录的起点，且最后一条按「段尾」解析。换位会改变「谁是最后一条」，所以写回后**自己重读一遍**
+ *   核对片段表（id / name / frameCount / 轨数）与预期一致；不一致就返回 null（宁可拒绝，也不交一份
+ *   连本函数都读不回来的文件）。
+ */
+export function moveMdlClip(bytes: Uint8Array, from: number, to: number): Uint8Array | null {
+  const d = docOf(bytes);
+  const anims = d && animsOf(d);
+  if (!d || !anims || anims.length < 2) return null;
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return null;
+  if (from < 0 || from >= anims.length || to < 0 || to >= anims.length || from === to) return null;
+  if (from === 0 || to === 0) return null;
+  const moved = anims.splice(from, 1)[0];
+  anims.splice(to, 0, moved);
+  const out = writeMdlDoc(d) as Uint8Array;
+  const back = docOf(out);
+  const after = (back && animsOf(back)) || [];
+  const key = (a: Anim) => `${a.id}\u0000${a.name}\u0000${a.frameCount}\u0000${a.tracks.length}`;
+  if (after.length !== anims.length || after.map(key).join("|") !== anims.map(key).join("|")) return null;
+  return out;
+}
+
+/**
  * 关键帧影响权重（逐帧）：radius < 0 = 整段 1；radius = 0 = 只有该帧；否则余弦衰减，
  * 距离 > radius 为 0。loop 片段按周期 frames−1 计距离（末帧与首帧重合）。
  */
@@ -812,6 +845,98 @@ export function setMdlSkeleton(
   const mode = opts?.tail ?? "auto";
   if (mode === "drop" || (mode === "auto" && !sameCount)) sec.tail = new Uint8Array(0);
   return writeMdlDoc(d) as Uint8Array;
+}
+
+// ─── W18 残余：无动画模型的静态装配姿势（MDLS 尾表） ────────────────────────
+//
+// **姿势的杠杆是尾表，不是骨记录的局部矩阵**（两处都改了才叫对，先看这里）：
+// - 骨记录的 16 分量矩阵同时喂 `bindTRS` 与 `invBindWorld`（`render/mdl-parse.js:424-465`，
+//   其 :427 头注要求「computeSkinMatrices 的 base 必须取这里，不能另算一套」）；
+// - 引擎在 `render/mdl-skin.js:310-311` 里判 `useStaticPose` = **这个模型自己一条轨道都没有**
+//   且 `staticPoseTRS.length === 骨数`，`:334` 才有 `base = staticPoseTRS`，蒙皮
+//   `World(base) · invBindWorld⁻¹`；没有尾表姿势时 base 与 invBind 同源 ⇒ 乘积**恒等于单位**
+//   （`mdl-skin.js:314-326` 连蒙皮都走 identityEarlyOut）。**所以改 MDLS 局部矩阵对这类模型
+//   是空操作**，改了看不见；有尾表姿势时它看得见，但语义是改绑定参考（invBind 跟着变），
+//   不是摆姿势的入口。
+// - 尾表读点：`render/mdl-parse.js:1094 parseStaticPose`，在 MDLS 记录之后按
+//   `[3B][64N 姿势][9B][76N 分组][1+4N 排列]` 先算 `byLayout = nextOff − perm − group2 − 9 − pose`，
+//   再在记录结束后的前 32 字节退化扫描「N 个连续合法 64B 矩阵」；命中结果挂成
+//   `mdl.staticPoseTRS`（:575），TRS 九分量由 local 分解（:499-503）。
+//
+// 语料实测（全库 403 个带骨 .mdl）：能解析出尾表姿势的 106 个，本文件的定位口径与引擎
+// 逐条比对 106/106 一致（0 不一致）；其中「无任何动画轨道」（即引擎真的会读它）的只有 7 个。
+//
+// 非破坏性：尾表长度不变、段偏移不变，只有目标骨那 64 字节变，其余骨 / 网格 / 动画逐字节原样。
+
+const POSE_MATRIX_BYTES = 64;
+
+/** 尾表里静态姿势表的起点（尾表内相对偏移）；-1 = 这张尾表解析不出姿势（引擎同样读不到） */
+function staticPoseOffset(tail: Uint8Array, count: number): number {
+  const pose = POSE_MATRIX_BYTES * count;
+  const group2 = 76 * count;
+  const perm = 1 + 4 * count;
+  const cand: number[] = [];
+  const byLayout = tail.length - perm - group2 - 9 - pose;
+  if (byLayout >= 0) cand.push(byLayout);
+  const scanEnd = Math.min(32, tail.length - pose);
+  for (let off = 0; off < scanEnd; off++) if (!cand.includes(off)) cand.push(off);
+  const dv = dvOf(tail);
+  const okMatrix = (at: number) => {
+    const m = (k: number) => dv.getFloat32(at + k * 4, true);
+    if (!(Number.isFinite(m(12)) && Number.isFinite(m(13)))) return false;
+    if (Math.abs(m(15) - 1) > 1e-3) return false;
+    if (Math.abs(m(3)) > 1e-3 || Math.abs(m(7)) > 1e-3 || Math.abs(m(11)) > 1e-3) return false;
+    const len = (a: number, b: number, c: number) => Math.hypot(m(a), m(b), m(c));
+    return Math.abs(len(0, 1, 2) - 1) < 0.05 && Math.abs(len(4, 5, 6) - 1) < 0.05 && Math.abs(len(8, 9, 10) - 1) < 0.05;
+  };
+  for (const start of cand) {
+    if (start < 0 || start + pose > tail.length) continue;
+    let ok = true;
+    for (let i = 0; i < count && ok; i++) if (!okMatrix(start + i * POSE_MATRIX_BYTES)) ok = false;
+    if (ok) return start;
+  }
+  return -1;
+}
+
+/** 能被引擎当姿势读的那张尾表（`useStaticPose` 的判据）；读不到返回 null */
+function restPoseAt(bytes: Uint8Array): { d: MdlDoc; sec: Section; count: number; start: number } | null {
+  const d = docOf(bytes);
+  const sec = d?.sections?.find((s) => s.type === "MDLS");
+  if (!d || !sec || sec.raw || !sec.bones || !sec.tail || sec.bones.length === 0) return null;
+  const anims = d.sections?.find((s) => s.type === "MDLA");
+  if (anims && (anims.raw || (anims.anims?.length ?? 0) > 0)) return null;
+  const start = staticPoseOffset(sec.tail, sec.bones.length);
+  return start < 0 ? null : { d, sec, count: sec.bones.length, start };
+}
+
+/**
+ * 读某根骨的静态装配姿势局部矩阵（引擎 `staticPoseTRS[i]` 的原始 16 分量）。
+ * 有动画轨道 / 尾表解析不出姿势 / 骨号越界时 null —— 这三种情况引擎都不读这张表，
+ * 返回数字只会让调用方以为「改这里有效」。
+ */
+export function mdlRestPose(bytes: Uint8Array, boneIndex: number): Float32Array | null {
+  const hit = restPoseAt(bytes);
+  if (!hit || !Number.isInteger(boneIndex) || boneIndex < 0 || boneIndex >= hit.count) return null;
+  const dv = dvOf(hit.sec.tail!);
+  const at = hit.start + boneIndex * POSE_MATRIX_BYTES;
+  const out = new Float32Array(16);
+  for (let k = 0; k < 16; k++) out[k] = dv.getFloat32(at + k * 4, true);
+  return out;
+}
+
+/**
+ * 写某根骨的静态装配姿势局部矩阵 —— 无动画模型摆姿势的**唯一**可见杠杆（见上）。
+ * 长度不变（尾表 64N 定长），目标骨之外逐字节原样；矩阵必须 16 分量且有限。
+ */
+export function setMdlRestPose(bytes: Uint8Array, boneIndex: number, matrix: ArrayLike<number>): Uint8Array | null {
+  const hit = restPoseAt(bytes);
+  if (!hit || !Number.isInteger(boneIndex) || boneIndex < 0 || boneIndex >= hit.count) return null;
+  if (!boneMatrixOk(matrix)) return null;
+  hit.sec.tail = Uint8Array.from(hit.sec.tail!);
+  const dv = dvOf(hit.sec.tail);
+  const at = hit.start + boneIndex * POSE_MATRIX_BYTES;
+  for (let k = 0; k < 16; k++) dv.setFloat32(at + k * 4, matrix[k], true);
+  return writeMdlDoc(hit.d) as Uint8Array;
 }
 
 /** 蒙皮槽：每顶点 4 个骨号 + 4 个权重（模型空间无关，纯格式）；非蒙皮 / 不可编辑时 null */

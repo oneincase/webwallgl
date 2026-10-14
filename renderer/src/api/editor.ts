@@ -29,6 +29,8 @@ export {
   mdlBones,
   setMdlBoneNames,
   setMdlSkeleton,
+  mdlRestPose,
+  setMdlRestPose,
   mdlSkin,
   setMdlWeights,
   setMdlBoneIdx,
@@ -41,6 +43,7 @@ export {
   clearMdlClips,
   setMdlClipMeta,
   setMdlClipEvents,
+  moveMdlClip,
 } from "../editor/mdl-edit";
 // P2：骨架与权重的写侧类型（与上面那组函数同源，直接来自 mdl-edit）
 export type { MdlBoneInfo, MdlBoneSpec } from "../editor/mdl-edit";

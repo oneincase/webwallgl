@@ -4,12 +4,14 @@
 // 模型内容（骨骼 / 动画 / 附着点）一律经引擎 getModelInfo 取，页面不解析 .mdl。
 
 import {
+  addMdlClip,
   applyBoneDelta,
   mdlMeshMaterials,
   retargetMdlMaterial,
   type EditorModelInfo,
   type MdlBoneDelta,
   type MdlClip,
+  type MdlClipInit,
 } from "../renderer/src/api/editor";
 import { modelPathOf, type ImageInput } from "./create";
 import { composeXform, localXform, rebuildTree, relativeXform, writeObjProps, type EditorDoc, type SceneObject, type Xform } from "./doc";
@@ -446,6 +448,57 @@ export function defaultClipId(clips: ReadonlyArray<{ id: number }>, layers: read
   const ids = new Set(clips.map((c) => c.id));
   const l = layers.find((x) => x.visible && ids.has(x.animation));
   return l ? l.animation : (clips[0]?.id ?? null);
+}
+
+// ---------- W18b：新片段 + 挂首个动画层（主进程一次 commit = 一步撤销的数据层） ----------
+// 引擎语义（renderer/vendor/we-scene/render/mdl-skin.js 三处读点，改这三处先红）：
+//   :314 `if (layers.length === 0 && !hadExplicitLayers)` —— 只有场景**完全没给**
+//        animationlayers 时才回退 `animations[0]`；对象一旦有了层表（哪怕整表 visible:false），
+//        这条回退就不再生效，有动画的模型会退到绑定姿势（图集散开位）。
+//   :168-186 resolveLayers 跳过 `visible===false||0` 与 `playing===false` 的层。
+//   :408-411 非加算层按 blend 顺序加权平均写进 acc：一条 blend=1 的**可见**新层会盖掉
+//        同骨上先前所有非加算层 ⇒ 新层一挂上画面立刻变。
+// 所以：① 对象已有层表 → 新层必须 visible:false（零视觉变化，用户显式启用才播）；
+//       ② 对象没有层表 → 不许挂层（挂任何层都砍掉 animations[0] 回退），只加片段并把原因回给 UI。
+export type ClipWithLayerResult = {
+  /** 新 .mdl 字节（含新片段） */
+  bytes: Uint8Array;
+  /** 新片段 id（= 现有最大 id + 1，与 addMdlClip 同源） */
+  id: number;
+  /** 新挂动画层的下标 / id；null = 没挂，见 layerSkip */
+  layerIndex: number | null;
+  layerId: number | null;
+  /** 没挂层的原因：no-layer-table = 该对象没有层表，挂层会砍掉引擎的 animations[0] 回退 */
+  layerSkip: "no-layer-table" | null;
+};
+
+/** 追加片段并给它挂一条动画层；动的是 doc（层）与 .mdl（片段）两份产物，主进程一次 commit 落盘 */
+export function addClipWithLayer(
+  doc: EditorDoc,
+  o: SceneObject,
+  mdlBytes: Uint8Array,
+  init: MdlClipInit,
+  pose: "copy" | "rest" = "rest",
+  source?: number,
+  layerName = "",
+): ClipWithLayerResult | null {
+  const added = addMdlClip(mdlBytes, init, pose, source);
+  if (!added) return null;
+  const list = listOf(o);
+  if (!list || !list.length)
+    return { bytes: added.bytes, id: added.id, layerIndex: null, layerId: null, layerSkip: "no-layer-table" };
+  const index = addAnimLayer(doc, o, added.id, layerName || init.name);
+  if (index === null)
+    return { bytes: added.bytes, id: added.id, layerIndex: null, layerId: null, layerSkip: null };
+  setAnimLayerField(o, index, "visible", false);
+  const entry = listOf(o)?.[index];
+  return {
+    bytes: added.bytes,
+    id: added.id,
+    layerIndex: index,
+    layerId: typeof entry?.id === "number" ? entry.id : null,
+    layerSkip: null,
+  };
 }
 
 /** 骨骼在父链里的深度（下拉缩进用）；父号非法 / 成环时按根处理 */

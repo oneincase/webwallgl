@@ -36,9 +36,12 @@ import {
   mdlMeshIndices,
   mdlMeshInfo,
   mdlMeshPositions,
+  mdlRestPose,
   mdlSkin,
+  moveMdlClip,
   setMdlBoneIdx,
   setMdlParts,
+  setMdlRestPose,
   setMdlSkeleton,
   setMdlTopology,
   setMdlWeights,
@@ -109,8 +112,30 @@ import {
   type EffectValue,
   type EffectView,
   type InlinePassParams,
+  type InlinePassView,
   type PassCombos,
 } from "./effects";
+// 效果结构编辑（M1 A1 扩展）：加 / 删 / 上下移 pass、换 material、改 bind / target。
+// 六种 plan 都是纯函数（新 effect.json 文本 + scene.json 位置同步），这里只负责落地与记账。
+import {
+  applyDocSync,
+  bindsOf,
+  fboNamesOf,
+  isStructEditable,
+  materialCandidates,
+  materialOfPass,
+  parseEffectDoc,
+  passesOf,
+  planBind,
+  planMaterial,
+  planPassAdd,
+  planPassMove,
+  planPassRemove,
+  planTarget,
+  type FxIo,
+  type FxOutcome,
+  type FxPlan,
+} from "./effects-struct";
 import { bootEditor, type EditorApp } from "./app";
 import { blobImporter } from "./plugins/external";
 import { createPluginLog } from "./plugins/log";
@@ -333,6 +358,13 @@ import {
   type TextFields,
   type TextPreset,
 } from "./text";
+import {
+  addableTextScriptProps,
+  declaredTextScriptProps,
+  removeTextScriptProp,
+  setTextScriptProp,
+  textScriptPropRows,
+} from "./text-script-props";
 import {
   PARTICLE_PARAMS,
   PARTICLE_RANGES,
@@ -571,6 +603,7 @@ import {
   structCommand,
   type Patch,
   type PropsCmd,
+  type StructCmd,
 } from "./history";
 import {
   collectDropped,
@@ -1069,6 +1102,10 @@ async function openWith(name: string, load: () => Promise<Opened>, opts: OpenOpt
   overlay =
     opened.assets && opened.doc.scene ? overlayAssets(opened.assets.entry, opened.assets, () => referencedGroups(doc)) : null;
   if (overlay) opened = { ...opened, assets: overlay };
+  // 换叠加层 = 上面那句是**唯一**改 overlay 的地方 ⇒ 按路径做键、从叠加层字节派生的解析缓存
+  // （参数表 / 结构控件原文 / 粒子模型）必须在这里整体作废，否则新工程会吃到上一个工程同名路径
+  // 的解析结果（根因见 forgetDerivedOverlayCaches）。
+  forgetDerivedOverlayCaches();
   current = opened;
   doc = opened.doc;
   selectedId = null;
@@ -2698,23 +2735,62 @@ function restoreObjects(json: string, sel: number | string | null, props?: strin
   void mountCurrent(true);
 }
 
+/** 结构编辑同时改掉的文件字节快照（效果 effect.json）；撤销 / 重做要把它换回去 */
+type FxFileSnap = { path: string; before: Uint8Array; after: Uint8Array };
+/**
+ * 结构命令 → 它改过的文件字节。键就是 HistoryStack 里那个命令对象。
+ * 为什么不用 history 的 FileCmd 单列一条：一次「加 pass」文档（objects 快照）与文件
+ *（effect.json 字节）都得回滚，拆成两条命令就是两步撤销 —— 用户按一次 ⌘Z 只能回一半。
+ * 命令对象离开撤销栈后被回收，WeakMap 跟着释放，不会攒住字节。
+ */
+const fxFileJournal = new WeakMap<object, FxFileSnap[]>();
+
+/**
+ * 对象数组没变、只有文件变了时用的结构命令（换 material / 改 bind / 改 target）：
+ * before === after，撤销 / 重做只回滚文件字节（restoreObjects 原样换回快照，顺带完成重挂 ——
+ * 结构变化本来就必须重挂）。对象数组真变了时 structCommand 给出的是带快照的命令，走不到这里。
+ */
+function noopStructCmd(label: string): StructCmd | null {
+  if (!doc?.scene) return null;
+  const json = JSON.stringify(doc.scene.objects ?? []);
+  return { kind: "struct", label, before: json, after: json, selBefore: selectedId, selAfter: selectedId };
+}
+
+/** 把效果文件字节换进叠加层并作废解析缓存（结构编辑的落地 / 撤销 / 重做共用） */
+function applyFxBytes(path: string, bytes: Uint8Array): void {
+  if (!overlay) return;
+  overlay.put(path, bytes, path);
+  forgetFxFile(path);
+}
+
 /**
  * 一次结构编辑：快照 → 改文档 → 入栈 → 重挂。mutate 返回新的选中 id（undefined = 没改成）。
  * hot：只动了属性表、对象数组没变时改走热更（引擎已与文档一致，不必重挂）；撤销重做仍重挂。
  * hotAlways：对象变了也走 hot（调用方保证 hot 能把引擎带到与文档一致，如动画层整表替换）。
+ * files：同一次动作里还改掉的文件字节（效果 effect.json）。文件字节与文档快照一起记在
+ * 同一条命令上（撤销时两者必须同时回滚），所以调用方**不要**再补一条 history 的 FileCmd。
  */
 function structEdit(
   label: string,
   mutate: (d: EditorDoc) => number | string | null | undefined,
   hot?: () => void,
   hotAlways = false,
+  files?: readonly FxFileSnap[],
 ) {
   if (!doc?.scene || !current?.assets) {
     log(et("log.structUnavailable"), "warn");
     return;
   }
-  const cmd = structCommand(doc, label, selectedId, mutate);
+  const cmd = structCommand(doc, label, selectedId, mutate) ?? (files?.length ? noopStructCmd(label) : null);
   if (!cmd) return;
+  // 字节先落进叠加层：下面的重挂是从资源表读 effect.json 的，晚写这一帧还是旧结构
+  if (files?.length && overlay) {
+    for (const f of files) {
+      overlay.put(f.path, f.after, f.path);
+      forgetFxFile(f.path);
+    }
+    fxFileJournal.set(cmd, [...files]);
+  }
   edits.push(cmd);
   syncHistoryButtons();
   markDirty();
@@ -2939,6 +3015,11 @@ function undoRedo(dir: "undo" | "redo") {
   }
   if (isStruct(cmd)) {
     log(et(dir === "undo" ? "log.undo" : "log.redo", { name: cmd.label }));
+    // 结构编辑可能同时改过文件（效果 effect.json）：先把字节换回叠加层，再 restoreObjects 重挂。
+    // 顺序要紧 —— 重挂才会拿换回去的字节重新解析 pass 链（effects-parse.js:163-264），
+    // 反过来则是「先按新结构挂上、再改字节」，这一帧的引擎状态与文档不符。
+    const snaps = fxFileJournal.get(cmd);
+    if (snaps) for (const f of snaps) applyFxBytes(f.path, dir === "undo" ? f.before : f.after);
     restoreObjects(
       dir === "undo" ? cmd.before : cmd.after,
       dir === "undo" ? cmd.selBefore : cmd.selAfter,
@@ -5872,6 +5953,21 @@ function animLayersGroup(node: LayerNode): HTMLElement {
     item.className = "ed-fx-item";
     item.dataset.alIndex = String(v.index);
     if (!v.visible) item.classList.add("hidden-layer");
+    // task-12 ①：「新建片段」挂上来的动画层是 visible:false（口径见 editor/model.ts:476 addClipWithLayer）。
+    // 这里必须显式标「未启用」+ 一键启用；启用会顶掉该片段当前覆盖的骨骼姿势，代价写进 title（不许静默）。
+    const offTag = document.createElement("span");
+    offTag.className = "ed-tag ed-tag-dim ed-al-off";
+    offTag.textContent = et("al.off");
+    offTag.title = et("al.enable");
+    offTag.hidden = v.visible;
+    const enableBtn = iconBtn(
+      "ed-al-on",
+      "▷",
+      et("al.enable"),
+      () => edit("al.visible", (o) => setAnimLayerField(o, v.index, "visible", true)),
+      v.visible,
+    );
+    enableBtn.hidden = v.visible;
     const head = document.createElement("div");
     head.className = "ed-fx-head";
     const name = document.createElement("input");
@@ -5891,6 +5987,8 @@ function animLayersGroup(node: LayerNode): HTMLElement {
     head.append(
       name,
       soloBtn,
+      offTag,
+      enableBtn,
       iconBtn("ed-al-up", "↑", et("fx.up"), () => animLayerEdit(et("log.animLayerMoved", { name: label }), node, (o) => moveAnimLayer(o, v.index, -1)), v.index === 0),
       iconBtn("ed-al-down", "↓", et("fx.down"), () => animLayerEdit(et("log.animLayerMoved", { name: label }), node, (o) => moveAnimLayer(o, v.index, 1)), v.index === views.length - 1),
       iconBtn("ed-al-del", "✕", et("fx.del"), () => animLayerEdit(et("log.animLayerRemoved", { name: label }), node, (o) => removeAnimLayer(o, v.index))),
@@ -6036,7 +6134,19 @@ function modelTexGroup(node: LayerNode): HTMLElement | null {
       modelTexPick = { layer: node.id, mesh: s.index };
       inModelTexEl.click();
     };
-    box.append(name, b);
+    // task-12 ④：显示原图尺寸（异步探测，读不到写「未知」）；换图时尺寸不同另发提示文案。
+    // 变量名刻意叫 sizeTag 而不是 size：main.ts 里已有两处 `const size`（文字面板 tx.size 行等），
+    // 同名局部变量会让按 first-occurrence 切片的离线判据误切到这一段（见 scripts/verify-editor.mjs A13）。
+    const sizeTag = document.createElement("span");
+    sizeTag.className = "ed-mt-size";
+    sizeTag.textContent = et("mt.origProbing");
+    const key = `${node.id}:${s.index}`;
+    modelTexOrig.set(key, null);
+    void originalTexSize(node, s.index).then((dims) => {
+      modelTexOrig.set(key, dims);
+      sizeTag.textContent = dims ? et("mt.origSize", { w: dims[0], h: dims[1] }) : et("mt.origNone");
+    });
+    box.append(name, sizeTag, b);
     form.append(l, box);
   }
   group.appendChild(form);
@@ -6045,6 +6155,8 @@ function modelTexGroup(node: LayerNode): HTMLElement | null {
 
 const inModelTexEl = $<HTMLInputElement>("#in-model-tex");
 let modelTexPick: { layer: number | string; mesh: number } | null = null;
+/** task-12 ④：每个槽「原图尺寸」探测结果（`层:槽` → [宽,高] 或 null=读不到）。只用于文案。 */
+const modelTexOrig = new Map<string, [number, number] | null>();
 inModelTexEl.onchange = async () => {
   const file = inModelTexEl.files?.[0];
   inModelTexEl.value = "";
@@ -6052,8 +6164,59 @@ inModelTexEl.onchange = async () => {
   modelTexPick = null;
   if (!file || !pick || !isImageFile(file)) return;
   const [img] = await readImages([file]);
-  if (img) await replaceModelTexture(pick.layer, pick.mesh, img);
+  if (!img) return;
+  // task-12 ④：只是文案，不改采样、不拦换图。引擎事实（renderer/src/scene-mount.ts:3259-3277）：模型 json
+  // `autosize:true` 且**图层 size 有 0 分量**（世界尺寸没写死）时，引擎把 layer.size 改成该模型**单帧**尺寸
+  // （geomFrame / frames[0] / .tex 声明尺寸）；素材库 387/387 个 puppet model json 都是 autosize:true。
+  // 所以尺寸不同的新图会让「没写死尺寸」的图层整体变大/变小 —— 提示按这个真实后果写，不写「材质 UV 拉伸」。
+  const orig = modelTexOrig.get(`${pick.layer}:${pick.mesh}`) ?? null;
+  if (texSizeDiffers(orig, img.width, img.height)) {
+    log(et("mt.sizeDiffers", { nw: img.width, nh: img.height, w: orig![0], h: orig![1] }), "warn");
+  }
+  await replaceModelTexture(pick.layer, pick.mesh, img);
 };
+
+/**
+ * task-12 ④：读某槽当前贴图的真实像素尺寸（「原图尺寸」）。路径解析与 replaceModelTexture 同源
+ * （editor/main.ts:6132）：puppet → model json 的 material；mesh → meshMaterialPath；材质里
+ * passes[0].textures[0] 是贴图名，真实文件由 overlay 资源表里同名前缀（`name.`）决定，**不猜扩展名**。
+ * 读不到（无资源表 / 名字解析不出 / 不是 png|jpg）返回 null —— 调用方显示「原图尺寸未知」。
+ */
+async function originalTexSize(node: LayerNode, mesh: number): Promise<[number, number] | null> {
+  const assets = overlay;
+  if (!assets) return null;
+  const o = node.obj;
+  let matPath = "";
+  if (node.modelForm === "puppet") {
+    const modelJson = parseJsonBytes(await assets.read(String(o.image)));
+    matPath = String(modelJson?.material ?? "");
+  } else {
+    const bytes = await assets.read(String(o.model));
+    matPath = bytes ? meshMaterialPath(bytes, mesh) ?? "" : "";
+  }
+  if (!matPath) return null;
+  const material = parseJsonBytes(await assets.read(matPath));
+  const passes = material?.passes;
+  const p0 = Array.isArray(passes) && passes[0] && typeof passes[0] === "object" ? (passes[0] as Record<string, unknown>) : null;
+  const tex = p0 && Array.isArray(p0.textures) ? (p0.textures as unknown[]) : [];
+  const name = typeof tex[0] === "string" ? tex[0] : "";
+  if (!name) return null;
+  const file = assets.list().find((p) => p === name || p.startsWith(`${name}.`));
+  if (!file) return null;
+  const ext = file.split(".").pop()?.toLowerCase() ?? "";
+  const type = ext === "png" ? "image/png" : ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "";
+  if (!type) return null;
+  const b = await assets.read(file);
+  if (!b) return null;
+  try {
+    const bmp = await createImageBitmap(new Blob([b.slice()], { type }));
+    const dims: [number, number] = [bmp.width, bmp.height];
+    bmp.close?.();
+    return dims;
+  } catch {
+    return null;
+  }
+}
 
 async function replaceModelTexture(layerId: number | string, mesh: number, img: ImageInput) {
   const d = doc;
@@ -6284,9 +6447,70 @@ function boneGroup(node: LayerNode): HTMLElement | null {
   reset.className = "ed-btn ed-bn-reset";
   reset.textContent = et("bn.reset");
   reset.onclick = () => reselect({});
-  actions.append(apply, reset);
+  // task-12 ③：把当前骨骼写成静止姿势（读回 renderer/src/editor/mdl-edit.ts:917 mdlRestPose，
+  // 写 renderer/src/editor/mdl-edit.ts:931 setMdlRestPose）。该模型只要有动画（或有尾表姿势）就读不出
+  // 静止姿势 ⇒ mdlRestPose 返回 null，此时按钮禁用 + 原因文案，不静默。
+  const rest = document.createElement("button");
+  rest.type = "button";
+  rest.className = "ed-btn ed-bn-rest";
+  rest.textContent = et("bn.restPose");
+  rest.disabled = true;
+  rest.title = et("bn.restProbing");
+  rest.onclick = () => {
+    const boneName = info.bones[pick.bone]?.name || `#${pick.bone}`;
+    void commitMdlEdit(node.id, et("log.boneRestPose", { layer: nodeName(node.id), bone: boneName }), "pose", "bn", (b) => {
+      const m = mdlRestPose(b, pick.bone);
+      if (!m) return void log(et("bn.restOff"), "warn"), null;
+      return setMdlRestPose(b, pick.bone, m);
+    });
+  };
+  const restNote = note(et("bn.restProbing"));
+  void modelMdlBytes(node).then((b) => {
+    const ok = restPoseWritable(b, pick.bone);
+    rest.disabled = !editable || !ok;
+    rest.title = ok ? et("bn.restPose") : et("bn.restOff");
+    restNote.textContent = ok ? "" : et("bn.restOff");
+    restNote.hidden = ok;
+  });
+  actions.append(apply, reset, rest);
   group.appendChild(actions);
+  group.appendChild(restNote);
   return group;
+}
+
+/**
+ * task-12 ③：对象当前的 .mdl 字节（puppet 先读 model json 的 `puppet`，与 editor/main.ts:6370 commitMdlEdit
+ * 的读法同源）。只用于「能不能写静止姿势」的预检，不写文档。
+ */
+async function modelMdlBytes(node: LayerNode): Promise<Uint8Array | null> {
+  const assets = overlay;
+  if (!assets) return null;
+  const o = node.obj;
+  const json = parseJsonBytes(await assets.read(String(o.model)));
+  const p = json && typeof json.puppet === "string" ? json.puppet : "";
+  return assets.read(p || String(o.model));
+}
+
+/**
+ * task-12 ②：片段能否从 from 位挪到 to 位。口径与数据层 renderer/src/editor/mdl-edit.ts:333 moveMdlClip
+ * 的拒绝条件一致：跨 0 号位（0 号是引擎的姿势参考）、原地、越界、片段数 < 2 都拒绝。
+ * 纯函数，离线判据直接真跑它（见 scripts/verify-editor.mjs 的 MODEL-UI 段）。
+ */
+export function clipDragAllowed(clipCount: number, from: number, to: number): boolean {
+  return clipCount >= 3 && from > 0 && to > 0 && from !== to && from < clipCount && to < clipCount;
+}
+
+/**
+ * task-12 ③：这个模型能不能写静止姿势 —— 真读数据层 mdlRestPose（renderer/src/editor/mdl-edit.ts:917，
+ * 返回 null = 该模型有动画 / 无尾表姿势 / 字节读不成结构）。界面据此禁用按钮并给原因，不许静默。
+ */
+export function restPoseWritable(bytes: Uint8Array | null, bone: number): boolean {
+  return !!bytes && mdlRestPose(bytes, bone) !== null;
+}
+
+/** task-12 ④：新图与原图尺寸是否不同（只决定提示文案，不拦换图、不改采样）。 */
+export function texSizeDiffers(orig: [number, number] | null, w: number, h: number): boolean {
+  return !!orig && (orig[0] !== w || orig[1] !== h);
 }
 
 /**
@@ -8893,6 +9117,9 @@ stageEl.addEventListener("pointercancel", (e) => {
 });
 
 
+/** task-12 ②：片段拖拽的当前来源（行每次 renderInspector 都会重建，所以状态放在模块级） */
+let clipDrag: { layer: number | string; index: number } | null = null;
+
 /**
  * 动画片段（W18b）：每个片段一项（名字 / 模式 / fps / 帧数 / 帧事件，复制 / 删除），底部「新建片段」（静止姿势）。
  * 每次修改都是写时复制 .mdl + 结构编辑；删片段同一步删掉指向它的动画层
@@ -8920,6 +9147,39 @@ function clipsGroup(node: LayerNode): HTMLElement | null {
     const item = document.createElement("div");
     item.className = "ed-fx-item";
     item.dataset.clipId = String(c.id);
+    // task-12 ②：片段拖拽排序（数据层 renderer/src/editor/mdl-edit.ts:333 moveMdlClip）。
+    // 数据层拒绝「跨 0 号位」（0 号是引擎的姿势参考）与 from === to，所以只有 ≥3 个片段才存在合法拖动：
+    // 2 个片段时唯一可能的移动必然涉及 0 号 ⇒ 整体禁用拖拽并把原因写在行 title 与分组 note 里（不许静默）。
+    const rowDraggable = clips.some((_, j) => clipDragAllowed(clips.length, ci, j));
+    item.draggable = editable && rowDraggable;
+    item.title = rowDraggable ? et("cl.drag") : et("cl.moveSingle");
+    item.addEventListener("dragstart", (e) => {
+      clipDrag = { layer: node.id, index: ci };
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", String(ci));
+      }
+      item.style.opacity = "0.5";
+    });
+    item.addEventListener("dragend", () => {
+      item.style.opacity = "";
+      clipDrag = null;
+    });
+    item.addEventListener("dragover", (e) => {
+      if (!clipDrag || clipDrag.layer !== node.id || clipDrag.index === ci) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    });
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const from = clipDrag && clipDrag.layer === node.id ? clipDrag.index : -1;
+      clipDrag = null;
+      if (from < 0 || from === ci) return;
+      // 跨 0 号位（把别人挪成姿势参考）/ 2 个片段的模型：数据层会拒绝，这里先给原因再不动文档（不许静默）。
+      if (!clipDragAllowed(clips.length, from, ci)) return void log(et(ci === 0 ? "cl.moveFirst" : "cl.moveSingle"), "warn");
+      const moved = `${c.name || `#${c.id}`} → ${ci + 1}`;
+      void commitMdlEdit(node.id, et("log.clipMoved", { layer: layerName, clip: moved }), "clip", "cl", (b) => moveMdlClip(b, from, ci));
+    });
     const head = document.createElement("div");
     head.className = "ed-fx-head";
     const name = document.createElement("input");
@@ -9021,6 +9281,7 @@ function clipsGroup(node: LayerNode): HTMLElement | null {
     item.appendChild(form);
     group.appendChild(item);
   });
+  if (clips.length < 3) group.appendChild(note(et("cl.moveSingle")));
   const add = document.createElement("button");
   add.type = "button";
   add.className = "ed-btn ed-cl-add";
@@ -9029,7 +9290,24 @@ function clipsGroup(node: LayerNode): HTMLElement | null {
   add.onclick = () => {
     const c0 = clips[0];
     const init = { name: nextClipName(clips, et("cl.defaultName")), mode: "loop", fps: c0.fps, frameCount: c0.frameCount };
-    void commitMdlEdit(node.id, et("log.clipAdded", { layer: layerName, clip: init.name }), "clip", "cl", (b) => addMdlClip(b, init, "rest", c0.id)?.bytes ?? null);
+    // task-12 ①：新建片段同时挂一条动画层。时序事实（editor/main.ts:6400/6410）：commitMdlEdit 的
+    // edit()（产出新 .mdl 字节）先跑、mutate() 后跑且只在新文档副本上生效 ⇒ 新片段 id 只能在 edit 里拿到，
+    // 再经闭包交给 mutate。层表判定与 editor/model.ts:476 addClipWithLayer 一致（`!listOf(o)?.length`
+    // 等价 getAnimLayers(o).length === 0）；挂上的层 visible:false =「未启用」，见 al.off 标注 + 一键启用。
+    // 没有层表就不能挂：引擎 render/mdl-skin.js:293 `hadExplicitLayers = Array.isArray(animLayers) && animLayers.length > 0`
+    // 与 :314 `if (layers.length === 0 && !hadExplicitLayers)` 的 animations[0] 回退 —— 一旦写了层表，回退就没了。
+    let addedClipId: number | null = null;
+    void commitMdlEdit(node.id, et("log.clipAdded", { layer: layerName, clip: init.name }), "clip", "cl", (b) => {
+      const r = addMdlClip(b, init, "rest", c0.id);
+      addedClipId = r?.id ?? null;
+      return r?.bytes ?? null;
+    }, (o) => {
+      if (addedClipId === null) return;
+      if (!getAnimLayers(o).length) return void log(et("cl.noLayerTable", { clip: init.name }), "warn");
+      if (!doc) return;
+      const idx = addAnimLayer(doc, o, addedClipId, init.name);
+      if (idx !== null) setAnimLayerField(o, idx, "visible", false);
+    });
   };
   group.appendChild(add);
   return group;
@@ -9563,6 +9841,37 @@ const externalParams = new Map<string, EffectParam[] | "loading">();
  * 只解析一次：两个缓存由同一次 `inspectEffectPasses` 填。
  */
 const externalPasses = new Map<string, InlinePassParams[] | "loading">();
+
+/**
+ * 「按工程内相对路径做键、内容从叠加层字节派生」的缓存代次 + 整体作废。
+ *
+ * 为什么换工程必须整体作废：这些 Map 的键是**工程内相对路径**（`effects/<dir>/effect.json`、
+ * `materials/...`、`particles/**.json`），换了叠加层以后同一路径指向的是**另一个文件**；而每只
+ * 缓存都是「命中就不再重读」（`loadExternalParams` 第一句 `if (externalPasses.has(file)) return;`、
+ * `loadParticleFile` 的 `particleFiles.has(path)`、`loadFxText` 的 `fxTextWait.get(name)`），
+ * 且 `particleFiles.set(path, null)` / `fxTexts.set(name, null)` 还把「读不到」记成终态。
+ * 编辑器自造效果又用**确定性目录名**（`effects/wwgl_tint/effect.json`）⇒ 先在工程 A 里把该路径
+ * 读成 1 个 pass、再开工程 B（同一内置效果）⇒ B 的面板声明表仍来自 A，而且永不自愈：B 点「加 pass」
+ * 之后新 pass 的参数格永远不出现（真机终轮 AR 段就是这么中断的：DOM 现场
+ * `{"passes":["0:0[params:2,struct:5]","0:1[params:0,struct:5]"],"locked":0,"insp":null}`，
+ * 等了 30000ms 仍没有「pass 1 的参数行 color」）。
+ *
+ * 为什么只在**工程切换的唯一边界**（`openWith` 换 overlay/doc 那处）清、不在渲染路径清：
+ * 这些 Map 是面板渲染时**同步**问的（`inlinePassesOf` / `externalParamsOf` / `particleFiles` /
+ * `fxTexts`），渲染路径里清会让参数表与结构控件每帧回到「读取中」而闪烁；而这里的调用者
+ * `forgetFxFile()` 只在真的换了某个文件字节时按文件作废（结构编辑 / 撤销）。
+ */
+let derivedCacheGen = 0;
+function forgetDerivedOverlayCaches(): void {
+  derivedCacheGen++;
+  externalParams.clear();
+  externalPasses.clear();
+  fxTexts.clear();
+  fxTextWait.clear();
+  particleFiles.clear();
+  particleFileText.clear();
+  particlePending.clear();
+}
 /** effect.json 路径 → 参数表（loading / 空数组都是「已问过」） */
 const externalParamsOfCached = (file: string): EffectParam[] | null => {
   const hit = externalParams.get(file);
@@ -9584,15 +9893,25 @@ function loadExternalParams(file: string): void {
   externalPasses.set(file, "loading");
   const dec = new TextDecoder();
   const target = doc;
+  const gen = derivedCacheGen;
   void inspectEffectPasses(file, async (name) => {
+    // **工程自己的字节优先**：叠加层里有这个文件就用它。库文本只是**回落**（文件不在工程里的
+    // 库引用效果，M6）——因为「本机壁纸库」是按同一个「工程内相对路径」做键的
+    // （宿主 scanEffectLibrary ⇒ `effects/<dir>/effect.json`），库优先时库里的旧文本会顶掉
+    // 工程自己的新字节：先在别的工程里把 `effects/wwgl_tint/effect.json` 读成 1 个 pass，再往
+    // 本工程加 pass，面板的声明表仍是那份 1 pass 的库文本 ⇒ 新 pass 的参数格永远不出现
+    // （真机终轮 AR 段中断现场：`{"passes":["0:0[params:2,struct:5]","0:1[params:0,struct:5]"],…}`）。
+    if (assets) {
+      const b = await assets.read(name).catch(() => null);
+      if (b) return dec.decode(b);
+    }
     const lib = fxLibraryFiles.get(name);
-    if (lib !== undefined) return lib;
-    if (!assets) return null;
-    const b = await assets.read(name).catch(() => null);
-    return b ? dec.decode(b) : null;
+    return lib !== undefined ? lib : null;
   })
     .catch(() => [] as InlinePassParams[])
     .then((ps) => {
+      // 读的是**上一个工程**的字节（这中间换过叠加层）：丢弃，别把旧工程写进新工程的缓存
+      if (gen !== derivedCacheGen) return;
       externalPasses.set(file, ps);
       externalParams.set(file, ps.flatMap((x) => x.params));
       if (doc === target) renderInspector();
@@ -9634,11 +9953,14 @@ function loadParticleFile(path: string): void {
   particlePending.add(path);
   const dec = new TextDecoder();
   const target = doc;
+  const gen = derivedCacheGen;
   void assets
     .read(path)
     .catch(() => null)
     .then((b) => {
       particlePending.delete(path);
+      // 上一个工程的字节：丢弃（换叠加层时已整体作废，这里防的是**读回来的晚了一拍**）
+      if (gen !== derivedCacheGen) return;
       if (!b) {
         particleFiles.set(path, null);
       } else {
@@ -10124,6 +10446,265 @@ function containerGroup(node: LayerNode): HTMLElement {
   return group;
 }
 
+// ---------- 效果结构编辑（M1 A1 扩展）：pass 增删移 / 换 material / 改 bind·target ----------
+//
+// 为什么不做热更：`setEffectConstants` 只写 scene.json `constantshadervalues` 的**值**；pass 的
+// 条数 / 顺序 / material / target / bind 都是**挂载时**解析成 materialPasses 的（引擎读点见
+// editor/effects-struct.ts 文件头逐行列出），改它们必须重挂 —— 所以统一走 structEdit 的默认路径
+//（restoreObjects → mountCurrent(true)），与所有既有结构编辑同一条重载，不新增第二套。
+// 六种编辑都是纯函数（新 effect.json 文本 + scene.json 位置同步），离线判据见
+// scripts/verify-editor.mjs 的 FX-STRUCT 段。
+
+/**
+ * effect.json / 材质 json 的原文缓存（结构编辑按**文本**改；参数面板看的是解析后的形状）。
+ * 只走工程资源表（overlay.read：叠加层优先、回落工程目录）⇒ 库引用效果读不到，于是自动
+ * 拿不到结构控件（COMPLIANCE：素材库不入库、不改）。null = 读过但读不到（不再重试）。
+ */
+const fxTexts = new Map<string, string | null>();
+const fxTextWait = new Map<string, Promise<string | null>>();
+
+/** 发起一次读（幂等）；读完重画检视器 */
+function loadFxText(name: string): Promise<string | null> {
+  const pending = fxTextWait.get(name);
+  if (pending) return pending;
+  const assets = overlay;
+  const target = doc;
+  const gen = derivedCacheGen;
+  const p = (assets ? assets.read(name) : Promise.resolve(null))
+    .then((b) => (b ? new TextDecoder().decode(b) : null))
+    .catch(() => null)
+    .then((text) => {
+      // 上一个工程的字节：不写进新工程那代缓存（换了工程就重新读；调用方拿到 null 会再发一次）
+      if (gen !== derivedCacheGen) return null;
+      fxTexts.set(name, text);
+      if (doc === target) renderInspector();
+      return text;
+    });
+  fxTextWait.set(name, p);
+  return p;
+}
+
+/** 已读到的原文；没读过就顺手发起读取并先返回 null（读完重画） */
+function fxTextOf(name: string): string | null {
+  void loadFxText(name);
+  return fxTexts.get(name) ?? null;
+}
+
+/** 作废按文件的全部解析缓存（结构编辑 / 撤销后必须重读：material 换了参数表也就换了） */
+function forgetFxFile(name: string): void {
+  fxTexts.delete(name);
+  fxTextWait.delete(name);
+  externalPasses.delete(name);
+  externalParams.delete(name);
+}
+
+/** 一次结构编辑的落地：新文件字节与文档位置同步记成**同一条**撤销步（两者必须一起回滚） */
+function commitFxStruct(label: string, layerId: number | string, plan: FxPlan): void {
+  const cur = fxTexts.get(plan.file) ?? null;
+  if (cur === null) {
+    log(et("fx.structUnreadable"), "warn");
+    return;
+  }
+  const enc = new TextEncoder();
+  structEdit(
+    label,
+    (d) => {
+      // doc 侧位置同步：**所有**引用这条效果文件的对象都要跟着改 —— 同一份 effect.json 可以被多个
+      // 图层引用，只同步当前图层会让另一个图层按位置的覆盖错位到别的 pass 上（引擎读点
+      // renderer.js:5007：同一个 pi 既取 `mp` 又取 `ov`）。没得同步（纯文件编辑）时返回选中 id，
+      // structCommand 会因对象数组没变返回 null，再由 noopStructCmd 用文件快照入栈。
+      let touched = 0;
+      const sync = plan.doc;
+      const scene = d.scene;
+      if (sync && scene) {
+        const objects = Array.isArray(scene.objects) ? (scene.objects as Record<string, unknown>[]) : [];
+        for (const o of objects) if (applyDocSync(o, plan.file, sync) > 0) touched++;
+        if (!touched) return undefined;
+      }
+      return findNode(d.roots, layerId) ? layerId : null;
+    },
+    undefined,
+    false,
+    [{ path: plan.file, before: enc.encode(cur), after: enc.encode(plan.text) }],
+  );
+}
+
+/**
+ * 一个 pass 的结构编辑控件行：加 / 删 / 上下移 pass、换 material、改 target / bind。
+ * 纯函数产出的 plan 在这里落地；不合法只写日志 + 重画（控件回到当前文本的状态），不动工程。
+ */
+function fxStructControls(node: LayerNode, v: InlinePassView, text: string, editable: boolean): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "ed-inline-struct";
+  row.dataset.fxStructPass = String(v.pass);
+  const fxDoc = parseEffectDoc(text);
+  const io: FxIo = { read: fxTextOf, projectFiles: new Set(overlay?.list() ?? []) };
+  const chain = passesOf(fxDoc);
+  const passCount = chain?.length ?? 0;
+  const cur = chain?.[v.pass];
+  /** 提交一条 plan：失败就报原因（失败原因键都有中英词条，界面上不出现裸键） */
+  const run = (label: string, out: FxOutcome<FxPlan>) => {
+    if (!out.ok) {
+      log(et(out.reason), "warn");
+      renderInspector();
+      return;
+    }
+    commitFxStruct(label, node.id, out.value);
+  };
+  const mkBtn = (key: string, action: string, on: () => void, off = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ed-btn ed-inline-struct-btn";
+    b.dataset.fxStructAction = action;
+    b.textContent = et(key);
+    b.disabled = !editable || off;
+    b.onclick = on;
+    return b;
+  };
+  // pass 序：执行序 = effect.json 的 passes 顺序（renderer.js:5005-5008 拉平成 flatPasses）
+  const bar = document.createElement("div");
+  bar.className = "ed-inline-struct-bar";
+  bar.append(
+    mkBtn(
+      "fx.structPassAdd",
+      "add",
+      () => run(et("log.fxPassAdded", { name: v.effectName, pass: v.pass + 2 }), planPassAdd(v.file, text, v.pass)),
+    ),
+    mkBtn(
+      "fx.structPassUp",
+      "up",
+      () => run(et("log.fxPassMoved", { name: v.effectName }), planPassMove(v.file, text, v.pass, -1)),
+      v.pass <= 0,
+    ),
+    mkBtn(
+      "fx.structPassDown",
+      "down",
+      () => run(et("log.fxPassMoved", { name: v.effectName }), planPassMove(v.file, text, v.pass, 1)),
+      v.pass >= passCount - 1,
+    ),
+    // 最后一个 pass 不给删（删空 = 整条链什么都不画，见 effects-struct.ts:198-202 的理由）
+    mkBtn(
+      "fx.structPassDel",
+      "del",
+      () => run(et("log.fxPassRemoved", { name: v.effectName, pass: v.pass + 1 }), planPassRemove(v.file, text, v.pass)),
+      passCount <= 1,
+    ),
+  );
+  row.appendChild(bar);
+
+  // 换 material：候选 = 工程内 materials/**.json（引擎按 p.material 取名各自读，:220）
+  const curMat = materialOfPass(cur);
+  const matRow = document.createElement("div");
+  matRow.className = "ed-inline-struct-mat";
+  const matLbl = document.createElement("span");
+  matLbl.textContent = `${et("fx.structMaterial")}：`;
+  const mat = document.createElement("select");
+  mat.className = "ed-inline-struct-select";
+  mat.dataset.fxStructMaterial = String(v.pass);
+  for (const m of materialCandidates(io, curMat)) {
+    const o = document.createElement("option");
+    o.value = m;
+    o.textContent = m;
+    mat.appendChild(o);
+  }
+  mat.value = curMat ?? "";
+  mat.disabled = !editable;
+  mat.onchange = () => {
+    const pick = mat.value;
+    // 校验要同步读材质内容（是否真有 passes[0].shader，:243-252）：先读一次再交纯函数判
+    void loadFxText(pick).then((t) => {
+      if (t === null) {
+        log(et("fx.structBadMaterial"), "warn");
+        renderInspector();
+        return;
+      }
+      run(et("log.fxMaterialChanged", { name: v.effectName }), planMaterial(v.file, text, v.pass, pick, io));
+    });
+  };
+  matRow.append(matLbl, mat);
+  row.appendChild(matRow);
+
+  // 改 target：名字不在 fbos 里会被自动补声明（renderer.js:4995 声明、:5149 查表回落 curInput）
+  const tgtRow = document.createElement("div");
+  tgtRow.className = "ed-inline-struct-target";
+  const tgtLbl = document.createElement("span");
+  tgtLbl.textContent = `${et("fx.structTarget")}：`;
+  const listId = `ed-fx-fbo-${String(node.id)}-${v.effect}`;
+  const dl = document.createElement("datalist");
+  dl.id = listId;
+  for (const n of fboNamesOf(fxDoc)) {
+    const o = document.createElement("option");
+    o.value = n;
+    dl.appendChild(o);
+  }
+  const tgt = document.createElement("input");
+  tgt.type = "text";
+  tgt.className = "ed-inline-struct-input";
+  tgt.dataset.fxStructTarget = String(v.pass);
+  tgt.setAttribute("list", listId);
+  tgt.placeholder = "—";
+  tgt.value = typeof cur?.target === "string" ? cur.target : "";
+  tgt.disabled = !editable;
+  tgt.onchange = () => run(et("log.fxTargetChanged", { name: v.effectName }), planTarget(v.file, text, v.pass, tgt.value));
+  tgtRow.append(tgtLbl, tgt, dl);
+  row.appendChild(tgtRow);
+
+  // 改 bind：槽下标严格相等匹配（renderer.js:5201-5203），'previous' = 上一 pass 的输入（:5227）
+  const binds = bindsOf(cur);
+  const bindBox = document.createElement("div");
+  bindBox.className = "ed-inline-struct-binds";
+  bindBox.dataset.fxStructBinds = String(v.pass);
+  const bindHead = document.createElement("div");
+  bindHead.className = "ed-inline-struct-binds-head";
+  bindHead.textContent = et("fx.structBind");
+  bindBox.appendChild(bindHead);
+  /** 空串按 NaN 走（NaN 不是整数 → planBind 拒绝；Number("") === 0 会悄悄写成槽 0） */
+  const submitBind = (at: number, name: string, slot: string) => {
+    const s = slot.trim();
+    run(et("log.fxBindChanged", { name: v.effectName }), planBind(v.file, text, v.pass, at, { name: name.trim(), index: s === "" ? NaN : Number(s) }));
+  };
+  binds.forEach((b, i) => {
+    const line = document.createElement("div");
+    line.className = "ed-inline-struct-bind";
+    line.dataset.fxBindRow = String(i);
+    const slot = document.createElement("input");
+    slot.type = "number";
+    slot.className = "ed-inline-struct-slot";
+    slot.dataset.fxBindSlot = String(i);
+    slot.title = et("fx.structBindSlot");
+    slot.value = String(b.index);
+    slot.disabled = !editable;
+    const name = document.createElement("input");
+    name.type = "text";
+    name.className = "ed-inline-struct-input";
+    name.dataset.fxBindName = String(i);
+    name.title = et("fx.structBindName");
+    name.value = b.name;
+    name.disabled = !editable;
+    slot.onchange = () => submitBind(i, name.value, slot.value);
+    name.onchange = () => submitBind(i, name.value, slot.value);
+    const del = mkBtn("fx.structBindDel", `del:${i}`, () =>
+      run(et("log.fxBindChanged", { name: v.effectName }), planBind(v.file, text, v.pass, i, null)),
+    );
+    line.append(slot, name, del);
+    bindBox.appendChild(line);
+  });
+  if (editable) {
+    // 新绑定的默认值：最小空槽 + 第一条已声明 FBO（没有 FBO 就用引擎认的 'previous'）
+    const add = mkBtn("fx.structBindAdd", "addbind", () => {
+      let slot = 0;
+      while (binds.some((b) => b.index === slot)) slot++;
+      run(
+        et("log.fxBindChanged", { name: v.effectName }),
+        planBind(v.file, text, v.pass, -1, { name: fboNamesOf(fxDoc)[0] ?? "previous", index: slot }),
+      );
+    });
+    bindBox.appendChild(add);
+  }
+  row.appendChild(bindBox);
+  return row;
+}
+
 /**
  * `fx` 分组末尾的「作品自带效果」分区：列出 `obj.effects[i].passes[j]`，
  * 把 effect.json 参数表（uniform 注释）渲染成可编辑表单。
@@ -10161,6 +10742,25 @@ function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
     return box;
   }
   box.appendChild(note(et("fx.inlineHint")));
+  // 结构编辑的准入：只有**工程资源表里**的 `effects/wwgl_*/effect.json` 可改（见 effects-struct.ts
+  // 的 isStructEditable）。库引用效果（M6）文件在素材库里，改它就是改素材库 —— COMPLIANCE 红线，
+  // 所以按文件列出禁用原因，而不是悄悄不显示（用户得知道为什么没有控件）。
+  const structTitle = document.createElement("div");
+  structTitle.className = "ed-inline-struct-title";
+  structTitle.dataset.fxStructTitle = "1";
+  structTitle.textContent = et("fx.structTitle");
+  box.appendChild(structTitle);
+  const projectFiles = new Set(overlay?.list() ?? []);
+  const structFiles = new Set<string>();
+  const lockedFiles = new Map<string, string>();
+  for (const f of files) {
+    if (isStructEditable(f, projectFiles)) {
+      structFiles.add(f);
+      void loadFxText(f);
+    } else {
+      lockedFiles.set(f, et("fx.structLibReason"));
+    }
+  }
   for (const v of views) {
     const key = inlineFxKey(node.id, v.effect, v.pass);
     const det = document.createElement("details");
@@ -10250,8 +10850,19 @@ function inlineFxSection(node: LayerNode, editable: boolean): HTMLElement {
       }
       body.appendChild(row);
     }
+    // 结构编辑控件（M1 A1 扩展）：effect.json 原文读到之后才能列出 pass / material / bind
+    const structText = structFiles.has(v.file) ? fxTexts.get(v.file) : undefined;
+    if (typeof structText === "string") body.appendChild(fxStructControls(node, v, structText, editable));
+    else if (structFiles.has(v.file) && structText === null) body.appendChild(note(et("fx.structUnreadable")));
     det.appendChild(body);
     box.appendChild(det);
+  }
+  // 库引用效果：控件一律不生成，只留一条原因（判据查 data-fxStructLocked 存在 + 无控件）
+  for (const [file, reason] of lockedFiles) {
+    const lk = note(reason);
+    lk.classList.add("ed-inline-struct-locked");
+    lk.dataset.fxStructLocked = file;
+    box.appendChild(lk);
   }
   return box;
 }
@@ -10445,6 +11056,271 @@ inFontEl.onchange = async () => {
   await textEdit(node, "tx.font", [path], (o) => setTextField(o, "font", path));
 };
 
+/** 该文字层的脚本源码（引擎 parse.js:492 读 `text.script`，只有字符串才算脚本） */
+function textScriptOf(o: LayerNode["obj"]): string | null {
+  const t = o.text;
+  if (!t || typeof t !== "object" || Array.isArray(t)) return null;
+  const s = (t as { script?: unknown }).script;
+  return typeof s === "string" ? s : null;
+}
+
+/**
+ * 颜色 / 向量属性的分量 **token（原样文本，不重排、不格式化）**。
+ * 引擎 text.js:836-857 coerceVec3Prop：addColor / addVec* 的字符串按 2..4 个空格 / 逗号分隔的
+ * 有限数强转 Vec3（缺位补 0）—— 所以这里收 2..4 个，多于 4 个 / 含非数一律不认（不猜）。
+ */
+function spPropColorTokens(v: unknown): string[] | null {
+  if (typeof v !== "string") return null;
+  const tokens = v
+    .trim()
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 4) return null;
+  return tokens.every((t) => Number.isFinite(Number(t))) ? tokens : null;
+}
+
+/**
+ * 控件可接管的 RGB（前 3 分量）。
+ * **只有 3 / 4 分量的作者值才算可接管**：2 分量的含义（例如 xy、uv）引擎交给脚本解释，
+ * 编辑器猜不出来 —— 硬按 hex 写回会把「2 分量」静默改成「3 分量」，属于改作者数据，
+ * 所以 2 分量与不可解析值一样走「只读 + 不支持形状」。
+ */
+function spPropRgb(v: unknown): [number, number, number] | null {
+  const tokens = spPropColorTokens(v);
+  if (!tokens || tokens.length < 3) return null;
+  return [Number(tokens[0] ?? 0), Number(tokens[1] ?? 0), Number(tokens[2] ?? 0)];
+}
+
+/**
+ * 用控件产出的前 3 分量替换作者值的前 3 位，**其余分量逐字接回**（task-10）。
+ * 例：`spColorWrite(["0.2","0.4","0.8","0.500"], [1,0,0]) === "1 0 0 0.500"`。
+ * 分隔符统一空格（引擎两者都收），保留下来的第 4 个分量原小数位一字不改 —— 不丢作者数据。
+ */
+function spColorWrite(tokens: readonly string[], rgb: readonly number[]): string {
+  return [fmtNum(rgb[0] ?? 0), fmtNum(rgb[1] ?? 0), fmtNum(rgb[2] ?? 0), ...tokens.slice(3)].join(" ");
+}
+
+const spAsBool = (v: unknown) => v === true || v === 1 || v === "true";
+const spNumberText = (v: unknown) => (typeof v === "number" ? fmtNum(v) : String(v ?? ""));
+/** 值的只读预览：字符串原样，其余走 JSON（对象 / null 也看得见形状） */
+const spPreview = (v: unknown): string => {
+  if (typeof v === "string") return v;
+  if (v === undefined) return "";
+  try {
+    return JSON.stringify(v) ?? String(v);
+  } catch {
+    return String(v);
+  }
+};
+
+/**
+ * 新增一条属性时的初值：脚本声明里的默认值优先 —— 与引擎 declaredDefault（text.js:820-832）
+ * 同一口径（addCombo 省略 value 时取 options[0].value）；声明里没有默认值就按类型给中性值。
+ */
+function scriptPropSeed(ob: LayerNode["obj"], key: string): unknown {
+  const decls = declaredTextScriptProps(textScriptOf(ob));
+  const d = decls.find((x) => x.name === key) ?? decls.find((x) => x.name.toLowerCase() === key.toLowerCase());
+  if (d && d.hasDefault) return d.defaultValue;
+  if (!d) return "";
+  if (d.kind === "number") return 0;
+  if (d.kind === "bool") return false;
+  if (d.kind === "color") return "1 1 1";
+  if (d.kind === "combo") return d.options?.[0]?.value ?? "";
+  return "";
+}
+
+/**
+ * 文字脚本属性面板（task-7）：把 scene.json 的 `text.scriptproperties` 摆成可编辑行。
+ *
+ * 引擎读点（改口径时与这里同步）：
+ *   · parse.js:493 `textScriptProps: o.text.scriptproperties || null` —— 容器键只认小写；
+ *   · text.js:994 脚本 `addX({ name })` 用**精确 `in`** 判 spValues 有没有这个键 ——
+ *     所以键名匹配交给 text-script-props.ts 的大小写不敏感命中、写回作者原拼写，
+ *     绝不新建小写重复键（建了就落在引擎读的另一个槽位上）；
+ *   · text.js:808 propValue 容错 `{ user, value }`：值可以带包装，只改 `.value`（铁律②）；
+ *   · text.js:826-830 脚本省略 value 时用声明里的默认值（addCombo 取 options[0].value）；
+ *   · text.js:836-857 颜色属性只认 2..4 个空格 / 逗号分隔的数（addColor / addVec* 的强转）。
+ *
+ * 读写判断一条都不在这里做：全部经 text-script-props.ts（纯数据层，独立判据 + 变异红测）。
+ * 这里只负责「按 kind 选控件」「一条改动 = 一步撤销（textEdit → objEdit，同 A13 的 numRow）」
+ * 与「脚本有默认值 / 引擎会读但脚本未声明」的标注。
+ */
+function textScriptSection(node: LayerNode, editable: boolean): HTMLElement | null {
+  const o = node.obj;
+  const rows = textScriptPropRows(o, textScriptOf);
+  const addable = addableTextScriptProps(o, textScriptOf);
+  if (!rows.length && !addable.length) return null;
+  const box = document.createElement("div");
+  box.className = "ed-inline-fx";
+  box.dataset.scriptprops = String(node.id);
+  const head = document.createElement("div");
+  head.className = "ed-inline-fx-title";
+  head.textContent = et("tx.scriptprops");
+  box.appendChild(head);
+  const form = document.createElement("div");
+  form.className = "ed-fx-params";
+  box.appendChild(form);
+
+  const font = getTextFields(o).font;
+  // 一条改动 = 一步撤销：textEdit → objEdit（与 A13 的 numRow / timeRow 同一条通道）。
+  // field 传作者原键名 —— 属性名是作者数据而不是界面文案（et 对未知键回落键名本身）。
+  const edit = (key: string, v: unknown) =>
+    void textEdit(node, key, [font], (ob) => setTextScriptProp(ob, key, v));
+
+  const spTag = (key: string, title?: string) => {
+    const s = document.createElement("span");
+    s.className = "ed-tag";
+    s.textContent = et(key);
+    if (title) s.title = title;
+    return s;
+  };
+
+  for (const r of rows) {
+    const label = document.createElement("label");
+    label.textContent = r.key;
+    const cell = document.createElement("div");
+    cell.className = "ed-fx-param";
+    cell.dataset.scriptprop = r.key;
+    cell.dataset.kind = r.kind;
+    let el: HTMLInputElement | HTMLSelectElement;
+
+    if (r.kind === "bool") {
+      const inp = document.createElement("input");
+      inp.type = "checkbox";
+      inp.checked = spAsBool(r.value);
+      inp.addEventListener("change", () => edit(r.key, inp.checked));
+      el = inp;
+    } else if (r.kind === "number") {
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.step = "any";
+      inp.value = spNumberText(r.value);
+      inp.addEventListener("change", () => {
+        const n = Number(inp.value);
+        // 引擎（text.js:808）把值原样交给脚本，范围由脚本自己判：这里只挡「不是数」的输入
+        if (inp.value.trim() === "" || !Number.isFinite(n)) inp.value = spNumberText(r.value);
+        else edit(r.key, n);
+      });
+      el = inp;
+    } else if (r.kind === "color") {
+      const inp = document.createElement("input");
+      inp.type = "color";
+      // 3 / 4 分量才给控件接管；2 分量与不可解析值只读（理由见 spPropRgb 注释）
+      const rgb = spPropRgb(r.value);
+      const tokens = spPropColorTokens(r.value);
+      inp.value = toHex(rgb ?? [1, 1, 1]);
+      if (!rgb) {
+        // 值不是引擎认得的 3 / 4 分量颜色串（text.js:836-857）：只读展示，免得一次点击把作者
+        // 原值换成一个「看起来等价」的写法 —— 不认得就别写（铁律④的精神）
+        inp.disabled = true;
+        inp.title = et("tx.scriptprop.colorPartial");
+      }
+      inp.addEventListener("change", () => {
+        const [cr, cg, cb] = fromHex(inp.value);
+        // 第 4 个分量（alpha 等）逐字接回：引擎收 2..4 个分量，写回吃掉它 = 丢作者数据（task-10）
+        edit(r.key, spColorWrite(tokens ?? [], [cr, cg, cb]));
+      });
+      el = inp;
+    } else if (r.kind === "combo" && r.options && r.options.length > 0) {
+      const opts = r.options;
+      const sel = document.createElement("select");
+      const hit = opts.findIndex((op) => op.value === r.value);
+      if (hit < 0) {
+        // 当前值不在脚本声明的选项里：原样列一条并选中 —— 不收敛、不谎报（数据层同口径）。
+        // 合成项的 value 用 "-1"：下拉里真实选项的 value 是**下标字符串**（>= 0），不是脚本值，
+        // 所以 "-1" 不可能撞车（task-10 第 4 条：查过之后判定不需要额外标记）。
+        const cur = document.createElement("option");
+        cur.value = "-1";
+        cur.textContent = spPreview(r.value);
+        sel.appendChild(cur);
+      }
+      opts.forEach((op, i) => {
+        const op2 = document.createElement("option");
+        op2.value = String(i);
+        op2.textContent = op.label !== undefined ? op.label : spPreview(op.value);
+        sel.appendChild(op2);
+      });
+      sel.value = hit < 0 ? "-1" : String(hit);
+      sel.addEventListener("change", () => {
+        const i = Number(sel.value);
+        if (i < 0) return; // 选中「当前值」那条：什么也不改，撤销栈里不留空步
+        edit(r.key, opts[i].value);
+      });
+      el = sel;
+    } else if (r.kind === "string") {
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = typeof r.value === "string" ? r.value : spPreview(r.value);
+      inp.addEventListener("change", () => edit(r.key, inp.value));
+      el = inp;
+    } else {
+      // unknown：值的类型判不出来（既不是声明过的 5 种 add*，也不是 number/bool/string）。
+      // 只读展示，不猜、不写 —— 猜一个形状写回去就是覆盖作者数据
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = spPreview(r.value);
+      inp.readOnly = true;
+      inp.title = et("tx.scriptprop.unknown");
+      el = inp;
+    }
+
+    el.disabled = el.disabled || !editable;
+    cell.appendChild(el);
+    if (r.declared && r.hasDefault) cell.appendChild(spTag("tx.scriptprop.declared", et("tx.scriptprop.hint")));
+    else if (!r.declared) cell.appendChild(spTag("tx.scriptprop.undeclared", et("tx.scriptprop.hint")));
+    if (r.wrapped) cell.appendChild(spTag("tx.scriptprop.wrapped"));
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ed-btn ed-btn-sm";
+    del.textContent = et("tx.scriptprop.del");
+    del.disabled = !editable;
+    del.addEventListener("click", () =>
+      objEdit(et("log.scriptPropRemoved", { layer: nodeName(node.id), key: r.key }), node.id, (ob) =>
+        removeTextScriptProp(ob, r.key),
+      ),
+    );
+    cell.appendChild(del);
+    form.append(label, cell);
+  }
+
+  if (addable.length > 0) {
+    if (rows.length === 0) box.appendChild(note(et("tx.scriptprop.none")));
+    const addRow = document.createElement("div");
+    addRow.className = "ed-fx-param";
+    const sel = document.createElement("select");
+    sel.dataset.scriptpropAdd = String(node.id);
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = et("tx.scriptprop.pick");
+    sel.appendChild(ph);
+    for (const k of addable) {
+      const op = document.createElement("option");
+      op.value = k;
+      op.textContent = k;
+      sel.appendChild(op);
+    }
+    sel.disabled = !editable;
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "ed-btn ed-btn-sm";
+    add.textContent = et("tx.scriptprop.add");
+    add.disabled = !editable;
+    add.addEventListener("click", () => {
+      const key = sel.value;
+      if (!key) return;
+      objEdit(et("log.scriptPropAdded", { layer: nodeName(node.id), key }), node.id, (ob) =>
+        setTextScriptProp(ob, key, scriptPropSeed(ob, key)),
+      );
+      sel.value = "";
+    });
+    addRow.append(sel, add);
+    box.appendChild(addRow);
+  }
+  box.appendChild(note(et("tx.scriptprop.hint")));
+  return box;
+}
+
 function textGroup(node: LayerNode): HTMLElement {
   const group = document.createElement("div");
   group.className = "ed-insp-group ed-text";
@@ -10598,6 +11474,9 @@ function textGroup(node: LayerNode): HTMLElement {
   row("tx.bg", bgBox);
 
   group.appendChild(form);
+  // 脚本属性面板（task-7）：值全部写进 text.scriptproperties，读写判断都在 text-script-props.ts
+  const scriptSec = textScriptSection(node, editable);
+  if (scriptSec) group.appendChild(scriptSec);
   if ((f.limitwidth && !(f.maxwidth > 0)) || (f.limitrows && !(f.maxrows > 0)) || (f.limituseellipsis && !f.limitrows)) {
     group.appendChild(note(et("tx.limitNote")));
   }

@@ -16,6 +16,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { pathToFileURL } from "node:url";
+import { build } from "esbuild";
 import { ROOT, LIB, createChecker } from "./lib/verify-kit.mjs";
 
 const { check, fail, errors } = createChecker({ echo: true });
@@ -241,6 +243,208 @@ async function run(pkg, file, { name = "", visible = true } = {}) {
   } else {
     console.log(`  ✓ 语料零误报：${scenes} 场景 ${effects} 个效果 / ${passes} 个 pass 全部零诊断`);
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// K. 效果结构编辑（M1 A1 扩展）：六种 plan 的纯函数判据 + 真引擎复核
+//    真源是 editor/effects-struct.ts（esbuild 现打包真跑，与 verify-editor 同款做法，
+//    不在脚本里抄第二份逻辑）。最后三条把 plan 的**产物文本**喂给真 resolveEffectChain，
+//    确认引擎确实按我写的位置读 material / target / bind。
+// ───────────────────────────────────────────────────────────────────────────
+async function loadStructModule() {
+  const res = await build({
+    entryPoints: [path.join(ROOT, "editor/effects-struct.ts")],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    loader: { ".glsl": "text" },
+    logLevel: "silent",
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-effects-struct-"));
+  const tmp = path.join(dir, "effects-struct.mjs");
+  fs.writeFileSync(tmp, res.outputFiles[0].text);
+  return import(pathToFileURL(tmp).href);
+}
+{
+  const S = await loadStructModule();
+  const j = (v) => JSON.stringify(v);
+  const onePass = () =>
+    j({ version: 1, name: "wwgl_t", passes: [{ material: "materials/effects/wwgl_t.json" }] }, null, 2);
+  const twoPass = () =>
+    j(
+      {
+        version: 1,
+        name: "wwgl_t",
+        fbos: [{ name: "_rt_A", scale: 1, format: "rgba8888" }],
+        passes: [
+          { material: "materials/effects/wwgl_t.json", target: "_rt_A", bind: [{ name: "previous", index: 1 }] },
+          { material: "materials/effects/wwgl_t.json" },
+        ],
+      },
+      null,
+      2,
+    );
+  const shaderMat = j({ passes: [{ shader: "effects/wwgl_t", blending: "normal" }] });
+  const mats = { "materials/effects/wwgl_t.json": shaderMat, "materials/editor/lib.json": shaderMat };
+  const io = {
+    read: (n) => mats[n] ?? null,
+    projectFiles: new Set(["effects/wwgl_t/effect.json", "materials/effects/wwgl_t.json", "materials/editor/lib.json"]),
+  };
+  const F = "effects/wwgl_t/effect.json";
+
+  // K1-K3 加 pass
+  {
+    const r = S.planPassAdd(F, onePass(), 0);
+    const d = r.ok ? S.parseEffectDoc(r.value.text) : null;
+    const ps = S.passesOf(d);
+    check(r.ok && r.value.doc?.kind === "insert" && r.value.doc.at === 1, "K1 加 pass：doc 侧同步 = insert@1（positional 覆盖必须同步）");
+    check(ps?.length === 2 && j(ps[0]) === j(ps[1]), "K2 加 pass：新 pass 是源 pass 的深拷贝（材质路径共用，不新增文件）");
+    check(r.ok && r.value.text === S.serializeEffectDoc(d) && r.value.text.includes('"name": "wwgl_t"'), "K3 落盘口径 = 2 空格 stringify（未动的键逐字节不变）");
+  }
+  // K4-K5 删 pass
+  {
+    const r1 = S.planPassRemove(F, onePass(), 0);
+    check(!r1.ok && r1.reason === "fx.structLastPass", "K4 最后一个 pass 不给删（删空 = 整条链不出图）");
+    const r2 = S.planPassRemove(F, twoPass(), 0);
+    check(r2.ok && r2.value.doc?.kind === "remove" && r2.value.doc.at === 0 && S.passesOf(S.parseEffectDoc(r2.value.text))?.length === 1,
+      "K5 删 pass：passes 少一条 + 同步 remove@0");
+  }
+  // K6-K7 上下移 pass
+  {
+    const up = S.planPassMove(F, twoPass(), 0, -1);
+    check(!up.ok && up.reason === "fx.structNoChange", "K6 首个 pass 上移 = 没有变化（调用方据此不进撤销栈）");
+    const mv = S.planPassMove(F, twoPass(), 0, 1);
+    const ps = mv.ok ? S.passesOf(S.parseEffectDoc(mv.value.text)) : null;
+    check(mv.ok && mv.value.doc?.kind === "move" && mv.value.doc.from === 0 && mv.value.doc.to === 1 && ps?.[1]?.target === "_rt_A" && ps?.[0]?.target === undefined,
+      "K7 下移 pass：执行序换位 + 同步 move{0→1}");
+  }
+  // K8-K12 换 material
+  {
+    check(!S.planMaterial(F, onePass(), 0, "../library/materials/x.json", io).ok, "K8 换 material：绝对/越界路径被拒");
+    const bad2 = S.planMaterial(F, onePass(), 0, "materials/nope.json", io);
+    check(!bad2.ok && bad2.reason === "fx.structBadMaterial", "K9 换 material：不在工程资源表被拒（＝不改素材库）");
+    const bare = { read: () => j({ passes: [{ blending: "normal" }] }), projectFiles: new Set(["materials/bare.json"]) };
+    const bad3 = S.planMaterial(F, onePass(), 0, "materials/bare.json", bare);
+    check(!bad3.ok && bad3.reason === "fx.structBadMaterial", "K10 换 material：材质缺 passes[0].shader 被拒（引擎会静默跳过该 pass）");
+    const same = S.planMaterial(F, onePass(), 0, "materials/effects/wwgl_t.json", io);
+    check(!same.ok && same.reason === "fx.structNoChange", "K11 换 material：值没变被拒");
+    const good = S.planMaterial(F, onePass(), 0, "materials/editor/lib.json", io);
+    const gd = good.ok ? S.parseEffectDoc(good.value.text) : null;
+    check(good.ok && good.value.doc === null && S.passesOf(gd)?.[0]?.material === "materials/editor/lib.json" && gd?.name === "wwgl_t",
+      "K12 换 material：只改 passes[0].material，其余键不动（doc 侧无需同步）");
+  }
+  // K13-K15 改 target
+  {
+    const bad = S.planTarget(F, onePass(), 0, "bad name");
+    check(!bad.ok && bad.reason === "fx.structBadTarget", "K13 改 target：非法 FBO 名被拒");
+    const set = S.planTarget(F, onePass(), 0, "_rt_New");
+    const sd = set.ok ? S.parseEffectDoc(set.value.text) : null;
+    check(set.ok && set.value.fbo === "_rt_New" && S.fboNamesOf(sd).includes("_rt_New") && S.passesOf(sd)?.[0]?.target === "_rt_New",
+      "K14 改 target：未声明的 FBO 自动补 fbos（否则引擎查不到、静默回落 curInput）");
+    const clr = S.planTarget(F, twoPass(), 0, "");
+    const cd = clr.ok ? S.parseEffectDoc(clr.value.text) : null;
+    check(clr.ok && !("target" in (S.passesOf(cd)?.[0] ?? {})), "K15 清空 target：把键删掉（回落到画进当前主 FBO）");
+  }
+  // K16-K19 改 bind
+  {
+    const add = S.planBind(F, onePass(), 0, -1, { name: "previous", index: 1 });
+    const ad = add.ok ? S.parseEffectDoc(add.value.text) : null;
+    check(add.ok && S.bindsOf(S.passesOf(ad)?.[0]).length === 1, "K16 加 bind：追加一条（name + 数字槽）");
+    const dup = S.planBind(F, add.ok ? add.value.text : "", 0, -1, { name: "previous", index: 1 });
+    check(!dup.ok && dup.reason === "fx.structBindDup", "K17 同槽重复 bind 被拒（引擎里后写覆盖先写，结果取决于数组顺序）");
+    const bad = S.planBind(F, onePass(), 0, -1, { name: "有中文", index: 0 });
+    check(!bad.ok && bad.reason === "fx.structBadBind", "K18 非法 bind 名 / 槽被拒");
+    const del = S.planBind(F, add.ok ? add.value.text : "", 0, 0, null);
+    const dd = del.ok ? S.parseEffectDoc(del.value.text) : null;
+    check(del.ok && !("bind" in (S.passesOf(dd)?.[0] ?? {})), "K19 删 bind：删空后连键一起删（不留空数组）");
+  }
+  // K20-K24 doc 侧位置同步
+  {
+    const obj = () => ({
+      id: 1,
+      effects: [
+        { file: F, visible: true, passes: [{ constantshadervalues: { a: 1 } }, { constantshadervalues: { b: 2 } }] },
+        { file: "effects/wwgl_other/effect.json", passes: [{ constantshadervalues: { c: 3 } }] },
+      ],
+    });
+    const o1 = obj();
+    const n1 = S.applyDocSync(o1, F, { kind: "insert", at: 1 });
+    check(n1 === 1 && j(o1.effects[0].passes[1]) === j({ constantshadervalues: { a: 1 } }) && o1.effects[0].passes.length === 3,
+      "K20 加 pass：scene.json 覆盖在 at 处插入同形拷贝（位置对齐）");
+    check(o1.effects[1].passes.length === 1, "K21 同步只碰同一个 file 的条目");
+    const o2 = obj();
+    S.applyDocSync(o2, F, { kind: "remove", at: 0 });
+    check(j(o2.effects[0].passes) === j([{ constantshadervalues: { b: 2 } }]), "K22 删 pass：覆盖同步删同下标");
+    const o3 = obj();
+    S.applyDocSync(o3, F, { kind: "move", from: 0, to: 1 });
+    check(j(o3.effects[0].passes) === j([{ constantshadervalues: { b: 2 } }, { constantshadervalues: { a: 1 } }]),
+      "K23 移 pass：覆盖跟着换位（否则参数静默错位到别的 pass）");
+    const o4 = { id: 2, effects: [{ file: F }] };
+    check(S.applyDocSync(o4, F, { kind: "insert", at: 0 }) === 0 && o4.effects[0].passes === undefined,
+      "K24 作者没写 passes 覆盖时不动文档（引擎对缺项取 undefined，凭空造数组会写脏字段）");
+  }
+  // K25-K27 准入（COMPLIANCE：库引用效果禁止结构编辑）
+  {
+    const files = new Set(["effects/wwgl_t/effect.json", "effects/tint/effect.json"]);
+    check(S.isStructEditable(F, files) === true, "K25 工程内 wwgl_ 效果可结构编辑");
+    check(S.isStructEditable("effects/tint/effect.json", files) === false, "K26 工程内非编辑器自造的效果（官方内置）不给结构编辑");
+    check(S.isStructEditable(F, new Set()) === false, "K27 库引用效果（文件不在工程资源表）不给结构编辑");
+  }
+  // K28 失败原因键中英各一条（界面 / 日志里不许出现裸键）
+  {
+    const i18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+    const missing = S.FX_STRUCT_REASONS.filter((k) => (i18n.split(`"${k}":`).length - 1) !== 2);
+    check(missing.length === 0, `K28 失败原因键中英各恰好一条（缺/多：${missing.join(", ") || "无"}）`);
+  }
+  // K29-K31 真引擎复核：plan 的产物文本喂 resolveEffectChain
+  {
+    const added = S.planPassAdd(F, onePass(), 0);
+    const pkg1 = fakePkg([[F, added.ok ? added.value.text : ""], ["materials/effects/wwgl_t.json", shaderMat]]);
+    const r1 = await run(pkg1, F);
+    check(r1.diags.length === 0 && r1.effect.materialPasses.length === 2 && r1.effect.materialPasses[1].shader === r1.effect.materialPasses[0].shader,
+      `K29 加 pass 的产物喂真引擎：2 个 pass 解析出同一条 shader、零诊断（got ${JSON.stringify(r1.diags)}）`);
+
+    const pkg2 = fakePkg([[F, twoPass()], ["materials/effects/wwgl_t.json", shaderMat]]);
+    const r2 = await run(pkg2, F);
+    check(r2.effect.materialPasses.length === 2 && r2.effect.materialPasses[0].target === "_rt_A" && r2.effect.fbos.length === 1,
+      "K30 引擎按位置读 passes[i].target（改 target 就是改这里）");
+    check(r2.effect.materialPasses[0].binds.length === 1 && r2.effect.materialPasses[0].binds[0].index === 1 && r2.effect.materialPasses[0].binds[0].name === "previous",
+      "K31 引擎按位置读 passes[i].bind（槽是数字、名是字符串）");
+
+    const moved = S.planPassMove(F, twoPass(), 0, 1);
+    const pkg3 = fakePkg([[F, moved.ok ? moved.value.text : ""], ["materials/effects/wwgl_t.json", shaderMat]]);
+    const r3 = await run(pkg3, F);
+    check(moved.ok && r3.effect.materialPasses[0].target === null && r3.effect.materialPasses[1].target === "_rt_A",
+      "K32 下移的产物喂真引擎：target 跟着 pass 走到新下标（执行序 = effect.json 顺序）");
+  }
+  // K33-K34 换 material / 改 target 的产物喂真引擎（「出帧像素会变」的离线代理）
+  {
+    const before = await run(fakePkg([[F, onePass()], ["materials/effects/wwgl_t.json", shaderMat]]), F);
+    const other = j({ passes: [{ shader: "effects/wwgl_o", blending: "normal" }] });
+    const swapped = S.planMaterial(F, onePass(), 0, "materials/other.json", {
+      read: (n) => (n === "materials/other.json" ? other : null),
+      projectFiles: new Set(["materials/other.json"]),
+    });
+    const after = await run(fakePkg([[F, swapped.ok ? swapped.value.text : ""], ["materials/other.json", other]]), F);
+    check(
+      swapped.ok &&
+        before.effect.materialPasses[0].shader === "effects/wwgl_t" &&
+        after.effect.materialPasses[0].shader === "effects/wwgl_o" &&
+        after.diags.length === 0,
+      `K33 换 material 的产物喂真引擎：该 pass 解析出的 shader 换了一条（这就是出帧像素变化的离线代理；got ${after.effect.materialPasses[0].shader}）`,
+    );
+
+    const tgt = S.planTarget(F, onePass(), 0, "_rt_Ping");
+    const pkg5 = fakePkg([[F, tgt.ok ? tgt.value.text : ""], ["materials/effects/wwgl_t.json", shaderMat]]);
+    const r5 = await run(pkg5, F);
+    check(
+      tgt.ok && r5.effect.fbos.some((f) => f.name === "_rt_Ping") && r5.effect.materialPasses[0].target === "_rt_Ping",
+      `K34 plan 补的 fbos 声明就是引擎查表用的那个名（否则 renderer.js:5149 静默回落 curInput；got ${JSON.stringify(r5.effect.fbos)}）`,
+    );
+  }
+  console.log(`  - 结构编辑 plan 判据 K1–K34 已跑（失败原因键 ${S.FX_STRUCT_REASONS.length} 个逐个查中英词条）`);
 }
 
 console.log("");
