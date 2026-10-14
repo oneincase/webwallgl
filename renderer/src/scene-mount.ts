@@ -3074,7 +3074,35 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               constantshadervalues?: Record<string, unknown>;
             }>;
           }).passes?.[0];
-          const texSlots = pass?.textures || [];
+          const matTexSlots = pass?.textures || [];
+          // [we-scene patch] 编辑器「实例化」图层的贴图槽覆盖（instance.textures）：
+          // 实例模型（models/solid_instance_model_*.json）的材质指向
+          // materials/util/solidlayer_instance_*.json —— pkg 里不存在，装配端按
+          // 「solid 兜底」回退到 BUILTIN_MATERIALS['materials/util/solidlayer.json']，
+          // 而那份内置表的 passes[0].textures 是**空数组**：槽位根本取不到。
+          // 结果全库 343 层 / 67 张的实例层只剩 whiteTex × color 的纯色块：
+          // 3815761795「明日方舟・夕｜画桥」的 背景(id18)/桥-不透明(id307) 各是一张
+          // 3840×2160 全屏实例层，于是整屏白、下面的人/桥/伞全被盖住。
+          // 真正的内容写在 instance.textures[i]（非 util/white 的 119 层 / 21 张，
+          // 逐张都能在包内找到 materials/<name>.tex；util/white 是引擎内置白贴图，
+          // 保留 solid 纯色语义）。按索引覆盖材质槽，缺位不补；被覆盖的槽位单独记
+          // 一份，加载循环里取到真贴图时要撤掉 solid（渲染端 solid 恒赢）。
+          const instTexSlots = (layer as any).srcObject?.instance?.textures as
+            | Array<string | null>
+            | undefined;
+          let texSlots = matTexSlots;
+          const instTexSlotsOverride = new Set<number>();
+          if (Array.isArray(instTexSlots) && instTexSlots.length) {
+            const merged = matTexSlots.slice();
+            for (let i = 0; i < instTexSlots.length; i++) {
+              const t = instTexSlots[i];
+              if (typeof t !== "string" || !t || t.startsWith("util/") || t.startsWith("_rt_"))
+                continue;
+              merged[i] = t;
+              instTexSlotsOverride.add(i);
+            }
+            if (instTexSlotsOverride.size) texSlots = merged;
+          }
           const texName = texSlots[0];
           // 基色材质 blending 字段（additive/translucent/normal）：对象无 colorBlendMode
           // 时合成层按它走（2734266359 spot overlay 黑底光斑必须加法，否则黑方块）。
@@ -3210,6 +3238,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 const reservedBound = typeof layer.textureName === "string" && layer.textureName.startsWith("$");
                 if (si === 0 && !instUtName && !reservedBound) {
                   layer.textureName = tn;
+                  // [we-scene patch] 实例层（instance.textures 覆盖过槽位）拿到真贴图
+                  // 时必须撤掉 solid：渲染端判据是 `!layer.solid && layer.textureName`
+                  // 才取自己的贴图，solid 恒赢（见本函数上方 usertextures 注释）。
+                  // 只撤实例覆盖过的槽位，其余 solid 层的纯色语义原样保留。
+                  if (instTexSlotsOverride.has(si)) (layer as any).solid = false;
                   loadedTex++;
                   if (entry.videoCtl) (layer as any).videoCtl = entry.videoCtl;
                   // [we-scene patch] WE autosize 模型（GIF 导入模板 843532366 等）：
