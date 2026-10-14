@@ -6710,6 +6710,75 @@ export function texSizeDiffers(orig: [number, number] | null, w: number, h: numb
   return !!orig && (orig[0] !== w || orig[1] !== h);
 }
 
+// ↓ task-13 ①：片段事件时间轴的纯逻辑（离线判据真跑这几条；DOM 接线在 clipsGroup 里）
+/** frameCount 的规范化上限（非有限 / ≤0 → 0） */
+function clipEventFrameMax(frameCount: number): number {
+  return Number.isFinite(frameCount) && frameCount > 0 ? Math.round(frameCount) : 0;
+}
+
+/** 帧号夹取：四舍五入成整数 + 夹到 0..frameCount（frameCount≤0 → 0）。拖动 / 点击 / 新增共用它。 */
+export function clipEventFrame(frame: number, frameCount: number): number {
+  const max = clipEventFrameMax(frameCount);
+  const f = Math.round(Number(frame));
+  if (!Number.isFinite(f)) return 0;
+  return f < 0 ? 0 : f > max ? max : f;
+}
+
+/** 帧号 → 轨道内位置（0..1，线性）：pos = 夹取后的帧号 / frameCount。② 的标尺按同一条关系画。 */
+export function clipEventPos(frame: number, frameCount: number): number {
+  const max = clipEventFrameMax(frameCount);
+  if (max <= 0) return 0;
+  return clipEventFrame(frame, max) / max;
+}
+
+/** 轨道内位置（0..1）→ 帧号（夹取；非有限输入 → 0）。拖动与点击共用同一口径。 */
+export function clipEventFrameAt(pos: number, frameCount: number): number {
+  const max = clipEventFrameMax(frameCount);
+  if (!Number.isFinite(pos)) return 0;
+  return clipEventFrame(pos * max, max);
+}
+
+/**
+ * 拖动一个事件后的新事件表：**只改被拖那一条的 frame**，数组序一个字节都不动。
+ * 为什么不动序：引擎保数组序，同帧多事件的派发顺序**就是**数组序 ——
+ * `render/animation.js:322-331`「帧事件表（保数组序；同帧多事件的预期派发顺序即数组序，
+ * 语料 7 组全在 frame 0）」+ `:328-331` 的 filter/map 只做字段规整、不排序。
+ * 因此重复帧允许存在（同帧顺序仍是数组序），重排等于改脚本看到的事件顺序。
+ * 夹取后与当前值相同 / 下标越界 → null（不谎报变更、不产生空撤销步，与 A13 同口径）。
+ */
+export function clipEventDrag(
+  events: readonly { frame: number; name: string }[],
+  index: number,
+  frame: number,
+  frameCount: number,
+): { frame: number; name: string }[] | null {
+  if (!Array.isArray(events) || !Number.isInteger(index) || index < 0 || index >= events.length) return null;
+  const next = clipEventFrame(frame, frameCount);
+  if (next === clipEventFrame(events[index].frame, frameCount)) return null;
+  return events.map((e, i) => (i === index ? { frame: next, name: e.name } : { frame: e.frame, name: e.name }));
+}
+
+/** 点击空白新增：插到**末尾**（既有事件的数组序不动，同帧顺序仍是数组序），帧号同样夹取。 */
+export function clipEventAdd(
+  events: readonly { frame: number; name: string }[],
+  frame: number,
+  name: string,
+  frameCount: number,
+): { frame: number; name: string }[] {
+  return [...events.map((e) => ({ frame: e.frame, name: e.name })), { frame: clipEventFrame(frame, frameCount), name }];
+}
+
+/** 标尺刻度帧号：升序、去重、最多 count 条，必含 0 与 frameCount（frameCount≤0 → [0]）。 */
+export function clipEventTicks(frameCount: number, count = 9): number[] {
+  const max = clipEventFrameMax(frameCount);
+  if (max <= 0) return [0];
+  const n = Math.max(2, Math.min(Math.round(count), max + 1));
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) out.push(Math.round((max * i) / (n - 1)));
+  return [...new Set(out)];
+}
+// ↑ task-13 ①：片段事件时间轴的纯逻辑结束
+
 /**
  * 改模型 .mdl 的一次可撤销编辑（W18）：读对象当前的 .mdl → edit → 写时复制（puppet 连 model json 一起）→
  * 结构编辑改指向（重挂）。mutate 在同一步里顺带改对象（删片段时删掉指向它的动画层）。fail = 文案前缀（bn / cl / wp）
@@ -9458,6 +9527,82 @@ function clipsGroup(node: LayerNode): HTMLElement | null {
     };
     row("cl.fps", num("ed-cl-fps", c.fps, "1", "1", (v) => metaEdit(c, "cl.fps", { fps: v })));
     row("cl.frames", num("ed-cl-frames", c.frameCount, "1", "1", (v) => metaEdit(c, "cl.frames", { frameCount: Math.round(v) })));
+    // ↓ task-13 ①：事件时间轴（W18b）—— 与下面 textarea 同一条数据通道（setMdlClipEvents）
+    const track = document.createElement("div");
+    track.className = "ed-cl-track";
+    track.setAttribute("data-clip-events", String(c.id));
+    const cap = document.createElement("div");
+    cap.className = "ed-cl-track-cap";
+    cap.textContent = et("cl.eventsTrack", { n: c.frameCount });
+    const rail = document.createElement("div");
+    rail.className = "ed-cl-rail";
+    /** 轨道内像素 x → 帧号（宽度 0（面板隐藏）时退回 0，不产生 NaN） */
+    const frameAtX = (x: number): number => {
+      const rect = rail.getBoundingClientRect();
+      return clipEventFrameAt(rect.width > 0 ? (x - rect.left) / rect.width : 0, c.frameCount);
+    };
+    for (const t of clipEventTicks(c.frameCount)) {
+      const tick = document.createElement("i");
+      tick.className = "ed-cl-tick";
+      tick.style.left = `${(clipEventPos(t, c.frameCount) * 100).toFixed(4)}%`;
+      tick.title = String(t);
+      rail.appendChild(tick);
+    }
+    if (!c.events.length) {
+      const empty = document.createElement("span");
+      empty.className = "ed-cl-empty";
+      empty.textContent = et("cl.eventsEmpty");
+      rail.appendChild(empty);
+    }
+    c.events.forEach((e, ei) => {
+      const mk = document.createElement("span");
+      mk.className = "ed-cl-ev";
+      mk.setAttribute("data-ev-index", String(ei));
+      mk.style.left = `${(clipEventPos(e.frame, c.frameCount) * 100).toFixed(4)}%`;
+      mk.textContent = String(e.frame);
+      mk.title = `${e.frame} ${e.name}`;
+      mk.tabIndex = editable ? 0 : -1;
+      /** 松手才算一次编辑：pointermove 只挪视觉，pointerup 才走 commitMdlEdit（一条动作 = 一步 ⌘Z） */
+      const settle = (uv: PointerEvent): void => {
+        mk.onpointermove = null;
+        mk.onpointerup = null;
+        track.classList.remove("is-dragging");
+        const next = clipEventDrag(c.events, ei, frameAtX(uv.clientX), c.frameCount);
+        if (!next) {
+          mk.style.left = `${(clipEventPos(e.frame, c.frameCount) * 100).toFixed(4)}%`;
+          mk.textContent = String(e.frame);
+          return;
+        }
+        void commitMdlEdit(node.id, et("log.clipEdited", { layer: layerName, clip: label, field: et("cl.events") }), "clip", "cl", (b) => setMdlClipEvents(b, c.id, next));
+      };
+      mk.onpointerdown = (pe) => {
+        if (!editable) return;
+        pe.preventDefault();
+        mk.setPointerCapture(pe.pointerId);
+        track.classList.add("is-dragging");
+        mk.onpointermove = (mv) => {
+          const f = frameAtX(mv.clientX);
+          mk.style.left = `${(clipEventPos(f, c.frameCount) * 100).toFixed(4)}%`;
+          mk.textContent = String(f);
+        };
+        mk.onpointerup = settle;
+      };
+      rail.appendChild(mk);
+    });
+    rail.onpointerdown = (pe) => {
+      if (!editable) return;
+      if (pe.target !== rail) return; // 标记自己的按下不当作「新增事件」
+      const f = frameAtX(pe.clientX);
+      const next = clipEventAdd(c.events, f, et("cl.eventDefault"), c.frameCount);
+      void commitMdlEdit(node.id, et("log.clipEventAdded", { layer: layerName, clip: label, frame: f }), "clip", "cl", (b) => setMdlClipEvents(b, c.id, next));
+    };
+    if (!editable) {
+      track.classList.add("is-locked");
+      track.title = et("cl.eventsLocked");
+    }
+    track.append(cap, rail);
+    form.appendChild(track);
+    // ↑ task-13 ①：事件时间轴结束
     const ev = document.createElement("textarea");
     ev.className = "ed-cl-events";
     ev.rows = Math.min(6, Math.max(2, c.events.length + 1));

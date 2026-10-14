@@ -1273,6 +1273,80 @@ input.ed-al-name {
   gap: 6px;
 }
 
+/* ---- task-13 ①：片段事件时间轴（帧 → 位置线性；标记可拖、点空白新增） ---- */
+.ed-cl-track {
+  grid-column: 1 / -1;
+  margin: 2px 0 4px;
+}
+
+.ed-cl-track-cap {
+  font-size: var(--wb-font-xs);
+  color: var(--wb-fg-mute);
+  margin-bottom: 2px;
+}
+
+.ed-cl-rail {
+  position: relative;
+  height: 22px;
+  border: 1px solid var(--wb-line);
+  border-radius: 4px;
+  background: var(--wb-bg-2);
+}
+
+.ed-cl-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--wb-line);
+  opacity: 0.6;
+}
+
+.ed-cl-ev {
+  position: absolute;
+  top: 50%;
+  min-width: 16px;
+  padding: 0 3px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--wb-accent);
+  border-radius: 3px;
+  background: var(--wb-accent-soft);
+  color: var(--wb-fg);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.ed-cl-track.is-locked .ed-cl-ev {
+  cursor: not-allowed;
+}
+
+.ed-cl-track.is-locked .ed-cl-rail {
+  opacity: 0.55;
+}
+
+/* 拖动中的命中反馈：抓取光标 + 轨道描边高亮（只在拖动时加 .is-dragging） */
+.ed-cl-track.is-dragging .ed-cl-ev {
+  cursor: grabbing;
+}
+
+.ed-cl-track.is-dragging .ed-cl-rail {
+  border-color: var(--wb-accent);
+}
+
+.ed-cl-empty {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--wb-fg-dim);
+  font-size: var(--wb-font-xs);
+  pointer-events: none;
+}
+
 /* ---- 作品自带效果（M1）：按 effect / pass 折叠的内联参数区 ---- */
 .ed-inline-fx {
   margin-top: 8px;

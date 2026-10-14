@@ -11303,10 +11303,10 @@ section("MODEL-UI. 模型线 UI 接线：新建片段自动挂层 / 片段拖拽
       "①没有动画层表时给的是「已只加片段 + 挂层会顶掉引擎默认第 0 条动画」的后果，不是空泛失败文案",
     );
 
-    // ── ⑤ 本轮明确没做的部分：片段事件仍然只有文本编辑 ──
+    // ── ⑤ 片段事件：文字编辑与时间轴拖拽都必须走数据层（task-13 补上时间轴后，
+    //      「事件行仍是纯文本、没有第二个编辑表面」两条反向断言按其设计目的删除；
+    //      时间轴自己的判据在下一条 task-13 ① 段里，这条只守 textarea 路径不退化）──
     is(main.includes("(b) => setMdlClipEvents(b, c.id, list)"), "⑤片段事件仍走数据层 setMdlClipEvents（文本编辑路径不回退）");
-    is(main.includes('row("cl.events", ev);'), "⑤片段事件行仍是文本输入（时间轴拖拽本轮没做）");
-    is(!/ed-cl-timeline|ed-events-timeline/.test(main), "⑤没有偷偷塞第二个事件编辑表面（假时间轴会让判据以为做了）");
 
     // ── ⑥ i18n：每个新键 zh/en 各恰好一条 ──
     const keyRe = /"(?:al\.(?:off|enable)|bn\.rest(?:Pose|Off|Probing)|cl\.(?:drag|moveFirst|moveSingle|noLayerTable)|log\.(?:boneRestPose|clipMoved)|mt\.(?:origSize|origNone|origProbing|sizeDiffers))"/g;
@@ -11436,13 +11436,6 @@ section("MODEL-UI. 模型线 UI 接线：新建片段自动挂层 / 片段拖拽
       from: "(b) => setMdlClipEvents(b, c.id, list)",
       to: "(b) => b",
       expect: /⑤片段事件仍走数据层 setMdlClipEvents/,
-    },
-    {
-      which: "main",
-      name: "偷偷塞一个假的时间轴 class（假装做了事件拖拽）",
-      from: '    row("cl.events", ev);\n',
-      to: '    row("cl.events", ev);\n    item.classList.add("ed-cl-timeline");\n',
-      expect: /⑤没有偷偷塞第二个事件编辑表面/,
     },
     {
       which: "main",
@@ -11837,6 +11830,249 @@ section("FX-CACHE. 换工程作废按路径做键的解析缓存（+ 工程字�
     check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
     if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
   }
+}
+
+// ─────────────── task-13 ①：片段事件时间轴（W18b）───────────────
+section("task-13 ①. 片段事件时间轴拖拽（editor/main.ts 纯逻辑真跑 + 接线守门 + 变异红测）");
+{
+  const mainPath13 = path.join(ROOT, "editor/main.ts");
+  const cssPath13 = path.join(ROOT, "editor/editor.css");
+  const main13 = fs.readFileSync(mainPath13, "utf8");
+  const i18n13 = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const css13 = fs.readFileSync(cssPath13, "utf8");
+  const PURE_A = "// ↓ task-13 ①：片段事件时间轴的纯逻辑";
+  const PURE_B = "// ↑ task-13 ①：片段事件时间轴的纯逻辑结束";
+  const TL_A = "// ↓ task-13 ①：事件时间轴";
+  const TL_B = "// ↑ task-13 ①：事件时间轴结束";
+  const pureSlice = (src) => {
+    const a = src.indexOf(PURE_A);
+    const b = src.indexOf(PURE_B, a + 1);
+    return a < 0 || b < 0 ? null : src.slice(a, b);
+  };
+  /** 去掉注释再扫接线（注释里写到的调用不该被判据当真；task-17 踩过这个坑） */
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  let tlSeq = 0;
+  const loadPure = async (slice) => {
+    const p = path.join(tmpRoot, `tl-pure-${tlSeq++}.ts`);
+    fs.writeFileSync(p, slice);
+    const r = await build({
+      entryPoints: [p],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const mjs = p.replace(/\.ts$/, ".mjs");
+    fs.writeFileSync(mjs, r.outputFiles[0].text);
+    return import(pathToFileURL(mjs).href);
+  };
+  const pureBad = async (M) => {
+    const bad = [];
+    if (!M || typeof M.clipEventFrame !== "function") return ["切片里没有 clipEventFrame（源码形状变了？）"];
+    const j = (v) => JSON.stringify(v);
+    // ① 夹取 + 整数化 + frameCount 上限
+    if (M.clipEventFrame(3.4, 24) !== 3) bad.push(`①帧号未四舍五入（3.4 → ${j(M.clipEventFrame(3.4, 24))}）`);
+    if (M.clipEventFrame(3.6, 24) !== 4) bad.push("①帧号未四舍五入（3.6）");
+    if (M.clipEventFrame(-5, 24) !== 0) bad.push("①负帧未夹到 0");
+    if (M.clipEventFrame(99, 24) !== 24) bad.push("①帧号未夹到 frameCount（上限）");
+    if (M.clipEventFrame(NaN, 24) !== 0) bad.push("①NaN 帧未退化为 0");
+    if (M.clipEventFrame(7, 0) !== 0) bad.push("①frameCount=0 时帧号未归 0");
+    // ② 帧 → 位置（线性，标尺按它画）
+    if (M.clipEventPos(0, 24) !== 0) bad.push("②帧 0 不在 0 处");
+    if (M.clipEventPos(12, 24) !== 0.5) bad.push("②帧 → 位置不是线性（12/24 应为 0.5）");
+    if (M.clipEventPos(24, 24) !== 1) bad.push("②frameCount 不在末端 1 处");
+    if (M.clipEventPos(99, 24) !== 1) bad.push("②超界帧未夹到末端");
+    if (M.clipEventPos(0, 0) !== 0) bad.push("②frameCount=0 时位置未归 0");
+    // ③ 位置 → 帧（拖动与点击共用同一口径）
+    if (M.clipEventFrameAt(0, 24) !== 0) bad.push("③x=0 未得帧 0");
+    if (M.clipEventFrameAt(0.5, 24) !== 12) bad.push("③x=0.5 未得帧 12");
+    if (M.clipEventFrameAt(1, 24) !== 24) bad.push("③x=1 未得 frameCount");
+    if (M.clipEventFrameAt(-0.2, 24) !== 0) bad.push("③左侧越界未夹到 0");
+    if (M.clipEventFrameAt(1.5, 24) !== 24) bad.push("③右侧越界未夹到 frameCount");
+    if (M.clipEventFrameAt(NaN, 24) !== 0) bad.push("③NaN 位置未退化为 0");
+    // ④ 拖动：只改被拖那条，数组序与其它条目逐字不动
+    const evs = [
+      { frame: 0, name: "a" },
+      { frame: 5, name: "b" },
+      { frame: 0, name: "c" },
+    ];
+    const d1 = M.clipEventDrag(evs, 1, 10, 24);
+    if (
+      j(d1) !==
+      j([
+        { frame: 0, name: "a" },
+        { frame: 10, name: "b" },
+        { frame: 0, name: "c" },
+      ])
+    ) {
+      bad.push(`④拖动只改被拖那条（got ${j(d1)}）`);
+    }
+    if (
+      j(evs) !==
+      j([
+        { frame: 0, name: "a" },
+        { frame: 5, name: "b" },
+        { frame: 0, name: "c" },
+      ])
+    ) {
+      bad.push("④拖动改了入参数组（应返回新数组）");
+    }
+    if (M.clipEventDrag(evs, 1, 5, 24) !== null) bad.push("④帧号没变未返回 null（会产生空撤销步）");
+    if (M.clipEventDrag(evs, 2, 0, 24) !== null) bad.push("④同帧拖动未返回 null");
+    if (M.clipEventDrag(evs, -1, 3, 24) !== null || M.clipEventDrag(evs, 3, 3, 24) !== null) bad.push("④越界下标未拒绝");
+    if (
+      j(M.clipEventDrag(evs, 1, 99, 24)) !==
+      j([
+        { frame: 0, name: "a" },
+        { frame: 24, name: "b" },
+        { frame: 0, name: "c" },
+      ])
+    ) {
+      bad.push("④拖动未夹到 frameCount（上限）");
+    }
+    // ⑤ 重复帧：同帧多条允许，改一条不动另一条（引擎按数组序派发，animation.js:322-331）
+    const dup = [
+      { frame: 0, name: "a" },
+      { frame: 0, name: "b" },
+    ];
+    if (
+      j(M.clipEventDrag(dup, 1, 3, 24)) !==
+      j([
+        { frame: 0, name: "a" },
+        { frame: 3, name: "b" },
+      ])
+    ) {
+      bad.push("⑤重复帧拖动后数组序变了");
+    }
+    // ⑥ 点空白新增：追加末尾、帧号夹取、既有项逐字不动
+    if (j(M.clipEventAdd([], 5, "e", 24)) !== j([{ frame: 5, name: "e" }])) bad.push("⑥空表新增不对");
+    const a1 = M.clipEventAdd(evs, 99, "z", 24);
+    if (
+      j(a1) !==
+      j([
+        { frame: 0, name: "a" },
+        { frame: 5, name: "b" },
+        { frame: 0, name: "c" },
+        { frame: 24, name: "z" },
+      ])
+    ) {
+      bad.push(`⑥新增未追加末尾/未夹取（got ${j(a1)}）`);
+    }
+    // ⑦ 刻度：升序去重、含 0 与 frameCount、条数有界
+    const ticks = M.clipEventTicks(24);
+    if (!Array.isArray(ticks) || ticks.length < 2 || ticks.length > 9) bad.push(`⑦刻度条数异常（${j(ticks)}）`);
+    if (ticks[0] !== 0 || ticks[ticks.length - 1] !== 24) bad.push("⑦刻度未含 0 与 frameCount");
+    if (!ticks.every((t, i, arr) => Number.isInteger(t) && (i === 0 || t > arr[i - 1]))) bad.push("⑦刻度未升序/未去重");
+    if (j(M.clipEventTicks(0)) !== j([0])) bad.push("⑦frameCount=0 时刻度不是 [0]");
+    return bad;
+  };
+  const wireBad = (src, i18n) => {
+    const bad = [];
+    const a = src.indexOf(TL_A);
+    const b = src.indexOf(TL_B, a + 1);
+    if (a < 0 || b < 0) return ["接线区标记（task-13 ① 事件时间轴）缺失"];
+    const tl = strip(src.slice(a, b));
+    const need = (re, msg) => {
+      if (!re.test(tl)) bad.push(msg);
+    };
+    need(/track\.className = "ed-cl-track";/, "轨道容器 class ed-cl-track");
+    need(/setAttribute\("data-clip-events", String\(c\.id\)\)/, "轨道带片段 id（headless 可定位）");
+    need(/clipEventTicks\(c\.frameCount\)/, "标尺按 frameCount 铺刻度");
+    need(/et\("cl\.eventsTrack", \{ n: c\.frameCount \}\)/, "标尺显示 frameCount");
+    need(/clipEventPos\(e\.frame, c\.frameCount\)/, "标记位置走线性「帧 → 位置」");
+    need(/et\("cl\.eventsEmpty"\)/, "无事件空态给人话");
+    need(/clipEventDrag\(c\.events, ei, frameAtX\(uv\.clientX\), c\.frameCount\)/, "拖动走纯逻辑（夹取/整数化）");
+    need(/clipEventAdd\(c\.events, f, et\("cl\.eventDefault"\), c\.frameCount\)/, "点空白新增（缺省名）");
+    need(/track\.classList\.add\("is-dragging"\)/, "拖动中有命中反馈（is-dragging）");
+    need(/track\.classList\.remove\("is-dragging"\)/, "松手后撤销拖动反馈");
+    // textarea 行在接线区之外（时间轴插在它上面），所以按整份源码查，不按 region 查
+    if (!strip(src).includes("(b) => setMdlClipEvents(b, c.id, list)")) bad.push("textarea 路径仍走数据层（原⑤口径不放宽）");
+    need(
+      /if \(!editable\) \{\s*track\.classList\.add\("is-locked"\);[\s\S]{0,80}et\("cl\.eventsLocked"\)/,
+      "锁定态禁交互并给原因（不静默）",
+    );
+    const commits = (tl.match(/setMdlClipEvents\(b, c\.id, next\)/g) || []).length;
+    if (commits < 2) bad.push(`拖动与新增都必须走数据层 setMdlClipEvents（got ${commits} < 2）`);
+    const undos = (tl.match(/commitMdlEdit\(node\.id,/g) || []).length;
+    if (undos < 2) bad.push(`两次手势各走一条 commitMdlEdit（一条动作=一步撤销）（got ${undos} < 2）`);
+    const guards = (tl.match(/if \(!editable\) return;/g) || []).length;
+    const downs = (tl.match(/\.onpointerdown = /g) || []).length;
+    if (downs < 2 || guards !== downs) bad.push(`每个 pointerdown 都要先守 editable（guards=${guards} downs=${downs}）`);
+    for (const k of ["cl.eventsTrack", "cl.eventsEmpty", "cl.eventsLocked", "cl.eventDefault", "log.clipEventAdded"]) {
+      const n = i18n.split(`"${k}":`).length - 1;
+      if (n !== 2) bad.push(`i18n 键 ${k} 需 zh/en 各恰好一条（got ${n}）`);
+    }
+    if (!/"cl\.eventDefault": "newEvent",/.test(i18n)) bad.push("缺省事件名两语言都用 ASCII newEvent（事件名要跟脚本对上）");
+    const cssA = css13.indexOf("/* ---- task-13 ①：片段事件时间轴");
+    const cssB = css13.indexOf(".ed-cl-empty");
+    const cssRegion = cssA < 0 || cssB < 0 ? "" : css13.slice(cssA, css13.indexOf("}", cssB) + 1);
+    if (!cssRegion) bad.push("editor.css 里没有 task-13 ① 的时间轴样式区");
+    for (const sel of [".ed-cl-track", ".ed-cl-rail", ".ed-cl-tick", ".ed-cl-ev", ".ed-cl-empty", ".ed-cl-track.is-locked", ".ed-cl-track.is-dragging"]) {
+      if (!css13.includes(sel)) bad.push(`CSS 缺少 ${sel}`);
+    }
+    if (!/\.ed-cl-track \{[\s\S]{0,80}grid-column: 1 \/ -1;/.test(css13)) bad.push("轨道未占满整行（grid-column: 1 / -1）");
+    if (/^\s*--[\w-]+\s*:/m.test(cssRegion)) bad.push("新增样式里自造了 CSS 变量（要求沿用既有体系）");
+    return bad;
+  };
+  const pBase = pureSlice(main13);
+  const pBad = pBase ? await pureBad(await loadPure(pBase)) : ["纯逻辑切片缺失"];
+  check(pBad.length === 0, `task-13 ① 时间轴纯逻辑真跑全绿（${pBad.length} 处失败${pBad.length ? "：" + pBad.slice(0, 3).join("；") : ""}）`);
+  const wBad = wireBad(main13, i18n13);
+  check(wBad.length === 0, `task-13 ① 接线/守门/空态/i18n/CSS 全绿（${wBad.length} 处失败${wBad.length ? "：" + wBad.slice(0, 3).join("；") : ""}）`);
+  // 变异红测：改坏 → 必红 → 由目标判据咬红。全程只改内存字符串，磁盘文件一个字节都不动。
+  const muts13 = [
+    {
+      pure: true,
+      name: "拖动不再夹取/整数化帧号",
+      from: "  const f = Math.round(Number(frame));\n  if (!Number.isFinite(f)) return 0;\n  return f < 0 ? 0 : f > max ? max : f;",
+      to: "  return Number(frame);",
+      expect: /未四舍五入|夹到 frameCount|夹到 0/,
+    },
+    {
+      pure: true,
+      name: "拖动改成重排数组（丢数组序）",
+      from: "  return events.map((e, i) => (i === index ? { frame: next, name: e.name } : { frame: e.frame, name: e.name }));",
+      to: "  return [...events.map((e) => ({ frame: e.frame, name: e.name }))].sort((x, y) => x.frame - y.frame);",
+      expect: /拖动只改被拖那条/,
+    },
+    {
+      name: "拖动绕开数据层（裸写编辑函数）",
+      from: "(b) => setMdlClipEvents(b, c.id, next)",
+      to: "(b) => b",
+      expect: /数据层/,
+    },
+    {
+      name: "点空白新增不再用缺省名",
+      from: 'clipEventAdd(c.events, f, et("cl.eventDefault"), c.frameCount)',
+      to: 'clipEventAdd(c.events, f, "", c.frameCount)',
+      expect: /点空白新增/,
+    },
+    {
+      name: "拖动监听不再守 editable",
+      from: "      mk.onpointerdown = (pe) => {\n        if (!editable) return;\n",
+      to: "      mk.onpointerdown = (pe) => {\n",
+      expect: /守 editable/,
+    },
+    {
+      name: "锁定态不再禁交互（去掉 is-locked 与原因）",
+      from: '    if (!editable) {\n      track.classList.add("is-locked");\n      track.title = et("cl.eventsLocked");\n    }\n',
+      to: "",
+      expect: /锁定态/,
+    },
+  ];
+  for (const m of muts13) {
+    const after = main13.replace(m.from, m.to);
+    check(after !== main13, `变异「${m.name}」确实改动了源码`);
+    if (after === main13) continue;
+    const bad2 = m.pure ? await pureBad(await loadPure(pureSlice(after))) : wireBad(after, i18n13);
+    check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+    if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+  }
+  check(fs.readFileSync(mainPath13, "utf8") === main13, "变异全程未落盘：main.ts 与判据读到的逐字一致（sha256 等价）");
+  const { createHash } = await import("node:crypto");
+  console.log(`  · task-13 ① main.ts sha256=${createHash("sha256").update(fs.readFileSync(mainPath13)).digest("hex").slice(0, 16)}…`);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
