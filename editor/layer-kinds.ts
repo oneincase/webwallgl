@@ -55,6 +55,10 @@ export const BUILTIN_LAYER_KINDS: LayerKindDef[] = [
   { kind: "light", builtin: true, canAnimate: true, create: (doc, opts) => addLightLayer(doc, "lpoint", opts?.name ?? "Light") },
   { kind: "camera", builtin: true, create: (doc, opts) => addCameraLayer(doc, opts?.name ?? "Camera") },
   { kind: "group", builtin: true, canAnimate: true },
+  // A14：WE 的 `component` 对象（parse.js:539）。语料 0 命中 ⇒ 只修「降级成 other」+
+  // 只读标注：不登记 create（「添加图层」菜单依旧列不出来），也不给 canHaveEffects /
+  // canAnimate —— 引擎不渲染它，挂效果与关键帧没有消费侧。
+  { kind: "component", builtin: true },
   { kind: "other", builtin: true },
 ];
 layerKinds.setFallback(BUILTIN_LAYER_KINDS);

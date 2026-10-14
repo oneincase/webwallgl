@@ -13,7 +13,7 @@
  *   F. 示例插件（examples/plugins/*）全部能装上且 active；木偶生成器产物经 irToGltf → gltfToModel 往返；
  *   H. M10：七个 UI 槽位都能被贡献且 mount 时真的渲染进宿主（含变化重绘与卸载清理）；
  *      particles.components 数据入口（路径数组校验 / 组件白名单 / 参数 DSL / 停用回落内置）；逐项权限开关结算 allow；
- *   G. 变异红测：把权限门控 / 启用判断 / 整包原子性改坏，确认对应判据变红。
+ *   G. 变异红测：把权限门控 / 启用判断 / 整包原子性 / 重挂时的旧 Scope 回收改坏，确认对应判据变红。
  */
 import { build } from "esbuild";
 import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
@@ -628,22 +628,27 @@ async function m10Suite(M) {
   m.dispose();
   check(M10_SLOTS.every((s) => a.ui.items(s).length === 0), "插件卸载：七个槽位的贡献全部撤回");
 
-  // 逐项权限开关：settings 写 false → 挂载时结算的 allow 里就少了这一项
+  // 逐项权限开关：settings 写 false → 挂载时结算的 allow 里就少了这一项。
+  // 槽位项按官方姿势用 ctx.effect 登记（Disposer 随 Scope 回收），这样「关权限 → 重挂 → 旧贡献撤回」才可观察：
+  // 裸 ctx.get("ui").add(...) 的项不会随 Scope 消失，判据看着在测回收、其实测不到。
   const permPkg = {
     "wwgl-plugin.json": manifest({ id: "m10-perm", main: "index.js", permissions: ["inspector", "ui"] }),
-    "index.js": `export default { name: "m10-perm", inject: ["inspector", "ui"], apply(ctx) { ctx.get("ui").add("toolbar", { id: "m10-perm-btn", render: () => null }); } };`,
+    "index.js": `export default { name: "m10-perm", inject: ["inspector", "ui"], apply(ctx) { ctx.effect(() => ctx.get("ui").add("toolbar", { id: "m10-perm-btn", render: () => null })); } };`,
   };
-  const { m: m2, settings } = await bootWith(M, [memSource("store", new Map([["m10-perm", { stamp: "1", files: permPkg }]]))]);
+  const { a: a2, m: m2, settings } = await bootWith(M, [memSource("store", new Map([["m10-perm", { stamp: "1", files: permPkg }]]))]);
+  const permBtn = () => a2.ui.items("toolbar").filter((x) => x.id === "m10-perm-btn").length;
   await m2.refresh();
-  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]), `逐项权限默认全开：granted = ${json(m2.list()[0]?.granted)}`);
+  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]) && permBtn() === 1,
+    `逐项权限默认全开：granted = ${json(m2.list()[0]?.granted)}，槽位项 ${permBtn()} 个`);
   settings.set(M.ext.permKey("m10-perm", "inspector"), false);
   await m2.reload("m10-perm");
   const e2 = m2.list()[0];
-  check(e2?.status === "pending" && json(e2.granted) === json(["ui"]) && json(e2.missing) === json(["inspector"]),
-    `逐项关掉 inspector → 白名单里只剩 ui，子插件 pending（${e2?.status} granted=${json(e2?.granted)} missing=${json(e2?.missing)}）`);
+  check(e2?.status === "pending" && json(e2.granted) === json(["ui"]) && json(e2.missing) === json(["inspector"]) && permBtn() === 0,
+    `逐项关掉 inspector → 白名单里只剩 ui，子插件 pending 且旧槽位项随之撤回（${e2?.status} granted=${json(e2?.granted)} missing=${json(e2?.missing)} 槽位项=${permBtn()}）`);
   settings.set(M.ext.permKey("m10-perm", "inspector"), true);
   await m2.reload("m10-perm");
-  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]), "逐项打开 → 重新 active（白名单在挂载时重新结算）");
+  check(m2.list()[0]?.status === "active" && json(m2.list()[0].granted) === json(["inspector", "ui"]) && permBtn() === 1,
+    `逐项打开 → 重新 active、槽位项回来且不重复（白名单在挂载时重新结算，槽位项 ${permBtn()} 个）`);
   check(json(M.ext.grantedOf({ permissions: ["inspector", "ui", "nope"] }, new Set(["ui"]))) === json(["inspector"]), "grantedOf(m, denied)：granted = 清单 ∩ GRANTABLE − 逐项关掉的");
   check(json(M.ext.grantedOf({ permissions: ["inspector", "ui"] })) === json(["inspector", "ui"]), "grantedOf 第二参缺省时行为与旧版逐位一致（不关任何项）");
   m2.dispose();
@@ -673,6 +678,7 @@ const mutants = [
   { name: "未知 contributes 不报错", file: EXT, from: "if (!known.has(k)) errors.push", to: "if (false) errors.push", expect: /坏清单/ },
   { name: "目录来源不再优先", file: MGR, from: "RANK[k.source.kind] > RANK[cur.source.kind]", to: "false", expect: /目录版/ },
   { name: "内置示例盖过已安装版", file: MGR, from: "dir: 3, store: 2, memory: 1, bundled: 0", to: "dir: 3, store: 2, memory: 1, bundled: 9", expect: /内置/ },
+  { name: "重挂不撤旧 Scope（槽位项不回收）", file: MGR, from: "scopes.get(id)?.dispose();", to: "void scopes.get(id);", expect: /随之撤回|槽位项/ },
 ];
 let killed = 0;
 console.log("\nG 变异红测");

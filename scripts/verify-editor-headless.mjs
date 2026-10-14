@@ -2007,8 +2007,9 @@ async function runCreateAndDraft(ctx) {
   var ao = await rawObj();
   var abW = sizeOf(ao)[0] / 2;
   var origin0 = ao.origin;
-  // 开关集合就是 editor/keyframes.ts 的 ANIM_FIELDS（M4 起 brightness 也是可关键帧字段，共六个）
-  check(await ev(`(() => { const on = [...document.querySelectorAll('.ed-anim [data-anim-on]')]; return on.length === 6 && on.map((c) => c.dataset.animOn).join() === 'origin,scale,angles,alpha,color,brightness' && on.every((c) => !c.checked); })()`), "检视器有「动画」分组：位置 / 缩放 / 旋转 / 不透明度 / 颜色 / 亮度六个开关，缺省全关");
+  // 开关集合 = editor/keyframes.ts 的 ANIM_FIELDS 按图层种类过滤（A13：文字层拿到 visible 与 maxwidth，
+  // 判据与离线段 A13 的 animFieldsForKind("text") 同一口径）
+  check(await ev(`(() => { const on = [...document.querySelectorAll('.ed-anim [data-anim-on]')]; return on.length === 8 && on.map((c) => c.dataset.animOn).join() === 'origin,scale,angles,alpha,color,brightness,visible,maxwidth' && on.every((c) => !c.checked); })()`), "检视器有「动画」分组：文字层八个开关（位置 / 缩放 / 旋转 / 不透明度 / 颜色 / 亮度 / 可见 / 限宽），缺省全关");
   if (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) await clickSel("#tb-play");
   await seekTo(0);
 

@@ -310,6 +310,10 @@ import { irToGltf, type ModelIR } from "./model-ir";
 import {
   FONT_FILE_RE,
   H_ALIGNS,
+  MAX_TEXT_PADDING,
+  MAX_TEXT_ROWS,
+  MAX_TEXT_SIZE,
+  MAX_TEXT_WIDTH,
   SYSTEM_FONTS,
   V_ALIGNS,
   addTextLayer,
@@ -358,6 +362,7 @@ import {
   type ParticleFieldView,
 } from "./particle-params";
 import {
+  MAX_SOUND_TIME,
   PLAYBACK_MODES,
   addSoundLayer,
   getSoundFields,
@@ -373,6 +378,7 @@ import {
 import {
   ANIM_FIELDS,
   ANIM_MODES,
+  animFieldsForKind,
   animSummary,
   baseValue,
   copyKeysAt,
@@ -10505,7 +10511,9 @@ function textGroup(node: LayerNode): HTMLElement {
   const size = document.createElement("input");
   size.type = "number";
   size.min = "1";
-  size.max = "1000";
+  // 此前是字面量上限，与 text.ts 的校验各写一份 ⇒ 收成单一真源（编辑器侧输入护栏，不是引擎上限：
+  // 读侧不夹（超上限照原样显示）、只拒写）
+  size.max = String(MAX_TEXT_SIZE);
   size.step = "1";
   size.value = fmtNum(f.pointsize);
   size.addEventListener("change", () => setField("pointsize", "tx.size", Number(size.value)));
@@ -10529,10 +10537,48 @@ function textGroup(node: LayerNode): HTMLElement {
   const pad = document.createElement("input");
   pad.type = "number";
   pad.min = "0";
+  // 编辑器侧输入护栏，不是引擎上限（padding 由引擎 parseNum 读，无范围）：读侧不夹（超上限照原样显示）、只拒写；
+  // 上限单一真源 = text.ts 的 MAX_TEXT_PADDING（校验与输入框此前各写一份字面量）
+  pad.max = String(MAX_TEXT_PADDING);
   pad.step = "1";
   pad.value = fmtNum(f.padding);
   pad.addEventListener("change", () => setField("padding", "tx.padding", Number(pad.value)));
   row("tx.padding", pad);
+
+  // 文字布局（A13）：五个字段都是引擎真读（parse.js:516-520）。开关与限值的耦合按引擎口径照抄 ——
+  // limitwidth 只在 maxwidth > 0 时换行、limitrows 只在 maxrows > 0 时截行（text-layout.js:41 / :77-80），
+  // 所以限值为 0 时下面给一条提示，避免「勾了开关没反应」被当成 bug。
+  const numRow = (field: "maxwidth" | "maxrows", key: string, value: number) => {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = "0";
+    // 编辑器侧输入护栏，不是引擎上限（parse.js:516-517 只做 parseNum，无范围）：读侧不夹（超上限照原样显示）、只拒写。
+    // 上限挂在输入框上，让「填 200000 被拒」有可见的范围解释；单一真源 = text.ts 的 MAX_TEXT_WIDTH / MAX_TEXT_ROWS。
+    inp.max = field === "maxwidth" ? String(MAX_TEXT_WIDTH) : String(MAX_TEXT_ROWS);
+    inp.step = "1";
+    inp.value = fmtNum(value);
+    inp.addEventListener("change", () => setField(field, key, Number(inp.value)));
+    row(key, inp);
+  };
+  const boolRow = (field: "limitwidth" | "limitrows" | "limituseellipsis", key: string, checked: boolean) => {
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.checked = checked;
+    inp.disabled = !editable;
+    inp.dataset.text = key.slice(3);
+    inp.addEventListener("change", () => setField(field, key, inp.checked));
+    box.appendChild(inp);
+    const l = document.createElement("label");
+    l.textContent = et(key);
+    form.append(l, box);
+  };
+  numRow("maxwidth", "tx.maxwidth", f.maxwidth);
+  numRow("maxrows", "tx.maxrows", f.maxrows);
+  boolRow("limitwidth", "tx.limitwidth", f.limitwidth);
+  boolRow("limitrows", "tx.limitrows", f.limitrows);
+  boolRow("limituseellipsis", "tx.limituseellipsis", f.limituseellipsis);
 
   const bgBox = document.createElement("div");
   bgBox.className = "ed-fx-param";
@@ -10552,6 +10598,9 @@ function textGroup(node: LayerNode): HTMLElement {
   row("tx.bg", bgBox);
 
   group.appendChild(form);
+  if ((f.limitwidth && !(f.maxwidth > 0)) || (f.limitrows && !(f.maxrows > 0)) || (f.limituseellipsis && !f.limitrows)) {
+    group.appendChild(note(et("tx.limitNote")));
+  }
   if (scripted) group.appendChild(note(et("tx.scripted")));
   else if (isBoundText(o)) {
     const u = (o.text as { user?: unknown }).user;
@@ -10854,6 +10903,40 @@ function soundGroup(node: LayerNode): HTMLElement {
   silentBox.appendChild(silent);
   row("snd.startsilent", silentBox);
 
+  // 播放参数（A13）：读点 parse.js:486-489。本机渲染侧还没接这四个字段（音频路径只消费
+  // playbackmode / volume / startsilent，见 sound.ts 文件头），这里保证读写保真、不丢作者数据。
+  const timeRow = (field: "maxtime" | "mintime", key: string, value: number) => {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = "0";
+    // 编辑器侧输入护栏，不是引擎上限（parse.js:486 只做 parseNum，无范围）：读侧不夹（超上限照原样显示）、只拒写。
+    // 上限挂在输入框上，让「填 7200 被拒」有可见的范围解释；单一真源 = sound.ts 的 MAX_SOUND_TIME。
+    inp.max = String(MAX_SOUND_TIME);
+    inp.step = "0.1";
+    inp.value = fmtNum(value);
+    inp.disabled = !editable;
+    inp.dataset.sound = field;
+    inp.title = et("snd.timeTip");
+    inp.addEventListener("change", () => setField(field, key, Number(inp.value)));
+    row(key, inp);
+  };
+  const flagRow = (field: "spatialization" | "muteineditor", key: string, checked: boolean) => {
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.checked = checked;
+    inp.disabled = !editable;
+    inp.dataset.sound = field;
+    inp.addEventListener("change", () => setField(field, key, inp.checked));
+    box.appendChild(inp);
+    row(key, box);
+  };
+  timeRow("maxtime", "snd.maxtime", f.maxtime);
+  timeRow("mintime", "snd.mintime", f.mintime);
+  flagRow("spatialization", "snd.spatialization", f.spatialization);
+  flagRow("muteineditor", "snd.muteineditor", f.muteineditor);
+
   group.appendChild(form);
   const notes = [et("snd.hint")];
   if (f.playbackmode === "random") notes.push(et("snd.randomNote"));
@@ -10864,15 +10947,45 @@ function soundGroup(node: LayerNode): HTMLElement {
 
 // ---------- 关键帧动画：字段开 / 关动画、当前帧打关键帧、改动自动落关键帧、时长 / 模式 / 插值 ----------
 
-const canAnimate = (n: LayerNode) => n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model";
-const ANIM_LABEL: Record<AnimField, string> = { origin: "f.origin", scale: "f.scale", angles: "f.angles", alpha: "f.alpha", color: "f.color", brightness: "f.brightness" };
+/**
+ * 能放映「动画」分组的图层种类。除历史上这四种（image / text / particle / model）外，A13 加上：
+ * - sound：引擎逐帧写回把 volume 曲线落到 layer.soundprops.volume（parse.js:663 白名单 +
+ *   scene-mount.ts:6956），且声音层本来就能被位移 / 缩放曲线驱动；
+ * - camera：zoom 曲线的语义消费方是 scene.cameraTransforms.zoom（parse.js:964 + scene-mount.ts:6990），
+ *   语料里就挂在相机对象上（3521337568 相机路径对象开场 zoom 3→1）。
+ * 某个字段对哪种层有意义由 keyframes.ts 的 ANIM_FIELD_KINDS 表决定（animFieldsForKind 查表），
+ * 所以这里只管「层能不能动画」，不在这里散字段 if。
+ */
+const canAnimate = (n: LayerNode) =>
+  n.kind === "image" || n.kind === "text" || n.kind === "particle" || n.kind === "model" || n.kind === "sound" || n.kind === "camera";
+const ANIM_LABEL: Record<AnimField, string> = {
+  origin: "f.origin",
+  scale: "f.scale",
+  angles: "f.angles",
+  alpha: "f.alpha",
+  color: "f.color",
+  brightness: "f.brightness",
+  // A13 追加的四项：顺序与 keyframes.ts 的 ANIM_FIELDS / CHANNELS 一致；Record<AnimField, string>
+  // 少一个键就编译不过，所以这张表也是「新字段一定进了 UI」的编译期判据。
+  visible: "f.visible",
+  volume: "f.volume",
+  maxwidth: "f.maxwidth",
+  zoom: "f.zoom",
+};
 
 /** 画面上的当前值（动画字段 = 曲线在当前时刻的值）；没有引擎时退回静态值 */
 function liveValue(node: LayerNode, f: AnimField): number[] {
   const p = editor?.getLayerProps(Number(node.id));
   if (!p) return baseValue(node.obj, f);
-  // 1 通道字段（alpha / brightness）在 EditorLayerProps 上是裸数字，不能展开
-  return f === "alpha" ? [p.alpha] : f === "brightness" ? [p.brightness] : [...p[f]];
+  // 1 通道字段在 EditorLayerProps 上是裸值，不能展开：alpha / brightness 是数字，
+  // visible 是布尔（曲线数据仍是 0/1，理由见 keyframes.ts 文件头）
+  if (f === "alpha") return [p.alpha];
+  if (f === "brightness") return [p.brightness];
+  if (f === "visible") return [p.visible ? 1 : 0];
+  if (f === "origin" || f === "scale" || f === "angles" || f === "color") return [...p[f]];
+  // volume / maxwidth / zoom 不在 EditorLayerProps 里（引擎侧分别住在 layer.soundprops.volume /
+  // layer.textMaxwidth / scene.cameraTransforms.zoom）⇒ 退回文档里的静态值
+  return baseValue(node.obj, f);
 }
 
 const nowTime = () => editor?.time ?? 0;
@@ -10919,10 +11032,14 @@ function animGroup(node: LayerNode): HTMLElement {
   const layer = nodeName(node.id);
   const form = document.createElement("div");
   form.className = "ed-fx-params";
-  for (const f of ANIM_FIELDS) {
+  // 只列该图层种类上有引擎消费点的字段（keyframes.ts 的 ANIM_FIELD_KINDS 表）：
+  // 文字层多 maxwidth、声音层多 volume、相机层多 zoom，visible 所有种类都有
+  for (const f of animFieldsForKind(node.kind)) {
     const view = getAnim(node.obj, f);
     const l = document.createElement("label");
     l.textContent = et(ANIM_LABEL[f]);
+    // 可见性动画是 0 / 1 单通道（引擎逐帧折成布尔），给个口径提示
+    if (f === "visible") l.title = et("anim.visibleHint");
     const head = document.createElement("div");
     head.className = "ed-fx-param ed-anim-head";
     head.dataset.field = f;

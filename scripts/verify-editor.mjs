@@ -2826,7 +2826,7 @@ section("AG. 时间轴按层动画条 / 关键帧复制粘贴 keyframes.ts");
   const before = json(keep);
   check(!kfMod.pasteKeysAt(keep, { origin: [1, 1, 1], alpha: [1, 2] }, 1) && json(keep) === before, "剪贴板里有一项维度不对：整体拒绝、一处不改");
   check(!kfMod.pasteKeysAt(keep, { origin: [1, 1, 1] }, 1e6) && json(keep) === before, "超出时长上限：拒绝、不改");
-  check(!kfMod.pasteKeysAt(keep, {}, 1) && !kfMod.pasteKeysAt(keep, { origin: [1, 1, 1] }, -1) && !kfMod.pasteKeysAt(keep, { visible: [1] }, 1), "空剪贴板 / 负时刻 / 非动画字段：拒绝");
+  check(!kfMod.pasteKeysAt(keep, {}, 1) && !kfMod.pasteKeysAt(keep, { origin: [1, 1, 1] }, -1) && !kfMod.pasteKeysAt(keep, { depthtest: [1] }, 1), "空剪贴板 / 负时刻 / 非动画字段：拒绝");
   const same = { origin: { value: "0 0 0", animation: a3([0, 30], [0, 4], { length: 60, mode: "loop" }) } };
   check(!kfMod.pasteKeysAt(same, { origin: [4, 0, 0] }, 1), "同帧同值：不算改动（不进撤销栈）");
   const roundTrip = { origin: "0 0 0" };
@@ -9938,6 +9938,470 @@ section("SKEL. 骨架与权重 editor/skeleton.ts + editor/weights.ts（P2）");
   );
   const p2Css = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
   check(/\.ed-skel\b/.test(p2Css) && /\.ed-wt\b/.test(p2Css), "骨架 / 权重面板有样式（.ed-skel / .ed-wt）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+section("A13. 字段补全：文字布局 / 声音播放 / 关键帧 visible·volume·maxwidth·zoom");
+{
+  const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  const layoutSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/text-layout.js"), "utf8");
+  const mountSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const mainA13 = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const textPath = path.join(ROOT, "editor/text.ts");
+  const soundPath = path.join(ROOT, "editor/sound.ts");
+  const kfPath = path.join(ROOT, "editor/keyframes.ts");
+  const textSrc = fs.readFileSync(textPath, "utf8");
+  const soundSrc = fs.readFileSync(soundPath, "utf8");
+  const kfSrc = fs.readFileSync(kfPath, "utf8");
+  const keyCount = (key) => (i18nSrc.match(new RegExp(`"${key.replace(/\./g, "\\.")}":`, "g")) || []).length;
+
+  // ① 引擎读点：零命中的字段不许有入口 —— 这就是「只补引擎真读字段」的闸门
+  check(
+    /textMaxwidth: parseNum\(o\.maxwidth, 0\)/.test(parseSrc) &&
+      /textMaxrows: parseNum\(o\.maxrows, 0\)/.test(parseSrc) &&
+      /textLimitwidth: parseBool\(o\.limitwidth, false\)/.test(parseSrc) &&
+      /textLimitrows: parseBool\(o\.limitrows, false\)/.test(parseSrc) &&
+      /textLimituseellipsis: parseBool\(o\.limituseellipsis, false\)/.test(parseSrc),
+    "引擎读点：文字布局五字段 scene/parse.js:516-520（maxwidth→textMaxwidth / maxrows→textMaxrows / limitwidth·limitrows·limituseellipsis→textLimit*）",
+  );
+  check(
+    /const wrapW = opts\.limitwidth && opts\.maxwidth > 0 \? opts\.maxwidth : Infinity/.test(layoutSrc) &&
+      /if \(opts\.limitrows && opts\.maxrows > 0 && lines\.length > opts\.maxrows\)/.test(layoutSrc) &&
+      /if \(opts\.limituseellipsis\)/.test(layoutSrc),
+    "文字布局消费点 render/text-layout.js:41 / :77-80：限宽换行 + 限行截断 + 省略号（开关与限值的耦合口径照抄引擎）",
+  );
+  check(
+    /maxtime: parseNum\(o\.maxtime, 0\)/.test(parseSrc) &&
+      /mintime: parseNum\(o\.mintime, 0\)/.test(parseSrc) &&
+      /spatialization: parseBool\(o\.spatialization, false\)/.test(parseSrc) &&
+      /muteineditor: parseBool\(o\.muteineditor, false\)/.test(parseSrc),
+    "引擎读点：声音四字段 scene/parse.js:486-489（maxtime / mintime parseNum 缺省 0；spatialization / muteineditor parseBool 缺省 false）",
+  );
+  {
+    const at = parseSrc.indexOf("objectAnimations:");
+    const m = /for \(const f of \[([^\]]+)\]\)/.exec(parseSrc.slice(at, at + 1500));
+    const fields = m ? m[1].split(",").map((s) => s.trim().replace(/^'|'$/g, "")) : [];
+    check(
+      json(fields) === json(["scale", "origin", "color", "alpha", "brightness", "angles", "visible", "volume", "maxwidth", "zoom"]),
+      "引擎关键帧白名单 scene/parse.js:663 十项且顺序逐字未变（新四字段追加在原六项之后）",
+    );
+  }
+  check(
+    /run\.layer\.visibleSelf = !!out;/.test(mountSrc) &&
+      /run\.layer\.soundprops\.volume = out;/.test(mountSrc) &&
+      /run\.layer\.textMaxwidth = out;/.test(mountSrc) &&
+      /\(scene as any\)\.cameraTransforms\.zoom = out;/.test(mountSrc),
+    "宿主逐帧写回 renderer/src/scene-mount.ts:6949-6966：visible→visibleSelf / volume→soundprops.volume / maxwidth→textMaxwidth / zoom→cameraTransforms.zoom（四个都是 1 通道标量）",
+  );
+
+  // ② 文字布局：缺省 / 读写对称 / 只碰自己那一个键 / 大小写不敏感命中原名
+  const tEmpty = { text: "hi" };
+  {
+    const f = textMod.getTextFields(tEmpty);
+    check(
+      f.maxwidth === 0 && f.maxrows === 0 && f.limitwidth === false && f.limitrows === false && f.limituseellipsis === false,
+      "文字布局五字段缺省 = 引擎缺省：maxwidth 0 / maxrows 0 / limitwidth false / limitrows false / limituseellipsis false",
+    );
+  }
+  check(textMod.setTextField(tEmpty, "maxwidth", 320) && tEmpty.maxwidth === 320 && textMod.getTextFields(tEmpty).maxwidth === 320, "maxwidth 写读对称（320）");
+  check(textMod.setTextField(tEmpty, "maxrows", 3) && tEmpty.maxrows === 3 && textMod.getTextFields(tEmpty).maxrows === 3, "maxrows 写读对称（3）");
+  check(
+    textMod.setTextField(tEmpty, "limitwidth", true) && tEmpty.limitwidth === true && textMod.getTextFields(tEmpty).limitwidth === true,
+    "limitwidth 写读对称（true）",
+  );
+  check(
+    textMod.setTextField(tEmpty, "limitrows", true) && tEmpty.limitrows === true && textMod.getTextFields(tEmpty).limitrows === true,
+    "limitrows 写读对称（true）",
+  );
+  check(
+    textMod.setTextField(tEmpty, "limituseellipsis", true) && tEmpty.limituseellipsis === true && textMod.getTextFields(tEmpty).limituseellipsis === true,
+    "limituseellipsis 写读对称（true）",
+  );
+  check(
+    !textMod.setTextField(tEmpty, "maxwidth", -1) &&
+      !textMod.setTextField(tEmpty, "maxwidth", textMod.MAX_TEXT_WIDTH + 1) &&
+      !textMod.setTextField(tEmpty, "maxrows", textMod.MAX_TEXT_ROWS + 1) &&
+      !textMod.setTextField(tEmpty, "limitwidth", "yes") &&
+      !textMod.setTextField(tEmpty, "limitrows", 1) &&
+      !textMod.setTextField(tEmpty, "limituseellipsis", 1),
+    "文字布局：越界 / 非数字 / 非布尔的输入一律拒绝（不写坏原值）",
+  );
+  {
+    const o = { text: "hi", font: "systemfont_arial", color: "1 1 1", MaxWidth: 100 };
+    const ok = textMod.setTextField(o, "maxwidth", 320);
+    check(
+      ok && o.MaxWidth === 320 && !("maxwidth" in o) && o.font === "systemfont_arial" && o.color === "1 1 1" && textMod.getTextFields(o).maxwidth === 320,
+      "大小写不敏感命中真实键名写回（MaxWidth 更新、不多出 maxwidth），且不碰 font / color 等别的键（objprops 铁律 1 / 2）",
+    );
+  }
+  {
+    const o = { text: "hi", limitwidth: { user: "w", value: false } };
+    check(textMod.setTextField(o, "limitwidth", true) && o.limitwidth.user === "w" && o.limitwidth.value === true, "绑定包装只改 .value（limitwidth）");
+  }
+
+  // ③ 声音播放参数：缺省 / 读写对称 / 不碰别的键
+  const sEmpty = { sound: ["a.mp3"] };
+  {
+    const f = sndMod.getSoundFields(sEmpty);
+    check(
+      f.maxtime === 0 && f.mintime === 0 && f.spatialization === false && f.muteineditor === false,
+      "声音四字段缺省 = 引擎缺省：maxtime 0 / mintime 0 / spatialization false / muteineditor false",
+    );
+    check(f.volume === 1 && f.playbackmode === "single" && f.startsilent === false, "既有 volume / playbackmode / startsilent 缺省未回归（1 / single / false）");
+  }
+  check(sndMod.setSoundField(sEmpty, "maxtime", 12.5) && sEmpty.maxtime === 12.5 && sndMod.getSoundFields(sEmpty).maxtime === 12.5, "maxtime 写读对称（12.5）");
+  check(sndMod.setSoundField(sEmpty, "mintime", 2) && sEmpty.mintime === 2 && sndMod.getSoundFields(sEmpty).mintime === 2, "mintime 写读对称（2）");
+  check(
+    sndMod.setSoundField(sEmpty, "spatialization", true) && sEmpty.spatialization === true && sndMod.getSoundFields(sEmpty).spatialization === true,
+    "spatialization 写读对称（true）",
+  );
+  check(
+    sndMod.setSoundField(sEmpty, "muteineditor", true) && sEmpty.muteineditor === true && sndMod.getSoundFields(sEmpty).muteineditor === true,
+    "muteineditor 写读对称（true）",
+  );
+  check(
+    !sndMod.setSoundField(sEmpty, "maxtime", -1) &&
+      !sndMod.setSoundField(sEmpty, "mintime", sndMod.MAX_SOUND_TIME + 1) &&
+      !sndMod.setSoundField(sEmpty, "spatialization", "yes") &&
+      !sndMod.setSoundField(sEmpty, "muteineditor", 1),
+    "声音：越界 / 非布尔的输入一律拒绝",
+  );
+  {
+    const o = { sound: ["a.mp3"], volume: 0.5, Maxtime: 3, name: "s" };
+    const ok = sndMod.setSoundField(o, "maxtime", 9);
+    check(
+      ok && o.Maxtime === 9 && !("maxtime" in o) && o.volume === 0.5 && o.name === "s" && json(o.sound) === json(["a.mp3"]) && sndMod.getSoundFields(o).maxtime === 9,
+      "大小写不敏感命中原名写回（Maxtime 更新、不多出 maxtime），且不碰 volume / name / sound（objprops 铁律 1 / 2）",
+    );
+  }
+
+  // ④ 关键帧：新四字段进表 / 1 通道 / 基准与静态形状对齐引擎 / 剪贴板与拆分
+  check(
+    json(kfMod.ANIM_FIELDS) === json(["origin", "scale", "angles", "alpha", "color", "brightness", "visible", "volume", "maxwidth", "zoom"]) &&
+      kfMod.CHANNELS.visible === 1 &&
+      kfMod.CHANNELS.volume === 1 &&
+      kfMod.CHANNELS.maxwidth === 1 &&
+      kfMod.CHANNELS.zoom === 1,
+    "ANIM_FIELDS 十项（既有六项顺序与语义不变、新四字段追加在后），visible / volume / maxwidth / zoom 都是 1 通道",
+  );
+  {
+    const cases = [
+      ["visible", 1, 0],
+      ["volume", 1, 0.25],
+      ["maxwidth", 0, 400],
+      ["zoom", 1, 2],
+    ];
+    let allOk = true;
+    const rows = [];
+    for (const [f, dflt, keyed] of cases) {
+      const o = {};
+      const b = kfMod.baseValue(o, f);
+      const enabled = kfMod.enableAnim(o, f, b);
+      const view = kfMod.getAnim(o, f);
+      const set = kfMod.setKey(o, f, 30, [keyed]);
+      const v2 = kfMod.getAnim(o, f);
+      const keys = v2 ? v2.keys.map((k) => [k.frame, k.value[0]]) : [];
+      const ok =
+        b.length === 1 &&
+        b[0] === dflt &&
+        enabled &&
+        !!view &&
+        view.channels === 1 &&
+        set &&
+        json(keys) === json([[0, dflt], [30, keyed]]) &&
+        kfMod.animatedFields(o).includes(f);
+      if (!ok) allOk = false;
+      rows.push(`${f}:基准${b[0]}→${json(keys)}`);
+    }
+    check(allOk, `四个新字段都能 enableAnim / setKey / getAnim 走通，基准缺省与引擎静态值一致（${rows.join(" · ")}）`);
+  }
+  check(
+    kfMod.baseValue({ visible: false }, "visible")[0] === 0 && kfMod.baseValue({ visible: true }, "visible")[0] === 1 && kfMod.baseValue({ volume: 0.5 }, "volume")[0] === 0.5,
+    "baseValue 读静态值：visible 布尔折成 0 / 1（false 不能再落回缺省 1），数字直取",
+  );
+  {
+    const o = { maxwidth: 0 };
+    kfMod.enableAnim(o, "maxwidth", [0]);
+    kfMod.setKey(o, "maxwidth", 30, [400]);
+    kfMod.disableAnim(o, "maxwidth", [400]);
+    check(o.maxwidth === 400, "disableAnim：maxwidth 写回标量数字（不是 \"0 0 0\" 串）");
+    const v = { visible: false };
+    kfMod.enableAnim(v, "visible", [1]);
+    kfMod.disableAnim(v, "visible", [0]);
+    check(v.visible === false, "disableAnim：visible 写回布尔（引擎 parseBool 认布尔）");
+  }
+  {
+    const o = {};
+    kfMod.enableAnim(o, "zoom", [1]);
+    check(o.zoom && o.zoom.value === 1 && kfMod.getAnim(o, "zoom").channels === 1, "无 zoom 字段的层开动画补 value 1（相机对象缺省 1）");
+    const s = {};
+    kfMod.enableAnim(s, "visible", [1]);
+    check(s.visible && s.visible.value === true, "无 visible 字段的层开动画补 value true（对象 visible 缺省 true）");
+  }
+  {
+    const o = { alpha: 0.5, maxwidth: 0 };
+    kfMod.enableAnim(o, "maxwidth", [0]);
+    const r = kfMod.splitAnimated(o, { maxwidth: 400, alpha: 0.5 });
+    check(
+      json(r.keyed.maxwidth) === json([400]) && !("maxwidth" in r.plain) && r.plain.alpha === 0.5,
+      "splitAnimated：开了动画的新字段转关键帧（maxwidth），没开动画的留在 plain（alpha）",
+    );
+    // 布尔补丁：只有 1 通道字段（visible）折算成 0/1 关键帧；多通道字段收到布尔是真类型错误，留在 plain
+    const b = { alpha: 0.5 };
+    kfMod.enableAnim(b, "visible", [1]);
+    const r2 = kfMod.splitAnimated(b, { visible: false, alpha: 0.5 });
+    check(
+      json(r2.keyed.visible) === json([0]) && !("visible" in r2.plain) && r2.plain.alpha === 0.5,
+      "splitAnimated：开过动画的 visible 传布尔 ⇒ 折算成 0/1 关键帧（留在 plain 会被引擎求值器每帧覆盖回来）",
+    );
+    // 真实调用形态：树上的 ◉/○ 与检视器勾选都走 applyPatch → splitAnimated → setKey
+    const rv = {};
+    kfMod.enableAnim(rv, "visible", [1]);
+    kfMod.setKey(rv, "visible", 30, [1]);
+    const r2v = kfMod.splitAnimated(rv, { visible: false });
+    for (const f of Object.keys(r2v.keyed)) kfMod.setKey(rv, f, 30, r2v.keyed[f]);
+    check(
+      json(r2v.keyed.visible) === json([0]) && !("visible" in r2v.plain) && rv.visible.animation.c0.find((k) => k.frame === 30).value === 0,
+      "真实调用形态（enableAnim + 中途帧改 visible=false + setKey 写回）：第 30 帧 visible 关键帧值 = 0",
+    );
+    const r2n = kfMod.splitAnimated({ visible: true }, { visible: false });
+    check(r2n.keyed.visible === undefined && r2n.plain.visible === false, "splitAnimated：没开动画的 visible 传布尔 ⇒ 仍走静态 plain（既有行为零回归）");
+    const bom = {
+      origin: { value: "0 0 0", animation: { c0: [{ frame: 0, value: 0 }], c1: [{ frame: 0, value: 0 }], c2: [{ frame: 0, value: 0 }], options: { fps: 30, length: 60, mode: "loop" } } },
+    };
+    const r2m = kfMod.splitAnimated(bom, { origin: false });
+    check(r2m.keyed.origin === undefined && r2m.plain.origin === false, "splitAnimated：多通道字段收到布尔 ⇒ 不折算、留在 plain（真类型错误不猜）");
+    {
+      const mutB = kfSrc.replace("      keyed[f] = [v ? 1 : 0];", "      continue;");
+      check(mutB !== kfSrc, "注入点存在（布尔补丁折算成 0/1 关键帧）");
+      const kfB = await loadEditorModule("keyframes", { [kfPath]: mutB });
+      const mo = {};
+      kfB.enableAnim(mo, "visible", [1]);
+      const mR = kfB.splitAnimated(mo, { visible: false });
+      check(json(mR.keyed.visible) !== json([0]), "不折算布尔时「visible 布尔补丁进关键帧」判据变红（静态写回会被求值器覆盖）");
+    }
+  }
+  {
+    const o = {};
+    kfMod.enableAnim(o, "volume", [1]);
+    kfMod.setKey(o, "volume", 30, [0.4]);
+    const clip = kfMod.copyKeysAt(o, 1);
+    check(json(clip && clip.volume) === json([0.4]), "copyKeysAt：新字段 volume 进剪贴板（t=1s → 第 30 帧，绝对画面值）");
+    const d = {};
+    check(
+      !!clip &&
+        kfMod.pasteKeysAt(d, clip, 1) &&
+        json(kfMod.getAnim(d, "volume").keys.map((k) => [k.frame, k.value[0]])) === json([[0, 1], [30, 0.4]]),
+      "pasteKeysAt：粘到没有动画的层先按静态基准开动画（volume 缺省 1）再打帧",
+    );
+    const e = {};
+    check(!kfMod.pasteKeysAt(e, { maxwidth: [1, 2] }, 0), "pasteKeysAt：新字段同样先验通道数（maxwidth 是 1 通道，给 2 个值就拒绝、一处不改）");
+  }
+  const kindExpect = {
+    text: ["origin", "scale", "angles", "alpha", "color", "brightness", "visible", "maxwidth"],
+    sound: ["origin", "scale", "angles", "alpha", "color", "brightness", "visible", "volume"],
+    camera: ["origin", "scale", "angles", "alpha", "color", "brightness", "visible", "zoom"],
+    image: ["origin", "scale", "angles", "alpha", "color", "brightness", "visible"],
+  };
+  check(
+    Object.entries(kindExpect).every(([kind, want]) => json(kfMod.animFieldsForKind(kind)) === json(want)),
+    "animFieldsForKind 查「字段 → 适用种类」表：文字层 8 个（+visible / maxwidth）、声音层 +volume、相机层 +zoom、图片层 7 个",
+  );
+  {
+    const headSrc = fs.readFileSync(path.join(ROOT, "scripts/verify-editor-headless.mjs"), "utf8");
+    const want = kfMod.animFieldsForKind("text").join(",");
+    const re = new RegExp(`on\\.map\\(\\(c\\) => c\\.dataset\\.animOn\\)\\.join\\(\\) === '${want}'`);
+    check(re.test(headSrc), `真机段（headless）文字层开关集合与 animFieldsForKind("text") 同口径：${want}`);
+  }
+
+  // ⑤ UI 接线 + i18n 成对
+  check(
+    /animFieldsForKind\(node\.kind\)/.test(mainA13) &&
+      /ANIM_LABEL: Record<AnimField, string>/.test(mainA13) &&
+      /visible: "f\.visible"/.test(mainA13) &&
+      /volume: "f\.volume"/.test(mainA13) &&
+      /maxwidth: "f\.maxwidth"/.test(mainA13) &&
+      /zoom: "f\.zoom"/.test(mainA13) &&
+      /et\("anim\.visibleHint"\)/.test(mainA13),
+    "检视器动画分组按图层种类取字段（ANIM_LABEL 十个键齐全），visible 行带 0 / 1 口径提示",
+  );
+  check(
+    /numRow\("maxwidth", "tx\.maxwidth"/.test(mainA13) &&
+      /numRow\("maxrows", "tx\.maxrows"/.test(mainA13) &&
+      /boolRow\("limitwidth", "tx\.limitwidth"/.test(mainA13) &&
+      /boolRow\("limitrows", "tx\.limitrows"/.test(mainA13) &&
+      /boolRow\("limituseellipsis", "tx\.limituseellipsis"/.test(mainA13) &&
+      /et\("tx\.limitNote"\)/.test(mainA13),
+    "文字面板接 5 行（限宽 / 最多行数 / 三个开关）+ 开关与限值耦合的引擎口径提示",
+  );
+  {
+    // 上限单一真源：两个数字行共用一个 numRow，上限在体内按字段取 text.ts 的导出（不写字面量）。
+    // 1000 在 main.ts 别处是毫秒换算（如 `(view.length / view.fps) * 1000`），所以否定断言只在 numRow 体内做。
+    const nrSrc = mainA13.slice(mainA13.indexOf("const numRow = "), mainA13.indexOf('numRow("maxwidth"'));
+    check(
+      /String\(MAX_TEXT_WIDTH\)/.test(nrSrc) &&
+        /String\(MAX_TEXT_ROWS\)/.test(nrSrc) &&
+        !/\b65535\b/.test(mainA13) &&
+        !/\b1000\b/.test(nrSrc) &&
+        textMod.MAX_TEXT_WIDTH === 65535 &&
+        textMod.MAX_TEXT_ROWS === 1000,
+      `文字行上限单一真源：限宽 / 最多行数取 text.ts 导出（模块实测 MAX_TEXT_WIDTH=${textMod.MAX_TEXT_WIDTH} / MAX_TEXT_ROWS=${textMod.MAX_TEXT_ROWS}），面板里不写字面量`,
+    );
+  }
+  {
+    // 字号 / 内边距的上限：校验与输入框此前各写一份字面量，收成 text.ts 的单一真源。
+    // 否定断言仍只在各自那一行的切片内做（main.ts 别处有毫秒换算常量与其它数字）。
+    const sizeSrc = mainA13.slice(mainA13.indexOf("const size = document.createElement"), mainA13.indexOf('row("tx.size", size)'));
+    const padSrc = mainA13.slice(mainA13.indexOf("const pad = document.createElement"), mainA13.indexOf('row("tx.padding", pad)'));
+    check(
+      /size\.max = String\(MAX_TEXT_SIZE\)/.test(sizeSrc) &&
+        !/1000/.test(sizeSrc) &&
+        textMod.MAX_TEXT_SIZE === 1000,
+      `字号上限单一真源：size 行取 text.ts 的 MAX_TEXT_SIZE（模块实测 ${textMod.MAX_TEXT_SIZE}），行内不再写死字面量`,
+    );
+    check(
+      /pad\.max = String\(MAX_TEXT_PADDING\)/.test(padSrc) && !/4096/.test(padSrc) && textMod.MAX_TEXT_PADDING === 4096,
+      `内边距上限单一真源：pad 行取 text.ts 的 MAX_TEXT_PADDING（模块实测 ${textMod.MAX_TEXT_PADDING}），行内不写死 4096`,
+    );
+  }
+  check(
+    /timeRow\("maxtime", "snd\.maxtime"/.test(mainA13) &&
+      /timeRow\("mintime", "snd\.mintime"/.test(mainA13) &&
+      /flagRow\("spatialization", "snd\.spatialization"/.test(mainA13) &&
+      /flagRow\("muteineditor", "snd\.muteineditor"/.test(mainA13) &&
+      /inp\.dataset\.sound = field/.test(mainA13),
+    "声音面板接 4 行（最长 / 最短间隔 + 空间化 / 编辑器内静音），带 data-sound 钩子",
+  );
+  check(
+    /inp\.max = String\(MAX_SOUND_TIME\)/.test(mainA13) && !/\b3600\b/.test(mainA13) && sndMod.MAX_SOUND_TIME === 3600,
+    "时间上限单一真源：输入护栏取 sound.ts 的 MAX_SOUND_TIME（main.ts 不写死 3600），填超上限被拒时输入框有可见的 range 解释",
+  );
+  {
+    const groups = [
+      ["文字布局", ["tx.maxwidth", "tx.maxrows", "tx.limitwidth", "tx.limitrows", "tx.limituseellipsis", "tx.limitNote"]],
+      ["声音播放", ["snd.maxtime", "snd.mintime", "snd.spatialization", "snd.muteineditor", "snd.timeTip"]],
+      ["关键帧", ["anim.visibleHint", "f.volume", "f.maxwidth", "f.zoom"]],
+    ];
+    for (const [label, keys] of groups) {
+      const bad = keys.filter((k) => keyCount(k) !== 2);
+      check(bad.length === 0, `i18n 成对（zh / en 各恰好一条）：${label} —— ${keys.join(" / ")}${bad.length ? `（缺：${bad.join(" / ")}）` : ""}`);
+    }
+  }
+  check(
+    /"tx\.limitNote": "开关只在限值 > 0 时生效/.test(i18nSrc) && /"tx\.limitNote": "The switches only take effect when the limit is above 0/.test(i18nSrc),
+    "i18n 的引擎口径提示落在词条里（tx.limitNote，zh / en 都说明开关依赖限值 > 0）",
+  );
+
+  // ⑥ 变异红测：把这轮的新判据改坏，必须变红
+  {
+    // (1) text.ts 的 writeField 不走 realKey ⇒ 大小写不敏感「命中原名写回」判据变红
+    const mut = textSrc.replace("  const k = realKey(obj, key);", "  const k = key;");
+    check(mut !== textSrc, "注入点存在（text.ts writeField 走 realKey）");
+    const mtext = await loadEditorModule("text", { [textPath]: mut });
+    const o = { text: "hi", MaxWidth: 100 };
+    mtext.setTextField(o, "maxwidth", 320);
+    check(o.MaxWidth === 100 && o.maxwidth === 320, "去掉 realKey 后「命中原名写回」判据变红：MaxWidth 不更新、多出一个 maxwidth");
+  }
+  {
+    // (2) sound.ts 的 maxtime 缺省被改 ⇒ 「缺省 = 引擎缺省 0」判据变红
+    const mut = soundSrc.replace("    maxtime: Number.isFinite(maxT) && maxT >= 0 ? maxT : 0,", "    maxtime: 5,");
+    check(mut !== soundSrc, "注入点存在（sound.ts maxtime 缺省）");
+    const msnd = await loadEditorModule("sound", { [soundPath]: mut });
+    check(msnd.getSoundFields({ sound: ["a.mp3"] }).maxtime === 5, "把 maxtime 缺省改成 5 后「缺省 = 引擎缺省 0」判据变红");
+  }
+  {
+    // (3) visible 的静态基准缺省被改 ⇒ baseValue 判据变红（锚点带上 brightness，避免打到 CHANNELS 里的同名行）
+    const mut = kfSrc.replace("  brightness: 1,\n  visible: 1,\n  volume: 1,\n  maxwidth: 0,", "  brightness: 1,\n  visible: 0,\n  volume: 1,\n  maxwidth: 0,");
+    check(mut !== kfSrc, "注入点存在（keyframes.ts BASE_DEFAULT.visible）");
+    const mkf = await loadEditorModule("keyframes", { [kfPath]: mut });
+    check(mkf.baseValue({}, "visible")[0] === 0, "把 visible 基准缺省改成 0 后「visible 缺省 true ⇒ 基准 1」判据变红");
+  }
+  {
+    // (4) 种类过滤表被改坏 ⇒ per-kind 判据变红
+    const mut = kfSrc.replace('  maxwidth: ["text"],', "  maxwidth: null,");
+    check(mut !== kfSrc, "注入点存在（keyframes.ts ANIM_FIELD_KINDS.maxwidth）");
+    const mkf = await loadEditorModule("keyframes", { [kfPath]: mut });
+    check(json(mkf.animFieldsForKind("image")) !== json(kindExpect.image), "把 maxwidth 改成全种类后 per-kind 判据变红（图片层会多出 maxwidth）");
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// I18N-PAIR. 词条表成对：DICT 的 zh / en 键集必须全等
+// ───────────────────────────────────────────────────────────────────────────
+// 已有的成对判据都是「某个功能自己列出自己的键，再断言每个键在文件里恰好出现 2 次」——
+// 只覆盖被列出来的键。新加的键若只写进 zh、又没进任何功能的键数组，谁都拦不住，
+// 界面上就是一个裸键（A12 的 kind.container / kind.fullscreen-post 正是这样漏出去的）。
+// 这里做一次全集比较：DICT 里 `  zh: {` / `  en: {` 两段的 4 空格缩进条目，键集必须全等。
+// （EXTRA / extra() 是运行时扩展，不参与。）
+section("I18N-PAIR. zh / en 词条键集全等（缺键、多键、重复键都算红）");
+{
+  const i18nPairSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const pairKeys = (src) => {
+    const out = { zh: [], en: [] };
+    let lang = null;
+    for (const L of src.split("\n")) {
+      const m = /^ {2}(zh|en):\s*\{/.exec(L);
+      if (m) {
+        lang = m[1];
+        continue;
+      }
+      if (!lang) continue;
+      const k = /^ {4}"([^"]+)":/.exec(L);
+      if (k) out[lang].push(k[1]);
+    }
+    return out;
+  };
+  const dups = (arr) => [...new Set(arr.filter((k, i) => arr.indexOf(k) !== i))];
+  const { zh, en } = pairKeys(i18nPairSrc);
+  const zhSet = new Set(zh);
+  const enSet = new Set(en);
+  const onlyZh = zh.filter((k) => !enSet.has(k));
+  const onlyEn = en.filter((k) => !zhSet.has(k));
+  check(zh.length > 1200 && en.length > 1200, `两种语言的词条都可枚举（zh ${zh.length} / en ${en.length}）`);
+  check(onlyZh.length === 0, `zh 里没有 en 缺失的键（缺 ${onlyZh.length} 条${onlyZh.length ? "：" + onlyZh.slice(0, 8).join(" / ") : ""}）`);
+  check(onlyEn.length === 0, `en 里没有 zh 缺失的键（缺 ${onlyEn.length} 条${onlyEn.length ? "：" + onlyEn.slice(0, 8).join(" / ") : ""}）`);
+  check(dups(zh).length === 0 && dups(en).length === 0, "两种语言内都没有重复键（同键写两遍会被后一条静默覆盖）");
+  // 变异：删掉 zh 段的 ly.addAlpha ⇒ 「en 独有 1 条」必须被这条判据抓到
+  const i18nMut = i18nPairSrc.replace(/^ {4}"ly\.addAlpha":.*\n/m, "");
+  check(i18nMut !== i18nPairSrc, "注入点存在（zh 段的 ly.addAlpha，首个匹配即 zh）");
+  const mPair = pairKeys(i18nMut);
+  const mZhSet = new Set(mPair.zh);
+  check(mPair.en.filter((k) => !mZhSet.has(k)).includes("ly.addAlpha"), "删掉 zh 的 ly.addAlpha 后，这条判据变红（en 独有 1 条）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// KIND-I18N. 图层种类名：内建种类都要有 kind.<kind> 的中英词条（裸键回归闸门）
+// ───────────────────────────────────────────────────────────────────────────
+section("KIND-I18N. 图层种类名成对（树徽标 / 检视器「类型」行不出现裸键）");
+{
+  const kindsSrc = fs.readFileSync(path.join(ROOT, "editor/layer-kinds.ts"), "utf8");
+  const mainKindSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const i18nKindSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const keyCount = (key) => (i18nKindSrc.match(new RegExp(`"${key.replace(/[.\-]/g, "\\$&")}":`, "g")) || []).length;
+
+  // ① 渲染点：树徽标与检视器「类型」行都用 kind.<kind> 查词条 —— 缺键就显示裸键
+  check(
+    /`kind\.\$\{n\.kind\}`/.test(mainKindSrc) && /`kind\.\$\{node\.kind\}`/.test(mainKindSrc),
+    "渲染点：图层树徽标与检视器「类型」行都用 kind.<kind> 取词条（editor/main.ts:5623 / :11678）",
+  );
+
+  // ② 逐种类成对：A12 的 container / fullscreen-post 曾漏词条 ⇒ 界面显示 `kind.container`
+  const kindNames = [...new Set([...kindsSrc.matchAll(/\{\s*kind:\s*"([a-z0-9-]+)"/g)].map((m) => m[1]))];
+  check(kindNames.length >= 12, `layer-kinds.ts 的内建种类清单可枚举（${kindNames.length} 种：${kindNames.join(" / ")}）`);
+  const kindMissing = kindNames.filter((k) => keyCount(`kind.${k}`) !== 2);
+  check(kindMissing.length === 0, `每个内建种类都有 kind.<kind> 的中英词条（${kindNames.length} 种；缺或不成对：${json(kindMissing)}）`);
+
+  // ③ 动态形态：视频层走 isVideoNode 分支（不在 layer-kinds 表里），单独钉一条
+  check(keyCount("kind.video") === 2, "动态形态 kind.video 的中英词条也在（editor/main.ts:5623 的 isVideoNode 分支）");
+
+  // ④ 变异红测：删掉 kind.container 的一条 ⇒ ② 必须变红
+  const kindMutated = i18nKindSrc.replace('    "kind.container": "容器",\n', "");
+  const kindMutMissing = kindNames.filter((k) => (kindMutated.match(new RegExp(`"${k.replace(/[.\-]/g, "\\$&")}":`, "g")) || []).length !== 2);
+  check(
+    kindMutated !== i18nKindSrc && kindMutMissing.includes("container"),
+    "变异红测：删掉 kind.container 的一条词条后判据变红（界面上会显示裸键）",
+  );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

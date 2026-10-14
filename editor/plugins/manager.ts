@@ -115,6 +115,19 @@ export function createPluginManager(o: ManagerOptions): PluginManager {
     scopes.delete(id);
   }
 
+  /**
+   * 重挂一个插件：先撤旧 Scope、再挂新的。
+   *
+   * 中间态说明：代码插件的入口是异步 import 的（externalPlugin 里 await importModule），
+   * 所以从「旧 Scope 撤掉」到「新代码子插件 apply」之间有一小段空窗 —— 该插件贡献到 ui 槽位的项
+   * 会瞬时消失再回来（一次 reload 内 toolbar 变化轨迹 = 0 项 → 1 项）。这段空窗里**不会**出现
+   * 重复项：旧 Scope 的贡献在挂新 Scope 之前就已经随 Scope 一起撤回（Context.plugin 把子 Scope
+   * 挂进父 Scope 的回收链，Scope.reset 再兜一层），因此任何时刻同名活跃子 Scope ≤1 且同 id 的
+   * 槽位项 ≤1。判据见 scripts/verify-plugin-perms.mjs A 段「重挂不产生重复项」。
+   *
+   * 之所以不改成「先挂新、再撤旧」来消掉空窗：两者短暂共存会让同一插件的服务提供者叠加、
+   * 把旧子插件按「服务被顶掉」的语义挂起，反而更抖；空窗只是可见性抖动，重复项才是真缺陷。
+   */
   function mount(k: Known) {
     const pkg = k.pkg!;
     const id = pkg.manifest.id;

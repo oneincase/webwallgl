@@ -2,6 +2,13 @@
 // （语料 444 个声音对象都写全 sound / playbackmode / volume / startsilent / mintime /
 // maxtime / muteineditor）。音频原字节写进 sounds/<slug>.<ext>，按引用进出保存清单。
 // volume 常被 `{ user, value }` 包装（音量滑条，语料约一半），写入时只改 value。
+//
+// 播放参数（A13）：maxtime / mintime / spatialization / muteineditor 的读点是
+// renderer/vendor/we-scene/scene/parse.js:486-489（soundprops.maxtime / mintime = parseNum 缺省 0、
+// spatialization / muteineditor = parseBool 缺省 false）。这四个字段本机引擎只解析、渲染侧还没接
+// （音频路径 scene-mount.ts:3849-3850 / 3906 目前只消费 playbackmode / volume / startsilent），
+// 所以它们在编辑器里的作用 = 读写保真、不丢作者数据，不改播放行为。
+export const MAX_SOUND_TIME = 3600;
 
 import { nextObjectId, rebuildTree, unwrap, type EditorDoc, type SceneObject } from "./doc";
 
@@ -77,17 +84,43 @@ export type SoundFields = {
   playbackmode: PlaybackMode;
   volume: number;
   startsilent: boolean;
+  /** random 模式两次播放的最长间隔（秒）；引擎缺省 0 */
+  maxtime: number;
+  /** random 模式两次播放的最短间隔（秒）；引擎缺省 0 */
+  mintime: number;
+  spatialization: boolean;
+  muteineditor: boolean;
 };
 
+/** 引擎 parseBool 的读法（布尔 / "true" / 1 都算真） */
+const asBool = (v: unknown) => v === true || v === "true" || v === 1;
+
+/** 大小写不敏感找已存在的真实键名（与 editor/objprops.ts 铁律 1 同口径） */
+function realKey(obj: SceneObject, key: string): string {
+  const want = key.toLowerCase();
+  for (const k of Object.keys(obj)) if (k.toLowerCase() === want) return k;
+  return key;
+}
+
+/** 按铁律 1 读一个字段（包装解出 .value） */
+const readField = (obj: SceneObject, key: string) => unwrap(obj[realKey(obj, key)]);
+
 export function getSoundFields(obj: SceneObject): SoundFields {
-  const mode = unwrap(obj.playbackmode);
-  const vol = Number(unwrap(obj.volume));
-  const ss = unwrap(obj.startsilent);
+  const mode = readField(obj, "playbackmode");
+  const vol = Number(readField(obj, "volume"));
+  const ss = readField(obj, "startsilent");
+  const maxT = Number(readField(obj, "maxtime"));
+  const minT = Number(readField(obj, "mintime"));
   return {
     files: Array.isArray(obj.sound) ? (obj.sound as unknown[]).filter((s): s is string => typeof s === "string") : [],
     playbackmode: (PLAYBACK_MODES as readonly unknown[]).includes(mode) ? (mode as PlaybackMode) : "single",
     volume: Number.isFinite(vol) ? vol : 1,
-    startsilent: ss === true || ss === "true" || ss === 1,
+    startsilent: asBool(ss),
+    // 播放参数缺省 = 引擎缺省（parse.js:486-489）：0 / 0 / false / false
+    maxtime: Number.isFinite(maxT) && maxT >= 0 ? maxT : 0,
+    mintime: Number.isFinite(minT) && minT >= 0 ? minT : 0,
+    spatialization: asBool(readField(obj, "spatialization")),
+    muteineditor: asBool(readField(obj, "muteineditor")),
   };
 }
 
@@ -95,18 +128,19 @@ type Wrapped = Record<string, unknown> & { value?: unknown };
 const isWrapped = (v: unknown): v is Wrapped => !!v && typeof v === "object" && !Array.isArray(v);
 
 function writeField(obj: SceneObject, key: string, v: unknown): boolean {
-  const cur = obj[key];
+  const k = realKey(obj, key);
+  const cur = obj[k];
   if (isWrapped(cur) && ("value" in cur || "user" in cur || "script" in cur)) {
     if (cur.value === v) return false;
     cur.value = v;
     return true;
   }
   if (cur === v) return false;
-  obj[key] = v;
+  obj[k] = v;
   return true;
 }
 
-export type SoundField = "playbackmode" | "volume" | "startsilent";
+export type SoundField = "playbackmode" | "volume" | "startsilent" | "maxtime" | "mintime" | "spatialization" | "muteineditor";
 
 /** 检视器写值：不是声音层 / 校验不过 / 没变返回 false */
 export function setSoundField<K extends SoundField>(obj: SceneObject, field: K, value: SoundFields[K]): boolean {
@@ -121,6 +155,18 @@ export function setSoundField<K extends SoundField>(obj: SceneObject, field: K, 
     }
     case "startsilent":
       return typeof value === "boolean" && writeField(obj, field, value);
+    case "maxtime": {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= MAX_SOUND_TIME && writeField(obj, "maxtime", Math.round(n * 1000) / 1000);
+    }
+    case "mintime": {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= MAX_SOUND_TIME && writeField(obj, "mintime", Math.round(n * 1000) / 1000);
+    }
+    case "spatialization":
+      return typeof value === "boolean" && writeField(obj, "spatialization", value);
+    case "muteineditor":
+      return typeof value === "boolean" && writeField(obj, "muteineditor", value);
   }
   return false;
 }

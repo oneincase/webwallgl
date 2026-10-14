@@ -98,6 +98,14 @@ export function kindOf(o: SceneObject): LayerKind {
   if (Array.isArray(o.sound) && o.sound.length) return "sound";
   if (typeof o.light === "string" && o.light) return "light";
   if (typeof o.camera === "string") return "camera";
+  // A14：WE 的 `component` 对象（parse.js:539 `isComponent: !!o.component`，字段解析见
+  // :494）。**刻意放在最后一行之前**：引擎里 isComponent 唯一的消费点是灯光派发
+  // （renderer.js:4613 `if (layer.isLight && … && !layer.isComponent) return`），对象本身
+  // 仍按 image / text / … 正常建层 —— 所以带 component 又有 image 的对象继续算 image，
+  // 只有**光秃秃的 component 对象**（此前整条掉进 "other"，查不出来历）落到这里。
+  // 语料 0 命中（render/text.js:2 记「本机 84 个场景 0 个 component」）⇒ 只修降级 +
+  // 只读标注，不做专属编辑：编辑器没有 component 的挂载点，WE 也不渲染它。
+  if (o.component) return "component";
   return "other";
 }
 
@@ -161,14 +169,27 @@ const vecStr = (v: readonly number[]) => v.map(num).join(" ");
 /**
  * 把热改写回 scene.json 对象。字段若是 `{user, value}` / `{script, value}` 包装，
  * 只改 `.value`（作者快照），绑定本身保留。
+ *
+ * 键名**大小写不敏感命中原名**（§8.2 的 L1）：作者文件里可能写成 `Origin` / `ALIGNMENT`，
+ * 直接 `obj[key]` 会读不到 → 另起一个规范小写键，对象上变成两份、作者的 `{user,value}`
+ * 绑定也被绕过。口径与 editor/objprops.ts:102 的 `fieldKeyOf` 一致（只做全等比较，
+ * 不模糊匹配）。这里是**第 4 份同口径实现**（objprops.ts / effects.ts / text.ts / sound.ts
+ * 各一份）：doc.ts 是 objprops.ts 的下层（后者值级 `import { isFieldWrapper } from "./doc"`），
+ * 反向引 `fieldKeyOf` 会形成值级循环，所以就地扫描；后续应把这些收敛到一个共享 helper。
  */
 export function writeObjProps(obj: SceneObject, patch: Partial<EditorLayerProps>): void {
+  const realKey = (key: string): string => {
+    const want = key.toLowerCase();
+    for (const k of Object.keys(obj)) if (k.toLowerCase() === want) return k;
+    return key;
+  };
   const put = (key: string, value: unknown) => {
-    const cur = obj[key];
+    const real = realKey(key);
+    const cur = obj[real];
     if (isFieldWrapper(cur)) {
       (cur as { value: unknown }).value = value;
     } else {
-      obj[key] = value;
+      obj[real] = value;
     }
   };
   if (patch.origin) put("origin", vecStr(patch.origin));

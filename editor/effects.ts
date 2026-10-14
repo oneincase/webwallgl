@@ -690,9 +690,15 @@ export function setEffectParam(obj: SceneObject, index: number, key: string, val
   const pass = e.passes[p.pass ?? 0];
   pass.constantshadervalues ??= {};
   const enc = encodeValue(p, value);
-  const cur = pass.constantshadervalues[key];
-  if (cur && typeof cur === "object" && !Array.isArray(cur) && "value" in (cur as object)) (cur as { value: unknown }).value = enc;
-  else pass.constantshadervalues[key] = enc;
+  // 键名与引擎同口径**大小写不敏感**（render/renderer.js:731 indexMatMetaLower / :776-779
+  // 查表；readValues 也先 toLowerCase）。袋里已有 "Strength" 时按 "strength" 写不能新开一个
+  // 键：脚本 / 关键帧读的那份（renderer.js:2007 / :2164）与面板写的这份会分叉。
+  const bag = pass.constantshadervalues;
+  const existing = Object.keys(bag).find((k) => k.toLowerCase() === key.toLowerCase());
+  const cur = existing === undefined ? undefined : bag[existing];
+  // 只改 .value：{script, value} / {animation, value} 包装里的脚本与关键帧定义保持原样
+  if (existing !== undefined && cur && typeof cur === "object" && !Array.isArray(cur) && "value" in (cur as object)) (cur as { value: unknown }).value = enc;
+  else bag[existing ?? key] = enc;
   return true;
 }
 

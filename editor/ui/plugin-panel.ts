@@ -53,21 +53,35 @@ function logEntriesOf(o: PluginPanelOptions, id: string): PluginLogEntry[] {
   return all.sort((a, b) => a.at - b.at);
 }
 
-/** 逐项权限开关：关掉的项写进 settings，再 reload 让代码子插件用新白名单重挂 */
-function renderPermissions(o: PluginPanelOptions, row: HTMLElement, entry: PluginEntry, rerender?: () => void) {
+/** 面板一次最多画多少条日志（log.ts 的环形缓冲上限 200；这里再限一次，别把长列表整份塞进 DOM） */
+export const LOG_RENDER_MAX = 50;
+/** 单条日志正文的显示上限（超长报错只留开头，避免一条日志撑爆面板） */
+const LOG_TEXT_MAX = 400;
+
+/** 这个插件被逐项关掉的权限（开关行标注 / 贡献摘要共用同一份结算） */
+const deniedOf = (o: PluginPanelOptions, entry: PluginEntry) => deniedPermissions(o.settings, entry.id);
+
+/** 逐项权限开关：关掉的项写进 settings，再 reload 让代码子插件用新白名单重挂（数据贡献也按同一开关重结算） */
+function renderPermissions(
+  o: PluginPanelOptions,
+  row: HTMLElement,
+  entry: PluginEntry,
+  denied: ReadonlySet<string>,
+  rerender?: () => void,
+) {
   const perms = (entry.manifest?.permissions ?? []).filter((p) => p in GRANTABLE);
   if (!perms.length) return;
-  const denied = deniedPermissions(o.settings, entry.id);
   const box = el("div", "ed-plugin-perms");
   box.appendChild(el("span", "ed-plugin-perms-title", o.t("pl.permsTitle")));
   for (const p of perms) {
     const high = GRANTABLE[p] === "high";
-    const label = el("label", "ed-plugin-perm");
-    label.title = high ? o.t("pl.permHigh") : p;
+    const off = denied.has(p);
+    const label = el("label", off ? "ed-plugin-perm is-denied" : "ed-plugin-perm");
+    label.title = off ? `${p} —— ${o.t("pl.permDenied")}` : high ? o.t("pl.permHigh") : p;
     const cb = el("input");
     cb.type = "checkbox";
     cb.dataset.perm = p;
-    cb.checked = !denied.has(p);
+    cb.checked = !off;
     cb.onchange = () => {
       o.settings.set(permKey(entry.id, p), cb.checked);
       o.logs?.push(entry.id, "info", `${p}: ${cb.checked ? "on" : "off"}`);
@@ -76,13 +90,13 @@ function renderPermissions(o: PluginPanelOptions, row: HTMLElement, entry: Plugi
       void o.manager.reload(entry.id).then(() => rerender?.());
     };
     label.appendChild(cb);
-    label.appendChild(el("span", high ? "ed-plugin-perm-name is-high" : "ed-plugin-perm-name", high ? `${p} ⚠` : p));
+    label.appendChild(el("span", high ? "ed-plugin-perm-name is-high" : "ed-plugin-perm-name", `${p}${high ? " ⚠" : ""}${off ? ` · ${o.t("pl.permDenied")}` : ""}`));
     box.appendChild(label);
   }
   row.appendChild(box);
 }
 
-/** 日志区：最近 N 条（倒序显示）+ 清空 */
+/** 日志区：只画最近 LOG_RENDER_MAX 条（倒序显示），更早的只报数目 + 清空 */
 function renderLogs(o: PluginPanelOptions, row: HTMLElement, entry: PluginEntry, rerender?: () => void) {
   if (!o.logs) return;
   const entries = logEntriesOf(o, entry.id);
@@ -91,18 +105,22 @@ function renderLogs(o: PluginPanelOptions, row: HTMLElement, entry: PluginEntry,
   det.appendChild(el("summary", undefined, `${o.t("pl.logs")} (${entries.length})`));
   if (!entries.length) det.appendChild(el("div", "ed-plugin-log is-empty", o.t("pl.logsEmpty")));
   else {
-    // 倒序：最新的在最上面
-    for (const x of [...entries].reverse()) {
-      const line = el("div", `ed-plugin-log is-${x.level}`, `${new Date(x.at).toTimeString().slice(0, 8)} ${x.text}`);
-      det.appendChild(line);
+    // 倒序：最新的在最上面；长列表只画尾部，别全量渲染
+    const shown = entries.slice(-LOG_RENDER_MAX).reverse();
+    for (const x of shown) {
+      const text = x.text.length > LOG_TEXT_MAX ? `${x.text.slice(0, LOG_TEXT_MAX)}…` : x.text;
+      det.appendChild(el("div", `ed-plugin-log is-${x.level}`, `${new Date(x.at).toTimeString().slice(0, 8)} ${text}`));
     }
+    if (entries.length > shown.length) det.appendChild(el("div", "ed-plugin-log is-more", o.t("pl.logsMore", { n: entries.length - shown.length })));
   }
   const clr = el("button", "ed-btn ed-btn-sm", o.t("pl.logsClear"));
   clr.type = "button";
   clr.dataset.act = "logs-clear";
   clr.disabled = !entries.length;
   clr.onclick = () => {
+    // 一个插件的日志可能记在清单 id 上，也可能记在外层 ext:<id> 上 —— 清空要两只都清
     o.logs!.clear(entry.id);
+    o.logs!.clear(`ext:${entry.id}`);
     rerender?.();
   };
   det.appendChild(clr);
@@ -159,14 +177,17 @@ export function renderPluginRows(o: PluginPanelOptions, entries: PluginEntry[], 
     head.appendChild(acts);
     row.appendChild(head);
     if (e.manifest?.description) row.appendChild(el("div", "ed-plugin-desc", text(e.manifest.description, "")));
+    const denied = deniedOf(o, e);
     if (e.manifest) {
       const bits: string[] = [];
       const c = e.manifest.contributes ?? {};
-      if (c.effects?.length) bits.push(t("pl.c.effects", { n: c.effects.length }));
-      if (c.particles?.length) bits.push(t("pl.c.particles", { n: c.particles.length }));
-      if (c["particles.components"]?.length) bits.push(t("pl.c.components", { n: c["particles.components"].length }));
-      if (c.shaders?.length) bits.push(t("pl.c.shaders", { n: c.shaders.length }));
-      if (c.i18n) bits.push(t("pl.c.i18n"));
+      // 清单申请过、又被逐项关掉的权限：它对应的数据贡献真的没登记，摘要里如实标出来
+      const offMark = (p: string) => ((e.manifest?.permissions ?? []).includes(p) && denied.has(p) ? `（${t("pl.permDenied")}）` : "");
+      if (c.effects?.length) bits.push(t("pl.c.effects", { n: c.effects.length }) + offMark("effects"));
+      if (c.particles?.length) bits.push(t("pl.c.particles", { n: c.particles.length }) + offMark("particles.templates"));
+      if (c["particles.components"]?.length) bits.push(t("pl.c.components", { n: c["particles.components"].length }) + offMark("particles.components"));
+      if (c.shaders?.length) bits.push(t("pl.c.shaders", { n: c.shaders.length }) + offMark("shaders"));
+      if (c.i18n) bits.push(t("pl.c.i18n") + offMark("i18n"));
       if (e.manifest.main) bits.push(t("pl.c.code"));
       const { low, high } = permissionSummary(e.manifest);
       if (low.length || high.length) bits.push(t("pl.perms", { list: [...high.map((p) => `${p}⚠`), ...low].join(", ") }));
@@ -175,7 +196,7 @@ export function renderPluginRows(o: PluginPanelOptions, entries: PluginEntry[], 
     if (e.missing.length) row.appendChild(el("div", "ed-plugin-err", t("pl.missing", { list: e.missing.join(", ") })));
     if (e.error) row.appendChild(el("div", "ed-plugin-err", e.error));
     if (e.manifest) {
-      renderPermissions(o, row, e, rerender);
+      renderPermissions(o, row, e, denied, rerender);
       renderLogs(o, row, e, rerender);
     }
     list.appendChild(row);

@@ -6,6 +6,14 @@
 // size 只是定位盒：WE 的盒 ≈ 文字在 em（= pointsize × TEXT_EM_SCALE）下的外框，
 // 高 = 行数 × 1.2 em。引擎给静态文字按溢出墨水扩画布，脚本文字不扩 —— 时钟 / 日期
 // 的盒必须按最宽可能输出量好，否则长出来的字被纹理边缘切掉。
+//
+// 文字布局（A13）：maxwidth / maxrows / limitwidth / limitrows / limituseellipsis 都是引擎真读字段。
+// 读点 renderer/vendor/we-scene/scene/parse.js:516-520（textMaxwidth / textMaxrows / textLimitwidth /
+// textLimitrows / textLimituseellipsis，parseNum 缺省 0、parseBool 缺省 false）；消费点
+// renderer/vendor/we-scene/render/text-layout.js:41
+//   `const wrapW = opts.limitwidth && opts.maxwidth > 0 ? opts.maxwidth : Infinity`
+// 与 :77-80（limitrows + maxrows 截行、limituseellipsis 给最后一行加省略号）。
+// 两个开关的引擎口径要照抄，不能想当然：limitwidth 只在 maxwidth > 0 时生效，limitrows 只在 maxrows > 0 时生效。
 
 import { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../renderer/src/api/editor";
 import { nextObjectId, rebuildTree, unwrap, type EditorDoc, type SceneObject } from "./doc";
@@ -84,16 +92,27 @@ type Wrapped = Record<string, unknown> & { value?: unknown };
 const isWrapped = (v: unknown): v is Wrapped => !!v && typeof v === "object" && !Array.isArray(v);
 const f3 = (v: number) => (Math.round(v * 1000) / 1000).toFixed(3);
 
+/** 大小写不敏感找已存在的真实键名（与 editor/objprops.ts 铁律 1 同口径）：命中用原名写回，否则写规范小写键 */
+function realKey(obj: SceneObject, key: string): string {
+  const want = key.toLowerCase();
+  for (const k of Object.keys(obj)) if (k.toLowerCase() === want) return k;
+  return key;
+}
+
+/** 按铁律 1 读一个字段（包装解出 .value） */
+const readField = (obj: SceneObject, key: string) => unwrap(obj[realKey(obj, key)]);
+
 /** 写字段：包装（用户属性 / 脚本）只改 value。返回是否真的变了 */
 function writeField(obj: SceneObject, key: string, v: unknown): boolean {
-  const cur = obj[key];
+  const k = realKey(obj, key);
+  const cur = obj[k];
   if (isWrapped(cur) && ("value" in cur || "user" in cur || "script" in cur)) {
     if (cur.value === v) return false;
     cur.value = v;
     return true;
   }
   if (cur === v) return false;
-  obj[key] = v;
+  obj[k] = v;
   return true;
 }
 
@@ -129,7 +148,26 @@ export function setTextValue(obj: SceneObject, text: string): boolean {
   return writeField(obj, "text", text.replace(/\r\n?/g, "\n"));
 }
 
-export type TextField = "font" | "pointsize" | "horizontalalign" | "verticalalign" | "padding" | "opaquebackground" | "backgroundcolor";
+/** 布局五件套的上限（按量纲取：盒宽是像素，行数是行数） */
+export const MAX_TEXT_WIDTH = 65535;
+export const MAX_TEXT_ROWS = 1000;
+/** 字号 / 内边距的上限：单一真源（校验与检视器输入框都引它，此前两处各写一份字面量） */
+export const MAX_TEXT_SIZE = 1000;
+export const MAX_TEXT_PADDING = 4096;
+
+export type TextField =
+  | "font"
+  | "pointsize"
+  | "horizontalalign"
+  | "verticalalign"
+  | "padding"
+  | "opaquebackground"
+  | "backgroundcolor"
+  | "maxwidth"
+  | "maxrows"
+  | "limitwidth"
+  | "limitrows"
+  | "limituseellipsis";
 
 export const H_ALIGNS = ["left", "center", "right"] as const;
 export const V_ALIGNS = ["top", "center", "bottom"] as const;
@@ -142,6 +180,13 @@ export type TextFields = {
   padding: number;
   opaquebackground: boolean;
   backgroundcolor: [number, number, number];
+  /** 折行宽度（px）；引擎 text-layout 只在 > 0 且 limitwidth 时当换行宽用 */
+  maxwidth: number;
+  /** 最多显示几行；引擎只在 > 0 且 limitrows 时截行 */
+  maxrows: number;
+  limitwidth: boolean;
+  limitrows: boolean;
+  limituseellipsis: boolean;
 };
 
 function parseColor(v: unknown): [number, number, number] {
@@ -150,23 +195,34 @@ function parseColor(v: unknown): [number, number, number] {
   return [parts[0], parts[1], parts[2]];
 }
 
+/** 引擎 parseBool 的读法（布尔 / "true" / 1 都算真） */
+const asBool = (v: unknown) => v === true || v === "true" || v === 1;
+
 /** 检视器读值：缺省按引擎口径补齐 */
 export function getTextFields(obj: SceneObject): TextFields {
-  const font = unwrap(obj.font);
-  const ps = Number(unwrap(obj.pointsize));
-  const ha = unwrap(obj.horizontalalign);
-  const va = unwrap(obj.verticalalign);
-  const pad = unwrap(obj.padding);
+  const font = readField(obj, "font");
+  const ps = Number(readField(obj, "pointsize"));
+  const ha = readField(obj, "horizontalalign");
+  const va = readField(obj, "verticalalign");
+  const pad = readField(obj, "padding");
   const padN = typeof pad === "string" ? Number(pad.trim().split(/\s+/)[0]) : Number(pad);
-  const bg = unwrap(obj.opaquebackground);
+  const bg = readField(obj, "opaquebackground");
+  const mw = Number(readField(obj, "maxwidth"));
+  const mr = Number(readField(obj, "maxrows"));
   return {
     font: typeof font === "string" && font ? font : DEFAULT_FONT,
     pointsize: Number.isFinite(ps) && ps > 0 ? ps : ENGINE_POINTSIZE,
     horizontalalign: typeof ha === "string" && (H_ALIGNS as readonly string[]).includes(ha) ? ha : "center",
     verticalalign: typeof va === "string" && (V_ALIGNS as readonly string[]).includes(va) ? va : "center",
     padding: Number.isFinite(padN) && padN >= 0 ? padN : 0,
-    opaquebackground: bg === true || bg === "true" || bg === 1,
-    backgroundcolor: parseColor(unwrap(obj.backgroundcolor)),
+    opaquebackground: asBool(bg),
+    backgroundcolor: parseColor(readField(obj, "backgroundcolor")),
+    // 布局五件套的缺省 = 引擎缺省（parse.js:516-520）：0 / 0 / false / false / false
+    maxwidth: Number.isFinite(mw) && mw >= 0 ? mw : 0,
+    maxrows: Number.isFinite(mr) && mr >= 0 ? mr : 0,
+    limitwidth: asBool(readField(obj, "limitwidth")),
+    limitrows: asBool(readField(obj, "limitrows")),
+    limituseellipsis: asBool(readField(obj, "limituseellipsis")),
   };
 }
 
@@ -180,7 +236,7 @@ export function setTextField<K extends TextField>(obj: SceneObject, field: K, va
     }
     case "pointsize": {
       const n = Number(value);
-      if (!Number.isFinite(n) || n <= 0 || n > 1000) return false;
+      if (!Number.isFinite(n) || n <= 0 || n > MAX_TEXT_SIZE) return false;
       const next = Math.round(n * 1000) / 1000;
       const prev = getTextFields(obj).pointsize;
       if (!writeField(obj, "pointsize", next)) return false;
@@ -194,7 +250,7 @@ export function setTextField<K extends TextField>(obj: SceneObject, field: K, va
       return (V_ALIGNS as readonly unknown[]).includes(value) && writeField(obj, field, value);
     case "padding": {
       const n = Number(value);
-      return Number.isFinite(n) && n >= 0 && n <= 4096 && writeField(obj, "padding", Math.round(n * 1000) / 1000);
+      return Number.isFinite(n) && n >= 0 && n <= MAX_TEXT_PADDING && writeField(obj, "padding", Math.round(n * 1000) / 1000);
     }
     case "opaquebackground":
       return typeof value === "boolean" && writeField(obj, field, value);
@@ -204,6 +260,20 @@ export function setTextField<K extends TextField>(obj: SceneObject, field: K, va
       const s = c.slice(0, 3).map((x) => f3(Math.max(0, Math.min(1, Number(x))))).join(" ");
       return writeField(obj, field, s);
     }
+    case "maxwidth": {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= MAX_TEXT_WIDTH && writeField(obj, "maxwidth", Math.round(n * 1000) / 1000);
+    }
+    case "maxrows": {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= MAX_TEXT_ROWS && writeField(obj, "maxrows", Math.round(n * 1000) / 1000);
+    }
+    case "limitwidth":
+      return typeof value === "boolean" && writeField(obj, "limitwidth", value);
+    case "limitrows":
+      return typeof value === "boolean" && writeField(obj, "limitrows", value);
+    case "limituseellipsis":
+      return typeof value === "boolean" && writeField(obj, "limituseellipsis", value);
   }
   return false;
 }

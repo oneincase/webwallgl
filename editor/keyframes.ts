@@ -5,13 +5,85 @@
 // - 关键帧恒为 6 字段 `{ back, frame, front, lockangle, locklength, value }`，frame 为整数；
 //   front {enabled:true,x:1,y:0} + back {enabled:true,x:-1,y:0} = 平滑（缓入缓出），enabled:false = 线性。
 // 编辑器新建的动画一律绝对值（relative:false）；外来 relative 动画打关键帧时按「值 − 基准」写回。
+//
+// A13：引擎的对象关键帧白名单是十项 —— renderer/vendor/we-scene/scene/parse.js:663
+//   `for (const f of ['scale', 'origin', 'color', 'alpha', 'brightness', 'angles', 'visible', 'volume', 'maxwidth', 'zoom'])`
+// 前六项本模块早就有，缺的是后四项，通道数与求值口径按引擎/宿主的实际写回分支定（都不是猜的）：
+// - 四项全是 **1 通道**：引擎 render/animation.js 的 `value()` 一通道返回标量；宿主逐帧写回分支
+//   renderer/src/scene-mount.ts:6938-6990 对 visible / volume / maxwidth / zoom 都是标量语义：
+//   `visible` → `run.layer.visibleSelf = !!out`、`volume` → `run.layer.soundprops.volume = out`、
+//   `maxwidth` → `run.layer.textMaxwidth = out`、`zoom` → `if (out > 0) scene.cameraTransforms.zoom = out`。
+// - 静态基准的缺省也对齐引擎解析缺省：visible 1（parse.js:358 `parseBool(o.visible, true)`）、
+//   volume 1（parse.js:486 `parseNum(o.volume, 1)`）、maxwidth 0（parse.js:516 `parseNum(o.maxwidth, 0)`）、
+//   zoom 1（parse.js:964 相机 `parseNum(..., 1)`）。
+//
+// visible 的布尔曲线怎么呈现：**曲线数据保持 0/1 数值单通道，不做成布尔开关**。理由：引擎的求值器
+// （render/animation.js 的 c0 时间轴 + 贝塞尔插值）与 writeAnimSlot 都是纯数值通道，写 true/false
+// 会在插值里变成 NaN/丢帧；而 WE 自己的 visible 曲线在 JSON 里也是 0/1 数字，引擎到消费点才折成
+// `!!out`。所以编辑器把它当普通 1 通道曲线编辑（关键帧值 0 / 1），只在文案上标注「0 = 隐藏、
+// 1 = 显示」，避免用户按「不透明度」的直觉去读这条曲线（见 ANIM_LABEL["visible"] 与 anim.visibleHint）。
 
 import { unwrap, type SceneObject } from "./doc";
 import type { EditorLayerProps } from "../renderer/src/api/editor";
 
-export const ANIM_FIELDS = ["origin", "scale", "angles", "alpha", "color", "brightness"] as const;
+export const ANIM_FIELDS = [
+  "origin",
+  "scale",
+  "angles",
+  "alpha",
+  "color",
+  "brightness",
+  "visible",
+  "volume",
+  "maxwidth",
+  "zoom",
+] as const;
 export type AnimField = (typeof ANIM_FIELDS)[number];
-export const CHANNELS: Record<AnimField, number> = { origin: 3, scale: 3, angles: 3, alpha: 1, color: 3, brightness: 1 };
+export const CHANNELS: Record<AnimField, number> = {
+  origin: 3,
+  scale: 3,
+  angles: 3,
+  alpha: 1,
+  color: 3,
+  brightness: 1,
+  visible: 1,
+  volume: 1,
+  maxwidth: 1,
+  zoom: 1,
+};
+
+/**
+ * 字段 → 该字段在哪些图层种类上有意义。`null` = 所有可动画种类都能用。
+ * 这张表是「引擎消费者住在哪」的直接翻译，不是 UI 偏好（所以放在模块里，main.ts 只查表，
+ * 不散 if）：
+ * - origin / scale / angles / alpha / color / brightness：引擎对任意对象读（parse.js:663 白名单），
+ *   编辑器沿用历史上可动画的种类集合（image / text / particle / model，见 main.ts 的 canAnimate）；
+ * - visible：引擎对任意对象读 `o.visible`（parse.js:358）⇒ 所有可动画种类，包括声音 / 相机；
+ * - volume：引擎只认 `layer.soundprops.volume`（parse.js:486 + scene-mount.ts:6956）⇒ 只有声音层；
+ * - maxwidth：引擎只认 `layer.textMaxwidth`（parse.js:516 + text-layout.js:41）⇒ 只有文字层；
+ * - zoom：语义消费方是 `scene.cameraTransforms.zoom`（parse.js:964 + scene-mount.ts:6990），
+ *   语料里挂在相机对象上（3521337568 相机路径对象开场 zoom 3→1）⇒ 只有相机层。
+ */
+export const ANIM_FIELD_KINDS: Record<AnimField, readonly string[] | null> = {
+  origin: null,
+  scale: null,
+  angles: null,
+  alpha: null,
+  color: null,
+  brightness: null,
+  visible: null,
+  volume: ["sound"],
+  maxwidth: ["text"],
+  zoom: ["camera"],
+};
+
+/** 某图层种类能用哪些关键帧字段（顺序 = ANIM_FIELDS 顺序，UI 与判据共用同一口径） */
+export function animFieldsForKind(kind: string): AnimField[] {
+  return ANIM_FIELDS.filter((f) => {
+    const kinds = ANIM_FIELD_KINDS[f];
+    return !kinds || kinds.includes(kind);
+  });
+}
 
 export const ANIM_MODES = ["loop", "mirror", "single"] as const;
 export type AnimMode = (typeof ANIM_MODES)[number];
@@ -57,19 +129,38 @@ function channelsOf(a: Anim): Key[][] {
   return out;
 }
 
+/**
+ * 字段静态值的缺省（= 引擎解析该字段时的缺省，见文件头 A13 注释）。字段没值 / 值不可解析时用它。
+ * 既有六项逐字保持原判据（origin / angles 0，scale / alpha / color / brightness 1），零回归。
+ */
+const BASE_DEFAULT: Record<AnimField, number> = {
+  origin: 0,
+  scale: 1,
+  angles: 0,
+  alpha: 1,
+  color: 1,
+  brightness: 1,
+  visible: 1,
+  volume: 1,
+  maxwidth: 0,
+  zoom: 1,
+};
+
 /** 字段的静态值（动画的基准）→ 数组；alpha 为单元素 */
 export function baseValue(obj: SceneObject, field: AnimField): number[] {
   const raw = unwrap(obj[field]);
   const n = CHANNELS[field];
-  const dflt = field === "scale" || field === "alpha" || field === "color" || field === "brightness" ? 1 : 0;
+  const dflt = BASE_DEFAULT[field];
   const arr =
-    typeof raw === "string"
-      ? raw.trim().split(/\s+/).map(Number)
-      : typeof raw === "number"
-        ? Array(n).fill(raw)
-        : Array.isArray(raw)
-          ? raw.map(Number)
-          : [];
+    typeof raw === "boolean"
+      ? [raw ? 1 : 0]
+      : typeof raw === "string"
+        ? raw.trim().split(/\s+/).map(Number)
+        : typeof raw === "number"
+          ? Array(n).fill(raw)
+          : Array.isArray(raw)
+            ? raw.map(Number)
+            : [];
   return Array.from({ length: n }, (_, i) => (Number.isFinite(arr[i]) ? arr[i] : dflt));
 }
 
@@ -149,7 +240,18 @@ export function enableAnim(obj: SceneObject, field: AnimField, cur: readonly num
 }
 
 function defaultRaw(field: AnimField): unknown {
+  // 形状按引擎的解析器给（parse.js）：parseBool 认布尔，parseNum 认数字，parseVec3 只认 "x y z" 串
+  if (field === "visible") return true;
+  if (field === "volume" || field === "zoom") return 1;
+  if (field === "maxwidth") return 0;
   return field === "alpha" || field === "brightness" ? 1 : field === "scale" || field === "color" ? "1 1 1" : "0 0 0";
+}
+
+/** 关键帧值 → 字段静态原始值的形状（关动画时写回）：同 defaultRaw 的按解析器给形 */
+function staticRaw(field: AnimField, vals: readonly number[]): unknown {
+  if (field === "visible") return vals[0] !== 0;
+  if (field === "volume" || field === "maxwidth" || field === "zoom" || field === "alpha" || field === "brightness") return r5(vals[0]);
+  return vals.map((v) => String(r5(v))).join(" ");
 }
 
 const validLength = (n: number) => Number.isInteger(n) && n >= 1 && n <= MAX_LENGTH;
@@ -164,7 +266,7 @@ export function disableAnim(obj: SceneObject, field: AnimField, keep?: readonly 
   const w = raw as Wrapped;
   delete w.animation;
   if (keep && keep.length === CHANNELS[field] && keep.every(Number.isFinite)) {
-    w.value = field === "alpha" || field === "brightness" ? r5(keep[0]) : keep.map((v) => String(r5(v))).join(" ");
+    w.value = staticRaw(field, keep);
   }
   if (Object.keys(w).length === 1 && "value" in w) obj[field] = w.value;
   return true;
@@ -293,17 +395,27 @@ export function setSmooth(obj: SceneObject, field: AnimField, smooth: boolean): 
   return changed;
 }
 
-/** 检视器 / 视口改动里落在已开动画字段上的部分，转成关键帧值（alpha → [alpha]） */
+/** 检视器 / 视口改动里落在已开动画字段上的部分，转成关键帧值（alpha / brightness / 1 通道 → [x]） */
 export function splitAnimated(
   obj: SceneObject,
   patch: Partial<EditorLayerProps>,
 ): { plain: Partial<EditorLayerProps>; keyed: Partial<Record<AnimField, number[]>> } {
-  const plain: Partial<EditorLayerProps> = { ...patch };
+  // patch 是检视器热改（EditorLayerProps）；A13 的 volume / maxwidth / zoom 还没进那个类型，
+  // 所以交集一个字符串索引签名按下标取值（visible 已在类型里但是布尔，同样走这里的类型判定）
+  const plain = { ...patch } as Partial<EditorLayerProps> & Record<string, unknown>;
   const keyed: Partial<Record<AnimField, number[]>> = {};
   for (const f of ANIM_FIELDS) {
-    const v = patch[f];
+    const v = plain[f];
     if (v === undefined || !isAnimated(obj, f)) continue;
-    keyed[f] = typeof v === "number" ? [v] : [...(v as readonly number[])];
+    if (typeof v === "number") keyed[f] = [v];
+    else if (typeof v === "boolean") {
+      // 布尔补丁为什么必须折算成 0/1 关键帧、不能留在 plain：该字段已经挂了 { animation }，
+      // 引擎每帧用求值结果覆盖静态值（宿主 scene-mount 的 visible 写回分支），静态写回会被立刻冲掉，
+      // 用户看到「关掉又自己回来」。布尔只对 1 通道字段（visible）成立；多通道字段收到布尔是真类型错误，留在 plain。
+      if (CHANNELS[f] !== 1) continue;
+      keyed[f] = [v ? 1 : 0];
+    } else if (Array.isArray(v)) keyed[f] = [...(v as readonly number[])];
+    else continue;
     delete plain[f];
   }
   return { plain, keyed };

@@ -50,6 +50,7 @@ const STABLE = [
   "verify-cover-peek",
   "verify-pointer",
   "verify-groups",
+  "verify-script-hooks",
   "verify-web",
   "verify-resolution",
   "verify-quality",
@@ -129,6 +130,10 @@ const STABLE = [
   "verify-we-export",
   // 外部插件：清单 / 数据贡献原子登记 / 代码插件权限门控 / 来源优先与热重载 / 插件目录端点 / 示例插件 + 变异红测
   "verify-plugins",
+  // D6×D2 逐项权限开关：真跑 externalPlugin 的数据贡献门控（效果 / shader 片段 / 粒子模板 / 粒子组件 / 词条
+  // 逐项关开 + 未声明不拦的向后兼容 + 同开关同时管数据与代码）、面板「已拒绝」标注与日志上限/清空、
+  // log.ts 语义 + 6 条变异红测
+  "verify-plugin-perms",
   // 产物卫生（issue #14 第二半）：**按文本发布**的东西不许留内部注释 —— 引擎模板串里的 GLSL
   // 注释（压缩器看不见字符串内容）、`?raw` 注入第三方页面的 web-shim（14 KB JSDoc）、
   // 以及压缩版默认 ascii 把中文转义成 `\uXXXX`（看着像漏剥的注释）。三条路径都锁在构建期。

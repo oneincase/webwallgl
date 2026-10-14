@@ -380,6 +380,11 @@ export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginOb
   const c = m.contributes ?? {};
   // 逐项权限开关在挂载时结算一次；面板改开关后会 reload → 用新白名单重挂
   const denied = deniedPermissions(deps.settings, m.id);
+  // 逐项开关同时管**数据贡献**（D6×D2）：清单里申请过、又被关掉的权限，它对应的整类数据不再登记。
+  // 清单没申请该权限的贡献点（fx-crt / particle-fireflies 这类没有 permissions 字段的纯数据插件）
+  // 行为不变 —— 没有开关就没有「关掉」，外层可信包装照常登记。
+  const declared = new Set(m.permissions ?? []);
+  const off = (p: string) => declared.has(p) && denied.has(p);
   const need = new Set<string>();
   if (c.effects?.length) need.add("effects");
   if (c.particles?.length) need.add("particles.templates");
@@ -391,16 +396,17 @@ export function externalPlugin(pkg: PluginPackage, deps: ExternalDeps): PluginOb
     inject: [...need],
     async apply(ctx: Context) {
       const data = dataContributions(pkg);
-      // 片段先于效果（效果写盘时要展开 include）
-      for (const s of data.shaders) ctx.contribute("shaders", s);
-      for (const e of data.effects) ctx.contribute("effects", e);
+      // 片段先于效果（效果写盘时要展开 include）；每类贡献各自看它对应的权限开关
+      if (!off("shaders")) for (const s of data.shaders) ctx.contribute("shaders", s);
+      if (!off("effects")) for (const e of data.effects) ctx.contribute("effects", e);
       // 组件先于模板（模板里的算子要能对上已登记的组件）
-      for (const k of data.components) ctx.contribute("particles.components", k);
-      for (const t of data.particles) ctx.contribute("particles.templates", t);
-      for (const [lang, dict] of Object.entries(data.i18n)) {
-        const i18n = ctx.get("i18n");
-        ctx.effect(() => i18n.extend(lang, dict));
-      }
+      if (!off("particles.components")) for (const k of data.components) ctx.contribute("particles.components", k);
+      if (!off("particles.templates")) for (const t of data.particles) ctx.contribute("particles.templates", t);
+      if (!off("i18n"))
+        for (const [lang, dict] of Object.entries(data.i18n)) {
+          const i18n = ctx.get("i18n");
+          ctx.effect(() => i18n.extend(lang, dict));
+        }
       if (!m.main) return;
       const code = pkg.files.get(normPath(m.main)!);
       if (!code) throw new Error(`入口 ${m.main} 不在包里`);
