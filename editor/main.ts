@@ -327,6 +327,7 @@ import {
   gltfImportFiles,
   gltfToModel,
   isOrthoDoc,
+  meshView,
   type Gltf,
   type GltfTarget,
 } from "./gltf";
@@ -629,6 +630,7 @@ import {
   type DirHandle,
   type SaveFile,
 } from "./save";
+import { fileSig, sigFor } from "./write-sig";
 import {
   createVirtualProject,
   deleteVirtualProject,
@@ -1992,22 +1994,15 @@ let pendingDraft: { slot: string; draft: Draft } | null = null;
 let dirWritable: boolean | null = null;
 /** 已经为哪个文档提示过「没有可保存内容」，同一次打开只提示一次 */
 let warnedNoSaveFor: EditorDoc | null = null;
-/** 已写出内容的签名，没变的文件跳过 */
-const writtenSig = new Map<string, string>();
 /** 本次会话写出过的路径；不再引用时从项目文件夹删掉 */
 const ownedPaths = new Set<string>();
-
-function fileSig(data: Uint8Array): string {
-  let h = 2166136261;
-  for (let i = 0; i < data.length; i++) h = Math.imul(h ^ data[i], 16777619);
-  return `${data.length}:${h >>> 0}`;
-}
 
 function adoptProject(dir: DirHandle) {
   projectDir = dir;
   // 内置浏览器工程记一笔：刷新 / 重开后靠它找回（真目录会置空，免得恢复横幅指向陈旧的虚拟工程）
   setLastVirtualProjectId(virtualIdOf(dir));
-  writtenSig.clear();
+  // 只清这个目录那一份：别的目录（比如上一轮还在飞的 flush 所属的旧目录）不受影响（task-22）
+  sigFor(dir).clear();
   ownedPaths.clear();
   saveAgain = false;
   clearTimeout(saveTimer);
@@ -2017,9 +2012,10 @@ function adoptProject(dir: DirHandle) {
 
 /** 库条目不落盘：解绑上一个文档的项目文件夹，免得自动保存把它写进别的工程 */
 function releaseProject() {
+  const prev = projectDir;
   projectDir = null;
   dirWritable = null;
-  writtenSig.clear();
+  if (prev) sigFor(prev).clear();
   ownedPaths.clear();
   saveAgain = false;
   clearTimeout(saveTimer);
@@ -2452,9 +2448,13 @@ async function flushAutosave(): Promise<boolean> {
     const unreadable = new Set<string>();
     const files = await collectCurrent(preview, unreadable);
     if (!files) return ok;
-    const changed = files.filter((f) => fileSig(f.data) !== writtenSig.get(f.path));
+    const changed = files.filter((f) => fileSig(f.data) !== sigFor(dir).get(f.path));
     if (changed.length) await writeToDirectory(dir, changed);
-    for (const f of changed) writtenSig.set(f.path, fileSig(f.data));
+    // 起跑（上面那次检查）之后又换过目录 / 换过文档：这一轮已经是「旧目录的一轮」，
+    // 尾巴（记账、ownedPaths 修剪、dirty、已保存日志）一律作废，否则它会把新目录的
+    // 首次写盘算成「没变」——真机 AJ 段「切到新文件夹后只剩 .webwallgl-editor」就是这么来的（task-22）。
+    if (dir !== projectDir || doc !== snap) return ok;
+    for (const f of changed) sigFor(dir).set(f.path, fileSig(f.data));
     const keep = new Set(files.map((f) => f.path));
     for (const p of [...ownedPaths]) {
       if (keep.has(p)) continue;
@@ -2463,7 +2463,7 @@ async function flushAutosave(): Promise<boolean> {
       if (unreadable.has(p)) continue;
       await removeProjectFile(dir, p);
       ownedPaths.delete(p);
-      writtenSig.delete(p);
+      sigFor(dir).delete(p);
     }
     for (const f of files) ownedPaths.add(f.path);
     if (doc === snap) {
@@ -4781,7 +4781,7 @@ let modelFormPick: GltfTarget | null = null;
 inModelEl.onchange = () => {
   const files = Array.from(inModelEl.files ?? []);
   inModelEl.value = "";
-  if (files.length) void importModelFiles(files, modelFormPick);
+  if (files.length) openGltfImportDialog(files, null);
 };
 
 /**
@@ -4789,7 +4789,48 @@ inModelEl.onchange = () => {
  * 形态缺省按场景定（正交 puppet = 图片层 + model json，透视 = 网格，model 指 .mdl），菜单可强制；
  * 同批的其余文件（.bin / .mtl / 贴图）供主文件按文件名引用（不分大小写、去目录）。产物写进资源表，加层 + 首个片段的动画层是一步结构编辑
  */
-async function importModelFiles(files: File[], forceForm: GltfTarget | null = null, gen: PuppetGenerator | null = null) {
+/** 导入确认条（W19 ②）给出的采样参数：缩放是叠加在缺省 fit 之上的倍率 */
+type ImportOpts = { fps: number; scaleMul: number };
+
+// ↓ task-17 ②：纯逻辑（判据真跑这三条；DOM 接线在下面）
+/**
+ * 确认条的输入校验：空 = 原口径（fps 30 / 缩放 ×1）；非法给原因键，UI 必须据此禁用「导入」。
+ * 上限不是随口定的：240 = 常见最高采样率；×100 = fit 之上的合理上限（防手滑 1e9 把模型撑到看不见）。
+ */
+export function gltfImportCheck(fpsText: string, mulText: string): { ok: boolean; fps: number; scaleMul: number; reason: string | null } {
+  const fps = Number(fpsText.trim() === "" ? "30" : fpsText);
+  const mul = Number(mulText.trim() === "" ? "1" : mulText);
+  if (!Number.isFinite(fps) || fps <= 0 || fps > 240) return { ok: false, fps: 30, scaleMul: 1, reason: "gl.check.fps" };
+  if (!Number.isFinite(mul) || mul <= 0 || mul > 100) return { ok: false, fps, scaleMul: 1, reason: "gl.check.scale" };
+  return { ok: true, fps, scaleMul: mul, reason: null };
+}
+
+/** 片段预览的一行：名字 + 帧数（引擎 ModelIR.clips[].frameCount，与 log.modelImported 同款字段） */
+export function gltfClipLines(clips: readonly { name: string; frameCount: number }[]): string[] {
+  return clips.map((c) => `${c.name} · ${c.frameCount} 帧`);
+}
+
+/** 取景来源行：把 meshView 的结论翻成 i18n 键 + 编号（有实体给实体 id，否则给计数） */
+export function gltfImportCamLine(view: { source: string; entityCount: number; entityId: number | null }): { key: string; n: number } {
+  return { key: `gl.cam.${view.source}`, n: view.source === "entity" ? (view.entityId ?? view.entityCount) : view.entityCount };
+}
+// ↑ task-17 ②：纯逻辑结束
+
+/** 同批旁路资源（.bin / .mtl / 贴图）：主文件按 URI 或文件名（不分大小写、去目录）引用 —— 导入与预览共用同一口径 */
+function sideResolver(side: Map<string, Uint8Array>): (uri: string) => Uint8Array | null {
+  return (uri: string) => {
+    let u = uri;
+    try {
+      u = decodeURIComponent(uri);
+    } catch {
+      /* 保留原样 */
+    }
+    const base = u.replace(/\\/g, "/").split("/").pop()!.toLowerCase();
+    return side.get(u.toLowerCase()) ?? side.get(base) ?? null;
+  };
+}
+
+async function importModelFiles(files: File[], forceForm: GltfTarget | null = null, gen: PuppetGenerator | null = null, opts: ImportOpts | null = null) {
   if (!doc?.scene || !overlay || doc.type !== "scene") {
     log(et("log.structUnavailable"), "warn");
     return;
@@ -4807,16 +4848,7 @@ async function importModelFiles(files: File[], forceForm: GltfTarget | null = nu
     const out: ModelIR | Gltf = await g.generate({ name, bytes });
     return "json" in out && "resolve" in out ? { gltf: out, warnings: [] } : { gltf: irToGltf(out as ModelIR), warnings: (out as ModelIR).warnings ?? [] };
   };
-  const resolve = (uri: string) => {
-    let u = uri;
-    try {
-      u = decodeURIComponent(uri);
-    } catch {
-      /* 保留原样 */
-    }
-    const base = u.replace(/\\/g, "/").split("/").pop()!.toLowerCase();
-    return side.get(u.toLowerCase()) ?? side.get(base) ?? null;
-  };
+  const resolve = sideResolver(side);
   for (const f of mains) {
     const name = f.name.replace(/\.[^.]+$/, "");
     try {
@@ -4834,7 +4866,18 @@ async function importModelFiles(files: File[], forceForm: GltfTarget | null = nu
       // fitMeshScale 给的是相机世界单位（≈几像素），mesh 形态会小到看不见（addModelLayer 里
       // 对应地也走 2D 摆放口径）。
       const pixelUnits = form === "puppet" || isOrthoDoc(target);
-      const m = gltfToModel(g, { target: form, slug, fps: 30, scale: pixelUnits ? fitPuppetScale(target) : fitMeshScale(target) });
+      // [task-17 W19 ②] 形态 / 缩放 / fps 由导入确认条给出，缺省 = 原口径（按场景自动判形态、
+      // 缺省 fit 缩放 ×1、fps 30）。缩放是**叠加在缺省 fit 之上的倍率**，fit 口径本身不变。
+      const fitScale = pixelUnits ? fitPuppetScale(target) : fitMeshScale(target);
+      const mul = opts?.scaleMul ?? 1;
+      const scale = mul === 1 ? fitScale : (b: Float64Array) => fitScale(b) * mul;
+      // [task-17 W19 ①] 取景来源不许静默：有相机实体就按运行时相机（parse.js:957-969 取最后一个
+      // 可见相机实体）摆，没有实体才回落编辑器视口快照 scene.camera —— 回落是近似，必须给原因。
+      if (!pixelUnits) {
+        const camView = meshView(target);
+        if (camView.source !== "entity") log(et(`gl.cam.${camView.source}`, { n: camView.entityCount }), "warn");
+      }
+      const m = gltfToModel(g, { target: form, slug, fps: opts?.fps ?? 30, scale });
       await bakePuppetAtlas(m);
       const r = gltfImportFiles(m, slug);
       for (const x of r.files) assets.put(x.name, x.data, r.path);
@@ -4849,6 +4892,160 @@ async function importModelFiles(files: File[], forceForm: GltfTarget | null = nu
     }
   }
 }
+
+// ↓ task-17 ②：导入确认对话框（形态 / 缩放 / fps / 片段预览 / 取景来源；确认 = 一步结构编辑）
+/**
+ * W19 ②：文件选择器选完模型后先开确认条 —— 形态 / 缩放倍率 / 采样帧率 / 片段预览 / 取景来源。
+ * 确认后**仍只走** importModelFiles 那一条通道：其中的 structEdit(addModelLayer) 是唯一撤销步，
+ * 所以一次导入 = 一步撤销；确认条自己绝不编辑文档（判据锁死这一点）。
+ * 每次打开重建 DOM：语言切换后文案跟着变，也不留上一次的解析状态。
+ * 拖入文件的快速通道（drop → importModelFiles(files.map(f => f.file))）不弹窗，保持原口径；
+ * 木偶生成器那条路径（importModelFiles(files, "puppet", g)）同样绕过确认条。
+ */
+function openGltfImportDialog(files: File[], gen: PuppetGenerator | null): void {
+  const target = doc;
+  if (!target || !overlay || target.type !== "scene") {
+    log(et("log.structUnavailable"), "warn");
+    return;
+  }
+  let probeSeq = 0;
+  let probeTimer = 0;
+  const gltfDlgEl = document.createElement("dialog");
+  gltfDlgEl.className = "ed-dialog ed-gltf-import";
+  const dlgTitle = document.createElement("div");
+  dlgTitle.className = "ed-dialog-title";
+  dlgTitle.textContent = et("gl.dlg.title");
+  const dlgHint = document.createElement("p");
+  dlgHint.className = "ed-dialog-body";
+  dlgHint.textContent = et("gl.dlg.hint");
+  const grid = document.createElement("div");
+  grid.className = "ed-fx-params";
+  const dlgRow = (labelKey: string, el: HTMLElement): void => {
+    const l = document.createElement("label");
+    l.textContent = et(labelKey);
+    const box = document.createElement("div");
+    box.className = "ed-fx-param";
+    box.append(el);
+    grid.append(l, box);
+  };
+  const formEl = document.createElement("select");
+  formEl.setAttribute("data-gltf-form", "");
+  for (const [value, label] of [["auto", et("md.auto")], ["puppet", et("md.puppet")], ["mesh", et("md.mesh")]] as const) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    formEl.append(o);
+  }
+  formEl.value = modelFormPick ?? "auto";
+  dlgRow("gl.dlg.form", formEl);
+  const scaleEl = document.createElement("input");
+  scaleEl.type = "number";
+  scaleEl.step = "0.01";
+  scaleEl.min = "0.01";
+  scaleEl.max = "100";
+  scaleEl.value = "1";
+  scaleEl.setAttribute("data-gltf-scale", "");
+  dlgRow("gl.dlg.scale", scaleEl);
+  const fpsEl = document.createElement("input");
+  fpsEl.type = "number";
+  fpsEl.step = "1";
+  fpsEl.min = "1";
+  fpsEl.max = "240";
+  fpsEl.value = "30";
+  fpsEl.setAttribute("data-gltf-fps", "");
+  dlgRow("gl.dlg.fps", fpsEl);
+  const camP = document.createElement("p");
+  camP.className = "ed-dialog-body";
+  const camEl = document.createElement("span");
+  camEl.setAttribute("data-gltf-cam", "");
+  const cam = gltfImportCamLine(meshView(target));
+  camEl.textContent = et(cam.key, { n: cam.n });
+  camP.append(`${et("gl.dlg.cam")}：`, camEl);
+  const clipsHead = document.createElement("p");
+  clipsHead.className = "ed-dialog-body";
+  clipsHead.textContent = `${et("gl.dlg.clips")}：`;
+  const clipsEl = document.createElement("div");
+  clipsEl.className = "ed-dlg-clips";
+  clipsEl.setAttribute("data-gltf-clips", "");
+  const reasonEl = document.createElement("p");
+  reasonEl.className = "ed-note";
+  const actions = document.createElement("div");
+  actions.className = "ed-dialog-actions";
+  const cancelEl = document.createElement("button");
+  cancelEl.type = "button";
+  cancelEl.className = "ed-btn";
+  cancelEl.textContent = et("gl.dlg.cancel");
+  const okEl = document.createElement("button");
+  okEl.type = "button";
+  okEl.className = "ed-btn is-primary";
+  okEl.textContent = et("gl.dlg.ok");
+  actions.append(cancelEl, okEl);
+  gltfDlgEl.append(dlgTitle, dlgHint, grid, camP, clipsHead, clipsEl, reasonEl, actions);
+
+  /** 形态：下拉选 auto 就回到既有自动判据（菜单选过的 modelFormPick 优先） */
+  const pickForm = (): GltfTarget => (formEl.value === "auto" ? (modelFormPick ?? defaultTarget(target)) : (formEl.value as GltfTarget));
+  const syncDlg = (): void => {
+    const ok = gltfImportCheck(fpsEl.value, scaleEl.value);
+    okEl.disabled = !ok.ok;
+    reasonEl.textContent = ok.reason ? et(ok.reason) : "";
+  };
+  /** 片段预览：真解析一遍（与导入同一条 loadModelFile → gltfToModel），只取 clips 展示 */
+  const probeClips = async (): Promise<void> => {
+    const seq = ++probeSeq;
+    clipsEl.textContent = et("gl.dlg.probing");
+    const first = files.find((f) => isModelFile(f));
+    if (!first) {
+      clipsEl.textContent = et("gl.dlg.noClips");
+      return;
+    }
+    try {
+      const side = new Map<string, Uint8Array>();
+      for (const f of files) if (!isModelFile(f)) side.set(f.name.toLowerCase(), new Uint8Array(await f.arrayBuffer()));
+      const c = gltfImportCheck(fpsEl.value, scaleEl.value);
+      const loaded = await loadModelFile(first.name, new Uint8Array(await first.arrayBuffer()), sideResolver(side));
+      const m = gltfToModel(loaded.gltf, { target: pickForm(), slug: "preview", fps: c.ok ? c.fps : 30, scale: 1 });
+      if (seq !== probeSeq) return; // 更晚的一次探测已经开始，丢弃这次的结果
+      const lines = gltfClipLines(m.clips);
+      if (!lines.length) {
+        clipsEl.textContent = et("gl.dlg.noClips");
+        return;
+      }
+      clipsEl.replaceChildren(...lines.map((text) => {
+        const d = document.createElement("div");
+        d.textContent = text;
+        return d;
+      }));
+    } catch (e) {
+      if (seq !== probeSeq) return;
+      const ge = e instanceof GltfError ? e : null;
+      clipsEl.textContent = et(`gl.fail.${ge?.code ?? "format"}`, { name: first.name, detail: ge ? ge.detail : (e as Error).message });
+    }
+  };
+  const debounceProbe = (): void => {
+    window.clearTimeout(probeTimer);
+    probeTimer = window.setTimeout(() => void probeClips(), 250);
+  };
+  formEl.onchange = () => debounceProbe();
+  scaleEl.oninput = () => syncDlg();
+  fpsEl.oninput = () => {
+    syncDlg();
+    debounceProbe();
+  };
+  cancelEl.onclick = () => gltfDlgEl.close();
+  okEl.onclick = () => {
+    const c = gltfImportCheck(fpsEl.value, scaleEl.value);
+    if (!c.ok) return;
+    const form = pickForm();
+    gltfDlgEl.close();
+    void importModelFiles(files, form, gen, { fps: c.fps, scaleMul: c.scaleMul });
+  };
+  gltfDlgEl.addEventListener("close", () => gltfDlgEl.remove());
+  syncDlg();
+  document.body.append(gltfDlgEl);
+  gltfDlgEl.showModal();
+  void probeClips();
+}
+// ↑ task-17 ②：导入确认对话框结束
 
 // ---------- 视频成层 ----------
 

@@ -592,6 +592,28 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       const readAsset = async (name: string): Promise<Uint8Array | null> =>
         sceneDir ? await sceneDir.read(name, pkgAbort.signal) : pkg.getEntry(parsedPkg, name);
 
+      /**
+       * [we-scene patch] G3 皮肤变体：读 `models/<名>.mdl` 的平行模型描述
+       * `models/<名>.json` 的 `skins` 表（缺失/坏 json 返回 null）。
+       * **只在对象写了 `skin` 时才被调用**（闸门 `scn.skinIndexOf`），普通模型零多余 I/O；
+       * 本机打包语料 14904 个对象里 `skin` 0 命中 ⇒ 这条路径在工坊语料上从不进入。
+       * 命名依据：官方语料 `audiophile/models/grid/grid.{mdl,json}`、
+       * `techno/models/techno/sphere.{mdl,json}`、`fantasticcar/models/grid/grid.{mdl,json}`
+       * —— `.mdl` 的自带材质路径是 `materials/<目录>/<基名>.json`，而平行 `.json` 才是
+       * 带 `skins` 的模型描述，两者别混（`applySkinToMaterialPath` 只管后者映射的结果）。
+       */
+      const readModelSkinTable = async (mdlPath: string): Promise<unknown[] | null> => {
+        if (!/\.mdl$/i.test(mdlPath)) return null;
+        const entry = await readAsset(mdlPath.replace(/\.mdl$/i, ".json"));
+        if (!entry) return null;
+        try {
+          const doc = JSON.parse(readText(entry)) as { skins?: unknown };
+          return Array.isArray(doc?.skins) ? (doc.skins as unknown[]) : null;
+        } catch {
+          return null;
+        }
+      };
+
       // project.json（可选；属性表缺失是常态，source.project 返回 null 合法）
       let project: unknown = null;
       try {
@@ -3042,7 +3064,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               layer.size = [m.width, m.height];
             }
           }
-          const mat = scn.resolveMaterial(model);
+          // [we-scene patch] G3 皮肤变体（模型 json 形态）：`model` 就是对象引用的那个
+          // `models/x.json`，若它自带 `skins` 而对象写了 `skin: N`，材质路径按第 N 套
+          // 映射（`resolveMaterial` 的第三参；不写 skin 时恒等）。纯数据变换，无额外 I/O。
+          const mat = scn.resolveMaterial(model, scn.skinIndexOf((layer as any).srcObject));
           if (!mat) continue;
           // cropoffset 不得加进 origin（CASEBOOK 2341 / verify-groups I5c）：
           // origin 已是最终世界坐标；2477602742 的 Mountain crop.y=−358 等会把
@@ -4221,6 +4246,22 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const mdlEntry = await readAsset(model.puppet);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
+          // [we-scene patch] G3 皮肤变体（puppet 形态）：材质路径来自 `model.puppet` 那个
+          // MDL 的头，而 `skins` 表在**对象自己的模型 json** 里（本循环上面已解析成
+          // `model`）⇒ 直接用 `model.skins` 就地映射，不需要第二次 I/O。同族语义与 mesh
+          // 形态（读 sidecar）一致，闸门同款（对象必须显式写 `skin`）。官方语料没有
+          // 「puppet + skin」样本（唯一写 `skin` 的是 mesh 形态的 audiophile），本机打包
+          // 语料 0 命中，所以这条分支只按同族规则推广、不改任何既有壁纸行为。
+          const skinIdxPuppet = scn.skinIndexOf((layer as any).srcObject);
+          if (skinIdxPuppet !== null && Array.isArray((model as any).skins)) {
+            const skins = (model as any).skins as unknown[];
+            const skim = (p: string | null | undefined) =>
+              scn.applySkinToMaterialPath(p as string, skins, skinIdxPuppet);
+            if (mdlObj.materialPath) mdlObj.materialPath = skim(mdlObj.materialPath);
+            for (const mm of (mdlObj.meshes || []) as Array<{ materialPath?: string }>) {
+              if (mm.materialPath) mm.materialPath = skim(mm.materialPath);
+            }
+          }
           // [we-scene patch 2026-10-08] puppet 层此前**完全不读材质**，2D 场景里就一律
           // keepZ=0（z 压平 + 不测深度）—— 编辑器导入的 3D 网格（puppet 形态）自遮挡因此
           // 退化成三角形顺序。这里补上材质解析：只有材质**显式**写 depthtest:"enabled"
@@ -4289,6 +4330,26 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const mdlEntry = await readAsset(layer.model);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
+          // [we-scene patch] G3 皮肤变体：对象 `skin: N` ⇒ 用 sidecar `models/<名>.json`
+          // 的 `skins[N]` 把 MDL 自带材质路径映射成变体材质（audiophile
+          // `{model:"models/grid/grid.mdl", skin:1}` → `materials/grid/grid2.json`；
+          // 判据口径见 scene/parse.js 的 applySkinToMaterialPath 头注）。
+          // **在解析产物上就地改写** mdlObj/meshes 的 materialPath：下面所有读材质的
+          // 分支（mesh0 的 blending/depthtest、逐网格 meshMaterials、modelSrc 记账）
+          // 都只看这份已改写的路径，不新增第二套解析。闸门：对象没写 `skin` 时连
+          // sidecar 都不读 —— 本机打包语料 348 张 / 14904 个对象 0 命中。
+          const skinIdx = scn.skinIndexOf((layer as any).srcObject);
+          if (skinIdx !== null) {
+            const skins = await readModelSkinTable(layer.model);
+            if (skins) {
+              const skim = (p: string | null | undefined) =>
+                scn.applySkinToMaterialPath(p as string, skins, skinIdx);
+              if (mdlObj.materialPath) mdlObj.materialPath = skim(mdlObj.materialPath);
+              for (const mm of (mdlObj.meshes || []) as Array<{ materialPath?: string }>) {
+                if (mm.materialPath) mm.materialPath = skim(mm.materialPath);
+              }
+            }
+          }
           // [we-scene patch 2026-10-03] `reflected: true` 的对象要**同时**画进
           // `_rt_Reflection`（关于 y=0 平面的镜像），供地板/桌面这类材质按屏幕 UV 采样。
           // 标在图层上，渲染侧的 renderReflectionPass 按它筛（fantasticcar 的
@@ -5773,7 +5834,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                     return;
                   }
                   const model = JSON.parse(readText(modelBytes));
-                  const mat = scn.resolveMaterial(model);
+                  // G3：克隆层沿用模板对象的 `skin: N`（`{...src}` 已带 srcObject），否则
+                  // 克隆体会退回模型 json 的基底材质 —— 与模板层看到的画面不一致。
+                  const mat = scn.resolveMaterial(model, scn.skinIndexOf((clone as any).srcObject));
                   const matEntry = mat ? await readAsset(mat.materialPath) : null;
                   const material = matEntry ? readMaterialDoc(matEntry) : null;
                   const pass = material?.passes?.[0];

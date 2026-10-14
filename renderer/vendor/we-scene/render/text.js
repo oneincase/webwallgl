@@ -648,7 +648,16 @@ const MEDIA_CALLBACKS = [
 // 全库实测撞名 389 份脚本（scriptProperties 386 / window 2 / self 1），
 // 占 883 份脚本的 44%、涉及 68 个壁纸 —— 而 `export let scriptProperties =
 // createScriptProperties()...` 正是 WE 官方模板的标准写法。
-const SANDBOX_PARAM_NAMES = [
+//
+// [we-scene patch] P1-3：这是**沙箱形参的唯一真源**。三处入口全部由它展开 ——
+//   ① `SANDBOX_PARAM_DECL_RE` 的名字串（顶层同名声明降级为赋值）；
+//   ② `evalTextScript` 的 `new Function(...)` 形参；
+//   ③ `evalObjectScript` 的 `new Function(...)` 形参。
+// 此前是三份手抄清单 + 两份手抄实参表，历史上失同步产生过 44% 脚本 SyntaxError
+// 事故；本轮实测到的真缺陷是文字侧漏了 `thisObject`（顶层 `var thisObject` 被
+// DECL_RE 剥成对未声明标识符的赋值 → 严格模式 ReferenceError → 整段返回 null，
+// 而 checkSceneScript 用 42 形参编译还说 ok）。新增名字只改这一处。
+export const SANDBOX_PARAM_NAMES = [
   'scriptProperties', 'engine', 'WEMath', 'WEColor', 'WEVector', 'createScriptProperties', 'shared',
   'console', 'process', 'globalThis', 'self', 'window', 'document', 'require', 'module', 'exports',
   'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
@@ -661,6 +670,26 @@ const SANDBOX_PARAM_NAMES = [
   // 否则脚本顶层若声明同名变量会 SyntaxError 报废整个脚本。
   'MediaPlaybackEvent',
 ]
+
+/**
+ * [we-scene patch] 把声明表排成某个沙箱的形参序列。
+ *
+ * 形参表的**顺序本身是一份数据**：实参表按位置对齐，一旦顺序不同而实参没跟着换，
+ * 不会有任何语法错误 —— 只是静默绑错（例如 localStorage 拿到 MediaPlaybackEvent）。
+ * 所以这里表达的是「本沙箱的形参序列」，而不是「从名字集合里筛出子集」：
+ * `head` 里的名字提到第 3 位起（脚本惯用前几个位置），`tail` 里的名字沉到末位，
+ * 其余保持声明表原序。两个数组都必须是声明表的子集（新增的名字只需进声明表）。
+ */
+function arrangeSandboxParams(head, tail) {
+  const moved = new Set([...head, ...tail])
+  const rest = SANDBOX_PARAM_NAMES.filter((n) => !moved.has(n))
+  return [...rest.slice(0, 2), ...head, ...rest.slice(2), ...tail]
+}
+
+// 文字沙箱的形参序列：`thisLayer/thisScene` 提到第 3/4 位（紧跟 engine），
+// `localStorage` 沉到末位。与声明表**名字集合相同、顺序不同**。
+export const TEXT_SANDBOX_PARAM_NAMES = arrangeSandboxParams(['thisLayer', 'thisScene'], ['localStorage'])
+
 // 行内空白：JS 把 NBSP/全角空格/BOM 都当空白，富文本编辑器粘贴来的脚本常带 NBSP
 //（9 张壁纸的 `export\u00a0var scriptProperties` 因只认 [ \t] 而没被剥，整段 SyntaxError）。
 const HWS = '[ \\t\\u00a0\\u3000\\ufeff]'
@@ -1165,13 +1194,10 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     // 整个换成 no-op，污染宿主；这里除 console（给静音副本）外全部遮成 undefined。
     // Function/eval 无法遮蔽（保留字语义），属已知边界：WE 本身也是全信任执行脚本。
     const factory = new Function(
-      'scriptProperties', 'engine', 'thisLayer', 'thisScene', 'WEMath', 'WEColor', 'WEVector', 'createScriptProperties', 'shared',
-      'console', 'process', 'globalThis', 'self', 'window', 'document', 'require', 'module', 'exports',
-      'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
-      'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-      'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
-      'Vec3', 'Vec2', 'Vec4', 'input',
-      'MediaPlaybackEvent', 'localStorage',
+      // [we-scene patch] P1-3：形参不再手抄。名字与顺序都来自单一真源
+      // TEXT_SANDBOX_PARAM_NAMES（= 声明表把 thisLayer/thisScene 提到第 3/4 位、
+      // localStorage 沉到末位），实参表必须逐位对齐下面这 42 个位置。
+      ...TEXT_SANDBOX_PARAM_NAMES,
       // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
       // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
       '"use strict";\nvar localstorage = localStorage;\n' + body +
@@ -1212,6 +1238,11 @@ export function evalTextScript(script, scriptprops, opts = {}) {
       undefined, undefined, undefined, engine.setTimeout, engine.setInterval, engine.clearTimeout, engine.clearInterval,
       undefined, undefined, undefined, undefined,
       Vec3, Vec2, Vec4, input,
+      // [we-scene patch] thisObject ← thisLayer（与对象沙箱同口径：脚本顶层
+      // `var thisObject` 在 WE 里就是文字层自身）。此前文字形参表漏了这个名字，
+      // 而 SANDBOX_PARAM_DECL_RE 会把它从声明里剥掉 → 严格模式下对未声明标识符
+      // 赋值 → ReferenceError → 整段脚本返回 null（checkSceneScript 却还说 ok）。
+      thisLayer,
       MEDIA_PLAYBACK_EVENT,
       // [we-scene patch] 文字沙箱也拿按壁纸共享的 localStorage（P1-2）：
       // 此前形参表里没有 localStorage，脚本读它得到的是消毒全局上的 undefined，
@@ -1234,7 +1265,27 @@ export function evalTextScript(script, scriptprops, opts = {}) {
   // 3405117965 的 LED 矩阵按画布重排）。首帧也派发一次，因此纯 resize 脚本
   // 没有任何逐帧消费者，不进 update 队列，只在尺寸变化时由宿主调 callResize。
   const hasResizeHook = !!(fns && typeof fns.resizeScreen === 'function')
-  if (!fns || (!fns.update && !hasMediaHook && !hasApplyHook && !hasAnimEventHook && !hasResizeHook)) return null
+  // [we-scene patch] 第六闸门族：cursor*（鼠标悬停/按下/拖拽）。文字脚本同样有
+  // cursor 回调——3786330502 的悬停显隐按钮就挂在文字层上——而宿主确实会为文字沙箱
+  // 登记并派发指针事件：scene-mount.ts 对 textWidgets 逐个 addCursorHook（守卫读的
+  // 正是 sandbox.hasCursorHook），派发点在同一文件。此前这一族不在闸门里，纯 cursor
+  // 文字脚本（无 update）在建沙箱这一步就被整个丢弃，宿主拿不到句柄，登记表为空，
+  // 该层的指针交互整体不存在——且没有任何报错。
+  const hasCursorHook = !!(fns && (fns.cursorClick || fns.cursorEnter || fns.cursorLeave ||
+    fns.cursorDown || fns.cursorUp || fns.cursorMove))
+  // [we-scene patch] 第七闸门族：init（只导出 init 的启动副作用）。宿主对**文字**沙箱
+  // 真调 init：装配期 deferredTextInits 末端与热替换路径都会调，返回值是字符串就写回
+  // layer.text（scene-mount.ts 两处）。闸门丢弃则这两条路径永远等不到沙箱。
+  const hasInitHook = !!(fns && typeof fns.init === 'function')
+  // [we-scene patch] 对象侧还认一族 `usesEngineClock`（读 engine.runtime/frametime 的
+  // 无 export helper），文字侧**刻意不放行**：这里放行只会得到静默错值 —— ①无 export
+  // 且不含 update/resizeScreen 的脚本在更前面的快速短路就被丢；②宿主只对 hasUpdate 的
+  // 文字沙箱回填时钟（scene-mount.ts 的 `it.sandbox.engine.runtime = t` 写在
+  // `if (sandbox && sandbox.hasUpdate)` 分支内）⇒ 放行后 engine.runtime 恒 0，
+  // helper 里的 `engine.runtime - t0 >= delay` 永不成立，表现为「点击后 shared 翻了
+  // 但图层一动不动」。半修比不修更坏（不修至少不假装成功）。真修要改宿主回填那一处，
+  // 属本文件之外，已记为声明缺口 HOOK_GAP（见 scripts/verify-sandbox-params.mjs）。
+  if (!fns || (!fns.update && !hasCursorHook && !hasMediaHook && !hasApplyHook && !hasAnimEventHook && !hasResizeHook && !hasInitHook)) return null
   // [we-scene patch] update 的首帧 value 语义按脚本形态区分：
   //  - 写回式（打字机模板）：update 把入参 value 当作**累积中的当前文本读入**
   //    （addLastChar(value) / handleBlinker(value) / queuedWord===value），返回值
@@ -1275,9 +1326,9 @@ export function evalTextScript(script, scriptprops, opts = {}) {
     thisLayer,
     scriptProperties: spValues,
     hasUpdate: !!fns.update,
-    // [we-scene patch] 是否挂了指针回调（宿主据此建 hit-test 索引）
-    hasCursorHook: !!(fns.cursorClick || fns.cursorEnter || fns.cursorLeave ||
-      fns.cursorDown || fns.cursorUp || fns.cursorMove),
+    // [we-scene patch] 是否挂了指针回调（宿主据此建 hit-test 索引）。
+    // 与上面的闸门族同源：表达式只写一遍，闸门与句柄不可能再失同步。
+    hasCursorHook,
     // [we-scene patch] 是否挂了媒体回调（宿主据此建广播表）
     hasMediaHook,
     hasApplyHook,
@@ -2700,13 +2751,10 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   let fns
   try {
     const factory = new Function(
-      'scriptProperties', 'engine', 'WEMath', 'WEColor', 'WEVector', 'createScriptProperties', 'shared',
-      'console', 'process', 'globalThis', 'self', 'window', 'document', 'require', 'module', 'exports',
-      'fetch', 'XMLHttpRequest', 'Worker', 'importScripts', 'location', 'navigator',
-      'alert', 'confirm', 'prompt', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-      'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Function',
-      'Vec3', 'Vec2', 'Vec4', 'input', 'thisLayer', 'thisScene', 'thisObject', 'localStorage',
-      'MediaPlaybackEvent',
+      // [we-scene patch] P1-3：形参不再手抄。对象沙箱的形参序列**就是声明表原序**
+      // （与 evalTextScript 的排列不同：那里 thisLayer/thisScene 在第 3/4 位、
+      // localStorage 在末位）。实参表逐位对齐下面的 42 个位置。
+      ...SANDBOX_PARAM_NAMES,
       // [we-scene patch] 别名注入：2955378002 的脚本把 localStorage 写成小写
       // `localstorage`（作者笔误），WE 侧可运行而这里会 ReferenceError 熔断该入口。
       '"use strict";\nvar localstorage = localStorage;\n' + body +

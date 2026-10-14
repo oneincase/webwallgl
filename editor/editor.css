@@ -2070,6 +2070,21 @@ input.ed-al-name {
   width: min(520px, calc(100vw - 48px));
 }
 
+/* task-17 ②：W19 导入确认对话框（复用 .ed-dialog；片段预览需要限高滚动） */
+.ed-dialog.ed-gltf-import {
+  width: min(420px, calc(100vw - 48px));
+}
+
+.ed-dlg-clips {
+  max-height: 9em;
+  overflow: auto;
+  margin: 4px 0 0;
+}
+
+.ed-dlg-clips > div {
+  line-height: 1.5;
+}
+
 .ed-vdir-list {
   display: flex;
   flex-direction: column;

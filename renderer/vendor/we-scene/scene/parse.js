@@ -400,6 +400,8 @@ export function parseScene(sceneJson, project) {
 
   const layers = objects.map((o, i) => {
     const world = local[i]
+    // [we-scene patch] G4：本轮显式忽略的对象字段在此处提示一次（见 noteUnsupportedObjectFields）
+    noteUnsupportedObjectFields(o)
     // projectlayer / fullscreenlayer 覆盖整个正交投影。作者常留编辑器预览框
     // （973101892：1248×702 @ origin 0）或 size 缺省 [0,0]；按作者矩形画
     // 只动左上角一小块，看起来还是「整张星云不会动」。
@@ -1033,11 +1035,110 @@ export function applySolidFromModel(layer, modelJson) {
   if (modelJson.solidlayer === true) layer.solid = true
 }
 
+/**
+ * [we-scene patch] G4：本轮**显式忽略**的对象字段（定案：DEFAULTPROJECTS-PLAN E3，
+ * 判据：scripts/verify-defprojects.mjs 判据 10）。
+ *
+ * 这四个字段在官方内置语料里真的有真值 —— 少了这条诊断，用户看到的是「字段被静默
+ * 吃掉」，与「字段已生效」在图上一模一样，排查会走错方向：
+ *   · `locktransforms:true`（razer_vortex 的 vortex 等）：锁住对象变换，使其不跟随
+ *     父级/脚本；本仓仍会做父子合成 ⇒ 该层可能被父级变换带动。
+ *   · `ledsource:true`（razer_vortex 的 led 等）：把该层作为 LED 灯效的取色源；
+ *     本仓无 LED 通道 ⇒ 该层只按普通模型画。
+ *   · `blockalign:false`（dino_run 的文字层）：文本框对齐方式；本仓文字排版走自己的
+ *     实现 ⇒ 该字段不参与布局。
+ *   · `particlesrc:null`（ricepod 的 starfield）：粒子源覆盖；本仓粒子参数覆盖走
+ *     `instanceoverride`，该字段不读。
+ * 语义：只有**真值**（true / 非 0 数字 / 非空字符串）才提示，且每个字段全进程只提示
+ * 一次（跨场景热更不重复刷屏）。返回命中的字段名，便于判据直接断言。
+ */
+const G4_IGNORED_FIELDS = ['locktransforms', 'ledsource', 'blockalign', 'particlesrc']
+const g4Noted = new Set()
+export function noteUnsupportedObjectFields(o) {
+  if (!o || typeof o !== 'object') return null
+  for (const f of G4_IGNORED_FIELDS) {
+    const v = o[f]
+    if (v === undefined || v === null || v === false || v === 0 || v === '') continue
+    if (!g4Noted.has(f)) {
+      g4Noted.add(f)
+      console.info(
+        `[we-scene] 对象字段 ${f}=${JSON.stringify(v)} 本轮显式忽略（行为未实现，见 verify-defprojects 判据 10）：${o.name || o.id || ''}`,
+      )
+    }
+    return f
+  }
+  return null
+}
+
+/**
+ * [we-scene patch] G3 皮肤变体：对象侧闸门。
+ *
+ * 取场景对象（parseScene 存进 layer.srcObject）的 `skin` 字段。**只有对象显式写了
+ * `skin` 才返回非 null** —— 调用方据此决定是否去读模型 sidecar、是否改写材质路径；
+ * 没写就完全跳过（这是「工坊打包语料一个字节都不动」的闸门：本机打包库 348 张 pkg /
+ * 14904 个场景对象里 `skin` 0 命中、模型 sidecar `skins` 0 命中）。
+ *
+ * 证据（官方源码工程 defaultprojects）：
+ *   · `audiophile/audiophile.json:11` 对象 `{model:"models/grid/grid.mdl", skin:1}`
+ *     （全语料**唯一**一处对象写 skin）；
+ *   · techno 的 `sphere.mdl` 对象与 fantasticcar 的 `grid.mdl` 对象都**不写** skin。
+ *
+ * 语义：`skin: N` = 取 sidecar `skins[N]` 那一套（0 基）。数字与纯数字字符串都收
+ * （WE 的 json 两栖），其余类型（含 null/false/字符串 "abc"）按「没写」处理。
+ */
+export function skinIndexOf(srcObject) {
+  if (!srcObject || typeof srcObject !== 'object') return null
+  const raw = srcObject.skin
+  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.trunc(raw)
+  if (typeof raw === 'string' && /^\s*-?\d+\s*$/.test(raw)) return parseInt(raw, 10)
+  return null
+}
+
+/**
+ * [we-scene patch] G3 皮肤变体：把 MDL 自带的材质路径按 `skins[N]` 映射成变体材质。
+ *
+ * sidecar `models/<名>.json` 的 `skins` 是「材质目录名 → 材质基名」的映射表：
+ *   · `audiophile/models/grid/grid.json` = `{"skins":[{"grid":"grid"},{"grid":"grid2"}]}`
+ *     配 `grid.mdl` 头里的 materialPath = `materials/grid/grid.json`
+ *     （parseMDL 读 0x15 cstring，见 render/mdl-parse.js:544）⇒ `skin:1` 得到
+ *     `materials/grid/grid2.json`（该材质与 grid2.tex 都在工程里）。
+ *   · `techno/models/techno/sphere.json` = `{"skins":[{"techno":"technohex"}]}`
+ *     配 sphere.mdl 的 materialPath = `materials/techno/technohex.json`
+ *     ⇒ **键 `techno` 是材质目录名、值 `technohex` 是材质基名**，不是模型名
+ *     （模型叫 sphere，这条把「键 = 模型 stem」的读法排除掉）；0 号皮是恒等映射。
+ *   · `fantasticcar/models/grid/grid.json` = `{"skins":[{"grid":"grid"}]}`（恒等）。
+ *
+ * 生效条件（同时满足才改写，否则**原样返回**）：
+ *   ① 路径形如 `materials/<目录>/<基名>.json`；② 第 N 套里键 `<目录>` 有非空字符串值；
+ *   ③ 值不含路径分隔符或相对段（皮肤值只能是基名，防越权跳到别处）。
+ *
+ * 回落口径：`skins` 缺失/非数组、第 N 套不是对象、键不命中 ⇒ 原样返回（等价 0 号套）；
+ * N 越界/负数 ⇒ 按第 0 套处理。`skinIndex` 为 null/undefined ⇒ 恒等（零回归路径）。
+ */
+export function applySkinToMaterialPath(materialPath, skins, skinIndex) {
+  if (typeof materialPath !== 'string' || !materialPath) return materialPath
+  if (skinIndex === undefined || skinIndex === null) return materialPath
+  if (!Array.isArray(skins)) return materialPath
+  const n = Number.isInteger(skinIndex) && skinIndex >= 0 && skinIndex < skins.length ? skinIndex : 0
+  const set = skins[n]
+  if (!set || typeof set !== 'object') return materialPath
+  const seg = materialPath.split('/')
+  if (seg.length < 3 || seg[0] !== 'materials') return materialPath
+  const file = seg[seg.length - 1]
+  if (!/\.json$/i.test(file)) return materialPath
+  const next = set[seg[seg.length - 2]]
+  if (typeof next !== 'string' || !next) return materialPath
+  if (/[\\/]/.test(next) || next === '.' || next === '..') return materialPath
+  seg[seg.length - 1] = next + file.slice(file.length - 5)
+  return seg.join('/')
+}
+
 // 从对象模型解析材质链：object.image → models/x.json → materials/y.json → passes
-export function resolveMaterial(modelJson) {
+// 第三参 = 对象 `skin: N`（G3）；省略/传 null 时行为与历史完全一致（恒等）。
+export function resolveMaterial(modelJson, skinIndex = null) {
   if (!modelJson || typeof modelJson.material !== 'string') return null
   return {
-    materialPath: modelJson.material,
+    materialPath: applySkinToMaterialPath(modelJson.material, modelJson.skins, skinIndex),
     autosize: !!modelJson.autosize,
     cropoffset: modelJson.cropoffset ? parseVec2(modelJson.cropoffset) : null,
   }

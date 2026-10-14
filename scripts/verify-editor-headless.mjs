@@ -68,14 +68,27 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   await server.listen();
   cleanups.push(() => server.close());
   var origin = `http://127.0.0.1:${port}`;
+  // 假目录保存竞态的确定性复现：真宿主 + 假目录源码，在 Chrome 起来之前跑完（不把页面自己的请求卷进来）。
+  await runPickerRaceCheck({ check, origin, lib });
 
   var { launchHeadless, instrument } = await imp("scripts/headless-gpu.mjs");
   var session = await launchHeadless({ url: "about:blank", task: "verify-editor", width: 1440, height: 900 });
   cleanups.push(() => session.close());
   instrument(session, { width: 1440, height: 900 });
   var cdp = session.pageCdp;
+  // 假目录的保存纪律（守卫先咬，坏了就不用等真机轮才发现「少一个文件」）：
+  // 真机轮 409 的根因在这个假目录里，不在页面也不在产品侧（见 pickerGuardBad 的注释与 /tmp/repro409/）。
+  var pickerSrc = fs.readFileSync(path.join(ROOT, "scripts/e2e-dir-picker.js"), "utf8");
+  var hostSrc = fs.readFileSync(path.join(ROOT, "host/wallpaper-host.ts"), "utf8");
+  var pickerBad = pickerGuardBad(pickerSrc, fs.readFileSync(fileURLToPath(import.meta.url), "utf8"), hostSrc);
+  check(
+    pickerBad.length === 0,
+    `e2e 假目录保存纪律（save-begin 单飞 + 成功后才置 begun + 宿主写请求串行 + 宿主按 itemId 串行/P2 + save-begin 原子换名/P1 + 409 换新 id 重试 + run 内 id 唯一 + 存盘失败现场）：${
+      pickerBad.join("；") || "OK"
+    }`,
+  );
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-    source: fs.readFileSync(path.join(ROOT, "scripts/e2e-dir-picker.js"), "utf8"),
+    source: pickerSrc,
   });
   var walkRel = (dir, base, out = []) => {
     for (const name of fs.readdirSync(dir)) {
@@ -149,11 +162,58 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
   /** 浏览器存储里的工程整份落到本机文件夹（状态栏 / 工程卡那颗按钮）；已经是真目录就直接返回 */
   var saveToLocal = async () => {
     if (!(await ev(`!!localStorage.getItem('webwallgl-vdir-last')`))) return null;
+    // task-22：真因窗口只在「已经有一个 flush 过了 dir 检查、正在写盘」时才打开（editor/main.ts
+    // flushAutosave 的 :2452 dir 检查 → :2458 记账之间）。状态栏 #st-save 在 saving 期间显示 st.saving
+    // （renderSaveStatus()），等它出现再点，是页面外能做到的最强逼近；没等到也照点（页面干净时本来就
+    // 没有在飞的 flush），上限 1.2s、20ms 轮询，不影响别的段。
+    const SAVING = `/保存中|Saving/.test(document.querySelector('#st-save')?.textContent || '')`;
+    if (!(await ev(SAVING))) await waitFor(SAVING, { timeoutMs: 1200, pollMs: 20 }).catch(() => false);
     await clickSel("#st-save");
     await waitFor(`!localStorage.getItem('webwallgl-vdir-last')`, 30000);
-    const id = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
-    await waitFileOnDisk(path.join(lib, String(id), "project.json"));
-    check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(path.join(lib, id, "project.json")), `「存到本机文件夹…」：浏览器存储里的工程整份落到真目录（${id}）`);
+    const id = await ev(`sessionStorage.getItem("wwgl-e2e-project")`);
+    // task-22 判据的读法（Lead 修 harness 竞态）：账本必须**等到**写盘落定后再快照。
+    // `#st-save` 的完成条件是 `webwallgl-vdir-last` 被清（adoptProject 里那一步），而 flushAutosave 的
+    // save-file 请求是 adoptProject 之后才发的 ⇒ 此前单次快照只会看到探针写的 `.webwallgl-write-test`，
+    // 盘上 project.json 却会在随后 15s 轮询里出现（U / AJ 两处调用点必红，且是判据自身的时序错，
+    // 不是产品缺陷）。这里改成有界等账本出现 project.json：真的没走真目录（changed=[] 那条路）时
+    // 等满就红，判据的判别力不变。
+    const ioOf = async () => await ev(`(window.__e2eIo || {})[${JSON.stringify(String(id))}] || null`);
+    const wrote = await waitFileOnDisk(path.join(lib, String(id), "project.json"));
+    let io = await ioOf();
+    for (let i = 0; i < 100 && !(io && Array.isArray(io.paths) && io.paths.includes("project.json")); i++) {
+      await sleep(120);
+      io = await ioOf();
+    }
+    if (!wrote) {
+      // 真机轮就在这里红过，而原来只有一句「少 project.json」，真因（宿主 409 被假目录原样抛成 保存失败）看不到。
+      // 现场：页面最后几条与「写到哪个目录」有关的日志（log.autosaved 带目录名）/ 假目录 I/O 账本
+      // （哪个 id 收到过哪几个文件 —— changed=[] 那条路是真目录一个 project.json 都没有）/ 宿主冲突 / 换 id 重试。
+      const errs = await ev(
+        `[...document.querySelectorAll('#ed-con-body > div')].map((d) => d.textContent).filter((t) => /保存失败|保存用时|Save failed|Save took|Error|已自动保存|Autosaved|已存到本机文件夹|Saved to the local|项目文件夹|Project folder|正在保存|Saving: collecting/.test(t)).slice(-12)`,
+      );
+      const conflicts = await ev(`JSON.stringify(window.__e2eConflicts || [])`);
+      const retries = await ev(`JSON.stringify(window.__e2eRetries || [])`);
+      const dirPath = path.join(lib, String(id));
+      const exists = fs.existsSync(dirPath);
+      const marked = exists && fs.existsSync(path.join(dirPath, ".webwallgl-editor"));
+      const listed = exists ? fs.readdirSync(dirPath).sort().join(",") || "(空目录)" : "(目录不存在)";
+      console.log(
+        `  · 存到本机文件夹失败现场：id=${id} 目录=${exists ? "存在" : "不存在"} 编辑标记=${marked ? "有" : "无"} 盘上=[${listed}]\n    页面报错=${JSON.stringify(errs)}\n    假目录 I/O=${JSON.stringify(io)}\n    宿主冲突=${conflicts}\n    假目录换 id 重试=${retries}`,
+      );
+    }
+    check(
+      typeof id === "string" && /^editor-/.test(id) && fs.existsSync(path.join(lib, id, "project.json")),
+      `「存到本机文件夹…」：浏览器存储里的工程整份落到真目录（${id}${wrote ? "" : "；失败现场见上一行"}）`,
+    );
+    // task-22 判据：健康的存盘**一定**会在真目录上发出 project.json 的 save-file 请求（adoptProject 清空
+    // 指纹后 changed 必然含它）。真目录一次都没收到 ⇒ flushAutosave 走了 changed=[] 那条路（在飞 flush 把
+    // 旧目录的指纹记到了新目录头上，而它同时把 dirty 置回 false ⇒ 之后不再有 flush），现场就是
+    // 「只剩 .webwallgl-editor」+ 保存用时 0.0s + 0 条 保存失败。这条与盘上文件断言互补：盘上可能被
+    // 「写了别的名字 / 写晚了」掩盖，账本不会被掩盖。
+    check(
+      !!io && Array.isArray(io.paths) && io.paths.includes("project.json"),
+      `存到本机文件夹：真目录收到过 project.json 的写请求（${id}；假目录 I/O=${JSON.stringify(io)}）`,
+    );
     return id;
   };
 
@@ -899,6 +959,207 @@ export function arHarnessBad(src) {
   is(/arXLibOwners\.length === 1/.test(fx15), "AR：FX-CACHE 复现有确定性前提断言（库目录里只有 A 一个条目带那个路径）");
   is(/await arBtn\(0, "add"\)/.test(fx15) && /await arWaitParam\(1, AR_X_P2\)/.test(fx15), "AR：FX-CACHE 的 A→B 正向断言：加 pass 后第 2 条 pass 的参数格必须补上");
   return bad;
+}
+
+/**
+ * e2e 假目录的「保存原子性」守卫（纯函数，不做 IO，可离线单独跑）。
+ *
+ * 真机轮（/tmp/hl-final4.log:2744/2747）就是这样红的：页面「存到本机文件夹」之后盘上没有
+ * project.json（✗ 项目写入文件夹），控制台一条 `保存失败：{"error":"目标不是编辑器创建的目录，拒绝覆盖：editor-…"}`。
+ * 根因不在页面也不在产品侧，而在这个假目录：页面会**不 await 地**探活（editor/main.ts adoptProject →
+ * probeDirWritable 的 `void probeWritable(...)`：探针 write→close 触发 save-begin，紧接着
+ * removeEntry→mirrorAll 又无条件发第二条 save-begin），而 flushAutosave 的写盘同一时刻也在 postFile。
+ * 假目录原来的 begin() 在请求成功**之前**就置 `root.begun = true`，三条宿主请求又互不排队 ⇒
+ * 同 id 的 save-file 会落在宿主 rm→mkdir→写编辑标记（host/wallpaper-host.ts:1106-1108）的中间态上，
+ * 被守卫判成「存在但没有编辑标记」⇒ 409，当次 flush 整个失败；begun 已为 true 之后写盘继续失败（级联）。
+ *
+ * 离线复现（真宿主 + 本文件源码，/tmp/repro409/e2-pattern.mjs）：坏版本 80 轮里 10 轮命中，
+ * 修好后 80 轮 0 命中。谁把单飞 / 串行 / 成功后才置 begun / 409 换 id 重试 / run 内 id 唯一改回去，
+ * 本守卫立刻红，而不是等到真机轮再出现「少一个文件」。最后一条咬 harness 自己：存盘失败必须留下
+ * 现场（页面报错 + 宿主冲突 + 假目录重试），只报「少文件」等于把真因埋掉。
+ */
+export function pickerGuardBad(pickerSrc, harnessSrc, hostSrc = "") {
+  const bad = [];
+  const is = (c, m) => {
+    if (!c) bad.push(m);
+  };
+  const at = (n, from = 0) => pickerSrc.indexOf(n, from);
+  const slice = (from, to) => {
+    const a = at(from);
+    if (a < 0) return "";
+    const b = to === undefined ? pickerSrc.length : pickerSrc.indexOf(to, a);
+    return b > a ? pickerSrc.slice(a, b) : "";
+  };
+  is(at("let ioChain = Promise.resolve();") > 0 && at("const hostSeq = (fn) =>") > 0, "假目录：同一 root 的宿主写请求走一条串行链");
+  const post = slice("const postFile = (path, data) =>", "let beginInFlight = null;");
+  is(post.length > 0 && post.includes("hostSeq(async () => {") && post.includes("save-file"), "假目录：save-file 在串行链上");
+  const once = slice("const beginOnce = () =>", "// 单飞：");
+  is(once.length > 0 && once.includes("hostSeq(async () => {") && once.includes("save-begin"), "假目录：save-begin 也在同一条串行链上（漏了它 = 宿主的 rm/mkdir 会被同 id 的写看见）");
+  is(!/root\.begun = true/.test(once), "假目录：beginOnce 里不许置 begun（要等响应成功）");
+  const begin = slice("const begin = () => {", "const mirrorAll = async () => {");
+  const first = begin.indexOf("const first = await beginOnce();");
+  const okAt = begin.indexOf("if (first.res.ok)");
+  const setAt = begin.indexOf("root.begun = true;");
+  is(first > 0 && okAt > first && setAt > okAt, "假目录：begin() 只有 save-begin **成功**之后才置 root.begun（提前置位 ⇒ 一次 409 之后所有写盘跳过 begin，级联失败）");
+  is(begin.includes("if (beginInFlight) return beginInFlight;"), "假目录：begin() 单飞（页面探针与写盘会并发调进来，不能同时发两条 save-begin）");
+  is(begin.includes("first.res.status !== 409") && begin.includes("root.itemId = freshItemId();") && begin.includes("window.__e2eRetries"), "假目录：save-begin 收 409 要换新 id 重试一次并留证据");
+  is(
+    /const second = await beginOnce\(\);[\s\S]*?for \(const f of collect\(root, "", \[\]\)\) await postFile/.test(begin),
+    "假目录：换 id 重试成功后把整棵树重新镜像过去（先写过的文件不能留在被弃用的旧目录里）",
+  );
+  const idFn = slice("const freshItemId = () =>", "function createRoot(");
+  is(idFn.includes("RUN_TAG") && idFn.includes("idSeq++"), "假目录：itemId 在 run 内单调唯一（随机 id 会撞上一轮跑剩的目录，而那种目录一律 409）");
+  is(!/itemId: `editor-e2e\$\{Math\.random\(\)/.test(pickerSrc), "假目录：createRoot 不再用随机 id 前缀");
+  const pick = slice("window.showDirectoryPicker = async () => {");
+  is(pick.includes('sessionStorage.setItem("wwgl-e2e-project", root.itemId)'), "假目录：空白/种子模式仍然登记 wwgl-e2e-project（harness 靠它取 id）");
+  is(/root\.begun = true;/.test(pick), "假目录：打开已有工程沿用宿主的编辑标记（不再 save-begin，那会 rm 掉它）");
+  const hs = harnessSrc.indexOf("var saveToLocal = async () => {");
+  const hb = harnessSrc.indexOf("var clearLocalStore", hs);
+  const dump = hs > 0 && hb > hs ? harnessSrc.slice(hs, hb) : "";
+  is(
+    dump.includes("存到本机文件夹失败现场") && dump.includes(".webwallgl-editor") && dump.includes("__e2eRetries") && dump.includes("__e2eIo") && dump.includes("已自动保存"),
+    "harness：存到本机文件夹失败要打出页面报错（含 autosaved 的目录名）+ 编辑标记 + 假目录 I/O 账本 + 换 id 重试的现场（只报「少文件」= 把真因埋掉）",
+  );
+  // ── task-22：真机 AJ 段的「存到本机文件夹之后真目录只剩编辑标记」──
+  // 真因不是宿主 409，而是产品侧 flushAutosave 算出 changed=[]（一次写请求都不发）：
+  // writtenSig 是按**路径**记的全局表，adoptProject() 的 clear() 与「已经在飞的旧目录 flush」
+  // 在 flushAutosave 的 dir 检查与记账之间交错 —— 旧 flush 在 clear 之后把（写进旧目录的）指纹
+  // 记回来，新目录的 flush 就一路 changed=[]，且它同时把 dirty 置回 false ⇒ 之后不再有 flush。
+  // 现场签名：真目录 0 次 project.json 的 save-file + 保存用时 0.0s ×N + 0 条 保存失败 + 盘上只有
+  // .webwallgl-editor（换 id 重试与宿主 409 都干净）。判据落在两处：假目录的 I/O 账本（能证「一次都没写」）
+  // 与点 #st-save 之前等「保存中」（有 flush 在飞 = 那个窗口唯一开着的时候，把概率抬到最高）。
+  is(
+    dump.includes('io.paths.includes("project.json")') && dump.includes("真目录收到过 project.json 的写请求"),
+    "harness：存到本机文件夹必须断言真目录收到过 project.json 的写请求（changed=[] 那条路 = 0 次 save-file，盘上文件断言会把它说成「少文件」）",
+  );
+  // Lead 修掉的判据自身时序错：账本快照必须发生在 waitFileOnDisk 之后、且要有界等 project.json 出现。
+  // 单次快照会稳定误报（U/AJ 两处调用点都红，而盘上文件齐全）——因为 #st-save 的完成条件
+  // （webwallgl-vdir-last 被清）早于 flushAutosave 发 save-file。判别力不变：真的走 changed=[] 时等满即红。
+  is(
+    /const wrote = await waitFileOnDisk\([\s\S]{0,600}?paths\.includes\("project\.json"\)/.test(dump),
+    "harness：真目录 I/O 账本必须在写盘落定后**有界等待**再断言（单次早读会稳定误报为「没收到 project.json」）",
+  );
+  is(
+    !/const io = await ev\(`\(window\.__e2eIo/.test(dump),
+    "harness：不得保留「点完 #st-save 立刻单次快照账本」的老读法（判据时序错，会误报）",
+  );
+  is(
+    dump.includes("document.querySelector('#st-save')?.textContent") && /timeoutMs: 1200, pollMs: 20/.test(dump),
+    "harness：点 #st-save 之前先等状态栏进「保存中」（有 flush 在飞才是竞态窗口开着的时刻，20ms 轮询把命中率抬到最高）",
+  );
+  is(pickerSrc.includes("const noteIo =") && pickerSrc.includes("window.__e2eIo"), "假目录：每个 itemId 的宿主 I/O 账本（哪条路径被真写过，失败现场靠它定位）");
+  is(post.includes('noteIo("file"') && post.includes('noteIo("failed"'), "假目录：save-file 无论成败都记账（失败时这本账就是真因证据）");
+  is(once.includes('noteIo("begin")'), "假目录：save-begin 也记账（区分「目录被建出来」与「内容被写进去」）");
+  is(/var pickerBad = pickerGuardBad\(pickerSrc/.test(harnessSrc), "harness：注入假目录**之前**先跑本守卫（删掉调用 = 守卫形同虚设）");
+  is(/await runPickerRaceCheck\(\{ check, origin, lib \}\)/.test(harnessSrc), "harness：真机轮里带着那次竞态的确定性复现（删掉它 = 只剩静态守卫、跑不出先红）");
+  // ── 宿主侧（host/wallpaper-host.ts 的 P2 串行 + P1 原子化，task-19）──
+  // 这四类改动任何一条被改回去，409 的中间态就重新可见（且真机现场是「少一个文件」，很难回查）：
+  const hostA = hostSrc.indexOf('if (path === "/api/editor/save-begin" || path === "/api/editor/save-file") {');
+  const hostB = hostSrc.indexOf("// --- 网页壁纸工程相对资源解析", hostA);
+  const host = hostA > 0 && hostB > hostA ? hostSrc.slice(hostA, hostB) : "";
+  const lockAt = host.indexOf("await withEditorSaveLock(itemId, async () => {");
+  const existsAt = host.indexOf("const exists = !!(await asDirectory(dir));");
+  const lockFnAt = hostSrc.indexOf("function withEditorSaveLock<T>(");
+  const lockFn = lockFnAt > 0 ? hostSrc.slice(lockFnAt, hostSrc.indexOf("\n}", lockFnAt)) : "";
+  is(lockAt > 0, "宿主：save-begin/save-file 整条处理链按 itemId 串行（守卫求值也在里面）");
+  is(existsAt > lockAt && lockAt > 0, "宿主：守卫求值必须在串行段**之内**（挪到锁外 ⇒ 同 id 请求又看得见中间态）");
+  is(host.includes("if (exists && !marked)") && host.includes("拒绝覆盖"), "宿主：守卫语义未被放宽（存在但没有编辑标记仍然 409）");
+  is(host.includes("先调 save-begin"), "宿主：save-file 分支仍在同一段串行链里（只锁 save-begin 等于没锁）");
+  is(
+    host.includes("const tmp = ") && host.includes("join(tmp, EDITOR_MARK)") && host.includes("await fs.rename(tmp, dir);"),
+    "宿主：save-begin 先建同级临时目录、写好标记再原子换名（断在中间只留 tmp 残迹，不会留下此后永远 409 的无标记目录）",
+  );
+  is(!host.includes("await fs.mkdir(dir, { recursive: true });"), "宿主：save-begin 不再原地 mkdir 目标目录（那是非原子的旧写法）");
+  is(lockFn.includes("prev.then(fn, fn)"), "宿主：串行链异常不破坏链（prev.then(fn, fn)：一个请求失败不卡死同 id 后续请求）");
+  is(
+    /pickerGuardBad\(pickerSrc,[\s\S]{0,160}?hostSrc\)/.test(harnessSrc),
+    "harness：守卫必须真的拿到宿主源码（漏传 ⇒ 上面 7 条宿主判据被静默跳过，等于没守）",
+  );
+  return bad;
+}
+
+/**
+ * 假目录保存竞态的**确定性复现**（真宿主 + `scripts/e2e-dir-picker.js` 源码，在页面起来之前跑完）。
+ *
+ * 复刻页面的真实交错：`adoptProject()` 的 fire-and-forget 探针（`write → close` 触发 save-begin，
+ * `removeEntry → mirrorAll` 又无条件发第二条 save-begin）+ `flushAutosave()` 同一时刻的写盘。
+ * 宿主的守卫（host/wallpaper-host.ts:1098-1103）在它自己 `rm → mkdir → 写编辑标记`（:1106-1108）
+ * 的中间态被同 id 的 save-file 看见时会 409（`目标不是编辑器创建的目录，拒绝覆盖` / rm 与 mkdir
+ * 之间还会 `先调 save-begin`）—— 现场就是「存到本机文件夹之后少 project.json」。
+ *
+ * 实测（同一份代码，只换 picker 源码）：坏版本 80 轮 10 轮命中（约 12.5%/轮），修好后 80 轮 0 命中；
+ * 40 轮时「坏版本一次都不命中」的概率约 0.5%。跟着真机轮一起跑，谁把假目录的串行/单飞改回去，这里先红。
+ * 用掉的临时目录在本函数里删干净（后面的真机段会把 `lib` 当壁纸库枚举，不能留下 `editor-e2e*` 残渣）。
+ */
+export async function runPickerRaceCheck({ check, origin, lib, rounds = 40 }) {
+  const vm = await import("node:vm");
+  const before = new Set(fs.readdirSync(lib));
+  const store = new Map();
+  const conflicts = [];
+  const sandbox = {
+    console,
+    Math,
+    Date,
+    JSON,
+    Uint8Array,
+    Blob,
+    File,
+    encodeURIComponent,
+    setTimeout,
+    sessionStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: (k) => store.delete(k),
+    },
+    fetch: async (url, init) => {
+      const res = await fetch(origin + url, init);
+      if (!res.ok) {
+        const body = await res.clone().text();
+        if (conflicts.length < 6) conflicts.push({ url, status: res.status, body: body.slice(0, 200) });
+      }
+      return res;
+    },
+  };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  new vm.Script(fs.readFileSync(path.join(ROOT, "scripts/e2e-dir-picker.js"), "utf8"), { filename: "e2e-dir-picker.js" }).runInContext(sandbox);
+  const writeThrough = async (root, rel, byte) => {
+    const fh = await root.getFileHandle(rel, { create: true });
+    const w = await fh.createWritable();
+    await w.write(new Uint8Array([byte]));
+    await w.close();
+  };
+  let errors = 0;
+  try {
+    for (let i = 0; i < rounds; i++) {
+      sandbox.window.__e2eMode = "empty";
+      sandbox.window.__e2eOpen = null;
+      const root = await sandbox.window.showDirectoryPicker();
+      const probe = (async () => {
+        await writeThrough(root, ".webwallgl-write-test", 1);
+        await root.removeEntry(".webwallgl-write-test");
+      })().catch(() => {
+        errors++;
+      });
+      await sleep(0); // 让探针先走到它的第一条 save-begin 上，再说页面的下一次写盘
+      await writeThrough(root, "project.json", 2).catch(() => {
+        errors++;
+      });
+      await probe;
+    }
+  } finally {
+    for (const name of fs.readdirSync(lib)) {
+      if (!before.has(name) && /^editor-e2e/.test(name)) fs.rmSync(path.join(lib, name), { recursive: true, force: true });
+    }
+  }
+  const bad = conflicts.length > 0 || errors > 0;
+  check(
+    !bad,
+    `假目录保存竞态：${rounds} 轮真宿主交错（页面探针 + 立刻写盘）没有一次落在宿主「目录已存在、编辑标记还没写上」的窗口里（冲突 ${conflicts.length} 次 / 写失败 ${errors} 次）${
+      bad ? ` —— 首个现场：${JSON.stringify(conflicts[0] || "写盘直接抛错")}` : ""
+    }`,
+  );
+  return { conflicts, errors };
 }
 
 /**

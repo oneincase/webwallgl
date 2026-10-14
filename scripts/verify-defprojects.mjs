@@ -23,7 +23,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ROOT, imp, createChecker, dec } from "./lib/verify-kit.mjs";
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { build } from "esbuild";
+import { ROOT, LIB, imp, createChecker, dec } from "./lib/verify-kit.mjs";
 import { packSourceProject } from "./dev-pack-pkg.mjs";
 
 const { check, fail, errors } = createChecker({ echo: true });
@@ -629,6 +632,393 @@ check(
     typeof WE_BUILTIN_SHADERS["generic.vert"] === "string" && WE_BUILTIN_SHADERS["generic.vert"].trim(),
   "generic 的仓内实现缺失：无原版素材的机器上 arsenal 会整体回落素模（F47）",
 );
+
+// ==========================================================================
+// 判据 10（G3/G4，E3 DEFAULTPROJECTS 定案）：材质皮肤变体 + 被显式忽略的对象字段
+// ==========================================================================
+// G3 `skins` / 对象 `skin: N`
+//   官方内置语料里 `skins` 只在 3 个模型 json 出现（audiophile/models/grid/grid.json、
+//   techno/models/techno/sphere.json、fantasticcar/models/grid/grid.json），对象 `skin`
+//   只有 1 处（audiophile.json 的 grid 层写 skin:1）。键语义由语料定死：techno 的键
+//   `techno` 是**材质目录名**（materials/techno/），既不是模型名 sphere 也不是材质基名
+//   technohex ⇒ 键 = 材质目录、值 = 材质基名；三例 skins[0] 都是恒等映射。
+//   下面每条都是**真解析产物**：packSourceProject → parsePkg → getEntry 取真 .mdl/.json
+//   字节 → mdlMod.parseMDL 解出内嵌材质路径 + 真 skins 表 → 走引擎真实的
+//   scn.applySkinToMaterialPath / scn.skinIndexOf；没有任何「grep 源码」式判据
+//   （源码只用于反向断言：证明引擎**没有**别的读点）。
+// G4 被忽略字段（locktransforms / ledsource / blockalign / particlesrc）
+//   定案 = 显式忽略 + info 诊断；判据 = 语料普查基线 + 反向断言（引擎不得有直接读点）
+//   + 诊断函数的行为单测（真值才提示、每字段一次）+ 挂载点结构断言。
+const PARSE_REL = "renderer/vendor/we-scene/scene/parse.js";
+const SM_REL = "renderer/src/scene-mount.ts";
+const sha256File = (rel) => createHash("sha256").update(fs.readFileSync(path.join(ROOT, rel))).digest("hex");
+const dpDir = (name) => path.join(root, name);
+const dpPack = (name) => {
+  const dir = dpDir(name);
+  if (!fs.existsSync(path.join(dir, "project.json"))) return null;
+  try {
+    return parsePkg(packSourceProject(dir).buffer);
+  } catch {
+    return null;
+  }
+};
+
+const SKIN_TABLE = [{ grid: "grid" }, { grid: "grid2" }];
+const SKIN_CASES = [
+  { proj: "audiophile", scene: "audiophile.json", mdl: "models/grid/grid.mdl", sidecar: "models/grid/grid.json", skin: 1, want: "materials/grid/grid2.json", pick: true },
+  { proj: "techno", scene: "techno.json", mdl: "models/techno/sphere.mdl", sidecar: "models/techno/sphere.json", skin: 0, want: "materials/techno/technohex.json", pick: false },
+  { proj: "fantasticcar", scene: "fantasticcar.json", mdl: "models/grid/grid.mdl", sidecar: "models/grid/grid.json", skin: 0, want: "materials/grid/grid.json", pick: false },
+];
+
+/** G3 全套判据；`api` = parse.js 模块（可换成变异版），`tag` = 变异红测前缀 */
+function g3Checks(api, tag) {
+  const t = tag ? `${tag} ` : "";
+  for (const c of SKIN_CASES) {
+    const pkg = dpPack(c.proj);
+    if (!pkg) continue;
+    const mdlBytes = getEntry(pkg, c.mdl);
+    const sideBytes = getEntry(pkg, c.sidecar);
+    if (!mdlBytes || !sideBytes) continue;
+    const mdl = mdlMod.parseMDL(new Uint8Array(mdlBytes));
+    const side = parseJsonLoose(readText(sideBytes));
+    const skins = Array.isArray(side.skins) ? side.skins : null;
+    check(!!mdl.materialPath, `${t}G3 ${c.proj}: ${c.mdl} 应解出内嵌材质路径`);
+    check(!!skins, `${t}G3 ${c.proj}: ${c.sidecar} 应有 skins 数组`);
+    const got = api.applySkinToMaterialPath(mdl.materialPath, skins, c.skin);
+    check(got === c.want, `${t}G3 ${c.proj}: skin=${c.skin} 应得 ${c.want}，实际 ${got}`);
+    if (c.skin > 0) check(got !== mdl.materialPath, `${t}G3 ${c.proj}: skin=${c.skin} 必须与模型内嵌材质不同（判据不能空转）`);
+    if (Array.isArray(mdl.meshes) && mdl.meshes.length && mdl.meshes[0].materialPath) {
+      const mm = api.applySkinToMaterialPath(mdl.meshes[0].materialPath, skins, c.skin);
+      check(mm === c.want, `${t}G3 ${c.proj}: 子网格材质也应换到 ${c.want}，实际 ${mm}`);
+    }
+    const entry0 = skins && skins[c.skin] && typeof skins[c.skin] === "object" ? Object.entries(skins[c.skin])[0] : null;
+    if (entry0 && String(entry0[0]).length) {
+      check(c.want === `materials/${entry0[0]}/${entry0[1]}.json`,
+        `${t}G3 ${c.proj}: 皮肤表应直接给出 ${c.want}，实际键 ${entry0[0]} 值 ${entry0[1]}（键=材质目录、值=基名）`);
+    }
+    if (c.pick) {
+      const sceneBytes = getEntry(pkg, c.scene);
+      const scene = sceneBytes ? parseJsonLoose(readText(sceneBytes)) : null;
+      const hits = ((scene && scene.objects) || []).filter((o) => Object.prototype.hasOwnProperty.call(o, "skin"));
+      check(hits.length === 1, `${t}G3 ${c.proj}: 应恰好 1 个对象写 skin，实际 ${hits.length}`);
+      if (hits.length === 1) {
+        check(api.skinIndexOf(hits[0]) === c.skin, `${t}G3 ${c.proj}: 对象闸门应得 skin=${c.skin}，实际 ${api.skinIndexOf(hits[0])}`);
+      }
+      check(!!getEntry(pkg, c.want), `${t}G3 ${c.proj}: 变体材质 ${c.want} 必须在包内`);
+    }
+  }
+  const p0 = "materials/grid/grid.json";
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, null) === p0, `${t}G3 skin=null 必须恒等（无 skin 字段 = 现状，逐位不变）`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, 0) === p0, `${t}G3 skin=0 应落到第 0 套（此例恒等）`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, 1) === "materials/grid/grid2.json", `${t}G3 skin=1 应取第 2 套`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, 2) === p0, `${t}G3 skin 越界必须回落第 0 套`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, -1) === p0, `${t}G3 skin 负数必须回落第 0 套`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, 1.5) === p0, `${t}G3 非整数 skin 必须回落第 0 套`);
+  check(api.applySkinToMaterialPath(p0, SKIN_TABLE, "1") === p0, `${t}G3 字符串索引必须回落第 0 套（闸门已归一）`);
+  check(api.applySkinToMaterialPath(p0, null, 1) === p0, `${t}G3 无 skins 表必须恒等`);
+  check(api.applySkinToMaterialPath(p0, {}, 1) === p0, `${t}G3 skins 非数组必须恒等`);
+  check(api.applySkinToMaterialPath(p0, [{ grid: "grid2" }, { grid: "grid" }], 1) === p0, `${t}G3 皮肤表键不命中必须恒等`);
+  check(api.applySkinToMaterialPath(p0, [{ grid: "../evil" }], 0) === p0, `${t}G3 值含 ../ 必须拒绝（皮肤值只能是基名）`);
+  check(api.applySkinToMaterialPath(p0, [{ grid: "sub/grid2" }], 0) === p0, `${t}G3 值含 / 必须拒绝`);
+  check(api.applySkinToMaterialPath("materials/x/y.png", SKIN_TABLE, 1) === "materials/x/y.png", `${t}G3 非 .json 材质必须恒等`);
+  check(api.applySkinToMaterialPath("", SKIN_TABLE, 1) === "", `${t}G3 空路径必须恒等`);
+  check(api.applySkinToMaterialPath("materials/grid/old.json", [{ grid: "grid" }], 0) === "materials/grid/grid.json",
+    `${t}G3 skin=0 也必须按皮肤表落位（材质表是权威，不是「0 号恒等」的捷径）`);
+  check(api.skinIndexOf({ id: 1 }) === null, `${t}G3 无 skin 字段必须 null（闸门：不开闸就零回归）`);
+  check(api.skinIndexOf({ id: 1, skin: 1 }) === 1, `${t}G3 skin:1 → 1`);
+  check(api.skinIndexOf({ id: 1, skin: 0 }) === 0, `${t}G3 skin:0 是显式皮肤（≠ null）`);
+  check(api.skinIndexOf({ id: 1, skin: "2" }) === 2, `${t}G3 纯数字字符串 skin:"2" → 2（WE 的 json 两栖）`);
+  check(api.skinIndexOf({ id: 1, skin: 1.5 }) === 1, `${t}G3 小数 skin 取整（与闸门归一一致）`);
+  check(api.skinIndexOf({ id: 1, skin: true }) === null, `${t}G3 布尔 skin 必须 null（不误判）`);
+  check(api.skinIndexOf({ id: 1, skin: "abc" }) === null, `${t}G3 非数字字符串 skin 必须 null`);
+}
+
+// —— G4：语料普查（对象字段现值基线）——
+const G4_FIELDS = ["reflected", "locktransforms", "ledsource", "blockalign", "particlesrc", "sprite", "skin"];
+function dpCensus() {
+  const present = Object.fromEntries(G4_FIELDS.map((f) => [f, 0]));
+  const on = Object.fromEntries(G4_FIELDS.map((f) => [f, 0]));
+  let objects = 0, modelMat = 0, changed = 0;
+  const changes = [];
+  for (const d of fs.readdirSync(root).filter((n) => fs.statSync(path.join(root, n)).isDirectory()).sort()) {
+    if (!fs.existsSync(path.join(root, d, "project.json"))) continue;
+    const pkg = dpPack(d);
+    if (!pkg) continue;
+    const projBytes = getEntry(pkg, "project.json");
+    if (!projBytes) continue;
+    const rel = scn.sceneEntryCandidates(parseJsonLoose(readText(projBytes))).find((n) => !!getEntry(pkg, n));
+    if (!rel) continue;
+    const sceneBytes = getEntry(pkg, rel);
+    const scene = sceneBytes ? parseJsonLoose(readText(sceneBytes)) : null;
+    for (const [i, o] of ((scene && scene.objects) || []).entries()) {
+      objects++;
+      for (const f of G4_FIELDS) {
+        if (!Object.prototype.hasOwnProperty.call(o, f)) continue;
+        present[f]++;
+        const v = o[f];
+        if (v !== null && v !== false && v !== undefined && v !== 0 && v !== "") on[f]++;
+      }
+      let mdlRel = typeof o.model === "string" ? o.model : null;
+      let side = null;
+      if (mdlRel) {
+        const sb = getEntry(pkg, mdlRel.replace(/\.mdl$/i, ".json"));
+        side = sb ? parseJsonLoose(readText(sb)) : null;
+      } else if (typeof o.image === "string" && /\.json$/i.test(o.image)) {
+        const mb = getEntry(pkg, o.image);
+        const mj = mb ? parseJsonLoose(readText(mb)) : null;
+        if (mj && typeof mj.puppet === "string") { mdlRel = mj.puppet; side = mj; }
+      }
+      if (!mdlRel) continue;
+      const bytes = getEntry(pkg, mdlRel);
+      if (!bytes) continue;
+      let mdl;
+      try { mdl = mdlMod.parseMDL(new Uint8Array(bytes)); } catch { continue; }
+      if (!mdl.materialPath) continue;
+      modelMat++;
+      const skins = side && Array.isArray(side.skins) ? side.skins : null;
+      const got = scn.applySkinToMaterialPath(mdl.materialPath, skins, scn.skinIndexOf(o));
+      if (got !== mdl.materialPath) { changed++; changes.push(`${d}/${rel}#${o.id ?? i} ${mdl.materialPath} → ${got}`); }
+    }
+  }
+  return { objects, modelMat, present, on, changed, changes };
+}
+
+/** G4 全套判据；`api` = parse.js 模块（可换成变异版），`tag` = 变异红测前缀 */
+function g4Checks(api, tag) {
+  const t = tag ? `${tag} ` : "";
+  if (tag) {
+    // 变异红测用的最小行为断言（真值字段必须被认出；表被清空/逻辑改坏就变红）
+    check(api.noteUnsupportedObjectFields({ id: 7, ledsource: true }) === "ledsource", `${t}G4 诊断应认出 ledsource=true`);
+    return;
+  }
+  const info = console.info;
+  let calls = 0;
+  const seen = [];
+  console.info = (...a) => { calls++; seen.push(a.join(" ")); };
+  let hitLed = null, hitLock = null, miss1 = null, miss2 = null;
+  try {
+    hitLed = api.noteUnsupportedObjectFields({ id: 11, ledsource: true });
+    api.noteUnsupportedObjectFields({ id: 12, ledsource: true }); // 去重：不应再提示
+    miss1 = api.noteUnsupportedObjectFields({ id: 13, ledsource: false });
+    miss2 = api.noteUnsupportedObjectFields({ id: 14, locktransforms: null });
+    hitLock = api.noteUnsupportedObjectFields({ id: 15, locktransforms: true });
+    miss1 = miss1 ?? api.noteUnsupportedObjectFields({ id: 16, blockalign: 0 });
+  } finally {
+    console.info = info;
+  }
+  check(hitLed === "ledsource" && hitLock === "locktransforms", `G4 诊断：真值字段应被认出（ledsource / locktransforms），实际 ${hitLed} / ${hitLock}`);
+  check(miss1 === null && miss2 === null, `G4 诊断：false / null / 0 不算命中，实际 ${miss1} / ${miss2}`);
+  check(calls === 2, `G4 诊断：每个字段全进程只提示一次（期望 2 次，实际 ${calls}）`);
+  check(seen[0] && seen[0].includes("ledsource") && seen[0].includes("显式忽略"), `G4 诊断文案应含字段名与「显式忽略」，实际 ${JSON.stringify(seen[0])}`);
+}
+
+// —— 真语料：G3 三条样本 + G4 普查（只跑一次，用未变异的 scn）——
+console.log("  - G3 皮肤变体（真解析产物：packSourceProject → parsePkg → parseMDL → 真 skins 表）：");
+g3Checks(scn, "");
+console.log("  - G4 被忽略字段：诊断行为 + 语料普查基线");
+g4Checks(scn, "");
+const census = dpCensus();
+console.log(`  - defaultprojects 对象字段普查：${census.objects} 个对象 / ${census.modelMat} 个能解出 MDL 材质；` +
+  G4_FIELDS.map((f) => `${f} ${census.present[f]}/${census.on[f]}(在/真)`).join("、"));
+check(census.objects === 109, `语料对象总数变化：${census.objects}（基线 109）—— 普查基线需按新语料更新`);
+check(census.modelMat >= 27, `能解出 MDL 材质的对象只有 ${census.modelMat} 个（基线 29）—— G3 语料面可能空转`);
+const G4_BASE = {
+  reflected: [3, 3], locktransforms: [31, 1], ledsource: [22, 2],
+  blockalign: [2, 0], particlesrc: [1, 0], sprite: [3, 1], skin: [1, 1],
+};
+for (const f of G4_FIELDS) {
+  const [p, o] = G4_BASE[f];
+  check(census.present[f] === p, `字段 ${f} 出现次数变化：${census.present[f]}（基线 ${p}）`);
+  check(census.on[f] === o, `字段 ${f} 真值次数变化：${census.on[f]}（基线 ${o}）`);
+}
+check(census.changed === 1 && /^audiophile\//.test(census.changes[0] || ""),
+  `G3 语料不变性：整份 defaultprojects 只能有 audiophile 那 1 处材质路径变化，实际 ${census.changed} 处：${census.changes.join("、")}`);
+if (census.changes.length) console.log(`  - G3 语料唯一变化点：${census.changes.join("、")}`);
+
+// —— 工坊打包语料不变性（闸门不开时逐位不变）——
+{
+  let pkgs = 0, scenes2 = 0, objects2 = 0, skinObjs = 0, skinModels = 0;
+  for (const d of fs.readdirSync(LIB).filter((x) => /^\d+$/.test(x))) {
+    const p = path.join(LIB, d, "scene.pkg");
+    if (!fs.existsSync(p)) continue;
+    let pkg;
+    try { pkg = parsePkg(fs.readFileSync(p)); } catch { continue; }
+    pkgs++;
+    const e = pkg.entries.find((x) => /^scene\.json$/i.test(x.name));
+    if (e) {
+      const b = getEntry(pkg, e.name);
+      let sj = null;
+      try { sj = b ? parseJsonLoose(readText(b)) : null; } catch { /* 坏 json 跳过 */ }
+      if (sj && Array.isArray(sj.objects)) {
+        scenes2++;
+        for (const o of sj.objects) {
+          objects2++;
+          if (Object.prototype.hasOwnProperty.call(o, "skin")) skinObjs++;
+        }
+      }
+    }
+    for (const e2 of pkg.entries) {
+      if (!/^models\/.*\.json$/i.test(e2.name)) continue;
+      const b = getEntry(pkg, e2.name);
+      if (!b) continue;
+      let t2 = null;
+      try { t2 = parseJsonLoose(readText(b)); } catch { continue; }
+      if (Array.isArray(t2.skins)) skinModels++;
+    }
+  }
+  check(pkgs >= 300, `工坊打包语料数量异常：${pkgs} 张 pkg（基线 348）—— 闸门判据可能空转`);
+  check(scenes2 >= 300, `工坊语料里能解出 scene.json 的只有 ${scenes2} 张（基线 348）`);
+  check(objects2 >= 10000, `工坊语料对象只有 ${objects2} 个（基线 14904）—— 不变性判据可能空转`);
+  check(skinObjs === 0, `工坊语料出现对象 skin 字段 ${skinObjs} 处（闸门假设「一个都没有」已失效，必须重跑不变性）`);
+  check(skinModels === 0, `工坊语料出现模型 json skins 表 ${skinModels} 处（同上）`);
+  console.log(`  - 工坊打包语料不变性：${pkgs} 张 pkg / ${scenes2} 个 scene.json / ${objects2} 个对象；skin 字段 ${skinObjs} 处、模型 skins 表 ${skinModels} 处 ⇒ 闸门不开，行为逐位不变`);
+}
+
+// —— 反向断言 + 读点结构（G3 接线 / G4 无直接读点）——
+const parseSrc = fs.readFileSync(path.join(ROOT, PARSE_REL), "utf8");
+const smSrc = fs.readFileSync(path.join(ROOT, SM_REL), "utf8");
+const srcHasG4Call = (src) => /const world = local\[i\][\s\S]{0,200}?noteUnsupportedObjectFields\(o\)/.test(src);
+/** G4 的源码结构断言（未变异源码 + 变异源码走同一条，保证变异红测不会与判据漂移） */
+const structuralG4 = (src) => check(srcHasG4Call(src), "G4：诊断必须挂在 parseScene 的逐对象循环里（唯一对象遍历点）");
+check(/export function resolveMaterial\(modelJson, skinIndex = null\)/.test(parseSrc),
+  "G3：resolveMaterial 必须带默认 null 的 skinIndex 第二参（省略时与历史逐位一致）");
+structuralG4(parseSrc);
+check(/const skinIdx = scn\.skinIndexOf\(\(layer as any\)\.srcObject\)/.test(smSrc),
+  "G3：.mdl 分支必须用对象闸门取 skin 索引");
+check(/if \(skinIdx !== null\) \{/.test(smSrc) && /readModelSkinTable\(layer\.model\)/.test(smSrc),
+  "G3：只有对象写了 skin 才去读 sidecar（普通模型零额外 I/O）");
+check(/scn\.resolveMaterial\(model, scn\.skinIndexOf\(/.test(smSrc),
+  "G3：image→model json 路径必须把 skin 索引喂给 resolveMaterial");
+const idxCalls = (smSrc.match(/scn\.skinIndexOf\(/g) || []).length;
+check(idxCalls >= 4, `G3：皮肤闸门应覆盖 .mdl 分支 / 模型 json 分支 / 普通 image 路径 / 克隆路径，实际 ${idxCalls} 处`);
+check(/skinIdxPuppet !== null && Array\.isArray\(\(model as any\)\.skins\)/.test(smSrc),
+  "G3：puppet 分支用对象模型 json 自带的 skins（不第二次 I/O）");
+
+const engineFiles = [];
+for (const base of ["renderer/src", "renderer/vendor/we-scene"]) {
+  for (const f of fs.readdirSync(path.join(ROOT, base), { recursive: true })) {
+    const rel = path.join(base, String(f));
+    if (!/\.(ts|js|mjs)$/.test(rel) || /\.d\.ts$/.test(rel)) continue;
+    engineFiles.push(rel);
+  }
+}
+const directReads = (field) => {
+  let n = 0;
+  const where = new Set();
+  for (const rel of engineFiles) {
+    const s = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    const m = s.match(new RegExp(`(?:\\bo|srcObject|l|layer|clone)\\??\\.${field}\\b`, "g"));
+    if (m) { n += m.length; where.add(rel); }
+  }
+  return { n, where: [...where] };
+};
+for (const f of ["locktransforms", "ledsource", "blockalign", "particlesrc"]) {
+  const r = directReads(f);
+  check(r.n === 0, `G4 反向断言：引擎不得有「读对象 ${f}」的直接读点（定案=显式忽略；实际 ${r.n} 处：${r.where.join("、")}）`);
+}
+check(directReads("reflected").n >= 1,
+  "G4 反向断言自查：reflected 是已实现字段，应至少有 1 处读点（否则上面 4 条 0 断言可能因正则写错而空转）");
+check(directReads("skin").n >= 1,
+  "G4 反向断言自查：skin 是本轮新实现字段，应至少有 1 处读点（同上）");
+check(parseSrc.includes("G4_IGNORED_FIELDS") && parseSrc.includes("noteUnsupportedObjectFields"),
+  "G4：parse.js 里应有被忽略字段表与诊断函数（判据 10 的源码面）");
+
+// —— sprite：判定「本轮不实现」（普通材质链画不了）——
+{
+  const rp = dpPack("ricepod");
+  if (rp) {
+    const sceneBytes = getEntry(rp, "ricepod.json");
+    const scene = sceneBytes ? parseJsonLoose(readText(sceneBytes)) : null;
+    const sp = ((scene && scene.objects) || []).filter((o) => typeof o.sprite === "string");
+    check(sp.length === 1, `sprite：ricepod 应恰好 1 个对象写 sprite（字符串），实际 ${sp.length}`);
+    if (sp.length === 1) {
+      const o = sp[0];
+      check(!o.image && !o.model && !o.size && !o.particle,
+        "sprite 对象没有 image/model/size/particle ⇒ 引擎现有入口（image→models/x.json→material）不成立");
+      const docBytes = getEntry(rp, o.sprite);
+      check(!!docBytes, `sprite 指向的文档必须在包内：${o.sprite}`);
+      if (docBytes) {
+        const doc = parseJsonLoose(readText(docBytes));
+        check(Array.isArray(doc.passes) && doc.passes.length > 0,
+          "sprite 文档是材质文档（内联 passes），不是模型 json —— 与 G3 那条链不同族");
+        check(!doc.material, "sprite 文档没有 material 字段（模型 json 才有）");
+      }
+      check(!!getEntry(rp, "shaders/sprite.frag") && !!getEntry(rp, "shaders/sprite.vert"),
+        "sprite 的着色器由工程自带（shaders/sprite.frag|vert 在包内）⇒ 需要独立的 vert/frag 绑定链");
+      console.log(`  - sprite 定案=本轮不实现：ricepod#${o.id ?? "?"} 只写 sprite（无 image/model/size），` +
+        `目标是自带 shaders/sprite.frag|vert 的材质 pass；引擎要新增「sprite 对象 → 材质文档直挂 + 全屏四边形」这条独立链，` +
+        `工作量与风险见报告，交官方 A/B 定案`);
+    }
+    const r = directReads("sprite");
+    check(r.n === 0, `G4 反向断言：引擎不得有「读对象 sprite」的直接读点（本轮未实现；实际 ${r.n} 处：${r.where.join("、")}）`);
+  }
+}
+
+// —— 判据 10 变异红测：改坏引擎 → 判据必须变红 → 复原后 sha256 一致 ——
+console.log("  - 判据 10 变异红测（改坏 → 变红 → 复原 → sha256 一致）：");
+async function bundlePatched(rel, from, to, name) {
+  let src = fs.readFileSync(path.join(ROOT, rel), "utf8");
+  const hits = src.split(from).length - 1;
+  if (hits !== 1) throw new Error(`变异锤未唯一命中 ${rel}（${hits} 次）：${name}`);
+  src = src.replace(from, to);
+  const out = await build({
+    stdin: { contents: src, resolveDir: path.dirname(path.join(ROOT, rel)), loader: "js" },
+    bundle: true, format: "esm", platform: "node", target: "node20", write: false, logLevel: "silent",
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "defproj-mut-"));
+  const file = path.join(dir, "mod.mjs");
+  fs.writeFileSync(file, out.outputFiles[0].text);
+  try { return await import(pathToFileURL(file).href); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+const G3_MUTATIONS = [
+  { name: "M1 对象闸门失效（skinIndexOf 永远 null）", from: "  const raw = srcObject.skin\n", to: "  const raw = null // MUT\n" },
+  { name: "M2 忽略 skin 索引（永远第 0 套）", from: "  const n = Number.isInteger(skinIndex) && skinIndex >= 0 && skinIndex < skins.length ? skinIndex : 0\n", to: "  const n = 0 // MUT\n" },
+  { name: "M3 皮肤值允许路径分隔符", from: "  if (/[\\\\/]/.test(next) || next === '.' || next === '..') return materialPath\n", to: "  if (false) return materialPath // MUT\n" },
+  { name: "M4 被忽略字段表清空", from: "const G4_IGNORED_FIELDS = ['locktransforms', 'ledsource', 'blockalign', 'particlesrc']\n", to: "const G4_IGNORED_FIELDS = [] // MUT\n" },
+  { name: "M6 0 号皮肤走恒等捷径", from: "  const set = skins[n]\n", to: "  if (n === 0) return materialPath // MUT\n  const set = skins[n]\n" },
+  { name: "M7 皮肤索引不收纯数字字符串", from: "  if (typeof raw === 'string' && /^\\s*-?\\d+\\s*$/.test(raw)) return parseInt(raw, 10)\n", to: "" },
+];
+const shaBefore = sha256File(PARSE_REL);
+const shaBeforeSm = sha256File(SM_REL);
+for (const m of G3_MUTATIONS) {
+  const mark = errors.length;
+  let added = 0, note = "";
+  try {
+    const mod = await bundlePatched(PARSE_REL, m.from, m.to, m.name);
+    const info = console.info;
+    const log = console.log;
+    console.info = () => {};
+    console.log = () => {}; // 变异红测期间的 ✗ 是**预期证据**，不刷屏（汇总只报计数）
+    try {
+      g3Checks(mod, "[坏]");
+      g4Checks(mod, "[坏]");
+    } finally { console.info = info; console.log = log; }
+    added = errors.length - mark;
+  } catch (e) {
+    note = `（变异装载失败：${e.message}）`;
+  }
+  errors.length = mark;
+  check(added >= 1 && added <= 8, `${m.name}：判据未按预期变红（新增失败 ${added} 处）${note}`);
+  console.log(`    · ${m.name} → 新增失败 ${added} 处`);
+}
+// 结构类变异（不装载模块，直接对源码跑同一条结构断言）
+{
+  const mark = errors.length;
+  const callSite = "    // [we-scene patch] G4：本轮显式忽略的对象字段在此处提示一次（见 noteUnsupportedObjectFields）\n    noteUnsupportedObjectFields(o)\n";
+  const hits = parseSrc.split(callSite).length - 1;
+  check(hits === 1, `M5 锤子应唯一命中 parse.js 的 G4 调用点（实际 ${hits} 次）`);
+  if (hits === 1) {
+    const log = console.log;
+    console.log = () => {}; // 同上：变异期间的结构 ✗ 是预期证据
+    try { structuralG4(parseSrc.replace(callSite, "")); } finally { console.log = log; }
+  }
+  const added = errors.length - mark;
+  errors.length = mark;
+  check(added >= 1 && added <= 3, `M5 逐对象诊断调用被删：判据未按预期变红（新增失败 ${added} 处）`);
+  console.log(`    · M5 删掉逐对象诊断调用 → 新增失败 ${added} 处`);
+}
+check(sha256File(PARSE_REL) === shaBefore, "变异红测后 parse.js 必须逐字节复原（sha256 与变异前一致）");
+check(sha256File(SM_REL) === shaBeforeSm, "变异红测后 scene-mount.ts 必须逐字节复原（sha256 与变异前一致）");
 
 console.log("");
 if (errors.length > 0) {

@@ -106,6 +106,7 @@ const STABLE = [
   // M1.4 脚本沙箱：三条已知逃逸向量（fnCtor / arrCtor / indirEval）钉住当前真实行为 +
   // M7(B+C) 通道收紧的文本判据。逃逸向量用子进程跑（20s 硬超时），不读素材库。
   "verify-sandbox",
+  "verify-sandbox-params",
   // 本波（we-native-constants）四份「原生常量对账」判据：只读本仓源码 + 只读第一方语料，
   // 不依赖任何外部工具链（原生证据列为 null 时跳过并打印 unknown 清单，填值即自动启用断言）。
   //   状态机 / .tex 头与 format 枚举 / 光照 9 键 + 着色器 5 项 / 粒子 9 段 / 场景脚本 6 判定 / 相机 5 组

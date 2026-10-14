@@ -1140,13 +1140,39 @@ const parseVec = (v: unknown): V3 | null => {
   return p.length >= 3 && p.every(Number.isFinite) ? [p[0], p[1], p[2]] : null;
 };
 
-export type MeshView = { eye: V3; fwd: V3; fov: number; dist: number };
+/** 取景相机来源：entity = 运行时相机实体（引擎真读的那台）/ snapshot = 顶层 scene.camera 视口快照 / default = 都没有 */
+export type MeshCamSource = "entity" | "snapshot" | "default";
+
+export type MeshView = {
+  eye: V3;
+  fwd: V3;
+  fov: number;
+  dist: number;
+  /** 取景相机来源（UI 必须显示，不许静默用缺省，见 task-17 ①） */
+  source: MeshCamSource;
+  /** 场景里的相机实体数（判据同 parse.js:438-444 `typeof o.camera === 'string' && o.camera !== ''`） */
+  entityCount: number;
+  /** 选中的相机实体 id；没有实体或没写 id 时为 null */
+  entityId: number | null;
+};
 
 /**
- * 网格导入的取景：相机按渲染器 buildCamera 的规则选 —— 最后一个可见的相机实体
- * （origin 为眼、angles 按角度转 -Z 朝向），没有实体时用顶层 scene.camera。
- * dist = 摆放深度：视线前方最近的已有模型层再往前 20%（不和主体穿插），
- * 没有模型层时取 scene.camera 眼到注视点的距离。
+ * 网格导入的取景：相机按**运行时相机**的规则选 —— 最后一个可见的相机实体
+ * （origin 为眼、angles 按角度转 -Z 朝向），**没有实体时才回落**顶层 scene.camera。
+ *
+ * [task-17 W19 ①] 为什么顶层 scene.camera 不是运行时相机：
+ *   - `renderer/vendor/we-scene/scene/parse.js:438-444` 把 `camera` 字段非空的对象标成
+ *     `isCamera`，`parseNum(o.fov…)` 读成 `cameraFov`；
+ *   - `parse.js:957-969` 运行时相机 = `cameraNodes.filter(l => l.visible).pop() || cameraNodes[0]`
+ *     的 `{eye: origin, angles, fov, zoom}`（参考引擎 SceneObjectParsers.cpp ParseCameraObj
+ *     只对 visible 的相机 attach）；
+ *   - 顶层 `scene.camera` 是 **Web 编辑器写下的视口快照**，运行时装配根本不读它。
+ *   所以有相机实体（相机路径 / 脚本相机）时，作者设计的机位与快照注视点可以完全不同：
+ *   3509243656 导入后不在画面内、需要手动挪层，就是按快照摆放造成的。
+ *
+ * dist = 摆放深度：视线前方最近的已有模型层再往前 20%（不和主体穿插）；
+ * 没有模型层时**必须先看实体视线**（第二遍扫描非相机对象的 origin 投影深度，含图片/文字/粒子），
+ * 只有没有实体时才用 scene.camera 眼到注视点的快照距离。
  */
 export function meshView(doc: EditorDoc): MeshView {
   const scene = doc.scene ?? {};
@@ -1189,9 +1215,37 @@ export function meshView(doc: EditorDoc): MeshView {
     const off = Math.hypot(v[0] - depth * fwd[0], v[1] - depth * fwd[1], v[2] - depth * fwd[2]);
     if (depth > near * 10 && off < depth && depth < nearest) nearest = depth;
   }
+  // [task-17 W19 ①] 摆放深度的三条路，顺序不能反（有实体时不许再看 scene.camera 快照）：
+  //   1) 已有模型层 → 最近模型层深度 * 0.8（原口径，不与主体穿插）；
+  //   2) 有相机实体但没有模型层 → 实体视线上的最近参照物（第二遍扫描，含图片/文字/粒子层：
+  //      相机看着的主体不一定是模型）；此前这里直接取快照距离，正是导入后不在画面内的成因；
+  //   3) 没有实体 → 才回落快照 eye→center 距离（原口径）。
   const topDist = topEye && topCenter ? Math.hypot(topCenter[0] - topEye[0], topCenter[1] - topEye[1], topCenter[2] - topEye[2]) : 0;
-  const dist = Number.isFinite(nearest) ? nearest * 0.8 : topDist > 0 ? topDist : 2;
-  return { eye, fwd, fov, dist };
+  let dist: number;
+  if (Number.isFinite(nearest)) dist = nearest * 0.8;
+  else if (ent) {
+    let look = Infinity;
+    for (const o of objs) {
+      if (typeof o.camera === "string" && o.camera !== "") continue;
+      const p = parseVec(o.origin);
+      if (!p) continue;
+      const depth = (p[0] - eye[0]) * fwd[0] + (p[1] - eye[1]) * fwd[1] + (p[2] - eye[2]) * fwd[2];
+      if (depth > near * 10 && depth < look) look = depth;
+    }
+    // 连一个参照物都没有（空场景）：用世界原点在实体视线上的投影深度 —— 相机实体通常围着
+    // 场景原点摆；仍不足 near*10 就退回 2。这是启发式，不是引擎读数（已在注释里标明）。
+    const t0 = -(eye[0] * fwd[0] + eye[1] * fwd[1] + eye[2] * fwd[2]);
+    dist = Number.isFinite(look) ? look * 0.8 : t0 > near * 10 ? t0 * 0.8 : 2;
+  } else dist = topDist > 0 ? topDist : 2;
+  return {
+    eye,
+    fwd,
+    fov,
+    dist,
+    source: ent ? "entity" : topEye || topCenter ? "snapshot" : "default",
+    entityCount: cams.length,
+    entityId: ent && typeof ent.id === "number" ? ent.id : null,
+  };
 }
 
 /** 网格缺省缩放：包围球直径 ≈ 摆放深度处画面高度的 60% */

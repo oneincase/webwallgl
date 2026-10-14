@@ -283,6 +283,34 @@ async function statFile(p: string) {
 }
 
 /**
+ * 同一个 itemId 的编辑器保存请求在宿主侧串行（task-19）。
+ *
+ * 守卫语义**未放宽**（仍是「目标存在但没有 EDITOR_MARK 就 409」），这里只是把
+ * `/api/editor/save-begin` 与 `/api/editor/save-file` 按 itemId 排队：原先守卫在
+ * rm→mkdir→写标记**之前**求值，同 id 的另一条请求插进这段中间态就会看见
+ * `exists && !marked` ⇒ 409「目标不是编辑器创建的目录，拒绝覆盖」（或 rm 与 mkdir 之间
+ * ⇒ 409「先调 save-begin」）。真机现场：一次 flush 整个失败、盘上少 project.json，控制台
+ * `保存失败：{"error":"目标不是编辑器创建的目录，拒绝覆盖：editor-…"}`。页面侧的并发源是
+ * `editor/main.ts` 的 `probeDirWritable()`（`void probeWritable(...).then(...)`，探针 write→close
+ * 触发一条 save-begin、removeEntry→mirrorAll 又发一条）与同刻的 `flushAutosave()` 写盘。
+ *
+ * 异常不破坏链：链尾只保留 settled 状态（下一跳无论成败都继续），一个请求失败不会卡死后续请求。
+ */
+const editorSaveChains = new Map<string, Promise<unknown>>();
+function withEditorSaveLock<T>(itemId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = editorSaveChains.get(itemId) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  editorSaveChains.set(
+    itemId,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return next;
+}
+
+/**
  * 把磁盘文件 pipe 到响应，并**等到流结束才返回**。
  *
  * Vite 的 configureServer 中间件是 async 的：Promise resolve 时若
@@ -1095,38 +1123,53 @@ export function createHostMiddleware(opts: HostOptions = {}): HostHandler {
         sendJson(res, 403, { error: "路径非法" });
         return;
       }
-      const exists = !!(await asDirectory(dir));
-      const marked = exists && !!(await statFile(join(dir, EDITOR_MARK)));
-      if (exists && !marked) {
-        sendJson(res, 409, { error: `目标不是编辑器创建的目录，拒绝覆盖：${itemId}` });
-        return;
-      }
-      try {
-        if (path === "/api/editor/save-begin") {
-          if (exists) await fs.rm(dir, { recursive: true, force: true });
-          await fs.mkdir(dir, { recursive: true });
-          await fs.writeFile(join(dir, EDITOR_MARK), `${new Date().toISOString()}\n`);
-          logger.info(`[host] 编辑器保存：${itemId}`);
-          sendJson(res, 200, { ok: true, itemId, dir });
+      // P2：同一个 itemId 的编辑器保存请求在这里串行（守卫语义未放宽，仅串行化以消除中间态可观测窗口）。
+      await withEditorSaveLock(itemId, async () => {
+        const exists = !!(await asDirectory(dir));
+        const marked = exists && !!(await statFile(join(dir, EDITOR_MARK)));
+        if (exists && !marked) {
+          sendJson(res, 409, { error: `目标不是编辑器创建的目录，拒绝覆盖：${itemId}` });
           return;
         }
-        if (!exists) {
-          sendJson(res, 409, { error: "先调 save-begin" });
-          return;
+        try {
+          if (path === "/api/editor/save-begin") {
+            // P1（P2 之上的第二层）：先把目录建在同级临时路径上、写好编辑标记，再整体换名到目标 ——
+            // 目标目录因此不会出现「存在但没有标记」的中间态（那种目录此后对同一个 itemId 永远 409）。
+            // 崩在中间只留下一个 `<itemId>.tmp-…` 残迹：它没有 effects/ 子目录，库枚举（scanEffectLibrary）
+            // 会跳过它，也不会再被当成目标目录；同一毫秒内的下一次 save-begin 会先把它 rm 掉。
+            const tmp = `${dir}.tmp-${process.pid.toString(36)}-${Date.now().toString(36)}`;
+            await fs.rm(tmp, { recursive: true, force: true });
+            try {
+              await fs.mkdir(tmp, { recursive: true });
+              await fs.writeFile(join(tmp, EDITOR_MARK), `${new Date().toISOString()}\n`);
+              if (exists) await fs.rm(dir, { recursive: true, force: true });
+              await fs.rename(tmp, dir);
+            } catch (e) {
+              await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
+              throw e;
+            }
+            logger.info(`[host] 编辑器保存：${itemId}`);
+            sendJson(res, 200, { ok: true, itemId, dir });
+            return;
+          }
+          if (!exists) {
+            sendJson(res, 409, { error: "先调 save-begin" });
+            return;
+          }
+          const rel = url.searchParams.get("path") ?? "";
+          const target = rel && rel !== EDITOR_MARK ? safeJoin(dir, rel) : null;
+          if (!target || target === dir) {
+            sendJson(res, 400, { error: `非法文件路径：${rel}` });
+            return;
+          }
+          const body = await readRawBody(req, 1024 * 1024 * 1024);
+          await fs.mkdir(resolve(target, ".."), { recursive: true });
+          await fs.writeFile(target, body);
+          sendJson(res, 200, { ok: true, bytes: body.length });
+        } catch (e) {
+          sendJson(res, 500, { error: (e as Error).message });
         }
-        const rel = url.searchParams.get("path") ?? "";
-        const target = rel && rel !== EDITOR_MARK ? safeJoin(dir, rel) : null;
-        if (!target || target === dir) {
-          sendJson(res, 400, { error: `非法文件路径：${rel}` });
-          return;
-        }
-        const body = await readRawBody(req, 1024 * 1024 * 1024);
-        await fs.mkdir(resolve(target, ".."), { recursive: true });
-        await fs.writeFile(target, body);
-        sendJson(res, 200, { ok: true, bytes: body.length });
-      } catch (e) {
-        sendJson(res, 500, { error: (e as Error).message });
-      }
+      });
       return;
     }
 

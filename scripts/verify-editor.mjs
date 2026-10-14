@@ -2988,7 +2988,7 @@ section("MA. 模型层识别 editor/model.ts + doc.modelFormOf（W12）");
   check(/opts\.after\?\.\(\);\s*void detectPuppets\(\);/.test(mainSrc) && /const found = await scanPuppets\(d, \(name\) => assets\.read\(name\)\);\s*if \(d !== doc \|\| !found\.size\) return;\s*d\.puppets = found;\s*rebuildTree\(d\);/.test(mainSrc), "页面：打开后异步扫 puppet，换了文档作废，扫完写 doc.puppets 并重建树");
   check(/const info = editor && Number\.isFinite\(id\) \? editor\.getModelInfo\(id\) : null;/.test(mainSrc) && /\{ id: "model", order: 700, when: \(\) => true, render: modelGroup(?:, tab: "model")? \}/.test(mainSrc) && /modelInfoRows\(info\)/.test(mainSrc), "检视器「模型」分组：信息只经 getModelInfo，行由 modelInfoRows 排");
   const pageSrc = fs.readdirSync(path.join(ROOT, "editor")).filter((f) => f.endsWith(".ts") && f !== "i18n.ts").map((f) => fs.readFileSync(path.join(ROOT, "editor", f), "utf8")).join("\n");
-  check(!/\.puppet\b(?!s)/.test(pageSrc.replace(/\b(json|modelJson)\.puppet/g, "")) && !/parseMDL|mdl-parse/.test(pageSrc), "页面不读 layer.puppet、不自己解析 .mdl（只有 scanPuppets 读 model json 的 puppet 字段）");
+  check(!/\.puppet\b(?!s)/.test(pageSrc.replace(/\b(json|modelJson)\.puppet/g, "").replace(/\bet\("(?:md|gl\.form)\.puppet"\)/g, "")) && !/parseMDL|mdl-parse/.test(pageSrc), "页面不读 layer.puppet、不自己解析 .mdl（只有 scanPuppets 读 model json 的 puppet 字段）");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const mKeys = ["insp.model", "kind.model", "model.notLoaded", "model.form.puppet", "model.form.mesh", ...rows.map((r) => r[0])];
   const mMissing = mKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
@@ -4158,11 +4158,12 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
   check(/files\.some\(\(f\) => isModelFile\(f\.file\)\) && doc\?\.scene\) \{\s*void importModelFiles\(files\.map\(\(f\) => f\.file\)\);/.test(mainSrc) &&
     /presetMenu\(lyAddModelEl, modelMenuEl, \(p\) => \{\s*modelFormPick = p === "puppet" \|\| p === "mesh" \? p : null;\s*inModelEl\.click\(\);/.test(mainSrc) &&
-    /void importModelFiles\(files, modelFormPick\)/.test(mainSrc) && /const form = forceForm \?\? defaultTarget\(target\);/.test(mainSrc) && /lyAddModelEl\.disabled = lyAddEl\.disabled;/.test(mainSrc),
-    "页面：图层栏「导入模型」下拉（自动 / puppet / 3D 网格，选完再开文件框）+ 拖入模型文件（自动形态）");
+    /if \(files\.length\) openGltfImportDialog\(files, null\);/.test(mainSrc) && /formEl\.value = modelFormPick \?\? "auto";/.test(mainSrc) &&
+    /const form = forceForm \?\? defaultTarget\(target\);/.test(mainSrc) && /lyAddModelEl\.disabled = lyAddEl\.disabled;/.test(mainSrc),
+    "页面：图层栏「导入模型」下拉（自动 / puppet / 3D 网格；预设进确认条）+ 拖入模型文件（自动形态，不弹窗）");
   check(/for \(const x of r\.files\) assets\.put\(x\.name, x\.data, r\.path\);[\s\S]{0,200}target\.puppets = new Map[\s\S]{0,400}structEdit\([\s\S]{0,300}addModelLayer\(d, m, r\.path/.test(mainSrc),
     "导入：产物进资源表（分组 = 对象引用路径）、puppet 登记到 doc.puppets，加层是一步结构编辑（可撤销）");
-  check(/const pixelUnits = form === "puppet" \|\| isOrthoDoc\(target\);/.test(mainSrc) && /scale: pixelUnits \? fitPuppetScale\(target\) : fitMeshScale\(target\)/.test(mainSrc),
+  check(/const pixelUnits = form === "puppet" \|\| isOrthoDoc\(target\);/.test(mainSrc) && /const fitScale = pixelUnits \? fitPuppetScale\(target\) : fitMeshScale\(target\);/.test(mainSrc),
     "导入：2D 正交场景里两种形态都按像素量几何（fitMeshScale 给的是相机世界单位，mesh 形态会小到看不见）");
   const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   const dmHits = [...smSrc.matchAll(/String\((?:pass0|ppass0)\?\.depthtest \?\? ""\)\.toLowerCase\(\) === "enabled"\) \(layer as any\)\.depthMesh = true;/g)];
@@ -11350,6 +11351,231 @@ section("FX-CACHE. 换工程作废按路径做键的解析缓存（+ 工程字�
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// task-17 ①：W19 相机注视点 —— 有相机实体就按运行时相机摆放，没有才回落 scene.camera 快照
+// 引擎读数：scene/parse.js:438-444 相机实体判据（`camera` 字段非空 → isCamera / cameraFov）；
+//          scene/parse.js:957-969 运行时相机 = cameraNodes.filter(l => l.visible).pop() || cameraNodes[0]
+//          的 {eye: origin, angles, fov, zoom}；顶层 scene.camera 只是编辑器视口快照，运行时装配不读它。
+// ───────────────────────────────────────────────────────────────────────────
+{
+  section("task-17 ①. 导入取景用运行时相机实体（editor/gltf.ts meshView）");
+  const gltfSrc = fs.readFileSync(path.join(ROOT, "editor/gltf.ts"), "utf8");
+  const mainSrc17 = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const i18nSrc17 = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const G3 = await loadEditorModule("gltf");
+
+  // 夹具 A：两个相机实体（后一个 `visible:false`）+ 一个非模型层（图片）。
+  // 运行时相机 = 最后一个**可见**实体 #7（parse.js:957-969）；快照 scene.camera 刻意看向 +X、
+  // 眼→注视点距离 100 —— 一旦误用快照，下面的 dist 断言必红（这就是 3509243656 的成因）。
+  const entDoc = docMod.makeDoc(
+    "t",
+    null,
+    {
+      general: { fov: 50 },
+      camera: { eye: "0 0 10", center: "100 0 10" },
+      objects: [
+        { id: 7, camera: "default", origin: "0 0 10", angles: "0 0 0", fov: { user: "f", value: 40 } },
+        { id: 8, camera: "default", origin: "50 50 50", angles: "0 0 0", visible: false },
+        { id: 3, image: "models/editor/a.png", origin: "0 0 5" },
+      ],
+    },
+    "loose",
+  );
+  const emptyEntDoc = docMod.makeDoc(
+    "t",
+    null,
+    {
+      general: { fov: 50 },
+      camera: { eye: "0 0 10", center: "100 0 10" },
+      objects: [{ id: 7, camera: "default", origin: "0 0 10", angles: "0 0 0", fov: 40 }],
+    },
+    "loose",
+  );
+  const noEntDoc = docMod.makeDoc("t", null, { general: {}, camera: { eye: "1 2 13", center: "1 2 3" }, objects: [] }, "loose");
+  const bareDoc17 = docMod.makeDoc("t", null, { general: {}, objects: [] }, "loose");
+  const v3 = (a, e) => Array.isArray(a) && a.length >= 3 && e.every((x, i) => Math.abs(a[i] - x) < 1e-6);
+
+  const camBad = (M) => {
+    const bad = [];
+    const A = M.meshView(entDoc);
+    if (!(A.source === "entity" && A.entityCount === 2 && A.entityId === 7 && near(A.fov, 40) && v3(A.eye, [0, 0, 10]) && v3(A.fwd, [0, 0, -1])))
+      bad.push("① 运行时相机实体：取最后一个可见实体的 origin / angles / fov（parse.js:957-969）——顶层 scene.camera 只是视口快照");
+    if (!near(A.dist, 4))
+      bad.push("① 有实体但没有模型层：摆放深度取实体视线上的最近参照物再往前 20%（图片在 0 0 5 → 4），不许用 scene.camera 快照的眼→注视点距离（100）");
+    const B = M.meshView(emptyEntDoc);
+    if (!near(B.dist, 8)) bad.push("① 空场景（只有实体、没有参照物）：用世界原点在实体视线上的投影深度 ×0.8（8），不用快照距离");
+    const C = M.meshView(noEntDoc);
+    if (!(C.source === "snapshot" && C.entityCount === 0 && C.entityId === null && near(C.dist, 10)))
+      bad.push("① 只有没有相机实体时才回落顶层 scene.camera 快照（source=snapshot、dist=眼到注视点 10）");
+    const D = M.meshView(bareDoc17);
+    if (!(D.source === "default" && near(D.dist, 2))) bad.push("① 既没有实体也没有快照：缺省位姿（source=default、dist=2）");
+    return bad;
+  };
+  const camBase = camBad(G3);
+  check(camBase.length === 0, `task-17 ① 取景判据体全绿（${camBase.length} 处失败${camBase.length ? "：" + camBase[0] : ""}）`);
+  check(/parse\.js:438-444/.test(gltfSrc) && /parse\.js:957-969/.test(gltfSrc),
+    "① 引擎读点写进了注释（parse.js:438-444 相机实体判据 / parse.js:957-969 运行时相机选择）");
+
+  // ① 的「不许静默回落」必须真的落成原因文案；i18n 三条 zh/en 各恰好一条
+  const camWireBad = (src, i18n) => {
+    const bad = [];
+    if (!/if \(!pixelUnits\) \{\s*const camView = meshView\(target\);\s*if \(camView\.source !== "entity"\) log\(et\(`gl\.cam\.\$\{camView\.source\}`, \{ n: camView\.entityCount \}\), "warn"\);/.test(src))
+      bad.push("① 回落快照必须在导入路径给原因文案（log et(`gl.cam.${source}`)），不许静默用缺省");
+    if (!/const fitScale = pixelUnits \? fitPuppetScale\(target\) : fitMeshScale\(target\);/.test(src))
+      bad.push("① 取景/缩放不得回归：缺省 fit 口径必须原样保留（fitScale = pixelUnits ? fitPuppetScale : fitMeshScale）");
+    for (const k of ["gl.cam.entity", "gl.cam.snapshot", "gl.cam.none"])
+      if (i18n.split(`"${k}":`).length - 1 !== 2) bad.push(`① i18n 词条 ${k} 必须 zh/en 各恰好一条`);
+    return bad;
+  };
+  const camWire = camWireBad(mainSrc17, i18nSrc17);
+  check(camWire.length === 0, `task-17 ① 接线判据体全绿（${camWire.length} 处失败${camWire.length ? "：" + camWire[0] : ""}）`);
+
+  const camMutations = [
+    { which: "gltf", name: "① 实体视线不再参与摆放深度（回落成 scene.camera 快照距离）", from: "else if (ent) {", to: "else if (false && ent) {", expect: /摆放深度/ },
+    { which: "gltf", name: "① 相机实体不再按可见性挑（丢 parse.js:957-969 的 visible 口径）", from: "const ent = cams.filter(visible).pop() ?? cams[0];", to: "const ent = cams.pop() ?? cams[0];", expect: /运行时相机实体/ },
+    { which: "gltf", name: "① 取景来源不再区分实体/快照", from: 'source: ent ? "entity" : topEye || topCenter ? "snapshot" : "default",', to: 'source: "snapshot" as MeshCamSource,', expect: /运行时相机实体/ },
+    { which: "main", name: "① 回落快照不再给原因文案（静默用缺省）", from: 'if (camView.source !== "entity") log(et(`gl.cam.${camView.source}`, { n: camView.entityCount }), "warn");', to: "void camView;", expect: /原因文案/ },
+  ];
+  for (const m of camMutations) {
+    const src = m.which === "gltf" ? gltfSrc : mainSrc17;
+    const after = src.replace(m.from, m.to);
+    check(after !== src, `变异「${m.name}」确实改动了源码`);
+    if (after === src) continue;
+    const bad2 =
+      m.which === "gltf"
+        ? camBad(await loadEditorModule("gltf", { [path.join(ROOT, "editor/gltf.ts")]: after }))
+        : camWireBad(after, i18nSrc17);
+    check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+    if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// task-17 ②：W19 导入确认对话框 —— 形态 / 缩放 / fps / 片段预览 / 取景来源 → 一步撤销
+// 引擎读数：确认后仍走 main.ts:4796 importModelFiles → gltfToModel（clips{id,name,fps,frameCount}）
+//          → main.ts:4857 的 structEdit(addModelLayer) 是**唯一**一条撤销步；对话框自身不许编辑文档
+//          （否则一次导入会变成两步撤销）。
+// ───────────────────────────────────────────────────────────────────────────
+{
+  section("task-17 ②. 导入确认对话框（gltfImportCheck / gltfClipLines / gltfImportCamLine + DOM 接线）");
+  const mainSrcB = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  const i18nSrcB = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+
+  // 真跑切片：把 main.ts 里三段纯逻辑剪出来现编译（不是 grep，是真的执行）
+  const loadDlgHelpers = async (src) => {
+    const i = src.indexOf("export function gltfImportCheck");
+    const j = src.indexOf("// ↑ task-17 ②：纯逻辑结束", i + 1);
+    const body = i >= 0 && j > i ? src.slice(i, j) : "";
+    const p = path.join(tmpRoot, `tsgltfd-${Math.random().toString(36).slice(2)}.ts`);
+    // 三段都是 `export function`，切片本身就是合法 ESM（再补一行 export {…} 反而会「重复导出」编译失败）
+    fs.writeFileSync(p, body);
+    const out = await build({
+      entryPoints: [p],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const mjs = p.replace(/\.ts$/, ".mjs");
+    fs.writeFileSync(mjs, out.outputFiles[0].text);
+    return import(pathToFileURL(mjs).href);
+  };
+
+  const dlgRealBad = async (src) => {
+    const bad = [];
+    let C = null;
+    try {
+      C = await loadDlgHelpers(src);
+    } catch (e) {
+      bad.push(`② 纯逻辑切片无法编译/导入：${String(e && e.message).slice(0, 140)}`);
+    }
+    if (!C) return bad;
+    if (typeof C.gltfImportCheck !== "function" || typeof C.gltfClipLines !== "function" || typeof C.gltfImportCamLine !== "function") {
+      bad.push("② 找不到三段纯逻辑（gltfImportCheck / gltfClipLines / gltfImportCamLine 的切片标记 `// ↑ task-17 ②：纯逻辑结束` 必须紧随其后）");
+      return bad;
+    }
+    const a = C.gltfImportCheck("", "");
+    if (!(a.ok && a.fps === 30 && a.scaleMul === 1 && a.reason === null)) bad.push("② 空输入 = 缺省口径不变（fps 30 / 缩放 ×1 / 无原因）");
+    const b = C.gltfImportCheck("24", "2");
+    if (!(b.ok && b.fps === 24 && b.scaleMul === 2 && b.reason === null)) bad.push("② 合法输入原样交给导入通道（fps 24 / ×2）");
+    for (const t of ["0", "-1", "abc", "241"]) {
+      const r = C.gltfImportCheck(t, "1");
+      if (!(r.ok === false && r.reason === "gl.check.fps")) bad.push(`② 帧率 "${t}" 必须非法且给原因 gl.check.fps（不许静默走缺省）`);
+    }
+    for (const t of ["0", "-1", "abc", "101"]) {
+      const r = C.gltfImportCheck("30", t);
+      if (!(r.ok === false && r.reason === "gl.check.scale")) bad.push(`② 缩放 "${t}" 必须非法且给原因 gl.check.scale（不许静默走缺省）`);
+    }
+    const lines = C.gltfClipLines([{ name: "idle", frameCount: 30 }, { name: "walk", frameCount: 12 }]);
+    if (!(lines.length === 2 && lines[0] === "idle · 30 帧" && lines[1] === "walk · 12 帧"))
+      bad.push("② 片段预览必须列出片段名 + 帧数（引擎 clips[].frameCount）");
+    if (C.gltfClipLines([]).length !== 0) bad.push("② 没有片段时预览给空列表（UI 负责显示 gl.dlg.noClips 原因，不许假装有片段）");
+    const cam = C.gltfImportCamLine({ source: "entity", entityCount: 2, entityId: 7 });
+    if (!(cam.key === "gl.cam.entity" && cam.n === 7)) bad.push("② 取景来源行：有实体时显示实体 id 与 gl.cam.entity");
+    const cam2 = C.gltfImportCamLine({ source: "snapshot", entityCount: 0, entityId: null });
+    if (!(cam2.key === "gl.cam.snapshot" && cam2.n === 0)) bad.push("② 取景来源行：回落快照时显示 gl.cam.snapshot（原因对用户可见）");
+    return bad;
+  };
+
+  const dlgWireBad = (src, i18n) => {
+    const bad = [];
+    if (!/const gltfDlgEl = document\.createElement\("dialog"\);/.test(src) || !/gltfDlgEl\.className = "ed-dialog ed-gltf-import";/.test(src) || !/gltfDlgEl\.showModal\(\);/.test(src))
+      bad.push('② 确认条必须是一个 <dialog class="ed-dialog"> 并且真的 showModal（复用既有 dialog 样式与 backdrop）');
+    if (!/data-gltf-form/.test(src) || !/et\("md\.auto"\)[\s\S]{0,160}et\("md\.puppet"\)[\s\S]{0,160}et\("md\.mesh"\)/.test(src))
+      bad.push("② 形态下拉必须复用既有三标签 md.auto / md.puppet / md.mesh");
+    if (!/defaultForm\(target, modelFormPick\)/.test(src) && !/modelFormPick \?\? defaultTarget\(target\)/.test(src))
+      bad.push("② 形态缺省必须回到既有自动判据（菜单选的 modelFormPick 优先，否则 defaultTarget(target)）");
+    if (!/void importModelFiles\(files, form, gen, \{ fps: c\.fps, scaleMul: c\.scaleMul \}\);/.test(src))
+      bad.push("② 确认必须走导入通道 importModelFiles(files, form, gen, { fps, scaleMul })（fps/缩放真的被消费）");
+    if (!/okEl\.disabled = !ok\.ok;/.test(src)) bad.push("② 非法输入必须禁用确认按钮（不许静默用缺省导入）");
+    if (!/reasonEl\.textContent = ok\.reason \? et\(ok\.reason\) : "";/.test(src)) bad.push("② 非法输入必须给出原因文案（et(ok.reason)）");
+    if (!/inModelEl\.onchange = \(\) => \{\s*const files = Array\.from\(inModelEl\.files \?\? \[\]\);\s*inModelEl\.value = "";\s*if \(files\.length\) openGltfImportDialog\(files, null\);\s*\};/.test(src))
+      bad.push("② 文件选择器必须开确认条，不许直接导入");
+    if (/void importModelFiles\(files, modelFormPick\)/.test(src)) bad.push("② 旧的直接导入路径必须已被确认条取代（不可两路并存）");
+    if (!/void importModelFiles\(files\.map\(\(f\) => f\.file\)\)/.test(src))
+      bad.push("② 拖入的快速通道必须保持原样（确认条只服务文件选择器；拖入仍是原口径）");
+    if (!/gltfClipLines\(m\.clips\)/.test(src) || !/et\("gl\.dlg\.probing"\)/.test(src) || !/et\("gl\.dlg\.noClips"\)/.test(src))
+      bad.push("② 片段预览必须真跑解析（gltfClipLines(m.clips)）+ 解析中/无片段两种状态文案");
+    // 确认条自身不许编辑文档：一次导入只能有一条撤销步
+    const i = src.indexOf("// ↓ task-17 ②：导入确认对话框");
+    const j = src.indexOf("// ↑ task-17 ②：导入确认对话框结束", i + 1);
+    const region = i >= 0 && j > i ? src.slice(i, j) : "";
+    // 只扫**代码**：注释里出现 structEdit / addModelLayer 是说明文字，不是编辑（否则注释写法会误报）
+    const regionCode = region.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    if (!region) bad.push("② 找不到确认条区域标记（// ↓ / ↑ task-17 ②：导入确认对话框）");
+    else if (/structEdit\(|addModelLayer\(|edits\.push\(/.test(regionCode))
+      bad.push("② 确认条自身不许编辑文档（否则一次导入 = 两步撤销；文档改动只能留在 importModelFiles 的 structEdit）");
+    for (const k of [
+      "gl.dlg.title", "gl.dlg.hint", "gl.dlg.form", "gl.dlg.scale", "gl.dlg.fps", "gl.dlg.cam", "gl.dlg.clips",
+      "gl.dlg.probing", "gl.dlg.noClips", "gl.dlg.ok", "gl.dlg.cancel", "gl.check.fps", "gl.check.scale",
+    ])
+      if (i18n.split(`"${k}":`).length - 1 !== 2) bad.push(`② i18n 词条 ${k} 必须 zh/en 各恰好一条`);
+    return bad;
+  };
+
+  const dlgBad = async (src) => [...(await dlgRealBad(src)), ...dlgWireBad(src, i18nSrcB)];
+  const dlgBase = await dlgBad(mainSrcB);
+  check(dlgBase.length === 0, `task-17 ② 判据体全绿（${dlgBase.length} 处失败${dlgBase.length ? "：" + dlgBase[0] : ""}）`);
+
+  const dlgMutations = [
+    { which: "real", name: "② 非法帧率不再被拦（静默走缺省）", from: "if (!Number.isFinite(fps) || fps <= 0 || fps > 240)", to: "if (!Number.isFinite(fps) || fps <= 0)", expect: /帧率/ },
+    { which: "real", name: "② 片段预览丢掉帧数", from: "`${c.name} · ${c.frameCount} 帧`", to: "c.name", expect: /帧数/ },
+    { which: "wire", name: "② 确认后不再把 fps/缩放交给导入通道", from: "void importModelFiles(files, form, gen, { fps: c.fps, scaleMul: c.scaleMul });", to: "void importModelFiles(files, form, gen);", expect: /导入通道/ },
+    { which: "wire", name: "② 文件选择器绕过确认条直接导入", from: "if (files.length) openGltfImportDialog(files, null);", to: "if (files.length) void importModelFiles(files, modelFormPick);", expect: /确认条|直接导入/ },
+    { which: "wire", name: "② 非法输入不再禁用确认按钮", from: "okEl.disabled = !ok.ok;", to: "okEl.disabled = false;", expect: /禁用/ },
+  ];
+  for (const m of dlgMutations) {
+    const after = mainSrcB.replace(m.from, m.to);
+    check(after !== mainSrcB, `变异「${m.name}」确实改动了源码`);
+    if (after === mainSrcB) continue;
+    const bad2 = m.which === "real" ? await dlgRealBad(after) : dlgWireBad(after, i18nSrcB);
+    check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+    if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // K / L. 真浏览器（--headless）
 // ───────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--headless")) {
@@ -11371,6 +11597,47 @@ if (process.argv.includes("--headless")) {
   await phase("模型层真机段（MA2…MD2）", () => runModelHeadless({ check, section, tmpRoot, LIB }));
 } else {
   console.log("\n（跳过真浏览器部分：加 --headless 跑，需要 Chrome + 会自起 dev server）");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W. 按目录各一份「已写出内容指纹」（editor/write-sig.ts；task-22 修复的真跑判据）
+//    esbuild 现打包真跑，不是文本断言：指纹表本身必须是「每个目录一张」。
+// ───────────────────────────────────────────────────────────────────────────
+const wsMod = await loadEditorModule("write-sig");
+{
+  const dirA = { name: "editor-A" };
+  const dirB = { name: "editor-B" };
+  wsMod.sigFor(dirA).set("project.json", wsMod.fileSig(new Uint8Array([1, 2, 3])));
+  wsMod.sigFor(dirA).set("scene.json", wsMod.fileSig(new Uint8Array([4])));
+  check(wsMod.sigFor(dirA) !== wsMod.sigFor(dirB), "write-sig：两个目录各拿一张表（不是一张按路径记的全局表）");
+  check(
+    wsMod.sigFor(dirA).size === 2 && wsMod.sigFor(dirB).size === 0,
+    `write-sig：A 记了 2 条时 B 仍是空的（实得 A=${wsMod.sigFor(dirA).size} B=${wsMod.sigFor(dirB).size}）`,
+  );
+  check(wsMod.sigFor(dirA) === wsMod.sigFor(dirA), "write-sig：同一目录反复取到同一张表（记与读不会各拿一份）");
+  // adoptProject / releaseProject 的「只清一份」语义：清 A 不能动 B
+  wsMod.sigFor(dirB).set("project.json", "1:2");
+  wsMod.sigFor(dirA).clear();
+  check(
+    wsMod.sigFor(dirA).size === 0 && wsMod.sigFor(dirB).get("project.json") === "1:2",
+    "write-sig：清一份不动另一份（换目录后旧一轮的记账只落在它自己那张表里）",
+  );
+  check(
+    wsMod.fileSig(new Uint8Array([1, 2, 3])) !== wsMod.fileSig(new Uint8Array([3, 2, 1])) &&
+      wsMod.fileSig(new Uint8Array([1, 2])) !== wsMod.fileSig(new Uint8Array([1, 2, 3])),
+    "write-sig：fileSig 对内容与长度都敏感（同长不同内容不会被当成没变）",
+  );
+  // 接线：main.ts 不再有全局表；护栏必须在 writeToDirectory **之后**（提前到前面会挡正常路径）
+  const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(!/writtenSig/.test(mainSrc), "main.ts：全局按路径的 writtenSig 已删干净（0 处引用）");
+  const iWrite = mainSrc.indexOf("if (changed.length) await writeToDirectory(dir, changed);");
+  const iGuard = mainSrc.indexOf("if (dir !== projectDir || doc !== snap) return ok;", iWrite);
+  const iRecord = mainSrc.indexOf("for (const f of changed) sigFor(dir).set(f.path, fileSig(f.data));", iWrite);
+  check(iWrite > 0 && iGuard > iWrite && iRecord > iGuard, "main.ts：换目录护栏在 writeToDirectory 之后、记账之前");
+  check(
+    /sigFor\(dir\)\.(get|set|delete)\(/.test(mainSrc) && /if \(prev\) sigFor\(prev\)\.clear\(\)/.test(mainSrc),
+    "main.ts：flush 的读/记/删与 releaseProject 的清理都按目录走",
+  );
 }
 
 // 自证：真机两阶段都有阶段级容错（防回归；离线跑也检查这一条）
