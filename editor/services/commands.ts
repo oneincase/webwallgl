@@ -24,6 +24,8 @@ export function keyOf(e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "sh
 
 export function createCommandService(): CommandService {
   const registry = createRegistry<CommandDef>("commands");
+  // 内部这份是真注册表（可 add / setFallback）；对外经 CommandService.registry 暴露为只读视图
+  // （CommandRegistryView，D3）：命令面板只 list / onChange，写入口只有下面的 register。
   // 注册入口：内置命令与插件命令都从这里进注册表，校验前置，失败不脏注册表
   const register = (def: CommandDef, owner?: string): Disposer => {
     if (!def || typeof def.id !== "string" || !def.id) throw new Error("命令必须有非空 id");

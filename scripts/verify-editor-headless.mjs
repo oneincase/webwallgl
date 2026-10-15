@@ -5128,6 +5128,313 @@ async function fxStructE2E() {
 await alphaE2E();
 await skelE2E();
 await fxStructE2E();
+await boneGizmoE2E();
+
+/**
+ * AS. 视口骨骼 gizmo（W18a）：木偶层 → 骨 + 一条有帧的片段 → 选骨 → 视口拖骨（拖动中只是预览）
+ * → 松手一次提交（一步 ⌘Z）→ Esc 取消零副作用（不留空撤销步）→ 非骨点不吞事件（图层照旧被拖）。
+ * 判据 = 叠加层真实像素（选中骨画成 SNAP_COLOR 粉点，只把**实心核**当骨点，避开右侧骨名字）+
+ * 盘上产物快照（.mdl 逐字节 / scene.json 的 origin）。整段不需要 CDP 截图，U7 是纯叠加层 + 盘上事实。
+ */
+async function boneGizmoE2E() {
+  var asName = "AS. 视口骨骼 gizmo（拖拽预览 / 一步 ⌘Z / Esc 零副作用 / 非骨点不吞事件）";
+  section(asName);
+  if (hlState.dead && process.env.WE_E2E_FROM !== "AS") hlSkip("AS", asName); else try {
+  var asHas = async (sel) => (await ev(`!!document.querySelector('${sel}')`)) === true;
+  // settle() 只定义在 runCreateAndDraft 里（另一个函数作用域），这里用模块级的 sleep —— boneGizmoE2E
+  // 是独立函数，之前备料失败提前 return，从没走到用 settle 的那几行（2026-10-15 修备料时暴露）。
+  var settle = () => sleep(400);
+  var asPick = (sel, v) => ev(`(() => { const el = document.querySelector('${sel}'); if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  /**
+   * 叠加层上的骨点读数（与 AQ 的 aqScanBones 同一块画布）：
+   *   粉 R>200 / G<130 / 90<B<200 = SNAP_COLOR 选中骨（+ 拖动环 / 悬停环，都是描边，不算实心核）
+   *   琥珀 = 钉子（#ffd166）与骨架模式的选中下标；蓝 = 其余骨点
+   * 骨点坐标取「3×3 全粉」的实心核质心 —— 骨名文字画在点右侧 7px、笔画只有 1px，进不了实心核。
+   */
+  var asBonePt = () => ev(`(() => {
+    const cv = document.querySelector('#ed-overlay');
+    if (!cv) return null;
+    const r = cv.getBoundingClientRect();
+    const k = cv.width / r.width;
+    const W = cv.width, H = cv.height;
+    const d = cv.getContext('2d').getImageData(0, 0, W, H).data;
+    const pink = new Uint8Array(W * H);
+    let pinkN = 0, amber = 0, blue = 0;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      if (d[i + 3] < 120) continue;
+      const R = d[i], G = d[i + 1], B = d[i + 2];
+      if (R > 200 && G < 130 && B > 90 && B < 200) { pink[y * W + x] = 1; pinkN++; }
+      else if (R > 200 && G > 150 && G < 240 && B < 150) amber++;
+      else if (B > 150 && B > R + 40 && G > 120) blue++;
+    }
+    let sx = 0, sy = 0, n = 0;
+    let px0 = 1e9, py0 = 1e9, px1 = -1, py1 = -1;
+    const hist = new Map();
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      if (d[i + 3] < 120) continue;
+      const R = d[i], G = d[i + 1], B = d[i + 2];
+      if (!(R > 200 && G < 130 && B > 90 && B < 200)) continue;
+      if (x < px0) px0 = x; if (y < py0) py0 = y; if (x > px1) px1 = x; if (y > py1) py1 = y;
+      const key = R + ',' + G + ',' + B;
+      hist.set(key, (hist.get(key) || 0) + 1);
+    }
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      if (!pink[y * W + x]) continue;
+      let solid = true;
+      for (let dy = -1; dy <= 1 && solid; dy++) for (let dx = -1; dx <= 1; dx++) if (!pink[(y + dy) * W + (x + dx)]) { solid = false; break; }
+      if (solid) { sx += x; sy += y; n++; }
+    }
+    // 粉色像素的整体包围盒 + 按精确 RGB 归类（诊断「实心核找不到」到底是哪种绘制）
+    const bb = px1 < 0 ? null : [px0, py0, px1, py1, px1 - px0 + 1, py1 - py0 + 1];
+    const top = [...hist.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+    // 连通块（8 邻接）：每块的质心就是一枚粉色标记的中心。**不依赖「3×3 全粉的实心核」**：
+    // ⌘Z 之后实测叠加层上画的是「粉盘 + 同心蓝盘」（另一根骨点落在同一处，后画的蓝盘把中心挖空）
+    // ⇒ solid 读数为 0、拿不到骨点坐标，会让后面所有手势判据级联变红（真机轮 AS 段 6 条红就是这么来的）。
+    // 质心对「实心盘」与「环」都等于圆心，所以按块取点比按实心核取点稳。
+    // 只留「像一枚点」的块（包围盒 ≤ 24px）：骨名文字是细笔画、全画布吸附线更不可能进这个包围盒。
+    const lab = new Int32Array(W * H).fill(-1);
+    const stack = new Int32Array(W * H);
+    const comps = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const s0 = y * W + x;
+      if (!pink[s0] || lab[s0] >= 0) continue;
+      const id = comps.length;
+      let sp = 0, cnt = 0, ax = 0, ay = 0, qx0 = 1e9, qy0 = 1e9, qx1 = -1, qy1 = -1;
+      stack[sp++] = s0; lab[s0] = id;
+      while (sp > 0) {
+        const cur = stack[--sp];
+        const cy = (cur / W) | 0, cx = cur - cy * W;
+        cnt++; ax += cx; ay += cy;
+        if (cx < qx0) qx0 = cx; if (cy < qy0) qy0 = cy; if (cx > qx1) qx1 = cx; if (cy > qy1) qy1 = cy;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx, ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const ni = ny * W + nx;
+          if (!pink[ni] || lab[ni] >= 0) continue;
+          lab[ni] = id; stack[sp++] = ni;
+        }
+      }
+      const bw = qx1 - qx0 + 1, bh = qy1 - qy0 + 1;
+      // 只留「像一枚点」的块：骨名文字是 1px 细笔画（每笔一块、宽度 ≤ 8），全画布吸附线更是细长。
+      // 用「块内像素数 ≥ 10 且包围盒 ≤ 24px」筛掉它们；再按像素数降序，取第一块 = 最大那枚标记。
+      if (cnt >= 10 && bw <= 24 && bh <= 24) comps.push({ x: ax / cnt / k + r.left, y: ay / cnt / k + r.top, n: cnt, w: bw, h: bh });
+    }
+    comps.sort((a, b) => b.n - a.n);
+    const c0 = comps.length ? comps[0] : null;
+    return { pink: pinkN, solid: n, amber, blue, bb, top, comps, x: c0 ? c0.x : null, y: c0 ? c0.y : null };
+  })()`);
+  /** 盘上「stripe」层：模型 json（含 warp 布局）+ .mdl 字节 + 场景对象（与 AO / AQ 同法） */
+  var asDisk = (id) => {
+    const dir = path.join(lib, id);
+    const sc = JSON.parse(fs.readFileSync(path.join(dir, "scene.json"), "utf8"));
+    const obj = (sc.objects ?? []).find((o) => o.name === "stripe") ?? (sc.objects ?? [])[0];
+    return { dir, obj, json: obj && obj.image ? JSON.parse(fs.readFileSync(path.join(dir, String(obj.image)), "utf8")) : null };
+  };
+  var asMdl = (id) => { const d = asDisk(id); const p = d.json?.puppet; return p ? fs.readFileSync(path.join(d.dir, p)) : null; };
+  /**
+   * 盘上快照：图层变换 + 钉子布局（非骨点按下要么走图层位移、要么走钉子，两者都在这里）。
+   * origin/scale **按数值比较**，不比原文：正拖写回走 writeObjProps 的 vecStr（toFixed(5) 归一，
+   * editor/doc.ts:165 ⇒ "1106.93878 466.53061 0"），撤销走同一条路，而空白工程的初始 origin
+   * 是 create.ts 的 f3（toFixed(3) ⇒ "960.000 540.000 0.000"）—— 值相同、字面量不同。
+   * 字面量逐字节是「未受改动的工程」的契约，撤销只承诺「值回到拖前」。
+   */
+  var asSnap = (id) => {
+    const d = asDisk(id);
+    const nums = (s) => (typeof s === "string" ? s.trim().split(/\s+/).map(Number) : s);
+    const pins = d.json?.warp?.pins ?? null;
+    return JSON.stringify([
+      d.obj?.origin === undefined ? null : nums(d.obj.origin),
+      d.obj?.scale === undefined ? null : nums(d.obj.scale),
+      Array.isArray(pins) ? pins.map((p) => (Array.isArray(p) ? p.map(Number) : p)) : pins,
+    ]);
+  };
+  /** 按住不放的拖拽：中途做判据，再由返回的 release() 松手（与 AE 的 holdDrag 同法） */
+  var asHold = async ([x0, y0], [x1, y1]) => {
+    await mouse("mouseMoved", x0, y0);
+    await mouse("mousePressed", x0, y0, { buttons: 1 });
+    for (let i = 1; i <= 10; i++) {
+      await mouse("mouseMoved", x0 + ((x1 - x0) * i) / 10, y0 + ((y1 - y0) * i) / 10, { buttons: 1 });
+      await sleep(16);
+    }
+    await sleep(200);
+    return async () => { await mouse("mouseReleased", x1, y1); await sleep(200); };
+  };
+  var asClick = async (sel, what) => { if (!(await asHas(sel))) { check(false, `${what}：页面里没有 ${sel}`); return false; } await clickSel(sel); return true; };
+  /**
+   * 骨骼面板现场（失败时贴进 ✗ 文案，避免下次只能靠猜）：
+   *   面板文本（含 bn.noClips 注 ⇒ 有骨无片段）、骨下拉是否在、盘上 .mdl 的骨数与片段数。
+   *   只看 DOM 与盘上产物 —— 编辑器页不暴露调试探针（verify-arch 断言），所以不读 getModelInfo。
+   */
+  var asDiag = async (tag) => {
+    try {
+      if (tag) {
+        try {
+          const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
+          fs.writeFileSync(`/tmp/as-${tag}.png`, Buffer.from(data, "base64"));
+        } catch (e) { /* 截图失败不影响现场 */ }
+      }
+      const dom = await ev(`(() => {
+        const g = document.querySelector('#ed-inspector .ed-bones');
+        const q = (s) => document.querySelector(s);
+        return {
+          bones: !!g, sel: !!q('#ed-inspector .ed-bones .ed-bn-bone'), text: g ? g.innerText.replace(/\\s+/g, ' ').slice(0, 200) : null,
+          insp: !!q('#ed-inspector'), empty: !!q('#ed-empty'), href: location.href.replace(/^https?:\\/\\/[^/]+/, ''),
+          warpExit: !!q('.ed-warp .ed-warp-exit'), warpOpen: !!q('.ed-warp .ed-warp-open'), warpMake: !!q('.ed-warp .ed-warp-make'),
+          pins: document.querySelectorAll('.ed-warp-pins .ed-fx-item').length,
+          skelNew: !!q('.ed-skel-new'), skelApply: !!q('.ed-skel-apply'), applyDis: q('.ed-skel-apply') ? q('.ed-skel-apply').disabled : 'MISSING',
+          skelBones: document.querySelectorAll('#ed-inspector .ed-skel-bone').length,
+          tab: q('#ed-inspector .ed-insp-tab.on') ? q('#ed-inspector .ed-insp-tab.on').textContent : null,
+          draft: q('#ed-draft') ? !q('#ed-draft').hidden : "MISSING",
+          objs: (q('#ed-left') ? q('#ed-left').innerText.replace(/\\s+/g, ' ') : '').slice(0, 180),
+          errs: [...document.querySelectorAll('#ed-con-body > div.error')].slice(-3).map((d) => d.textContent.replace(/\\s+/g, ' ').slice(0, 160)),
+        };
+      })()`);
+      const id = await ev(`sessionStorage.getItem('wwgl-e2e-project')`);
+      let disk = null;
+      try {
+        const d = asDisk(String(id));
+        const p = d.json?.puppet;
+        const m = p ? JSON.parse(fs.readFileSync(path.join(d.dir, p), "utf8")) : null;
+        disk = { obj: d.obj?.name, image: d.obj?.image, jsonKeys: d.json ? Object.keys(d.json).slice(0, 8) : null, mdl: !!m, bones: m ? (m.bones ?? []).length : null, clips: m ? (m.animations ?? []).length : null };
+      } catch (e) { disk = { err: String(e.message).slice(0, 80) }; }
+      return `；现场 ${JSON.stringify({ ...dom, disk })}`;
+    } catch (e) { return `；现场读取失败 ${String(e.message).slice(0, 80)}`; }
+  };  var asEsc = async () => {
+    for (const type of ["rawKeyDown", "keyUp"]) {
+      await cdp.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    }
+    await sleep(150);
+  };
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  await addImage(stripePath);
+  check(await asHas(".ed-warp .ed-warp-make"), "普通图片层的检视器里就有「操控变形」分组（AS 的起点）");
+
+  // ── 备料：转木偶自带骨架与片段，不必再建骨架 ──
+  // 「转木偶」（warpPromote）写出的 .mdl 本身就有两样东西，正是 boneGroup 的准入条件：
+  //   ① 骨 —— warpFiles(buildRig(layout, size, …)) 的钉子骨（root + pin1…pin5 = 6 根）；
+  //   ② 一条 frames>0 的片段 —— structEdit 里 addAnimLayer(dd, n.obj, WARP_CLIP_ID, WARP_CLIP_NAME)
+  //      （editor/main.ts:7665 warpPromote），实测 "片段 warp · loop · 31f"。
+  // 所以备料只要「转木偶 → 退出操控变形」两步。**不要在备料里应用骨架**：skelApplySkeleton
+  // （editor/main.ts:9236）在骨数/名字/矩阵与盘上不同时会走 clearMdlClips（:9261 `next = clearMdlClips(next) ?? next`），
+  // 把唯一的 warp 片段清掉 ⇒ bones 组只剩 bn.noClips、连 .ed-bn-bone 都不会建（AQ 段 :4371
+  // `check((aqM1.animations ?? []).length === 0, …)` 记的就是这个语义）。而骨架模式（skelMode = "skeleton"）
+  // 下拖视口里的钉子是建模手势，会经 skelPointerDown 落到通用路径上把选中层点掉。
+  // 退出操控变形是必须的：boneDragPermitted（editor/main.ts:7187）里 `!f.warp` 那条要求关掉会话。
+  var asRc = await h.readyCount();
+  await clickSel(".ed-warp .ed-warp-make");
+  await h.waitRemount(asRc);
+  await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 40000);
+  console.log(`  · AS 备料①转木偶后：${await asDiag()}`);
+  var asBones = () => asHas("#ed-inspector .ed-bones .ed-bn-bone");
+  if (await asHas(".ed-warp .ed-warp-exit")) {
+    await clickSel(".ed-warp .ed-warp-exit");
+    await settle();
+    await waitFor(`!document.querySelector('.ed-warp .ed-warp-exit')`, 20000);
+    console.log(`  · AS 备料②退出操控变形后：${await asDiag()}`);
+  }
+  check(await asBones(), `转木偶写出的骨 + 它自带的有帧片段都在盘上后，骨骼面板（W18a）出现 —— 视口骨点可拖${await asDiag()}`);
+  if (!(await asBones())) { check(false, `AS 停在此处：没有骨骼面板就没有视口骨点（余下手势判据全依赖它）${await asDiag("as-stop")}`); return; }
+
+  // ── 选一根骨：下拉切骨 = reselect 口径（撤旧预览 + 清未提交增量 + 重绘叠加层） ──
+  await asPick("#ed-inspector .ed-bn-bone", "1");
+  await settle();
+  var asB0 = await asBonePt();
+  check(!!asB0 && asB0.x !== null && (asB0.comps ?? []).length >= 1, `选中骨在叠加层上画成粉点（粉 ${asB0 ? asB0.pink : 0} px、实心核 ${asB0 ? asB0.solid : 0} px、连通块 ${asB0 && asB0.comps ? asB0.comps.length : 0} 个、bb ${asB0 && asB0.bb ? asB0.bb.join("/") : "—"}）`);
+  if (!asB0 || asB0.x === null) { check(false, "AS 停在此处：叠加层上找不到选中骨的粉点（拿不到手势落点）"); return; }
+  var asPt0 = [asB0.x, asB0.y];
+
+  // ── 拖动中只是预览：叠加层的骨点跟手，盘上 .mdl 逐字节不动 ──
+  var asIdA = await saveLoose();
+  var asM0 = asMdl(asIdA);
+  check(!!asM0, "手势前存库：盘上 .mdl 在（后面三处逐字节比对的基线）");
+  var asRc4 = await h.readyCount();
+  var asRel = await asHold(asPt0, [asPt0[0] + 60, asPt0[1]]);
+  var asB1 = await asBonePt();
+  var asMoved = asB1 && asB1.x !== null ? Math.hypot(asB1.x - asPt0[0], asB1.y - asPt0[1]) : -1;
+  check(asMoved >= 25, `拖动中：叠加层的选中骨跟着指针走（位移 ${asMoved.toFixed(1)} px ≥ 25）`);
+  var asMid = asMdl(await saveLoose());
+  check(!!asMid && !!asM0 && Buffer.compare(asMid, asM0) === 0, "拖动中只是预览：盘上 .mdl 逐字节没变（没有写文档）");
+  await asRel();
+  await h.waitRemount(asRc4);
+  var asM1 = asMdl(await saveLoose());
+  check(!!asM1 && !!asM0 && Buffer.compare(asM1, asM0) !== 0, "松手：一次性提交（盘上 .mdl 变了）");
+
+  // ── 一次手势 = 一步 ⌘Z ──
+  var asRc5 = await h.readyCount();
+  await key("z", MOD.meta);
+  await h.waitRemount(asRc5);
+  var asM2 = asMdl(await saveLoose());
+  check(!!asM2 && !!asM0 && Buffer.compare(asM2, asM0) === 0, "一次手势 = 一步 ⌘Z：撤销后盘上 .mdl 逐字节回到拖前");
+
+  // ── 负控：非骨点处的按下不能被骨 gizmo 吞掉（事件照旧落回图层 / 钉子拖拽路径） ──
+  // ⌘Z 会触发重挂 ⇒ renderInspector 末尾 `if (!bonesShown) dropBonePick()`（editor/main.ts:13414）
+  // 把骨选择清掉，重挂后 boneGroup 会用缺省 bone=0（root）重建。这里重新选回 pin1，后半段的
+  // 「选中骨」口径才和前半段一致（否则量到的是另一根骨，负控的「离骨点 ≥20px」会假红）。
+  await asPick("#ed-inspector .ed-bn-bone", "1");
+  await settle();
+  var asCr1 = await h.canvasRect();
+  var asOff = worldToPage(asCr1, [860, 490]); // 3×3 钉子的格心，离最近的钉子 / 骨点 ~110px
+  var asB2 = await asBonePt();
+  console.log(`  · AS 负控前：${await asDiag("as-neg")}；骨点 ${JSON.stringify(asB2)}；落点 ${JSON.stringify(asOff)}`);
+  check(!!asB2 && asB2.x !== null && Math.hypot(asB2.x - asOff[0], asB2.y - asOff[1]) >= 20, "负控前置：按下点离选中骨 ≥ 20px（在骨点命中半径之外）");
+  var asIdB = await saveLoose();
+  var asSnap0 = asSnap(asIdB);
+  var asMdl0 = asMdl(asIdB);
+  var asSel0 = await h.selectedName();
+  var asRel2 = await asHold(asOff, [asOff[0] + 60, asOff[1] + 30]);
+  await asRel2();
+  await settle();
+  // 「骨 gizmo 不吞半径外事件」的**硬证据是盘上 .mdl 没多出骨位移**：命中半径外 boneGrab 返回 false，
+  // 事件落到既有图层拖拽路径 ⇒ 变的是 scene.json 的 origin/scale（图层变换），.mdl 一个字节都不该动。
+  // （不要拿「叠加层骨点的屏幕坐标没变」当判据：负控那一下会拖动图层，骨点随图层一起平移，
+  //  屏幕坐标必然变 —— 早先 AS 段就是这么假红的。）
+  var asMdlNeg = asMdl(await saveLoose());
+  check(!!asMdl0 && !!asMdlNeg && Buffer.compare(asMdlNeg, asMdl0) === 0, "非骨点处按下：盘上 .mdl 逐字节没变（骨 gizmo 不吞命中半径外的事件，没写任何骨位移）");
+  var asSnap1 = asSnap(await saveLoose());
+  check(asSnap1 !== asSnap0, "非骨点处按下：事件照旧落回既有的图层 / 钉子拖拽路径（盘上变换或钉子变了）");
+  check((await h.selectedName()) === asSel0, "非骨点处按下：选中层没被换掉（负控的第二半）");
+
+  // ── Esc 取消：不提交、不产生空撤销步 ──
+  // 负控拖动把图层挪了 ⇒ 骨点屏幕坐标也变了，先重新选回 pin1 再取一次骨点（口径与前半段一致）
+  await asPick("#ed-inspector .ed-bn-bone", "1");
+  await settle();
+  var asSel1 = await h.selectedName();
+  var asB3b = await asBonePt();
+  check(!!asB3b && asB3b.x !== null, `Esc 段前置：还能在叠加层上读到选中骨的粉点（${JSON.stringify(asB3b)}）`);
+  if (!asB3b || asB3b.x === null) { check(false, "AS 停在此处：负控之后读不到骨点（Esc 段没法继续）"); return; }
+  var asPt3 = [asB3b.x, asB3b.y];
+  var asFrom = asSnap(await saveLoose());
+  var asRel3 = await asHold(asPt3, [asPt3[0] + 60, asPt3[1]]);
+  var asB4 = await asBonePt();
+  check(!!asB4 && asB4.x !== null && Math.hypot(asB4.x - asPt3[0], asB4.y - asPt3[1]) >= 25, "第二次拖动同样跟手（Esc 判据的前置）");
+  await asEsc();
+  await asRel3();
+  await settle();
+  var asAfterEsc = asSnap(await saveLoose());
+  check(asAfterEsc === asFrom, "Esc 取消后松手：盘上产物逐字段还是拖前（没提交、预览清回）");
+  var asB5 = await asBonePt();
+  check(!!asB5 && asB5.x !== null && Math.hypot(asB5.x - asPt3[0], asB5.y - asPt3[1]) <= 2, "Esc 取消：叠加层的骨点回到原位（预览撤掉，不是留在半路）");
+  // 撤销栈上没有多出空步：这一下 ⌘Z 必须打到「上一个真实步骤」（负控那次拖动），而不是被 Esc 的空步吃掉
+  // 现场：撤销/重做按钮的 disabled 就是 edits.canUndo/canRedo 的镜像（syncHistoryButtons）——
+  // ⌘Z 前后各读一次，能区分「⌘Z 打到空（栈本来就空）/ 打到了别的步骤 / 栈上多出了空步」三种情况。
+  var asUndoBtns = () => ev(`JSON.stringify({ undo: document.querySelector('#tb-undo')?.disabled ?? null, redo: document.querySelector('#tb-redo')?.disabled ?? null })`);
+  console.log(`  · AS ⌘Z 前：${await asUndoBtns()}；asSnap0=${asSnap0}；asFrom=${asFrom}`);
+  await key("z", MOD.meta);
+  await settle();
+  console.log(`  · AS ⌘Z 后：${await asUndoBtns()}`);
+  var asFinalSnap = asSnap(await saveLoose());
+  check(asFinalSnap === asSnap0, `Esc 没有产生空撤销步：下一次 ⌘Z 打到上一个真实步骤（负控那次的盘上改动被撤回；盘上 ${asFinalSnap}，期望 ${asSnap0}）`);
+  check((await h.selectedName()) === asSel1, "Esc / ⌘Z 全程没有换掉选中层");
+  var asErrs = await h.errorLines();
+  check(asErrs.length === 0, `AS 全程控制台无错误${asErrs.length ? `：${asErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AS", asName, err); }
+}
 
   if (hlState.aborts.length || hlState.skipped) {
     console.log(`\n真机段小结：中断 ${hlState.aborts.length} 段、跳过 ${hlState.skipped} 段`);

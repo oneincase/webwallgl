@@ -7,7 +7,8 @@
  *   同名服务栈（覆盖与回落）/ 卸载逆序撤销 / 重载幂等 / 监听出错隔离与错误预算 /
  *   权限白名单（含继承）/ profile 合并、缺服务与依赖环诊断 / 注册表栈与合批 / schema 规整。
  * M10/D3 追加：editor/services/commands.ts 的 register 路径（命令的唯一注册入口，
- *   内置与插件同 API：owner 归属、同 id 叠栈与回落、校验、键盘派发与 list() 枚举一致）。
+ *   内置与插件同 API：owner 归属、同 id 叠栈与回落、校验、键盘派发与 list() 枚举一致），
+ *   以及 registry 收窄成只读视图 CommandRegistryView（源码口径：消费者只能用 list/get/has/ownerOf/onChange）。
  * 每组判据配变异红测：把内核改坏，确认对应判据变红（防自证）。
  */
 import { build } from "esbuild";
@@ -311,6 +312,34 @@ for (const r of [...real, ...realCmd]) {
   if (!r.ok) failed++;
 }
 
+// ── D3：registry 收窄成只读视图（源码口径判据；运行时语义由上面的 cmdSuite 覆盖） ──
+const d3SourceSuite = (over = {}) => {
+  const res = [];
+  const check = (ok, msg) => res.push({ ok: !!ok, msg });
+  const read = (p) => over[p] ?? fs.readFileSync(path.join(ROOT, p), "utf8");
+  const typesSrc = read("editor/services/types.ts");
+  const exSrc = read("examples/plugins/cmd-layer-align/src/index.ts");
+  const palSrc = read("editor/ui/command-palette.ts");
+
+  check(/export type CommandRegistryView = Omit<Registry<CommandDef>, "add" \| "setFallback">;/.test(typesSrc),
+    "D3：命令注册表视图类型把 add / setFallback 从类型上去掉（写入口只剩 register）");
+  check(typesSrc.includes("readonly registry: CommandRegistryView;") && !typesSrc.includes("readonly registry: Registry<CommandDef>"),
+    "D3：CommandService.registry 字段已声明为视图（旧的 Registry<CommandDef> 全量声明不再存在）");
+  check(exSrc.includes('commands").register(') && !exSrc.includes(".registry") && !/\breg\.add\(/.test(exSrc),
+    "D3：示例插件源码只用 commands.register（不再摸 registry.add）");
+  check(
+    palSrc.includes('Pick<CommandService, "registry" | "exec">') && palSrc.includes("o.commands.registry.list()") && palSrc.includes("o.commands.registry.onChange("),
+    "D3：命令面板三处消费都是视图允许的只读用法（Pick 类型 / list() / onChange()）",
+  );
+  return res;
+};
+const realD3 = d3SourceSuite();
+console.log("  D3 registry 收窄（源码口径）");
+for (const r of realD3) {
+  console[r.ok ? "log" : "error"](`  ${r.ok ? "✓" : "✗"} ${r.msg}`);
+  if (!r.ok) failed++;
+}
+
 console.log("\n变异红测");
 const ctxPath = path.join(ROOT, "editor/core/context.ts");
 const regPath = path.join(ROOT, "editor/core/registry.ts");
@@ -367,7 +396,27 @@ for (const [label, file, src, from, to] of cmdMutants) {
   if (!red) failed++;
 }
 
-const total = real.length + realCmd.length;
-const bad = [...real, ...realCmd].filter((r) => !r.ok).length;
+// ── D3 变异红测：registry 收窄（源码口径；改坏后上面四条判据必须变红） ──
+const d3Mutants = [
+  ["registry 视图把 add 放回来", "editor/services/types.ts",
+    'export type CommandRegistryView = Omit<Registry<CommandDef>, "add" | "setFallback">;',
+    "export type CommandRegistryView = Registry<CommandDef>;"],
+  ["示例插件改回 registry.add", "examples/plugins/cmd-layer-align/src/index.ts",
+    'ctx.get("commands").register(', 'ctx.get("commands").registry.add('],
+];
+for (const [label, rel, from, to] of d3Mutants) {
+  const src = fs.readFileSync(path.join(ROOT, rel), "utf8");
+  if (!src.includes(from)) {
+    console.error(`  ✗ ${label}：注入点不存在（源码改过？同步更新本脚本）`);
+    failed++;
+    continue;
+  }
+  const red = d3SourceSuite({ [rel]: src.replace(from, to) }).filter((r) => !r.ok).length;
+  console[red ? "log" : "error"](`  ${red ? "✓" : "✗"} ${label} → ${red} 条判据变红`);
+  if (!red) failed++;
+}
+
+const total = real.length + realCmd.length + realD3.length;
+const bad = [...real, ...realCmd, ...realD3].filter((r) => !r.ok).length;
 console.log(`\n${failed ? "✗" : "✓"} verify-plugin-kernel：${total - bad}/${total} 判据通过，${failed} 项失败`);
 process.exit(failed ? 1 : 0);

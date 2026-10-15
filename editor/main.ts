@@ -528,8 +528,11 @@ import {
 } from "./doc";
 import {
   LAYER_CLIP_KEY,
+  clipRefPaths,
+  missingPasteResources,
   parseLayerClip,
   pasteLayerClip,
+  pasteMissingHint,
   serializeLayerClip,
   stringifyLayerClip,
   type LayerClip,
@@ -918,6 +921,32 @@ let bonePick: {
   r: BoneVec;
   s: BoneVec;
 } | null = null;
+// task-28 A（W18a 视口骨骼 gizmo）的常量与纯逻辑都放在下面的「视口骨骼 gizmo 纯逻辑」区里
+// （BONE_HIT_R / BONE_DRAG_MIN + 命中 / 角度 / 位移 / 准入），这里只留会话状态。
+/** 当前悬停命中的骨（-1 = 没命中）：只用于高亮环与光标，不参与任何提交 */
+let boneHover = -1;
+/**
+ * 视口骨骼拖拽会话。拖动中**只**走 setBonePose 预览（引擎里的未提交姿势，不进文档）；松手才经
+ * applyBoneEdit 提交一次（= 一步 ⌘Z）。Esc 取消 / 位移不足 BONE_DRAG_MIN 时零副作用：
+ * 不提交、不产生空撤销步、预览清回 null（见 boneCancelDrag / boneDrop）。
+ */
+let boneDrag: {
+  pointerId: number;
+  layer: number;
+  bone: number;
+  x0: number;
+  y0: number;
+  /** 骨点屏幕原点：旋转的支点 */
+  o: [number, number];
+  /** 抓取瞬间的增量基线（拖动在它之上累加：面板里先输入的值不会被吃掉） */
+  t0: BoneVec;
+  r0: BoneVec;
+  /** 抓取瞬间指针相对骨点的**局部**向量（旋转用：与当前向量一起交给 boneSweepLocal） */
+  v0: [number, number];
+  /** 修饰键命中的模式：⌘/Ctrl = 旋转，否则平移 */
+  rot: boolean;
+  moved: boolean;
+} | null = null;
 /**
  * 操控变形（Puppet Warp）会话：引擎里只有 setBonePose 预览，换选中层 / 重挂即失效
  * （没记录进 .mdl 的钉子位移随之丢弃，和骨骼面板的未提交增量一个口径）
@@ -938,6 +967,9 @@ async function mountCurrent(keepTime = false) {
   animSolo = null;
   const gen = ++openGen;
   if (bonePick) bonePick = { ...bonePick, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+  // 重挂换引擎实例：视口骨骼拖拽会话与悬停高亮一律作废（预览属于旧实例）
+  boneDrag = null;
+  boneHover = -1;
   // 重挂换实例：操控变形的会话与布局缓存一律作废（钉骨属于旧实例）
   warpSession = null;
   warpLayoutCache.clear();
@@ -3067,6 +3099,11 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     return;
   }
+  // task-28 A：视口骨骼拖拽中按 Esc = 取消（不提交、不产生空撤销步、预览清回 null）
+  if (e.key === "Escape" && boneCancelDrag()) {
+    e.preventDefault();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
     e.preventDefault();
     undoRedo(e.shiftKey ? "redo" : "undo");
@@ -3233,10 +3270,21 @@ function drawBoneMarkers() {
   pts.forEach((p, i) => {
     if (!p.screen) return;
     const on = i === bonePick!.bone;
+    const hot = i === boneHover || boneDrag?.bone === i;
     overlayCtx.fillStyle = on ? SNAP_COLOR : "rgba(120,200,255,0.9)";
     overlayCtx.beginPath();
     overlayCtx.arc(p.screen[0], p.screen[1], on ? 4.5 : 2.5, 0, Math.PI * 2);
     overlayCtx.fill();
+    // task-28 A：可拖的骨点在悬停 / 拖动时套一圈命中环（半径与 BONE_HIT_R 同源；透视族不画 —— 那里不能拖）
+    if (hot && boneDraggable()) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(p.screen[0], p.screen[1], BONE_HIT_R - 3, 0, Math.PI * 2);
+      overlayCtx.strokeStyle = boneDrag?.bone === i ? SNAP_COLOR : "rgba(120,200,255,0.55)";
+      overlayCtx.lineWidth = 1.5;
+      overlayCtx.stroke();
+      overlayCtx.lineWidth = 1;
+      overlayCtx.strokeStyle = "rgba(120,200,255,0.7)";
+    }
     if (on) {
       overlayCtx.font = "11px system-ui, sans-serif";
       overlayCtx.fillStyle = "rgba(0,0,0,0.6)";
@@ -3381,6 +3429,8 @@ stageEl.addEventListener("pointerdown", (e) => {
   if (!p) return;
   // 操控变形：钉子比手柄优先（钉子常常就压在手柄 / 角点附近）
   if (warpGrab(e, p.x, p.y)) return;
+  // task-28 A：骨骼面板开着时，骨点比手柄优先；半径外一律不吞（负控判据咬这条）
+  if (boneGrab(e, p.x, p.y)) return;
   const handle = handleAt(gizmo, p.x, p.y);
   if (!handle && !overSelected(p.x, p.y)) return;
   const props = editor.getLayerProps(Number(selectedId));
@@ -3414,10 +3464,12 @@ stageEl.addEventListener("pointermove", (e) => {
   const p = canvasPoint(e);
   if (!p) return;
   if (warpDragMove(e, p.x, p.y)) return;
+  if (boneDragMove(e, p.x, p.y)) return;
   if (!drag || e.pointerId !== drag.pointerId || !editor) {
     if (e.buttons) return;
     const h = !isLocked(selectedId) ? handleAt(gizmo, p.x, p.y) : null;
-    const cursor = h ? h.kind : !isLocked(selectedId) && overSelected(p.x, p.y) ? "move" : "";
+    // task-28 A：手柄优先，其次可拖的骨点（光标给 move），再次整体层
+    const cursor = h ? h.kind : boneHover >= 0 ? "move" : !isLocked(selectedId) && overSelected(p.x, p.y) ? "move" : "";
     if ((stageEl.dataset.cursor ?? "") !== cursor) stageEl.dataset.cursor = cursor;
     return;
   }
@@ -3476,6 +3528,9 @@ stageEl.addEventListener("pointercancel", endDrag);
 // 操控变形的钉子拖动是另一条通道（不进 drag / 不进 undo）：引擎预览 + 悬停高亮
 stageEl.addEventListener("pointerup", warpDrop);
 stageEl.addEventListener("pointercancel", warpDrop);
+// task-28 A：视口骨骼拖拽同理（预览不进 undo；松手那一下才提交一次）
+stageEl.addEventListener("pointerup", boneDrop);
+stageEl.addEventListener("pointercancel", boneDrop);
 
 // ---------- 指针工作室（B5 / M11：停帧摆位 → 轨迹录制 → 回放） ----------
 // 引擎指针通道（pointer.js → pushPointer）本来就在；这里补的是「编辑器主动驱动」。
@@ -3874,6 +3929,20 @@ function pasteClipboard(): boolean {
   });
   if (!added.length) return false;
   selectMany(added[0], added.slice(1));
+  // task-28 B（§8.2 L5「跨文档粘贴不搬资源」）：检测子树引用、而本工程资源表里没有的文件。
+  // 只提示一次：**不阻断粘贴**（上面已经粘完了）、**不自动拷贝资源**（把文件搬进目标工程是另一件事）。
+  const missing = missingPasteResources(clipRefPaths(clip), overlay?.list() ?? []);
+  if (missing.length) {
+    const { shown, rest } = pasteMissingHint(missing);
+    log(
+      et("log.pasteMissing", {
+        n: missing.length,
+        list: shown.join("、"),
+        more: rest ? et("log.pasteMissingMore", { m: rest }) : "",
+      }),
+      "warn",
+    );
+  }
   return true;
 }
 
@@ -6638,6 +6707,9 @@ function dropBonePick() {
   if (!bonePick) return;
   void editor?.setBonePose(Number(bonePick.layer), bonePick.bone, null).catch(() => {});
   bonePick = null;
+  // task-28 A：面板关了就不再命中 / 拖拽骨点
+  boneHover = -1;
+  boneDrag = null;
 }
 
 const DEG = Math.PI / 180;
@@ -6689,6 +6761,8 @@ function boneGroup(node: LayerNode): HTMLElement | null {
   const frame = Math.min(clip.frames - 1, pick.frame ?? clipFrameAt(clip, editor!.time * rate));
   const editable = !!overlay && !isLocked(node.id);
   group.appendChild(note(et("bn.note")));
+  // task-28 A：视口拖拽提示（修饰键写在 i18n 里）；透视族不给视口拖拽 —— 显式说明原因，不许静默无反应
+  group.appendChild(note(et(boneViewportCorners(node.id) ? "bn.dragHint" : "bn.persp")));
   const form = document.createElement("div");
   form.className = "ed-fx-params";
   const row = (key: string, el: HTMLElement) => {
@@ -7009,6 +7083,279 @@ function applyBoneEdit(layerId: number | string, e: BoneEdit, boneName: string, 
   return commitMdlEdit(layerId, et("log.boneEdited", { layer: nodeName(layerId), bone: boneName, clip: clipName, frame: e.frame }), "pose", "bn", (bytes) =>
     applyBoneDelta(bytes, e.animId, e.bone, e.frame, e.delta, e.radius),
   );
+}
+
+// ---------- task-28 A：W18a 视口骨骼 gizmo（拖拽平移 / 旋转） ----------
+// 视口已经在画骨点与父子连线（drawBoneMarkers）；这里补的是「直接拖骨点」：
+//   默认拖 = 平移该骨（bonePick.t），按住 ⌘/Ctrl 拖 = 旋转该骨（bonePick.r[2]，i18n 键 bn.dragHint 里写明）
+//   拖动中只走 setBonePose 预览（引擎未提交姿势，不进文档）；松手才经 applyBoneEdit 提交一次 = 一步 ⌘Z。
+//   屏幕 → 局部复用既有的 editor.screenDeltaToLocal（和图层拖动 / 操控变形同一套换算，不新写矩阵），
+//   它本身就是「透视族返回 null」，与 W15「透视层不能视口拖动」同口径 —— 透视场景一律不进拖拽，
+//   由骨骼面板里的 bn.persp 注说明原因（不许静默无反应）。
+//   旋转角 = 指针绕骨点的局部角度差（r[2]）：2D 场景的 rx/ry 恒 0，见 mdl-math.js 的 [t,r,s] 9 分量。
+
+// ↓ task-28 A：视口骨骼 gizmo 纯逻辑（命中 / 角度 / 位移 / 准入；判据真跑）
+/**
+ * 骨点命中半径（CSS px）。与 drawBoneMarkers 的绘制半径同源（选中的骨画 4.5、其余 2.5），
+ * 取 9 ≈ 2 倍选中环：手不必停在 4.5px 里，又不会把邻近骨点抢走 —— 命中仍是「最近且在半径内」优先，
+ * 半径外一律不吞事件（boneGrabTarget 返回 null ⇒ pointerdown 当作没点到骨头）。
+ */
+export const BONE_HIT_R = 9;
+/** 视口骨骼拖拽的最小位移（CSS px）：与图层拖动的 DRAG_THRESHOLD 同口径，不足一像素的手势零副作用 */
+export const BONE_DRAG_MIN = 1;
+
+/**
+ * 屏幕命中骨点（纯函数，判据真跑）：返回骨下标，-1 = 半径外（等于半径算命中）。最近优先；
+ * 只认 getBonePoints 的 screen（落在相机身后为 null，跳过）。
+ */
+export function boneHitAt(
+  pts: ReadonlyArray<{ screen: [number, number] | null }>,
+  x: number,
+  y: number,
+  r = BONE_HIT_R,
+): number {
+  let best = -1;
+  let bestD = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const s = pts[i]?.screen;
+    if (!s) continue;
+    const d = Math.hypot(s[0] - x, s[1] - y);
+    if (d <= r && d < bestD) {
+      best = i;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * 抓取判定（纯函数）：半径内返回 {index, screen}，半径外 / 骨点在相机身后返回 null。
+ * **不吞事件**的负控就落在这里：null ⇒ boneGrab 交回既有的手柄 / 框选 / 图层拖动路径。
+ */
+export function boneGrabTarget(
+  pts: ReadonlyArray<{ screen: [number, number] | null }>,
+  x: number,
+  y: number,
+): { index: number; screen: [number, number] } | null {
+  const i = boneHitAt(pts, x, y);
+  const s = i < 0 ? null : (pts[i]?.screen ?? null);
+  return i < 0 || !s ? null : { index: i, screen: [s[0], s[1]] };
+}
+
+/**
+ * 局部空间角差（纯函数，判据真跑）。局部 y 向上、屏幕 y 向下：把两个局部向量按 y 翻号交给
+ * gizmo.ts 的 `rotateZ`（旋转柄**同一套**角度数学），得到的就是要加到 r[2] 的角差 ——
+ * 页面里不再长第二份旋转数学（I. 接线判据禁止把 gizmo.ts 的旋转数学内联回页面）。
+ */
+export function boneSweepLocal(v0: readonly [number, number], v1: readonly [number, number]): number {
+  return boneNormAngle(rotateZ(0, [0, 0], [v0[0], -v0[1]], [v1[0], -v1[1]]));
+}
+
+/** 角度归一到 (-π, π]：指针扫过 ±180° 时不会突然倒转一整圈（判据咬这一条） */
+export function boneNormAngle(a: number): number {
+  let d = a % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  else if (d <= -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/** 平移：把局部位移累加到 t（t 的 z 与 r / s 一律不动） */
+export function boneMoveTo(base: BoneVec, d: readonly [number, number]): BoneVec {
+  return [base[0] + d[0], base[1] + d[1], base[2]];
+}
+
+/** 旋转：局部角度差（弧度）→ r[2] 的角度增量（面板的 r 用度，提交时 boneDeltaOf 再换弧度） */
+export function boneRotateTo(base: BoneVec, sweep: number): BoneVec {
+  return [base[0], base[1], base[2] + (sweep * 180) / Math.PI];
+}
+
+/**
+ * 视口骨骼拖拽的准入（纯函数，判据真跑）。任一条不满足就不进拖拽、事件交回既有路径：
+ * `corners === null` 是透视族（W15 已定「透视层不能视口拖动」，这里同口径）；只读工程 / 几何模态 /
+ * 操控变形会话 / 图层锁定 / 选中层与骨骼面板不一致同样不行。
+ */
+export function boneDragPermitted(f: {
+  corners: number | null;
+  readonly: boolean;
+  geomModal: boolean;
+  warp: boolean;
+  locked: boolean;
+  sameLayer: boolean;
+}): boolean {
+  return !f.readonly && !f.geomModal && !f.warp && !f.locked && f.sameLayer && !!f.corners && f.corners === 4;
+}
+// ↑ task-28 A：视口骨骼 gizmo 纯逻辑结束
+
+/** `getLayerOutline().corners` 是不是四角轮廓：透视族返回 null（= W15 那条「透视层不能视口拖动」） */
+function boneViewportCorners(layer: number | string): boolean {
+  const c = editor?.getLayerOutline(Number(layer))?.corners;
+  return !!c && c.length === 4;
+}
+
+/** 这个选中层的骨点此刻能不能视口拖拽（准入判定全在纯函数 boneDragPermitted 里，判据真跑它） */
+function boneDraggable(): boolean {
+  if (!editor || !bonePick || selectedId === null) return false;
+  return boneDragPermitted({
+    corners: editor.getLayerOutline(Number(bonePick.layer))?.corners?.length ?? null,
+    readonly: !overlay,
+    geomModal: geomModal(),
+    warp: !!warpTarget(),
+    locked: isLocked(selectedId),
+    sameLayer: same(bonePick.layer, selectedId),
+  });
+}
+
+/** 悬停命中的骨（不可拖时恒 -1） */
+function boneHoverAt(x: number, y: number): number {
+  if (!boneDraggable() || !editor || !bonePick) return -1;
+  return boneHitAt(editor.getBonePoints(Number(bonePick.layer)) ?? [], x, y);
+}
+
+/** 模块级预览：与骨骼面板 boneGroup 的 preview() 同一口径（净增量为 0 就撤掉预览） */
+function bonePreview() {
+  if (!editor || !bonePick) return;
+  void editor
+    .setBonePose(Number(bonePick.layer), bonePick.bone, isZeroDelta(boneDeltaOf(bonePick)) ? null : boneDeltaOf(bonePick))
+    .then(() => drawOverlay())
+    .catch(() => {});
+}
+
+/** 撤掉预览（不清 bonePick）：Esc / 空手势 / 会话失效都走它 */
+function boneClearPreview() {
+  if (!editor || !bonePick) return;
+  void editor.setBonePose(Number(bonePick.layer), bonePick.bone, null).catch(() => {});
+}
+
+/**
+ * pointerdown：命中骨点就开始拖（true = 这一下归骨骼 gizmo，不再进手柄 / 框选 / 图层拖动）。
+ * 半径外、不可拖（透视族 / 操控变形会话 / 只读工程）一律 false —— **不吞事件**，
+ * 原本能拖图层的地方不变（判据有负控）。
+ */
+function boneGrab(e: PointerEvent, x: number, y: number): boolean {
+  if (boneDrag || !boneDraggable() || !editor || !bonePick) return false;
+  const id = Number(bonePick.layer);
+  const pts = editor.getBonePoints(id);
+  const hit = boneGrabTarget(pts ?? [], x, y);
+  if (!hit) return false; // 半径外 / 骨点在相机身后 ⇒ 不吞事件（负控判据咬这条）
+  const i = hit.index;
+  const o = hit.screen;
+  const rot = e.metaKey || e.ctrlKey;
+  const v0 = rot ? editor.screenDeltaToLocal(id, x - o[0], y - o[1]) : null;
+  if (rot && !v0) return false;
+  // 命中的不是面板当前选中的骨：切过去（与面板 reselect({bone}) 同口径：撤旧预览 + 清未提交增量 + 重画面板）
+  if (i !== bonePick.bone) {
+    boneClearPreview();
+    bonePick = { ...bonePick, bone: i, t: [0, 0, 0], r: [0, 0, 0], s: [1, 1, 1] };
+    renderInspector();
+  }
+  boneDrag = {
+    pointerId: e.pointerId,
+    layer: id,
+    bone: i,
+    x0: x,
+    y0: y,
+    o: [o[0], o[1]],
+    t0: [...bonePick.t],
+    r0: [...bonePick.r],
+    v0: v0 ? [v0[0], v0[1]] : [0, 0],
+    rot,
+    moved: false,
+  };
+  boneHover = i;
+  stageEl.setPointerCapture(e.pointerId);
+  drawOverlay();
+  return true;
+}
+
+/**
+ * pointermove：拖动中更新预览（不进文档）；没在拖就只更新悬停高亮 + 重画。
+ * 拖动中必须一直返回 true，否则指针移动会顺带把图层拖走（图层拖动是另一条通道）。
+ */
+function boneDragMove(e: PointerEvent, x: number, y: number): boolean {
+  if (geomModal() || !editor || !bonePick) return false;
+  const d = boneDrag;
+  if (!d) {
+    const i = boneHoverAt(x, y);
+    if (i !== boneHover) {
+      boneHover = i;
+      drawOverlay();
+    }
+    return false;
+  }
+  if (e.pointerId !== d.pointerId) return true;
+  const dx = x - d.x0;
+  const dy = y - d.y0;
+  // 不足一像素：不预览（不写引擎）、也不算「拖过」——松手时不提交、不产生空撤销步
+  if (!d.moved && Math.hypot(dx, dy) < BONE_DRAG_MIN) return true;
+  d.moved = true;
+  if (!same(bonePick.layer, d.layer)) return true;
+  if (d.rot) {
+    const v = editor.screenDeltaToLocal(d.layer, x - d.o[0], y - d.o[1]);
+    if (!v) return true;
+    bonePick.r = boneRotateTo(d.r0, boneSweepLocal(d.v0, v));
+  } else {
+    const loc = editor.screenDeltaToLocal(d.layer, dx, dy);
+    if (!loc) return true;
+    bonePick.t = boneMoveTo(d.t0, loc);
+  }
+  bonePreview();
+  drawOverlay();
+  return true;
+}
+
+/**
+ * pointerup / cancel：真拖过就提交一次（applyBoneEdit = 骨骼面板「应用」那条通道 = 一步 ⌘Z），
+ * 没拖过就只清预览 —— 不提交、不产生空撤销步。
+ */
+function boneDrop(e: PointerEvent) {
+  const d = boneDrag;
+  if (!d || e.pointerId !== d.pointerId) return;
+  boneDrag = null;
+  if (!editor || !bonePick || !same(bonePick.layer, d.layer)) return;
+  if (!d.moved) {
+    boneClearPreview();
+    return;
+  }
+  const info = editor.getModelInfo(d.layer);
+  const clip = info?.animations.find((c) => c.id === bonePick!.clip);
+  if (!info || !clip || clip.frames <= 0) {
+    boneClearPreview();
+    return;
+  }
+  const node = doc ? findNode(doc.roots, d.layer) : null;
+  const rate = node ? (getAnimLayers(node.obj).find((l) => l.animation === clip.id)?.rate ?? 1) : 1;
+  // 帧号与骨骼面板同口径：pick.frame 为空就按当前时刻（动画层 rate）算
+  const frame = Math.min(clip.frames - 1, bonePick.frame ?? clipFrameAt(clip, editor.time * rate));
+  suppressClick = true; // 真拖过：这次 pointerup 之后的 click 不算「点选」，免得换掉选中层
+  const bone = bonePick.bone;
+  void applyBoneEdit(
+    d.layer,
+    { animId: clip.id, bone, frame, delta: boneDeltaOf(bonePick), radius: bonePick.radius },
+    info.bones[bone]?.name || `#${bone}`,
+    clip.name || `#${clip.id}`,
+  )
+    .then(() => renderInspector())
+    .catch(() => {});
+}
+
+/**
+ * Esc：取消进行中的视口骨骼拖拽。**零副作用**：不提交、不产生空撤销步，预览清回 null，
+ * bonePick 的未提交增量回到抓取前的基线（选中层不动）。返回 true = 吃掉了这次按键。
+ *
+ * 注意指针还按着：松手后浏览器照样会补一次 click。那次 click 落回画面点选通道会把
+ * 「取消掉的手势」当成一次点选（换层 / 取消选中 ⇒ 骨骼面板跟着没了）。所以这里顺手把
+ * suppressClick 置位，让这一次残留 click 不参与点选 —— 取消就是取消，什么都不该发生。
+ */
+function boneCancelDrag(): boolean {
+  const d = boneDrag;
+  if (!d) return false;
+  boneDrag = null;
+  boneClearPreview();
+  if (bonePick && same(bonePick.layer, d.layer)) bonePick = { ...bonePick, t: [...d.t0], r: [...d.r0] };
+  suppressClick = true;
+  renderInspector();
+  drawOverlay();
+  return true;
 }
 
 // ---------- 操控变形（Puppet Warp，伪 Live2D） ----------

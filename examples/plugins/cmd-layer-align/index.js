@@ -84,10 +84,9 @@ var index_default = definePlugin({
     const doc = ctx.get("doc");
     const i18n = ctx.get("i18n");
     const run = commands(doc, i18n);
-    const reg = ctx.get("commands").registry;
     const has = () => doc.current() !== null;
-    ctx.effect(() => reg.add({ id: "layerAlign.center", title: { "zh-CN": "图层居中", en: "Center layer" }, keys: "Mod+Shift+K", when: has, run: run.center }, ctx.name));
-    ctx.effect(() => reg.add({ id: "layerAlign.reset", title: { "zh-CN": "缩放 / 旋转归位", en: "Reset scale / rotation" }, keys: "Mod+Shift+U", when: has, run: run.reset }, ctx.name));
+    ctx.effect(() => ctx.get("commands").register({ id: "layerAlign.center", title: { "zh-CN": "图层居中", en: "Center layer" }, keys: "Mod+Shift+K", when: has, run: run.center }, ctx.name));
+    ctx.effect(() => ctx.get("commands").register({ id: "layerAlign.reset", title: { "zh-CN": "缩放 / 旋转归位", en: "Reset scale / rotation" }, keys: "Mod+Shift+U", when: has, run: run.reset }, ctx.name));
     const ui = ctx.get("ui");
     const button = (id, label, title, cmd) => ctx.effect(
       () => ui.add("toolbar", {

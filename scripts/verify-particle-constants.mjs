@@ -20,13 +20,50 @@
  *   · 动态导入段不碰 GL：`particles.js` 的纯函数（时序/绳长/段数）在裸 node 下可执行。
  */
 import fs from "node:fs";
+import os from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { build } from "esbuild";
 
 const here = join(fileURLToPath(import.meta.url), "..");
 const ROOT = join(here, "..");
 const R = join(ROOT, "renderer/vendor/we-scene/render/");
 const PKG = join(ROOT, "renderer/vendor/we-scene/pkg/");
+const PP = join(ROOT, "editor/particle-params.ts");
+
+// 变异红测用：esbuild 把编辑器的 TS 就地打成 mjs，覆盖只在内存里生效，绝不落盘。
+const tmpRoot = fs.mkdtempSync(join(os.tmpdir(), "verify-particle-params-"));
+process.on("exit", () => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+
+const PP_ENTRY = `export * from "./editor/particle-params.ts";\nexport { particleComponents as componentRegistry, BUILTIN_PARTICLE_COMPONENTS } from "./editor/particles.ts";\n`;
+
+/** 打 editor/particle-params.ts（连带 ./particles 的注册表）成临时 mjs；overrides 按绝对路径换源码 */
+async function loadParticleParams(overrides = {}) {
+  const plugins = Object.keys(overrides).length
+    ? [
+        {
+          name: "mutate",
+          setup(b) {
+            b.onLoad({ filter: /\.ts$/ }, (a) => (overrides[a.path] !== undefined ? { contents: overrides[a.path], loader: "ts" } : undefined));
+          },
+        },
+      ]
+    : [];
+  const out = await build({
+    stdin: { contents: PP_ENTRY, resolveDir: ROOT, loader: "ts", sourcefile: "pp-entry.ts" },
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    plugins,
+    logLevel: "silent",
+  });
+  const tmp = join(tmpRoot, `pp-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(tmp, out.outputFiles[0].text);
+  return import(pathToFileURL(tmp).href);
+}
 
 let failed = 0;
 function check(ok, msg) {
@@ -223,6 +260,134 @@ console.log("\n[9] 构造期端到端（真建一个 ParticleSystem，不需要 
     "该初始化器体仍应带文档化的缺省 scale 0.1（体不可达 ≠ 可以消失）",
   );
 }
+
+// ── [10] D2：插件贡献的粒子组件参数（静态表未命中 → particleComponents 注册表回落） ──
+// ── [11] L4：粒子文件 BOM 与序列化保真 ──
+// 两段都真跑 editor/particle-params.ts（esbuild 打包成临时 mjs），不 grep 源码。
+
+/** D2/L4 全套判据：不直接打印，变异红测复用同一份 */
+async function ppSuite(P) {
+  const res = [];
+  const check = (ok, msg) => res.push({ ok: !!ok, msg });
+  const reg = P.componentRegistry;
+  const specStatus = (kind, name) => P.particleComponents({ [kind]: [{ name }] })[0]?.status;
+  const keys = (fields) => fields.map((f) => `${f.key}:${f.type}`).join(",");
+
+  // ── D2：静态表未命中时的回落 ──
+  // 先钉住「死通道」到底有几只：引擎认识的组件里，静态表没有 spec 的**恰好**是 positionoffsetrandom
+  // 一个（清单核对过：oscillatealpha / oscillateposition / oscillatesize 都早有静态 spec）。
+  const staticKeys = new Set(P.PARTICLE_SPECS.map((s) => `${s.kind}:${s.name}`));
+  const dead = P.BUILTIN_PARTICLE_COMPONENTS.map((c) => `${c.kind}:${c.id}`).filter((k) => !staticKeys.has(k));
+  check(dead.join() === "operator:positionoffsetrandom",
+    `引擎认识但静态表没有 spec 的组件恰好一个（实得 ${JSON.stringify(dead)}）⇒ D2 回落点就在它身上`);
+  check(P.particleSpec("operator", "oscillatealpha") !== null,
+    "对照：被点名过的 oscillatealpha 其实早有静态 spec（不靠注册表回落）");
+  check(
+    P.particleSpec("operator", "positionoffsetrandom") === null && specStatus("operator", "positionoffsetrandom") === "noPanel",
+    "没有插件贡献时：operator:positionoffsetrandom 无 spec ⇒ noPanel（引擎认识但本版无控件 = 死通道）",
+  );
+  const params = [
+    { key: "frequencymin", type: "float", min: 0, max: 60, step: 0.01, label: "频率下限" },
+    { key: "scalemin", type: "float" },
+    { key: "mode", type: "enum", options: [{ value: "a", label: "A" }, "b"] },
+    { key: "tint", type: "color" },
+    { key: "uv", type: "vec4" },
+    { key: "tex", type: "texture" },
+    { key: "flag", type: "bool" },
+    { key: "note", type: "string", label: { zh: "备注", en: "Note" } },
+  ];
+  const off = reg.add({ id: "positionoffsetrandom", kind: "operator", params }, "ext:verify");
+  const spec = P.particleSpec("operator", "positionoffsetrandom");
+  check(
+    !!spec && keys(spec.fields) === "frequencymin:float,scalemin:float,mode:enum,flag:bool,note:string",
+    `注册表有 params ⇒ particleSpec 非 null 且字段逐项等于转换结果（实得 ${spec ? keys(spec.fields) : "null"}）`,
+  );
+  check(
+    !!spec && spec.fields.length === 5 && spec.fields[0].min === 0 && spec.fields[0].max === 60 && spec.fields[0].step === 0.01 && spec.fields[0].label === "频率下限",
+    "转换带走 min / max / step 与 string 形态 label",
+  );
+  check(
+    !!spec && spec.fields.find((f) => f.key === "note")?.label === undefined && spec.fields.find((f) => f.key === "mode")?.options?.join() === "a,b",
+    "label 只取 string 形态（{zh,en} 表不塞，面板回落字段名）；enum 的 {value,label} 取 value",
+  );
+  check(specStatus("operator", "positionoffsetrandom") === "ok", "插件补了 params ⇒ 面板状态由 noPanel 升为 ok（D2 的意义）");
+  const view = P.particleComponentViews({ operator: [{ name: "positionoffsetrandom", frequencymin: 3 }] })[0];
+  check(
+    view?.status === "ok" && view.views.length === 1 && view.views[0].key === "operator[0].frequencymin",
+    "真跑消费侧：文件里写了 frequencymin ⇒ 面板出该字段（此前一个字段都没有）",
+  );
+  check(P.particleSpec("operator", "PositionOffsetRandom") !== null && specStatus("operator", "PositionOffsetRandom") === "ok",
+    "注册表回落大小写不敏感（文件里写 PositionOffsetRandom 也命中）");
+  check(P.particleSpec("operator", "zzz-nope-x") === null && specStatus("operator", "zzz-nope-x") === "unknown",
+    "纯造出来的未知名仍是 unknown（不许被回落吞成 ok）");
+  const offStatic = reg.add({ id: "alphafade", kind: "operator", params: [{ key: "nope", type: "float" }] }, "ext:verify");
+  check(P.particleSpec("operator", "alphafade")?.fields.some((f) => f.key === "fadeintime") === true,
+    "静态表命中的组件优先用静态 spec，插件同键贡献不改写它");
+  offStatic();
+  off();
+  const offEmpty = reg.add({ id: "positionoffsetrandom", kind: "operator", params: [{ key: "tint", type: "color" }] }, "ext:verify");
+  check(
+    P.particleSpec("operator", "positionoffsetrandom") === null && specStatus("operator", "positionoffsetrandom") === "noPanel",
+    "params 全是粒子侧没有控件的类型 ⇒ 转换后 0 字段 ⇒ 仍 noPanel（不静默变 ok）",
+  );
+  offEmpty();
+  check(
+    specStatus("initializer", "turbulentvelocityrandom") === "unsupported" && specStatus("emitter", "boxrandom") === "ok" && P.particleSpec("controlpoint", "") !== null,
+    "三态回归：engineUnsupported=unsupported / 静态表命中=ok / controlpoint 恒有 spec",
+  );
+  off();
+  check(P.particleSpec("operator", "positionoffsetrandom") === null && specStatus("operator", "positionoffsetrandom") === "noPanel",
+    "撤回贡献（Disposer）后回落到 noPanel");
+
+  // ── L4：BOM 与序列化保真 ──
+  const obj = { maxcount: 12, emitter: [{ name: "boxrandom", rate: 3 }] };
+  const plain = JSON.stringify(obj);
+  const pBom = P.parseParticleFile("\uFEFF" + plain);
+  check(!!pBom && JSON.stringify(pBom) === JSON.stringify(P.parseParticleFile(plain)),
+    "带 UTF-8 BOM 的文本能 parse，且与不带 BOM 结果逐键等价（此前整份 parse 失败 ⇒ 面板空白）");
+  check(pBom?.maxcount === 12, "带 BOM 时字段真的读得出来（不是「回落 null 也算过」）");
+  check(P.parseParticleFile(plain)?.maxcount === 12 && P.parseParticleFile("{oops") === null && P.parseParticleFile("[1]") === null,
+    "不带 BOM 行为不变；非法 JSON / 顶层不是对象仍返回 null");
+  const text = new TextDecoder().decode(P.serializeParticleFile(obj));
+  check(JSON.stringify(P.parseParticleFile(text)) === JSON.stringify(obj), "序列化产物 parse 回来与原对象逐键等价");
+  check(text.startsWith('{\n  "maxcount": 12'), "序列化仍是 JSON.stringify(..., 2) 的 2 空格缩进（既有口径）");
+  return res;
+}
+
+console.log("\n[10] D2：插件贡献的粒子组件参数通道（真跑 editor/particle-params.ts）");
+console.log("[11] L4：粒子文件 BOM 与序列化保真");
+const ppBefore = fs.readFileSync(PP, "utf8");
+const ppSha = createHash("sha256").update(ppBefore).digest("hex");
+for (const r of await ppSuite(await loadParticleParams())) {
+  console[r.ok ? "log" : "error"](`  ${r.ok ? "✓" : "✗"} ${r.msg}`);
+  if (!r.ok) failed++;
+}
+
+console.log("\n[12] 变异红测（把判定改坏 → 对应判据必须变红；覆盖只在内存里，不落盘）");
+const ppMutants = [
+  ["删掉注册表回落", "  const fields = contributedFields(kind, name);", "  const fields = null;"],
+  ["回落对未知名也命中", "    if (`${c.kind}:${c.id}`.toLowerCase() !== want) continue;", "    void want;"],
+  ["noPanel 被吞成 ok", '  if (kind !== "controlpoint" && isKnownComponent(kind, name)) return "noPanel";', '  return "ok";'],
+  ["BOM 不再剥离", 'JSON.parse(text.replace(/^\\uFEFF/, ""))', "JSON.parse(text)"],
+  ["color/vec4/texture 不再跳过", "    const type = SCHEMA_FIELD_TYPES[f.type];", '    const type = SCHEMA_FIELD_TYPES[f.type] ?? "float";'],
+];
+for (const [label, from, to] of ppMutants) {
+  if (!ppBefore.includes(from)) {
+    console.error(`  ✗ ${label}：注入点不存在（源码改过？同步更新本脚本）`);
+    failed++;
+    continue;
+  }
+  let red = 0;
+  try {
+    red = (await ppSuite(await loadParticleParams({ [PP]: ppBefore.replace(from, to) }))).filter((r) => !r.ok).length;
+  } catch {
+    red = 1; // 变异把模块弄到打不出来，也算被逮到
+  }
+  console[red ? "log" : "error"](`  ${red ? "✓" : "✗"} ${label} → ${red} 条判据变红`);
+  if (!red) failed++;
+}
+check(createHash("sha256").update(fs.readFileSync(PP, "utf8")).digest("hex") === ppSha,
+  "变异只在内存里覆盖（esbuild overrides），跑完源文件 sha256 与运行前逐字一致");
 
 console.log(failed === 0 ? "\nverify-particle-constants: 全部通过 ✓" : `\nverify-particle-constants: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

@@ -2,6 +2,11 @@
 // 纯数据层，不碰 DOM；跨文档靠内存载荷 + localStorage 兜底（刷新 / 换标签页后仍能粘贴）。
 
 import { rebuildTree, type EditorDoc, type SceneObject } from "./doc";
+import { referencedModels } from "./create";
+import { referencedEffects } from "./effects";
+import { referencedParticles } from "./particles";
+import { referencedSounds } from "./sound";
+import { referencedFonts } from "./text";
 
 /** 跨文档传递的剪贴板格式；版本号变了就整条丢弃（宁可不粘贴，也不写坏文档） */
 export const LAYER_CLIP_FORMAT = "wewallgl.layer-clip";
@@ -138,6 +143,52 @@ export function pasteLayerClip(doc: EditorDoc, clip: LayerClip, offset: readonly
   list.push(...clones);
   rebuildTree(doc);
   return added;
+}
+
+/**
+ * task-28 B（§8.2 L5「跨文档粘贴不搬资源」）：粘贴前算出「子树引用、而目标工程资源表里没有」的文件。
+ *
+ * 字段清单**不在这里另写一份**：把子树包成一个「只有 scene.objects 的假 doc」，直接复用文档侧既有的
+ * 收集器（image / model = create.referencedModels，effects[].file = effects.referencedEffects，
+ * particle / sound / font = particles / sound / text 各自的 referenced*）。以后文档新增一类资源引用，
+ * 这里自动跟上，不会出现两份会漂移的表。
+ *
+ * 注意：资源表（OverlayAssets）挂在编辑器运行时上、**不在 EditorDoc 上**（doc 只有 scene / puppets 等），
+ * 所以判缺的入参是 available（editor/main.ts 传 assets.list()），不是 doc。
+ * 检测**只提示、不阻断粘贴、也不自动拷贝资源**（自动把文件搬进目标工程是另一件事，见 main.ts 的粘贴路径）。
+ */
+const refDoc = (objs: readonly SceneObject[]): EditorDoc =>
+  ({ type: "scene", scene: { objects: objs as SceneObject[] } }) as unknown as EditorDoc;
+
+/** 子树引用的全部资源路径（去重、按既有收集器顺序：模型 / 图片 → 效果 → 粒子 → 声音 → 字体） */
+export function clipRefPaths(clip: LayerClip | null): string[] {
+  const objs = clip?.objs?.map((e) => e.obj) ?? [];
+  if (!objs.length) return [];
+  const d = refDoc(objs);
+  return [
+    ...new Set<string>([
+      ...referencedModels(d),
+      ...referencedEffects(d),
+      ...referencedParticles(d),
+      ...referencedSounds(d),
+      ...referencedFonts(d),
+    ]),
+  ];
+}
+
+/** 目标资源表里没有的引用（保持输入顺序）。available 传 assets.list() */
+export function missingPasteResources(refs: readonly string[], available: Iterable<string>): string[] {
+  const have = new Set(available);
+  return refs.filter((p) => !!p && !have.has(p));
+}
+
+/** 提示里最多列几个文件名，其余折成「另有 M 个」 */
+export const PASTE_MISSING_SHOWN = 3;
+
+/** 提示的两段（纯函数，判据真跑）：shown = 前 N 条，rest = 折起来的条数 */
+export function pasteMissingHint(missing: readonly string[], n = PASTE_MISSING_SHOWN): { shown: string[]; rest: number } {
+  const shown = missing.slice(0, Math.max(0, n));
+  return { shown, rest: Math.max(0, missing.length - shown.length) };
 }
 
 /**

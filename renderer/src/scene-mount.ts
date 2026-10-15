@@ -420,6 +420,60 @@ async function loadSceneSource(
   return entry;
 }
 
+/**
+ * 对象脚本字段白名单 —— **必须与引擎同源**：`renderer/vendor/we-scene/scene/parse.js:552-568`
+ * 用同一张 12 字段表把 `{script, value, scriptproperties}` 形态收成解析产物 `objectScripts`
+ * （引擎没导出这个常量，所以这里就地定义；判据 `scripts/verify-editor-model.mjs` 做
+ * 「两处逐字相等」的正向断言，防日后漂移 —— 改一处必须同批改另一处）。
+ * 热增判定读的是**原始 scene.json 对象**，那里没有 `objectScripts` 这个解析产物键，
+ * 只有字段级脚本形态，所以必须按同一张表再判一次（§8.2 [中-5]）。
+ */
+export const OBJECT_SCRIPT_FIELDS = [
+  "scale",
+  "origin",
+  "color",
+  "alpha",
+  "brightness",
+  "angles",
+  "visible",
+  "maxwidth",
+  "pointsize",
+  "volume",
+  "intensity",
+  "exponent",
+] as const;
+
+/** 原始 scene 对象上是否有**字段级脚本**（= 引擎 parse.js 收进 objectScripts 的同一条件）：
+ *  `v && typeof v === 'object' && typeof v.script === 'string' && v.script`，白名单同上。 */
+export function hasObjectFieldScript(obj: unknown): boolean {
+  if (!obj || typeof obj !== "object") return false;
+  const o = obj as Record<string, unknown>;
+  for (const field of OBJECT_SCRIPT_FIELDS) {
+    const v = o[field];
+    if (v && typeof v === "object" && typeof (v as { script?: unknown }).script === "string" && (v as { script: string }).script) return true;
+  }
+  return false;
+}
+
+/** 热增拒绝判定的 **obj 分支**（`spec.obj` = 原始 scene.json 对象；另一支是 duplicateOf）。
+ *  hotAddReject 的 obj 分支逐字调它 —— 抽成纯函数是为了让离线判据能真跑这段接线
+ *  （真 `mountScene` 要 WebGL，Node 侧起不来；判据 scripts/verify-editor-model.mjs 直接调它）。
+ *  `residentTexture` 管「贴图是否已驻留」，由调用方注入（装配期查 scene.layers）。 */
+export function hotAddRejectForObject(obj: unknown, residentTexture: (image: string) => string | null): string | null {
+  if (!obj || typeof obj !== "object") return "缺少 duplicateOf 或 obj";
+  const o = obj as Record<string, unknown>;
+  if (o.parent !== undefined && o.parent !== null) return "带父级的图层要等容器变换语义定案（M5），热增暂不支持";
+  if (o.particle) return "粒子系统装配是异步的，热增暂不支持（走整场景重挂）";
+  if (o.model) return "模型装配是异步的，热增暂不支持（走整场景重挂）";
+  if (o.text !== undefined && o.text !== null) return "文字层装配要重建离屏画布与字体表，热增暂不支持（走整场景重挂）";
+  if (o.image && !residentTexture(String(o.image))) return `贴图未驻留，热增拿不到 textureName（走整场景重挂）: ${o.image}`;
+  if (o.objectScripts) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";
+  // spec.obj 是**原始 scene.json 对象**：字段级脚本形态（`angles: {script: …}`）在那里还没有
+  // `objectScripts` 这个解析产物键（引擎 parse.js:552-568 才把它收起来），必须按同一张白名单再判一次。
+  if (hasObjectFieldScript(o)) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";
+  return null;
+}
+
 export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   clear(rt);
   // GPU 探测必须在**算 DPR 之前**：软件渲染要把画布压到 SOFTWARE_DPR_CAP，
@@ -8173,15 +8227,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           return null;
         }
         const obj: any = spec.obj;
-        if (!obj || typeof obj !== "object") return "缺少 duplicateOf 或 obj";
-        if (obj.parent !== undefined && obj.parent !== null) return "带父级的图层要等容器变换语义定案（M5），热增暂不支持";
-        if (obj.particle) return "粒子系统装配是异步的，热增暂不支持（走整场景重挂）";
-        if (obj.model) return "模型装配是异步的，热增暂不支持（走整场景重挂）";
-        if (obj.text !== undefined && obj.text !== null) return "文字层装配要重建离屏画布与字体表，热增暂不支持（走整场景重挂）";
-        if (obj.image && !residentTextureFor(String(obj.image))) {
-          return `贴图未驻留，热增拿不到 textureName（走整场景重挂）: ${obj.image}`;
-        }
-        if (obj.objectScripts) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";
+        // obj 分支的判定体抽到模块级纯函数 hotAddRejectForObject（同一份代码，离线判据也跑它）
+        const objReason = hotAddRejectForObject(obj, residentTextureFor);
+        if (objReason) return objReason;
         return null;
       };
       /** 图层拆除：把被删子树从所有装配期登记表里摘干净。

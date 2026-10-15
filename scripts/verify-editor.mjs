@@ -8313,8 +8313,33 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
   await storeV.save(snap, draftMod.draftSlotFor({ vdirId }));
   check((await beV.listMeta()).length === 1 && (await vdirMod.listVirtualProjects(beV)).length === 1 && (await vdirMod.listVirtualProjects(beV))[0].id === vdirId,
     "草稿不写 vdir 的工程 meta：虚拟工程列表里不会多出一条假工程");
-  check(vdirId !== draftMod.DRAFT_ID && json(await beV.keys(draftMod.DRAFT_ID)) === json([`vdir:${vdirId}`]),
-    "草稿只落在保留 id 的文件键空间里，和工程 id 的键空间不重叠");
+  // 草稿键空间与工程键空间不重叠。task-30 的 meta 设计给每个槽**多写一条** NUL 前缀的同空间 meta 键
+  // （`draft.ts` 的 `DRAFT_META_PREFIX`），所以「DRAFT_ID 下恰有一只槽」不再是完整契约：
+  // 契约是「恰一只槽键 + 每槽恰一条 meta 键，剥掉前缀后与那组槽名一一对应」。前缀取常量，不硬写字面量。
+  const draftKeysSrc = `(keys, prefix, slot) => {
+    const slots = keys.filter((k) => !k.startsWith(prefix));
+    const metas = keys.filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
+    return json(slots) === json([slot]) && json(metas) === json(slots);
+  }`;
+  const draftKeysOk = new Function("json", `return ${draftKeysSrc};`)(json);
+  const dKeysV = await beV.keys(draftMod.DRAFT_ID);
+  const dSlotV = draftMod.draftSlotFor({ vdirId });
+  check(vdirId !== draftMod.DRAFT_ID && draftKeysOk(dKeysV, draftMod.DRAFT_META_PREFIX, dSlotV),
+    "草稿只落在保留 id 的文件键空间里：一只槽 + 每槽一条 meta（剥前缀后与槽名一一对应），都不与工程 id 的键空间重叠");
+  // 变异：把这条新判据改坏（前缀取错 / 不剥前缀就比）必须变红 —— 证明它真的咬人，不是放宽后的空断言。
+  for (const m of [
+    { name: "meta 前缀取错（拿槽名当 meta 前缀）", from: "k.startsWith(prefix)", to: "k.startsWith(slot)" },
+    {
+      name: "meta 键不剥前缀就与槽名比",
+      from: "keys.filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))",
+      to: "keys.filter((k) => k.startsWith(prefix))",
+    },
+  ]) {
+    const dSrc = draftKeysSrc.replaceAll(m.from, m.to);
+    check(dSrc !== draftKeysSrc, `变异「${m.name}」确实改动了判据源码`);
+    const dBad = new Function("json", `return ${dSrc};`)(json);
+    check(dBad(dKeysV, draftMod.DRAFT_META_PREFIX, dSlotV) === false, `变异「${m.name}」被这条判据咬红（真数据下转红）`);
+  }
   await beV.write(vdirId, "scene.json", new Blob(["{}"], { type: "application/json" }));
   check((await storeV.load("session")) === null && (await storeV.load(`vdir:${vdirId}`)) !== null
     && json(await beV.keys(vdirId)) === json(["scene.json"]),
@@ -12359,6 +12384,520 @@ section("task-27 ①. W16 贴图缩略图 + `.tex` 原图尺寸（editor/main.ts
   check(fs.readFileSync(mainPath27, "utf8") === main27, "变异全程未落盘：main.ts 与判据读到的逐字一致（sha256 等价）");
   const { createHash } = await import("node:crypto");
   console.log(`  · task-27 ① main.ts sha256=${createHash("sha256").update(fs.readFileSync(mainPath27)).digest("hex").slice(0, 16)}…`);
+}
+
+// ─────────────── task-28 A：W18a 视口骨骼 gizmo（拖拽平移 / 旋转） ───────────────
+section("task-28 A. 视口骨骼 gizmo（editor/main.ts 纯逻辑真跑 + 接线守门 + 变异红测）");
+{
+  const mainPath28 = path.join(ROOT, "editor/main.ts");
+  const i18nPath28 = path.join(ROOT, "editor/i18n.ts");
+  const main28 = fs.readFileSync(mainPath28, "utf8");
+  const i18n28 = fs.readFileSync(i18nPath28, "utf8");
+  const A28 = "// ↓ task-28 A：视口骨骼 gizmo 纯逻辑";
+  const B28 = "// ↑ task-28 A：视口骨骼 gizmo 纯逻辑结束";
+  const pure28 = (src) => {
+    const a = src.indexOf(A28);
+    const b = src.indexOf(B28, a + 1);
+    return a < 0 || b < 0 ? null : src.slice(a, b);
+  };
+  /** 去注释再扫接线（注释里写到的调用不算接线；task-17 踩过这个坑） */
+  const strip28 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // 这一片只引用**一个**运行时符号 `rotateZ`（gizmo.ts 的旋转柄角度数学，页面复用它而不是内联第二份；
+  // I. 接线判据明令禁止页面里出现 `Math.atan2`）。切片落在 tmpRoot，相对 import 解析不了 ⇒ 注入一条
+  // 绝对路径的 gizmo 导入；注入的是**真源码**，其余逐字就是 main.ts 里那一段。
+  const imp28 = `import { rotateZ } from ${JSON.stringify(path.join(ROOT, "editor/gizmo.ts"))};\n`;
+  let seq28 = 0;
+  const loadPure28 = async (slice) => {
+    const p = path.join(tmpRoot, `bone-pure-${seq28++}.ts`);
+    fs.writeFileSync(p, imp28 + slice);
+    const r = await build({
+      entryPoints: [p],
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "neutral",
+      target: "es2022",
+      logLevel: "silent",
+    });
+    const mjs = p.replace(/\.ts$/, ".mjs");
+    fs.writeFileSync(mjs, r.outputFiles[0].text);
+    return import(pathToFileURL(mjs).href);
+  };
+  const pureBad28 = (M) => {
+    const bad = [];
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    for (const k of ["boneHitAt", "boneGrabTarget", "boneSweepLocal", "boneNormAngle", "boneMoveTo", "boneRotateTo", "boneDragPermitted"]) {
+      if (!M || typeof M[k] !== "function") return [`task-28 A 切片里的纯逻辑符号不全（缺 ${k}；源码形状变了？）`];
+    }
+    // ① 命中半径：半径内命中（含边界）、半径外不命中、最近优先、屏幕外骨点跳过
+    const pts = [{ screen: [100, 100] }, { screen: [140, 140] }, { screen: null }];
+    need(M.BONE_HIT_R === 9 && M.BONE_DRAG_MIN === 1, `①命中半径 / 位移门槛常量变了（got ${M.BONE_HIT_R}/${M.BONE_DRAG_MIN}）`);
+    need(M.boneHitAt(pts, 100, 100) === 0, "①骨点正上方没命中");
+    need(M.boneHitAt(pts, 109, 100) === 0, "①半径内（9px）没命中");
+    need(M.boneHitAt(pts, 110, 100) === -1, "①半径外（10px）也命中了（命中区比 affordance 大）");
+    need(M.boneHitAt(pts, 136, 136) === 1, "①第二个骨点附近没命中");
+    need(M.boneHitAt(pts, 120, 120) === -1, "①两个骨点都在半径外却命中了");
+    need(M.boneHitAt(pts, 100, 100, 3) === 0 && M.boneHitAt(pts, 105, 100, 3) === -1, "①显式半径参数没生效（判据/引擎不能调半径）");
+    need(M.boneHitAt([], 0, 0) === -1 && M.boneHitAt([{ screen: null }], 0, 0) === -1, "①空骨点表 / 相机身后的骨点没跳过");
+    need(M.boneHitAt([{ screen: [100, 100] }, { screen: [105, 100] }], 104, 100) === 1, "①两个骨点都在半径内时没取最近的");
+    // ② 抓取判定（不吞事件的负控真跑）：半径外必须 null
+    need(M.boneGrabTarget(pts, 100, 100)?.index === 0, "②半径内没给出抓取目标");
+    need(M.boneGrabTarget(pts, 120, 120) === null, "②半径外也吞事件（骨点把图层拖动/框选抢走了）");
+    need(M.boneGrabTarget([{ screen: null }], 0, 0) === null, "②相机身后的骨点也吞事件");
+    const tgt = M.boneGrabTarget(pts, 101, 101);
+    need(!!tgt && tgt.screen[0] === 100 && tgt.screen[1] === 100, "②抓取目标没带回骨点屏幕原点（旋转支点会错）");
+    // ③ 局部角差：方向（局部 y 向上）+ 跨 ±180° 走短路，不整圈倒转
+    need(Math.abs(M.boneSweepLocal([1, 0], [1, 0])) < 1e-12, "③零角差没归零");
+    const q1 = M.boneSweepLocal([1, 0], [0, 1]);
+    need(Math.abs(q1 - Math.PI / 2) < 1e-12, `③局部角差方向反了 / 幅度不对（局部 y 向上时 +x→+y 应是 +π/2，got ${q1}）`);
+    const q2 = M.boneSweepLocal([1, 0], [0, -1]);
+    need(Math.abs(q2 + Math.PI / 2) < 1e-12, `③局部角差符号反了（+x→-y 应是 -π/2，got ${q2}）`);
+    for (const d of [0, 0.3, -0.7, 1.2]) {
+      const v0 = [Math.cos(d), Math.sin(d)];
+      const v1 = [Math.cos(d + 0.5), Math.sin(d + 0.5)];
+      need(Math.abs(M.boneSweepLocal(v0, v1) - 0.5) < 1e-9, `③一般角差算错（起点 ${d} 转 0.5rad，got ${M.boneSweepLocal(v0, v1)}）`);
+    }
+    const sw = M.boneSweepLocal([-0.984807753012208, 0.17364817766693033], [-0.984807753012208, -0.17364817766693033]);
+    need(sw > 0 && Math.abs(sw - 0.3490658503988659) < 1e-9, `③跨 ±180° 时没走短路（会倒转一整圈，got ${sw}）`);
+    const wrap = M.boneSweepLocal([-1, 0], [1, 0]);
+    need(Math.abs(Math.abs(wrap) - Math.PI) < 1e-12, `③两极之间应归到 ±π（got ${wrap}）`);
+    for (const [a, b] of [[0, 3], [3, -3], [-1, 2], [2.9, -2.9]]) {
+      const v0 = [Math.cos(a), Math.sin(a)];
+      const v1 = [Math.cos(b), Math.sin(b)];
+      const got = M.boneSweepLocal(v0, v1);
+      need(Math.abs(got) <= Math.PI + 1e-12, `③角差没归一（|sweepLocal(${a},${b})| = ${Math.abs(got)} > π）`);
+      need(Math.abs(M.boneNormAngle(got) - got) < 1e-12, `③boneNormAngle 对已归一的角度又动了它（got ${M.boneNormAngle(got)}）`);
+    }
+    // ④ 平移 / 旋转
+    need(JSON.stringify(M.boneMoveTo([1, 2, 3], [4, 5])) === "[5,7,3]", "④平移没累加局部位移");
+    const base = [1, 2, 3];
+    M.boneMoveTo(base, [4, 5]);
+    need(JSON.stringify(base) === "[1,2,3]", "④boneMoveTo 改了入参（面板基线被吃掉）");
+    need(JSON.stringify(M.boneMoveTo([1, 2, 3], [0, 0])) === "[1,2,3]", "④零位移也改动了 t");
+    const rot = M.boneRotateTo([0, 0, 10], Math.PI / 2);
+    need(Math.abs(rot[2] - 100) < 1e-9 && rot[0] === 0 && rot[1] === 0, "④旋转角换算不对（面板是度、局部角差是弧度）");
+    need(Math.abs(M.boneRotateTo([0, 0, 0], -Math.PI / 2)[2] + 90) < 1e-9, "④旋转方向反了");
+    // ⑤ 准入：透视族（corners === null）与 W15 同口径一律不进视口拖拽
+    const ok = { corners: 4, readonly: false, geomModal: false, warp: false, locked: false, sameLayer: true };
+    need(M.boneDragPermitted(ok) === true, "⑤正常 2D 层没被允许拖拽骨骼");
+    need(M.boneDragPermitted({ ...ok, corners: null }) === false, "⑤透视族也在视口拖拽名单里（与 W15「透视层不能视口拖动」冲突）");
+    need(M.boneDragPermitted({ ...ok, corners: 0 }) === false, "⑤没有四角轮廓的层被允许拖拽");
+    need(M.boneDragPermitted({ ...ok, readonly: true }) === false, "⑤只读工程还在拖拽（越权写文档）");
+    need(M.boneDragPermitted({ ...ok, geomModal: true }) === false, "⑤几何模态（裁剪/拉伸）里抢走了指针");
+    need(M.boneDragPermitted({ ...ok, warp: true }) === false, "⑤操控变形会话里抢走了钉子拖动");
+    need(M.boneDragPermitted({ ...ok, locked: true }) === false, "⑤锁定层还能拖");
+    need(M.boneDragPermitted({ ...ok, sameLayer: false }) === false, "⑤骨骼面板选的是别的层也在拖");
+    return bad;
+  };
+  const wireBad28 = (src, i18n) => {
+    const bad = [];
+    const s = strip28(src);
+    const raw = src; // 段落边界要在**未剥注释**的源码里找（`// ---------- …` 是注释）
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    // ① 接进既有指针链，且不抢操控变形钉子的优先级
+    const iWarp = s.indexOf("if (warpGrab(e, p.x, p.y)) return;");
+    const iBone = s.indexOf("if (boneGrab(e, p.x, p.y)) return;");
+    need(iBone > 0, "骨点拖拽没接进 pointerdown（骨头拖不动）");
+    need(iWarp > 0 && iBone > iWarp, "骨点抓取没排在操控变形钉子之后（钉子在手柄附近会被抢）");
+    need(/if \(boneDragMove\(e, p\.x, p\.y\)\) return;/.test(s), "拖动中的 pointermove 没接管（会顺带把图层拖走）");
+    need(/stageEl\.addEventListener\("pointerup", boneDrop\);/.test(s), "pointerup 没接 boneDrop（松手不提交）");
+    need(/stageEl\.addEventListener\("pointercancel", boneDrop\);/.test(s), "pointercancel 没接 boneDrop（取消会留下预览）");
+    need(/if \(e\.key === "Escape" && boneCancelDrag\(\)\)/.test(s), "Esc 取消没接线");
+    need(/const hit = boneGrabTarget\(pts \?\? \[\], x, y\);/.test(s), "抓取没走纯函数 boneGrabTarget（命中判定脱管）");
+    need(/return boneDragPermitted\(\{/.test(s), "准入没走纯函数 boneDragPermitted");
+    need(/from "\.\/gizmo"/.test(s) && /\brotateZ,/.test(s), "页面没从 gizmo.ts 取旋转数学（骨点旋转会另长一份，和旋转柄不是同一套）");
+    // ② 拖动中只预览：不写文档、不进撤销栈
+    const fa = raw.indexOf("function boneDragMove(");
+    const fb = raw.indexOf("function boneDrop(", fa + 1);
+    if (fa < 0 || fb < 0) bad.push("boneDragMove / boneDrop 定义缺失");
+    else {
+      const dm = strip28(raw.slice(fa, fb));
+      need(/bonePreview\(\);/.test(dm), "拖动中不预览（松手前看不到结果）");
+      need(!/applyBoneEdit|structEdit|pushUndo|commitMdlEdit/.test(dm), "拖动中写了文档 / 撤销栈（一次手势会变成很多步撤销）");
+      need(/if \(!d\.moved && Math\.hypot\(dx, dy\) < BONE_DRAG_MIN\) return true;/.test(dm), "没有位移门槛（点一下就会产生空撤销步）");
+      need(/boneSweepLocal\(d\.v0, v\)/.test(dm), "拖动中的旋转没走纯函数 boneSweepLocal（角度数学脱管）");
+    }
+    const fc = raw.indexOf("function boneDrop(");
+    const fd = raw.indexOf("function boneCancelDrag(", fc + 1);
+    if (fc < 0 || fd < 0) bad.push("boneDrop / boneCancelDrag 定义缺失");
+    else {
+      const dd = strip28(raw.slice(fc, fd));
+      need(/void editor[\s\S]{0,40}setBonePose\([\s\S]{0,60}null\)/.test(s), "撤预览没把引擎姿势清回 null");
+      need(/if \(!d\.moved\) \{\s*boneClearPreview\(\);\s*return;/.test(dd), "没拖过也提交了（会产生空撤销步）");
+      need(/void applyBoneEdit\(/.test(dd), "松手没走 applyBoneEdit（不进撤销栈 / 不是一步 ⌘Z）");
+      need(/suppressClick = true;/.test(dd), "真拖过的松手没抑制随后的 click（会顺手换掉选中层）");
+      need(!/for \(|while \(/.test(dd), "松手路径里有循环（一次手势会提交多次）");
+    }
+    // ③ Esc：零副作用（不提交、不产生空撤销步、预览清回 null、增量回基线）
+    const fe = raw.indexOf("function boneCancelDrag(");
+    const feEnd = raw.indexOf("// ---------- 操控变形", fe);
+    if (fe < 0 || feEnd < 0) bad.push("boneCancelDrag 定义缺失");
+    else {
+      const cd = strip28(raw.slice(fe, feEnd));
+      need(/boneClearPreview\(\)/.test(cd), "Esc 没清预览（引擎里留着未提交姿势）");
+      need(!/applyBoneEdit|structEdit|pushUndo|commitMdlEdit/.test(cd), "Esc 取消产生了副作用（提交 / 撤销步）");
+      need(/bonePick = \{ \.\.\.bonePick, t: \[\.\.\.d\.t0\], r: \[\.\.\.d\.r0\] \}/.test(cd), "Esc 没把未提交增量退回基线");
+      need(/return true;/.test(cd), "Esc 没吃掉这次按键（会继续走后面的内置快捷键）");
+      // 指针还按着就按了 Esc：松手后浏览器补的那次 click 会落回画面点选通道（换层 / 取消选中）。
+      // 取消必须是零副作用 ⇒ 这里必须把 suppressClick 置位，让那次残留 click 不参与点选。
+      need(/suppressClick = true;/.test(cd), "Esc 取消后残留的 click 没被抑制（会顺手换掉选中层 / 取消选中）");
+    }
+    // ④ 透视场景显式表态 + 命中环 / 光标反馈
+    need(
+      /note\(et\(boneViewportCorners\(node\.id\) \? "bn\.dragHint" : "bn\.persp"\)\)/.test(s),
+      "透视场景没有显式表态（不许静默无反应）",
+    );
+    need(/BONE_HIT_R - 3/.test(s), "悬停高亮环没用命中半径（affordance 与命中区不一致）");
+    need(/boneHover >= 0 \? "move"/.test(s), "可拖骨点没有光标反馈");
+    need(/if \(hot && boneDraggable\(\)\)/.test(s), "不可拖的层（透视族）也画了高亮环（暗示能拖）");
+    // ⑤ i18n：zh/en 各恰好一条
+    for (const k of ["bn.dragHint", "bn.persp"]) {
+      const n = i18n.split(`"${k}":`).length - 1;
+      if (n !== 2) bad.push(`i18n 键 ${k} 需 zh/en 各恰好一条（got ${n}）`);
+    }
+    return bad;
+  };
+  const pA28 = pure28(main28);
+  const pBad28 = pA28 ? pureBad28(await loadPure28(pA28)) : ["纯逻辑切片缺失"];
+  check(
+    pBad28.length === 0,
+    `task-28 A 骨骼 gizmo 纯逻辑真跑全绿（${pBad28.length} 处失败${pBad28.length ? "：" + pBad28.slice(0, 3).join("；") : ""}）`,
+  );
+  const wBad28 = wireBad28(main28, i18n28);
+  check(
+    wBad28.length === 0,
+    `task-28 A 接线/i18n 全绿（${wBad28.length} 处失败${wBad28.length ? "：" + wBad28.slice(0, 3).join("；") : ""}）`,
+  );
+  // 变异红测：只改内存字符串，磁盘一个字节都不动
+  const mutsA = [
+    {
+      name: "骨点命中判定失效（半径内也当没点到）",
+      from: "    if (d <= r && d < bestD) {",
+      to: "    if (d <= r && false) {",
+      expect: /①骨点正上方没命中|①半径内/,
+    },
+    {
+      name: "半径外也吞事件（骨点抢走图层拖动）",
+      from: "  return i < 0 || !s ? null : { index: i, screen: [s[0], s[1]] };",
+      to: "  return { index: Math.max(0, i), screen: s ?? [x, y] };",
+      expect: /②半径外也吞事件/,
+    },
+    {
+      name: "角差不归一（跨 ±180° 直接返回原角差，会倒转一整圈）",
+      from: "  let d = a % (Math.PI * 2);\n  if (d > Math.PI) d -= Math.PI * 2;\n  else if (d <= -Math.PI) d += Math.PI * 2;\n  return d;",
+      to: "  return a;",
+      expect: /③跨 ±180° 时没走短路|③角差没归一/,
+    },
+    {
+      name: "局部角差没做 y 翻号（骨点旋转方向反）",
+      from: "  return boneNormAngle(rotateZ(0, [0, 0], [v0[0], -v0[1]], [v1[0], -v1[1]]));",
+      to: "  return boneNormAngle(rotateZ(0, [0, 0], [v0[0], v0[1]], [v1[0], v1[1]]));",
+      expect: /③局部角差方向反了/,
+    },
+    {
+      name: "平移不累加局部位移",
+      from: "  return [base[0] + d[0], base[1] + d[1], base[2]];",
+      to: "  return [base[0], base[1], base[2]];",
+      expect: /④平移没累加局部位移/,
+    },
+    {
+      name: "旋转方向反了",
+      from: "  return [base[0], base[1], base[2] + (sweep * 180) / Math.PI];",
+      to: "  return [base[0], base[1], base[2] - (sweep * 180) / Math.PI];",
+      expect: /④旋转方向反了/,
+    },
+    {
+      name: "透视族也进了视口拖拽名单（与 W15 口径冲突）",
+      from: "  return !f.readonly && !f.geomModal && !f.warp && !f.locked && f.sameLayer && !!f.corners && f.corners === 4;",
+      to: "  return !f.readonly && !f.geomModal && !f.warp && !f.locked && f.sameLayer;",
+      expect: /⑤透视族也在视口拖拽名单里/,
+    },
+    {
+      name: "骨点拖拽没接进 pointerdown（功能整条失效）",
+      from: "  if (boneGrab(e, p.x, p.y)) return;",
+      to: "  if (false) return;",
+      expect: /骨点拖拽没接进 pointerdown/,
+    },
+    {
+      name: "没拖过也提交（产生空撤销步）",
+      from: "  if (!d.moved) {\n    boneClearPreview();\n    return;\n  }",
+      to: "  if (d.moved && false) {\n    boneClearPreview();\n    return;\n  }",
+      expect: /没拖过也提交了/,
+    },
+    {
+      name: "拖动中直接写文档（一次手势多步撤销）",
+      from: "  bonePreview();\n  drawOverlay();\n  return true;",
+      to: "  void applyBoneEdit(d.layer, { animId: clip.id, bone: 0, frame: 0, delta: boneDeltaOf(bonePick), radius: 0 }, \"x\", \"y\");\n  drawOverlay();\n  return true;",
+      expect: /拖动中写了文档/,
+    },
+    {
+      name: "Esc 取消变成提交（取消产生副作用）",
+      from: "  boneDrag = null;\n  boneClearPreview();\n  if (bonePick && same(bonePick.layer, d.layer))",
+      to: "  boneDrag = null;\n  void applyBoneEdit(d.layer, { animId: \"\", bone: 0, frame: 0, delta: boneDeltaOf(bonePick!), radius: 0 }, \"x\", \"y\");\n  if (bonePick && same(bonePick.layer, d.layer))",
+      expect: /Esc 取消产生了副作用/,
+    },
+    {
+      name: "透视场景静默无反应（面板不表态）",
+      from: '  group.appendChild(note(et(boneViewportCorners(node.id) ? "bn.dragHint" : "bn.persp")));',
+      to: '  group.appendChild(note(et("bn.dragHint")));',
+      expect: /透视场景没有显式表态/,
+    },
+    {
+      name: "Esc 后残留 click 没被抑制（取消会顺手换掉选中层）",
+      from: "  if (bonePick && same(bonePick.layer, d.layer)) bonePick = { ...bonePick, t: [...d.t0], r: [...d.r0] };\n  suppressClick = true;\n  renderInspector();",
+      to: "  if (bonePick && same(bonePick.layer, d.layer)) bonePick = { ...bonePick, t: [...d.t0], r: [...d.r0] };\n  renderInspector();",
+      expect: /Esc 取消后残留的 click 没被抑制/,
+    },
+  ];
+  for (const m of mutsA) {
+    const after = main28.replace(m.from, m.to);
+    check(after !== main28, `变异「${m.name}」确实改动了源码`);
+    if (after === main28) continue;
+    const bad2 = wireBad28(after, i18n28);
+    const pure2 = pure28(after);
+    const pBad2 = pure2 ? pureBad28(await loadPure28(pure2)) : ["纯逻辑切片缺失"];
+    const all = [...bad2, ...pBad2];
+    check(all.length > 0, `变异「${m.name}」被咬红${all.length ? "" : "（没红！）"}`);
+    if (all.length) check(all.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${all[0]}`);
+  }
+  check(fs.readFileSync(mainPath28, "utf8") === main28, "变异全程未落盘：main.ts 与判据读到的逐字一致（sha256 等价）");
+  const { createHash } = await import("node:crypto");
+  console.log(`  · task-28 A main.ts sha256=${createHash("sha256").update(fs.readFileSync(mainPath28)).digest("hex").slice(0, 16)}…`);
+}
+
+// ─────────────── task-28 B：§8.2 L5 跨文档粘贴的缺失资源检测 ───────────────
+section("task-28 B. 跨文档粘贴的缺失资源检测（editor/clipboard.ts 真跑 + main.ts 接线 + 变异红测）");
+{
+  const cbPath28 = path.join(ROOT, "editor/clipboard.ts");
+  const mainPath28b = path.join(ROOT, "editor/main.ts");
+  const cbSrc28 = fs.readFileSync(cbPath28, "utf8");
+  const main28b = fs.readFileSync(mainPath28b, "utf8");
+  const i18n28b = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
+  const strip28b = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // 真实语料：一个带六类资源引用的子树（含重复引用与系统字体，用来咬去重 / 排除）
+  const clip28 = {
+    objs: [
+      { obj: { image: "img/a.png" } },
+      { obj: { model: "models/hero.mdl" } },
+      { obj: { effects: [{ file: "effects/glow.json" }] } },
+      { obj: { particle: "particles/spark.json" } },
+      { obj: { sound: ["sound/bgm.mp3"] } },
+      { obj: { text: "hi", font: "fonts/zcool.ttf" } },
+      { obj: { text: "sys", font: "systemfont_arial" } },
+      { obj: { image: "img/a.png" } },
+    ],
+    ids: [],
+  };
+  const EXP28 = ["img/a.png", "models/hero.mdl", "effects/glow.json", "particles/spark.json", "sound/bgm.mp3", "fonts/zcool.ttf"];
+  const pureBad28b = (CB) => {
+    const bad = [];
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    for (const k of ["clipRefPaths", "missingPasteResources", "pasteMissingHint"]) {
+      if (!CB || typeof CB[k] !== "function") return [`task-28 B 的 ${k} 没导出（源码形状变了？）`];
+    }
+    const refs = CB.clipRefPaths(clip28);
+    need(
+      JSON.stringify(refs) === JSON.stringify(EXP28),
+      `①子树资源收集漏项 / 顺序不对（got ${JSON.stringify(refs)}）`,
+    );
+    need(CB.clipRefPaths(null).length === 0 && CB.clipRefPaths({ objs: [], ids: [] }).length === 0, "①空子树还报引用");
+    need(refs.filter((p) => p === "systemfont_arial").length === 0, "①系统字体被当成资源（永远「缺失」误报）");
+    const miss = CB.missingPasteResources(refs, ["img/a.png", "particles/spark.json"]);
+    need(
+      JSON.stringify(miss) === JSON.stringify(["models/hero.mdl", "effects/glow.json", "sound/bgm.mp3", "fonts/zcool.ttf"]),
+      `②缺资源判定不对（got ${JSON.stringify(miss)}）`,
+    );
+    need(CB.missingPasteResources(refs, refs).length === 0, "②资源齐全也报缺失（会天天误报）");
+    need(JSON.stringify(CB.missingPasteResources(refs, [])) === JSON.stringify(refs), "②空资源表没报全缺");
+    need(CB.missingPasteResources(["", "img/a.png"], ["img/a.png"]).length === 0, "②空引用被当成缺失资源");
+    const hint = CB.pasteMissingHint(miss, 3);
+    need(
+      JSON.stringify(hint) === JSON.stringify({ shown: miss.slice(0, 3), rest: 1 }),
+      `③提示折叠算错（got ${JSON.stringify(hint)}，应「前 3 + 另有 1」）`,
+    );
+    need(CB.pasteMissingHint([], 3).rest === 0 && CB.pasteMissingHint(["a"], 3).rest === 0, "③不缺失时也算出「另有」");
+    need(CB.pasteMissingHint(miss).shown.length <= CB.PASTE_MISSING_SHOWN, "③默认折叠条数没跟着常量走");
+    need(CB.PASTE_MISSING_SHOWN === 3, `③默认折叠条数变了（got ${CB.PASTE_MISSING_SHOWN}）`);
+    return bad;
+  };
+  const wireBad28b = (src, i18n) => {
+    const bad = [];
+    const s = strip28b(src);
+    const raw = src; // 段落边界要在**未剥注释**的源码里找（`// ---------- …` 是注释）
+    const need = (cond, msg) => {
+      if (!cond) bad.push(msg);
+    };
+    const iPaste = raw.indexOf("added = pasteLayerClip(d, clip,");
+    const iMiss = raw.indexOf("const missing = missingPasteResources(clipRefPaths(clip)");
+    const iLog = raw.indexOf('et("log.pasteMissing"');
+    const iEnd = raw.indexOf("// ---------- 状态栏", iLog);
+    need(iPaste > 0, "粘贴路径里找不到 pasteLayerClip 调用（源码形状变了？）");
+    need(iMiss > 0 && iMiss > iPaste, "④缺失检测不在粘贴之后（顺序错了会阻断粘贴）");
+    need(iLog > iMiss && iEnd > iLog, "④缺失提示不在检测之后");
+    if (iMiss > 0 && iEnd > iMiss) {
+      const block = strip28b(raw.slice(iMiss, iEnd));
+      need(/if \(missing\.length\) \{/.test(block), "④没有「缺了才提示」的判断（资源齐全也弹提示）");
+      need(/log\(/.test(block), "④缺失结果没落到日志（用户看不见）");
+      need(!/return false/.test(block), "④缺失提示后面把粘贴结果改回失败（L5 明确：不阻断粘贴）");
+      need(
+        !/writeAsset|assets\.write\(|\.write\(|copyFile|mkdir|writeFileSync/.test(block),
+        "④缺失提示块里写了资源（L5 明确：不自动拷贝）",
+      );
+    }
+    need((s.match(/missingPasteResources\(/g) || []).length === 1, "④缺失检测被调用了多次（每次粘贴只该算一次）");
+    need(/clipRefPaths\(clip\)/.test(s), "④没走纯函数 clipRefPaths（自己另写了一张会漂的资源表）");
+    // i18n：zh/en 各恰好一条，且两段都带占位符
+    for (const k of ["log.pasteMissing", "log.pasteMissingMore"]) {
+      const n = i18n.split(`"${k}":`).length - 1;
+      if (n !== 2) bad.push(`i18n 键 ${k} 需 zh/en 各恰好一条（got ${n}）`);
+    }
+    need(/"log\.pasteMissing": "[^"]*\{n\}[^"]*\{list\}/.test(i18n), "log.pasteMissing 缺 {n} / {list} 占位符");
+    need(/"log\.pasteMissingMore": "[^"]*\{m\}/.test(i18n), "log.pasteMissingMore 缺 {m} 占位符");
+    return bad;
+  };
+  const CB0 = await loadEditorModule("clipboard");
+  const pBadB = pureBad28b(CB0);
+  check(pBadB.length === 0, `task-28 B 缺资源检测真跑全绿（${pBadB.length} 处失败${pBadB.length ? "：" + pBadB.slice(0, 3).join("；") : ""}）`);
+  const wBadB = wireBad28b(main28b, i18n28b);
+  check(wBadB.length === 0, `task-28 B 接线/i18n 全绿（${wBadB.length} 处失败${wBadB.length ? "：" + wBadB.slice(0, 3).join("；") : ""}）`);
+  const mutsB = [
+    {
+      cb: true,
+      name: "声音引用不再收集（跨文档粘贴漏报音频）",
+      from: "      ...referencedSounds(d),",
+      to: "      ...[] ,",
+      expect: /①子树资源收集漏项/,
+    },
+    {
+      cb: true,
+      name: "缺资源判定反了（齐全也报缺失）",
+      from: "  return refs.filter((p) => !!p && !have.has(p));",
+      to: "  return refs.filter((p) => !!p && have.has(p));",
+      expect: /②缺资源判定不对|②资源齐全也报缺失/,
+    },
+    {
+      cb: true,
+      name: "折叠条数把已显示的也算进「另有 M 个」",
+      from: "  return { shown, rest: Math.max(0, missing.length - shown.length) };",
+      to: "  return { shown, rest: missing.length };",
+      expect: /③提示折叠算错/,
+    },
+    {
+      name: "粘贴后不做缺失检测（L5 整条失效）",
+      from: "  const missing = missingPasteResources(clipRefPaths(clip), overlay?.list() ?? []);",
+      to: "  const missing: string[] = [];",
+      expect: /④缺失检测不在粘贴之后|④没走纯函数 clipRefPaths/,
+    },
+    {
+      name: "缺失检测阻断粘贴（把提示当成错误）",
+      from: "  const missing = missingPasteResources(clipRefPaths(clip), overlay?.list() ?? []);",
+      to: "  const missing = missingPasteResources(clipRefPaths(clip), overlay?.list() ?? []);\n  if (missing.length) return false;",
+      expect: /④缺失提示后面把粘贴结果改回失败/,
+    },
+    {
+      name: "缺失时自动拷贝资源（L5 明确不做的事）",
+      from: "    const { shown, rest } = pasteMissingHint(missing);",
+      to: '    void overlay?.write(missing[0] ?? "", new Uint8Array());\n    const { shown, rest } = pasteMissingHint(missing);',
+      expect: /④缺失提示块里写了资源/,
+    },
+  ];
+  for (const m of mutsB) {
+    if (m.cb) {
+      const after = cbSrc28.replace(m.from, m.to);
+      check(after !== cbSrc28, `变异「${m.name}」确实改动了源码`);
+      if (after === cbSrc28) continue;
+      const bad2 = pureBad28b(await loadEditorModule("clipboard", { [cbPath28]: after }));
+      check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+      if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+    } else {
+      const after = main28b.replace(m.from, m.to);
+      check(after !== main28b, `变异「${m.name}」确实改动了源码`);
+      if (after === main28b) continue;
+      const bad2 = wireBad28b(after, i18n28b);
+      check(bad2.length > 0, `变异「${m.name}」被咬红${bad2.length ? "" : "（没红！）"}`);
+      if (bad2.length) check(bad2.some((x) => m.expect.test(x)), `变异「${m.name}」由目标判据咬红：${bad2[0]}`);
+    }
+  }
+  check(fs.readFileSync(cbPath28, "utf8") === cbSrc28 && fs.readFileSync(mainPath28b, "utf8") === main28b, "变异全程未落盘：clipboard.ts / main.ts 与判据读到的逐字一致");
+  const { createHash } = await import("node:crypto");
+  console.log(
+    `  · task-28 B clipboard.ts sha256=${createHash("sha256").update(fs.readFileSync(cbPath28)).digest("hex").slice(0, 16)}…`,
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// task-28 AS. 真机侧「视口骨骼 gizmo」用例的静态接线（--headless 跑；离线只守结构、闸门与判色同源）
+// ───────────────────────────────────────────────────────────────────────────
+{
+  const asHeadSrc = fs.readFileSync(path.join(ROOT, "scripts/verify-editor-headless.mjs"), "utf8");
+  const asMainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  check(/var asName = "AS\. 视口骨骼 gizmo/.test(asHeadSrc) && /section\(asName\)/.test(asHeadSrc), "真机侧有「视口骨骼 gizmo」用例（--headless 跑）");
+  check(
+    /async function boneGizmoE2E\(\)\s*\{/.test(asHeadSrc) && /await boneGizmoE2E\(\);/.test(asHeadSrc),
+    "AS 段的函数声明与主流程调用都在（真机轮会真的跑到）",
+  );
+  check(/process\.env\.WE_E2E_FROM !== "AS"/.test(asHeadSrc), "AS 段能被 WE_E2E_FROM=AS 单独起跑（与其它真机段同一道闸门）");
+  // 三个必咬点在真机段里各有一条断言文本：删掉 / 改弱会让离线这四条先红
+  check(/骨 gizmo 不吞命中半径外的事件/.test(asHeadSrc), "真机段留着「非骨点处按下不吞事件」的负控断言");
+  check(/一次手势 = 一步 ⌘Z/.test(asHeadSrc), "真机段留着「一次手势 = 一步撤销」的断言（拖后 ⌘Z 逐字节回退）");
+  check(
+    /拖动中只是预览/.test(asHeadSrc) && /Esc 取消后松手/.test(asHeadSrc) && /Esc 没有产生空撤销步/.test(asHeadSrc),
+    "真机段留着「拖动中只预览 / Esc 零副作用 / 不留空撤销步」三条断言",
+  );
+  // 判色同源：真机段按 SNAP_COLOR 找「选中的骨」，颜色常量挪走就没人再咬（所以离线钉一次）
+  const asSnap = /const SNAP_COLOR = "#([0-9a-f]{6})";/i.exec(asMainSrc);
+  const asRgb = asSnap ? [0, 2, 4].map((i) => parseInt(asSnap[1].slice(i, i + 2), 16)) : null;
+  check(
+    !!asRgb && asRgb[0] > 200 && asRgb[1] < 130 && /R > 200 && G < 130/.test(asHeadSrc),
+    `真机段的「选中骨」判色与 main.ts 的 SNAP_COLOR 同源（${asSnap ? `#${asSnap[1]}` : "没找到常量"}）`,
+  );
+  check(
+    /#ed-inspector \.ed-bones \.ed-bn-bone/.test(asHeadSrc) && /\.ed-warp \.ed-warp-exit/.test(asHeadSrc),
+    "AS 段按真实选择器备料（骨骼面板 .ed-bn-bone 选骨；手势前退出操控变形会话）",
+  );
+  // 备料口径钉死（2026-10-15 修复）：boneGroup 的准入是「有骨 + 一条 frames>0 的片段」，而这两样
+  // 「转木偶」自己就写出来了（editor/main.ts:7665 warpPromote 的 buildRig 钉子骨 + addAnimLayer(WARP_CLIP_ID)）。
+  // 备料里**绝不能**再应用骨架：skelApplySkeleton（editor/main.ts:9236）会走 clearMdlClips（:9261）把那条
+  // 唯一的 warp 片段清掉 ⇒ bones 组只剩 bn.noClips、.ed-bn-bone 根本不会建（真机轮 AS 段就是这么红的）。
+  {
+    // 切片从备料注释起（不含上面的 asDiag 现场读取器 —— 它同时引用骨架/权重面板的选择器，只用于贴现场）
+    const asPrep0 = asHeadSrc.indexOf("── 备料：转木偶自带骨架与片段");
+    const asPrep1 = asHeadSrc.indexOf('await asPick("#ed-inspector .ed-bn-bone"');
+    const asPrep = asPrep0 >= 0 && asPrep1 > asPrep0 ? asHeadSrc.slice(asPrep0, asPrep1) : "";
+    check(
+      asPrep.length > 200 && /\.ed-warp \.ed-warp-make/.test(asPrep) && /\.ed-warp \.ed-warp-exit/.test(asPrep) && /waitFor\(`!document\.querySelector\('\.ed-warp \.ed-warp-exit'\)`/.test(asPrep),
+      `AS 备料只做「转木偶 → 退出操控变形」（转木偶已带骨与片段，退出是 boneDragPermitted 的 \`!f.warp\` 前提；切片 ${asPrep.length} 字符）`,
+    );
+    check(
+      !/ed-skel-apply/.test(asPrep) && !/ed-skel-new/.test(asPrep),
+      "AS 备料里不再出现「新建/应用骨架」——应用骨架会 clearMdlClips 掉唯一的 warp 片段，让骨骼面板退化成 bn.noClips",
+    );
+  }
+  // 三种判色互斥且各归其位：真机轮跑不了（沙箱起不来 Chrome），判别式只能在离线钉在真实颜色上
+  const asPred = (re) => { const m = re.exec(asHeadSrc); return m ? m[1] : null; };
+  const asPinkP = asPred(/if \((R [^)]*?B < 200)\) \{ pink/);
+  const asAmberP = asPred(/else if \((R [^)]*?B < 150)\) amber/);
+  const asBlueP = asPred(/else if \((B > 150 && B > R \+ 40 && G > 120)\) blue/);
+  const asHit = (expr, rgb) => (expr ? !!new Function("R", "G", "B", `return (${expr});`)(rgb[0], rgb[1], rgb[2]) : null);
+  const asPinRgb = [255, 209, 102]; // main.ts 的钉子色 #ffd166
+  const asBlueRgb = [120, 200, 255]; // main.ts 的未选中骨色 rgba(120,200,255,0.9)
+  check(
+    !!asRgb && !!asPinkP && !!asAmberP && !!asBlueP &&
+      asHit(asPinkP, asRgb) === true && asHit(asPinkP, asPinRgb) === false && asHit(asPinkP, asBlueRgb) === false &&
+      asHit(asAmberP, asPinRgb) === true && asHit(asAmberP, asRgb) === false && asHit(asAmberP, asBlueRgb) === false &&
+      asHit(asBlueP, asBlueRgb) === true && asHit(asBlueP, asRgb) === false && asHit(asBlueP, asPinRgb) === false,
+    "真机段三种判色互斥且各归其位（选中骨粉 / 钉子琥珀 / 其余骨蓝，输入取 main.ts 的真实颜色）",
+  );
+  check(
+    /"rgba\(120,200,255,0\.9\)"/.test(asMainSrc) && /"#ffd166"/.test(asMainSrc),
+    "这三种颜色在 main.ts 里仍是真实用色（判色同源不是空断言）",
+  );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

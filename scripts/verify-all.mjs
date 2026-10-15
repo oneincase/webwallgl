@@ -128,6 +128,11 @@ const STABLE = [
   // （尾表姿势定位 / 片段排序 / 换图尺寸 / 加片段挂动画层；47 条判据含运行模式契约 + 9 条变异红测）。
   // 默认即离线（不启 Chrome）；真浏览器段要 `node scripts/verify-editor-model.mjs --headless`
   "verify-editor-model",
+  // 草稿存储（editor/draft.ts）§8.2 L6：info() 不再为取 savedAt 而整份读+解码每个槽
+  // —— 同批写一份 NUL 前缀的 meta 记录（槽名不可能以 \u0000 开头 ⇒ 两套键不互撞），
+  // meta 缺失/坏照旧回落整份读（老槽不消失）；淘汰/清空与本体成对删。
+  // 判据含 4 条内存变异红测（不写 meta / 删回落 / clear 不删 meta / 淘汰不删 meta）
+  "verify-draft",
   // 编辑器插件内核（editor/core）：inject 等待 / 依赖消失回 pending / 服务栈回落 / 逆序撤销 /
   // 出错隔离与预算 / 权限白名单 / profile 诊断 / 注册表栈 + 变异红测
   "verify-plugin-kernel",

@@ -30,7 +30,8 @@
 // 回写，且数值没变时原样返回旧值，保证「没动过的地方逐字节不变」。
 
 import type { EffectParam, EffectParamType, EffectValue } from "./effects";
-import { isKnownComponent, type ParticleComponentKind } from "./particles";
+import { isKnownComponent, particleComponents as componentRegistry, type ParticleComponentKind } from "./particles";
+import type { FieldType, Schema } from "./core";
 
 export type ParticleGroup = ParticleComponentKind | "controlpoint";
 export const PARTICLE_GROUP_NAMES: readonly ParticleGroup[] = ["emitter", "initializer", "operator", "renderer", "controlpoint"];
@@ -302,9 +303,70 @@ export const PARTICLE_TOP_PREFIX = "particle.";
 const BY_KEY = new Map<string, ParticleField>(PARTICLE_TOP_FIELDS.map((x) => [x.key, x]));
 const BY_SPEC = new Map<string, ParticleComponentSpec>(PARTICLE_SPECS.map((s) => [`${s.kind}:${s.name}`, s]));
 
+// ---------- 插件贡献的组件参数（D2：把 core 的 Schema 转成粒子面板的字段表） ----------
+
+/**
+ * 类型映射：粒子面板（editor/ui/schema-form.ts）只认 ParticleFieldType 这七种。
+ * `color` / `vec4` / `texture` 在粒子侧**没有对应控件类型** ⇒ 统一**跳过该字段**（不是整条拒绝）：
+ *   · 整条拒绝会让插件为一个颜色 / 贴图字段搭的其它滑条一起消失，代价大于收益；
+ *   · 跳过只是不出控件，字段仍落在 extraKeys 里只读列出并逐字节保留（见 particleComponentViews），
+ *     作者写在文件里的值不会丢，面板也不会因此新增 / 改坏任何键。
+ * `label` 只取 `string` 形态：`{ zh, en }` 表不塞进来（粒子字段表没有语言维度，面板回落显示字段名）。
+ * `min` / `max` / `step` 原样带过（只喂滑条，不做引擎侧钳位）；schema 的 `default` 不转 ——
+ * 粒子面板恒按文件里的现值渲染，ParticleField.default 在粒子侧没有消费方。
+ */
+const SCHEMA_FIELD_TYPES: Partial<Record<FieldType, ParticleFieldType>> = {
+  float: "float",
+  int: "int",
+  bool: "bool",
+  vec2: "vec2",
+  vec3: "vec3",
+  enum: "enum",
+  string: "string",
+};
+
+/** PluginComponent.params（Schema）→ 粒子面板字段表（跳过 color / vec4 / texture） */
+export function particleFieldsFromSchema(schema: Schema): ParticleField[] {
+  const out: ParticleField[] = [];
+  for (const f of schema) {
+    const type = SCHEMA_FIELD_TYPES[f.type];
+    if (!type) continue; // color / vec4 / texture：粒子面板无对应控件，跳过该字段、保留其它字段
+    const field: ParticleField = { key: f.key, type };
+    if (typeof f.label === "string") field.label = f.label;
+    if (typeof f.min === "number") field.min = f.min;
+    if (typeof f.max === "number") field.max = f.max;
+    if (typeof f.step === "number") field.step = f.step;
+    if (type === "enum") field.options = (f.options ?? []).map((o) => (typeof o === "string" ? o : o.value));
+    out.push(field);
+  }
+  return out;
+}
+
+/**
+ * 注册表里有没有人给这个组件补过参数描述。只认**插件注册表里真有的贡献项**（particleComponents
+ * 的 list() 不含 fallback 的内置项），且转换后至少剩一个字段 —— 空 params（或只写了
+ * color/vec4/texture 这些粒子侧没有控件的字段）不算，免得把「引擎认识但本版无控件」的
+ * noPanel 静默吞成 ok。名字大小写不敏感，与静态表同口径。
+ */
+function contributedFields(kind: ParticleComponentKind, name: string): ParticleField[] | null {
+  const want = `${kind}:${String(name).toLowerCase()}`;
+  for (const c of componentRegistry.list()) {
+    if (`${c.kind}:${c.id}`.toLowerCase() !== want) continue;
+    const fields = c.params ? particleFieldsFromSchema(c.params) : [];
+    return fields.length ? fields : null;
+  }
+  return null;
+}
+
 export function particleSpec(kind: ParticleGroup, name: string): ParticleComponentSpec | null {
   if (kind === "controlpoint") return CONTROLPOINT_SPEC;
-  return BY_SPEC.get(`${kind}:${String(name).toLowerCase()}`) ?? null;
+  const staticSpec = BY_SPEC.get(`${kind}:${String(name).toLowerCase()}`);
+  if (staticSpec) return staticSpec;
+  // 静态表没有（如 operator 的 oscillatealpha / positionoffsetrandom —— 引擎认识但本版没有
+  // 专属控件）时，看插件有没有通过 particleComponents 注册表补过参数描述；补过就现场转成
+  // 字段表，状态由 noPanel 升为 ok（这正是 D2 的意义）。
+  const fields = contributedFields(kind, name);
+  return fields ? { kind, name: String(name).toLowerCase(), fields } : null;
 }
 
 // ---------- 基础工具 ----------
@@ -578,17 +640,27 @@ export function setParticleField(file: ParticleBox, key: string, value: unknown)
 
 // ---------- 序列化 ----------
 
-/** 解析粒子文件（非法 JSON / 不是对象 → null） */
+/**
+ * 解析粒子文件（非法 JSON / 不是对象 → null）。
+ * UTF-8 BOM 先剥掉：带 BOM 的文件此前整份 `JSON.parse` 直接抛错 ⇒ 参数面板一片空白
+ * （文件在磁盘上是好的，只是第一个字符是 U+FEFF）。effects / gltf / model / open 等同口径加载器
+ * 一律先 `.replace(/^\uFEFF/, "")`，这里补齐。
+ */
 export function parseParticleFile(text: string): ParticleBox | null {
   try {
-    const v = JSON.parse(text) as unknown;
+    const v = JSON.parse(text.replace(/^\uFEFF/, "")) as unknown;
     return isObj(v) ? v : null;
   } catch {
     return null;
   }
 }
 
-/** 序列化粒子文件（2 空格缩进，与 editor/particles.ts 生成的产物同形） */
+/**
+ * 序列化粒子文件（2 空格缩进，与 editor/particles.ts 生成的产物同形）。
+ * 注意：本函数按 `JSON.stringify(file, null, 2)` **归一化重写整份文件** —— 作者原有排版、
+ * 数字字面量形态（如 `1.0` 写成 `1`）会被归一。这是既有口径，本轮不引入「原文保留」
+ * （那会牵动 particleFileText 缓存与提交通道，是另一件事）。
+ */
 export function serializeParticleFile(file: ParticleBox): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(file, null, 2));
 }

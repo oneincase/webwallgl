@@ -1488,6 +1488,85 @@ async function loadModelModule(mutate) {
   return import(pathToFileURL(file).href);
 }
 
+const SY_MOUNT = "renderer/src/scene-mount.ts";
+
+/**
+ * 打包 renderer/src/scene-mount.ts（§8.2 [中-5] 的热增判定就在这儿）。
+ * 它的依赖链是浏览器模块：`.glsl` 要 loader、`?raw` 要插件，模块体在 import 期就碰
+ * `window`/`document`（真 `mountScene` 要 WebGL，Node 起不来 —— 但**纯函数判据不需要挂载**：
+ * `hasObjectFieldScript` / `hotAddRejectForObject` 就是热增 obj 分支逐字调的那两个函数）。
+ * 所以：①esbuild 就地打包；②import 前装最小 DOM 垫片；③import 后把垫片原样卸载。
+ */
+async function loadSceneMountModule(mutate) {
+  let src = fs.readFileSync(path.join(ROOT, SY_MOUNT), "utf8");
+  for (const [from, to, want] of mutate || []) {
+    const hits = src.split(from).length - 1;
+    if (hits !== (want ?? 1)) throw new Error(`变异锚点命中 ${hits} 处（期望 ${want ?? 1}）：${from}`);
+    src = src.replace(from, to);
+  }
+  const { build } = await import("esbuild");
+  const plugins = [
+    { name: "glsl-stub", setup: (b) => b.onLoad({ filter: /\.glsl$/ }, () => ({ contents: 'export default "";', loader: "js" })) },
+    {
+      name: "raw-stub",
+      setup: (b) => {
+        b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: a.path, namespace: "rawq" }));
+        b.onLoad({ filter: /.*/, namespace: "rawq" }, () => ({ contents: 'export default "";', loader: "js" }));
+      },
+    },
+  ];
+  const out = await build({
+    stdin: {
+      contents: src,
+      resolveDir: path.dirname(path.join(ROOT, SY_MOUNT)),
+      sourcefile: path.join(ROOT, SY_MOUNT),
+      loader: "ts",
+    },
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    external: ["node:*"],
+    write: false,
+    logLevel: "silent",
+    plugins,
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vem-resid-mount-"));
+  const file = path.join(dir, "mod.mjs");
+  fs.writeFileSync(file, out.outputFiles[0].text);
+  const shim = {
+    window: globalThis,
+    self: globalThis,
+    document: {
+      createElement: () => ({ style: {}, getContext: () => null, addEventListener() {}, remove() {} }),
+      createElementNS: () => ({ style: {}, getContext: () => null }),
+      addEventListener() {},
+      removeEventListener() {},
+      documentElement: { style: {} },
+      body: { style: {}, appendChild() {} },
+      head: { appendChild() {} },
+    },
+    requestAnimationFrame: (cb) => setTimeout(() => cb(0), 0),
+    cancelAnimationFrame: (h) => clearTimeout(h),
+    addEventListener: () => {},
+    OffscreenCanvas: class { getContext() { return null; } },
+    HTMLCanvasElement: class {},
+  };
+  const saved = new Map();
+  for (const [k, v] of Object.entries(shim)) {
+    saved.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
+    Object.defineProperty(globalThis, k, { value: v, configurable: true, writable: true });
+  }
+  try {
+    return await import(pathToFileURL(file).href);
+  } finally {
+    for (const [k, d] of saved) {
+      if (d) Object.defineProperty(globalThis, k, d);
+      else delete globalThis[k];
+    }
+  }
+}
+
 /** 引擎级姿势指纹：算完立刻摘出来（computeSkinMatrices 复用 mdl._skin 缓存，不能留引用） */
 function skinHash(mdl, time, layers) {
   const m = S.computeSkinMatrices(mdl, time, layers, null);
@@ -1525,9 +1604,12 @@ const bytesEqual = (a, b) => {
 
 let residCache = null;
 /** 语料扫描（只扫一次，变异跑复用） */
-function residScan(LIB) {
+function residScan(LIB, hasFieldScript = null) {
   if (residCache) return residCache;
   const s = {
+    scannedPkgs: 0,
+    fieldScriptObjs: 0, // §8.2 [中-5]：原始 scene 对象上的**字段级脚本**形态（angles:{script:…}）
+    objectScriptsObjs: 0, // 原始 scene.json 里的 objectScripts 键（解析产物，正常为 0）
     poseNoAnim: [], // 无动画 + 引擎能解析出尾表姿势 → 改尾表看得见（唯一可见杠杆）
     animatedWithPose: [], // 有动画 + 尾表能解析 → 引擎不读尾表
     noAnimNoPose: [], // 无动画 + 尾表解析不出 → 引擎恒等早退，改局部矩阵是空操作
@@ -1618,6 +1700,14 @@ function residScan(LIB) {
     }
     const scene = jsonOf("scene.json");
     if (!scene) continue;
+    s.scannedPkgs += 1;
+    // §8.2 [中-5] 的语料对照：老判据只看 `o.objectScripts`（解析产物），字段级脚本形态要按
+    // 引擎同一张白名单再判一次。这里用**被测实现自己的函数**数一遍（不是另写一份口径）。
+    for (const o of scene.objects || []) {
+      if (!o || typeof o !== "object") continue;
+      if (hasFieldScript && hasFieldScript(o)) s.fieldScriptObjs += 1;
+      if (o.objectScripts) s.objectScriptsObjs += 1;
+    }
     for (const o of scene.objects || []) {
       const p = o.model || o.image;
       if (typeof p !== "string" || !p) continue;
@@ -1668,8 +1758,8 @@ function residScan(LIB) {
   return s;
 }
 
-async function residBattery(ME, MODEL, LIB, check) {
-  const s = residScan(LIB);
+async function residBattery(ME, MODEL, LIB, check, SM = null) {
+  const s = residScan(LIB, SM ? SM.hasObjectFieldScript : null);
 
   /* ── RESID-0 运行模式（task-11）：默认路径必须离线、不启动 Chrome ────────────
    * 判据要点：把 CLI 契约做成可证伪的 —— 子进程探针 VEM_MODE_PROBE=1 只打印 mode 立即退出，
@@ -1960,6 +2050,92 @@ async function residBattery(ME, MODEL, LIB, check) {
       "RESID-5i 拒绝路径零副作用：对象没有多出 animationlayers（挂上就会砍掉引擎的 animations[0] 回退）",
     );
   }
+
+  /* ── RESID-6 §8.2 [中-5]：热增 obj 分支漏判「字段级脚本」形态（task-30 B） ──────
+     原始 scene.json 对象上没有 `objectScripts`（那是 parse.js 的解析产物），热增判定读的
+     正是原始对象 ⇒ 只判 `o.objectScripts` 会漏掉 `angles: {script: …}` 这类对象。 */
+  if (SM) {
+    const FIELDS = Array.from(SM.OBJECT_SCRIPT_FIELDS || []);
+    const eq = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+
+    // 6a 白名单同源：scene-mount.ts 的常量 vs 引擎 parse.js:552-568 的内联表（顺序敏感）
+    const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+    const block = parseSrc.slice(parseSrc.indexOf("objectScripts: (() => {"));
+    const m = block.match(/for \(const f of \[([\s\S]*?)\]\) \{/);
+    const engineFields = m ? Array.from(m[1].matchAll(/'([A-Za-z0-9_]+)'/g)).map((x) => x[1]) : null;
+    check(
+      !!engineFields && engineFields.length === 12 && eq(engineFields, FIELDS),
+      `RESID-6a 白名单同源：引擎 parse.js 内联表 ${JSON.stringify(engineFields)} 与 scene-mount 常量逐字相等（顺序敏感 ⇒ 改一处必须同批改另一处）`,
+    );
+
+    // 6b 字段级脚本判定表：12 个字段的 {script} 形态全收，非脚本形态一个不收
+    const allTrue = FIELDS.every((f) => SM.hasObjectFieldScript({ [f]: { script: "cb", value: 1 } }) === true);
+    const negatives = [
+      [{ angles: { script: "" } }, "script 是空串"],
+      [{ angles: { script: 5 } }, "script 非字符串"],
+      [{ angles: [1, 2, 3] }, "angles 是纯数组"],
+      [{ angles: { value: 1 } }, "有字段对象但没有 script"],
+      [{ objectScripts: { angles: {} } }, "只有解析产物键 objectScripts"],
+      [{}, "空对象"],
+      [null, "null"],
+      [42, "数字"],
+    ].filter(([o]) => SM.hasObjectFieldScript(o) === false);
+    check(
+      FIELDS.length === 12 && allTrue && negatives.length === 8,
+      `RESID-6b 字段级脚本判定：${FIELDS.length} 个白名单字段的 {script} 形态全部命中；${negatives.length}/8 条反例全部不命中（${negatives.map((x) => x[1]).join(" / ")}）`,
+    );
+
+    // 6c/6d 真行为（= 热增 obj 分支逐字调的那个函数）
+    const resident = () => "tex-1";
+    const notResident = () => null;
+    const R = (o, t = notResident) => SM.hotAddRejectForObject(o, t);
+    const scriptReason = R({ name: "sun", angles: { script: "rotate" } });
+    check(
+      typeof scriptReason === "string" &&
+        scriptReason.includes("两阶段 init") &&
+        R({ name: "sun", angles: [1, 2, 3] }) === null &&
+        typeof R({ alpha: { script: "fade" } }) === "string" &&
+        typeof R({ objectScripts: { angles: {} } }) === "string" &&
+        typeof R({ angles: { script: "rotate" } }, resident) === "string",
+      `RESID-6c 热增判定：{angles:{script}} ⇒ ok=false 且理由含「两阶段 init」（"${String(scriptReason).slice(0, 24)}…"）；纯数组 {angles:[1,2,3]} ⇒ ok=true（null）；解析产物键 objectScripts 与「有贴图驻留」两种叠加都不能放行`,
+    );
+    check(
+      typeof R(null) === "string" &&
+        typeof R({ parent: 3 }) === "string" &&
+        R({ parent: 3 }).includes("父级") &&
+        typeof R({ particle: "p.json" }) === "string" &&
+        typeof R({ model: "m.mdl" }) === "string" &&
+        typeof R({ text: "hi" }) === "string" &&
+        typeof R({ image: "i.png" }) === "string" &&
+        R({ image: "i.png" }).includes("贴图未驻留") &&
+        R({ image: "i.png" }, resident) === null,
+      "RESID-6d obj 分支其余闸门未被这次改动打乱（缺 obj / parent / particle / model / text / 贴图未驻留 / 贴图已驻留放行）",
+    );
+
+    // 6e 语料对照：工坊库里字段级脚本对象远多于 0，而 objectScripts 键在原始 scene.json 里 0 个
+    // ⇒ 老判据（只看 o.objectScripts）在真实语料上完全落空，这次补的正是这一条。
+    check(
+      s.scannedPkgs > 300 && s.objectScriptsObjs === 0 && s.fieldScriptObjs > 1000,
+      `RESID-6e 语料对照：${s.scannedPkgs} 个 scene.pkg 里字段级脚本对象 ${s.fieldScriptObjs} 个，而原始场景带 objectScripts 键的 ${s.objectScriptsObjs} 个 ⇒ 老判据在真实语料上 0 命中（漏判是实打实的）`,
+    );
+
+    // 6f/6g 接线与零回归：obj 分支真走这个纯函数；duplicateOf 分支保持原样
+    const mountSrc = fs.readFileSync(path.join(ROOT, SY_MOUNT), "utf8");
+    const fnBody = mountSrc.slice(mountSrc.indexOf("export function hotAddRejectForObject"));
+    const bodyEnd = fnBody.indexOf("\n}");
+    const callsite = mountSrc.slice(mountSrc.indexOf("const hotAddReject = (spec: any)"));
+    const callsiteHead = callsite.slice(0, callsite.indexOf("const obj: any = spec.obj;"));
+    check(
+      bodyEnd > 0 &&
+        fnBody.slice(0, bodyEnd).includes("if (hasObjectFieldScript(o)) return") &&
+        callsite.includes("hotAddRejectForObject(obj, residentTextureFor)"),
+      "RESID-6f 接线：canHotAddLayer → hotAddReject 的 obj 分支逐字调 hotAddRejectForObject(obj, residentTextureFor)，而该函数体里就有 hasObjectFieldScript(o) 这一条（离线判据跑的就是这段真代码）",
+    );
+    check(
+      callsiteHead.includes("src.objectScripts") && !callsiteHead.includes("hasObjectFieldScript(src)"),
+      "RESID-6g duplicateOf 分支零回归：仍按**解析产物** src.objectScripts 判，没有把「原始对象字段级形态」那套判定套到 src 上（headless 用法只走这条分支）",
+    );
+  }
 }
 
 /** 变异红测：每条判据对应的实现分支改坏 → 至少一条 RESID 判据必须变红 */
@@ -1998,6 +2174,26 @@ const RESID_MUTATIONS = [
     name: "W18b①：新层指向隔壁片段（id 接错）",
     pairs: [["addAnimLayer(doc, o, added.id, layerName || init.name)", "addAnimLayer(doc, o, added.id - 1, layerName || init.name)"]],
   },
+  {
+    file: SY_MOUNT,
+    name: "§8.2 [中-5]：热增漏判字段级脚本（撤掉 hasObjectFieldScript 这一条）",
+    pairs: [['  if (hasObjectFieldScript(o)) return "带对象脚本的图层需要两阶段 init，热增暂不支持（走整场景重挂）";\n', ""]],
+  },
+  {
+    file: SY_MOUNT,
+    name: "§8.2 [中-5]：白名单漂移（scene-mount 侧少一个 angles）",
+    pairs: [['  "angles",\n', ""]],
+  },
+  {
+    file: SY_MOUNT,
+    name: "§8.2 [中-5]：脚本形态判定放宽（有字段对象就算脚本）",
+    pairs: [
+      [
+        '    const v = o[field];\n    if (v && typeof v === "object" && typeof (v as { script?: unknown }).script === "string" && (v as { script: string }).script) return true;',
+        "    const v = o[field];\n    if (v) return true;",
+      ],
+    ],
+  },
 ];
 
 export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
@@ -2009,7 +2205,8 @@ export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
   };
   const ME = await loadEditorModule(RESID_ME);
   const MODEL = await loadModelModule();
-  await residBattery(ME, MODEL, LIB, c);
+  const SM = await loadSceneMountModule();
+  await residBattery(ME, MODEL, LIB, c, SM);
 
   section(`变异红测（${RESID_MUTATIONS.length} 条：判据把实现改坏必须抓住）`);
   let red = 0;
@@ -2018,11 +2215,13 @@ export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
     let hits = 0;
     try {
       const onModel = mut.file === RESID_MODEL;
-      const MM = onModel ? ME : await loadEditorModule(RESID_ME, mut.pairs);
+      const onMount = mut.file === SY_MOUNT;
+      const MM = onModel || onMount ? ME : await loadEditorModule(RESID_ME, mut.pairs);
       const MUT = onModel ? await loadModelModule(mut.pairs) : MODEL;
+      const SMUT = onMount ? await loadSceneMountModule(mut.pairs) : SM;
       await residBattery(MM, MUT, LIB, (ok) => {
         if (!ok) hits++;
-      });
+      }, SMUT);
     } catch (e) {
       hits = hits || 1; // 改坏后直接抛异常也算判据抓住
       void e;

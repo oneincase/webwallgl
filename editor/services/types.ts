@@ -75,8 +75,16 @@ export type CommandDef = {
   run: (...args: unknown[]) => unknown;
 };
 
+/**
+ * 命令注册表的**只读视图**（D3）：`CommandService.registry` 只用于枚举 / 查询 / 订阅
+ * （命令面板的 list()、onChange()、get()/has()/ownerOf()）。写入口只有 register 一条
+ * （它做 id / run 校验并记 owner），所以这里把 `add` / `setFallback` 从视图里去掉。
+ * 注意：这是**类型收窄**，不为它给 Registry 本身删方法（其它注册表仍要 add）。
+ */
+export type CommandRegistryView = Omit<Registry<CommandDef>, "add" | "setFallback">;
+
 export interface CommandService {
-  readonly registry: Registry<CommandDef>;
+  readonly registry: CommandRegistryView;
   /** 注册一条命令（内置与插件走同一条路）；返回撤销函数，owner 用于查归属与随插件卸载撤回 */
   register(def: CommandDef, owner?: string): Disposer;
   exec(id: string, ...args: unknown[]): unknown;

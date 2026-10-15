@@ -213,6 +213,39 @@ export function autosaveTargetFor(state: {
 
 export type DraftSlotInfo = { slot: string; savedAt: number; bytes: number };
 
+// ---------- 槽位元信息：列表只读 meta，不整份解码（§8.2 L6 读放大） ----------
+//
+// info() 只为了拿每个槽的 savedAt / bytes，却要把整份草稿读出来再 decodeDraft ——
+// `save()` 末尾的 `evict(await info())` 因此每次自动保存都要重读**全部**槽：
+// 8 槽 × 单槽上限 32MB 的最坏情况是每次自动保存读 + 解析 256MB。
+// 这里给每个槽另存一条**小 meta**（键 = NUL 前缀 + 槽名，内容 {savedAt, bytes}），
+// save() 与草稿同批写、clear()/淘汰时同批删；info() 只读 meta。
+// meta 键用 NUL 起头：真实槽名（vdir: / library: / local: / session[:key]）不可能以它开头，
+// 两套键不会互撞，keys() 里也能一眼分开。
+// **向后兼容是硬要求**：meta 缺失（老草稿 / 别的写入者 / meta 被手删）时 info() 回落到
+// 「整份读 + decodeDraft」这条旧路径，老槽不能从列表里凭空消失（DRAFT-2 断言 slot 序与 savedAt）。
+export const DRAFT_META_PREFIX = "\u0000meta\u0000";
+const draftMetaKey = (slot: string): string => `${DRAFT_META_PREFIX}${slot}`;
+const isDraftMetaKey = (key: string): boolean => key.startsWith(DRAFT_META_PREFIX);
+const draftSlotOfMetaKey = (key: string): string => key.slice(DRAFT_META_PREFIX.length);
+
+/** meta 内容同样不可信（手改 / 截断 / 旧版本）：形状不对一律当没有，让 info() 走回落路径 */
+export function parseDraftMeta(text: string): { savedAt: number; bytes: number } | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!isObj(raw)) return null;
+  const { savedAt, bytes } = raw as { savedAt?: unknown; bytes?: unknown };
+  if (typeof savedAt !== "number" || !Number.isFinite(savedAt)) return null;
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return null;
+  return { savedAt, bytes };
+}
+
+const encodeDraftMeta = (savedAt: number, bytes: number): string => JSON.stringify({ savedAt, bytes });
+
 export type DraftStore = {
   /** 所有槽（按 savedAt 降序，越新越前） */
   list(): Promise<DraftSlotInfo[]>;
@@ -225,8 +258,29 @@ const byNewest = (a: DraftSlotInfo, b: DraftSlotInfo): number => b.savedAt - a.s
 
 export function vdirDraftStore(be: VdirBackend = vdirBackend(), maxSlots = DRAFT_MAX_SLOTS, maxBytes = DRAFT_MAX_BYTES): DraftStore {
   const info = async (): Promise<DraftSlotInfo[]> => {
+    // 一趟扫键把「草稿槽」与「meta」分开；meta 是唯一会被读的字节（每个槽一条小 JSON）
+    const slots: string[] = [];
+    const metas = new Map<string, DraftSlotInfo>();
+    for (const key of await be.keys(DRAFT_ID)) {
+      if (!isDraftMetaKey(key)) {
+        slots.push(key);
+        continue;
+      }
+      const slot = draftSlotOfMetaKey(key);
+      if (!slot) continue;
+      const blob = await be.read(DRAFT_ID, key);
+      if (!blob) continue;
+      const meta = parseDraftMeta(await blob.text());
+      if (meta) metas.set(slot, { slot, savedAt: meta.savedAt, bytes: meta.bytes });
+    }
     const out: DraftSlotInfo[] = [];
-    for (const slot of await be.keys(DRAFT_ID)) {
+    for (const slot of slots) {
+      const meta = metas.get(slot);
+      if (meta) {
+        out.push(meta);
+        continue;
+      }
+      // 回落路径（meta 缺失 / 坏 meta）：整份读 + decode，口径与加 meta 之前逐字相同
       const blob = await be.read(DRAFT_ID, slot);
       if (!blob) continue;
       let savedAt = 0;
@@ -246,6 +300,7 @@ export function vdirDraftStore(be: VdirBackend = vdirBackend(), maxSlots = DRAFT
     for (const i of infos) {
       if (kept > 0 && (kept >= maxSlots || bytes + i.bytes > maxBytes)) {
         await be.remove(DRAFT_ID, i.slot);
+        await be.remove(DRAFT_ID, draftMetaKey(i.slot));
         continue;
       }
       kept += 1;
@@ -265,12 +320,16 @@ export function vdirDraftStore(be: VdirBackend = vdirBackend(), maxSlots = DRAFT
     },
     async save(d, slot) {
       if (!slot) return;
-      await be.write(DRAFT_ID, slot, new Blob([encodeDraft(d)], { type: "application/json" }));
+      const blob = new Blob([encodeDraft(d)], { type: "application/json" });
+      await be.write(DRAFT_ID, slot, blob);
+      // meta 与草稿同批写：列表（以及 save 末尾的 evict）只读它就能拿到 savedAt / bytes
+      await be.write(DRAFT_ID, draftMetaKey(slot), new Blob([encodeDraftMeta(d.savedAt, blob.size)], { type: "application/json" }));
       await evict(await info());
     },
     async clear(slot) {
       if (!slot) return;
       await be.remove(DRAFT_ID, slot);
+      await be.remove(DRAFT_ID, draftMetaKey(slot));
     },
   };
 }
