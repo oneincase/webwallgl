@@ -184,6 +184,33 @@ export declare function setMdlClipEvents(
  */
 export declare function moveMdlClip(bytes: Uint8Array, from: number, to: number): Uint8Array | null;
 
+/** 一条骨轨道：每帧 9 分量稠密 TRS（t0..2 / r0..2 弧度 / s0..2），帧数 = data.length / 9 —— W18a 对账 */
+export type MdlClipTrack = { frameCount: number; data: Float32Array };
+
+/**
+ * 读某片段里某根骨的轨道（编辑器文档视图；无 MDLA / 无该片段 / 无该骨轨道时 null）—— W18a 对账
+ */
+export declare function mdlClipTrack(bytes: Uint8Array, animId: number, bone: number): MdlClipTrack | null;
+
+/**
+ * 引擎解析出的绑定姿势 TRS 九分量（= computeSkinMatrices 的 base，与 invBindWorld 同源）；
+ * 无骨骼 / 骨号越界 / 解析失败时 null —— W18a 对账
+ */
+export declare function mdlBindTRS(bytes: Uint8Array, bone: number): Float32Array | null;
+
+/**
+ * 片段 animId + 时间 time ⇒ 骨 bone 合成后的局部 TRS 九分量（采样索引 / 最短弧 / 无轨道回落绑定姿势
+ * 全部与引擎 render/mdl-skin.js 同口径）。editPose = 编辑器预览增量（t/r 相加、s 相乘）；
+ * 无 MDLA / 无该片段 / 骨号越界 / time 非有限时 null。**只覆盖单条替换层**（多层加算栈不在范围）—— W18a 对账
+ */
+export declare function mdlClipFrameTrs(
+  bytes: Uint8Array,
+  animId: number,
+  bone: number,
+  time: number,
+  editPose?: MdlBoneDelta | null,
+): Float32Array | null;
+
 /** MDLS 段的骨数（无 MDLS 段 / 网格表不可结构化读出时 null）—— P0 */
 export declare function mdlBoneCount(bytes: Uint8Array): number | null;
 

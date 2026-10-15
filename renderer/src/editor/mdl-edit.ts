@@ -1033,3 +1033,159 @@ function aabbFromVertexData(data: Uint8Array, stride: number, vertexCount: numbe
   }
   return a;
 }
+
+// ---------- W18a 片段叠增量逐帧对账（MF 段语义） ----------
+// 目的：给定「片段 + 时间」，逐帧算出**每根骨的合成局部 TRS**，供页面读数，并与引擎
+// `render/mdl-skin.js` 的真实求值逐位对账（判据 scripts/verify-editor-model.mjs：
+// 用真语料把本文件的输出与引擎 computeSkinMatrices 写出的 `_local[i]` 逐元素比）。
+//
+// 同源口径（照抄，不许另立一套）：
+//   · 采样索引   mdl-skin.js:54 `frameIndices()` —— loop 按区间数 frames−1 环绕、
+//                mirror 周期 2(n−1) 折返、其余（single/未声明）钳 [0,n−1]；n≤1 恒 f0=f1=0,t=0。
+//   · 采样插值   mdl-skin.js:76 `sampleTrackTRS()` —— r 三分量（k=3..5）按最短弧，
+//                其余线性；**不是**四元数点积翻转。
+//   · 无轨道回落 mdl-skin.js:340 `if (!track || !track.keyframes.length) continue`
+//                ⇒ 该骨保持 acc = 绑定姿势（**不是**恒等 TRS，也不是轨道首帧）。
+//   · 绑定姿势   引擎 `parseMDL().bindTRS[i]`（mdl-parse.js:428-445，与 invBindWorld 同源）。
+//                这里**直接取引擎解析结果**，不自己再分解一遍 —— 引擎在 :428 明令
+//                「computeSkinMatrices 的 base 必须取这里，不能另算一套」。
+//   · 预览增量   mdl-skin.js:429-436 从 `mdl._editPose` 读 9 分量：k<6 相加、k≥6 相乘，
+//                与写盘 `applyBoneDelta` 的语义一一对应。
+//
+// **首版范围 = 单条替换层**：调用方一次只喂一条片段（等价 blend=1 的单层）。
+// 多层 / 加算栈（mdl-skin.js:388-427 的 addBaseSet / addW 归一化 / restAt 偏移 /
+// 逐层 rate 与 paused 时钟）**不在本版范围** —— 不做「看起来支持整张 animationlayers」
+// 的假象。单层时替换与加算的合成结果相同（都等于该帧采样值），所以本版不受影响；
+// 调用方若该层 rate ≠ 1，请把 time 先乘 rate 再传进来。
+
+/** 一条骨轨道：每帧 9 分量稠密 TRS（t0..2 / r0..2 弧度 / s0..2），帧数 = data.length / 9 */
+export type MdlClipTrack = { frameCount: number; data: Float32Array };
+
+/**
+ * 取某片段里某根骨的轨道 —— **按轨序号取**。
+ *
+ * 轨道顺序即骨骼顺序（`render/mdl-parse.js` 读到「boneId 字段实测恒为 0，轨顺序即骨骼顺序」，
+ * 引擎 `mdl-skin.js` 也直接 `L.anim.tracks[i]`；本文件的 `applyBoneDelta` 同样按 `tracks[bone]` 索引）。
+ * 只有轨道数与骨骼数不等时（例如手工裁剪过的文档）才退回按 boneId 字段匹配 —— 首版语料里
+ * 每根骨都有且只有一条轨道，按序索引恒成立。
+ */
+function clipTrackOf(anim: Anim, bone: number, boneCount: number): Track | null {
+  if (boneCount > 0 && anim.tracks.length === boneCount && anim.tracks[bone]) return anim.tracks[bone];
+  return anim.tracks.find((t) => t.boneId === bone) ?? null;
+}
+
+/** 读某片段里某根骨的轨道（编辑器文档视图；无 MDLA / 无该片段 / 无该骨轨道时 null） */
+export function mdlClipTrack(bytes: Uint8Array, animId: number, bone: number): MdlClipTrack | null {
+  const d = docOf(bytes);
+  const anims = d && animsOf(d);
+  if (!d || !anims || !Number.isInteger(bone) || bone < 0) return null;
+  const anim = anims.find((a) => a.id === animId);
+  const track = anim && clipTrackOf(anim, bone, bonesOf(d)?.length ?? 0);
+  if (!anim || !track) return null;
+  return { frameCount: Math.floor(track.data.length / 9), data: Float32Array.from(track.data) };
+}
+
+/** 引擎解析出的绑定姿势 TRS 九分量（= computeSkinMatrices 的 base；无骨骼 / 越界时 null） */
+export function mdlBindTRS(bytes: Uint8Array, bone: number): Float32Array | null {
+  if (!Number.isInteger(bone) || bone < 0) return null;
+  let m: { bindTRS?: Float32Array[] | null } | null = null;
+  try {
+    m = parseMDL(bytes) as { bindTRS?: Float32Array[] | null };
+  } catch {
+    return null;
+  }
+  const b = m && m.bindTRS && m.bindTRS[bone];
+  return b && b.length >= 9 ? Float32Array.from(b.subarray(0, 9)) : null;
+}
+
+/** 采样索引 —— mdl-skin.js:54 的同口径副本（引擎那个没导出，编辑器也不许 import vendor 内部） */
+function clipFrameIndices(mode: string, fps: number, time: number, n: number): { f0: number; f1: number; t: number } {
+  const frame = time * fps;
+  if (n <= 1) return { f0: 0, f1: 0, t: 0 };
+  if (mode === "loop") {
+    const span = Math.max(1, n - 1);
+    const w = ((frame % span) + span) % span;
+    const f0 = Math.floor(w);
+    return { f0, f1: (f0 + 1) % n, t: w - f0 };
+  }
+  if (mode === "mirror") {
+    const span = Math.max(1, n - 1);
+    const period = span * 2;
+    let w = ((frame % period) + period) % period;
+    if (w > span) w = period - w;
+    const f0 = Math.floor(w);
+    return { f0, f1: Math.min(f0 + 1, n - 1), t: w - f0 };
+  }
+  const c = Math.min(Math.max(frame, 0), n - 1);
+  const f0 = Math.floor(c);
+  return { f0, f1: Math.min(f0 + 1, n - 1), t: c - f0 };
+}
+
+/** 在 time 处采样 9 分量 TRS（r 三分量最短弧）—— mdl-skin.js:76 同口径 */
+function sampleClipTrs(data: Float32Array, mode: string, fps: number, time: number, out: Float32Array): Float32Array {
+  const n = Math.floor(data.length / 9);
+  if (n === 0) {
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    out[3] = 0; out[4] = 0; out[5] = 0;
+    out[6] = 1; out[7] = 1; out[8] = 1;
+    return out;
+  }
+  const { f0, f1, t } = clipFrameIndices(mode, fps, time, n);
+  const a = f0 * 9;
+  const b = f1 * 9;
+  const it = 1 - t;
+  for (let i = 0; i < 9; i++) {
+    if (i >= 3 && i <= 5) {
+      let d = data[b + i] - data[a + i];
+      if (d > Math.PI) d -= 2 * Math.PI;
+      else if (d < -Math.PI) d += 2 * Math.PI;
+      out[i] = data[a + i] + d * t;
+    } else {
+      out[i] = data[a + i] * it + data[b + i] * t;
+    }
+  }
+  return out;
+}
+
+/**
+ * 片段 animId + 时间 time ⇒ 骨 bone 合成后的局部 TRS 九分量（页面读数 / 对账用）。
+ *
+ * 该骨在这条片段里没有轨道（或空轨道）⇒ 回落绑定姿势 bindTRS（引擎 mdl-skin.js:340 同口径）。
+ * editPose = 编辑器预览增量（与 setBonePose 入参同形）：t/r 相加、s 相乘。
+ *
+ * 返回新数组；无 MDLA / 无该片段 / 骨号越界 / 连 bindTRS 都读不到 / time 非有限时 null。
+ * 只覆盖单条替换层（见段首注释）。
+ */
+export function mdlClipFrameTrs(
+  bytes: Uint8Array,
+  animId: number,
+  bone: number,
+  time: number,
+  editPose?: MdlBoneDelta | null,
+): Float32Array | null {
+  const d = docOf(bytes);
+  const anims = d && animsOf(d);
+  if (!d || !anims || !Number.isFinite(time)) return null;
+  const anim = anims.find((a) => a.id === animId);
+  if (!anim) return null;
+  const boneCount = bonesOf(d)?.length ?? 0;
+  if (!Number.isInteger(bone) || bone < 0 || bone >= boneCount) return null;
+  const out = new Float32Array(9);
+  const track = clipTrackOf(anim, bone, boneCount);
+  if (!track || track.data.length < 9) {
+    const base = mdlBindTRS(bytes, bone);
+    if (!base) return null;
+    out.set(base);
+  } else {
+    sampleClipTrs(track.data, text(anim.mode), anim.fps, time, out);
+  }
+  if (editPose) {
+    const t = editPose.t ?? [0, 0, 0];
+    const r = editPose.r ?? [0, 0, 0];
+    const s = editPose.s ?? [1, 1, 1];
+    for (let k = 0; k < 3; k++) out[k] += t[k] ?? 0;
+    for (let k = 0; k < 3; k++) out[3 + k] += r[k] ?? 0;
+    for (let k = 0; k < 3; k++) out[6 + k] *= s[k] ?? 1;
+  }
+  return out;
+}

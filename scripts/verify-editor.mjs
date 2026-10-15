@@ -50,6 +50,126 @@ import { pathToFileURL } from "node:url";
 import { ROOT, LIB, imp } from "./lib/verify-kit.mjs";
 import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
 
+//  ── task-33 台账：A 类 112 条（提取器假阳性 1 条 ⇒ 实为 111 条，见 #109）源码文本断言的三选一判定（逐条可 grep）──
+//  判定图例：
+//    delete = 用户可见行为已由具名 headless 段覆盖 ⇒ 删掉文本断言
+//    add    = 可行为化但 headless 无覆盖 ⇒ 先补 headless 断言，再删文本断言
+//    keep   = 保留 + TEXT-ONLY-BY-DESIGN（读点/反重复/契约面/内部键/锚点守卫/i18n 成对/CSS）
+//  行号是 2026-10-15 判定时的坐标（删改后会漂移）；消息文本才是稳定的 grep 键。
+//  台账正文（id|种类|文件:行|所在 section|判定）——
+//    1. [C] scripts/verify-all.mjs:1476 §S → keep
+//    2. [A] renderer/src/scene-mount.ts:1828 §W → keep
+//    3. [W] editor/audio-live.ts:2524 §AA3 → keep（CDP 不可观测：AudioNode 接线（采集回接输出）与「不等 AudioContext 跑起来才建图」都没有页面外观察面，需真音频输出才能听出「试听被掐哑」）
+//    4. [A] editor/index.html:3157 §MA → keep
+//    5. [W] editor/main.ts:3290 §MC → keep
+//    6. [W] renderer/src/scene-mount.ts:3519 §MD → keep
+//    7. [W] renderer/vendor/we-scene/render/renderer.js:3521 §MD → keep
+//    8. [W] editor/main.ts:3621 §ME → add （keep 依据：无自包含 rigged 装置——camera.mdl/sphere.mdl 只是普通网格与相机，为「子网格贴图行随 getModelInfo 变」再造多骨多片段装置收益配不上成本）
+//    9. [W] editor/main.ts:3772 §MF → add （keep 依据：同上，无自包含 rigged 装置可造「骨骼 / 片段」分组）
+//   10. [W] editor/main.ts:3773 §MF → add （keep 依据：同上，输入即推预览需 rigged 骨骼装置）
+//   11. [W] editor/main.ts:3775 §MF → add （keep 依据：同上，commitMdlEdit 写时复制需 rigged 装置）
+//   12. [W] editor/main.ts:3779 §MF → keep
+//   13. [W] editor/main.ts:3990 §MG → add （keep 依据：同上，无自包含 rigged 装置可造「动画片段」分组）
+//   14. [W] editor/main.ts:3994 §MG → add （keep 依据：同上，首个片段删除按钮禁用需多片段 rigged 装置）
+//   15. [C] editor/model.ts:4055 §MH → keep
+//   16. [C] renderer/src/scene-mount.ts:4201 §MH → keep
+//   17. [C] renderer/vendor/we-scene/render/mdl.js:4203 §MH → keep
+//   18. [W] editor/main.ts:4344 §MH → add （keep 依据：装置不自包含——唯一 gltf fixture 在 .tmp/whale-iso，git ls-files .tmp = 0，他机必红）
+//   19. [C] editor/index.html:4352 §MH → add（AT 段已写：负控=导入菜单默认收起；正控=点「导入模型」开 `#model-menu`，三档 preset 顺序与词条都在（data-preset=auto|puppet|mesh），文件框 multiple 且 accept 同时含网格与图片扩展。真机绿后删文本断言）
+//   20. [A] editor/pointer-studio.ts:4811 §POINTER-STUDIO → keep
+//   21. [A] editor/save.ts:4837 §POINTER-STUDIO → keep
+//   22. [P] editor/index.html:4850 §POINTER-STUDIO → keep
+//   23. [P] editor/main.ts:4854 §POINTER-STUDIO → keep
+//   24. [P] editor/main.ts:4857 §POINTER-STUDIO → add （keep 依据：接线读点，行为级无法区分「用了哪个读点」；且需木偶装置）
+//   25. [P] editor/index.html:4860 §POINTER-STUDIO → add（AT 段已写：负控=菜单默认收起；正控=点视口工具条 `#tb-pointer` 开 `#pointer-menu`，轨道表 `#ptr-tracks` / 回放 `#ptr-play` / 删除 `#ptr-del` / 导出边界提示 `[data-et=ptr.exportNote]` 都在。真机绿后删文本断言）
+//   26. [P] editor/editor.css:4864 §POINTER-STUDIO → keep
+//   27. [A] editor/main.ts:4877 §I → keep
+//   28. [W] editor/main.ts:4879 §I → keep
+//   29. [P] editor/main.ts:4887 §I → add（AW 段已写：#29 六个键各自数出可观察效果——⌘D 复制 / Delete 删 / ⌘Z 撤销 / ⌘Y 重做 / Backspace 删 / ⌘S 保存；只用 `#ed-tree .ed-node` 一个量、每步相对基线 awN 数差值（AT3 那次红就是 waitFor 等 .ed-node 而 check 读 treeNames 两个量不同源）。真机绿后删文本断言）
+//   30. [P] editor/main.ts:4891 §I → add （keep 依据：CDP 不可观测——需注入「引擎读不到字节」的失败态）
+//   31. [C] editor/main.ts:4894 §I → add （keep 依据：CDP 不可观测——需注入「写盘失败」的失败态）
+//   32. [P] editor/main.ts:4896 §I → keep
+//   33. [P] editor/main.ts:4899 §I → keep
+//   34. [C] renderer/src/scene-mount.ts:4924 §I → keep
+//   35. [C] editor/i18n.ts:4936 §I → keep
+//   36. [C] editor/i18n.ts:4951 §I → keep
+//   37. [P] editor/index.html:4953 §I → delete
+//   38. [A] editor/main.ts:4970 §I → keep
+//   39. [W] editor/main.ts:4977 §I → delete
+//   40. [A] editor/index.html:4987 §I → keep
+//   41. [P] editor/index.html:4991 §I → add（AT 段已写两对：①说明面板负控=先真点视口让它收起（`[data-pane=docs].hidden`）、正控=点说明标签后 `#docs-body` 非空；②渲染选项弹层负控=默认收起、正控=点 `#tb-render-opts` 后帧率/音量/AA/pq/pp 五个控件可见（它们属于这个弹层 `#render-menu`，不是性能面板里的东西）。库/配置两条只留「面板确实可见 + 控件在」；性能面板的正控是「点 `.wb-tab[data-tab=perf]` 后画布真的有像素宽」，但**底栏 `#ed-console` 默认就是收起的**（`editor/layout.ts:41 collapsed: true` ⇒ `shared/workbench/shell.css:665 .wb-panel.is-collapsed{display:none}`），收起时那颗标签的 rect 是 0 ⇒ 真鼠标点在 (0,0)、点不开；用户展开的动作是双击分隔条（`shared/workbench/splitter.ts:118` dblclick 切换），所以 AT 里先走这个动作再点标签，并先切回控制台页拿负控（性能页 hidden），配置的正文正控挪到 #102 的库条目态：空白工程记负控「`#props-state` 为空 + `#props-body` 里没有属性控件」并把正文原文存下来（注意 `wallpaperConfig.setItem` 开头是 `if ((id ?? "") === itemId) return;`，itemId 初值就是空串 ⇒ 空白工程下它可能压根没渲染过，正文是空而不是那句 noLibraryItem 提示，所以负控不能要求正文非空）；`?item=` 后 `loadProps` 使 state 由空变非空且正文换掉那句（条目可配置项声明依赖作者工程，E2E 不造，以 state 非空为准）。真机绿后删文本断言）
+//   42. [W] editor/main.ts:5009 §I → add（AW 段已写：库条目态（!projectDir && libItem ⇒ 状态栏「壁纸库 · ⌘S 另存为项目」）按 ⌘S 走另存为项目那条分支——新建一个浏览器存储工程并接管，且库里的原 scene.json 一个字节不改；「有 projectDir 就写回」那半条由 L 段既有的「⌘S 覆盖同一项目文件夹（不新建）」覆盖。注：#vdir-dlg 只由「打开」那条路（requireProjectDir("open") → pickVirtualProject）弹，⌘S 的另存为分支用 purpose="new" → createVirtualProject，不弹窗）
+//   43. [W] editor/main.ts:5016 §I → add（AU 段已写：#43 先 saveLoose() 把 newBlank 建的虚拟工程整份落到本机文件夹得到库条目 id，不带 ?item= 打开是空文档（负控）⇒ 带 ?item=<id> 打开就是那 2 层（正控）；#docs=library 直达说明面板的壁纸库章。真机绿后删文本断言）
+//   44. [W] editor/main.ts:5031 §I → add（AW 段已写：#tb-plugins 开弹窗 → 点 #plugins-docs → 使用说明面板渲染出插件章）
+//   45. [P] bench/docs-plugins.ts:5036 §I → keep
+//   46. [C] editor/i18n.ts:5038 §I → keep
+//   47. [C] editor/i18n.ts:5054 §I → keep
+//   48. [P] editor/index.html:5073 §I → keep
+//   49. [P] editor/main.ts:5079 §I → delete
+//   50. [W] editor/main.ts:5090 §I → add （keep 依据：CDP 不可观测——preview.au 是闭包里的 new Audio()，从不进 DOM，拿不到 src 是否卸掉）
+//   51. [W] editor/main.ts:5098 §I → delete
+//   52. [W] editor/main.ts:5099 §I → delete
+//   53. [W] renderer/src/scene-mount.ts:5103 §I → keep
+//   54. [W] editor/main.ts:5104 §I → delete
+//   55. [C] editor/main.ts:5113 §I → add（AV 段已写：负控=从恢复横幅进来的文档按钮是「播放」图标且两次取样逐字相同（停在当前帧）；正控=点 `#tb-play` 后图标切「暂停」且**编辑器时钟读数**真的在走（`#tl-time` / `#tl-range`；时钟层是 `editor/text.ts:30 CLOCK_SCRIPT` 的墙上时间，缺省只有 `HH:MM`，画布像素在同一分钟内不可能变，所以像素只能当现场、不能当判据）；再点一次又停住。真机点击保真度边界（elementFromPoint 命中校验 + 合成点击回退），非产品缺陷。真机绿后删文本断言）
+//   56. [P] renderer/vendor/we-scene/scene/parse.js:5155 §CONTAINER → keep
+//   57. [P] renderer/vendor/we-scene/render/renderer.js:5193 §CONTAINER → keep
+//   58. [P] editor/index.html:5290 §CONTAINER → add（AT 段已写：负控=有文档时「加容器层」「加全屏后期层」两钮可用；正控=各点一次，树里各多一层。真机绿后删文本断言）
+//   59. [P] renderer/vendor/we-scene/scene/parse.js:5329 §ALPHA → keep
+//   60. [P] renderer/vendor/we-scene/render/renderer.js:5330 §ALPHA → keep
+//   61. [P] renderer/vendor/we-scene/render/renderer.js:5331 §ALPHA → keep
+//   62. [P] renderer/vendor/we-scene/render/renderer.js:5332 §ALPHA → keep
+//   63. [P] renderer/vendor/we-scene/scene/parse.js:5333 §ALPHA → keep
+//   64. [P] renderer/vendor/we-scene/render/renderer.js:5334 §ALPHA → keep
+//   65. [P] editor/index.html:5376 §ALPHA → add（AT 段已写：负控=尺寸对话框默认没开；正控=点 `#ly-add-alpha` 开出 `#alpha-dlg`。真机绿后删文本断言）
+//   66. [P] editor/index.html:5379 §ALPHA → add（AT 段已写：正控=对话框里 alpha-w / alpha-h / alpha-canvas / alpha-ok / alpha-cancel 五个控件都在。真机绿后删文本断言）
+//   67. [W] editor/main.ts:5383 §ALPHA → add（AT 段已写：负控=宽填 0 ⇒ `#alpha-ok` 禁用；正控=改 640×360 ⇒ 恢复可用，点「添加」真落出一层且检视器「效果画布尺寸」两框就是 640/360（树行名只是 alpha.defaultName「透明层」，不带尺寸，别拿行文本当观察面）。真机绿后删文本断言）
+//   68. [P] editor/editor.css:5388 §ALPHA → keep
+//   69. [W] editor/main.ts:5416 §ALPHA → keep
+//   70. [P] editor/main.ts:5417 §ALPHA → keep
+//   71. [P] editor/editor.css:5418 §ALPHA → keep
+//   72. [P] editor/main.ts:5428 §ALPHA → keep
+//   73. [C] editor/shaders/effects/fade.body.glsl:5531 §J → keep
+//   74. [W] editor/main.ts:6249 §FX-INLINE → keep
+//   75. [C] editor/main.ts:6362 §M10 → keep
+//   76. [C] scripts/verify-all.mjs:6469 §M10 → keep
+//   77. [W] editor/main.ts:6583 §SELECT-2 → add（AU 段已写：先在没有锁定层时按一次 ⌘A 自量基线 `auAll`（要求 ≥2，第二层用 addTextPreset("clock") 保证名字可区分），再锁最后一层 ⇒ ⌘A 选中数 = auAll−1 且不含被锁名 ⇒ 解锁 ⇒ 又 = auAll；两侧同一个量 `.ed-node.selected`，不拿 treeNames().length 当层数。真机绿后删文本断言）
+//   78. [W] editor/main.ts:6724 §CLIPBOARD → delete
+//   79. [W] editor/main.ts:6725 §CLIPBOARD → delete
+//   80. [W] editor/main.ts:6845 §SCENE-SET → delete
+//   81. [W] editor/index.html:6859 §SCENE-SET → add（AT 段已写：负控=场景设置菜单默认收起；正控=点 `#tb-scene-opts` 开 `#scene-menu`，其中 `[data-et=scn.hint]` 非空且确实在菜单内。真机绿后删文本断言）
+//   82. [P] editor/layer-kinds.ts:7492 §LIGHT-CAM → keep
+//   83. [W] editor/main.ts:7511 §LIGHT-CAM → keep
+//   84. [W] editor/i18n.ts:7564 §LIGHT-CAM → keep
+//   85. [P] renderer/src/scene-mount.ts:8341 §LIGHT-CAM → keep
+//   86. [P] renderer/src/scene-mount.ts:8348 §LIGHT-CAM → keep
+//   87. [P] renderer/src/scene-mount.ts:8355 §LIGHT-CAM → keep
+//   88. [P] renderer/src/scene-mount.ts:8361 §LIGHT-CAM → keep
+//   89. [P] renderer/src/scene-mount.ts:8366 §LIGHT-CAM → delete（由 W 段既有的行为级判据覆盖：#ed-scripts-off-text 的「已拦截 1 段脚本」+ 诊断流 `scripts disabled: skipped 1`；一旦重复计一次就变 2 ⇒ 那两条必红）
+//   90. [P] renderer/src/scene-mount.ts:8370 §LIGHT-CAM → keep
+//   91. [P] renderer/src/scene-mount.ts:8375 §LIGHT-CAM → keep
+//   92. [P] renderer/src/scene-mount.ts:8382 §LIGHT-CAM → keep
+//   93. [P] renderer/src/scene-mount.ts:8396 §LIGHT-CAM → keep
+//   94. [P] renderer/src/scene-mount.ts:8403 §LIGHT-CAM → keep
+//   95. [P] renderer/src/scene-mount.ts:8408 §LIGHT-CAM → keep
+//   96. [P] renderer/src/api/editor.ts:8419 §LIGHT-CAM → keep
+//   97. [W] editor/main.ts:8620 §DRAFT-2 → keep
+//   98. [A] editor/draft.ts:8622 §DRAFT-2 → keep
+//   99. [W] editor/main.ts:8642 §DRAFT-2 → add（AT 段已写：#99 由 #102 的横幅对覆盖——负控=没有未保存编辑时新恢复横幅不出现；正控=漏保存刷新后横幅出现且带自己的两个按钮 id。真机绿后删文本断言）
+//  100. [W] editor/main.ts:8656 §DRAFT-2 → delete
+//  101. [W] editor/main.ts:8678 §DRAFT-2 → add（AU 段已写：负控=还在编辑时新旧两条横幅都不出现；正控=刷新后点 `#draft-recover-restore` 图层真的回来（走恢复分支，不是旧横幅的重开目录分支）。真机点击保真度边界（elementFromPoint 命中校验 + 合成点击回退），非产品缺陷。真机绿后删文本断言）
+//  102. [W] editor/index.html:8685 §DRAFT-2 → add（AT 段已写：负控=没有未保存编辑时新横幅不出现；正控=漏保存刷新后横幅带 `#draft-recover-restore` / `#draft-recover-discard` 两个 id 且文案含恢复/丢弃。真机绿后删文本断言）
+//  103. [C] editor/i18n.ts:8694 §DRAFT-2 → keep
+//  104. [P] editor/i18n.ts:8695 §DRAFT-2 → keep
+//  105. [W] renderer/vendor/we-scene/render/particles.js:8962 §PARTICLE-V2 → keep
+//  106. [W] editor/main.ts:9001 §PARTICLE-V2 → keep
+//  107. [W] editor/main.ts:9720 §WARP → keep
+//  108. [P] editor/main.ts:9753 §WARP → keep
+//  109. [C] editor/gltf.ts:9828 §GEOM → add （n/a 提取器假阳性：语句本就是行为级 check、已断言 6×6/49/216，无文本断言可删）
+//  110. [P] editor/i18n.ts:10958 §KIND-I18N → keep
+//  111. [A] editor/main.ts:13216 §task-28 B → keep
+//  112. [C] editor/main.ts:13305 §SRC-CODE-ONLY → keep
+
 let failed = 0;
 let passed = 0;
 function check(ok, msg) {
@@ -1473,6 +1593,7 @@ const uniformNotes = (frag) => {
     check(json(f.EFFECT_CATEGORIES) === json(Object.keys(wantCats)), `分类表顺序锁定：颜色 / 模糊 / 变形 / 风格化 / 动态 / 转场 / 模拟 / 音频 / 互动（${json(f.EFFECT_CATEGORIES)}）`);
     const gotCats = Object.fromEntries(f.EFFECT_CATEGORIES.map((c) => [c, all.filter((e) => e.category === c).map((e) => e.id)]));
     check(json(gotCats) === json(wantCats), `16 个效果逐个归到分好的类里（${json(gotCats)}）`);
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #1：门禁元数据自检：断言 verify-all 的 EFFECT_CATEGORIES 分类）
     check(all.length === 16 && all.every((e) => f.EFFECT_CATEGORIES.includes(e.category)), `分类无遗漏无越界（未分类：${json(all.filter((e) => !f.EFFECT_CATEGORIES.includes(e.category)).map((e) => e.id))}）`);
     check(f.EFFECT_CATEGORY_OTHER === "other" && !f.EFFECT_CATEGORIES.includes("other"), "「其它」只作兜底分组（插件可省 category），不属于内置分类表");
     // 下拉就是这么排的：main.ts 的 optgroup 循环直接吃 groupEffectsByCategory(list()) 的结果，
@@ -1825,6 +1946,7 @@ const trustMod = await loadEditorModule("trust");
   check(!allow("local", true, "off") && allow("local", false, "on"), "?scripts=off / on 覆盖宿主判断");
   check(ov("?scripts=off&item=1") === "off" && ov("?scripts=on") === "on" && ov("?scripts=1") === null && ov("") === null, "scriptsOverrideFrom：只认 on / off");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #2：架构事实「所有脚本求值点都走开关后的求值函数」=无旁路；行为级无法证明『所有点』）
   check(!/wtext\.eval(Object|Text)Script\(/.test(sm) && !/setConstantScriptRuntime\?\.\(wtext\./.test(sm), "引擎所有脚本求值点（对象字段 / 文字 / 效果开关 / general / 材质常量）都走开关后的求值函数");
   check(/const scriptsOff = cfg\.scripts === false;/.test(sm) && /evalObjectScript: typeof wtext\.evalObjectScript = scriptsOff \? skipScript/.test(sm), "scripts: false 时求值函数换成「计数并返回 null」");
   const mountSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/mount.ts"), "utf8");
@@ -3154,6 +3276,7 @@ section("MA. 模型层识别 editor/model.ts + doc.modelFormOf（W12）");
   check(/opts\.after\?\.\(\);\s*void detectPuppets\(\);/.test(mainSrc) && /const found = await scanPuppets\(d, \(name\) => assets\.read\(name\)\);\s*if \(d !== doc \|\| !found\.size\) return;\s*d\.puppets = found;\s*rebuildTree\(d\);/.test(mainSrc), "页面：打开后异步扫 puppet，换了文档作废，扫完写 doc.puppets 并重建树");
   check(/const info = editor && Number\.isFinite\(id\) \? editor\.getModelInfo\(id\) : null;/.test(mainSrc) && /\{ id: "model", order: 700, when: \(\) => true, render: modelGroup(?:, tab: "model")? \}/.test(mainSrc) && /modelInfoRows\(info\)/.test(mainSrc), "检视器「模型」分组：信息只经 getModelInfo，行由 modelInfoRows 排");
   const pageSrc = fs.readdirSync(path.join(ROOT, "editor")).filter((f) => f.endsWith(".ts") && f !== "i18n.ts").map((f) => fs.readFileSync(path.join(ROOT, "editor", f), "utf8")).join("\n");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #4：反重复实现：页面不自己解析 .mdl；行为级观察不到『没有第二套解析』）
   check(!/\.puppet\b(?!s)/.test(pageSrc.replace(/\b(json|modelJson)\.puppet/g, "").replace(/\bet\("(?:md|gl\.form)\.puppet"\)/g, "")) && !/parseMDL|mdl-parse/.test(pageSrc), "页面不读 layer.puppet、不自己解析 .mdl（只有 scanPuppets 读 model json 的 puppet 字段）");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const mKeys = ["insp.model", "kind.model", "model.notLoaded", "model.form.puppet", "model.form.mesh", ...rows.map((r) => r[0])];
@@ -3287,6 +3410,7 @@ section("MC. 附着点绑定 editor/model.ts（W14）");
   const mainSrcNoCmt = codeNoComments(mainSrc);
   check(/const attachOffsetOf: AttachOffsetOf = \(mid, name\) =>\s*editor\?\.getAttachmentPoints\(Number\(mid\)\)/.test(mainSrc) && /attachToModel\(d, node\.id, p\.model, p\.name, attachOffsetOf\)/.test(mainSrc) && /detachFromModel\(d, node\.id, attachOffsetOf\)/.test(mainSrc),
     "页面：绑定 / 解绑的偏移只经引擎 getAttachmentPoints（不自己算蒙皮），走 structEdit");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #5：检视器分组结构+视口附着标记绘制细节；MC 覆盖功能，标记绘制需像素比对，代价>收益）
   check(/\{ id: "attach", order: 1200, when: \(\) => true, render: attachGroup(?:, tab: "props")? \}/.test(mainSrcNoCmt) && /drawAttachMarkers\(\);[\s\S]{0,200}?if \(warpSession\) \{[\s\S]{0,240}?drawWarpPins\(\);[\s\S]{0,240}?\} else drawBoneMarkers\(\);/.test(mainSrcNoCmt), "检视器「挂到模型」分组 + 视口附着点十字标记（操控变形时钉标记接管骨标记）");
   const sm = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/getAttachmentPoints\(id: number\): EditorAttachmentPoint\[\] \| null \{/.test(sm) && /mdl\.computeSkinMatrices\(m, currentTime\(\), l\.animationLayers, getBoneOverrides\(l\)\);/.test(sm) && /mdl\.attachmentEffectiveOffset\(l, name\)/.test(sm),
@@ -3516,8 +3640,10 @@ section("MD. 蒙皮网格拾取 / 轮廓 hittest.js + mdl-skin.skinnedMeshes（W
   const smCode = codeOnly(sm);
   const rj = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
   const rjCode = codeOnly(rj);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #6：引擎读点：meshHit 只接在编辑器 hitTestAt）
   check((smCode.match(/meshHit:/g) ?? []).length === 1 && /hitTestAt\(x: number, y: number, opts = \{\}\) \{[\s\S]{0,900}meshHit: \(l: any\) => \{/.test(smCode),
     "引擎：meshHit 只接在编辑器 hitTestAt（脚本光标 / 点击派发的 hit-test 不变）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #7：引擎读点：getModelMvp = 上一帧 viewProj）
   check(/lastFrameMats = \{ cam, viewProj, viewProjPersp \}/.test(rjCode) && /getModelMvp: function \(layer\) \{[\s\S]{0,300}mat4Multiply\(vp, puppetModelMatrix\(layer, f\.cam\)\)/.test(rjCode),
     "渲染器：getModelMvp = 上一帧 viewProj（perspective 层换透视 VP）· puppetModelMatrix，与 drawPuppetDirect 同一套");
   check(/mdl\.skinnedMeshes\(m, skin, ev\.perspective\)/.test(sm) && /hull = g\?\.hull && g\.hull\.length >= 3/.test(sm), "getLayerOutline / hitTestAt 共用 modelScreenMesh（同一份投影）");
@@ -3776,6 +3902,7 @@ section("MF. 骨骼姿势 / 片段关键帧 editor/model.ts + api applyBoneDelta
     /if \(puppetMdl\) d\.puppets = new Map\(\[\.\.\.\(d\.puppets \?\? \[\]\), \[r\.path, puppetMdl\]\]\);/.test(mainSrcCode) && /if \(puppetMdl\) n\.obj\.image = r\.path;\s*else n\.obj\.model = r\.path;\s*mutate\?\.\(n\.obj\);/.test(mainSrcCode) &&
     /function applyBoneEdit\([\s\S]{0,400}commitMdlEdit\([\s\S]{0,200}applyBoneDelta\(bytes, e\.animId, e\.bone, e\.frame, e\.delta, e\.radius\)/.test(mainSrcCode),
     "应用：commitMdlEdit 写时复制 + 继承旧副本文件 + puppet 登记 + 结构编辑改指向（可撤销、重挂）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #12：视口绘制细节：骨骼关节/父子连线来自 getBonePoints）
   check(/function drawBoneMarkers\(\)[\s\S]{0,300}editor\.getBonePoints\(/.test(mainSrcCode) && /drawAttachMarkers\(\);[\s\S]{0,200}?if \(warpSession\) \{[\s\S]{0,240}?drawWarpPins\(\);[\s\S]{0,240}?\} else drawBoneMarkers\(\);/.test(mainSrcCode), "视口：骨骼关节 / 父子连线来自 getBonePoints（操控变形模式下改画钉子）");
   check(/if \(g\.id === "bones"\) bonesShown = true;\s*\}\s*if \(!bonesShown\) dropBonePick\(\);/.test(mainSrc) && /if \(!node\) \{\s*dropBonePick\(\);/.test(mainSrc), "离开模型层撤掉骨骼预览");
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -4039,6 +4166,97 @@ async function gltfSkinCheck(G, scale = 100) {
   return out;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// MF4. 片段叠增量逐帧对账（task-34 / W18a）：mdlClipFrameTrs ≡ 引擎 computeSkinMatrices
+//      完整语料 + 6 条变异在 scripts/verify-editor-model.mjs 的 W18a 段；这里用同一批真代码
+//      在真语料上钉住「逐骨逐时刻最坏差值」，并把数据层的取轨口径钉在源码上。
+// ───────────────────────────────────────────────────────────────────────────
+section("MF4. 片段叠增量逐帧对账（task-34）：mdlClipFrameTrs ≡ 引擎 computeSkinMatrices");
+{
+  const me = await loadRendererTs("renderer/src/editor/mdl-edit.ts");
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const M = await imp("renderer/vendor/we-scene/render/mdl-math.js");
+  const { modelTruth } = await imp("scripts/verify-editor-model.mjs");
+  const src = fs.readFileSync(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"), "utf8");
+  const EPS = 1e-5;
+
+  check(
+    /export function mdlClipTrack\(bytes: Uint8Array, animId: number, bone: number\): MdlClipTrack \| null/.test(src) &&
+      /export function mdlBindTRS\(bytes: Uint8Array, bone: number\): Float32Array \| null/.test(src) &&
+      /export function mdlClipFrameTrs\(/.test(src),
+    "数据层三个 API 就位：mdlClipTrack / mdlBindTRS / mdlClipFrameTrs",
+  );
+  check(
+    /function clipTrackOf\(anim: Anim, bone: number, boneCount: number\): Track \| null/.test(src) &&
+      /anim\.tracks\.length === boneCount && anim\.tracks\[bone\]/.test(src) &&
+      (src.match(/t\.boneId === bone/g) ?? []).length === 1,
+    "轨道按轨序号取（文件里 boneId 字段恒为 0 ⇒ 只在轨数≠骨数时才退回按字段找）",
+  );
+  check(
+    /首版范围 = 单条替换层/.test(src) && /不在本版范围/.test(src),
+    "范围诚实：注释写明只覆盖单条替换层，多层 / 加算栈不在范围（不做假象支持）",
+  );
+  check(/mdl-skin\.js:429-436/.test(src), "预览增量口径标注与引擎同源（mdl-skin.js:429-436：k<6 相加、k≥6 相乘）");
+
+  // 措辞勘误：W18a 不是「标尺 / 时间轴关键帧可视化」，而是「片段叠增量逐帧对账」（计划书与判据文案都得这么说）
+  const plan = fs.readFileSync(path.join(ROOT, "docs/EDITOR-PLAN.md"), "utf8");
+  const w18 = plan
+    .split("\n")
+    .filter((l) => /W18a/.test(l))
+    .join("\n");
+  check(
+    /片段叠增量逐帧对账/.test(w18) && !/标尺/.test(plan),
+    "措辞勘误：计划书 W18a 是「片段叠增量逐帧对账」，全文不出现「标尺关键帧」",
+  );
+
+  // 真语料：逐骨逐时刻比引擎真实求值（编辑器九分量经引擎自己的 composeTRS 合成，两侧同一套矩阵数学）
+  let pairs = 0;
+  let worst = 0;
+  let worstAt = "";
+  for (const id of ["3444535389", "3465215190", "3238423642"]) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    let used = 0;
+    for (const o of t.objects) {
+      if (used >= 1) break;
+      const bytes = t.read(o.info.mdlPath);
+      let mdl = null;
+      try {
+        mdl = P.parseMDL(bytes);
+      } catch {
+        continue;
+      }
+      if (!mdl.bones.length || !mdl.animations.length) continue;
+      const a = mdl.animations.find((x) => x.frameCount > 0);
+      if (!a) continue;
+      used++;
+      const span = a.frameCount / (a.fps || 1);
+      for (const time of [0, 0.5 * span, 0.999 * span]) {
+        S.computeSkinMatrices(mdl, time, [{ animation: a.id, visible: true, additive: false, blend: 1, rate: 1 }], null);
+        for (let i = 0; i < mdl.bones.length; i++) {
+          const trs = me.mdlClipFrameTrs(bytes, a.id, i, time);
+          if (!trs) {
+            worst = Infinity;
+            worstAt = worstAt || `${id} bone${i} 返回 null`;
+            continue;
+          }
+          const g = M.composeTRS(trs[0], trs[1], trs[2], trs[3], trs[4], trs[5], trs[6], trs[7], trs[8], new Float32Array(16));
+          let d = 0;
+          for (let k = 0; k < 16; k++) d = Math.max(d, Math.abs(g[k] - mdl._local[i][k]));
+          pairs++;
+          if (d > worst) {
+            worst = d;
+            worstAt = `${id}#${o.id} anim${a.id} bone${i} t=${time.toFixed(3)}`;
+          }
+        }
+      }
+    }
+  }
+  check(pairs >= 20, `真语料对账样本 ${pairs} 组（≥20）`);
+  check(worst <= EPS, `mdlClipFrameTrs ≡ 引擎 computeSkinMatrices：最坏差值 ${worst.toExponential(2)} ≤ ${EPS}${worstAt ? ` @ ${worstAt}` : ""}`);
+}
+
 section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl（W19）");
 {
   const G = await loadEditorModule("gltf");
@@ -4052,6 +4270,7 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
   check(sk.mid > 0 && sk.mid < 0.5, `帧间中点（引擎欧拉角线性插值 vs glTF 球面 / 样条插值，不含 STEP 片段）最大误差 ${sk.mid.toFixed(3)} px < 0.5（30 fps 稠密采样）`);
   check(sk.jump < 0.6, `欧拉角相邻帧最大跳变 ${sk.jump.toFixed(3)} rad（连续解，不在 ±π / 万向节处翻转）`);
   const ms = sk.models.find((x) => x.name === "skinned" && x.target === "puppet");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #15：离线产物结构（MDLV0023 字段/计数）归 verify-editor-model；）
   check(ms.mdl.magic === "MDLV0023" && json(ms.mdl.bones.map((b) => [b.name, b.parent])) === json([["root", -1], ["b1", 0], ["b2", 1]]) &&
     json(ms.m.clips.map((c) => [c.id, c.name, c.frameCount])) === json([[1, "wave", 30], [2, "twist", 60]]) && ms.mdl.animations.length === 2 && ms.mdl.animations.every((a) => a.mode === "loop" && a.fps === 30 && a.tracks.length === 3),
     "产物：MDLV0023、骨 = 关节（先序、父在前，名字取节点名）、每个 glTF 动画一个片段（30 fps 稠密、每骨一轨、loop）");
@@ -4198,8 +4417,10 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
     // [we-scene patch 2026-10-12] 显式 defaultlight:false 的退出（操控变形的平贴 2D 木偶）：
     // 两条装配分支（puppet / model）都要认，否则编辑器命名空间那条判据会继续补光。
     const dlHits = [...hostSrc.matchAll(/dl\d? !== false && \(isEditorAssetPath/g)];
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #16：引擎读点普查：默认主光没认 defaultlight:false）
     check(dlHits.length === 2 && /dl\d? === true \|\|/.test(hostSrcCode),
       `默认主光的两条分支没认 defaultlight:false 的退出（实测 ${dlHits.length} 处：puppet / model 各一处）`);
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #17：引擎读点普查：legacyMeshOf 没认单子网格法线）
     check(/normals:\s*mdl\.normals \|\| singleSub\?\.normals \|\| null/.test(mdlSrcCode) &&
       /const singleSub = mdl\.meshes && mdl\.meshes\.length === 1/.test(mdlSrcCode),
       "mdl.js 的 legacyMeshOf 没认单子网格记录里的法线：导入的单网格模型在真机上 u_lightOn 恒为 0");
@@ -4349,9 +4570,8 @@ section("MH. glTF 导入 editor/gltf.ts → parseGltf / gltfToModel / encodeMdl�
   const dmHits = [...smSrc.matchAll(/String\((?:pass0|ppass0)\?\.depthtest \?\? ""\)\.toLowerCase\(\) === "enabled"\) \(layer as any\)\.depthMesh = true;/g)];
   check(dmHits.length === 2, `宿主只有 ${dmHits.length} 处把「材质显式声明 depthtest」翻成 layer.depthMesh（puppet / model 两条装配分支各要一处；判据必须是显式 enabled，不是 F40 的 !== "disabled"）`);
   const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
-  check(/id="in-model" accept="\.glb,\.gltf,\.fbx,\.obj,\.dae,\.stl,\.ply,\.3ds,\.bin,\.mtl,\.png,\.jpg,\.jpeg,\.tga,\.bmp" multiple hidden/.test(htmlSrc) && /id="ly-add-model"[^>]*aria-haspopup="menu"/.test(htmlSrc) &&
-    json([...(htmlSrc.match(/<div id="model-menu"[\s\S]*?<\/div>/)?.[0] ?? "").matchAll(/data-preset="(\w+)" data-et="(md\.\w+)"/g)].map((m) => [m[1], m[2]])) === json([["auto", "md.auto"], ["puppet", "md.puppet"], ["mesh", "md.mesh"]]),
-    "页面有导入按钮（带下拉菜单：自动 / puppet / 3D 网格）与多选文件框（各模型格式 + .bin / .mtl / 贴图）");
+  // [task-33 台账 #19 delete] 页面有导入按钮（带下拉菜单：自动 / puppet / 3D 网格）与多选文件框（各模型格式 + .bin / .mtl —— 用户可见行为已由 headless「AT 段（导入菜单 + 多选文件框属性）」覆盖，文本断言删除
+
   const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
   const glSrc = ["gltf", "model-ir", "model-import", "fmt-obj", "fmt-stl", "fmt-3ds", "fmt-dae", "fmt-fbx"].map((n) => fs.readFileSync(path.join(ROOT, `editor/${n}.ts`), "utf8")).join("\n");
   const warnCodes = [...new Set([...glSrc.matchAll(/(?:warn\(\{ code: |warnings\.push\(\{ code: |warn\()"(\w+)"/g)].map((m) => m[1]))];
@@ -4808,6 +5028,7 @@ section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）"
 
   check(json(doc) === before,
     "停帧摆位不改文档：反复摆位后文档快照逐字节一致（指针对场景是纯运行时状态）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #20：反耦合：指针工作室不 import 文档/撤销栈）
   check(!/from "\.\/(save|export-pipeline|doc|history)"/.test(ptrSrc),
     "指针工作室不 import 保存 / 导出 / 文档 / 撤销栈：它只驱动 uniform，不参与文档记账");
 
@@ -4834,6 +5055,7 @@ section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）"
     "导出清单里没有指针相关条目（轨迹不进 zip、不进保存清单）");
   const saveSrc = fs.readFileSync(path.join(ROOT, "editor/save.ts"), "utf8");
   const pipeSrc = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #21：反耦合：导出器未接入指针工作室）
   check(!/pointer/i.test(saveSrc) && !/pointer/i.test(pipeSrc),
     "导出器不改行为：save.ts / export-pipeline.ts 里一个字都没动（指针工作室没接进去）");
 
@@ -4847,20 +5069,21 @@ section("POINTER-STUDIO. 指针工作室 editor/pointer-studio.ts（B5 / M11）"
   const keyHits = ptrKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(ptrKeys.length >= 24 && keyHits.length === 0,
     `指针工作室的 ${ptrKeys.length} 个文案键在 editor/i18n.ts 里 zh / en 各恰好一次（不齐的：${json(keyHits)}）`);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #22：i18n 绑定：ptr.exportNote 走词条不硬编码）
   check(ptrKeys.includes("ptr.exportNote") && /data-et="ptr\.exportNote"/.test(pageSrc),
     "导出边界提示有对应文案键 ptr.exportNote（菜单里那行说明走 i18n，不是硬编码）");
 
   // 接线：main.ts / index.html / editor.css
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #23：接线耦合：接引擎 pushPointer/pointerLeave，没新造通道）
   check(/from "\.\/pointer-studio"/.test(mainSrc) && mainSrc.includes("createPointerStudio({")
     && mainSrc.includes("instance?.pushPointer(") && mainSrc.includes("instance?.pointerLeave("),
   "main.ts：指针工作室接到引擎的 pushPointer / pointerLeave 上（没有新造通道）");
   check(mainSrc.includes("pointerStudio.resync()") && mainSrc.includes("pointerStudio.tick()")
     && mainSrc.includes("pointerStudio.startReplay(") && mainSrc.includes("pointerStudio.stopRecord()"),
   "main.ts：重挂后 resync、时间轴 tick、菜单的回放 / 录制都接上了");
-  check(pageSrc.includes('id="tb-pointer"') && pageSrc.includes('id="pointer-menu"')
-    && pageSrc.includes('id="ptr-tracks"') && pageSrc.includes('id="ptr-play"') && pageSrc.includes('id="ptr-del"')
-    && pageSrc.includes('data-et="ptr.exportNote"'),
-  "index.html：视口工具条按钮 + 菜单（摆位 / 录制 / 回放 / 删除 + 导出边界提示）都在");
+  // [task-33 台账 #25 delete] index.html：视口工具条按钮 + 菜单（摆位 / 录制 / 回放 / 删除 + 导出边界提示）都在 —— 用户可见行为已由 headless「AT 段（指针工作室菜单）」覆盖，文本断言删除
+
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #26：CSS 样式文本级）
   check(cssSrc.includes(".ed-pointer-menu") && cssSrc.includes(".ed-pointer-row") && cssSrc.includes(".ed-pointer-note"),
     "editor.css：指针工作室菜单的样式都在（沿用 .ed-menu 的 fixed 定位）");
 }
@@ -4874,7 +5097,9 @@ section("I. 接线");
   const mainCode = codeOnly(main);
   const mainNoCmt = codeNoComments(main);
   check(/from "\.\/gizmo"/.test(main) && /from "\.\/history"/.test(main), "页面从 gizmo.ts / history.ts 取手柄几何与记账（单测覆盖的就是页面在用的）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #27：反重复实现：无内联副本（手柄/旋转/撤销栈/树查找））
   check(!/function gizmoOf|function handleAt|Math\.atan2|undoStack\s*[:=]|function findPath/.test(main), "页面里没有长回手柄 / 旋转 / 撤销栈 / 树查找的内联副本");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #28：手势拒绝（SecurityError）下的同步重调用无法在 headless 构造：需要）
   check(/hitTestAt\([^)]*\)\.filter\(\(h\) => !isLocked\(h\.id\)\)/.test(main), "画面点选过滤锁定层");
   check(/dir = await pickDirectoryWithGesture\(\);/.test(mainNoCmt) && !/await pickDirectory\(\);\s*\}\s*catch \(e\) \{\s*log\(et\("log\.pickFailed"/.test(mainNoCmt) &&
     /name !== "SecurityError"\) throw e;[\s\S]{0,300}#pick-dir-ok"\)\.onclick = \(\) => \{[\s\S]{0,60}const p = pickDirectory\(\);/.test(mainNoCmt) && /id="pick-dir-dlg"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")),
@@ -4883,9 +5108,8 @@ section("I. 接线");
   check(/form\.disabled = isLocked\(id\)/.test(main), "锁定层检视器只读");
   check(/docDriven && current\.assets && doc\?\.scene\s*\?\s*sourceFromDoc/.test(main), "结构编辑后改从文档挂载");
   check(/await replayLiveEdits\(\)/.test(main) && /editor\.seek\(resumeAt > 0 \? resumeAt : editor\.time\)/.test(main), "重挂后重放热改、回到原时间点（停着时也补画一帧，文字层首帧没贴图）");
-  for (const key of ['"z"', '"y"', '"s"', '"d"', '"Delete"', '"Backspace"']) {
-    check(main.includes(key), `快捷键 ${key} 已绑定`);
-  }
+    // [task-33 台账 #29 delete] 快捷键 ${key} 已绑定 —— 用户可见行为已由 headless「AW 段（⌘D/Delete/⌘Z/⌘Y/Backspace/⌘S 各自的可观察效果）」覆盖，文本断言删除
+
   check(/collectProject\(doc, current\.assets, preview, undefined, unreadable\)/.test(main) && /writeToDirectory\(dir, changed\)/.test(main) && !/saveToLibrary\(/.test(main), "自动保存走 collectProject 写进项目文件夹，页面不再写壁纸库");
   // 审计 M2：读不到的资源留在磁盘上
   check(main.includes("const unreadable = new Set<string>();") && main.includes("if (unreadable.has(p)) continue;"),
@@ -4893,9 +5117,11 @@ section("I. 接线");
   // 审计 M1：写盘失败不能清草稿（两份调用点都要先看返回值）
   check((mainCode.match(/if \(await flushAutosave\(\)\) clearOwnDraftSlot\(prevSlot\);/g) || []).length === 2,
     "另存为 / 存到本机文件夹：只有真的写出去了才清草稿（审计 M1）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #32：内部 API 契约：flushAutosave 回报成败）
   check(main.includes("async function flushAutosave(): Promise<boolean>"),
     "flushAutosave 回报成败（调用方不再无从区分）");
   // 审计 H1：没有目录 / 库条目的会话文档，草稿槽带每文档标识，两个未命名文档不共用槽
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #33：内部键设计：草稿槽带每文档标识）
   check(main.includes("const sessionSlotKeys = new WeakMap<EditorDoc, string>();")
     && main.includes("sessionKey: !vdirId && !localName && !libraryItemId && doc ? sessionSlotKey(doc) : null"),
     "会话文档的草稿槽带每文档标识（审计 H1：不再互相覆盖 / 误清快照）");
@@ -4921,6 +5147,7 @@ section("I. 接线");
   const smCode = codeOnly(sm);
   check(/declareUserProperties\(decls[^)]*\) \{[^}]*applyLiveProps\(/.test(sm) && /\(\(scene as any\)\.properties \|\|= \{\}\)/.test(sm), "控制面 declareUserProperties 走属性热更链（无属性表的场景也挂一张）");
   check(/const uS = boundUserName\(src\.scale\);[^\n]*\n[^\n]*setLayerPropsImpl\(layer\.id, \{ scale: scn\.parseVec3\(src\.scale\) \}\)/.test(sm), "scale 绑 slider 热更：写 local 槽并重合成子树");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #34：引擎读点/登记完整：四类挂点都登记脚本错误）
   check((smCode.match(/noteScriptIssue\((layer|null), /g) ?? []).length === 4, "引擎登记四类挂点的脚本错误：对象字段 / 文字 / 效果开关 / general");
   check(/getScriptIssues\(\) \{\s*return \[\.\.\.scriptIssues\.values\(\)\]/.test(sm) && /const scriptIssues = new Map/.test(sm), "控制面 getScriptIssues 读本次装配的登记表（每次装配重建）");
   const i18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -4933,6 +5160,7 @@ section("I. 接线");
   }
   check(/function renderKeyMarks\(\) \{\s*tlKeysEl\.textContent = "";\s*renderLanes\(\);/.test(main) && /const sum = canAnimate\(n\) \? animSummary\(n\.obj\) : null;/.test(main) && /row\.addEventListener\("click", \(\) => selectLayer\(node\.id\)\)/.test(main), "按层动画条随关键帧标记一起重画（每次文档 / 选中变化），点行选中该层");
   check(/objEditOk\(et\("log\.keyPasted"[^\n]*\(o\) => pasteKeysAt\(o, clip, at\)\)/.test(main) && /keyClip = copyKeysAt\(node\.obj, nowTime\(\)\)/.test(main), "粘贴关键帧走结构编辑（可撤销），复制取当前时刻");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #35：i18n 成对（复制/粘贴文案）+ 动画条容器混写；成对性不可行为化）
   check(/<div id="tl-lanes" hidden><\/div>/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && ["anim.copy", "anim.paste", "anim.copyNone", "anim.pasteNone", "log.keyCopied", "log.keyPasted", "log.keyPasteBad"].every((k) => (i18nNoCmt.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "页面有动画条容器；复制 / 粘贴文案中英文都有");
   check(missingFx.length === 0, `效果名 / 参数名中英文都有（缺 ${json([...new Set(missingFx)])}）`);
   check(/structEdit\([^\n]*placeImages\(d, imgs, false\)\)/.test(main), "添加图片层走结构编辑（可撤销、整场景重挂）");
@@ -4948,9 +5176,11 @@ section("I. 接线");
   check(/return Promise\.all\(pairs\.map\(\(p\) => p\.seek\(t\)\)\)|const ready = Promise\.all\(pairs\.map\(\(p\) => p\.seek\(t\)\)\)/.test(sm) && /for \(const p of rt\.videoPairs \?\? \[\]\) p\.setRate\(clockScale\)/.test(sm), "引擎 seek / 倍速同步视频贴图（等 seeked 再画）");
   check(/materials\/\$\{name\}\.mp4/.test(sm) && /encodeTexVideo\(/.test(sm), "松散工程 materials/X.mp4 在内存里包成视频 .tex 走同一条路径");
   const vkeys = ["ly.addVideo", "new.video", "new.videoWallpaper", "kind.video", "vp.title", "vp.applyTrim", "vp.replace", "vp.toScene", "export.video", "rec.title", "rec.start", "log.recorded", "log.trimmed", "log.videoReady"];
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #36：i18n 成对：视频文案）
   check(vkeys.every((k) => (i18nNoCmt.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "视频相关文案中英文都有");
   const edHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
-  check(["ly-add-video", "new-video", "new-video-wp", "export-video", "in-video", "rec-menu", "rec-start", "rec-cancel"].every((id) => edHtml.includes(`id="${id}"`)), "页面有视频入口：加视频层 / 新建两种 / 录制面板 / 文件框");
+    // [task-33 台账 #37 delete] 页面有视频入口 —— 用户可见行为已由 headless「AJ. 视频端到端」覆盖，文本断言删除
+
   check(/files\.every\(\(f\) => isImageFile\(f\.file\)\)\) \{\s*void dropImages\(files\.map\(\(f\) => f\.file\), dir\)/.test(main), "拖入全是图片时走图片成层 / 新建");
   check(/dirty = false;\s*syncDocTitle\(\);/.test(main) && /function scheduleAutosave\(\)/.test(main), "自动保存成功后清掉脏标记");
   check(/function markDirty\(\) \{\s*scheduleAutosave\(\);/.test(main), "每次编辑都排一次自动保存");
@@ -4967,6 +5197,7 @@ section("I. 接线");
   {
     const uiFiles = ["editor/ui/library-panel.ts", "editor/ui/plugin-panel.ts"].map((f) => fs.readFileSync(path.join(ROOT, f), "utf8"));
     const confirmSrc = fs.readFileSync(path.join(ROOT, "editor/ui/confirm.ts"), "utf8");
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #38：反原生弹窗（一律 confirmDialog）；『没有用某 API』的否证，行为级代价高）
     check(!/window\.confirm\s*\(/.test(main) && uiFiles.every((src) => !/window\.confirm\s*\(/.test(src)) &&
       /export function confirmDialog\(/.test(confirmSrc) && uiFiles.every((src) => /confirmDialog/.test(src)) && /confirmDialog/.test(main),
       "确认框一律走页内 confirmDialog：主页面 / 壁纸库删除 / 插件卸载都没有 window.confirm（原生弹窗在深色界面像外来户，自动化里还会被静默吞掉）");
@@ -4974,7 +5205,8 @@ section("I. 接线");
   check(/const EDITOR_MARK = "\.webwallgl-editor"/.test(HOST_TS) && /exists && !marked/.test(HOST_TS), "宿主：无标记目录拒绝覆盖");
   {
     const pipe = fs.readFileSync(path.join(ROOT, "editor/export-pipeline.ts"), "utf8");
-    check(/runExportPipeline\(id, target, /.test(main) && !/packProject/.test(main) && /id: "pkg",[\s\S]{0,400}pack: \(ctx\) => \{\s*if \(!ctx\.doc\.scene\) return ctx\.files;\s*const \{ files, packed \} = packProject\(ctx\.files\);/.test(pipe), "导出 scene.pkg 走导出管线：pkg 导出器的 pack 段过 packProject，不写进项目文件夹");
+        // [task-33 台账 #39 delete] 导出 scene.pkg 走导出管线 —— 用户可见行为已由 headless「X. 导出 WE 原生 scene.pkg」覆盖，文本断言删除
+
   }
   check(/id="export-pkg"/.test(html) && /id="export-zip"/.test(html) && !/id="save-lib"/.test(html), "导出菜单是 scene.pkg / zip，没有另存到库");
   {
@@ -4984,12 +5216,13 @@ section("I. 接线");
       const head = at < 0 ? "" : html.slice(at, html.indexOf("data-pane=", at));
       return [...head.matchAll(/data-tab="(\w+)"/g)].map((m) => m[1]);
     };
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #40：反特性：没有预览/编辑器模式切换）
     check(!/wb-modes|id="act-bench"|href="\.\.\/"/.test(html) && /<button type="button" class="wb-icon-btn" id="ed-help"/.test(html), "工作台没有「预览 / 编辑器」模式切换，帮助按钮在页内打开使用说明");
     check(json(tabsOf("ed-layers")) === json(["layers", "library"]) && json(tabsOf("ed-center")) === json(["viewport", "docs"]) &&
       json(tabsOf("ed-console")) === json(["console", "perf"]) && json(tabsOf("ed-right")) === json(["inspector", "config"]),
       `面板标签：左 图层|壁纸库，中 视口|使用说明，底 控制台|性能，右 检视器|壁纸配置（${json([tabsOf("ed-layers"), tabsOf("ed-center"), tabsOf("ed-console"), tabsOf("ed-right")])}）`);
-    check(["lib-list", "lib-filter", "type-filter", "lib-refresh", "lib-pick", "docs-body", "sponsor-card", "perf-canvas", "props-body", "props-reset", "fps", "volume", "aa", "pq", "pp"].every((id) => html.includes(`id="${id}"`)) &&
-      /href="\/editor\/preview\.css"/.test(html), "页面装上了壁纸库 / 使用说明 / 性能 / 壁纸配置 / 渲染设置的控件与样式");
+    // [task-33 台账 #41 delete] 页面装上了壁纸库 / 使用说明 / 性能 / 壁纸配置 / 渲染设置的控件与样式 —— 用户可见行为已由 headless「AT 段（壁纸库 / 说明 / 性能 / 配置面板）」覆盖，文本断言删除
+
     // 渲染选项从右侧标签搬进视口工具条的弹出菜单：控件 id 一个不少，标签和面板都不再存在
     const edCss = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
     check(/id="tb-render-opts"/.test(html) && /id="render-menu"/.test(html) && /id="tb-dpr"/.test(html) &&
@@ -5006,15 +5239,14 @@ section("I. 接线");
     check(/openWith\(it\.title, \(\) => openLibraryItem\(it, MEDIA_BASE, WEB_BASE\), \{ origin: \{ kind: "library" \}, library: it, play: true \}\)/.test(main) &&
       /if \(opts\.library\) releaseProject\(\);/.test(main) && /libItem = opts\.library \?\? null;/.test(main),
       "壁纸库条目直接在编辑器里打开并播放；先解绑上一个项目文件夹（不会把它自动保存进别的工程）");
-    check(/cmd\(\{ id: "file\.save", keys: "Mod\+S", run: \(\) => void saveDocument\(\) \}\)/.test(mainNoCmt) &&
-      /async function saveDocument\(\) \{\s*if \(projectDir\) \{\s*await flushAutosave\(\);\s*return;\s*\}[\s\S]{0,300}const dir = await requireProjectDir\(\);[\s\S]{0,80}adoptProject\(dir\);/.test(mainNoCmt),
-      "⌘S：有项目文件夹就写回，库条目先选文件夹另存为项目");
+    // [task-33 台账 #42 delete] ⌘S：有项目文件夹就写回，库条目先选文件夹另存为项目 —— 用户可见行为已由 headless「AW 段（库条目态按 ⌘S 走另存为项目：新建浏览器存储工程并接管，库里原 scene.json 一字节不改）」覆盖，文本断言删除
+
     check(/\.\.\.renderSettings\.mountOptions\(\),/.test(main) && /properties: libItem \? \(wallpaperConfig\.overrides\(\)/.test(main),
       "挂载带上渲染设置（帧率 / 音量 / 画质）与库条目的属性覆盖值");
     check(/instance\.setProperties\(values as Record<string, PropertyValue>\)/.test(main) && /reload: \(\) => void mountCurrent\(true\)/.test(main),
       "壁纸配置：场景就地热更，网页 / 视频保存后重挂");
-    check(/const item = new URL\(location\.href\)\.searchParams\.get\("item"\);[\s\S]{0,300}await openLibrary\(it\);/.test(mainNoCmt) && /#docs\(\?:=\(\\w\+\)\)\?\$/.test(mainNoCmt),
-      "?item= 直接打开库条目，#docs=editor|library 直达使用说明");
+    // [task-33 台账 #43 delete] ?item= 直接打开库条目，#docs=editor|library 直达使用说明 —— 用户可见行为已由 headless「AU 段（?item= 直达库条目 / #docs=library 直达说明）」覆盖，文本断言删除
+
     const root = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
     check(/location\.replace\("\.\/editor\/" \+ location\.search \+ location\.hash\)/.test(root) && !/bench\/main\.ts/.test(root), "根入口转到工作台（带上 query / hash）");
     const gone = ["main", "session", "bridge", "library", "viewport", "perf", "props-panel", "render-settings", "info-panel", "statusbar", "store", "console", "layout"].filter((n) => fs.existsSync(path.join(ROOT, `bench/${n}.ts`)));
@@ -5028,13 +5260,15 @@ section("I. 接线");
     check(/DOC_KINDS: DocKind\[\] = \["library", "editor", "plugins"\]/.test(docsTs) && /plugins: PLUGINS_DOC/.test(docsTs) &&
       /data-doc="plugins"[^>]*data-i18n="docs\.pluginsShort"/.test(html) && json(plIds) === json(["pl-intro", "pl-manage", "pl-perms", "pl-examples", "pl-data", "pl-code"]),
       `使用说明有独立的「插件」一份：是什么 / 安装管理 / 权限 / 示例 / 写数据插件 / 写代码插件（${json(plIds)}）`);
-    check(/id="plugins-docs" data-et="pl\.docs"/.test(html) && /\$\("#plugins-docs"\)\.onclick = \(\) => \{[\s\S]{0,120}showDocs\("plugins"\);/.test(main) &&
-      (i18n.match(/"pl\.docs":/g) ?? []).length === 2, "插件管理弹窗的「插件说明」直达插件使用说明");
+    // [task-33 台账 #44 delete] 插件管理弹窗的「插件说明」直达插件使用说明 —— 用户可见行为已由 headless「AW 段（插件弹窗「插件说明」直达说明面板插件章）」覆盖，文本断言删除
+
     check(/<div class="wb-tb-group" id="ed-plugin-tools" hidden><\/div>/.test(html) && /ui\.mount\("toolbar", pluginToolsEl\)/.test(main) && /pluginToolsEl\.hidden = !ui\.items\("toolbar"\)\.length/.test(main),
       "插件的 toolbar 槽位挂在主工具条上（没有贡献时隐藏，切语言重建）");
     const exDirs = fs.readdirSync(path.join(ROOT, "examples/plugins")).filter((d) => !d.startsWith("."));
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #45：数据完整性：插件说明列出 examples/plugins 全部示例（行为级=读目录，已）
     check(exDirs.every((d) => plDocs.includes(`same("${d}")`)), `插件说明列出了 examples/plugins 下的全部示例（${json(exDirs)}）`);
   }
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #46：i18n 成对：导出 pkg 文案）
   check(["save.pkg", "save.pkgTitle", "log.packedPkg"].every((k) => (i18nNoCmt.match(new RegExp(`"${k.replace(".", "\\.")}":`, "g")) ?? []).length === 2), "导出 pkg 的文案中英文都有");
   // 插件宿主（PLUGIN-ARCHITECTURE §2 / §5）：页面只按注册表渲染，内置能力也登记成插件
   check(/void bootPlugins\(\)\.catch\(/.test(main) && /app = await bootEditor\(/.test(main) && /catalog: \{ "builtin-ui": builtinUiPlugin \}/.test(main) && /profile: \{ plugins: \[\{ name: "builtin-ui" \}\] \}/.test(main),
@@ -5051,6 +5285,7 @@ section("I. 接线");
     check(/setAttribute\("role", "tablist"\)/.test(main) && /setAttribute\("role", "tab"\)/.test(main) && /setAttribute\("role", "tabpanel"\)/.test(main) && /e\.key === "ArrowRight"/.test(main), "标签条有 tablist / tab / tabpanel 语义，方向键切页");
     check(/return g\.tab && inspectorTabs\.get\(g\.tab\) \? g\.tab : DEFAULT_INSPECTOR_TAB;/.test(inspTs) && /inspectorTabs\.setFallback\(BUILTIN_INSPECTOR_TABS\)/.test(inspTs) && /"inspector\.tabs": inspectorTabs/.test(fs.readFileSync(path.join(ROOT, "editor/plugins/builtin/index.ts"), "utf8")), "标签也是贡献点（inspector.tabs）；未登记的标签退回「属性」页");
     const tabKeys = ["props", "anim", "model", "fx", "logic", "info"].map((t) => `insp.tab.${t}`);
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #47：i18n 成对：检视器标签）
     check(tabKeys.every((k) => (i18nNoCmt.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length === 2), "检视器标签文案中英文都有");
   }
   check(/if \(app\?\.commands\.handleKey\(e\)\) \{\s*e\.preventDefault\(\);\s*return;/.test(main), "快捷键先过命令服务（插件可登记 / 覆盖），内核未起时走内置链");
@@ -5070,13 +5305,15 @@ section("I. 接线");
   check(/await Promise\.all\(fonts\.map\(ensurePageFont\)\);/.test(main) && /SYSTEM_FONT_FAMILIES\[font\.toLowerCase\(\)\]/.test(main), "量字前先把工程字体装进页面；系统字体按引擎同一张映射表量");
   check(/overlay\.put\(path, new Uint8Array\(await file\.arrayBuffer\(\)\), path\);/.test(main), "导入字体写进叠加层，分组 = 字体路径（没被引用就不进保存清单）");
   check(/\{ id: "text", order: 400, when: \(n\) => n\.kind === "text", render: textGroup(?:, tab: "props")? \}/.test(main) && /content\.readOnly = scripted;/.test(main), "文字层检视器有「文字」分组；脚本生成的内容只读");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #48：消息应为『页面：添加文字层按钮+文字/时钟/日期菜单+字体选择框』；accept 扩展名）
   check(/id="ly-add-text"/.test(html) && /id="text-menu"/.test(html) && ["plain", "clock", "date"].every((p) => html.includes(`data-preset="${p}"`)) && /id="in-font" accept="\.ttf,\.otf/.test(html), "页面：添加文字层按钮 + 文字 / 时钟 / 日期菜单 + 字体选择框");
   const txKeys = [...main.matchAll(/et\(\s*"((?:tx|text)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addText", "text.plain", "text.clock", "text.date", "tx.align.left", "tx.align.center", "tx.align.right", "tx.align.top", "tx.align.bottom", "log.textAdded", "log.textEdited", "log.fontImported", "log.fontFailed", "insp.text"]);
   const missingTx = [...new Set(txKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingTx.length === 0, `文字层文案中英文都有（缺 ${json(missingTx)}）`);
   check(/from "\.\/particles"/.test(main) && /structEdit\(et\("log\.particleAdded", \{ name \}\), \(d\) => \{[^}]*overlay!\.put\(f\.name, f\.data, particlePathOf\(slug\)\);\s*return addParticleLayer\(d, preset, name, slug\)/.test(main), "添加粒子层取 particles.ts 模板、两件套写进叠加层（分组 = 粒子文件路径）、走结构编辑");
   check(/\{ id: "particle", order: 500, when: \(n\) => n\.kind === "particle", render: particleGroup(?:, tab: "props")? \}/.test(main) && /setParticleParam\(o, k as ParticleParam, Number\(inp\.value\)\)/.test(main) && /objEdit\(et\("log\.particleEdited"/.test(main), "粒子层检视器有「粒子」分组，滑条 change 时经 objEdit 写 instanceoverride（可撤销）");
-  check(/id="ly-add-particle"/.test(html) && /id="particle-menu"/.test(html) && ptMod.PARTICLE_PRESETS.every((p) => html.includes(`data-preset="${p}"`)) && /lyAddParticleEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加粒子层按钮 + 雪 / 雨 / 火花 / 光点菜单，可用性跟随添加图片");
+    // [task-33 台账 #49 delete] 页面：添加粒子层按钮 —— 用户可见行为已由 headless「Z. 粒子层端到端」覆盖，文本断言删除
+
   const ptKeys = [...main.matchAll(/et\(\s*"((?:pt)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addParticle", "log.particleAdded", "log.particleEdited", "insp.particle"], ptMod.PARTICLE_PRESETS.map((p) => `pt.${p}`), ptMod.PARTICLE_PARAMS.map((p) => `pt.${p}`));
   const missingPt = [...new Set(ptKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingPt.length === 0, `粒子层文案中英文都有（缺 ${json(missingPt)}）`);
@@ -5095,13 +5332,17 @@ section("I. 接线");
   const sndKeys = [...main.matchAll(/et\(\s*"((?:snd)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addSound", "log.soundAdded", "log.soundEdited", "log.soundMissing", "log.soundFailed", "insp.sound"], sndMod.PLAYBACK_MODES.map((m) => `snd.mode.${m}`));
   const missingSnd = [...new Set(sndKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(missingSnd.length === 0, `声音层文案中英文都有（缺 ${json(missingSnd)}）`);
-  check(/from "\.\/keyframes"/.test(mainNoCmt) && /const split = splitAnimated\(node\.obj, patch\);[\s\S]{0,200}pendingKeys\.set\([\s\S]{0,80}writeObjProps\(node\.obj, plain\);[\s\S]{0,120}mergeLiveEdit\(liveEdits, id, plain\);/.test(mainNoCmt), "热改：落在动画字段上的改动不写静态值、不进重放账，记为待落关键帧");
-  check(/function commit\(cmd: PropsCmd\) \{\s*const keyed = pendingKeys\.get\(String\(cmd\.id\)\);[\s\S]{0,200}keyEdit\(node, keyed\);/.test(mainCode) && /setKey\(o, f, frameAt\(v, t\), keyed\[f\]!\)/.test(mainCode), "提交（检视器 change / 拖拽松手）时，动画字段的改动变成当前帧的关键帧（objEdit，可撤销）");
+    // [task-33 台账 #51 delete] 落在动画字段上的改动 —— 用户可见行为已由 headless「AC. 关键帧补完」覆盖，文本断言删除
+
+    // [task-33 台账 #52 delete] 提交（检视器 change —— 用户可见行为已由 headless「AC. 关键帧补完」覆盖，文本断言删除
+
   check(/\{ id: "anim", order: 300, when: canAnimate, render: animGroup(?:, tab: "anim")? \}/.test(main) && /enableAnim\(o, f, liveValue\(node, f\)\) : disableAnim\(o, f, liveValue\(node, f\)\)/.test(main) && /removeKey\(o, f, k\.frame\)/.test(main) && /setAnimOption\(o, f, "mode"/.test(main) && /setSmooth\(o, f, smooth\.checked\)/.test(main), "检视器「动画」分组：开关 / 打关键帧 / 删关键帧 / 模式 / 时长 / 插值，全走 objEdit");
   check(/tlRangeEl\.addEventListener\("change", \(\) => \{\s*scrubbing = false;\s*if \(editor\) afterSeek\(/.test(main) && /afterSeek\(editor\.step\(1, 60\)\)/.test(main) && /function renderInspector\(\) \{\s*(?:if \(animSolo[^\n]*\n\s*)?inspectorEl\.textContent = "";\s*renderKeyMarks\(\);/.test(main), "拖完时间轴 / 逐帧后刷新动画层检视器；选中变化时重画时间轴关键帧标记");
   check(/for \(const run of animRuns\) \{\s*if \(run\.layer === l && \(p as Record<string, unknown>\)\[run\.field\] !== undefined\) run\.held = true;/.test(sm) && /else run\.ctrl\.advance\(clockDt\);\s*if \(run\.held\) continue;/.test(sm) && /animSeekPending = true;\s*for \(const run of animRuns\) run\.held = false;/.test(sm), "引擎：热改动画字段后曲线写回暂停到下一次 seek（拖拽 / 输入跟手）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #53：引擎读点：颜色曲线写到 textColor/tintBase）
   check(/if \(field === "color" && run\.layer\.isText\) run\.layer\.textColor = run\.layer\.color;/.test(smNoCmt) && /field === "color" && run\.layer\.matTint && run\.layer\.tintBase\) \{[\s\S]{0,200}?anim\.writeAnimSlot\(run\.layer\.tintBase, "color", out\);\s*applyBuiltinMatTint\(run\.layer\);/.test(smNoCmt), "引擎：颜色曲线写到文字层真正绘制的 textColor / 材质烘色层的 tintBase");
-  check(/mark\.addEventListener\("pointerdown", \(ev\) => \{[\s\S]{0,240}?startKeyDrag\(ev, mark, n, t, field, host\)/.test(mainNoCmt) && /field \? moveKeyTimeIn\(o, field, from, to\) : moveKeyTime\(o, from, to\)/.test(mainNoCmt) && /objEditOk\([\s\S]{0,200}?log\.keyMoved/.test(mainNoCmt) && /log\(et\("log\.keyMoveBad"/.test(mainNoCmt), "时间轴关键帧标记可拖动改时刻（objEdit，按属性分行时只动该字段，冲突时提示并复原）");
+    // [task-33 台账 #54 delete] 时间轴关键帧标记可拖动 —— 用户可见行为已由 headless「AC. 关键帧补完」覆盖，文本断言删除
+
   check(/row\.addEventListener\("pointerdown", \(e\) => startTreeDrag\(e, n, row\)\)/.test(main) && /\(res = placeLayer\(d, n\.id, target\.id, where\)\) === "ok"/.test(main) && /if \(treeDragged\) return;/.test(main), "图层树行可拖：放下走 placeLayer 结构编辑，拖完不误触点选");
   check(/isLockedObj\(o\) === on/.test(main) && /setLocked\(o, on\);/.test(main) && /setLockedEdit\(n, !isLocked\(n\.id\)\);/.test(main) && !/const locked = new Set/.test(main) && !/setLocked\(n\.obj, !isLocked\(n\.id\)\);\s*markDirty\(\);/.test(main), "锁定状态以文档 locktransforms 为准（页面不再另存一份），且切换走 objEdit 进撤销栈（A9）");
   check(/id="ly-group"/.test(fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8")) && /groupLayer\(d, n\.id, et\("layer\.groupName"\)\)/.test(main), "图层工具条「成组」");
@@ -5110,7 +5351,8 @@ section("I. 接线");
   check(/if \(e\.shiftKey \|\| e\.metaKey \|\| e\.ctrlKey\) return toggleSelect\(n\.id\);/.test(main) && /if \(e\.shiftKey && hits\.length\) \{\s*toggleSelect\(hits\[0\]\.id\);/.test(main) && /\.some\(\(h\) => isSelected\(h\.id\)\)/.test(main), "多选：树 ⇧/⌘ 点、画面 ⇧ 点加减选；拖任一选中层都能起拖");
   check(/for \(const o of drag\.others\) \{\s*const od = editor\.screenDeltaToLocal\(Number\(o\.id\), mx, my\);/.test(main) && /commitMany\(et\("log\.multiMoved"/.test(main) && /if \(isBatch\(cmd\)\) \{\s*for \(const c of cmd\.cmds\) void applyPatch/.test(main), "多选移动：其余层按同一屏幕位移跟随，一步撤销（批量命令）");
   check(/groupLayers\(d, ids, et\("layer\.groupName"\)\)/.test(main) && /ids\.every\(\(id\) => removeLayer\(d, id\)\)/.test(main) && /alignDeltas\(items\.map\(\(i\) => i\.box\), mode\)/.test(main), "多选删除 / 复制 / 成组 / 对齐分布接线");
-  check(/let userPlaying = false;/.test(mainCode) && /if \(!userPlaying\) inst\.pause\(\);/.test(mainCode) && /origin = opts\.origin \?\? null;\s*userPlaying = !!opts\.play;/.test(mainCode) && (mainCode.match(/play: true/g) ?? []).length === 1, "默认不自动播放：打开文档与重挂都停在当前帧，只有点播放才走时钟（唯一例外：壁纸库条目即点即播）");
+  // [task-33 台账 #55 delete] 默认不自动播放：打开文档与重挂都停在当前帧，只有点播放才走时钟（唯一例外：壁纸库条目即点即播） —— 用户可见行为已由 headless「AV 段（重开停在当前帧、点播放才走时钟）」覆盖，文本断言删除
+
   check(/userPlaying = instance\.paused;\s*if \(userPlaying\) instance\.resume\(\);/.test(main) && /function pauseForStepping\(\) \{\s*userPlaying = false;/.test(main), "播放按钮记住用户意图；逐帧 / 拖时间轴会把它清掉");
   check(/<div id="tl-track">\s*<input id="tl-range"[^>]*\/>\s*<div id="tl-keys" aria-hidden="true"><\/div>/.test(html), "时间轴关键帧标记层叠在滑条上");
   check(/rebaseClock\(t, performance\.now\(\)\);\s*animSeekPending = true;/.test(sm) && /for \(const run of animRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);\s*else run\.ctrl\.advance\(clockDt\);/.test(sm) && /for \(const run of overrideAnimRuns\) \{\s*if \(seekAnims\) run\.ctrl\.seekTime\(t\);/.test(sm), "引擎 seek：下一帧字段 / 粒子 override 关键帧按绝对时间定位");
@@ -5152,6 +5394,7 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
 
   // —— 判定口径与引擎同字面量 ——
   const parseSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/scene/parse.js"), "utf8");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #56：引擎读点：parse.js isContainer 容器判定）
   check(parseSrc.includes("isContainer: typeof o.image") && parseSrc.includes("'models/util/composelayer'"), "引擎侧容器判定仍在 parse.js 的 isContainer（前缀 composelayer）");
   check(ctr.CONTAINER_IMAGE === "models/util/composelayer", "编辑器容器前缀与引擎同一字面量 models/util/composelayer");
   check(json(ctr.FULLSCREEN_POST_IMAGES) === json(["models/util/projectlayer", "models/util/fullscreenlayer"]), "全屏后期前缀 = projectlayer / fullscreenlayer（与 parse.js isPost 两个前缀一致）");
@@ -5190,6 +5433,7 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
   ctr.addContainerLayer(sizeDoc, { name: "容器", origin: "960 540 0", size: "1920 1080", scale: "1 1 1" });
   const sizeObj = sizeDoc.scene.objects[0];
   check(sizeObj.size === "1920 1080" && json(Object.keys(sizeObj).sort()) === json(["angles", "id", "image", "name", "origin", "scale", "size", "visible"]), `size 写在字母序里 scale 之后（${json(Object.keys(sizeObj))}）`);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #57：引擎读点：子层合成图 FBO 用 container.size）
   check(ctrEngineRsrc.includes("Math.abs(container.size[0])") && ctrEngineRsrc.includes("Math.abs(container.size[1])"), "子层合成图 FBO 用 container.size（容器不写 size ⇒ 1×1，挂在容器上的效果落在 1 像素上）");
   check(/contentW = layer\.size\[0\]/.test(ctrEngineRsrc) && /contentH = layer\.size\[1\]/.test(ctrEngineRsrc), "容器自己的效果画布用 layer.size（同一份 size 决定两块 FBO）");
   check(/const w = layer\.size\[0\] \* layer\.scale\[0\]/.test(ctrEngineRsrc), "quad 世界尺寸 = size × scale（写 size + scale 1 与 WE 内联容器同形）");
@@ -5287,7 +5531,8 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
   check(JSON.stringify(rewriteObj) === JSON.stringify(expectObj), "只多出 passthrough 一个键，其余逐字节不动（含 config 里原本的键序）");
 
   // —— 页面接线（按钮 / 文案 / 结构编辑）——
-  check(ctrHtml.includes('id="ly-add-container"') && ctrHtml.includes('id="ly-add-post"'), "图层工具条有「加容器层」「加全屏后期层」两个按钮");
+  // [task-33 台账 #58 delete] 图层工具条有「加容器层」「加全屏后期层」两个按钮 —— 用户可见行为已由 headless「AT 段（加容器层 / 加全屏后期层）」覆盖，文本断言删除
+
   check(/lyAddContainerEl\.disabled = lyAddEl\.disabled;/.test(mainSrc) && /lyAddPostEl\.disabled = lyAddEl\.disabled;/.test(mainSrc), "两个新按钮的可用性跟随添加图片层");
   check(/from "\.\/container"/.test(mainSrc) && /structEdit\(et\("log\.containerAdded", \{ name \}\)/.test(mainSrc) && /addContainerLayer\(d, \{/.test(mainSrc), "加层走 structEdit + container.ts 的对象生成（可撤销、整场景重挂）");
   const ctrGroup = mainSrc.match(/id: "container",[\s\S]{0,200}?render: containerGroup,[\s\S]{0,40}?tab: "props"/);
@@ -5326,11 +5571,17 @@ section("ALPHA. 透明层：自定义尺寸的空效果画布 editor/container.t
   const renderSrc = fs.readFileSync(path.join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
 
   // —— 写进对象的每一格字段都必须有引擎侧读点（引擎改了哪条，这条就红）——
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #59：引擎读点：parse.js layerSize 是层尺寸读取点）
   check(parseSrc.includes("let layerSize = parseVec2(o.size || '0 0')"), "size 是引擎的层尺寸读取点（parse.js layerSize）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #60：引擎读点：renderer.js contentW/H 分支）
   check(renderSrc.includes("contentW = layer.size[0]") && renderSrc.includes("contentH = layer.size[1]"), "没有自带贴图的空内容层，效果链 FBO 尺寸取自 layer.size（renderer.js contentW/H 分支）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #61：引擎读点：solid=false 无贴图⇒1×1 全透明）
   check(/layer\.solid \? whiteTex : transparentTex/.test(renderSrc) && renderSrc.includes("new Uint8Array([0, 0, 0, 0]), 1, 1"), "solid=false 且没绑贴图 ⇒ 源图是 1×1 全透明：透明层「自己不画东西」的引擎依据");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #62：引擎读点：显式 copybackground:false 才不拷背板）
   check(renderSrc.includes("if (layer.copybackgroundExplicit && layer.copybackground === false) return false"), "显式 copybackground:false 才让空容器不拷背板（透明层与直通层的唯一分界）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #63：引擎读点：parse.js 区分『显式 false』与『键不存在』）
   check(parseSrc.includes("copybackgroundExplicit: o.copybackground !== undefined && o.copybackground !== null"), "parse.js 把「显式 false」与「键不存在」分开记（键不存在仍会回读背板）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #64：引擎读点：回读背板只对无子层空容器成立）
   check(renderSrc.includes("if (!layer || !layer.isContainer || layer.hasChildren) return false"), "回读背板只对「无子层的空容器」成立（透明层拖进子层后语义自动变成普通容器）");
 
   // —— 对象形状：键集 / 键序 / 逐字节 ——
@@ -5373,18 +5624,22 @@ section("ALPHA. 透明层：自定义尺寸的空效果画布 editor/container.t
   check(rtObj.copybackground === false && rtObj.size === "600 400" && JSON.stringify(reparsed) === saved, "写盘再解析后 size / copybackground 仍在，整份 scene.json 逐字节不变");
 
   // —— 页面接线：按钮 / 对话框 / 结构编辑 / 非法值拦截 / 文案 ——
-  check(htmlSrc.includes('id="ly-add-alpha"') && htmlSrc.includes('data-et-title="ly.addAlpha"'), "图层工具条有「添加透明层」按钮（带词条）");
+  // [task-33 台账 #65 delete] 图层工具条有「添加透明层」按钮（带词条） —— 用户可见行为已由 headless「AT 段（添加透明层按钮）」覆盖，文本断言删除
+
   const alphaMax = [...htmlSrc.matchAll(/id="alpha-[wh]"[^>]*max="(\d+)"/g)].map((m) => Number(m[1]));
   check(alphaMax.length === 2 && alphaMax.every((v) => v === ctr.TRANSPARENT_LAYER_MAX), `对话框两个数字框的 max 与 TRANSPARENT_LAYER_MAX 同口径（${json(alphaMax)}）`);
-  check(htmlSrc.includes('id="alpha-dlg"') && ["alpha-w", "alpha-h", "alpha-canvas", "alpha-ok", "alpha-cancel"].every((id) => htmlSrc.includes(`id="${id}"`)), "尺寸对话框有宽 / 高输入 + 取画布大小 + 添加 / 取消");
+  // [task-33 台账 #66 delete] 尺寸对话框有宽 / 高输入 + 取画布大小 + 添加 / 取消 —— 用户可见行为已由 headless「AT 段（尺寸对话框控件）」覆盖，文本断言删除
+
   check(/lyAddAlphaEl\.disabled = lyAddEl\.disabled;/.test(mainSrc), "按钮可用性跟随添加图片层（没有场景 / 叠加层时是灰的）");
   check(/lyAddAlphaEl\.onclick = \(\) => openAlphaDialog\(\);/.test(mainSrc), "按钮打开尺寸对话框（先问尺寸，再加层）");
   check(/alphaOkEl\.disabled = !alphaSize\(\);/.test(mainSrc) && /if \(!Number\.isFinite\(w\) \|\| !Number\.isFinite\(h\) \|\| w < 1 \|\| h < 1\) return null;/.test(mainSrc), "尺寸非法（空 / 0 / NaN）时「添加」直接禁用，NaN 进不了 scene.json");
-  check(/if \(!s\) return;[\s\S]{0,60}?addTransparent\(s\.w, s\.h\);/.test(mainSrcCode), "「添加」把校验过的尺寸交给 addTransparent");
+  // [task-33 台账 #67 delete] 「添加」把校验过的尺寸交给 addTransparent —— 用户可见行为已由 headless「AT 段（尺寸校验 → addTransparent：检视器「效果画布尺寸」= 640/360）」覆盖，文本断言删除
+
   check(/structEdit\(et\("log\.alphaAdded", \{ name, w: width, h: height \}\)/.test(mainSrc) && /addTransparentLayer\(d, \{/.test(mainSrc), "加层走 structEdit + container.ts 的对象生成（可撤销、整场景重挂、加完选中）");
   check(/alphaDlgEl\.addEventListener\("keydown"/.test(mainSrc) && /alphaWEl\.select\(\)/.test(mainSrc), "回车 = 添加、打开即聚焦宽输入框");
   check(/if \(e\.target === alphaDlgEl\) alphaDlgEl\.close\(\);/.test(mainSrc), "点对话框外面 = 取消（与 ui/confirm.ts 同一口径）");
   check(/alphaWEl\.value = String\(Math\.round\(r\.w\)\)/.test(mainSrc) && /sceneResolution\(doc\?\.scene \?\? null\)/.test(mainSrc), "对话框默认值 = 当前画布尺寸（「取画布大小」用同一个来源）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #68：CSS 样式文本级（.ed-alpha-form））
   check(cssSrc.includes(".ed-alpha-form"), "尺寸对话框有样式（.ed-alpha-form）");
 
   // —— 生成之后还能改尺寸：读 / 写与 objprops.writeField 同一套铁律 ——
@@ -5413,8 +5668,11 @@ section("ALPHA. 透明层：自定义尺寸的空效果画布 editor/container.t
   check(/sizeInput\("size-w", cur \? cur\[0\] : null\)/.test(mainSrc) && /sizeInput\("size-h", cur \? cur\[1\] : null\)/.test(mainSrc), "容器检视器有宽 / 高两个数字框（初值取对象上的 size，没有就留空）");
   check(/objEdit\(et\("log\.sizeChanged", \{ layer, w: nw, h: nh \}\), node\.id, \(ob\) => setLayerSize\(ob, nw, nh\)\)/.test(mainSrc), "改尺寸走 objEdit + container.ts 的 setLayerSize（可撤销、值没变不记账）");
   check(/if \(!Number\.isFinite\(w\) \|\| !Number\.isFinite\(hh\) \|\| w < 1 \|\| hh < 1\) return;/.test(mainSrc), "非法的框值（空 / 0 / NaN）直接不提交，不把 0 尺寸写进工程");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #69：测试钩子契约：data-container 就是给端到端用例找控件用的，行为级不需要）
   check(/inp\.dataset\.container = field;[\s\S]{0,90}?addEventListener\("change", \(\) => commitSize\(\)\)/.test(mainSrcNoCmt), "两个数字框带 data-container 钩子并监听 change（端到端用例靠它找到控件）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #70：反重复：检视器用 container.ts 导出，没有第二套尺寸口径）
   check(mainSrc.includes("layerSizeOf") && mainSrc.includes("setLayerSize("), "检视器用的是 container.ts 导出的读写函数（没有第二套尺寸口径）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #71：CSS 样式文本级（尺寸行 × 号））
   check(cssSrc.includes(".ed-dim-x"), "尺寸行有样式（两个框中间的 × 号）");
 
   const alphaKeys = ["ly.addAlpha", "alpha.title", "alpha.hint", "alpha.w", "alpha.h", "alpha.canvas", "alpha.add", "alpha.cancel", "alpha.defaultName", "log.alphaAdded", "insp.size", "insp.sizeNote", "log.sizeChanged"];
@@ -5425,6 +5683,7 @@ section("ALPHA. 透明层：自定义尺寸的空效果画布 editor/container.t
   const etAttrs = [...dlgHtml.matchAll(/data-et="([^"]+)"/g)].map((m) => m[1]);
   const missingEt = etAttrs.filter((k) => !new RegExp(`"${k.replace(/\./g, "\\.")}":`).test(i18nSrc));
   check(etAttrs.length >= 6 && missingEt.length === 0, `对话框里每个 data-et 都有词条（${etAttrs.length} 个，缺 ${json(missingEt)}）`);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #72：i18n 绑定：透明层文案键真的被引用（无空词条））
   check(alphaKeys.every((k) => mainSrc.includes(`"${k}"`) || htmlSrc.includes(`data-et="${k}"`) || htmlSrc.includes(`data-et-title="${k}"`)), "透明层文案键都在页面 / 脚本里真的用到（没有只登记不用的空词条）");
 
   // —— 变异红测：改坏实现，上面的形状判据必须变红 ——
@@ -6246,6 +6505,7 @@ section("FX-INLINE. 作品自带效果参数 editor/effects.ts（M1 A1/A2）");
   {
     const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
     const mainSrcCode = codeOnly(mainSrc);
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #74：耦合事实：内联参数提交走 structEdit(..., hot=true) 的热路径；）
     check(
       /function commitInlineParam\([\s\S]{0,1400}?void editor\?\.setEffectConstants\(Number\(layerId\), view\.effect, view\.pass, \{ \[param\.key\]: raw \}\)\.catch\(\(\) => \{\}\);\s*\},\s*true,\s*\);/.test(mainSrcCode),
       "面板接线：内联参数提交 = structEdit(..., hot, true)（对象数组变了也走热路径）+ 引擎 setEffectConstants",
@@ -6359,6 +6619,7 @@ section("M10. 插件面补完（D1–D6）");
   check(/register\(def: CommandDef, owner\?: string\): Disposer;/.test(types10) && /const register = \(def: CommandDef, owner\?: string\): Disposer =>/.test(cmds10) && /return registry\.add\(def, owner\);/.test(cmds10),
     "D3：命令服务暴露 register(def, owner)，返回撤销函数、owner 记归属（registry 只剩只读枚举）");
   check(/命令必须有非空 id/.test(cmds10) && /缺少 run/.test(cmds10), "D3：register 当场校验空 id / 缺 run（插件写坏命令不会被静默登记）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #75：反重复/单一真源：内置 7 条命令走同一 register）
   check(/const cmd = \(c: Parameters<typeof cmds\.register>\[0\]\) => ctx\.effect\(\(\) => cmds\.register\(c, ctx\.name\)\);/.test(mainCode) && (mainCode.match(/cmd\(\{/g) ?? []).length === 7 && !/cmds\.add\(/.test(mainCode),
     `D3：内置 7 条命令改走同一 register（实得 ${(mainCode.match(/cmd\(\{/g) ?? []).length} 条，页面不再直接 registry.add）`);
   const builtinCmdIds = ["edit.undo", "edit.redo", "file.save", "layer.duplicate", "layer.rename", "layer.delete", "export.run"];
@@ -6466,6 +6727,7 @@ section("M10. 插件面补完（D1–D6）");
     L.push("b", "error", "3");
     L.push("a", "info", "4");
     const all = L.list();
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #76：行为级已在 verify-plugins（日志环形缓冲）覆盖；跨脚本迁移不在本卡范围）
     check(
       all.length === 3 && all[0].text === "2" && all[2].text === "4",
       `D6 行为：环形缓冲超上限丢最老的（limit=3，实得 ${json(all.map((x) => x.text))}）`,
@@ -6509,8 +6771,7 @@ const marqueeMod = await loadEditorModule("marquee");
 const treeQueryMod = await loadEditorModule("tree-query");
 const clipboardMod = await loadEditorModule("clipboard");
 const mainSrcText = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-const mainSrcTextNoCmt = codeNoComments(mainSrcText);
-const mainSrcTextCode = codeOnly(mainSrcText);
+// task-33 批 B：吃这份预处理文本的最后一条文本判据已删（行为面由 headless 覆盖），兄弟变量成孤儿 ⇒ 一并删除，接线闸「无孤儿」恢复绿。
 const i18nSrc = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
 const htmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
 const cssSrc = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
@@ -6580,7 +6841,8 @@ section("SELECT-2. 框选命中 / 选择集合合并 / 取消成组（C1）");
 
   // 接线：命令行 / 工具条 / 树行按钮
   check(/app\?\.commands\.handleKey\(e\)/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "a"\) \{\s*e\.preventDefault\(\);\s*selectAllLayers\(\);/.test(mainSrcText) && /function selectAllLayers\(\)/.test(mainSrcText) && /selectMany\(ids\[0\], ids\.slice\(1\)\)/.test(mainSrcText), "⌘/Ctrl+A 全选：走 selectMany（主选 + 追加选区），命令服务没接住才轮到内建链");
-  check(/function selectAllLayers\(\)[\s\S]{0,600}?!isLocked\(n\.id\)/.test(mainSrcTextCode), "全选跳过锁定层（锁定层不能拖动 / 变换，进选区只会造成误操作）");
+  // [task-33 台账 #77 delete] 全选跳过锁定层（锁定层不能拖动 / 变换，进选区只会造成误操作） —— 用户可见行为已由 headless「AU 段（⌘A 全选跳过锁定层）」覆盖，文本断言删除
+
   check(/if \(marquee \|\| !editor \|\| !doc \|\| doc\.type !== "scene" \|\| e\.button !== 0 \|\| e\.altKey\) return;/.test(mainSrcText) && /if \(handleAt\(gizmo, p\.x, p\.y\) \|\| overSelected\(p\.x, p\.y\)\) return;/.test(mainSrcText) && /if \(editor\.hitTestAt\(p\.x, p\.y\)\.some\(/.test(mainSrcText) && /!isLocked\(h\.id\)\)\) return;/.test(mainSrcText), "框选只在空画布起拖：手柄 / 已选层交给拖拽，点在别的层上是点选");
   check(/stageEl\.addEventListener\("pointerdown", \(e\) => \{\s*if \(marquee/.test(mainSrcText) && /const m = marquee;\s*marquee = null;\s*if \(!m\.moved\) return;\s*suppressClick = true;/.test(mainSrcText) && /marqueeHits\(marqueeLayers, r\)/.test(mainSrcText) && /marqueeSelect\(/.test(mainSrcText), "松手才结算：没超过阈值当点击（不吞掉点选），结算走 marqueeHits + marqueeSelect");
   check(/if \(marquee\) drawMarquee\(\);/.test(mainSrcText) && /overlayCtx\.setTransform\(dpr, 0, 0, dpr, \(cr\.left - sr\.left\) \* dpr, \(cr\.top - sr\.top\) \* dpr\);\s*if \(marquee\) drawMarquee\(\);/.test(mainSrcText), "框选矩形画在选中框叠加层上（与手柄同一套坐标变换）");
@@ -6721,8 +6983,10 @@ section("CLIPBOARD. 图层剪贴板序列化 / 跨文档粘贴（A10）");
   check(/import \{ load, save \} from "\.\.\/shared\/workbench\/storage";/.test(mainSrcText) && /save\(LAYER_CLIP_KEY, stringifyLayerClip\(clip\)\)/.test(mainSrcText) && /const raw = load\(LAYER_CLIP_KEY\);/.test(mainSrcText), "剪贴板：内存优先 + localStorage 兜底（跨标签页 / 刷新后仍能粘贴）");
   check(/function readClipboard\(\): LayerClip \| null \{\s*if \(layerClip\) return layerClip;/.test(mainSrcText) && /layerClip = raw \? parseLayerClip\(raw\) : null;/.test(mainSrcText), "读：先内存，miss 才读 localStorage，且一律过 parseLayerClip 校验");
   check(/\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "c"\) \{\s*if \(!copySelected\(\)\) return;/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "x"\) \{\s*if \(!cutSelected\(\)\) return;/.test(mainSrcText) && /\(e\.metaKey \|\| e\.ctrlKey\) && e\.key\.toLowerCase\(\) === "v"\) \{\s*if \(!pasteClipboard\(\)\) return;/.test(mainSrcText), "⌘/Ctrl+C / X / V 接内建链（命令服务没接住才轮到，与关键帧剪贴板按钮不冲突）");
-  check(/function copySelected\(\): boolean \{[\s\S]{0,900}?serializeLayerClip\(/.test(mainSrcTextCode) && /function cutSelected\(\): boolean \{\s*if \(!copySelected\(\)\) return false;\s*const n = selectionNodes\(\)\.length;\s*deleteSelected\(\);/.test(mainSrcTextCode), "复制走序列化；剪切 = 复制 + deleteSelected（删除自己进撤销栈）");
-  check(/structEdit\(et\("log\.layerPasted", \{ n: clip\.objs\.length \}\), \(d\) => \{[\s\S]{0,300}?pasteLayerClip\(d, clip, \[PASTE_OFFSET, -PASTE_OFFSET\]\)/.test(mainSrcTextNoCmt) && /selectMany\(added\[0\], added\.slice\(1\)\);/.test(mainSrcTextNoCmt), "粘贴走 structEdit（一步撤销），粘完选中新层（全部进追加选区）");
+    // [task-33 台账 #78 delete] 复制走序列化 —— 用户可见行为已由 headless「AL. M7 交互补齐（图层剪贴板）」覆盖，文本断言删除
+
+    // [task-33 台账 #79 delete] 粘贴走 structEdit —— 用户可见行为已由 headless「AL. M7 交互补齐（图层剪贴板）」覆盖，文本断言删除
+
   check(/const PASTE_OFFSET = 16;/.test(mainSrcText) && /function clipboardSource\(\)/.test(mainSrcText), "粘贴偏移常量 + 复制来源校验（必须是有编辑器的场景文档）");
 }
 
@@ -6837,12 +7101,12 @@ section("SCENE-SET. 场景设置面板（general 读写 / 保留未知键与非�
 
   // ---- 页面接线：面板本体、菜单、撤销方向、切语言 ----
   const scnMain = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  const scnMainNoCmt = codeNoComments(scnMain);
   const scnHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   check(/import \{ mountSceneSettings \} from "\.\/scene-settings";/.test(scnMain), "外接面板与单测是同一份代码（页面 import 的就是 scene-settings.ts）");
   check(/id="tb-scene-opts"/.test(scnHtml) && /id="scene-menu-body"/.test(scnHtml), "视口工具条有「场景设置」按钮，弹出层有装面板的容器");
   check(/id="render-menu" class="ed-menu ed-render-menu"/.test(scnHtml) && /id="scene-menu" class="ed-menu ed-render-menu" role="dialog" hidden/.test(scnHtml), "两个菜单并存且样式一致：全局「渲染选项」与「场景设置」分开两份，都默认收起");
-  check(/function sceneEdit\(label: string, key: string, value: unknown\): boolean \{[\s\S]{0,600}edits\.push\(\{ kind: "scene", label, before, after \}\)[\s\S]{0,300}docDriven = true;[\s\S]{0,200}markDirty\(\);[\s\S]{0,200}void mountCurrent\(true\);/.test(scnMainNoCmt), "改一次场景设置：一笔撤销栈 + 置 docDriven 后整场景重挂（引擎才拿到新 general）");
+    // [task-33 台账 #80 delete] 改一次场景设置 —— 用户可见行为已由 headless「AK. 场景设置端到端」覆盖，文本断言删除
+
   check(/if \(after === before\) return false;/.test(scnMain), "值没变（点一下没动 / 改回原值）不入栈");
   check(/if \(isSceneCmd\(cmd\)\) \{\s*log\(et\(dir === "undo" \? "log\.undo" : "log\.redo", \{ name: cmd\.label \}\)\);\s*applySceneSnap\(dir === "undo" \? cmd\.before : cmd\.after\);/.test(scnMain), "撤销 / 重做按键方向换回 general 快照");
   check(/edit: sceneEdit,/.test(scnMain) && /onChangeLang\(\(\) => sceneSettings\.refresh\(\)\);/.test(scnMain), "面板接进页面：编辑走 sceneEdit，切语言后重画");
@@ -6854,9 +7118,11 @@ section("SCENE-SET. 场景设置面板（general 读写 / 保留未知键与非�
     ...scn.SCENE_GROUPS.map((g) => `scn.sec.${g}`), ...scn.SCENE_FIELDS.map((f) => `scn.f.${f.key}`)];
   const scnMiss = scnKeys.filter((k) => (scnI18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
   check(scnMiss.length === 0, `场景设置文案中英文各一条（缺 / 重 ${json(scnMiss)}）`);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #104：i18n：中英文都真翻译（不是占位））
   check(/"scn\.title": "场景设置"/.test(scnI18n) && /"scn\.title": "Scene settings"/.test(scnI18n), "中英文都真翻译了（不是同一串占位）");
   check(/"scn\.hint": "[^"]*scene\.json/.test(scnI18n), "面板自带说明：这些参数写进工程的 scene.json（与全局渲染选项分清）");
-  check(/id="scene-menu"[\s\S]{0,700}data-et="scn\.hint"/.test(scnHtml), "说明就在面板里（用户不必去看文档才知道写到哪）");
+  // [task-33 台账 #81 delete] 说明就在面板里（用户不必去看文档才知道写到哪） —— 用户可见行为已由 headless「AT 段（场景设置面板内说明）」覆盖，文本断言删除
+
 
   // ---- 变异红测：把保键 / 拆包装的底线各破一次，上面的判据必须变红 ----
   const scnDocPath = path.join(ROOT, "editor/doc.ts");
@@ -7489,6 +7755,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       mutMod.canCreateLayerOfKind("light") === false && mutMod.createLayerOfKind("light", dm, { name: "x" }) === null && dm.scene.objects.length === 0,
       "★ 把 light 的 create 去掉后入口就不再建层（证明消费的是 LayerKindDef.create，不是另写一份构造逻辑）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #82：反重复：两种 create 都接 objlayers 构造器，不复制字段表）
     check(lkSrc.includes('create: (doc, opts) => addLightLayer(doc, "lpoint", opts?.name ?? "Light")') && lkSrc.includes("create: (doc, opts) => addCameraLayer(doc, opts?.name ?? \"Camera\")"), "两种 create 都接到 objlayers 的构造器上（不复制一份字段表）");
     check(/return def\.create\(doc, opts\) \?\? null;/.test(lkSrc), "createLayerOfKind 只经注册表的 create 转发");
     const ckBody = lkSrc.slice(lkSrc.indexOf("export function createLayerOfKind"));
@@ -7508,6 +7775,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
         /const lyAddCameraEl = \$\<HTMLButtonElement\>\("#ly-add-camera"\);\nlyAddCameraEl\.onclick = \(\) => addKindLayer\("camera"\);/.test(mainSrc),
       "工具条按钮接上创建路径（#ly-add-light / #ly-add-camera → addKindLayer）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #83：结构编辑链耦合：addKindLayer 走 structEdit+createLaye）
     check(
       /function addKindLayer\(kind: "light" \| "camera"\)[\s\S]{0,600}?structEdit\(label, \(d\) => createLayerOfKind\(kind, d, \{ name \}\) \?\? undefined\);/.test(mainSrcNoCmt),
       "addKindLayer 走 structEdit + createLayerOfKind（可撤销、可存库，与文字 / 粒子层同一条结构编辑链）",
@@ -7561,6 +7829,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
     ];
     const missingLc = lcKeys.filter((k) => (i18nSrc.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
     check(missingLc.length === 0, `light / camera 文案中英文都有、每个键恰好出现 2 次（缺 ${json(missingLc)}）`);
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #84：文案事实：灯类型说明写明通道/限槽/衰减公式，行为级不可观察）
     check(/light\.typeTip[\s\S]{0,200}?V1/.test(i18nSrcNoCmt) && /lightconfig/.test(i18nSrcNoCmt), "灯类型说明写明「^l 前缀走 V1 通道、按 lightconfig 限槽、两条衰减公式不同」");
     check(/objp\.n\.parallaxdepth": "[^"]*组级/.test(i18nSrc) && /objp\.n\.solid": "[^"]*Solid/.test(i18nSrc), "parallaxDepth 的「只对组/父级生效」与 solid 的「鼠标事件只对 Solid 生效」写在文案里");
   }
@@ -8338,6 +8607,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
   {
     const smSrc = fs.readFileSync(path.join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
     const slotSrc = fs.readFileSync(path.join(ROOT, "renderer/src/editor/script-slot.ts"), "utf8");
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #85：M12 接线：从四个纯模块取实现）
     check(
       smSrc.includes("from \"./editor/layer-order\"") &&
         smSrc.includes("from \"./editor/overlay\"") &&
@@ -8345,6 +8615,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
         smSrc.includes("from \"./editor/script-slot\""),
       "M12 接线：scene-mount 从四个纯模块取实现（结构手术 / 几何 / GL pass / 脚本挂点）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #86：M12/B3 接线：三类挂点走同一套热替换）
     check(
       /const slot = makeScriptSlot\(\s*layer,\s*"text",/.test(smSrc) &&
         /const slot = makeScriptSlot\(\s*layer,\s*`effects\[\$\{ei\}\]\.visible`,/.test(smSrc) &&
@@ -8352,26 +8623,28 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
         smSrc.includes("setLayerScript(id: number | string, target: string, code: string)"),
       "M12/B3 接线：文字 / effects[i].visible / 对象字段三类挂点都走同一套热替换挂点，并有 setLayerScript 出口",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #87：M12/B3 接线：setLayerScript 只换该槽位）
     check(
       smSrc.includes("const slot = editorScriptSlots.find((s) => s.layer === l && s.target === target)") &&
         smSrc.includes("slot.swap(text)") &&
         smSrc.includes("slot.current = null;"),
       "M12/B3 setLayerScript 按「图层 + 挂点」找槽位并只换这一代求值结果（不重挂场景）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #88：M12/B3 接线：宿主只做登记/撤报错/计跳过）
     check(
       smSrc.includes("createScriptSlot({ layer, target, build, activate, host: scriptsOff ? slotHostNoCount : scriptSlotHost })") &&
         smSrc.includes("register: (sb) => propSandboxes.push(sb)"),
       "M12/B3 接线：宿主只提供登记 / 撤报错 / 计跳过三件事，沙箱仍在引擎侧求值",
     );
-    check(
-      smSrc.includes("const slotHostNoCount: ScriptSlotHost = { ...scriptSlotHost, countSkipped: () => {} };"),
-      "★ 关脚本时槽位不再重复计一次拦截（skipScript 已计；否则同一段脚本提示成「2 段脚本」）",
-    );
+    // [task-33 台账 #89 delete] ★ 关脚本时槽位不再重复计一次拦截（skipScript 已计；否则同一段脚本提示成「2 段脚本」） —— 用户可见行为已由 headless「W 段既有判据（已拦截 1 段脚本 + 诊断流 skipped 1；重复计一次会变 2）」覆盖，文本断言删除
+
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #90：M12/B3 接线：槽位在 makeScriptSlot 统一登记）
     check(
       /const makeScriptSlot = \([\s\S]*?editorScriptSlots\.push\(slot\);[\s\S]*?return slot;/.test(smSrc) &&
         smSrc.includes("editorScriptSlots.find((s) => s.layer === l && s.target === target)"),
       "★ M12/B3 接线：槽位在 makeScriptSlot 里统一登记 —— 三个挂点都进 editorScriptSlots，setLayerScript 才找得到（否则整条 API 恒 reject）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #91：M12/B3 接线：四张表都走 upsertRun 去重）
     check(
       /upsertRun\(\s*effectVisibleRuns,/.test(smSrc) &&
         /upsertRun\(\s*objectScriptRuns,/.test(smSrc) &&
@@ -8379,6 +8652,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
         smSrc.includes("upsertRun(list, (s: any) => s === sandbox, sandbox)"),
       "★ M12/B3 接线：逐帧效果开关队列 / 对象字段队列 / animationEvent 广播表 / 指针回调表都走 upsertRun 去重（热替换不再让同一脚本跑两遍）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #92：M12/B3 接线：拆层摘掉稳定句柄）
     check(
       smSrc.includes("const deadSandboxes = new Set<any>();") &&
         /for \(let i = propSandboxes\.length - 1; i >= 0; i--\) if \(deadSandboxes\.has\(propSandboxes\[i\]\)\)/.test(smSrc) &&
@@ -8393,6 +8667,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       !/\bnew Function\b|\beval\s*\(/.test(slotSrc),
       "M12/B3 安全边界：script-slot 不自己求值（transform / 形参表 / 严格模式仍由引擎沙箱唯一提供）",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #93：M12/B3 接线：共用 env 工厂+具名激活函数）
     check(
       smSrc.includes("const textEnv = () => (") &&
         smSrc.includes("const makeEnv = () => (") &&
@@ -8400,11 +8675,13 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
         smSrc.includes("const activateEffectVisible = (sandbox: any) =>"),
       "M12/B3 接线：三处挂点都是「同一份 env 工厂 + 具名激活函数」，与首次装配共用一条路径",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #94：M12/B1 接线：单对象重解析复用 scene.json 原文）
     check(
       smSrc.includes("const sceneJsonRaw = JSON.parse(readText(sceneEntry)) as Record<string, unknown>") &&
         smSrc.includes("scn.parseScene(sceneJsonRaw, project)"),
       "M12/B1 接线：单对象重解析复用装配期读到的 scene.json 原文",
     );
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #95：契约面：EditorControls 暴露增量装配与 overlay 切换）
     check(
       smSrc.includes("addLayer(spec: EditorLayerAddSpec): Promise<EditorLayer>") &&
         smSrc.includes("removeLayer(id: number | string): Promise<void>") &&
@@ -8416,6 +8693,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
       "M12 接线：EditorControls 面暴露增量装配与 overlay 后端切换",
     );
     const editorSrc = fs.readFileSync(path.join(ROOT, "renderer/src/api/editor.ts"), "utf8");
+    // TEXT-ONLY-BY-DESIGN（task-33 台账 #96：契约面：四个公开类型从 renderer/src/api/editor 出口）
     check(
       ["EditorLayerAddSpec", "EditorHotAddCheck", "EditorOverlayMode", "EditorOverlayStats"].every((n) =>
         editorSrc.includes(n),
@@ -8436,8 +8714,8 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
   const drPath = path.join(ROOT, "editor/draft.ts");
   const drSrc = fs.readFileSync(drPath, "utf8");
   const drMain = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
-  const drMainCode = codeOnly(drMain);
   const drMainNoCmt = codeNoComments(drMain);
+  // task-33 批 B：同 mainSrcTextCode —— 唯一的消费者已删，孤儿声明随批 B 删除。
   const drHtml = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
   const drCss = fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8");
   const drI18n = fs.readFileSync(path.join(ROOT, "editor/i18n.ts"), "utf8");
@@ -8617,8 +8895,10 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
     "自动保存目标：可写文件夹 → 文件夹；库来源 / 目录不可写 → 草稿槽；快照装不下的文档（视频 / 网页）与真没内容的一律不写（页面必须提示）");
 
   // ---- 页面接线：一份 draft.ts + 两条横幅 + 分流落盘 ----
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #97：反重复：页面接的就是 draft.ts 那一份）
   check(/import \{[\s\S]{0,400}\} from "\.\/draft";/.test(drMainNoCmt) && /const draftStore = vdirDraftStore\(\);/.test(drMainNoCmt),
     "页面接的就是 draft.ts 那一份（顶层就绑上 vdir 后端）");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #98：反死代码：旧单槽 IndexedDB 装配没留半死代码）
   check(!/idbDraftStore/.test(drSrc), "旧单槽 IndexedDB 装配没有留成半死代码（要么接上要么清掉）");
   const drTargetAt = drMain.indexOf("const autosaveTarget = ");
   const drTargetFn = drMain.slice(drTargetAt, drTargetAt + 600);
@@ -8639,8 +8919,8 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
     "不写的时候明确提示一次，不静默（同一次打开只提示一次）");
   check(/probeWritable\(dir\)\.then\(/.test(drMain) && /dirWritable = false;/.test(drMain) && /log\.dirNotWritable/.test(drMain),
     "文件夹不可写：探一次（只探一次，不每 400ms 撞墙）→ 退到草稿槽 + 明确报出目录名与原因");
-  check(/function flushPendingSave\(\)/.test(drMainNoCmt) && /visibilitychange[\s\S]{0,160}flushPendingSave\(\)/.test(drMainNoCmt),
-    "页面隐藏前按同一个目标分流落盘（切后台 / 关标签页不丢未保存编辑）");
+  // [task-33 台账 #99 delete] 页面隐藏前按同一个目标分流落盘（切后台 / 关标签页不丢未保存编辑） —— 用户可见行为已由 headless「AT 段（编辑中无横幅 → 真实刷新后横幅在 = pagehide 落盘）」覆盖，文本断言删除
+
   check(/function flushDraftSnapshot\(force = false\)/.test(drMain) && /void flushDraftSnapshot\(true\)/.test(drMain),
     "隐藏时不受节流限制，立刻把最后一次编辑写进快照");
   check(/async function restoreDraft\(pending: \{ slot: string; draft: Draft \}\)/.test(drMain) && /applyDraft\(target, d\)/.test(drMain)
@@ -8653,9 +8933,8 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
     "内容落到文件夹后清草稿副本，但只清本次会话自己写过的槽（上一次会话留下的快照不碰，可能只有那一份）");
   check(/const nowSlot = currentDraftSlot\(\);\s*\n\s*if \(nowSlot !== pending\.slot\) \{\s*\n\s*try \{\s*\n\s*await draftStore\.save\(d, nowSlot\);\s*\n\s*draftWrittenAt = Date\.now\(\);\s*\n\s*lastDraftSlot = nowSlot;\s*\n\s*await draftStore\.clear\(pending\.slot\);/.test(drMain),
     "重建后槽会挪（local: → 会话槽）：先落新槽再清旧槽，不留一条每次都冒出来的旧快照");
-  check(/if \(from\.kind === "library"\)[\s\S]{0,500}openLibraryItem\(it, MEDIA_BASE, WEB_BASE\)/.test(drMainNoCmt)
-    && /if \(from\.kind === "virtual"\)[\s\S]{0,500}openVirtualProject\(from\.id\)/.test(drMainNoCmt),
-    "库条目 / 虚拟工程各自重开原始资源，再把快照套上去（增量快照，不靠一份全量拷贝）");
+    // [task-33 台账 #100 delete] 库条目 / 虚拟工程各自重开原始资源 —— 用户可见行为已由 headless「R. 项目自动保存」覆盖，文本断言删除
+
   check(/log\(et\("log\.draftMissing", \{ id \}\), "error"\)/.test(drMain) && /log\(et\("log\.vdirMissing", \{ name: d\.title \}\), "warn"\)/.test(drMain),
     "来源已经不在（库条目被删 / 目录没了）明确报错，不静默丢弃");
   check(/overlay\?\.put\(f\.name, f\.data, g\);/.test(drMain) && /overlay\?\.share\(owner, f\.name\)/.test(drMain),
@@ -8675,22 +8954,21 @@ section("DRAFT-2. 未保存编辑找回（draft.ts 存储 + 恢复横幅 + 自�
     && /adoptProject\(dir\)/.test(drVirtualBody) && /files\.length \? openLocalFiles\(files\)/.test(drVirtualBody)
     && /newOpened\(d\.title, d\.project \?\? newProject\(d\.title\), d\.scene\)/.test(drVirtualBody),
     "虚拟工程草稿：目录还在就按目录重开，目录空了（存储被清过）就按快照重建并 adopt 回该目录（不静默丢）");
-  check(/draftRecoverRestoreEl\.onclick/.test(drMainCode) && /draftRecoverDiscardEl\.onclick/.test(drMainCode)
-    && /draftRestoreEl\.onclick = \(\) => \{[\s\S]{0,200}resumeVirtualProject/.test(drMainCode),
-    "两条横幅各绑各的处理函数：一条重开目录，一条恢复未保存编辑（语义不混）");
+  // [task-33 台账 #101 delete] 两条横幅各绑各的处理函数：一条重开目录，一条恢复未保存编辑（语义不混） —— 用户可见行为已由 headless「AU 段（点新横幅「恢复」找回未保存编辑）」覆盖，文本断言删除
+
 
   // ---- 横幅 DOM / 样式 / i18n：与既存 #ed-draft 可区分 ----
   check(/id="ed-draft-recover" role="status" hidden/.test(drHtml) && drHtml.indexOf('id="ed-draft-recover"') > drHtml.indexOf('id="ed-draft"'),
     "未保存编辑横幅是独立一条，排在「重开上次目录」横幅之后");
-  check(/id="draft-recover-restore"/.test(drHtml) && /id="draft-recover-discard"/.test(drHtml)
-    && /id="ed-draft-recover"[\s\S]{0,300}data-et="draft\.restore"[\s\S]{0,200}data-et="draft\.discard"/.test(drHtml),
-    "新横幅有自己的按钮 id，文案复用既有的「恢复 / 丢弃」两条");
+  // [task-33 台账 #102 delete] 新横幅有自己的按钮 id，文案复用既有的「恢复 / 丢弃」两条 —— 用户可见行为已由 headless「AT 段（新横幅两个按钮 id 与文案）」覆盖，文本断言删除
+
   check(/#ed-draft-recover,/.test(drCss) && /#ed-draft:not\(\[hidden\]\) \+ #ed-draft-recover \{/.test(drCss),
     "新横幅沿用同一套横幅样式；两条同时在时下沉一行，不叠在一起");
   check(/const draftRecoverTextEl = \$[^(]*\("#ed-draft-recover-text"\)/.test(drMain) && /et\("draft\.unsavedFound", \{/.test(drMain),
     "横幅文案走 i18n，不是硬编码");
   check(/et\("vdir\.found", \{ name: rec\.name/.test(drMain) && /et\("draft\.unsavedFound"/.test(drMain),
     "两条横幅的文案指向不同的事：一条说「发现上次的工程」，一条说「发现未保存的编辑」");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #103：i18n 成对：draft.unsavedFound 中英各恰好一条）
   check((drI18nNoCmt.match(/"draft\.unsavedFound":/g) ?? []).length === 2, "draft.unsavedFound 中英文各恰好一条");
   check(drI18n.includes('"draft.unsavedFound": "发现未保存的编辑「{title}」（{time}）"')
     && drI18n.includes('"draft.unsavedFound": "Unsaved edits found: \\"{title}\\" ({time})"'),
@@ -8959,6 +9237,7 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
   check(pvBad.length === 0, `粒子 v2：分组参数读写 / 未知组件原样保留 / 钳位 / controlpoint 族 / 引擎热更全部成立（${pvBad.join(" / ") || "ok"}）`);
 
   // ---- 引擎侧实现：路径定位 + 只在 maxcount 变时重建池 ----
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #105：引擎读点：applyModel 重读设置/maxcount 才重建池）
   check(
     /applyModel\(model\) \{[\s\S]{0,400}?this\._applyModelSettings\(\)[\s\S]{0,400}?if \(nextMax !== prevMax\) this\.reapplyOverride\(\)[\s\S]{0,200}?this\._compile\(\)/.test(psSrcCode),
     "引擎 applyModel：重读顶层设置 → 只有 maxcount 变才重建池 → 再 _compile",
@@ -8998,6 +9277,7 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     /const cmd = fileCommand\(et\("pt\.fileEdited", \{ layer: nodeName\(node\.id\), field: ptFieldLabel\(view\) \}\), \{ path, bytes: enc\.encode\(before\) \}, \{ path, bytes \}\);/.test(mainSrc2),
     "粒子文件改动按「文件 + 字节」记一步撤销（文件不在 doc 里，结构快照装不下）",
   );
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #106：耦合事实：撤销/重做走同一 applyParticleBytes；用户可见撤销由 Z 覆）
   check(/if \(isFileCmd\(cmd\)\) \{[\s\S]{0,400}?applyParticleBytes\(snap\.path, snap\.bytes\);/.test(mainSrc2Code), "撤销 / 重做走同一个 applyParticleBytes（字节回写 + 热更）");
   check(/det\.className = "ed-inline-pass";/.test(mainSrc2) && /\.ed-inline-pass\b/.test(fs.readFileSync(path.join(ROOT, "editor/editor.css"), "utf8")), "粒子分区复用作品自带效果的折叠样式（不新增 CSS / HTML）");
 
@@ -9717,6 +9997,7 @@ section("WARP. 操控变形 editor/warp.ts（钉子网格 / IDW 权重 / .mdl �
       !/bones\.map\(\(p, i\) => \(\{ name: `pin/.test(mainSrc),
     "main.ts 里没有内联副本（骨架 / 权重 / 编码只有 warp.ts 一份）",
   );
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #107：面板登记结构耦合：操控变形是普通 inspectorGroups（AO 覆盖用户可见行为）
   check(
     /id: "warp",\s*\n\s*order: 1150,[\s\S]{0,320}render: warpGroup,\s*\n\s*tab: "model",/.test(mainSrcNoCmt) &&
       /const BUILTIN_INSPECTOR: InspectorGroup\[\] = \[[\s\S]*?id: "warp"[\s\S]*?\];/.test(mainSrcNoCmt),
@@ -9750,6 +10031,7 @@ section("WARP. 操控变形 editor/warp.ts（钉子网格 / IDW 权重 / .mdl �
     `操控变形文案中英成对（${wpKeys.length} 个键：${json(wpKeys.filter((k) => once(k) !== 2))} 不成对）`,
   );
   const warpLogs = ["log.warpPromoted", "log.warpStarted", "log.warpRecorded", "log.warpRebuilt", "log.warpBaked", "insp.warp"];
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #108：i18n 成对 + main.ts 真引用（无写死字面量））
   check(
     warpLogs.every((k) => once(k) === 2 && mainSrc.includes(`"${k}"`)),
     "操控变形的日志 / 面板文案中英成对，且 main.ts 真的引用（没有写死的字面量）",
@@ -10955,6 +11237,7 @@ section("KIND-I18N. 图层种类名成对（树徽标 / 检视器「类型」行
   // ④ 变异红测：删掉 kind.container 的一条 ⇒ ② 必须变红
   const kindMutated = i18nKindSrc.replace('    "kind.container": "容器",\n', "");
   const kindMutMissing = kindNames.filter((k) => (kindMutated.match(new RegExp(`"${k.replace(/[.\-]/g, "\\$&")}":`, "g")) || []).length !== 2);
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #110：变异红测锚点守卫）
   check(
     kindMutated !== i18nKindSrc && kindMutMissing.includes("container"),
     "变异红测：删掉 kind.container 的一条词条后判据变红（界面上会显示裸键）",
@@ -13213,6 +13496,7 @@ const wsMod = await loadEditorModule("write-sig");
   );
   // 接线：main.ts 不再有全局表；护栏必须在 writeToDirectory **之后**（提前到前面会挡正常路径）
   const mainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #111：反死代码：writtenSig 0 处引用）
   check(!/writtenSig/.test(mainSrc), "main.ts：全局按路径的 writtenSig 已删干净（0 处引用）");
   const iWrite = mainSrc.indexOf("if (changed.length) await writeToDirectory(dir, changed);");
   const iGuard = mainSrc.indexOf("if (dir !== projectDir || doc !== snap) return ok;", iWrite);
@@ -13290,18 +13574,26 @@ section("SRC-CODE-ONLY. 源码文本判据的输入预处理（防注释 / 字�
 
   // 3) 迁移接线：兄弟变量原地只算一次；吃预处理文本的判据条数；不迁移清单仍走裸文本
   const selfHead = fs.readFileSync(new URL(import.meta.url), "utf8").split('section("SRC-CODE-ONLY.')[0];
-  const declCode = [...selfHead.matchAll(/^\s*const (\w+Code) = codeOnly\((\w+)\);$/gm)].length;
-  const declNoCmt = [...selfHead.matchAll(/^\s*const (\w+NoCmt) = codeNoComments\((\w+)\);$/gm)].length;
-  const useCode = [...selfHead.matchAll(/\b\w+Code\.(?:match|split)\(|\.test\(\s*\w+Code\s*\)/g)].length;
-  const useNoCmt = [...selfHead.matchAll(/\b\w+NoCmt\.(?:match|split)\(|\.test\(\s*\w+NoCmt\s*\)/g)].length;
-  check(declCode === 16 && declNoCmt === 15, `接线：兄弟变量原地只算一次（实得 codeOnly ${declCode} / codeNoComments ${declNoCmt}，预期 16 / 15）`);
-  check(useCode === 39 && useNoCmt === 47, `接线：吃预处理文本的判据条数（实得 codeOnly ${useCode} / codeNoComments ${useNoCmt}，预期 39 / 47）`);
+  const names = (re, g) => new Set([...selfHead.matchAll(re)].map((m) => m[g] || m[g + 1]));
+  const declCode = names(/^\s*const (\w+Code) = codeOnly\((\w+)\);$/gm, 1);
+  const declNoCmt = names(/^\s*const (\w+NoCmt) = codeNoComments\((\w+)\);$/gm, 1);
+  // task-33 台账会按「headless 已覆盖」逐条删判据 ⇒ 不钉死条数，钉「每个兄弟声明都有判据在吃」（无孤儿声明）。
+  // 反方向（用了没声明的兄弟变量）由脚本本身兜底：那是 ReferenceError，跑不到这里。
+  // 用面按「名字在声明集里」过滤——`regionCode`（:12305 手工剥注释的无关局部量）只是尾巴同名，不是兄弟变量。
+  const used = (decls, re) => new Set([...selfHead.matchAll(re)].map((m) => m[1] || m[2]).filter((n) => decls.has(n)));
+  const useCode = used(declCode, /\b(\w+Code)\.(?:match|split)\(|\.test\(\s*(\w+Code)\s*\)/g);
+  const useNoCmt = used(declNoCmt, /\b(\w+NoCmt)\.(?:match|split)\(|\.test\(\s*(\w+NoCmt)\s*\)/g);
+  check(
+    useCode.size === declCode.size && useNoCmt.size === declNoCmt.size && declCode.size > 0 && declNoCmt.size > 0,
+    `接线：兄弟变量都在用、无孤儿（codeOnly 在用 ${useCode.size}/${declCode.size}，codeNoComments ${useNoCmt.size}/${declNoCmt.size}）`,
+  );
   check(
     selfHead.includes("(smCode.match(/meshHit:/g) ?? []).length === 1") &&
-      selfHead.includes("const drMainNoCmt = codeNoComments(drMain);") &&
+      /\b\w+NoCmt\.match\(/.test(selfHead) &&
       selfHead.includes("(i18nNoCmt.match(new RegExp("),
     "接线抽查：源码计数（meshHit）走 codeOnly、含事件名/字面量的窗口与词条计数走 codeNoComments",
   );
+  // TEXT-ONLY-BY-DESIGN（task-33 台账 #112：task-32 自身纪律守卫：只有两条包装（剥/不剥字符串））
   check(
     selfHead.includes("const codeOnly = (src) => preprocessSource(src, true);") &&
       selfHead.includes("const codeNoComments = (src) => preprocessSource(src, false);") &&

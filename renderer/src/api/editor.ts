@@ -44,9 +44,13 @@ export {
   setMdlClipMeta,
   setMdlClipEvents,
   moveMdlClip,
+  // W18a 片段叠增量逐帧对账（单层）：轨道读数 + 引擎同源 bindTRS + 合成 TRS
+  mdlClipTrack,
+  mdlBindTRS,
+  mdlClipFrameTrs,
 } from "../editor/mdl-edit";
 // P2：骨架与权重的写侧类型（与上面那组函数同源，直接来自 mdl-edit）
-export type { MdlBoneInfo, MdlBoneSpec } from "../editor/mdl-edit";
+export type { MdlBoneInfo, MdlBoneSpec, MdlClipTrack } from "../editor/mdl-edit";
 export { SYSTEM_FONT_FAMILIES, TEXT_EM_SCALE } from "../types";
 // M12（B7）：相机路径（`scripts/camera_paths_*.json`）的只读体检 + clip 队列 / queuemode 读写。
 // 页面侧只准 import 本出口，不许直接碰 renderer/src/editor/ 下的实现。

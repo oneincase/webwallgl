@@ -835,25 +835,35 @@ check(census.changed === 1 && /^audiophile\//.test(census.changes[0] || ""),
   `G3 语料不变性：整份 defaultprojects 只能有 audiophile 那 1 处材质路径变化，实际 ${census.changed} 处：${census.changes.join("、")}`);
 if (census.changes.length) console.log(`  - G3 语料唯一变化点：${census.changes.join("、")}`);
 
-// —— 工坊打包语料不变性（闸门不开时逐位不变）——
+// —— 工坊打包语料不变性（闸门不开时逐位不变）+ 全量 skins 语料面（task-35 E3）——
+// 口径 = **所有**含 scene.pkg 的条目（数字 ID + 命名的自建/导入条目），不只看 `/^\d+$/`。
+// task-35 全量实测：命名条目里恰好带着全部 3 张 skins 表（audiophile / fantasticcar / techno），
+// 旧口径把它们整体排除在外 ⇒ `skinModels === 0` 是**结构性假绿**（永远看不到真样本）。
+// 现在把「语料事实」本身变成判据：3 张表 / 键=材质目录名 / 值=纯基名 / 对象 skin 0 处。
+/** 工坊全量语料里真出现的 skins 样本：{ item, sidecar, materialPath(来自 .mdl 内嵌), skins, modelStem } */
+const WORKSHOP_SKIN_SAMPLES = [];
+const WORKSHOP_SCAN = { pkgs: 0, numeric: 0, named: 0, scenes: 0, objects: 0, skinObjs: 0, tables: 0, nonArray: 0, malformed: [], badKey: [], badVal: [] };
 {
-  let pkgs = 0, scenes2 = 0, objects2 = 0, skinObjs = 0, skinModels = 0;
-  for (const d of fs.readdirSync(LIB).filter((x) => /^\d+$/.test(x))) {
+  const dirs = fs.readdirSync(LIB).filter((x) => {
+    try { return fs.statSync(path.join(LIB, x)).isDirectory(); } catch { return false; }
+  });
+  for (const d of dirs) {
     const p = path.join(LIB, d, "scene.pkg");
     if (!fs.existsSync(p)) continue;
     let pkg;
     try { pkg = parsePkg(fs.readFileSync(p)); } catch { continue; }
-    pkgs++;
+    WORKSHOP_SCAN.pkgs++;
+    if (/^\d+$/.test(d)) WORKSHOP_SCAN.numeric++; else WORKSHOP_SCAN.named++;
     const e = pkg.entries.find((x) => /^scene\.json$/i.test(x.name));
     if (e) {
       const b = getEntry(pkg, e.name);
       let sj = null;
       try { sj = b ? parseJsonLoose(readText(b)) : null; } catch { /* 坏 json 跳过 */ }
       if (sj && Array.isArray(sj.objects)) {
-        scenes2++;
+        WORKSHOP_SCAN.scenes++;
         for (const o of sj.objects) {
-          objects2++;
-          if (Object.prototype.hasOwnProperty.call(o, "skin")) skinObjs++;
+          WORKSHOP_SCAN.objects++;
+          if (Object.prototype.hasOwnProperty.call(o, "skin")) WORKSHOP_SCAN.skinObjs++;
         }
       }
     }
@@ -863,16 +873,108 @@ if (census.changes.length) console.log(`  - G3 语料唯一变化点：${census.
       if (!b) continue;
       let t2 = null;
       try { t2 = parseJsonLoose(readText(b)); } catch { continue; }
-      if (Array.isArray(t2.skins)) skinModels++;
+      if (!Object.prototype.hasOwnProperty.call(t2, "skins")) continue;
+      WORKSHOP_SCAN.tables++;
+      if (!Array.isArray(t2.skins)) {
+        WORKSHOP_SCAN.nonArray++;
+        WORKSHOP_SCAN.malformed.push(`${d}/${e2.name}: skins 非数组（${typeof t2.skins}）`);
+        continue;
+      }
+      for (const [si, set] of t2.skins.entries()) {
+        if (!set || typeof set !== "object" || Array.isArray(set)) {
+          WORKSHOP_SCAN.malformed.push(`${d}/${e2.name}[${si}]: 该套不是对象`);
+        }
+      }
+      // 键语义的权威口径 = .mdl 内嵌材质路径（引擎读到的就是它）；没有 .mdl 时退回模型 json 的 material
+      const mb = getEntry(pkg, e2.name.replace(/\.json$/i, ".mdl"));
+      let materialPath = typeof t2.material === "string" ? t2.material : null;
+      if (mb) {
+        try {
+          const m = mdlMod.parseMDL(new Uint8Array(mb));
+          if (m && typeof m.materialPath === "string") materialPath = m.materialPath;
+        } catch { /* 坏 mdl：退回 json material，键语义判据按可得口径跑 */ }
+      }
+      const seg = String(materialPath || "").split("/");
+      const dir = seg.length >= 2 ? seg[seg.length - 2] : null;
+      for (const [si, set] of t2.skins.entries()) {
+        if (!set || typeof set !== "object" || Array.isArray(set)) continue;
+        for (const [k, v] of Object.entries(set)) {
+          if (k !== dir) WORKSHOP_SCAN.badKey.push(`${d}/${e2.name}[${si}] 键 ${k} ≠ 材质目录 ${dir}（materialPath=${materialPath}）`);
+          if (typeof v !== "string" || !v || /[\\/]/.test(v) || v === "." || v === "..") {
+            WORKSHOP_SCAN.badVal.push(`${d}/${e2.name}[${si}] 值 ${JSON.stringify(v)} 不是纯基名`);
+          }
+        }
+      }
+      WORKSHOP_SKIN_SAMPLES.push({ item: d, sidecar: e2.name, materialPath, skins: t2.skins, modelStem: path.basename(e2.name).replace(/\.json$/i, "") });
     }
   }
-  check(pkgs >= 300, `工坊打包语料数量异常：${pkgs} 张 pkg（基线 348）—— 闸门判据可能空转`);
-  check(scenes2 >= 300, `工坊语料里能解出 scene.json 的只有 ${scenes2} 张（基线 348）`);
-  check(objects2 >= 10000, `工坊语料对象只有 ${objects2} 个（基线 14904）—— 不变性判据可能空转`);
-  check(skinObjs === 0, `工坊语料出现对象 skin 字段 ${skinObjs} 处（闸门假设「一个都没有」已失效，必须重跑不变性）`);
-  check(skinModels === 0, `工坊语料出现模型 json skins 表 ${skinModels} 处（同上）`);
-  console.log(`  - 工坊打包语料不变性：${pkgs} 张 pkg / ${scenes2} 个 scene.json / ${objects2} 个对象；skin 字段 ${skinObjs} 处、模型 skins 表 ${skinModels} 处 ⇒ 闸门不开，行为逐位不变`);
+  const S = WORKSHOP_SCAN;
+  check(S.pkgs >= 300, `工坊打包语料数量异常：${S.pkgs} 张 pkg（基线 364）—— 闸门判据可能空转`);
+  check(S.numeric >= 300 && S.named >= 10,
+    `工坊语料条目结构变化：数字 ${S.numeric} / 命名 ${S.named}（基线 348/16）—— 命名条目必须进扫描（skins 样本全在那里）`);
+  check(S.scenes >= 300, `工坊语料里能解出 scene.json 的只有 ${S.scenes} 张（基线 360）`);
+  check(S.objects >= 10000, `工坊语料对象只有 ${S.objects} 个（基线 ~14990）—— 不变性判据可能空转`);
+  check(S.skinObjs === 0, `工坊语料出现对象 skin 字段 ${S.skinObjs} 处（闸门假设「一个都没有」已失效，必须重跑不变性）`);
+  check(S.tables === 3, `工坊全量语料 skins 表数量变化：${S.tables}（task-35 基线 3：audiophile/fantasticcar/techno）—— 语料变了必须重跑键语义定案`);
+  check(S.nonArray === 0 && S.malformed.length === 0,
+    `工坊语料出现畸形 skins（非数组/套不是对象）：${S.malformed.slice(0, 3).join("；")} —— 引擎按「没写」回落，需人工定案`);
+  check(S.badKey.length === 0,
+    `键语义被反例推翻（键 ≠ 材质目录名）：${S.badKey.slice(0, 3).join("；")} —— applySkinToMaterialPath 判定需重定`);
+  check(S.badVal.length === 0,
+    `值语义被反例推翻（值不是纯基名）：${S.badVal.slice(0, 3).join("；")} —— 同上`);
+  const disc = WORKSHOP_SKIN_SAMPLES.find((s) => {
+    const set = s.skins[0];
+    if (!set || typeof set !== "object") return false;
+    const k = Object.keys(set)[0];
+    return !!k && k !== s.modelStem;
+  });
+  check(!!disc,
+    "「键 = 材质目录名」缺少判别性样本：需要一条「键 ≠ 模型 stem」的真样本（如 techno：键 techno / 模型 sphere）");
+  if (disc) {
+    const k = Object.keys(disc.skins[0])[0];
+    const dir = String(disc.materialPath || "").split("/").slice(-2, -1)[0];
+    check(k === dir, `判别性样本 ${disc.item}: 键 ${k} 必须等于材质目录 ${dir}（模型 stem 是 ${disc.modelStem}）`);
+  }
+  check(WORKSHOP_SKIN_SAMPLES.every((s) => String(s.materialPath || "").split("/").length >= 3),
+    "skins 样本的材质路径必须至少 3 段（materials/<目录>/<基名>.json）：引擎键口径取 seg[len-2]，" +
+    "而语料里 3129 个模型的 material 只有 2 段（materials/x.json），那类路径上皮肤表必然恒等 ⇒ 出现 2 段 + skins 需重新定案");
+  console.log(`  - 工坊全量语料：${S.pkgs} 张 pkg（数字 ${S.numeric} + 命名 ${S.named}）/ ${S.scenes} 个 scene.json / ${S.objects} 个对象；` +
+    `对象 skin 字段 ${S.skinObjs} 处；skins 表 ${S.tables} 张（真样本 ${WORKSHOP_SKIN_SAMPLES.length} 条：` +
+    `${WORKSHOP_SKIN_SAMPLES.map((s) => s.item).join("/")}）⇒ 闸门不开，行为逐位不变`);
 }
+
+/**
+ * G3 工坊全量样本判据（task-35）：用**工坊语料**里真解出的 (mdl 内嵌材质路径, 真 skins 表, 索引) 调引擎。
+ * 与 defaultprojects 是**不同入口的样本**（不是只 techno 那三条）。注意真实语料里 techno / fantasticcar
+ * 的 0 号套是恒等映射、audiophile 才有 1 号套，所以除真三元组外，还把**真表**套在**同目录的旧材质路径**
+ * 上（`materials/<目录>/legacy.json`）——这样「键 = 材质目录名（不是模型名 / 上级目录）」与
+ * 「值 = 纯基名（不是整路径）」两条才真正有判别力：引擎读错键或把值当整文件名，这里先红。
+ */
+function g3WorkshopChecks(api, tag) {
+  const t = tag ? `${tag} ` : "";
+  for (const s of WORKSHOP_SKIN_SAMPLES) {
+    const seg = String(s.materialPath || "").split("/");
+    const dir = seg.length >= 2 ? seg[seg.length - 2] : null;
+    const idx = Array.isArray(s.skins) ? Math.max(0, s.skins.length - 1) : 0;
+    const set = Array.isArray(s.skins) ? s.skins[idx] : null;
+    const key = set && typeof set === "object" ? Object.keys(set)[0] : null;
+    const val = key ? set[key] : null;
+    if (!dir || !key || typeof val !== "string") continue;
+    const want = `materials/${dir}/${val}.json`;
+    check(api.applySkinToMaterialPath(s.materialPath, s.skins, idx) === want,
+      `${t}G3 工坊样本 ${s.item}: skin=${idx} 应得 ${want}，实际 ${api.applySkinToMaterialPath(s.materialPath, s.skins, idx)}`);
+    const legacy = `materials/${dir}/legacy.json`;
+    check(api.applySkinToMaterialPath(legacy, s.skins, idx) === want,
+      `${t}G3 工坊样本 ${s.item}: 真表套同目录旧路径应得 ${want}（键必须是材质目录名 ${dir}、值必须是纯基名 ${val}），` +
+      `实际 ${api.applySkinToMaterialPath(legacy, s.skins, idx)}`);
+    check(key === dir, `${t}G3 工坊样本 ${s.item}: 真语料键 ${key} 必须等于材质目录 ${dir}`);
+    check(!/[\\/]/.test(val), `${t}G3 工坊样本 ${s.item}: 真语料值 ${val} 必须是纯基名`);
+  }
+}
+
+// —— G3 工坊全量样本（task-35：与 defaultprojects 不同入口的真样本）——
+console.log("  - G3 工坊全量样本（工坊语料真 mdl 材质路径 + 真 skins 表 → 引擎判定）：");
+g3WorkshopChecks(scn, "");
 
 // —— 反向断言 + 读点结构（G3 接线 / G4 无直接读点）——
 const parseSrc = fs.readFileSync(path.join(ROOT, PARSE_REL), "utf8");
@@ -977,6 +1079,20 @@ const G3_MUTATIONS = [
   { name: "M4 被忽略字段表清空", from: "const G4_IGNORED_FIELDS = ['locktransforms', 'ledsource', 'blockalign', 'particlesrc']\n", to: "const G4_IGNORED_FIELDS = [] // MUT\n" },
   { name: "M6 0 号皮肤走恒等捷径", from: "  const set = skins[n]\n", to: "  if (n === 0) return materialPath // MUT\n  const set = skins[n]\n" },
   { name: "M7 皮肤索引不收纯数字字符串", from: "  if (typeof raw === 'string' && /^\\s*-?\\d+\\s*$/.test(raw)) return parseInt(raw, 10)\n", to: "" },
+  // task-35：键/值语义变异 —— 只跑 g3WorkshopChecks（工坊全量真样本），证明新样本判据不是空转。
+  // 旧 mutation 的「新增失败」窗口保持 1..8 不动，所以这两条不叠加 g3Checks/g4Checks。
+  {
+    name: "M8 键读成上一级目录（键 = 材质目录名 被改成 键 = 上级目录 / 模型目录）",
+    from: "  const next = set[seg[seg.length - 2]]\n",
+    to: "  const next = set[seg[seg.length - 3]] // MUT\n",
+    checks: [g3WorkshopChecks],
+  },
+  {
+    name: "M9 皮肤值当整文件名（值 = 材质基名 被改成 值 = 完整文件名）",
+    from: "  seg[seg.length - 1] = next + file.slice(file.length - 5)\n",
+    to: "  seg[seg.length - 1] = next // MUT\n",
+    checks: [g3WorkshopChecks],
+  },
 ];
 const shaBefore = sha256File(PARSE_REL);
 const shaBeforeSm = sha256File(SM_REL);
@@ -990,8 +1106,7 @@ for (const m of G3_MUTATIONS) {
     console.info = () => {};
     console.log = () => {}; // 变异红测期间的 ✗ 是**预期证据**，不刷屏（汇总只报计数）
     try {
-      g3Checks(mod, "[坏]");
-      g4Checks(mod, "[坏]");
+      for (const fn of (m.checks || [g3Checks, g4Checks])) fn(mod, "[坏]");
     } finally { console.info = info; console.log = log; }
     added = errors.length - mark;
   } catch (e) {

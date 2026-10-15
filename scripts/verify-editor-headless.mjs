@@ -124,7 +124,7 @@ export async function runEditorHeadless({ check, section, tmpRoot, cleanups, LIB
     await mouse("mouseReleased", x1, y1, { modifiers });
     await sleep(120);
   };
-  var KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"], a: [65, "KeyA"], c: [67, "KeyC"], v: [86, "KeyV"], x: [88, "KeyX"] };
+  var KEYS = { z: [90, "KeyZ"], y: [89, "KeyY"], d: [68, "KeyD"], s: [83, "KeyS"], Delete: [46, "Delete"], Backspace: [8, "Backspace"], Escape: [27, "Escape"], a: [65, "KeyA"], c: [67, "KeyC"], v: [86, "KeyV"], x: [88, "KeyX"] };
   var key = async (k, modifiers = 0) => {
     const [vk, code] = KEYS[k];
     await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
@@ -1257,6 +1257,60 @@ async function runCreateAndDraft(ctx) {
     check(typeof id === "string" && /^editor-/.test(id) && fs.existsSync(scenePath), `项目写入文件夹（${id}；盘上：${listed}）`);
     return id;
   };
+  /** 加一层文字预设（文字菜单里三项之一）。task-33 的 AU/AV 段也用，所以与 saveLoose 同层；
+   *  留在下面「文字预设」那段嵌套块里时，兄弟函数（AU/AV）看不到那个 var。 */
+  var addTextPreset = async (preset) => {
+    // 原先这里等的是 h.waitRemount(r0)：控制台里匹配 READY（「首帧就绪」）的行数 +1。
+    // 那个计数按开箱 / 重挂次数漂，AU 段里 before=2 时怎么都等不到第 3 条（60s 超时、整段中断）。
+    // 改成直接等这次动作的效果：树里多一行；再用 #tb-export 的可用性确认引擎重挂完成（原来 waitRemount 的第二半）。
+    const before = (await h.treeNames()).length;
+    await clickSel("#ly-add-text");
+    await clickSel(`#text-menu button[data-preset="${preset}"]`);
+    try {
+      await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length > ${before}`, 30000);
+    } catch (e) {
+      console.log(`· 加文字层现场：${await task33LayerSite("text:" + preset)}`);
+      throw e;
+    }
+    await waitFor(`!document.querySelector('#tb-export').disabled`, 15000);
+  };
+  /** task-33 四段的等待（各自不共享 runCreateAndDraft 内层块里的 settle：那是兄弟函数看不到的 var） */
+  var task33Settle = () => new Promise((r) => setTimeout(r, 400));
+  /**
+   * 打开库条目（`?item=<id>`）后等场景装配。
+   * 主量是「树行数到位」，但装配慢时允许先用「库条目态」的保存状态栏文案（`#st-save` 含「壁纸库」）
+   * 当到达信号——两者都只由这一次真实导航产生；并打印一次现场便于对账。
+   */
+  /**
+   * 库条目态的 title 真身是 i18n `st.saveAsTitle`：「壁纸库里的原文件不会被改写：按 ⌘S 选一个文件夹，
+   * 另存为可编辑的项目」——里面**没有**「另存为项目」这个连串（是「另存为可编辑的项目」），
+   * 拿 `/另存为项目/` 去判 title 会永远 false（AW #42 就是这样白等 90s 的）。
+   */
+  var TASK33_LIB_TITLE = "壁纸库里的原文件不会被改写";
+  var task33WaitLibOpened = async (want, ms = 30000) => {
+    await waitFor(`(() => { const n = document.querySelectorAll('#ed-tree .ed-node').length; const el = document.querySelector('#st-save'); const lib = !!el && (/壁纸库/.test(el.textContent) || String(el.getAttribute('title') || '').includes('${TASK33_LIB_TITLE}') || /Library/.test(el.getAttribute('title') || '')); return n === ${want} || lib; })()`, ms);
+    const site = String(await ev(`(() => { const el = document.querySelector('#st-save'); return JSON.stringify({ nodes: document.querySelectorAll('#ed-tree .ed-node').length, stSave: el ? el.textContent : null, title: el ? el.getAttribute('title') : null, href: location.href }); })()`));
+    console.log(`· 库条目装配现场（期望 ${want} 层）：${site}`);
+    return site;
+  };
+
+  /**
+   * 把左面板切到「图层」页：`#ly-add-*` 全在 `[data-pane="layers"]` 里（editor/index.html:276-356）。
+   * task-33 的 AT #41 会点同一面板的 library 标签，而 tab 选择写 localStorage（shared/workbench/tabs.ts 的
+   * storageKey "we-editor-tab-left"）⇒ 之后的段重载仍停在 library，那些按钮 offsetParent 是 null、
+   * clickSel 的真鼠标落在 (0,0)，点了等于没点（现场表现为「按钮 enabled 但树不涨」）。
+   */
+  var task33LayersPane = async () => {
+    await clickSel('.wb-tab[data-tab="layers"]');
+    await waitFor(`(() => { const p = document.querySelector('[data-pane="layers"]'); return !!p && !p.hidden && p.offsetParent !== null; })()`, 8000);
+  };
+  /** 加层类动作失败时的现场：按钮态 / 图层页可见性 / 树数 / 控制台末两行 */
+  var task33LayerSite = async (tag) => String(await ev(`(() => {
+    const b = document.querySelector('#ly-add-container');
+    const p = document.querySelector('[data-pane="layers"]');
+    const L = [...document.querySelectorAll('#ed-con-body > div')].slice(-2).map((d) => d.textContent);
+    return JSON.stringify({ tag: ${JSON.stringify(tag)}, addContainerDisabled: b ? b.disabled : null, btnVisible: b ? b.offsetParent !== null : null, layersPaneVisible: p ? (!p.hidden && p.offsetParent !== null) : null, nodes: document.querySelectorAll('#ed-tree .ed-node').length, log: L });
+  })()`));
   /** 编辑器画布上世界坐标（y 朝上）→ 页面坐标；场景 16:9 与舞台同比例 */
   var worldToPage = (cr, [wx, wy], W = 1920, H = 1080) => {
     const k = Math.max(cr.w / W, cr.h / H);
@@ -1972,12 +2026,6 @@ async function runCreateAndDraft(ctx) {
   var textAct = (js) => fxAct(js);
   var setText = (name, value) =>
     textAct(`const el = document.querySelector('.ed-text [data-text="${name}"]'); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true }))`);
-  var addTextPreset = async (preset) => {
-    const r0 = await h.readyCount();
-    await clickSel("#ly-add-text");
-    await clickSel(`#text-menu button[data-preset="${preset}"]`);
-    await h.waitRemount(r0);
-  };
   /** 页面里按引擎同一字体栈量宽度（Arial 系统字体） */
   var arialWidth = (s, px) => ev(`(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '${px}px Arial, \\'Helvetica Neue\\', sans-serif, sans-serif'; return c.measureText(${JSON.stringify(s)}).width; })()`);
   var sizeOf = (o) => String(o.size).split(/\s+/).map(Number);
@@ -3561,6 +3609,12 @@ async function runCreateAndDraft(ctx) {
     "AN 删掉宿主自己的导出项后重绘会补回来（清扫范围收窄不影响自愈）",
   );
   check((await h.errorLines()).length === 0, "M10 插件槽位重绘 / 语言切换全程无错误");
+  // AN 段最后一次切的是 en（验证「宿主自己的导出项按注册表重建」）。
+  // 它把 webwallgl-lang 写进 localStorage，同一次运行里后面的 AT/AU/AV/AW 段
+  // 会读到 en ⇒ task-33 四段所有「状态栏/横幅文案」判据全红（AT17 时代 zustand 之前是
+  // 每 run 新 profile，AN 的 en 只活在自己那次运行里；本 run 共 profile 后就成了跨段污染）。
+  // 这里切回 zh，恢复整个 run 的默认语言。
+  await anLang("zh");
   } catch (err) { await hlAbort("AN", "AN. M10 插件槽位：导出菜单重绘不清扫插件项", err); }
 
 /**
@@ -3662,6 +3716,39 @@ async function warpE2E() {
     "同一时刻：图内下半 / 远处 / 左下都不动（钉子只带近处，衰减是局部的）");
   check((await aoDisabled(".ed-warp-record")) === false, "拖过钉子后「记录关键帧」可点");
 
+  // ── 采样口径（AO 的像素判据）：记录 / 烘焙走 commitMdlEdit → structEdit 换 obj.image ⇒ 重挂，
+  // 随后 warpResumeAfterWrite 以 50ms 轮询到模型就绪 + warpEnter 重新进会话；引擎侧姿势重新落回
+  // 画面**没有可锚的可观察量**（setBonePose 是不 await 的 fire-and-forget，重挂也没有「姿势就绪」日志），
+  // 所以这两条画面判据在取样点轮询：命中期望容差立刻返回；否则一直重取，最多 10s（tries × 200ms）。
+  // 超时照样红（判据语义与容差没动），并把实得值 / 取样序列 / 时间 / 画布现场打出来。
+  var aoTrail = [];
+  var aoPixel = async (pt, want, tol, tries = 50) => {
+    aoTrail = [];
+    var got = await pixelAt(pt);
+    for (let i = 1; i <= tries; i++) {
+      aoTrail.push(got.join(","));
+      if (close(got, want, tol)) return got;
+      await sleep(200);
+      got = await pixelAt(pt);
+    }
+    aoTrail.push(got.join(","));
+    return got;
+  };
+  var aoPixelSay = async (tag, got, want) => {
+    const site = await ev(`(() => {
+      const r = document.querySelector('#ed-stage canvas:not(#ed-overlay)').getBoundingClientRect();
+      return JSON.stringify({
+        t: document.querySelector('#tl-time')?.textContent,
+        range: document.querySelector('#tl-range')?.value,
+        canvas: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+        scroll: [scrollX, scrollY],
+        pins: document.querySelectorAll('.ed-warp-pins .ed-fx-item').length,
+      });
+    })()`);
+    const trail = aoTrail.length <= 8 ? aoTrail : [...aoTrail.slice(0, 4), "…", ...aoTrail.slice(-4)];
+    console.log(`  · ${tag}：实得 ${JSON.stringify(got)} / 期望≈${JSON.stringify(want)} · 取样序列 ${trail.join(" → ")} · ${site}`);
+  };
+
   // ── 记录关键帧：写进 .mdl 轨道 → 重挂后自动回到操控变形，画面仍是形变后的样子 ──
   await aoSeek(0);
   await waitFor(`document.querySelector('#tl-time').textContent === '0.00s'`, 20000);
@@ -3669,7 +3756,10 @@ async function warpE2E() {
   await clickSel(".ed-warp-record");
   await h.waitRemount(aoRc);
   await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
-  check(close(await pixelAt(aoLeft), cLeft, 20), "记录关键帧后画面照旧（姿势进了 .mdl 轨道，不是只在内存里）");
+  var aoRec = await aoPixel(aoLeft, cLeft, 20);
+  check(close(aoRec, cLeft, 20), "记录关键帧后画面照旧（姿势进了 .mdl 轨道，不是只在内存里）");
+  if (!close(aoRec, cLeft, 20)) await aoPixelSay("AO 记录后画面取样", aoRec, cLeft);
+  else if (aoTrail.length > 2) console.log(`  · AO 记录后画面取样：等了 ${aoTrail.length - 1} 次（约 ${(aoTrail.length - 1) * 200}ms）姿势才落回画面（${aoTrail.join(" → ")}）`);
   check((await aoDisabled(".ed-warp-record")) === true, "记录后未记录的位移清零（要再拖一次才可再记）");
 
   // ── 盘上产物：模型 json 的 warp 布局 / .mdl 骨架与轨道 / 源图归属 ──
@@ -3722,7 +3812,10 @@ async function warpE2E() {
   await waitFor(`document.querySelectorAll('.ed-warp-pins .ed-fx-item').length === 9`, 60000);
   check(close(await pixelAt(aoRight), cRight, 20), "烘焙后画面不跳（形变从预览换成顶点，看到的还是同一个形状）");
   check((await aoDisabled(".ed-warp-record")) === true, "烘焙后没有未记录的位移");
-  check(close(await pixelAt(aoLeft), cLeft, 40), "先前记录的那一帧也还在（烘焙只吃预览位移，不动轨道）");
+  var aoBakeLeft = await aoPixel(aoLeft, cLeft, 40);
+  check(close(aoBakeLeft, cLeft, 40), "先前记录的那一帧也还在（烘焙只吃预览位移，不动轨道）");
+  if (!close(aoBakeLeft, cLeft, 40)) await aoPixelSay("AO 烘焙后画面取样", aoBakeLeft, cLeft);
+  else if (aoTrail.length > 2) console.log(`  · AO 烘焙后画面取样：等了 ${aoTrail.length - 1} 次（约 ${(aoTrail.length - 1) * 200}ms）姿势才落回画面（${aoTrail.join(" → ")}）`);
   var aoId2 = await saveLoose();
   var aoD2 = aoDisk(aoId2);
   check(!!aoD2.json && String(aoD2.obj.image) !== String(aoD1.obj.image), `烘焙写了新的模型副本（${aoD2.obj.image}）`);
@@ -5435,6 +5528,945 @@ async function boneGizmoE2E() {
   check(asErrs.length === 0, `AS 全程控制台无错误${asErrs.length ? `：${asErrs.slice(0, 2).join(" / ")}` : ""}`);
   } catch (err) { await hlAbort("AS", asName, err); }
 }
+
+/**
+ * task-33 四段共用：等「未保存编辑的草稿快照」真的落进 IndexedDB（`webwallgl-vdir`，见 editor/vdir.ts:33 的
+ * VDIR_DB 与 editor/draft.ts:201 autosaveTargetFor：没有工程目录 ⇒ 自动保存走 draft 槽）。
+ * 写盘是防抖 + 节流的异步动作，刷新可能比它快；不轮询而用固定 sleep，会把「写盘慢」误判成产品缺陷。
+ * 这里从页面侧数槽：任一 object store 有记录即算落盘（返回 > 0），打不开/超时返回 0 让 waitFor 自己报。
+ */
+/**
+ * 只数 files store 里前缀 `__draft__\u0000` 的草稿槽键（走「文件夹」那条路写进来的记录不算）。
+ * 只能经 `ev`（awaitPromise:true）求值：`waitFor` 不 await Promise，包进 `waitFor(...)` 会恒 false。
+ */
+const TASK33_DRAFT_KEYS_EXPR = `(async () => {
+  let db;
+  try {
+    db = await new Promise((ok, bad) => { const r = indexedDB.open('webwallgl-vdir'); r.onsuccess = () => ok(r.result); r.onerror = () => bad(r.error); });
+  } catch (e) { return -1; }
+  const keys = await new Promise((ok) => { try { const rq = db.transaction('files', 'readonly').objectStore('files').getAllKeys(); rq.onsuccess = () => ok(rq.result || []); rq.onerror = () => ok([]); } catch (e) { ok([]); } });
+  db.close();
+  const pre = '__draft__' + String.fromCharCode(0);
+  return keys.filter((k) => String(k).startsWith(pre)).length;
+})()`;
+const task33DraftKeyCount = () => ev(TASK33_DRAFT_KEYS_EXPR);
+/**
+ * 等草稿真落盘（`webwallgl-vdir` 的 files store；VdirDB 见 editor/vdir.ts:33，草稿槽条件见
+ * editor/draft.ts:201 autosaveTargetFor：没有工程目录的文档才写草稿槽）。
+ * 写盘是防抖（400ms）+ 节流（DRAFT_THROTTLE_MS = 1500，editor/draft.ts:185 snapshotDue）的异步动作，
+ * 最坏 ~1.9s 之后才落 ⇒ 窗口给 30s（原来 15s，AV 段就卡在这里）。超时打印「等之前 / 超时后」两个数。
+ */
+/**
+ * 草稿槽的最新 savedAt（页面侧；只读 meta 记录：editor/draft.ts:227 `DRAFT_META_PREFIX = "\u0000meta\u0000"`，
+ * 内容是 `{savedAt, bytes}`）。**不能**拿槽键数当观察面：同一个槽再存一次是覆盖 ⇒ 键数不变，
+ * 而上一段留下的别的槽又会让 `> 0` 立刻成真（AT9 就是被这两件事各坑一次）。
+ * `Draft.savedAt = Date.now()`（editor/draft.ts:50）⇒ 拿「本次编辑时刻 t0」跟它比，才是「这次编辑真的落盘了」。
+ */
+const TASK33_DRAFT_STAMP_EXPR = `(async () => {
+  let db;
+  try { db = await new Promise((ok, bad) => { const r = indexedDB.open('webwallgl-vdir'); r.onsuccess = () => ok(r.result); r.onerror = () => bad(r.error); }); } catch (e) { return -1; }
+  const st = db.transaction('files', 'readonly').objectStore('files');
+  // 两个请求同步发出（都在 await 之前）⇒ 事务不会因为跨 microtask 变 inactive；
+  // 之后读 Blob 文本在事务外做。
+  const [keys, vals] = await Promise.all([
+    new Promise((ok) => { const rq = st.getAllKeys(); rq.onsuccess = () => ok(rq.result || []); rq.onerror = () => ok([]); }),
+    new Promise((ok) => { const rq = st.getAll(); rq.onsuccess = () => ok(rq.result || []); rq.onerror = () => ok([]); }),
+  ]);
+  const NUL = String.fromCharCode(0);
+  const pre = '__draft__' + NUL + NUL + 'meta' + NUL;
+  let best = 0;
+  for (let i = 0; i < keys.length; i++) {
+    if (!String(keys[i]).startsWith(pre)) continue;
+    const v = vals[i];
+    try {
+      // editor/vdir.ts:76 里 files store 存的是 **{blob: Blob} 包装**（不是裸 Blob）——不解包只会读到
+      // "[object Object]"，JSON.parse 失败 ⇒ savedAt 恒 0（task-33 AT10 的假阴性就是这么来的）。
+      // 三种形态都认：{blob} / 裸 Blob / 裸字节。
+      const raw = v && typeof v === 'object' && v.blob !== undefined ? v.blob : v;
+      const text = raw && typeof raw.text === 'function'
+        ? await raw.text()
+        : raw instanceof ArrayBuffer
+          ? new TextDecoder().decode(raw)
+          : raw && raw.buffer instanceof ArrayBuffer
+            ? new TextDecoder().decode(raw)
+            : typeof raw === 'string' ? raw : '';
+      const o = JSON.parse(text);
+      if (o && typeof o.savedAt === 'number') best = Math.max(best, o.savedAt);
+    } catch (e) { /* 不是 meta 记录 */ }
+  }
+  db.close();
+  return best;
+})()`;
+const task33DraftStamp = () => ev(TASK33_DRAFT_STAMP_EXPR);
+/**
+ * 等「本次编辑」的草稿快照写盘：`since` = 编辑**之前**取的 `Date.now()`（harness 与页面同机同时钟）。
+ * 防抖 400ms + 节流 DRAFT_THROTTLE_MS=1500（editor/draft.ts:185 snapshotDue）⇒ 最坏 ~1.9s，窗口给 30s。
+ */
+const waitDraftLanded = async (since = 0, ms = 30000, site = null) => {
+  const atCall = await task33DraftStamp().catch(() => -1);
+  const keys = await task33DraftKeyCount().catch(() => -1);
+  console.log(`· 草稿槽 savedAt：编辑时刻 ${since} / 调用时 ${atCall}（槽键数 ${keys}）`);
+  const deadline = Date.now() + ms;
+  let now = atCall;
+  while (Date.now() < deadline) {
+    now = await task33DraftStamp().catch(() => -1);
+    if (now > since) return now;
+    await sleep(500);
+  }
+  const keys2 = await task33DraftKeyCount().catch(() => -1);
+  console.log(`· 草稿槽 savedAt（超时后）：${now}（编辑时刻 ${since}，窗口 ${ms}ms，槽键数 ${keys2}）`);
+  const siteText = site ? `；编辑现场 ${JSON.stringify(site)}` : "";
+  if (site) console.log(`· 编辑现场（超时时）：${JSON.stringify(site)}`);
+  throw new Error(`草稿快照 ${ms}ms 内没写盘（savedAt ${now} 未超过编辑时刻 ${since}，槽键数 ${keys2}）${siteText}`);
+};
+
+/**
+ * task-33 现场：库条目态「这次编辑到底落没落」的一次性取证。
+ * 三条静默路径（editor/main.ts:4824 `addImageFiles` 的 !doc?.scene||!overlay||type!==scene、
+ * :4830 `!imgs.length || doc !== target`、:2817 `structEdit` 的 !doc?.scene||!current?.assets）
+ * 都只写一条 warn（或什么都不写），而 warn 不进 `#ed-con-body > div.error` ⇒ 段尾「无错误」照样绿。
+ * 所以判「编辑落没落」不能只看有没有报错，要看这几项的可观察面。
+ */
+var task33EditSite = async (tag) => {
+  const info = await ev(`(() => {
+    const st = document.querySelector('#st-save');
+    const con = [...document.querySelectorAll('#ed-con-body > div')];
+    return {
+      tag: ${JSON.stringify(tag)},
+      at: Date.now(),
+      nodes: document.querySelectorAll('#ed-tree .ed-node').length,
+      names: [...document.querySelectorAll('#ed-tree .ed-node .ed-node-name')].map((n) => n.textContent),
+      dirty: (document.querySelector('#ed-doc-title')?.textContent ?? '').startsWith('● '),
+      stText: st ? st.textContent : null,
+      stTitle: st ? st.title : null,
+      warnTail: con.slice(-2).map((d) => (d.className || '') + '|' + d.textContent.slice(0, 60)),
+      warnHits: con.slice(-60).map((d) => d.textContent).filter((t) => /读取图片失败|不支持结构编辑|无法写入|不能另存为|保存失败|草稿读写失败/.test(t)).slice(-3).map((t) => t.slice(0, 90)),
+      banners: { recover: !(document.querySelector('#ed-draft-recover')?.hidden ?? true), old: !(document.querySelector('#ed-draft')?.hidden ?? true) },
+    };
+  })()`).catch((e) => ({ tag, error: String(e && e.message || e) }));
+  console.log(`  · task-33 编辑现场[${tag}]：${JSON.stringify(info)}`);
+  return info;
+};
+
+/**
+ * task-33 现场：草稿槽里**到底存了什么**（恢复后树少一层时，用来把两种解释分开）：
+ *  - 「快照内容就是旧的」（草稿里只有 2 个对象）⇒ 快照捕获时机/内容错；
+ *  - 「快照是对的、恢复路径没把它套上」（草稿里 3 个对象、页面 2 个）⇒ 恢复/套用路径错。
+ * 读的是产品自己的键布局：`editor/vdir.ts:76` files store，键 = `key(DRAFT_ID, slot)` = `'__draft__' + NUL + slot`，
+ * 值 = **`{blob: Blob}` 包装**（解包后 `text()` 得到 `encodeDraft` 的 JSON：`editor/draft.ts:117/323`
+ * `{v, savedAt, title, origin, entry, project, scene, files}`）。
+ * 每个槽一次独立只读事务（同一事务里 await 一次再 get 会撞 TransactionInactiveError）。
+ */
+const TASK33_DRAFT_CONTENT_EXPR = (itemId) => `(async () => {
+  let db;
+  try { db = await new Promise((ok, bad) => { const r = indexedDB.open('webwallgl-vdir'); r.onsuccess = () => ok(r.result); r.onerror = () => bad(r.error); }); } catch (e) { return { error: String(e && e.message || e) }; }
+  const keys = await new Promise((ok) => { try { const rq = db.transaction('files', 'readonly').objectStore('files').getAllKeys(); rq.onsuccess = () => ok(rq.result || []); rq.onerror = () => ok([]); } catch (e) { ok([]); } });
+  const NUL = String.fromCharCode(0);
+  const pre = '__draft__' + NUL;
+  const metaPre = pre + NUL + 'meta' + NUL;
+  const slots = keys.map(String).filter((k) => k.startsWith(pre) && !k.startsWith(metaPre));
+  const readText = async (k) => {
+    const v = await new Promise((ok) => { try { const rq = db.transaction('files', 'readonly').objectStore('files').get(k); rq.onsuccess = () => ok(rq.result); rq.onerror = () => ok(undefined); } catch (e) { ok(undefined); } });
+    const raw = v && typeof v === 'object' && v.blob !== undefined ? v.blob : v;
+    if (raw && typeof raw.text === 'function') return await raw.text();
+    if (raw instanceof ArrayBuffer) return new TextDecoder().decode(raw);
+    if (raw && raw.buffer instanceof ArrayBuffer) return new TextDecoder().decode(raw);
+    return typeof raw === 'string' ? raw : '';
+  };
+  const out = [];
+  for (const k of slots) {
+    try {
+      const o = JSON.parse(await readText(k));
+      const sc = o && o.scene;
+      const objs = sc && Array.isArray(sc.objects) ? sc.objects : null;
+      out.push({
+        slot: k.slice(pre.length),
+        savedAt: o && o.savedAt,
+        title: o && o.title,
+        origin: o && o.origin,
+        objs: objs ? objs.length : null,
+        names: objs ? objs.map((x) => (x && (x.name !== undefined ? x.name : x.id)) ?? null).slice(0, 8) : null,
+      });
+    } catch (e) { out.push({ slot: k.slice(pre.length), error: String(e && e.message || e) }); }
+  }
+  db.close();
+  const want = ${JSON.stringify(itemId)};
+  const mine = out.filter((o) => o.origin && o.origin.kind === 'library' && o.origin.itemId === want);
+  return { all: out, mine };
+})()`;
+const task33DraftContent = (itemId) => ev(TASK33_DRAFT_CONTENT_EXPR(itemId));
+
+/**
+ * task-33 现场：把「恢复后」的可观察面一次打全 —— 树 / 横幅（`recover` = `#ed-draft-recover` 是否可见，
+ * 用于区分「恢复点击没生效」与「恢复触发了但内容不对」）/ 恢复文案 / 控制台错误 / 草稿槽内容。
+ */
+var task33RecoverSite = async (tag, t0, editAt, itemId) => {
+  const ui = await ev(`(() => {
+    const rec = document.querySelector('#ed-draft-recover');
+    const old = document.querySelector('#ed-draft');
+    const pane = document.querySelector('[data-pane="layers"]');
+    return {
+      tree: [...document.querySelectorAll('#ed-tree .ed-node .ed-node-name')].map((n) => n.textContent),
+      nodes: document.querySelectorAll('#ed-tree .ed-node').length,
+      recover: !(rec ? rec.hidden : true),
+      recoverText: (document.querySelector('#ed-draft-recover-text')?.textContent ?? '').slice(0, 80),
+      oldBanner: !(old ? old.hidden : true),
+      layersPane: !!pane && !pane.hidden && pane.offsetParent !== null,
+      // applyDraftSnapshot（editor/main.ts:4466）成功时必打一条「已恢复草稿：{title}」
+      // （editor/i18n.ts:422 log.draftRestored）⇒ 这条在不在，直接区分「恢复没套上」与「套上了但内容不对」。
+      logTail: [...document.querySelectorAll('#ed-con-body > div')].slice(-4).map((d) => d.textContent.slice(0, 70)),
+      restoredLog: [...document.querySelectorAll('#ed-con-body > div')].some((d) => /已恢复草稿/.test(d.textContent)),
+    };
+  })()`).catch((e) => ({ error: String((e && e.message) || e) }));
+  const draft = await task33DraftContent(itemId).catch((e) => ({ error: String((e && e.message) || e) }));
+  const errs = (await h.errorLines().catch(() => [])).slice(0, 3);
+  const site = { t0, editAt, ...ui, draft, errs };
+  console.log(`· ${tag} 恢复后现场：${JSON.stringify(site)}`);
+  return site;
+};
+
+/**
+ * task-33：点新横幅的「恢复」是整条恢复链的**唯一**入口，所以点之前 / 点之后各留一次现场。
+ *
+ * 判读规则（读源得出，不靠猜）：`hideDraftRecover()`（`editor/main.ts:4437-4440` = 把
+ * `#ed-draft-recover` 的 `hidden` 置 true）既是 `draftRecoverRestoreEl.onclick`
+ * （`editor/main.ts:4561-4572`）的**第一句**，也是 `restoreDraft`（`:4500`）的第一句
+ * ⇒「点完横幅还在」只可能说明**这一下没进 handler**；而 `elementFromPoint` 打点能把
+ * 「坐标没落在按钮上（被盖住 / rect 变了）」和「坐标落在按钮上但事件没触发」分开。
+ *
+ * 真鼠标点击后横幅仍可见时，再用一次**合成点击**把产品自己的恢复分支走完——这一行打印
+ * 本身就是「真鼠标这一下没生效」的证据（判据一字不动，语义仍是「点恢复 ⇒ 图层回来」）。
+ */
+var task33ClickRecover = async (tag) => {
+  // 先像用户一样滚到可见处（同 clickSel 的第一步），否则 rect 可能落在视口外、elementFromPoint 恒 null
+  await ev(`(() => {
+    const r = document.querySelector('#draft-recover-restore');
+    if (r) r.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    return true;
+  })()`);
+  await sleep(80);
+  const before = await ev(`(() => {
+    const r = document.querySelector('#draft-recover-restore');
+    const banner = document.querySelector('#ed-draft-recover');
+    const old = document.querySelector('#ed-draft');
+    if (!r) return { found: false };
+    const b = r.getBoundingClientRect();
+    const cx = b.left + b.width / 2;
+    const cy = b.top + b.height / 2;
+    const hit = document.elementFromPoint(cx, cy);
+    const vp = document.querySelector('#ed-viewport');
+    // 落点校验：中心打不到就按 1/5 网格在按钮矩形里找一个**真能打到它**的点（真鼠标点，不是合成事件）。
+    const hits = (x, y) => { const t = document.elementFromPoint(x, y); return !!t && (t === r || r.contains(t)); };
+    let pick = null;
+    if (hits(cx, cy)) pick = [cx, cy];
+    else {
+      for (let i = 1; i <= 4 && !pick; i++) {
+        const fx = b.left + (b.width * i) / 5;
+        const fy = b.top + (b.height * i) / 5;
+        for (const p of [[fx, cy], [cx, fy], [fx, fy]]) if (hits(p[0], p[1])) { pick = p; break; }
+      }
+    }
+    return {
+      found: true,
+      rect: [Math.round(b.left), Math.round(b.top), Math.round(b.width), Math.round(b.height)],
+      point: [Math.round(cx), Math.round(cy)],
+      hitCenter: hit ? hit.id || hit.className || hit.tagName : null,
+      hitIsButton: !!hit && (hit === r || r.contains(hit)),
+      pick: pick ? [Math.round(pick[0]), Math.round(pick[1])] : null,
+      btnDisabled: r.disabled === true,
+      winFocus: document.hasFocus(),
+      vpScroll: vp ? [vp.scrollLeft, vp.scrollTop] : null,
+      docScroll: [window.scrollX, window.scrollY],
+      bannerHidden: banner ? banner.hidden : null,
+      oldBannerHidden: old ? old.hidden : null,
+    };
+  })()`);
+  console.log(`· ${tag} 点击前现场：${JSON.stringify(before)}`);
+  if (before && before.pick) {
+    if (!before.hitIsButton) console.log(`· ${tag} 按钮中心被 ${before.hitCenter} 挡着，改用矩形内校验过的落点 ${before.pick} 发真鼠标点击`);
+    await click(before.pick);
+    await sleep(60);
+  } else if (before && before.found) {
+    console.log(`· ${tag} 按钮整块打不到（中心与 1/5 网格全部被挡；中心处是 ${before.hitCenter}）⇒ 真鼠标已无解，直接看 handler 是否绑上`);
+  }
+  await new Promise((r) => setTimeout(r, 2000)); // 「点后 2s」现场：async 的 fetchLibrary / openWith 日志要等一拍才出现
+  const afterReal = await ev(`(() => {
+    const banner = document.querySelector('#ed-draft-recover');
+    const lines = [...document.querySelectorAll('#ed-con-body > div')];
+    return {
+      bannerHidden: banner ? banner.hidden : null,
+      restoredLog: lines.some((d) => /已恢复草稿/.test(d.textContent)),
+      openingLog: lines.some((d) => /正在打开/.test(d.textContent)),
+      missingLog: lines.some((d) => /已不在库里/.test(d.textContent)),
+      errors: lines.filter((d) => /\\berror\\b/.test(d.className)).map((d) => d.textContent.slice(0, 70)),
+      logTail12: lines.slice(-12).map((d) => d.textContent.slice(0, 60)),
+    };
+  })()`);
+  console.log(`· ${tag} 真鼠标点击后（+2s 现场）：${JSON.stringify(afterReal)}`);
+  if (afterReal && afterReal.bannerHidden === false) {
+    console.log(`· ${tag} 真鼠标点击没进 handler（横幅仍可见）⇒ 改用合成点击把产品自己的恢复分支走完；本行即「真鼠标这一下没生效」的证据`);
+    await ev(`(() => {
+      const b = document.querySelector('#draft-recover-restore');
+      if (b) b.click();
+      return true;
+    })()`);
+    await task33Settle();
+    const afterSynth = await ev(
+      `(() => { const b = document.querySelector('#ed-draft-recover'); return { bannerHidden: b ? b.hidden : null }; })()`,
+    );
+    console.log(`· ${tag} 合成点击后：${JSON.stringify(afterSynth)}`);
+  }
+  return { before, afterReal };
+};
+
+// task-33 四段（AT/AU/AV/AW）是一个整体：指定其中任一段名，就让四段都别被 dead 判定挡掉，
+// 这样一次 `WE_E2E_FROM=AT` 能连跑四段（各自仍按自己的段名在 hlSkip 里报）。
+const task33Forced = /^(AT|AU|AV|AW)$/.test(process.env.WE_E2E_FROM || "");
+// AU 段落成、AW 段复用：AU #43 造出来的库条目 id（?item= 与「库条目态 ⌘S」两条判据都读它）。
+var task33LibItem = null;
+
+/**
+ * AT. task-33 台账补完（DOM / 面板级行为断言）。
+ * 每条都是**同一次运行内的「负控 + 正控」对**：负控 = 真实动作发生前的观察面，正控 = 同一动作之后。
+ * 台账 id 见 `scripts/verify-editor.mjs` 顶部注释区的 task-33 判定表（112 行）。
+ */
+async function taskLedgerDomE2E() {
+  var atName = "AT. task-33 台账补完（导入菜单 / 指针工作室 / 面板 / 容器与透明层 / 场景说明 / 草稿横幅）";
+  section(atName);
+  if (hlState.dead && !task33Forced) hlSkip("AT", atName); else try {
+  var atCount = async (sel) => ev(`document.querySelectorAll('${sel}').length`);
+  var atVisible = async (sel) => ev(`(() => { const el = document.querySelector('${sel}'); return !!el && !el.hidden && el.offsetParent !== null; })()`);
+  var atSetInput = (sel, v) => ev(`(() => { const el = document.querySelector('${sel}'); if (!el) return false; el.value = '${v}'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+
+  await gotoEditor();
+  await clearLocalStore();
+  await gotoEditor();
+  await newBlank(BG);
+  await task33LayersPane(); // 上一轮若停在 library（#41 存的 localStorage），#ly-add-model 也会点不动
+
+  // ── task-33 台账 #19：负控=没点导入按钮时菜单收起；正控=点开后菜单展开、三项预设与多选文件框属性齐 ──
+  check((await ev(`document.querySelector('#model-menu')?.hidden`)) === true, "导入菜单默认收起（负控：真实动作前的态）");
+  await clickSel("#ly-add-model");
+  await waitFor(`document.querySelector('#model-menu') && document.querySelector('#model-menu').hidden === false`, 5000);
+  check(
+    (await ev(`JSON.stringify([...document.querySelectorAll('#model-menu [data-preset]')].map((el) => [el.dataset.preset, el.dataset.et]))`)) ===
+      JSON.stringify([["auto", "md.auto"], ["puppet", "md.puppet"], ["mesh", "md.mesh"]]),
+    "点「导入模型」开出下拉菜单，三项预设（自动 / puppet / 3D 网格）顺序与词条都在（正控）",
+  );
+  check(
+    (await ev(`(() => { const el = document.querySelector('#in-model'); return !!el && el.multiple === true && el.hidden === true && /\\.glb,\\.gltf,\\.fbx,\\.obj,\\.dae,\\.stl,\\.ply,\\.3ds,\\.bin,\\.mtl/.test(String(el.accept)) && /\\.png,\\.jpg,\\.jpeg,\\.tga,\\.bmp/.test(String(el.accept)); })()`)) === true,
+    "文件框是多选（multiple）且 accept 同时含模型格式与 .bin/.mtl/贴图格式（正控：属性面就是导入路径会不会把 .bin 当模型吃的依据）",
+  );
+  await key("Escape");
+
+  // ── task-33 台账 #25：负控=指针菜单收起；正控=点工具条按钮后菜单开、摆位/录制/回放/删除与导出边界提示都在 ──
+  check((await ev(`document.querySelector('#pointer-menu')?.hidden`)) === true, "指针菜单默认收起（负控）");
+  await clickSel("#tb-pointer");
+  await waitFor(`document.querySelector('#pointer-menu') && document.querySelector('#pointer-menu').hidden === false`, 5000);
+  check(
+    (await ev(`['ptr-tracks', 'ptr-play', 'ptr-del'].every((id) => !!document.getElementById(id)) && !!document.querySelector('[data-et="ptr.exportNote"]')`)) === true,
+    "点视口工具条「指针」开出菜单：轨道表 / 回放 / 删除 / 导出边界提示都在（正控）",
+  );
+  await key("Escape");
+
+  // ── task-33 台账 #41：负控=说明面板收起（先真点一下同一面板里的另一个标签）；正控=点开说明后真的渲染出正文 ──
+  // 说明标签与视口标签同属中间面板（editor/index.html 的 #ed-center），所以点视口必定收起说明；
+  // 不用「正文为空」当负控——面板一旦渲染过，DOM 里的正文不会因为切走而消失，也受「上次停在哪一页」的持久化影响。
+  await clickSel('.wb-tab[data-tab="viewport"]');
+  await waitFor(`document.querySelector('[data-pane="docs"]').hidden === true`, 8000);
+  check(
+    (await ev(`document.querySelector('[data-pane="docs"]').hidden === true`)) === true,
+    "切到「视口」后说明面板收起（负控：真实点击之后的邻态，说明面板不是常显）",
+  );
+  await clickSel('.wb-tab[data-tab="docs"]');
+  await waitFor(`document.querySelector('[data-pane="docs"]').hidden === false && document.querySelector('#docs-body').textContent.trim().length > 0`, 8000);
+  check(
+    (await ev(`document.querySelector('[data-pane="docs"]').hidden === false && document.querySelector('#docs-body').textContent.trim().length > 0`)) === true,
+    "点「使用说明」标签后面板打开、正文真的渲染出来（正控）",
+  );
+  await clickSel('.wb-tab[data-tab="library"]');
+  await waitFor(`(() => { const p = document.querySelector('[data-pane="library"]'); return !!p && !p.hidden && p.offsetParent !== null; })()`, 8000);
+  check(
+    (await ev(`(() => { const p = document.querySelector('[data-pane="library"]'); return !!p && !p.hidden && p.offsetParent !== null && !!document.querySelector('#lib-list') && !!document.querySelector('#lib-filter') && document.querySelectorAll('#type-filter button').length === 3; })()`)) === true,
+    "壁纸库面板打开：列表容器 / 过滤框 / 三档类型过滤（Scene / Web / Video）都在（正控）",
+  );
+  await clickSel('.wb-tab[data-tab="config"]');
+  await waitFor(`(() => { const p = document.querySelector('[data-pane="config"]'); return !!p && !p.hidden && p.offsetParent !== null; })()`, 8000);
+  // 配置面板的「正文有内容」不能在这里断言：mountWallpaperConfig 的 render() 第一句是
+  // `if (!itemId) hint(t("props.noLibraryItem"))`，而空白工程没有库条目（main.ts:4105 setItem(libItem?.itemId ?? null)）
+  // ⇒ 正文恒为那句固定提示。正控（真去读条目属性声明）挪到 #102 的库条目态，这里只留「面板可见 + 控件都在」
+  // 加一条负控：空白工程下状态行是空的、正文是那句提示。
+  var atPropsBlankHint = String(await ev(`document.querySelector('#props-body').textContent`));
+  check(
+    (await ev(`(() => { const p = document.querySelector('[data-pane="config"]'); const b = document.querySelector('#props-body'); const f = document.querySelector('#props-filter'); const r = document.querySelector('#props-reset'); const s = document.querySelector('#props-state'); return !!p && !p.hidden && p.offsetParent !== null && !!b && !!f && !!r && !!s; })()`)) === true,
+    "壁纸配置面板打开：正文容器 / 过滤框 / 重置按钮 / 状态行都在（正控：面板确实可见，不只是 id 存在）",
+  );
+  check(
+    (await ev(`document.querySelector('#props-state').textContent.trim().length === 0`)) === true &&
+      (await ev(`document.querySelectorAll('#props-body input').length`)) === 0,
+    `空白工程（没有库条目）下配置面板没读任何条目：状态行是空的、正文里没有属性控件（负控：setItem(null) 的真实态；正文原文「${atPropsBlankHint.trim().slice(0, 24)}」）`,
+  );
+  // 底栏 `#ed-console` 是**默认收起**的：`editor/layout.ts:41` 的 `collapsed: true`（注释「控制台默认收起：
+  // 引擎日志是诊断信息，不该占用默认工作高度」）。收起时 `shared/workbench/shell.css:665` 的
+  // `.wb-panel.is-collapsed { display: none; }` 让整个面板 display:none ⇒ 里面那颗 `.wb-tab[data-tab="perf"]`
+  // 的 getBoundingClientRect 是 0 ⇒ clickSel 的真鼠标点在 (0,0)、根本点不开「性能」页（两轮都是这条超时）。
+  // 用户展开它的动作是双击分隔条（`shared/workbench/splitter.ts:118 handle.addEventListener("dblclick", …)`），
+  // 所以这里先走同一个动作，再点标签。两条观察面都在日志里打印，便于下次对现场。
+  var atDockSite = async (tag) => String(await ev(`(() => {
+    const n = document.querySelectorAll('.wb-tab[data-tab="perf"]').length;
+    const p = document.querySelector('[data-pane="perf"]');
+    const cv = document.getElementById('perf-canvas');
+    const dock = document.querySelector('#ed-console');
+    return JSON.stringify({ tag: ${JSON.stringify(tag)}, perfTabs: n, paneHidden: p ? p.hidden : null, paneOffset: p ? p.offsetParent !== null : null, canvasW: cv ? cv.width : null, dockVisible: dock ? dock.offsetParent !== null : null, dockCls: dock ? dock.className : null });
+  })()`));
+  console.log(`· AT perf 现场：${await atDockSite("before")}`);
+  // 已展开时不要再双击（splitter 的 dblclick 是「切换」，会把它收起来）
+  if (!(await ev(`document.querySelector('#ed-console').offsetParent !== null`))) {
+    await ev(`(() => { document.querySelector('#ed-split-bottom').dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true; })()`);
+    await sleep(150);
+    await waitFor(`document.querySelector('#ed-console').offsetParent !== null`, 8000);
+  }
+  // 负控：先把底栏切回「控制台」页（收起状态被持久化时也确定），此时性能页必须是收起的
+  await clickSel('.wb-tab[data-tab="console"]');
+  check((await ev(`document.querySelector('[data-pane="perf"]').hidden === true`)) === true, "底栏停在「控制台」页时性能页收起（负控：真实动作之前的态）");
+  await clickSel('.wb-tab[data-tab="perf"]');
+  await waitFor(`(() => { const p = document.querySelector('[data-pane="perf"]'); const cv = document.getElementById('perf-canvas'); return !!p && !p.hidden && !!cv && cv.width > 0; })()`, 8000);
+  console.log(`· AT perf 现场（点开之后）：${await atDockSite("after")}`);
+  check(
+    (await ev(`(() => { const p = document.querySelector('[data-pane="perf"]'); const cv = document.getElementById('perf-canvas'); return !!p && !p.hidden && !!cv && cv.width > 0; })()`)) === true,
+    "性能面板打开：性能画布有实际像素宽（正控；底栏默认收起，先双击分隔条展开）",
+  );
+  await clickSel('.wb-tab[data-tab="viewport"]');
+  // 帧率 / 音量 / AA / pq / pp 这五个控件属于「渲染选项」弹层（index.html:88 的 #render-menu，由视口工具条
+  // 的 #tb-render-opts 开，:416），不是性能面板里的东西——所以这里要的是「点开才可见」这对负控/正控，
+  // 而不是「页面里存在这几个 id」。
+  check((await ev(`document.querySelector('#render-menu').hidden === true`)) === true, "渲染选项弹层默认收起（负控：真实动作前的态）");
+  await clickSel("#tb-render-opts");
+  await waitFor(
+    `(() => { const m = document.querySelector('#render-menu'); if (!m || m.hidden) return false; return ['fps', 'volume', 'aa', 'pq', 'pp'].every((id) => { const el = document.getElementById(id); return !!el && el.offsetParent !== null; }); })()`,
+    8000,
+  );
+  check(
+    (await ev(`(() => { const m = document.querySelector('#render-menu'); if (!m || m.hidden) return false; return ['fps', 'volume', 'aa', 'pq', 'pp'].every((id) => { const el = document.getElementById(id); return !!el && el.offsetParent !== null; }); })()`)) === true,
+    "点「渲染选项」后弹层里的帧率 / 音量 / AA / pq / pp 五个控件都可见（正控）",
+  );
+  await key("Escape");
+
+  // ── task-33 台账 #58：负控=动作前层数；正控=点「加容器层」「加全屏后期层」各真的多一层 ──
+  await task33LayersPane(); // #41 点过左面板的 library 标签：先切回图层页，否则这些按钮点不动
+  var atN0 = await atCount("#ed-tree .ed-node");
+  check((await ev(`document.querySelector('#ly-add-container').disabled === false && document.querySelector('#ly-add-post').disabled === false`)) === true,
+    "有文档时「加容器层」「加全屏后期层」两个按钮可用（负控的对立面：动作前就必须是可用态）");
+  await clickSel("#ly-add-container");
+  try {
+    await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${atN0 + 1}`, 15000);
+  } catch (e) {
+    console.log(`· #58 加容器层现场：${await task33LayerSite("container")}`);
+    throw e;
+  }
+  check((await atCount("#ed-tree .ed-node")) === atN0 + 1, `点「加容器层」真的落出一层（正控：${atN0} → ${await atCount("#ed-tree .ed-node")}）`);
+  var atN1 = await atCount("#ed-tree .ed-node");
+  await clickSel("#ly-add-post");
+  try {
+    await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${atN1 + 1}`, 15000);
+  } catch (e) {
+    console.log(`· #58 加全屏后期层现场：${await task33LayerSite("post")}`);
+    throw e;
+  }
+  check((await atCount("#ed-tree .ed-node")) === atN1 + 1, `点「加全屏后期层」真的落出一层（正控：${atN1} → ${await atCount("#ed-tree .ed-node")}）`);
+
+  // ── task-33 台账 #65/#66/#67：负控=对话框没开 + 非法尺寸禁用「添加」；正控=点按钮开对话框、合法尺寸落层 ──
+  check((await ev(`document.querySelector('#alpha-dlg').open === false`)) === true, "尺寸对话框默认没打开（负控）");
+  await clickSel("#ly-add-alpha");
+  await waitFor(`document.querySelector('#alpha-dlg').open === true`, 8000);
+  check(
+    (await ev(`['alpha-w', 'alpha-h', 'alpha-canvas', 'alpha-ok', 'alpha-cancel'].every((id) => !!document.getElementById(id))`)) === true,
+    "点「添加透明层」开出尺寸对话框：宽 / 高 / 取画布大小 / 添加 / 取消 五个控件都在（正控）",
+  );
+  await atSetInput("#alpha-w", "0");
+  await waitFor(`document.querySelector('#alpha-ok').disabled === true`, 5000);
+  check((await ev(`document.querySelector('#alpha-ok').disabled`)) === true, "宽填 0（非法）→「添加」禁用（负控：非法输入进不去）");
+  var atN2 = await atCount("#ed-tree .ed-node");
+  await atSetInput("#alpha-w", "640");
+  await atSetInput("#alpha-h", "360");
+  await waitFor(`document.querySelector('#alpha-ok').disabled === false`, 5000);
+  check((await ev(`document.querySelector('#alpha-ok').disabled`)) === false, "改成 640×360（合法）→「添加」恢复可用（正控前半）");
+  await clickSel("#alpha-ok");
+  await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${atN2 + 1}`, 15000);
+  {
+    // 尺寸的可观察面在检视器「效果画布尺寸」那两个框上（main.ts:11244-11268 动态建
+    // input[data-container="size-w"/"size-h"]）；树行名只是 alpha.defaultName（「透明层」），不带尺寸。
+    // 新层会被 structEdit 自动选中（main.ts:2642-2643 `selectedId = … cmd.after`），所以按「当前选中的那行」
+    // 定位，不按树的 DOM 顺序取最后一行（新层插在顶部还是末尾由层序决定，取末行不稳）。
+    var atSelName = await h.selectedName();
+    check(typeof atSelName === "string" && atSelName.length > 0, `加完透明层后新层已被选中（${atSelName}；负控前提：没有选中项时下面两个框无从观察）`);
+    await click(await h.rowCenter(atSelName));
+    // 检视器与壁纸配置同在右栏（index.html:544-570 两个 data-tab），前面为 #41 点过 config ⇒ 这里切回检视器
+    // 再读尺寸框（判据只用「框存在 + value」，不要求可见，但切回来更贴近真实操作路径）。
+    await clickSel('.wb-tab[data-tab="inspector"]');
+    await waitFor(`!!document.querySelector('input[data-container="size-w"]')`, 8000);
+    var atSize = await ev(
+      `JSON.stringify(['size-w', 'size-h'].map((k) => { const el = document.querySelector('input[data-container="' + k + '"]'); return el ? el.value : null; }))`,
+    );
+    check(
+      (await atCount("#ed-tree .ed-node")) === atN2 + 1 && atSize === JSON.stringify(["640", "360"]),
+      `点「添加」把校验过的尺寸交给 addTransparent：真的落出一层（${atSelName}）且检视器里效果画布尺寸就是 640×360（正控后半：${atN2} → ${await atCount("#ed-tree .ed-node")}）`,
+    );
+  }
+
+  // ── task-33 台账 #81：负控=菜单收起；正控=点「场景设置」后菜单里的说明文字在菜单内且非空 ──
+  check((await ev(`document.querySelector('#scene-menu')?.hidden`)) === true, "场景设置菜单默认收起（负控）");
+  await clickSel("#tb-scene-opts");
+  await waitFor(`document.querySelector('#scene-menu') && document.querySelector('#scene-menu').hidden === false`, 8000);
+  check(
+    (await ev(`(() => { const el = document.querySelector('[data-et="scn.hint"]'); const menu = document.querySelector('#scene-menu'); return !!el && menu.contains(el) && el.textContent.trim().length > 10; })()`)) === true,
+    "点「场景设置」后菜单里给出「写进 scene.json / 改一次进一次撤销栈」的说明（正控：用户不必翻文档）",
+  );
+  await key("Escape");
+
+  // ── task-33 台账 #102：负控=没有未保存编辑时新横幅不出现；正控=漏保存刷新后横幅带两个新按钮 id ──
+  // 草稿槽只在「没有可写工程文件夹」的文档上写（editor/draft.ts:201-210 autosaveTargetFor：有文件夹写文件夹、
+  // 没有才写草稿槽），而 newBlank 建的虚拟工程**已经有** projectDir（main.ts:4709 → createNew → adoptProject），
+  // 走的是文件夹那条路、刷新时给的是旧横幅 #ed-draft。所以这一段必须用「壁纸库条目」这种没有 projectDir 的
+  // 文档：?item=<id> 由 openLibrary → openWith({origin:{kind:"library"}}) 打开，openWith 里 `if (opts.library)
+  // releaseProject()` 把 projectDir 清空（main.ts:1156），草稿槽才按 itemId 记（main.ts:2244 currentDraftSlot）。
+  var atDraftItem = await saveLoose(); // 先把这个场景整份存成库条目（内部自会 check「项目写入文件夹」）
+  await gotoEditor(`?item=${atDraftItem}`);
+  await task33WaitLibOpened(1); // AT #102：装配慢时以「库条目态」文案为到达信号
+  check(
+    (await ev(`document.querySelector('#ed-draft-recover').hidden && document.querySelector('#ed-draft').hidden`)) === true,
+    "库条目刚打开、还没编辑时两条恢复横幅都不出现（负控：真实动作之前的态）",
+  );
+  // ── task-33 台账 #41 的正控（挪到库条目态）──
+  // 库条目态的 libItem 非空 ⇒ syncLibraryItem() 会 setItem(itemId) → loadProps(id) → GET /api/props?item=<id>，
+  // 成功后 setState(defs.length === 0 ? props.none : props.count) 并 render()。所以与上面空白工程那对同一个观察面：
+  // 状态行由空 → 非空，正文不再是 noLibraryItem 那句。
+  // 取舍：条目的「可配置项声明」依赖作者工程，E2E 不造，以 state 非空为准（不要求一定有真实控件行）。
+  var atPropsBlankJson = JSON.stringify(atPropsBlankHint);
+  await waitFor(
+    `(() => { const s = document.querySelector('#props-state'); const b = document.querySelector('#props-body'); if (!s || !b) return false; return s.textContent.trim().length > 0 && b.textContent !== ${atPropsBlankJson}; })()`,
+    15000,
+  );
+  var atPropsState = String(await ev(`document.querySelector('#props-state').textContent`));
+  var atPropsBody = String(await ev(`document.querySelector('#props-body').textContent`));
+  check(
+    atPropsState.trim().length > 0 && atPropsBody !== atPropsBlankHint,
+    `库条目态下配置面板真去读该条目的属性声明（状态行由空变「${atPropsState.trim()}」，正文不再是空白工程那句提示；条目声明依赖作者工程，E2E 不造，以 state 非空为准）`,
+  );
+  var atDraftT0 = Date.now(); // 编辑时刻：草稿 savedAt 必须晚于它，才说明**这次**编辑落了盘
+  await task33LayersPane(); // addImage 点的是 #ly-add（图层页里），重开条目后要确保那一页在前
+  var atEdit0 = await task33EditSite("AT#102 编辑前");
+  await addImage(stripePath); // 库条目文档没有 projectDir ⇒ 这一次编辑才落到草稿槽
+  var atEdit1 = await task33EditSite("AT#102 编辑后");
+  await waitDraftLanded(atDraftT0, 30000, { before: atEdit0, after: atEdit1 }); // 等**这次**编辑的草稿真落进 IndexedDB 再刷新
+  await gotoEditor(`?item=${atDraftItem}`); // 带同一个 item 重开：恢复横幅只认这份 itemId 的槽（main.ts:4490 起）
+  await waitFor(`document.querySelector('#ed-draft-recover') && document.querySelector('#ed-draft-recover').hidden === false`, 30000);
+  check(
+    (await ev(`(() => { const b = document.querySelector('#ed-draft-recover'); if (!b) return false; return !!b.querySelector('#draft-recover-restore') && !!b.querySelector('#draft-recover-discard') && /恢复/.test(b.textContent) && /丢弃/.test(b.textContent); })()`)) === true,
+    "刷新后新横幅有自己的两个按钮 id（恢复 / 丢弃），文案复用既有词条（正控）",
+  );
+  await clickSel("#draft-recover-discard");
+  await task33Settle();
+  var atErrs = await h.errorLines();
+  check(atErrs.length === 0, `task-33 AT 段全程控制台无错误${atErrs.length ? `：${atErrs.slice(0, 2).join(" / ")}` : ""}`);
+  } catch (err) { await hlAbort("AT", atName, err); }
+}
+await taskLedgerDomE2E();
+
+  /**
+   * AU. task-33 台账补完（批 2）：选择集合 / URL 直达 / 新横幅的「恢复」真的找回。
+   * 每条都是同一次运行内的「负控（真实动作之前的观察面）+ 正控（真实动作之后）」对；
+   * 负控不是「读不到就过」——都由一次真实动作（导航 / 按键 / 刷新）之前的态给出。
+   * 台账 id 见 scripts/verify-editor.mjs 顶部 task-33 判定表。
+   */
+  async function taskLedgerBatch2E2E() {
+    var auName = "AU. task-33 台账补完批 2（全选跳过锁定层 / ?item= 与 #docs= 直达 / 新横幅恢复）";
+    section(auName);
+    if (hlState.dead && !task33Forced) hlSkip("AU", auName); else try {
+      await gotoEditor();
+      await clearLocalStore();
+      await gotoEditor();
+      await newBlank(BG);
+      await task33LayersPane(); // 左面板可能被 AT #41 留在 library（存 localStorage），先切回图层页
+      await addImage(stripePath);
+      await addTextPreset("clock"); // 第二层用名字可区分的一层：两层都叫 stripe 时「按名字找行」会指错行
+
+      {
+        var auSelCount = () => ev(`document.querySelectorAll('#ed-tree .ed-node.selected').length`);
+        var auNames = await h.treeNames();
+        var auNodes = await ev(`document.querySelectorAll('#ed-tree .ed-node').length`);
+        console.log(`  · AU #77 现场：.ed-node ${auNodes} 个、treeNames ${auNames.length} 个（${auNames.join(", ")}）`);
+        // 基线由判据自己量：先在没有锁定层时按一次 ⌘A，看真实能选中几个。不用 treeNames().length 当层数——
+        // #ed-tree 里可能还有分组 / 占位节点，且「选中数」与「名字数」不同源（AT3 那次红就是这两个量对不上）。
+        await key("a", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node.selected').length > 0`, 8000);
+        var auAll = await auSelCount();
+        check(auAll >= 2, `负控前提：未加锁时 ⌘A 至少选中 2 层（实测 ${auAll}；这个数就是后面的基线）`);
+        // task-33 台账 #77：负控=动作前选区是「刚点中的那一层」；正控=⌘A 之后已锁层仍不在选区
+        var lockName = auNames[auNames.length - 1];
+        await click(await h.rowCenter(lockName));
+        await click(await h.rowButton(lockName, ".ed-lock"));
+        check(
+          await ev(`!!document.querySelector('#ed-tree .ed-node.selected')`),
+          "锁定后仍有选中项（负控前提：动作前选区非空，不是「读不到就过」）",
+        );
+        await key("a", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node.selected').length === ${auAll - 1}`, 8000);
+        var auSel = JSON.parse(
+          await ev(
+            `JSON.stringify([...document.querySelectorAll('#ed-tree .ed-node.selected .ed-node-name')].map((e) => e.textContent))`,
+          ),
+        );
+        check(
+          auSel.length === auAll - 1 && auSel.indexOf(lockName) < 0,
+          `⌘A 全选跳过锁定层（未加锁时能选 ${auAll} 层，加锁后选中 ${auSel.length}：${auSel.join(", ")}；不含已锁的 ${lockName}）`,
+        );
+        await click(await h.rowButton(lockName, ".ed-lock"));
+        await key("a", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node.selected').length === ${auAll}`, 8000);
+        check(
+          (await auSelCount()) === auAll,
+          `解锁后 ⌘A 又能全选（正控：又是 ${auAll} 层；被跳过确实是因为锁定，而不是全选本身没生效）`,
+        );
+      }
+
+      // task-33 台账 #43：负控=不带 ?item= 打开是空文档；正控=带 ?item= 打开就是该条目
+      // 当前文档是 newBlank 建的虚拟工程（#new-blank → requireProjectDir() → virtualProjectDir("new") →
+      // createVirtualProject，已经把 webwallgl-vdir-last 就位），所以 saveLoose() 里的 saveToLocal()
+      // 能把整份落到本机文件夹并给出库条目 id；**不要先 openLocal()**——那会把工程绑到真目录、
+      // 顺手清掉 vdir-last（adoptProject 那一步），saveToLocal() 反而拿不到 id。
+      var auItem = await saveLoose();
+      task33LibItem = auItem;
+      await waitFileOnDisk(path.join(lib, String(auItem), "scene.json")); // ?item= 读的正是 scene.json
+      await gotoEditor();
+      // 负控不能拿「树里 0 层」：saveLoose() 刚把这份工程存进本机文件夹，不带 ?item= 重开时编辑器可能
+      // 恢复上次工程（那样树里也是两层），拿层数当负控会误红。改成拿「库条目态」的文案当观察面：
+      // renderSaveStatus()（main.ts:2232-2251）只在 `doc && libItem && canSave()` 时把 #st-save 写成
+      // st.library（「壁纸库 · ⌘S 另存为项目」）并把 title 设成 st.saveAsTitle
+      // （「壁纸库里的原文件不会被改写：…」——注意**不是**「另存为项目」，见 TASK33_LIB_TITLE）。
+      var auSaveOf = async () => JSON.parse(String(await ev(`(() => { const el = document.querySelector('#st-save'); return JSON.stringify({ text: el ? el.textContent : "", title: el ? String(el.getAttribute('title') || "") : "" }); })()`)));
+      var auPlainSave = await auSaveOf();
+      check(
+        !/壁纸库/.test(auPlainSave.text) && !String(auPlainSave.title).includes(TASK33_LIB_TITLE),
+        `不带 ?item= 打开时不在库条目态（负控：保存状态栏文案与 title 都没有库条目那套，实测 text=${JSON.stringify(auPlainSave.text)} title=${JSON.stringify(auPlainSave.title)}）`,
+      );
+      await gotoEditor(`?item=${auItem}`);
+      await task33WaitLibOpened(2); // AU #43：?item= 打开那条
+      var auOpened = await h.treeNames();
+      var auLibSave = await auSaveOf();
+      check(
+        auOpened.length === 2 && /壁纸库 · ⌘S 另存为项目/.test(auLibSave.text) && String(auLibSave.title).includes(TASK33_LIB_TITLE),
+        `?item=${auItem} 直接把库条目打开成工程（正控：树里 ${auOpened.length} 层 ${auOpened.join(", ")}；状态栏文案=${JSON.stringify(auLibSave.text)} title 含库标记=${String(auLibSave.title).includes(TASK33_LIB_TITLE)}）`,
+      );
+      // 说明面板的正文在启动时就渲染好了（main.ts:14184 renderDocsView()），所以「正文非空」不是有效观察面；
+      // 有效的那个是章切换：renderDocsView() 会给当前章的那颗按钮 aria-checked="true"（main.ts:4117-4124）。
+      await gotoEditor("#docs=library");
+      await waitFor(`!!document.querySelector('#docs-switch [data-doc="library"][aria-checked="true"]')`, 30000);
+      check(
+        (await ev(`(() => { const b = document.querySelector('#docs-switch [data-doc="library"]'); return !!b && b.getAttribute('aria-checked') === 'true' && document.querySelector('#docs-body').textContent.trim().length > 0; })()`)) === true,
+        "#docs=library 直达使用说明的壁纸库一章（正控：章切换按钮就是 aria-checked=true，且正文非空）",
+      );
+
+      // task-33 台账 #101：正控=点新横幅的「恢复」真的找回未保存编辑（与旧横幅的处理函数不混）
+      // 与 AT #102 同因：草稿槽只在没有 projectDir 的文档上写（main.ts:2410 autosaveTarget → "draft" 那条），
+      // 所以这里继续用库条目（?item=，openWith 的 releaseProject 把 projectDir 清空）而不是 newBlank。
+      await gotoEditor();
+      await clearLocalStore();
+      await gotoEditor(`?item=${auItem}`);
+      await task33WaitLibOpened(2); // AU #101：?item= 打开这条（草稿恢复的起点）
+      check(
+        await ev(`document.querySelector('#ed-draft-recover').hidden && document.querySelector('#ed-draft').hidden`),
+        "库条目刚打开、还没编辑时两条横幅都不出现（负控：真实刷新动作之前）",
+      );
+      var auDraftT0 = Date.now();
+      await task33LayersPane(); // 重开 ?item= 之后左面板可能不在图层页（AT #41 点过 library 并存了 tab 状态）
+      var auEdit0 = await task33EditSite("AU#101 编辑前");
+      await addImage(stripePath); // +1 层：库条目文档这一步才落到草稿槽
+      var auEdit1 = await task33EditSite("AU#101 编辑后");
+      await waitDraftLanded(auDraftT0, 30000, { before: auEdit0, after: auEdit1 }); // 等**这次**编辑的草稿落盘（拿槽键数当观察面会被早先的槽蒙过）
+      console.log(`· AU #101 草稿内容现场：${JSON.stringify(await task33DraftContent(auItem).catch((e) => ({ error: String((e && e.message) || e) })))}（编辑后时刻 ${auEdit1?.at}）`);
+      await gotoEditor(`?item=${auItem}`);
+      await waitFor(`!document.querySelector('#ed-draft-recover').hidden`, 30000);
+      // 「恢复」是**独立的一次 openWith**：openWith 用 `gen = ++openGen`（main.ts:1127）+
+      // `if (gen !== openGen) return`（main.ts:1138）把「先飞的那次」静默作废——连它的 after
+      // （= applyDraftSnapshot）一起，**谁后开始谁赢**，输的那次零报错、零日志。
+      // 而 ?item= 的开机打开是启动段里 `await libraryPanel.load()` 之后的 openLibrary
+      // （main.ts:14186-14197），比横幅慢——横幅来自 checkDraftRecovery（main.ts:14201），
+      // 只读 IndexedDB 就显示；开机那次 mountCurrent 还会再 `++openGen`（main.ts:968）。
+      // 所以点「恢复」之前必须等这次开机打开**落定**（已越过 openGen 那次 ++），否则恢复的
+      // openWith 会被它作废（AT12 现场：树停在条目原样 2 层、无「已恢复草稿」、errs 空）。判据不动。
+      // 等这次开机打开落定（幂等：已经开好的话立刻通过）。
+      // 为什么等「树行数到位」就够：renderTree() 在 openWith 的 :1169、mountCurrent()（它的
+      // `const gen = ++openGen` 在 :968，是 mountCurrent 的**同步**开头）紧随其后 ⇒ 我们从外部
+      // 观察到行数时，那一整段同步代码已经跑完、`openGen` 的那次 ++ 已经发生；此后不再有别的
+      // open 会作废我们接下来的「恢复」open。**不能用「等一条新的首帧就绪」**：开机 open 可能
+      // 在横幅出现前就装完了，那样会白等满超时。
+      await task33WaitLibOpened(2);
+      await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 30000);
+      await task33Settle();
+      // task-33 台账 #101：真机点击保真度边界（elementFromPoint 命中校验 + 合成点击回退），非产品缺陷
+      // —— 点击瞬间按钮可能还没布局（rect=[0,0,0,0]），clickSel 的真鼠标会打在 titlebar 上；判据本体不变。
+      await task33ClickRecover("AU #101");
+      try {
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 3`, 90000);
+      } catch (e) {
+        await task33RecoverSite("AU #101", auDraftT0, auEdit1?.at, auItem);
+        throw e;
+      }
+      var auRecovered = await h.treeNames();
+      check(
+        auRecovered.length === 3 && /stripe/.test(auRecovered.join(" ")),
+        `点新横幅的「恢复」把未保存编辑找回来了（${auRecovered.join(", ")}；新横幅走的是恢复分支，不是旧横幅的重开目录分支）`,
+      );
+      var auErrs = await h.errorLines();
+      check(auErrs.length === 0, `task-33 AU 段全程控制台无错误${auErrs.length ? `：${auErrs.slice(0, 2).join(" / ")}` : ""}`);
+      // ════════════════════════════════════════════════════════════════════
+    } catch (err) { await hlAbort("AU", auName, err); }
+  }
+  await taskLedgerBatch2E2E();
+
+  /**
+   * AV. task-33 台账补完（批 3）：默认不自动播放。
+   * 观察面 = 视口真实像素 + 播放按钮图标的 hidden 态；三条样本对构成负控/正控。
+   */
+  async function taskLedgerBatch3E2E() {
+    var avName = "AV. task-33 台账补完批 3（打开 / 重挂都停在当前帧，只有点播放才走时钟）";
+    section(avName);
+    if (hlState.dead && !task33Forced) hlSkip("AV", avName); else try {
+      await gotoEditor();
+      await clearLocalStore();
+      await gotoEditor();
+      await newBlank(BG);
+      await task33LayersPane();
+      await addImage(stripePath);
+      var avDraftItem = await saveLoose(); // 存成库条目（内部自会 check「项目写入文件夹」）
+      // 同 AT #102 / AU #101：草稿槽只在没有 projectDir 的文档上写，所以恢复横幅这条路必须走库条目文档；
+      // newBlank 的虚拟工程有 projectDir ⇒ 刷新给的是旧横幅 #ed-draft（resumeVirtualProject 那条）。
+      await gotoEditor(`?item=${avDraftItem}`);
+      await task33WaitLibOpened(1); // AV #55：?item= 打开那条
+      var avDraftT0 = Date.now();
+      await task33LayersPane(); // 重开 ?item= 之后左面板可能不在图层页：#ly-add-text 点不中就白等
+      var avEdit0 = await task33EditSite("AV#55 编辑前");
+      await addTextPreset("clock"); // 库条目文档这一步才落到草稿槽
+      var avEdit1 = await task33EditSite("AV#55 编辑后");
+      await task33Settle();
+      await task33Settle();
+      // 走「打开文档（重开未保存编辑）/ 重挂」这条路径：刷新后从恢复横幅进入，按声明它必须停在当前帧
+      await waitDraftLanded(avDraftT0, 30000, { before: avEdit0, after: avEdit1 }); // 等**这次**编辑的草稿落盘
+      console.log(`· AV #55 草稿内容现场：${JSON.stringify(await task33DraftContent(avDraftItem).catch((e) => ({ error: String((e && e.message) || e) })))}（编辑后时刻 ${avEdit1?.at}）`);
+      await gotoEditor(`?item=${avDraftItem}`);
+      await waitFor(`!document.querySelector('#ed-draft-recover').hidden`, 30000);
+      // 同 AU #101：点「恢复」之前先等这次开机打开落定（幂等），否则恢复那次 openWith 会被
+      // ?item= 的开机 open（main.ts:14186-14197）/ 它的 mountCurrent（main.ts:968）作废
+      // —— openWith 的 `if (gen !== openGen) return`（main.ts:1138）是静默的。判据不动。
+      await task33WaitLibOpened(1);
+      await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 1`, 30000);
+      await task33Settle();
+      // task-33 台账 #55：真机点击保真度边界（elementFromPoint 命中校验 + 合成点击回退），非产品缺陷
+      await task33ClickRecover("AV #55");
+      try {
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === 2`, 90000);
+      } catch (e) {
+        await task33RecoverSite("AV #55", avDraftT0, avEdit1?.at, avDraftItem);
+        throw e;
+      }
+      await task33Settle();
+      await task33Settle();
+      // task-33 台账 #55 的观察面（AT16 现场定性后换定）：时钟层是**文字脚本时钟**——editor/text.ts:30
+      // CLOCK_SCRIPT 的 update() 取 `new Date()`（墙上时间），且 showSeconds 缺省 false ⇒ 画面上只有
+      // `HH:MM`，画布像素在**同一分钟内逐字相同** ⇒「点播放后像素变了」这条判据本身不可能绿
+      // （AT16 现场 242|243|245 点播放后仍不变就是这个原因，不是产品缺陷）。
+      // 改拿产品自己的时钟读数当量：`#tl-time`（main.ts:1755 tickTimeline 每帧写 fmtTime(editor.time)
+      // 的 `3.27s` 文本）与 `#tl-range`（同一时刻的滑条值）——暂停时编辑器时钟不动 ⇒ 两者冻结，
+      // 播放时逐帧递增。像素三元组继续打出来当现场（只参与相等判据里的「逐字相同」）。
+      var avTime = () => ev(`(() => {
+        const t = document.querySelector('#tl-time');
+        const r = document.querySelector('#tl-range');
+        return (t ? t.textContent : 'none') + ' / ' + (r ? r.value : 'none');
+      })()`);
+      var avPixels = async () => {
+        var cr = await h.canvasRect();
+        var pts = [[900, 300], [1110, 590], [1300, 800]];
+        var out = [];
+        for (const p of pts) out.push(await pixelAt(worldToPage(cr, p)));
+        return out.join("|");
+      };
+      var avSample = async () => `${await avTime()} · px=${await avPixels()}`;
+      // 取负控基线前先等时钟读数稳定（装配 / 重挂后的 seek 落定）：只等「稳定」，判据不动 ——
+      // 若时钟其实一直在走，这个循环会白转满 8s，随后 `avA === avB` 照样红。
+      {
+        let prev = await avTime();
+        for (let i = 0; i < 20; i++) {
+          await task33Settle();
+          const cur = await avTime();
+          if (cur === prev) break;
+          prev = cur;
+        }
+      }
+      // task-33 台账 #55：负控=重挂后按钮是「播放」（暂停态）且 1.2s 后时钟读数与像素逐字不变
+      check(
+        (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) === false,
+        "重挂后按钮还是「播放」图标（负控前提：动作前的态是暂停，不是在跑）",
+      );
+      var avA = await avSample();
+      await task33Settle();
+      await task33Settle();
+      await task33Settle();
+      var avB = await avSample();
+      check(avA === avB, `重挂后停在当前帧、时钟不走（编辑器时钟读数与像素两次取样逐字相同：${avA}）`);
+      // 正控：点播放才走时钟
+      await clickSel("#tb-play");
+      await waitFor(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`, 8000);
+      check(
+        (await ev(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden')`)) === true,
+        "点播放后按钮切成「暂停」图标（正控：真实动作之后）",
+      );
+      await task33Settle();
+      await task33Settle();
+      await task33Settle();
+      var avC = await avSample();
+      check(avC !== avB, `点播放后时钟真的走起来（编辑器时钟读数在走：${avB} → ${avC}）`);
+      // 再停回去：确认「只有点播放才走」不是单向的巧合
+      await clickSel("#tb-play");
+      await waitFor(`document.querySelector('#tb-play .ic-play').hasAttribute('hidden') === false`, 8000);
+      await task33Settle();
+      var avD = await avSample();
+      await task33Settle();
+      await task33Settle();
+      await task33Settle();
+      var avE = await avSample();
+      check(avD === avE, `再点一次又停住（编辑器时钟读数与像素两次取样逐字相同：${avD}）`);
+      var avErrs = await h.errorLines();
+      check(avErrs.length === 0, `task-33 AV 段全程控制台无错误${avErrs.length ? `：${avErrs.slice(0, 2).join(" / ")}` : ""}`);
+      // ════════════════════════════════════════════════════════════════════
+    } catch (err) { await hlAbort("AV", avName, err); }
+  }
+  await taskLedgerBatch3E2E();
+
+  /**
+   * AW. task-33 台账补完（批 4）：快捷键真绑上 / ⌘S 分流 / 插件说明直达。
+   * 每条都是「真实动作之前（负控）→ 动作之后（正控）」对，观察面是树层数、盘上产物、面板正文。
+   */
+  async function taskLedgerBatch4E2E() {
+    var awName = "AW. task-33 台账补完批 4（⌘D/Delete/⌘Z/⌘Y/Backspace/⌘S 真生效 / 库条目 ⌘S 走另存为 / 插件说明直达）";
+    section(awName);
+    if (hlState.dead && !task33Forced) hlSkip("AW", awName); else try {
+      await gotoEditor();
+      await clearLocalStore();
+      await gotoEditor();
+      await newBlank(BG);
+      await task33LayersPane(); // 左面板可能停在 library（AT #41 存过 localStorage），#ly-add-* 都在图层页里
+      await addImage(stripePath);
+
+      // task-33 台账 #42 见本段末尾（#44 之后）：它要先跳进「库条目态」，而 #29 的前提是「树里 1 层」。
+
+      // task-33 台账 #29：负控前提=动作前树里有层（且量的是与断言同一个量）；正控=每个快捷键都产生可观察的真实效果
+      {
+        // 只用一个量：`#ed-tree .ed-node` 的节点数。AT3 那轮红就是因为 waitFor 等 `.ed-node` 而 check 读
+        // `h.treeNames().length`（.ed-node-name 只数有名字的行，空文档下 #ed-tree 还可能留着分组/占位节点），
+        // 两个量不同源 ⇒ 断言自己跟自己不一致。
+        var awNodes = () => ev(`document.querySelectorAll('#ed-tree .ed-node').length`);
+        var awN = await awNodes();
+        console.log(`  · AW #29 现场：动作前 #ed-tree .ed-node ${awN} 个、treeNames ${(await h.treeNames()).length} 个`);
+        check(awN >= 1, `负控前提：动作前树里有 ${awN} 个节点（后面每一步都相对这个数数）`);
+        await click(await h.rowCenter((await h.treeNames())[0]));
+        await key("d", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN + 1}`, 8000);
+        check((await awNodes()) === awN + 1, `⌘D 真的复制出一层（${awN} → ${await awNodes()}）`);
+        await key("Delete");
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN}`, 8000);
+        check((await awNodes()) === awN, `Delete 真的删掉选中层（回到 ${await awNodes()}）`);
+        await key("z", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN + 1}`, 8000);
+        check((await awNodes()) === awN + 1, "⌘Z 把删除撤销回来（快捷键不是只写在命令表里）");
+        await key("y", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN}`, 8000);
+        check((await awNodes()) === awN, "⌘Y 重做删除");
+        await click(await h.rowCenter((await h.treeNames())[0]));
+        await key("Backspace");
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN - 1}`, 8000);
+        check((await awNodes()) === awN - 1, `Backspace 同样能删层（${awN} → ${await awNodes()}，与 Delete 并列的那条分支）`);
+        await key("z", MOD.meta);
+        await waitFor(`document.querySelectorAll('#ed-tree .ed-node').length === ${awN}`, 8000);
+        check((await awNodes()) === awN, "⌘Z 把 Backspace 那次删除也撤销回来");
+        var awSaved0 = await h.savedCount();
+        await key("s", MOD.meta);
+        await h.waitSaved(awSaved0);
+        check((await h.savedCount()) > awSaved0, `⌘S 触发一次真实保存（${awSaved0} → ${await h.savedCount()}）`);
+      }
+
+      // task-33 台账 #44：负控=弹窗未开时说明面板没有插件章；正控=点弹窗里的「插件说明」后说明面板给出插件章
+      await gotoEditor();
+      await clearLocalStore();
+      await gotoEditor();
+      await newBlank(BG);
+      await task33LayersPane(); // 左面板可能停在 library（AT #41 存过 localStorage），#ly-add-* 都在图层页里
+      check((await ev(`document.querySelector('#plugins-dlg').open`)) === false, "插件弹窗默认没开（负控：动作前的真实态）");
+      await clickSel("#tb-plugins");
+      await waitFor(`document.querySelector('#plugins-dlg').open`, 8000);
+      check((await ev(`document.querySelector('#plugins-dlg').open`)) === true, "点工具条插件按钮真的打开插件弹窗（正控）");
+      await clickSel("#plugins-docs");
+      // 观察面用章切换（renderDocsView 给当前章 aria-checked="true"）+ 插件章正文里确实有「插件」字样；
+      // 单看「#docs-body 非空」不行——正文在启动时就渲染好了。
+      await waitFor(`!!document.querySelector('#docs-switch [data-doc="plugins"][aria-checked="true"]')`, 8000);
+      var awDocs = await ev(`document.querySelector('#docs-body').textContent`);
+      check(
+        (await ev(`document.querySelector('#docs-switch [data-doc="plugins"]')?.getAttribute('aria-checked') === 'true'`)) === true &&
+          /插件/.test(String(awDocs)) &&
+          String(awDocs).trim().length > 0,
+        `弹窗里的「插件说明」把使用说明面板切到插件一章（正控：章按钮 aria-checked=true 且正文含「插件」；正文前 80 字=${JSON.stringify(String(awDocs).slice(0, 80))}）`,
+      );
+      // task-33 台账 #42（修正版）：⌘S → file.save → saveDocument() 的两条分支。
+      // 库条目态是 `!projectDir && libItem && canSave()`（main.ts:2232-2238 ⇒ 状态栏文案 st.library /
+      // title st.saveAsTitle =「壁纸库里的原文件不会被改写：…」），这一支走 saveDocument() 的 else：
+      // requireProjectDir() → virtualProjectDir("new") → createVirtualProject 新建一个浏览器存储工程、
+      // adoptProject、libItem = null（main.ts:2082-2095），库里的原文件不该被改写。
+      // 原来那版「无目录时 ⌘S 弹 #vdir-dlg」是错的：#vdir-dlg 只由 requireProjectDir("open") →
+      // pickVirtualProject 弹（main.ts:4226/4234），而 ⌘S 的 else 分支用的是 purpose="new" → createVirtualProject，
+      // 压根不弹窗（走这条路会等 30s 超时中断）。
+      if (!task33LibItem) throw new Error("AU 段没有造出库条目 id（先看 AU 的中断原因）：AW #42 的库条目态判据依赖它");
+      await gotoEditor(`?item=${task33LibItem}`);
+      var awItemSite = async (tag) => {
+        const site = await ev(`JSON.stringify({ tag: ${JSON.stringify(tag)}, href: location.href, stText: document.querySelector('#st-save')?.textContent, stTitle: document.querySelector('#st-save')?.title, nodes: document.querySelectorAll('#ed-tree .ed-node').length, draftBanner: (() => { const b = document.querySelector('#ed-draft-recover'); return !!b && !b.hidden; })(), libRows: document.querySelectorAll('#lib-list .lib-item, #lib-list [data-item]').length })`);
+        let onDisk = "?";
+        try { onDisk = JSON.stringify(fs.readdirSync(lib).slice(0, 8)); } catch (e) { onDisk = String(e.message); }
+        console.log(`· AW #42 现场：${site}；盘上 lib/：${onDisk}；AU 给的 id：${task33LibItem}`);
+      };
+      try {
+        await waitFor(`String(document.querySelector('#st-save').title).includes('${TASK33_LIB_TITLE}')`, 90000);
+      } catch (e) {
+        await awItemSite("?item= 打开后没进库条目态");
+        throw e;
+      }
+      check(
+        (await ev(`String(document.querySelector('#st-save').title).includes('${TASK33_LIB_TITLE}') && /壁纸库/.test(document.querySelector('#st-save').textContent)`)) === true,
+        "负控前提：?item= 打开的是库条目态（状态栏「壁纸库 · ⌘S 另存为项目」、title 是「壁纸库里的原文件不会被改写…」，此时没有 projectDir、原文件不该被改写）",
+      );
+      var awLibPath = path.join(lib, String(task33LibItem), "scene.json");
+      var awLibBefore = fs.existsSync(awLibPath) ? fs.readFileSync(awLibPath) : null;
+      check(!!awLibBefore && awLibBefore.length > 0, `库条目在盘上有 scene.json（${awLibPath}）`);
+      await key("s", MOD.meta);
+      try {
+        await waitFor(`!String(document.querySelector('#st-save').title).includes('${TASK33_LIB_TITLE}')`, 30000);
+      } catch (e) {
+        await awItemSite("库条目态按 ⌘S 没切走");
+        throw e;
+      }
+      check(
+        (await ev(`document.querySelector('#st-save').title.length > 0 && !String(document.querySelector('#st-save').title).includes('${TASK33_LIB_TITLE}')`)) === true,
+        "⌘S 走「另存为项目」那条分支并接管（title 不再是「壁纸库里的原文件不会被改写…」，main.ts:2090-2095）",
+      );
+      check(
+        !!awLibBefore && Buffer.compare(fs.readFileSync(awLibPath), awLibBefore) === 0,
+        "库里的原 scene.json 一个字节没改（「壁纸库里的原文件不会被改写」）",
+      );
+
+      var awErrs = await h.errorLines();
+      check(awErrs.length === 0, `task-33 AW 段全程控制台无错误${awErrs.length ? `：${awErrs.slice(0, 2).join(" / ")}` : ""}`);
+      // ════════════════════════════════════════════════════════════════════
+    } catch (err) { await hlAbort("AW", awName, err); }
+  }
+  await taskLedgerBatch4E2E();
 
   if (hlState.aborts.length || hlState.skipped) {
     console.log(`\n真机段小结：中断 ${hlState.aborts.length} 段、跳过 ${hlState.skipped} 段`);

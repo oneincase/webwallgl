@@ -2196,6 +2196,326 @@ const RESID_MUTATIONS = [
   },
 ];
 
+// ══════════════════════════════════════════════════════════════════════════════
+// W18a 片段叠增量逐帧对账（task-34）：编辑器数据层 ≡ 引擎真实求值
+//
+// 这条判据**不是自证**：编辑器侧 `mdlClipFrameTrs` 的九分量经引擎自己的 `composeTRS` 合成
+// 16 分量矩阵，与引擎 `computeSkinMatrices`（真实播放路径）写出的 `_local[i]` 逐元素比，
+// 两侧都吃真语料 / 合成字节。覆盖三种 mode 的采样索引、r 分量最短弧、无轨道骨回落 bindTRS、
+// 编辑预览增量（t/r 相加、s 相乘）、轨序号映射、越界与非法输入。
+// ══════════════════════════════════════════════════════════════════════════════
+const FRAME_ME = "renderer/src/editor/mdl-edit.ts";
+const FRAME_EPS = 1e-5;
+
+/** 每条变异 = 把逐帧合成改坏的一种方式；对账判据必须变红（否则说明没覆盖该分支） */
+const FRAME_MUTATIONS = [
+  {
+    name: "有轨道的骨却回落绑定姿势（rest 当输出）",
+    pairs: [
+      [
+        "    sampleClipTrs(track.data, text(anim.mode), anim.fps, time, out);",
+        "    { const b0 = mdlBindTRS(bytes, bone); if (b0) out.set(b0); }",
+      ],
+    ],
+  },
+  {
+    name: "插值权重反了（t 与 1−t 互换）",
+    pairs: [["      out[i] = data[a + i] * it + data[b + i] * t;", "      out[i] = data[a + i] * t + data[b + i] * it;"]],
+  },
+  {
+    name: "预览增量的缩放口径错（相乘改成相加）",
+    pairs: [
+      ["    for (let k = 0; k < 3; k++) out[6 + k] *= s[k] ?? 1;", "    for (let k = 0; k < 3; k++) out[6 + k] += (s[k] ?? 1) - 1;"],
+    ],
+  },
+  {
+    name: "r 分量去掉最短弧（跨 ±π 直接线性插值）",
+    pairs: [
+      [
+        "      let d = data[b + i] - data[a + i];\n      if (d > Math.PI) d -= 2 * Math.PI;\n      else if (d < -Math.PI) d += 2 * Math.PI;\n      out[i] = data[a + i] + d * t;",
+        "      out[i] = data[a + i] * it + data[b + i] * t;",
+      ],
+    ],
+  },
+  {
+    name: "无轨道骨回落成单位 TRS（不是绑定姿势）",
+    pairs: [
+      [
+        "    out.set(base);",
+        "    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0; out[5] = 0; out[6] = 1; out[7] = 1; out[8] = 1;",
+      ],
+    ],
+  },
+  {
+    name: "轨道按 boneId 字段找（文件里该字段恒为 0 ⇒ 每根骨都命中首轨）",
+    pairs: [
+      [
+        "  if (boneCount > 0 && anim.tracks.length === boneCount && anim.tracks[bone]) return anim.tracks[bone];\n  return anim.tracks.find((t) => t.boneId === bone) ?? null;",
+        "  return anim.tracks.find((t) => t.boneId === bone) ?? null;",
+      ],
+    ],
+  },
+];
+
+const frameMatDiff = (a, b) => {
+  let w = 0;
+  for (let i = 0; i < 16; i++) w = Math.max(w, Math.abs(a[i] - b[i]));
+  return w;
+};
+
+/** 引擎侧：解析 + 真实求值（单条替换层 blend=1，boneOverrides=null），返回 mdl（读 _local） */
+function frameEngineLocals(P, S, bytes, animId, time, editPose) {
+  const mdl = P.parseMDL(bytes);
+  if (editPose) mdl._editPose = new Map([[editPose.bone, Float32Array.from(editPose.v)]]);
+  S.computeSkinMatrices(mdl, time, [{ animation: animId, visible: true, additive: false, blend: 1, rate: 1 }], null);
+  return mdl;
+}
+
+/** 编辑器侧：九分量 → 引擎自己的 composeTRS 合成（比的是 TRS 语义，不是各写一套矩阵） */
+function frameEditorMat(ME, M, bytes, animId, bone, time, pose) {
+  const trs = ME.mdlClipFrameTrs(bytes, animId, bone, time, pose);
+  if (!trs) return null;
+  return M.composeTRS(trs[0], trs[1], trs[2], trs[3], trs[4], trs[5], trs[6], trs[7], trs[8], new Float32Array(16));
+}
+
+/** light = 变异轮：只裁语料规模（合成用例与空轨道回落必须留着，否则变异咬不住） */
+async function frameBattery(ME, P, S, M, W, LIB, check, light) {
+  const fixtures = (light ? PUPPET_FIXTURES : [...PUPPET_FIXTURES, ...MESH_FIXTURES]).filter((id) =>
+    fs.existsSync(path.join(LIB, id, "scene.pkg")),
+  );
+  const objsPerFixture = light ? 1 : 2;
+  const animsPerObj = light ? 1 : 2;
+  const timeCount = light ? 2 : 3;
+  let models = 0;
+  let pairs = 0;
+  let tracked = 0;
+  let noTrack = 0;
+  let worst = 0;
+  let worstAt = "";
+  let miss = "";
+  const cands = [];
+  for (const id of fixtures) {
+    const t = modelTruth(LIB, id);
+    if (!t) continue;
+    let used = 0;
+    for (const o of t.objects) {
+      if (used >= objsPerFixture) break;
+      const bytes = t.read(o.info.mdlPath);
+      let mdl = null;
+      try {
+        mdl = P.parseMDL(bytes);
+      } catch {
+        continue;
+      }
+      if (!mdl || !mdl.bones || !mdl.bones.length || !mdl.animations || !mdl.animations.length) continue;
+      const anims = mdl.animations.filter((a) => a.frameCount > 0).slice(0, animsPerObj);
+      if (!anims.length) continue;
+      used++;
+      models++;
+      for (const a of anims) {
+        const span = a.frameCount / (a.fps || 1);
+        const times = [0, 0.5 * span, 0.999 * span].slice(0, timeCount);
+        for (const time of times) {
+          const eng = frameEngineLocals(P, S, bytes, a.id, time, null)._local;
+          for (let i = 0; i < mdl.bones.length; i++) {
+            const gm = frameEditorMat(ME, M, bytes, a.id, i, time, null);
+            if (!gm) {
+              miss = miss || `${id}#${o.id} anim${a.id} bone${i}`;
+              continue;
+            }
+            const trk = a.tracks[i];
+            if (trk && trk.keyframes.length) tracked++;
+            else noTrack++;
+            pairs++;
+            const d = frameMatDiff(gm, eng[i]);
+            if (d > worst) {
+              worst = d;
+              worstAt = `${id}#${o.id} anim${a.id} bone${i} t=${time.toFixed(3)}`;
+            }
+            if (!cands.length && trk && trk.keyframes.length) cands.push({ bytes, animId: a.id, bone: i });
+          }
+        }
+      }
+    }
+  }
+  check(models >= 3, `对账语料：含骨骼与动画轨道的模型 ${models} 个（≥3）`);
+  check(pairs >= 150, `逐骨逐时刻对账样本 ${pairs} 组（有轨道 ${tracked} / 无轨道回落 ${noTrack}）`);
+  check(!miss, `每根骨都有读数（缺 ${miss || "0"} 处）`);
+  check(worst <= FRAME_EPS, `编辑器数据层 ≡ 引擎 computeSkinMatrices：最坏差值 ${worst.toExponential(2)} ≤ ${FRAME_EPS} @ ${worstAt || "—"}`);
+  if (!cands.length) {
+    check(false, "没取到有轨道的骨样本（后面的合成用例没法造）");
+    return;
+  }
+  const s0 = cands[0];
+
+  // ── 合成片段：真语料里 mode 只有 loop/single、相邻帧也未必跨 ±π，所以自己造 ──
+  const syn = [];
+  for (const mode of ["loop", "mirror", "single"]) {
+    const added = ME.addMdlClip(s0.bytes, { name: `t34-${mode}`, mode, fps: 10, frameCount: 8 }, "rest", s0.animId);
+    let b = added ? ME.applyBoneDelta(added.bytes, added.id, s0.bone, 0, { t: [30, -20, 5], r: [0, 0, 3.1] }, 0) : null;
+    b = b && ME.applyBoneDelta(b, added.id, s0.bone, 1, { t: [-30, 20, -5], r: [0, 0, -3.1] }, 0);
+    b = b && ME.applyBoneDelta(b, added.id, s0.bone, 4, { t: [40, -25, 0], r: [0, 0, 0.7], s: [1.5, 0.5, 1] }, -1);
+    syn.push(b ? { mode, bytes: b, id: added.id } : null);
+  }
+  check(syn.every(Boolean), "合成三种 mode 的片段（loop/mirror/single，含逐帧差异与跨 ±π 的 r）");
+  let synPairs = 0;
+  let synBad = "";
+  for (const s of syn) {
+    if (!s) continue;
+    for (const time of [0, 0.05, 0.35, 0.95, 1.6, 3.2]) {
+      const eng = frameEngineLocals(P, S, s.bytes, s.id, time, null)._local;
+      for (let i = 0; i < eng.length; i++) {
+        const gm = frameEditorMat(ME, M, s.bytes, s.id, i, time, null);
+        if (!gm) {
+          synBad = synBad || `${s.mode} t=${time} bone${i} null`;
+          continue;
+        }
+        const d = frameMatDiff(gm, eng[i]);
+        synPairs++;
+        if (d > FRAME_EPS) synBad = synBad || `${s.mode} t=${time} bone${i} 差 ${d.toExponential(2)}`;
+        if (d > worst) {
+          worst = d;
+          worstAt = `synth/${s.mode} bone${i} t=${time}`;
+        }
+      }
+    }
+  }
+  check(synPairs >= 30 && !synBad, `合成片段三种 mode 逐骨逐时刻一致：${synPairs} 组${synBad ? `，不符：${synBad}` : ""}`);
+
+  // ── 编辑预览增量：t/r 相加、s 相乘（对 mdl-skin.js:429-434 的 _editPose 分支）──
+  const pose = { t: [12, -7, 3], r: [0, 0, 0.25], s: [1.5, 0.5, 2] };
+  const pose9 = [12, -7, 3, 0, 0, 0.25, 1.5, 0.5, 2];
+  let posePairs = 0;
+  let poseBad = "";
+  let poseWorst = 0;
+  for (const s of syn) {
+    if (!s) continue;
+    for (const time of [0, 0.05, 0.35]) {
+      const eng = frameEngineLocals(P, S, s.bytes, s.id, time, { bone: s0.bone, v: pose9 })._local;
+      const gm = frameEditorMat(ME, M, s.bytes, s.id, s0.bone, time, pose);
+      if (!gm) {
+        poseBad = poseBad || `${s.mode} t=${time} null`;
+        continue;
+      }
+      const d = frameMatDiff(gm, eng[s0.bone]);
+      posePairs++;
+      poseWorst = Math.max(poseWorst, d);
+      if (d > FRAME_EPS) poseBad = poseBad || `${s.mode} t=${time} 差 ${d.toExponential(2)}`;
+    }
+  }
+  check(
+    posePairs >= 9 && !poseBad,
+    `编辑预览增量（t/r 相加、s 相乘）≡ 引擎 _editPose 分支：${posePairs} 组，最坏 ${poseWorst.toExponential(2)}${poseBad ? `，不符：${poseBad}` : ""}`,
+  );
+
+  // ── 无轨道骨回落：真语料每根骨都有轨道，手工造「轨道存在但空」的文档 ──
+  let fbPairs = 0;
+  let fbBad = "";
+  try {
+    const doc = W.readMdlDoc(s0.bytes);
+    const mdla = (doc.sections || []).find((x) => x.type === "MDLA");
+    const bone = s0.bone === 0 ? 1 : 0;
+    const anim0 = mdla && mdla.anims && mdla.anims[0];
+    if (anim0 && anim0.tracks[bone]) {
+      anim0.tracks[bone].data = new Float32Array(0);
+      const bytes = W.writeMdlDoc(doc);
+      const animId = anim0.id;
+      for (const time of [0, 0.5, 1.25]) {
+        const mdl = P.parseMDL(bytes);
+        const et = mdl.animations[0] && mdl.animations[0].tracks[bone];
+        if (!et || et.keyframes.length !== 0) {
+          fbBad = fbBad || "空轨道没写进文档";
+          continue;
+        }
+        S.computeSkinMatrices(mdl, time, [{ animation: animId, visible: true, additive: false, blend: 1, rate: 1 }], null);
+        const gm = frameEditorMat(ME, M, bytes, animId, bone, time, null);
+        if (!gm) {
+          fbBad = fbBad || `t=${time} null`;
+          continue;
+        }
+        const d = frameMatDiff(gm, mdl._local[bone]);
+        fbPairs++;
+        if (d > FRAME_EPS) fbBad = fbBad || `t=${time} 差 ${d.toExponential(2)}`;
+        if (d > worst) {
+          worst = d;
+          worstAt = `fallback bone${bone} t=${time}`;
+        }
+      }
+    } else {
+      fbBad = "造不出空轨道（文档里没有 MDLA 轨道）";
+    }
+  } catch (e) {
+    fbBad = `造空轨道失败：${e.message}`;
+  }
+  check(fbPairs >= 3 && !fbBad, `无轨道骨回落绑定姿势（引擎 skip 空轨道）≡ 编辑器：${fbPairs} 组 3 个时刻${fbBad ? `，不符：${fbBad}` : ""}`);
+
+  // ── API 形状与非法输入 ──
+  const engMdl = P.parseMDL(s0.bytes);
+  const engTrk = engMdl.animations.find((a) => a.id === s0.animId).tracks[s0.bone];
+  const trk = ME.mdlClipTrack(s0.bytes, s0.animId, s0.bone);
+  let bits = !!trk && trk.frameCount === engTrk.frameCount && trk.data.length === engTrk.keyframes.length;
+  if (bits) for (let i = 0; i < engTrk.keyframes.length; i++) if (trk.data[i] !== engTrk.keyframes[i]) bits = false;
+  check(bits, `mdlClipTrack 与引擎轨道逐位一致（骨 ${s0.bone}，${trk ? trk.frameCount : "?"} 帧）`);
+  const base9 = ME.mdlBindTRS(s0.bytes, s0.bone);
+  const engBase = engMdl.bindTRS[s0.bone];
+  check(
+    !!base9 && base9.length === 9 && [0, 1, 2, 3, 4, 5, 6, 7, 8].every((k) => base9[k] === engBase[k]),
+    "mdlBindTRS 与引擎 bindTRS 逐位一致",
+  );
+  if (engMdl.bones.length > 1 && engMdl.animations[0].tracks[1] && engMdl.animations[0].tracks[1].keyframes.length) {
+    const t0 = ME.mdlClipTrack(s0.bytes, s0.animId, 0);
+    const t1 = ME.mdlClipTrack(s0.bytes, s0.animId, 1);
+    check(!!t0 && !!t1 && t0.data[0] !== t1.data[0], "骨 0 / 骨 1 取到不同轨道（按轨序号索引，不是全命中 boneId=0 的首轨）");
+  }
+  check(
+    ME.mdlClipTrack(s0.bytes, s0.animId, 99999) === null &&
+      ME.mdlClipTrack(s0.bytes, -7, s0.bone) === null &&
+      ME.mdlClipTrack(s0.bytes, s0.animId, s0.bone + 0.5) === null &&
+      ME.mdlBindTRS(s0.bytes, 99999) === null &&
+      ME.mdlClipFrameTrs(s0.bytes, s0.animId, s0.bone, Number.NaN) === null &&
+      ME.mdlClipFrameTrs(s0.bytes, 999999, s0.bone, 0) === null,
+    "越界骨号 / 不存在片段 / time 非有限 → null（不抛错）",
+  );
+}
+
+export async function runFrameReconcileOffline({ check, section, LIB = DEFAULT_LIB }) {
+  section("W18a 片段叠增量逐帧对账（task-34）：编辑器数据层 ≡ 引擎 computeSkinMatrices");
+  let failed = 0;
+  const c = (ok, msg) => {
+    if (!ok) failed++;
+    check(ok, msg);
+  };
+  const P = await imp("renderer/vendor/we-scene/render/mdl-parse.js");
+  const S = await imp("renderer/vendor/we-scene/render/mdl-skin.js");
+  const M = await imp("renderer/vendor/we-scene/render/mdl-math.js");
+  const W = await imp("renderer/vendor/we-scene/pkg/mdl-write.js");
+  const ME = await loadEditorModule(FRAME_ME);
+  await frameBattery(ME, P, S, M, W, LIB, c, false);
+
+  section(`变异红测（${FRAME_MUTATIONS.length} 条：把逐帧合成改坏必须被抓住）`);
+  let red = 0;
+  for (let i = 0; i < FRAME_MUTATIONS.length; i++) {
+    const mut = FRAME_MUTATIONS[i];
+    let hits = 0;
+    try {
+      const MM = await loadEditorModule(FRAME_ME, mut.pairs);
+      await frameBattery(MM, P, S, M, W, LIB, (ok) => {
+        if (!ok) hits++;
+      }, true);
+    } catch (e) {
+      hits = hits || 1; // 改坏后直接抛异常也算判据抓住
+      void e;
+    }
+    if (hits > 0) {
+      red++;
+      c(true, `M${i + 1} ${mut.name} → 判据变红（${hits} 条）`);
+    } else {
+      c(false, `M${i + 1} ${mut.name} → 判据全绿（这条判据没有覆盖该分支）`);
+    }
+  }
+  return failed;
+}
+
 export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
   section("B6 残余（task-8）离线段：尾表姿势 / 片段排序 / 换图尺寸");
   let failed = 0;
@@ -2207,6 +2527,7 @@ export async function runResidOffline({ check, section, LIB = DEFAULT_LIB }) {
   const MODEL = await loadModelModule();
   const SM = await loadSceneMountModule();
   await residBattery(ME, MODEL, LIB, c, SM);
+  await runFrameReconcileOffline({ check: c, section, LIB });
 
   section(`变异红测（${RESID_MUTATIONS.length} 条：判据把实现改坏必须抓住）`);
   let red = 0;

@@ -749,7 +749,20 @@ check(
   const edRuntime = new Set();
   for (const em of editorTs.matchAll(/export\s+\{([^}]*)\}\s+from/g)) {
     for (const raw of em[1].split(",")) {
-      const name = raw.trim().split(/\s+as\s+/).pop()?.trim();
+      // 剥整行注释与拖尾逗号。注意不能只对单条 item 做 `//` 到行尾的截断：
+      // 一条 item 可能是「整行注释 + 下一行名字」的融合体（名字自己不带行注释），
+      // `//.*$` 会把融合体里的名字一起吃掉 ⇒ 该导出永远进不了 edRuntime，
+      // d.ts 侧被误报「未导出」（task-33 轮在 mdlClipTrack 上实际触发）。
+      const name = raw
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("//"))
+        .join("\n")
+        .trim()
+        .split(/\s+as\s+/)
+        .pop()
+        ?.trim()
+        .replace(/,+$/, "")
+        .trim();
       if (name) edRuntime.add(name);
     }
   }
