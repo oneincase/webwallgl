@@ -2047,6 +2047,11 @@ function extractWorkshopId(script) {
   return m ? m[1] : null
 }
 
+/** 对象脚本 thisLayer 与 thisScene.getLayer 共用的代理出口。
+ * 模块私有 Symbol，不进脚本可见面（Symbol 键不会被 for-in / Object.keys 列出）。
+ * 语义说明见 makeThisScene 末尾。 */
+const LAYER_PROXY_KEY = Symbol('we-scene.thisScene.layerProxy')
+
 /**
  * 对象脚本的 thisScene。getLayer 找不到仍回哑代理（语料不判空）。
  *
@@ -2055,6 +2060,9 @@ function extractWorkshopId(script) {
  *   getCameraTransforms / setCameraTransforms  1 张（3151551777 火车震动 zoom）
  *   getInitialLayerConfig + createLayer  3791163858 克隆音频条
  *   getAnimation(name)  3444535389 场景级命名动画（此前恒 null → .play TypeError）
+ *
+ * 2026-11-04：getLayerCount() / getLayer(数字下标)（2732362906 黑屏）；
+ * thisLayer 与 getLayer 同代理身份（同批）。
  *
  * 2026-09-04：createLayer('models/bar.json') 字符串路径 + __workshopId
  * （3789604238 等 7 张 Simple Visualizer；此前 typeof 非 object → 空层）
@@ -2086,13 +2094,34 @@ function makeThisScene(opts) {
     }
     return p
   }
-  return {
+  /** 活层列表（enumerate 顺序 = 脚本 getLayer 下标空间）。 */
+  const liveLayers = () => (typeof opts.enumerateSceneLayers === 'function' ? opts.enumerateSceneLayers() : [])
+  const thisScene = {
+    // [we-scene patch 2026-11-04] **getLayer 必须接受数字下标**。
+    // 作者脚本遍历层的标准写法是
+    //   `for (i = 0; i < thisScene.getLayerCount(); ++i) thisScene.getLayer(i).name …`
+    // （2732362906 的 visible 脚本靠它把「左/Big/Fix」层索引装进数组，再按索引
+    // 置 visible）。旧实现只有按名查 `getSceneLayer(String(name))`，数字被串成
+    // "0"/"1" 去撞名字，全部落哑代理 → 数组装满 undefined、`thisLayer ==
+    // getLayer(idx)` 恒 false → 三层 visible 全被脚本改成 false，整屏纯黑。
     getLayer(name) {
+      if (typeof name === 'number' && Number.isFinite(name)) {
+        // 与官方逆向实现同口径：下标取整（`order[Math.floor(n)]`），
+        // 越界 → undefined → 哑代理（官方对越界返回值无明文）。
+        const l = liveLayers()[Math.floor(name)]
+        return layerProxy(l && !l.destroyed ? l : null)
+      }
       if (opts.getSceneLayer) {
         const l = opts.getSceneLayer(String(name))
         if (l && !l.destroyed) return layerProxy(l)
       }
       return layerProxy(null)
+    },
+    // [we-scene patch 2026-11-04] 官方 IScene.getLayerCount()：本仓此前**完全没有**，
+    // 全库唯一作者写法的第一行就 TypeError → init 整个熔断（数组不建、层不显示）。
+    // 与 getLayer(数字) 共用同一份 liveLayers()，保证 0..count-1 与 getLayer 下标一致。
+    getLayerCount() {
+      return liveLayers().length
     },
     createLayer(cfg) {
       if (typeof opts.createSceneLayer !== 'function') return layerProxy(null)
@@ -2184,6 +2213,16 @@ function makeThisScene(opts) {
       return layer || null
     },
   }
+  // [we-scene patch 2026-11-04] 内部出口：对象脚本的 `thisLayer` 必须与
+  // `thisScene.getLayer(...)` 返回**同一个代理对象**。作者脚本用身份比较判定
+  // 「我是不是当前该显示的那层」——2732362906 的 visible 脚本末行就是
+  //   `value = (thisLayer == thisScene.getLayer(arrayIndexesLeftLayers[currentIndexLeft])) || …`
+  // 此前 thisLayer 由 evalObjectScript 直接 makeObjectLayerProxy() 新建、而 getLayer 走
+  // 本函数的 proxyCache，同一真实图层得到**两个不同对象** ⇒ 比较恒 false ⇒
+  // 三层 visible 全被脚本写成 false（整屏纯黑）。官方 getLayer 返回稳定对象、
+  // thisLayer 即其自身，这里把 thisLayer 也接到同一份缓存上，身份语义才对。
+  Object.defineProperty(thisScene, LAYER_PROXY_KEY, { value: layerProxy })
+  return thisScene
 }
 
 /**
@@ -2750,12 +2789,16 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
   // 让脚本逻辑跑完而不是崩掉（与 thisScene.createLayer 的既有降级策略一致）。
   const layerRef = opts.layer || null
   const workshopId = opts.workshopId != null ? opts.workshopId : extractWorkshopId(script)
-  const thisLayer = makeObjectLayerProxy(layerRef, opts)
   const thisScene = makeThisScene({
     ...opts,
     workshopId,
     getWorkshopId: () => workshopId,
   })
+  // [we-scene patch 2026-11-04] thisLayer 必须与 thisScene.getLayer(...) 同代理身份：
+  // 作者脚本用 `thisLayer == thisScene.getLayer(idx)` 判定「当前该显示的层」
+  // （2732362906 的 visible 脚本末行）。此前这里另起一个 makeObjectLayerProxy，
+  // 与 getLayer 的缓存代理是两个对象，`==` 恒 false ⇒ 层被脚本隐藏到整屏纯黑。
+  const thisLayer = thisScene[LAYER_PROXY_KEY](layerRef)
 
   let fns
   try {

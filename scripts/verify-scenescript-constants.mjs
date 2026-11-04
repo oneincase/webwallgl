@@ -364,6 +364,90 @@ ${ENTRY}`, {}, { shared });
   }
 }
 
+// ================================================================ §三·IScene 面（真跑对象沙箱）
+//
+// 2026-11-04 回归 2732362906「[Mitsu] Rem - Summer」黑屏（整帧纯黑、fps 照走、无 JS 报错）。
+// 该作者的 visible 脚本是全库通行的「层索引表」模板：
+//   for (var i = 0; i < thisScene.getLayerCount(); ++i) { … thisScene.getLayer(i).name … }
+//   …
+//   value = (thisLayer == thisScene.getLayer(arrayIndexesLeftLayers[currentIndexLeft]))
+// 官方 IScene（docs.wallpaperengine.io → Scene/SceneScript/reference/class/IScene）：
+//   getLayer(name: String|Number) —— "Get a layer by index or custom name."
+//   getLayerCount(): Number      —— "Get the total layer count."
+// 本仓此前三处缺口叠加 ⇒ 三层 visible 全被脚本写成 false ⇒ 纯黑：
+//   ① makeThisScene 没有 getLayerCount()（init 首行 TypeError，索引数组永远为空）
+//   ② getLayer 只按名查（数字实参被 String() 成 "0"，撞不到任何层名）
+//   ③ thisLayer 与 getLayer 返回**两个不同代理**对象 ⇒ `==` 身份比较恒 false
+// 下面的夹具逐字照抄该模板的结构（层名/分支换中性名），跑**真实** evalObjectScript。
+
+console.log("verify-scenescript-constants: IScene 层索引面（真跑对象沙箱）");
+
+{
+  const FIXTURE_NAMES = ["Base", "Alt", "Wide"];
+  const makeLayers = () => FIXTURE_NAMES.map((name, i) => ({
+    id: 10 + i, name, visibleSelf: i === 0, visible: i === 0, destroyed: false,
+    origin: [0, 0, 0], scale: [1, 1, 1], localOrigin: [0, 0, 0], localScale: [1, 1, 1],
+    localAngles: [0, 0, 0], angles: [0, 0, 0], size: [100, 100], alpha: 1, brightness: 1, effects: [],
+  }));
+  /** 在「第 layerIndex 层」上跑脚本，返回 { sb, shared, layers } */
+  const runOnLayer = (layerIndex, script) => {
+    const layers = makeLayers();
+    const shared = {};
+    const sb = wtext.evalObjectScript(script, null, {
+      layer: layers[layerIndex],
+      shared,
+      userProperties: {},
+      canvasSize: { width: 1920, height: 1080 },
+      screenResolution: { x: 1920, y: 1080 },
+      getSceneLayer: (n) => layers.find((l) => l.name === n) || null,
+      enumerateSceneLayers: () => layers.filter((l) => !l.destroyed),
+    });
+    // 宿主语义：沙箱建好后立刻 init(字段当前值)，再进逐帧 update
+    if (sb) sb.init(!!layers[layerIndex].visibleSelf);
+    return { sb, shared, layers };
+  };
+
+  // 模板脚本：init 建索引表，update 用身份比较判定「我是不是第 0 层」
+  const INDEX_SCRIPT = `
+var names = [];
+export function init(value) {
+  shared.count = thisScene.getLayerCount();
+  for (var i = 0; i < thisScene.getLayerCount(); ++i) names.push(thisScene.getLayer(i).name);
+  shared.names = names;
+  shared.byName = thisScene.getLayer("Alt") ? thisScene.getLayer("Alt").name : null;
+  shared.outOfRange = thisScene.getLayer(99).name;
+  shared.indexSelf = thisScene.getLayerIndex(thisLayer);
+  return value;
+}
+export function update(value) {
+  return thisLayer == thisScene.getLayer(0);
+}
+`;
+  const a = runOnLayer(0, INDEX_SCRIPT);
+  check(a.sb !== null, "IScene：对象脚本必须能进沙箱（evalObjectScript 返回非 null）");
+  check(a.sb && a.sb.errCount === 0,
+    `IScene：getLayerCount() / getLayer(数字下标) 不得抛错（errCount=${a.sb && a.sb.errCount}；官方明文支持数字下标）`);
+  check(a.shared.count === 3, `IScene：getLayerCount() 应等于活层数 3，实为 ${a.shared.count}`);
+  check(Array.isArray(a.shared.names) && a.shared.names.join(",") === FIXTURE_NAMES.join(","),
+    `IScene：getLayer(i) 必须按 enumerate 顺序返回第 i 层，实为 ${fmt(a.shared.names)}`);
+  check(a.shared.byName === "Alt", `IScene：getLayer(名字) 仍须按名命中，实为 ${fmt(a.shared.byName)}`);
+  check(a.shared.outOfRange === "", `IScene：getLayer(越界下标) 回哑代理（name 为空串），实为 ${fmt(a.shared.outOfRange)}`);
+  check(a.shared.indexSelf === 0, `IScene：getLayerIndex(thisLayer) 应为 0，实为 ${a.shared.indexSelf}`);
+  check(a.sb && a.sb.callUpdate(true) === true,
+    "IScene：thisLayer 必须与 getLayer(自身下标) 同一代理身份（`thisLayer == getLayer(0)` 为 true）——"
+    + "作者脚本靠这个身份比较决定层是否可见；返回两个不同代理会让整屏层被隐藏（2732362906 黑屏）");
+  // 反向对照：第 0 层的 thisLayer 不能等于第 1 层的代理（否则判据变成「恒真」而失去区分力）
+  const b = runOnLayer(1, INDEX_SCRIPT);
+  check(b.sb && b.sb.callUpdate(true) === false,
+    "IScene：第 1 层的 thisLayer 与 getLayer(0) 必须**不**同身份（身份比较要有区分力）");
+  // 名字版本的身份也必须一致（作者也写 `thisLayer == getLayer("名字")`）
+  const c = runOnLayer(1, `
+export function update(value) { return thisLayer == thisScene.getLayer("Alt"); }
+`);
+  check(c.sb && c.sb.callUpdate(true) === true,
+    "IScene：thisLayer 与 getLayer(名字) 必须同一代理身份（同代理缓存口径）");
+}
+
 // ================================================================ §四 缺口钉住
 
 console.log("verify-scenescript-constants: 已知缺口（现状钉住；补齐后请同步改本判据）");
