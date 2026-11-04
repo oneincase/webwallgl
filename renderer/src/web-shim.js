@@ -1970,5 +1970,112 @@
   } catch (_) {
     /* 无 addEventListener 的环境忽略 */
   }
+
+  /**
+   * 整页画布自适配（可缩放宿主；GitHub issue #16）。
+   *
+   * 大量 web 壁纸是「整页只有一个满屏 canvas」的 spine / WebGL 形态：作者在 init 里按
+   * **那一刻**的 window.innerWidth/innerHeight 写死 backing store，之后用
+   *   `if (canvas.width != canvas.clientWidth) { canvas.width = window.innerWidth; … }`
+   * 做 resize 判断。作者没写 CSS 尺寸时，浏览器拿属性尺寸当 CSS 尺寸 ⇒ clientWidth
+   * 恒等于 canvas.width ⇒ 这条判断**永远不成立**。WE 官方宿主的画布窗口固定为显示器
+   * 分辨率、从不改变，所以那边不出事（这正是它能上工坊的原因）；宿主一旦可缩放，
+   * 壁纸就停在加载那一刻的像素尺寸上：放大露底色、缩小被裁一截（这类页面普遍
+   * `body{overflow:hidden}`）。
+   *
+   * 修法：只给「整页唯一满屏画布」补一条**视口尺寸的样式** ⇒ 作者的 clientWidth 比较
+   * 重新有信息量，由作者自己的 resize 逻辑把 backing store 跟上窗口（分辨率真的更新，
+   * 不是拉伸）。**这里绝不改 canvas.width/height**：改 backing store 会重置 2D/WebGL
+   * 上下文状态，作者没重新 init 就会画错甚至黑屏。
+   *
+   * 命中面用三条收窄（宁可不修，不可误修）：
+   *   ① 整页只有一个 canvas —— 多画布时无从判断哪块是舞台；
+   *   ② 启动时 backing store 精确等于视口（±2px）—— 作者意图就是整页画布；
+   *   ③ 作者没有自己管 CSS 尺寸（clientWidth/clientHeight 与属性值相等）——
+   *      固定分辨率缩放舞台（1920×1080 画布 + CSS transform）这类天然出局。
+   * `display:block` 顺手消掉 canvas 作为行内元素在文档流里多出来的那几 px。
+   */
+  (function () {
+    try {
+      var doc = w.document;
+      if (!doc || typeof doc.getElementsByTagName !== "function") return;
+      var applied = false;
+      var observer = null;
+      var stopObserver = function () {
+        try {
+          if (observer) observer.disconnect();
+        } catch (_) {
+          /* 断开失败无关紧要 */
+        }
+        observer = null;
+      };
+      var fluidFix = function () {
+        try {
+          if (applied) return;
+          var list = doc.getElementsByTagName("canvas");
+          if (!list || list.length !== 1) return;
+          var c = list[0];
+          if (!c || !c.style || c.__weFluid) return;
+          // ② 启动时必须是整页画布：backing store 与视口一致（±2px）
+          if (!(c.width > 0 && c.height > 0)) return;
+          if (Math.abs(c.width - w.innerWidth) > 2 || Math.abs(c.height - w.innerHeight) > 2) return;
+          // ③ 作者自己写了 CSS 尺寸（缩放舞台 / 装饰画布）：不碰
+          if (Math.abs(c.clientWidth - c.width) > 2 || Math.abs(c.clientHeight - c.height) > 2) return;
+          c.__weFluid = 1;
+          // position:fixed 下 100% 的包含块就是视口 ⇒ 尺寸精确等于视口，且不受 body
+          // margin / 行盒影响（用 100vw/100vh 会把滚动条宽度算进去）。
+          c.style.position = "fixed";
+          c.style.left = "0";
+          c.style.top = "0";
+          c.style.width = "100%";
+          c.style.height = "100%";
+          c.style.display = "block";
+          applied = true;
+          stopObserver();
+        } catch (_) {
+          /* 判定失败不影响壁纸 */
+        }
+      };
+      var boot = function () {
+        fluidFix();
+        try {
+          w.addEventListener("resize", fluidFix, { passive: true });
+        } catch (_) {
+          /* 无 addEventListener 的环境忽略 */
+        }
+        try {
+          w.addEventListener("load", fluidFix, { once: true });
+        } catch (_) {
+          /* 同上 */
+        }
+        // 作者可能晚于 DOMContentLoaded 才建立画布 / 才写 size：补两次定时兜底
+        try {
+          w.setTimeout(fluidFix, 400);
+          w.setTimeout(fluidFix, 1600);
+        } catch (_) {
+          /* 同上 */
+        }
+        // 更晚建 canvas 的（异步加载的引擎）：MutationObserver 兜一次，命中即断开；
+        // 壁纸逐帧改 DOM 也只付一次 childList 早退的成本，3s 后无条件断开。
+        try {
+          var MO = w.MutationObserver;
+          if (MO && !applied) {
+            observer = new MO(fluidFix);
+            observer.observe(doc.documentElement || doc, { childList: true, subtree: true });
+            w.setTimeout(stopObserver, 3000);
+          }
+        } catch (_) {
+          /* 无 MutationObserver 的环境忽略 */
+        }
+      };
+      if (doc.readyState === "loading") {
+        doc.addEventListener("DOMContentLoaded", boot, { once: true });
+      } else {
+        boot();
+      }
+    } catch (_) {
+      /* 整段是增强：任何失败都不影响壁纸本身 */
+    }
+  })();
 })(window);
 

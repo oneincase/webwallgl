@@ -370,9 +370,20 @@ async function importIsolatedFn(srcText, fnName) {
  */
 function runShim(extras, opts) {
   const loadHandlers = [];
+  const winListeners = {};
+  // issue #16（整页画布自适配）需要的最小 DOM 面：视口尺寸、canvas 列表、窗口事件。
+  // 不给 opts 时全部退化成空 —— 既有用例行为不变。
+  const view = (opts && opts.viewport) || null;
+  const canvasesOf = (opts && typeof opts.canvases === "function" && opts.canvases) || null;
   const win = {
     URL,
     location: { href: "http://localhost:1430/", protocol: "http:" },
+    innerWidth: view ? view.w : 0,
+    innerHeight: view ? view.h : 0,
+    addEventListener(type, fn) {
+      (winListeners[type] || (winListeners[type] = [])).push(fn);
+    },
+    MutationObserver: (opts && opts.MutationObserver) || undefined,
     document: {
       readyState: "complete",
       addEventListener(_type, fn) {
@@ -386,6 +397,9 @@ function runShim(extras, opts) {
       },
       querySelectorAll() {
         return [];
+      },
+      getElementsByTagName(tag) {
+        return canvasesOf && tag === "canvas" ? canvasesOf() : [];
       },
     },
     parent: { postMessage() {} },
@@ -450,7 +464,17 @@ function runShim(extras, opts) {
     `, ctx);
   }
   vm.runInContext(shimSrc, ctx);
-  return { win, loadHandlers, ctx, evalIn: (code) => vm.runInContext(code, ctx) };
+  /** 派发窗口事件（issue #16 的 resize 路径用；未注册的类型天然是空操作）。 */
+  const fire = (type) => {
+    for (const fn of winListeners[type] || []) {
+      try {
+        fn({ type });
+      } catch {
+        /* 使用者（shim）自己兜底，测试不因单点抛错中断 */
+      }
+    }
+  };
+  return { win, loadHandlers, ctx, fire, evalIn: (code) => vm.runInContext(code, ctx) };
 }
 
 {
@@ -2078,6 +2102,98 @@ function runShim(extras, opts) {
       seen.indexOf("mouseover") >= 0 && seen.indexOf("mouseover") < seen.indexOf("wheel"),
       `命中元素首次进入时应先补 over/enter 再发 wheel，实得 ${seen.join(",")}`,
     );
+  }
+}
+
+// ---------- 3e. 整页画布自适配（issue #16）----------
+//
+// 现象：web 壁纸「整页只有一个满屏 canvas」（spine / WebGL 形态）在**可缩放宿主**里
+// 拉伸窗口后仍停在加载那一刻的像素尺寸（放大露底色 / 缩小被裁一截）。
+// 根因是作者脚本的自指判断：
+//   canvas.width = window.innerWidth;                     // init 里量一次
+//   if (canvas.width != canvas.clientWidth) { …重新量… }  // 作者没写 CSS ⇒ 两者恒等 ⇒ 恒不成立
+// WE 官方宿主的画布窗口固定为显示器分辨率、从不改变，所以在那边不出事；可缩放宿主一拉伸就显形。
+// 修法在 shim：只给「整页唯一满屏画布」补视口尺寸样式 ⇒ 作者这条比较重新有信息量；
+// **不改 backing store**（改 width 会重置 2D/WebGL 上下文状态，作者不重新 init 就画错/黑屏）。
+// 命中面用三条收窄（宁可不修，不可误修）：唯一 canvas、backing==视口(±2)、作者没写 CSS 尺寸。
+{
+  const runFluidCase = (build) => {
+    const viewport = { w: 900, h: 700 };
+    // 浏览器语义的假 canvas：作者写了 CSS 尺寸就按 CSS，否则退回属性尺寸（缺陷成因）。
+    const mk = (w, h, cssFixed) => {
+      const c = { width: w, height: h, style: {}, __weFluid: undefined };
+      Object.defineProperty(c, "clientWidth", {
+        get() {
+          if (cssFixed) return cssFixed.w;
+          return c.style.width ? viewport.w : c.width;
+        },
+      });
+      Object.defineProperty(c, "clientHeight", {
+        get() {
+          if (cssFixed) return cssFixed.h;
+          return c.style.height ? viewport.h : c.height;
+        },
+      });
+      return c;
+    };
+    const canvases = build(mk, viewport);
+    const { win, fire } = runShim({}, { viewport, canvases: () => canvases });
+    return { viewport, canvases, win, fire };
+  };
+
+  // A. 正例：整页唯一满屏画布 → 必须接管，且**只动样式**
+  {
+    const A = runFluidCase((mk) => [mk(900, 700)]);
+    const c = A.canvases[0];
+    check(c.__weFluid === 1,
+      "issue #16：整页唯一满屏画布必须被 shim 接管（否则可缩放宿主里它永远停在加载时的像素尺寸）");
+    check(
+      c.style.position === "fixed" && c.style.left === "0" && c.style.top === "0" &&
+        c.style.width === "100%" && c.style.height === "100%" && c.style.display === "block",
+      `issue #16：接管后必须补视口尺寸样式（position:fixed + 100%/100% + display:block），实为 ${JSON.stringify(c.style)}`,
+    );
+    check(c.width === 900 && c.height === 700,
+      "issue #16：shim **不得**改 backing store —— 改 width 会重置 2D/WebGL 上下文，作者不重新 init 就画错/黑屏");
+    // 作者自指判断重新有信息量：视口变大后 clientWidth(已成视口) ≠ canvas.width(旧 backing)
+    A.viewport.w = 1200;
+    A.viewport.h = 800;
+    A.fire("resize");
+    check(c.clientWidth === 1200 && c.clientHeight === 800 && c.width === 900,
+      `issue #16：接管后换视口必须让 clientWidth 跟到 1200、而 backing 仍是 900（作者的 resize 判断据此成立），`
+        + `实为 client ${c.clientWidth}x${c.clientHeight} / backing ${c.width}x${c.height}`);
+  }
+
+  // B. 反例①：多画布 —— 无从判断哪块是舞台，不得接管
+  {
+    const B = runFluidCase((mk) => [mk(900, 700), mk(100, 100)]);
+    check(B.canvases.every((c) => !c.__weFluid), "issue #16：多画布时不得猜测哪块是舞台（必须全部不接管）");
+    check(B.canvases.every((c) => !c.style.width), "issue #16：多画布时不得写任何画布样式");
+  }
+
+  // C. 反例②：固定分辨率缩放舞台（backing 1920×1080 + CSS transform，视口 900×700）—— 不得接管
+  {
+    const C = runFluidCase((mk) => [mk(1920, 1080, { w: 960, h: 540 })]);
+    const c = C.canvases[0];
+    check(!c.__weFluid, "issue #16：backing store 不等于视口的固定分辨率舞台不得接管（命中面必须收窄）");
+    check(!c.style.width && !c.style.position, "issue #16：固定分辨率舞台的样式不得被改写");
+  }
+
+  // D. 反例③：作者自己写了 CSS 尺寸（backing==视口但 CSS 只有一半）—— 不得接管
+  {
+    const D = runFluidCase((mk) => [mk(900, 700, { w: 450, h: 350 })]);
+    const c = D.canvases[0];
+    check(!c.__weFluid, "issue #16：作者自管 CSS 尺寸（clientWidth≠width）时不得接管");
+    check(!c.style.width, "issue #16：作者自管 CSS 尺寸时不得覆盖其样式");
+  }
+
+  // E. 源码级：补丁段不得出现写 backing store 的赋值（防以后「顺手」加回来）
+  {
+    const start = shimSrc.indexOf("整页画布自适配");
+    const end = shimSrc.lastIndexOf("})(window);");
+    const fluidBlock = start >= 0 && end > start ? shimSrc.slice(start, end) : "";
+    check(fluidBlock.length > 500, "web-shim.js 必须含「整页画布自适配」补丁段（issue #16）");
+    check(!/\bc\.width\s*=/.test(fluidBlock) && !/\bc\.height\s*=/.test(fluidBlock),
+      "整页画布自适配段不得写 canvas.width/height（只补 CSS 尺寸，backing store 交给作者自己的 resize）");
   }
 }
 
