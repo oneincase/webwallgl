@@ -153,6 +153,7 @@ const ENGINE_COMPONENTS: Record<ParticleComponentKind, readonly string[]> = {
     "velocityrandom",
     "rotationrandom",
     "angularvelocityrandom",
+    "turbulentvelocityrandom",
     "mapsequencearoundcontrolpoint",
     "mapsequencebetweencontrolpoints",
   ],

@@ -204,21 +204,19 @@ console.log("\n[7] 纯函数行为（裸 node 动态导入，真跑一遍）");
   check(particles.ropeParticleV({ age: 0.5, life: 1 }) === 0.5, "ropeParticleV = age / life");
 }
 
-console.log("\n[8] 初始化器分派表：钉住当前已知状态（标签被「插块」吃掉 ⇒ 体不可达）");
+console.log("\n[8] 初始化器分派表：turbulentvelocityrandom case 标签已补回（task-29，2026-10-16）");
 {
   const raw = readP("particles.js");
-  // 本段是「故意反向」的：本仓目前确实缺这个 case 标签（d9814df 插块吞掉），
-  // 而补回标签属行为变更，已另有书面决定「另立一项」，不在本 wave 范围。
-  // 所以这里钉住现状；谁补回标签，本段 3 项会一起变红 —— 那时请同批更新：
-  // editor/particle-params.ts 的 engineUnsupported、editor/i18n.ts 文案、
-  // scripts/verify-editor.mjs 的两处断言、docs/re/we-native-particle-constants.md §2.1。
+  // 2026-10-16 修复（task-29）：标签曾于 d9814df 被「插块」吞掉（体落在裸 break 之后不可达），
+  // 本段此前反向钉住该缺陷；本轮已补回标签，翻成正向钉住。
+  // 行为证据：docs/re/we-native-particle-constants.md §2.1（缺省 scale 0.1）。
   check(
-    count(raw, /case 'turbulentvelocityrandom':/g) === 0,
-    "turbulentvelocityrandom 的 case 标签当前应为缺失（已确证缺陷，本轮不修）；若已补回，请同批更新上面列出的四处",
+    count(raw, /case 'turbulentvelocityrandom':/g) === 1,
+    "turbulentvelocityrandom 的 case 标签应恰好 1 处（task-29 已补回）",
   );
   check(
-    /break\s*\n\s*\/\/[^\n]*\n\s*this\.init\.turbulentVelocity = \{/.test(raw),
-    "该初始化器体当前紧跟在裸 break（+注释）之后 ⇒ 无 case 标签、整块不可达（状态本身要被钉住，避免被无声改掉）",
+    /case 'turbulentvelocityrandom':\s*\n(?:\s*\/\/[^\n]*\n)*\s*this\.init\.turbulentVelocity = \{/.test(raw),
+    "该初始化器体应紧跟 case 标签（+ task-29 注释）之后 ⇒ 可达",
   );
   // 通用不变量：独占一行的 `break` 之后、下一个 case/default/} 之前，不允许再出现代码行。
   const lines = raw.split("\n");
@@ -232,8 +230,8 @@ console.log("\n[8] 初始化器分派表：钉住当前已知状态（标签被�
     if (t.trim() && !/^\s*(case\s|default\s*:|\})/.test(t)) dead.push(`${j + 1}: ${t.trim().slice(0, 60)}`);
   }
   check(
-    dead.length === 1 && /^693: this\.init\.turbulentVelocity = \{/.test(dead[0]),
-    `全文不可达语句当前应恰好 1 处（应为 693: this.init.turbulentVelocity = {，实得 ${dead.length} 处${dead.length ? "：" + dead.slice(0, 3).join(" | ") : ""}）`,
+    dead.length === 0,
+    `全文不可达语句应为 0 处（实得 ${dead.length} 处${dead.length ? "：" + dead.slice(0, 3).join(" | ") : ""}）`,
   );
 }
 
@@ -252,8 +250,8 @@ console.log("\n[9] 构造期端到端（真建一个 ParticleSystem，不需要 
   check(mk({ flags: 1 }).worldSpace === true, "flags bit0(1) → 世界空间");
   const turb = mk({ maxcount: 5, emitter: [{ name: "boxrandom", rate: 10 }], initializer: [{ name: "turbulentvelocityrandom", scale: 0.3 }] });
   check(
-    turb.init.turbulentVelocity === null,
-    "已知缺陷的端到端表现：case 标签缺失 ⇒ 该初始化器整块死代码 ⇒ 这里应为 null（补回标签后本断言会变红，见段 [8] 注释）",
+    turb.init.turbulentVelocity !== null && turb.init.turbulentVelocity.scale === 0.3,
+    "task-29 修复后：turbulentvelocityrandom 初始化器可达，scale 0.3 透传（构造期端到端）",
   );
   check(
     /this\.init\.turbulentVelocity = \{[^}]*scale: num\(z\.scale, 0\.1\)/.test(readP("particles.js")),
@@ -332,8 +330,8 @@ async function ppSuite(P) {
   );
   offEmpty();
   check(
-    specStatus("initializer", "turbulentvelocityrandom") === "unsupported" && specStatus("emitter", "boxrandom") === "ok" && P.particleSpec("controlpoint", "") !== null,
-    "三态回归：engineUnsupported=unsupported / 静态表命中=ok / controlpoint 恒有 spec",
+    specStatus("initializer", "turbulentvelocityrandom") === "ok" && specStatus("emitter", "boxrandom") === "ok" && P.particleSpec("controlpoint", "") !== null,
+    "状态回归（task-29 后）：已登记组件=ok（turbulentvelocityrandom 不再 unsupported）/ 静态表命中=ok / controlpoint 恒有 spec",
   );
   off();
   check(P.particleSpec("operator", "positionoffsetrandom") === null && specStatus("operator", "positionoffsetrandom") === "noPanel",

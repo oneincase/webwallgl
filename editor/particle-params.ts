@@ -17,11 +17,10 @@
 // 面板按「未识别键」只读列出并逐字节保留，不会给出一个动了也没用的滑条。
 //
 // 「引擎未生效」的诊断标注两处，都只标注不修：
-//   * `turbulentvelocityrandom` 初始化器：render/particles.js 的初始化器 switch 里**没有
-//     `case` 标签** —— 给 `this.init.turbulentVelocity` 赋值的那段代码落在上一个 case 的
-//     `break` 之后，是不可达的死代码，所以它从来没生效过；而 renderer/vendor/we-scene/README.md
-//     把它列为已支持。计划 §5 要求 M2 只做面板标注（修引擎会改变既有壁纸观感，另立一项）。
 //   * `maintaindistancetocontrolpoint` 算子：引擎里没有对应分支（库内 1 处），按未知组件标注。
+//     （`turbulentvelocityrandom` 曾同列于此 —— render/particles.js 的初始化器 switch 缺
+//     `case` 标签、整块死代码；task-29 已于 2026-10-16 补回标签，该组件升为正常支持，
+//     spec 的 engineUnsupported 同批移除。）
 //
 // 计划 §5 还说 `positionoffsetrandom` 初始化器（库内 1 处）低于 5% 门槛，只做被动透传、
 // 不做专属面板 —— 故它不在这张表里，落到 `noPanel`（引擎认识但本版没有控件）。
@@ -169,10 +168,10 @@ export const PARTICLE_SPECS: readonly ParticleComponentSpec[] = [
     fields: [int("count", { min: 1, max: 4096 }), num("arcamount", R_RATIO), en("limitbehavior", ["", "repeat", "mirror"]), int("flags", R_FLAGS)],
   },
   {
-    // 引擎未生效的初始化器：字段照登记（只读展示 + 诊断），标 engineUnsupported
+    // task-29（2026-10-16）修复后引擎已支持；字段照登记（面板可编辑）。历史上曾标
+    // engineUnsupported —— 引擎侧 case 标签缺失时整块死代码，现标签已补回。
     kind: "initializer",
     name: "turbulentvelocityrandom",
-    engineUnsupported: true,
     fields: [
       num("scale", R_SCALE),
       num("offset"),

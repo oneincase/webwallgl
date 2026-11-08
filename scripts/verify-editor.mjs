@@ -9077,7 +9077,7 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
         json([
           "emitter:boxrandom:ok",
           "initializer:lifetimerandom:ok",
-          "initializer:turbulentvelocityrandom:unsupported",
+          "initializer:turbulentvelocityrandom:ok",
           "initializer:FutureThing:unknown",
           "initializer:positionoffsetrandom:unknown",
           "operator:movement:ok",
@@ -9090,8 +9090,8 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     );
     const issues = f.particleIssues(file);
     is(
-      issues.some((i) => i.kind === "unsupported" && i.name === "turbulentvelocityrandom" && i.group === "initializer"),
-      "诊断标注：turbulentvelocityrandom 标为「引擎未生效」（面板据此出提示文案）",
+      !issues.some((i) => i.kind === "unsupported" && i.name === "turbulentvelocityrandom" && i.group === "initializer"),
+      "task-29 后：turbulentvelocityrandom 不再标「引擎未生效」（case 标签已补回，引擎侧可达）",
     );
     is(
       json(issues.filter((i) => i.kind === "unknown").map((i) => i.name)) === json(["FutureThing", "positionoffsetrandom", "maintaindistancetocontrolpoint"]),
@@ -9135,7 +9135,7 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     restored.operator[0].drag = 2.5;
     is(json(restored) === snap, "逐字节：把那一处改回原值后整串完全相同（只有它变了）");
     is(file.emitter[0].FutureEmitter === 3 && file.FutureTop === 7, "未知键（组件内 / 顶层）逐字节不动");
-    is(file.initializer[1].scale === 0.1 && file.initializer[1].forward === "1 0 0" && file.initializer[2].foo === 1, "引擎未生效组件与未知组件的字段原样保留");
+    is(file.initializer[1].scale === 0.1 && file.initializer[1].forward === "1 0 0" && file.initializer[2].foo === 1, "turbulentvelocityrandom（task-29 修复后为普通支持组件）与未知组件的字段原样保留");
     is(file.operator[2].variablestrength === 1, "引擎不认识名字的组件原样保留");
 
     // ---- 5. maxcount / starttime 钳位（与引擎同口径）----
@@ -9184,7 +9184,11 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     const fresh = pvFile();
     const freshSnap = json(fresh);
     is(f.setParticleField(fresh, "particle.nope", 1) === false, "顶层未声明的键拒绝");
-    is(f.setParticleField(fresh, "initializer[1].scale", 9) === false, "引擎未生效的组件拒绝写（只标注不修）");
+    // task-29（2026-10-16）：turbulentvelocityrandom 已修（case 标签补回），升为可写 ok 组件，
+    // 改用正例钉「scale 写回」（在独立副本上做，不影响下面拒绝路径的逐字节快照）；
+    // 拒绝写路径改由未知组件（initializer[2]）承担。
+    const tvOk = JSON.parse(json(fresh));
+    is(f.setParticleField(tvOk, "initializer[1].scale", 9) === true && tvOk.initializer[1].scale === 9, "task-29 后：turbulentvelocityrandom.scale 可写回（此前引擎未生效拒绝写）");
     is(f.setParticleField(fresh, "initializer[2].foo", 9) === false, "未知组件拒绝写");
     is(f.setParticleField(fresh, "operator[2].variablestrength", 9) === false, "引擎不认识名字的组件拒绝写");
     is(
@@ -9311,7 +9315,9 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     const missingPv = pvKeys.filter((k) => (i18nSrc2.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
     check(missingPv.length === 0, `粒子 v2 文案中英文都有（缺 ${json(missingPv)}）`);
     check(/引擎未生效/.test(i18nSrc2) && /Not effective in the engine/.test(i18nSrc2), "「引擎未生效」诊断文案中英双写");
-    check(/turbulentvelocityrandom/.test(i18nSrc2), "诊断文案点名 turbulentvelocityrandom（面板上看得见是哪个组件）");
+    // task-29（2026-10-16）：turbulentvelocityrandom 已修，hint 文案改为不点名的通用表述；
+    // 此处改钉通用 statusUnsupported 文案仍然中英双写、且旧点名文案确已移除。
+    check(/pt\.unsupportedHint/.test(i18nSrc2) && !/turbulentvelocityrandom 在引擎里缺 case 标签/.test(i18nSrc2), "unsupported hint 文案存在且不再点名已修复的 turbulentvelocityrandom");
   }
 
   // ---- 变异红测：判据咬得住吗 ----
@@ -9332,8 +9338,11 @@ section("PARTICLE-V2. 粒子系统编辑器 v2：分组参数读写 / 未知组�
     check(/只列文件里真有的字段/.test(particleV2Corpus(m4, psLive).join(" / ")), "视图不再只列真有的字段时「缺失字段不出控件」判据变红");
     const m5 = await pvMut('      return use.map(fmt).join(" ");', "      return use;", "vec 按原件形态回写");
     check(/空格分隔字符串/.test(particleV2Corpus(m5, psLive).join(" / ")), "vec 不再回写成字符串形态时「与语料同形」判据变红");
-    const m6 = await pvMut('  if (spec?.engineUnsupported) return "unsupported";', '  if (spec?.engineUnsupported) return "ok";', "引擎未生效的诊断标注");
-    check(/诊断标注|五族组件与状态/.test(particleV2Corpus(m6, psLive).join(" / ")), "抹掉「引擎未生效」状态时诊断标注判据变红");
+    // task-29（2026-10-16）：engineUnsupported 标记已随修复从静态表移除（机制保留），
+    // 变异改为：给静态 spec 注入 engineUnsupported:true，断言 particleIssues 立刻点名该组件 ——
+    // 判据方向翻过来后仍能咬住「标注机制没被拆掉」。
+    const m6 = await pvMut('    name: "turbulentvelocityrandom",', '    name: "turbulentvelocityrandom",\n    engineUnsupported: true,', "引擎未生效的诊断标注");
+    check(/五族组件与状态/.test(particleV2Corpus(m6, psLive).join(" / ")), "静态 spec 注入 engineUnsupported 时「五族组件与状态」判据变红（标注机制仍被咬住）");
     // 引擎侧：applyModel 每次都重建池 → 「不闪」判据红
     const psMut = psSrc.replace("    if (nextMax !== prevMax) this.reapplyOverride()", "    this.reapplyOverride()");
   // TEXT-ONLY-BY-DESIGN（变异锚点守卫：盯的就是源码文本，不能吃预处理文本）

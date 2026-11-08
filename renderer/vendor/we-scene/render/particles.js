@@ -689,7 +689,11 @@ export class ParticleSystem {
           }
           this._mapBetweenSeq = 0
           break
-          // 用噪声场给初速度方向（雪/雾的自然扩散感来源）
+        case 'turbulentvelocityrandom':
+          // 用噪声场给初速度方向（雪/雾的自然扩散感来源）。
+          // [we-scene patch] task-29：标签曾被 d9814df 插块吞掉（体落在 break 之后不可达，
+          // 全语料 176 个引用静默失效），2026-10-16 补回。行为证据见
+          // docs/re/we-native-particle-constants.md §2.1（缺省 scale 0.1）。
           this.init.turbulentVelocity = {
             scale: num(z.scale, 0.1),
             offset: num(z.offset, 0),
