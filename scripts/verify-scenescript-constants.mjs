@@ -448,6 +448,184 @@ export function update(value) { return thisLayer == thisScene.getLayer("Alt"); }
     "IScene：thisLayer 与 getLayer(名字) 必须同一代理身份（同代理缓存口径）");
 }
 
+// ================================================================ §三·IScene 按名未命中（issue #19）
+//
+// 3819697503（CSAV 脚本）的 init 用「变量守卫」枚举子层：
+//   while (true) { let child = thisScene.getLayer("EX_HRT_" + i); if (child) {…i++} else break }
+// 旧实现按名未命中返回真值代理 ⇒ 永不 break，每轮 push 一个 point，renderer 内存
+// 897→2607MB 后崩溃。修复不能简单 return null：本机 426 目录 / 109 张含 getLayer
+// 壁纸实测，无条件 null 会让 7 张壁纸新报 TypeError（2902406982 的灯亮度拖拽直接失效）。
+// 因此语义分两层：条件型脚本 null；存量「直接写不存在图层」脚本仍拿哑代理 + 运行期
+// 连续未命中预算锁存。下面的判据把两层都钉住，并防止把链式访问误判成条件。
+console.log("verify-scenescript-constants: IScene 按名未命中（枚举终止 / 守卫 / 兼容写入）");
+
+{
+  const FIXTURE_NAMES = ["Base", "EX_HRT_1", "EX_HRT_2", "EX_HRT_3", "Bar2"];
+  const makeLayers = () => FIXTURE_NAMES.map((name, i) => ({
+    id: 30 + i, name, visibleSelf: true, visible: true, destroyed: false,
+    origin: [0, 0, 0], scale: [1, 1, 1], localOrigin: [0, 0, 0], localScale: [1, 1, 1],
+    localAngles: [0, 0, 0], angles: [0, 0, 0], size: [100, 100], alpha: 1, brightness: 1, effects: [],
+  }));
+  const runObj = (script) => {
+    const layers = makeLayers();
+    const shared = {};
+    const sb = wtext.evalObjectScript(script, null, {
+      layer: layers[0],
+      shared,
+      userProperties: {},
+      canvasSize: { width: 1920, height: 1080 },
+      screenResolution: { x: 1920, y: 1080 },
+      getSceneLayer: (n) => layers.find((l) => l.name === n) || null,
+      enumerateSceneLayers: () => layers.filter((l) => !l.destroyed),
+    });
+    if (sb) sb.init(true);
+    return { sb, shared, layers };
+  };
+
+  // 1) 真实 CSAV 形态：变量守卫的 while(true) 枚举，首个未命中必须 break。
+  const csav = runObj(`
+function countChildren() {
+  let i = 1;
+  let n = 0;
+  let guard = 0;
+  while (true) {
+    if (++guard > 1000) break;
+    let child = thisScene.getLayer("EX_HRT_" + i);
+    if (child) { n++; i++; } else { break; }
+  }
+  return n;
+}
+export function init() { shared.loopCount = countChildren(); }
+`);
+  check(csav.sb && csav.sb.errCount === 0,
+    `IScene：3819697503 的变量守卫枚举不得报错（errCount=${csav.sb && csav.sb.errCount}）`);
+  check(csav.shared.loopCount === 3,
+    `IScene：变量守卫 while(true) 必须在首个未命中处终止（实跑 ${fmt(csav.shared.loopCount)} 次，应为 3）`);
+
+  // 2) 直接 while 条件（含带上限，旧实现跑满上限会变红而不是挂死判据）
+  const direct = runObj(`
+export function init() {
+  var i = 1, n = 0;
+  while (i <= 1000 && thisScene.getLayer("EX_HRT_" + i)) { n++; i++; }
+  shared.loopCount = n;
+}
+`);
+  check(direct.sb && direct.sb.errCount === 0 && direct.shared.loopCount === 3,
+    `IScene：while(getLayer(...)) 必须在首个未命中处终止（实为 ${fmt(direct.shared.loopCount)}，应为 3）`);
+
+  // 3) for 条件 + thisScene['getLayer'] 混淆写法：静态判定也要覆盖。
+  const bracket = runObj(`
+export function init() {
+  var n = 0;
+  for (var i = 1; i <= 1000 && thisScene['getLayer']("EX_HRT_" + i); i++) n++;
+  shared.loopCount = n;
+}
+`);
+  check(bracket.sb && bracket.sb.errCount === 0 && bracket.shared.loopCount === 3,
+    `IScene：for(;getLayer(...);) 与 thisScene['getLayer'] 枚举必须终止（实为 ${fmt(bracket.shared.loopCount)}，应为 3）`);
+
+  // 4) 纯条件守卫：未命中必须为假。
+  const guard = runObj(`
+export function init() {
+  if (thisScene.getLayer("NOPE")) shared.hit = true; else shared.miss = true;
+}
+`);
+  check(guard.shared.miss === true && guard.shared.hit !== true,
+    "IScene：if(getLayer(未命中)) 必须为假（旧实现真值代理会误走命中分支）");
+
+  // 5) 存量兼容：不判空直接写不存在的层仍是静默 no-op（CASEBOOK:1096 契约）。
+  const write = runObj(`
+export function update() {
+  thisScene.getLayer("NOPE").visible = false;
+  shared.ok = true;
+}
+`);
+  write.sb && write.sb.callUpdate(true);
+  check(write.sb && write.sb.errCount === 0 && write.shared.ok === true,
+    `IScene：getLayer(未命中).visible 必须仍静默 no-op（errCount=${write.sb && write.sb.errCount}）`);
+
+  // 6) 数字名假阳性回归：Bar1 不存在、Bar2 存在时，直接写 Bar1 仍必须 no-op
+  //    （防止把「数字后缀 + 同前缀活层」的枚举启发式重新引入本仓）。
+  const numericWrite = runObj(`
+export function update() {
+  thisScene.getLayer("Bar1").visible = false;
+  shared.ok = true;
+}
+`);
+  numericWrite.sb && numericWrite.sb.callUpdate(true);
+  check(numericWrite.sb && numericWrite.sb.errCount === 0 && numericWrite.shared.ok === true,
+    `IScene：数字名 Bar1 缺失而 Bar2 存活时，直接写仍必须 no-op（不得当成枚举终点）`);
+
+  // 7) 链式访问在条件里也不能被误判为「条件型脚本」：getLayer("NOPE").visible 应走
+  //    哑代理（false），不能 TypeError。严格判定只认「结果本身」作条件。
+  const chained = runObj(`
+export function init() {
+  if (thisScene.getLayer("NOPE").visible) shared.hit = true; else shared.miss = true;
+}
+`);
+  check(chained.sb && chained.sb.errCount === 0 && chained.shared.miss === true,
+    "IScene：条件里的链式 getLayer(...).visible 不得 TypeError（链式访问仍走哑代理）");
+
+  // 8) 注释/字符串里的“枚举示例”不得把存量脚本误判成严格模式。
+  const comment = runObj(`
+export function update() {
+  /* while (thisScene.getLayer("NOPE")) { } */
+  thisScene.getLayer("NOPE").visible = false;
+  shared.ok = true;
+}
+`);
+  comment.sb && comment.sb.callUpdate(true);
+  check(comment.sb && comment.sb.errCount === 0 && comment.shared.ok === true,
+    "IScene：注释里的 getLayer 枚举示例不得改变脚本形态判定");
+
+  // 9) 静态判定漏掉的动态键枚举：连续未命中预算 64 后必须终止并锁存；
+  //    第二次入口首轮即 null（否则每帧再写 64 次，内存只是增长变慢）。
+  //    预算值只钉「有界 + 锁存」，不钉具体常数（改预算时本判据不应假红）。
+  const budget = runObj(`
+function countMissing() {
+  var n = 0;
+  while (n < 10000) {
+    var fn = thisScene[String.fromCharCode(103, 101, 116, 76, 97, 121, 101, 114)];
+    var child = fn.call(thisScene, "EX_MISS_" + (n + 1));
+    if (child) { n++; } else { break; }
+  }
+  return n;
+}
+export function init() { shared.first = countMissing(); }
+export function update() { shared.second = countMissing(); }
+`);
+  budget.sb && budget.sb.callUpdate(true);
+  check(budget.sb && budget.sb.errCount === 0,
+    `IScene：动态键枚举的预算兜底不得报错（errCount=${budget.sb && budget.sb.errCount}）`);
+  check(typeof budget.shared.first === "number" && budget.shared.first >= 16 && budget.shared.first <= 256,
+    `IScene：动态键枚举必须在有界预算内终止（实跑 ${fmt(budget.shared.first)} 次，应在 16..256）`);
+  check(budget.shared.second === 0,
+    `IScene：预算触发后必须锁存（第二次入口应 0 次未命中，实为 ${fmt(budget.shared.second)}）`);
+
+  // 10) 数字下标越界仍是哑代理（issue #19 明确要求不动；名字命中语义见上）。
+  const index = runObj(`
+export function init() {
+  shared.outOfRange = thisScene.getLayer(99).name;
+  shared.byName = thisScene.getLayer("Base").name;
+}
+`);
+  check(index.shared.outOfRange === "" && index.shared.byName === "Base",
+    `IScene：数字越界仍回哑代理（name 应为空串，实为 ${fmt(index.shared.outOfRange)}；按名命中仍须返回真实层）`);
+
+  // 11) 链式访问型脚本即使连续未命中超过预算，也不得切 null（否则 null.prop TypeError）。
+  //     2983846453 的混淆 visible 脚本在离线「只给脚本、不给图层表」夹具里 init 实测 108 次
+  //     未命中；预算若按 64 就把它打爆（verify-text 的真实回归）。这里用 300 次钉住
+  //     「链式访问 → budgetEnabled=false」。
+  const chainedMany = runObj(`
+export function init() {
+  for (var i = 0; i < 300; i++) thisScene.getLayer("CHAIN_MISS_" + i).origin.x = 0;
+  shared.ok = true;
+}
+`);
+  check(chainedMany.sb && chainedMany.sb.errCount === 0 && chainedMany.shared.ok === true,
+    `IScene：链式访问型脚本连续 300 次未命中也不得 TypeError（errCount=${chainedMany.sb && chainedMany.sb.errCount}）`);
+}
+
 // ================================================================ §四 缺口钉住
 
 console.log("verify-scenescript-constants: 已知缺口（现状钉住；补齐后请同步改本判据）");

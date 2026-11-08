@@ -2052,6 +2052,15 @@ function extractWorkshopId(script) {
  * 语义说明见 makeThisScene 末尾。 */
 const LAYER_PROXY_KEY = Symbol('we-scene.thisScene.layerProxy')
 
+/** [issue #19] 按名未命中的运行期兜底预算 / 入口重置出口。
+ * 模块私有 Symbol，不进脚本可见面；evalObjectScript 用它把「本入口内连续未命中」
+ * 计数清零，但**不清** runaway 锁存（见 makeThisScene 的 getLayerState 注释）。 */
+const GETLAYER_MISS_STATE_KEY = Symbol('we-scene.thisScene.getLayerMissState')
+/** 同一入口内连续按名未命中的上限。本机 426 目录 / 109 张含 getLayer 壁纸实测
+ * 单入口最大连续未命中 = 27（3302695207 的 27 个天气层探测），64 留足余量；
+ * 超过即视为失控枚举，开始返回 null 并锁存（否则每帧再跑 64 次，内存只是增长变慢）。 */
+const GETLAYER_MISS_BUDGET = 64
+
 /**
  * 对象脚本的 thisScene。getLayer 找不到仍回哑代理（语料不判空）。
  *
@@ -2096,6 +2105,23 @@ function makeThisScene(opts) {
   }
   /** 活层列表（enumerate 顺序 = 脚本 getLayer 下标空间）。 */
   const liveLayers = () => (typeof opts.enumerateSceneLayers === 'function' ? opts.enumerateSceneLayers() : [])
+  // [issue #19] 按名未命中语义：默认哑代理（存量兼容），但两类情况返回 null：
+  //   ① strictNameMiss —— 脚本自己把 getLayer 结果用于条件/真值（while 枚举、if(layer)
+  //      守卫、变量赋值后 if(child)），这类脚本期望 null 语义；否则 while(getLayer(...))
+  //      永远为真（3819697503 的 CSAV 脚本，renderer 内存 897→2607MB 后崩溃）。
+  //   ② runaway 兜底 —— 静态判定漏掉/混淆的动态键枚举，连续未命中达 GETLAYER_MISS_BUDGET
+  //      后锁存为 null。锁存是**永久**的：只在单入口内返回 null 的话，下一帧还会再跑 64 次
+  //      未命中并继续往数组里写，内存只是增长变慢。
+  // 数字下标分支不动：越界仍回哑代理（2732362906 的层索引表与 thisLayer 身份语义依赖它）。
+  const getLayerState = {
+    strict: opts.strictNameMiss === true,
+    // 链式访问型脚本（getLayer(...).origin/.visible/[...]）不能走 null：null.prop 会
+    // 直接 TypeError。这类脚本连预算兜底也不开（离线夹具里常见「只给脚本、不给图层表」
+    // 的写法，一次 init 就有上百次未命中；2983846453 的混淆脚本 init 实测 108 次）。
+    budget: opts.budgetEnabled !== false,
+    streak: 0,
+    runaway: false,
+  }
   const thisScene = {
     // [we-scene patch 2026-11-04] **getLayer 必须接受数字下标**。
     // 作者脚本遍历层的标准写法是
@@ -2113,7 +2139,21 @@ function makeThisScene(opts) {
       }
       if (opts.getSceneLayer) {
         const l = opts.getSceneLayer(String(name))
-        if (l && !l.destroyed) return layerProxy(l)
+        if (l && !l.destroyed) {
+          getLayerState.streak = 0
+          return layerProxy(l)
+        }
+      }
+      // [issue #19] 条件型脚本：未命中直接 null（枚举/守卫终止）。
+      if (getLayerState.strict || getLayerState.runaway) return null
+      // 存量兼容：默认仍回哑代理；只在连续未命中失控时锁存为 null（见上方注释）。
+      // 链式访问型脚本不开预算（null.prop 会 TypeError，兼容优先；见 getLayerState）。
+      if (getLayerState.budget) {
+        getLayerState.streak++
+        if (getLayerState.streak >= GETLAYER_MISS_BUDGET) {
+          getLayerState.runaway = true
+          return null
+        }
       }
       return layerProxy(null)
     },
@@ -2222,6 +2262,17 @@ function makeThisScene(opts) {
   // 三层 visible 全被脚本写成 false（整屏纯黑）。官方 getLayer 返回稳定对象、
   // thisLayer 即其自身，这里把 thisLayer 也接到同一份缓存上，身份语义才对。
   Object.defineProperty(thisScene, LAYER_PROXY_KEY, { value: layerProxy })
+  // [issue #19] 入口边界出口：每个 init/update/cursor/media/... 入口开始时清零「本入口
+  // 连续未命中」计数；runaway 锁存不清（它代表这个脚本已经失控过，后续入口保持严格）。
+  Object.defineProperty(thisScene, GETLAYER_MISS_STATE_KEY, {
+    value: {
+      beginEntry() {
+        if (!getLayerState.runaway) getLayerState.streak = 0
+      },
+      get runaway() { return getLayerState.runaway },
+      get strict() { return getLayerState.strict },
+    },
+  })
   return thisScene
 }
 
@@ -2688,6 +2739,152 @@ function makeObjectLayerProxy(layer, opts) {
   return proxy
 }
 
+/** `/` 前是否处于「期望表达式」位置（用于把正则字面量整体挖空，见 source-scan 同款启发式）。 */
+function regexAllowedForGetLayerScan(prevSignificant) {
+  if (prevSignificant === '') return true
+  return '([{,;:!&|?+-*/%<>^~='.includes(prevSignificant)
+}
+
+/**
+ * [issue #19] 把注释、字符串、模板字面量与正则字面量挖成空格，只留代码结构。
+ * 为什么要这么麻烦：`// while (getLayer(...))` 这类注释/文档字符串在 426 目录语料里
+ * 很常见；直接正则会把「直接写不存在图层」的存量脚本误判成条件型脚本，切到严格
+ * null 后变成 TypeError（issue #19 的一行补丁就是这样打爆 7 张壁纸的）。
+ * 保留换行以维持行号无关的可读性；分类只看结构，不需要精确偏移。
+ */
+function sanitizeForGetLayerScan(scriptBody) {
+  // 混淆写法 `thisScene['getLayer'](...)` 归一成 `thisScene.getLayer(...)` 再扫；
+  // 字符串挖空后键名会消失，所以必须在挖空之前归一。
+  const src = String(scriptBody).replace(/\[\s*(['"])getLayer\1\s*\]/g, '.getLayer')
+  let out = ''
+  let i = 0
+  let prev = ''
+  const n = src.length
+  while (i < n) {
+    const c = src[i]
+    const c2 = src[i + 1]
+    if (c === '/' && c2 === '/') {
+      while (i < n && src[i] !== '\n') { out += ' '; i++ }
+      continue
+    }
+    if (c === '/' && c2 === '*') {
+      out += '  '
+      i += 2
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
+        out += src[i] === '\n' ? '\n' : ' '
+        i++
+      }
+      if (i < n) { out += '  '; i += 2 }
+      continue
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c
+      out += ' '
+      i++
+      while (i < n) {
+        const d = src[i]
+        if (d === '\\') { out += '  '; i += 2; continue }
+        if (d === quote) { out += ' '; i++; break }
+        out += d === '\n' ? '\n' : ' '
+        i++
+      }
+      prev = ' '
+      continue
+    }
+    if (c === '/' && regexAllowedForGetLayerScan(prev)) {
+      // 正则字面量：整体挖空（含字符类里的 / 与转义）；换行视为不是正则，退化除号。
+      let j = i + 1
+      let inClass = false
+      let closed = false
+      while (j < n) {
+        const d = src[j]
+        if (d === '\\') { j += 2; continue }
+        if (d === '[') inClass = true
+        else if (d === ']') inClass = false
+        else if (d === '/' && !inClass) { closed = true; break }
+        else if (d === '\n') break
+        j++
+      }
+      if (closed) {
+        for (let k = i; k <= j; k++) out += src[k] === '\n' ? '\n' : ' '
+        i = j + 1
+        prev = ' '
+        continue
+      }
+    }
+    out += c
+    if (!/\s/.test(c)) prev = c
+    i++
+  }
+  return out
+}
+
+/** getLayer 调用所在的最近未闭合 `(` 是否属于 if/while/for 头（保守近似）。 */
+function getLayerCallInControlHeader(code, callStart) {
+  let depth = 0
+  for (let i = callStart - 1; i >= 0; i--) {
+    const c = code[i]
+    if (c === ')') depth++
+    else if (c === '(') {
+      if (depth === 0) {
+        const head = code.slice(Math.max(0, i - 24), i)
+        return /(?:if|while|for)\s*$/.test(head)
+      }
+      depth--
+    }
+  }
+  return false
+}
+
+/**
+ * [issue #19] 脚本是否把 getLayer 结果当作**条件/真值**使用。
+ *
+ * 只对这类脚本切「按名未命中返回 null」：它们本来就需要 null 才能终止枚举/守卫；
+ * 直接 `getLayer(name).visible = …` 的存量脚本继续拿哑代理（CASEBOOK:1096 的兼容契约）。
+ * 判定刻意保守（漏判由 GETLAYER_MISS_BUDGET 兜底，误判会打爆存量脚本）：
+ *   - `while/if/for (… getLayer(…) …)` 且调用结果没有后续 `.`/`[` 链式访问；
+ *   - `!getLayer(…)` / `getLayer(…) && …` / `… || getLayer(…)`；
+ *   - `let x = getLayer(…)` 之后 `if (x)` / `while (x)` / `!x` / `x && …` / `x || …`。
+ * 注释/字符串先挖空，避免把文档里的示例当成代码。
+ */
+function classifyGetLayerScript(scriptBody) {
+  const result = { strict: false, chained: false }
+  if (!/\bgetLayer\b/.test(scriptBody)) return result
+  const code = sanitizeForGetLayerScan(scriptBody)
+  for (const m of code.matchAll(/\bgetLayer\s*\(/g)) {
+    const open = m.index + m[0].lastIndexOf('(')
+    let depth = 0
+    let end = -1
+    for (let i = open; i < code.length; i++) {
+      const c = code[i]
+      if (c === '(') depth++
+      else if (c === ')') {
+        depth--
+        if (depth === 0) { end = i; break }
+      }
+    }
+    if (end < 0) continue
+    const after = code.slice(end + 1)
+    const first = (after.match(/^\s*(\S)/) || [])[1] || ''
+    // 调用结果被链式取属性/下标：不是「结果本身作条件」，保持哑代理（否则 null.prop 会 TypeError）。
+    if (first === '.' || first === '[') { result.chained = true; continue }
+    const before = code.slice(0, m.index)
+    if (getLayerCallInControlHeader(code, m.index)) result.strict = true
+    if (/(?:&&|\|\||!)\s*$/.test(before)) result.strict = true
+    if (/^\s*(?:&&|\|\||\?|===|!==|==|!=)/.test(after)) result.strict = true
+    if (/(?:===|!==|==|!=)\s*$/.test(before)) result.strict = true
+  }
+  // `let child = thisScene.getLayer(layerName); if (child) …`（3819697503 的 CSAV 枚举写法）。
+  for (const m of code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;{}]{0,400}\bgetLayer\s*\(/g)) {
+    const id = m[1]
+    const esc = id.replace(/\$/g, '\\$')
+    if (new RegExp(`(?:if|while|for)\\s*\\(\\s*!?\\s*${esc}\\s*\\)`).test(code)) result.strict = true
+    if (new RegExp(`(?:&&|\\|\\|)\\s*!?\\s*${esc}\\b`).test(code)) result.strict = true
+    if (new RegExp(`!\\s*${esc}\\b`).test(code)) result.strict = true
+  }
+  return result
+}
+
 /**
  * [we-scene patch] 求值 WE **对象脚本**（绑在 scale/origin/color/alpha/brightness/angles
  * 等 scene.json 字段上的脚本，区别于文字对象的 text.script）。经典用法：音频条的
@@ -2703,6 +2900,11 @@ function makeObjectLayerProxy(layer, opts) {
 export function evalObjectScript(script, scriptprops, opts = {}) {
   if (typeof script !== 'string' || script.length === 0) return null
   const body = scriptToFunctionBody(script)
+  // [issue #19] 条件型脚本（枚举/守卫）按名未命中返回 null；链式访问型脚本保持
+  // 哑代理且不启用预算兜底（null.prop 会 TypeError）。允许宿主显式覆盖 strict。
+  const getLayerUsage = classifyGetLayerScript(body)
+  const strictNameMiss = opts.strictNameMiss === true || getLayerUsage.strict
+  const budgetEnabled = opts.budgetEnabled !== false && !getLayerUsage.chained
 
   const spValues = {}
   if (scriptprops && typeof scriptprops === 'object') {
@@ -2793,7 +2995,15 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     ...opts,
     workshopId,
     getWorkshopId: () => workshopId,
+    strictNameMiss,
+    budgetEnabled,
   })
+  // [issue #19] 入口边界：每次 init/update/cursor/media/... 开始清零「本入口连续未命中」
+  // 计数（runaway 锁存不在此清）。
+  const beginGetLayerEntry = () => {
+    const state = thisScene[GETLAYER_MISS_STATE_KEY]
+    if (state) state.beginEntry()
+  }
   // [we-scene patch 2026-11-04] thisLayer 必须与 thisScene.getLayer(...) 同代理身份：
   // 作者脚本用 `thisLayer == thisScene.getLayer(idx)` 判定「当前该显示的层」
   // （2732362906 的 visible 脚本末行）。此前这里另起一个 makeObjectLayerProxy，
@@ -2915,17 +3125,20 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     errByEntry: {},
     entryDisabled: {},
     init(value) {
+      beginGetLayerEntry()
       if (!fns.init) return undefined
       // [we-scene patch] 同对象沙箱：init 返回值是属性新初值，透传给宿主消费。
       try { return fns.init(asScriptVec3(value)) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'init') }
       return undefined
     },
     applyUserProperties(props) {
+      beginGetLayerEntry()
       if (!fns.applyUserProperties) return
       try { fns.applyUserProperties(props || {}) } catch (e) { sandbox.errCount++; if (opts.onError) opts.onError(e, 'applyUserProperties') }
     },
     /** 求值：value 为字段当前值（可变对象/数字），返回脚本的原始返回值（可能 undefined） */
     callUpdate(value) {
+      beginGetLayerEntry()
       if (sandbox.entryDisabled.update) return undefined
       if (!fns.update) return undefined
       let ret
@@ -2945,6 +3158,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 与 callUpdate 共用三振熔断：坏脚本不会每帧刷错误日志。
      */
     callCursor(name, event) {
+      beginGetLayerEntry()
       if (sandbox.entryDisabled.cursor) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
@@ -2965,6 +3179,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 每帧调用会让动画永远卡在第 0 帧重放。
      */
     callMedia(name, event) {
+      beginGetLayerEntry()
       if (sandbox.entryDisabled.media) return undefined
       const fn = fns[name]
       if (typeof fn !== 'function') return undefined
@@ -2982,6 +3197,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
     //（undefined = 保持不变，与 update 的写回规则同构）。
     hasAnimEventHook,
     callAnimationEvent(event, value) {
+      beginGetLayerEntry()
       if (sandbox.entryDisabled.anim) return undefined
       if (typeof fns.animationEvent !== 'function') return undefined
       try {
@@ -3000,6 +3216,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
      * 返回脚本原值（可能改写 thisLayer / thisObject）。
      */
     callResize(width, height) {
+      beginGetLayerEntry()
       if (sandbox.entryDisabled.resize) return undefined
       if (typeof fns.resizeScreen !== 'function') return undefined
       const w = Number(width) || 0
