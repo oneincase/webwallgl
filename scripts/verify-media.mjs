@@ -1268,6 +1268,14 @@ function sniffMediaType(url) {
       // ④ 不能误伤既有两条路径
       const scfg = await mod.resolveMountConfig(el, { source: srcOf({ type: "scene" }) });
       check(scfg.type === "scene", `scene 壁纸仍应产出 type=scene，实得 ${scfg.type}`);
+      // issue #20：autoQuality 是「自动降档」开关，必须原样穿过这个白名单；
+      // 丢了它，scene-mount 的 `cfg.autoQuality !== false` 会恒真（调用方关不掉）。
+      const acfg = await mod.resolveMountConfig(el, { source: srcOf({ type: "scene" }), autoQuality: false });
+      check(acfg.autoQuality === false,
+        `resolveMountConfig 必须原样透传 autoQuality:false（实得 ${JSON.stringify(acfg.autoQuality)}）`);
+      const acfgOn = await mod.resolveMountConfig(el, { source: srcOf({ type: "scene" }), autoQuality: true });
+      check(acfgOn.autoQuality === true,
+        `resolveMountConfig 必须原样透传 autoQuality:true（实得 ${JSON.stringify(acfgOn.autoQuality)}）`);
       const wcfg = await mod.resolveMountConfig(el, {
         source: srcOf({ type: "web", file: "index.html" }, {
           webEntry: async () => ({ url: "https://cdn.example/wp/index.html" }),

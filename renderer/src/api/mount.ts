@@ -109,6 +109,9 @@ async function resolveMountConfig(
     // （scene-mount applyQuality / getQuality），这里不引依赖 —— 本函数会被
     // verify-media 抽出来脱离 import 单独执行。
     quality: o.quality,
+    // [issue #20] 自动降档开关也必须原样透传：此前白名单重建漏了它，scene-mount
+    // 读到的 cfg.autoQuality 恒 undefined → `!== false` 恒真 → 调用方显式关不掉。
+    autoQuality: o.autoQuality,
     scripts: o.scripts !== false,
   };
   let project: unknown = null;

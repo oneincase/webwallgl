@@ -200,6 +200,8 @@ const indexSrc = fs.readFileSync(join(ROOT, "editor/index.html"), "utf8");
   // resolveMountConfig 原样透传（规范化在消费方），它会被 verify-media 抽出来
   // 脱离 import 单独执行 —— 不能在这里调 normalizeQuality。
   check(/quality: o\.quality/.test(apiMountSrc), "公共 API resolveMountConfig 带 quality");
+  // issue #20：autoQuality 是 scene-mount 消费的开关，必须穿过 resolveMountConfig 的白名单。
+  check(/autoQuality: o\.autoQuality/.test(apiMountSrc), "公共 API resolveMountConfig 带 autoQuality（issue #20）");
   check(/setQuality\(patch: QualityOptions\)/.test(apiMountSrc), "SceneInstance.setQuality 存在");
   check(/quality: quality\(\)/.test(benchSrc) && /antiAliasing: o\.aa\.value/.test(benchSrc) && /particles: o\.pq\.value/.test(benchSrc) && /postProcessing: o\.pp\.value/.test(benchSrc) &&
     /\.\.\.renderSettings\.mountOptions\(\)/.test(editorMainSrc),
