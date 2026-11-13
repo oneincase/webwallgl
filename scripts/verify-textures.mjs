@@ -1601,6 +1601,104 @@ async function texLimits() {
 
 await builtinPatterns();
 await texLimits();
+await texConditionalVariant();
+
+// ─────── [6b] 条件变体纹理：TEXB0004 的 hasMipExtension>1 不得整张贴图作废 ───────
+// 依据：3689709805（Leon S Kennedy X-ray）`materials/心 拷贝.tex` 实测 –
+// TEXB0004 / imageCount=1 / freeImageFormat=13(PNG) / 该字段 = 3（= 变体数）。
+// 之后是 3 条条件条目 + 每级 mip 的「基准图 + 3 张变体图」，变体记录前缀
+// 20B/40B/32B/32B 不等。按已知布局读 dims 会落到 1x0 → assertDims 抛错 →
+// 挂载中断、整张壁纸无法预览（用户报「无法预览」）。
+// 判据：必须恢复出基准图（PNG 载荷），且**只取第一张**（不能被后续变体图吞并）。
+function fakePng(w, h) {
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(25);
+  ihdr.writeUInt32BE(13, 0);
+  ihdr.write("IHDR", 4, "latin1");
+  ihdr.writeUInt32BE(w, 8);
+  ihdr.writeUInt32BE(h, 12);
+  ihdr[16] = 8; // bit depth
+  ihdr[17] = 6; // RGBA
+  const iend = Buffer.alloc(12);
+  iend.writeUInt32BE(0, 0);
+  iend.write("IEND", 4, "latin1");
+  return Buffer.concat([sig, ihdr, iend]);
+}
+
+function buildTexConditional({ w = 16, h = 12 } = {}) {
+  const head = Buffer.alloc(46);
+  head.write("TEXV0005\0", 0, "latin1");
+  head.write("TEXI0001\0", 9, "latin1");
+  head.writeUInt32LE(0, 18); // format
+  head.writeUInt32LE(2, 22); // flags
+  head.writeUInt32LE(w, 26);
+  head.writeUInt32LE(h, 30);
+  head.writeUInt32LE(w, 34);
+  head.writeUInt32LE(h, 38);
+  const u32 = (v) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(v >>> 0);
+    return b;
+  };
+  const parts = [
+    head,
+    Buffer.from("TEXB0004\0", "latin1"),
+    u32(1), // imageCount
+    u32(13), // freeImageFormat = PNG
+    u32(3), // hasMipExtension = 变体数（问题语料形态）
+  ];
+  // 3 条条件条目 [u32 1][u32 序号][u32 0][{"condition":…}\0]
+  for (let i = 1; i <= 3; i++) {
+    parts.push(
+      u32(1),
+      u32(i),
+      u32(0),
+      Buffer.from(`{"condition":{"condition":"${i + 1}","name":"xraysty"}}\0`, "latin1"),
+    );
+  }
+  // 基准图：(mip 数)(W)(H)(cmp)(decomp)(size)(PNG)
+  const base = fakePng(w, h);
+  parts.push(u32(3), u32(w), u32(h), u32(0), u32(0), u32(base.length), base);
+  // 三种变体记录前缀（与真实语料的 40/32/32 字节同形）
+  const v1 = fakePng(w, h);
+  parts.push(u32(1), u32(3), u32(1), u32(1), u32(0), u32(0), u32(w), u32(h), u32(13), u32(v1.length), v1);
+  const v2 = fakePng(w, h);
+  parts.push(u32(1), u32(2), u32(0), u32(0), u32(w), u32(h), u32(13), u32(v2.length), v2);
+  const v3 = fakePng(w, h);
+  parts.push(u32(1), u32(3), u32(0), u32(0), u32(w), u32(h), u32(13), u32(v3.length), v3);
+  return Buffer.concat(parts);
+}
+
+async function texConditionalVariant() {
+  console.log("\n[6b] 条件变体纹理（hasMipExtension>1）：取基准图，不得整张作废");
+  const { parseTex, decodeMip0 } = await import(
+    pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href
+  );
+  const w = 16;
+  const h = 12;
+  const png = fakePng(w, h);
+  let tex = null;
+  let err = "";
+  try {
+    tex = parseTex(buildTexConditional({ w, h }), { name: "materials/cond.tex" });
+  } catch (e) {
+    err = String((e && e.message) || e);
+  }
+  check(err === "", `条件变体纹理必须能解析（实得：${err || "无异常"}）`);
+  if (!tex) return;
+  check(tex.width === w && tex.height === h, `尺寸取载荷自身/头部（期望 ${w}×${h}，实得 ${tex.width}×${tex.height}）`);
+  check(
+    tex.images.length === 1 && tex.images[0].length === 1,
+    `只产出一张图一级 mip（实得 ${tex.images.length} 图 / ${tex.images[0] ? tex.images[0].length : 0} 级）`,
+  );
+  const data = tex.images[0][0].data;
+  check(
+    data.length === png.length && data[0] === 0x89 && data[1] === 0x50,
+    `mip0 必须是第一张 PNG 且按 IEND 定界（期望 ${png.length}B，实得 ${data.length}B）—— 不得吞掉后续变体图`,
+  );
+  const m0 = decodeMip0(tex);
+  check(!!(m0 && m0.png && m0.width === w && m0.height === h), "decodeMip0 必须返回 PNG 与正确尺寸");
+}
 
 // ---------- [7] 编辑器贴图缩略图 / 尺寸（W16 地基，renderer/src/tex-preview.ts） ----------
 // 交付面：tex-preview.ts 的 texPreviewPixels(bytes, max) / texImageSize(bytes)，经

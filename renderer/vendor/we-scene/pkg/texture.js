@@ -88,6 +88,21 @@ export function parseTex(buf, opts = {}) {
     const hasMipExtension = u32(buf, p)
     p += 4
     if (freeImageFormat === FIF.UNKNOWN && hasMipExtension === 1) freeImageFormat = FIF.MP4
+    // [we-scene patch 2026-11-13] **条件变体纹理**：这个字段取 >1 时是「变体数」，
+    // 布局与 0/1 都不同（实测 3689709805 `materials/心 拷贝.tex` 取 3）。
+    // 详见 parseConditionalTex —— 按载荷自证取基准图，不再让整张贴图作废。
+    if (hasMipExtension > 1 && freeImageFormat !== FIF.MP4) {
+      return parseConditionalTex(buf, {
+        name,
+        format,
+        flags,
+        textureWidth,
+        textureHeight,
+        containerMagic,
+        freeImageFormat,
+        start: p,
+      })
+    }
     containerVersion = hasMipExtension === 1 ? 4 : 3
   } else if (containerMagic === 'TEXB0003\0') {
     freeImageFormat = u32(buf, p) | 0
@@ -375,6 +390,110 @@ function asciiTex(buf, start, len) {
   let s = ''
   for (let i = start; i < start + len; i++) s += String.fromCharCode(buf[i])
   return s
+}
+
+/**
+ * [we-scene patch 2026-11-13] **条件变体纹理** —— TEXB0004 的 `hasMipExtension`
+ * 取 >1（实测 3689709805 `materials/心 拷贝.tex` 取 3）。
+ *
+ * 实测布局（相对条目起点）：容器头之后 3 条条件条目
+ * `[u32 1][u32 序号][u32 0][{"condition":…}\0]`，随后每级 mip 依次是
+ * 「基准图 + 3 张变体图」，记录前缀长度不一（20B/40B/32B/32B），变体记录里的
+ * 整型字段语义未定型。按标准/V3/V4 任一已知布局读，尺寸都会落到 1x0，
+ * assertDims 抛「素材字段越界」→ 整张贴图作废、挂载中断（用户报「无法预览」）。
+ *
+ * 变体只影响「按属性值切图」，对画面不是必需：取**基准图**（第一张载荷）当
+ * mip0，画面正确、仅不走属性变体。按载荷自证恢复，尺寸优先取载荷自身
+ * （PNG IHDR / GIF 逻辑屏），缺失时退回头部 textureWidth/Height。
+ */
+function parseConditionalTex(buf, opts) {
+  const { name, format, flags, textureWidth, textureHeight, containerMagic, freeImageFormat, start } = opts
+  const at = (suffix) => (name ? name + (suffix || '') : (suffix || 'tex'))
+  const found = findFreeImagePayload(buf, start)
+  if (!found) throw new Error('条件变体纹理内未找到图像载荷: ' + at(''))
+  const width = found.width > 0 ? found.width : textureWidth
+  const height = found.height > 0 ? found.height : textureHeight
+  assertDims(width, height, at('[img0/mip0]'))
+  return {
+    format,
+    formatName: TEXTURE_FORMATS[format] || String(format),
+    flags,
+    textureWidth,
+    textureHeight,
+    width,
+    height,
+    freeImageFormat,
+    containerMagic,
+    containerVersion: 3,
+    isVideo: false,
+    images: [[{ width, height, compression: 0, data: buf.subarray(found.offset, found.end) }]],
+    frames: null,
+  }
+}
+
+/** 大端 u32（PNG/GIF/WEBP 定界用） */
+function u32be(buf, o) {
+  return ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]) >>> 0
+}
+
+/** 该偏移是否是自由图魔数（PNG/JPEG/GIF/WEBP） */
+function isFreeImageAt(buf, i) {
+  return (
+    (buf[i] === 0x89 && buf[i + 1] === 0x50 && buf[i + 2] === 0x4e && buf[i + 3] === 0x47) ||
+    (buf[i] === 0xff && buf[i + 1] === 0xd8 && buf[i + 2] === 0xff) ||
+    (buf[i] === 0x47 && buf[i + 1] === 0x49 && buf[i + 2] === 0x46 && buf[i + 3] === 0x38) ||
+    (buf[i] === 0x52 && buf[i + 1] === 0x49 && buf[i + 2] === 0x46 && buf[i + 3] === 0x46 &&
+      buf[i + 8] === 0x57 && buf[i + 9] === 0x45 && buf[i + 10] === 0x42 && buf[i + 11] === 0x50)
+  )
+}
+
+/**
+ * 从 start 起找第一个自由图载荷并定界。定界按格式：
+ * PNG 走到 IEND；WEBP 用 RIFF 长度；JPEG 走到 FFD9；GIF 走到下一个载荷魔数（或条目尾）。
+ * 返回 { offset, end, width, height }；找不到返回 null。
+ */
+function findFreeImagePayload(buf, start) {
+  const n = buf.length
+  for (let i = Math.max(0, start); i + 12 < n; i++) {
+    if (!isFreeImageAt(buf, i)) continue
+    // PNG
+    if (buf[i] === 0x89 && buf[i + 1] === 0x50 && buf[i + 2] === 0x4e && buf[i + 3] === 0x47) {
+      const w = u32be(buf, i + 16)
+      const h = u32be(buf, i + 20)
+      let q = i + 8
+      while (q + 8 <= n) {
+        const len = u32be(buf, q)
+        const isIend = buf[q + 4] === 0x49 && buf[q + 5] === 0x45 && buf[q + 6] === 0x4e && buf[q + 7] === 0x44
+        if (len > n || q + 12 + len > n) break
+        q += 12 + len
+        if (isIend) break
+      }
+      return { offset: i, end: Math.min(q, n), width: w, height: h }
+    }
+    // WEBP
+    if (buf[i] === 0x52 && buf[i + 1] === 0x49 && buf[i + 2] === 0x46 && buf[i + 3] === 0x46) {
+      const size = buf[i + 4] | (buf[i + 5] << 8) | (buf[i + 6] << 16) | (buf[i + 7] << 24)
+      return { offset: i, end: Math.min(i + 8 + size, n), width: 0, height: 0 }
+    }
+    // GIF：逻辑屏宽高 + 下一载荷/条目尾定界
+    if (buf[i] === 0x47 && buf[i + 1] === 0x49 && buf[i + 2] === 0x46) {
+      const w = buf[i + 6] | (buf[i + 7] << 8)
+      const h = buf[i + 8] | (buf[i + 9] << 8)
+      let end = n
+      for (let j = i + 10; j + 4 < n; j++) {
+        if (isFreeImageAt(buf, j)) { end = j; break }
+      }
+      return { offset: i, end, width: w, height: h }
+    }
+    // JPEG：走到 FFD9（首个；缩略图嵌套的极端情况接受截断风险）
+    let q = i + 2
+    while (q + 1 < n) {
+      if (buf[q] === 0xff && buf[q + 1] === 0xd9) { q += 2; break }
+      q++
+    }
+    return { offset: i, end: Math.min(q, n), width: 0, height: 0 }
+  }
+  return null
 }
 
 export { TEXTURE_FORMATS, FIF, decodeMip0, decodeMips, decodeMipLevel, decodePixels, cropBlocks, lz4Decompress, lazyLz4Mip }
