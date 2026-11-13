@@ -407,6 +407,15 @@ export type MountOptions = {
    */
   scripts?: boolean;
 
+  /**
+   * 网页壁纸 iframe 的沙箱级别。默认（缺省或 `"strict"`）= 仅 `allow-scripts`：
+   * 作者脚本拿不到宿主 origin，fetch/XHR 需要宿主返回 CORS 头，控制走 postMessage 通道。
+   * `"legacy"` = `allow-scripts allow-same-origin`，回到壁纸窗口旧行为 —— 只有素材
+   * 依赖同源身份（localStorage / 同源 fetch）时，嵌入方才能显式选它。
+   * 只影响网页壁纸；场景/媒体壁纸不受此项控制。详见 WallpaperConfig.webSandbox。
+   */
+  webSandbox?: "strict" | "legacy";
+
   /** 指针源。**当前未接线**，见 PointerSource 说明；外部喂指针请用 pushPointer() */
   pointer?: PointerSource | null;
   /**

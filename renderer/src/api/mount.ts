@@ -113,6 +113,10 @@ async function resolveMountConfig(
     // 读到的 cfg.autoQuality 恒 undefined → `!== false` 恒真 → 调用方显式关不掉。
     autoQuality: o.autoQuality,
     scripts: o.scripts !== false,
+    // [issue #21] 网页壁纸沙箱档位也必须原样透传：此前白名单重建漏了它，
+    // web.ts 读到的 cfg.webSandbox 恒 undefined → 内层 iframe 永远只剩
+    // allow-scripts（Origin: null），显式 legacy 的同源素材一律 401。
+    webSandbox: o.webSandbox,
   };
   let project: unknown = null;
   try {

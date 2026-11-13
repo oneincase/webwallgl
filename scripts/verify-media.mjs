@@ -1282,6 +1282,21 @@ function sniffMediaType(url) {
         }),
       });
       check(wcfg.type === "web", `web 壁纸仍应产出 type=web，实得 ${wcfg.type}`);
+      // issue #21：webSandbox 也必须穿过这个白名单 —— 丢了它，web.ts 的
+      // `cfg.webSandbox !== "legacy"` 恒真，内层 iframe 永远严格档（Origin: null），
+      // 显式 legacy 的同源素材一律 401。
+      const legacyCfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "web", file: "index.html" }),
+        webSandbox: "legacy",
+      });
+      check(legacyCfg.webSandbox === "legacy",
+        `resolveMountConfig 必须原样透传 webSandbox:"legacy"（实得 ${JSON.stringify(legacyCfg.webSandbox)}）`);
+      const strictCfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "web", file: "index.html" }),
+        webSandbox: "strict",
+      });
+      check(strictCfg.webSandbox === "strict",
+        `resolveMountConfig 必须原样透传 webSandbox:"strict"（实得 ${JSON.stringify(strictCfg.webSandbox)}）`);
       // 无 project.json（大量真实壁纸如此）也不能被误判成媒体
       const ncfg = await mod.resolveMountConfig(el, { source: srcOf(null) });
       check(ncfg.type === "scene", `无 project.json 时应走 scene，实得 ${ncfg.type}`);

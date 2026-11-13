@@ -244,6 +244,16 @@ check(
     !/cfg\.webSandbox === "strict"/.test(webTs),
   '网页壁纸默认 strict（cfg.webSandbox !== "legacy"）：三处 attachIframe 都走同一判定',
 );
+// issue #21：上面的判定消费的是 cfg.webSandbox，而公共 API 的配置在
+// resolveMountConfig 里重建白名单 —— 漏掉 webSandbox 时 legacy 永远到不了
+// web.ts（内层 iframe 只剩 allow-scripts，Origin: null，同源素材 401）。
+{
+  const apiMountTs = fs.readFileSync(join(ROOT, "renderer/src/api/mount.ts"), "utf8");
+  check(
+    /webSandbox: o\.webSandbox/.test(apiMountTs),
+    "公共 API resolveMountConfig 必须原样透传 webSandbox（issue #21）",
+  );
+}
 
 // ── 三、shim 注入不可被素材短路（真行为；合成的 HTML 样本，不碰 LIB/网络/DOM）──────
 //
