@@ -5283,6 +5283,10 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               entry: null,
               lastKey: null as string | null,
               quality,
+              // [3815761795] 带可见效果的文字层：墨水扩边会改 layer.size，而效果链
+              // FBO / 盒驱动效果（hollow_out 黑框、tint 蒙版…）的几何 = 层矩形 ——
+              // 逐帧扩边路径据此跳过（见下方 mount 时 hasVisibleEffects 的长注释）。
+              hasVisibleEffects: false,
             };
             if (layer.textScript) {
               // M12 / W8：env 收成工厂函数，热替换时按同一份 env 重新求值
@@ -5402,6 +5406,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const hasVisibleEffects = ((layer.effects as Array<{ visible?: boolean }>) || []).some(
               (e) => e && e.visible !== false,
             );
+            item.hasVisibleEffects = hasVisibleEffects;
             // [we-scene patch] 带可见效果的文字层不吃**基础**边距：效果链 FBO 与最终合成 quad
             // 都按 layer.size 走（renderer.js 的 contentW/H = |size×scale|），而基础边距按字号估
             //（32 号字 = 2×128+8 = 256、两侧共 +512），会把整层几何撑到盒子的 4.6 倍 ——
@@ -5428,10 +5433,16 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             //   - 无可见效果：效果 UV 按盒归一，扩边让圆环/蒙版错位（3396722575 丝带）；
             //     —— 这条只对**基础**边距生效（见上面 baseMargin）：带效果的层仍按墨水扩，
             //     否则溢出的字会被画布切掉；墨水装得下时 margin=0，效果几何 = 原盒。
+            //     [3815761795 补记] 「真溢出时照扩」对**盒驱动效果**是错的：hollow_out 的
+            //     黑框 = 层矩形本身，周几盒 126×141 装不下 em 128 的字形（溢出 2px），
+            //     扩边把层盒翻成 256×271 ⇒ 黑框比字形还大一圈（用户报「五背景渲染成
+            //     黑块」）。WE 的效果链 FBO = 层矩形，溢出字形在 WE 同样被裁 —— 对
+            //     带效果层，几何保真优先于 2px 的字边，墨水扩边整段跳过（isTintMask
+            //     同款处理）。isTintMask 之外的盒驱动效果（hollow_out / 蒙版族）都属此类。
             //   - 无 tint 蒙版：同上（3122339805 世界时钟粉条）；
             //   - 锚点 none/center：方向锚点的 origin 在挂载期按原盒平移过，扩边会把盒挪走。
             {
-              if (textCtx && !item.sandbox && anchorSafe && !isTintMask) {
+              if (textCtx && !item.sandbox && anchorSafe && !isTintMask && !hasVisibleEffects) {
                 const pts = Math.max(1, layer.textPointsize);
                 const em = TEXT_EM_SCALE * pts;
                 const fontPath = layer.textFont || "";
@@ -5606,7 +5617,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               //   3509243656 的 2×2 占位横条 → 溢出 1801px。
               // 这些层没有媒体回调，闸门一挡就永远是挂载时那点边距。只增不减：
               // 时钟/进度这类每帧变长的内容把画布撑到用过的最大值后不再回缩，字不抖。
-              if (!wtext.textLayerHasTintMask(layer) && anchorSafe) {
+              if (!wtext.textLayerHasTintMask(layer) && anchorSafe && !it.hasVisibleEffects) {
                 const grow = wtext.textCanvasMarginGrow(layout, bw, bh, M);
                 if (!!it.sandbox?.hasMediaHook && wtext.shouldGrowMediaPlaceholder(bw, bh, true)) {
                   // 2×2 占位层：跟随内容双向扩/缩（旧行为；短词 Paused/Playing
@@ -5623,6 +5634,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                   M = grow;
                 }
               }
+              // [3815761795] 带可见效果的文字层不扩边（isTintMask 同款豁免）：效果链
+              // FBO 与盒驱动效果（hollow_out 黑框、tint 蒙版…）的几何 = 层矩形，
+              // 扩边改 layer.size 就是改效果画布 —— 周几盒 126×141 装不下 em128 的
+              // 「五」（溢出 2px），扩边把层盒翻成 256×271，黑框比字形还大一圈。
+              // WE 的效果链同样按层矩形裁字，几何保真优先于 2px 字边。真被裁的层
+              // 走上面的裁字诊断，不再静默。
               // [we-scene patch] 裁字诊断：扩边后仍装不下的墨水说明这层被纹理边缘切了
               // （tint 蒙版层刻意不扩边——蒙版 UV 按盒对齐，扩边会错位；方向锚点层
               // 的 origin 在挂载期按原盒平移过）。以前只会静默少几个字，看着像字形
