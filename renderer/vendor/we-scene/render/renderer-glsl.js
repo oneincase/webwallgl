@@ -666,6 +666,29 @@ function layerQuadVerts(w, h) {
     w, 0, 0, 1, 0,
   ])
 }
+// 效果 pass 的像素 quad，a_Position **y 向上**（issue #22）。
+//
+// WE 的顶点位移效果（skew MODE=1）在 +left 时把图层**左半边上抬**（官方实测基线
+// 右端更低 = 左端更高），即位移发生在「y 向上」的像素空间。此前效果 pass 直接复用
+// layerQuadVerts：它的 a_Position.y 向下（y=h → FBO 顶 → 合成后屏幕下方），
+// 位移方向与官方镜像。新 quad 与 layerQuadVerts 的不变量逐一相同，只有 y 轴朝向翻转：
+//   1. 恒等直通：每个顶点的「输出 FBO 行」== 它携带的 v（y=0 → NDC +1 → FBO 顶
+//      携带 v=1；y=h → NDC −1 → FBO 底携带 v=0），pass 不动 UV 时仍是逐像素直通；
+//   2. FBO 内容倒置约定不变（copy pass 仍用 layerQuadVerts，合成不变）；
+//   3. MVP 必须成对换成 ortho(0, w, h, 0)（top=h, bottom=0，y=0 → NDC +1），
+//      否则 quad 只盖住 NDC 的另一半；g_EffectModelViewProjectionMatrix 的像素
+//      归一化也要同步翻 y（见 renderer.js 调用点），否则 shine/godrays 的
+//      v_ScreenCoord 上下错位。
+function passQuadVertsYUp(w, h) {
+  return new Float32Array([
+    0, 0, 0, 0, 1, // y=0 → NDC +1（FBO 顶）携带 v=1；合成后 FBO 顶=屏幕底 ⇒ y=0 在屏幕下方
+    0, h, 0, 0, 0, // y=h → NDC −1（FBO 底）携带 v=0 ⇒ y=h 在屏幕上方（y 向上）
+    w, 0, 0, 1, 1,
+    w, 0, 0, 1, 1,
+    0, h, 0, 0, 0,
+    w, h, 0, 1, 0,
+  ])
+}
 // 透视 y-up 世界、输入纹理正立（v=0=图像顶）时用的 local quad：world +y 采 v=0。
 function localQuadVertsYup() {
   return new Float32Array([
@@ -712,4 +735,4 @@ const GL_TYPES = {
   0x8b5b: 'mat3', // FLOAT_MAT3
 }
 
-export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES }
+export { COLOR_BLEND_GL, BLEND_PREP, WE_BLENDING_GLSL, COMPOSITE_BLEND_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, layerQuadVerts, passQuadVerts, passQuadVertsYUp, localQuadVerts, localQuadVertsYup, GL_TYPES }

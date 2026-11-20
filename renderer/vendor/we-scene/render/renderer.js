@@ -2,7 +2,7 @@ import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4Ro
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
-import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
+import { COLOR_BLEND_GL, BLEND_PREP, COMPOSITE_BLEND_FRAG, COPY_VERT, COPY_FRAG, COPY_LIT_VERT, COPY_LIT_FRAG, COMPOSITE_FRAG, BACKDROP_FRAG, FXAA_FRAG, BLOOM_LIGHTMAP_VERT, BLOOM_LIGHTMAP_FRAG, BLOOM_BLUR_VERT, BLOOM_BLUR_FRAG, BLOOM_APPLY_FRAG, TONEMAP_FRAG, layerQuadVerts, passQuadVerts, passQuadVertsYUp, localQuadVerts, localQuadVertsYup, GL_TYPES, ALIGN } from './renderer-glsl.js'
 import { linkProgram, compile, parseVec3Local, makeTexture, makeTextureMip, makeCompressedTextureMip, compressedFormatFor, makeR8TextureMip } from './gl-util.js'
 import { createGlRegistry } from './gl-registry.js'
 import { createAnimation, linkAnimations } from './animation.js'
@@ -2333,6 +2333,18 @@ export function createRenderer(canvas, opts = {}) {
     if (q === undefined) {
       q = layerQuadVerts(w, h)
       layerQuadCache.set(key, q)
+    }
+    return q
+  }
+  // 效果 pass 用（issue #22）：a_Position y 向上的像素 quad，缓存键前缀必须与
+  // layerQuad 区分 —— 两者同尺寸时数值不同，共键会互串顶点缓冲。
+  const passQuadCache = new Map()
+  function passQuadYUp(w, h) {
+    const key = w + 'x' + h
+    let q = passQuadCache.get(key)
+    if (q === undefined) {
+      q = passQuadVertsYUp(w, h)
+      passQuadCache.set(key, q)
     }
     return q
   }
@@ -5171,19 +5183,24 @@ export function createRenderer(canvas, opts = {}) {
       }
       gl.bindVertexArray(vao)
       // [we-scene patch] 效果 pass 顶点空间按 shader 约定二选一（判定见 getEffectProgram）：
-      //   mul(MVP) 系 → 像素 quad(0..w) + 转置像素正交 MVP（WE 像素顶点语义，
+      //   mul(MVP) 系 → 像素 quad + 转置像素正交 MVP（WE 像素顶点语义，
       //     skew 位移 87px=层宽 34% 合理；NDC 下 87 个 NDC 直接跑出裁剪体，
       //     3470764447 Audio Bar 白块）。转置上传是 HLSL 行向量 `transpose(M)*v`
       //     的约定（同 xray 逆矩阵先例），直接喂列主元会丢平移项。
+      //     [issue #22] quad 用 passQuadYUp（y 向上）+ ortho(0,w,h,0)（top=h），
+      //     与 layerQuad/ortho(0,w,0,h) 的差别**只**在 a_Position 的 y 轴朝向：
+      //     WE 顶点位移效果在 +left 时上抬左半边（y 向上语义），旧 quad 的
+      //     a_Position.y 向下 ⇒ 方向镜像。恒等直通性不变（顶点的 FBO 行 == 携带 v，
+      //     见 passQuadVertsYUp 注释），非位移类 pass 逐像素不受影响。
       //   NDC 直通系（gl_Position=vec4(a_Position,1)）→ NDC quad + 单位阵。
       const usePixelQuad = !progEntry.ndcDirect
       if (usePixelQuad) {
-        uploadQuad('passPx' + outFBO.width + 'x' + outFBO.height, layerQuad(outFBO.width, outFBO.height))
+        uploadQuad('passYUp' + outFBO.width + 'x' + outFBO.height, passQuadYUp(outFBO.width, outFBO.height))
       } else {
         uploadQuad('pass', PASS_QUAD)
       }
       const passMVP = usePixelQuad
-        ? mat4Transpose(mat4Ortho(0, outFBO.width, 0, outFBO.height, -10000, 10000))
+        ? mat4Transpose(mat4Ortho(0, outFBO.width, outFBO.height, 0, -10000, 10000))
         : IDENT_M4
       // 纹理绑定
       const texNames = mp.textures || []
@@ -5279,8 +5296,16 @@ export function createRenderer(canvas, opts = {}) {
       if (uni.get('g_EffectModelViewProjectionMatrix')) {
         const base = layerModelMatrix(layer, cam)
         let em = mat4Scale(base.m, base.w, base.h, 1)
+        // [issue #22] 像素 quad 换成 y 向上（passQuadYUp + ortho(0,w,h,0)）后，
+        // pass 像素 → 层局部的归一化也必须翻 y：pass y=0 在屏幕**下**方 → 局部 +0.5，
+        // y=h 在屏幕上方 → 局部 −0.5。旧式 (x/w−0.5, y/h−0.5) 在新空间会把
+        // shine/godrays 的 v_ScreenCoord 上下颠倒（它们拿该矩阵把 pass 顶点投到
+        // 画布 NDC 采样 _rt_FullFrameBuffer，屏幕对齐语义必须保持不变）。
+        // M·p = S·p + t：先 scale(1/w, −1/h) 再 translate(−0.5, +0.5)，即
+        // mat4Translate(mat4Scale(I, 1/w, −1/h), −0.5, +0.5)（math.js 的
+        // Translate/Scale 都是右乘，T·S 才是「先缩放后平移」）。
         em = usePixelQuad
-          ? mat4Multiply(em, mat4Scale(mat4Translate(mat4Identity(), -0.5, -0.5, 0), 1 / outFBO.width, 1 / outFBO.height, 1))
+          ? mat4Multiply(em, mat4Scale(mat4Translate(mat4Identity(), -0.5, 0.5, 0), 1 / outFBO.width, -1 / outFBO.height, 1))
           : mat4Multiply(em, mat4Scale(mat4Identity(), 0.5, 0.5, 1))
         effectScreenMVP = mat4Transpose(mat4Multiply(viewProj, em))
       }

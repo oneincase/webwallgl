@@ -2332,6 +2332,90 @@ const wireErrors = [];
   for (const e of tErr) wireErrors.push(e);
 }
 
+// ─────────── [issue #22] 效果 pass 顶点空间：y 向上 quad + 成对 MVP ───────────
+// WE 顶点位移效果（skew MODE=1）在 +left 时把图层左半边**上抬**（y 向上的像素空间）。
+// 旧实现效果 pass 复用 layerQuadVerts（a_Position.y 向下）⇒ 方向镜像（2684578755
+// 时钟/日期基线上翘 vs 官方下斜）。修复 = 三处**成对**改动，拆开任意一处都会坏：
+//   a) passQuadVertsYUp（新 quad，恒等直通不变，只有 y 轴翻转）；
+//   b) passMVP 换 ortho(0,w,h,0)（top=h：y=0 → NDC +1）；
+//   c) effectScreenMVP 的像素归一化翻 y（shine/godrays 的 v_ScreenCoord 屏幕对齐）。
+// 判据：真数值验证（导入 renderer-glsl/math 真模块算矩阵），不是正则看形状。
+{
+  const glslMod = await imp("renderer/vendor/we-scene/render/renderer-glsl.js");
+  const math = await imp("renderer/vendor/we-scene/render/math.js");
+  const { passQuadVertsYUp, layerQuadVerts } = glslMod;
+  const { mat4Ortho, mat4Identity, mat4Translate, mat4Scale } = math;
+  if (typeof passQuadVertsYUp !== "function") {
+    wireErrors.push("renderer-glsl.js 必须导出 passQuadVertsYUp（issue #22 的 y 向上 pass quad）");
+  } else {
+    // 管线约定：宿主 uniform U，shader 算 transpose(U)*v；宿主传 U=transpose(O)
+    // ⇒ 实际生效 O*v（列向量）。apply 按 O*v 建模（列主序数组）。
+    const apply = (M, x, y) => {
+      const v = [x, y, 0, 1]; const o = [];
+      for (let r = 0; r < 4; r++) o[r] = M[0 * 4 + r] * v[0] + M[1 * 4 + r] * v[1] + M[2 * 4 + r] * v[2] + M[3 * 4 + r] * v[3];
+      return o;
+    };
+    const W = 204, H = 84, DY = H * 0.27;
+    // ① 恒等直通：新 quad + ortho(0,w,h,0) 下每个顶点的 FBO 行 == 携带 v
+    //    （pass 不动 UV 时必须逐像素直通，非位移类效果零影响的前提）
+    const O = mat4Ortho(0, W, H, 0, -10000, 10000);
+    const q = passQuadVertsYUp(W, H);
+    for (let i = 0; i < 6; i++) {
+      const [x, y,,, v] = [q[i * 5], q[i * 5 + 1], q[i * 5 + 2], q[i * 5 + 3], q[i * 5 + 4]];
+      const p = apply(O, x, y);
+      const fboV = (p[1] / p[3] + 1) / 2;
+      if (Math.abs(fboV - v) > 1e-6) { wireErrors.push(`passQuadVertsYUp 顶点${i} 恒等直通破坏：FBO v=${fboV.toFixed(4)} != 携带 v=${v}`); break; }
+    }
+    // ② 方向：+left（顶点 y+Δ）必须减小 FBO v（FBO 底=屏幕顶 ⇒ 内容上移，与 WE 一致）
+    const a = apply(O, 0, 0), b = apply(O, 0, DY);
+    if (!(((b[1] / b[3] + 1) / 2) < ((a[1] / a[3] + 1) / 2))) {
+      wireErrors.push("passQuadVertsYUp + ortho(0,w,h,0) 下 +y 位移必须移向屏幕上方（否则 #22 镜像回归）");
+    }
+    // ③ 老对照锁死：layerQuadVerts + ortho(0,w,0,h) 同样恒等（证明 copy pass 语义
+    //    未动、只有位移方向差异），且 +y 在老空间是屏幕**下**移（#22 的病灶本身）
+    const Oold = mat4Ortho(0, W, 0, H, -10000, 10000);
+    const qo = layerQuadVerts(W, H);
+    let oldIdentity = true;
+    for (let i = 0; i < 6; i++) {
+      const [x, y,,, v] = [qo[i * 5], qo[i * 5 + 1], qo[i * 5 + 2], qo[i * 5 + 3], qo[i * 5 + 4]];
+      const p = apply(Oold, x, y);
+      if (Math.abs((p[1] / p[3] + 1) / 2 - v) > 1e-6) { oldIdentity = false; break; }
+    }
+    const c = apply(Oold, 0, 0), d = apply(Oold, 0, DY);
+    if (!oldIdentity) wireErrors.push("layerQuadVerts + ortho(0,w,0,h) 的恒等直通被破坏（copy pass / FBO 存储约定被误动）");
+    if (!(((d[1] / d[3] + 1) / 2) > ((c[1] / c[3] + 1) / 2))) {
+      wireErrors.push("layerQuadVerts 空间里 +y 应是屏幕下移（对照面失效，#22 的方向论证前提变了）");
+    }
+    // ④ effectScreenMVP 像素归一化必须翻 y：pass (0,0)→局部(−0.5,+0.5)（屏幕左下）、
+    //    (w,h)→(+0.5, −0.5)（屏幕右上）。写反会让 shine/godrays 的 v_ScreenCoord 上下颠倒。
+    const em = mat4Scale(mat4Translate(mat4Identity(), -0.5, 0.5, 0), 1 / W, -1 / H, 1);
+    const pt = (x, y) => { const p = apply(em, x, y); return [p[0] / p[3], p[1] / p[3]]; };
+    const [lx0, ly0] = pt(0, 0), [lxW, lyH] = pt(W, H);
+    if (Math.abs(lx0 + 0.5) > 1e-6 || Math.abs(ly0 - 0.5) > 1e-6 || Math.abs(lxW - 0.5) > 1e-6 || Math.abs(lyH + 0.5) > 1e-6) {
+      wireErrors.push(`effectScreenMVP 像素归一化映射错误（期望 (0,0)→(−0.5,+0.5)、(w,h)→(+0.5,−0.5)，实得 (${lx0.toFixed(3)},${ly0.toFixed(3)})/(${lxW.toFixed(3)},${lyH.toFixed(3)})）`);
+    }
+  }
+  // ⑤ 接线（文本判据，锁三处成对改动不散架）：
+  const rndSrc22 = readText(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")));
+  if (!/passQuadYUp\(outFBO\.width, outFBO\.height\)/.test(rndSrc22)) {
+    wireErrors.push("效果 pass 的像素 quad 必须用 passQuadYUp（y 向上，issue #22）");
+  }
+  if (!/mat4Ortho\(0, outFBO\.width, outFBO\.height, 0, -10000, 10000\)/.test(rndSrc22)) {
+    wireErrors.push("passMVP 必须与 passQuadYUp 成对：ortho(0,w,h,0)（top=h ⇒ y=0 → NDC +1）");
+  }
+  if (!/mat4Translate\(mat4Identity\(\), -0\.5, 0\.5, 0\), 1 \/ outFBO\.width, -1 \/ outFBO\.height, 1\)/.test(rndSrc22)) {
+    wireErrors.push("effectScreenMVP 的像素归一化必须翻 y（translate(−0.5,+0.5) × scale(1/w,−1/h)）");
+  }
+  // copy pass 保持 layerQuad（FBO 内容倒置约定是合成/命中/分组判据的地基，不能跟着翻）
+  if (!/uploadQuad\('layer' \+ fboW \+ 'x' \+ fboH, layerQuad\(fboW, fboH\)\)/.test(rndSrc22)) {
+    wireErrors.push("copy pass 必须仍用 layerQuad（FBO 倒置存储约定不能被 #22 波及）");
+  }
+  // uploadQuad 键必须区分两套 quad（同尺寸数值不同，共键会互串顶点缓冲）
+  if (!/uploadQuad\('passYUp' \+ outFBO\.width/.test(rndSrc22)) {
+    wireErrors.push("效果 pass quad 的 uploadQuad 键必须是 'passYUp…'（与 layer 键空间隔离）");
+  }
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);
