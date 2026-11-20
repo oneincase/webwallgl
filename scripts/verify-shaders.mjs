@@ -2416,6 +2416,45 @@ const wireErrors = [];
   }
 }
 
+// ─────────── [issue #23] 顶点位移越界的一次性诊断 ───────────
+// 效果链 FBO = 图层纹理尺寸；位移（skew 的 inset×画布）超出内容留白的部分被静默裁掉
+// （2684578755 文字层首字形/年份顶部被吃，无任何诊断）。修复 = getEffectProgram 检测
+// vert 的 position 位移 + pass 循环按常量 inset 估算位移量、one-shot info。
+{
+  // ① 检测正则必须命中官方位移家族、放过纯 UV/直通 shader（真文件判据）
+  const detectVtx = (src) => /position\s*\.\s*x[y]?\s*(\+=|-=|=)/.test(src) || /position\s*\.\s*y\s*(\+=|-=)/.test(src);
+  const mustHit = [
+    "local-assets/effects/skew/shaders/effects/skew.vert",
+    "local-assets/effects/transform/shaders/effects/transform.vert",
+    "local-assets/effects/foliagesway/shaders/effects/foliagesway.vert",
+  ];
+  const mustMiss = [
+    "local-assets/effects/scroll/shaders/effects/scroll.vert",
+    "local-assets/effects/pulse/shaders/effects/pulse.vert",
+    "local-assets/effects/spin/shaders/effects/spin.vert",
+    "local-assets/effects/perspective/shaders/effects/perspective.vert",
+    "local-assets/effects/shake/shaders/effects/shake.vert",
+  ];
+  for (const f of mustHit) {
+    if (!detectVtx(readText(fs.readFileSync(join(ROOT, f))))) {
+      wireErrors.push(`vertexDisplace 检测漏报 ${f}（位移家族必须被识别，否则 #23 诊断失明）`);
+    }
+  }
+  for (const f of mustMiss) {
+    if (detectVtx(readText(fs.readFileSync(join(ROOT, f))))) {
+      wireErrors.push(`vertexDisplace 检测误报 ${f}（声明行/纯 UV 不得命中，否则每层刷诊断）`);
+    }
+  }
+  // ② 接线：src 缓存带 vertexDisplace；pass 循环有 one-shot 裁切诊断（层+shader 去重）
+  const rndSrc23 = readText(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")));
+  if (!/vertexDisplace:/.test(rndSrc23)) {
+    wireErrors.push("getEffectProgram 的 src 缓存必须带 vertexDisplace 标志（#23 检测点）");
+  }
+  if (!/顶点位移效果可能裁切/.test(rndSrc23) || !/oneShotDiag\.add\(clipKey\)/.test(rndSrc23)) {
+    wireErrors.push("pass 循环必须发「顶点位移效果可能裁切」的 one-shot 诊断（clipKey = 层+shader 去重）");
+  }
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);

@@ -1401,6 +1401,12 @@ export function createRenderer(canvas, opts = {}) {
         frag: fragSrc,
         vert: vertSrc,
         texCombos: parseTextureCombos(fragSrc),
+        // [issue #23] 顶点位移检测（对**转译前**的 HLSL 源，与 ndcDirect 同一时机）：
+        // `position.x +=` / `position.y +=` / `position.xy =`（skew/transform/foliagesway
+        // 家族）。声明行 `vec3 position = a_Position;` 不匹配。效果目标 = 图层纹理
+        // 尺寸，位移超出画布的部分会被裁掉 —— pass 循环据此发一次性诊断（见下方
+        // vertexClipDiag），不再让「文字边缘被吃掉」无迹可寻。
+        vertexDisplace: /position\s*\.\s*x[y]?\s*(\+=|-=|=)/.test(vertSrc) || /position\s*\.\s*y\s*(\+=|-=)/.test(vertSrc),
       }
       shaderSrcCache.set(shaderName, src)
     }
@@ -5317,6 +5323,36 @@ export function createRenderer(canvas, opts = {}) {
       // 沙箱创建即同步补发媒体事件，getAnimation() 要能拿到本常量的控制器。
       const constCacheKey = (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi
       const constMerged = { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) }
+      // [issue #23] 顶点位移越界的一次性 info：效果链 FBO = 图层纹理尺寸，位移
+      // 超出「内容四周留白」的部分直接被裁。文字层最疼（画布留白 20% 上下，而
+      // 2684578755 的 skew left=0.27/0.40 位移是画布高的 27%/40% —— 首字形/年份
+      // 顶部被吃）。渲染器不知道内容墨迹边距，只能按 **常量 inset × 画布尺寸**
+      // 估算位移量给个提示（skew 家族的 left/right/top/bottom；transform 的
+      // offset/scale、foliagesway 的时变摆动不在此列，估不了就不报）。
+      // 只 info 不 warn：位移大 ≠ 一定裁 —— 2748169441 的 top=-0.97 是作者要的
+      // 「剪切后斜带」造型（WE 同样按图层尺寸跑效果链，大概率同样裁）。
+      // one-shot 按 层+shader 去重，不刷屏。
+      if (usePixelQuad && progEntry.vertexDisplace) {
+        const insetNum = (k) => {
+          const raw = constMerged[k]
+          const n = raw !== null && typeof raw === 'object' ? Number(raw.value) : Number(raw)
+          return Number.isFinite(n) ? Math.abs(n) : 0
+        }
+        const lR = Math.max(insetNum('left'), insetNum('right')) * outFBO.height
+        const tB = Math.max(insetNum('top'), insetNum('bottom')) * outFBO.width
+        const disp = Math.max(lR, tB)
+        if (disp > 4) {
+          const clipKey = 'vclip:' + (layer.id !== undefined ? layer.id : layer.name) + '|' + (mp.shader || '?')
+          if (!oneShotDiag.has(clipKey)) {
+            oneShotDiag.add(clipKey)
+            diag(
+              '顶点位移效果可能裁切：层 ' + (layer.name || layer.id) + ' ' + (mp.shader || '?') +
+                ' inset ≤ ' + Math.round(disp / Math.max(outFBO.width, outFBO.height) * 100) + '% → 位移约 ' + Math.round(disp) +
+                'px（画布 ' + outFBO.width + '×' + outFBO.height + '）；效果目标=图层尺寸，内容边距不足时超出部分被裁（issue #23）',
+            )
+          }
+        }
+      }
       ensureConstAnimRecs(constMerged, constCacheKey, time)
       bindConstants(
         uni,
