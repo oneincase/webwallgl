@@ -308,12 +308,15 @@ function runLayout() {
   //     溢出 465px、3509243656 的 2×2 占位横条 溢出 1801px。
   {
     const src = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
-    const perFrame = /if \(!wtext\.textLayerHasTintMask\(layer\) && anchorSafe && !it\.hasVisibleEffects\) \{\s*\n\s*const grow = wtext\.textCanvasMarginGrow\(layout, bw, bh, M\);/;
+    const perFrame = /if \(!wtext\.textLayerHasTintMask\(layer\) && anchorSafe && !it\.blocksGeometry\) \{\s*\n\s*const grow = wtext\.textCanvasMarginGrow\(layout, bw, bh, M\);/;
     if (!perFrame.test(src)) {
-      errors.push("逐帧扩边闸门应只排除 tint 蒙版/方向锚点/带可见效果层（3815761795），不得再要求 hasMediaHook（脚本层长文本会静默截断）");
+      errors.push("逐帧扩边闸门应只排除 tint 蒙版/方向锚点/真实盒驱动效果层（blocksGeometry，3815761795），不得再要求 hasMediaHook（脚本层长文本会静默截断）");
     }
-    if (!/item\.hasVisibleEffects = hasVisibleEffects;/.test(src)) {
-      errors.push("挂载期必须把 hasVisibleEffects 存进 item（逐帧扩边闸门的输入，3815761795）");
+    if (!/item\.blocksGeometry = hasVisibleEffects && !hasSelfRefComposite;/.test(src)) {
+      errors.push("挂载期必须把 blocksGeometry 存进 item：自引用合成 RT 的层（效果会被渲染端跳过）不得阻挡墨水扩边（3815761795）");
+    }
+    if (!/startsWith\(`_rt_imageLayerComposite_\$\{layer\.id\}_`\)/.test(src)) {
+      errors.push("必须识别「pass 贴图槽 = 自己的合成 RT」的自引用层（3815761795）");
     }
     // 裁字诊断：扩边后仍装不下必须留痕（tint 蒙版层刻意不扩，以前只会静默少几个字）
     if (!src.includes("文字被画布裁切")) {

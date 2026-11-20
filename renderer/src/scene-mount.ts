@@ -5406,7 +5406,18 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             const hasVisibleEffects = ((layer.effects as Array<{ visible?: boolean }>) || []).some(
               (e) => e && e.visible !== false,
             );
+            // [3815761795] 自引用合成 RT 的层（pass 贴图槽 = `_rt_imageLayerComposite_<自己的id>`）：
+            // 渲染端对「反转 alpha 盒填充」家族会**跳过该效果**（WE 里该引用不可解析、
+            // 不产生可见输出）。这类层不存在「效果画布 = 层矩形」的几何约束，
+            // 必须保留墨水扩边，否则字形被紧盒裁掉（周几层 128px 的「五」对 126×141
+            // 的盒，halign right / valign bottom 钉盒心 ⇒ 四分之三在盒外）。
+            const hasSelfRefComposite = ((layer.effects as Array<{ visible?: boolean; passes?: Array<{ textures?: unknown[] }> }>) || [])
+              .some((e) => !!e && e.visible !== false && (e.passes || []).some((p) =>
+                (p.textures || []).some((t) => typeof t === "string" && t.startsWith(`_rt_imageLayerComposite_${layer.id}_`))));
             item.hasVisibleEffects = hasVisibleEffects;
+            // 只有「真实可见且不会被跳过」的效果才阻挡排版几何（3694771168 的
+            // hollow_out 是真实盒驱动效果，仍需按盒对齐）。
+            item.blocksGeometry = hasVisibleEffects && !hasSelfRefComposite;
             // [we-scene patch] 带可见效果的文字层不吃**基础**边距：效果链 FBO 与最终合成 quad
             // 都按 layer.size 走（renderer.js 的 contentW/H = |size×scale|），而基础边距按字号估
             //（32 号字 = 2×128+8 = 256、两侧共 +512），会把整层几何撑到盒子的 4.6 倍 ——
@@ -5442,7 +5453,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             //   - 无 tint 蒙版：同上（3122339805 世界时钟粉条）；
             //   - 锚点 none/center：方向锚点的 origin 在挂载期按原盒平移过，扩边会把盒挪走。
             {
-              if (textCtx && !item.sandbox && anchorSafe && !isTintMask && !hasVisibleEffects) {
+              if (textCtx && !item.sandbox && anchorSafe && !isTintMask && !item.blocksGeometry) {
                 const pts = Math.max(1, layer.textPointsize);
                 const em = TEXT_EM_SCALE * pts;
                 const fontPath = layer.textFont || "";
@@ -5617,7 +5628,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               //   3509243656 的 2×2 占位横条 → 溢出 1801px。
               // 这些层没有媒体回调，闸门一挡就永远是挂载时那点边距。只增不减：
               // 时钟/进度这类每帧变长的内容把画布撑到用过的最大值后不再回缩，字不抖。
-              if (!wtext.textLayerHasTintMask(layer) && anchorSafe && !it.hasVisibleEffects) {
+              if (!wtext.textLayerHasTintMask(layer) && anchorSafe && !it.blocksGeometry) {
                 const grow = wtext.textCanvasMarginGrow(layout, bw, bh, M);
                 if (!!it.sandbox?.hasMediaHook && wtext.shouldGrowMediaPlaceholder(bw, bh, true)) {
                   // 2×2 占位层：跟随内容双向扩/缩（旧行为；短词 Paused/Playing
