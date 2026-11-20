@@ -2357,6 +2357,8 @@ export function createRenderer(canvas, opts = {}) {
   // [issue #23] 顶点位移检测用的 vert 源缓存（按 shader 名；getEffectProgram 的
   // shaderSrcCache 在程序缓存之后，外扩估算在链装配期就要读源码）。
   const effectVertSrcCache = new Map()
+  // [3815761795] 自引用反转 alpha 检测用的 frag 源缓存（按 shader 名）。
+  const effectFragSrcCache = new Map()
   let currentQuadKey = null
   function uploadQuad(key, verts) {
     if (currentQuadKey === key) return
@@ -5131,6 +5133,62 @@ export function createRenderer(canvas, opts = {}) {
           const fb = ov.textureFallbacks[i]
           if (fb) mergedTex[i] = fb
         }
+      }
+      // [3815761795] **可见层自引用自己的合成 RT** + 反转 alpha 盒填充：效果采样
+      // `_rt_imageLayerComposite_<自己的id>`。该引用在 WE 里无法以独立纹理解析
+      // （合成 = 层画进场景缓冲、含身后画面，不是层自己的透明底内容）——
+      // 用户对照 WE 实证：时间组件 hollow_out 的黑框**不渲染**，可见的只是
+      // 层自身的文字（黑色）。我们的旧解析（自引用回退 inputFBO = 文字画布）
+      // 会让反转 alpha 的效果把「非字形区」填成 Hole Color ⇒ 一块黑框。
+      // 处理：跳过整个效果，链输出 = 层自身内容（copy），与 WE 一致。
+      // **收窄条件**：只对「采样 g_Texture0 的 alpha 并做 1.0-x 反转填充」的
+      // 盒填充家族生效（hollow_out）。同为自引用但拿自己**当底图做 combine** 的
+      // 效果不在此列 —— 2408936835 的 shine（shine_combine 槽 1 =
+      // `_rt_imageLayerComposite_86_b` = 自己的底图）：inputFBO 行为正是底图来源，
+      // 跳过会让光效整个消失（本机 A/B 实证）。隐藏素材层（3448845950 蒙版）的
+      // 合成源走预渲染，同样不受影响。
+      if (layer.visible !== false) {
+        for (const nm of mergedTex) {
+          if (typeof nm !== 'string' || compositeObjectId(nm) !== layer.id) continue
+          let fragSrc = effectFragSrcCache.get(mp.shader)
+          if (fragSrc === undefined) {
+            fragSrc = (await shaderResolver('shaders/' + mp.shader + '.frag')) || ''
+            effectFragSrcCache.set(mp.shader, fragSrc)
+          }
+          const invertMaskFill = /1\.0\s*-\s*[a-z_.]*alpha/i.test(fragSrc) || /invertedalpha/i.test(fragSrc)
+          if (!invertMaskFill) continue
+          failedEffects.add(eff)
+          if (layer.isText) {
+            // 组件作者把**同一个共享色**同时绑在文字与盒填充上（Hole Color 常量 =
+            // chTime_color，快照形如 "0 0 0"）：盒不可渲染后，该色就是文字色 ——
+            // 跳过时把它应用到 layer.color/textColor（用户规格：字黑色、盒透明）。
+            // 只在层没有显式颜色绑定时兜底，不覆盖作者写的颜色。
+            const selfConsts = { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) }
+            // 颜色类常量优先（hollow_out 的 "Hole Color"）；同族效果的色常量名不统一，
+            // 其余按「值形如 'r g b' 字符串」兜底。
+            const names = Object.keys(selfConsts)
+            const ordered = names.filter((k) => /hole|color|tint|fill/i.test(k)).concat(names.filter((k) => !/hole|color|tint|fill/i.test(k)))
+            for (const k of ordered) {
+              const raw = selfConsts[k]
+              const val = raw !== null && typeof raw === 'object' ? raw.value : raw
+              if (typeof val === 'string' && /^\s*[\d.+-]+\s+[\d.+-]+\s+[\d.+-]+\s*$/.test(val)) {
+                const parts = val.trim().split(/\s+/).map(Number)
+                if (parts.every((n) => Number.isFinite(n))) {
+                  layer.color = [parts[0], parts[1], parts[2]]
+                  layer.textColor = layer.color.slice()
+                }
+                break
+              }
+            }
+          }
+          const selfKey = 'selfcomp:' + (layer.id !== undefined ? layer.id : layer.name) + '|' + (eff.file || mp.shader || '?')
+          if (!oneShotDiag.has(selfKey)) {
+            oneShotDiag.add(selfKey)
+            diag('效果采样自身的合成结果做反转 alpha 填充（' + nm + '）：该引用在 WE 中不可独立解析、不产生可见输出，已跳过（层 ' + (layer.name || layer.id) + '）')
+          }
+          break
+        }
+        if (failedEffects.has(eff)) continue
       }
       // [we-scene patch] pass 编译失败（缺失公共头/不支持的组合）时跳过**整个效果**，
       // 而不是只跳过这一个 pass。多 pass 效果的后续 pass 依赖前置 pass 写入的中间

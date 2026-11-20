@@ -2552,6 +2552,47 @@ const wireErrors = [];
   }
 }
 
+
+// ─────────── [3815761795] 自引用合成 RT + 反转 alpha 盒填充：跳过效果、色转文字 ───────────
+// 时间组件 hollow_out 采样 `_rt_imageLayerComposite_<自己的id>`（自引用）做
+// `1.0 - alpha` 反转填充。WE 里该引用不可独立解析、盒不渲染（用户实证：字黑、
+// 盒透明）；我们的旧解析回退 inputFBO ⇒ 非字形区被填 Hole Color 成黑块。
+// 修：收窄到「反转 alpha 填充」家族才跳过（链输出=层自身内容），并把该效果的
+// 颜色常量应用到文字色。**不能扩到所有自引用**：shine/godrays/localcontrast 的
+// combine 也自引用（拿自己当底图），跳过会让光效消失（2408936835 等 5 张)。
+{
+  const invertPred = (src) => /1\.0\s*-\s*[a-z_.]*alpha/i.test(src) || /invertedalpha/i.test(src);
+  // ① 正例：hollow_out 家族的语义片段（1.0 - textAlpha 反转）
+  const positive = 'float textAlpha = texSample2D(g_Texture0, uv).a; float invertedAlpha = 1.0 - textAlpha; gl_FragColor = vec4(u_HoleColor, smoothstep(0.0, 1.0, invertedAlpha));';
+  if (!invertPred(positive)) wireErrors.push("自引用反转 alpha 检测漏报 hollow_out 家族片段（3815761795）");
+  // ② 反例：官方 combine shader（真实文件）必须不命中 —— 它们是「拿自己当底图」，
+  //    跳过会让光效整个消失（2408936835/2648798210/2789335656/2808378924/2823687015）
+  for (const f of [
+    "local-assets/effects/shine/shaders/effects/shine_combine.frag",
+    "local-assets/effects/godrays/shaders/effects/godrays_combine.frag",
+    "local-assets/effects/localcontrast/shaders/effects/localcontrast_combine.frag",
+  ]) {
+    if (!fs.existsSync(join(ROOT, f))) continue;
+    if (invertPred(readText(fs.readFileSync(join(ROOT, f))))) {
+      wireErrors.push(`${f} 被误判为反转 alpha 盒填充 —— 自引用跳过收窄条件失效（光效会消失）`);
+    }
+  }
+  // ③ 接线：自引用检测 + 反转闸门 + 颜色转写 + one-shot 诊断
+  const rndSrcSR = readText(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")));
+  if (!/compositeObjectId\(nm\) !== layer\.id/.test(rndSrcSR)) {
+    wireErrors.push("pass 循环必须检测「贴图 = 自己的合成 RT」的自引用（3815761795）");
+  }
+  if (!/const invertMaskFill = /.test(rndSrcSR) || !/if \(!invertMaskFill\) continue/.test(rndSrcSR)) {
+    wireErrors.push("自引用跳过必须收窄到反转 alpha 盒填充（invertMaskFill），不得扩到全部自引用");
+  }
+  if (!/layer\.textColor = layer\.color\.slice\(\)/.test(rndSrcSR)) {
+    wireErrors.push("跳过自引用反转填充时，必须把效果颜色常量应用到文字色（字黑、盒透明，3815761795）");
+  }
+  if (!/效果采样自身的合成结果做反转 alpha 填充/.test(rndSrcSR)) {
+    wireErrors.push("自引用跳过必须留一条 one-shot 诊断（可观测，不静默）");
+  }
+}
+
 if (wireErrors.length) {
   console.log(`\n[图层材质/音谱转译] ${wireErrors.length} 处`);
   for (const e of wireErrors) console.log("    " + e);
