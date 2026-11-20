@@ -5415,9 +5415,17 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               .some((e) => !!e && e.visible !== false && (e.passes || []).some((p) =>
                 (p.textures || []).some((t) => typeof t === "string" && t.startsWith(`_rt_imageLayerComposite_${layer.id}_`))));
             item.hasVisibleEffects = hasVisibleEffects;
-            // 只有「真实可见且不会被跳过」的效果才阻挡排版几何（3694771168 的
-            // hollow_out 是真实盒驱动效果，仍需按盒对齐）。
-            item.blocksGeometry = hasVisibleEffects && !hasSelfRefComposite;
+            // [3556568863] 只有**固定几何类**效果才阻挡墨水扩边：这类效果的几何
+            // （盒框/蒙版 UV/圆环）按层矩形或整层 UV 归一，扩边会改画布 ⇒ 盒子变大、
+            // 蒙版错位、圆环塌形（3694771168 hollow_out 官方 84.6px 盒 /
+            // 3122339805 tint 蒙版 / 3396722575 geometric_transform 丝带）。
+            // 普通**滤镜**（blurprecise、chromatic_aberration、opacity…）作用在
+            // 整块画布上、与画布尺寸无关，必须允许扩边 —— 否则大字号文字被紧盒
+            // 两端裁掉（3556568863「F R I D A Y」只剩「RIDA」，用户报多张同款）。
+            const FIXED_GEOMETRY_EFFECT = /hollow_out|geometric_transform|(^|\/)tint(\/|$)/i;
+            const hasFixedGeometryEffect = ((layer.effects as Array<{ visible?: boolean; file?: string }>) || [])
+              .some((e) => !!e && e.visible !== false && FIXED_GEOMETRY_EFFECT.test(String(e.file || "")));
+            item.blocksGeometry = hasFixedGeometryEffect && !hasSelfRefComposite;
             // [we-scene patch] 带可见效果的文字层不吃**基础**边距：效果链 FBO 与最终合成 quad
             // 都按 layer.size 走（renderer.js 的 contentW/H = |size×scale|），而基础边距按字号估
             //（32 号字 = 2×128+8 = 256、两侧共 +512），会把整层几何撑到盒子的 4.6 倍 ——

@@ -312,8 +312,11 @@ function runLayout() {
     if (!perFrame.test(src)) {
       errors.push("逐帧扩边闸门应只排除 tint 蒙版/方向锚点/真实盒驱动效果层（blocksGeometry，3815761795），不得再要求 hasMediaHook（脚本层长文本会静默截断）");
     }
-    if (!/item\.blocksGeometry = hasVisibleEffects && !hasSelfRefComposite;/.test(src)) {
-      errors.push("挂载期必须把 blocksGeometry 存进 item：自引用合成 RT 的层（效果会被渲染端跳过）不得阻挡墨水扩边（3815761795）");
+    if (!/item\.blocksGeometry = hasFixedGeometryEffect && !hasSelfRefComposite;/.test(src)) {
+      errors.push("挂载期必须把 blocksGeometry 存进 item：只有固定几何类效果（+ 非自引用）才阻挡墨水扩边（3556568863/3815761795）");
+    }
+    if (!/const FIXED_GEOMETRY_EFFECT = \/hollow_out\|geometric_transform\|\(\.\.\.\)/.test(src) && !/FIXED_GEOMETRY_EFFECT = \/hollow_out\|geometric_transform/.test(src)) {
+      errors.push("固定几何类效果白名单必须存在（hollow_out / geometric_transform / tint）：普通滤镜不得锁盒，否则大字号文字被紧盒裁掉（3556568863）");
     }
     if (!/startsWith\(`_rt_imageLayerComposite_\$\{layer\.id\}_`\)/.test(src)) {
       errors.push("必须识别「pass 贴图槽 = 自己的合成 RT」的自引用层（3815761795）");
