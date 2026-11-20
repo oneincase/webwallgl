@@ -416,6 +416,21 @@ export type MountOptions = {
    */
   webSandbox?: "strict" | "legacy";
 
+  /**
+   * 本机 WE 官方素材（安装目录 `assets/` 树）接入档位。缺省 = 按 URL 参数
+   * `?localAssets=` 解析，都没有时 dev 为 `"lazy"`、生产构建为 `"off"`（不发任何请求）。
+   * 显式传值优先于 URL 参数。档位：
+   *   - `"off"`：关闭（缺省生产行为）；
+   *   - `"fonts"`：只开字体通路 —— 工坊文字层引用的 WE 内置字体（如
+   *     `fonts/Segment7Standard.otf`）不在壁纸 pkg 里、只在官方 `assets/fonts`，
+   *     不开素材通路时只能静默回落 sans-serif（issue #24）。这一档只要素材根
+   *     可达就按名取字体，不连带开启公共贴图的批量装载（贴图继续走程序化复刻）；
+   *   - `"lazy"`：util 贴图急切 + particle/gradient 等按需 + 字体；
+   *   - `"all"`：全量急切 + 字体（批量对账用，接受内存占用）。
+   * 素材根由嵌入方的 `/api/local-assets` 端点提供（官方树目录），库只按该约定发请求。
+   */
+  localAssets?: "off" | "fonts" | "lazy" | "all";
+
   /** 指针源。**当前未接线**，见 PointerSource 说明；外部喂指针请用 pushPointer() */
   pointer?: PointerSource | null;
   /**

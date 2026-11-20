@@ -49,6 +49,22 @@ export const SYSTEM_FONT_FAMILIES: Record<string, string> = {
 
 export type WallpaperFit = "cover" | "contain" | "stretch" | "fill" | "fit";
 
+/**
+ * 本机 WE 官方素材（安装目录 `assets/` 树）的接入档位（issue #24）。
+ * 官方树里有三类壁纸 pkg 不带、工坊场景按名引用的资源：`materials/**`（util/ 粒子等
+ * 公共贴图）、`fonts/**`（Segment7 等 WE 内置字体）、效果 shader/材质 JSON（不进运行时）。
+ * 没有素材时全部走程序化复刻 / 系统字体兜底，行为与关闭时完全一致。
+ */
+export type LocalAssetsMode =
+  /** 不发任何请求（npm 生产构建的缺省行为） */
+  | "off"
+  /** 只开字体通路：探测素材根 + 按名取 `fonts/*`；公共贴图仍走程序化复刻 */
+  | "fonts"
+  /** 贴图懒加载（util 急切、particle/gradient 等按需）+ 字体 */
+  | "lazy"
+  /** 全量急切装载 + 字体（批量对账 / 预热用，接受内存占用） */
+  | "all";
+
 export type WallpaperConfig = {
   type: "canvas" | "video" | "gif" | "web" | "scene" | "image";
   src?: string;
@@ -130,6 +146,19 @@ export type WallpaperConfig = {
    *   壁纸窗口用 `?webSandbox=legacy` 打开同理。
    */
   webSandbox?: "legacy" | "strict";
+  /**
+   * 本机 WE 官方素材接入档位（issue #24，见 {@link LocalAssetsMode}）。
+   *
+   * 缺省（省略）= 按 URL 参数 `?localAssets=` 解析，都没有时 dev 为 `"lazy"`、
+   * 生产构建为 `"off"`（库不联网的既有契约）。**显式传值优先于 URL 参数**。
+   *
+   * 典型场景：工坊文字层引用 WE 内置字体（如 `fonts/Segment7Standard.otf`），
+   * 字体只存在于官方安装目录 `assets/fonts`、不在壁纸 pkg 里 —— 不开素材通路时
+   * 只能静默回落 sans-serif（`"fonts"` 档专为此设：只要素材根可达就按名取字体，
+   * 不连带开启贴图批量装载）。素材根由 dev server 的 `/api/local-assets` 提供
+   * （`local-assets/` 目录或 `WE_LOCAL_ASSETS` 环境变量，见 local-assets.ts 头注）。
+   */
+  localAssets?: LocalAssetsMode;
   /**
    * 覆盖场景的清屏色（`"r g b"` 0..1 浮点三元组）。默认不覆盖，用场景自带的
    * `general.clearcolor`。

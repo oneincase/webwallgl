@@ -3219,6 +3219,160 @@ async function importParticle() {
   return _particleMod;
 }
 
+// ---------- 字体通路（issue #24：localAssets 档位 + 懒探测 + 缺字体诊断） ----------
+/**
+ * 2684578755：时钟/日期层声明 `fonts/Segment7Standard.otf`，该字体只在 WE 安装目录
+ * `assets/fonts`、不在壁纸 pkg 里。旧实现两个洞：
+ *   ① 字体探测被贴图开关绑死 —— `installLocalAssets()` 被 `?localAssets=`（生产缺省 off）
+ *      挡住，`fetchLocalAssetFile` 的 `if (!source) return null` 连探测都不发；
+ *   ② 失败静默 —— `if (!raw) continue` 无任何诊断，用户只看到「数码管变细体」。
+ * 修复：档位加 `"fonts"`（显式 cfg > URL 参数 > dev 缺省）、探测从贴图装载里拆出来
+ * （fonts 只需根 id，不需要 materials/index.json）、fetchLocalAssetFile 懒探测 +
+ * 失败缓存、缺字体报 warn。
+ *
+ * 判据形式：把 local-assets.ts 从 `const BASE` 起到文件尾整段抽出（去掉 import 行），
+ * esbuild 转译后**真跑**——mock 全局 fetch 计数/应答，逐条断言网络行为；
+ * 场景侧另加文本判据（scene-mount 的缺字体诊断）。
+ */
+async function runFontsChannel() {
+  const errors = [];
+  const fsMod = await import("node:fs");
+  const { pathToFileURL } = await import("node:url");
+  const laSrc = fsMod.readFileSync(join(ROOT, "renderer/src/local-assets.ts"), "utf8");
+  const sceneMountSrc = fsMod.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+
+  // 场景侧文本判据：缺字体必须出声 + 汇总行带缺失清单 + FontFace 抛错走诊断通道
+  if (!/字体缺失 \$\{fp\}/.test(sceneMountSrc)) {
+    errors.push("scene-mount 字体装配缺「字体缺失」诊断（if (!raw) 静默 continue 回潮）");
+  }
+  if (/if \(!raw\)\s*continue;/.test(sceneMountSrc)) {
+    errors.push("scene-mount 字体装配出现了无诊断的 `if (!raw) continue;`（issue #24 回潮）");
+  }
+  if (!/missingFonts\.join\(", "\)/.test(sceneMountSrc)) {
+    errors.push("text widgets 汇总诊断必须带缺失字体清单（missingFonts）");
+  }
+  if (!/字体加载失败 \$\{fp\}：\$\{\(e as Error\)/.test(sceneMountSrc)) {
+    errors.push("FontFace 抛错必须走 reportDiag（npm 库形态 console.warn 是黑盒）");
+  }
+
+  // 抽 local-assets.ts 的状态 + 模式解析 + 探测 + 字体取字节。
+  // 锚点 = 模块级状态块的第一行注释（pixels）：activeMode / source / probeFailed /
+  // files 都在其后，缺了任何一个判据都跑不起来。类型声明与 import 行在锚点之前，
+  // 类型标注由 esbuild 的 ts loader 剥掉，无运行时依赖。
+  const sliceStart = laSrc.indexOf("/** 已解码像素缓存：跨挂载复用");
+  const slice = sliceStart >= 0 ? laSrc.slice(sliceStart) : "";
+  if (!slice.length) {
+    errors.push("local-assets.ts 抽不到状态块起源码（切片锚点变了，本判据要同步改）");
+    return errors;
+  }
+
+  // 构建 mock fetch 的可执行模块。注意：mock 必须盖住「模块函数运行」的整个时段
+  // （probeRoot 是运行期才 fetch，不是 import 期），所以返回 done() 由调用方收尾，
+  // 不能在 buildMod 的 finally 里还原。statePersistence：同一模块内 source/probeFailed
+  // 跨用例保留，所以「失败缓存」用 A 模块（探测 404）、「成功通路」用 B 模块（探测 200）分开跑。
+  const esbuild = await import("esbuild");
+  const buildMod = async (fetchImpl) => {
+    const realFetch = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = (url, opts) => {
+      calls.push(String(url));
+      return fetchImpl(String(url), opts);
+    };
+    const out = await esbuild.transform(slice, {
+      loader: "ts",
+      format: "esm",
+      target: "es2022",
+    });
+    const tmp = join(ROOT, "scripts", `.tmp-local-assets-${process.pid}-${Math.random().toString(36).slice(2)}.mjs`);
+    fsMod.writeFileSync(tmp, out.code);
+    try {
+      const mod = await import(pathToFileURL(tmp).href + `?t=${Date.now()}`);
+      return { mod, calls, done() { globalThis.fetch = realFetch; } };
+    } catch (e) {
+      globalThis.fetch = realFetch;
+      throw e;
+    } finally {
+      try { fsMod.unlinkSync(tmp); } catch { /* 忽略 */ }
+    }
+  };
+
+  const FONT_BYTES = new Uint8Array([79, 84, 84, 79]); // "OTTO"
+
+  // ---- A 模块：模式解析表 + off 零请求 + 探测失败缓存 ----
+  {
+    const root404 = async () => ({ ok: false, status: 404 });
+    const { mod, calls, done } = await buildMod(root404);
+    const savedLocation = globalThis.location;
+    try {
+      // ① URL 解析表（node 无 location 时 stub）
+      globalThis.location = { search: "?localAssets=fonts" };
+      if (mod.resolveLocalAssetsMode(undefined) !== "fonts") errors.push(`?localAssets=fonts 应解析为 fonts，实得 ${mod.resolveLocalAssetsMode(undefined)}`);
+      globalThis.location = { search: "?fonts=1" };
+      if (mod.resolveLocalAssetsMode(undefined) !== "fonts") errors.push("?fonts=1 应等价 localAssets=fonts");
+      globalThis.location = { search: "?localAssets=0" };
+      if (mod.resolveLocalAssetsMode(undefined) !== "off") errors.push("?localAssets=0 应解析为 off");
+      globalThis.location = { search: "?localAssets=all" };
+      if (mod.resolveLocalAssetsMode(undefined) !== "all") errors.push("?localAssets=all 应解析为 all");
+      globalThis.location = { search: "?localAssets=all" };
+      // ② 显式 cfg 优先于 URL 参数
+      if (mod.resolveLocalAssetsMode("off") !== "off") errors.push("cfg localAssets:'off' 必须压过 ?localAssets=all");
+      delete globalThis.location;
+      // ③ off 档零网络：贴图装载返回 null、字体返回 null、fetch 0 次
+      if ((await mod.installLocalAssets("off")) !== null) errors.push("installLocalAssets('off') 必须返回 null");
+      const before = calls.length;
+      if ((await mod.fetchLocalAssetFile("fonts/Segment7Standard.otf")) !== null) errors.push("off 档 fetchLocalAssetFile 必须返回 null");
+      if (calls.length !== before) errors.push(`off 档不得发任何请求，实发 ${calls.length - before} 次`);
+      // ④ fonts 档探测失败 → null；第二个字体不再重复探测（失败缓存）
+      mod.resolveLocalAssetsMode("fonts");
+      if ((await mod.fetchLocalAssetFile("fonts/a.otf")) !== null) errors.push("探测 404 时 fetchLocalAssetFile 必须返回 null");
+      const afterFirst = calls.length;
+      if ((await mod.fetchLocalAssetFile("fonts/b.otf")) !== null) errors.push("探测 404 时第二个字体也必须返回 null");
+      if (calls.length !== afterFirst) errors.push(`探测失败必须缓存（同一次挂载缺 N 个字体只探测一次），实发 ${calls.length - afterFirst} 次冗余探测`);
+    } finally {
+      if (savedLocation === undefined) delete globalThis.location;
+      else globalThis.location = savedLocation;
+      done();
+    }
+  }
+
+  // ---- B 模块：fonts 档只探测根（不拉贴图清单）+ 字体可达 ----
+  {
+    const root200 = async (url) => {
+      if (url === "/api/local-assets") {
+        return { ok: true, status: 200, json: async () => ({ ok: true, roots: [{ id: "we", dir: "/x" }] }) };
+      }
+      if (url === "/api/local-assets/we/fonts/Segment7Standard.otf") {
+        return { ok: true, status: 200, arrayBuffer: async () => FONT_BYTES.buffer.slice(0, FONT_BYTES.length) };
+      }
+      return { ok: false, status: 404 };
+    };
+    const { mod, calls, done } = await buildMod(root200);
+    try {
+      // ⑤ 缺省（无 cfg、无 URL 参数、node 无 dev）= off：装载体返回 null 且零请求
+      if ((await mod.installLocalAssets(undefined)) !== null) errors.push("无配置时 installLocalAssets 必须返回 null（生产缺省 off）");
+      if (calls.length !== 0) errors.push(`无配置时不得发请求，实发 ${calls.length}`);
+      // ⑥ fonts 档装载体：只探测根。materials/index.json 是贴图清单，fonts 不需要 ——
+      //    没实现清单路由、只实现按名取文件的宿主也能供字体（issue #24 的解耦点）
+      mod.resolveLocalAssetsMode("fonts");
+      if ((await mod.installLocalAssets("fonts")) !== null) errors.push("installLocalAssets('fonts') 必须返回 null（不装贴图 provider）");
+      if (calls.length !== 1) errors.push(`fonts 档装载体只应发 1 次探测请求，实发 ${calls.length}：${calls.join(", ")}`);
+      if (calls.some((u) => u.includes("materials/index.json"))) errors.push("fonts 档不得拉 materials/index.json（那是贴图清单）");
+      // ⑦ 字体按名可达 + 素材根可读
+      const bytes = await mod.fetchLocalAssetFile("fonts/Segment7Standard.otf");
+      if (!bytes || bytes[0] !== 79) errors.push("fonts 档下官方字体字节必须可达（探测根 → 按名取 fonts/*）");
+      if (mod.localAssetsSourceId() !== "we") errors.push(`localAssetsSourceId() 应为素材根 id "we"，实得 ${mod.localAssetsSourceId()}`);
+      // ⑧ 同一字体第二次走 files 缓存，不再发请求
+      const n = calls.length;
+      await mod.fetchLocalAssetFile("fonts/Segment7Standard.otf");
+      if (calls.length !== n) errors.push("同一字体第二次必须命中 files 缓存（不发请求）");
+    } finally {
+      done();
+    }
+  }
+
+  return errors;
+}
+
 // ---------- 入口 ----------
 
 const action = process.argv[2] ?? "all";
@@ -3305,6 +3459,13 @@ if (action === "all" || action === "script" || action === "p21") {
 if (action === "all" || action === "script" || action === "anchor") {
   const errors = runAnchorNone();
   console.log(`\n【anchor:none 放置】按文字对齐贴 origin（3509578940 时钟回归） → 问题 ${errors.length}`);
+  errors.forEach((e) => console.log("  ! " + e));
+  failed += errors.length;
+}
+
+if (action === "all" || action === "script" || action === "fonts") {
+  const errors = await runFontsChannel();
+  console.log(`\n【字体通路】localAssets 档位/懒探测/缺字体诊断（issue #24） → 问题 ${errors.length}`);
   errors.forEach((e) => console.log("  ! " + e));
   failed += errors.length;
 }

@@ -1297,6 +1297,21 @@ function sniffMediaType(url) {
       });
       check(strictCfg.webSandbox === "strict",
         `resolveMountConfig 必须原样透传 webSandbox:"strict"（实得 ${JSON.stringify(strictCfg.webSandbox)}）`);
+      // issue #24：本机素材档位也必须穿过这个白名单 —— 丢了它，scene-mount →
+      // installLocalAssets 拿到的恒 undefined → 生产缺省 off 绑死字体通路，
+      // WE 内置字体（pkg 不内嵌、只在官方 assets/fonts）静默回落 sans-serif。
+      const fontsCfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "scene" }),
+        localAssets: "fonts",
+      });
+      check(fontsCfg.localAssets === "fonts",
+        `resolveMountConfig 必须原样透传 localAssets:"fonts"（实得 ${JSON.stringify(fontsCfg.localAssets)}）`);
+      const offCfg = await mod.resolveMountConfig(el, {
+        source: srcOf({ type: "scene" }),
+        localAssets: "off",
+      });
+      check(offCfg.localAssets === "off",
+        `resolveMountConfig 必须原样透传 localAssets:"off"（实得 ${JSON.stringify(offCfg.localAssets)}）`);
       // 无 project.json（大量真实壁纸如此）也不能被误判成媒体
       const ncfg = await mod.resolveMountConfig(el, { source: srcOf(null) });
       check(ncfg.type === "scene", `无 project.json 时应走 scene，实得 ${ncfg.type}`);

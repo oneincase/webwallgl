@@ -40,10 +40,15 @@
  *   - `?localAssets=all`：全量急切装载（批量对账 / 预热点用，接受内存占用）。
  *
  * ## 开关
- *   `?localAssets=0|off` 关闭；`all` 全量；`1|on` 或 dev 缺省 = util 急切 + particle 按需。
- *   只有 dev（`import.meta.env.DEV`）或显式参数才发请求，生产构建不会产生任何请求。
+ *   `?localAssets=0|off` 关闭；`all` 全量；`fonts` 只开字体通路；`1|on` 或 dev 缺省 =
+ *   util 急切 + particle 按需。`?fonts=1` 等价 `?localAssets=fonts`。
+ *   库宿主用 `MountOptions.localAssets` / `WallpaperConfig.localAssets` 显式指定档位，
+ *   **显式值优先于 URL 参数**。只有 dev（`import.meta.env.DEV`）或显式配置/参数才发请求，
+ *   生产构建缺省不会产生任何请求（issue #24：字体探测原来被贴图开关绑死 ——
+ *   `off` 时连 `/api/local-assets` 都不探测，WE 内置字体只能静默回落 sans-serif）。
  */
 import { tex, ptex, sysTex, gtex, patTex } from "./vendor";
+import type { LocalAssetsMode } from "./types";
 
 /** 一次装载的结果（给 diag / `window.__localAssets` 看） */
 export type LocalAssetStats = {
@@ -74,9 +79,10 @@ type Pixel = {
 
 /** 已解码像素缓存：跨挂载复用（切壁纸 / 改画质不重新下载解码）。 */
 const pixels = new Map<string, Pixel>();
-/** 素材源信息（null = 本机没装素材 / 已关闭 / 还没探测） */
+/** 素材源信息（null = 本机没装素材 / 已关闭 / 还没探测；names 为空 = 只探到根、没拉贴图清单） */
 let source: { id: string; names: Set<string> } | null = null;
-let probed = false;
+/** 探测失败的挂载内缓存：同一次挂载里缺 N 个字体只发一次探测请求（resolveLocalAssetsMode 时重置） */
+let probeFailed = false;
 let eagerDone = false;
 let inFlight: Promise<LocalAssetStats | null> | null = null;
 let lastStats: LocalAssetStats | null = null;
@@ -85,14 +91,84 @@ const pending = new Map<string, Promise<Pixel | null>>();
 
 const BASE = "/api/local-assets";
 
-function queryMode(): "off" | "lazy" | "all" {
+/**
+ * URL 参数档位（cfg.localAssets 未指定时的回落，见 resolveLocalAssetsMode）。
+ * `fonts` 档 + `?fonts=1` 是 issue #24 加的：WE 内置字体不在壁纸 pkg 里，
+ * 只想要官方字体时不该连带开启贴图的批量装载。
+ */
+function queryMode(): LocalAssetsMode {
   if (typeof location === "undefined") return "off";
-  const q = new URLSearchParams(location.search).get("localAssets");
-  if (q === "0" || q === "off" || q === "false") return "off";
-  if (q === "all") return "all";
-  if (q === "1" || q === "on" || q === "true") return "lazy";
+  const q = new URLSearchParams(location.search);
+  const la = q.get("localAssets");
+  if (la === "0" || la === "off" || la === "false") return "off";
+  if (la === "all") return "all";
+  if (la === "fonts" || q.get("fonts") === "1" || q.get("fonts") === "true") return "fonts";
+  if (la === "1" || la === "on" || la === "true") return "lazy";
   const dev = typeof import.meta !== "undefined" && (import.meta as any).env?.DEV;
   return dev ? "lazy" : "off";
+}
+
+/** 当前生效档位（installLocalAssets / fetchLocalAssetFile 共用；"off" = 不发任何请求） */
+let activeMode: LocalAssetsMode = "off";
+
+/**
+ * 解析生效档位：cfg 显式值 > URL 参数 > dev 缺省。scene-mount 挂载期调用一次，
+ * 结果存进 activeMode 供后续字体懒探测读取。
+ */
+export function resolveLocalAssetsMode(cfgMode?: LocalAssetsMode): LocalAssetsMode {
+  activeMode = cfgMode ?? queryMode();
+  probeFailed = false; // 新一次挂载允许重新探测（切了素材目录 / 刚装上素材）
+  return activeMode;
+}
+
+/**
+ * 探测素材根（只取 root id；名字清单是贴图路径才需要的，fonts 不用 —— issue #24：
+ * 只实现 `/api/local-assets/local/<rel>` 路由、没有 materials 索引的宿主也能供字体）。
+ * 幂等 + 并发合流；失败缓存到下次 resolveLocalAssetsMode（缺 N 个字体只发一次探测）。
+ */
+let probeInFlight: Promise<boolean> | null = null;
+function probeRoot(): Promise<boolean> {
+  if (source) return Promise.resolve(true);
+  if (probeFailed) return Promise.resolve(false);
+  if (!probeInFlight) {
+    probeInFlight = (async () => {
+      try {
+        const res = await fetch(BASE, { cache: "no-store" });
+        if (!res.ok) return false;
+        const info = (await res.json()) as { ok?: boolean; roots?: Array<{ id: string; dir: string }> };
+        if (!info?.ok || !info.roots?.length) return false;
+        source = { id: info.roots[0].id, names: new Set() };
+        return true;
+      } catch {
+        return false;
+      } finally {
+        if (!source) probeFailed = true;
+        probeInFlight = null;
+      }
+    })();
+  }
+  return probeInFlight;
+}
+
+/**
+ * 素材名清单（materials/index.json）。贴图路径（loadOne / 急切装载）依赖它；
+ * 只取字体的路径不需要。在 installLocalAssets 里按需拉一次。
+ */
+async function loadMaterialNames(): Promise<boolean> {
+  if (!source) return false;
+  if (source.names.size) return true;
+  try {
+    const idxRes = await fetch(`${BASE}/${encodeURIComponent(source.id)}/materials/index.json`, {
+      cache: "force-cache",
+    });
+    if (!idxRes.ok) return false;
+    const idx = (await idxRes.json()) as { names?: string[] };
+    if (!Array.isArray(idx.names) || !idx.names.length) return false;
+    source.names = new Set(idx.names);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 把 .tex 的 mip 解成 RGBA。内嵌 PNG/JPEG（Mirage 素材几乎全是这种）走位图解码。 */
@@ -191,33 +267,32 @@ async function loadOne(name: string): Promise<Pixel | null> {
 /**
  * 探测素材源 + 装载 util 子树 + 装上 provider（幂等，可并发合流）。
  * 没有素材、被关闭、环境不支持 → 返回 null，调用方照常走程序化复刻。
+ *
+ * [issue #24] `cfgMode`（`WallpaperConfig.localAssets`，显式值优先于 URL 参数）：
+ *   - `"off"`：不发任何请求，返回 null；
+ *   - `"fonts"`：**只探测素材根**（供 fetchLocalAssetFile 按名取 `fonts/*`），
+ *     不拉贴图清单、不装 provider —— 字体不该被贴图的批量装载绑架，
+ *     公共贴图继续走程序化复刻；
+ *   - `"lazy"` / `"all"`：与原行为一致（贴图 + 字体都可达）。
  */
-export async function installLocalAssets(): Promise<LocalAssetStats | null> {
-  const mode = queryMode();
+export async function installLocalAssets(cfgMode?: LocalAssetsMode): Promise<LocalAssetStats | null> {
+  const mode = resolveLocalAssetsMode(cfgMode);
   if (mode === "off") return null;
+  if (mode === "fonts") {
+    // 只探根（materials/index.json 是贴图清单，fonts 路径不需要）。
+    // probeRoot 幂等 + 失败缓存，这里 await 一次即完成字体通路的全部准备。
+    await probeRoot();
+    return null;
+  }
   if (eagerDone) return lastStats;
   if (inFlight) return inFlight;
 
   inFlight = (async (): Promise<LocalAssetStats | null> => {
     const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
-    // 1) 探测源：端点不存在（生产 / 没装素材）就静默回落
-    try {
-      const res = await fetch(BASE, { cache: "no-store" });
-      if (!res.ok) return null;
-      const info = (await res.json()) as { ok?: boolean; roots?: Array<{ id: string; dir: string }> };
-      if (!info?.ok || !info.roots?.length) return null;
-      const root = info.roots[0];
-      // 2) 素材名清单：dev server 扫盘给出（引擎名 = materials/ 下的相对路径去 .tex）
-      const idxRes = await fetch(`${BASE}/${encodeURIComponent(root.id)}/materials/index.json`, {
-        cache: "force-cache",
-      });
-      if (!idxRes.ok) return null;
-      const idx = (await idxRes.json()) as { names?: string[] };
-      if (!Array.isArray(idx.names) || !idx.names.length) return null;
-      source = { id: root.id, names: new Set(idx.names) };
-    } catch {
-      return null;
-    }
+    // 1) 探测源 + 素材名清单：端点不存在（生产 / 没装素材）就静默回落。
+    //    探测失败写进 probeFailed，同一次挂载里后续字体懒探测不再重复发请求。
+    if (!(await probeRoot())) return null;
+    if (!(await loadMaterialNames())) return null;
 
     // 3) provider 必须先装：util 注册循环、粒子取贴图都会立刻问它
     sysTex.setSystemTextureProvider((name: string) => pixels.get(name) ?? null);
@@ -230,9 +305,12 @@ export async function installLocalAssets(): Promise<LocalAssetStats | null> {
     // 否则 pattern-textures.js 的程序化复刻兜底。
     patTex.setPatternTextureProvider((name: string) => pixels.get(name) ?? null);
 
-    // 4) 急切装载：util（默认）或全量（mode=all）
-    const utilNames = [...source.names].filter((n) => n.startsWith("util/"));
-    const wanted = mode === "all" ? [...source.names] : utilNames;
+    // 4) 急切装载：util（默认）或全量（mode=all）。source 是模块级可变量，
+    //    await 之后 TS 不再收窄，取局部快照。
+    const src = source;
+    if (!src) return null;
+    const utilNames = [...src.names].filter((n) => n.startsWith("util/"));
+    const wanted = mode === "all" ? [...src.names] : utilNames;
     let failed = 0;
     await mapLimit(wanted, 8, async (n) => {
       const px = await loadOne(n);
@@ -249,8 +327,8 @@ export async function installLocalAssets(): Promise<LocalAssetStats | null> {
       else if (n.startsWith("particle/")) particle++;
     }
     const stats: LocalAssetStats = {
-      source: source.id,
-      available: source.names.size,
+      source: src.id,
+      available: src.names.size,
       requested: wanted.length,
       loaded: pixels.size,
       failed,
@@ -299,13 +377,22 @@ const files = new Map<string, Uint8Array>();
 /**
  * 取素材树里的原始文件字节（非贴图路径：scene-mount 的字体装配拉 `fonts/*.ttf`）。
  * 素材没装 / 路径不存在 → null，调用方继续走自己的兜底（系统字体）。
+ *
+ * [issue #24] 贴图通路没装（installLocalAssets 没跑 / 档位是 fonts / 贴图清单缺失）
+ * 也会在这里懒探测素材根 —— 字体只依赖「根可达」，不依赖贴图清单。档位为 off
+ * （生产构建缺省）时不发任何请求，维持「库不联网」契约。
  */
 export async function fetchLocalAssetFile(rel: string): Promise<Uint8Array | null> {
-  if (!source || !rel || rel.includes("..")) return null;
+  if (!rel || rel.includes("..")) return null;
+  if (!source) {
+    if (activeMode === "off") return null;
+    if (!(await probeRoot())) return null;
+  }
+  const sid = source!.id; // probeRoot 成功后 source 必非空（模块级 let，TS 不跨 await 收窄）
   const hit = files.get(rel);
   if (hit) return hit;
   try {
-    const url = `${BASE}/${encodeURIComponent(source.id)}/${rel
+    const url = `${BASE}/${encodeURIComponent(sid)}/${rel
       .split("/")
       .map(encodeURIComponent)
       .join("/")}`;
@@ -322,4 +409,12 @@ export async function fetchLocalAssetFile(rel: string): Promise<Uint8Array | nul
 /** 调试 / 测试用：已装载的引擎素材名单 */
 export function loadedLocalAssetNames(): string[] {
   return [...pixels.keys()];
+}
+
+/**
+ * 已探测到的素材根 id（null = 没装素材 / 档位 off / 探测失败）。
+ * scene-mount 用它给 fonts 档发一条「字体通路可达」的 info 诊断（issue #24）。
+ */
+export function localAssetsSourceId(): string | null {
+  return source ? source.id : null;
 }

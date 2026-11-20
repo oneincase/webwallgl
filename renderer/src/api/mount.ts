@@ -117,6 +117,10 @@ async function resolveMountConfig(
     // web.ts 读到的 cfg.webSandbox 恒 undefined → 内层 iframe 永远只剩
     // allow-scripts（Origin: null），显式 legacy 的同源素材一律 401。
     webSandbox: o.webSandbox,
+    // [issue #24] 本机 WE 官方素材档位同样必须透传：白名单漏了它，scene-mount →
+    // installLocalAssets 拿到的恒 undefined → 字体通路被生产缺省的 off 绑死，
+    // WE 内置字体（pkg 不内嵌、只在官方 assets/fonts）静默回落 sans-serif。
+    localAssets: o.localAssets,
   };
   let project: unknown = null;
   try {

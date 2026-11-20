@@ -75,7 +75,7 @@ import {
 import { startLiveSystem, rasterizeArtwork, sampleArtworkPalette, type LiveSystemHandle } from "./live-system";
 import { createBgmAnalyser, mergeBgmBands } from "./bgm-analyser";
 import { createSpectrumCalibrator } from "./audio-calibrate";
-import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile } from "./local-assets";
+import { installLocalAssets, ensureLocalAsset, fetchLocalAssetFile, localAssetsSourceId } from "./local-assets";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { WE_BUILTIN_SHADERS } from "../vendor/we-scene/shaders-builtin";
 import { fitWindow, coverContentBounds, layerParallaxOffset, applyCameraZoom, cameraZoomOf, isPerspectiveScene } from "../vendor/we-scene/render/math.js";
@@ -1890,9 +1890,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 必须在注册 util 贴图**之前** await：provider 一旦装上，注册循环直接拿官方像素。
       {
         // 防呆：本地素材只是测试通路，任何意外都不许拖垮挂载（内部已各自 try/catch）
+        // [issue #24] cfg.localAssets（显式档位优先于 URL 参数）传进去：fonts 档
+        // 只探素材根供字体按名取用，不连带贴图装载；undefined 走 ?localAssets= / dev 缺省。
         let st: Awaited<ReturnType<typeof installLocalAssets>> = null;
         try {
-          st = await installLocalAssets();
+          st = await installLocalAssets(cfg.localAssets);
         } catch (e) {
           reportDiag(rt, cfg, `local assets 装载失败（忽略）：${(e as Error)?.message}`, "warn");
         }
@@ -1903,6 +1905,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             `local assets: ${st.loaded}/${st.requested} tex（util ${st.util} / particle ${st.particle}）` +
               ` ${(st.bytes / 1e6).toFixed(1)}MB ${st.ms}ms source=${st.source} mode=${st.mode}` +
               (st.failed ? ` failed=${st.failed}` : ""),
+            "info",
+          );
+        } else if (localAssetsSourceId()) {
+          // fonts 档（或贴图清单缺失但根可达）：字体通路已就绪，贴图走程序化复刻。
+          // 给集成方一条可核对的信息 —— 字体命中与否不再是黑盒（issue #24）。
+          reportDiag(
+            rt,
+            cfg,
+            `local assets: fonts-only source=${localAssetsSourceId()}（贴图通路未启用，公共贴图走程序化复刻）`,
             "info",
           );
         }
@@ -5148,6 +5159,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         // 字体：pkg 内嵌 ttf/otf → FontFace（refs 计数，clear 归零释放）；systemfont_* → 系统字体栈
         const fontFamilies = new Map<string, string>(); // fontPath → CSS family
         const usedFontKeys: string[] = []; // 本次挂载引入的缓存键（cleanup 时 refs--）
+        const missingFonts: string[] = []; // pkg 与本机素材都没取到的字体（汇总诊断用，issue #24）
         const fontPaths = new Set<string>();
         for (const l of scene.layers as any[]) if (l.isText && l.textFont) fontPaths.add(l.textFont);
         // 脚本可能在包内其它字体间切换（3396722575 有 18 个）。只预载层快照路径的话，
@@ -5185,7 +5197,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 ? fe
                 : new Uint8Array(fe as ArrayBuffer)
               : await fetchLocalAssetFile(fp);
-            if (!raw) continue;
+            if (!raw) {
+              // [issue #24] **缺字体必须出声**。过去 `continue` 静默跳过，用户只看到
+              // 「七段数码管变细体」而无从定位（2684578755 的 Segment7Standard.otf
+              // 只存在于 WE 安装目录 assets/fonts，不在壁纸 pkg 里；未开素材通路时
+              // fetchLocalAssetFile 连探测都不发）。指名字体 + 指出素材在哪 + 怎么开。
+              missingFonts.push(fp);
+              reportDiag(
+                rt,
+                cfg,
+                `字体缺失 ${fp}：pkg 内没有，本机 WE 素材（安装目录 assets/fonts，` +
+                  `/api/local-assets 端点或 localAssets:"fonts" 配置）也未取到，该字体回落 sans-serif`,
+                "warn",
+              );
+              continue;
+            }
             // Chrome OTS 拒载 cmap rangeShift 写错的 Tourner 等；先修再喂 FontFace。
             const bytes = sanitizeFontForBrowser(raw);
             // family 带 key 哈希：不同壁纸同文件名字体不共族，释放时按 family 删不误伤
@@ -5204,7 +5230,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             fontFaceCache.set(key, { family: fam, refs: 1 });
             usedFontKeys.push(key);
           } catch (e) {
-            console.warn(`字体加载失败 ${fp}: ${(e as Error).message}`);
+            // [issue #24] FontFace 抛错也要进诊断通道：console.warn 在 npm 库形态
+            // （宿主自接 onDiagnostic）里是黑盒，与 issue #10「缺 stage 必须出声」同一条纪律。
+            reportDiag(rt, cfg, `字体加载失败 ${fp}：${(e as Error)?.message}（已回落 sans-serif）`, "warn");
           }
         }
         if (usedFontKeys.length) {
@@ -5648,7 +5676,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         reportDiag(rt,
           cfg,
           `text widgets: ${textWidgets.length} (scripts ${textWidgets.filter((i) => i.sandbox).length}, ` +
-            `fonts ${fontFamilies.size}, quality ${quality.toFixed(2)})`,
+            // [issue #24] 汇总行区分「装上的」与「缺失的」：单独一个 fonts 计数缩小说明不了谁缺了
+            `fonts ${fontFamilies.size}, quality ${quality.toFixed(2)})` +
+            (missingFonts.length ? ` —— 字体缺失 ${missingFonts.length} 个（已回落 sans-serif）：${missingFonts.join(", ")}` : ""),
           "info",
         );
       }
