@@ -2972,7 +2972,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         if (textures.has(name)) return Promise.resolve(textures.get(name));
         const hit = texInflight.get(name);
         if (hit) return hit;
-        const p = loadTexInner(name);
+        // [we-scene patch] 单张贴图失败**在源头隔离**：容器截断/整块零/解码拒绝都会让
+        // loadTexInner 抛。过去这个异常会从 texInflight 冒到 `await Promise.all(texJobs)`
+        // 与各层加载处，直接 reject 整个 mountScene —— 用户看到的是默认黑壁纸，诊断里
+        // 只有一行 `scene render failed`（2026-11-16 2902406982 的 scene.pkg 有 1~2MiB
+        // 全零块，wallhaven 主图 mip0 也缺 1MiB）。契约与 d763d94 的 model 路径一致：
+        // 失败只跳过这一张，调用方照旧按 `textures.get(name) == null` 回落，其余层继续。
+        const p = loadTexInner(name).catch((e) => {
+          reportDiag(
+            rt,
+            cfg,
+            `贴图 '${name}' 加载失败（跳过该贴图，不影响其它层）：${(e as Error)?.message}`,
+            "warn",
+          );
+          return null;
+        });
         texInflight.set(name, p);
         void p.finally(() => {
           if (texInflight.get(name) === p) texInflight.delete(name);
@@ -4513,10 +4527,22 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             // 五张贴图全抛「不是 .tex 文件」→ scene render failed → 画面全空）。
             // 失败时不写 layer.textureName，交给下面的跳过分支。
             try {
-              await loadTex(texName);
-              layer.textureName = texName;
-              // 材质 shader 路径（F13）的槽 0 贴图：给渲染侧一个可直接 bind 的条目
-              if ((layer as any).meshMaterial) (layer as any).meshMaterial.texture = textures.get(texName) || null;
+              // loadTex 在源头已把失败折成 null（见 loadTex 注释）：这里必须看返回的
+              // 条目而不是「没抛就算成功」，否则会写一个 textures 里不存在的
+              // textureName，后面的 `!texObj` 分支虽然还会跳过，但诊断会丢原因。
+              const loaded = await loadTex(texName);
+              if (loaded) {
+                layer.textureName = texName;
+                // 材质 shader 路径（F13）的槽 0 贴图：给渲染侧一个可直接 bind 的条目
+                if ((layer as any).meshMaterial) (layer as any).meshMaterial.texture = loaded;
+              } else {
+                reportDiag(
+                  rt,
+                  cfg,
+                  `model '${layer.name}' 的贴图 '${texName}' 加载失败，跳过该层`,
+                  "warn",
+                );
+              }
             } catch (e) {
               reportDiag(
                 rt,

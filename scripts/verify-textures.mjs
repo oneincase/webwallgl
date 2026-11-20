@@ -1997,6 +1997,163 @@ async function texPreviewChecks(mod, opts = {}) {
   return local;
 }
 
+// ─────────── [6c] 单张贴图失败隔离（scene-mount.ts 的 loadTex） ───────────
+// 2026-11-16 用户报 2902406982「麻匪 月半与鬼哭 所有元素自定义」整张黑屏：
+// 本机 scene.pkg 有 1~2MiB 全零块（wallhaven 主图 mip0 也缺 1MiB），parseTex 抛
+// 「素材字段越界：mip 尺寸=0x0」。旧 loadTex 不接异常，reject 一路冒到
+// `await Promise.all(texJobs)` → mountScene 整体失败 → 回退默认黑壁纸。
+// 判据形态沿用 verify-instance-textures：[A] 把 loadTex 源码切片原样取出来真跑，
+// [B] 变异红测（删 catch / 删 return null）必须转红。
+const LOADTEX_START = "const loadTex = (name: string): Promise<any | null> => {";
+const LOADTEX_END = "return p;\n      };";
+
+function loadTexSlice(srcText) {
+  const i = srcText.indexOf(LOADTEX_START);
+  if (i < 0) return null;
+  const j = srcText.indexOf(LOADTEX_END, i);
+  if (j < 0) return null;
+  return srcText.slice(i, j + LOADTEX_END.length);
+}
+
+/** TS → JS：本切片只有参数/返回类型与一处 `as Error` */
+function loadTexToJs(slice) {
+  return slice
+    .replace("(name: string): Promise<any | null>", "(name)")
+    .replace("(e as Error)?.message", "e?.message");
+}
+
+function makeLoadTex(slice) {
+  const js = loadTexToJs(slice);
+  // eslint-disable-next-line no-new-func —— 被测对象就是产品源码本身
+  return new Function(
+    "textures",
+    "texInflight",
+    "loadTexInner",
+    "reportDiag",
+    "rt",
+    "cfg",
+    `${js}\n;return loadTex;`,
+  );
+}
+
+/**
+ * 真跑切片的三条契约：
+ *   ① loadTexInner reject → 必须 resolve null（不是 reject），并上报带贴图名的 warn 诊断；
+ *   ② 成功 → 原样返回 entry，且同一名字第二次走 textures 缓存（不再调 loadTexInner）；
+ *   ③ 并发同名 → 共用同一条在途 Promise（只解码一次）。
+ */
+async function loadTexIsolationResult(srcText) {
+  const slice = loadTexSlice(srcText);
+  if (!slice) return { ok: false, why: "切片未定位（loadTex 形状变了，本判据要同步改）" };
+  if (/\bas\s+Error|:\s*Promise/.test(loadTexToJs(slice))) {
+    return { ok: false, why: "切片里仍有 TS 语法（new Function 会抛）" };
+  }
+  let make;
+  try {
+    make = makeLoadTex(slice);
+  } catch (e) {
+    return { ok: false, why: `切片语法错误：${String(e && e.message).slice(0, 160)}` };
+  }
+  const diags = [];
+  const reportDiag = (_rt, _cfg, msg, level) => diags.push({ msg, level });
+  const entry = { width: 8, height: 4 };
+
+  // ① 失败隔离
+  const textures = new Map();
+  const failing = async () => {
+    throw new Error("素材字段越界：mip 尺寸=0x0");
+  };
+  const loadTex = make(textures, new Map(), failing, reportDiag, {}, {});
+  let failedResult = "unset";
+  let failedErr = null;
+  try {
+    failedResult = await loadTex("materials/broken.tex");
+  } catch (e) {
+    failedErr = e;
+  }
+  const failOk =
+    failedErr === null &&
+    failedResult === null &&
+    diags.length === 1 &&
+    diags[0].level === "warn" &&
+    /materials\/broken\.tex/.test(diags[0].msg) &&
+    /加载失败/.test(diags[0].msg);
+
+  // ② 成功 + 缓存
+  let calls = 0;
+  const okInner = async (name) => {
+    calls++;
+    textures.set(name, entry);
+    return entry;
+  };
+  const loadTexOk = make(textures, new Map(), okInner, reportDiag, {}, {});
+  const a = await loadTexOk("materials/good.tex");
+  const b = await loadTexOk("materials/good.tex");
+  const cacheOk = a === entry && b === entry && calls === 1;
+
+  // ③ 并发同名去重
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let slowCalls = 0;
+  const slowInner = async (name) => {
+    slowCalls++;
+    await gate;
+    textures.set(name, entry);
+    return entry;
+  };
+  const loadTexSlow = make(textures, new Map(), slowInner, reportDiag, {}, {});
+  const p1 = loadTexSlow("materials/slow.tex");
+  const p2 = loadTexSlow("materials/slow.tex");
+  release();
+  const [c, d] = await Promise.all([p1, p2]);
+  const inflightOk = slowCalls === 1 && c === entry && d === entry;
+
+  return {
+    ok: failOk && cacheOk && inflightOk,
+    why: JSON.stringify({
+      failOk,
+      cacheOk,
+      inflightOk,
+      failedResult,
+      failedErr: String(failedErr),
+      diags,
+      calls,
+      slowCalls,
+    }),
+  };
+}
+
+async function texFailureIsolation() {
+  const srcText = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const slice = loadTexSlice(srcText);
+  check(!!slice, `必须能在 scene-mount.ts 里定位到 loadTex 切片（\`${LOADTEX_START}\` … \`${LOADTEX_END}\`）`);
+  const real = await loadTexIsolationResult(srcText);
+  check(real.ok, `loadTex 必须把 reject 折成 null + 带名 warn，并保留缓存/在途去重（${real.why}）`);
+  // 接线：texJobs 仍统一 await；隔离在源头而不是漏掉某个 push 点
+  check(/await Promise\.all\(texJobs\);/.test(srcText), "texJobs 必须仍统一 await（隔离在 loadTex 源头）");
+  // [B] 变异红测：删 catch / 删 return null ⇒ 上面那条必须转红
+  const noCatch = srcText.replace(".catch((e) => {", ".then((e) => {");
+  const noNull = srcText.replace(/return null;\n        \}\);/, "});");
+  const mutations = [
+    ["M1 去掉 .catch（reject 原样外泄）", noCatch],
+    ["M2 catch 里不返回 null", noNull],
+  ];
+  // M1 会让 `void p.finally(...)` 派生出一条无处理器的 rejected promise（真实代码
+  // 里 p 因 catch 永不 reject，所以永远走不到）。变异测试只为证明判据有牙，这里
+  // 临时吞掉该 unhandledRejection，避免 Node 以退出码 1 结束、误报为脚本崩溃。
+  const swallow = () => {};
+  process.on("unhandledRejection", swallow);
+  try {
+    for (const [name, mutated] of mutations) {
+      const r = await loadTexIsolationResult(mutated);
+      check(r.ok === false, `${name} ⇒ loadTex 隔离判据必须变红（实得 ok=${r.ok}）`);
+    }
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    process.off("unhandledRejection", swallow);
+  }
+}
+
 async function texPreview() {
   console.log("\n[7] 编辑器贴图缩略图 / 尺寸（tex-preview.ts，W16 地基）");
   const mod = await loadTexPreview();
@@ -2038,6 +2195,8 @@ async function texPreviewMutations() {
   check(after === before, `变异只发生在内存里：真实文件 sha256 前后一致（${before.slice(0, 12)}…）`);
 }
 
+console.log("\n[6c] 单张贴图失败隔离：loadTex 必须把 reject 折成 null（一张坏图不得整墙黑屏）");
+await texFailureIsolation();
 await texPreview();
 await texPreviewMutations();
 
