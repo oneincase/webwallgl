@@ -2354,6 +2354,9 @@ export function createRenderer(canvas, opts = {}) {
     }
     return q
   }
+  // [issue #23] 顶点位移检测用的 vert 源缓存（按 shader 名；getEffectProgram 的
+  // shaderSrcCache 在程序缓存之后，外扩估算在链装配期就要读源码）。
+  const effectVertSrcCache = new Map()
   let currentQuadKey = null
   function uploadQuad(key, verts) {
     if (currentQuadKey === key) return
@@ -2774,7 +2777,7 @@ export function createRenderer(canvas, opts = {}) {
     return m
   }
 
-  function compositeLayer(prog, inputTex, color4, layer, cam, viewProj, width, height, premultiplied = false, frameBasis = null, contentRect = null) {
+  function compositeLayer(prog, inputTex, color4, layer, cam, viewProj, width, height, premultiplied = false, frameBasis = null, contentRect = null, chainScale = null) {
     const base = layerModelMatrix(layer, cam)
     // [we-scene patch] contentRect（puppet 网格超出层矩形时）：层 FBO 覆盖的是
     // 「层矩形 ∪ 网格包围盒」，比 layer.size 大且中心可能偏移，合成 quad 必须按
@@ -2786,6 +2789,12 @@ export function createRenderer(canvas, opts = {}) {
       const cy = (contentRect[1] + contentRect[3] / 2) * layer.scale[1]
       m = mat4Translate(m, cx, -cy, 0)
       m = mat4Scale(m, contentRect[2] * layer.scale[0], contentRect[3] * layer.scale[1], 1)
+    } else if (chainScale) {
+      // [issue #23] 顶点位移外扩链：FBO 全域 = 内容 + 2P（四周对称），合成 quad
+      // 等比放大 k = chain/内容 —— 中心不动、内区恰好落回原层矩形，padding 区
+      // 显示到层矩形之外（与 WE 的溢出观感一致）。用「base 尺寸 × k」而不是
+      // 直接用 chain 像素数，避开 base.w（未取整）与 fboW（取整）的舍入差。
+      m = mat4Scale(m, base.w * chainScale[0], base.h * chainScale[1], 1)
     } else {
       m = mat4Scale(m, base.w, base.h, 1)
     }
@@ -4903,6 +4912,52 @@ export function createRenderer(canvas, opts = {}) {
       }
     }
 
+    // [issue #23 P1] 文字层的顶点位移外扩边距（padding）。
+    // 2684578755 实证：官方 WE 里 skew(MODE=1) 的日期「2026」完整，我们被裁 ——
+    // 效果链 FBO = 图层纹理尺寸，位移 = inset × 内容高（Date 0.40×105 ≈ 42px）
+    // 超出文字画布 ~20% 的留白，字形顶部被吃。修法 = 效果链 FBO 四周外扩 P、
+    // copy 画进内区、合成按 contentRect 放回（内区 ↔ 原层矩形，padding 区
+    // 显示到层矩形之外，与 WE 的溢出观感一致）。
+    // **只对文字层启用**：2748169441 / 3470764447 的音频条同样带大 inset，但
+    // 「位移后塌出画布」的剪切斜带是用户对照 WE 确认过的造型（forbidden.md：
+    // 不要改那条 skew），非文字层保持现状、只吃 [issue #23] 的越界诊断。
+    // 预算（docs/EFFECT-PADDING-PLAN.md §4）：P ≤ 0.5×min(fboW,fboH) ——
+    // 目标案例（0.27/0.40）都落在内；极端 inset（0.97）天然超预算，维持原裁切。
+    // g_Texture0Resolution 仍按**内容尺寸**绑定（位移量不随 padding 放大，
+    // 与 WE 的实测斜率一致，见 issue #22 的数值论证）。
+    let padPx = 0
+    if (layer.isText && effects.length) {
+      for (const eff of effects) {
+        const passes = eff.materialPasses || []
+        for (let pi = 0; pi < passes.length; pi++) {
+          const mp = passes[pi]
+          if (!mp.shader) continue
+          const ov = eff.passes && eff.passes[pi]
+          const consts = { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) }
+          const insetNum = (k) => {
+            const raw = consts[k]
+            const n = raw !== null && typeof raw === 'object' ? Number(raw.value) : Number(raw)
+            return Number.isFinite(n) ? Math.abs(n) : 0
+          }
+          if (!(insetNum('left') || insetNum('right') || insetNum('top') || insetNum('bottom'))) continue
+          // 确认是顶点位移 shader（读 vert 源，与 progEntry.vertexDisplace 同一正则；
+          // 材质 JSON 带这四个常量名但不动 position 的效果不外扩）
+          let vertSrc = effectVertSrcCache.get(mp.shader)
+          if (vertSrc === undefined) {
+            vertSrc = (await shaderResolver('shaders/' + mp.shader + '.vert')) || ''
+            effectVertSrcCache.set(mp.shader, vertSrc)
+          }
+          if (!/position\s*\.\s*x[y]?\s*(\+=|-=|=)/.test(vertSrc) && !/position\s*\.\s*y\s*(\+=|-=)/.test(vertSrc)) continue
+          const lR = Math.max(insetNum('left'), insetNum('right')) * fboH
+          const tB = Math.max(insetNum('top'), insetNum('bottom')) * fboW
+          padPx = Math.max(padPx, Math.ceil(Math.max(lR, tB)))
+        }
+      }
+      padPx = Math.min(padPx, Math.floor(0.5 * Math.min(fboW, fboH)))
+    }
+    const chainW = fboW + padPx * 2
+    const chainH = fboH + padPx * 2
+
     // 无效果：直接合成
     if (effects.length === 0) {
       if (isPuppet) drawPuppetDirect(layer, cam, viewProj, width, height, time)
@@ -4918,17 +4973,19 @@ export function createRenderer(canvas, opts = {}) {
       return
     }
 
-    // copy pass → FBO A（乒乓 A/B 必须独立实例）
-    const fboA = getFBO(fboW, fboH, 'ping')
-    const fboB = getFBO(fboW, fboH, 'pong')
-    const layerOrtho = mat4Ortho(0, fboW, 0, fboH, -10000, 10000)
+    // copy pass → FBO A（乒乓 A/B 必须独立实例）。[issue #23] 尺寸 = 内容 + 2×padding，
+    // copy 的 MVP 用 ortho(-P, w+P, -P, h+P) 把内容画进内区（FBO 存储倒置约定不变），
+    // padding 区保持 copy 前清好的透明。
+    const fboA = getFBO(chainW, chainH, 'ping')
+    const fboB = getFBO(chainW, chainH, 'pong')
+    const layerOrtho = mat4Ortho(-padPx, fboW + padPx, -padPx, fboH + padPx, -10000, 10000)
     if (isPuppet) {
       // puppet 的效果链在贴图空间：这里走和普通图片层完全相同的 copy pass，
       // 把平面贴图铺进 FBO A；网格形变留到链尾（见文件中部那段长注释）。
       gl.useProgram(copyProg)
       setBlend('normal')
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo)
-      gl.viewport(0, 0, fboW, fboH)
+      gl.viewport(0, 0, chainW, chainH)
       gl.clearColor(0, 0, 0, 0)
       gl.clear(gl.COLOR_BUFFER_BIT)
       gl.bindVertexArray(vao)
@@ -4958,7 +5015,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.useProgram(copyProg)
       setBlend('normal')
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo)
-      gl.viewport(0, 0, fboW, fboH)
+      gl.viewport(0, 0, chainW, chainH)
       // 先清成透明：fboA/fboB 按尺寸缓存、被所有图层共享，上一层的内容会残留。
       // waterwaves 这类效果做 UV 位移时会采样到 quad 之外，层 FBO 是 CLAMP_TO_EDGE，
       // 于是把残留像素（solid 层缺贴图时回退的 whiteTex 尤为明显）沿边缘拉出来 ——
@@ -5264,7 +5321,7 @@ export function createRenderer(canvas, opts = {}) {
           }
           entry = paintDefault || { glTex: whiteTex, width: 1, height: 1, tex: whiteTex }
         }
-        const t = entry.fbo ? entry : { tex: entry.glTex || whiteTex, width: entry.width || 1, height: entry.height || 1 }
+        let t = entry.fbo ? entry : { tex: entry.glTex || whiteTex, width: entry.width || 1, height: entry.height || 1 }
         gl.activeTexture(gl.TEXTURE0 + ti)
         gl.bindTexture(gl.TEXTURE_2D, t.tex)
         // [we-scene patch] 效果链输入槽（ti>=1）的环绕按**贴图自身**的 wrap 设置：
@@ -5290,6 +5347,14 @@ export function createRenderer(canvas, opts = {}) {
           // 贴图对象（entry）在多个 pass / 多帧之间共享，设一次即可，避免每帧的冗余调用。
           entry.samplerWrapSet = true
         }
+        // [issue #23] 外扩链的槽 0（链输入 = padded FBO）按**内容尺寸**上报：
+        // skew 家族的位移 = g_Texture0Resolution.zw × inset，放大成 padded 尺寸
+        // 会让位移量随 padding 膨胀（与 WE 实测斜率矛盾，issue #22 数值论证）。
+        // blur 等以 .zw 当 texel 的混合链拿到的会是内容 texel 而非真实 texel ——
+        // 偏差 ≤ 2P/pw，且这类链一般不与 skew 同链，可接受。
+        // 实现：换上报用的 t 本体（tex 仍指 padded FBO 纹理，只改 width/height 字段），
+        // resolutions.set 一行保持 M1.7 判据的字面形状（verify-mat 按字面求值）。
+        if (padPx > 0 && entry === passInput) t = { tex: t.tex, width: fboW, height: fboH }
         resolutions.set(ti, [t.width, t.height, t.width, t.height])
       }
       // 系统 uniform（mvp 随 quad 空间，见上方说明）
@@ -5310,8 +5375,13 @@ export function createRenderer(canvas, opts = {}) {
         // M·p = S·p + t：先 scale(1/w, −1/h) 再 translate(−0.5, +0.5)，即
         // mat4Translate(mat4Scale(I, 1/w, −1/h), −0.5, +0.5)（math.js 的
         // Translate/Scale 都是右乘，T·S 才是「先缩放后平移」）。
+        // [issue #23] 外扩链（padPx>0）再减去内区起点 P：局部坐标以**内容**为准
+        // （内区 [P, P+w] ↔ 层局部 [−0.5, +0.5]），屏幕对齐语义不变。
         em = usePixelQuad
-          ? mat4Multiply(em, mat4Scale(mat4Translate(mat4Identity(), -0.5, 0.5, 0), 1 / outFBO.width, -1 / outFBO.height, 1))
+          ? mat4Multiply(em, mat4Scale(
+              mat4Translate(mat4Identity(), -0.5 - padPx / fboW, 0.5 + padPx / fboH, 0),
+              1 / fboW, -1 / fboH, 1,
+            ))
           : mat4Multiply(em, mat4Scale(mat4Identity(), 0.5, 0.5, 1))
         effectScreenMVP = mat4Transpose(mat4Multiply(viewProj, em))
       }
@@ -5324,13 +5394,14 @@ export function createRenderer(canvas, opts = {}) {
       const constCacheKey = (layer.id || layer.name || '?') + '|' + (mp.shader || '?') + '|' + fi
       const constMerged = { ...(mp.constants || {}), ...((ov && ov.constantshadervalues) || {}) }
       // [issue #23] 顶点位移越界的一次性 info：效果链 FBO = 图层纹理尺寸，位移
-      // 超出「内容四周留白」的部分直接被裁。文字层最疼（画布留白 20% 上下，而
-      // 2684578755 的 skew left=0.27/0.40 位移是画布高的 27%/40% —— 首字形/年份
-      // 顶部被吃）。渲染器不知道内容墨迹边距，只能按 **常量 inset × 画布尺寸**
-      // 估算位移量给个提示（skew 家族的 left/right/top/bottom；transform 的
-      // offset/scale、foliagesway 的时变摆动不在此列，估不了就不报）。
-      // 只 info 不 warn：位移大 ≠ 一定裁 —— 2748169441 的 top=-0.97 是作者要的
-      // 「剪切后斜带」造型（WE 同样按图层尺寸跑效果链，大概率同样裁）。
+      // 超出「内容四周留白」的部分直接被裁。渲染器不知道内容墨迹边距，只能按
+      // **常量 inset × 内容尺寸**（注意：外扩链用 fboW/fboH 而不是 padded 的
+      // outFBO 尺寸 —— 位移量以内容为基准）估算给个提示（skew 家族的
+      // left/right/top/bottom；transform 的 offset/scale、foliagesway 的时变摆动
+      // 不在此列，估不了就不报）。
+      // [issue #23 P1] 文字层已外扩（padPx ≥ disp）= 裁切已被吸收，不再报；
+      // 预算被截断（disp > padPx）或非文字层才报。只 info 不 warn：位移大 ≠ 一定
+      // 裁 —— 2748169441 的 top=-0.97 是作者要的「剪切后斜带」造型。
       // one-shot 按 层+shader 去重，不刷屏。
       if (usePixelQuad && progEntry.vertexDisplace) {
         const insetNum = (k) => {
@@ -5338,17 +5409,18 @@ export function createRenderer(canvas, opts = {}) {
           const n = raw !== null && typeof raw === 'object' ? Number(raw.value) : Number(raw)
           return Number.isFinite(n) ? Math.abs(n) : 0
         }
-        const lR = Math.max(insetNum('left'), insetNum('right')) * outFBO.height
-        const tB = Math.max(insetNum('top'), insetNum('bottom')) * outFBO.width
+        const lR = Math.max(insetNum('left'), insetNum('right')) * fboH
+        const tB = Math.max(insetNum('top'), insetNum('bottom')) * fboW
         const disp = Math.max(lR, tB)
-        if (disp > 4) {
+        if (disp > 4 && !(padPx > 0 && disp <= padPx + 0.5)) {
           const clipKey = 'vclip:' + (layer.id !== undefined ? layer.id : layer.name) + '|' + (mp.shader || '?')
           if (!oneShotDiag.has(clipKey)) {
             oneShotDiag.add(clipKey)
             diag(
               '顶点位移效果可能裁切：层 ' + (layer.name || layer.id) + ' ' + (mp.shader || '?') +
-                ' inset ≤ ' + Math.round(disp / Math.max(outFBO.width, outFBO.height) * 100) + '% → 位移约 ' + Math.round(disp) +
-                'px（画布 ' + outFBO.width + '×' + outFBO.height + '）；效果目标=图层尺寸，内容边距不足时超出部分被裁（issue #23）',
+                ' inset ≤ ' + Math.round(disp / Math.max(fboW, fboH) * 100) + '% → 位移约 ' + Math.round(disp) +
+                'px（画布 ' + fboW + '×' + fboH + (padPx > 0 ? '，外扩 ' + padPx + 'px 后仍超出' : '') +
+                '）；效果目标=图层尺寸，内容边距不足时超出部分被裁（issue #23）',
             )
           }
         }
@@ -5411,7 +5483,11 @@ export function createRenderer(canvas, opts = {}) {
     // 「背景 + 效果」的**不透明**结果，按普通 over 直接盖回原位即可
     // （效果没改动的像素恰好等于原背景，视觉上零遮挡）。走 premultiplied 的
     // 加法分支会把整块背景又加一遍，画面直接过曝。
-    compositeLayer(compProg, curInput.tex, [1, 1, 1, 1], layer, cam, viewProj, width, height, !!layer.isContainer && !layer.groupTex && !usePassthrough, null, null)
+    // [issue #23] 外扩链等比放回（chainScale，见 compositeLayer 注释）：
+    // FBO 全域 =「内容 + 2P」，对称外扩 ⇒ 内区恰好落回原层矩形，padding 区
+    // 显示到层矩形之外，与 WE 的溢出观感一致。
+    compositeLayer(compProg, curInput.tex, [1, 1, 1, 1], layer, cam, viewProj, width, height, !!layer.isContainer && !layer.groupTex && !usePassthrough, null, null,
+      padPx > 0 ? [chainW / fboW, chainH / fboH] : null)
   }
 
   return {

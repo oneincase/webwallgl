@@ -2403,8 +2403,9 @@ const wireErrors = [];
   if (!/mat4Ortho\(0, outFBO\.width, outFBO\.height, 0, -10000, 10000\)/.test(rndSrc22)) {
     wireErrors.push("passMVP 必须与 passQuadYUp 成对：ortho(0,w,h,0)（top=h ⇒ y=0 → NDC +1）");
   }
-  if (!/mat4Translate\(mat4Identity\(\), -0\.5, 0\.5, 0\), 1 \/ outFBO\.width, -1 \/ outFBO\.height, 1\)/.test(rndSrc22)) {
-    wireErrors.push("effectScreenMVP 的像素归一化必须翻 y（translate(−0.5,+0.5) × scale(1/w,−1/h)）");
+  if (!/mat4Translate\(mat4Identity\(\), -0\.5 - padPx \/ fboW, 0\.5 \+ padPx \/ fboH, 0\)/.test(rndSrc22) ||
+      !/1 \/ fboW, -1 \/ fboH, 1/.test(rndSrc22)) {
+    wireErrors.push("effectScreenMVP 的像素归一化必须翻 y（translate(−0.5,+0.5) × scale(1/w,−1/h)），外扩链再减内区起点 P（issue #22/#23）");
   }
   // copy pass 保持 layerQuad（FBO 内容倒置约定是合成/命中/分组判据的地基，不能跟着翻）
   if (!/uploadQuad\('layer' \+ fboW \+ 'x' \+ fboH, layerQuad\(fboW, fboH\)\)/.test(rndSrc22)) {
@@ -2452,6 +2453,102 @@ const wireErrors = [];
   }
   if (!/顶点位移效果可能裁切/.test(rndSrc23) || !/oneShotDiag\.add\(clipKey\)/.test(rndSrc23)) {
     wireErrors.push("pass 循环必须发「顶点位移效果可能裁切」的 one-shot 诊断（clipKey = 层+shader 去重）");
+  }
+}
+
+// ─────────── [issue #23 P1] 文字层顶点位移外扩（padding）───────────
+// 2684578755 实证：官方 WE 日期「2026」完整、我们被裁（效果链 FBO = 图层纹理
+// 尺寸，位移 = inset × 内容高超出文字画布留白）。修法 = 文字层外扩 P、copy 画进
+// 内区（FBO 倒置存储约定不变）、pass quad 铺满外扩域、effectScreenMVP 按**内容**
+// 归一（减内区起点 P）、resolutions 槽 0 上报内容尺寸（位移量不随 padding 膨胀）、
+// 合成等比放回（chainScale，对称外扩 ⇒ 内区恰好落回原层矩形）。
+// **只对文字层**：2748169441/3470764447 的音频条「塌出画布」剪切造型是用户对照
+// WE 确认过的（forbidden.md），非文字层不动。预算 P ≤ 0.5×min(fboW,fboH)。
+{
+  // ① 数值判据：真矩阵验证外扩链的四段映射（2684578755 Date 层实测参数 422×105, P=42）
+  const glslModP1 = await imp("renderer/vendor/we-scene/render/renderer-glsl.js");
+  const mathP1 = await imp("renderer/vendor/we-scene/render/math.js");
+  const { passQuadVertsYUp } = glslModP1;
+  const { mat4Ortho: oP1, mat4Identity: iP1, mat4Translate: tP1, mat4Scale: sP1 } = mathP1;
+  const applyP1 = (M, x, y) => {
+    const v = [x, y, 0, 1]; const o = [];
+    for (let r = 0; r < 4; r++) o[r] = M[0 * 4 + r] * v[0] + M[1 * 4 + r] * v[1] + M[2 * 4 + r] * v[2] + M[3 * 4 + r] * v[3];
+    return o;
+  };
+  const nearP1 = (a, b) => Math.abs(a - b) < 1e-5;
+  const w1 = 422, h1 = 105, P1 = 42, cw1 = w1 + 2 * P1, ch1 = h1 + 2 * P1;
+  // a) padded copy：内容四角必须落进内区四角（FBO 像素），倒置约定不破坏
+  const copyO = oP1(-P1, w1 + P1, -P1, h1 + P1, -10000, 10000);
+  for (const [x, y] of [[0, 0], [w1, 0], [0, h1], [w1, h1]]) {
+    const p = applyP1(copyO, x, y);
+    const px = (p[0] / p[3] + 1) / 2 * cw1, py = (p[1] / p[3] + 1) / 2 * ch1;
+    if (!nearP1(px, x + P1) || !nearP1(py, y + P1)) {
+      wireErrors.push(`外扩 copy 的 ortho(-P,w+P,-P,h+P) 映射错误：内容 (${x},${y}) → FBO (${px.toFixed(2)},${py.toFixed(2)})，期望内区 (${x + P1},${y + P1})`);
+      break;
+    }
+  }
+  // b) padded pass quad 恒等直通（外扩域上仍逐像素直通）
+  {
+    const passO = oP1(0, cw1, ch1, 0, -10000, 10000);
+    const q = passQuadVertsYUp(cw1, ch1);
+    for (let i = 0; i < 6; i++) {
+      const [x, y,,, v] = [q[i * 5], q[i * 5 + 1], q[i * 5 + 2], q[i * 5 + 3], q[i * 5 + 4]];
+      const p = applyP1(passO, x, y);
+      if (Math.abs((p[1] / p[3] + 1) / 2 - v) > 1e-6) {
+        wireErrors.push("外扩域上的 passQuadVertsYUp 恒等直通破坏（#23 padding 改坏了 #22 的不变量）");
+        break;
+      }
+    }
+  }
+  // c) effectScreenMVP 内区映射：内区角 ↔ 局部 ±0.5（位移参考系以内容为准）
+  {
+    const em = sP1(tP1(iP1(), -0.5 - P1 / w1, 0.5 + P1 / h1, 0), 1 / w1, -1 / h1, 1);
+    const pt = (x, y) => { const p = applyP1(em, x, y); return [p[0] / p[3], p[1] / p[3]]; };
+    const [a1, b1] = pt(P1, P1), [a2, b2] = pt(P1 + w1, P1 + h1);
+    if (!nearP1(a1, -0.5) || !nearP1(b1, 0.5) || !nearP1(a2, 0.5) || !nearP1(b2, -0.5)) {
+      wireErrors.push(`外扩链 effectScreenMVP 内区映射错误：内区角映到 (${a1.toFixed(3)},${b1.toFixed(3)})/(${a2.toFixed(3)},${b2.toFixed(3)})，期望 (−0.5,+0.5)/(+0.5,−0.5)`);
+    }
+  }
+  // d) chainScale 合成：内区四角必须落回原层矩形（±base/2），外缘 = 层矩形 + P
+  //    （复刻 compositeLayer 的 chainScale 公式；base 局部 = 层中心像素空间）
+  {
+    const kx = cw1 / w1, ky = ch1 / h1;
+    const toLocal = (px, pyFromBottom) => [(px / cw1 - 0.5) * w1 * kx, (pyFromBottom / ch1 - 0.5) * h1 * ky];
+    for (const [px, py, ex, ey] of [
+      [P1, P1, -w1 / 2, -h1 / 2], [P1 + w1, P1, w1 / 2, -h1 / 2],
+      [P1, P1 + h1, -w1 / 2, h1 / 2], [P1 + w1, P1 + h1, w1 / 2, h1 / 2],
+    ]) {
+      const [lx, ly] = toLocal(px, py);
+      if (!nearP1(lx, ex) || !nearP1(ly, ey)) {
+        wireErrors.push(`外扩合成 chainScale 内区角 (${px},${py}) 映到 (${lx.toFixed(2)},${ly.toFixed(2)})，期望原层矩形角 (${ex},${ey})`);
+        break;
+      }
+    }
+    const [ox] = toLocal(0, 0);
+    if (!nearP1(ox, -w1 / 2 - P1)) {
+      wireErrors.push(`外扩合成外缘应超出层矩形 P（实得 ${ox.toFixed(2)}，期望 ${-w1 / 2 - P1}）`);
+    }
+  }
+  // ② 接线（文本判据，锁六处联动不散架）
+  const rndSrcP1 = readText(fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")));
+  if (!/if \(layer\.isText && effects\.length\)/.test(rndSrcP1)) {
+    wireErrors.push("外扩 padding 必须只对文字层启用（2748169441/3470764447 的剪切造型是用户确认的，非文字层不得动）");
+  }
+  if (!/Math\.min\(padPx, Math\.floor\(0\.5 \* Math\.min\(fboW, fboH\)\)\)/.test(rndSrcP1)) {
+    wireErrors.push("外扩预算 P ≤ 0.5×min(fboW,fboH) 必须存在（防极端 inset 撑爆显存/改变造型）");
+  }
+  if (!/getFBO\(chainW, chainH, 'ping'\)/.test(rndSrcP1) || !/mat4Ortho\(-padPx, fboW \+ padPx, -padPx, fboH \+ padPx, -10000, 10000\)/.test(rndSrcP1)) {
+    wireErrors.push("外扩链 FBO 尺寸与 copy 内区 MVP 必须成对（ortho(-P,w+P,-P,h+P)）");
+  }
+  if (!/if \(padPx > 0 && entry === passInput\) t = \{ tex: t\.tex, width: fboW, height: fboH \}/.test(rndSrcP1) ||
+      !/resolutions\.set\(ti, \[t\.width, t\.height, t\.width, t\.height\]\)/.test(rndSrcP1)) {
+    wireErrors.push("外扩链槽 0 的 g_Texture0Resolution 必须按内容尺寸上报（换 t 本体，位移量不得随 padding 膨胀；且保持 M1.7 判据的字面形状）");
+  }
+  if (!/padPx > 0 \? \[chainW \/ fboW, chainH \/ fboH\] : null/.test(rndSrcP1)) {
+    wireErrors.push("外扩链合成必须走 chainScale 等比放回（内区落回原层矩形）");
+  }
+  if (!/disp <= padPx \+ 0\.5/.test(rndSrcP1)) {
+    wireErrors.push("裁切诊断必须跳过已被外扩吸收的位移（disp ≤ padPx 不再报）");
   }
 }
 
