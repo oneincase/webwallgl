@@ -12,6 +12,9 @@
  * 宿主可**先于本 shim** 声明站点根（可选，官方语义的 `..` 夹住按它行事）：
  *   window.__weSiteRoot = "/<前缀…>/<条目>/"   — 站点形态非 /web/<token>/<itemId>/
  *                                              的宿主（dsh-wallpaper-engine）用
+ *   严格沙箱（allow-scripts，opaque origin）下，宿主自己的贴图/视频帧要在加载前挂
+ *   `crossOrigin="anonymous"` 才能被 WebGL 采成纹理（issue #25，见文件末尾
+ *   armHostAssetCors；命中面 = baseURI 同源 + 站点根之下，推不出根就整段放弃）。
  *
  * 父页控制面 __we*（main.ts weShimCall / web.ts 泵）：
  *   __weSetPaused / __weSetFps / __weSetVolume / __weApplyProps / __weSeedProps
@@ -2077,5 +2080,140 @@
       /* 整段是增强：任何失败都不影响壁纸本身 */
     }
   })();
+
+  /**
+   * [issue #25] 严格沙箱（`sandbox="allow-scripts"`，opaque origin）下，网页壁纸把
+   * **宿主自己的**贴图上传成 WebGL 纹理时会被判跨源污染：`texImage2D` 抛
+   * `SecurityError`，spine / Live2D / WebGL 类壁纸整块画不出来（只剩页面自己的 CSS
+   * 底色）。宿主侧 `/scene-files` 已返回 `Access-Control-Allow-Origin: *`，缺的只是
+   * 图片走 CORS 模式 —— 在加载前给宿主资源挂 `crossOrigin="anonymous"`。
+   *
+   * 命中面（宁可不修，不可误修）：**baseURI 同源** + **落在站点根之下** + 非
+   * data:/blob:/about: 等。origin 必须取自 `document.baseURI`：引擎会把网页壁纸
+   * HTML 转成 `blob:` URL 再塞 iframe，`location.href` 的 origin 是宿主的 scheme
+   * （null），与贴图的 http 源永不相等 —— 用它判 origin 会让补丁完全失效。
+   * 站点根复用 `siteRootPath()`（与 `__weRewriteFileUrl` 同一套规则），推不出就
+   * 整段放弃：给没开 CORS 的图挂 crossOrigin 会直接裂图，比"能看不能上传"更糟。
+   * 跨站资源与作者已设过 crossOrigin 的一律不碰；视频帧同样需要（HTMLMediaElement）。
+   * `crossOrigin` 必须在加载开始前设置 ⇒ 挂在 `src` 的 setter 与 setAttribute 上。
+   */
+  function armHostAssetCors() {
+    var base = "";
+    try {
+      base = (w.document && w.document.baseURI) || "";
+    } catch (_) {
+      /* 不透明源读 baseURI 可能抛，退回 location */
+    }
+    if (!base) {
+      try {
+        base = (w.location && w.location.href) || "";
+      } catch (_) {
+        return;
+      }
+    }
+    if (!base) return;
+    var docOrigin = "";
+    try {
+      docOrigin = new URL(base).origin;
+    } catch (_) {
+      docOrigin = "";
+    }
+    if (!docOrigin || docOrigin === "null") return;
+    var siteRoot = siteRootPath();
+    if (!siteRoot) return; // 推不出站点根：不修复，也绝不弄裂
+
+    var SKIP = /^(?:data:|blob:|about:|javascript:|chrome-extension:|moz-extension:)/i;
+    var isHostAsset = function (u) {
+      var s = String(u == null ? "" : u).trim();
+      if (!s || SKIP.test(s)) return false;
+      var abs;
+      try {
+        abs = new URL(s, base);
+      } catch (_) {
+        return false;
+      }
+      if (!abs.origin || abs.origin === "null" || abs.origin !== docOrigin) return false;
+      return abs.pathname.indexOf(siteRoot) === 0;
+    };
+    // 只处理会进画布的图片/视频（不碰 script/link：它们改 CORS 属另一类风险）
+    var arm = function (el, url) {
+      try {
+        if (!el || !("crossOrigin" in el)) return;
+        var tag = String(el.tagName || "").toUpperCase();
+        if (tag !== "IMG" && tag !== "VIDEO" && tag !== "AUDIO") return;
+        var host = isHostAsset(url);
+        if (el.__weCorsArmed) {
+          // 我们挂的标记还在：作者自己改过 crossOrigin 就交出控制权
+          if (el.crossOrigin !== "anonymous") {
+            el.__weCorsArmed = 0;
+          } else if (host) {
+            return;
+          } else {
+            // 换成跨站/根外资源：撤掉，避免把原本能显示的图变成裂图
+            el.crossOrigin = null;
+            el.__weCorsArmed = 0;
+            return;
+          }
+        }
+        if (el.crossOrigin) return; // 作者显式设过：不覆盖
+        if (!host) return;
+        el.crossOrigin = "anonymous";
+        el.__weCorsArmed = 1;
+      } catch (_) {
+        /* 单个元素失败不影响其余资源 */
+      }
+    };
+
+    // ① setAttribute("src" | "poster", …)
+    try {
+      var ep = w.Element && w.Element.prototype;
+      var setAttr = ep && ep.setAttribute;
+      if (typeof setAttr === "function" && !ep.__weCorsArm) {
+        ep.setAttribute = function (name, value) {
+          try {
+            var k = String(name || "").toLowerCase();
+            if (k === "src" || k === "poster") arm(this, value);
+          } catch (_) {
+            /* 忽略 */
+          }
+          return setAttr.call(this, name, value);
+        };
+        ep.__weCorsArm = 1;
+      }
+    } catch (_) {
+      /* 无 Element 的环境忽略 */
+    }
+
+    // ② 属性赋值（img.src = … / video.src = …），必须在加载开始前挂上
+    var kinds = ["HTMLImageElement", "HTMLMediaElement"];
+    for (var i = 0; i < kinds.length; i++) {
+      try {
+        var C = w[kinds[i]];
+        if (!C || !C.prototype) continue;
+        var desc = Object.getOwnPropertyDescriptor(C.prototype, "src");
+        if (!desc || typeof desc.set !== "function" || desc.set.__weCorsArm) continue;
+        (function (d) {
+          var wrapped = function (v) {
+            arm(this, v);
+            return d.set.call(this, v);
+          };
+          wrapped.__weCorsArm = 1;
+          Object.defineProperty(C.prototype, "src", {
+            configurable: true,
+            enumerable: d.enumerable,
+            get: d.get,
+            set: wrapped,
+          });
+        })(desc);
+      } catch (_) {
+        /* 某些元素不支持改写原型，忽略 */
+      }
+    }
+  }
+  try {
+    armHostAssetCors();
+  } catch (_) {
+    /* 整段是增强：任何失败都不影响壁纸本身 */
+  }
 })(window);
 

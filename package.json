@@ -58,6 +58,7 @@
     "verify:cover-peek": "node scripts/verify-cover-peek.mjs",
     "verify:diag": "node scripts/verify-diag.mjs",
     "verify:web": "node scripts/verify-web.mjs",
+    "verify:web-cors": "node scripts/verify-web-cors.mjs",
     "verify:resolution": "node scripts/verify-resolution.mjs",
     "verify:quality": "node scripts/verify-quality.mjs",
     "verify:occlusion": "node scripts/verify-occlusion.mjs",

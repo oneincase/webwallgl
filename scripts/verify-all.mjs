@@ -52,6 +52,9 @@ const STABLE = [
   "verify-groups",
   "verify-script-hooks",
   "verify-web",
+  // 严格沙箱下宿主贴图/视频帧必须走 CORS 模式（issue #25）：真跑 shim + 命中面
+  // 收窄（baseURI 同源 + 站点根之下）+ 4 个变异红测；推不出站点根时整段放弃
+  "verify-web-cors",
   "verify-resolution",
   "verify-quality",
   // 解码/定位类判据：LZ4（逐位对账 + 惰性 mip 契约）、MDL 段定位（单趟扫描 vs 独立扫描）
