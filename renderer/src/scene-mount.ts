@@ -5465,7 +5465,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 const pts = Math.max(1, layer.textPointsize);
                 const em = TEXT_EM_SCALE * pts;
                 const fontPath = layer.textFont || "";
-                const fam = fontPath ? fontFamilies.get(fontPath) || "sans-serif" : "sans-serif";
+                const fam = fontPath ? fontFamilies.get(fontPath) || fontPath : "sans-serif";
                 textCtx.setTransform(1, 0, 0, 1, 0, 0);
                 textCtx.font = `${em}px "${fam}", sans-serif`;
                 const met = textCtx.measureText("");
@@ -5579,7 +5579,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               const bh = it.boxH;
               const sx = Math.abs(layer.scale[0] || 1);
               const sy = Math.abs(layer.scale[1] || 1);
-              const fam = fontPath ? (fontFamilies.get(fontPath) || "sans-serif") : "sans-serif";
+              const fam = fontPath ? (fontFamilies.get(fontPath) || fontPath) : "sans-serif";
               // 先排版（measure 只依赖 ctx.font，与 transform 无关），再按墨水量界定画布。
               ctx.setTransform(1, 0, 0, 1, 0, 0);
               ctx.font = `${em}px "${fam}", sans-serif`;
