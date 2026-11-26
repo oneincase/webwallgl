@@ -4013,6 +4013,11 @@ const renderSettings = mountRenderSettings({
   aa: $("#aa"),
   pq: $("#pq"),
   pp: $("#pp"),
+  fadeIn: $("#fadein"),
+  // 渐显是挂载期效果，热更无通道：勾选变化重挂预览（保留时间轴位置），让开关立刻可见
+  onFadeChange: () => {
+    void mountCurrent(true);
+  },
   sysAudio: $("#audio-sys"),
   audioStatus: $("#audio-state"),
   audioMeter: $("#audio-meter"),

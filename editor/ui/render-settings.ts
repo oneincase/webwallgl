@@ -20,6 +20,13 @@ export type RenderSettingsOptions = {
   aa: HTMLSelectElement;
   pq: HTMLSelectElement;
   pp: HTMLSelectElement;
+  /** 渲染过程渐显（3.1，默认关；见 renderer/src/fade-in.ts 的时序契约） */
+  fadeIn: HTMLInputElement;
+  /**
+   * 渐显是**挂载期**效果（预览循环活在加载窗口里），没有 setQuality 那样的热更通道；
+   * 勾选变化后由调用方重挂预览（keepTime），否则用户看不到任何反馈、开关就成了摆设。
+   */
+  onFadeChange?: () => void;
   /** 「系统音频」开关 */
   sysAudio: HTMLInputElement;
   /** 音频状态文案（关 / 等待信号 / 已连接 / 试听中） */
@@ -32,8 +39,8 @@ export type RenderSettingsOptions = {
 
 export type RenderSettings = {
   fpsCap(): number;
-  /** 挂载期选项：fps / volume / quality，开着系统音频时再带 audio 与媒体源 */
-  mountOptions(): Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource; media?: MediaSource };
+  /** 挂载期选项：fps / volume / quality / fadeIn，开着系统音频时再带 audio 与媒体源 */
+  mountOptions(): Pick<MountOptions, "fps" | "volume" | "quality" | "fadeIn"> & { audio?: AudioSource; media?: MediaSource };
   /** 试听元素的分析源（null = 试听结束，回落到系统音频 / 引擎内置源） */
   setPreviewAudio(src: LiveBandsSource | null): void;
 };
@@ -69,6 +76,8 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
   if (hasOption(o.fps, String(r.fps ?? ""))) o.fps.value = String(r.fps);
   if (typeof r.volume === "number" && r.volume >= 0 && r.volume <= 1) o.volume.value = String(r.volume);
   if (r.sysAudio === true) o.sysAudio.checked = true;
+  // 渐显默认关：localStorage 只记 true 的显式开启（缺省形态与「从没这个键」同义）
+  if (r.fadeIn === true) o.fadeIn.checked = true;
 
   const quality = () => ({
     antiAliasing: o.aa.value as AntiAliasingMode,
@@ -77,7 +86,7 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
   });
   const saveQuality = () => write(QUALITY_KEY, { aa: o.aa.value, pq: o.pq.value, pp: o.pp.value });
   const saveRender = () =>
-    write(RENDER_KEY, { fps: Number(o.fps.value), volume: Number(o.volume.value), sysAudio: o.sysAudio.checked });
+    write(RENDER_KEY, { fps: Number(o.fps.value), volume: Number(o.volume.value), sysAudio: o.sysAudio.checked, fadeIn: o.fadeIn.checked });
   const syncVolumeLabel = () => (o.volumeVal.textContent = `${Math.round(Number(o.volume.value) * 100)}%`);
 
   // ── 音频源 ─────────────────────────────────────────────────────────────
@@ -128,16 +137,23 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
     saveQuality();
     o.instance()?.setQuality({ postProcessing: quality().postProcessing });
   };
+  // 渐显没有热更通道（效果活在加载窗口里）：存档 + 重挂预览。重挂走调用方注入的
+  // onFadeChange（mountCurrent(keepTime)），面板模块不碰实例生命周期。
+  o.fadeIn.onchange = () => {
+    saveRender();
+    o.onFadeChange?.();
+  };
   syncVolumeLabel();
   syncAudioStatus();
 
   return {
     fpsCap: () => Number(o.fps.value),
     mountOptions: () => {
-      const opts: Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource; media?: MediaSource } = {
+      const opts: Pick<MountOptions, "fps" | "volume" | "quality" | "fadeIn"> & { audio?: AudioSource; media?: MediaSource } = {
         fps: Number(o.fps.value),
         volume: Number(o.volume.value),
         quality: quality(),
+        fadeIn: o.fadeIn.checked,
       };
       // 只在真开着音频源时才带 audio 键：mount.ts 里「键存在」= 显式接管整条音频模拟，
       // 传 null 会连引擎内置的 BGM 分析一起关掉（音频反应层连壁纸自带的歌都不跟）。

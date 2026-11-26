@@ -117,6 +117,28 @@ assertWiringApi(mountApiSrc, mainSrc);
 check(/fadeIn\?: boolean;/.test(typesSrc), "[B] WallpaperConfig 必须有 fadeIn");
 check(/fadeIn\?: boolean;/.test(apiTypesSrc), "[B] MountOptions 必须有 fadeIn");
 
+/** 测试台（编辑器「渲染→画质」区）开关接线：DOM 控件 → 面板持久化 → mountOptions → 重挂。 */
+function assertWiringEditor(html, rs, edMain, i18nSrc, sink = check, label = "[B] 测试台开关") {
+  sink(/id="fadein"/.test(html), `${label}：index.html 必须有渐显勾选控件`);
+  // 真机探针抓到的形态：data-i18n 键**没注册**时 i18n 会把文本覆盖成键名本身
+  // （界面直接显示 "toolbar.fade"），不是保留字面兜底 —— 两套词典都必须有键。
+  const fadeKeys = (i18nSrc.match(/"toolbar\.fade":/g) || []).length;
+  const tipKeys = (i18nSrc.match(/"toolbar\.fadeTip":/g) || []).length;
+  sink(fadeKeys >= 2, `${label}：toolbar.fade 必须在中英两套词典都注册（实得 ${fadeKeys}；未注册=界面显示键名）`);
+  sink(tipKeys >= 2, `${label}：toolbar.fadeTip 必须中英两套都注册（实得 ${tipKeys}）`);
+  sink(/fadeIn: o\.fadeIn\.checked,/.test(rs), `${label}：mountOptions 必须带 fadeIn（漏了开关就是摆设）`);
+  sink(/o\.fadeIn\.onchange[\s\S]{0,160}saveRender\(\);[\s\S]{0,80}onFadeChange\?\.\(\);/.test(rs),
+    `${label}：勾选变化必须 存档+触发重挂（渐显无热更通道，不重挂用户看不到反馈）`);
+  sink(/fadeIn: \$\("#fadein"\)/.test(edMain), `${label}：main.ts 必须把控件接进 mountRenderSettings`);
+  sink(/onFadeChange: \(\) => \{[\s\S]{0,120}mountCurrent\(true\)/.test(edMain),
+    `${label}：重挂必须走 mountCurrent(true)（keepTime：不跳回第一帧）`);
+}
+const edHtmlSrc = fs.readFileSync(path.join(ROOT, "editor/index.html"), "utf8");
+const edRsSrc = fs.readFileSync(path.join(ROOT, "editor/ui/render-settings.ts"), "utf8");
+const edMainSrc = fs.readFileSync(path.join(ROOT, "editor/main.ts"), "utf8");
+const edI18nSrc = fs.readFileSync(path.join(ROOT, "bench/i18n.ts"), "utf8");
+assertWiringEditor(edHtmlSrc, edRsSrc, edMainSrc, edI18nSrc);
+
 // ---------------------------------------------------------------- §C 变异红测
 console.log("verify-fade-in: [C] 变异红测（改坏必红，局部 sink 不污染全局）");
 {
@@ -154,9 +176,27 @@ console.log("verify-fade-in: [C] 变异红测（改坏必红，局部 sink 不�
       ),
       recheck: (x, l, sink) => assertWiring(x, l, sink),
     },
+    {
+      name: "测试台开关不进 mountOptions",
+      target: "rs",
+      apply: (x) => x.replace("fadeIn: o.fadeIn.checked,", ""),
+      recheck: (x, l, sink) => assertWiringEditor(edHtmlSrc, x, edMainSrc, edI18nSrc, sink, l),
+    },
+    {
+      name: "测试台勾选不重挂（开关成哑的）",
+      target: "rs",
+      apply: (x) => x.replace("o.onFadeChange?.();", ""),
+      recheck: (x, l, sink) => assertWiringEditor(edHtmlSrc, x, edMainSrc, edI18nSrc, sink, l),
+    },
+    {
+      name: "i18n 键没注册（界面显示键名，真机探针抓过的形态）",
+      target: "i18n",
+      apply: (x) => x.replace('"toolbar.fade": "渐显",\n', "").replace('"toolbar.fade": "Fade in",\n', ""),
+      recheck: (x, l, sink) => assertWiringEditor(edHtmlSrc, edRsSrc, edMainSrc, x, sink, l),
+    },
   ];
   for (const m of muts) {
-    const base = m.target === "mount" ? mountApiSrc : smSrc;
+    const base = m.target === "mount" ? mountApiSrc : m.target === "rs" ? edRsSrc : m.target === "i18n" ? edI18nSrc : smSrc;
     const mutated = m.apply(base);
     if (mutated === base) {
       check(false, `[C] 变异「${m.name}」没有命中源码（判据失去牙齿）`);

@@ -138,6 +138,12 @@
               <option value="off" data-i18n="quality.off">关</option>
             </select>
           </label>
+          <label class="wb-field" data-i18n-title="toolbar.fadeTip" title="渲染过程渐显（3.1，默认关）：打开/切换壁纸时边加载边画已就绪图层，画布透明度随加载进度渐入到首帧。仅场景壁纸有这段空档；网页/视频不受影响。开关会重挂预览，好让效果立刻可见">
+            <span class="wb-field-label" data-i18n="toolbar.fade">渐显</span>
+            <span class="wb-field-ctl">
+              <input id="fadein" type="checkbox" />
+            </span>
+          </label>
           <p class="wb-hint" data-et="render.hint">全局设置，所有文档共用；改动即时生效，不影响导出的工程。</p>
         </div>
         <!-- 场景设置：写进这个工程的 scene.json（general 段），可撤销；与上面的全局「渲染选项」不是一回事 -->
