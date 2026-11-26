@@ -1406,6 +1406,20 @@ function runRibbonEffects() {
     if (!/0x00010000/.test(fontSan) || !/0x00011000/.test(fontSan)) {
       errors.push("font-sanitize.js 必须同时认合法的 0x00010000 与 0x00011000（不能见 vhea 就改）");
     }
+    // PR#26（贡献者 L-IMz，main 已并入）字体名直通：作者把 textFont 写成系统字体名
+    // （"Arial" 等）时 fontFamilies.get 必然落空，旧代码直接压成 sans-serif，作者
+    // 声明的字体整个丢掉。修法 = `fontFamilies.get(fontPath) || fontPath`：未加载的
+    // 路径串（fonts/x.otf）在 CSS 里匹配不到任何 @font-face，浏览器自然回落 sans-serif
+    // ——与旧行为等价；系统字体名则按名命中。**measure/layout 两处必须同源**：
+    // 只改一处会让测量与绘制用不同字体，墨水定界错位（文字裁切/偏移的万金油形态）。
+    const smFontSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+    const passCount = (smFontSrc.match(/fontFamilies\.get\(fontPath\) \|\| fontPath/g) || []).length;
+    if (passCount !== 2) {
+      errors.push(`字体名直通必须恰好两处（measure+layout 同源），实得 ${passCount}（PR#26）`);
+    }
+    if (/fontFamilies\.get\(fontPath\) \|\| "sans-serif"/.test(smFontSrc)) {
+      errors.push("字体名直通缺失：fontFamilies 落空不许退回 sans-serif（系统字体名会被压掉，PR#26）");
+    }
     // 本机语料：3448845950 的 Aa后浪行楷 / Aa攒劲小楷 写的是 0x00010001，
     // 且它们的 cmap 本身是对的 —— 修完 cmap 才能 return 的实现会在这里漏修
     // （旧实现的 `if (!changed) return src` 就是这种形态）。
