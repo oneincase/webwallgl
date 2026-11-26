@@ -40,6 +40,7 @@
     "verify:light-constants": "node scripts/verify-light-constants.mjs",
     "verify:particle-constants": "node scripts/verify-particle-constants.mjs",
     "verify:scenescript-constants": "node scripts/verify-scenescript-constants.mjs",
+    "verify:fade-in": "node scripts/verify-fade-in.mjs",
     "verify:camera-constants": "node scripts/verify-camera-constants.mjs",
     "verify:pointer": "node scripts/verify-pointer.mjs",
     "verify:audio": "node scripts/verify-audio.mjs",

@@ -2,6 +2,8 @@
 import { clear, effectiveDpr, effectiveUserVolume, FrameGate, markFrame, normalizeFit, occlPaused, occlusionCfgOf, ownSceneDebugGlobals, readText, reapplyVolume, reportDiag, resourceScaleFor, resourceScaleForNormal, syncCanvasSize, tickOcclusion, type Runtime } from "./shell";
 import { classifyDiag } from "./diag-level";
 import { occlusionFpsCap, roiWorldRects, type WorldRect } from "./occlusion";
+// 3.1 渐显：进度纯函数（离线判据直接跑）与 job 完成计数包装。
+import { countJobSettle, fadeOpacityOf } from "./fade-in";
 import { estimateGpuBytes as estimateGpuBytesPure, footprintTarget, isSmallTexture, layerFootprintPx, looksOpaque as looksOpaquePure, pickMipLevel as pickMipLevelPure, resourcesOff, scaleFrames, targetLong, texResScale } from "./resource-scale";
 import { httpSource, workshopIdFromSourceKey } from "./api/source";
 // M12（EDITOR-COMPLETION-PLAN §2 B1 / B2）：增量装配的数组手术与 overlay 几何 / GL pass。
@@ -496,6 +498,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
   }
   rt.canvas = c;
   let disposed = false;
+  // 渐显（3.1，默认关）失败还原钩子：装配体在 try 里装填，外层 catch 必须够得着
+  // （声明在函数级而不是 try 内，否则 catch 里是未定义）。关闭时恒 null。
+  let fadeRestore: (() => void) | null = null;
   /**
    * 调试钩子开关（§3.4）：页面形态（fullscreen）默认开 —— 那是既有的手工排障工作流；
    * **库实例默认关** —— 库嵌进宿主页时，宿主上的同名全局不该能静默改渲染
@@ -3512,7 +3517,100 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           }
         }
       }
-      await Promise.all(texJobs);
+      // —— 渲染过程渐显（3.1 特性；**默认关**，`cfg.fadeIn === true` 才存在）——
+      // 空档期正是下面这个 await：真 renderLoop 在粒子/脚本/相机全链装配之后才定义、
+      // 才 kickLoop —— 加载期画布只有 clearcolor。开启渐显时：
+      // 覆盖边界（实测 3815033574 后写死在这里，别当全加载期的遮罩用）：渐显窗口 =
+      // [贴图 job 开始落地 → 资源全部就绪]。**再往前的 scene.pkg 读取/解压/parseScene
+      // 阶段不在窗口内** —— 那时场景本身还不存在，没有任何「已就绪图层」可画，
+      // 淡入它只会把「看得见底色」变成「看不见底色」；那段空档的消法是性能计划里的
+      // 增量 parse / 解码下沉，不是渐显。bake 缓存热时本窗口会很短（窗口短=空档短，
+      // 特性接近 no-op 是正确行为，不是失效）。
+      //   ① 画布压成全透明（内联 opacity，transition 关掉）；
+      //   ② 起一个**预览循环**直接 renderer.render：未加载贴图 `textures.get` 落空 →
+      //      transparentTex，粒子/puppet provider 尚未注入 → 既有判空跳过（renderer.js
+      //      particleAdvanceFn/puppetDrawFn 的 null 分支），于是「贴图就绪一帧、该层
+      //      显形一帧」= 边加载边画已就绪图层。脚本/关键帧动画不在 render() 里跑，
+      //      预览帧只是静态出图；无 size 的简单图片层要等 await 后的 autosize 才出现
+      //      （渐进语义的一部分，不算缺陷）；
+      //   ③ 画布 opacity 按「已完成 job / 总 job」线性推进（fadeOpacityOf 纯函数；
+      //      不用 loadedTex——它只在部分装载点自增，分子口径与分母不一致会虚高）；
+      //   ④ await 返回 = 资源全部就绪 = 渐显终点：预览循环**先停**（cancel rAF，
+      //      busy 中的那一帧自然落地），opacity 拉满，再进后续装配。真循环首帧
+      //      （onFirstFrame / mount() 契约）清掉内联样式交回自然态 —— 时序与关
+      //      渐显逐拍一致，首帧仍是「全部装配后的第一次提交」。
+      // 外层 catch（失败 → onError/降级页）必须还原样式：渐显绝不允许把壁纸或
+      // 降级页吞成空白。关闭时本段整体不存在（不包 job、不起 rAF、零样式写入）。
+      const fadeOn = cfg.fadeIn === true;
+      let fadeDone = 0;
+      let fadeStop: (() => void) | null = null;
+      // 测试钩子（与 __noProxyCache 同族，默认 0 = 不生效、零行为变化）：按 job 序号
+      // 错峰延后 settle，把「贴图落地窗口」拉成判据可稳定观测的秒级过程。真机窗口
+      // 长短取决于语料/机器/bake 缓存（快机器上整段 await 在同一任务里落地，"0" 一帧
+      // 都不剩 —— 机制正确但行为臂测不到），确定性测试不能赌语料。
+      const fadeTestDelayMs = Number((globalThis as any).__wwglFadeTestJobDelayMs || 0);
+      const fadeStaged = fadeTestDelayMs > 0
+        ? texJobs.map((pj, i) => pj.then((pv) => new Promise<unknown>((r) => setTimeout(() => r(pv), (i + 1) * fadeTestDelayMs))))
+        : texJobs;
+      const texJobsSettled = fadeOn ? countJobSettle(fadeStaged, () => { fadeDone++; }) : texJobs;
+      if (fadeOn) {
+        const fadeTotal = texJobs.length;
+        c.style.transition = "none";
+        c.style.opacity = "0";
+        let rafId = 0;
+        let busy = false;
+        let stopped = false;
+        const t0 = performance.now();
+        const frame = () => {
+          rafId = 0;
+          if (stopped || disposed) return;
+          c.style.opacity = String(fadeOpacityOf(fadeDone, fadeTotal));
+          if (!busy && !rt.paused && !occlPaused(rt)) {
+            busy = true;
+            Promise.resolve()
+              .then(() => renderer.render(
+                scene,
+                textures,
+                c.width,
+                c.height,
+                (performance.now() - t0) / 1000,
+                normalizeFit(rt.cfg.fit),
+                0,
+                0,
+                undefined,
+              ))
+              .catch(() => {
+                /* 预览帧尽力而为：装配中途状态不完整，坏帧不顶真循环的账 */
+              })
+              .then(() => { busy = false; });
+          }
+          rafId = requestAnimationFrame(frame);
+        };
+        rafId = requestAnimationFrame(frame);
+        fadeStop = () => {
+          stopped = true;
+          if (rafId) cancelAnimationFrame(rafId);
+          rafId = 0;
+        };
+        fadeRestore = () => {
+          fadeStop?.();
+          c.style.opacity = "";
+          c.style.transition = "";
+        };
+      }
+      await Promise.all(texJobsSettled);
+      if (fadeOn) {
+        // 终点 = 资源全部就绪（首帧时刻）：预览循环停摆、opacity 拉满；真循环首帧
+        // 清内联样式（包 onFirstFrame 而不是改 renderLoopImpl —— 首帧语义不动）。
+        fadeStop?.();
+        c.style.opacity = "1";
+        const fadeFirst = rt.onFirstFrame;
+        rt.onFirstFrame = () => {
+          c.style.opacity = "";
+          c.style.transition = "";
+          fadeFirst?.();
+        };
+      }
       // 贴图装载完成后再扫一遍：部分保留纹理（壁纸自带封面等）是 texJobs 拉进来的
       bindPendingInstanceMedia();
       if (bakeEnabled) {
@@ -8788,6 +8886,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       }
       reportDiag(rt, cfg, `renderer started: ${scene.layers.length} layers`, "info");
     } catch (e) {
+      // 渐显开启时任何失败出口都必须还原可见性：降级页/onError 面对的是画布，
+      // 留着 opacity:0 等于把兜底一起吞掉（fade-in.ts 头注释的时序契约第 3 条）。
+      fadeRestore?.();
       if (disposed) return;
       if (e && (e as Error).name === "AbortError") return;
       // 场景加载/渲染失败：diag 上报 + 降级画布演示

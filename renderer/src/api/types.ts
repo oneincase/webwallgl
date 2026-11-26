@@ -461,6 +461,14 @@ export type MountOptions = {
    */
   autoQuality?: boolean;
   /**
+   * 渲染过程渐显（**默认关**；仅 scene 壁纸）：加载期渲染预览循环「边加载边画已就绪
+   * 图层」，画布 opacity 按「已完成贴图 job / 总 job」线性推进，终点 = 资源全部就绪
+   * （首帧时刻，即 `onReady` / mount() resolve 的那一拍）。失败/降级出口立即还原可见，
+   * 绝不把壁纸或兜底页吞成空白。纯函数见 `renderer/src/fade-in.ts`，接线见
+   * `scene-mount.ts` 渐显块；壁纸页对应 `?fadein=1`。
+   */
+  fadeIn?: boolean;
+  /**
    * 贴图烘焙（默认开）：内嵌 PNG/JPEG 贴图的预缩放缓存。命中后省掉「解全尺寸再缩」
    * （实测 −80% 解码耗时，缓存产物比原图小），像素与不烘时逐位一致；
    * 未命中走原路径并后台补烘。传 `false`（或 `?bake=0`）关闭。目标尺寸取资源档位上限，

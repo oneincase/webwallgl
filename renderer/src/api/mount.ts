@@ -112,6 +112,8 @@ async function resolveMountConfig(
     // [issue #20] 自动降档开关也必须原样透传：此前白名单重建漏了它，scene-mount
     // 读到的 cfg.autoQuality 恒 undefined → `!== false` 恒真 → 调用方显式关不掉。
     autoQuality: o.autoQuality,
+    // 渐显开关同样必须穿过白名单（#20 的同类坑：漏了 mountScene 就永远收不到）。
+    fadeIn: o.fadeIn,
     scripts: o.scripts !== false,
     // [issue #21] 网页壁纸沙箱档位也必须原样透传：此前白名单重建漏了它，
     // web.ts 读到的 cfg.webSandbox 恒 undefined → 内层 iframe 永远只剩

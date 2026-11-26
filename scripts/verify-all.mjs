@@ -118,6 +118,8 @@ const STABLE = [
   "verify-light-constants",
   "verify-particle-constants",
   "verify-scenescript-constants",
+  // 渲染过程渐显（3.1，默认关）：纯函数行为 + 接线断言 + 变异红测（真机臂 --headless 不在此列）
+  "verify-fade-in",
   "verify-camera-constants",
   // 松散目录形态的场景壁纸（源码工程 / 官方内置 defaultprojects）：判定表与回退语义
   // 真跑（含本地 HTTP 服务器）、本地库 17 个条目的引用闭包审计、接线守卫、变异红测。

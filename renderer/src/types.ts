@@ -99,6 +99,14 @@ export type WallpaperConfig = {
    */
   autoQuality?: boolean;
   /**
+   * 渲染过程渐显（**默认关**，`?fadein=1` 开启；仅 scene 壁纸——web/media 的可见性
+   * 由 DOM 元素自身渐进，无此空档）。加载期起预览循环边加载边画已就绪图层，画布
+   * opacity 按「已完成贴图 job / 总 job」线性推进，终点 = 资源全部就绪（首帧时刻）。
+   * 失败/降级出口立即还原可见，绝不因淡入把壁纸或兜底页吞成空白。纯函数见
+   * `fade-in.ts`，装配接线见 `scene-mount.ts` 的渐显块。
+   */
+  fadeIn?: boolean;
+  /**
    * 贴图烘焙（B3）：内嵌 PNG/JPEG 的**预缩放缓存**，默认开（`false` / `?bake=0` 关闭）。
    *
    * 内嵌图的现状路径是「解全尺寸再缩」，实测大图最贵的就是这一步（52 张内嵌图

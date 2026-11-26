@@ -632,6 +632,10 @@ const initialCfg: WallpaperConfig = {
   mediaBase: params.get("mediaBase") ?? undefined,
   // 自动降档开关：`?autoq=0` 关闭（量基线 / A-B 对照用）
   autoQuality: params.get("autoq") === "0" ? false : undefined,
+  // 渲染过程渐显（3.1）：`?fadein=1` 开启，**默认关**。仅 scene 壁纸生效：加载期
+  // 预览循环边加载边画已就绪图层，画布 opacity 按加载进度推进到首帧（终点）。
+  // 语义与失败还原契约见 renderer/src/fade-in.ts 头注释。
+  fadeIn: params.get("fadein") === "1" || params.get("fadein") === "true",
   // 贴图烘焙开关：`?bake=0` 关闭（量基线 / A-B 对照用）
   bake: params.get("bake") === "0" ? false : undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",

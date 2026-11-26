@@ -668,8 +668,10 @@ const { check, errors } = createChecker();
   // 装配循环：绑不到时必须登记（旧实现直接什么都不做）
   check(/else if \(instUtName\) \{\s*pendingInstanceMedia\.push/.test(smSrc),
     "实例层绑不到保留纹理时必须登记 pendingInstanceMedia");
-  // 两个触发点：texJobs 完成（壁纸自带封面等）与真实封面上传进表（系统实况）
-  check(/await Promise\.all\(texJobs\);[\s\S]{0,120}bindPendingInstanceMedia\(\)/.test(smSrc),
+  // 两个触发点：texJobs 完成（壁纸自带封面等）与真实封面上传进表（系统实况）。
+  // 3.1 渐显在 await 与补绑之间插进了「停预览循环 + opacity 拉满」的 handover（约
+  // 200 字符），窗口跟着切口搬到 400 —— 语义不变：**贴图落地后第一件事**仍是补绑。
+  check(/await Promise\.all\(texJobs(?:Settled)?\);[\s\S]{0,400}bindPendingInstanceMedia\(\)/.test(smSrc),
     "texJobs 完成后必须补绑一次 pending 实例层");
   const uploadIdx5c = smSrc.indexOf("const uploadThumbnailBitmap");
   check(uploadIdx5c >= 0 &&
