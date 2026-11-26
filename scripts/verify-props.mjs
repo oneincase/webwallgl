@@ -846,7 +846,7 @@ const ids = fs.existsSync(LIB)
   //      shader 文本断言 + 实机 A/B（8.13% 饱和像素 → 0%，灯心 +16/255）。
   {
     const lw = load("3737267090");
-    if (!lw) note("3737267090 语料缺失，跳过 V1 通道直射光数值判据");
+    if (!lw) ok("3737267090 语料缺失，跳过 V1 通道直射光数值判据");
     else {
       const scene = parseScene(lw.scene, lw.proj);
       const ls = scene.layers.filter((l) => l.isLight);

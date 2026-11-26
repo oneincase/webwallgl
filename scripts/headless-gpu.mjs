@@ -269,6 +269,14 @@ async function launchOnce({
     `--window-size=${width},${height}`,
     "--no-first-run",
     "--no-default-browser-check",
+    // macOS 钥匙串弹窗（2026-11-27 用户实拍）：不带这个 flag 时 Chromium 会去访问
+    // 登录钥匙串的「Chromium Safe Storage」条目（cookie 加密密钥）。Playwright 缓存里
+    // 的 Chromium.app 是 ad-hoc 签名、路径又不在常规安装位，**不在该条目的 ACL 里**，
+    // 每次启动都弹「想要使用机密信息」要登录钥匙串密码 —— 而且一次启动能弹好几回，
+    // 弹窗还抢焦点，CDP 等端口就绪会被它拖死（headless 卡到超时的真凶之一）。
+    // mock keychain 把这份密钥换成内存里的固定 mock（Playwright 自家 launcher 也是
+    // 这么做的）：无头验证不需要真实 cookie 加密，弹窗与卡启动一起消掉。
+    "--use-mock-keychain",
     "--disable-background-networking",
     "--disable-sync",
     "--disable-extensions",
