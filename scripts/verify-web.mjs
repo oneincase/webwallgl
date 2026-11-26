@@ -751,7 +751,13 @@ function runShim(extras, opts) {
     function harness() {
       const pending = new Map();
       let seq = 0;
-      let t = 0; // 虚拟墙钟：performance.now() 与 rAF 时间戳都从它取
+      let t = 0; // 虚拟墙钟（performance.now）
+      // rAF 时间戳 = **帧号 × VSYNC**，与墙钟解耦：浏览器每个 vsync 有自己的时间戳，
+      // 长任务后「追赶」= 被推迟的旧帧回调（旧戳）与当前帧回调（新戳）**同刻连发但戳不同**
+      //（shim 注释实测 11.9 / 145.2）。旧夹具给同刻双发喂同一个戳，与真机不符 ——
+      // 旧代码交付判定不看 now 所以没暴露；issue #27 的同帧放行判据必须喂忠实模型，
+      // 否则「同刻不同戳」的防连发不变量在判据里根本没被检查。
+      let frame = 0;
       const { win } = runShim({
         performance: { now: () => t },
         requestAnimationFrame: (cb) => {
@@ -773,9 +779,10 @@ function runShim(extras, opts) {
         delivered,
         pumpAt(dt) {
           t += dt;
+          frame += VSYNC;
           const list = [...pending.entries()];
           pending.clear();
-          for (const [, cb] of list) cb(t);
+          for (const [, cb] of list) cb(frame);
           return t;
         },
       };
@@ -831,6 +838,96 @@ function runShim(extras, opts) {
     check(
       Math.min(...tail) >= TARGET - 1,
       `持续过载时交付间隔不得低于目标（否则 cap 被绕过，机器越慢交付越密），实得最小 ${Math.round(Math.min(...tail))}ms / 目标 ${Math.round(TARGET)}ms`,
+    );
+  }
+
+  // ---------- 多条 rAF 链必须同帧公平交付（issue #27：限帧下雨类网页壁纸几乎不动）----------
+  //
+  // Codrops Rain 模板（1403160205 / 1595037011）同时跑三条自递归 rAF 链：GSAP TweenLite、
+  // Water.draw()、Raindrops.update()。旧交付判定只看共用墙钟（lastDeliverNow）：队首链
+  // 先交付并更新基准，同帧其余链算出 nowMs-lastDeliverNow≈0.x ms 全被跳过；而交付链的 cb
+  // 在回调期间就重登记、永远排在下帧队首 —— 其余链永久饿死（180 帧：队首 90 次、其余 0 次，
+  // 雨滴位置不再更新，画面几乎定格；fps=60 走原生路径不复现）。
+  // 修法：额外记交付帧的 rAF 时间戳 lastDeliverFrameNow —— 同一 vsync 帧内各回调收到的
+  // now 相同 ⇒ 一起放行；长任务「追赶」时同刻连发的回调时间戳**不同** ⇒ 墙钟防连发照旧。
+  {
+    const VSYNC = 1000 / 60;
+    const TARGET = 1000 / 30;
+    /** 三条自递归链 + 虚拟时钟；pump = 一个 vsync 帧（同帧回调收到同一个时间戳） */
+    function multiHarness() {
+      const pending = new Map();
+      let seq = 0;
+      let t = 0;
+      const msgs = [];
+      const { win } = runShim({
+        performance: { now: () => t },
+        parent: { postMessage: (m) => msgs.push(m) },
+        requestAnimationFrame: (cb) => {
+          pending.set(++seq, cb);
+          return seq;
+        },
+        cancelAnimationFrame: (id) => pending.delete(id),
+      });
+      win.__weSetFps(30);
+      const delivered = { A: 0, B: 0, C: 0 };
+      for (const name of ["A", "B", "C"]) {
+        const loop = () => {
+          delivered[name]++;
+          win.requestAnimationFrame(loop); // 作者在回调期间重登记（队首效应来源）
+        };
+        win.requestAnimationFrame(loop);
+      }
+      return {
+        delivered,
+        msgs,
+        pump() {
+          t += VSYNC;
+          const list = [...pending.values()];
+          pending.clear();
+          for (const cb of list) cb(t);
+        },
+        // 追赶：同一墙钟时刻连发两个**不同时间戳**的回调（真机实测 11.9 / 145.2）
+        pumpCatchup(tsA, tsB) {
+          const list = [...pending.values()];
+          pending.clear();
+          list[0](tsA);
+          list[1](tsB);
+        },
+      };
+    }
+
+    // ① 公平性：180 帧（3 秒）三条链交付数必须一致 ≈ 帧数/2；旧实现这里 B/C = 0
+    const h = multiHarness();
+    for (let i = 0; i < 180; i++) h.pump();
+    const d = h.delivered;
+    check(
+      d.A >= 85 && d.B >= 85 && d.C >= 85,
+      `#27：fps=30 下三条 rAF 链必须同帧一起交付（各应 ≈90），实得 A=${d.A} B=${d.B} C=${d.C}` +
+        `（B/C 归零 = 交付判定回到「只看共用墙钟」，队首链饿死其余链）`,
+    );
+    check(
+      d.A <= 95 && d.B <= 95 && d.C <= 95,
+      `#27：公平不能变成连发（各链仍受 30fps 上限），实得 A=${d.A} B=${d.B} C=${d.C}`,
+    );
+
+    // ② we-frame 打点去重：一个 rAF 时间戳只报一条（webFps 滑窗按条数计，
+    //    不去重会把「三条链同帧交付」读成 90fps）
+    const frameMsgs = h.msgs.filter((m) => m && m.op === "we-frame");
+    const uniqTs = new Set(frameMsgs.map((m) => m.t));
+    check(
+      frameMsgs.length === uniqTs.size && frameMsgs.length >= 85,
+      `#27：we-frame 每个 vsync 至多一条（条数 ${frameMsgs.length} / 唯一时间戳 ${uniqTs.size}）`,
+    );
+
+    // ③ 追赶防连发不变：同刻连发两个不同时间戳的回调，不得在目标间隔内交付两帧
+    const hc = multiHarness();
+    for (let i = 0; i < 40; i++) hc.pump();
+    const before = hc.delivered.A + hc.delivered.B + hc.delivered.C;
+    hc.pumpCatchup(1000, 1400); // 同刻双发（墙钟不动）
+    const after = hc.delivered.A + hc.delivered.B + hc.delivered.C;
+    check(
+      after - before <= 1,
+      `#27：追赶同刻双发（时间戳不同）不得连交两帧，实得 +${after - before}`,
     );
   }
 

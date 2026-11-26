@@ -1801,6 +1801,26 @@
     // 回调普遍在交付里立刻登记下一帧（自递归主循环），每次交付都换一条新链，新链的
     // lastNow 从 0 起步 —— 饿死恰好落在链首那次回调时链内什么都看不到。
     var lastDeliverNow = -1;
+    // [issue #27] 上一次交付所在**帧**的 rAF 时间戳。同一 vsync 帧内所有 rAF 回调收到
+    // 的 now 相同：只按墙钟判「到没到点」时，同帧里排在后面的循环算出 nowMs-lastDeliverNow
+    // ≈ 0.x ms 全被跳过，而交付链的 cb 在回调期间就重登记、永远排在下帧队首 —— 多循环
+    // 网页壁纸（Codrops Rain 模板：GSAP + draw + update 三条 rAF 链）里除队首链外全部
+    // 饿死（实测 180 帧：队首 90 次、其余 0 次，画面几乎不动；fps=60 走原生路径不复现）。
+    // 同帧时间戳相等 ⇒ 一起放行；长任务「追赶」时同刻连发的回调时间戳**不同**
+    //（实测 11.9 / 145.2），不满足等式，墙钟防连发判据照旧生效。
+    var lastDeliverFrameNow = -1;
+    // we-frame 打点去重：交付公平后同一帧可能多条链各交付一次，逐条上报会把
+    // 宿主 webFps（1s 滑窗按条数计）虚高成「链数 × fps」。一个 rAF 时间戳只报一条。
+    var lastFrameMsgTs = -1;
+    function postFrameMsg(now) {
+      if (now === lastFrameMsgTs) return;
+      lastFrameMsgTs = now;
+      try {
+        w.parent.postMessage({ op: "we-frame", t: now }, "*");
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
     var throttled = function (cb) {
       if (typeof cb !== "function") return 0;
       if (paused) {
@@ -1817,11 +1837,7 @@
           } catch (_) {
             /* 忽略 */
           }
-          try {
-            w.parent.postMessage({ op: "we-frame", t: now }, "*");
-          } catch (_) {
-            /* 忽略 */
-          }
+          postFrameMsg(now);
         });
         rafMap[idNative] = { kind: "native", id: idNative };
         return idNative;
@@ -1851,22 +1867,21 @@
         // 容差 0.05 帧沿用原判据的标定：16.4ms 这类测量噪声不许把 30fps 算成 20fps。
         var target = 1000 / fps;
         var slack = nativeMs > 0 ? nativeMs * 0.05 : 0;
-        if (lastDeliverNow >= 0 && nowMs - lastDeliverNow < target - slack) {
+        // [issue #27] `now !== lastDeliverFrameNow`：同一 vsync 帧内的多条链一起放行
+        //（时间戳相等 = 同帧；追赶时同刻不同戳，仍被墙钟判据拦住）。
+        if (lastDeliverNow >= 0 && now !== lastDeliverFrameNow && nowMs - lastDeliverNow < target - slack) {
           rafMap[id] = { kind: "native", id: origRaf(step) };
           return;
         }
         delete rafMap[id];
         lastDeliverNow = nowMs;
+        lastDeliverFrameNow = now;
         try {
           cb(now);
         } catch (_) {
           /* 忽略 */
         }
-        try {
-          w.parent.postMessage({ op: "we-frame", t: now }, "*");
-        } catch (_) {
-          /* 忽略 */
-        }
+        postFrameMsg(now);
       };
       rafMap[id] = { kind: "native", id: origRaf(step) };
       return id;
