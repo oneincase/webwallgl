@@ -2571,10 +2571,17 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
   const passWindow = bindI > 0 && drawI > 0 ? rsrc.slice(bindI, drawI) : "";
   check(/gl\.clear\(gl\.COLOR_BUFFER_BIT\)/.test(passWindow),
     "效果 pass 绑定 outFBO 后、drawArrays 前必须 gl.clear 目标（覆盖写不画的空区会露出 fboA 的 copy 白底 → 3486806915 白楔）");
-  check(/blendMode\s*!==\s*'translucent'/.test(passWindow) && /blendMode\s*!==\s*'additive'/.test(passWindow),
-    "清目标必须按 blend 分流：translucent/additive 是 LOAD 语义，清了会丢叠加目标的既有内容");
-  check(/!mp\.target/.test(passWindow),
+  // [2026-11-27 PR#28] 清屏分流从内联单行条件抽成了纯函数 effectPassNeedsClear
+  // （真值表 + 接线 + 变异红测在 verify-fx-chain-clear）。本段不再匹配旧的
+  // `blendMode !== 'translucent' && …` 内联写法，改钉「判定走那个函数、且 blend
+  // 与 !mp.target 两档实参都传进去了」——语义不变：translucent/additive 仍是
+  // LOAD 不清（清了会丢叠加目标的既有内容），命名 target 仍永不在此清。
+  check(/const needClear = effectPassNeedsClear\(/.test(passWindow) && /,\s*blendMode,/.test(passWindow),
+    "清目标必须按 blend 分流（经 effectPassNeedsClear）：translucent/additive 是 LOAD 语义，清了会丢叠加目标的既有内容");
+  check(/!!mp\.target/.test(passWindow),
     "清目标只应发生在 ping-pong（!mp.target）路径：命名目标可能被其他 pass 当历史读，不能盲目清");
+  check(/if \(needClear\) \{[\s\S]{0,120}gl\.clear\(gl\.COLOR_BUFFER_BIT\)/.test(passWindow),
+    "needClear 为真时必须真的执行 gl.clear（判定与清屏动作不能脱钩）");
 
   // 语料前提：顶点位移的 skew 在全库真实存在，且多数挂在多 pass 链的**非首位**
   // （位移 pass 不是第一个才有「前序 pass 写的 copy 底」可露；单 pass 位移则露

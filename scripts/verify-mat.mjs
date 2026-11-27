@@ -256,9 +256,12 @@ console.log(
     },
     {
       where: "效果 pass 覆盖写清屏条件",
-      file: "render/renderer.js:5161",
+      file: "render/renderer.js:5346-5352",
       src: rendererSrc,
-      re: /if \(!mp\.target && blendMode !== 'translucent' && blendMode !== 'additive'\)/,
+      // [2026-11-27 PR#28] 内联单行条件抽成纯函数 effectPassNeedsClear（首写 pong 也清）。
+      // 这里必须匹配**调用点整段**而不是函数名：m[0] 里的 'translucent'/'additive' 字面量
+      // 是本脚本「源码识别集合 == 声明集合」的真源证据，匹配文本没了字面量 = 断言失去牙。
+      re: /const needClear = effectPassNeedsClear\(\s*!!mp\.target,\s*blendMode,\s*outFBO === fboB,\s*!pongWritten,\s*\)/,
     },
     {
       where: "网格模型（.mdl）",
