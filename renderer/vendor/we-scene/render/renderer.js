@@ -268,6 +268,36 @@ export function layerCompositeBlendMode(colorBlendMode, materialBlending) {
 }
 
 /**
+ * 效果链里「这个 pass 开始前要不要先清空写入目标」。
+ *
+ * 三档语义（与 WE 的 loadOp 对齐）：
+ *   · normal/其它      → DONT_CARE + force_clear，**总是清**（栅格化没画到的区域会
+ *                        原样留下目标旧内容，见 3486806915 的白楔）。
+ *   · translucent/additive → LOAD 语义，**保留目标**，链中间的 pass 就靠这个把本 pass
+ *                        叠到上一 pass 的输出上。
+ *   · 但 LOAD 语义的前提是「目标里装着**本帧**已经画好的东西」。乒乓缓冲 fboB 没有
+ *     对应的清理点：`getFBO` 的缓存键只有 `tag|WxH|format`，tag 是字面量 'pong'
+ *     （不含 layer.id），命中即原样复用 —— 于是 fboB 会带着**上一帧**的内容跨帧存活。
+ *     链的第一个 pass（尤其是单 pass 链）写 fboB 时，LOAD 的叠加对象就是上一帧残留，
+ *     而链尾又会把 fboB 直接当结果合成出去。
+ *
+ * 后果（实测）：单 pass + additive + 大面积蒙版的工坊壁纸，r8 贴图经 fromR8 解出
+ * alpha≡1 ⇒ `blendFuncSeparate(SRC_ALPHA, ONE, …)` 的 SRC_ALPHA 恒为 1 ⇒ 每帧满量
+ * 叠加，几十帧后饱和成**蒙版形状的纯白块**（作者侧看是「壁纸右侧一大片白」）。
+ * 桌面 WE 不受影响，因为它是每帧重建渲染目标。
+ *
+ * 修法就是这里：本帧**第一次**写 fboB 时无条件清一次，语义回到「每帧从干净目标
+ * 开始」。链中后续 pass 仍走 LOAD，交错读写不受影响。
+ *
+ * 纯函数，verify-fx-chain-clear 直接跑数值回归。
+ */
+export function effectPassNeedsClear(hasTarget, blendMode, targetIsPong, firstPongWrite) {
+  if (hasTarget) return false
+  if (targetIsPong && firstPongWrite) return true
+  return blendMode !== 'translucent' && blendMode !== 'additive'
+}
+
+/**
  * [we-scene patch] 这个 colorBlendMode 是否必须走 shader 侧混合（回读背景）。
  *
  * COLOR_BLEND_GL 只收录能用固定管线 blendFunc 表达的 5 个编号（2/6/7/9/31）。
@@ -5063,6 +5093,18 @@ export function createRenderer(canvas, opts = {}) {
     // 效果链
     let curInput = fboA // 当前主 FBO（asInput）
     let curDraw = fboB // 乒乓目标
+    let pongWritten = false // fboB 本帧是否已被本链写过（见 effectPassNeedsClear）
+    // 为什么需要 pongWritten：fboA 每帧在 copy 阶段被清零并灌入层内容，所以它是干净
+    // 的；fboB 没有对应的清理点，而 `getFBO` 的缓存键只有 `tag|WxH|format`（tag 是
+    // 字面量 'pong'，不含 layer.id），命中即原样复用 —— 于是 fboB 会带着**上一帧**的
+    // 内容跨帧存活。
+    // additive/translucent 是 LOAD 语义（保留目标）故不清屏 —— 这对链中间的 pass 是
+    // 对的（它就是要叠加到本帧的 passInput 上），但对**链的第一个 pass** 是错的：那时
+    // outFBO 是不清的 fboB，叠加对象是上一帧的残留。单 pass 的链更是如此，且链尾会把
+    // fboB 直接当结果合成出去。
+    // 表现：单 pass + additive + 大蒙版的工坊壁纸（r8 贴图经 fromR8 解出 alpha≡1，
+    // SRC_ALPHA 恒为 1 ⇒ 每帧满量叠加）几十帧后饱和成蒙版形状的**纯白块**。
+    // 修法：本帧第一次写 fboB 时无条件清一次，语义回到「每帧从干净目标开始」。
     const effectFBOs = new Map()
     let inTargetSeq = false
     let seqInput = fboA
@@ -5298,7 +5340,17 @@ export function createRenderer(canvas, opts = {}) {
       // 白楔（三角 = 原 quad − 位移 quad 的集合差，3486806915 #384）。
       // translucent/additive 是 LOAD 语义（保留目标），不清；!mp.target 保证
       // outFBO ≠ passInput 且不会被其他 pass 按名当历史读。
-      if (!mp.target && blendMode !== 'translucent' && blendMode !== 'additive') {
+      // [we-scene patch] 例外：本帧第一次写 fboB 时必须清 —— 见 effectPassNeedsClear
+      // 的注释。链中间 pass 的目标是**本帧**刚写出来的 passInput，LOAD 语义成立；
+      // 链首 pass 的目标是上一帧残留的 fboB，没有「保留」可言。
+      const needClear = effectPassNeedsClear(
+        !!mp.target,
+        blendMode,
+        outFBO === fboB,
+        !pongWritten,
+      )
+      if (!mp.target && outFBO === fboB) pongWritten = true
+      if (needClear) {
         gl.clearColor(0, 0, 0, 0)
         gl.clear(gl.COLOR_BUFFER_BIT)
       }

@@ -31,6 +31,10 @@ const STABLE = [
   // 材质缺 shader、坏 JSON、同一处只报一次），不该报的一个都不许报（官方两段式、
   // copy/swap 命令 pass、全库 10420 个效果零误报）—— issue #11
   "verify-effects",
+  // 效果链首 pass 写 ping-pong 目标前必须清屏：作者侧症状是「单 pass + additive +
+  // 大蒙版」的壁纸跑几十秒后右侧变成蒙版形状的**纯白块**（fboB 按字面 tag 跨帧复用、
+  // additive 走 LOAD 语义不清屏 ⇒ 每帧满量叠加饱和）—— 乒乓缓冲补一个清理点
+  "verify-fx-chain-clear",
   // 官方内置**源码工程**的装载判据：场景条目按 project.json.file 命中、
   // 引用完整性（材质链/模型内嵌材质/贴子/sprite/音效）、层材质合成条目零假诊断
   // —— DEFAULTPROJECTS-PLAN P0
