@@ -149,10 +149,18 @@ console.log("[2] setBlend：三条分支的 GL 因子（语料 alphatocoverage �
     src.includes("const blendMode = mp.blending || 'normal'") && src.includes("setBlend(blendMode)"),
     "效果 pass 路径以 mp.blending 直接喂 setBlend（alphatocoverage 因此当 normal）"
   );
+  // [2026-11-27] 清屏条件已抽成纯函数 effectPassNeedsClear（原先是内联的单行判断）。
+  // 语义不变，另加一档：LOAD 语义的 pass 首次写 ping-pong 的 pong 时也必须清 ——
+  // 否则它叠的是上一帧残留，单 pass + additive 会逐帧累积到纯白（见 verify-fx-chain-clear）。
   check(
-    src.includes("if (!mp.target && blendMode !== 'translucent' && blendMode !== 'additive') {") &&
-      src.includes("gl.clear(gl.COLOR_BUFFER_BIT)"),
-    "覆盖写 pass 的「先清透明」只对非 translucent/additive 的无目标 pass 生效"
+    src.includes("const needClear = effectPassNeedsClear(") &&
+      src.includes("gl.clear(gl.COLOR_BUFFER_BIT)") &&
+      !src.includes("if (!mp.target && blendMode !== 'translucent' && blendMode !== 'additive') {"),
+    "覆盖写 pass 的「先清透明」由 effectPassNeedsClear 判定（内联旧写法已移除）"
+  );
+  check(
+    src.includes("outFBO === fboB,") && src.includes("!pongWritten,"),
+    "effectPassNeedsClear 必须收到「目标是 pong」与「本帧首次」两档实参"
   );
 }
 
