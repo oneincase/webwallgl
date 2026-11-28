@@ -2040,6 +2040,15 @@
           // ③ 作者自己写了 CSS 尺寸（缩放舞台 / 装饰画布）：不碰
           if (Math.abs(c.clientWidth - c.width) > 2 || Math.abs(c.clientHeight - c.height) > 2) return;
           c.__weFluid = 1;
+          // [issue #29] 页面背景（人物贴图）常常画在 body 上、用 `background-size:cover`，
+          // 依赖 body 盒 = 视口。canvas 一旦被 fixed 抽出文档流，body 会塌成 0 / 行盒高，
+          // cover 便按这个错误的小盒子重算 ⇒ 背景图被放大并平移（比例方向不变，只是整块错位）。
+          // 把根与 body 钉回视口高度，使背景盒仍然是视口，才是官方桌面端看到的构图。
+          // 只在它们的行内高度为空时补，避免覆盖作者显式写的高度。
+          var htmlEl = doc.documentElement;
+          var bodyEl = doc.body;
+          if (htmlEl && htmlEl.style && !htmlEl.style.height) htmlEl.style.height = "100%";
+          if (bodyEl && bodyEl.style && !bodyEl.style.height) bodyEl.style.height = "100%";
           // position:fixed 下 100% 的包含块就是视口 ⇒ 尺寸精确等于视口，且不受 body
           // margin / 行盒影响（用 100vw/100vh 会把滚动条宽度算进去）。
           c.style.position = "fixed";

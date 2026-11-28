@@ -390,11 +390,15 @@ function runShim(extras, opts) {
         loadHandlers.push(fn);
       },
       documentElement: {
+        style: {},
         setAttribute() {},
         getAttribute() {
           return null;
         },
       },
+      // issue #29：整页画布接管要能把根/body 钉回视口高度（背景画在 body 上的页面靠它），
+      // 这里给最小 body.style 面，默认无内联高度 ⇒ 补丁段应写入 height:100%。
+      body: { style: {} },
       querySelectorAll() {
         return [];
       },
@@ -2291,6 +2295,36 @@ function runShim(extras, opts) {
     check(fluidBlock.length > 500, "web-shim.js 必须含「整页画布自适配」补丁段（issue #16）");
     check(!/\bc\.width\s*=/.test(fluidBlock) && !/\bc\.height\s*=/.test(fluidBlock),
       "整页画布自适配段不得写 canvas.width/height（只补 CSS 尺寸，backing store 交给作者自己的 resize）");
+  }
+
+  // F. [issue #29] 接管时必须把根与 body 钉回视口高度 —— 页面背景（人物贴图）常画在
+  //    body 上、用 background-size:cover，靠 body 盒 == 视口。canvas 被 fixed 抽出文档流
+  //    后 body 会塌成 0/行盒高，cover 便按错误小盒重算 ⇒ 背景整块放大平移（比例方向不变）。
+  {
+    // F1 正例：接管 → html/body 都补 height:100%（无内联高度时）
+    const F1 = runFluidCase((mk) => [mk(900, 700)]);
+    check(F1.canvases[0].__weFluid === 1, "issue #29：前置条件——整页单画布应被接管");
+    check(F1.win.document.documentElement.style.height === "100%",
+      `issue #29：接管后必须把 documentElement 高度钉回视口（否则 background-size:cover 按塌缩的 body 重算 ⇒ 人物整块位移），实为 ${JSON.stringify(F1.win.document.documentElement.style)}`);
+    check(F1.win.document.body.style.height === "100%",
+      `issue #29：接管后必须把 body 高度钉回视口（背景画布盒），实为 ${JSON.stringify(F1.win.document.body.style)}`);
+
+    // F2 反例：不接管（多画布）→ 不得动 html/body 高度
+    const F2 = runFluidCase((mk) => [mk(900, 700), mk(100, 100)]);
+    check(F2.canvases.every((c) => !c.__weFluid), "issue #29：前置条件——多画布不接管");
+    check(!F2.win.document.documentElement.style.height && !F2.win.document.body.style.height,
+      "issue #29：不接管时不得改写根/body 高度（避免误伤固定舞台 / 多画布页面）");
+
+    // F3 反例：作者已显式写内联高度 → 不得覆盖
+    const F3 = runFluidCase((mk) => [mk(900, 700)]);
+    F3.win.document.body.style.height = "auto";
+    F3.win.document.documentElement.style.height = "50%";
+    // 重置后重新跑一次 fluidFix：直接把页面内联高度还原成「作者已设置」，再看补丁是否尊重
+    // （runFluidCase 已在 build 时跑过一次；这里显式 fire resize 复查不覆盖）
+    F3.fire("resize");
+    check(F3.win.document.body.style.height === "auto" &&
+      F3.win.document.documentElement.style.height === "50%",
+      `issue #29：作者已写内联高度时不得覆盖（respect author），实为 html=${F3.win.document.documentElement.style.height} body=${F3.win.document.body.style.height}`);
   }
 }
 
